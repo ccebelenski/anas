@@ -1,0 +1,9 @@
+{
+  "name": "anas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A NAS — Storage management GUI for Proxmox",
+  "workspaces": [
+    "packages/*"
+  ]
+}

@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.nuxt/
+.output/
+*.sock
+.DS_Store
