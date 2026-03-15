@@ -9,7 +9,7 @@ export {
   ApiError,
   RequestHeaders,
   ConfirmHeader,
-} from './schemas/api.ts'
+} from './schemas/api'
 
 // Job schemas
 export {
@@ -19,7 +19,7 @@ export {
   Job,
   JobList,
   JobDetail,
-} from './schemas/jobs.ts'
+} from './schemas/jobs'
 
 // Common validators
 export {
@@ -31,4 +31,4 @@ export {
   DevicePath,
   ISODateTime,
   UUID,
-} from './schemas/common.ts'
+} from './schemas/common'
