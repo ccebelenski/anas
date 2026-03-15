@@ -1,6 +1,5 @@
 import type { FastifyInstance } from 'fastify'
-
-const VERSION = '0.1.0'
+import { VERSION } from '@anas/shared'
 
 export async function healthRoutes(server: FastifyInstance) {
   server.get('/health', async () => {
