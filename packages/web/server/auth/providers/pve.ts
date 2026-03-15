@@ -1,14 +1,12 @@
 import { request as httpRequest } from 'node:https'
-import type { AuthProvider, AuthUser, LoginCredentials } from '../types'
+import { execFile } from 'node:child_process'
+import type { AuthProvider, AuthUser } from '../types'
 
 /**
- * PVE auth provider — validates against the local Proxmox API.
+ * PVE auth provider — validates PVEAuthCookie against localhost Proxmox API.
  *
- * Two auth paths:
- * 1. Token validation: validates an existing PVEAuthCookie against
- *    localhost:8006 (for users coming from Proxmox UI).
- * 2. Credential auth: authenticates username/password against Proxmox
- *    API (for standalone login when PVE is available).
+ * ANAS is always accessed through the Proxmox UI, so the user already
+ * has a valid PVEAuthCookie. We validate it on each request.
  */
 export class PveAuthProvider implements AuthProvider {
   readonly name = 'pve'
@@ -21,46 +19,35 @@ export class PveAuthProvider implements AuthProvider {
     this.pvePort = opts?.port ?? 8006
   }
 
-  async authenticate(credentials: LoginCredentials): Promise<AuthUser | null> {
-    const { username, password } = credentials
-
-    // Authenticate against PVE API
-    const result = await this.pveRequest<{
-      data?: { ticket?: string; username?: string }
-    }>('POST', '/api2/json/access/ticket', {
-      username: username.includes('@') ? username : `${username}@pam`,
-      password,
-    })
-
-    if (!result?.data?.username) return null
-
-    // Extract the bare username (strip @realm)
-    const name = result.data.username.split('@')[0]!
-    const uid = await this.resolveUid(name)
-
-    return { name, uid }
-  }
-
   async validateToken(cookie: string): Promise<AuthUser | null> {
-    // Use the PVEAuthCookie to query the current user's access permissions.
-    // If the cookie is valid, PVE returns the user info.
+    // Use the PVEAuthCookie to query the Proxmox API.
+    // If the cookie is valid, PVE authenticates the request.
     const result = await this.pveRequest<{
-      data?: { user?: string }
-    }>('GET', '/api2/json/access/permissions', undefined, cookie)
+      data?: Record<string, unknown>
+    }>('/api2/json/access/permissions', cookie)
 
-    if (!result?.data?.user) return null
+    if (!result?.data) return null
 
-    const name = result.data.user.split('@')[0]!
-    const uid = await this.resolveUid(name)
+    // Extract username from the cookie itself.
+    // PVEAuthCookie format: PVE:username@realm:timestamp::signature
+    const username = this.extractUsername(cookie)
+    if (!username) return null
 
-    return { name, uid }
+    const uid = await this.resolveUid(username)
+    return { name: username, uid }
   }
 
-  /** Resolve a username to a UID via /etc/passwd. */
+  /** Extract bare username from PVEAuthCookie value. */
+  private extractUsername(cookie: string): string | null {
+    // Format: PVE:user@realm:hex:...
+    const match = cookie.match(/^PVE:([^@]+)@[^:]+:/)
+    return match?.[1] ?? null
+  }
+
+  /** Resolve a username to a UID via id(1). */
   private resolveUid(username: string): Promise<number> {
     return new Promise((resolve) => {
-      const { execFile } = require('node:child_process')
-      execFile('/usr/bin/id', ['-u', username], (err: Error | null, stdout: string) => {
+      execFile('/usr/bin/id', ['-u', username], (err, stdout) => {
         if (err) {
           // Default to 0 (root) if we can't resolve — PVE users are admins
           resolve(0)
@@ -72,35 +59,18 @@ export class PveAuthProvider implements AuthProvider {
     })
   }
 
-  private pveRequest<T>(
-    method: string,
-    path: string,
-    body?: Record<string, string>,
-    cookie?: string,
-  ): Promise<T | null> {
+  private pveRequest<T>(path: string, cookie: string): Promise<T | null> {
     return new Promise((resolve) => {
-      const headers: Record<string, string> = {
-        accept: 'application/json',
-      }
-
-      if (cookie) {
-        headers.cookie = `PVEAuthCookie=${cookie}`
-      }
-
-      let bodyStr: string | undefined
-      if (body) {
-        bodyStr = new URLSearchParams(body).toString()
-        headers['content-type'] = 'application/x-www-form-urlencoded'
-        headers['content-length'] = String(Buffer.byteLength(bodyStr))
-      }
-
       const req = httpRequest(
         {
           hostname: this.pveHost,
           port: this.pvePort,
-          method,
+          method: 'GET',
           path,
-          headers,
+          headers: {
+            accept: 'application/json',
+            cookie: `PVEAuthCookie=${cookie}`,
+          },
           rejectUnauthorized: false, // PVE uses self-signed certs
           timeout: 5000,
         },
@@ -109,7 +79,9 @@ export class PveAuthProvider implements AuthProvider {
           res.on('data', (chunk: Buffer) => chunks.push(chunk))
           res.on('end', () => {
             try {
-              const data = JSON.parse(Buffer.concat(chunks).toString('utf8')) as T
+              const data = JSON.parse(
+                Buffer.concat(chunks).toString('utf8'),
+              ) as T
               resolve(res.statusCode === 200 ? data : null)
             } catch {
               resolve(null)
@@ -123,13 +95,11 @@ export class PveAuthProvider implements AuthProvider {
         req.destroy()
         resolve(null)
       })
-
-      if (bodyStr) req.write(bodyStr)
       req.end()
     })
   }
 
-  /** Check if Proxmox API is reachable. Used for auto-detection at startup. */
+  /** Check if Proxmox API is reachable. */
   static async isAvailable(host = 'localhost', port = 8006): Promise<boolean> {
     return new Promise((resolve) => {
       const req = httpRequest(

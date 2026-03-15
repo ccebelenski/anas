@@ -491,31 +491,23 @@ Every operation has a schema defining valid parameters. anasd validates before e
 
 ### Authentication
 
-Pluggable auth provider interface:
+ANAS is always accessed through Proxmox UI — Proxmox owns the session.
 
 | Provider | When | How |
 |----------|------|-----|
-| `PveAuthProvider` | Production on Proxmox (default) | Validates PVEAuthCookie against local Proxmox API (localhost:8006) |
-| `PamAuthProvider` | Standalone / non-Proxmox fallback | PAM authentication with system credentials |
-| `DevAuthProvider` | Development & testing | Accepts any login, returns configurable mock user |
+| `PveAuthProvider` | Production (default) | Validates PVEAuthCookie against local Proxmox API (localhost:8006) |
+| `DevAuthProvider` | Development & testing | Accepts everything, returns mock user |
 
-Auto-detection at startup: if Proxmox API is reachable on localhost:8006, use PVE. Otherwise fall back to PAM. Overridable in config.
+- **No login page** — users are already authenticated via Proxmox
+- **No JWT / session store** — PVEAuthCookie is the credential, validated on each request
+- **No PAM fallback** — standalone access outside Proxmox is not a supported path
+- **Session expiry & logout** — managed by Proxmox
+- **Auth middleware** (Nuxt server): validates PVEAuthCookie → populates `event.context.user` with `{ name, uid }` → rejects with 401 if invalid
+- **Dev mode** (`ANAS_AUTH_PROVIDER=dev`): skips cookie validation, sets a mock user on every request
 
-Proxmox integration (Level 1 + 2):
+Proxmox integration:
 - Users logged into Proxmox UI are already authenticated to ANAS via PVEAuthCookie
 - Custom JS entry in Proxmox UI sidebar links to ANAS (via `/usr/share/pve-manager/js/custom.js`)
-- No separate login page needed when accessing through Proxmox
-
-Session: **stateless via JWT**. No server-side session store.
-
-- **PAM/Dev login flow**: user authenticates with credentials → Nuxt issues a signed JWT as an httpOnly secure cookie (`anas-token`). Claims: `{ sub: username, uid: number, iss: "anas", exp: ... }`. Signed with HMAC secret from `/etc/anas/config.yaml` (generated on first run by `anas setup`).
-- **PVE flow**: no ANAS JWT needed — the `PVEAuthCookie` is the credential. Validated against Proxmox API on each request.
-- **Auth middleware** (Nuxt server): on every request, checks for credentials in order: `PVEAuthCookie` → `anas-token` JWT → reject (401). If valid, populates `event.context.user` with `{ name, uid }`.
-- **Logout**: clears the `anas-token` cookie. PVE sessions are managed by Proxmox.
-- **Token expiry**: configurable, default 30 minutes. Baked into the JWT `exp` claim. No server-side expiry tracking.
-- **Restart resilience**: tokens survive service restart (no in-memory state to lose). Valid as long as the signing secret and expiry hold.
-
-JWT library: `jose` (zero-dependency, standards-compliant).
 
 Both services run as root — no dedicated service user.
 
@@ -798,16 +790,14 @@ This means ANAS can manage any share or export, regardless of whether ANAS creat
 
 This is more complex to implement but essential to the Proxmox philosophy — the system was here before ANAS and will be here after.
 
-### 6. Session Management: Stateless JWT (no server-side session store)
+### 6. Session Management: Proxmox owns the session (no ANAS session at all)
 
-Stateless auth via JWT rather than server-side sessions. Rationale:
+ANAS does not manage sessions. PVEAuthCookie is the only credential, validated on each request against the Proxmox API. Rationale:
 
-- **PVE already manages sessions** — duplicating state is pointless when the PVEAuthCookie is the canonical credential
-- **PAM/Dev**: after initial password auth, issue a signed JWT cookie. Each request validates the signature and expiry — no server-side state to manage, clean up, or lose on restart
-- **Guest philosophy** — less state we own, better
-- **Multi-node future** — JWT is exactly what you'd propagate when anasd runs over TCP/TLS to remote nodes (Epic 12)
-
-Library: `jose` (zero-dependency, standards-compliant, works in all runtimes).
+- **ANAS is always accessed through Proxmox** — the user is already authenticated
+- **No login page, no JWT, no PAM** — massive simplification with no loss of functionality
+- **Guest philosophy** — we don't own what we don't need to own
+- **Session expiry, logout** — Proxmox handles it; we just validate what we're given
 
 ---
 

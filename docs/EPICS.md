@@ -30,6 +30,8 @@ Story numbering is for identification only, not implementation order. Within eac
 
 0.7. [done] As a dev, I want the auth provider interface defined with PVE, PAM, and Dev implementations, so that authentication is pluggable from day one.
 
+0.7.1. [done] As a dev, I want auth simplified to PVE-only (with Dev for testing), removing PAM, JWT, and login page — since ANAS is always accessed through Proxmox, Proxmox owns the session.
+
 0.8. As a dev, I want audit logging to journald wired into anasd, so that every mutation is traceable from the start.
 
 0.9. As a dev, I want a basic app layout shell (sidebar nav, header, content area), so that feature work has a place to live.
@@ -46,13 +48,13 @@ Story numbering is for identification only, not implementation order. Within eac
 
 1.1. As a user, I want to access ANAS from the Proxmox UI sidebar and be automatically authenticated via my Proxmox session, so that it feels like part of Proxmox with no separate login.
 
-1.2. As a user, I want a fallback login page with PAM authentication, so that I can access ANAS directly (not through Proxmox) if needed.
+1.2. [OBE] ~~As a user, I want a fallback login page with PAM authentication, so that I can access ANAS directly (not through Proxmox) if needed.~~ *ANAS is always accessed through Proxmox; PVE owns auth.*
 
-1.3. As a user, I want ANAS to auto-detect whether Proxmox is available at startup and choose the right auth provider, so that I don't have to configure authentication manually.
+1.3. [OBE] ~~As a user, I want ANAS to auto-detect whether Proxmox is available at startup and choose the right auth provider, so that I don't have to configure authentication manually.~~ *Simplified: PVE in production, Dev for testing. No auto-detection needed.*
 
-1.4. As a user, I want my session to expire after inactivity, so that an unattended browser isn't a security risk.
+1.4. [OBE] ~~As a user, I want my session to expire after inactivity, so that an unattended browser isn't a security risk.~~ *Proxmox manages session expiry via PVEAuthCookie.*
 
-1.5. As a user, I want to log out explicitly, so that I can secure my session when I'm done.
+1.5. [OBE] ~~As a user, I want to log out explicitly, so that I can secure my session when I'm done.~~ *Logout is through Proxmox UI.*
 
 #### Dev
 1.6. As a dev, I want a mock PVE auth endpoint in the test suite, so that I can test PVEAuthCookie validation without a real Proxmox instance.
