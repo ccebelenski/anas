@@ -18,5 +18,5 @@ export interface AuthProvider {
    * Validate a PVEAuthCookie or equivalent token.
    * Returns the user if valid, null otherwise.
    */
-  validateToken(token: string): Promise<AuthUser | null>
+  validateToken: (token: string) => Promise<AuthUser | null>
 }

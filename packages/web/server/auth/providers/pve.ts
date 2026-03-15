@@ -1,6 +1,9 @@
-import { request as httpRequest } from 'node:https'
-import { execFile } from 'node:child_process'
 import type { AuthProvider, AuthUser } from '../types'
+import { execFile } from 'node:child_process'
+import { request as httpRequest } from 'node:https'
+
+/** PVEAuthCookie format: PVE:user@realm:hex:... */
+const PVE_COOKIE_RE = /^PVE:([^@]+)@[^:]+:/
 
 /**
  * PVE auth provider — validates PVEAuthCookie against localhost Proxmox API.
@@ -14,7 +17,7 @@ export class PveAuthProvider implements AuthProvider {
   private pveHost: string
   private pvePort: number
 
-  constructor(opts?: { host?: string; port?: number }) {
+  constructor(opts?: { host?: string, port?: number }) {
     this.pveHost = opts?.host ?? 'localhost'
     this.pvePort = opts?.port ?? 8006
   }
@@ -26,12 +29,14 @@ export class PveAuthProvider implements AuthProvider {
       data?: Record<string, unknown>
     }>('/api2/json/access/permissions', cookie)
 
-    if (!result?.data) return null
+    if (!result?.data)
+      return null
 
     // Extract username from the cookie itself.
     // PVEAuthCookie format: PVE:username@realm:timestamp::signature
     const username = this.extractUsername(cookie)
-    if (!username) return null
+    if (!username)
+      return null
 
     const uid = await this.resolveUid(username)
     return { name: username, uid }
@@ -39,8 +44,7 @@ export class PveAuthProvider implements AuthProvider {
 
   /** Extract bare username from PVEAuthCookie value. */
   private extractUsername(cookie: string): string | null {
-    // Format: PVE:user@realm:hex:...
-    const match = cookie.match(/^PVE:([^@]+)@[^:]+:/)
+    const match = cookie.match(PVE_COOKIE_RE)
     return match?.[1] ?? null
   }
 
@@ -53,7 +57,7 @@ export class PveAuthProvider implements AuthProvider {
           resolve(0)
           return
         }
-        const uid = parseInt(stdout.trim(), 10)
+        const uid = Number.parseInt(stdout.trim(), 10)
         resolve(Number.isNaN(uid) ? 0 : uid)
       })
     })
@@ -83,7 +87,8 @@ export class PveAuthProvider implements AuthProvider {
                 Buffer.concat(chunks).toString('utf8'),
               ) as T
               resolve(res.statusCode === 200 ? data : null)
-            } catch {
+            }
+            catch {
               resolve(null)
             }
           })

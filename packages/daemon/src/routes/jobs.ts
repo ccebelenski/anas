@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
-import { JobStatus } from '@anas/shared'
 import type { JobQueue } from '../jobs/queue.js'
+import { JobStatus } from '@anas/shared'
 
 export async function jobRoutes(
   server: FastifyInstance,

@@ -19,5 +19,5 @@ export interface CommandExecutor {
    * @returns The command result (stdout, stderr, exitCode)
    * @throws If the command cannot be started (not found, permission denied)
    */
-  exec(command: string, args: string[]): Promise<ExecResult>
+  exec: (command: string, args: string[]) => Promise<ExecResult>
 }

@@ -1,5 +1,5 @@
-import { execFile } from 'node:child_process'
 import type { CommandExecutor, ExecResult } from './types.js'
+import { execFile } from 'node:child_process'
 
 /**
  * Production executor — runs real commands via execFile.

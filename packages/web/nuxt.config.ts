@@ -1,3 +1,5 @@
+import Lara from '@primeuix/themes/lara'
+
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
   compatibilityDate: '2025-07-15',
@@ -10,7 +12,12 @@ export default defineNuxtConfig({
 
   primevue: {
     options: {
-      theme: 'none', // We'll configure the Lara Dark theme via CSS
+      theme: {
+        preset: Lara,
+        options: {
+          darkModeSelector: '.p-dark',
+        },
+      },
     },
   },
 })

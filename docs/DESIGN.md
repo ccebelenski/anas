@@ -361,7 +361,7 @@ All mutating operations return `202 Accepted` with a job reference:
 {
   "job": {
     "id": "550e8400-e29b-41d4-a716-446655440000",
-    "status": "running",         // queued | running | completed | failed
+    "status": "running", // queued | running | completed | failed
     "operation": "pool.create",
     "progress": "creating mirror-0...",
     "createdAt": "2026-03-14T10:00:00Z",

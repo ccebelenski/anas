@@ -8,16 +8,18 @@ let provider: AuthProvider | null = null
 
 /** Get the current auth provider. */
 export function getAuthProvider(): AuthProvider {
-  if (provider) return provider
+  if (provider)
+    return provider
 
   const configured = process.env.ANAS_AUTH_PROVIDER
 
   if (configured === 'dev') {
     provider = new DevAuthProvider()
-  } else {
+  }
+  else {
     provider = new PveAuthProvider()
   }
 
-  console.log(`[auth] Using ${provider.name} auth provider`)
+  console.warn(`[auth] Using ${provider.name} auth provider`)
   return provider
 }

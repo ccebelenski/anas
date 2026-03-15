@@ -25,7 +25,8 @@ async function main() {
   try {
     await server.listen({ path: SOCKET_PATH })
     server.log.info(`anasd listening on ${SOCKET_PATH}`)
-  } catch (err) {
+  }
+  catch (err) {
     server.log.error(err)
     process.exit(1)
   }

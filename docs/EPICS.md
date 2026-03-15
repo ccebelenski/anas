@@ -34,9 +34,9 @@ Story numbering is for identification only, not implementation order. Within eac
 
 0.8. [done] As a dev, I want audit logging to journald wired into anasd, so that every mutation is traceable from the start.
 
-0.9. As a dev, I want a basic app layout shell (sidebar nav, header, content area), so that feature work has a place to live.
+0.9. [done] As a dev, I want a basic app layout shell (sidebar nav, header, content area), so that feature work has a place to live.
 
-0.10. As a dev, I want a CI pipeline (lint, type-check, test), so that quality is enforced from the start.
+0.10. [done] As a dev, I want a CI pipeline (lint, type-check, test), so that quality is enforced from the start.
 
 ---
 

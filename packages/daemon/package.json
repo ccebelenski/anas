@@ -1,8 +1,8 @@
 {
   "name": "@anas/daemon",
   "type": "module",
-  "private": true,
   "version": "0.1.0",
+  "private": true,
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",

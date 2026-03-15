@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto'
-import type { Job, JobStatus, JobRef } from '@anas/shared'
+import type { Job, JobRef, JobStatus } from '@anas/shared'
 import type { AuditLogger } from '../audit/logger.js'
+import { randomUUID } from 'node:crypto'
 
 /** The function a job executes. Receives a progress callback. */
 export type JobHandler = (
@@ -28,7 +28,7 @@ export class JobQueue {
   private running = 0
   private audit?: AuditLogger
 
-  constructor(opts?: { concurrency?: number; audit?: AuditLogger }) {
+  constructor(opts?: { concurrency?: number, audit?: AuditLogger }) {
     this.concurrency = opts?.concurrency ?? 4
     this.audit = opts?.audit
   }
@@ -83,9 +83,9 @@ export class JobQueue {
 
   /** List jobs, optionally filtered by status. */
   list(status?: JobStatus): Job[] {
-    const all = Array.from(this.jobs.values()).map((r) => r.job)
+    const all = Array.from(this.jobs.values(), r => r.job)
     if (status) {
-      return all.filter((j) => j.status === status)
+      return all.filter(j => j.status === status)
     }
     return all
   }
@@ -93,8 +93,10 @@ export class JobQueue {
   /** Try to run queued jobs up to the concurrency limit. */
   private drain(): void {
     for (const record of this.jobs.values()) {
-      if (this.running >= this.concurrency) break
-      if (record.job.status !== 'queued') continue
+      if (this.running >= this.concurrency)
+        break
+      if (record.job.status !== 'queued')
+        continue
 
       this.running++
       record.job.status = 'running'
@@ -127,7 +129,8 @@ export class JobQueue {
         },
         { status: 'completed', durationMs: Date.now() - startTime },
       )
-    } catch (err) {
+    }
+    catch (err) {
       job.status = 'failed'
       const message = err instanceof Error ? err.message : String(err)
       job.error = { code: 'JOB_FAILED', message }
@@ -142,7 +145,8 @@ export class JobQueue {
         },
         { status: 'failed', durationMs: Date.now() - startTime, error: message },
       )
-    } finally {
+    }
+    finally {
       job.completedAt = new Date().toISOString()
       this.running--
       this.drain()

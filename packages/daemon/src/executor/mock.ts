@@ -33,18 +33,20 @@ export class MockExecutor implements CommandExecutor {
   async exec(command: string, args: string[]): Promise<ExecResult> {
     // Try exact match (command + args) first, then command-only match
     const exactMatch = this.fixtures.find(
-      (f) =>
-        f.command === command &&
-        f.args !== undefined &&
-        f.args.length === args.length &&
-        f.args.every((a, i) => a === args[i]),
+      f =>
+        f.command === command
+        && f.args !== undefined
+        && f.args.length === args.length
+        && f.args.every((a, i) => a === args[i]),
     )
-    if (exactMatch) return exactMatch.result
+    if (exactMatch)
+      return exactMatch.result
 
     const commandMatch = this.fixtures.find(
-      (f) => f.command === command && f.args === undefined,
+      f => f.command === command && f.args === undefined,
     )
-    if (commandMatch) return commandMatch.result
+    if (commandMatch)
+      return commandMatch.result
 
     return {
       stdout: '',

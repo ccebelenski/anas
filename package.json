@@ -1,9 +1,23 @@
 {
   "name": "anas",
+  "type": "module",
   "version": "0.1.0",
   "private": true,
   "description": "A NAS — Storage management GUI for Proxmox",
   "workspaces": [
     "packages/*"
-  ]
+  ],
+  "scripts": {
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "typecheck": "npm run typecheck:shared && npm run typecheck:daemon && npm run typecheck:web",
+    "typecheck:shared": "cd packages/shared && npx tsc --noEmit",
+    "typecheck:daemon": "cd packages/daemon && npx tsc --noEmit",
+    "typecheck:web": "cd packages/web && npx nuxi typecheck"
+  },
+  "devDependencies": {
+    "@antfu/eslint-config": "^7.7.2",
+    "eslint": "^10.0.3",
+    "typescript": "^5.9.3"
+  }
 }

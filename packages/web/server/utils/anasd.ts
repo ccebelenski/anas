@@ -1,7 +1,7 @@
-import { request as httpRequest } from 'node:http'
-import { randomUUID } from 'node:crypto'
-import type { H3Event } from 'h3'
 import type { ApiError } from '@anas/shared'
+import type { H3Event } from 'h3'
+import { randomUUID } from 'node:crypto'
+import { request as httpRequest } from 'node:http'
 
 const SOCKET_PATH = process.env.ANASD_SOCKET ?? '/run/anas/anasd.sock'
 
@@ -32,13 +32,13 @@ export function anasdRequest<T = unknown>(
 ): Promise<AnasdResponse<T>> {
   return new Promise((resolve, reject) => {
     const headers: Record<string, string> = {
-      accept: 'application/json',
+      'accept': 'application/json',
       'x-anas-request-id': randomUUID(),
     }
 
     // Propagate user identity from the session (set by auth middleware)
     const user = opts.event.context.user as
-      | { name: string; uid: number }
+      | { name: string, uid: number }
       | undefined
     if (user) {
       headers['x-anas-user'] = user.name
@@ -72,7 +72,8 @@ export function anasdRequest<T = unknown>(
           let data: T
           try {
             data = JSON.parse(raw) as T
-          } catch {
+          }
+          catch {
             data = raw as T
           }
           resolve({
