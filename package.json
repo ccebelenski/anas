@@ -8,6 +8,12 @@
     "packages/*"
   ],
   "scripts": {
+    "dev": "concurrently -k -n daemon,web -c blue,green \"ANASD_SOCKET=/tmp/anasd.sock npm run dev:daemon\" \"ANASD_SOCKET=/tmp/anasd.sock ANAS_AUTH_PROVIDER=dev npm run dev:web\"",
+    "dev:daemon": "cd packages/daemon && tsx watch src/index.ts -- --mock",
+    "dev:web": "cd packages/web && npx nuxi dev",
+    "build": "npm run build:daemon && npm run build:web",
+    "build:daemon": "cd packages/daemon && tsc",
+    "build:web": "cd packages/web && npx nuxi build",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "typecheck": "npm run typecheck:shared && npm run typecheck:daemon && npm run typecheck:web",
@@ -17,6 +23,7 @@
   },
   "devDependencies": {
     "@antfu/eslint-config": "^7.7.2",
+    "concurrently": "^9.2.1",
     "eslint": "^10.0.3",
     "typescript": "^5.9.3"
   }

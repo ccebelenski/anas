@@ -3,7 +3,7 @@ import { getAuthProvider } from '../auth'
 /**
  * Server middleware that authenticates every request.
  *
- * In production: validates PVEAuthCookie against Proxmox API.
+ * In production: verifies PVEAuthCookie RSA signature locally.
  * In dev mode (ANAS_AUTH_PROVIDER=dev): always sets a mock user.
  */
 export default defineEventHandler(async (event) => {

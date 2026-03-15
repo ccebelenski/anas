@@ -2,6 +2,7 @@ import { existsSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
 
 const SOCKET_PATH = process.env.ANASD_SOCKET ?? '/tmp/anasd.sock'
+const MOCK = process.argv.includes('--mock')
 
 async function main() {
   // Clean up stale socket from a previous crash
@@ -9,7 +10,7 @@ async function main() {
     unlinkSync(SOCKET_PATH)
   }
 
-  const server = createServer()
+  const server = createServer({ mock: MOCK })
 
   // Clean shutdown on SIGTERM (systemd) and SIGINT (ctrl-c)
   const shutdown = async () => {
@@ -24,7 +25,7 @@ async function main() {
 
   try {
     await server.listen({ path: SOCKET_PATH })
-    server.log.info(`anasd listening on ${SOCKET_PATH}`)
+    server.log.info(`anasd listening on ${SOCKET_PATH}${MOCK ? ' (mock mode)' : ''}`)
   }
   catch (err) {
     server.log.error(err)
