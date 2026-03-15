@@ -25,11 +25,13 @@ interface JobRecord {
 export class JobQueue {
   private jobs = new Map<string, JobRecord>()
   private concurrency: number
+  private maxRetained: number
   private running = 0
   private audit?: AuditLogger
 
-  constructor(opts?: { concurrency?: number, audit?: AuditLogger }) {
+  constructor(opts?: { concurrency?: number, maxRetained?: number, audit?: AuditLogger }) {
     this.concurrency = opts?.concurrency ?? 4
+    this.maxRetained = opts?.maxRetained ?? 1000
     this.audit = opts?.audit
   }
 
@@ -88,6 +90,19 @@ export class JobQueue {
       return all.filter(j => j.status === status)
     }
     return all
+  }
+
+  /** Evict oldest completed/failed jobs when over maxRetained. */
+  private evict(): void {
+    if (this.jobs.size <= this.maxRetained)
+      return
+
+    for (const [id, record] of this.jobs) {
+      if (this.jobs.size <= this.maxRetained)
+        break
+      if (record.job.status === 'completed' || record.job.status === 'failed')
+        this.jobs.delete(id)
+    }
   }
 
   /** Try to run queued jobs up to the concurrency limit. */
@@ -149,6 +164,7 @@ export class JobQueue {
     finally {
       job.completedAt = new Date().toISOString()
       this.running--
+      this.evict()
       this.drain()
     }
   }

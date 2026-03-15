@@ -39,6 +39,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: cd packages/daemon && npm run build
       - run: cd packages/web && npx nuxi build
         env:
           ANAS_AUTH_PROVIDER: dev
