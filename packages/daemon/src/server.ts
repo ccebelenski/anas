@@ -2,6 +2,7 @@ import Fastify from 'fastify'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
 import { JobQueue } from './jobs/queue.js'
+import { AuditLogger } from './audit/logger.js'
 import { ProdExecutor } from './executor/prod.js'
 import { MockExecutor } from './executor/mock.js'
 import type { CommandExecutor } from './executor/types.js'
@@ -16,7 +17,8 @@ export function createServer(opts?: ServerOptions) {
     logger: true,
   })
 
-  const jobQueue = new JobQueue()
+  const audit = new AuditLogger(server.log)
+  const jobQueue = new JobQueue({ audit })
   const executor: CommandExecutor = opts?.mock
     ? new MockExecutor()
     : new ProdExecutor()

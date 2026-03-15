@@ -1,28 +1,44 @@
 import { randomUUID } from 'node:crypto'
 import type { Job, JobStatus, JobRef } from '@anas/shared'
+import type { AuditLogger } from '../audit/logger.js'
 
 /** The function a job executes. Receives a progress callback. */
 export type JobHandler = (
   updateProgress: (message: string) => void,
 ) => Promise<unknown>
 
+/** Metadata about who submitted the job, for audit logging. */
+export interface JobSubmitter {
+  user: string
+  uid: number
+  requestId?: string
+  params?: Record<string, unknown>
+}
+
 /** Internal job record with the handler attached. */
 interface JobRecord {
   job: Job
   handler: JobHandler
+  submitter: JobSubmitter
 }
 
 export class JobQueue {
   private jobs = new Map<string, JobRecord>()
   private concurrency: number
   private running = 0
+  private audit?: AuditLogger
 
-  constructor(opts?: { concurrency?: number }) {
+  constructor(opts?: { concurrency?: number; audit?: AuditLogger }) {
     this.concurrency = opts?.concurrency ?? 4
+    this.audit = opts?.audit
   }
 
   /** Submit a new job. Returns the JobRef for the 202 response. */
-  submit(operation: string, createdBy: string, handler: JobHandler): JobRef {
+  submit(
+    operation: string,
+    submitter: JobSubmitter,
+    handler: JobHandler,
+  ): JobRef {
     const id = randomUUID()
     const now = new Date().toISOString()
 
@@ -32,14 +48,23 @@ export class JobQueue {
       operation,
       progress: null,
       createdAt: now,
-      createdBy,
+      createdBy: submitter.user,
       startedAt: null,
       completedAt: null,
       result: null,
       error: null,
     }
 
-    this.jobs.set(id, { job, handler })
+    this.jobs.set(id, { job, handler, submitter })
+
+    this.audit?.submitted({
+      user: submitter.user,
+      uid: submitter.uid,
+      operation,
+      params: submitter.params,
+      requestId: submitter.requestId,
+    })
+
     this.drain()
 
     return {
@@ -80,7 +105,8 @@ export class JobQueue {
   }
 
   private async execute(record: JobRecord): Promise<void> {
-    const { job, handler } = record
+    const { job, handler, submitter } = record
+    const startTime = Date.now()
 
     const updateProgress = (message: string) => {
       job.progress = message
@@ -90,12 +116,32 @@ export class JobQueue {
       const result = await handler(updateProgress)
       job.status = 'completed'
       job.result = result ?? null
+
+      this.audit?.finished(
+        {
+          user: submitter.user,
+          uid: submitter.uid,
+          operation: job.operation,
+          params: submitter.params,
+          requestId: submitter.requestId,
+        },
+        { status: 'completed', durationMs: Date.now() - startTime },
+      )
     } catch (err) {
       job.status = 'failed'
-      job.error = {
-        code: 'JOB_FAILED',
-        message: err instanceof Error ? err.message : String(err),
-      }
+      const message = err instanceof Error ? err.message : String(err)
+      job.error = { code: 'JOB_FAILED', message }
+
+      this.audit?.finished(
+        {
+          user: submitter.user,
+          uid: submitter.uid,
+          operation: job.operation,
+          params: submitter.params,
+          requestId: submitter.requestId,
+        },
+        { status: 'failed', durationMs: Date.now() - startTime, error: message },
+      )
     } finally {
       job.completedAt = new Date().toISOString()
       this.running--

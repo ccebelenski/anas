@@ -32,7 +32,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 0.7.1. [done] As a dev, I want auth simplified to PVE-only (with Dev for testing), removing PAM, JWT, and login page — since ANAS is always accessed through Proxmox, Proxmox owns the session.
 
-0.8. As a dev, I want audit logging to journald wired into anasd, so that every mutation is traceable from the start.
+0.8. [done] As a dev, I want audit logging to journald wired into anasd, so that every mutation is traceable from the start.
 
 0.9. As a dev, I want a basic app layout shell (sidebar nav, header, content area), so that feature work has a place to live.
 

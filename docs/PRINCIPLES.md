@@ -40,9 +40,9 @@ The entire system ships as one npm package. `npm install -g anas` gets you every
 
 anasd listens on a Unix domain socket, not a TCP port. This means only local processes can reach it, and access is controlled by filesystem permissions. This is a security boundary, not a convenience choice. If multi-node support is added later, it gets its own transport layer — the socket assumption is not relaxed.
 
-## 10. PAM for authentication, system users for identity
+## 10. Proxmox for authentication, system users for identity
 
-We do not maintain our own user database. Users authenticate via PAM (system credentials). If you're logged in, you can do everything — auth is binary, no roles or permission matrix. Share access requires real system users with real UIDs/GIDs. We manage users through standard system tools, not a parallel identity system.
+We do not maintain our own user database or session management. Users authenticate via Proxmox (PVEAuthCookie) — ANAS is always accessed through the Proxmox UI. If you're logged in, you can do everything — auth is binary, no roles or permission matrix. Share access requires real system users with real UIDs/GIDs. We manage users through standard system tools, not a parallel identity system.
 
 ## 11. Stateless — the system is the source of truth
 
