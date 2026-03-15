@@ -12,6 +12,7 @@
     "@anas/shared": "*",
     "@pinia/nuxt": "^0.11.3",
     "@primevue/nuxt-module": "^4.3.0",
+    "jose": "^6.2.1",
     "nuxt": "^4.4.2",
     "pinia": "^3.0.0",
     "primevue": "^4.3.0",

@@ -506,7 +506,17 @@ Proxmox integration (Level 1 + 2):
 - Custom JS entry in Proxmox UI sidebar links to ANAS (via `/usr/share/pve-manager/js/custom.js`)
 - No separate login page needed when accessing through Proxmox
 
-Session: managed by Nuxt (cookie-based, httpOnly, secure). In-memory session store for V1.
+Session: **stateless via JWT**. No server-side session store.
+
+- **PAM/Dev login flow**: user authenticates with credentials → Nuxt issues a signed JWT as an httpOnly secure cookie (`anas-token`). Claims: `{ sub: username, uid: number, iss: "anas", exp: ... }`. Signed with HMAC secret from `/etc/anas/config.yaml` (generated on first run by `anas setup`).
+- **PVE flow**: no ANAS JWT needed — the `PVEAuthCookie` is the credential. Validated against Proxmox API on each request.
+- **Auth middleware** (Nuxt server): on every request, checks for credentials in order: `PVEAuthCookie` → `anas-token` JWT → reject (401). If valid, populates `event.context.user` with `{ name, uid }`.
+- **Logout**: clears the `anas-token` cookie. PVE sessions are managed by Proxmox.
+- **Token expiry**: configurable, default 30 minutes. Baked into the JWT `exp` claim. No server-side expiry tracking.
+- **Restart resilience**: tokens survive service restart (no in-memory state to lose). Valid as long as the signing secret and expiry hold.
+
+JWT library: `jose` (zero-dependency, standards-compliant).
+
 Both services run as root — no dedicated service user.
 
 ### Authorization
@@ -787,6 +797,17 @@ ANAS is fully stateless regarding config management. It does not track which sha
 This means ANAS can manage any share or export, regardless of whether ANAS created it or someone added it manually. It's a tool, not an owner.
 
 This is more complex to implement but essential to the Proxmox philosophy — the system was here before ANAS and will be here after.
+
+### 6. Session Management: Stateless JWT (no server-side session store)
+
+Stateless auth via JWT rather than server-side sessions. Rationale:
+
+- **PVE already manages sessions** — duplicating state is pointless when the PVEAuthCookie is the canonical credential
+- **PAM/Dev**: after initial password auth, issue a signed JWT cookie. Each request validates the signature and expiry — no server-side state to manage, clean up, or lose on restart
+- **Guest philosophy** — less state we own, better
+- **Multi-node future** — JWT is exactly what you'd propagate when anasd runs over TCP/TLS to remote nodes (Epic 12)
+
+Library: `jose` (zero-dependency, standards-compliant, works in all runtimes).
 
 ---
 
