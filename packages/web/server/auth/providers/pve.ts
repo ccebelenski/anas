@@ -1,73 +1,105 @@
 import type { AuthProvider, AuthUser } from '../types'
 import { execFile } from 'node:child_process'
-import { request as httpRequest } from 'node:https'
+import { createVerify } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 
-/** PVEAuthCookie format: PVE:user@realm:hex:... */
-const PVE_COOKIE_RE = /^PVE:([^@]+)@[^:]+:/
+/** PVEAuthCookie format: PVE:user@realm:TIMESTAMP::base64_signature */
+const PVE_TICKET_RE = /^(PVE:([^@]+)@[^:]+:([0-9A-F]{8}))::(.+)$/
 
-/** Cache TTL: 2 minutes. The cookie is signed by Proxmox, so a recently validated cookie is still valid. */
-const CACHE_TTL_MS = 2 * 60 * 1000
+/** Ticket lifetime: 2 hours (matches Proxmox default). */
+const TICKET_LIFETIME_S = 7200
 
-interface CacheEntry {
-  user: AuthUser
-  expiresAt: number
-}
+/** Clock skew tolerance: 5 minutes into the future (matches Proxmox). */
+const CLOCK_SKEW_S = 300
+
+/** Path to Proxmox RSA public key for ticket verification. */
+const AUTHKEY_PATH = '/etc/pve/authkey.pub'
+const AUTHKEY_OLD_PATH = '/etc/pve/authkey.pub.old'
 
 /**
- * PVE auth provider — validates PVEAuthCookie against localhost Proxmox API.
+ * PVE auth provider — verifies PVEAuthCookie locally using Proxmox's
+ * RSA public key.
  *
- * ANAS is always accessed through the Proxmox UI, so the user already
- * has a valid PVEAuthCookie. Validated results are cached briefly since
- * the cookie is HMAC-signed by Proxmox and can be trusted for the
- * cache duration.
+ * No network calls. The ticket is RSA-signed by Proxmox with a 2048-bit
+ * key. We verify the signature using the public key at /etc/pve/authkey.pub,
+ * then check the embedded timestamp for expiry.
  */
 export class PveAuthProvider implements AuthProvider {
   readonly name = 'pve'
 
-  private pveHost: string
-  private pvePort: number
-  private cache = new Map<string, CacheEntry>()
+  private pubKeys: string[] = []
 
-  constructor(opts?: { host?: string, port?: number }) {
-    this.pveHost = opts?.host ?? 'localhost'
-    this.pvePort = opts?.port ?? 8006
+  constructor() {
+    this.loadKeys()
   }
 
   async validateToken(cookie: string): Promise<AuthUser | null> {
-    // Check cache first
-    const cached = this.cache.get(cookie)
-    if (cached && cached.expiresAt > Date.now())
-      return cached.user
-
-    // Cache miss or expired — validate against Proxmox API
-    const result = await this.pveRequest<{
-      data?: Record<string, unknown>
-    }>('/api2/json/access/permissions', cookie)
-
-    if (!result?.data)
+    const parsed = this.parseTicket(cookie)
+    if (!parsed)
       return null
 
-    // Extract username from the cookie itself
-    const username = this.extractUsername(cookie)
-    if (!username)
+    // Check expiry
+    const age = Math.floor(Date.now() / 1000) - parsed.timestamp
+    if (age < -CLOCK_SKEW_S || age > TICKET_LIFETIME_S)
       return null
 
-    const uid = await this.resolveUid(username)
-    const user: AuthUser = { name: username, uid }
+    // Verify RSA signature against any loaded public key
+    const valid = this.pubKeys.some(key =>
+      this.verifySignature(parsed.plaintext, parsed.signature, key),
+    )
+    if (!valid)
+      return null
 
-    // Cache the validated result
-    this.cache.set(cookie, {
-      user,
-      expiresAt: Date.now() + CACHE_TTL_MS,
-    })
-
-    return user
+    const uid = await this.resolveUid(parsed.username)
+    return { name: parsed.username, uid }
   }
 
-  /** Extract bare username from PVEAuthCookie value. */
-  private extractUsername(cookie: string): string | null {
-    const match = cookie.match(PVE_COOKIE_RE)
-    return match?.[1] ?? null
+  private parseTicket(cookie: string): {
+    plaintext: string
+    username: string
+    timestamp: number
+    signature: string
+  } | null {
+    const match = cookie.match(PVE_TICKET_RE)
+    if (!match)
+      return null
+
+    return {
+      plaintext: match[1]!,
+      username: match[2]!,
+      timestamp: Number.parseInt(match[3]!, 16),
+      signature: match[4]!,
+    }
+  }
+
+  private verifySignature(plaintext: string, signatureB64: string, pubKey: string): boolean {
+    try {
+      const verifier = createVerify('RSA-SHA256')
+      verifier.update(plaintext)
+      return verifier.verify(pubKey, signatureB64, 'base64')
+    }
+    catch {
+      return false
+    }
+  }
+
+  /** Load RSA public keys from disk. Tries current and previous (for key rotation). */
+  private loadKeys(): void {
+    this.pubKeys = []
+
+    try {
+      this.pubKeys.push(readFileSync(AUTHKEY_PATH, 'utf8'))
+    }
+    catch {
+      console.error(`[auth] Cannot read ${AUTHKEY_PATH} — PVE ticket verification will fail`)
+    }
+
+    try {
+      this.pubKeys.push(readFileSync(AUTHKEY_OLD_PATH, 'utf8'))
+    }
+    catch {
+      // Old key is optional — only exists after key rotation
+    }
   }
 
   /** Resolve a username to a UID via id(1). Returns -1 for non-PAM realm users. */
@@ -75,8 +107,6 @@ export class PveAuthProvider implements AuthProvider {
     return new Promise((resolve) => {
       execFile('/usr/bin/id', ['-u', username], (err, stdout) => {
         if (err) {
-          // User authenticated via PVE but has no system account
-          // (e.g., @pve or @ldap realm). Use -1 for audit trail.
           console.warn(`[auth] Cannot resolve UID for '${username}' — non-PAM realm user?`)
           resolve(-1)
           return
@@ -87,70 +117,14 @@ export class PveAuthProvider implements AuthProvider {
     })
   }
 
-  private pveRequest<T>(path: string, cookie: string): Promise<T | null> {
-    return new Promise((resolve) => {
-      const req = httpRequest(
-        {
-          hostname: this.pveHost,
-          port: this.pvePort,
-          method: 'GET',
-          path,
-          headers: {
-            accept: 'application/json',
-            cookie: `PVEAuthCookie=${cookie}`,
-          },
-          rejectUnauthorized: false, // PVE uses self-signed certs
-          timeout: 5000,
-        },
-        (res) => {
-          const chunks: Buffer[] = []
-          res.on('data', (chunk: Buffer) => chunks.push(chunk))
-          res.on('end', () => {
-            try {
-              const data = JSON.parse(
-                Buffer.concat(chunks).toString('utf8'),
-              ) as T
-              resolve(res.statusCode === 200 ? data : null)
-            }
-            catch {
-              resolve(null)
-            }
-          })
-        },
-      )
-
-      req.on('error', () => resolve(null))
-      req.on('timeout', () => {
-        req.destroy()
-        resolve(null)
-      })
-      req.end()
-    })
-  }
-
-  /** Check if Proxmox API is reachable. */
-  static async isAvailable(host = 'localhost', port = 8006): Promise<boolean> {
-    return new Promise((resolve) => {
-      const req = httpRequest(
-        {
-          hostname: host,
-          port,
-          method: 'GET',
-          path: '/api2/json/version',
-          rejectUnauthorized: false,
-          timeout: 2000,
-        },
-        (res) => {
-          res.resume()
-          resolve(res.statusCode === 200)
-        },
-      )
-      req.on('error', () => resolve(false))
-      req.on('timeout', () => {
-        req.destroy()
-        resolve(false)
-      })
-      req.end()
-    })
+  /** Check if Proxmox auth key exists on disk. */
+  static isAvailable(): boolean {
+    try {
+      readFileSync(AUTHKEY_PATH)
+      return true
+    }
+    catch {
+      return false
+    }
   }
 }
