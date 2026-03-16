@@ -9,7 +9,7 @@ export {
   dataResponse,
   ErrorCode,
   RequestHeaders,
-} from './schemas/api'
+} from './schemas/api.js'
 
 // Common validators
 export {
@@ -21,7 +21,7 @@ export {
   ShareName,
   SnapshotName,
   UUID,
-} from './schemas/common'
+} from './schemas/common.js'
 
 // Job schemas
 export {
@@ -31,4 +31,4 @@ export {
   JobList,
   JobRef,
   JobStatus,
-} from './schemas/jobs'
+} from './schemas/jobs.js'

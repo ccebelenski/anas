@@ -11,7 +11,8 @@
     "dev": "concurrently -k -n daemon,web -c blue,green \"ANASD_SOCKET=/tmp/anasd.sock npm run dev:daemon\" \"ANASD_SOCKET=/tmp/anasd.sock ANAS_AUTH_PROVIDER=dev npm run dev:web\"",
     "dev:daemon": "cd packages/daemon && tsx watch src/index.ts -- --mock",
     "dev:web": "cd packages/web && npx nuxi dev",
-    "build": "npm run build:daemon && npm run build:web",
+    "build": "npm run build:shared && npm run build:daemon && npm run build:web",
+    "build:shared": "cd packages/shared && tsc",
     "build:daemon": "cd packages/daemon && tsc",
     "build:web": "cd packages/web && npx nuxi build",
     "lint": "eslint .",
@@ -19,10 +20,14 @@
     "typecheck": "npm run typecheck:shared && npm run typecheck:daemon && npm run typecheck:web",
     "typecheck:shared": "cd packages/shared && npx tsc --noEmit",
     "typecheck:daemon": "cd packages/daemon && npx tsc --noEmit",
-    "typecheck:web": "cd packages/web && npx nuxi typecheck"
+    "typecheck:web": "cd packages/web && npx nuxi typecheck",
+    "test:integration": "npx playwright test --project=integration",
+    "test:stunt-deploy": "./test/stunt-node/deploy-anas.sh",
+    "test:stunt-run": "./test/stunt-node/run-tests.sh"
   },
   "devDependencies": {
     "@antfu/eslint-config": "^7.7.2",
+    "@playwright/test": "^1.58.2",
     "concurrently": "^9.2.1",
     "eslint": "^10.0.3",
     "typescript": "^5.9.3"
