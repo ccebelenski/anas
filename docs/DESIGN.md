@@ -521,63 +521,41 @@ Both services run as root — no dedicated service user.
 
 ## Frontend Structure
 
+### UI Model: Floating Panels over a Persistent Dashboard
+
+ANAS uses a **workspace model**, not page navigation. The dashboard is always visible as the home base. Features open as **floating panels** — clean bordered overlays that appear on top of the dashboard (or each other) and dismiss back when done. This lets the user cross-reference information without losing context (e.g. check pool status while configuring a share).
+
+**Key principles:**
+- The **dashboard** is the persistent workspace — pool health, active jobs, warnings. Always underneath.
+- **Sidebar items open floating panels**, not navigate to pages. No route changes, no context loss.
+- **Panels are self-contained** — each fetches its own data on open. No shared state to maintain.
+- **Dismiss with Escape or click-outside** — clean restore, no leftover state.
+- **Panels can stack** — open pools while shares panel is already open (future refinement).
+
 ```
-pages/
-├── index.vue                  # Dashboard — pool health, share summary
-├── login.vue                  # Login page
+components/
+├── FloatingPanel.vue               # Base: overlay box with title, close, Escape/click-outside dismiss
 ├── storage/
-│   ├── pools/
-│   │   ├── index.vue          # Pool list
-│   │   └── [name].vue         # Pool detail (status, vdevs, datasets)
-│   ├── datasets/
-│   │   └── [...path].vue      # Dataset detail (properties, snapshots)
-│   └── disks.vue              # Available disks
-├── shares/
-│   ├── smb/
-│   │   ├── index.vue          # SMB share list
-│   │   └── [name].vue         # SMB share config
-│   └── nfs/
-│       ├── index.vue          # NFS export list
-│       └── [id].vue           # NFS export config
-├── users/
-│   └── index.vue              # User/group management
-└── jobs/
-    └── index.vue              # Job history & active jobs
+│   ├── PoolList.vue                # Pure presentation: DataTable of PoolSummary[]
+│   └── PoolListPanel.vue           # Self-contained: opens FloatingPanel, fetches pools, renders PoolList
+├── shares/                         # (future) SMB/NFS list components and panels
+├── users/                          # (future) User/group components and panels
+└── jobs/                           # (future) Job list components and panels
 ```
 
 ```
+pages/
+├── index.vue                       # Dashboard — the persistent workspace
+└── storage/
+    └── pools.vue                   # Standalone page (for direct URL access / bookmarking)
+```
+
+### Nuxt Server API Routes (proxy to anasd)
+
+```
 server/api/
-├── auth/
-│   ├── login.post.ts          # PAM authentication
-│   ├── logout.post.ts         # Session teardown
-│   └── session.get.ts         # Current session info
-├── zfs/
-│   ├── pools/
-│   │   ├── index.get.ts       # List pools
-│   │   ├── index.post.ts      # Create pool
-│   │   └── [name]/
-│   │       ├── index.get.ts   # Pool detail
-│   │       ├── index.delete.ts # Destroy pool
-│   │       └── scrub.post.ts  # Start scrub
-│   └── datasets/
-│       ├── index.get.ts       # List datasets
-│       ├── index.post.ts      # Create dataset
-│       └── [...path].ts       # Dataset operations
-├── shares/
-│   ├── smb/
-│   │   ├── index.get.ts       # List SMB shares
-│   │   ├── index.post.ts      # Create share
-│   │   └── [name].ts          # Share CRUD
-│   └── nfs/
-│       ├── index.get.ts       # List NFS exports
-│       ├── index.post.ts      # Create export
-│       └── [id].ts            # Export CRUD
-├── system/
-│   ├── disks.get.ts           # Available disks
-│   └── users.get.ts           # System users/groups
-└── jobs/
-    ├── index.get.ts           # List jobs
-    └── [id].get.ts            # Job status
+├── pools.get.ts                    # GET /api/pools → anasd /v1/pools
+└── ...                             # Additional proxy routes added per feature
 ```
 
 ---
