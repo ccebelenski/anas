@@ -22,8 +22,8 @@ describe('parseZpoolList', () => {
     assert.equal(pool.size, 480 * 1024 * 1024)
     assert.ok(pool.allocated >= 0)
     assert.ok(pool.free > 0)
-    assert.equal(pool.fragmentation, 3)
-    assert.equal(pool.capacity, 0)
+    assert.equal(pool.fragmentation, 12)
+    assert.equal(pool.capacity, 37)
     assert.equal(pool.dedupRatio, 1.0)
   })
 

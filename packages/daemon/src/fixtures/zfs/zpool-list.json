@@ -22,14 +22,14 @@
                     }
                 },
                 "allocated": {
-                    "value": "140K",
+                    "value": "178M",
                     "source": {
                         "type": "NONE",
                         "data": "-"
                     }
                 },
                 "free": {
-                    "value": "480M",
+                    "value": "302M",
                     "source": {
                         "type": "NONE",
                         "data": "-"
@@ -50,14 +50,14 @@
                     }
                 },
                 "fragmentation": {
-                    "value": "3%",
+                    "value": "12%",
                     "source": {
                         "type": "NONE",
                         "data": "-"
                     }
                 },
                 "capacity": {
-                    "value": "0%",
+                    "value": "37%",
                     "source": {
                         "type": "NONE",
                         "data": "-"
