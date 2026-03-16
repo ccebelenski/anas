@@ -1,0 +1,90 @@
+{
+    "output_version": {
+        "command": "zpool list",
+        "vers_major": 0,
+        "vers_minor": 1
+    },
+    "pools": {
+        "testpool": {
+            "name": "testpool",
+            "type": "POOL",
+            "state": "ONLINE",
+            "pool_guid": "17089633195827257163",
+            "txg": "28",
+            "spa_version": "5000",
+            "zpl_version": "5",
+            "properties": {
+                "size": {
+                    "value": "480M",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "allocated": {
+                    "value": "140K",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "free": {
+                    "value": "480M",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "checkpoint": {
+                    "value": "-",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "expandsize": {
+                    "value": "-",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "fragmentation": {
+                    "value": "3%",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "capacity": {
+                    "value": "0%",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "dedupratio": {
+                    "value": "1.00x",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "health": {
+                    "value": "ONLINE",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "altroot": {
+                    "value": "-",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,72 @@
+{
+    "json_format_version": [
+        1,
+        0
+    ],
+    "smartctl": {
+        "version": [
+            7,
+            4
+        ],
+        "pre_release": false,
+        "svn_revision": "5620",
+        "platform_info": "x86_64-linux-6.17.13-2-pve",
+        "build_info": "(local build)",
+        "argv": [
+            "smartctl",
+            "-a",
+            "/dev/sdb",
+            "--json"
+        ],
+        "exit_status": 4
+    },
+    "local_time": {
+        "time_t": 1773627197,
+        "asctime": "Mon Mar 16 02:13:17 2026 UTC"
+    },
+    "device": {
+        "name": "/dev/sdb",
+        "info_name": "/dev/sdb",
+        "type": "scsi",
+        "protocol": "SCSI"
+    },
+    "scsi_vendor": "QEMU",
+    "scsi_product": "QEMU HARDDISK",
+    "scsi_model_name": "QEMU QEMU HARDDISK",
+    "scsi_revision": "2.5+",
+    "scsi_version": "SPC-3",
+    "user_capacity": {
+        "blocks": 1048576,
+        "bytes": 536870912
+    },
+    "logical_block_size": 512,
+    "scsi_lb_provisioning": {
+        "name": "thin provisioned",
+        "value": 2,
+        "management_enabled": {
+            "name": "LBPME",
+            "value": -1
+        },
+        "read_zeros": {
+            "name": "LBPRZ",
+            "value": 0
+        }
+    },
+    "rotation_rate": 0,
+    "serial_number": "ANAS_HOT1",
+    "device_type": {
+        "scsi_terminology": "Peripheral Device Type [PDT]",
+        "scsi_value": 0,
+        "name": "disk"
+    },
+    "smart_support": {
+        "available": false
+    },
+    "temperature": {
+        "current": 0,
+        "drive_trip": 0
+    },
+    "seagate_farm_log": {
+        "supported": false
+    }
+}

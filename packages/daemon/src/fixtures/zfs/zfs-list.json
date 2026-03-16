@@ -1,0 +1,45 @@
+{
+    "output_version": {
+        "command": "zfs list",
+        "vers_major": 0,
+        "vers_minor": 1
+    },
+    "datasets": {
+        "testpool": {
+            "name": "testpool",
+            "type": "FILESYSTEM",
+            "pool": "testpool",
+            "createtxg": "1",
+            "properties": {
+                "used": {
+                    "value": "140K",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "available": {
+                    "value": "352M",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "referenced": {
+                    "value": "24K",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "mountpoint": {
+                    "value": "/testpool",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                }
+            }
+        }
+    }
+}
