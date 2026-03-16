@@ -201,7 +201,12 @@ const propertyHelp: Record<string, string> = {
         <div class="topo-group-header">
           <span class="topo-group-desc">{{ groupDescription(group) }}</span>
         </div>
-        <div v-for="vdev in group.vdevs" :key="vdev.name" class="topo-vdev">
+        <div
+          v-for="(vdev, vdevIdx) in group.vdevs"
+          :key="vdev.name"
+          class="topo-vdev"
+          :class="`topo-vdev-color-${vdevIdx % 6}`"
+        >
           <div class="topo-vdev-header">
             <span class="topo-vdev-name">{{ vdev.name }}</span>
             <Tag :value="vdev.type" severity="secondary" />
@@ -374,16 +379,27 @@ const propertyHelp: Record<string, string> = {
 }
 
 .topo-vdev {
-  margin-left: 0.5rem;
   margin-bottom: 0.5rem;
+  border-left: 3px solid #585b70;
+  padding-left: 0.75rem;
+  border-radius: 2px;
+  background: rgba(88, 91, 112, 0.06);
 }
+
+/* Color palette for vdev grouping — border + matching subtle tint */
+.topo-vdev-color-0 { border-left-color: #89b4fa; background: rgba(137, 180, 250, 0.06); }
+.topo-vdev-color-1 { border-left-color: #a6e3a1; background: rgba(166, 227, 161, 0.06); }
+.topo-vdev-color-2 { border-left-color: #f9e2af; background: rgba(249, 226, 175, 0.06); }
+.topo-vdev-color-3 { border-left-color: #cba6f7; background: rgba(203, 166, 247, 0.06); }
+.topo-vdev-color-4 { border-left-color: #f38ba8; background: rgba(243, 139, 168, 0.06); }
+.topo-vdev-color-5 { border-left-color: #94e2d5; background: rgba(148, 226, 213, 0.06); }
 
 .topo-vdev-header {
   display: flex;
   align-items: center;
   gap: 0.5rem;
   font-size: 0.85rem;
-  padding: 0.2rem 0;
+  padding: 0.35rem 0.25rem;
 }
 
 .topo-vdev-name {
@@ -391,7 +407,7 @@ const propertyHelp: Record<string, string> = {
 }
 
 .topo-disks {
-  margin-left: 1rem;
+  margin-left: 0.5rem;
 }
 
 .topo-disk {
@@ -430,7 +446,7 @@ const propertyHelp: Record<string, string> = {
   display: flex;
   align-items: center;
   gap: 0.3rem;
-  margin-left: 3.5rem;
+  margin-left: 4rem;
   font-size: 0.75rem;
   color: #7f849c;
   line-height: 1.4;
