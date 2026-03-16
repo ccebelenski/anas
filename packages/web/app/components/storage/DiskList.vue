@@ -47,11 +47,7 @@ function diskType(rotational: boolean): string {
       </template>
     </Column>
 
-    <Column field="id" header="ID" sortable>
-      <template #body="{ data: disk }">
-        <span style="font-family: monospace; font-size: 0.85em;">{{ disk.id }}</span>
-      </template>
-    </Column>
+    <Column field="id" header="ID" sortable />
 
     <Column field="size" header="Size" sortable>
       <template #body="{ data: disk }">
@@ -67,8 +63,7 @@ function diskType(rotational: boolean): string {
 
     <Column field="serial" header="Serial" sortable>
       <template #body="{ data: disk }">
-        <span v-if="disk.serial" style="font-family: monospace; font-size: 0.85em;">{{ disk.serial }}</span>
-        <span v-else style="color: var(--p-text-muted-color);">-</span>
+        {{ disk.serial ?? '-' }}
       </template>
     </Column>
 

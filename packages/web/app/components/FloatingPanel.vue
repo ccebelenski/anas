@@ -7,34 +7,44 @@ const props = defineProps<{
 }>()
 
 const visible = defineModel<boolean>('visible', { required: true })
+const panelRef = ref<HTMLElement | null>(null)
+
+function close() {
+  visible.value = false
+}
 
 function onClickOutside(e: MouseEvent) {
-  const panel = (e.target as HTMLElement).closest('.floating-panel')
-  if (!panel) {
-    visible.value = false
+  if (!panelRef.value) return
+  // Only close if click is outside THIS panel (not a child panel)
+  if (!panelRef.value.contains(e.target as Node)) {
+    close()
   }
 }
 
 function onKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') {
-    visible.value = false
+    e.stopPropagation()
+    close()
   }
 }
 
 watch(visible, (val) => {
   if (val) {
-    document.addEventListener('mousedown', onClickOutside)
-    document.addEventListener('keydown', onKeydown)
+    // Delay listener registration so the opening click doesn't immediately close
+    nextTick(() => {
+      document.addEventListener('mousedown', onClickOutside)
+      document.addEventListener('keydown', onKeydown, true)
+    })
   }
   else {
     document.removeEventListener('mousedown', onClickOutside)
-    document.removeEventListener('keydown', onKeydown)
+    document.removeEventListener('keydown', onKeydown, true)
   }
 })
 
 onUnmounted(() => {
   document.removeEventListener('mousedown', onClickOutside)
-  document.removeEventListener('keydown', onKeydown)
+  document.removeEventListener('keydown', onKeydown, true)
 })
 </script>
 
@@ -43,12 +53,13 @@ onUnmounted(() => {
     <Transition name="panel">
       <div v-if="visible" class="floating-panel-backdrop">
         <div
+          ref="panelRef"
           class="floating-panel"
           :style="{ width: width ?? '800px', maxWidth: '90vw' }"
         >
           <div class="floating-panel-header">
             <span class="floating-panel-title">{{ title }}</span>
-            <button class="floating-panel-close" @click="visible = false">
+            <button class="floating-panel-close" @click="close">
               <i class="pi pi-times" />
             </button>
           </div>
@@ -69,10 +80,11 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  /* No dimming backdrop — just positioning */
+  pointer-events: none;
 }
 
 .floating-panel {
+  pointer-events: auto;
   background: var(--p-surface-800);
   border: 1px solid var(--p-surface-600);
   border-radius: 8px;

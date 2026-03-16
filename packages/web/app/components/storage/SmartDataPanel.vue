@@ -27,7 +27,7 @@ watch(visible, async (val) => {
       loading.value = false
     }
   }
-})
+}, { immediate: true })
 
 function healthSeverity(health: string): 'success' | 'danger' | 'secondary' {
   switch (health) {
@@ -133,7 +133,7 @@ function formatHours(hours: number | null): string {
 
           <Column field="rawValue" header="Raw" sortable style="width: 7rem; text-align: right;">
             <template #body="{ data: attr }">
-              <span style="font-family: monospace;">{{ attr.rawValue.toLocaleString() }}</span>
+              {{ attr.rawValue.toLocaleString() }}
             </template>
           </Column>
 

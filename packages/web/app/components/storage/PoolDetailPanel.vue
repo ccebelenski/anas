@@ -27,7 +27,7 @@ watch(visible, async (val) => {
       loading.value = false
     }
   }
-})
+}, { immediate: true })
 </script>
 
 <template>
