@@ -4,12 +4,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-DISK_NUM="${1:?Usage: add-disk.sh <1|2|3>}"
-
-if [[ ! "$DISK_NUM" =~ ^[1-3]$ ]]; then
-  echo "ERROR: Disk number must be 1, 2, or 3"
+usage() {
+  echo "Usage: add-disk.sh [--nvme] <1|2|3>"
+  echo "  --nvme  Attach as NVMe device (default: SCSI)"
   exit 1
-fi
+}
+
+BUS="scsi"
+DISK_NUM=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --nvme) BUS="nvme"; shift ;;
+    [1-3])  DISK_NUM="$1"; shift ;;
+    *)      usage ;;
+  esac
+done
+
+[ -z "$DISK_NUM" ] && usage
 
 DISK_PATH="${STORAGE_PATH}/${VM_NAME}-hot${DISK_NUM}.qcow2"
 SERIAL="ANAS_HOT${DISK_NUM}"
@@ -20,17 +32,43 @@ if [ ! -f "$DISK_PATH" ]; then
   qemu-img create -f qcow2 "$DISK_PATH" 512M
 fi
 
-# sda=system, sdb=cdrom, so hot disks start at sdc
-TARGET="sd$(printf "\\x$(printf '%02x' $((98 + DISK_NUM)))")"
+# QEMU runs as 'qemu' user — needs read/write access
+chmod 666 "$DISK_PATH"
 
-echo "Attaching hot${DISK_NUM} to ${VM_NAME} as ${TARGET}..."
-sudo virsh attach-disk "$VM_NAME" \
-  "$DISK_PATH" \
-  "$TARGET" \
-  --driver qemu \
-  --subdriver qcow2 \
-  --targetbus scsi \
-  --serial "$SERIAL" \
-  --live
+if [ "$BUS" = "nvme" ]; then
+  # NVMe requires QEMU device passthrough — libvirt doesn't support
+  # nvme via attach-disk. We add an nvme controller via qemu monitor
+  # commands, plugged into a free pcie-root-port.
+  CTRL_ID="nvme${DISK_NUM}"
+  # Use pci.7, pci.8, pci.9 for nvme disks 1, 2, 3
+  PCI_BUS="pci.$((6 + DISK_NUM))"
 
-echo "✓ hot${DISK_NUM} attached as ${TARGET} (serial: ${SERIAL})"
+  echo "Attaching hot${DISK_NUM} to ${VM_NAME} as NVMe on ${PCI_BUS}..."
+
+  # Add a drive backend
+  sudo virsh qemu-monitor-command "$VM_NAME" --hmp \
+    "drive_add auto \"id=drive-${CTRL_ID},file=${DISK_PATH},format=qcow2,if=none\""
+
+  # Add NVMe controller on a pcie-root-port with serial number
+  sudo virsh qemu-monitor-command "$VM_NAME" --hmp \
+    "device_add nvme,id=${CTRL_ID},drive=drive-${CTRL_ID},serial=${SERIAL},bus=${PCI_BUS}"
+
+  echo "✓ hot${DISK_NUM} attached as NVMe (serial: ${SERIAL})"
+  echo "  Inside VM: /dev/nvme*  (by-id: nvme-${SERIAL}*)"
+else
+  # SCSI: sda=system, sdb=cdrom, so hot disks start at sdc
+  TARGET="sd$(printf "\\x$(printf '%02x' $((98 + DISK_NUM)))")"
+
+  echo "Attaching hot${DISK_NUM} to ${VM_NAME} as ${TARGET} (SCSI)..."
+  sudo virsh attach-disk "$VM_NAME" \
+    "$DISK_PATH" \
+    "$TARGET" \
+    --driver qemu \
+    --subdriver qcow2 \
+    --targetbus scsi \
+    --serial "$SERIAL" \
+    --live
+
+  echo "✓ hot${DISK_NUM} attached as ${TARGET} (serial: ${SERIAL})"
+  echo "  Inside VM: /dev/${TARGET}  (by-id: scsi-0QEMU_QEMU_HARDDISK_${SERIAL})"
+fi
