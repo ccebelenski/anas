@@ -7,6 +7,7 @@ import { mockFixtures } from './fixtures/loader.js'
 import { JobQueue } from './jobs/queue.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
+import { diskRoutes } from './routes/disks.js'
 import { poolRoutes } from './routes/pools.js'
 
 export interface ServerOptions {
@@ -30,11 +31,16 @@ export function createServer(opts?: ServerOptions) {
     const mock = executor as MockExecutor
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-j'], result: mockFixtures.zpoolStatus() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', 'all', '-j'], result: mockFixtures.zpoolGetAll('testpool') })
+    mock.addFixture({ command: '/usr/bin/lsblk', args: ['-Jb'], result: mockFixtures.lsblk() })
+    mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    mock.addFixture({ command: '/usr/sbin/smartctl', result: mockFixtures.smartctl() })
   }
 
   server.register(healthRoutes, { prefix: '/v1' })
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
   server.register(poolRoutes, { prefix: '/v1', executor })
+  server.register(diskRoutes, { prefix: '/v1', executor })
 
   server.decorate('jobQueue', jobQueue)
   server.decorate('executor', executor)

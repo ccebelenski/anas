@@ -65,10 +65,7 @@ const sidebarItems = [
     <!-- Floating panels — self-contained, fetch their own data -->
     <StoragePoolListPanel v-model:visible="showPools" />
 
-    <!-- Placeholders for future panels -->
-    <FloatingPanel v-model:visible="showDisks" title="Disks">
-      <p style="color: var(--p-text-muted-color);">Disk list coming soon.</p>
-    </FloatingPanel>
+    <StorageDiskListPanel v-model:visible="showDisks" />
     <FloatingPanel v-model:visible="showSmb" title="SMB Shares">
       <p style="color: var(--p-text-muted-color);">SMB shares coming soon.</p>
     </FloatingPanel>
