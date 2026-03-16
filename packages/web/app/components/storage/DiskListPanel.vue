@@ -34,7 +34,7 @@ function showSmart(diskId: string) {
 </script>
 
 <template>
-  <FloatingPanel v-model:visible="visible" title="Disks" width="1000px">
+  <FloatingPanel v-model:visible="visible" title="Disks">
     <Message v-if="error" severity="error" :closable="false">
       {{ error }}
     </Message>
@@ -44,11 +44,11 @@ function showSmart(diskId: string) {
     </div>
 
     <StorageDiskList v-else :disks="disks" @show-smart="showSmart" />
-
-    <StorageSmartDataPanel
-      v-if="smartDiskId"
-      v-model:visible="smartVisible"
-      :disk-id="smartDiskId"
-    />
   </FloatingPanel>
+
+  <StorageSmartDataPanel
+    v-if="smartDiskId"
+    v-model:visible="smartVisible"
+    :disk-id="smartDiskId"
+  />
 </template>

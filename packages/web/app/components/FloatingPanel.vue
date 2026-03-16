@@ -1,9 +1,7 @@
 <script setup lang="ts">
-const props = defineProps<{
+defineProps<{
   /** Panel title shown in the header bar */
   title: string
-  /** Width of the panel (CSS value) */
-  width?: string
 }>()
 
 const visible = defineModel<boolean>('visible', { required: true })
@@ -14,11 +12,10 @@ function close() {
 }
 
 function onClickOutside(e: MouseEvent) {
-  if (!panelRef.value) return
-  // Only close if click is outside THIS panel (not a child panel)
-  if (!panelRef.value.contains(e.target as Node)) {
-    close()
-  }
+  const target = e.target as HTMLElement
+  // Don't close if click landed on ANY floating panel (including child panels)
+  if (target.closest('.floating-panel')) return
+  close()
 }
 
 function onKeydown(e: KeyboardEvent) {
@@ -30,7 +27,6 @@ function onKeydown(e: KeyboardEvent) {
 
 watch(visible, (val) => {
   if (val) {
-    // Delay listener registration so the opening click doesn't immediately close
     nextTick(() => {
       document.addEventListener('mousedown', onClickOutside)
       document.addEventListener('keydown', onKeydown, true)
@@ -55,7 +51,6 @@ onUnmounted(() => {
         <div
           ref="panelRef"
           class="floating-panel"
-          :style="{ width: width ?? '800px', maxWidth: '90vw' }"
         >
           <div class="floating-panel-header">
             <span class="floating-panel-title">{{ title }}</span>
@@ -90,6 +85,8 @@ onUnmounted(() => {
   border-radius: 8px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
   max-height: 80vh;
+  width: 90vw;
+  max-width: 1000px;
   display: flex;
   flex-direction: column;
 }
