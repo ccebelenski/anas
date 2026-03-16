@@ -53,29 +53,34 @@ function usageColor(pct: number): string {
 }
 
 /** Describe redundancy for a vdev group */
-function redundancyDescription(group: VdevGroup): string {
+/** Pool-level description for a vdev group */
+function groupDescription(group: VdevGroup): string {
   if (group.role === 'spare') {
-    const avail = group.vdevs[0]?.disks.filter(d => d.state === 'AVAIL').length ?? 0
-    const inuse = group.vdevs[0]?.disks.filter(d => d.state === 'INUSE').length ?? 0
-    if (inuse > 0) return `${inuse} spare active, ${avail} standing by`
-    return `${avail} spare${avail !== 1 ? 's' : ''} standing by`
+    const allDisks = group.vdevs.flatMap(v => v.disks)
+    const avail = allDisks.filter(d => d.state === 'AVAIL').length
+    const inuse = allDisks.filter(d => d.state === 'INUSE').length
+    if (inuse > 0) return `Spares — ${inuse} active, ${avail} standing by`
+    return `Spares — ${avail} standing by`
   }
-  if (group.role === 'cache') return 'L2ARC read cache'
-  if (group.role === 'log') return 'ZIL write log'
-  if (group.role === 'special') return 'Metadata / small blocks'
-  if (group.role === 'dedup') return 'Dedup table'
+  if (group.role === 'cache') return 'Cache — L2ARC read cache'
+  if (group.role === 'log') return 'Log — ZIL write log'
+  if (group.role === 'special') return 'Special — metadata / small blocks'
+  if (group.role === 'dedup') return 'Dedup — dedup table'
 
-  // Data vdevs — describe redundancy per vdev type
-  const vdev = group.vdevs[0]
-  if (!vdev) return 'Data'
-  const type = vdev.type
-  const diskCount = vdev.disks.length
-  if (type === 'mirror') return `Mirror — can survive ${diskCount - 1} disk failure${diskCount > 2 ? 's' : ''}`
-  if (type === 'raidz') return 'RAIDZ1 — can survive 1 disk failure'
-  if (type === 'raidz2') return 'RAIDZ2 — can survive 2 disk failures'
-  if (type === 'raidz3') return 'RAIDZ3 — can survive 3 disk failures'
-  if (type === 'disk') return 'Stripe — no redundancy'
-  return `${type}`
+  const n = group.vdevs.length
+  if (n === 1) return 'Data — 1 vdev'
+  return `Data — ${n} vdevs, striped (pool requires all vdevs)`
+}
+
+/** Per-vdev redundancy description */
+function vdevRedundancy(vdev: Vdev): string {
+  const n = vdev.disks.length
+  if (vdev.type === 'mirror') return `survives ${n - 1} disk failure${n > 2 ? 's' : ''}`
+  if (vdev.type === 'raidz') return 'survives 1 disk failure'
+  if (vdev.type === 'raidz2') return 'survives 2 disk failures'
+  if (vdev.type === 'raidz3') return 'survives 3 disk failures'
+  if (vdev.type === 'disk') return 'no redundancy'
+  return ''
 }
 
 const propertyHelp: Record<string, string> = {
@@ -186,14 +191,14 @@ const propertyHelp: Record<string, string> = {
       <h3>Topology</h3>
       <div v-for="group in pool.vdevGroups" :key="group.role" class="topo-group">
         <div class="topo-group-header">
-          <span class="topo-redundancy">{{ redundancyDescription(group) }}</span>
-          <Tag v-if="group.role !== 'data'" :value="group.role" severity="secondary" />
+          <span class="topo-group-desc">{{ groupDescription(group) }}</span>
         </div>
         <div v-for="vdev in group.vdevs" :key="vdev.name" class="topo-vdev">
           <div class="topo-vdev-header">
             <span class="topo-vdev-name">{{ vdev.name }}</span>
             <Tag :value="vdev.type" severity="secondary" />
             <Tag :value="vdev.state" :severity="stateSeverity(vdev.state)" />
+            <span v-if="vdevRedundancy(vdev)" class="topo-vdev-redundancy">{{ vdevRedundancy(vdev) }}</span>
           </div>
           <div class="topo-disks">
             <div
@@ -328,13 +333,19 @@ const propertyHelp: Record<string, string> = {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.35rem;
 }
 
-.topo-redundancy {
+.topo-group-desc {
   font-size: 0.85rem;
   font-weight: 600;
   color: #cdd6f4;
+}
+
+.topo-vdev-redundancy {
+  font-size: 0.75rem;
+  color: #a6adc8;
+  font-style: italic;
 }
 
 .topo-vdev {
