@@ -1,8 +1,9 @@
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
-import type { PoolSummary } from '@anas/shared'
+import type { PoolDetail, PoolSummary } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { parseZpoolStatus } from '../parsers/zpool-status.js'
+import { parseZpoolGet } from '../parsers/zpool-get.js'
+import { parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
 
 export async function poolRoutes(
   server: FastifyInstance,
@@ -41,5 +42,60 @@ export async function poolRoutes(
     })
 
     return { data: pools }
+  })
+
+  server.get<{ Params: { name: string } }>('/pools/:name', async (request, reply) => {
+    const poolName = request.params.name
+
+    const [statusResult, listResult, getResult] = await Promise.all([
+      executor.exec('/usr/sbin/zpool', ['status', '-j']),
+      executor.exec('/usr/sbin/zpool', ['list', '-j']),
+      executor.exec('/usr/sbin/zpool', ['get', 'all', '-j']),
+    ])
+
+    // Parse status for this specific pool
+    const status = statusResult.exitCode === 0
+      ? parseZpoolStatusPool(statusResult.stdout, poolName)
+      : null
+
+    if (!status) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    // Parse list data and find this pool
+    const listData = listResult.exitCode === 0
+      ? parseZpoolList(listResult.stdout)
+      : []
+    const listPool = listData.find(p => p.name === poolName)
+
+    // Parse properties
+    const properties = getResult.exitCode === 0
+      ? parseZpoolGet(getResult.stdout, poolName)
+      : null
+
+    if (!listPool || !properties) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    const detail: PoolDetail = {
+      name: poolName,
+      state: status.state,
+      guid: status.guid,
+      size: listPool.size,
+      allocated: listPool.allocated,
+      free: listPool.free,
+      fragmentation: listPool.fragmentation,
+      capacity: listPool.capacity,
+      dedupRatio: listPool.dedupRatio,
+      ...(status.health && { health: status.health }),
+      errorCount: status.errorCount,
+      vdevGroups: status.vdevGroups,
+      scan: status.scan,
+      properties,
+    }
+
+    return { data: detail }
   })
 }

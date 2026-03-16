@@ -7,6 +7,9 @@ const pools = ref<PoolSummary[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
 
+const selectedPool = ref('')
+const showDetail = ref(false)
+
 watch(visible, async (val) => {
   if (val) {
     loading.value = true
@@ -23,6 +26,11 @@ watch(visible, async (val) => {
     }
   }
 })
+
+function onSelectPool(name: string) {
+  selectedPool.value = name
+  showDetail.value = true
+}
 </script>
 
 <template>
@@ -35,6 +43,12 @@ watch(visible, async (val) => {
       <ProgressSpinner />
     </div>
 
-    <StoragePoolList v-else :pools="pools" />
+    <StoragePoolList v-else :pools="pools" @select-pool="onSelectPool" />
   </FloatingPanel>
+
+  <StoragePoolDetailPanel
+    v-if="selectedPool"
+    v-model:visible="showDetail"
+    :pool-name="selectedPool"
+  />
 </template>

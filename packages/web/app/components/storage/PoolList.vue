@@ -6,6 +6,10 @@ defineProps<{
   pools: PoolSummary[]
 }>()
 
+const emit = defineEmits<{
+  selectPool: [name: string]
+}>()
+
 function stateSeverity(state: string): 'success' | 'warn' | 'danger' | 'secondary' {
   switch (state) {
     case 'ONLINE': return 'success'
@@ -26,7 +30,10 @@ function stateSeverity(state: string): 'success' | 'warn' | 'danger' | 'secondar
   >
     <Column field="name" header="Name" sortable>
       <template #body="{ data: pool }">
-        <strong>{{ pool.name }}</strong>
+        <strong
+          class="pool-name-link"
+          @click="emit('selectPool', pool.name)"
+        >{{ pool.name }}</strong>
       </template>
     </Column>
 
@@ -92,3 +99,15 @@ function stateSeverity(state: string): 'success' | 'warn' | 'danger' | 'secondar
     </template>
   </DataTable>
 </template>
+
+<style scoped>
+.pool-name-link {
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.pool-name-link:hover {
+  text-decoration: underline;
+  color: var(--p-primary-color);
+}
+</style>
