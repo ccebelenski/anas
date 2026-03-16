@@ -5,7 +5,6 @@ defineProps<{
 }>()
 
 const visible = defineModel<boolean>('visible', { required: true })
-const panelRef = ref<HTMLElement | null>(null)
 
 function close() {
   visible.value = false
@@ -13,7 +12,6 @@ function close() {
 
 function onClickOutside(e: MouseEvent) {
   const target = e.target as HTMLElement
-  // Don't close if click landed on ANY floating panel (including child panels)
   if (target.closest('.floating-panel')) return
   close()
 }
@@ -48,13 +46,10 @@ onUnmounted(() => {
   <Teleport to="body">
     <Transition name="panel">
       <div v-if="visible" class="floating-panel-backdrop">
-        <div
-          ref="panelRef"
-          class="floating-panel"
-        >
+        <div class="floating-panel">
           <div class="floating-panel-header">
             <span class="floating-panel-title">{{ title }}</span>
-            <button class="floating-panel-close" @click="close">
+            <button class="floating-panel-close" @click="close" aria-label="Close">
               <i class="pi pi-times" />
             </button>
           </div>
@@ -80,13 +75,12 @@ onUnmounted(() => {
 
 .floating-panel {
   pointer-events: auto;
-  background: var(--p-surface-800);
+  background: var(--p-surface-900);
   border: 1px solid var(--p-surface-600);
   border-radius: 8px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
   max-height: 80vh;
-  width: 90vw;
-  max-width: 1000px;
+  width: min(90vw, 1000px);
   display: flex;
   flex-direction: column;
 }
@@ -95,9 +89,11 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.75rem 1rem;
-  border-bottom: 1px solid var(--p-surface-600);
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--p-surface-700);
   flex-shrink: 0;
+  background: var(--p-surface-800);
+  border-radius: 8px 8px 0 0;
 }
 
 .floating-panel-title {
@@ -111,25 +107,25 @@ onUnmounted(() => {
   border: none;
   color: var(--p-text-muted-color);
   cursor: pointer;
-  padding: 0.25rem;
+  padding: 0.35rem;
   border-radius: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
+  font-size: 1rem;
 }
 
 .floating-panel-close:hover {
   color: var(--p-text-color);
-  background: var(--p-surface-700);
+  background: var(--p-surface-600);
 }
 
 .floating-panel-body {
-  padding: 0.75rem 1rem;
-  overflow-y: auto;
+  padding: 1rem;
+  overflow: auto;
   flex: 1;
 }
 
-/* Transition */
 .panel-enter-active,
 .panel-leave-active {
   transition: opacity 0.15s ease, transform 0.15s ease;

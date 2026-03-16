@@ -5,79 +5,49 @@ const showSmb = ref(false)
 const showNfs = ref(false)
 const showUsers = ref(false)
 const showJobs = ref(false)
-
-interface SidebarItem {
-  label: string
-  icon: string
-  action?: () => void
-  children?: SidebarItem[]
-}
-
-const sidebarItems: SidebarItem[] = [
-  {
-    label: 'Dashboard',
-    icon: 'pi pi-home',
-    action: () => navigateTo('/'),
-  },
-  {
-    label: 'Storage',
-    icon: 'pi pi-database',
-    children: [
-      { label: 'Pools', icon: 'pi pi-server', action: () => { showPools.value = true } },
-      { label: 'Disks', icon: 'pi pi-circle', action: () => { showDisks.value = true } },
-    ],
-  },
-  {
-    label: 'Shares',
-    icon: 'pi pi-share-alt',
-    children: [
-      { label: 'SMB', icon: 'pi pi-folder', action: () => { showSmb.value = true } },
-      { label: 'NFS', icon: 'pi pi-folder-open', action: () => { showNfs.value = true } },
-    ],
-  },
-  {
-    label: 'Users & Groups',
-    icon: 'pi pi-users',
-    action: () => { showUsers.value = true },
-  },
-  {
-    label: 'Jobs',
-    icon: 'pi pi-list-check',
-    action: () => { showJobs.value = true },
-  },
-]
 </script>
 
 <template>
   <div class="app-layout">
+    <ClientOnly>
     <aside class="app-sidebar">
       <div class="app-sidebar-header">
         <h2>ANAS</h2>
       </div>
       <nav class="app-nav">
-        <template v-for="item in sidebarItems" :key="item.label">
-          <button v-if="!item.children" class="nav-item" @click="item.action?.()">
-            <i :class="item.icon" />
-            <span>{{ item.label }}</span>
+        <button class="nav-item" @click="navigateTo('/')">
+          <i class="pi pi-home" /><span>Dashboard</span>
+        </button>
+
+        <div class="nav-group">
+          <div class="nav-group-label"><i class="pi pi-database" /><span>Storage</span></div>
+          <button class="nav-item nav-child" @click="showPools = true">
+            <i class="pi pi-server" /><span>Pools</span>
           </button>
-          <div v-else class="nav-group">
-            <div class="nav-group-label">
-              <i :class="item.icon" />
-              <span>{{ item.label }}</span>
-            </div>
-            <button
-              v-for="child in item.children"
-              :key="child.label"
-              class="nav-item nav-child"
-              @click="child.action?.()"
-            >
-              <i :class="child.icon" />
-              <span>{{ child.label }}</span>
-            </button>
-          </div>
-        </template>
+          <button class="nav-item nav-child" @click="showDisks = true">
+            <i class="pi pi-circle" /><span>Disks</span>
+          </button>
+        </div>
+
+        <div class="nav-group">
+          <div class="nav-group-label"><i class="pi pi-share-alt" /><span>Shares</span></div>
+          <button class="nav-item nav-child" @click="showSmb = true">
+            <i class="pi pi-folder" /><span>SMB</span>
+          </button>
+          <button class="nav-item nav-child" @click="showNfs = true">
+            <i class="pi pi-folder-open" /><span>NFS</span>
+          </button>
+        </div>
+
+        <button class="nav-item" @click="showUsers = true">
+          <i class="pi pi-users" /><span>Users & Groups</span>
+        </button>
+        <button class="nav-item" @click="showJobs = true">
+          <i class="pi pi-list-check" /><span>Jobs</span>
+        </button>
       </nav>
     </aside>
+    </ClientOnly>
 
     <div class="app-main">
       <header class="app-header">
