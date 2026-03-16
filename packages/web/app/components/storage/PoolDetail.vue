@@ -134,8 +134,12 @@ const propertyHelp: Record<string, string> = {
           <span>{{ formatDate(pool.scan.finishedAt) }}</span>
         </div>
         <div class="kv-row">
-          <span class="kv-key" v-tooltip.right="'Data errors found during scan. Use zpool status -v for details.'">Errors</span>
+          <span class="kv-key" v-tooltip.right="'Data errors found during scan'">Errors</span>
           <span :class="pool.scan.errors > 0 ? 'text-error' : ''">{{ pool.scan.errors }}</span>
+        </div>
+        <div v-if="pool.errorDetail" class="error-detail">
+          <i class="pi pi-exclamation-circle" />
+          {{ pool.errorDetail }}
         </div>
       </div>
       <p v-else class="text-muted">No scan history</p>
@@ -339,6 +343,20 @@ const propertyHelp: Record<string, string> = {
   grid-template-columns: auto 1fr;
   gap: 0.2rem 1.5rem;
   font-size: 0.85rem;
+}
+
+.error-detail {
+  margin-top: 0.35rem;
+  padding: 0.5rem 0.75rem;
+  background: rgba(243, 139, 168, 0.1);
+  border: 1px solid rgba(243, 139, 168, 0.3);
+  border-radius: 4px;
+  color: #f38ba8;
+  font-size: 0.8rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  white-space: pre-wrap;
 }
 
 .text-muted { color: #bac2de; font-style: italic; font-size: 0.85rem; }

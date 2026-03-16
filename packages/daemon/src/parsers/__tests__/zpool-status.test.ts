@@ -102,6 +102,14 @@ describe('parseZpoolStatus', () => {
     assert.ok(disk1.readErrors > 0 || disk1.writeErrors > 0)
   })
 
+  it('parses verbose (-v) error details', () => {
+    const result = parseZpoolStatus(loadFixture('zpool-status-suspended-verbose.json'))
+    const pool = result[0]
+    assert.equal(pool.errorCount, 4)
+    assert.ok(pool.errorDetail)
+    assert.ok(pool.errorDetail.length > 0)
+  })
+
   it('parses ONLINE raidz pool', () => {
     const result = parseZpoolStatus(loadFixture('zpool-status-raidz.json'))
     const pool = result[0]

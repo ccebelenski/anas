@@ -30,7 +30,7 @@ export function createServer(opts?: ServerOptions) {
   if (opts?.mock) {
     const mock = executor as MockExecutor
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
-    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-j'], result: mockFixtures.zpoolStatus() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', 'all', '-j'], result: mockFixtures.zpoolGetAll('testpool') })
     mock.addFixture({ command: '/usr/bin/lsblk', args: ['-Jb'], result: mockFixtures.lsblk() })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })

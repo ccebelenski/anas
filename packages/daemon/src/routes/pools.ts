@@ -14,7 +14,7 @@ export async function poolRoutes(
   server.get('/pools', async (_request, reply) => {
     const [listResult, statusResult] = await Promise.all([
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
-      executor.exec('/usr/sbin/zpool', ['status', '-j']),
+      executor.exec('/usr/sbin/zpool', ['status', '-jv']),
     ])
 
     // If no pools exist, zpool list exits non-zero with no stdout
@@ -48,7 +48,7 @@ export async function poolRoutes(
     const poolName = request.params.name
 
     const [statusResult, listResult, getResult] = await Promise.all([
-      executor.exec('/usr/sbin/zpool', ['status', '-j']),
+      executor.exec('/usr/sbin/zpool', ['status', '-jv']),
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
       executor.exec('/usr/sbin/zpool', ['get', 'all', '-j']),
     ])
@@ -91,6 +91,7 @@ export async function poolRoutes(
       dedupRatio: listPool.dedupRatio,
       ...(status.health && { health: status.health }),
       errorCount: status.errorCount,
+      ...(status.errorDetail && { errorDetail: status.errorDetail }),
       vdevGroups: status.vdevGroups,
       scan: status.scan,
       properties,

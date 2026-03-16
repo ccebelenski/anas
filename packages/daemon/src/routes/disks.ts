@@ -16,7 +16,7 @@ export async function diskRoutes(
     const [lsblkResult, byIdResult, statusResult] = await Promise.all([
       executor.exec('/usr/bin/lsblk', ['-Jb']),
       executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
-      executor.exec('/usr/sbin/zpool', ['status', '-j']),
+      executor.exec('/usr/sbin/zpool', ['status', '-jv']),
     ])
 
     const byIdMap = parseDiskByIdListing(byIdResult.stdout)

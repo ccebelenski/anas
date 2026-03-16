@@ -46,6 +46,8 @@ interface ZfsPoolStatusRaw {
   scan_stats?: ZfsScanStatsRaw
   vdevs: Record<string, ZfsVdevRaw>
   error_count: string
+  /** Present with -v flag when there are data errors */
+  errlist?: string
 }
 
 interface ZpoolStatusOutput {
@@ -57,13 +59,15 @@ export interface ParsedPoolStatus {
   state: PoolState
   guid: string
   errorCount: number
+  /** Error details from -v flag (file list or error message) */
+  errorDetail?: string
   vdevGroups: VdevGroup[]
   scan: ScanStatus | null
   health?: PoolHealthMessage
 }
 
 /**
- * Parse `zpool status -j` JSON output for all pools.
+ * Parse `zpool status -jv` JSON output for all pools.
  */
 export function parseZpoolStatus(json: string | ZpoolStatusOutput): ParsedPoolStatus[] {
   const data: ZpoolStatusOutput = typeof json === 'string' ? JSON.parse(json) : json
@@ -71,7 +75,7 @@ export function parseZpoolStatus(json: string | ZpoolStatusOutput): ParsedPoolSt
 }
 
 /**
- * Parse a single pool from `zpool status -j` output.
+ * Parse a single pool from `zpool status -jv` output.
  */
 export function parseZpoolStatusPool(json: string | ZpoolStatusOutput, poolName: string): ParsedPoolStatus | null {
   const data: ZpoolStatusOutput = typeof json === 'string' ? JSON.parse(json) : json
@@ -86,6 +90,7 @@ function parsePool(pool: ZfsPoolStatusRaw): ParsedPoolStatus {
     state: pool.state as PoolState,
     guid: pool.pool_guid,
     errorCount: parseIntOrZero(pool.error_count),
+    ...(pool.errlist && { errorDetail: pool.errlist }),
     vdevGroups: [],
     scan: pool.scan_stats ? parseScanStats(pool.scan_stats) : null,
   }

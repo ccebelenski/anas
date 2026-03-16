@@ -186,6 +186,8 @@ export const PoolDetail = z.object({
   health: PoolHealthMessage.optional(),
   /** Total error count for the pool */
   errorCount: z.number().int().nonnegative(),
+  /** Error details from zpool status -v (file list or error message) */
+  errorDetail: z.string().optional(),
   /** Vdevs grouped by role */
   vdevGroups: z.array(VdevGroup),
   /** Last or current scan status, null if no scan has ever run */
