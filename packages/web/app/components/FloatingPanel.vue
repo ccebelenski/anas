@@ -235,4 +235,9 @@ onUnmounted(() => {
 .fp-body .p-datatable {
   background: transparent;
 }
+
+/* Ensure PrimeVue tooltips appear above floating panels */
+.p-tooltip {
+  z-index: 9999 !important;
+}
 </style>

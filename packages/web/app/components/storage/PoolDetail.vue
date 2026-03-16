@@ -80,11 +80,20 @@ const propertyHelp: Record<string, string> = {
     </div>
 
     <!-- Usage bar -->
-    <div class="usage-bar" v-tooltip.bottom="`${pool.capacity}% used`">
-      <div
-        class="usage-fill"
-        :style="{ width: Math.max(pool.capacity, 1) + '%', background: usageColor(pool.capacity) }"
-      />
+    <div class="usage-bar-wrap" v-tooltip.bottom="`${pool.capacity}% used — ${formatBytes(pool.allocated)} of ${formatBytes(pool.size)}`">
+      <div class="usage-bar">
+        <div
+          class="usage-fill"
+          :style="{ width: Math.max(pool.capacity, 1) + '%', background: usageColor(pool.capacity) }"
+        />
+      </div>
+      <div class="usage-markers">
+        <span>0%</span>
+        <span>25%</span>
+        <span>50%</span>
+        <span>75%</span>
+        <span>100%</span>
+      </div>
     </div>
 
     <!-- Scan -->
@@ -225,20 +234,31 @@ const propertyHelp: Record<string, string> = {
 .stat-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #bac2de; margin-top: 0.1rem; }
 
 /* Usage bar */
+.usage-bar-wrap {
+  cursor: help;
+}
+
 .usage-bar {
-  height: 6px;
+  height: 12px;
   background: #313244;
   border-radius: 0 0 6px 6px;
   overflow: hidden;
   border: 1px solid #313244;
   border-top: none;
-  cursor: help;
 }
 
 .usage-fill {
   height: 100%;
   border-radius: 0 0 0 6px;
   transition: width 0.3s ease;
+}
+
+.usage-markers {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.6rem;
+  color: #6c7086;
+  padding: 0.15rem 0.1rem 0;
 }
 
 /* Sections */
