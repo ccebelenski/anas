@@ -34,7 +34,7 @@ function onSelectPool(name: string) {
 </script>
 
 <template>
-  <FloatingPanel v-model:visible="visible" title="Storage Pools">
+  <FloatingPanel v-model:visible="visible" panel-id="pool-list" title="Storage Pools">
     <Message v-if="error" severity="error" :closable="false">
       {{ error }}
     </Message>

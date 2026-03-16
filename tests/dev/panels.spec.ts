@@ -1,9 +1,8 @@
 import { test, expect, type Page } from '@playwright/test'
 
-/** Wait for the app to fully hydrate by checking the sidebar is interactive */
 async function waitForApp(page: Page) {
   await page.goto('/')
-  await page.locator('button.nav-child', { hasText: 'Pools' }).waitFor({ state: 'visible' })
+  await page.locator('[data-nav="pools"]').waitFor({ state: 'visible' })
 }
 
 test.describe('Floating Panels', () => {
@@ -11,71 +10,69 @@ test.describe('Floating Panels', () => {
   test('pool list panel opens and closes with X', async ({ page }) => {
     await waitForApp(page)
 
-    await page.locator('button.nav-child', { hasText: 'Pools' }).click()
-    const panel = page.locator('.floating-panel').first()
+    await page.locator('[data-nav="pools"]').click()
+    const panel = page.locator('[data-panel-id="pool-list"]')
     await expect(panel).toBeVisible()
-    await expect(panel.getByText('testpool')).toBeVisible()
 
-    await panel.locator('.floating-panel-close').click()
-    await expect(page.locator('.floating-panel')).toHaveCount(0)
+    await panel.locator('[data-close-panel="pool-list"]').click()
+    await expect(panel).not.toBeVisible()
   })
 
   test('pool detail opens when clicking pool name', async ({ page }) => {
     await waitForApp(page)
 
-    await page.locator('button.nav-child', { hasText: 'Pools' }).click()
-    const poolPanel = page.locator('.floating-panel').first()
-    await expect(poolPanel).toBeVisible()
+    await page.locator('[data-nav="pools"]').click()
+    await expect(page.locator('[data-panel-id="pool-list"]')).toBeVisible()
 
-    await poolPanel.getByText('testpool').first().click()
-    await page.locator('.floating-panel').nth(1).waitFor({ state: 'visible' })
+    await page.locator('[data-panel-id="pool-list"]').getByText('testpool').first().click()
+    const detail = page.locator('[data-panel-id="pool-detail-testpool"]')
+    await expect(detail).toBeVisible()
 
     await page.screenshot({ path: '/tmp/panel-detail-opened.png' })
-    expect(await page.locator('.floating-panel').count()).toBe(2)
-
-    const detailPanel = page.locator('.floating-panel').nth(1)
-    await expect(detailPanel.getByText('mirror-0')).toBeVisible()
+    await expect(detail.getByText('mirror-0')).toBeVisible()
   })
 
   test('Escape closes topmost panel only', async ({ page }) => {
     await waitForApp(page)
 
-    await page.locator('button.nav-child', { hasText: 'Pools' }).click()
-    await expect(page.locator('.floating-panel').first()).toBeVisible()
+    await page.locator('[data-nav="pools"]').click()
+    await expect(page.locator('[data-panel-id="pool-list"]')).toBeVisible()
 
-    await page.locator('.floating-panel').first().getByText('testpool').first().click()
-    await page.locator('.floating-panel').nth(1).waitFor({ state: 'visible' })
-    expect(await page.locator('.floating-panel').count()).toBe(2)
+    await page.locator('[data-panel-id="pool-list"]').getByText('testpool').first().click()
+    await expect(page.locator('[data-panel-id="pool-detail-testpool"]')).toBeVisible()
 
+    // Escape closes detail, pool list stays
     await page.keyboard.press('Escape')
     await page.waitForTimeout(300)
+    await expect(page.locator('[data-panel-id="pool-detail-testpool"]')).not.toBeVisible()
+    await expect(page.locator('[data-panel-id="pool-list"]')).toBeVisible()
 
     await page.screenshot({ path: '/tmp/panel-after-escape.png' })
-    expect(await page.locator('.floating-panel').count()).toBe(1)
   })
 
   test('click outside closes panel', async ({ page }) => {
     await waitForApp(page)
 
-    await page.locator('button.nav-child', { hasText: 'Pools' }).click()
-    await expect(page.locator('.floating-panel').first()).toBeVisible()
+    await page.locator('[data-nav="pools"]').click()
+    await expect(page.locator('[data-panel-id="pool-list"]')).toBeVisible()
 
-    const content = page.locator('.app-content')
+    // Click bottom-right of content area
+    const content = page.locator('[data-region="content"]')
     const box = await content.boundingBox()
     if (box) {
       await page.mouse.click(box.x + box.width - 50, box.y + box.height - 50)
     }
     await page.waitForTimeout(300)
 
+    await expect(page.locator('[data-panel-id="pool-list"]')).not.toBeVisible()
     await page.screenshot({ path: '/tmp/panel-after-outside.png' })
-    await expect(page.locator('.floating-panel')).toHaveCount(0)
   })
 
   test('disk panel opens with data', async ({ page }) => {
     await waitForApp(page)
 
-    await page.locator('button.nav-child', { hasText: 'Disks' }).click()
-    const panel = page.locator('.floating-panel').first()
+    await page.locator('[data-nav="disks"]').click()
+    const panel = page.locator('[data-panel-id="disk-list"]')
     await expect(panel).toBeVisible()
 
     await page.screenshot({ path: '/tmp/panel-disks.png' })

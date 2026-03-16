@@ -31,7 +31,7 @@ watch(visible, async (val) => {
 </script>
 
 <template>
-  <FloatingPanel v-model:visible="visible" :title="poolName">
+  <FloatingPanel v-model:visible="visible" :panel-id="`pool-detail-${poolName}`" :title="poolName">
     <Message v-if="error" severity="error" :closable="false">
       {{ error }}
     </Message>

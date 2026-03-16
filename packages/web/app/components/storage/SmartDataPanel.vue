@@ -46,7 +46,7 @@ function formatHours(hours: number | null): string {
 </script>
 
 <template>
-  <FloatingPanel v-model:visible="visible" :title="`SMART \u2014 ${diskId}`">
+  <FloatingPanel v-model:visible="visible" :panel-id="`smart-${diskId}`" :title="`SMART \u2014 ${diskId}`">
     <Message v-if="error" severity="error" :closable="false">
       {{ error }}
     </Message>

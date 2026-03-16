@@ -34,7 +34,7 @@ function showSmart(diskId: string) {
 </script>
 
 <template>
-  <FloatingPanel v-model:visible="visible" title="Disks">
+  <FloatingPanel v-model:visible="visible" panel-id="disk-list" title="Disks">
     <Message v-if="error" severity="error" :closable="false">
       {{ error }}
     </Message>

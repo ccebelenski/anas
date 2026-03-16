@@ -10,39 +10,39 @@ const showJobs = ref(false)
 <template>
   <div class="app-layout">
     <ClientOnly>
-    <aside class="app-sidebar">
+    <aside class="app-sidebar" data-region="sidebar">
       <div class="app-sidebar-header">
         <h2>ANAS</h2>
       </div>
       <nav class="app-nav">
-        <button class="nav-item" @click="navigateTo('/')">
+        <button data-nav="dashboard" class="nav-item" @click="navigateTo('/')">
           <i class="pi pi-home" /><span>Dashboard</span>
         </button>
 
         <div class="nav-group">
           <div class="nav-group-label"><i class="pi pi-database" /><span>Storage</span></div>
-          <button class="nav-item nav-child" @click="showPools = true">
+          <button data-nav="pools" class="nav-item nav-child" @click="showPools = true">
             <i class="pi pi-server" /><span>Pools</span>
           </button>
-          <button class="nav-item nav-child" @click="showDisks = true">
+          <button data-nav="disks" class="nav-item nav-child" @click="showDisks = true">
             <i class="pi pi-circle" /><span>Disks</span>
           </button>
         </div>
 
         <div class="nav-group">
           <div class="nav-group-label"><i class="pi pi-share-alt" /><span>Shares</span></div>
-          <button class="nav-item nav-child" @click="showSmb = true">
+          <button data-nav="smb" class="nav-item nav-child" @click="showSmb = true">
             <i class="pi pi-folder" /><span>SMB</span>
           </button>
-          <button class="nav-item nav-child" @click="showNfs = true">
+          <button data-nav="nfs" class="nav-item nav-child" @click="showNfs = true">
             <i class="pi pi-folder-open" /><span>NFS</span>
           </button>
         </div>
 
-        <button class="nav-item" @click="showUsers = true">
+        <button data-nav="users" class="nav-item" @click="showUsers = true">
           <i class="pi pi-users" /><span>Users & Groups</span>
         </button>
-        <button class="nav-item" @click="showJobs = true">
+        <button data-nav="jobs" class="nav-item" @click="showJobs = true">
           <i class="pi pi-list-check" /><span>Jobs</span>
         </button>
       </nav>
@@ -56,7 +56,7 @@ const showJobs = ref(false)
         </div>
       </header>
 
-      <main class="app-content">
+      <main class="app-content" data-region="content">
         <slot />
       </main>
     </div>
@@ -66,17 +66,17 @@ const showJobs = ref(false)
     <StorageDiskListPanel v-model:visible="showDisks" />
 
     <!-- Placeholders for future panels -->
-    <FloatingPanel v-model:visible="showSmb" title="SMB Shares">
-      <p style="color: var(--p-text-muted-color);">SMB shares coming soon.</p>
+    <FloatingPanel v-model:visible="showSmb" panel-id="smb" title="SMB Shares">
+      <p style="opacity: 0.5;">SMB shares coming soon.</p>
     </FloatingPanel>
-    <FloatingPanel v-model:visible="showNfs" title="NFS Exports">
-      <p style="color: var(--p-text-muted-color);">NFS exports coming soon.</p>
+    <FloatingPanel v-model:visible="showNfs" panel-id="nfs" title="NFS Exports">
+      <p style="opacity: 0.5;">NFS exports coming soon.</p>
     </FloatingPanel>
-    <FloatingPanel v-model:visible="showUsers" title="Users & Groups">
-      <p style="color: var(--p-text-muted-color);">User management coming soon.</p>
+    <FloatingPanel v-model:visible="showUsers" panel-id="users" title="Users & Groups">
+      <p style="opacity: 0.5;">User management coming soon.</p>
     </FloatingPanel>
-    <FloatingPanel v-model:visible="showJobs" title="Jobs">
-      <p style="color: var(--p-text-muted-color);">Job history coming soon.</p>
+    <FloatingPanel v-model:visible="showJobs" panel-id="jobs" title="Jobs">
+      <p style="opacity: 0.5;">Job history coming soon.</p>
     </FloatingPanel>
   </div>
 </template>
