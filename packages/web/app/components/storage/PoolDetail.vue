@@ -24,6 +24,22 @@ function formatDate(iso: string | null): string {
   if (!iso) return '-'
   return new Date(iso).toLocaleString()
 }
+
+/** Usage bar color: green < 60%, yellow 60-80%, orange 80-90%, red > 90% */
+function usageColor(pct: number): string {
+  if (pct < 60) return '#a6e3a1'
+  if (pct < 80) return '#f9e2af'
+  if (pct < 90) return '#fab387'
+  return '#f38ba8'
+}
+
+const propertyHelp: Record<string, string> = {
+  ashift: 'Sector size exponent (2^N bytes). 9=512B, 12=4K, 13=8K. Set at creation, cannot be changed. Should match physical sector size of disks.',
+  autoexpand: 'Automatically expand pool when larger disks replace smaller ones.',
+  autoreplace: 'Automatically replace a failed disk with a hot spare if available.',
+  autotrim: 'Automatically issue TRIM/UNMAP commands to SSDs for freed blocks.',
+  failmode: 'Behavior when a write failure occurs: wait (block until device recovers), continue (return errors), panic (halt system).',
+}
 </script>
 
 <template>
@@ -39,28 +55,36 @@ function formatDate(iso: string | null): string {
       {{ pool.health.status }}
     </div>
 
-    <!-- Summary -->
+    <!-- Summary stats -->
     <div class="detail-summary">
-      <div class="stat">
+      <div class="stat" v-tooltip.bottom="'Total raw pool capacity'">
         <div class="stat-value">{{ formatBytes(pool.size) }}</div>
         <div class="stat-label">Size</div>
       </div>
-      <div class="stat">
+      <div class="stat" v-tooltip.bottom="'Space allocated to data and metadata'">
         <div class="stat-value">{{ formatBytes(pool.allocated) }} <small>({{ pool.capacity }}%)</small></div>
         <div class="stat-label">Used</div>
       </div>
-      <div class="stat">
+      <div class="stat" v-tooltip.bottom="'Remaining available space'">
         <div class="stat-value">{{ formatBytes(pool.free) }}</div>
         <div class="stat-label">Free</div>
       </div>
-      <div class="stat">
+      <div class="stat" v-tooltip.bottom="'How fragmented the free space is. High fragmentation can impact write performance.'">
         <div class="stat-value">{{ pool.fragmentation }}%</div>
         <div class="stat-label">Frag</div>
       </div>
-      <div class="stat">
+      <div class="stat" v-tooltip.bottom="'Deduplication ratio. 1.00x = no dedup savings.'">
         <div class="stat-value">{{ pool.dedupRatio.toFixed(2) }}x</div>
         <div class="stat-label">Dedup</div>
       </div>
+    </div>
+
+    <!-- Usage bar -->
+    <div class="usage-bar" v-tooltip.bottom="`${pool.capacity}% used`">
+      <div
+        class="usage-fill"
+        :style="{ width: Math.max(pool.capacity, 1) + '%', background: usageColor(pool.capacity) }"
+      />
     </div>
 
     <!-- Scan -->
@@ -83,6 +107,16 @@ function formatDate(iso: string | null): string {
           <ProgressBar :value="pool.scan.percentComplete" :show-value="true" style="flex: 1; height: 1.25rem;" />
         </div>
         <div class="kv-row">
+          <span class="kv-key">Examined</span>
+          <span v-tooltip.right="'Bytes examined vs total'">
+            {{ formatBytes(pool.scan.examinedBytes) }} / {{ formatBytes(pool.scan.totalBytes) }}
+          </span>
+        </div>
+        <div class="kv-row">
+          <span class="kv-key">Repaired</span>
+          <span>{{ formatBytes(pool.scan.processedBytes) }}</span>
+        </div>
+        <div class="kv-row">
           <span class="kv-key">Started</span>
           <span>{{ formatDate(pool.scan.startedAt) }}</span>
         </div>
@@ -91,7 +125,7 @@ function formatDate(iso: string | null): string {
           <span>{{ formatDate(pool.scan.finishedAt) }}</span>
         </div>
         <div class="kv-row">
-          <span class="kv-key">Errors</span>
+          <span class="kv-key" v-tooltip.right="'Data errors found during scan. Use zpool status -v for details.'">Errors</span>
           <span :class="pool.scan.errors > 0 ? 'text-error' : ''">{{ pool.scan.errors }}</span>
         </div>
       </div>
@@ -109,10 +143,18 @@ function formatDate(iso: string | null): string {
             <Tag :value="vdev.type" severity="secondary" />
             <Tag :value="vdev.state" :severity="stateSeverity(vdev.state)" />
           </div>
-          <div v-for="disk in vdev.disks" :key="disk.id" class="topo-disk" :class="{ 'has-errors': hasErrors(disk) }">
+          <div
+            v-for="disk in vdev.disks"
+            :key="disk.id"
+            class="topo-disk"
+            :class="{ 'has-errors': hasErrors(disk) }"
+          >
             <span class="topo-disk-id">{{ disk.id }}</span>
             <Tag :value="disk.state" :severity="stateSeverity(disk.state)" />
-            <span class="topo-disk-errors">
+            <span
+              class="topo-disk-errors"
+              v-tooltip.right="'Read / Write / Checksum errors'"
+            >
               R:{{ disk.readErrors }} W:{{ disk.writeErrors }} C:{{ disk.checksumErrors }}
             </span>
           </div>
@@ -124,11 +166,16 @@ function formatDate(iso: string | null): string {
     <section class="detail-section">
       <h3>Properties</h3>
       <div class="props-grid">
-        <span class="kv-key">ashift</span><span>{{ pool.properties.ashift }}</span>
-        <span class="kv-key">autoexpand</span><span>{{ pool.properties.autoexpand ? 'on' : 'off' }}</span>
-        <span class="kv-key">autoreplace</span><span>{{ pool.properties.autoreplace ? 'on' : 'off' }}</span>
-        <span class="kv-key">autotrim</span><span>{{ pool.properties.autotrim ? 'on' : 'off' }}</span>
-        <span class="kv-key">failmode</span><span>{{ pool.properties.failmode }}</span>
+        <template v-for="(value, key) in {
+          ashift: pool.properties.ashift,
+          autoexpand: pool.properties.autoexpand ? 'on' : 'off',
+          autoreplace: pool.properties.autoreplace ? 'on' : 'off',
+          autotrim: pool.properties.autotrim ? 'on' : 'off',
+          failmode: pool.properties.failmode,
+        }" :key="key">
+          <span class="kv-key" v-tooltip.right="propertyHelp[key]">{{ key }}</span>
+          <span>{{ value }}</span>
+        </template>
       </div>
     </section>
   </div>
@@ -153,44 +200,45 @@ function formatDate(iso: string | null): string {
 }
 
 .detail-health {
-  color: var(--p-yellow-400);
+  color: #f9e2af;
   font-size: 0.85rem;
   display: flex;
   align-items: center;
   gap: 0.5rem;
 }
 
-/* Summary stats row */
+/* Summary stats */
 .detail-summary {
   display: flex;
   flex-wrap: wrap;
   gap: 1.5rem;
   padding: 0.75rem 1rem;
   background: #181825;
-  border-radius: 6px;
+  border-radius: 6px 6px 0 0;
   border: 1px solid #313244;
+  border-bottom: none;
 }
 
-.stat {
-  min-width: 5rem;
+.stat { min-width: 5rem; cursor: help; }
+.stat-value { font-size: 1rem; font-weight: 600; }
+.stat-value small { font-weight: 400; color: #bac2de; }
+.stat-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #bac2de; margin-top: 0.1rem; }
+
+/* Usage bar */
+.usage-bar {
+  height: 6px;
+  background: #313244;
+  border-radius: 0 0 6px 6px;
+  overflow: hidden;
+  border: 1px solid #313244;
+  border-top: none;
+  cursor: help;
 }
 
-.stat-value {
-  font-size: 1rem;
-  font-weight: 600;
-}
-
-.stat-value small {
-  font-weight: 400;
-  color: #a6adc8;
-}
-
-.stat-label {
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: #a6adc8;
-  margin-top: 0.1rem;
+.usage-fill {
+  height: 100%;
+  border-radius: 0 0 0 6px;
+  transition: width 0.3s ease;
 }
 
 /* Sections */
@@ -199,7 +247,7 @@ function formatDate(iso: string | null): string {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: #a6adc8;
+  color: #bac2de;
   margin: 0 0 0.5rem;
   padding-bottom: 0.25rem;
   border-bottom: 1px solid #313244;
@@ -215,28 +263,24 @@ function formatDate(iso: string | null): string {
 }
 
 .kv-key {
-  color: #a6adc8;
-  min-width: 5rem;
+  color: #bac2de;
+  min-width: 5.5rem;
+  cursor: help;
 }
 
 /* Topology */
-.topo-group {
-  margin-bottom: 0.75rem;
-}
+.topo-group { margin-bottom: 0.75rem; }
 
 .topo-role {
   font-size: 0.8rem;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #a6adc8;
+  color: #bac2de;
   margin-bottom: 0.35rem;
 }
 
-.topo-vdev {
-  margin-left: 0.5rem;
-  margin-bottom: 0.5rem;
-}
+.topo-vdev { margin-left: 0.5rem; margin-bottom: 0.5rem; }
 
 .topo-vdev-header {
   display: flex;
@@ -256,19 +300,16 @@ function formatDate(iso: string | null): string {
   font-size: 0.8rem;
 }
 
-.topo-disk-id {
-  font-family: var(--p-font-family);
-  font-size: 0.8rem;
-}
+.topo-disk-id { font-size: 0.8rem; }
 
 .topo-disk-errors {
-  color: #a6adc8;
+  color: #bac2de;
   font-size: 0.75rem;
+  cursor: help;
 }
 
 .topo-disk.has-errors .topo-disk-errors {
-  color: var(--p-red-400);
-  opacity: 1;
+  color: #f38ba8;
   font-weight: 600;
 }
 
@@ -280,6 +321,6 @@ function formatDate(iso: string | null): string {
   font-size: 0.85rem;
 }
 
-.text-muted { color: #a6adc8; font-style: italic; font-size: 0.85rem; }
-.text-error { color: var(--p-red-400); font-weight: 600; }
+.text-muted { color: #bac2de; font-style: italic; font-size: 0.85rem; }
+.text-error { color: #f38ba8; font-weight: 600; }
 </style>

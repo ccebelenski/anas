@@ -16,6 +16,7 @@ export default defineNuxtConfig({
         preset: Lara,
         options: {
           darkModeSelector: '.p-dark',
+          cssLayer: false,
         },
       },
     },

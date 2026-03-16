@@ -1,5 +1,12 @@
+<script setup lang="ts">
+// Apply dark mode class to <html> so it covers Teleport content too
+useHead({
+  htmlAttrs: { class: 'p-dark' },
+})
+</script>
+
 <template>
-  <div class="p-dark">
+  <div>
     <NuxtRouteAnnouncer />
     <NuxtLayout>
       <NuxtPage />

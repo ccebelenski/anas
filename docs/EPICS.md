@@ -117,7 +117,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 3.4. [done] As a user, I want to see pool properties (ashift, autoexpand, etc.), so that I understand current configuration.
 
-3.5. [done] As a user, I want to see scrub progress and history, so that I know when the last integrity check ran and how it went.
+3.5. [done] As a user, I want to see scrub progress and history, so that I know when the last integrity check ran and how it went. *(Future: parse `zpool status -v` for per-file error details.)*
 
 3.6. [done] As a user, I want to see SMART health data for individual disks, so that I can identify drives that may be failing.
 

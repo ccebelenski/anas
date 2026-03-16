@@ -230,4 +230,9 @@ onUnmounted(() => {
   flex: 1;
   color: #cdd6f4;
 }
+
+/* Subtle tweaks for DataTable in panels (PrimeVue dark theme handles most styling) */
+.fp-body .p-datatable {
+  background: transparent;
+}
 </style>
