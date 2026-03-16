@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
-import { parseLsblk } from '../parsers/lsblk.js'
+import { parseLsblk, LSBLK_ARGS } from '../parsers/lsblk.js'
 import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 import { parseSmartctl } from '../parsers/smartctl.js'
@@ -14,7 +14,7 @@ export async function diskRoutes(
   /** Fetch all disk data: lsblk, by-id mapping, and pool membership. */
   async function fetchDisks() {
     const [lsblkResult, byIdResult, statusResult] = await Promise.all([
-      executor.exec('/usr/bin/lsblk', ['-Jb']),
+      executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
       executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
       executor.exec('/usr/sbin/zpool', ['status', '-jv']),
     ])

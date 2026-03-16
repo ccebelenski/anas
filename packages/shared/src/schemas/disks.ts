@@ -33,7 +33,7 @@ export type DiskPartition = z.infer<typeof DiskPartition>
 
 /** A storage disk (GET /v1/disks) */
 export const Disk = z.object({
-  /** by-id identifier (API resource ID), e.g. "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1" */
+  /** by-id identifier (API resource ID), e.g. "ata-WDC_WD2003FZEX-00SRLA0_WD-12345678" */
   id: z.string(),
   /** Kernel device name, e.g. "sdb" */
   name: z.string(),
@@ -45,10 +45,20 @@ export const Disk = z.object({
   model: z.string().nullable(),
   /** Serial number */
   serial: z.string().nullable(),
+  /** Vendor string */
+  vendor: z.string().nullable(),
+  /** Firmware revision */
+  revision: z.string().nullable(),
   /** Transport type: "sata", "nvme", "sas", "usb", etc. */
   transport: z.string().nullable(),
   /** Rotational disk (HDD=true, SSD/NVMe=false) */
   rotational: z.boolean(),
+  /** Physical sector size in bytes */
+  physicalSectorSize: z.number().int().nullable(),
+  /** Logical sector size in bytes */
+  logicalSectorSize: z.number().int().nullable(),
+  /** World Wide Name */
+  wwn: z.string().nullable(),
   /** Current usage status */
   status: DiskUsageStatus,
   /** If pool_member, which pool */

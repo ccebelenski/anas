@@ -100,6 +100,6 @@ test.describe('Floating Panels', () => {
     await expect(panel).toBeVisible()
 
     await page.screenshot({ path: '/tmp/panel-disks.png' })
-    await expect(panel.getByText('sda', { exact: true }).first()).toBeVisible()
+    await expect(panel.getByText('/dev/sda')).toBeVisible()
   })
 })

@@ -5,6 +5,7 @@ import { MockExecutor } from './executor/mock.js'
 import { ProdExecutor } from './executor/prod.js'
 import { mockFixtures } from './fixtures/loader.js'
 import { JobQueue } from './jobs/queue.js'
+import { LSBLK_ARGS } from './parsers/lsblk.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
 import { diskRoutes } from './routes/disks.js'
@@ -32,7 +33,7 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', 'all', '-j'], result: mockFixtures.zpoolGetAll('testpool') })
-    mock.addFixture({ command: '/usr/bin/lsblk', args: ['-Jb'], result: mockFixtures.lsblk() })
+    mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: mockFixtures.lsblk() })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     mock.addFixture({ command: '/usr/sbin/smartctl', result: mockFixtures.smartctl() })
   }

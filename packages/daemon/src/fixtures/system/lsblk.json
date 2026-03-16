@@ -4,46 +4,31 @@
             "name": "sda",
             "type": "disk",
             "size": 256060514304,
-            "model": "Samsung SSD 870",
+            "model": "Samsung SSD 870 EVO",
             "serial": "S6PPNG0R400123",
             "tran": "sata",
             "fstype": null,
             "mountpoint": null,
             "rota": false,
-            "disc-gran": 4096,
             "phy-sec": 512,
             "log-sec": 512,
-            "wwn": null,
+            "wwn": "0x5002538f411eb834",
+            "vendor": "ATA",
+            "rev": "SVT02B6Q",
             "children": [
                 {
                     "name": "sda1",
                     "type": "part",
                     "size": 255985344512,
-                    "model": null,
-                    "serial": null,
-                    "tran": null,
                     "fstype": "ext4",
-                    "mountpoint": "/",
-                    "rota": false,
-                    "disc-gran": 4096,
-                    "phy-sec": 512,
-                    "log-sec": 512,
-                    "wwn": null
+                    "mountpoint": "/"
                 },
                 {
                     "name": "sda15",
                     "type": "part",
                     "size": 130023424,
-                    "model": null,
-                    "serial": null,
-                    "tran": null,
                     "fstype": "vfat",
-                    "mountpoint": "/boot/efi",
-                    "rota": false,
-                    "disc-gran": 4096,
-                    "phy-sec": 512,
-                    "log-sec": 512,
-                    "wwn": null
+                    "mountpoint": "/boot/efi"
                 }
             ]
         },
@@ -51,46 +36,31 @@
             "name": "sdb",
             "type": "disk",
             "size": 268435456000,
-            "model": "WDC WD2003FZEX-0",
+            "model": "WDC WD2003FZEX-00SRLA0",
             "serial": "WD-12345678",
             "tran": "sata",
             "fstype": null,
             "mountpoint": null,
             "rota": true,
-            "disc-gran": 0,
             "phy-sec": 4096,
             "log-sec": 512,
-            "wwn": null,
+            "wwn": "0x50014ee20e72a8b1",
+            "vendor": "ATA",
+            "rev": "81.00A81",
             "children": [
                 {
                     "name": "sdb1",
                     "type": "part",
                     "size": 268300615680,
-                    "model": null,
-                    "serial": null,
-                    "tran": null,
                     "fstype": "zfs_member",
-                    "mountpoint": null,
-                    "rota": true,
-                    "disc-gran": 0,
-                    "phy-sec": 4096,
-                    "log-sec": 512,
-                    "wwn": null
+                    "mountpoint": null
                 },
                 {
                     "name": "sdb9",
                     "type": "part",
                     "size": 8388608,
-                    "model": null,
-                    "serial": null,
-                    "tran": null,
                     "fstype": null,
-                    "mountpoint": null,
-                    "rota": true,
-                    "disc-gran": 0,
-                    "phy-sec": 4096,
-                    "log-sec": 512,
-                    "wwn": null
+                    "mountpoint": null
                 }
             ]
         },
@@ -98,31 +68,24 @@
             "name": "sdc",
             "type": "disk",
             "size": 268435456000,
-            "model": "WDC WD2003FZEX-0",
+            "model": "WDC WD2003FZEX-00SRLA0",
             "serial": "WD-23456789",
             "tran": "sata",
             "fstype": null,
             "mountpoint": null,
             "rota": true,
-            "disc-gran": 0,
             "phy-sec": 4096,
             "log-sec": 512,
-            "wwn": null,
+            "wwn": "0x50014ee20e72b942",
+            "vendor": "ATA",
+            "rev": "81.00A81",
             "children": [
                 {
                     "name": "sdc1",
                     "type": "part",
                     "size": 268300615680,
-                    "model": null,
-                    "serial": null,
-                    "tran": null,
                     "fstype": "zfs_member",
-                    "mountpoint": null,
-                    "rota": true,
-                    "disc-gran": 0,
-                    "phy-sec": 4096,
-                    "log-sec": 512,
-                    "wwn": null
+                    "mountpoint": null
                 }
             ]
         },
@@ -130,31 +93,24 @@
             "name": "sdd",
             "type": "disk",
             "size": 268435456000,
-            "model": "WDC WD2003FZEX-0",
+            "model": "WDC WD2003FZEX-00SRLA0",
             "serial": "WD-34567890",
             "tran": "sata",
             "fstype": null,
             "mountpoint": null,
             "rota": true,
-            "disc-gran": 0,
             "phy-sec": 4096,
             "log-sec": 512,
-            "wwn": null,
+            "wwn": "0x50014ee20e72ca53",
+            "vendor": "ATA",
+            "rev": "81.00A81",
             "children": [
                 {
                     "name": "sdd1",
                     "type": "part",
                     "size": 268300615680,
-                    "model": null,
-                    "serial": null,
-                    "tran": null,
                     "fstype": "zfs_member",
-                    "mountpoint": null,
-                    "rota": true,
-                    "disc-gran": 0,
-                    "phy-sec": 4096,
-                    "log-sec": 512,
-                    "wwn": null
+                    "mountpoint": null
                 }
             ]
         },
@@ -162,31 +118,24 @@
             "name": "sde",
             "type": "disk",
             "size": 268435456000,
-            "model": "WDC WD2003FZEX-0",
+            "model": "WDC WD2003FZEX-00SRLA0",
             "serial": "WD-45678901",
             "tran": "sata",
             "fstype": null,
             "mountpoint": null,
             "rota": true,
-            "disc-gran": 0,
             "phy-sec": 4096,
             "log-sec": 512,
-            "wwn": null,
+            "wwn": "0x50014ee20e72db64",
+            "vendor": "ATA",
+            "rev": "81.00A81",
             "children": [
                 {
                     "name": "sde1",
                     "type": "part",
                     "size": 268300615680,
-                    "model": null,
-                    "serial": null,
-                    "tran": null,
                     "fstype": "zfs_member",
-                    "mountpoint": null,
-                    "rota": true,
-                    "disc-gran": 0,
-                    "phy-sec": 4096,
-                    "log-sec": 512,
-                    "wwn": null
+                    "mountpoint": null
                 }
             ]
         },
@@ -194,16 +143,17 @@
             "name": "sdf",
             "type": "disk",
             "size": 268435456000,
-            "model": "WDC WD2003FZEX-0",
+            "model": "WDC WD2003FZEX-00SRLA0",
             "serial": "WD-56789012",
             "tran": "sata",
             "fstype": null,
             "mountpoint": null,
             "rota": true,
-            "disc-gran": 0,
             "phy-sec": 4096,
             "log-sec": 512,
-            "wwn": null
+            "wwn": "0x50014ee20e72ec75",
+            "vendor": "ATA",
+            "rev": "81.00A81"
         }
     ]
 }
