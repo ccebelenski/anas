@@ -45,6 +45,10 @@ interface ZfsPoolStatusRaw {
   moreinfo?: string
   scan_stats?: ZfsScanStatsRaw
   vdevs: Record<string, ZfsVdevRaw>
+  /** Pool-level spares (separate from vdev tree) */
+  spares?: Record<string, ZfsVdevRaw>
+  /** Pool-level L2ARC cache (separate from vdev tree) */
+  l2cache?: Record<string, ZfsVdevRaw>
   error_count: string
   /** Present with -v flag when there are data errors */
   errlist?: string
@@ -108,6 +112,36 @@ function parsePool(pool: ZfsPoolStatusRaw): ParsedPoolStatus {
   const rootVdev = Object.values(pool.vdevs)[0]
   if (rootVdev?.vdevs) {
     result.vdevGroups = classifyVdevs(rootVdev.vdevs)
+  }
+
+  // Pool-level spares (separate from vdev tree)
+  if (pool.spares && Object.keys(pool.spares).length > 0) {
+    const spareDisksList: PoolDisk[] = Object.values(pool.spares).map(parseDisk)
+    const spareVdev: Vdev = {
+      name: 'spares',
+      type: 'spare',
+      state: 'ONLINE' as VdevState,
+      readErrors: 0,
+      writeErrors: 0,
+      checksumErrors: 0,
+      disks: spareDisksList,
+    }
+    result.vdevGroups.push({ role: 'spare', vdevs: [spareVdev] })
+  }
+
+  // Pool-level L2ARC cache
+  if (pool.l2cache && Object.keys(pool.l2cache).length > 0) {
+    const cacheDisksList: PoolDisk[] = Object.values(pool.l2cache).map(parseDisk)
+    const cacheVdev: Vdev = {
+      name: 'cache',
+      type: 'disk' as VdevType,
+      state: 'ONLINE' as VdevState,
+      readErrors: 0,
+      writeErrors: 0,
+      checksumErrors: 0,
+      disks: cacheDisksList,
+    }
+    result.vdevGroups.push({ role: 'cache', vdevs: [cacheVdev] })
   }
 
   return result

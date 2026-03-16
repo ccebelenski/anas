@@ -102,6 +102,39 @@ describe('parseZpoolStatus', () => {
     assert.ok(disk1.readErrors > 0 || disk1.writeErrors > 0)
   })
 
+  it('parses pool with standing-by spare', () => {
+    const result = parseZpoolStatus(loadFixture('zpool-status-with-spare.json'))
+    const pool = result[0]
+    assert.equal(pool.state, 'ONLINE')
+
+    // Should have data group + spare group
+    const dataGroup = pool.vdevGroups.find(g => g.role === 'data')
+    const spareGroup = pool.vdevGroups.find(g => g.role === 'spare')
+    assert.ok(dataGroup)
+    assert.ok(spareGroup)
+    assert.equal(spareGroup.vdevs[0].disks.length, 1)
+    assert.equal(spareGroup.vdevs[0].disks[0].id, 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3')
+  })
+
+  it('parses pool with activated spare', () => {
+    const result = parseZpoolStatus(loadFixture('zpool-status-spare-active.json'))
+    const pool = result[0]
+    assert.equal(pool.state, 'DEGRADED')
+
+    // Spare group should show INUSE
+    const spareGroup = pool.vdevGroups.find(g => g.role === 'spare')
+    assert.ok(spareGroup)
+    const spareDisk = spareGroup.vdevs[0].disks[0]
+    assert.equal(spareDisk.state, 'INUSE')
+
+    // Data group should have the spare-1 virtual vdev
+    const dataGroup = pool.vdevGroups.find(g => g.role === 'data')
+    assert.ok(dataGroup)
+    const mirror = dataGroup.vdevs[0]
+    // Mirror contains spare-1 vdev which has the replaced + spare disks
+    assert.ok(mirror.disks.length >= 2)
+  })
+
   it('parses verbose (-v) error details', () => {
     const result = parseZpoolStatus(loadFixture('zpool-status-suspended-verbose.json'))
     const pool = result[0]

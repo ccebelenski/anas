@@ -1,17 +1,37 @@
 <script setup lang="ts">
-import type { PoolDetail, PoolDisk } from '@anas/shared'
+import type { Disk, PoolDetail, PoolDisk, Vdev, VdevGroup } from '@anas/shared'
 import { formatBytes } from '~/utils/format'
 
-defineProps<{
+const props = defineProps<{
   pool: PoolDetail
 }>()
 
-function stateSeverity(state: string): 'success' | 'warn' | 'danger' | 'secondary' {
+// Fetch disk info for cross-referencing (fire-and-forget, non-blocking)
+const diskMap = ref<Map<string, Disk>>(new Map())
+onMounted(async () => {
+  try {
+    const res = await $fetch<{ data: Disk[] }>('/api/disks')
+    const map = new Map<string, Disk>()
+    for (const d of res.data) {
+      map.set(d.id, d)
+    }
+    diskMap.value = map
+  }
+  catch { /* disk info is optional enhancement */ }
+})
+
+function getDiskInfo(poolDisk: PoolDisk): Disk | undefined {
+  return diskMap.value.get(poolDisk.id)
+}
+
+function stateSeverity(state: string): 'success' | 'warn' | 'danger' | 'info' | 'secondary' {
   switch (state) {
     case 'ONLINE': return 'success'
     case 'DEGRADED': return 'warn'
     case 'FAULTED':
     case 'SUSPENDED': return 'danger'
+    case 'AVAIL': return 'info'
+    case 'INUSE': return 'info'
     default: return 'secondary'
   }
 }
@@ -25,7 +45,6 @@ function formatDate(iso: string | null): string {
   return new Date(iso).toLocaleString()
 }
 
-/** Usage bar color: green < 60%, yellow 60-80%, orange 80-90%, red > 90% */
 function usageColor(pct: number): string {
   if (pct < 60) return '#a6e3a1'
   if (pct < 80) return '#f9e2af'
@@ -33,12 +52,38 @@ function usageColor(pct: number): string {
   return '#f38ba8'
 }
 
+/** Describe redundancy for a vdev group */
+function redundancyDescription(group: VdevGroup): string {
+  if (group.role === 'spare') {
+    const avail = group.vdevs[0]?.disks.filter(d => d.state === 'AVAIL').length ?? 0
+    const inuse = group.vdevs[0]?.disks.filter(d => d.state === 'INUSE').length ?? 0
+    if (inuse > 0) return `${inuse} spare active, ${avail} standing by`
+    return `${avail} spare${avail !== 1 ? 's' : ''} standing by`
+  }
+  if (group.role === 'cache') return 'L2ARC read cache'
+  if (group.role === 'log') return 'ZIL write log'
+  if (group.role === 'special') return 'Metadata / small blocks'
+  if (group.role === 'dedup') return 'Dedup table'
+
+  // Data vdevs — describe redundancy per vdev type
+  const vdev = group.vdevs[0]
+  if (!vdev) return 'Data'
+  const type = vdev.type
+  const diskCount = vdev.disks.length
+  if (type === 'mirror') return `Mirror — can survive ${diskCount - 1} disk failure${diskCount > 2 ? 's' : ''}`
+  if (type === 'raidz') return 'RAIDZ1 — can survive 1 disk failure'
+  if (type === 'raidz2') return 'RAIDZ2 — can survive 2 disk failures'
+  if (type === 'raidz3') return 'RAIDZ3 — can survive 3 disk failures'
+  if (type === 'disk') return 'Stripe — no redundancy'
+  return `${type}`
+}
+
 const propertyHelp: Record<string, string> = {
-  ashift: 'Sector size exponent (2^N bytes). 9=512B, 12=4K, 13=8K. Set at creation, cannot be changed. Should match physical sector size of disks.',
+  ashift: 'Sector size exponent (2^N bytes). 9=512B, 12=4K, 13=8K. Set at creation, cannot be changed.',
   autoexpand: 'Automatically expand pool when larger disks replace smaller ones.',
   autoreplace: 'Automatically replace a failed disk with a hot spare if available.',
   autotrim: 'Automatically issue TRIM/UNMAP commands to SSDs for freed blocks.',
-  failmode: 'Behavior when a write failure occurs: wait (block until device recovers), continue (return errors), panic (halt system).',
+  failmode: 'Behavior on write failure: wait (block), continue (return errors), panic (halt).',
 }
 </script>
 
@@ -69,7 +114,7 @@ const propertyHelp: Record<string, string> = {
         <div class="stat-value">{{ formatBytes(pool.free) }}</div>
         <div class="stat-label">Free</div>
       </div>
-      <div class="stat" v-tooltip.bottom="'How fragmented the free space is. High fragmentation can impact write performance.'">
+      <div class="stat" v-tooltip.bottom="'Free space fragmentation. High values impact write performance.'">
         <div class="stat-value">{{ pool.fragmentation }}%</div>
         <div class="stat-label">Frag</div>
       </div>
@@ -82,17 +127,10 @@ const propertyHelp: Record<string, string> = {
     <!-- Usage bar -->
     <div class="usage-bar-wrap" v-tooltip.bottom="`${pool.capacity}% used — ${formatBytes(pool.allocated)} of ${formatBytes(pool.size)}`">
       <div class="usage-bar">
-        <div
-          class="usage-fill"
-          :style="{ width: Math.max(pool.capacity, 1) + '%', background: usageColor(pool.capacity) }"
-        />
+        <div class="usage-fill" :style="{ width: Math.max(pool.capacity, 1) + '%', background: usageColor(pool.capacity) }" />
       </div>
       <div class="usage-markers">
-        <span>0%</span>
-        <span>25%</span>
-        <span>50%</span>
-        <span>75%</span>
-        <span>100%</span>
+        <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
       </div>
     </div>
 
@@ -117,9 +155,7 @@ const propertyHelp: Record<string, string> = {
         </div>
         <div class="kv-row">
           <span class="kv-key">Examined</span>
-          <span v-tooltip.right="'Bytes examined vs total'">
-            {{ formatBytes(pool.scan.examinedBytes) }} / {{ formatBytes(pool.scan.totalBytes) }}
-          </span>
+          <span>{{ formatBytes(pool.scan.examinedBytes) }} / {{ formatBytes(pool.scan.totalBytes) }}</span>
         </div>
         <div class="kv-row">
           <span class="kv-key">Repaired</span>
@@ -134,7 +170,7 @@ const propertyHelp: Record<string, string> = {
           <span>{{ formatDate(pool.scan.finishedAt) }}</span>
         </div>
         <div class="kv-row">
-          <span class="kv-key" v-tooltip.right="'Data errors found during scan'">Errors</span>
+          <span class="kv-key">Errors</span>
           <span :class="pool.scan.errors > 0 ? 'text-error' : ''">{{ pool.scan.errors }}</span>
         </div>
         <div v-if="pool.errorDetail" class="error-detail">
@@ -149,27 +185,36 @@ const propertyHelp: Record<string, string> = {
     <section class="detail-section">
       <h3>Topology</h3>
       <div v-for="group in pool.vdevGroups" :key="group.role" class="topo-group">
-        <div class="topo-role">{{ group.role }}</div>
+        <div class="topo-group-header">
+          <span class="topo-redundancy">{{ redundancyDescription(group) }}</span>
+          <Tag v-if="group.role !== 'data'" :value="group.role" severity="secondary" />
+        </div>
         <div v-for="vdev in group.vdevs" :key="vdev.name" class="topo-vdev">
           <div class="topo-vdev-header">
-            <span>{{ vdev.name }}</span>
+            <span class="topo-vdev-name">{{ vdev.name }}</span>
             <Tag :value="vdev.type" severity="secondary" />
             <Tag :value="vdev.state" :severity="stateSeverity(vdev.state)" />
           </div>
-          <div
-            v-for="disk in vdev.disks"
-            :key="disk.id"
-            class="topo-disk"
-            :class="{ 'has-errors': hasErrors(disk) }"
-          >
-            <span class="topo-disk-id">{{ disk.id }}</span>
-            <Tag :value="disk.state" :severity="stateSeverity(disk.state)" />
-            <span
-              class="topo-disk-errors"
-              v-tooltip.right="'Read / Write / Checksum errors'"
+          <div class="topo-disks">
+            <div
+              v-for="disk in vdev.disks"
+              :key="disk.id"
+              class="topo-disk"
+              :class="{ 'has-errors': hasErrors(disk) }"
             >
-              R:{{ disk.readErrors }} W:{{ disk.writeErrors }} C:{{ disk.checksumErrors }}
-            </span>
+              <div class="topo-disk-main">
+                <Tag :value="disk.state" :severity="stateSeverity(disk.state)" />
+                <span class="topo-disk-id">{{ disk.id }}</span>
+                <span class="topo-disk-errors" v-tooltip.right="'Read / Write / Checksum errors'">
+                  R:{{ disk.readErrors }} W:{{ disk.writeErrors }} C:{{ disk.checksumErrors }}
+                </span>
+              </div>
+              <div v-if="getDiskInfo(disk)" class="topo-disk-info">
+                <span>/dev/{{ getDiskInfo(disk)!.name }}</span>
+                <span>{{ getDiskInfo(disk)!.model ?? '' }}</span>
+                <span>{{ formatBytes(getDiskInfo(disk)!.size) }}</span>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -220,7 +265,6 @@ const propertyHelp: Record<string, string> = {
   gap: 0.5rem;
 }
 
-/* Summary stats */
 .detail-summary {
   display: flex;
   flex-wrap: wrap;
@@ -237,11 +281,7 @@ const propertyHelp: Record<string, string> = {
 .stat-value small { font-weight: 400; color: #bac2de; }
 .stat-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; color: #bac2de; margin-top: 0.1rem; }
 
-/* Usage bar */
-.usage-bar-wrap {
-  cursor: help;
-}
-
+.usage-bar-wrap { cursor: help; }
 .usage-bar {
   height: 12px;
   background: #313244;
@@ -250,20 +290,8 @@ const propertyHelp: Record<string, string> = {
   border: 1px solid #313244;
   border-top: none;
 }
-
-.usage-fill {
-  height: 100%;
-  border-radius: 0 0 0 6px;
-  transition: width 0.3s ease;
-}
-
-.usage-markers {
-  display: flex;
-  justify-content: space-between;
-  font-size: 0.6rem;
-  color: #6c7086;
-  padding: 0.15rem 0.1rem 0;
-}
+.usage-fill { height: 100%; border-radius: 0 0 0 6px; transition: width 0.3s ease; }
+.usage-markers { display: flex; justify-content: space-between; font-size: 0.6rem; color: #6c7086; padding: 0.15rem 0.1rem 0; }
 
 /* Sections */
 .detail-section h3 {
@@ -277,7 +305,6 @@ const propertyHelp: Record<string, string> = {
   border-bottom: 1px solid #313244;
 }
 
-/* Key-value rows */
 .kv-row {
   display: flex;
   align-items: center;
@@ -293,43 +320,69 @@ const propertyHelp: Record<string, string> = {
 }
 
 /* Topology */
-.topo-group { margin-bottom: 0.75rem; }
-
-.topo-role {
-  font-size: 0.8rem;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: #bac2de;
-  margin-bottom: 0.35rem;
+.topo-group {
+  margin-bottom: 1rem;
 }
 
-.topo-vdev { margin-left: 0.5rem; margin-bottom: 0.5rem; }
+.topo-group-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.topo-redundancy {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #cdd6f4;
+}
+
+.topo-vdev {
+  margin-left: 0.5rem;
+  margin-bottom: 0.5rem;
+}
 
 .topo-vdev-header {
   display: flex;
   align-items: center;
   gap: 0.5rem;
   font-size: 0.85rem;
-  font-weight: 500;
   padding: 0.2rem 0;
 }
 
+.topo-vdev-name {
+  font-weight: 500;
+}
+
+.topo-disks {
+  margin-left: 1rem;
+}
+
 .topo-disk {
+  padding: 0.25rem 0;
+  border-bottom: 1px solid rgba(49, 50, 68, 0.5);
+}
+
+.topo-disk:last-child {
+  border-bottom: none;
+}
+
+.topo-disk-main {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  margin-left: 1.25rem;
-  padding: 0.15rem 0;
   font-size: 0.8rem;
 }
 
-.topo-disk-id { font-size: 0.8rem; }
+.topo-disk-id {
+  font-size: 0.8rem;
+}
 
 .topo-disk-errors {
   color: #bac2de;
   font-size: 0.75rem;
   cursor: help;
+  margin-left: auto;
 }
 
 .topo-disk.has-errors .topo-disk-errors {
@@ -337,7 +390,16 @@ const propertyHelp: Record<string, string> = {
   font-weight: 600;
 }
 
-/* Properties grid */
+.topo-disk-info {
+  display: flex;
+  gap: 1rem;
+  margin-left: 2rem;
+  margin-top: 0.1rem;
+  font-size: 0.75rem;
+  color: #6c7086;
+}
+
+/* Properties */
 .props-grid {
   display: grid;
   grid-template-columns: auto 1fr;

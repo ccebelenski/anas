@@ -23,6 +23,8 @@ export const VdevState = z.enum([
   'OFFLINE',
   'REMOVED',
   'UNAVAIL',
+  'AVAIL',
+  'INUSE',
 ])
 export type VdevState = z.infer<typeof VdevState>
 
