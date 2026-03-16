@@ -46,3 +46,6 @@ export const ISODateTime = z.string().datetime()
 
 /** UUID (v4) */
 export const UUID = z.string().uuid()
+
+/** Disk by-id identifier, e.g. "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1" */
+export const DiskId = z.string().min(1).regex(/^[\w.-]+$/, 'Invalid disk by-id identifier')

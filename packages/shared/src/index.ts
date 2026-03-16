@@ -16,12 +16,49 @@ export {
   AbsolutePath,
   DatasetPath,
   DevicePath,
+  DiskId,
   ISODateTime,
   PoolName,
   ShareName,
   SnapshotName,
   UUID,
 } from './schemas/common.js'
+
+// ZFS schemas
+export {
+  AddVdevRequest,
+  AttachDiskRequest,
+  CreatePoolRequest,
+  ExportPoolRequest,
+  ImportPoolRequest,
+  PoolDetail,
+  PoolDisk,
+  PoolHealthMessage,
+  PoolProperties,
+  PoolState,
+  PoolSummary,
+  ScanFunction,
+  ScanState,
+  ScanStatus,
+  ScrubRequest,
+  UpdatePoolPropertiesRequest,
+  Vdev,
+  VdevGroup,
+  VdevRole,
+  VdevSpec,
+  VdevState,
+  VdevType,
+} from './schemas/zfs.js'
+
+// Disk schemas
+export {
+  Disk,
+  DiskPartition,
+  DiskUsageStatus,
+  SmartAttribute,
+  SmartData,
+  SmartHealth,
+} from './schemas/disks.js'
 
 // Job schemas
 export {
