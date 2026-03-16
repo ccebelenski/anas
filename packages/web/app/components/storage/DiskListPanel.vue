@@ -10,6 +10,9 @@ const error = ref<string | null>(null)
 const smartDiskId = ref<string | null>(null)
 const smartVisible = ref(false)
 
+const poolName = ref('')
+const poolVisible = ref(false)
+
 watch(visible, async (val) => {
   if (val) {
     loading.value = true
@@ -31,6 +34,11 @@ function showSmart(diskId: string) {
   smartDiskId.value = diskId
   smartVisible.value = true
 }
+
+function showPool(name: string) {
+  poolName.value = name
+  poolVisible.value = true
+}
 </script>
 
 <template>
@@ -43,12 +51,18 @@ function showSmart(diskId: string) {
       <ProgressSpinner />
     </div>
 
-    <StorageDiskList v-else :disks="disks" @show-smart="showSmart" />
+    <StorageDiskList v-else :disks="disks" @show-smart="showSmart" @show-pool="showPool" />
   </FloatingPanel>
 
   <StorageSmartDataPanel
     v-if="smartDiskId"
     v-model:visible="smartVisible"
     :disk-id="smartDiskId"
+  />
+
+  <StoragePoolDetailPanel
+    v-if="poolName"
+    v-model:visible="poolVisible"
+    :pool-name="poolName"
   />
 </template>

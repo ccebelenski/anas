@@ -20,6 +20,8 @@ export interface DiskIdentity {
   interface: string | null
   /** Whether TRIM is available (SSDs) */
   trimSupport: boolean
+  /** SMART health: true=passed, false=failed, null=not supported/unknown */
+  smartHealthy: boolean | null
 }
 
 export class DiskIdentityCache {
@@ -70,8 +72,8 @@ export class DiskIdentityCache {
 
   private async fetchFromSmartctl(devicePath: string): Promise<DiskIdentity> {
     try {
-      const result = await this.executor.exec('/usr/sbin/smartctl', ['-i', '--json', devicePath])
-      // smartctl -i is identity only (no full scan), much faster than -a
+      const result = await this.executor.exec('/usr/sbin/smartctl', ['-iH', '--json', devicePath])
+      // smartctl -iH is identity + health check (no full scan), fast
       const data = JSON.parse(result.stdout)
       return {
         modelFamily: data.model_family ?? null,
@@ -80,6 +82,7 @@ export class DiskIdentityCache {
         firmwareVersion: data.firmware_version ?? null,
         interface: formatInterface(data),
         trimSupport: !!data.trim?.supported,
+        smartHealthy: data.smart_status?.passed ?? null,
       }
     }
     catch {
@@ -91,6 +94,7 @@ export class DiskIdentityCache {
         firmwareVersion: null,
         interface: null,
         trimSupport: false,
+        smartHealthy: null,
       }
     }
   }

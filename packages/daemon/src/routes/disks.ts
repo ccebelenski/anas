@@ -50,13 +50,13 @@ export async function diskRoutes(
     // Enrich disks with cached identity
     return disks.map(d => {
       const identity = diskIdentityCache.getCached(d.id)
-      if (!identity) return { ...d, modelFamily: null, formFactor: null }
+      if (!identity) return { ...d, modelFamily: null, formFactor: null, smartHealthy: null }
       return {
         ...d,
         modelFamily: identity.modelFamily,
         formFactor: identity.formFactor,
-        // Override revision with smartctl firmware if available (often more detailed)
         revision: identity.firmwareVersion ?? d.revision,
+        smartHealthy: identity.smartHealthy,
       }
     })
   }

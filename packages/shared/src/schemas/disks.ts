@@ -63,6 +63,8 @@ export const Disk = z.object({
   logicalSectorSize: z.number().int().nullable(),
   /** World Wide Name */
   wwn: z.string().nullable(),
+  /** SMART health: true=passed, false=failed, null=not supported or unknown */
+  smartHealthy: z.boolean().nullable(),
   /** Current usage status */
   status: DiskUsageStatus,
   /** If pool_member, which pool */

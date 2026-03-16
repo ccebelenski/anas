@@ -85,6 +85,7 @@ export function parseLsblk(
         physicalSectorSize: dev['phy-sec'] ?? null,
         logicalSectorSize: dev['log-sec'] ?? null,
         wwn: dev.wwn ?? null,
+        smartHealthy: null, // enriched by DiskIdentityCache
         status,
         poolName,
         partitions,

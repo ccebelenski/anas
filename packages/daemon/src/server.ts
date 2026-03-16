@@ -37,31 +37,17 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: mockFixtures.lsblk() })
     mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
     mock.addFixture({ command: '/usr/sbin/smartctl', result: mockFixtures.smartctl() })
-    // Identity-only call used by DiskIdentityCache (smartctl -i)
-    mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-i', '--json', '/dev/sda'], result: {
-      stdout: JSON.stringify({ model_family: 'Samsung 870 EVO', model_name: 'Samsung SSD 870 EVO 250GB', form_factor: { name: '2.5 inches' }, firmware_version: 'SVT02B6Q', sata_version: { string: 'SATA 3.2, 6.0 Gb/s' }, trim: { supported: true } }),
+    // Identity + health call used by DiskIdentityCache (smartctl -iH)
+    const wdIdentity = { model_family: 'Western Digital Black', model_name: 'WDC WD2003FZEX-00SRLA0', form_factor: { name: '3.5 inches' }, firmware_version: '81.00A81', sata_version: { string: 'SATA 3.1, 6.0 Gb/s' }, smart_status: { passed: true } }
+    mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-iH', '--json', '/dev/sda'], result: {
+      stdout: JSON.stringify({ model_family: 'Samsung 870 EVO', model_name: 'Samsung SSD 870 EVO 250GB', form_factor: { name: '2.5 inches' }, firmware_version: 'SVT02B6Q', sata_version: { string: 'SATA 3.2, 6.0 Gb/s' }, trim: { supported: true }, smart_status: { passed: true } }),
       stderr: '', exitCode: 0,
     } })
-    mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-i', '--json', '/dev/sdb'], result: {
-      stdout: JSON.stringify({ model_family: 'Western Digital Black', model_name: 'WDC WD2003FZEX-00SRLA0', form_factor: { name: '3.5 inches' }, firmware_version: '81.00A81', sata_version: { string: 'SATA 3.1, 6.0 Gb/s' } }),
-      stderr: '', exitCode: 0,
-    } })
-    mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-i', '--json', '/dev/sdc'], result: {
-      stdout: JSON.stringify({ model_family: 'Western Digital Black', model_name: 'WDC WD2003FZEX-00SRLA0', firmware_version: '81.00A81' }),
-      stderr: '', exitCode: 0,
-    } })
-    mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-i', '--json', '/dev/sdd'], result: {
-      stdout: JSON.stringify({ model_family: 'Western Digital Black', model_name: 'WDC WD2003FZEX-00SRLA0', firmware_version: '81.00A81' }),
-      stderr: '', exitCode: 0,
-    } })
-    mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-i', '--json', '/dev/sde'], result: {
-      stdout: JSON.stringify({ model_family: 'Western Digital Black', model_name: 'WDC WD2003FZEX-00SRLA0', firmware_version: '81.00A81' }),
-      stderr: '', exitCode: 0,
-    } })
-    mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-i', '--json', '/dev/sdf'], result: {
-      stdout: JSON.stringify({ model_family: 'Western Digital Black', model_name: 'WDC WD2003FZEX-00SRLA0', firmware_version: '81.00A81' }),
-      stderr: '', exitCode: 0,
-    } })
+    for (const dev of ['/dev/sdb', '/dev/sdc', '/dev/sdd', '/dev/sde', '/dev/sdf']) {
+      mock.addFixture({ command: '/usr/sbin/smartctl', args: ['-iH', '--json', dev], result: {
+        stdout: JSON.stringify(wdIdentity), stderr: '', exitCode: 0,
+      } })
+    }
   }
 
   server.register(healthRoutes, { prefix: '/v1' })

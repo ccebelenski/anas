@@ -8,6 +8,7 @@ defineProps<{
 
 const emit = defineEmits<{
   (e: 'show-smart', diskId: string): void
+  (e: 'show-pool', poolName: string): void
 }>()
 
 function statusSeverity(status: string): 'success' | 'info' | 'secondary' | 'warn' {
@@ -41,6 +42,18 @@ function sectorInfo(disk: Disk): string {
   if (!phys && !log) return ''
   if (phys === log) return `${phys}B sectors`
   return `${log}B logical / ${phys}B physical`
+}
+
+function smartSeverity(healthy: boolean | null): 'success' | 'danger' | 'secondary' {
+  if (healthy === true) return 'success'
+  if (healthy === false) return 'danger'
+  return 'secondary'
+}
+
+function smartLabel(healthy: boolean | null): string {
+  if (healthy === true) return 'OK'
+  if (healthy === false) return 'FAIL'
+  return '—'
 }
 </script>
 
@@ -80,6 +93,16 @@ function sectorInfo(disk: Disk): string {
       </template>
     </Column>
 
+    <Column header="Health" sortable :sort-field="'smartHealthy'" style="width: 4.5rem;">
+      <template #body="{ data: disk }">
+        <Tag
+          :value="smartLabel(disk.smartHealthy)"
+          :severity="smartSeverity(disk.smartHealthy)"
+          v-tooltip.top="disk.smartHealthy === true ? 'SMART self-assessment: PASSED' : disk.smartHealthy === false ? 'SMART self-assessment: FAILED' : 'SMART not available'"
+        />
+      </template>
+    </Column>
+
     <Column field="status" header="Status" sortable style="width: 7rem;">
       <template #body="{ data: disk }">
         <Tag :value="statusLabel(disk.status)" :severity="statusSeverity(disk.status)" />
@@ -88,7 +111,13 @@ function sectorInfo(disk: Disk): string {
 
     <Column field="poolName" header="Pool" sortable style="width: 6rem;">
       <template #body="{ data: disk }">
-        {{ disk.poolName ?? '-' }}
+        <span
+          v-if="disk.poolName"
+          class="pool-link"
+          :data-pool-link="disk.poolName"
+          @click="emit('show-pool', disk.poolName!)"
+        >{{ disk.poolName }}</span>
+        <span v-else>-</span>
       </template>
     </Column>
 
@@ -99,7 +128,8 @@ function sectorInfo(disk: Disk): string {
           text
           rounded
           size="small"
-          v-tooltip.top="'SMART health'"
+          :data-smart-btn="disk.id"
+          v-tooltip.top="'SMART details'"
           @click="emit('show-smart', disk.id)"
         />
       </template>
@@ -112,3 +142,13 @@ function sectorInfo(disk: Disk): string {
     </template>
   </DataTable>
 </template>
+
+<style scoped>
+.pool-link {
+  color: #89b4fa;
+  cursor: pointer;
+}
+.pool-link:hover {
+  text-decoration: underline;
+}
+</style>
