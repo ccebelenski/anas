@@ -166,9 +166,9 @@ function formatDate(iso: string | null): string {
   flex-wrap: wrap;
   gap: 1.5rem;
   padding: 0.75rem 1rem;
-  background: var(--p-surface-800);
+  background: #181825;
   border-radius: 6px;
-  border: 1px solid var(--p-surface-700);
+  border: 1px solid #313244;
 }
 
 .stat {
@@ -182,14 +182,14 @@ function formatDate(iso: string | null): string {
 
 .stat-value small {
   font-weight: 400;
-  color: var(--p-text-muted-color);
+  color: #a6adc8;
 }
 
 .stat-label {
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: var(--p-text-muted-color);
+  color: #a6adc8;
   margin-top: 0.1rem;
 }
 
@@ -199,10 +199,10 @@ function formatDate(iso: string | null): string {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: var(--p-text-muted-color);
+  color: #a6adc8;
   margin: 0 0 0.5rem;
   padding-bottom: 0.25rem;
-  border-bottom: 1px solid var(--p-surface-700);
+  border-bottom: 1px solid #313244;
 }
 
 /* Key-value rows */
@@ -215,7 +215,7 @@ function formatDate(iso: string | null): string {
 }
 
 .kv-key {
-  color: var(--p-text-muted-color);
+  color: #a6adc8;
   min-width: 5rem;
 }
 
@@ -229,7 +229,7 @@ function formatDate(iso: string | null): string {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--p-text-muted-color);
+  color: #a6adc8;
   margin-bottom: 0.35rem;
 }
 
@@ -262,7 +262,7 @@ function formatDate(iso: string | null): string {
 }
 
 .topo-disk-errors {
-  color: var(--p-text-muted-color);
+  color: #a6adc8;
   font-size: 0.75rem;
 }
 
@@ -280,6 +280,6 @@ function formatDate(iso: string | null): string {
   font-size: 0.85rem;
 }
 
-.text-muted { color: var(--p-text-muted-color); font-style: italic; font-size: 0.85rem; }
+.text-muted { color: #a6adc8; font-style: italic; font-size: 0.85rem; }
 .text-error { color: var(--p-red-400); font-weight: 600; }
 </style>
