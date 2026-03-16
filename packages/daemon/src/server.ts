@@ -3,9 +3,11 @@ import Fastify from 'fastify'
 import { AuditLogger } from './audit/logger.js'
 import { MockExecutor } from './executor/mock.js'
 import { ProdExecutor } from './executor/prod.js'
+import { mockFixtures } from './fixtures/loader.js'
 import { JobQueue } from './jobs/queue.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
+import { poolRoutes } from './routes/pools.js'
 
 export interface ServerOptions {
   /** Use mock executor instead of real commands. Default: false. */
@@ -23,8 +25,16 @@ export function createServer(opts?: ServerOptions) {
     ? new MockExecutor()
     : new ProdExecutor()
 
+  // Register mock fixtures for dev mode
+  if (opts?.mock) {
+    const mock = executor as MockExecutor
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-j'], result: mockFixtures.zpoolStatus() })
+  }
+
   server.register(healthRoutes, { prefix: '/v1' })
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
+  server.register(poolRoutes, { prefix: '/v1', executor })
 
   server.decorate('jobQueue', jobQueue)
   server.decorate('executor', executor)
