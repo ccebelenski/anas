@@ -1,0 +1,6 @@
+<network>
+  <name>anas-test</name>
+  <forward mode='nat'/>
+  <bridge name='virbr-anas' stp='on' delay='0'/>
+  <ip address='192.168.200.1' netmask='255.255.255.0'/>
+</network>

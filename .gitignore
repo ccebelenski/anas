@@ -4,3 +4,10 @@ dist/
 .output/
 *.sock
 .DS_Store
+
+# Playwright
+test-results/
+playwright-report/
+
+# Stunt node (developer-specific)
+test/stunt-node/config.local
