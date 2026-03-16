@@ -5,6 +5,7 @@ Stories follow the format: **As a [role], I want to [action], so that [outcome].
 Roles:
 - **user** — any authenticated user. If you're logged in, you can see and do everything. Auth is binary: logged in or not.
 - **dev** — developer/engineering role. Dev stories are non-deliverable prerequisites: infrastructure, scaffolding, parsers, test harnesses. They exist to make the scope of foundational work visible.
+- **component** — a UI component or API endpoint that consumes data from another part of the system. Component-as-actor stories make dependency graphs explicit: the dashboard *consumes* what the pool status component *provides*.
 
 Story numbering is for identification only, not implementation order. Within each epic, stories are ordered by natural workflow: observe → understand → act.
 
@@ -64,9 +65,9 @@ Story numbering is for identification only, not implementation order. Within eac
 
 0.5.6. [done] As a dev, I want a test harness that authenticates through Proxmox (real PVEAuthCookie + RSA-SHA1 verification), navigates to ANAS, and verifies the dashboard loads, so that the full auth chain is tested.
 
-0.5.7. As a dev, I want integration test helpers that create/verify/destroy ZFS pools and datasets on the stunt VM, so that storage operations can be tested end-to-end.
+0.5.7. As a dev, I want integration test helpers that create/verify/destroy ZFS pools and datasets on the stunt VM, so that storage operations can be tested end-to-end. *(Activates with Epic 3.)*
 
-0.5.8. As a dev, I want integration test helpers that create/verify/destroy SMB and NFS shares on the stunt VM, so that share management can be tested end-to-end.
+0.5.8. As a dev, I want integration test helpers that create/verify/destroy SMB and NFS shares on the stunt VM, so that share management can be tested end-to-end. *(Activates with Epics 6–7.)*
 
 #### CI Strategy
 *Integration tests are a manual gate — the PR reviewer runs them on their stunt node before approving. CI (GitHub Actions) stays lint/typecheck/build only.*
@@ -75,11 +76,11 @@ Story numbering is for identification only, not implementation order. Within eac
 
 ## Epic 1: Authentication & Session Management
 
-> As a user, I can access ANAS securely, with seamless authentication when coming from Proxmox.
+> [done] Proxmox owns auth. ANAS verifies PVEAuthCookie locally via RSA-SHA1.
 
 ### Stories
 
-1.1. As a user, I want to access ANAS from the Proxmox UI sidebar and be automatically authenticated via my Proxmox session, so that it feels like part of Proxmox with no separate login.
+1.1. As a user, I want to access ANAS from the Proxmox UI sidebar and be automatically authenticated via my Proxmox session, so that it feels like part of Proxmox with no separate login. *(Deferred to Epic 10 — sidebar installation is a setup concern.)*
 
 1.2. [OBE] ~~As a user, I want a fallback login page with PAM authentication, so that I can access ANAS directly (not through Proxmox) if needed.~~ *ANAS is always accessed through Proxmox; PVE owns auth.*
 
@@ -96,32 +97,16 @@ Story numbering is for identification only, not implementation order. Within eac
 
 ---
 
-## Epic 2: Dashboard & System Overview
-
-> As a user, I want a single view that tells me the health of my storage and shares at a glance.
-
-### Stories
-
-2.1. As a user, I want to see the health status of all ZFS pools on the dashboard, so that I can quickly identify problems.
-
-2.2. As a user, I want to see disk utilization summaries, so that I know when I'm running low on space.
-
-2.3. As a user, I want to see active SMB and NFS shares with their status, so that I can confirm services are running.
-
-2.4. As a user, I want to see recent job activity on the dashboard, so that I know what operations have been performed.
-
-2.5. As a user, I want to see warnings (degraded pools, failed scrubs, disk errors) prominently, so that I can take action before data loss.
-
-#### Dev
-2.6. As a dev, I want a unified system status endpoint in anasd that aggregates pool health, share status, and disk state, so that the dashboard can render from a single call.
-
----
-
 ## Epic 3: ZFS Pool Management
 
 > As a user, I can create, manage, and monitor ZFS storage pools.
 
 ### Stories
+
+#### Dev (build first — parsers and data layer)
+3.15. As a dev, I want a ZFS output parser that handles both JSON (`-j`) and parseable (`-Hp`) formats, so that pool/vdev/disk data is consistently structured regardless of ZFS version.
+
+3.16. As a dev, I want mock ZFS command output fixtures (healthy pool, degraded pool, mid-scrub, etc.), so that I can develop and test the UI against realistic data.
 
 #### Observe
 3.1. As a user, I want to see all available disks and their current usage (unpartitioned, part of a pool, etc.), so that I understand what hardware I have.
@@ -152,11 +137,6 @@ Story numbering is for identification only, not implementation order. Within eac
 3.13. As a user, I want to export a pool, so that I can safely move it to another system.
 
 3.14. As a user, I want to destroy a pool, so that I can reclaim the disks. *(Confirmation required, clearly dangerous.)*
-
-#### Dev
-3.15. As a dev, I want a ZFS output parser that handles both JSON (`-j`) and parseable (`-Hp`) formats, so that pool/vdev/disk data is consistently structured regardless of ZFS version.
-
-3.16. As a dev, I want mock ZFS command output fixtures (healthy pool, degraded pool, mid-scrub, etc.), so that I can develop and test the UI against realistic data.
 
 ---
 
@@ -214,6 +194,11 @@ Story numbering is for identification only, not implementation order. Within eac
 
 ### Stories
 
+#### Dev (build first — parser)
+6.9. As a dev, I want a round-trip smb.conf parser (parse → modify → write) that preserves comments, whitespace, ordering, and unknown directives, so that surgical config editing works correctly.
+
+6.10. As a dev, I want smb.conf test fixtures (minimal, complex, hand-edited with comments, Proxmox-default), so that the parser is tested against real-world configs.
+
 #### Observe
 6.1. As a user, I want to see all configured SMB shares (including ones created outside ANAS), so that I have a complete picture of what's shared.
 
@@ -232,11 +217,6 @@ Story numbering is for identification only, not implementation order. Within eac
 
 6.8. As a user, I want ANAS to reload the SMB service after configuration changes, so that changes take effect without manual intervention.
 
-#### Dev
-6.9. As a dev, I want a round-trip smb.conf parser (parse → modify → write) that preserves comments, whitespace, ordering, and unknown directives, so that surgical config editing works correctly.
-
-6.10. As a dev, I want smb.conf test fixtures (minimal, complex, hand-edited with comments, Proxmox-default), so that the parser is tested against real-world configs.
-
 ---
 
 ## Epic 7: NFS Export Management
@@ -244,6 +224,9 @@ Story numbering is for identification only, not implementation order. Within eac
 > As a user, I can create and manage NFS exports for Linux/Unix clients.
 
 ### Stories
+
+#### Dev (build first — parser)
+7.7. As a dev, I want a round-trip /etc/exports parser (parse → modify → write) that preserves comments, whitespace, and unknown entries, so that surgical config editing works correctly.
 
 #### Observe
 7.1. As a user, I want to see all configured NFS exports (including ones created outside ANAS), so that I have a complete picture of what's exported.
@@ -258,9 +241,6 @@ Story numbering is for identification only, not implementation order. Within eac
 7.5. As a user, I want to remove an NFS export, so that I can revoke access.
 
 7.6. As a user, I want ANAS to reload NFS exports after configuration changes, so that changes take effect without manual intervention.
-
-#### Dev
-7.7. As a dev, I want a round-trip /etc/exports parser (parse → modify → write) that preserves comments, whitespace, and unknown entries, so that surgical config editing works correctly.
 
 ---
 
@@ -305,6 +285,28 @@ Story numbering is for identification only, not implementation order. Within eac
 
 ---
 
+## Epic 2: Dashboard & System Overview
+
+> Assembles data from Epics 3, 4, 6, 7, and 9 into a single-page overview. **Depends on the observe stories in those epics being built first** — the dashboard composes components, it doesn't build the data layer.
+
+### Stories
+
+#### Dev
+2.6. As the dashboard page, I want a unified status endpoint in anasd (`GET /v1/status`) that aggregates pool health, share status, and disk state, so that I can render from a single API call instead of fanning out.
+
+#### Compose
+2.1. As the dashboard, I want a pool health summary component (from Epic 3), so that I can display pool status without knowing ZFS internals.
+
+2.2. As the dashboard, I want a disk utilization component (from Epic 3), so that I can show space usage at a glance.
+
+2.3. As the dashboard, I want a share status component (from Epics 6/7), so that I can show SMB/NFS service health and active shares.
+
+2.4. As the dashboard, I want a recent jobs component (from Epic 9), so that I can show recent activity.
+
+2.5. As the dashboard, I want a warnings/alerts component that surfaces degraded pools, failed scrubs, and disk errors prominently, so that problems are impossible to miss.
+
+---
+
 ## Epic 10: System Setup & Configuration
 
 > As a user, I can install ANAS on my Proxmox system quickly and have it integrate automatically.
@@ -334,18 +336,20 @@ Story numbering is for identification only, not implementation order. Within eac
 
 ## MVP Scope
 
-For V1 MVP, the priority order is:
+For V1 MVP, the implementation order is:
 
-1. **Epic 10** — Setup & config (foundation — can't do anything without it)
-2. **Epic 1** — Auth (can't use it without logging in)
-3. **Epic 9** — Jobs (infrastructure — every mutation depends on this)
-4. **Epic 3** — ZFS pools (core value proposition)
-5. **Epic 4** — ZFS datasets (core value proposition)
-6. **Epic 5** — Snapshots (core value proposition)
-7. **Epic 6** — SMB shares (core value proposition)
-8. **Epic 7** — NFS exports (core value proposition)
+1. **Epic 0** — Foundation *(done)*
+2. **Epic 0.5** — Test infrastructure *(done — stunt node, Playwright)*
+3. **Epic 1** — Auth *(done — PVE RSA-SHA1 verification; sidebar deferred to Epic 10)*
+4. **Epic 3** — ZFS pools (core value proposition — parsers first, then observe, then act)
+5. **Epic 4** — ZFS datasets (builds on pool infrastructure)
+6. **Epic 5** — Snapshots (builds on dataset infrastructure)
+7. **Epic 6** — SMB shares (parser first, then CRUD)
+8. **Epic 7** — NFS exports (parser first, then CRUD)
 9. **Epic 8** — Users & groups (required for share security)
-10. **Epic 2** — Dashboard (polish — can ship without it initially)
+10. **Epic 9** — Jobs UI (infrastructure exists from Epic 0; this is the user-facing view)
+11. **Epic 2** — Dashboard (composes components built in 3–9; last because it depends on everything)
+12. **Epic 10** — Setup & packaging (install, setup, doctor — can develop in parallel once core features work)
 
 Stories marked *(V2?)* are explicitly deferred.
 
