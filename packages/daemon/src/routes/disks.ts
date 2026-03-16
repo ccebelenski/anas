@@ -24,15 +24,20 @@ export async function diskRoutes(
     // Build a Map<diskId, poolName> from zpool status vdev trees
     const poolDisks = new Map<string, string>()
     if (statusResult.exitCode === 0 && statusResult.stdout.trim()) {
-      const pools = parseZpoolStatus(statusResult.stdout)
-      for (const pool of pools) {
-        for (const group of pool.vdevGroups) {
-          for (const vdev of group.vdevs) {
-            for (const disk of vdev.disks) {
-              poolDisks.set(disk.id, pool.name)
+      try {
+        const pools = parseZpoolStatus(statusResult.stdout)
+        for (const pool of pools) {
+          for (const group of pool.vdevGroups) {
+            for (const vdev of group.vdevs) {
+              for (const disk of vdev.disks) {
+                poolDisks.set(disk.id, pool.name)
+              }
             }
           }
         }
+      }
+      catch {
+        // zpool status returned unexpected output — continue with empty pool map
       }
     }
 
@@ -50,12 +55,8 @@ export async function diskRoutes(
     const disk = disks.find(d => d.id === id)
 
     if (!disk) {
-      return reply.status(404).send({
-        error: {
-          code: 'NOT_FOUND',
-          message: `Disk '${id}' not found`,
-        },
-      })
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Disk '${id}' not found` } }
     }
 
     return { data: disk }
@@ -67,12 +68,8 @@ export async function diskRoutes(
     const disk = disks.find(d => d.id === id)
 
     if (!disk) {
-      return reply.status(404).send({
-        error: {
-          code: 'NOT_FOUND',
-          message: `Disk '${id}' not found`,
-        },
-      })
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Disk '${id}' not found` } }
     }
 
     const smartResult = await executor.exec('/usr/sbin/smartctl', [

@@ -173,9 +173,10 @@ function parseVdev(raw: ZfsVdevRaw): Vdev {
 }
 
 function parseDisk(raw: ZfsVdevRaw): PoolDisk {
+  const id = stripPartSuffix(raw.name)
   return {
-    id: stripPartSuffix(raw.name),
-    path: (raw.path ?? `/dev/disk/by-id/${raw.name}`) as `/dev/${string}`,
+    id,
+    path: (raw.path ?? `/dev/disk/by-id/${id}`) as `/dev/${string}`,
     state: raw.state as VdevState,
     readErrors: parseIntOrZero(raw.read_errors),
     writeErrors: parseIntOrZero(raw.write_errors),
