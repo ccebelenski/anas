@@ -74,7 +74,7 @@ export class PveAuthProvider implements AuthProvider {
 
   private verifySignature(plaintext: string, signatureB64: string, pubKey: string): boolean {
     try {
-      const verifier = createVerify('RSA-SHA256')
+      const verifier = createVerify('RSA-SHA1')
       verifier.update(plaintext)
       return verifier.verify(pubKey, signatureB64, 'base64')
     }
