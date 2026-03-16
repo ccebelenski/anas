@@ -75,9 +75,11 @@ export function parseLsblk(
         path: `/dev/${dev.name}` as `/dev/${string}`,
         size: dev.size,
         model: trimOrNull(dev.model),
+        modelFamily: null, // enriched by DiskIdentityCache
         serial: trimOrNull(dev.serial),
         vendor: trimOrNull(dev.vendor),
         revision: trimOrNull(dev.rev),
+        formFactor: null, // enriched by DiskIdentityCache
         transport: dev.tran,
         rotational: dev.rota,
         physicalSectorSize: dev['phy-sec'] ?? null,

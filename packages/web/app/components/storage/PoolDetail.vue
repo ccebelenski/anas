@@ -225,7 +225,11 @@ const propertyHelp: Record<string, string> = {
               <div v-if="getDiskInfo(disk)" class="topo-disk-line2">
                 <span class="topo-hw-item">/dev/{{ getDiskInfo(disk)!.name }}</span>
                 <span class="topo-hw-sep">·</span>
-                <span class="topo-hw-item">{{ getDiskInfo(disk)!.model }}</span>
+                <span class="topo-hw-item">{{ getDiskInfo(disk)!.modelFamily ?? getDiskInfo(disk)!.model }}</span>
+                <template v-if="getDiskInfo(disk)!.formFactor">
+                  <span class="topo-hw-sep">·</span>
+                  <span class="topo-hw-item">{{ getDiskInfo(disk)!.formFactor }}</span>
+                </template>
                 <template v-if="getDiskInfo(disk)!.revision">
                   <span class="topo-hw-sep">·</span>
                   <span class="topo-hw-item">FW {{ getDiskInfo(disk)!.revision }}</span>

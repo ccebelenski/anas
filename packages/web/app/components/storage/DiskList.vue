@@ -60,8 +60,8 @@ function sectorInfo(disk: Disk): string {
 
     <Column field="model" header="Model" sortable>
       <template #body="{ data: disk }">
-        <span v-tooltip.bottom="[disk.vendor, disk.revision ? `FW: ${disk.revision}` : null, sectorInfo(disk)].filter(Boolean).join(' · ') || undefined">
-          {{ disk.model ?? '-' }}
+        <span v-tooltip.bottom="[disk.model, disk.vendor, disk.revision ? `FW: ${disk.revision}` : null, disk.formFactor, sectorInfo(disk)].filter(Boolean).join(' · ') || undefined">
+          {{ disk.modelFamily ?? disk.model ?? '-' }}
         </span>
       </template>
     </Column>

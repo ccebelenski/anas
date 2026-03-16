@@ -43,12 +43,16 @@ export const Disk = z.object({
   size: z.number().nonnegative(),
   /** Disk model string */
   model: z.string().nullable(),
+  /** Human-readable model family, e.g. "Western Digital Red Pro" */
+  modelFamily: z.string().nullable(),
   /** Serial number */
   serial: z.string().nullable(),
   /** Vendor string */
   vendor: z.string().nullable(),
   /** Firmware revision */
   revision: z.string().nullable(),
+  /** Form factor, e.g. "2.5 inches", "3.5 inches" */
+  formFactor: z.string().nullable(),
   /** Transport type: "sata", "nvme", "sas", "usb", etc. */
   transport: z.string().nullable(),
   /** Rotational disk (HDD=true, SSD/NVMe=false) */

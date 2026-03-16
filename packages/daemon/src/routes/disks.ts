@@ -1,5 +1,7 @@
 import type { FastifyInstance } from 'fastify'
+import type { Disk } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { parseLsblk, LSBLK_ARGS } from '../parsers/lsblk.js'
 import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
@@ -7,12 +9,12 @@ import { parseSmartctl } from '../parsers/smartctl.js'
 
 export async function diskRoutes(
   server: FastifyInstance,
-  opts: { executor: CommandExecutor },
+  opts: { executor: CommandExecutor, diskIdentityCache: DiskIdentityCache },
 ) {
-  const { executor } = opts
+  const { executor, diskIdentityCache } = opts
 
   /** Fetch all disk data: lsblk, by-id mapping, and pool membership. */
-  async function fetchDisks() {
+  async function fetchDisks(): Promise<Disk[]> {
     const [lsblkResult, byIdResult, statusResult] = await Promise.all([
       executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
       executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
@@ -21,7 +23,6 @@ export async function diskRoutes(
 
     const byIdMap = parseDiskByIdListing(byIdResult.stdout)
 
-    // Build a Map<diskId, poolName> from zpool status vdev trees
     const poolDisks = new Map<string, string>()
     if (statusResult.exitCode === 0 && statusResult.stdout.trim()) {
       try {
@@ -37,11 +38,27 @@ export async function diskRoutes(
         }
       }
       catch {
-        // zpool status returned unexpected output — continue with empty pool map
+        // continue with empty pool map
       }
     }
 
-    return parseLsblk(lsblkResult.stdout, byIdMap, poolDisks)
+    const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks)
+
+    // Lazy-load identity cache for all disks in parallel
+    await diskIdentityCache.loadMany(disks.map(d => ({ id: d.id, path: d.path })))
+
+    // Enrich disks with cached identity
+    return disks.map(d => {
+      const identity = diskIdentityCache.getCached(d.id)
+      if (!identity) return { ...d, modelFamily: null, formFactor: null }
+      return {
+        ...d,
+        modelFamily: identity.modelFamily,
+        formFactor: identity.formFactor,
+        // Override revision with smartctl firmware if available (often more detailed)
+        revision: identity.firmwareVersion ?? d.revision,
+      }
+    })
   }
 
   server.get('/disks', async (_request, reply) => {
@@ -78,9 +95,6 @@ export async function diskRoutes(
       disk.path,
     ])
 
-    // smartctl returns non-zero exit codes for various conditions
-    // (e.g. bit 0 = command parse error, bit 2 = disk open error)
-    // but still produces valid JSON output in most cases
     const smartData = parseSmartctl(smartResult.stdout)
     return { data: smartData }
   })
