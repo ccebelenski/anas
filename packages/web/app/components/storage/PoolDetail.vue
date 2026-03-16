@@ -198,7 +198,9 @@ const propertyHelp: Record<string, string> = {
     <section class="detail-section">
       <h3>Topology</h3>
       <div v-for="group in pool.vdevGroups" :key="group.role" class="topo-group">
-        <div class="topo-group-header">
+        <div class="topo-pool-root">
+          <span class="topo-pool-name">{{ pool.name }}</span>
+          <Tag :value="pool.state" :severity="stateSeverity(pool.state)" />
           <span class="topo-group-desc">{{ groupDescription(group) }}</span>
         </div>
         <div
@@ -357,19 +359,31 @@ const propertyHelp: Record<string, string> = {
 /* Topology */
 .topo-group {
   margin-bottom: 1rem;
+  border: 1px solid #313244;
+  border-radius: 6px;
+  padding: 0.5rem;
+  background: rgba(30, 30, 46, 0.5);
 }
 
-.topo-group-header {
+.topo-pool-root {
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  margin-bottom: 0.35rem;
+  padding: 0.25rem 0.25rem 0.4rem;
+  border-bottom: 1px solid #313244;
+  margin-bottom: 0.4rem;
 }
 
-.topo-group-desc {
+.topo-pool-name {
   font-size: 0.85rem;
   font-weight: 600;
   color: #cdd6f4;
+}
+
+.topo-group-desc {
+  font-size: 0.8rem;
+  color: #7f849c;
+  font-style: italic;
 }
 
 .topo-vdev-redundancy {

@@ -54,7 +54,7 @@ function sectorInfo(disk: Disk): string {
   >
     <Column field="name" header="Device" sortable style="width: 5rem;">
       <template #body="{ data: disk }">
-        <strong>/dev/{{ disk.name }}</strong>
+        <strong :data-disk-name="disk.name">/dev/{{ disk.name }}</strong>
       </template>
     </Column>
 

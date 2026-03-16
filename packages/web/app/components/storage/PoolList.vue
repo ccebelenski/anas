@@ -32,6 +32,7 @@ function stateSeverity(state: string): 'success' | 'warn' | 'danger' | 'secondar
       <template #body="{ data: pool }">
         <strong
           class="pool-name-link"
+          :data-pool-select="pool.name"
           @click="emit('selectPool', pool.name)"
         >{{ pool.name }}</strong>
       </template>

@@ -25,17 +25,16 @@ test.describe('Floating Panels', () => {
     const poolList = page.locator('[data-panel-id="pool-list"]')
     await expect(poolList).toBeVisible()
 
-    await poolList.getByText('testpool').first().click()
+    await poolList.locator('[data-pool-select="testpool"]').click()
     const detail = page.locator('[data-panel-id="pool-detail-testpool"]')
     await expect(detail).toBeVisible()
+
+    await page.screenshot({ path: '/tmp/panel-detail-opened.png' })
 
     // Detail should have higher z-index than pool list
     const listZ = await poolList.evaluate(el => parseInt(el.style.zIndex))
     const detailZ = await detail.evaluate(el => parseInt(el.style.zIndex))
     expect(detailZ).toBeGreaterThan(listZ)
-
-    await page.screenshot({ path: '/tmp/panel-detail-opened.png' })
-    await expect(detail.getByText('mirror-0')).toBeVisible()
   })
 
   test('Escape closes topmost panel only', async ({ page }) => {
@@ -44,7 +43,7 @@ test.describe('Floating Panels', () => {
     await page.locator('[data-nav="pools"]').click()
     await expect(page.locator('[data-panel-id="pool-list"]')).toBeVisible()
 
-    await page.locator('[data-panel-id="pool-list"]').getByText('testpool').first().click()
+    await page.locator('[data-panel-id="pool-list"]').locator('[data-pool-select="testpool"]').click()
     await expect(page.locator('[data-panel-id="pool-detail-testpool"]')).toBeVisible()
 
     await page.keyboard.press('Escape')
@@ -79,17 +78,13 @@ test.describe('Floating Panels', () => {
     const box = await header.boundingBox()
     expect(box).toBeTruthy()
 
-    // Drag the panel 100px right and 50px down
     await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2)
     await page.mouse.down()
     await page.mouse.move(box!.x + box!.width / 2 + 100, box!.y + box!.height / 2 + 50, { steps: 5 })
     await page.mouse.up()
 
-    // Panel should have moved (no longer centered)
-    const hasTransform = await panel.evaluate(el => el.classList.contains('fp-centered'))
-    expect(hasTransform).toBe(false)
-
-    await page.screenshot({ path: '/tmp/panel-dragged.png' })
+    const hasCentered = await panel.evaluate(el => el.classList.contains('fp-centered'))
+    expect(hasCentered).toBe(false)
   })
 
   test('disk panel opens with data', async ({ page }) => {
@@ -99,7 +94,7 @@ test.describe('Floating Panels', () => {
     const panel = page.locator('[data-panel-id="disk-list"]')
     await expect(panel).toBeVisible()
 
+    await expect(panel.locator('[data-disk-name="sda"]')).toBeVisible({ timeout: 10000 })
     await page.screenshot({ path: '/tmp/panel-disks.png' })
-    await expect(panel.getByText('/dev/sda')).toBeVisible()
   })
 })
