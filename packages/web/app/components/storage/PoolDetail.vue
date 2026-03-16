@@ -24,6 +24,14 @@ function getDiskInfo(poolDisk: PoolDisk): Disk | undefined {
   return diskMap.value.get(poolDisk.id)
 }
 
+function sectorDesc(disk: Disk): string {
+  const p = disk.physicalSectorSize
+  const l = disk.logicalSectorSize
+  if (!p && !l) return ''
+  if (p === l) return `${p}B`
+  return `${p}B/${l}B`
+}
+
 function stateSeverity(state: string): 'success' | 'warn' | 'danger' | 'info' | 'secondary' {
   switch (state) {
     case 'ONLINE': return 'success'
@@ -207,17 +215,30 @@ const propertyHelp: Record<string, string> = {
               class="topo-disk"
               :class="{ 'has-errors': hasErrors(disk) }"
             >
-              <div class="topo-disk-main">
+              <div class="topo-disk-line1">
                 <Tag :value="disk.state" :severity="stateSeverity(disk.state)" />
                 <span class="topo-disk-id">{{ disk.id }}</span>
                 <span class="topo-disk-errors" v-tooltip.right="'Read / Write / Checksum errors'">
                   R:{{ disk.readErrors }} W:{{ disk.writeErrors }} C:{{ disk.checksumErrors }}
                 </span>
               </div>
-              <div v-if="getDiskInfo(disk)" class="topo-disk-info">
-                <span>/dev/{{ getDiskInfo(disk)!.name }}</span>
-                <span>{{ getDiskInfo(disk)!.model ?? '' }}</span>
-                <span>{{ formatBytes(getDiskInfo(disk)!.size) }}</span>
+              <div v-if="getDiskInfo(disk)" class="topo-disk-line2">
+                <span class="topo-hw-item">/dev/{{ getDiskInfo(disk)!.name }}</span>
+                <span class="topo-hw-sep">·</span>
+                <span class="topo-hw-item">{{ getDiskInfo(disk)!.model }}</span>
+                <template v-if="getDiskInfo(disk)!.revision">
+                  <span class="topo-hw-sep">·</span>
+                  <span class="topo-hw-item">FW {{ getDiskInfo(disk)!.revision }}</span>
+                </template>
+              </div>
+              <div v-if="getDiskInfo(disk)" class="topo-disk-line2">
+                <span class="topo-hw-item">{{ formatBytes(getDiskInfo(disk)!.size) }}</span>
+                <span class="topo-hw-sep">·</span>
+                <span class="topo-hw-item">Serial {{ getDiskInfo(disk)!.serial }}</span>
+                <template v-if="sectorDesc(getDiskInfo(disk)!)">
+                  <span class="topo-hw-sep">·</span>
+                  <span class="topo-hw-item">{{ sectorDesc(getDiskInfo(disk)!) }} sectors</span>
+                </template>
               </div>
             </div>
           </div>
@@ -378,7 +399,7 @@ const propertyHelp: Record<string, string> = {
   border-bottom: none;
 }
 
-.topo-disk-main {
+.topo-disk-line1 {
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -401,13 +422,22 @@ const propertyHelp: Record<string, string> = {
   font-weight: 600;
 }
 
-.topo-disk-info {
+.topo-disk-line2 {
   display: flex;
-  gap: 1rem;
-  margin-left: 2rem;
-  margin-top: 0.1rem;
+  align-items: center;
+  gap: 0.3rem;
+  margin-left: 3.5rem;
   font-size: 0.75rem;
-  color: #6c7086;
+  color: #7f849c;
+  line-height: 1.4;
+}
+
+.topo-hw-sep {
+  color: #585b70;
+}
+
+.topo-hw-item {
+  white-space: nowrap;
 }
 
 /* Properties — compact inline chips */
