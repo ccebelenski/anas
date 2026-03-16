@@ -109,17 +109,17 @@ Story numbering is for identification only, not implementation order. Within eac
 3.16. [done] As a dev, I want real ZFS command output fixtures captured from the stunt node (healthy, degraded, mid-scrub, mid-resilver, suspended), so that I can develop and test the UI against realistic data.
 
 #### Observe
-3.1. As a user, I want to see all available disks and their current usage (unpartitioned, part of a pool, etc.), so that I understand what hardware I have.
+3.1. [done] As a user, I want to see all available disks and their current usage (unpartitioned, part of a pool, etc.), so that I understand what hardware I have.
 
-3.2. As a user, I want to see the status of each pool (online, degraded, faulted, scrub progress), so that I can monitor health.
+3.2. [done] As a user, I want to see the status of each pool (online, degraded, faulted, scrub progress), so that I can monitor health.
 
-3.3. As a user, I want to see the vdev topology of a pool (which disks are in which vdevs, spares, cache, log), so that I understand the physical layout.
+3.3. [done] As a user, I want to see the vdev topology of a pool (which disks are in which vdevs, spares, cache, log), so that I understand the physical layout.
 
-3.4. As a user, I want to see pool properties (ashift, autoexpand, etc.), so that I understand current configuration.
+3.4. [done] As a user, I want to see pool properties (ashift, autoexpand, etc.), so that I understand current configuration.
 
-3.5. As a user, I want to see scrub progress and history, so that I know when the last integrity check ran and how it went.
+3.5. [done] As a user, I want to see scrub progress and history, so that I know when the last integrity check ran and how it went.
 
-3.6. As a user, I want to see SMART health data for individual disks, so that I can identify drives that may be failing.
+3.6. [done] As a user, I want to see SMART health data for individual disks, so that I can identify drives that may be failing.
 
 #### Act
 3.7. As a user, I want to import an existing pool (e.g., after moving disks from another system), so that I can access the data.
