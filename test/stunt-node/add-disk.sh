@@ -20,8 +20,8 @@ if [ ! -f "$DISK_PATH" ]; then
   qemu-img create -f qcow2 "$DISK_PATH" 512M
 fi
 
-# Use sdb, sdc, sdd for hot disks (sda is the system disk)
-TARGET="sd$(printf "\\x$(printf '%02x' $((97 + DISK_NUM)))")"
+# sda=system, sdb=cdrom, so hot disks start at sdc
+TARGET="sd$(printf "\\x$(printf '%02x' $((98 + DISK_NUM)))")"
 
 echo "Attaching hot${DISK_NUM} to ${VM_NAME} as ${TARGET}..."
 sudo virsh attach-disk "$VM_NAME" \

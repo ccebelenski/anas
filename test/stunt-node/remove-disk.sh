@@ -11,8 +11,8 @@ if [[ ! "$DISK_NUM" =~ ^[1-3]$ ]]; then
   exit 1
 fi
 
-# Match the target device from add-disk.sh
-TARGET="sd$(printf "\\x$(printf '%02x' $((97 + DISK_NUM)))")"
+# sda=system, sdb=cdrom, so hot disks start at sdc (matching add-disk.sh)
+TARGET="sd$(printf "\\x$(printf '%02x' $((98 + DISK_NUM)))")"
 
 echo "Detaching hot${DISK_NUM} from ${VM_NAME}..."
 sudo virsh detach-disk "$VM_NAME" "$TARGET" --live
