@@ -1,26 +1,76 @@
 <script setup lang="ts">
 const props = defineProps<{
-  /** Panel title shown in the header bar */
   title: string
-  /** Unique panel identifier for testing and click-outside logic */
   panelId: string
 }>()
 
 const visible = defineModel<boolean>('visible', { required: true })
 
-// Global panel stack on window — survives HMR, shared across all instances
-function getPanelStack(): string[] {
-  if (import.meta.client) {
-    const w = window as any
-    if (!w.__fpStack) w.__fpStack = []
-    return w.__fpStack
-  }
-  return []
+// --- Global state on window (survives HMR, shared across instances) ---
+function getStack(): string[] {
+  if (!import.meta.client) return []
+  const w = window as any
+  if (!w.__fpStack) w.__fpStack = []
+  return w.__fpStack
 }
-let nextZ = 1000
 
+function getNextZ(): number {
+  if (!import.meta.client) return 1000
+  const w = window as any
+  w.__fpZ = (w.__fpZ ?? 1000) + 10
+  return w.__fpZ
+}
+
+// --- Panel position & z-index ---
 const zIndex = ref(1000)
+const posX = ref(0)
+const posY = ref(0)
+const positioned = ref(false) // false = auto-center, true = user dragged
 
+// --- Drag state ---
+const dragging = ref(false)
+let dragStartX = 0
+let dragStartY = 0
+let dragOriginX = 0
+let dragOriginY = 0
+
+function onDragStart(e: MouseEvent) {
+  // Only drag on left-click, not on close button
+  if (e.button !== 0) return
+  if ((e.target as HTMLElement).closest('[data-close-panel]')) return
+  dragging.value = true
+  dragStartX = e.clientX
+  dragStartY = e.clientY
+  dragOriginX = posX.value
+  dragOriginY = posY.value
+  document.addEventListener('mousemove', onDragMove)
+  document.addEventListener('mouseup', onDragEnd)
+  e.preventDefault()
+}
+
+function onDragMove(e: MouseEvent) {
+  posX.value = dragOriginX + (e.clientX - dragStartX)
+  posY.value = dragOriginY + (e.clientY - dragStartY)
+  positioned.value = true
+}
+
+function onDragEnd() {
+  dragging.value = false
+  document.removeEventListener('mousemove', onDragMove)
+  document.removeEventListener('mouseup', onDragEnd)
+}
+
+// --- Bring to front on click ---
+function bringToFront() {
+  zIndex.value = getNextZ()
+  // Move to top of stack
+  const stack = getStack()
+  const idx = stack.indexOf(props.panelId)
+  if (idx !== -1) stack.splice(idx, 1)
+  stack.push(props.panelId)
+}
+
+// --- Close ---
 function close() {
   visible.value = false
 }
@@ -32,16 +82,20 @@ function onClickOutside(e: MouseEvent) {
 }
 
 function onKeydown(e: KeyboardEvent) {
-  const stack = getPanelStack()
+  const stack = getStack()
   if (e.key === 'Escape' && stack[stack.length - 1] === props.panelId) {
     close()
   }
 }
 
+// --- Lifecycle ---
 function activate() {
-  nextZ += 10
-  zIndex.value = nextZ
-  const stack = getPanelStack()
+  zIndex.value = getNextZ()
+  // Center on screen
+  posX.value = 0
+  posY.value = 0
+  positioned.value = false
+  const stack = getStack()
   if (!stack.includes(props.panelId)) stack.push(props.panelId)
   nextTick(() => {
     document.addEventListener('mousedown', onClickOutside)
@@ -50,10 +104,13 @@ function activate() {
 }
 
 function deactivate() {
-  const s = getPanelStack(); const idx = s.indexOf(props.panelId)
+  const s = getStack()
+  const idx = s.indexOf(props.panelId)
   if (idx !== -1) s.splice(idx, 1)
   document.removeEventListener('mousedown', onClickOutside)
   document.removeEventListener('keydown', onKeydown)
+  document.removeEventListener('mousemove', onDragMove)
+  document.removeEventListener('mouseup', onDragEnd)
 }
 
 watch(visible, (val) => {
@@ -66,76 +123,83 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  const idx = panelStack.indexOf(props.panelId)
-  if (idx !== -1) panelStack.splice(idx, 1)
-  document.removeEventListener('mousedown', onClickOutside)
-  document.removeEventListener('keydown', onKeydown)
+  deactivate()
 })
 </script>
 
 <template>
   <Teleport to="body">
-    <Transition name="fp-anim">
+    <div
+      v-if="visible"
+      :data-panel-id="panelId"
+      data-floating-panel
+      class="fp-card"
+      :class="{ 'fp-dragging': dragging, 'fp-centered': !positioned }"
+      :style="{
+        zIndex,
+        ...(positioned ? { left: posX + 'px', top: posY + 'px' } : {}),
+      }"
+      @mousedown="bringToFront"
+    >
       <div
-        v-if="visible"
-        :data-panel-id="panelId"
-        data-floating-panel
-        class="fp-backdrop"
-        :style="{ zIndex }"
+        class="fp-header"
+        @mousedown="onDragStart"
       >
-        <div class="fp-card">
-          <div class="fp-header">
-            <span class="fp-title">{{ title }}</span>
-            <button class="fp-close" :data-close-panel="panelId" @click="close" aria-label="Close">
-              <i class="pi pi-times" />
-            </button>
-          </div>
-          <div class="fp-body">
-            <slot />
-          </div>
-        </div>
+        <span class="fp-title">{{ title }}</span>
+        <button class="fp-close" :data-close-panel="panelId" @click="close" aria-label="Close">
+          <i class="pi pi-times" />
+        </button>
       </div>
-    </Transition>
+      <div class="fp-body">
+        <slot />
+      </div>
+    </div>
   </Teleport>
 </template>
 
 <style>
-/* Global styles — not scoped, because Teleport renders outside component tree */
-.fp-backdrop {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  pointer-events: none;
-}
-
 .fp-card {
-  pointer-events: auto;
+  position: fixed;
   background: var(--p-surface-900);
-  border: 1px solid var(--p-surface-600);
+  border: 1px solid var(--p-surface-500);
   border-radius: 8px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
   max-height: 80vh;
-  width: min(92vw, 1000px);
+  width: min(92vw, 960px);
   display: flex;
   flex-direction: column;
+}
+
+/* Auto-center when not yet dragged */
+.fp-centered {
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.fp-dragging {
+  user-select: none;
 }
 
 .fp-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.6rem 1rem;
-  border-bottom: 1px solid var(--p-surface-700);
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--p-surface-600);
   flex-shrink: 0;
-  background: var(--p-surface-800);
+  background: var(--p-surface-700);
   border-radius: 8px 8px 0 0;
+  cursor: grab;
+}
+
+.fp-dragging .fp-header {
+  cursor: grabbing;
 }
 
 .fp-title {
   font-weight: 600;
-  font-size: 0.95rem;
+  font-size: 0.9rem;
   color: var(--p-text-color);
 }
 
@@ -144,33 +208,22 @@ onUnmounted(() => {
   border: none;
   color: var(--p-text-muted-color);
   cursor: pointer;
-  padding: 0.35rem;
+  padding: 0.3rem 0.5rem;
   border-radius: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 1rem;
+  font-size: 0.9rem;
 }
 
 .fp-close:hover {
   color: var(--p-text-color);
-  background: var(--p-surface-600);
+  background: var(--p-surface-500);
 }
 
 .fp-body {
-  padding: 1rem;
+  padding: 0.75rem;
   overflow: auto;
   flex: 1;
-}
-
-.fp-anim-enter-active,
-.fp-anim-leave-active {
-  transition: opacity 0.15s ease, transform 0.15s ease;
-}
-
-.fp-anim-enter-from,
-.fp-anim-leave-to {
-  opacity: 0;
-  transform: scale(0.95);
 }
 </style>

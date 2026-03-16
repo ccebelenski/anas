@@ -182,14 +182,14 @@ function formatDate(iso: string | null): string {
 
 .stat-value small {
   font-weight: 400;
-  opacity: 0.6;
+  color: var(--p-text-muted-color);
 }
 
 .stat-label {
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  opacity: 0.5;
+  color: var(--p-text-muted-color);
   margin-top: 0.1rem;
 }
 
@@ -199,7 +199,7 @@ function formatDate(iso: string | null): string {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  opacity: 0.5;
+  color: var(--p-text-muted-color);
   margin: 0 0 0.5rem;
   padding-bottom: 0.25rem;
   border-bottom: 1px solid var(--p-surface-700);
@@ -215,7 +215,7 @@ function formatDate(iso: string | null): string {
 }
 
 .kv-key {
-  opacity: 0.5;
+  color: var(--p-text-muted-color);
   min-width: 5rem;
 }
 
@@ -229,7 +229,7 @@ function formatDate(iso: string | null): string {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  opacity: 0.5;
+  color: var(--p-text-muted-color);
   margin-bottom: 0.35rem;
 }
 
@@ -262,7 +262,7 @@ function formatDate(iso: string | null): string {
 }
 
 .topo-disk-errors {
-  opacity: 0.4;
+  color: var(--p-text-muted-color);
   font-size: 0.75rem;
 }
 
@@ -280,6 +280,6 @@ function formatDate(iso: string | null): string {
   font-size: 0.85rem;
 }
 
-.text-muted { opacity: 0.5; font-style: italic; font-size: 0.85rem; }
+.text-muted { color: var(--p-text-muted-color); font-style: italic; font-size: 0.85rem; }
 .text-error { color: var(--p-red-400); font-weight: 600; }
 </style>
