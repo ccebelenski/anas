@@ -9,6 +9,15 @@ export default defineConfig({
   reporter: 'html',
   projects: [
     {
+      name: 'dev',
+      testDir: './tests/dev',
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: 'http://localhost:3100',
+        screenshot: 'on',
+      },
+    },
+    {
       name: 'integration',
       testDir: './tests/integration',
       use: {
