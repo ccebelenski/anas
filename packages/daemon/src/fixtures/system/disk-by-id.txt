@@ -1,17 +1,16 @@
 total 0
-drwxr-xr-x 2 root root 320 Mar 16 02:08 .
-drwxr-xr-x 9 root root 180 Mar 16 02:08 ..
-lrwxrwxrwx 1 root root   9 Mar 16 01:33 ata-QEMU_DVD-ROM_QM00003 -> ../../sr0
-lrwxrwxrwx 1 root root  13 Mar 16 02:07 nvme-QEMU_NVMe_Ctrl_ANAS_HOT3 -> ../../nvme0n1
-lrwxrwxrwx 1 root root  13 Mar 16 02:07 nvme-QEMU_NVMe_Ctrl_ANAS_HOT3_1 -> ../../nvme0n1
-lrwxrwxrwx 1 root root  13 Mar 16 02:07 nvme-nvme.1b36-414e41535f484f5433-51454d55204e564d65204374726c-00000001 -> ../../nvme0n1
-lrwxrwxrwx 1 root root   9 Mar 16 02:07 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1 -> ../../sdb
-lrwxrwxrwx 1 root root  10 Mar 16 02:08 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1 -> ../../sdb1
-lrwxrwxrwx 1 root root  10 Mar 16 02:08 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part9 -> ../../sdb9
-lrwxrwxrwx 1 root root   9 Mar 16 02:07 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2 -> ../../sdc
-lrwxrwxrwx 1 root root  10 Mar 16 02:08 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part1 -> ../../sdc1
-lrwxrwxrwx 1 root root  10 Mar 16 02:08 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part9 -> ../../sdc9
-lrwxrwxrwx 1 root root   9 Mar 16 01:18 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0 -> ../../sda
-lrwxrwxrwx 1 root root  10 Mar 16 01:18 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0-part1 -> ../../sda1
-lrwxrwxrwx 1 root root  11 Mar 16 01:18 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0-part14 -> ../../sda14
-lrwxrwxrwx 1 root root  11 Mar 16 01:18 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0-part15 -> ../../sda15
+drwxr-xr-x 2 root root 320 Mar 15 22:12 .
+drwxr-xr-x 9 root root 180 Mar 15 22:12 ..
+lrwxrwxrwx 1 root root   9 Mar 15 22:12 ata-Samsung_SSD_870_S6PPNG0R400123 -> ../../sda
+lrwxrwxrwx 1 root root  10 Mar 15 22:12 ata-Samsung_SSD_870_S6PPNG0R400123-part1 -> ../../sda1
+lrwxrwxrwx 1 root root  11 Mar 15 22:12 ata-Samsung_SSD_870_S6PPNG0R400123-part15 -> ../../sda15
+lrwxrwxrwx 1 root root   9 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-12345678 -> ../../sdb
+lrwxrwxrwx 1 root root  10 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-12345678-part1 -> ../../sdb1
+lrwxrwxrwx 1 root root  10 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-12345678-part9 -> ../../sdb9
+lrwxrwxrwx 1 root root   9 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-23456789 -> ../../sdc
+lrwxrwxrwx 1 root root  10 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-23456789-part1 -> ../../sdc1
+lrwxrwxrwx 1 root root   9 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-34567890 -> ../../sdd
+lrwxrwxrwx 1 root root  10 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-34567890-part1 -> ../../sdd1
+lrwxrwxrwx 1 root root   9 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-45678901 -> ../../sde
+lrwxrwxrwx 1 root root  10 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-45678901-part1 -> ../../sde1
+lrwxrwxrwx 1 root root   9 Mar 15 22:12 ata-WDC_WD2003FZEX-00SRLA0_WD-56789012 -> ../../sdf

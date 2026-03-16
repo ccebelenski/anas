@@ -17,16 +17,15 @@ function loadText(name: string) {
 }
 
 describe('parseLsblk', () => {
-  it('parses all physical disks (excludes CD-ROM)', () => {
+  it('parses all physical disks', () => {
     const byIdMap = parseDiskByIdListing(loadText('disk-by-id.txt'))
     const disks = parseLsblk(loadJson('lsblk.json'), byIdMap)
 
-    // Should include sda (system), sdb, sdc, nvme0n1 — but NOT sr0 (rom)
     const names = disks.map(d => d.name)
     assert.ok(names.includes('sda'))
     assert.ok(names.includes('sdb'))
-    assert.ok(names.includes('nvme0n1'))
-    assert.ok(!names.includes('sr0'))
+    assert.ok(names.includes('sdf'))
+    assert.equal(disks.length, 6)
   })
 
   it('identifies system disk', () => {
@@ -41,8 +40,8 @@ describe('parseLsblk', () => {
   it('identifies pool member disks', () => {
     const byIdMap = parseDiskByIdListing(loadText('disk-by-id.txt'))
     const poolDisks = new Map([
-      ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1', 'testpool'],
-      ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2', 'testpool'],
+      ['ata-WDC_WD2003FZEX-00SRLA0_WD-12345678', 'testpool'],
+      ['ata-WDC_WD2003FZEX-00SRLA0_WD-23456789', 'testpool'],
     ])
     const disks = parseLsblk(loadJson('lsblk.json'), byIdMap, poolDisks)
 
@@ -56,23 +55,23 @@ describe('parseLsblk', () => {
     const byIdMap = parseDiskByIdListing(loadText('disk-by-id.txt'))
     const disks = parseLsblk(loadJson('lsblk.json'), byIdMap)
 
-    const nvme = disks.find(d => d.name === 'nvme0n1')
-    assert.ok(nvme)
-    assert.equal(nvme.status, 'available')
-    assert.equal(nvme.poolName, null)
+    const sdf = disks.find(d => d.name === 'sdf')
+    assert.ok(sdf)
+    assert.equal(sdf.status, 'available')
+    assert.equal(sdf.poolName, null)
   })
 
   it('parses disk properties correctly', () => {
     const byIdMap = parseDiskByIdListing(loadText('disk-by-id.txt'))
     const disks = parseLsblk(loadJson('lsblk.json'), byIdMap)
 
-    const nvme = disks.find(d => d.name === 'nvme0n1')
-    assert.ok(nvme)
-    assert.equal(nvme.size, 536870912)
-    assert.equal(nvme.model, 'QEMU NVMe Ctrl')
-    assert.equal(nvme.serial, 'ANAS_HOT3')
-    assert.equal(nvme.transport, 'nvme')
-    assert.equal(nvme.rotational, false)
+    const sdb = disks.find(d => d.name === 'sdb')
+    assert.ok(sdb)
+    assert.equal(sdb.size, 268435456000)
+    assert.ok(sdb.model?.includes('WDC'))
+    assert.equal(sdb.serial, 'WD-12345678')
+    assert.equal(sdb.transport, 'sata')
+    assert.equal(sdb.rotational, true)
   })
 
   it('parses partitions', () => {

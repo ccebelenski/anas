@@ -15,21 +15,21 @@
             "zpl_version": "5",
             "properties": {
                 "size": {
-                    "value": "480M",
+                    "value": "480G",
                     "source": {
                         "type": "NONE",
                         "data": "-"
                     }
                 },
                 "allocated": {
-                    "value": "178M",
+                    "value": "178G",
                     "source": {
                         "type": "NONE",
                         "data": "-"
                     }
                 },
                 "free": {
-                    "value": "302M",
+                    "value": "302G",
                     "source": {
                         "type": "NONE",
                         "data": "-"

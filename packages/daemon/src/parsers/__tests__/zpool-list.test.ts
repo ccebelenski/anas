@@ -19,7 +19,7 @@ describe('parseZpoolList', () => {
     const pool = result[0]
     assert.equal(pool.name, 'testpool')
     assert.equal(pool.state, 'ONLINE')
-    assert.equal(pool.size, 480 * 1024 * 1024)
+    assert.equal(pool.size, 480 * 1024 * 1024 * 1024)
     assert.ok(pool.allocated >= 0)
     assert.ok(pool.free > 0)
     assert.equal(pool.fragmentation, 12)

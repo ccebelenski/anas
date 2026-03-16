@@ -220,20 +220,20 @@ const propertyHelp: Record<string, string> = {
       </div>
     </section>
 
-    <!-- Properties -->
+    <!-- Properties (compact inline) -->
     <section class="detail-section">
       <h3>Properties</h3>
-      <div class="props-grid">
-        <template v-for="(value, key) in {
+      <div class="props-inline">
+        <span v-for="(value, key) in {
           ashift: pool.properties.ashift,
           autoexpand: pool.properties.autoexpand ? 'on' : 'off',
           autoreplace: pool.properties.autoreplace ? 'on' : 'off',
           autotrim: pool.properties.autotrim ? 'on' : 'off',
           failmode: pool.properties.failmode,
-        }" :key="key">
-          <span class="kv-key" v-tooltip.right="propertyHelp[key]">{{ key }}</span>
-          <span>{{ value }}</span>
-        </template>
+        }" :key="key" class="prop-chip" v-tooltip.top="propertyHelp[key]">
+          <span class="prop-name">{{ key }}</span>
+          <span class="prop-val">{{ value }}</span>
+        </span>
       </div>
     </section>
   </div>
@@ -399,12 +399,32 @@ const propertyHelp: Record<string, string> = {
   color: #6c7086;
 }
 
-/* Properties */
-.props-grid {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 0.2rem 1.5rem;
-  font-size: 0.85rem;
+/* Properties — compact inline chips */
+.props-inline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.prop-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.2rem 0.5rem;
+  background: #181825;
+  border: 1px solid #313244;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  cursor: help;
+}
+
+.prop-name {
+  color: #bac2de;
+}
+
+.prop-val {
+  color: #cdd6f4;
+  font-weight: 600;
 }
 
 .error-detail {

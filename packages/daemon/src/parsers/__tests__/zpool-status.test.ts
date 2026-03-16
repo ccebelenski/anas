@@ -14,7 +14,7 @@ function loadFixture(name: string) {
 }
 
 describe('parseZpoolStatus', () => {
-  it('parses ONLINE mirror pool', () => {
+  it('parses ONLINE mirror pool with spare', () => {
     const result = parseZpoolStatus(loadFixture('zpool-status-online.json'))
     assert.equal(result.length, 1)
     const pool = result[0]
@@ -23,24 +23,26 @@ describe('parseZpoolStatus', () => {
     assert.equal(pool.errorCount, 0)
     assert.equal(pool.health, undefined)
 
-    // Vdev groups
-    assert.equal(pool.vdevGroups.length, 1)
-    const dataGroup = pool.vdevGroups[0]
-    assert.equal(dataGroup.role, 'data')
-    assert.equal(dataGroup.vdevs.length, 1)
+    // Data group — two mirrors
+    const dataGroup = pool.vdevGroups.find(g => g.role === 'data')
+    assert.ok(dataGroup)
+    assert.equal(dataGroup.vdevs.length, 2)
 
-    // Mirror vdev
-    const mirror = dataGroup.vdevs[0]
-    assert.equal(mirror.name, 'mirror-0')
-    assert.equal(mirror.type, 'mirror')
-    assert.equal(mirror.state, 'ONLINE')
-    assert.equal(mirror.disks.length, 2)
+    const mirror0 = dataGroup.vdevs[0]
+    assert.equal(mirror0.name, 'mirror-0')
+    assert.equal(mirror0.type, 'mirror')
+    assert.equal(mirror0.state, 'ONLINE')
+    assert.equal(mirror0.disks.length, 2)
 
-    // Disks
-    const disk1 = mirror.disks[0]
-    assert.equal(disk1.id, 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1')
-    assert.equal(disk1.state, 'ONLINE')
-    assert.equal(disk1.readErrors, 0)
+    const mirror1 = dataGroup.vdevs[1]
+    assert.equal(mirror1.name, 'mirror-1')
+    assert.equal(mirror1.disks.length, 2)
+
+    // Spare group
+    const spareGroup = pool.vdevGroups.find(g => g.role === 'spare')
+    assert.ok(spareGroup)
+    assert.equal(spareGroup.vdevs[0].disks.length, 1)
+    assert.equal(spareGroup.vdevs[0].disks[0].state, 'AVAIL')
   })
 
   it('parses ONLINE pool with finished scrub', () => {
