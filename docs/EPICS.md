@@ -106,7 +106,7 @@ Story numbering is for identification only, not implementation order. Within eac
 #### Dev (build first — parsers and data layer)
 3.15. As a dev, I want a ZFS output parser that handles both JSON (`-j`) and parseable (`-Hp`) formats, so that pool/vdev/disk data is consistently structured regardless of ZFS version.
 
-3.16. As a dev, I want mock ZFS command output fixtures (healthy pool, degraded pool, mid-scrub, etc.), so that I can develop and test the UI against realistic data.
+3.16. As a dev, I want real ZFS command output fixtures captured from the stunt node (healthy, degraded, mid-scrub, mid-resilver, faulted), so that I can develop and test the UI against realistic data. *(Capture by forcing states: `zpool offline` for degraded, disk removal for faulted. The stunt node is expendable — snapshot/restore if it breaks.)*
 
 #### Observe
 3.1. As a user, I want to see all available disks and their current usage (unpartitioned, part of a pool, etc.), so that I understand what hardware I have.
