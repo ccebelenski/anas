@@ -302,9 +302,14 @@
                     children.push(buildPoolNode(results[j].pool, results[j].datasets));
                 }
                 try {
-                    var root = tree.getRootNode();
-                    root.removeAll();
-                    root.appendChild(children);
+                    // Replace the whole root atomically. Incrementally mutating
+                    // an already-rendered root (removeAll + appendChild) can leave
+                    // a stale phantom row in the tree view; setRootNode forces a
+                    // clean rebuild.
+                    tree.setRootNode({
+                        expanded: true,
+                        children: children,
+                    });
                 } catch (e2) {
                     ANAS.warn('dataset tree build failed: ' + ANAS.errText(e2));
                 }

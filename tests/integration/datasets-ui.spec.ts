@@ -41,8 +41,12 @@ test.describe('ANAS Datasets panel (stunt node)', () => {
 
     const grid = page.locator('.anas-grid-datasets')
     await expect(grid).toBeVisible({ timeout: 45_000 })
-    // The flat list includes the pool root dataset.
+    // The tree shows the pool root (testpool) and its child (share1).
     await expect(grid.getByText('testpool').first()).toBeVisible({ timeout: 45_000 })
+
+    // The pool root must appear EXACTLY once — guards the tree-rebuild phantom-row
+    // regression (a stale view row survived removeAll+appendChild; setRootNode fixed it).
+    await expect(grid.locator('.x-tree-node-text', { hasText: /^testpool$/ })).toHaveCount(1)
 
     // Native, not embedded: the retired iframe approach must be gone entirely.
     await expect(page.locator('.anas-view-datasets iframe')).toHaveCount(0)
