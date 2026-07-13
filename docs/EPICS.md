@@ -130,7 +130,12 @@ Story numbering is for identification only, not implementation order. Within eac
 
 3.19. [done] As a user, I want per-disk health and a Replace action inline in the pool topology, so I can act on a failing disk in the context where I see it.
 
+3.20. [backlog] As a user, I want the Disk Health view grouped by pool → vdev (with unassigned/available disks in their own group), so that many disks stay scannable instead of a flat horde. *(Cheap — ExtJS grid grouping on a computed key. A graphical disk→vdev→pool connection diagram is a possible later, heavier follow-on.)*
+
 #### Act
+3.21. [backlog] As a user, I want to create a pool with — and add to an existing pool — a **special** (and dedup) allocation-class vdev, so that metadata and small blocks live on fast devices. *(Not yet possible: CreatePoolRequest has log/cache/spare but not special/dedup; AddVdevRequest takes only a data VdevSpec. Requires schema extension + UI. SAFETY: a special vdev holds pool-wide metadata — its loss loses the whole pool — so the UI must ENFORCE redundancy, ideally matching pool redundancy, not merely warn.)*
+
+
 3.7. [done] As a user, I want to import an existing pool (e.g., after moving disks from another system), so that I can access the data.
 
 3.8. [done] As a user, I want to create a ZFS pool by selecting disks and a redundancy level (mirror, raidz, raidz2, etc.), so that I can set up storage appropriate for my needs.
@@ -313,6 +318,8 @@ Story numbering is for identification only, not implementation order. Within eac
 2.4. As the dashboard, I want a recent jobs component (from Epic 9), so that I can show recent activity.
 
 2.5. As the dashboard, I want a warnings/alerts component that surfaces degraded pools, failed scrubs, and disk errors prominently, so that problems are impossible to miss.
+
+2.7. [backlog] As a user, I want ZFS-specific performance telemetry on the dashboard (ARC hit ratio & size, L2ARC, per-pool `zpool iostat` throughput/IOPS, compression ratio, live scrub/resilver rate), so I get the storage insight TrueNAS gives that PVE's generic RRD graphs don't. *(Do NOT duplicate PVE's node CPU/mem/disk-IO graphs — Principle 15. Principle 7 tension: prefer live on-demand sampling while the panel is open, or PVE's RRD, over a background collector; persisted history is a separate discussion. Data sources: /proc/spl/kstat/zfs/arcstats, `zpool iostat`.)*
 
 ---
 
