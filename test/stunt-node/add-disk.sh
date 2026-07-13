@@ -5,19 +5,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
 usage() {
-  echo "Usage: add-disk.sh [--nvme] <1|2|3>"
-  echo "  --nvme  Attach as NVMe device (default: SCSI)"
+  echo "Usage: add-disk.sh [--nvme] [--size <MB>] <n>"
+  echo "  <n>      Disk index (1,2,… → serial ANAS_HOT<n>, by-id scsi-…ANAS_HOT<n>)"
+  echo "  --nvme   Attach as NVMe device (default: SCSI)"
+  echo "  --size   Image size in MB (default: 512). Spares can be small, e.g. 100."
   exit 1
 }
 
 BUS="scsi"
 DISK_NUM=""
+SIZE_MB="512"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --nvme) BUS="nvme"; shift ;;
-    [1-3])  DISK_NUM="$1"; shift ;;
-    *)      usage ;;
+    --nvme)  BUS="nvme"; shift ;;
+    --size)  SIZE_MB="$2"; shift 2 ;;
+    [0-9]|[0-9][0-9]) DISK_NUM="$1"; shift ;;
+    *)       usage ;;
   esac
 done
 
@@ -28,8 +32,8 @@ SERIAL="ANAS_HOT${DISK_NUM}"
 
 # Create disk image on demand if it doesn't exist
 if [ ! -f "$DISK_PATH" ]; then
-  echo "Creating hot${DISK_NUM} disk image..."
-  qemu-img create -f qcow2 "$DISK_PATH" 512M
+  echo "Creating hot${DISK_NUM} disk image (${SIZE_MB}M)..."
+  qemu-img create -f qcow2 "$DISK_PATH" "${SIZE_MB}M"
 fi
 
 # QEMU runs as 'qemu' user — needs read/write access

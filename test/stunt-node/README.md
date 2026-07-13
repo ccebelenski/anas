@@ -65,7 +65,8 @@ The VM runs on an isolated NAT network (`anas-test`, 192.168.200.0/24).
 | `ssh.sh` | SSH into the VM |
 | `snapshot.sh <name>` | Take offline snapshot |
 | `restore.sh <name>` | Restore snapshot + start VM |
-| `add-disk.sh <1\|2\|3>` | Create + hot-attach a disk (512M, on demand) |
+| `add-disk.sh [--size <MB>] <n>` | Create + hot-attach one disk `ANAS_HOT<n>` (default 512M) |
+| `add-spare-disks.sh [count] [start] [MB]` | Batch-attach small spares (default 12 × 100M, `ANAS_HOT4`+) for multi-disk pool tests |
 | `remove-disk.sh <1\|2\|3>` | Hot-detach a disk |
 | `deploy-anas.sh` | Build + rsync + restart services |
 | `setup-test-data.sh` | Attach disks + create test pool and shares |
