@@ -72,7 +72,12 @@ export function parseLsblk(
         status = 'system'
       else if (poolName)
         status = 'pool_member'
-      else if (hasNonZfsPartitions(partitions))
+      else if (hasAnySignature(dev, partitions))
+        // Any partition (including a leftover zfs_member label) or a whole-disk
+        // filesystem means the disk is NOT empty. Such disks are never offered
+        // for vdev creation — only genuinely blank disks are 'available', so a
+        // user cannot accidentally clobber data. To reuse a non-empty disk it
+        // must be wiped first (e.g. destroy-with-cleanup).
         status = 'other'
 
       return {
@@ -129,8 +134,14 @@ function isSystemDisk(dev: LsblkDeviceRaw, partitions: DiskPartition[]): boolean
   return false
 }
 
-function hasNonZfsPartitions(partitions: DiskPartition[]): boolean {
-  return partitions.some(
-    p => p.fstype !== null && p.fstype !== 'zfs_member' && p.fstype !== '',
-  )
+/**
+ * True if the disk carries any on-disk signature and is therefore not empty:
+ * a partition table (any partitions at all, including ZFS's own part1/part9 and
+ * leftover zfs_member labels) or a filesystem written straight to the whole
+ * disk. Only a disk with neither is safe to hand to `zpool create`.
+ */
+function hasAnySignature(dev: LsblkDeviceRaw, partitions: DiskPartition[]): boolean {
+  if (partitions.length > 0)
+    return true
+  return dev.fstype !== null && dev.fstype !== ''
 }

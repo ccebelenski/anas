@@ -61,6 +61,26 @@ describe('parseLsblk', () => {
     assert.equal(sdf.poolName, null)
   })
 
+  it('does NOT mark a disk with a leftover zfs_member label as available', () => {
+    // A disk freed from a destroyed/exported pool keeps a zfs_member label but
+    // is in no active pool. It must be classed 'other' (not empty), so the
+    // vdev-creation picker never offers it — the user must wipe it first.
+    const input = {
+      blockdevices: [{
+        name: 'sdz',
+        type: 'disk',
+        size: 512_000_000,
+        children: [
+          { name: 'sdz1', fstype: 'zfs_member', mountpoint: null },
+          { name: 'sdz9', fstype: null, mountpoint: null },
+        ],
+      }],
+    }
+    const [disk] = parseLsblk(JSON.stringify(input), new Map())
+    assert.equal(disk.status, 'other')
+    assert.notEqual(disk.status, 'available')
+  })
+
   it('parses disk properties correctly', () => {
     const byIdMap = parseDiskByIdListing(loadText('disk-by-id.txt'))
     const disks = parseLsblk(loadJson('lsblk.json'), byIdMap)
