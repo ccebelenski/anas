@@ -90,16 +90,22 @@ describe('cORS', () => {
     await server.close()
   })
 
-  it('strips the port from an IPv6 Host header', async () => {
+  it('derives the allowed origin from an IPv6 Host header', async () => {
     const server = createServer({
       config: baseConfig(),
       authProvider: new AcceptAuthProvider(),
       logger: false,
     })
+    // The browser sends the matching Origin; the gateway echoes it only because
+    // it equals the host-derived PVE UI origin (port stripped from [addr]:port).
     const res = await server.inject({
       method: 'GET',
       url: '/api/health',
-      headers: { host: '[2001:db8::1]:3000', cookie: 'PVEAuthCookie=x' },
+      headers: {
+        host: '[2001:db8::1]:3000',
+        origin: 'https://2001:db8::1:8006',
+        cookie: 'PVEAuthCookie=x',
+      },
     })
     assert.equal(res.headers['access-control-allow-origin'], 'https://2001:db8::1:8006')
     await server.close()

@@ -47,14 +47,14 @@ test.describe('ANAS native panels (stunt node)', () => {
     await loginToPve(page)
     await openAnasItem(page, 'Pools')
 
-    const view = page.locator('.anas-view-pools')
-    await expect(view).toBeVisible({ timeout: 45_000 })
-
-    const grid = view.locator('.anas-grid-pools')
+    // The Pools grid IS the view panel (cls 'anas-view anas-view-pools
+    // anas-grid-pools' on one element), so match the grid directly.
+    const grid = page.locator('.anas-grid-pools')
+    await expect(grid).toBeVisible({ timeout: 45_000 })
     await expect(grid.getByText('testpool')).toBeVisible({ timeout: 45_000 })
 
     // Native, not embedded: the retired iframe approach must be gone entirely.
-    await expect(view.locator('iframe')).toHaveCount(0)
+    await expect(page.locator('.anas-view-pools iframe')).toHaveCount(0)
   })
 
   test('Start Scrub on testpool posts a 202 job and runs a real scrub', async ({ page }) => {
@@ -64,8 +64,9 @@ test.describe('ANAS native panels (stunt node)', () => {
     const grid = page.locator('.anas-grid-pools')
     await expect(grid).toBeVisible({ timeout: 45_000 })
 
-    // Select the testpool row, then trigger the toolbar scrub action.
-    await grid.getByText('testpool').click()
+    // Select the testpool row (click the grid row, not the inner text span —
+    // ExtJS row selection binds to the row element).
+    await grid.locator('.x-grid-row', { hasText: 'testpool' }).click()
     const scrubBtn = page.locator('.anas-btn-scrub')
     await expect(scrubBtn).toBeVisible({ timeout: 20_000 })
     await expect(scrubBtn).toBeEnabled()
@@ -117,8 +118,10 @@ test.describe('ANAS native panels (stunt node)', () => {
     await expect(smartBtn).toBeVisible({ timeout: 20_000 })
     await smartBtn.click()
 
-    // The SMART detail renders as an Ext.window.Window.
-    await expect(page.locator('.x-window')).toBeVisible({ timeout: 30_000 })
+    // The SMART detail renders as an Ext.window.Window. Exclude message-box
+    // windows (the subscription nag is a hidden .x-message-box that would make
+    // a bare .x-window match ambiguous under strict mode).
+    await expect(page.locator('.x-window:not(.x-message-box)')).toBeVisible({ timeout: 30_000 })
   })
 })
 

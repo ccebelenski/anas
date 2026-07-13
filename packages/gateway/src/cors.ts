@@ -40,20 +40,26 @@ export function allowedOrigin(request: FastifyRequest): string | undefined {
  * preflight (which carries no cookie).
  */
 export async function corsHook(request: FastifyRequest, reply: FastifyReply): Promise<void> {
-  const origin = allowedOrigin(request)
-  if (origin) {
-    reply.header('access-control-allow-origin', origin)
+  const allowed = allowedOrigin(request)
+  const requestOrigin = request.headers.origin
+
+  // Emit CORS headers only when the request's Origin is exactly the trusted
+  // PVE UI origin. Same-origin/non-browser requests (no Origin header) need no
+  // CORS headers, and disallowed origins must not receive any allow headers.
+  if (allowed && requestOrigin === allowed) {
+    reply.header('access-control-allow-origin', allowed)
     reply.header('access-control-allow-credentials', 'true')
     reply.header('vary', 'Origin')
+    reply.header('access-control-allow-methods', 'GET, POST, PUT, DELETE, OPTIONS')
+    reply.header('access-control-allow-headers', 'content-type, x-anas-confirm')
+    // The 409 confirmation contract lives in response headers the browser must
+    // read cross-origin; without this the ExtJS panels can't see the code.
+    reply.header('access-control-expose-headers', 'x-anas-confirm-code, x-anas-confirm-expires')
   }
-  reply.header('access-control-allow-methods', 'GET, POST, PUT, DELETE, OPTIONS')
-  reply.header('access-control-allow-headers', 'content-type, x-anas-confirm')
-  // The 409 confirmation contract lives in response headers the browser must
-  // read cross-origin; without this the ExtJS panels can't see the code.
-  reply.header('access-control-expose-headers', 'x-anas-confirm-code, x-anas-confirm-expires')
 
   if (request.method === 'OPTIONS') {
-    // Preflight: short-circuit before auth. 204, no body.
+    // Preflight: short-circuit before auth (a preflight carries no cookie).
+    // 204 with no allow headers for disallowed origins — the browser blocks.
     await reply.code(204).send()
   }
 }

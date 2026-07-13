@@ -268,8 +268,11 @@
                 afterrender: function (grid) {
                     loadPools(grid, node);
                 },
-                selectionchange: function (grid) {
-                    updateButtons(grid);
+                // ExtJS fires selectionchange with (selModel, selected, …) —
+                // the first arg is the selection model, NOT the grid. Use `this`
+                // (the grid, per listener scope) so updateButtons gets a real grid.
+                selectionchange: function () {
+                    updateButtons(this);
                 },
                 itemdblclick: function (grid, record) {
                     showPoolDetail(node, record.get('name'));
