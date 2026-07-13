@@ -1,56 +1,68 @@
 <script setup lang="ts">
-const showPools = ref(false)
-const showDisks = ref(false)
+// Story 13.2 — embedded mode hides ANAS chrome (sidebar + header).
+const embedded = useEmbedded()
+
 const showSmb = ref(false)
 const showNfs = ref(false)
 const showUsers = ref(false)
 const showJobs = ref(false)
+
+// Story 13.1 — top-level views are routes. Sidebar navigates instead of
+// opening list panels. Carry the embedded flag across programmatic navigation
+// (story 13.2) so it survives in-app navigation.
+function go(path: string) {
+  return navigateTo(embedded.value ? { path, query: { embedded: '1' } } : path)
+}
 </script>
 
 <template>
-  <div class="app-layout">
+  <div class="app-layout" :class="{ 'app-embedded': embedded }">
     <ClientOnly>
-    <aside class="app-sidebar" data-region="sidebar">
-      <div class="app-sidebar-header">
-        <h2>ANAS</h2>
-      </div>
-      <nav class="app-nav">
-        <button data-nav="dashboard" class="nav-item" @click="navigateTo('/')">
-          <i class="pi pi-home" /><span>Dashboard</span>
-        </button>
-
-        <div class="nav-group">
-          <div class="nav-group-label"><i class="pi pi-database" /><span>Storage</span></div>
-          <button data-nav="pools" class="nav-item nav-child" @click="showPools = true">
-            <i class="pi pi-server" /><span>Pools</span>
-          </button>
-          <button data-nav="disks" class="nav-item nav-child" @click="showDisks = true">
-            <i class="pi pi-circle" /><span>Disks</span>
-          </button>
+      <aside v-if="!embedded" class="app-sidebar" data-region="sidebar">
+        <div class="app-sidebar-header">
+          <h2>ANAS</h2>
         </div>
-
-        <div class="nav-group">
-          <div class="nav-group-label"><i class="pi pi-share-alt" /><span>Shares</span></div>
-          <button data-nav="smb" class="nav-item nav-child" @click="showSmb = true">
-            <i class="pi pi-folder" /><span>SMB</span>
+        <nav class="app-nav">
+          <button data-nav="dashboard" class="nav-item" @click="go('/')">
+            <i class="pi pi-home" /><span>Dashboard</span>
           </button>
-          <button data-nav="nfs" class="nav-item nav-child" @click="showNfs = true">
-            <i class="pi pi-folder-open" /><span>NFS</span>
-          </button>
-        </div>
 
-        <button data-nav="users" class="nav-item" @click="showUsers = true">
-          <i class="pi pi-users" /><span>Users & Groups</span>
-        </button>
-        <button data-nav="jobs" class="nav-item" @click="showJobs = true">
-          <i class="pi pi-list-check" /><span>Jobs</span>
-        </button>
-      </nav>
-    </aside>
+          <div class="nav-group">
+            <div class="nav-group-label">
+              <i class="pi pi-database" /><span>Storage</span>
+            </div>
+            <button data-nav="pools" class="nav-item nav-child" @click="go('/storage/pools')">
+              <i class="pi pi-server" /><span>Pools</span>
+            </button>
+            <button data-nav="disks" class="nav-item nav-child" @click="go('/storage/disks')">
+              <i class="pi pi-circle" /><span>Disks</span>
+            </button>
+          </div>
+
+          <div class="nav-group">
+            <div class="nav-group-label">
+              <i class="pi pi-share-alt" /><span>Shares</span>
+            </div>
+            <button data-nav="smb" class="nav-item nav-child" @click="showSmb = true">
+              <i class="pi pi-folder" /><span>SMB</span>
+            </button>
+            <button data-nav="nfs" class="nav-item nav-child" @click="showNfs = true">
+              <i class="pi pi-folder-open" /><span>NFS</span>
+            </button>
+          </div>
+
+          <button data-nav="users" class="nav-item" @click="showUsers = true">
+            <i class="pi pi-users" /><span>Users & Groups</span>
+          </button>
+          <button data-nav="jobs" class="nav-item" @click="showJobs = true">
+            <i class="pi pi-list-check" /><span>Jobs</span>
+          </button>
+        </nav>
+      </aside>
     </ClientOnly>
 
     <div class="app-main">
-      <header class="app-header">
+      <header v-if="!embedded" class="app-header">
         <div class="app-header-title">
           <slot name="header" />
         </div>
@@ -61,22 +73,26 @@ const showJobs = ref(false)
       </main>
     </div>
 
-    <!-- Floating panels — self-contained, fetch their own data -->
-    <StoragePoolListPanel v-model:visible="showPools" />
-    <StorageDiskListPanel v-model:visible="showDisks" />
-
-    <!-- Placeholders for future panels -->
+    <!-- Placeholders for future views (not yet routed — future epics) -->
     <FloatingPanel v-model:visible="showSmb" panel-id="smb" title="SMB Shares">
-      <p style="opacity: 0.5;">SMB shares coming soon.</p>
+      <p style="opacity: 0.5;">
+        SMB shares coming soon.
+      </p>
     </FloatingPanel>
     <FloatingPanel v-model:visible="showNfs" panel-id="nfs" title="NFS Exports">
-      <p style="opacity: 0.5;">NFS exports coming soon.</p>
+      <p style="opacity: 0.5;">
+        NFS exports coming soon.
+      </p>
     </FloatingPanel>
     <FloatingPanel v-model:visible="showUsers" panel-id="users" title="Users & Groups">
-      <p style="opacity: 0.5;">User management coming soon.</p>
+      <p style="opacity: 0.5;">
+        User management coming soon.
+      </p>
     </FloatingPanel>
     <FloatingPanel v-model:visible="showJobs" panel-id="jobs" title="Jobs">
-      <p style="opacity: 0.5;">Job history coming soon.</p>
+      <p style="opacity: 0.5;">
+        Job history coming soon.
+      </p>
     </FloatingPanel>
   </div>
 </template>
@@ -85,6 +101,15 @@ const showJobs = ref(false)
 .app-layout {
   display: flex;
   min-height: 100vh;
+}
+
+/* Embedded (inside PVE UI): no chrome, content fills the frame. */
+.app-embedded {
+  min-height: 100vh;
+}
+
+.app-embedded .app-content {
+  padding: 1rem;
 }
 
 .app-sidebar {
