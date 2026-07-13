@@ -55,6 +55,10 @@ export function createServer(opts?: ServerOptions) {
         exitCode: 0,
       } })
     }
+    // zpool set <prop>=<value> testpool — pool property updates (story 3.9)
+    for (const kv of ['autoexpand=on', 'autoexpand=off', 'autoreplace=on', 'autoreplace=off', 'autotrim=on', 'autotrim=off', 'failmode=wait', 'failmode=continue', 'failmode=panic']) {
+      mock.addFixture({ command: '/usr/sbin/zpool', args: ['set', kv, 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    }
   }
 
   server.register(healthRoutes, { prefix: '/v1' })
