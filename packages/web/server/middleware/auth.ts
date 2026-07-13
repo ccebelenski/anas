@@ -14,6 +14,15 @@ export default defineEventHandler(async (event) => {
     return
   }
 
+  // PVE ticket handoff page (story 13.3) — served without auth by design.
+  // It renders no data and makes no privileged calls before the session
+  // exists; its sole job is the cross-node postMessage handshake that
+  // establishes the PVEAuthCookie. Only the page itself is exempt — API
+  // routes (/api/*) stay protected. See docs/DESIGN.md "Ticket handoff".
+  if (path === '/auth/handoff') {
+    return
+  }
+
   const provider = getAuthProvider()
 
   // Dev provider: authenticate without a cookie
