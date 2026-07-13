@@ -31,8 +31,12 @@
 
     // Low-level fetch → Promise. Parses JSON when the response advertises it,
     // otherwise text. Resolves on 2xx (incl. 202), rejects otherwise with an
-    // Error carrying .status and .body.
-    function doFetch(method, url, body) {
+    // Error carrying .status, .body, and (for 409 confirmation) .confirmCode /
+    // .confirmExpires read from the X-Anas-Confirm-* response headers.
+    // `opts` may carry { confirmCode } — resent as the X-Anas-Confirm header to
+    // proceed through a dangerous operation's confirmation gate.
+    function doFetch(method, url, body, opts) {
+        opts = opts || {};
         return new Promise(function (resolve, reject) {
             if (typeof fetch !== 'function') {
                 var noFetch = new Error('fetch API unavailable');
@@ -41,17 +45,20 @@
                 return;
             }
 
-            var opts = {
+            var fetchOpts = {
                 method: method,
                 credentials: 'include',
                 headers: { Accept: 'application/json' },
             };
             if (body !== undefined && body !== null) {
-                opts.headers['Content-Type'] = 'application/json';
-                opts.body = JSON.stringify(body);
+                fetchOpts.headers['Content-Type'] = 'application/json';
+                fetchOpts.body = JSON.stringify(body);
+            }
+            if (opts.confirmCode) {
+                fetchOpts.headers['X-Anas-Confirm'] = opts.confirmCode;
             }
 
-            fetch(url, opts).then(function (res) {
+            fetch(url, fetchOpts).then(function (res) {
                 // Read as text, then attempt JSON — the gateway always speaks
                 // JSON, but reading text first keeps error bodies intact even
                 // when a proxy strips or mangles the Content-Type header.
@@ -77,6 +84,14 @@
                     var err = new Error(msg);
                     err.status = res.status;
                     err.body = data;
+                    // Confirmation contract (409): surface the code + expiry so
+                    // callers can prompt and resend. Headers are exposed via CORS.
+                    try {
+                        err.confirmCode = res.headers.get('x-anas-confirm-code') || null;
+                        err.confirmExpires = res.headers.get('x-anas-confirm-expires') || null;
+                    } catch (he) {
+                        // headers unreadable — leave undefined
+                    }
                     reject(err);
                 }, function (bodyErr) {
                     var e2 = new Error('failed to read response body: ' + (bodyErr && bodyErr.message));
@@ -95,21 +110,22 @@
     var api = {};
 
     // Per-node request. `path` is relative to /v1 and must start with '/'.
-    api.request = function (method, node, path, body) {
-        return doFetch(method, nodeBase(node) + path, body);
+    // `opts` (optional) may carry { confirmCode } for the confirmation flow.
+    api.request = function (method, node, path, body, opts) {
+        return doFetch(method, nodeBase(node) + path, body, opts);
     };
 
     api.get = function (node, path) {
         return api.request('GET', node, path);
     };
-    api.post = function (node, path, body) {
-        return api.request('POST', node, path, body);
+    api.post = function (node, path, body, opts) {
+        return api.request('POST', node, path, body, opts);
     };
-    api.put = function (node, path, body) {
-        return api.request('PUT', node, path, body);
+    api.put = function (node, path, body, opts) {
+        return api.request('PUT', node, path, body, opts);
     };
-    api.del = function (node, path) {
-        return api.request('DELETE', node, path);
+    api.del = function (node, path, opts) {
+        return api.request('DELETE', node, path, undefined, opts);
     };
 
     // Health probe. NOTE: the health endpoint is gateway-level, not under
@@ -121,4 +137,131 @@
     };
 
     ANAS.api = api;
+
+    // ---- Shared mutation helpers ----
+    //
+    // Every ANAS mutation is a job (202 + { job }). runJob submits the mutation
+    // and polls the job to completion, so views don't each re-implement polling.
+    //
+    // opts:
+    //   node, method ('post'|'put'|'del'), path, body, confirmCode
+    //   view       — a component; polling stops if it is destroyed
+    //   maxMs      — poll budget (default 15000)
+    //   successMsg — toast on completion
+    //   failTitle  — alert title on failure (default 'Operation failed')
+    //   onComplete(job) / onFailed(job) / onConfirm(err) — callbacks
+    // onConfirm receives the rejected 409 Error (with .confirmCode) so callers
+    // can prompt and retry with { confirmCode }. If absent, ANAS.confirmAndRun
+    // wraps this for the standard prompt flow.
+    ANAS.runJob = function (opts) {
+        var node = opts.node;
+        var method = (opts.method || 'post').toLowerCase();
+        var reqOpts = opts.confirmCode ? { confirmCode: opts.confirmCode } : undefined;
+        var call;
+        if (method === 'put') {
+            call = api.put(node, opts.path, opts.body, reqOpts);
+        } else if (method === 'del' || method === 'delete') {
+            call = api.del(node, opts.path, reqOpts);
+        } else {
+            call = api.post(node, opts.path, opts.body, reqOpts);
+        }
+        return call.then(function (res) {
+            var job = res && res.job;
+            if (!job || !job.id) {
+                if (opts.onComplete) { opts.onComplete(null); }
+                return;
+            }
+            ANAS.pollJob(node, job.id, opts);
+        }, function (err) {
+            if (err && err.status === 409 && err.confirmCode && opts.onConfirm) {
+                opts.onConfirm(err);
+                return;
+            }
+            if (opts.onFailed) { opts.onFailed(null); }
+            try {
+                Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), ANAS.errText(err));
+            } catch (e) {
+                ANAS.warn(ANAS.errText(err));
+            }
+        });
+    };
+
+    ANAS.pollJob = function (node, jobId, opts) {
+        var interval = 500;
+        var maxMs = opts.maxMs || 15000;
+        var elapsed = 0;
+        var view = opts.view;
+        function dead() {
+            return view && (view.destroyed || view.destroying);
+        }
+        function tick() {
+            if (dead()) { return; }
+            api.get(node, '/jobs/' + encodeURIComponent(jobId)).then(function (res) {
+                if (dead()) { return; }
+                var job = res && res.job;
+                var status = job && job.status;
+                if (status === 'completed') {
+                    if (opts.successMsg) { ANAS.toast(opts.successMsg); }
+                    if (opts.onComplete) { opts.onComplete(job); }
+                    return;
+                }
+                if (status === 'failed') {
+                    var msg = (job && job.error && job.error.message) || ANAS.t('unknown error');
+                    try {
+                        Ext.Msg.alert(ANAS.t(opts.failTitle || 'Operation failed'), msg);
+                    } catch (e) {
+                        ANAS.warn(msg);
+                    }
+                    if (opts.onFailed) { opts.onFailed(job); }
+                    return;
+                }
+                elapsed += interval;
+                if (elapsed >= maxMs) {
+                    // Still running after the wait window — treat as "kicked off
+                    // ok" and let the caller refresh; stop polling.
+                    if (opts.onComplete) { opts.onComplete(job); }
+                    return;
+                }
+                setTimeout(tick, interval);
+            }, function (err) {
+                if (dead()) { return; }
+                ANAS.warn('job poll failed: ' + ANAS.errText(err));
+            });
+        }
+        setTimeout(tick, interval);
+    };
+
+    // Dangerous-operation wrapper (Principle 14): run a mutation; on a 409 with a
+    // confirm code, show the server's warnings and, if the user confirms, resend
+    // with the code. `opts` is a runJob opts object; `confirmTitle`/`confirmIntro`
+    // customise the dialog.
+    ANAS.confirmAndRun = function (opts) {
+        var base = {};
+        var k;
+        for (k in opts) { if (opts.hasOwnProperty(k)) { base[k] = opts[k]; } }
+        base.onConfirm = function (err) {
+            var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
+            var intro = opts.confirmIntro || ANAS.t('This operation requires confirmation:');
+            var msg = intro;
+            if (warnings.length) {
+                msg += '<ul><li>' + warnings.map(function (w) {
+                    return Ext.String.htmlEncode(w);
+                }).join('</li><li>') + '</li></ul>';
+            }
+            try {
+                Ext.Msg.confirm(ANAS.t(opts.confirmTitle || 'Confirm'), msg, function (btn) {
+                    if (btn === 'yes') {
+                        var retry = {};
+                        var j;
+                        for (j in opts) { if (opts.hasOwnProperty(j)) { retry[j] = opts[j]; } }
+                        retry.confirmCode = err.confirmCode;
+                        ANAS.runJob(retry);
+                    }
+                });
+            } catch (e) {
+                ANAS.warn('confirm dialog failed: ' + ANAS.errText(e));
+            }
+        };
+        ANAS.runJob(base);
+    };
 })();

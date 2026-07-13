@@ -18,6 +18,25 @@
 
     var ANAS = window.ANAS || (window.ANAS = {});
 
+    // ---- Pools action registry --------------------------------------------
+    //
+    // Per-operation view files (31-*, 32-*, …) register toolbar actions here
+    // instead of editing the grid's tbar array, so parallel work never collides
+    // on one file. Each action:
+    //   { itemId, text, cls, iconCls,
+    //     needsSelection      — disabled until a pool row is selected,
+    //     disableWhileScanning — also disabled while the selected pool scrubs,
+    //     handler(node, grid, poolName) }
+    // Helpers for action files: ANAS.pools.reload(grid, node),
+    //   ANAS.pools.selectedPool(grid).
+    ANAS.pools = ANAS.pools || {};
+    if (!ANAS.pools.actions) {
+        ANAS.pools.actions = [];
+    }
+    ANAS.pools.registerAction = function (spec) {
+        ANAS.pools.actions.push(spec);
+    };
+
     // Human role labels for vdev groups.
     var ROLE_LABELS = {
         data: 'Data',
@@ -78,6 +97,19 @@
             var scanning = has && sel[0].get('scanRunning');
             scrubBtn.setDisabled(!has || scanning);
         }
+        // Registered actions: toggle by their declared selection needs.
+        var scanningSel = has && sel[0].get('scanRunning');
+        var actions = ANAS.pools.actions;
+        for (var i = 0; i < actions.length; i++) {
+            var a = actions[i];
+            if (!a.needsSelection) {
+                continue;
+            }
+            var btn = a.itemId ? grid.down('#' + a.itemId) : null;
+            if (btn) {
+                btn.setDisabled(!has || (a.disableWhileScanning && scanningSel));
+            }
+        }
     }
 
     function selectedPool(grid) {
@@ -85,78 +117,47 @@
         return (sel && sel.length) ? sel[0].get('name') : null;
     }
 
+    // Expose helpers for per-operation action files.
+    ANAS.pools.selectedPool = selectedPool;
+    ANAS.pools.reload = loadPools;
+
+    // Scrub via the shared runJob helper (submit 202 → poll job → refresh).
     function startScrub(grid, node) {
         var pool = selectedPool(grid);
         if (!pool) {
             return;
         }
-        ANAS.api.post(node, '/pools/' + encodeURIComponent(pool) + '/scrub', { action: 'start' })
-            .then(function (res) {
-                var job = res && res.job;
-                if (!job || !job.id) {
-                    ANAS.warn('scrub: no job id in response');
-                    loadPools(grid, node);
-                    return;
-                }
-                pollScrubJob(grid, node, job.id, pool);
-            }, function (err) {
-                ANAS.warn('scrub start failed: ' + ANAS.errText(err));
-                try {
-                    Ext.Msg.alert(ANAS.t('Scrub failed'), ANAS.errText(err));
-                } catch (e) {
-                    // non-fatal
-                }
-            });
+        ANAS.runJob({
+            node: node,
+            method: 'post',
+            path: '/pools/' + encodeURIComponent(pool) + '/scrub',
+            body: { action: 'start' },
+            view: grid,
+            failTitle: 'Scrub failed',
+            successMsg: ANAS.t('Scrub started on pool') + ' ' + pool,
+            onComplete: function () {
+                loadPools(grid, node);
+            },
+        });
     }
 
-    // Poll the job until completed/failed, every 500ms up to ~15s. A recursive
-    // setTimeout guarded by grid.destroyed ensures a closed view stops polling.
-    function pollScrubJob(grid, node, jobId, pool) {
-        var interval = 500;
-        var maxMs = 15000;
-        var elapsed = 0;
-
-        function tick() {
-            if (grid.destroyed || grid.destroying) {
-                return;
-            }
-            ANAS.api.get(node, '/jobs/' + encodeURIComponent(jobId)).then(function (res) {
-                if (grid.destroyed || grid.destroying) {
-                    return;
+    // Build a toolbar button config from a registered action spec.
+    function actionButton(node, spec) {
+        return {
+            text: ANAS.t(spec.text),
+            itemId: spec.itemId,
+            cls: spec.cls,
+            iconCls: spec.iconCls,
+            disabled: !!spec.needsSelection,
+            handler: function (btn) {
+                var grid = btn.up('grid');
+                try {
+                    spec.handler(node, grid, selectedPool(grid));
+                } catch (e) {
+                    ANAS.warn('pool action "' + spec.itemId + '" failed: ' + ANAS.errText(e));
                 }
-                var job = res && res.job;
-                var status = job && job.status;
-                if (status === 'completed') {
-                    loadPools(grid, node);
-                    ANAS.toast(ANAS.t('Scrub started on pool') + ' ' + pool);
-                    return;
-                }
-                if (status === 'failed') {
-                    var msg = (job && job.error && job.error.message) || ANAS.t('unknown error');
-                    try {
-                        Ext.Msg.alert(ANAS.t('Scrub failed'), msg);
-                    } catch (e) {
-                        ANAS.warn('scrub failed: ' + msg);
-                    }
-                    return;
-                }
-                elapsed += interval;
-                if (elapsed >= maxMs) {
-                    // Still running after the wait window — refresh the grid so
-                    // the scan state shows, and stop polling.
-                    loadPools(grid, node);
-                    return;
-                }
-                setTimeout(tick, interval);
-            }, function (err) {
-                if (grid.destroyed || grid.destroying) {
-                    return;
-                }
-                ANAS.warn('scrub poll failed: ' + ANAS.errText(err));
-            });
-        }
-
-        setTimeout(tick, interval);
+            },
+        };
     }
 
     function poolsGrid(node) {
@@ -174,6 +175,46 @@
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
         });
+
+        // Base toolbar (always present) + any actions registered by 31-*/32-*…
+        var tbar = [
+            {
+                text: ANAS.t('Reload'),
+                itemId: 'refresh',
+                cls: 'anas-btn-refresh',
+                iconCls: 'fa fa-refresh',
+                handler: function (btn) {
+                    loadPools(btn.up('grid'), node);
+                },
+            },
+            {
+                text: ANAS.t('Detail'),
+                itemId: 'detail',
+                cls: 'anas-btn-detail',
+                iconCls: 'fa fa-search',
+                disabled: true,
+                handler: function (btn) {
+                    var grid = btn.up('grid');
+                    var pool = selectedPool(grid);
+                    if (pool) {
+                        showPoolDetail(node, pool);
+                    }
+                },
+            },
+            {
+                text: ANAS.t('Start Scrub'),
+                itemId: 'scrub',
+                cls: 'anas-btn-scrub',
+                iconCls: 'fa fa-check-circle',
+                disabled: true,
+                handler: function (btn) {
+                    startScrub(btn.up('grid'), node);
+                },
+            },
+        ];
+        for (var ai = 0; ai < ANAS.pools.actions.length; ai++) {
+            tbar.push(actionButton(node, ANAS.pools.actions[ai]));
+        }
 
         return {
             xtype: 'grid',
@@ -227,43 +268,7 @@
                     },
                 },
             ],
-            tbar: [
-                {
-                    text: ANAS.t('Reload'),
-                    itemId: 'refresh',
-                    cls: 'anas-btn-refresh',
-                    iconCls: 'fa fa-refresh',
-                    handler: function (btn) {
-                        var grid = btn.up('grid');
-                        loadPools(grid, node);
-                    },
-                },
-                {
-                    text: ANAS.t('Detail'),
-                    itemId: 'detail',
-                    cls: 'anas-btn-detail',
-                    iconCls: 'fa fa-search',
-                    disabled: true,
-                    handler: function (btn) {
-                        var grid = btn.up('grid');
-                        var pool = selectedPool(grid);
-                        if (pool) {
-                            showPoolDetail(node, pool);
-                        }
-                    },
-                },
-                {
-                    text: ANAS.t('Start Scrub'),
-                    itemId: 'scrub',
-                    cls: 'anas-btn-scrub',
-                    iconCls: 'fa fa-check-circle',
-                    disabled: true,
-                    handler: function (btn) {
-                        var grid = btn.up('grid');
-                        startScrub(grid, node);
-                    },
-                },
-            ],
+            tbar: tbar,
             listeners: {
                 afterrender: function (grid) {
                     loadPools(grid, node);
