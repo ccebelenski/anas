@@ -1,50 +1,68 @@
 # ANAS — Proxmox VE UI Integration
 
-This package makes ANAS appear as a native-feeling section inside the Proxmox
-web UI, modeled on how PVE presents **Ceph**: a collapsible group in the
-**node** menu whose items (Dashboard, Pools, Disks) render in the content area.
+This package makes ANAS a **native** section inside the Proxmox web UI, modeled
+on how PVE presents **Ceph**: a collapsible group in the **node** menu whose
+items (Dashboard, Pools, Disks) render as native ExtJS panels in the content
+area. There is no separate web app and no iframe — the panels talk directly to
+the ANAS gateway on the same host (`https://<host>:3000`), and `PVEAuthCookie`
+flows automatically because cookies ignore ports.
 
 ```
 Node "pve1"
 ├─ Summary / Shell / System / Disks ...   (PVE's own)
 └─ ANAS                                    (collapsible section, injected)
-   ├─ Dashboard   → iframe /?embedded=1
-   ├─ Pools       → iframe /storage/pools?embedded=1
-   └─ Disks       → iframe /storage/disks?embedded=1
+   ├─ Dashboard   → native ExtJS panel
+   ├─ Pools       → native ExtJS grid + detail window
+   └─ Disks       → native ExtJS grid + SMART window
 ```
 
 ## Why this exists / why it looks like this
 
 PVE 9 has **no official UI extension hook**. See `docs/DESIGN.md` → *PVE UI
-Integration* for the authoritative contract. Verified facts (PVE 9.2):
+Integration* and *UI: Native PVE Panels* for the authoritative contract.
+Verified facts (PVE 9.2):
 
 - `pveproxy` serves unowned files dropped into `/usr/share/pve-manager/js/`.
   dpkg never removes files it does not own, so our script survives upgrades.
-- The PVE UI page sends no CSP or `X-Frame-Options`, so a same-origin injected
-  script and cross-port iframes work.
-- `PVEAuthCookie` is set by PVE's own JS, is **not** HttpOnly (readable by page
-  JS), and tickets are **cluster-valid** (any node verifies them).
+- The PVE UI page sends no CSP headers, so a same-origin injected script works.
+- `PVEAuthCookie` is set by PVE's own JS with `Secure` + `SameSite=Lax` and
+  tickets are **cluster-valid** (any node verifies them). The gateway routes
+  per-node server-side, so the browser only ever talks to the local host.
 
 ## Files
 
-| File            | Role                                                                 |
-| --------------- | -------------------------------------------------------------------- |
-| `anas.js`       | ExtJS integration script. Our file. Copied to `/usr/share/pve-manager/js/anas.js`, served at `/pve2/js/anas.js`. |
-| `install.sh`    | Idempotent installer (see below).                                    |
-| `uninstall.sh`  | Surgical uninstaller — restores the pristine template.               |
+The installed `anas.js` is **generated** by concatenating the per-view ES5
+sources in `src/` (lexical order), so there is no build step — plain files
+joined verbatim.
+
+| File                   | Role                                                             |
+| ---------------------- | ---------------------------------------------------------------- |
+| `src/00-core.js`       | `window.ANAS` namespace, fail-open helpers, formatters, menu injection. |
+| `src/10-api.js`        | `ANAS.api` gateway helper (`request`/`get`/`post`/`put`/`del`/`health`). |
+| `src/20-notinstalled.js` | `ANAS.notInstalledPanel` + `ANAS.withInstallCheck` (the Ceph "not installed" probe). |
+| `src/30-pools.js`      | Pools view (grid, detail window, Start Scrub via the job API).   |
+| `src/40-disks.js`      | Disks view.                                                      |
+| `src/50-dashboard.js`  | Dashboard view.                                                  |
+| `src/90-register.js`   | Wires `ANAS.views` into the node menu in a fixed order.          |
+| `install.sh`           | Idempotent installer — concatenates `src/*.js` → `/usr/share/pve-manager/js/anas.js` (served at `/pve2/js/anas.js`), inserts the tpl line, installs the apt hook. |
+| `uninstall.sh`         | Surgical uninstaller — restores the pristine template.           |
 
 ## Mechanism
 
 Two moving parts:
 
-1. **`/usr/share/pve-manager/js/anas.js`** — our script. Upgrade-safe (dpkg
-   doesn't own it). It uses `Ext.override(PVE.node.Config, ...)` to run after
-   the node menu is built, then appends an `ANAS` group (with Dashboard / Pools
-   / Disks child panels) to the menu's tree store and card registry — the same
-   structure `PVE.panel.Config` builds for Ceph. Every ExtJS/PVE internal it
-   touches is feature-detected and everything is wrapped in try/catch:
-   **it fails open**. Worst case is "no ANAS section appears"; the PVE UI is
-   never broken.
+1. **`/usr/share/pve-manager/js/anas.js`** — our generated script. Upgrade-safe
+   (dpkg doesn't own it). It patches `PVE.node.Config.prototype.initComponent`
+   directly — the original is captured in a closure and called first, then our
+   guarded injection appends an `ANAS` group (with the registered view panels)
+   to the menu's tree store and card registry, the same structure
+   `PVE.panel.Config` builds for Ceph. **Not `Ext.override`**: `callParent`
+   inside a runtime override resolves against the override's absent class
+   hierarchy and crashes node panel construction. Every ExtJS/PVE internal it
+   touches is feature-detected and everything is wrapped in try/catch: **it
+   fails open**. Worst case is "no ANAS section appears"; the PVE UI is never
+   broken. Each view is wrapped in a health probe (`ANAS.withInstallCheck`) so a
+   node without ANAS installed shows a friendly install hint instead.
 
 2. **One `<script>` line in `/usr/share/pve-manager/index.html.tpl`**, inserted
    immediately after the `pvemanagerlib.js` line:
@@ -71,32 +89,19 @@ If the line is ever lost between an upgrade and the next apt run, the only
 symptom is that the ANAS section disappears until `install.sh` runs again — PVE
 itself keeps working.
 
-## Ticket handoff (cross-node auth)
+## Cross-node auth
 
-`PVEAuthCookie` is host-scoped: logged into node A's UI, the browser has no
-cookie for node B's ANAS (`https://<node>:3000`). `anas.js` implements the
-parent side of the postMessage handshake described in `docs/DESIGN.md`:
-
-1. A menu item renders an iframe `https://<node>:3000/auth/handoff?to=<route>`.
-2. The ANAS handoff page posts `{ type: 'anas:handoff:ready' }` to its parent.
-3. `anas.js` verifies `event.origin` is an ANAS iframe origin **it created**,
-   reads `PVEAuthCookie` via `document.cookie`, and replies
-   `{ type: 'anas:handoff:ticket', ticket }` with `targetOrigin` set to that
-   same (validated) origin.
-4. The handoff page verifies the sender origin, sets the cookie on its own
-   origin, and redirects to the target route.
-
-The ticket is only ever posted to an origin ANAS itself opened an iframe for —
-never to an arbitrary sender.
-
-Node addressing: when the selected tree node is the one serving the PVE UI
-(`Proxmox.NodeName`), the iframe uses `window.location.hostname` (preserving
-IP-based access); otherwise it uses the node name.
+`PVEAuthCookie` is cluster-valid and, because cookies ignore ports, the browser
+sends it to the local gateway (`https://<ui-host>:3000`) automatically. The
+panels only ever call the **local** gateway; cross-node requests are forwarded
+server-side by the gateway (node as a path parameter,
+`/api/nodes/<node>/v1/...`). There is no browser-side ticket handoff — that
+iframe-era mechanism was retired with the ExtJS-native pivot.
 
 ## Install / uninstall
 
 ```bash
-sudo ./install.sh      # copy anas.js, insert tpl line, install apt hook
+sudo ./install.sh      # generate anas.js from src/, insert tpl line, install apt hook
 sudo ./uninstall.sh    # remove tpl line, anas.js, apt hook
 ```
 

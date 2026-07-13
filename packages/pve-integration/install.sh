@@ -31,9 +31,38 @@ SCRIPT_SRC="/pve2/js/anas.js"
 # The full line we insert, matching the template's 4-space indentation.
 SCRIPT_TAG='    <script type="text/javascript" src="/pve2/js/anas.js"></script>'
 
-# 1. Install our JS file (our file — upgrade-safe).
-install -D -m 0644 "${SCRIPT_DIR}/anas.js" "${PVE_JS_DIR}/anas.js"
-echo "anas: installed ${PVE_JS_DIR}/anas.js"
+# 1. Generate and install our JS file (our file — upgrade-safe).
+#    anas.js is built by concatenating the per-view sources in src/ in lexical
+#    order (00-core, 10-api, 20-notinstalled, 30-pools, 40-disks, 50-dashboard,
+#    90-register). No build step — plain ES5 files joined verbatim.
+SRC_DIR="${SCRIPT_DIR}/src"
+if [ ! -d "${SRC_DIR}" ]; then
+  echo "anas: ERROR: source dir ${SRC_DIR} not found" >&2
+  exit 1
+fi
+gen="$(mktemp)"
+{
+  echo "/*"
+  echo " * GENERATED FILE — do not edit."
+  echo " * Concatenated from packages/pve-integration/src/*.js (lexical order) by"
+  echo " * install.sh. Edit the per-view sources in src/ instead."
+  echo " */"
+  # Bash pathname expansion yields the sources in sorted (numeric-prefix) order.
+  for f in "${SRC_DIR}"/*.js; do
+    echo ""
+    echo "/* ==== $(basename "${f}") ==== */"
+    cat "${f}"
+  done
+} > "${gen}"
+# Defensive: refuse to install an empty/failed generation.
+if [ ! -s "${gen}" ]; then
+  rm -f "${gen}"
+  echo "anas: ERROR: generated anas.js is empty" >&2
+  exit 1
+fi
+install -D -m 0644 "${gen}" "${PVE_JS_DIR}/anas.js"
+rm -f "${gen}"
+echo "anas: installed ${PVE_JS_DIR}/anas.js (generated from src/)"
 
 # 2. Insert the <script> line after pvemanagerlib.js, idempotently.
 if [ ! -f "${PVE_TPL}" ]; then
