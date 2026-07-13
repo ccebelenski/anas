@@ -99,6 +99,10 @@ export function parseLsblk(
         smartHealthy: null, // enriched by DiskIdentityCache
         status,
         poolName,
+        vdevName: null, // enriched from zpool status in the disks route
+        vdevRole: null, // enriched from zpool status in the disks route
+        zfsErrors: null, // enriched from zpool status in the disks route
+        healthStatus: 'unknown', // computed in the disks route (SMART + ZFS errors)
         partitions,
       }
     })

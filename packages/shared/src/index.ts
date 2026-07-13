@@ -27,6 +27,7 @@ export {
 // Disk schemas
 export {
   Disk,
+  DiskHealthStatus,
   DiskPartition,
   DiskUsageStatus,
   SmartAttribute,

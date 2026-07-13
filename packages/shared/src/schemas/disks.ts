@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { DevicePath } from './common.js'
+import { VdevRole } from './zfs.js'
 
 // --- Enums ---
 
@@ -11,6 +12,15 @@ export const DiskUsageStatus = z.enum([
   'other',
 ])
 export type DiskUsageStatus = z.infer<typeof DiskUsageStatus>
+
+/** Derived disk-health level (fuses SMART pass/fail with ZFS error counts) */
+export const DiskHealthStatus = z.enum([
+  'healthy',
+  'warning',
+  'critical',
+  'unknown',
+])
+export type DiskHealthStatus = z.infer<typeof DiskHealthStatus>
 
 /** Overall SMART health assessment */
 export const SmartHealth = z.enum(['PASSED', 'FAILED', 'UNKNOWN'])
@@ -69,6 +79,26 @@ export const Disk = z.object({
   status: DiskUsageStatus,
   /** If pool_member, which pool */
   poolName: z.string().nullable(),
+  /** If pool_member, the vdev this disk belongs to, e.g. "mirror-0" */
+  vdevName: z.string().nullable(),
+  /** If pool_member, the vdev's role (data/log/cache/spare/special/dedup) */
+  vdevRole: VdevRole.nullable(),
+  /** Live ZFS error counts for this disk (null unless a pool member) */
+  zfsErrors: z
+    .object({
+      read: z.number().int().nonnegative(),
+      write: z.number().int().nonnegative(),
+      checksum: z.number().int().nonnegative(),
+    })
+    .nullable(),
+  /**
+   * Derived disk health, fusing SMART pass/fail with live ZFS error counts:
+   * - critical: SMART FAILED, or read/write errors, or a faulted vdev state
+   * - warning: checksum errors (silent corruption ZFS is repairing)
+   * - healthy: SMART passed (or n/a) and no ZFS errors
+   * - unknown: no usable signal (SMART unsupported, not in a pool)
+   */
+  healthStatus: DiskHealthStatus,
   /** Partitions on this disk */
   partitions: z.array(DiskPartition),
 })
