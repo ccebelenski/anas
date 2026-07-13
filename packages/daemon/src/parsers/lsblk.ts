@@ -64,6 +64,8 @@ export function parseLsblk(
       const id = byIdMap.get(dev.name) ?? dev.serial ?? dev.name
       const partitions = parsePartitions(dev.children ?? [])
       const isSystem = isSystemDisk(dev, partitions)
+      // Pool membership is matched by stable by-id (parseZpoolStatus derives the
+      // leaf's id from its devid). Never key on the kernel name — it changes.
       const poolName = poolDisks.get(id) ?? null
       let status: DiskUsageStatus = 'available'
       if (isSystem)

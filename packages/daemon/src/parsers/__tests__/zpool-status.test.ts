@@ -215,4 +215,43 @@ describe('parseZpoolStatus', () => {
       }
     }
   })
+
+  // Regression: on a real system `zpool status -jv` reports the leaf `name` as
+  // the KERNEL device ("sdb"), which is unstable and must never be the disk's
+  // identity. The stable by-id comes from `devid`. If parseDisk used `name`,
+  // the disk list could not match pool members to by-id and would class active
+  // pool disks as 'available' (a real bug — a user could pick in-use disks).
+  it('derives disk id from the stable by-id (devid), never the kernel name', () => {
+    const status = {
+      pools: {
+        tank: {
+          name: 'tank',
+          vdev_type: 'root',
+          pool_guid: '1',
+          state: 'ONLINE',
+          vdevs: {
+            'mirror-0': {
+              name: 'mirror-0',
+              vdev_type: 'mirror',
+              state: 'ONLINE',
+              vdevs: {
+                // Leaf named by the (unstable) kernel device, with the by-id in devid.
+                sdb: {
+                  name: 'sdb',
+                  vdev_type: 'disk',
+                  state: 'ONLINE',
+                  path: '/dev/sdb1',
+                  devid: 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1',
+                },
+              },
+            },
+          },
+        },
+      },
+    }
+    const [pool] = parseZpoolStatus(JSON.stringify(status))
+    const disk = pool.vdevGroups[0].vdevs[0].disks[0]
+    assert.equal(disk.id, 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1')
+    assert.notEqual(disk.id, 'sdb')
+  })
 })

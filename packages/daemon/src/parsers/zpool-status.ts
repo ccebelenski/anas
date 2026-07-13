@@ -12,6 +12,8 @@ interface ZfsVdevRaw {
   vdev_type: string
   guid?: string
   path?: string
+  /** Stable by-id of the leaf device, e.g. "scsi-…ANAS_HOT1-part1". */
+  devid?: string
   state: string
   class?: string
   alloc_space?: string
@@ -220,7 +222,7 @@ function parseVdev(raw: ZfsVdevRaw): Vdev {
 }
 
 function parseDisk(raw: ZfsVdevRaw): PoolDisk {
-  const id = stripPartSuffix(raw.name)
+  const id = diskId(raw)
   return {
     id,
     path: (raw.path ?? `/dev/disk/by-id/${id}`) as `/dev/${string}`,
@@ -261,10 +263,26 @@ function mapVdevType(zfsType: string): VdevType {
 }
 
 const PART_SUFFIX_RE = /-part\d+$/
+const BY_ID_PATH_RE = /\/dev\/disk\/by-id\//
 
 /** Strip -partN suffix from a by-id disk name */
 function stripPartSuffix(name: string): string {
   return name.replace(PART_SUFFIX_RE, '')
+}
+
+/**
+ * Stable identity for a vdev leaf — always a by-id, never the kernel name
+ * (which changes across reboots). ZFS reports the leaf's `devid` (a by-id) and
+ * often a by-id `path`; prefer those. The kernel `name` is the last resort only
+ * so a leaf with no by-id info still yields *something* rather than crashing —
+ * such a disk simply won't cross-reference to the disk list.
+ */
+function diskId(raw: ZfsVdevRaw): string {
+  if (raw.devid)
+    return stripPartSuffix(raw.devid)
+  if (raw.path && BY_ID_PATH_RE.test(raw.path))
+    return stripPartSuffix(raw.path.replace(BY_ID_PATH_RE, ''))
+  return stripPartSuffix(raw.name)
 }
 
 function parseScanStats(raw: ZfsScanStatsRaw): ScanStatus {
