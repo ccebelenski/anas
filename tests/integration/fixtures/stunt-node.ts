@@ -54,6 +54,38 @@ export async function datasetExists(dataset: string): Promise<boolean> {
 }
 
 /**
+ * Best-effort recursive teardown of a throwaway dataset, leaving the box clean
+ * for reruns. Never throws — the dataset may already be gone. `-r` removes any
+ * children a test staged under it.
+ */
+export async function destroyDataset(dataset: string): Promise<void> {
+  await sshExec(`zfs destroy -r ${dataset}`).catch(() => {})
+}
+
+/**
+ * Read a single ZFS property value from the real system (source of truth).
+ * Uses `-H -o value` for a bare, scriptable scalar (Principle 13).
+ */
+export async function getDatasetProp(dataset: string, prop: string): Promise<string> {
+  return (await sshExec(`zfs get -H -o value ${prop} ${dataset}`)).trim()
+}
+
+/**
+ * Return a dataset's mountpoint on the real system (e.g. `/testpool/itest`).
+ */
+export async function getDatasetMountpoint(dataset: string): Promise<string> {
+  return getDatasetProp(dataset, 'mountpoint')
+}
+
+/**
+ * Return `stat -c '%U %G %a' <path>` for a filesystem path — the owner name,
+ * group name, and octal mode. Used to verify POSIX permission mutations (4.7).
+ */
+export async function statOwnership(path: string): Promise<string> {
+  return (await sshExec(`stat -c '%U %G %a' ${path}`)).trim()
+}
+
+/**
  * Check if an SMB share exists in smb.conf.
  */
 export async function smbShareExists(share: string): Promise<boolean> {
