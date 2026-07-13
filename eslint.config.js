@@ -13,11 +13,12 @@ export default antfu({
     'packages/daemon/src/fixtures/**/*.json',
     'tests/integration/fixtures/**',
     'playwright-report/**',
-    // PVE web-UI injection script: plain ES5 that must match Proxmox's compiled
-    // ExtJS bundle (var, function expressions, string concat, 4-space indent,
-    // semicolons). It is browser code loaded by pveproxy, not part of the
+    // PVE web-UI injection scripts: plain ES5 that must match Proxmox's
+    // compiled ExtJS bundle (var, function expressions, string concat, 4-space
+    // indent, semicolons). These are browser code loaded by pveproxy — the
+    // per-view sources in src/ plus the generated anas.js — not part of the
     // Node/Vue codebase, so the repo's TS/modern-JS style rules do not apply.
-    'packages/pve-integration/anas.js',
+    'packages/pve-integration/**/*.js',
   ],
   rules: {
     // Node globals are fine — both processes run on Node.js
