@@ -180,7 +180,9 @@ Story numbering is for identification only, not implementation order. Within eac
 
 4.6. As a user, I want to modify dataset properties, so that I can adjust behavior as needs change.
 
-4.7. As a user, I want to set permissions (owner, group, mode) on a dataset's mountpoint, so that the right users can access it.
+4.7. As a user, I want to set basic POSIX permissions (owner, group, mode via chown/chmod) on a dataset's mountpoint, so that the right users can access it. *(MVP scope: POSIX only, owner/group limited to EXISTING system users. This is the shallow part.)*
+
+4.7.1. [deferred — depth] As a user, I want a full ACL editor for dataset mountpoints (NFSv4 ACLs: per-ACE who × permission-bits × inheritance flags, plus acltype/aclmode/aclinherit), so I can manage Windows-compatible permissions. *(The DEEP part — deliberately NOT MVP. Pairs with Epic 6/SMB, where NFSv4 ACLs earn their complexity; populated by Epic 8 users/groups. PVE has nothing here and there's no existing ACL UI to wire up, so this is differentiated but a real investment — wrap setfacl/nfs4_setfacl, don't rush it. "Datasets is shallow until permissions" — this is the trapdoor.)*
 
 4.8. As a user, I want to destroy a dataset, so that I can clean up unused storage. *(Confirmation required, warn if dataset has children or active shares.)*
 
