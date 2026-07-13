@@ -8,7 +8,7 @@
     "packages/*"
   ],
   "scripts": {
-    "dev": "concurrently -k -n daemon,gateway -c blue,green \"ANASD_SOCKET=/tmp/anasd.sock npm run dev:daemon\" \"ANASD_SOCKET=/tmp/anasd.sock ANAS_AUTH_PROVIDER=dev ANAS_PORT=3000 npm run dev:gateway\"",
+    "dev": "concurrently -k -n daemon,gateway -c blue,green \"ANASD_SOCKET=/tmp/anasd.sock npm run dev:daemon\" \"ANASD_SOCKET=/tmp/anasd.sock ANAS_AUTH_PROVIDER=dev ANAS_PORT=3100 npm run dev:gateway\"",
     "dev:daemon": "cd packages/daemon && tsx watch src/index.ts -- --mock",
     "dev:gateway": "cd packages/gateway && tsx watch src/index.ts",
     "build": "npm run build:shared && npm run build:daemon && npm run build:gateway",
