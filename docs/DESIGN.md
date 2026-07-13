@@ -438,6 +438,7 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `zpool.replace` | `zpool replace <name> <old-device> <new-device>` |
 | `zpool.import` | `zpool import [opts]` |
 | `zpool.export` | `zpool export <name>` |
+| `disk.wipe` | `wipefs -a --force <device>` (optional cleanup after pool destroy) |
 | `zfs.list` | `zfs list -Hp -t all` |
 | `zfs.create` | `zfs create [opts] <dataset>` |
 | `zfs.destroy` | `zfs destroy <dataset>` |

@@ -64,6 +64,8 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['export', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['export', '-f', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['destroy', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    // Disk cleanup after destroy (story 3.14 cleanup option) — wipefs any device.
+    mock.addFixture({ command: '/usr/sbin/wipefs', result: { stdout: '', stderr: '', exitCode: 0 } })
     // Import scan (story 3.7): `zpool import` with no args lists one pool.
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['import'], result: {
       stdout: [

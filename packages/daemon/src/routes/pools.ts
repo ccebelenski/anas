@@ -151,6 +151,22 @@ export async function poolRoutes(
 ) {
   const { executor, jobQueue, confirmStore } = opts
 
+  /** Stable by-id identifiers of every leaf disk in a pool (for disk cleanup). */
+  async function poolMemberIds(poolName: string): Promise<string[]> {
+    const statusResult = await executor.exec('/usr/sbin/zpool', ['status', '-jv'])
+    if (statusResult.exitCode !== 0)
+      return []
+    const pool = parseZpoolStatusPool(statusResult.stdout, poolName)
+    if (!pool)
+      return []
+    const ids: string[] = []
+    for (const group of pool.vdevGroups)
+      for (const vdev of group.vdevs)
+        for (const disk of vdev.disks)
+          ids.push(disk.id)
+    return ids
+  }
+
 
   server.get('/pools', async (_request, _reply) => {
     const [listResult, statusResult] = await Promise.all([
@@ -612,13 +628,16 @@ export async function poolRoutes(
 
   // Destroy a pool (story 3.14) — the dangerous one. Blocked outright for the
   // root/boot pool (Level 1, no override); otherwise confirmation-gated.
-  server.delete<{ Params: { name: string } }>('/pools/:name', async (request, reply) => {
+  server.delete<{ Params: { name: string }, Querystring: { cleanup?: string } }>('/pools/:name', async (request, reply) => {
     const nameParsed = PoolName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
     }
     const poolName = nameParsed.data
+    // Opt-in disk hygiene (PVE's "Clean Up Disks"): after destroy, wipe each
+    // freed member so it comes back pristine and immediately reusable.
+    const cleanup = request.query.cleanup === 'true' || request.query.cleanup === '1'
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -643,10 +662,12 @@ export async function poolRoutes(
       `Destroying '${poolName}' is irreversible — all data in the pool is permanently lost.`,
       `Every dataset, snapshot, and volume in '${poolName}' will be destroyed.`,
     ]
+    if (cleanup)
+      warnings.push(`The pool's disks will be wiped clean (existing ZFS labels removed).`)
 
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'zpool.destroy',
-      params: { pool: poolName },
+      params: { pool: poolName, cleanup },
       message: `Destroying pool '${poolName}' permanently erases all its data`,
       warnings,
     })) {
@@ -655,13 +676,32 @@ export async function poolRoutes(
 
     const job = jobQueue.submit(
       'zpool.destroy',
-      { ...identity, params: { pool: poolName } },
-      async () => {
+      { ...identity, params: { pool: poolName, cleanup } },
+      async (updateProgress) => {
+        // Capture the member disks by stable by-id BEFORE destroy — the pool
+        // must still exist to enumerate them.
+        const memberIds = cleanup ? await poolMemberIds(poolName) : []
+
         const result = await executor.exec('/usr/sbin/zpool', ['destroy', poolName])
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool destroy exited with code ${result.exitCode}`)
         }
-        return null
+
+        if (cleanup && memberIds.length > 0) {
+          // Best-effort: the pool is already destroyed, so a failed wipe must
+          // not fail the job. Report any disks we couldn't clean.
+          const failed: string[] = []
+          for (const id of memberIds) {
+            updateProgress(`Wiping ${id}`)
+            const wipe = await executor.exec('/usr/sbin/wipefs', ['-a', '--force', `/dev/disk/by-id/${id}`])
+            if (wipe.exitCode !== 0)
+              failed.push(id)
+          }
+          if (failed.length > 0)
+            return { destroyed: poolName, wipedFailed: failed }
+          return { destroyed: poolName, wiped: memberIds }
+        }
+        return { destroyed: poolName }
       },
     )
 

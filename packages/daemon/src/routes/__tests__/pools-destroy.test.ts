@@ -68,6 +68,32 @@ describe('destroy endpoint: DELETE /v1/pools/:name', () => {
     assert.equal(job.status, 'completed')
   })
 
+  it('wipes the freed member disks when cleanup=true', async () => {
+    server = createServer({ mock: true, logger: false })
+
+    // The challenge warns that disks will be wiped, and binds cleanup into the code.
+    const first = await server.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool?cleanup=true',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(first.statusCode, 409)
+    assert.match(JSON.stringify(first.json()), /wiped clean|labels removed/i)
+    const code = first.headers['x-anas-confirm-code'] as string
+
+    const res = await server.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool?cleanup=true',
+      headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code },
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+    // The job reports the (by-id) disks it wiped — the mock testpool has members.
+    const result = job.result as { wiped?: string[] }
+    assert.ok(Array.isArray(result.wiped) && result.wiped.length > 0, 'expected wiped disks in result')
+  })
+
   it('rejects a wrong confirm code with 409 and a fresh code', async () => {
     server = createServer({ mock: true, logger: false })
 
