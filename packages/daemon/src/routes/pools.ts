@@ -2,7 +2,7 @@ import type { PoolDetail, PoolSummary } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
-import { PoolName, ScrubRequest } from '@anas/shared'
+import { PoolName, ScrubRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseZpoolGet } from '../parsers/zpool-get.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
@@ -140,6 +140,78 @@ export async function poolRoutes(
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool scrub exited with code ${result.exitCode}`)
+        }
+        return null
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
+  // Whitelist of user-settable pool properties and their allowed values
+  // (Principle 5 — structured operations, not command passthrough). Booleans
+  // are expressed to zpool as 'on'/'off'. ashift is creation-only and is
+  // deliberately absent so a request to change it is rejected as invalid.
+  const SETTABLE_POOL_PROPS: Record<string, readonly string[]> = {
+    autoexpand: ['on', 'off'],
+    autoreplace: ['on', 'off'],
+    autotrim: ['on', 'off'],
+    failmode: ['wait', 'continue', 'panic'],
+  }
+
+  server.put<{ Params: { name: string } }>('/pools/:name', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    const bodyParsed = UpdatePoolPropertiesRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid property update: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const { properties } = bodyParsed.data
+
+    // Reject any property that is not settable (e.g. ashift) or any
+    // out-of-range value before we touch the system.
+    for (const [prop, value] of Object.entries(properties)) {
+      const allowed = SETTABLE_POOL_PROPS[prop]
+      if (!allowed) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Property '${prop}' is not settable` } }
+      }
+      if (!allowed.includes(value)) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid value '${value}' for property '${prop}'` } }
+      }
+    }
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
+    const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
+    if (!pools.some(p => p.name === poolName)) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    const changes = Object.entries(properties)
+
+    const job = jobQueue.submit(
+      'zpool.set',
+      { ...identity, params: { pool: poolName, properties } },
+      async (updateProgress) => {
+        for (const [prop, value] of changes) {
+          updateProgress(`Setting ${prop}=${value} on ${poolName}`)
+          const result = await executor.exec('/usr/sbin/zpool', ['set', `${prop}=${value}`, poolName])
+          if (result.exitCode !== 0) {
+            throw new Error(result.stderr.trim() || `zpool set ${prop}=${value} exited with code ${result.exitCode}`)
+          }
         }
         return null
       },
