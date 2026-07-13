@@ -462,6 +462,19 @@ md provides RAID without ZFS's memory overhead, using standard Linux filesystems
 
 Detailed stories to be written when this epic is prioritized.
 
+#### SHR-style hybrid RAID (V2+ headline, far future)
+
+> As a user, I want Synology-SHR-style mixed-drive-size pooling with redundancy and online growth, so I can use drives of different sizes efficiently and expand incrementally — the thing ZFS fundamentally can't do (raidz is fixed-width to the smallest disk).
+
+The stack (bottom→top): **partition each disk into size-matched regions → one mdadm array per region (RAID5=SHR-1 / RAID6=SHR-2; redundancy lives HERE) → LVM concatenates the arrays into one logical volume → btrfs (or ext4) as the filesystem.** Critical design fact: redundancy is md's job; **btrfs is only the filesystem, NEVER btrfs-RAID5/6** (unstable) — btrfs runs on a single already-redundant LVM volume.
+
+The differentiated work (per Don't-Build-Undifferentiated: we wrap mdadm/LVM/btrfs, we build the orchestration no open tool provides):
+1. **Layout algorithm** — optimal region partitioning for arbitrary drive sizes, respecting SHR-1/SHR-2 minimum-overlap-per-region.
+2. **Online growth (the hard/dangerous part)** — add/replace-with-bigger drive → re-partition + `mdadm --grow` + `pvresize`/`lvextend` + `btrfs resize`, as a long-running, RESUMABLE, multi-layer job where each layer can fail independently.
+3. Degraded/recovery handling across all three layers.
+
+Real prosumer draw (mismatched-drive efficiency), but big and data-integrity-sensitive — a V2+ flagship, not near-term. Builds on the md basics above; PVE offers nothing comparable.
+
 ### Epic 12: Multi-Node / Cluster Management
 
 > As a user, I can manage storage and shares across multiple Proxmox nodes from a single ANAS instance.
