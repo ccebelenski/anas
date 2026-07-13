@@ -1,4 +1,4 @@
-import type { AuthProvider, AuthUser } from '../types'
+import type { AuthProvider, AuthUser } from '../types.js'
 
 /**
  * Dev auth provider — accepts any token, returns a mock user.

@@ -50,21 +50,19 @@ EOF
 
 $SSH_CMD "cat > /etc/systemd/system/anas.service" <<'EOF'
 [Unit]
-Description=ANAS Web UI
+Description=ANAS API Gateway
 After=anasd.service
 Requires=anasd.service
 
 [Service]
 Type=simple
-# Serve HTTPS with the host's PVE certificates (story 10.4). PVE marks
-# PVEAuthCookie as Secure, so browsers only send it over HTTPS. Prefer the
-# custom cert (pveproxy-ssl.*) when present, like pveproxy does.
-# ($$ is systemd's escape for a literal $ passed to bash.)
-ExecStart=/bin/bash -c 'C=/etc/pve/local/pveproxy-ssl; { [ -f "$${C}.pem" ] && [ -f "$${C}.key" ]; } || C=/etc/pve/local/pve-ssl; export NITRO_SSL_CERT="$$(cat "$${C}.pem")" NITRO_SSL_KEY="$$(cat "$${C}.key")"; exec /usr/bin/node /opt/anas/packages/web/.output/server/index.mjs'
+# The gateway reads the host's PVE certificates itself (story 13.8): it
+# auto-detects /etc/pve/local/pveproxy-ssl.* (custom) or pve-ssl.* (node) and
+# serves HTTPS. PVE marks PVEAuthCookie as Secure, so this HTTPS is required
+# for auth to work at all (story 10.4).
+ExecStart=/usr/bin/node /opt/anas/packages/gateway/dist/index.js
 Environment=ANASD_SOCKET=/run/anas/anasd.sock
 Environment=ANAS_AUTH_PROVIDER=pve
-Environment=NITRO_PORT=3000
-Environment=NITRO_HOST=0.0.0.0
 Restart=on-failure
 RestartSec=5
 
