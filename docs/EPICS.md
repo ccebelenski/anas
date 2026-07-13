@@ -334,20 +334,20 @@ Story numbering is for identification only, not implementation order. Within eac
 
 ---
 
-## Epic 13: PVE UI Embedding
+## Epic 13: PVE UI Embedding (ExtJS-native)
 
-> As a user, I want ANAS to appear as a native section of the Proxmox web UI (Ceph-style collapsible node menu group), so that managing storage feels like part of Proxmox, not a separate app.
+> As a user, I want ANAS to appear as a native section of the Proxmox web UI (Ceph-style collapsible node menu group with native ExtJS panels), so that managing storage feels like part of Proxmox, not a separate app.
 
-Design: see **PVE UI Integration** in DESIGN.md — injected `anas.js` + one-line tpl insert (apt-hook re-applied), iframe views, postMessage ticket handoff. Contracts there are authoritative; stories below build to them.
+> **Pivot (July 2026):** the first iteration embedded the Nuxt/Vue app in iframes with a postMessage ticket handoff (stories 13.1–13.3, built and verified). User review rejected the iframe approach — the style clash and foreign interaction patterns read as a separate app. ANAS now follows the Ceph model end to end: native ExtJS panels, `anas` reduced to a pure API gateway with PVE-style server-side node forwarding. See DESIGN.md "UI: Native PVE Panels" and "Public API". The injection mechanism and installer (13.4/13.5) carry forward unchanged.
 
 ### Stories
 
 #### Web app (independent of PVE-side work)
-13.1. [done] As a user, I want each top-level view (dashboard, pools, disks) served at a stable route (`/`, `/storage/pools`, `/storage/disks`), so that views are deep-linkable and embeddable. *(Future epics add their own views following this pattern.)*
+13.1. [done→OBE] As a user, I want each top-level view (dashboard, pools, disks) served at a stable route (`/`, `/storage/pools`, `/storage/disks`), so that views are deep-linkable and embeddable. *(Future epics add their own views following this pattern.)*
 
-13.2. [done] As a user, I want an embedded display mode (`?embedded=1`, persists across in-app navigation) that hides ANAS chrome, so that ANAS views render cleanly inside the PVE UI.
+13.2. [done→OBE] As a user, I want an embedded display mode (`?embedded=1`, persists across in-app navigation) that hides ANAS chrome, so that ANAS views render cleanly inside the PVE UI.
 
-13.3. [done] As a user, I want ANAS to accept my PVE session via the postMessage ticket handoff (`/auth/handoff` page, unauthenticated, origin-verified, redirect-validated), so that embedded views authenticate without a separate login — including for nodes other than the one serving my PVE session.
+13.3. [done→OBE] As a user, I want ANAS to accept my PVE session via the postMessage ticket handoff (`/auth/handoff` page, unauthenticated, origin-verified, redirect-validated), so that embedded views authenticate without a separate login — including for nodes other than the one serving my PVE session.
 
 #### PVE side (independent of web-app work)
 13.4. [done] As a user, I want an "ANAS" collapsible section in the PVE node menu (Dashboard, Storage → Pools/Disks) whose items render embedded ANAS views, so that ANAS is reachable from where I already work. *(Fail-open: script errors must never break the PVE UI.)*
@@ -357,7 +357,22 @@ Design: see **PVE UI Integration** in DESIGN.md — injected `anas.js` + one-lin
 #### Verification
 13.6. [done] As a dev, I want integration tests that log in through the real PVE UI, expand the ANAS section, and verify the embedded pools/disks views render and function, so that the whole chain (injection → handoff → embedded view) is continuously verified.
 
-13.7. *(V2?)* As a user, I want embedded ANAS to match the PVE theme (light/dark), so the integration is visually seamless.
+13.7. [OBE] ~~As a user, I want embedded ANAS to match the PVE theme (light/dark), so the integration is visually seamless.~~ *Native ExtJS panels inherit the PVE theme by construction.*
+
+#### ExtJS-native rework
+13.8. As a dev, I want anas reduced to a pure API gateway — no pages, PVE-origin CORS with credentials, and `/api/nodes/<node>/v1/*` routing (local node → anasd socket; other nodes → forward to that node's gateway with the user's ticket, TLS verified against the cluster CA) — so the browser only ever talks to the UI host and cross-node works the PVE way.
+
+13.9. As a dev, I want an ExtJS panel framework in packages/pve-integration (loader, per-view files concatenated by the installer, shared API helper, "ANAS is not installed on this node" probe/panel), so that views have a consistent foundation and missing installs degrade gracefully like Ceph.
+
+13.10. As a user, I want the Pools view as native ExtJS (grid of pools; detail window with topology, properties, scan status; Start Scrub action via the job API), so that pool management has parity with the retired Vue views inside the PVE UI.
+
+13.11. As a user, I want the Disks view as native ExtJS (grid with usage/health; SMART detail window), so that disk visibility has parity with the retired Vue views.
+
+13.12. As a user, I want a minimal ANAS Dashboard panel (gateway health, pool states, active jobs), so that the ANAS section has a landing view. *(Full dashboard remains Epic 2.)*
+
+13.13. As a dev, I want the Nuxt web app retired (pages, components, embedded mode, handoff removed; gateway extracted; deploy/dev scripts and docs updated), so that there is exactly one UI surface to maintain.
+
+13.14. As a dev, I want dev and integration tests reworked for the native panels (PVE login → ANAS section → panels render real data; not-installed path; scrub flow through the ExtJS UI), so that the new chain is verified end to end.
 
 ---
 
@@ -369,7 +384,7 @@ For V1 MVP, the implementation order is:
 2. **Epic 0.5** — Test infrastructure *(done — stunt node, Playwright)*
 3. **Epic 1** — Auth *(done — PVE RSA-SHA1 verification; sidebar deferred to Epic 10)*
 4. **Epic 3** — ZFS pools (core value proposition — parsers first, then observe, then act)
-4.5. **Epic 13** — PVE UI embedding (pulled forward from the original 10.3 plan — establishes the routed-view pattern all later epics' views follow; parallelizable with Epic 3 act stories)
+4.5. **Epic 13** — PVE UI embedding, ExtJS-native (establishes the panel framework and gateway API shape all later epics' views build on; do 13.8–13.14 before starting Epic 4 UI work)
 5. **Epic 4** — ZFS datasets (builds on pool infrastructure)
 6. **Epic 5** — Snapshots (builds on dataset infrastructure)
 7. **Epic 6** — SMB shares (parser first, then CRUD)

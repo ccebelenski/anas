@@ -8,11 +8,11 @@
 
 ## Key decisions (do not revisit without discussion)
 
-- Two processes: anas (Nuxt 3) + anasd (Fastify), both as root
+- Two processes: anas (Fastify API gateway) + anasd (Fastify daemon), both as root
 - REST over Unix socket, versioned /v1/
 - Shared Zod schemas in packages/shared/
-- PrimeVue for UI, no Tailwind
-- PVE auth primary, PAM fallback, Dev for testing
+- UI is native ExtJS panels injected into the PVE web UI (Ceph model) — no separate web app, no iframe
+- PVE auth only (tickets are cluster-valid), Dev provider for testing
 - All mutations are jobs (202 Accepted)
 - Safety: 409 with X-Anas-Confirm-Code for dangerous ops
 - Config files are the API — surgical editing, never overwrite
