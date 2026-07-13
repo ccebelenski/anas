@@ -160,13 +160,14 @@ export async function poolRoutes(
     if (!pool)
       return []
     const ids: string[] = []
-    for (const group of pool.vdevGroups)
-      for (const vdev of group.vdevs)
+    for (const group of pool.vdevGroups) {
+      for (const vdev of group.vdevs) {
         for (const disk of vdev.disks)
           ids.push(disk.id)
+      }
+    }
     return ids
   }
-
 
   server.get('/pools', async (_request, _reply) => {
     const [listResult, statusResult] = await Promise.all([
