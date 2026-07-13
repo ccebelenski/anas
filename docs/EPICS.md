@@ -124,11 +124,11 @@ Story numbering is for identification only, not implementation order. Within eac
 #### Disk health (ZFS-focused — not a PVE inventory clone)
 > The generic disk inventory + wipe/GPT/LVM is PVE's job (Principle 15). ANAS's disk view is about disks *as ZFS storage*: health-in-context and the replace workflow. Decided July 2026 — do both a pool-topology integration and a standalone triage view.
 
-3.17. [dev] As a dev, I want disk data enriched with ZFS topology context (vdev name/role, per-disk read/write/checksum error counts) and a derived health status (healthy/warning/critical/unknown, fusing SMART pass-fail with ZFS errors), so both disk surfaces share one health model. *(Cheap signals only — no smartctl-per-disk on list calls.)*
+3.17. [done] As a dev, I want disk data enriched with ZFS topology context (vdev name/role, per-disk read/write/checksum error counts) and a derived health status (healthy/warning/critical/unknown, fusing SMART pass-fail with ZFS errors), so both disk surfaces share one health model. *(Cheap signals only — no smartctl-per-disk on list calls.)*
 
-3.18. As a user, I want a Disk Health view that shows every disk's ZFS health at a glance (pool/vdev/role, ZFS error counts, SMART, at-risk disks surfaced first) with disk-first actions (Replace, Add as spare/cache/log), so I can triage failing disks across all pools without hunting through each pool. *(Replaces the inventory-clone Disks view.)*
+3.18. [done] As a user, I want a Disk Health view that shows every disk's ZFS health at a glance (pool/vdev/role, ZFS error counts, SMART, at-risk disks surfaced first) with disk-first actions (Replace, Add as spare/cache/log), so I can triage failing disks across all pools without hunting through each pool. *(Replaces the inventory-clone Disks view.)*
 
-3.19. As a user, I want per-disk health and a Replace action inline in the pool topology, so I can act on a failing disk in the context where I see it.
+3.19. [done] As a user, I want per-disk health and a Replace action inline in the pool topology, so I can act on a failing disk in the context where I see it.
 
 #### Act
 3.7. [done] As a user, I want to import an existing pool (e.g., after moving disks from another system), so that I can access the data.
