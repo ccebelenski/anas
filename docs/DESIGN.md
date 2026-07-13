@@ -439,13 +439,21 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `zpool.import` | `zpool import [opts]` |
 | `zpool.export` | `zpool export <name>` |
 | `disk.wipe` | `wipefs -a --force <device>` (optional cleanup after pool destroy) |
-| `zfs.list` | `zfs list -Hp -t all` |
+| `zfs.list` | `zfs list -j -t all` (JSON — Principle 13, matches the pool parsers; ZFS 2.3+) |
 | `zfs.create` | `zfs create [opts] <dataset>` |
 | `zfs.destroy` | `zfs destroy <dataset>` |
 | `zfs.set` | `zfs set <prop>=<val> <dataset>` |
-| `zfs.get` | `zfs get <props> <dataset>` |
+| `zfs.get` | `zfs get -j <props> <dataset>` (JSON) |
 | `zfs.snapshot` | `zfs snapshot <dataset>@<name>` |
 | `zfs.rollback` | `zfs rollback <snapshot>` |
+
+### Filesystem permissions (dataset mountpoints — Epic 4.7, POSIX MVP)
+| Operation | Command |
+|-----------|---------|
+| `fs.chown` | `chown <owner>[:<group>] <mountpoint>` |
+| `fs.chmod` | `chmod <mode> <mountpoint>` |
+| `identity.users` | `getent passwd` (owner/group pickers — via nsswitch, NOT /etc/passwd; source-agnostic) |
+| `identity.groups` | `getent group` |
 
 ### SMB Operations
 | Operation | Command |
@@ -621,19 +629,19 @@ RuntimeDirectory=anas
 WantedBy=multi-user.target
 ```
 
-**anas.service**
+**anas.service** (the API gateway — serves no pages; HTTPS with PVE certs)
 ```ini
 [Unit]
-Description=ANAS Web Interface
+Description=ANAS API Gateway
 After=anasd.service
 Requires=anasd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node /path/to/anas/.output/server/index.mjs
+ExecStart=/usr/bin/node /path/to/anas/packages/gateway/dist/index.js
 User=root
 Environment=NODE_ENV=production
-Environment=NUXT_PORT=3000
+Environment=ANAS_PORT=3000
 
 [Install]
 WantedBy=multi-user.target
