@@ -49,7 +49,7 @@ The VM runs on an isolated NAT network (`anas-test`, 192.168.200.0/24).
 |---------|---------|
 | SSH | `ssh root@192.168.200.50` (password: `anas-test`) |
 | PVE Web UI | `https://192.168.200.50:8006` |
-| ANAS | `http://192.168.200.50:3000` |
+| ANAS | `https://192.168.200.50:3000` (PVE cert, log into PVE first) |
 | SMB | `smbclient //192.168.200.50/share` |
 | NFS | `mount 192.168.200.50:/export /mnt` |
 

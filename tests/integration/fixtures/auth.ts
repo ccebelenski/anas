@@ -55,14 +55,16 @@ export const test = base.extend<AuthFixtures>({
     const context = await browser.newContext({
       ignoreHTTPSErrors: true,
     })
-    // Set the PVE auth cookie
+    // Set the PVE auth cookie with the same attributes the real PVE UI
+    // uses (proxmoxlib.js setAuthData): Secure + SameSite=Lax. The Secure
+    // flag matters — it's why ANAS must serve HTTPS (story 10.4).
     await context.addCookies([
       {
         name: 'PVEAuthCookie',
         value: pveTicket,
         domain: '192.168.200.50',
         path: '/',
-        secure: false,
+        secure: true,
         sameSite: 'Lax',
       },
     ])

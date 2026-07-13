@@ -22,7 +22,7 @@ export default defineConfig({
       testDir: './tests/integration',
       use: {
         ...devices['Desktop Chrome'],
-        baseURL: 'http://192.168.200.50:3000',
+        baseURL: 'https://192.168.200.50:3000',
         ignoreHTTPSErrors: true,
         screenshot: 'only-on-failure',
         trace: 'on-first-retry',

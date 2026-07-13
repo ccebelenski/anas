@@ -56,7 +56,11 @@ Requires=anasd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node /opt/anas/packages/web/.output/server/index.mjs
+# Serve HTTPS with the host's PVE certificates (story 10.4). PVE marks
+# PVEAuthCookie as Secure, so browsers only send it over HTTPS. Prefer the
+# custom cert (pveproxy-ssl.*) when present, like pveproxy does.
+# ($$ is systemd's escape for a literal $ passed to bash.)
+ExecStart=/bin/bash -c 'C=/etc/pve/local/pveproxy-ssl; { [ -f "$${C}.pem" ] && [ -f "$${C}.key" ]; } || C=/etc/pve/local/pve-ssl; export NITRO_SSL_CERT="$$(cat "$${C}.pem")" NITRO_SSL_KEY="$$(cat "$${C}.key")"; exec /usr/bin/node /opt/anas/packages/web/.output/server/index.mjs'
 Environment=ANASD_SOCKET=/run/anas/anasd.sock
 Environment=ANAS_AUTH_PROVIDER=pve
 Environment=NITRO_PORT=3000
@@ -99,4 +103,4 @@ fi
 
 echo
 echo "=== Deploy complete ==="
-echo "ANAS available at http://${VM_IP}:3000"
+echo "ANAS available at https://${VM_IP}:3000"
