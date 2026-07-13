@@ -206,6 +206,34 @@ Story numbering is for identification only, not implementation order. Within eac
 
 5.6. As a user, I want to destroy a snapshot, so that I can reclaim space.
 
+5.7. [backlog] As a user, I want to clone a snapshot into a writable dataset (`zfs clone`), so I can branch off a point-in-time copy. *(Small once snapshots exist.)*
+
+---
+
+## Epic 4.5 (backlog): Additional ZFS Dataset Capabilities
+
+> Beyond the core properties already in Epic 4. Brainstormed July 2026.
+
+4.9. [backlog] As a user, I want to see each dataset's achieved compression ratio (`compressratio`) and pick a modern compressor (lz4/zstd), so compression gives visible feedback. *(Cheap — fold into 4.3/4.5.)*
+
+4.10. [backlog] As a user, I want to toggle deduplication on a dataset, behind an ADVANCED, heavily-warned control that shows the dedup table's RAM cost. *(Plumbing is trivial (`zfs set dedup=`); the responsibility is the guardrails — ~1–5 GB RAM/TB, sticky on existing data. OpenZFS 2.3 fast-dedup softens it.)*
+
+4.11. [backlog] As a user, I want native at-rest encryption on datasets (aes-256-gcm), so data is protected on disk. *(Set at creation. The work is KEY MANAGEMENT: passphrase vs keyfile, load/unload, change-key — not the property itself. Possibly its own epic.)*
+
+4.12. [backlog] As a user, I want small tuning/maintenance actions: manual `zpool trim`, `sync`/atime toggles (with a data-loss warning on sync=disabled), and pool feature-flag `upgrade`. *(Completeness; each tiny.)*
+
+---
+
+## Epic 5.5 (backlog): ZFS Replication (zfs send/recv)
+
+> The highest-value missing ZFS capability — snapshots are useless off-box without it. Likely warrants promotion to a full epic (cf. TrueNAS "Replication Tasks"). Brainstormed July 2026.
+
+5.8. [backlog] As a user, I want to replicate a snapshot to another local pool (`zfs send | zfs recv`), so I have a backup on separate disks. *(Local target; incremental via `send -i`.)*
+
+5.9. [backlog] As a user, I want to replicate to a remote host (`zfs send | ssh | zfs recv`), so I have off-site backups / migration. *(The meat: remote target + auth, incremental streams, resume tokens.)*
+
+> **Cross-cutting decision (affects 5.x replication, snapshot retention, and scrub scheduling): do we build scheduling, or leverage existing tools?** Principle 7 discourages background schedulers and we've said Proxmox owns scheduling. Options: configure `sanoid`/`zfs-auto-snapshot`/systemd-timers/`pve-zsync` surgically (guest philosophy) vs. build our own. Settle once, not per-feature.
+
 ---
 
 ## Epic 6: SMB Share Management
