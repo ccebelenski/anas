@@ -24,6 +24,20 @@ export {
   UUID,
 } from './schemas/common.js'
 
+// Dataset schemas
+export {
+  CreateDatasetRequest,
+  Dataset,
+  DatasetDetail,
+  DatasetProperties,
+  DatasetType,
+  MountpointPermissions,
+  SetPermissionsRequest,
+  SystemGroup,
+  SystemUser,
+  UpdateDatasetPropertiesRequest,
+} from './schemas/datasets.js'
+
 // Disk schemas
 export {
   Disk,
