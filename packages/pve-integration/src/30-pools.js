@@ -51,6 +51,115 @@
         return ANAS.t(ROLE_LABELS[role] || role);
     }
 
+    // ---- Per-disk health (story 3.19) --------------------------------------
+    //
+    // Derive a per-disk health level inline from what PoolDetail gives us —
+    // vdev state + read/write/checksum error counts. Mirrors the daemon's
+    // computeHealth (packages/daemon/src/routes/disks.ts) for the in-pool case:
+    //   FAULTED/UNAVAIL/REMOVED or read>0 or write>0 → 'critical'
+    //   OFFLINE/DEGRADED or checksum>0               → 'warning'
+    //   ONLINE, no errors                            → 'healthy'
+    // Deviation: computeHealth also returns 'critical' when SMART self-assessment
+    // failed (smartHealthy === false) and 'unknown' for disks not in any pool.
+    // PoolDetail carries neither SMART nor out-of-pool disks, so those branches
+    // do not apply here — every topology disk is a live pool member.
+    function diskHealthLevel(state, read, write, cksum) {
+        var r = Number(read) || 0;
+        var w = Number(write) || 0;
+        var c = Number(cksum) || 0;
+        if (state === 'FAULTED' || state === 'UNAVAIL' || state === 'REMOVED'
+            || r > 0 || w > 0) {
+            return 'critical';
+        }
+        if (state === 'OFFLINE' || state === 'DEGRADED' || c > 0) {
+            return 'warning';
+        }
+        return 'healthy';
+    }
+
+    var HEALTH_LABELS = {
+        healthy: 'Healthy',
+        warning: 'Warning',
+        critical: 'Critical',
+    };
+
+    var HEALTH_ICONS = {
+        healthy: 'check-circle',
+        warning: 'exclamation-circle',
+        critical: 'times-circle',
+    };
+
+    // Colored dot + label for the topology Health column. Carries the
+    // anas-topo-health-<level> class as a test hook. Fail-open: any failure
+    // degrades to a bare (translated) label.
+    function renderTopoHealth(value) {
+        if (!value) {
+            return '';
+        }
+        var level = value;
+        var label = ANAS.t(HEALTH_LABELS[level] || level);
+        var icon = HEALTH_ICONS[level] || 'question-circle';
+        try {
+            return '<i class="fa fa-' + icon + ' anas-topo-health-' + level
+                + '"></i> ' + Ext.String.htmlEncode(label);
+        } catch (e) {
+            return label;
+        }
+    }
+
+    // Error-count cell: nonzero values turn red + bold so a degrading disk's
+    // counters visibly stand out. Blank for the group/vdev structural rows.
+    function renderErrCount(value) {
+        if (value === '' || value === undefined || value === null) {
+            return '';
+        }
+        var txt;
+        try {
+            txt = Ext.String.htmlEncode('' + value);
+        } catch (e) {
+            txt = '' + value;
+        }
+        if ((Number(value) || 0) > 0) {
+            return '<span style="color:#d9534f;font-weight:bold;">' + txt + '</span>';
+        }
+        return txt;
+    }
+
+    // Inject the topology health styles once (icon colors + subtle row tint).
+    // No stylesheet ships with the integration bundle, so we add a single
+    // guarded <style> element. Idempotent and fail-open.
+    function ensureTopoStyles() {
+        try {
+            if (typeof document === 'undefined' || !document.getElementById) {
+                return;
+            }
+            if (document.getElementById('anas-topo-styles')) {
+                return;
+            }
+            var css = ''
+                + '.anas-topo-health-healthy{color:#21BF13;}'
+                + '.anas-topo-health-warning{color:#f0ad4e;}'
+                + '.anas-topo-health-critical{color:#d9534f;}'
+                + '.anas-topo-disk.anas-topo-row-warning .x-grid-cell'
+                + '{background-color:rgba(240,173,78,0.14);}'
+                + '.anas-topo-disk.anas-topo-row-critical .x-grid-cell'
+                + '{background-color:rgba(217,83,79,0.16);}';
+            var style = document.createElement('style');
+            style.id = 'anas-topo-styles';
+            style.type = 'text/css';
+            if (style.styleSheet) {
+                style.styleSheet.cssText = css;
+            } else {
+                style.appendChild(document.createTextNode(css));
+            }
+            var head = document.getElementsByTagName('head')[0] || document.documentElement;
+            head.appendChild(style);
+        } catch (e) {
+            // non-fatal — indicators still render via inline icon classes
+            ANAS.warn('topology style injection failed: ' + ANAS.errText(e));
+        }
+    }
+
     // ---- Grid --------------------------------------------------------------
 
     function loadPools(grid, node) {
@@ -404,14 +513,26 @@
                 var disks = v.disks || [];
                 for (di = 0; di < disks.length; di++) {
                     var disk = disks[di];
-                    vdevNode.children.push({
+                    var diskNode = {
                         name: disk.id,
                         state: disk.state,
                         read: disk.readErrors,
                         write: disk.writeErrors,
                         cksum: disk.checksumErrors,
+                        isDisk: true,
+                        health: '',
                         leaf: true,
-                    });
+                    };
+                    // Fail-open: if derivation throws, the row still renders
+                    // with its existing state + error display, no health tag.
+                    try {
+                        diskNode.health = diskHealthLevel(
+                            disk.state, disk.readErrors,
+                            disk.writeErrors, disk.checksumErrors);
+                    } catch (e) {
+                        diskNode.health = '';
+                    }
+                    vdevNode.children.push(diskNode);
                 }
                 if (!vdevNode.children.length) {
                     vdevNode.leaf = true;
@@ -434,6 +555,7 @@
             content.add(ANAS.errorPanel(ANAS.t('No pool detail returned.')));
             return;
         }
+        ensureTopoStyles();
         content.add([
             {
                 xtype: 'panel',
@@ -450,20 +572,46 @@
                 rootVisible: false,
                 border: false,
                 store: Ext.create('Ext.data.TreeStore', {
-                    fields: ['name', 'state', 'read', 'write', 'cksum'],
+                    fields: ['name', 'state', 'read', 'write', 'cksum',
+                        'health', { name: 'isDisk', type: 'boolean' }],
                     root: topologyRoot(d.vdevGroups),
                 }),
+                // Tag each disk row (test hook: anas-topo-disk) and tint the row
+                // for a disk in trouble so it visibly stands out. Fail-open.
+                viewConfig: {
+                    getRowClass: function (record) {
+                        try {
+                            if (!record.get('isDisk')) {
+                                return '';
+                            }
+                            var cls = 'anas-topo-disk';
+                            var h = record.get('health');
+                            if (h === 'critical' || h === 'warning') {
+                                cls += ' anas-topo-row-' + h;
+                            }
+                            return cls;
+                        } catch (e) {
+                            return '';
+                        }
+                    },
+                },
                 columns: [
                     { xtype: 'treecolumn', text: ANAS.t('Name'), dataIndex: 'name', flex: 1 },
+                    {
+                        text: ANAS.t('Health'),
+                        dataIndex: 'health',
+                        width: 110,
+                        renderer: renderTopoHealth,
+                    },
                     {
                         text: ANAS.t('State'),
                         dataIndex: 'state',
                         width: 130,
                         renderer: ANAS.renderState,
                     },
-                    { text: 'READ', dataIndex: 'read', width: 80 },
-                    { text: 'WRITE', dataIndex: 'write', width: 80 },
-                    { text: 'CKSUM', dataIndex: 'cksum', width: 80 },
+                    { text: 'READ', dataIndex: 'read', width: 80, renderer: renderErrCount },
+                    { text: 'WRITE', dataIndex: 'write', width: 80, renderer: renderErrCount },
+                    { text: 'CKSUM', dataIndex: 'cksum', width: 80, renderer: renderErrCount },
                 ],
             },
             {
