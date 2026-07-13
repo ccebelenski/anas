@@ -98,5 +98,15 @@ else
 fi
 
 echo
+
+# Install PVE UI integration
+# The rsync above already placed packages/pve-integration/ under /opt/anas/, so
+# install.sh runs from its final location (the apt hook references that path).
+# Idempotent: re-running on every deploy is safe.
+echo "Installing PVE UI integration..."
+$SSH_CMD "chmod +x /opt/anas/packages/pve-integration/install.sh /opt/anas/packages/pve-integration/uninstall.sh && /opt/anas/packages/pve-integration/install.sh"
+echo "✓ PVE UI integration installed"
+echo
+
 echo "=== Deploy complete ==="
 echo "ANAS available at http://${VM_IP}:3000"
