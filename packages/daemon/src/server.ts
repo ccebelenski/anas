@@ -10,6 +10,7 @@ import { diskRoutes } from './routes/disks.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
 import { poolRoutes } from './routes/pools.js'
+import { ConfirmStore } from './safety/confirm.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
 
 export interface ServerOptions {
@@ -59,11 +60,39 @@ export function createServer(opts?: ServerOptions) {
     for (const kv of ['autoexpand=on', 'autoexpand=off', 'autoreplace=on', 'autoreplace=off', 'autotrim=on', 'autotrim=off', 'failmode=wait', 'failmode=continue', 'failmode=panic']) {
       mock.addFixture({ command: '/usr/sbin/zpool', args: ['set', kv, 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
     }
+    // Export / destroy (stories 3.13/3.14)
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['export', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['export', '-f', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['destroy', 'testpool'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    // Import scan (story 3.7): `zpool import` with no args lists one pool.
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['import'], result: {
+      stdout: [
+        '   pool: oldtank',
+        '     id: 9876543210987654321',
+        '  state: ONLINE',
+        ' action: The pool can be imported using its name or numeric identifier.',
+        ' config:',
+        '',
+        '\toldtank     ONLINE',
+        '\t  mirror-0  ONLINE',
+        '\t    sdg     ONLINE',
+        '\t    sdh     ONLINE',
+        '',
+      ].join('\n'),
+      stderr: '',
+      exitCode: 0,
+    } })
+    // Dynamic-arg mutations (create, import-by-name, add-vdev, attach/replace)
+    // take disk/target args, so a command-only fallback lets them succeed in dev
+    // mock. Exact fixtures above still take priority (MockExecutor: exact first).
+    mock.addFixture({ command: '/usr/sbin/zpool', result: { stdout: '', stderr: '', exitCode: 0 } })
   }
+
+  const confirmStore = new ConfirmStore()
 
   server.register(healthRoutes, { prefix: '/v1' })
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
-  server.register(poolRoutes, { prefix: '/v1', executor, jobQueue })
+  server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
 

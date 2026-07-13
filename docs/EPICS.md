@@ -122,21 +122,21 @@ Story numbering is for identification only, not implementation order. Within eac
 3.6. [done] As a user, I want to see SMART health data for individual disks, so that I can identify drives that may be failing.
 
 #### Act
-3.7. As a user, I want to import an existing pool (e.g., after moving disks from another system), so that I can access the data.
+3.7. [done] As a user, I want to import an existing pool (e.g., after moving disks from another system), so that I can access the data.
 
-3.8. As a user, I want to create a ZFS pool by selecting disks and a redundancy level (mirror, raidz, raidz2, etc.), so that I can set up storage appropriate for my needs.
+3.8. [done] As a user, I want to create a ZFS pool by selecting disks and a redundancy level (mirror, raidz, raidz2, etc.), so that I can set up storage appropriate for my needs.
 
-3.9. As a user, I want to modify pool properties, so that I can tune pool behavior.
+3.9. [done] As a user, I want to modify pool properties, so that I can tune pool behavior.
 
 3.10. [done] As a user, I want to start a scrub on a pool, so that I can verify data integrity.
 
-3.11. As a user, I want to add a vdev to an existing pool, so that I can expand capacity.
+3.11. [done] As a user, I want to add a vdev to an existing pool, so that I can expand capacity.
 
-3.12. As a user, I want to attach a disk to a mirror (or replace a failed disk), so that I can restore redundancy.
+3.12. [done] As a user, I want to attach a disk to a mirror (or replace a failed disk), so that I can restore redundancy.
 
-3.13. As a user, I want to export a pool, so that I can safely move it to another system.
+3.13. [done] As a user, I want to export a pool, so that I can safely move it to another system.
 
-3.14. As a user, I want to destroy a pool, so that I can reclaim the disks. *(Confirmation required, clearly dangerous.)*
+3.14. [done] As a user, I want to destroy a pool, so that I can reclaim the disks. *(Confirmation required, clearly dangerous.)*
 
 ---
 

@@ -157,7 +157,7 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `PUT` | `/v1/pools/:name` | Update pool properties | `202` with job |
 | `DELETE` | `/v1/pools/:name` | Destroy a pool | `202`/`409` |
 | `POST` | `/v1/pools/:name/scrub` | Start a scrub | `202` with job |
-| `POST` | `/v1/pools/:name/export` | Export a pool | `202`/`449` |
+| `POST` | `/v1/pools/:name/export` | Export a pool | `202`/`409` |
 | `POST` | `/v1/pools/import` | Import a pool (on collection — pool isn't ours yet) | `202` with job |
 
 #### ZFS Datasets (nested under pools)
@@ -179,7 +179,7 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `GET` | `/v1/pools/:name/datasets/*path/snapshots/:snap` | Snapshot detail | `200` |
 | `PUT` | `/v1/pools/:name/datasets/*path/snapshots/:snap` | Rename a snapshot | `202` with job |
 | `DELETE` | `/v1/pools/:name/datasets/*path/snapshots/:snap` | Destroy a snapshot | `202` with job |
-| `POST` | `/v1/pools/:name/datasets/*path/snapshots/:snap/rollback` | Rollback to snapshot | `202`/`449` |
+| `POST` | `/v1/pools/:name/datasets/*path/snapshots/:snap/rollback` | Rollback to snapshot | `202`/`409` |
 
 #### SMB Shares
 
@@ -191,7 +191,7 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `PUT` | `/v1/shares/smb/global` | Update global config | `202` with job |
 | `GET` | `/v1/shares/smb/:name` | Share detail (config + active connections) | `200` |
 | `PUT` | `/v1/shares/smb/:name` | Update share config | `202` with job |
-| `DELETE` | `/v1/shares/smb/:name` | Remove a share | `202`/`449` |
+| `DELETE` | `/v1/shares/smb/:name` | Remove a share | `202`/`409` |
 
 #### NFS Exports
 
@@ -201,7 +201,7 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `POST` | `/v1/shares/nfs` | Create an export | `202` with job |
 | `GET` | `/v1/shares/nfs/:path` | Export detail (path is URL-encoded) | `200` |
 | `PUT` | `/v1/shares/nfs/:path` | Update export config | `202` with job |
-| `DELETE` | `/v1/shares/nfs/:path` | Remove an export | `202`/`449` |
+| `DELETE` | `/v1/shares/nfs/:path` | Remove an export | `202`/`409` |
 
 #### Disks (read-only, filtered to relevant storage devices)
 
@@ -432,6 +432,10 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `zpool.create` | `zpool create [opts] <name> <vdevs...>` |
 | `zpool.destroy` | `zpool destroy <name>` |
 | `zpool.scrub` | `zpool scrub <name>` |
+| `zpool.set` | `zpool set <prop>=<val> <name>` |
+| `zpool.add` | `zpool add <name> <vdev-spec...>` |
+| `zpool.attach` | `zpool attach <name> <device> <new-device>` |
+| `zpool.replace` | `zpool replace <name> <old-device> <new-device>` |
 | `zpool.import` | `zpool import [opts]` |
 | `zpool.export` | `zpool export <name>` |
 | `zfs.list` | `zfs list -Hp -t all` |

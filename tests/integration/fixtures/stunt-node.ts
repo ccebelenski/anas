@@ -85,3 +85,118 @@ export async function nfsExportExists(exportPath: string): Promise<boolean> {
 export async function getZpoolStatus(pool: string): Promise<string> {
   return sshExec(`zpool status ${pool}`)
 }
+
+/**
+ * List by-id identifiers of spare (unused) test disks on the stunt node.
+ *
+ * Only the QEMU 'ANAS_HOT<n>' whole disks are considered — never the boot disk —
+ * so an empty result is a safe "no spares" rather than a risk of grabbing rpool.
+ * A disk is spare when its real device is NOT claimed by any imported pool, so a
+ * disk freed by `destroyPool`/`zpool export` shows up again on the next call
+ * (even with stale ZFS labels — `createTestPool` forces past those).
+ *
+ * Returns e.g. ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3']. The spare-requiring specs
+ * `test.skip` cleanly when this is empty — attach more disks with
+ * test/stunt-node/add-disk.sh to enable them.
+ */
+export async function listSpareDisks(): Promise<string[]> {
+  let ids: string[]
+  try {
+    const out = await sshExec('ls /dev/disk/by-id/ 2>/dev/null')
+    ids = out
+      .split('\n')
+      .map(s => s.trim())
+      .filter(id =>
+        /^scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT\d+$/.test(id)
+        || /^nvme-ANAS_HOT\d+$/.test(id),
+      )
+  }
+  catch {
+    return []
+  }
+
+  // Base device paths (partition suffix stripped) currently claimed by a pool.
+  const inUse = new Set<string>()
+  try {
+    // -L resolves vdev names to real devices, -P prints their full paths.
+    const status = await sshExec('zpool status -LP 2>/dev/null || true')
+    for (const m of status.matchAll(/\/dev\/\S+/g))
+      inUse.add(m[0].replace(/\d+$/, ''))
+  }
+  catch {
+    // No pools / zpool unavailable — treat everything as free.
+  }
+
+  const spares: string[] = []
+  for (const id of ids) {
+    try {
+      const dev = (await sshExec(`readlink -f /dev/disk/by-id/${id}`)).trim()
+      if (dev && !inUse.has(dev))
+        spares.push(id)
+    }
+    catch {
+      // Skip disks we can't resolve.
+    }
+  }
+  return spares
+}
+
+/**
+ * Create a throwaway ZFS pool from the given by-id disks (a no-redundancy stripe).
+ * `-f` forces past stale labels left by a previously destroyed/exported pool.
+ * Used only to stage disposable pools for the Act specs — never for the create
+ * story itself (that goes through the API).
+ */
+export async function createTestPool(name: string, diskIds: string[]): Promise<void> {
+  const devs = diskIds.map(id => `/dev/disk/by-id/${id}`).join(' ')
+  await sshExec(`zpool create -f ${name} ${devs}`)
+}
+
+/**
+ * Best-effort teardown of a throwaway pool, leaving the box clean for reruns.
+ * Handles both states an Act test can leave it in: still imported (destroy) or
+ * exported by an export test (import, then destroy). Never throws.
+ */
+export async function destroyPool(name: string): Promise<void> {
+  try {
+    await sshExec(`zpool destroy -f ${name}`)
+    return
+  }
+  catch {
+    // Not imported — it may be an exported pool still on its disks.
+  }
+  try {
+    await sshExec(`zpool import -f ${name} 2>/dev/null && zpool destroy -f ${name}`)
+  }
+  catch {
+    // Nothing to clean up (or already gone).
+  }
+}
+
+/**
+ * Return the name of the pool holding the boot/root filesystem, or null when the
+ * system root is not on ZFS (e.g. an ext4/LVM install). The PROTECTED_RESOURCE
+ * destroy test skips when this is null — there is no protected pool to exercise.
+ */
+export async function getRootPool(): Promise<string | null> {
+  try {
+    const src = (await sshExec('findmnt -n -o SOURCE / 2>/dev/null || true')).trim()
+    // ZFS root looks like 'rpool/ROOT/pve-1'; a block device starts with /dev/.
+    if (src && !src.startsWith('/dev/') && src.includes('/'))
+      return src.split('/')[0]
+  }
+  catch {
+    // Fall through to the bootfs probe.
+  }
+  try {
+    const bootfs = (await sshExec(
+      'zpool get -H -o value bootfs 2>/dev/null | grep -v \'^-$\' | head -n1 || true',
+    )).trim()
+    if (bootfs && bootfs.includes('/'))
+      return bootfs.split('/')[0]
+  }
+  catch {
+    // No ZFS boot pool.
+  }
+  return null
+}
