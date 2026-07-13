@@ -101,14 +101,25 @@
         return icon + colored(t(info.label), info.color);
     }
 
-    // Disk identity: device name (emphasised) plus model / model family.
+    // Disk identity: the STABLE by-id (emphasised) is the primary identifier —
+    // kernel names (sdb) change across reboots and must never be identity. The
+    // kernel name is kept as a small secondary hint since it's familiar and
+    // short; model follows if present.
     function renderDisk(v, meta, rec) {
         var d = rec.data;
-        var name = d.name || d.id || '';
+        var byId = d.id || d.name || '';
+        var head = '<b>' + enc(byId) + '</b>';
+        var sub = [];
+        if (d.name && d.name !== byId) {
+            sub.push(enc(d.name));
+        }
         var model = d.model || d.modelFamily || '';
-        var head = '<b>' + enc(name) + '</b>';
         if (model) {
-            return head + ' <span style="color:gray;">' + enc(model) + '</span>';
+            sub.push(enc(model));
+        }
+        if (sub.length) {
+            return head + '<br><span style="color:gray;font-size:0.9em;">'
+                + sub.join(' &middot; ') + '</span>';
         }
         return head;
     }
@@ -436,6 +447,9 @@
                 border: false,
                 store: store,
                 emptyText: t('No disks found'),
+                // The Disk cell renders the by-id over the kernel name/model on
+                // two lines, so let row height grow to fit.
+                variableRowHeight: true,
                 selModel: { mode: 'SINGLE' },
                 columns: [
                     {
