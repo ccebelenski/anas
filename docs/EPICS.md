@@ -133,7 +133,11 @@ Story numbering is for identification only, not implementation order. Within eac
 3.20. [backlog] As a user, I want the Disk Health view grouped by pool → vdev (with unassigned/available disks in their own group), so that many disks stay scannable instead of a flat horde. *(Cheap — ExtJS grid grouping on a computed key. A graphical disk→vdev→pool connection diagram is a possible later, heavier follow-on.)*
 
 #### Act
-3.21. [backlog] As a user, I want to create a pool with — and add to an existing pool — a **special** (and dedup) allocation-class vdev, so that metadata and small blocks live on fast devices. *(Not yet possible: CreatePoolRequest has log/cache/spare but not special/dedup; AddVdevRequest takes only a data VdevSpec. Requires schema extension + UI. SAFETY: a special vdev holds pool-wide metadata — its loss loses the whole pool — so the UI must ENFORCE redundancy, ideally matching pool redundancy, not merely warn.)*
+3.21. [backlog] As a user, I want to add **Log (SLOG) / Cache (L2ARC) / hot Spare** vdevs — at pool creation and to an existing pool — so I can tune ZFS performance and resilience (PVE's pool UI offers none of this). *Scope:*
+- *Create: the API is DONE (CreatePoolRequest.logVdevs/cacheDisks/spareDisks, buildCreateArgs). Gap is UI only — expose optional Log/Cache/Spare pickers in the create window (32-pool-create.js).*
+- *Add-to-existing: gap is schema + daemon + UI — give AddVdevRequest a role/class (log/cache/spare), branch the daemon add to `zpool add <pool> log|cache|spare <spec>`, add a role selector to 34-pool-addvdev.js.*
+
+3.22. [backlog] As a user, I want **special** and **dedup** allocation-class vdevs, so metadata and small blocks live on fast devices. *(Deferred behind 3.21 — riskier. SAFETY: a special/dedup vdev holds pool-wide metadata; its loss loses the WHOLE pool, so the UI must ENFORCE redundancy — ideally matching pool redundancy — not merely warn.)*
 
 
 3.7. [done] As a user, I want to import an existing pool (e.g., after moving disks from another system), so that I can access the data.
