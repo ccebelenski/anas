@@ -298,6 +298,8 @@ Story numbering is for identification only, not implementation order. Within eac
 
 > As a user, I can manage the system users and groups that are needed for share access and permissions.
 
+> **ARCHITECTURAL SEAM (lock in even for MVP): resolve users/groups via `getent`/nsswitch, NEVER by parsing `/etc/passwd`.** That makes identity source-agnostic — local, LDAP, or AD users all surface through the same abstraction once the box is configured (see Epic 14). PVE-realm (`@pve`) users have no UID and are NOT usable for file ownership; only system-resolvable users (getent) are. PVE realms authenticate to the PVE UI, which is a different thing from making a user own files.
+
 ### Stories
 
 #### Observe
@@ -469,3 +471,13 @@ Single pane of glass for multi-node environments. anasd's REST API becomes the b
 Proxmox has the Datacenter Manager product, but ANAS cluster management would be storage-focused and independent of it.
 
 Detailed stories to be written when this epic is prioritized.
+
+### Epic 14: Directory Services / External Identity (enterprise)
+
+> As an enterprise user, I can join the storage host to Active Directory or LDAP so that domain users and groups can own files and access SMB/NFS shares.
+
+Enterprise identity is nearly a requirement for real deployments — users live in AD/LDAP, not `/etc/passwd`. The key insight: PVE's AD/LDAP *realms* authenticate users to the PVE UI but do NOT make them system-resolvable for file ownership. That needs OS-level domain integration — **`realmd` + `winbind`/`sssd` + nsswitch** — which PVE has no story for. This is a genuine PVE gap and thus differentiated ANAS value.
+
+Per Don't-Build-Undifferentiated-Code: ANAS **configures** realmd/winbind/sssd (join domain, wire nsswitch, map SMB via Samba's AD member mode) — it does not build identity mapping. Once joined, everything else works unchanged *because* user/group resolution goes through `getent` (the Epic 8 seam): pickers, ownership, and ACLs all just see domain users. Pairs with the NFSv4 ACL editor (4.7.1) and SMB (Epic 6, run as an AD member).
+
+Detailed stories to be written when prioritized. Not MVP — but the getent seam (Epic 8) must be in place so this drops in without rework.
