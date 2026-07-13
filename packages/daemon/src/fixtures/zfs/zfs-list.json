@@ -11,34 +11,62 @@
             "pool": "testpool",
             "createtxg": "1",
             "properties": {
-                "used": {
-                    "value": "140K",
-                    "source": {
-                        "type": "NONE",
-                        "data": "-"
-                    }
-                },
-                "available": {
-                    "value": "352M",
-                    "source": {
-                        "type": "NONE",
-                        "data": "-"
-                    }
-                },
-                "referenced": {
-                    "value": "24K",
-                    "source": {
-                        "type": "NONE",
-                        "data": "-"
-                    }
-                },
-                "mountpoint": {
-                    "value": "/testpool",
-                    "source": {
-                        "type": "DEFAULT",
-                        "data": "-"
-                    }
-                }
+                "used": { "value": "140M", "source": { "type": "NONE", "data": "-" } },
+                "available": { "value": "352M", "source": { "type": "NONE", "data": "-" } },
+                "referenced": { "value": "24K", "source": { "type": "NONE", "data": "-" } },
+                "quota": { "value": "none", "source": { "type": "DEFAULT", "data": "-" } },
+                "mountpoint": { "value": "/testpool", "source": { "type": "DEFAULT", "data": "-" } },
+                "compression": { "value": "lz4", "source": { "type": "LOCAL", "data": "-" } },
+                "compressratio": { "value": "1.00x", "source": { "type": "NONE", "data": "-" } },
+                "type": { "value": "filesystem", "source": { "type": "NONE", "data": "-" } }
+            }
+        },
+        "testpool/media": {
+            "name": "testpool/media",
+            "type": "FILESYSTEM",
+            "pool": "testpool",
+            "createtxg": "42",
+            "properties": {
+                "used": { "value": "120M", "source": { "type": "NONE", "data": "-" } },
+                "available": { "value": "352M", "source": { "type": "NONE", "data": "-" } },
+                "referenced": { "value": "120M", "source": { "type": "NONE", "data": "-" } },
+                "quota": { "value": "10G", "source": { "type": "LOCAL", "data": "-" } },
+                "mountpoint": { "value": "/testpool/media", "source": { "type": "DEFAULT", "data": "-" } },
+                "compression": { "value": "zstd", "source": { "type": "LOCAL", "data": "-" } },
+                "compressratio": { "value": "1.42x", "source": { "type": "NONE", "data": "-" } },
+                "type": { "value": "filesystem", "source": { "type": "NONE", "data": "-" } }
+            }
+        },
+        "testpool/vm-100-disk-0": {
+            "name": "testpool/vm-100-disk-0",
+            "type": "VOLUME",
+            "pool": "testpool",
+            "createtxg": "88",
+            "properties": {
+                "used": { "value": "8G", "source": { "type": "NONE", "data": "-" } },
+                "available": { "value": "352M", "source": { "type": "NONE", "data": "-" } },
+                "referenced": { "value": "56K", "source": { "type": "NONE", "data": "-" } },
+                "quota": { "value": "none", "source": { "type": "DEFAULT", "data": "-" } },
+                "mountpoint": { "value": "-", "source": { "type": "NONE", "data": "-" } },
+                "compression": { "value": "lz4", "source": { "type": "INHERITED", "data": "testpool" } },
+                "compressratio": { "value": "1.00x", "source": { "type": "NONE", "data": "-" } },
+                "type": { "value": "volume", "source": { "type": "NONE", "data": "-" } }
+            }
+        },
+        "testpool/media@snap1": {
+            "name": "testpool/media@snap1",
+            "type": "SNAPSHOT",
+            "pool": "testpool",
+            "createtxg": "50",
+            "properties": {
+                "used": { "value": "0B", "source": { "type": "NONE", "data": "-" } },
+                "available": { "value": "-", "source": { "type": "NONE", "data": "-" } },
+                "referenced": { "value": "120M", "source": { "type": "NONE", "data": "-" } },
+                "quota": { "value": "-", "source": { "type": "NONE", "data": "-" } },
+                "mountpoint": { "value": "-", "source": { "type": "NONE", "data": "-" } },
+                "compression": { "value": "-", "source": { "type": "NONE", "data": "-" } },
+                "compressratio": { "value": "1.42x", "source": { "type": "NONE", "data": "-" } },
+                "type": { "value": "snapshot", "source": { "type": "NONE", "data": "-" } }
             }
         }
     }

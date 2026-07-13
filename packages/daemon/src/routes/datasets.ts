@@ -1,0 +1,479 @@
+import type { CreateDatasetRequest, Dataset, DatasetDetail, MountpointPermissions, SystemGroup, SystemUser, UpdateDatasetPropertiesRequest } from '@anas/shared'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
+import type { CommandExecutor } from '../executor/types.js'
+import type { JobQueue } from '../jobs/queue.js'
+import type { ConfirmStore } from '../safety/confirm.js'
+import { CreateDatasetRequest as CreateDatasetRequestSchema, DatasetPath, PoolName, SetPermissionsRequest, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
+import { parseDatasetGet, parseSnapshotNames, parseZfsList, zfsListArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
+import { parseZpoolList } from '../parsers/zpool-list.js'
+import { confirmGate } from '../safety/gate.js'
+import { requireIdentity } from './identity.js'
+
+const ZFS = '/usr/sbin/zfs'
+const GETENT = '/usr/bin/getent'
+const STAT = '/usr/bin/stat'
+const CHOWN = '/usr/bin/chown'
+const CHMOD = '/usr/bin/chmod'
+
+/** Whitespace splitter for `stat` output (owner group mode). */
+const WHITESPACE_RE = /\s+/
+
+/** Build the `zfs create` argument array from a validated request. */
+function buildCreateArgs(fullName: string, req: CreateDatasetRequest): string[] {
+  const args = ['create']
+  const p = req.properties
+  if (p) {
+    if (p.compression !== undefined)
+      args.push('-o', `compression=${p.compression}`)
+    if (p.recordsize !== undefined)
+      args.push('-o', `recordsize=${p.recordsize}`)
+    if (p.quota !== undefined)
+      args.push('-o', `quota=${p.quota === 0 ? 'none' : p.quota}`)
+    if (p.reservation !== undefined)
+      args.push('-o', `reservation=${p.reservation === 0 ? 'none' : p.reservation}`)
+    if (p.mountpoint !== undefined)
+      args.push('-o', `mountpoint=${p.mountpoint}`)
+  }
+  args.push(fullName)
+  return args
+}
+
+/**
+ * Build one `<prop>=<value>` token per changed property (fed to `zfs set`).
+ * Booleans map to on/off; a 0 quota/reservation means 'none'; the rest pass
+ * through as-is. Only the settable properties in the shared schema are mapped —
+ * anything else is silently absent (structured operations, Principle 5).
+ */
+function buildSetPairs(p: UpdateDatasetPropertiesRequest['properties']): string[] {
+  const pairs: string[] = []
+  const size = (n: number) => (n === 0 ? 'none' : String(n))
+  if (p.compression !== undefined)
+    pairs.push(`compression=${p.compression}`)
+  if (p.recordsize !== undefined)
+    pairs.push(`recordsize=${p.recordsize}`)
+  if (p.quota !== undefined)
+    pairs.push(`quota=${size(p.quota)}`)
+  if (p.reservation !== undefined)
+    pairs.push(`reservation=${size(p.reservation)}`)
+  if (p.refquota !== undefined)
+    pairs.push(`refquota=${size(p.refquota)}`)
+  if (p.refreservation !== undefined)
+    pairs.push(`refreservation=${size(p.refreservation)}`)
+  if (p.atime !== undefined)
+    pairs.push(`atime=${p.atime ? 'on' : 'off'}`)
+  if (p.sync !== undefined)
+    pairs.push(`sync=${p.sync}`)
+  if (p.readonly !== undefined)
+    pairs.push(`readonly=${p.readonly ? 'on' : 'off'}`)
+  if (p.dedup !== undefined)
+    pairs.push(`dedup=${p.dedup}`)
+  return pairs
+}
+
+/** Parse `getent passwd` lines into system users (uid ≥ 1000 plus root). */
+function parsePasswd(stdout: string): SystemUser[] {
+  const users: SystemUser[] = []
+  for (const line of stdout.split('\n')) {
+    if (!line.trim())
+      continue
+    const parts = line.split(':')
+    const name = parts[0]
+    const uid = Number.parseInt(parts[2], 10)
+    if (!name || Number.isNaN(uid))
+      continue
+    if (uid === 0 || uid >= 1000)
+      users.push({ name, uid })
+  }
+  return users
+}
+
+/** Parse `getent group` lines into system groups (gid ≥ 1000 plus root). */
+function parseGroup(stdout: string): SystemGroup[] {
+  const groups: SystemGroup[] = []
+  for (const line of stdout.split('\n')) {
+    if (!line.trim())
+      continue
+    const parts = line.split(':')
+    const name = parts[0]
+    const gid = Number.parseInt(parts[2], 10)
+    if (!name || Number.isNaN(gid))
+      continue
+    if (gid === 0 || gid >= 1000)
+      groups.push({ name, gid })
+  }
+  return groups
+}
+
+export async function datasetRoutes(
+  server: FastifyInstance,
+  opts: { executor: CommandExecutor, jobQueue: JobQueue, confirmStore: ConfirmStore },
+) {
+  const { executor, jobQueue, confirmStore } = opts
+
+  /** Does the named pool exist? (source of truth is `zpool list`). */
+  async function poolExists(poolName: string): Promise<boolean> {
+    const r = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
+    const pools = r.exitCode === 0 && r.stdout.trim() ? parseZpoolList(r.stdout) : []
+    return pools.some(p => p.name === poolName)
+  }
+
+  /** The pool's flat dataset list (filesystems + volumes). */
+  async function listDatasets(poolName: string): Promise<Dataset[]> {
+    const r = await executor.exec(ZFS, zfsListArgs(poolName))
+    if (r.exitCode !== 0 || !r.stdout.trim())
+      return []
+    return parseZfsList(r.stdout)
+  }
+
+  /** Snapshot names below a dataset (for destroy warnings). */
+  async function snapshotNames(fullName: string): Promise<string[]> {
+    const r = await executor.exec(ZFS, zfsSnapshotListArgs(fullName))
+    if (r.exitCode !== 0 || !r.stdout.trim())
+      return []
+    return parseSnapshotNames(r.stdout)
+  }
+
+  /** Stat a mountpoint for owner/group/mode, or null if it can't be read. */
+  async function statMountpoint(mountpoint: string): Promise<MountpointPermissions | null> {
+    const r = await executor.exec(STAT, ['-c', '%U %G %a', mountpoint])
+    if (r.exitCode !== 0 || !r.stdout.trim())
+      return null
+    const [owner, group, mode] = r.stdout.trim().split(WHITESPACE_RE)
+    if (!owner || !group || !mode)
+      return null
+    return { owner, group, mode }
+  }
+
+  // --- GET /pools/:name/datasets — flat list (UI builds the tree) ----------
+  server.get<{ Params: { name: string } }>('/pools/:name/datasets', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    if (!(await poolExists(poolName))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    return { data: await listDatasets(poolName) }
+  })
+
+  // --- GET /pools/:name/datasets/*path — detail ---------------------------
+  // Wildcard `*` captures the full (possibly nested) dataset path. The `PUT`
+  // permissions action shares this wildcard because find-my-way only allows a
+  // wildcard as the final path segment — see the PUT handler below.
+  server.get<{ Params: { 'name': string, '*': string } }>('/pools/:name/datasets/*', async (request, reply) => {
+    const poolName = request.params.name
+    const path = request.params['*']
+
+    const fullName = path ? `${poolName}/${path}` : poolName
+
+    const r = await executor.exec(ZFS, ['get', '-j', 'all', fullName])
+    if (r.exitCode !== 0 || !r.stdout.trim()) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+
+    const parsed = parseDatasetGet(r.stdout, fullName)
+    if (!parsed) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+
+    // POSIX permissions from the mountpoint (filesystems only, when mounted).
+    const permissions = parsed.base.type === 'filesystem' && parsed.base.mountpoint
+      ? await statMountpoint(parsed.base.mountpoint)
+      : null
+
+    const detail: DatasetDetail = {
+      ...parsed.base,
+      properties: parsed.properties,
+      permissions,
+      // Populated once SMB/NFS shares exist (Epics 6/7).
+      associatedShares: [],
+    }
+
+    return { data: detail }
+  })
+
+  // --- POST /pools/:name/datasets — create --------------------------------
+  server.post<{ Params: { name: string } }>('/pools/:name/datasets', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    const bodyParsed = CreateDatasetRequestSchema.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid create request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const req = bodyParsed.data
+    const fullName = `${poolName}/${req.path}`
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!(await poolExists(poolName))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    // 409 if it already exists — the system is the source of truth.
+    const existing = await listDatasets(poolName)
+    if (existing.some(d => d.name === fullName)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Dataset '${fullName}' already exists` } }
+    }
+
+    const args = buildCreateArgs(fullName, req)
+
+    const job = jobQueue.submit(
+      'zfs.create',
+      { ...identity, params: { dataset: fullName } },
+      async () => {
+        const result = await executor.exec(ZFS, args)
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `zfs create exited with code ${result.exitCode}`)
+        return { created: fullName }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
+  // --- PUT /pools/:name/datasets/*path — update props OR permissions ------
+  // find-my-way only permits a wildcard as the final segment, so a nested
+  // dataset path plus a `/permissions` suffix cannot be two routes. We branch
+  // here: a wildcard ending in `/permissions` is the SetPermissions action,
+  // otherwise it is a property update.
+  server.put<{ Params: { 'name': string, '*': string } }>('/pools/:name/datasets/*', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+    const wildcard = request.params['*']
+
+    const PERM_SUFFIX = '/permissions'
+    if (wildcard === 'permissions' || wildcard.endsWith(PERM_SUFFIX)) {
+      const path = wildcard === 'permissions' ? '' : wildcard.slice(0, -PERM_SUFFIX.length)
+      return setPermissions(poolName, path, request, reply)
+    }
+
+    return updateProperties(poolName, wildcard, request, reply)
+  })
+
+  async function updateProperties(
+    poolName: string,
+    path: string,
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ) {
+    const pathParsed = DatasetPath.safeParse(path)
+    if (!pathParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${pathParsed.error.issues[0]?.message}` } }
+    }
+    const fullName = `${poolName}/${pathParsed.data}`
+
+    const bodyParsed = UpdateDatasetPropertiesRequestSchema.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid property update: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const pairs = buildSetPairs(bodyParsed.data.properties)
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const existing = await listDatasets(poolName)
+    if (!existing.some(d => d.name === fullName)) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+
+    const job = jobQueue.submit(
+      'zfs.set',
+      { ...identity, params: { dataset: fullName, properties: bodyParsed.data.properties } },
+      async (updateProgress) => {
+        for (const pair of pairs) {
+          updateProgress(`Setting ${pair} on ${fullName}`)
+          const result = await executor.exec(ZFS, ['set', pair, fullName])
+          if (result.exitCode !== 0)
+            throw new Error(result.stderr.trim() || `zfs set ${pair} exited with code ${result.exitCode}`)
+        }
+        return { dataset: fullName, applied: pairs }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  }
+
+  async function setPermissions(
+    poolName: string,
+    path: string,
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ) {
+    // Empty path targets the pool root dataset; otherwise validate the path.
+    let fullName = poolName
+    if (path) {
+      const pathParsed = DatasetPath.safeParse(path)
+      if (!pathParsed.success) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${pathParsed.error.issues[0]?.message}` } }
+      }
+      fullName = `${poolName}/${pathParsed.data}`
+    }
+
+    const bodyParsed = SetPermissionsRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid permissions request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const { owner, group, mode, recursive } = bodyParsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    // Resolve the mountpoint from the dataset — permissions apply to the path.
+    const r = await executor.exec(ZFS, ['get', '-j', 'all', fullName])
+    if (r.exitCode !== 0 || !r.stdout.trim()) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+    const parsed = parseDatasetGet(r.stdout, fullName)
+    if (!parsed) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+    const mountpoint = parsed.base.mountpoint
+    if (!mountpoint) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Dataset '${fullName}' has no mountpoint (volume or unmounted)` } }
+    }
+
+    const job = jobQueue.submit(
+      'fs.setPermissions',
+      { ...identity, params: { dataset: fullName, mountpoint, owner, group, mode, recursive } },
+      async (updateProgress) => {
+        if (owner !== undefined || group !== undefined) {
+          const spec = group !== undefined ? `${owner ?? ''}:${group}` : `${owner}`
+          const args = recursive ? ['-R', spec, mountpoint] : [spec, mountpoint]
+          updateProgress(`chown ${spec} ${mountpoint}`)
+          const result = await executor.exec(CHOWN, args)
+          if (result.exitCode !== 0)
+            throw new Error(result.stderr.trim() || `chown exited with code ${result.exitCode}`)
+        }
+        if (mode !== undefined) {
+          const args = recursive ? ['-R', mode, mountpoint] : [mode, mountpoint]
+          updateProgress(`chmod ${mode} ${mountpoint}`)
+          const result = await executor.exec(CHMOD, args)
+          if (result.exitCode !== 0)
+            throw new Error(result.stderr.trim() || `chmod exited with code ${result.exitCode}`)
+        }
+        return { dataset: fullName, mountpoint }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  }
+
+  // --- DELETE /pools/:name/datasets/*path — destroy (dangerous) -----------
+  server.delete<{ Params: { 'name': string, '*': string }, Querystring: { recursive?: string } }>('/pools/:name/datasets/*', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    const pathParsed = DatasetPath.safeParse(request.params['*'])
+    if (!pathParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${pathParsed.error.issues[0]?.message}` } }
+    }
+    const fullName = `${poolName}/${pathParsed.data}`
+    const recursive = request.query.recursive === 'true' || request.query.recursive === '1'
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const datasets = await listDatasets(poolName)
+    if (!datasets.some(d => d.name === fullName)) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+
+    const children = datasets.filter(d => d.name.startsWith(`${fullName}/`))
+    const snapshots = await snapshotNames(fullName)
+
+    const warnings = [
+      `Destroying '${fullName}' is irreversible — all data in the dataset is permanently lost.`,
+    ]
+    if (children.length > 0)
+      warnings.push(`${children.length} child dataset(s) will also be destroyed.`)
+    if (snapshots.length > 0)
+      warnings.push(`${snapshots.length} snapshot(s) of '${fullName}' will also be destroyed.`)
+    if (!recursive && (children.length > 0 || snapshots.length > 0))
+      warnings.push(`This dataset has children or snapshots; destroy will fail unless recursive is requested.`)
+
+    // The confirmation protects "destroy this dataset" — `recursive` is NOT part
+    // of the signature. The flag is chosen after the challenge is issued (like
+    // the pool-destroy cleanup bug), so binding it here would make the confirmed
+    // request mismatch the minted code and 409 again.
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'zfs.destroy',
+      params: { dataset: fullName },
+      message: `Destroying dataset '${fullName}' permanently erases its data`,
+      warnings,
+    })) {
+      return reply
+    }
+
+    const args = recursive ? ['destroy', '-r', fullName] : ['destroy', fullName]
+
+    const job = jobQueue.submit(
+      'zfs.destroy',
+      { ...identity, params: { dataset: fullName, recursive } },
+      async () => {
+        const result = await executor.exec(ZFS, args)
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `zfs destroy exited with code ${result.exitCode}`)
+        return { destroyed: fullName }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
+  // --- Identity pickers (getent-backed, source-agnostic — Epic 8 seam) ----
+  server.get('/identity/users', async (_request, _reply) => {
+    const r = await executor.exec(GETENT, ['passwd'])
+    if (r.exitCode !== 0 && !r.stdout.trim())
+      return { data: [] }
+    return { data: parsePasswd(r.stdout) }
+  })
+
+  server.get('/identity/groups', async (_request, _reply) => {
+    const r = await executor.exec(GETENT, ['group'])
+    if (r.exitCode !== 0 && !r.stdout.trim())
+      return { data: [] }
+    return { data: parseGroup(r.stdout) }
+  })
+}

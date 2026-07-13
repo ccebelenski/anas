@@ -1,0 +1,34 @@
+{
+    "output_version": {
+        "command": "zfs get",
+        "vers_major": 0,
+        "vers_minor": 1
+    },
+    "datasets": {
+        "testpool/media": {
+            "name": "testpool/media",
+            "type": "FILESYSTEM",
+            "pool": "testpool",
+            "createtxg": "42",
+            "properties": {
+                "type": { "value": "filesystem", "source": { "type": "NONE", "data": "-" } },
+                "used": { "value": "120M", "source": { "type": "NONE", "data": "-" } },
+                "available": { "value": "352M", "source": { "type": "NONE", "data": "-" } },
+                "referenced": { "value": "120M", "source": { "type": "NONE", "data": "-" } },
+                "compressratio": { "value": "1.42x", "source": { "type": "NONE", "data": "-" } },
+                "mounted": { "value": "yes", "source": { "type": "NONE", "data": "-" } },
+                "quota": { "value": "10G", "source": { "type": "LOCAL", "data": "-" } },
+                "reservation": { "value": "none", "source": { "type": "DEFAULT", "data": "-" } },
+                "recordsize": { "value": "128K", "source": { "type": "DEFAULT", "data": "-" } },
+                "mountpoint": { "value": "/testpool/media", "source": { "type": "DEFAULT", "data": "-" } },
+                "compression": { "value": "zstd", "source": { "type": "LOCAL", "data": "-" } },
+                "atime": { "value": "on", "source": { "type": "DEFAULT", "data": "-" } },
+                "readonly": { "value": "off", "source": { "type": "DEFAULT", "data": "-" } },
+                "dedup": { "value": "off", "source": { "type": "DEFAULT", "data": "-" } },
+                "sync": { "value": "standard", "source": { "type": "DEFAULT", "data": "-" } },
+                "refquota": { "value": "none", "source": { "type": "DEFAULT", "data": "-" } },
+                "refreservation": { "value": "none", "source": { "type": "DEFAULT", "data": "-" } }
+            }
+        }
+    }
+}
