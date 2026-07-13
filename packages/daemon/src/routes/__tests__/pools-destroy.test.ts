@@ -71,14 +71,15 @@ describe('destroy endpoint: DELETE /v1/pools/:name', () => {
   it('wipes the freed member disks when cleanup=true', async () => {
     server = createServer({ mock: true, logger: false })
 
-    // The challenge warns that disks will be wiped, and binds cleanup into the code.
+    // The UI challenges WITHOUT cleanup (the checkbox is shown afterward), then
+    // resends WITH cleanup=true. cleanup must NOT be part of the confirmation
+    // signature, or the resend 409s — the bug this guards against.
     const first = await server.inject({
       method: 'DELETE',
-      url: '/v1/pools/testpool?cleanup=true',
+      url: '/v1/pools/testpool',
       headers: IDENTITY_HEADERS,
     })
     assert.equal(first.statusCode, 409)
-    assert.match(JSON.stringify(first.json()), /wiped clean|labels removed/i)
     const code = first.headers['x-anas-confirm-code'] as string
 
     const res = await server.inject({

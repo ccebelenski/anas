@@ -666,9 +666,13 @@ export async function poolRoutes(
     if (cleanup)
       warnings.push(`The pool's disks will be wiped clean (existing ZFS labels removed).`)
 
+    // The confirmation protects "destroy this pool" — `cleanup` is NOT part of
+    // the signature. The checkbox is chosen after the challenge is issued, so
+    // binding cleanup here would make the confirmed request (cleanup=true)
+    // mismatch the code minted for the challenge (cleanup=false) and 409 again.
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'zpool.destroy',
-      params: { pool: poolName, cleanup },
+      params: { pool: poolName },
       message: `Destroying pool '${poolName}' permanently erases all its data`,
       warnings,
     })) {
