@@ -1,5 +1,12 @@
-import { expect, test } from './fixtures/auth'
+import { expect, pveAuthState, test } from './fixtures/auth'
 
+const GATEWAY = 'https://192.168.200.50:3000'
+
+/**
+ * Auth boundary smoke tests. The `anas` gateway serves no pages (13.13) — its
+ * authenticated surface is the API, so these exercise `GET /api/health`, the
+ * probe the native panels use before rendering, rather than a page load.
+ */
 test.describe('Authentication', () => {
   test('can obtain PVE auth ticket', async ({ pveTicket }) => {
     expect(pveTicket).toBeTruthy()
@@ -16,15 +23,21 @@ test.describe('Authentication', () => {
     await context.dispose()
   })
 
-  test('ANAS rejects unauthenticated requests', async ({ page }) => {
-    const response = await page.goto('/')
-    expect(response).not.toBeNull()
-    expect(response!.status()).toBe(401)
+  test('the gateway rejects unauthenticated API requests', async ({ playwright }) => {
+    // No cookie: a browser that never logged into PVE.
+    const context = await playwright.request.newContext({ ignoreHTTPSErrors: true })
+    const response = await context.get(`${GATEWAY}/api/health`)
+    expect(response.status()).toBe(401)
+    await context.dispose()
   })
 
-  test('ANAS accepts PVE auth cookie', async ({ authenticatedPage }) => {
-    const response = await authenticatedPage.goto('/')
-    expect(response).not.toBeNull()
-    expect(response!.status()).toBeLessThan(400)
+  test('the gateway accepts the PVE auth cookie', async ({ playwright, pveTicket }) => {
+    const context = await playwright.request.newContext({
+      ignoreHTTPSErrors: true,
+      storageState: pveAuthState(pveTicket),
+    })
+    const response = await context.get(`${GATEWAY}/api/health`)
+    expect(response.status()).toBe(200)
+    await context.dispose()
   })
 })
