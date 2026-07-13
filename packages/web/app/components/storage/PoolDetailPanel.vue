@@ -11,22 +11,28 @@ const pool = ref<PoolDetail | null>(null)
 const loading = ref(false)
 const error = ref<string | null>(null)
 
-watch(visible, async (val) => {
-  if (val) {
+async function load(initial = false) {
+  if (initial) {
     loading.value = true
     error.value = null
     pool.value = null
-    try {
-      const res = await $fetch<{ data: PoolDetail }>(`/api/pools/${props.poolName}`)
-      pool.value = res.data
-    }
-    catch (e: any) {
-      error.value = e.message ?? 'Failed to load pool details'
-    }
-    finally {
-      loading.value = false
-    }
   }
+  try {
+    const res = await $fetch<{ data: PoolDetail }>(`/api/pools/${props.poolName}`)
+    pool.value = res.data
+    error.value = null
+  }
+  catch (e: any) {
+    error.value = e.message ?? 'Failed to load pool details'
+  }
+  finally {
+    loading.value = false
+  }
+}
+
+watch(visible, (val) => {
+  if (val)
+    load(true)
 }, { immediate: true })
 </script>
 
@@ -40,6 +46,6 @@ watch(visible, async (val) => {
       <ProgressSpinner />
     </div>
 
-    <StoragePoolDetail v-else-if="pool" :pool="pool" />
+    <StoragePoolDetail v-else-if="pool" :pool="pool" @refresh="load()" />
   </FloatingPanel>
 </template>

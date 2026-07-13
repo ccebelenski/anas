@@ -1,10 +1,46 @@
 <script setup lang="ts">
-import type { Disk, PoolDetail, PoolDisk, Vdev, VdevGroup } from '@anas/shared'
+import type { Disk, Job, JobAccepted, PoolDetail, PoolDisk, Vdev, VdevGroup } from '@anas/shared'
 import { formatBytes } from '~/utils/format'
 
 const props = defineProps<{
   pool: PoolDetail
 }>()
+
+const emit = defineEmits<{ refresh: [] }>()
+
+// --- Scrub action ---
+const scrubSubmitting = ref(false)
+const scrubError = ref<string | null>(null)
+const scanRunning = computed(() => props.pool.scan?.state === 'SCANNING')
+
+async function startScrub() {
+  scrubSubmitting.value = true
+  scrubError.value = null
+  try {
+    const res = await $fetch<JobAccepted>(`/api/pools/${props.pool.name}/scrub`, { method: 'POST' })
+    // Poll briefly — the job itself is fast (scrub runs in the kernel);
+    // the pool's scan state is the durable progress indicator.
+    for (let i = 0; i < 20; i++) {
+      await new Promise(resolve => setTimeout(resolve, 500))
+      const { job } = await $fetch<{ job: Job }>(`/api/jobs/${res.job.id}`)
+      if (job.status === 'completed') {
+        emit('refresh')
+        return
+      }
+      if (job.status === 'failed') {
+        scrubError.value = job.error?.message ?? 'Scrub failed to start'
+        return
+      }
+    }
+    emit('refresh')
+  }
+  catch (e: any) {
+    scrubError.value = e?.data?.error?.message ?? e?.message ?? 'Failed to start scrub'
+  }
+  finally {
+    scrubSubmitting.value = false
+  }
+}
 
 // Fetch disk info for cross-referencing (fire-and-forget, non-blocking)
 const diskMap = ref<Map<string, Disk>>(new Map())
@@ -27,8 +63,10 @@ function getDiskInfo(poolDisk: PoolDisk): Disk | undefined {
 function sectorDesc(disk: Disk): string {
   const p = disk.physicalSectorSize
   const l = disk.logicalSectorSize
-  if (!p && !l) return ''
-  if (p === l) return `${p}B`
+  if (!p && !l)
+    return ''
+  if (p === l)
+    return `${p}B`
   return `${p}B/${l}B`
 }
 
@@ -49,14 +87,18 @@ function hasErrors(disk: PoolDisk): boolean {
 }
 
 function formatDate(iso: string | null): string {
-  if (!iso) return '-'
+  if (!iso)
+    return '-'
   return new Date(iso).toLocaleString()
 }
 
 function usageColor(pct: number): string {
-  if (pct < 60) return '#a6e3a1'
-  if (pct < 80) return '#f9e2af'
-  if (pct < 90) return '#fab387'
+  if (pct < 60)
+    return '#a6e3a1'
+  if (pct < 80)
+    return '#f9e2af'
+  if (pct < 90)
+    return '#fab387'
   return '#f38ba8'
 }
 
@@ -67,27 +109,38 @@ function groupDescription(group: VdevGroup): string {
     const allDisks = group.vdevs.flatMap(v => v.disks)
     const avail = allDisks.filter(d => d.state === 'AVAIL').length
     const inuse = allDisks.filter(d => d.state === 'INUSE').length
-    if (inuse > 0) return `Spares — ${inuse} active, ${avail} standing by`
+    if (inuse > 0)
+      return `Spares — ${inuse} active, ${avail} standing by`
     return `Spares — ${avail} standing by`
   }
-  if (group.role === 'cache') return 'Cache — L2ARC read cache'
-  if (group.role === 'log') return 'Log — ZIL write log'
-  if (group.role === 'special') return 'Special — metadata / small blocks'
-  if (group.role === 'dedup') return 'Dedup — dedup table'
+  if (group.role === 'cache')
+    return 'Cache — L2ARC read cache'
+  if (group.role === 'log')
+    return 'Log — ZIL write log'
+  if (group.role === 'special')
+    return 'Special — metadata / small blocks'
+  if (group.role === 'dedup')
+    return 'Dedup — dedup table'
 
   const n = group.vdevs.length
-  if (n === 1) return 'Data — 1 vdev'
+  if (n === 1)
+    return 'Data — 1 vdev'
   return `Data — ${n} vdevs, striped (pool requires all vdevs)`
 }
 
 /** Per-vdev redundancy description */
 function vdevRedundancy(vdev: Vdev): string {
   const n = vdev.disks.length
-  if (vdev.type === 'mirror') return `survives ${n - 1} disk failure${n > 2 ? 's' : ''}`
-  if (vdev.type === 'raidz') return 'survives 1 disk failure'
-  if (vdev.type === 'raidz2') return 'survives 2 disk failures'
-  if (vdev.type === 'raidz3') return 'survives 3 disk failures'
-  if (vdev.type === 'disk') return 'no redundancy'
+  if (vdev.type === 'mirror')
+    return `survives ${n - 1} disk failure${n > 2 ? 's' : ''}`
+  if (vdev.type === 'raidz')
+    return 'survives 1 disk failure'
+  if (vdev.type === 'raidz2')
+    return 'survives 2 disk failures'
+  if (vdev.type === 'raidz3')
+    return 'survives 3 disk failures'
+  if (vdev.type === 'disk')
+    return 'no redundancy'
   return ''
 }
 
@@ -115,32 +168,52 @@ const propertyHelp: Record<string, string> = {
 
     <!-- Summary stats -->
     <div class="detail-summary">
-      <div class="stat" v-tooltip.bottom="'Total raw pool capacity'">
-        <div class="stat-value">{{ formatBytes(pool.size) }}</div>
-        <div class="stat-label">Size</div>
+      <div v-tooltip.bottom="'Total raw pool capacity'" class="stat">
+        <div class="stat-value">
+          {{ formatBytes(pool.size) }}
+        </div>
+        <div class="stat-label">
+          Size
+        </div>
       </div>
-      <div class="stat" v-tooltip.bottom="'Space allocated to data and metadata'">
-        <div class="stat-value">{{ formatBytes(pool.allocated) }} <small>({{ pool.capacity }}%)</small></div>
-        <div class="stat-label">Used</div>
+      <div v-tooltip.bottom="'Space allocated to data and metadata'" class="stat">
+        <div class="stat-value">
+          {{ formatBytes(pool.allocated) }} <small>({{ pool.capacity }}%)</small>
+        </div>
+        <div class="stat-label">
+          Used
+        </div>
       </div>
-      <div class="stat" v-tooltip.bottom="'Remaining available space'">
-        <div class="stat-value">{{ formatBytes(pool.free) }}</div>
-        <div class="stat-label">Free</div>
+      <div v-tooltip.bottom="'Remaining available space'" class="stat">
+        <div class="stat-value">
+          {{ formatBytes(pool.free) }}
+        </div>
+        <div class="stat-label">
+          Free
+        </div>
       </div>
-      <div class="stat" v-tooltip.bottom="'Free space fragmentation. High values impact write performance.'">
-        <div class="stat-value">{{ pool.fragmentation }}%</div>
-        <div class="stat-label">Frag</div>
+      <div v-tooltip.bottom="'Free space fragmentation. High values impact write performance.'" class="stat">
+        <div class="stat-value">
+          {{ pool.fragmentation }}%
+        </div>
+        <div class="stat-label">
+          Frag
+        </div>
       </div>
-      <div class="stat" v-tooltip.bottom="'Deduplication ratio. 1.00x = no dedup savings.'">
-        <div class="stat-value">{{ pool.dedupRatio.toFixed(2) }}x</div>
-        <div class="stat-label">Dedup</div>
+      <div v-tooltip.bottom="'Deduplication ratio. 1.00x = no dedup savings.'" class="stat">
+        <div class="stat-value">
+          {{ pool.dedupRatio.toFixed(2) }}x
+        </div>
+        <div class="stat-label">
+          Dedup
+        </div>
       </div>
     </div>
 
     <!-- Usage bar -->
-    <div class="usage-bar-wrap" v-tooltip.bottom="`${pool.capacity}% used — ${formatBytes(pool.allocated)} of ${formatBytes(pool.size)}`">
+    <div v-tooltip.bottom="`${pool.capacity}% used — ${formatBytes(pool.allocated)} of ${formatBytes(pool.size)}`" class="usage-bar-wrap">
       <div class="usage-bar">
-        <div class="usage-fill" :style="{ width: Math.max(pool.capacity, 1) + '%', background: usageColor(pool.capacity) }" />
+        <div class="usage-fill" :style="{ width: `${Math.max(pool.capacity, 1)}%`, background: usageColor(pool.capacity) }" />
       </div>
       <div class="usage-markers">
         <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
@@ -149,7 +222,25 @@ const propertyHelp: Record<string, string> = {
 
     <!-- Scan -->
     <section class="detail-section">
-      <h3>Scan</h3>
+      <div class="section-header">
+        <h3>Scan</h3>
+        <Button
+          v-tooltip.left="scanRunning ? 'A scan is already in progress' : 'Verify data integrity by reading all data and checking checksums'"
+          data-id="start-scrub"
+          label="Start Scrub"
+          icon="pi pi-sync"
+          size="small"
+          severity="secondary"
+          outlined
+          :loading="scrubSubmitting"
+          :disabled="scanRunning"
+          @click="startScrub"
+        />
+      </div>
+      <div v-if="scrubError" class="error-detail" data-id="scrub-error">
+        <i class="pi pi-exclamation-circle" />
+        {{ scrubError }}
+      </div>
       <div v-if="pool.scan">
         <div class="kv-row">
           <span class="kv-key">Type</span>
@@ -191,7 +282,9 @@ const propertyHelp: Record<string, string> = {
           {{ pool.errorDetail }}
         </div>
       </div>
-      <p v-else class="text-muted">No scan history</p>
+      <p v-else class="text-muted">
+        No scan history
+      </p>
     </section>
 
     <!-- Topology -->
@@ -225,7 +318,7 @@ const propertyHelp: Record<string, string> = {
               <div class="topo-disk-line1">
                 <Tag :value="disk.state" :severity="stateSeverity(disk.state)" />
                 <span class="topo-disk-id">{{ disk.id }}</span>
-                <span class="topo-disk-errors" v-tooltip.right="'Read / Write / Checksum errors'">
+                <span v-tooltip.right="'Read / Write / Checksum errors'" class="topo-disk-errors">
                   R:{{ disk.readErrors }} W:{{ disk.writeErrors }} C:{{ disk.checksumErrors }}
                 </span>
               </div>
@@ -261,13 +354,15 @@ const propertyHelp: Record<string, string> = {
     <section class="detail-section">
       <h3>Properties</h3>
       <div class="props-inline">
-        <span v-for="(value, key) in {
-          ashift: pool.properties.ashift,
-          autoexpand: pool.properties.autoexpand ? 'on' : 'off',
-          autoreplace: pool.properties.autoreplace ? 'on' : 'off',
-          autotrim: pool.properties.autotrim ? 'on' : 'off',
-          failmode: pool.properties.failmode,
-        }" :key="key" class="prop-chip" v-tooltip.top="propertyHelp[key]">
+        <span
+          v-for="(value, key) in {
+            ashift: pool.properties.ashift,
+            autoexpand: pool.properties.autoexpand ? 'on' : 'off',
+            autoreplace: pool.properties.autoreplace ? 'on' : 'off',
+            autotrim: pool.properties.autotrim ? 'on' : 'off',
+            failmode: pool.properties.failmode,
+          }" :key="key" v-tooltip.top="propertyHelp[key]" class="prop-chip"
+        >
           <span class="prop-name">{{ key }}</span>
           <span class="prop-val">{{ value }}</span>
         </span>
@@ -331,6 +426,21 @@ const propertyHelp: Record<string, string> = {
 .usage-markers { display: flex; justify-content: space-between; font-size: 0.6rem; color: #6c7086; padding: 0.15rem 0.1rem 0; }
 
 /* Sections */
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  border-bottom: 1px solid #313244;
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.25rem;
+}
+.section-header h3 {
+  border-bottom: none;
+  margin: 0;
+  padding-bottom: 0;
+}
+
 .detail-section h3 {
   font-size: 0.85rem;
   font-weight: 600;

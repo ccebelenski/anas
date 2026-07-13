@@ -1,17 +1,20 @@
+import type { PoolDetail, PoolSummary } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
-import type { PoolDetail, PoolSummary } from '@anas/shared'
-import { parseZpoolList } from '../parsers/zpool-list.js'
+import type { JobQueue } from '../jobs/queue.js'
+import { PoolName, ScrubRequest } from '@anas/shared'
 import { parseZpoolGet } from '../parsers/zpool-get.js'
+import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
+import { requireIdentity } from './identity.js'
 
 export async function poolRoutes(
   server: FastifyInstance,
-  opts: { executor: CommandExecutor },
+  opts: { executor: CommandExecutor, jobQueue: JobQueue },
 ) {
-  const { executor } = opts
+  const { executor, jobQueue } = opts
 
-  server.get('/pools', async (_request, reply) => {
+  server.get('/pools', async (_request, _reply) => {
     const [listResult, statusResult] = await Promise.all([
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
       executor.exec('/usr/sbin/zpool', ['status', '-jv']),
@@ -98,5 +101,51 @@ export async function poolRoutes(
     }
 
     return { data: detail }
+  })
+
+  server.post<{ Params: { name: string } }>('/pools/:name/scrub', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    const bodyParsed = ScrubRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid scrub request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const { action } = bodyParsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
+    const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
+    if (!pools.some(p => p.name === poolName)) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    const args = action === 'stop'
+      ? ['scrub', '-s', poolName]
+      : ['scrub', poolName]
+
+    const job = jobQueue.submit(
+      'zpool.scrub',
+      { ...identity, params: { pool: poolName, action } },
+      async () => {
+        const result = await executor.exec('/usr/sbin/zpool', args)
+        if (result.exitCode !== 0) {
+          throw new Error(result.stderr.trim() || `zpool scrub exited with code ${result.exitCode}`)
+        }
+        return null
+      },
+    )
+
+    reply.code(202)
+    return { job }
   })
 }
