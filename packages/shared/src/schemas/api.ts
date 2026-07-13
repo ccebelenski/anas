@@ -17,6 +17,8 @@ export const ErrorCode = z.enum([
   'CONFIRMATION_REQUIRED',
   'INTERNAL_ERROR',
   'UNAUTHORIZED',
+  // Gateway-only: a peer node's gateway could not be reached (story 13.8).
+  'NODE_UNREACHABLE',
 ])
 export type ErrorCode = z.infer<typeof ErrorCode>
 

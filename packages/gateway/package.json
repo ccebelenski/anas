@@ -1,0 +1,21 @@
+{
+  "name": "@anas/gateway",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "test": "tsx --test src/**/__tests__/*.test.ts"
+  },
+  "dependencies": {
+    "@anas/shared": "*",
+    "fastify": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

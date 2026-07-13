@@ -1,4 +1,4 @@
-import type { AuthProvider, AuthUser } from '../types'
+import type { AuthProvider, AuthUser } from '../types.js'
 import { execFile } from 'node:child_process'
 import { createVerify } from 'node:crypto'
 import { readFileSync } from 'node:fs'
