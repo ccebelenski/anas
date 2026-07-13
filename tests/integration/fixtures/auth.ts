@@ -74,4 +74,29 @@ export const test = base.extend<AuthFixtures>({
   },
 })
 
+/**
+ * Build a Playwright storageState carrying the PVE session cookie, for use with
+ * `request.newContext({ storageState })` in request-context (API) tests. Mirrors
+ * the attributes the real PVE UI sets (Secure + SameSite=Lax) — the Secure flag
+ * is why the gateway must serve HTTPS (the browser withholds the cookie on plain
+ * HTTP, which once masked a transport bug; see pve-login-flow.spec.ts).
+ */
+export function pveAuthState(ticket: string) {
+  return {
+    cookies: [
+      {
+        name: 'PVEAuthCookie',
+        value: ticket,
+        domain: '192.168.200.50',
+        path: '/',
+        expires: -1,
+        httpOnly: false,
+        secure: true,
+        sameSite: 'Lax' as const,
+      },
+    ],
+    origins: [],
+  }
+}
+
 export { expect }

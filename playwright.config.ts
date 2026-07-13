@@ -9,15 +9,6 @@ export default defineConfig({
   reporter: 'html',
   projects: [
     {
-      name: 'dev',
-      testDir: './tests/dev',
-      use: {
-        ...devices['Desktop Chrome'],
-        baseURL: 'http://localhost:3100',
-        screenshot: 'on',
-      },
-    },
-    {
       name: 'integration',
       testDir: './tests/integration',
       use: {
@@ -29,15 +20,4 @@ export default defineConfig({
       },
     },
   ],
-  // Auto-start dev server for the 'dev' project
-  webServer: {
-    command: 'npm run dev',
-    url: 'http://localhost:3100',
-    reuseExistingServer: true,
-    timeout: 30000,
-    env: {
-      ANASD_SOCKET: '/tmp/anasd.sock',
-      ANAS_AUTH_PROVIDER: 'dev',
-    },
-  },
 })
