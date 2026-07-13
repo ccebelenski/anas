@@ -455,6 +455,7 @@
                         {
                             xtype: 'textfield',
                             itemId: 'path',
+                            cls: 'anas-fld-ds-path',
                             fieldLabel: t('Path (relative to pool)'),
                             emptyText: 'media/movies',
                             allowBlank: false,

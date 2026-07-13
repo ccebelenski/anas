@@ -103,15 +103,15 @@ test.describe.serial('ANAS dataset create via UI (throwaway dataset)', () => {
     const win = page.locator('.anas-win-dataset-create')
     await expect(win).toBeVisible({ timeout: 20_000 })
 
-    // The window's first text field is the dataset name/path. Fill it with the
-    // throwaway leaf name (the window carries the parent-pool context).
-    const nameField = win.locator('input[type="text"]').first()
+    // The path field (the pool is a separate readonly combobox, pre-selected).
+    // Fill it with the throwaway leaf name; the window carries the pool context.
+    const nameField = win.locator('.anas-fld-ds-path input[type="text"]')
     await expect(nameField).toBeVisible({ timeout: 20_000 })
     await nameField.fill('itestui')
 
-    // Submit — Proxmox.window.Edit subclasses expose a Create/OK/Add/Submit
-    // button and handle the 202 job + 4xx display internally.
-    await page.getByRole('button', { name: /Create|OK|Add|Submit|Save/i }).first().click()
+    // Submit via the window's own button (scoped hook) — a page-wide "Create"
+    // role match would hit PVE's "Create VM" header button instead.
+    await win.locator('.anas-btn-dataset-create-submit').click()
 
     // Source of truth: the dataset really exists on the system (async job).
     await expect.poll(() => datasetExists(DS_CREATE_UI), { timeout: 60_000 }).toBe(true)
