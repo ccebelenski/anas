@@ -232,7 +232,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 5.9. [backlog] As a user, I want to replicate to a remote host (`zfs send | ssh | zfs recv`), so I have off-site backups / migration. *(The meat: remote target + auth, incremental streams, resume tokens.)*
 
-> **Cross-cutting decision (affects 5.x replication, snapshot retention, and scrub scheduling): do we build scheduling, or leverage existing tools?** Principle 7 discourages background schedulers and we've said Proxmox owns scheduling. Options: configure `sanoid`/`zfs-auto-snapshot`/systemd-timers/`pve-zsync` surgically (guest philosophy) vs. build our own. Settle once, not per-feature.
+> **Scheduling (affects 5.x replication, snapshot retention, scrub schedules): LEVERAGE existing tools, never build a scheduler.** A scheduler is undifferentiated code (user's rule) and violates Principle 7. ANAS surgically configures `sanoid`/`zfs-auto-snapshot`/systemd-timers/`pve-zsync` and presents a UI over them — it does not run its own scheduler.
 
 ---
 
