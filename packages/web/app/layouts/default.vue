@@ -1,21 +1,29 @@
 <script setup lang="ts">
-const showPools = ref(false)
-const showDisks = ref(false)
+// Story 13.2 — embedded mode hides ANAS chrome (sidebar + header).
+const embedded = useEmbedded()
+
 const showSmb = ref(false)
 const showNfs = ref(false)
 const showUsers = ref(false)
 const showJobs = ref(false)
+
+// Story 13.1 — top-level views are routes. Sidebar navigates instead of
+// opening list panels. Carry the embedded flag across programmatic navigation
+// (story 13.2) so it survives in-app navigation.
+function go(path: string) {
+  return navigateTo(embedded.value ? { path, query: { embedded: '1' } } : path)
+}
 </script>
 
 <template>
-  <div class="app-layout">
+  <div class="app-layout" :class="{ 'app-embedded': embedded }">
     <ClientOnly>
-      <aside class="app-sidebar" data-region="sidebar">
+      <aside v-if="!embedded" class="app-sidebar" data-region="sidebar">
         <div class="app-sidebar-header">
           <h2>ANAS</h2>
         </div>
         <nav class="app-nav">
-          <button data-nav="dashboard" class="nav-item" @click="navigateTo('/')">
+          <button data-nav="dashboard" class="nav-item" @click="go('/')">
             <i class="pi pi-home" /><span>Dashboard</span>
           </button>
 
@@ -23,10 +31,10 @@ const showJobs = ref(false)
             <div class="nav-group-label">
               <i class="pi pi-database" /><span>Storage</span>
             </div>
-            <button data-nav="pools" class="nav-item nav-child" @click="showPools = true">
+            <button data-nav="pools" class="nav-item nav-child" @click="go('/storage/pools')">
               <i class="pi pi-server" /><span>Pools</span>
             </button>
-            <button data-nav="disks" class="nav-item nav-child" @click="showDisks = true">
+            <button data-nav="disks" class="nav-item nav-child" @click="go('/storage/disks')">
               <i class="pi pi-circle" /><span>Disks</span>
             </button>
           </div>
@@ -54,7 +62,7 @@ const showJobs = ref(false)
     </ClientOnly>
 
     <div class="app-main">
-      <header class="app-header">
+      <header v-if="!embedded" class="app-header">
         <div class="app-header-title">
           <slot name="header" />
         </div>
@@ -65,11 +73,7 @@ const showJobs = ref(false)
       </main>
     </div>
 
-    <!-- Floating panels — self-contained, fetch their own data -->
-    <StoragePoolListPanel v-model:visible="showPools" />
-    <StorageDiskListPanel v-model:visible="showDisks" />
-
-    <!-- Placeholders for future panels -->
+    <!-- Placeholders for future views (not yet routed — future epics) -->
     <FloatingPanel v-model:visible="showSmb" panel-id="smb" title="SMB Shares">
       <p style="opacity: 0.5;">
         SMB shares coming soon.
@@ -97,6 +101,15 @@ const showJobs = ref(false)
 .app-layout {
   display: flex;
   min-height: 100vh;
+}
+
+/* Embedded (inside PVE UI): no chrome, content fills the frame. */
+.app-embedded {
+  min-height: 100vh;
+}
+
+.app-embedded .app-content {
+  padding: 1rem;
 }
 
 .app-sidebar {

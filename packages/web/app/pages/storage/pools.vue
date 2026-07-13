@@ -6,6 +6,15 @@ definePageMeta({ layout: 'default' })
 const { data, status, error } = await useFetch<{ data: PoolSummary[] }>('/api/pools')
 
 const pools = computed(() => data.value?.data ?? [])
+
+// Details/actions remain floating panels (story 13.1) — opened on pool-name click.
+const selectedPool = ref('')
+const showDetail = ref(false)
+
+function onSelectPool(name: string) {
+  selectedPool.value = name
+  showDetail.value = true
+}
 </script>
 
 <template>
@@ -20,6 +29,12 @@ const pools = computed(() => data.value?.data ?? [])
 
     <ProgressSpinner v-else-if="status === 'pending'" style="margin: 2rem auto; display: block;" />
 
-    <StoragePoolList v-else :pools="pools" />
+    <StoragePoolList v-else :pools="pools" @select-pool="onSelectPool" />
+
+    <StoragePoolDetailPanel
+      v-if="selectedPool"
+      v-model:visible="showDetail"
+      :pool-name="selectedPool"
+    />
   </div>
 </template>

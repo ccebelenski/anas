@@ -6,75 +6,75 @@ async function waitForApp(page: Page) {
   await page.locator('[data-nav="pools"]').waitFor({ state: 'visible' })
 }
 
-test.describe('Floating Panels', () => {
-  test('pool list panel opens and closes with X', async ({ page }) => {
+// Open the routed pools view and its floating pool-detail panel for testpool.
+async function openPoolDetail(page: Page) {
+  await page.locator('[data-nav="pools"]').click()
+  await expect(page).toHaveURL(/\/storage\/pools$/)
+
+  const select = page.locator('[data-pool-select="testpool"]')
+  await expect(select).toBeVisible()
+  await select.click()
+
+  const detail = page.locator('[data-panel-id="pool-detail-testpool"]')
+  await expect(detail).toBeVisible()
+  return detail
+}
+
+test.describe('Routed views + floating panels', () => {
+  test('sidebar Pools navigates to the pools view (list is page content)', async ({ page }) => {
     await waitForApp(page)
 
     await page.locator('[data-nav="pools"]').click()
-    const panel = page.locator('[data-panel-id="pool-list"]')
-    await expect(panel).toBeVisible()
+    await expect(page).toHaveURL(/\/storage\/pools$/)
 
-    await panel.locator('[data-close-panel="pool-list"]').click()
-    await expect(panel).not.toBeVisible()
+    // The pool list renders as page content, not a floating panel.
+    await expect(page.locator('[data-panel-id="pool-list"]')).toHaveCount(0)
+    await expect(page.locator('[data-region="content"] [data-pool-select="testpool"]')).toBeVisible()
   })
 
-  test('pool detail opens on top of pool list', async ({ page }) => {
+  test('pool detail opens as a floating panel over the pools view', async ({ page }) => {
     await waitForApp(page)
 
-    await page.locator('[data-nav="pools"]').click()
-    const poolList = page.locator('[data-panel-id="pool-list"]')
-    await expect(poolList).toBeVisible()
-
-    await poolList.locator('[data-pool-select="testpool"]').click()
-    const detail = page.locator('[data-panel-id="pool-detail-testpool"]')
-    await expect(detail).toBeVisible()
-
+    const detail = await openPoolDetail(page)
     await page.screenshot({ path: '/tmp/panel-detail-opened.png' })
 
-    // Detail should have higher z-index than pool list
-    const listZ = await poolList.evaluate(el => Number.parseInt(el.style.zIndex))
-    const detailZ = await detail.evaluate(el => Number.parseInt(el.style.zIndex))
-    expect(detailZ).toBeGreaterThan(listZ)
+    // Detail panel floats above the page content.
+    const detailZ = await detail.evaluate(el => Number.parseInt((el as HTMLElement).style.zIndex))
+    expect(detailZ).toBeGreaterThan(0)
   })
 
-  test('Escape closes topmost panel only', async ({ page }) => {
+  test('Escape closes the pool detail panel, view stays', async ({ page }) => {
     await waitForApp(page)
 
-    await page.locator('[data-nav="pools"]').click()
-    await expect(page.locator('[data-panel-id="pool-list"]')).toBeVisible()
-
-    await page.locator('[data-panel-id="pool-list"]').locator('[data-pool-select="testpool"]').click()
-    await expect(page.locator('[data-panel-id="pool-detail-testpool"]')).toBeVisible()
+    await openPoolDetail(page)
 
     await page.keyboard.press('Escape')
     await page.waitForTimeout(300)
     await expect(page.locator('[data-panel-id="pool-detail-testpool"]')).not.toBeVisible()
-    await expect(page.locator('[data-panel-id="pool-list"]')).toBeVisible()
+    // The routed view remains.
+    await expect(page.locator('[data-region="content"] [data-pool-select="testpool"]')).toBeVisible()
   })
 
-  test('click outside closes panel', async ({ page }) => {
+  test('click outside closes the pool detail panel', async ({ page }) => {
     await waitForApp(page)
 
-    await page.locator('[data-nav="pools"]').click()
-    await expect(page.locator('[data-panel-id="pool-list"]')).toBeVisible()
+    await openPoolDetail(page)
 
     const content = page.locator('[data-region="content"]')
     const box = await content.boundingBox()
     if (box) {
-      await page.mouse.click(box.x + box.width - 50, box.y + box.height - 50)
+      await page.mouse.click(box.x + box.width - 20, box.y + box.height - 20)
     }
     await page.waitForTimeout(300)
-    await expect(page.locator('[data-panel-id="pool-list"]')).not.toBeVisible()
+    await expect(page.locator('[data-panel-id="pool-detail-testpool"]')).not.toBeVisible()
   })
 
-  test('panel is draggable', async ({ page }) => {
+  test('pool detail panel is draggable', async ({ page }) => {
     await waitForApp(page)
 
-    await page.locator('[data-nav="pools"]').click()
-    const panel = page.locator('[data-panel-id="pool-list"]')
-    await expect(panel).toBeVisible()
+    const detail = await openPoolDetail(page)
 
-    const header = panel.locator('.fp-header')
+    const header = detail.locator('.fp-header')
     const box = await header.boundingBox()
     expect(box).toBeTruthy()
 
@@ -83,18 +83,18 @@ test.describe('Floating Panels', () => {
     await page.mouse.move(box!.x + box!.width / 2 + 100, box!.y + box!.height / 2 + 50, { steps: 5 })
     await page.mouse.up()
 
-    const hasCentered = await panel.evaluate(el => el.classList.contains('fp-centered'))
+    const hasCentered = await detail.evaluate(el => el.classList.contains('fp-centered'))
     expect(hasCentered).toBe(false)
   })
 
-  test('disk panel opens with data', async ({ page }) => {
+  test('sidebar Disks navigates to the disks view with data', async ({ page }) => {
     await waitForApp(page)
 
     await page.locator('[data-nav="disks"]').click()
-    const panel = page.locator('[data-panel-id="disk-list"]')
-    await expect(panel).toBeVisible()
+    await expect(page).toHaveURL(/\/storage\/disks$/)
 
-    await expect(panel.locator('[data-disk-name="sda"]')).toBeVisible({ timeout: 10000 })
+    await expect(page.locator('[data-panel-id="disk-list"]')).toHaveCount(0)
+    await expect(page.locator('[data-region="content"] [data-disk-name="sda"]')).toBeVisible({ timeout: 10000 })
     await page.screenshot({ path: '/tmp/panel-disks.png' })
   })
 })
