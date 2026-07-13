@@ -50,6 +50,17 @@ test.describe('PVE UI embedding (stunt node)', () => {
     await page.getByRole('button', { name: 'Login' }).click()
     // Workspace loaded once the login dialog is gone.
     await expect(page.locator('input[name="username"]')).not.toBeVisible({ timeout: 20_000 })
+
+    // Unsubscribed nodes always show the subscription nag after login; its
+    // modal mask intercepts every click until dismissed. Wait for it
+    // deterministically, dismiss, then wait for all ExtJS masks to clear.
+    await page.getByText('No valid subscription').waitFor({ timeout: 15_000 })
+    await page.getByRole('button', { name: 'OK' }).click()
+    await page.waitForFunction(
+      () => !Array.from(document.querySelectorAll('.x-mask')).some(el => (el as HTMLElement).offsetParent !== null),
+      undefined,
+      { timeout: 15_000 },
+    )
   }
 
   /**
@@ -58,16 +69,25 @@ test.describe('PVE UI embedding (stunt node)', () => {
    * to ExtJS-generated ids.
    */
   async function openAnasItem(page: import('@playwright/test').Page, item: string) {
-    // Contract: node-level placement — select the node in the resource tree.
-    await page.getByText(NODE_NAME, { exact: false }).first().click()
+    // Contract: node-level placement — select the node in the LEFT resource
+    // tree. Scope to the tree element: the datacenter Search grid and storage
+    // entries also render cells containing the node name.
+    await page
+      .locator('[id^="pveResourceTree"] .x-grid-cell-inner', { hasText: new RegExp(`^${NODE_NAME}$`) })
+      .first()
+      .click()
 
-    // Contract: a collapsible "ANAS" section appears in the node menu. Click it
-    // to ensure it is expanded (harmless if already open), then click the item.
-    const anasSection = page.getByText('ANAS', { exact: true }).first()
-    await expect(anasSection).toBeVisible({ timeout: 20_000 })
-    await anasSection.click()
+    // Contract: an expanded "ANAS" section appears in the node menu. Scope the
+    // item lookup to the ANAS group's own subtree — PVE's Ceph section has a
+    // (collapsed, hidden) "Pools" item too, so a page-wide text match is
+    // ambiguous.
+    const anasGroup = page
+      .getByRole('listitem')
+      .filter({ has: page.getByText('ANAS', { exact: true }) })
+      .first()
+    await expect(anasGroup).toBeVisible({ timeout: 20_000 })
 
-    const menuItem = page.getByText(item, { exact: true }).first()
+    const menuItem = anasGroup.getByText(item, { exact: true })
     await expect(menuItem).toBeVisible({ timeout: 20_000 })
     await menuItem.click()
   }

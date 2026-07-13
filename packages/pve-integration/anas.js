@@ -173,7 +173,11 @@
             text: 'ANAS',
             iconCls: 'fa fa-database',
             leaf: false,
-            expanded: false,
+            // Expanded from the start: clicking a group with no card of its
+            // own does not toggle expansion in PVE's config treelist, and the
+            // items should be discoverable without a click anyway (mirrors
+            // Ceph's expandedOnInit behavior).
+            expanded: true,
         });
         root.appendChild(group);
 
@@ -216,28 +220,29 @@
     }
 
     function register() {
-        if (typeof Ext === 'undefined' || typeof Ext.override !== 'function') {
-            throw new Error('Ext.override unavailable');
-        }
-        if (typeof PVE === 'undefined' || !PVE.node || !PVE.node.Config) {
+        if (typeof PVE === 'undefined' || !PVE.node || !PVE.node.Config
+            || !PVE.node.Config.prototype
+            || typeof PVE.node.Config.prototype.initComponent !== 'function') {
             throw new Error('PVE.node.Config unavailable');
         }
 
-        // Extension mechanism: Ext.override on PVE.node.Config. We let the
-        // original initComponent run (via callParent, which builds the menu),
-        // then inject our group afterwards. The injection itself is guarded so a
-        // failure there degrades to "no ANAS section" without disturbing PVE.
-        Ext.override(PVE.node.Config, {
-            initComponent: function () {
-                var me = this;
-                me.callParent(arguments);
-                try {
-                    injectMenu(me);
-                } catch (e) {
-                    warn('menu injection failed: ' + errText(e));
-                }
-            },
-        });
+        // Extension mechanism: direct prototype patch with the original method
+        // captured in a closure. Deliberately NOT Ext.override — callParent
+        // inside a runtime override resolves against the override's (absent)
+        // class hierarchy and crashes with "null (reading 'apply')", which
+        // breaks node panel construction entirely. Calling the captured
+        // original directly has no resolution machinery to fail, so PVE's own
+        // init path is untouched and only our guarded injection can degrade.
+        var proto = PVE.node.Config.prototype;
+        var origInitComponent = proto.initComponent;
+        proto.initComponent = function () {
+            origInitComponent.apply(this, arguments);
+            try {
+                injectMenu(this);
+            } catch (e) {
+                warn('menu injection failed: ' + errText(e));
+            }
+        };
     }
 
     try {
