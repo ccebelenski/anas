@@ -24,6 +24,26 @@ export {
   UUID,
 } from './schemas/common.js'
 
+// Disk schemas
+export {
+  Disk,
+  DiskPartition,
+  DiskUsageStatus,
+  SmartAttribute,
+  SmartData,
+  SmartHealth,
+} from './schemas/disks.js'
+
+// Job schemas
+export {
+  Job,
+  JobAccepted,
+  JobDetail,
+  JobList,
+  JobRef,
+  JobStatus,
+} from './schemas/jobs.js'
+
 // ZFS schemas
 export {
   AddVdevRequest,
@@ -49,23 +69,3 @@ export {
   VdevState,
   VdevType,
 } from './schemas/zfs.js'
-
-// Disk schemas
-export {
-  Disk,
-  DiskPartition,
-  DiskUsageStatus,
-  SmartAttribute,
-  SmartData,
-  SmartHealth,
-} from './schemas/disks.js'
-
-// Job schemas
-export {
-  Job,
-  JobAccepted,
-  JobDetail,
-  JobList,
-  JobRef,
-  JobStatus,
-} from './schemas/jobs.js'

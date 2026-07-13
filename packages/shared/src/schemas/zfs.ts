@@ -201,15 +201,17 @@ export type PoolDetail = z.infer<typeof PoolDetail>
 
 // --- Write models (API requests) ---
 
-/** Vdev specification for pool creation or expansion.
- *  'stripe' is our synthetic type — means individual disk vdevs (no redundancy). */
+/**
+ * Vdev specification for pool creation or expansion.
+ *  'stripe' is our synthetic type — means individual disk vdevs (no redundancy).
+ */
 export const VdevSpec = z
   .object({
     type: z.enum(['mirror', 'raidz', 'raidz2', 'raidz3', 'stripe']),
     /** Disk by-id identifiers */
     disks: z.array(z.string()).min(1),
   })
-  .check(ctx => {
+  .check((ctx) => {
     const minDisks: Record<string, number> = {
       mirror: 2,
       raidz: 3,

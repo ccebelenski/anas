@@ -1,7 +1,7 @@
-import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { dirname, join } from 'node:path'
+import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { parseZpoolGet } from '../zpool-get.js'
 
@@ -33,8 +33,8 @@ describe('parseZpoolGet', () => {
     assert.ok(result)
     assert.ok(result.all)
     assert.ok(Object.keys(result.all).length > 10)
-    assert.equal(typeof result.all['ashift'], 'string')
-    assert.equal(typeof result.all['failmode'], 'string')
+    assert.equal(typeof result.all.ashift, 'string')
+    assert.equal(typeof result.all.failmode, 'string')
   })
 
   it('omits full property bag by default', () => {

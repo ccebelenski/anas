@@ -7,8 +7,8 @@ defineProps<{
 }>()
 
 const emit = defineEmits<{
-  (e: 'show-smart', diskId: string): void
-  (e: 'show-pool', poolName: string): void
+  (e: 'showSmart', diskId: string): void
+  (e: 'showPool', poolName: string): void
 }>()
 
 function statusSeverity(status: string): 'success' | 'info' | 'secondary' | 'warn' {
@@ -31,28 +31,36 @@ function statusLabel(status: string): string {
 }
 
 function diskType(disk: Disk): string {
-  if (disk.transport === 'nvme') return 'NVMe'
-  if (disk.transport === 'usb') return 'USB'
+  if (disk.transport === 'nvme')
+    return 'NVMe'
+  if (disk.transport === 'usb')
+    return 'USB'
   return disk.rotational ? 'HDD' : 'SSD'
 }
 
 function sectorInfo(disk: Disk): string {
   const phys = disk.physicalSectorSize
   const log = disk.logicalSectorSize
-  if (!phys && !log) return ''
-  if (phys === log) return `${phys}B sectors`
+  if (!phys && !log)
+    return ''
+  if (phys === log)
+    return `${phys}B sectors`
   return `${log}B logical / ${phys}B physical`
 }
 
 function smartSeverity(healthy: boolean | null): 'success' | 'danger' | 'secondary' {
-  if (healthy === true) return 'success'
-  if (healthy === false) return 'danger'
+  if (healthy === true)
+    return 'success'
+  if (healthy === false)
+    return 'danger'
   return 'secondary'
 }
 
 function smartLabel(healthy: boolean | null): string {
-  if (healthy === true) return 'OK'
-  if (healthy === false) return 'FAIL'
+  if (healthy === true)
+    return 'OK'
+  if (healthy === false)
+    return 'FAIL'
   return '—'
 }
 </script>
@@ -87,18 +95,18 @@ function smartLabel(healthy: boolean | null): string {
       </template>
     </Column>
 
-    <Column header="Type" sortable :sort-field="'rotational'" style="width: 4.5rem;">
+    <Column header="Type" sortable sort-field="rotational" style="width: 4.5rem;">
       <template #body="{ data: disk }">
         {{ diskType(disk) }}
       </template>
     </Column>
 
-    <Column header="Health" sortable :sort-field="'smartHealthy'" style="width: 4.5rem;">
+    <Column header="Health" sortable sort-field="smartHealthy" style="width: 4.5rem;">
       <template #body="{ data: disk }">
         <Tag
+          v-tooltip.top="disk.smartHealthy === true ? 'SMART self-assessment: PASSED' : disk.smartHealthy === false ? 'SMART self-assessment: FAILED' : 'SMART not available'"
           :value="smartLabel(disk.smartHealthy)"
           :severity="smartSeverity(disk.smartHealthy)"
-          v-tooltip.top="disk.smartHealthy === true ? 'SMART self-assessment: PASSED' : disk.smartHealthy === false ? 'SMART self-assessment: FAILED' : 'SMART not available'"
         />
       </template>
     </Column>
@@ -115,7 +123,7 @@ function smartLabel(healthy: boolean | null): string {
           v-if="disk.poolName"
           class="pool-link"
           :data-pool-link="disk.poolName"
-          @click="emit('show-pool', disk.poolName!)"
+          @click="emit('showPool', disk.poolName!)"
         >{{ disk.poolName }}</span>
         <span v-else>-</span>
       </template>
@@ -124,13 +132,13 @@ function smartLabel(healthy: boolean | null): string {
     <Column header="" style="width: 3rem;">
       <template #body="{ data: disk }">
         <Button
+          v-tooltip.top="'SMART details'"
           icon="pi pi-chart-bar"
           text
           rounded
           size="small"
           :data-smart-btn="disk.id"
-          v-tooltip.top="'SMART details'"
-          @click="emit('show-smart', disk.id)"
+          @click="emit('showSmart', disk.id)"
         />
       </template>
     </Column>

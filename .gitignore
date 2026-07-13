@@ -11,3 +11,6 @@ playwright-report/
 
 # Stunt node (developer-specific)
 test/stunt-node/config.local
+
+# Claude Code local state
+.claude/

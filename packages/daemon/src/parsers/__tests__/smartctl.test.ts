@@ -1,7 +1,7 @@
-import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { dirname, join } from 'node:path'
+import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { parseSmartctl } from '../smartctl.js'
 

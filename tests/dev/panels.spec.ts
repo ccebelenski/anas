@@ -1,4 +1,5 @@
-import { test, expect, type Page } from '@playwright/test'
+import type { Page } from '@playwright/test'
+import { expect, test } from '@playwright/test'
 
 async function waitForApp(page: Page) {
   await page.goto('/')
@@ -6,7 +7,6 @@ async function waitForApp(page: Page) {
 }
 
 test.describe('Floating Panels', () => {
-
   test('pool list panel opens and closes with X', async ({ page }) => {
     await waitForApp(page)
 
@@ -32,8 +32,8 @@ test.describe('Floating Panels', () => {
     await page.screenshot({ path: '/tmp/panel-detail-opened.png' })
 
     // Detail should have higher z-index than pool list
-    const listZ = await poolList.evaluate(el => parseInt(el.style.zIndex))
-    const detailZ = await detail.evaluate(el => parseInt(el.style.zIndex))
+    const listZ = await poolList.evaluate(el => Number.parseInt(el.style.zIndex))
+    const detailZ = await detail.evaluate(el => Number.parseInt(el.style.zIndex))
     expect(detailZ).toBeGreaterThan(listZ)
   })
 

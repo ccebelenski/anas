@@ -41,11 +41,13 @@ export class DiskIdentityCache {
   /** Get identity, loading from smartctl if not cached. */
   async get(diskId: string, devicePath: string): Promise<DiskIdentity> {
     const cached = this.cache.get(diskId)
-    if (cached) return cached
+    if (cached)
+      return cached
 
     // Deduplicate concurrent requests for the same disk
     const existing = this.pending.get(diskId)
-    if (existing) return existing
+    if (existing)
+      return existing
 
     const promise = this.load(diskId, devicePath)
     this.pending.set(diskId, promise)
@@ -60,7 +62,8 @@ export class DiskIdentityCache {
   /** Load identity for multiple disks in parallel. */
   async loadMany(disks: Array<{ id: string, path: string }>): Promise<void> {
     const uncached = disks.filter(d => !this.cache.has(d.id))
-    if (uncached.length === 0) return
+    if (uncached.length === 0)
+      return
     await Promise.all(uncached.map(d => this.get(d.id, d.path)))
   }
 
@@ -101,8 +104,11 @@ export class DiskIdentityCache {
 }
 
 function formatInterface(data: any): string | null {
-  if (data.sata_version?.string) return data.sata_version.string
-  if (data.nvme_version?.string) return `NVMe ${data.nvme_version.string}`
-  if (data.device?.protocol) return data.device.protocol
+  if (data.sata_version?.string)
+    return data.sata_version.string
+  if (data.nvme_version?.string)
+    return `NVMe ${data.nvme_version.string}`
+  if (data.device?.protocol)
+    return data.device.protocol
   return null
 }

@@ -9,14 +9,17 @@ const cardRef = ref<HTMLElement | null>(null)
 
 // --- Global state on window (survives HMR, shared across instances) ---
 function getStack(): string[] {
-  if (!import.meta.client) return []
+  if (!import.meta.client)
+    return []
   const w = window as any
-  if (!w.__fpStack) w.__fpStack = []
+  if (!w.__fpStack)
+    w.__fpStack = []
   return w.__fpStack
 }
 
 function getNextZ(): number {
-  if (!import.meta.client) return 1000
+  if (!import.meta.client)
+    return 1000
   const w = window as any
   w.__fpZ = (w.__fpZ ?? 1000) + 10
   return w.__fpZ
@@ -36,8 +39,10 @@ let dragOriginX = 0
 let dragOriginY = 0
 
 function onDragStart(e: MouseEvent) {
-  if (e.button !== 0) return
-  if ((e.target as HTMLElement).closest('[data-close-panel]')) return
+  if (e.button !== 0)
+    return
+  if ((e.target as HTMLElement).closest('[data-close-panel]'))
+    return
 
   // On first drag, read actual rendered position so there's no jump
   if (!positioned.value && cardRef.value) {
@@ -73,7 +78,8 @@ function bringToFront() {
   zIndex.value = getNextZ()
   const stack = getStack()
   const idx = stack.indexOf(props.panelId)
-  if (idx !== -1) stack.splice(idx, 1)
+  if (idx !== -1)
+    stack.splice(idx, 1)
   stack.push(props.panelId)
 }
 
@@ -84,13 +90,14 @@ function close() {
 
 function onClickOutside(e: MouseEvent) {
   const target = e.target as HTMLElement
-  if (target.closest('[data-floating-panel]')) return
+  if (target.closest('[data-floating-panel]'))
+    return
   close()
 }
 
 function onKeydown(e: KeyboardEvent) {
   const stack = getStack()
-  if (e.key === 'Escape' && stack[stack.length - 1] === props.panelId) {
+  if (e.key === 'Escape' && stack.at(-1) === props.panelId) {
     close()
   }
 }
@@ -102,7 +109,8 @@ function activate() {
   posY.value = 0
   positioned.value = false
   const stack = getStack()
-  if (!stack.includes(props.panelId)) stack.push(props.panelId)
+  if (!stack.includes(props.panelId))
+    stack.push(props.panelId)
   nextTick(() => {
     document.addEventListener('mousedown', onClickOutside)
     document.addEventListener('keydown', onKeydown)
@@ -112,7 +120,8 @@ function activate() {
 function deactivate() {
   const s = getStack()
   const idx = s.indexOf(props.panelId)
-  if (idx !== -1) s.splice(idx, 1)
+  if (idx !== -1)
+    s.splice(idx, 1)
   document.removeEventListener('mousedown', onClickOutside)
   document.removeEventListener('keydown', onKeydown)
   document.removeEventListener('mousemove', onDragMove)
@@ -120,12 +129,14 @@ function deactivate() {
 }
 
 watch(visible, (val) => {
-  if (val) activate()
+  if (val)
+    activate()
   else deactivate()
 })
 
 onMounted(() => {
-  if (visible.value) activate()
+  if (visible.value)
+    activate()
 })
 
 onUnmounted(() => {
@@ -144,13 +155,13 @@ onUnmounted(() => {
       :class="{ 'fp-dragging': dragging, 'fp-centered': !positioned }"
       :style="{
         zIndex,
-        ...(positioned ? { left: posX + 'px', top: posY + 'px' } : {}),
+        ...(positioned ? { left: `${posX}px`, top: `${posY}px` } : {}),
       }"
       @mousedown="bringToFront"
     >
       <div class="fp-header" @mousedown="onDragStart">
         <span class="fp-title">{{ title }}</span>
-        <button class="fp-close" :data-close-panel="panelId" @click="close" aria-label="Close">
+        <button class="fp-close" :data-close-panel="panelId" aria-label="Close" @click="close">
           <i class="pi pi-times" />
         </button>
       </div>

@@ -1,11 +1,11 @@
-import type { FastifyInstance } from 'fastify'
 import type { Disk } from '@anas/shared'
+import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
-import { parseLsblk, LSBLK_ARGS } from '../parsers/lsblk.js'
 import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
-import { parseZpoolStatus } from '../parsers/zpool-status.js'
+import { LSBLK_ARGS, parseLsblk } from '../parsers/lsblk.js'
 import { parseSmartctl } from '../parsers/smartctl.js'
+import { parseZpoolStatus } from '../parsers/zpool-status.js'
 
 export async function diskRoutes(
   server: FastifyInstance,
@@ -48,9 +48,10 @@ export async function diskRoutes(
     await diskIdentityCache.loadMany(disks.map(d => ({ id: d.id, path: d.path })))
 
     // Enrich disks with cached identity
-    return disks.map(d => {
+    return disks.map((d) => {
       const identity = diskIdentityCache.getCached(d.id)
-      if (!identity) return { ...d, modelFamily: null, formFactor: null, smartHealthy: null }
+      if (!identity)
+        return { ...d, modelFamily: null, formFactor: null, smartHealthy: null }
       return {
         ...d,
         modelFamily: identity.modelFamily,
@@ -61,7 +62,7 @@ export async function diskRoutes(
     })
   }
 
-  server.get('/disks', async (_request, reply) => {
+  server.get('/disks', async (_request, _reply) => {
     const disks = await fetchDisks()
     return { data: disks }
   })

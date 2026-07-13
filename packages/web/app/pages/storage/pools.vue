@@ -10,7 +10,9 @@ const pools = computed(() => data.value?.data ?? [])
 
 <template>
   <div>
-    <h1 style="margin-bottom: 1rem;">Storage Pools</h1>
+    <h1 style="margin-bottom: 1rem;">
+      Storage Pools
+    </h1>
 
     <Message v-if="error" severity="error" :closable="false">
       Failed to load pools: {{ error.message }}

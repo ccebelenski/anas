@@ -84,7 +84,8 @@ export function parseZpoolStatus(json: string | ZpoolStatusOutput): ParsedPoolSt
 export function parseZpoolStatusPool(json: string | ZpoolStatusOutput, poolName: string): ParsedPoolStatus | null {
   const data: ZpoolStatusOutput = typeof json === 'string' ? JSON.parse(json) : json
   const pool = data.pools[poolName]
-  if (!pool) return null
+  if (!pool)
+    return null
   return parsePool(pool)
 }
 
@@ -156,11 +157,12 @@ function classifyVdevs(topLevelVdevs: Record<string, ZfsVdevRaw>): VdevGroup[] {
 
   for (const [, rawVdev] of Object.entries(topLevelVdevs)) {
     const role = inferRole(rawVdev)
-    if (!groups.has(role)) groups.set(role, [])
+    if (!groups.has(role))
+      groups.set(role, [])
     groups.get(role)!.push(parseVdev(rawVdev))
   }
 
-  return Array.from(groups.entries()).map(([role, vdevs]) => ({ role, vdevs }))
+  return Array.from(groups.entries(), ([role, vdevs]) => ({ role, vdevs }))
 }
 
 /**
@@ -169,11 +171,16 @@ function classifyVdevs(topLevelVdevs: Record<string, ZfsVdevRaw>): VdevGroup[] {
  */
 function inferRole(vdev: ZfsVdevRaw): VdevRole {
   const name = vdev.name.toLowerCase()
-  if (name === 'logs' || name === 'log') return 'log'
-  if (name === 'cache') return 'cache'
-  if (name === 'spares' || name === 'spare') return 'spare'
-  if (name === 'special') return 'special'
-  if (name === 'dedup') return 'dedup'
+  if (name === 'logs' || name === 'log')
+    return 'log'
+  if (name === 'cache')
+    return 'cache'
+  if (name === 'spares' || name === 'spare')
+    return 'spare'
+  if (name === 'special')
+    return 'special'
+  if (name === 'dedup')
+    return 'dedup'
   return 'data'
 }
 
@@ -193,7 +200,8 @@ function parseVdev(raw: ZfsVdevRaw): Vdev {
         }
       }
     }
-  } else if (raw.vdev_type === 'disk') {
+  }
+  else if (raw.vdev_type === 'disk') {
     // Single disk vdev (stripe member) — the vdev IS the disk
     disks.push(parseDisk(raw))
   }
@@ -224,25 +232,39 @@ function parseDisk(raw: ZfsVdevRaw): PoolDisk {
   }
 }
 
-/** Map ZFS vdev_type strings to our VdevType enum.
- *  ZFS uses "raidz" for raidz1, the name contains the actual level (e.g. "raidz1-0"). */
+/**
+ * Map ZFS vdev_type strings to our VdevType enum.
+ *  ZFS uses "raidz" for raidz1, the name contains the actual level (e.g. "raidz1-0").
+ */
 function mapVdevType(zfsType: string): VdevType {
-  if (zfsType === 'raidz') return 'raidz'
-  if (zfsType === 'raidz2') return 'raidz2'
-  if (zfsType === 'raidz3') return 'raidz3'
-  if (zfsType === 'mirror') return 'mirror'
-  if (zfsType === 'disk' || zfsType === 'file') return 'disk'
-  if (zfsType === 'replacing') return 'replacing'
-  if (zfsType === 'spare') return 'spare'
-  if (zfsType.startsWith('draid3')) return 'draid3'
-  if (zfsType.startsWith('draid2')) return 'draid2'
-  if (zfsType.startsWith('draid')) return 'draid'
+  if (zfsType === 'raidz')
+    return 'raidz'
+  if (zfsType === 'raidz2')
+    return 'raidz2'
+  if (zfsType === 'raidz3')
+    return 'raidz3'
+  if (zfsType === 'mirror')
+    return 'mirror'
+  if (zfsType === 'disk' || zfsType === 'file')
+    return 'disk'
+  if (zfsType === 'replacing')
+    return 'replacing'
+  if (zfsType === 'spare')
+    return 'spare'
+  if (zfsType.startsWith('draid3'))
+    return 'draid3'
+  if (zfsType.startsWith('draid2'))
+    return 'draid2'
+  if (zfsType.startsWith('draid'))
+    return 'draid'
   return 'disk' // fallback
 }
 
+const PART_SUFFIX_RE = /-part\d+$/
+
 /** Strip -partN suffix from a by-id disk name */
 function stripPartSuffix(name: string): string {
-  return name.replace(/-part\d+$/, '')
+  return name.replace(PART_SUFFIX_RE, '')
 }
 
 function parseScanStats(raw: ZfsScanStatsRaw): ScanStatus {

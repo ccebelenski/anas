@@ -8,7 +8,7 @@ import { parseDedupRatio, parseHumanSize, parsePercent } from './utils.js'
 
 interface ZfsPropertyRaw {
   value: string
-  source: { type: string; data: string }
+  source: { type: string, data: string }
 }
 
 interface ZfsPoolListRaw {
@@ -27,7 +27,7 @@ interface ZpoolListOutput {
  */
 export function parseZpoolList(json: string | ZpoolListOutput): Omit<PoolSummary, 'scanRunning' | 'health'>[] {
   const data: ZpoolListOutput = typeof json === 'string' ? JSON.parse(json) : json
-  return Object.values(data.pools).map(pool => {
+  return Object.values(data.pools).map((pool) => {
     const prop = (name: string) => pool.properties[name]?.value ?? '-'
 
     return {

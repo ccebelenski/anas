@@ -17,21 +17,21 @@ interface LsblkPartRaw {
 }
 
 interface LsblkDeviceRaw {
-  name: string
-  type: string
-  size: number
-  model: string | null
-  serial: string | null
-  tran: string | null
-  fstype: string | null
-  mountpoint: string | null
-  rota: boolean
+  'name': string
+  'type': string
+  'size': number
+  'model': string | null
+  'serial': string | null
+  'tran': string | null
+  'fstype': string | null
+  'mountpoint': string | null
+  'rota': boolean
   'phy-sec'?: number | null
   'log-sec'?: number | null
-  wwn?: string | null
-  vendor?: string | null
-  rev?: string | null
-  children?: LsblkPartRaw[]
+  'wwn'?: string | null
+  'vendor'?: string | null
+  'rev'?: string | null
+  'children'?: LsblkPartRaw[]
 }
 
 interface LsblkOutput {
@@ -47,6 +47,7 @@ export type ByIdMap = Map<string, string>
 /**
  * Parse lsblk JSON output into Disk objects.
  * Filters to physical disks (type=disk), excluding CD-ROMs, zram, loop, etc.
+ * @param json raw lsblk JSON output (string or pre-parsed object)
  * @param byIdMap mapping of kernel names to by-id identifiers (from disk-by-id parser)
  * @param poolDisks set of by-id names that belong to ZFS pools
  */
@@ -59,15 +60,18 @@ export function parseLsblk(
 
   return data.blockdevices
     .filter(dev => dev.type === 'disk' && !dev.name.startsWith('zram') && !dev.name.startsWith('loop'))
-    .map(dev => {
+    .map((dev) => {
       const id = byIdMap.get(dev.name) ?? dev.serial ?? dev.name
       const partitions = parsePartitions(dev.children ?? [])
       const isSystem = isSystemDisk(dev, partitions)
       const poolName = poolDisks.get(id) ?? null
       let status: DiskUsageStatus = 'available'
-      if (isSystem) status = 'system'
-      else if (poolName) status = 'pool_member'
-      else if (hasNonZfsPartitions(partitions)) status = 'other'
+      if (isSystem)
+        status = 'system'
+      else if (poolName)
+        status = 'pool_member'
+      else if (hasNonZfsPartitions(partitions))
+        status = 'other'
 
       return {
         id,
@@ -95,7 +99,8 @@ export function parseLsblk(
 
 /** Trim whitespace and return null for empty/null strings */
 function trimOrNull(s: string | null | undefined): string | null {
-  if (!s) return null
+  if (!s)
+    return null
   const trimmed = s.trim()
   return trimmed.length > 0 ? trimmed : null
 }
@@ -117,7 +122,8 @@ function isSystemDisk(dev: LsblkDeviceRaw, partitions: DiskPartition[]): boolean
       return true
     }
   }
-  if (dev.mountpoint === '/') return true
+  if (dev.mountpoint === '/')
+    return true
   return false
 }
 

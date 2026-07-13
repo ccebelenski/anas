@@ -10,43 +10,47 @@ const showJobs = ref(false)
 <template>
   <div class="app-layout">
     <ClientOnly>
-    <aside class="app-sidebar" data-region="sidebar">
-      <div class="app-sidebar-header">
-        <h2>ANAS</h2>
-      </div>
-      <nav class="app-nav">
-        <button data-nav="dashboard" class="nav-item" @click="navigateTo('/')">
-          <i class="pi pi-home" /><span>Dashboard</span>
-        </button>
-
-        <div class="nav-group">
-          <div class="nav-group-label"><i class="pi pi-database" /><span>Storage</span></div>
-          <button data-nav="pools" class="nav-item nav-child" @click="showPools = true">
-            <i class="pi pi-server" /><span>Pools</span>
-          </button>
-          <button data-nav="disks" class="nav-item nav-child" @click="showDisks = true">
-            <i class="pi pi-circle" /><span>Disks</span>
-          </button>
+      <aside class="app-sidebar" data-region="sidebar">
+        <div class="app-sidebar-header">
+          <h2>ANAS</h2>
         </div>
-
-        <div class="nav-group">
-          <div class="nav-group-label"><i class="pi pi-share-alt" /><span>Shares</span></div>
-          <button data-nav="smb" class="nav-item nav-child" @click="showSmb = true">
-            <i class="pi pi-folder" /><span>SMB</span>
+        <nav class="app-nav">
+          <button data-nav="dashboard" class="nav-item" @click="navigateTo('/')">
+            <i class="pi pi-home" /><span>Dashboard</span>
           </button>
-          <button data-nav="nfs" class="nav-item nav-child" @click="showNfs = true">
-            <i class="pi pi-folder-open" /><span>NFS</span>
-          </button>
-        </div>
 
-        <button data-nav="users" class="nav-item" @click="showUsers = true">
-          <i class="pi pi-users" /><span>Users & Groups</span>
-        </button>
-        <button data-nav="jobs" class="nav-item" @click="showJobs = true">
-          <i class="pi pi-list-check" /><span>Jobs</span>
-        </button>
-      </nav>
-    </aside>
+          <div class="nav-group">
+            <div class="nav-group-label">
+              <i class="pi pi-database" /><span>Storage</span>
+            </div>
+            <button data-nav="pools" class="nav-item nav-child" @click="showPools = true">
+              <i class="pi pi-server" /><span>Pools</span>
+            </button>
+            <button data-nav="disks" class="nav-item nav-child" @click="showDisks = true">
+              <i class="pi pi-circle" /><span>Disks</span>
+            </button>
+          </div>
+
+          <div class="nav-group">
+            <div class="nav-group-label">
+              <i class="pi pi-share-alt" /><span>Shares</span>
+            </div>
+            <button data-nav="smb" class="nav-item nav-child" @click="showSmb = true">
+              <i class="pi pi-folder" /><span>SMB</span>
+            </button>
+            <button data-nav="nfs" class="nav-item nav-child" @click="showNfs = true">
+              <i class="pi pi-folder-open" /><span>NFS</span>
+            </button>
+          </div>
+
+          <button data-nav="users" class="nav-item" @click="showUsers = true">
+            <i class="pi pi-users" /><span>Users & Groups</span>
+          </button>
+          <button data-nav="jobs" class="nav-item" @click="showJobs = true">
+            <i class="pi pi-list-check" /><span>Jobs</span>
+          </button>
+        </nav>
+      </aside>
     </ClientOnly>
 
     <div class="app-main">
@@ -67,16 +71,24 @@ const showJobs = ref(false)
 
     <!-- Placeholders for future panels -->
     <FloatingPanel v-model:visible="showSmb" panel-id="smb" title="SMB Shares">
-      <p style="opacity: 0.5;">SMB shares coming soon.</p>
+      <p style="opacity: 0.5;">
+        SMB shares coming soon.
+      </p>
     </FloatingPanel>
     <FloatingPanel v-model:visible="showNfs" panel-id="nfs" title="NFS Exports">
-      <p style="opacity: 0.5;">NFS exports coming soon.</p>
+      <p style="opacity: 0.5;">
+        NFS exports coming soon.
+      </p>
     </FloatingPanel>
     <FloatingPanel v-model:visible="showUsers" panel-id="users" title="Users & Groups">
-      <p style="opacity: 0.5;">User management coming soon.</p>
+      <p style="opacity: 0.5;">
+        User management coming soon.
+      </p>
     </FloatingPanel>
     <FloatingPanel v-model:visible="showJobs" panel-id="jobs" title="Jobs">
-      <p style="opacity: 0.5;">Job history coming soon.</p>
+      <p style="opacity: 0.5;">
+        Job history coming soon.
+      </p>
     </FloatingPanel>
   </div>
 </template>

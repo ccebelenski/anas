@@ -8,7 +8,7 @@ import { parseIntOrZero, parseZfsBool } from './utils.js'
 
 interface ZfsPropertyRaw {
   value: string
-  source: { type: string; data: string }
+  source: { type: string, data: string }
 }
 
 interface ZfsPoolGetRaw {
@@ -21,6 +21,8 @@ interface ZpoolGetOutput {
 
 /**
  * Parse `zpool get all -j` for a specific pool.
+ * @param json raw `zpool get` JSON output (string or pre-parsed object)
+ * @param poolName pool to extract properties for
  * @param includeAll If true, include the full property bag in `all`.
  */
 export function parseZpoolGet(
@@ -30,7 +32,8 @@ export function parseZpoolGet(
 ): PoolProperties | null {
   const data: ZpoolGetOutput = typeof json === 'string' ? JSON.parse(json) : json
   const pool = data.pools[poolName]
-  if (!pool) return null
+  if (!pool)
+    return null
 
   const prop = (name: string) => pool.properties[name]?.value ?? ''
 
@@ -54,6 +57,7 @@ export function parseZpoolGet(
 }
 
 function parseFailmode(val: string): 'wait' | 'continue' | 'panic' {
-  if (val === 'continue' || val === 'panic') return val
+  if (val === 'continue' || val === 'panic')
+    return val
   return 'wait' // default
 }

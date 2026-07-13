@@ -5,7 +5,7 @@
 
 import type { ExecResult } from '../executor/types.js'
 import { readFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -22,7 +22,7 @@ function fixtureResult(subdir: string, filename: string): ExecResult {
 export const mockFixtures = {
   zpoolList: () => fixtureResult('zfs', 'zpool-list.json'),
   zpoolStatus: () => fixtureResult('zfs', 'zpool-status-online.json'),
-  zpoolGetAll: (pool: string) => fixtureResult('zfs', 'zpool-get-all.json'),
+  zpoolGetAll: (_pool: string) => fixtureResult('zfs', 'zpool-get-all.json'),
   zfsList: () => fixtureResult('zfs', 'zfs-list.json'),
   lsblk: () => fixtureResult('system', 'lsblk.json'),
   diskByIdListing: () => fixtureResult('system', 'disk-by-id.txt'),

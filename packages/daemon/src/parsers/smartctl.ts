@@ -6,7 +6,7 @@
 import type { SmartAttribute, SmartData, SmartHealth } from '@anas/shared'
 
 interface SmartctlOutput {
-  smart_support?: { available: boolean; enabled?: boolean }
+  smart_support?: { available: boolean, enabled?: boolean }
   smart_status?: { passed: boolean }
   temperature?: { current: number }
   power_on_time?: { hours: number }

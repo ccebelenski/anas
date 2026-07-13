@@ -38,9 +38,11 @@ function healthSeverity(health: string): 'success' | 'danger' | 'secondary' {
 }
 
 function formatHours(hours: number | null): string {
-  if (hours === null) return '-'
+  if (hours === null)
+    return '-'
   const days = Math.floor(hours / 24)
-  if (days > 0) return `${hours.toLocaleString()}h (${days.toLocaleString()}d)`
+  if (days > 0)
+    return `${hours.toLocaleString()}h (${days.toLocaleString()}d)`
   return `${hours}h`
 }
 </script>

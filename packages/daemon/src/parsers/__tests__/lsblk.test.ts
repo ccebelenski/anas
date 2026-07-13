@@ -1,10 +1,10 @@
-import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { dirname, join } from 'node:path'
+import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { parseLsblk } from '../lsblk.js'
 import { parseDiskByIdListing } from '../disk-by-id.js'
+import { parseLsblk } from '../lsblk.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/system')
