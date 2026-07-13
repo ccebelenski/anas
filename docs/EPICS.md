@@ -80,7 +80,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 ### Stories
 
-1.1. As a user, I want to access ANAS from the Proxmox UI sidebar and be automatically authenticated via my Proxmox session, so that it feels like part of Proxmox with no separate login. *(Deferred to Epic 10 — sidebar installation is a setup concern.)*
+1.1. As a user, I want to access ANAS from the Proxmox UI sidebar and be automatically authenticated via my Proxmox session, so that it feels like part of Proxmox with no separate login. *(Realized by Epic 13 — PVE UI embedding with ticket handoff; packaged by 10.3.)*
 
 1.2. [OBE] ~~As a user, I want a fallback login page with PAM authentication, so that I can access ANAS directly (not through Proxmox) if needed.~~ *ANAS is always accessed through Proxmox; PVE owns auth.*
 
@@ -128,7 +128,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 3.9. As a user, I want to modify pool properties, so that I can tune pool behavior.
 
-3.10. As a user, I want to start a scrub on a pool, so that I can verify data integrity.
+3.10. [done] As a user, I want to start a scrub on a pool, so that I can verify data integrity.
 
 3.11. As a user, I want to add a vdev to an existing pool, so that I can expand capacity.
 
@@ -317,9 +317,9 @@ Story numbering is for identification only, not implementation order. Within eac
 
 10.2. As a user, I want `anas setup` to detect Proxmox, configure systemd units, set up TLS, and generate default config, so that the system is ready to use with minimal intervention.
 
-10.3. As a user, I want `anas setup` to install a sidebar entry in the Proxmox UI, so that ANAS is accessible from the Proxmox interface.
+10.3. As a user, I want `anas setup` to install the PVE UI integration (Epic 13's scripts), so that ANAS is accessible from the Proxmox interface after a standard install. *(Mechanism built in Epic 13; this story packages it.)*
 
-10.4. As a user, I want ANAS to use Proxmox TLS certificates automatically, so that I don't need to manage separate certs.
+10.4. [done] As a user, I want ANAS to use Proxmox TLS certificates automatically, so that I don't need to manage separate certs. *(Pulled forward: PVE marks PVEAuthCookie as Secure, so browsers withhold it from plain-HTTP ANAS — HTTPS with the host's certs is a prerequisite for auth to work at all. Implemented in the systemd unit via NITRO_SSL_CERT/KEY from /etc/pve/local, preferring pveproxy-ssl.\* like pveproxy. `anas setup` in 10.2 must install the same configuration.)*
 
 10.5. As a user, I want to override defaults (port, TLS, auth provider) via `/etc/anas/config.yaml`, so that I can customize the deployment when needed.
 
@@ -334,6 +334,33 @@ Story numbering is for identification only, not implementation order. Within eac
 
 ---
 
+## Epic 13: PVE UI Embedding
+
+> As a user, I want ANAS to appear as a native section of the Proxmox web UI (Ceph-style collapsible node menu group), so that managing storage feels like part of Proxmox, not a separate app.
+
+Design: see **PVE UI Integration** in DESIGN.md — injected `anas.js` + one-line tpl insert (apt-hook re-applied), iframe views, postMessage ticket handoff. Contracts there are authoritative; stories below build to them.
+
+### Stories
+
+#### Web app (independent of PVE-side work)
+13.1. As a user, I want each top-level view (dashboard, pools, disks) served at a stable route (`/`, `/storage/pools`, `/storage/disks`), so that views are deep-linkable and embeddable. *(Future epics add their own views following this pattern.)*
+
+13.2. As a user, I want an embedded display mode (`?embedded=1`, persists across in-app navigation) that hides ANAS chrome, so that ANAS views render cleanly inside the PVE UI.
+
+13.3. As a user, I want ANAS to accept my PVE session via the postMessage ticket handoff (`/auth/handoff` page, unauthenticated, origin-verified, redirect-validated), so that embedded views authenticate without a separate login — including for nodes other than the one serving my PVE session.
+
+#### PVE side (independent of web-app work)
+13.4. As a user, I want an "ANAS" collapsible section in the PVE node menu (Dashboard, Storage → Pools/Disks) whose items render embedded ANAS views, so that ANAS is reachable from where I already work. *(Fail-open: script errors must never break the PVE UI.)*
+
+13.5. As a dev, I want idempotent install/uninstall/re-apply scripts for the integration (JS file + tpl insert + apt post-invoke hook), wired into the stunt-node deploy, so that the integration survives pve-manager upgrades. *(Productization into `anas setup` remains stories 10.2/10.3.)*
+
+#### Verification
+13.6. As a dev, I want integration tests that log in through the real PVE UI, expand the ANAS section, and verify the embedded pools/disks views render and function, so that the whole chain (injection → handoff → embedded view) is continuously verified.
+
+13.7. *(V2?)* As a user, I want embedded ANAS to match the PVE theme (light/dark), so the integration is visually seamless.
+
+---
+
 ## MVP Scope
 
 For V1 MVP, the implementation order is:
@@ -342,6 +369,7 @@ For V1 MVP, the implementation order is:
 2. **Epic 0.5** — Test infrastructure *(done — stunt node, Playwright)*
 3. **Epic 1** — Auth *(done — PVE RSA-SHA1 verification; sidebar deferred to Epic 10)*
 4. **Epic 3** — ZFS pools (core value proposition — parsers first, then observe, then act)
+4.5. **Epic 13** — PVE UI embedding (pulled forward from the original 10.3 plan — establishes the routed-view pattern all later epics' views follow; parallelizable with Epic 3 act stories)
 5. **Epic 4** — ZFS datasets (builds on pool infrastructure)
 6. **Epic 5** — Snapshots (builds on dataset infrastructure)
 7. **Epic 6** — SMB shares (parser first, then CRUD)

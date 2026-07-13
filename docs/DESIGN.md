@@ -495,7 +495,7 @@ ANAS is always accessed through Proxmox UI — Proxmox owns the session.
 
 | Provider | When | How |
 |----------|------|-----|
-| `PveAuthProvider` | Production (default) | Validates PVEAuthCookie against local Proxmox API (localhost:8006) |
+| `PveAuthProvider` | Production (default) | Verifies PVEAuthCookie signature locally (RSA-SHA1 against `/etc/pve/authkey.pub`) — no network calls |
 | `DevAuthProvider` | Development & testing | Accepts everything, returns mock user |
 
 - **No login page** — users are already authenticated via Proxmox
@@ -506,8 +506,8 @@ ANAS is always accessed through Proxmox UI — Proxmox owns the session.
 - **Dev mode** (`ANAS_AUTH_PROVIDER=dev`): skips cookie validation, sets a mock user on every request
 
 Proxmox integration:
-- Users logged into Proxmox UI are already authenticated to ANAS via PVEAuthCookie
-- Custom JS entry in Proxmox UI sidebar links to ANAS (via `/usr/share/pve-manager/js/custom.js`)
+- Users logged into Proxmox UI are already authenticated to ANAS via PVEAuthCookie — but the cookie is `Secure` and host-scoped, so ANAS must serve HTTPS (with the host's PVE certs), and cross-node access requires the ticket handoff described in **PVE UI Integration** below
+- The PVE web UI gains an ANAS section via an injected integration script (see **PVE UI Integration**). PVE 9 has no official UI extension hook — the previously assumed `/usr/share/pve-manager/js/custom.js` mechanism does not exist
 
 Both services run as root — no dedicated service user.
 
@@ -521,16 +521,22 @@ Both services run as root — no dedicated service user.
 
 ## Frontend Structure
 
-### UI Model: Floating Panels over a Persistent Dashboard
+### UI Model: Routed Views + Floating Panels
 
-ANAS uses a **workspace model**, not page navigation. The dashboard is always visible as the home base. Features open as **floating panels** — clean bordered overlays that appear on top of the dashboard (or each other) and dismiss back when done. This lets the user cross-reference information without losing context (e.g. check pool status while configuring a share).
+ANAS has two navigation layers:
+
+1. **Top-level views are routed pages** — every view (dashboard, pools, disks, and later datasets/shares/jobs) has a stable, deep-linkable URL. This is what lets the PVE UI embed individual ANAS views (see **PVE UI Integration**), and it's the pattern every future epic's views must follow.
+2. **Within a view, details and actions are floating panels** — clean bordered overlays (pool detail, SMART data, confirmations) that stack, drag, and dismiss with Escape/click-outside. This mirrors PVE's own grid→floating-window interaction and lets the user cross-reference without losing context.
+
+**Display modes:**
+- **Standalone** (direct browser access): ANAS shows its own sidebar for navigating between views.
+- **Embedded** (`?embedded=1`, inside the PVE UI): ANAS chrome (sidebar, header) is hidden — navigation belongs to the PVE resource tree. The flag persists across in-app navigation. Views render content-only, filling the frame.
 
 **Key principles:**
-- The **dashboard** is the persistent workspace — pool health, active jobs, warnings. Always underneath.
-- **Sidebar items open floating panels**, not navigate to pages. No route changes, no context loss.
+- **Views are routes** — deep-linkable, embeddable, bookmarkable.
 - **Panels are self-contained** — each fetches its own data on open. No shared state to maintain.
 - **Dismiss with Escape or click-outside** — clean restore, no leftover state.
-- **Panels can stack** — open pools while shares panel is already open (future refinement).
+- **Panels can stack** — pool detail on top of pool list, SMART on top of disks.
 
 ```
 components/
@@ -545,9 +551,12 @@ components/
 
 ```
 pages/
-├── index.vue                       # Dashboard — the persistent workspace
+├── index.vue                       # Dashboard view (route: /)
+├── auth/
+│   └── handoff.vue                 # PVE ticket handoff page — unauthenticated, see PVE UI Integration
 └── storage/
-    └── pools.vue                   # Standalone page (for direct URL access / bookmarking)
+    ├── pools.vue                   # Pools view (route: /storage/pools)
+    └── disks.vue                   # Disks view (route: /storage/disks)
 ```
 
 ### Nuxt Server API Routes (proxy to anasd)
@@ -557,6 +566,55 @@ server/api/
 ├── pools.get.ts                    # GET /api/pools → anasd /v1/pools
 └── ...                             # Additional proxy routes added per feature
 ```
+
+---
+
+## PVE UI Integration
+
+ANAS appears as a native-feeling section in the Proxmox web UI, modeled on how PVE presents **Ceph**: a collapsible group in the **node** menu whose items render in the content area. Node-level placement matches PVE's mental model (storage is node-scoped) and scales to clusters.
+
+```
+Node "pve1"
+├─ Summary / Shell / System / Disks ...   (PVE's own)
+└─ ANAS                                   (collapsible section, injected)
+   ├─ Dashboard        → iframe /?embedded=1
+   ├─ Storage
+   │  ├─ Pools         → iframe /storage/pools?embedded=1
+   │  └─ Disks         → iframe /storage/disks?embedded=1
+   ├─ Shares (SMB/NFS) → added with Epics 6–7
+   └─ Jobs             → added with Epic 9
+```
+
+### Mechanism
+
+PVE 9 has **no official UI extension hook**. Verified facts (PVE 9.2, stunt node):
+- pveproxy serves unowned files dropped into `/usr/share/pve-manager/js/` (dpkg never removes files it doesn't own — survives upgrades)
+- The PVE UI page sends no CSP or X-Frame-Options headers — same-origin injected scripts and cross-port iframes work
+- `PVEAuthCookie` is set by PVE's own JS with `Secure` + `SameSite=Lax`, is **not** HttpOnly (readable by page JS), and tickets are **cluster-valid** (any node verifies against the shared authkey)
+
+Integration therefore consists of:
+1. **`/usr/share/pve-manager/js/anas.js`** — our ExtJS integration script, served at `/pve2/js/anas.js`. Our file, upgrade-safe.
+2. **One `<script>` line inserted into `/usr/share/pve-manager/index.html.tpl`** (after `pvemanagerlib.js`). This is the single fragile point: pve-manager upgrades overwrite the template. Mitigations: the insert is idempotent (presence-checked, no marker comments), an apt `DPkg::Post-Invoke` hook re-applies it after upgrades, `anas doctor` detects and repairs it, and uninstall restores the pristine template.
+3. **Fail-open script**: `anas.js` wraps everything in try/catch and feature-detects the ExtJS internals it touches. Worst-case failure is "no ANAS section appears" — never a broken PVE UI.
+
+### Ticket handoff (cross-node auth)
+
+The cookie is host-scoped: logged into node A's UI, the browser has no cookie for node B's ANAS. The integration script hands the (cluster-valid) ticket to the target node's ANAS via postMessage:
+
+1. Menu item renders an iframe: `https://<node>:3000/auth/handoff?to=/storage/pools`
+2. The handoff page (**served without auth** — it renders no data, only performs the handshake) posts `{ type: 'anas:handoff:ready' }` to `window.parent`, targetOrigin `https://<pve-host>:8006`
+3. The parent script replies `{ type: 'anas:handoff:ticket', ticket: <PVEAuthCookie value> }`, targetOrigin `https://<node>:3000`
+4. The handoff page **verifies `event.origin`** is the expected PVE UI origin, sets `PVEAuthCookie` on its own origin (`Secure; SameSite=Lax; path=/`), and `location.replace()`s to `to` + `?embedded=1`
+5. `to` must be a same-origin relative path (validated — no open redirect). If no ticket arrives within a timeout, the page shows "Log into Proxmox first."
+
+ANAS validates the handed-off cookie on every request exactly as it does today (local RSA-SHA1) — the handoff adds **no new server-side auth paths**.
+
+Node addressing (v1): when the selected tree node is the one serving the PVE UI (`Proxmox.NodeName`), the iframe uses `window.location.hostname` — this preserves IP-based access, where the node name may not resolve from the admin's browser. For other cluster nodes, the node name is used (standard PVE cluster `/etc/hosts`/DNS assumption). Port is 3000; overrides come with `/etc/anas/config.yaml` (story 10.5).
+
+### Forward compatibility
+
+- **Epic 12 (central multi-node ANAS)**: the injected script doesn't care whether it loads N per-node ANAS instances or one central one — only the iframe URL changes.
+- **Upstream extension point**: if PVE ever ships an official UI hook, the tpl insert is replaced by the sanctioned mechanism; everything else stays.
 
 ---
 
