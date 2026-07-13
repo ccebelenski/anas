@@ -1,3 +1,4 @@
+import { gotoHydrated } from '../helpers/hydration'
 import { expect, test } from './fixtures/auth'
 import { getZpoolStatus, poolExists } from './fixtures/stunt-node'
 
@@ -5,11 +6,8 @@ test.describe('Pool Scrub', () => {
   test('starting a scrub from the UI runs a real scrub', async ({ authenticatedPage: page }) => {
     test.skip(!(await poolExists('testpool')), 'testpool not present — run setup-test-data.sh')
 
-    await page.goto('/')
-    await page.locator('[data-nav="pools"]').click()
-    const poolList = page.locator('[data-panel-id="pool-list"]')
-    await expect(poolList).toBeVisible()
-    await poolList.locator('[data-pool-select="testpool"]').click()
+    await gotoHydrated(page, '/storage/pools')
+    await page.locator('[data-pool-select="testpool"]').click()
 
     const detail = page.locator('[data-panel-id="pool-detail-testpool"]')
     await expect(detail).toBeVisible()

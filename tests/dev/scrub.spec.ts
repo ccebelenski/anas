@@ -1,13 +1,10 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
+import { gotoHydrated } from '../helpers/hydration'
 
 async function openPoolDetail(page: Page) {
-  await page.goto('/')
-  await page.locator('[data-nav="pools"]').waitFor({ state: 'visible' })
-  await page.locator('[data-nav="pools"]').click()
-  const poolList = page.locator('[data-panel-id="pool-list"]')
-  await expect(poolList).toBeVisible()
-  await poolList.locator('[data-pool-select="testpool"]').click()
+  await gotoHydrated(page, '/storage/pools')
+  await page.locator('[data-pool-select="testpool"]').click()
   const detail = page.locator('[data-panel-id="pool-detail-testpool"]')
   await expect(detail).toBeVisible()
   return detail

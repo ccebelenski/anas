@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { waitForFrameHydrated } from '../helpers/hydration'
 import { poolExists } from './fixtures/stunt-node'
 
 /**
@@ -94,6 +95,10 @@ test.describe('PVE UI embedding (stunt node)', () => {
     const anasFrame = page.frameLocator('iframe[src*="/auth/handoff"]')
     const poolRow = anasFrame.locator('[data-pool-select="testpool"]')
     await expect(poolRow).toBeVisible({ timeout: 45_000 })
+
+    // Clicking pre-hydration hits dead SSR handlers — wait for the app's
+    // hydration stamp inside the frame first (see tests/helpers/hydration.ts).
+    await waitForFrameHydrated(anasFrame)
 
     // Contract: pool rows open the floating pool-detail panel (inside the frame).
     await poolRow.click()

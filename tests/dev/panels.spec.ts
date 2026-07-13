@@ -1,8 +1,9 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
+import { gotoHydrated } from '../helpers/hydration'
 
 async function waitForApp(page: Page) {
-  await page.goto('/')
+  await gotoHydrated(page, '/')
   await page.locator('[data-nav="pools"]').waitFor({ state: 'visible' })
 }
 

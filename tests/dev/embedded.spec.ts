@@ -1,5 +1,6 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
+import { gotoHydrated } from '../helpers/hydration'
 
 /**
  * Story 13.6 — embedded display mode, verified against the mock dev server.
@@ -33,7 +34,7 @@ async function waitForPoolRow(page: Page) {
 test.describe('Embedded display mode (mock dev server)', () => {
   test('standalone /storage/pools renders the pool list with sidebar chrome visible', async ({ page }) => {
     // Contract: views are routed pages — /storage/pools is directly reachable.
-    await page.goto('/storage/pools')
+    await gotoHydrated(page, '/storage/pools')
 
     // The pool list renders `testpool`.
     await waitForPoolRow(page)
@@ -47,7 +48,7 @@ test.describe('Embedded display mode (mock dev server)', () => {
   test('embedded /storage/pools?embedded=1 renders the pool list with NO chrome', async ({ page }) => {
     // Contract: `?embedded=1` hides ANAS chrome — navigation belongs to the PVE
     // resource tree; the view renders content-only, filling the frame.
-    await page.goto('/storage/pools?embedded=1')
+    await gotoHydrated(page, '/storage/pools?embedded=1')
 
     // Content still renders: the pool list shows `testpool`.
     await waitForPoolRow(page)
@@ -62,7 +63,7 @@ test.describe('Embedded display mode (mock dev server)', () => {
 
   test('embedded flag persists after opening the pool detail panel', async ({ page }) => {
     // Contract: the embedded flag persists across in-app navigation/interaction.
-    await page.goto('/storage/pools?embedded=1')
+    await gotoHydrated(page, '/storage/pools?embedded=1')
     await waitForPoolRow(page)
 
     // Chrome is hidden before we interact.

@@ -607,6 +607,8 @@ The cookie is host-scoped: logged into node A's UI, the browser has no cookie fo
 4. The handoff page **verifies `event.origin`** is the expected PVE UI origin, sets `PVEAuthCookie` on its own origin (`Secure; SameSite=Lax; path=/`), and `location.replace()`s to `to` + `?embedded=1`
 5. `to` must be a same-origin relative path (validated — no open redirect). If no ticket arrives within a timeout, the page shows "Log into Proxmox first."
 
+> **Known v1 limitation:** the handoff page derives the expected PVE UI origin from its *own* hostname (`https://<location.hostname>:8006`). That holds when the embedded ANAS node is the node serving the PVE UI — the only case testable on the single-node stunt setup. For cross-node embedding the parent origin differs; the fix (validate the parent origin from `document.referrer` against an allowlist pattern instead) is deferred until a cluster test environment exists.
+
 ANAS validates the handed-off cookie on every request exactly as it does today (local RSA-SHA1) — the handoff adds **no new server-side auth paths**.
 
 Node addressing (v1): when the selected tree node is the one serving the PVE UI (`Proxmox.NodeName`), the iframe uses `window.location.hostname` — this preserves IP-based access, where the node name may not resolve from the admin's browser. For other cluster nodes, the node name is used (standard PVE cluster `/etc/hosts`/DNS assumption). Port is 3000; overrides come with `/etc/anas/config.yaml` (story 10.5).
