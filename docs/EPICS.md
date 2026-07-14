@@ -260,6 +260,8 @@ Story numbering is for identification only, not implementation order. Within eac
 
 6.3. As a user, I want to see SMB global configuration (workgroup, server string, etc.), so that I understand the server-level settings.
 
+6.11. [done] As a user, I want a "Details" view that shows how a client connects to a share — copy-pasteable Windows (`\\host\name`), macOS (`smb://…`), and Linux (`mount -t cifs …`) strings keyed off the node's real addresses (read from PVE's network API), plus the access summary and current connections — so I can hand connect instructions to users without looking up syntax. *(The `interfaces` picker in SMB Settings is populated from the same PVE network data — an empty pick list previously made it look broken.)*
+
 #### Act
 6.4. As a user, I want to create an SMB share pointing at a dataset or directory, with options and access controls configured together, so that the share is ready to use in one step.
 
@@ -286,6 +288,8 @@ Story numbering is for identification only, not implementation order. Within eac
 
 #### Observe
 7.1. As a user, I want to see all configured NFS exports (including ones created outside ANAS), so that I have a complete picture of what's exported.
+
+7.8. [done] As a user, I want a "Details" view that shows how a client mounts an export — copy-pasteable `mount -t nfs host:/path …` and `/etc/fstab` lines keyed off the node's real addresses, plus the allowed-client summary — so I can hand mount instructions to users. *(Shares the unified Details window with 6.11.)*
 
 #### Act
 7.2. As a user, I want to create an NFS export for a dataset or directory, so that Unix clients can mount it.
