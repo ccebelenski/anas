@@ -225,3 +225,42 @@ test.describe('Snapshot rollback — confirmation-gated, verified against the re
     }
   })
 })
+
+test.describe('Snapshot nesting — a dataset lists only its OWN snapshots, not children\'s', () => {
+  const PARENT = `${POOL}/nesttest`
+  const CHILD = `${POOL}/nesttest/child`
+  const PARENT_SNAPS = `${V1}/pools/${POOL}/datasets/nesttest/snapshots`
+  const CHILD_SNAPS = `${V1}/pools/${POOL}/datasets/${encodeURIComponent('nesttest/child')}/snapshots`
+
+  test.beforeEach(async () => {
+    await sshExec(`zfs create ${PARENT}`).catch(() => {})
+    await sshExec(`zfs create ${CHILD}`).catch(() => {})
+  })
+  test.afterEach(async () => {
+    await sshExec(`zfs destroy -r ${PARENT}`).catch(() => {})
+  })
+
+  test('a recursive snapshot of the parent does not leak the child snapshot into the parent list', async ({ playwright, pveTicket }) => {
+    // Recursive snapshot → both nesttest@n1 AND nesttest/child@n1 exist.
+    await sshExec(`zfs snapshot -r ${PARENT}@n1`)
+
+    const ctx = await authedContext(playwright, pveTicket)
+    try {
+      const parent = await ctx.get(PARENT_SNAPS)
+      expect(parent.status()).toBe(200)
+      const parentNames = ((await parent.json()).data as Array<{ name: string }>).map(s => s.name)
+      // The parent lists ONLY its own snapshot — never the child's (the -r bug).
+      expect(parentNames).toContain(`${PARENT}@n1`)
+      expect(parentNames.every(n => !n.includes('/child@'))).toBe(true)
+
+      const child = await ctx.get(CHILD_SNAPS)
+      expect(child.status()).toBe(200)
+      const childNames = ((await child.json()).data as Array<{ name: string }>).map(s => s.name)
+      expect(childNames).toContain(`${CHILD}@n1`)
+      expect(childNames.every(n => n.startsWith(`${CHILD}@`))).toBe(true)
+    }
+    finally {
+      await ctx.dispose()
+    }
+  })
+})

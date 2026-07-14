@@ -45,18 +45,22 @@ export function zfsListArgs(pool: string): string[] {
   return ['list', '-j', '-r', '-o', ZFS_LIST_PROPS, '-t', 'filesystem,volume', pool]
 }
 
-/** `zfs list` argument array for a dataset's snapshots (name only). */
+// NOTE: no `-r`. A dataset's snapshot list must be DIRECT-only — `-r` pulls in
+// child datasets' snapshots (e.g. testdata's list would include testdata/dajunk@…),
+// which the tree then wrongly shows under the parent. Each dataset node shows
+// only its own snapshots.
+
+/** `zfs list` argument array for a dataset's own snapshots (name only). */
 export function zfsSnapshotListArgs(dataset: string): string[] {
-  return ['list', '-j', '-r', '-o', 'name', '-t', 'snapshot', dataset]
+  return ['list', '-j', '-o', 'name', '-t', 'snapshot', dataset]
 }
 
 /**
- * `zfs list` argument array for a dataset's snapshots with the columns the
- * Snapshot read model needs (creation/used/referenced). `-r` includes the
- * snapshots of child datasets too.
+ * `zfs list` argument array for a dataset's own snapshots with the columns the
+ * Snapshot read model needs (creation/used/referenced).
  */
 export function zfsSnapshotDetailArgs(dataset: string): string[] {
-  return ['list', '-j', '-r', '-o', 'name,creation,used,referenced', '-t', 'snapshot', dataset]
+  return ['list', '-j', '-o', 'name,creation,used,referenced', '-t', 'snapshot', dataset]
 }
 
 /** Normalise a ZFS mountpoint value to a path or null (volumes / unmounted). */
