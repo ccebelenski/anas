@@ -130,7 +130,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 3.19. [done] As a user, I want per-disk health and a Replace action inline in the pool topology, so I can act on a failing disk in the context where I see it.
 
-3.20. [backlog] As a user, I want the Disk Health view grouped by pool → vdev (with unassigned/available disks in their own group), so that many disks stay scannable instead of a flat horde. *(Cheap — ExtJS grid grouping on a computed key. A graphical disk→vdev→pool connection diagram is a possible later, heavier follow-on.)*
+3.20. [done] As a user, I want the Disk Health view grouped by pool → vdev (with unassigned/available disks in their own group), so that many disks stay scannable instead of a flat horde. *(Cheap — ExtJS grid grouping on a computed key. A graphical disk→vdev→pool connection diagram is a possible later, heavier follow-on.)*
 
 #### Act
 3.21. [backlog] As a user, I want to add **Log (SLOG) / Cache (L2ARC) / hot Spare** vdevs — at pool creation and to an existing pool — so I can tune ZFS performance and resilience (PVE's pool UI offers none of this). *Scope:*
@@ -139,7 +139,9 @@ Story numbering is for identification only, not implementation order. Within eac
 
 3.23. [backlog] As a user, I want a **vdev-centric pool composer** (TrueNAS pool-manager style) for creating and expanding pools — stage vdevs one at a time (pick role: data/log/cache/spare/special + type + disks), see the pool topology build up, add/remove before committing — so I can build a multi-vdev pool in one workflow instead of creating a bare pool then adding vdevs one-by-one. *Key: the API is ALREADY vdev-centric (CreatePoolRequest composes dataVdevs[]/logVdevs[]/cacheDisks[]/spareDisks[]; POST /pools takes the whole topology at once) — this is a UI/UX story. The same composer serves create AND edit/expand (drives POST /pools for new, add-vdev for existing), and is the natural home for redundancy-consistency warnings (don't mix raidz+mirror data vdevs; enforce special/log redundancy per 3.22). Supersedes the "simple create window" and folds in the UI half of 3.21.*
 
-3.22. [backlog] As a user, I want **special** and **dedup** allocation-class vdevs, so metadata and small blocks live on fast devices. *(Deferred behind 3.21 — riskier. SAFETY: a special/dedup vdev holds pool-wide metadata; its loss loses the WHOLE pool, so the UI must ENFORCE redundancy — ideally matching pool redundancy — not merely warn.)*
+3.22. [backlog] As a user, I want **special** and **dedup** allocation-class vdevs, so metadata and small blocks live on fast devices. *(Deferred behind 3.21 — riskier. SAFETY: a special/dedup vdev holds pool-wide metadata; its loss loses the WHOLE pool, so the UI must ENFORCE redundancy — ideally matching pool redundancy — not merely warn. Scope note: also expose `special_small_blocks` (route small data blocks, not just metadata, onto the fast tier). Industry-confirmed: TrueNAS's July 2026 "hybrid storage is hot again" post cites special vdevs requiring mirror redundancy today, with RAIDZ special support arriving — so plan for both mirror and raidz special vdevs.)*
+
+3.24. [backlog — likely its own epic] As a user, I want **policy-based tiering** — scheduled, auditable movement of data between fast and capacity tiers within a single pool (not a black-box heat-map). *(NEW idea, from TrueNAS's July 2026 hybrid-storage post; their TrueNAS 26 feature. Heavier than vdev management — it's live data mobility with checksum preservation, schedules, and policies — so it likely warrants its own epic rather than a pool-management story. The hybrid-vdev work (3.21/3.22) + the composer (3.23) are the prerequisites: you can't tier without the tiers.)*
 
 
 3.7. [done] As a user, I want to import an existing pool (e.g., after moving disks from another system), so that I can access the data.
@@ -173,7 +175,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 4.3. [done] As a user, I want to see dataset properties (compression, record size, mountpoint, etc.), so that I understand current configuration.
 
-4.4. [deferred — Epic 6/7] As a user, I want to see which shares (SMB and NFS) are associated with a dataset, so that I understand how it's being used before making changes.
+4.4. [done] As a user, I want to see which shares (SMB and NFS) are associated with a dataset, so that I understand how it's being used before making changes.
 
 #### Act
 4.5. [done] As a user, I want to create a dataset with configurable properties (compression, quota, reservation, record size), so that I can organize storage by purpose.
@@ -210,7 +212,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 5.6. [done] As a user, I want to destroy a snapshot, so that I can reclaim space.
 
-5.7. [backlog] As a user, I want to clone a snapshot into a writable dataset (`zfs clone`), so I can branch off a point-in-time copy. *(Small once snapshots exist.)*
+5.7. [done] As a user, I want to clone a snapshot into a writable dataset (`zfs clone`), so I can branch off a point-in-time copy. *(Small once snapshots exist.)*
 
 5.8. [backlog] As a user, I want stronger visual separation between a dataset's snapshots and its child datasets in the tree, so nesting is unambiguous. *(MVP lists snapshots before child datasets; a divider/section header or grouping would be clearer.)*
 
@@ -220,13 +222,13 @@ Story numbering is for identification only, not implementation order. Within eac
 
 > Beyond the core properties already in Epic 4. Brainstormed July 2026.
 
-4.9. [backlog] As a user, I want to see each dataset's achieved compression ratio (`compressratio`) and pick a modern compressor (lz4/zstd), so compression gives visible feedback. *(Cheap — fold into 4.3/4.5.)*
+4.9. [done] As a user, I want to see each dataset's achieved compression ratio (`compressratio`) and pick a modern compressor (lz4/zstd), so compression gives visible feedback. *(Cheap — fold into 4.3/4.5.)*
 
-4.10. [backlog] As a user, I want to toggle deduplication on a dataset, behind an ADVANCED, heavily-warned control that shows the dedup table's RAM cost. *(Plumbing is trivial (`zfs set dedup=`); the responsibility is the guardrails — ~1–5 GB RAM/TB, sticky on existing data. OpenZFS 2.3 fast-dedup softens it.)*
+4.10. [done] As a user, I want to toggle deduplication on a dataset, behind an ADVANCED, heavily-warned control that shows the dedup table's RAM cost. *(Plumbing is trivial (`zfs set dedup=`); the responsibility is the guardrails — ~1–5 GB RAM/TB, sticky on existing data. OpenZFS 2.3 fast-dedup softens it.)*
 
 4.11. [backlog] As a user, I want native at-rest encryption on datasets (aes-256-gcm), so data is protected on disk. *(Set at creation. The work is KEY MANAGEMENT: passphrase vs keyfile, load/unload, change-key — not the property itself. Possibly its own epic.)*
 
-4.12. [backlog] As a user, I want small tuning/maintenance actions: manual `zpool trim`, `sync`/atime toggles (with a data-loss warning on sync=disabled), and pool feature-flag `upgrade`. *(Completeness; each tiny.)*
+4.12. [done, scoped] As a user, I want small tuning/maintenance actions: manual `zpool trim`, `sync`/atime toggles (with a data-loss warning on sync=disabled), and pool feature-flag `upgrade`. *(Completeness; each tiny.)*
 
 ---
 
