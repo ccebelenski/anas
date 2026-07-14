@@ -934,7 +934,11 @@
                     interfaces: form.findField('interfaces').getValue() || [],
                     bindInterfacesOnly: !!form.findField('bindInterfacesOnly').getValue(),
                 };
-                ANAS.runJob({
+                // Changing the interface binding while clients are connected is
+                // confirmation-gated by the daemon (409 + warnings); cosmetic
+                // edits apply straight through. confirmAndRun surfaces the
+                // warnings and resends with the confirm code on approval.
+                ANAS.confirmAndRun({
                     node: node,
                     method: 'put',
                     path: '/shares/smb/global',
@@ -942,6 +946,8 @@
                     view: win,
                     failTitle: 'Update failed',
                     successMsg: t('SMB settings updated'),
+                    confirmTitle: 'Disconnect clients?',
+                    confirmIntro: t('This SMB interface change reloads smbd and may disconnect active clients:'),
                     onComplete: function () {
                         win.close();
                     },

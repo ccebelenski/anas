@@ -139,6 +139,58 @@ describe('SMB share routes', () => {
       })
       assert.equal(res.statusCode, 401)
     })
+
+    it('409 CONFIRMATION_REQUIRED when the interface binding changes with live connections', async () => {
+      const s = startServer()
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/global',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        // current interfaces = "lo eth0"; this drops eth0 → a real binding change.
+        payload: JSON.stringify({ interfaces: ['lo'] }),
+      })
+      assert.equal(res.statusCode, 409)
+      assert.equal((res.json() as { error: { code: string } }).error.code, 'CONFIRMATION_REQUIRED')
+      assert.ok(res.headers['x-anas-confirm-code'])
+      const warnings = (res.json() as { error: { warnings: string[] } }).error.warnings
+      assert.ok(warnings.some(w => w.includes('active SMB connection')))
+      // The file was NOT touched — the change is still pending confirmation.
+      assert.ok(readFileSync(confPath!, 'utf8').includes('\tinterfaces = lo eth0'))
+    })
+
+    it('applies the interface change once confirmed', async () => {
+      const s = startServer()
+      const first = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/global',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ interfaces: ['lo'] }),
+      })
+      assert.equal(first.statusCode, 409)
+      const code = first.headers['x-anas-confirm-code'] as string
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/global',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json', 'x-anas-confirm': code },
+        payload: JSON.stringify({ interfaces: ['lo'] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.ok(readFileSync(confPath!, 'utf8').includes('\tinterfaces = lo'))
+    })
+
+    it('does NOT gate a reorder-only interfaces change (functionally a no-op)', async () => {
+      const s = startServer()
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/global',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        // same set as current ("lo eth0"), just reordered → not a binding change.
+        payload: JSON.stringify({ interfaces: ['eth0', 'lo'] }),
+      })
+      assert.equal(res.statusCode, 202)
+    })
   })
 
   // --- GET detail --------------------------------------------------------

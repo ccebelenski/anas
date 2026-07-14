@@ -269,6 +269,8 @@ Story numbering is for identification only, not implementation order. Within eac
 
 6.6. As a user, I want to modify SMB global configuration, so that I can change server-level settings like workgroup name.
 
+6.6.1. [done] As a user, I want changing the SMB interface binding (`interfaces` / `bind interfaces only`) to be confirmation-gated when clients are connected — warning me how many and which clients may be dropped when smbd rebinds — while cosmetic edits (workgroup, server string) apply without a prompt, so I don't silently cut off active users. *(Only the binding change is disruptive: we `reload` smbd, not restart, so per-connection smbd processes survive a cosmetic reload. Signature is the `global` section only — the changed values are never bound into the confirm code.)*
+
 6.7. As a user, I want to remove an SMB share from the configuration, so that I can revoke access to a path.
 
 6.8. As a user, I want ANAS to reload the SMB service after configuration changes, so that changes take effect without manual intervention.

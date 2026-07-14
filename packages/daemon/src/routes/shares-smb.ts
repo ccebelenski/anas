@@ -32,12 +32,12 @@ export async function smbShareRoutes(
     return readConfig(smbConfPath)
   }
 
-  /** Live connections for a given share, from smbstatus (JSON preferred). */
-  async function connectionsFor(shareName: string): Promise<SmbConnection[]> {
+  /** Live connections keyed by share (service), from smbstatus (JSON first). */
+  async function connectionsByShare(): Promise<Record<string, SmbConnection[]>> {
     const json = await executor.exec(SMBSTATUS, ['--json'])
     if (json.exitCode === 0 && json.stdout.trim().startsWith('{')) {
       try {
-        return parseSmbStatusJson(json.stdout)[shareName] ?? []
+        return parseSmbStatusJson(json.stdout)
       }
       catch {
         // Fall through to the text parser below.
@@ -45,8 +45,19 @@ export async function smbShareRoutes(
     }
     const text = await executor.exec(SMBSTATUS, ['-S'])
     if (text.exitCode === 0 && text.stdout.trim())
-      return parseSmbStatusText(text.stdout)[shareName] ?? []
-    return []
+      return parseSmbStatusText(text.stdout)
+    return {}
+  }
+
+  /** Live connections for a given share, from smbstatus (JSON preferred). */
+  async function connectionsFor(shareName: string): Promise<SmbConnection[]> {
+    return (await connectionsByShare())[shareName] ?? []
+  }
+
+  /** Every live connection across all shares (for global-change impact). */
+  async function allConnections(): Promise<SmbConnection[]> {
+    const byShare = await connectionsByShare()
+    return Object.values(byShare).flat()
   }
 
   /** Reload smbd so the config change takes effect (side effect of the job). */
@@ -54,6 +65,14 @@ export async function smbShareRoutes(
     const r = await executor.exec(SYSTEMCTL, ['reload', 'smbd'])
     if (r.exitCode !== 0)
       throw new Error(r.stderr.trim() || `systemctl reload smbd exited with code ${r.exitCode}`)
+  }
+
+  /** Order-insensitive equality for the interface list (a reorder is a no-op). */
+  function sameStringList(a: string[], b: string[]): boolean {
+    if (a.length !== b.length)
+      return false
+    const setB = new Set(b)
+    return a.every(v => setB.has(v))
   }
 
   /** Map a ConfigConflictError raised in a job into a clear job error. */
@@ -88,6 +107,40 @@ export async function smbShareRoutes(
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
+
+    // Guard only the disruptive change: retargeting which interfaces/addresses
+    // smbd binds to can cut off clients when smbd rebinds on reload. Cosmetic
+    // edits (workgroup, server string) reload without dropping sessions, so they
+    // stay unguarded. Gate only when the binding actually changes AND there are
+    // live connections that could be dropped.
+    const current = parseSmbConf(await readSmbConf()).global
+    const interfacesChanged = req.interfaces !== undefined
+      && !sameStringList(req.interfaces, current.interfaces)
+    const bindChanged = req.bindInterfacesOnly !== undefined
+      && req.bindInterfacesOnly !== current.bindInterfacesOnly
+
+    if (interfacesChanged || bindChanged) {
+      const conns = await allConnections()
+      if (conns.length > 0) {
+        const warnings = [
+          `${conns.length} active SMB connection(s) may be dropped when smbd rebinds to the new interface list.`,
+        ]
+        const machines = [...new Set(conns.map(c => c.machine).filter(Boolean))]
+        if (machines.length > 0)
+          warnings.push(`Connected clients: ${machines.join(', ')}.`)
+
+        // Signature is the resource identity only (section: 'global') — never
+        // the changed values, so the confirm code stays valid on resend.
+        if (!confirmGate(confirmStore, request, reply, {
+          operation: 'smb.config.set',
+          params: { section: 'global' },
+          message: `Changing the SMB interface binding reloads smbd and may disconnect active clients`,
+          warnings,
+        })) {
+          return reply
+        }
+      }
+    }
 
     const job = jobQueue.submit(
       'smb.config.set',
