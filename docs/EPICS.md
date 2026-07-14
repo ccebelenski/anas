@@ -334,6 +334,8 @@ Story numbering is for identification only, not implementation order. Within eac
 
 8.6. [done] As a user, I want to disable a user's access without deleting them, so that I can temporarily revoke access.
 
+> **User delete: deliberately OUT (decided 2026-07-14).** Deleting an identity that owns files orphans ownership + ACL entries and risks UID recycling (a new user reusing the freed uid inherits the old grants). Disable is the correct primitive — access is revoked but ownership stays attributable, no orphans, no recycling. Revisit only by request, and then as a scan-impact → confirm → reassign-or-orphan flow. Related and shipped regardless: the permissions editor (4.7.2) now flags an ACL/owner whose uid/gid no longer resolves (deleted outside ANAS, or a departed directory identity) as "unknown (uid N)" so it can be recognised and removed — `AccessEntry.unresolved`.
+
 ---
 
 ## Epic 9: Job & Operation Management

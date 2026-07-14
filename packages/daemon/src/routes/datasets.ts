@@ -104,12 +104,23 @@ function baseLevelsFromMode(mode: string): BaseLevels {
   }
 }
 
+const NUMERIC_ID_RE = /^\d+$/
+/** A bare-numeric principal token means the uid/gid did not resolve to a name. */
+function isNumericId(name: string): boolean {
+  return NUMERIC_ID_RE.test(name)
+}
+
+/** Tag an entry as an orphan (unresolved uid/gid) when `orphan` is true. */
+function orphanFlag(entry: AccessEntry, orphan: boolean): AccessEntry {
+  return orphan ? { ...entry, unresolved: true } : entry
+}
+
 /** The base-three AccessEntry list derived from mode bits (mode-only datasets). */
-function baseEntriesFromMode(mode: string): AccessEntry[] {
+function baseEntriesFromMode(mode: string, ownerOrphan = false, groupOrphan = false): AccessEntry[] {
   const levels = baseLevelsFromMode(mode)
   return [
-    { kind: 'owner', level: levels.owner },
-    { kind: 'owning-group', level: levels['owning-group'] },
+    orphanFlag({ kind: 'owner', level: levels.owner }, ownerOrphan),
+    orphanFlag({ kind: 'owning-group', level: levels['owning-group'] }, groupOrphan),
     { kind: 'everyone', level: levels.everyone },
   ]
 }
@@ -629,22 +640,29 @@ export async function datasetRoutes(
     let entries: AccessEntry[]
     let aclText: string | null = null
 
+    // A principal whose uid/gid no longer resolves shows as a bare number
+    // (getfacl/stat print the numeric id) — an orphan from a delete outside
+    // ANAS. Flag it so the UI can render "unknown (uid N)".
+    const ownerOrphan = isNumericId(perm.owner)
+    const groupOrphan = isNumericId(perm.group)
+
     if (enabled && supported) {
       // ACLs are live: read the full ACL and map it to entries.
       const r = await executor.exec(GETFACL, ['-pcE', mountpoint])
       if (r.exitCode === 0 && r.stdout.trim()) {
         const acl = parseGetfacl(r.stdout)
         entries = [
-          { kind: 'owner', level: permsToLevel(acl.owner) },
-          { kind: 'owning-group', level: permsToLevel(acl.owningGroup) },
+          orphanFlag({ kind: 'owner', level: permsToLevel(acl.owner) }, ownerOrphan),
+          orphanFlag({ kind: 'owning-group', level: permsToLevel(acl.owningGroup) }, groupOrphan),
           { kind: 'everyone', level: permsToLevel(acl.everyone) },
           // Named entries; mask + default entries are managed, not shown.
-          ...acl.named.map((n): AccessEntry => ({ kind: n.type, name: n.name, level: permsToLevel(n.perms) })),
+          ...acl.named.map((n): AccessEntry =>
+            orphanFlag({ kind: n.type, name: n.name, level: permsToLevel(n.perms) }, isNumericId(n.name))),
         ]
       }
       else {
         // ACLs enabled but unreadable — fall back to the mode bits.
-        entries = baseEntriesFromMode(perm.mode)
+        entries = baseEntriesFromMode(perm.mode, ownerOrphan, groupOrphan)
       }
       // Raw ACL text (with header, no effective comments) for the Advanced panel.
       const raw = await executor.exec(GETFACL, ['-pE', mountpoint])
@@ -652,7 +670,7 @@ export async function datasetRoutes(
     }
     else {
       // No ACLs: the base three come straight from the mode bits.
-      entries = baseEntriesFromMode(perm.mode)
+      entries = baseEntriesFromMode(perm.mode, ownerOrphan, groupOrphan)
     }
 
     const data: DatasetAccess = {

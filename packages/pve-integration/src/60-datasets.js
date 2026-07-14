@@ -1158,6 +1158,46 @@
         return 'none';
     }
 
+    // Is the base owner/owning-group entry an orphan (uid/gid didn't resolve)?
+    function baseEntryUnresolved(entries, kind) {
+        var list = entries || [];
+        for (var i = 0; i < list.length; i++) {
+            if (list[i] && list[i].kind === kind) {
+                return !!list[i].unresolved;
+            }
+        }
+        return false;
+    }
+
+    // Display label for a named/base principal, flagging orphans clearly so a
+    // bare numeric id reads as "unknown (uid N)" rather than a real name.
+    function principalLabel(name, unresolved) {
+        var n = '' + (name == null ? '' : name);
+        if (unresolved) {
+            return t('unknown') + ' (uid ' + enc(n) + ')';
+        }
+        return enc(n);
+    }
+
+    // Tag an owner/group picker field as showing an orphaned id (tooltip + note).
+    function markOrphanPicker(field, unresolved) {
+        if (!field) { return; }
+        try {
+            if (unresolved) {
+                field.addCls('anas-fld-orphan');
+                field.setFieldStyle('color:#b35900;');
+                if (field.setTooltip) {
+                    field.setTooltip(t('This uid no longer resolves to a user — the account was removed outside ANAS.'));
+                }
+            } else {
+                field.removeCls('anas-fld-orphan');
+                field.setFieldStyle('');
+            }
+        } catch (e) {
+            // non-fatal — display hint only
+        }
+    }
+
     function identityStore() {
         return Ext.create('Ext.data.Store', {
             fields: ['name'],
@@ -1336,7 +1376,7 @@
         var userStore = identityStore();
         var groupStore = identityStore();
         var namedStore = Ext.create('Ext.data.Store', {
-            fields: ['kind', 'name', 'level'],
+            fields: ['kind', 'name', 'level', 'unresolved'],
             data: [],
         });
 
@@ -1482,7 +1522,18 @@
                                 text: t('Name'),
                                 dataIndex: 'name',
                                 flex: 1,
-                                renderer: Ext.String.htmlEncode,
+                                renderer: function (v, meta, rec) {
+                                    var orphan = rec && rec.get('unresolved');
+                                    if (orphan) {
+                                        meta.tdCls = 'anas-cell-orphan';
+                                        meta.tdAttr = 'data-qtip="'
+                                            + enc(t('This id no longer resolves to a user/group — removed outside ANAS. Remove this entry to clean it up.'))
+                                            + '"';
+                                        return '<span style="color:#b35900;">'
+                                            + principalLabel(v, true) + '</span>';
+                                    }
+                                    return principalLabel(v, false);
+                                },
                             },
                             {
                                 text: t('Access'),
@@ -1678,10 +1729,15 @@
         for (var i = 0; i < entries.length; i++) {
             var e = entries[i];
             if (e && (e.kind === 'user' || e.kind === 'group')) {
-                named.push({ kind: e.kind, name: e.name || '', level: e.level || 'none' });
+                named.push({ kind: e.kind, name: e.name || '', level: e.level || 'none', unresolved: !!e.unresolved });
             }
         }
         namedStore.loadData(named);
+
+        // Surface an orphaned owner/group (uid/gid deleted outside ANAS) next to
+        // the pickers so a bare number isn't mistaken for a real account.
+        markOrphanPicker(win.down('#owner'), baseEntryUnresolved(entries, 'owner'));
+        markOrphanPicker(win.down('#group'), baseEntryUnresolved(entries, 'owning-group'));
 
         // Advanced: raw getfacl text (view-only).
         var aclTextCmp = win.down('#aclText');

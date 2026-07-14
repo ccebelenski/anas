@@ -24,6 +24,13 @@ export const AccessEntry = z.object({
   /** System user/group name — required iff kind is 'user' or 'group' */
   name: z.string().optional(),
   level: AccessLevel,
+  /**
+   * Read-only marker (set by the daemon): the principal's uid/gid no longer
+   * resolves to a name — an orphan from a user/group deleted outside ANAS (or a
+   * departed directory identity). `name` is then the bare numeric id. The UI
+   * surfaces it as "unknown (uid N)" so it can be recognised and removed.
+   */
+  unresolved: z.boolean().optional(),
 })
   .refine(
     e => (e.kind === 'user' || e.kind === 'group') ? !!e.name : e.name === undefined,

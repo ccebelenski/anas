@@ -93,6 +93,25 @@ describe('access routes', () => {
       assert.equal(byKind('user', 'alice')?.level, 'read-write') // user:alice:rwx
     })
 
+    it('flags a named entry whose uid no longer resolves as unresolved', async () => {
+      server = createServer({ mock: true, logger: false })
+      // A user deleted outside ANAS leaves a bare-numeric ACL entry.
+      installExecutor(server, [
+        { command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') },
+        { command: '/usr/bin/getfacl', args: ['-pcE', MP], result: ok(
+          'user::rwx\nuser:1002:r-x\ngroup::r-x\nmask::rwx\nother::---\n',
+        ) },
+      ])
+
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/media/access', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: DatasetAccess }
+      const orphan = data.entries.find((e: AccessEntry) => e.kind === 'user' && e.name === '1002')
+      assert.ok(orphan, 'numeric named entry present')
+      assert.equal(orphan?.unresolved, true)
+      assert.equal(orphan?.level, 'read')
+    })
+
     it('derives base three from mode bits when ACLs are disabled', async () => {
       server = createServer({ mock: true, logger: false })
       // acltype fixture is 'off' → mode-only path; stat fixture is 755.
