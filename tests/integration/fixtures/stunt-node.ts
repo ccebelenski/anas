@@ -86,6 +86,58 @@ export async function statOwnership(path: string): Promise<string> {
 }
 
 /**
+ * Create a ZFS snapshot directly on the real system (source of truth staging for
+ * the snapshot specs — never for the create story itself, which goes through the
+ * API). `dataset` is fully-qualified (e.g. 'testpool/share1'), `snap` the bare
+ * snapshot name (e.g. 's1'). `-r` recurses into children when requested.
+ */
+export async function createSnapshot(dataset: string, snap: string, recursive = false): Promise<void> {
+  await sshExec(`zfs snapshot ${recursive ? '-r ' : ''}${dataset}@${snap}`)
+}
+
+/**
+ * Best-effort teardown of a single snapshot, leaving the box clean for reruns.
+ * Never throws — the snapshot may already be gone. `-r` also removes the same
+ * snapshot on any child datasets (mirrors a recursive create).
+ */
+export async function destroySnapshot(dataset: string, snap: string): Promise<void> {
+  await sshExec(`zfs destroy -r ${dataset}@${snap}`).catch(() => {})
+}
+
+/**
+ * List the bare snapshot names for a dataset on the real system, e.g. ['s1',
+ * 's2']. Uses `-H -o name -t snapshot -d 1` for a bare, scriptable list scoped to
+ * the dataset itself (not children). Returns [] when the dataset has none.
+ */
+export async function listSnapshots(dataset: string): Promise<string[]> {
+  try {
+    const out = await sshExec(`zfs list -H -o name -t snapshot -d 1 ${dataset}`)
+    return out
+      .split('\n')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(fq => fq.split('@')[1])
+      .filter(Boolean)
+  }
+  catch {
+    return []
+  }
+}
+
+/**
+ * Check if a specific snapshot (`dataset@snap`) exists on the real system.
+ */
+export async function snapshotExists(dataset: string, snap: string): Promise<boolean> {
+  try {
+    await sshExec(`zfs list -t snapshot ${dataset}@${snap}`)
+    return true
+  }
+  catch {
+    return false
+  }
+}
+
+/**
  * Check if an SMB share exists in smb.conf.
  */
 export async function smbShareExists(share: string): Promise<boolean> {
