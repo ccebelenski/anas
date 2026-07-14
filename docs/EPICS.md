@@ -234,9 +234,9 @@ Story numbering is for identification only, not implementation order. Within eac
 
 > The highest-value missing ZFS capability — snapshots are useless off-box without it. Likely warrants promotion to a full epic (cf. TrueNAS "Replication Tasks"). Brainstormed July 2026.
 
-5.8. [backlog] As a user, I want to replicate a snapshot to another local pool (`zfs send | zfs recv`), so I have a backup on separate disks. *(Local target; incremental via `send -i`.)*
+5.5.1. [backlog] As a user, I want to replicate a snapshot to another local pool (`zfs send | zfs recv`), so I have a backup on separate disks. *(Local target; incremental via `send -i`.)*
 
-5.9. [backlog] As a user, I want to replicate to a remote host (`zfs send | ssh | zfs recv`), so I have off-site backups / migration. *(The meat: remote target + auth, incremental streams, resume tokens.)*
+5.5.2. [backlog] As a user, I want to replicate to a remote host (`zfs send | ssh | zfs recv`), so I have off-site backups / migration. *(The meat: remote target + auth, incremental streams, resume tokens.)*
 
 > **Scheduling (affects 5.x replication, snapshot retention, scrub schedules): LEVERAGE existing tools, never build a scheduler.** A scheduler is undifferentiated code (user's rule) and violates Principle 7. ANAS surgically configures `sanoid`/`zfs-auto-snapshot`/systemd-timers/`pve-zsync` and presents a UI over them — it does not run its own scheduler.
 
