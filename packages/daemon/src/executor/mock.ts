@@ -1,4 +1,4 @@
-import type { CommandExecutor, ExecResult } from './types.js'
+import type { CommandExecutor, ExecOptions, ExecResult } from './types.js'
 
 /** A canned response for a specific command + args pattern. */
 export interface MockFixture {
@@ -30,7 +30,9 @@ export class MockExecutor implements CommandExecutor {
     this.fixtures = []
   }
 
-  async exec(command: string, args: string[]): Promise<ExecResult> {
+  async exec(command: string, args: string[], _opts?: ExecOptions): Promise<ExecResult> {
+    // stdin (_opts.stdin) is accepted for interface parity but ignored — mock
+    // matching is by command + args only, and secrets must never be matched on.
     // Try exact match (command + args) first, then command-only match
     const exactMatch = this.fixtures.find(
       f =>

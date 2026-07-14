@@ -1,4 +1,4 @@
-import type { CommandExecutor, ExecResult } from './types.js'
+import type { CommandExecutor, ExecOptions, ExecResult } from './types.js'
 import { execFile } from 'node:child_process'
 
 /**
@@ -8,9 +8,9 @@ import { execFile } from 'node:child_process'
  * and command injection. Arguments are passed as an array.
  */
 export class ProdExecutor implements CommandExecutor {
-  exec(command: string, args: string[]): Promise<ExecResult> {
+  exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve, reject) => {
-      execFile(
+      const child = execFile(
         command,
         args,
         { maxBuffer: 10 * 1024 * 1024 },
@@ -31,6 +31,16 @@ export class ProdExecutor implements CommandExecutor {
           })
         },
       )
+
+      // Feed stdin for secrets (e.g. smbpasswd -s reads the password here, so
+      // it never lands in argv / the process list), then close the stream.
+      if (opts?.stdin !== undefined && child.stdin) {
+        child.stdin.on('error', () => {
+          // Ignore EPIPE if the child exits before consuming stdin — the
+          // execFile callback above already reports the real outcome.
+        })
+        child.stdin.end(opts.stdin)
+      }
     })
   }
 }
