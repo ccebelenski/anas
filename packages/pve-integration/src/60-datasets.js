@@ -1170,24 +1170,29 @@
     }
 
     // Display label for a named/base principal, flagging orphans clearly so a
-    // bare numeric id reads as "unknown (uid N)" rather than a real name.
-    function principalLabel(name, unresolved) {
+    // bare numeric id reads as "unknown (uid N)" / "unknown (gid N)" rather than
+    // a real name. `isGroup` picks the right id kind (a group's number is a gid).
+    function principalLabel(name, unresolved, isGroup) {
         var n = '' + (name == null ? '' : name);
         if (unresolved) {
-            return t('unknown') + ' (uid ' + enc(n) + ')';
+            var idKind = isGroup ? 'gid' : 'uid';
+            return t('unknown') + ' (' + idKind + ' ' + enc(n) + ')';
         }
         return enc(n);
     }
 
     // Tag an owner/group picker field as showing an orphaned id (tooltip + note).
-    function markOrphanPicker(field, unresolved) {
+    // `isGroup` picks user/uid vs group/gid wording.
+    function markOrphanPicker(field, unresolved, isGroup) {
         if (!field) { return; }
         try {
             if (unresolved) {
                 field.addCls('anas-fld-orphan');
                 field.setFieldStyle('color:#b35900;');
                 if (field.setTooltip) {
-                    field.setTooltip(t('This uid no longer resolves to a user — the account was removed outside ANAS.'));
+                    field.setTooltip(isGroup
+                        ? t('This gid no longer resolves to a group — it was removed outside ANAS.')
+                        : t('This uid no longer resolves to a user — the account was removed outside ANAS.'));
                 }
             } else {
                 field.removeCls('anas-fld-orphan');
@@ -1523,6 +1528,7 @@
                                 dataIndex: 'name',
                                 flex: 1,
                                 renderer: function (v, meta, rec) {
+                                    var isGroup = rec && rec.get('kind') === 'group';
                                     var orphan = rec && rec.get('unresolved');
                                     if (orphan) {
                                         meta.tdCls = 'anas-cell-orphan';
@@ -1530,9 +1536,9 @@
                                             + enc(t('This id no longer resolves to a user/group — removed outside ANAS. Remove this entry to clean it up.'))
                                             + '"';
                                         return '<span style="color:#b35900;">'
-                                            + principalLabel(v, true) + '</span>';
+                                            + principalLabel(v, true, isGroup) + '</span>';
                                     }
-                                    return principalLabel(v, false);
+                                    return principalLabel(v, false, isGroup);
                                 },
                             },
                             {
@@ -1736,8 +1742,8 @@
 
         // Surface an orphaned owner/group (uid/gid deleted outside ANAS) next to
         // the pickers so a bare number isn't mistaken for a real account.
-        markOrphanPicker(win.down('#owner'), baseEntryUnresolved(entries, 'owner'));
-        markOrphanPicker(win.down('#group'), baseEntryUnresolved(entries, 'owning-group'));
+        markOrphanPicker(win.down('#owner'), baseEntryUnresolved(entries, 'owner'), false);
+        markOrphanPicker(win.down('#group'), baseEntryUnresolved(entries, 'owning-group'), true);
 
         // Advanced: raw getfacl text (view-only).
         var aclTextCmp = win.down('#aclText');
