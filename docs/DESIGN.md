@@ -829,6 +829,15 @@ Binding is **server-wide, not per-share** — one `smbd`/`nfsd` listens for all 
 
 Schema impact: **SmbGlobalConfig** carries `interfaces` + `bindInterfacesOnly` (MVP — multi-NIC is common); **SmbShare** carries `hostsAllow`/`hostsDeny`; **NfsExport** carries client specs (host/subnet + options).
 
+### 5d. Shares UX (decided July 2026 — usability-first)
+
+- **Unified "Shares" view** — one menu item, one grid listing every share across both protocols (Protocol column). A path shared via SMB+NFS shows as two clearly-labeled rows. Toolbar: +SMB Share, +NFS Export, SMB Settings.
+- **Contextual create** — a "Share…" action on *filesystem* datasets (Datasets view) opens the create dialog pre-filled: path = mountpoint, SMB name suggested from the dataset's last path segment, overridable (the snapshot-name-default pattern).
+- **Near-zero-typing defaults** — browseable=yes, read-only=no, guest=no; SMB access via a getent-backed user/group picker (not free-text); NFS client spec via a subnet field.
+- **Active connections** column from `smbstatus` — live per-share connections (a differentiator PVE lacks).
+- **Preview-diff on confirm** — show the exact smb.conf/exports change before applying.
+- **SMB Settings** action for the global config (interface binding / multi-NIC lever, workgroup, server string) — a clear surface, not buried.
+
 This is more complex to implement but essential to the Proxmox philosophy — the system was here before ANAS and will be here after.
 
 ### 6. Session Management: Proxmox owns the session (no ANAS session at all)
