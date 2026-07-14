@@ -86,6 +86,64 @@ export async function statOwnership(path: string): Promise<string> {
 }
 
 /**
+ * Return just the octal mode of a path (`stat -c '%a'`), e.g. `755` or `2755`.
+ * The layered permissions editor (4.7.2) maps base levels to mode bits, so this
+ * is the source-of-truth check for a base-only change.
+ */
+export async function getMode(path: string): Promise<string> {
+  return (await sshExec(`stat -c '%a' ${path}`)).trim()
+}
+
+/**
+ * Raw `getfacl -pcE` for a path — the POSIX ACL as the daemon reads it (no
+ * header, no #effective comments). Best-effort; returns '' when unreadable so
+ * callers can grep it without try/catch.
+ */
+export async function getfaclText(path: string): Promise<string> {
+  try {
+    return await sshExec(`getfacl -pcE ${path} 2>/dev/null`)
+  }
+  catch {
+    return ''
+  }
+}
+
+/**
+ * Whether the access ACL of `path` carries a NAMED user entry for `user`
+ * (`user:<name>:<perms>`). Skips the base `user::` owner line (empty qualifier)
+ * and the inherited `default:user:<name>:` lines — only the live access-ACL
+ * named grant counts. Source of truth behind the named-principal grid.
+ */
+export async function aclHasNamedUser(path: string, user: string): Promise<boolean> {
+  const text = await getfaclText(path)
+  return text.split('\n').some(l => l.trim().startsWith(`user:${user}:`))
+}
+
+/**
+ * Reset a throwaway dataset's mountpoint to a pristine baseline for a rerun /
+ * teardown: strip every ACL entry (`-b`) and the default ACL (`-k`) WHILE the
+ * dataset is still posixacl, restore the default 755 mode, then revert acltype
+ * to its inherited value (off). Order matters — setfacl needs posixacl in force,
+ * so the `zfs inherit` comes last. Never throws.
+ */
+export async function resetDatasetAccess(dataset: string, path: string): Promise<void> {
+  await sshExec(
+    `setfacl -b -k ${path} 2>/dev/null; chmod 755 ${path} 2>/dev/null; `
+    + `zfs inherit acltype ${dataset} 2>/dev/null; true`,
+  ).catch(() => {})
+}
+
+/**
+ * Create a throwaway share user on the real system (`useradd -M`, no home, a
+ * nologin shell — it exists only to be an ACL principal). Not best-effort: the
+ * caller pre-cleans with removeShareUser so this lands a fresh account whose
+ * uid falls in the regular-user band and thus surfaces in /identity/users.
+ */
+export async function createShareUser(name: string): Promise<void> {
+  await sshExec(`useradd -M -s /usr/sbin/nologin ${name}`)
+}
+
+/**
  * Create a ZFS snapshot directly on the real system (source of truth staging for
  * the snapshot specs — never for the create story itself, which goes through the
  * API). `dataset` is fully-qualified (e.g. 'testpool/share1'), `snap` the bare
