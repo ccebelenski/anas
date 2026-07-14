@@ -1,14 +1,17 @@
-import type { AccessEntry, CreateDatasetRequest, Dataset, DatasetAccess, DatasetDetail, MountpointPermissions, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
+import type { AccessEntry, AssociatedShare, CreateDatasetRequest, Dataset, DatasetAccess, DatasetDetail, MountpointPermissions, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedAcl } from '../parsers/getfacl.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import { CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, PoolName, RenameSnapshotRequest, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
+import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, PoolName, RenameSnapshotRequest, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
+import { parseExports } from '../parsers/exports.js'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
+import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { confirmGate } from '../safety/gate.js'
+import { readConfig } from '../services/config-writer.js'
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
@@ -194,6 +197,8 @@ interface SnapshotTail {
   datasetPath: string
   snap?: string
   rollback: boolean
+  /** `<snap>/clone` — clone the snapshot into a new dataset (Epic 5.7). */
+  clone: boolean
   /** Trailing segments we don't understand (→ 404). */
   extra: boolean
 }
@@ -208,8 +213,9 @@ function parseSnapshotTail(wildcard: string): SnapshotTail | null {
   const rest = parts.slice(idx + 1)
   const snap = rest[0]
   const rollback = rest.length === 2 && rest[1] === 'rollback'
-  const known = rest.length === 0 || rest.length === 1 || rollback
-  return { datasetPath, snap, rollback, extra: !known }
+  const clone = rest.length === 2 && rest[1] === 'clone'
+  const known = rest.length === 0 || rest.length === 1 || rollback || clone
+  return { datasetPath, snap, rollback, clone, extra: !known }
 }
 
 export async function datasetRoutes(
@@ -261,6 +267,32 @@ export async function datasetRoutes(
     if (r.exitCode !== 0 || !r.stdout.trim())
       return []
     return parseSnapshotList(r.stdout)
+  }
+
+  /**
+   * SMB/NFS shares serving a dataset's mountpoint (Epic 4.4). Matches share
+   * paths in smb.conf and /etc/exports against the exact mountpoint (a share ON
+   * this dataset — nested paths are out of scope for MVP). Reuses the read-only
+   * share parsers so admin-made shares surface too (Principle 11). A missing
+   * config path or file simply contributes no shares for that protocol.
+   */
+  async function associatedShares(mountpoint: string): Promise<AssociatedShare[]> {
+    const shares: AssociatedShare[] = []
+    if (opts.smbConfPath) {
+      const text = await readConfig(opts.smbConfPath)
+      for (const share of parseSmbConf(text).shares) {
+        if (share.path === mountpoint)
+          shares.push({ protocol: 'smb', name: share.name })
+      }
+    }
+    if (opts.exportsPath) {
+      const text = await readConfig(opts.exportsPath)
+      for (const exp of parseExports(text)) {
+        if (exp.path === mountpoint)
+          shares.push({ protocol: 'nfs', name: exp.path })
+      }
+    }
+    return shares
   }
 
   /**
@@ -414,12 +446,17 @@ export async function datasetRoutes(
       ? await statMountpoint(parsed.base.mountpoint)
       : null
 
+    // Shares serving this dataset's mountpoint (filesystems with a mountpoint
+    // only; volumes and unmounted datasets have no path to share) — Epic 4.4.
+    const associated = parsed.base.type === 'filesystem' && parsed.base.mountpoint
+      ? await associatedShares(parsed.base.mountpoint)
+      : []
+
     const detail: DatasetDetail = {
       ...parsed.base,
       properties: parsed.properties,
       permissions,
-      // Populated once SMB/NFS shares exist (Epics 6/7).
-      associatedShares: [],
+      associatedShares: associated,
     }
 
     return { data: detail }
@@ -488,13 +525,16 @@ export async function datasetRoutes(
     const wildcard = request.params['*']
 
     const tail = parseSnapshotTail(wildcard)
-    if (!tail || tail.extra || (tail.snap && !tail.rollback)) {
+    if (!tail || tail.extra || (tail.snap && !tail.rollback && !tail.clone)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Unknown resource '${wildcard}'` } }
     }
 
     if (tail.rollback && tail.snap)
       return rollbackSnapshot(poolName, tail.datasetPath, tail.snap, request, reply)
+
+    if (tail.clone && tail.snap)
+      return cloneSnapshot(poolName, tail.datasetPath, tail.snap, request, reply)
 
     // Collection POST → create a snapshot.
     return createSnapshot(poolName, tail.datasetPath, request, reply)
@@ -517,7 +557,7 @@ export async function datasetRoutes(
     // Snapshot rename: `<dataset>/snapshots/<snap>`.
     const tail = parseSnapshotTail(wildcard)
     if (tail) {
-      if (!tail.snap || tail.rollback || tail.extra) {
+      if (!tail.snap || tail.rollback || tail.clone || tail.extra) {
         reply.code(404)
         return { error: { code: 'NOT_FOUND', message: `Unknown snapshot resource '${wildcard}'` } }
       }
@@ -934,7 +974,7 @@ export async function datasetRoutes(
     // Snapshot destroy: `<dataset>/snapshots/<snap>` (plain 202, no confirm).
     const tail = parseSnapshotTail(request.params['*'])
     if (tail) {
-      if (!tail.snap || tail.rollback || tail.extra) {
+      if (!tail.snap || tail.rollback || tail.clone || tail.extra) {
         reply.code(404)
         return { error: { code: 'NOT_FOUND', message: `Unknown snapshot resource '${request.params['*']}'` } }
       }
@@ -954,13 +994,19 @@ export async function datasetRoutes(
       return
 
     const datasets = await listDatasets(poolName)
-    if (!datasets.some(d => d.name === fullName)) {
+    const targetDataset = datasets.find(d => d.name === fullName)
+    if (!targetDataset) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
     }
 
     const children = datasets.filter(d => d.name.startsWith(`${fullName}/`))
     const snapshots = await snapshotNames(fullName)
+    // Shares serving this dataset's mountpoint will break when it's destroyed
+    // (Epic 4.4) — warn, but do not block (like the children/snapshots warnings).
+    const shares = targetDataset.type === 'filesystem' && targetDataset.mountpoint
+      ? await associatedShares(targetDataset.mountpoint)
+      : []
 
     const warnings = [
       `Destroying '${fullName}' is irreversible — all data in the dataset is permanently lost.`,
@@ -969,6 +1015,8 @@ export async function datasetRoutes(
       warnings.push(`${children.length} child dataset(s) will also be destroyed.`)
     if (snapshots.length > 0)
       warnings.push(`${snapshots.length} snapshot(s) of '${fullName}' will also be destroyed.`)
+    if (shares.length > 0)
+      warnings.push(`${shares.length} share(s) serve this dataset (${shares.map(s => `'${s.protocol}:${s.name}'`).join(', ')}) and will stop working.`)
     if (!recursive && (children.length > 0 || snapshots.length > 0))
       warnings.push(`This dataset has children or snapshots; destroy will fail unless recursive is requested.`)
 
@@ -1223,6 +1271,61 @@ export async function datasetRoutes(
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs rollback exited with code ${result.exitCode}`)
         return { rolledBack: snapName }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  }
+
+  async function cloneSnapshot(poolName: string, datasetPath: string, snap: string, request: FastifyRequest, reply: FastifyReply) {
+    const fullName = resolveDatasetName(poolName, datasetPath, reply)
+    if (!fullName)
+      return reply
+
+    const snapParsed = SnapshotName.safeParse(snap)
+    if (!snapParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid snapshot name: ${snapParsed.error.issues[0]?.message}` } }
+    }
+    const snapName = `${fullName}@${snap}`
+
+    const bodyParsed = CloneSnapshotRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid clone request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const { target } = bodyParsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    // 404 if the source snapshot does not exist (system is the source of truth).
+    const existing = await listSnapshotsDetail(fullName)
+    if (!existing.some(s => s.name === snapName)) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` } }
+    }
+
+    // 409 if the target dataset already exists — clone creates a NEW dataset.
+    const targetPool = target.split('/')[0]
+    const targetDatasets = await listDatasets(targetPool)
+    if (targetDatasets.some(d => d.name === target)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Dataset '${target}' already exists` } }
+    }
+
+    // Plain 202 — creating a new dataset from a snapshot is not destructive, so
+    // no confirmation gate (it never touches existing data).
+    const job = jobQueue.submit(
+      'zfs.clone',
+      { ...identity, params: { snapshot: snapName, target } },
+      async () => {
+        const result = await executor.exec(ZFS, ['clone', snapName, target])
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `zfs clone exited with code ${result.exitCode}`)
+        return { cloned: snapName, target }
       },
     )
 
