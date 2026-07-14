@@ -143,6 +143,17 @@ test.describe('ANAS snapshots appear under a dataset (stunt node)', () => {
     for (const name of SNAP_NAMES)
       await expect(grid.getByText(name).first()).toBeVisible({ timeout: 30_000 })
   })
+
+  test('the Create Snapshot dialog pre-fills a snapshot-<datetime> name', async ({ page }) => {
+    await openDatasets(page)
+    // Select a dataset, open Create Snapshot; the name is pre-filled for speed
+    // (a sortable timestamp) and overridable.
+    await page.locator('.anas-grid-datasets .x-tree-node-text', { hasText: /^share1$/ }).click()
+    await page.locator('.anas-btn-snap-create').click()
+    await expect(page.locator('.anas-win-snap-create')).toBeVisible({ timeout: 20_000 })
+    const value = await page.locator('.anas-fld-snap-name input').inputValue()
+    expect(value).toMatch(/^snapshot-\d{4}-\d{2}-\d{2}-\d{6}$/)
+  })
 })
 
 /**

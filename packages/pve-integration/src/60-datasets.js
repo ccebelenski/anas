@@ -172,6 +172,19 @@
         }
     }
 
+    // Default snapshot label: "snapshot-<local timestamp>", human-readable and
+    // sortable. Recomputed each time the create dialog opens; fully overridable.
+    function defaultSnapName() {
+        try {
+            if (typeof Ext !== 'undefined' && Ext.Date && typeof Ext.Date.format === 'function') {
+                return 'snapshot-' + Ext.Date.format(new Date(), 'Y-m-d-His');
+            }
+        } catch (e) {
+            // fall through
+        }
+        return 'snapshot-';
+    }
+
     // ---- Tree building -----------------------------------------------------
     //
     // Fold a pool's flat dataset list into a hierarchy. Nodes are keyed by full
@@ -1507,6 +1520,11 @@
                             cls: 'anas-fld-snap-name',
                             fieldLabel: t('Snapshot name'),
                             emptyText: 'nightly-2026-07-14',
+                            // Default to a human-readable, sortable timestamp so
+                            // creating a snapshot is one click; fully overridable
+                            // (selectOnFocus selects it all for quick replacement).
+                            value: defaultSnapName(),
+                            selectOnFocus: true,
                             allowBlank: false,
                         },
                         {
