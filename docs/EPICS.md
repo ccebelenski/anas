@@ -244,6 +244,8 @@ Story numbering is for identification only, not implementation order. Within eac
 
 > As a user, I can create and manage SMB (Windows/Samba) file shares.
 
+> **Status: shipped 2026-07-13.** 6.1–6.10 all done — round-trip smb.conf parser + fixtures, `/v1/shares/smb*` routes (list-all incl. admin shares, smbstatus connections, global config, create/modify/remove via surgical `editConfig`, `systemctl reload smbd` side effect), and the unified Shares UI. Verified live on the stunt node: create → surgical stanza append, confirmed delete → clean removal, `/etc/samba/smb.conf` byte-identical to pre-state (154 comments preserved).
+
 ### Stories
 
 #### Dev (build first — parser)
@@ -274,6 +276,8 @@ Story numbering is for identification only, not implementation order. Within eac
 ## Epic 7: NFS Export Management
 
 > As a user, I can create and manage NFS exports for Linux/Unix clients.
+
+> **Status: shipped 2026-07-13.** 7.1–7.7 all done — round-trip /etc/exports parser, `/v1/shares/nfs*` routes (list-all, create/modify/remove via surgical `editConfig`, `exportfs -ra` side effect), and NFS rows in the unified Shares UI. Verified live: create → one-line append, confirmed delete → clean removal, `/etc/exports` byte-identical to pre-state.
 
 ### Stories
 
