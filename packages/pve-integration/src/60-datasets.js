@@ -29,6 +29,13 @@
  * 'anas-btn-ds-destroy', windows 'anas-win-dataset-create' /
  * 'anas-win-dataset-detail' / 'anas-win-dataset-perms'.
  *
+ * Snapshots (Epic 5, GET/POST …/datasets/<path>/snapshots and
+ * PUT/DELETE/…/rollback per snapshot): snapshots hang off their dataset as
+ * flat leaf rows, lazy-loaded on first expand (top-5 inline, an 'anas-snap-more'
+ * overflow row + 'anas-btn-snap-all' toolbar button open the 'anas-win-snapshots'
+ * popup grid 'anas-grid-snapshots'). Snapshot rows carry cls 'anas-snap-row';
+ * actions use buttons 'anas-btn-snap-create' / -rollback / -rename / -destroy.
+ *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  */
 (function () {
@@ -94,6 +101,21 @@
         return p;
     }
 
+    // Build the /v1 path to a snapshot resource under its dataset. snapName is
+    // the label after '@' (Snapshot.snapshotName); sub is an optional trailing
+    // action such as 'rollback'.
+    function snapshotsPath(pool, datasetFullName) {
+        return datasetPath(pool, datasetFullName, 'snapshots');
+    }
+
+    function snapshotPath(pool, datasetFullName, snapName, sub) {
+        var p = snapshotsPath(pool, datasetFullName) + '/' + encodeURIComponent(snapName);
+        if (sub) {
+            p += '/' + sub;
+        }
+        return p;
+    }
+
     // ---- Renderers ---------------------------------------------------------
 
     function renderBytes(v) {
@@ -127,6 +149,27 @@
             out += ' (' + ratio.toFixed(2) + 'x)';
         }
         return enc(out);
+    }
+
+    // Format a snapshot's ISO 8601 creation time as a compact local string.
+    // Blank for non-snapshot rows (no 'created' value). Fail-open: on any parse
+    // trouble, show the raw value rather than throwing in a cell renderer.
+    function formatCreated(v) {
+        if (v === undefined || v === null || v === '') {
+            return '';
+        }
+        try {
+            var d = new Date(v);
+            if (isNaN(d.getTime())) {
+                return enc(v);
+            }
+            if (typeof Ext !== 'undefined' && Ext.Date && typeof Ext.Date.format === 'function') {
+                return enc(Ext.Date.format(d, 'Y-m-d H:i'));
+            }
+            return enc(d.toLocaleString());
+        } catch (e) {
+            return enc(v);
+        }
     }
 
     // ---- Tree building -----------------------------------------------------
@@ -229,24 +272,38 @@
             parent.leaf = false;
         }
 
-        markLeavesExpanded(rootNode);
+        finalizeNode(rootNode);
         return rootNode;
     }
 
-    // Datasets with children get an expander and start expanded (Epic 4.1 wants
-    // the hierarchy visible); leaves are marked so no expander is drawn.
-    function markLeavesExpanded(node) {
-        if (node.children && node.children.length) {
-            node.leaf = false;
+    // Finalise a freshly-built pool subtree. Pools start expanded so their
+    // top-level datasets are visible (Epic 4.1). Datasets are ALWAYS non-leaf
+    // but start COLLAPSED: every dataset is a potential snapshot host, so it
+    // must show an expander even with no child datasets, and its snapshots are
+    // fetched lazily on the first expand (Epic 5) rather than upfront. An
+    // explicit (possibly empty) children array marks the node "loaded" so
+    // expanding fires itemexpand without triggering a store-proxy load.
+    function finalizeNode(node) {
+        var kids = node.children || [];
+        if (node.kind === 'pool') {
             node.expanded = true;
-            for (var i = 0; i < node.children.length; i++) {
-                markLeavesExpanded(node.children[i]);
-            }
-        } else {
-            node.leaf = true;
-            if (node.children) {
+            node.leaf = kids.length === 0;
+            if (!kids.length && node.children) {
                 delete node.children;
             }
+        } else if (node.kind === 'dataset') {
+            node.leaf = false;
+            node.expanded = false;
+            // Force the expander even when the dataset has no child datasets:
+            // ExtJS would otherwise hide it for a loaded, childless, non-leaf
+            // node, leaving no way to trigger the lazy snapshot load.
+            node.expandable = true;
+            if (!node.children) {
+                node.children = [];
+            }
+        }
+        for (var i = 0; i < kids.length; i++) {
+            finalizeNode(kids[i]);
         }
     }
 
@@ -361,6 +418,14 @@
         return isDataset(rec) && rec.get('type') === 'filesystem';
     }
 
+    function isSnapshot(rec) {
+        return !!(rec && rec.get('kind') === 'snapshot');
+    }
+
+    function isSnapshotsMore(rec) {
+        return !!(rec && rec.get('kind') === 'snapshots-more');
+    }
+
     function setDisabled(tree, itemId, disabled) {
         var btn = tree.down('#' + itemId);
         if (btn) {
@@ -372,10 +437,18 @@
         var rec = selectedRecord(tree);
         var ds = isDataset(rec);
         var fs = isFilesystem(rec);
+        var snap = isSnapshot(rec);
         setDisabled(tree, 'dsDetail', !ds);
         setDisabled(tree, 'dsEdit', !ds);
         setDisabled(tree, 'dsPerms', !fs);
         setDisabled(tree, 'dsDestroy', !ds);
+        // Snapshot actions: create/list act on a selected dataset; the
+        // rollback/rename/destroy trio act on a selected snapshot row.
+        setDisabled(tree, 'snapCreate', !ds);
+        setDisabled(tree, 'snapAll', !ds);
+        setDisabled(tree, 'snapRollback', !snap);
+        setDisabled(tree, 'snapRename', !snap);
+        setDisabled(tree, 'snapDestroy', !snap);
     }
 
     // ---- Property field vocabularies ---------------------------------------
@@ -1250,6 +1323,669 @@
         });
     }
 
+    // ======================================================================
+    //  Snapshots (Epic 5: stories 5.1–5.6)
+    //
+    //  Snapshots hang off their dataset as flat leaf rows. They are fetched
+    //  lazily the first time a dataset node is expanded (never upfront), the
+    //  five most-recent shown inline; a "Show all N…" overflow row and a
+    //  "Snapshots" toolbar button both open a popup grid of the full list.
+    //  Every action works from both the inline rows and the popup.
+    // ======================================================================
+
+    var MAX_INLINE_SNAPS = 5;
+
+    // ---- Snapshot node builders -------------------------------------------
+
+    function snapshotNode(snap) {
+        return {
+            name: '@' + snap.snapshotName,
+            fullName: snap.name,
+            pool: snap.pool,
+            dataset: snap.dataset,
+            snapshotName: snap.snapshotName,
+            kind: 'snapshot',
+            created: snap.created,
+            used: snap.used,
+            referenced: snap.referenced,
+            iconCls: 'fa fa-clock-o',
+            leaf: true,
+        };
+    }
+
+    function overflowNode(pool, datasetFullName, total) {
+        return {
+            name: t('Show all') + ' ' + total + ' ' + t('snapshots') + '…',
+            pool: pool,
+            dataset: datasetFullName,
+            kind: 'snapshots-more',
+            iconCls: 'fa fa-ellipsis-h',
+            leaf: true,
+        };
+    }
+
+    // ---- Lazy load / refresh ----------------------------------------------
+
+    function removeSnapshotChildren(dsNode) {
+        if (!dsNode || !dsNode.childNodes) {
+            return;
+        }
+        var kids = dsNode.childNodes.slice();
+        for (var i = 0; i < kids.length; i++) {
+            var k = kids[i].get('kind');
+            if (k === 'snapshot' || k === 'snapshots-more') {
+                dsNode.removeChild(kids[i], true);
+            }
+        }
+    }
+
+    function appendSnapshotChildren(dsNode, snaps) {
+        if (!dsNode || dsNode.destroyed) {
+            return;
+        }
+        var list = snaps || [];
+        var nodes = [];
+        var shown = list.slice(0, MAX_INLINE_SNAPS);
+        for (var i = 0; i < shown.length; i++) {
+            nodes.push(snapshotNode(shown[i]));
+        }
+        if (list.length > MAX_INLINE_SNAPS) {
+            nodes.push(overflowNode(dsNode.get('pool'), dsNode.get('fullName'), list.length));
+        }
+        if (nodes.length) {
+            dsNode.appendChild(nodes);
+        }
+    }
+
+    // Fetch a dataset's snapshots and render them under the node. Guarded by a
+    // per-record flag so re-expanding does not re-fetch; `force` bypasses it for
+    // an explicit refresh. Fail-open: a failure leaves the dataset with no
+    // snapshot children and never disturbs the rest of the tree.
+    function loadSnapshotsForNode(node, tree, dsNode, force) {
+        if (!dsNode || dsNode.destroyed) {
+            return;
+        }
+        if (dsNode.anasSnapsLoaded && !force) {
+            return;
+        }
+        dsNode.anasSnapsLoaded = true;
+        var pool = dsNode.get('pool');
+        var fullName = dsNode.get('fullName');
+        ANAS.api.get(node, snapshotsPath(pool, fullName)).then(function (res) {
+            if (dsNode.destroyed || (tree && (tree.destroyed || tree.destroying))) {
+                return;
+            }
+            removeSnapshotChildren(dsNode);
+            appendSnapshotChildren(dsNode, (res && res.data) || []);
+        }, function (err) {
+            // Fail-open: no snapshot children. Clear the guard so a later
+            // collapse/expand can retry rather than staying permanently empty.
+            if (!dsNode.destroyed) {
+                dsNode.anasSnapsLoaded = false;
+            }
+            ANAS.warn('snapshots load failed for ' + fullName + ': ' + ANAS.errText(err));
+        });
+    }
+
+    function findDatasetNode(tree, pool, datasetFullName) {
+        var found = null;
+        try {
+            var root = tree.getRootNode();
+            if (root && typeof root.cascadeBy === 'function') {
+                root.cascadeBy(function (n) {
+                    if (!found && n.get('kind') === 'dataset'
+                        && n.get('fullName') === datasetFullName && n.get('pool') === pool) {
+                        found = n;
+                    }
+                });
+            }
+        } catch (e) {
+            // fail-open — no node
+        }
+        return found;
+    }
+
+    // Reload the inline snapshot rows for one dataset after a mutation. When the
+    // node is collapsed we just drop stale rows (they reload on next expand);
+    // `expandCollapsed` forces it open so a freshly-created snapshot is visible.
+    function refreshTreeSnapshots(node, tree, pool, datasetFullName, expandCollapsed) {
+        var dsNode = findDatasetNode(tree, pool, datasetFullName);
+        if (!dsNode) {
+            return;
+        }
+        dsNode.anasSnapsLoaded = false;
+        removeSnapshotChildren(dsNode);
+        if (dsNode.isExpanded && dsNode.isExpanded()) {
+            loadSnapshotsForNode(node, tree, dsNode, true);
+        } else if (expandCollapsed && dsNode.expand) {
+            dsNode.expand();
+        }
+    }
+
+    function ctxFromSnapshotRecord(rec, view) {
+        var dataset = rec.get('dataset');
+        var snapshotName = rec.get('snapshotName');
+        return {
+            pool: rec.get('pool'),
+            dataset: dataset,
+            snapshotName: snapshotName,
+            fullName: rec.get('fullName') || (dataset + '@' + snapshotName),
+            view: view,
+        };
+    }
+
+    // Reusable validator for a ZFS snapshot label (no '@' or '/').
+    function validSnapName(name) {
+        return /^[\w][\w.:-]*$/.test(name);
+    }
+
+    // ---- Create snapshot (story 5.3) --------------------------------------
+
+    function openCreateSnapshot(node, pool, fullName, onDone) {
+        if (!pool || !fullName) {
+            return;
+        }
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-snap-create',
+                title: t('Create Snapshot') + ': ' + fullName,
+                modal: true,
+                width: 460,
+                resizable: false,
+                layout: 'fit',
+                items: [{
+                    xtype: 'form',
+                    itemId: 'form',
+                    bodyPadding: 12,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 150 },
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            itemId: 'snapName',
+                            cls: 'anas-fld-snap-name',
+                            fieldLabel: t('Snapshot name'),
+                            emptyText: 'nightly-2026-07-14',
+                            allowBlank: false,
+                        },
+                        {
+                            xtype: 'checkboxfield',
+                            itemId: 'recursive',
+                            fieldLabel: t('Recursive'),
+                            boxLabel: t('Also snapshot child datasets'),
+                        },
+                    ],
+                }],
+                buttons: [
+                    {
+                        text: t('Cancel'),
+                        handler: function () { win.close(); },
+                    },
+                    {
+                        text: t('Create'),
+                        cls: 'anas-btn-snap-create-submit',
+                        handler: function () {
+                            try {
+                                submitCreateSnapshot(win, node, pool, fullName, onDone);
+                            } catch (e) {
+                                ANAS.warn('snapshot create submit failed: ' + ANAS.errText(e));
+                            }
+                        },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('snapshot create window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+    }
+
+    function submitCreateSnapshot(win, node, pool, fullName, onDone) {
+        var form = win.down('#form');
+        var basicForm = form && form.getForm();
+        if (basicForm && basicForm.isValid && !basicForm.isValid()) {
+            return;
+        }
+        var name = (win.down('#snapName').getValue() || '').trim();
+        if (!name) {
+            alertMsg('Invalid input', t('Enter a snapshot name.'));
+            return;
+        }
+        if (!validSnapName(name)) {
+            alertMsg('Invalid input', t('Invalid snapshot name.'));
+            return;
+        }
+        var body = { name: name };
+        if (win.down('#recursive').getValue()) {
+            body.recursive = true;
+        }
+        ANAS.runJob({
+            node: node,
+            method: 'post',
+            path: snapshotsPath(pool, fullName),
+            body: body,
+            view: win,
+            failTitle: 'Create snapshot failed',
+            successMsg: t('Snapshot created') + ': ' + fullName + '@' + name,
+            onComplete: function () {
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+                if (onDone) { onDone(); }
+            },
+        });
+    }
+
+    // ---- Rollback (story 5.5 — DANGEROUS) ---------------------------------
+    //
+    // Confirmation-gated like dataset/pool destroy: an unconfirmed POST returns
+    // 409 + code + warnings; we surface the warnings in a dialog carrying an
+    // optional "force" checkbox and, on confirm, resend with the code. The code
+    // is NOT bound to force — force is appended to the confirmed request.
+
+    function runRollback(node, ctx, confirmCode, force, onDone) {
+        var path = snapshotPath(ctx.pool, ctx.dataset, ctx.snapshotName, 'rollback');
+        if (force) {
+            path += '?force=true';
+        }
+        ANAS.runJob({
+            node: node,
+            method: 'post',
+            path: path,
+            confirmCode: confirmCode,
+            view: ctx.view,
+            failTitle: 'Rollback failed',
+            successMsg: t('Rolled back to') + ' ' + ctx.fullName,
+            maxMs: 30000,
+            onComplete: function () { if (onDone) { onDone(); } },
+        });
+    }
+
+    function showRollbackConfirm(node, ctx, confirmCode, warnings, onDone) {
+        var items = [{
+            xtype: 'component',
+            html: '<b>' + enc(t('Roll back to snapshot') + ' "' + ctx.fullName + '"?') + '</b>'
+                + '<ul><li>'
+                + (warnings || []).map(function (w) { return enc(w); }).join('</li><li>')
+                + '</li></ul>',
+            margin: '0 0 8 0',
+        }, {
+            xtype: 'checkbox',
+            itemId: 'force',
+            cls: 'anas-chk-snap-force',
+            boxLabel: t('Force (-r): destroy any more-recent snapshots and bookmarks'),
+        }];
+        var win = Ext.create('Ext.window.Window', {
+            title: t('Rollback snapshot'),
+            cls: 'anas-win-snap-rollback',
+            modal: true,
+            width: 480,
+            bodyPadding: 12,
+            layout: 'anchor',
+            items: items,
+            buttons: [{
+                text: t('Cancel'),
+                handler: function () { win.close(); },
+            }, {
+                text: t('Rollback'),
+                cls: 'anas-btn-snap-rollback-confirm',
+                ui: 'default-toolbar',
+                handler: function () {
+                    var force = win.down('#force').getValue();
+                    win.close();
+                    runRollback(node, ctx, confirmCode, force, onDone);
+                },
+            }],
+        });
+        win.show();
+    }
+
+    function openRollback(node, ctx, onDone) {
+        ANAS.api.post(node, snapshotPath(ctx.pool, ctx.dataset, ctx.snapshotName, 'rollback'), null).then(
+            function () {
+                // Unexpected: rollback without confirmation should not succeed.
+                if (onDone) { onDone(); }
+            },
+            function (err) {
+                if (err && err.status === 409 && err.confirmCode) {
+                    var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
+                    showRollbackConfirm(node, ctx, err.confirmCode, warnings, onDone);
+                    return;
+                }
+                alertMsg('Rollback failed', ANAS.errText(err));
+            }
+        );
+    }
+
+    // ---- Rename (story 5.4) -----------------------------------------------
+
+    function openRenameSnapshot(node, ctx, onDone) {
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-snap-rename',
+                title: t('Rename Snapshot') + ': ' + ctx.fullName,
+                modal: true,
+                width: 460,
+                resizable: false,
+                layout: 'fit',
+                items: [{
+                    xtype: 'form',
+                    itemId: 'form',
+                    bodyPadding: 12,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 150 },
+                    items: [{
+                        xtype: 'textfield',
+                        itemId: 'newName',
+                        cls: 'anas-fld-snap-newname',
+                        fieldLabel: t('New name'),
+                        allowBlank: false,
+                        value: ctx.snapshotName,
+                    }],
+                }],
+                buttons: [
+                    {
+                        text: t('Cancel'),
+                        handler: function () { win.close(); },
+                    },
+                    {
+                        text: t('Rename'),
+                        cls: 'anas-btn-snap-rename-submit',
+                        handler: function () {
+                            try {
+                                submitRenameSnapshot(win, node, ctx, onDone);
+                            } catch (e) {
+                                ANAS.warn('snapshot rename submit failed: ' + ANAS.errText(e));
+                            }
+                        },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('snapshot rename window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+    }
+
+    function submitRenameSnapshot(win, node, ctx, onDone) {
+        var form = win.down('#form');
+        var basicForm = form && form.getForm();
+        if (basicForm && basicForm.isValid && !basicForm.isValid()) {
+            return;
+        }
+        var newName = (win.down('#newName').getValue() || '').trim();
+        if (!newName) {
+            alertMsg('Invalid input', t('Enter a new snapshot name.'));
+            return;
+        }
+        if (!validSnapName(newName)) {
+            alertMsg('Invalid input', t('Invalid snapshot name.'));
+            return;
+        }
+        if (newName === ctx.snapshotName) {
+            win.close();
+            return;
+        }
+        ANAS.runJob({
+            node: node,
+            method: 'put',
+            path: snapshotPath(ctx.pool, ctx.dataset, ctx.snapshotName),
+            body: { newName: newName },
+            view: win,
+            failTitle: 'Rename failed',
+            successMsg: t('Snapshot renamed') + ': ' + ctx.dataset + '@' + newName,
+            onComplete: function () {
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+                if (onDone) { onDone(); }
+            },
+        });
+    }
+
+    // ---- Destroy snapshot (story 5.6) -------------------------------------
+    //
+    // Not confirmation-gated by the daemon (removes a recovery point, not live
+    // data): a plain Ext.Msg.confirm then a plain DELETE.
+
+    function runDestroySnapshot(node, ctx, onDone) {
+        ANAS.runJob({
+            node: node,
+            method: 'del',
+            path: snapshotPath(ctx.pool, ctx.dataset, ctx.snapshotName),
+            view: ctx.view,
+            failTitle: 'Destroy failed',
+            successMsg: t('Destroyed') + ' ' + ctx.fullName,
+            onComplete: function () { if (onDone) { onDone(); } },
+        });
+    }
+
+    function destroySnapshotConfirm(node, ctx, onDone) {
+        var msg = enc(t('Destroy snapshot') + ' "' + ctx.fullName + '"? ')
+            + enc(t('This permanently removes the recovery point.'));
+        try {
+            Ext.Msg.confirm(t('Destroy snapshot'), msg, function (btn) {
+                if (btn === 'yes') {
+                    runDestroySnapshot(node, ctx, onDone);
+                }
+            });
+        } catch (e) {
+            ANAS.warn('snapshot destroy confirm failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // ---- Snapshots popup (stories 5.1 / 5.2 + full action surface) --------
+
+    function openSnapshotsPopup(node, tree, pool, datasetFullName) {
+        var store = Ext.create('Ext.data.Store', {
+            fields: [
+                'name', 'dataset', 'snapshotName', 'pool', 'created',
+                { name: 'used', type: 'auto' },
+                { name: 'referenced', type: 'auto' },
+            ],
+            data: [],
+        });
+
+        var grid;
+        var win;
+
+        function selectedSnap() {
+            var sel = grid ? grid.getSelection() : [];
+            var rec = (sel && sel.length) ? sel[0] : null;
+            return rec ? ctxFromSnapshotRecord(rec, win) : null;
+        }
+
+        function updatePopupButtons() {
+            var has = !!selectedSnap();
+            var ids = ['snapRollback', 'snapRename', 'snapDestroy'];
+            for (var i = 0; i < ids.length; i++) {
+                var b = win.down('#' + ids[i]);
+                if (b) { b.setDisabled(!has); }
+            }
+        }
+
+        function reloadGrid() {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            try { win.setLoading(true); } catch (e) { /* non-fatal */ }
+            ANAS.api.get(node, snapshotsPath(pool, datasetFullName)).then(function (res) {
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                try { win.setLoading(false); } catch (e) { /* non-fatal */ }
+                store.loadData((res && res.data) || []);
+                updatePopupButtons();
+            }, function (err) {
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                try { win.setLoading(false); } catch (e) { /* non-fatal */ }
+                ANAS.warn('snapshots popup load failed: ' + ANAS.errText(err));
+                alertMsg('Error', t('Failed to load snapshots') + ': ' + ANAS.errText(err));
+            });
+        }
+
+        // After any popup-driven mutation, reload the grid AND the inline rows.
+        function afterMutation() {
+            reloadGrid();
+            refreshTreeSnapshots(node, tree, pool, datasetFullName, false);
+        }
+
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-snapshots',
+                title: t('Snapshots') + ': ' + datasetFullName,
+                modal: true,
+                width: 760,
+                height: 520,
+                resizable: true,
+                layout: 'fit',
+                items: [{
+                    xtype: 'grid',
+                    itemId: 'grid',
+                    cls: 'anas-grid-snapshots',
+                    border: false,
+                    store: store,
+                    selModel: { mode: 'SINGLE' },
+                    emptyText: t('No snapshots'),
+                    columns: [
+                        {
+                            text: t('Name'),
+                            dataIndex: 'snapshotName',
+                            flex: 1,
+                            renderer: Ext.String.htmlEncode,
+                        },
+                        {
+                            text: t('Created'),
+                            dataIndex: 'created',
+                            width: 150,
+                            renderer: formatCreated,
+                        },
+                        {
+                            text: t('Used'),
+                            dataIndex: 'used',
+                            width: 110,
+                            align: 'right',
+                            renderer: renderBytes,
+                        },
+                        {
+                            text: t('Referenced'),
+                            dataIndex: 'referenced',
+                            width: 110,
+                            align: 'right',
+                            renderer: renderBytes,
+                        },
+                    ],
+                    tbar: [
+                        {
+                            text: t('Reload'),
+                            iconCls: 'fa fa-refresh',
+                            handler: function () { reloadGrid(); },
+                        },
+                        {
+                            text: t('Create Snapshot'),
+                            cls: 'anas-btn-snap-create',
+                            iconCls: 'fa fa-camera',
+                            handler: function () {
+                                openCreateSnapshot(node, pool, datasetFullName, afterMutation);
+                            },
+                        },
+                        {
+                            text: t('Rollback'),
+                            itemId: 'snapRollback',
+                            cls: 'anas-btn-snap-rollback',
+                            iconCls: 'fa fa-history',
+                            disabled: true,
+                            handler: function () {
+                                var ctx = selectedSnap();
+                                if (ctx) { openRollback(node, ctx, afterMutation); }
+                            },
+                        },
+                        {
+                            text: t('Rename'),
+                            itemId: 'snapRename',
+                            cls: 'anas-btn-snap-rename',
+                            iconCls: 'fa fa-pencil',
+                            disabled: true,
+                            handler: function () {
+                                var ctx = selectedSnap();
+                                if (ctx) { openRenameSnapshot(node, ctx, afterMutation); }
+                            },
+                        },
+                        {
+                            text: t('Destroy'),
+                            itemId: 'snapDestroy',
+                            cls: 'anas-btn-snap-destroy',
+                            iconCls: 'fa fa-trash',
+                            disabled: true,
+                            handler: function () {
+                                var ctx = selectedSnap();
+                                if (ctx) { destroySnapshotConfirm(node, ctx, afterMutation); }
+                            },
+                        },
+                    ],
+                    listeners: {
+                        selectionchange: function () { updatePopupButtons(); },
+                        itemdblclick: function (g, rec) {
+                            openRenameSnapshot(node, ctxFromSnapshotRecord(rec, win), afterMutation);
+                        },
+                    },
+                }],
+            });
+        } catch (e) {
+            ANAS.warn('snapshots popup window failed: ' + ANAS.errText(e));
+            return;
+        }
+        grid = win.down('#grid');
+        win.show();
+        reloadGrid();
+    }
+
+    // ---- Snapshot toolbar-action dispatch (from the datasets tree) --------
+
+    function snapCreateFromTree(node, tree) {
+        var rec = selectedRecord(tree);
+        if (!isDataset(rec)) {
+            return;
+        }
+        var pool = rec.get('pool');
+        var fullName = rec.get('fullName');
+        openCreateSnapshot(node, pool, fullName, function () {
+            refreshTreeSnapshots(node, tree, pool, fullName, true);
+        });
+    }
+
+    function snapPopupFromTree(node, tree) {
+        var rec = selectedRecord(tree);
+        if (!isDataset(rec)) {
+            return;
+        }
+        openSnapshotsPopup(node, tree, rec.get('pool'), rec.get('fullName'));
+    }
+
+    function snapActionFromTree(node, tree, kind) {
+        var rec = selectedRecord(tree);
+        if (!isSnapshot(rec)) {
+            return;
+        }
+        var ctx = ctxFromSnapshotRecord(rec, tree);
+        var onDone = function () {
+            refreshTreeSnapshots(node, tree, ctx.pool, ctx.dataset, false);
+        };
+        if (kind === 'rollback') {
+            openRollback(node, ctx, onDone);
+        } else if (kind === 'rename') {
+            openRenameSnapshot(node, ctx, onDone);
+        } else if (kind === 'destroy') {
+            destroySnapshotConfirm(node, ctx, onDone);
+        }
+    }
+
     // ---- View --------------------------------------------------------------
 
     function datasetsView(node) {
@@ -1257,6 +1993,9 @@
             fields: [
                 'name', 'fullName', 'pool', 'kind', 'type', 'mountpoint',
                 'compression',
+                // Snapshot rows reuse the tree: 'dataset'/'snapshotName' carry
+                // the parent + label; 'created' feeds the Created column.
+                'dataset', 'snapshotName', 'created',
                 { name: 'used', type: 'auto' },
                 { name: 'available', type: 'auto' },
                 { name: 'referenced', type: 'auto' },
@@ -1328,6 +2067,57 @@
                     openDestroy(node, tree, selectedRecord(tree));
                 },
             },
+            '-',
+            {
+                text: t('Create Snapshot'),
+                itemId: 'snapCreate',
+                cls: 'anas-btn-snap-create',
+                iconCls: 'fa fa-camera',
+                disabled: true,
+                handler: function (btn) {
+                    snapCreateFromTree(node, btn.up('treepanel'));
+                },
+            },
+            {
+                text: t('Snapshots'),
+                itemId: 'snapAll',
+                cls: 'anas-btn-snap-all',
+                iconCls: 'fa fa-clock-o',
+                disabled: true,
+                handler: function (btn) {
+                    snapPopupFromTree(node, btn.up('treepanel'));
+                },
+            },
+            {
+                text: t('Rollback'),
+                itemId: 'snapRollback',
+                cls: 'anas-btn-snap-rollback',
+                iconCls: 'fa fa-history',
+                disabled: true,
+                handler: function (btn) {
+                    snapActionFromTree(node, btn.up('treepanel'), 'rollback');
+                },
+            },
+            {
+                text: t('Rename Snapshot'),
+                itemId: 'snapRename',
+                cls: 'anas-btn-snap-rename',
+                iconCls: 'fa fa-pencil',
+                disabled: true,
+                handler: function (btn) {
+                    snapActionFromTree(node, btn.up('treepanel'), 'rename');
+                },
+            },
+            {
+                text: t('Destroy Snapshot'),
+                itemId: 'snapDestroy',
+                cls: 'anas-btn-snap-destroy',
+                iconCls: 'fa fa-trash-o',
+                disabled: true,
+                handler: function (btn) {
+                    snapActionFromTree(node, btn.up('treepanel'), 'destroy');
+                },
+            },
         ];
 
         return {
@@ -1375,6 +2165,13 @@
                         renderer: renderBytes,
                     },
                     {
+                        // New for snapshot rows; blank for datasets/pools.
+                        text: t('Created'),
+                        dataIndex: 'created',
+                        width: 150,
+                        renderer: formatCreated,
+                    },
+                    {
                         text: t('Compression'),
                         dataIndex: 'compression',
                         width: 150,
@@ -1389,6 +2186,19 @@
                     },
                 ],
                 tbar: tbar,
+                // Tag snapshot / overflow rows for styling + test hooks.
+                viewConfig: {
+                    getRowClass: function (record) {
+                        var kind = record.get('kind');
+                        if (kind === 'snapshot') {
+                            return 'anas-snap-row';
+                        }
+                        if (kind === 'snapshots-more') {
+                            return 'anas-snap-more';
+                        }
+                        return '';
+                    },
+                },
                 listeners: {
                     afterrender: function (tree) {
                         loadTree(tree, node);
@@ -1396,9 +2206,27 @@
                     selectionchange: function () {
                         updateButtons(this);
                     },
+                    // Lazy-load a dataset's snapshots the first time it expands.
+                    itemexpand: function (record) {
+                        try {
+                            if (record && record.get && record.get('kind') === 'dataset') {
+                                loadSnapshotsForNode(node, this, record, false);
+                            }
+                        } catch (e) {
+                            ANAS.warn('snapshot lazy-load failed: ' + ANAS.errText(e));
+                        }
+                    },
+                    itemclick: function (tree, record) {
+                        // The "Show all N…" overflow row opens the full popup.
+                        if (isSnapshotsMore(record)) {
+                            openSnapshotsPopup(node, tree, record.get('pool'), record.get('dataset'));
+                        }
+                    },
                     itemdblclick: function (tree, record) {
                         if (isDataset(record)) {
                             openDetail(node, record);
+                        } else if (isSnapshotsMore(record)) {
+                            openSnapshotsPopup(node, tree, record.get('pool'), record.get('dataset'));
                         }
                     },
                 },
