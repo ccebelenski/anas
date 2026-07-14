@@ -103,10 +103,17 @@ export function createServer(opts: ServerOptions = {}) {
     }
 
     if (node === config.nodeName) {
-      const rest = (request.params as { '*': string })['*'] ?? ''
-      const qIdx = request.url.indexOf('?')
-      const query = qIdx >= 0 ? request.url.slice(qIdx) : ''
-      const anasdPath = `/v1/${rest}${query}`
+      // Preserve the path's original percent-encoding. Fastify decodes the
+      // wildcard param, turning %2F into a literal '/', which corrupts daemon
+      // routes keyed by a URL-encoded path — e.g. NFS exports at
+      // /shares/nfs/:path (identity is the URL-encoded mountpoint). Slice the
+      // still-encoded suffix (path + query) out of the raw request URL instead.
+      const marker = `/api/nodes/${node}/v1/`
+      const idx = request.url.indexOf(marker)
+      const rest = idx >= 0
+        ? request.url.slice(idx + marker.length)
+        : `${(request.params as { '*': string })['*'] ?? ''}`
+      const anasdPath = `/v1/${rest}`
       await proxyToLocalSocket(request, reply, {
         socketPath: config.anasdSocket,
         anasdPath,

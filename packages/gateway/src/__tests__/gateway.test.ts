@@ -176,6 +176,27 @@ describe('local proxy → anasd socket', () => {
 
     await server.close()
   })
+
+  it('preserves a URL-encoded path segment (%2F) so daemon :path routes match', async () => {
+    // NFS exports are keyed by their URL-encoded mountpoint (/shares/nfs/:path).
+    // The gateway must forward the encoding intact — Fastify decodes the wildcard
+    // param, so building the upstream path from it would corrupt %2F into '/'.
+    const server = createServer({
+      config: baseConfig({ anasdSocket: socketPath }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'DELETE',
+      url: '/api/nodes/testnode/v1/shares/nfs/%2Ftestpool%2Fshare1',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+
+    assert.equal(res.statusCode, 200)
+    assert.equal(received.url, '/v1/shares/nfs/%2Ftestpool%2Fshare1')
+
+    await server.close()
+  })
 })
 
 describe('remote node forwarding', () => {

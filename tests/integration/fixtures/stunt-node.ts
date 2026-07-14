@@ -164,6 +164,44 @@ export async function nfsExportExists(exportPath: string): Promise<boolean> {
 }
 
 /**
+ * Best-effort teardown of a throwaway SMB share, leaving smb.conf clean for
+ * reruns. Surgically deletes the `[name]` stanza (and its indented body up to the
+ * next section or EOF) directly on the real system, then reloads smbd. Never
+ * throws — a GREEN create→remove test removes the stanza through the UI, so this
+ * is a no-op safety net; it only bites when a test aborts mid-flight.
+ */
+export async function removeSmbShare(name: string): Promise<void> {
+  const py = `import re; p='/etc/samba/smb.conf'; s=open(p).read(); s2=re.sub(r'(?ms)^\\[${name}\\].*?(?=^\\[|\\Z)','',s); open(p,'w').write(s2)`
+  await sshExec(`python3 -c "${py}" && systemctl reload smbd 2>/dev/null || true`).catch(() => {})
+}
+
+/**
+ * Best-effort teardown of a throwaway NFS export, leaving /etc/exports clean for
+ * reruns. Deletes any line beginning with the export path, then re-syncs the
+ * kernel export table (`exportfs -ra`). Never throws — a `#` sed delimiter keeps
+ * the slash-heavy path readable.
+ */
+export async function removeNfsExport(exportPath: string): Promise<void> {
+  await sshExec(`sed -i '\\#^${exportPath}[[:space:]]#d' /etc/exports && exportfs -ra 2>/dev/null || true`).catch(() => {})
+}
+
+/**
+ * Create a directory on the real system (an NFS export path must exist before
+ * `exportfs` will accept it). `-p` is idempotent. Best-effort; never throws.
+ */
+export async function makeDir(path: string): Promise<void> {
+  await sshExec(`mkdir -p ${path}`).catch(() => {})
+}
+
+/**
+ * Best-effort removal of a directory staged by makeDir. `rmdir` only removes it
+ * when empty, so a mistakenly-populated path is left intact. Never throws.
+ */
+export async function removeDir(path: string): Promise<void> {
+  await sshExec(`rmdir ${path}`).catch(() => {})
+}
+
+/**
  * Get the output of a command for verification.
  */
 export async function getZpoolStatus(pool: string): Promise<string> {
