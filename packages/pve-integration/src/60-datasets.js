@@ -26,7 +26,10 @@
  * Test hooks: view panel cls 'anas-view anas-view-datasets', tree cls
  * 'anas-grid-datasets', action buttons 'anas-btn-ds-create' /
  * 'anas-btn-ds-detail' / 'anas-btn-ds-edit' / 'anas-btn-ds-perms' /
- * 'anas-btn-ds-destroy', windows 'anas-win-dataset-create' /
+ * 'anas-btn-ds-destroy', the contextual 'anas-btn-ds-share' (submenu items
+ * 'anas-btn-ds-share-smb' / 'anas-btn-ds-share-nfs', Epic 6/7 — opens the
+ * Shares create flow pre-filled from the dataset), windows
+ * 'anas-win-dataset-create' /
  * 'anas-win-dataset-detail' / 'anas-win-dataset-perms'.
  *
  * Snapshots (Epic 5, GET/POST …/datasets/<path>/snapshots and
@@ -454,6 +457,9 @@
         setDisabled(tree, 'dsDetail', !ds);
         setDisabled(tree, 'dsEdit', !ds);
         setDisabled(tree, 'dsPerms', !fs);
+        // Contextual "Share…" is offered on filesystem datasets only — they
+        // have a mountpoint path to share (DESIGN 5a/5d). zvols cannot.
+        setDisabled(tree, 'dsShare', !fs);
         setDisabled(tree, 'dsDestroy', !ds);
         // Snapshot actions: create/list act on a selected dataset; the
         // rollback/rename/destroy trio act on a selected snapshot row.
@@ -462,6 +468,45 @@
         setDisabled(tree, 'snapRollback', !snap);
         setDisabled(tree, 'snapRename', !snap);
         setDisabled(tree, 'snapDestroy', !snap);
+    }
+
+    // ---- Contextual "Share…" (Epic 6/7, DESIGN 5d) -------------------------
+    //
+    // Open the unified Shares create flow pre-filled from a filesystem dataset:
+    // path = the dataset's mountpoint, SMB name suggested from its last path
+    // segment (overridable in the dialog). The Shares view (70-shares.js) owns
+    // the create windows and is resolved lazily — it loads after this file, so
+    // ANAS.shares exists by the time a user clicks. Fail-open: if it is somehow
+    // absent, warn rather than throw.
+
+    function shareDatasetFromTree(node, tree, proto) {
+        var rec = selectedRecord(tree);
+        if (!isFilesystem(rec)) {
+            return;
+        }
+        if (!ANAS.shares || typeof ANAS.shares.openSmbCreate !== 'function'
+            || typeof ANAS.shares.openNfsCreate !== 'function') {
+            alertMsg('Shares unavailable', t('The Shares view is not available.'));
+            return;
+        }
+        var mountpoint = rec.get('mountpoint');
+        if (!mountpoint || mountpoint === 'none' || mountpoint === '-') {
+            alertMsg('Cannot share', t('This dataset has no mountpoint to share.'));
+            return;
+        }
+        var preset = {
+            path: mountpoint,
+            name: lastSegment(rec.get('fullName')),
+        };
+        var onDone = function () {
+            // Nothing to refresh in the datasets tree; the share lives in the
+            // Shares view. runJob already toasts success.
+        };
+        if (proto === 'nfs') {
+            ANAS.shares.openNfsCreate(node, preset, onDone);
+        } else {
+            ANAS.shares.openSmbCreate(node, preset, onDone);
+        }
     }
 
     // ---- Property field vocabularies ---------------------------------------
@@ -2018,6 +2063,10 @@
     // ---- View --------------------------------------------------------------
 
     function datasetsView(node) {
+        // Captured at afterrender so the "Share…" submenu items (which are not
+        // in the tree's component hierarchy, so btn.up('treepanel') can't reach
+        // it) can resolve the tree for the current selection.
+        var treeRef = null;
         var store = Ext.create('Ext.data.TreeStore', {
             fields: [
                 'name', 'fullName', 'pool', 'kind', 'type', 'mountpoint',
@@ -2084,6 +2133,31 @@
                     var tree = btn.up('treepanel');
                     openPermissions(node, tree, selectedRecord(tree));
                 },
+            },
+            {
+                text: t('Share…'),
+                itemId: 'dsShare',
+                cls: 'anas-btn-ds-share',
+                iconCls: 'fa fa-share-alt',
+                disabled: true,
+                menu: [
+                    {
+                        text: t('SMB Share…'),
+                        cls: 'anas-btn-ds-share-smb',
+                        iconCls: 'fa fa-windows',
+                        handler: function () {
+                            shareDatasetFromTree(node, treeRef, 'smb');
+                        },
+                    },
+                    {
+                        text: t('NFS Export…'),
+                        cls: 'anas-btn-ds-share-nfs',
+                        iconCls: 'fa fa-hdd-o',
+                        handler: function () {
+                            shareDatasetFromTree(node, treeRef, 'nfs');
+                        },
+                    },
+                ],
             },
             {
                 text: t('Destroy'),
@@ -2230,6 +2304,7 @@
                 },
                 listeners: {
                     afterrender: function (tree) {
+                        treeRef = tree;
                         loadTree(tree, node);
                     },
                     selectionchange: function () {
