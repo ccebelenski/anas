@@ -1131,6 +1131,10 @@
         var name = mountName(proto, id, path);
 
         var addrStore = Ext.create('Ext.data.Store', { fields: ['name'], data: [] });
+        // Strict pick-list: the addresses come from PVE (the node's real,
+        // known-good addresses). This is a read-only display helper, so free
+        // entry would only invite typos that yield a broken connect string —
+        // pick from the authoritative set, don't hand-type.
         var addrCombo = Ext.create('Ext.form.field.ComboBox', {
             fieldLabel: t('Server address'),
             cls: 'anas-fld-details-addr',
@@ -1140,9 +1144,9 @@
             displayField: 'name',
             valueField: 'name',
             queryMode: 'local',
-            forceSelection: false,
-            editable: true,
-            emptyText: browserHost(),
+            forceSelection: true,
+            editable: false,
+            emptyText: t('Select an address…'),
         });
 
         var tmpl = connectStrings(proto, '', name, path);
