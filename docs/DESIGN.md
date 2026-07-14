@@ -818,7 +818,16 @@ Text-file editing must be safe against races — both ANAS-internal (two jobs) a
 - **Backup before write** — keep a timestamped `.bak` so a bad edit is recoverable (guest philosophy: never destroy).
 - **Reload is a side effect** — after a successful write, reload the service (`systemctl reload smbd`, `exportfs -ra`) as part of the same job, not a separate API call.
 
-> Open sub-decision (no strong preference stated): edit `smb.conf` **in place** (surgical stanza edits, ANAS sees/manages every share incl. admin-created — matches Principle 11) vs. an ANAS-managed **include file** (`include = /etc/samba/anas-shares.conf`, cleaner ownership but splits ANAS vs non-ANAS shares). Leaning in-place for the stateless "manage anything" property; `net conf` registry is a third option but less transparent than a file. Settle before the SMB parser is built.
+Decided: edit `smb.conf` / `/etc/exports` **in place** (surgical stanza edits) — ANAS sees and manages *every* share incl. admin-created, one source of truth (Principle 11). Not an include file (splits ANAS vs non-ANAS shares), not `net conf` registry (less transparent). And **no stage-then-apply** (unlike PVE network config): shares are independent, non-self-locking, and cheap+non-disruptive to reload, so per-operation atomicity (temp-write → rename, one job, immediate reload) is the right granularity; staging would add shadow "pending" state that conflicts with Principle 11. The review benefit comes cheaply via an optional **preview-diff on the confirmation step** of a single mutation.
+
+### 5c. Share network binding — global server bind vs per-share client access
+
+Binding is **server-wide, not per-share** — one `smbd`/`nfsd` listens for all shares.
+
+- **Which address(es) the server serves on = GLOBAL.** SMB: `interfaces = …` + `bind interfaces only = yes` (in the SMB global config — `/v1/shares/smb/global`); this is the multi-NIC lever ("serve NAS traffic on the storage NIC only"). Default is all interfaces. There is no per-share interface binding in vanilla Samba. NFS: server-level (`/etc/nfs.conf`), coarse — MVP relies on per-export client specs rather than interface binding.
+- **Which clients may connect = PER-SHARE.** SMB: `hosts allow`/`hosts deny` (host/subnet allow-lists) on each share. NFS: the per-export client spec (`/export 10.0.0.0/24(rw,sync)`). This segments access by network even while the server listens broadly.
+
+Schema impact: **SmbGlobalConfig** carries `interfaces` + `bindInterfacesOnly` (MVP — multi-NIC is common); **SmbShare** carries `hostsAllow`/`hostsDeny`; **NfsExport** carries client specs (host/subnet + options).
 
 This is more complex to implement but essential to the Proxmox philosophy — the system was here before ANAS and will be here after.
 
