@@ -1405,7 +1405,18 @@
         if (list.length > MAX_INLINE_SNAPS) {
             nodes.push(overflowNode(dsNode.get('pool'), dsNode.get('fullName'), list.length));
         }
-        if (nodes.length) {
+        if (!nodes.length) {
+            return;
+        }
+        // List a dataset's own snapshots BEFORE its child datasets — snapshots
+        // belong directly to the dataset, so keeping them adjacent (above the
+        // child datasets) avoids reading them as nested under a child.
+        var ref = dsNode.firstChild;
+        if (ref) {
+            for (var j = 0; j < nodes.length; j++) {
+                dsNode.insertBefore(nodes[j], ref);
+            }
+        } else {
             dsNode.appendChild(nodes);
         }
     }
