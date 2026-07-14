@@ -40,7 +40,27 @@
  * flat leaf rows, lazy-loaded on first expand (top-5 inline, an 'anas-snap-more'
  * overflow row + 'anas-btn-snap-all' toolbar button open the 'anas-win-snapshots'
  * popup grid 'anas-grid-snapshots'). Snapshot rows carry cls 'anas-snap-row';
- * actions use buttons 'anas-btn-snap-create' / -rollback / -rename / -destroy.
+ * actions use buttons 'anas-btn-snap-create' / -rollback / -rename / -clone /
+ * -destroy.
+ *
+ * Later enhancements (Epics 4.4 / 4.9 / 4.10 / 5.7 / 4.12) add these hooks:
+ *   4.4  associated shares in the detail window — panel cls 'anas-detail-shares'
+ *        (SMB/NFS protocol badges beside each share name; "None" when empty).
+ *   4.9  achieved compression ratio in the detail Usage section, wrapped in a
+ *        '<span class="anas-detail-compressratio">'. The Edit Properties
+ *        compression combo already offers off/lz4/zstd/gzip (+on) and stays
+ *        free-text so any current value survives.
+ *   4.10 dedup control in Edit Properties — combobox cls 'anas-fld-dedup' behind
+ *        a collapsed "Advanced" fieldset; a prominent inline warning (itemId
+ *        'anasDedupWarn') appears whenever dedup != off. Sent via the existing
+ *        properties PUT.
+ *   4.12 sync=disabled inline caution (itemId 'anasSyncWarn') shown/hidden by a
+ *        listener on the sync field.
+ *   5.7  clone a snapshot into a new dataset — window 'anas-win-snap-clone',
+ *        target field 'anas-fld-clone-target', submit 'anas-btn-snap-clone-submit';
+ *        the Clone action is button 'anas-btn-snap-clone' (tree toolbar +
+ *        snapshots popup). POST …/snapshots/:snap/clone { target }, then the tree
+ *        reloads so the new dataset appears.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  */
@@ -470,6 +490,7 @@
         setDisabled(tree, 'snapAll', !ds);
         setDisabled(tree, 'snapRollback', !snap);
         setDisabled(tree, 'snapRename', !snap);
+        setDisabled(tree, 'snapClone', !snap);
         setDisabled(tree, 'snapDestroy', !snap);
     }
 
@@ -755,7 +776,10 @@
             + kv(t('Referenced'), enc(ANAS.formatBytes(d.referenced)))
             + kv(t('Quota'), dashOrBytes(d.quota))
             + kv(t('Compression'), enc(d.compression)
-                + (Number(d.compressratio) > 0 ? ' (' + Number(d.compressratio).toFixed(2) + 'x)' : ''));
+                + (Number(d.compressratio) > 0
+                    ? ' <span class="anas-detail-compressratio">('
+                        + Number(d.compressratio).toFixed(2) + 'x)</span>'
+                    : ''));
         return '<table style="border-collapse:collapse;">' + rows + '</table>';
     }
 
@@ -786,15 +810,32 @@
         return '<table style="border-collapse:collapse;">' + rows + '</table>';
     }
 
+    // Small protocol pill matching the Shares view badge style (70-shares.js
+    // renderProtocol): SMB blue, NFS violet.
+    function shareBadge(proto) {
+        var p = ('' + (proto || '')).toLowerCase();
+        var color = p === 'smb' ? '#3468c0' : '#8a2be2';
+        return '<span class="anas-badge anas-badge-' + enc(p) + '"'
+            + ' style="display:inline-block;padding:1px 8px;border-radius:3px;'
+            + 'color:#fff;font-size:0.85em;background:' + color + ';">'
+            + enc(p.toUpperCase()) + '</span>';
+    }
+
+    // Associated shares (Epic 4.4): each entry is { protocol:'smb'|'nfs', name }
+    // where name is the SMB share name or the NFS export path. Render a protocol
+    // badge beside the name; show "None" when empty.
     function sharesHtml(shares) {
         if (!shares || !shares.length) {
-            return '<p style="color:gray;">' + enc(t('No shares associated with this dataset.')) + '</p>';
+            return '<p style="color:gray;">' + enc(t('None')) + '</p>';
         }
-        var out = '<ul style="margin:0;padding-left:18px;">';
+        var out = '<table style="border-collapse:collapse;">';
         for (var i = 0; i < shares.length; i++) {
-            out += '<li>' + enc(shares[i]) + '</li>';
+            var s = shares[i] || {};
+            out += '<tr><td style="padding:2px 8px 2px 0;white-space:nowrap;vertical-align:top;">'
+                + shareBadge(s.protocol) + '</td>'
+                + '<td style="padding:2px 0;vertical-align:top;">' + enc(s.name || '') + '</td></tr>';
         }
-        return out + '</ul>';
+        return out + '</table>';
     }
 
     function renderDetail(win, d) {
@@ -831,6 +872,7 @@
             },
             {
                 xtype: 'panel',
+                cls: 'anas-detail-shares',
                 title: t('Associated Shares'),
                 bodyPadding: 10,
                 border: false,
@@ -913,6 +955,35 @@
 
     // ---- Edit Properties (story 4.6) ---------------------------------------
 
+    // Show the sync=disabled caution (Epic 4.12) only when the field reads
+    // 'disabled'. The note component lives as a sibling in the same form.
+    function toggleSyncWarn(field) {
+        try {
+            var form = field.up('form');
+            var cmp = form && form.down('#anasSyncWarn');
+            if (cmp) {
+                cmp.setHidden(('' + field.getValue()) !== 'disabled');
+            }
+        } catch (e) {
+            // non-fatal — display hint only
+        }
+    }
+
+    // Show the dedup caution (Epic 4.10) whenever dedup is set to anything other
+    // than 'off'.
+    function toggleDedupWarn(field) {
+        try {
+            var v = '' + (field.getValue() || '');
+            var form = field.up('form');
+            var cmp = form && form.down('#anasDedupWarn');
+            if (cmp) {
+                cmp.setHidden(!v || v === 'off');
+            }
+        } catch (e) {
+            // non-fatal — display hint only
+        }
+    }
+
     function editableFields() {
         return [
             {
@@ -962,6 +1033,20 @@
                 queryMode: 'local',
                 editable: false,
                 forceSelection: true,
+                listeners: {
+                    change: function (f) { toggleSyncWarn(f); },
+                    afterrender: function (f) { toggleSyncWarn(f); },
+                },
+            },
+            {
+                // Epic 4.12 — data-loss caution, shown only when sync=disabled.
+                xtype: 'component',
+                itemId: 'anasSyncWarn',
+                hidden: true,
+                margin: '0 0 8 0',
+                style: 'color:#b35900;font-size:11px;',
+                html: enc(t('sync=disabled risks losing the last few seconds of writes '
+                    + 'on a crash — safe only for reproducible/scratch data.')),
             },
             {
                 xtype: 'checkboxfield',
@@ -974,6 +1059,44 @@
                 name: 'readonly',
                 fieldLabel: t('Read-only'),
                 boxLabel: t('Reject writes to this dataset'),
+            },
+            {
+                // Epic 4.10 — dedup is a foot-gun: keep it collapsed by default.
+                xtype: 'fieldset',
+                title: t('Advanced'),
+                collapsible: true,
+                collapsed: true,
+                margin: '4 0 0 0',
+                items: [
+                    {
+                        xtype: 'combobox',
+                        name: 'dedup',
+                        cls: 'anas-fld-dedup',
+                        fieldLabel: t('Deduplication'),
+                        anchor: '100%',
+                        labelWidth: 150,
+                        store: ['off', 'on', 'verify'],
+                        queryMode: 'local',
+                        editable: false,
+                        forceSelection: true,
+                        listeners: {
+                            change: function (f) { toggleDedupWarn(f); },
+                            afterrender: function (f) { toggleDedupWarn(f); },
+                        },
+                    },
+                    {
+                        xtype: 'component',
+                        itemId: 'anasDedupWarn',
+                        hidden: true,
+                        margin: '4 0 0 0',
+                        style: 'color:#b35900;font-size:11px;',
+                        html: enc(t('Deduplication is costly and hard to undo: budget roughly '
+                            + '1–5 GB of RAM per TB of stored data, and it applies only to data '
+                            + 'written AFTER it is enabled (it is sticky, not retroactive). '
+                            + 'OpenZFS 2.3 "fast dedup" softens the cost but does not remove it. '
+                            + 'Leave this off unless you understand the trade-offs.')),
+                    },
+                ],
             },
         ];
     }
@@ -1015,6 +1138,7 @@
                         sync: p.sync || 'standard',
                         atime: !!p.atime,
                         readonly: !!p.readonly,
+                        dedup: p.dedup || 'off',
                     };
                     form.setValues(original);
                     done();
@@ -1034,6 +1158,7 @@
                     sync: '' + form.findField('sync').getValue(),
                     atime: !!form.findField('atime').getValue(),
                     readonly: !!form.findField('readonly').getValue(),
+                    dedup: '' + (form.findField('dedup').getValue() || ''),
                 };
 
                 var changed = {};
@@ -1063,6 +1188,9 @@
                 }
                 if (current.readonly !== original.readonly) {
                     changed.readonly = current.readonly;
+                }
+                if (current.dedup && current.dedup !== original.dedup) {
+                    changed.dedup = current.dedup;
                 }
 
                 if (!Object.keys(changed).length) {
@@ -2351,6 +2479,111 @@
         });
     }
 
+    // ---- Clone (story 5.7) ------------------------------------------------
+    //
+    // Create a new writable dataset from a snapshot (POST …/snapshots/:snap/clone
+    // with { target }). The clone appears as a brand-new dataset elsewhere in the
+    // tree, so onDone reloads the whole tree rather than just this dataset's
+    // snapshot rows.
+
+    // Suggest "<pool>/<lastSegment>-clone" as a starting target name.
+    function suggestCloneTarget(ctx) {
+        return ctx.pool + '/' + lastSegment(ctx.dataset) + '-clone';
+    }
+
+    function openCloneSnapshot(node, ctx, onDone) {
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-snap-clone',
+                title: t('Clone Snapshot') + ': ' + ctx.fullName,
+                modal: true,
+                width: 480,
+                resizable: false,
+                layout: 'fit',
+                items: [{
+                    xtype: 'form',
+                    itemId: 'form',
+                    bodyPadding: 12,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 170 },
+                    items: [
+                        {
+                            xtype: 'displayfield',
+                            fieldLabel: t('Source snapshot'),
+                            value: enc(ctx.fullName),
+                        },
+                        {
+                            xtype: 'textfield',
+                            itemId: 'target',
+                            cls: 'anas-fld-clone-target',
+                            fieldLabel: t('Target dataset name'),
+                            emptyText: ctx.pool + '/restored',
+                            value: suggestCloneTarget(ctx),
+                            selectOnFocus: true,
+                            allowBlank: false,
+                        },
+                    ],
+                }],
+                buttons: [
+                    {
+                        text: t('Cancel'),
+                        handler: function () { win.close(); },
+                    },
+                    {
+                        text: t('Clone'),
+                        cls: 'anas-btn-snap-clone-submit',
+                        handler: function () {
+                            try {
+                                submitCloneSnapshot(win, node, ctx, onDone);
+                            } catch (e) {
+                                ANAS.warn('snapshot clone submit failed: ' + ANAS.errText(e));
+                            }
+                        },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('snapshot clone window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+    }
+
+    function submitCloneSnapshot(win, node, ctx, onDone) {
+        var form = win.down('#form');
+        var basicForm = form && form.getForm();
+        if (basicForm && basicForm.isValid && !basicForm.isValid()) {
+            return;
+        }
+        var target = (win.down('#target').getValue() || '').trim();
+        if (!target) {
+            alertMsg('Invalid input', t('Enter a target dataset name.'));
+            return;
+        }
+        // Mirror CloneSnapshotRequest's shape (pool/path) so obvious mistakes are
+        // caught before the round-trip; the daemon revalidates.
+        if (!/^[a-z0-9_][\w.:-]*(?:\/[\w.:-]+)*$/i.test(target)) {
+            alertMsg('Invalid input', t('Invalid target dataset name.'));
+            return;
+        }
+        ANAS.runJob({
+            node: node,
+            method: 'post',
+            path: snapshotPath(ctx.pool, ctx.dataset, ctx.snapshotName, 'clone'),
+            body: { target: target },
+            view: win,
+            failTitle: 'Clone failed',
+            successMsg: t('Snapshot cloned to') + ' ' + target,
+            onComplete: function () {
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+                if (onDone) { onDone(); }
+            },
+        });
+    }
+
     // ---- Destroy snapshot (story 5.6) -------------------------------------
     //
     // Not confirmation-gated by the daemon (removes a recovery point, not live
@@ -2405,7 +2638,7 @@
 
         function updatePopupButtons() {
             var has = !!selectedSnap();
-            var ids = ['snapRollback', 'snapRename', 'snapDestroy'];
+            var ids = ['snapRollback', 'snapRename', 'snapClone', 'snapDestroy'];
             for (var i = 0; i < ids.length; i++) {
                 var b = win.down('#' + ids[i]);
                 if (b) { b.setDisabled(!has); }
@@ -2522,6 +2755,21 @@
                             },
                         },
                         {
+                            text: t('Clone'),
+                            itemId: 'snapClone',
+                            cls: 'anas-btn-snap-clone',
+                            iconCls: 'fa fa-copy',
+                            disabled: true,
+                            handler: function () {
+                                var ctx = selectedSnap();
+                                if (ctx) {
+                                    openCloneSnapshot(node, ctx, function () {
+                                        loadTree(tree, node);
+                                    });
+                                }
+                            },
+                        },
+                        {
                             text: t('Destroy'),
                             itemId: 'snapDestroy',
                             cls: 'anas-btn-snap-destroy',
@@ -2585,6 +2833,11 @@
             openRollback(node, ctx, onDone);
         } else if (kind === 'rename') {
             openRenameSnapshot(node, ctx, onDone);
+        } else if (kind === 'clone') {
+            // A clone materialises a new dataset — reload the whole tree.
+            openCloneSnapshot(node, ctx, function () {
+                loadTree(tree, node);
+            });
         } else if (kind === 'destroy') {
             destroySnapshotConfirm(node, ctx, onDone);
         }
@@ -2739,6 +2992,16 @@
                 disabled: true,
                 handler: function (btn) {
                     snapActionFromTree(node, btn.up('treepanel'), 'rename');
+                },
+            },
+            {
+                text: t('Clone Snapshot'),
+                itemId: 'snapClone',
+                cls: 'anas-btn-snap-clone',
+                iconCls: 'fa fa-copy',
+                disabled: true,
+                handler: function (btn) {
+                    snapActionFromTree(node, btn.up('treepanel'), 'clone');
                 },
             },
             {
