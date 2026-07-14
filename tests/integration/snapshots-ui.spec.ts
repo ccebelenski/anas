@@ -64,10 +64,12 @@ test.describe('ANAS snapshots appear under a dataset (stunt node)', () => {
   test.setTimeout(120_000)
 
   test.beforeEach(async () => {
-    for (const name of SNAP_NAMES) {
+    // Start from a clean slate — destroy ALL of share1's snapshots (not just
+    // ours), so a leftover from an earlier run can't break the exact row count.
+    for (const name of await listSnapshots(DS_FQ))
       await destroySnapshot(DS_FQ, name)
+    for (const name of SNAP_NAMES)
       await createSnapshot(DS_FQ, name)
-    }
   })
 
   test.afterEach(async () => {
