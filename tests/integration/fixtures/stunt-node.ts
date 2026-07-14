@@ -208,6 +208,108 @@ export async function getZpoolStatus(pool: string): Promise<string> {
   return sshExec(`zpool status ${pool}`)
 }
 
+// ---- Share identities (Epic 8) ------------------------------------------
+//
+// Source-of-truth probes + best-effort teardown for the Share Users specs.
+// Users/groups are resolved via getent (source-agnostic, exactly like the
+// daemon) — never by parsing /etc/passwd. Teardown mirrors the daemon's own
+// commands in reverse (userdel + smbpasswd -x / groupdel) so a crashed UI run
+// leaves no itest_* leftovers.
+
+/**
+ * Check whether a user is resolvable on the real system (getent passwd).
+ */
+export async function shareUserExists(name: string): Promise<boolean> {
+  try {
+    await sshExec(`getent passwd ${name}`)
+    return true
+  }
+  catch {
+    return false
+  }
+}
+
+/**
+ * Check whether a group is resolvable on the real system (getent group).
+ */
+export async function shareGroupExists(name: string): Promise<boolean> {
+  try {
+    await sshExec(`getent group ${name}`)
+    return true
+  }
+  catch {
+    return false
+  }
+}
+
+/**
+ * Check whether a user has a Samba passdb entry (pdbedit -L) — the source of
+ * truth behind the grid's SMB ✓ column.
+ */
+export async function smbUserExists(name: string): Promise<boolean> {
+  try {
+    const out = await sshExec(`pdbedit -L 2>/dev/null | cut -d: -f1`)
+    return out.split('\n').map(s => s.trim()).includes(name)
+  }
+  catch {
+    return false
+  }
+}
+
+/**
+ * Best-effort teardown of a throwaway share user, leaving the box clean for
+ * reruns. Drops the Samba passdb entry first (smbpasswd -x), then removes the
+ * account (userdel). Never throws — a GREEN test removes the user through the
+ * UI, so this is a no-op safety net that only bites on an aborted run.
+ */
+export async function removeShareUser(name: string): Promise<void> {
+  await sshExec(`smbpasswd -x ${name} 2>/dev/null || true`).catch(() => {})
+  await sshExec(`userdel ${name} 2>/dev/null || true`).catch(() => {})
+}
+
+/**
+ * Best-effort teardown of a throwaway group (groupdel). Never throws.
+ */
+export async function removeShareGroup(name: string): Promise<void> {
+  await sshExec(`groupdel ${name} 2>/dev/null || true`).catch(() => {})
+}
+
+/**
+ * Whether a user is disabled on the real system. Mirrors the daemon's `locked`
+ * derivation exactly: it reads the shadow account-expiry field (getent shadow,
+ * 8th colon-field) and treats a past/day-1 value as expired. `disableUser`
+ * sets `--expiredate 1`; `enableUser` clears it. Returns false when the field
+ * is empty/-1 (never expires) or unreadable.
+ */
+export async function userDisabled(name: string): Promise<boolean> {
+  try {
+    const field = (await sshExec(`getent shadow ${name} | cut -d: -f8`)).trim()
+    if (field === '' || field === '-1')
+      return false
+    const days = Number(field)
+    if (!Number.isFinite(days) || days < 0)
+      return false
+    return days <= Math.floor(Date.now() / 86_400_000)
+  }
+  catch {
+    return false
+  }
+}
+
+/**
+ * List the supplementary/primary groups a user belongs to on the real system
+ * (`id -nG`), e.g. ['itest_usr', 'itest_grp']. Returns [] when unresolvable.
+ */
+export async function userGroups(name: string): Promise<string[]> {
+  try {
+    const out = await sshExec(`id -nG ${name}`)
+    return out.split(/\s+/).map(s => s.trim()).filter(Boolean)
+  }
+  catch {
+    return []
+  }
+}
+
 /**
  * List by-id identifiers of spare (unused) test disks on the stunt node.
  *
