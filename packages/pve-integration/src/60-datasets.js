@@ -19,7 +19,8 @@
  *   POST   /pools/:name/datasets               → 202 { job }  (CreateDatasetRequest)
  *   PUT    /pools/:name/datasets/<path>        → 202 { job }  (UpdateDatasetPropertiesRequest)
  *   DELETE /pools/:name/datasets/<path>[?recursive=true] → 409-confirm then 202
- *   PUT    /pools/:name/datasets/<path>/permissions → 202 { job }  (SetPermissionsRequest)
+ *   GET    /pools/:name/datasets/<path>/access → { data: DatasetAccess } (Epic 4.7.2)
+ *   PUT    /pools/:name/datasets/<path>/access → 202 { job }  (SetAccessRequest)
  *   GET    /identity/users                     → { data: SystemUser[] }
  *   GET    /identity/groups                    → { data: SystemGroup[] }
  *
@@ -30,7 +31,9 @@
  * 'anas-btn-ds-share-smb' / 'anas-btn-ds-share-nfs', Epic 6/7 — opens the
  * Shares create flow pre-filled from the dataset), windows
  * 'anas-win-dataset-create' /
- * 'anas-win-dataset-detail' / 'anas-win-dataset-perms'.
+ * 'anas-win-dataset-detail'. The layered access editor (Epic 4.7.2) opens
+ * 'anas-win-dataset-access' — its full test-hook list is documented in a
+ * comment above openPermissions.
  *
  * Snapshots (Epic 5, GET/POST …/datasets/<path>/snapshots and
  * PUT/DELETE/…/rollback per snapshot): snapshots hang off their dataset as
@@ -1085,7 +1088,75 @@
         });
     }
 
-    // ---- Permissions (story 4.7 — MVP POSIX owner/group/mode) --------------
+    // ---- Permissions: layered access editor (Epic 4.7.2) ------------------
+    //
+    // Replaces the story-4.7 octal editor (Owner/Group combos + Mode textfield +
+    // Recursive checkbox). The base three principals (owner / owning-group /
+    // everyone) map to POSIX mode bits; extra named users/groups map to POSIX
+    // ACL entries. Data contract: packages/shared/src/schemas/access.ts
+    // (DatasetAccess on GET, SetAccessRequest on PUT). The daemon does the
+    // acltype=posixacl enable + default-ACL inheritance; the UI only informs.
+    //
+    // Access-level labels ↔ schema: "No access"↔none, "Read"↔read,
+    // "Read-Write"↔read-write.
+    //
+    // Test hooks (stable selectors targeted by the integration agent):
+    //   window            'anas-win-dataset-access'
+    //   owner picker       'anas-fld-access-owner'
+    //   owner level        'anas-fld-access-owner-level'
+    //   group picker       'anas-fld-access-group'
+    //   group level        'anas-fld-access-group-level'
+    //   everyone level     'anas-fld-access-everyone-level'
+    //   named grid         'anas-grid-access-named'
+    //   add button         'anas-btn-access-add'
+    //   per-row remove     'anas-btn-access-remove'
+    //   apply-existing     'anas-fld-access-recursive'
+    //   Advanced panel     'anas-panel-access-advanced'
+    //   window submit      'anas-btn-dataset-access-submit'
+    //   add-principal win  'anas-win-access-add'
+    //     kind field        'anas-fld-access-add-kind'
+    //     name field        'anas-fld-access-add-name'
+    //     level field       'anas-fld-access-add-level'
+    //     submit            'anas-btn-access-add-submit'
+    //
+    // acl-unsupported / not-enabled handling (from DatasetAccess flags):
+    //   aclSupported === false — no setfacl on this node: the base three rows
+    //     still edit (mode bits) and submit fine; "+ Add user or group" is
+    //     DISABLED with an inline "install acl" note.
+    //   aclEnabled === false (but supported) — adding a named principal is
+    //     allowed and shows a subtle note that it will enable POSIX ACLs
+    //     (acltype=posixacl) on the dataset; the daemon performs the enable.
+
+    // Plain-language level dropdown options (label ↔ schema value).
+    function accessLevelStore() {
+        return Ext.create('Ext.data.Store', {
+            fields: ['level', 'label'],
+            data: [
+                { level: 'none', label: t('No access') },
+                { level: 'read', label: t('Read') },
+                { level: 'read-write', label: t('Read-Write') },
+            ],
+        });
+    }
+
+    // Map a schema level to its display label (grid renderer / fallbacks).
+    function accessLevelLabel(level) {
+        if (level === 'read') { return t('Read'); }
+        if (level === 'read-write') { return t('Read-Write'); }
+        return t('No access');
+    }
+
+    // Level of the first entry matching `kind` in a DatasetAccess.entries list;
+    // defaults to 'none' when absent (the daemon always sends the base three).
+    function baseEntryLevel(entries, kind) {
+        var list = entries || [];
+        for (var i = 0; i < list.length; i++) {
+            if (list[i] && list[i].kind === kind) {
+                return list[i].level || 'none';
+            }
+        }
+        return 'none';
+    }
 
     function identityStore() {
         return Ext.create('Ext.data.Store', {
@@ -1107,6 +1178,155 @@
         });
     }
 
+    // Best-effort refresh of any open dataset-detail window (its Permissions
+    // section reflects owner/group). Fail-open — the tree reload is the primary
+    // refresh; this is a convenience so a visible detail view isn't stale.
+    function reloadVisibleDetail() {
+        try {
+            var wins = Ext.ComponentQuery.query('.anas-win-dataset-detail');
+            for (var i = 0; i < wins.length; i++) {
+                var btn = wins[i].down('button');
+                if (btn && typeof btn.handler === 'function') {
+                    btn.handler(btn);
+                }
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // Small window to add one named user/group grant. The name picker swaps its
+    // store between users and groups as the kind toggles.
+    function openAddPrincipal(parentWin, namedStore, userStore, groupStore, aclEnabled) {
+        var addWin;
+        try {
+            addWin = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-access-add',
+                title: t('Add user or group'),
+                modal: true,
+                width: 380,
+                resizable: false,
+                layout: 'fit',
+                items: [{
+                    xtype: 'form',
+                    itemId: 'form',
+                    bodyPadding: 12,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 90 },
+                    items: [
+                        {
+                            xtype: 'combobox',
+                            itemId: 'kind',
+                            cls: 'anas-fld-access-add-kind',
+                            fieldLabel: t('Type'),
+                            store: Ext.create('Ext.data.Store', {
+                                fields: ['kind', 'label'],
+                                data: [
+                                    { kind: 'user', label: t('User') },
+                                    { kind: 'group', label: t('Group') },
+                                ],
+                            }),
+                            valueField: 'kind',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            value: 'user',
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'name',
+                            cls: 'anas-fld-access-add-name',
+                            fieldLabel: t('Name'),
+                            store: userStore,
+                            valueField: 'name',
+                            displayField: 'name',
+                            queryMode: 'local',
+                            editable: true,
+                            forceSelection: false,
+                            allowBlank: false,
+                            emptyText: t('pick a user'),
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'level',
+                            cls: 'anas-fld-access-add-level',
+                            fieldLabel: t('Access'),
+                            store: accessLevelStore(),
+                            valueField: 'level',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            value: 'read',
+                        },
+                        {
+                            xtype: 'component',
+                            hidden: !!aclEnabled,
+                            style: 'margin-top:6px;color:#888;font-size:11px;',
+                            html: enc(t('Adding a named user or group enables POSIX ACLs '
+                                + '(acltype=posixacl) on this dataset.')),
+                        },
+                    ],
+                }],
+                buttons: [
+                    {
+                        text: t('Cancel'),
+                        handler: function () { addWin.close(); },
+                    },
+                    {
+                        text: t('Add'),
+                        cls: 'anas-btn-access-add-submit',
+                        handler: function () {
+                            try {
+                                var kind = addWin.down('#kind').getValue() || 'user';
+                                var name = (addWin.down('#name').getValue() || '').trim();
+                                var level = addWin.down('#level').getValue() || 'read';
+                                if (!name) {
+                                    alertMsg('Invalid input',
+                                        t('Pick a user or group name.'));
+                                    return;
+                                }
+                                // Collapse duplicates: same kind+name updates level.
+                                var dup = namedStore.findBy(function (r) {
+                                    return r.get('kind') === kind && r.get('name') === name;
+                                });
+                                if (dup !== -1) {
+                                    namedStore.getAt(dup).set('level', level);
+                                } else {
+                                    namedStore.add({ kind: kind, name: name, level: level });
+                                }
+                                addWin.close();
+                            } catch (e) {
+                                ANAS.warn('add principal failed: ' + ANAS.errText(e));
+                            }
+                        },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('add principal window failed: ' + ANAS.errText(e));
+            return;
+        }
+
+        // Swap the name picker's store when the kind toggles.
+        var kindField = addWin.down('#kind');
+        var nameField = addWin.down('#name');
+        if (kindField && nameField) {
+            kindField.on('change', function (f, v) {
+                try {
+                    nameField.bindStore(v === 'group' ? groupStore : userStore);
+                    nameField.setValue('');
+                    nameField.setEmptyText(v === 'group'
+                        ? t('pick a group') : t('pick a user'));
+                } catch (e) {
+                    // non-fatal
+                }
+            });
+        }
+        addWin.show();
+    }
+
     function openPermissions(node, tree, rec) {
         if (!isFilesystem(rec)) {
             return;
@@ -1115,85 +1335,283 @@
         var fullName = rec.get('fullName');
         var userStore = identityStore();
         var groupStore = identityStore();
+        var namedStore = Ext.create('Ext.data.Store', {
+            fields: ['kind', 'name', 'level'],
+            data: [],
+        });
 
         var win;
         try {
             win = Ext.create('Ext.window.Window', {
-                cls: 'anas-win-dataset-perms',
+                cls: 'anas-win-dataset-access',
                 title: t('Permissions') + ': ' + fullName,
                 modal: true,
-                width: 460,
-                resizable: false,
-                layout: 'fit',
-                items: [{
-                    xtype: 'form',
-                    itemId: 'form',
-                    bodyPadding: 12,
-                    border: false,
-                    defaults: { anchor: '100%', labelWidth: 150 },
-                    items: [
-                        {
-                            xtype: 'combobox',
-                            itemId: 'owner',
-                            fieldLabel: t('Owner'),
-                            store: userStore,
-                            valueField: 'name',
-                            displayField: 'name',
-                            queryMode: 'local',
-                            editable: true,
-                            forceSelection: false,
-                            emptyText: t('(unchanged)'),
-                        },
-                        {
-                            xtype: 'combobox',
-                            itemId: 'group',
-                            fieldLabel: t('Group'),
-                            store: groupStore,
-                            valueField: 'name',
-                            displayField: 'name',
-                            queryMode: 'local',
-                            editable: true,
-                            forceSelection: false,
-                            emptyText: t('(unchanged)'),
-                        },
-                        {
-                            xtype: 'textfield',
-                            itemId: 'mode',
-                            fieldLabel: t('Mode (octal)'),
-                            emptyText: '0755',
-                            regex: /^[0-7]{3,4}$/,
-                            regexText: t('Mode must be 3 or 4 octal digits.'),
-                        },
-                        {
-                            xtype: 'checkboxfield',
-                            itemId: 'recursive',
-                            fieldLabel: t('Recursive'),
-                            boxLabel: t('Apply to all descendants'),
-                        },
-                    ],
-                }],
+                width: 560,
+                height: 620,
+                minWidth: 460,
+                minHeight: 480,
+                resizable: true,
+                layout: { type: 'vbox', align: 'stretch' },
+                items: [
+                    {
+                        // Base three principals (mode bits) + apply-existing.
+                        xtype: 'form',
+                        itemId: 'baseForm',
+                        border: false,
+                        bodyPadding: 12,
+                        items: [
+                            {
+                                xtype: 'fieldcontainer',
+                                fieldLabel: t('Owner'),
+                                labelWidth: 120,
+                                anchor: '100%',
+                                layout: 'hbox',
+                                items: [
+                                    {
+                                        xtype: 'combobox',
+                                        itemId: 'owner',
+                                        cls: 'anas-fld-access-owner',
+                                        flex: 1,
+                                        store: userStore,
+                                        valueField: 'name',
+                                        displayField: 'name',
+                                        queryMode: 'local',
+                                        editable: true,
+                                        forceSelection: false,
+                                        emptyText: t('user'),
+                                    },
+                                    {
+                                        xtype: 'combobox',
+                                        itemId: 'ownerLevel',
+                                        cls: 'anas-fld-access-owner-level',
+                                        width: 150,
+                                        margin: '0 0 0 8',
+                                        store: accessLevelStore(),
+                                        valueField: 'level',
+                                        displayField: 'label',
+                                        queryMode: 'local',
+                                        editable: false,
+                                        forceSelection: true,
+                                        value: 'read-write',
+                                    },
+                                ],
+                            },
+                            {
+                                xtype: 'fieldcontainer',
+                                fieldLabel: t('Owning group'),
+                                labelWidth: 120,
+                                anchor: '100%',
+                                layout: 'hbox',
+                                items: [
+                                    {
+                                        xtype: 'combobox',
+                                        itemId: 'group',
+                                        cls: 'anas-fld-access-group',
+                                        flex: 1,
+                                        store: groupStore,
+                                        valueField: 'name',
+                                        displayField: 'name',
+                                        queryMode: 'local',
+                                        editable: true,
+                                        forceSelection: false,
+                                        emptyText: t('group'),
+                                    },
+                                    {
+                                        xtype: 'combobox',
+                                        itemId: 'groupLevel',
+                                        cls: 'anas-fld-access-group-level',
+                                        width: 150,
+                                        margin: '0 0 0 8',
+                                        store: accessLevelStore(),
+                                        valueField: 'level',
+                                        displayField: 'label',
+                                        queryMode: 'local',
+                                        editable: false,
+                                        forceSelection: true,
+                                        value: 'read',
+                                    },
+                                ],
+                            },
+                            {
+                                xtype: 'fieldcontainer',
+                                fieldLabel: t('Everyone'),
+                                labelWidth: 120,
+                                anchor: '100%',
+                                layout: 'hbox',
+                                items: [
+                                    {
+                                        xtype: 'combobox',
+                                        itemId: 'everyoneLevel',
+                                        cls: 'anas-fld-access-everyone-level',
+                                        width: 150,
+                                        store: accessLevelStore(),
+                                        valueField: 'level',
+                                        displayField: 'label',
+                                        queryMode: 'local',
+                                        editable: false,
+                                        forceSelection: true,
+                                        value: 'none',
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        // Named users & groups (POSIX ACL entries).
+                        xtype: 'grid',
+                        itemId: 'named',
+                        cls: 'anas-grid-access-named',
+                        title: t('Named users & groups'),
+                        flex: 1,
+                        margin: '0 12 0 12',
+                        border: true,
+                        store: namedStore,
+                        selModel: { mode: 'SINGLE' },
+                        plugins: [{ ptype: 'cellediting', clicksToEdit: 1 }],
+                        emptyText: t('No named users or groups.'),
+                        columns: [
+                            {
+                                text: t('Type'),
+                                dataIndex: 'kind',
+                                width: 90,
+                                renderer: function (v) {
+                                    return v === 'group' ? t('Group') : t('User');
+                                },
+                            },
+                            {
+                                text: t('Name'),
+                                dataIndex: 'name',
+                                flex: 1,
+                                renderer: Ext.String.htmlEncode,
+                            },
+                            {
+                                text: t('Access'),
+                                dataIndex: 'level',
+                                width: 150,
+                                renderer: function (v) {
+                                    return enc(accessLevelLabel(v));
+                                },
+                                editor: {
+                                    xtype: 'combobox',
+                                    store: accessLevelStore(),
+                                    valueField: 'level',
+                                    displayField: 'label',
+                                    queryMode: 'local',
+                                    editable: false,
+                                    forceSelection: true,
+                                },
+                            },
+                            {
+                                xtype: 'widgetcolumn',
+                                width: 50,
+                                sortable: false,
+                                menuDisabled: true,
+                                widget: {
+                                    xtype: 'button',
+                                    cls: 'anas-btn-access-remove',
+                                    iconCls: 'fa fa-times',
+                                    tooltip: t('Remove'),
+                                    handler: function (btn) {
+                                        try {
+                                            var r = btn.getWidgetRecord();
+                                            if (r) { namedStore.remove(r); }
+                                        } catch (e) {
+                                            ANAS.warn('remove principal failed: '
+                                                + ANAS.errText(e));
+                                        }
+                                    },
+                                },
+                            },
+                        ],
+                        tbar: [
+                            {
+                                text: t('Add user or group'),
+                                itemId: 'addBtn',
+                                cls: 'anas-btn-access-add',
+                                iconCls: 'fa fa-plus',
+                                handler: function () {
+                                    try {
+                                        openAddPrincipal(win, namedStore,
+                                            userStore, groupStore,
+                                            win._aclEnabled);
+                                    } catch (e) {
+                                        ANAS.warn('open add principal failed: '
+                                            + ANAS.errText(e));
+                                    }
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        // Inline note for acl-unsupported / not-enabled states.
+                        xtype: 'component',
+                        itemId: 'aclNote',
+                        hidden: true,
+                        margin: '6 12 0 12',
+                        style: 'color:#888;font-size:11px;',
+                        html: '',
+                    },
+                    {
+                        // Apply-to-existing + helptext.
+                        xtype: 'container',
+                        margin: '8 12 0 12',
+                        items: [
+                            {
+                                xtype: 'checkbox',
+                                itemId: 'recursive',
+                                cls: 'anas-fld-access-recursive',
+                                boxLabel: t('Apply to existing files too'),
+                            },
+                            {
+                                xtype: 'component',
+                                style: 'color:#888;font-size:11px;margin:2px 0 0 18px;',
+                                html: enc(t('New files always inherit these settings; '
+                                    + 'tick this to also update files already in the folder.')),
+                            },
+                        ],
+                    },
+                    {
+                        // Advanced: read-only raw getfacl view.
+                        xtype: 'panel',
+                        cls: 'anas-panel-access-advanced',
+                        title: t('Advanced'),
+                        collapsible: true,
+                        collapsed: true,
+                        titleCollapse: true,
+                        margin: '8 12 8 12',
+                        border: true,
+                        bodyPadding: 8,
+                        maxHeight: 200,
+                        scrollable: true,
+                        items: [{
+                            xtype: 'component',
+                            itemId: 'aclText',
+                            style: 'font-family:monospace;white-space:pre;font-size:11px;',
+                            html: enc(t('No ACL entries.')),
+                        }],
+                    },
+                ],
                 buttons: [
                     {
                         text: t('Cancel'),
-                        handler: function () {
-                            win.close();
-                        },
+                        handler: function () { win.close(); },
                     },
                     {
                         text: t('Apply'),
-                        cls: 'anas-btn-dataset-perms-submit',
+                        cls: 'anas-btn-dataset-access-submit',
                         handler: function () {
                             try {
-                                submitPermissions(win, node, tree, pool, fullName);
+                                submitAccess(win, node, tree, pool, fullName, namedStore);
                             } catch (e) {
-                                ANAS.warn('dataset perms submit failed: ' + ANAS.errText(e));
+                                ANAS.warn('dataset access submit failed: '
+                                    + ANAS.errText(e));
                             }
                         },
                     },
                 ],
             });
         } catch (e) {
-            ANAS.warn('dataset perms window failed: ' + ANAS.errText(e));
+            ANAS.warn('dataset access window failed: ' + ANAS.errText(e));
             return;
         }
 
@@ -1204,19 +1622,20 @@
             // non-fatal
         }
 
-        // Load pickers and current permissions in parallel; prefill from the
-        // dataset's current mountpoint ownership when present.
-        var detailCall = ANAS.api.get(node, datasetPath(pool, fullName)).then(function (res) {
-            return (res && res.data && res.data.permissions) || null;
-        }, function (err) {
-            ANAS.warn('dataset perms detail load failed: ' + ANAS.errText(err));
-            return null;
-        });
+        var accessCall = ANAS.api.get(node, datasetPath(pool, fullName, 'access')).then(
+            function (res) {
+                // Reads are wrapped in { data }; tolerate a bare object too.
+                return (res && res.data) ? res.data : res;
+            },
+            function (err) {
+                ANAS.warn('dataset access load failed: ' + ANAS.errText(err));
+                return null;
+            });
 
         Promise.all([
             loadIdentity(node, '/identity/users', userStore, 'users'),
             loadIdentity(node, '/identity/groups', groupStore, 'groups'),
-            detailCall,
+            accessCall,
         ]).then(function (results) {
             if (win.destroyed || win.destroying) {
                 return;
@@ -1226,61 +1645,109 @@
             } catch (e) {
                 // non-fatal
             }
-            var perms = results[2];
-            if (perms) {
-                var ownerField = win.down('#owner');
-                var groupField = win.down('#group');
-                var modeField = win.down('#mode');
-                if (ownerField && perms.owner) {
-                    ownerField.setValue(perms.owner);
-                }
-                if (groupField && perms.group) {
-                    groupField.setValue(perms.group);
-                }
-                if (modeField && perms.mode) {
-                    modeField.setValue(perms.mode);
-                }
+            var acc = results[2];
+            if (!acc) {
+                return;
+            }
+            try {
+                populateAccess(win, namedStore, acc);
+            } catch (e) {
+                ANAS.warn('populate access failed: ' + ANAS.errText(e));
             }
         });
     }
 
-    function submitPermissions(win, node, tree, pool, fullName) {
-        var form = win.down('#form');
-        var basicForm = form && form.getForm();
-        if (basicForm && basicForm.isValid && !basicForm.isValid()) {
-            return;
+    // Fill the window's fields from a DatasetAccess payload and reflect the
+    // aclSupported / aclEnabled flags into the add button + inline note.
+    function populateAccess(win, namedStore, acc) {
+        var entries = acc.entries || [];
+        var ownerField = win.down('#owner');
+        var groupField = win.down('#group');
+        if (ownerField && acc.owner) { ownerField.setValue(acc.owner); }
+        if (groupField && acc.group) { groupField.setValue(acc.group); }
+
+        var ownerLevel = win.down('#ownerLevel');
+        var groupLevel = win.down('#groupLevel');
+        var everyoneLevel = win.down('#everyoneLevel');
+        if (ownerLevel) { ownerLevel.setValue(baseEntryLevel(entries, 'owner')); }
+        if (groupLevel) { groupLevel.setValue(baseEntryLevel(entries, 'owning-group')); }
+        if (everyoneLevel) { everyoneLevel.setValue(baseEntryLevel(entries, 'everyone')); }
+
+        // Named entries → grid.
+        var named = [];
+        for (var i = 0; i < entries.length; i++) {
+            var e = entries[i];
+            if (e && (e.kind === 'user' || e.kind === 'group')) {
+                named.push({ kind: e.kind, name: e.name || '', level: e.level || 'none' });
+            }
         }
+        namedStore.loadData(named);
+
+        // Advanced: raw getfacl text (view-only).
+        var aclTextCmp = win.down('#aclText');
+        if (aclTextCmp) {
+            var raw = acc.aclText;
+            aclTextCmp.setHtml(raw ? enc(raw) : enc(t('No ACL entries.')));
+        }
+
+        // Flag-driven states.
+        var supported = acc.aclSupported !== false;
+        var enabled = acc.aclEnabled === true;
+        win._aclEnabled = enabled;
+        var addBtn = win.down('#addBtn');
+        var note = win.down('#aclNote');
+        if (!supported) {
+            if (addBtn) { addBtn.setDisabled(true); }
+            if (note) {
+                note.setHtml(enc(t('Named users/groups need the acl package '
+                    + '(setfacl) installed on this node.')));
+                note.setHidden(false);
+            }
+        } else if (!enabled) {
+            if (addBtn) { addBtn.setDisabled(false); }
+            if (note) {
+                note.setHtml(enc(t('Adding a named user or group will enable POSIX ACLs '
+                    + '(acltype=posixacl) on this dataset.')));
+                note.setHidden(false);
+            }
+        } else {
+            if (addBtn) { addBtn.setDisabled(false); }
+            if (note) { note.setHidden(true); }
+        }
+    }
+
+    function submitAccess(win, node, tree, pool, fullName, namedStore) {
         var owner = (win.down('#owner').getValue() || '').trim();
         var group = (win.down('#group').getValue() || '').trim();
-        var mode = (win.down('#mode').getValue() || '').trim();
-        var recursive = !!win.down('#recursive').getValue();
+        var ownerLevel = win.down('#ownerLevel').getValue() || 'none';
+        var groupLevel = win.down('#groupLevel').getValue() || 'none';
+        var everyoneLevel = win.down('#everyoneLevel').getValue() || 'none';
+        var applyToExisting = !!win.down('#recursive').getValue();
 
-        var body = {};
-        if (owner) {
-            body.owner = owner;
-        }
-        if (group) {
-            body.group = group;
-        }
-        if (mode) {
-            if (!/^[0-7]{3,4}$/.test(mode)) {
-                alertMsg('Invalid input', t('Mode must be 3 or 4 octal digits.'));
-                return;
-            }
-            body.mode = mode;
-        }
-        if (body.owner === undefined && body.group === undefined && body.mode === undefined) {
-            alertMsg('Invalid input', t('Set at least one of owner, group, or mode.'));
-            return;
-        }
-        if (recursive) {
-            body.recursive = true;
-        }
+        // Always send the base three, then any named principals.
+        var entries = [
+            { kind: 'owner', level: ownerLevel },
+            { kind: 'owning-group', level: groupLevel },
+            { kind: 'everyone', level: everyoneLevel },
+        ];
+        namedStore.each(function (r) {
+            var name = (r.get('name') || '').trim();
+            if (!name) { return; }
+            entries.push({
+                kind: r.get('kind') === 'group' ? 'group' : 'user',
+                name: name,
+                level: r.get('level') || 'none',
+            });
+        });
+
+        var body = { entries: entries, applyToExisting: applyToExisting };
+        if (owner) { body.owner = owner; }
+        if (group) { body.group = group; }
 
         ANAS.runJob({
             node: node,
             method: 'put',
-            path: datasetPath(pool, fullName, 'permissions'),
+            path: datasetPath(pool, fullName, 'access'),
             body: body,
             view: win,
             failTitle: 'Set permissions failed',
@@ -1290,6 +1757,7 @@
                     win.close();
                 }
                 loadTree(tree, node);
+                reloadVisibleDetail();
             },
         });
     }
