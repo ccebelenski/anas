@@ -1,0 +1,13 @@
+# /etc/exports: the access control list for filesystems which may be exported
+#               to NFS clients.  See exports(5).
+#
+# Example for NFSv2 and NFSv3:
+# /srv/homes       hostname1(rw,sync,no_subtree_check) hostname2(ro,sync,no_subtree_check)
+
+/srv/nfs/media    192.168.1.0/24(rw,sync,no_subtree_check) 10.0.0.5(ro,sync,no_subtree_check)
+/srv/nfs/backups  *(ro,sync,no_subtree_check,root_squash)
+
+# Legacy export — hand-maintained, leave it exactly as-is
+/export/legacy		nfsclient.example.com(rw,async,no_root_squash)
+
+"/srv/nfs/my documents"  192.168.1.0/24(rw,sync)

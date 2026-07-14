@@ -1,4 +1,7 @@
 import type { CommandExecutor } from './executor/types.js'
+import { writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import Fastify from 'fastify'
 import { AuditLogger } from './audit/logger.js'
 import { MockExecutor } from './executor/mock.js'
@@ -12,6 +15,7 @@ import { diskRoutes } from './routes/disks.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
 import { poolRoutes } from './routes/pools.js'
+import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { ConfirmStore } from './safety/confirm.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
 
@@ -32,6 +36,12 @@ export function createServer(opts?: ServerOptions) {
   const executor: CommandExecutor = opts?.mock
     ? new MockExecutor()
     : new ProdExecutor()
+
+  // /etc/exports location (Epic 7). Override via ANAS_EXPORTS_PATH — tests point
+  // it at a temp file; dev mock (without the override) seeds a writable copy of
+  // the fixture below so reads show sample data and writes never touch the host.
+  const envExportsPath = process.env.ANAS_EXPORTS_PATH
+  let exportsPath = envExportsPath ?? '/etc/exports'
 
   // Register mock fixtures for dev mode
   if (opts?.mock) {
@@ -135,6 +145,21 @@ export function createServer(opts?: ServerOptions) {
     // Dynamic-arg zfs mutations (create/set/destroy) — command-only fallback,
     // taking effect only when no exact read fixture above matches.
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    // --- Epic 7: NFS exports ---------------------------------------------
+    // `exportfs -ra` reloads the kernel export table after each mutation.
+    mock.addFixture({ command: '/usr/sbin/exportfs', args: ['-ra'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    // Seed a writable temp /etc/exports from the fixture (unless overridden), so
+    // dev reads real sample exports and writes never touch the host's file.
+    if (!envExportsPath) {
+      exportsPath = join(tmpdir(), `anas-mock-exports-${process.pid}`)
+      try {
+        writeFileSync(exportsPath, mockFixtures.nfsExportsText())
+      }
+      catch {
+        // best-effort seed — readConfig tolerates a missing file (empty list)
+      }
+    }
   }
 
   const confirmStore = new ConfirmStore()
@@ -143,6 +168,7 @@ export function createServer(opts?: ServerOptions) {
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
   server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
+  server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
 
