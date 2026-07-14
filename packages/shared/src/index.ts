@@ -49,6 +49,16 @@ export {
   SmartHealth,
 } from './schemas/disks.js'
 
+// Job schemas
+export {
+  Job,
+  JobAccepted,
+  JobDetail,
+  JobList,
+  JobRef,
+  JobStatus,
+} from './schemas/jobs.js'
+
 // Share schemas (SMB + NFS)
 export {
   CreateNfsExportRequest,
@@ -64,16 +74,6 @@ export {
   UpdateSmbGlobalConfigRequest,
   UpdateSmbShareRequest,
 } from './schemas/shares.js'
-
-// Job schemas
-export {
-  Job,
-  JobAccepted,
-  JobDetail,
-  JobList,
-  JobRef,
-  JobStatus,
-} from './schemas/jobs.js'
 
 // Snapshot schemas
 export {
