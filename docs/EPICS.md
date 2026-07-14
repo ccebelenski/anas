@@ -316,21 +316,23 @@ Story numbering is for identification only, not implementation order. Within eac
 
 > **SCOPE (decided 2026-07-14): "Minimal" — create share users, not login/PVE users.** A user ANAS creates has no login shell and no Unix password (`useradd -M -s nologin`); it owns files (NFS) and optionally holds an SMB password (`smbpasswd`). We do NOT write PVE's `user.cfg` or grant PVE login (a user we create is available for PVE to reference as `@pam` if the admin later chooses — we don't do it for them). Directory users (AD/LDAP) are consumed read-only via getent; in an AD deployment no local users are made at all. Endpoints live under `/v1/identity/*`.
 
+> **Status: Unit 1 shipped 2026-07-14.** 8.1–8.6 done — getent/pdbedit-backed `/v1/identity/*` (enriched `ShareUser`/`ShareGroup` lists, source-agnostic; regular-user band [1000,60000)+root filters service accounts), create user (`useradd -M -s nologin`, no login/no Unix password), SMB password (`smbpasswd -s`, password on stdin — never argv), enable/disable, group create + membership, and the "Share Users" UI panel (directory users read-only). Verified live: full create → SMB password → group → disable lifecycle, password confirmed absent from the process list.
+
 ### Stories
 
 #### Observe
-8.1. As a user, I want to see system users relevant to share access (filtering out system/service accounts), so that I understand the access landscape without noise.
+8.1. [done] As a user, I want to see system users relevant to share access (filtering out system/service accounts), so that I understand the access landscape without noise.
 
 #### Act
-8.2. As a user, I want to create a system user, so that they can access shares. *(Focused on share access, not full user administration.)*
+8.2. [done] As a user, I want to create a system user, so that they can access shares. *(Focused on share access, not full user administration.)*
 
-8.3. As a user, I want to create a group, so that I can organize share permissions.
+8.3. [done] As a user, I want to create a group, so that I can organize share permissions.
 
-8.4. As a user, I want to add/remove users from groups, so that I can manage access at the group level.
+8.4. [done] As a user, I want to add/remove users from groups, so that I can manage access at the group level.
 
-8.5. As a user, I want to set an SMB password for a user, so that they can authenticate to SMB shares.
+8.5. [done] As a user, I want to set an SMB password for a user, so that they can authenticate to SMB shares.
 
-8.6. As a user, I want to disable a user's access without deleting them, so that I can temporarily revoke access.
+8.6. [done] As a user, I want to disable a user's access without deleting them, so that I can temporarily revoke access.
 
 ---
 

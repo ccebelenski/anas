@@ -28,12 +28,14 @@ export interface GroupEntry {
 }
 
 /**
- * Share-relevant ids: root (0) plus real accounts (>= 1000). Filters out the
- * 1..999 service-account range so pickers/lists show a clean access landscape
- * (story 8.1). Reused for both uids and gids.
+ * Share-relevant ids: root (0) plus the regular-user band [1000, 60000)
+ * (Debian login.defs UID_MIN..UID_MAX). Filters out both the 1..999 service
+ * range AND high dynamically-allocated system accounts (e.g. `ceph` 64045,
+ * `nobody` 65534) so pickers/lists show a clean access landscape (story 8.1).
+ * Reused for both uids and gids.
  */
 export function isShareRelevant(id: number): boolean {
-  return id === 0 || id >= 1000
+  return id === 0 || (id >= 1000 && id < 60000)
 }
 
 /**
