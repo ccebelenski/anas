@@ -1,4 +1,8 @@
 import type { CommandExecutor } from './executor/types.js'
+import { copyFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { AuditLogger } from './audit/logger.js'
 import { MockExecutor } from './executor/mock.js'
@@ -12,6 +16,7 @@ import { diskRoutes } from './routes/disks.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
 import { poolRoutes } from './routes/pools.js'
+import { smbShareRoutes } from './routes/shares-smb.js'
 import { ConfirmStore } from './safety/confirm.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
 
@@ -20,6 +25,12 @@ export interface ServerOptions {
   mock?: boolean
   /** Enable request logging. Default: true. Disable in unit tests. */
   logger?: boolean
+  /**
+   * Path to smb.conf (config IS the API — Principle 13). Defaults to
+   * $SMB_CONF_PATH, else a throwaway temp copy of the dev fixture in mock mode,
+   * else /etc/samba/smb.conf.
+   */
+  smbConfPath?: string
 }
 
 export function createServer(opts?: ServerOptions) {
@@ -135,14 +146,40 @@ export function createServer(opts?: ServerOptions) {
     // Dynamic-arg zfs mutations (create/set/destroy) — command-only fallback,
     // taking effect only when no exact read fixture above matches.
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    // --- Epic 6: SMB shares ----------------------------------------------
+    // smbstatus --json: one live connection to the [media] share.
+    mock.addFixture({ command: '/usr/bin/smbstatus', args: ['--json'], result: {
+      stdout: JSON.stringify({
+        sessions: {
+          3410950666: { username: 'media', remote_machine: '10.0.0.50', hostname: 'ipv4:10.0.0.50:49610' },
+        },
+        tcons: {
+          3813605233: { service: 'media', session_id: '3410950666', machine: '10.0.0.50' },
+        },
+      }),
+      stderr: '',
+      exitCode: 0,
+    } })
+    // smbstatus -S text fallback (unused when --json is available).
+    mock.addFixture({ command: '/usr/bin/smbstatus', args: ['-S'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    // systemctl reload smbd — config-change side effect.
+    mock.addFixture({ command: '/usr/bin/systemctl', args: ['reload', 'smbd'], result: { stdout: '', stderr: '', exitCode: 0 } })
   }
 
   const confirmStore = new ConfirmStore()
+
+  // Resolve the smb.conf path: explicit option > env > (mock: throwaway temp
+  // copy of the dev fixture so mock writes never clobber the repo) > default.
+  const smbConfPath = opts?.smbConfPath
+    ?? process.env.SMB_CONF_PATH
+    ?? (opts?.mock ? createMockSmbConf() : '/etc/samba/smb.conf')
 
   server.register(healthRoutes, { prefix: '/v1' })
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
   server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
+  server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
 
@@ -150,4 +187,17 @@ export function createServer(opts?: ServerOptions) {
   server.decorate('executor', executor)
 
   return server
+}
+
+/**
+ * Copy the dev smb.conf fixture to a throwaway temp file and return its path.
+ * Mock-mode share mutations then edit this copy (surgical, atomic) instead of a
+ * real system file or the repo fixture.
+ */
+function createMockSmbConf(): string {
+  const here = dirname(fileURLToPath(import.meta.url))
+  const fixture = join(here, 'fixtures/samba/smb.conf')
+  const dest = join(tmpdir(), `anas-mock-smb-${process.pid}.conf`)
+  copyFileSync(fixture, dest)
+  return dest
 }
