@@ -801,6 +801,25 @@ ANAS is fully stateless regarding config management. It does not track which sha
 
 This means ANAS can manage any share or export, regardless of whether ANAS created it or someone added it manually. It's a tool, not an owner.
 
+### 5a. Shares are storage-agnostic — a path is a path (decided July 2026)
+
+ANAS manages shares by editing `smb.conf` / `/etc/exports` directly. It does **NOT** use ZFS's `sharesmb`/`sharenfs` dataset properties, even though those are useful and used elsewhere. Rationale: a share is just a directory **path** plus protocol options — it doesn't care what filesystem backs it. Editing the Samba/NFS config keeps the share layer completely decoupled from the storage backend, so the **same** share management works over ZFS datasets today and md + LVM + btrfs later (Epic 11). Tying shares to `sharesmb` would fork the share layer per backend. So: a filesystem dataset's mountpoint is the *usual* share path, but the share machinery only knows about paths and config files.
+
+Consequence: the "Share this" action is offered only on **filesystem** datasets (they have a mountpoint); ZFS **volumes** (zvols) are block devices with no path to share — that's iSCSI/PVE territory, out of scope. A dataset's "associated shares" (story 4.4) are resolved by matching share paths against the dataset's mountpoint.
+
+### 5b. Concurrency safety for config-file writes
+
+Text-file editing must be safe against races — both ANAS-internal (two jobs) and external (an admin editing `smb.conf` by hand). The model:
+
+- **Serialize ANAS writes** — a per-file async mutex in anasd so two jobs never read-modify-write the same config concurrently. (All mutations already funnel through the single anasd job queue.)
+- **Always read fresh, never cache** — re-read the current file at the start of every mutation (Principle 11), so the edit is applied to the real current state, minimizing the external-edit window.
+- **Optimistic change-detection** — capture a hash (or mtime+size) of the file at read; before writing, re-read and compare. If it changed underneath us (external edit), abort and surface a conflict rather than clobbering — the operator re-drives against fresh state.
+- **Atomic replace** — write the new content to a temp file in the same directory, `fsync`, then `rename()` over the original (atomic on POSIX). Readers and the service reload never see a half-written file.
+- **Backup before write** — keep a timestamped `.bak` so a bad edit is recoverable (guest philosophy: never destroy).
+- **Reload is a side effect** — after a successful write, reload the service (`systemctl reload smbd`, `exportfs -ra`) as part of the same job, not a separate API call.
+
+> Open sub-decision (no strong preference stated): edit `smb.conf` **in place** (surgical stanza edits, ANAS sees/manages every share incl. admin-created — matches Principle 11) vs. an ANAS-managed **include file** (`include = /etc/samba/anas-shares.conf`, cleaner ownership but splits ANAS vs non-ANAS shares). Leaning in-place for the stateless "manage anything" property; `net conf` registry is a third option but less transparent than a file. Settle before the SMB parser is built.
+
 This is more complex to implement but essential to the Proxmox philosophy — the system was here before ANAS and will be here after.
 
 ### 6. Session Management: Proxmox owns the session (no ANAS session at all)
