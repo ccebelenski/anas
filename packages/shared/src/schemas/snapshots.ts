@@ -51,7 +51,7 @@ export const CloneSnapshotRequest = z.object({
   target: z.string()
     .min(1)
     .max(255)
-    .regex(/^[a-z0-9_][\w.:-]*(?:\/[\w.:-]+)*$/i, 'must be a valid ZFS dataset name (pool/path)'),
+    .regex(/^\w[\w.:-]*(?:\/[\w.:-]+)*$/, 'must be a valid ZFS dataset name (pool/path)'),
 })
 export type CloneSnapshotRequest = z.infer<typeof CloneSnapshotRequest>
 
