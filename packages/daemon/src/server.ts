@@ -16,6 +16,7 @@ import { diskRoutes } from './routes/disks.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
 import { poolRoutes } from './routes/pools.js'
+import { shareIdentityRoutes } from './routes/share-identity.js'
 import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { smbShareRoutes } from './routes/shares-smb.js'
 import { ConfirmStore } from './safety/confirm.js'
@@ -124,32 +125,69 @@ export function createServer(opts?: ServerOptions) {
     // chown / chmod succeed for any target in dev mock.
     mock.addFixture({ command: '/usr/bin/chown', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/chmod', result: { stdout: '', stderr: '', exitCode: 0 } })
-    // getent pickers (source-agnostic via nsswitch) — a representative sample.
-    mock.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: {
+    // --- Epic 8: identity (getent-backed, source-agnostic via nsswitch) ---
+    // Representative sample: root (0), a local SMB-enabled share user (media,
+    // uid 1000), a filtered service account (backup-svc keeps uid 1001 so it
+    // stays share-relevant; sub-1000 daemon/bin/www-data are filtered out), and
+    // a group with members (smbusers). In dev mock every user/group is "local".
+    const getentPasswd = [
+      'root:x:0:0:root:/root:/bin/bash',
+      'daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin',
+      'bin:x:2:2:bin:/bin:/usr/sbin/nologin',
+      'www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin',
+      'media:x:1000:1000:Media User:/home/media:/usr/sbin/nologin',
+      'backup-svc:x:1001:1001::/home/backup-svc:/usr/sbin/nologin',
+      '',
+    ].join('\n')
+    const getentGroup = [
+      'root:x:0:',
+      'daemon:x:1:',
+      'users:x:100:',
+      'media:x:1000:media',
+      'smbusers:x:1001:media,backup-svc',
+      '',
+    ].join('\n')
+    mock.addFixture({ command: '/usr/bin/getent', args: ['passwd'], result: { stdout: getentPasswd, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/getent', args: ['group'], result: { stdout: getentGroup, stderr: '', exitCode: 0 } })
+    // `-s files` = only the LOCAL DB (marks a user/group manageable vs directory).
+    mock.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd'], result: { stdout: getentPasswd, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'group'], result: { stdout: getentGroup, stderr: '', exitCode: 0 } })
+    // getent shadow — expiry drives the `locked` flag; backup-svc is expired.
+    mock.addFixture({ command: '/usr/bin/getent', args: ['shadow'], result: {
       stdout: [
-        'root:x:0:0:root:/root:/bin/bash',
-        'daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin',
-        'bin:x:2:2:bin:/bin:/usr/sbin/nologin',
-        'www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin',
-        'media:x:1000:1000:Media User:/home/media:/bin/bash',
-        'backup-svc:x:1001:1001::/home/backup-svc:/usr/sbin/nologin',
+        'root:!:19000:0:99999:7:::',
+        'media:!:19000:0:99999:7:::',
+        'backup-svc:!:19000:0:99999:7::1:',
         '',
       ].join('\n'),
       stderr: '',
       exitCode: 0,
     } })
-    mock.addFixture({ command: '/usr/bin/getent', args: ['group'], result: {
-      stdout: [
-        'root:x:0:',
-        'daemon:x:1:',
-        'users:x:100:',
-        'media:x:1000:media',
-        'smbusers:x:1001:media,backup-svc',
-        '',
-      ].join('\n'),
+    // pdbedit -L — which users have a Samba passdb entry (SMB-enabled). Only media.
+    mock.addFixture({ command: '/usr/bin/pdbedit', args: ['-L'], result: {
+      stdout: 'media:1000:Media User\n',
       stderr: '',
       exitCode: 0,
     } })
+    // Single-name getent lookups used by the detail GET + mutation existence
+    // checks. Command-only fallbacks below return exit 0 for any other name,
+    // which the routes read as "resolves / is local" — fine for dev mutations.
+    mock.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'media'], result: { stdout: 'media:x:1000:1000:Media User:/home/media:/usr/sbin/nologin\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/getent', args: ['group', 'smbusers'], result: { stdout: 'smbusers:x:1001:media,backup-svc\n', stderr: '', exitCode: 0 } })
+    // Identity mutations (useradd/usermod/groupadd/gpasswd/smbpasswd) — dynamic
+    // args, so command-only fallbacks let dev-mode mutations succeed.
+    mock.addFixture({ command: '/usr/sbin/useradd', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/usermod', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/groupadd', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/gpasswd', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/smbpasswd', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // Command-only getent fallback (exit 0, non-parseable stdout). Registered
+    // AFTER the exact fixtures so those still win. It makes the LOCAL check
+    // (`getent -s files <db> <name>`, which only tests exit 0) pass for the
+    // sample users/groups, so their mutations don't 409-as-directory in dev. It
+    // does NOT resolve as a valid passwd/group line, so `resolveUser`/`resolveGroup`
+    // still return null for unknown names → the 404/409 paths behave correctly.
+    mock.addFixture({ command: '/usr/bin/getent', result: { stdout: 'x\n', stderr: '', exitCode: 0 } })
     // Dynamic-arg zfs mutations (create/set/destroy) — command-only fallback,
     // taking effect only when no exact read fixture above matches.
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -203,6 +241,7 @@ export function createServer(opts?: ServerOptions) {
   server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath })
   server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
+  server.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
 
