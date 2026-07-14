@@ -26,6 +26,7 @@ export const mockFixtures = {
   zfsList: () => fixtureResult('zfs', 'zfs-list.json'),
   zfsGetAll: () => fixtureResult('zfs', 'zfs-get-all.json'),
   zfsGetMedia: () => fixtureResult('zfs', 'zfs-get-media.json'),
+  zfsSnapshotsMedia: () => fixtureResult('zfs', 'zfs-snapshots-media.json'),
   lsblk: () => fixtureResult('system', 'lsblk.json'),
   diskByIdListing: () => fixtureResult('system', 'disk-by-id.txt'),
   smartctl: () => fixtureResult('system', 'smartctl.json'),

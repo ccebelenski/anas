@@ -6,7 +6,7 @@ import { ProdExecutor } from './executor/prod.js'
 import { mockFixtures } from './fixtures/loader.js'
 import { JobQueue } from './jobs/queue.js'
 import { LSBLK_ARGS } from './parsers/lsblk.js'
-import { zfsListArgs } from './parsers/zfs-list.js'
+import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
 import { datasetRoutes } from './routes/datasets.js'
 import { diskRoutes } from './routes/disks.js'
 import { healthRoutes } from './routes/health.js'
@@ -99,6 +99,10 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', 'testpool'], result: mockFixtures.zfsGetAll() })
     // Mountpoint stat for the media dataset's permissions.
     mock.addFixture({ command: '/usr/bin/stat', args: ['-c', '%U %G %a', '/testpool/media'], result: { stdout: 'root root 755\n', stderr: '', exitCode: 0 } })
+    // --- Epic 5: snapshots — testpool/media has two (snap1 older, snap2 newer).
+    // Reads need real JSON; snapshot/rename/rollback/destroy mutations succeed
+    // via the command-only `/usr/sbin/zfs` fallback registered below.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: zfsSnapshotDetailArgs('testpool/media'), result: mockFixtures.zfsSnapshotsMedia() })
     // chown / chmod succeed for any target in dev mock.
     mock.addFixture({ command: '/usr/bin/chown', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/chmod', result: { stdout: '', stderr: '', exitCode: 0 } })

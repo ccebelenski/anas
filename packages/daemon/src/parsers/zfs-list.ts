@@ -6,8 +6,8 @@
  * their stable ZFS name/path (Principle 13).
  */
 
-import type { Dataset, DatasetProperties } from '@anas/shared'
-import { parseDedupRatio, parseHumanSize, parseZfsBool } from './utils.js'
+import type { Dataset, DatasetProperties, Snapshot } from '@anas/shared'
+import { parseDedupRatio, parseHumanSize, parseZfsBool, parseZfsDate } from './utils.js'
 
 interface ZfsPropertyRaw {
   value: string
@@ -19,6 +19,12 @@ interface ZfsDatasetRaw {
   /** "FILESYSTEM" | "VOLUME" | "SNAPSHOT" | "BOOKMARK" */
   type: string
   pool?: string
+  /** Parent dataset (present on SNAPSHOT entries), e.g. "tank/media". */
+  dataset?: string
+  /** Label after '@' (present on SNAPSHOT entries), e.g. "nightly". */
+  snapshot_name?: string
+  /** Creation transaction group — monotonic, breaks creation-time ties. */
+  createtxg?: string
   properties: Record<string, ZfsPropertyRaw>
 }
 
@@ -42,6 +48,15 @@ export function zfsListArgs(pool: string): string[] {
 /** `zfs list` argument array for a dataset's snapshots (name only). */
 export function zfsSnapshotListArgs(dataset: string): string[] {
   return ['list', '-j', '-r', '-o', 'name', '-t', 'snapshot', dataset]
+}
+
+/**
+ * `zfs list` argument array for a dataset's snapshots with the columns the
+ * Snapshot read model needs (creation/used/referenced). `-r` includes the
+ * snapshots of child datasets too.
+ */
+export function zfsSnapshotDetailArgs(dataset: string): string[] {
+  return ['list', '-j', '-r', '-o', 'name,creation,used,referenced', '-t', 'snapshot', dataset]
 }
 
 /** Normalise a ZFS mountpoint value to a path or null (volumes / unmounted). */
@@ -97,6 +112,48 @@ export function parseSnapshotNames(json: string | ZfsListOutput): string[] {
   return Object.values(data.datasets)
     .filter(ds => ds.type.toLowerCase() === 'snapshot')
     .map(ds => ds.name)
+}
+
+/**
+ * Parse `zfs list -j -t snapshot` output into the Snapshot read model, sorted
+ * newest-first. `created` comes from the human `creation` string (→ ISO);
+ * `used`/`referenced` from the human sizes. Ordering is by creation time
+ * descending, with the monotonic `createtxg` breaking ties (and standing in
+ * when a creation string fails to parse).
+ */
+export function parseSnapshotList(json: string | ZfsListOutput): Snapshot[] {
+  const data: ZfsListOutput = typeof json === 'string' ? JSON.parse(json) : json
+  const result: (Snapshot & { _createtxg: number })[] = []
+
+  for (const ds of Object.values(data.datasets)) {
+    if (ds.type.toLowerCase() !== 'snapshot')
+      continue
+
+    const prop = (name: string) => ds.properties[name]?.value ?? ''
+    const atIndex = ds.name.indexOf('@')
+    const dataset = ds.dataset ?? (atIndex >= 0 ? ds.name.slice(0, atIndex) : ds.name)
+    const snapshotName = ds.snapshot_name ?? (atIndex >= 0 ? ds.name.slice(atIndex + 1) : ds.name)
+    const created = parseZfsDate(prop('creation'))
+
+    result.push({
+      name: ds.name,
+      dataset,
+      snapshotName,
+      pool: ds.pool ?? ds.name.split('/')[0],
+      created: created ?? new Date(0).toISOString(),
+      used: parseHumanSize(prop('used')),
+      referenced: parseHumanSize(prop('referenced')),
+      _createtxg: Number.parseInt(ds.createtxg ?? '', 10) || 0,
+    })
+  }
+
+  result.sort((a, b) => {
+    if (a.created !== b.created)
+      return a.created < b.created ? 1 : -1
+    return b._createtxg - a._createtxg
+  })
+
+  return result.map(({ _createtxg, ...snap }) => snap)
 }
 
 function parseSync(value: string): 'standard' | 'always' | 'disabled' {
