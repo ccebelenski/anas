@@ -283,10 +283,18 @@ export async function datasetRoutes(
     return { owner, group, mode }
   }
 
-  /** Is `getfacl`/`setfacl` present (the `acl` package)? Feature-detect. */
-  async function aclSupported(): Promise<boolean> {
-    const r = await executor.exec(GETFACL, ['--version'])
-    return r.exitCode === 0
+  /**
+   * Is `getfacl`/`setfacl` present (the `acl` package)? Feature-detect, then
+   * memoize: whether the package is installed does not change at runtime, so we
+   * probe `getfacl --version` once per process instead of on every access
+   * request. The cache is a closure variable, so a fresh server (each
+   * `createServer()` re-invokes `datasetRoutes`) starts with a fresh cache. A
+   * cached Promise avoids a concurrent double-probe.
+   */
+  let aclSupportedCache: Promise<boolean> | null = null
+  function aclSupported(): Promise<boolean> {
+    aclSupportedCache ??= executor.exec(GETFACL, ['--version']).then(r => r.exitCode === 0)
+    return aclSupportedCache
   }
 
   /** The dataset's `acltype` value (`off`, `posixacl`, …); '' if unreadable. */
@@ -867,19 +875,30 @@ export async function datasetRoutes(
             // Also drop the setgid bit we set for ACL inheritance — with the
             // named grants gone there is nothing to inherit, and a leftover
             // setgid would make the reported mode (e.g. 2775 vs 775) misleading.
-            const unsetgidArgs = recursive ? ['-R', 'g-s', mountpoint] : ['g-s', mountpoint]
-            updateProgress(`chmod g-s ${mountpoint}`)
-            const unsetR = await executor.exec(CHMOD, unsetgidArgs)
-            if (unsetR.exitCode !== 0)
-              throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
+            // Non-recursive: a cheap standalone chmod on the single directory.
+            // Recursive: the setgid-clear is folded into the mode chmod below
+            // (one `-R` walk instead of two — the `g-s` clause rides along with
+            // the base-perm clauses in a single traversal).
+            if (!recursive) {
+              updateProgress(`chmod g-s ${mountpoint}`)
+              const unsetR = await executor.exec(CHMOD, ['g-s', mountpoint])
+              if (unsetR.exitCode !== 0)
+                throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
+            }
           }
           // Recursive: symbolic perms with capital `X` so execute is applied only
           // to directories (and already-executable files), never sprinkled onto
-          // plain data files. Non-recursive: numeric octal is correct — the
-          // mountpoint is always a directory.
-          // ASSUMPTION (verify live): `chmod -R 'u=rwX,g=rX,o=' <mp>` is accepted
-          // by GNU coreutils chmod (symbolic mode with X, comma-separated clauses).
-          const mode = recursive ? levelsToSymbolic(base) : levelsToMode(base)
+          // plain data files. When we cleared ACLs, append `,g-s` so the setgid
+          // bit is removed in the SAME recursive walk (the `=` clauses set the
+          // base perms, `g-s` strips setgid). Non-recursive: numeric octal is
+          // correct — the mountpoint is always a directory — and the setgid-clear
+          // above stays its own cheap call.
+          // ASSUMPTION (verify live): `chmod -R 'u=rwX,g=rX,o=,g-s' <mp>` is
+          // accepted by GNU coreutils chmod (symbolic mode with X, comma-separated
+          // clauses mixing `=` and `-` operators).
+          const mode = recursive
+            ? (clearAcls ? `${levelsToSymbolic(base)},g-s` : levelsToSymbolic(base))
+            : levelsToMode(base)
           const modeArgs = recursive ? ['-R', mode, mountpoint] : [mode, mountpoint]
           updateProgress(`chmod ${mode} ${mountpoint}`)
           const modeR = await executor.exec(CHMOD, modeArgs)

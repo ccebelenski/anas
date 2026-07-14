@@ -323,6 +323,38 @@ describe('access routes', () => {
       assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g-s')), ['g-s', MP])
       assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('755')), ['755', MP]) // 7,5,5
     })
+
+    it('recursively clears the ACL then folds setgid-drop into a single chmod -R', async () => {
+      server = createServer({ mock: true, logger: false })
+      // Same posixacl dataset with a live named entry, but applyToExisting so the
+      // whole subtree is walked. The setgid-clear must ride along with the mode
+      // chmod (one `-R` traversal), not be a second independent recursive walk.
+      const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ entries: [
+          { kind: 'owner', level: 'read-write' },
+          { kind: 'owning-group', level: 'read' },
+          { kind: 'everyone', level: 'read' },
+        ], applyToExisting: true }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+
+      // The ACL clear is a different tool (setfacl) and stays recursive.
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-R', '-b', '-k', MP])
+      // A SINGLE recursive chmod carries both the base perms (symbolic X) and the
+      // setgid-drop clause — not two `chmod -R` walks.
+      const chmodR = calls.filter(c => c.command === '/usr/bin/chmod' && c.args[0] === '-R')
+      assert.equal(chmodR.length, 1, 'exactly one recursive chmod')
+      assert.deepEqual(chmodR[0].args, ['-R', 'u=rwX,g=rX,o=rX,g-s', MP])
+      // No standalone `chmod -R g-s`.
+      assert.equal(find(calls, '/usr/bin/chmod', a => a.length === 3 && a[0] === '-R' && a[1] === 'g-s'), undefined)
+    })
   })
 
   // --- PUT /access: applyToExisting recurses ------------------------------
