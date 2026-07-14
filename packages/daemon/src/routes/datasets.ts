@@ -214,7 +214,15 @@ function parseSnapshotTail(wildcard: string): SnapshotTail | null {
 
 export async function datasetRoutes(
   server: FastifyInstance,
-  opts: { executor: CommandExecutor, jobQueue: JobQueue, confirmStore: ConfirmStore },
+  opts: {
+    executor: CommandExecutor
+    jobQueue: JobQueue
+    confirmStore: ConfirmStore
+    /** smb.conf path — for reporting shares that serve a dataset (Epic 4.4). */
+    smbConfPath?: string
+    /** /etc/exports path — for reporting NFS exports of a dataset (Epic 4.4). */
+    exportsPath?: string
+  },
 ) {
   const { executor, jobQueue, confirmStore } = opts
 

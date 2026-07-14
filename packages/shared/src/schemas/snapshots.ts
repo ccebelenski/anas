@@ -42,6 +42,19 @@ export const RenameSnapshotRequest = z.object({
 })
 export type RenameSnapshotRequest = z.infer<typeof RenameSnapshotRequest>
 
+/**
+ * Clone a snapshot into a new writable dataset (POST …/snapshots/:snap/clone).
+ * `target` is the full ZFS name of the dataset to create (e.g. "tank/restored")
+ * — it must not already exist. `zfs clone <snapshot> <target>`.
+ */
+export const CloneSnapshotRequest = z.object({
+  target: z.string()
+    .min(1)
+    .max(255)
+    .regex(/^[a-z0-9_][\w.:-]*(?:\/[\w.:-]+)*$/i, 'must be a valid ZFS dataset name (pool/path)'),
+})
+export type CloneSnapshotRequest = z.infer<typeof CloneSnapshotRequest>
+
 // Rollback (POST …/snapshots/:snap/rollback) and destroy (DELETE) need no body:
 // the snapshot is identified by the URL. Rollback is dangerous and goes through
 // the confirmation flow; snapshot destroy is a plain 202 (removes a recovery

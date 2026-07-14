@@ -34,6 +34,7 @@ export {
 
 // Dataset schemas
 export {
+  AssociatedShare,
   CreateDatasetRequest,
   Dataset,
   DatasetDetail,
@@ -98,6 +99,7 @@ export {
 
 // Snapshot schemas
 export {
+  CloneSnapshotRequest,
   CreateSnapshotRequest,
   RenameSnapshotRequest,
   Snapshot,
@@ -120,6 +122,7 @@ export {
   ScanState,
   ScanStatus,
   ScrubRequest,
+  TrimPoolRequest,
   UpdatePoolPropertiesRequest,
   Vdev,
   VdevGroup,

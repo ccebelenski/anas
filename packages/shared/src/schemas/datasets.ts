@@ -65,13 +65,25 @@ export const MountpointPermissions = z.object({
 })
 export type MountpointPermissions = z.infer<typeof MountpointPermissions>
 
+/**
+ * A share (SMB or NFS) serving this dataset's mountpoint (Epic 4.4). Sourced by
+ * matching smb.conf / /etc/exports paths against the mountpoint — so admin-made
+ * shares surface too (Principle 11). `name` is the SMB share name or the NFS
+ * export path.
+ */
+export const AssociatedShare = z.object({
+  protocol: z.enum(['smb', 'nfs']),
+  name: z.string(),
+})
+export type AssociatedShare = z.infer<typeof AssociatedShare>
+
 /** Full dataset detail (GET /v1/pools/:name/datasets/*path). */
 export const DatasetDetail = Dataset.extend({
   properties: DatasetProperties,
   /** null for volumes / unmounted datasets */
   permissions: MountpointPermissions.nullable(),
-  /** SMB/NFS shares on this dataset — empty until Epics 6/7 exist */
-  associatedShares: z.array(z.string()),
+  /** SMB/NFS shares serving this dataset's mountpoint (Epic 4.4) */
+  associatedShares: z.array(AssociatedShare),
 })
 export type DatasetDetail = z.infer<typeof DatasetDetail>
 

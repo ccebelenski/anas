@@ -275,6 +275,15 @@ export const ScrubRequest = z.object({
 })
 export type ScrubRequest = z.infer<typeof ScrubRequest>
 
+/** Trim a pool's SSDs (POST /v1/pools/:name/trim) — Epic 4.12. */
+export const TrimPoolRequest = z.object({
+  action: z.enum(['start', 'cancel']).default('start'),
+})
+export type TrimPoolRequest = z.infer<typeof TrimPoolRequest>
+
+// Pool feature-flag upgrade (POST /v1/pools/:name/upgrade) needs no body — it
+// enables all supported features on the pool. One-way; the UI must warn.
+
 /** Export a pool (POST /v1/pools/:name/export) */
 export const ExportPoolRequest = z
   .object({

@@ -290,7 +290,9 @@ export function createServer(opts?: ServerOptions) {
   server.register(healthRoutes, { prefix: '/v1' })
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
   server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
-  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
+  // datasetRoutes also reads the share configs to report associated shares
+  // (Epic 4.4) and warn on destroy — same paths the share routes edit.
+  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath })
   server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath })
   server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
   server.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })

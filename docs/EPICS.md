@@ -275,7 +275,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 6.7. As a user, I want to remove an SMB share from the configuration, so that I can revoke access to a path.
 
-6.8. As a user, I want ANAS to reload the SMB service after configuration changes, so that changes take effect without manual intervention.
+6.8. [done] As a user, I want ANAS to reload the SMB service after configuration changes, so that changes take effect without manual intervention. *(Already satisfied: `reloadSmbd()` runs as a side effect of every SMB mutation — the "service reloads are side effects of mutations, not separate API calls" principle. NFS's `exportfs -ra` (7.6) is the same.)*
 
 ---
 

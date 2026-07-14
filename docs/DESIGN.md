@@ -432,6 +432,8 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `zpool.create` | `zpool create [opts] <name> <vdevs...>` |
 | `zpool.destroy` | `zpool destroy <name>` |
 | `zpool.scrub` | `zpool scrub <name>` |
+| `zpool.trim` | `zpool trim <name>` / `zpool trim -c <name>` (cancel) — Epic 4.12 |
+| `zpool.upgrade` | `zpool upgrade <name>` (enable feature flags; one-way) — Epic 4.12 |
 | `zpool.set` | `zpool set <prop>=<val> <name>` |
 | `zpool.add` | `zpool add <name> <vdev-spec...>` |
 | `zpool.attach` | `zpool attach <name> <device> <new-device>` |
@@ -446,6 +448,9 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `zfs.get` | `zfs get -j <props> <dataset>` (JSON) |
 | `zfs.snapshot` | `zfs snapshot <dataset>@<name>` |
 | `zfs.rollback` | `zfs rollback <snapshot>` |
+| `zfs.clone` | `zfs clone <snapshot> <target-dataset>` — Epic 5.7 |
+
+> **Associated shares (Epic 4.4):** a dataset's detail lists SMB/NFS shares serving its mountpoint by matching the mountpoint against `smb.conf` share paths and `/etc/exports` paths (read-only; reuses the share parsers). The same lookup feeds the destroy-confirmation warnings.
 
 ### Filesystem permissions (dataset mountpoints — Epic 4.7, POSIX MVP)
 | Operation | Command |
