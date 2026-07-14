@@ -455,6 +455,18 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `identity.users` | `getent passwd` (owner/group pickers — via nsswitch, NOT /etc/passwd; source-agnostic) |
 | `identity.groups` | `getent group` |
 
+### Layered access / ACLs (dataset mountpoints — Epic 4.7.2, POSIX ACLs)
+
+The base three principals (owner / owning-group / everyone) are **mode bits** (`chown`/`chmod`); extra named principals are **POSIX ACL entries**. A named entry requires the `acl` package (feature-detected — if `setfacl` is absent, the base editor still works and named grants are disabled with an "install acl" hint) AND `acltype=posixacl` on the dataset (auto-enabled on first named grant, with a notice). Granting a principal also writes a matching **default ACL** (+ setgid on the dir) so new files inherit; `applyToExisting` recurses. Level → perms: none=`---`, read=`r-x`/`X`, read-write=`rwx`. Mask is managed so the reported group level stays truthful.
+
+| Operation | Command |
+|-----------|---------|
+| `fs.acl.get` | `getfacl -pcE <mountpoint>` (and `getfacl` on a probe for feature-detect) |
+| `fs.acl.set` | `setfacl [-R] -m <spec>[,…] <mountpoint>` (access + `-d` default entries) |
+| `fs.acl.clear` | `setfacl [-R] -b -k <mountpoint>` (remove access + default ACLs) |
+| `fs.acltype.enable` | `zfs set acltype=posixacl xattr=sa <dataset>` (first named grant only) |
+| `fs.acltype.get` | `zfs get -Hp -o value acltype <dataset>` |
+
 ### SMB Operations
 | Operation | Command |
 |-----------|---------|

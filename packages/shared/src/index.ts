@@ -2,6 +2,14 @@
 
 export const VERSION = '0.1.0'
 
+// Access / permissions schemas (layered editor — Epic 4.7.2)
+export {
+  AccessEntry,
+  AccessLevel,
+  DatasetAccess,
+  SetAccessRequest,
+} from './schemas/access.js'
+
 // API envelope schemas
 export {
   ApiError,
