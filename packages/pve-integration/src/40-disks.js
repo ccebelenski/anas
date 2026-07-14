@@ -16,6 +16,14 @@
  * GET /disks/:id/smart returns full SmartData (attributes / temperature /
  * powerOnHours) on demand for the S.M.A.R.T. detail window.
  *
+ * GROUPING (story 3.20): the grid is grouped by a computed `groupKey` derived
+ * from each disk's pool → vdev association, so a large fleet stays scannable.
+ * Pool members group under "<pool> / <vdev>"; disks in no pool fall into a
+ * single "Unassigned / Available" group. This is pure ExtJS grid grouping (a
+ * `grouping` feature on a groupField), NOT a hand-rolled tree, and it degrades
+ * to an ungrouped grid if the grouping feature cannot be built. Test hook on
+ * the grid: `anas-grid-disks-grouped` (alongside the existing `anas-grid-disks`).
+ *
  * FRAMEWORK CONTRACT: window.ANAS exists with ANAS.api.get (Promise-returning,
  * path relative to /v1, rejections carry .status/.body) plus the shared helpers
  * ANAS.t / ANAS.formatBytes / ANAS.errText / ANAS.warn / ANAS.errorPanel. The
@@ -74,6 +82,45 @@
 
     function colored(text, color) {
         return '<span style="color:' + color + ';">' + enc(text) + '</span>';
+    }
+
+    // --- Grouping (story 3.20) -------------------------------------------
+
+    // Compute the group a disk belongs to: primary by pool, secondary by vdev
+    // ("<pool> / <vdev>"), with any disk not associated with a pool collapsed
+    // into a single "Unassigned / Available" group. Uses the same fields the
+    // Usage column already reads (status / poolName / vdevName / vdevRole), so
+    // no new data is required. Fail-open: any surprise → Unassigned.
+    function groupKeyFor(rec) {
+        try {
+            var pool = rec.get('poolName');
+            if (rec.get('status') !== 'pool_member' || !pool) {
+                return t('Unassigned / Available');
+            }
+            var vdev = rec.get('vdevName') || rec.get('vdevRole') || '';
+            return vdev ? (pool + ' / ' + vdev) : pool;
+        } catch (e) {
+            return t('Unassigned / Available');
+        }
+    }
+
+    // Build the grouping feature for the grid. Returns an empty array if the
+    // feature cannot be constructed, so the grid still renders ungrouped —
+    // graceful degradation per the story.
+    function groupingFeatures() {
+        try {
+            return [{
+                ftype: 'grouping',
+                // Group header shows the pool/vdev label + a member count so a
+                // vdev's disk count is visible at a glance.
+                groupHeaderTpl: '{name} ({rows.length})',
+                enableGroupingMenu: false,
+                collapsible: true,
+            }];
+        } catch (e) {
+            ANAS.warn('disk grouping disabled: ' + ANAS.errText(e));
+            return [];
+        }
     }
 
     // --- Renderers -------------------------------------------------------
@@ -425,9 +472,21 @@
                         return info.rank;
                     },
                 },
+                // Derived pool → vdev group key (story 3.20). Placed after the
+                // pool/vdev/status fields so rec.get() sees populated values.
+                {
+                    name: 'groupKey',
+                    type: 'string',
+                    convert: function (v, rec) {
+                        return groupKeyFor(rec);
+                    },
+                },
             ],
             data: [],
-            // Default sort: at-risk first, stable tiebreak by device name.
+            // Group by pool → vdev; disks not in a pool share one group.
+            groupField: 'groupKey',
+            // Default sort within each group: at-risk first, stable tiebreak
+            // by device name (the global triage order still holds per group).
             sorters: [
                 { property: 'healthRank', direction: 'ASC' },
                 { property: 'name', direction: 'ASC' },
@@ -443,9 +502,11 @@
             items: [{
                 xtype: 'gridpanel',
                 itemId: 'anasDisksGrid',
-                cls: 'anas-grid-disks',
+                cls: 'anas-grid-disks anas-grid-disks-grouped',
                 border: false,
                 store: store,
+                // Group by pool → vdev (story 3.20); [] → ungrouped fallback.
+                features: groupingFeatures(),
                 emptyText: t('No disks found'),
                 // The Disk cell renders the by-id over the kernel name/model on
                 // two lines, so let row height grow to fit.
