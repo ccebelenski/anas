@@ -1,10 +1,10 @@
-import type { CreateDatasetRequest, Dataset, DatasetDetail, MountpointPermissions, SystemGroup, SystemUser, UpdateDatasetPropertiesRequest } from '@anas/shared'
+import type { CreateDatasetRequest, Dataset, DatasetDetail, MountpointPermissions, Snapshot, SystemGroup, SystemUser, UpdateDatasetPropertiesRequest } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import { CreateDatasetRequest as CreateDatasetRequestSchema, DatasetPath, PoolName, SetPermissionsRequest, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
-import { parseDatasetGet, parseSnapshotNames, parseZfsList, zfsListArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
+import { CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, PoolName, RenameSnapshotRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
+import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { confirmGate } from '../safety/gate.js'
 import { requireIdentity } from './identity.js'
@@ -104,6 +104,41 @@ function parseGroup(stdout: string): SystemGroup[] {
   return groups
 }
 
+/**
+ * The snapshot sub-resource of a dataset wildcard, or null if the wildcard is a
+ * plain dataset path. find-my-way only allows a terminal wildcard, so the whole
+ * `<datasetpath>/snapshots/<snap>/<action>` tail arrives as one `*` capture.
+ * Split on the `snapshots` path segment: everything before it is the dataset
+ * path (may contain '/'), everything after is the snapshot sub-resource.
+ * Snapshot names never contain '/', so this is unambiguous.
+ *
+ *   media/snapshots                 → { datasetPath: 'media' }                       (collection)
+ *   media/movies/snapshots/snap1    → { datasetPath: 'media/movies', snap: 'snap1' } (item)
+ *   media/snapshots/snap1/rollback  → { datasetPath: 'media', snap: 'snap1', rollback }
+ *   snapshots                       → { datasetPath: '' }                            (pool-root dataset)
+ */
+interface SnapshotTail {
+  datasetPath: string
+  snap?: string
+  rollback: boolean
+  /** Trailing segments we don't understand (→ 404). */
+  extra: boolean
+}
+
+function parseSnapshotTail(wildcard: string): SnapshotTail | null {
+  const parts = wildcard.split('/')
+  const idx = parts.indexOf('snapshots')
+  if (idx === -1)
+    return null
+
+  const datasetPath = parts.slice(0, idx).join('/')
+  const rest = parts.slice(idx + 1)
+  const snap = rest[0]
+  const rollback = rest.length === 2 && rest[1] === 'rollback'
+  const known = rest.length === 0 || rest.length === 1 || rollback
+  return { datasetPath, snap, rollback, extra: !known }
+}
+
 export async function datasetRoutes(
   server: FastifyInstance,
   opts: { executor: CommandExecutor, jobQueue: JobQueue, confirmStore: ConfirmStore },
@@ -131,6 +166,37 @@ export async function datasetRoutes(
     if (r.exitCode !== 0 || !r.stdout.trim())
       return []
     return parseSnapshotNames(r.stdout)
+  }
+
+  /** Does the named dataset (or pool-root dataset) exist? */
+  async function datasetExists(poolName: string, fullName: string): Promise<boolean> {
+    const datasets = await listDatasets(poolName)
+    return datasets.some(d => d.name === fullName)
+  }
+
+  /** A dataset's snapshots, newest-first (empty when it has none). */
+  async function listSnapshotsDetail(fullName: string): Promise<Snapshot[]> {
+    const r = await executor.exec(ZFS, zfsSnapshotDetailArgs(fullName))
+    if (r.exitCode !== 0 || !r.stdout.trim())
+      return []
+    return parseSnapshotList(r.stdout)
+  }
+
+  /**
+   * Resolve the pool + wildcard tail to a dataset full name, validating the
+   * dataset path (empty tail = the pool-root dataset). Returns null after
+   * sending a 400 on an invalid path.
+   */
+  function resolveDatasetName(poolName: string, datasetPath: string, reply: FastifyReply): string | null {
+    if (!datasetPath)
+      return poolName
+    const parsed = DatasetPath.safeParse(datasetPath)
+    if (!parsed.success) {
+      reply.code(400)
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${parsed.error.issues[0]?.message}` } })
+      return null
+    }
+    return `${poolName}/${parsed.data}`
   }
 
   /** Stat a mountpoint for owner/group/mode, or null if it can't be read. */
@@ -168,6 +234,18 @@ export async function datasetRoutes(
   server.get<{ Params: { 'name': string, '*': string } }>('/pools/:name/datasets/*', async (request, reply) => {
     const poolName = request.params.name
     const path = request.params['*']
+
+    // Snapshot sub-resource: `<dataset>/snapshots[/<snap>]`.
+    const tail = parseSnapshotTail(path)
+    if (tail) {
+      if (tail.extra) {
+        reply.code(404)
+        return { error: { code: 'NOT_FOUND', message: `Unknown snapshot resource '${path}'` } }
+      }
+      return tail.snap
+        ? snapshotDetail(poolName, tail.datasetPath, tail.snap, reply)
+        : listSnapshots(poolName, tail.datasetPath, reply)
+    }
 
     const fullName = path ? `${poolName}/${path}` : poolName
 
@@ -249,6 +327,31 @@ export async function datasetRoutes(
     return { job }
   })
 
+  // --- POST /pools/:name/datasets/*path/snapshots[...] — snapshot actions --
+  // The only POST on the dataset wildcard is the snapshot sub-resource: create
+  // a snapshot (collection) or roll back to one (`/snapshots/:snap/rollback`).
+  server.post<{ Params: { 'name': string, '*': string }, Querystring: { force?: string } }>('/pools/:name/datasets/*', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+    const wildcard = request.params['*']
+
+    const tail = parseSnapshotTail(wildcard)
+    if (!tail || tail.extra || (tail.snap && !tail.rollback)) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Unknown resource '${wildcard}'` } }
+    }
+
+    if (tail.rollback && tail.snap)
+      return rollbackSnapshot(poolName, tail.datasetPath, tail.snap, request, reply)
+
+    // Collection POST → create a snapshot.
+    return createSnapshot(poolName, tail.datasetPath, request, reply)
+  })
+
   // --- PUT /pools/:name/datasets/*path — update props OR permissions ------
   // find-my-way only permits a wildcard as the final segment, so a nested
   // dataset path plus a `/permissions` suffix cannot be two routes. We branch
@@ -262,6 +365,16 @@ export async function datasetRoutes(
     }
     const poolName = nameParsed.data
     const wildcard = request.params['*']
+
+    // Snapshot rename: `<dataset>/snapshots/<snap>`.
+    const tail = parseSnapshotTail(wildcard)
+    if (tail) {
+      if (!tail.snap || tail.rollback || tail.extra) {
+        reply.code(404)
+        return { error: { code: 'NOT_FOUND', message: `Unknown snapshot resource '${wildcard}'` } }
+      }
+      return renameSnapshot(poolName, tail.datasetPath, tail.snap, request, reply)
+    }
 
     const PERM_SUFFIX = '/permissions'
     if (wildcard === 'permissions' || wildcard.endsWith(PERM_SUFFIX)) {
@@ -401,6 +514,16 @@ export async function datasetRoutes(
     }
     const poolName = nameParsed.data
 
+    // Snapshot destroy: `<dataset>/snapshots/<snap>` (plain 202, no confirm).
+    const tail = parseSnapshotTail(request.params['*'])
+    if (tail) {
+      if (!tail.snap || tail.rollback || tail.extra) {
+        reply.code(404)
+        return { error: { code: 'NOT_FOUND', message: `Unknown snapshot resource '${request.params['*']}'` } }
+      }
+      return destroySnapshot(poolName, tail.datasetPath, tail.snap, request, reply)
+    }
+
     const pathParsed = DatasetPath.safeParse(request.params['*'])
     if (!pathParsed.success) {
       reply.code(400)
@@ -461,6 +584,234 @@ export async function datasetRoutes(
     reply.code(202)
     return { job }
   })
+
+  // --- Snapshot sub-resource handlers (Epic 5) ---------------------------
+  // All reached via the dataset `*` wildcard; the tail is parsed by
+  // parseSnapshotTail. Full ZFS snapshot name is `<dataset>@<snap>`.
+
+  async function listSnapshots(poolName: string, datasetPath: string, reply: FastifyReply) {
+    const fullName = resolveDatasetName(poolName, datasetPath, reply)
+    if (!fullName)
+      return reply
+    if (!(await datasetExists(poolName, fullName))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+    return { data: await listSnapshotsDetail(fullName) }
+  }
+
+  async function snapshotDetail(poolName: string, datasetPath: string, snap: string, reply: FastifyReply) {
+    const fullName = resolveDatasetName(poolName, datasetPath, reply)
+    if (!fullName)
+      return reply
+    if (!(await datasetExists(poolName, fullName))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+    const snapshot = (await listSnapshotsDetail(fullName)).find(s => s.snapshotName === snap)
+    if (!snapshot) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Snapshot '${fullName}@${snap}' not found` } }
+    }
+    return { data: snapshot }
+  }
+
+  async function createSnapshot(poolName: string, datasetPath: string, request: FastifyRequest, reply: FastifyReply) {
+    const fullName = resolveDatasetName(poolName, datasetPath, reply)
+    if (!fullName)
+      return reply
+
+    const bodyParsed = CreateSnapshotRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid create snapshot request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const { name, recursive } = bodyParsed.data
+    const snapName = `${fullName}@${name}`
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!(await datasetExists(poolName, fullName))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+
+    // 409 if the snapshot already exists — the system is the source of truth.
+    const existing = await listSnapshotsDetail(fullName)
+    if (existing.some(s => s.name === snapName)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Snapshot '${snapName}' already exists` } }
+    }
+
+    const args = recursive ? ['snapshot', '-r', snapName] : ['snapshot', snapName]
+
+    const job = jobQueue.submit(
+      'zfs.snapshot',
+      { ...identity, params: { snapshot: snapName, recursive: recursive ?? false } },
+      async () => {
+        const result = await executor.exec(ZFS, args)
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `zfs snapshot exited with code ${result.exitCode}`)
+        return { created: snapName }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  }
+
+  async function renameSnapshot(poolName: string, datasetPath: string, snap: string, request: FastifyRequest, reply: FastifyReply) {
+    const fullName = resolveDatasetName(poolName, datasetPath, reply)
+    if (!fullName)
+      return reply
+
+    const snapParsed = SnapshotName.safeParse(snap)
+    if (!snapParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid snapshot name: ${snapParsed.error.issues[0]?.message}` } }
+    }
+
+    const bodyParsed = RenameSnapshotRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid rename snapshot request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const { newName } = bodyParsed.data
+    const from = `${fullName}@${snap}`
+    const to = `${fullName}@${newName}`
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const existing = await listSnapshotsDetail(fullName)
+    if (!existing.some(s => s.name === from)) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Snapshot '${from}' not found` } }
+    }
+
+    const job = jobQueue.submit(
+      'zfs.rename',
+      { ...identity, params: { from, to } },
+      async () => {
+        const result = await executor.exec(ZFS, ['rename', from, to])
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `zfs rename exited with code ${result.exitCode}`)
+        return { renamed: from, to }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  }
+
+  async function destroySnapshot(poolName: string, datasetPath: string, snap: string, request: FastifyRequest, reply: FastifyReply) {
+    const fullName = resolveDatasetName(poolName, datasetPath, reply)
+    if (!fullName)
+      return reply
+
+    const snapParsed = SnapshotName.safeParse(snap)
+    if (!snapParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid snapshot name: ${snapParsed.error.issues[0]?.message}` } }
+    }
+    const snapName = `${fullName}@${snap}`
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const existing = await listSnapshotsDetail(fullName)
+    if (!existing.some(s => s.name === snapName)) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` } }
+    }
+
+    // Plain 202 — destroying a snapshot removes a recovery point, not live data,
+    // so no confirmation gate (DESIGN safety semantics).
+    const job = jobQueue.submit(
+      'zfs.destroy',
+      { ...identity, params: { snapshot: snapName } },
+      async () => {
+        const result = await executor.exec(ZFS, ['destroy', snapName])
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `zfs destroy exited with code ${result.exitCode}`)
+        return { destroyed: snapName }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  }
+
+  async function rollbackSnapshot(poolName: string, datasetPath: string, snap: string, request: FastifyRequest, reply: FastifyReply) {
+    const fullName = resolveDatasetName(poolName, datasetPath, reply)
+    if (!fullName)
+      return reply
+
+    const snapParsed = SnapshotName.safeParse(snap)
+    if (!snapParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid snapshot name: ${snapParsed.error.issues[0]?.message}` } }
+    }
+    const snapName = `${fullName}@${snap}`
+    // `?force=true` maps to `zfs rollback -r` (also destroys intermediate
+    // snapshots). NOT bound into the confirm signature — it is chosen after the
+    // challenge is issued (the pool-destroy cleanup bug).
+    const q = request.query as { force?: string }
+    const force = q.force === 'true' || q.force === '1'
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const snapshots = await listSnapshotsDetail(fullName)
+    const target = snapshots.find(s => s.name === snapName)
+    if (!target) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` } }
+    }
+
+    // Snapshots newer than the target block a plain rollback; ZFS needs `-r`
+    // (force) to destroy them. listSnapshotsDetail is newest-first, so "newer"
+    // are the ones ahead of the target in the list.
+    const targetIndex = snapshots.findIndex(s => s.name === snapName)
+    const laterSnapshots = snapshots.slice(0, targetIndex).map(s => s.snapshotName)
+
+    const warnings = [
+      `Rolling back discards all changes to '${fullName}' since snapshot '${snap}'.`,
+    ]
+    if (laterSnapshots.length > 0) {
+      warnings.push(`${laterSnapshots.length} more recent snapshot(s) exist (${laterSnapshots.join(', ')}); rollback requires force to destroy them, and doing so is irreversible.`)
+    }
+
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'zfs.rollback',
+      params: { snapshot: snapName },
+      message: `Rolling back '${fullName}' to snapshot '${snap}' discards newer data`,
+      warnings,
+    })) {
+      return reply
+    }
+
+    const args = force ? ['rollback', '-r', snapName] : ['rollback', snapName]
+
+    const job = jobQueue.submit(
+      'zfs.rollback',
+      { ...identity, params: { snapshot: snapName, force } },
+      async () => {
+        const result = await executor.exec(ZFS, args)
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `zfs rollback exited with code ${result.exitCode}`)
+        return { rolledBack: snapName }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  }
 
   // --- Identity pickers (getent-backed, source-agnostic — Epic 8 seam) ----
   server.get('/identity/users', async (_request, _reply) => {

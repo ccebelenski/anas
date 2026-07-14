@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { parseDatasetGet, parseSnapshotNames, parseZfsList } from '../zfs-list.js'
+import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseZfsList } from '../zfs-list.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/zfs')
@@ -57,6 +57,52 @@ describe('parseSnapshotNames', () => {
   it('lists only snapshot entries', () => {
     const names = parseSnapshotNames(loadFixture('zfs-list.json'))
     assert.deepEqual(names, ['testpool/media@snap1'])
+  })
+})
+
+describe('parseSnapshotList', () => {
+  it('maps name/dataset/label/pool, ISO created, and byte sizes', () => {
+    const snaps = parseSnapshotList(loadFixture('zfs-snapshots-media.json'))
+    assert.equal(snaps.length, 2)
+    const snap1 = snaps.find(s => s.snapshotName === 'snap1')!
+    assert.equal(snap1.name, 'testpool/media@snap1')
+    assert.equal(snap1.dataset, 'testpool/media')
+    assert.equal(snap1.pool, 'testpool')
+    assert.equal(snap1.created, '2026-07-13T10:00:00.000Z')
+    assert.equal(snap1.used, 0)
+    assert.equal(snap1.referenced, 128 * 1024 * 1024)
+  })
+
+  it('sorts newest-first by creation time', () => {
+    const snaps = parseSnapshotList(loadFixture('zfs-snapshots-media.json'))
+    assert.deepEqual(snaps.map(s => s.snapshotName), ['snap2', 'snap1'])
+  })
+
+  it('breaks creation-time ties by createtxg (descending)', () => {
+    const same = 'Tue Jul 14 10:00:00 UTC 2026'
+    const snaps = parseSnapshotList({
+      datasets: {
+        'tank/a@old': { name: 'tank/a@old', type: 'SNAPSHOT', pool: 'tank', dataset: 'tank/a', snapshot_name: 'old', createtxg: '10', properties: { creation: { value: same }, used: { value: '0B' }, referenced: { value: '1M' } } },
+        'tank/a@new': { name: 'tank/a@new', type: 'SNAPSHOT', pool: 'tank', dataset: 'tank/a', snapshot_name: 'new', createtxg: '99', properties: { creation: { value: same }, used: { value: '0B' }, referenced: { value: '1M' } } },
+      },
+    } as any)
+    assert.deepEqual(snaps.map(s => s.snapshotName), ['new', 'old'])
+  })
+
+  it('derives dataset and label from the name when fields are absent', () => {
+    const snaps = parseSnapshotList({
+      datasets: {
+        'tank/media@x': { name: 'tank/media@x', type: 'SNAPSHOT', properties: { creation: { value: 'Tue Jul 14 10:00:00 UTC 2026' }, used: { value: '0B' }, referenced: { value: '0B' } } },
+      },
+    } as any)
+    assert.equal(snaps[0].dataset, 'tank/media')
+    assert.equal(snaps[0].snapshotName, 'x')
+    assert.equal(snaps[0].pool, 'tank')
+  })
+
+  it('ignores non-snapshot rows', () => {
+    const snaps = parseSnapshotList(loadFixture('zfs-list.json'))
+    assert.deepEqual(snaps.map(s => s.name), ['testpool/media@snap1'])
   })
 })
 

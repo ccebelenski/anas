@@ -1,0 +1,71 @@
+{
+    "output_version": {
+        "command": "zfs list",
+        "vers_major": 0,
+        "vers_minor": 1
+    },
+    "datasets": {
+        "testpool/media@snap1": {
+            "name": "testpool/media@snap1",
+            "type": "SNAPSHOT",
+            "pool": "testpool",
+            "createtxg": "120",
+            "dataset": "testpool/media",
+            "snapshot_name": "snap1",
+            "properties": {
+                "creation": {
+                    "value": "Mon Jul 13 10:00:00 UTC 2026",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "used": {
+                    "value": "0B",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "referenced": {
+                    "value": "128M",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                }
+            }
+        },
+        "testpool/media@snap2": {
+            "name": "testpool/media@snap2",
+            "type": "SNAPSHOT",
+            "pool": "testpool",
+            "createtxg": "240",
+            "dataset": "testpool/media",
+            "snapshot_name": "snap2",
+            "properties": {
+                "creation": {
+                    "value": "Tue Jul 14 10:00:00 UTC 2026",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "used": {
+                    "value": "16K",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "referenced": {
+                    "value": "130M",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                }
+            }
+        }
+    }
+}
