@@ -38,6 +38,13 @@ export {
   UpdateDatasetPropertiesRequest,
 } from './schemas/datasets.js'
 
+// Snapshot schemas
+export {
+  CreateSnapshotRequest,
+  RenameSnapshotRequest,
+  Snapshot,
+} from './schemas/snapshots.js'
+
 // Disk schemas
 export {
   Disk,
