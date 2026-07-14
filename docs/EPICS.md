@@ -210,6 +210,8 @@ Story numbering is for identification only, not implementation order. Within eac
 
 5.7. [backlog] As a user, I want to clone a snapshot into a writable dataset (`zfs clone`), so I can branch off a point-in-time copy. *(Small once snapshots exist.)*
 
+5.8. [backlog] As a user, I want stronger visual separation between a dataset's snapshots and its child datasets in the tree, so nesting is unambiguous. *(MVP lists snapshots before child datasets; a divider/section header or grouping would be clearer.)*
+
 ---
 
 ## Epic 4.5 (backlog): Additional ZFS Dataset Capabilities
