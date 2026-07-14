@@ -1,4 +1,4 @@
-import type { Dataset, DatasetDetail, Job, JobAccepted, SystemGroup, SystemUser } from '@anas/shared'
+import type { Dataset, DatasetDetail, Job, JobAccepted } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
@@ -231,27 +231,6 @@ describe('datasets routes', () => {
         headers: IDENTITY_HEADERS,
       })
       assert.equal(res.statusCode, 404)
-    })
-  })
-
-  // --- Identity pickers --------------------------------------------------
-  describe('identity pickers', () => {
-    it('GET /v1/identity/users filters out low-uid system accounts (keeps root + uid>=1000)', async () => {
-      server = createServer({ mock: true, logger: false })
-      const res = await server.inject({ method: 'GET', url: '/v1/identity/users' })
-      assert.equal(res.statusCode, 200)
-      const { data } = res.json() as { data: SystemUser[] }
-      const names = data.map(u => u.name).sort()
-      assert.deepEqual(names, ['backup-svc', 'media', 'root'])
-    })
-
-    it('GET /v1/identity/groups filters out low-gid system groups (keeps root + gid>=1000)', async () => {
-      server = createServer({ mock: true, logger: false })
-      const res = await server.inject({ method: 'GET', url: '/v1/identity/groups' })
-      assert.equal(res.statusCode, 200)
-      const { data } = res.json() as { data: SystemGroup[] }
-      const names = data.map(g => g.name).sort()
-      assert.deepEqual(names, ['media', 'root', 'smbusers'])
     })
   })
 })

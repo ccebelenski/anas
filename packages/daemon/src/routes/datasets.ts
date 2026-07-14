@@ -1,4 +1,4 @@
-import type { CreateDatasetRequest, Dataset, DatasetDetail, MountpointPermissions, Snapshot, SystemGroup, SystemUser, UpdateDatasetPropertiesRequest } from '@anas/shared'
+import type { CreateDatasetRequest, Dataset, DatasetDetail, MountpointPermissions, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
@@ -10,7 +10,6 @@ import { confirmGate } from '../safety/gate.js'
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
-const GETENT = '/usr/bin/getent'
 const STAT = '/usr/bin/stat'
 const CHOWN = '/usr/bin/chown'
 const CHMOD = '/usr/bin/chmod'
@@ -68,40 +67,6 @@ function buildSetPairs(p: UpdateDatasetPropertiesRequest['properties']): string[
   if (p.dedup !== undefined)
     pairs.push(`dedup=${p.dedup}`)
   return pairs
-}
-
-/** Parse `getent passwd` lines into system users (uid ≥ 1000 plus root). */
-function parsePasswd(stdout: string): SystemUser[] {
-  const users: SystemUser[] = []
-  for (const line of stdout.split('\n')) {
-    if (!line.trim())
-      continue
-    const parts = line.split(':')
-    const name = parts[0]
-    const uid = Number.parseInt(parts[2], 10)
-    if (!name || Number.isNaN(uid))
-      continue
-    if (uid === 0 || uid >= 1000)
-      users.push({ name, uid })
-  }
-  return users
-}
-
-/** Parse `getent group` lines into system groups (gid ≥ 1000 plus root). */
-function parseGroup(stdout: string): SystemGroup[] {
-  const groups: SystemGroup[] = []
-  for (const line of stdout.split('\n')) {
-    if (!line.trim())
-      continue
-    const parts = line.split(':')
-    const name = parts[0]
-    const gid = Number.parseInt(parts[2], 10)
-    if (!name || Number.isNaN(gid))
-      continue
-    if (gid === 0 || gid >= 1000)
-      groups.push({ name, gid })
-  }
-  return groups
 }
 
 /**
@@ -812,19 +777,4 @@ export async function datasetRoutes(
     reply.code(202)
     return { job }
   }
-
-  // --- Identity pickers (getent-backed, source-agnostic — Epic 8 seam) ----
-  server.get('/identity/users', async (_request, _reply) => {
-    const r = await executor.exec(GETENT, ['passwd'])
-    if (r.exitCode !== 0 && !r.stdout.trim())
-      return { data: [] }
-    return { data: parsePasswd(r.stdout) }
-  })
-
-  server.get('/identity/groups', async (_request, _reply) => {
-    const r = await executor.exec(GETENT, ['group'])
-    if (r.exitCode !== 0 && !r.stdout.trim())
-      return { data: [] }
-    return { data: parseGroup(r.stdout) }
-  })
 }
