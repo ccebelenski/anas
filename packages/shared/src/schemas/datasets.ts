@@ -129,16 +129,5 @@ export const SetPermissionsRequest = z
   )
 export type SetPermissionsRequest = z.infer<typeof SetPermissionsRequest>
 
-// --- Identity (getent-backed pickers; source-agnostic, Epic 8 seam) ---
-
-export const SystemUser = z.object({
-  name: z.string(),
-  uid: z.number().int().nonnegative(),
-})
-export type SystemUser = z.infer<typeof SystemUser>
-
-export const SystemGroup = z.object({
-  name: z.string(),
-  gid: z.number().int().nonnegative(),
-})
-export type SystemGroup = z.infer<typeof SystemGroup>
+// Identity models (SystemUser/SystemGroup, ShareUser, …) live in identity.js —
+// they are shared by the getent pickers here and the Epic 8 management surface.

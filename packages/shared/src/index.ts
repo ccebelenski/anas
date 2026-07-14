@@ -33,8 +33,6 @@ export {
   DatasetType,
   MountpointPermissions,
   SetPermissionsRequest,
-  SystemGroup,
-  SystemUser,
   UpdateDatasetPropertiesRequest,
 } from './schemas/datasets.js'
 
@@ -48,6 +46,20 @@ export {
   SmartData,
   SmartHealth,
 } from './schemas/disks.js'
+
+// Identity schemas (share users & groups — Epic 8)
+export {
+  CreateGroupRequest,
+  CreateShareUserRequest,
+  IdentityName,
+  SetSmbPasswordRequest,
+  SetUserEnabledRequest,
+  ShareGroup,
+  ShareUser,
+  SystemGroup,
+  SystemUser,
+  UpdateGroupMembersRequest,
+} from './schemas/identity.js'
 
 // Job schemas
 export {

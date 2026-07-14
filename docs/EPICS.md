@@ -182,7 +182,9 @@ Story numbering is for identification only, not implementation order. Within eac
 
 4.7. [done] As a user, I want to set basic POSIX permissions (owner, group, mode via chown/chmod) on a dataset's mountpoint, so that the right users can access it. *(MVP scope: POSIX only, owner/group limited to EXISTING system users. This is the shallow part.)*
 
-4.7.1. [deferred — depth] As a user, I want a full ACL editor for dataset mountpoints (NFSv4 ACLs: per-ACE who × permission-bits × inheritance flags, plus acltype/aclmode/aclinherit), so I can manage Windows-compatible permissions. *(The DEEP part — deliberately NOT MVP. Pairs with Epic 6/SMB, where NFSv4 ACLs earn their complexity; populated by Epic 8 users/groups. PVE has nothing here and there's no existing ACL UI to wire up, so this is differentiated but a real investment — wrap setfacl/nfs4_setfacl, don't rush it. "Datasets is shallow until permissions" — this is the trapdoor.)*
+4.7.2. As a user, I want a layered filesystem-permissions editor on a dataset — Owner / Group / Everyone with plain-language access levels (No-access / Read / Read-Write), plus "+ add user or group" for extra principals, an "apply to existing files" (recursive) option, and an Advanced door to raw ACL entries — so I can manage access without deciphering octal or ACE flags. **Backed by POSIX ACLs** (`getfacl`/`setfacl`, `acltype=posixacl`): base rows → mode bits, extra principals → named ACL entries, inheritance → default ACL + setgid. *(Decided 2026-07-14 — this is the "better-UX-than-TrueNAS" story. Consumes Epic 8 identities.)*
+
+4.7.1. [deferred — Epic 14] As a user, I want NFSv4 ACLs (per-ACE who × granular permission-bits × inheritance flags, DENY entries, `acltype=nfsv4`), so I can manage **Windows-file-server-parity** permissions from Explorer's Security tab. *(Deliberately deferred: NFSv4 ACLs earn their complexity only for the Windows-managed/AD-joined shop — and are themselves the source of TrueNAS's permission confusion. Same layered UI as 4.7.2; only the ACL backend changes. Verify the OpenZFS-on-Linux nfs4 tooling before committing. Pairs with Epic 14.)*
 
 4.8. [done] As a user, I want to destroy a dataset, so that I can clean up unused storage. *(Confirmation required, warn if dataset has children or active shares.)*
 
@@ -311,6 +313,8 @@ Story numbering is for identification only, not implementation order. Within eac
 > As a user, I can manage the system users and groups that are needed for share access and permissions.
 
 > **ARCHITECTURAL SEAM (lock in even for MVP): resolve users/groups via `getent`/nsswitch, NEVER by parsing `/etc/passwd`.** That makes identity source-agnostic — local, LDAP, or AD users all surface through the same abstraction once the box is configured (see Epic 14). PVE-realm (`@pve`) users have no UID and are NOT usable for file ownership; only system-resolvable users (getent) are. PVE realms authenticate to the PVE UI, which is a different thing from making a user own files.
+
+> **SCOPE (decided 2026-07-14): "Minimal" — create share users, not login/PVE users.** A user ANAS creates has no login shell and no Unix password (`useradd -M -s nologin`); it owns files (NFS) and optionally holds an SMB password (`smbpasswd`). We do NOT write PVE's `user.cfg` or grant PVE login (a user we create is available for PVE to reference as `@pam` if the admin later chooses — we don't do it for them). Directory users (AD/LDAP) are consumed read-only via getent; in an AD deployment no local users are made at all. Endpoints live under `/v1/identity/*`.
 
 ### Stories
 

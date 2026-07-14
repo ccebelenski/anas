@@ -479,13 +479,26 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 |-----------|---------|
 | `system.disks` | `lsblk -Jb` |
 | `system.disk.smart` | `smartctl -a <device>` |
-| `user.list` | Parse /etc/passwd |
-| `user.add` | `useradd` |
-| `user.modify` | `usermod` |
-| `group.list` | Parse /etc/group |
-| `group.add` | `groupadd` |
-| `group.modify` | `groupmod` |
-| `smbpasswd.set` | `smbpasswd -a <user>` |
+
+### Identity — share users & groups (Epic 8)
+
+Users/groups are read **only** via `getent`/nsswitch (source-agnostic — local, LDAP, AD all surface the same; NEVER parse `/etc/passwd`). ANAS creates only **share** identities: no login shell, no Unix password (`useradd -M -s /usr/sbin/nologin`) — they exist to own files (uid/gid → NFS) and optionally hold an SMB password (Samba passdb). They cannot log into the box or PVE. Directory-provided users are read-only here (provisioned in AD/LDAP — Epic 14). All mutations are jobs.
+
+| Operation | Command |
+|-----------|---------|
+| `identity.users` | `getent passwd` (pickers + list; filtered to real accounts) |
+| `identity.groups` | `getent group` |
+| `identity.user.local` | `getent -s files passwd <name>` (manageable vs directory) |
+| `identity.smb.list` | `pdbedit -L` (which users have an SMB passdb entry) |
+| `identity.user.add` | `useradd -M -s /usr/sbin/nologin [-c <gecos>] [-G <groups>] <name>` |
+| `identity.user.disable` | `usermod --lock --expiredate 1 <name>` + `smbpasswd -d <name>` |
+| `identity.user.enable` | `usermod --unlock --expiredate '' <name>` + `smbpasswd -e <name>` |
+| `identity.group.add` | `groupadd <name>` |
+| `identity.group.members` | `gpasswd -a` / `gpasswd -d <user> <group>` |
+| `identity.smbpasswd.set` | `smbpasswd -a -s <name>` (password on stdin, never argv) |
+| `identity.smbpasswd.clear` | `smbpasswd -x <name>` |
+
+> **Permissions editor (Epic 4.7 → 4.7.1):** the layered access UI is backed by **POSIX ACLs** (`getfacl`/`setfacl`, `acltype=posixacl`) — owner/group/mode for the base rows, named-user/group ACL entries for extra principals, and a default ACL + setgid for inheritance. NFSv4 ACLs are **deferred to Epic 14** (they earn their complexity only for Windows-file-server parity, which pairs with an AD join). No `passwd`/`chpasswd` — ANAS never sets a Unix login password.
 
 ### Parameter validation
 
