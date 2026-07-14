@@ -40,7 +40,9 @@ if [ ! -d "${SRC_DIR}" ]; then
   echo "anas: ERROR: source dir ${SRC_DIR} not found" >&2
   exit 1
 fi
-gen="$(mktemp)"
+# A .js suffix lets `node --check` (below) infer the file is a plain script;
+# without an extension newer node refuses to pick a module format.
+gen="$(mktemp --suffix=.js)"
 {
   echo "/*"
   echo " * GENERATED FILE — do not edit."
@@ -60,6 +62,20 @@ if [ ! -s "${gen}" ]; then
   echo "anas: ERROR: generated anas.js is empty" >&2
   exit 1
 fi
+# Defensive: syntax-check the concatenated bundle before shipping it. A parse
+# error in any one src/*.js (they are ESLint-ignored and not checked by the
+# build) would make the whole ANAS UI silently vanish in the browser with no
+# error surfaced. node is present on the PVE node (the daemon runs on it); skip
+# the check if it is not, rather than hard-failing a node-less environment.
+if command -v node >/dev/null 2>&1; then
+  if ! node --check "${gen}"; then
+    rm -f "${gen}"
+    echo "anas: ERROR: generated anas.js has a syntax error; aborting install" >&2
+    exit 1
+  fi
+else
+  echo "anas: note: node not found; skipping anas.js syntax check" >&2
+fi
 install -D -m 0644 "${gen}" "${PVE_JS_DIR}/anas.js"
 rm -f "${gen}"
 echo "anas: installed ${PVE_JS_DIR}/anas.js (generated from src/)"
@@ -73,12 +89,16 @@ elif ! grep -q 'pvemanagerlib\.js' "${PVE_TPL}"; then
   echo "anas: ERROR: no pvemanagerlib.js line in ${PVE_TPL}; refusing to guess" >&2
   exit 1
 else
-  # Surgical append after the first pvemanagerlib.js line. The `a\<newline>TAG`
-  # form preserves the tag's leading whitespace verbatim. Everything else in the
-  # file is passed through untouched.
+  # Surgical append after ONLY the first pvemanagerlib.js line. awk tracks a
+  # done-flag so that a template with more than one pvemanagerlib.js line gets
+  # exactly one anas.js tag (a second insert would double-load the bundle and
+  # run 00-core/90-register twice). The tag text is passed in verbatim via -v to
+  # preserve its leading whitespace. Everything else is passed through untouched.
   tmp="$(mktemp)"
-  sed "\|pvemanagerlib\.js|a\\
-${SCRIPT_TAG}" "${PVE_TPL}" > "${tmp}"
+  awk -v tag="${SCRIPT_TAG}" '
+    { print }
+    !done && /pvemanagerlib\.js/ { print tag; done = 1 }
+  ' "${PVE_TPL}" > "${tmp}"
   # Defensive: only replace the real file if the insert actually landed.
   if grep -qF "${SCRIPT_SRC}" "${tmp}"; then
     cat "${tmp}" > "${PVE_TPL}"

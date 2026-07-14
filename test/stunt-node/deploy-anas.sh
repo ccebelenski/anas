@@ -101,6 +101,35 @@ fi
 
 echo
 
+# Preflight: daemon runtime dependencies
+# The daemon shells out to host tools that PVE does not install by default.
+# Production packaging (a future .deb) should declare `Depends: acl` so this is
+# not deploy-script-only; until then we provision/check them here.
+echo "Checking daemon dependencies..."
+# acl (getfacl/setfacl) is REQUIRED for named-principal POSIX ACL grants — the
+# "Add user or group" permission editor fails at job time without it. It is a
+# tiny standard package, so ensure it is present (idempotent).
+if $SSH_CMD "command -v setfacl >/dev/null 2>&1"; then
+  echo "  ✓ acl (setfacl) present"
+else
+  echo "  acl not found — installing..."
+  $SSH_CMD "apt-get install -y acl"
+  echo "  ✓ acl installed"
+fi
+# smbd (samba) and exportfs (nfs-kernel-server) are per-protocol and the
+# operator chooses which to run, so warn but never auto-install or fail.
+if $SSH_CMD "command -v smbd >/dev/null 2>&1"; then
+  echo "  ✓ smbd (samba) present"
+else
+  echo "  ⚠ smbd not found — SMB shares will not work until samba is installed."
+fi
+if $SSH_CMD "command -v exportfs >/dev/null 2>&1"; then
+  echo "  ✓ exportfs (nfs-kernel-server) present"
+else
+  echo "  ⚠ exportfs not found — NFS shares will not work until nfs-kernel-server is installed."
+fi
+echo
+
 # Install PVE UI integration
 # The rsync above already placed packages/pve-integration/ under /opt/anas/, so
 # install.sh runs from its final location (the apt hook references that path).
