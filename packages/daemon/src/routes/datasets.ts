@@ -810,6 +810,14 @@ export async function datasetRoutes(
             const clearR = await executor.exec(SETFACL, clearArgs)
             if (clearR.exitCode !== 0)
               throw new Error(clearR.stderr.trim() || `setfacl -b -k exited with code ${clearR.exitCode}`)
+            // Also drop the setgid bit we set for ACL inheritance — with the
+            // named grants gone there is nothing to inherit, and a leftover
+            // setgid would make the reported mode (e.g. 2775 vs 775) misleading.
+            const unsetgidArgs = recursive ? ['-R', 'g-s', mountpoint] : ['g-s', mountpoint]
+            updateProgress(`chmod g-s ${mountpoint}`)
+            const unsetR = await executor.exec(CHMOD, unsetgidArgs)
+            if (unsetR.exitCode !== 0)
+              throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
           }
           const mode = levelsToMode(base)
           const modeArgs = recursive ? ['-R', mode, mountpoint] : [mode, mountpoint]

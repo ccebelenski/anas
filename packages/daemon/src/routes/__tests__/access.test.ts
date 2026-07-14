@@ -228,7 +228,10 @@ describe('access routes', () => {
       assert.equal(job.status, 'completed')
 
       assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-b', '-k', MP])
-      assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['755', MP]) // 7,5,5
+      // Clearing the ACLs also drops the setgid bit we set for inheritance, so
+      // the reported mode is the whole truth (no misleading 2775).
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g-s')), ['g-s', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('755')), ['755', MP]) // 7,5,5
     })
   })
 
