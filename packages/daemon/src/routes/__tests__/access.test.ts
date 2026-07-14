@@ -174,6 +174,77 @@ describe('access routes', () => {
       assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
       assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
     })
+
+    it('recursive base-only chmod uses symbolic X, not a blanket numeric +x', async () => {
+      // A recursive Read grant must not sprinkle execute onto plain data files:
+      // the base-only chmod uses capital X so only directories gain execute.
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server) // acltype 'off' → base-only path
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({
+          entries: [
+            { kind: 'owner', level: 'read-write' },
+            { kind: 'owning-group', level: 'read' },
+            { kind: 'everyone', level: 'read' },
+          ],
+          applyToExisting: true,
+        }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+
+      // Symbolic mode with X (owner rwX, group rX, other rX) — never a numeric octal.
+      const chmod = find(calls, '/usr/bin/chmod', a => a[0] === '-R')
+      assert.deepEqual(chmod, ['-R', 'u=rwX,g=rX,o=rX', MP])
+      assert.ok(chmod && chmod[1].includes('X'), 'recursive chmod mode uses capital X')
+      assert.equal(find(calls, '/usr/bin/chmod', a => /^[0-7]{3,4}$/.test(a[1] ?? '')), undefined)
+    })
+  })
+
+  // --- PUT /access: base-level fallback reads the real ACL, not the mask --
+  describe('PUT /v1/pools/:name/datasets/*path/access — ACL mask fallback', () => {
+    it('an omitted owning-group falls back to group::, not the ACL mask', async () => {
+      // acltype=posixacl, group::r-x (read) but mask::rwx so the mode group digit
+      // is 7 (rwx). A PUT that omits owning-group must keep it at read (g::r-x),
+      // NOT escalate it to read-write by reading the mask digit off the mode.
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server, [
+        { command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') },
+        // stat reports mode 775 — group digit 7 is the MASK, not group::.
+        { command: '/usr/bin/stat', args: ['-c', '%U %G %a', MP], result: ok('root root 775\n') },
+        // Live ACL: real owning-group level is r-x (read), mask is rwx.
+        { command: '/usr/bin/getfacl', args: ['-pcE', MP], result: ok(
+          'user::rwx\ngroup::r-x\nmask::rwx\nother::---\n',
+        ) },
+      ])
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        // Omits owning-group; includes a named entry so the setfacl --set path runs.
+        payload: JSON.stringify({ entries: [
+          { kind: 'owner', level: 'read-write' },
+          { kind: 'everyone', level: 'none' },
+          { kind: 'user', name: 'alice', level: 'read-write' },
+        ] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+
+      const setArgs = find(calls, '/usr/bin/setfacl', a => a[0] === '--set')
+      assert.ok(setArgs, 'setfacl --set was issued')
+      const spec = setArgs![1]
+      assert.ok(spec.includes('g::r-x'), `spec keeps group at read: ${spec}`)
+      assert.ok(!spec.includes('g::rwx'), `spec must NOT escalate group to rwx: ${spec}`)
+      assert.equal(spec, 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx')
+    })
   })
 
   // --- PUT /access: add a named user on an acltype=off dataset ------------

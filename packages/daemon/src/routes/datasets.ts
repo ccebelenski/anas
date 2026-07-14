@@ -2,6 +2,7 @@ import type { AccessEntry, CreateDatasetRequest, Dataset, DatasetAccess, Dataset
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { ParsedAcl } from '../parsers/getfacl.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, PoolName, RenameSnapshotRequest, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
@@ -128,6 +129,26 @@ function baseEntriesFromMode(mode: string, ownerOrphan = false, groupOrphan = fa
 /** Base three levels → 3-digit octal mode string (e.g. `750`). */
 function levelsToMode(levels: BaseLevels): string {
   return `${levelToOctalDigit(levels.owner)}${levelToOctalDigit(levels['owning-group'])}${levelToOctalDigit(levels.everyone)}`
+}
+
+/**
+ * One principal's symbolic perms for a RECURSIVE chmod. Uses capital `X` so
+ * execute lands only on directories (and files that already have it) — a
+ * blanket numeric octal (`levelsToMode`) would sprinkle +x onto every plain
+ * data file on a recursive Read grant. none → `` (empty), read → `rX`,
+ * read-write → `rwX`.
+ */
+function levelToSymbolicPerms(level: AccessEntry['level']): string {
+  switch (level) {
+    case 'none': return ''
+    case 'read': return 'rX'
+    case 'read-write': return 'rwX'
+  }
+}
+
+/** Base three levels → a symbolic chmod mode (`u=rwX,g=rX,o=`) for a recursive apply. */
+function levelsToSymbolic(levels: BaseLevels): string {
+  return `u=${levelToSymbolicPerms(levels.owner)},g=${levelToSymbolicPerms(levels['owning-group'])},o=${levelToSymbolicPerms(levels.everyone)}`
 }
 
 /** A named (user/group) AccessEntry — kind narrowed, name guaranteed present. */
@@ -710,16 +731,6 @@ export async function datasetRoutes(
 
     const recursive = req.applyToExisting === true
 
-    // Desired base three: a supplied entry overrides the current mode-bit level,
-    // so a partial request never silently drops an unmentioned base principal.
-    const current = baseLevelsFromMode(perm.mode)
-    const levelOf = (kind: BaseKind) => req.entries?.find(e => e.kind === kind)?.level ?? current[kind]
-    const base: BaseLevels = {
-      'owner': levelOf('owner'),
-      'owning-group': levelOf('owning-group'),
-      'everyone': levelOf('everyone'),
-    }
-
     const named = (req.entries ?? []).filter(isNamed)
     const hasNamed = named.length > 0
     const baseChanged = req.entries !== undefined
@@ -734,14 +745,39 @@ export async function datasetRoutes(
     const enabled = isPosixAcl(await getAcltype(fullName))
     const aclAutoEnabled = hasNamed && supported && !enabled
 
-    // Base-only request that clears existing named ACLs → we must strip them so
-    // the mode bits are the whole truth again. Detect current named entries.
-    let clearAcls = false
-    if (!hasNamed && baseChanged && enabled && supported) {
+    // When ACLs are live, read the ACL once up front and reuse it for BOTH the
+    // base-level fallback (below) and the clearAcls detection — one getfacl.
+    let liveAcl: ParsedAcl | null = null
+    if (enabled && supported) {
       const r = await executor.exec(GETFACL, ['-pcE', mountpoint])
       if (r.exitCode === 0 && r.stdout.trim())
-        clearAcls = parseGetfacl(r.stdout).named.length > 0
+        liveAcl = parseGetfacl(r.stdout)
     }
+
+    // Desired base three: a supplied entry overrides the current level, so a
+    // partial request never silently drops an unmentioned base principal. The
+    // fallback "current" level must be the REAL current level: when ACLs are
+    // live, take it from the actual ACL (`group::` etc.) — the mode's group
+    // digit is the ACL MASK (rwx), not the owning-group level, so reading it as
+    // the group level would silently escalate an omitted owning-group to
+    // read-write. With no ACLs, the mode bits ARE the truth.
+    const current: BaseLevels = liveAcl
+      ? {
+          'owner': permsToLevel(liveAcl.owner),
+          'owning-group': permsToLevel(liveAcl.owningGroup),
+          'everyone': permsToLevel(liveAcl.everyone),
+        }
+      : baseLevelsFromMode(perm.mode)
+    const levelOf = (kind: BaseKind) => req.entries?.find(e => e.kind === kind)?.level ?? current[kind]
+    const base: BaseLevels = {
+      'owner': levelOf('owner'),
+      'owning-group': levelOf('owning-group'),
+      'everyone': levelOf('everyone'),
+    }
+
+    // Base-only request that clears existing named ACLs → we must strip them so
+    // the mode bits are the whole truth again. Reuse the ACL read above.
+    const clearAcls = !hasNamed && baseChanged && (liveAcl?.named.length ?? 0) > 0
 
     const job = jobQueue.submit(
       'fs.setAccess',
@@ -837,7 +873,13 @@ export async function datasetRoutes(
             if (unsetR.exitCode !== 0)
               throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
           }
-          const mode = levelsToMode(base)
+          // Recursive: symbolic perms with capital `X` so execute is applied only
+          // to directories (and already-executable files), never sprinkled onto
+          // plain data files. Non-recursive: numeric octal is correct — the
+          // mountpoint is always a directory.
+          // ASSUMPTION (verify live): `chmod -R 'u=rwX,g=rX,o=' <mp>` is accepted
+          // by GNU coreutils chmod (symbolic mode with X, comma-separated clauses).
+          const mode = recursive ? levelsToSymbolic(base) : levelsToMode(base)
           const modeArgs = recursive ? ['-R', mode, mountpoint] : [mode, mountpoint]
           updateProgress(`chmod ${mode} ${mountpoint}`)
           const modeR = await executor.exec(CHMOD, modeArgs)
