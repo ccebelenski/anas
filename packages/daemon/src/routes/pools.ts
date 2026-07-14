@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, PoolName, ScrubRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
+import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseZpoolGet } from '../parsers/zpool-get.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
@@ -295,6 +295,99 @@ export async function poolRoutes(
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool scrub exited with code ${result.exitCode}`)
+        }
+        return null
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
+  // Trim a pool's SSDs (Epic 4.12). Trim is a safe online operation like scrub —
+  // no confirmation gate. `start` issues a trim; `cancel` (-c) stops one.
+  server.post<{ Params: { name: string } }>('/pools/:name/trim', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    const bodyParsed = TrimPoolRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid trim request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const { action } = bodyParsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!(await poolExists(poolName))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    const args = action === 'cancel'
+      ? ['trim', '-c', poolName]
+      : ['trim', poolName]
+
+    const job = jobQueue.submit(
+      'zpool.trim',
+      { ...identity, params: { pool: poolName, action } },
+      async () => {
+        const result = await executor.exec('/usr/sbin/zpool', args)
+        if (result.exitCode !== 0) {
+          throw new Error(result.stderr.trim() || `zpool trim exited with code ${result.exitCode}`)
+        }
+        return null
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
+  // Upgrade a pool's feature flags (Epic 4.12) — one-way. Enabling feature flags
+  // is IRREVERSIBLE: the pool may no longer import on an older ZFS or another OS,
+  // so this is confirmation-gated like destroy.
+  server.post<{ Params: { name: string } }>('/pools/:name/upgrade', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!(await poolExists(poolName))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'zpool.upgrade',
+      params: { pool: poolName },
+      message: `Upgrading pool '${poolName}' enables new ZFS feature flags`,
+      warnings: [
+        'Enabling feature flags is one-way — the pool may no longer be importable on older ZFS versions or other systems.',
+      ],
+    })) {
+      return reply
+    }
+
+    const job = jobQueue.submit(
+      'zpool.upgrade',
+      { ...identity, params: { pool: poolName } },
+      async () => {
+        const result = await executor.exec('/usr/sbin/zpool', ['upgrade', poolName])
+        if (result.exitCode !== 0) {
+          throw new Error(result.stderr.trim() || `zpool upgrade exited with code ${result.exitCode}`)
         }
         return null
       },
