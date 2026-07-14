@@ -1,0 +1,268 @@
+import type { AccessEntry, DatasetAccess, Job, JobAccepted } from '@anas/shared'
+import type { MockExecutor } from '../../executor/mock.js'
+import type { ExecResult } from '../../executor/types.js'
+import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import { afterEach, describe, it } from 'node:test'
+import { createServer } from '../../server.js'
+
+const IDENTITY_HEADERS = {
+  'x-anas-user': 'root@pam',
+  'x-anas-user-uid': '0',
+  'x-anas-request-id': randomUUID(),
+}
+const JSON_HEADERS = { ...IDENTITY_HEADERS, 'content-type': 'application/json' }
+
+async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
+  for (let i = 0; i < 50; i++) {
+    const res = await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY_HEADERS })
+    const { job } = res.json() as { job: Job }
+    if (job.status === 'completed' || job.status === 'failed')
+      return job
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error(`Job ${id} did not finish`)
+}
+
+interface Call { command: string, args: string[] }
+interface Stub { command: string, args?: string[], result: ExecResult }
+
+/**
+ * Wrap the mock executor to (a) record every command/args issued and (b) return
+ * canned results for chosen commands (stubs) before delegating. This lets a test
+ * pose the dataset as acltype=posixacl (or off), with specific getfacl output,
+ * that the fixed dev fixtures can't model — while still asserting the exact
+ * setfacl/chmod/chown/zfs argument arrays the route constructs.
+ */
+function installExecutor(server: ReturnType<typeof createServer>, stubs: Stub[] = []): Call[] {
+  const mock = (server as any).executor as MockExecutor
+  const calls: Call[] = []
+  const orig = mock.exec.bind(mock)
+  mock.exec = async (command: string, args: string[]): Promise<ExecResult> => {
+    calls.push({ command, args })
+    const stub = stubs.find(s =>
+      s.command === command
+      && (s.args === undefined
+        || (s.args.length === args.length && s.args.every((a, i) => a === args[i]))),
+    )
+    if (stub)
+      return stub.result
+    return orig(command, args)
+  }
+  return calls
+}
+
+const ACLTYPE_MEDIA = ['get', '-Hp', '-o', 'value', 'acltype', 'testpool/media']
+const MP = '/testpool/media'
+
+function ok(stdout = ''): ExecResult {
+  return { stdout, stderr: '', exitCode: 0 }
+}
+
+function find(calls: Call[], command: string, pred: (a: string[]) => boolean): string[] | undefined {
+  return calls.find(c => c.command === command && pred(c.args))?.args
+}
+
+describe('access routes', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  // --- GET /access -------------------------------------------------------
+  describe('GET /v1/pools/:name/datasets/*path/access', () => {
+    it('maps a live POSIX ACL into base + named entries', async () => {
+      server = createServer({ mock: true, logger: false })
+      installExecutor(server, [{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
+
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/media/access', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: DatasetAccess }
+      assert.equal(data.aclSupported, true)
+      assert.equal(data.aclEnabled, true)
+      assert.equal(data.owner, 'root')
+      assert.ok(data.aclText && data.aclText.includes('user::rwx'))
+
+      const byKind = (kind: string, name?: string) =>
+        data.entries.find((e: AccessEntry) => e.kind === kind && e.name === name)
+      assert.equal(byKind('owner')?.level, 'read-write') // user::rwx
+      assert.equal(byKind('owning-group')?.level, 'read') // group::r-x
+      assert.equal(byKind('everyone')?.level, 'none') // other::---
+      assert.equal(byKind('user', 'alice')?.level, 'read-write') // user:alice:rwx
+    })
+
+    it('derives base three from mode bits when ACLs are disabled', async () => {
+      server = createServer({ mock: true, logger: false })
+      // acltype fixture is 'off' → mode-only path; stat fixture is 755.
+      installExecutor(server)
+
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/media/access', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: DatasetAccess }
+      assert.equal(data.aclEnabled, false)
+      assert.equal(data.aclText, null)
+      assert.equal(data.entries.length, 3)
+      assert.equal(data.entries.find(e => e.kind === 'owner')?.level, 'read-write') // 7
+      assert.equal(data.entries.find(e => e.kind === 'owning-group')?.level, 'read') // 5
+      assert.equal(data.entries.find(e => e.kind === 'everyone')?.level, 'read') // 5
+    })
+
+    it('404s for an unknown dataset', async () => {
+      server = createServer({ mock: true, logger: false })
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/nope/access', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 404)
+    })
+
+    it('404s for a non-filesystem (volume / unmounted) dataset', async () => {
+      server = createServer({ mock: true, logger: false })
+      installExecutor(server, [{
+        command: '/usr/sbin/zfs',
+        args: ['get', '-j', 'all', 'testpool/vol'],
+        result: ok(JSON.stringify({ datasets: { 'testpool/vol': { name: 'testpool/vol', type: 'VOLUME', properties: {} } } })),
+      }])
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/vol/access', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 404)
+      assert.match(res.json().error.message, /not a mounted filesystem/)
+    })
+  })
+
+  // --- PUT /access: base-only (mode bits) --------------------------------
+  describe('PUT /v1/pools/:name/datasets/*path/access — base only', () => {
+    it('issues a single chmod and no ACL commands', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server)
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ entries: [
+          { kind: 'owner', level: 'read-write' },
+          { kind: 'owning-group', level: 'read' },
+          { kind: 'everyone', level: 'none' },
+        ] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const body = res.json() as JobAccepted
+      assert.equal(body.job.operation, 'fs.setAccess')
+      const job = await waitForJob(server, body.job.id)
+      assert.equal(job.status, 'completed')
+
+      // owner=rwx(7), group=r-x(5), everyone=---(0) → 750
+      assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['750', MP])
+      assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
+      assert.equal(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), undefined)
+    })
+  })
+
+  // --- PUT /access: add a named user on an acltype=off dataset ------------
+  describe('PUT /v1/pools/:name/datasets/*path/access — named grant', () => {
+    it('enables acltype, sets the access + default ACL, and sets setgid', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server) // acltype fixture 'off'
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ entries: [
+          { kind: 'owner', level: 'read-write' },
+          { kind: 'owning-group', level: 'read' },
+          { kind: 'everyone', level: 'none' },
+          { kind: 'user', name: 'alice', level: 'read-write' },
+        ] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      assert.equal((job.result as { aclAutoEnabled: boolean }).aclAutoEnabled, true)
+
+      // acltype auto-enabled first.
+      assert.deepEqual(find(calls, '/usr/sbin/zfs', a => a[0] === 'set'), ['set', 'acltype=posixacl', 'xattr=sa', 'testpool/media'])
+
+      const expectSpec = 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx'
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '--set'), ['--set', expectSpec, MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-d'), ['-d', '--set', expectSpec, MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['g+s', MP])
+    })
+
+    it('fails the job clearly when the acl package is absent', async () => {
+      server = createServer({ mock: true, logger: false })
+      installExecutor(server, [{ command: '/usr/bin/getfacl', args: ['--version'], result: { stdout: '', stderr: 'not found', exitCode: 127 } }])
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ entries: [{ kind: 'user', name: 'alice', level: 'read-write' }] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /acl package/)
+    })
+  })
+
+  // --- PUT /access: remove all named entries (back to mode bits) ----------
+  describe('PUT /v1/pools/:name/datasets/*path/access — remove named', () => {
+    it('clears the ACL then chmods when a base-only request lands on an ACL dataset', async () => {
+      server = createServer({ mock: true, logger: false })
+      // Pose the dataset as posixacl with a live named entry (server fixture
+      // getfacl -pcE returns alice), so the base-only request must strip it.
+      const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ entries: [
+          { kind: 'owner', level: 'read-write' },
+          { kind: 'owning-group', level: 'read' },
+          { kind: 'everyone', level: 'read' },
+        ] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-b', '-k', MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', () => true), ['755', MP]) // 7,5,5
+    })
+  })
+
+  // --- PUT /access: applyToExisting recurses ------------------------------
+  describe('PUT /v1/pools/:name/datasets/*path/access — applyToExisting', () => {
+    it('adds -R to chown, setfacl (access + default), and chmod g+s, using X for read', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server) // acltype 'off'
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({
+          owner: 'media',
+          entries: [
+            { kind: 'owner', level: 'read-write' },
+            { kind: 'owning-group', level: 'read' },
+            { kind: 'everyone', level: 'read' },
+            { kind: 'user', name: 'alice', level: 'read' },
+          ],
+          applyToExisting: true,
+        }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+
+      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['-R', 'media', MP])
+      // Recursive → read levels use capital X so files don't gain execute.
+      const spec = 'u::rwx,g::r-X,o::r-X,u:alice:r-X,m::rwx'
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '--set'), ['-R', '--set', spec, MP])
+      assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a[0] === '-R' && a[1] === '-d'), ['-R', '-d', '--set', spec, MP])
+      assert.deepEqual(find(calls, '/usr/bin/chmod', a => a.includes('g+s')), ['-R', 'g+s', MP])
+    })
+  })
+})

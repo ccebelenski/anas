@@ -125,6 +125,58 @@ export function createServer(opts?: ServerOptions) {
     // chown / chmod succeed for any target in dev mock.
     mock.addFixture({ command: '/usr/bin/chown', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/chmod', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    // --- Epic 4.7.2: layered access / POSIX ACLs -------------------------
+    // Feature-detect: the acl package is present (getfacl/setfacl available).
+    mock.addFixture({ command: '/usr/bin/getfacl', args: ['--version'], result: {
+      stdout: 'getfacl 2.3.1\n',
+      stderr: '',
+      exitCode: 0,
+    } })
+    // testpool/media starts with acltype=off so the GET reports mode-only and a
+    // named grant exercises the auto-enable path (zfs set acltype=posixacl).
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'acltype', 'testpool/media'], result: {
+      stdout: 'off\n',
+      stderr: '',
+      exitCode: 0,
+    } })
+    // A representative ACL for /testpool/media (used when acltype is posixacl):
+    // owner rwx, owning-group r-x, everyone ---, one named user (alice rwx),
+    // managed mask, and a matching default ACL for inheritance.
+    const getfaclMedia = [
+      'user::rwx',
+      'user:alice:rwx',
+      'group::r-x',
+      'mask::rwx',
+      'other::---',
+      'default:user::rwx',
+      'default:user:alice:rwx',
+      'default:group::r-x',
+      'default:mask::rwx',
+      'default:other::---',
+      '',
+    ].join('\n')
+    mock.addFixture({ command: '/usr/bin/getfacl', args: ['-pcE', '/testpool/media'], result: {
+      stdout: getfaclMedia,
+      stderr: '',
+      exitCode: 0,
+    } })
+    // Raw variant (keeps the `# file:/owner:/group:` header) for the Advanced panel.
+    mock.addFixture({ command: '/usr/bin/getfacl', args: ['-pE', '/testpool/media'], result: {
+      stdout: [
+        '# file: /testpool/media',
+        '# owner: root',
+        '# group: root',
+        getfaclMedia,
+      ].join('\n'),
+      stderr: '',
+      exitCode: 0,
+    } })
+    // setfacl mutations (--set access, -d default, -b -k clear) succeed for any
+    // target in dev mock; command-only fallback covers the dynamic specs.
+    mock.addFixture({ command: '/usr/bin/setfacl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // acltype read for other datasets falls through to the command-only zfs
+    // fallback below (empty stdout → not posixacl), which is the correct default.
     // --- Epic 8: identity (getent-backed, source-agnostic via nsswitch) ---
     // Representative sample: root (0), a local SMB-enabled share user (media,
     // uid 1000), a filtered service account (backup-svc keeps uid 1001 so it
