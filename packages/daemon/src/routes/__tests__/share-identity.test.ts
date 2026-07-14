@@ -1,9 +1,33 @@
 import type { Job, JobAccepted, ShareGroup, ShareUser } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+
+interface Call { command: string, args: string[] }
+
+/**
+ * Wrap the mock executor to record every command/args issued (delegating to the
+ * original for results), so a test can assert the exact usermod argv the route
+ * constructs — the fixed dev fixtures return canned results but don't expose the
+ * arguments.
+ */
+function recordCalls(server: ReturnType<typeof createServer>): Call[] {
+  const mock = (server as unknown as { executor: MockExecutor }).executor
+  const calls: Call[] = []
+  const orig = mock.exec.bind(mock)
+  mock.exec = async (command: string, args: string[]): Promise<ExecResult> => {
+    calls.push({ command, args })
+    return orig(command, args)
+  }
+  return calls
+}
+
+function find(calls: Call[], command: string, pred: (a: string[]) => boolean): string[] | undefined {
+  return calls.find(c => c.command === command && pred(c.args))?.args
+}
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -97,6 +121,29 @@ describe('share-identity routes', () => {
       const res = await server.inject({ method: 'GET', url: '/v1/identity/users/ghost' })
       assert.equal(res.statusCode, 404)
       assert.equal(res.json().error.code, 'NOT_FOUND')
+    })
+
+    it('resolves a directory name with a dot and uppercase (not the strict POSIX regex)', async () => {
+      // A directory user like `John.Doe` appears in the getent-backed list yet
+      // the old strict IdentityName param regex 400'd it. LookupName allows it.
+      server = createServer({ mock: true, logger: false })
+      mockOf(server).addFixture({
+        command: '/usr/bin/getent',
+        args: ['passwd', 'John.Doe'],
+        result: { stdout: 'John.Doe:*:6000:6000:John Doe:/home/John.Doe:/usr/sbin/nologin\n', stderr: '', exitCode: 0 },
+      })
+      const res = await server.inject({ method: 'GET', url: '/v1/identity/users/John.Doe' })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: ShareUser }
+      assert.equal(data.name, 'John.Doe')
+      assert.equal(data.uid, 6000)
+    })
+
+    it('still rejects an option-injection path param (leading dash)', async () => {
+      server = createServer({ mock: true, logger: false })
+      const res = await server.inject({ method: 'GET', url: '/v1/identity/users/-rf' })
+      assert.equal(res.statusCode, 400)
+      assert.equal(res.json().error.code, 'VALIDATION_ERROR')
     })
   })
 
@@ -224,8 +271,9 @@ describe('share-identity routes', () => {
 
   // --- PUT /identity/users/:name (enable/disable) -------------------------
   describe('PUT /v1/identity/users/:name', () => {
-    it('disables a user (usermod + smbpasswd -d) and completes', async () => {
+    it('disables a user (usermod --expiredate 1 + smbpasswd -d) and completes', async () => {
       server = createServer({ mock: true, logger: false })
+      const calls = recordCalls(server)
       const res = await server.inject({
         method: 'PUT',
         url: '/v1/identity/users/media',
@@ -238,10 +286,18 @@ describe('share-identity routes', () => {
       const job = await waitForJob(server, body.job.id)
       assert.equal(job.status, 'completed')
       assert.deepEqual(job.result, { user: 'media', enabled: false })
+
+      // Expiry-only toggle: no redundant --lock (it warns on a passwordless
+      // share user and the `locked` flag comes from shadow expiry, not password).
+      assert.deepEqual(find(calls, '/usr/sbin/usermod', () => true), ['--expiredate', '1', 'media'])
+      assert.equal(find(calls, '/usr/sbin/usermod', a => a.includes('--lock')), undefined)
+      // SMB side is unchanged (media has a passdb entry).
+      assert.deepEqual(find(calls, '/usr/bin/smbpasswd', () => true), ['-d', 'media'])
     })
 
-    it('enables a user (usermod + smbpasswd -e) and completes', async () => {
+    it('enables a user (usermod --expiredate "" + smbpasswd -e) and completes', async () => {
       server = createServer({ mock: true, logger: false })
+      const calls = recordCalls(server)
       const res = await server.inject({
         method: 'PUT',
         url: '/v1/identity/users/media',
@@ -252,6 +308,11 @@ describe('share-identity routes', () => {
       assert.equal((res.json() as JobAccepted).job.operation, 'identity.user.enable')
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
+
+      // Clears expiry, no redundant --unlock.
+      assert.deepEqual(find(calls, '/usr/sbin/usermod', () => true), ['--expiredate', '', 'media'])
+      assert.equal(find(calls, '/usr/sbin/usermod', a => a.includes('--unlock')), undefined)
+      assert.deepEqual(find(calls, '/usr/bin/smbpasswd', () => true), ['-e', 'media'])
     })
 
     it('returns 404 for an unknown user', async () => {

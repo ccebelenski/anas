@@ -60,6 +60,7 @@ export {
   CreateGroupRequest,
   CreateShareUserRequest,
   IdentityName,
+  LookupName,
   SetSmbPasswordRequest,
   SetUserEnabledRequest,
   ShareGroup,

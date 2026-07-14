@@ -77,6 +77,30 @@ export const IdentityName = z.string()
 export type IdentityName = z.infer<typeof IdentityName>
 
 /**
+ * Lenient name for a path param that resolves an EXISTING identity to read or
+ * manage (NOT to create). Directory identities (LDAP/AD) surface through
+ * getent in forms POSIX rules forbid — dots (`john.doe`), uppercase (`Alice`),
+ * and the AD forms `DOMAIN\user` / `user@domain` — so the strict create regex
+ * (`IdentityName`) would 400 a name that legitimately appears in the users
+ * list, breaking the source-agnostic seam.
+ *
+ * Safety: these values become execFile argv to getent/usermod/gpasswd, so we
+ * still reject anything that could inject an option or corrupt a passwd line —
+ * a leading `-` (option injection), whitespace, control chars, NUL, `:` (the
+ * passwd field delimiter), and `/`. Dots, uppercase, `@`, and backslash are
+ * allowed. Mutations stay safe regardless because they re-gate on
+ * isLocalUser/isLocalGroup before touching anything.
+ */
+export const LookupName = z.string()
+  .min(1)
+  .max(256)
+  // First char: not `-` and not forbidden; rest: no forbidden chars. Forbidden
+  // = whitespace, control (\x00-\x1f, \x7f), `:` (passwd delimiter), and `/`.
+  // eslint-disable-next-line no-control-regex
+  .regex(/^[^-\s:/\x00-\x1F\x7F][^\s:/\x00-\x1F\x7F]*$/, 'must be a valid identity name')
+export type LookupName = z.infer<typeof LookupName>
+
+/**
  * Create a local share user (POST /v1/identity/users). Made with no login
  * shell and no Unix password; if `smbPassword` is given, an SMB passdb entry is
  * created so they can authenticate to SMB shares.

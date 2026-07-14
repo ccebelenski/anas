@@ -7,7 +7,7 @@ import type { ConfirmStore } from '../safety/confirm.js'
 import {
   CreateGroupRequest,
   CreateShareUserRequest,
-  IdentityName,
+  LookupName,
   SetSmbPasswordRequest,
   SetUserEnabledRequest,
   UpdateGroupMembersRequest,
@@ -185,7 +185,7 @@ export async function shareIdentityRoutes(
 
   // --- GET /identity/users/:name — single ShareUser ------------------------
   server.get<{ Params: { name: string } }>('/identity/users/:name', async (request, reply) => {
-    const nameParsed = IdentityName.safeParse(request.params.name)
+    const nameParsed = LookupName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid user name: ${nameParsed.error.issues[0]?.message}` } }
@@ -276,7 +276,7 @@ export async function shareIdentityRoutes(
 
   // --- POST /identity/users/:name/smb-password — set/replace SMB password ---
   server.post<{ Params: { name: string } }>('/identity/users/:name/smb-password', async (request, reply) => {
-    const nameParsed = IdentityName.safeParse(request.params.name)
+    const nameParsed = LookupName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid user name: ${nameParsed.error.issues[0]?.message}` } }
@@ -321,7 +321,7 @@ export async function shareIdentityRoutes(
 
   // --- PUT /identity/users/:name — enable / disable (no deletion) ------------
   server.put<{ Params: { name: string } }>('/identity/users/:name', async (request, reply) => {
-    const nameParsed = IdentityName.safeParse(request.params.name)
+    const nameParsed = LookupName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid user name: ${nameParsed.error.issues[0]?.message}` } }
@@ -346,10 +346,14 @@ export async function shareIdentityRoutes(
     if (!(await isLocalUser(name)))
       return rejectDirectory(reply, 'user', name)
 
-    // enable → unlock + clear expiry; disable → lock + expire immediately.
+    // enable → clear expiry; disable → expire immediately. Share users have no
+    // Unix password, so `--lock`/`--unlock` is redundant (it warns on a
+    // passwordless account and is fragile across OSes); the `locked` flag is
+    // derived from shadow EXPIRY, not the password field, so expiry alone is
+    // the whole toggle. The SMB smbpasswd -d/-e side is handled below.
     const usermodArgs = enabled
-      ? ['--unlock', '--expiredate', '', name]
-      : ['--lock', '--expiredate', '1', name]
+      ? ['--expiredate', '', name]
+      : ['--expiredate', '1', name]
 
     const job = jobQueue.submit(
       enabled ? 'identity.user.enable' : 'identity.user.disable',
@@ -413,7 +417,7 @@ export async function shareIdentityRoutes(
 
   // --- PUT /identity/groups/:name/members — add / remove members ------------
   server.put<{ Params: { name: string } }>('/identity/groups/:name/members', async (request, reply) => {
-    const nameParsed = IdentityName.safeParse(request.params.name)
+    const nameParsed = LookupName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid group name: ${nameParsed.error.issues[0]?.message}` } }
