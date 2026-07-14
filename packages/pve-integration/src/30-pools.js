@@ -11,7 +11,15 @@
  *   GET  /pools                 → { data: PoolSummary[] }
  *   GET  /pools/:name           → { data: PoolDetail }
  *   POST /pools/:name/scrub     → 202 { job }
+ *   POST /pools/:name/trim      → 202 { job }   (body { action:'start'|'cancel' })
+ *   POST /pools/:name/upgrade   → 409 confirm → 202 { job }   (one-way, gated)
  *   GET  /jobs/:id              → { job }
+ *
+ * Toolbar actions (story 4.12): Trim is a safe online op run via ANAS.runJob
+ * (plain 202, no confirm). Upgrade applies feature flags and is irreversible,
+ * so the daemon confirmation-gates it (409 + warnings) and we route it through
+ * ANAS.confirmAndRun — the same warnings-then-confirmed-retry flow as
+ * export/destroy. Test hooks: anas-btn-pool-trim, anas-btn-pool-upgrade.
  */
 (function () {
     'use strict';
@@ -199,12 +207,22 @@
         var has = sel && sel.length > 0;
         var scrubBtn = grid.down('#scrub');
         var detailBtn = grid.down('#detail');
+        var trimBtn = grid.down('#trim');
+        var upgradeBtn = grid.down('#upgrade');
         if (detailBtn) {
             detailBtn.setDisabled(!has);
         }
         if (scrubBtn) {
             var scanning = has && sel[0].get('scanRunning');
             scrubBtn.setDisabled(!has || scanning);
+        }
+        // Trim and Upgrade only need a selected pool (both operate on any
+        // online pool; Upgrade's one-way risk is handled by the confirm gate).
+        if (trimBtn) {
+            trimBtn.setDisabled(!has);
+        }
+        if (upgradeBtn) {
+            upgradeBtn.setDisabled(!has);
         }
         // Registered actions: toggle by their declared selection needs.
         var scanningSel = has && sel[0].get('scanRunning');
@@ -244,6 +262,51 @@
             view: grid,
             failTitle: 'Scrub failed',
             successMsg: ANAS.t('Scrub started on pool') + ' ' + pool,
+            onComplete: function () {
+                loadPools(grid, node);
+            },
+        });
+    }
+
+    // Trim via the shared runJob helper (story 4.12). `zpool trim` is a safe,
+    // online operation, so no confirmation gate — submit 202, poll, refresh.
+    function startTrim(grid, node) {
+        var pool = selectedPool(grid);
+        if (!pool) {
+            return;
+        }
+        ANAS.runJob({
+            node: node,
+            method: 'post',
+            path: '/pools/' + encodeURIComponent(pool) + '/trim',
+            body: { action: 'start' },
+            view: grid,
+            failTitle: 'Trim failed',
+            successMsg: ANAS.t('Trim started on') + ' ' + pool,
+            onComplete: function () {
+                loadPools(grid, node);
+            },
+        });
+    }
+
+    // Upgrade via confirmAndRun (story 4.12). Feature-flag upgrade is one-way,
+    // so the daemon answers the first request with 409 + warnings;
+    // confirmAndRun surfaces them and resends with the confirm code — exactly
+    // like export/destroy. No request body.
+    function upgradePool(grid, node) {
+        var pool = selectedPool(grid);
+        if (!pool) {
+            return;
+        }
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/pools/' + encodeURIComponent(pool) + '/upgrade',
+            view: grid,
+            confirmTitle: 'Upgrade pool',
+            confirmIntro: ANAS.t('Upgrade') + ' ' + pool + '?',
+            successMsg: ANAS.t('Pool') + ' ' + pool + ' ' + ANAS.t('upgraded'),
+            failTitle: 'Upgrade failed',
             onComplete: function () {
                 loadPools(grid, node);
             },
@@ -318,6 +381,26 @@
                 disabled: true,
                 handler: function (btn) {
                     startScrub(btn.up('grid'), node);
+                },
+            },
+            {
+                text: ANAS.t('Trim'),
+                itemId: 'trim',
+                cls: 'anas-btn-pool-trim',
+                iconCls: 'fa fa-eraser',
+                disabled: true,
+                handler: function (btn) {
+                    startTrim(btn.up('grid'), node);
+                },
+            },
+            {
+                text: ANAS.t('Upgrade'),
+                itemId: 'upgrade',
+                cls: 'anas-btn-pool-upgrade',
+                iconCls: 'fa fa-arrow-circle-up',
+                disabled: true,
+                handler: function (btn) {
+                    upgradePool(btn.up('grid'), node);
                 },
             },
         ];
