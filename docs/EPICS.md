@@ -195,18 +195,18 @@ Story numbering is for identification only, not implementation order. Within eac
 ### Stories
 
 #### Observe
-5.1. As a user, I want to see all snapshots for a dataset, so that I know what recovery points exist.
+5.1. [done] As a user, I want to see all snapshots for a dataset, so that I know what recovery points exist.
 
-5.2. As a user, I want to see how much space each snapshot is consuming, so that I can manage snapshot retention.
+5.2. [done] As a user, I want to see how much space each snapshot is consuming, so that I can manage snapshot retention.
 
 #### Act
-5.3. As a user, I want to create a snapshot of a dataset, so that I can capture the current state.
+5.3. [done] As a user, I want to create a snapshot of a dataset, so that I can capture the current state.
 
-5.4. As a user, I want to rename a snapshot, so that I can give it a meaningful name.
+5.4. [done] As a user, I want to rename a snapshot, so that I can give it a meaningful name.
 
-5.5. As a user, I want to rollback a dataset to a snapshot, so that I can recover from mistakes. *(Confirmation required, clearly destructive.)*
+5.5. [done] As a user, I want to rollback a dataset to a snapshot, so that I can recover from mistakes. *(Confirmation required, clearly destructive.)*
 
-5.6. As a user, I want to destroy a snapshot, so that I can reclaim space.
+5.6. [done] As a user, I want to destroy a snapshot, so that I can reclaim space.
 
 5.7. [backlog] As a user, I want to clone a snapshot into a writable dataset (`zfs clone`), so I can branch off a point-in-time copy. *(Small once snapshots exist.)*
 

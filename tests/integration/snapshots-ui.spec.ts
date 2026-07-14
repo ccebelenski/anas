@@ -105,8 +105,10 @@ test.describe('ANAS snapshots appear under a dataset (stunt node)', () => {
       await expect(page.locator(sel)).toBeVisible({ timeout: 30_000 })
     }
 
-    // The "all snapshots" button needs no selection — enabled immediately.
-    await expect(page.locator('.anas-btn-snap-all')).toBeEnabled()
+    // "All Snapshots" opens the popup for the SELECTED dataset, so it enables
+    // once a dataset row is selected (there's no dataset to show otherwise).
+    await page.locator('.anas-grid-datasets').getByText('share1', { exact: true }).first().click()
+    await expect(page.locator('.anas-btn-snap-all')).toBeEnabled({ timeout: 10_000 })
   })
 
   test('selecting a snapshot row enables the per-snapshot actions', async ({ page }) => {
