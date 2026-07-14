@@ -622,6 +622,11 @@
         }
         var userName = rec.get('name');
         var original = (rec.get('groups') || []).slice();
+        // The user's `groups` list carries the primary group first (identity.ts).
+        // The primary group is managed with the user, not via gpasswd on the
+        // group's member list, so it must never reach a remove op — gpasswd -d
+        // refuses to strip a user's primary group and would abort the chain.
+        var primaryGroup = rec.get('primaryGroup') || null;
         var groupStore = Ext.create('Ext.data.Store', { fields: ['name'], data: [] });
         var win;
         try {
@@ -659,7 +664,10 @@
                             xtype: 'component',
                             margin: '4 0 0 0',
                             html: '<div style="color:#888;font-size:0.9em;">'
-                                + enc(t('The primary group is managed with the user and is not changed here.'))
+                                + enc(primaryGroup
+                                    ? t('The primary group') + ' (' + primaryGroup + ') '
+                                        + t('is managed with the user and cannot be removed here.')
+                                    : t('The primary group is managed with the user and is not changed here.'))
                                 + '</div>',
                         },
                     ],
@@ -676,7 +684,7 @@
                         cls: 'anas-btn-user-groups-submit',
                         handler: function () {
                             try {
-                                submitUserGroups(win, node, view, userName, original);
+                                submitUserGroups(win, node, view, userName, original, primaryGroup);
                             } catch (e) {
                                 ANAS.warn('user groups submit failed: ' + ANAS.errText(e));
                             }
@@ -717,10 +725,22 @@
         return { added: added, removed: removed };
     }
 
-    function submitUserGroups(win, node, view, userName, original) {
+    function submitUserGroups(win, node, view, userName, original, primaryGroup) {
         var after = win.down('#groups').getValue() || [];
         var d = diffList(original, after);
-        if (!d.added.length && !d.removed.length) {
+        // A user cannot be removed from their primary group (gpasswd -d refuses,
+        // aborting the chain). If the operator cleared the primary-group tag, drop
+        // it from the removals — it is a no-op the daemon can't honor, and leaving
+        // the tag selected would have been a no-op too. Adds are unaffected.
+        var removed = [];
+        var i;
+        for (i = 0; i < d.removed.length; i++) {
+            if (primaryGroup && d.removed[i] === primaryGroup) {
+                continue;
+            }
+            removed.push(d.removed[i]);
+        }
+        if (!d.added.length && !removed.length) {
             win.close();
             return;
         }
@@ -728,12 +748,11 @@
         // remove it from cleared ones. Chained so the grid refresh runs once at
         // the end; each call is its own job.
         var ops = [];
-        var i;
         for (i = 0; i < d.added.length; i++) {
             ops.push({ group: d.added[i], body: { add: [userName] } });
         }
-        for (i = 0; i < d.removed.length; i++) {
-            ops.push({ group: d.removed[i], body: { remove: [userName] } });
+        for (i = 0; i < removed.length; i++) {
+            ops.push({ group: removed[i], body: { remove: [userName] } });
         }
 
         var idx = 0;
