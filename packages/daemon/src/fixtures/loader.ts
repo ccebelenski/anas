@@ -30,4 +30,6 @@ export const mockFixtures = {
   lsblk: () => fixtureResult('system', 'lsblk.json'),
   diskByIdListing: () => fixtureResult('system', 'disk-by-id.txt'),
   smartctl: () => fixtureResult('system', 'smartctl.json'),
+  /** Raw /etc/exports text for seeding a writable mock file in dev. */
+  nfsExportsText: () => loadFixture('nfs', 'etc-exports'),
 }
