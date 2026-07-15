@@ -440,40 +440,29 @@ export async function createTestPool(name: string, diskIds: string[]): Promise<v
  * exported by an export test (import, then destroy). Never throws.
  */
 export async function destroyPool(name: string): Promise<void> {
-  // Capture the pool's member devices BEFORE destroy so we can wipe them back
-  // to blank afterwards — `zpool destroy` leaves ZFS labels, which would leave
-  // the disks as 'other' (not 'available'), making the suite non-idempotent
-  // (each create/destroy cycle would permanently consume free disks).
-  let devices: string[] = []
+  // Destroy a test pool AND wipe its freed disks back to blank so the suite is
+  // idempotent. `zpool destroy` leaves ZFS labels, so freed disks would show as
+  // 'other' (not 'available') and each create/destroy cycle would permanently
+  // consume free disks. ZFS partitions each disk, so we must wipe the WHOLE
+  // disk (resolved via lsblk PKNAME), not the partition the pool reported.
+  const script = [
+    `pool=${name}`,
+    // capture member device paths before destroy (may be partitions)
+    `devs=$(zpool status -PL "$pool" 2>/dev/null | grep -oE '/dev/[^ ]+' || true)`,
+    // destroy (import first if it's an exported pool still on its disks)
+    `zpool destroy -f "$pool" 2>/dev/null || { zpool import -f "$pool" 2>/dev/null && zpool destroy -f "$pool" 2>/dev/null; } || true`,
+    // wipe each member's WHOLE disk (parent of the partition, else itself)
+    `for d in $devs; do`,
+    `  p=$(lsblk -no pkname "$d" 2>/dev/null | head -1)`,
+    `  if [ -n "$p" ]; then tgt="/dev/$p"; else tgt="$d"; fi`,
+    `  wipefs -a "$tgt" 2>/dev/null || true`,
+    `done`,
+  ].join('\n')
   try {
-    const st = await sshExec(
-      `zpool status -PL ${name} 2>/dev/null | grep -oE '/dev/[^ ]+' || true`,
-    )
-    devices = st.split('\n').map(s => s.trim()).filter(Boolean)
+    await sshExec(script)
   }
   catch {
-    // no members captured — the wipe loop below just no-ops
-  }
-  try {
-    await sshExec(`zpool destroy -f ${name}`)
-  }
-  catch {
-    // Not imported — it may be an exported pool still on its disks.
-    try {
-      await sshExec(`zpool import -f ${name} 2>/dev/null && zpool destroy -f ${name}`)
-    }
-    catch {
-      // Nothing to clean up (or already gone).
-    }
-  }
-  // Wipe the freed members so they return to 'available' for the next run.
-  for (const dev of devices) {
-    try {
-      await sshExec(`wipefs -a ${dev} 2>/dev/null || true`)
-    }
-    catch {
-      // best-effort — a leftover label just means fewer available disks
-    }
+    // best-effort — a leftover label just means fewer available disks next run
   }
 }
 
