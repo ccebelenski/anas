@@ -168,6 +168,280 @@
         }
     }
 
+    // ---- gfx retrofit (story 15.3) -----------------------------------------
+    //
+    // The graphical "monitor side" of the composer's visual language, built on
+    // the frozen ANAS.gfx foundation (15-gfx.js). Every builder below is fully
+    // fail-open: any throw / missing gfx / '' return degrades to the existing
+    // text rendering (renderState / formatPercent) or an omitted graphic — the
+    // native ExtJS grid and error-count tree always still render.
+
+    function encHtml(s) {
+        try {
+            return Ext.String.htmlEncode('' + s);
+        } catch (e) {
+            return '' + s;
+        }
+    }
+
+    // Map a derived per-disk health level (diskHealthLevel) to a gfx icon state
+    // token. gfx.icon/diskCard key their status dot + dead/greyscale material off
+    // the lowercase tokens online|degraded|faulted; ZFS states are UPPERCASE, so
+    // we route through the health derivation already used by the tree — a disk
+    // that is ONLINE but throwing read/write errors still shows RED, which is the
+    // whole point of colouring the topology by *live* health.
+    function gfxDiskState(level) {
+        if (level === 'critical') {
+            return 'faulted';
+        }
+        if (level === 'warning') {
+            return 'degraded';
+        }
+        return 'online';
+    }
+
+    // by-id identifiers can be long (scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1). Keep a
+    // short trailing form for the card's top line; the full id stays in title.
+    function shortDiskId(id) {
+        id = '' + (id || '');
+        if (id.length > 24) {
+            return '…' + id.substring(id.length - 22);
+        }
+        return id;
+    }
+
+    // Card sub-line. PoolDetail carries no per-disk kind or size, so the honest
+    // secondary descriptor is the live signal: a compact error summary when any
+    // counter is nonzero, otherwise the raw ZFS state (lowercased).
+    function diskSub(disk) {
+        var r = Number(disk.readErrors) || 0;
+        var w = Number(disk.writeErrors) || 0;
+        var c = Number(disk.checksumErrors) || 0;
+        if (r || w || c) {
+            return 'R:' + r + ' W:' + w + ' C:' + c;
+        }
+        return ('' + (disk.state || '')).toLowerCase();
+    }
+
+    // Grid State column: render the pool state as a gfx status pill (matches the
+    // spike). Fail-open to the FA-icon renderState.
+    function renderStatePill(value) {
+        try {
+            var gfx = ANAS.gfx;
+            if (gfx && typeof gfx.statePill === 'function' && value) {
+                var html = gfx.statePill(value, { label: value });
+                if (html) {
+                    return html;
+                }
+            }
+        } catch (e) {
+            // fall through
+        }
+        return ANAS.renderState(value);
+    }
+
+    // Grid Capacity column: render capacity% (0–100) as a fullness-coloured gfx
+    // bar; the numeric % stays legible in the bar's trailing label. Fail-open to
+    // the plain formatPercent text.
+    function renderCapacityBar(value) {
+        try {
+            var gfx = ANAS.gfx;
+            if (gfx && typeof gfx.bar === 'function'
+                && value !== null && value !== undefined && !isNaN(value)) {
+                var html = gfx.bar(Number(value) / 100,
+                    { title: ANAS.formatPercent(value) });
+                if (html) {
+                    return html;
+                }
+            }
+        } catch (e) {
+            // fall through
+        }
+        return ANAS.formatPercent(value);
+    }
+
+    // Build one skeuomorphic disk card from a PoolDisk. kind defaults to 'hdd'
+    // (PoolDetail has no kind; gfx.icon also defaults unknown → hdd).
+    function diskCardHtml(gfx, disk) {
+        var level;
+        try {
+            level = diskHealthLevel(disk.state, disk.readErrors,
+                disk.writeErrors, disk.checksumErrors);
+        } catch (e) {
+            level = '';
+        }
+        var card = gfx.diskCard({
+            kind: 'hdd',
+            state: gfxDiskState(level),
+            id: shortDiskId(disk.id),
+            sub: diskSub(disk),
+            title: disk.id + ' — ' + disk.state,
+        });
+        return { html: card || '', level: level };
+    }
+
+    // The headline graphic: capacity gauge + state pill, an activity strip while
+    // a scan runs, a bay per vdev (each member a health-coloured disk card so a
+    // faulted drive shows RED right where it physically lives), and an advisory
+    // callout naming any bad member. Returns '' on any failure → the caller omits
+    // the panel and the error-count tree carries the detail alone.
+    function topologyGfxHtml(d) {
+        try {
+            var gfx = ANAS.gfx;
+            if (!gfx || typeof gfx.bay !== 'function'
+                || typeof gfx.diskCard !== 'function') {
+                return '';
+            }
+
+            // Header: state pill + capacity gauge (spike pool-header row).
+            var pill = '';
+            try {
+                pill = gfx.statePill(d.state, { label: d.state }) || '';
+            } catch (eP) {
+                pill = '';
+            }
+            var gauge = '';
+            var cap = Number(d.capacity);
+            if (!isNaN(cap)) {
+                try {
+                    gauge = gfx.gauge(cap / 100, {
+                        label: ANAS.formatBytes(d.allocated) + ' / '
+                            + ANAS.formatBytes(d.size),
+                        title: ANAS.t('Pool capacity'),
+                    }) || '';
+                } catch (eG) {
+                    gauge = '';
+                }
+            }
+            var head = '<div class="anas-pool-topo-head" style="display:flex;'
+                + 'align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:12px;">'
+                + pill + gauge + '</div>';
+
+            // Activity strip while a scan is in progress.
+            var activity = '';
+            if (d.scan && d.scan.state === 'SCANNING') {
+                var isResilver = d.scan.function === 'RESILVER';
+                var pc = Number(d.scan.percentComplete);
+                var frac = isNaN(pc) ? null : pc / 100;
+                try {
+                    activity = gfx.activity(frac, {
+                        label: isResilver ? ANAS.t('Resilvering') : ANAS.t('Scrubbing'),
+                    }) || '';
+                } catch (eA) {
+                    activity = '';
+                }
+                if (activity) {
+                    activity = '<div style="margin-bottom:12px;">' + activity + '</div>';
+                }
+            }
+
+            // Bays, grouped by vdev role. Collect bad members for the callout.
+            var groups = d.vdevGroups || [];
+            var faulted = [];
+            var warned = [];
+            var body = '';
+            var gi;
+            for (gi = 0; gi < groups.length; gi++) {
+                var grp = groups[gi];
+                var vdevs = grp.vdevs || [];
+                var baysHtml = '';
+                var vi;
+                for (vi = 0; vi < vdevs.length; vi++) {
+                    var v = vdevs[vi];
+                    var disks = v.disks || [];
+                    var cardsHtml = '';
+                    var di;
+                    for (di = 0; di < disks.length; di++) {
+                        var disk = disks[di];
+                        var res = diskCardHtml(gfx, disk);
+                        cardsHtml += res.html;
+                        if (res.level === 'critical') {
+                            faulted.push(disk.id);
+                        } else if (res.level === 'warning') {
+                            warned.push(disk.id);
+                        }
+                    }
+                    // Structural vdev with no leaf disks — render the vdev itself
+                    // as a card so the bay is never empty.
+                    if (!disks.length) {
+                        var vlvl;
+                        try {
+                            vlvl = diskHealthLevel(v.state, v.readErrors,
+                                v.writeErrors, v.checksumErrors);
+                        } catch (eV) {
+                            vlvl = '';
+                        }
+                        cardsHtml += gfx.diskCard({
+                            kind: 'hdd',
+                            state: gfxDiskState(vlvl),
+                            id: v.name,
+                            sub: ('' + (v.state || '')).toLowerCase(),
+                            title: v.name + ' — ' + v.state,
+                        }) || '';
+                    }
+                    var bay = gfx.bay(v.name || '', cardsHtml);
+                    if (bay) {
+                        baysHtml += '<div class="anas-pool-topo-bay">' + bay + '</div>';
+                    }
+                }
+                body += '<div class="anas-pool-topo-group" style="margin-bottom:12px;">'
+                    + '<div style="font-size:10px;font-weight:800;text-transform:uppercase;'
+                    + 'letter-spacing:.5px;color:gray;margin:0 0 7px;">'
+                    + encHtml(roleLabel(grp.role)) + '</div>'
+                    + '<div style="display:flex;flex-wrap:wrap;gap:10px;">'
+                    + baysHtml + '</div></div>';
+            }
+
+            // Advisory callout — reuse the derived health, name the bad members.
+            var callout = '';
+            var state = ('' + (d.state || '')).toUpperCase();
+            try {
+                if (faulted.length) {
+                    var fnames = [];
+                    var fi;
+                    for (fi = 0; fi < faulted.length; fi++) {
+                        fnames.push('<b>' + encHtml(shortDiskId(faulted[fi])) + '</b>');
+                    }
+                    var flvl = (state === 'FAULTED' || state === 'SUSPENDED'
+                        || state === 'UNAVAIL' || state === 'DEGRADED') ? 'bad' : 'warn';
+                    var fverb = faulted.length > 1
+                        ? ANAS.t('have faulted') : ANAS.t('has faulted');
+                    callout = gfx.callout(
+                        '<b>' + encHtml(ANAS.t('Degraded')) + '</b> — '
+                        + fnames.join(', ') + ' ' + encHtml(fverb) + '. '
+                        + encHtml(ANAS.t('Replace the affected device; '
+                            + 'a resilver rebuilds redundancy automatically.')),
+                        { level: flvl });
+                } else if (warned.length || state === 'DEGRADED') {
+                    var wnames = [];
+                    var wi;
+                    for (wi = 0; wi < warned.length; wi++) {
+                        wnames.push('<b>' + encHtml(shortDiskId(warned[wi])) + '</b>');
+                    }
+                    var wmsg = wnames.length
+                        ? (encHtml(ANAS.t('Attention')) + ' — ' + wnames.join(', ')
+                            + ' ' + encHtml(ANAS.t('reporting errors.')))
+                        : encHtml(ANAS.t('Pool is degraded.'));
+                    callout = gfx.callout(wmsg, { level: 'warn' });
+                } else if (state === 'ONLINE') {
+                    callout = gfx.callout(encHtml(ANAS.t('Pool is healthy.')),
+                        { level: 'ok' });
+                }
+            } catch (eC) {
+                callout = '';
+            }
+            if (callout) {
+                callout = '<div style="margin-top:4px;">' + callout + '</div>';
+            }
+
+            return '<div class="anas-pool-topo">'
+                + head + activity + body + callout + '</div>';
+        } catch (e) {
+            ANAS.warn('pool topology graphic failed: ' + ANAS.errText(e));
+            return '';
+        }
+    }
+
     // ---- Grid --------------------------------------------------------------
 
     function loadPools(grid, node) {
@@ -419,7 +693,7 @@
                     text: ANAS.t('State'),
                     dataIndex: 'state',
                     width: 130,
-                    renderer: ANAS.renderState,
+                    renderer: renderStatePill,
                 },
                 {
                     text: ANAS.t('Size'),
@@ -442,8 +716,8 @@
                 {
                     text: ANAS.t('Capacity'),
                     dataIndex: 'capacity',
-                    width: 100,
-                    renderer: ANAS.formatPercent,
+                    width: 150,
+                    renderer: renderCapacityBar,
                 },
                 {
                     text: ANAS.t('Fragmentation'),
@@ -639,7 +913,17 @@
             return;
         }
         ensureTopoStyles();
-        content.add([
+
+        // Headline skeuomorphic topology (story 15.3). Built as a fail-open HTML
+        // string; when it degrades to '' the graphical panel is omitted entirely
+        // and the error-count tree below carries the topology alone.
+        var topoGfx = '';
+        try {
+            topoGfx = topologyGfxHtml(d);
+        } catch (e) {
+            topoGfx = '';
+        }
+        var items = [
             {
                 xtype: 'panel',
                 title: ANAS.t('Summary'),
@@ -647,9 +931,24 @@
                 border: false,
                 html: summaryHtml(d),
             },
+        ];
+        if (topoGfx) {
+            items.push({
+                xtype: 'panel',
+                title: ANAS.t('Topology'),
+                cls: 'anas-pool-topo-panel',
+                bodyPadding: 12,
+                border: false,
+                html: topoGfx,
+            });
+        }
+        items.push(
             {
                 xtype: 'treepanel',
-                title: ANAS.t('Topology'),
+                // Secondary per-disk read/write/checksum error-count detail; the
+                // graphical bays above are the headline (story 15.3). Titled to
+                // reflect its role when the graphic is present.
+                title: topoGfx ? ANAS.t('Device Errors') : ANAS.t('Topology'),
                 cls: 'anas-pool-topology',
                 flex: 1,
                 rootVisible: false,
@@ -710,8 +1009,9 @@
                 bodyPadding: 10,
                 border: false,
                 html: scanHtml(d.scan),
-            },
-        ]);
+            }
+        );
+        content.add(items);
     }
 
     function showPoolDetail(node, poolName) {
