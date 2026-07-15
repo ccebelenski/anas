@@ -43,6 +43,86 @@ export function computeHealth(
   return smartHealthy === true ? 'healthy' : 'unknown'
 }
 
+/**
+ * Fetch all disk data: lsblk, by-id mapping, and pool membership, enriched with
+ * cached identity + the fused SMART/ZFS `healthStatus`. Standalone (not a route
+ * closure) so the Disks view AND the Dashboard status endpoint share ONE health
+ * computation rather than diverging (Epic 2 reuse).
+ */
+export async function collectDisks(
+  executor: CommandExecutor,
+  diskIdentityCache: DiskIdentityCache,
+): Promise<Disk[]> {
+  const [lsblkResult, byIdResult, statusResult] = await Promise.all([
+    executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
+    executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
+    executor.exec('/usr/sbin/zpool', ['status', '-jv']),
+  ])
+
+  const byIdMap = parseDiskByIdListing(byIdResult.stdout)
+
+  // Rich ZFS context per disk (vdev/role/state/error counts), keyed by by-id.
+  const poolInfo = new Map<string, PoolDiskInfo>()
+  if (statusResult.exitCode === 0 && statusResult.stdout.trim()) {
+    try {
+      const pools = parseZpoolStatus(statusResult.stdout)
+      for (const pool of pools) {
+        for (const group of pool.vdevGroups) {
+          for (const vdev of group.vdevs) {
+            for (const disk of vdev.disks) {
+              poolInfo.set(disk.id, {
+                pool: pool.name,
+                vdevName: vdev.name,
+                role: group.role,
+                state: disk.state,
+                read: disk.readErrors,
+                write: disk.writeErrors,
+                checksum: disk.checksumErrors,
+              })
+            }
+          }
+        }
+      }
+    }
+    catch {
+      // continue with empty pool map
+    }
+  }
+
+  // parseLsblk only needs id→pool for its usage-status classification.
+  const poolDisks = new Map<string, string>()
+  for (const [id, info] of poolInfo)
+    poolDisks.set(id, info.pool)
+
+  const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks)
+
+  // Lazy-load identity cache for all disks in parallel
+  await diskIdentityCache.loadMany(disks.map(d => ({ id: d.id, path: d.path })))
+
+  // Enrich each disk with cached identity, ZFS context, and derived health.
+  return disks.map((d) => {
+    const identity = diskIdentityCache.getCached(d.id)
+    const smartHealthy = identity ? identity.smartHealthy : null
+    const info = poolInfo.get(d.id)
+    const zfsContext = info
+      ? {
+          vdevName: info.vdevName,
+          vdevRole: info.role,
+          zfsErrors: { read: info.read, write: info.write, checksum: info.checksum },
+        }
+      : { vdevName: null, vdevRole: null, zfsErrors: null }
+    return {
+      ...d,
+      modelFamily: identity ? identity.modelFamily : null,
+      formFactor: identity ? identity.formFactor : null,
+      revision: identity?.firmwareVersion ?? d.revision,
+      smartHealthy,
+      ...zfsContext,
+      healthStatus: computeHealth(smartHealthy, info),
+    }
+  })
+}
+
 export async function diskRoutes(
   server: FastifyInstance,
   opts: { executor: CommandExecutor, diskIdentityCache: DiskIdentityCache },
@@ -51,74 +131,7 @@ export async function diskRoutes(
 
   /** Fetch all disk data: lsblk, by-id mapping, and pool membership. */
   async function fetchDisks(): Promise<Disk[]> {
-    const [lsblkResult, byIdResult, statusResult] = await Promise.all([
-      executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
-      executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
-      executor.exec('/usr/sbin/zpool', ['status', '-jv']),
-    ])
-
-    const byIdMap = parseDiskByIdListing(byIdResult.stdout)
-
-    // Rich ZFS context per disk (vdev/role/state/error counts), keyed by by-id.
-    const poolInfo = new Map<string, PoolDiskInfo>()
-    if (statusResult.exitCode === 0 && statusResult.stdout.trim()) {
-      try {
-        const pools = parseZpoolStatus(statusResult.stdout)
-        for (const pool of pools) {
-          for (const group of pool.vdevGroups) {
-            for (const vdev of group.vdevs) {
-              for (const disk of vdev.disks) {
-                poolInfo.set(disk.id, {
-                  pool: pool.name,
-                  vdevName: vdev.name,
-                  role: group.role,
-                  state: disk.state,
-                  read: disk.readErrors,
-                  write: disk.writeErrors,
-                  checksum: disk.checksumErrors,
-                })
-              }
-            }
-          }
-        }
-      }
-      catch {
-        // continue with empty pool map
-      }
-    }
-
-    // parseLsblk only needs id→pool for its usage-status classification.
-    const poolDisks = new Map<string, string>()
-    for (const [id, info] of poolInfo)
-      poolDisks.set(id, info.pool)
-
-    const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks)
-
-    // Lazy-load identity cache for all disks in parallel
-    await diskIdentityCache.loadMany(disks.map(d => ({ id: d.id, path: d.path })))
-
-    // Enrich each disk with cached identity, ZFS context, and derived health.
-    return disks.map((d) => {
-      const identity = diskIdentityCache.getCached(d.id)
-      const smartHealthy = identity ? identity.smartHealthy : null
-      const info = poolInfo.get(d.id)
-      const zfsContext = info
-        ? {
-            vdevName: info.vdevName,
-            vdevRole: info.role,
-            zfsErrors: { read: info.read, write: info.write, checksum: info.checksum },
-          }
-        : { vdevName: null, vdevRole: null, zfsErrors: null }
-      return {
-        ...d,
-        modelFamily: identity ? identity.modelFamily : null,
-        formFactor: identity ? identity.formFactor : null,
-        revision: identity?.firmwareVersion ?? d.revision,
-        smartHealthy,
-        ...zfsContext,
-        healthStatus: computeHealth(smartHealthy, info),
-      }
-    })
+    return collectDisks(executor, diskIdentityCache)
   }
 
   server.get('/disks', async (_request, _reply) => {

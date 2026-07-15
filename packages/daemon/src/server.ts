@@ -11,6 +11,7 @@ import { mockFixtures } from './fixtures/loader.js'
 import { JobQueue } from './jobs/queue.js'
 import { LSBLK_ARGS } from './parsers/lsblk.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
+import { dashboardRoutes } from './routes/dashboard.js'
 import { datasetRoutes } from './routes/datasets.js'
 import { diskRoutes } from './routes/disks.js'
 import { healthRoutes } from './routes/health.js'
@@ -263,6 +264,13 @@ export function createServer(opts?: ServerOptions) {
     // systemctl reload smbd — config-change side effect.
     mock.addFixture({ command: '/usr/bin/systemctl', args: ['reload', 'smbd'], result: { stdout: '', stderr: '', exitCode: 0 } })
 
+    // --- Epic 2: Dashboard -----------------------------------------------
+    // Service-active probes for the share status panel (GET /v1/status).
+    mock.addFixture({ command: '/usr/bin/systemctl', args: ['is-active', 'smbd'], result: { stdout: 'active\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/systemctl', args: ['is-active', 'nfs-server'], result: { stdout: 'active\n', stderr: '', exitCode: 0 } })
+    // Live per-pool/disk I/O sample for GET /v1/telemetry (two-sample window).
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', 'testpool', '1', '2'], result: mockFixtures.zpoolIostat() })
+
     // --- Epic 7: NFS exports ---------------------------------------------
     // `exportfs -ra` reloads the kernel export table after each mutation.
     mock.addFixture({ command: '/usr/sbin/exportfs', args: ['-ra'], result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -298,6 +306,9 @@ export function createServer(opts?: ServerOptions) {
   server.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
+  // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
+  // disk, share, and job sources above, plus on-demand ARC/iostat/net sampling.
+  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath })
 
   server.decorate('jobQueue', jobQueue)
   server.decorate('executor', executor)
