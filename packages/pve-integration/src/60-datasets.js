@@ -237,6 +237,11 @@
             compression: ds.compression,
             compressratio: ds.compressratio,
             quota: ds.quota,
+            // Epic 4.4 / 15.4: protocols sharing this dataset (['smb'|'nfs'])
+            // and its snapshot count, from the enriched flat feed. Optional —
+            // absent on older daemons, in which case the badges/chip degrade.
+            sharedOver: ds.sharedOver,
+            snapshotCount: ds.snapshotCount,
             // Total capacity of the owning pool (bytes) — feeds the "Space of
             // pool" gfx bar (Epic 15.4). Threaded from the GET /pools summary.
             poolSize: poolSize,
@@ -261,6 +266,8 @@
         node.compression = ds.compression;
         node.compressratio = ds.compressratio;
         node.quota = ds.quota;
+        node.sharedOver = ds.sharedOver;
+        node.snapshotCount = ds.snapshotCount;
     }
 
     // Ensure an intermediate parent node exists for parentName (defensive — in
@@ -3134,10 +3141,11 @@
     }
 
     // Properties column: compression + achieved-ratio chip (highlighted when the
-    // ratio pays off), a best-effort snapshot-count chip, and SMB/NFS share
-    // badges. Every piece is omitted when its data is absent. Pool roots show a
-    // single capacity chip. Falls back to the plain compression renderer if gfx
-    // is unavailable.
+    // ratio pays off), a snapshot-count chip (from the enriched feed's
+    // snapshotCount, so it shows on collapsed rows), and SMB/NFS share badges
+    // (from sharedOver). Every piece is omitted when its data is absent. Pool
+    // roots show a single capacity chip. Falls back to the plain compression
+    // renderer if gfx is unavailable.
     function renderDsProps(v, meta, rec) {
         try {
             if (!gfxReady() || typeof ANAS.gfx.chip !== 'function') {
@@ -3168,27 +3176,33 @@
                 }
                 parts.push(ANAS.gfx.chip(text, { good: ratio >= 1.5, title: tip }));
             }
-            // Snapshot count (best-effort; appears once snapshots are loaded).
-            var sc = snapCountForRecord(rec);
-            if (sc.count > 0 && typeof ANAS.gfx.chip === 'function') {
-                var slabel = sc.count + (sc.more ? '+' : '');
+            // Snapshot count — authoritative count from the enriched flat feed
+            // (snapshotCount), so it shows even on COLLAPSED rows. Falls back to
+            // the loaded-children tally on an older daemon that omits the field.
+            var scount = rec.get('snapshotCount');
+            var smore = false;
+            if (scount === undefined || scount === null) {
+                var sc = snapCountForRecord(rec);
+                scount = sc.count;
+                smore = sc.more;
+            }
+            if (Number(scount) > 0 && typeof ANAS.gfx.chip === 'function') {
+                var slabel = Number(scount) + (smore ? '+' : '');
                 parts.push(ANAS.gfx.chip('◷ ' + slabel, {
                     title: slabel + ' ' + t('snapshots'),
                 }));
             }
-            // Share badges — only when the row actually carries share data. The
-            // flat dataset list does not include shares today (data gap), so this
-            // stays dormant until the field is populated; it degrades to nothing.
-            var shares = rec.get('shares');
-            if (shares && shares.length && typeof ANAS.gfx.badge === 'function') {
-                for (var i = 0; i < shares.length; i++) {
-                    var s = shares[i] || {};
-                    var proto = ('' + (s.protocol || s)).toLowerCase();
+            // Share badges — driven by the enriched flat feed's sharedOver list
+            // (['smb'|'nfs']). Degrades to nothing when the field is absent.
+            var sharedOver = rec.get('sharedOver');
+            if (sharedOver && sharedOver.length && typeof ANAS.gfx.badge === 'function') {
+                for (var i = 0; i < sharedOver.length; i++) {
+                    var proto = ('' + (sharedOver[i] || '')).toLowerCase();
                     if (proto === 'smb' || proto === 'nfs') {
                         parts.push(ANAS.gfx.badge(proto.toUpperCase(), {
                             kind: proto,
                             title: proto === 'smb'
-                                ? t('Shared over SMB') : t('Exported over NFS'),
+                                ? t('Shared over SMB') : t('Shared over NFS'),
                         }));
                     }
                 }
@@ -3544,6 +3558,21 @@
             // Properties cell: allow chips/badges to wrap gracefully.
             css.push('.anas-grid-datasets .anas-ds-props-cell .x-grid-cell-inner{'
                 + 'white-space:normal;line-height:1.9}');
+            // Story 5.8: snapshot rows read distinctly from child datasets —
+            // muted italic text, a faint tinted band, and an inset accent rule
+            // on the left edge so their nesting under a dataset is unambiguous.
+            css.push('.anas-grid-datasets .anas-ds-snapshot-row .x-grid-cell{'
+                + 'background:color-mix(in srgb,var(--anas-muted) 8%,transparent)}');
+            css.push('.anas-grid-datasets .anas-ds-snapshot-row .anas-ds-nm,'
+                + '.anas-grid-datasets .anas-ds-snapshot-row .x-tree-node-text{'
+                + 'color:var(--anas-muted);font-style:italic}');
+            // Inset accent rule on the name cell — visually tucks the snapshot
+            // under its parent dataset without competing with the pool band.
+            css.push('.anas-grid-datasets .anas-ds-snapshot-row .x-grid-cell-first{'
+                + 'box-shadow:inset 2px 0 0 color-mix(in srgb,var(--anas-accent) 40%,transparent)}');
+            // The snapshot glyph (fa clock) picks up the muted tone too.
+            css.push('.anas-grid-datasets .anas-ds-snapshot-row .x-tree-icon{'
+                + 'opacity:0.75}');
             // Hero panel above the tree.
             css.push('.anas-ds-hero{padding:14px 18px;border-bottom:1px solid var(--anas-line);'
                 + 'background:var(--anas-panel)}');
@@ -3584,10 +3613,13 @@
                 { name: 'compressratio', type: 'auto' },
                 { name: 'quota', type: 'auto' },
                 // Epic 15.4: owning pool's total capacity (bytes) for the
-                // "Space of pool" bar; optional per-row share list for badges
-                // (dormant until the flat dataset feed carries it).
+                // "Space of pool" bar.
                 { name: 'poolSize', type: 'auto' },
-                { name: 'shares', type: 'auto' },
+                // Epic 4.4 / 15.4: enriched flat-feed fields — protocols sharing
+                // the dataset (SMB/NFS badges) and its snapshot count (chip on
+                // collapsed rows). Both optional; degrade to nothing if absent.
+                { name: 'sharedOver', type: 'auto' },
+                { name: 'snapshotCount', type: 'auto' },
                 // Story 3.25: whole-pool PVE ownership, stamped on every pool +
                 // dataset node so row renderers/handlers branch hands-off (PVE)
                 // vs first-class-root (ANAS). pveStorages kept for future detail.
@@ -3877,7 +3909,11 @@
                             return 'anas-ds-pool-row' + pve;
                         }
                         if (kind === 'snapshot') {
-                            return 'anas-snap-row';
+                            // Story 5.8: a distinct row treatment (muted, inset,
+                            // separator) so snapshots read clearly apart from
+                            // child datasets. 'anas-ds-snapshot-row' is the
+                            // stable test hook for that styling.
+                            return 'anas-snap-row anas-ds-snapshot-row';
                         }
                         if (kind === 'snapshots-more') {
                             return 'anas-snap-more';

@@ -33,6 +33,19 @@ export const Dataset = z.object({
   compressratio: z.number().nonnegative(),
   /** Quota in bytes, 0 = none */
   quota: z.number().nonnegative(),
+  /**
+   * Protocols currently sharing this dataset's mountpoint (Epic 4.4 / 15.4).
+   * Optional so the flat feed degrades when shares can't be read — the UI
+   * simply omits the SMB/NFS badges. Sourced by matching smb.conf / exports
+   * paths against the mountpoint, gathered once for the whole list (not N+1).
+   */
+  sharedOver: z.array(z.enum(['smb', 'nfs'])).optional(),
+  /**
+   * Number of snapshots of this dataset (Epic 5 / 15.4). Optional so the flat
+   * feed degrades when snapshots can't be read — the UI omits the count chip.
+   * Tallied from one recursive `zfs list -t snapshot` pass (not N+1).
+   */
+  snapshotCount: z.number().int().nonnegative().optional(),
 })
 export type Dataset = z.infer<typeof Dataset>
 
