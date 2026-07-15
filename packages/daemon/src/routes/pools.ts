@@ -1,4 +1,4 @@
-import type { PoolDetail, PoolSummary } from '@anas/shared'
+import type { PoolDetail, PoolSummary, VdevSpec } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
@@ -60,64 +60,53 @@ function buildCreateArgs(req: CreatePoolRequest): string[] {
 
   args.push(req.name)
 
-  // Data vdevs
-  for (const vdev of req.dataVdevs) {
-    if (vdev.type !== 'stripe')
-      args.push(vdev.type)
-    for (const id of vdev.disks)
-      args.push(byIdPath(id))
-  }
-
-  // Log (ZIL) vdevs — 'log' keyword once, then each vdev's keyword + disks
-  if (req.logVdevs && req.logVdevs.length > 0) {
-    args.push('log')
-    for (const vdev of req.logVdevs) {
-      if (vdev.type !== 'stripe')
-        args.push(vdev.type)
-      for (const id of vdev.disks)
-        args.push(byIdPath(id))
-    }
-  }
-
-  // Special allocation-class vdevs (metadata / small blocks) — like 'log', the
-  // 'special' keyword begins the class and each following vdev belongs to it.
-  // Redundancy is enforced by the caller (isRedundantSpec) before this runs.
-  if (req.specialVdevs && req.specialVdevs.length > 0) {
-    args.push('special')
-    for (const vdev of req.specialVdevs) {
-      if (vdev.type !== 'stripe')
-        args.push(vdev.type)
-      for (const id of vdev.disks)
-        args.push(byIdPath(id))
-    }
-  }
-
-  // Dedup allocation-class vdevs (the dedup table) — same shape as special.
-  if (req.dedupVdevs && req.dedupVdevs.length > 0) {
-    args.push('dedup')
-    for (const vdev of req.dedupVdevs) {
-      if (vdev.type !== 'stripe')
-        args.push(vdev.type)
-      for (const id of vdev.disks)
-        args.push(byIdPath(id))
-    }
-  }
-
-  // Cache (L2ARC) — always individual disks
-  if (req.cacheDisks && req.cacheDisks.length > 0) {
-    args.push('cache')
-    for (const id of req.cacheDisks)
-      args.push(byIdPath(id))
-  }
-
-  // Hot spares — always individual disks
-  if (req.spareDisks && req.spareDisks.length > 0) {
-    args.push('spare')
-    for (const id of req.spareDisks)
-      args.push(byIdPath(id))
-  }
+  // Data vdevs carry no class keyword; the redundant allocation classes
+  // (log/special/dedup) and the bare-disk classes (cache/spare) follow, in the
+  // order zpool expects. Redundancy for special/dedup is enforced by the caller
+  // (isRedundantSpec) before this runs.
+  for (const vdev of req.dataVdevs)
+    args.push(...vdevSpecArgs(vdev))
+  pushClassVdevs(args, 'log', req.logVdevs)
+  pushClassVdevs(args, 'special', req.specialVdevs)
+  pushClassVdevs(args, 'dedup', req.dedupVdevs)
+  pushDiskClass(args, 'cache', req.cacheDisks)
+  pushDiskClass(args, 'spare', req.spareDisks)
 
   return args
+}
+
+/**
+ * The argv fragment for one vdev spec: its redundancy keyword (mirror/raidzN)
+ * unless it's the synthetic 'stripe' (bare disks, no keyword), then the by-id
+ * disk paths. THE single source of the "stripe → bare, else keyword" rule that
+ * both pool-create and add-vdev depend on.
+ */
+function vdevSpecArgs(vdev: VdevSpec): string[] {
+  const args: string[] = []
+  if (vdev.type !== 'stripe')
+    args.push(vdev.type)
+  for (const id of vdev.disks)
+    args.push(byIdPath(id))
+  return args
+}
+
+/** Append a redundant allocation class (log/special/dedup): the class keyword
+ *  once, then each vdev's spec args. No-op when the list is empty. */
+function pushClassVdevs(args: string[], keyword: string, vdevs: VdevSpec[] | undefined): void {
+  if (!vdevs || vdevs.length === 0)
+    return
+  args.push(keyword)
+  for (const vdev of vdevs)
+    args.push(...vdevSpecArgs(vdev))
+}
+
+/** Append a bare-disk class (cache/spare): the keyword then plain disk paths. */
+function pushDiskClass(args: string[], keyword: string, disks: string[] | undefined): void {
+  if (!disks || disks.length === 0)
+    return
+  args.push(keyword)
+  for (const id of disks)
+    args.push(byIdPath(id))
 }
 
 /** An importable pool discovered by a `zpool import` scan. */
@@ -677,15 +666,12 @@ export async function poolRoutes(
     }
     else {
       const v = vdev!
-      const diskPaths = v.disks.map(byIdPath)
       const head = ['add', poolName]
       // log/special/dedup prepend their class keyword; data has none.
       if (role === 'log' || role === 'special' || role === 'dedup')
         head.push(role)
-      // stripe → bare disks (no redundancy keyword); mirror/raidz* → keyword.
-      if (v.type !== 'stripe')
-        head.push(v.type)
-      args = [...head, ...diskPaths]
+      // vdevSpecArgs applies the shared stripe→bare / else→keyword rule + disks.
+      args = [...head, ...vdevSpecArgs(v)]
       jobDisks = v.disks
       jobType = v.type
     }
