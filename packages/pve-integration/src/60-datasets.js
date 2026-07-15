@@ -194,6 +194,21 @@
         }
     }
 
+    // Shared column definitions for the space/created fields, so the Datasets
+    // tree and the snapshots popup declare them ONCE and cannot drift (same
+    // dataIndex/width/renderer). Each returns a FRESH config object — ExtJS takes
+    // ownership of a column config when a grid consumes it, so two grids must not
+    // be handed the same instance.
+    function colUsed() {
+        return { text: t('Used'), dataIndex: 'used', width: 110, align: 'right', renderer: renderBytes };
+    }
+    function colReferenced() {
+        return { text: t('Referenced'), dataIndex: 'referenced', width: 110, align: 'right', renderer: renderBytes };
+    }
+    function colCreated() {
+        return { text: t('Created'), dataIndex: 'created', width: 150, renderer: formatCreated };
+    }
+
     // Default snapshot label: "snapshot-<local timestamp>", human-readable and
     // sortable. Recomputed each time the create dialog opens; fully overridable.
     function defaultSnapName() {
@@ -2850,26 +2865,9 @@
                             flex: 1,
                             renderer: Ext.String.htmlEncode,
                         },
-                        {
-                            text: t('Created'),
-                            dataIndex: 'created',
-                            width: 150,
-                            renderer: formatCreated,
-                        },
-                        {
-                            text: t('Used'),
-                            dataIndex: 'used',
-                            width: 110,
-                            align: 'right',
-                            renderer: renderBytes,
-                        },
-                        {
-                            text: t('Referenced'),
-                            dataIndex: 'referenced',
-                            width: 110,
-                            align: 'right',
-                            renderer: renderBytes,
-                        },
+                        colCreated(),
+                        colUsed(),
+                        colReferenced(),
                     ],
                     tbar: [
                         {
@@ -3794,13 +3792,7 @@
                         // Epic 15.4: prepend the gfx pool/folder object icon.
                         renderer: renderName,
                     },
-                    {
-                        text: t('Used'),
-                        dataIndex: 'used',
-                        width: 110,
-                        align: 'right',
-                        renderer: renderBytes,
-                    },
+                    colUsed(),
                     {
                         // Epic 15.4: fraction of the pool's total capacity, as a
                         // fullness-coloured gfx bar.
@@ -3832,20 +3824,8 @@
                         align: 'right',
                         renderer: renderBytes,
                     },
-                    {
-                        text: t('Referenced'),
-                        dataIndex: 'referenced',
-                        width: 110,
-                        align: 'right',
-                        renderer: renderBytes,
-                    },
-                    {
-                        // New for snapshot rows; blank for datasets/pools.
-                        text: t('Created'),
-                        dataIndex: 'created',
-                        width: 150,
-                        renderer: formatCreated,
-                    },
+                    colReferenced(),
+                    colCreated(),
                     {
                         text: t('Quota'),
                         dataIndex: 'quota',
