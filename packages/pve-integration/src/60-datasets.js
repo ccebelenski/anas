@@ -223,7 +223,7 @@
         return idx >= 0 ? name.substring(idx + 1) : name;
     }
 
-    function nodeFromDataset(ds, kind) {
+    function nodeFromDataset(ds, kind, poolSize) {
         return {
             name: lastSegment(ds.name),
             fullName: ds.name,
@@ -237,6 +237,12 @@
             compression: ds.compression,
             compressratio: ds.compressratio,
             quota: ds.quota,
+            // Total capacity of the owning pool (bytes) — feeds the "Space of
+            // pool" gfx bar (Epic 15.4). Threaded from the GET /pools summary.
+            poolSize: poolSize,
+            // Suppress the default tree node glyph so the gfx object icon drawn
+            // in the Name column is the only icon (see ensureDatasetStyles).
+            iconCls: 'anas-tree-obj',
             leaf: true,
             children: [],
         };
@@ -255,7 +261,7 @@
 
     // Ensure an intermediate parent node exists for parentName (defensive — in
     // practice every ZFS level is itself a dataset row, so this is rarely hit).
-    function ensureParent(parentName, pool, byName) {
+    function ensureParent(parentName, pool, byName, poolSize) {
         if (byName[parentName]) {
             return byName[parentName];
         }
@@ -265,12 +271,14 @@
             pool: pool,
             kind: 'dataset',
             type: 'filesystem',
+            poolSize: poolSize,
+            iconCls: 'anas-tree-obj',
             leaf: false,
             children: [],
         };
         byName[parentName] = node;
         var grandName = parentName.substring(0, parentName.lastIndexOf('/'));
-        var grand = grandName ? ensureParent(grandName, pool, byName) : byName[pool];
+        var grand = grandName ? ensureParent(grandName, pool, byName, poolSize) : byName[pool];
         if (grand) {
             grand.children.push(node);
             grand.leaf = false;
@@ -280,12 +288,15 @@
 
     function buildPoolNode(pool, datasets) {
         var byName = {};
+        var poolSize = Number(pool.size) || 0;
         var rootNode = {
             name: pool.name,
             fullName: pool.name,
             pool: pool.name,
             kind: 'pool',
             type: 'filesystem',
+            poolSize: poolSize,
+            iconCls: 'anas-tree-obj',
             expanded: true,
             leaf: true,
             children: [],
@@ -303,10 +314,10 @@
                 applyDatasetData(rootNode, ds);
                 continue;
             }
-            var node = nodeFromDataset(ds, 'dataset');
+            var node = nodeFromDataset(ds, 'dataset', poolSize);
             byName[ds.name] = node;
             var parentName = ds.name.substring(0, ds.name.lastIndexOf('/'));
-            var parent = byName[parentName] || ensureParent(parentName, pool.name, byName);
+            var parent = byName[parentName] || ensureParent(parentName, pool.name, byName, poolSize);
             parent.children.push(node);
             parent.leaf = false;
         }
@@ -394,8 +405,19 @@
                     // non-fatal
                 }
                 var children = [];
+                var poolMap = {};
                 for (var j = 0; j < results.length; j++) {
                     children.push(buildPoolNode(results[j].pool, results[j].datasets));
+                    if (results[j].pool && results[j].pool.name) {
+                        poolMap[results[j].pool.name] = results[j].pool;
+                    }
+                }
+                // Stash the pool summaries so the donut hero (Epic 15.4) can read
+                // size/allocated/free without another round-trip.
+                try {
+                    tree.anasPools = poolMap;
+                } catch (ePool) {
+                    // non-fatal
                 }
                 try {
                     // Replace the whole root atomically. Incrementally mutating
@@ -410,6 +432,11 @@
                     ANAS.warn('dataset tree build failed: ' + ANAS.errText(e2));
                 }
                 updateButtons(tree);
+                try {
+                    refreshHero(tree);
+                } catch (eHero) {
+                    // Hero is a graceful enhancement — never let it break the tree.
+                }
             });
         }, function (err) {
             if (tree.destroyed || tree.destroying) {
@@ -503,8 +530,10 @@
     // ANAS.shares exists by the time a user clicks. Fail-open: if it is somehow
     // absent, warn rather than throw.
 
-    function shareDatasetFromTree(node, tree, proto) {
-        var rec = selectedRecord(tree);
+    function shareDatasetFromTree(node, tree, proto, rec) {
+        // `rec` is optional — the toolbar submenu relies on the tree selection,
+        // while the per-row action icon (Epic 15.4) passes the clicked record.
+        rec = rec || selectedRecord(tree);
         if (!isFilesystem(rec)) {
             return;
         }
@@ -1102,7 +1131,11 @@
     }
 
     function openEdit(node, tree, rec) {
-        if (!isDataset(rec)) {
+        // Accept a dataset OR the pool root: the pool root row carries the pool's
+        // root filesystem data (merged in buildPoolNode) and the daemon addresses
+        // it via the empty-relative-path detail endpoint, so its ZFS properties
+        // are editable too (Epic 15.4 per-row "props" action on the pool root).
+        if (!isDataset(rec) && !(rec && rec.get('kind') === 'pool')) {
             return;
         }
         if (typeof ANAS.editWindow !== 'function') {
@@ -2843,6 +2876,477 @@
         }
     }
 
+    // ======================================================================
+    //  Epic 15.4 — enriched-tree gfx retrofit
+    //
+    //  The datasets view stays a native ExtJS treepanel (hierarchy, lazy
+    //  loading, selection, keyboard nav, a11y come for free). We reproduce the
+    //  approved spike's VISUAL LANGUAGE inside it via column renderers that emit
+    //  ANAS.gfx markup, a pool-space donut hero above the tree, a pool-root row
+    //  band, and PERSISTENT per-row line-icon action buttons (never hover-
+    //  reveal). Everything is fail-open: a gfx gap degrades to the prior plain
+    //  rendering and never breaks the tree or PVE.
+    // ======================================================================
+
+    function gfxReady() {
+        return !!(ANAS && ANAS.gfx);
+    }
+
+    function fmtBytes(v) {
+        try {
+            return ANAS.formatBytes(v);
+        } catch (e) {
+            return '' + v;
+        }
+    }
+
+    // Name column: draw the gfx object icon (pool vs open/closed folder) ahead
+    // of the label so pool roots and datasets read distinctly. Snapshot and
+    // overflow rows keep their own fa iconCls and are just html-encoded.
+    function renderName(v, meta, rec) {
+        var label = enc(v == null ? '' : v);
+        try {
+            if (!gfxReady() || typeof ANAS.gfx.objectIcon !== 'function') {
+                return label;
+            }
+            var kind = rec.get('kind');
+            if (kind === 'pool') {
+                return ANAS.gfx.objectIcon('pool', { title: t('Pool') })
+                    + '<span class="anas-ds-nm">' + label + '</span>';
+            }
+            if (kind === 'dataset') {
+                var open = false;
+                try {
+                    open = !!(rec.isExpanded && rec.isExpanded());
+                } catch (e0) {
+                    open = false;
+                }
+                var title = rec.get('type') === 'volume' ? t('Volume') : t('Filesystem');
+                return ANAS.gfx.objectIcon('folder', { open: open, title: title })
+                    + '<span class="anas-ds-nm">' + label + '</span>';
+            }
+            return label;
+        } catch (e) {
+            return label;
+        }
+    }
+
+    // "Space of pool" column: fraction of the owning pool's TOTAL capacity this
+    // dataset occupies (used ÷ pool size), drawn as a fullness-coloured gfx bar.
+    function renderSpaceOfPool(v, meta, rec) {
+        try {
+            if (!gfxReady() || typeof ANAS.gfx.bar !== 'function') {
+                return renderBytes(rec.get('used'));
+            }
+            var kind = rec.get('kind');
+            if (kind !== 'pool' && kind !== 'dataset') {
+                return '';
+            }
+            var used = Number(rec.get('used'));
+            var poolSize = Number(rec.get('poolSize'));
+            if (!poolSize || isNaN(poolSize) || isNaN(used)) {
+                return '';
+            }
+            var frac = used / poolSize;
+            var pct = Math.round(frac * 100);
+            var title = rec.get('name') + ' ' + t('uses') + ' ' + fmtBytes(used)
+                + ' — ' + pct + '% ' + t('of') + ' ' + rec.get('pool')
+                + ' (' + fmtBytes(poolSize) + ')';
+            return ANAS.gfx.bar(frac, { title: title });
+        } catch (e) {
+            return '';
+        }
+    }
+
+    // Best-effort snapshot count for a dataset row: counts already-loaded
+    // snapshot child rows (snapshots load lazily on first expand). Returns
+    // { count, more } — `more` true when a "show all" overflow row is present.
+    function snapCountForRecord(rec) {
+        var out = { count: 0, more: false };
+        try {
+            var kids = rec && rec.childNodes;
+            if (!kids) {
+                return out;
+            }
+            for (var i = 0; i < kids.length; i++) {
+                var k = kids[i].get('kind');
+                if (k === 'snapshot') {
+                    out.count++;
+                } else if (k === 'snapshots-more') {
+                    out.more = true;
+                }
+            }
+        } catch (e) {
+            // fail-open
+        }
+        return out;
+    }
+
+    // Properties column: compression + achieved-ratio chip (highlighted when the
+    // ratio pays off), a best-effort snapshot-count chip, and SMB/NFS share
+    // badges. Every piece is omitted when its data is absent. Pool roots show a
+    // single capacity chip. Falls back to the plain compression renderer if gfx
+    // is unavailable.
+    function renderDsProps(v, meta, rec) {
+        try {
+            if (!gfxReady() || typeof ANAS.gfx.chip !== 'function') {
+                return renderCompression(v, meta, rec);
+            }
+            var kind = rec.get('kind');
+            if (kind === 'pool') {
+                var pused = Number(rec.get('used'));
+                var psize = Number(rec.get('poolSize'));
+                if (psize && !isNaN(pused)) {
+                    return ANAS.gfx.chip(fmtBytes(pused) + ' / ' + fmtBytes(psize),
+                        { title: t('Pool capacity used / total') });
+                }
+                return '';
+            }
+            if (kind !== 'dataset') {
+                return '';
+            }
+            var parts = [];
+            var comp = rec.get('compression');
+            if (comp) {
+                var ratio = Number(rec.get('compressratio'));
+                var text = '' + comp;
+                var tip = t('Compression') + ': ' + comp;
+                if (ratio && ratio > 0) {
+                    text += ' ' + ratio.toFixed(1) + 'x';
+                    tip += ' — ' + ratio.toFixed(2) + 'x ' + t('achieved ratio');
+                }
+                parts.push(ANAS.gfx.chip(text, { good: ratio >= 1.5, title: tip }));
+            }
+            // Snapshot count (best-effort; appears once snapshots are loaded).
+            var sc = snapCountForRecord(rec);
+            if (sc.count > 0 && typeof ANAS.gfx.chip === 'function') {
+                var slabel = sc.count + (sc.more ? '+' : '');
+                parts.push(ANAS.gfx.chip('◷ ' + slabel, {
+                    title: slabel + ' ' + t('snapshots'),
+                }));
+            }
+            // Share badges — only when the row actually carries share data. The
+            // flat dataset list does not include shares today (data gap), so this
+            // stays dormant until the field is populated; it degrades to nothing.
+            var shares = rec.get('shares');
+            if (shares && shares.length && typeof ANAS.gfx.badge === 'function') {
+                for (var i = 0; i < shares.length; i++) {
+                    var s = shares[i] || {};
+                    var proto = ('' + (s.protocol || s)).toLowerCase();
+                    if (proto === 'smb' || proto === 'nfs') {
+                        parts.push(ANAS.gfx.badge(proto.toUpperCase(), {
+                            kind: proto,
+                            title: proto === 'smb'
+                                ? t('Shared over SMB') : t('Exported over NFS'),
+                        }));
+                    }
+                }
+            }
+            return parts.join(' ');
+        } catch (e) {
+            return '';
+        }
+    }
+
+    // Actions column: persistent (always-visible) gfx line-icon buttons, each
+    // with a tooltip. Pool root → add (new top-level dataset) + props (root
+    // filesystem). Dataset → add (child) + snapshot + share/lock (filesystems
+    // only) + props + trash. Wired to the existing handlers via the tree
+    // cellclick delegate below.
+    function renderDsActions(v, meta, rec) {
+        try {
+            if (!gfxReady() || typeof ANAS.gfx.ctl !== 'function') {
+                return '';
+            }
+            var kind = rec.get('kind');
+            if (kind === 'pool') {
+                return ANAS.gfx.ctl('add', t('New top-level dataset'))
+                    + ANAS.gfx.ctl('props', t('Root filesystem properties'));
+            }
+            if (kind !== 'dataset') {
+                return '';
+            }
+            var isFs = rec.get('type') === 'filesystem';
+            var out = ANAS.gfx.ctl('add', t('New child dataset'))
+                + ANAS.gfx.ctl('snapshot', t('Take snapshot'));
+            if (isFs) {
+                out += ANAS.gfx.ctl('share', t('Share…'))
+                    + ANAS.gfx.ctl('lock', t('Permissions'));
+            }
+            out += ANAS.gfx.ctl('props', t('Edit properties'))
+                + ANAS.gfx.ctl('trash', t('Destroy…'), { danger: true });
+            return out;
+        } catch (e) {
+            return '';
+        }
+    }
+
+    // Small SMB/NFS chooser for the per-row Share icon (mirrors the toolbar
+    // submenu). Anchored at the click point; reuses shareDatasetFromTree.
+    function openShareMenu(node, tree, rec, ev) {
+        try {
+            var menu = Ext.create('Ext.menu.Menu', {
+                cls: 'anas-menu-ds-share',
+                items: [
+                    {
+                        text: t('SMB Share…'),
+                        cls: 'anas-btn-ds-share-smb',
+                        iconCls: 'fa fa-windows',
+                        handler: function () {
+                            shareDatasetFromTree(node, tree, 'smb', rec);
+                        },
+                    },
+                    {
+                        text: t('NFS Export…'),
+                        cls: 'anas-btn-ds-share-nfs',
+                        iconCls: 'fa fa-hdd-o',
+                        handler: function () {
+                            shareDatasetFromTree(node, tree, 'nfs', rec);
+                        },
+                    },
+                ],
+            });
+            if (ev && typeof ev.getXY === 'function') {
+                menu.showAt(ev.getXY());
+            } else {
+                menu.show();
+            }
+        } catch (e) {
+            ANAS.warn('dataset share menu failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // Dispatch a per-row action-icon click to the EXISTING handler for the
+    // clicked record. `name` is the gfx control name (add|snapshot|share|lock|
+    // props|trash). Fail-open — an unknown name or a thrown handler is swallowed.
+    function dispatchRowCtl(node, tree, rec, name, ev) {
+        try {
+            if (!rec) {
+                return;
+            }
+            var kind = rec.get('kind');
+            if (name === 'add') {
+                // openCreate seeds the parent from the record: a dataset → child,
+                // the pool root → a new top-level dataset in that pool.
+                openCreate(node, tree, rec);
+                return;
+            }
+            if (kind === 'pool') {
+                if (name === 'props') {
+                    openEdit(node, tree, rec);
+                }
+                return;
+            }
+            if (kind !== 'dataset') {
+                return;
+            }
+            if (name === 'snapshot') {
+                var pool = rec.get('pool');
+                var fullName = rec.get('fullName');
+                openCreateSnapshot(node, pool, fullName, function () {
+                    refreshTreeSnapshots(node, tree, pool, fullName, true);
+                });
+            } else if (name === 'share') {
+                openShareMenu(node, tree, rec, ev);
+            } else if (name === 'lock') {
+                openPermissions(node, tree, rec);
+            } else if (name === 'props') {
+                openEdit(node, tree, rec);
+            } else if (name === 'trash') {
+                openDestroy(node, tree, rec);
+            }
+        } catch (e) {
+            ANAS.warn('dataset row action failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // ---- Pool-space donut hero (Epic 15.4 enhancement) --------------------
+    //
+    // A panel above the tree showing where a pool's space goes: a gfx donut of
+    // used-space by top-level dataset (+ a Free segment) with a legend, for the
+    // pool of the currently-selected node (defaulting to the first pool). Scoped
+    // to a single pool and fully optional — any failure hides it and leaves the
+    // tree untouched.
+
+    function poolNodeByName(tree, poolName) {
+        try {
+            var root = tree.getRootNode();
+            var kids = root && root.childNodes;
+            if (!kids) {
+                return null;
+            }
+            for (var i = 0; i < kids.length; i++) {
+                if (kids[i].get('kind') === 'pool' && kids[i].get('name') === poolName) {
+                    return kids[i];
+                }
+            }
+        } catch (e) {
+            // fail-open
+        }
+        return null;
+    }
+
+    function firstPoolName(tree) {
+        try {
+            var root = tree.getRootNode();
+            var kids = root && root.childNodes;
+            if (kids) {
+                for (var i = 0; i < kids.length; i++) {
+                    if (kids[i].get('kind') === 'pool') {
+                        return kids[i].get('name');
+                    }
+                }
+            }
+        } catch (e) {
+            // fail-open
+        }
+        return null;
+    }
+
+    function buildHeroHtml(tree, poolName) {
+        if (!gfxReady() || typeof ANAS.gfx.donut !== 'function') {
+            return '';
+        }
+        var pools = tree.anasPools || {};
+        var ps = pools[poolName];
+        if (!ps) {
+            return '';
+        }
+        var size = Number(ps.size) || 0;
+        if (!size) {
+            return '';
+        }
+        var allocated = Number(ps.allocated) || 0;
+        var free = Number(ps.free);
+        if (isNaN(free)) {
+            free = Math.max(0, size - allocated);
+        }
+        var segs = [];
+        var poolNode = poolNodeByName(tree, poolName);
+        if (poolNode && poolNode.childNodes) {
+            for (var i = 0; i < poolNode.childNodes.length; i++) {
+                var c = poolNode.childNodes[i];
+                if (c.get('kind') === 'dataset') {
+                    segs.push({ label: c.get('name'), value: Number(c.get('used')) || 0 });
+                }
+            }
+        }
+        segs.push({ label: t('Free'), value: free, free: true });
+        var donut = ANAS.gfx.donut(segs, {
+            total: size,
+            size: 150,
+            center: { big: fmtBytes(allocated), sm: t('of') + ' ' + fmtBytes(size) },
+        });
+        var legend = ANAS.gfx.legend(segs, { total: size, format: fmtBytes });
+        return '<div class="anas-ds-hero-wrap">'
+            + '<div class="anas-ds-hero-donut">' + donut + '</div>'
+            + '<div class="anas-ds-hero-main">'
+            + '<div class="anas-ds-hero-t">' + enc(t('Pool space') + ' — ') + '<b>' + enc(poolName) + '</b></div>'
+            + '<div class="anas-ds-hero-s">'
+            + enc(t('How the used space breaks down across top-level datasets.')) + '</div>'
+            + legend + '</div></div>';
+    }
+
+    // Recompute + update the hero for the tree's current pool focus (a selected
+    // node's pool, else the first pool). Hides the hero when there is nothing to
+    // show. Never throws out to the caller.
+    function refreshHero(tree) {
+        try {
+            if (!tree || tree.destroyed || tree.destroying) {
+                return;
+            }
+            var view = tree.up('.anas-view-datasets') || tree.up('panel');
+            var hero = view && view.down('#dsHero');
+            if (!hero) {
+                return;
+            }
+            var poolName = tree.anasHeroPool || firstPoolName(tree);
+            var html = poolName ? buildHeroHtml(tree, poolName) : '';
+            if (html) {
+                hero.update(html);
+                hero.setHidden(false);
+            } else {
+                hero.setHidden(true);
+            }
+        } catch (e) {
+            // Graceful — hide on any trouble.
+            try {
+                var v2 = tree.up('.anas-view-datasets');
+                var h2 = v2 && v2.down('#dsHero');
+                if (h2) { h2.setHidden(true); }
+            } catch (e2) {
+                // give up silently
+            }
+        }
+    }
+
+    // ---- View-local style injection (Epic 15.4) ---------------------------
+    //
+    // View-scoped chrome that is NOT part of the shared gfx layer: the pool-root
+    // row band, hiding the default tree node glyph (so the gfx object icon is the
+    // only Name-column icon), and hero layout. Uses gfx's own --anas-* theme
+    // tokens (published on :root) so it follows the PVE light/dark theme. Injected
+    // once; fail-open.
+    var dsStylesInjected = false;
+    function ensureDatasetStyles() {
+        if (dsStylesInjected) {
+            return;
+        }
+        try {
+            var STYLE_ID = 'anas-datasets-style';
+            var head = document.head || document.getElementsByTagName('head')[0]
+                || document.documentElement;
+            if (!head || document.getElementById(STYLE_ID)) {
+                dsStylesInjected = true;
+                return;
+            }
+            var css = [];
+            // Pool-root row band: distinct tinted background + accent left edge.
+            css.push('.anas-grid-datasets .anas-ds-pool-row .x-grid-cell{'
+                + 'background:var(--anas-accent-soft);'
+                + 'border-top:1px solid color-mix(in srgb,var(--anas-accent) 22%,var(--anas-line));'
+                + 'border-bottom:1px solid color-mix(in srgb,var(--anas-accent) 22%,var(--anas-line))}');
+            css.push('.anas-grid-datasets .anas-ds-pool-row .x-grid-cell-first{'
+                + 'box-shadow:inset 3px 0 0 var(--anas-accent)}');
+            css.push('.anas-grid-datasets .anas-ds-pool-row .anas-ds-nm{font-weight:750}');
+            // Bold-ish dataset names sit a touch above muted metadata.
+            css.push('.anas-grid-datasets .anas-ds-nm{margin-left:5px;vertical-align:middle}');
+            // Object icon aligns with the text baseline in the Name cell.
+            css.push('.anas-grid-datasets .anas-gfx-obj{vertical-align:middle}');
+            // Suppress the default tree node glyph for pool/dataset rows so only
+            // the gfx object icon shows (snapshot rows keep their fa icon).
+            css.push('.anas-grid-datasets .anas-tree-obj{display:none!important}');
+            // Actions cell: keep the persistent buttons tight and right-aligned.
+            css.push('.anas-grid-datasets .anas-ds-actions-cell .x-grid-cell-inner{'
+                + 'padding-top:2px;padding-bottom:2px;white-space:nowrap;text-align:right}');
+            css.push('.anas-grid-datasets .anas-ds-actions-cell .anas-gfx-ctl{'
+                + 'vertical-align:middle}');
+            // Space-of-pool cell lets the gfx bar fill the column width.
+            css.push('.anas-grid-datasets .anas-ds-space-cell .x-grid-cell-inner{'
+                + 'padding-top:4px;padding-bottom:4px}');
+            // Properties cell: allow chips/badges to wrap gracefully.
+            css.push('.anas-grid-datasets .anas-ds-props-cell .x-grid-cell-inner{'
+                + 'white-space:normal;line-height:1.9}');
+            // Hero panel above the tree.
+            css.push('.anas-ds-hero{padding:14px 18px;border-bottom:1px solid var(--anas-line);'
+                + 'background:var(--anas-panel)}');
+            css.push('.anas-ds-hero-wrap{display:flex;align-items:center;gap:22px;flex-wrap:wrap}');
+            css.push('.anas-ds-hero-donut{flex:0 0 auto}');
+            css.push('.anas-ds-hero-main{flex:1;min-width:240px}');
+            css.push('.anas-ds-hero-t{font-weight:650;margin:0 0 3px;color:var(--anas-ink)}');
+            css.push('.anas-ds-hero-s{color:var(--anas-muted);font-size:12px;margin-bottom:10px}');
+
+            var style = document.createElement('style');
+            style.id = STYLE_ID;
+            style.type = 'text/css';
+            style.appendChild(document.createTextNode(css.join('\n')));
+            head.appendChild(style);
+            dsStylesInjected = true;
+        } catch (e) {
+            ANAS.warn('dataset styles injection failed: ' + ANAS.errText(e));
+        }
+    }
+
     // ---- View --------------------------------------------------------------
 
     function datasetsView(node) {
@@ -2862,6 +3366,11 @@
                 { name: 'referenced', type: 'auto' },
                 { name: 'compressratio', type: 'auto' },
                 { name: 'quota', type: 'auto' },
+                // Epic 15.4: owning pool's total capacity (bytes) for the
+                // "Space of pool" bar; optional per-row share list for badges
+                // (dormant until the flat dataset feed carries it).
+                { name: 'poolSize', type: 'auto' },
+                { name: 'shares', type: 'auto' },
             ],
             root: { expanded: true, children: [] },
         });
@@ -3016,16 +3525,29 @@
             },
         ];
 
+        // Inject the view-local chrome (pool band, hero layout, icon hiding)
+        // up front so first paint is styled. Fail-open inside.
+        ensureDatasetStyles();
+
         return {
             xtype: 'panel',
             cls: 'anas-view anas-view-datasets',
             title: t('Datasets'),
-            layout: 'fit',
+            layout: { type: 'vbox', align: 'stretch' },
             border: false,
             items: [{
+                // Epic 15.4 pool-space donut hero — sits above the tree, hidden
+                // until data arrives (refreshHero populates + reveals it).
+                xtype: 'component',
+                itemId: 'dsHero',
+                cls: 'anas-ds-hero',
+                hidden: true,
+                html: '',
+            }, {
                 xtype: 'treepanel',
                 itemId: 'dsTree',
                 cls: 'anas-grid-datasets',
+                flex: 1,
                 border: false,
                 rootVisible: false,
                 store: store,
@@ -3037,7 +3559,9 @@
                         text: t('Name'),
                         dataIndex: 'name',
                         flex: 1,
-                        renderer: Ext.String.htmlEncode,
+                        minWidth: 220,
+                        // Epic 15.4: prepend the gfx pool/folder object icon.
+                        renderer: renderName,
                     },
                     {
                         text: t('Used'),
@@ -3045,6 +3569,30 @@
                         width: 110,
                         align: 'right',
                         renderer: renderBytes,
+                    },
+                    {
+                        // Epic 15.4: fraction of the pool's total capacity, as a
+                        // fullness-coloured gfx bar.
+                        text: t('Space of pool'),
+                        dataIndex: 'used',
+                        width: 190,
+                        sortable: false,
+                        menuDisabled: true,
+                        tdCls: 'anas-ds-space-cell',
+                        renderer: renderSpaceOfPool,
+                    },
+                    {
+                        // Epic 15.4: compression/ratio + snapshot-count chips and
+                        // SMB/NFS share badges (replaces the plain Compression
+                        // column; the chip conveys the compressor + achieved
+                        // ratio).
+                        text: t('Properties'),
+                        dataIndex: 'compression',
+                        width: 210,
+                        sortable: false,
+                        menuDisabled: true,
+                        tdCls: 'anas-ds-props-cell',
+                        renderer: renderDsProps,
                     },
                     {
                         text: t('Available'),
@@ -3068,24 +3616,33 @@
                         renderer: formatCreated,
                     },
                     {
-                        text: t('Compression'),
-                        dataIndex: 'compression',
-                        width: 150,
-                        renderer: renderCompression,
-                    },
-                    {
                         text: t('Quota'),
                         dataIndex: 'quota',
                         width: 110,
                         align: 'right',
                         renderer: renderQuota,
                     },
+                    {
+                        // Epic 15.4: persistent per-row action icons (add /
+                        // snapshot / share / lock / props / trash). Wired to the
+                        // existing handlers via the cellclick delegate below.
+                        text: t('Actions'),
+                        dataIndex: 'kind',
+                        width: 210,
+                        sortable: false,
+                        menuDisabled: true,
+                        tdCls: 'anas-ds-actions-cell',
+                        renderer: renderDsActions,
+                    },
                 ],
                 tbar: tbar,
-                // Tag snapshot / overflow rows for styling + test hooks.
+                // Tag pool-root / snapshot / overflow rows for styling + hooks.
                 viewConfig: {
                     getRowClass: function (record) {
                         var kind = record.get('kind');
+                        if (kind === 'pool') {
+                            return 'anas-ds-pool-row';
+                        }
                         if (kind === 'snapshot') {
                             return 'anas-snap-row';
                         }
@@ -3100,8 +3657,38 @@
                         treeRef = tree;
                         loadTree(tree, node);
                     },
-                    selectionchange: function () {
+                    selectionchange: function (selModel, selected) {
                         updateButtons(this);
+                        // Focus the donut hero on the selected node's pool.
+                        try {
+                            var rec = (selected && selected.length) ? selected[0] : null;
+                            if (rec && rec.get('pool')) {
+                                this.anasHeroPool = rec.get('pool');
+                                refreshHero(this);
+                            }
+                        } catch (e) {
+                            // hero is optional
+                        }
+                    },
+                    // Persistent per-row action icons: delegate a click on any
+                    // gfx control button to its existing handler (Epic 15.4).
+                    cellclick: function (view, td, cellIndex, record, tr, rowIndex, e) {
+                        try {
+                            var target = e && e.target;
+                            var btn = (target && target.closest)
+                                ? target.closest('[data-anas-ctl]') : null;
+                            if (!btn) {
+                                return;
+                            }
+                            if (e && e.stopEvent) {
+                                e.stopEvent();
+                            }
+                            var name = btn.getAttribute('data-anas-ctl');
+                            var tree = view.up('treepanel') || view;
+                            dispatchRowCtl(node, tree, record, name, e);
+                        } catch (err) {
+                            ANAS.warn('dataset cellclick failed: ' + ANAS.errText(err));
+                        }
                     },
                     // Lazy-load a dataset's snapshots the first time it expands.
                     itemexpand: function (record) {
