@@ -32,4 +32,6 @@ export const mockFixtures = {
   smartctl: () => fixtureResult('system', 'smartctl.json'),
   /** Raw /etc/exports text for seeding a writable mock file in dev. */
   nfsExportsText: () => loadFixture('nfs', 'etc-exports'),
+  /** `zpool iostat -plv` two-sample output for the dashboard telemetry (2.7). */
+  zpoolIostat: () => fixtureResult('telemetry', 'zpool-iostat-plv.txt'),
 }
