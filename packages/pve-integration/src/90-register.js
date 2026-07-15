@@ -13,7 +13,9 @@
 
     // Fixed presentation order for the ANAS group. Views not present in
     // ANAS.views are skipped by injectMenu.
-    var ORDER = ['dashboard', 'pools', 'datasets', 'shares', 'users', 'disks'];
+    // TEMPORARY (Epic 15.1): 'gfxcheck' is the ANAS.gfx de-risk proof panel —
+    // REMOVE it here (and delete src/16-gfxcheck.js) once the Pool Composer ships.
+    var ORDER = ['dashboard', 'pools', 'datasets', 'shares', 'users', 'disks', 'gfxcheck'];
 
     try {
         if (!ANAS || typeof ANAS.installMenu !== 'function') {
