@@ -375,20 +375,20 @@ Story numbering is for identification only, not implementation order. Within eac
 ### Stories
 
 #### Dev
-2.6. As the dashboard page, I want a unified status endpoint in anasd (`GET /v1/status`) that aggregates pool health, share status, and disk state, so that I can render from a single API call instead of fanning out.
+2.6. [done 2026-07-15] As the dashboard page, I want a unified status endpoint in anasd (`GET /v1/status`) that aggregates pool health, share status, and disk state, so that I can render from a single API call instead of fanning out.
 
 #### Compose
-2.1. As the dashboard, I want a pool health summary component (from Epic 3), so that I can display pool status without knowing ZFS internals.
+2.1. [done 2026-07-15] As the dashboard, I want a pool health summary component (from Epic 3), so that I can display pool status without knowing ZFS internals.
 
-2.2. As the dashboard, I want a disk utilization component (from Epic 3), so that I can show space usage at a glance.
+2.2. [done 2026-07-15] As the dashboard, I want a disk utilization component (from Epic 3), so that I can show space usage at a glance.
 
-2.3. As the dashboard, I want a share status component (from Epics 6/7), so that I can show SMB/NFS service health and active shares.
+2.3. [done 2026-07-15] As the dashboard, I want a share status component (from Epics 6/7), so that I can show SMB/NFS service health and active shares.
 
-2.4. As the dashboard, I want a recent jobs component (from Epic 9), so that I can show recent activity.
+2.4. [done 2026-07-15] As the dashboard, I want a recent jobs component (from Epic 9), so that I can show recent activity.
 
-2.5. As the dashboard, I want a warnings/alerts component that surfaces degraded pools, failed scrubs, and disk errors prominently, so that problems are impossible to miss.
+2.5. [done 2026-07-15] As the dashboard, I want a warnings/alerts component that surfaces degraded pools, failed scrubs, and disk errors prominently, so that problems are impossible to miss.
 
-2.7. [backlog] As a user, I want ZFS-specific performance telemetry on the dashboard (ARC hit ratio & size, L2ARC, per-pool `zpool iostat` throughput/IOPS, compression ratio, live scrub/resilver rate), so I get the storage insight TrueNAS gives that PVE's generic RRD graphs don't. *(Do NOT duplicate PVE's node CPU/mem/disk-IO graphs — Principle 15. Principle 7 tension: prefer live on-demand sampling while the panel is open, or PVE's RRD, over a background collector; persisted history is a separate discussion. Data sources: /proc/spl/kstat/zfs/arcstats, `zpool iostat`.)*
+2.7. [done 2026-07-15] As a user, I want ZFS-specific performance telemetry on the dashboard (ARC hit ratio & size, L2ARC, per-pool `zpool iostat` throughput/IOPS, compression ratio, live scrub/resilver rate), so I get the storage insight TrueNAS gives that PVE's generic RRD graphs don't. *(Do NOT duplicate PVE's node CPU/mem/disk-IO graphs — Principle 15. Principle 7 tension: prefer live on-demand sampling while the panel is open, or PVE's RRD, over a background collector; persisted history is a separate discussion. Data sources: /proc/spl/kstat/zfs/arcstats, `zpool iostat`.)*
 
 ---
 
@@ -476,7 +476,7 @@ Story numbering is for identification only, not implementation order. Within eac
 15.2. [done — create-side 2026-07-14] **Pool Composer** (build-side of 3.23 — the flagship): draft topology, drag-to-bay, live capacity/redundancy, validity gating (special/log redundancy enforced), pool advisor. Launches from the Pools "Create" action; commits one `CreatePoolRequest`. **Verified live: the graphical composer created a real ZFS pool on the stunt node.** *(Gaps deferred: (a) **special/dedup vdevs are not yet creatable** — `CreatePoolRequest` has no special/dedup field and the daemon's `buildCreateArgs` emits only data/log/cache/spare; the composer offers the Special role but blocks commit with a clear reason rather than silently dropping disks. Resolving this = finishing the API side of 3.22 (schema field + `zpool create … special mirror …` args). (b) **Expand mode** is implemented but not wired to a toolbar button, and `AddVdevRequest` carries no role so it can only add data vdevs — needs a role field for log/cache/spare/special expansion.)*
 15.3. [done 2026-07-14] **Pools status view** — the monitor-side twin: grid state pills + capacity bars; a graphical **Topology** panel in the pool detail (one `gfx.bay` per vdev, a `gfx.diskCard` per member colored by *live* health so a faulted drive shows red in its physical bay position), capacity gauge, scrub/resilver `gfx.activity` strip, and an advisor `gfx.callout` naming bad members. The per-disk READ/WRITE/CKSUM tree is retained below as "Device Errors". *(Gaps: `PoolDetail` carries no per-disk `kind`, so every disk tile renders as the HDD object (gfx's unknown-kind default) — lighting up SSD/NVMe tiles needs `kind` on `PoolDetail`; also no per-disk size, so the tile sub-line shows a live error/state summary instead. A disk that is `ONLINE` but reporting errors is intentionally colored red, consistent with the existing row tint. Nice-to-have: a `gfx.bayGroup(label, bays)` helper — the role-group wrapper is the only hand-rolled inline markup.)*
 15.4. [done 2026-07-14] **Datasets enriched tree** — retrofit into the *existing* ExtJS treepanel (not a rewrite): pool/folder gfx object icons + a distinct pool-root row band, a **Space of pool** `gfx.bar` column, a **Properties** column (compression/ratio + snapshot-count `gfx.chip`, SMB/NFS `gfx.badge`), always-visible per-row `gfx.ctl` action icons (add/snapshot/share/lock/props/trash) delegated to the existing handlers, and a pool-space **donut** hero that refocuses on the selected node's pool. *(Gaps: the flat `GET /pools/:name/datasets` feed carries no share info, so SMB/NFS badges are dormant until `shares` is added to that feed — badges omit gracefully when absent. Snapshot-count chip is best-effort — it counts loaded snapshot child rows, so it appears only after a dataset is expanded.)*
-15.5. Extend the language to the **Dashboard** (Epic 2) and Disk Health (3.20) as the vocabulary matures. *(Disk Health portion done 2026-07-14: the Disks grid now leads each row with a skeuomorphic `gfx.icon` disk object — hdd/ssd/nvme by `transport`/`rotational`, colored by the fused `healthStatus` (SMART+ZFS) with a corner health dot, faulted drives greyscaled. Dashboard retrofit still pending.)*
+15.5. Extend the language to the **Dashboard** (Epic 2) and Disk Health (3.20) as the vocabulary matures. *(Disk Health portion done 2026-07-14: the Disks grid now leads each row with a skeuomorphic `gfx.icon` disk object — hdd/ssd/nvme by `transport`/`rotational`, colored by the fused `healthStatus` (SMART+ZFS) with a corner health dot, faulted drives greyscaled. Dashboard done 2026-07-15: rebuilt from the placeholder into the full Epic 2 dashboard — pool-health donuts/pills, fleet health, shares/jobs, warning callouts, and the live telemetry headline (ARC gauge, per-pool/disk I/O bars + sparklines with latency, network throughput) on GET /v1/status + /v1/telemetry.)*
 
 ---
 
