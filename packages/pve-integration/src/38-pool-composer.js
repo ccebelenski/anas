@@ -913,7 +913,7 @@
             + '<span style="flex:1"></span>'
             + '<span style="' + PILL + '">' + enc(t('Draft — nothing is created until you commit.')) + '</span></div>'
 
-            + '<div style="display:grid;grid-template-columns:280px minmax(0,1fr) 272px;gap:14px;align-items:start">'
+            + '<div style="display:grid;grid-template-columns:280px minmax(360px,1fr) 272px;gap:14px;align-items:start">'
 
             // Available disks
             + '<div style="' + CARD + '">'
@@ -1242,8 +1242,6 @@
                 minHeight: 480,
                 maximizable: true,
                 resizable: true,
-                constrain: true,
-                constrainTo: regionEl || undefined,
                 layout: 'fit',
                 items: [{
                     xtype: 'panel',
