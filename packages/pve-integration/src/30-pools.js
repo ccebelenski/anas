@@ -442,6 +442,121 @@
         }
     }
 
+    // ---- PVE-managed classification (story 3.25) ---------------------------
+    //
+    // A pool is PVE-managed iff its `pveStorages` is a *non-empty array*. That
+    // field carries the /etc/pve/storage.cfg entries that name this pool
+    // ([{ storage, type:'zfspool'|'dir'|'zfs', dataset?, content:[] }]). Older
+    // daemon responses omit it — treat missing as [] (ANAS-managed). Fail-open
+    // is deliberate: anything we cannot positively classify as PVE-managed
+    // (malformed / non-array) stays ANAS-managed so we never silently block a
+    // real ANAS pool's destructive actions.
+
+    // Registered actions that PVE ownership makes hands-off. Scrub/Trim/Upgrade/
+    // Detail (base toolbar) and Refresh stay enabled; Create/Import are not
+    // selection-bound so they are untouched. Keyed by registered-action itemId.
+    var PVE_HANDS_OFF = {
+        exportPool: 1,
+        destroyPool: 1,
+        addVdev: 1,
+        attachDisk: 1,
+        modifyProps: 1,
+    };
+
+    function isArray(v) {
+        try {
+            return Object.prototype.toString.call(v) === '[object Array]';
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // The pool's PVE storages as a plain array (never null). Accepts an ExtJS
+    // record or a raw object. Non-array / malformed ⇒ [] (ANAS-managed).
+    function pveStoragesOf(rec) {
+        try {
+            var v = (rec && typeof rec.get === 'function')
+                ? rec.get('pveStorages')
+                : (rec && rec.pveStorages);
+            return (isArray(v) && v.length) ? v : [];
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function isPveManaged(rec) {
+        try {
+            return pveStoragesOf(rec).length > 0;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Tooltip like "PVE storage: datapool (images, rootdir)". Joins multiple
+    // storages with "; ". Fail-open to a bare label.
+    function pveTooltip(storages) {
+        try {
+            var parts = [];
+            for (var i = 0; i < storages.length; i++) {
+                var s = storages[i] || {};
+                var nm = s.storage || s.dataset || '';
+                var content = isArray(s.content) ? s.content.join(', ') : '';
+                parts.push(('' + nm) + (content ? ' (' + content + ')' : ''));
+            }
+            return ANAS.t('PVE storage') + ': ' + parts.join('; ');
+        } catch (e) {
+            return ANAS.t('PVE storage');
+        }
+    }
+
+    // Name column: the pool name, plus a standout "PVE" badge for PVE-managed
+    // pools (test hook: anas-pool-pve-badge; tooltip names storages + content).
+    // ANAS-managed pools show the plain name. Fully fail-open — any throw or a
+    // missing gfx foundation degrades to just the encoded name.
+    function renderPoolName(value, meta, record) {
+        var name = encHtml(value);
+        try {
+            var storages = pveStoragesOf(record);
+            if (!storages.length) {
+                return name;
+            }
+            var tip = pveTooltip(storages);
+            var badge = '';
+            try {
+                var gfx = ANAS.gfx;
+                if (gfx && typeof gfx.badge === 'function') {
+                    badge = gfx.badge('PVE', { title: tip }) || '';
+                }
+            } catch (eB) {
+                badge = '';
+            }
+            if (!badge) {
+                // gfx unavailable — a plain inline tag still conveys PVE + tip.
+                badge = '<span class="anas-gfx-badge" title="' + encHtml(tip)
+                    + '">PVE</span>';
+            }
+            return name + ' <span class="anas-pool-pve-badge" title="'
+                + encHtml(tip) + '">' + badge + '</span>';
+        } catch (e) {
+            return name;
+        }
+    }
+
+    // Set/clear the "why disabled" tooltip on a hands-off button. Guarded — a
+    // toolbar button without setTooltip must never break updateButtons.
+    function setPveTooltip(btn, blocked) {
+        try {
+            if (!btn || typeof btn.setTooltip !== 'function') {
+                return;
+            }
+            btn.setTooltip(blocked
+                ? ANAS.t('Disabled — PVE manages this pool')
+                : '');
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
     // ---- Grid --------------------------------------------------------------
 
     function loadPools(grid, node) {
@@ -498,8 +613,14 @@
         if (upgradeBtn) {
             upgradeBtn.setDisabled(!has);
         }
-        // Registered actions: toggle by their declared selection needs.
+        // Registered actions: toggle by their declared selection needs, plus
+        // the story 3.25 hands-off gate. When the selected pool is PVE-managed,
+        // the destructive/topology-mutating actions (Export/Destroy/Add-vdev/
+        // Attach/Modify) are disabled with an explanatory tooltip; Scrub/Trim/
+        // Upgrade/Detail (base toolbar) and Refresh stay enabled. Create/Import
+        // are not selection-bound (needsSelection false) so the loop skips them.
         var scanningSel = has && sel[0].get('scanRunning');
+        var pveManaged = has && isPveManaged(sel[0]);
         var actions = ANAS.pools.actions;
         for (var i = 0; i < actions.length; i++) {
             var a = actions[i];
@@ -507,9 +628,13 @@
                 continue;
             }
             var btn = a.itemId ? grid.down('#' + a.itemId) : null;
-            if (btn) {
-                btn.setDisabled(!has || (a.disableWhileScanning && scanningSel));
+            if (!btn) {
+                continue;
             }
+            var pveBlock = !!(pveManaged && PVE_HANDS_OFF[a.itemId]);
+            btn.setDisabled(!has || (a.disableWhileScanning && scanningSel)
+                || pveBlock);
+            setPveTooltip(btn, pveBlock);
         }
     }
 
@@ -617,6 +742,9 @@
                 { name: 'fragmentation', type: 'float' },
                 { name: 'dedupRatio', type: 'float' },
                 { name: 'scanRunning', type: 'boolean' },
+                // story 3.25: PVE-managed classification. Auto field keeps the
+                // array verbatim; empty/absent ⇒ ANAS-managed (see isPveManaged).
+                'pveStorages',
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
@@ -687,8 +815,24 @@
             cls: 'anas-view anas-view-pools anas-grid-pools',
             store: store,
             selModel: { mode: 'SINGLE' },
+            // Tag PVE-managed rows (test hook: anas-pool-pve-row) so a test can
+            // assert the hands-off classification at the row level. Fail-open.
+            viewConfig: {
+                getRowClass: function (record) {
+                    try {
+                        return isPveManaged(record) ? 'anas-pool-pve-row' : '';
+                    } catch (e) {
+                        return '';
+                    }
+                },
+            },
             columns: [
-                { text: ANAS.t('Name'), dataIndex: 'name', flex: 1 },
+                {
+                    text: ANAS.t('Name'),
+                    dataIndex: 'name',
+                    flex: 1,
+                    renderer: renderPoolName,
+                },
                 {
                     text: ANAS.t('State'),
                     dataIndex: 'state',
