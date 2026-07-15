@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { parsePveStorageCfg, readPveStorages } from '../pve-storage.js'
+import { parsePveStorageCfg, parseZfsMountpoints, readPveStorages } from '../pve-storage.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/pve')
@@ -83,6 +83,92 @@ describe('parsePveStorageCfg', () => {
 
   it('returns an empty map for empty input', () => {
     assert.equal(parsePveStorageCfg('').size, 0)
+  })
+})
+
+describe('parsePveStorageCfg — dir on ZFS (secondary signal)', () => {
+  const mountpoints = [
+    { mountpoint: '/datapool', dataset: 'datapool', pool: 'datapool' },
+  ]
+
+  it('ignores dir stanzas entirely when no mountpoints are supplied', () => {
+    // Fixture has a dir on /datapool/backups; without the map it must not appear.
+    const map = parsePveStorageCfg(loadFixture('storage.cfg'))
+    assert.deepEqual([...map.keys()], ['datapool'])
+    assert.deepEqual(map.get('datapool')!.map(r => r.type), ['zfspool'])
+  })
+
+  it('attaches a dir on a ZFS mountpoint to the pool, keyed by pool root', () => {
+    const map = parsePveStorageCfg(loadFixture('storage.cfg'), mountpoints)
+    // /var/lib/vz is on no ZFS dataset → ignored; /datapool/backups → datapool.
+    assert.deepEqual([...map.keys()], ['datapool'])
+    const refs = map.get('datapool')!
+    assert.equal(refs.length, 2)
+    const dir = refs.find(r => r.type === 'dir')!
+    assert.deepEqual(dir, {
+      storage: 'backups',
+      type: 'dir',
+      dataset: 'datapool',
+      content: ['backup', 'iso'],
+    })
+  })
+
+  it('ignores a dir path that is on no ZFS dataset (e.g. /var/lib/vz)', () => {
+    const text = 'dir: local\n\tpath /var/lib/vz\n\tcontent backup,iso\n'
+    const map = parsePveStorageCfg(text, mountpoints)
+    assert.equal(map.size, 0)
+  })
+
+  it('picks the longest matching mountpoint (most specific dataset)', () => {
+    const nested = [
+      { mountpoint: '/tank', dataset: 'tank', pool: 'tank' },
+      { mountpoint: '/tank/backups', dataset: 'tank/backups', pool: 'tank' },
+    ]
+    const text = 'dir: bk\n\tpath /tank/backups/dump\n\tcontent backup\n'
+    const dir = parsePveStorageCfg(text, nested).get('tank')![0]
+    assert.equal(dir.dataset, 'tank/backups')
+  })
+
+  it('matches a dir path equal to the dataset mountpoint itself', () => {
+    const text = 'dir: bk\n\tpath /datapool\n\tcontent iso\n'
+    const dir = parsePveStorageCfg(text, mountpoints).get('datapool')![0]
+    assert.equal(dir.dataset, 'datapool')
+  })
+
+  it('does not let /tank swallow a sibling path like /tank-other', () => {
+    const mps = [{ mountpoint: '/tank', dataset: 'tank', pool: 'tank' }]
+    const text = 'dir: x\n\tpath /tank-other/dump\n\tcontent backup\n'
+    assert.equal(parsePveStorageCfg(text, mps).size, 0)
+  })
+
+  it('skips a dir stanza with no path line', () => {
+    const text = 'dir: x\n\tcontent backup\n'
+    assert.equal(parsePveStorageCfg(text, mountpoints).size, 0)
+  })
+})
+
+describe('parseZfsMountpoints', () => {
+  it('parses tab-separated name,mountpoint rows and derives the pool root', () => {
+    const out = parseZfsMountpoints('datapool\t/datapool\ndatapool/backups\t/datapool/backups\n')
+    assert.deepEqual(out, [
+      { mountpoint: '/datapool', dataset: 'datapool', pool: 'datapool' },
+      { mountpoint: '/datapool/backups', dataset: 'datapool/backups', pool: 'datapool' },
+    ])
+  })
+
+  it('drops volumes and non-mounted datasets (-, none, legacy)', () => {
+    const out = parseZfsMountpoints([
+      'tank\t/tank',
+      'tank/vm-100-disk-0\t-',
+      'tank/legacy\tlegacy',
+      'tank/nomount\tnone',
+      '',
+    ].join('\n'))
+    assert.deepEqual(out.map(m => m.dataset), ['tank'])
+  })
+
+  it('returns an empty array for empty input', () => {
+    assert.deepEqual(parseZfsMountpoints(''), [])
   })
 })
 
