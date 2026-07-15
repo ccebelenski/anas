@@ -457,6 +457,25 @@ Story numbering is for identification only, not implementation order. Within eac
 
 ---
 
+## Epic 15: `ANAS.gfx` — Graphical Visual Language (backlog)
+
+> As a user, I want ANAS's storage views to use a purpose-built graphical language — SVG hardware objects, capacity gauges, health states — instead of plain grids, so the physical/spatial reality of my storage is legible at a glance in a way tables can't convey.
+
+**Direction decided 2026-07-14** (validated via three local HTML spikes in scratchpad — composer, pools-status, datasets-tree). Key findings/decisions:
+- **SVG + DOM, not canvas** — canvas has no DOM nodes → no `anas-*` test hooks, no CSS theming, no accessibility. SVG objects on themed ExtJS chrome give crisp vector icons (HDD/SSD/NVMe), testability, and PVE light/dark theming for free. Drag is ~40 lines of Pointer Events (validated); Interact.js (vendored UMD in the concat) is optional polish, not load-bearing.
+- **A shared layer, not one-offs**: build `ANAS.gfx` once — disk/vdev icon set + health palette + capacity gauge/bar + node-drag toolkit + tree-enrichment helpers — consumed by every graphical view so a faulted disk (etc.) looks identical everywhere.
+- **Graphics where they add insight, tables where density wins** — target Pools/Disks/Composer/Datasets; keep Shares/Users/Jobs tabular (hybrid: graphical hero + tabular detail).
+- **Skeuomorphic-but-restrained**: objects carry their own material gradients; the UI chrome themes around them.
+
+### Stories (to be detailed when scheduled)
+15.1. `ANAS.gfx` foundation — the shared SVG icon set, palette, gauges, drag toolkit, packaging (vendored UMD in the installer concat), test-hook conventions.
+15.2. **Pool Composer** (this is the build-side of Epic 3.23 — the flagship): draft topology, drag-to-bay, live capacity/redundancy, validity gating, pool advisor.
+15.3. **Pools status view** — the monitor-side twin: same objects colored by live health, capacity gauges, scrub/resilver activity, advisor on live state.
+15.4. **Datasets enriched tree** — inline capacity bars, compression chips, snapshot counts, share/permission badges on the existing action tree.
+15.5. Extend the language to the **Dashboard** (Epic 2) and Disk Health (3.20) as the vocabulary matures.
+
+---
+
 ## MVP Scope
 
 For V1 MVP, the implementation order is:
