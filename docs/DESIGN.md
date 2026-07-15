@@ -597,7 +597,8 @@ Node "pve1"
 - **Data viz** — capacity gauges/bars (fullness-coloured) and the pool-space donut (breakdown by dataset + free).
 
 **Module surface** (`ANAS.gfx`, a new file in the `packages/pve-integration/` concat, loaded before the views):
-- `icon(kind, {state})` → content-object SVG; `ctl(name)` → control line-icon button; `gauge(frac)` / `bar(frac)` → capacity viz; `donut(segments)` → breakdown ring.
+- `icon(kind, {state})` / `objectIcon('pool'|'folder')` → content-object SVG; `ctl(name)` → control line-icon button; `gauge(frac)` / `bar(frac)` → capacity viz; `donut(segments)` + `legend(segments)` → breakdown ring.
+- Monitor-side vocabulary (added with the 15.3/15.4/15.5 retrofits, so a faulted disk etc. looks identical in every view): `statePill(state)` pool/vdev state chip; `chip(text, {good})` property chip; `badge(text, {kind:'smb'|'nfs'})` share badge; `callout(html, {level})` advisory banner (reuses the composer advisor output); `activity(frac, {label})` animated scrub/resilver strip; `bay(label, inner)` read-only vdev bay; `diskCard({kind, state, id, sub})` skeuomorphic disk tile.
 - `drag(el, {onDrop})` → the pointer-events drag/dropzone helper (ghost locked to source width — no resize-on-lift; dropzone hit-test via `elementFromPoint`). Native Pointer Events — no library for MVP (a vendored Interact.js UMD is an optional later polish for touch/snapping, added as an earlier-numbered concat file exposing a global).
 - Shared `<defs>` (material gradients) + a scoped `<style>` (palette tokens) injected once by the layer. Chrome tokens inherit PVE light/dark; every object/control carries an `anas-gfx-*` hook.
 
