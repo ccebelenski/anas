@@ -51,6 +51,14 @@
  *     .anas-gfx-gauge / -gauge-fill  capacity gauge (bar + used/total text)
  *     .anas-gfx-donut                breakdown ring
  *     .anas-gfx-legend / -legend-row donut legend
+ *   Status & labels (monitor side)
+ *     .anas-gfx-pill / -pill-<lvl>   pool/vdev state pill (online|degraded|faulted)
+ *     .anas-gfx-chip / -chip-good    dataset property chip
+ *     .anas-gfx-badge / -badge-<k>   share badge (+smb|nfs)
+ *     .anas-gfx-callout / -<lvl>     advisory banner (ok|warn|bad)
+ *     .anas-gfx-activity             scrub/resilver progress strip
+ *     .anas-gfx-bay-box              read-only vdev bay wrapper
+ *     .anas-gfx-diskcard             read-only disk tile (+ .anas-gfx-disk)
  *   Drag
  *     .anas-gfx-ghost                the floating drag ghost (width-locked)
  *     .anas-gfx-dragging             source element while its ghost is aloft
@@ -249,6 +257,65 @@
         css.push('.anas-gfx-legend-nm{flex:1}');
         css.push('.anas-gfx-legend-sz{color:var(--anas-muted);font-variant-numeric:tabular-nums}');
         css.push('.anas-gfx-legend-pct{width:42px;text-align:right;font-weight:650;font-variant-numeric:tabular-nums}');
+
+        // Status pill: pool/vdev state chip with a coloured dot (monitor side).
+        css.push('.anas-gfx-pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;'
+            + 'font-weight:800;letter-spacing:.4px;text-transform:uppercase;padding:3px 10px;'
+            + 'border-radius:999px;border:1px solid var(--anas-line);color:var(--anas-muted)}');
+        css.push('.anas-gfx-pill-dot{width:8px;height:8px;border-radius:50%;background:var(--anas-muted)}');
+        css.push('.anas-gfx-pill-online{color:var(--anas-ok);border-color:color-mix(in srgb,var(--anas-ok) 45%,var(--anas-line))}');
+        css.push('.anas-gfx-pill-online .anas-gfx-pill-dot{background:var(--anas-ok)}');
+        css.push('.anas-gfx-pill-degraded{color:var(--anas-warn);border-color:color-mix(in srgb,var(--anas-warn) 45%,var(--anas-line))}');
+        css.push('.anas-gfx-pill-degraded .anas-gfx-pill-dot{background:var(--anas-warn)}');
+        css.push('.anas-gfx-pill-faulted{color:var(--anas-danger);border-color:color-mix(in srgb,var(--anas-danger) 45%,var(--anas-line))}');
+        css.push('.anas-gfx-pill-faulted .anas-gfx-pill-dot{background:var(--anas-danger)}');
+
+        // Property chip (dataset props) + share badge (SMB/NFS).
+        css.push('.anas-gfx-chip{display:inline-flex;align-items:center;font-size:10px;padding:1px 7px;'
+            + 'border-radius:999px;border:1px solid var(--anas-card-edge);color:var(--anas-muted);'
+            + 'background:var(--anas-slot);white-space:nowrap}');
+        css.push('.anas-gfx-chip-good{color:var(--anas-ok);border-color:color-mix(in srgb,var(--anas-ok) 45%,var(--anas-line))}');
+        css.push('.anas-gfx-badge{display:inline-flex;align-items:center;font-size:9.5px;font-weight:800;'
+            + 'color:#fff;padding:1px 6px;border-radius:999px;background:var(--anas-accent)}');
+        css.push('.anas-gfx-badge-smb{background:var(--anas-series-1)}');
+        css.push('.anas-gfx-badge-nfs{background:var(--anas-series-2)}');
+
+        // Advisory callout (reuses the composer advisor rule-engine output).
+        css.push('.anas-gfx-callout{display:flex;gap:8px;align-items:flex-start;font-size:12px;'
+            + 'padding:9px 11px;border-radius:10px;box-shadow:inset 0 1px 0 var(--anas-card-hi)}');
+        css.push('.anas-gfx-callout b{font-weight:750}');
+        css.push('.anas-gfx-callout-ok{background:color-mix(in srgb,var(--anas-ok) 11%,transparent);color:var(--anas-ok)}');
+        css.push('.anas-gfx-callout-warn{background:color-mix(in srgb,var(--anas-warn) 13%,transparent);color:var(--anas-warn)}');
+        css.push('.anas-gfx-callout-bad{background:color-mix(in srgb,var(--anas-danger) 14%,transparent);color:var(--anas-danger)}');
+
+        // Activity strip: animated indeterminate/progress bar (scrub/resilver).
+        css.push('.anas-gfx-activity{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:10px;'
+            + 'background:color-mix(in srgb,var(--anas-accent) 8%,transparent);'
+            + 'border:1px solid color-mix(in srgb,var(--anas-accent) 25%,var(--anas-line))}');
+        css.push('.anas-gfx-activity-lbl{font-weight:700;color:var(--anas-ink)}');
+        css.push('.anas-gfx-activity-bar{flex:1;height:8px;border-radius:999px;background:var(--anas-slot);'
+            + 'overflow:hidden;box-shadow:inset 0 1px 2px rgba(0,0,0,.2)}');
+        css.push('.anas-gfx-activity-fill{display:block;height:100%;background-size:24px 100%;'
+            + 'background-image:linear-gradient(90deg,var(--anas-accent),color-mix(in srgb,var(--anas-accent) 55%,#fff));'
+            + 'animation:anas-gfx-stripe 1s linear infinite}');
+        css.push('.anas-gfx-activity-pct{font-size:11px;color:var(--anas-muted);font-variant-numeric:tabular-nums}');
+        css.push('@keyframes anas-gfx-stripe{to{background-position:24px 0}}');
+
+        // Read-only vdev bay (the monitor-side counterpart of the composer bay).
+        css.push('.anas-gfx-bay-box{display:inline-flex;flex-direction:column;gap:8px;border-radius:11px;'
+            + 'background:var(--anas-bay);box-shadow:inset 0 2px 6px rgba(0,0,0,.16),inset 0 -1px 0 var(--anas-bay-lip);padding:10px}');
+        css.push('.anas-gfx-bay-box-lbl{font-size:10.5px;color:var(--anas-muted);font-weight:700}');
+        css.push('.anas-gfx-bay-box-disks{display:flex;gap:8px;flex-wrap:wrap}');
+
+        // Disk tile: skeuomorphic disk object + id/size text (status view).
+        css.push('.anas-gfx-diskcard{display:inline-flex;align-items:center;gap:8px;padding:6px 8px;'
+            + 'border-radius:9px;background:linear-gradient(var(--anas-card-top),var(--anas-card-bot));'
+            + 'border:1px solid var(--anas-card-edge);box-shadow:var(--anas-shadow),inset 0 1px 0 var(--anas-card-hi);'
+            + 'max-width:174px;box-sizing:border-box}');
+        css.push('.anas-gfx-diskcard-faulted{border-color:color-mix(in srgb,var(--anas-danger) 55%,var(--anas-card-edge));'
+            + 'box-shadow:0 0 0 1px var(--anas-danger) inset,var(--anas-shadow)}');
+        css.push('.anas-gfx-diskcard-id{font-size:11px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}');
+        css.push('.anas-gfx-diskcard-sub{font-size:10px;color:var(--anas-muted)}');
 
         // Drag: the floating ghost (width locked in JS → no resize-on-lift) and
         // the source/zone highlight states.
@@ -673,6 +740,153 @@
             return '<div class="anas-gfx-legend">' + rows + '</div>';
         } catch (e) {
             warn('legend failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // ======================================================================
+    // STATUS & LABELS — the monitor-side vocabulary that pairs with the
+    // composer's editing objects: state pills, property chips, share badges,
+    // advisory callouts, activity strips, read-only vdev bays and disk tiles.
+    // ======================================================================
+
+    // Map a raw ZFS state string to one of the three pill severities (or '').
+    function pillLevel(state) {
+        var s = ('' + (state || '')).toUpperCase();
+        if (s === 'ONLINE' || s === 'AVAIL' || s === 'INUSE') { return 'online'; }
+        if (s === 'DEGRADED' || s === 'REMOVED' || s === 'RESILVERING') { return 'degraded'; }
+        if (s === 'FAULTED' || s === 'OFFLINE' || s === 'UNAVAIL' || s === 'SUSPENDED') { return 'faulted'; }
+        return '';
+    }
+    gfx.pillLevel = pillLevel;
+
+    // statePill(state, opts) → a pool/vdev state pill (coloured dot + label).
+    //   opts : { label:String override text, title:String }
+    gfx.statePill = function (state, opts) {
+        try {
+            ensureInjected();
+            opts = opts || {};
+            var lvl = pillLevel(state);
+            var cls = 'anas-gfx-pill' + (lvl ? ' anas-gfx-pill-' + lvl : '');
+            var text = opts.label != null ? opts.label : ('' + (state || ''));
+            var title = opts.title ? ' title="' + enc(opts.title) + '"' : '';
+            return '<span class="' + cls + '"' + title + '>'
+                + '<span class="anas-gfx-pill-dot"></span>' + enc(text) + '</span>';
+        } catch (e) {
+            warn('statePill failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // chip(text, opts) → a small property chip (compression, recordsize, …).
+    //   opts : { good:bool positive-highlight, title:String }
+    gfx.chip = function (text, opts) {
+        try {
+            ensureInjected();
+            opts = opts || {};
+            var cls = 'anas-gfx-chip' + (opts.good ? ' anas-gfx-chip-good' : '');
+            var title = opts.title ? ' title="' + enc(opts.title) + '"' : '';
+            return '<span class="' + cls + '"' + title + '>' + enc(text) + '</span>';
+        } catch (e) {
+            warn('chip failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // badge(text, opts) → a filled share badge (SMB/NFS).
+    //   opts : { kind:'smb'|'nfs', title:String }
+    gfx.badge = function (text, opts) {
+        try {
+            ensureInjected();
+            opts = opts || {};
+            var kind = (opts.kind === 'smb' || opts.kind === 'nfs') ? opts.kind : '';
+            var cls = 'anas-gfx-badge' + (kind ? ' anas-gfx-badge-' + kind : '');
+            var title = opts.title ? ' title="' + enc(opts.title) + '"' : '';
+            return '<span class="' + cls + '"' + title + '>' + enc(text) + '</span>';
+        } catch (e) {
+            warn('badge failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // callout(html, opts) → an advisory banner (advisor output / health note).
+    //   opts : { level:'ok'|'warn'|'bad' (default 'ok'), icon:String glyph }
+    // `html` is inserted verbatim — callers pass gfx-built / already-encoded
+    // markup (e.g. the advisor's <b>…</b> emphasis), never raw user text.
+    gfx.callout = function (html, opts) {
+        try {
+            ensureInjected();
+            opts = opts || {};
+            var lvl = (opts.level === 'warn' || opts.level === 'bad') ? opts.level : 'ok';
+            var glyph = opts.icon || (lvl === 'bad' ? '⛔' : lvl === 'warn' ? '⚠' : '✓');
+            return '<div class="anas-gfx-callout anas-gfx-callout-' + lvl + '">'
+                + '<span aria-hidden="true">' + glyph + '</span>'
+                + '<span>' + (html == null ? '' : html) + '</span></div>';
+        } catch (e) {
+            warn('callout failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // activity(frac, opts) → an animated progress strip (scrub / resilver).
+    //   frac : 0..1 progress (null/undefined → indeterminate: full striped bar)
+    //   opts : { label:String left caption, pct:bool show % (default true when
+    //            determinate) }
+    gfx.activity = function (frac, opts) {
+        try {
+            ensureInjected();
+            opts = opts || {};
+            var determinate = frac != null && !isNaN(Number(frac));
+            var f = determinate ? clampFrac(frac) : 1;
+            var pct = Math.round(f * 100);
+            var showPct = determinate && opts.pct !== false;
+            return '<div class="anas-gfx-activity">'
+                + (opts.label ? '<span class="anas-gfx-activity-lbl">' + enc(opts.label) + '</span>' : '')
+                + '<span class="anas-gfx-activity-bar"><span class="anas-gfx-activity-fill" '
+                + 'style="width:' + pct + '%"></span></span>'
+                + (showPct ? '<span class="anas-gfx-activity-pct">' + pct + '%</span>' : '')
+                + '</div>';
+        } catch (e) {
+            warn('activity failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // bay(label, innerHtml, opts) → a read-only vdev bay (label + a flex row of
+    // disk tiles). The monitor-side counterpart of the composer's drop bay.
+    // `innerHtml` is inserted verbatim (gfx-built tiles).
+    gfx.bay = function (label, innerHtml) {
+        try {
+            ensureInjected();
+            return '<div class="anas-gfx-bay-box">'
+                + (label ? '<span class="anas-gfx-bay-box-lbl">' + enc(label) + '</span>' : '')
+                + '<div class="anas-gfx-bay-box-disks">' + (innerHtml == null ? '' : innerHtml) + '</div></div>';
+        } catch (e) {
+            warn('bay failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // diskCard(opts) → a skeuomorphic disk tile (object icon + id + size), the
+    // read-only cousin of the composer's draggable disk. Carries the CONVENTION
+    // class .anas-gfx-disk so the whole tile is targetable.
+    //   opts : { kind:'hdd'|'ssd'|'nvme', state:<health>, id:String top line,
+    //            sub:String bottom line (e.g. size), title:String }
+    gfx.diskCard = function (opts) {
+        try {
+            ensureInjected();
+            opts = opts || {};
+            var dead = opts.state === 'faulted';
+            var cls = 'anas-gfx-diskcard anas-gfx-disk' + (dead ? ' anas-gfx-diskcard-faulted' : '');
+            var title = opts.title || (opts.id ? opts.id + (opts.state ? ' — ' + opts.state : '') : '');
+            return '<span class="' + cls + '"' + (title ? ' title="' + enc(title) + '"' : '') + '>'
+                + gfx.icon(opts.kind, { state: opts.state })
+                + '<span style="display:inline-flex;flex-direction:column;min-width:0">'
+                + (opts.id != null ? '<span class="anas-gfx-diskcard-id">' + enc(opts.id) + '</span>' : '')
+                + (opts.sub != null ? '<span class="anas-gfx-diskcard-sub">' + enc(opts.sub) + '</span>' : '')
+                + '</span></span>';
+        } catch (e) {
+            warn('diskCard failed: ' + (e && e.message));
             return '';
         }
     };
