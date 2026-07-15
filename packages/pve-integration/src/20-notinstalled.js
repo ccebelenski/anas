@@ -15,13 +15,7 @@
     // install commands. Styled as a simple hint block, mirroring how PVE shows
     // its Ceph "not installed" mask.
     ANAS.notInstalledPanel = function (node) {
-        var enc = function (s) {
-            try {
-                return Ext.String.htmlEncode(s);
-            } catch (e) {
-                return '' + s;
-            }
-        };
+        var enc = ANAS.enc;
         var html = ''
             + '<div style="max-width:640px;margin:0 auto;">'
             + '<h2><i class="fa fa-database"></i> '

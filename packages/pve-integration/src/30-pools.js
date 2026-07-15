@@ -177,11 +177,7 @@
     // native ExtJS grid and error-count tree always still render.
 
     function encHtml(s) {
-        try {
-            return Ext.String.htmlEncode('' + s);
-        } catch (e) {
-            return '' + s;
-        }
+        return ANAS.enc(s);
     }
 
     // Map a derived per-disk health level (diskHealthLevel) to a gfx icon state
@@ -904,25 +900,13 @@
     // ---- Detail window -----------------------------------------------------
 
     function kv(label, value) {
-        var enc = function (s) {
-            try {
-                return Ext.String.htmlEncode('' + s);
-            } catch (e) {
-                return '' + s;
-            }
-        };
+        var enc = ANAS.enc;
         return '<tr><td style="padding:2px 12px 2px 0;color:gray;white-space:nowrap;">'
             + enc(label) + '</td><td style="padding:2px 0;">' + value + '</td></tr>';
     }
 
     function summaryHtml(d) {
-        var enc = function (s) {
-            try {
-                return Ext.String.htmlEncode('' + s);
-            } catch (e) {
-                return '' + s;
-            }
-        };
+        var enc = ANAS.enc;
         var rows = ''
             + kv(ANAS.t('State'), ANAS.renderState(d.state))
             + kv(ANAS.t('Size'), enc(ANAS.formatBytes(d.size)))
@@ -945,13 +929,7 @@
     }
 
     function propsHtml(p) {
-        var enc = function (s) {
-            try {
-                return Ext.String.htmlEncode('' + s);
-            } catch (e) {
-                return '' + s;
-            }
-        };
+        var enc = ANAS.enc;
         p = p || {};
         var rows = ''
             + kv(ANAS.t('ashift'), enc(p.ashift))
@@ -963,13 +941,7 @@
     }
 
     function scanHtml(scan) {
-        var enc = function (s) {
-            try {
-                return Ext.String.htmlEncode('' + s);
-            } catch (e) {
-                return '' + s;
-            }
-        };
+        var enc = ANAS.enc;
         if (!scan) {
             return '<p style="color:gray;">' + enc(ANAS.t('No scan has run on this pool.')) + '</p>';
         }
