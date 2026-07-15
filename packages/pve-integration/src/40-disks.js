@@ -18,8 +18,10 @@
  *
  * GROUPING (story 3.20): the grid is grouped by a computed `groupKey` derived
  * from each disk's pool → vdev association, so a large fleet stays scannable.
- * Pool members group under "<pool> / <vdev>"; disks in no pool fall into a
- * single "Unassigned / Available" group. This is pure ExtJS grid grouping (a
+ * Pool members group under "<pool> / <vdev>"; disks in no pool group by their
+ * usage status — "Available" (genuinely blank), "System" (boot/OS), or "Other"
+ * (in use / partitioned) — so a boot disk never shows under an Available
+ * heading. This is pure ExtJS grid grouping (a
  * `grouping` feature on a groupField), NOT a hand-rolled tree, and it degrades
  * to an ungrouped grid if the grouping feature cannot be built. Test hook on
  * the grid: `anas-grid-disks-grouped` (alongside the existing `anas-grid-disks`).
@@ -87,20 +89,33 @@
     // --- Grouping (story 3.20) -------------------------------------------
 
     // Compute the group a disk belongs to: primary by pool, secondary by vdev
-    // ("<pool> / <vdev>"), with any disk not associated with a pool collapsed
-    // into a single "Unassigned / Available" group. Uses the same fields the
-    // Usage column already reads (status / poolName / vdevName / vdevRole), so
-    // no new data is required. Fail-open: any surprise → Unassigned.
+    // ("<pool> / <vdev>"). A disk not in a pool groups by its actual usage
+    // status — "Available" ONLY for genuinely blank disks the composer can
+    // offer, "System" for boot/OS disks, "Other" for everything else in use —
+    // so the boot disk never appears under an "Available" heading. Mirrors the
+    // labels the Usage column already renders. Fail-open: any surprise → Other
+    // (never "Available", which would misrepresent an unclassifiable disk as
+    // free to use).
     function groupKeyFor(rec) {
         try {
-            var pool = rec.get('poolName');
-            if (rec.get('status') !== 'pool_member' || !pool) {
-                return t('Unassigned / Available');
+            var status = rec.get('status');
+            if (status === 'pool_member') {
+                var pool = rec.get('poolName');
+                if (pool) {
+                    var vdev = rec.get('vdevName') || rec.get('vdevRole') || '';
+                    return vdev ? (pool + ' / ' + vdev) : pool;
+                }
             }
-            var vdev = rec.get('vdevName') || rec.get('vdevRole') || '';
-            return vdev ? (pool + ' / ' + vdev) : pool;
+            switch (status) {
+                case 'available':
+                    return t('Available');
+                case 'system':
+                    return t('System');
+                default:
+                    return t('Other');
+            }
         } catch (e) {
-            return t('Unassigned / Available');
+            return t('Other');
         }
     }
 

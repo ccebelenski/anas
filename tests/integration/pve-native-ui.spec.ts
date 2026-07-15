@@ -112,6 +112,15 @@ test.describe('ANAS native panels (stunt node)', () => {
     // At least one disk row (ExtJS renders grid rows as .x-grid-row).
     const rows = grid.locator('.x-grid-row')
     await expect(rows.first()).toBeVisible({ timeout: 45_000 })
+
+    // Grouping: a non-pool disk groups by its real usage status. The boot disk
+    // (always present, status 'system') must land under a "System (n)" header,
+    // NOT be lumped under an "Available" heading (the old mislabel that showed
+    // the boot disk as free to use). The group header carries the "(count)"
+    // suffix, which distinguishes it from the plain "System" Usage cell.
+    await expect(grid.getByText(/System \(\d+\)/).first()).toBeVisible({ timeout: 20_000 })
+    await expect(grid.getByText('Unassigned / Available')).toHaveCount(0)
+
     await rows.first().click()
 
     const smartBtn = page.locator('.anas-btn-smart')
