@@ -123,6 +123,77 @@
         }
     }
 
+    // --- gfx disk objects (story 3.20 / epic 15.5) -----------------------
+    //
+    // Extend the ANAS.gfx visual language to the Disk Health grid: each row leads
+    // with a skeuomorphic disk object (HDD platter / SSD / NVMe stick) coloured by
+    // health, so a faulted drive reads as a dead grey disk at a glance instead of
+    // living only in a text column. Purely additive — the object is prepended to
+    // the existing Disk cell; every column and behaviour is unchanged. Fail open:
+    // any gfx trouble degrades silently to the original text.
+
+    // Map a disk record to a gfx object kind. NVMe wins on transport (or an nvmeN
+    // kernel name); otherwise the rotational flag decides SSD vs HDD. Unknown
+    // rotational falls back to 'hdd' (the safe, common default). Uses only fields
+    // the store already carries: transport, name, rotational.
+    function gfxKind(d) {
+        var tran = ('' + (d.transport || '')).toLowerCase();
+        var name = ('' + (d.name || '')).toLowerCase();
+        if (tran === 'nvme' || name.indexOf('nvme') === 0) {
+            return 'nvme';
+        }
+        if (d.rotational === false) {
+            return 'ssd';
+        }
+        // rotational === true → HDD; unknown/undefined → HDD default.
+        return 'hdd';
+    }
+
+    // Map the fused health signal to a gfx status state (drives the corner dot and
+    // the faulted greyscale treatment). Reads the same healthStatus the Health
+    // column and healthRank sort already use, so the object matches its row.
+    //   critical → 'faulted'   spare role → 'spare'   warning → 'degraded'
+    //   healthy  → 'online'    unknown    → null (plain object, no dot)
+    // Returns null when there is no health to show — we do not invent a dot.
+    function gfxState(d) {
+        var health = d.healthStatus;
+        if (health === 'critical') {
+            return 'faulted';
+        }
+        if (d.vdevRole === 'spare') {
+            return 'spare';
+        }
+        if (health === 'warning') {
+            return 'degraded';
+        }
+        if (health === 'healthy') {
+            return 'online';
+        }
+        return null;
+    }
+
+    // Build the leading gfx disk object markup for a disk record. Returns '' on any
+    // failure or when gfx is unavailable, so renderDisk falls back to plain text.
+    function diskObjHtml(d) {
+        try {
+            if (!ANAS.gfx || typeof ANAS.gfx.icon !== 'function') {
+                return '';
+            }
+            var kind = gfxKind(d);
+            var state = gfxState(d);
+            var level = d.healthStatus || 'unknown';
+            var healthLabel = (HEALTH[level] || HEALTH.unknown).label;
+            var title = ANAS.gfx.kindLabel(kind) + ' — ' + t(healthLabel);
+            var opts = { title: title, scale: 0.62 };
+            if (state) {
+                opts.state = state;
+            }
+            return ANAS.gfx.icon(kind, opts);
+        } catch (e) {
+            return '';
+        }
+    }
+
     // --- Renderers -------------------------------------------------------
 
     function renderSize(v) {
@@ -164,11 +235,19 @@
         if (model) {
             sub.push(enc(model));
         }
-        if (sub.length) {
-            return head + '<br><span style="color:gray;font-size:0.9em;">'
-                + sub.join(' &middot; ') + '</span>';
+        var text = sub.length
+            ? head + '<br><span style="color:gray;font-size:0.9em;">'
+                + sub.join(' &middot; ') + '</span>'
+            : head;
+        // Lead with the skeuomorphic gfx disk object (epic 15.5). Fail open: if
+        // the object cannot be built, render the identity text exactly as before.
+        var obj = diskObjHtml(d);
+        if (obj) {
+            return '<span class="anas-disk-obj" style="display:inline-flex;'
+                + 'align-items:center;gap:8px;">' + obj
+                + '<span style="min-width:0;">' + text + '</span></span>';
         }
-        return head;
+        return text;
     }
 
     // Usage in ZFS terms: for a pool member, "pool / vdev / role"; otherwise the
