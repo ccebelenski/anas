@@ -296,6 +296,56 @@ export async function datasetRoutes(
   }
 
   /**
+   * Every shared path on the system → the protocols sharing it, read ONCE for
+   * the whole flat list (not N+1 per dataset like `associatedShares`). Reuses
+   * the same read-only smb.conf / exports parsers so admin-made shares surface
+   * too (Principle 11). Fail-open: a missing config path or unreadable file
+   * simply contributes no entries for that protocol.
+   */
+  async function sharedPathProtocols(): Promise<Map<string, Set<'smb' | 'nfs'>>> {
+    const map = new Map<string, Set<'smb' | 'nfs'>>()
+    const add = (path: string, proto: 'smb' | 'nfs') => {
+      if (!path)
+        return
+      const set = map.get(path) ?? new Set<'smb' | 'nfs'>()
+      set.add(proto)
+      map.set(path, set)
+    }
+    if (opts.smbConfPath) {
+      const text = await readConfig(opts.smbConfPath)
+      for (const share of parseSmbConf(text).shares)
+        add(share.path, 'smb')
+    }
+    if (opts.exportsPath) {
+      const text = await readConfig(opts.exportsPath)
+      for (const exp of parseExports(text))
+        add(exp.path, 'nfs')
+    }
+    return map
+  }
+
+  /**
+   * Snapshot counts for every dataset in the pool, tallied from ONE recursive
+   * name-only `zfs list -t snapshot` pass — NOT one call per dataset. Each name
+   * is `<dataset>@<snap>`; the dataset half gets a +1. Fail-open: a non-zero
+   * exit or empty output yields an empty map, so counts are simply omitted.
+   */
+  async function snapshotCounts(poolName: string): Promise<Map<string, number>> {
+    const counts = new Map<string, number>()
+    const r = await executor.exec(ZFS, ['list', '-j', '-o', 'name', '-t', 'snapshot', '-r', poolName])
+    if (r.exitCode !== 0 || !r.stdout.trim())
+      return counts
+    for (const full of parseSnapshotNames(r.stdout)) {
+      const at = full.indexOf('@')
+      if (at < 0)
+        continue
+      const dataset = full.slice(0, at)
+      counts.set(dataset, (counts.get(dataset) ?? 0) + 1)
+    }
+    return counts
+  }
+
+  /**
    * Resolve the pool + wildcard tail to a dataset full name, validating the
    * dataset path (empty tail = the pool-root dataset). Returns null after
    * sending a 400 on an invalid path.
@@ -398,7 +448,41 @@ export async function datasetRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    return { data: await listDatasets(poolName) }
+    const datasets = await listDatasets(poolName)
+
+    // Enrich the flat feed so the UI can light up share badges + a snapshot
+    // count on collapsed rows (Epic 4.4 / 15.4). Both sources are gathered ONCE
+    // for the whole list (shares parsed once; snapshots in a single recursive
+    // pass) — never per dataset. Fail-open: any read error leaves the optional
+    // fields undefined and the dataset list still returns.
+    try {
+      const [shareMap, snapCounts] = await Promise.all([
+        sharedPathProtocols(),
+        snapshotCounts(poolName),
+      ])
+      for (const d of datasets) {
+        if (d.mountpoint) {
+          const protos = shareMap.get(d.mountpoint)
+          if (protos && protos.size) {
+            // Canonical order (smb, nfs) — matches the schema enum order.
+            const over: ('smb' | 'nfs')[] = []
+            if (protos.has('smb'))
+              over.push('smb')
+            if (protos.has('nfs'))
+              over.push('nfs')
+            d.sharedOver = over
+          }
+        }
+        const count = snapCounts.get(d.name)
+        if (count !== undefined)
+          d.snapshotCount = count
+      }
+    }
+    catch {
+      // fail-open — omit the enrichment fields rather than fail the list
+    }
+
+    return { data: datasets }
   })
 
   // --- GET /pools/:name/datasets/*path — detail ---------------------------

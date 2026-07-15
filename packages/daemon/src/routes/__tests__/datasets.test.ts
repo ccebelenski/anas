@@ -1,4 +1,5 @@
 import type { Dataset, DatasetDetail, Job, JobAccepted } from '@anas/shared'
+import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -45,6 +46,21 @@ const EXPORTS = [
   '',
 ].join('\n')
 
+// A recursive name-only snapshot listing for the whole pool: testpool has one
+// root snapshot, testpool/media has two, and the zvol has none. This is what
+// the enriched flat feed tallies into `snapshotCount`.
+const SNAPSHOTS_RECURSIVE = JSON.stringify({
+  output_version: { command: 'zfs list', vers_major: 0, vers_minor: 1 },
+  datasets: {
+    'testpool@rootsnap': { name: 'testpool@rootsnap', type: 'SNAPSHOT', pool: 'testpool', properties: {} },
+    'testpool/media@snap1': { name: 'testpool/media@snap1', type: 'SNAPSHOT', pool: 'testpool', properties: {} },
+    'testpool/media@snap2': { name: 'testpool/media@snap2', type: 'SNAPSHOT', pool: 'testpool', properties: {} },
+  },
+})
+
+/** The recursive snapshot-count command the enriched flat list issues. */
+const SNAPSHOT_COUNT_ARGS = ['list', '-j', '-o', 'name', '-t', 'snapshot', '-r', 'testpool']
+
 describe('datasets routes', () => {
   let server: ReturnType<typeof createServer> | undefined
   let shareDir: string | undefined
@@ -90,6 +106,51 @@ describe('datasets routes', () => {
       const res = await server.inject({ method: 'GET', url: '/v1/pools/nosuchpool/datasets' })
       assert.equal(res.statusCode, 404)
       assert.equal(res.json().error.code, 'NOT_FOUND')
+    })
+
+    it('enriches each dataset with a snapshotCount from ONE recursive pass', async () => {
+      server = createServer({ mock: true, logger: false })
+      // Register the whole-pool recursive snapshot listing (exact-args fixtures
+      // win over the command-only zfs fallback).
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      mock.addFixture({ command: '/usr/sbin/zfs', args: SNAPSHOT_COUNT_ARGS, result: { stdout: SNAPSHOTS_RECURSIVE, stderr: '', exitCode: 0 } })
+
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets' })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: Dataset[] }
+      const byName = Object.fromEntries(data.map(d => [d.name, d]))
+      assert.equal(byName['testpool/media'].snapshotCount, 2)
+      assert.equal(byName.testpool.snapshotCount, 1)
+      // A dataset with no snapshots simply omits the field (undefined).
+      assert.equal(byName['testpool/vm-100-disk-0'].snapshotCount, undefined)
+    })
+
+    it('enriches datasets with sharedOver from the SMB/NFS share config (gathered once)', async () => {
+      server = startServerWithShares()
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets' })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: Dataset[] }
+      const byName = Object.fromEntries(data.map(d => [d.name, d]))
+      // testpool/media is shared over both protocols (smb.conf [media] + exports).
+      assert.deepEqual(byName['testpool/media'].sharedOver, ['smb', 'nfs'])
+      // Unshared datasets omit the field entirely.
+      assert.equal(byName.testpool.sharedOver, undefined)
+      assert.equal(byName['testpool/vm-100-disk-0'].sharedOver, undefined)
+    })
+
+    it('omits enrichment fields when nothing matches (no snapshots, no shares on these paths)', async () => {
+      // Default mock: the command-only zfs fallback returns empty for the
+      // recursive snapshot listing, and the seeded smb.conf/exports share other
+      // paths (/tank/*, /srv/nfs/*), none of them a testpool mountpoint — so
+      // both optional fields stay absent.
+      server = createServer({ mock: true, logger: false })
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets' })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: Dataset[] }
+      for (const d of data) {
+        assert.equal(d.snapshotCount, undefined)
+        assert.equal(d.sharedOver, undefined)
+      }
     })
   })
 
