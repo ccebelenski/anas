@@ -136,6 +136,18 @@ export const PoolHealthMessage = z.object({
 })
 export type PoolHealthMessage = z.infer<typeof PoolHealthMessage>
 
+export const PveStorageRef = z.object({
+  /** PVE storage id, e.g. 'local-zfs' or 'datapool'. */
+  storage: z.string(),
+  /** PVE storage type that references the pool. */
+  type: z.enum(['zfspool', 'dir', 'zfs']),
+  /** The pool/dataset the storage points at (zfspool `pool` line), if any. */
+  dataset: z.string().optional(),
+  /** PVE content types this storage serves (images, rootdir, backup, iso, …). */
+  content: z.array(z.string()),
+})
+export type PveStorageRef = z.infer<typeof PveStorageRef>
+
 /** Pool summary for list views (GET /v1/pools) */
 export const PoolSummary = z.object({
   name: PoolName,
@@ -156,6 +168,9 @@ export const PoolSummary = z.object({
   scanRunning: z.boolean(),
   /** Health message, present only when pool is not ONLINE */
   health: PoolHealthMessage.optional(),
+  /** PVE storages referencing this pool (read-only, from /etc/pve/storage.cfg).
+   *  Empty ⇒ not PVE-managed. */
+  pveStorages: z.array(PveStorageRef).default([]),
 })
 export type PoolSummary = z.infer<typeof PoolSummary>
 
@@ -196,6 +211,9 @@ export const PoolDetail = z.object({
   scan: ScanStatus.nullable(),
   /** Pool properties */
   properties: PoolProperties,
+  /** PVE storages referencing this pool (read-only, from /etc/pve/storage.cfg).
+   *  Empty ⇒ not PVE-managed. */
+  pveStorages: z.array(PveStorageRef).default([]),
 })
 export type PoolDetail = z.infer<typeof PoolDetail>
 
