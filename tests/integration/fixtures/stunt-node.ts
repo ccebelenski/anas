@@ -440,18 +440,40 @@ export async function createTestPool(name: string, diskIds: string[]): Promise<v
  * exported by an export test (import, then destroy). Never throws.
  */
 export async function destroyPool(name: string): Promise<void> {
+  // Capture the pool's member devices BEFORE destroy so we can wipe them back
+  // to blank afterwards — `zpool destroy` leaves ZFS labels, which would leave
+  // the disks as 'other' (not 'available'), making the suite non-idempotent
+  // (each create/destroy cycle would permanently consume free disks).
+  let devices: string[] = []
+  try {
+    const st = await sshExec(
+      `zpool status -PL ${name} 2>/dev/null | grep -oE '/dev/[^ ]+' || true`,
+    )
+    devices = st.split('\n').map(s => s.trim()).filter(Boolean)
+  }
+  catch {
+    // no members captured — the wipe loop below just no-ops
+  }
   try {
     await sshExec(`zpool destroy -f ${name}`)
-    return
   }
   catch {
     // Not imported — it may be an exported pool still on its disks.
+    try {
+      await sshExec(`zpool import -f ${name} 2>/dev/null && zpool destroy -f ${name}`)
+    }
+    catch {
+      // Nothing to clean up (or already gone).
+    }
   }
-  try {
-    await sshExec(`zpool import -f ${name} 2>/dev/null && zpool destroy -f ${name}`)
-  }
-  catch {
-    // Nothing to clean up (or already gone).
+  // Wipe the freed members so they return to 'available' for the next run.
+  for (const dev of devices) {
+    try {
+      await sshExec(`wipefs -a ${dev} 2>/dev/null || true`)
+    }
+    catch {
+      // best-effort — a leftover label just means fewer available disks
+    }
   }
 }
 
