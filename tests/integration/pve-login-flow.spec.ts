@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
+import { PVE_URL } from './fixtures/pve-ui'
 
-const PVE_URL = 'https://192.168.200.50:8006'
 const GATEWAY_URL = 'https://192.168.200.50:3000'
 
 /**

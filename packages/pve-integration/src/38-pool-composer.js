@@ -57,12 +57,7 @@
         return ANAS.t ? ANAS.t(str) : str;
     }
     function enc(s) {
-        try {
-            return Ext.String.htmlEncode('' + s);
-        } catch (e) {
-            return ('' + s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-        }
+        return ANAS.enc(s);
     }
     function fmtBytes(n) {
         try {
@@ -72,8 +67,7 @@
         }
     }
     function gfxReady() {
-        return ANAS.gfx && typeof ANAS.gfx.icon === 'function'
-            && typeof ANAS.gfx.drag === 'function';
+        return ANAS.gfx && ANAS.gfx.ready ? ANAS.gfx.ready() : false;
     }
 
     // ---- vdev type + role metadata ----------------------------------------

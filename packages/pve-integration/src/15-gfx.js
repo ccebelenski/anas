@@ -98,15 +98,7 @@
     }
 
     function enc(s) {
-        try {
-            if (typeof Ext !== 'undefined' && Ext.String && Ext.String.htmlEncode) {
-                return Ext.String.htmlEncode('' + s);
-            }
-        } catch (e) {
-            // fall through
-        }
-        return ('' + s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        return ANAS.enc(s);
     }
 
     function clampFrac(f) {
@@ -1035,6 +1027,14 @@
     // ---- publish + prime injection ----------------------------------------
 
     gfx.fillColorVar = fillColorVar; // exposed so views can colour-match custom bits
+
+    // Capability check: gfx is present AND its core builders are wired up.
+    // Views gate their gfx retrofit on this and degrade to plain rendering.
+    gfx.ready = function () {
+        return !!(gfx && typeof gfx.icon === 'function'
+            && typeof gfx.drag === 'function');
+    };
+
     ANAS.gfx = gfx;
 
     // Inject eagerly at load (guarded); every builder also calls ensureInjected

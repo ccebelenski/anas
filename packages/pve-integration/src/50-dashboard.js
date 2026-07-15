@@ -32,7 +32,7 @@
     }
 
     function enc(str) {
-        return Ext.String.htmlEncode('' + str);
+        return ANAS.enc(str);
     }
 
     function errText(e) {
