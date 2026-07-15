@@ -27,10 +27,29 @@
  */
 
 import type { PveStorageRef } from '@anas/shared'
+import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
 
 /** Default location of the PVE storage config on a Proxmox host. */
 export const PVE_STORAGE_CFG = '/etc/pve/storage.cfg'
+
+/**
+ * A ZFS dataset's mountpoint, as needed to resolve a PVE `dir` storage back to
+ * its pool. `pool` is the pool ROOT that owns `dataset` (e.g. dataset
+ * `tank/backups` → pool `tank`). Supplied to {@link parsePveStorageCfg} /
+ * {@link readPveStorages}; produced by {@link readZfsMountpoints}.
+ */
+export interface ZfsMountpoint {
+  /** Absolute mountpoint, e.g. `/tank/backups`. */
+  mountpoint: string
+  /** Full ZFS dataset name, e.g. `tank/backups`. */
+  dataset: string
+  /** Pool root that owns the dataset, e.g. `tank`. */
+  pool: string
+}
 
 /** A stanza header line: `<type>: <id>` at column 0 (not indented). */
 const HEADER_RE = /^(\w+):\s+(\S+)\s*$/
@@ -45,18 +64,75 @@ const KEY_VALUE_RE = /^(\S+)\s(.*)$/
 /** Trailing carriage return (CRLF files) — stripped, indentation preserved. */
 const TRAILING_CR_RE = /\r$/
 
+/** One or more trailing slashes on a path (normalised away before comparison). */
+const TRAILING_SLASH_RE = /\/+$/
+
 /** The pool ROOT is the segment before the first '/' (e.g. `tank/data` → `tank`). */
 function poolRoot(dataset: string): string {
   return dataset.split('/')[0]
 }
 
+/** Split a `content` CSV (`images,rootdir`) into a trimmed, empty-free array. */
+function splitContent(content: string | undefined): string[] {
+  return content
+    ? content.split(',').map(c => c.trim()).filter(Boolean)
+    : []
+}
+
+/** Strip trailing slashes from an absolute path (but keep the root `/` itself). */
+function stripTrailingSlash(path: string): string {
+  return path.replace(TRAILING_SLASH_RE, '') || '/'
+}
+
+/**
+ * Is `path` equal to, or nested under, mountpoint `mp`? Both are compared as
+ * normalised absolute paths. The root mountpoint `/` contains every absolute
+ * path; any other `mp` contains `path` only when `path` is `mp` or begins with
+ * `mp + '/'` (so `/tank` does NOT swallow `/tank-other`).
+ */
+function isUnder(path: string, mp: string): boolean {
+  if (mp === '/')
+    return path.startsWith('/')
+  return path === mp || path.startsWith(`${mp}/`)
+}
+
+/**
+ * Resolve a `dir` storage's absolute `path` onto a ZFS dataset. A path is on
+ * ZFS iff it sits at or under a dataset's mountpoint; when several datasets
+ * nest (e.g. `/tank` and `/tank/backups`), the LONGEST matching mountpoint —
+ * the most specific dataset — wins. Returns the winning mountpoint entry, or
+ * `null` when the path is on no ZFS dataset (e.g. `/var/lib/vz`).
+ */
+function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): ZfsMountpoint | null {
+  const target = stripTrailingSlash(path)
+  let best: ZfsMountpoint | null = null
+  let bestLen = -1
+  for (const mp of mountpoints) {
+    if (!mp.mountpoint)
+      continue
+    const canonical = stripTrailingSlash(mp.mountpoint)
+    if (isUnder(target, canonical) && canonical.length > bestLen) {
+      best = mp
+      bestLen = canonical.length
+    }
+  }
+  return best
+}
+
 /**
  * Parse the text of a storage.cfg into a map `poolRoot -> PveStorageRef[]`.
  *
- * Only `zfspool` stanzas are emitted today — they carry the `pool <name>` line
- * that ties a storage to a ZFS pool, which is the signal 3.25 needs. For each
- * such stanza we read `pool <name>` and `content <csv>`, key the ref by the
- * pool root, and record the full dataset the storage points at.
+ * `zfspool` stanzas are the PRIMARY signal: they carry the `pool <name>` line
+ * that ties a storage to a ZFS pool. For each we read `pool <name>` and
+ * `content <csv>`, key the ref by the pool root, and record the full dataset.
+ *
+ * `dir` stanzas are a SECONDARY signal (backup/iso/template storage). A dir has
+ * `path <abspath>` + `content <csv>`; it is PVE-managed-on-ZFS iff its `path`
+ * resolves onto a ZFS dataset's mountpoint. Resolution needs the mountpoint→pool
+ * map, so it only happens when `mountpoints` is supplied — WITHOUT it, dir
+ * stanzas are ignored (the original zfspool-only behavior, unchanged). When a
+ * dir path matches, the ref is `{ type:'dir', dataset:<matched dataset> }` and
+ * is keyed by that dataset's pool root.
  *
  * Edge cases:
  *  - Commented-out lines (leading `#`, after trimming) are skipped, so a
@@ -64,37 +140,53 @@ function poolRoot(dataset: string): string {
  *  - `pool <name>` may be a dataset path (`tank/data`); we key by its root but
  *    keep the full path in `dataset`.
  *  - A `zfspool` stanza with no `pool` line is skipped (nothing to attach to).
+ *  - A `dir` stanza with no `path` line, or whose path is on no ZFS dataset
+ *    (e.g. `/var/lib/vz`), is skipped.
+ *  - Nested datasets: the LONGEST matching mountpoint (most specific dataset)
+ *    wins, so a dir under `/tank/backups` attaches to `tank/backups`, not `tank`.
  *  - Missing `content` yields an empty content array (still a valid ref).
- *  - EXTENSION POINT (deferred, Epic 3.26+): `dir` storages whose `path` sits on
- *    a ZFS mountpoint are a SECONDARY (backup/iso) signal for a pool. Resolving a
- *    dir path back to its pool needs the mountpoint→pool map, so it is not done
- *    here yet; `zfspool` is the primary signal and all 3.25 needs now.
  */
-export function parsePveStorageCfg(text: string): Map<string, PveStorageRef[]> {
+export function parsePveStorageCfg(
+  text: string,
+  mountpoints?: ZfsMountpoint[],
+): Map<string, PveStorageRef[]> {
   const byPool = new Map<string, PveStorageRef[]>()
 
-  interface Stanza { type: string, id: string, pool?: string, content?: string }
+  const pushRef = (root: string, ref: PveStorageRef) => {
+    const list = byPool.get(root)
+    if (list)
+      list.push(ref)
+    else
+      byPool.set(root, [ref])
+  }
+
+  interface Stanza { type: string, id: string, pool?: string, path?: string, content?: string }
   let current: Stanza | null = null
 
   const flush = () => {
     if (!current)
       return
-    // Only zfspool stanzas with a pool line map to a ZFS pool today.
+    // zfspool: the pool line names the ZFS pool directly (primary signal).
     if (current.type === 'zfspool' && current.pool) {
-      const root = poolRoot(current.pool)
-      const ref: PveStorageRef = {
+      pushRef(poolRoot(current.pool), {
         storage: current.id,
         type: 'zfspool',
         dataset: current.pool,
-        content: current.content
-          ? current.content.split(',').map(c => c.trim()).filter(Boolean)
-          : [],
+        content: splitContent(current.content),
+      })
+    }
+    // dir: resolve the path onto a ZFS dataset (secondary signal). Only when a
+    // mountpoint map is supplied; otherwise dir stanzas are ignored.
+    else if (current.type === 'dir' && current.path && mountpoints && mountpoints.length > 0) {
+      const match = matchMountpoint(current.path, mountpoints)
+      if (match) {
+        pushRef(poolRoot(match.pool), {
+          storage: current.id,
+          type: 'dir',
+          dataset: match.dataset,
+          content: splitContent(current.content),
+        })
       }
-      const list = byPool.get(root)
-      if (list)
-        list.push(ref)
-      else
-        byPool.set(root, [ref])
     }
     current = null
   }
@@ -130,6 +222,8 @@ export function parsePveStorageCfg(text: string): Map<string, PveStorageRef[]> {
     const [, key, value] = kv
     if (key === 'pool')
       current.pool = value.trim()
+    else if (key === 'path')
+      current.path = value.trim()
     else if (key === 'content')
       current.content = value.trim()
   }
@@ -142,8 +236,15 @@ export function parsePveStorageCfg(text: string): Map<string, PveStorageRef[]> {
  * Read and parse the PVE storage config, FAIL-OPEN. A missing file (non-PVE or
  * dev host) or any read/parse error resolves to an empty map — never throws, so
  * GET /pools keeps working everywhere. Path is overridable for tests.
+ *
+ * Pass `mountpoints` (from {@link readZfsMountpoints}) to ALSO resolve `dir`
+ * storages that live on a ZFS dataset (secondary signal). Omit it for the
+ * original zfspool-only behavior — nothing extra is read or computed.
  */
-export async function readPveStorages(path: string = PVE_STORAGE_CFG): Promise<Map<string, PveStorageRef[]>> {
+export async function readPveStorages(
+  path: string = PVE_STORAGE_CFG,
+  mountpoints?: ZfsMountpoint[],
+): Promise<Map<string, PveStorageRef[]>> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
@@ -155,10 +256,53 @@ export async function readPveStorages(path: string = PVE_STORAGE_CFG): Promise<M
     return new Map()
   }
   try {
-    return parsePveStorageCfg(text)
+    return parsePveStorageCfg(text, mountpoints)
   }
   catch (err: unknown) {
     console.warn(`anasd: could not parse ${path} for PVE storage detection:`, err)
     return new Map()
+  }
+}
+
+/**
+ * Parse `zfs list -H -o name,mountpoint` output into a mountpoint→pool map.
+ *
+ * `-H` gives tab-separated, header-less rows: `<dataset>\t<mountpoint>`. Rows
+ * whose mountpoint is not a real path (`-` for volumes, `none`, `legacy`, or
+ * empty) are dropped — they cannot host a `dir` storage. Pure and total: any
+ * malformed row is skipped, never throws.
+ */
+export function parseZfsMountpoints(text: string): ZfsMountpoint[] {
+  const out: ZfsMountpoint[] = []
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.replace(TRAILING_CR_RE, '')
+    if (line.trim() === '')
+      continue
+    const tab = line.indexOf('\t')
+    if (tab < 0)
+      continue
+    const dataset = line.slice(0, tab).trim()
+    const mountpoint = line.slice(tab + 1).trim()
+    if (!dataset || !mountpoint || mountpoint === '-' || mountpoint === 'none' || mountpoint === 'legacy')
+      continue
+    out.push({ mountpoint, dataset, pool: poolRoot(dataset) })
+  }
+  return out
+}
+
+/**
+ * List ZFS dataset mountpoints via `zfs list`, FAIL-OPEN. Used to resolve PVE
+ * `dir` storages onto their pool. Any failure (no ZFS, command error) resolves
+ * to an empty array — dir detection is a secondary signal and must never break
+ * GET /pools. Uses execFile (args array, no shell).
+ */
+export async function readZfsMountpoints(): Promise<ZfsMountpoint[]> {
+  try {
+    const { stdout } = await execFileAsync('zfs', ['list', '-H', '-o', 'name,mountpoint'])
+    return parseZfsMountpoints(stdout)
+  }
+  catch (err: unknown) {
+    console.warn('anasd: could not list ZFS mountpoints for PVE dir detection:', err)
+    return []
   }
 }
