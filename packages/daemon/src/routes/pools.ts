@@ -18,6 +18,17 @@ function byIdPath(id: string): string {
 }
 
 /**
+ * Whether a vdev spec carries redundancy. Every VdevSpec type except our
+ * synthetic 'stripe' (bare disks, no redundancy keyword) has a per-type minimum
+ * enforced by the schema (mirror ≥ 2, raidzN at its min), so "not a stripe" is a
+ * sufficient redundancy test. Used to reject a special/dedup vdev whose loss
+ * would take the whole pool (story 3.22).
+ */
+function isRedundantSpec(vdev: { type: string }): boolean {
+  return vdev.type !== 'stripe'
+}
+
+/**
  * Build the `zpool create` argument array from a validated CreatePoolRequest.
  *
  * A data vdev contributes its redundancy keyword followed by its disk paths
@@ -61,6 +72,30 @@ function buildCreateArgs(req: CreatePoolRequest): string[] {
   if (req.logVdevs && req.logVdevs.length > 0) {
     args.push('log')
     for (const vdev of req.logVdevs) {
+      if (vdev.type !== 'stripe')
+        args.push(vdev.type)
+      for (const id of vdev.disks)
+        args.push(byIdPath(id))
+    }
+  }
+
+  // Special allocation-class vdevs (metadata / small blocks) — like 'log', the
+  // 'special' keyword begins the class and each following vdev belongs to it.
+  // Redundancy is enforced by the caller (isRedundantSpec) before this runs.
+  if (req.specialVdevs && req.specialVdevs.length > 0) {
+    args.push('special')
+    for (const vdev of req.specialVdevs) {
+      if (vdev.type !== 'stripe')
+        args.push(vdev.type)
+      for (const id of vdev.disks)
+        args.push(byIdPath(id))
+    }
+  }
+
+  // Dedup allocation-class vdevs (the dedup table) — same shape as special.
+  if (req.dedupVdevs && req.dedupVdevs.length > 0) {
+    args.push('dedup')
+    for (const vdev of req.dedupVdevs) {
       if (vdev.type !== 'stripe')
         args.push(vdev.type)
       for (const id of vdev.disks)
@@ -485,6 +520,20 @@ export async function poolRoutes(
     }
     const req = bodyParsed.data
 
+    // SAFETY (story 3.22): a special or dedup vdev holds pool-wide metadata — if
+    // it dies, the whole pool is lost. Reject a non-redundant (stripe) one at the
+    // boundary; we never pass -f to force it. Defense-in-depth behind the
+    // composer's own gating.
+    for (const cls of ['special', 'dedup'] as const) {
+      const vdevs = cls === 'special' ? req.specialVdevs : req.dedupVdevs
+      for (const vdev of vdevs ?? []) {
+        if (!isRedundantSpec(vdev)) {
+          reply.code(400)
+          return { error: { code: 'VALIDATION_ERROR', message: `A ${cls} vdev must be redundant (mirror or raidz) — a single-disk or striped ${cls} vdev would risk the entire pool` } }
+        }
+      }
+    }
+
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
@@ -570,9 +619,17 @@ export async function poolRoutes(
     return pools.some(p => p.name === poolName)
   }
 
-  // Add a vdev to an existing pool (story 3.11). Expands capacity by appending a
-  // new top-level vdev. `stripe` is our synthetic type — bare disks with no
-  // redundancy keyword; every other type prepends its ZFS keyword.
+  // Add a vdev to an existing pool (stories 3.11, 3.21, 3.22). Expands the pool
+  // by appending a new top-level vdev in the requested role/class. `stripe` is
+  // our synthetic type — bare disks with no redundancy keyword; every other type
+  // prepends its ZFS keyword. cache/spare carry bare `disks`; data/log/special/
+  // dedup carry a redundant `vdev` (data may still be a bare stripe).
+  //   data    → zpool add <pool> [<type>] <disks…>
+  //   log     → zpool add <pool> log [<type>] <disks…>
+  //   special → zpool add <pool> special <type> <disks…>   (redundant only)
+  //   dedup   → zpool add <pool> dedup <type> <disks…>      (redundant only)
+  //   cache   → zpool add <pool> cache <disks…>
+  //   spare   → zpool add <pool> spare <disks…>
   server.post<{ Params: { name: string } }>('/pools/:name/vdevs', async (request, reply) => {
     const nameParsed = PoolName.safeParse(request.params.name)
     if (!nameParsed.success) {
@@ -586,7 +643,15 @@ export async function poolRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid add-vdev request: ${bodyParsed.error.issues[0]?.message}` } }
     }
-    const { vdev } = bodyParsed.data
+    const { role, vdev, disks } = bodyParsed.data
+
+    // SAFETY (story 3.22): a special/dedup vdev whose loss loses the whole pool
+    // must be redundant. Reject a stripe (or single-disk) one at the boundary;
+    // never pass -f. Mirrors the create-path check.
+    if ((role === 'special' || role === 'dedup') && vdev && !isRedundantSpec(vdev)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `A ${role} vdev must be redundant (mirror or raidz) — a single-disk or striped ${role} vdev would risk the entire pool` } }
+    }
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -597,15 +662,35 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    const diskPaths = vdev.disks.map(byIdPath)
-    // stripe → bare disks (no redundancy vdev keyword); mirror/raidz* → keyword first.
-    const args = vdev.type === 'stripe'
-      ? ['add', poolName, ...diskPaths]
-      : ['add', poolName, vdev.type, ...diskPaths]
+    // Build the argv by role. The schema guarantees cache/spare carry `disks`
+    // and data/log/special/dedup carry `vdev`.
+    let args: string[]
+    let jobDisks: string[]
+    let jobType: string
+    if (role === 'cache' || role === 'spare') {
+      const diskIds = disks ?? []
+      args = ['add', poolName, role, ...diskIds.map(byIdPath)]
+      jobDisks = diskIds
+      jobType = role
+    }
+    else {
+      const v = vdev!
+      const diskPaths = v.disks.map(byIdPath)
+      const head = ['add', poolName]
+      // log/special/dedup prepend their class keyword; data has none.
+      if (role === 'log' || role === 'special' || role === 'dedup')
+        head.push(role)
+      // stripe → bare disks (no redundancy keyword); mirror/raidz* → keyword.
+      if (v.type !== 'stripe')
+        head.push(v.type)
+      args = [...head, ...diskPaths]
+      jobDisks = v.disks
+      jobType = v.type
+    }
 
     const job = jobQueue.submit(
       'zpool.add',
-      { ...identity, params: { pool: poolName, type: vdev.type, disks: vdev.disks } },
+      { ...identity, params: { pool: poolName, role, type: jobType, disks: jobDisks } },
       async () => {
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {

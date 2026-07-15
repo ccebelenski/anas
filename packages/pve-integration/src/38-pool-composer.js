@@ -8,11 +8,13 @@
  *
  * Two modes:
  *   - create  (empty draft): compose a whole topology, commit ONE POST /pools
- *              with a CreatePoolRequest (dataVdevs/logVdevs/cacheDisks/spareDisks).
+ *              with a CreatePoolRequest (dataVdevs/logVdevs/specialVdevs/
+ *              dedupVdevs/cacheDisks/spareDisks).
  *   - expand  (seeded, stretch): the pool's existing vdevs render read-only; stage
- *              NEW data vdevs and commit one AddVdevRequest (POST /pools/:name/vdevs)
- *              per staged vdev. (The add-vdev API carries no role, so expand stages
- *              DATA vdevs only — see the TODO at ANAS.composer.open.)
+ *              NEW vdevs of any role and commit one AddVdevRequest (POST
+ *              /pools/:name/vdevs) per staged vdev, each carrying its role
+ *              (data/log/cache/spare/special/dedup). Launched from the Pools
+ *              "Add Vdevs" toolbar action.
  *
  * Draft model is 100% client-side (vdevs[] + an assigned map) — no server call
  * until commit. Drag an available disk into a bay to assign; drag it back to the
@@ -29,11 +31,12 @@
  *     raidzN at its min).
  * Mixed data-vdev types WARN but don't block. Blocking reasons are shown.
  *
- * SCHEMA NOTE: CreatePoolRequest has no special/dedup field and buildCreateArgs
- * (daemon) emits only data/log/cache/spare — so special/dedup vdevs cannot be
- * created through the current API. The composer still offers the role (grouping,
- * validity, advisor all reference it) but BLOCKS commit with a clear reason when
- * a special/dedup vdev holds disks, rather than silently dropping those disks.
+ * ALLOCATION CLASSES (story 3.22): CreatePoolRequest carries specialVdevs/
+ * dedupVdevs and the daemon emits `special mirror …` / `dedup mirror …`, so the
+ * composer maps the Special/Dedup bays straight through on create, and expand
+ * adds them via AddVdevRequest{ role }. A special/dedup vdev's loss loses the
+ * WHOLE pool, so it must be redundant — the composer gates commit on that (hard
+ * rule below) and the daemon rejects a non-redundant one as defense-in-depth.
  *
  * FRAMEWORK CONTRACT: window.ANAS with ANAS.gfx.*, ANAS.api.get, ANAS.runJob /
  * ANAS.confirmAndRun, ANAS.pools.reload, ANAS.t / ANAS.formatBytes / ANAS.warn /
@@ -96,9 +99,12 @@
         cache: { label: 'Cache (L2ARC)', individual: true, redundantRequired: false },
         spare: { label: 'Spare', individual: true, redundantRequired: false },
         special: { label: 'Special (metadata)', individual: false, redundantRequired: true },
+        dedup: { label: 'Dedup (dedup table)', individual: false, redundantRequired: true },
     };
-    // Roles the create form offers, in presentation order.
-    var CREATE_ROLE_ORDER = ['data', 'log', 'cache', 'spare', 'special'];
+    // Roles offered in the add-vdev row, in presentation order. The same set
+    // serves create and expand — every class can be created with a pool or added
+    // to an existing one.
+    var CREATE_ROLE_ORDER = ['data', 'log', 'cache', 'spare', 'special', 'dedup'];
 
     function typeMin(type) {
         return (TYPES[type] && TYPES[type].min) || 1;
@@ -333,10 +339,6 @@
             }
             if (ROLES[v.role] && ROLES[v.role].redundantRequired && n > 0 && !isRedundant(v)) {
                 blocking.push(roleLabel(v.role) + ' ' + t('vdev must be redundant (mirror ≥ 2, or a raidzN at its minimum) — losing it can lose the whole pool.'));
-            }
-            // Schema gap: special/dedup cannot be created through the current API.
-            if ((v.role === 'special' || v.role === 'dedup') && n > 0 && state.mode === 'create') {
-                blocking.push(roleLabel(v.role) + ' ' + t('vdevs cannot be created yet (the API supports data, log, cache and spare) — remove it to create the pool.'));
             }
             if (v.role === 'data' && n >= min) {
                 hasCompleteData = true;
@@ -887,16 +889,13 @@
                 + 'var(--anas-card-bot));outline:none;width:180px">';
         }
 
-        // Role options (create). Expand stages data vdevs only.
+        // Role options — the same set for create and expand (the add-vdev API
+        // now carries a role, so expand can stage any class).
         var roleOpts = '';
         var ri;
-        if (state.mode === 'expand') {
-            roleOpts = '<option value="data">' + enc(roleLabel('data')) + '</option>';
-        } else {
-            for (ri = 0; ri < CREATE_ROLE_ORDER.length; ri++) {
-                var rk = CREATE_ROLE_ORDER[ri];
-                roleOpts += '<option value="' + rk + '">' + enc(roleLabel(rk)) + '</option>';
-            }
+        for (ri = 0; ri < CREATE_ROLE_ORDER.length; ri++) {
+            var rk = CREATE_ROLE_ORDER[ri];
+            roleOpts += '<option value="' + rk + '">' + enc(roleLabel(rk)) + '</option>';
         }
         var typeOpts = '';
         for (var i = 0; i < DATA_TYPES.length; i++) {
@@ -1034,6 +1033,8 @@
     function buildCreateBody(state) {
         var body = { name: state.name, dataVdevs: [] };
         var logVdevs = [];
+        var specialVdevs = [];
+        var dedupVdevs = [];
         var cacheDisks = [];
         var spareDisks = [];
         var i, j, v;
@@ -1046,6 +1047,10 @@
                 body.dataVdevs.push(toSpec(v));
             } else if (v.role === 'log') {
                 logVdevs.push(toSpec(v));
+            } else if (v.role === 'special') {
+                specialVdevs.push(toSpec(v));
+            } else if (v.role === 'dedup') {
+                dedupVdevs.push(toSpec(v));
             } else if (v.role === 'cache') {
                 for (j = 0; j < v.diskIds.length; j++) {
                     cacheDisks.push(v.diskIds[j]);
@@ -1055,10 +1060,15 @@
                     spareDisks.push(v.diskIds[j]);
                 }
             }
-            // special/dedup are blocked by validate() in create mode.
         }
         if (logVdevs.length) {
             body.logVdevs = logVdevs;
+        }
+        if (specialVdevs.length) {
+            body.specialVdevs = specialVdevs;
+        }
+        if (dedupVdevs.length) {
+            body.dedupVdevs = dedupVdevs;
         }
         if (cacheDisks.length) {
             body.cacheDisks = cacheDisks;
@@ -1092,7 +1102,23 @@
         });
     }
 
-    // Expand: add each staged vdev sequentially (one AddVdevRequest apiece).
+    // Build one AddVdevRequest body for a staged bay. cache/spare are bare disks
+    // (role + disks[]); data/log/special/dedup carry a redundant vdev spec
+    // (role + vdev). Mirrors the shared AddVdevRequest role→field contract.
+    function toAddBody(v) {
+        if (v.role === 'cache' || v.role === 'spare') {
+            var disks = [];
+            for (var i = 0; i < v.diskIds.length; i++) {
+                disks.push(v.diskIds[i]);
+            }
+            return { role: v.role, disks: disks };
+        }
+        return { role: v.role, vdev: toSpec(v) };
+    }
+
+    // Expand: add each staged vdev sequentially (one AddVdevRequest apiece), each
+    // carrying its role so the daemon appends it in the right class (data/log/
+    // cache/spare/special/dedup).
     function commitExpand(state) {
         var staged = [];
         for (var i = 0; i < state.vdevs.length; i++) {
@@ -1116,11 +1142,11 @@
                 node: state.node,
                 method: 'post',
                 path: '/pools/' + encodeURIComponent(state.poolName) + '/vdevs',
-                body: { vdev: toSpec(v) },
+                body: toAddBody(v),
                 view: state.win,
                 confirmTitle: 'Add vdev',
                 failTitle: 'Add vdev failed',
-                successMsg: t('Vdev added to') + ' ' + state.poolName,
+                successMsg: roleLabel(v.role) + ' ' + t('vdev added to') + ' ' + state.poolName,
                 onComplete: next,
             });
         }
@@ -1334,14 +1360,12 @@
         }
     }
 
-    // Public surface. Launched from the Pools "Create" toolbar action (create),
-    // or programmatically for expand:
-    //   ANAS.composer.open({ node, grid, mode:'create' })
-    //   ANAS.composer.open({ node, grid, mode:'expand', poolName })
-    // TODO(expand): the Pools toolbar still uses the dedicated Add-Vdev window
-    // (34-pool-addvdev.js). A future story can rewire an "Expand" action to
-    // ANAS.composer.open({ mode:'expand', ... }); the code path is implemented
-    // and functional here (add-vdev API carries no role, so it stages DATA vdevs).
+    // Public surface. Launched from the Pools toolbar:
+    //   Create    → ANAS.composer.open({ node, grid, mode:'create' })
+    //   Add Vdevs → ANAS.composer.open({ node, grid, mode:'expand', poolName })
+    // The old dedicated Add-Vdev window (34-pool-addvdev.js) is RETIRED — the
+    // composer's expand mode is the single add-vdev path, staging any role and
+    // committing each with the correct AddVdevRequest.role.
     ANAS.composer = ANAS.composer || {};
     ANAS.composer.open = function (o) {
         try {

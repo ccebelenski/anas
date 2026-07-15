@@ -18,8 +18,10 @@ import {
  *       .anas-btn-modify, .anas-btn-addvdev,
  *       .anas-btn-attach, .anas-btn-export,
  *       .anas-btn-destroy                       — enabled only with a row selected
- *   - Their mutation windows carry .anas-win-modify / -addvdev / etc.; Create now
- *     launches the graphical Pool Composer (.anas-win-composer, Epic 15.2 / 3.23).
+ *   - Their mutation windows carry .anas-win-modify / etc. Create AND Add Vdevs
+ *     both launch the graphical Pool Composer (.anas-win-composer, Epic 15.2 /
+ *     3.23): Create in create mode, Add Vdevs in expand mode against the selected
+ *     pool (the dedicated single-vdev Add-Vdev window is retired).
  *   - Export/destroy use Ext.Msg.confirm (standard Yes/No) rather than a custom
  *     window, wiring the 409 + x-anas-confirm-code contract behind the UI.
  *
@@ -86,6 +88,24 @@ test.describe('ANAS pool action toolbar (stunt node)', () => {
     // story 3.23), superseding the old simple-create window.
     await page.locator('.anas-btn-create').click()
     await expect(page.locator('.anas-win-composer')).toBeVisible({ timeout: 20_000 })
+  })
+
+  test('the Add Vdevs button opens the Pool Composer in expand mode', async ({ page }) => {
+    await loginToPve(page)
+    await openAnasItem(page, 'Pools')
+
+    const grid = page.locator('.anas-grid-pools')
+    await expect(grid).toBeVisible({ timeout: 45_000 })
+    await grid.locator('.x-grid-row', { hasText: 'testpool' }).click()
+
+    // Add Vdevs (formerly the dedicated Add-Vdev window, now retired) launches
+    // the composer in expand mode against the selected pool (Epic 15.2 / 3.21).
+    const addBtn = page.locator('.anas-btn-addvdev')
+    await expect(addBtn).toBeEnabled({ timeout: 20_000 })
+    await addBtn.click()
+    const win = page.locator('.anas-win-composer')
+    await expect(win).toBeVisible({ timeout: 20_000 })
+    await expect(win).toContainText('Expand Pool', { timeout: 20_000 })
   })
 
   test('the Modify button opens the .anas-win-modify window for the selected pool', async ({ page }) => {
