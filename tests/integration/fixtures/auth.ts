@@ -1,5 +1,5 @@
 import { test as base, expect } from '@playwright/test'
-import { PVE_URL } from './pve-ui'
+import { PVE_URL, STUNT_HOST } from './pve-ui'
 
 const PVE_USER = 'root@pam'
 const PVE_PASS = 'anas-test'
@@ -62,7 +62,7 @@ export const test = base.extend<AuthFixtures>({
       {
         name: 'PVEAuthCookie',
         value: pveTicket,
-        domain: '192.168.200.50',
+        domain: STUNT_HOST,
         path: '/',
         secure: true,
         sameSite: 'Lax',
@@ -87,7 +87,7 @@ export function pveAuthState(ticket: string) {
       {
         name: 'PVEAuthCookie',
         value: ticket,
-        domain: '192.168.200.50',
+        domain: STUNT_HOST,
         path: '/',
         expires: -1,
         httpOnly: false,

@@ -1,7 +1,5 @@
 import { expect, test } from '@playwright/test'
-import { PVE_URL } from './fixtures/pve-ui'
-
-const GATEWAY_URL = 'https://192.168.200.50:3000'
+import { GATEWAY_URL, PVE_URL } from './fixtures/pve-ui'
 
 /**
  * The real user journey: log into the Proxmox web UI, then reach the ANAS

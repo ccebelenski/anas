@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { STUNT_HOST } from './target'
 
 const execFileAsync = promisify(execFile)
 
@@ -12,7 +13,7 @@ const SSH_OPTS = [
   'ConnectTimeout=5',
 ]
 const VM_USER = 'root'
-const VM_IP = '192.168.200.50'
+const VM_IP = STUNT_HOST
 
 /**
  * Execute a command on the stunt node via SSH.

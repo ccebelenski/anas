@@ -1,4 +1,5 @@
 import { defineConfig, devices } from '@playwright/test'
+import { GATEWAY_URL } from './tests/integration/fixtures/target'
 
 export default defineConfig({
   testDir: './tests',
@@ -13,7 +14,7 @@ export default defineConfig({
       testDir: './tests/integration',
       use: {
         ...devices['Desktop Chrome'],
-        baseURL: 'https://192.168.200.50:3000',
+        baseURL: GATEWAY_URL,
         ignoreHTTPSErrors: true,
         screenshot: 'only-on-failure',
         trace: 'on-first-retry',

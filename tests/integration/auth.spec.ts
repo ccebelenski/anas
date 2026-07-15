@@ -1,6 +1,7 @@
 import { expect, pveAuthState, test } from './fixtures/auth'
+import { GATEWAY_URL, PVE_URL } from './fixtures/pve-ui'
 
-const GATEWAY = 'https://192.168.200.50:3000'
+const GATEWAY = GATEWAY_URL
 
 /**
  * Auth boundary smoke tests. The `anas` gateway serves no pages (13.13) — its
@@ -18,7 +19,7 @@ test.describe('Authentication', () => {
     const context = await playwright.request.newContext({
       ignoreHTTPSErrors: true,
     })
-    const response = await context.get('https://192.168.200.50:8006/')
+    const response = await context.get(`${PVE_URL}/`)
     expect(response.ok()).toBeTruthy()
     await context.dispose()
   })

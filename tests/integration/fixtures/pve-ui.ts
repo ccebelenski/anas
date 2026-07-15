@@ -1,5 +1,6 @@
 import type { Locator, Page } from '@playwright/test'
 import { expect } from '@playwright/test'
+import { GATEWAY_URL, NODE_NAME, PVE_URL, STUNT_HOST } from './target'
 
 /**
  * Shared helpers for driving the real PVE ExtJS UI on the stunt node.
@@ -11,10 +12,9 @@ import { expect } from '@playwright/test'
  * match is ambiguous). ExtJS is slow to render — callers use generous timeouts.
  */
 
-export const PVE_URL = 'https://192.168.200.50:8006'
-export const GATEWAY_URL = 'https://192.168.200.50:3000'
-// The stunt node's hostname (test/stunt-node/provision.sh: hostnamectl set-hostname).
-export const NODE_NAME = 'anas-pve'
+// The test-target address/names live in one place (./target). Re-exported here
+// because these fixtures are the established import point for specs.
+export { GATEWAY_URL, NODE_NAME, PVE_URL, STUNT_HOST }
 
 /**
  * Drive the real PVE login form so the PVEAuthCookie is set by PVE's own JS

@@ -1,4 +1,5 @@
 import { expect, pveAuthState, test } from './fixtures/auth'
+import { GATEWAY_URL, NODE_NAME, PVE_URL } from './fixtures/pve-ui'
 
 /**
  * Story 13.8 — the `anas` gateway is a pure API surface (no pages). These are
@@ -14,9 +15,9 @@ import { expect, pveAuthState, test } from './fixtures/auth'
  *     allowed, and ONLY for that origin.
  */
 
-const GATEWAY = 'https://192.168.200.50:3000'
-const PVE_ORIGIN = 'https://192.168.200.50:8006'
-const NODE = 'anas-pve'
+const GATEWAY = GATEWAY_URL
+const PVE_ORIGIN = PVE_URL
+const NODE = NODE_NAME
 
 test.describe('Gateway API', () => {
   test('rejects requests without a PVE cookie (401)', async ({ playwright }) => {
