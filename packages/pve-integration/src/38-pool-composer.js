@@ -913,7 +913,7 @@
             + '<span style="flex:1"></span>'
             + '<span style="' + PILL + '">' + enc(t('Draft — nothing is created until you commit.')) + '</span></div>'
 
-            + '<div style="display:grid;grid-template-columns:300px 1fr 288px;gap:14px;align-items:start">'
+            + '<div style="display:grid;grid-template-columns:280px minmax(0,1fr) 272px;gap:14px;align-items:start">'
 
             // Available disks
             + '<div style="' + CARD + '">'
@@ -1209,12 +1209,17 @@
         // Bound the composer to the ANAS content region (the card our views
         // render into), not the whole viewport — so it fills the right-hand
         // section without covering the PVE node menu / leftmost view.
+        // NOTE: must use the DOM element's up() (CSS selector), NOT the
+        // component's up() — ComponentQuery has no '.class' selector, so the
+        // component form returns null and the window falls back to a cramped
+        // fixed width.
         var regionEl = null, rbox = null;
         try {
-            var card = opts.grid && opts.grid.up ? opts.grid.up('.anas-view-card') : null;
-            if (card && card.getEl && card.getEl()) {
-                regionEl = card.getEl();
-                rbox = regionEl.getBox();
+            var gridEl = opts.grid && opts.grid.getEl ? opts.grid.getEl() : null;
+            var cardEl = gridEl && gridEl.up ? gridEl.up('.anas-view-card') : null;
+            if (cardEl && cardEl.getBox) {
+                regionEl = cardEl;               // an Ext.dom.Element
+                rbox = cardEl.getBox();
             }
         } catch (eRegion) { regionEl = null; rbox = null; }
 
