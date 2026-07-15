@@ -1,7 +1,7 @@
 import type { AuthProvider, AuthUser } from '../types.js'
 import { execFile } from 'node:child_process'
 import { createVerify } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
 
 /** PVEAuthCookie format: PVE:user@realm:TIMESTAMP::base64_signature */
 const PVE_TICKET_RE = /^(PVE:([^@]+)@[^:]+:([0-9A-F]{8}))::(.+)$/
@@ -17,6 +17,13 @@ const AUTHKEY_PATH = '/etc/pve/authkey.pub'
 const AUTHKEY_OLD_PATH = '/etc/pve/authkey.pub.old'
 
 /**
+ * Minimum gap between disk re-checks for a rotated authkey. Proxmox rotates the
+ * ticket-signing key ~daily; this only bounds how often a *failing* verify may
+ * touch the filesystem, so a flood of bad/forged tickets can't hammer it.
+ */
+const RELOAD_CHECK_INTERVAL_MS = 1000
+
+/**
  * PVE auth provider — verifies PVEAuthCookie locally using Proxmox's
  * RSA public key.
  *
@@ -28,8 +35,15 @@ export class PveAuthProvider implements AuthProvider {
   readonly name = 'pve'
 
   private pubKeys: string[] = []
+  /** mtime (ms) of authkey.pub when pubKeys were last loaded (0 = unread). */
+  private authkeyMtimeMs = 0
+  /** Last time we checked disk for a rotated key, for throttling. */
+  private lastReloadCheckMs = 0
 
-  constructor() {
+  constructor(
+    private readonly authkeyPath: string = AUTHKEY_PATH,
+    private readonly authkeyOldPath: string = AUTHKEY_OLD_PATH,
+  ) {
     this.loadKeys()
   }
 
@@ -43,10 +57,15 @@ export class PveAuthProvider implements AuthProvider {
     if (age < -CLOCK_SKEW_S || age > TICKET_LIFETIME_S)
       return null
 
-    // Verify RSA signature against any loaded public key
-    const valid = this.pubKeys.some(key =>
-      this.verifySignature(parsed.plaintext, parsed.signature, key),
-    )
+    // Verify the RSA signature against any loaded public key. Proxmox rotates
+    // its ticket-signing authkey (~daily): it moves the live key to
+    // authkey.pub.old and writes a fresh authkey.pub. A gateway that only read
+    // the key at startup would then 401 every ticket until restarted. So on a
+    // miss for an otherwise well-formed, unexpired ticket, re-read the key from
+    // disk (mtime-gated + throttled) and retry once before rejecting.
+    let valid = this.verifyAgainstLoaded(parsed)
+    if (!valid && this.reloadIfRotated())
+      valid = this.verifyAgainstLoaded(parsed)
     if (!valid)
       return null
 
@@ -88,18 +107,52 @@ export class PveAuthProvider implements AuthProvider {
     this.pubKeys = []
 
     try {
-      this.pubKeys.push(readFileSync(AUTHKEY_PATH, 'utf8'))
+      this.pubKeys.push(readFileSync(this.authkeyPath, 'utf8'))
+      this.authkeyMtimeMs = statSync(this.authkeyPath).mtimeMs
     }
     catch {
-      console.error(`[auth] Cannot read ${AUTHKEY_PATH} — PVE ticket verification will fail`)
+      this.authkeyMtimeMs = 0
+      console.error(`[auth] Cannot read ${this.authkeyPath} — PVE ticket verification will fail`)
     }
 
     try {
-      this.pubKeys.push(readFileSync(AUTHKEY_OLD_PATH, 'utf8'))
+      this.pubKeys.push(readFileSync(this.authkeyOldPath, 'utf8'))
     }
     catch {
       // Old key is optional — only exists after key rotation
     }
+  }
+
+  /** True if the parsed ticket verifies against any currently-loaded key. */
+  private verifyAgainstLoaded(parsed: { plaintext: string, signature: string }): boolean {
+    return this.pubKeys.some(key =>
+      this.verifySignature(parsed.plaintext, parsed.signature, key),
+    )
+  }
+
+  /**
+   * Reload keys from disk if authkey.pub has rotated since we last read it.
+   * Throttled to at most once per RELOAD_CHECK_INTERVAL_MS (a stream of bad
+   * tickets can't hammer the FS) and mtime-gated (we only rebuild pubKeys when
+   * the file actually changed). Returns true when keys were reloaded, so the
+   * caller re-verifies against the fresh set.
+   */
+  private reloadIfRotated(): boolean {
+    const now = Date.now()
+    if (now - this.lastReloadCheckMs < RELOAD_CHECK_INTERVAL_MS)
+      return false
+    this.lastReloadCheckMs = now
+
+    try {
+      if (statSync(this.authkeyPath).mtimeMs === this.authkeyMtimeMs)
+        return false
+    }
+    catch {
+      // stat failed (key briefly absent mid-rotation) — try a reload anyway.
+    }
+
+    this.loadKeys()
+    return true
   }
 
   /** Resolve a username to a UID via id(1). Returns -1 for non-PAM realm users. */
