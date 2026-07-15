@@ -231,7 +231,7 @@
 
         // Data viz: capacity gauge (bar + used/total + pct).
         css.push('.anas-gfx-gauge{display:inline-block;width:100%;max-width:320px}');
-        css.push('.anas-gfx-gauge-track{height:12px;border-radius:999px;background:var(--anas-slot);'
+        css.push('.anas-gfx-gauge-track{display:block;height:12px;border-radius:999px;background:var(--anas-slot);'
             + 'border:1px solid var(--anas-card-edge);box-shadow:inset 0 1px 3px rgba(0,0,0,.18);overflow:hidden}');
         css.push('.anas-gfx-gauge-fill{display:block;height:100%;border-radius:999px}');
         css.push('.anas-gfx-gauge-text{font-size:11px;color:var(--anas-muted);margin-top:3px;'
