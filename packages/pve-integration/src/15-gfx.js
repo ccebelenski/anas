@@ -58,6 +58,7 @@
  *     .anas-gfx-callout / -<lvl>     advisory banner (ok|warn|bad)
  *     .anas-gfx-activity             scrub/resilver progress strip
  *     .anas-gfx-bay-box              read-only vdev bay wrapper
+ *     .anas-gfx-baygroup             role-group wrapper (label + flex row of bays)
  *     .anas-gfx-diskcard             read-only disk tile (+ .anas-gfx-disk)
  *   Drag
  *     .anas-gfx-ghost                the floating drag ghost (width-locked)
@@ -306,6 +307,13 @@
             + 'background:var(--anas-bay);box-shadow:inset 0 2px 6px rgba(0,0,0,.16),inset 0 -1px 0 var(--anas-bay-lip);padding:10px}');
         css.push('.anas-gfx-bay-box-lbl{font-size:10.5px;color:var(--anas-muted);font-weight:700}');
         css.push('.anas-gfx-bay-box-disks{display:flex;gap:8px;flex-wrap:wrap}');
+
+        // Role-group wrapper: an uppercase role label above a flex row of bays
+        // (the pool topology's per-role container).
+        css.push('.anas-gfx-baygroup{margin-bottom:12px}');
+        css.push('.anas-gfx-baygroup-lbl{font-size:10px;font-weight:800;text-transform:uppercase;'
+            + 'letter-spacing:.5px;color:var(--anas-muted);margin:0 0 7px}');
+        css.push('.anas-gfx-baygroup-bays{display:flex;flex-wrap:wrap;gap:10px}');
 
         // Disk tile: skeuomorphic disk object + id/size text (status view).
         css.push('.anas-gfx-diskcard{display:inline-flex;align-items:center;gap:8px;padding:6px 8px;'
@@ -863,6 +871,23 @@
                 + '<div class="anas-gfx-bay-box-disks">' + (innerHtml == null ? '' : innerHtml) + '</div></div>';
         } catch (e) {
             warn('bay failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // bayGroup(label, baysHtml) → a labelled role-group container: an uppercase
+    // label above a flex-wrapping row of vdev bays. The topology's per-role
+    // wrapper (data / log / cache / spare / special / dedup). `baysHtml` is
+    // inserted verbatim (caller-built gfx.bay outputs, optionally wrapped).
+    gfx.bayGroup = function (label, baysHtml) {
+        try {
+            ensureInjected();
+            return '<div class="anas-gfx-baygroup">'
+                + (label ? '<div class="anas-gfx-baygroup-lbl">' + enc(label) + '</div>' : '')
+                + '<div class="anas-gfx-baygroup-bays">'
+                + (baysHtml == null ? '' : baysHtml) + '</div></div>';
+        } catch (e) {
+            warn('bayGroup failed: ' + (e && e.message));
             return '';
         }
     };

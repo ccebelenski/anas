@@ -384,12 +384,17 @@
                         baysHtml += '<div class="anas-pool-topo-bay">' + bay + '</div>';
                     }
                 }
-                body += '<div class="anas-pool-topo-group" style="margin-bottom:12px;">'
-                    + '<div style="font-size:10px;font-weight:800;text-transform:uppercase;'
-                    + 'letter-spacing:.5px;color:gray;margin:0 0 7px;">'
-                    + encHtml(roleLabel(grp.role)) + '</div>'
-                    + '<div style="display:flex;flex-wrap:wrap;gap:10px;">'
-                    + baysHtml + '</div></div>';
+                // Role-group wrapper via the gfx primitive (story 15.3 gap).
+                // Fail-open: if bayGroup degrades to '', keep the group's bays
+                // rather than dropping the whole role silently.
+                var groupHtml = '';
+                if (typeof gfx.bayGroup === 'function') {
+                    groupHtml = gfx.bayGroup(roleLabel(grp.role), baysHtml) || '';
+                }
+                body += groupHtml
+                    || ('<div class="anas-gfx-baygroup">'
+                        + '<div class="anas-gfx-baygroup-lbl">' + encHtml(roleLabel(grp.role)) + '</div>'
+                        + '<div class="anas-gfx-baygroup-bays">' + baysHtml + '</div></div>');
             }
 
             // Advisory callout — reuse the derived health, name the bad members.
@@ -458,7 +463,7 @@
     var PVE_HANDS_OFF = {
         exportPool: 1,
         destroyPool: 1,
-        addVdev: 1,
+        addVdevs: 1,
         attachDisk: 1,
         modifyProps: 1,
     };
@@ -1230,6 +1235,39 @@
         win.show();
         loadDetail();
     }
+
+    // ---- Add Vdevs action (stories 3.21 / 3.22 / 3.23) ---------------------
+    //
+    // Expanding a pool is now the Pool Composer's job (expand mode): stage new
+    // Log/Cache/Spare/special/dedup/data vdevs against the selected pool and
+    // commit each via POST /pools/:name/vdevs with the right role. This RETIRES
+    // the old single-vdev window (34-pool-addvdev.js) — one add-vdev path only.
+    // Keeps the .anas-btn-addvdev test hook so existing toolbar specs resolve.
+    // PVE-managed pools must not be expandable → itemId is in PVE_HANDS_OFF.
+    ANAS.pools.registerAction({
+        itemId: 'addVdevs',
+        text: 'Add Vdevs',
+        cls: 'anas-btn-addvdev anas-btn-addvdevs',
+        iconCls: 'fa fa-plus-square',
+        needsSelection: true,
+        disableWhileScanning: false,
+        handler: function (node, grid, poolName) {
+            try {
+                if (poolName && ANAS.composer && typeof ANAS.composer.open === 'function') {
+                    ANAS.composer.open({
+                        node: node,
+                        grid: grid,
+                        mode: 'expand',
+                        poolName: poolName,
+                    });
+                    return;
+                }
+                Ext.Msg.alert(ANAS.t('Add Vdevs'), ANAS.t('The Pool Composer is unavailable.'));
+            } catch (e) {
+                ANAS.warn('add-vdevs (composer expand) failed: ' + ANAS.errText(e));
+            }
+        },
+    });
 
     // ---- View registration -------------------------------------------------
 

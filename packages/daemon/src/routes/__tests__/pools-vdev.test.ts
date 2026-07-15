@@ -101,6 +101,137 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     assert.deepEqual(addCall!.args, ['add', 'testpool', `${BY_ID}${DISK_A}`])
   })
 
+  it('adds a log vdev with the log keyword (role: log)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const spy = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ role: 'log', vdev: { type: 'mirror', disks: [DISK_A, DISK_B] } }),
+    })
+
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+
+    const addCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add')
+    assert.deepEqual(addCall!.args, [
+      'add',
+      'testpool',
+      'log',
+      'mirror',
+      `${BY_ID}${DISK_A}`,
+      `${BY_ID}${DISK_B}`,
+    ])
+  })
+
+  it('adds bare cache disks (role: cache, no redundancy keyword)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const spy = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ role: 'cache', disks: [DISK_A] }),
+    })
+
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, (res.json() as JobAccepted).job.id)
+
+    const addCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add')
+    assert.deepEqual(addCall!.args, ['add', 'testpool', 'cache', `${BY_ID}${DISK_A}`])
+  })
+
+  it('adds bare spare disks (role: spare)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const spy = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ role: 'spare', disks: [DISK_A] }),
+    })
+
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, (res.json() as JobAccepted).job.id)
+
+    const addCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add')
+    assert.deepEqual(addCall!.args, ['add', 'testpool', 'spare', `${BY_ID}${DISK_A}`])
+  })
+
+  it('adds a redundant special vdev with the special keyword (role: special)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const spy = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ role: 'special', vdev: { type: 'mirror', disks: [DISK_A, DISK_B] } }),
+    })
+
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, (res.json() as JobAccepted).job.id)
+
+    const addCall = spy.calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add')
+    assert.deepEqual(addCall!.args, [
+      'add',
+      'testpool',
+      'special',
+      'mirror',
+      `${BY_ID}${DISK_A}`,
+      `${BY_ID}${DISK_B}`,
+    ])
+  })
+
+  it('rejects a striped (non-redundant) special vdev with 400 — never invokes zpool add', async () => {
+    server = createServer({ mock: true, logger: false })
+    const spy = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ role: 'special', vdev: { type: 'stripe', disks: [DISK_A] } }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.ok(!spy.calls.some(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'add'))
+  })
+
+  it('rejects a striped (non-redundant) dedup vdev with 400', async () => {
+    server = createServer({ mock: true, logger: false })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ role: 'dedup', vdev: { type: 'stripe', disks: [DISK_A] } }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+  })
+
+  it('rejects a cache role carrying a vdev spec instead of bare disks', async () => {
+    server = createServer({ mock: true, logger: false })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ role: 'cache', vdev: { type: 'mirror', disks: [DISK_A, DISK_B] } }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+  })
+
   it('rejects requests without identity headers', async () => {
     server = createServer({ mock: true, logger: false })
 

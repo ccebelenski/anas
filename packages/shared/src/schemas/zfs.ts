@@ -256,6 +256,13 @@ export const CreatePoolRequest = z.object({
   dataVdevs: z.array(VdevSpec).min(1),
   /** Log (ZIL) vdevs */
   logVdevs: z.array(VdevSpec).optional(),
+  /** Special allocation-class vdevs (metadata / small blocks). Redundant vdevs,
+   *  not bare disks — their loss loses the WHOLE pool, so the daemon rejects a
+   *  non-redundant (stripe) special vdev at its boundary (story 3.22). */
+  specialVdevs: z.array(VdevSpec).optional(),
+  /** Dedup allocation-class vdevs (the dedup table). Redundant vdevs, not bare
+   *  disks — same pool-wide-loss risk as special vdevs (story 3.22). */
+  dedupVdevs: z.array(VdevSpec).optional(),
   /** Cache (L2ARC) disk IDs — always individual disks */
   cacheDisks: z.array(z.string()).optional(),
   /** Hot spare disk IDs — always individual disks */
@@ -325,10 +332,65 @@ export const ImportPoolRequest = z
   .refine(data => data.name || data.guid, 'Either name or guid must be specified')
 export type ImportPoolRequest = z.infer<typeof ImportPoolRequest>
 
-/** Add a vdev to an existing pool (POST /v1/pools/:name/vdevs) */
-export const AddVdevRequest = z.object({
-  vdev: VdevSpec,
-})
+/**
+ * Add a vdev to an existing pool (POST /v1/pools/:name/vdevs).
+ *
+ * `role` selects the vdev class (default 'data' so pre-role callers still
+ * validate). data/log/special/dedup are redundant vdevs and carry a `vdev`
+ * (VdevSpec); cache/spare are always bare disks and carry `disks` (string[]).
+ * The check enforces exactly the right field per role. The special/dedup
+ * redundancy rule (no stripe — its loss loses the whole pool) is enforced at
+ * the daemon boundary, not here.
+ */
+export const AddVdevRequest = z
+  .object({
+    /** Vdev class. Omitted ⇒ 'data' (backward-compatible with { vdev }). */
+    role: VdevRole.default('data'),
+    /** Redundant vdev spec — for data/log/special/dedup roles. */
+    vdev: VdevSpec.optional(),
+    /** Bare disk IDs — for cache/spare roles (always individual disks). */
+    disks: z.array(z.string()).optional(),
+  })
+  .check((ctx) => {
+    const { role, vdev, disks } = ctx.value
+    const bare = role === 'cache' || role === 'spare'
+    if (bare) {
+      if (!disks || disks.length < 1) {
+        ctx.issues.push({
+          code: 'custom',
+          message: `${role} vdev requires at least one disk in 'disks'`,
+          path: ['disks'],
+          input: disks,
+        })
+      }
+      if (vdev) {
+        ctx.issues.push({
+          code: 'custom',
+          message: `${role} vdev takes bare 'disks', not a 'vdev' spec`,
+          path: ['vdev'],
+          input: vdev,
+        })
+      }
+    }
+    else {
+      if (!vdev) {
+        ctx.issues.push({
+          code: 'custom',
+          message: `${role} vdev requires a 'vdev' spec`,
+          path: ['vdev'],
+          input: vdev,
+        })
+      }
+      if (disks) {
+        ctx.issues.push({
+          code: 'custom',
+          message: `${role} vdev takes a 'vdev' spec, not bare 'disks'`,
+          path: ['disks'],
+          input: disks,
+        })
+      }
+    }
+  })
 export type AddVdevRequest = z.infer<typeof AddVdevRequest>
 
 /** Attach or replace a disk in a mirror (POST /v1/pools/:name/attach) */

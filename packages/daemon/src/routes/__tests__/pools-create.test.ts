@@ -172,6 +172,82 @@ describe('create pool endpoint: POST /v1/pools', () => {
     ])
   })
 
+  it('appends special and dedup allocation-class vdevs with their keywords', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'alloc',
+        dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }],
+        specialVdevs: [{ type: 'mirror', disks: ['sp1', 'sp2'] }],
+        dedupVdevs: [{ type: 'mirror', disks: ['dd1', 'dd2'] }],
+      }),
+    })
+
+    assert.equal(res.statusCode, 202)
+    const body = res.json() as JobAccepted
+    await waitForJob(server, body.job.id)
+
+    assert.deepEqual(createCall(calls), [
+      'create',
+      'alloc',
+      'mirror',
+      '/dev/disk/by-id/d1',
+      '/dev/disk/by-id/d2',
+      'special',
+      'mirror',
+      '/dev/disk/by-id/sp1',
+      '/dev/disk/by-id/sp2',
+      'dedup',
+      'mirror',
+      '/dev/disk/by-id/dd1',
+      '/dev/disk/by-id/dd2',
+    ])
+  })
+
+  it('rejects a striped (non-redundant) special vdev with 400 — never forced', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'badspecial',
+        dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }],
+        specialVdevs: [{ type: 'stripe', disks: ['sp1'] }],
+      }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    // The pool must never be created for a non-redundant special vdev.
+    assert.equal(createCall(calls), undefined)
+  })
+
+  it('rejects a striped (non-redundant) dedup vdev with 400', async () => {
+    server = createServer({ mock: true, logger: false })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'baddedup',
+        dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }],
+        dedupVdevs: [{ type: 'stripe', disks: ['dd1'] }],
+      }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+  })
+
   it('returns 409 for a pool name that already exists', async () => {
     server = createServer({ mock: true, logger: false })
 
