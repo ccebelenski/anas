@@ -37,8 +37,8 @@
  *
  * Snapshots (Epic 5, GET/POST …/datasets/<path>/snapshots and
  * PUT/DELETE/…/rollback per snapshot): snapshots hang off their dataset as
- * flat leaf rows, lazy-loaded on first expand (top-5 inline, an 'anas-snap-more'
- * overflow row + 'anas-btn-snap-all' toolbar button open the 'anas-win-snapshots'
+ * flat leaf rows, lazy-loaded on first expand (top-5 inline; the 'anas-snap-more'
+ * "show all N…" overflow row — present only past 5 — opens the 'anas-win-snapshots'
  * popup grid 'anas-grid-snapshots'). Snapshot rows carry cls 'anas-snap-row';
  * actions use buttons 'anas-btn-snap-create' / -rollback / -rename / -clone /
  * -destroy.
@@ -590,7 +590,6 @@
         // Snapshot actions: create/list act on a selected dataset; the
         // rollback/rename/destroy trio act on a selected snapshot row.
         setDisabled(tree, 'snapCreate', !ds || pve);
-        setDisabled(tree, 'snapAll', !ds);
         setDisabled(tree, 'snapRollback', !snap);
         setDisabled(tree, 'snapRename', !snap);
         setDisabled(tree, 'snapClone', !snap);
@@ -2966,14 +2965,6 @@
         });
     }
 
-    function snapPopupFromTree(node, tree) {
-        var rec = selectedRecord(tree);
-        if (!isDataset(rec)) {
-            return;
-        }
-        openSnapshotsPopup(node, tree, rec.get('pool'), rec.get('fullName'));
-    }
-
     function snapActionFromTree(node, tree, kind) {
         var rec = selectedRecord(tree);
         if (!isSnapshot(rec)) {
@@ -3721,16 +3712,6 @@
                 disabled: true,
                 handler: function (btn) {
                     snapCreateFromTree(node, btn.up('treepanel'));
-                },
-            },
-            {
-                text: t('Snapshots'),
-                itemId: 'snapAll',
-                cls: 'anas-btn-snap-all',
-                iconCls: 'fa fa-clock-o',
-                disabled: true,
-                handler: function (btn) {
-                    snapPopupFromTree(node, btn.up('treepanel'));
                 },
             },
             {

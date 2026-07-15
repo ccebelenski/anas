@@ -91,26 +91,23 @@ test.describe('ANAS snapshots appear under a dataset (stunt node)', () => {
       await expect(page.locator('.anas-snap-row', { hasText: name }).first()).toBeVisible({ timeout: 30_000 })
   })
 
-  test('the snapshot toolbar exposes create/rollback/rename/destroy/all buttons', async ({ page }) => {
+  test('the snapshot toolbar exposes create/rollback/rename/destroy buttons', async ({ page }) => {
     await openDatasets(page)
 
-    // Snapshot actions live on the Datasets toolbar (create-all is selection-free;
+    // Snapshot actions live on the Datasets toolbar (create is selection-free;
     // per-snapshot actions may be disabled until a snapshot row is selected — we
-    // assert presence here, mirroring the dataset toolbar spec).
+    // assert presence here, mirroring the dataset toolbar spec). There is no
+    // "Snapshots" button: snapshots already render inline, and the "show all N…"
+    // overflow row (past 5) is the single path to the full popup.
     for (const sel of [
       '.anas-btn-snap-create',
       '.anas-btn-snap-rollback',
       '.anas-btn-snap-rename',
       '.anas-btn-snap-destroy',
-      '.anas-btn-snap-all',
     ]) {
       await expect(page.locator(sel)).toBeVisible({ timeout: 30_000 })
     }
-
-    // "All Snapshots" opens the popup for the SELECTED dataset, so it enables
-    // once a dataset row is selected (there's no dataset to show otherwise).
-    await page.locator('.anas-grid-datasets').getByText('share1', { exact: true }).first().click()
-    await expect(page.locator('.anas-btn-snap-all')).toBeEnabled({ timeout: 10_000 })
+    await expect(page.locator('.anas-btn-snap-all')).toHaveCount(0)
   })
 
   test('selecting a snapshot row enables the per-snapshot actions', async ({ page }) => {
@@ -124,26 +121,6 @@ test.describe('ANAS snapshots appear under a dataset (stunt node)', () => {
     // With a snapshot selected, the destructive/edit actions become enabled.
     for (const sel of ['.anas-btn-snap-rollback', '.anas-btn-snap-rename', '.anas-btn-snap-destroy'])
       await expect(page.locator(sel)).toBeEnabled({ timeout: 20_000 })
-  })
-
-  test('the All Snapshots button opens the popup grid listing the snapshots', async ({ page }) => {
-    await openDatasets(page)
-    await expandShare1(page)
-
-    // Select the dataset so the popup is scoped to share1's snapshots.
-    const node = page.locator('.anas-grid-datasets .x-tree-node-text', { hasText: /^share1$/ })
-    await node.click()
-
-    await page.locator('.anas-btn-snap-all').click()
-
-    const win = page.locator('.anas-win-snapshots')
-    await expect(win).toBeVisible({ timeout: 30_000 })
-    const grid = win.locator('.anas-grid-snapshots')
-    await expect(grid).toBeVisible({ timeout: 30_000 })
-
-    // The popup grid lists the pre-staged snapshots.
-    for (const name of SNAP_NAMES)
-      await expect(grid.getByText(name).first()).toBeVisible({ timeout: 30_000 })
   })
 
   test('the Create Snapshot dialog pre-fills a snapshot-<datetime> name', async ({ page }) => {
@@ -188,5 +165,24 @@ test.describe('ANAS snapshot overflow node (many snapshots)', () => {
     await expandShare1(page)
 
     await expect(page.locator('.anas-grid-datasets .anas-snap-more')).toBeVisible({ timeout: 30_000 })
+  })
+
+  test('clicking the "show all" overflow row opens the popup listing every snapshot', async ({ page }) => {
+    await openDatasets(page)
+    await expandShare1(page)
+
+    // The overflow row is the single path to the full popup (the standalone
+    // "Snapshots" button was removed as redundant — snapshots already render
+    // inline with the same columns/formatters as the popup).
+    await page.locator('.anas-grid-datasets .anas-snap-more').click()
+
+    const win = page.locator('.anas-win-snapshots')
+    await expect(win).toBeVisible({ timeout: 30_000 })
+    const grid = win.locator('.anas-grid-snapshots')
+    await expect(grid).toBeVisible({ timeout: 30_000 })
+
+    // The popup lists ALL of them — including snapshots past the inline top-5.
+    for (const name of MANY)
+      await expect(grid.getByText(name).first()).toBeVisible({ timeout: 30_000 })
   })
 })
