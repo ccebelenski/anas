@@ -32,6 +32,23 @@ export {
   UUID,
 } from './schemas/common.js'
 
+// Dashboard schemas (Epic 2)
+export {
+  ArcTelemetry,
+  DashboardWarning,
+  DiskHealthCounts,
+  DiskTelemetry,
+  IoStats,
+  JobBrief,
+  NetInterface,
+  NetTelemetry,
+  PoolStatusBrief,
+  PoolTelemetry,
+  ShareStatusBrief,
+  StatusSummary,
+  Telemetry,
+} from './schemas/dashboard.js'
+
 // Dataset schemas
 export {
   AssociatedShare,
