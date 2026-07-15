@@ -1205,6 +1205,18 @@
         ensureComposerStyle();
         var state = makeState(opts);
 
+        // Bound the composer to the ANAS content region (the card our views
+        // render into), not the whole viewport — so it fills the right-hand
+        // section without covering the PVE node menu / leftmost view.
+        var regionEl = null, rbox = null;
+        try {
+            var card = opts.grid && opts.grid.up ? opts.grid.up('.anas-view-card') : null;
+            if (card && card.getEl && card.getEl()) {
+                regionEl = card.getEl();
+                rbox = regionEl.getBox();
+            }
+        } catch (eRegion) { regionEl = null; rbox = null; }
+
         var win;
         try {
             win = Ext.create('Ext.window.Window', {
@@ -1213,16 +1225,19 @@
                     ? (t('Expand Pool') + ': ' + state.poolName)
                     : t('Create Pool'),
                 modal: true,
-                // Open filling the viewport — a pool build wants all the room it
-                // can get (the topology column is `1fr`, so it grows to fill).
-                // 1040x720 is kept as the restore size; maximizable toggles back.
-                maximized: true,
-                width: 1040,
-                height: 720,
+                // Fill the ANAS content region (right-hand section), not the
+                // viewport — sized/positioned to the view card when found, else a
+                // large centred fallback. constrain keeps it in bounds.
+                x: rbox ? rbox.x : undefined,
+                y: rbox ? rbox.y : undefined,
+                width: rbox ? rbox.width : 1040,
+                height: rbox ? rbox.height : 720,
                 minWidth: 720,
                 minHeight: 480,
                 maximizable: true,
                 resizable: true,
+                constrain: true,
+                constrainTo: regionEl || undefined,
                 layout: 'fit',
                 items: [{
                     xtype: 'panel',
@@ -1274,6 +1289,18 @@
         }
 
         win.show();
+        // Keep the composer filling the content region as the browser resizes.
+        if (regionEl) {
+            var refit = function () {
+                try {
+                    if (win.destroyed || win.destroying) { return; }
+                    var b = regionEl.getBox();
+                    win.setBox({ x: b.x, y: b.y, width: b.width, height: b.height });
+                } catch (eFit) { /* non-fatal */ }
+            };
+            Ext.on('resize', refit);
+            win.on('destroy', function () { try { Ext.un('resize', refit); } catch (eU) { /* non-fatal */ } });
+        }
         try {
             win.setLoading(true);
         } catch (e2) {

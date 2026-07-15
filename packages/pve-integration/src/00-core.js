@@ -243,6 +243,9 @@
         return {
             xtype: 'panel',
             itemId: view.itemId,
+            // Marker so overlays (e.g. the Pool Composer) can find the ANAS
+            // content-region card and size themselves to it, not the viewport.
+            cls: 'anas-view-card',
             title: view.text,
             iconCls: view.iconCls,
             layout: 'fit',
