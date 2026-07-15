@@ -4,6 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
+import { readPveStorages } from '../parsers/pve-storage.js'
 import { parseZpoolGet } from '../parsers/zpool-get.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
@@ -170,9 +171,12 @@ export async function poolRoutes(
   }
 
   server.get('/pools', async (_request, _reply) => {
-    const [listResult, statusResult] = await Promise.all([
+    const [listResult, statusResult, pveStorages] = await Promise.all([
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
       executor.exec('/usr/sbin/zpool', ['status', '-jv']),
+      // Read-only PVE storage detection (Epic 3.25). Fail-open: off-PVE hosts
+      // and parse errors yield an empty map, so this never breaks GET /pools.
+      readPveStorages(),
     ])
 
     // If no pools exist, zpool list exits non-zero with no stdout
@@ -196,6 +200,7 @@ export async function poolRoutes(
         state: status?.state ?? pool.state,
         scanRunning: status?.scan?.state === 'SCANNING',
         ...(status?.health && { health: status.health }),
+        pveStorages: pveStorages.get(pool.name) ?? [],
       }
     })
 
@@ -205,10 +210,12 @@ export async function poolRoutes(
   server.get<{ Params: { name: string } }>('/pools/:name', async (request, reply) => {
     const poolName = request.params.name
 
-    const [statusResult, listResult, getResult] = await Promise.all([
+    const [statusResult, listResult, getResult, pveStorages] = await Promise.all([
       executor.exec('/usr/sbin/zpool', ['status', '-jv']),
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
       executor.exec('/usr/sbin/zpool', ['get', 'all', '-j']),
+      // Read-only PVE storage detection (Epic 3.25) — fail-open (see GET /pools).
+      readPveStorages(),
     ])
 
     // Parse status for this specific pool
@@ -253,6 +260,7 @@ export async function poolRoutes(
       vdevGroups: status.vdevGroups,
       scan: status.scan,
       properties,
+      pveStorages: pveStorages.get(poolName) ?? [],
     }
 
     return { data: detail }

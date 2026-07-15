@@ -584,12 +584,11 @@ export async function datasetRoutes(
     request: FastifyRequest,
     reply: FastifyReply,
   ) {
-    const pathParsed = DatasetPath.safeParse(path)
-    if (!pathParsed.success) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${pathParsed.error.issues[0]?.message}` } }
-    }
-    const fullName = `${poolName}/${pathParsed.data}`
+    // Empty path targets the pool-root dataset (3.26 — the root is a
+    // first-class dataset and accepts property-set like any child).
+    const fullName = resolveDatasetName(poolName, path, reply)
+    if (!fullName)
+      return reply
 
     const bodyParsed = UpdateDatasetPropertiesRequestSchema.safeParse(request.body ?? {})
     if (!bodyParsed.success) {

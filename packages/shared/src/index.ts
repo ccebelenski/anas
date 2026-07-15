@@ -118,6 +118,7 @@ export {
   PoolProperties,
   PoolState,
   PoolSummary,
+  PveStorageRef,
   ScanFunction,
   ScanState,
   ScanStatus,
