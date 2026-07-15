@@ -587,6 +587,33 @@ Node "pve1"
 
 **Dev workflow:** panel development targets a PVE host (the stunt node) — edit, push via a fast deploy script, reload the PVE UI. API development keeps the mock loop: `anasd --mock` + the gateway serve realistic fixture data without ZFS hardware.
 
+### `ANAS.gfx` — graphical visual language (Epic 15)
+
+> Decision (2026-07-14, validated via three local HTML spikes — composer, pools-status, datasets-tree). Storage views use a purpose-built graphical language rather than plain grids, because the physical/spatial reality of storage (which disk in which vdev faulted; where the space went) is legible graphically in a way tables aren't. **SVG + DOM, never canvas** — canvas has no DOM nodes → no `anas-*` test hooks, no CSS theming, no accessibility.
+
+**Three visual registers** (a deliberate, consistent separation):
+- **Content objects** — skeuomorphic *filled* SVG with material gradients: disks (HDD platter+actuator / SSD label / NVMe PCB+gold), vdev "bays", the pool. Materials are theme-neutral (a real drive is grey regardless of UI theme).
+- **Controls** — flat monochrome *line* icons (`currentColor`, so they theme): add / snapshot / share / lock / properties / trash / folder / pool. Always-visible with `title` tooltips (no hover-reveal).
+- **Data viz** — capacity gauges/bars (fullness-coloured) and the pool-space donut (breakdown by dataset + free).
+
+**Module surface** (`ANAS.gfx`, a new file in the `packages/pve-integration/` concat, loaded before the views):
+- `icon(kind, {state})` → content-object SVG; `ctl(name)` → control line-icon button; `gauge(frac)` / `bar(frac)` → capacity viz; `donut(segments)` → breakdown ring.
+- `drag(el, {onDrop})` → the pointer-events drag/dropzone helper (ghost locked to source width — no resize-on-lift; dropzone hit-test via `elementFromPoint`). Native Pointer Events — no library for MVP (a vendored Interact.js UMD is an optional later polish for touch/snapping, added as an earlier-numbered concat file exposing a global).
+- Shared `<defs>` (material gradients) + a scoped `<style>` (palette tokens) injected once by the layer. Chrome tokens inherit PVE light/dark; every object/control carries an `anas-gfx-*` hook.
+
+**First increment (de-risk before the composer):** port `ANAS.gfx` into `pve-integration` and deploy a minimal graphical panel to the stunt node to confirm the *real* PVE page is happy — CSP permits inline SVG/style, no ExtJS event conflicts, theme inherits, a Playwright hook drives. (The one thing local spikes couldn't prove.)
+
+**Consumers** (build order): Pool Composer (below, the flagship / Epic 3.23 build-side) → Pools status view (same objects, live health) → Datasets enriched tree (inline bars/chips/badges + persistent controls + space donut) → Dashboard/Disk-Health as the vocabulary matures. Graphics where they add insight; Shares/Users/Jobs stay tabular.
+
+### Pool Composer (Epic 15.2 / story 3.23)
+
+A large modal composer launched from the Pools view, serving **create** (empty draft) and **expand** (seeded with the pool's existing topology, shown read-only; stage additions). Built on `ANAS.gfx`.
+
+- **Data flow:** on open, GET the node's disks (existing disks API), filter to available/blank. Hold a **client-side draft model** (`vdevs[]` with role/type/disks, an assigned map) — no server calls until commit. Commit → **create**: `POST /pools` with `CreatePoolRequest` (compose `dataVdevs[]/logVdevs[]/cacheDisks[]/spareDisks[]` from the draft, one shot); **expand**: `zpool add` per staged vdev (`AddVdevRequest`). Via `ANAS.runJob`. No new schema — the API is already vdev-centric.
+- **Interaction:** available-disk objects (draggable) → vdev bays grouped by role; "Add vdev" (role+type) spins up a bay; drag disks in, remove returns them; change a bay's type inline. Live summary (usable capacity, redundancy, "survives N failures").
+- **Validity gating:** the Create button is DISABLED until the draft is valid — ≥1 data vdev at/above its type-min, every vdev meets its min, and (hard rule, per 3.22) special/dedup/log vdevs are **redundant**. Mixed data-vdev types warn but don't block.
+- **Pool advisor** (differentiator): a rules-based panel that (a) characterises best-use from the composition ("Capacity pool, all-HDD — sequential/large-file"), (b) suggests improvements from the *unused* disks ("2 free SSDs → a mirrored special vdev accelerates metadata/small files"), (c) states honest caveats (L2ARC helps only when the working set exceeds RAM yet fits cache, and costs RAM for headers; SLOG helps only sync writes; a special vdev's loss loses the pool). Advisory, not salesy.
+
 ---
 
 ## Public API (browser ↔ anas gateway)
