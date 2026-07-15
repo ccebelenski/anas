@@ -401,6 +401,28 @@
         return names;
     }
 
+    // Pools eligible as a create target: ANAS-managed only. PVE-managed pools are
+    // hands-off (story 3.25), so they must never be offered as a place to add a
+    // dataset — not via the tree row (gated in openCreate) NOR via the create
+    // dialog's pool picker (which would otherwise bypass the gate).
+    function anasPoolNames(tree) {
+        var names = [];
+        try {
+            var root = tree.getRootNode();
+            if (root && root.childNodes) {
+                for (var i = 0; i < root.childNodes.length; i++) {
+                    var n = root.childNodes[i];
+                    if (n.get('kind') === 'pool' && !n.get('pveManaged')) {
+                        names.push(n.get('name'));
+                    }
+                }
+            }
+        } catch (e) {
+            // fail-open — empty list
+        }
+        return names;
+    }
+
     function loadTree(tree, node) {
         if (!tree || tree.destroyed || tree.destroying) {
             return;
@@ -654,8 +676,14 @@
             ANAS.toast(t("PVE manages this pool — ANAS won't add datasets here."));
             return;
         }
-        var pools = poolNames(tree);
+        // Only ANAS-managed pools are valid create targets — a PVE pool selected
+        // via the picker must not slip past the row-level gate above.
+        var pools = anasPoolNames(tree);
         var defaultPool = rec ? rec.get('pool') : (pools.length ? pools[0] : '');
+        if (!defaultPool) {
+            ANAS.toast(t('No ANAS-managed pool is available to create a dataset.'));
+            return;
+        }
         // When a dataset (not a pool root) is selected, pre-seed its relative
         // path as the parent so a child is created under it.
         var parentRel = '';
