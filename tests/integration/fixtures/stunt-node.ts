@@ -447,11 +447,14 @@ export async function destroyPool(name: string): Promise<void> {
   // disk (resolved via lsblk PKNAME), not the partition the pool reported.
   const script = [
     `pool=${name}`,
-    // capture member device paths before destroy (may be partitions)
+    // Import first if the pool is only exported (a test may leave it that way) —
+    // otherwise `zpool status` reports no members and the wipe below is skipped,
+    // stranding the disks as 'other'.
+    `zpool list "$pool" >/dev/null 2>&1 || zpool import -f "$pool" 2>/dev/null || true`,
+    // Now capture member device paths (may be partitions), then destroy.
     `devs=$(zpool status -PL "$pool" 2>/dev/null | grep -oE '/dev/[^ ]+' || true)`,
-    // destroy (import first if it's an exported pool still on its disks)
-    `zpool destroy -f "$pool" 2>/dev/null || { zpool import -f "$pool" 2>/dev/null && zpool destroy -f "$pool" 2>/dev/null; } || true`,
-    // wipe each member's WHOLE disk (parent of the partition, else itself)
+    `zpool destroy -f "$pool" 2>/dev/null || true`,
+    // Wipe each member's WHOLE disk (parent of the partition, else itself).
     `for d in $devs; do`,
     `  p=$(lsblk -no pkname "$d" 2>/dev/null | head -1)`,
     `  if [ -n "$p" ]; then tgt="/dev/$p"; else tgt="$d"; fi`,
