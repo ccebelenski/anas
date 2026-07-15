@@ -1213,6 +1213,10 @@
                     ? (t('Expand Pool') + ': ' + state.poolName)
                     : t('Create Pool'),
                 modal: true,
+                // Open filling the viewport — a pool build wants all the room it
+                // can get (the topology column is `1fr`, so it grows to fill).
+                // 1040x720 is kept as the restore size; maximizable toggles back.
+                maximized: true,
                 width: 1040,
                 height: 720,
                 minWidth: 720,
