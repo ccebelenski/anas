@@ -223,7 +223,7 @@
         return idx >= 0 ? name.substring(idx + 1) : name;
     }
 
-    function nodeFromDataset(ds, kind, poolSize) {
+    function nodeFromDataset(ds, kind, poolSize, pveManaged) {
         return {
             name: lastSegment(ds.name),
             fullName: ds.name,
@@ -240,6 +240,10 @@
             // Total capacity of the owning pool (bytes) — feeds the "Space of
             // pool" gfx bar (Epic 15.4). Threaded from the GET /pools summary.
             poolSize: poolSize,
+            // Story 3.25: does the OWNING pool have PVE storages? Threaded from
+            // the pool summary so per-row renderers/handlers can gate structural
+            // actions on PVE-managed datasets the same way as the pool root.
+            pveManaged: !!pveManaged,
             // Suppress the default tree node glyph so the gfx object icon drawn
             // in the Name column is the only icon (see ensureDatasetStyles).
             iconCls: 'anas-tree-obj',
@@ -261,7 +265,7 @@
 
     // Ensure an intermediate parent node exists for parentName (defensive — in
     // practice every ZFS level is itself a dataset row, so this is rarely hit).
-    function ensureParent(parentName, pool, byName, poolSize) {
+    function ensureParent(parentName, pool, byName, poolSize, pveManaged) {
         if (byName[parentName]) {
             return byName[parentName];
         }
@@ -272,13 +276,14 @@
             kind: 'dataset',
             type: 'filesystem',
             poolSize: poolSize,
+            pveManaged: !!pveManaged,
             iconCls: 'anas-tree-obj',
             leaf: false,
             children: [],
         };
         byName[parentName] = node;
         var grandName = parentName.substring(0, parentName.lastIndexOf('/'));
-        var grand = grandName ? ensureParent(grandName, pool, byName, poolSize) : byName[pool];
+        var grand = grandName ? ensureParent(grandName, pool, byName, poolSize, pveManaged) : byName[pool];
         if (grand) {
             grand.children.push(node);
             grand.leaf = false;
@@ -286,9 +291,23 @@
         return node;
     }
 
+    // Story 3.25: a pool is PVE-managed iff its summary carries a non-empty
+    // pveStorages[] (VM/LXC/backup storages that PVE owns). Fail-open: a missing
+    // or malformed field is treated as empty ⇒ ANAS-managed, keeping full
+    // functionality rather than accidentally locking a pool down.
+    function isPveManaged(pool) {
+        try {
+            var ps = pool && pool.pveStorages;
+            return !!(ps && ps.length);
+        } catch (e) {
+            return false;
+        }
+    }
+
     function buildPoolNode(pool, datasets) {
         var byName = {};
         var poolSize = Number(pool.size) || 0;
+        var pveManaged = isPveManaged(pool);
         var rootNode = {
             name: pool.name,
             fullName: pool.name,
@@ -296,6 +315,10 @@
             kind: 'pool',
             type: 'filesystem',
             poolSize: poolSize,
+            // Story 3.25: whole-pool PVE ownership drives Thread 1 (hands-off)
+            // vs Thread 2 (root fully manageable) in the row renderers/handlers.
+            pveManaged: pveManaged,
+            pveStorages: (pool && pool.pveStorages) || [],
             iconCls: 'anas-tree-obj',
             expanded: true,
             leaf: true,
@@ -314,10 +337,11 @@
                 applyDatasetData(rootNode, ds);
                 continue;
             }
-            var node = nodeFromDataset(ds, 'dataset', poolSize);
+            var node = nodeFromDataset(ds, 'dataset', poolSize, pveManaged);
             byName[ds.name] = node;
             var parentName = ds.name.substring(0, ds.name.lastIndexOf('/'));
-            var parent = byName[parentName] || ensureParent(parentName, pool.name, byName, poolSize);
+            var parent = byName[parentName]
+                || ensureParent(parentName, pool.name, byName, poolSize, pveManaged);
             parent.children.push(node);
             parent.leaf = false;
         }
@@ -484,6 +508,28 @@
         return isDataset(rec) && rec.get('type') === 'filesystem';
     }
 
+    // Story 3.26: the pool ROOT is a first-class filesystem too. Share and
+    // Permissions accept either a dataset OR the pool-root row when it is a
+    // filesystem, so the root gets the full action set on ANAS-managed pools.
+    function isFsShareable(rec) {
+        if (!rec) {
+            return false;
+        }
+        var kind = rec.get('kind');
+        return (kind === 'dataset' || kind === 'pool') && rec.get('type') === 'filesystem';
+    }
+
+    // Story 3.25: is the row's owning pool PVE-managed? Read the boolean stamped
+    // on every pool/dataset node in buildPoolNode. Fail-open ⇒ false (treat as
+    // ANAS-managed, keep full functionality).
+    function recPveManaged(rec) {
+        try {
+            return !!(rec && rec.get('pveManaged'));
+        } catch (e) {
+            return false;
+        }
+    }
+
     function isSnapshot(rec) {
         return !!(rec && rec.get('kind') === 'snapshot');
     }
@@ -504,16 +550,21 @@
         var ds = isDataset(rec);
         var fs = isFilesystem(rec);
         var snap = isSnapshot(rec);
+        // Story 3.25: PVE-managed pools/datasets are hands-off. Structural
+        // toolbar actions are gated alongside the primary per-row gate; only
+        // read-only Detail / snapshot-listing stay enabled.
+        var pve = recPveManaged(rec);
+        setDisabled(tree, 'dsCreate', pve);
         setDisabled(tree, 'dsDetail', !ds);
-        setDisabled(tree, 'dsEdit', !ds);
-        setDisabled(tree, 'dsPerms', !fs);
+        setDisabled(tree, 'dsEdit', !ds || pve);
+        setDisabled(tree, 'dsPerms', !fs || pve);
         // Contextual "Share…" is offered on filesystem datasets only — they
         // have a mountpoint path to share (DESIGN 5a/5d). zvols cannot.
-        setDisabled(tree, 'dsShare', !fs);
-        setDisabled(tree, 'dsDestroy', !ds);
+        setDisabled(tree, 'dsShare', !fs || pve);
+        setDisabled(tree, 'dsDestroy', !ds || pve);
         // Snapshot actions: create/list act on a selected dataset; the
         // rollback/rename/destroy trio act on a selected snapshot row.
-        setDisabled(tree, 'snapCreate', !ds);
+        setDisabled(tree, 'snapCreate', !ds || pve);
         setDisabled(tree, 'snapAll', !ds);
         setDisabled(tree, 'snapRollback', !snap);
         setDisabled(tree, 'snapRename', !snap);
@@ -534,7 +585,13 @@
         // `rec` is optional — the toolbar submenu relies on the tree selection,
         // while the per-row action icon (Epic 15.4) passes the clicked record.
         rec = rec || selectedRecord(tree);
-        if (!isFilesystem(rec)) {
+        // Story 3.26: the pool root shares too (isFsShareable). Story 3.25: a
+        // PVE-managed row is hands-off — soft-gate here as well as at the row.
+        if (!isFsShareable(rec)) {
+            return;
+        }
+        if (recPveManaged(rec)) {
+            ANAS.toast(t('PVE manages this pool — sharing is disabled in ANAS.'));
             return;
         }
         if (!ANAS.shares || typeof ANAS.shares.openSmbCreate !== 'function'
@@ -591,6 +648,12 @@
     // ---- Create Dataset (story 4.5) ----------------------------------------
 
     function openCreate(node, tree, rec) {
+        // Story 3.25: never add a child dataset under a PVE-managed pool. Soft
+        // gate — the affordance stays visible, the mutation is refused.
+        if (recPveManaged(rec)) {
+            ANAS.toast(t("PVE manages this pool — ANAS won't add datasets here."));
+            return;
+        }
         var pools = poolNames(tree);
         var defaultPool = rec ? rec.get('pool') : (pools.length ? pools[0] : '');
         // When a dataset (not a pool root) is selected, pre-seed its relative
@@ -911,7 +974,11 @@
     }
 
     function openDetail(node, rec) {
-        if (!isDataset(rec)) {
+        // Accept a dataset OR the pool root: the root carries its filesystem data
+        // (merged in buildPoolNode) and the daemon serves it via the empty-
+        // relative-path detail endpoint — this is the read-only "View properties"
+        // affordance offered on PVE-managed rows (story 3.25).
+        if (!isDataset(rec) && !(rec && rec.get('kind') === 'pool')) {
             return;
         }
         var pool = rec.get('pool');
@@ -1136,6 +1203,12 @@
         // it via the empty-relative-path detail endpoint, so its ZFS properties
         // are editable too (Epic 15.4 per-row "props" action on the pool root).
         if (!isDataset(rec) && !(rec && rec.get('kind') === 'pool')) {
+            return;
+        }
+        // Story 3.25: property EDITING is disabled on PVE-managed rows (the
+        // read-only Detail view is offered instead, via openDetail).
+        if (recPveManaged(rec)) {
+            ANAS.toast(t('PVE manages this pool — properties are read-only in ANAS.'));
             return;
         }
         if (typeof ANAS.editWindow !== 'function') {
@@ -1534,7 +1607,13 @@
     }
 
     function openPermissions(node, tree, rec) {
-        if (!isFilesystem(rec)) {
+        // Story 3.26: accept the pool-root filesystem too (isFsShareable).
+        if (!isFsShareable(rec)) {
+            return;
+        }
+        // Story 3.25: PVE-managed rows are hands-off — soft-gate.
+        if (recPveManaged(rec)) {
+            ANAS.toast(t('PVE manages this pool — permissions are read-only in ANAS.'));
             return;
         }
         var pool = rec.get('pool');
@@ -2052,7 +2131,15 @@
     }
 
     function openDestroy(node, tree, rec) {
+        // Only child datasets are destroyable here. Story 3.26: the pool root is
+        // NOT destroyable in the Datasets view (that ≈ destroying the pool — a
+        // Pools-view op), so kind==='pool' never reaches here.
         if (!isDataset(rec)) {
+            return;
+        }
+        // Story 3.25: PVE owns this pool — refuse destroy (soft gate).
+        if (recPveManaged(rec)) {
+            ANAS.toast(t('PVE manages this pool — ANAS will not destroy its datasets.'));
             return;
         }
         var pool = rec.get('pool');
@@ -2193,7 +2280,10 @@
             var root = tree.getRootNode();
             if (root && typeof root.cascadeBy === 'function') {
                 root.cascadeBy(function (n) {
-                    if (!found && n.get('kind') === 'dataset'
+                    // Story 3.26: the pool ROOT hosts snapshots too, so match it
+                    // (kind 'pool', fullName === pool) as well as child datasets.
+                    var k = n.get('kind');
+                    if (!found && (k === 'dataset' || k === 'pool')
                         && n.get('fullName') === datasetFullName && n.get('pool') === pool) {
                         found = n;
                     }
@@ -2900,6 +2990,30 @@
         }
     }
 
+    // Story 3.25: a soft-disabled (greyed) gfx control. Renders the same button
+    // as gfx.ctl but visually inert — the affordance stays VISIBLE with an
+    // explaining tooltip, so a future homelab opt-in can flip it back on. The
+    // click still routes through the cellclick delegate to dispatchRowCtl, which
+    // authoritatively no-ops on PVE-managed rows (never mutating PVE's pool).
+    function gatedCtl(name, tip, danger) {
+        try {
+            if (!gfxReady() || typeof ANAS.gfx.ctl !== 'function') {
+                return '';
+            }
+            var html = ANAS.gfx.ctl(name, tip, danger ? { danger: true } : undefined);
+            if (!html) {
+                return '';
+            }
+            // Mark the button gated + grey it inline (no gfx CSS is added here).
+            // Keep data-anas-ctl so cellclick still delegates it to the soft gate.
+            return html.replace('<button type="button" ',
+                '<button type="button" data-anas-gated="1" aria-disabled="true"'
+                + ' style="opacity:.38;cursor:not-allowed" ');
+        } catch (e) {
+            return '';
+        }
+    }
+
     // Name column: draw the gfx object icon (pool vs open/closed folder) ahead
     // of the label so pool roots and datasets read distinctly. Snapshot and
     // overflow rows keep their own fa iconCls and are just html-encoded.
@@ -2910,9 +3024,18 @@
                 return label;
             }
             var kind = rec.get('kind');
+            // Story 3.25: tag PVE-managed rows so they read as PVE's territory.
+            // Prominent 'PVE' badge on the pool root; a subtle one on each of its
+            // datasets. gfx.badge is optional — degrade to no badge if absent.
+            var pveBadge = '';
+            if (recPveManaged(rec) && typeof ANAS.gfx.badge === 'function') {
+                pveBadge = ' ' + ANAS.gfx.badge('PVE', {
+                    title: t('PVE-managed — VM/LXC storage'),
+                });
+            }
             if (kind === 'pool') {
                 return ANAS.gfx.objectIcon('pool', { title: t('Pool') })
-                    + '<span class="anas-ds-nm">' + label + '</span>';
+                    + '<span class="anas-ds-nm">' + label + '</span>' + pveBadge;
             }
             if (kind === 'dataset') {
                 var open = false;
@@ -2923,7 +3046,7 @@
                 }
                 var title = rec.get('type') === 'volume' ? t('Volume') : t('Filesystem');
                 return ANAS.gfx.objectIcon('folder', { open: open, title: title })
-                    + '<span class="anas-ds-nm">' + label + '</span>';
+                    + '<span class="anas-ds-nm">' + label + '</span>' + pveBadge;
             }
             return label;
         } catch (e) {
@@ -3059,14 +3182,49 @@
                 return '';
             }
             var kind = rec.get('kind');
-            if (kind === 'pool') {
-                return ANAS.gfx.ctl('add', t('New top-level dataset'))
-                    + ANAS.gfx.ctl('props', t('Root filesystem properties'));
-            }
-            if (kind !== 'dataset') {
+            if (kind !== 'pool' && kind !== 'dataset') {
                 return '';
             }
-            var isFs = rec.get('type') === 'filesystem';
+            // Pool roots are filesystems; datasets may be zvols (no share/lock).
+            var isFs = (kind === 'pool') ? true : (rec.get('type') === 'filesystem');
+
+            // ---- Thread 1 (story 3.25): PVE-managed pool + its datasets are
+            // hands-off. Every structural action is rendered but soft-disabled
+            // (greyed, explained); only a read-only "View properties" is live.
+            if (recPveManaged(rec)) {
+                var addTip = t("PVE manages this pool — ANAS won't add datasets here.");
+                var handsOff = t('PVE-managed storage — hands-off in ANAS.');
+                var g = gatedCtl('add', addTip)
+                    + gatedCtl('snapshot', handsOff);
+                if (isFs) {
+                    g += gatedCtl('share', handsOff)
+                        + gatedCtl('lock', handsOff);
+                }
+                // Live, read-only view of properties (opens the Detail window).
+                g += ANAS.gfx.ctl('props', t('View properties (PVE-managed, read-only)'));
+                // Destroy is offered (greyed) on child datasets only; the pool
+                // root never shows destroy here (that is a Pools-view op).
+                if (kind === 'dataset') {
+                    g += gatedCtl('trash', handsOff, true);
+                }
+                return g;
+            }
+
+            // ---- Thread 2 (story 3.26): ANAS-managed pool ROOT is first-class —
+            // add child, snapshot, share, permissions, editable props. NO destroy
+            // (destroying the root ≈ destroying the pool → Pools view).
+            if (kind === 'pool') {
+                var p = ANAS.gfx.ctl('add', t('New top-level dataset'))
+                    + ANAS.gfx.ctl('snapshot', t('Take snapshot'));
+                if (isFs) {
+                    p += ANAS.gfx.ctl('share', t('Share…'))
+                        + ANAS.gfx.ctl('lock', t('Permissions'));
+                }
+                p += ANAS.gfx.ctl('props', t('Edit root properties'));
+                return p;
+            }
+
+            // ---- ANAS-managed child dataset: the full action set.
             var out = ANAS.gfx.ctl('add', t('New child dataset'))
                 + ANAS.gfx.ctl('snapshot', t('Take snapshot'));
             if (isFs) {
@@ -3125,18 +3283,49 @@
                 return;
             }
             var kind = rec.get('kind');
+
+            // Thread 1 (story 3.25): PVE-managed rows are hands-off. The ONLY live
+            // action is the read-only "View properties" (Detail); every structural
+            // action is soft-gated here so even a stray click cannot mutate PVE's
+            // pool. This is the authoritative gate — the greying is cosmetic.
+            if (recPveManaged(rec)) {
+                if (name === 'props') {
+                    openDetail(node, rec);
+                } else if (name === 'add') {
+                    ANAS.toast(t("PVE manages this pool — ANAS won't add datasets here."));
+                } else {
+                    ANAS.toast(t('PVE-managed storage — this action is disabled in ANAS.'));
+                }
+                return;
+            }
+
             if (name === 'add') {
                 // openCreate seeds the parent from the record: a dataset → child,
                 // the pool root → a new top-level dataset in that pool.
                 openCreate(node, tree, rec);
                 return;
             }
+
+            // Thread 2 (story 3.26): the ANAS pool ROOT gets the full dataset
+            // action set (minus destroy). Its pool === fullName and its relative
+            // path is empty, which datasetPath/snapshotsPath already handle.
             if (kind === 'pool') {
-                if (name === 'props') {
+                if (name === 'snapshot') {
+                    var ppool = rec.get('pool');
+                    var pfull = rec.get('fullName');
+                    openCreateSnapshot(node, ppool, pfull, function () {
+                        refreshTreeSnapshots(node, tree, ppool, pfull, true);
+                    });
+                } else if (name === 'share') {
+                    openShareMenu(node, tree, rec, ev);
+                } else if (name === 'lock') {
+                    openPermissions(node, tree, rec);
+                } else if (name === 'props') {
                     openEdit(node, tree, rec);
                 }
                 return;
             }
+
             if (kind !== 'dataset') {
                 return;
             }
@@ -3371,6 +3560,11 @@
                 // (dormant until the flat dataset feed carries it).
                 { name: 'poolSize', type: 'auto' },
                 { name: 'shares', type: 'auto' },
+                // Story 3.25: whole-pool PVE ownership, stamped on every pool +
+                // dataset node so row renderers/handlers branch hands-off (PVE)
+                // vs first-class-root (ANAS). pveStorages kept for future detail.
+                { name: 'pveManaged', type: 'auto' },
+                { name: 'pveStorages', type: 'auto' },
             ],
             root: { expanded: true, children: [] },
         });
@@ -3640,8 +3834,19 @@
                 viewConfig: {
                     getRowClass: function (record) {
                         var kind = record.get('kind');
+                        // Story 3.25: mark PVE-managed rows (pool + datasets) for
+                        // styling and as a test hook.
+                        var pve = '';
+                        try {
+                            if ((kind === 'pool' || kind === 'dataset')
+                                && record.get('pveManaged')) {
+                                pve = ' anas-ds-pve-row';
+                            }
+                        } catch (ePve) {
+                            pve = '';
+                        }
                         if (kind === 'pool') {
-                            return 'anas-ds-pool-row';
+                            return 'anas-ds-pool-row' + pve;
                         }
                         if (kind === 'snapshot') {
                             return 'anas-snap-row';
@@ -3649,7 +3854,8 @@
                         if (kind === 'snapshots-more') {
                             return 'anas-snap-more';
                         }
-                        return '';
+                        // Datasets: only a class when PVE-managed (trim leading space).
+                        return pve ? pve.replace(/^\s+/, '') : '';
                     },
                 },
                 listeners: {
@@ -3693,7 +3899,12 @@
                     // Lazy-load a dataset's snapshots the first time it expands.
                     itemexpand: function (record) {
                         try {
-                            if (record && record.get && record.get('kind') === 'dataset') {
+                            // Story 3.26: the ANAS pool ROOT hosts snapshots too;
+                            // lazy-load them on expand like a dataset. PVE-managed
+                            // roots are hands-off, so skip them (view-only).
+                            var k = record && record.get && record.get('kind');
+                            if (k === 'dataset'
+                                || (k === 'pool' && !recPveManaged(record))) {
                                 loadSnapshotsForNode(node, this, record, false);
                             }
                         } catch (e) {
