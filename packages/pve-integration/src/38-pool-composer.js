@@ -504,6 +504,7 @@
                 + 'cursor:pointer;font-size:14px;line-height:1;padding:0 2px">✕</button>'
             : '';
         return '<div class="anas-gfx-disk anas-composer-disk" data-id="' + enc(d.id) + '"'
+            + ' data-size="' + enc(String(d.size == null ? '' : d.size)) + '"'
             + ' title="' + enc(d.id) + '"'
             + ' style="width:216px;display:inline-flex;align-items:center;gap:9px;padding:7px 9px;'
             + 'margin:4px;border-radius:11px;cursor:grab;touch-action:none;box-sizing:border-box;'

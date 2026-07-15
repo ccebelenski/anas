@@ -133,11 +133,23 @@ test.describe.serial('ANAS Pool Composer create (throwaway pool)', () => {
     // Name the throwaway pool.
     await win.locator('.anas-fld-composer-poolname').fill(THROW)
 
-    // Add a mirror data vdev and drag two disks in.
+    // A mirror needs SAME-SIZE disks: `zpool create` rejects a mismatched
+    // mirror without -f, which the composer deliberately never sends. Pick a
+    // disk size that has >= 2 available disks and drag two of THOSE, rather
+    // than the first two (which may differ in size on a mixed test rig).
+    const sizes = await win.locator('#anasc-avail .anas-composer-disk')
+      .evaluateAll(els => els.map(e => e.getAttribute('data-size') || ''))
+    const counts: Record<string, number> = {}
+    for (const s of sizes) counts[s] = (counts[s] ?? 0) + 1
+    const size = Object.keys(counts).find(s => s && counts[s] >= 2)
+    test.skip(!size, 'need >= 2 same-size spare disks for a mirror')
+    const sameSize = `#anasc-avail .anas-composer-disk[data-size="${size}"]`
+
+    // Add a mirror data vdev and drag two same-size disks in.
     await win.locator('.anas-btn-composer-addvdev').click()
     await expect(win.locator('.anas-composer-bay')).toHaveCount(1, { timeout: 20_000 })
-    await dragDiskIntoBay(page, '#anasc-avail .anas-composer-disk', '[data-anas-zone^="vdev:"]')
-    await dragDiskIntoBay(page, '#anasc-avail .anas-composer-disk', '[data-anas-zone^="vdev:"]')
+    await dragDiskIntoBay(page, sameSize, '[data-anas-zone^="vdev:"]')
+    await dragDiskIntoBay(page, sameSize, '[data-anas-zone^="vdev:"]')
     await expect(win.locator('[data-anas-zone^="vdev:"] .anas-composer-disk')).toHaveCount(2, { timeout: 20_000 })
 
     const createBtn = page.locator('.anas-btn-composer-create')
