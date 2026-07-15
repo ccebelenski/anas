@@ -950,7 +950,13 @@
                 // reflect its role when the graphic is present.
                 title: topoGfx ? ANAS.t('Device Errors') : ANAS.t('Topology'),
                 cls: 'anas-pool-topology',
-                flex: 1,
+                // The detail body is a scrollable vbox. flex:1 collapses to 0px
+                // once the graphical topology above fills the viewport (a flex
+                // item can't take negative space), which hid this tree entirely.
+                // With the graphic present, stack at a fixed height and let the
+                // whole body scroll; without it, flex to fill as the sole view.
+                flex: topoGfx ? undefined : 1,
+                height: topoGfx ? 280 : undefined,
                 rootVisible: false,
                 border: false,
                 store: Ext.create('Ext.data.TreeStore', {
