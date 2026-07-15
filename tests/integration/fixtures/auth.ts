@@ -1,6 +1,6 @@
 import { test as base, expect } from '@playwright/test'
+import { PVE_URL } from './pve-ui'
 
-const PVE_URL = 'https://192.168.200.50:8006'
 const PVE_USER = 'root@pam'
 const PVE_PASS = 'anas-test'
 

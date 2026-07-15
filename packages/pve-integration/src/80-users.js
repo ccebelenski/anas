@@ -60,11 +60,7 @@
     }
 
     function enc(s) {
-        try {
-            return Ext.String.htmlEncode('' + s);
-        } catch (e) {
-            return '' + s;
-        }
+        return ANAS.enc(s);
     }
 
     function alertMsg(title, msg) {

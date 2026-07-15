@@ -54,6 +54,18 @@
         return str;
     };
 
+    // HTML-encode for safe interpolation into markup. Prefers ExtJS's encoder
+    // (matches PVE); on any failure falls back to escaping the four dangerous
+    // characters directly. Fail-open: always returns an escaped string.
+    ANAS.enc = function (s) {
+        try {
+            return Ext.String.htmlEncode('' + s);
+        } catch (e) {
+            return ('' + s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+    };
+
     // ---- Formatters --------------------------------------------------------
 
     // Human-readable byte size. Prefers Proxmox's own formatter (identical
