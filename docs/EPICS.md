@@ -133,7 +133,7 @@ Story numbering is for identification only, not implementation order. Within eac
 3.20. [done] As a user, I want the Disk Health view grouped by pool → vdev (with unassigned/available disks in their own group), so that many disks stay scannable instead of a flat horde. *(Cheap — ExtJS grid grouping on a computed key. A graphical disk→vdev→pool connection diagram is a possible later, heavier follow-on.)*
 
 #### Act
-3.21. [backlog] As a user, I want to add **Log (SLOG) / Cache (L2ARC) / hot Spare** vdevs — at pool creation and to an existing pool — so I can tune ZFS performance and resilience (PVE's pool UI offers none of this). *Scope:*
+3.21. [done 2026-07-15] As a user, I want to add **Log (SLOG) / Cache (L2ARC) / hot Spare** vdevs — at pool creation and to an existing pool — so I can tune ZFS performance and resilience (PVE's pool UI offers none of this). *Scope:*
 - *Create: the API is DONE (CreatePoolRequest.logVdevs/cacheDisks/spareDisks, buildCreateArgs). Gap is UI only — best delivered via the vdev-centric composer (3.23) rather than bolting pickers onto the current single-vdev create window.*
 - *Add-to-existing: gap is schema + daemon + UI — give AddVdevRequest a role/class (log/cache/spare), branch the daemon add to `zpool add <pool> log|cache|spare <spec>`, expose it in the composer (3.23).*
 
@@ -144,7 +144,7 @@ Story numbering is for identification only, not implementation order. Within eac
 > - **Commit gating**: the "Create pool" button MUST be disabled while the draft is invalid (a vdev below its min disks, an unprotected special/log vdev, no data vdev, etc.) — don't let an invalid topology be submittable.
 > - **Pool advisor (differentiator)**: an analysis panel under the summary that (a) characterizes how the pool is best used from its composition (e.g. "Capacity pool (all-HDD) — best for sequential access / large files"), (b) suggests improvements from the *available* unused disks (e.g. "you have 2 spare SSDs → a mirrored **special** vdev would accelerate metadata & small files"), and (c) states honest **caveats** — a Cache/L2ARC vdev helps only when the working set exceeds ARC (RAM) yet fits L2ARC, and costs RAM for headers; a SLOG helps only *sync* writes (NFS/DBs), useless for async; a special vdev's loss loses the pool. Rules-based, advisory, not salesy — this is the "guide the user, don't just warn them" thesis, which is exactly where TrueNAS's UX is weak.
 
-3.22. [backlog] As a user, I want **special** and **dedup** allocation-class vdevs, so metadata and small blocks live on fast devices. *(Deferred behind 3.21 — riskier. SAFETY: a special/dedup vdev holds pool-wide metadata; its loss loses the WHOLE pool, so the UI must ENFORCE redundancy — ideally matching pool redundancy — not merely warn. Scope note: also expose `special_small_blocks` (route small data blocks, not just metadata, onto the fast tier). Industry-confirmed: TrueNAS's July 2026 "hybrid storage is hot again" post cites special vdevs requiring mirror redundancy today, with RAIDZ special support arriving — so plan for both mirror and raidz special vdevs.)*
+3.22. [done 2026-07-15] As a user, I want **special** and **dedup** allocation-class vdevs, so metadata and small blocks live on fast devices. *(Deferred behind 3.21 — riskier. SAFETY: a special/dedup vdev holds pool-wide metadata; its loss loses the WHOLE pool, so the UI must ENFORCE redundancy — ideally matching pool redundancy — not merely warn. Scope note: also expose `special_small_blocks` (route small data blocks, not just metadata, onto the fast tier). Industry-confirmed: TrueNAS's July 2026 "hybrid storage is hot again" post cites special vdevs requiring mirror redundancy today, with RAIDZ special support arriving — so plan for both mirror and raidz special vdevs.)*
 
 3.24. [backlog — likely its own epic] As a user, I want **policy-based tiering** — scheduled, auditable movement of data between fast and capacity tiers within a single pool (not a black-box heat-map). *(NEW idea, from TrueNAS's July 2026 hybrid-storage post; their TrueNAS 26 feature. Heavier than vdev management — it's live data mobility with checksum preservation, schedules, and policies — so it likely warrants its own epic rather than a pool-management story. The hybrid-vdev work (3.21/3.22) + the composer (3.23) are the prerequisites: you can't tier without the tiers.)*
 
@@ -223,7 +223,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 5.7. [done] As a user, I want to clone a snapshot into a writable dataset (`zfs clone`), so I can branch off a point-in-time copy. *(Small once snapshots exist.)*
 
-5.8. [backlog] As a user, I want stronger visual separation between a dataset's snapshots and its child datasets in the tree, so nesting is unambiguous. *(MVP lists snapshots before child datasets; a divider/section header or grouping would be clearer.)*
+5.8. [done 2026-07-15] As a user, I want stronger visual separation between a dataset's snapshots and its child datasets in the tree, so nesting is unambiguous. *(MVP lists snapshots before child datasets; a divider/section header or grouping would be clearer.)*
 
 ---
 
