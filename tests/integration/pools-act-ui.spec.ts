@@ -18,7 +18,8 @@ import {
  *       .anas-btn-modify, .anas-btn-addvdev,
  *       .anas-btn-attach, .anas-btn-export,
  *       .anas-btn-destroy                       — enabled only with a row selected
- *   - Their mutation windows carry .anas-win-create / -modify / etc.
+ *   - Their mutation windows carry .anas-win-modify / -addvdev / etc.; Create now
+ *     launches the graphical Pool Composer (.anas-win-composer, Epic 15.2 / 3.23).
  *   - Export/destroy use Ext.Msg.confirm (standard Yes/No) rather than a custom
  *     window, wiring the 409 + x-anas-confirm-code contract behind the UI.
  *
@@ -76,13 +77,15 @@ test.describe('ANAS pool action toolbar (stunt node)', () => {
       await expect(page.locator(sel)).toBeEnabled({ timeout: 20_000 })
   })
 
-  test('the Create button opens the .anas-win-create window', async ({ page }) => {
+  test('the Create button opens the Pool Composer window', async ({ page }) => {
     await loginToPve(page)
     await openAnasItem(page, 'Pools')
 
     await expect(page.locator('.anas-grid-pools')).toBeVisible({ timeout: 45_000 })
+    // The Create action now launches the graphical Pool Composer (Epic 15.2 /
+    // story 3.23), superseding the old simple-create window.
     await page.locator('.anas-btn-create').click()
-    await expect(page.locator('.anas-win-create')).toBeVisible({ timeout: 20_000 })
+    await expect(page.locator('.anas-win-composer')).toBeVisible({ timeout: 20_000 })
   })
 
   test('the Modify button opens the .anas-win-modify window for the selected pool', async ({ page }) => {
