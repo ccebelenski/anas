@@ -355,12 +355,22 @@ async function timerNextRun(executor: CommandExecutor, name: string): Promise<st
     if (r.exitCode !== 0 && !r.stdout.trim())
       return null
     const raw = parseShow(r.stdout).NextElapseUSecRealtime
-    const usec = Number(raw)
-    // 0 (and the sentinel systemd uses for "no next elapse") → null.
-    if (!Number.isFinite(usec) || usec <= 0)
+    if (!raw || raw === '0' || /^n\/a$/i.test(raw) || /infinity/i.test(raw))
       return null
-    const d = new Date(Math.floor(usec / 1000))
-    return Number.isNaN(d.getTime()) ? null : d.toISOString()
+    // Despite the property's name, `systemctl show` prints a HUMAN date string
+    // ("Fri 2026-07-17 00:00:00 UTC"), not microseconds (verified live on
+    // PVE 9 / systemd 257). Handle both forms: numeric µs (older systemd /
+    // machine formats) and the day-name-prefixed date string.
+    const usec = Number(raw)
+    if (Number.isFinite(usec) && usec > 0) {
+      const d = new Date(Math.floor(usec / 1000))
+      return Number.isNaN(d.getTime()) ? null : d.toISOString()
+    }
+    // Strip a leading weekday name ("Fri ") — Date.parse dislikes it combined
+    // with the "UTC" suffix on some engines; the rest parses cleanly.
+    const cleaned = raw.replace(/^[A-Z][a-z]{2}\s+/, '')
+    const parsed = Date.parse(cleaned)
+    return Number.isNaN(parsed) ? null : new Date(parsed).toISOString()
   }
   catch {
     return null

@@ -248,6 +248,20 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
       const st = await deriveTaskStatus(statusMock({ source: [{ name: 's1', txg: 1 }], target: [{ name: 's1', txg: 1 }], nextUsec: usec }), makeTask())
       assert.equal(st.nextRunAt, '2026-07-20T02:00:00.000Z')
     })
+
+    it('nextRunAt parses the HUMAN date string systemctl actually prints', async () => {
+      // Verified live on PVE 9 / systemd 257: `systemctl show -p
+      // NextElapseUSecRealtime` prints "Fri 2026-07-17 00:00:00 UTC", not µs.
+      const st = await deriveTaskStatus(statusMock({ source: [{ name: 's1', txg: 1 }], target: [{ name: 's1', txg: 1 }], nextUsec: 'Fri 2026-07-17 00:00:00 UTC' }), makeTask())
+      assert.equal(st.nextRunAt, '2026-07-17T00:00:00.000Z')
+    })
+
+    it('nextRunAt null on n/a and infinity sentinels', async () => {
+      for (const v of ['n/a', 'infinity', '0']) {
+        const st = await deriveTaskStatus(statusMock({ source: [{ name: 's1', txg: 1 }], target: [{ name: 's1', txg: 1 }], nextUsec: v }), makeTask())
+        assert.equal(st.nextRunAt, null, `sentinel ${v}`)
+      }
+    })
   })
 
   // --- warnings ------------------------------------------------------------
