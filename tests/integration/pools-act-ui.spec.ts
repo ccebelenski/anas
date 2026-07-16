@@ -79,6 +79,30 @@ test.describe('ANAS pool action toolbar (stunt node)', () => {
       await expect(page.locator(sel)).toBeEnabled({ timeout: 20_000 })
   })
 
+  test('gates Trim by device capability and Upgrade by availability (story 4.12)', async ({ page }) => {
+    await loginToPve(page)
+    await openAnasItem(page, 'Pools')
+
+    const grid = page.locator('.anas-grid-pools')
+    await expect(grid).toBeVisible({ timeout: 45_000 })
+    await grid.locator('.x-grid-row', { hasText: 'testpool' }).click()
+
+    const DISABLED = /x-item-disabled|x-btn-disabled/
+
+    // Trim: the stunt node's pool disks are QEMU virtual disks, which DO report
+    // discard support (DISC-GRAN > 0), so trimSupported is true → Trim enabled.
+    const trimBtn = page.locator('.anas-btn-pool-trim')
+    await expect(trimBtn).toBeVisible({ timeout: 20_000 })
+    await expect(trimBtn).not.toHaveClass(DISABLED, { timeout: 20_000 })
+
+    // Upgrade: the stunt pools are freshly created on current ZFS, so all
+    // supported features are already enabled → upgradeAvailable false → Upgrade
+    // stays DISABLED even with a pool selected.
+    const upgradeBtn = page.locator('.anas-btn-pool-upgrade')
+    await expect(upgradeBtn).toBeVisible({ timeout: 20_000 })
+    await expect(upgradeBtn).toHaveClass(DISABLED, { timeout: 20_000 })
+  })
+
   test('the Create button opens the Pool Composer window', async ({ page }) => {
     await loginToPve(page)
     await openAnasItem(page, 'Pools')

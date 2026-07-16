@@ -1,0 +1,5 @@
+This system supports ZFS pool feature flags.
+
+All pools are formatted using feature flags.
+
+Every feature flags pool has all supported and requested features enabled.

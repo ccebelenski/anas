@@ -558,6 +558,45 @@
         }
     }
 
+    // Guarded button.setText — a toolbar button missing setText must never break
+    // updateButtons (fail-open, story 4.12 scrub toggle).
+    function btnSetText(btn, text) {
+        try {
+            if (btn && typeof btn.setText === 'function') {
+                btn.setText(ANAS.t(text));
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // Guarded button.setTooltip with an explicit (already-translated) message.
+    function btnSetTip(btn, msg) {
+        try {
+            if (btn && typeof btn.setTooltip === 'function') {
+                btn.setTooltip(msg || '');
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // A capability flag from the selected pool record, tri-state:
+    //   true / false when the field is present, null when ABSENT (old daemon).
+    // Callers must treat null as "unknown → do not gate" so an old daemon keeps
+    // today's behavior (no gating regression).
+    function capFlag(rec, field) {
+        try {
+            var v = rec.get(field);
+            if (v === undefined || v === null) {
+                return null;
+            }
+            return !!v;
+        } catch (e) {
+            return null;
+        }
+    }
+
     // ---- Grid --------------------------------------------------------------
 
     function loadPools(grid, node) {
@@ -595,24 +634,73 @@
     function updateButtons(grid) {
         var sel = grid.getSelection();
         var has = sel && sel.length > 0;
+        var rec = has ? sel[0] : null;
         var scrubBtn = grid.down('#scrub');
         var detailBtn = grid.down('#detail');
         var trimBtn = grid.down('#trim');
         var upgradeBtn = grid.down('#upgrade');
+        var pveManaged = has && isPveManaged(rec);
         if (detailBtn) {
             detailBtn.setDisabled(!has);
         }
+        // Scrub is a start/stop TOGGLE (story 4.12). While a SCRUB runs the
+        // button stays ENABLED but flips to "Stop Scrub" (its handler then posts
+        // {action:'stop'} — see startScrub). While a RESILVER runs it is disabled
+        // (you cannot scrub during a resilver, nor stop a resilver). Otherwise
+        // it is the normal "Start Scrub". An old daemon omits scanFunction, so a
+        // running scan of unknown type keeps today's behavior: disabled, no flip.
         if (scrubBtn) {
-            var scanning = has && sel[0].get('scanRunning');
-            scrubBtn.setDisabled(!has || scanning);
+            var scanning = has && rec.get('scanRunning');
+            var fn = has ? rec.get('scanFunction') : null;
+            if (scanning && fn === 'SCRUB') {
+                scrubBtn.setDisabled(!has);
+                btnSetText(scrubBtn, 'Stop Scrub');
+                btnSetTip(scrubBtn, '');
+            } else if (scanning && fn === 'RESILVER') {
+                scrubBtn.setDisabled(true);
+                btnSetText(scrubBtn, 'Start Scrub');
+                btnSetTip(scrubBtn, ANAS.t('Cannot scrub while the pool is resilvering'));
+            } else if (scanning) {
+                // Unknown scan type (old daemon) — preserve prior behavior.
+                scrubBtn.setDisabled(true);
+                btnSetText(scrubBtn, 'Start Scrub');
+                btnSetTip(scrubBtn, '');
+            } else {
+                scrubBtn.setDisabled(!has);
+                btnSetText(scrubBtn, 'Start Scrub');
+                btnSetTip(scrubBtn, '');
+            }
         }
-        // Trim and Upgrade only need a selected pool (both operate on any
-        // online pool; Upgrade's one-way risk is handled by the confirm gate).
+        // Trim is capability-gated (story 4.12): disabled unless a member device
+        // supports discard. Composed with the story 3.25 PVE hands-off gate — a
+        // PVE-managed pool stays disabled regardless. Absent trimSupported (old
+        // daemon ⇒ capFlag null) does NOT gate, preserving today's behavior.
         if (trimBtn) {
-            trimBtn.setDisabled(!has);
+            var trimCap = capFlag(rec, 'trimSupported');
+            var noTrim = has && trimCap === false;
+            trimBtn.setDisabled(!has || noTrim || pveManaged);
+            if (pveManaged) {
+                setPveTooltip(trimBtn, true);
+            } else if (noTrim) {
+                btnSetTip(trimBtn, ANAS.t('No devices in this pool support TRIM'));
+            } else {
+                btnSetTip(trimBtn, '');
+            }
         }
+        // Upgrade is availability-gated (story 4.12): disabled unless the pool
+        // has supported-but-disabled features. Same PVE hands-off composition.
+        // Absent upgradeAvailable (old daemon ⇒ null) does NOT gate.
         if (upgradeBtn) {
-            upgradeBtn.setDisabled(!has);
+            var upgCap = capFlag(rec, 'upgradeAvailable');
+            var noUpg = has && upgCap === false;
+            upgradeBtn.setDisabled(!has || noUpg || pveManaged);
+            if (pveManaged) {
+                setPveTooltip(upgradeBtn, true);
+            } else if (noUpg) {
+                btnSetTip(upgradeBtn, ANAS.t('All supported features are already enabled'));
+            } else {
+                btnSetTip(upgradeBtn, '');
+            }
         }
         // Registered actions: toggle by their declared selection needs, plus
         // the story 3.25 hands-off gate. When the selected pool is PVE-managed,
@@ -620,8 +708,7 @@
         // Attach/Modify) are disabled with an explanatory tooltip; Scrub/Trim/
         // Upgrade/Detail (base toolbar) and Refresh stay enabled. Create/Import
         // are not selection-bound (needsSelection false) so the loop skips them.
-        var scanningSel = has && sel[0].get('scanRunning');
-        var pveManaged = has && isPveManaged(sel[0]);
+        var scanningSel = has && rec.get('scanRunning');
         var actions = ANAS.pools.actions;
         for (var i = 0; i < actions.length; i++) {
             var a = actions[i];
@@ -649,19 +736,32 @@
     ANAS.pools.reload = loadPools;
 
     // Scrub via the shared runJob helper (submit 202 → poll job → refresh).
+    // This is the start/stop TOGGLE handler (story 4.12): if the selected pool
+    // is mid-SCRUB it posts {action:'stop'} (→ `zpool scrub -s`), otherwise
+    // {action:'start'}. The decision reads the live record rather than the
+    // button label so it is correct regardless of render timing. After the job
+    // completes, onComplete reloads /pools; the fresh scanRunning/scanFunction
+    // flips the button text back via updateButtons (no manual relabel needed).
     function startScrub(grid, node) {
+        var sel = grid.getSelection();
         var pool = selectedPool(grid);
         if (!pool) {
             return;
         }
+        var rec = (sel && sel.length) ? sel[0] : null;
+        var stopping = !!(rec && rec.get('scanRunning')
+            && rec.get('scanFunction') === 'SCRUB');
+        var action = stopping ? 'stop' : 'start';
         ANAS.runJob({
             node: node,
             method: 'post',
             path: '/pools/' + encodeURIComponent(pool) + '/scrub',
-            body: { action: 'start' },
+            body: { action: action },
             view: grid,
-            failTitle: 'Scrub failed',
-            successMsg: ANAS.t('Scrub started on pool') + ' ' + pool,
+            failTitle: stopping ? 'Stop scrub failed' : 'Scrub failed',
+            successMsg: stopping
+                ? (ANAS.t('Stopping scrub on pool') + ' ' + pool)
+                : (ANAS.t('Scrub started on pool') + ' ' + pool),
             onComplete: function () {
                 loadPools(grid, node);
             },
@@ -743,6 +843,15 @@
                 { name: 'fragmentation', type: 'float' },
                 { name: 'dedupRatio', type: 'float' },
                 { name: 'scanRunning', type: 'boolean' },
+                // story 4.12 gating: keep these as AUTO fields (no type coercion)
+                // so an old daemon that omits them leaves get() === undefined —
+                // the button logic then falls back to today's behavior (no
+                // regression). A typed boolean would coerce absent → false and
+                // wrongly disable Trim.
+                //   scanFunction    — 'SCRUB'|'RESILVER', present only while scanning
+                //   trimSupported   — any member device supports discard
+                //   upgradeAvailable— pool has supported-but-disabled features
+                'scanFunction', 'trimSupported', 'upgradeAvailable',
                 // story 3.25: PVE-managed classification. Auto field keeps the
                 // array verbatim; empty/absent ⇒ ANAS-managed (see isPveManaged).
                 'pveStorages',

@@ -166,6 +166,14 @@ export const PoolSummary = z.object({
   dedupRatio: z.number().nonnegative(),
   /** Whether a scan (scrub/resilver) is currently running */
   scanRunning: z.boolean(),
+  /** Scan operation type — present ONLY while a scan runs. Lets the UI offer
+   *  "Stop Scrub" for a SCRUB but not a RESILVER (a resilver cannot be stopped). */
+  scanFunction: ScanFunction.optional(),
+  /** Any member device of the pool supports discard (TRIM). Gates the Trim action. */
+  trimSupported: z.boolean().default(false),
+  /** The pool has supported-but-disabled features (a `zpool upgrade` would enable
+   *  them). Gates the Upgrade action. */
+  upgradeAvailable: z.boolean().default(false),
   /** Health message, present only when pool is not ONLINE */
   health: PoolHealthMessage.optional(),
   /** PVE storages referencing this pool (read-only, from /etc/pve/storage.cfg).

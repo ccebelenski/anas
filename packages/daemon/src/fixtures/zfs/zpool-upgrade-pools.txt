@@ -1,0 +1,17 @@
+This system supports ZFS pool feature flags.
+
+All pools are formatted using feature flags.
+
+
+Some supported features are not enabled on the following pools. Once this is done, the pool may become incompatible with software that does not support the features. See zpool-features(7) for details.
+
+Note that the pool 'compatibility' feature can be used to inhibit feature upgrades.
+
+POOL  FEATURE
+---------------
+tank
+      hole_birth
+      embedded_data
+      large_dnode
+pond
+      large_blocks
