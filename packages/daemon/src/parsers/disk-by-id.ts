@@ -16,6 +16,57 @@ const PREFIX_PRIORITY: Record<string, number> = {
 const SYMLINK_RE = /(\S+)\s+->\s+(?:\.\.\/)*(\S+)$/
 const PARTITION_RE = /-part\d+$/
 const RELATIVE_PREFIX_RE = /^(?:\.\.\/)*/
+const NVME_PART_RE = /^(nvme\d+n\d+)p\d+$/
+const SCSI_PART_RE = /^(\D+)\d+$/
+
+/**
+ * Reduce a kernel partition name to its whole-disk parent:
+ *   sdb1 → sdb, sda15 → sda, nvme0n1p1 → nvme0n1.
+ * A whole-disk name (no partition suffix) is returned unchanged.
+ */
+export function wholeDiskKernel(kernel: string): string {
+  const nvme = kernel.match(NVME_PART_RE)
+  if (nvme)
+    return nvme[1]
+  const scsi = kernel.match(SCSI_PART_RE)
+  if (scsi)
+    return scsi[1]
+  return kernel
+}
+
+/**
+ * Parse `ls -la /dev/disk/by-id/` into a COMPLETE by-id-name → kernel-name map.
+ *
+ * Unlike {@link parseDiskByIdListing} (which keeps only the single highest-
+ * priority by-id per kernel device), this keeps EVERY by-id form — every
+ * `ata-…`, `wwn-…`, `scsi-…`, `nvme-…` name maps to its whole-disk kernel
+ * device. This is the join key used to cross-reference `zpool status` leaves
+ * (whose `devid`/`path` may pick a DIFFERENT by-id form than our disk parser
+ * would) against physical disks: both sides canonicalize to the kernel device.
+ *
+ * Partition suffixes are stripped on both sides: the by-id key loses its
+ * `-partN` and the kernel target is reduced to its whole disk, so
+ * `wwn-0x…-part1 -> ../../sdb1` contributes `wwn-0x…` → `sdb`.
+ */
+export function parseByIdToKernel(output: string): Map<string, string> {
+  const map = new Map<string, string>()
+
+  for (const line of output.split('\n')) {
+    const match = line.match(SYMLINK_RE)
+    if (!match)
+      continue
+
+    const byIdName = match[1].replace(PARTITION_RE, '')
+    const kernelName = wholeDiskKernel(match[2].replace(RELATIVE_PREFIX_RE, ''))
+
+    // First (whole-disk) entry wins; partition entries for the same by-id
+    // resolve to the same kernel, so order is immaterial.
+    if (!map.has(byIdName))
+      map.set(byIdName, kernelName)
+  }
+
+  return map
+}
 
 /**
  * Parse the output of `ls -la /dev/disk/by-id/` into a kernel-name → by-id mapping.
