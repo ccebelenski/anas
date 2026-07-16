@@ -284,9 +284,9 @@ health_check() {
   local code="" i
   for i in $(seq 1 10); do
     # PVE certs -> HTTPS; try https first (self-signed -> -k), then http.
-    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://127.0.0.1:${HEALTH_PORT}/api/health" 2>/dev/null || echo 000)"
+    code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "https://127.0.0.1:${HEALTH_PORT}/api/health" 2>/dev/null || true)"
     if [ "${code}" = "000" ] || [ -z "${code}" ]; then
-      code="$(curl -s  -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${HEALTH_PORT}/api/health" 2>/dev/null || echo 000)"
+      code="$(curl -s  -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${HEALTH_PORT}/api/health" 2>/dev/null || true)"
     fi
     if [ -n "${code}" ] && [ "${code}" != "000" ]; then
       info "gateway responded on :${HEALTH_PORT} (HTTP ${code})"
@@ -338,11 +338,19 @@ phase1_install() {
   health_check
 
   # 5. PVE UI integration (injection + apt hook), then verify it landed.
+  # First keep a byte-perfect copy of the ONLY Proxmox-owned file we edit
+  # (index.html.tpl) — captured ONCE, as the pristine pre-ANAS original, before
+  # the surgical <script> insert. The uninstall reverts the line surgically, but
+  # this is the belt-and-suspenders original to restore by hand if ever needed.
+  local tpl="${PVE_TPL:-/usr/share/pve-manager/index.html.tpl}"
+  if [ -f "${tpl}" ] && ! grep -qF '/pve2/js/anas.js' "${tpl}" && [ ! -f "${tpl}.anas-orig" ]; then
+    cp -a "${tpl}" "${tpl}.anas-orig"
+    info "saved pristine template -> ${tpl}.anas-orig"
+  fi
   info "installing PVE UI integration"
   "${PREFIX}/packages/pve-integration/install.sh"
   UI_INSTALLED=1
   local js_dir="${PVE_JS_DIR:-/usr/share/pve-manager/js}"
-  local tpl="${PVE_TPL:-/usr/share/pve-manager/index.html.tpl}"
   [ -f "${js_dir}/anas.js" ] || { err "UI verify: ${js_dir}/anas.js missing"; return 1; }
   grep -qF '/pve2/js/anas.js' "${tpl}" || { err "UI verify: script line not present in ${tpl}"; return 1; }
   info "UI integration verified"
