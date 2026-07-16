@@ -109,6 +109,14 @@ test.describe('ANAS dashboard (stunt node)', () => {
       await expect(
         view.locator('.anas-dash-pools .anas-dash-vdev .anas-dash-disk .anas-gfx-timechart'),
       ).toHaveCount(0)
+
+      // Latency is shown as a now/peak/avg readout (instantaneous, plus peak and
+      // average over the rolling 5-minute window) at the pool, vdev and device
+      // levels — each carrying the .anas-dash-lat hook. Present once telemetry
+      // lands, which is guaranteed inside this vdev-present branch.
+      await expect(
+        view.locator('.anas-dash-pools .anas-dash-lat').first(),
+      ).toBeVisible({ timeout: 20_000 })
     }
   })
 
