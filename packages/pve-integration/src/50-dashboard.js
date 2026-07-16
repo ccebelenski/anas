@@ -142,12 +142,6 @@
         return (n / 1000000).toFixed(2) + ' ms';
     }
 
-    // Trim a long device id to a tail form; full id stays in the title tooltip.
-    function shortId(id) {
-        id = '' + (id || '');
-        return id.length > 16 ? '…' + id.substring(id.length - 15) : id;
-    }
-
     function heading(txt) {
         return '<div class="anas-dash-h">' + enc(txt) + '</div>';
     }
@@ -210,8 +204,11 @@
                 + '.anas-dash-disk{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;'
                 + 'background:linear-gradient(var(--anas-card-top,#fff),var(--anas-card-bot,#eef1f5));'
                 + 'border:1px solid var(--anas-card-edge,#cfd6df);min-width:150px;box-sizing:border-box}'
+                // Full device id, never truncated — the dash/underscore-heavy ids
+                // wrap (break-all) to a second line so the disambiguating tail is
+                // always visible without hover; the tile grows/wraps to fit.
                 + '.anas-dash-disk-id{font-size:11px;font-weight:650;color:var(--anas-ink,#232936);'
-                + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:118px}'
+                + 'word-break:break-all}'
                 + '.anas-dash-disk-sub{font-size:10px;color:var(--anas-muted,#6b7280)}'
                 + '.anas-dash-jobrow{display:flex;justify-content:space-between;gap:12px;font-size:12px;'
                 + 'padding:4px 0;border-bottom:1px solid var(--anas-line,#dfe3e8)}'
@@ -247,15 +244,33 @@
                 + '.anas-dash-vdev-faulted{border-left-color:var(--anas-danger,#c23b2c)}'
                 + '.anas-dash-vdev-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px}'
                 + '.anas-dash-vdev-name{font-weight:700;color:var(--anas-ink,#232936)}'
+                // Literal "VDEV" tag + human descriptor so the tier self-describes.
+                + '.anas-dash-vdev-tag{font-size:9px;font-weight:800;letter-spacing:.6px;'
+                + 'text-transform:uppercase;padding:1px 5px;border-radius:4px;'
+                + 'background:var(--anas-slot,#e6e9ee);color:var(--anas-muted,#6b7280);'
+                + 'border:1px solid var(--anas-card-edge,#cfd6df)}'
+                + '.anas-dash-vdev-desc{font-size:11px;color:var(--anas-muted,#6b7280)}'
                 + '.anas-dash-vdev-type{font-size:10px;text-transform:uppercase;letter-spacing:.5px;'
                 + 'color:var(--anas-muted,#6b7280)}'
                 + '.anas-dash-vdev-io{margin-left:auto;color:var(--anas-muted,#6b7280);'
                 + 'font-variant-numeric:tabular-nums}'
                 + '.anas-dash-devs{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}'
-                // Latency now/peak/avg readout (pool head, vdev line, device tiles).
+                // I/O + latency now/peak/avg readouts (pool head, vdev line, device tiles).
                 + '.anas-dash-lat{font-variant-numeric:tabular-nums}'
                 + '.anas-dash-vdev-lat{margin-top:4px;font-size:11px}'
-                + '.anas-dash-lat-hist{opacity:.85}';
+                + '.anas-dash-lat-hist{opacity:.85}'
+                // Aligned two-row (I/O, then latency) readout at pool/vdev level:
+                // a fixed-width label column keeps the ▼/▲ values vertically lined
+                // up so the eye can scan now/peak/avg down the rows.
+                + '.anas-dash-io-lat{margin-top:4px}'
+                + '.anas-dash-mrow{display:flex;gap:8px;align-items:baseline;'
+                + 'font-variant-numeric:tabular-nums}'
+                + '.anas-dash-mrow-l{flex:0 0 auto;min-width:54px;font-weight:650;'
+                + 'color:var(--anas-muted,#6b7280)}'
+                + '.anas-dash-mrow-v{flex:1 1 auto;min-width:0}'
+                // Warning card: category icon + bold ref lead so cards scan by target.
+                + '.anas-dash-warn-ico{flex:0 0 auto;margin-right:2px;opacity:.85}'
+                + '.anas-dash-warn-ref{font-weight:750}';
             var style = document.createElement('style');
             style.id = 'anas-dash-styles';
             style.type = 'text/css';
@@ -311,10 +326,16 @@
         return arr;
     }
 
-    // Peak (max) and average (mean) over the NON-null samples of a latency buffer.
-    // count === 0 (no I/O seen yet in the window) → peak/avg null, so the readout
-    // shows just the instantaneous value with no fake zeros.
-    function latStats(arr) {
+    // Peak (max) and average (mean) over the usable samples of a rolling buffer —
+    // serves BOTH the latency and the throughput readouts. Only null/undefined/NaN
+    // are skipped:
+    //   • LATENCY buffers (pushLat) store null for idle windows, so those are
+    //     skipped — avg is over windows that actually had I/O, no fake zeros.
+    //   • THROUGHPUT buffers (pushSpark) store a real 0 for idle windows, so those
+    //     zeros ARE counted — an idle-mostly pool shows a truthfully low average.
+    // count === 0 (nothing usable in the window yet) → peak/avg null, so a latency
+    // readout shows just the instantaneous value until real samples land.
+    function bufStats(arr) {
         var peak = null, sum = 0, count = 0;
         if (arr) {
             for (var i = 0; i < arr.length; i++) {
@@ -327,6 +348,41 @@
             }
         }
         return { peak: peak, avg: count > 0 ? sum / count : null, count: count };
+    }
+
+    // One aligned "<label> ▼ <read> ▲ <write> · peak ▼/▲ · avg ▼/▲" metric row,
+    // shared by the I/O (bps) and latency (fmtLat) readouts so the two rows line
+    // up. `fmt` formats each value; `sR`/`sW` are the read/write bufStats. peak/avg
+    // are appended only once `hasHist` (real history in the window); `extraCls`
+    // carries hooks (e.g. anas-dash-lat). A title tooltip spells out the window.
+    function metricRow(label, extraCls, fmt, nowR, nowW, sR, sW, hasHist, tip) {
+        var seg = '▼ ' + fmt(nowR) + ' ▲ ' + fmt(nowW);
+        if (hasHist) {
+            seg += ' · ' + t('peak') + ' ▼ ' + fmt(sR.peak) + ' ▲ ' + fmt(sW.peak)
+                + ' · ' + t('avg') + ' ▼ ' + fmt(sR.avg) + ' ▲ ' + fmt(sW.avg);
+        }
+        return '<div class="anas-dash-mrow' + (extraCls ? ' ' + extraCls : '') + '"'
+            + (tip ? ' title="' + enc(tip) + '"' : '') + '>'
+            + '<span class="anas-dash-mrow-l">' + enc(label) + '</span>'
+            + '<span class="anas-dash-mrow-v">' + enc(seg) + '</span></div>';
+    }
+
+    // The aligned two-row I/O + latency block for a pool head or a vdev line. The
+    // I/O read/write history is REUSED from the caller's throughput spark buffers
+    // (rBuf/wBuf — the SAME arrays that feed the time chart, already pushed this
+    // tick, so no duplicate buffers for series the chart already holds); peak/avg
+    // over them INCLUDE idle 0s. Latency pushes its own null-for-idle buffers here
+    // keyed by keyBase, and its peak/avg SKIP the idle windows. The latency row
+    // keeps the .anas-dash-lat hook; a shared tooltip explains the 5-minute window.
+    function ioLatRows(view, keyBase, rBuf, wBuf, nowRB, nowWB, latRNs, latWNs) {
+        var ioR = bufStats(rBuf), ioW = bufStats(wBuf);
+        var ioHist = rBuf.length > 1 || wBuf.length > 1;
+        var lr = bufStats(pushLat(view, keyBase + '.read', latRNs));
+        var lw = bufStats(pushLat(view, keyBase + '.write', latWNs));
+        var latHist = lr.count > 0 || lw.count > 0;
+        var tip = t('now · peak / average over the last 5 minutes');
+        return metricRow(t('I/O'), '', bps, nowRB, nowWB, ioR, ioW, ioHist, tip)
+            + metricRow(t('latency'), 'anas-dash-lat', fmtLat, latRNs, latWNs, lr, lw, latHist, tip);
     }
 
     // A read/write latency pair: "<label> ▼ <read> ▲ <write>" (▼ = read, ▲ =
@@ -346,10 +402,10 @@
     // the inline pool/vdev form. Every readout carries the .anas-dash-lat hook.
     function latReadout(view, keyBase, readNs, writeNs, opts) {
         opts = opts || {};
-        var rs = latStats(pushLat(view, keyBase + '.read', readNs));
-        var ws = latStats(pushLat(view, keyBase + '.write', writeNs));
+        var rs = bufStats(pushLat(view, keyBase + '.read', readNs));
+        var ws = bufStats(pushLat(view, keyBase + '.write', writeNs));
         var hasHist = rs.count > 0 || ws.count > 0;
-        var now = latPair(t('lat'), readNs, writeNs);
+        var now = latPair(t('latency'), readNs, writeNs);
         var peak = latPair(t('peak'), rs.peak, ws.peak);
         var avg = latPair(t('avg'), rs.avg, ws.avg);
         var tip = t('now · peak / average over the last 5 minutes');
@@ -408,6 +464,19 @@
 
     // ---- STATUS sections (loaded on show + manual Refresh) -----------------
 
+    // Font Awesome glyph (already shipped in PVE) for a warning's category, so a
+    // card can be scanned by kind at a glance. Unknown/absent category → no icon
+    // (fail-open — the card still renders).
+    function warnIcon(category) {
+        var map = {
+            pool: 'fa-database', capacity: 'fa-database', disk: 'fa-hdd-o',
+            scrub: 'fa-refresh', share: 'fa-share-alt'
+        };
+        var fa = map['' + (category || '')];
+        if (!fa) { return ''; }
+        return '<i class="fa ' + fa + ' anas-dash-warn-ico" aria-hidden="true"></i>';
+    }
+
     // 2.5 — warnings banners at the very top, critical before warning. Empty
     // string when there are none (the section then renders nothing).
     function renderWarnings(status) {
@@ -429,9 +498,13 @@
         for (var j = 0; j < ordered.length; j++) {
             var w = ordered[j] || {};
             var lvl = w.level === 'critical' ? 'bad' : 'warn';
-            var body = '';
-            if (w.category) {
-                body += '<b>' + enc('' + w.category) + '</b> — ';
+            // Lead with identity so cards scan by target, not prose: a small
+            // category icon, then the ref in bold, then the message. When the
+            // message repeats the ref (e.g. "Pool 'p1' is 94% full") we don't
+            // de-dup the text — the bold ref up front is what the eye scans.
+            var body = warnIcon(w.category);
+            if (w.ref) {
+                body += '<span class="anas-dash-warn-ref">' + enc('' + w.ref) + '</span> ';
             }
             body += enc(w.message || '');
             var callout = '';
@@ -677,14 +750,53 @@
         if (!barHtml) {
             barHtml = fallbackBar(frac, 'var(--anas-accent,#3468c0)');
         }
+
+        // Device-level I/O peak/avg: small rolling buffers (same _anasSpark rolling
+        // machinery the pool/vdev throughput uses — idle 0s count) keyed by disk
+        // id. peak/avg only once real history has landed (>1 sample).
+        var dr = pushSpark(view, 'disk.' + id + '.read', dev.readBytesPerSec);
+        var dw = pushSpark(view, 'disk.' + id + '.write', dev.writeBytesPerSec);
+        var dsR = bufStats(dr), dsW = bufStats(dw);
+        var ioHistLine = (dr.length > 1 || dw.length > 1)
+            ? '<div class="anas-dash-disk-sub anas-dash-lat-hist">'
+                + enc(t('peak') + ' ▼ ' + bps(dsR.peak) + ' ▲ ' + bps(dsW.peak)
+                    + ' · ' + t('avg') + ' ▼ ' + bps(dsR.avg) + ' ▲ ' + bps(dsW.avg))
+                + '</div>'
+            : '';
+
         return '<div class="anas-dash-disk">' + iconHtml
             + '<div style="min-width:0;flex:1 1 auto">'
-            + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(shortId(id)) + '</div>'
+            + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(id) + '</div>'
             + '<div class="anas-dash-disk-sub">'
             + enc('▼ ' + bps(dev.readBytesPerSec) + '  ▲ ' + bps(dev.writeBytesPerSec)) + '</div>'
+            + ioHistLine
             + latReadout(view, 'disk.' + id, dev.readLatencyNs, dev.writeLatencyNs, { compact: true })
             + '<div style="margin-top:5px">' + barHtml + '</div>'
             + '</div></div>';
+    }
+
+    // Human-readable vdev type label from the raw ZFS type token.
+    function vdevTypeLabel(type) {
+        var ty = ('' + (type || '')).toLowerCase();
+        if (ty === 'mirror') { return t('Mirror'); }
+        if (ty === 'raidz' || ty === 'raidz1') { return 'RAIDZ1'; }
+        if (ty === 'raidz2') { return 'RAIDZ2'; }
+        if (ty === 'raidz3') { return 'RAIDZ3'; }
+        if (ty.indexOf('draid') === 0) { return 'dRAID' + ty.substring(5); }
+        if (ty === 'disk' || ty === 'file') { return t('Single disk'); }
+        return type ? ('' + type) : t('vdev');
+    }
+
+    // Human role callout for a NON-data vdev role; '' for data / unknown so the
+    // common case adds no noise.
+    function vdevRoleLabel(role) {
+        var r = ('' + (role || '')).toLowerCase();
+        if (r === 'log') { return t('Log (SLOG)'); }
+        if (r === 'cache') { return t('Cache (L2ARC)'); }
+        if (r === 'special') { return t('Special'); }
+        if (r === 'dedup') { return t('Dedup'); }
+        if (r === 'spare') { return t('Spare'); }
+        return '';
     }
 
     // A vdev group: name + type + its state pill + aggregated IOPS/latency line,
@@ -713,25 +825,46 @@
         if (!pill && vdev.state) {
             pill = '<span class="anas-dash-muted">' + enc('' + vdev.state) + '</span>';
         }
-        var name = vdev.name || vdev.type || t('vdev');
-        var typeTag = vdev.type
-            ? '<span class="anas-dash-vdev-type">' + enc(vdev.type) + '</span>' : '';
+        // Self-describing identity: a literal "VDEV" tag, the vdev name (omitted
+        // for a single-disk vdev, whose raw name IS the disk id the device card
+        // below already shows), then a human descriptor — role callout (non-data
+        // only) · type label · device count — beside the state pill. So a bare
+        // single disk reads "VDEV — Single disk · ONLINE", not a naked disk id.
+        var keyName = vdev.name || vdev.type || t('vdev');
+        var ty = ('' + (vdev.type || '')).toLowerCase();
+        var isSingle = ty === 'disk' || ty === 'file';
+        var nDev = (vdev.disks || []).length;
+        var descParts = [];
+        var roleL = vdevRoleLabel(vdev.role);
+        if (roleL) { descParts.push(roleL); }
+        descParts.push(vdevTypeLabel(vdev.type));
+        if (!isSingle) {
+            descParts.push(nDev + ' ' + (nDev === 1 ? t('device') : t('devices')));
+        }
+        var nameHtml = (!isSingle && vdev.name)
+            ? '<span class="anas-dash-vdev-name">' + enc('' + vdev.name) + '</span>' : '';
+        var identHtml = '<span class="anas-dash-vdev-tag">' + enc(t('VDEV')) + '</span>'
+            + nameHtml
+            + '<span class="anas-dash-vdev-desc">' + enc('— ' + descParts.join(' · ')) + '</span>';
         var io = '<span class="anas-dash-vdev-io">'
-            + enc('▼ ' + bps(vdev.readBytesPerSec) + '  ▲ ' + bps(vdev.writeBytesPerSec)
-                + '  ·  ' + iops(vdev.readIops) + '/' + iops(vdev.writeIops) + ' IOPS') + '</span>';
+            + enc(iops(vdev.readIops) + '/' + iops(vdev.writeIops) + ' IOPS') + '</span>';
 
-        // Latency now/peak/avg for the whole vdev, on its own muted line under the
-        // head (the head is already IOPS-dense; keeping latency on its own line
-        // lets peak/avg for both directions sit inline without crowding).
-        var latHtml = '<div class="anas-dash-vdev-lat anas-dash-muted">'
-            + latReadout(view, 'vdev.' + poolName + '.' + name,
-                vdev.readLatencyNs, vdev.writeLatencyNs, {}) + '</div>';
+        // Push the throughput spark buffers first, then reuse those SAME arrays for
+        // the I/O peak/avg readout and the time chart (no duplicate buffers).
+        var vKey = 'vdev.' + poolName + '.' + keyName;
+        var vr = pushSpark(view, vKey + '.read', vdev.readBytesPerSec);
+        var vw = pushSpark(view, vKey + '.write', vdev.writeBytesPerSec);
+
+        // Aligned I/O + latency now/peak/avg for the whole vdev, on its own line
+        // under the head (the head carries identity + IOPS; the two-row block keeps
+        // bytes-throughput and latency peak/avg legible without crowding the head).
+        var ioLatHtml = '<div class="anas-dash-vdev-lat anas-dash-muted anas-dash-io-lat">'
+            + ioLatRows(view, vKey, vr, vw,
+                vdev.readBytesPerSec, vdev.writeBytesPerSec,
+                vdev.readLatencyNs, vdev.writeLatencyNs) + '</div>';
 
         // Per-vdev bicolor read/write time chart (compact — visual hierarchy under
         // the pool chart — but still fully labelled with axes + legend).
-        var vKey = 'vdev.' + poolName + '.' + name;
-        var vr = pushSpark(view, vKey + '.read', vdev.readBytesPerSec);
-        var vw = pushSpark(view, vKey + '.write', vdev.writeBytesPerSec);
         var chart = timeChartHtml(
             [
                 { label: t('Read'), color: READ_COLOR, values: vr },
@@ -752,9 +885,8 @@
         }
         return '<div class="anas-dash-vdev' + (lvl ? ' anas-dash-vdev-' + lvl : '') + '">'
             + '<div class="anas-dash-vdev-head">'
-            + '<span class="anas-dash-vdev-name">' + enc(name) + '</span>'
-            + typeTag + pill + io + '</div>'
-            + latHtml
+            + identHtml + pill + io + '</div>'
+            + ioLatHtml
             + '<div class="anas-dash-vdev-chart">' + chart + '</div>'
             + (devHtml ? '<div class="anas-dash-devs">' + devHtml + '</div>' : '')
             + '</div>';
@@ -812,12 +944,18 @@
         var summaryHtml = '';
         var chartHtml = '';
         if (tp) {
-            summaryHtml = '<div class="anas-dash-muted" style="margin-top:4px">'
-                + enc(iops(tp.readIops) + ' r · ' + iops(tp.writeIops) + ' w IOPS   ·   ')
-                + latReadout(view, 'pool.' + name, tp.readLatencyNs, tp.writeLatencyNs, {})
-                + '</div>';
+            // Push the throughput spark buffers FIRST, then reuse the very same
+            // arrays for both the I/O peak/avg readout and the time chart below
+            // (no duplicate buffers for a series the chart already holds).
             var pr = pushSpark(view, 'pool.' + name + '.read', tp.readBytesPerSec);
             var pw = pushSpark(view, 'pool.' + name + '.write', tp.writeBytesPerSec);
+            summaryHtml = '<div class="anas-dash-muted" style="margin-top:4px">'
+                + enc(iops(tp.readIops) + ' r · ' + iops(tp.writeIops) + ' w IOPS') + '</div>'
+                + '<div class="anas-dash-muted anas-dash-io-lat">'
+                + ioLatRows(view, 'pool.' + name, pr, pw,
+                    tp.readBytesPerSec, tp.writeBytesPerSec,
+                    tp.readLatencyNs, tp.writeLatencyNs)
+                + '</div>';
             chartHtml = '<div class="anas-dash-pool-io">' + timeChartHtml(
                 [
                     { label: t('Read'), color: READ_COLOR, values: pr },
