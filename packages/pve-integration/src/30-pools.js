@@ -672,31 +672,30 @@
             }
         }
         // Trim is capability-gated (story 4.12): disabled unless a member device
-        // supports discard. Composed with the story 3.25 PVE hands-off gate — a
-        // PVE-managed pool stays disabled regardless. Absent trimSupported (old
-        // daemon ⇒ capFlag null) does NOT gate, preserving today's behavior.
+        // supports discard. Deliberately NOT composed with the PVE hands-off
+        // gate — the 3.25 decision keeps maintenance ops (Scrub/Trim/Upgrade/
+        // Detail) available on PVE-managed pools; only structural mutations are
+        // hands-off. Absent trimSupported (old daemon ⇒ capFlag null) does NOT
+        // gate, preserving today's behavior.
         if (trimBtn) {
             var trimCap = capFlag(rec, 'trimSupported');
             var noTrim = has && trimCap === false;
-            trimBtn.setDisabled(!has || noTrim || pveManaged);
-            if (pveManaged) {
-                setPveTooltip(trimBtn, true);
-            } else if (noTrim) {
+            trimBtn.setDisabled(!has || noTrim);
+            if (noTrim) {
                 btnSetTip(trimBtn, ANAS.t('No devices in this pool support TRIM'));
             } else {
                 btnSetTip(trimBtn, '');
             }
         }
         // Upgrade is availability-gated (story 4.12): disabled unless the pool
-        // has supported-but-disabled features. Same PVE hands-off composition.
-        // Absent upgradeAvailable (old daemon ⇒ null) does NOT gate.
+        // has supported-but-disabled features. Like Trim, stays available on
+        // PVE-managed pools (3.25 maintenance carve-out). Absent
+        // upgradeAvailable (old daemon ⇒ null) does NOT gate.
         if (upgradeBtn) {
             var upgCap = capFlag(rec, 'upgradeAvailable');
             var noUpg = has && upgCap === false;
-            upgradeBtn.setDisabled(!has || noUpg || pveManaged);
-            if (pveManaged) {
-                setPveTooltip(upgradeBtn, true);
-            } else if (noUpg) {
+            upgradeBtn.setDisabled(!has || noUpg);
+            if (noUpg) {
                 btnSetTip(upgradeBtn, ANAS.t('All supported features are already enabled'));
             } else {
                 btnSetTip(upgradeBtn, '');
