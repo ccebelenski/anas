@@ -1,6 +1,6 @@
 import type { Locator, Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
-import { loginToPve, openAnasItem } from './fixtures/pve-ui'
+import { GATEWAY_URL, loginToPve, NODE_NAME, openAnasItem } from './fixtures/pve-ui'
 import {
   createSnapshot,
   datasetExists,
@@ -75,6 +75,25 @@ async function pickCombo(page: Page, field: Locator, label: string): Promise<voi
     .click()
 }
 
+/**
+ * Set a target-pool combo that may be a strict pick-list (pools were listed) OR
+ * a free-text field (the location's pools could not be listed). Try to click the
+ * matching boundlist item; if it isn't offered, type the value into the input.
+ */
+async function setPool(page: Page, field: Locator, value: string): Promise<void> {
+  await field.click()
+  const item = page
+    .locator('.x-boundlist:visible .x-boundlist-item', { hasText: new RegExp(`^${value}$`) })
+    .first()
+  if (await item.count().then(n => n > 0).catch(() => false)) {
+    await item.click().catch(async () => {
+      await field.locator('input').fill(value)
+    })
+    return
+  }
+  await field.locator('input').fill(value)
+}
+
 test.describe('ANAS replication view — grid, toolbar, once dialog (stunt node)', () => {
   test.setTimeout(120_000)
 
@@ -115,7 +134,8 @@ test.describe('ANAS replication view — grid, toolbar, once dialog (stunt node)
       // Cancel — no mutation.
       await win.getByText('Cancel', { exact: true }).click()
       await expect(win).toBeHidden({ timeout: 20_000 })
-    } finally {
+    }
+    finally {
       await destroySnapshot(DS_FQ, 'onceui1')
     }
   })
@@ -253,5 +273,218 @@ test.describe('ANAS replication task CRUD (stunt node)', () => {
 
     // ---- The row is gone --------------------------------------------------
     await expect(grid.locator('.x-grid-row', { hasText: TASK })).toHaveCount(0, { timeout: 30_000 })
+  })
+})
+
+/**
+ * Stage 3 (story 5.5.2) — the Remotes manager and the self-remote end-to-end.
+ *
+ * Additional UI hooks (task brief):
+ *   - Toolbar: '.anas-btn-repl-remotes'.
+ *   - Manager window: '.anas-win-repl-remotes' (grid '.anas-grid-repl-remotes',
+ *     public key '.anas-repl-pubkey-text', add '.anas-btn-remote-add').
+ *   - Add/edit wizard: '.anas-win-repl-remote-edit' (fields '.anas-fld-remote-name',
+ *     '.anas-fld-remote-host', '.anas-fld-remote-port', '.anas-fld-remote-user';
+ *     '.anas-btn-remote-testconn' drives the staged test into '.anas-remote-test',
+ *     '.anas-btn-remote-trust' confirms an unknown host key, '.anas-btn-remote-save').
+ *   - Location picker (both dialogs): '.anas-fld-repl-location'.
+ */
+
+const REMOTE = 'selfbox'
+const PUBKEY_MARKER = 'anas-replication'
+
+/**
+ * Fetch the daemon's cluster public key over the gateway (shares the page's
+ * PVE cookie jar). Returns '' on any failure so callers can skip gracefully.
+ */
+async function fetchPublicKey(page: Page): Promise<string> {
+  try {
+    const res = await page.request.get(
+      `${GATEWAY_URL}/api/nodes/${NODE_NAME}/v1/replication/remotes`,
+    )
+    if (!res.ok())
+      return ''
+    const body = await res.json()
+    return (body?.data?.publicKey as string) ?? ''
+  }
+  catch {
+    return ''
+  }
+}
+
+/**
+ * Best-effort: drop the 'selfbox' entry from the corosync registry so reruns
+ * start clean. Fail-open (the file/daemon may be absent). Bumps the version so
+ * the daemon's next GET reflects the removal.
+ */
+async function scrubRemote(): Promise<void> {
+  const py
+    = 'import json\n'
+      + 'p="/etc/pve/anas/remotes.json"\n'
+      + 'try:\n'
+      + ' d=json.load(open(p))\n'
+      + ' d["remotes"]=[r for r in d.get("remotes",[]) if r.get("name")!="selfbox"]\n'
+      + ' d["version"]=int(d.get("version",0))+1\n'
+      + ' json.dump(d,open(p,"w"))\n'
+      + 'except Exception:\n pass\n'
+  await sshExec(`python3 - <<'PY' 2>/dev/null || true\n${py}PY`).catch(() => {})
+}
+
+/**
+ * Append the cluster public key to root's authorized_keys (base64 to dodge
+ * shell quoting), so the daemon can auth to localhost as itself.
+ */
+async function authorizeKey(pubKey: string): Promise<void> {
+  const b64 = Buffer.from(`${pubKey.trim()}\n`).toString('base64')
+  await sshExec(
+    'mkdir -p /root/.ssh && chmod 700 /root/.ssh && '
+    + `echo ${b64} | base64 -d >> /root/.ssh/authorized_keys && `
+    + 'chmod 600 /root/.ssh/authorized_keys',
+  )
+}
+
+/** Remove any authorized_keys line carrying the anas-replication comment. */
+async function deauthorizeKey(): Promise<void> {
+  await sshExec(`sed -i '/${PUBKEY_MARKER}/d' /root/.ssh/authorized_keys 2>/dev/null || true`)
+    .catch(() => {})
+}
+
+test.describe('ANAS replication Remotes manager (stunt node)', () => {
+  test.setTimeout(120_000)
+
+  test('the Remotes manager opens and shows the cluster public key', async ({ page }) => {
+    await openReplication(page)
+    await page.locator('.anas-btn-repl-remotes').click()
+
+    const win = page.locator('.anas-win-repl-remotes')
+    await expect(win).toBeVisible({ timeout: 20_000 })
+
+    // The public-key panel shows a real key (the daemon generates one on first
+    // GET /replication/remotes). ExtJS renders the field as a <textarea>.
+    const keyField = win.locator('.anas-repl-pubkey-text textarea')
+    await expect(keyField).toBeVisible({ timeout: 20_000 })
+    await expect
+      .poll(async () => (await keyField.inputValue()).trim(), { timeout: 20_000 })
+      .toMatch(/ssh-|AAAA/)
+
+    await win.getByText('Close', { exact: true }).click()
+    await expect(win).toBeHidden({ timeout: 20_000 })
+  })
+})
+
+/**
+ * The self-remote E2E: authorize the daemon's own key on the box, register
+ * 'selfbox' (host localhost) through the wizard driving the staged test to 'ok'
+ * (confirming the unknown host key), then Replicate Once to 'remote: selfbox'
+ * targeting testpool/replremote and poll the real system for the dataset. The
+ * remote is localhost so datasetExists (a local zfs list) sees the result.
+ *
+ * Cleanup is fail-open: delete the remote via the UI, then afterEach releases
+ * holds, destroys the throwaway target + snapshots, drops the authorized_keys
+ * line, and scrubs the registry entry so reruns are clean.
+ */
+test.describe('ANAS self-remote replication E2E (stunt node)', () => {
+  test.setTimeout(240_000)
+
+  const SNAP = 'selfremotesnap'
+  const TARGET_DS = 'replremote'
+  const TARGET_FQ = `${POOL}/${TARGET_DS}`
+
+  test.beforeEach(async () => {
+    await scrubRemote()
+    await deauthorizeKey()
+    await releaseHolds(TARGET_FQ)
+    await releaseHolds(DS_FQ)
+    await destroyDataset(TARGET_FQ)
+    for (const name of await listSnapshots(DS_FQ))
+      await destroySnapshot(DS_FQ, name)
+    await createSnapshot(DS_FQ, SNAP)
+  })
+
+  test.afterEach(async () => {
+    await releaseHolds(TARGET_FQ).catch(() => {})
+    await releaseHolds(DS_FQ).catch(() => {})
+    await destroyDataset(TARGET_FQ).catch(() => {})
+    await destroySnapshot(DS_FQ, SNAP).catch(() => {})
+    await deauthorizeKey()
+    await scrubRemote()
+  })
+
+  test('register selfbox via the wizard, then Replicate Once to it', async ({ page }) => {
+    await openReplication(page)
+
+    // Authorize the daemon's own public key so ssh root@localhost works.
+    const pubKey = await fetchPublicKey(page)
+    test.skip(!pubKey, 'daemon returned no public key — stage-3 daemon not present')
+    await authorizeKey(pubKey)
+
+    // ---- Register the remote through the wizard --------------------------
+    await page.locator('.anas-btn-repl-remotes').click()
+    const mgr = page.locator('.anas-win-repl-remotes')
+    await expect(mgr).toBeVisible({ timeout: 20_000 })
+
+    await mgr.locator('.anas-btn-remote-add').click()
+    const wiz = page.locator('.anas-win-repl-remote-edit')
+    await expect(wiz).toBeVisible({ timeout: 20_000 })
+
+    await wiz.locator('.anas-fld-remote-name input').fill(REMOTE)
+    await wiz.locator('.anas-fld-remote-host input').fill('localhost')
+
+    // Drive the staged test to OK, confirming the unknown host key if prompted.
+    await wiz.locator('.anas-btn-remote-testconn').click()
+    const testArea = wiz.locator('.anas-remote-test')
+    await expect(async () => {
+      const trust = wiz.locator('.anas-btn-remote-trust')
+      if (await trust.count())
+        await trust.click()
+      await expect(testArea).toContainText(/ok|zfs/i, { timeout: 5_000 })
+    }).toPass({ timeout: 90_000 })
+
+    // Save → the row appears in the manager grid.
+    await wiz.locator('.anas-btn-remote-save').click()
+    await expect(wiz).toBeHidden({ timeout: 30_000 })
+    await expect(mgr.locator('.anas-grid-repl-remotes .x-grid-row', { hasText: REMOTE }))
+      .toBeVisible({ timeout: 30_000 })
+
+    await mgr.getByText('Close', { exact: true }).click()
+    await expect(mgr).toBeHidden({ timeout: 20_000 })
+
+    // ---- Replicate Once to the remote ------------------------------------
+    await page.locator('.anas-btn-repl-once').click()
+    const once = page.locator('.anas-win-replicate')
+    await expect(once).toBeVisible({ timeout: 20_000 })
+
+    await pickCombo(page, once.locator('.anas-fld-repl-src-pool'), POOL)
+    await pickCombo(page, once.locator('.anas-fld-repl-src-dataset'), 'share1')
+
+    // Point the target at the registered remote; the target-pool combo then
+    // repopulates from the remote's pools (or free-texts if it can't list).
+    await pickCombo(page, once.locator('.anas-fld-repl-location'), `remote: ${REMOTE}`)
+    await setPool(page, once.locator('.anas-fld-repl-pool'), POOL)
+    await once.locator('.anas-fld-repl-dataset input').fill(TARGET_DS)
+
+    const plan = once.locator('.anas-repl-plan')
+    await expect(plan).toHaveText(/Incremental|FULL send|plan unavailable/, { timeout: 40_000 })
+
+    const submit = once.locator('.anas-btn-replicate-submit')
+    await expect(submit).toBeEnabled({ timeout: 20_000 })
+    await submit.click()
+
+    // The daemon send|ssh|recv job materialises the dataset on the (local) box.
+    await expect.poll(async () => datasetExists(TARGET_FQ), { timeout: 120_000, intervals: [3_000] })
+      .toBe(true)
+
+    // ---- Delete the remote via the UI (registry cleanup) -----------------
+    await page.locator('.anas-btn-repl-remotes').click()
+    await expect(mgr).toBeVisible({ timeout: 20_000 })
+    await mgr.locator('.anas-grid-repl-remotes .x-grid-row', { hasText: REMOTE }).first().click()
+    const del = mgr.locator('.anas-btn-remote-delete')
+    await expect(del).toBeEnabled({ timeout: 20_000 })
+    await del.click()
+    const confirm = page.locator('.x-message-box:visible')
+    await expect(confirm).toBeVisible({ timeout: 20_000 })
+    await page.getByRole('button', { name: 'Yes' }).click()
+    await expect(mgr.locator('.anas-grid-repl-remotes .x-grid-row', { hasText: REMOTE }))
+      .toHaveCount(0, { timeout: 30_000 })
   })
 })

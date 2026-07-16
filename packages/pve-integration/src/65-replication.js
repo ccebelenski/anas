@@ -1,5 +1,34 @@
 /*
- * ANAS — Replication view (Epic 5.5: story 5.5.3, stage 2).
+ * ANAS — Replication view (Epic 5.5: story 5.5.3 stage 2 + 5.5.2 stage 3).
+ *
+ * Stage 3 (story 5.5.2) adds off-box replication: a cluster-wide Remotes
+ * registry (the corosync store at /etc/pve/anas/remotes.json) managed here, and
+ * a Target-location picker in the task + Replicate-Once dialogs so a replication
+ * target can be This node, a cluster peer, or a registered external remote.
+ *
+ *   Remotes registry (paths relative to /v1):
+ *     GET    /replication/remotes            → { data:{ version, remotes:[
+ *              {name,host,port,user,hostKeyFingerprint?} ], publicKey } }
+ *     POST   /replication/remotes            body { remote, expectedVersion }  (CAS, 202 job)
+ *     PUT    /replication/remotes/:name      body { remote, expectedVersion }  (CAS, 202 job)
+ *     DELETE /replication/remotes/:name?expectedVersion=N                      (CAS, 202 job)
+ *       A 409 CONFLICT on any write = the registry moved under us: reload +
+ *       toast + re-prompt, NEVER blind-retry.
+ *     POST   /replication/remotes/test       body {host,port?,user?}   (pre-registration)
+ *     POST   /replication/remotes/:name/test  ?pin=true optional
+ *       → { data:{ stage:'unreachable'|'hostkey-unknown'|'auth-failed'|'no-zfs'|'ok',
+ *                  zfsVersion?, fingerprint?, detail? } }
+ *   Target locations:
+ *     GET    /replication/locations          → { data:{ peers:string[], remotes:string[] } }
+ *     GET    /replication/peers/:name/pools   → { data:string[] }
+ *     GET    /replication/remotes/:name/pools → { data:string[] }
+ *   Task / once bodies carry target.location = { kind:'local'|'peer'|'remote', name? }
+ *   (omitted for local); plan/run endpoints are otherwise unchanged.
+ *
+ * Stage-3 test hooks: toolbar 'anas-btn-repl-remotes'; manager window
+ * 'anas-win-repl-remotes'; add/edit wizard 'anas-win-repl-remote-edit' with
+ * staged-test result area 'anas-remote-test'; location combo (both dialogs)
+ * 'anas-fld-repl-location'.
  *
  * A dedicated top-level "Replication" menu item (sibling of Pools / Datasets /
  * Shares). Replication is an ongoing, scheduled process with configuration and
@@ -177,10 +206,21 @@
     }
 
     // Source → Target: "pool/ds → pool/ds" (pool root shows the bare pool name).
+    // A non-local target is prefixed with a location tag: "→ remote: nas pool/ds".
     function renderRoute(v, meta, rec) {
         var src = enc(routeSide(rec.get('sourcePool'), rec.get('sourceDataset')));
         var tgt = enc(routeSide(rec.get('targetPool'), rec.get('targetDataset')));
-        return src + ' <span style="color:var(--anas-muted,gray);">&rarr;</span> ' + tgt;
+        var kind = rec.get('targetLocationKind');
+        var lname = rec.get('targetLocationName');
+        var locTag = '';
+        if ((kind === 'peer' || kind === 'remote') && lname) {
+            locTag = '<span class="anas-repl-loc-tag" title="' + enc(kind + ': ' + lname) + '"'
+                + ' style="display:inline-block;padding:0 6px;margin-right:5px;border-radius:8px;'
+                + 'font-size:0.8em;color:var(--anas-accent,#3468c0);'
+                + 'background:color-mix(in srgb,var(--anas-accent,#3468c0) 14%,transparent);">'
+                + enc(kind + ': ' + lname) + '</span>';
+        }
+        return src + ' <span style="color:var(--anas-muted,gray);">&rarr;</span> ' + locTag + tgt;
     }
 
     // Schedule: the raw OnCalendar expression, with the full value as a tooltip
@@ -321,12 +361,15 @@
         var task = entry.task || {};
         var src = task.source || {};
         var tgt = task.target || {};
+        var loc = tgt.location || {};
         return {
             name: task.name,
             sourcePool: src.pool,
             sourceDataset: src.dataset,
             targetPool: tgt.pool,
             targetDataset: tgt.dataset,
+            targetLocationKind: loc.kind || 'local',
+            targetLocationName: loc.name || '',
             schedule: task.schedule,
             snapshotFirst: !!task.snapshotFirst,
             enabled: task.enabled !== false,
@@ -449,6 +492,929 @@
     }
 
     // ======================================================================
+    //  Stage-3 shared helpers — target locations + CAS registry writes
+    // ======================================================================
+
+    // A location value is a stable key: 'local' | 'peer:<name>' | 'remote:<name>'.
+    function locKey(kind, name) {
+        return (kind === 'peer' || kind === 'remote') && name ? (kind + ':' + name) : 'local';
+    }
+
+    // GET /replication/locations → { peers, remotes }. Never rejects (fail-open:
+    // a locations failure just leaves 'This node' as the only option).
+    function loadLocations(node) {
+        return ANAS.api.get(node, '/replication/locations').then(function (res) {
+            var d = (res && res.data) || {};
+            return { peers: d.peers || [], remotes: d.remotes || [] };
+        }, function (err) {
+            ANAS.warn('replication locations load failed: ' + ANAS.errText(err));
+            return { peers: [], remotes: [] };
+        });
+    }
+
+    // Build the location combo's store rows: This node first, then peers, then
+    // registered remotes.
+    function locationRows(locs) {
+        var rows = [{ value: 'local', label: t('This node'), kind: 'local', name: '' }];
+        var i;
+        var peers = (locs && locs.peers) || [];
+        for (i = 0; i < peers.length; i++) {
+            rows.push({ value: locKey('peer', peers[i]), label: 'peer: ' + peers[i], kind: 'peer', name: peers[i] });
+        }
+        var remotes = (locs && locs.remotes) || [];
+        for (i = 0; i < remotes.length; i++) {
+            rows.push({ value: locKey('remote', remotes[i]), label: 'remote: ' + remotes[i], kind: 'remote', name: remotes[i] });
+        }
+        return rows;
+    }
+
+    // Resolve the location currently selected in a dialog to { kind, name }.
+    function selectedLocation(win) {
+        try {
+            var combo = win.down('#targetLocation');
+            if (!combo) {
+                return { kind: 'local', name: '' };
+            }
+            var rec = combo.getStore().findRecord('value', combo.getValue(), 0, false, false, true);
+            if (rec) {
+                return { kind: rec.get('kind'), name: rec.get('name') };
+            }
+        } catch (e) {
+            // fall through to local
+        }
+        return { kind: 'local', name: '' };
+    }
+
+    // Resolve the target-pool candidates for a location. Local → ANAS pools;
+    // peer/remote → that location's pools endpoint. Never rejects; on an error
+    // or empty list the caller falls back to free-text entry.
+    //   → { names:[...], freeText:bool }
+    function loadLocationPools(node, loc) {
+        if (!loc || loc.kind === 'local' || !loc.name) {
+            return loadAnasPools(node).then(function (names) {
+                return { names: names, freeText: false };
+            });
+        }
+        var seg = loc.kind === 'peer' ? 'peers' : 'remotes';
+        var path = '/replication/' + seg + '/' + encodeURIComponent(loc.name) + '/pools';
+        return ANAS.api.get(node, path).then(function (res) {
+            var names = (res && res.data) || [];
+            return { names: names, freeText: !names.length };
+        }, function (err) {
+            ANAS.warn('replication location pools failed for ' + loc.name + ': ' + ANAS.errText(err));
+            return { names: [], freeText: true };
+        });
+    }
+
+    var LOC_HINT = t('could not list pools — enter the pool name');
+
+    // setEmptyText is version-dependent on ExtJS combos; guard it so a missing
+    // method can never abort the surrounding repopulation logic.
+    function setEmpty(combo, txt) {
+        try {
+            if (typeof combo.setEmptyText === 'function') {
+                combo.setEmptyText(txt);
+            } else {
+                combo.emptyText = txt;
+            }
+        } catch (e) {
+            // non-fatal — the placeholder is cosmetic
+        }
+    }
+
+    // Repopulate a dialog's '#targetPool' combo from the chosen location. A
+    // known pool set stays a strict pick-list; an empty/failed list flips the
+    // combo to free-text with a hint. Honours win._pendingTargetPool (an edit's
+    // saved pool) as the preselection, once.
+    function applyLocationToPoolCombo(win, node, loc) {
+        var combo = win.down('#targetPool');
+        if (!combo) {
+            return;
+        }
+        var preselect = win._pendingTargetPool;
+        win._pendingTargetPool = undefined;
+        try {
+            combo.setValue('');
+        } catch (ePre) {
+            // non-fatal
+        }
+        setEmpty(combo, t('(loading pools…)'));
+        loadLocationPools(node, loc).then(function (r) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            try {
+                var store = combo.getStore();
+                var data = [];
+                for (var i = 0; i < r.names.length; i++) {
+                    data.push({ name: r.names[i] });
+                }
+                store.loadData(data);
+                if (r.freeText) {
+                    // Editable free-text: the operator names a pool we can't list.
+                    combo.forceSelection = false;
+                    combo.setEditable(true);
+                    setEmpty(combo, LOC_HINT);
+                    if (preselect) {
+                        combo.setValue(preselect);
+                    }
+                } else {
+                    combo.forceSelection = true;
+                    combo.setEditable(false);
+                    setEmpty(combo, '');
+                    var want = (preselect && r.names.indexOf(preselect) >= 0) ? preselect : (r.names[0] || '');
+                    combo.setValue(want);
+                }
+            } catch (e) {
+                ANAS.warn('replication pool combo repopulate failed: ' + ANAS.errText(e));
+            }
+        });
+    }
+
+    // Wire a location combo (already added to the form as '#targetLocation') and
+    // load its rows. `onAfterApply` (optional) fires after each repopulation so
+    // the once dialog can re-plan. On edit, pass preLoc/prePool to preselect.
+    function wireLocationPicker(win, node, opts) {
+        opts = opts || {};
+        var combo = win.down('#targetLocation');
+        if (!combo) {
+            return;
+        }
+        var apply = function () {
+            applyLocationToPoolCombo(win, node, selectedLocation(win));
+            if (opts.onAfterApply) {
+                opts.onAfterApply();
+            }
+        };
+        try {
+            combo.on('change', apply);
+        } catch (eWire) {
+            ANAS.warn('replication location wiring failed: ' + ANAS.errText(eWire));
+        }
+        loadLocations(node).then(function (locs) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            try {
+                combo.getStore().loadData(locationRows(locs));
+                var preKey = opts.preLoc && opts.preLoc.kind && opts.preLoc.kind !== 'local'
+                    ? locKey(opts.preLoc.kind, opts.preLoc.name) : 'local';
+                if (preKey !== 'local') {
+                    // Preselect the saved remote/peer and its pool (edit path).
+                    win._pendingTargetPool = opts.prePool;
+                    combo.setValue(preKey); // fires change → applyLocationToPoolCombo
+                } else {
+                    combo.setValue('local');
+                    // Local default: leave the pre-seeded ANAS pool list intact
+                    // (the change handler above only re-applies on user action).
+                }
+            } catch (e) {
+                ANAS.warn('replication location load failed: ' + ANAS.errText(e));
+            }
+        });
+    }
+
+    // A location combo field config, shared by both dialogs.
+    function locationComboCfg() {
+        return {
+            xtype: 'combobox',
+            itemId: 'targetLocation',
+            cls: 'anas-fld-repl-location',
+            fieldLabel: t('Target location'),
+            store: Ext.create('Ext.data.Store', { fields: ['value', 'label', 'kind', 'name'],
+                data: [{ value: 'local', label: t('This node'), kind: 'local', name: '' }] }),
+            valueField: 'value',
+            displayField: 'label',
+            queryMode: 'local',
+            editable: false,
+            forceSelection: true,
+            value: 'local',
+        };
+    }
+
+    // A CAS-aware mutation: POST/PUT/DELETE that returns a 202 job. Success polls
+    // the job; a 409 is a registry-moved conflict routed to onConflict (never a
+    // blind retry); other failures alert. Distinct from ANAS.runJob because the
+    // registry's 409 is a stale-version conflict, not a confirm-code challenge.
+    function casWrite(o) {
+        var call;
+        if (o.method === 'put') {
+            call = ANAS.api.put(o.node, o.path, o.body);
+        } else if (o.method === 'del') {
+            call = ANAS.api.del(o.node, o.path);
+        } else {
+            call = ANAS.api.post(o.node, o.path, o.body);
+        }
+        call.then(function (res) {
+            var job = res && res.job;
+            if (!job || !job.id) {
+                if (o.successMsg) { ANAS.toast(o.successMsg); }
+                if (o.onComplete) { o.onComplete(); }
+                return;
+            }
+            ANAS.pollJob(o.node, job.id, {
+                view: o.view,
+                successMsg: o.successMsg,
+                failTitle: o.failTitle,
+                onComplete: function () { if (o.onComplete) { o.onComplete(); } },
+                onFailed: o.onFailed,
+            });
+        }, function (err) {
+            if (err && err.status === 409) {
+                if (o.onConflict) { o.onConflict(err); }
+                return;
+            }
+            if (o.onError) {
+                o.onError(err);
+                return;
+            }
+            alertMsg(o.failTitle || 'Operation failed', ANAS.errText(err));
+        });
+    }
+
+    // ======================================================================
+    //  Remotes manager — 'anas-win-repl-remotes' (Build A)
+    // ======================================================================
+
+    function fpShort(fp) {
+        var s = '' + (fp == null ? '' : fp);
+        if (!s) {
+            return '';
+        }
+        // Keep the algo prefix + a leading chunk of the digest, then ellipsize.
+        return s.length > 26 ? (s.substring(0, 26) + '…') : s;
+    }
+
+    function endpointLabel(rec) {
+        var user = rec.get('user') || 'root';
+        var host = rec.get('host') || '';
+        var port = rec.get('port') || 22;
+        return user + '@' + host + ':' + port;
+    }
+
+    function renderEndpoint(v, meta, rec) {
+        return enc(endpointLabel(rec));
+    }
+
+    function renderFingerprint(v, meta, rec) {
+        var fp = rec.get('fingerprint');
+        if (!fp) {
+            return '<span style="color:gray;" title="' + enc(t('host key not pinned yet')) + '">'
+                + enc(t('not pinned')) + '</span>';
+        }
+        return '<span style="font-family:monospace;font-size:0.85em;" title="' + enc(fp) + '">'
+            + enc(fpShort(fp)) + '</span>';
+    }
+
+    // A test-result chip for the given stage (grid cell + wizard reuse the map).
+    function stageChip(stage, detail, zfsVersion) {
+        stage = '' + (stage || '');
+        if (!stage) {
+            return '<span style="color:gray;">&mdash;</span>';
+        }
+        var spec = {
+            'ok': { good: true, label: zfsVersion ? ('ok — zfs ' + zfsVersion) : 'ok',
+                title: zfsVersion ? (t('reachable; zfs') + ' ' + zfsVersion) : t('reachable') },
+            'hostkey-unknown': { warn: true, label: t('host key?'), title: t('host key not confirmed') },
+            'auth-failed': { bad: true, label: t('auth failed'), title: t('key not authorized on the remote yet') },
+            'no-zfs': { warn: true, label: t('no zfs'), title: t('connected, but no zfs on the remote') },
+            'unreachable': { bad: true, label: t('unreachable'), title: detail || t('unreachable') },
+        };
+        var s = spec[stage] || { label: stage };
+        if (gfxReady() && ANAS.gfx) {
+            if (s.good && typeof ANAS.gfx.chip === 'function') {
+                return ANAS.gfx.chip(s.label, { good: true, title: s.title });
+            }
+            if (typeof ANAS.gfx.chip === 'function' && s.warn) {
+                return '<span title="' + enc(s.title || '') + '">' + ANAS.gfx.chip(s.label) + '</span>';
+            }
+        }
+        var color = s.bad ? 'var(--anas-danger,#c23b2c)'
+            : s.warn ? 'var(--anas-warn,#b06a12)' : 'var(--anas-ok,#1f9c56)';
+        return '<span title="' + enc(s.title || '') + '"'
+            + ' style="display:inline-block;padding:1px 8px;border-radius:9px;font-size:0.82em;'
+            + 'color:' + color + ';background:color-mix(in srgb,' + color + ' 15%,transparent);">'
+            + enc(s.label) + '</span>';
+    }
+
+    function renderTestChip(v, meta, rec) {
+        return stageChip(rec.get('testStage'), rec.get('testDetail'), rec.get('testZfs'));
+    }
+
+    function remoteRow(r) {
+        r = r || {};
+        return {
+            name: r.name,
+            host: r.host,
+            port: r.port || 22,
+            user: r.user || 'root',
+            fingerprint: r.hostKeyFingerprint || '',
+            testStage: '',
+            testDetail: '',
+            testZfs: '',
+            raw: r,
+        };
+    }
+
+    function selectedRemote(grid) {
+        var sel = grid ? grid.getSelection() : [];
+        return (sel && sel.length) ? sel[0] : null;
+    }
+
+    // Reload the registry into the manager window: grid rows, version (for CAS),
+    // and the public-key textarea. Preserves each row's last test result.
+    function reloadRemotes(win, node) {
+        if (!win || win.destroyed || win.destroying) {
+            return;
+        }
+        var grid = win.down('#remotesGrid');
+        if (grid) {
+            try { grid.setLoading(true); } catch (e) { /* non-fatal */ }
+        }
+        ANAS.api.get(node, '/replication/remotes').then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            if (grid) {
+                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
+            }
+            var data = (res && res.data) || {};
+            win._registryVersion = (data.version === undefined || data.version === null) ? 0 : data.version;
+            var list = data.remotes || [];
+            // Preserve per-row test results across a reload by name.
+            var prev = {};
+            try {
+                grid.getStore().each(function (r) {
+                    if (r.get('testStage')) {
+                        prev[r.get('name')] = { s: r.get('testStage'), d: r.get('testDetail'), z: r.get('testZfs') };
+                    }
+                });
+            } catch (ePrev) {
+                // best-effort
+            }
+            var rows = [];
+            for (var i = 0; i < list.length; i++) {
+                var row = remoteRow(list[i]);
+                var p = prev[row.name];
+                if (p) { row.testStage = p.s; row.testDetail = p.d; row.testZfs = p.z; }
+                rows.push(row);
+            }
+            try {
+                grid.getStore().loadData(rows);
+            } catch (eLoad) {
+                ANAS.warn('remotes grid load failed: ' + ANAS.errText(eLoad));
+            }
+            var key = win.down('#publicKey');
+            if (key) {
+                key.setValue(data.publicKey || t('(no cluster key returned by the daemon)'));
+            }
+            updateRemoteButtons(grid);
+        }, function (err) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            if (grid) {
+                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
+            }
+            ANAS.warn('remotes load failed: ' + ANAS.errText(err));
+            alertMsg('Load failed', t('Failed to load the remotes registry') + ': ' + ANAS.errText(err));
+        });
+    }
+
+    function updateRemoteButtons(grid) {
+        if (!grid) {
+            return;
+        }
+        var has = !!selectedRemote(grid);
+        var ids = ['remoteEdit', 'remoteTest', 'remoteDelete'];
+        for (var i = 0; i < ids.length; i++) {
+            var btn = grid.down('#' + ids[i]);
+            if (btn) { btn.setDisabled(!has); }
+        }
+    }
+
+    // Test a REGISTERED remote from the manager (uses its stored host). Writes the
+    // result chip onto the row.
+    function testRemoteRow(node, grid, rec) {
+        if (!rec) {
+            return;
+        }
+        var name = rec.get('name');
+        try { grid.setLoading(t('Testing') + ' ' + name + '…'); } catch (e) { /* non-fatal */ }
+        ANAS.api.post(node, '/replication/remotes/' + encodeURIComponent(name) + '/test', {}).then(
+            function (res) {
+                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
+                if (grid.destroyed || grid.destroying) {
+                    return;
+                }
+                var d = (res && res.data) || {};
+                rec.set('testStage', d.stage || 'unreachable');
+                rec.set('testDetail', d.detail || '');
+                rec.set('testZfs', d.zfsVersion || '');
+            },
+            function (err) {
+                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
+                if (grid.destroyed || grid.destroying) {
+                    return;
+                }
+                ANAS.warn('remote test failed: ' + ANAS.errText(err));
+                rec.set('testStage', 'unreachable');
+                rec.set('testDetail', ANAS.errText(err));
+            }
+        );
+    }
+
+    function deleteRemote(node, win, rec) {
+        if (!rec) {
+            return;
+        }
+        var name = rec.get('name');
+        try {
+            Ext.Msg.confirm(
+                t('Delete Remote'),
+                t('Delete the remote') + ' "' + enc(name) + '"? '
+                    + t('This removes it from the cluster registry.'),
+                function (btn) {
+                    if (btn !== 'yes') {
+                        return;
+                    }
+                    var ver = win._registryVersion;
+                    casWrite({
+                        node: node,
+                        method: 'del',
+                        path: '/replication/remotes/' + encodeURIComponent(name)
+                            + '?expectedVersion=' + encodeURIComponent(ver),
+                        view: win,
+                        failTitle: 'Delete failed',
+                        successMsg: t('Remote deleted') + ': ' + name,
+                        onComplete: function () { reloadRemotes(win, node); },
+                        onConflict: function () {
+                            reloadRemotes(win, node);
+                            ANAS.toast(t('registry changed on another node — reloaded, please retry'));
+                        },
+                        // A 400 "referenced by task" (or any non-409) surfaces the
+                        // daemon's message verbatim.
+                        onError: function (err) {
+                            alertMsg('Delete failed', ANAS.errText(err));
+                        },
+                    });
+                }
+            );
+        } catch (e) {
+            ANAS.warn('remote delete confirm failed: ' + ANAS.errText(e));
+        }
+    }
+
+    function publicKeyPanel() {
+        var pasteTrueNas = t('TrueNAS: Credentials → Users → root → Authorized Keys → paste.');
+        var pasteLinux = t('Generic Linux: append the key to ~/.ssh/authorized_keys on the remote.');
+        return {
+            xtype: 'panel',
+            itemId: 'pubkeyPanel',
+            cls: 'anas-repl-pubkey',
+            border: false,
+            bodyPadding: '10 12',
+            height: 210,
+            scrollable: true,
+            items: [
+                {
+                    xtype: 'component',
+                    style: 'font-weight:600;margin-bottom:4px;',
+                    html: enc(t('Cluster public key')),
+                },
+                {
+                    xtype: 'component',
+                    style: 'color:var(--anas-muted,gray);font-size:11px;margin-bottom:6px;',
+                    html: enc(t('Authorize this key on the remote:')),
+                },
+                {
+                    xtype: 'textareafield',
+                    itemId: 'publicKey',
+                    cls: 'anas-repl-pubkey-text',
+                    readOnly: true,
+                    selectOnFocus: true,
+                    grow: false,
+                    height: 66,
+                    fieldStyle: 'font-family:monospace;font-size:11px;white-space:pre;',
+                    anchor: '100%',
+                    value: t('(loading…)'),
+                },
+                {
+                    xtype: 'panel',
+                    title: t('TrueNAS'),
+                    collapsible: true,
+                    collapsed: true,
+                    titleCollapse: true,
+                    border: false,
+                    bodyPadding: '4 8',
+                    margin: '8 0 0 0',
+                    html: enc(pasteTrueNas),
+                },
+                {
+                    xtype: 'panel',
+                    title: t('Generic Linux'),
+                    collapsible: true,
+                    collapsed: true,
+                    titleCollapse: true,
+                    border: false,
+                    bodyPadding: '4 8',
+                    html: enc(pasteLinux),
+                },
+            ],
+        };
+    }
+
+    function openRemotesManager(node) {
+        var store = Ext.create('Ext.data.Store', {
+            fields: ['name', 'host', 'port', 'user', 'fingerprint',
+                'testStage', 'testDetail', 'testZfs', { name: 'raw', type: 'auto' }],
+            data: [],
+            sorters: [{ property: 'name', direction: 'ASC' }],
+        });
+
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-repl-remotes',
+                title: t('Replication Remotes'),
+                modal: true,
+                width: 640,
+                height: 560,
+                resizable: true,
+                layout: { type: 'vbox', align: 'stretch' },
+                items: [
+                    {
+                        xtype: 'gridpanel',
+                        itemId: 'remotesGrid',
+                        cls: 'anas-grid-repl-remotes',
+                        flex: 1,
+                        border: false,
+                        store: store,
+                        selModel: { mode: 'SINGLE' },
+                        emptyText: t('No remotes registered'),
+                        columns: [
+                            { text: t('Name'), dataIndex: 'name', width: 130, renderer: Ext.String.htmlEncode },
+                            { text: t('Connection'), dataIndex: 'host', flex: 1, minWidth: 180,
+                                sortable: false, menuDisabled: true, renderer: renderEndpoint },
+                            { text: t('Host key'), dataIndex: 'fingerprint', width: 150,
+                                sortable: false, menuDisabled: true, renderer: renderFingerprint },
+                            { text: t('Test'), dataIndex: 'testStage', width: 130, align: 'center',
+                                sortable: false, menuDisabled: true, renderer: renderTestChip },
+                        ],
+                        tbar: [
+                            {
+                                text: t('Add…'),
+                                cls: 'anas-btn-remote-add',
+                                iconCls: 'fa fa-plus',
+                                handler: function () { openRemoteEdit(node, win, null); },
+                            },
+                            {
+                                text: t('Edit'),
+                                itemId: 'remoteEdit',
+                                cls: 'anas-btn-remote-edit',
+                                iconCls: 'fa fa-pencil',
+                                disabled: true,
+                                handler: function (btn) {
+                                    var rec = selectedRemote(btn.up('grid'));
+                                    openRemoteEdit(node, win, rec ? (rec.get('raw') || {
+                                        name: rec.get('name'), host: rec.get('host'),
+                                        port: rec.get('port'), user: rec.get('user'),
+                                    }) : null);
+                                },
+                            },
+                            {
+                                text: t('Test'),
+                                itemId: 'remoteTest',
+                                cls: 'anas-btn-remote-test',
+                                iconCls: 'fa fa-plug',
+                                disabled: true,
+                                handler: function (btn) {
+                                    var grid = btn.up('grid');
+                                    testRemoteRow(node, grid, selectedRemote(grid));
+                                },
+                            },
+                            {
+                                text: t('Delete'),
+                                itemId: 'remoteDelete',
+                                cls: 'anas-btn-remote-delete',
+                                iconCls: 'fa fa-trash',
+                                disabled: true,
+                                handler: function (btn) {
+                                    deleteRemote(node, win, selectedRemote(btn.up('grid')));
+                                },
+                            },
+                        ],
+                        listeners: {
+                            selectionchange: function () {
+                                updateRemoteButtons(this);
+                            },
+                            itemdblclick: function (grid, rec) {
+                                openRemoteEdit(node, win, rec ? (rec.get('raw') || null) : null);
+                            },
+                        },
+                    },
+                    publicKeyPanel(),
+                ],
+                buttons: [
+                    { text: t('Close'), handler: function () { win.close(); } },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('remotes manager window failed: ' + ANAS.errText(e));
+            return;
+        }
+
+        // Expose a reload hook the wizard calls after a successful save.
+        win._reload = function () { reloadRemotes(win, node); };
+        win.show();
+        reloadRemotes(win, node);
+    }
+
+    ANAS.replication = ANAS.replication || {};
+    ANAS.replication.openRemotes = openRemotesManager;
+
+    // ======================================================================
+    //  Add / edit remote wizard — 'anas-win-repl-remote-edit' (Build B)
+    // ======================================================================
+
+    // Render the staged Test-connection result into the '#testResult' area. On
+    // 'hostkey-unknown' it shows the fingerprint prominently + a trust button
+    // that re-tests with ?pin=true, continuing the staged flow.
+    function renderTestStage(win, node, data) {
+        var area = win.down('#testResult');
+        if (!area) {
+            return;
+        }
+        data = data || {};
+        var stage = data.stage || 'unreachable';
+        win._tested = (stage === 'ok');
+        var items = [];
+        if (stage === 'hostkey-unknown') {
+            items.push({
+                xtype: 'component',
+                html: '<div style="color:var(--anas-warn,#b06a12);font-weight:600;">'
+                    + enc(t('Unknown host key — confirm the fingerprint before trusting:')) + '</div>'
+                    + '<div style="font-family:monospace;font-size:12px;margin:6px 0;padding:6px 8px;'
+                    + 'background:rgba(127,127,127,0.1);border-radius:6px;word-break:break-all;">'
+                    + enc(data.fingerprint || t('(no fingerprint returned)')) + '</div>',
+            });
+            items.push({
+                xtype: 'button',
+                cls: 'anas-btn-remote-trust',
+                text: t('Confirm & trust this host'),
+                iconCls: 'fa fa-check',
+                margin: '2 0 0 0',
+                handler: function () { runRemoteTest(win, node, true); },
+            });
+        } else if (stage === 'auth-failed') {
+            items.push({
+                xtype: 'component',
+                html: ANAS.gfx && gfxReady() && ANAS.gfx.callout
+                    ? ANAS.gfx.callout(enc(t('Connected, but the key is not authorized on the remote yet — '
+                        + 'paste the cluster public key (Remotes window) into the remote, then re-test.')), { level: 'warn' })
+                    : '<span style="color:var(--anas-warn,#b06a12);">' + enc(t('Connected, but the key is '
+                        + 'not authorized on the remote yet — paste the cluster public key into the remote, then re-test.')) + '</span>',
+            });
+        } else if (stage === 'no-zfs') {
+            items.push({
+                xtype: 'component',
+                html: '<span style="color:var(--anas-warn,#b06a12);">'
+                    + enc(t('Connected, but no zfs on the remote.')) + '</span>',
+            });
+        } else if (stage === 'ok') {
+            var okHtml = stageChip('ok', '', data.zfsVersion);
+            items.push({
+                xtype: 'component',
+                html: '<div>' + okHtml + ' <span style="color:var(--anas-muted,gray);font-size:12px;">'
+                    + enc(t('reachable — you can save this remote.')) + '</span></div>',
+            });
+        } else {
+            // unreachable (or unknown stage)
+            items.push({
+                xtype: 'component',
+                html: '<span style="color:var(--anas-danger,#c23b2c);">'
+                    + enc(data.detail || t('Host is unreachable.')) + '</span>',
+            });
+        }
+        try {
+            area.removeAll();
+            area.add(items);
+        } catch (e) {
+            ANAS.warn('test stage render failed: ' + ANAS.errText(e));
+        }
+    }
+
+    function setTestBusy(win) {
+        var area = win.down('#testResult');
+        if (!area) {
+            return;
+        }
+        try {
+            area.removeAll();
+            area.add({
+                xtype: 'component',
+                html: '<span style="color:var(--anas-muted,gray);">'
+                    + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
+                    + enc(t('testing connection…')) + '</span>',
+            });
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // Drive the pre-registration staged test with the values typed in the dialog.
+    // pin=true re-runs after the operator confirms an unknown host key.
+    function runRemoteTest(win, node, pin) {
+        var host = ('' + (valOf(win, '#host') || '')).trim();
+        if (!host) {
+            alertMsg('Invalid input', t('Enter a host to test.'));
+            return;
+        }
+        var port = parseInt(valOf(win, '#port'), 10);
+        if (isNaN(port) || port <= 0) { port = 22; }
+        var user = ('' + (valOf(win, '#user') || 'root')).trim() || 'root';
+        var body = { host: host, port: port, user: user };
+        var path = '/replication/remotes/test' + (pin ? '?pin=true' : '');
+        setTestBusy(win);
+        ANAS.api.post(node, path, body).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            renderTestStage(win, node, (res && res.data) || {});
+        }, function (err) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            ANAS.warn('remote test failed: ' + ANAS.errText(err));
+            renderTestStage(win, node, { stage: 'unreachable', detail: ANAS.errText(err) });
+        });
+    }
+
+    function openRemoteEdit(node, mgrWin, existing) {
+        var isEdit = !!existing;
+        var r = existing || {};
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-repl-remote-edit',
+                title: isEdit ? (t('Edit Remote') + ': ' + (r.name || '')) : t('Add Remote'),
+                modal: true,
+                width: 480,
+                resizable: false,
+                layout: 'fit',
+                items: [{
+                    xtype: 'form',
+                    itemId: 'form',
+                    bodyPadding: 12,
+                    border: false,
+                    scrollable: true,
+                    defaults: { anchor: '100%', labelWidth: 130 },
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            itemId: 'name',
+                            cls: 'anas-fld-remote-name',
+                            fieldLabel: t('Name'),
+                            emptyText: 'offsite-nas',
+                            disabled: isEdit,
+                            allowBlank: false,
+                            value: r.name || '',
+                            regex: NAME_RE,
+                            maxLength: 64,
+                            regexText: t('Lowercase letters, digits and hyphens; must start with a letter or digit.'),
+                        },
+                        {
+                            xtype: 'textfield',
+                            itemId: 'host',
+                            cls: 'anas-fld-remote-host',
+                            fieldLabel: t('Host'),
+                            emptyText: 'nas.example.com',
+                            allowBlank: false,
+                            value: r.host || '',
+                        },
+                        {
+                            xtype: 'numberfield',
+                            itemId: 'port',
+                            cls: 'anas-fld-remote-port',
+                            fieldLabel: t('SSH port'),
+                            minValue: 1,
+                            maxValue: 65535,
+                            value: r.port || 22,
+                        },
+                        {
+                            xtype: 'textfield',
+                            itemId: 'user',
+                            cls: 'anas-fld-remote-user',
+                            fieldLabel: t('User'),
+                            emptyText: 'root',
+                            value: r.user || 'root',
+                        },
+                        {
+                            xtype: 'button',
+                            cls: 'anas-btn-remote-testconn',
+                            text: t('Test connection'),
+                            iconCls: 'fa fa-plug',
+                            margin: '4 0 0 0',
+                            width: 150,
+                            handler: function () { runRemoteTest(win, node, false); },
+                        },
+                        {
+                            xtype: 'container',
+                            itemId: 'testResult',
+                            cls: 'anas-remote-test',
+                            margin: '10 0 0 0',
+                            layout: { type: 'vbox', align: 'stretch' },
+                            minHeight: 24,
+                            items: [{
+                                xtype: 'component',
+                                html: '<span style="color:var(--anas-muted,gray);font-size:12px;">'
+                                    + enc(t('Test the connection to diagnose reachability, host key, auth and zfs.'))
+                                    + '</span>',
+                            }],
+                        },
+                        {
+                            xtype: 'component',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin-top:12px;',
+                            html: enc(t('You can save now and authorize the cluster key on the remote later — '
+                                + 'the remote just needs sshd + zfs, no software installed.')),
+                        },
+                    ],
+                }],
+                buttons: [
+                    { text: t('Cancel'), handler: function () { win.close(); } },
+                    {
+                        text: isEdit ? t('Save') : t('Add'),
+                        cls: 'anas-btn-remote-save',
+                        handler: function () {
+                            try {
+                                submitRemote(win, node, mgrWin, isEdit);
+                            } catch (e) {
+                                ANAS.warn('remote save failed: ' + ANAS.errText(e));
+                            }
+                        },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('remote edit window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+    }
+
+    function submitRemote(win, node, mgrWin, isEdit) {
+        var form = win.down('#form');
+        var basicForm = form && form.getForm();
+        if (basicForm && basicForm.isValid && !basicForm.isValid()) {
+            return;
+        }
+        var name = ('' + (valOf(win, '#name') || '')).trim();
+        if (!NAME_RE.test(name) || name.length > 64) {
+            alertMsg('Invalid input',
+                t('Name must be lowercase letters, digits and hyphens (≤64 chars).'));
+            return;
+        }
+        var host = ('' + (valOf(win, '#host') || '')).trim();
+        if (!host) {
+            alertMsg('Invalid input', t('Enter a host.'));
+            return;
+        }
+        var port = parseInt(valOf(win, '#port'), 10);
+        if (isNaN(port) || port <= 0) { port = 22; }
+        var user = ('' + (valOf(win, '#user') || 'root')).trim() || 'root';
+
+        var remote = { name: name, host: host, port: port, user: user };
+        var expectedVersion = mgrWin && mgrWin._registryVersion !== undefined ? mgrWin._registryVersion : 0;
+        var body = { remote: remote, expectedVersion: expectedVersion };
+
+        casWrite({
+            node: node,
+            method: isEdit ? 'put' : 'post',
+            path: isEdit ? ('/replication/remotes/' + encodeURIComponent(name)) : '/replication/remotes',
+            body: body,
+            view: win,
+            failTitle: isEdit ? 'Save failed' : 'Add failed',
+            successMsg: isEdit ? (t('Remote saved') + ': ' + name) : (t('Remote added') + ': ' + name),
+            onComplete: function () {
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+                if (mgrWin && mgrWin._reload) {
+                    mgrWin._reload();
+                }
+            },
+            // CAS conflict: the registry moved on another node. Reload the manager
+            // (refreshing the version), toast, and KEEP this dialog open to retry.
+            onConflict: function () {
+                if (mgrWin && mgrWin._reload) {
+                    mgrWin._reload();
+                }
+                ANAS.toast(t('registry changed on another node — reloaded, please retry'));
+            },
+        });
+    }
+
+    // ======================================================================
     //  Task dialog (create / edit) — 'anas-win-repl-task'
     // ======================================================================
 
@@ -537,6 +1503,7 @@
                             forceSelection: true,
                             emptyText: t('(loading…)'),
                         },
+                        locationComboCfg(),
                         {
                             xtype: 'combobox',
                             itemId: 'targetPool',
@@ -642,6 +1609,12 @@
         win.show();
         // Initial dataset list — preselect the existing source dataset on edit.
         loadSrcDatasets(defaultSrcPool, isEdit ? (src.dataset || '') : undefined);
+        // Target-location picker: default 'This node'; on edit, preselect the
+        // saved peer/remote and repopulate the target-pool combo from it.
+        wireLocationPicker(win, node, {
+            preLoc: isEdit ? tgt.location : null,
+            prePool: isEdit ? tgt.pool : undefined,
+        });
     }
 
     function valOf(win, sel) {
@@ -689,6 +1662,10 @@
         };
         if (targetDataset) {
             body.target.dataset = targetDataset;
+        }
+        var loc = selectedLocation(win);
+        if (loc.kind === 'peer' || loc.kind === 'remote') {
+            body.target.location = { kind: loc.kind, name: loc.name };
         }
 
         // Create → POST; edit → PUT :name. The daemon may answer with a job
@@ -751,6 +1728,13 @@
         };
         if (!body.target.dataset && rec.get('targetDataset')) {
             body.target.dataset = rec.get('targetDataset');
+        }
+        // Preserve the target location when reconstructing from the record.
+        if (!body.target.location) {
+            var lk = rec.get('targetLocationKind');
+            if (lk === 'peer' || lk === 'remote') {
+                body.target.location = { kind: lk, name: rec.get('targetLocationName') };
+            }
         }
         ANAS.runJob({
             node: node,
@@ -905,6 +1889,10 @@
         if (targetDs) {
             body.target.dataset = targetDs;
         }
+        var planLoc = selectedLocation(win);
+        if (planLoc.kind === 'peer' || planLoc.kind === 'remote') {
+            body.target.location = { kind: planLoc.kind, name: planLoc.name };
+        }
         if (!valOf(win, '#snapshotFirst')) {
             var snap = valOf(win, '#snapshot');
             if (snap) {
@@ -1031,6 +2019,7 @@
                             forceSelection: true,
                             emptyText: t('(loading…)'),
                         },
+                        locationComboCfg(),
                         {
                             xtype: 'combobox',
                             itemId: 'targetPool',
@@ -1120,7 +2109,10 @@
             var targetPool = valOf(win, '#targetPool');
             var srcRel = ('' + (valOf(win, '#srcDataset') || '')).replace(/^\/+|\/+$/g, '');
             var baseName = srcRel || srcPool;
-            if (targetPool === srcPool) {
+            // A remote/peer target is a different box, so a same-named pool is not
+            // a self-collision — only the local same-pool case needs the suffix.
+            var local = selectedLocation(win).kind === 'local';
+            if (local && targetPool === srcPool) {
                 fld.setValue(baseName + '-replica');
             } else {
                 fld.setValue(baseName);
@@ -1167,6 +2159,14 @@
         win.show();
         renderCalculating(win);
         loadSrc(defaultPool);
+        // Target-location picker: switching location repopulates the target-pool
+        // combo and re-plans (a remote plan is computed daemon-side).
+        wireLocationPicker(win, node, {
+            onAfterApply: function () {
+                seedTargetDefault();
+                replan();
+            },
+        });
     }
 
     function submitOnce(win, node, grid) {
@@ -1200,9 +2200,14 @@
         } else {
             body.snapshot = snap;
         }
+        var loc = selectedLocation(win);
+        if (loc.kind === 'peer' || loc.kind === 'remote') {
+            body.target.location = { kind: loc.kind, name: loc.name };
+        }
 
         var srcLabel = routeSide(srcPool, srcRel);
-        var targetLabel = targetPool + (targetDs ? ('/' + targetDs) : '');
+        var locPrefix = (loc.kind === 'peer' || loc.kind === 'remote') ? (loc.kind + ':' + loc.name + ' ') : '';
+        var targetLabel = locPrefix + targetPool + (targetDs ? ('/' + targetDs) : '');
         var suffix = '';
         var plan = win._lastPlan;
         if (plan && plan.mode) {
@@ -1287,6 +2292,7 @@
         var store = Ext.create('Ext.data.Store', {
             fields: [
                 'name', 'sourcePool', 'sourceDataset', 'targetPool', 'targetDataset',
+                'targetLocationKind', 'targetLocationName',
                 'schedule', 'lastReplicatedSnapshot', 'lastReplicatedAt', 'lastRunResult', 'nextRunAt',
                 { name: 'snapshotFirst', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
@@ -1320,6 +2326,14 @@
                 iconCls: 'fa fa-bolt',
                 handler: function (btn) {
                     openReplicateOnce(node, btn.up('grid'));
+                },
+            },
+            {
+                text: t('Remotes…'),
+                cls: 'anas-btn-repl-remotes',
+                iconCls: 'fa fa-server',
+                handler: function () {
+                    openRemotesManager(node);
                 },
             },
             '-',
@@ -1494,6 +2508,10 @@
         var target = { pool: rec.get('targetPool') };
         if (rec.get('targetDataset')) {
             target.dataset = rec.get('targetDataset');
+        }
+        var lk = rec.get('targetLocationKind');
+        if (lk === 'peer' || lk === 'remote') {
+            target.location = { kind: lk, name: rec.get('targetLocationName') };
         }
         return {
             name: rec.get('name'),
