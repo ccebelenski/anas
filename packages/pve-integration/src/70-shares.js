@@ -246,6 +246,10 @@
             protocol: 'smb',
             name: share.name,
             path: share.path,
+            // Read-time staleness observation from the daemon: false = the
+            // shared path is missing on disk; undefined = unknown (old daemon
+            // or a stat that failed — render as today, never flag stale).
+            pathExists: share.pathExists,
             activeConnections: Number(active) || 0,
             raw: share,
         };
@@ -264,6 +268,7 @@
             protocol: 'nfs',
             name: exp.path,
             path: exp.path,
+            pathExists: exp.pathExists,
             activeConnections: null,
             raw: exp,
         };
@@ -278,6 +283,28 @@
             + ' style="display:inline-block;padding:1px 8px;border-radius:3px;'
             + 'color:#fff;font-size:0.85em;background:' + color + ';">'
             + enc(proto) + '</span>';
+    }
+
+    // Tooltip text for a stale (missing-path) share. Kept as a constant so the
+    // hook class + copy stay in one place.
+    var STALE_TIP = 'The shared path no longer exists on disk. The share '
+        + 'definition is stale — clients cannot use it. Remove it or restore '
+        + 'the path.';
+
+    // Path column. When the daemon reports pathExists === false the backing
+    // storage is gone and the share is stale: append a small danger-styled
+    // "path missing" tag (hook class 'anas-share-stale'). pathExists === undefined
+    // (unknown — old daemon or a failed stat) renders exactly as before.
+    function renderPath(v, meta, rec) {
+        var html = enc(v);
+        if (rec.get('pathExists') === false) {
+            html += ' <span class="anas-share-stale" title="' + enc(t(STALE_TIP)) + '"'
+                + ' style="display:inline-block;margin-left:6px;padding:0 7px;'
+                + 'border-radius:9px;font-size:0.82em;font-weight:600;color:#fff;'
+                + 'background:var(--anas-danger,#c23b2c);vertical-align:baseline;">'
+                + enc(t('path missing')) + '</span>';
+        }
+        return html;
     }
 
     // Key attributes summary. SMB: read-only/guest/valid-users; NFS: client
@@ -1296,6 +1323,7 @@
         var store = Ext.create('Ext.data.Store', {
             fields: [
                 'protocol', 'name', 'path',
+                { name: 'pathExists', type: 'auto' },
                 { name: 'activeConnections', type: 'auto' },
                 { name: 'raw', type: 'auto' },
             ],
@@ -1337,7 +1365,7 @@
                         text: t('Path'),
                         dataIndex: 'path',
                         flex: 1,
-                        renderer: Ext.String.htmlEncode,
+                        renderer: renderPath,
                     },
                     {
                         text: t('Attributes'),

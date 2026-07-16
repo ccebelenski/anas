@@ -1,7 +1,7 @@
 import type { Job, JobAccepted, NfsExport } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -67,6 +67,21 @@ describe('nfs export routes', () => {
       assert.equal(res.statusCode, 200)
       const { data } = res.json() as { data: NfsExport[] }
       assert.deepEqual(data.map(e => e.path), ['/srv/nfs/media', '/srv/nfs/backups', '/export/legacy'])
+    })
+
+    it('sets pathExists true for a live path and false for a missing one (stale)', async () => {
+      const livePath = join(dir, 'live')
+      await mkdir(livePath)
+      await writeFile(exportsPath, [
+        `${livePath} 10.0.0.0/24(rw,sync)`,
+        '/does/not/exist *(ro,sync)',
+        '',
+      ].join('\n'))
+      const res = await server!.inject({ method: 'GET', url: '/v1/shares/nfs' })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: NfsExport[] }
+      assert.equal(data.find(e => e.path === livePath)!.pathExists, true)
+      assert.equal(data.find(e => e.path === '/does/not/exist')!.pathExists, false)
     })
 
     it('returns an empty list when the file is missing', async () => {

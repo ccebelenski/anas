@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import { statSync } from 'node:fs'
 import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
 import { addShare, getShare, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
@@ -12,6 +13,28 @@ import { requireIdentity } from './identity.js'
 
 const SMBSTATUS = '/usr/bin/smbstatus'
 const SYSTEMCTL = '/usr/bin/systemctl'
+
+/**
+ * Read-time staleness check for a share's backing path (Principle 7 — the
+ * filesystem is the source of truth; nothing is cached). Returns:
+ *   true      — the path exists,
+ *   false     — the path is confirmed missing (ENOENT / ENOTDIR): the share is
+ *               stale, its storage is gone,
+ *   undefined — unknown: any other stat failure (EACCES, EIO, …) FAILS OPEN so
+ *               a healthy share is never mislabelled stale.
+ */
+export function pathExists(path: string): boolean | undefined {
+  try {
+    statSync(path)
+    return true
+  }
+  catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ENOTDIR')
+      return false
+    return undefined
+  }
+}
 
 export interface SmbShareRouteOptions {
   executor: CommandExecutor
@@ -85,7 +108,13 @@ export async function smbShareRoutes(
   // --- GET /shares/smb — ALL shares (incl. admin-created, Principle 11) -----
   server.get('/shares/smb', async () => {
     const text = await readSmbConf()
-    return { data: parseSmbConf(text).shares }
+    // Stat each share's path at read time to surface stale definitions whose
+    // storage no longer exists (pathExists=false). Fail-open per share.
+    const shares = parseSmbConf(text).shares.map(share => ({
+      ...share,
+      pathExists: pathExists(share.path),
+    }))
+    return { data: shares }
   })
 
   // --- GET /shares/smb/global — SMB global config ---------------------------
@@ -177,7 +206,11 @@ export async function smbShareRoutes(
       return { error: { code: 'NOT_FOUND', message: `SMB share '${name}' not found` } }
     }
 
-    const detail: SmbShareDetail = { ...share, connections: await connectionsFor(share.name) }
+    const detail: SmbShareDetail = {
+      ...share,
+      pathExists: pathExists(share.path),
+      connections: await connectionsFor(share.name),
+    }
     return { data: detail }
   })
 

@@ -33,6 +33,14 @@ export const SmbShare = z.object({
   hostsAllow: z.array(z.string()),
   /** `hosts deny` */
   hostsDeny: z.array(z.string()),
+  /**
+   * Whether `path` currently exists on disk — a READ-TIME observation, never
+   * stored state (the daemon stats the path when it lists the share). A share
+   * whose backing storage is gone is stale: the definition outlives the path
+   * and clients cannot use it. `false` = confirmed missing; `undefined` =
+   * unknown (old daemon, or the stat failed, e.g. EACCES — never a false stale).
+   */
+  pathExists: z.boolean().optional(),
 })
 export type SmbShare = z.infer<typeof SmbShare>
 
@@ -94,6 +102,14 @@ export type NfsClient = z.infer<typeof NfsClient>
 export const NfsExport = z.object({
   path: AbsolutePath,
   clients: z.array(NfsClient).min(1),
+  /**
+   * Whether `path` currently exists on disk — a READ-TIME observation, never
+   * stored state (the daemon stats the path when it lists the export). An
+   * export whose backing storage is gone is stale: the line outlives the path
+   * and clients cannot use it. `false` = confirmed missing; `undefined` =
+   * unknown (old daemon, or the stat failed, e.g. EACCES — never a false stale).
+   */
+  pathExists: z.boolean().optional(),
 })
 export type NfsExport = z.infer<typeof NfsExport>
 
