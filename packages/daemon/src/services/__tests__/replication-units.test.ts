@@ -84,6 +84,20 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
     assert.match(unit, /WantedBy=timers\.target/)
   })
 
+  it('stage-3: X-ANAS-Task round-trips a target.location and ExecStart emits it', () => {
+    const remote = makeTask({ target: { pool: 'backup', dataset: 'media', location: { kind: 'remote', name: 'nas1' } } })
+    assert.deepEqual(parseServiceUnit(renderServiceUnit(remote)), remote)
+    assert.match(renderServiceUnit(remote), /--location-kind remote --location-name nas1/)
+
+    const peer = makeTask({ target: { pool: 'backup', dataset: 'media', location: { kind: 'peer', name: 'node2' } } })
+    assert.match(renderServiceUnit(peer), /--location-kind peer --location-name node2/)
+  })
+
+  it('stage-3: a local (default) target emits NO --location-* args', () => {
+    const unit = renderServiceUnit(makeTask({ target: { pool: 'backup', dataset: 'media', location: { kind: 'local' } } }))
+    assert.doesNotMatch(unit, /--location-kind/)
+  })
+
   it('pool-root source emits --dataset "" and no --target-dataset by default', () => {
     const unit = renderServiceUnit(makeTask({ source: { pool: 'testpool', dataset: '' }, target: { pool: 'backup' }, snapshotFirst: false }))
     assert.match(unit, /--pool testpool --dataset "" --target-pool backup(\n|$)/)

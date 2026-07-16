@@ -65,6 +65,14 @@ export function runnerArgs(task: ReplicationTask): string[] {
   ]
   if (task.target.dataset !== undefined && task.target.dataset !== '')
     args.push('--target-dataset', task.target.dataset)
+  // Stage 3: emit the target LOCATION so the runner replicates to a peer/remote.
+  // Absent or 'local' → nothing (the runner defaults to a same-node target).
+  const location = task.target.location
+  if (location && location.kind !== 'local') {
+    args.push('--location-kind', location.kind)
+    if (location.name !== undefined)
+      args.push('--location-name', location.name)
+  }
   if (task.snapshotFirst)
     args.push('--snapshot-first')
   return args

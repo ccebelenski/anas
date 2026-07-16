@@ -4,6 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedAcl } from '../parsers/getfacl.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { Transport } from '../services/replication-transport.js'
 import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, PoolName, RenameSnapshotRequest, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { parseExports } from '../parsers/exports.js'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
@@ -230,9 +231,11 @@ export async function datasetRoutes(
     smbConfPath?: string
     /** /etc/exports path — for reporting NFS exports of a dataset (Epic 4.4). */
     exportsPath?: string
+    /** Stage-3 remote/peer SSH transport for replication (Epic 5.5.2). */
+    transport: Transport
   },
 ) {
-  const { executor, jobQueue, confirmStore } = opts
+  const { executor, jobQueue, confirmStore, transport } = opts
 
   // Replication (Epic 5.5.1) shares this file's dataset `*` wildcard (find-my-way
   // permits only one wildcard route per method+path). The send/recv logic lives
@@ -256,6 +259,7 @@ export async function datasetRoutes(
         return false
       }
     },
+    transport,
   })
 
   /** Does the named pool exist? (source of truth is `zpool list`). */
