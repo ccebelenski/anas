@@ -1,0 +1,19 @@
+[Unit]
+Description=ANAS API Gateway
+After=anasd.service
+Requires=anasd.service
+
+[Service]
+Type=simple
+# The gateway reads the host's PVE certificates itself (story 13.8): it
+# auto-detects /etc/pve/local/pveproxy-ssl.* (custom) or pve-ssl.* (node) and
+# serves HTTPS. PVE marks PVEAuthCookie as Secure, so this HTTPS is required
+# for auth to work at all (story 10.4).
+ExecStart=/usr/bin/node /opt/anas/packages/gateway/dist/index.js
+Environment=ANASD_SOCKET=/run/anas/anasd.sock
+Environment=ANAS_AUTH_PROVIDER=pve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
