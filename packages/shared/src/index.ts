@@ -99,6 +99,14 @@ export {
   JobStatus,
 } from './schemas/jobs.js'
 
+// Replication schemas (Epic 5.5)
+export {
+  ReplicatePlan,
+  ReplicatePlanRequest,
+  ReplicateRequest,
+  ReplicationTarget,
+} from './schemas/replication.js'
+
 // Share schemas (SMB + NFS)
 export {
   CreateNfsExportRequest,
