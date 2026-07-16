@@ -71,6 +71,25 @@ test.describe('ANAS Datasets panel (stunt node)', () => {
     }
   })
 
+  test('selecting an ANAS pool ROOT enables the dataset toolbar (story 3.26)', async ({ page }) => {
+    // Real-node regression (pve5): some systems store all data at pool level
+    // with NO child datasets, so the pool-root row is the only thing selectable
+    // — the toolbar must work on it (detail/edit/perms/share/snapshot; destroy
+    // stays dataset-only, that's a Pools-view op).
+    await loginToPve(page)
+    await openAnasItem(page, 'Datasets')
+    const grid = page.locator('.anas-grid-datasets')
+    await expect(grid).toBeVisible({ timeout: 45_000 })
+
+    await grid.locator('.x-tree-node-text', { hasText: /^testpool$/ }).click()
+
+    for (const sel of ['.anas-btn-ds-detail', '.anas-btn-ds-edit', '.anas-btn-ds-perms', '.anas-btn-ds-share', '.anas-btn-snap-create']) {
+      await expect(page.locator(sel)).toBeEnabled({ timeout: 20_000 })
+    }
+    // Destroy stays disabled on the root.
+    await expect(page.locator('.anas-btn-ds-destroy')).toBeDisabled()
+  })
+
   test('the Create button opens the .anas-win-dataset-create window', async ({ page }) => {
     await loginToPve(page)
     await openAnasItem(page, 'Datasets')

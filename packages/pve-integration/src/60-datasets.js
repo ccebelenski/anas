@@ -588,23 +588,31 @@
     function updateButtons(tree) {
         var rec = selectedRecord(tree);
         var ds = isDataset(rec);
-        var fs = isFilesystem(rec);
+        // Story 3.26: the pool ROOT is a first-class dataset — some systems
+        // store all data at pool level with no child datasets at all, so the
+        // toolbar must work on a selected pool row too (detail, props, perms,
+        // share, snapshot; NOT destroy — destroying the root ≈ the pool, a
+        // Pools-view op). The root is always a filesystem (type stamped in
+        // buildPoolNode).
+        var root = !!(rec && rec.get('kind') === 'pool');
+        var dsOrRoot = ds || root;
+        var fs = isFilesystem(rec) || root;
         var snap = isSnapshot(rec);
         // Story 3.25: PVE-managed pools/datasets are hands-off. Structural
         // toolbar actions are gated alongside the primary per-row gate; only
         // read-only Detail / snapshot-listing stay enabled.
         var pve = recPveManaged(rec);
         setDisabled(tree, 'dsCreate', pve);
-        setDisabled(tree, 'dsDetail', !ds);
-        setDisabled(tree, 'dsEdit', !ds || pve);
+        setDisabled(tree, 'dsDetail', !dsOrRoot);
+        setDisabled(tree, 'dsEdit', !dsOrRoot || pve);
         setDisabled(tree, 'dsPerms', !fs || pve);
         // Contextual "Share…" is offered on filesystem datasets only — they
         // have a mountpoint path to share (DESIGN 5a/5d). zvols cannot.
         setDisabled(tree, 'dsShare', !fs || pve);
         setDisabled(tree, 'dsDestroy', !ds || pve);
-        // Snapshot actions: create/list act on a selected dataset; the
-        // rollback/rename/destroy trio act on a selected snapshot row.
-        setDisabled(tree, 'snapCreate', !ds || pve);
+        // Snapshot actions: create/list act on a selected dataset or the pool
+        // root; the rollback/rename/destroy trio act on a selected snapshot row.
+        setDisabled(tree, 'snapCreate', !dsOrRoot || pve);
         setDisabled(tree, 'snapRollback', !snap);
         setDisabled(tree, 'snapRename', !snap);
         setDisabled(tree, 'snapClone', !snap);
@@ -2953,7 +2961,14 @@
 
     function snapCreateFromTree(node, tree) {
         var rec = selectedRecord(tree);
-        if (!isDataset(rec)) {
+        // Story 3.26: the pool ROOT snapshots too (fullName === pool; the
+        // daemon's root snapshot is non-recursive). Some systems keep all data
+        // at pool level with no child datasets.
+        if (!isDataset(rec) && !(rec && rec.get('kind') === 'pool')) {
+            return;
+        }
+        if (recPveManaged(rec)) {
+            ANAS.toast(t('PVE manages this pool — snapshots are PVE territory.'));
             return;
         }
         var pool = rec.get('pool');
@@ -3939,7 +3954,9 @@
                         }
                     },
                     itemdblclick: function (tree, record) {
-                        if (isDataset(record)) {
+                        // Datasets AND pool roots open detail (story 3.26 —
+                        // openDetail accepts the root's empty-rel-path form).
+                        if (isDataset(record) || (record && record.get('kind') === 'pool')) {
                             openDetail(node, record);
                         } else if (isSnapshotsMore(record)) {
                             openSnapshotsPopup(node, tree, record.get('pool'), record.get('dataset'));
