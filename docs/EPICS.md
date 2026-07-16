@@ -257,7 +257,7 @@ Story numbering is for identification only, not implementation order. Within eac
 > - **Safety**: destination `readonly=on` by default; `recv -F` (divergence rollback) behind the 409-confirm gate; UI must announce a FULL send (with size) whenever the incremental chain is broken; `zfs hold` on the incremental base so cleanup can't sever the chain.
 > - **Sequencing**: local one-shot job → the view + timers → remote (5.5.2). Remote leverages PVE cluster SSH trust (free between cluster nodes); receiver needs ZFS only, NOT ANAS. *(Local target; incremental via `send -i`.)*
 
-5.5.2. [done 2026-07-16] As a user, I want to replicate to a remote host (`zfs send | ssh | zfs recv`), so I have off-site backups / migration.
+5.5.2. [done 2026-07-16 — stunt-node proven; REAL-NODE VALIDATION PENDING (operator needs to stage a receiving end: spare pool / cluster peer / TrueNAS box)] As a user, I want to replicate to a remote host (`zfs send | ssh | zfs recv`), so I have off-site backups / migration.
 
 > **Stage-3 design decisions (agreed 2026-07-16):**
 > - **Remote needs sshd + ZFS only — no software installed there, ever.** All remote ops are `ssh <remote> zfs …` (list for base-discovery/lag, recv, hold). Push-only; progress comes from the local send side. TrueNAS works as a target out of the box.
