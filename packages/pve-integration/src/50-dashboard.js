@@ -1,17 +1,41 @@
 /*
- * ANAS — Dashboard view (Epic 2: stories 2.1–2.7; gfx retrofit 15.5).
+ * ANAS — Dashboard view (Epic 2: stories 2.1–2.7; gfx retrofit 15.5;
+ * information-architecture re-layout).
  *
- * The real, gold-standard ANAS landing page: warnings, per-pool health, disk
- * fleet, shares + jobs, and — the headline — live ZFS telemetry (ARC, per-pool
- * and per-disk I/O, network) rendered entirely in the ANAS.gfx visual language
- * (15-gfx.js) with client-side rolling sparklines. Replaces the story-13.12
- * placeholder landing panel.
+ * The real, gold-standard ANAS landing page. Top → bottom:
+ *   1. Warnings   — critical/warning callouts (only when present).
+ *   2. Disk Fleet — the at-a-glance healthy/warning/critical/unknown count tiles
+ *                   plus a compact "Recent activity" jobs strip (relative time +
+ *                   duration + outcome). Moved to the TOP.
+ *   3. Pools      — THE HEADLINE. One nested Pool → VDEV → Device hierarchy per
+ *                   pool, absorbing the old "Pool health", "Pool I/O" and
+ *                   "Disk I/O" sections: pool state pill + capacity donut +
+ *                   aggregate live I/O + scan indicator; each vdev its own state
+ *                   pill + type + aggregated I/O; each device its disk object +
+ *                   live throughput + latency. Matches /status pools to
+ *                   /telemetry pools by name.
+ *   4. ARC        — hit-ratio gauge + size/target + L2 + sparkline.
+ *   5. Network    — total + per-interface rx/tx.
+ * All rendered in the ANAS.gfx visual language (15-gfx.js) with client-side
+ * rolling sparklines.
  *
  * Data contract (two endpoints, read as JSON; no compile dependency):
- *   GET /v1/status    → { node, pools[], disks{}, shares{}, jobs[], warnings[] }
+ *   GET /v1/status    → { node, pools[], disks{healthy,warning,critical,unknown,
+ *                         total}, shares{}, jobs[{id,kind,status,startedAt?,
+ *                         finishedAt?,durationMs?}], warnings[] }
  *                       loaded on show + manual Refresh.
- *   GET /v1/telemetry → { sampledAt, windowMs, arc{}, pools[], disks[], net{} }
+ *   GET /v1/telemetry → { sampledAt, windowMs, arc{}, net{}, pools:[ { name,
+ *                         ...ioStats, vdevs:[ { name,type,role,state,...ioStats,
+ *                         disks:[ { id, ...ioStats } ] } ] } ] }
  *                       POLLED every POLL_MS while the panel is visible.
+ *                       ioStats = { readBytesPerSec, writeBytesPerSec, readIops,
+ *                       writeIops, readLatencyNs|null, writeLatencyNs|null }.
+ *                       (The old flat top-level disks[] array is GONE — disks are
+ *                       nested under vdevs under pools.)
+ *
+ * The Pools section needs BOTH endpoints (state/capacity/scan from /status, I/O
+ * from /telemetry). We cache the last-good of each on the view (_anasStatus /
+ * _anasTelemetry) and re-render the composite whenever either arrives.
  *
  * POLL LIFECYCLE (critical — a leaked setInterval hammering the daemon is
  * unacceptable): the interval starts on afterrender / activate / show and STOPS
@@ -21,16 +45,17 @@
  * down (interval + the document listener).
  *
  * FRAMEWORK CONTRACT: window.ANAS with ANAS.api.get (Promise; path relative to
- * /v1), ANAS.gfx (gauge/bar/donut/legend/icon/statePill/callout/badge/activity),
- * ANAS.formatBytes, ANAS.t, ANAS.enc. The framework wraps this view in the
- * "not installed" probe — we do NOT probe health here. Fail open throughout: a
- * failed status/telemetry fetch degrades a section to a muted "unavailable"
- * state and NEVER throws into the PVE UI.
+ * /v1), ANAS.gfx (gauge/bar/donut/legend/icon/statePill/callout/badge/activity/
+ * pillLevel), ANAS.formatBytes, ANAS.t, ANAS.enc. The framework wraps this view
+ * in the "not installed" probe — we do NOT probe health here. Fail open
+ * throughout: a failed status/telemetry fetch degrades a section to a muted
+ * "unavailable" state and NEVER throws into the PVE UI.
  *
  * Test hooks: view cls 'anas-view anas-view-dashboard'; section classes
- * 'anas-dash-warnings' / 'anas-dash-pools' / 'anas-dash-overview' (fleet+shares+
- * jobs) / 'anas-dash-arc' / 'anas-dash-io' / 'anas-dash-disks' / 'anas-dash-net'
- * / 'anas-dash-status'; Refresh button 'anas-btn-dash-refresh'.
+ * 'anas-dash-warnings' / 'anas-dash-fleet' / 'anas-dash-pools' / 'anas-dash-arc'
+ * / 'anas-dash-net' / 'anas-dash-status'; Refresh button 'anas-btn-dash-refresh'.
+ * (The old 'anas-dash-overview' / 'anas-dash-io' / 'anas-dash-disks' /
+ * 'anas-dash-shares' sections were folded away by the re-layout.)
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  */
@@ -155,7 +180,7 @@
                 + 'letter-spacing:.6px;color:var(--anas-muted,#6b7280);margin:0 0 8px}'
                 + '.anas-dash-muted{color:var(--anas-muted,#6b7280);font-size:12px}'
                 + '.anas-dash-status{font-size:11px;color:var(--anas-muted,#6b7280)}'
-                + '.anas-dash-status .dot,.anas-dash-shares .dot{display:inline-block;width:8px;'
+                + '.anas-dash-status .dot{display:inline-block;width:8px;'
                 + 'height:8px;border-radius:50%;margin:0 6px;vertical-align:middle}'
                 + '.anas-dash-section{margin-bottom:20px}'
                 + '.anas-dash-cards{display:flex;flex-wrap:wrap;gap:14px}'
@@ -191,7 +216,39 @@
                 + '.anas-dash-cb{display:flex;gap:8px;align-items:flex-start;font-size:12px;padding:9px 11px;'
                 + 'border-radius:10px;margin-bottom:8px}'
                 + '.anas-dash-cb-warn{background:rgba(176,106,18,.13);color:var(--anas-warn,#b06a12)}'
-                + '.anas-dash-cb-bad{background:rgba(194,59,44,.14);color:var(--anas-danger,#c23b2c)}';
+                + '.anas-dash-cb-bad{background:rgba(194,59,44,.14);color:var(--anas-danger,#c23b2c)}'
+                // Recent-activity jobs strip (under the fleet).
+                + '.anas-dash-jobstrip{margin-top:14px}'
+                + '.anas-dash-job{display:flex;align-items:baseline;gap:8px;font-size:12px;padding:5px 0;'
+                + 'border-bottom:1px solid var(--anas-line,#dfe3e8)}'
+                + '.anas-dash-job-k{font-weight:650;color:var(--anas-ink,#232936)}'
+                + '.anas-dash-job-meta{color:var(--anas-muted,#6b7280);font-variant-numeric:tabular-nums}'
+                + '.anas-dash-job-out{margin-left:auto;font-size:10px;text-transform:uppercase;'
+                + 'letter-spacing:.5px;font-weight:800}'
+                + '.anas-dash-job-run{color:var(--anas-accent,#3468c0)}'
+                + '.anas-dash-job-ok{color:var(--anas-ok,#1f9c56)}'
+                + '.anas-dash-job-bad{color:var(--anas-danger,#c23b2c)}'
+                // Pool → VDEV → Device composite hierarchy.
+                + '.anas-dash-pool{padding:14px;border-radius:12px;margin-bottom:14px;box-sizing:border-box;'
+                + 'background:linear-gradient(var(--anas-card-top,#fff),var(--anas-card-bot,#eef1f5));'
+                + 'border:1px solid var(--anas-card-edge,#cfd6df);box-shadow:var(--anas-shadow,0 1px 3px rgba(20,30,50,.12))}'
+                + '.anas-dash-pool-head{display:flex;align-items:center;gap:18px;flex-wrap:wrap}'
+                + '.anas-dash-pool-cap{flex:0 0 auto;text-align:center}'
+                + '.anas-dash-pool-main{flex:1 1 280px;min-width:240px}'
+                + '.anas-dash-pool-name{display:flex;align-items:center;gap:8px;font-weight:750;'
+                + 'font-size:15px;color:var(--anas-ink,#232936);margin-bottom:8px}'
+                + '.anas-dash-pool-io{max-width:520px}'
+                + '.anas-dash-vdev{margin:10px 0 0 4px;padding:8px 10px 8px 12px;border-radius:0 10px 10px 0;'
+                + 'border-left:3px solid var(--anas-card-edge,#cfd6df);background:var(--anas-slot,#f2f4f7)}'
+                + '.anas-dash-vdev-degraded{border-left-color:var(--anas-warn,#b06a12)}'
+                + '.anas-dash-vdev-faulted{border-left-color:var(--anas-danger,#c23b2c)}'
+                + '.anas-dash-vdev-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px}'
+                + '.anas-dash-vdev-name{font-weight:700;color:var(--anas-ink,#232936)}'
+                + '.anas-dash-vdev-type{font-size:10px;text-transform:uppercase;letter-spacing:.5px;'
+                + 'color:var(--anas-muted,#6b7280)}'
+                + '.anas-dash-vdev-io{margin-left:auto;color:var(--anas-muted,#6b7280);'
+                + 'font-variant-numeric:tabular-nums}'
+                + '.anas-dash-devs{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}';
             var style = document.createElement('style');
             style.id = 'anas-dash-styles';
             style.type = 'text/css';
@@ -352,80 +409,6 @@
         return out;
     }
 
-    // 2.1 / 2.2 — per-pool health card: name, a capacity donut (used vs free,
-    // capacity% in the centre), a state pill, a free/used caption, and an
-    // indeterminate activity strip while a scrub/resilver runs.
-    function renderPools(status) {
-        var pools = (status && status.pools) || [];
-        if (!pools.length) {
-            return heading(t('Pool Health')) + muted(t('No pools.'));
-        }
-        var cards = '';
-        for (var i = 0; i < pools.length; i++) {
-            var p = pools[i] || {};
-            var cap = num(p.capacity);
-            var alloc = num(p.allocated);
-            var size = num(p.size);
-            var free = p.free !== undefined ? num(p.free) : Math.max(size - alloc, 0);
-
-            var donut = '';
-            try {
-                if (gfx && typeof gfx.donut === 'function') {
-                    donut = gfx.donut(
-                        [
-                            { label: t('Used'), value: alloc },
-                            { label: t('Free'), value: free, free: true }
-                        ],
-                        { size: 108, center: { big: Math.round(cap) + '%', sm: ANAS.formatBytes(size) } }
-                    ) || '';
-                }
-            } catch (eD) {
-                donut = '';
-            }
-            if (!donut) {
-                // gfx unavailable — a plain fullness bar still conveys capacity.
-                donut = fallbackBar(cap / 100, cap >= 90 ? BAD_COLOR : (cap >= 75 ? WARN_COLOR : OK_COLOR))
-                    + '<div class="anas-dash-muted" style="margin-top:4px">' + enc(Math.round(cap) + '%') + '</div>';
-            }
-
-            var pill = '';
-            try {
-                if (gfx && typeof gfx.statePill === 'function') {
-                    pill = gfx.statePill(p.state, { label: p.state }) || '';
-                }
-            } catch (eP) {
-                pill = '';
-            }
-            if (!pill) {
-                pill = ANAS.renderState(p.state);
-            }
-
-            var scan = '';
-            if (p.scanRunning) {
-                try {
-                    if (gfx && typeof gfx.activity === 'function') {
-                        scan = '<div style="margin-top:10px">'
-                            + (gfx.activity(null, { label: t('Scrub / Resilver') }) || '')
-                            + '</div>';
-                    }
-                } catch (eA) {
-                    scan = '';
-                }
-            }
-
-            cards += '<div class="anas-dash-card" style="text-align:center;min-width:180px">'
-                + '<div class="anas-dash-card-title" style="justify-content:center">' + enc(p.name) + '</div>'
-                + donut
-                + '<div style="margin-top:8px">' + pill + '</div>'
-                + '<div class="anas-dash-muted" style="margin-top:6px">'
-                + enc(ANAS.formatBytes(alloc) + ' ' + t('used') + ' · '
-                    + ANAS.formatBytes(free) + ' ' + t('free')) + '</div>'
-                + scan
-                + '</div>';
-        }
-        return heading(t('Pool Health')) + '<div class="anas-dash-cards">' + cards + '</div>';
-    }
-
     // A coloured count tile for the fleet summary.
     function statTile(n, label, color) {
         return '<div class="anas-dash-stat">'
@@ -433,8 +416,111 @@
             + '<div class="anas-dash-stat-l">' + enc(label) + '</div></div>';
     }
 
-    // 2.2 — disk fleet health: healthy / warning / critical / unknown counts.
-    function fleetHtml(status) {
+    // ---- Jobs / activity time formatting -----------------------------------
+
+    // Coerce an ISO string or epoch (ms or s) to epoch-ms; NaN when absent/bad.
+    function toMs(v) {
+        if (v === null || v === undefined || v === '') { return NaN; }
+        if (typeof v === 'number') {
+            // Heuristic: a 10-digit epoch is seconds; widen to milliseconds.
+            return v < 1e12 ? v * 1000 : v;
+        }
+        var p = Date.parse('' + v);
+        return isNaN(p) ? NaN : p;
+    }
+
+    // Human duration from milliseconds: "45s", "12m 3s", "1h 2m", "2d 3h".
+    function fmtDur(ms) {
+        var n = Number(ms);
+        if (isNaN(n) || n < 0) { return '—'; }
+        var s = Math.round(n / 1000);
+        if (s < 60) { return s + 's'; }
+        var m = Math.floor(s / 60); s = s % 60;
+        if (m < 60) { return m + 'm ' + s + 's'; }
+        var h = Math.floor(m / 60); m = m % 60;
+        if (h < 24) { return h + 'h ' + m + 'm'; }
+        var d = Math.floor(h / 24); h = h % 24;
+        return d + 'd ' + h + 'h';
+    }
+
+    // Relative "time ago" from an epoch-ms; "just now" under 10s. Never negative.
+    function relAgo(ms) {
+        var n = Number(ms);
+        if (isNaN(n)) { return ''; }
+        var delta = Date.now() - n;
+        if (delta < 0) { delta = 0; }
+        if (delta < 10000) { return t('just now'); }
+        return fmtDur(delta) + ' ' + t('ago');
+    }
+
+    // 2.4 — enriched recent-activity strip. Each job renders as
+    // "<kind [target]> · <when> · <ran|elapsed duration>" plus an outcome tag.
+    // Running jobs show elapsed since startedAt; finished jobs show finishedAt
+    // relative + the run duration (durationMs, else finishedAt − startedAt).
+    function jobsStrip(status) {
+        var jobs = (status && status.jobs) || [];
+        if (!jobs.length) {
+            return heading(t('Recent activity')) + muted(t('No recent jobs.'));
+        }
+        var maxRows = Math.min(jobs.length, 6);
+        var rows = '';
+        for (var i = 0; i < maxRows; i++) {
+            var j = jobs[i] || {};
+            var kind = j.kind || j.id || t('job');
+            var target = j.target || j.pool || j.dataset || j.name || '';
+            var st = ('' + (j.status || '')).toLowerCase();
+            var started = toMs(j.startedAt);
+            var finished = toMs(j.finishedAt);
+            var running = isNaN(finished)
+                && (st === 'running' || st === 'active' || st === 'in_progress'
+                    || st === 'pending' || st === '');
+
+            var when = '';
+            var durPart = '';
+            var outCls = 'anas-dash-job-ok';
+            var outTxt = st || t('done');
+            if (running) {
+                outCls = 'anas-dash-job-run';
+                outTxt = t('running');
+                when = t('running');
+                if (!isNaN(started)) {
+                    durPart = t('elapsed') + ' ' + fmtDur(Date.now() - started);
+                }
+            } else {
+                if (st === 'failed' || st === 'error' || st === 'cancelled' || st === 'canceled') {
+                    outCls = 'anas-dash-job-bad';
+                }
+                when = !isNaN(finished) ? relAgo(finished) : (!isNaN(started) ? relAgo(started) : '');
+                var dur = j.durationMs;
+                if ((dur === null || dur === undefined || isNaN(Number(dur)))
+                    && !isNaN(finished) && !isNaN(started)) {
+                    dur = finished - started;
+                }
+                if (dur !== null && dur !== undefined && !isNaN(Number(dur))) {
+                    durPart = t('ran') + ' ' + fmtDur(dur);
+                }
+            }
+
+            var meta = [];
+            if (when) { meta.push(when); }
+            if (durPart) { meta.push(durPart); }
+
+            rows += '<div class="anas-dash-job">'
+                + '<span class="anas-dash-job-k">' + enc(kind + (target ? ' ' + target : '')) + '</span>'
+                + (meta.length ? '<span class="anas-dash-job-meta">· ' + enc(meta.join(' · ')) + '</span>' : '')
+                + '<span class="anas-dash-job-out ' + outCls + '">' + enc(outTxt) + '</span>'
+                + '</div>';
+        }
+        if (jobs.length > maxRows) {
+            rows += '<div class="anas-dash-muted" style="margin-top:6px">'
+                + enc('+' + (jobs.length - maxRows) + ' ' + t('more')) + '</div>';
+        }
+        return heading(t('Recent activity')) + rows;
+    }
+
+    // 2.2 — disk fleet health, now at the TOP: healthy / warning / critical /
+    // unknown count tiles + total, with the recent-activity strip alongside.
+    function renderFleet(status) {
         var d = (status && status.disks) || {};
         var tiles = '<div class="anas-dash-stats">'
             + statTile(num(d.healthy), t('Healthy'), OK_COLOR)
@@ -444,70 +530,11 @@
             + '</div>'
             + '<div class="anas-dash-muted" style="margin-top:8px">'
             + enc(num(d.total) + ' ' + t('disks total')) + '</div>';
-        return heading(t('Disk Fleet')) + tiles;
-    }
-
-    // Service-active dot: green active, red stopped, muted unknown (undefined).
-    function svcDot(active) {
-        var color = active === true ? OK_COLOR : (active === false ? BAD_COLOR : MUTED_COLOR);
-        return '<span class="dot" style="background:' + color + '"></span>';
-    }
-
-    function svcLabel(active) {
-        return active === true ? t('active') : (active === false ? t('stopped') : t('unknown'));
-    }
-
-    // 2.3 — SMB / NFS share counts + service-active state.
-    function sharesHtml(status) {
-        var s = (status && status.shares) || {};
-        var smbBadge = '';
-        var nfsBadge = '';
-        try {
-            if (gfx && typeof gfx.badge === 'function') {
-                smbBadge = gfx.badge('SMB', { kind: 'smb' }) || '';
-                nfsBadge = gfx.badge('NFS', { kind: 'nfs' }) || '';
-            }
-        } catch (e) {
-            smbBadge = '';
-            nfsBadge = '';
-        }
-        var rows = '<div class="anas-dash-metric">' + smbBadge
-            + '<span class="anas-dash-metric-lbl" style="width:auto">'
-            + enc(num(s.smbCount) + ' ' + t('shares')) + '</span>'
-            + svcDot(s.smbActive) + '<span class="anas-dash-muted">' + enc(svcLabel(s.smbActive)) + '</span></div>'
-            + '<div class="anas-dash-metric">' + nfsBadge
-            + '<span class="anas-dash-metric-lbl" style="width:auto">'
-            + enc(num(s.nfsCount) + ' ' + t('exports')) + '</span>'
-            + svcDot(s.nfsActive) + '<span class="anas-dash-muted">' + enc(svcLabel(s.nfsActive)) + '</span></div>';
-        return heading(t('Shares')) + rows;
-    }
-
-    // 2.4 — a short active-jobs list (kind + status), capped with a "+N more".
-    function jobsHtml(status) {
-        var jobs = (status && status.jobs) || [];
-        if (!jobs.length) {
-            return heading(t('Active Jobs')) + muted(t('No active jobs.'));
-        }
-        var maxRows = Math.min(jobs.length, 6);
-        var rows = '';
-        for (var i = 0; i < maxRows; i++) {
-            var j = jobs[i] || {};
-            rows += '<div class="anas-dash-jobrow"><span>' + enc(j.kind || j.id || t('job')) + '</span>'
-                + '<span class="anas-dash-muted">' + enc(j.status || '') + '</span></div>';
-        }
-        if (jobs.length > maxRows) {
-            rows += '<div class="anas-dash-muted" style="margin-top:4px">'
-                + enc('+' + (jobs.length - maxRows) + ' ' + t('more')) + '</div>';
-        }
-        return heading(t('Active Jobs')) + rows;
-    }
-
-    // Fleet + shares + jobs in one three-column row.
-    function renderOverview(status) {
         return '<div class="anas-dash-row">'
-            + '<div class="anas-dash-col anas-dash-fleet">' + fleetHtml(status) + '</div>'
-            + '<div class="anas-dash-col anas-dash-shares">' + sharesHtml(status) + '</div>'
-            + '<div class="anas-dash-col anas-dash-jobs">' + jobsHtml(status) + '</div>'
+            + '<div class="anas-dash-col" style="flex:1 1 340px">'
+            + heading(t('Disk Fleet')) + tiles + '</div>'
+            + '<div class="anas-dash-col anas-dash-jobs" style="flex:1 1 300px">'
+            + '<div class="anas-dash-jobstrip">' + jobsStrip(status) + '</div></div>'
             + '</div>';
     }
 
@@ -567,68 +594,213 @@
         return '';
     }
 
-    // 2.7 — per-pool read/write throughput bars + sparklines + IOPS + latency.
-    function renderPoolIo(view, tel) {
-        var pools = (tel && tel.pools) || [];
-        if (!pools.length) {
-            return heading(t('Pool I/O')) + muted(t('No pool I/O.'));
+    // ---- Pool → VDEV → Device composite (the headline) ---------------------
+    //
+    // ONE nested hierarchy per pool, absorbing the old Pool-health / Pool-I/O /
+    // Disk-I/O sections. State/capacity/scan come from /status; live I/O comes
+    // from the matching /telemetry pool (by name); vdevs and devices come from
+    // the telemetry pool's nested vdevs[].disks[]. Both caches live on the view
+    // and this renders from whichever we have (fail-open, last-good preserved).
+
+    // A telemetry device tile: disk object + live throughput + latency + a
+    // combined-throughput sparkline. Kind defaults to 'hdd', state to 'online'
+    // (telemetry carries no per-disk health) — scoped to its vdev by nesting.
+    function renderDevice(view, dev) {
+        dev = dev || {};
+        var id = dev.id || 'disk';
+        var iconHtml = '';
+        try {
+            if (gfx && typeof gfx.icon === 'function') {
+                iconHtml = gfx.icon('hdd', { state: 'online', title: id }) || '';
+            }
+        } catch (e) {
+            iconHtml = '';
         }
-        var body = '';
-        for (var i = 0; i < pools.length; i++) {
-            var p = pools[i] || {};
-            var name = p.name || ('pool' + i);
-            body += '<div class="anas-dash-card" style="min-width:290px;flex:1 1 300px">'
-                + '<div class="anas-dash-card-title"><span>' + poolGlyph() + ' ' + enc(name) + '</span>'
-                + '<span class="anas-dash-muted">'
-                + enc(iops(p.readIops) + ' r · ' + iops(p.writeIops) + ' w IOPS') + '</span></div>'
-                + metricRow(view, 'pool.' + name + '.read', t('Read'), p.readBytesPerSec, READ_COLOR)
-                + metricRow(view, 'pool.' + name + '.write', t('Write'), p.writeBytesPerSec, WRITE_COLOR)
-                + '<div class="anas-dash-muted" style="margin-top:6px">'
-                + enc(t('Latency') + '  ▼ ' + fmtLat(p.readLatencyNs)
-                    + '   ▲ ' + fmtLat(p.writeLatencyNs)) + '</div>'
-                + '</div>';
-        }
-        return heading(t('Pool I/O — live throughput'))
-            + '<div class="anas-dash-cards">' + body + '</div>';
+        var total = num(dev.readBytesPerSec) + num(dev.writeBytesPerSec);
+        var arr = pushSpark(view, 'disk.' + id, total);
+        var spark = sparkline(arr, { color: 'var(--anas-accent,#3468c0)', width: 66, height: 18 });
+        return '<div class="anas-dash-disk">' + iconHtml
+            + '<div style="min-width:0">'
+            + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(shortId(id)) + '</div>'
+            + '<div class="anas-dash-disk-sub">'
+            + enc('▼ ' + bps(dev.readBytesPerSec) + '  ▲ ' + bps(dev.writeBytesPerSec)) + '</div>'
+            + '<div class="anas-dash-disk-sub">' + enc(t('lat') + ' ' + fmtLat(pickLat(dev))) + '</div>'
+            + spark
+            + '</div></div>';
     }
 
-    // 2.7 — per-disk objects in a compact grid, each with live throughput +
-    // latency + a combined-throughput sparkline. Kind defaults to 'hdd' and
-    // state to 'online' (telemetry carries no per-disk health) — fail-open.
-    function renderDisks(view, tel) {
-        var disks = (tel && tel.disks) || [];
-        if (!disks.length) {
-            return heading(t('Disk I/O')) + muted(t('No per-disk telemetry.'));
-        }
-        var grid = '';
-        for (var i = 0; i < disks.length; i++) {
-            var d = disks[i] || {};
-            var id = d.id || ('disk' + i);
-            var iconHtml = '';
-            try {
-                if (gfx && typeof gfx.icon === 'function') {
-                    iconHtml = gfx.icon('hdd', {
-                        state: 'online',
-                        title: id + (d.pool ? (' · ' + d.pool) : '')
-                    }) || '';
-                }
-            } catch (e) {
-                iconHtml = '';
+    // A vdev group: name + type + its state pill + aggregated I/O, over a device
+    // grid. The left border + a *-degraded/-faulted class make a degraded vdev
+    // read as degraded even at a glance (colour keyed off gfx.pillLevel).
+    function renderVdev(view, vdev) {
+        vdev = vdev || {};
+        var lvl = '';
+        try {
+            if (gfx && typeof gfx.pillLevel === 'function') {
+                lvl = gfx.pillLevel(vdev.state) || '';
             }
-            var total = num(d.readBytesPerSec) + num(d.writeBytesPerSec);
-            var arr = pushSpark(view, 'disk.' + id, total);
-            var spark = sparkline(arr, { color: 'var(--anas-accent,#3468c0)', width: 66, height: 18 });
-            grid += '<div class="anas-dash-disk">' + iconHtml
-                + '<div style="min-width:0">'
-                + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(shortId(id)) + '</div>'
-                + '<div class="anas-dash-disk-sub">'
-                + enc('▼ ' + bps(d.readBytesPerSec) + '  ▲ ' + bps(d.writeBytesPerSec)) + '</div>'
-                + '<div class="anas-dash-disk-sub">' + enc(t('lat') + ' ' + fmtLat(pickLat(d))) + '</div>'
-                + spark
-                + '</div></div>';
+        } catch (eL) {
+            lvl = '';
         }
-        return heading(t('Disk I/O — per device'))
-            + '<div class="anas-dash-diskgrid">' + grid + '</div>';
+        var pill = '';
+        try {
+            if (gfx && typeof gfx.statePill === 'function' && vdev.state) {
+                pill = gfx.statePill(vdev.state, { label: vdev.state }) || '';
+            }
+        } catch (eP) {
+            pill = '';
+        }
+        if (!pill && vdev.state) {
+            pill = '<span class="anas-dash-muted">' + enc('' + vdev.state) + '</span>';
+        }
+        var name = vdev.name || vdev.type || t('vdev');
+        var typeTag = vdev.type
+            ? '<span class="anas-dash-vdev-type">' + enc(vdev.type) + '</span>' : '';
+        var io = '<span class="anas-dash-vdev-io">'
+            + enc('▼ ' + bps(vdev.readBytesPerSec) + '  ▲ ' + bps(vdev.writeBytesPerSec)
+                + '  ·  ' + iops(vdev.readIops) + '/' + iops(vdev.writeIops) + ' IOPS') + '</span>';
+        var devs = vdev.disks || [];
+        var devHtml = '';
+        for (var i = 0; i < devs.length; i++) {
+            devHtml += renderDevice(view, devs[i]);
+        }
+        return '<div class="anas-dash-vdev' + (lvl ? ' anas-dash-vdev-' + lvl : '') + '">'
+            + '<div class="anas-dash-vdev-head">'
+            + '<span class="anas-dash-vdev-name">' + enc(name) + '</span>'
+            + typeTag + pill + io + '</div>'
+            + (devHtml ? '<div class="anas-dash-devs">' + devHtml + '</div>' : '')
+            + '</div>';
+    }
+
+    // A single pool block: the good card look (state pill + capacity donut) +
+    // aggregate live I/O + scan indicator, then the nested vdevs. `p` is the
+    // /status pool (capacity/state/scan); `tp` is the matched /telemetry pool
+    // (I/O + vdevs), or null when telemetry hasn't landed for this pool yet.
+    function renderPoolBlock(view, p, tp) {
+        var name = p.name || 'pool';
+        var cap = num(p.capacity);
+        var alloc = num(p.allocated);
+        var size = num(p.size);
+        var free = p.free !== undefined ? num(p.free) : Math.max(size - alloc, 0);
+
+        var donut = '';
+        try {
+            if (gfx && typeof gfx.donut === 'function' && (size > 0 || alloc > 0 || free > 0)) {
+                donut = gfx.donut(
+                    [
+                        { label: t('Used'), value: alloc },
+                        { label: t('Free'), value: free, free: true }
+                    ],
+                    { size: 104, center: { big: Math.round(cap) + '%', sm: ANAS.formatBytes(size) } }
+                ) || '';
+            }
+        } catch (eD) {
+            donut = '';
+        }
+        if (!donut && p.capacity !== undefined) {
+            // gfx unavailable — a plain fullness bar still conveys capacity.
+            donut = fallbackBar(cap / 100, cap >= 90 ? BAD_COLOR : (cap >= 75 ? WARN_COLOR : OK_COLOR))
+                + '<div class="anas-dash-muted" style="margin-top:4px">' + enc(Math.round(cap) + '%') + '</div>';
+        }
+
+        var pill = '';
+        try {
+            if (gfx && typeof gfx.statePill === 'function' && p.state) {
+                pill = gfx.statePill(p.state, { label: p.state }) || '';
+            }
+        } catch (eP) {
+            pill = '';
+        }
+        if (!pill && p.state && ANAS.renderState) {
+            pill = ANAS.renderState(p.state);
+        }
+
+        // Aggregate live read/write I/O from the telemetry pool level.
+        var ioHtml;
+        if (tp) {
+            ioHtml = '<div class="anas-dash-pool-io">'
+                + metricRow(view, 'pool.' + name + '.read', t('Read'), tp.readBytesPerSec, READ_COLOR)
+                + metricRow(view, 'pool.' + name + '.write', t('Write'), tp.writeBytesPerSec, WRITE_COLOR)
+                + '<div class="anas-dash-muted" style="margin-top:2px">'
+                + enc(iops(tp.readIops) + ' r · ' + iops(tp.writeIops) + ' w IOPS   ·   '
+                    + t('lat') + ' ▼ ' + fmtLat(tp.readLatencyNs) + '  ▲ ' + fmtLat(tp.writeLatencyNs))
+                + '</div></div>';
+        } else {
+            ioHtml = '<div class="anas-dash-pool-io">' + muted(t('Live I/O collecting…')) + '</div>';
+        }
+
+        var capBlock = donut
+            ? '<div class="anas-dash-pool-cap">' + donut
+                + '<div class="anas-dash-muted" style="margin-top:6px">'
+                + enc(ANAS.formatBytes(alloc) + ' / ' + ANAS.formatBytes(size)) + '</div></div>'
+            : '';
+
+        var scan = '';
+        if (p.scanRunning) {
+            try {
+                if (gfx && typeof gfx.activity === 'function') {
+                    scan = '<div style="margin-top:10px">'
+                        + (gfx.activity(null, { label: t('Scrub / Resilver') }) || '')
+                        + '</div>';
+                }
+            } catch (eA) {
+                scan = '';
+            }
+        }
+
+        var vdevs = (tp && tp.vdevs) || [];
+        var vdevHtml = '';
+        for (var i = 0; i < vdevs.length; i++) {
+            vdevHtml += renderVdev(view, vdevs[i]);
+        }
+
+        return '<div class="anas-dash-pool">'
+            + '<div class="anas-dash-pool-head">'
+            + capBlock
+            + '<div class="anas-dash-pool-main">'
+            + '<div class="anas-dash-pool-name">' + poolGlyph()
+            + '<span>' + enc(name) + '</span>' + pill + '</div>'
+            + ioHtml
+            + '</div></div>'
+            + scan
+            + vdevHtml
+            + '</div>';
+    }
+
+    // The headline Pools section: matches /status pools to /telemetry pools by
+    // name and renders each as a Pool → VDEV → Device block. Reads both caches
+    // off the view so it re-renders correctly whichever endpoint ticked.
+    function renderPoolsComposite(view) {
+        var st = view && view._anasStatus;
+        var tel = view && view._anasTelemetry;
+        var statusPools = (st && st.pools) || [];
+        var telPools = (tel && tel.pools) || [];
+
+        var telMap = {};
+        for (var k = 0; k < telPools.length; k++) {
+            if (telPools[k] && telPools[k].name != null) {
+                telMap['' + telPools[k].name] = telPools[k];
+            }
+        }
+
+        // Prefer /status pools (they carry capacity/state); fall back to the
+        // telemetry pools when status hasn't arrived so the section is never
+        // empty on the first telemetry tick.
+        var list = statusPools.length ? statusPools : telPools;
+        if (!list.length) {
+            return heading(t('Pools')) + muted(t('No pools.'));
+        }
+
+        var body = '';
+        for (var i = 0; i < list.length; i++) {
+            var p = list[i] || {};
+            var name = p.name || ('pool' + i);
+            // When falling back to telemetry pools, `p` already IS the telemetry
+            // pool, so use it directly for the I/O side too.
+            var tp = telMap[name] || (statusPools.length ? null : p);
+            body += renderPoolBlock(view, p, tp);
+        }
+        return heading(t('Pools')) + body;
     }
 
     // 2.7 — network correlation view: total rx/tx (link utilization next to the
@@ -702,18 +874,25 @@
                 return;
             }
             var st = unwrap(res, 'pools');
+            view._anasStatus = st; // cache for the composite (needs both endpoints)
             setSection(view, 'anasDashWarnings', renderWarnings(st));
-            setSection(view, 'anasDashPools', renderPools(st));
-            setSection(view, 'anasDashOverview', renderOverview(st));
+            setSection(view, 'anasDashFleet', renderFleet(st));
+            // The Pools composite blends /status (state/capacity/scan) with the
+            // cached /telemetry (I/O + vdevs). Re-render it from both caches.
+            setSection(view, 'anasDashPools', renderPoolsComposite(view));
         }, function (err) {
             if (view.destroyed || view.destroying) {
                 return;
             }
             ANAS.warn('dashboard status failed: ' + ANAS.errText(err));
-            // Fail-open: degrade the status sections to muted "unavailable".
+            // Fail-open: degrade the status-fed sections to muted "unavailable".
             setSection(view, 'anasDashWarnings', '');
-            setSection(view, 'anasDashPools', heading(t('Pool Health')) + muted(t('Status unavailable.')));
-            setSection(view, 'anasDashOverview', muted(t('Status unavailable.')));
+            setSection(view, 'anasDashFleet', heading(t('Disk Fleet')) + muted(t('Status unavailable.')));
+            // Keep the composite if we've ever had status; otherwise show it as
+            // unavailable (telemetry-only pools may still fill in on a good tick).
+            if (!view._anasStatus) {
+                setSection(view, 'anasDashPools', heading(t('Pools')) + muted(t('Status unavailable.')));
+            }
         });
     }
 
@@ -723,11 +902,12 @@
                 return;
             }
             var tel = unwrap(res, 'arc');
+            view._anasTelemetry = tel; // cache for the composite
             view._anasHadTelemetry = true;
             setSection(view, 'anasDashStatus', statusLine(true, t('just now')));
             setSection(view, 'anasDashArc', renderArc(view, tel));
-            setSection(view, 'anasDashIo', renderPoolIo(view, tel));
-            setSection(view, 'anasDashDisks', renderDisks(view, tel));
+            // Pool I/O now lives inside the composite — re-render it each tick.
+            setSection(view, 'anasDashPools', renderPoolsComposite(view));
             setSection(view, 'anasDashNet', renderNet(view, tel));
         }, function (err) {
             if (view.destroyed || view.destroying) {
@@ -737,11 +917,10 @@
             setSection(view, 'anasDashStatus', statusLine(false, ''));
             // Only blank the telemetry sections on the FIRST failure (no good
             // data yet). Once we've had a good sample, keep the last-good render
-            // rather than flickering to "unavailable" on a transient blip.
+            // rather than flickering to "unavailable" on a transient blip. The
+            // Pools composite still shows /status capacity/state without I/O.
             if (!view._anasHadTelemetry) {
                 setSection(view, 'anasDashArc', heading(t('ARC')) + muted(t('Live telemetry unavailable.')));
-                setSection(view, 'anasDashIo', heading(t('Pool I/O')) + muted(t('Live telemetry unavailable.')));
-                setSection(view, 'anasDashDisks', heading(t('Disk I/O')) + muted(t('Live telemetry unavailable.')));
                 setSection(view, 'anasDashNet', heading(t('Network')) + muted(t('Live telemetry unavailable.')));
             }
         });
@@ -881,11 +1060,11 @@
                         cls: 'anas-dash-warnings',
                         html: ''
                     },
-                    section('anasDashPools', 'anas-dash-pools', heading(t('Pool Health')) + muted(t('Loading…'))),
-                    section('anasDashOverview', 'anas-dash-overview', muted(t('Loading…'))),
+                    // Disk Fleet at the top — the at-a-glance view (+ recent activity).
+                    section('anasDashFleet', 'anas-dash-fleet', heading(t('Disk Fleet')) + muted(t('Loading…'))),
+                    // The headline: nested Pool → VDEV → Device composite.
+                    section('anasDashPools', 'anas-dash-pools', heading(t('Pools')) + muted(t('Loading…'))),
                     section('anasDashArc', 'anas-dash-arc', heading(t('ARC')) + muted(t('Connecting…'))),
-                    section('anasDashIo', 'anas-dash-io', heading(t('Pool I/O')) + muted(t('Connecting…'))),
-                    section('anasDashDisks', 'anas-dash-disks', heading(t('Disk I/O')) + muted(t('Connecting…'))),
                     section('anasDashNet', 'anas-dash-net', heading(t('Network')) + muted(t('Connecting…')))
                 ],
                 listeners: {
