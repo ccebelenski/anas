@@ -1,4 +1,4 @@
-import type { Page } from '@playwright/test'
+import type { Locator, Page } from '@playwright/test'
 import { expect, test } from '@playwright/test'
 import { loginToPve, openAnasItem } from './fixtures/pve-ui'
 import {
@@ -9,24 +9,29 @@ import {
   listSnapshots,
   poolExists,
   releaseHolds,
+  sshExec,
 } from './fixtures/stunt-node'
 
 /**
- * Replication stage 1 (story 5.5.1) — the "Replicate…" action on the Datasets
- * view, driven through the real PVE UI on the stunt node (PVE login → ANAS node
- * menu → native Datasets grid → select a dataset → open the Replicate dialog).
- * Companion to the daemon's replicate API specs.
+ * Replication view (story 5.5.3, stage 2) — the dedicated "Replication" menu
+ * item, driven through the real PVE UI on the stunt node (PVE login → ANAS node
+ * menu → native Replication grid). Companion to the daemon's replication specs;
+ * the daemon owns systemd-unit truth, so the browser asserts only on grid state.
  *
- * The dialog's headline feature is HONESTY: before running a local one-shot
- * `zfs send | zfs recv`, it shows the plan (full vs incremental, exact estimated
- * bytes, or a "diverged" dead-end). UI hooks (task brief):
- *   - Datasets view/grid: '.anas-view-datasets', '.anas-grid-datasets'.
- *   - Toolbar button: '.anas-btn-ds-replicate'.
- *   - Dialog window: '.anas-win-replicate'; plan line '.anas-repl-plan'
- *     (with '.anas-repl-diverged' when the plan cannot proceed).
- *   - Fields: '.anas-fld-repl-pool', '.anas-fld-repl-dataset',
- *     '.anas-fld-repl-snapshot', '.anas-fld-repl-snapfirst'; submit
+ * UI hooks (task brief):
+ *   - View/grid: '.anas-view-replication', '.anas-grid-replication'.
+ *   - Toolbar: '.anas-btn-repl-new', '.anas-btn-repl-once', '.anas-btn-repl-run',
+ *     '.anas-btn-repl-edit', '.anas-btn-repl-toggle', '.anas-btn-repl-delete'.
+ *   - Task dialog: '.anas-win-repl-task' (fields '.anas-fld-repl-name',
+ *     '.anas-fld-repl-src-pool', '.anas-fld-repl-src-dataset',
+ *     '.anas-fld-repl-tgt-pool', '.anas-fld-repl-tgt-dataset',
+ *     '.anas-fld-repl-schedule'; submit '.anas-btn-repl-task-submit').
+ *   - Replicate Once dialog: '.anas-win-replicate'; plan line '.anas-repl-plan'
+ *     (with '.anas-repl-diverged' when the plan cannot proceed); submit
  *     '.anas-btn-replicate-submit'.
+ *
+ * Also asserts the Datasets view no longer carries ANY replication surface
+ * (the bleed the user explicitly did not want).
  *
  * Uses the pre-existing 'testpool/share1' dataset. ExtJS boot + panel render is
  * slow — timeouts are generous.
@@ -41,9 +46,15 @@ test.beforeEach(async () => {
   test.skip(!(await poolExists(POOL)), 'testpool not present — run setup-test-data.sh')
 })
 
-/**
- * Select the stunt node, open Datasets, and wait for the tree grid to render.
- */
+/** Select the stunt node, open Replication, wait for the grid to render. */
+async function openReplication(page: Page): Promise<void> {
+  await loginToPve(page)
+  await openAnasItem(page, 'Replication')
+  await expect(page.locator('.anas-view-replication')).toBeVisible({ timeout: 45_000 })
+  await expect(page.locator('.anas-grid-replication')).toBeVisible({ timeout: 45_000 })
+}
+
+/** Select the stunt node, open Datasets, wait for the tree grid to render. */
 async function openDatasets(page: Page): Promise<void> {
   await loginToPve(page)
   await openAnasItem(page, 'Datasets')
@@ -52,63 +63,76 @@ async function openDatasets(page: Page): Promise<void> {
 }
 
 /**
- * Select the 'share1' dataset row and open the Replicate dialog via the toolbar
- * button (enabled once a dataset is selected).
+ * Pick a value in an ExtJS readonly combobox by its display label — click the
+ * field to drop its boundlist, then click the matching item. An exact-match
+ * regex avoids selecting a label that is a prefix of another.
  */
-async function openReplicateDialog(page: Page): Promise<void> {
-  await page.locator('.anas-grid-datasets .x-tree-node-text', { hasText: /^share1$/ }).click()
-  const btn = page.locator('.anas-btn-ds-replicate')
-  await expect(btn).toBeEnabled({ timeout: 20_000 })
-  await btn.click()
-  await expect(page.locator('.anas-win-replicate')).toBeVisible({ timeout: 20_000 })
+async function pickCombo(page: Page, field: Locator, label: string): Promise<void> {
+  await field.click()
+  await page
+    .locator('.x-boundlist:visible .x-boundlist-item', { hasText: new RegExp(`^${label}$`) })
+    .first()
+    .click()
 }
 
-test.describe('ANAS replication dialog — plan preview (stunt node)', () => {
+test.describe('ANAS replication view — grid, toolbar, once dialog (stunt node)', () => {
   test.setTimeout(120_000)
 
-  // A single snapshot so the source has a valid, preselected send point.
-  const SNAP = 'replui1'
+  test('menu shows Replication; grid + toolbar render', async ({ page }) => {
+    await openReplication(page)
 
-  test.beforeEach(async () => {
-    // Clean slate — remove ALL of share1's snapshots so the newest is ours.
+    const view = page.locator('.anas-view-replication')
+    // Core toolbar affordances are present.
+    await expect(view.locator('.anas-btn-repl-new')).toBeVisible({ timeout: 20_000 })
+    await expect(view.locator('.anas-btn-repl-once')).toBeVisible({ timeout: 20_000 })
+    // Selection-gated actions start disabled (nothing selected yet).
+    await expect(view.locator('.anas-btn-repl-run')).toBeDisabled({ timeout: 20_000 })
+    await expect(view.locator('.anas-btn-repl-delete')).toBeDisabled({ timeout: 20_000 })
+  })
+
+  test('the Replicate Once dialog opens, source is pickable, plan resolves', async ({ page }) => {
+    // A single fresh snapshot so the source has a valid send point.
     for (const name of await listSnapshots(DS_FQ))
       await destroySnapshot(DS_FQ, name)
-    await createSnapshot(DS_FQ, SNAP)
+    await createSnapshot(DS_FQ, 'onceui1')
+
+    try {
+      await openReplication(page)
+      await page.locator('.anas-btn-repl-once').click()
+
+      const win = page.locator('.anas-win-replicate')
+      await expect(win).toBeVisible({ timeout: 20_000 })
+
+      // Pick the source pool + dataset in the dialog (no dataset-row context).
+      await pickCombo(page, win.locator('.anas-fld-repl-src-pool'), POOL)
+      await pickCombo(page, win.locator('.anas-fld-repl-src-dataset'), 'share1')
+
+      // The plan line renders and resolves to an honest verdict (any mode).
+      const plan = win.locator('.anas-repl-plan')
+      await expect(plan).toBeVisible({ timeout: 20_000 })
+      await expect(plan).toHaveText(/Incremental|FULL send|plan unavailable/, { timeout: 30_000 })
+
+      // Cancel — no mutation.
+      await win.getByText('Cancel', { exact: true }).click()
+      await expect(win).toBeHidden({ timeout: 20_000 })
+    } finally {
+      await destroySnapshot(DS_FQ, 'onceui1')
+    }
   })
 
-  test.afterEach(async () => {
-    await destroySnapshot(DS_FQ, SNAP)
-  })
-
-  test('opening the dialog shows source, target fields and a plan line', async ({ page }) => {
+  test('the Datasets view carries NO replication surface', async ({ page }) => {
     await openDatasets(page)
-    await openReplicateDialog(page)
-
-    const win = page.locator('.anas-win-replicate')
-    // Target defaults are visible and adjustable.
-    await expect(win.locator('.anas-fld-repl-pool')).toBeVisible({ timeout: 20_000 })
-    // Same-pool default appends -replica so the dialog never opens onto a
-    // self-target (replicating a dataset onto itself is rejected by the daemon).
-    await expect(win.locator('.anas-fld-repl-dataset input')).toHaveValue('share1-replica', { timeout: 20_000 })
-
-    // The plan line renders and resolves to an honest verdict (any mode). It may
-    // pass through "calculating…" first; wait for a terminal state.
-    const plan = win.locator('.anas-repl-plan')
-    await expect(plan).toBeVisible({ timeout: 20_000 })
-    await expect(plan).toHaveText(/Incremental|FULL send|plan unavailable/, { timeout: 30_000 })
-
-    // Cancel — no mutation.
-    await win.getByText('Cancel', { exact: true }).click()
-    await expect(win).toBeHidden({ timeout: 20_000 })
+    // The bleed is gone: the stage-1 toolbar button no longer exists anywhere.
+    await expect(page.locator('.anas-btn-ds-replicate')).toHaveCount(0)
   })
 })
 
 /**
- * End-to-end create — replicate share1@<fresh snap> into a throwaway
+ * End-to-end "Replicate Once" — replicate share1@<fresh snap> into a throwaway
  * 'testpool/replspec' dataset (same pool is legal), poll the real system for the
- * dataset, then tear it down. Mirrors the pool-composer throwaway pattern.
+ * dataset, then tear it down. Mirrors the stage-1 throwaway pattern.
  */
-test.describe('ANAS replication runs a send | recv job (stunt node)', () => {
+test.describe('ANAS Replicate Once runs a send | recv job (stunt node)', () => {
   test.setTimeout(180_000)
 
   const SNAP = 'replspecsnap'
@@ -116,9 +140,9 @@ test.describe('ANAS replication runs a send | recv job (stunt node)', () => {
   const TARGET_FQ = `${POOL}/${TARGET_DS}`
 
   test.beforeEach(async () => {
-    // Replication HOLDS its base snapshot on both sides (by design — the chain
-    // guard). Release holds first or the destroys below silently fail and the
-    // leftover snapshot breaks the next run's createSnapshot.
+    // Replication HOLDS its base snapshot on both sides (the chain guard).
+    // Release holds first or the destroys silently fail and the leftover
+    // snapshot breaks the next run's createSnapshot.
     await releaseHolds(TARGET_FQ)
     await releaseHolds(DS_FQ)
     await destroyDataset(TARGET_FQ)
@@ -135,17 +159,21 @@ test.describe('ANAS replication runs a send | recv job (stunt node)', () => {
   })
 
   test('replicating share1 into testpool/replspec materialises the dataset', async ({ page }) => {
-    await openDatasets(page)
-    await openReplicateDialog(page)
+    await openReplication(page)
+    await page.locator('.anas-btn-repl-once').click()
 
     const win = page.locator('.anas-win-replicate')
+    await expect(win).toBeVisible({ timeout: 20_000 })
+
+    await pickCombo(page, win.locator('.anas-fld-repl-src-pool'), POOL)
+    await pickCombo(page, win.locator('.anas-fld-repl-src-dataset'), 'share1')
+
     // Retarget the destination dataset (target pool defaults to the source pool).
     const dsField = win.locator('.anas-fld-repl-dataset input')
     await dsField.fill(TARGET_DS)
 
-    // The lone fresh snapshot is preselected. Wait for the plan to resolve so the
-    // Replicate button is enabled (a diverged/full plan still runs — a brand-new
-    // target is a clean full send).
+    // Wait for the plan to resolve so the Replicate button is enabled (a brand-new
+    // target is a clean full send — still runnable).
     const plan = win.locator('.anas-repl-plan')
     await expect(plan).toHaveText(/Incremental|FULL send|plan unavailable/, { timeout: 30_000 })
 
@@ -156,5 +184,74 @@ test.describe('ANAS replication runs a send | recv job (stunt node)', () => {
     // The job creates the target on the real system (source of truth). Poll.
     await expect.poll(async () => datasetExists(TARGET_FQ), { timeout: 90_000, intervals: [2_000] })
       .toBe(true)
+  })
+})
+
+/**
+ * Task CRUD through the dialog: create a scheduled task → its row appears with
+ * the schedule and a lag cell → delete it → the row is gone. The daemon owns the
+ * systemd-unit truth (the daemon specs assert that); the browser asserts only on
+ * grid state, per the design.
+ */
+test.describe('ANAS replication task CRUD (stunt node)', () => {
+  test.setTimeout(180_000)
+
+  const TASK = 'spec-repl-task'
+  const TARGET_DS = 'spec-repl-target'
+
+  // Best-effort teardown of the systemd units + throwaway target, so reruns are
+  // clean even if a test aborts mid-way. Never throws (units may not exist).
+  async function cleanupTask(): Promise<void> {
+    await sshExec(
+      `systemctl disable --now anas-repl-${TASK}.timer 2>/dev/null; `
+      + `rm -f /etc/systemd/system/anas-repl-${TASK}.* ; systemctl daemon-reload 2>/dev/null`,
+    ).catch(() => {})
+    await destroyDataset(`${POOL}/${TARGET_DS}`)
+  }
+
+  test.beforeEach(async () => {
+    await cleanupTask()
+  })
+
+  test.afterEach(async () => {
+    await cleanupTask()
+  })
+
+  test('create a task, see its row, then delete it', async ({ page }) => {
+    await openReplication(page)
+
+    // ---- Create ----------------------------------------------------------
+    await page.locator('.anas-btn-repl-new').click()
+    const dlg = page.locator('.anas-win-repl-task')
+    await expect(dlg).toBeVisible({ timeout: 20_000 })
+
+    await dlg.locator('.anas-fld-repl-name input').fill(TASK)
+    await pickCombo(page, dlg.locator('.anas-fld-repl-src-pool'), POOL)
+    await pickCombo(page, dlg.locator('.anas-fld-repl-src-dataset'), 'share1')
+    await pickCombo(page, dlg.locator('.anas-fld-repl-tgt-pool'), POOL)
+    await dlg.locator('.anas-fld-repl-tgt-dataset input').fill(TARGET_DS)
+    await dlg.locator('.anas-fld-repl-schedule input').fill('daily')
+
+    await dlg.locator('.anas-btn-repl-task-submit').click()
+    await expect(dlg).toBeHidden({ timeout: 30_000 })
+
+    // ---- The row appears with its schedule -------------------------------
+    const grid = page.locator('.anas-grid-replication')
+    const row = grid.locator('.x-grid-row', { hasText: TASK })
+    await expect(row).toBeVisible({ timeout: 30_000 })
+    await expect(row).toContainText('daily', { timeout: 20_000 })
+
+    // ---- Delete (Ext.Msg confirm — removes the schedule only) ------------
+    await row.click()
+    const del = page.locator('.anas-btn-repl-delete')
+    await expect(del).toBeEnabled({ timeout: 20_000 })
+    await del.click()
+
+    const confirm = page.locator('.x-message-box:visible')
+    await expect(confirm).toBeVisible({ timeout: 20_000 })
+    await page.getByRole('button', { name: 'Yes' }).click()
+
+    // ---- The row is gone --------------------------------------------------
+    await expect(grid.locator('.x-grid-row', { hasText: TASK })).toHaveCount(0, { timeout: 30_000 })
   })
 })

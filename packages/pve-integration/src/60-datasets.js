@@ -61,12 +61,10 @@
  *        the Clone action is button 'anas-btn-snap-clone' (tree toolbar +
  *        snapshots popup). POST …/snapshots/:snap/clone { target }, then the tree
  *        reloads so the new dataset appears.
- *   5.5.1 replicate a dataset / ANAS pool root via a local one-shot send|recv —
- *        toolbar button 'anas-btn-ds-replicate' + a per-row gfx.ctl('replicate')
- *        icon (gated like snapshot-create). Window 'anas-win-replicate' with an
- *        honest plan preview line 'anas-repl-plan' ('anas-repl-diverged' when the
- *        target diverged). POST …/datasets/<path>/replicate/plan for the preview,
- *        POST …/datasets/<path>/replicate to run; the tree reloads on completion.
+ *
+ * Replication is NOT a Datasets-view function — it lives entirely in the
+ * dedicated Replication view (65-replication.js, story 5.5.3). No replication
+ * surface (toolbar button, row icon, dialog) exists in this file.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  */
@@ -616,9 +614,6 @@
         // have a mountpoint path to share (DESIGN 5a/5d). zvols cannot.
         setDisabled(tree, 'dsShare', !fs || pve);
         setDisabled(tree, 'dsDestroy', !ds || pve);
-        // Replicate: like snapshot-create — enabled for datasets and ANAS-managed
-        // pool roots, gated on PVE-managed rows and (implicitly) snapshot rows.
-        setDisabled(tree, 'dsReplicate', !dsOrRoot || pve);
         // Snapshot actions: create/list act on a selected dataset or the pool
         // root; the rollback/rename/destroy trio act on a selected snapshot row.
         setDisabled(tree, 'snapCreate', !dsOrRoot || pve);
@@ -3011,452 +3006,6 @@
     }
 
     // ======================================================================
-    //  Replication — stage 1 (story 5.5.1)
-    //
-    //  A "Replicate…" action (toolbar + per-row icon) on a dataset or an
-    //  ANAS-managed pool root. The dialog runs a LOCAL one-shot
-    //  `zfs send | zfs recv` job, but first shows an HONEST plan (full vs
-    //  incremental, exact estimated bytes, or a "diverged" dead-end) so the
-    //  operator knows what will happen before committing. The dedicated
-    //  Replication menu view is STAGE 2 and lives elsewhere.
-    //
-    //  API contract (a parallel agent builds the daemon):
-    //    POST …/datasets/<path>/replicate/plan  { target:{pool,dataset?},
-    //         snapshot? } → { mode:'full'|'incremental', snapshot, baseSnapshot?,
-    //         estimatedBytes, targetExists, targetDiverged }
-    //    POST …/datasets/<path>/replicate       { target:{pool,dataset?},
-    //         snapshot?, snapshotFirst? } → 202 { job }
-    //
-    //  Test hooks: window 'anas-win-replicate', the plan line 'anas-repl-plan'
-    //  (with 'anas-repl-diverged' added when the plan is a dead-end).
-    // ======================================================================
-
-    // Reduce a snapshot reference (bare name OR fully-qualified ds@snap) to its
-    // '@label' form for display, e.g. 'snap-x' / 'pool/ds@snap-x' → '@snap-x'.
-    function atLabel(s) {
-        s = '' + (s == null ? '' : s);
-        var i = s.lastIndexOf('@');
-        return i >= 0 ? s.substring(i) : ('@' + s);
-    }
-
-    function replSubmitBtn(win) {
-        return win && !win.destroyed ? win.down('#replicateSubmit') : null;
-    }
-
-    function setReplSubmit(win, enabled) {
-        var btn = replSubmitBtn(win);
-        if (btn) {
-            btn.setDisabled(!enabled);
-        }
-    }
-
-    // Update the plan line's inner html + toggle the diverged (danger) hook.
-    function updatePlanCmp(win, html, diverged) {
-        try {
-            var cmp = win.down('#planLine');
-            if (!cmp) {
-                return;
-            }
-            if (diverged) {
-                cmp.addCls('anas-repl-diverged');
-            } else {
-                cmp.removeCls('anas-repl-diverged');
-            }
-            cmp.update(html == null ? '' : html);
-        } catch (e) {
-            // display hint only
-        }
-    }
-
-    function renderReplCalculating(win) {
-        updatePlanCmp(win, '<span style="color:gray;">' + enc(t('calculating…')) + '</span>', false);
-    }
-
-    // Plan endpoint failed → the daemon re-validates inside the job, so we do NOT
-    // block the run: show a muted "plan unavailable" and keep the button enabled.
-    function renderReplUnavailable(win) {
-        updatePlanCmp(win, '<span style="color:gray;">' + enc(t('plan unavailable')) + '</span>', false);
-        setReplSubmit(win, true);
-    }
-
-    function renderReplPlan(win, plan) {
-        if (!plan) {
-            renderReplUnavailable(win);
-            return;
-        }
-        win._lastPlan = plan;
-        // Dead-end: target exists but shares no common snapshot with the source.
-        if (plan.targetDiverged) {
-            var msg = t('Target exists with no common snapshot — replication cannot '
-                + 'proceed; choose a different target');
-            var html;
-            if (ANAS.gfx && typeof ANAS.gfx.callout === 'function') {
-                html = ANAS.gfx.callout(enc(msg), { level: 'bad' });
-            } else {
-                html = '<span style="color:#c23b2c;font-weight:600;">' + enc(msg) + '</span>';
-            }
-            updatePlanCmp(win, html, true);
-            setReplSubmit(win, false);
-            return;
-        }
-        var bytes = ANAS.formatBytes(plan.estimatedBytes);
-        var sizeText = bytes ? ('~' + bytes) : t('unknown size');
-        var out;
-        if (plan.mode === 'incremental') {
-            // Calm style — a small delta on top of a shared base snapshot.
-            var base = plan.baseSnapshot
-                ? (' <span style="color:gray;">(' + enc(t('base')) + ' '
-                    + enc(atLabel(plan.baseSnapshot)) + ')</span>')
-                : '';
-            out = '<span style="color:var(--anas-ok,#1f9c56);font-weight:600;">'
-                + enc(t('Incremental')) + '</span> &mdash; ' + enc(sizeText) + base;
-        } else {
-            // Warning style — a full send moves the entire dataset.
-            out = '<span style="color:var(--anas-warn,#b06a12);font-weight:700;">'
-                + enc(t('FULL send')) + '</span> &mdash; '
-                + '<span style="color:var(--anas-warn,#b06a12);">' + enc(sizeText) + '</span>';
-        }
-        updatePlanCmp(win, out, false);
-        setReplSubmit(win, true);
-    }
-
-    // Fetch the plan for the current dialog selections. Sequenced so only the
-    // latest response is applied (target/snapshot can change fast).
-    function fetchReplPlan(node, win, srcPool, srcFull) {
-        if (!win || win.destroyed || win.destroying) {
-            return;
-        }
-        var targetPool = valOf(win, '#targetPool');
-        if (!targetPool) {
-            renderReplUnavailable(win);
-            return;
-        }
-        var body = { target: { pool: targetPool } };
-        var targetDs = (valOf(win, '#targetDataset') || '').replace(/^\/+|\/+$/g, '');
-        if (targetDs) {
-            body.target.dataset = targetDs;
-        }
-        // snapshotFirst plans against a to-be-created snapshot — omit an explicit
-        // snapshot and let the daemon estimate against current state.
-        if (!valOf(win, '#snapshotFirst')) {
-            var snap = valOf(win, '#snapshot');
-            if (snap) {
-                body.snapshot = snap;
-            }
-        }
-        var seq = (win._planSeq = (win._planSeq || 0) + 1);
-        renderReplCalculating(win);
-        ANAS.api.post(node, datasetPath(srcPool, srcFull, 'replicate/plan'), body).then(
-            function (res) {
-                if (win.destroyed || win.destroying || seq !== win._planSeq) {
-                    return;
-                }
-                renderReplPlan(win, (res && res.data) || null);
-            },
-            function (err) {
-                if (win.destroyed || win.destroying || seq !== win._planSeq) {
-                    return;
-                }
-                ANAS.warn('replicate plan failed: ' + ANAS.errText(err));
-                renderReplUnavailable(win);
-            }
-        );
-    }
-
-    // Small getter — value of a field by itemId, tolerant of a missing field.
-    function valOf(win, sel) {
-        try {
-            var f = win.down(sel);
-            return f ? f.getValue() : undefined;
-        } catch (e) {
-            return undefined;
-        }
-    }
-
-    function openReplicate(node, tree, rec) {
-        // Accept a dataset OR the ANAS pool root (its empty relative path is
-        // handled by datasetPath/snapshotsPath, like snapshot-create).
-        if (!isDataset(rec) && !(rec && rec.get('kind') === 'pool')) {
-            return;
-        }
-        if (recPveManaged(rec)) {
-            ANAS.toast(t('PVE manages this pool — replication is disabled in ANAS.'));
-            return;
-        }
-        var srcPool = rec.get('pool');
-        var srcFull = rec.get('fullName');
-        var isRoot = (srcFull === srcPool);
-        var srcRel = relPath(srcFull, srcPool);
-
-        // Target-pool picker: ANAS-managed pools (same pool is legal); PVE pools
-        // excluded via anasPoolNames' pveManaged filter.
-        var pools = anasPoolNames(tree);
-
-        // Target dataset default: the source's relative path, or the source pool
-        // name when replicating a pool root. BUT when the default pool is the
-        // SOURCE pool (single-pool systems), that would target the dataset onto
-        // itself — default to '<name>-replica' instead so the dialog opens onto
-        // a valid plan rather than a self-target error.
-        var defaultPool = pools.indexOf(srcPool) >= 0 ? srcPool : pools[0];
-        var defaultTargetDs = isRoot ? srcPool : srcRel;
-        if (defaultPool === srcPool) {
-            defaultTargetDs = (isRoot ? srcPool : srcRel) + '-replica';
-        }
-        var poolData = [];
-        for (var i = 0; i < pools.length; i++) {
-            poolData.push({ name: pools[i] });
-        }
-        if (!poolData.length) {
-            ANAS.toast(t('No ANAS-managed pool is available as a replication target.'));
-            return;
-        }
-        var poolStore = Ext.create('Ext.data.Store', {
-            fields: ['name'],
-            data: poolData,
-        });
-        var snapStore = Ext.create('Ext.data.Store', {
-            fields: ['snapshotName', 'label'],
-            data: [],
-        });
-
-        var win;
-        try {
-            win = Ext.create('Ext.window.Window', {
-                cls: 'anas-win-replicate',
-                title: t('Replicate') + ': ' + srcFull,
-                modal: true,
-                width: 520,
-                resizable: false,
-                layout: 'fit',
-                items: [{
-                    xtype: 'form',
-                    itemId: 'form',
-                    bodyPadding: 12,
-                    border: false,
-                    defaults: { anchor: '100%', labelWidth: 150 },
-                    items: [
-                        {
-                            xtype: 'displayfield',
-                            fieldLabel: t('Source'),
-                            value: enc(srcFull),
-                        },
-                        {
-                            xtype: 'combobox',
-                            itemId: 'targetPool',
-                            cls: 'anas-fld-repl-pool',
-                            fieldLabel: t('Target pool'),
-                            store: poolStore,
-                            valueField: 'name',
-                            displayField: 'name',
-                            queryMode: 'local',
-                            editable: false,
-                            forceSelection: true,
-                            allowBlank: false,
-                            value: defaultPool,
-                        },
-                        {
-                            xtype: 'textfield',
-                            itemId: 'targetDataset',
-                            cls: 'anas-fld-repl-dataset',
-                            fieldLabel: t('Target dataset'),
-                            emptyText: srcPool + '/replica',
-                            value: defaultTargetDs,
-                            selectOnFocus: true,
-                        },
-                        {
-                            xtype: 'combobox',
-                            itemId: 'snapshot',
-                            cls: 'anas-fld-repl-snapshot',
-                            fieldLabel: t('Snapshot'),
-                            store: snapStore,
-                            valueField: 'snapshotName',
-                            displayField: 'label',
-                            queryMode: 'local',
-                            editable: false,
-                            forceSelection: true,
-                            emptyText: t('(loading snapshots…)'),
-                        },
-                        {
-                            xtype: 'checkboxfield',
-                            itemId: 'snapshotFirst',
-                            cls: 'anas-fld-repl-snapfirst',
-                            fieldLabel: t('Snapshot first'),
-                            boxLabel: t('Snapshot now and replicate'),
-                        },
-                        {
-                            xtype: 'component',
-                            itemId: 'planLine',
-                            cls: 'anas-repl-plan',
-                            margin: '10 0 0 0',
-                            style: 'padding:8px 10px;border-radius:8px;'
-                                + 'background:rgba(127,127,127,0.08);font-size:12px;',
-                            html: '',
-                        },
-                    ],
-                }],
-                buttons: [
-                    {
-                        text: t('Cancel'),
-                        handler: function () { win.close(); },
-                    },
-                    {
-                        text: t('Replicate'),
-                        itemId: 'replicateSubmit',
-                        cls: 'anas-btn-replicate-submit',
-                        disabled: true,
-                        handler: function () {
-                            try {
-                                submitReplicate(win, node, tree, srcPool, srcFull);
-                            } catch (e) {
-                                ANAS.warn('replicate submit failed: ' + ANAS.errText(e));
-                            }
-                        },
-                    },
-                ],
-            });
-        } catch (e) {
-            ANAS.warn('replicate window failed: ' + ANAS.errText(e));
-            return;
-        }
-
-        var replan = function () {
-            fetchReplPlan(node, win, srcPool, srcFull);
-        };
-
-        // Re-plan on any input that changes the plan. Text field is buffered so
-        // typing a target path does not hammer the endpoint.
-        try {
-            win.down('#targetPool').on('change', replan);
-            win.down('#targetDataset').on('change', replan, null, { buffer: 400 });
-            win.down('#snapshot').on('change', replan);
-            win.down('#snapshotFirst').on('change', function (f) {
-                var snapFld = win.down('#snapshot');
-                if (snapFld) {
-                    snapFld.setDisabled(!!f.getValue());
-                }
-                replan();
-            });
-        } catch (eWire) {
-            ANAS.warn('replicate wiring failed: ' + ANAS.errText(eWire));
-        }
-
-        win.show();
-        renderReplCalculating(win);
-
-        // Load the source's snapshots; newest preselected. Kick off the initial
-        // plan once loaded (or immediately if there are none — snapshotFirst is
-        // then the natural path).
-        ANAS.api.get(node, snapshotsPath(srcPool, srcFull)).then(function (res) {
-            if (win.destroyed || win.destroying) {
-                return;
-            }
-            var snaps = (res && res.data) || [];
-            // Newest first — sort by creation time descending, best-effort.
-            snaps = snaps.slice().sort(function (a, b) {
-                var ca = new Date(a && a.created).getTime() || 0;
-                var cb = new Date(b && b.created).getTime() || 0;
-                return cb - ca;
-            });
-            var data = [];
-            for (var j = 0; j < snaps.length; j++) {
-                var s = snaps[j] || {};
-                data.push({
-                    snapshotName: s.snapshotName,
-                    label: '@' + s.snapshotName
-                        + (s.created ? '  (' + formatCreatedPlain(s.created) + ')' : ''),
-                });
-            }
-            snapStore.loadData(data);
-            var snapFld = win.down('#snapshot');
-            if (snapFld && data.length) {
-                snapFld.setValue(data[0].snapshotName);
-            }
-            replan();
-        }, function (err) {
-            if (win.destroyed || win.destroying) {
-                return;
-            }
-            ANAS.warn('replicate snapshot list failed: ' + ANAS.errText(err));
-            // No snapshot list — the operator can still "Snapshot now and
-            // replicate". Plan against current state.
-            replan();
-        });
-    }
-
-    // Compact local timestamp for the snapshot picker labels (no html-encoding —
-    // the combobox displays plain text).
-    function formatCreatedPlain(v) {
-        try {
-            var d = new Date(v);
-            if (isNaN(d.getTime())) {
-                return '' + v;
-            }
-            if (typeof Ext !== 'undefined' && Ext.Date && typeof Ext.Date.format === 'function') {
-                return Ext.Date.format(d, 'Y-m-d H:i');
-            }
-            return d.toLocaleString();
-        } catch (e) {
-            return '' + v;
-        }
-    }
-
-    function submitReplicate(win, node, tree, srcPool, srcFull) {
-        var form = win.down('#form');
-        var basicForm = form && form.getForm();
-        if (basicForm && basicForm.isValid && !basicForm.isValid()) {
-            return;
-        }
-        var targetPool = valOf(win, '#targetPool');
-        if (!targetPool) {
-            alertMsg('Invalid input', t('Select a target pool.'));
-            return;
-        }
-        var targetDs = (valOf(win, '#targetDataset') || '').replace(/^\/+|\/+$/g, '');
-        var snapFirst = !!valOf(win, '#snapshotFirst');
-        var snap = snapFirst ? '' : valOf(win, '#snapshot');
-        if (!snapFirst && !snap) {
-            alertMsg('Invalid input',
-                t('Choose a snapshot, or check "Snapshot now and replicate".'));
-            return;
-        }
-
-        var body = { target: { pool: targetPool } };
-        if (targetDs) {
-            body.target.dataset = targetDs;
-        }
-        if (snapFirst) {
-            body.snapshotFirst = true;
-        } else {
-            body.snapshot = snap;
-        }
-
-        // Build the success message from the plan we last showed (mode + size).
-        var targetLabel = targetPool + (targetDs ? ('/' + targetDs) : '');
-        var suffix = '';
-        var plan = win._lastPlan;
-        if (plan && plan.mode) {
-            var b = ANAS.formatBytes(plan.estimatedBytes);
-            suffix = ' (' + plan.mode + (b ? ', ' + b : '') + ')';
-        }
-
-        ANAS.runJob({
-            node: node,
-            method: 'post',
-            path: datasetPath(srcPool, srcFull, 'replicate'),
-            body: body,
-            view: win,
-            failTitle: 'Replication failed',
-            successMsg: t('Replicated') + ' ' + srcFull + ' → ' + targetLabel + suffix,
-            onComplete: function () {
-                if (!win.destroyed && !win.destroying) {
-                    win.close();
-                }
-                loadTree(tree, node);
-            },
-        });
-    }
-
-    // ======================================================================
     //  Epic 15.4 — enriched-tree gfx retrofit
     //
     //  The datasets view stays a native ExtJS treepanel (hierarchy, lazy
@@ -3692,8 +3241,7 @@
                 var addTip = t("PVE manages this pool — ANAS won't add datasets here.");
                 var handsOff = t('PVE-managed storage — hands-off in ANAS.');
                 var g = gatedCtl('add', addTip)
-                    + gatedCtl('snapshot', handsOff)
-                    + gatedCtl('replicate', handsOff);
+                    + gatedCtl('snapshot', handsOff);
                 if (isFs) {
                     g += gatedCtl('share', handsOff)
                         + gatedCtl('lock', handsOff);
@@ -3713,8 +3261,7 @@
             // (destroying the root ≈ destroying the pool → Pools view).
             if (kind === 'pool') {
                 var p = ANAS.gfx.ctl('add', t('New top-level dataset'))
-                    + ANAS.gfx.ctl('snapshot', t('Take snapshot'))
-                    + ANAS.gfx.ctl('replicate', t('Replicate…'));
+                    + ANAS.gfx.ctl('snapshot', t('Take snapshot'));
                 if (isFs) {
                     p += ANAS.gfx.ctl('share', t('Share…'))
                         + ANAS.gfx.ctl('lock', t('Permissions'));
@@ -3725,8 +3272,7 @@
 
             // ---- ANAS-managed child dataset: the full action set.
             var out = ANAS.gfx.ctl('add', t('New child dataset'))
-                + ANAS.gfx.ctl('snapshot', t('Take snapshot'))
-                + ANAS.gfx.ctl('replicate', t('Replicate…'));
+                + ANAS.gfx.ctl('snapshot', t('Take snapshot'));
             if (isFs) {
                 out += ANAS.gfx.ctl('share', t('Share…'))
                     + ANAS.gfx.ctl('lock', t('Permissions'));
@@ -3816,8 +3362,6 @@
                     openCreateSnapshot(node, ppool, pfull, function () {
                         refreshTreeSnapshots(node, tree, ppool, pfull, true);
                     });
-                } else if (name === 'replicate') {
-                    openReplicate(node, tree, rec);
                 } else if (name === 'share') {
                     openShareMenu(node, tree, rec, ev);
                 } else if (name === 'lock') {
@@ -3837,8 +3381,6 @@
                 openCreateSnapshot(node, pool, fullName, function () {
                     refreshTreeSnapshots(node, tree, pool, fullName, true);
                 });
-            } else if (name === 'replicate') {
-                openReplicate(node, tree, rec);
             } else if (name === 'share') {
                 openShareMenu(node, tree, rec, ev);
             } else if (name === 'lock') {
@@ -4176,19 +3718,6 @@
                 handler: function (btn) {
                     var tree = btn.up('treepanel');
                     openDestroy(node, tree, selectedRecord(tree));
-                },
-            },
-            {
-                // Replication stage 1 (story 5.5.1): a local one-shot
-                // send | recv with an honest plan preview before it runs.
-                text: t('Replicate…'),
-                itemId: 'dsReplicate',
-                cls: 'anas-btn-ds-replicate',
-                iconCls: 'fa fa-exchange',
-                disabled: true,
-                handler: function (btn) {
-                    var tree = btn.up('treepanel');
-                    openReplicate(node, tree, selectedRecord(tree));
                 },
             },
             '-',
