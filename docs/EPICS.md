@@ -247,7 +247,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 5.5.1. [done 2026-07-16] As a user, I want to replicate a snapshot to another local pool (`zfs send | zfs recv`), so I have a backup on separate disks.
 
-5.5.3. [backlog — design agreed 2026-07-16] As a user, I want a dedicated **Replication** menu item — a task grid (source → target, last run, next run, **lag**), create/edit/disable/delete, and Run Now with real progress (stream size from `zfs send -nvP` dry-run) — so replication is configurable and observable in one place.
+5.5.3. [done 2026-07-16] As a user, I want a dedicated **Replication** menu item — a task grid (source → target, last run, next run, **lag**), create/edit/disable/delete, and Run Now with real progress (stream size from `zfs send -nvP` dry-run) — so replication is configurable and observable in one place.
 
 > **Design decisions (agreed 2026-07-16):**
 > - **New top-level menu item** (sibling of Pools/Datasets/Shares); replication is an ongoing process with config + history, not a point-in-time view.
