@@ -245,7 +245,17 @@ Story numbering is for identification only, not implementation order. Within eac
 
 > The highest-value missing ZFS capability — snapshots are useless off-box without it. Likely warrants promotion to a full epic (cf. TrueNAS "Replication Tasks"). Brainstormed July 2026.
 
-5.5.1. [backlog] As a user, I want to replicate a snapshot to another local pool (`zfs send | zfs recv`), so I have a backup on separate disks. *(Local target; incremental via `send -i`.)*
+5.5.1. [backlog — design agreed 2026-07-16] As a user, I want to replicate a snapshot to another local pool (`zfs send | zfs recv`), so I have a backup on separate disks.
+
+5.5.3. [backlog — design agreed 2026-07-16] As a user, I want a dedicated **Replication** menu item — a task grid (source → target, last run, next run, **lag**), create/edit/disable/delete, and Run Now with real progress (stream size from `zfs send -nvP` dry-run) — so replication is configurable and observable in one place.
+
+> **Design decisions (agreed 2026-07-16):**
+> - **New top-level menu item** (sibling of Pools/Datasets/Shares); replication is an ongoing process with config + history, not a point-in-time view.
+> - **Dashboard policy**: only RUNNING syncs (jobs strip) and FAILURES (warning card, new `replication` category; a task silently overdue past its interval counts as failed) appear. Healthy/idle shows nothing.
+> - **Task store = the systemd units themselves** (`anas-repl-<name>.service` + `.timer`, generated/parsed/rewritten by ANAS; no second config source; no custom scheduler per the standing ruling). The service invokes a helper that POSTs the daemon's replicate job and polls to completion, exiting nonzero on failure so systemd's own last-result is truthful.
+> - **journald is forensics, never correctness** (it rotates): authoritative last-success/lag derive from ZFS snapshot state on both ends (the newest common snapshot IS the durable record); current failure state from systemd unit/timer persistent state; journald supplies recent run detail only, labeled as such. (Future option if per-run detail must be durable: stamp a ZFS user property on the destination snapshot.)
+> - **Safety**: destination `readonly=on` by default; `recv -F` (divergence rollback) behind the 409-confirm gate; UI must announce a FULL send (with size) whenever the incremental chain is broken; `zfs hold` on the incremental base so cleanup can't sever the chain.
+> - **Sequencing**: local one-shot job → the view + timers → remote (5.5.2). Remote leverages PVE cluster SSH trust (free between cluster nodes); receiver needs ZFS only, NOT ANAS. *(Local target; incremental via `send -i`.)*
 
 5.5.2. [backlog] As a user, I want to replicate to a remote host (`zfs send | ssh | zfs recv`), so I have off-site backups / migration. *(The meat: remote target + auth, incremental streams, resume tokens.)*
 
