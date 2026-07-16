@@ -31,6 +31,7 @@ import { nodeToIoStats, parseZpoolIostat } from '../parsers/zpool-iostat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 import { readConfig } from '../services/config-writer.js'
+import { buildReplicationWarnings, collectTaskStatuses } from '../services/replication-units.js'
 import { collectDisks } from './disks.js'
 import { pathExists } from './shares-smb.js'
 
@@ -60,19 +61,22 @@ export async function dashboardRoutes(
     diskIdentityCache: DiskIdentityCache
     smbConfPath: string
     exportsPath: string
+    /** systemd unit dir — replication task store, for failure warnings (5.5.3). */
+    systemdDir: string
   },
 ) {
-  const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath } = opts
+  const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir } = opts
 
   // --- GET /v1/status ------------------------------------------------------
   server.get('/status', async () => {
     // Each block is independently fail-open so one failing source (e.g. no ZFS)
     // never blanks the rest of the dashboard.
-    const [poolStatus, diskHealth, shares, jobs] = await Promise.all([
+    const [poolStatus, diskHealth, shares, jobs, replicationWarnings] = await Promise.all([
       collectPoolStatus(),
       collectDiskHealth(),
       collectShareStatus(),
       collectJobs(),
+      collectReplicationWarnings(),
     ])
 
     const summary: StatusSummary = {
@@ -81,12 +85,24 @@ export async function dashboardRoutes(
       disks: diskHealth.counts,
       shares: shares.brief,
       jobs,
-      // Pool/disk warnings plus any stale-share warnings derived from the same
-      // smb.conf/exports parse collectShareStatus already ran (no second pass).
-      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings],
+      // Pool/disk warnings, stale-share warnings (same smb.conf/exports parse
+      // collectShareStatus already ran), plus failed-replication-task warnings.
+      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings],
     }
     return { data: summary }
   })
+
+  /** Replication tasks whose last run failed → 'replication' warnings (5.5.3).
+   *  Reuses the same task-status derivation the Replication view uses; fail-open
+   *  to no warnings (units-as-store, ZFS + systemd truth). */
+  async function collectReplicationWarnings(): Promise<DashboardWarning[]> {
+    try {
+      return buildReplicationWarnings(await collectTaskStatuses(executor, systemdDir))
+    }
+    catch {
+      return []
+    }
+  }
 
   /** Pool briefs + the scan/state context the warnings pass needs. */
   async function collectPoolStatus(): Promise<{

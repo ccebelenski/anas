@@ -17,6 +17,7 @@ import { diskRoutes } from './routes/disks.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
 import { poolRoutes } from './routes/pools.js'
+import { replicationTaskRoutes } from './routes/replication-tasks.js'
 import { shareIdentityRoutes } from './routes/share-identity.js'
 import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { smbShareRoutes } from './routes/shares-smb.js'
@@ -52,6 +53,11 @@ export function createServer(opts?: ServerOptions) {
   // the fixture below so reads show sample data and writes never touch the host.
   const envExportsPath = process.env.ANAS_EXPORTS_PATH
   let exportsPath = envExportsPath ?? '/etc/exports'
+
+  // systemd unit directory — the store for recurring replication TASKS (Epic
+  // 5.5.3). The units ARE the config; override via ANAS_SYSTEMD_DIR (tests point
+  // it at a temp dir).
+  const systemdDir = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
 
   // Register mock fixtures for dev mode
   if (opts?.mock) {
@@ -304,11 +310,13 @@ export function createServer(opts?: ServerOptions) {
   server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath })
   server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
   server.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
+  // Recurring replication tasks (Epic 5.5.3) — units-as-store CRUD + status.
+  server.register(replicationTaskRoutes, { prefix: '/v1', executor, jobQueue, systemdDir })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, and job sources above, plus on-demand ARC/iostat/net sampling.
-  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath })
+  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir })
 
   server.decorate('jobQueue', jobQueue)
   server.decorate('executor', executor)
