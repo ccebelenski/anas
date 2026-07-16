@@ -189,6 +189,14 @@
                 + '.anas-dash-status .dot{display:inline-block;width:8px;'
                 + 'height:8px;border-radius:50%;margin:0 6px;vertical-align:middle}'
                 + '.anas-dash-section{margin-bottom:20px}'
+                // Warnings as wrap-flow cards sized to their text — many
+                // mild "pool is 9x% full" warnings pack into rows instead of
+                // stacking full-width banners. Targets both the gfx callout and
+                // the plain-HTML fallback (.anas-dash-cb).
+                + '.anas-dash-warn-cards{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start}'
+                + '.anas-dash-warn-cards .anas-gfx-callout,'
+                + '.anas-dash-warn-cards .anas-dash-cb'
+                + '{display:inline-flex;width:auto;max-width:520px;flex:0 1 auto;box-sizing:border-box}'
                 + '.anas-dash-cards{display:flex;flex-wrap:wrap;gap:14px}'
                 + '.anas-dash-card{flex:0 1 auto;min-width:170px;padding:14px;border-radius:12px;'
                 + 'background:linear-gradient(var(--anas-card-top,#fff),var(--anas-card-bot,#eef1f5));'
@@ -370,9 +378,13 @@
                     + '<span aria-hidden="true">' + (lvl === 'bad' ? '⛔' : '⚠') + '</span>'
                     + '<span>' + body + '</span></div>';
             }
-            out += '<div style="margin-bottom:8px">' + callout + '</div>';
+            out += callout;
         }
-        return out;
+        // Wrap-flow cards, each sized to its text — a dozen "pool is 9x% full"
+        // warnings pack into a couple of rows instead of a full-width banner
+        // stack (the callouts themselves are styled inline-flex via
+        // .anas-dash-warn-cards in ensureDashStyles).
+        return '<div class="anas-dash-warn-cards">' + out + '</div>';
     }
 
     // A coloured count tile for the fleet summary.
