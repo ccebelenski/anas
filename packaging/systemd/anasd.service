@@ -1,0 +1,14 @@
+[Unit]
+Description=ANAS Daemon
+After=network.target pve-cluster.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /run/anas
+ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/index.js
+Environment=ANASD_SOCKET=/run/anas/anasd.sock
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
