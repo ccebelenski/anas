@@ -13,6 +13,7 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { confirmGate } from '../safety/gate.js'
 import { readConfig } from '../services/config-writer.js'
 import { requireIdentity } from './identity.js'
+import { createReplicationHandlers } from './replication.js'
 
 const ZFS = '/usr/sbin/zfs'
 const STAT = '/usr/bin/stat'
@@ -231,6 +232,19 @@ export async function datasetRoutes(
   },
 ) {
   const { executor, jobQueue, confirmStore } = opts
+
+  // Replication (Epic 5.5.1) shares this file's dataset `*` wildcard (find-my-way
+  // permits only one wildcard route per method+path). The send/recv logic lives
+  // in replication.ts; it reuses the dataset helpers below. Function declarations
+  // are hoisted, so wiring them here (before they textually appear) is safe.
+  const replication = createReplicationHandlers({
+    executor,
+    jobQueue,
+    resolveDatasetName,
+    poolExists,
+    datasetExists,
+    listSnapshotsDetail,
+  })
 
   /** Does the named pool exist? (source of truth is `zpool list`). */
   async function poolExists(poolName: string): Promise<boolean> {
@@ -607,6 +621,20 @@ export async function datasetRoutes(
     }
     const poolName = nameParsed.data
     const wildcard = request.params['*']
+
+    // Replication sub-resource: `<dataset>/replicate/plan` (dry-run, 200) and
+    // `<dataset>/replicate` (run, 202 job). Checked before the snapshot tail —
+    // these are their own action, dispatched into replication.ts.
+    const REPLICATE_PLAN_SUFFIX = '/replicate/plan'
+    const REPLICATE_SUFFIX = '/replicate'
+    if (wildcard === 'replicate/plan' || wildcard.endsWith(REPLICATE_PLAN_SUFFIX)) {
+      const dpath = wildcard === 'replicate/plan' ? '' : wildcard.slice(0, -REPLICATE_PLAN_SUFFIX.length)
+      return replication.planReplication(poolName, dpath, request, reply)
+    }
+    if (wildcard === 'replicate' || wildcard.endsWith(REPLICATE_SUFFIX)) {
+      const dpath = wildcard === 'replicate' ? '' : wildcard.slice(0, -REPLICATE_SUFFIX.length)
+      return replication.runReplication(poolName, dpath, request, reply)
+    }
 
     const tail = parseSnapshotTail(wildcard)
     if (!tail || tail.extra || (tail.snap && !tail.rollback && !tail.clone)) {
