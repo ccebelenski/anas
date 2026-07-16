@@ -18,6 +18,15 @@ import { ISODateTime, PoolName } from './common.js'
  *   POST /pools/:name/datasets/<path>/replicate      → 202 { job }
  */
 
+/** Where replication can land (stage 3): local, a cluster peer, or a remote. */
+export const ReplicationLocation = z.object({
+  /** 'local' (default) | 'peer' (PVE cluster node) | 'remote' (registered). */
+  kind: z.enum(['local', 'peer', 'remote']).default('local'),
+  /** Peer nodename or registered remote name (absent for local). */
+  name: z.string().optional(),
+})
+export type ReplicationLocation = z.infer<typeof ReplicationLocation>
+
 /** Where a replication lands: a pool and optionally a dataset path within it
  *  (default: the source dataset's own path). Stage 1 is same-node only. */
 export const ReplicationTarget = z.object({
@@ -25,6 +34,9 @@ export const ReplicationTarget = z.object({
   /** Target dataset path relative to the pool (no leading slash). Defaults to
    *  the source dataset's relative path. */
   dataset: z.string().optional(),
+  /** Stage 3: where the target pool lives — local (default), a PVE cluster
+   *  peer, or a registered external remote. Additive; absent = local. */
+  location: ReplicationLocation.optional(),
 })
 export type ReplicationTarget = z.infer<typeof ReplicationTarget>
 
@@ -111,3 +123,58 @@ export const ReplicationTaskStatus = z.object({
   nextRunAt: ISODateTime.nullable(),
 })
 export type ReplicationTaskStatus = z.infer<typeof ReplicationTaskStatus>
+
+// ---- Stage 3: REMOTE replication (peers + external remotes) ------------------
+//
+// Remotes are a CLUSTER-level concept: the registry lives in pmxcfs at
+// /etc/pve/anas/remotes.json (corosync-replicated; quorum-gated writes), the
+// cluster-wide keypair at /etc/pve/priv/anas/replication_key, pinned host keys
+// in /etc/pve/priv/anas/known_hosts. The remote itself needs sshd + ZFS only.
+
+/** A registered external remote (TrueNAS, plain Linux+ZFS, …). */
+export const ReplicationRemote = z.object({
+  /** Registry key; also shows in target pickers. */
+  name: ReplicationTaskName,
+  host: z.string().min(1),
+  port: z.number().int().min(1).max(65535).default(22),
+  /** v1 connects as root (or the remote's admin); zfs-allow delegation later. */
+  user: z.string().min(1).default('root'),
+  /** Pinned SSH host-key fingerprint (SHA256:…), set on explicit confirm. */
+  hostKeyFingerprint: z.string().optional(),
+})
+export type ReplicationRemote = z.infer<typeof ReplicationRemote>
+
+/**
+ * The registry file — split-brain guarded: `version` is monotonic and every
+ * write is compare-and-swap (a mutation carries the version it read; the
+ * daemon 409s when it moved). updatedBy/updatedAt are forensics.
+ */
+export const RemotesFile = z.object({
+  version: z.number().int().nonnegative(),
+  updatedBy: z.string(),
+  updatedAt: ISODateTime,
+  remotes: z.array(ReplicationRemote),
+})
+export type RemotesFile = z.infer<typeof RemotesFile>
+
+/** Create/update a remote — carries the registry version the client read. */
+export const UpsertRemoteRequest = z.object({
+  remote: ReplicationRemote,
+  /** CAS guard: the registry version this change was based on. */
+  expectedVersion: z.number().int().nonnegative(),
+})
+export type UpsertRemoteRequest = z.infer<typeof UpsertRemoteRequest>
+
+/** Diagnosing test-connection result — says WHAT failed, not just that it did. */
+export const RemoteTestResult = z.object({
+  /** How far the probe got. 'ok' = ssh + zfs both answered. */
+  stage: z.enum(['unreachable', 'hostkey-unknown', 'auth-failed', 'no-zfs', 'ok']),
+  /** Remote's zfs version when stage === 'ok'. */
+  zfsVersion: z.string().optional(),
+  /** The host-key fingerprint seen (for the explicit-confirm flow). */
+  fingerprint: z.string().optional(),
+  /** Human detail for the failure stages (stderr excerpt). */
+  detail: z.string().optional(),
+})
+export type RemoteTestResult = z.infer<typeof RemoteTestResult>
+

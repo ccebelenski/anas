@@ -104,10 +104,15 @@ export {
   ReplicatePlan,
   ReplicatePlanRequest,
   ReplicateRequest,
+  ReplicationLocation,
+  ReplicationRemote,
   ReplicationTarget,
   ReplicationTask,
   ReplicationTaskName,
   ReplicationTaskStatus,
+  RemotesFile,
+  RemoteTestResult,
+  UpsertRemoteRequest,
 } from './schemas/replication.js'
 
 // Share schemas (SMB + NFS)
