@@ -544,3 +544,37 @@ Enterprise identity is nearly a requirement for real deployments — users live 
 Per Don't-Build-Undifferentiated-Code: ANAS **configures** realmd/winbind/sssd (join domain, wire nsswitch, map SMB via Samba's AD member mode) — it does not build identity mapping. Once joined, everything else works unchanged *because* user/group resolution goes through `getent` (the Epic 8 seam): pickers, ownership, and ACLs all just see domain users. Pairs with the NFSv4 ACL editor (4.7.1) and SMB (Epic 6, run as an AD member).
 
 Detailed stories to be written when prioritized. Not MVP — but the getent seam (Epic 8) must be in place so this drops in without rework.
+
+### Epic 16: File Backup via Proxmox Backup (experimental — needs spec/design)
+
+> As a user, I want ANAS to back up share/dataset FILE data to a Proxmox Backup Server using `proxmox-backup-client`, so my NAS data gets PBS's dedup/encryption/retention/verification without hand-rolled cron jobs.
+
+Captured 2026-07-16 from real-world use: the operator currently runs ad-hoc cron
+jobs invoking proxmox-backup-client (file/pxar backup of directories to a PBS
+datastore) on several nodes. PVE's own backup story (vzdump/PBS) covers GUESTS,
+not host file data — so file-level NAS backup is a genuine gap and differentiated
+ANAS value, and it is maximal guest-philosophy leverage: PBS owns the hard parts
+(chunking, dedup, encryption, retention, verify, restore); ANAS only *configures
+and schedules* the client invocation and surfaces status.
+
+Design questions to settle before stories are written:
+- **Target model**: PBS repository/datastore + namespace + auth (API token vs
+  password file; secrets handling must follow the stdin-not-argv rule). Where
+  does the repository config live? (Config-as-API: probably a small stanza the
+  daemon owns, or reuse /etc/pve PBS storage entries read-only when present —
+  a PBS storage in storage.cfg already carries server/datastore/auth.)
+- **What to back up**: per-dataset/per-share selection (mountpoint → pxar
+  archive). Snapshot-consistent backups: take a ZFS snapshot, back up from the
+  snapshot's .zfs/snapshot path, destroy after — atomicity for free.
+- **Scheduling**: per the standing ruling, NO custom scheduler — generate
+  systemd timer/service units (surgical, removable), status read back from
+  systemd/journald.
+- **Status/observe**: last-run result + next-run surfaced on the dataset/share
+  rows and the dashboard (jobs/warnings categories already exist);
+  proxmox-backup-client exit status + journald for detail.
+- **Restore**: v1 probably points at the PBS UI for restore (leverage) rather
+  than building a restore browser; revisit after real use.
+- **Scope guard**: experimental — one node, file/pxar only, no guest backups
+  (PVE owns those), no PBS server management.
+
+Detailed stories to be written when prioritized.
