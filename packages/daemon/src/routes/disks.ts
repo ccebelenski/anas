@@ -28,7 +28,7 @@ const BARE_KERNEL_RE = /^(?:sd|vd|hd)[a-z]+\d*$|^nvme\d+n\d+/
  *   3. the leaf `id` treated as a bare kernel name.
  * Returns null when nothing resolves — that leaf simply won't cross-reference.
  */
-function resolveLeafKernel(
+export function resolveLeafKernel(
   id: string,
   path: string,
   byIdToKernel: Map<string, string>,

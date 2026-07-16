@@ -25,7 +25,7 @@ interface ZpoolListOutput {
  * Parse `zpool list -j` JSON output into pool summaries.
  * Note: This provides size/capacity data. State and health come from zpool-status parser.
  */
-export function parseZpoolList(json: string | ZpoolListOutput): Omit<PoolSummary, 'scanRunning' | 'health' | 'pveStorages'>[] {
+export function parseZpoolList(json: string | ZpoolListOutput): Omit<PoolSummary, 'scanRunning' | 'scanFunction' | 'trimSupported' | 'upgradeAvailable' | 'health' | 'pveStorages'>[] {
   const data: ZpoolListOutput = typeof json === 'string' ? JSON.parse(json) : json
   return Object.values(data.pools).map((pool) => {
     const prop = (name: string) => pool.properties[name]?.value ?? '-'

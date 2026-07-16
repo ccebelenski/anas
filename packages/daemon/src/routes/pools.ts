@@ -4,13 +4,80 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
+import { parseByIdToKernel, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseZpoolGet } from '../parsers/zpool-get.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
+import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { confirmGate } from '../safety/gate.js'
 import { isRootPool } from '../safety/root-pool.js'
+import { resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
+
+/** lsblk args to probe per-device discard support (Epic 4.12 trim gating).
+ *  `-b` bytes, `-J` JSON, `-n` no headings, `-o NAME,DISC-GRAN`. A device is
+ *  discard-capable iff its DISC-GRAN (discard granularity) is greater than 0. */
+export const LSBLK_DISCARD_ARGS = ['-Jbno', 'NAME,DISC-GRAN']
+
+/** A leaf device reference from a pool's topology — enough to resolve it to a
+ *  whole-disk kernel name via {@link resolveLeafKernel}. */
+interface LeafRef {
+  id: string
+  path: string
+}
+
+interface LsblkDiscardRaw {
+  name: string
+  'disc-gran'?: number | string | null
+  children?: LsblkDiscardRaw[]
+}
+
+/**
+ * Parse `lsblk -Jbno NAME,DISC-GRAN` into the set of whole-disk KERNEL names
+ * whose discard granularity is > 0 (i.e. the device supports TRIM/discard).
+ * Partitions are reduced to their whole disk so the set keys the same way
+ * {@link resolveLeafKernel} canonicalizes pool leaves. Fail-open: malformed
+ * output yields an empty set.
+ */
+export function parseDiscardCapableKernels(lsblkJson: string): Set<string> {
+  const capable = new Set<string>()
+  let data: { blockdevices?: LsblkDiscardRaw[] }
+  try {
+    data = JSON.parse(lsblkJson)
+  }
+  catch {
+    return capable
+  }
+  const walk = (dev: LsblkDiscardRaw): void => {
+    if ((Number(dev['disc-gran']) || 0) > 0)
+      capable.add(wholeDiskKernel(dev.name))
+    for (const child of dev.children ?? [])
+      walk(child)
+  }
+  for (const dev of data.blockdevices ?? [])
+    walk(dev)
+  return capable
+}
+
+/**
+ * Whether ANY leaf of a pool lives on a discard-capable device. Each leaf is
+ * canonicalized to its whole-disk kernel name (the identity both zpool-status
+ * and lsblk agree on — see resolveLeafKernel) and tested against the capable
+ * set. Unresolvable leaves are simply skipped — never throws.
+ */
+export function poolTrimSupported(
+  leaves: LeafRef[],
+  byIdToKernel: Map<string, string>,
+  capableKernels: Set<string>,
+): boolean {
+  for (const leaf of leaves) {
+    const kernel = resolveLeafKernel(leaf.id, leaf.path, byIdToKernel)
+    if (kernel && capableKernels.has(kernel))
+      return true
+  }
+  return false
+}
 
 /** Map a disk by-id identifier to its stable /dev/disk/by-id path. */
 function byIdPath(id: string): string {
@@ -195,9 +262,16 @@ export async function poolRoutes(
   }
 
   server.get('/pools', async (_request, _reply) => {
-    const [listResult, statusResult, pveStorages] = await Promise.all([
+    const [listResult, statusResult, byIdResult, lsblkDiscardResult, upgradeResult, pveStorages] = await Promise.all([
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
       executor.exec('/usr/sbin/zpool', ['status', '-jv']),
+      // by-id → kernel map, to canonicalize pool leaves for the discard probe.
+      executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
+      // Per-device discard capability (Epic 4.12 Trim gating). Fail-open.
+      executor.exec('/usr/bin/lsblk', LSBLK_DISCARD_ARGS),
+      // Pools with supported-but-disabled features (Epic 4.12 Upgrade gating).
+      // `zpool upgrade` (no args) has no -j; text-parsed. Fail-open.
+      executor.exec('/usr/sbin/zpool', ['upgrade']),
       // Read-only PVE storage detection (Epic 3.25). Fail-open: off-PVE hosts
       // and parse errors yield an empty map, so this never breaks GET /pools.
       // Passing the ZFS mountpoint map also catches `dir` storages backed by a
@@ -218,13 +292,50 @@ export async function poolRoutes(
     // Build a lookup from status data
     const statusByName = new Map(statusData.map(s => [s.name, s]))
 
+    // Trim capability (Epic 4.12): resolve each pool's leaves to their whole-disk
+    // kernel name and ask lsblk whether that device advertises discard. All
+    // fail-open — a failed probe just leaves trimSupported false.
+    const byIdToKernel = byIdResult.exitCode === 0
+      ? parseByIdToKernel(byIdResult.stdout)
+      : new Map<string, string>()
+    const capableKernels = lsblkDiscardResult.exitCode === 0
+      ? parseDiscardCapableKernels(lsblkDiscardResult.stdout)
+      : new Set<string>()
+
+    // Upgrade availability (Epic 4.12): pools with disabled features. `zpool
+    // upgrade` exits 0 whether or not any pool needs upgrading; a non-zero exit
+    // (probe failure) → empty set → all upgradeAvailable false.
+    const upgradablePools = upgradeResult.exitCode === 0
+      ? parseZpoolUpgrade(upgradeResult.stdout)
+      : new Set<string>()
+
+    // Collect a pool's leaf devices (id + path) from its parsed topology.
+    const leavesOf = (status: (typeof statusData)[number] | undefined): LeafRef[] => {
+      const leaves: LeafRef[] = []
+      if (!status)
+        return leaves
+      for (const group of status.vdevGroups) {
+        for (const vdev of group.vdevs) {
+          for (const disk of vdev.disks)
+            leaves.push({ id: disk.id, path: disk.path })
+        }
+      }
+      return leaves
+    }
+
     // Merge list (sizes) with status (state, scan, health) into PoolSummary
     const pools: PoolSummary[] = listData.map((pool) => {
       const status = statusByName.get(pool.name)
+      const scanning = status?.scan?.state === 'SCANNING'
       return {
         ...pool,
         state: status?.state ?? pool.state,
-        scanRunning: status?.scan?.state === 'SCANNING',
+        scanRunning: scanning,
+        // scanFunction is meaningful only while a scan is actually running — the
+        // UI keys "Stop Scrub" (SCRUB only, never a RESILVER) off it.
+        ...(scanning && status?.scan && { scanFunction: status.scan.function }),
+        trimSupported: poolTrimSupported(leavesOf(status), byIdToKernel, capableKernels),
+        upgradeAvailable: upgradablePools.has(pool.name),
         ...(status?.health && { health: status.health }),
         pveStorages: pveStorages.get(pool.name) ?? [],
       }

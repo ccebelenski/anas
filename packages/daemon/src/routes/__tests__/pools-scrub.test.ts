@@ -1,5 +1,6 @@
 import type { Job, JobAccepted } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
@@ -66,6 +67,41 @@ describe('scrub endpoint: POST /v1/pools/:name/scrub', () => {
     const body = res.json() as JobAccepted
     const job = await waitForJob(server, body.job.id)
     assert.equal(job.status, 'completed')
+  })
+
+  it('issues `zpool scrub -s <pool>` for a stop and plain `zpool scrub <pool>` for a start', async () => {
+    server = createServer({ mock: true, logger: false })
+    // Spy on the executor to capture the exact argv each action runs.
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const calls: { command: string, args: string[] }[] = []
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]): Promise<ExecResult> => {
+      calls.push({ command, args })
+      return orig(command, args)
+    }
+
+    const stop = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/scrub',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ action: 'stop' }),
+    })
+    await waitForJob(server, (stop.json() as JobAccepted).job.id)
+    const stopCall = calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'scrub')
+    assert.ok(stopCall, 'zpool scrub was invoked for stop')
+    assert.deepEqual(stopCall!.args, ['scrub', '-s', 'testpool'])
+
+    calls.length = 0
+    const start = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/scrub',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ action: 'start' }),
+    })
+    await waitForJob(server, (start.json() as JobAccepted).job.id)
+    const startCall = calls.find(c => c.command === '/usr/sbin/zpool' && c.args[0] === 'scrub')
+    assert.ok(startCall, 'zpool scrub was invoked for start')
+    assert.deepEqual(startCall!.args, ['scrub', 'testpool'])
   })
 
   it('rejects requests without identity headers', async () => {
