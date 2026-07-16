@@ -51,6 +51,7 @@
  *     .anas-gfx-gauge / -gauge-fill  capacity gauge (bar + used/total text)
  *     .anas-gfx-donut                breakdown ring
  *     .anas-gfx-legend / -legend-row donut legend
+ *     .anas-gfx-timechart            labelled time-series chart (axes + legend)
  *   Status & labels (monitor side)
  *     .anas-gfx-pill / -pill-<lvl>   pool/vdev state pill (online|degraded|faulted)
  *     .anas-gfx-chip / -chip-good    dataset property chip
@@ -250,6 +251,18 @@
         css.push('.anas-gfx-legend-nm{flex:1}');
         css.push('.anas-gfx-legend-sz{color:var(--anas-muted);font-variant-numeric:tabular-nums}');
         css.push('.anas-gfx-legend-pct{width:42px;text-align:right;font-weight:650;font-variant-numeric:tabular-nums}');
+
+        // Data viz: labelled time-series chart (axes + gridlines + legend/readout).
+        css.push('.anas-gfx-timechart{display:block;max-width:100%}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-frame{fill:var(--anas-slot);stroke:var(--anas-card-edge);stroke-width:1}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-grid{stroke:var(--anas-line);stroke-width:1;shape-rendering:crispEdges}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-base{stroke:var(--anas-card-edge);stroke-width:1;shape-rendering:crispEdges}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-tick{stroke:var(--anas-card-edge);stroke-width:1;shape-rendering:crispEdges}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-ylab,.anas-gfx-timechart .anas-gfx-tc-xlab{'
+            + 'fill:var(--anas-muted);font-size:9.5px;font-variant-numeric:tabular-nums}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-title{fill:var(--anas-muted);font-size:10.5px;font-weight:700}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-legend{fill:var(--anas-ink);font-size:11px;font-variant-numeric:tabular-nums}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-empty{fill:var(--anas-muted);font-size:11px}');
 
         // Status pill: pool/vdev state chip with a coloured dot (monitor side).
         css.push('.anas-gfx-pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;'
@@ -740,6 +753,214 @@
             return '<div class="anas-gfx-legend">' + rows + '</div>';
         } catch (e) {
             warn('legend failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // Round a positive value UP to a "nice" 1/2/5 × 10ⁿ boundary so the chart's
+    // top gridline is a readable round number (e.g. 118 MB/s → 200 MB/s).
+    function niceCeil(v) {
+        v = Number(v);
+        if (!(v > 0)) { return 1; }
+        var exp = Math.floor(Math.log(v) / Math.LN10);
+        var base = Math.pow(10, exp);
+        var f = v / base; // 1 .. <10
+        var nice;
+        if (f <= 1) { nice = 1; }
+        else if (f <= 2) { nice = 2; }
+        else if (f <= 5) { nice = 5; }
+        else { nice = 10; }
+        return nice * base;
+    }
+
+    function tcColor(i) {
+        return SERIES[i % SERIES.length];
+    }
+
+    // Latest (newest) finite value of a series' values array, or null.
+    function latestVal(values) {
+        if (!values) { return null; }
+        for (var i = values.length - 1; i >= 0; i--) {
+            var v = Number(values[i]);
+            if (!isNaN(v)) { return v; }
+        }
+        return null;
+    }
+
+    // timeChart(series, opts) → a compact-but-readable labelled time-series SVG.
+    //   series : [{ label, color?, values:[oldest..newest] }]  values may be
+    //            SHORTER than the window (right-aligned: newest at the right edge).
+    //   opts   : { width:px (REQUIRED — caller measures the container),
+    //              height:px (default 150), windowMs (default 5min),
+    //              sampleMs (default 2500), max:Number (fixed; else nice-auto),
+    //              minMax:Number (floor for the auto max so an idle chart still
+    //              has a scale; default 1), format:fn(v)->str (Y labels + readout;
+    //              default ANAS.formatBytes(v)+'/s'), title:String }
+    // Renders: 0 / mid / nice-max Y gridlines with labels; a time X axis spanning
+    // windowMs with ~1-minute ticks (now, 1m, 2m…); each series as a 2px polyline
+    // over a faint filled area; a legend + latest-value readout per series.
+    // Fail-open: <2 total points → framed empty axes + muted "collecting…"; any
+    // throw → ''. Test hook: .anas-gfx-timechart.
+    gfx.timeChart = function (series, opts) {
+        try {
+            ensureInjected();
+            opts = opts || {};
+            series = series || [];
+
+            var W = Math.round(Number(opts.width) || 0);
+            var H = Math.round(Number(opts.height) || 150);
+            if (!(W > 0)) { return ''; }
+            if (!(H > 40)) { H = 40; }
+
+            var fmt = (typeof opts.format === 'function')
+                ? opts.format
+                : function (v) {
+                    return (ANAS.formatBytes ? ANAS.formatBytes(v) : ('' + Math.round(v))) + '/s';
+                };
+            var windowMs = Number(opts.windowMs) > 0 ? Number(opts.windowMs) : 5 * 60 * 1000;
+            var sampleMs = Number(opts.sampleMs) > 0 ? Number(opts.sampleMs) : 2500;
+            var slots = Math.max(2, Math.round(windowMs / sampleMs));
+
+            // Plot geometry — margins reserved for the labels.
+            var ML = 52, MR = 12, MT = 20, MB = 18;
+            var plotW = W - ML - MR;
+            var plotH = H - MT - MB;
+            if (plotW < 12) { plotW = 12; }
+            if (plotH < 12) { plotH = 12; }
+            var x0 = ML;                    // left edge of plot
+            var xR = ML + plotW;            // right edge (newest sample)
+            var yTop = MT;                  // top of plot (= max)
+            var yBase = MT + plotH;         // baseline (= 0)
+
+            // Value scale: nice-rounded max across all series (or fixed opts.max),
+            // floored so an idle chart still has a readable scale.
+            var peak = 0, totalPts = 0, si, vi;
+            for (si = 0; si < series.length; si++) {
+                var vals = (series[si] && series[si].values) || [];
+                for (vi = 0; vi < vals.length; vi++) {
+                    var pv = Number(vals[vi]);
+                    if (!isNaN(pv)) {
+                        totalPts++;
+                        if (pv > peak) { peak = pv; }
+                    }
+                }
+            }
+            var floor = Number(opts.minMax) > 0 ? Number(opts.minMax) : 1;
+            var vmax;
+            if (Number(opts.max) > 0) {
+                vmax = Number(opts.max);
+            } else {
+                vmax = niceCeil(peak > floor ? peak : floor);
+            }
+            if (!(vmax > 0)) { vmax = 1; }
+            var vmid = vmax / 2;
+
+            function yFor(v) {
+                v = Number(v);
+                if (isNaN(v) || v < 0) { v = 0; }
+                if (v > vmax) { v = vmax; }
+                return yBase - (v / vmax) * plotH;
+            }
+
+            var parts = [];
+            parts.push('<svg class="anas-gfx-timechart" width="' + W + '" height="' + H + '" '
+                + 'viewBox="0 0 ' + W + ' ' + H + '" aria-hidden="true">');
+            // Plot background frame.
+            parts.push('<rect class="anas-gfx-tc-frame" x="' + x0 + '" y="' + yTop
+                + '" width="' + plotW + '" height="' + plotH + '" rx="3"/>');
+
+            // Horizontal gridlines + Y labels at 0 / mid / max.
+            var yLines = [[vmax, yTop], [vmid, (yTop + yBase) / 2], [0, yBase]];
+            for (var g = 0; g < yLines.length; g++) {
+                var gy = yLines[g][1];
+                var cls = (yLines[g][0] === 0) ? 'anas-gfx-tc-base' : 'anas-gfx-tc-grid';
+                parts.push('<line class="' + cls + '" x1="' + x0 + '" y1="' + gy.toFixed(1)
+                    + '" x2="' + xR + '" y2="' + gy.toFixed(1) + '"/>');
+                parts.push('<text class="anas-gfx-tc-ylab" x="' + (x0 - 6) + '" y="'
+                    + (gy + 3).toFixed(1) + '" text-anchor="end">' + enc(fmt(yLines[g][0])) + '</text>');
+            }
+
+            // Time X axis: ticks + labels at ~1-minute intervals (now, 1m, 2m…).
+            var stepMs = 60000;
+            for (var mMs = 0; mMs <= windowMs + 1; mMs += stepMs) {
+                var tx = xR - (mMs / windowMs) * plotW;
+                if (tx < x0 - 0.5) { break; }
+                parts.push('<line class="anas-gfx-tc-tick" x1="' + tx.toFixed(1) + '" y1="'
+                    + yBase + '" x2="' + tx.toFixed(1) + '" y2="' + (yBase + 4) + '"/>');
+                var lbl = (mMs === 0) ? 'now' : (Math.round(mMs / 60000) + 'm');
+                var anchor = (mMs === 0) ? 'end' : 'middle';
+                parts.push('<text class="anas-gfx-tc-xlab" x="' + tx.toFixed(1) + '" y="'
+                    + (yBase + 13) + '" text-anchor="' + anchor + '">' + enc(lbl) + '</text>');
+            }
+
+            if (totalPts < 2) {
+                // Empty state — framed axes already drawn; add a muted note.
+                parts.push('<text class="anas-gfx-tc-empty" x="' + ((x0 + xR) / 2).toFixed(1)
+                    + '" y="' + ((yTop + yBase) / 2 + 4).toFixed(1) + '" text-anchor="middle">'
+                    + enc('collecting…') + '</text>');
+            } else {
+                var spacing = plotW / (slots - 1);
+                for (si = 0; si < series.length; si++) {
+                    var s = series[si] || {};
+                    var v2 = s.values || [];
+                    var col = s.color || tcColor(si);
+                    // Right-align: plot at most `slots` newest points.
+                    var start = Math.max(0, v2.length - slots);
+                    var pts = [];
+                    for (vi = start; vi < v2.length; vi++) {
+                        var nv = Number(v2[vi]);
+                        if (isNaN(nv)) { continue; }
+                        var px = xR - (v2.length - 1 - vi) * spacing;
+                        if (px < x0) { px = x0; }
+                        pts.push(px.toFixed(1) + ',' + yFor(nv).toFixed(1));
+                    }
+                    if (pts.length < 1) { continue; }
+                    if (pts.length >= 2) {
+                        var first = pts[0].split(',')[0];
+                        var last = pts[pts.length - 1].split(',')[0];
+                        parts.push('<path d="M' + first + ',' + yBase.toFixed(1) + ' L'
+                            + pts.join(' L') + ' L' + last + ',' + yBase.toFixed(1) + ' Z" '
+                            + 'fill="' + col + '" fill-opacity="0.12" stroke="none"/>');
+                        parts.push('<polyline points="' + pts.join(' ') + '" fill="none" stroke="'
+                            + col + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>');
+                    } else {
+                        var pc = pts[0].split(',');
+                        parts.push('<circle cx="' + pc[0] + '" cy="' + pc[1] + '" r="2" fill="' + col + '"/>');
+                    }
+                }
+            }
+
+            // Title (top-left) + legend/readout (top-right, latest value per series).
+            if (opts.title) {
+                parts.push('<text class="anas-gfx-tc-title" x="2" y="13">' + enc(opts.title) + '</text>');
+            }
+            var charW = 6.3, swGap = 13, entryGap = 14;
+            var entries = [];
+            var totalW = 0;
+            for (si = 0; si < series.length; si++) {
+                var se = series[si] || {};
+                var lv = latestVal(se.values);
+                var txt = (se.label ? se.label + ' ' : '') + (lv == null ? '—' : fmt(lv));
+                var wEst = swGap + txt.length * charW + entryGap;
+                entries.push({ color: se.color || tcColor(si), text: txt, w: wEst });
+                totalW += wEst;
+            }
+            var lx = xR - totalW;
+            var titleMin = opts.title ? (2 + ('' + opts.title).length * charW + 8) : x0;
+            if (lx < titleMin) { lx = titleMin; }
+            for (si = 0; si < entries.length; si++) {
+                var e = entries[si];
+                parts.push('<rect x="' + lx.toFixed(1) + '" y="5" width="9" height="9" rx="2" fill="'
+                    + e.color + '"/>');
+                parts.push('<text class="anas-gfx-tc-legend" x="' + (lx + swGap).toFixed(1)
+                    + '" y="13">' + enc(e.text) + '</text>');
+                lx += e.w;
+            }
+
+            parts.push('</svg>');
+            return parts.join('');
+        } catch (e) {
+            warn('timeChart failed: ' + (e && e.message));
             return '';
         }
     };

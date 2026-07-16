@@ -14,10 +14,12 @@
  *                   pill + type + aggregated I/O; each device its disk object +
  *                   live throughput + latency. Matches /status pools to
  *                   /telemetry pools by name.
- *   4. ARC        — hit-ratio gauge + size/target + L2 + sparkline.
- *   5. Network    — total + per-interface rx/tx.
- * All rendered in the ANAS.gfx visual language (15-gfx.js) with client-side
- * rolling sparklines.
+ *   4. ARC        — hit-ratio gauge + size/target + L2.
+ *   5. Network    — total rx/tx time chart + per-interface rx/tx numbers.
+ * All rendered in the ANAS.gfx visual language (15-gfx.js). Pool, per-vdev and
+ * network I/O use labelled gfx.timeChart time-series charts fed by client-side
+ * rolling 5-minute buffers; ARC keeps its gauge and per-device rows are live
+ * numbers + an activity bar.
  *
  * Data contract (two endpoints, read as JSON; no compile dependency):
  *   GET /v1/status    → { node, pools[], disks{healthy,warning,critical,unknown,
@@ -68,10 +70,14 @@
 
     var ANAS = window.ANAS;
 
-    // Poll cadence for /telemetry while the panel is visible, and the depth of
-    // the client-side rolling sparkline buffers (samples kept per metric key).
+    // Poll cadence for /telemetry while the panel is visible, and the time span of
+    // the client-side rolling buffers feeding the time-series charts. 5 minutes at
+    // the 2.5s cadence is ~120 samples per metric key. Buffers live on the view so
+    // they reset with the panel and never touch the server (no persisted history —
+    // Principle 7).
     var POLL_MS = 2500;
-    var SPARK_MAX = 60;
+    var BUFFER_MS = 5 * 60 * 1000;
+    var BUFFER_MAX = Math.max(2, Math.round(BUFFER_MS / POLL_MS));
 
     // Owning card's itemId (see ANAS.makeCard → itemId: view.itemId). We attach
     // the card-layout activate/deactivate listeners here so polling follows the
@@ -197,7 +203,6 @@
                 + '.anas-dash-metric-bar{flex:1 1 auto;min-width:70px;display:flex}'
                 + '.anas-dash-metric-val{width:92px;text-align:right;font-size:11.5px;'
                 + 'font-variant-numeric:tabular-nums;color:var(--anas-ink,#232936);flex:0 0 auto}'
-                + '.anas-dash-spark{flex:0 0 auto;display:block}'
                 + '.anas-dash-stats{display:flex;flex-wrap:wrap;gap:12px}'
                 + '.anas-dash-stat{min-width:70px;padding:10px 12px;border-radius:10px;'
                 + 'background:var(--anas-slot,#f2f4f7);border:1px solid var(--anas-card-edge,#cfd6df);text-align:center}'
@@ -237,7 +242,8 @@
                 + '.anas-dash-pool-main{flex:1 1 280px;min-width:240px}'
                 + '.anas-dash-pool-name{display:flex;align-items:center;gap:8px;font-weight:750;'
                 + 'font-size:15px;color:var(--anas-ink,#232936);margin-bottom:8px}'
-                + '.anas-dash-pool-io{max-width:520px}'
+                + '.anas-dash-pool-io{margin-top:10px}'
+                + '.anas-dash-vdev-chart{margin-top:6px}'
                 + '.anas-dash-vdev{margin:10px 0 0 4px;padding:8px 10px 8px 12px;border-radius:0 10px 10px 0;'
                 + 'border-left:3px solid var(--anas-card-edge,#cfd6df);background:var(--anas-slot,#f2f4f7)}'
                 + '.anas-dash-vdev-degraded{border-left-color:var(--anas-warn,#b06a12)}'
@@ -265,94 +271,54 @@
         }
     }
 
-    // ---- Sparklines (client-side rolling buffer) ---------------------------
+    // ---- Rolling buffers + time-series charts ------------------------------
 
-    // Push a sample onto the rolling buffer for `key`, capped at SPARK_MAX, and
-    // return the (mutated) buffer. Buffers live on the view so they reset with
-    // the panel and never touch the server (no persisted history — Principle 7).
+    // Push a sample onto the rolling buffer for `key`, capped at BUFFER_MAX (the
+    // 5-minute window), and return the (mutated, oldest→newest) buffer. The
+    // buffers feed gfx.timeChart; they live on the view so they reset with the
+    // panel and never touch the server (no persisted history — Principle 7).
     function pushSpark(view, key, value) {
         var buf = view._anasSpark || (view._anasSpark = {});
         var arr = buf[key] || (buf[key] = []);
         arr.push(num(value));
-        while (arr.length > SPARK_MAX) {
+        while (arr.length > BUFFER_MAX) {
             arr.shift();
         }
         return arr;
     }
 
-    // Inline SVG sparkline (area + polyline), auto-scaled to the buffer peak.
-    // Fail-open: any trouble (or <2 points) returns '' and the caller omits it.
-    function sparkline(values, opts) {
+    // Content width of a section component (its rendered pixel width), so the
+    // time charts can be rendered at exact px and fill the section. Fail-open to
+    // a sane default before the first layout pass has sized the component.
+    function sectionWidth(view, itemId, fallback) {
         try {
-            opts = opts || {};
-            if (!values || values.length < 2) {
-                return '';
+            var cmp = view && view.down && view.down('#' + itemId);
+            if (cmp && typeof cmp.getWidth === 'function') {
+                var w = cmp.getWidth();
+                if (w && w > 0) { return w; }
             }
-            var w = opts.width || 96;
-            var hgt = opts.height || 22;
-            var pad = 2;
-            var i;
-            var max = 0;
-            for (i = 0; i < values.length; i++) {
-                var v = num(values[i]);
-                if (v > max) { max = v; }
+            if (view && typeof view.getWidth === 'function') {
+                var vw = view.getWidth();
+                if (vw && vw > 0) { return vw - 32; } // minus bodyPadding
             }
-            if (opts.max && opts.max > max) { max = opts.max; }
-            if (max <= 0) { max = 1; }
-            var n = values.length;
-            var stepX = (w - pad * 2) / (n - 1);
-            var pts = [];
-            for (i = 0; i < n; i++) {
-                var x = pad + i * stepX;
-                var y = hgt - pad - (num(values[i]) / max) * (hgt - pad * 2);
-                pts.push(x.toFixed(1) + ',' + y.toFixed(1));
-            }
-            var line = pts.join(' ');
-            var baseline = (hgt - pad).toFixed(1);
-            var lastX = (pad + (n - 1) * stepX).toFixed(1);
-            var area = 'M' + pad.toFixed(1) + ',' + baseline
-                + ' L' + pts.join(' L')
-                + ' L' + lastX + ',' + baseline + ' Z';
-            var color = opts.color || 'var(--anas-accent,#3468c0)';
-            return '<svg class="anas-dash-spark" width="' + w + '" height="' + hgt + '" '
-                + 'viewBox="0 0 ' + w + ' ' + hgt + '" preserveAspectRatio="none" aria-hidden="true">'
-                + '<path d="' + area + '" fill="' + color + '" opacity="0.12"/>'
-                + '<polyline points="' + line + '" fill="none" stroke="' + color + '" '
-                + 'stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>'
-                + '</svg>';
         } catch (e) {
-            return '';
+            // fall through
         }
+        return fallback || 620;
     }
 
-    // A throughput row: label + fullness-relative gfx bar (scaled to the metric's
-    // recent peak) + absolute value + rolling sparkline. Bytes/s throughput has
-    // no natural 0..1 fullness, so we scale the bar against the buffer peak to
-    // give a live sense of "how busy relative to recent". Fail-open bar fallback.
-    function metricRow(view, key, label, value, color) {
-        var arr = pushSpark(view, key, value);
-        var peak = 0;
-        for (var i = 0; i < arr.length; i++) {
-            if (arr[i] > peak) { peak = arr[i]; }
-        }
-        var frac = peak > 0 ? num(value) / peak : 0;
-        var barHtml = '';
+    // Render a bicolor gfx.timeChart, degrading to a muted note if gfx is absent
+    // or the chart fails open (returns ''). Never throws into the caller.
+    function timeChartHtml(series, opts) {
         try {
-            if (gfx && typeof gfx.bar === 'function') {
-                barHtml = gfx.bar(frac, { pct: false, color: color, title: bps(value) }) || '';
+            if (gfx && typeof gfx.timeChart === 'function') {
+                var html = gfx.timeChart(series, opts);
+                if (html) { return html; }
             }
         } catch (e) {
-            barHtml = '';
+            // fall through to the muted note
         }
-        if (!barHtml) {
-            barHtml = fallbackBar(frac, color);
-        }
-        return '<div class="anas-dash-metric">'
-            + '<span class="anas-dash-metric-lbl">' + enc(label) + '</span>'
-            + '<span class="anas-dash-metric-bar">' + barHtml + '</span>'
-            + '<span class="anas-dash-metric-val">' + enc(bps(value)) + '</span>'
-            + sparkline(arr, { color: color, width: 88, height: 20 })
-            + '</div>';
+        return '<div class="anas-dash-muted">' + enc(t('Live I/O collecting…')) + '</div>';
     }
 
     function fallbackBar(frac, color) {
@@ -540,15 +506,15 @@
 
     // ---- TELEMETRY sections (polled) ---------------------------------------
 
-    // 2.7 — ARC hit ratio gauge + size/target + max, L2ARC line when present,
-    // and a hit-ratio sparkline.
+    // 2.7 — ARC hit ratio gauge + size/target + max, L2ARC line when present.
+    // Hit ratio is a natural 0..1 fullness, so the gauge already reads clearly —
+    // no time chart here (the sparkline earned no axes and was removed).
     function renderArc(view, tel) {
         var arc = tel && tel.arc;
         if (!arc) {
             return heading(t('ARC')) + muted(t('No ARC data.'));
         }
         var hr = clamp01(arc.hitRatio);
-        var arr = pushSpark(view, 'arc.hit', hr);
         var gaugeHtml = '';
         try {
             if (gfx && typeof gfx.gauge === 'function') {
@@ -574,13 +540,10 @@
                 + enc('L2ARC: ' + Math.round(clamp01(arc.l2.hitRatio) * 100) + '% '
                     + t('hit') + ' · ' + ANAS.formatBytes(arc.l2.size)) + '</div>';
         }
-        var spark = sparkline(arr, { color: ARC_COLOR, width: 140, height: 26 });
         return heading(t('ARC — Adaptive Replacement Cache'))
             + '<div class="anas-dash-row">'
             + '<div class="anas-dash-col">' + gaugeHtml + maxLine + l2 + '</div>'
-            + '<div class="anas-dash-col" style="max-width:170px;flex:0 0 auto">'
-            + (spark || '<span class="anas-dash-muted">' + enc(t('collecting…')) + '</span>')
-            + '</div></div>';
+            + '</div>';
     }
 
     function poolGlyph() {
@@ -602,10 +565,12 @@
     // the telemetry pool's nested vdevs[].disks[]. Both caches live on the view
     // and this renders from whichever we have (fail-open, last-good preserved).
 
-    // A telemetry device tile: disk object + live throughput + latency + a
-    // combined-throughput sparkline. Kind defaults to 'hdd', state to 'online'
-    // (telemetry carries no per-disk health) — scoped to its vdev by nesting.
-    function renderDevice(view, dev) {
+    // A telemetry device tile: disk object + live throughput numbers + latency +
+    // a slim activity bar (combined throughput relative to the busiest sibling
+    // device in this vdev — a live, stateless "how busy" read; no sparkline, it
+    // earned no axes). Kind defaults to 'hdd', state to 'online' (telemetry
+    // carries no per-disk health) — scoped to its vdev by nesting.
+    function renderDevice(view, dev, refMax) {
         dev = dev || {};
         var id = dev.id || 'disk';
         var iconHtml = '';
@@ -617,22 +582,36 @@
             iconHtml = '';
         }
         var total = num(dev.readBytesPerSec) + num(dev.writeBytesPerSec);
-        var arr = pushSpark(view, 'disk.' + id, total);
-        var spark = sparkline(arr, { color: 'var(--anas-accent,#3468c0)', width: 66, height: 18 });
+        var frac = refMax > 0 ? total / refMax : 0;
+        var barHtml = '';
+        try {
+            if (gfx && typeof gfx.bar === 'function') {
+                barHtml = gfx.bar(frac, {
+                    pct: false, color: 'var(--anas-accent,#3468c0)', title: bps(total)
+                }) || '';
+            }
+        } catch (eB) {
+            barHtml = '';
+        }
+        if (!barHtml) {
+            barHtml = fallbackBar(frac, 'var(--anas-accent,#3468c0)');
+        }
         return '<div class="anas-dash-disk">' + iconHtml
-            + '<div style="min-width:0">'
+            + '<div style="min-width:0;flex:1 1 auto">'
             + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(shortId(id)) + '</div>'
             + '<div class="anas-dash-disk-sub">'
             + enc('▼ ' + bps(dev.readBytesPerSec) + '  ▲ ' + bps(dev.writeBytesPerSec)) + '</div>'
             + '<div class="anas-dash-disk-sub">' + enc(t('lat') + ' ' + fmtLat(pickLat(dev))) + '</div>'
-            + spark
+            + '<div style="margin-top:5px">' + barHtml + '</div>'
             + '</div></div>';
     }
 
-    // A vdev group: name + type + its state pill + aggregated I/O, over a device
-    // grid. The left border + a *-degraded/-faulted class make a degraded vdev
-    // read as degraded even at a glance (colour keyed off gfx.pillLevel).
-    function renderVdev(view, vdev) {
+    // A vdev group: name + type + its state pill + aggregated IOPS/latency line,
+    // its own bicolor read/write time chart, over a device grid. The left border
+    // + a *-degraded/-faulted class make a degraded vdev read as degraded even at
+    // a glance (colour keyed off gfx.pillLevel). `chartW` is the measured pixel
+    // width for its time chart; `poolName` scopes the rolling-buffer keys.
+    function renderVdev(view, vdev, poolName, chartW) {
         vdev = vdev || {};
         var lvl = '';
         try {
@@ -659,15 +638,35 @@
         var io = '<span class="anas-dash-vdev-io">'
             + enc('▼ ' + bps(vdev.readBytesPerSec) + '  ▲ ' + bps(vdev.writeBytesPerSec)
                 + '  ·  ' + iops(vdev.readIops) + '/' + iops(vdev.writeIops) + ' IOPS') + '</span>';
+
+        // Per-vdev bicolor read/write time chart (compact — visual hierarchy under
+        // the pool chart — but still fully labelled with axes + legend).
+        var vKey = 'vdev.' + poolName + '.' + name;
+        var vr = pushSpark(view, vKey + '.read', vdev.readBytesPerSec);
+        var vw = pushSpark(view, vKey + '.write', vdev.writeBytesPerSec);
+        var chart = timeChartHtml(
+            [
+                { label: t('Read'), color: READ_COLOR, values: vr },
+                { label: t('Write'), color: WRITE_COLOR, values: vw }
+            ],
+            { width: chartW, height: 120, windowMs: BUFFER_MS, sampleMs: POLL_MS }
+        );
+
         var devs = vdev.disks || [];
+        var refMax = 0;
+        for (var d = 0; d < devs.length; d++) {
+            var dt = num(devs[d] && devs[d].readBytesPerSec) + num(devs[d] && devs[d].writeBytesPerSec);
+            if (dt > refMax) { refMax = dt; }
+        }
         var devHtml = '';
         for (var i = 0; i < devs.length; i++) {
-            devHtml += renderDevice(view, devs[i]);
+            devHtml += renderDevice(view, devs[i], refMax);
         }
         return '<div class="anas-dash-vdev' + (lvl ? ' anas-dash-vdev-' + lvl : '') + '">'
             + '<div class="anas-dash-vdev-head">'
             + '<span class="anas-dash-vdev-name">' + enc(name) + '</span>'
             + typeTag + pill + io + '</div>'
+            + '<div class="anas-dash-vdev-chart">' + chart + '</div>'
             + (devHtml ? '<div class="anas-dash-devs">' + devHtml + '</div>' : '')
             + '</div>';
     }
@@ -676,7 +675,10 @@
     // aggregate live I/O + scan indicator, then the nested vdevs. `p` is the
     // /status pool (capacity/state/scan); `tp` is the matched /telemetry pool
     // (I/O + vdevs), or null when telemetry hasn't landed for this pool yet.
-    function renderPoolBlock(view, p, tp) {
+    function renderPoolBlock(view, p, tp, dims) {
+        dims = dims || {};
+        var poolW = dims.pool > 0 ? dims.pool : 620;
+        var vdevW = dims.vdev > 0 ? dims.vdev : 560;
         var name = p.name || 'pool';
         var cap = num(p.capacity);
         var alloc = num(p.allocated);
@@ -715,18 +717,30 @@
             pill = ANAS.renderState(p.state);
         }
 
-        // Aggregate live read/write I/O from the telemetry pool level.
-        var ioHtml;
+        // Aggregate live read/write I/O from the telemetry pool level: an IOPS +
+        // latency summary line in the head, and the headline full-width bicolor
+        // time chart below it.
+        var summaryHtml = '';
+        var chartHtml = '';
         if (tp) {
-            ioHtml = '<div class="anas-dash-pool-io">'
-                + metricRow(view, 'pool.' + name + '.read', t('Read'), tp.readBytesPerSec, READ_COLOR)
-                + metricRow(view, 'pool.' + name + '.write', t('Write'), tp.writeBytesPerSec, WRITE_COLOR)
-                + '<div class="anas-dash-muted" style="margin-top:2px">'
+            summaryHtml = '<div class="anas-dash-muted" style="margin-top:4px">'
                 + enc(iops(tp.readIops) + ' r · ' + iops(tp.writeIops) + ' w IOPS   ·   '
                     + t('lat') + ' ▼ ' + fmtLat(tp.readLatencyNs) + '  ▲ ' + fmtLat(tp.writeLatencyNs))
-                + '</div></div>';
+                + '</div>';
+            var pr = pushSpark(view, 'pool.' + name + '.read', tp.readBytesPerSec);
+            var pw = pushSpark(view, 'pool.' + name + '.write', tp.writeBytesPerSec);
+            chartHtml = '<div class="anas-dash-pool-io">' + timeChartHtml(
+                [
+                    { label: t('Read'), color: READ_COLOR, values: pr },
+                    { label: t('Write'), color: WRITE_COLOR, values: pw }
+                ],
+                {
+                    width: poolW, height: 160, windowMs: BUFFER_MS, sampleMs: POLL_MS,
+                    title: t('Pool I/O')
+                }
+            ) + '</div>';
         } else {
-            ioHtml = '<div class="anas-dash-pool-io">' + muted(t('Live I/O collecting…')) + '</div>';
+            chartHtml = '<div class="anas-dash-pool-io">' + muted(t('Live I/O collecting…')) + '</div>';
         }
 
         var capBlock = donut
@@ -751,7 +765,7 @@
         var vdevs = (tp && tp.vdevs) || [];
         var vdevHtml = '';
         for (var i = 0; i < vdevs.length; i++) {
-            vdevHtml += renderVdev(view, vdevs[i]);
+            vdevHtml += renderVdev(view, vdevs[i], name, vdevW);
         }
 
         return '<div class="anas-dash-pool">'
@@ -760,8 +774,9 @@
             + '<div class="anas-dash-pool-main">'
             + '<div class="anas-dash-pool-name">' + poolGlyph()
             + '<span>' + enc(name) + '</span>' + pill + '</div>'
-            + ioHtml
+            + summaryHtml
             + '</div></div>'
+            + chartHtml
             + scan
             + vdevHtml
             + '</div>';
@@ -791,6 +806,15 @@
             return heading(t('Pools')) + muted(t('No pools.'));
         }
 
+        // Measure the section so the time charts render at exact px and fill it.
+        // pool card = 14px padding each side + 1px border; the nested vdev adds a
+        // 4px margin, 12+10px padding and 3px accent border. Floor so a not-yet-
+        // laid-out (width 0) first render still produces sensible charts.
+        var secW = sectionWidth(view, 'anasDashPools', 620);
+        var poolW = Math.max(240, secW - 30);
+        var vdevW = Math.max(220, poolW - 33);
+        var dims = { pool: poolW, vdev: vdevW };
+
         var body = '';
         for (var i = 0; i < list.length; i++) {
             var p = list[i] || {};
@@ -798,7 +822,7 @@
             // When falling back to telemetry pools, `p` already IS the telemetry
             // pool, so use it directly for the I/O side too.
             var tp = telMap[name] || (statusPools.length ? null : p);
-            body += renderPoolBlock(view, p, tp);
+            body += renderPoolBlock(view, p, tp, dims);
         }
         return heading(t('Pools')) + body;
     }
@@ -810,19 +834,36 @@
         if (!net) {
             return heading(t('Network')) + muted(t('No network telemetry.'));
         }
+        // Full-width bicolor rx/tx time chart for total link utilization.
+        var secW = sectionWidth(view, 'anasDashNet', 620);
+        var netW = Math.max(240, secW - 30);
+        var nrx = pushSpark(view, 'net.total.rx', net.totalRxBytesPerSec);
+        var ntx = pushSpark(view, 'net.total.tx', net.totalTxBytesPerSec);
         var total = '<div class="anas-dash-card" style="margin-bottom:12px">'
-            + metricRow(view, 'net.total.rx', t('Total RX'), net.totalRxBytesPerSec, RX_COLOR)
-            + metricRow(view, 'net.total.tx', t('Total TX'), net.totalTxBytesPerSec, TX_COLOR)
+            + timeChartHtml(
+                [
+                    { label: t('RX'), color: RX_COLOR, values: nrx },
+                    { label: t('TX'), color: TX_COLOR, values: ntx }
+                ],
+                {
+                    width: netW, height: 150, windowMs: BUFFER_MS, sampleMs: POLL_MS,
+                    title: t('Total throughput')
+                }
+            )
             + '</div>';
+        // Per-interface live numeric readout (no chart — the total chart carries
+        // the trend; interfaces are a compact rx/tx number pair).
         var ifs = net.interfaces || [];
         var perIf = '';
         for (var i = 0; i < ifs.length; i++) {
             var f = ifs[i] || {};
             var nm = f.name || ('if' + i);
-            perIf += '<div class="anas-dash-card" style="min-width:270px;flex:1 1 280px">'
+            perIf += '<div class="anas-dash-card" style="min-width:200px;flex:1 1 220px">'
                 + '<div class="anas-dash-card-title"><span>' + enc(nm) + '</span></div>'
-                + metricRow(view, 'net.' + nm + '.rx', t('RX'), f.rxBytesPerSec, RX_COLOR)
-                + metricRow(view, 'net.' + nm + '.tx', t('TX'), f.txBytesPerSec, TX_COLOR)
+                + '<div class="anas-dash-disk-sub">'
+                + enc('▼ ' + t('RX') + ' ' + bps(f.rxBytesPerSec)) + '</div>'
+                + '<div class="anas-dash-disk-sub">'
+                + enc('▲ ' + t('TX') + ' ' + bps(f.txBytesPerSec)) + '</div>'
                 + '</div>';
         }
         return heading(t('Network — link utilization vs storage throughput'))

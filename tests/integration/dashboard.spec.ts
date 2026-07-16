@@ -71,18 +71,44 @@ test.describe('ANAS dashboard (stunt node)', () => {
       timeout: 20_000,
     })
 
+    // I/O is now shown as labelled gfx.timeChart time-series charts (axes +
+    // scale + time markings + legend), NOT the old axis-less sparklines. When
+    // live telemetry lands the pool gets a headline chart and the network its
+    // rx/tx chart.
+    await expect(
+      view.locator('.anas-dash-pools .anas-gfx-timechart').first(),
+    ).toBeVisible({ timeout: 30_000 })
+    await expect(
+      view.locator('.anas-dash-net .anas-gfx-timechart').first(),
+    ).toBeVisible({ timeout: 30_000 })
+
+    // The old axis-less sparklines are gone everywhere.
+    await expect(view.locator('.anas-dash-spark')).toHaveCount(0)
+
+    // ARC keeps its capacity GAUGE — no time chart, no sparkline in that section.
+    await expect(view.locator('.anas-dash-arc .anas-gfx-timechart')).toHaveCount(0)
+
     // When live telemetry lands, the Pool → VDEV → Device nesting appears:
     // devices (.anas-dash-disk) live INSIDE a vdev (.anas-dash-vdev) inside a
-    // pool. Tolerant of telemetry not (yet) being available — fail-open.
+    // pool, and each vdev carries its own time chart. Per-device tiles are live
+    // numbers + a bar only — never a chart. Tolerant of telemetry not (yet)
+    // being available — fail-open.
     const vdevCount = await view.locator('.anas-dash-pools .anas-dash-vdev').count()
     if (vdevCount > 0) {
       await expect(
         view.locator('.anas-dash-pools .anas-dash-vdev').first(),
       ).toBeVisible({ timeout: 20_000 })
+      await expect(
+        view.locator('.anas-dash-pools .anas-dash-vdev .anas-gfx-timechart').first(),
+      ).toBeVisible({ timeout: 20_000 })
       const nestedDisks = await view
         .locator('.anas-dash-pools .anas-dash-vdev .anas-dash-disk')
         .count()
       expect(nestedDisks).toBeGreaterThan(0)
+      // Per-device tiles carry no time chart (numbers + bar only).
+      await expect(
+        view.locator('.anas-dash-pools .anas-dash-vdev .anas-dash-disk .anas-gfx-timechart'),
+      ).toHaveCount(0)
     }
   })
 
