@@ -47,6 +47,7 @@ export {
   ShareStatusBrief,
   StatusSummary,
   Telemetry,
+  VdevTelemetry,
 } from './schemas/dashboard.js'
 
 // Dataset schemas

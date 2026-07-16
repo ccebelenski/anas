@@ -11,6 +11,10 @@ import type {
   ShareStatusBrief,
   StatusSummary,
   Telemetry,
+  VdevRole,
+  VdevState,
+  VdevTelemetry,
+  VdevType,
 } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
@@ -181,12 +185,22 @@ export async function dashboardRoutes(
         .list()
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
         .slice(0, 20)
-        .map((j): JobBrief => ({
-          id: j.id,
-          kind: j.operation,
-          status: j.status,
-          ...(j.startedAt ? { startedAt: j.startedAt } : {}),
-        }))
+        .map((j): JobBrief => {
+          const brief: JobBrief = { id: j.id, kind: j.operation, status: j.status }
+          if (j.startedAt) {
+            brief.startedAt = j.startedAt
+            const start = Date.parse(j.startedAt)
+            if (!Number.isNaN(start)) {
+              // Finished job: measure to completedAt. Still running: measure to now.
+              const end = j.completedAt ? Date.parse(j.completedAt) : Date.now()
+              if (j.completedAt && !Number.isNaN(Date.parse(j.completedAt)))
+                brief.finishedAt = j.completedAt
+              if (!Number.isNaN(end))
+                brief.durationMs = Math.max(0, end - start)
+            }
+          }
+          return brief
+        })
     }
     catch {
       return []
@@ -233,9 +247,9 @@ export async function dashboardRoutes(
 
       const arc = computeArc(arc0, arc1)
       const net = computeNet(net0, net1, windowMs)
-      const { pools, disks } = await computeIo(iostatText)
+      const pools = await computeIo(iostatText)
 
-      return { sampledAt, windowMs, arc, pools, disks, net }
+      return { sampledAt, windowMs, arc, pools, net }
     }
     catch {
       return emptyTelemetry(sampledAt)
@@ -262,48 +276,142 @@ export async function dashboardRoutes(
     )
   }
 
-  /** Per-pool and per-leaf-disk I/O from the interval (LAST) iostat sample. */
-  async function computeIo(iostatText: string): Promise<{ pools: PoolTelemetry[], disks: DiskTelemetry[] }> {
+  /**
+   * Nested pool → vdevs[] → disks[] I/O from the interval (LAST) iostat sample.
+   * Each vdev is enriched with type/role/state joined from `zpool status`.
+   */
+  async function computeIo(iostatText: string): Promise<PoolTelemetry[]> {
     const pools: PoolTelemetry[] = []
-    const disks: DiskTelemetry[] = []
     if (!iostatText.trim())
-      return { pools, disks }
+      return pools
 
     const samples = parseZpoolIostat(iostatText)
     const sample = samples[samples.length - 1]
     if (!sample || sample.length === 0)
-      return { pools, disks }
+      return pools
 
-    // Map iostat leaf names (kernel like `sdb` or already-by-id) to the SAME
-    // stable by-id identity the Disks view / pool topology uses. `ls -la
-    // /dev/disk/by-id/` gives kernel→by-id; a name that is already a by-id (or
-    // unresolvable) is used verbatim.
-    let byIdMap = new Map<string, string>()
-    try {
-      const byIdResult = await executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/'])
-      byIdMap = parseDiskByIdListing(byIdResult.stdout)
-    }
-    catch { /* leaf names used verbatim */ }
+    // Both joins are independent and fail-open: the by-id map (leaf → stable
+    // identity) and the topology map (vdev → type/role/state).
+    const [byIdMap, topology] = await Promise.all([loadByIdMap(), fetchVdevTopology()])
+
+    const disk = (name: string, node: (typeof sample)[number]): DiskTelemetry => ({
+      id: byIdMap.get(name) ?? name,
+      ...nodeToIoStats(node),
+    })
+
+    let currentPool: PoolTelemetry | null = null
+    let currentVdev: VdevTelemetry | null = null
 
     for (let i = 0; i < sample.length; i++) {
       const node = sample[i]
+      const hasChild = i + 1 < sample.length && sample[i + 1].depth > node.depth
+
       if (node.depth === 0) {
-        pools.push({ name: node.name, ...nodeToIoStats(node) })
+        currentPool = { name: node.name, vdevs: [], ...nodeToIoStats(node) }
+        currentVdev = null
+        pools.push(currentPool)
         continue
       }
-      // A leaf disk is any non-pool row with no deeper child row following it.
-      const hasChild = i + 1 < sample.length && sample[i + 1].depth > node.depth
-      if (hasChild)
+      if (!currentPool)
+        continue // defensive: a vdev/disk row with no standing pool
+
+      if (node.depth === 1) {
+        const info = topology.get(currentPool.name)?.get(node.name)
+        const vdev: VdevTelemetry = {
+          name: node.name,
+          type: info?.type ?? typeFromName(node.name),
+          role: info?.role ?? 'data',
+          state: info?.state ?? 'ONLINE',
+          disks: [],
+          ...nodeToIoStats(node),
+        }
+        currentPool.vdevs.push(vdev)
+        currentVdev = vdev
+        // A bare striped leaf disk is a depth-1 row with no deeper child: it is
+        // both vdev and disk — surface it as the vdev's single disk.
+        if (!hasChild)
+          vdev.disks.push(disk(node.name, node))
         continue
-      disks.push({
-        id: byIdMap.get(node.name) ?? node.name,
-        pool: node.pool,
-        ...(node.vdev ? { vdev: node.vdev } : {}),
-        ...nodeToIoStats(node),
-      })
+      }
+
+      // depth >= 2: a leaf disk in the current vdev. Skip nested container rows
+      // (e.g. `replacing-0`) that still have deeper child rows following them.
+      if (!hasChild && currentVdev)
+        currentVdev.disks.push(disk(node.name, node))
     }
-    return { pools, disks }
+    return pools
   }
+
+  /**
+   * Map iostat leaf names (kernel like `sdb` or already-by-id) to the SAME
+   * stable by-id identity the Disks view / pool topology uses. `ls -la
+   * /dev/disk/by-id/` gives kernel→by-id; a name that is already a by-id (or
+   * unresolvable) is used verbatim. Fail-open to an empty map.
+   */
+  async function loadByIdMap(): Promise<Map<string, string>> {
+    try {
+      const byIdResult = await executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/'])
+      return parseDiskByIdListing(byIdResult.stdout)
+    }
+    catch {
+      return new Map()
+    }
+  }
+
+  /**
+   * One `zpool status -jv` read per sample, reduced to pool → (vdev name →
+   * type/role/state). Reuses the same parser /status uses. Fail-open: an
+   * unmatched vdev falls back to a name-derived type + role 'data' + 'ONLINE'.
+   */
+  async function fetchVdevTopology(): Promise<Map<string, Map<string, VdevJoin>>> {
+    const map = new Map<string, Map<string, VdevJoin>>()
+    try {
+      const r = await executor.exec(ZPOOL, ['status', '-jv'])
+      if (r.exitCode !== 0 && !r.stdout.trim())
+        return map
+      for (const pool of parseZpoolStatus(r.stdout)) {
+        const vmap = new Map<string, VdevJoin>()
+        for (const group of pool.vdevGroups) {
+          for (const vdev of group.vdevs)
+            vmap.set(vdev.name, { type: vdev.type, role: group.role, state: vdev.state })
+        }
+        map.set(pool.name, vmap)
+      }
+    }
+    catch { /* fail-open: no topology, callers use name-derived fallback */ }
+    return map
+  }
+}
+
+/** The topology fields joined onto a vdev from `zpool status`. */
+interface VdevJoin {
+  type: VdevType
+  role: VdevRole
+  state: VdevState
+}
+
+/** Fallback vdev type from its iostat name when topology has no match. */
+function typeFromName(name: string): VdevType {
+  const n = name.toLowerCase()
+  if (n.startsWith('mirror'))
+    return 'mirror'
+  if (n.startsWith('raidz3'))
+    return 'raidz3'
+  if (n.startsWith('raidz2'))
+    return 'raidz2'
+  if (n.startsWith('raidz'))
+    return 'raidz'
+  if (n.startsWith('draid3'))
+    return 'draid3'
+  if (n.startsWith('draid2'))
+    return 'draid2'
+  if (n.startsWith('draid'))
+    return 'draid'
+  if (n.startsWith('replacing'))
+    return 'replacing'
+  if (n.startsWith('spare'))
+    return 'spare'
+  return 'disk'
 }
 
 /** Read a /proc file, returning null on any error (fail-open). */
@@ -329,7 +437,6 @@ function emptyTelemetry(sampledAt: string): Telemetry {
     windowMs: 0,
     arc: { hitRatio: 0, size: 0, target: 0, max: 0, l2: null },
     pools: [],
-    disks: [],
     net: { interfaces: [], totalRxBytesPerSec: 0, totalTxBytesPerSec: 0 },
   }
 }
