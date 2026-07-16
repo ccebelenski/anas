@@ -580,6 +580,9 @@
         props: '<path d="M4 8h8M18 8h2"/><circle cx="15" cy="8" r="2.2"/>'
             + '<path d="M4 16h2M12 16h8"/><circle cx="9" cy="16" r="2.2"/>',
         trash: '<path d="M5 7h14M9 7V5.5h6V7M6.5 7l1 12.5h9L17.5 7"/>',
+        // Two circular sync arrows — send/receive replication (Epic 5.5).
+        replicate: '<path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 6.7 3M21 3v5h-5"/>'
+            + '<path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-6.7-3M3 21v-5h5"/>',
     };
     // Convenience aliases so callers can use either vocabulary.
     var CTL_ALIAS = { snap: 'snapshot', properties: 'props', permissions: 'lock', delete: 'trash' };
