@@ -39,9 +39,11 @@ describe('parseLsblk', () => {
 
   it('identifies pool member disks', () => {
     const byIdMap = parseDiskByIdListing(loadText('disk-by-id.txt'))
+    // poolDisks is keyed by KERNEL name (the caller canonicalizes zpool-status
+    // leaves to their kernel device before handing the map to parseLsblk).
     const poolDisks = new Map([
-      ['ata-WDC_WD2003FZEX-00SRLA0_WD-12345678', 'testpool'],
-      ['ata-WDC_WD2003FZEX-00SRLA0_WD-23456789', 'testpool'],
+      ['sdb', 'testpool'],
+      ['sdc', 'testpool'],
     ])
     const disks = parseLsblk(loadJson('lsblk.json'), byIdMap, poolDisks)
 

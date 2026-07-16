@@ -49,7 +49,7 @@ export type ByIdMap = Map<string, string>
  * Filters to physical disks (type=disk), excluding CD-ROMs, zram, loop, etc.
  * @param json raw lsblk JSON output (string or pre-parsed object)
  * @param byIdMap mapping of kernel names to by-id identifiers (from disk-by-id parser)
- * @param poolDisks set of by-id names that belong to ZFS pools
+ * @param poolDisks map of KERNEL names to the ZFS pool they belong to
  */
 export function parseLsblk(
   json: string | LsblkOutput,
@@ -64,9 +64,10 @@ export function parseLsblk(
       const id = byIdMap.get(dev.name) ?? dev.serial ?? dev.name
       const partitions = parsePartitions(dev.children ?? [])
       const isSystem = isSystemDisk(dev, partitions)
-      // Pool membership is matched by stable by-id (parseZpoolStatus derives the
-      // leaf's id from its devid). Never key on the kernel name — it changes.
-      const poolName = poolDisks.get(id) ?? null
+      // Pool membership is matched on the KERNEL name: the caller canonicalizes
+      // each zpool-status leaf (whose ZFS-chosen by-id may differ from the one
+      // we display) to its kernel device, so both sides join on `dev.name`.
+      const poolName = poolDisks.get(dev.name) ?? null
       let status: DiskUsageStatus = 'available'
       if (isSystem)
         status = 'system'

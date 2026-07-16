@@ -2,12 +2,63 @@ import type { Disk, DiskHealthStatus, VdevRole, VdevState } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
-import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
+import { parseByIdToKernel, parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { LSBLK_ARGS, parseLsblk } from '../parsers/lsblk.js'
 import { parseSmartctl } from '../parsers/smartctl.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 
-/** ZFS context for a pool-member disk, keyed by stable by-id. */
+const BY_ID_PATH_RE = /^\/dev\/disk\/by-id\/(.+)$/
+const KERNEL_PATH_RE = /^\/dev\/([a-z0-9]+)$/
+const PART_SUFFIX_RE = /-part\d+$/
+const BARE_KERNEL_RE = /^(?:sd|vd|hd)[a-z]+\d*$|^nvme\d+n\d+/
+
+/**
+ * Resolve a `zpool status` leaf to its whole-disk KERNEL name so both sides of
+ * the disk↔pool join canonicalize to the same key. A leaf's ZFS-chosen by-id
+ * (its `devid`) is often a DIFFERENT form than the highest-priority by-id our
+ * disk parser picks (e.g. ZFS says `wwn-0x…`, we display `ata-WDC…`); keying on
+ * the by-id therefore drops the match on real hardware. The kernel device is
+ * the one identity both agree on.
+ *
+ * Precedence, mirroring `zpool-status`'s own `diskId()` inputs:
+ *   1. the leaf `id` (its `devid`, or a by-id derived from `path`/`name`),
+ *      looked up in the complete by-id → kernel map;
+ *   2. the leaf `path`: a `/dev/disk/by-id/<x>` form is stripped + mapped; a
+ *      `/dev/sdX[N]` / `/dev/nvmeXnY[pN]` form is reduced to its parent kernel;
+ *   3. the leaf `id` treated as a bare kernel name.
+ * Returns null when nothing resolves — that leaf simply won't cross-reference.
+ */
+function resolveLeafKernel(
+  id: string,
+  path: string,
+  byIdToKernel: Map<string, string>,
+): string | null {
+  // 1. id is the leaf's devid (or by-id from path/name) in the common case.
+  const fromId = byIdToKernel.get(id.replace(PART_SUFFIX_RE, ''))
+  if (fromId)
+    return fromId
+
+  // 2. fall back to the raw path.
+  if (path) {
+    const byIdPath = path.match(BY_ID_PATH_RE)
+    if (byIdPath) {
+      const fromPath = byIdToKernel.get(byIdPath[1].replace(PART_SUFFIX_RE, ''))
+      if (fromPath)
+        return fromPath
+    }
+    const kernelPath = path.match(KERNEL_PATH_RE)
+    if (kernelPath)
+      return wholeDiskKernel(kernelPath[1])
+  }
+
+  // 3. id may itself be a bare kernel name (ZFS had nothing better).
+  if (BARE_KERNEL_RE.test(id))
+    return wholeDiskKernel(id)
+
+  return null
+}
+
+/** ZFS context for a pool-member disk, keyed by whole-disk kernel name. */
 interface PoolDiskInfo {
   pool: string
   vdevName: string
@@ -60,8 +111,13 @@ export async function collectDisks(
   ])
 
   const byIdMap = parseDiskByIdListing(byIdResult.stdout)
+  // Complete by-id → kernel map (every ata-/wwn-/scsi-/nvme- form), used to
+  // canonicalize both the zpool-status leaves and the physical disks to the
+  // same kernel device before joining. See resolveLeafKernel.
+  const byIdToKernel = parseByIdToKernel(byIdResult.stdout)
 
-  // Rich ZFS context per disk (vdev/role/state/error counts), keyed by by-id.
+  // Rich ZFS context per disk (vdev/role/state/error counts), keyed by the
+  // whole-disk KERNEL name — the identity both zpool-status and lsblk share.
   const poolInfo = new Map<string, PoolDiskInfo>()
   if (statusResult.exitCode === 0 && statusResult.stdout.trim()) {
     try {
@@ -70,7 +126,10 @@ export async function collectDisks(
         for (const group of pool.vdevGroups) {
           for (const vdev of group.vdevs) {
             for (const disk of vdev.disks) {
-              poolInfo.set(disk.id, {
+              const kernel = resolveLeafKernel(disk.id, disk.path, byIdToKernel)
+              if (!kernel)
+                continue
+              poolInfo.set(kernel, {
                 pool: pool.name,
                 vdevName: vdev.name,
                 role: group.role,
@@ -89,10 +148,10 @@ export async function collectDisks(
     }
   }
 
-  // parseLsblk only needs id→pool for its usage-status classification.
+  // parseLsblk needs kernel-name → pool for its usage-status classification.
   const poolDisks = new Map<string, string>()
-  for (const [id, info] of poolInfo)
-    poolDisks.set(id, info.pool)
+  for (const [kernel, info] of poolInfo)
+    poolDisks.set(kernel, info.pool)
 
   const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks)
 
@@ -103,7 +162,9 @@ export async function collectDisks(
   return disks.map((d) => {
     const identity = diskIdentityCache.getCached(d.id)
     const smartHealthy = identity ? identity.smartHealthy : null
-    const info = poolInfo.get(d.id)
+    // Pool context joins on the kernel name (d.name), NOT the display by-id
+    // (d.id) — the by-id ZFS reports and the by-id we display can differ.
+    const info = poolInfo.get(d.name)
     const zfsContext = info
       ? {
           vdevName: info.vdevName,
