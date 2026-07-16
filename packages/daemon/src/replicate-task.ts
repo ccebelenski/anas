@@ -22,6 +22,10 @@ export interface RunnerOptions {
   dataset: string
   targetPool: string
   targetDataset?: string
+  /** Stage-3: where the target pool lives (absent / 'local' = same node). */
+  locationKind?: 'local' | 'peer' | 'remote'
+  /** Peer nodename or registered remote name (with a non-local kind). */
+  locationName?: string
   snapshotFirst: boolean
   socket: string
 }
@@ -46,6 +50,10 @@ export function parseRunnerArgs(argv: string[]): RunnerOptions {
       opts.targetPool = value
     else if (flag === '--target-dataset')
       opts.targetDataset = value
+    else if (flag === '--location-kind')
+      opts.locationKind = value as RunnerOptions['locationKind']
+    else if (flag === '--location-name')
+      opts.locationName = value
     else if (flag === '--socket')
       opts.socket = value
     else if (flag === '--snapshot-first')
@@ -59,11 +67,15 @@ export function parseRunnerArgs(argv: string[]): RunnerOptions {
     throw new Error('Missing required --dataset (use --dataset "" for the pool root)')
   if (!opts.targetPool)
     throw new Error('Missing required --target-pool')
+  if (opts.locationKind && opts.locationKind !== 'local' && !opts.locationName)
+    throw new Error(`Missing --location-name for --location-kind ${opts.locationKind}`)
   return {
     pool: opts.pool,
     dataset: opts.dataset,
     targetPool: opts.targetPool,
     ...(opts.targetDataset !== undefined ? { targetDataset: opts.targetDataset } : {}),
+    ...(opts.locationKind !== undefined ? { locationKind: opts.locationKind } : {}),
+    ...(opts.locationName !== undefined ? { locationName: opts.locationName } : {}),
     snapshotFirst: opts.snapshotFirst,
     socket: opts.socket ?? DEFAULT_SOCKET,
   }
@@ -85,6 +97,11 @@ export function replicateBody(opts: RunnerOptions): Record<string, unknown> {
     target: {
       pool: opts.targetPool,
       ...(opts.targetDataset !== undefined && opts.targetDataset !== '' ? { dataset: opts.targetDataset } : {}),
+      // Stage 3: pass the target LOCATION through so the endpoint replicates to a
+      // peer/remote. Absent or 'local' → the endpoint's default (same node).
+      ...(opts.locationKind && opts.locationKind !== 'local'
+        ? { location: { kind: opts.locationKind, ...(opts.locationName ? { name: opts.locationName } : {}) } }
+        : {}),
     },
     snapshotFirst: opts.snapshotFirst,
   }

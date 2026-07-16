@@ -48,6 +48,35 @@ describe('replicate-task runner (Epic 5.5.3)', () => {
     assert.deepEqual(replicateBody({ pool: 'p', dataset: 'd', targetPool: 'backup', snapshotFirst: false, socket: 's' }), { target: { pool: 'backup' }, snapshotFirst: false })
   })
 
+  // --- stage-3 location args -----------------------------------------------
+  it('parses --location-kind / --location-name (remote + peer)', () => {
+    const remote = parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'backup', '--location-kind', 'remote', '--location-name', 'nas1'])
+    assert.equal(remote.locationKind, 'remote')
+    assert.equal(remote.locationName, 'nas1')
+    const peer = parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'backup', '--location-kind', 'peer', '--location-name', 'node2'])
+    assert.equal(peer.locationKind, 'peer')
+    assert.equal(peer.locationName, 'node2')
+  })
+
+  it('throws when a non-local location kind has no name', () => {
+    assert.throws(
+      () => parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'backup', '--location-kind', 'remote']),
+      /Missing --location-name for --location-kind remote/,
+    )
+  })
+
+  it('replicateBody carries target.location only for a non-local kind', () => {
+    assert.deepEqual(
+      replicateBody({ pool: 'p', dataset: 'd', targetPool: 'backup', locationKind: 'remote', locationName: 'nas1', snapshotFirst: false, socket: 's' }),
+      { target: { pool: 'backup', location: { kind: 'remote', name: 'nas1' } }, snapshotFirst: false },
+    )
+    // 'local' (or absent) → no location key at all (full stage-1 compat).
+    assert.deepEqual(
+      replicateBody({ pool: 'p', dataset: 'd', targetPool: 'backup', locationKind: 'local', snapshotFirst: false, socket: 's' }),
+      { target: { pool: 'backup' }, snapshotFirst: false },
+    )
+  })
+
   // --- run loop (mocked requester) -----------------------------------------
   const OPTS = { pool: 'testpool', dataset: 'media', targetPool: 'backup', snapshotFirst: true, socket: '/x' }
   const noSleep = async () => {}

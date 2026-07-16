@@ -1,7 +1,8 @@
-import type { ReplicatePlan, Snapshot } from '@anas/shared'
+import type { ReplicatePlan, ReplicationTarget, Snapshot } from '@anas/shared'
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { ResolvedLocation, Transport } from '../services/replication-transport.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
 import { requireIdentity } from './identity.js'
 
@@ -23,6 +24,9 @@ import { requireIdentity } from './identity.js'
  */
 
 const ZFS = '/usr/sbin/zfs'
+/** The remote-side zfs — UNQUALIFIED (rely on the remote login PATH; we don't
+ *  own the remote and can't assume /usr/sbin). Used inside `ssh … zfs …`. */
+const ZFS_REMOTE = 'zfs'
 const HOLD_TAG = 'anas-repl'
 
 /** Dependencies handed in from datasetRoutes — its executor, queue, and the
@@ -42,6 +46,8 @@ export interface ReplicationDeps {
    *  dataset there, which ANAS never does. Fail-open: detection failure /
    *  non-PVE host → false. */
   isPveManagedPool: (poolName: string) => Promise<boolean>
+  /** Stage-3 remote/peer SSH transport (location resolution + remote zfs ops). */
+  transport: Transport
 }
 
 /**
@@ -137,8 +143,53 @@ async function heldTags(executor: CommandExecutor, snapFull: string): Promise<st
   return r.stdout.split('\n').filter(Boolean).map(l => l.split('\t')[1]).filter(Boolean)
 }
 
+/** Resolved target location: local, or a resolved peer/remote (isRemote true). */
+type TargetLocation
+  = | { isRemote: false }
+    | { isRemote: true, resolved: ResolvedLocation }
+    | { error: string }
+
 export function createReplicationHandlers(deps: ReplicationDeps) {
-  const { executor, jobQueue, resolveDatasetName, poolExists, datasetExists, listSnapshotsDetail } = deps
+  const { executor, jobQueue, resolveDatasetName, poolExists, datasetExists, listSnapshotsDetail, transport } = deps
+
+  /**
+   * Resolve where the target pool lives. `local` (absent location) → { isRemote:
+   * false }. A peer/remote is looked up (members / registry); an unresolvable one
+   * is a 400-worthy { error }.
+   */
+  async function resolveTargetLocation(target: ReplicationTarget): Promise<TargetLocation> {
+    const kind = target.location?.kind ?? 'local'
+    if (kind === 'local')
+      return { isRemote: false }
+    const res = await transport.resolveLocation(target.location!)
+    if (!res.ok)
+      return { error: res.error }
+    return { isRemote: true, resolved: res.resolved }
+  }
+
+  /** Does the target pool exist — locally (`zpool list`) or on the peer/remote (`ssh zpool list`)? */
+  async function targetPoolExists(loc: TargetLocation, pool: string): Promise<boolean> {
+    if ('error' in loc)
+      return false
+    return loc.isRemote ? transport.remotePoolExists(loc.resolved, pool) : poolExists(pool)
+  }
+
+  /**
+   * The target dataset's snapshots (as minimal Snapshot records — only
+   * snapshotName is read downstream), or null when the target dataset is absent.
+   * Remote targets go over ssh; the zfs -H list yields names only.
+   */
+  async function targetSnapshots(loc: TargetLocation, targetPool: string, targetFull: string): Promise<Snapshot[] | null> {
+    if ('error' in loc)
+      return null
+    if (loc.isRemote) {
+      if (!(await transport.remoteDatasetExists(loc.resolved, targetFull)))
+        return null
+      const names = await transport.remoteSnapshotNames(loc.resolved, targetFull)
+      return names.map(n => ({ snapshotName: n }) as Snapshot)
+    }
+    return (await datasetExists(targetPool, targetFull)) ? listSnapshotsDetail(targetFull) : null
+  }
 
   // --- POST …/datasets/*path/replicate/plan — dry-run (read-only, 200) -----
   async function planReplication(poolName: string, path: string, request: FastifyRequest, reply: FastifyReply) {
@@ -159,23 +210,34 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       return { error: { code: 'NOT_FOUND', message: `Dataset '${source}' not found` } }
     }
 
-    // The target POOL must exist — we replicate into an existing pool, never create one.
-    if (!(await poolExists(target.pool))) {
+    // Stage 3: resolve where the target lives (local / peer / remote).
+    const loc = await resolveTargetLocation(target)
+    if ('error' in loc) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' does not exist` } }
+      return { error: { code: 'VALIDATION_ERROR', message: loc.error } }
     }
-    // Story 3.25: never create datasets on a PVE-managed pool — reject it as a
-    // replication target at the API boundary too (the UI already excludes it).
-    if (await deps.isPveManagedPool(target.pool)) {
+
+    // The target POOL must exist — we replicate into an existing pool, never
+    // create one. Locally via `zpool list`; on a peer/remote via `ssh zpool list`.
+    if (!(await targetPoolExists(loc, target.pool))) {
+      const where = loc.isRemote ? ` on ${target.location?.kind} '${target.location?.name}'` : ''
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' does not exist${where}` } }
+    }
+    // Story 3.25: never create datasets on a PVE-managed pool. This guard applies
+    // ONLY to LOCAL targets — we cannot and must not read a remote's storage.cfg,
+    // so a peer/remote pool is never subject to the PVE-managed exclusion.
+    if (!loc.isRemote && (await deps.isPveManagedPool(target.pool))) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' is PVE-managed — ANAS does not create datasets there` } }
     }
 
     const targetFull = resolveTarget(source, poolName, target)
 
-    // Replicating a dataset onto itself is meaningless — give the honest
-    // answer rather than reporting it as "diverged".
-    if (targetFull === source) {
+    // Replicating a dataset onto itself is meaningless — give the honest answer.
+    // Only meaningful for LOCAL targets: a peer/remote dataset of the same name
+    // lives on a different machine and is never the source.
+    if (!loc.isRemote && targetFull === source) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Cannot replicate '${source}' onto itself — choose a different target dataset` } }
     }
@@ -192,13 +254,12 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       return { error: { code: 'NOT_FOUND', message: `Snapshot '${source}@${snapshot}' not found` } }
     }
 
-    const targetSnaps = (await datasetExists(target.pool, targetFull))
-      ? await listSnapshotsDetail(targetFull)
-      : null
+    const targetSnaps = await targetSnapshots(loc, target.pool, targetFull)
     const d = discover(sourceSnaps, targetSnaps, snapName)
 
     // Estimate the stream size for the resolved mode (full when diverged, so the
     // UI can show the honest byte cost even though it must not offer the run).
+    // The dry-run is always LOCAL — `zfs send -nvP` on the source side.
     const dryArgs = ['send', '-nvP']
     if (d.mode === 'incremental' && d.baseSnapshot)
       dryArgs.push('-i', `@${d.baseSnapshot}`)
@@ -238,29 +299,37 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Dataset '${source}' not found` } }
     }
-    if (!(await poolExists(target.pool))) {
+
+    // Stage 3: resolve where the target lives (local / peer / remote).
+    const loc = await resolveTargetLocation(target)
+    if ('error' in loc) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' does not exist` } }
+      return { error: { code: 'VALIDATION_ERROR', message: loc.error } }
     }
-    // Story 3.25: never create datasets on a PVE-managed pool — reject it as a
-    // replication target at the API boundary too (the UI already excludes it).
-    if (await deps.isPveManagedPool(target.pool)) {
+
+    if (!(await targetPoolExists(loc, target.pool))) {
+      const where = loc.isRemote ? ` on ${target.location?.kind} '${target.location?.name}'` : ''
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' does not exist${where}` } }
+    }
+    // Story 3.25: never create datasets on a PVE-managed pool — LOCAL targets
+    // only (we cannot and must not read a remote's storage.cfg).
+    if (!loc.isRemote && (await deps.isPveManagedPool(target.pool))) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' is PVE-managed — ANAS does not create datasets there` } }
     }
 
     const targetFull = resolveTarget(source, poolName, target)
 
-    // Replicating a dataset onto itself is meaningless — give the honest
-    // answer rather than reporting it as "diverged".
-    if (targetFull === source) {
+    // Replicating a dataset onto itself is meaningless — LOCAL targets only.
+    if (!loc.isRemote && targetFull === source) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Cannot replicate '${source}' onto itself — choose a different target dataset` } }
     }
 
     const job = jobQueue.submit(
       'zfs.replicate',
-      { ...identity, params: { source, target: targetFull } },
+      { ...identity, params: { source, target: targetFull, ...(loc.isRemote ? { location: target.location } : {}) } },
       async (updateProgress) => {
         // 1) Optional snapshot-first — create a fresh, sortable snapshot to send up to.
         let snapName = snapshot
@@ -282,16 +351,14 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
         else if (!sourceSnaps.some(s => s.snapshotName === snapName))
           throw new Error(`Snapshot '${source}@${snapName}' does not exist on source`)
 
-        const targetSnaps = (await datasetExists(target.pool, targetFull))
-          ? await listSnapshotsDetail(targetFull)
-          : null
+        const targetSnaps = await targetSnapshots(loc, target.pool, targetFull)
         const d = discover(sourceSnaps, targetSnaps, snapName)
         if (d.targetDiverged)
           throw new Error(`Target '${targetFull}' has diverged — no common snapshot; remove the target dataset or replicate to a new path`)
 
         const srcSnapFull = `${source}@${snapName}`
 
-        // 3) Estimate bytes (best-effort) for the job result.
+        // 3) Estimate bytes (best-effort) for the job result — always a LOCAL dry-run.
         const dryArgs = ['send', '-nvP']
         if (d.mode === 'incremental' && d.baseSnapshot)
           dryArgs.push('-i', `@${d.baseSnapshot}`)
@@ -301,7 +368,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
 
         // 4) Run the send|recv pipeline. readonly=on only on CREATE (full send);
         //    an incremental recv into the existing (already-readonly) target
-        //    must not re-set the property, which -o would reject.
+        //    must not re-set the property, which -o would reject. For a remote/
+        //    peer target the recv side runs over ssh (`… | ssh <host> zfs recv`);
+        //    for a local target it is a second local `zfs` process.
         const sendArgs = d.mode === 'incremental' && d.baseSnapshot
           ? ['send', '-i', `@${d.baseSnapshot}`, srcSnapFull]
           : ['send', srcSnapFull]
@@ -309,8 +378,16 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           ? ['recv', '-o', 'readonly=on', targetFull]
           : ['recv', targetFull]
 
+        let recvCmd = ZFS
+        let recvArgv = recvArgs
+        if (loc.isRemote) {
+          const argv = transport.buildSshArgv(loc.resolved, [ZFS_REMOTE, ...recvArgs])
+          recvCmd = argv[0]
+          recvArgv = argv.slice(1)
+        }
+
         updateProgress(`zfs send ${srcSnapFull} | zfs recv ${targetFull}`)
-        const pipe = await executor.pipeline(ZFS, sendArgs, ZFS, recvArgs)
+        const pipe = await executor.pipeline(ZFS, sendArgs, recvCmd, recvArgv)
         if (pipe.leftExitCode !== 0 || pipe.rightExitCode !== 0) {
           const detail = pipe.rightStderr.trim()
             ? `recv: ${pipe.rightStderr.trim()}`
@@ -321,18 +398,24 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
         }
 
         // 5) Hold the newest replicated base on BOTH sides, then release the
-        //    older anas-repl holds so exactly the newest base stays pinned.
-        //    Fail-open: hold/release hiccups are warnings, not job failures.
+        //    older anas-repl holds so exactly the newest base stays pinned. The
+        //    SOURCE is always local; the TARGET hold/release goes over ssh for a
+        //    peer/remote. Fail-open: hiccups are warnings, not job failures.
         const warnings: string[] = []
         const targetSnapFull = `${targetFull}@${snapName}`
-        for (const snapFull of [srcSnapFull, targetSnapFull]) {
-          const holdR = await executor.exec(ZFS, ['hold', HOLD_TAG, snapFull])
-          if (holdR.exitCode !== 0)
-            warnings.push(`Could not place ${HOLD_TAG} hold on ${snapFull}: ${holdR.stderr.trim() || `exit ${holdR.exitCode}`}`)
-        }
 
-        // Release stale holds on OLDER snapshots of both datasets (keep only snapName).
-        const releaseOlder = async (datasetFull: string, snaps: Snapshot[]): Promise<void> => {
+        const srcHold = await executor.exec(ZFS, ['hold', HOLD_TAG, srcSnapFull])
+        if (srcHold.exitCode !== 0)
+          warnings.push(`Could not place ${HOLD_TAG} hold on ${srcSnapFull}: ${srcHold.stderr.trim() || `exit ${srcHold.exitCode}`}`)
+
+        const tgtHold = loc.isRemote
+          ? await transport.remoteHold(loc.resolved, targetSnapFull, HOLD_TAG)
+          : await executor.exec(ZFS, ['hold', HOLD_TAG, targetSnapFull])
+        if (tgtHold.exitCode !== 0)
+          warnings.push(`Could not place ${HOLD_TAG} hold on ${targetSnapFull}: ${tgtHold.stderr.trim() || `exit ${tgtHold.exitCode}`}`)
+
+        // Release stale holds on OLDER source snapshots (keep only snapName).
+        const releaseOlderLocal = async (datasetFull: string, snaps: Snapshot[]): Promise<void> => {
           for (const s of snaps) {
             if (s.snapshotName === snapName)
               continue
@@ -344,9 +427,26 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
               warnings.push(`Could not release ${HOLD_TAG} hold on ${full}: ${rel.stderr.trim() || `exit ${rel.exitCode}`}`)
           }
         }
-        await releaseOlder(source, sourceSnaps)
-        // Re-read the target's snapshots — the recv just added snapName there.
-        await releaseOlder(targetFull, await listSnapshotsDetail(targetFull))
+        await releaseOlderLocal(source, sourceSnaps)
+
+        // Release stale holds on OLDER target snapshots — local or over ssh.
+        if (loc.isRemote) {
+          const resolved = loc.resolved
+          for (const name of await transport.remoteSnapshotNames(resolved, targetFull)) {
+            if (name === snapName)
+              continue
+            const full = `${targetFull}@${name}`
+            if (!(await transport.remoteHeldTags(resolved, full)).includes(HOLD_TAG))
+              continue
+            const rel = await transport.remoteRelease(resolved, full, HOLD_TAG)
+            if (rel.exitCode !== 0)
+              warnings.push(`Could not release ${HOLD_TAG} hold on ${full}: ${rel.stderr.trim() || `exit ${rel.exitCode}`}`)
+          }
+        }
+        else {
+          // Re-read the target's snapshots — the recv just added snapName there.
+          await releaseOlderLocal(targetFull, await listSnapshotsDetail(targetFull))
+        }
 
         return {
           mode: d.mode,

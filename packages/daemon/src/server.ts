@@ -17,12 +17,15 @@ import { diskRoutes } from './routes/disks.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
 import { poolRoutes } from './routes/pools.js'
+import { replicationRemotesRoutes } from './routes/replication-remotes.js'
 import { replicationTaskRoutes } from './routes/replication-tasks.js'
 import { shareIdentityRoutes } from './routes/share-identity.js'
 import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { smbShareRoutes } from './routes/shares-smb.js'
 import { ConfirmStore } from './safety/confirm.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
+import { defaultRemotesPaths } from './services/replication-remotes.js'
+import { createTransport, defaultMembersFile } from './services/replication-transport.js'
 
 export interface ServerOptions {
   /** Use mock executor instead of real commands. Default: false. */
@@ -58,6 +61,24 @@ export function createServer(opts?: ServerOptions) {
   // 5.5.3). The units ARE the config; override via ANAS_SYSTEMD_DIR (tests point
   // it at a temp dir).
   const systemdDir = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
+
+  // Stage-3 remote replication (Epic 5.5.2): the corosync-store paths (registry /
+  // keypair / known_hosts, all env-overridable) and the SSH transport bound to
+  // them + the cluster members file. The transport resolves peer/remote targets
+  // and runs the remote-side zfs ops for plan/run.
+  // In dev mock mode (no explicit env), keep the corosync-store off the real
+  // /etc/pve so a stray ensureKeypair / registry write never touches the host.
+  const remotesPaths = (opts?.mock && !process.env.ANAS_REMOTES_FILE)
+    ? {
+        registryFile: join(tmpdir(), `anas-mock-remotes-${process.pid}.json`),
+        keyPath: join(tmpdir(), `anas-mock-replkey-${process.pid}`),
+        knownHostsFile: join(tmpdir(), `anas-mock-known_hosts-${process.pid}`),
+      }
+    : defaultRemotesPaths()
+  const membersFile = (opts?.mock && !process.env.ANAS_PVE_MEMBERS)
+    ? join(tmpdir(), `anas-mock-members-${process.pid}.json`)
+    : defaultMembersFile()
+  const transport = createTransport(executor, { paths: remotesPaths, membersFile })
 
   // Register mock fixtures for dev mode
   if (opts?.mock) {
@@ -306,12 +327,14 @@ export function createServer(opts?: ServerOptions) {
   server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   // datasetRoutes also reads the share configs to report associated shares
   // (Epic 4.4) and warn on destroy — same paths the share routes edit.
-  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath })
+  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport })
   server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath })
   server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
   server.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   // Recurring replication tasks (Epic 5.5.3) — units-as-store CRUD + status.
   server.register(replicationTaskRoutes, { prefix: '/v1', executor, jobQueue, systemdDir })
+  // Stage-3 remotes registry (Epic 5.5.2) — corosync-store CRUD + diagnostics.
+  server.register(replicationRemotesRoutes, { prefix: '/v1', executor, jobQueue, paths: remotesPaths, transport, systemdDir })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
