@@ -128,12 +128,16 @@
         return api.request('DELETE', node, path, undefined, opts);
     };
 
-    // Health probe. NOTE: the health endpoint is gateway-level, not under
-    // /nodes — https://<host>:3000/api/health. The `node` argument is accepted
-    // for a future per-node route; today it always probes the local gateway.
+    // Per-NODE availability probe (cluster-correct). Hits the node-scoped daemon
+    // health through the gateway proxy: on the local node (or a peer that also
+    // runs ANAS) the daemon answers 200 and the view renders; on a node WITHOUT
+    // ANAS the gateway can't reach its :3000 peer and returns 502, so this
+    // rejects and the caller shows the clean "not installed on this node" panel.
+    // The old form probed the LOCAL gateway's /api/health, which always passed
+    // when connected through an ANAS node — so ANAS views on ANAS-less peer nodes
+    // rendered and then errored with raw "node unreachable" messages.
     api.health = function (node) {
-        void node;
-        return doFetch('GET', gatewayOrigin() + '/api/health');
+        return doFetch('GET', nodeBase(node) + '/health');
     };
 
     ANAS.api = api;

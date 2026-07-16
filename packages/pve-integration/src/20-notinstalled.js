@@ -21,16 +21,20 @@
             + '<h2><i class="fa fa-database"></i> '
             + enc(ANAS.t('ANAS is not installed on this node')) + '</h2>'
             + '<p>' + enc(ANAS.t(
-                'The ANAS storage management gateway is not reachable on '
-                + 'node "' + node + '". Install it, then reload this page.',
+                'The ANAS gateway is not running on node "' + node + '", so its '
+                + 'storage cannot be managed from here. ANAS is installed per node.',
+            )) + '</p>'
+            + '<p>' + enc(ANAS.t(
+                'To manage this node, install the ANAS release on it — copy the '
+                + 'release tarball to the node, then as root:',
             )) + '</p>'
             + '<pre style="padding:10px;border-radius:3px;background:rgba(128,128,128,0.12);'
             + 'white-space:pre-wrap;">'
-            + enc('npm install -g anas') + '\n'
-            + enc('sudo anas setup') + '</pre>'
+            + enc('tar xzf anas-<version>.tar.gz') + '\n'
+            + enc('cd anas-<version> && ./install.sh') + '</pre>'
             + '<p>' + enc(ANAS.t(
-                'Once the anas and anasd services are running, the ANAS views '
-                + 'become available here.',
+                'Once the anas and anasd services are running there, reload this '
+                + 'page and the ANAS views become available for this node.',
             )) + '</p>'
             + '</div>';
 
