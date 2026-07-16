@@ -245,7 +245,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 > The highest-value missing ZFS capability — snapshots are useless off-box without it. Likely warrants promotion to a full epic (cf. TrueNAS "Replication Tasks"). Brainstormed July 2026.
 
-5.5.1. [backlog — design agreed 2026-07-16] As a user, I want to replicate a snapshot to another local pool (`zfs send | zfs recv`), so I have a backup on separate disks.
+5.5.1. [done 2026-07-16] As a user, I want to replicate a snapshot to another local pool (`zfs send | zfs recv`), so I have a backup on separate disks.
 
 5.5.3. [backlog — design agreed 2026-07-16] As a user, I want a dedicated **Replication** menu item — a task grid (source → target, last run, next run, **lag**), create/edit/disable/delete, and Run Now with real progress (stream size from `zfs send -nvP` dry-run) — so replication is configurable and observable in one place.
 
