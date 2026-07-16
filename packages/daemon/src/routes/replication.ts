@@ -173,6 +173,13 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
 
     const targetFull = resolveTarget(source, poolName, target)
 
+    // Replicating a dataset onto itself is meaningless — give the honest
+    // answer rather than reporting it as "diverged".
+    if (targetFull === source) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Cannot replicate '${source}' onto itself — choose a different target dataset` } }
+    }
+
     // Pick the snapshot to send: explicit (must exist) or the newest source snapshot.
     const sourceSnaps = await listSnapshotsDetail(source)
     if (sourceSnaps.length === 0) {
@@ -243,6 +250,13 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     }
 
     const targetFull = resolveTarget(source, poolName, target)
+
+    // Replicating a dataset onto itself is meaningless — give the honest
+    // answer rather than reporting it as "diverged".
+    if (targetFull === source) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Cannot replicate '${source}' onto itself — choose a different target dataset` } }
+    }
 
     const job = jobQueue.submit(
       'zfs.replicate',

@@ -3187,13 +3187,21 @@
         var srcFull = rec.get('fullName');
         var isRoot = (srcFull === srcPool);
         var srcRel = relPath(srcFull, srcPool);
-        // Target dataset default: the source's relative path, or the source pool
-        // name when replicating a pool root (visible so the operator can adjust).
-        var defaultTargetDs = isRoot ? srcPool : srcRel;
 
         // Target-pool picker: ANAS-managed pools (same pool is legal); PVE pools
         // excluded via anasPoolNames' pveManaged filter.
         var pools = anasPoolNames(tree);
+
+        // Target dataset default: the source's relative path, or the source pool
+        // name when replicating a pool root. BUT when the default pool is the
+        // SOURCE pool (single-pool systems), that would target the dataset onto
+        // itself — default to '<name>-replica' instead so the dialog opens onto
+        // a valid plan rather than a self-target error.
+        var defaultPool = pools.indexOf(srcPool) >= 0 ? srcPool : pools[0];
+        var defaultTargetDs = isRoot ? srcPool : srcRel;
+        if (defaultPool === srcPool) {
+            defaultTargetDs = (isRoot ? srcPool : srcRel) + '-replica';
+        }
         var poolData = [];
         for (var i = 0; i < pools.length; i++) {
             poolData.push({ name: pools[i] });
@@ -3244,7 +3252,7 @@
                             editable: false,
                             forceSelection: true,
                             allowBlank: false,
-                            value: (pools.indexOf(srcPool) >= 0 ? srcPool : pools[0]),
+                            value: defaultPool,
                         },
                         {
                             xtype: 'textfield',

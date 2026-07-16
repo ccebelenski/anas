@@ -64,6 +64,23 @@ export async function destroyDataset(dataset: string): Promise<void> {
 }
 
 /**
+ * Release EVERY hold on every snapshot of a dataset (fail-open). Replication
+ * pins its incremental base with a `zfs hold` (tag anas-repl) on BOTH sides —
+ * by design that blocks `zfs destroy`, including test cleanup. Specs that
+ * replicate must release holds before destroying their throwaway snapshots.
+ */
+export async function releaseHolds(dataset: string): Promise<void> {
+  const script = [
+    `for s in $(zfs list -H -t snapshot -o name ${dataset} 2>/dev/null); do`,
+    `  zfs holds -H "$s" 2>/dev/null | while read -r snap tag rest; do`,
+    `    zfs release "$tag" "$snap" 2>/dev/null || true`,
+    `  done`,
+    `done`,
+  ].join('\n')
+  await sshExec(script).catch(() => {})
+}
+
+/**
  * Read a single ZFS property value from the real system (source of truth).
  * Uses `-H -o value` for a bare, scriptable scalar (Principle 13).
  */

@@ -8,6 +8,7 @@ import {
   destroySnapshot,
   listSnapshots,
   poolExists,
+  releaseHolds,
 } from './fixtures/stunt-node'
 
 /**
@@ -86,7 +87,9 @@ test.describe('ANAS replication dialog — plan preview (stunt node)', () => {
     const win = page.locator('.anas-win-replicate')
     // Target defaults are visible and adjustable.
     await expect(win.locator('.anas-fld-repl-pool')).toBeVisible({ timeout: 20_000 })
-    await expect(win.locator('.anas-fld-repl-dataset input')).toHaveValue('share1', { timeout: 20_000 })
+    // Same-pool default appends -replica so the dialog never opens onto a
+    // self-target (replicating a dataset onto itself is rejected by the daemon).
+    await expect(win.locator('.anas-fld-repl-dataset input')).toHaveValue('share1-replica', { timeout: 20_000 })
 
     // The plan line renders and resolves to an honest verdict (any mode). It may
     // pass through "calculating…" first; wait for a terminal state.
@@ -113,6 +116,11 @@ test.describe('ANAS replication runs a send | recv job (stunt node)', () => {
   const TARGET_FQ = `${POOL}/${TARGET_DS}`
 
   test.beforeEach(async () => {
+    // Replication HOLDS its base snapshot on both sides (by design — the chain
+    // guard). Release holds first or the destroys below silently fail and the
+    // leftover snapshot breaks the next run's createSnapshot.
+    await releaseHolds(TARGET_FQ)
+    await releaseHolds(DS_FQ)
     await destroyDataset(TARGET_FQ)
     for (const name of await listSnapshots(DS_FQ))
       await destroySnapshot(DS_FQ, name)
@@ -120,6 +128,8 @@ test.describe('ANAS replication runs a send | recv job (stunt node)', () => {
   })
 
   test.afterEach(async () => {
+    await releaseHolds(TARGET_FQ)
+    await releaseHolds(DS_FQ)
     await destroyDataset(TARGET_FQ)
     await destroySnapshot(DS_FQ, SNAP)
   })
