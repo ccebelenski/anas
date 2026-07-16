@@ -32,6 +32,7 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 import { readConfig } from '../services/config-writer.js'
 import { collectDisks } from './disks.js'
+import { pathExists } from './shares-smb.js'
 
 const ARCSTATS_PATH = '/proc/spl/kstat/zfs/arcstats'
 const PROC_NET_DEV = '/proc/net/dev'
@@ -78,9 +79,11 @@ export async function dashboardRoutes(
       node: hostname(),
       pools: poolStatus.pools,
       disks: diskHealth.counts,
-      shares,
+      shares: shares.brief,
       jobs,
-      warnings: buildWarnings(poolStatus, diskHealth.disks),
+      // Pool/disk warnings plus any stale-share warnings derived from the same
+      // smb.conf/exports parse collectShareStatus already ran (no second pass).
+      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings],
     }
     return { data: summary }
   })
@@ -142,15 +145,45 @@ export async function dashboardRoutes(
     return { counts, disks }
   }
 
-  /** SMB + NFS share counts, plus service-active flags when detectable. */
-  async function collectShareStatus(): Promise<ShareStatusBrief> {
+  /**
+   * SMB + NFS share counts (plus service-active flags when detectable) AND the
+   * stale-share warnings derived from the SAME parse: a share/export whose
+   * backing path no longer exists on disk (2.5). A stat that fails for any
+   * reason other than "missing" contributes NO warning (fail-open — never a
+   * false stale). Every stale share is emitted; the dashboard renders warnings
+   * as compact wrap cards, so volume is fine.
+   */
+  async function collectShareStatus(): Promise<{ brief: ShareStatusBrief, warnings: DashboardWarning[] }> {
     const brief: ShareStatusBrief = { smbCount: 0, nfsCount: 0 }
+    const warnings: DashboardWarning[] = []
     try {
-      brief.smbCount = parseSmbConf(await readConfig(smbConfPath)).shares.length
+      const smbShares = parseSmbConf(await readConfig(smbConfPath)).shares
+      brief.smbCount = smbShares.length
+      for (const share of smbShares) {
+        if (pathExists(share.path) === false) {
+          warnings.push({
+            level: 'warning',
+            category: 'share',
+            message: `SMB share '${share.name}' points to a missing path ${share.path}`,
+            ref: share.name,
+          })
+        }
+      }
     }
     catch { /* fail-open */ }
     try {
-      brief.nfsCount = parseExports(await readConfig(exportsPath)).length
+      const exports = parseExports(await readConfig(exportsPath))
+      brief.nfsCount = exports.length
+      for (const exp of exports) {
+        if (pathExists(exp.path) === false) {
+          warnings.push({
+            level: 'warning',
+            category: 'share',
+            message: `NFS export path ${exp.path} no longer exists`,
+            ref: exp.path,
+          })
+        }
+      }
     }
     catch { /* fail-open */ }
     const smbActive = await serviceActive('smbd')
@@ -159,7 +192,7 @@ export async function dashboardRoutes(
     const nfsActive = await serviceActive('nfs-server')
     if (nfsActive !== undefined)
       brief.nfsActive = nfsActive
-    return brief
+    return { brief, warnings }
   }
 
   /** `systemctl is-active <unit>` → true/false, or undefined if undetectable. */

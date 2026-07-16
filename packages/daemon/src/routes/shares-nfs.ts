@@ -7,6 +7,7 @@ import { addExport, hasExport, parseExports, removeExport, replaceExport } from 
 import { confirmGate } from '../safety/gate.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import { requireIdentity } from './identity.js'
+import { pathExists } from './shares-smb.js'
 
 /** `exportfs -ra` re-reads /etc/exports and syncs the kernel export table. */
 const EXPORTFS = '/usr/sbin/exportfs'
@@ -35,7 +36,13 @@ export async function nfsExportRoutes(
 
   // --- GET /shares/nfs — list ALL exports --------------------------------
   server.get('/shares/nfs', async () => {
-    return { data: parseExports(await readConfig(exportsPath)) }
+    // Stat each export's path at read time to flag stale definitions whose
+    // storage no longer exists (pathExists=false). Fail-open per export.
+    const exports = parseExports(await readConfig(exportsPath)).map(exp => ({
+      ...exp,
+      pathExists: pathExists(exp.path),
+    }))
+    return { data: exports }
   })
 
   // --- GET /shares/nfs/:path — export detail (path is URL-encoded) --------
@@ -52,7 +59,7 @@ export async function nfsExportRoutes(
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Export '${path}' not found` } }
     }
-    return { data: exp }
+    return { data: { ...exp, pathExists: pathExists(exp.path) } }
   })
 
   // --- POST /shares/nfs — create an export -------------------------------

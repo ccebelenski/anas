@@ -1,7 +1,7 @@
 import type { Job, JobAccepted, SmbGlobalConfig, SmbShare, SmbShareDetail } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
@@ -82,6 +82,31 @@ describe('SMB share routes', () => {
       assert.equal(media.path, '/tank/media')
       assert.equal(media.readOnly, false)
       assert.deepEqual(media.validUsers, ['media', '@smbusers'])
+    })
+
+    it('sets pathExists true for a live path and false for a missing one (stale)', async () => {
+      dir = mkdtempSync(join(tmpdir(), 'anas-smb-test-'))
+      const livePath = join(dir, 'live')
+      mkdirSync(livePath)
+      const missingPath = join(dir, 'gone') // deliberately never created
+      confPath = join(dir, 'smb.conf')
+      writeFileSync(confPath, [
+        '[global]',
+        '\tworkgroup = WORKGROUP',
+        '',
+        '[live]',
+        `\tpath = ${livePath}`,
+        '',
+        '[stale]',
+        `\tpath = ${missingPath}`,
+        '',
+      ].join('\n'), 'utf8')
+      server = createServer({ mock: true, logger: false, smbConfPath: confPath })
+      const res = await server.inject({ method: 'GET', url: '/v1/shares/smb' })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: SmbShare[] }
+      assert.equal(data.find(d => d.name === 'live')!.pathExists, true)
+      assert.equal(data.find(d => d.name === 'stale')!.pathExists, false)
     })
 
     it('returns an empty list when smb.conf is missing', async () => {
@@ -202,6 +227,8 @@ describe('SMB share routes', () => {
       const { data } = res.json() as { data: SmbShareDetail }
       assert.equal(data.name, 'media')
       assert.deepEqual(data.connections, [{ user: 'media', machine: '10.0.0.50' }])
+      // /tank/media does not exist in the test env → observed stale.
+      assert.equal(data.pathExists, false)
     })
 
     it('returns [] connections for a share with none', async () => {

@@ -2,6 +2,9 @@ import type { JobBrief, PoolTelemetry, StatusSummary, Telemetry } from '@anas/sh
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
@@ -145,5 +148,90 @@ describe('GET /v1/status — job durations', () => {
     // durationMs == finishedAt − startedAt for a finished job.
     const expected = Date.parse(brief.finishedAt!) - Date.parse(brief.startedAt!)
     assert.equal(brief.durationMs, Math.max(0, expected))
+  })
+})
+
+describe('GET /v1/status — stale-share warnings', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    delete process.env.ANAS_EXPORTS_PATH
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true })
+      dir = undefined
+    }
+  })
+
+  async function status(srv: ReturnType<typeof createServer>): Promise<StatusSummary> {
+    const res = await srv.inject({ method: 'GET', url: '/v1/status', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    return (res.json() as { data: StatusSummary }).data
+  }
+
+  it('emits a warning per SMB share / NFS export whose path is missing, and none for live paths', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'anas-stale-'))
+    const livePath = join(dir, 'live')
+    mkdirSync(livePath)
+    const missingSmb = join(dir, 'gone-smb') // never created
+    const missingNfs = join(dir, 'gone-nfs') // never created
+
+    const smbConfPath = join(dir, 'smb.conf')
+    writeFileSync(smbConfPath, [
+      '[global]',
+      '\tworkgroup = WORKGROUP',
+      '',
+      '[live]',
+      `\tpath = ${livePath}`,
+      '',
+      '[media]',
+      `\tpath = ${missingSmb}`,
+      '',
+    ].join('\n'), 'utf8')
+
+    const exportsPath = join(dir, 'exports')
+    writeFileSync(exportsPath, [
+      `${livePath} 10.0.0.0/24(rw,sync)`,
+      `${missingNfs} *(ro,sync)`,
+      '',
+    ].join('\n'), 'utf8')
+    process.env.ANAS_EXPORTS_PATH = exportsPath
+
+    server = createServer({ mock: true, logger: false, smbConfPath })
+    const summary = await status(server)
+    const shareWarnings = summary.warnings.filter(w => w.category === 'share')
+
+    // One SMB + one NFS stale warning, both 'warning' level.
+    assert.equal(shareWarnings.length, 2)
+    assert.ok(shareWarnings.every(w => w.level === 'warning'))
+
+    const smb = shareWarnings.find(w => w.ref === 'media')!
+    assert.ok(smb, 'SMB stale warning present, ref = share name')
+    assert.equal(smb.message, `SMB share 'media' points to a missing path ${missingSmb}`)
+
+    const nfs = shareWarnings.find(w => w.ref === missingNfs)!
+    assert.ok(nfs, 'NFS stale warning present, ref = export path')
+    assert.equal(nfs.message, `NFS export path ${missingNfs} no longer exists`)
+
+    // The live path (shared by both protocols) yields no stale warning.
+    assert.ok(!shareWarnings.some(w => w.message.includes(livePath)))
+  })
+
+  it('emits no share warnings when every backing path exists', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'anas-stale-'))
+    const livePath = join(dir, 'live')
+    mkdirSync(livePath)
+
+    const smbConfPath = join(dir, 'smb.conf')
+    writeFileSync(smbConfPath, ['[global]', '\tworkgroup = WORKGROUP', '', '[live]', `\tpath = ${livePath}`, ''].join('\n'), 'utf8')
+    const exportsPath = join(dir, 'exports')
+    writeFileSync(exportsPath, [`${livePath} *(ro,sync)`, ''].join('\n'), 'utf8')
+    process.env.ANAS_EXPORTS_PATH = exportsPath
+
+    server = createServer({ mock: true, logger: false, smbConfPath })
+    const summary = await status(server)
+    assert.equal(summary.warnings.filter(w => w.category === 'share').length, 0)
   })
 })
