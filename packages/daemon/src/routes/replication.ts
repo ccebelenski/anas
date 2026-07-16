@@ -37,6 +37,11 @@ export interface ReplicationDeps {
   datasetExists: (poolName: string, fullName: string) => Promise<boolean>
   /** A dataset's snapshots, newest-first (empty when it has none). */
   listSnapshotsDetail: (fullName: string) => Promise<Snapshot[]>
+  /** Story 3.25 boundary guard: is the pool PVE-managed (referenced by
+   *  /etc/pve/storage.cfg)? Replicating INTO PVE territory would create a
+   *  dataset there, which ANAS never does. Fail-open: detection failure /
+   *  non-PVE host → false. */
+  isPveManagedPool: (poolName: string) => Promise<boolean>
 }
 
 /**
@@ -159,6 +164,12 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' does not exist` } }
     }
+    // Story 3.25: never create datasets on a PVE-managed pool — reject it as a
+    // replication target at the API boundary too (the UI already excludes it).
+    if (await deps.isPveManagedPool(target.pool)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' is PVE-managed — ANAS does not create datasets there` } }
+    }
 
     const targetFull = resolveTarget(source, poolName, target)
 
@@ -223,6 +234,12 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     if (!(await poolExists(target.pool))) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' does not exist` } }
+    }
+    // Story 3.25: never create datasets on a PVE-managed pool — reject it as a
+    // replication target at the API boundary too (the UI already excludes it).
+    if (await deps.isPveManagedPool(target.pool)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' is PVE-managed — ANAS does not create datasets there` } }
     }
 
     const targetFull = resolveTarget(source, poolName, target)

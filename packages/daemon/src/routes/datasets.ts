@@ -13,6 +13,7 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { confirmGate } from '../safety/gate.js'
 import { readConfig } from '../services/config-writer.js'
 import { requireIdentity } from './identity.js'
+import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { createReplicationHandlers } from './replication.js'
 
 const ZFS = '/usr/sbin/zfs'
@@ -244,6 +245,17 @@ export async function datasetRoutes(
     poolExists,
     datasetExists,
     listSnapshotsDetail,
+    // Story 3.25 boundary guard: same storage.cfg detection GET /pools uses.
+    // Fail-open (non-PVE host / unreadable config → not PVE-managed).
+    isPveManagedPool: async (pool: string) => {
+      try {
+        const refs = await readPveStorages(PVE_STORAGE_CFG, await readZfsMountpoints())
+        return (refs.get(pool) ?? []).length > 0
+      }
+      catch {
+        return false
+      }
+    },
   })
 
   /** Does the named pool exist? (source of truth is `zpool list`). */
