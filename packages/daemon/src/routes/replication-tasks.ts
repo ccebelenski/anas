@@ -1,6 +1,8 @@
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { Transport } from '../services/replication-transport.js'
+import type { TargetNamesResolver } from '../services/replication-units.js'
 import { ReplicationTask, ReplicationTaskName } from '@anas/shared'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
@@ -40,13 +42,37 @@ export interface ReplicationTaskRouteOptions {
   jobQueue: JobQueue
   /** systemd unit directory (the task store). Overridable for tests. */
   systemdDir: string
+  /** Stage-3 SSH transport — lets task STATUS read a non-local target's
+   *  snapshots so lag/last-replicated are real for remote tasks. Optional:
+   *  without it, remote-task lag honestly shows unknown. */
+  transport?: Transport
 }
 
 export async function replicationTaskRoutes(
   server: FastifyInstance,
   opts: ReplicationTaskRouteOptions,
 ) {
-  const { executor, jobQueue, systemdDir } = opts
+  const { executor, jobQueue, systemdDir, transport } = opts
+
+  /**
+   * Resolve a NON-local task target's snapshot names over the SSH transport.
+   * Any transport/resolution failure → null (unknown), never a false
+   * "everything is behind".
+   */
+  const remoteTargetNames: TargetNamesResolver | undefined = transport
+    ? async (task, targetFull) => {
+        try {
+          const res = await transport.resolveLocation(task.target.location!)
+          if (!res.ok)
+            return null
+          const names = await transport.remoteSnapshotNames(res.resolved, targetFull)
+          return new Set(names)
+        }
+        catch {
+          return null
+        }
+      }
+    : undefined
 
   /**
    * Does the named pool exist? (source of truth is `zpool list`). Same probe
@@ -107,7 +133,7 @@ export async function replicationTaskRoutes(
 
   // --- GET /replication/tasks — derived statuses (read-only) ----------------
   server.get('/replication/tasks', async () => {
-    return { data: await collectTaskStatuses(executor, systemdDir) }
+    return { data: await collectTaskStatuses(executor, systemdDir, remoteTargetNames) }
   })
 
   // --- POST /replication/tasks — create -------------------------------------

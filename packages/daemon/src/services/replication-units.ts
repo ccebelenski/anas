@@ -390,9 +390,19 @@ async function timerNextRun(executor: CommandExecutor, name: string): Promise<st
  * ZFS (the newest source snapshot also on the target); lastRunResult from
  * systemd; nextRunAt from the timer. Source with no snapshots (or gone) → nulls.
  */
+/**
+ * How a caller supplies the TARGET's snapshot names for a task whose target is
+ * non-local (stage 3): returns the name set, or null when the remote could not
+ * be read (transport down ≠ "nothing replicated" — status must show unknown,
+ * never a false "N behind").
+ */
+export type TargetNamesResolver
+  = (task: ReplicationTask, targetFull: string) => Promise<Set<string> | null>
+
 export async function deriveTaskStatus(
   executor: CommandExecutor,
   task: ReplicationTask,
+  remoteTargetNames?: TargetNamesResolver,
 ): Promise<ReplicationTaskStatus> {
   const { sourceFull, targetFull } = resolveTaskDatasets(task)
 
@@ -402,18 +412,33 @@ export async function deriveTaskStatus(
   let snapshotsBehind: number | null = null
 
   if (sourceSnaps.length > 0) {
-    const targetSnaps = await listSnapshots(executor, targetFull)
-    const targetNames = new Set(targetSnaps.map(s => s.snapshotName))
-    // First (newest) source snapshot present on the target = last successful sync.
-    const idx = sourceSnaps.findIndex(s => targetNames.has(s.snapshotName))
-    if (idx !== -1) {
-      lastReplicatedSnapshot = sourceSnaps[idx].snapshotName
-      lastReplicatedAt = sourceSnaps[idx].created
-      snapshotsBehind = idx // source snapshots newer than the last replicated one
+    // Local target → list locally. Non-local target → the injected resolver
+    // reads the REMOTE's snapshots over SSH (stage 3); without a resolver the
+    // remote is unreadable here, so the lag honestly stays unknown (nulls).
+    const isLocalTarget = !task.target.location || task.target.location.kind === 'local'
+    let targetNames: Set<string> | null
+    if (isLocalTarget) {
+      targetNames = new Set((await listSnapshots(executor, targetFull)).map(s => s.snapshotName))
+    }
+    else if (remoteTargetNames) {
+      targetNames = await remoteTargetNames(task, targetFull)
     }
     else {
-      // Nothing replicated yet: every source snapshot is behind.
-      snapshotsBehind = sourceSnaps.length
+      targetNames = null
+    }
+
+    if (targetNames !== null) {
+      // First (newest) source snapshot present on the target = last successful sync.
+      const idx = sourceSnaps.findIndex(s => targetNames.has(s.snapshotName))
+      if (idx !== -1) {
+        lastReplicatedSnapshot = sourceSnaps[idx].snapshotName
+        lastReplicatedAt = sourceSnaps[idx].created
+        snapshotsBehind = idx // source snapshots newer than the last replicated one
+      }
+      else {
+        // Nothing replicated yet: every source snapshot is behind.
+        snapshotsBehind = sourceSnaps.length
+      }
     }
   }
 
@@ -429,9 +454,10 @@ export async function deriveTaskStatus(
 export async function collectTaskStatuses(
   executor: CommandExecutor,
   dir: string,
+  remoteTargetNames?: TargetNamesResolver,
 ): Promise<ReplicationTaskStatus[]> {
   const tasks = await readAllTasks(dir)
-  return Promise.all(tasks.map(t => deriveTaskStatus(executor, t)))
+  return Promise.all(tasks.map(t => deriveTaskStatus(executor, t, remoteTargetNames)))
 }
 
 /**

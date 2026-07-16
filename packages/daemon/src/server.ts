@@ -332,7 +332,7 @@ export function createServer(opts?: ServerOptions) {
   server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
   server.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   // Recurring replication tasks (Epic 5.5.3) — units-as-store CRUD + status.
-  server.register(replicationTaskRoutes, { prefix: '/v1', executor, jobQueue, systemdDir })
+  server.register(replicationTaskRoutes, { prefix: '/v1', executor, jobQueue, systemdDir, transport })
   // Stage-3 remotes registry (Epic 5.5.2) — corosync-store CRUD + diagnostics.
   server.register(replicationRemotesRoutes, { prefix: '/v1', executor, jobQueue, paths: remotesPaths, transport, systemdDir })
   const diskIdentityCache = new DiskIdentityCache(executor)
