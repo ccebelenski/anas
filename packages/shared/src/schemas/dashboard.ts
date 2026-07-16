@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { ISODateTime } from './common.js'
-import { PoolState } from './zfs.js'
+import { PoolState, VdevRole, VdevState, VdevType } from './zfs.js'
 
 /**
  * Dashboard schemas (Epic 2). Two endpoints:
@@ -63,6 +63,11 @@ export const JobBrief = z.object({
   kind: z.string(),
   status: z.string(),
   startedAt: ISODateTime.optional(),
+  /** When the job reached a terminal state; omitted while still running. */
+  finishedAt: ISODateTime.optional(),
+  /** Elapsed time in ms: finishedAt−startedAt for finished jobs, now−startedAt
+   *  for running ones. Omitted when the job never started. */
+  durationMs: z.number().nonnegative().optional(),
 })
 export type JobBrief = z.infer<typeof JobBrief>
 
@@ -108,16 +113,34 @@ export const ArcTelemetry = z.object({
 })
 export type ArcTelemetry = z.infer<typeof ArcTelemetry>
 
-export const PoolTelemetry = IoStats.extend({ name: z.string() })
-export type PoolTelemetry = z.infer<typeof PoolTelemetry>
-
+/** Leaf-disk I/O. Its pool and vdev are implied by nesting. */
 export const DiskTelemetry = IoStats.extend({
   /** Stable by-id / identity (mapped from the iostat leaf name). */
   id: z.string(),
-  pool: z.string(),
-  vdev: z.string().optional(),
 })
 export type DiskTelemetry = z.infer<typeof DiskTelemetry>
+
+/** A vdev's aggregate I/O plus its topology (joined from `zpool status`) and
+ *  the leaf disks it contains. */
+export const VdevTelemetry = IoStats.extend({
+  /** ZFS vdev name, e.g. "mirror-0". */
+  name: z.string(),
+  /** Topology type (mirror/raidz/…/disk). */
+  type: VdevType,
+  /** Role within the pool (data/log/cache/special/dedup/spare). */
+  role: VdevRole,
+  /** Vdev state (ONLINE/DEGRADED/FAULTED/…). */
+  state: VdevState,
+  disks: z.array(DiskTelemetry),
+})
+export type VdevTelemetry = z.infer<typeof VdevTelemetry>
+
+/** A pool's aggregate I/O plus the vdevs beneath it. */
+export const PoolTelemetry = IoStats.extend({
+  name: z.string(),
+  vdevs: z.array(VdevTelemetry),
+})
+export type PoolTelemetry = z.infer<typeof PoolTelemetry>
 
 export const NetInterface = z.object({
   name: z.string(),
@@ -138,8 +161,8 @@ export const Telemetry = z.object({
   /** Length of the sample window in ms (~1000). */
   windowMs: z.number().nonnegative(),
   arc: ArcTelemetry,
+  /** Nested pool → vdevs[] → disks[] I/O tree. */
   pools: z.array(PoolTelemetry),
-  disks: z.array(DiskTelemetry),
   net: NetTelemetry,
 })
 export type Telemetry = z.infer<typeof Telemetry>
