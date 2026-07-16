@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { PoolName } from './common.js'
+import { ISODateTime, PoolName } from './common.js'
 
 /**
  * Replication (Epic 5.5) — stage 1: LOCAL one-shot snapshot replication
@@ -66,3 +66,48 @@ export const ReplicateRequest = z.object({
   snapshotFirst: z.boolean().optional(),
 })
 export type ReplicateRequest = z.infer<typeof ReplicateRequest>
+
+// ---- Stage 2: recurring replication TASKS (the Replication view) -------------
+//
+// Task store = the systemd units themselves (anas-repl-<name>.service/.timer),
+// generated/parsed/rewritten by the daemon — no second config source, no custom
+// scheduler. Status: authoritative last-success/lag derive from ZFS snapshot
+// state on both ends; current failure state from systemd; journald = forensics.
+
+/** A task name — also the systemd unit suffix (anas-repl-<name>). */
+export const ReplicationTaskName = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9-]*$/, 'lowercase alphanumerics and dashes')
+export type ReplicationTaskName = z.infer<typeof ReplicationTaskName>
+
+/** A configured recurring replication (one systemd service+timer pair). */
+export const ReplicationTask = z.object({
+  name: ReplicationTaskName,
+  /** Source dataset, pool-rooted ('' dataset = the pool root). */
+  source: z.object({ pool: PoolName, dataset: z.string() }),
+  target: ReplicationTarget,
+  /** systemd OnCalendar expression (e.g. 'daily', '02:00', 'Mon *-*-* 03:00'). */
+  schedule: z.string().min(1),
+  /** Snapshot the source before each run (recommended; default true). */
+  snapshotFirst: z.boolean().default(true),
+  enabled: z.boolean().default(true),
+})
+export type ReplicationTask = z.infer<typeof ReplicationTask>
+
+/** Live status of a task — derived, never stored (ZFS + systemd truth). */
+export const ReplicationTaskStatus = z.object({
+  task: ReplicationTask,
+  /** Newest source snapshot already present on the target (ZFS truth). */
+  lastReplicatedSnapshot: z.string().nullable(),
+  /** When that snapshot was created (proxy for last successful sync). */
+  lastReplicatedAt: ISODateTime.nullable(),
+  /** Source snapshots newer than the last replicated one (lag). */
+  snapshotsBehind: z.number().int().nonnegative().nullable(),
+  /** systemd: last trigger result ('success' | 'failure' | 'running' | 'unknown'). */
+  lastRunResult: z.enum(['success', 'failure', 'running', 'unknown']),
+  /** systemd timer: next scheduled trigger. */
+  nextRunAt: ISODateTime.nullable(),
+})
+export type ReplicationTaskStatus = z.infer<typeof ReplicationTaskStatus>
