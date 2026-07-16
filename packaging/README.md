@@ -41,6 +41,18 @@ sudo ./install.sh            # add --install-deps on a fresh node
 Open `https://<node-ip>:3000`. The ANAS panels appear inside the normal PVE web
 UI (no separate app).
 
+> **First run — trust the gateway cert (or ANAS shows "not reachable").** The
+> gateway serves HTTPS on `:3000` with the node's PVE certificate (the same one
+> `:8006` uses). Browsers scope certificate trust **per host:port**, so accepting
+> the warning for the PVE UI on `:8006` does **not** cover `:3000` — the ANAS
+> panel's background request to `:3000` is silently blocked and the view reports
+> "not reachable on node". Do ONE of:
+> - open `https://<node-ip>:3000/` once and accept the certificate; **or**
+> - import the PVE cluster CA (`/etc/pve/pve-root-ca.pem`) into your browser —
+>   trusts `:8006` and `:3000` together, no per-port clicks; **or**
+> - install a browser-trusted cert on PVE (built-in ACME/Let's Encrypt, or your
+>   own at `pveproxy-ssl.pem`) — the gateway auto-inherits it.
+
 ### Flags
 
 | Flag | Effect |

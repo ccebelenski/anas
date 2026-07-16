@@ -369,6 +369,18 @@ finish_success() {
   [ -n "${ip}" ] || ip="<node-ip>"
   echo
   log "ANAS installed — https://${ip}:${HEALTH_PORT}"
+  echo
+  info "FIRST RUN — trust the gateway certificate:"
+  info "  ANAS's gateway serves HTTPS on :${HEALTH_PORT} using this node's PVE"
+  info "  certificate. Browsers scope trust per host:port, so even though you've"
+  info "  accepted the cert for the PVE UI on :8006, you must ALSO trust :${HEALTH_PORT}"
+  info "  or ANAS shows \"not reachable\". Do ONE of:"
+  info "    - open https://${ip}:${HEALTH_PORT}/ once and accept the certificate, OR"
+  info "    - import the PVE cluster CA (/etc/pve/pve-root-ca.pem) into your browser"
+  info "      (trusts :8006 and :${HEALTH_PORT} together), OR"
+  info "    - install a browser-trusted cert on PVE (ACME / pveproxy-ssl.pem) — the"
+  info "      gateway auto-inherits it."
+  echo
   info "to remove: sudo ${SCRIPT_DIR}/uninstall.sh"
 }
 
