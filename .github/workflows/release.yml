@@ -1,0 +1,53 @@
+# Release pipeline (Epic 10.10 tail): tag push vX.Y.Z -> make-release.sh
+# (version-drift guard + build + pruned node_modules + boot smoke test) ->
+# tarball attached to a GitHub Release. make-release.sh is the shared
+# local/CI build core — this workflow adds nothing it doesn't do locally.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify tag matches package version
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "ERROR: tag ${GITHUB_REF_NAME} does not match package.json version ${VERSION}" >&2
+            exit 1
+          fi
+
+      - run: npm ci
+
+      # make-release's tag step needs a git identity if it ever creates the
+      # tag; on a tag-push the tag is already at HEAD, so this is insurance.
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Build release (make-release.sh)
+        run: ./packaging/make-release.sh
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" \
+            "dist-release/anas-${VERSION}.tar.gz" \
+            --title "ANAS ${VERSION}" \
+            --generate-notes
