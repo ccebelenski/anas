@@ -99,6 +99,32 @@ export {
   JobStatus,
 } from './schemas/jobs.js'
 
+// Mount schemas (Epic 18 — external & local storage)
+export {
+  CreateMountRequest,
+  MountCapacity,
+  MountCifsOptions,
+  MountCommonOptions,
+  MountCredentials,
+  MountCredentialsInfo,
+  MountDetail,
+  MountEntry,
+  MountHealth,
+  MountKind,
+  MountNfsOptions,
+  MountOptions,
+  MountRequestOptions,
+  MountState,
+  MountStateRequest,
+  MountSummary,
+  MountTestRequest,
+  MountTestResult,
+  MountTestVerdict,
+  MountType,
+  MountUnit,
+  UpdateMountRequest,
+} from './schemas/mounts.js'
+
 // Replication schemas (Epic 5.5)
 export {
   ReplicatePlan,

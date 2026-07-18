@@ -1,5 +1,5 @@
 import type { CommandExecutor } from './executor/types.js'
-import { copyFileSync, writeFileSync } from 'node:fs'
+import { copyFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,6 +16,7 @@ import { datasetRoutes } from './routes/datasets.js'
 import { diskRoutes } from './routes/disks.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
+import { mountsRoutes } from './routes/mounts.js'
 import { poolRoutes } from './routes/pools.js'
 import { replicationRemotesRoutes } from './routes/replication-remotes.js'
 import { replicationTaskRoutes } from './routes/replication-tasks.js'
@@ -61,6 +62,17 @@ export function createServer(opts?: ServerOptions) {
   // 5.5.3). The units ARE the config; override via ANAS_SYSTEMD_DIR (tests point
   // it at a temp dir).
   const systemdDir = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
+
+  // /etc/fstab location (Epic 18). Config IS the API — surgical round-trip edits.
+  // Override via ANAS_FSTAB_PATH (tests point it at a temp file; dev mock seeds a
+  // writable copy of the sample fstab below). Credentials live in ANAS_CREDS_DIR
+  // (per-mount 0600 root-only files); dev mock uses a throwaway temp dir. PVE
+  // storage.cfg is parsed READ-ONLY for hands-off tagging.
+  const envFstabPath = process.env.ANAS_FSTAB_PATH
+  let fstabPath = envFstabPath ?? '/etc/fstab'
+  const credsDir = process.env.ANAS_CREDS_DIR
+    ?? (opts?.mock ? join(tmpdir(), `anas-mock-creds-${process.pid}`) : '/etc/anas/creds')
+  let mountsStoragePath = process.env.ANAS_STORAGE_CFG // undefined = /etc/pve/storage.cfg default
 
   // Stage-3 remote replication (Epic 5.5.2): the corosync-store paths (registry /
   // keypair / known_hosts, all env-overridable) and the SSH transport bound to
@@ -312,6 +324,43 @@ export function createServer(opts?: ServerOptions) {
         // best-effort seed — readConfig tolerates a missing file (empty list)
       }
     }
+
+    // --- Epic 18: Mounts -------------------------------------------------
+    // Seed a writable temp /etc/fstab from the sample, point storage.cfg at the
+    // read-only fixture, and register findmnt + mount lifecycle command mocks so
+    // dev reads real sample mounts and writes never touch the host.
+    const mountsFixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures/mounts')
+    if (!envFstabPath) {
+      fstabPath = join(tmpdir(), `anas-mock-fstab-${process.pid}`)
+      try {
+        copyFileSync(join(mountsFixtures, 'fstab-anas-managed'), fstabPath)
+      }
+      catch { /* best-effort seed */ }
+    }
+    if (!mountsStoragePath) {
+      try {
+        // Only expose the fixture when the real PVE file is absent (dev host).
+        mountsStoragePath = join(mountsFixtures, 'storage.cfg')
+      }
+      catch { /* leave undefined */ }
+    }
+    // findmnt --json → the full sample mount tree.
+    try {
+      mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: {
+        stdout: readFileSync(join(mountsFixtures, 'findmnt-full.json'), 'utf8'),
+        stderr: '',
+        exitCode: 0,
+      } })
+    }
+    catch { /* fixture missing — GET /mounts still fail-opens to fstab-only */ }
+    // `timeout 2 stat -f` health probe — a healthy answer with capacity.
+    mock.addFixture({ command: '/usr/bin/timeout', result: { stdout: '4096 8203953 6637110 6291265\n', stderr: '', exitCode: 0 } })
+    // Mount lifecycle side effects (daemon-reload / mount / umount) succeed.
+    mock.addFixture({ command: '/usr/bin/systemctl', args: ['daemon-reload'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/mount', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/umount', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // lsof (busy-unmount holder list) — nothing holding by default.
+    mock.addFixture({ command: '/usr/bin/lsof', result: { stdout: '', stderr: '', exitCode: 1 } })
   }
 
   const confirmStore = new ConfirmStore()
@@ -335,11 +384,14 @@ export function createServer(opts?: ServerOptions) {
   server.register(replicationTaskRoutes, { prefix: '/v1', executor, jobQueue, systemdDir, transport })
   // Stage-3 remotes registry (Epic 5.5.2) — corosync-store CRUD + diagnostics.
   server.register(replicationRemotesRoutes, { prefix: '/v1', executor, jobQueue, paths: remotesPaths, transport, systemdDir })
+  // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
+  // inventory + PVE-tagged hands-off + guarded status probe.
+  server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, and job sources above, plus on-demand ARC/iostat/net sampling.
-  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir })
+  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath })
 
   server.decorate('jobQueue', jobQueue)
   server.decorate('executor', executor)
