@@ -97,6 +97,28 @@ FATAL=()
 phase0_preflight() {
   log "Preflight checks (no changes will be made)..."
 
+  # Version transition (10.10): what's installed now vs what this release is.
+  NEW_VERSION="unknown"
+  [ -f "${SCRIPT_DIR}/VERSION" ] && NEW_VERSION="$(cat "${SCRIPT_DIR}/VERSION")"
+  OLD_VERSION=""
+  if [ -f "${PREFIX}/VERSION" ]; then
+    OLD_VERSION="$(cat "${PREFIX}/VERSION")"
+  elif [ -e "${PREFIX}" ]; then
+    OLD_VERSION="unknown"   # pre-10.10 install: no VERSION on disk
+  fi
+  if [ -z "${OLD_VERSION}" ]; then
+    info "fresh install: ANAS ${NEW_VERSION}"
+  elif [ "${OLD_VERSION}" = "${NEW_VERSION}" ]; then
+    info "reinstall: ANAS ${NEW_VERSION} (same version)"
+  elif [ "${NEW_VERSION}" != "unknown" ] && [ "${OLD_VERSION}" != "unknown" ] \
+       && ! version_ge "${NEW_VERSION}" "${OLD_VERSION}"; then
+    warn "DOWNGRADE: installed ANAS is ${OLD_VERSION}, this release is ${NEW_VERSION}"
+    confirm "Continue with downgrade to ${NEW_VERSION}?" \
+      || { err "downgrade declined — the node was NOT modified"; exit 1; }
+  else
+    info "upgrade: ANAS ${OLD_VERSION} -> ${NEW_VERSION}"
+  fi
+
   # Layout sanity — the release must be intact.
   [ -d "${APP_SRC}" ]  || FATAL+=("release incomplete: app/ not found next to install.sh")
   [ -f "${UNIT_SRC}/anasd.service" ] && [ -f "${UNIT_SRC}/anas.service" ] \
@@ -320,6 +342,11 @@ phase1_install() {
   mkdir -p "$(dirname "${PREFIX}")"
   cp -a "${APP_SRC}" "${PREFIX}"
   PREFIX_INSTALLED=1
+  # app/VERSION ships in the tarball since 10.10 and rides along in the copy;
+  # fall back to the release-root copy so older tarball layouts still stamp it.
+  if [ ! -f "${PREFIX}/VERSION" ] && [ -f "${SCRIPT_DIR}/VERSION" ]; then
+    install -m 0644 "${SCRIPT_DIR}/VERSION" "${PREFIX}/VERSION"
+  fi
   chmod +x "${PREFIX}/packages/pve-integration/install.sh" \
            "${PREFIX}/packages/pve-integration/uninstall.sh" 2>/dev/null || true
 
@@ -368,7 +395,7 @@ finish_success() {
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   [ -n "${ip}" ] || ip="<node-ip>"
   echo
-  log "ANAS installed — https://${ip}:${HEALTH_PORT}"
+  log "ANAS ${NEW_VERSION} installed — https://${ip}:${HEALTH_PORT}"
   echo
   info "FIRST RUN — trust the gateway certificate:"
   info "  ANAS's gateway serves HTTPS on :${HEALTH_PORT} using this node's PVE"

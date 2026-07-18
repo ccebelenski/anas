@@ -1,7 +1,7 @@
 {
   "name": "anas",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "A NAS — Storage management GUI for Proxmox",
   "workspaces": [
@@ -17,6 +17,7 @@
     "build:gateway": "cd packages/gateway && tsc",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
+    "version:bump": "node packaging/bump-version.mjs",
     "typecheck": "npm run typecheck:shared && npm run typecheck:daemon && npm run typecheck:gateway",
     "typecheck:shared": "cd packages/shared && npx tsc --noEmit",
     "typecheck:daemon": "cd packages/daemon && npx tsc --noEmit",

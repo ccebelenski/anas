@@ -22,23 +22,52 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # workspace set so `npm ci` is happy against package-lock.json).
 WORKSPACES=(shared daemon gateway)
 
+# --dev: iteration build — skip the clean-tree gate and the git tag. A release
+# built without --dev must come from a committed tree and gets tagged v<version>.
+DEV_BUILD=0
+case "${1:-}" in
+  --dev) DEV_BUILD=1 ;;
+  "") ;;
+  *) printf 'usage: %s [--dev]\n' "$0" >&2; exit 2 ;;
+esac
+
 log() { printf '==> %s\n' "$*"; }
 err() { printf 'ERROR: %s\n' "$*" >&2; }
+
+# --- 0. Version (single source: root package.json) ---------------------------
+# Verify every copy agrees BEFORE building — the bump script (bump-version.mjs)
+# writes them all, but drift must fail loudly, not ship (story 10.10).
+VERSION="$(node -p "require('${REPO_ROOT}/package.json').version")"
+if [ -z "${VERSION}" ] || [ "${VERSION}" = "undefined" ]; then
+  err "could not read version from package.json"
+  exit 1
+fi
+for p in "${WORKSPACES[@]}"; do
+  wv="$(node -p "require('${REPO_ROOT}/packages/${p}/package.json').version")"
+  if [ "${wv}" != "${VERSION}" ]; then
+    err "version drift: packages/${p} is ${wv}, root is ${VERSION} — run: npm run version:bump -- ${VERSION}"
+    exit 1
+  fi
+done
+SRC_VERSION="$(sed -n "s/^export const VERSION = '\(.*\)'$/\1/p" "${REPO_ROOT}/packages/shared/src/index.ts")"
+if [ "${SRC_VERSION}" != "${VERSION}" ]; then
+  err "version drift: shared VERSION const is '${SRC_VERSION}', root is ${VERSION} — run: npm run version:bump -- ${VERSION}"
+  exit 1
+fi
+RELEASE_NAME="anas-${VERSION}"
+log "Release version: ${VERSION}"
+
+# Clean-tree gate: a real release must be reproducible from a commit.
+if [ "${DEV_BUILD}" -eq 0 ] && [ -n "$(git -C "${REPO_ROOT}" status --porcelain)" ]; then
+  err "working tree is dirty — commit first, or use --dev for an untagged iteration build"
+  exit 1
+fi
 
 # --- 1. Build (shared -> daemon -> gateway) --------------------------------
 log "Building ANAS (npm run build)..."
 cd "${REPO_ROOT}"
 npm run build
 log "Build complete."
-
-# --- 2. Version -------------------------------------------------------------
-VERSION="$(node -p "require('${REPO_ROOT}/package.json').version")"
-if [ -z "${VERSION}" ] || [ "${VERSION}" = "undefined" ]; then
-  err "could not read version from package.json"
-  exit 1
-fi
-RELEASE_NAME="anas-${VERSION}"
-log "Release version: ${VERSION}"
 
 # --- 3. Staging tree --------------------------------------------------------
 STAGING="$(mktemp -d)"
@@ -56,6 +85,9 @@ log "Assembling staging tree at ${REL_ROOT}"
 install -m 0755 "${SCRIPT_DIR}/install.sh"   "${REL_ROOT}/install.sh"
 install -m 0755 "${SCRIPT_DIR}/uninstall.sh" "${REL_ROOT}/uninstall.sh"
 printf '%s\n' "${VERSION}" > "${REL_ROOT}/VERSION"
+# Also inside app/ — cp -a carries it to /opt/anas, so an installed node can
+# report its release on disk (install.sh reads it for upgrade/downgrade logs).
+printf '%s\n' "${VERSION}" > "${APP}/VERSION"
 mkdir -p "${REL_ROOT}/systemd"
 cp "${SCRIPT_DIR}/systemd/anasd.service" "${REL_ROOT}/systemd/anasd.service"
 cp "${SCRIPT_DIR}/systemd/anas.service"  "${REL_ROOT}/systemd/anas.service"
@@ -183,4 +215,25 @@ tar czf "${TARBALL}" -C "${STAGING}" "${RELEASE_NAME}"
 
 TAR_SIZE="$(du -h "${TARBALL}" | awk '{print $1}')"
 log "Release tarball: ${TARBALL} (${TAR_SIZE})"
+
+# --- 7. Tag -----------------------------------------------------------------
+# Only for real (non --dev) builds, which passed the clean-tree gate. Idempotent:
+# tag already at HEAD is fine; tag elsewhere means the version wasn't bumped.
+if [ "${DEV_BUILD}" -eq 0 ]; then
+  TAG="v${VERSION}"
+  if git -C "${REPO_ROOT}" rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+    if [ "$(git -C "${REPO_ROOT}" rev-parse "${TAG}^{commit}")" = "$(git -C "${REPO_ROOT}" rev-parse HEAD)" ]; then
+      log "Tag ${TAG} already at HEAD."
+    else
+      err "tag ${TAG} exists on a different commit — bump the version (npm run version:bump) before releasing"
+      exit 1
+    fi
+  else
+    git -C "${REPO_ROOT}" tag -a "${TAG}" -m "ANAS ${VERSION}"
+    log "Tagged ${TAG} (push with: git push origin ${TAG})"
+  fi
+else
+  log "Dev build — skipping tag."
+fi
+
 printf '\nDone. Untar on the target PVE node and run: sudo ./%s/install.sh\n' "${RELEASE_NAME}"
