@@ -20,7 +20,7 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { classifyKind, isPseudoFstype, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
+import { classifyKind, isPseudoFstype, isSystemMountTarget, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { getMount, parseFstab } from '../parsers/fstab.js'
 import { readPveMountPaths } from '../parsers/pve-storage.js'
 import { readConfig } from './config-writer.js'
@@ -75,7 +75,7 @@ export function buildBaseInventory(
   fstabText: string,
   pveMountPaths: Map<string, string>,
 ): MountSummary[] {
-  const nodes = parseFindmnt(findmntText).filter(n => !isPseudoFstype(n.fstype))
+  const nodes = parseFindmnt(findmntText).filter(n => !isPseudoFstype(n.fstype) && !isSystemMountTarget(n.target))
   const entries = parseFstab(fstabText)
   const entryByMount = new Map(entries.map(e => [e.mountpoint, e]))
 

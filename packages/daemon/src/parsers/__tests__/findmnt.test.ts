@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { classifyKind, isPseudoFstype, optionsReadOnly, parseFindmnt } from '../findmnt.js'
+import { classifyKind, isPseudoFstype, isSystemMountTarget, optionsReadOnly, parseFindmnt } from '../findmnt.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/mounts')
@@ -51,6 +51,21 @@ describe('isPseudoFstype', () => {
       assert.equal(isPseudoFstype(fs), true, fs)
     for (const fs of ['ext4', 'nfs4', 'cifs', 'zfs', 'autofs', 'vfat', 'xfs'])
       assert.equal(isPseudoFstype(fs), false, fs)
+  })
+})
+
+describe('isSystemMountTarget', () => {
+  it('drops OS-plumbing targets (incl. the binfmt_misc autofs placeholder)', () => {
+    // A systemd autofs placeholder over binfmt_misc reports fstype `autofs`
+    // (which we keep for real automounts) but lives under /proc — filter it.
+    assert.equal(isSystemMountTarget('/proc/sys/fs/binfmt_misc'), true)
+    assert.equal(isSystemMountTarget('/sys/kernel/config'), true)
+    assert.equal(isSystemMountTarget('/dev/shm'), true)
+    assert.equal(isSystemMountTarget('/run/user/0'), true)
+  })
+  it('keeps real user storage targets', () => {
+    for (const t of ['/', '/boot/efi', '/mnt/anas-nfs', '/mnttest', '/srv/data'])
+      assert.equal(isSystemMountTarget(t), false, t)
   })
 })
 

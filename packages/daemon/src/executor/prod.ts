@@ -21,8 +21,14 @@ export class ProdExecutor implements CommandExecutor {
             return
           }
 
-          // Process exited (possibly non-zero) — that's a valid result
-          const exitCode = err ? (err as any).status ?? 1 : 0
+          // Process exited (possibly non-zero) — that's a valid result. For an
+          // async execFile error the numeric exit code lives on `err.code`
+          // (NOT `err.status`, which is a spawnSync-only field); preserving it
+          // is load-bearing for callers that classify by the exact code — e.g.
+          // `timeout` exit 124 → mount 'unreachable' (Epic 18). A signal kill
+          // (err.code === null) has no exit code, so fall back to 1.
+          const errCode = err ? (err as { code?: unknown }).code : undefined
+          const exitCode = err ? (typeof errCode === 'number' ? errCode : 1) : 0
 
           resolve({
             stdout: stdout ?? '',
@@ -70,9 +76,15 @@ export class ProdExecutor implements CommandExecutor {
       let rightClosed = false
       let settled = false
 
-      left.stderr.on('data', (d) => { leftStderr += d })
-      right.stderr.on('data', (d) => { rightStderr += d })
-      right.stdout.on('data', (d) => { rightStdout += d })
+      left.stderr.on('data', (d) => {
+        leftStderr += d
+      })
+      right.stderr.on('data', (d) => {
+        rightStderr += d
+      })
+      right.stdout.on('data', (d) => {
+        rightStdout += d
+      })
 
       // Join the two processes. EPIPE is expected when the consumer exits early
       // (the producer is still writing) — swallow it; the exit codes are the
