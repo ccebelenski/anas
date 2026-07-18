@@ -205,7 +205,20 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `PUT` | `/v1/shares/nfs/:path` | Update export config | `202` with job |
 | `DELETE` | `/v1/shares/nfs/:path` | Remove an export | `202`/`409` |
 
-#### Disks (read-only, filtered to relevant storage devices)
+#### Mounts (Epic 18 — external & local storage; designed 2026-07-18)
+
+Identity is the URL-encoded mountpoint (the NFS-exports precedent). Pure management: ANAS writes fstab (surgical round-trip) and invokes `mount`/`umount`; the kernel, `mount.nfs`/`mount.cifs`, and systemd's fstab generator do the work. PVE-owned mounts (read-only `storage.cfg` parse) appear in the list tagged hands-off and reject mutations.
+
+| Method | Path | Description | Response |
+|--------|------|-------------|----------|
+| `GET` | `/v1/mounts` | Inventory: remote + local + PVE-tagged; configured (fstab) vs actual (findmnt) vs health per entry | `200` |
+| `POST` | `/v1/mounts` | Create: write fstab (if persistent) + mount now | `202` with job |
+| `GET` | `/v1/mounts/:mountpoint` | Detail: fstab line as written, effective options, health, capacity | `200` |
+| `PUT` | `/v1/mounts/:mountpoint` | Edit options/credentials → fstab rewrite + remount | `202` with job |
+| `DELETE` | `/v1/mounts/:mountpoint` | Unmount + drop fstab entry; busy → 409 listing holding processes, force/lazy behind confirm | `202`/`409` |
+| `POST` | `/v1/mounts/test` | Preflight diagnosis: DNS → port (2049/445) → timeout-guarded probe mount → unreachable / auth / not-found / protocol / OK | `200` |
+
+Key decisions: **status never touches a mountpoint synchronously** (dead NFS server hangs `stat()`; all liveness/capacity via `timeout`-guarded `stat -f` in a child process → ok/stale/unreachable/unmounted). CIFS credentials in per-mount 0600 root-only files under `/etc/anas/creds/` (local, not pmxcfs — mounts are per-node and boot must not depend on pmxcfs), write-only through the API. Defaults: boot mount with `nofail` forced; `x-systemd.automount` an exposed toggle; `nosuid,nodev` on remote mounts; NFS `vers=4.2`/`hard`, CIFS `vers=3.1.1` (1.0 behind a loud warning). Options are a structured known tier + verbatim passthrough for everything else. Dashboard warning category `mount`, failures only.
 
 | Method | Path | Description | Response |
 |--------|------|-------------|----------|
