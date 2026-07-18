@@ -529,7 +529,7 @@ Stories marked *(V2?)* are explicitly deferred.
 ## V2 Backlog
 
 > **V2 priorities (operator call, 2026-07-18): homelab first.**
-> 1. **Epic 16** (PBS file backup) — next epic; spec/design first.
+> 1. **Epic 16** (PBS file backup) — next epic; spec/design first. **Epic 18** (Mounts, inked 2026-07-18) pairs with it: its observe half (mount inventory, PVE-tagged hands-off) feeds 16's source picker; its act half + fstab machinery is the bottom stratum Epic 11 inherits. PVE's artifact-store paradigm explicitly excluded.
 > 2. **Epic 11 + SHR** — promoted to the V2 headline: a Synology alternative. Mixed-drive-size arrays with **online expansion** matter precisely because disks are expensive — grow-as-you-buy beats forklift upgrades, and it's the thing neither ZFS nor PVE offers.
 > 3. **Epic 17** (scheduled snapshots & scrubs) — inked as its own epic 2026-07-18 (it needs a new screen); TrueNAS-parity table stakes, cheap relative to value — the replication timer/task-store machinery is the template.
 > 4. **12.1** (version-skew checks) — the one Epic 12 survivor; rides early ("easy now" post-10.10, and upgrade pain compounds as versions accumulate).
@@ -643,3 +643,30 @@ Detailed stories to be written when prioritized.
 
 ##### Dashboard
 17.7. As a user, I want only failures and overdue schedules on the dashboard (warning card, existing categories) — healthy/idle shows nothing, matching the replication policy. *(This epic multiplies the unattended tasks in the system — it strengthens the case for the deferred 9.4 notification evaluation once shipped.)*
+
+### Epic 18: Mounts — External & Local Storage
+
+> As a user, I can mount external and local storage — spare disks, USB drives, and remote NFS/CIFS shares — and have it usable as NAS data (shareable, backupable), so ANAS covers the storage that isn't ZFS.
+
+> **Inked 2026-07-18 (operator call). Scope boundary stated up front: PVE's artifact-store paradigm is EXCLUDED.** PVE mounts storage (`storage.cfg` dir/NFS/CIFS entries under `/mnt/pve/*`) as content-typed homes for its own artifacts (VM images, ISOs, backups). ANAS does not manage, replicate, or offer that paradigm — **no content types, no storage.cfg writes, ever**. `storage.cfg` is parsed READ-ONLY to tag PVE-owned mounts hands-off (the proven 3.25 pattern). An ANAS mount is a plain filesystem at a path — data the user shares, backs up, or copies.
+>
+> **Sequencing:** the observe half (18.1–18.3) lands with or before Epic 16 — its backup-source picker wants the mount inventory. The act half lands whenever. Epic 11 (md) then inherits this whole layer: fstab machinery, mount lifecycle, and the Mounts view are its bottom stratum, pulled forward. Mounted paths feed the existing seams for free: shares (Epics 6/7 — a path is a path) and Epic 16 backup sources/targets.
+
+#### Stories
+
+##### Dev (ground truth first)
+18.1. As a dev, I want ground truth captured from real nodes before code: `findmnt`/`lsblk` JSON output shapes, real fstab variants (including hand-edited ones), `storage.cfg` mount entries and where PVE actually mounts them, and the systemd fstab-generator behavior that matters (`nofail`, `x-systemd.automount`, boot ordering) — so the inventory and the persistence model are built on reality.
+
+18.2. As a dev, I want a round-trip fstab parser (parse → modify → write) preserving comments, ordering, and unknown entries, so mount persistence is surgical config editing like smb.conf/exports. *(Config files are the API; the systemd fstab generator does the actual mounting — no mount-manager daemon logic.)*
+
+##### Observe
+18.3. As a user, I want a **Mounts** view: every mounted filesystem (device, type, mountpoint, size/used, source: local disk / USB / NFS / CIFS), whether it persists in fstab, **PVE-owned mounts tagged hands-off** (from the read-only `storage.cfg` parse — visible for the complete picture, untouchable), and unmounted-but-mountable candidates (partitions carrying a filesystem that aren't claimed by ZFS, md, or PVE) — so I see everything attachable at a glance.
+
+##### Act
+18.4. As a user, I want to mount/unmount a local filesystem (ext4/xfs first-class; ntfs/exfat read-tolerant for data import), with optional fstab persistence defaulting to `nofail` so an absent drive never blocks boot, so spare and external disks become usable storage in two clicks.
+
+18.5. As a user, I want to mount remote NFS and CIFS shares as a client (the old-NAS migration path, and remote backup targets), with CIFS credentials in a root-only credentials file — never inline in fstab, never on argv — so remote data is reachable without hand-editing anything.
+
+18.6. As a user, I want removable drives handled as removable: hotplug detection in the inventory, a safe-eject action (unmount + flush, device power-off where the tooling supports it), and a warning when a share or backup task rides on the device I'm ejecting — so pulling a USB drive is safe by default.
+
+18.7. As a user, I want to format a blank spare/external disk (single disk, ext4/xfs) behind the 409 confirmation gate, so a drive fresh from the store becomes usable without leaving ANAS. *(The minimal case only — partitioning schemes, multi-disk, and RAID stay in Epic 11, which builds on this epic's machinery.)*
