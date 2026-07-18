@@ -371,18 +371,20 @@ Story numbering is for identification only, not implementation order. Within eac
 
 > As a user, I can monitor operations and be notified of outcomes through Proxmox's notification system.
 
+> **Status (reviewed 2026-07-18): descoped — the epic predates the surfaces that made it redundant.** The 202-job machinery (Epic 0) remains the mutation transport, but a dedicated Jobs *menu* failed the earn-its-keep test: jobs are in-memory and ephemeral by design (a history view over that is a worse audit trail than journald, the designated audit log); interactive failures surface in the view the user is standing in; and everything long-running already has a feature-native home (scrub/resilver → pool Topology activity strip; replication runs → Replication view, deliberately systemd units rather than ANAS jobs; running jobs + failures → dashboard 2.4/2.5). A Jobs menu would be a second place to see the same things — exactly what the one-menu-per-feature rule prevents. The one slice with real value is **unattended**-failure notifications (9.4/9.5) — deferred, see below.
+
 ### Stories
 
-9.1. As a user, I want to see all active jobs and their progress, so that I know what's currently happening.
+9.1. [OBE 2026-07-18] As a user, I want to see all active jobs and their progress, so that I know what's currently happening. *(Dashboard jobs strip (2.4) + the owning feature's view cover this; no dedicated menu.)*
 
-9.2. As a user, I want to see the history of completed and failed jobs since the last service restart, so that I can review recent activity.
+9.2. [OBE 2026-07-18] As a user, I want to see the history of completed and failed jobs since the last service restart, so that I can review recent activity. *(In-memory job history is ephemeral by design; durable history is journald + ZFS/systemd state per the principles.)*
 
-9.3. As a user, I want to see the details of a job (who initiated it, what it did, when, result or error), so that I can audit operations.
+9.3. [OBE 2026-07-18] As a user, I want to see the details of a job (who initiated it, what it did, when, result or error), so that I can audit operations. *(Audit is journald — structured, timestamped, with initiator — not a UI over a volatile store.)*
 
-9.4. As a user, I want job failures to generate Proxmox notifications, so that I'm alerted through whatever channels I've already configured (email, Gotify, etc.).
+9.4. [deferred 2026-07-18] As a user, I want **unattended** failures (replication task failed or silently overdue) to generate Proxmox notifications, so that I'm alerted through whatever channels I've already configured (email, Gotify, etc.). *(Rescoped from "job failures" — interactive failures don't need notifications, the user is looking at them. Deferred pending a look at what PVE gives out of the box: PVE's notification system (targets/matchers) and ZED's own alerting may already cover or partially cover this — e.g. a failing `anas-repl-*.service` unit, scrub results via ZED. Evaluate the built-ins first; only wire what's genuinely missing.)*
 
 #### Dev
-9.5. As a dev, I want a Proxmox notification client that can send notifications through the PVE notification system, so that ANAS events reach users through their existing alert channels.
+9.5. [deferred 2026-07-18] As a dev, I want a Proxmox notification client that can send notifications through the PVE notification system, so that ANAS events reach users through their existing alert channels. *(Deferred with 9.4 — build only if the out-of-the-box evaluation shows a gap worth filling.)*
 
 ---
 
@@ -516,7 +518,7 @@ For V1 MVP, the implementation order is:
 7. **Epic 6** — SMB shares (parser first, then CRUD)
 8. **Epic 7** — NFS exports (parser first, then CRUD)
 9. **Epic 8** — Users & groups (required for share security)
-10. **Epic 9** — Jobs UI (infrastructure exists from Epic 0; this is the user-facing view)
+10. **Epic 9** — Jobs UI *(descoped 2026-07-18 — dedicated menu OBE, feedback is feature-native + dashboard, audit is journald; unattended-failure notifications (9.4/9.5) deferred pending evaluation of PVE/ZED built-ins — see epic status note)*
 11. **Epic 2** — Dashboard (composes components built in 3–9; last because it depends on everything)
 12. **Epic 10** — Setup & packaging *(done 2026-07-18 via `packaging/` tarball + install.sh + semver (10.10) — see epic status note; open tail: GitHub Actions release builds)*
 
