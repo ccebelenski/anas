@@ -54,7 +54,8 @@ export async function corsHook(request: FastifyRequest, reply: FastifyReply): Pr
     reply.header('access-control-allow-headers', 'content-type, x-anas-confirm')
     // The 409 confirmation contract lives in response headers the browser must
     // read cross-origin; without this the ExtJS panels can't see the code.
-    reply.header('access-control-expose-headers', 'x-anas-confirm-code, x-anas-confirm-expires')
+    // x-anas-version feeds the UI's version-skew warning (12.1).
+    reply.header('access-control-expose-headers', 'x-anas-confirm-code, x-anas-confirm-expires, x-anas-version')
   }
 
   if (request.method === 'OPTIONS') {

@@ -167,6 +167,8 @@ describe('local proxy → anasd socket', () => {
     assert.deepEqual(res.json(), { data: [{ name: 'tank' }] })
     // Confirmation header passed straight through.
     assert.equal(res.headers['x-anas-confirm-code'], 'CONF-123')
+    // Proxied responses carry the gateway's own version header (12.1).
+    assert.equal(res.headers['x-anas-version'], VERSION)
     // Prefix stripped, query preserved.
     assert.equal(received.url, '/v1/pools?verbose=1')
     // Identity headers attached.
@@ -233,6 +235,8 @@ describe('health endpoint', () => {
     })
     assert.equal(res.statusCode, 200)
     assert.deepEqual(res.json(), { data: { node: NODE, version: VERSION } })
+    // Version-skew visibility (12.1): every response names the gateway version.
+    assert.equal(res.headers['x-anas-version'], VERSION)
     await server.close()
   })
 })

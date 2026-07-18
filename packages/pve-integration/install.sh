@@ -40,6 +40,18 @@ if [ ! -d "${SRC_DIR}" ]; then
   echo "anas: ERROR: source dir ${SRC_DIR} not found" >&2
   exit 1
 fi
+# Resolve the ANAS version to stamp into the bundle (12.1 version-skew checks:
+# the UI compares its own build against the gateway/daemon versions). Release
+# layout has VERSION two levels up (/opt/anas/VERSION); a dev tree has the root
+# package.json there instead. Unresolvable -> no stamp line, checks stay off.
+ANAS_VERSION=""
+if [ -f "${SCRIPT_DIR}/../../VERSION" ]; then
+  ANAS_VERSION="$(cat "${SCRIPT_DIR}/../../VERSION")"
+elif command -v node >/dev/null 2>&1 && [ -f "${SCRIPT_DIR}/../../package.json" ]; then
+  ANAS_VERSION="$(node -p "require('${SCRIPT_DIR}/../../package.json').version" 2>/dev/null || true)"
+  [ "${ANAS_VERSION}" = "undefined" ] && ANAS_VERSION=""
+fi
+
 # A .js suffix lets `node --check` (below) infer the file is a plain script;
 # without an extension newer node refuses to pick a module format.
 gen="$(mktemp --suffix=.js)"
@@ -49,6 +61,9 @@ gen="$(mktemp --suffix=.js)"
   echo " * Concatenated from packages/pve-integration/src/*.js (lexical order) by"
   echo " * install.sh. Edit the per-view sources in src/ instead."
   echo " */"
+  if [ -n "${ANAS_VERSION}" ]; then
+    echo "window.ANAS = window.ANAS || {}; window.ANAS.BUILD_VERSION = '${ANAS_VERSION}';"
+  fi
   # Bash pathname expansion yields the sources in sorted (numeric-prefix) order.
   for f in "${SRC_DIR}"/*.js; do
     echo ""

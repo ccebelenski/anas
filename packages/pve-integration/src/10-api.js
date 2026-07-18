@@ -59,6 +59,18 @@
             }
 
             fetch(url, fetchOpts).then(function (res) {
+                // Version-skew visibility (12.1): the gateway stamps every
+                // response with its own version. Remember the latest sighting;
+                // the health probe compares it against the UI build and the
+                // node's daemon version.
+                try {
+                    var gwVersion = res.headers.get('x-anas-version');
+                    if (gwVersion) {
+                        ANAS.gatewayVersion = gwVersion;
+                    }
+                } catch (hv) {
+                    // header unreadable — skew check simply has less to compare
+                }
                 // Read as text, then attempt JSON — the gateway always speaks
                 // JSON, but reading text first keeps error bodies intact even
                 // when a proxy strips or mangles the Content-Type header.

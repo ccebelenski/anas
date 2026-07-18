@@ -127,6 +127,8 @@ anasd runs a Fastify HTTP server bound to `/run/anas/anasd.sock`. The anas gatew
 
 All anasd routes are prefixed with `/v1/`. This allows future breaking changes without disrupting running systems during upgrades.
 
+**Version-skew visibility (12.1):** every gateway response carries `X-Anas-Version` (the responding gateway's own semver; never overwritten by a forwarded peer's copy), the daemon's `/v1/health` body carries its version, and the installer stamps the UI bundle with `ANAS.BUILD_VERSION`. The UI's per-view health probe compares all three and docks an advisory warning banner on any difference — warn, never fail: `/v1/` stays additive, so skew is an upgrade nudge, not an error.
+
 ### Authentication Propagation & Audit Trail
 
 Every request from anas to anasd carries the authenticated user's identity via headers:

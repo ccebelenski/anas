@@ -48,6 +48,54 @@
         };
     };
 
+    // ---- Version-skew warning (12.1) ---------------------------------------
+    //
+    // Three versions can drift: the browser-cached UI bundle (stamped into
+    // anas.js by the installer as ANAS.BUILD_VERSION), the local gateway
+    // (X-Anas-Version on every response, captured by 10-api), and the target
+    // node's daemon (the health probe's own body). Any difference gets a
+    // warning banner docked onto the view — warn, never fail: a partially
+    // upgraded cluster should tell the user, not break.
+    //
+    // Returns a docked-toolbar config, or null when everything matches (or the
+    // bundle is unstamped — dev trees — in which case the check stays off).
+    ANAS.versionSkewBanner = function (node, daemonVersion) {
+        var ui = ANAS.BUILD_VERSION;
+        if (!ui) {
+            return null;
+        }
+        var gw = ANAS.gatewayVersion;
+        var gwSkew = !!(gw && gw !== ui);
+        var daemonSkew = !!(daemonVersion && daemonVersion !== ui);
+        if (!gwSkew && !daemonSkew && !(gw && daemonVersion && gw !== daemonVersion)) {
+            return null;
+        }
+
+        var enc = ANAS.enc;
+        var parts = ['UI ' + ui];
+        if (gw) {
+            parts.push('gateway ' + gw);
+        }
+        if (daemonVersion) {
+            parts.push('node "' + node + '" ' + daemonVersion);
+        }
+        var hint = gwSkew
+            // The gateway serving us is newer/older than our cached bundle —
+            // a reload refetches anas.js; otherwise the mismatch is on-node.
+            ? ANAS.t('Reload the browser (Ctrl-Shift-R) to refresh the ANAS UI, or upgrade the older install.')
+            : ANAS.t('Upgrade ANAS on the older node.');
+        return {
+            xtype: 'toolbar',
+            dock: 'top',
+            cls: 'anas-version-skew',
+            items: [{
+                xtype: 'tbtext',
+                html: '<i class="fa fa-exclamation-triangle warning"></i> '
+                    + enc(ANAS.t('ANAS version mismatch') + ': ' + parts.join(', ') + '. ' + hint),
+            }],
+        };
+    };
+
     // Return a panel config that probes health on render, then swaps in either
     // the real view (panelFactory()) or the not-installed panel. Every
     // registered view is wrapped in this so a missing install degrades
@@ -65,7 +113,7 @@
                     } catch (e) {
                         // non-fatal
                     }
-                    ANAS.api.health(node).then(function () {
+                    ANAS.api.health(node).then(function (health) {
                         if (panel.destroyed || panel.destroying) {
                             return;
                         }
@@ -73,6 +121,15 @@
                             panel.setLoading(false);
                         } catch (e) {
                             // non-fatal
+                        }
+                        // Version-skew banner (12.1) — advisory, fail-open.
+                        try {
+                            var skew = ANAS.versionSkewBanner(node, health && health.version);
+                            if (skew) {
+                                panel.addDocked(skew);
+                            }
+                        } catch (vs) {
+                            ANAS.warn('version-skew check failed: ' + ANAS.errText(vs));
                         }
                         var child;
                         try {

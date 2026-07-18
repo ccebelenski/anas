@@ -63,6 +63,14 @@ export function createServer(opts: ServerOptions = {}) {
   // 1. CORS (also answers OPTIONS preflight, unauthenticated).
   server.addHook('onRequest', corsHook)
 
+  // Version-skew visibility (12.1): every response names this gateway's
+  // version. Forwarded peer responses keep it too — relayHeaders never copies
+  // the peer's copy — so the header always identifies the gateway the browser
+  // is actually talking to.
+  server.addHook('onRequest', async (_request, reply) => {
+    reply.header('x-anas-version', VERSION)
+  })
+
   // 2. Auth: verify PVEAuthCookie (or dev), attach { name, uid } → 401 otherwise.
   server.addHook('onRequest', async (request, reply) => {
     if (request.method === 'OPTIONS')
