@@ -197,6 +197,8 @@
             title: 'Configured but not present in the mount table.' },
         armed: { color: 'var(--anas-accent,#3468c0)', label: 'Automount (armed)',
             title: 'An automount placeholder — mounts on first access. Not an error.' },
+        disabled: { color: 'var(--anas-muted,gray)', label: 'Disabled',
+            title: 'Deliberately disabled — the fstab entry is commented with the #ANAS marker. Enable restores it (mounts at next boot or via Mount).' },
     };
 
     function statePill(state) {
@@ -487,6 +489,30 @@
                 btnSetTip(grid, 'mountEdit', t('Editing options is available for remote shares'));
             }
         }
+
+        // Disable/Enable (the #ANAS fstab marker) — config-level, so only
+        // fstab-persisted, non-PVE rows. The button label follows the state.
+        var isOff = has && ('' + rec.get('state')).toLowerCase() === 'disabled';
+        var persisted = has && first(rec.get('persistent'), rec.get('inFstab')) === true;
+        setDisabled(grid, 'mountDisable', !(mutable && persisted));
+        btnSetTip(grid, 'mountDisable', pve ? tip
+            : (has && !persisted ? t('Only fstab-persisted mounts can be disabled') : ''));
+        try {
+            var dbtn = grid.down('#mountDisable');
+            if (dbtn) {
+                dbtn.setText(isOff ? t('Enable') : t('Disable'));
+                dbtn.setIconCls(isOff ? 'fa fa-check-circle-o' : 'fa fa-ban');
+            }
+        } catch (eD) {
+            // non-fatal
+        }
+        if (isOff) {
+            // A disabled entry is config-off: enable it before mount/edit.
+            setDisabled(grid, 'mountToggle', true);
+            btnSetTip(grid, 'mountToggle', t('Enable this mount first'));
+            setDisabled(grid, 'mountEdit', true);
+            btnSetTip(grid, 'mountEdit', t('Enable this mount first'));
+        }
     }
 
     // ---- Detail area -------------------------------------------------------
@@ -718,6 +744,42 @@
             opts.confirmTitle = 'Unmount busy filesystem';
             opts.confirmIntro = t('Processes are using this mount:');
             ANAS.confirmAndRun(opts);
+        }
+    }
+
+    // ---- Disable / Enable (the #ANAS fstab marker; config-level) -----------
+    //
+    // disable = unmount now (busy → the standard 409 holder-list confirm) and
+    // comment the fstab line as '#ANAS <original>'; credentials are kept.
+    // enable = strip the marker ONLY (byte-identical restore) — it does not
+    // mount; the row shows 'unmounted' until Mount or the next boot.
+
+    function mountEnableDisable(view, node, rec) {
+        if (!rec) {
+            return;
+        }
+        var mp = rec.get('mountpoint');
+        var disabling = ('' + rec.get('state')).toLowerCase() !== 'disabled';
+        var grid = mountsGridOf(view);
+        var opts = {
+            node: node,
+            method: 'post',
+            path: '/mounts/' + encMp(mp) + '/state',
+            body: { action: disabling ? 'disable' : 'enable' },
+            view: grid,
+            failTitle: disabling ? 'Disable failed' : 'Enable failed',
+            successMsg: (disabling ? t('Disabled') : t('Enabled')) + ' ' + mp,
+            onComplete: function () {
+                loadMounts(view, node);
+                loadMountDetail(view, node, mp);
+            },
+        };
+        if (disabling) {
+            opts.confirmTitle = 'Disable mount';
+            opts.confirmIntro = t('Processes are using this mount:');
+            ANAS.confirmAndRun(opts);
+        } else {
+            ANAS.runJob(opts);
         }
     }
 
@@ -1728,6 +1790,17 @@
                     var view = btn.up('#mountsView');
                     var rec = selectedMount(mountsGridOf(view));
                     openMountEdit(view, node, rec ? rec.getData() : null);
+                },
+            },
+            {
+                text: t('Disable'),
+                itemId: 'mountDisable',
+                cls: 'anas-btn-mount-disable',
+                iconCls: 'fa fa-ban',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#mountsView');
+                    mountEnableDisable(view, node, selectedMount(mountsGridOf(view)));
                 },
             },
             {
