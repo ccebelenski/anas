@@ -1,0 +1,41 @@
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+==========================================================
+ Busy-unmount capture (story 18.1) — target /mnt/anas-cifs
+==========================================================
+
+### Holding processes: PID 5960 (open FD on README.txt), PID 5961 (CWD in mount)
+
+### umount /mnt/anas-cifs   (expect EBUSY)
+umount: /mnt/anas-cifs: target is busy.
+umount EXIT=32
+
+### umount by device //127.0.0.1/anastest
+umount: /mnt/anas-cifs: target is busy.
+umount EXIT=32
+
+### fuser -vm /mnt/anas-cifs
+                     USER        PID ACCESS COMMAND
+/mnt/anas-cifs:      root     kernel mount /mnt/anas-cifs
+                     root       5960 f.... sleep
+                     root       5961 ..c.. sleep
+fuser EXIT=0
+
+### fuser -m /mnt/anas-cifs  (terse: just PIDs)
+/mnt/anas-cifs:       5960  5961c
+fuser EXIT=0
+
+### lsof +f -- /mnt/anas-cifs
+COMMAND  PID USER  FD   TYPE DEVICE SIZE/OFF   NODE NAME
+sleep   5960 root   0r   REG   0,56       22 562136 /mnt/anas-cifs/README.txt
+sleep   5961 root cwd    DIR   0,56        0 562135 /mnt/anas-cifs
+lsof EXIT=0
+
+### lsof -t +f -- /mnt/anas-cifs  (terse: just PIDs)
+5960
+5961
+lsof EXIT=0
+
+### After releasing holders: umount /mnt/anas-cifs
+umount EXIT=0
+### remount for continued testing
+mount EXIT=0

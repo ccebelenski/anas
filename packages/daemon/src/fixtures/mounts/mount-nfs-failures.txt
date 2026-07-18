@@ -1,0 +1,57 @@
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+==============================================================
+ mount.nfs failure taxonomy (story 18.1) -> /v1/mounts/test
+ probe dir: /mnt/anas-probe ; RFC5737 bogus IP 192.0.2.1 for unreachable
+==============================================================
+
+### UNREACHABLE: bogus IP, short timeo/retrans/retry (no route/no answer)
+$ mount -t nfs4 -o vers=4.2,soft,timeo=10,retrans=1,retry=0 192.0.2.1:/srv/nfs/export1 /mnt/anas-probe
+mount.nfs4: Connection timed out for 192.0.2.1:/srv/nfs/export1 on /mnt/anas-probe
+EXIT=32
+
+### NOT-FOUND: server OK (localhost), export path does not exist
+$ mount -t nfs4 -o vers=4.2,soft,timeo=20,retrans=1,retry=0 127.0.0.1:/srv/nfs/nonexistent /mnt/anas-probe
+mount.nfs4: mounting 127.0.0.1:/srv/nfs/nonexistent failed, reason given by server: No such file or directory
+EXIT=32
+
+### PROTOCOL-MISMATCH: request nfsvers=3 (server also offers 3 — may succeed) 
+$ mount -t nfs -o nfsvers=3,soft,timeo=20,retrans=1,retry=0 127.0.0.1:/srv/nfs/export1 /mnt/anas-probe
+EXIT=0
+
+### PROTOCOL: request nfsvers=4.0 minor mismatch vs default
+$ mount -t nfs -o nfsvers=4.0,soft,timeo=20,retrans=1,retry=0 127.0.0.1:/srv/nfs/export1 /mnt/anas-probe
+EXIT=0
+
+### CONN-REFUSED: localhost but wrong port via addr with nfs-server behavior (blocked port sim: use IP with no nfsd = 127.0.0.2 loopback, port 2049 closed)
+$ mount -t nfs4 -o vers=4.2,soft,timeo=10,retrans=1,retry=0 127.0.0.2:/srv/nfs/export1 /mnt/anas-probe
+EXIT=0
+
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+
+==============================================================
+ REFINED cases (protocol / connection-refused)
+==============================================================
+
+### CONN-REFUSED: reachable host (127.0.0.1) but closed port (port=1)
+$ mount -t nfs4 -o vers=4.2,soft,timeo=10,retrans=1,retry=0,port=1 127.0.0.1:/srv/nfs/export1 /mnt/anas-probe
+mount.nfs4: Connection refused for 127.0.0.1:/srv/nfs/export1 on /mnt/anas-probe
+EXIT=32
+
+### WRONG-SERVICE: NFS against the SMB port 445 (reachable, wrong protocol)
+$ mount -t nfs4 -o vers=4.2,soft,timeo=10,retrans=1,retry=0,port=445 127.0.0.1:/srv/nfs/export1 /mnt/anas-probe
+mount.nfs4: Connection timed out for 127.0.0.1:/srv/nfs/export1 on /mnt/anas-probe
+EXIT=32
+
+### PROTOCOL: request nfsvers=2 (not supported by modern kernel/server)
+$ mount -t nfs -o nfsvers=2,soft,timeo=20,retrans=1,retry=0 127.0.0.1:/srv/nfs/export1 /mnt/anas-probe
+mount.nfs: requested NFS version or transport protocol is not supported for /mnt/anas-probe
+EXIT=32
+
+### PROTOCOL-MISMATCH: disable NFSv4 on server, then request vers=4.2
+server versions now: +3 -4 -4.0 -4.1 -4.2
+### PROTOCOL-MISMATCH: server has v4 OFF, client requests vers=4.2
+$ mount -t nfs4 -o vers=4.2,soft,timeo=20,retrans=1,retry=0 127.0.0.1:/srv/nfs/export1 /mnt/anas-probe
+mount.nfs4: Protocol not supported for 127.0.0.1:/srv/nfs/export1 on /mnt/anas-probe
+EXIT=32
+
+server versions restored: +3 +4 +4.1 +4.2

@@ -1,0 +1,97 @@
+{
+   "blockdevices": [
+      {
+         "name": "sda",
+         "type": "disk",
+         "fstype": null,
+         "size": "32G",
+         "fssize": null,
+         "fsused": null,
+         "fsavail": null,
+         "mountpoints": [],
+         "label": null,
+         "uuid": null,
+         "rm": false,
+         "ro": false,
+         "hotplug": false,
+         "tran": null,
+         "model": "QEMU HARDDISK",
+         "serial": "drive-scsi0-0-0-0",
+         "children": [
+            {
+               "name": "sda1",
+               "type": "part",
+               "fstype": "ext4",
+               "size": "31.9G",
+               "fssize": "31.3G",
+               "fsused": "6G",
+               "fsavail": "24G",
+               "mountpoints": [
+                   "/"
+               ],
+               "label": null,
+               "uuid": "81e2a465-6506-463a-943e-57fd9434aa70",
+               "rm": false,
+               "ro": false,
+               "hotplug": false,
+               "tran": null,
+               "model": null,
+               "serial": null
+            },{
+               "name": "sda14",
+               "type": "part",
+               "fstype": null,
+               "size": "3M",
+               "fssize": null,
+               "fsused": null,
+               "fsavail": null,
+               "mountpoints": [],
+               "label": null,
+               "uuid": null,
+               "rm": false,
+               "ro": false,
+               "hotplug": false,
+               "tran": null,
+               "model": null,
+               "serial": null
+            },{
+               "name": "sda15",
+               "type": "part",
+               "fstype": "vfat",
+               "size": "124M",
+               "fssize": "123.7M",
+               "fsused": "8.9M",
+               "fsavail": "114.8M",
+               "mountpoints": [
+                   "/boot/efi"
+               ],
+               "label": null,
+               "uuid": "FEBE-2792",
+               "rm": false,
+               "ro": false,
+               "hotplug": false,
+               "tran": null,
+               "model": null,
+               "serial": null
+            }
+         ]
+      },{
+         "name": "sr0",
+         "type": "rom",
+         "fstype": "iso9660",
+         "size": "368K",
+         "fssize": null,
+         "fsused": null,
+         "fsavail": null,
+         "mountpoints": [],
+         "label": "cidata",
+         "uuid": "2026-07-13-11-47-34-00",
+         "rm": true,
+         "ro": true,
+         "hotplug": false,
+         "tran": "sata",
+         "model": "QEMU DVD-ROM",
+         "serial": "QM00003"
+      }
+   ]
+}

@@ -1,0 +1,41 @@
+device 127.0.0.1:/srv/nfs/export1 mounted on /mnt/anas-nfs with fstype nfs4 statvers=1.1
+	opts:	rw,vers=4.2,rsize=524288,wsize=524288,namlen=255,acregmin=3,acregmax=60,acdirmin=30,acdirmax=60,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none
+	age:	105
+	impl_id:	name='Linux 7.0.14-4-pve #1 SMP PREEMPT_DYNAMIC PMX 7.0.14-4 (2026-07-07T07:27Z) x86_64',domain='kernel.org',date='0,0'
+	caps:	caps=0xfffbfebf,wtmult=512,dtsize=524288,bsize=0,namlen=255
+	nfsv4:	bm0=0xfdffbfff,bm1=0x40fdbe3e,bm2=0x762803,acl=0x3,sessions,pnfs=not configured,lease_time=90,lease_expired=0
+	sec:	flavor=1,pseudoflavor=1
+	events:	2 24 0 2 0 3 31 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 
+	bytes:	0 0 0 0 0 0 0 0 
+	RPC iostats version: 1.1  p/v: 100003/4 (nfs)
+	xprt:	tcp 0 0 2 0 2 60 60 0 60 0 2 0 0
+	per-op statistics
+	        NULL: 1 1 0 44 24 0 0 1 0
+	        READ: 0 0 0 0 0 0 0 0 0
+	       WRITE: 0 0 0 0 0 0 0 0 0
+	      COMMIT: 0 0 0 0 0 0 0 0 0
+	        OPEN: 0 0 0 0 0 0 0 0 0
+	OPEN_CONFIRM: 0 0 0 0 0 0 0 0 0
+	 OPEN_NOATTR: 0 0 0 0 0 0 0 0 0
+	OPEN_DOWNGRADE: 0 0 0 0 0 0 0 0 0
+	       CLOSE: 0 0 0 0 0 0 0 0 0
+	     SETATTR: 0 0 0 0 0 0 0 0 0
+	      FSINFO: 1 1 0 180 172 0 0 0 0
+	       RENEW: 0 0 0 0 0 0 0 0 0
+	 SETCLIENTID: 0 0 0 0 0 0 0 0 0
+	SETCLIENTID_CONFIRM: 0 0 0 0 0 0 0 0 0
+	        LOCK: 0 0 0 0 0 0 0 0 0
+	       LOCKT: 0 0 0 0 0 0 0 0 0
+	       LOCKU: 0 0 0 0 0 0 0 0 0
+	      ACCESS: 7 7 0 1252 1048 0 1 1 0
+	     GETATTR: 4 4 0 752 1068 0 0 0 0
+	      LOOKUP: 5 5 0 968 1296 0 0 0 1
+	 LOOKUP_ROOT: 0 0 0 0 0 0 0 0 0
+	      REMOVE: 0 0 0 0 0 0 0 0 0
+	      RENAME: 0 0 0 0 0 0 0 0 0
+	        LINK: 0 0 0 0 0 0 0 0 0
+	     SYMLINK: 0 0 0 0 0 0 0 0 0
+	      CREATE: 1 1 0 224 344 0 8 9 0
+	    PATHCONF: 1 1 0 172 116 0 0 0 0
+	      STATFS: 10 10 0 1728 1600 0 1 1 0
+	    READLINK: 0 0 0 0 0 0 0 0 0

@@ -1,0 +1,65 @@
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+==============================================================
+ mount.cifs failure taxonomy (story 18.1) -> /v1/mounts/test
+ valid share //127.0.0.1/anastest  user smbtest
+==============================================================
+
+### UNREACHABLE: bogus RFC5737 IP
+$ mount -t cifs -o credentials=/etc/anas/creds/anastest.cred,vers=3.1.1 //192.0.2.1/anastest /mnt/anas-probe
+mount error(115): could not connect to 192.0.2.1Unable to find suitable address.
+EXIT=32
+
+### CONN-REFUSED: reachable host, closed port 445 (use port=1)
+$ mount -t cifs -o credentials=/etc/anas/creds/anastest.cred,vers=3.1.1,port=1 //127.0.0.1/anastest /mnt/anas-probe
+mount error(111): could not connect to 127.0.0.1Unable to find suitable address.
+EXIT=32
+
+### AUTH-FAILED: wrong password
+$ mount -t cifs -o username=smbtest,password=WRONGPASS,vers=3.1.1 //127.0.0.1/anastest /mnt/anas-probe
+mount error(13): Permission denied
+Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)
+EXIT=32
+
+### AUTH-FAILED: unknown username
+$ mount -t cifs -o username=nosuchuser,password=whatever,vers=3.1.1 //127.0.0.1/anastest /mnt/anas-probe
+mount error(13): Permission denied
+Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)
+EXIT=32
+
+### NOT-FOUND: bad share name (bad_netname)
+$ mount -t cifs -o credentials=/etc/anas/creds/anastest.cred,vers=3.1.1 //127.0.0.1/nosuchshare /mnt/anas-probe
+mount error(2): No such file or directory
+Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)
+EXIT=32
+
+### PROTOCOL: request SMB1 vers=1.0 (server has SMB1 disabled)
+$ mount -t cifs -o credentials=/etc/anas/creds/anastest.cred,vers=1.0 //127.0.0.1/anastest /mnt/anas-probe
+mount error(95): Operation not supported
+Refer to the mount.cifs(8) manual page (e.g. man mount.cifs) and kernel log messages (dmesg)
+EXIT=32
+
+### PROTOCOL: request vers=2.0 (may be disabled/negotiate)
+$ mount -t cifs -o credentials=/etc/anas/creds/anastest.cred,vers=2.0 //127.0.0.1/anastest /mnt/anas-probe
+EXIT=0
+
+### dmesg CIFS status tail (kernel gives the real error detail) ###
+[  623.118006] CIFS: Attempting to mount //127.0.0.1/anastest
+[  730.377907] CIFS: Attempting to mount //192.0.2.1/anastest
+[  740.529809] CIFS: VFS: Error connecting to socket. Aborting operation.
+[  740.529827] CIFS: VFS: cifs_mount failed w/return code = -115
+[  740.549506] CIFS: Attempting to mount //127.0.0.1/anastest
+[  740.549985] CIFS: VFS: Error connecting to socket. Aborting operation.
+[  740.549995] CIFS: VFS: cifs_mount failed w/return code = -111
+[  740.567321] CIFS: Attempting to mount //127.0.0.1/anastest
+[  740.569727] CIFS: Status code returned 0xc000006d STATUS_LOGON_FAILURE
+[  740.569745] CIFS: VFS: \\127.0.0.1 failed to create a new SMB session with Unknown: -13
+[  740.569757] CIFS: VFS: cifs_mount failed w/return code = -13
+[  740.587551] CIFS: Attempting to mount //127.0.0.1/anastest
+[  740.598925] CIFS: VFS: cifs_mount failed w/return code = -13
+[  740.618733] CIFS: Attempting to mount //127.0.0.1/nosuchshare
+[  740.629328] CIFS: VFS: BAD_NETWORK_NAME: \\127.0.0.1\nosuchshare
+[  740.629346] CIFS: VFS: cifs_mount failed w/return code = -2
+[  740.647059] CIFS: VFS: Use of the less secure dialect vers=1.0 is not recommended unless required for access to very old servers
+[  740.647072] CIFS: Attempting to mount //127.0.0.1/anastest
+[  740.653178] CIFS: VFS: cifs_mount failed w/return code = -95
+[  740.673564] CIFS: Attempting to mount //127.0.0.1/anastest

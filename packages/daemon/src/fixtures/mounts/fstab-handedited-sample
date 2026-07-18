@@ -1,0 +1,21 @@
+# /etc/fstab: static file system information. Hand-maintained since 2019 — DO NOT let any tool reformat this.
+# <file system>	<mount point>	<type>	<options>	<dump>	<pass>
+
+# root and boot (installer-generated, left alone)
+PARTUUID=72b15c20-a4f1-4a48-a54e-bb8aa2c7a129   /           ext4    rw,discard,errors=remount-ro,x-systemd.growfs   0 1
+PARTUUID=b472bf42-11d9-4d54-8279-96e3c24e2c18   /boot/efi   vfat    defaults,umask=077   0 2
+
+# --- local spare disk, tabs not spaces, by-uuid ---
+UUID=1b3e6c9a-2f44-4d8e-91aa-77c0de3f1a2b	/mnt/spare	xfs	defaults,nofail,noatime	0	2
+
+# old USB drive — commented out while it is unplugged, keep for reference
+#UUID=A1B2-C3D4  /mnt/usb   exfat   rw,uid=1000,gid=1000,nofail   0 0
+
+/dev/sdz1   /mnt/weird   ext4   defaults,nofail,x-gvfs-show,x-anas-note=keep-this-unknown-option,comment=cloudconfig   0 0
+
+# remote NAS over NFS, mixed spacing and an inline comment
+192.168.1.50:/volume1/media     /mnt/media   nfs4   rw,nofail,soft,timeo=150,retrans=3,_netdev   0 0   # media library, read-mostly
+
+# a bind mount and a tmpfs, because real fstabs have these
+/srv/data/shared    /export/shared    none    bind          0 0
+tmpfs               /scratch          tmpfs   size=2G,mode=1777   0 0

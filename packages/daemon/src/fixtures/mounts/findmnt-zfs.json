@@ -1,0 +1,10 @@
+{
+   "filesystems": [
+      {
+         "target": "/mnttest",
+         "source": "mnttest",
+         "fstype": "zfs",
+         "options": "rw,relatime,xattr,noacl,casesensitive"
+      }
+   ]
+}
