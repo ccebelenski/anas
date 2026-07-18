@@ -391,28 +391,41 @@
             for (var i = 0; i < list.length; i++) {
                 rows.push(mountRow(list[i]));
             }
+            // loadData clears the store, which fires selectionchange with an
+            // EMPTY selection — guard so that transient doesn't blank the
+            // detail panel; the re-select below (suppressed) can't refire it.
+            grid.anasReloading = true;
             try {
                 grid.getStore().loadData(rows);
             } catch (e2) {
                 ANAS.warn('mounts grid load failed: ' + ANAS.errText(e2));
             }
-            // Re-select the prior row by mountpoint (no detail reload flicker).
+            // Re-select the prior row by mountpoint. Restored → refresh the
+            // detail QUIETLY (no spinner swap, no flicker) so it tracks state;
+            // row gone (deleted elsewhere) → clear the detail for real.
+            var restored = false;
             if (priorMp) {
                 try {
                     var store = grid.getStore();
                     var idx = store.findExact('mountpoint', priorMp);
                     if (idx >= 0) {
                         grid.getSelectionModel().select(idx, false, true);
+                        restored = true;
                     }
                 } catch (eSel) {
                     // non-fatal
                 }
+            }
+            grid.anasReloading = false;
+            if (priorMp) {
+                loadMountDetail(view, node, restored ? priorMp : null, true);
             }
             updateButtons(grid);
         }, function (err) {
             if (grid.destroyed || grid.destroying) {
                 return;
             }
+            grid.anasReloading = false;
             try {
                 grid.setLoading(false);
             } catch (e) {
@@ -674,7 +687,9 @@
         return html;
     }
 
-    function loadMountDetail(view, node, mountpoint) {
+    // `quiet` skips the spinner swap — used by the poll refresh, which updates
+    // the already-rendered detail in place instead of flickering it.
+    function loadMountDetail(view, node, mountpoint, quiet) {
         var panel = detailPanelOf(view);
         if (!panel) {
             return;
@@ -683,9 +698,11 @@
             panel.update(detailHint());
             return;
         }
-        panel.update('<div style="padding:12px 14px;color:var(--anas-muted,gray);">'
-            + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
-            + enc(t('loading…')) + '</div>');
+        if (!quiet) {
+            panel.update('<div style="padding:12px 14px;color:var(--anas-muted,gray);">'
+                + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
+                + enc(t('loading…')) + '</div>');
+        }
         ANAS.api.get(node, '/mounts/' + encMp(mountpoint)).then(function (res) {
             if (panel.destroyed || panel.destroying) {
                 return;
@@ -1867,6 +1884,12 @@
                     listeners: {
                         selectionchange: function (selModel, selected) {
                             var grid = this;
+                            // Ignore the transient empty selection fired by
+                            // loadData during a poll refresh — loadMounts
+                            // restores selection and detail itself.
+                            if (grid.anasReloading && !(selected && selected.length)) {
+                                return;
+                            }
                             updateButtons(grid);
                             var view = grid.up('#mountsView');
                             var rec = (selected && selected.length) ? selected[0] : null;
