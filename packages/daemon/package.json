@@ -2,6 +2,7 @@
   "name": "@anas/daemon",
   "type": "module",
   "version": "0.1.1",
+  "license": "AGPL-3.0-or-later",
   "private": true,
   "scripts": {
     "dev": "tsx watch src/index.ts",

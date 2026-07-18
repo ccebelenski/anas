@@ -16,15 +16,15 @@
 //
 // make-release.sh independently verifies all copies agree before building.
 //
-import { readFileSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 const newVersion = process.argv[2]
-const SEMVER = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/
+const SEMVER = /^\d+\.\d+\.\d+(?:-[0-9a-z.-]+)?$/i
 if (!newVersion || !SEMVER.test(newVersion)) {
   console.error('usage: node packaging/bump-version.mjs <new-version>   (semver, e.g. 0.2.0)')
   process.exit(2)
@@ -43,22 +43,22 @@ for (const rel of manifests) {
   const path = join(repoRoot, rel)
   const pkg = JSON.parse(readFileSync(path, 'utf8'))
   pkg.version = newVersion
-  writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n')
-  console.log(`  ${rel}: ${newVersion}`)
+  writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`)
+  process.stdout.write(`  ${rel}: ${newVersion}\n`)
 }
 
 // The VERSION const in shared — a build-time constant, not a runtime fs read.
 const indexPath = join(repoRoot, 'packages/shared/src/index.ts')
 const index = readFileSync(indexPath, 'utf8')
-const stamped = index.replace(/^export const VERSION = '[^']*'$/m, `export const VERSION = '${newVersion}'`)
-if (stamped === index) {
+const VERSION_LINE = /^export const VERSION = '[^']*'$/m
+if (!VERSION_LINE.test(index)) {
   console.error(`ERROR: VERSION const not found in ${indexPath} — expected: export const VERSION = '...'`)
   process.exit(1)
 }
-writeFileSync(indexPath, stamped)
-console.log(`  packages/shared/src/index.ts: VERSION = '${newVersion}'`)
+writeFileSync(indexPath, index.replace(VERSION_LINE, `export const VERSION = '${newVersion}'`))
+process.stdout.write(`  packages/shared/src/index.ts: VERSION = '${newVersion}'\n`)
 
-console.log('  syncing package-lock.json ...')
+process.stdout.write('  syncing package-lock.json ...\n')
 execFileSync('npm', ['install', '--package-lock-only'], { cwd: repoRoot, stdio: 'inherit' })
 
-console.log(`\n${oldVersion} -> ${newVersion}. Commit, then packaging/make-release.sh will tag v${newVersion}.`)
+process.stdout.write(`\n${oldVersion} -> ${newVersion}. Commit, then packaging/make-release.sh will tag v${newVersion}.\n`)

@@ -2,6 +2,7 @@
   "name": "anas",
   "type": "module",
   "version": "0.1.1",
+  "license": "AGPL-3.0-or-later",
   "private": true,
   "description": "A NAS — Storage management GUI for Proxmox",
   "workspaces": [
