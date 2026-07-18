@@ -580,7 +580,9 @@ Detailed stories to be written when prioritized. Not MVP — but the getent seam
 
 ### Epic 16: File Backup via Proxmox Backup (experimental — needs spec/design)
 
-> As a user, I want ANAS to back up share/dataset FILE data to a Proxmox Backup Server using `proxmox-backup-client`, so my NAS data gets PBS's dedup/encryption/retention/verification without hand-rolled cron jobs.
+> As a user, I want ANAS to back up host FILE data — shares, datasets, **and any mounted drive/path** — to a Proxmox Backup Server using `proxmox-backup-client`, so my NAS data gets PBS's dedup/encryption/retention/verification without hand-rolled cron jobs.
+
+> **Scope note (operator, 2026-07-18): NOT scoped to ANAS shares/datasets.** Backup sources are paths, and a mounted non-ZFS drive is a first-class source — that's how the operator's existing cron jobs work. Implication for the source picker: offer datasets/shares as convenient entries, but accept any mounted path (surface `findmnt` mounts as candidates). Snapshot-consistency is a per-source capability, not a requirement: a ZFS-backed source gets the snapshot → backup-from-`.zfs/snapshot` → destroy treatment; a plain mounted filesystem backs up live (stated in the UI, not hidden).
 
 Captured 2026-07-16 from real-world use: the operator currently runs ad-hoc cron
 jobs invoking proxmox-backup-client (file/pxar backup of directories to a PBS
@@ -596,9 +598,12 @@ Design questions to settle before stories are written:
   does the repository config live? (Config-as-API: probably a small stanza the
   daemon owns, or reuse /etc/pve PBS storage entries read-only when present —
   a PBS storage in storage.cfg already carries server/datastore/auth.)
-- **What to back up**: per-dataset/per-share selection (mountpoint → pxar
-  archive). Snapshot-consistent backups: take a ZFS snapshot, back up from the
-  snapshot's .zfs/snapshot path, destroy after — atomicity for free.
+- **What to back up**: per-source selection where a source is a PATH — dataset,
+  share, or any mounted drive/directory (per the scope note above; mounts from
+  `findmnt` populate the picker alongside datasets/shares). ZFS-backed sources
+  get snapshot-consistent backups: take a ZFS snapshot, back up from the
+  snapshot's .zfs/snapshot path, destroy after — atomicity for free. Non-ZFS
+  sources back up live, labeled as such.
 - **Scheduling**: per the standing ruling, NO custom scheduler — generate
   systemd timer/service units (surgical, removable), status read back from
   systemd/journald.
