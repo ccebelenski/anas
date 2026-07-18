@@ -66,6 +66,21 @@ export function isPseudoFstype(fstype: string): boolean {
   return PSEUDO_FSTYPES.has(fstype)
 }
 
+/**
+ * Kernel/system mount-point roots. Anything mounted at or under these is OS
+ * plumbing, never user storage. This catches the case the fstype filter misses:
+ * a systemd `autofs` PLACEHOLDER over a pseudo-fs (e.g. `binfmt_misc` at
+ * `/proc/sys/fs/binfmt_misc`) reports fstype `autofs` — which we deliberately
+ * keep for real user automounts — so it leaks into the inventory as a spurious
+ * "armed" row on every node unless we also filter by target.
+ */
+const SYSTEM_TARGET_PREFIXES = ['/proc/', '/sys/', '/dev/', '/run/']
+
+/** Is this mount target OS plumbing (`/proc/*`, `/sys/*`, `/dev/*`, `/run/*`)? */
+export function isSystemMountTarget(target: string): boolean {
+  return SYSTEM_TARGET_PREFIXES.some(p => target.startsWith(p))
+}
+
 /** `host:/export` NFS source shape (host, then `:/`). */
 const NFS_SOURCE_RE = /^[^/]+:\//
 
