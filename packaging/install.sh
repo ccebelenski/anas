@@ -200,9 +200,15 @@ phase0_preflight() {
   command -v smbd     >/dev/null 2>&1 || warn "smbd (samba) not found — SMB shares will not work until samba is installed."
   command -v exportfs >/dev/null 2>&1 || warn "exportfs (nfs-kernel-server) not found — NFS shares will not work until nfs-kernel-server is installed."
 
-  # Port already in use?
+  # Port already in use? On an in-place upgrade the listener is our own
+  # gateway (stopped in Phase 1 before the copy) — that's routine, not a
+  # warning; only a FOREIGN listener deserves one.
   if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE "[:.]${HEALTH_PORT}[[:space:]]"; then
-    warn "something is already LISTENing on :${HEALTH_PORT} — the gateway may fail to bind."
+    if systemctl is-active --quiet anas 2>/dev/null; then
+      info "existing ANAS gateway is listening on :${HEALTH_PORT} — it will be stopped and upgraded"
+    else
+      warn "something is already LISTENing on :${HEALTH_PORT} — the gateway may fail to bind."
+    fi
   fi
 
   # Abort if any hard failure. Nothing has been mutated up to this point.
