@@ -528,15 +528,24 @@ Stories marked *(V2?)* are explicitly deferred.
 
 ## V2 Backlog
 
+> **V2 priorities (operator call, 2026-07-18): homelab first.**
+> 1. **Epic 16** (PBS file backup) — next epic; spec/design first.
+> 2. **Epic 11 + SHR** — promoted to the V2 headline: a Synology alternative. Mixed-drive-size arrays with **online expansion** matter precisely because disks are expensive — grow-as-you-buy beats forklift upgrades, and it's the thing neither ZFS nor PVE offers.
+> 3. **Epic 12** — OBE (the Ceph model already realizes it); one surviving story: version-skew checks (12.1).
+> 4. **Epic 14 + NFSv4 ACLs (4.7.1)** — deferred as enterprise features; revisit when demand appears.
+> 5. Unplaced (flagged 2026-07-18, no story yet): **scheduled snapshots + retention and scrub schedules** — TrueNAS-parity table stakes; the replication timer/task-store machinery is the template, sanoid the retention engine.
+
 ### Epic 11: md (mdadm) Storage Management
 
 > As a user, I can create and manage Linux software RAID arrays with md for environments where ZFS isn't appropriate.
+
+> **Priority: promoted 2026-07-18 (operator call) — Epic 11 + SHR are the V2 headline.** The draw is the Synology-alternative story: SHR-style mixed-size arrays and, above all, **expanding an existing array** — huge when disk prices make buy-all-drives-up-front painful. Epic 11's md basics are the prerequisite layer for SHR.
 
 md provides RAID without ZFS's memory overhead, using standard Linux filesystems (ext4, xfs). This involves managing multiple layers: mdadm arrays, filesystem creation/formatting, mount points, and /etc/fstab. The share management side (SMB, NFS) is reusable — a path is a path. The storage management UI needs parallel workflows for md vs ZFS.
 
 Detailed stories to be written when this epic is prioritized.
 
-#### SHR-style hybrid RAID (V2+ headline, far future)
+#### SHR-style hybrid RAID (V2 headline — promoted from "far future" 2026-07-18)
 
 > As a user, I want Synology-SHR-style mixed-drive-size pooling with redundancy and online growth, so I can use drives of different sizes efficiently and expand incrementally — the thing ZFS fundamentally can't do (raidz is fixed-width to the smallest disk).
 
@@ -547,21 +556,21 @@ The differentiated work (per Don't-Build-Undifferentiated: we wrap mdadm/LVM/btr
 2. **Online growth (the hard/dangerous part)** — add/replace-with-bigger drive → re-partition + `mdadm --grow` + `pvresize`/`lvextend` + `btrfs resize`, as a long-running, RESUMABLE, multi-layer job where each layer can fail independently.
 3. Degraded/recovery handling across all three layers.
 
-Real prosumer draw (mismatched-drive efficiency), but big and data-integrity-sensitive — a V2+ flagship, not near-term. Builds on the md basics above; PVE offers nothing comparable.
+Real prosumer draw (mismatched-drive efficiency), but big and data-integrity-sensitive. Builds on the md basics above; PVE offers nothing comparable. *(Promoted 2026-07-18: this is the V2 headline — the Synology-alternative feature, with online expansion as the killer capability given current disk prices. Still sequenced after Epic 16 and behind Epic 11's md basics.)*
 
 ### Epic 12: Multi-Node / Cluster Management
 
 > As a user, I can manage storage and shares across multiple Proxmox nodes from a single ANAS instance.
 
-Single pane of glass for multi-node environments. anasd's REST API becomes the building block — the same API that runs over a Unix socket locally can run over TCP/TLS to remote nodes. Each node runs anasd; one node runs anas as the central UI.
+> **Status: OBE 2026-07-18 (operator call).** The epic as written (one central anas instance, anasd over TCP/TLS to remote nodes) was superseded by the architecture V1 actually shipped — the **Ceph model**: per-node install (each node runs its own anas+anasd pair), routed front-end (the gateway forwards `/api/nodes/<node>/...` to that node's anas with the ticket, over cluster-CA TLS), cluster-wide config where it belongs (the pmxcfs remotes registry). Whatever node you connect to works, as long as it has the package — same as PVE's own Ceph panels. No central instance, no new transport. One surviving story:
 
-Proxmox has the Datacenter Manager product, but ANAS cluster management would be storage-focused and independent of it.
-
-Detailed stories to be written when this epic is prioritized.
+12.1. As a user, I want ANAS to detect **version skew** — between a node's gateway and daemon, between nodes in cross-node routing, and between the browser-cached UI (`anas.js`) and the gateway — and surface a clear warning, so that a partially-upgraded cluster tells me instead of failing strangely. *(Enabled by 10.10: every layer now reports its semver — the shared VERSION const in health/status responses, /opt/anas/VERSION on disk. Warn, don't hard-fail (homelab-friendly); a version column/badge on cross-node views and a mismatch callout is likely enough. Design when scheduled: exact comparison rule — probably warn on any difference, since the API is /v1/ and additive.)*
 
 ### Epic 14: Directory Services / External Identity (enterprise)
 
 > As an enterprise user, I can join the storage host to Active Directory or LDAP so that domain users and groups can own files and access SMB/NFS shares.
+
+> **Deferred 2026-07-18 (operator call): homelab first.** Enterprise identity isn't the current audience; NFSv4 ACLs (4.7.1) stay deferred with it — they only earn their complexity in an AD-managed shop. The Epic 8 getent seam keeps this a drop-in later; nothing else needs to be kept warm for it.
 
 Enterprise identity is nearly a requirement for real deployments — users live in AD/LDAP, not `/etc/passwd`. The key insight: PVE's AD/LDAP *realms* authenticate users to the PVE UI but do NOT make them system-resolvable for file ownership. That needs OS-level domain integration — **`realmd` + `winbind`/`sssd` + nsswitch** — which PVE has no story for. This is a genuine PVE gap and thus differentiated ANAS value.
 
