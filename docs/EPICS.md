@@ -414,26 +414,30 @@ Story numbering is for identification only, not implementation order. Within eac
 
 > As a user, I can install ANAS on my Proxmox system quickly and have it integrate automatically.
 
+> **Status (reviewed 2026-07-18): effectively shipped via `packaging/` — most stories OBE.** Distribution is a release tarball (`make-release.sh`: build → pruned prod-only node_modules → boot smoke test → `anas-<version>.tar.gz`) installed by `packaging/install.sh` (read-only preflight → transactional install with ERR-trap rollback → health check → PVE UI integration, verified). Proven on the real pve5 node. The npm-registry/CLI-subcommand framing below is superseded, not missing. Remaining work: **10.10 (semantic versioning)**; ultimately **GitHub Actions builds the release artifacts** (per the standing CI/CD decision) rather than a dev-host `make-release.sh` run.
+
 ### Stories
 
-10.1. As a user, I want to install ANAS with a single command (`npm install -g anas`), so that deployment is simple.
+10.1. [OBE 2026-07-18] As a user, I want to install ANAS with a single command (`npm install -g anas`), so that deployment is simple. *(Superseded: distribution is the release tarball + `install.sh` — an npm registry package can't carry the systemd units, PVE UI injection, or preflight. Single command achieved anyway: untar, `sudo ./install.sh`.)*
 
-10.2. As a user, I want `anas setup` to detect Proxmox, configure systemd units, set up TLS, and generate default config, so that the system is ready to use with minimal intervention.
+10.2. [OBE 2026-07-18] As a user, I want `anas setup` to detect Proxmox, configure systemd units, set up TLS, and generate default config, so that the system is ready to use with minimal intervention. *(install.sh Phase 0 preflight detects PVE node, Node ≥ 20, ZFS ≥ 2.2 for `zpool -j`, acl, samba/nfs, port collisions; Phase 1 installs units incl. TLS wiring. No default config to generate — the system is env-driven and stateless.)*
 
-10.3. As a user, I want `anas setup` to install the PVE UI integration (Epic 13's scripts), so that ANAS is accessible from the Proxmox interface after a standard install. *(Mechanism built in Epic 13; this story packages it.)*
+10.3. [OBE 2026-07-18] As a user, I want `anas setup` to install the PVE UI integration (Epic 13's scripts), so that ANAS is accessible from the Proxmox interface after a standard install. *(install.sh step 5: saves pristine `index.html.tpl.anas-orig`, runs the pve-integration installer, verifies `anas.js` + script line landed.)*
 
 10.4. [done] As a user, I want ANAS to use Proxmox TLS certificates automatically, so that I don't need to manage separate certs. *(Pulled forward: PVE marks PVEAuthCookie as Secure, so browsers withhold it from plain-HTTP ANAS — HTTPS with the host's certs is a prerequisite for auth to work at all. Implemented in the systemd unit via NITRO_SSL_CERT/KEY from /etc/pve/local, preferring pveproxy-ssl.\* like pveproxy. `anas setup` in 10.2 must install the same configuration.)*
 
-10.5. As a user, I want to override defaults (port, TLS, auth provider) via `/etc/anas/config.yaml`, so that I can customize the deployment when needed.
+10.5. [OBE 2026-07-18] As a user, I want to override defaults (port, TLS, auth provider) via `/etc/anas/config.yaml`, so that I can customize the deployment when needed. *(Deliberately not built — a yaml config layer is undifferentiated code. Overrides exist as env vars (`--prefix`, `HEALTH_PORT`, `NODE_BIN` at install; unit environment at runtime), and the standard mechanism for the rest is a systemd drop-in.)*
 
-10.6. As a user, I want to run `anas doctor` to validate my environment (Proxmox version, ZFS availability, Samba/NFS installed, TLS certs, config sanity), so that I can diagnose problems without guessing.
+10.6. [OBE 2026-07-18] As a user, I want to run `anas doctor` to validate my environment (Proxmox version, ZFS availability, Samba/NFS installed, TLS certs, config sanity), so that I can diagnose problems without guessing. *(install.sh's read-only preflight IS the doctor at install time: aborts with a clear summary of everything wrong, node untouched. A post-install runtime doctor doesn't exist; runtime problems surface through the dashboard, health endpoint, and journald. Revisit only if a real diagnosis gap shows up in the field.)*
 
-10.7. As a user, I want `anas doctor` to fix what it can automatically and clearly explain what it can't (with actionable guidance), so that I can resolve issues quickly.
+10.7. [OBE 2026-07-18] As a user, I want `anas doctor` to fix what it can automatically and clearly explain what it can't (with actionable guidance), so that I can resolve issues quickly. *(`install.sh --install-deps` is exactly this: auto-installs Node 22 via NodeSource and acl; everything it can't fix aborts preflight with actionable per-item messages.)*
 
-10.8. As a user, I want to upgrade ANAS (`npm update -g anas`) and have services restart cleanly, so that upgrades are simple and low-risk.
+10.8. [OBE 2026-07-18] As a user, I want to upgrade ANAS (`npm update -g anas`) and have services restart cleanly, so that upgrades are simple and low-risk. *(Re-running install.sh is a transactional in-place upgrade: stop → backup `/opt/anas` → install → health check → drop backup, with ERR-trap rollback restoring and restarting the previous install on any failure. Version-awareness — "upgrading X → Y", downgrade warning — lands with 10.10.)*
+
+10.10. As a dev, I want semantic versioning with a single source of truth, so that a release's tarball name, git tag, and the version the running system reports can never disagree. *(Today the version lives in five hand-synced places: root package.json, the three workspace package.jsons, and `VERSION` in `packages/shared/src/index.ts` — which is what the gateway/daemon health and status endpoints actually report; the tarball's VERSION file isn't copied into `/opt/anas`, so an installed node can't say what release it runs except via the API. Scope: root package.json is the single source; a bump script/build step syncs the workspaces and generates the shared `VERSION` const; make-release refuses a dirty tree and tags `vX.Y.Z`; install.sh stamps VERSION into the prefix and logs the from→to transition, warning on downgrade. **Ultimately GitHub Actions builds the release artifacts** — tag push `vX.Y.Z` → CI runs make-release (incl. the boot smoke test) → tarball attached to the GitHub Release; `make-release.sh` remains as the local/CI-shared build core.)*
 
 #### Dev
-10.9. As a dev, I want the `anas setup` and `anas doctor` commands implemented as CLI subcommands (not part of the web app), so that they can run before the services are started.
+10.9. [OBE 2026-07-18] As a dev, I want the `anas setup` and `anas doctor` commands implemented as CLI subcommands (not part of the web app), so that they can run before the services are started. *(Requirement was "runs before the services exist" — the bash installer satisfies it without building a CLI framework.)*
 
 ---
 
@@ -514,7 +518,7 @@ For V1 MVP, the implementation order is:
 9. **Epic 8** — Users & groups (required for share security)
 10. **Epic 9** — Jobs UI (infrastructure exists from Epic 0; this is the user-facing view)
 11. **Epic 2** — Dashboard (composes components built in 3–9; last because it depends on everything)
-12. **Epic 10** — Setup & packaging (install, setup, doctor — can develop in parallel once core features work)
+12. **Epic 10** — Setup & packaging *(effectively done 2026-07-18 via `packaging/` tarball + install.sh — see epic status note; open: 10.10 semantic versioning, then GitHub Actions release builds)*
 
 Stories marked *(V2?)* are explicitly deferred.
 
