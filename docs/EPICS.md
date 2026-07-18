@@ -531,9 +531,9 @@ Stories marked *(V2?)* are explicitly deferred.
 > **V2 priorities (operator call, 2026-07-18): homelab first.**
 > 1. **Epic 16** (PBS file backup) — next epic; spec/design first.
 > 2. **Epic 11 + SHR** — promoted to the V2 headline: a Synology alternative. Mixed-drive-size arrays with **online expansion** matter precisely because disks are expensive — grow-as-you-buy beats forklift upgrades, and it's the thing neither ZFS nor PVE offers.
-> 3. **Epic 12** — OBE (the Ceph model already realizes it); one surviving story: version-skew checks (12.1).
-> 4. **Epic 14 + NFSv4 ACLs (4.7.1)** — deferred as enterprise features; revisit when demand appears.
-> 5. Unplaced (flagged 2026-07-18, no story yet): **scheduled snapshots + retention and scrub schedules** — TrueNAS-parity table stakes; the replication timer/task-store machinery is the template, sanoid the retention engine.
+> 3. **Epic 17** (scheduled snapshots & scrubs) — inked as its own epic 2026-07-18 (it needs a new screen); TrueNAS-parity table stakes, cheap relative to value — the replication timer/task-store machinery is the template.
+> 4. **12.1** (version-skew checks) — the one Epic 12 survivor; rides early ("easy now" post-10.10, and upgrade pain compounds as versions accumulate).
+> 5. **Epic 14 + NFSv4 ACLs (4.7.1)** — deferred as enterprise features; revisit when demand appears.
 
 ### Epic 11: md (mdadm) Storage Management
 
@@ -611,3 +611,30 @@ Design questions to settle before stories are written:
   (PVE owns those), no PBS server management.
 
 Detailed stories to be written when prioritized.
+
+### Epic 17: Scheduled Snapshots & Scrubs
+
+> As a user, I can schedule automatic snapshots with retention policies and recurring pool scrubs, and manage both from one dedicated screen — so routine data protection runs unattended.
+
+> **Inked 2026-07-18 (operator call): its own epic because it needs a new screen.** One new top-level menu item (per the one-menu-per-feature rule) covering both task types — the Replication view is the idiom to follow (task grid: target, policy/cadence, last run, next run, overdue). The standing scheduling ruling applies in full: **leverage `sanoid`/`zfsutils` scrub timers/systemd — never build a scheduler.** Closes the biggest remaining TrueNAS-parity gap (Periodic Snapshot Tasks).
+
+#### Stories
+
+##### Dev (ground truth + tool decision first)
+17.1. As a dev, I want ground truth captured from a real node before any parser is written — sanoid's config format and pruning behavior, `zfsutils-linux`'s shipped scrub machinery (`zfs-scrub-monthly@.timer` templates and/or the cron.d entry PVE nodes actually carry), and what a stock PVE node already scrubs by default — so the tool decision (sanoid vs `zfs-auto-snapshot`) and the config surface are based on reality, not docs. *(Per the ground-truth-first rule. sanoid is the presumptive pick — retention policies are its core competency — but confirm packaging/behavior on PVE first.)*
+
+17.2. As a dev, I want a round-trip parser for the chosen tool's config (presumably `sanoid.conf` INI: templates + per-dataset stanzas) preserving comments/ordering/unknown directives, so schedule management is surgical config editing like smb.conf/exports. *(Config files are the API.)*
+
+##### Observe
+17.3. As a user, I want the **Schedules** screen: one grid over both snapshot schedules and scrub schedules — target (dataset/pool, recursive flag), policy summary (e.g. "24h / 30d / 12m" or "monthly scrub"), enabled state, last run/result, next run, and overdue highlighted — including schedules created outside ANAS, so I have the complete picture. *(Authoritative state from the config file + systemd timer state + ZFS reality (`zfs list -t snapshot` counts, `zpool status` scrub dates); journald is run-detail forensics only, per the replication precedent.)*
+
+##### Act
+17.4. As a user, I want to create/edit/disable/delete a snapshot schedule with a retention policy (keep N hourly/daily/weekly/monthly, recursive or not) on a dataset or pool root, so snapshots manage themselves. *(Surgical edit of the tool's config; the tool's own timer does the running.)*
+
+17.5. As a user, I want per-pool scrub schedules (weekly/monthly/custom), with ANAS recognizing and surfacing the distro/PVE default scrub rather than double-scheduling it, so pools verify themselves without me remembering. *(systemd timer units per the replication task-store pattern; guest philosophy — the existing default is surfaced and adjusted, not fought.)*
+
+##### Safety
+17.6. As a user, I want retention pruning to respect `zfs hold`s — replication's incremental bases must never be pruned out from under a chain — with skipped-by-hold snapshots surfaced (not silently retried forever), so snapshot cleanup and replication coexist. *(The known holds-vs-cleanup trap; whatever pruning tool wins 17.1 must be verified against held snapshots as part of live-proof.)*
+
+##### Dashboard
+17.7. As a user, I want only failures and overdue schedules on the dashboard (warning card, existing categories) — healthy/idle shows nothing, matching the replication policy. *(This epic multiplies the unattended tasks in the system — it strengthens the case for the deferred 9.4 notification evaluation once shipped.)*
