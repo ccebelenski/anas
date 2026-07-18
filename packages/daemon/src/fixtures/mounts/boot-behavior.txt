@@ -1,0 +1,53 @@
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+==================================================================
+ Boot behavior spot-check (story 18.1) — after reboot with a
+ nofail entry for an UNREACHABLE server (192.0.2.9) in /etc/fstab
+==================================================================
+
+### uptime
+ 20:48:38 up 0 min,  1 user,  load average: 0.23, 0.06, 0.02
+
+### systemctl is-system-running
+degraded
+
+### systemctl --failed
+● mnt-anas\x2dcifs.mount      loaded failed failed /mnt/anas-cifs
+● mnt-anas\x2dunreach.mount   loaded failed failed /mnt/anas-unreach
+● zfs-import@datapool.service loaded failed failed Import ZFS pool datapool
+(exit=0)
+
+### Did boot complete without hanging on the dead mount? (multi-user reached)
+ActiveState=active
+SubState=active
+
+### ANAS services after boot
+active
+active
+
+### The unreachable mount unit state (nofail => not failed, just not mounted)
+Result=exit-code
+LoadState=loaded
+ActiveState=failed
+SubState=failed
+
+### healthy persisted mounts came back?
+├─/mnt/anas-auto                                systemd-1                  autofs
+├─/mnttest                                      mnttest                    zfs
+│ └─/mnttest/data                               mnttest/data               zfs
+├─/etc/pve                                      /dev/fuse                  fuse
+├─/mnt/anas-nfs                                 127.0.0.1:/srv/nfs/export1 nfs4
+└─/mnt/pve/anastest-nfs                         127.0.0.1:/srv/nfs/export1 nfs4
+
+### automount re-armed after boot?
+ActiveState=active
+SubState=waiting
+{
+   "filesystems": [
+      {
+         "target": "/mnt/anas-auto",
+         "source": "systemd-1",
+         "fstype": "autofs",
+         "options": "rw,relatime,fd=58,pgrp=1,timeout=60,minproto=5,maxproto=5,direct,pipe_ino=3906"
+      }
+   ]
+}

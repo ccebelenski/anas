@@ -1,0 +1,6 @@
+PARTUUID=72b15c20-a4f1-4a48-a54e-bb8aa2c7a129 / ext4 rw,discard,errors=remount-ro,x-systemd.growfs 0 1
+PARTUUID=b472bf42-11d9-4d54-8279-96e3c24e2c18 /boot/efi vfat defaults,umask=077 0 2
+127.0.0.1:/srv/nfs/export1  /mnt/anas-nfs  nfs4  defaults,nofail  0  0
+//127.0.0.1/anastest  /mnt/anas-cifs  cifs  credentials=/etc/anas/creds/anastest.cred,vers=3.1.1,uid=1002,gid=1002,nofail  0  0
+127.0.0.1:/srv/nfs/export1  /mnt/anas-auto  nfs4  defaults,nofail,x-systemd.automount,x-systemd.idle-timeout=60  0  0
+192.0.2.9:/srv/nfs/export1  /mnt/anas-unreach  nfs4  nofail,soft,timeo=30,retrans=2,retry=0,_netdev,x-systemd.mount-timeout=20  0  0

@@ -1,0 +1,51 @@
+{
+   "filesystems": [
+      {
+         "target": "/",
+         "source": "/dev/sda1",
+         "fstype": "ext4",
+         "options": "rw,relatime,discard,errors=remount-ro",
+         "children": [
+            {
+               "target": "/boot/efi",
+               "source": "/dev/sda15",
+               "fstype": "vfat",
+               "options": "rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro"
+            },{
+               "target": "/mnt/anas-cifs",
+               "source": "//127.0.0.1/anastest",
+               "fstype": "cifs",
+               "options": "rw,relatime,vers=3.1.1,cache=strict,upcall_target=app,username=smbtest,domain=WORKGROUP,uid=1002,forceuid,gid=1002,forcegid,addr=127.0.0.1,file_mode=0755,dir_mode=0755,soft,nounix,serverino,mapposix,reparse=nfs,nativesocket,symlink=native,rsize=4194304,wsize=4194304,bsize=1048576,echo_interval=60,actimeo=1,closetimeo=1"
+            },{
+               "target": "/mnt/anas-nfs",
+               "source": "127.0.0.1:/srv/nfs/export1",
+               "fstype": "nfs4",
+               "options": "rw,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none,addr=127.0.0.1"
+            },{
+               "target": "/mnttest",
+               "source": "mnttest",
+               "fstype": "zfs",
+               "options": "rw,relatime,xattr,noacl,casesensitive",
+               "children": [
+                  {
+                     "target": "/mnttest/data",
+                     "source": "mnttest/data",
+                     "fstype": "zfs",
+                     "options": "rw,relatime,xattr,noacl,casesensitive"
+                  }
+               ]
+            },{
+               "target": "/mnt/anas-auto",
+               "source": "127.0.0.1:/srv/nfs/export1",
+               "fstype": "nfs4",
+               "options": "rw,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none,addr=127.0.0.1"
+            },{
+               "target": "/mnt/pve/anastest-nfs",
+               "source": "127.0.0.1:/srv/nfs/export1",
+               "fstype": "nfs4",
+               "options": "rw,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none,addr=127.0.0.1"
+            }
+         ]
+      }
+   ]
+}

@@ -1,0 +1,27 @@
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+### journalctl for the cifs mount unit this boot ###
+2026-07-18T20:48:14+00:00 anas-pve systemd[1]: Mounting mnt-anas\x2dcifs.mount - /mnt/anas-cifs...
+2026-07-18T20:48:14+00:00 anas-pve mount[891]: mount error(111): could not connect to 127.0.0.1Unable to find suitable address.
+2026-07-18T20:48:14+00:00 anas-pve systemd[1]: mnt-anas\x2dcifs.mount: Mount process exited, code=exited, status=32/n/a
+2026-07-18T20:48:14+00:00 anas-pve systemd[1]: mnt-anas\x2dcifs.mount: Failed with result 'exit-code'.
+2026-07-18T20:48:14+00:00 anas-pve systemd[1]: Failed to mount mnt-anas\x2dcifs.mount - /mnt/anas-cifs.
+
+### journalctl for the unreach mount unit this boot ###
+2026-07-18T20:48:15+00:00 anas-pve systemd[1]: Mounting mnt-anas\x2dunreach.mount - /mnt/anas-unreach...
+2026-07-18T20:48:24+00:00 anas-pve mount[1147]: mount.nfs4: Connection timed out for 192.0.2.9:/srv/nfs/export1 on /mnt/anas-unreach
+2026-07-18T20:48:24+00:00 anas-pve systemd[1]: mnt-anas\x2dunreach.mount: Mount process exited, code=exited, status=32/n/a
+2026-07-18T20:48:24+00:00 anas-pve systemd[1]: mnt-anas\x2dunreach.mount: Failed with result 'exit-code'.
+2026-07-18T20:48:24+00:00 anas-pve systemd[1]: Failed to mount mnt-anas\x2dunreach.mount - /mnt/anas-unreach.
+
+### smbd ready time vs mount attempt (was samba up when cifs mount ran?) ###
+ActiveEnterTimestamp=Sat 2026-07-18 20:48:14 UTC
+InactiveExitTimestamp=Sat 2026-07-18 20:48:14 UTC
+
+### dmesg cifs at boot ###
+[    4.563772] Key type cifs.spnego registered
+[    4.563782] Key type cifs.idmap registered
+[    4.563981] CIFS: enabling forceuid mount option implicitly because uid= option is specified
+[    4.563982] CIFS: enabling forcegid mount option implicitly because gid= option is specified
+[    4.563983] CIFS: Attempting to mount //127.0.0.1/anastest
+[    4.564367] CIFS: VFS: Error connecting to socket. Aborting operation.
+[    4.564369] CIFS: VFS: cifs_mount failed w/return code = -111

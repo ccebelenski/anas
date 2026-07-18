@@ -1,0 +1,10 @@
+{
+   "filesystems": [
+      {
+         "target": "/mnt/anas-cifs",
+         "source": "//127.0.0.1/anastest",
+         "fstype": "cifs",
+         "options": "rw,relatime,vers=3.1.1,cache=strict,upcall_target=app,username=smbtest,domain=WORKGROUP,uid=1002,forceuid,gid=1002,forcegid,addr=127.0.0.1,file_mode=0755,dir_mode=0755,soft,nounix,serverino,mapposix,reparse=nfs,nativesocket,symlink=native,rsize=4194304,wsize=4194304,bsize=1048576,echo_interval=60,actimeo=1,closetimeo=1"
+      }
+   ]
+}

@@ -1,0 +1,15 @@
+Where=/mnt/anas-nfs
+What=127.0.0.1:/srv/nfs/export1
+Options=rw,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none,addr=127.0.0.1
+Type=nfs4
+Id=mnt-anas\x2dnfs.mount
+Names="mnt-anas\\x2dnfs.mount"
+Requires=-.mount system.slice
+WantedBy=remote-fs.target
+After=systemd-journald.socket network-online.target system.slice network.target nfs-server.service -.mount remote-fs-pre.target
+Description=/mnt/anas-nfs
+LoadState=loaded
+ActiveState=active
+SubState=mounted
+FragmentPath=/run/systemd/generator/mnt-anas\x2dnfs.mount
+SourcePath=/etc/fstab

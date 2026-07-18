@@ -1,0 +1,10 @@
+{
+   "filesystems": [
+      {
+         "target": "/mnt/anas-auto",
+         "source": "systemd-1",
+         "fstype": "autofs",
+         "options": "rw,relatime,fd=108,pgrp=1,timeout=60,minproto=5,maxproto=5,direct,pipe_ino=27304"
+      }
+   ]
+}

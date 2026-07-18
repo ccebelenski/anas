@@ -1,0 +1,15 @@
+{
+   "filesystems": [
+      {
+         "target": "/mnt/anas-auto",
+         "source": "systemd-1",
+         "fstype": "autofs",
+         "options": "rw,relatime,fd=108,pgrp=1,timeout=60,minproto=5,maxproto=5,direct,pipe_ino=27304"
+      },{
+         "target": "/mnt/anas-auto",
+         "source": "127.0.0.1:/srv/nfs/export1",
+         "fstype": "nfs4",
+         "options": "rw,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none,addr=127.0.0.1"
+      }
+   ]
+}

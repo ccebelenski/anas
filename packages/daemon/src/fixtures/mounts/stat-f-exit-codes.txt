@@ -1,0 +1,111 @@
+Warning: Permanently added '192.168.200.50' (ED25519) to the list of known hosts.
+======================================================================
+ timeout 2 stat -f  exit-code matrix   (util-linux 2.41, kernel 7.0.14-pve)
+ Captured on stunt node 192.168.200.50 for ANAS story 18.1
+======================================================================
+
+--- HEALTHY MOUNTS (baseline) ---
+### ext4 root (healthy local)
+$ timeout 2 stat -f /
+  File: "/"
+    ID: 98f3dc154aec32f1 Namelen: 255     Type: ext2/ext3
+Block size: 4096       Fundamental block size: 4096
+Blocks: Total: 8203953    Free: 6637110    Available: 6291265
+Inodes: Total: 2088960    Free: 1993210
+EXIT=0
+
+### zfs mount (healthy local)
+$ timeout 2 stat -f /mnttest
+  File: "/mnttest"
+    ID: 6b62156d00949e02 Namelen: 255     Type: zfs
+Block size: 131072     Fundamental block size: 131072
+Blocks: Total: 767        Free: 766        Available: 766
+Inodes: Total: 196321     Free: 196314
+EXIT=0
+
+### nfs4 mount (healthy remote)
+$ timeout 2 stat -f /mnt/anas-nfs
+  File: "/mnt/anas-nfs"
+    ID: 0        Namelen: 255     Type: nfs
+Block size: 524288     Fundamental block size: 524288
+Blocks: Total: 64094      Free: 51853      Available: 49151
+Inodes: Total: 2088960    Free: 1993210
+EXIT=0
+
+### cifs mount (healthy remote)
+$ timeout 2 stat -f /mnt/anas-cifs
+  File: "/mnt/anas-cifs"
+    ID: 92dba40cf55b2215 Namelen: 255     Type: smb2
+Block size: 1024       Fundamental block size: 1024
+Blocks: Total: 32815812   Free: 25165060   Available: 25165060
+Inodes: Total: 0          Free: 0
+EXIT=0
+
+--- UNMOUNTED / MISSING ---
+### empty dir, nothing mounted (reports UNDERLYING fs, note ID matches /)
+$ timeout 2 stat -f /mnt/anas-empty
+  File: "/mnt/anas-empty"
+    ID: 98f3dc154aec32f1 Namelen: 255     Type: ext2/ext3
+Block size: 4096       Fundamental block size: 4096
+Blocks: Total: 8203953    Free: 6637109    Available: 6291264
+Inodes: Total: 2088960    Free: 1993209
+EXIT=0
+
+### nonexistent path
+$ timeout 2 stat -f /mnt/does-not-exist-xyz
+stat: cannot read file system information for '/mnt/does-not-exist-xyz': No such file or directory
+EXIT=1
+
+--- STALE (ESTALE) ---
+### ESTALE: held CWD in a subdir whose server-side inode was removed
+$ timeout 2 stat -f .
+stat: cannot read file system information for '.': Stale file handle
+EXIT=1
+
+--- DEAD SERVER (hang trap) ---
+### nfs-server STOPPED; hard mount -> stat hangs -> timeout kills it
+$ timeout 2 stat -f /mnt/anas-nfs
+EXIT=124  elapsed_ms=2004
+
+### CONTRAST while nfs-server is down: local + cifs still answer instantly
+### ext4 root (still healthy)
+$ timeout 2 stat -f /
+  File: "/"
+    ID: 98f3dc154aec32f1 Namelen: 255     Type: ext2/ext3
+Block size: 4096       Fundamental block size: 4096
+Blocks: Total: 8203953    Free: 6637111    Available: 6291266
+Inodes: Total: 2088960    Free: 1993211
+EXIT=0
+
+### cifs mount (still healthy)
+$ timeout 2 stat -f /mnt/anas-cifs
+  File: "/mnt/anas-cifs"
+    ID: 92dba40cf55b2215 Namelen: 255     Type: smb2
+Block size: 1024       Fundamental block size: 1024
+Blocks: Total: 32815812   Free: 25165064   Available: 25165064
+Inodes: Total: 0          Free: 0
+EXIT=0
+
+### findmnt still lists the dead nfs mount (reads kernel table, never touches fs):
+{
+   "filesystems": [
+      {
+         "target": "/mnt/anas-nfs",
+         "source": "127.0.0.1:/srv/nfs/export1",
+         "fstype": "nfs4",
+         "options": "rw,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,fatal_neterrors=none,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=127.0.0.1,local_lock=none,addr=127.0.0.1"
+      }
+   ]
+}
+findmnt EXIT=0
+
+--- RECOVERY ---
+### nfs4 mount after nfs-server restart (recovered)
+$ timeout 2 stat -f /mnt/anas-nfs
+  File: "/mnt/anas-nfs"
+    ID: 0        Namelen: 255     Type: nfs
+Block size: 524288     Fundamental block size: 524288
+Blocks: Total: 64094      Free: 51853      Available: 49151
+Inodes: Total: 2088960    Free: 1993210
+EXIT=0
+
