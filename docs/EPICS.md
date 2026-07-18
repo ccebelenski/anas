@@ -235,7 +235,7 @@ Story numbering is for identification only, not implementation order. Within eac
 
 4.10. [done] As a user, I want to toggle deduplication on a dataset, behind an ADVANCED, heavily-warned control that shows the dedup table's RAM cost. *(Plumbing is trivial (`zfs set dedup=`); the responsibility is the guardrails — ~1–5 GB RAM/TB, sticky on existing data. OpenZFS 2.3 fast-dedup softens it.)*
 
-4.11. [backlog] As a user, I want native at-rest encryption on datasets (aes-256-gcm), so data is protected on disk. *(Set at creation. The work is KEY MANAGEMENT: passphrase vs keyfile, load/unload, change-key — not the property itself. Possibly its own epic.)*
+4.11. [deferred 2026-07-18 — until user demand] As a user, I want native at-rest encryption on datasets (aes-256-gcm), so data is protected on disk. *(Set at creation. The work is KEY MANAGEMENT: passphrase vs keyfile, load/unload, change-key — not the property itself. Possibly its own epic. Deferral rationale: PVE's own UI manages no ZFS encryption anywhere — no encrypted ZFS-on-root install, no dataset encryption, no key handling (its only encryption toggles are Ceph OSD dmcrypt and PBS backups) — so there's no platform precedent to match; and per the guest philosophy, datasets encrypted outside ANAS coexist fine, ANAS just doesn't manage keys. Revisit when someone actually asks.)*
 
 4.12. [done, scoped] As a user, I want small tuning/maintenance actions: manual `zpool trim`, `sync`/atime toggles (with a data-loss warning on sync=disabled), and pool feature-flag `upgrade`. *(Completeness; each tiny.)*
 
