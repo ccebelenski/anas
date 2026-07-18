@@ -27,8 +27,13 @@ import { AbsolutePath } from './common.js'
 export const MountKind = z.enum(['nfs', 'cifs', 'local', 'zfs', 'bind', 'autofs', 'other'])
 export type MountKind = z.infer<typeof MountKind>
 
-/** The mount types ANAS can CREATE (act half). */
-export const MountType = z.enum(['nfs', 'cifs', 'local'])
+/**
+ * The mount types ANAS can CREATE or mutate — remote shares ONLY (operator
+ * ruling 2026-07-18): ANAS is a NAS layer, not a manager of local Linux
+ * mounts. Local filesystems appear in the inventory (observe) but the
+ * local-drive path is ZFS (later md/SHR, Epic 11) — never generic mounts.
+ */
+export const MountType = z.enum(['nfs', 'cifs'])
 export type MountType = z.infer<typeof MountType>
 
 /**
@@ -267,10 +272,6 @@ export const CreateMountRequest = z.object({
   server: z.string().optional(),
   /** NFS export path (`/srv/nfs/export1`) or CIFS share name (`anastest`). */
   remotePath: z.string().optional(),
-  /** Explicit fs_spec — a local device / `UUID=…`, or to override server/remotePath. */
-  source: z.string().optional(),
-  /** Local filesystem type (ext4/xfs/…); inferred for remote (nfs4/cifs). */
-  fstype: z.string().optional(),
   mountpoint: AbsolutePath,
   /** Write an /etc/fstab entry (default true). */
   persistent: z.boolean().default(true),

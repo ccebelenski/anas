@@ -188,11 +188,9 @@ describe('applyMountDefaults', () => {
     assert.ok(applyMountDefaults('cifs', { vers: '1.0' }, false).warnings.some(w => w.includes('1.0')))
   })
 
-  it('local mounts do not force _netdev/nosuid/nodev', () => {
-    const { options } = applyMountDefaults('local', undefined, false)
-    assert.equal(options.common.netdev, false)
-    assert.equal(options.common.nosuid, false)
-    assert.equal(options.common.nofail, true)
+  it('forces nofail on every ANAS-written entry regardless of type', () => {
+    assert.equal(applyMountDefaults('nfs', undefined, false).options.common.nofail, true)
+    assert.equal(applyMountDefaults('cifs', undefined, false).options.common.nofail, true)
   })
 })
 

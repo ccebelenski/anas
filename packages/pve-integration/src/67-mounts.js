@@ -449,20 +449,24 @@
         }
     }
 
-    // Enable/disable selection-dependent actions. PVE-managed rows are hands-off:
-    // every mutation is disabled with an explanatory tooltip (30-pools pattern).
-    // The Mount/Unmount toggle follows the selected row's state.
+    // Enable/disable selection-dependent actions. PVE-managed rows are hands-off
+    // (30-pools pattern), and so are LOCAL filesystems — ANAS mutates remote
+    // shares only (operator ruling 2026-07-18: the local-drive path is ZFS, not
+    // generic mount management; local rows are observe-only inventory).
     function updateButtons(grid) {
         var rec = selectedMount(grid);
         var has = !!rec;
         var pve = has && isPveManaged(rec);
-        var mutable = has && !pve;
+        var mutable = has && !pve && isRemoteRec(rec);
 
         setDisabled(grid, 'mountToggle', !mutable);
         setDisabled(grid, 'mountEdit', !mutable);
         setDisabled(grid, 'mountRemove', !mutable);
 
-        var tip = pve ? t('Disabled — PVE manages this mount') : '';
+        var tip = pve ? t('Disabled — PVE manages this mount')
+            : (has && !isRemoteRec(rec)
+                ? t('View only — ANAS manages remote shares; local storage is ZFS territory')
+                : '');
         btnSetTip(grid, 'mountToggle', tip);
         btnSetTip(grid, 'mountEdit', tip);
         btnSetTip(grid, 'mountRemove', tip);
@@ -480,16 +484,6 @@
         } catch (e) {
             // non-fatal
         }
-        // Edit only makes sense for a remote share (18.5); a local mount edit is
-        // Epic 18.4 territory. Keep Edit enabled for remote, disabled for local.
-        if (mutable) {
-            var remote = isRemoteRec(rec);
-            setDisabled(grid, 'mountEdit', !remote);
-            if (!remote) {
-                btnSetTip(grid, 'mountEdit', t('Editing options is available for remote shares'));
-            }
-        }
-
         // Disable/Enable (the #ANAS fstab marker) — config-level, so only
         // fstab-persisted, non-PVE rows. The button label follows the state.
         var isOff = has && ('' + rec.get('state')).toLowerCase() === 'disabled';

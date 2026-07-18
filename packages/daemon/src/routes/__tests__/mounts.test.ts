@@ -201,6 +201,27 @@ describe('mount routes (Epic 18)', () => {
     })
   })
 
+  describe('remote-only guard (local storage is ZFS territory)', () => {
+    it('rejects state/PUT/DELETE on a local fstab entry with 400', async () => {
+      await writeFile(fstabPath, `${FSTAB_FIXTURE}UUID=abcd-1234 /data ext4 defaults,nofail 0 2\n`)
+      const calls = [
+        { method: 'POST' as const, url: `/v1/mounts/${enc('/data')}/state`, payload: { action: 'unmount' } },
+        { method: 'PUT' as const, url: `/v1/mounts/${enc('/data')}`, payload: {} },
+        { method: 'DELETE' as const, url: `/v1/mounts/${enc('/data')}`, payload: undefined },
+      ]
+      for (const call of calls) {
+        const res = await server!.inject({ method: call.method, url: call.url, headers: IDENTITY_HEADERS, payload: call.payload })
+        assert.equal(res.statusCode, 400, `${call.method} ${call.url}`)
+        assert.match((res.json() as { error: { message: string } }).error.message, /remote shares only/)
+      }
+    })
+
+    it('rejects a create body with a non-remote type at the schema boundary', async () => {
+      const res = await server!.inject({ method: 'POST', url: '/v1/mounts', headers: IDENTITY_HEADERS, payload: { type: 'local', source: '/dev/sdb1', mountpoint: '/data' } })
+      assert.equal(res.statusCode, 400)
+    })
+  })
+
   describe('POST /v1/mounts/test', () => {
     it('diagnoses an unresolvable host as unreachable at the DNS stage', async () => {
       const res = await server!.inject({ method: 'POST', url: '/v1/mounts/test', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ type: 'nfs', server: 'no-such-host.invalid', remotePath: '/x' }) })

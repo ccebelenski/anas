@@ -16,6 +16,7 @@ import {
   credsFilePath,
   entryFromRequest,
   fstabHasMount,
+  isRemoteKind,
   mountpointReservedByPve,
   probeInventoryHealth,
   pveStorageFor,
@@ -97,14 +98,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (!identity)
       return
 
-    // Remote mounts need a server; local needs a source (device / UUID=).
-    if ((req.type === 'nfs' || req.type === 'cifs') && !req.server && !req.source) {
+    // Remote shares only (see rejectIfNotRemote): a mount needs its server.
+    if (!req.server) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `A ${req.type} mount requires 'server' (and 'remotePath')` } }
-    }
-    if (req.type === 'local' && !req.source) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: 'A local mount requires a device \'source\' (e.g. /dev/sdb1 or UUID=…)' } }
     }
     if (req.type === 'cifs' && !req.credentials) {
       reply.code(400)
@@ -209,6 +206,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return { error: { code: 'NOT_FOUND', message: `Mount '${mp}' is not in /etc/fstab` } }
     }
 
+    const rejectedLocal = await rejectIfNotRemote(mp, existing, reply)
+    if (rejectedLocal)
+      return rejectedLocal
+
     const merged = mergeEntry(existing, body.options, body.automount, body.extraOptions)
 
     const job = jobQueue.submit(
@@ -262,6 +263,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const fstabText = await readConfig(fstabPath)
     const entry = getMount(fstabText, mp)
     const mounted = await isMounted(mp)
+
+    const rejectedLocal = await rejectIfNotRemote(mp, entry, reply)
+    if (rejectedLocal)
+      return rejectedLocal
 
     // --- mount: bring it up (keep the fstab entry) ---
     if (action === 'mount') {
@@ -377,6 +382,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return { error: { code: 'NOT_FOUND', message: `Mount '${mp}' not found` } }
     }
 
+    const rejectedLocal = await rejectIfNotRemote(mp, entry ?? undefined, reply)
+    if (rejectedLocal)
+      return rejectedLocal
+
     let lazy = false
     if (mounted) {
       const gate = await busyGate(mp, 'mount.remove', request, reply)
@@ -464,6 +473,30 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return 'sent'
     }
     return { lazy: true } // confirmed
+  }
+
+  /**
+   * NAS-surface guard (operator ruling 2026-07-18): ANAS mutates REMOTE share
+   * mounts only. Local filesystems are observe-only — the local-drive path is
+   * ZFS (later md/SHR), not generic mount management. Returns a 400 body when
+   * the target exists and is not an NFS/CIFS mount; unknown targets fall
+   * through to the handlers' own 404s.
+   */
+  async function rejectIfNotRemote(
+    mountpoint: string,
+    entry: { fstype: string, spec: string } | undefined,
+    reply: FastifyReply,
+  ): Promise<object | undefined> {
+    let kind: string | undefined = entry ? classifyKind(entry.fstype, entry.spec) : undefined
+    if (kind === undefined) {
+      const findmntText = await readFindmnt(executor)
+      kind = buildBaseInventory(findmntText, '', new Map()).find(r => r.mountpoint === mountpoint)?.type
+    }
+    if (kind !== undefined && !isRemoteKind(kind)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mountpoint}' is a local filesystem — ANAS manages remote shares only (local storage is ZFS territory)` } }
+    }
+    return undefined
   }
 
   /** Reject a mutation on a PVE-owned mount (hands-off). Returns a body to send. */

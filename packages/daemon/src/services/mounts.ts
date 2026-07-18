@@ -363,23 +363,15 @@ export function cleanMountStderr(stderr: string): string {
 // ============================================================================
 
 /** The remote fstype ANAS writes for a given mount type. */
-export function fstypeForType(type: MountType, requested?: string): string {
-  if (type === 'nfs')
-    return 'nfs4'
-  if (type === 'cifs')
-    return 'cifs'
-  return requested && requested.trim() ? requested.trim() : 'auto'
+export function fstypeForType(type: MountType): string {
+  return type === 'nfs' ? 'nfs4' : 'cifs'
 }
 
 /** Build the fs_spec for a create/test request. */
-export function buildSpec(type: MountType, req: { server?: string, remotePath?: string, source?: string }): string {
-  if (req.source && req.source.trim())
-    return req.source.trim()
+export function buildSpec(type: MountType, req: { server?: string, remotePath?: string }): string {
   if (type === 'nfs')
     return `${req.server ?? ''}:${req.remotePath ?? '/'}`
-  if (type === 'cifs')
-    return `//${req.server ?? ''}/${req.remotePath ?? ''}`
-  return req.source ?? ''
+  return `//${req.server ?? ''}/${req.remotePath ?? ''}`
 }
 
 /**
@@ -787,7 +779,7 @@ export function entryFromRequest(
   const entry: MountEntry = {
     spec: buildSpec(req.type, req),
     mountpoint: req.mountpoint,
-    fstype: fstypeForType(req.type, req.fstype),
+    fstype: fstypeForType(req.type),
     options,
     dump: 0,
     pass: 0,
