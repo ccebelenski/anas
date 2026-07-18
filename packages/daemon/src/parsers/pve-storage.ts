@@ -306,3 +306,60 @@ export async function readZfsMountpoints(): Promise<ZfsMountpoint[]> {
     return []
   }
 }
+
+/**
+ * Parse storage.cfg into a map `absolute-mount-path -> storage id` for the
+ * Mounts inventory's HANDS-OFF tagging (Epic 18). A PVE `nfs`/`cifs` storage
+ * lands its mount at `path /mnt/pve/<id>` and shows in findmnt as an ordinary
+ * remote mount — the ONLY way to recognise it is to cross-reference this file
+ * (NOTES §3; never shell `pvesm status`). We collect the `path` of every
+ * remote/dir storage and the `mountpoint` of every zfspool storage; the caller
+ * matches a findmnt target against these paths (and the `/mnt/pve/` prefix).
+ *
+ * Pure and total: commented-out lines are skipped, malformed input yields an
+ * empty map, never throws.
+ */
+export function parsePveMountPaths(text: string): Map<string, string> {
+  const byPath = new Map<string, string>()
+  let id: string | null = null
+
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.replace(TRAILING_CR_RE, '')
+    const trimmed = line.trim()
+    if (trimmed === '' || trimmed.startsWith('#'))
+      continue
+
+    const header = HEADER_RE.exec(line)
+    if (header) {
+      id = header[2]
+      continue
+    }
+    if (!id)
+      continue
+    const kv = KEY_VALUE_RE.exec(trimmed)
+    if (!kv)
+      continue
+    const [, key, value] = kv
+    // `path` (dir/nfs/cifs storages) and `mountpoint` (zfspool) both name an
+    // absolute filesystem path PVE owns.
+    if ((key === 'path' || key === 'mountpoint') && value.trim().startsWith('/'))
+      byPath.set(stripTrailingSlash(value.trim()), id)
+  }
+  return byPath
+}
+
+/**
+ * Read storage.cfg and return the PVE-owned mount-path → storage-id map,
+ * FAIL-OPEN (missing file / parse error → empty map, never throws). Path is
+ * overridable for tests.
+ */
+export async function readPveMountPaths(path: string = PVE_STORAGE_CFG): Promise<Map<string, string>> {
+  try {
+    return parsePveMountPaths(await readFile(path, 'utf8'))
+  }
+  catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+      console.warn(`anasd: could not read ${path} for PVE mount tagging:`, err)
+    return new Map()
+  }
+}

@@ -31,6 +31,7 @@ import { nodeToIoStats, parseZpoolIostat } from '../parsers/zpool-iostat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 import { readConfig } from '../services/config-writer.js'
+import { collectMountWarnings } from '../services/mounts.js'
 import { buildReplicationWarnings, collectTaskStatuses } from '../services/replication-units.js'
 import { collectDisks } from './disks.js'
 import { pathExists } from './shares-smb.js'
@@ -63,20 +64,25 @@ export async function dashboardRoutes(
     exportsPath: string
     /** systemd unit dir — replication task store, for failure warnings (5.5.3). */
     systemdDir: string
+    /** /etc/fstab location — for failing-mount warnings (Epic 18). */
+    fstabPath: string
+    /** storage.cfg location for read-only PVE tagging (undefined = default). */
+    storagePath?: string
   },
 ) {
-  const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir } = opts
+  const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath } = opts
 
   // --- GET /v1/status ------------------------------------------------------
   server.get('/status', async () => {
     // Each block is independently fail-open so one failing source (e.g. no ZFS)
     // never blanks the rest of the dashboard.
-    const [poolStatus, diskHealth, shares, jobs, replicationWarnings] = await Promise.all([
+    const [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings] = await Promise.all([
       collectPoolStatus(),
       collectDiskHealth(),
       collectShareStatus(),
       collectJobs(),
       collectReplicationWarnings(),
+      collectMountWarnings(executor, { fstabPath, storagePath }),
     ])
 
     const summary: StatusSummary = {
@@ -87,7 +93,7 @@ export async function dashboardRoutes(
       jobs,
       // Pool/disk warnings, stale-share warnings (same smb.conf/exports parse
       // collectShareStatus already ran), plus failed-replication-task warnings.
-      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings],
+      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings],
     }
     return { data: summary }
   })
