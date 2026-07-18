@@ -7,7 +7,7 @@
  */
 
 import type { Dataset, DatasetProperties, Snapshot } from '@anas/shared'
-import { parseDedupRatio, parseHumanSize, parseZfsBool, parseZfsDate } from './utils.js'
+import { parseDedupRatio, parseHumanSize, parseZfsBool, parseZfsDate, parseZfsJson } from './utils.js'
 
 interface ZfsPropertyRaw {
   value: string
@@ -84,7 +84,7 @@ function datasetKind(rawType: string): 'filesystem' | 'volume' | null {
  * the tree from these by splitting names on '/'.
  */
 export function parseZfsList(json: string | ZfsListOutput): Dataset[] {
-  const data: ZfsListOutput = typeof json === 'string' ? JSON.parse(json) : json
+  const data: ZfsListOutput = parseZfsJson(json, { datasets: {} })
   const result: Dataset[] = []
 
   for (const ds of Object.values(data.datasets)) {
@@ -112,7 +112,7 @@ export function parseZfsList(json: string | ZfsListOutput): Dataset[] {
 
 /** Snapshot names from a `zfs list -t snapshot` output. */
 export function parseSnapshotNames(json: string | ZfsListOutput): string[] {
-  const data: ZfsListOutput = typeof json === 'string' ? JSON.parse(json) : json
+  const data: ZfsListOutput = parseZfsJson(json, { datasets: {} })
   return Object.values(data.datasets)
     .filter(ds => ds.type.toLowerCase() === 'snapshot')
     .map(ds => ds.name)
@@ -126,7 +126,7 @@ export function parseSnapshotNames(json: string | ZfsListOutput): string[] {
  * when a creation string fails to parse).
  */
 export function parseSnapshotList(json: string | ZfsListOutput): Snapshot[] {
-  const data: ZfsListOutput = typeof json === 'string' ? JSON.parse(json) : json
+  const data: ZfsListOutput = parseZfsJson(json, { datasets: {} })
   const result: (Snapshot & { _createtxg: number })[] = []
 
   for (const ds of Object.values(data.datasets)) {
@@ -176,7 +176,7 @@ export function parseDatasetGet(
   json: string | ZfsListOutput,
   datasetName: string,
 ): { base: Dataset, properties: DatasetProperties } | null {
-  const data: ZfsListOutput = typeof json === 'string' ? JSON.parse(json) : json
+  const data: ZfsListOutput = parseZfsJson(json, { datasets: {} })
   const ds = data.datasets[datasetName]
   if (!ds)
     return null

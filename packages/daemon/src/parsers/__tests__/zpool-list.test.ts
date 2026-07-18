@@ -46,3 +46,12 @@ describe('parseZpoolList', () => {
     assert.equal(typeof pool.dedupRatio, 'number')
   })
 })
+
+// Ground truth (stunt node, 2026-07-18): with zero pools, `zpool list -j`
+// prints NOTHING (empty stdout, exit 0). A fresh node must not 500.
+describe('parseZpoolList with no pools', () => {
+  it('returns [] for empty stdout', () => {
+    assert.deepEqual(parseZpoolList(''), [])
+    assert.deepEqual(parseZpoolList('\n'), [])
+  })
+})

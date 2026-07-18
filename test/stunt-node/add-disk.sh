@@ -36,8 +36,19 @@ if [ ! -f "$DISK_PATH" ]; then
   qemu-img create -f qcow2 "$DISK_PATH" "${SIZE_MB}M"
 fi
 
-# QEMU runs as 'qemu' user — needs read/write access
-chmod 666 "$DISK_PATH"
+# QEMU runs as 'qemu' user — needs read/write access. Skip when the mode is
+# already open: libvirt chowns attached images to qemu, after which even a
+# no-op chmod fails on ownership for the invoking user.
+if [ "$(stat -c %a "$DISK_PATH")" != "666" ]; then
+  chmod 666 "$DISK_PATH"
+fi
+
+# Idempotent: skip when this image is already attached to the VM (re-running
+# setup-test-data after a partial failure must not error on the attach).
+if sudo virsh domblklist "$VM_NAME" 2>/dev/null | grep -qF "$DISK_PATH"; then
+  echo "✓ hot${DISK_NUM} already attached (skipping)"
+  exit 0
+fi
 
 if [ "$BUS" = "nvme" ]; then
   # NVMe requires QEMU device passthrough — libvirt doesn't support

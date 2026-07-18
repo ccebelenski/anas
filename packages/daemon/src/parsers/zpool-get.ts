@@ -4,7 +4,7 @@
  */
 
 import type { PoolProperties } from '@anas/shared'
-import { parseIntOrZero, parseZfsBool } from './utils.js'
+import { parseIntOrZero, parseZfsBool, parseZfsJson } from './utils.js'
 
 interface ZfsPropertyRaw {
   value: string
@@ -30,7 +30,7 @@ export function parseZpoolGet(
   poolName: string,
   includeAll = false,
 ): PoolProperties | null {
-  const data: ZpoolGetOutput = typeof json === 'string' ? JSON.parse(json) : json
+  const data: ZpoolGetOutput = parseZfsJson(json, { pools: {} })
   const pool = data.pools[poolName]
   if (!pool)
     return null

@@ -4,7 +4,7 @@
  */
 
 import type { PoolSummary } from '@anas/shared'
-import { parseDedupRatio, parseHumanSize, parsePercent } from './utils.js'
+import { parseDedupRatio, parseHumanSize, parsePercent, parseZfsJson } from './utils.js'
 
 interface ZfsPropertyRaw {
   value: string
@@ -26,7 +26,7 @@ interface ZpoolListOutput {
  * Note: This provides size/capacity data. State and health come from zpool-status parser.
  */
 export function parseZpoolList(json: string | ZpoolListOutput): Omit<PoolSummary, 'scanRunning' | 'scanFunction' | 'trimSupported' | 'upgradeAvailable' | 'health' | 'pveStorages'>[] {
-  const data: ZpoolListOutput = typeof json === 'string' ? JSON.parse(json) : json
+  const data: ZpoolListOutput = parseZfsJson(json, { pools: {} })
   return Object.values(data.pools).map((pool) => {
     const prop = (name: string) => pool.properties[name]?.value ?? '-'
 

@@ -4,7 +4,7 @@
  */
 
 import type { PoolDisk, PoolHealthMessage, PoolState, ScanStatus, Vdev, VdevGroup, VdevRole, VdevState, VdevType } from '@anas/shared'
-import { parseHumanSize, parseIntOrZero, parseZfsDate } from './utils.js'
+import { parseHumanSize, parseIntOrZero, parseZfsDate, parseZfsJson } from './utils.js'
 
 /** Raw ZFS JSON types (what `zpool status -j` actually returns) */
 interface ZfsVdevRaw {
@@ -76,7 +76,7 @@ export interface ParsedPoolStatus {
  * Parse `zpool status -jv` JSON output for all pools.
  */
 export function parseZpoolStatus(json: string | ZpoolStatusOutput): ParsedPoolStatus[] {
-  const data: ZpoolStatusOutput = typeof json === 'string' ? JSON.parse(json) : json
+  const data: ZpoolStatusOutput = parseZfsJson(json, { pools: {} })
   return Object.values(data.pools).map(parsePool)
 }
 
@@ -84,7 +84,7 @@ export function parseZpoolStatus(json: string | ZpoolStatusOutput): ParsedPoolSt
  * Parse a single pool from `zpool status -jv` output.
  */
 export function parseZpoolStatusPool(json: string | ZpoolStatusOutput, poolName: string): ParsedPoolStatus | null {
-  const data: ZpoolStatusOutput = typeof json === 'string' ? JSON.parse(json) : json
+  const data: ZpoolStatusOutput = parseZfsJson(json, { pools: {} })
   const pool = data.pools[poolName]
   if (!pool)
     return null

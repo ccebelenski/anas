@@ -89,3 +89,17 @@ export function parseZfsDate(str: string): string | null {
 export function parseZfsBool(str: string): boolean {
   return str === 'on'
 }
+
+/**
+ * Parse ZFS-family `-j` JSON output, tolerating EMPTY stdout. Ground truth
+ * (stunt node, 2026-07-18): with zero pools, `zpool list -j` prints NOTHING —
+ * empty stdout, exit 0 — and the same holds family-wide for empty result
+ * sets. A fresh node with no pools yet is a legitimate state, not an error:
+ * blank input yields `empty` instead of a JSON.parse crash.
+ */
+export function parseZfsJson<T>(json: string | T, empty: T): T {
+  if (typeof json !== 'string')
+    return json
+  const text = json.trim()
+  return text === '' ? empty : JSON.parse(text) as T
+}

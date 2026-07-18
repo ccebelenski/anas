@@ -133,3 +133,11 @@ describe('parseDatasetGet', () => {
     assert.equal(parsed, null)
   })
 })
+
+// Empty-stdout family behavior (see zpool-list.test.ts): zero pools/datasets
+// ⇒ the -j commands print nothing. Must parse to empty, not crash.
+describe('empty stdout (no pools on the node)', () => {
+  it('parseZfsList returns []', () => {
+    assert.deepEqual(parseZfsList(''), [])
+  })
+})
