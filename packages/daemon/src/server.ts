@@ -102,6 +102,10 @@ export function createServer(opts?: ServerOptions) {
     ? {
         registryFile: join(tmpdir(), `anas-mock-backup-repos-${process.pid}.json`),
         credsDir: join(tmpdir(), `anas-mock-backup-creds-${process.pid}`),
+        // Tier-1 PVE repos: read-only. In mock, point at non-existent temp paths
+        // so detection fail-opens to empty and never touches the host's /etc/pve.
+        pveStorageCfg: join(tmpdir(), `anas-mock-storage-${process.pid}.cfg`),
+        pvePrivStorageDir: join(tmpdir(), `anas-mock-priv-storage-${process.pid}`),
       }
     : defaultBackupReposPaths()
 

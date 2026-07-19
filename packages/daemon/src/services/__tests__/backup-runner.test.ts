@@ -124,6 +124,18 @@ describe('backup runner — env + argv assembly (Epic 16, NOTES §1)', () => {
     assert.ok(args.includes('--backup-id'))
   })
 
+  it('an explicit effective namespace overrides / supplies --ns (repo fallback path)', () => {
+    // A task with no namespace but a repo that carries one → the resolved
+    // effective namespace is passed and emitted (zero re-entry, Epic 16.8).
+    const args = buildBackupArgs(makeTask({ namespace: undefined }), 'anastest')
+    const i = args.indexOf('--ns')
+    assert.ok(i >= 0 && args[i + 1] === 'anastest')
+    // An explicit namespace also overrides the task's own.
+    const overridden = buildBackupArgs(makeTask({ namespace: 'task-ns' }), 'repo-ns')
+    const j = overridden.indexOf('--ns')
+    assert.equal(overridden[j + 1], 'repo-ns')
+  })
+
   it('probe argv is snapshot list [--ns] --output-format json', () => {
     assert.deepEqual(buildProbeArgs('anastest'), ['snapshot', 'list', '--ns', 'anastest', '--output-format', 'json'])
     assert.deepEqual(buildProbeArgs(), ['snapshot', 'list', '--output-format', 'json'])

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { parsePveStorageCfg, parseZfsMountpoints, readPveStorages } from '../pve-storage.js'
+import { parsePbsStorages, parsePveStorageCfg, parseZfsMountpoints, readPbsStorages, readPveStorages } from '../pve-storage.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/pve')
@@ -169,6 +169,76 @@ describe('parseZfsMountpoints', () => {
 
   it('returns an empty array for empty input', () => {
     assert.deepEqual(parseZfsMountpoints(''), [])
+  })
+})
+
+describe('parsePbsStorages (Epic 16.8: tier-1 PVE-defined repos)', () => {
+  it('parses every pbs stanza from the real captured storage.cfg fixture', () => {
+    const defs = parsePbsStorages(loadFixture('storage-pbs.cfg'))
+    assert.deepEqual(defs.map(d => d.id), ['anastest-pw', 'anastest-tok', 'anastest-port'])
+    // password-auth entry with a namespace, no explicit port.
+    assert.deepEqual(defs[0], {
+      id: 'anastest-pw',
+      server: '127.0.0.1',
+      datastore: 'anastest-store',
+      fingerprint: 'cc:b8:a0:35:60:b9:5f:77:10:e8:c2:62:ce:1e:dd:08:b8:03:0a:82:f7:62:09:bf:e8:f5:44:7e:8b:3e:2c:1d',
+      namespace: 'anastest',
+      username: 'root@pam',
+    })
+  })
+
+  it('preserves a token username (the !tokenname suffix is the auth discriminator)', () => {
+    const tok = parsePbsStorages(loadFixture('storage-pbs.cfg')).find(d => d.id === 'anastest-tok')!
+    assert.equal(tok.username, 'root@pam!anas-test')
+    assert.equal(tok.namespace, undefined) // no namespace line → undefined
+    assert.equal(tok.port, undefined)
+  })
+
+  it('parses an explicit non-default port as a number', () => {
+    const p = parsePbsStorages(loadFixture('storage-pbs.cfg')).find(d => d.id === 'anastest-port')!
+    assert.equal(p.port, 8007)
+    assert.equal(typeof p.port, 'number')
+  })
+
+  it('ignores non-pbs stanzas (zfspool / dir) entirely', () => {
+    const defs = parsePbsStorages(loadFixture('storage-pbs.cfg'))
+    assert.equal(defs.length, 3) // datapool + local are not counted
+  })
+
+  it('skips a pbs stanza missing server or datastore (unusable)', () => {
+    assert.equal(parsePbsStorages('pbs: broken\n\tusername root@pam\n').length, 0)
+    assert.equal(parsePbsStorages('pbs: nods\n\tserver 10.0.0.1\n').length, 0)
+    assert.equal(parsePbsStorages('pbs: nosrv\n\tdatastore ds\n').length, 0)
+  })
+
+  it('ignores a commented-out pbs stanza', () => {
+    const text = '#pbs: ghost\n#\tserver 10.0.0.1\n#\tdatastore ds\n'
+    assert.equal(parsePbsStorages(text).length, 0)
+  })
+
+  it('parses a final stanza with no trailing blank line', () => {
+    const text = 'pbs: last\n\tserver 10.0.0.1\n\tdatastore ds'
+    assert.equal(parsePbsStorages(text)[0].id, 'last')
+  })
+
+  it('drops an out-of-range port rather than emitting garbage', () => {
+    const text = 'pbs: p\n\tserver h\n\tdatastore d\n\tport 99999\n'
+    assert.equal(parsePbsStorages(text)[0].port, undefined)
+  })
+
+  it('returns an empty array for empty input', () => {
+    assert.deepEqual(parsePbsStorages(''), [])
+  })
+})
+
+describe('readPbsStorages (fail-open)', () => {
+  it('reads and parses the pbs stanzas from a real fixture file', async () => {
+    const defs = await readPbsStorages(join(fixturesDir, 'storage-pbs.cfg'))
+    assert.deepEqual(defs.map(d => d.id), ['anastest-pw', 'anastest-tok', 'anastest-port'])
+  })
+
+  it('returns an empty array when the file is missing (non-PVE host)', async () => {
+    assert.deepEqual(await readPbsStorages(join(fixturesDir, 'nope.cfg')), [])
   })
 })
 

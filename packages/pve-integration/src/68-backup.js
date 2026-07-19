@@ -452,8 +452,20 @@
             username: first(r.username, r.user) || '',
             credentialsSet: first(r.credentialsSet, r.credsSet) === true,
             fingerprint: first(r.fingerprint, r.certFingerprint) || '',
+            // Tier: 'pve' = auto-discovered from storage.cfg (hands-off), else
+            // 'anas' = registered. Drives the PVE badge + edit/delete lock-out.
+            source: ('' + (first(r.source) || 'anas')).toLowerCase(),
             raw: r,
         };
+    }
+
+    // A tier-1 (PVE-defined) repo is hands-off: managed in Datacenter → Storage.
+    function isPveRepo(rec) {
+        try {
+            return rec && ('' + (rec.get ? rec.get('source') : rec.source)) === 'pve';
+        } catch (e) {
+            return false;
+        }
     }
 
     // Refresh REPO_MAP (name → {datastore,host,port}); returns the repos envelope.
@@ -485,6 +497,10 @@
                     continue;
                 }
                 var label = r.datastore ? (r.name + '  (' + r.datastore + ')') : r.name;
+                // Badge tier-1 PVE-defined repos so the picker distinguishes them.
+                if (('' + (r.source || 'anas')).toLowerCase() === 'pve') {
+                    label += '  — ' + t('PVE');
+                }
                 opts.push({ name: r.name, label: label });
             }
             return opts;
@@ -1518,16 +1534,42 @@
         return repoTestChip(rec.get('testStage'));
     }
 
+    // Name cell: the repo name, with a PVE badge for a tier-1 (hands-off) repo.
+    function renderRepoName(v, meta, rec) {
+        var name = '' + (v == null ? '' : v);
+        var cell = '<span title="' + enc(name) + '">' + enc(name) + '</span>';
+        if (isPveRepo(rec)) {
+            cell += ' <span class="anas-badge-pve" title="'
+                + enc(t('Defined by Proxmox in storage.cfg — manage it in Datacenter → Storage. '
+                    + 'ANAS uses it read-only and reads its credential only when running or testing.'))
+                + '" style="display:inline-block;padding:0 6px;border-radius:8px;font-size:0.78em;'
+                + 'color:var(--anas-accent,#3468c0);'
+                + 'background:color-mix(in srgb,var(--anas-accent,#3468c0) 15%,transparent);">'
+                + enc(t('PVE')) + '</span>';
+        }
+        return cell;
+    }
+
     function updateRepoButtons(grid) {
         if (!grid) {
             return;
         }
-        var has = !!selectedRepo(grid);
-        var ids = ['repoEdit', 'repoTest', 'repoDelete'];
-        for (var i = 0; i < ids.length; i++) {
-            var btn = grid.down('#' + ids[i]);
-            if (btn) { btn.setDisabled(!has); }
-        }
+        var rec = selectedRepo(grid);
+        var has = !!rec;
+        var pve = isPveRepo(rec);
+        // Test works for every repo; Edit/Delete are locked out on a PVE repo
+        // (hands-off — ANAS never writes storage.cfg or the .pw file).
+        var setBtn = function (id, disabled, tip) {
+            var btn = grid.down('#' + id);
+            if (!btn) { return; }
+            btn.setDisabled(disabled);
+            try { btn.setTooltip(tip || ''); } catch (e) { /* non-fatal */ }
+        };
+        var handsOff = t('This repository is defined by Proxmox (storage.cfg) — '
+            + 'edit it in Datacenter → Storage.');
+        setBtn('repoTest', !has, '');
+        setBtn('repoEdit', !has || pve, pve ? handsOff : '');
+        setBtn('repoDelete', !has || pve, pve ? handsOff : '');
     }
 
     function reloadRepos(win, node) {
@@ -1656,7 +1698,7 @@
     function openReposManager(node) {
         var store = Ext.create('Ext.data.Store', {
             fields: ['name', 'host', 'port', 'datastore', 'namespace', 'authType',
-                'tokenId', 'username', 'fingerprint',
+                'tokenId', 'username', 'fingerprint', 'source',
                 { name: 'credentialsSet', type: 'auto' },
                 'testStage', { name: 'raw', type: 'auto' }],
             data: [],
@@ -1682,7 +1724,7 @@
                     selModel: { mode: 'SINGLE' },
                     emptyText: t('No repositories registered'),
                     columns: [
-                        { text: t('Name'), dataIndex: 'name', width: 130, renderer: Ext.String.htmlEncode },
+                        { text: t('Name'), dataIndex: 'name', width: 160, renderer: renderRepoName },
                         { text: t('Host:Port'), dataIndex: 'host', width: 190,
                             sortable: false, menuDisabled: true, renderer: renderRepoEndpoint },
                         { text: t('Datastore'), dataIndex: 'datastore', width: 160,
@@ -1739,6 +1781,12 @@
                             updateRepoButtons(this);
                         },
                         itemdblclick: function (grid, rec) {
+                            // A PVE-defined repo is hands-off — double-click can't edit it.
+                            if (isPveRepo(rec)) {
+                                ANAS.toast(t('This repository is defined by Proxmox (storage.cfg) — '
+                                    + 'edit it in Datacenter → Storage.'));
+                                return;
+                            }
                             openRepoEdit(node, win, rec ? (rec.get('raw') || rec.getData()) : null);
                         },
                     },

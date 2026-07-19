@@ -17,8 +17,15 @@ import {
   BackupTaskRequest,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
+import { readPbsStorages } from '../parsers/pve-storage.js'
 import {
+  isPveRepoName,
+  pbsDefToRepo,
+  pveRepoName,
+  pveSecretSet,
+  pveStorageId,
   readBackupRepos,
+  readPveSecret,
   readRepoSecret,
   removeRepoSecret,
   repoSecretSet,
@@ -92,16 +99,77 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   //  Repositories
   // ==========================================================================
 
-  /** The response shape for one repo (adds `credentialsSet`; never the secret). */
+  /** A tier-2 (ANAS-registered) repo response (adds `credentialsSet`, source). */
   async function toRepoResponse(repo: BackupRepo): Promise<BackupRepoResponse> {
-    return { ...repo, credentialsSet: await repoSecretSet(paths.credsDir, repo.name) }
+    return { ...repo, credentialsSet: await repoSecretSet(paths.credsDir, repo.name), source: 'anas' }
+  }
+
+  /**
+   * The tier-1 (PVE-defined) repositories: every `pbs` stanza in storage.cfg,
+   * mapped to the repo response shape as `pve:<id>` with `source: 'pve'` and
+   * `credentialsSet` reflecting whether the `.pw` file exists. Read-only; the
+   * secret itself is NEVER read here (only at exec/test time). FAIL-OPEN.
+   */
+  async function pveRepoResponses(): Promise<BackupRepoResponse[]> {
+    const defs = await readPbsStorages(paths.pveStorageCfg)
+    return Promise.all(defs.map(async (def): Promise<BackupRepoResponse> => ({
+      ...pbsDefToRepo(def),
+      credentialsSet: await pveSecretSet(paths.pvePrivStorageDir, def.id),
+      source: 'pve',
+    })))
+  }
+
+  /**
+   * Resolve a repo REFERENCE (tier-2 name or `pve:<id>`) to its runtime repo +
+   * secret, reading the secret FRESH at call time. Returns null when the repo
+   * does not exist. A tier-1 secret comes from /etc/pve/priv/storage/<id>.pw;
+   * a tier-2 secret from /etc/anas/creds — neither is cached.
+   */
+  async function resolveRepoAndSecret(
+    name: string,
+  ): Promise<{ repo: BackupRepo, secret: string | null } | null> {
+    if (isPveRepoName(name)) {
+      const id = pveStorageId(name)
+      const def = (await readPbsStorages(paths.pveStorageCfg)).find(d => d.id === id)
+      if (!def)
+        return null
+      return { repo: pbsDefToRepo(def), secret: await readPveSecret(paths.pvePrivStorageDir, id) }
+    }
+    const found = (await readBackupRepos(paths)).repos.find(r => r.name === name)
+    if (!found)
+      return null
+    return { repo: found, secret: await readRepoSecret(paths.credsDir, name) }
+  }
+
+  /**
+   * The merged repo list used only to JOIN a task's datastore for the view
+   * (tier-2 registry + tier-1 PVE storages). The runner resolves its own repo +
+   * secret separately (resolveRepoAndSecret).
+   */
+  async function reposForJoin(registered: BackupRepo[]): Promise<BackupRepo[]> {
+    const defs = await readPbsStorages(paths.pveStorageCfg)
+    return [...registered, ...defs.map(pbsDefToRepo)]
+  }
+
+  /** 400 body for a mutation attempted on a hands-off PVE-defined repository. */
+  function pveHandsOff(name: string) {
+    return {
+      error: {
+        code: 'PVE_MANAGED',
+        message: `Repository '${name}' is defined by Proxmox in storage.cfg — manage it in `
+          + 'Datacenter → Storage. ANAS never writes storage.cfg or the credential file.',
+      },
+    }
   }
 
   // --- GET /backup/repos ----------------------------------------------------
   server.get('/backup/repos', async () => {
     const reg = await readBackupRepos(paths)
-    const repos = await Promise.all(reg.repos.map(toRepoResponse))
-    return { data: { version: reg.version, repos } }
+    const [registered, pve] = await Promise.all([
+      Promise.all(reg.repos.map(toRepoResponse)),
+      pveRepoResponses(),
+    ])
+    return { data: { version: reg.version, repos: [...registered, ...pve] } }
   })
 
   // --- POST /backup/repos — register (CAS) ----------------------------------
@@ -153,6 +221,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
   // --- PUT /backup/repos/:name — update / rotate (CAS) ----------------------
   server.put<{ Params: { name: string } }>('/backup/repos/:name', async (request, reply) => {
+    // Tier-1 PVE repos are hands-off — reject BEFORE the BackupName parse (a
+    // `pve:<id>` name would otherwise fail with a cryptic validation error).
+    if (isPveRepoName(request.params.name)) {
+      reply.code(400)
+      return pveHandsOff(request.params.name)
+    }
     const nameParsed = BackupName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
@@ -225,6 +299,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   server.delete<{ Params: { name: string }, Querystring: { expectedVersion?: string } }>(
     '/backup/repos/:name',
     async (request, reply) => {
+      // Tier-1 PVE repos cannot be unregistered — they live in storage.cfg.
+      if (isPveRepoName(request.params.name)) {
+        reply.code(400)
+        return pveHandsOff(request.params.name)
+      }
       const nameParsed = BackupName.safeParse(request.params.name)
       if (!nameParsed.success) {
         reply.code(400)
@@ -294,19 +373,19 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     if (!identity)
       return
 
-    // Resolve to a repo-like target + secret: a registered repo (by name, stored
-    // secret) OR an inline config (from the dialog, with its secret).
+    // Resolve to a repo-like target + secret: a registered repo OR a tier-1
+    // PVE-defined repo (both by name, secret loaded fresh) OR an inline config
+    // (from the dialog, with its secret).
     let repo: BackupRepo
     let secret: string | null
     if (!req.host && req.name) {
-      const reg = await readBackupRepos(paths)
-      const found = reg.repos.find(r => r.name === req.name)
-      if (!found) {
+      const resolved = await resolveRepoAndSecret(req.name)
+      if (!resolved) {
         reply.code(404)
         return { error: { code: 'NOT_FOUND', message: `Repository '${req.name}' not found` } }
       }
-      repo = found
-      secret = await readRepoSecret(paths.credsDir, found.name)
+      repo = resolved.repo
+      secret = resolved.secret
     }
     else {
       if (!req.host || !req.datastore || !req.authType) {
@@ -382,8 +461,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
   /**
    * Create/update guards: the schedule must be valid systemd calendar syntax and
-   * the referenced repository must be registered. Sends the 4xx and returns
-   * false on the first failure.
+   * the referenced repository must exist — as a tier-2 registered repo OR a
+   * tier-1 PVE-defined repo (`pve:<id>`). Sends the 4xx and returns false on the
+   * first failure.
    */
   async function guardTask(task: BackupTask, reply: FastifyReply): Promise<boolean> {
     const schedule = await validateSchedule(executor, task.schedule)
@@ -392,8 +472,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid schedule '${task.schedule}': ${schedule.error}` } })
       return false
     }
-    const reg = await readBackupRepos(paths)
-    if (!reg.repos.some(r => r.name === task.repository)) {
+    const known = isPveRepoName(task.repository)
+      ? (await readPbsStorages(paths.pveStorageCfg)).some(d => pveRepoName(d.id) === task.repository)
+      : (await readBackupRepos(paths)).repos.some(r => r.name === task.repository)
+    if (!known) {
       reply.code(400)
       reply.send({ error: { code: 'VALIDATION_ERROR', message: `Repository '${task.repository}' is not registered` } })
       return false
@@ -404,11 +486,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   // --- GET /backup/tasks — grid (LOCAL-ONLY status) -------------------------
   server.get('/backup/tasks', async () => {
     const [tasks, reg] = await Promise.all([readAllTasks(systemdDir), readBackupRepos(paths)])
+    // Merge tier-1 PVE repos so a task targeting `pve:<id>` still joins its datastore.
+    const joinRepos = await reposForJoin(reg.repos)
     const data = await Promise.all(
       tasks.map(async (task): Promise<BackupTaskEntry> => {
         const st = await deriveTaskStatus(executor, task)
         return {
-          task: toTaskView(task, reg.repos),
+          task: toTaskView(task, joinRepos),
           lastRunResult: st.lastRunResult,
           lastRunAt: st.lastRunAt,
           nextRunAt: st.nextRunAt,
@@ -440,8 +524,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       readUnitTexts(systemdDir, name),
       readRecentJournal(executor, name),
     ])
+    const joinRepos = await reposForJoin(reg.repos)
     const detail: BackupTaskDetail = {
-      task: toTaskView(task, reg.repos),
+      task: toTaskView(task, joinRepos),
       lastRunResult: st.lastRunResult,
       lastRunAt: st.lastRunAt,
       nextRunAt: st.nextRunAt,
@@ -587,13 +672,18 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         const task = await readTask(systemdDir, name)
         if (!task)
           throw new Error(`Backup task '${name}' not found`)
-        const reg = await readBackupRepos(paths)
-        const repo = reg.repos.find(r => r.name === task.repository)
-        if (!repo)
+        // Resolve tier-2 (registry) or tier-1 (pve:<id>) repo + secret FRESH.
+        // A tier-1 secret is read from /etc/pve/priv/storage/<id>.pw here, at
+        // exec time — never copied, never cached (PVE rotation is instant).
+        const resolved = await resolveRepoAndSecret(task.repository)
+        if (!resolved)
           throw new Error(`Repository '${task.repository}' is not registered`)
-        const secret = await readRepoSecret(paths.credsDir, repo.name)
-        if (secret === null)
-          throw new Error(`No secret stored for repository '${repo.name}' — set its credentials first`)
+        const { repo, secret } = resolved
+        if (secret === null) {
+          throw new Error(isPveRepoName(task.repository)
+            ? `No PBS credential file for '${task.repository}' (${paths.pvePrivStorageDir}/${pveStorageId(task.repository)}.pw is missing) — set it in Datacenter → Storage`
+            : `No secret stored for repository '${repo.name}' — set its credentials first`)
+        }
         return runBackup(executor, { task, repo, secret }, updateProgress)
       },
     )
