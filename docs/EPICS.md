@@ -625,6 +625,8 @@ and schedules* the client invocation and surfaces status.
 ##### Dashboard
 16.7. [done 2026-07-19 — live-proven: forced failure → backup warning, disable clears it; overdue fires only as post-downtime catch-up (systemd keeps NextElapse in the future on a healthy node) — accepted semantics] As a user, I want only failures and overdue tasks surfaced (new `backup` warning category, replication policy: silently-overdue-past-interval counts as failed; healthy/idle shows nothing) — and this epic further strengthens the deferred 9.4 notification evaluation once shipped.
 
+16.8. As a user, I want ANAS to **piggyback on PVE's PBS storages for credentials** — every `pbs` entry in `storage.cfg` appears as an auto-discovered, PVE-badged repository (server/datastore/username/fingerprint from the read-only parse; the secret read from `/etc/pve/priv/storage/<id>.pw` AT EXEC/TEST TIME, never copied or cached) usable as a task target but never editable/deletable through ANAS — so a PBS target I already gave PVE needs zero re-entry. *(Operator insight 2026-07-19: "when I back up VMs I don't define anything beyond the repo storage." The replication two-tier model reapplied: PVE-defined = tier 1 zero-config, ANAS-registered = tier 2 for targets PVE doesn't know. pmxcfs replicates both the stanza and the secret cluster-wide, and rotation in PVE is instantly effective since ANAS holds no second copy. Ground truth first: capture a real `pvesm add pbs` stanza incl. namespace/port/token-id syntax on the stunt node against the test PBS.)*
+
 ### Epic 17: Scheduled Snapshots & Scrubs
 
 > As a user, I can schedule automatic snapshots with retention policies and recurring pool scrubs, and manage both from one dedicated screen — so routine data protection runs unattended.
