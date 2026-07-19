@@ -33,6 +33,14 @@ export interface ExecOptions {
    * in argv / the process list.
    */
   stdin?: string
+  /**
+   * Extra environment variables MERGED over the daemon's own environment. Use
+   * this for secrets a tool reads from the environment (e.g. pbc's
+   * `PBS_PASSWORD` / `PBS_REPOSITORY` — Epic 16) so they never land in argv /
+   * the process list. Values here override the inherited environment for the
+   * child only.
+   */
+  env?: Record<string, string>
 }
 
 /**
