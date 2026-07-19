@@ -227,6 +227,27 @@ Key decisions: **status never touches a mountpoint synchronously** (dead NFS ser
 | `GET` | `/v1/disks/:id` | Disk detail (id = by-id identifier) | `200` |
 | `GET` | `/v1/disks/:id/smart` | SMART health data | `200` |
 
+#### Backup — PBS file backup (Epic 16; designed 2026-07-18)
+
+Mirrors the replication API shape. Repositories live in the cluster-wide CAS-versioned registry (`/etc/pve/anas/backup-repos.json`, pmxcfs) with per-repo secrets in `/etc/anas/creds/` (0600, write-only via API — token secret or password, user's choice). Tasks ARE systemd units (`anas-backup-<name>.service`/`.timer`) — no second config source. **Status is local-only** (persistent systemd state + journald + jobs): the only PBS-server contacts are backup runs and the explicit user-initiated repository test.
+
+| Method | Path | Description | Response |
+|--------|------|-------------|----------|
+| `GET` | `/v1/backup/repos` | Registered PBS repositories (secrets never returned; `credentialsSet` only) | `200` |
+| `POST` | `/v1/backup/repos` | Register a repository (CAS `version`; fingerprint confirmed explicitly) | `202` with job |
+| `PUT` | `/v1/backup/repos/:name` | Update / rotate credentials (CAS) | `202` with job |
+| `DELETE` | `/v1/backup/repos/:name` | Unregister (refuses while tasks reference it) | `202`/`409` |
+| `POST` | `/v1/backup/repos/test` | User-initiated diagnosis: dns / tcp / tls-fingerprint / auth / datastore / namespace verdicts | `200` |
+| `GET` | `/v1/backup/tasks` | Task grid: schedule, enabled, last result, next run, overdue (systemd state) | `200` |
+| `GET` | `/v1/backup/tasks/:name` | Detail: full config, unit/timer as written, recent journald runs (labeled recent-only) | `200` |
+| `POST` | `/v1/backup/tasks` | Create task (repo ref + namespace + backup-id + archives[{name,path,excludes[]}] + mode + schedule) | `202` with job |
+| `PUT` | `/v1/backup/tasks/:name` | Update / enable / disable | `202` with job |
+| `DELETE` | `/v1/backup/tasks/:name` | Remove task (units removed; PBS data untouched) | `202`/`409` |
+| `POST` | `/v1/backup/tasks/:name/run` | Run now (job with progress from client output) | `202` with job |
+
+Generated service units carry `LimitNOFILE=1024` by default (per-task override) — pbc hoards file handles, worst in metadata change-detection mode. Dashboard warning category `backup`: failures and silently-overdue only.
+
+
 #### Users & Groups (filtered to relevant accounts)
 
 | Method | Path | Description | Response |
