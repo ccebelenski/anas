@@ -1,0 +1,65 @@
+### CAPTURE: change-detection modes — same tree (/root/anas-src/music) backed up twice per mode.
+### The RE-RUN (2nd) output is what job-progress parsing keys on: reuse vs re-upload.
+### NOTE: runs are spaced >1s apart — PBS snapshot timestamps are 1-SECOND resolution;
+###       two snapshots in the same second fail: 'backup timestamp is older than last backup.' (see SURPRISES).
+
+############ DEFAULT mode (data/block change detection) — backup-id cdm-default2 ############
+=== RUN 1 (default) ===
+Starting backup: [anastest]:host/cdm-default2/2026-07-19T01:11:00Z    
+Client name: anas-pve    
+Starting backup protocol: Sun Jul 19 01:11:00 2026    
+No previous manifest available.    
+Upload directory '/root/anas-src/music' to 'root@pam@localhost:8007:anastest-store' as cdm.pxar.didx    
+cdm.pxar: had to backup 193.701 KiB of 193.701 KiB (compressed 193.713 KiB) in 0.01 s (average 24.936 MiB/s)
+Uploaded backup catalog (316 B)
+Duration: 0.16s    
+End Time: Sun Jul 19 01:11:00 2026    
+--- rc=0 ---
+=== RUN 2 (default) — unchanged tree, expect dedup REUSE stats ===
+Starting backup: [anastest]:host/cdm-default2/2026-07-19T01:11:03Z    
+Client name: anas-pve    
+Starting backup protocol: Sun Jul 19 01:11:03 2026    
+Downloading previous manifest (Sun Jul 19 01:11:00 2026)    
+Upload directory '/root/anas-src/music' to 'root@pam@localhost:8007:anastest-store' as cdm.pxar.didx    
+cdm.pxar: had to backup 0 B of 193.701 KiB (compressed 0 B) in 0.00 s (average 0 B/s)
+Uploaded backup catalog (316 B)
+Duration: 0.13s    
+End Time: Sun Jul 19 01:11:03 2026    
+--- rc=0 ---
+
+############ METADATA mode (--change-detection-mode=metadata) — backup-id cdm-metadata2 ############
+=== RUN 1 (metadata) ===
+Starting backup: [anastest]:host/cdm-metadata2/2026-07-19T01:11:06Z    
+Client name: anas-pve    
+Starting backup protocol: Sun Jul 19 01:11:06 2026    
+No previous manifest available.    
+Upload directory '/root/anas-src/music' to 'root@pam@localhost:8007:anastest-store' as cdm.mpxar.didx    
+cdm.ppxar: had to backup 192.219 KiB of 192.219 KiB (compressed 192.23 KiB) in 0.00 s (average 56.101 MiB/s)
+cdm.mpxar: had to backup 1.912 KiB of 1.912 KiB (compressed 476 B) in 0.00 s (average 579.427 KiB/s)
+Duration: 0.10s    
+End Time: Sun Jul 19 01:11:06 2026    
+--- rc=0 ---
+=== RUN 2 (metadata) — unchanged tree, expect METADATA-REUSE stats ===
+Starting backup: [anastest]:host/cdm-metadata2/2026-07-19T01:11:09Z    
+Client name: anas-pve    
+Starting backup protocol: Sun Jul 19 01:11:09 2026    
+Downloading previous manifest (Sun Jul 19 01:11:06 2026)    
+Upload directory '/root/anas-src/music' to 'root@pam@localhost:8007:anastest-store' as cdm.mpxar.didx    
+Using previous index as metadata reference for 'cdm.mpxar.didx'    
+Change detection summary:
+ - 12 total files (0 hardlinks)
+ - 12 unchanged, reusable files with 192.188 KiB data
+ - 0 changed or non-reusable files with 0 B data
+ - 32 B padding in 1 partially reused chunks
+cdm.mpxar: had to backup 1.912 KiB of 1.912 KiB (compressed 476 B) in 0.00 s (average 1.446 MiB/s)
+cdm.ppxar: reused 192.219 KiB from previous snapshot for unchanged files (1 chunks)
+cdm.ppxar: had to backup 32 B of 192.25 KiB (compressed 56 B) in 0.00 s (average 16.729 KiB/s)
+Duration: 0.16s    
+End Time: Sun Jul 19 01:11:09 2026    
+--- rc=0 ---
+
+### Archive file-set per mode (metadata splits mpxar+ppxar, no catalog):
+  cdm-default2 1784423460 ['cdm.pxar.didx', 'catalog.pcat1.didx', 'index.json.blob']
+  cdm-default2 1784423463 ['cdm.pxar.didx', 'catalog.pcat1.didx', 'index.json.blob']
+  cdm-metadata2 1784423466 ['cdm.ppxar.didx', 'cdm.mpxar.didx', 'index.json.blob']
+  cdm-metadata2 1784423469 ['cdm.ppxar.didx', 'cdm.mpxar.didx', 'index.json.blob']

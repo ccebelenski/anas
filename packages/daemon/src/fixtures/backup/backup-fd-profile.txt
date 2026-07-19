@@ -1,0 +1,122 @@
+### fd sampling every 30ms of the single pbc process (/proc/PID/fd count).
+### tree: /root/anas-big = 40000 files / 200 dirs / 158M
+
+### interactive baseline limits: soft=1024 hard=524288
+
+### raised shell soft nofile to 524288 for the HIGH-limit cases
+======================================================================
+CASE: DEFAULT mode, HIGH nofile (524288)
+  backup-id=fd-def-hi  nofile-limit=524288 (soft)  extra-args: 
+  pbc pid=56142
+  RESULT: exit=0  elapsed=0.4s  MAX_FDS=13  samples=10 avg=10
+  fd timeline (sampled):
+    t=0.0s fds=3
+
+  --- pbc output (tail) ---
+  | Starting backup: [anastest]:host/fd-def-hi/2026-07-19T01:12:40Z    
+  | Client name: anas-pve    
+  | Starting backup protocol: Sun Jul 19 01:12:40 2026    
+  | No previous manifest available.    
+  | Upload directory '/root/anas-big' to 'root@pam@localhost:8007:anastest-store' as bigtree.pxar.didx    
+  | bigtree.pxar: had to backup 6.374 MiB of 6.374 MiB (compressed 91.733 KiB) in 0.15 s (average 41.324 MiB/s)
+  | Uploaded backup catalog (606.377 KiB)
+  | Duration: 0.35s    
+  | End Time: Sun Jul 19 01:12:41 2026    
+
+======================================================================
+CASE: METADATA mode, HIGH nofile (524288)
+  backup-id=fd-meta-hi  nofile-limit=524288 (soft)  extra-args: --change-detection-mode=metadata
+  pbc pid=56244
+  RESULT: exit=0  elapsed=0.3s  MAX_FDS=13  samples=9 avg=10
+  fd timeline (sampled):
+    t=0.0s fds=3
+
+  --- pbc output (tail) ---
+  | Starting backup: [anastest]:host/fd-meta-hi/2026-07-19T01:12:44Z    
+  | Client name: anas-pve    
+  | Starting backup protocol: Sun Jul 19 01:12:44 2026    
+  | No previous manifest available.    
+  | Upload directory '/root/anas-big' to 'root@pam@localhost:8007:anastest-store' as bigtree.mpxar.didx    
+  | bigtree.ppxar: had to backup 2.362 MiB of 2.362 MiB (compressed 36.473 KiB) in 0.15 s (average 15.488 MiB/s)
+  | bigtree.mpxar: had to backup 5.232 MiB of 5.232 MiB (compressed 186.06 KiB) in 0.16 s (average 33.492 MiB/s)
+  | Duration: 0.28s    
+  | End Time: Sun Jul 19 01:12:44 2026    
+
+======================================================================
+CASE: DEFAULT mode, LOW nofile (prlimit 1024)
+  backup-id=fd-def-lo  nofile-limit=1024:1024 (prlimit)  extra-args: 
+  pbc pid=56304
+  RESULT: exit=0  elapsed=0.3s  MAX_FDS=12  samples=9 avg=10
+  fd timeline (sampled):
+    t=0.0s fds=3
+
+  --- pbc output (tail) ---
+  | Starting backup: [anastest]:host/fd-def-lo/2026-07-19T01:12:47Z    
+  | Client name: anas-pve    
+  | Starting backup protocol: Sun Jul 19 01:12:47 2026    
+  | No previous manifest available.    
+  | Upload directory '/root/anas-big' to 'root@pam@localhost:8007:anastest-store' as bigtree.pxar.didx    
+  | bigtree.pxar: had to backup 6.374 MiB of 6.374 MiB (compressed 91.733 KiB) in 0.16 s (average 39.028 MiB/s)
+  | Uploaded backup catalog (606.377 KiB)
+  | Duration: 0.29s    
+  | End Time: Sun Jul 19 01:12:47 2026    
+
+======================================================================
+CASE: METADATA mode, LOW nofile (prlimit 1024)
+  backup-id=fd-meta-lo  nofile-limit=1024:1024 (prlimit)  extra-args: --change-detection-mode=metadata
+  pbc pid=56364
+  RESULT: exit=0  elapsed=0.3s  MAX_FDS=13  samples=8 avg=10
+  fd timeline (sampled):
+    t=0.0s fds=3
+
+  --- pbc output (tail) ---
+  | Starting backup: [anastest]:host/fd-meta-lo/2026-07-19T01:12:50Z    
+  | Client name: anas-pve    
+  | Starting backup protocol: Sun Jul 19 01:12:50 2026    
+  | No previous manifest available.    
+  | Upload directory '/root/anas-big' to 'root@pam@localhost:8007:anastest-store' as bigtree.mpxar.didx    
+  | resource limit for open file handles low: 1024    
+  | bigtree.mpxar: had to backup 5.232 MiB of 5.232 MiB (compressed 186.06 KiB) in 0.15 s (average 34.517 MiB/s)
+  | bigtree.ppxar: had to backup 2.362 MiB of 2.362 MiB (compressed 36.473 KiB) in 0.15 s (average 15.502 MiB/s)
+  | Duration: 0.27s    
+  | End Time: Sun Jul 19 01:12:51 2026    
+
+======================================================================
+CASE: METADATA mode, VERY LOW nofile (prlimit 256)
+  backup-id=fd-meta-vlo  nofile-limit=256:256 (prlimit)  extra-args: --change-detection-mode=metadata
+  pbc pid=56454
+  RESULT: exit=0  elapsed=0.4s  MAX_FDS=13  samples=10 avg=10
+  fd timeline (sampled):
+    t=0.0s fds=3
+
+  --- pbc output (tail) ---
+  | Starting backup: [anastest]:host/fd-meta-vlo/2026-07-19T01:12:54Z    
+  | Client name: anas-pve    
+  | Starting backup protocol: Sun Jul 19 01:12:54 2026    
+  | No previous manifest available.    
+  | Upload directory '/root/anas-big' to 'root@pam@localhost:8007:anastest-store' as bigtree.mpxar.didx    
+  | resource limit for open file handles low: 256    
+  | bigtree.ppxar: had to backup 2.362 MiB of 2.362 MiB (compressed 36.473 KiB) in 0.14 s (average 17.045 MiB/s)
+  | bigtree.mpxar: had to backup 5.232 MiB of 5.232 MiB (compressed 186.06 KiB) in 0.14 s (average 37.431 MiB/s)
+  | Duration: 0.31s    
+  | End Time: Sun Jul 19 01:12:54 2026    
+
+======================================================================
+CASE: DEFAULT mode, VERY LOW nofile (prlimit 256)
+  backup-id=fd-def-vlo  nofile-limit=256:256 (prlimit)  extra-args: 
+  pbc pid=56518
+  RESULT: exit=0  elapsed=0.3s  MAX_FDS=13  samples=8 avg=10
+  fd timeline (sampled):
+    t=0.0s fds=4
+
+  --- pbc output (tail) ---
+  | Starting backup: [anastest]:host/fd-def-vlo/2026-07-19T01:12:57Z    
+  | Client name: anas-pve    
+  | Starting backup protocol: Sun Jul 19 01:12:57 2026    
+  | No previous manifest available.    
+  | Upload directory '/root/anas-big' to 'root@pam@localhost:8007:anastest-store' as bigtree.pxar.didx    
+  | bigtree.pxar: had to backup 6.374 MiB of 6.374 MiB (compressed 91.733 KiB) in 0.13 s (average 48.365 MiB/s)
+  | Uploaded backup catalog (606.377 KiB)
+  | Duration: 0.25s    
+  | End Time: Sun Jul 19 01:12:57 2026    
+
