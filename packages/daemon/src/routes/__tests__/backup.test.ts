@@ -69,7 +69,9 @@ describe('backup routes (Epic 16)', () => {
     mock.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/systemd-analyze', result: { stdout: 'Normalized form: *-*-* 02:00:00\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/journalctl', result: { stdout: 'recent run output', stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: '/usr/bin/proxmox-backup-client', result: { stdout: '', stderr: PBC_BACKUP_STDERR, exitCode: 0 } })
+    // pbc runs wrapped in prlimit — the fd cap must bind pbc itself, not the
+    // task unit (live-proof finding A). The mock keys on the outer command.
+    mock.addFixture({ command: '/usr/bin/prlimit', result: { stdout: '', stderr: PBC_BACKUP_STDERR, exitCode: 0 } })
   })
 
   afterEach(async () => {

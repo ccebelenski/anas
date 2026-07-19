@@ -245,7 +245,7 @@ Mirrors the replication API shape. Repositories live in the cluster-wide CAS-ver
 | `DELETE` | `/v1/backup/tasks/:name` | Remove task (units removed; PBS data untouched) | `202`/`409` |
 | `POST` | `/v1/backup/tasks/:name/run` | Run now (job with progress from client output) | `202` with job |
 
-Generated service units carry `LimitNOFILE=1024` by default (per-task override) — pbc hoards file handles, worst in metadata change-detection mode. Dashboard warning category `backup`: failures and silently-overdue only.
+The fd cap (default 1024, per-task override) binds pbc via `prlimit --nofile=N:N` around the daemon's exec — pbc hoards file handles, worst in metadata change-detection mode; the unit's `LimitNOFILE=` only bounds the thin helper (pbc runs inside anasd, not the unit cgroup — live-proof finding). Dashboard warning category `backup`: failures and silently-overdue only.
 
 
 #### Users & Groups (filtered to relevant accounts)

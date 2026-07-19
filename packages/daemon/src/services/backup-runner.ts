@@ -22,6 +22,7 @@ import { connect as tlsConnect } from 'node:tls'
  */
 
 export const PBC = '/usr/bin/proxmox-backup-client'
+export const PRLIMIT = '/usr/bin/prlimit'
 
 /** Per-archive stats / reuse line (parse by the filename token, not position). */
 const ARCHIVE_LINE_RE = /^\S+\.(?:pxar|mpxar|ppxar):\s/
@@ -245,8 +246,14 @@ export async function runBackup(
   const env = buildBackupEnv(repo, secret)
   const args = buildBackupArgs(task)
 
+  // The fd cap must bind pbc ITSELF. pbc execs inside anasd (nofile 524288 —
+  // Node raises soft→hard), not in the task unit's cgroup, so the unit's
+  // LimitNOFILE= never reaches it (live-proof finding A). prlimit around the
+  // exec is the operator's own proven mechanism: without the cap pbc hoards
+  // handles — worst in metadata mode — until the network stack degrades.
+  const nofile = task.limitNofile ?? 1024
   updateProgress(`starting backup ${task.name} → ${repo.name}:${repo.datastore}`)
-  const r = await executor.exec(PBC, args, { env })
+  const r = await executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env })
 
   const progress = parseBackupProgress(r.stderr)
   const summary = progressSummary(progress)
