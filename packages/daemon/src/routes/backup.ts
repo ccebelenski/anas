@@ -254,12 +254,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       }
 
       // Refuse (409) while a backup TASK still references this repository.
+      // Distinct code from the CAS 'CONFLICT': the UI reload-and-retries CAS
+      // conflicts, but a referenced-repo refusal must show its message.
       const referencing = (await readAllTasks(systemdDir)).filter(t => t.repository === name)
       if (referencing.length) {
         reply.code(409)
         return {
           error: {
-            code: 'CONFLICT',
+            code: 'IN_USE',
             message: `Repository '${name}' is still used by backup task(s): ${referencing.map(t => t.name).join(', ')} — remove them first`,
           },
         }

@@ -578,8 +578,15 @@
             });
         }, function (err) {
             if (err && err.status === 409) {
-                if (o.onConflict) { o.onConflict(err); }
-                return;
+                // Only a CAS 'CONFLICT' (registry moved) gets the
+                // reload-and-retry treatment; any other 409 (e.g. IN_USE —
+                // repo still referenced by tasks) is a refusal whose message
+                // must be shown, not swallowed by "registry changed".
+                var code = err.body && err.body.error && err.body.error.code;
+                if (code === 'CONFLICT' && o.onConflict) {
+                    o.onConflict(err);
+                    return;
+                }
             }
             if (o.onError) {
                 o.onError(err);
