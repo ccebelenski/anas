@@ -529,7 +529,7 @@ Stories marked *(V2?)* are explicitly deferred.
 ## V2 Backlog
 
 > **V2 priorities (operator call, 2026-07-18): homelab first.**
-> 1. **Epic 16** (PBS file backup) — next epic; spec/design first. **Epic 18 (Mounts) COMPLETE 2026-07-18** — remote shares live-proven same-day; 18.4/18.6/18.7 descoped (NAS layer, not a Linux-mount manager); the mount inventory 16's source picker wants is live.
+> 1. **Epic 16 (PBS file backup) COMPLETE 2026-07-19** — designed from the operator's real scripts and live-proven against a disposable PBS, all in one arc. **Epic 18 (Mounts) COMPLETE 2026-07-18** — remote shares live-proven same-day; 18.4/18.6/18.7 descoped (NAS layer, not a Linux-mount manager). Next up: **Epic 11 + SHR** (the headline) and **Epic 17** (schedules).
 > 2. **Epic 11 + SHR** — promoted to the V2 headline: a Synology alternative. Mixed-drive-size arrays with **online expansion** matter precisely because disks are expensive — grow-as-you-buy beats forklift upgrades, and it's the thing neither ZFS nor PVE offers.
 > 3. **Epic 17** (scheduled snapshots & scrubs) — inked as its own epic 2026-07-18 (it needs a new screen); TrueNAS-parity table stakes, cheap relative to value — the replication timer/task-store machinery is the template.
 > 4. **12.1** (version-skew checks) — the one Epic 12 survivor; rides early ("easy now" post-10.10, and upgrade pain compounds as versions accumulate).
