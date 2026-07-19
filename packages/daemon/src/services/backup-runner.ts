@@ -81,8 +81,13 @@ export function buildBackupEnv(repo: BackupRepo, secret: string): Record<string,
  * `<name>.pxar:<path>` args in order; each archive's excludes become `--exclude
  * <pattern>` (pbc applies --exclude across the whole invocation); then
  * `--backup-id`, optional `--ns`, and the metadata mode flag.
+ *
+ * `namespace` overrides the task's when supplied — the caller resolves the
+ * EFFECTIVE namespace (task's, else the repo's) so a repo that already carries a
+ * namespace (e.g. a PVE-defined `pbs` storage with `namespace anastest`) needs
+ * zero re-entry on the task, matching the test path which probes `repo.namespace`.
  */
-export function buildBackupArgs(task: BackupTask): string[] {
+export function buildBackupArgs(task: BackupTask, namespace?: string): string[] {
   const args: string[] = ['backup']
   for (const a of task.archives)
     args.push(`${a.name}.pxar:${a.path}`)
@@ -91,8 +96,9 @@ export function buildBackupArgs(task: BackupTask): string[] {
       args.push('--exclude', pattern)
   }
   args.push('--backup-id', task.backupId)
-  if (task.namespace)
-    args.push('--ns', task.namespace)
+  const ns = namespace ?? task.namespace
+  if (ns)
+    args.push('--ns', ns)
   if (task.changeDetectionMode === 'metadata')
     args.push('--change-detection-mode=metadata')
   return args
@@ -244,7 +250,10 @@ export async function runBackup(
 ): Promise<BackupRunResult> {
   const { task, repo, secret } = deps
   const env = buildBackupEnv(repo, secret)
-  const args = buildBackupArgs(task)
+  // Effective namespace: the task's if set, else the repo's (zero re-entry for a
+  // repo that already carries one, e.g. a PVE-defined storage). Mirrors the test
+  // path, which probes repo.namespace.
+  const args = buildBackupArgs(task, task.namespace ?? repo.namespace)
 
   // The fd cap must bind pbc ITSELF. pbc execs inside anasd (nofile 524288 —
   // Node raises soft→hard), not in the task unit's cgroup, so the unit's

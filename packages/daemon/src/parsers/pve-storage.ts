@@ -363,3 +363,149 @@ export async function readPveMountPaths(path: string = PVE_STORAGE_CFG): Promise
     return new Map()
   }
 }
+
+// --- PBS storages (Epic 16.8: piggyback on PVE's PBS credentials) -----------
+
+/**
+ * A `pbs` storage stanza from storage.cfg — the read-only view ANAS needs to
+ * offer it as a tier-1 backup repository. Ground truth (stunt node, `pvesm add
+ * pbs`, 2026-07-19): the stanza keys are `server`, `datastore`, `username`,
+ * `fingerprint`, optional `namespace`, optional `port`, plus a PVE-managed
+ * `content backup`. The AUTH STYLE is not a key — it is inferred from the
+ * username: a `user@realm!tokenname` (contains `!`) is token auth, otherwise
+ * password auth. The SECRET is NOT here — it lives in
+ * /etc/pve/priv/storage/<id>.pw and is read only at exec/test time.
+ */
+export interface PbsStorageDef {
+  /** Storage id (the `pbs: <id>` header). */
+  id: string
+  /** PBS server host/IP (`server` key). */
+  server: string
+  /** TCP port (`port` key); absent → the pbc default (8007). */
+  port?: number
+  /** Datastore name (`datastore` key). */
+  datastore: string
+  /** Auth identity (`username` key): `user@realm` or `user@realm!tokenname`. */
+  username?: string
+  /** Pinned cert fingerprint (`fingerprint` key), sha256 colon-hex. */
+  fingerprint?: string
+  /** Optional PBS namespace within the datastore (`namespace` key). */
+  namespace?: string
+}
+
+/** Default location of the PVE per-storage secret files (the `.pw` files). */
+export const PVE_PRIV_STORAGE_DIR = '/etc/pve/priv/storage'
+
+/**
+ * Parse every `pbs` stanza out of a storage.cfg into {@link PbsStorageDef}s.
+ *
+ * Pure and total (matches the other parsers here): commented-out lines are
+ * skipped, stanzas are blank-line- or header-separated, the final stanza needs
+ * no trailing blank line, and malformed input yields fewer entries — never
+ * throws. A stanza missing `server` or `datastore` is skipped (unusable).
+ */
+export function parsePbsStorages(text: string): PbsStorageDef[] {
+  const out: PbsStorageDef[] = []
+
+  interface Stanza {
+    type: string
+    id: string
+    server?: string
+    datastore?: string
+    username?: string
+    fingerprint?: string
+    namespace?: string
+    port?: string
+  }
+  let current: Stanza | null = null
+
+  const flush = () => {
+    if (current && current.type === 'pbs' && current.server && current.datastore) {
+      const def: PbsStorageDef = {
+        id: current.id,
+        server: current.server,
+        datastore: current.datastore,
+      }
+      if (current.port !== undefined) {
+        const p = Number(current.port)
+        if (Number.isInteger(p) && p > 0 && p <= 65535)
+          def.port = p
+      }
+      if (current.username)
+        def.username = current.username
+      if (current.fingerprint)
+        def.fingerprint = current.fingerprint
+      if (current.namespace)
+        def.namespace = current.namespace
+      out.push(def)
+    }
+    current = null
+  }
+
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.replace(TRAILING_CR_RE, '')
+    const trimmed = line.trim()
+
+    if (trimmed === '') {
+      flush()
+      continue
+    }
+    if (trimmed.startsWith('#'))
+      continue
+
+    const header = HEADER_RE.exec(line)
+    if (header) {
+      flush()
+      current = { type: header[1], id: header[2] }
+      continue
+    }
+
+    if (!current)
+      continue
+    const kv = KEY_VALUE_RE.exec(trimmed)
+    if (!kv)
+      continue
+    const [, key, value] = kv
+    const v = value.trim()
+    if (key === 'server')
+      current.server = v
+    else if (key === 'datastore')
+      current.datastore = v
+    else if (key === 'username')
+      current.username = v
+    else if (key === 'fingerprint')
+      current.fingerprint = v
+    else if (key === 'namespace')
+      current.namespace = v
+    else if (key === 'port')
+      current.port = v
+  }
+  flush()
+
+  return out
+}
+
+/**
+ * Read storage.cfg and return its `pbs` storage definitions, FAIL-OPEN (missing
+ * file / parse error → empty array, never throws). Path is overridable for
+ * tests. ANAS NEVER writes this file — it is read purely to offer the storage as
+ * a hands-off tier-1 backup repository (Epic 16.8).
+ */
+export async function readPbsStorages(path: string = PVE_STORAGE_CFG): Promise<PbsStorageDef[]> {
+  let text: string
+  try {
+    text = await readFile(path, 'utf8')
+  }
+  catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+      console.warn(`anasd: could not read ${path} for PVE PBS storage detection:`, err)
+    return []
+  }
+  try {
+    return parsePbsStorages(text)
+  }
+  catch (err: unknown) {
+    console.warn(`anasd: could not parse ${path} for PVE PBS storage detection:`, err)
+    return []
+  }
+}

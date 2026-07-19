@@ -1,4 +1,5 @@
 import type { BackupRepo } from '@anas/shared'
+import type { BackupReposPaths } from '../backup-repos.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -6,7 +7,14 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
   BackupReposConflictError,
+  isPveRepoName,
+  pbsDefToRepo,
+  pveRepoName,
+  pveSecretPath,
+  pveSecretSet,
+  pveStorageId,
   readBackupRepos,
+  readPveSecret,
   readRepoSecret,
   removeRepoSecret,
   repoSecretPath,
@@ -30,11 +38,16 @@ function makeRepo(over: Partial<BackupRepo> = {}): BackupRepo {
 
 describe('backup repos registry — CAS store (Epic 16.2, remotes pattern)', () => {
   let dir: string
-  let paths: { registryFile: string, credsDir: string }
+  let paths: BackupReposPaths
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-backup-repos-'))
-    paths = { registryFile: join(dir, 'backup-repos.json'), credsDir: join(dir, 'creds') }
+    paths = {
+      registryFile: join(dir, 'backup-repos.json'),
+      credsDir: join(dir, 'creds'),
+      pveStorageCfg: join(dir, 'storage.cfg'),
+      pvePrivStorageDir: join(dir, 'priv-storage'),
+    }
   })
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true })
@@ -130,5 +143,71 @@ describe('backup repos — per-repo secret files (0600 root-only)', () => {
 
   it('removeRepoSecret on a missing file is a no-op (best-effort)', async () => {
     await removeRepoSecret(credsDir, 'does-not-exist')
+  })
+})
+
+describe('backup repos — tier-1 PVE-defined (Epic 16.8)', () => {
+  it('pveRepoName / isPveRepoName / pveStorageId round-trip on the reserved namespace', () => {
+    assert.equal(pveRepoName('anastest-pw'), 'pve:anastest-pw')
+    assert.equal(isPveRepoName('pve:anastest-pw'), true)
+    assert.equal(isPveRepoName('pbs-main'), false)
+    assert.equal(pveStorageId('pve:anastest-pw'), 'anastest-pw')
+  })
+
+  it('pbsDefToRepo infers PASSWORD auth from a plain username (no ! suffix)', () => {
+    const repo = pbsDefToRepo({
+      id: 'anastest-pw',
+      server: '127.0.0.1',
+      datastore: 'anastest-store',
+      username: 'root@pam',
+      fingerprint: 'cc:b8:a0',
+      namespace: 'anastest',
+    })
+    assert.equal(repo.name, 'pve:anastest-pw')
+    assert.equal(repo.host, '127.0.0.1')
+    assert.equal(repo.port, 8007) // default applied when the stanza omits port
+    assert.equal(repo.authType, 'password')
+    assert.equal(repo.username, 'root@pam')
+    assert.equal(repo.tokenId, undefined)
+    assert.equal(repo.namespace, 'anastest')
+    assert.equal(repo.fingerprint, 'cc:b8:a0')
+  })
+
+  it('pbsDefToRepo infers TOKEN auth from a !tokenname username and carries the port', () => {
+    const repo = pbsDefToRepo({
+      id: 'anastest-tok',
+      server: 'pbs.example.com',
+      port: 8123,
+      datastore: 'store1',
+      username: 'root@pam!anas-test',
+    })
+    assert.equal(repo.authType, 'token')
+    assert.equal(repo.tokenId, 'root@pam!anas-test')
+    assert.equal(repo.username, undefined)
+    assert.equal(repo.port, 8123)
+  })
+
+  it('readPveSecret reads the .pw file and strips the single trailing newline', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-pve-priv-'))
+    try {
+      // Ground truth (16.8): PVE writes the bare secret + one trailing "\n".
+      await writeFile(pveSecretPath(dir, 'anastest-pw'), 'AnasPbsTest123\n')
+      assert.equal(await readPveSecret(dir, 'anastest-pw'), 'AnasPbsTest123')
+      assert.equal(await pveSecretSet(dir, 'anastest-pw'), true)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('readPveSecret returns null for a missing .pw file; pveSecretSet is false', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-pve-priv-'))
+    try {
+      assert.equal(await readPveSecret(dir, 'nope'), null)
+      assert.equal(await pveSecretSet(dir, 'nope'), false)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

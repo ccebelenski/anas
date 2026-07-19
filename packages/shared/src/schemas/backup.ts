@@ -30,6 +30,40 @@ export const BackupName = z
   .regex(/^[a-z0-9][a-z0-9-]*$/, 'lowercase alphanumerics and dashes')
 export type BackupName = z.infer<typeof BackupName>
 
+/**
+ * Reserved namespace prefix for a PVE-defined (tier-1) repository: it is exposed
+ * as `pve:<storage-id>`. Because a colon is not a legal BackupName character, a
+ * registered (tier-2) repo can NEVER occupy this namespace — that IS the
+ * collision rule. A registered `foo` and a PVE `pbs: foo` storage coexist
+ * unambiguously as `foo` and `pve:foo`.
+ */
+export const PVE_REPO_PREFIX = 'pve:'
+
+/**
+ * A reference to a repository from a task (`task.repository`) or the repos test
+ * endpoint — either a registered BackupName (tier 2), or a `pve:<storage-id>`
+ * reference to an auto-discovered PVE storage (tier 1). PVE storage ids are
+ * broader than a BackupName (they permit dots/underscores/uppercase), so the
+ * `pve:` branch is deliberately more permissive than the tier-2 branch.
+ */
+export const BackupRepoRef = z
+  .string()
+  .max(105)
+  .regex(
+    /^(?:pve:[A-Za-z0-9][\w.-]*|[a-z0-9][a-z0-9-]*)$/,
+    'a registered repo name, or pve:<storage-id> for a PVE-defined repository',
+  )
+export type BackupRepoRef = z.infer<typeof BackupRepoRef>
+
+/**
+ * Where a repository comes from: `anas` = ANAS-registered in the cluster
+ * registry (tier 2, fully editable); `pve` = auto-discovered from a `pbs` stanza
+ * in /etc/pve/storage.cfg (tier 1, hands-off — never editable through ANAS, its
+ * secret read from /etc/pve/priv/storage/<id>.pw only at exec/test time).
+ */
+export const BackupRepoSource = z.enum(['anas', 'pve'])
+export type BackupRepoSource = z.infer<typeof BackupRepoSource>
+
 /** How a repository authenticates. UI recommends tokens; both are first-class. */
 export const BackupAuthType = z.enum(['token', 'password'])
 export type BackupAuthType = z.infer<typeof BackupAuthType>
@@ -63,10 +97,20 @@ export const BackupRepo = z.object({
 })
 export type BackupRepo = z.infer<typeof BackupRepo>
 
-/** The repo shape returned to clients — adds `credentialsSet` (secret presence). */
+/**
+ * The repo shape returned to clients — adds `credentialsSet` (secret presence)
+ * and a `source` marker. `name` is widened to a {@link BackupRepoRef} so tier-1
+ * PVE repos can be returned as `pve:<storage-id>` (tier-2 names still validate as
+ * a plain BackupName). For tier-1, `credentialsSet` reflects whether the PVE
+ * `.pw` file exists — the secret itself is NEVER returned.
+ */
 export const BackupRepoResponse = BackupRepo.extend({
+  /** Registry key OR `pve:<storage-id>` for a PVE-defined repository. */
+  name: BackupRepoRef,
   /** Whether a secret is stored for this repo (never the secret itself). */
   credentialsSet: z.boolean(),
+  /** Tier: `anas` (registered) or `pve` (auto-discovered, hands-off). */
+  source: BackupRepoSource.default('anas'),
 })
 export type BackupRepoResponse = z.infer<typeof BackupRepoResponse>
 
@@ -107,8 +151,11 @@ export type UpsertBackupRepoRequest = z.infer<typeof UpsertBackupRepoRequest>
  * the stored secret). Distinguished by the presence of `host`.
  */
 export const BackupRepoTestRequest = z.object({
-  /** Test a REGISTERED repo by name (loads its stored secret). */
-  name: BackupName.optional(),
+  /**
+   * Test a REGISTERED repo by name — a tier-2 BackupName or a tier-1
+   * `pve:<storage-id>` (the daemon loads the stored / PVE `.pw` secret).
+   */
+  name: BackupRepoRef.optional(),
   host: z.string().optional(),
   port: z.number().int().min(1).max(65535).optional(),
   datastore: z.string().optional(),
@@ -163,8 +210,11 @@ export type BackupArchive = z.infer<typeof BackupArchive>
  */
 export const BackupTask = z.object({
   name: BackupName,
-  /** Registered repository name (see BackupRepo). */
-  repository: BackupName,
+  /**
+   * Target repository: a registered repo name (tier 2) OR `pve:<storage-id>`
+   * for a PVE-defined repository (tier 1). See {@link BackupRepoRef}.
+   */
+  repository: BackupRepoRef,
   /** Optional PBS namespace (overrides / complements the repo's). */
   namespace: z.string().optional(),
   /** PBS group identity host/<backupId>. Defaults to the hostname in the UI. */

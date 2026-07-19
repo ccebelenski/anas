@@ -26,8 +26,10 @@ export {
   BackupName,
   BackupRecentRun,
   BackupRepo,
+  BackupRepoRef,
   BackupRepoRegistry,
   BackupRepoResponse,
+  BackupRepoSource,
   BackupRepoTestRequest,
   BackupRepoTestResult,
   BackupRepoWrite,
@@ -38,6 +40,7 @@ export {
   BackupTaskRequest,
   BackupTaskView,
   ChangeDetectionMode,
+  PVE_REPO_PREFIX,
   UpsertBackupRepoRequest,
 } from './schemas/backup.js'
 

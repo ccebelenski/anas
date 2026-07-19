@@ -1,12 +1,28 @@
-import type { BackupTaskDetail, BackupTaskEntry, Job } from '@anas/shared'
+import type { BackupRepoResponse, BackupTaskDetail, BackupTaskEntry, Job } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+
+/** A real `pbs` stanza (ground truth 16.8) — a password-auth PVE-defined repo. */
+const PVE_STORAGE_CFG = [
+  'dir: local',
+  '\tpath /var/lib/vz',
+  '\tcontent backup',
+  '',
+  'pbs: anastest-pw',
+  '\tdatastore anastest-store',
+  '\tserver 127.0.0.1',
+  '\tcontent backup',
+  '\tfingerprint cc:b8:a0:35:60:b9:5f:77:10:e8:c2:62:ce:1e:dd:08:b8:03:0a:82:f7:62:09:bf:e8:f5:44:7e:8b:3e:2c:1d',
+  '\tnamespace anastest',
+  '\tusername root@pam',
+  '',
+].join('\n')
 
 const IDENTITY = {
   'x-anas-user': 'root@pam',
@@ -62,6 +78,13 @@ describe('backup routes (Epic 16)', () => {
     setEnv('ANAS_BACKUP_REPOS_FILE', join(dir, 'backup-repos.json'))
     setEnv('ANAS_BACKUP_CREDS_DIR', join(dir, 'creds'))
     setEnv('ANAS_SYSTEMD_DIR', dir)
+    // Tier-1 (PVE-defined) repos: a read-only storage.cfg + a per-storage .pw
+    // (bare secret + trailing newline, ground truth 16.8). ANAS never writes them.
+    setEnv('ANAS_STORAGE_CFG', join(dir, 'storage.cfg'))
+    setEnv('ANAS_PVE_PRIV_STORAGE_DIR', join(dir, 'priv-storage'))
+    await writeFile(join(dir, 'storage.cfg'), PVE_STORAGE_CFG)
+    await mkdir(join(dir, 'priv-storage'), { recursive: true })
+    await writeFile(join(dir, 'priv-storage', 'anastest-pw.pw'), 'AnasPbsTest123\n')
     server = createServer({ mock: true, logger: false })
     // Systemctl (daemon-reload / enable / disable) + systemd-analyze + journalctl
     // + pbc, so unit writes, schedule validation, detail, and Run-Now succeed.
@@ -125,9 +148,10 @@ describe('backup routes (Epic 16)', () => {
     const res = await server.inject({ method: 'GET', url: '/v1/backup/repos', headers: IDENTITY })
     const { data } = res.json() as { data: { version: number, repos: Array<Record<string, unknown>> } }
     assert.equal(data.version, 1)
-    assert.equal(data.repos.length, 1)
-    const repo = data.repos[0]
-    assert.equal(repo.name, 'pbs-main')
+    // The registered repo (source:anas) — a tier-1 pve:<id> repo also appears.
+    const repo = data.repos.find(r => r.name === 'pbs-main')!
+    assert.ok(repo, 'expected the registered repo')
+    assert.equal(repo.source, 'anas')
     assert.equal(repo.credentialsSet, true)
     assert.equal('secret' in repo, false)
   })
@@ -204,5 +228,74 @@ describe('backup routes (Epic 16)', () => {
   it('a mutation without identity headers is rejected', async () => {
     const res = await server.inject({ method: 'POST', url: '/v1/backup/repos', headers: { 'content-type': 'application/json' }, payload: { repo: REPO, expectedVersion: 0 } })
     assert.ok(res.statusCode === 401 || res.statusCode === 403)
+  })
+
+  // ---- Tier 1: PVE-defined repositories (Epic 16.8) ----------------------
+
+  it('GET /backup/repos surfaces the PVE storage as a hands-off pve:<id> repo', async () => {
+    await createRepo() // a tier-2 repo, so both tiers appear together
+    const res = await server.inject({ method: 'GET', url: '/v1/backup/repos', headers: IDENTITY })
+    const { data } = res.json() as { data: { version: number, repos: BackupRepoResponse[] } }
+    assert.equal(data.version, 1) // registry version is unaffected by tier-1
+    const pve = data.repos.find(r => r.source === 'pve')!
+    assert.ok(pve, 'expected a source:pve repo')
+    assert.equal(pve.name, 'pve:anastest-pw')
+    assert.equal(pve.host, '127.0.0.1')
+    assert.equal(pve.datastore, 'anastest-store')
+    assert.equal(pve.namespace, 'anastest')
+    assert.equal(pve.authType, 'password') // inferred: username has no ! suffix
+    assert.equal(pve.username, 'root@pam')
+    assert.equal(pve.credentialsSet, true) // the .pw file exists
+    assert.equal('secret' in pve, false) // never returned
+    // the registered repo is still there and marked source:anas
+    assert.ok(data.repos.some(r => r.name === 'pbs-main' && r.source === 'anas'))
+  })
+
+  it('PUT /backup/repos/pve:<id> is a 400 hands-off refusal', async () => {
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/backup/repos/pve:anastest-pw',
+      headers: JSON_HEADERS,
+      payload: { repo: { ...REPO, name: 'anastest-pw' }, expectedVersion: 0 },
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'PVE_MANAGED')
+  })
+
+  it('DELETE /backup/repos/pve:<id> is a 400 hands-off refusal', async () => {
+    const res = await server.inject({ method: 'DELETE', url: '/v1/backup/repos/pve:anastest-pw?expectedVersion=0', headers: IDENTITY })
+    assert.equal(res.statusCode, 400)
+    assert.equal((res.json() as { error: { code: string } }).error.code, 'PVE_MANAGED')
+  })
+
+  it('POST /backup/tasks accepts a pve:<id> repository and joins its datastore', async () => {
+    const pveTask = { ...TASK, name: 'pve-nightly', repository: 'pve:anastest-pw' }
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks', headers: JSON_HEADERS, payload: pveTask })
+    assert.equal(res.statusCode, 202)
+    assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
+    const list = await server.inject({ method: 'GET', url: '/v1/backup/tasks', headers: IDENTITY })
+    const { data } = list.json() as { data: BackupTaskEntry[] }
+    const entry = data.find(e => e.task.name === 'pve-nightly')!
+    assert.equal(entry.task.repository, 'pve:anastest-pw')
+    assert.equal(entry.task.datastore, 'anastest-store') // joined from the PVE storage
+  })
+
+  it('POST /backup/repos/test resolves a pve:<id> repo (404 only when it does not exist)', async () => {
+    const ok = await server.inject({ method: 'POST', url: '/v1/backup/repos/test', headers: JSON_HEADERS, payload: { name: 'pve:anastest-pw' } })
+    assert.equal(ok.statusCode, 200) // resolved (a real stage verdict, not a 404)
+    assert.ok((ok.json() as { data: { stage: string } }).data.stage)
+    const missing = await server.inject({ method: 'POST', url: '/v1/backup/repos/test', headers: JSON_HEADERS, payload: { name: 'pve:nope' } })
+    assert.equal(missing.statusCode, 404)
+  })
+
+  it('POST /backup/tasks/:name/run resolves the .pw secret at exec and completes', async () => {
+    const pveTask = { ...TASK, name: 'pve-run', repository: 'pve:anastest-pw' }
+    const create = await server.inject({ method: 'POST', url: '/v1/backup/tasks', headers: JSON_HEADERS, payload: pveTask })
+    await waitForJob(server, await jobIdFrom(create))
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pve-run/run', headers: JSON_HEADERS, payload: {} })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    assert.equal((job.result as { status: string }).status, 'success')
   })
 })

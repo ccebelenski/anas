@@ -1,8 +1,10 @@
 import type { BackupRepo, BackupRepoRegistry } from '@anas/shared'
+import type { PbsStorageDef } from '../parsers/pve-storage.js'
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
-import { BackupRepoRegistry as BackupRepoRegistrySchema } from '@anas/shared'
+import { BackupRepoRegistry as BackupRepoRegistrySchema, PVE_REPO_PREFIX } from '@anas/shared'
+import { PVE_PRIV_STORAGE_DIR, PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 
 /**
  * PBS repositories registry (Epic 16.2) — the COROSYNC STORE, reusing the
@@ -28,6 +30,17 @@ export interface BackupReposPaths {
   registryFile: string
   /** Directory holding per-repo 0600 secret files. */
   credsDir: string
+  /**
+   * storage.cfg — read-only, for tier-1 PVE-defined repos (Epic 16.8). ANAS
+   * never writes it. Reuses the mounts-tagging ANAS_STORAGE_CFG override.
+   */
+  pveStorageCfg: string
+  /**
+   * The PVE per-storage secret dir (`/etc/pve/priv/storage`). A tier-1 repo's
+   * secret is read from `<id>.pw` here at exec/test time — never copied,
+   * never cached. ANAS never writes it.
+   */
+  pvePrivStorageDir: string
 }
 
 /** Default paths (env-overridable, else the pmxcfs / system locations). */
@@ -35,6 +48,8 @@ export function defaultBackupReposPaths(): BackupReposPaths {
   return {
     registryFile: process.env.ANAS_BACKUP_REPOS_FILE ?? '/etc/pve/anas/backup-repos.json',
     credsDir: process.env.ANAS_BACKUP_CREDS_DIR ?? '/etc/anas/creds',
+    pveStorageCfg: process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG,
+    pvePrivStorageDir: process.env.ANAS_PVE_PRIV_STORAGE_DIR ?? PVE_PRIV_STORAGE_DIR,
   }
 }
 
@@ -42,6 +57,9 @@ export function defaultBackupReposPaths(): BackupReposPaths {
 export function backupNodename(): string {
   return process.env.ANAS_NODENAME ?? hostname()
 }
+
+/** A single trailing newline on a PVE `.pw` file (bare secret + `\n`). */
+const PW_TRAILING_NEWLINE_RE = /\r?\n$/
 
 /** Thrown when the registry moved between the caller's read and our CAS write. */
 export class BackupReposConflictError extends Error {
@@ -181,4 +199,83 @@ export async function repoSecretSet(dir: string, name: string): Promise<boolean>
 /** Remove a repo's secret file (best-effort — the goal state is "absent"). */
 export async function removeRepoSecret(dir: string, name: string): Promise<void> {
   await rm(repoSecretPath(dir, name), { force: true }).catch(() => {})
+}
+
+// --- Tier 1: PVE-defined repositories (Epic 16.8) ---------------------------
+//
+// A `pbs` storage in /etc/pve/storage.cfg is offered as a hands-off repository
+// named `pve:<storage-id>` (the reserved namespace — a tier-2 BackupName can
+// never carry a colon, so the two tiers never collide). The server/datastore/
+// username/fingerprint come from the read-only parse; the SECRET is read from
+// /etc/pve/priv/storage/<id>.pw ONLY at exec/test time — never copied into
+// /etc/anas/creds, never cached in memory beyond the exec, never returned.
+
+/** The tier-1 repo name for a PVE storage id (`anastest-pw` → `pve:anastest-pw`). */
+export function pveRepoName(id: string): string {
+  return `${PVE_REPO_PREFIX}${id}`
+}
+
+/** Is this repo reference a tier-1 PVE-defined repo (`pve:<id>`)? */
+export function isPveRepoName(name: string): boolean {
+  return name.startsWith(PVE_REPO_PREFIX)
+}
+
+/** The PVE storage id behind a `pve:<id>` reference (`pve:foo` → `foo`). */
+export function pveStorageId(name: string): string {
+  return name.slice(PVE_REPO_PREFIX.length)
+}
+
+/**
+ * Map a parsed PBS stanza onto the runtime {@link BackupRepo} shape (name
+ * `pve:<id>`). The auth style is inferred from the username: a token id carries
+ * a `!tokenname` suffix (ground truth 16.1/16.8), otherwise it is password auth.
+ * This object is built in-process (never zod-parsed), so the colon in the name
+ * is fine — the runner reads host/port/datastore/authType/username|tokenId, not
+ * the name, to build PBS_REPOSITORY.
+ */
+export function pbsDefToRepo(def: PbsStorageDef): BackupRepo {
+  const isToken = (def.username ?? '').includes('!')
+  const repo: BackupRepo = {
+    name: pveRepoName(def.id),
+    host: def.server,
+    port: def.port ?? 8007,
+    datastore: def.datastore,
+    authType: isToken ? 'token' : 'password',
+  }
+  if (def.namespace)
+    repo.namespace = def.namespace
+  if (def.fingerprint)
+    repo.fingerprint = def.fingerprint
+  if (isToken)
+    repo.tokenId = def.username
+  else if (def.username)
+    repo.username = def.username
+  return repo
+}
+
+/** Path of a PVE storage's secret file (`<privDir>/<id>.pw`). */
+export function pveSecretPath(privDir: string, id: string): string {
+  return join(privDir, `${id}.pw`)
+}
+
+/**
+ * Read a PVE storage's secret from its `.pw` file, or null if absent. Ground
+ * truth (16.8): the file is the bare secret plus a single trailing newline
+ * (`AnasPbsTest123\n`), so a lone trailing newline is stripped — nothing else is
+ * touched (the secret is used verbatim as PBS_PASSWORD). Read fresh EVERY time
+ * (rotation in PVE is instantly effective — ANAS holds no second copy).
+ */
+export async function readPveSecret(privDir: string, id: string): Promise<string | null> {
+  try {
+    const raw = await readFile(pveSecretPath(privDir, id), 'utf-8')
+    return raw.replace(PW_TRAILING_NEWLINE_RE, '')
+  }
+  catch {
+    return null
+  }
+}
+
+/** Does this PVE storage have a secret file? (drives tier-1 `credentialsSet`). */
+export async function pveSecretSet(privDir: string, id: string): Promise<boolean> {
+  return (await readPveSecret(privDir, id)) !== null
 }
