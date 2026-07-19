@@ -578,7 +578,7 @@ Per Don't-Build-Undifferentiated-Code: ANAS **configures** realmd/winbind/sssd (
 
 Detailed stories to be written when prioritized. Not MVP — but the getent seam (Epic 8) must be in place so this drops in without rework.
 
-### Epic 16: File Backup via Proxmox Backup (experimental — needs spec/design)
+### Epic 16: File Backup via Proxmox Backup (designed 2026-07-18 — ready to build)
 
 > As a user, I want ANAS to back up host FILE data — shares, datasets, **and any mounted drive/path** — to a Proxmox Backup Server using `proxmox-backup-client`, so my NAS data gets PBS's dedup/encryption/retention/verification without hand-rolled cron jobs.
 
@@ -592,30 +592,36 @@ ANAS value, and it is maximal guest-philosophy leverage: PBS owns the hard parts
 (chunking, dedup, encryption, retention, verify, restore); ANAS only *configures
 and schedules* the client invocation and surfaces status.
 
-Design questions to settle before stories are written:
-- **Target model**: PBS repository/datastore + namespace + auth (API token vs
-  password file; secrets handling must follow the stdin-not-argv rule). Where
-  does the repository config live? (Config-as-API: probably a small stanza the
-  daemon owns, or reuse /etc/pve PBS storage entries read-only when present —
-  a PBS storage in storage.cfg already carries server/datastore/auth.)
-- **What to back up**: per-source selection where a source is a PATH — dataset,
-  share, or any mounted drive/directory (per the scope note above; mounts from
-  `findmnt` populate the picker alongside datasets/shares). ZFS-backed sources
-  get snapshot-consistent backups: take a ZFS snapshot, back up from the
-  snapshot's .zfs/snapshot path, destroy after — atomicity for free. Non-ZFS
-  sources back up live, labeled as such.
-- **Scheduling**: per the standing ruling, NO custom scheduler — generate
-  systemd timer/service units (surgical, removable), status read back from
-  systemd/journald.
-- **Status/observe**: last-run result + next-run surfaced on the dataset/share
-  rows and the dashboard (jobs/warnings categories already exist);
-  proxmox-backup-client exit status + journald for detail.
-- **Restore**: v1 probably points at the PBS UI for restore (leverage) rather
-  than building a restore browser; revisit after real use.
-- **Scope guard**: experimental — one node, file/pxar only, no guest backups
-  (PVE owns those), no PBS server management.
+> **Design decisions (agreed 2026-07-18 — ground truth: the operator's real `pbc-backup.sh` cron script):**
+> - **Task model — multi-archive is a choice, never a requirement.** A backup task = repository ref + PBS namespace + **1..N archives**, each `{name, path, excludes[]}` — the operator's own shape (six named pxar archives in one atomic PBS snapshot group) fully supported, single-source tasks are just a list of one. Archive **names and paths are explicit config data** (stable PBS identities, shown in the UI — never derived/hidden).
+> - **Excludes are explicit config**, per archive, passed as `--exclude` patterns. The tool's `.pxarexclude` dotfile convention keeps working for hand-managed trees (guest philosophy — we never strip it), but ANAS-configured excludes live in the task config where they can be seen and edited.
+> - **Repositories = the replication-remotes pattern reapplied**: registered PBS repositories (user@host:port:datastore) in the cluster-wide CAS-versioned store; **certificate fingerprint pinned with explicit one-time confirmation** (the operator's script already pins `PBS_FINGERPRINT` — no silent TOFU); diagnosing test-connection (dns / tcp / tls-fingerprint / auth / datastore / namespace verdicts). `storage.cfg` PBS entries may pre-fill the add dialog (read-only), never be written.
+> - **Auth is a per-repository user choice: API token OR username+password.** UI copy recommends tokens (scoped, revocable) but both are first-class. Secret in a per-repo root-only 0600 file under `/etc/anas/creds/`, injected via environment (`PBS_PASSWORD`) — never argv, never a world-readable script (the one thing the operator's cron script did wrong, per the operator).
+> - **`--change-detection-mode` is a per-task choice, not a forced default**: the client's default (data/block) mode vs `metadata`. Honest guidance in the UI — metadata re-scans many-small-file trees faster; the operator's field experience is that default mode holds up well, especially for big backups. No pretending one is universally optimal.
+> - **Snapshot-consistency is a per-source upgrade**: ZFS-backed paths get snapshot → back up from `.zfs/snapshot` → destroy (atomicity for free); non-ZFS paths back up live, labeled as such (the operator's baseline for years). Mounted drives are first-class sources (scope note above); the Epic 18 mount inventory feeds the picker.
+> - **Scheduling/status = the replication template verbatim**: `anas-backup-<name>.service`/`.timer` ARE the task store (no second config source); the service invokes the helper that POSTs the daemon job, exiting truthfully for systemd; **PBS's own snapshot list is the durable last-good record** (the server is the source of truth, journald is forensics); retention/prune/GC is PBS server-side — ANAS surfaces it read-only at most.
+> - **Restore points at the PBS UI** (leverage); a restore browser is a someday, not v1.
+> - **Scope guard stands**: file/pxar only, no guest backups (PVE owns those), no PBS server management.
 
-Detailed stories to be written when prioritized.
+#### Stories
+
+##### Dev (ground truth first)
+16.1. As a dev, I want ground truth from a real PBS target before code: stand up a disposable PBS (test VM or PBS packages on the stunt node — NEVER the operator's real PBS box), then capture verbatim: successful backup runs (both change-detection modes, multi-archive, excludes), `snapshot list --output-format json`, the full failure taxonomy (bad fingerprint / bad token / bad password / missing datastore / bad namespace / unreachable) with exit codes and stderr, and the exact env-var contract (`PBS_REPOSITORY`/`PBS_PASSWORD`/`PBS_FINGERPRINT`, token id syntax) — so the parser, verdicts, and creds handling are built on reality.
+
+16.2. As a dev, I want the PBS repositories registry + shared schemas: cluster-wide CAS-versioned store (the replication-remotes machinery), per-repo secret files (0600, write-only through the API, token or password), fingerprint pinning with confirm-once, and a diagnosing test endpoint — so repositories are registered once and usable cluster-wide.
+
+16.3. As a dev, I want backup tasks stored as systemd units (`anas-backup-<name>.service` + `.timer`, generated/parsed/rewritten like replication's) carrying the full task config (repository ref, namespace, archives with excludes, change-detection mode), so there is no second config source and systemd's own state stays truthful.
+
+##### Observe
+16.4. As a user, I want a **Backup** menu: task grid (name, repository:datastore/namespace, archive count, last run + result, next run, overdue highlighted) with per-task detail showing the archive list, the PBS-side snapshot history for the task's group (from `snapshot list`, labeled as the durable record), and last-run journald output as forensics — so backup health is observable in one place.
+
+##### Act
+16.5. As a user, I want to create/edit/disable/delete backup tasks — pick a repository + namespace, add 1..N archives (name, path from the free-typed path or the datasets/shares/mounts pickers, per-archive excludes), choose schedule and change-detection mode, Run Now with job progress — so my hand-rolled cron jobs become managed, observable tasks. *(Suggested-defaults nicety: offer an `etc.pxar:/etc` host-config archive in the new-task dialog — the operator's own habit worth spreading.)*
+
+16.6. As a user, I want the repositories manager UI: add/edit a PBS repository with the auth choice (token recommended, username+password supported), the fingerprint shown for explicit confirmation, and Test that diagnoses rather than fails — so targets are set up once, safely.
+
+##### Dashboard
+16.7. As a user, I want only failures and overdue tasks surfaced (new `backup` warning category, replication policy: silently-overdue-past-interval counts as failed; healthy/idle shows nothing) — and this epic further strengthens the deferred 9.4 notification evaluation once shipped.
 
 ### Epic 17: Scheduled Snapshots & Scrubs
 
