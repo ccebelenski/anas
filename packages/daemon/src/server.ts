@@ -11,6 +11,7 @@ import { mockFixtures } from './fixtures/loader.js'
 import { JobQueue } from './jobs/queue.js'
 import { LSBLK_ARGS } from './parsers/lsblk.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
+import { backupRoutes } from './routes/backup.js'
 import { dashboardRoutes } from './routes/dashboard.js'
 import { datasetRoutes } from './routes/datasets.js'
 import { diskRoutes } from './routes/disks.js'
@@ -24,6 +25,7 @@ import { shareIdentityRoutes } from './routes/share-identity.js'
 import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { smbShareRoutes } from './routes/shares-smb.js'
 import { ConfirmStore } from './safety/confirm.js'
+import { defaultBackupReposPaths } from './services/backup-repos.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
 import { defaultRemotesPaths } from './services/replication-remotes.js'
 import { createTransport, defaultMembersFile } from './services/replication-transport.js'
@@ -91,6 +93,17 @@ export function createServer(opts?: ServerOptions) {
     ? join(tmpdir(), `anas-mock-members-${process.pid}.json`)
     : defaultMembersFile()
   const transport = createTransport(executor, { paths: remotesPaths, membersFile })
+
+  // PBS backup repositories registry + per-repo secret files (Epic 16.2). Same
+  // shape as the remotes store; in dev mock (no explicit env) keep the registry
+  // and creds off the real /etc/pve and /etc/anas so a stray write never touches
+  // the host.
+  const backupReposPaths = (opts?.mock && !process.env.ANAS_BACKUP_REPOS_FILE)
+    ? {
+        registryFile: join(tmpdir(), `anas-mock-backup-repos-${process.pid}.json`),
+        credsDir: join(tmpdir(), `anas-mock-backup-creds-${process.pid}`),
+      }
+    : defaultBackupReposPaths()
 
   // Register mock fixtures for dev mode
   if (opts?.mock) {
@@ -384,6 +397,9 @@ export function createServer(opts?: ServerOptions) {
   server.register(replicationTaskRoutes, { prefix: '/v1', executor, jobQueue, systemdDir, transport })
   // Stage-3 remotes registry (Epic 5.5.2) — corosync-store CRUD + diagnostics.
   server.register(replicationRemotesRoutes, { prefix: '/v1', executor, jobQueue, paths: remotesPaths, transport, systemdDir })
+  // PBS file backup (Epic 16) — repositories registry (CAS + creds + test) and
+  // the systemd units-as-store task CRUD + LOCAL-ONLY status + Run-Now.
+  server.register(backupRoutes, { prefix: '/v1', executor, jobQueue, paths: backupReposPaths, systemdDir })
   // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
   // inventory + PVE-tagged hands-off + guarded status probe.
   server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath })

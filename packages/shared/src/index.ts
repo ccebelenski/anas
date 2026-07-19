@@ -19,6 +19,28 @@ export {
   RequestHeaders,
 } from './schemas/api.js'
 
+// Backup schemas (Epic 16 — PBS file backup)
+export {
+  BackupArchive,
+  BackupAuthType,
+  BackupName,
+  BackupRecentRun,
+  BackupRepo,
+  BackupRepoRegistry,
+  BackupRepoResponse,
+  BackupRepoTestRequest,
+  BackupRepoTestResult,
+  BackupRepoWrite,
+  BackupRunResult,
+  BackupTask,
+  BackupTaskDetail,
+  BackupTaskEntry,
+  BackupTaskRequest,
+  BackupTaskView,
+  ChangeDetectionMode,
+  UpsertBackupRepoRequest,
+} from './schemas/backup.js'
+
 // Common validators
 export {
   AbsolutePath,
@@ -127,6 +149,8 @@ export {
 
 // Replication schemas (Epic 5.5)
 export {
+  RemotesFile,
+  RemoteTestResult,
   ReplicatePlan,
   ReplicatePlanRequest,
   ReplicateRequest,
@@ -136,8 +160,6 @@ export {
   ReplicationTask,
   ReplicationTaskName,
   ReplicationTaskStatus,
-  RemotesFile,
-  RemoteTestResult,
   UpsertRemoteRequest,
 } from './schemas/replication.js'
 

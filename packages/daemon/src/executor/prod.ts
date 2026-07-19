@@ -13,7 +13,12 @@ export class ProdExecutor implements CommandExecutor {
       const child = execFile(
         command,
         args,
-        { maxBuffer: 10 * 1024 * 1024 },
+        {
+          maxBuffer: 10 * 1024 * 1024,
+          // Merge secret env (e.g. pbc's PBS_PASSWORD, Epic 16) over the
+          // daemon's own environment for the child only — never on argv.
+          ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
+        },
         (err, stdout, stderr) => {
           // System errors (ENOENT, EACCES) — command couldn't start
           if (err && typeof err.code === 'string') {
