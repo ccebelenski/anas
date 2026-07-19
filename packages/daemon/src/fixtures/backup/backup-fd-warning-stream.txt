@@ -1,0 +1,31 @@
+### STREAM CHECK for the low-nofile warning + default-vs-metadata threshold
+
+=== metadata mode, prlimit 1024, STDOUT only (stderr -> /dev/null) ===
+--- (above is STDOUT only) ---
+
+=== metadata mode, prlimit 1024, STDERR only (stdout -> /dev/null) ===
+Starting backup: [anastest]:host/fd-stream-m/2026-07-19T01:13:57Z    
+Client name: anas-pve    
+Starting backup protocol: Sun Jul 19 01:13:57 2026    
+Downloading previous manifest (Sun Jul 19 01:13:55 2026)    
+Upload directory '/root/anas-big' to 'root@pam@localhost:8007:anastest-store' as w.mpxar.didx    
+Using previous index as metadata reference for 'w.mpxar.didx'    
+resource limit for open file handles low: 1024    
+Change detection summary:
+ - 40000 total files (0 hardlinks)
+ - 0 unchanged, reusable files with 0 B data
+ - 40000 changed or non-reusable files with 2.362 MiB data
+ - 0 B padding in 0 partially reused chunks
+w.ppxar: had to backup 0 B of 2.362 MiB (compressed 0 B) in 0.22 s (average 0 B/s)
+w.ppxar: backup was done incrementally, reused 2.362 MiB (100.0%)
+w.mpxar: had to backup 0 B of 5.232 MiB (compressed 0 B) in 0.22 s (average 0 B/s)
+w.mpxar: backup was done incrementally, reused 5.232 MiB (100.0%)
+Duration: 0.41s    
+End Time: Sun Jul 19 01:13:58 2026    
+--- (above is STDERR only) ---
+
+=== default mode, prlimit 1024, combined (does default warn at 1024?) ===
+  (no 'resource limit' warning in default mode at 1024)
+
+=== default mode, prlimit 256, combined (does default warn at 256?) ===
+  (no 'resource limit' warning in default mode at 256)

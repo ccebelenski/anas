@@ -1,0 +1,60 @@
+### CAPTURE: timer shape — hand-written anas-backup-test.service + .timer
+### (LimitNOFILE=1024 default; ExecStart placeholder; OnCalendar daily 02:00)
+
+===================== anas-backup-test.service (as written) =====================
+[Unit]
+Description=ANAS backup task test
+# X-ANAS-Task={"name":"test","repo":"pbs-main","namespace":"anastest","backupId":"anas-pve","archives":[{"name":"documents","path":"/root/anas-src/documents","excludes":[]}],"mode":"metadata","schedule":"*-*-* 02:00:00"}
+
+[Service]
+Type=oneshot
+# per-task file-handle backpressure (pbc hoards fds, worst in metadata mode)
+LimitNOFILE=1024
+# placeholder: real unit invokes the daemon-posting helper
+ExecStart=/usr/bin/true
+===================== anas-backup-test.timer (as written) =======================
+[Unit]
+Description=ANAS backup timer test
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+===================== systemctl list-timers anas-backup-test.timer =====================
+NEXT                         LEFT LAST PASSED UNIT                   ACTIVATES
+Sun 2026-07-19 02:00:00 UTC 43min -         - anas-backup-test.timer anas-backup-test.service
+
+1 timers listed.
+
+===================== systemctl show TIMER (props the status code reads + more) =====================
+### replication-units.ts reads NextElapseUSecRealtime off the timer:
+TimersCalendar={ OnCalendar=*-*-* 02:00:00 ; next_elapse=Sun 2026-07-19 02:00:00 UTC }
+NextElapseUSecRealtime=Sun 2026-07-19 02:00:00 UTC
+NextElapseUSecMonotonic=0
+LastTriggerUSec=
+Persistent=yes
+Id=anas-backup-test.timer
+Description=ANAS backup timer test
+LoadState=loaded
+ActiveState=active
+SubState=waiting
+UnitFileState=enabled
+
+===================== systemctl show SERVICE (props the status code reads + more) =====================
+### replication-units.ts reads ActiveState,Result,ExecMainStatus off the service:
+Type=oneshot
+Result=success
+ExecMainStartTimestamp=
+ExecMainStatus=0
+ExecStart={ path=/usr/bin/true ; argv[]=/usr/bin/true ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }
+LimitNOFILE=1024
+LimitNOFILESoft=1024
+Id=anas-backup-test.service
+Description=ANAS backup task test
+LoadState=loaded
+ActiveState=inactive
+SubState=dead
+UnitFileState=static

@@ -1,0 +1,48 @@
+### CAPTURE: EXCLUDES — --exclude patterns + a .pxarexclude file in the tree
+### Source tree files (11):
+###   /root/anas-exc/.pxarexclude
+###   /root/anas-exc/build/output.o
+###   /root/anas-exc/data/cache.tmp
+###   /root/anas-exc/data/real.dat
+###   /root/anas-exc/keep.txt
+###   /root/anas-exc/logs/app.log
+###   /root/anas-exc/logs/debug.log
+###   /root/anas-exc/node_modules/x.js
+###   /root/anas-exc/secret.key
+###   /root/anas-exc/src/build/keep.c
+###   /root/anas-exc/tmp/a.dat
+###
+### .pxarexclude (at tree root) contains:  node_modules  and  *.tmp
+### --exclude CLI patterns:  '*.key' (name glob) | '/build' (path-anchored to tree root) | 'tmp' (dir name)
+### EXPECTED KEPT: keep.txt, logs/app.log, logs/debug.log, src/build/keep.c, data/real.dat, .pxarexclude
+### EXPECTED GONE: secret.key, build/output.o, tmp/a.dat, node_modules/x.js, data/cache.tmp
+### cmd: proxmox-backup-client backup exc.pxar:/root/anas-exc --exclude '*.key' --exclude '/build' --exclude 'tmp' --ns anastest --backup-id excludes
+=== BACKUP STDOUT+STDERR ===
+Starting backup: [anastest]:host/excludes/2026-07-19T01:10:04Z    
+Client name: anas-pve    
+Starting backup protocol: Sun Jul 19 01:10:04 2026    
+Downloading previous manifest (Sun Jul 19 01:09:16 2026)    
+Upload directory '/root/anas-exc' to 'root@pam@localhost:8007:anastest-store' as exc.pxar.didx    
+exc.pxar: had to backup 0 B of 1.55 KiB (compressed 0 B) in 0.00 s (average 0 B/s)
+Uploaded backup catalog (190 B)
+Duration: 0.12s    
+End Time: Sun Jul 19 01:10:05 2026    
+=== EXIT CODE: 0 ===
+
+=== VERIFICATION: catalog dump of host/excludes/2026-07-19T01:10:04Z (what actually got stored) ===
+### ground-truth verification only; ANAS-the-product never reads server state
+d "./exc.pxar.didx"    
+f "./exc.pxar.didx/.pxarexclude" 19 2026-07-19T01:08:58Z    
+d "./exc.pxar.didx/data"    
+f "./exc.pxar.didx/data/real.dat" 9 2026-07-19T01:08:58Z    
+f "./exc.pxar.didx/keep.txt" 5 2026-07-19T01:08:58Z    
+d "./exc.pxar.didx/logs"    
+f "./exc.pxar.didx/logs/app.log" 7 2026-07-19T01:08:58Z    
+f "./exc.pxar.didx/logs/debug.log" 4 2026-07-19T01:08:58Z    
+d "./exc.pxar.didx/src"    
+d "./exc.pxar.didx/src/build"    
+f "./exc.pxar.didx/src/build/keep.c" 9 2026-07-19T01:08:58Z    
+f "./exc.pxar.didx/.pxarexclude-cli" 17 1970-01-01T00:00:00Z    
+=== END catalog dump ===
+### RESULT: path-anchored '/build' excluded ROOT build/ but KEPT src/build/keep.c (anchoring works).
+### The synthetic '.pxarexclude-cli' entry is the client recording the CLI --exclude patterns INTO the archive.

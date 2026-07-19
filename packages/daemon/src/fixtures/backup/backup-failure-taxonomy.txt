@@ -1,0 +1,105 @@
+### FAILURE TAXONOMY — proxmox-backup-client repo/auth/datastore/namespace probes
+### probe command: snapshot list (contacts server; needs tcp+tls+auth+datastore+namespace)
+### exit 255 = generic client error for ALL failures; stderr string is the discriminator.
+### rc 124 would mean 'timeout' fired (unreachable hang).
+
+----------------------------------------------------------------------
+CASE: 0. BASELINE (all correct, password auth) — expect success
+  PBS_REPOSITORY=root@pam@localhost:anastest-store   --ns anastest
+  probe: proxmox-backup-client snapshot list --ns anastest --output-format json
+  === stderr+stdout (verbatim) ===
+  | [{"backup-id":"fd-meta-lo","backup-time":1784423570,"backup-type":"host","files":[{"crypt-mode":"none","filename":"bigtree.ppxar.didx","size":2476832},{"crypt-mode":"none","filename":"bigtree.mpxar.didx","size":5486612},{"crypt-mode":"none","filename":"index.json.blob","size":370}],"owner":"root@pam","protected":false,"size":7963814},{"backup-id":"fd-def-vlo","backup-time":1784423577,"backup-type":"host","files":[{"crypt-mode":"none","filename":"bigtree.pxar.didx","size":6683388},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":620930},{"crypt-mode":"none","filename":"index.json.blob","size":382}],"owner":"root@pam","protected":false,"size":7304700},{"backup-id":"cdm-metadata","backup-time":1784423434,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.ppxar.didx","size":196832},{"crypt-mode":"none","filename":"cdm.mpxar.didx","size":1958},{"crypt-mode":"none","filename":"index.json.blob","size":368}],"owner":"root@pam","protected":false,"size":199158},{"backup-id":"cdm-default2","backup-time":1784423460,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.pxar.didx","size":198350},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":316},{"crypt-mode":"none","filename":"index.json.blob","size":374}],"owner":"root@pam","protected":false,"size":199040},{"backup-id":"cdm-default2","backup-time":1784423463,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.pxar.didx","size":198350},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":316},{"crypt-mode":"none","filename":"index.json.blob","size":373}],"owner":"root@pam","protected":false,"size":199039},{"backup-id":"cdm-default","backup-time":1784423434,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.pxar.didx","size":198350},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":316},{"crypt-mode":"none","filename":"index.json.blob","size":374}],"owner":"root@pam","protected":false,"size":199040},{"backup-id":"multiarch","backup-time":1784423293,"backup-type":"host","files":[{"crypt-mode":"none","filename":"documents.pxar.didx","size":84948},{"crypt-mode":"none","filename":"pictures.pxar.didx","size":131595},{"crypt-mode":"none","filename":"music.pxar.didx","size":198350},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":1362},{"crypt-mode":"none","filename":"index.json.blob","size":487}],"owner":"root@pam","protected":false,"size":416742},{"backup-id":"anas-pve","backup-time":1784423227,"backup-type":"host","files":[{"crypt-mode":"none","filename":"documents.pxar.didx","size":84948},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":516},{"crypt-mode":"none","filename":"index.json.blob","size":379}],"owner":"root@pam","protected":false,"size":85843},{"backup-id":"fd-meta-hi","backup-time":1784423564,"backup-type":"host","files":[{"crypt-mode":"none","filename":"bigtree.ppxar.didx","size":2476832},{"crypt-mode":"none","filename":"bigtree.mpxar.didx","size":5486612},{"crypt-mode":"none","filename":"index.json.blob","size":372}],"owner":"root@pam","protected":false,"size":7963816},{"backup-id":"pictures","backup-time":1784423314,"backup-type":"host","files":[{"crypt-mode":"none","filename":"pics.pxar.didx","size":131595},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":558},{"crypt-mode":"none","filename":"index.json.blob","size":376}],"owner":"root@pam","protected":false,"size":132529},{"backup-id":"tokentest","backup-time":1784423265,"backup-type":"host","files":[{"crypt-mode":"none","filename":"documents.pxar.didx","size":84948},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":516},{"crypt-mode":"none","filename":"index.json.blob","size":375}],"owner":"root@pam!anas-test","protected":false,"size":85839},{"backup-id":"excludes","backup-time":1784423356,"backup-type":"host","files":[{"crypt-mode":"none","filename":"exc.pxar.didx","size":1587},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":190},{"crypt-mode":"none","filename":"index.json.blob","size":371}],"owner":"root@pam","protected":false,"size":2148},{"backup-id":"excludes","backup-time":1784423404,"backup-type":"host","files":[{"crypt-mode":"none","filename":"exc.pxar.didx","size":1587},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":190},{"crypt-mode":"none","filename":"index.json.blob","size":367}],"owner":"root@pam","protected":false,"size":2144},{"backup-id":"fd-stream-d","backup-time":1784423642,"backup-type":"host","files":[{"crypt-mode":"none","filename":"w.pxar.didx","size":6683388},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":620924},{"crypt-mode":"none","filename":"index.json.blob","size":378}],"owner":"root@pam","protected":false,"size":7304690},{"backup-id":"fd-stream-d","backup-time":1784423640,"backup-type":"host","files":[{"crypt-mode":"none","filename":"w.pxar.didx","size":6683388},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":620924},{"crypt-mode":"none","filename":"index.json.blob","size":381}],"owner":"root@pam","protected":false,"size":7304693},{"backup-id":"fd-def-lo","backup-time":1784423567,"backup-type":"host","files":[{"crypt-mode":"none","filename":"bigtree.pxar.didx","size":6683388},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":620930},{"crypt-mode":"none","filename":"index.json.blob","size":381}],"owner":"root@pam","protected":false,"size":7304699},{"backup-id":"fd-stream-m","backup-time":1784423635,"backup-type":"host","files":[{"crypt-mode":"none","filename":"w.ppxar.didx","size":2476832},{"crypt-mode":"none","filename":"w.mpxar.didx","size":5486612},{"crypt-mode":"none","filename":"index.json.blob","size":370}],"owner":"root@pam","protected":false,"size":7963814},{"backup-id":"fd-stream-m","backup-time":1784423637,"backup-type":"host","files":[{"crypt-mode":"none","filename":"w.ppxar.didx","size":2476832},{"crypt-mode":"none","filename":"w.mpxar.didx","size":5486612},{"crypt-mode":"none","filename":"index.json.blob","size":361}],"owner":"root@pam","protected":false,"size":7963805},{"backup-id":"cdm-metadata2","backup-time":1784423466,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.ppxar.didx","size":196832},{"crypt-mode":"none","filename":"cdm.mpxar.didx","size":1958},{"crypt-mode":"none","filename":"index.json.blob","size":369}],"owner":"root@pam","protected":false,"size":199159},{"backup-id":"cdm-metadata2","backup-time":1784423469,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.ppxar.didx","size":196864},{"crypt-mode":"none","filename":"cdm.mpxar.didx","size":1958},{"crypt-mode":"none","filename":"index.json.blob","size":366}],"owner":"root@pam","protected":false,"size":199188},{"backup-id":"fd-def-hi","backup-time":1784423560,"backup-type":"host","files":[{"crypt-mode":"none","filename":"bigtree.pxar.didx","size":6683388},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":620930},{"crypt-mode":"none","filename":"index.json.blob","size":384}],"owner":"root@pam","protected":false,"size":7304702},{"backup-id":"fd-meta-vlo","backup-time":1784423574,"backup-type":"host","files":[{"crypt-mode":"none","filename":"bigtree.ppxar.didx","size":2476832},{"crypt-mode":"none","filename":"bigtree.mpxar.didx","size":5486612},{"crypt-mode":"none","filename":"index.json.blob","size":371}],"owner":"root@pam","protected":false,"size":7963815}]
+  === EXIT CODE: 0 ===
+
+----------------------------------------------------------------------
+CASE: 1. UNREACHABLE HOST (192.0.2.99, RFC5737) — expect timeout/no route
+  PBS_REPOSITORY=root@pam@192.0.2.99:anastest-store   --ns anastest
+  probe: proxmox-backup-client snapshot list --ns anastest --output-format json
+  === stderr+stdout (verbatim) ===
+  | Error: client error (Connect)
+  === EXIT CODE: 255 ===
+
+----------------------------------------------------------------------
+CASE: 2. REACHABLE HOST WRONG PORT (localhost:9999 closed) — expect connection refused
+  PBS_REPOSITORY=root@pam@localhost:9999:anastest-store   --ns anastest
+  probe: proxmox-backup-client snapshot list --ns anastest --output-format json
+  === stderr+stdout (verbatim) ===
+  | Error: client error (Connect)
+  === EXIT CODE: 255 ===
+
+----------------------------------------------------------------------
+CASE: 3. WRONG FINGERPRINT (first byte cc->dd) — expect cert-pin mismatch
+  PBS_REPOSITORY=root@pam@localhost:anastest-store   --ns anastest
+  probe: proxmox-backup-client snapshot list --ns anastest --output-format json
+  === stderr+stdout (verbatim) ===
+  | WARNING: certificate fingerprint does not match expected fingerprint!
+  | expected:    dd:b8:a0:35:60:b9:5f:77:10:e8:c2:62:ce:1e:dd:08:b8:03:0a:82:f7:62:09:bf:e8:f5:44:7e:8b:3e:2c:1d
+  | certificate validation failed - Certificate fingerprint was not confirmed.
+  | Error: client error (Connect)
+  === EXIT CODE: 255 ===
+
+----------------------------------------------------------------------
+CASE: 4. WRONG PASSWORD — expect auth failure
+  PBS_REPOSITORY=root@pam@localhost:anastest-store   --ns anastest
+  probe: proxmox-backup-client snapshot list --ns anastest --output-format json
+  === stderr+stdout (verbatim) ===
+  | Error: permission check failed.
+  === EXIT CODE: 255 ===
+
+----------------------------------------------------------------------
+CASE: 5. WRONG TOKEN SECRET (valid id, bad secret) — expect auth failure
+  PBS_REPOSITORY=root@pam!anas-test@localhost:anastest-store   --ns anastest
+  probe: proxmox-backup-client snapshot list --ns anastest --output-format json
+  === stderr+stdout (verbatim) ===
+  | Error: authentication failed
+  === EXIT CODE: 255 ===
+
+----------------------------------------------------------------------
+CASE: 6. REVOKED TOKEN (deleted server-side) — expect auth failure
+  PBS_REPOSITORY=root@pam!anas-revoked@localhost:anastest-store   --ns anastest
+  probe: proxmox-backup-client snapshot list --ns anastest --output-format json
+  === stderr+stdout (verbatim) ===
+  | Error: authentication failed
+  === EXIT CODE: 255 ===
+
+----------------------------------------------------------------------
+CASE: 7. TOKEN LACKING PERMISSION (no ACL) — expect permission denied
+  PBS_REPOSITORY=root@pam!anas-noperm@localhost:anastest-store   --ns anastest
+  probe: proxmox-backup-client snapshot list --ns anastest --output-format json
+  === stderr+stdout (verbatim) ===
+  | Error: permission check failed - missing Datastore.Audit|Datastore.Backup on /datastore/anastest-store/anastest
+  === EXIT CODE: 255 ===
+
+----------------------------------------------------------------------
+CASE: 8. NONEXISTENT DATASTORE (nosuchstore) — expect not found / permission
+  PBS_REPOSITORY=root@pam@localhost:nosuchstore   --ns anastest
+  probe: proxmox-backup-client snapshot list --ns anastest --output-format json
+  === stderr+stdout (verbatim) ===
+  | Error: no such datastore 'nosuchstore'
+  === EXIT CODE: 255 ===
+
+----------------------------------------------------------------------
+CASE: 9. NONEXISTENT NAMESPACE (--ns nosuchns)
+  PBS_REPOSITORY=root@pam@localhost:anastest-store   --ns nosuchns
+  probe: proxmox-backup-client snapshot list --ns nosuchns --output-format json
+  === stderr+stdout (verbatim) ===
+  | Error: ENOENT: No such file or directory
+  === EXIT CODE: 255 ===
+
+
+----------------------------------------------------------------------
+CASE: 10. DNS FAILURE (unresolvable hostname nosuchhost.invalid)
+  PBS_REPOSITORY=root@pam@nosuchhost.invalid:anastest-store   --ns anastest
+  === stderr+stdout (verbatim) ===
+  | Error: client error (Connect)
+  === EXIT CODE: 255 ===
+
+### DISCRIMINATOR SUMMARY (verbatim Error strings):
+###   unreachable IP / closed port / DNS-fail : ALL 'Error: client error (Connect)'  <- pbc CANNOT tell dns vs tcp vs route apart
+###   bad fingerprint : 'certificate fingerprint does not match expected fingerprint!' + 'Certificate fingerprint was not confirmed.' (final line still 'client error (Connect)')
+###   wrong PASSWORD  : 'Error: permission check failed.'   (note trailing period, no detail)
+###   wrong/revoked TOKEN : 'Error: authentication failed'  (bad-secret and revoked are IDENTICAL)
+###   token NO PERMISSION : 'Error: permission check failed - missing Datastore.Audit|Datastore.Backup on /datastore/<ds>/<ns>'
+###   nonexistent DATASTORE : "Error: no such datastore '<name>'"
+###   nonexistent NAMESPACE : 'Error: ENOENT: No such file or directory'
+### ALL failures exit 255 (124 only if timeout fires on a black-holed host).
