@@ -15,6 +15,7 @@ import { backupRoutes } from './routes/backup.js'
 import { dashboardRoutes } from './routes/dashboard.js'
 import { datasetRoutes } from './routes/datasets.js'
 import { diskRoutes } from './routes/disks.js'
+import { fsRoutes } from './routes/fs.js'
 import { healthRoutes } from './routes/health.js'
 import { jobRoutes } from './routes/jobs.js'
 import { mountsRoutes } from './routes/mounts.js'
@@ -389,6 +390,9 @@ export function createServer(opts?: ServerOptions) {
     ?? (opts?.mock ? createMockSmbConf() : '/etc/samba/smb.conf')
 
   server.register(healthRoutes, { prefix: '/v1' })
+  // Read-only filesystem browse (Epic 16.9) — backs the directory picker and
+  // gentle path validation. No executor, no mutation; node fs only.
+  server.register(fsRoutes, { prefix: '/v1' })
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
   server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
   // datasetRoutes also reads the share configs to report associated shares

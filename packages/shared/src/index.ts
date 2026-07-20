@@ -100,6 +100,13 @@ export {
   SmartHealth,
 } from './schemas/disks.js'
 
+// Filesystem browse (read-only UI support — Epic 16.9)
+export {
+  FsBrowseQuery,
+  FsBrowseResult,
+  FsEntryType,
+} from './schemas/fs.js'
+
 // Identity schemas (share users & groups — Epic 8)
 export {
   CreateGroupRequest,
