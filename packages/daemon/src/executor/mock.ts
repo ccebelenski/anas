@@ -7,7 +7,13 @@ export interface MockFixture {
   /** Args pattern to match. If omitted, matches any args for this command. */
   args?: string[]
   /** The result to return. */
-  result: ExecResult
+  result?: ExecResult
+  /**
+   * A SEQUENCE of results, one dequeued per matching call (the last repeats once
+   * exhausted). Lets a test script a state transition (e.g. `systemctl show`
+   * going activating → inactive). Takes precedence over `result`.
+   */
+  results?: ExecResult[]
 }
 
 /** A canned response for a specific pipeline (cmd1 | cmd2) pattern. */
@@ -79,19 +85,27 @@ export class MockExecutor implements CommandExecutor {
         && f.args.every((a, i) => a === args[i]),
     )
     if (exactMatch)
-      return exactMatch.result
+      return this.resultOf(exactMatch)
 
     const commandMatch = this.fixtures.find(
       f => f.command === command && f.args === undefined,
     )
     if (commandMatch)
-      return commandMatch.result
+      return this.resultOf(commandMatch)
 
     return {
       stdout: '',
       stderr: `mock: command not found: ${command}`,
       exitCode: 127,
     }
+  }
+
+  /** A fixture's next result — dequeue from `results` (last repeats), else `result`. */
+  private resultOf(fixture: MockFixture): ExecResult {
+    if (fixture.results && fixture.results.length > 0) {
+      return fixture.results.length > 1 ? fixture.results.shift()! : fixture.results[0]
+    }
+    return fixture.result ?? { stdout: '', stderr: '', exitCode: 0 }
   }
 
   async pipeline(cmd1: string, args1: string[], cmd2: string, args2: string[]): Promise<PipelineResult> {

@@ -476,7 +476,15 @@
             for (var i = 0; i < env.repos.length; i++) {
                 var r = env.repos[i] || {};
                 if (r.name) {
-                    map[r.name] = { datastore: r.datastore || '', host: r.host || '', port: r.port || PBS_PORT };
+                    map[r.name] = {
+                        datastore: r.datastore || '',
+                        host: r.host || '',
+                        port: r.port || PBS_PORT,
+                        // The repo's OWN namespace — the task wizard falls back to
+                        // it when a task sets no namespace, to verify the EFFECTIVE
+                        // namespace at save time.
+                        namespace: first(r.namespace) || '',
+                    };
                 }
             }
             REPO_MAP = map;
@@ -1241,6 +1249,7 @@
                     { text: t('Cancel'), handler: function () { win.close(); } },
                     {
                         text: isEdit ? t('Save') : t('Create'),
+                        itemId: 'taskSubmitBtn',
                         cls: 'anas-btn-backup-task-submit',
                         handler: function () {
                             try {
@@ -1342,22 +1351,93 @@
             body.namespace = namespace;
         }
 
-        ANAS.runJob({
-            node: node,
-            method: isEdit ? 'put' : 'post',
-            path: isEdit ? ('/backup/tasks/' + encodeURIComponent(name)) : '/backup/tasks',
-            body: body,
-            view: win,
-            failTitle: isEdit ? 'Save failed' : 'Create failed',
-            successMsg: isEdit ? (t('Backup task saved') + ': ' + name)
-                : (t('Backup task created') + ': ' + name),
-            onComplete: function () {
-                if (!win.destroyed && !win.destroying) {
-                    win.close();
+        var proceed = function () {
+            ANAS.runJob({
+                node: node,
+                method: isEdit ? 'put' : 'post',
+                path: isEdit ? ('/backup/tasks/' + encodeURIComponent(name)) : '/backup/tasks',
+                body: body,
+                view: win,
+                failTitle: isEdit ? 'Save failed' : 'Create failed',
+                successMsg: isEdit ? (t('Backup task saved') + ': ' + name)
+                    : (t('Backup task created') + ': ' + name),
+                onComplete: function () {
+                    if (!win.destroyed && !win.destroying) {
+                        win.close();
+                    }
+                    loadTasks(view, node);
+                },
+            });
+        };
+
+        // Save-time namespace verification (operator-sanctioned, warn-not-block):
+        // the effective namespace is the task's, else the chosen repo's own. When
+        // it is non-empty, verify it exists on the server before saving — a task
+        // pointed at a namespace that does not exist would fail at EVERY run
+        // (pbc ENOENT, ground truth). A blank effective namespace skips this.
+        var repoInfo = REPO_MAP[repository] || {};
+        var effectiveNs = namespace || (repoInfo.namespace || '');
+        if (!effectiveNs) {
+            proceed();
+            return;
+        }
+        verifyNamespaceThenSave(win, node, repository, effectiveNs, proceed);
+    }
+
+    // Verify the effective namespace via the (user-initiated, one-shot) test
+    // endpoint, then either save or ask for confirmation. Warn-not-block: a
+    // missing namespace, an unreachable/auth problem, or a failed call all offer
+    // "create anyway?" rather than stopping the operator. Reuses the repo Test
+    // endpoint with a namespace override so the TASK's effective namespace is
+    // what gets probed (not just the repo's).
+    function verifyNamespaceThenSave(win, node, repository, ns, proceed) {
+        var btn = win.down('#taskSubmitBtn');
+        if (btn) { try { btn.setDisabled(true); } catch (eBtn) { /* non-fatal */ } }
+        var reenable = function () {
+            if (btn && !win.destroyed && !win.destroying) {
+                try { btn.setDisabled(false); } catch (e) { /* non-fatal */ }
+            }
+        };
+        var confirmAnyway = function (msg) {
+            reenable();
+            try {
+                Ext.Msg.confirm(t('Verify PBS namespace'), msg, function (b) {
+                    if (b === 'yes') { proceed(); }
+                });
+            } catch (eMsg) {
+                // If the confirm dialog itself fails, do not block the save.
+                ANAS.warn('backup namespace confirm failed: ' + ANAS.errText(eMsg));
+                proceed();
+            }
+        };
+        ANAS.api.post(node, '/backup/repos/test', { name: repository, namespace: ns }).then(
+            function (res) {
+                if (win.destroyed || win.destroying) { return; }
+                var d = (res && res.data) || {};
+                var stage = '' + (first(d.stage, d.verdict) || 'ok');
+                if (stage === 'ok') {
+                    reenable();
+                    proceed();
+                    return;
                 }
-                loadTasks(view, node);
+                if (stage === 'namespace') {
+                    confirmAnyway(t('The namespace') + ' "' + enc(ns) + '" '
+                        + t('does not exist on the server — this task will fail at every run until you '
+                            + 'create it in the PBS UI.') + '<br><br>' + t('Create the task anyway?'));
+                    return;
+                }
+                // Any OTHER stage (unreachable / auth / datastore / tls …): warn
+                // generically — could not verify, still let the operator proceed.
+                var detail = d.detail ? (' — ' + enc(d.detail)) : (' (' + enc(stage) + ')');
+                confirmAnyway(t('Could not verify the namespace') + detail + '.<br><br>'
+                    + t('Create the task anyway?'));
             },
-        });
+            function (err) {
+                if (win.destroyed || win.destroying) { return; }
+                confirmAnyway(t('Could not verify the namespace') + ' — ' + enc(ANAS.errText(err))
+                    + '.<br><br>' + t('Create the task anyway?'));
+            }
+        );
     }
 
     // ---- Run Now (job with progress) ---------------------------------------

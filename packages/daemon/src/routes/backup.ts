@@ -14,6 +14,7 @@ import type { BackupReposPaths } from '../services/backup-repos.js'
 import {
   BackupName,
   BackupRepoTestRequest,
+  BackupRunRequest,
   BackupTaskRequest,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
@@ -50,6 +51,7 @@ import {
   readTask,
   readUnitTexts,
   removeTaskUnits,
+  superviseRun,
   taskFileExists,
   validateSchedule,
   writeTaskUnits,
@@ -71,7 +73,8 @@ import { requireIdentity } from './identity.js'
  *   POST   /v1/backup/tasks            → create (write units, enable timer)
  *   PUT    /v1/backup/tasks/:name      → update / enable / disable
  *   DELETE /v1/backup/tasks/:name      → remove units (PBS data untouched)
- *   POST   /v1/backup/tasks/:name/run  → Run Now (job carries pbc progress)
+ *   POST   /v1/backup/tasks/:name/run  → Run Now (UI: start+supervise the unit;
+ *                                        direct:true: the unit's own pbc exec)
  *
  * Mutations are identity-gated jobs (202 → { job }); registry writes are
  * COMPARE-AND-SWAP. Status is LOCAL-ONLY — ANAS never contacts the PBS server
@@ -384,7 +387,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         reply.code(404)
         return { error: { code: 'NOT_FOUND', message: `Repository '${req.name}' not found` } }
       }
-      repo = resolved.repo
+      // A `namespace` OVERRIDE lets the task wizard verify the TASK's effective
+      // namespace (the task's, else the repo's) against a REGISTERED repo without
+      // re-entering the whole config — the same `{ name }` form plus one field. A
+      // blank override falls through to the repo's own namespace.
+      repo = req.namespace
+        ? { ...resolved.repo, namespace: req.namespace }
+        : resolved.repo
       secret = resolved.secret
     }
     else {
@@ -643,11 +652,15 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     return { job }
   })
 
-  // --- POST /backup/tasks/:name/run — Run Now (real backup, live progress) --
-  // Unlike replication (which fires the systemd unit), the backup RUN endpoint
-  // runs the backup as the job itself so the UI can poll it for pbc progress.
-  // The timer's ExecStart helper (backup-task.js) POSTs to THIS endpoint too, so
-  // scheduled and manual runs share one code path.
+  // --- POST /backup/tasks/:name/run — Run Now ------------------------------
+  // TWO paths, one endpoint (the recursion guard is the `direct` flag):
+  //   • UI Run-Now (no `direct`): the job STARTS the task's own systemd unit and
+  //     supervises it to completion — so a manual run lands in systemd's
+  //     last-result and the unit journal exactly like a scheduled run (one code
+  //     path, one history). Supervision is LOCAL-ONLY (systemd + journald).
+  //   • The unit's OWN execution (`direct:true`, from the backup-task helper the
+  //     timer / `systemctl start` fires): runs pbc IN the daemon. It NEVER
+  //     re-enters systemctl — that is what keeps the two paths from recursing.
   server.post<{ Params: { name: string } }>('/backup/tasks/:name/run', async (request, reply) => {
     const nameParsed = BackupName.safeParse(request.params.name)
     if (!nameParsed.success) {
@@ -655,6 +668,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid task name: ${nameParsed.error.issues[0]?.message}` } }
     }
     const name = nameParsed.data
+
+    const bodyParsed = BackupRunRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid run request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const direct = bodyParsed.data.direct === true
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -667,8 +687,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
     const job = jobQueue.submit(
       'backup.task.run',
-      { ...identity, params: { task: name } },
+      { ...identity, params: { task: name, ...(direct ? { direct: true } : {}) } },
       async (updateProgress) => {
+        if (!direct) {
+          // The manual/UI path: run through the task's own unit and supervise it.
+          return superviseRun(executor, name, { onProgress: updateProgress })
+        }
+        // The unit's own execution: run pbc in the daemon (NEVER systemctl).
         const task = await readTask(systemdDir, name)
         if (!task)
           throw new Error(`Backup task '${name}' not found`)
