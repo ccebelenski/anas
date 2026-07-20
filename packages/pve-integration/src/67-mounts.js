@@ -363,15 +363,19 @@
         };
     }
 
-    function loadMounts(view, node) {
+    // `quiet` skips the grid loading mask — the timed poll refreshes in place
+    // with no visible flash; initial render and manual Reload keep the mask.
+    function loadMounts(view, node, quiet) {
         var grid = mountsGridOf(view);
         if (!grid || grid.destroyed || grid.destroying) {
             return;
         }
-        try {
-            grid.setLoading(true);
-        } catch (e) {
-            // non-fatal
+        if (!quiet) {
+            try {
+                grid.setLoading(true);
+            } catch (e) {
+                // non-fatal
+            }
         }
         // Remember the selected mountpoint so a poll refresh keeps the selection.
         var priorSel = selectedMount(grid);
@@ -381,10 +385,12 @@
             if (grid.destroyed || grid.destroying) {
                 return;
             }
-            try {
-                grid.setLoading(false);
-            } catch (e) {
-                // non-fatal
+            if (!quiet) {
+                try {
+                    grid.setLoading(false);
+                } catch (e) {
+                    // non-fatal
+                }
             }
             var list = (res && res.data) || [];
             var rows = [];
@@ -426,10 +432,12 @@
                 return;
             }
             grid.anasReloading = false;
-            try {
-                grid.setLoading(false);
-            } catch (e) {
-                // non-fatal
+            if (!quiet) {
+                try {
+                    grid.setLoading(false);
+                } catch (e) {
+                    // non-fatal
+                }
             }
             ANAS.warn('mounts load failed: ' + ANAS.errText(err));
         });
@@ -1709,7 +1717,7 @@
                     if (typeof g.isVisible === 'function' && !g.isVisible()) {
                         return;
                     }
-                    loadMounts(view, node);
+                    loadMounts(view, node, true);
                 } catch (tickErr) {
                     ANAS.warn('mounts poll tick failed: ' + ANAS.errText(tickErr));
                 }

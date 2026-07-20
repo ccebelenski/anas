@@ -629,15 +629,19 @@
         return (sel && sel.length) ? sel[0] : null;
     }
 
-    function loadTasks(view, node) {
+    // `quiet` skips the grid loading mask — the timed poll refreshes in place
+    // with no visible flash; initial render and manual Reload keep the mask.
+    function loadTasks(view, node, quiet) {
         var grid = gridOf(view);
         if (!grid || grid.destroyed || grid.destroying) {
             return;
         }
-        try {
-            grid.setLoading(true);
-        } catch (e) {
-            // non-fatal
+        if (!quiet) {
+            try {
+                grid.setLoading(true);
+            } catch (e) {
+                // non-fatal
+            }
         }
         var priorSel = selectedTask(grid);
         var priorName = priorSel ? priorSel.get('name') : null;
@@ -652,10 +656,12 @@
                 if (grid.destroyed || grid.destroying) {
                     return;
                 }
-                try {
-                    grid.setLoading(false);
-                } catch (e) {
-                    // non-fatal
+                if (!quiet) {
+                    try {
+                        grid.setLoading(false);
+                    } catch (e) {
+                        // non-fatal
+                    }
                 }
                 var list = (res && res.data) || [];
                 var rows = [];
@@ -693,10 +699,12 @@
                     return;
                 }
                 grid.anasReloading = false;
-                try {
-                    grid.setLoading(false);
-                } catch (e) {
-                    // non-fatal
+                if (!quiet) {
+                    try {
+                        grid.setLoading(false);
+                    } catch (e) {
+                        // non-fatal
+                    }
                 }
                 ANAS.warn('backup tasks load failed: ' + ANAS.errText(err));
             });
@@ -2268,7 +2276,7 @@
                     if (typeof g.isVisible === 'function' && !g.isVisible()) {
                         return;
                     }
-                    loadTasks(view, node);
+                    loadTasks(view, node, true);
                 } catch (tickErr) {
                     ANAS.warn('backup poll tick failed: ' + ANAS.errText(tickErr));
                 }

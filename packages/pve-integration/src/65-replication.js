@@ -312,23 +312,37 @@
 
     // ---- Load / reload the task grid ---------------------------------------
 
-    function loadTasks(grid, node) {
+    // `quiet` skips the loading mask so the timed poll refreshes in place with
+    // no visible flash; the selected row is restored by task name so the poll
+    // doesn't drop it (the mounts/backup pattern applied back here).
+    function loadTasks(grid, node, quiet) {
         if (!grid || grid.destroyed || grid.destroying) {
             return;
         }
+        if (!quiet) {
+            try {
+                grid.setLoading(true);
+            } catch (e) {
+                // non-fatal
+            }
+        }
+        var priorName = null;
         try {
-            grid.setLoading(true);
-        } catch (e) {
-            // non-fatal
+            var sel = grid.getSelectionModel().getSelection();
+            priorName = (sel && sel.length) ? sel[0].get('name') : null;
+        } catch (eS) {
+            priorName = null;
         }
         ANAS.api.get(node, '/replication/tasks').then(function (res) {
             if (grid.destroyed || grid.destroying) {
                 return;
             }
-            try {
-                grid.setLoading(false);
-            } catch (e) {
-                // non-fatal
+            if (!quiet) {
+                try {
+                    grid.setLoading(false);
+                } catch (e) {
+                    // non-fatal
+                }
             }
             var list = (res && res.data) || [];
             var rows = [];
@@ -340,15 +354,27 @@
             } catch (e2) {
                 ANAS.warn('replication grid load failed: ' + ANAS.errText(e2));
             }
+            if (priorName) {
+                try {
+                    var idx = grid.getStore().findExact('name', priorName);
+                    if (idx >= 0) {
+                        grid.getSelectionModel().select(idx, false, true);
+                    }
+                } catch (eSel) {
+                    // non-fatal
+                }
+            }
             updateButtons(grid);
         }, function (err) {
             if (grid.destroyed || grid.destroying) {
                 return;
             }
-            try {
-                grid.setLoading(false);
-            } catch (e) {
-                // non-fatal
+            if (!quiet) {
+                try {
+                    grid.setLoading(false);
+                } catch (e) {
+                    // non-fatal
+                }
             }
             ANAS.warn('replication tasks load failed: ' + ANAS.errText(err));
         });
@@ -2252,7 +2278,7 @@
                     if (typeof grid.isVisible === 'function' && !grid.isVisible()) {
                         return;
                     }
-                    loadTasks(grid, node);
+                    loadTasks(grid, node, true);
                 } catch (tickErr) {
                     ANAS.warn('replication poll tick failed: ' + ANAS.errText(tickErr));
                 }
