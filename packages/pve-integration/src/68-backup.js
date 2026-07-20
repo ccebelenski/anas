@@ -72,11 +72,15 @@
  *     GET /v1/pools/:name/datasets (dataset mountpoints).
  * ---------------------------------------------------------------------------
  *
- * Test hooks: view 'anas-view anas-view-backup'; grid 'anas-grid-backup'; detail
- * 'anas-backup-detail'; toolbar 'anas-btn-backup-refresh' / '-new' / '-repos' /
- * '-run' / '-edit' / '-toggle' / '-delete'; task window 'anas-win-backup-task'
- * (submit 'anas-btn-backup-task-submit', archives 'anas-backup-archives'); repos
- * manager 'anas-win-backup-repos' (grid 'anas-grid-backup-repos'); repo edit
+ * Test hooks: view 'anas-view anas-view-backup'; grid 'anas-grid-backup'; toolbar
+ * 'anas-btn-backup-refresh' / '-new' / '-repos' / '-run' / '-edit' / '-toggle' /
+ * '-delete' / '-details'; detail window 'anas-win-backup-detail' (body
+ * 'anas-backup-detail', reload 'anas-btn-backup-detail-reload'); task window
+ * 'anas-win-backup-task' (submit 'anas-btn-backup-task-submit', archives
+ * 'anas-backup-archives', per-row path browse 'anas-btn-backup-arch-browse');
+ * directory picker 'anas-win-fs-picker' (grid 'anas-grid-fs-picker', path field
+ * 'anas-fld-fs-path', select 'anas-btn-fs-select'); repos manager
+ * 'anas-win-backup-repos' (grid 'anas-grid-backup-repos'); repo edit
  * 'anas-win-backup-repo-edit' (test area 'anas-backup-repo-test', save
  * 'anas-btn-backup-repo-save').
  *
@@ -574,6 +578,230 @@
     }
 
     // ======================================================================
+    //  Directory picker — 'anas-win-fs-picker' (driven by GET /v1/fs/browse)
+    //
+    //  A small, plain listbox-style navigator (no tree widget): the current
+    //  path (editable + Go), an Up button, a list of child dirs (double-click
+    //  descends), and Select to return the current path. Fail-open: an
+    //  unreadable / non-directory path silently falls back to '/'. Free-form
+    //  typing in the wizard field is untouched — this only fills it.
+    // ======================================================================
+
+    // Join a directory and a child name into an absolute path.
+    function joinDir(base, name) {
+        var b = trim(base) || '/';
+        if (b.charAt(b.length - 1) === '/') {
+            return b + name;
+        }
+        return b + '/' + name;
+    }
+
+    // Parent of an absolute path ('/' is its own parent).
+    function parentDir(p) {
+        var s = trim(p);
+        if (!s || s === '/') {
+            return '/';
+        }
+        // Drop a trailing slash, then the last segment.
+        s = s.replace(/\/+$/, '');
+        var idx = s.lastIndexOf('/');
+        if (idx <= 0) {
+            return '/';
+        }
+        return s.substring(0, idx);
+    }
+
+    function setPickerNote(win, msg, warn) {
+        var c = win.down('#pickerNote');
+        if (!c) {
+            return;
+        }
+        var color = warn ? 'var(--anas-warn,#b06a12)' : 'var(--anas-muted,gray)';
+        try {
+            c.update(msg
+                ? '<span style="color:' + color + ';font-size:12px;">' + enc(msg) + '</span>'
+                : '');
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // Browse to a path: list its child dirs, or fall back to '/' when it is not
+    // a readable directory (fail-open, one retry against root).
+    function pickerBrowse(win, node, path) {
+        if (!win || win.destroyed || win.destroying) {
+            return;
+        }
+        var grid = win.down('#pickerGrid');
+        if (grid) {
+            try { grid.setLoading(true); } catch (e) { /* non-fatal */ }
+        }
+        ANAS.api.get(node, '/fs/browse?path=' + encodeURIComponent(path)).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            if (grid) {
+                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
+            }
+            var d = (res && res.data) || {};
+            if (d.type !== 'dir') {
+                // Not a directory (missing / file / other) — fall back to root
+                // once so the picker always lands somewhere navigable.
+                if (path !== '/') {
+                    pickerBrowse(win, node, '/');
+                    return;
+                }
+                setPickerNote(win, t('Not a directory.'), true);
+                return;
+            }
+            win._path = d.path || path;
+            var pf = win.down('#pickerPath');
+            if (pf) {
+                try { pf.setValue(win._path); } catch (e) { /* non-fatal */ }
+            }
+            var rows = [];
+            var dirs = isArray(d.dirs) ? d.dirs : [];
+            for (var i = 0; i < dirs.length; i++) {
+                rows.push({ name: '' + dirs[i] });
+            }
+            try {
+                grid.getStore().loadData(rows);
+            } catch (e2) {
+                // non-fatal
+            }
+            // Silent truncation is banned — say so plainly when the flag is set.
+            setPickerNote(win, d.truncated ? t('list truncated') : '', !!d.truncated);
+        }, function (err) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            if (grid) {
+                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
+            }
+            // A browse error is fail-open: retry root once, else note it.
+            if (path !== '/') {
+                pickerBrowse(win, node, '/');
+                return;
+            }
+            setPickerNote(win, t('Could not read directory') + ': ' + ANAS.errText(err), true);
+        });
+    }
+
+    function openDirPicker(node, startPath, onSelect) {
+        var start = trim(startPath) || '/';
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-fs-picker',
+                title: t('Choose a directory'),
+                modal: true,
+                width: 520,
+                height: 460,
+                resizable: true,
+                layout: { type: 'vbox', align: 'stretch' },
+                items: [
+                    {
+                        xtype: 'fieldcontainer',
+                        layout: 'hbox',
+                        padding: '8 8 4 8',
+                        items: [
+                            {
+                                xtype: 'textfield',
+                                itemId: 'pickerPath',
+                                cls: 'anas-fld-fs-path',
+                                flex: 1,
+                                selectOnFocus: true,
+                                value: start,
+                                listeners: {
+                                    specialkey: function (f, e) {
+                                        if (e.getKey() === e.ENTER) {
+                                            pickerBrowse(win, node, trim(f.getValue()) || '/');
+                                        }
+                                    },
+                                },
+                            },
+                            {
+                                xtype: 'button',
+                                text: t('Go'),
+                                cls: 'anas-btn-fs-go',
+                                margin: '0 0 0 6',
+                                handler: function () {
+                                    pickerBrowse(win, node, trim(valOf(win, '#pickerPath')) || '/');
+                                },
+                            },
+                            {
+                                xtype: 'button',
+                                text: t('Up'),
+                                cls: 'anas-btn-fs-up',
+                                iconCls: 'fa fa-level-up',
+                                margin: '0 0 0 6',
+                                handler: function () {
+                                    pickerBrowse(win, node, parentDir(win._path || valOf(win, '#pickerPath') || '/'));
+                                },
+                            },
+                        ],
+                    },
+                    {
+                        xtype: 'component',
+                        itemId: 'pickerNote',
+                        padding: '0 10',
+                        html: '',
+                    },
+                    {
+                        xtype: 'gridpanel',
+                        itemId: 'pickerGrid',
+                        cls: 'anas-grid-fs-picker',
+                        flex: 1,
+                        border: false,
+                        hideHeaders: true,
+                        store: Ext.create('Ext.data.Store', { fields: ['name'], data: [] }),
+                        emptyText: t('No subdirectories'),
+                        columns: [
+                            {
+                                text: t('Directory'),
+                                dataIndex: 'name',
+                                flex: 1,
+                                sortable: false,
+                                menuDisabled: true,
+                                renderer: function (v) {
+                                    return '<i class="fa fa-folder" style="margin-right:6px;'
+                                        + 'color:var(--anas-accent,#3468c0);"></i>' + enc(v);
+                                },
+                            },
+                        ],
+                        listeners: {
+                            itemdblclick: function (g, rec) {
+                                pickerBrowse(win, node, joinDir(win._path || '/', rec.get('name')));
+                            },
+                        },
+                    },
+                ],
+                buttons: [
+                    { text: t('Cancel'), handler: function () { win.close(); } },
+                    {
+                        text: t('Select'),
+                        cls: 'anas-btn-fs-select',
+                        handler: function () {
+                            var p = win._path || trim(valOf(win, '#pickerPath')) || '/';
+                            if (onSelect) {
+                                try { onSelect(p); } catch (e) { ANAS.warn('picker select failed: ' + ANAS.errText(e)); }
+                            }
+                            win.close();
+                        },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('directory picker window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+        // Start at the field's current value if it resolves to a dir, else '/'
+        // (pickerBrowse handles the fallback).
+        pickerBrowse(win, node, start);
+    }
+
+    // ======================================================================
     //  CAS-aware repo write (mirrors the replication remotes discipline)
     // ======================================================================
 
@@ -684,23 +912,18 @@
                 } catch (e2) {
                     ANAS.warn('backup grid load failed: ' + ANAS.errText(e2));
                 }
-                var restored = false;
                 if (priorName) {
                     try {
                         var store = grid.getStore();
                         var idx = store.findExact('name', priorName);
                         if (idx >= 0) {
                             grid.getSelectionModel().select(idx, false, true);
-                            restored = true;
                         }
                     } catch (eSel) {
                         // non-fatal
                     }
                 }
                 grid.anasReloading = false;
-                if (priorName) {
-                    loadTaskDetail(view, node, restored ? priorName : null, true);
-                }
                 updateButtons(grid);
             }, function (err) {
                 if (grid.destroyed || grid.destroying) {
@@ -739,6 +962,7 @@
         var rec = selectedTask(grid);
         var has = !!rec;
         setDisabled(grid, 'backupRun', !has);
+        setDisabled(grid, 'backupDetails', !has);
         setDisabled(grid, 'backupEdit', !has);
         setDisabled(grid, 'backupToggle', !has);
         setDisabled(grid, 'backupDelete', !has);
@@ -755,16 +979,11 @@
     }
 
     // ======================================================================
-    //  Detail area — LOCAL-ONLY (config + units + recent journald; no PBS)
+    //  Detail — LOCAL-ONLY (config + units + recent journald; no PBS). Shown
+    //  on demand in a window (the Details button), not a docked panel: the grid
+    //  owns the full height. The window is an open-on-demand snapshot — its
+    //  Reload button is the only refresh; it never polls.
     // ======================================================================
-
-    function detailPanelOf(view) {
-        try {
-            return view ? view.down('#backupDetail') : null;
-        } catch (e) {
-            return null;
-        }
-    }
 
     function kv(label, value) {
         return '<tr><td style="padding:2px 14px 2px 0;color:var(--anas-muted,gray);'
@@ -775,12 +994,6 @@
     function mono(s) {
         return '<span style="font-family:monospace;font-size:0.92em;word-break:break-all;">'
             + enc(s) + '</span>';
-    }
-
-    function detailHint() {
-        return '<div style="padding:12px 14px;color:var(--anas-muted,gray);">'
-            + enc(t('Select a task to see its archives, the systemd unit/timer as written, '
-                + 'and recent run output.')) + '</div>';
     }
 
     function unitBlock(title, text) {
@@ -920,37 +1133,79 @@
         return html;
     }
 
-    function loadTaskDetail(view, node, name, quiet) {
-        var panel = detailPanelOf(view);
-        if (!panel) {
+    // Fetch GET /backup/tasks/:name and render it into the detail window's body.
+    // Called on open and by the window's Reload button — no polling.
+    function loadDetailInto(win, node, name) {
+        if (!win || win.destroyed || win.destroying) {
             return;
         }
-        if (!name) {
-            panel.update(detailHint());
+        var body = win.down('#detailBody');
+        if (!body) {
             return;
         }
-        if (!quiet) {
-            panel.update('<div style="padding:12px 14px;color:var(--anas-muted,gray);">'
-                + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
-                + enc(t('loading…')) + '</div>');
-        }
+        body.update('<div style="padding:12px 14px;color:var(--anas-muted,gray);">'
+            + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
+            + enc(t('loading…')) + '</div>');
         ANAS.api.get(node, '/backup/tasks/' + encodeURIComponent(name)).then(function (res) {
-            if (panel.destroyed || panel.destroying) {
+            if (body.destroyed || body.destroying) {
                 return;
             }
             try {
-                panel.update(taskDetailHtml(res && res.data));
+                body.update(taskDetailHtml(res && res.data));
             } catch (e) {
                 ANAS.warn('backup detail render failed: ' + ANAS.errText(e));
             }
         }, function (err) {
-            if (panel.destroyed || panel.destroying) {
+            if (body.destroyed || body.destroying) {
                 return;
             }
             ANAS.warn('backup detail load failed: ' + ANAS.errText(err));
-            panel.update('<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
+            body.update('<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
                 + enc(t('Failed to load detail') + ': ' + ANAS.errText(err)) + '</div>');
         });
+    }
+
+    // Open the on-demand Details window (modal:false, sized like the repos
+    // manager). Snapshot semantics: it fetches once on open; the Reload button
+    // is the refresh. Everything the old docked area showed lives here.
+    function openTaskDetailWindow(node, name) {
+        if (!name) {
+            return;
+        }
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-backup-detail',
+                title: t('Backup Task') + ': ' + name,
+                modal: false,
+                width: 760,
+                height: 520,
+                resizable: true,
+                layout: 'fit',
+                items: [{
+                    xtype: 'panel',
+                    itemId: 'detailBody',
+                    cls: 'anas-backup-detail',
+                    border: false,
+                    scrollable: true,
+                    html: '',
+                }],
+                buttons: [
+                    {
+                        text: t('Reload'),
+                        cls: 'anas-btn-backup-detail-reload',
+                        iconCls: 'fa fa-refresh',
+                        handler: function () { loadDetailInto(win, node, name); },
+                    },
+                    { text: t('Close'), handler: function () { win.close(); } },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('backup detail window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+        loadDetailInto(win, node, name);
     }
 
     // ======================================================================
@@ -960,7 +1215,7 @@
     // Build one archive editor row (a bordered fieldset). Fields are addressed
     // RELATIVE to the fieldset (fs.down('#archName')) so itemIds never collide
     // across rows — win.down() is never used to reach an archive field.
-    function addArchiveRow(win, cont, pathStore, data) {
+    function addArchiveRow(win, cont, pathStore, data, node) {
         data = data || {};
         var fs;
         try {
@@ -1010,19 +1265,46 @@
                         ],
                     },
                     {
-                        xtype: 'combobox',
-                        itemId: 'archPath',
-                        cls: 'anas-fld-backup-arch-path',
+                        // The path field + a folder button that opens the
+                        // directory picker. Free-form typing (the combobox) stays
+                        // first-class; the picker just fills the field.
+                        xtype: 'fieldcontainer',
                         fieldLabel: t('Path'),
-                        store: pathStore,
-                        valueField: 'path',
-                        displayField: 'label',
-                        queryMode: 'local',
-                        editable: true,
-                        forceSelection: false,
-                        anyMatch: true,
-                        emptyText: '/etc',
-                        value: data.path || '',
+                        labelWidth: 120,
+                        layout: 'hbox',
+                        items: [
+                            {
+                                xtype: 'combobox',
+                                itemId: 'archPath',
+                                cls: 'anas-fld-backup-arch-path',
+                                flex: 1,
+                                store: pathStore,
+                                valueField: 'path',
+                                displayField: 'label',
+                                queryMode: 'local',
+                                editable: true,
+                                forceSelection: false,
+                                anyMatch: true,
+                                emptyText: '/etc',
+                                value: data.path || '',
+                            },
+                            {
+                                xtype: 'button',
+                                cls: 'anas-btn-backup-arch-browse',
+                                iconCls: 'fa fa-folder-open',
+                                tooltip: t('Browse for a directory'),
+                                margin: '0 0 0 6',
+                                handler: function () {
+                                    var f = fs.down('#archPath');
+                                    var cur = f ? trim(f.getValue()) : '';
+                                    openDirPicker(node, cur, function (chosen) {
+                                        if (f) {
+                                            f.setValue(chosen);
+                                        }
+                                    });
+                                },
+                            },
+                        ],
                     },
                     {
                         xtype: 'textareafield',
@@ -1181,7 +1463,7 @@
                                     handler: function () {
                                         var cont = win.down('#archivesContainer');
                                         if (cont) {
-                                            addArchiveRow(win, cont, pathStore, null);
+                                            addArchiveRow(win, cont, pathStore, null, node);
                                         }
                                     },
                                 },
@@ -1281,7 +1563,7 @@
                 seed = [{ name: '', path: '', excludes: [] }];
             }
             for (var i = 0; i < seed.length; i++) {
-                addArchiveRow(win, cont, pathStore, seed[i]);
+                addArchiveRow(win, cont, pathStore, seed[i], node);
             }
         }
     }
@@ -1370,27 +1652,87 @@
             });
         };
 
-        // Save-time namespace verification (operator-sanctioned, warn-not-block):
-        // the effective namespace is the task's, else the chosen repo's own. When
-        // it is non-empty, verify it exists on the server before saving — a task
-        // pointed at a namespace that does not exist would fail at EVERY run
-        // (pbc ENOENT, ground truth). A blank effective namespace skips this.
+        // Save-time verification (operator-sanctioned, warn-not-block): the
+        // effective namespace (the task's, else the chosen repo's own) plus the
+        // archive paths are checked before saving, and any problems are surfaced
+        // in ONE combined "create anyway?" confirm — never a stack of dialogs.
+        // Both checks fail-open: a broken check never blocks a save.
         var repoInfo = REPO_MAP[repository] || {};
         var effectiveNs = namespace || (repoInfo.namespace || '');
-        if (!effectiveNs) {
-            proceed();
-            return;
-        }
-        verifyNamespaceThenSave(win, node, repository, effectiveNs, proceed);
+        verifyThenSave(win, node, repository, effectiveNs, archives, proceed);
     }
 
-    // Verify the effective namespace via the (user-initiated, one-shot) test
-    // endpoint, then either save or ask for confirmation. Warn-not-block: a
-    // missing namespace, an unreachable/auth problem, or a failed call all offer
-    // "create anyway?" rather than stopping the operator. Reuses the repo Test
-    // endpoint with a namespace override so the TASK's effective namespace is
-    // what gets probed (not just the repo's).
-    function verifyNamespaceThenSave(win, node, repository, ns, proceed) {
+    // Verify the effective namespace via the (user-initiated, one-shot) repo Test
+    // endpoint. Returns a Promise<string|null> — a warning fragment or null. Never
+    // rejects (fail-open). A blank namespace skips (resolves null). Reuses the
+    // repo Test with a namespace override so the TASK's effective namespace is
+    // what gets probed (not just the repo's) — a namespace that does not exist
+    // would fail the task at EVERY run (pbc ENOENT, ground truth).
+    function namespaceWarning(node, repository, ns) {
+        if (!ns) {
+            return Promise.resolve(null);
+        }
+        return ANAS.api.post(node, '/backup/repos/test', { name: repository, namespace: ns }).then(
+            function (res) {
+                var d = (res && res.data) || {};
+                var stage = '' + (first(d.stage, d.verdict) || 'ok');
+                if (stage === 'ok') {
+                    return null;
+                }
+                if (stage === 'namespace') {
+                    return t('The namespace') + ' "' + enc(ns) + '" '
+                        + t('does not exist on the server — this task will fail at every run until you '
+                            + 'create it in the PBS UI.');
+                }
+                // Any OTHER stage (unreachable / auth / datastore / tls …): could
+                // not verify — warn generically, still let the operator proceed.
+                var detail = d.detail ? (' — ' + enc(d.detail)) : (' (' + enc(stage) + ')');
+                return t('Could not verify the namespace') + detail + '.';
+            },
+            function (err) {
+                return t('Could not verify the namespace') + ' — ' + enc(ANAS.errText(err)) + '.';
+            }
+        );
+    }
+
+    // Browse each distinct archive path and collect the ones that do not exist on
+    // this node. Returns a Promise<string[]> (sorted); never rejects. Each browse
+    // is independently fail-open — a browse error skips that path silently (a
+    // broken validation must never block a save).
+    function missingPathWarnings(node, archives) {
+        var checks = [];
+        var missing = [];
+        var seen = {};
+        for (var i = 0; i < archives.length; i++) {
+            var p = trim(archives[i] && archives[i].path);
+            if (!p || seen[p]) {
+                continue;
+            }
+            seen[p] = true;
+            (function (path) {
+                checks.push(ANAS.api.get(node, '/fs/browse?path=' + encodeURIComponent(path)).then(
+                    function (res) {
+                        var d = (res && res.data) || {};
+                        if (d.exists === false) {
+                            missing.push(path);
+                        }
+                    },
+                    function () { /* fail-open: skip this path */ }
+                ));
+            }(p));
+        }
+        return Promise.all(checks).then(function () {
+            missing.sort();
+            return missing;
+        }, function () {
+            return missing;
+        });
+    }
+
+    // Run both checks in parallel, then either save or raise ONE combined confirm
+    // covering whichever problems apply. The whole chain is fail-open: if it
+    // breaks, the save proceeds (validation must never be what blocks a save).
+    function verifyThenSave(win, node, repository, effectiveNs, archives, proceed) {
         var btn = win.down('#taskSubmitBtn');
         if (btn) { try { btn.setDisabled(true); } catch (eBtn) { /* non-fatal */ } }
         var reenable = function () {
@@ -1398,46 +1740,52 @@
                 try { btn.setDisabled(false); } catch (e) { /* non-fatal */ }
             }
         };
-        var confirmAnyway = function (msg) {
+
+        Promise.all([
+            namespaceWarning(node, repository, effectiveNs),
+            missingPathWarnings(node, archives),
+        ]).then(function (results) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var nsWarn = results[0];
+            var missing = results[1] || [];
+            if (!nsWarn && !missing.length) {
+                reenable();
+                proceed();
+                return;
+            }
+            var parts = [];
+            if (nsWarn) {
+                parts.push(nsWarn);
+            }
+            if (missing.length) {
+                var list = '';
+                for (var i = 0; i < missing.length; i++) {
+                    list += '<div style="font-family:monospace;">' + enc(missing[i]) + '</div>';
+                }
+                parts.push(t('These paths do not exist on this node:')
+                    + '<div style="margin-top:4px;">' + list + '</div>');
+            }
+            var msg = parts.join('<br><br>') + '<br><br>' + t('Create the task anyway?');
             reenable();
             try {
-                Ext.Msg.confirm(t('Verify PBS namespace'), msg, function (b) {
+                Ext.Msg.confirm(t('Verify before saving'), msg, function (b) {
                     if (b === 'yes') { proceed(); }
                 });
             } catch (eMsg) {
                 // If the confirm dialog itself fails, do not block the save.
-                ANAS.warn('backup namespace confirm failed: ' + ANAS.errText(eMsg));
+                ANAS.warn('backup save-verify confirm failed: ' + ANAS.errText(eMsg));
                 proceed();
             }
-        };
-        ANAS.api.post(node, '/backup/repos/test', { name: repository, namespace: ns }).then(
-            function (res) {
-                if (win.destroyed || win.destroying) { return; }
-                var d = (res && res.data) || {};
-                var stage = '' + (first(d.stage, d.verdict) || 'ok');
-                if (stage === 'ok') {
-                    reenable();
-                    proceed();
-                    return;
-                }
-                if (stage === 'namespace') {
-                    confirmAnyway(t('The namespace') + ' "' + enc(ns) + '" '
-                        + t('does not exist on the server — this task will fail at every run until you '
-                            + 'create it in the PBS UI.') + '<br><br>' + t('Create the task anyway?'));
-                    return;
-                }
-                // Any OTHER stage (unreachable / auth / datastore / tls …): warn
-                // generically — could not verify, still let the operator proceed.
-                var detail = d.detail ? (' — ' + enc(d.detail)) : (' (' + enc(stage) + ')');
-                confirmAnyway(t('Could not verify the namespace') + detail + '.<br><br>'
-                    + t('Create the task anyway?'));
-            },
-            function (err) {
-                if (win.destroyed || win.destroying) { return; }
-                confirmAnyway(t('Could not verify the namespace') + ' — ' + enc(ANAS.errText(err))
-                    + '.<br><br>' + t('Create the task anyway?'));
+        }, function () {
+            // The whole verification chain broke — fail-open, save anyway.
+            if (win.destroyed || win.destroying) {
+                return;
             }
-        );
+            reenable();
+            proceed();
+        });
     }
 
     // ---- Run Now (job with progress) ---------------------------------------
@@ -1459,7 +1807,6 @@
             successMsg: t('Backup finished') + ': ' + name,
             onComplete: function () {
                 loadTasks(view, node);
-                loadTaskDetail(view, node, name, true);
             },
         });
         ANAS.toast(t('Backup started') + ': ' + name);
@@ -1530,7 +1877,6 @@
                         successMsg: t('Backup task deleted') + ': ' + name,
                         onComplete: function () {
                             loadTasks(view, node);
-                            loadTaskDetail(view, node, null);
                         },
                     });
                 }
@@ -2446,6 +2792,19 @@
                 },
             },
             {
+                text: t('Details'),
+                itemId: 'backupDetails',
+                cls: 'anas-btn-backup-details',
+                iconCls: 'fa fa-info-circle',
+                disabled: true,
+                handler: function (btn) {
+                    var rec = selectedTask(gridOf(btn.up('#backupView')));
+                    if (rec) {
+                        openTaskDetailWindow(node, rec.get('name'));
+                    }
+                },
+            },
+            {
                 text: t('Edit'),
                 itemId: 'backupEdit',
                 cls: 'anas-btn-backup-edit',
@@ -2537,29 +2896,19 @@
                     listeners: {
                         selectionchange: function (selModel, selected) {
                             var grid = this;
+                            // The anasReloading guard still preserves selection
+                            // across a poll refresh (a transient empty
+                            // selectionchange must not clear the button state).
                             if (grid.anasReloading && !(selected && selected.length)) {
                                 return;
                             }
                             updateButtons(grid);
-                            var view = grid.up('#backupView');
-                            var rec = (selected && selected.length) ? selected[0] : null;
-                            loadTaskDetail(view, node, rec ? rec.get('name') : null);
                         },
                         itemdblclick: function (grid, rec) {
                             openTaskDialog(grid.up('#backupView'), node,
                                 rec ? (rec.get('raw') || taskFromRecord(rec)) : null);
                         },
                     },
-                },
-                {
-                    xtype: 'panel',
-                    itemId: 'backupDetail',
-                    cls: 'anas-backup-detail',
-                    height: 260,
-                    border: false,
-                    scrollable: true,
-                    bodyStyle: 'border-top:1px solid var(--anas-line,#dfe3e8);',
-                    html: detailHint(),
                 },
             ],
             listeners: {
