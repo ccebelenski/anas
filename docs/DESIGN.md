@@ -248,6 +248,14 @@ Mirrors the replication API shape. Repositories live in the cluster-wide CAS-ver
 The fd cap (default 1024, per-task override) binds pbc via `prlimit --nofile=N:N` around the daemon's exec — pbc hoards file handles, worst in metadata change-detection mode; the unit's `LimitNOFILE=` only bounds the thin helper (pbc runs inside anasd, not the unit cgroup — live-proof finding). Dashboard warning category `backup`: failures and silently-overdue only.
 
 
+#### Filesystem browse (read-only UI support; designed 2026-07-20)
+
+One generic endpoint backing directory pickers and gentle path validation across features (backup archive paths first; Epic 17 targets and share-create later). Read-only, absolute paths only, never follows into anything mutable — it lists, it never touches.
+
+| Method | Path | Description | Response |
+|--------|------|-------------|----------|
+| `GET` | `/v1/fs/browse?path=<abs>` | `{ path, exists, type: dir\|file\|other\|missing, dirs: [child dir names] }` — dirs listed only when type=dir | `200` |
+
 #### Users & Groups (filtered to relevant accounts)
 
 | Method | Path | Description | Response |
