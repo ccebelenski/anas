@@ -1,4 +1,5 @@
 import type { BackupTask } from '@anas/shared'
+import type { CommandExecutor, ExecResult, PipelineResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -10,6 +11,10 @@ import {
   collectBackupWarnings,
   deriveRunResult,
   deriveTaskStatus,
+  failureDetailFromJournal,
+  isRunActive,
+  messageFromJournalLine,
+  parseHelperResult,
   parseServiceUnit,
   parseSystemdTimestamp,
   readAllTasks,
@@ -17,7 +22,9 @@ import {
   removeTaskUnits,
   renderServiceUnit,
   renderTimerUnit,
+  runFailed,
   serviceUnitName,
+  superviseRun,
   timerUnitName,
   validateSchedule,
   writeTaskUnits,
@@ -235,5 +242,183 @@ describe('backup units — journald + dashboard warnings', () => {
     finally {
       await rm(dir, { recursive: true, force: true })
     }
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  Run-Now supervision (Fix 1: manual runs land in systemd + the unit journal)
+// ---------------------------------------------------------------------------
+
+/** A `systemctl show` blob from key=value pairs. */
+function showBlob(props: Record<string, string>): string {
+  return `${Object.entries(props).map(([k, v]) => `${k}=${v}`).join('\n')}\n`
+}
+
+/**
+ * A scripted executor: `systemctl show` returns the NEXT queued snapshot each
+ * call (last one repeats), `systemctl start` records + returns `startResult`,
+ * `journalctl` returns `journal`. Everything else is a benign success.
+ */
+class ScriptedExecutor implements CommandExecutor {
+  readonly calls: { command: string, args: string[] }[] = []
+  private showQueue: string[]
+  constructor(
+    private opts: { shows: Record<string, string>[], journal?: string, startExit?: number, startStderr?: string },
+  ) {
+    this.showQueue = opts.shows.map(showBlob)
+  }
+
+  async exec(command: string, args: string[]): Promise<ExecResult> {
+    this.calls.push({ command, args })
+    if (command === '/usr/bin/systemctl' && args[0] === 'show') {
+      const next = this.showQueue.length > 1 ? this.showQueue.shift()! : (this.showQueue[0] ?? '')
+      return { stdout: next, stderr: '', exitCode: 0 }
+    }
+    if (command === '/usr/bin/systemctl' && args[0] === 'start') {
+      return { stdout: '', stderr: this.opts.startStderr ?? '', exitCode: this.opts.startExit ?? 0 }
+    }
+    if (command === '/usr/bin/journalctl')
+      return { stdout: this.opts.journal ?? '', stderr: '', exitCode: 0 }
+    return { stdout: '', stderr: '', exitCode: 0 }
+  }
+
+  async pipeline(): Promise<PipelineResult> {
+    return { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: '' }
+  }
+}
+
+async function noopSleep(): Promise<void> {}
+const FAST = { pollIntervalMs: 0, timeoutMs: 60000, sleep: noopSleep }
+
+const OK_JOURNAL = [
+  '2026-07-19T01:07:07+0000 anas-pve systemd[1]: Starting ANAS backup task nightly-etc...',
+  '2026-07-19T01:07:07+0000 anas-pve anas-backup-nightly-etc[999]: {"task":"nightly-etc","result":{"status":"success","archives":["etc.pxar: had to backup 82.957 KiB of 82.957 KiB (compressed 81.043 KiB) in 0.01 s"],"target":"Starting backup: [anastest]:host/anas-pve/2026-07-19T01:07:07Z"}}',
+  '2026-07-19T01:07:07+0000 anas-pve systemd[1]: anas-backup-nightly-etc.service: Deactivated successfully.',
+].join('\n')
+
+const TOO_SOON_JOURNAL = [
+  '2026-07-19T01:07:08+0000 anas-pve anas-backup-nightly-etc[1001]: {"task":"nightly-etc","result":{"status":"skipped","archives":[],"reason":"snapshot timestamp collision (1-second resolution) — nothing new to back up yet"}}',
+  '2026-07-19T01:07:08+0000 anas-pve systemd[1]: anas-backup-nightly-etc.service: Deactivated successfully.',
+].join('\n')
+
+const FAILED_JOURNAL = [
+  '2026-07-19T01:08:00+0000 anas-pve anas-backup-nightly-etc[1010]: Error: permission check failed.',
+  '2026-07-19T01:08:00+0000 anas-pve systemd[1]: anas-backup-nightly-etc.service: Main process exited, code=exited, status=1/FAILURE',
+  '2026-07-19T01:08:00+0000 anas-pve systemd[1]: anas-backup-nightly-etc.service: Failed with result \'exit-code\'.',
+].join('\n')
+
+describe('backup Run-Now supervision (Fix 1 — through the unit)', () => {
+  it('isRunActive / runFailed classify systemd snapshots', () => {
+    assert.equal(isRunActive({ ActiveState: 'activating' }), true)
+    assert.equal(isRunActive({ ActiveState: 'active' }), true)
+    assert.equal(isRunActive({ ActiveState: 'inactive' }), false)
+    assert.equal(runFailed({ ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0' }), false)
+    assert.equal(runFailed({ ActiveState: 'failed', Result: 'exit-code' }), true)
+    assert.equal(runFailed({ ActiveState: 'inactive', Result: 'success', ExecMainStatus: '1' }), true)
+  })
+
+  it('messageFromJournalLine strips the syslog prefix', () => {
+    assert.equal(
+      messageFromJournalLine('2026-07-19T01:07:07+0000 anas-pve anas-backup-x[999]: Error: nope'),
+      'Error: nope',
+    )
+  })
+
+  it('parseHelperResult recovers the helper result JSON from the journal', () => {
+    const r = parseHelperResult(OK_JOURNAL)
+    assert.ok(r)
+    assert.equal(r!.status, 'success')
+    assert.ok(r!.archives!.some(l => l.startsWith('etc.pxar:')))
+    assert.equal(parseHelperResult(FAILED_JOURNAL), null) // a failure logs no result JSON
+  })
+
+  it('failureDetailFromJournal returns pbc\'s verbatim Error line', () => {
+    assert.equal(failureDetailFromJournal(FAILED_JOURNAL), 'Error: permission check failed.')
+  })
+
+  it('running → success: starts the unit, polls to completion, recovers stats', async () => {
+    const exec = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' }, // pre-check
+        { ActiveState: 'activating', Result: 'success', InvocationID: 'NEW' }, // running
+        { ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0', InvocationID: 'NEW' }, // done
+      ],
+      journal: OK_JOURNAL,
+    })
+    const res = await superviseRun(exec, 'nightly-etc', FAST)
+    assert.equal(res.status, 'success')
+    assert.equal(res.alreadyRunning, false)
+    assert.ok(res.archives!.some(l => l.startsWith('etc.pxar:')))
+    // It went through systemctl start (Fix 1: the run lands in the unit history).
+    assert.ok(exec.calls.some(c => c.command === '/usr/bin/systemctl' && c.args[0] === 'start'))
+  })
+
+  it('running → failed: throws the journal\'s error line (so the job fails)', async () => {
+    const exec = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        { ActiveState: 'activating', InvocationID: 'NEW' },
+        { ActiveState: 'failed', Result: 'exit-code', ExecMainStatus: '1', InvocationID: 'NEW' },
+      ],
+      journal: FAILED_JOURNAL,
+    })
+    await assert.rejects(superviseRun(exec, 'nightly-etc', FAST), /permission check failed/)
+  })
+
+  it('benign too-soon: helper JSON status skipped → success run reported as skipped', async () => {
+    const exec = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        // Fast finish: never observed active, but the invocation changed + exit 0.
+        { ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0', InvocationID: 'NEW' },
+      ],
+      journal: TOO_SOON_JOURNAL,
+    })
+    const res = await superviseRun(exec, 'nightly-etc', FAST)
+    assert.equal(res.status, 'skipped')
+    assert.match(res.reason ?? '', /timestamp collision/)
+  })
+
+  it('already running: does NOT start a second run, supervises the in-flight one', async () => {
+    const exec = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'active', InvocationID: 'CUR' }, // pre-check: already running
+        { ActiveState: 'active', InvocationID: 'CUR' },
+        { ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0', InvocationID: 'CUR' },
+      ],
+      journal: OK_JOURNAL,
+    })
+    const res = await superviseRun(exec, 'nightly-etc', FAST)
+    assert.equal(res.alreadyRunning, true)
+    assert.equal(res.status, 'success')
+    assert.equal(exec.calls.some(c => c.command === '/usr/bin/systemctl' && c.args[0] === 'start'), false)
+  })
+
+  it('ceiling: a still-running backup is reported truthfully (status running), not failed', async () => {
+    const exec = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        { ActiveState: 'activating', InvocationID: 'NEW' }, // never leaves running
+      ],
+      journal: '',
+    })
+    let clock = 0
+    const res = await superviseRun(exec, 'nightly-etc', {
+      pollIntervalMs: 0,
+      timeoutMs: 10,
+      sleep: noopSleep,
+      now: () => (clock += 4), // advances past the 10ms ceiling within a few polls
+    })
+    assert.equal(res.status, 'running')
+    assert.match(res.reason ?? '', /still running/)
+  })
+
+  it('a failed systemctl start throws (nothing to supervise)', async () => {
+    const exec = new ScriptedExecutor({
+      shows: [{ ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' }],
+      startExit: 1,
+      startStderr: 'Failed to start anas-backup-nightly-etc.service: Unit not found.',
+    })
+    await assert.rejects(superviseRun(exec, 'nightly-etc', FAST), /Unit not found/)
   })
 })

@@ -11,8 +11,11 @@ import { request as httpRequest } from 'node:http'
  * nonzero on failure — so systemd's own last-result stays truthful.
  *
  * No custom scheduling, no state, no pbc invocation here: the timer schedules,
- * the daemon runs pbc and classifies. Everything here is I/O plumbing. Scheduled
- * and manual runs share the exact same daemon endpoint.
+ * the daemon runs pbc and classifies. Everything here is I/O plumbing. It POSTs
+ * with `direct:true` — the daemon then runs pbc in-process (this IS the unit's
+ * work) rather than starting the unit again. A UI Run-Now instead starts THIS
+ * unit and supervises it, so scheduled and manual runs converge on one unit and
+ * one systemd/journald history.
  */
 
 const DEFAULT_SOCKET = process.env.ANASD_SOCKET ?? '/run/anas/anasd.sock'
@@ -88,11 +91,15 @@ export async function runBackupTask(
   const sleep = loop.sleep ?? (ms => new Promise<void>(r => setTimeout(r, ms)))
 
   const headers = identityHeaders()
+  // `direct:true` — THIS is the unit's own execution (the timer / systemctl start
+  // fired us). It runs pbc in the daemon and must NOT make the daemon start the
+  // unit again (that is the recursion guard); a UI Run-Now omits the flag and the
+  // daemon starts+supervises this same unit instead.
   const submit = await requester({
     method: 'POST',
     path: `/v1/backup/tasks/${encodeURIComponent(name)}/run`,
     headers,
-    body: {},
+    body: { direct: true },
   })
   if (submit.statusCode !== 202) {
     const detail = errorMessage(submit.body) ?? JSON.stringify(submit.body)

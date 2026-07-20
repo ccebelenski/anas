@@ -253,6 +253,21 @@ export const BackupTaskView = BackupTask.extend({
 })
 export type BackupTaskView = z.infer<typeof BackupTaskView>
 
+/**
+ * Run-Now request body. `direct: true` is the INTERNAL path the task's own
+ * systemd unit takes (via the backup-task helper the timer / `systemctl start`
+ * fires): it executes pbc in the daemon — that IS the unit's work. A normal UI
+ * Run-Now omits it (or sends false): the daemon starts the task's systemd unit
+ * and SUPERVISES it, so a manual run lands in systemd's last-result and the unit
+ * journal exactly like a scheduled run — one code path, one history. A `direct`
+ * run NEVER starts systemctl (that is the recursion guard). The body may also be
+ * empty (`{}`) — equivalent to a non-direct run.
+ */
+export const BackupRunRequest = z.object({
+  direct: z.boolean().optional(),
+})
+export type BackupRunRequest = z.infer<typeof BackupRunRequest>
+
 /** systemd-derived run result (LOCAL-ONLY). */
 export const BackupRunResult = z.enum(['success', 'failure', 'running', 'unknown'])
 export type BackupRunResult = z.infer<typeof BackupRunResult>

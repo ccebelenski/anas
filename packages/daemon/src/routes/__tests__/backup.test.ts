@@ -46,16 +46,25 @@ function mockOf(server: ReturnType<typeof createServer>): MockExecutor {
   return (server as unknown as { executor: MockExecutor }).executor
 }
 
-async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
-  for (let i = 0; i < 100; i++) {
+async function waitForJob(server: ReturnType<typeof createServer>, id: string, attempts = 100, delayMs = 10): Promise<Job> {
+  for (let i = 0; i < attempts; i++) {
     const res = await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY })
     const { job } = res.json() as { job: Job }
     if (job.status === 'completed' || job.status === 'failed')
       return job
-    await new Promise(r => setTimeout(r, 10))
+    await new Promise(r => setTimeout(r, delayMs))
   }
   throw new Error(`Job ${id} did not finish`)
 }
+
+/** The exact args `superviseRun` reads with `systemctl show` (a scriptable seam). */
+const SUPERVISE_SHOW_ARGS = ['show', 'anas-backup-nightly-etc.service', '-p', 'ActiveState,Result,ExecMainStatus,InvocationID']
+
+/** A unit-journal blob carrying the backup-task helper's result JSON (Fix 1). */
+const HELPER_JOURNAL = [
+  '2026-07-19T01:07:07+0000 anas-pve anas-backup-nightly-etc[999]: {"task":"nightly-etc","result":{"status":"success","archives":["etc.pxar: had to backup 82.957 KiB of 82.957 KiB"]}}',
+  '2026-07-19T01:07:07+0000 anas-pve systemd[1]: anas-backup-nightly-etc.service: Deactivated successfully.',
+].join('\n')
 
 async function jobIdFrom(res: { json: () => unknown }): Promise<string> {
   const { job } = res.json() as { job?: { id: string } }
@@ -195,16 +204,52 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(data.journal, 'recent run output')
   })
 
-  it('POST /backup/tasks/:name/run runs pbc and completes with parsed progress', async () => {
+  it('POST /run { direct:true } runs pbc IN the daemon (the unit\'s own exec) — never systemctl', async () => {
     await createRepo()
     await createTask()
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: {} })
+    const mock = mockOf(server)
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
     const result = job.result as { status: string, archives: string[] }
     assert.equal(result.status, 'success')
     assert.ok(result.archives.some(l => l.startsWith('etc.pxar:')))
+    // The direct path executes pbc (via prlimit) and NEVER starts the unit — the
+    // recursion guard. It is the unit's OWN work, not a manual supervise.
+    assert.ok(mock.calls.some(c => c.command === '/usr/bin/prlimit'))
+    assert.equal(mock.calls.some(c => c.command === '/usr/bin/systemctl' && c.args[0] === 'start'), false)
+  })
+
+  it('POST /run (no direct) starts the unit and supervises it to a systemd result (Fix 1)', async () => {
+    await createRepo()
+    await createTask()
+    const mock = mockOf(server)
+    // Script the `systemctl show` transition the supervisor polls: pre-check
+    // inactive (invocation OLD) → a fresh invocation that has already finished
+    // (fast success). The journal carries the helper's result JSON.
+    mock.addFixture({
+      command: '/usr/bin/systemctl',
+      args: SUPERVISE_SHOW_ARGS,
+      results: [
+        { stdout: 'ActiveState=inactive\nResult=success\nInvocationID=OLD\n', stderr: '', exitCode: 0 },
+        { stdout: 'ActiveState=inactive\nResult=success\nExecMainStatus=0\nInvocationID=NEW\n', stderr: '', exitCode: 0 },
+      ],
+    })
+    mock.addFixture({ command: '/usr/bin/journalctl', args: ['-u', 'anas-backup-nightly-etc.service', '-n', '200', '-o', 'short-iso', '--no-pager'], result: { stdout: HELPER_JOURNAL, stderr: '', exitCode: 0 } })
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: {} })
+    assert.equal(res.statusCode, 202)
+    // supervise sleeps ~2s per poll → allow a longer window.
+    const job = await waitForJob(server, await jobIdFrom(res), 400, 25)
+    assert.equal(job.status, 'completed')
+    const result = job.result as { status: string, archives?: string[] }
+    assert.equal(result.status, 'success')
+    assert.ok(result.archives!.some(l => l.startsWith('etc.pxar:')))
+    // It went through the unit (systemctl start), NOT a direct pbc exec.
+    assert.ok(mock.calls.some(c => c.command === '/usr/bin/systemctl' && c.args[0] === 'start'))
+    assert.equal(mock.calls.some(c => c.command === '/usr/bin/prlimit'), false)
   })
 
   it('DELETE /backup/repos refuses (409) while a task references it', async () => {
@@ -288,11 +333,32 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(missing.statusCode, 404)
   })
 
-  it('POST /backup/tasks/:name/run resolves the .pw secret at exec and completes', async () => {
+  it('POST /backup/repos/test accepts a namespace OVERRIDE with the { name } form (Fix 2)', async () => {
+    await createRepo()
+    // The wizard verifies the TASK's effective namespace against a REGISTERED
+    // repo via the { name } form + a `namespace` override. Assert the endpoint
+    // accepts that shape and returns a staged verdict (not a 400/404). The daemon
+    // does its OWN dns/tcp/tls before pbc, so against a non-listening 127.0.0.1
+    // this short-circuits at 'tcp' — the end-to-end 'namespace' verdict is
+    // live-proven on the stunt node's real PBS. This guards the wiring: the
+    // override is a first-class field on the { name } path, no host required.
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/repos/test',
+      headers: JSON_HEADERS,
+      payload: { name: 'pbs-main', namespace: 'task-ns' },
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: { stage: string } }
+    assert.ok(data.stage) // a real staged verdict came back
+  })
+
+  it('POST /run { direct:true } resolves the .pw secret at exec and completes', async () => {
     const pveTask = { ...TASK, name: 'pve-run', repository: 'pve:anastest-pw' }
     const create = await server.inject({ method: 'POST', url: '/v1/backup/tasks', headers: JSON_HEADERS, payload: pveTask })
     await waitForJob(server, await jobIdFrom(create))
-    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pve-run/run', headers: JSON_HEADERS, payload: {} })
+    // The direct path is the unit's own exec — it reads the .pw secret at run time.
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pve-run/run', headers: JSON_HEADERS, payload: { direct: true } })
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')

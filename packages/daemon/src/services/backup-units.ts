@@ -399,6 +399,264 @@ export async function readRecentJournal(executor: CommandExecutor, name: string)
   }
 }
 
+// --- Run-Now supervision (LOCAL-ONLY: systemd + journald, never PBS) ---------
+//
+// A manual Run-Now starts the task's OWN systemd unit (`systemctl start`) and
+// supervises it to completion, so the run lands in systemd's last-result and the
+// unit journal exactly like a scheduled one — one code path, one history. The
+// supervision reads only systemd (`systemctl show`) + journald; it never contacts
+// the PBS server (the runner INSIDE the unit is the sole server contact). The
+// unit's own execution (the backup-task helper) POSTs `/run` with `direct:true`,
+// which runs pbc in the daemon and NEVER re-enters systemctl — the recursion
+// guard.
+
+/** ActiveState values that mean the oneshot service is still running. */
+const RUN_ACTIVE_STATES = new Set(['activating', 'active', 'reloading'])
+/** Supervision poll cadence. */
+const SUPERVISE_POLL_MS = 2000
+/** Generous ceiling — a real backup can run long; mirrors the UI's 600s budget. */
+const SUPERVISE_TIMEOUT_MS = 600000
+/** journalctl syslog prefix without a `[pid]` bracket: `<ts> <host> <ident>: <msg>`. */
+const JOURNAL_PREFIX_RE = /^\S+\s+\S+\s+\S+?:\s(.*)$/
+/** The runner's owner-coupling failure message (a real, actionable cause). */
+const OWNER_MISMATCH_MSG_RE = /owner mismatch/i
+/** A failure-ish message line. */
+const FAILED_MSG_RE = /failed/i
+/** systemd's own `<unit>.service: …` boilerplate (skip in favor of the real cause). */
+const SYSTEMD_UNIT_LINE_RE = /^anas-backup-\S+\.service:/
+
+export interface SuperviseRunOptions {
+  /** Poll interval in ms (default 2000). */
+  pollIntervalMs?: number
+  /** Ceiling in ms before reporting still-running (default 600000). */
+  timeoutMs?: number
+  /** Injectable sleep (tests pass a no-op). */
+  sleep?: (ms: number) => Promise<void>
+  /** Injectable clock (tests advance it). */
+  now?: () => number
+  /** Job-progress callback (never carries a secret). */
+  onProgress?: (message: string) => void
+}
+
+export interface SuperviseRunResult {
+  /** 'success' | 'skipped' (benign too-soon) | 'running' (hit the ceiling). */
+  status: 'success' | 'skipped' | 'running'
+  /** True when the service was ALREADY running when Run-Now fired (no fresh start). */
+  alreadyRunning: boolean
+  /** Per-archive stats recovered from the helper's journal result JSON. */
+  archives?: string[]
+  /** The `Starting backup: …` target line, when recovered. */
+  target?: string
+  /** The metadata-mode low-fd warning, when the run emitted it. */
+  nofileWarning?: string
+  /** Why a run did nothing (too-soon) or is still running (ceiling). */
+  reason?: string
+}
+
+/** The shape the backup-task helper prints as JSON (its `job.result`). */
+interface HelperResult {
+  status?: string
+  archives?: string[]
+  target?: string
+  nofileWarning?: string
+  reason?: string
+}
+
+/** Is a `systemctl show` snapshot in a still-running state? */
+export function isRunActive(props: Record<string, string>): boolean {
+  return RUN_ACTIVE_STATES.has(props.ActiveState ?? '')
+}
+
+/**
+ * Did a TERMINAL run fail? A oneshot's failure shows as ActiveState=failed, or a
+ * non-success Result, or a non-zero ExecMainStatus (NOTES §7 confirms these
+ * props). Benign too-soon exits 0 → NOT a failure here (Result=success).
+ */
+export function runFailed(props: Record<string, string>): boolean {
+  if (props.ActiveState === 'failed')
+    return true
+  if (props.Result && props.Result !== 'success')
+    return true
+  if (props.ExecMainStatus && props.ExecMainStatus !== '0')
+    return true
+  return false
+}
+
+/** Strip journalctl's syslog prefix (`… unit[pid]: `) to the bare message. */
+export function messageFromJournalLine(line: string): string {
+  const idx = line.indexOf(']: ')
+  if (idx >= 0)
+    return line.slice(idx + 3).trim()
+  // Fallback for a prefix without a pid bracket: "<ts> <host> <ident>: <msg>".
+  const m = line.match(JOURNAL_PREFIX_RE)
+  return (m ? m[1] : line).trim()
+}
+
+/**
+ * Recover the helper's result JSON from the unit journal — the backup-task helper
+ * prints `{ task, result }` to stdout on completion, so the too-soon/skipped
+ * classification (and the per-archive stats) survive into the manual supervisor.
+ * Returns null when no result line is present (e.g. a failure, which logs stderr).
+ */
+export function parseHelperResult(journal: string): HelperResult | null {
+  const lines = journal.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const msg = messageFromJournalLine(lines[i])
+    if (!msg.startsWith('{'))
+      continue
+    try {
+      const obj = JSON.parse(msg) as { result?: HelperResult }
+      if (obj && typeof obj === 'object' && obj.result)
+        return obj.result
+    }
+    catch {
+      // Not the JSON result line — keep scanning.
+    }
+  }
+  return null
+}
+
+/**
+ * The client-safe failure detail from the unit journal: prefer pbc's verbatim
+ * `Error:` line (or the runner's thrown owner/failed message), else the last
+ * non-JSON message line. Never contains a secret (pbc's stderr never does).
+ */
+export function failureDetailFromJournal(journal: string): string | null {
+  const msgs = journal.split('\n').map(messageFromJournalLine).filter(Boolean)
+  // Prefer pbc's / the runner's own verbatim `Error:` line (the real cause) over
+  // systemd's generic "Failed with result …" trailer.
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].startsWith('Error:') || OWNER_MISMATCH_MSG_RE.test(msgs[i]))
+      return msgs[i]
+  }
+  // Next, any failure-ish line that is NOT systemd's boilerplate.
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (FAILED_MSG_RE.test(msgs[i]) && !SYSTEMD_UNIT_LINE_RE.test(msgs[i]))
+      return msgs[i]
+  }
+  // Last resort: the last non-JSON message line.
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (!msgs[i].startsWith('{'))
+      return msgs[i]
+  }
+  return null
+}
+
+/** `systemctl show` the run props supervision keys on (fail-open to {}). */
+async function showRunProps(executor: CommandExecutor, name: string): Promise<Record<string, string>> {
+  try {
+    const r = await executor.exec(SYSTEMCTL, [
+      'show',
+      serviceUnitName(name),
+      '-p',
+      'ActiveState,Result,ExecMainStatus,InvocationID',
+    ])
+    return parseShow(r.stdout)
+  }
+  catch {
+    return {}
+  }
+}
+
+/**
+ * A terminal (stopped) run → its outcome. Reads the unit journal for the detail:
+ * THROWS with the journal's error line on failure (so the job fails and the UI
+ * shows why); returns success/skipped otherwise, carrying the helper's recovered
+ * stats and the benign too-soon reason.
+ */
+async function classifyTerminalRun(
+  executor: CommandExecutor,
+  name: string,
+  props: Record<string, string>,
+  alreadyRunning: boolean,
+): Promise<SuperviseRunResult> {
+  const journal = await readRecentJournal(executor, name)
+  if (runFailed(props)) {
+    throw new Error(failureDetailFromJournal(journal) ?? `backup task '${name}' failed (see the recent journal)`)
+  }
+  const helper = parseHelperResult(journal)
+  const status: SuperviseRunResult['status'] = helper?.status === 'skipped' ? 'skipped' : 'success'
+  const result: SuperviseRunResult = { status, alreadyRunning }
+  if (helper?.archives?.length)
+    result.archives = helper.archives
+  if (helper?.target)
+    result.target = helper.target
+  if (helper?.nofileWarning)
+    result.nofileWarning = helper.nofileWarning
+  if (helper?.reason)
+    result.reason = helper.reason
+  else if (status === 'skipped')
+    result.reason = 'snapshot timestamp collision (1-second resolution) — nothing new to back up yet'
+  return result
+}
+
+/**
+ * Run a task NOW through its own systemd unit and supervise to completion. Starts
+ * the service with `systemctl start --no-block` (so we own the timeout ceiling,
+ * never hanging on a long backup) then polls `systemctl show` until the run we
+ * care about goes terminal, and reads the unit journal for the result detail.
+ *
+ * - A DISABLED task runs fine: `systemctl start` acts on the service regardless
+ *   of the timer's enabled state (a manual run of a disabled task is legitimate).
+ * - ALREADY RUNNING: we do NOT queue a second run — we supervise the in-flight
+ *   one and flag `alreadyRunning` so the caller can say so plainly.
+ * - CEILING: on timeout we report `status:'running'` truthfully (NOT a failure) —
+ *   systemd carries the backup on; the operator checks back later.
+ * - FAILURE: throws (so the job fails) with the journal's client-safe error line.
+ */
+export async function superviseRun(
+  executor: CommandExecutor,
+  name: string,
+  opts: SuperviseRunOptions = {},
+): Promise<SuperviseRunResult> {
+  const pollIntervalMs = opts.pollIntervalMs ?? SUPERVISE_POLL_MS
+  const timeoutMs = opts.timeoutMs ?? SUPERVISE_TIMEOUT_MS
+  const sleep = opts.sleep ?? (ms => new Promise<void>(r => setTimeout(r, ms)))
+  const now = opts.now ?? Date.now
+  const progress = opts.onProgress ?? (() => {})
+  const service = serviceUnitName(name)
+
+  // Pre-check: capture the current invocation + running state. If it is already
+  // running, supervise THAT run rather than starting a second one.
+  const pre = await showRunProps(executor, name)
+  const baseInvocation = pre.InvocationID ?? ''
+  const alreadyRunning = isRunActive(pre)
+
+  if (alreadyRunning) {
+    progress(`backup task '${name}' is already running — waiting for it to finish`)
+  }
+  else {
+    const started = await executor.exec(SYSTEMCTL, ['start', '--no-block', service])
+    if (started.exitCode !== 0)
+      throw new Error(started.stderr.trim() || `systemctl start ${service} exited with code ${started.exitCode}`)
+    progress(`started backup task '${name}'`)
+  }
+
+  const deadline = now() + timeoutMs
+  let seenActive = alreadyRunning
+  while (now() < deadline) {
+    await sleep(pollIntervalMs)
+    const props = await showRunProps(executor, name)
+    const active = isRunActive(props)
+    if (active)
+      seenActive = true
+    // A fresh invocation that came and went (a fast finish we never caught active)
+    // is also terminal — so a sub-poll too-soon skip is classified correctly. An
+    // absent/empty InvocationID never counts as a change (a never-run unit).
+    const inv = props.InvocationID ?? ''
+    const invocationChanged = inv !== '' && inv !== baseInvocation
+    if (!active && (seenActive || invocationChanged))
+      return classifyTerminalRun(executor, name, props, alreadyRunning)
+  }
+
+  // Ceiling — the backup is legitimately still running. Truthful, not a failure.
+  return {
+    status: 'running',
+    alreadyRunning,
+    reason: `still running after ${Math.round(timeoutMs / 1000)}s — systemd continues it; check the task again shortly`,
+  }
+}
+
 // --- Dashboard warnings -----------------------------------------------------
 
 /** A minimal task-status shape the dashboard warning builder needs. */

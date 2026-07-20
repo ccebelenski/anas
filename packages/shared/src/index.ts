@@ -33,6 +33,7 @@ export {
   BackupRepoTestRequest,
   BackupRepoTestResult,
   BackupRepoWrite,
+  BackupRunRequest,
   BackupRunResult,
   BackupTask,
   BackupTaskDetail,
