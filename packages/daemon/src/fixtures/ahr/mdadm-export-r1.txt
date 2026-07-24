@@ -1,0 +1,12 @@
+MD_LEVEL=raid5
+MD_DEVICES=3
+MD_METADATA=1.2
+MD_UUID=8f425218:8811d919:db5d4baa:f414bbac
+MD_DEVNAME=ahr0-r1
+MD_NAME=anas-pve:ahr0-r1
+MD_DEVICE_dev_sdd1_ROLE=2
+MD_DEVICE_dev_sdd1_DEV=/dev/sdd1
+MD_DEVICE_dev_sdc1_ROLE=1
+MD_DEVICE_dev_sdc1_DEV=/dev/sdc1
+MD_DEVICE_dev_sdb1_ROLE=0
+MD_DEVICE_dev_sdb1_DEV=/dev/sdb1

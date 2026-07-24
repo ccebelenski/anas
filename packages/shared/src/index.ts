@@ -25,6 +25,7 @@ export {
   AhrExpansionStepKind,
   AhrExpansionTrigger,
   AhrLayoutPreview,
+  AhrLayoutPreviewRequest,
   AhrMemberState,
   AhrPool,
   AhrPoolState,

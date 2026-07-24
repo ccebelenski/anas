@@ -116,6 +116,28 @@ else
   $SSH_CMD "apt-get install -y acl"
   echo "  ✓ acl installed"
 fi
+# mdadm + btrfs-progs are REQUIRED for AHR (hybrid RAID) pools — PVE 9 ships
+# neither (AHR ground truth GT-1). Standard Debian packages; auto-install
+# (noninteractive: mdadm's postinst debconf-prompts about boot arrays).
+if $SSH_CMD "command -v mdadm >/dev/null 2>&1"; then
+  echo "  ✓ mdadm present"
+else
+  echo "  mdadm not found — installing..."
+  $SSH_CMD "DEBIAN_FRONTEND=noninteractive apt-get install -y mdadm"
+  echo "  ✓ mdadm installed"
+fi
+if $SSH_CMD "command -v mkfs.btrfs >/dev/null 2>&1"; then
+  echo "  ✓ btrfs-progs (mkfs.btrfs) present"
+else
+  echo "  btrfs-progs not found — installing..."
+  $SSH_CMD "DEBIAN_FRONTEND=noninteractive apt-get install -y btrfs-progs"
+  echo "  ✓ btrfs-progs installed"
+fi
+# AHR md-event hook: the mdadm --monitor PROGRAM target. The rsync above
+# already placed packaging/ under /opt/anas/, so install from its synced copy
+# (same pattern as the pve-integration scripts). Idempotent on every deploy.
+$SSH_CMD "install -m 0755 /opt/anas/packaging/anas-md-event.sh /usr/local/bin/anas-md-event && install -d /usr/share/pve-manager/templates/default && install -m 0644 /opt/anas/packaging/templates/anas-ahr-*.hbs /usr/share/pve-manager/templates/default/"
+echo "  ✓ anas-md-event hook installed (/usr/local/bin/anas-md-event)"
 # smbd (samba) and exportfs (nfs-kernel-server) are per-protocol and the
 # operator chooses which to run, so warn but never auto-install or fail.
 if $SSH_CMD "command -v smbd >/dev/null 2>&1"; then

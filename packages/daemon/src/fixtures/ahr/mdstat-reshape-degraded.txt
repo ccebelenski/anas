@@ -1,0 +1,12 @@
+Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] 
+md125 : active raid1 sde3[1] sdd3[0]
+      523200 blocks super 1.2 [2/2] [UU]
+      
+md126 : active raid5 sde2[2] sdd2[1] sdc2[0]
+      1046400 blocks super 1.2 level 5, 64k chunk, algorithm 2 [3/3] [UUU]
+      
+md127 : active raid5 sdf1[5] sde1[4] sdd1[3] sdc1[1] sdb1[0](F)
+      3134976 blocks super 1.2 level 5, 512k chunk, algorithm 2 [5/4] [_UUUU]
+      [>....................]  reshape =  0.4% (5120/1044992) finish=16.7min speed=1024K/sec
+      
+unused devices: <none>

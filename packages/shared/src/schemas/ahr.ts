@@ -264,6 +264,18 @@ export const AhrLayoutPreview = z.object({
 })
 export type AhrLayoutPreview = z.infer<typeof AhrLayoutPreview>
 
+/**
+ * POST /v1/ahr/layout/preview request: a disk selection + tier for the §2.1
+ * dry-run. Disks are /v1/disks by-id identifiers; only disks whose inventory
+ * status is 'available' are eligible (the daemon rejects anything in use,
+ * foreign-labeled, or system — GT-12 made those exclusions safety-critical).
+ */
+export const AhrLayoutPreviewRequest = z.object({
+  disks: z.array(DiskId).min(1),
+  tier: AhrType,
+})
+export type AhrLayoutPreviewRequest = z.infer<typeof AhrLayoutPreviewRequest>
+
 // ---- Expansion -------------------------------------------------------------
 
 /** What kicked off an expansion. */

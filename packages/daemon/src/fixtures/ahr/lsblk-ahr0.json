@@ -1,0 +1,177 @@
+{
+   "blockdevices": [
+      {
+         "name": "sdb",
+         "size": 1073741824,
+         "type": "disk",
+         "fstype": null,
+         "mountpoint": null,
+         "partlabel": null,
+         "children": [
+            {
+               "name": "sdb1",
+               "size": 1072676352,
+               "type": "part",
+               "fstype": "linux_raid_member",
+               "mountpoint": null,
+               "partlabel": "ahr0-d1-b1",
+               "children": [
+                  {
+                     "name": "md127",
+                     "size": 2140143616,
+                     "type": "raid5",
+                     "fstype": "LVM2_member",
+                     "mountpoint": null,
+                     "partlabel": null,
+                     "children": [
+                        {
+                           "name": "ahr0-ahr0--vol",
+                           "size": 2671771648,
+                           "type": "lvm",
+                           "fstype": "btrfs",
+                           "mountpoint": "/mnt/anas-ahr/ahr0",
+                           "partlabel": null
+                        }
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "sdc",
+         "size": 1610612736,
+         "type": "disk",
+         "fstype": null,
+         "mountpoint": null,
+         "partlabel": null,
+         "children": [
+            {
+               "name": "sdc1",
+               "size": 1072693248,
+               "type": "part",
+               "fstype": "linux_raid_member",
+               "mountpoint": null,
+               "partlabel": "ahr0-d2-b1",
+               "children": [
+                  {
+                     "name": "md127",
+                     "size": 2140143616,
+                     "type": "raid5",
+                     "fstype": "LVM2_member",
+                     "mountpoint": null,
+                     "partlabel": null,
+                     "children": [
+                        {
+                           "name": "ahr0-ahr0--vol",
+                           "size": 2671771648,
+                           "type": "lvm",
+                           "fstype": "btrfs",
+                           "mountpoint": "/mnt/anas-ahr/ahr0",
+                           "partlabel": null
+                        }
+                     ]
+                  }
+               ]
+            },{
+               "name": "sdc2",
+               "size": 536854016,
+               "type": "part",
+               "fstype": "linux_raid_member",
+               "mountpoint": null,
+               "partlabel": "ahr0-d2-b2",
+               "children": [
+                  {
+                     "name": "md126",
+                     "size": 535756800,
+                     "type": "raid1",
+                     "fstype": "LVM2_member",
+                     "mountpoint": null,
+                     "partlabel": null,
+                     "children": [
+                        {
+                           "name": "ahr0-ahr0--vol",
+                           "size": 2671771648,
+                           "type": "lvm",
+                           "fstype": "btrfs",
+                           "mountpoint": "/mnt/anas-ahr/ahr0",
+                           "partlabel": null
+                        }
+                     ]
+                  }
+               ]
+            }
+         ]
+      },{
+         "name": "sdd",
+         "size": 2147483648,
+         "type": "disk",
+         "fstype": null,
+         "mountpoint": null,
+         "partlabel": null,
+         "children": [
+            {
+               "name": "sdd1",
+               "size": 1072693248,
+               "type": "part",
+               "fstype": "linux_raid_member",
+               "mountpoint": null,
+               "partlabel": "ahr0-d3-b1",
+               "children": [
+                  {
+                     "name": "md127",
+                     "size": 2140143616,
+                     "type": "raid5",
+                     "fstype": "LVM2_member",
+                     "mountpoint": null,
+                     "partlabel": null,
+                     "children": [
+                        {
+                           "name": "ahr0-ahr0--vol",
+                           "size": 2671771648,
+                           "type": "lvm",
+                           "fstype": "btrfs",
+                           "mountpoint": "/mnt/anas-ahr/ahr0",
+                           "partlabel": null
+                        }
+                     ]
+                  }
+               ]
+            },{
+               "name": "sdd2",
+               "size": 536870912,
+               "type": "part",
+               "fstype": "linux_raid_member",
+               "mountpoint": null,
+               "partlabel": "ahr0-d3-b2",
+               "children": [
+                  {
+                     "name": "md126",
+                     "size": 535756800,
+                     "type": "raid1",
+                     "fstype": "LVM2_member",
+                     "mountpoint": null,
+                     "partlabel": null,
+                     "children": [
+                        {
+                           "name": "ahr0-ahr0--vol",
+                           "size": 2671771648,
+                           "type": "lvm",
+                           "fstype": "btrfs",
+                           "mountpoint": "/mnt/anas-ahr/ahr0",
+                           "partlabel": null
+                        }
+                     ]
+                  }
+               ]
+            },{
+               "name": "sdd3",
+               "size": 536854016,
+               "type": "part",
+               "fstype": null,
+               "mountpoint": null,
+               "partlabel": "ahr0-d3-b3"
+            }
+         ]
+      }
+   ]
+}

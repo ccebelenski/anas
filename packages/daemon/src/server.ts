@@ -9,8 +9,13 @@ import { MockExecutor } from './executor/mock.js'
 import { ProdExecutor } from './executor/prod.js'
 import { mockFixtures } from './fixtures/loader.js'
 import { JobQueue } from './jobs/queue.js'
+import { btrfsUsageArgs } from './parsers/btrfs-usage.js'
 import { LSBLK_ARGS } from './parsers/lsblk.js'
+import { LVS_ARGS, VGS_ARGS } from './parsers/lvm-report.js'
+import { mdadmDetailExportArgs } from './parsers/mdadm-detail.js'
+import { MDSTAT_CAT_ARGS } from './parsers/mdstat.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
+import { ahrRoutes } from './routes/ahr.js'
 import { backupRoutes } from './routes/backup.js'
 import { dashboardRoutes } from './routes/dashboard.js'
 import { datasetRoutes } from './routes/datasets.js'
@@ -26,6 +31,7 @@ import { shareIdentityRoutes } from './routes/share-identity.js'
 import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { smbShareRoutes } from './routes/shares-smb.js'
 import { ConfirmStore } from './safety/confirm.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from './services/ahr-topology.js'
 import { defaultBackupReposPaths } from './services/backup-repos.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
 import { defaultRemotesPaths } from './services/replication-remotes.js'
@@ -379,6 +385,20 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/bin/umount', result: { stdout: '', stderr: '', exitCode: 0 } })
     // lsof (busy-unmount holder list) — nothing holding by default.
     mock.addFixture({ command: '/usr/bin/lsof', result: { stdout: '', stderr: '', exitCode: 1 } })
+
+    // --- Epic 11 + AHR: hybrid-RAID read layer ---------------------------
+    // Replays the stage-0 pool `ahr0` (raid5×3 + raid1×2 → LVM → btrfs,
+    // healthy, mounted) from the genuine ground-truth captures. See
+    // fixtures/ahr/NOTES.md for provenance (incl. which files are
+    // reconstructed/synthetic).
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    mock.addFixture({ command: '/usr/sbin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
   }
 
   const confirmStore = new ConfirmStore()
@@ -413,6 +433,10 @@ export function createServer(opts?: ServerOptions) {
   server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
+  // AHR hybrid RAID (Epic 11 + AHR) — READ layer only (list/detail/preview).
+  // The mutation routes (`ahrMutationRoutes` from routes/ahr-mutate.ts —
+  // create/expand/replace/scrub/destroy jobs) register beside this line.
+  server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, and job sources above, plus on-demand ARC/iostat/net sampling.
   server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath })

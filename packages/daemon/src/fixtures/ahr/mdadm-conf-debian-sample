@@ -1,0 +1,25 @@
+# mdadm.conf
+#
+# !NB! Run update-initramfs -u after updating this file.
+# !NB! This will ensure that initramfs has an uptodate copy.
+#
+# Please refer to mdadm.conf(5) for information about this file.
+#
+
+# by default (built-in), scan all partitions (/proc/partitions) and all
+# containers for MD superblocks. alternatively, specify devices to scan, using
+# wildcards if desired.
+#DEVICE partitions containers
+
+# automatically tag new arrays as belonging to the local system
+HOMEHOST <system>
+
+# instruct the monitoring daemon where to send mail alerts
+MAILADDR root
+
+# definitions of existing MD arrays
+ARRAY /dev/md0 metadata=1.2 name=oldbox:0 UUID=11111111:22222222:33333333:44444444
+array /dev/md/legacy metadata=1.2 UUID=aaaabbbb:ccccdddd:eeeeffff:00001111
+   spares=1
+
+# This configuration was auto-generated on Thu, 12 Jun 2025 by mkconf

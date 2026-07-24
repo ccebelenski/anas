@@ -34,4 +34,13 @@ export const mockFixtures = {
   nfsExportsText: () => loadFixture('nfs', 'etc-exports'),
   /** `zpool iostat -plv` two-sample output for the dashboard telemetry (2.7). */
   zpoolIostat: () => fixtureResult('telemetry', 'zpool-iostat-plv.txt'),
+  // --- AHR (Epic 11 + AHR) — the stage-0 pool `ahr0` replayed as dev sample.
+  ahrMdstat: () => fixtureResult('ahr', 'mdstat-clean.txt'),
+  ahrMdadmExportR1: () => fixtureResult('ahr', 'mdadm-export-r1.txt'),
+  ahrMdadmExportR2: () => fixtureResult('ahr', 'mdadm-export-r2.txt'),
+  ahrLsblk: () => fixtureResult('ahr', 'lsblk-ahr0.json'),
+  ahrVgs: () => fixtureResult('ahr', 'lvm-vgs.json'),
+  ahrLvs: () => fixtureResult('ahr', 'lvm-lvs.json'),
+  ahrFindmnt: () => fixtureResult('ahr', 'findmnt-ahr0.json'),
+  ahrBtrfsUsage: () => fixtureResult('ahr', 'btrfs-usage.txt'),
 }

@@ -13,7 +13,7 @@
 
     // Fixed presentation order for the ANAS group. Views not present in
     // ANAS.views are skipped by injectMenu.
-    var ORDER = ['dashboard', 'pools', 'datasets', 'shares', 'mounts', 'replication', 'backup', 'users', 'disks'];
+    var ORDER = ['dashboard', 'pools', 'ahr', 'datasets', 'shares', 'mounts', 'replication', 'backup', 'users', 'disks'];
 
     try {
         if (!ANAS || typeof ANAS.installMenu !== 'function') {

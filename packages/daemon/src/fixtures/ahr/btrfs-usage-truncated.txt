@@ -1,0 +1,12 @@
+Overall:
+    Device size:		        4810866688
+    Device allocated:		         820772864
+    Device unallocated:		        3990093824
+    Device missing:		                 0
+    Device slack:		                 0
+    Used:			         538247168
+    Free (estimated):		        3990093824	(min: 1995046912)
+    Free (statfs, df):		        3989045248
+    Data ratio:			              1.00
+    Metadata ratio:		              2.00
+    Global reserve:		           5767168	(used: 0)

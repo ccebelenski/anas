@@ -92,6 +92,8 @@ version_ge() {
 # =============================================================================
 NEED_NODE_INSTALL=0
 NEED_ACL_INSTALL=0
+NEED_MDADM_INSTALL=0
+NEED_BTRFS_INSTALL=0
 FATAL=()
 
 phase0_preflight() {
@@ -123,6 +125,10 @@ phase0_preflight() {
   [ -d "${APP_SRC}" ]  || FATAL+=("release incomplete: app/ not found next to install.sh")
   [ -f "${UNIT_SRC}/anasd.service" ] && [ -f "${UNIT_SRC}/anas.service" ] \
     || FATAL+=("release incomplete: systemd/ unit files not found")
+  [ -f "${SCRIPT_DIR}/anas-md-event.sh" ] \
+    || FATAL+=("release incomplete: anas-md-event.sh not found next to install.sh")
+  [ -f "${SCRIPT_DIR}/templates/anas-ahr-subject.txt.hbs" ] && [ -f "${SCRIPT_DIR}/templates/anas-ahr-body.txt.hbs" ] \
+    || FATAL+=("release incomplete: templates/anas-ahr-*.txt.hbs not found next to install.sh")
 
   # Root.
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -196,6 +202,22 @@ phase0_preflight() {
     info "acl (setfacl) missing — will auto-install"
   fi
 
+  # mdadm / btrfs-progs — required for AHR (hybrid RAID) pools. PVE 9 ships
+  # neither (AHR ground truth GT-1); standard Debian packages, mark for
+  # auto-install (performed after preflight passes, before Phase 1).
+  if command -v mdadm >/dev/null 2>&1; then
+    info "mdadm present"
+  else
+    NEED_MDADM_INSTALL=1
+    info "mdadm missing — will auto-install"
+  fi
+  if command -v mkfs.btrfs >/dev/null 2>&1; then
+    info "btrfs-progs (mkfs.btrfs) present"
+  else
+    NEED_BTRFS_INSTALL=1
+    info "btrfs-progs (mkfs.btrfs) missing — will auto-install"
+  fi
+
   # Per-protocol tools — warn only (operator chooses which to run).
   command -v smbd     >/dev/null 2>&1 || warn "smbd (samba) not found — SMB shares will not work until samba is installed."
   command -v exportfs >/dev/null 2>&1 || warn "exportfs (nfs-kernel-server) not found — NFS shares will not work until nfs-kernel-server is installed."
@@ -239,6 +261,14 @@ phase0b_install_deps() {
     command -v setfacl >/dev/null 2>&1 || { err "acl install failed (setfacl still missing)"; exit 1; }
     info "acl installed"
   fi
+  if [ "${NEED_MDADM_INSTALL}" -eq 1 ] || [ "${NEED_BTRFS_INSTALL}" -eq 1 ]; then
+    log "Installing mdadm + btrfs-progs..."
+    # noninteractive: mdadm's postinst debconf-prompts about boot arrays/MAILADDR.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y mdadm btrfs-progs
+    command -v mdadm      >/dev/null 2>&1 || { err "mdadm install failed"; exit 1; }
+    command -v mkfs.btrfs >/dev/null 2>&1 || { err "btrfs-progs install failed (mkfs.btrfs still missing)"; exit 1; }
+    info "mdadm + btrfs-progs installed"
+  fi
 }
 
 # =============================================================================
@@ -249,10 +279,14 @@ phase0b_install_deps() {
 SERVICES_STOPPED=0
 BACKUP_PATH=""
 PREFIX_INSTALLED=0
+HOOK_INSTALLED=0
 UNITS_INSTALLED=0
 SERVICES_STARTED=0
 UI_INSTALLED=0
 INSTALL_DONE=0
+
+# mdadm --monitor PROGRAM hook (AHR md events -> journald). Overridable for tests.
+HOOK_DEST="${HOOK_DEST:-/usr/local/bin/anas-md-event}"
 
 rollback() {
   set +e
@@ -271,6 +305,11 @@ rollback() {
     systemctl disable --now anasd anas >/dev/null 2>&1 || true
     rm -f "${SYSTEMD_DIR}/anasd.service" "${SYSTEMD_DIR}/anas.service"
     systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  if [ "${HOOK_INSTALLED}" -eq 1 ]; then
+    info "removing md-event hook"
+    rm -f "${HOOK_DEST}"
   fi
 
   if [ "${PREFIX_INSTALLED}" -eq 1 ]; then
@@ -355,6 +394,25 @@ phase1_install() {
   fi
   chmod +x "${PREFIX}/packages/pve-integration/install.sh" \
            "${PREFIX}/packages/pve-integration/uninstall.sh" 2>/dev/null || true
+
+  # 2b. Install the mdadm md-event hook (AHR §7.2). Inert until the daemon
+  # wires a PROGRAM line in mdadm.conf at pool-create time. Idempotent
+  # overwrite on upgrade; a fresh install's rollback removes it.
+  info "installing md-event hook -> ${HOOK_DEST}"
+  [ -e "${HOOK_DEST}" ] || HOOK_INSTALLED=1
+  install -m 0755 "${SCRIPT_DIR}/anas-md-event.sh" "${HOOK_DEST}"
+
+  # 2c. Install the ANAS notification templates (AHR §7.2, GT-17). They live
+  # in pve-manager's template dir, so a pve-manager upgrade can wipe them —
+  # the DPkg::Post-Invoke apt hook re-runs this installer (same protection as
+  # index.html.tpl). Overridable for tests.
+  PVE_TEMPLATE_DIR="${PVE_TEMPLATE_DIR:-/usr/share/pve-manager/templates/default}"
+  if [ -d "$(dirname "${PVE_TEMPLATE_DIR}")" ]; then
+    info "installing PVE notification templates -> ${PVE_TEMPLATE_DIR}"
+    install -d "${PVE_TEMPLATE_DIR}"
+    install -m 0644 "${SCRIPT_DIR}/templates/anas-ahr-subject.txt.hbs" "${PVE_TEMPLATE_DIR}/"
+    install -m 0644 "${SCRIPT_DIR}/templates/anas-ahr-body.txt.hbs" "${PVE_TEMPLATE_DIR}/"
+  fi
 
   # 3. Install units, enable, (re)start.
   info "installing systemd units"

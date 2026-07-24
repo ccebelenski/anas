@@ -1,0 +1,10 @@
+MD_LEVEL=raid1
+MD_DEVICES=2
+MD_METADATA=1.2
+MD_UUID=7cf3b711:6f0d9a8b:16467c9c:e6028ee8
+MD_DEVNAME=ahr0-r2
+MD_NAME=anas-pve:ahr0-r2
+MD_DEVICE_dev_sdd2_ROLE=1
+MD_DEVICE_dev_sdd2_DEV=/dev/sdd2
+MD_DEVICE_dev_sdc2_ROLE=0
+MD_DEVICE_dev_sdc2_DEV=/dev/sdc2

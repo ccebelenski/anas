@@ -1,0 +1,12 @@
+  {
+      "report": [
+          {
+              "lv": [
+                  {"lv_name":"ahr0-vol", "vg_name":"ahr0", "lv_attr":"-wi-a-----", "lv_size":"<2.49g", "pool_lv":"", "origin":"", "data_percent":"", "metadata_percent":"", "move_pv":"", "mirror_log":"", "copy_percent":"", "convert_lv":""}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }

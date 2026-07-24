@@ -1,0 +1,15 @@
+{
+   "filesystems": [
+      {
+         "target": "/",
+         "source": "/dev/sda1",
+         "fstype": "ext4",
+         "options": "rw,relatime,errors=remount-ro"
+      },{
+         "target": "/mnt/anas-ahr/ahr0",
+         "source": "/dev/mapper/ahr0-ahr0--vol",
+         "fstype": "btrfs",
+         "options": "rw,relatime,space_cache=v2,subvolid=5,subvol=/"
+      }
+   ]
+}

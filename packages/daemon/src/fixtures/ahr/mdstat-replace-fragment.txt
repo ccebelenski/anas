@@ -1,0 +1,4 @@
+md127 : active raid5 sdg1[7](R) sdb1[6] sdf1[5] sde1[4] sdd1[3] sdc1[1]
+      4179968 blocks super 1.2 level 5, 512k chunk, algorithm 2 [5/5] [UUUUU]
+      [>....................]  recovery =  1.5% (16384/1044992) finish=5.2min speed=3276K/sec
+      

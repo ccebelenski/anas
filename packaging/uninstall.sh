@@ -66,6 +66,15 @@ if [ "${removed_unit}" -eq 1 ]; then
 fi
 systemctl daemon-reload >/dev/null 2>&1 || true
 
+# 3b. Remove the mdadm md-event hook installed by install.sh. (Any PROGRAM
+# line in mdadm.conf is the daemon's surgical edit, reverted at pool teardown —
+# not touched here.)
+HOOK_DEST="${HOOK_DEST:-/usr/local/bin/anas-md-event}"
+if [ -f "${HOOK_DEST}" ]; then
+  rm -f "${HOOK_DEST}"
+  info "removed md-event hook ${HOOK_DEST}"
+fi
+
 # 4. Remove the install prefix.
 if [ -d "${PREFIX}" ]; then
   info "removing ${PREFIX}"

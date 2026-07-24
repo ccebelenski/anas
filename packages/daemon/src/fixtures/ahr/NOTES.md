@@ -1,0 +1,48 @@
+# AHR — fixture provenance (Epic 11 + AHR read layer)
+
+All genuine fixtures are the **exact bytes** captured during the stage-0 ground-truth
+build on the stunt PVE 9 node (`anas-pve`, 192.168.200.50), 2026-07-22 — the live
+2/3/4 "TB" worked example at 1:2048 scale (1024/1536/2048 MiB virtual disks,
+`scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT*`). See docs/AHR-GROUND-TRUTH.md; the raw
+phase logs lived in the session scratchpad (phase-a/b/c1/d/f). Environment:
+pve-manager 9.2.4, kernel 7.0.14-5-pve, mdadm 4.4, LVM 2.03.31, btrfs-progs 6.14.
+
+## Genuine captures (verbatim log extracts)
+
+| File | Source | What it is |
+|------|--------|------------|
+| `mdstat-initial-recovery.txt` | phase-a | `/proc/mdstat` right after create: md127 raid5 in initial `recovery` (percent/finish/speed line, `[3/2] [UU_]`), md126 raid1 with the tab-indented `resync=DELAYED` marker |
+| `mdstat-clean.txt` | phase-a | Same two arrays after initial sync — no sync lines, `[3/3] [UUU]` |
+| `mdstat-expanded.txt` | phase-b | Three arrays after online expansion (r2 converted raid1→raid5, new md125 r3). Note kernel numbers INVERTED from creation order (GT-2) |
+| `mdstat-reshape-degraded.txt` | phase-c1 | The failure-gauntlet state: md127 `reshape` line + faulted member `sdb1[0](F)`, `[5/4] [_UUUU]` — the "clean, degraded, reshaping" drill |
+| `mdstat-replace-fragment.txt` | phase-d | `grep -A3 md127` fragment during live `--replace`: replacement member `sdg1[7](R)` + `recovery` line. Deliberately partial (no Personalities header) — drift-tolerance input |
+| `mdadm-export-r1.txt` | phase-a | `mdadm --detail --export /dev/md/ahr0-r1` — KEY=VALUE incl. homehost-prefixed `MD_NAME=anas-pve:ahr0-r1` (GT-3) and per-member `MD_DEVICE_*_ROLE/_DEV` |
+| `mdadm-export-r2.txt` | phase-a | Same for the raid1 band array |
+| `lvm-pvs.json` / `lvm-vgs.json` / `lvm-lvs.json` | phase-a | `pvs/vgs/lvs --reportformat json` — **captured WITHOUT `--units b --nosuffix`** (stage-0 script omission), so sizes carry lvm's human suffixes (`508.00m`, `<2.49g`). The parser targets the byte form (its exported ARGS include the units flags) but tolerates this suffixed form; suffixed values round-trip approximately, byte values exactly |
+| `btrfs-usage.txt` | phase-a | `btrfs filesystem usage -b` — full output: Overall block + Data/Metadata/System profile sections + Unallocated |
+| `btrfs-usage-truncated.txt` | phase-b | Same command piped through `head -12` in the capture script — Overall block only. Kept as the format-drift tolerance case (GT-14: read free space, never precompute) |
+| `lsblk-ahr-capture.json` | phase-a | `lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,PARTLABEL` — verbatim. **Incomplete**: the capture script listed `/dev/sdb /dev/sdc /dev/sde` and sde did not exist, so disk sdd (HOT3) is missing from this genuine capture |
+
+## Reconstructed / synthetic (NOT verbatim captures — labeled honestly)
+
+| File | Status | Notes |
+|------|--------|-------|
+| `lsblk-ahr0.json` | **Reconstructed** | The complete phase-a tree: `lsblk-ahr-capture.json` (sdb, sdc verbatim) plus the missing sdd entry rebuilt from the same session's `sgdisk -p` sector table (sdd1 = sectors 2048–2097151 → 1072693248 B; sdd2 = 2097152–3145727 → 536870912 B; sdd3 = 3145728–4194270 → 536854016 B, raw/unused) and `/proc/mdstat` membership. Used by the dev-mode mock and topology tests |
+| `mdstat-inactive-spares.txt` | **Synthetic** | The GT-8 shape (post-power-loss degraded-reshape assembly: array `inactive`, all members `(S)`). The live drill proved the state but its mdstat bytes were not retained in the phase logs — format follows the kernel's md driver output. Replace with a live capture when next drilled |
+| `findmnt-ahr0.json` | **Synthetic** | `findmnt --json --real` including the ahr0 btrfs mount. Stage-0 verified the mount via `df`/`btrfs fi show` only; no findmnt capture exists. Shape matches the genuine findmnt fixtures in `../mounts/` |
+
+## Known gaps (for the next capture pass)
+
+- `mdadm --detail --scan` output was never captured — the topology reader
+  deliberately discovers arrays via `/proc/mdstat` + per-array
+  `--detail --export` instead (both shapes ARE captured).
+- `pvs/vgs/lvs --reportformat json --units b --nosuffix` (the byte form the
+  daemon actually runs) — only the suffixed form was captured.
+- `/proc/mdstat` for the GT-8 inactive-all-spares state (see above).
+- `--detail --export` of an array with a faulty/spare member — member STATE
+  therefore comes from `/proc/mdstat` flags, not from export keys.
+
+In dev mock mode these fixtures replay the phase-a pool (`ahr0`: raid5×3 +
+raid1×2 → LVM → btrfs, healthy, mounted). The by-id listing in mock mode is the
+shared `../system/disk-by-id.txt`, so mock AHR disks resolve to the WD sample
+ids rather than the ANAS_HOT ids of the real capture.

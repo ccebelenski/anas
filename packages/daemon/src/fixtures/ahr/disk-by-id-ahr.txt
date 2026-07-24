@@ -1,0 +1,9 @@
+lrwxrwxrwx 1 root root   9 Jul 22 22:43 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1 -> ../../sdb
+lrwxrwxrwx 1 root root  10 Jul 22 22:44 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1-part1 -> ../../sdb1
+lrwxrwxrwx 1 root root   9 Jul 22 22:43 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2 -> ../../sdc
+lrwxrwxrwx 1 root root  10 Jul 22 22:44 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part1 -> ../../sdc1
+lrwxrwxrwx 1 root root  10 Jul 22 22:44 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2-part2 -> ../../sdc2
+lrwxrwxrwx 1 root root   9 Jul 22 22:43 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3 -> ../../sdd
+lrwxrwxrwx 1 root root  10 Jul 22 22:44 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3-part1 -> ../../sdd1
+lrwxrwxrwx 1 root root  10 Jul 22 22:44 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3-part2 -> ../../sdd2
+lrwxrwxrwx 1 root root  10 Jul 22 22:44 scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3-part3 -> ../../sdd3

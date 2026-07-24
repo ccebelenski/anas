@@ -1,0 +1,25 @@
+Overall:
+    Device size:		        2671771648
+    Device allocated:		         292290560
+    Device unallocated:		        2379481088
+    Device missing:		                 0
+    Device slack:		                 0
+    Used:			            294912
+    Free (estimated):		        2387869696	(min: 1198129152)
+    Free (statfs, df):		        2386821120
+    Data ratio:			              1.00
+    Metadata ratio:		              2.00
+    Global reserve:		           5767168	(used: 0)
+    Multiple profiles:		                no
+
+Data,single: Size:8388608, Used:0 (0.00%)
+   /dev/mapper/ahr0-ahr0--vol	   8388608
+
+Metadata,DUP: Size:133562368, Used:131072 (0.10%)
+   /dev/mapper/ahr0-ahr0--vol	 267124736
+
+System,DUP: Size:8388608, Used:16384 (0.20%)
+   /dev/mapper/ahr0-ahr0--vol	  16777216
+
+Unallocated:
+   /dev/mapper/ahr0-ahr0--vol	2379481088
