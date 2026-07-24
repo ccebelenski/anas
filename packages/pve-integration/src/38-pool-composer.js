@@ -226,6 +226,7 @@
             // No default name (house rule, shared with the AHR composer): the
             // operator names the pool; commit stays gated until the name is valid.
             name: opts.poolName || '',
+            mountpoint: '',     // story 3.27: optional -m override; '' = ZFS default /<pool>
             disks: [],          // available Disk records
             diskById: {},       // id -> disk
             vdevs: [],          // staged/new vdevs (draft)
@@ -886,6 +887,21 @@
                 + 'var(--anas-card-bot));outline:none;width:180px">';
         }
 
+        // Story 3.27: optional mountpoint override (create only). Empty = ZFS's
+        // default, shown live in the placeholder (`/<pool>`). Passed as
+        // `zpool create -m` by the daemon; /mnt/pve is reserved for PVE.
+        var mountField = '';
+        if (state.mode !== 'expand') {
+            mountField = '<span style="' + SEC + ';margin:0">' + enc(t('Mount at')) + '</span>'
+                + '<input type="text" class="anas-fld-composer-mount" id="anasc-mount"'
+                + ' value="' + enc(state.mountpoint || '') + '" spellcheck="false"'
+                + ' placeholder="/' + enc(state.name || '<name>') + '"'
+                + ' title="' + enc(t('Optional. Absolute path; /mnt/pve is reserved for PVE. Empty = the ZFS default shown.')) + '"'
+                + ' style="font:inherit;color:var(--anas-ink);padding:5px 8px;border-radius:8px;'
+                + 'border:1px solid var(--anas-card-edge);background:linear-gradient(var(--anas-card-top),'
+                + 'var(--anas-card-bot));outline:none;width:220px">';
+        }
+
         // Role options — the same set for create and expand (the add-vdev API
         // now carries a role, so expand can stage any class).
         var roleOpts = '';
@@ -906,6 +922,7 @@
 
             + '<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">'
             + '<span style="' + SEC + ';margin:0">' + enc(t('Pool')) + '</span>' + poolField
+            + mountField
             + '<span style="flex:1"></span>'
             + '<span style="' + PILL + '">' + enc(t('Draft — nothing is created until you commit.')) + '</span></div>'
 
@@ -967,16 +984,27 @@
     // Wire the static controls (poolname, role/type selects, add-vdev button).
     function wireStatic(state) {
         var root = state.root;
+        var mountInput = root.querySelector('#anasc-mount');
         var nameInput = root.querySelector('#anasc-poolname');
         if (nameInput) {
             nameInput.addEventListener('input', function () {
                 state.name = nameInput.value;
+                // Keep the mountpoint placeholder tracking the live ZFS default.
+                if (mountInput) {
+                    mountInput.placeholder = '/' + (state.name || '<name>');
+                }
                 var r = validate(state);
                 renderSummary(state, r);
                 renderAdvisor(state, r);
                 if (state.createBtn) {
                     state.createBtn.setDisabled(!r.valid);
                 }
+            });
+        }
+        if (mountInput) {
+            mountInput.addEventListener('input', function () {
+                // Optional field: empty = the default shown in the placeholder.
+                state.mountpoint = mountInput.value.replace(/\s+/g, '');
             });
         }
         var roleSel = root.querySelector('#anasc-role');
@@ -1072,6 +1100,11 @@
         }
         if (spareDisks.length) {
             body.spareDisks = spareDisks;
+        }
+        // Story 3.27: optional mountpoint override — only when the operator set
+        // one. Empty = the ZFS default (`/<pool>`); the daemon omits -m then.
+        if (state.mountpoint) {
+            body.mountpoint = state.mountpoint;
         }
         return body;
     }

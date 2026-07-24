@@ -190,6 +190,8 @@ export function createServer(opts?: ServerOptions) {
     // Reads need real JSON, so register them exactly (they take priority over
     // the command-only fallback below).
     mock.addFixture({ command: '/usr/sbin/zfs', args: zfsListArgs('testpool'), result: mockFixtures.zfsList() })
+    // Pool root mountpoint + mounted flag (story 3.27 — the grid's Mount column).
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint,mounted'], result: { stdout: 'testpool\t/testpool\tyes\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', 'testpool/media'], result: mockFixtures.zfsGetMedia() })
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', 'testpool'], result: mockFixtures.zfsGetAll() })
     // Mountpoint stat for the media dataset's permissions.
@@ -451,7 +453,11 @@ export function createServer(opts?: ServerOptions) {
   // gentle path validation. No executor, no mutation; node fs only.
   server.register(fsRoutes, { prefix: '/v1' })
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
-  server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
+  // fstabPath + pveStoragePath feed the story 3.27 mountpoint flow: fstab
+  // collision checks and the story 3.25 PVE-managed hands-off guard. Both
+  // default inside the route to the real host paths; the env overrides make the
+  // guard and collisions testable (and keep mock reads off the host).
+  server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, pveStoragePath: process.env.ANAS_STORAGE_CFG })
   // datasetRoutes also reads the share configs to report associated shares
   // (Epic 4.4) and warn on destroy — same paths the share routes edit.
   server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport })

@@ -851,6 +851,10 @@
                 //   trimSupported   — any member device supports discard
                 //   upgradeAvailable— pool has supported-but-disabled features
                 'scanFunction', 'trimSupported', 'upgradeAvailable',
+                // story 3.27: pool root mountpoint + mounted flag (the Mount
+                // column). AUTO fields — absent on old daemons leaves get()
+                // undefined and the renderer shows nothing (no regression).
+                'mountpoint', 'mounted',
                 // story 3.25: PVE-managed classification. Auto field keeps the
                 // array verbatim; empty/absent ⇒ ANAS-managed (see isPveManaged).
                 'pveStorages',
@@ -921,6 +925,7 @@
 
         return {
             xtype: 'grid',
+            itemId: 'poolsGrid',
             cls: 'anas-view anas-view-pools anas-grid-pools',
             store: store,
             selModel: { mode: 'SINGLE' },
@@ -973,6 +978,24 @@
                     renderer: renderCapacityBar,
                 },
                 {
+                    // story 3.27: mirrors the AHR grid's Mount column exactly —
+                    // same header, same unmounted presentation.
+                    text: ANAS.t('Mount'),
+                    dataIndex: 'mountpoint',
+                    flex: 1,
+                    minWidth: 180,
+                    sortable: false,
+                    menuDisabled: true,
+                    renderer: function (v, meta, rec) {
+                        var mounted = rec && rec.get('mounted');
+                        var path = encHtml(v || '');
+                        return mounted
+                            ? path
+                            : path + ' <span style="color:var(--anas-warn);font-size:11px">('
+                                + encHtml(ANAS.t('not mounted')) + ')</span>';
+                    },
+                },
+                {
                     text: ANAS.t('Fragmentation'),
                     dataIndex: 'fragmentation',
                     width: 120,
@@ -1016,7 +1039,17 @@
     function summaryHtml(d) {
         var enc = ANAS.enc;
         var rows = ''
-            + kv(ANAS.t('State'), ANAS.renderState(d.state))
+            + kv(ANAS.t('State'), ANAS.renderState(d.state));
+        // story 3.27: the pool root's mountpoint (absent on old daemons).
+        if (d.mountpoint) {
+            var mountVal = enc(d.mountpoint);
+            if (d.mounted === false) {
+                mountVal += ' <span style="color:var(--anas-warn);font-size:11px">('
+                    + enc(ANAS.t('not mounted')) + ')</span>';
+            }
+            rows += kv(ANAS.t('Mount'), mountVal);
+        }
+        rows += ''
             + kv(ANAS.t('Size'), enc(ANAS.formatBytes(d.size)))
             + kv(ANAS.t('Allocated'), enc(ANAS.formatBytes(d.allocated)))
             + kv(ANAS.t('Free'), enc(ANAS.formatBytes(d.free)))
@@ -1249,6 +1282,53 @@
         content.add(items);
     }
 
+    // Whether a mountpoint value is a real directory path the pool can move
+    // (the mounted-pool flow — story 3.27). ZFS legacy/none, an empty value, or
+    // an unmounted device path are out of scope, so Change mount stays disabled.
+    function isMovableMountpoint(mp) {
+        if (!mp) {
+            return false;
+        }
+        if (mp === 'legacy' || mp === 'none' || mp === '-') {
+            return false;
+        }
+        return mp.charAt(0) === '/' && mp.indexOf('/dev/') !== 0;
+    }
+
+    // Change the pool's mountpoint (story 3.27 — mirrors the AHR flow). Prompt
+    // prefilled with the current path; the daemon validates (reserved paths,
+    // collisions, PVE hands-off) and confirm-gates the ZFS-native remount.
+    function changeMountpoint(win, node, poolName, current) {
+        Ext.Msg.prompt(ANAS.t('Change mount'),
+            ANAS.t('New mountpoint for') + ' <b>' + encHtml(poolName) + '</b>:',
+            function (btn, value) {
+                if (btn !== 'ok' || !value || value === current) {
+                    return;
+                }
+                ANAS.confirmAndRun({
+                    node: node,
+                    method: 'put',
+                    path: '/pools/' + encodeURIComponent(poolName) + '/mountpoint',
+                    body: { mountpoint: value },
+                    view: win,
+                    confirmTitle: 'Change mount',
+                    confirmIntro: ANAS.t('Moving') + ' <b>' + encHtml(poolName) + '</b> '
+                        + ANAS.t('to') + ' <b>' + encHtml(value) + '</b>:',
+                    failTitle: 'Change mount failed',
+                    successMsg: ANAS.t('Mountpoint changed') + ': ' + value,
+                    onComplete: function () {
+                        if (win && !win.destroyed && !win.destroying && win._reload) {
+                            win._reload();
+                        }
+                        var grid = Ext.ComponentQuery.query('#poolsGrid')[0];
+                        if (grid) {
+                            loadPools(grid, node);
+                        }
+                    },
+                });
+            }, null, false, current || '');
+    }
+
     function showPoolDetail(node, poolName) {
         var win;
         try {
@@ -1266,6 +1346,22 @@
                         iconCls: 'fa fa-refresh',
                         handler: function () {
                             loadDetail();
+                        },
+                    },
+                    {
+                        // story 3.27: confirm-gated mountpoint change. Enabled
+                        // only for an ANAS-managed, movably-mounted pool once the
+                        // detail loads (PVE-managed pools stay hands-off — 3.25).
+                        text: ANAS.t('Change mount…'),
+                        itemId: 'changeMount',
+                        cls: 'anas-btn-pool-remount',
+                        iconCls: 'fa fa-folder-open-o',
+                        disabled: true,
+                        handler: function () {
+                            var d = win._poolDetail;
+                            if (d) {
+                                changeMountpoint(win, node, poolName, d.mountpoint);
+                            }
                         },
                     },
                 ],
@@ -1296,7 +1392,25 @@
                     return;
                 }
                 win.setLoading(false);
-                renderDetail(win, res && res.data);
+                var d = res && res.data;
+                renderDetail(win, d);
+                // story 3.27: gate Change mount. Enabled only for an ANAS-managed
+                // pool (3.25 hands-off otherwise) whose root is movably mounted.
+                win._poolDetail = d;
+                try {
+                    var mbtn = win.down('#changeMount');
+                    if (mbtn) {
+                        var canMove = !!d && !isPveManaged(d)
+                            && isMovableMountpoint(d.mountpoint);
+                        mbtn.setDisabled(!canMove);
+                        mbtn.setTooltip(
+                            (d && isPveManaged(d))
+                                ? ANAS.t('Disabled — PVE manages this pool')
+                                : (canMove ? '' : ANAS.t('The pool root is not mounted at a movable path')));
+                    }
+                } catch (eg) {
+                    // non-fatal — the button simply stays disabled
+                }
             }, function (err) {
                 if (win.destroyed || win.destroying) {
                     return;
@@ -1311,6 +1425,9 @@
                 }
             });
         }
+
+        // Expose the loader so the mountpoint-change flow can refresh the window.
+        win._reload = loadDetail;
 
         win.show();
         loadDetail();

@@ -176,6 +176,16 @@ export const PoolSummary = z.object({
   upgradeAvailable: z.boolean().default(false),
   /** Health message, present only when pool is not ONLINE */
   health: PoolHealthMessage.optional(),
+  /**
+   * The pool ROOT dataset's mountpoint (story 3.27) — a filesystem path, or the
+   * literal `legacy`/`none`/`-` when the root is not mounted at a directory.
+   * Read from `zfs get mountpoint <pool>`; absent on old daemons that predate
+   * the Mount column (the UI then renders nothing). Mirrors AHR's `mountpoint`.
+   */
+  mountpoint: z.string().optional(),
+  /** Whether the pool root dataset is currently mounted. Mirrors AHR's `mounted`;
+   *  drives the "(not mounted)" presentation in the pool grid's Mount column. */
+  mounted: z.boolean().optional(),
   /** PVE storages referencing this pool (read-only, from /etc/pve/storage.cfg).
    *  Empty ⇒ not PVE-managed. */
   pveStorages: z.array(PveStorageRef).default([]),
@@ -219,6 +229,12 @@ export const PoolDetail = z.object({
   scan: ScanStatus.nullable(),
   /** Pool properties */
   properties: PoolProperties,
+  /** The pool ROOT dataset's mountpoint (story 3.27) — a path, or the literal
+   *  `legacy`/`none`/`-`. Read from `zfs get mountpoint <pool>`; absent on old
+   *  daemons. Prefilled into the Change mount prompt. Mirrors AHR's `mountpoint`. */
+  mountpoint: z.string().optional(),
+  /** Whether the pool root dataset is currently mounted (mirrors AHR's `mounted`). */
+  mounted: z.boolean().optional(),
   /** PVE storages referencing this pool (read-only, from /etc/pve/storage.cfg).
    *  Empty ⇒ not PVE-managed. */
   pveStorages: z.array(PveStorageRef).default([]),
@@ -290,6 +306,21 @@ export const CreatePoolRequest = z.object({
   force: z.boolean().optional(),
 })
 export type CreatePoolRequest = z.infer<typeof CreatePoolRequest>
+
+/**
+ * PUT /v1/pools/:name/mountpoint — change where a pool's root dataset mounts
+ * (story 3.27, retconned from AHR's mountpoint flow). The ZFS mountpoint is a
+ * native dataset property, so the job is `zfs set mountpoint=<path> <pool>`
+ * (ZFS unmounts/remounts itself — NO fstab writes). Child datasets that inherit
+ * their mountpoint move with the pool root; a child with its OWN explicit
+ * mountpoint stays put. Same collision/reserved constraints as the create-time
+ * override; `legacy`/`none` are refused (not absolute paths) — this is the
+ * mounted-pool flow only. Mirrors AhrMountpointRequest. ANAS-managed pools only
+ * (PVE-managed pools are hands-off per story 3.25 and the route 400s for them). */
+export const PoolMountpointRequest = z.object({
+  mountpoint: AbsolutePath,
+})
+export type PoolMountpointRequest = z.infer<typeof PoolMountpointRequest>
 
 /** Update pool properties (PUT /v1/pools/:name) */
 export const UpdatePoolPropertiesRequest = z.object({

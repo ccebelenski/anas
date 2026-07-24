@@ -3,8 +3,10 @@ import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
+import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, PoolMountpointRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseByIdToKernel, wholeDiskKernel } from '../parsers/disk-by-id.js'
+import { parseFindmnt } from '../parsers/findmnt.js'
+import { hasMount } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseZpoolGet } from '../parsers/zpool-get.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
@@ -12,8 +14,83 @@ import { parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { confirmGate } from '../safety/gate.js'
 import { isRootPool } from '../safety/root-pool.js'
+import { readConfig } from '../services/config-writer.js'
 import { resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
+
+const ZFS = '/usr/sbin/zfs'
+const FINDMNT = '/usr/bin/findmnt'
+/** findmnt args for live-mount collision checks (matches the AHR precedent). */
+const FINDMNT_ARGS = ['--json', '--real']
+
+/** The pool root dataset's mountpoint + mounted flag (story 3.27). */
+interface PoolMount {
+  /** The `mountpoint` property value: a path, or `legacy`/`none`/`-`. */
+  mountpoint: string
+  /** Whether the `mounted` property reports `yes`. */
+  mounted: boolean
+}
+
+/**
+ * Parse `zfs list -H -o name,mountpoint,mounted` into a dataset-name →
+ * {mountpoint, mounted} map. Tab-separated, header-less rows. Pure and total:
+ * malformed rows are skipped, never throws. Keyed by full dataset name so the
+ * caller looks up a pool root by its bare name.
+ */
+export function parsePoolMountpoints(text: string): Map<string, PoolMount> {
+  const out = new Map<string, PoolMount>()
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.replace(/\r$/, '')
+    if (line.trim() === '')
+      continue
+    const parts = line.split('\t')
+    if (parts.length < 3)
+      continue
+    const name = parts[0].trim()
+    if (!name)
+      continue
+    out.set(name, { mountpoint: parts[1].trim(), mounted: parts[2].trim() === 'yes' })
+  }
+  return out
+}
+
+/** Read every dataset's mountpoint + mounted flag, FAIL-OPEN (→ empty map). */
+async function readPoolMountpoints(executor: CommandExecutor): Promise<Map<string, PoolMount>> {
+  const res = await executor.exec(ZFS, ['list', '-H', '-o', 'name,mountpoint,mounted'])
+  return res.exitCode === 0 ? parsePoolMountpoints(res.stdout) : new Map()
+}
+
+/**
+ * A pool's descendant datasets that set their OWN explicit mountpoint (source
+ * `local`/`received`) — these do NOT inherit the pool root, so a `zfs set
+ * mountpoint` on the root leaves them where they are (story 3.27 confirm text).
+ * Reads `zfs get -Hp -r -o name,value,source mountpoint <pool>`; FAIL-OPEN.
+ */
+async function readExplicitChildMountpoints(
+  executor: CommandExecutor,
+  poolName: string,
+): Promise<{ name: string, value: string }[]> {
+  const res = await executor.exec(ZFS, ['get', '-Hp', '-r', '-o', 'name,value,source', 'mountpoint', poolName])
+  if (res.exitCode !== 0)
+    return []
+  const out: { name: string, value: string }[] = []
+  for (const rawLine of res.stdout.split('\n')) {
+    const line = rawLine.replace(/\r$/, '')
+    if (line.trim() === '')
+      continue
+    const parts = line.split('\t')
+    if (parts.length < 3)
+      continue
+    const [name, value, source] = parts.map(p => p.trim())
+    // The root itself is not a child; only 'local'/'received' are explicit
+    // (inherited/default/`-` all track the pool root and move with it).
+    if (!name || name === poolName)
+      continue
+    if (source.startsWith('local') || source.startsWith('received'))
+      out.push({ name, value })
+  }
+  return out
+}
 
 /** lsblk args to probe per-device discard support (Epic 4.12 trim gating).
  *  `-b` bytes, `-J` JSON, `-n` no headings, `-o NAME,DISC-GRAN`. A device is
@@ -239,9 +316,27 @@ function parseImportScan(stdout: string): ImportablePool[] {
 
 export async function poolRoutes(
   server: FastifyInstance,
-  opts: { executor: CommandExecutor, jobQueue: JobQueue, confirmStore: ConfirmStore },
+  opts: {
+    executor: CommandExecutor
+    jobQueue: JobQueue
+    confirmStore: ConfirmStore
+    /** /etc/fstab location (config IS the API) — for mountpoint collision checks.
+     *  Defaults to /etc/fstab; overridable via the env-driven server wiring. */
+    fstabPath?: string
+    /** storage.cfg path for PVE-managed detection (story 3.25). Defaults to the
+     *  real PVE file; overridable so the hands-off guard is testable. */
+    pveStoragePath?: string
+  },
 ) {
   const { executor, jobQueue, confirmStore } = opts
+  const fstabPath = opts.fstabPath ?? '/etc/fstab'
+  const pveCfgPath = opts.pveStoragePath ?? PVE_STORAGE_CFG
+
+  /** The PVE storages that reference a pool (story 3.25) — empty ⇒ ANAS-managed. */
+  async function poolPveStorages(poolName: string): Promise<{ storage: string }[]> {
+    const storages = await readPveStorages(pveCfgPath, await readZfsMountpoints())
+    return storages.get(poolName) ?? []
+  }
 
   /** Stable by-id identifiers of every leaf disk in a pool (for disk cleanup). */
   async function poolMemberIds(poolName: string): Promise<string[]> {
@@ -262,7 +357,7 @@ export async function poolRoutes(
   }
 
   server.get('/pools', async (_request, _reply) => {
-    const [listResult, statusResult, byIdResult, lsblkDiscardResult, upgradeResult, pveStorages] = await Promise.all([
+    const [listResult, statusResult, byIdResult, lsblkDiscardResult, upgradeResult, pveStorages, poolMounts] = await Promise.all([
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
       executor.exec('/usr/sbin/zpool', ['status', '-jv']),
       // by-id → kernel map, to canonicalize pool leaves for the discard probe.
@@ -276,7 +371,10 @@ export async function poolRoutes(
       // and parse errors yield an empty map, so this never breaks GET /pools.
       // Passing the ZFS mountpoint map also catches `dir` storages backed by a
       // ZFS dataset (backup/iso), not just `zfspool` entries.
-      readPveStorages(PVE_STORAGE_CFG, await readZfsMountpoints()),
+      readPveStorages(pveCfgPath, await readZfsMountpoints()),
+      // The pool ROOT dataset's mountpoint + mounted flag (story 3.27 — the
+      // grid's Mount column). Fail-open: an old/absent zfs leaves the field off.
+      readPoolMountpoints(executor),
     ])
 
     // If no pools exist, zpool list exits non-zero with no stdout
@@ -327,6 +425,7 @@ export async function poolRoutes(
     const pools: PoolSummary[] = listData.map((pool) => {
       const status = statusByName.get(pool.name)
       const scanning = status?.scan?.state === 'SCANNING'
+      const mount = poolMounts.get(pool.name)
       return {
         ...pool,
         state: status?.state ?? pool.state,
@@ -337,6 +436,8 @@ export async function poolRoutes(
         trimSupported: poolTrimSupported(leavesOf(status), byIdToKernel, capableKernels),
         upgradeAvailable: upgradablePools.has(pool.name),
         ...(status?.health && { health: status.health }),
+        // Pool root mountpoint (story 3.27) — the Mount column. Absent ⇒ omitted.
+        ...(mount && { mountpoint: mount.mountpoint, mounted: mount.mounted }),
         pveStorages: pveStorages.get(pool.name) ?? [],
       }
     })
@@ -347,12 +448,14 @@ export async function poolRoutes(
   server.get<{ Params: { name: string } }>('/pools/:name', async (request, reply) => {
     const poolName = request.params.name
 
-    const [statusResult, listResult, getResult, pveStorages] = await Promise.all([
+    const [statusResult, listResult, getResult, pveStorages, poolMounts] = await Promise.all([
       executor.exec('/usr/sbin/zpool', ['status', '-jv']),
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
       executor.exec('/usr/sbin/zpool', ['get', 'all', '-j']),
       // Read-only PVE storage detection (Epic 3.25) — fail-open (see GET /pools).
-      readPveStorages(),
+      readPveStorages(pveCfgPath),
+      // Pool root mountpoint + mounted flag (story 3.27) — fail-open.
+      readPoolMountpoints(executor),
     ])
 
     // Parse status for this specific pool
@@ -397,6 +500,11 @@ export async function poolRoutes(
       vdevGroups: status.vdevGroups,
       scan: status.scan,
       properties,
+      // Pool root mountpoint (story 3.27) — prefills the Change mount prompt.
+      ...(poolMounts.get(poolName) && {
+        mountpoint: poolMounts.get(poolName)!.mountpoint,
+        mounted: poolMounts.get(poolName)!.mounted,
+      }),
       pveStorages: pveStorages.get(poolName) ?? [],
     }
 
@@ -614,6 +722,122 @@ export async function poolRoutes(
     return { job }
   })
 
+  // Change a pool's mountpoint (story 3.27 — retconned from AHR's mountpoint
+  // flow, parallel construction). The ZFS mountpoint is a NATIVE dataset
+  // property, so the mechanics differ honestly from AHR: the job is `zfs set
+  // mountpoint=<path> <pool>` — ZFS unmounts and remounts itself and NO fstab is
+  // written anywhere. Child datasets that inherit their mountpoint move with the
+  // pool root; a child with its own explicit mountpoint stays put. Confirm-gated
+  // (409 → 202). ANAS-managed pools only: a PVE-managed pool (story 3.25) is
+  // hands-off and this route 400s for it.
+  server.put<{ Params: { name: string } }>('/pools/:name/mountpoint', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    const bodyParsed = PoolMountpointRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid mountpoint request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!(await poolExists(poolName))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    // SCOPE GUARD (story 3.25): PVE owns this pool's storage — ANAS keeps its
+    // hands off the mountpoint. A hard 400, never a confirm (mirrors the grid's
+    // disabled Change mount action for PVE-managed pools).
+    const pveStorages = await poolPveStorages(poolName)
+    if (pveStorages.length > 0) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Pool '${poolName}' is managed by PVE (${pveStorages.map(s => s.storage).join(', ')}) — ANAS keeps its mountpoint hands-off (story 3.25)` } }
+    }
+
+    const mp = bodyParsed.data.mountpoint.replace(/\/+$/, '') || '/'
+    if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${bodyParsed.data.mountpoint}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
+    }
+
+    const poolMounts = await readPoolMountpoints(executor)
+    const current = poolMounts.get(poolName)
+    const currentMp = current?.mountpoint ?? null
+    if (currentMp === mp) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `'${mp}' is already this pool's mountpoint` } }
+    }
+
+    // Collision checks (identical to the AHR precedent): live mounts, fstab
+    // claims, and any OTHER pool's mountpoint.
+    const findmntRes = await executor.exec(FINDMNT, FINDMNT_ARGS)
+    const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
+    if (mounts.some(m => m.target === mp)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` } }
+    }
+    if (hasMount(await readConfig(fstabPath), mp)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` } }
+    }
+    for (const [name, m] of poolMounts) {
+      if (name !== poolName && m.mountpoint === mp) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', message: `'${mp}' is already pool '${name}' mountpoint — pick an unused path` } }
+      }
+    }
+
+    // Child datasets that inherit the pool root move with it; those with their
+    // OWN explicit mountpoint stay put. The confirm text states both honestly.
+    const explicitChildren = await readExplicitChildMountpoints(executor, poolName)
+    const fromLabel = currentMp ?? `pool '${poolName}'`
+    const warnings = [
+      `Child datasets that inherit their mountpoint move with the pool root — their paths change from under '${fromLabel}' to under '${mp}'.`,
+      current?.mounted === false
+        ? `Pool '${poolName}' is not currently mounted; ZFS will set the property and mount it at '${mp}'.`
+        : `ZFS briefly unmounts the pool and its inheriting datasets during the change — open files there will block it (retry after closing them).`,
+    ]
+    if (explicitChildren.length > 0) {
+      const list = explicitChildren.slice(0, 5).map(c => `${c.name} → ${c.value}`).join(', ')
+      const more = explicitChildren.length > 5 ? `, and ${explicitChildren.length - 5} more` : ''
+      warnings.push(`${explicitChildren.length} child dataset(s) set their own explicit mountpoint (${list}${more}) — these stay where they are.`)
+    }
+
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'zpool.mountpoint',
+      params: { pool: poolName, mountpoint: mp },
+      message: `Changing pool '${poolName}' mountpoint${currentMp ? ` from '${currentMp}'` : ''} to '${mp}' remounts it and its inheriting datasets`,
+      warnings,
+    })) {
+      return reply
+    }
+
+    const job = jobQueue.submit(
+      'zpool.mountpoint',
+      { ...identity, params: { pool: poolName, mountpoint: mp } },
+      async () => {
+        // ZFS-native: `zfs set mountpoint` unmounts and remounts the dataset (and
+        // every inheriting descendant) itself — no fstab, no manual mount/umount.
+        const result = await executor.exec(ZFS, ['set', `mountpoint=${mp}`, poolName])
+        if (result.exitCode !== 0) {
+          throw new Error(result.stderr.trim() || `zfs set mountpoint exited with code ${result.exitCode}`)
+        }
+        return { pool: poolName, mountpoint: mp }
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
   server.post('/pools', async (request, reply) => {
     const bodyParsed = CreatePoolRequest.safeParse(request.body ?? {})
     if (!bodyParsed.success) {
@@ -646,6 +870,37 @@ export async function poolRoutes(
     if (existing.some(p => p.name === req.name)) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `Pool '${req.name}' already exists` } }
+    }
+
+    // Mountpoint override (story 3.27): identical checks to the AHR create path —
+    // never in PVE's namespace, never a path already mounted, claimed in fstab,
+    // or serving another pool. `-m` is passed verbatim to `zpool create`; ZFS
+    // owns the mount. (AbsolutePath already refused relative paths and
+    // `legacy`/`none` at parse — this is the mounted-pool flow only.)
+    if (req.mountpoint !== undefined) {
+      const mp = req.mountpoint.replace(/\/+$/, '') || '/'
+      if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
+      }
+      const findmntRes = await executor.exec(FINDMNT, FINDMNT_ARGS)
+      const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
+      if (mounts.some(m => m.target === mp)) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` } }
+      }
+      if (hasMount(await readConfig(fstabPath), mp)) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` } }
+      }
+      const poolMounts = await readPoolMountpoints(executor)
+      for (const [name, m] of poolMounts) {
+        if (m.mountpoint === mp) {
+          reply.code(409)
+          return { error: { code: 'CONFLICT', message: `'${mp}' is already pool '${name}' mountpoint — pick an unused path` } }
+        }
+      }
+      req.mountpoint = mp
     }
 
     const args = buildCreateArgs(req)

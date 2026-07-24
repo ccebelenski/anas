@@ -252,6 +252,7 @@ export {
   PoolDetail,
   PoolDisk,
   PoolHealthMessage,
+  PoolMountpointRequest,
   PoolProperties,
   PoolState,
   PoolSummary,
