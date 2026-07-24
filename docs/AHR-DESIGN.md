@@ -70,6 +70,9 @@ The planner's rules:
 - Per band, the only legal moves are: **add members** (grow width, same level), **convert level upward** when member count crosses a threshold (RAID1×2 → RAID5×3+ for AHR-1 — a distinct mdadm level-change reshape, not a plain grow), and **create** a new array in a new top band.
 - **Arrays are never renumbered, shrunk, or re-sliced.** Band indices strictly append (naming invariant, §2.6).
 - Input: existing bands + the disk set the operator approved. Output: an ordered step list (§5).
+- **"Existing bands" means existing arrays**: the append-only top boundary is the highest *array's* boundary, not the tallest disk's — the region above it (including any wasted top slice) is free for re-banding.
+- **Replace is a declared substitution**: the planner takes an explicit `{oldDiskId, newDiskId}` pair; the replacement inherits the old disk's band memberships and is size-checked against every band it joins (§2.5). Bands whose member count and level are unchanged get NO plan step — the physical swap is `mdadm --replace`'s job (§5.1), not a layout change.
+- **Stranded capacity is named, not dropped**: a disk whose size falls strictly between immovable existing boundaries (e.g. a 2.5 TB disk against 2/3 boundaries) has permanently unusable slack; the planner reports it in `unprotectedWastedBytes` with a per-disk warning.
 
 This "recompute the reachable target from existing bands + present disks" rule is also what makes resume nearly stateless — see §5.3.
 
@@ -84,8 +87,11 @@ The top band of the single largest disk is always single-member → unprotected 
 ### 2.6 Alignment & on-disk conventions
 
 - GPT, 1 MiB partition alignment, band boundaries aligned to the reserve granularity.
+- Partition geometry (ground truth GT-4): interior slice `[B_{i-1}, B_i)` = start `B_{i-1}`, size `B_i − B_{i-1}` (sgdisk end positions are inclusive — never end "at" a boundary); each disk's topmost slice clamps to the last usable sector (backup GPT eats the final 33).
+- **Unused regions are NOT partitioned** — the area above the top array boundary (wasted top slice included) stays raw so a future expansion can band it to whatever granularity the new disk set dictates.
 - Partition type GUID = Linux RAID (`A19D880F-…`).
-- mdadm metadata 1.2 with **explicit, generous data offset** (reshape headroom — §5.1); arrays named deterministically so assembly is reproducible (`md/<pool>-r<band>`).
+- mdadm metadata 1.2 with **explicit `--data-offset`** — the mdadm default VARIES with member size (GT-5), so ANAS pins a generous deterministic value (production number to be calibrated on TB-scale disks) for reshape headroom (§5.1). Per-member offsets legitimately diverge after grows (GT-6) — parsers must not assume uniformity.
+- Arrays named deterministically (`md/<pool>-r<band>`) and **pinned via ARRAY entries in `/etc/mdadm/mdadm.conf`** (operator decision 2026-07-22; surgical edits, config-files-are-the-API) so `/dev/md/` names are deterministic across assembly paths. Code still resolves arrays by superblock name/UUID via `mdadm --detail --export` defensively — the GT-3 instability exists on any pool ANAS didn't pin (foreign/pre-existing arrays).
 - **Naming invariant:** band indices strictly append across the pool's life; an existing array keeps its name forever. The §2.3 planner guarantees this.
 - LVM: one VG per pool (`<pool>`), one LV (`<pool>-vol`); PVs are the md devices in band order.
 - btrfs single-device (`-d single -m dup`) on the LV. Mounted under a pool-scoped mountpoint (never `/mnt/pve`).
@@ -98,8 +104,9 @@ New `packages/shared/src/schemas/ahr.ts`. All validated at both boundaries.
 AhrType      = 'ahr1' | 'ahr2'
 ArrayLevel   = 'raid1' | 'raid5' | 'raid6'
 ArrayState   = 'clean' | 'degraded' | 'resyncing' | 'reshaping' | 'recovering' | 'failed'
-PoolState    = 'healthy' | 'degraded' | 'expanding' | 'rebuilding' | 'scrubbing' | 'failed' | 'readonly'
+AhrPoolState = 'healthy' | 'degraded' | 'expanding' | 'rebuilding' | 'scrubbing' | 'failed' | 'readonly'
 ```
+(`AhrPoolState`, not `PoolState` — zfs.ts already owns that export name.)
 
 (Initial RAID5/6 sync after create reports as `resyncing`; the UI copy must present it as "building — pool usable now", distinct from degraded.)
 
@@ -161,7 +168,7 @@ partition (new/replaced disk) → array-create OR array-grow OR array-convert (m
 ```
 
 - **md reshape is kernel-resumable ONLY when offset-based.** `mdadm --grow` uses data-offset headroom for the critical section when it can; when it can't, it demands `--backup-file=` — and then resume-after-power-loss requires re-supplying that file at assembly. **Lose it and the array may be unassemblable.** That is critical hidden state, worse than any plan file, and AHR **mandates offset-based reshapes**: arrays are created (§2.6) with explicit generous data offsets, and the ground-truth stage must verify that every grow/convert we perform proceeds with NO backup file — including the widest-grow case. If any operation turns out to require one, that operation is redesigned or dropped, not backed by a file we promise not to lose.
-- On power loss mid-reshape, md resumes on next assembly. ANAS detects "reshape in progress" at boot/daemon-start and *re-attaches monitoring* rather than restarting anything. `reshape-wait` polls `/proc/mdstat` + `mdadm --detail`.
+- On power loss mid-reshape, a HEALTHY array resumes on next assembly. **A DEGRADED mid-reshape array does not (GT-8): udev assembles it INACTIVE, all members listed as spares.** Boot/daemon-start detection therefore does more than re-attach monitoring — it runs the verified recovery ladder: `mdadm --run` (starts the array, drops the failed member, lands `active (auto-read-only), clean, degraded`), then `mdadm --readwrite` (reshape resumes from its kernel checkpoint), then `vgchange -ay` once the PV appears. ANAS never re-issues the reshape itself. `reshape-wait` polls `/proc/mdstat` + `mdadm --detail`. Note `auto-read-only` is the normal post-assembly state of EVERY array until first write (GT-9) — not a fault.
 - **Ordering safety:** the filesystem is only grown as the LAST step, and only after the LV is confirmed extended. Never grow the fs before the block device beneath it.
 - **A step failure halts the pipeline** in a known state; the pool remains whatever it is (usually still mounted and usable — degraded, not down), the intent goes to `halted`, and ANAS reports exactly which layer stopped. The operator's verbs are `expand/resume` (idempotent recompute-and-continue) and `expand/abandon`.
 - **Replace uses `mdadm --replace`, never fail-then-rebuild.** When the outgoing disk is still alive (the proactive-upgrade case — the headline use case), `--replace` copies onto the new member while the old one stays in-array, so redundancy is never lost. Fail/remove-then-add would drop every band the disk touches to degraded — voluntarily running the second-failure exposure §7.2 warns about. Fail-then-rebuild is only for disks that are already dead.
@@ -223,7 +230,7 @@ AHR is the feature that justifies actually wiring the deferred Proxmox notificat
 | Pool read-only (btrfs forced ro) | **critical** | fs protecting itself |
 | Scrub found (and could/could not correct) errors | warning/error | latent corruption surfaced |
 
-Routed through PVE's own notification targets/matchers (email/Gotify/etc. the operator already configured) — ANAS emits, PVE delivers. Leverage, not a new alerting system. **Evaluate first (per 9.4):** does ZED/mdadm's own `MAILADDR`/monitor already cover the disk-failure cases? Wire only the genuinely-missing events; don't duplicate `mdadm --monitor` if PVE can consume it directly.
+Routed through PVE's own notification targets/matchers (email/Gotify/etc. the operator already configured) — ANAS emits, PVE delivers. Leverage, not a new alerting system. **Mechanism (GT-17, proven live):** `PVE::Notify::<severity>('anas-ahr', {title, message}, fields)` with ANAS-shipped handlebars templates in `/usr/share/pve-manager/templates/default/` (apt-hook reinstalls after pve-manager upgrades); `fields` carries `type=anas-ahr` for operator matcher rules. **Evaluate first (per 9.4):** does ZED/mdadm's own `MAILADDR`/monitor already cover the disk-failure cases? Wire only the genuinely-missing events; don't duplicate `mdadm --monitor` if PVE can consume it directly.
 
 ### 7.3 Dashboard
 Only failures and in-progress operations surface (the replication/backup policy): a degraded/failed/read-only pool → warning card; a running reshape/rebuild → the jobs strip with progress. Healthy/idle shows nothing.
@@ -231,8 +238,8 @@ Only failures and in-progress operations surface (the replication/backup policy)
 ## 8. Failure & recovery model
 
 - **Degraded ≠ down**: a single-disk failure in an AHR-1 band keeps the pool fully usable (that's the point). ANAS surfaces it loudly (dashboard + notification) but does not stop service.
-- **Reshape interrupted** (power loss): md resumes automatically on assembly (offset-based reshapes only — §5.1); ANAS re-attaches monitoring, never re-issues the reshape.
-- **Disk fails DURING a reshape** (the scariest real case): md continues the reshape degraded. ANAS must detect the combined state (reshaping + degraded), notify at `error` severity, keep monitoring, and refuse further operations until the reshape completes and the disk is replaced. **Mandatory stunt-node failure drill** — force this scenario on throwaway data before shipping.
+- **Reshape interrupted** (power loss): healthy arrays resume automatically on assembly (offset-based reshapes only — §5.1); ANAS re-attaches monitoring, never re-issues the reshape. **If the array was also degraded, it assembles inactive — ANAS drives the §5.1 recovery ladder (GT-8).**
+- **Disk fails DURING a reshape** (the scariest real case): md continues the reshape degraded (`clean, degraded, reshaping` — drilled live, GT stage 0, data intact through fail + power-loss + resume). ANAS detects the combined state, notifies at `error` severity, keeps monitoring, and refuses further operations until the reshape completes and the disk is replaced.
 - **Step failure**: pipeline halts, intent → `halted`, pool left in a known intermediate state (never fs-mounted-rw during an unsafe block-layer transition); ANAS reports the exact layer + offers Resume (idempotent recompute-and-continue) or Abandon.
 - **btrfs read-only trip**: surfaced as critical; ANAS never force-remounts rw (the fs is protecting data) — points the operator at diagnosis.
 - **Marginal replacement disk** (too small by a hair): caught before any destructive action via the §2.5 reserve pre-check, with a clear message.
@@ -240,12 +247,15 @@ Only failures and in-progress operations surface (the replication/backup policy)
 
 ## 9. Open questions for review
 
+> Stage-0 ground truth (2026-07-22, docs/AHR-GROUND-TRUTH.md) answered several — statuses below.
+
 1. ~~Plan shadow state~~ **Resolved (§5.3):** persist only the approved-disk-set intent; steps are always recomputed. A missing disk is never treated as intent.
-2. **Replacement reserve granularity (§2.5):** floor-to-GiB vs a fixed percentage vs a measured constant — needs the stunt-node disk-variance capture.
-3. **AHR-2 min-disk and small-band handling:** confirm behavior when a top band has 2–3 members under AHR-2 (unprotected-for-2? RAID1? wasted?) against a real build.
-4. **Reshape resource throttling** (`/proc/sys/dev/raid/speed_limit_*`) — tune during reshape or leave kernel defaults? Ground-truth it. Same session: measure sequential-vs-parallel multi-band rebuild on one spindle (§5.1).
-5. **Data-offset sizing (§5.1):** what offset guarantees backup-file-free grows and converts at every width we support? Ground-truth with the widest case.
-6. **Notification overlap (§7.2):** measure what `mdadm --monitor` / ZED already deliver on a PVE node before building the client.
+2. ~~Replacement reserve granularity~~ **Resolved (GT-16, operator fleet capture 2026-07-22):** modern drives of the same nominal class are byte-identical across vendors/models/interfaces (43-disk sample, zero variance). Floor-to-GiB confirmed as generous insurance; the real hazard is SSD marketing-class mismatch (1000-GB vs 1024-GB "1 TB"), which the §2.5 pre-check rejects explicitly rather than the reserve absorbing.
+3. ~~AHR-2 command path~~ **Answered (GT-15):** RAID6 create/grow/double-failure proven live; grow is backup-file-free like RAID5. Planner policy (<4 = wasted) stands.
+4. ~~Reshape throttling~~ **Answered (GT-10):** `dev.raid.speed_limit_max` throttles live in both directions; ANAS may offer it during expansions. Sequential-vs-parallel multi-band rebuild on one spindle still unmeasured.
+5. **Data-offset sizing (§5.1):** backup-file-free grow CONFIRMED via offset-shift even at small offsets (GT-6); production offset value still to calibrate on TB-scale disks.
+6. ~~Notification overlap~~ **Resolved (GT-11 + operator decision 2026-07-22):** `mdmonitor` runs out of the box; ANAS sets `PROGRAM` in mdadm.conf (surgical edit) pointing at a small ANAS hook that forwards md events to PVE's notification system. Event-driven, zero polling (Principle 7); mdadm covers the md rows of the §7.2 table, ANAS's job layer emits the rest (expansion done/failed, btrfs read-only, scrub results).
 7. **Foreign SHR pool adoption (parked, real scope):** because the stack is identical, disks pulled from a dead Synology will likely just assemble as md+LVM on a PVE node. Recognizing/adopting a foreign hybrid pool (read-only rescue at minimum) could be a killer migration story — decide deliberately later; not designed here.
+8. ~~mdadm.conf ARRAY pinning~~ **Resolved (operator decision 2026-07-22):** pin, via surgical ARRAY entries (§2.6); code still tolerates both name forms for unpinned/foreign arrays.
 
 ~~API home~~ **Resolved:** `/v1/ahr`, sibling of `/v1/pools` — decided with the naming.

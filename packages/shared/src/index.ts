@@ -10,6 +10,32 @@ export {
   SetAccessRequest,
 } from './schemas/access.js'
 
+// AHR schemas (Epic 11 + AHR — ANAS Hybrid RAID)
+export {
+  AhrArray,
+  AhrArrayMember,
+  AhrArraySync,
+  AhrCapacity,
+  AhrDisk,
+  AhrDiskPartition,
+  AhrDiskRole,
+  AhrExpansionIntent,
+  AhrExpansionState,
+  AhrExpansionStep,
+  AhrExpansionStepKind,
+  AhrExpansionTrigger,
+  AhrLayoutPreview,
+  AhrMemberState,
+  AhrPool,
+  AhrPoolState,
+  AhrPreviewBand,
+  AhrStepStatus,
+  AhrSyncAction,
+  AhrType,
+  ArrayLevel,
+  ArrayState,
+} from './schemas/ahr.js'
+
 // API envelope schemas
 export {
   ApiError,
