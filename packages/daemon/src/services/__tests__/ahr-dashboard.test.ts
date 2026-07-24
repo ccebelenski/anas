@@ -1,4 +1,4 @@
-import type { AhrCapacity, AhrExpansionIntent, AhrPool } from '@anas/shared'
+import type { AhrCapacity, AhrDisk, AhrExpansionIntent, AhrPool, AhrPoolBrief } from '@anas/shared'
 import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -13,7 +13,7 @@ import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { writeIntent } from '../ahr-intent.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, buildAhrWarnings, collectAhrWarnings, readAhrPools } from '../ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, buildAhrCapacityWarnings, buildAhrPoolBriefs, buildAhrWarnings, collectAhrPoolBriefs, collectAhrWarnings, readAhrPools } from '../ahr-topology.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/ahr')
@@ -27,6 +27,7 @@ function ok(stdout: string) {
 const HOT1 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1'
 const HOT2 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2'
 const HOT3 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3'
+const HOT4 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT4'
 
 /** The stage-0 phase-A pool `ahr0`, healthy and mounted (topology-test twin). */
 function healthyExecutor(overrides?: { mdstat?: string, findmnt?: string, vgs?: string, lvs?: string }): MockExecutor {
@@ -193,5 +194,178 @@ describe('collectAhrWarnings (fail-open source for GET /v1/status)', () => {
     writeFileSync(join(dir, 'ahr0.json'), '{ not json', 'utf-8')
     // The pool itself still reads healthy → no card, and no throw.
     assert.deepEqual(await collectAhrWarnings(healthyExecutor(), dir), [])
+  })
+})
+
+describe('buildAhrPoolBriefs (story 11.13, AHR-DESIGN §10 revision)', () => {
+  /** Attach a hot-spare disk (§11 shape) to a base pool: a role:'spare' disk plus
+   *  a memberState:'spare' member row on every band array. */
+  function withSpare(base: AhrPool): AhrPool {
+    const spare: AhrDisk = {
+      id: HOT4,
+      sizeBytes: 2147483648,
+      usableBytes: 2147483648,
+      model: 'QEMU HARDDISK',
+      serial: 'ANAS_HOT4',
+      role: 'spare',
+      partitions: [],
+    }
+    return {
+      ...base,
+      disks: [...base.disks, spare],
+      arrays: base.arrays.map(a => ({
+        ...a,
+        members: [
+          ...a.members,
+          { disk: HOT4, partition: `/dev/disk/by-id/${HOT4}-part${a.band}`, memberState: 'spare' as const },
+        ],
+      })),
+    }
+  }
+
+  it('derives the healthy pool: bands (level × members) + capacity + mount, no spare', async () => {
+    const pool = await healthyPool()
+    const briefs = buildAhrPoolBriefs([pool])
+    assert.equal(briefs.length, 1)
+    const b = briefs[0]
+
+    assert.equal(b.name, 'ahr0')
+    assert.equal(b.state, 'healthy')
+    assert.equal(b.mounted, true)
+    assert.equal(b.mountpoint, '/mnt/anas-ahr/ahr0')
+    assert.equal(b.subvolLayout, pool.subvolLayout)
+    // usable from the LV; used from btrfs (mounted → present, not a wrong number).
+    assert.equal(b.usableBytes, pool.capacity.usableBytes)
+    assert.ok(b.usableBytes > 0)
+    assert.equal(b.usedBytes, pool.capacity.usedBytes)
+    assert.notEqual(b.usedBytes, undefined)
+
+    // Two bands: r1 raid5×3, r2 raid1×2 — ascending, redundant members only.
+    assert.equal(b.bands.length, 2)
+    assert.equal(b.bands[0].band, 1)
+    assert.equal(b.bands[0].level, 'raid5')
+    assert.equal(b.bands[0].memberCount, 3)
+    assert.equal(b.bands[0].members.length, 3)
+    // Full member ids (never truncated) + their raw disk sizes for the tiles.
+    assert.deepEqual(b.bands[0].members.map(m => m.id).sort(), [HOT1, HOT2, HOT3])
+    for (const m of b.bands[0].members)
+      assert.ok(m.sizeBytes > 0, `${m.id} carries a disk size`)
+    assert.equal(b.bands[1].level, 'raid1')
+    assert.equal(b.bands[1].memberCount, 2)
+
+    // No spare attached in the stage-0 fixture.
+    assert.deepEqual(b.spares, [])
+  })
+
+  it('reports a hot spare at pool level and excludes it from band member counts', async () => {
+    const briefs = buildAhrPoolBriefs([withSpare(await healthyPool())])
+    const b = briefs[0]
+    // The spare is NOT a band member — "RAID5 × 3" stays three, not four.
+    assert.equal(b.bands[0].memberCount, 3)
+    assert.ok(!b.bands[0].members.some(m => m.id === HOT4), 'spare not a band member')
+    assert.equal(b.bands[1].memberCount, 2)
+    // It is reported once, at pool level, with its raw size (labeled spare bay).
+    assert.deepEqual(b.spares, [{ id: HOT4, sizeBytes: 2147483648 }])
+  })
+
+  it('OMITS usedBytes for an unmounted pool (never a wrong number)', async () => {
+    const base = await healthyPool()
+    const unmounted: AhrPool = { ...base, mounted: false }
+    const b = buildAhrPoolBriefs([unmounted])[0]
+    assert.equal(b.mounted, false)
+    assert.equal(b.usedBytes, undefined)
+    // Usable still reports — it comes from the LV, not the (absent) btrfs read.
+    assert.ok(b.usableBytes > 0)
+  })
+})
+
+describe('buildAhrCapacityWarnings (parity with ZFS capacity cards)', () => {
+  /** A minimal capacity-carrying brief; usedBytes omitted when `used` is null. */
+  function brief(usableBytes: number, used: number | null): AhrPoolBrief {
+    return {
+      name: 'tank',
+      state: 'healthy',
+      usableBytes,
+      ...(used === null ? {} : { usedBytes: used }),
+      mountpoint: '/mnt/tank',
+      mounted: used !== null,
+      subvolLayout: false,
+      bands: [],
+      spares: [],
+    }
+  }
+
+  it('≥95% full → one critical capacity card, wording mirrors ZFS', () => {
+    const warnings = buildAhrCapacityWarnings([brief(100, 96)])
+    assert.equal(warnings.length, 1)
+    assert.equal(warnings[0].level, 'critical')
+    assert.equal(warnings[0].category, 'capacity')
+    assert.equal(warnings[0].ref, 'tank')
+    assert.equal(warnings[0].message, `AHR pool 'tank' is 96% full`)
+  })
+
+  it('at the 95% threshold → critical', () => {
+    const warnings = buildAhrCapacityWarnings([brief(100, 95)])
+    assert.equal(warnings.length, 1)
+    assert.equal(warnings[0].level, 'critical')
+    assert.equal(warnings[0].message, `AHR pool 'tank' is 95% full`)
+  })
+
+  it('≥90% (but <95%) full → one warning capacity card', () => {
+    const warnings = buildAhrCapacityWarnings([brief(100, 94)])
+    assert.equal(warnings.length, 1)
+    assert.equal(warnings[0].level, 'warning')
+    assert.equal(warnings[0].category, 'capacity')
+    assert.equal(warnings[0].message, `AHR pool 'tank' is 94% full`)
+  })
+
+  it('at the 90% threshold → warning', () => {
+    const warnings = buildAhrCapacityWarnings([brief(100, 90)])
+    assert.equal(warnings.length, 1)
+    assert.equal(warnings[0].level, 'warning')
+    assert.equal(warnings[0].message, `AHR pool 'tank' is 90% full`)
+  })
+
+  it('below the 90% threshold → NO card', () => {
+    assert.deepEqual(buildAhrCapacityWarnings([brief(100, 89)]), [])
+  })
+
+  it('an unmounted pool (no usedBytes) → NO card, never a wrong number', () => {
+    assert.deepEqual(buildAhrCapacityWarnings([brief(100, null)]), [])
+  })
+
+  it('zero usable capacity → NO card (no division by zero)', () => {
+    assert.deepEqual(buildAhrCapacityWarnings([brief(0, 0)]), [])
+  })
+
+  it('end to end: the healthy fixture pool is not near-full → no capacity card', async () => {
+    assert.deepEqual(buildAhrCapacityWarnings(buildAhrPoolBriefs([await healthyPool()])), [])
+  })
+})
+
+describe('collectAhrPoolBriefs (fail-open source for GET /v1/status)', () => {
+  it('an AHR read error degrades the source to [] (never a throw)', async () => {
+    const throwing: CommandExecutor = {
+      exec: async () => {
+        throw new Error('boom')
+      },
+      pipeline: async () => {
+        throw new Error('boom')
+      },
+    }
+    assert.deepEqual(await collectAhrPoolBriefs(throwing), [])
+  })
+
+  it('reports [] when there are no AHR pools', async () => {
+    // An executor with no mdstat match → readAhrPools bails early → no pools.
+    assert.deepEqual(await collectAhrPoolBriefs(new MockExecutor()), [])
+  })
+
+  it('derives briefs from the live healthy pool end to end', async () => {
+    const briefs = await collectAhrPoolBriefs(healthyExecutor())
+    assert.equal(briefs.length, 1)
+    assert.equal(briefs[0].name, 'ahr0')
+    assert.equal(briefs[0].state, 'healthy')
+    assert.equal(briefs[0].bands.length, 2)
   })
 })

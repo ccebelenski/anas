@@ -22,8 +22,12 @@
  * Data contract (two endpoints, read as JSON; no compile dependency):
  *   GET /v1/status    → { node, pools[], disks{healthy,warning,critical,unknown,
  *                         total}, shares{}, jobs[{id,kind,status,startedAt?,
- *                         finishedAt?,durationMs?}], warnings[] }
- *                       loaded on show + manual Refresh.
+ *                         finishedAt?,durationMs?}], warnings[], ahrPools[] }
+ *                       loaded on show + manual Refresh. ahrPools[] (11.13) are
+ *                       AHR pool briefs { name, state, usableBytes, usedBytes?,
+ *                       mountpoint, mounted, subvolLayout, bands[], spares[] } —
+ *                       rendered in the Pools section after the ZFS pools, with
+ *                       no I/O strip (telemetry is zpool-based).
  *   GET /v1/telemetry → { sampledAt, windowMs, arc{}, net{}, pools:[ { name,
  *                         ...ioStats, vdevs:[ { name,type,role,state,...ioStats,
  *                         disks:[ { id, ...ioStats } ] } ] } ] }
@@ -266,7 +270,14 @@
                 + '.anas-dash-mrow-v{flex:1 1 auto;min-width:0}'
                 // Warning card: category icon + bold ref lead so cards scan by target.
                 + '.anas-dash-warn-ico{flex:0 0 auto;margin-right:2px;opacity:.85}'
-                + '.anas-dash-warn-ref{font-weight:750}';
+                + '.anas-dash-warn-ref{font-weight:750}'
+                // AHR pool block (11.13): the whole block deep-links to the Hybrid
+                // RAID view, so it reads as clickable and highlights on hover/focus.
+                + '.anas-dash-pool-ahr{cursor:pointer}'
+                + '.anas-dash-pool-ahr:hover{border-color:var(--anas-accent,#3468c0)}'
+                + '.anas-dash-pool-ahr:focus{outline:2px solid var(--anas-accent,#3468c0);outline-offset:2px}'
+                // The hot-spare tier: accent left border to set it apart from bands.
+                + '.anas-dash-vdev-spare{border-left-color:var(--anas-accent,#3468c0)}';
             var style = document.createElement('style');
             style.id = 'anas-dash-styles';
             style.type = 'text/css';
@@ -708,6 +719,244 @@
         return '';
     }
 
+    // ---- AHR pools in the headline Pools section (11.13, AHR-DESIGN §10) ----
+    //
+    // AHR pools render alongside ZFS pools (AFTER them) with the SAME structural
+    // presence: name + AHR badge + state light, a used/usable capacity donut, a
+    // labeled mountpoint, and the Pool → band → member-disk composite in the gfx
+    // visual language. NO I/O strip — telemetry is zpool-based, so the AHR block
+    // simply omits it (never a faked/zeroed number). The whole block deep-links
+    // to the Hybrid RAID view. Fed by /v1/status ahrPools (fail-open []).
+
+    // AHR pool state → gfx pill severity token (mirrors 39-ahr.js POOL_STATES):
+    // busy states (expanding/scrubbing) stay NEUTRAL — activity, not fault.
+    var AHR_PILL_TOKEN = {
+        healthy: 'ONLINE', degraded: 'DEGRADED', expanding: '',
+        rebuilding: 'DEGRADED', scrubbing: '', failed: 'FAULTED', readonly: 'FAULTED'
+    };
+
+    function ahrStatePill(state) {
+        var token = AHR_PILL_TOKEN.hasOwnProperty(state) ? AHR_PILL_TOKEN[state] : '';
+        var label = state === 'readonly' ? t('read-only') : t('' + (state || ''));
+        try {
+            if (gfx && typeof gfx.statePill === 'function') {
+                var html = gfx.statePill(token, { label: label });
+                if (html) { return html; }
+            }
+        } catch (e) {
+            // fall through
+        }
+        return '<span class="anas-dash-muted">' + enc(label) + '</span>';
+    }
+
+    // mdadm band level → display label (RAID5 / RAID6 / RAID1).
+    function ahrLevelLabel(level) {
+        var l = ('' + (level || '')).toLowerCase();
+        if (l === 'raid1') { return 'RAID1'; }
+        if (l === 'raid5') { return 'RAID5'; }
+        if (l === 'raid6') { return 'RAID6'; }
+        return level ? ('' + level).toUpperCase() : t('array');
+    }
+
+    // A static member/spare disk tile: a skeuomorphic disk object + the FULL
+    // by-id (never truncated — .anas-dash-disk-id wraps break-all) + a labeled
+    // size. No I/O numbers (telemetry is zpool-based). `spare` shows the grey
+    // spare status dot.
+    function ahrDiskTile(id, sizeBytes, spare) {
+        id = '' + (id || 'disk');
+        var iconHtml = '';
+        try {
+            if (gfx && typeof gfx.icon === 'function') {
+                iconHtml = gfx.icon('hdd', { state: spare ? 'spare' : 'online', title: id }) || '';
+            }
+        } catch (e) {
+            iconHtml = '';
+        }
+        return '<div class="anas-dash-disk">' + iconHtml
+            + '<div style="min-width:0;flex:1 1 auto">'
+            + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(id) + '</div>'
+            + '<div class="anas-dash-disk-sub">'
+            + enc(t('Size') + ' ' + ANAS.formatBytes(num(sizeBytes))) + '</div>'
+            + '</div></div>';
+    }
+
+    // One band row: "BAND · band N — RAID5 × 4" head + the member disk tiles.
+    // Reuses the ZFS vdev tier's classes so a band reads visually as a vdev, but
+    // carries no I/O strip.
+    function renderAhrBand(band) {
+        band = band || {};
+        var n = num(band.band);
+        var desc = '— ' + ahrLevelLabel(band.level) + ' × ' + num(band.memberCount);
+        var members = band.members || [];
+        var devHtml = '';
+        for (var i = 0; i < members.length; i++) {
+            devHtml += ahrDiskTile(members[i] && members[i].id, members[i] && members[i].sizeBytes, false);
+        }
+        return '<div class="anas-dash-vdev">'
+            + '<div class="anas-dash-vdev-head">'
+            + '<span class="anas-dash-vdev-tag">' + enc(t('BAND')) + '</span>'
+            + '<span class="anas-dash-vdev-name">' + enc(t('band') + ' ' + n) + '</span>'
+            + '<span class="anas-dash-vdev-desc">' + enc(desc) + '</span></div>'
+            + (devHtml ? '<div class="anas-dash-devs">' + devHtml + '</div>' : '')
+            + '</div>';
+    }
+
+    // The labeled hot-spare bay (§11 idiom, mirroring 39-ahr.js): a distinct
+    // tier whose tiles carry the spare status dot. '' when no spare is attached.
+    function renderAhrSpareBay(spares) {
+        spares = spares || [];
+        if (!spares.length) { return ''; }
+        var devHtml = '';
+        for (var i = 0; i < spares.length; i++) {
+            devHtml += ahrDiskTile(spares[i] && spares[i].id, spares[i] && spares[i].sizeBytes, true);
+        }
+        return '<div class="anas-dash-vdev anas-dash-vdev-spare">'
+            + '<div class="anas-dash-vdev-head">'
+            + '<span class="anas-dash-vdev-tag">' + enc(t('SPARE')) + '</span>'
+            + '<span class="anas-dash-vdev-desc">'
+            + enc('— ' + t('hot spare — automatic rebuild target on any member failure'))
+            + '</span></div>'
+            + '<div class="anas-dash-devs">' + devHtml + '</div>'
+            + '</div>';
+    }
+
+    // One AHR pool block. Matches the ZFS block's visual language (name + state
+    // pill + capacity donut) via gfx, adds a small AHR badge, labels the mount,
+    // renders the band → member-disk composite + spare bay, and DELIBERATELY
+    // omits the I/O strip (telemetry is zpool-based). data-anas-nav makes the
+    // whole block deep-link to the Hybrid RAID view.
+    function renderAhrPoolBlock(view, ap) {
+        ap = ap || {};
+        var name = ap.name || 'pool';
+        var usable = num(ap.usableBytes);
+        var hasUsed = ap.usedBytes !== undefined && ap.usedBytes !== null && !isNaN(Number(ap.usedBytes));
+        var used = hasUsed ? num(ap.usedBytes) : 0;
+        var free = Math.max(usable - used, 0);
+
+        // Capacity: a used/free donut when mounted (used is known); an unmounted
+        // pool shows usable only — no misleading fill, never a wrong number.
+        var capBlock;
+        if (hasUsed && usable > 0) {
+            var pct = Math.round((used / usable) * 100);
+            var donut = '';
+            try {
+                if (gfx && typeof gfx.donut === 'function') {
+                    donut = gfx.donut(
+                        [
+                            { label: t('Used'), value: used },
+                            { label: t('Free'), value: free, free: true }
+                        ],
+                        { size: 104, center: { big: pct + '%', sm: ANAS.formatBytes(usable) } }
+                    ) || '';
+                }
+            } catch (eD) {
+                donut = '';
+            }
+            if (!donut) {
+                donut = fallbackBar(used / usable, pct >= 90 ? BAD_COLOR : (pct >= 75 ? WARN_COLOR : OK_COLOR))
+                    + '<div class="anas-dash-muted" style="margin-top:4px">' + enc(pct + '%') + '</div>';
+            }
+            capBlock = '<div class="anas-dash-pool-cap">' + donut
+                + '<div class="anas-dash-muted" style="margin-top:6px">'
+                + enc(ANAS.formatBytes(used) + ' / ' + ANAS.formatBytes(usable)) + '</div></div>';
+        } else {
+            capBlock = '<div class="anas-dash-pool-cap">'
+                + '<div class="anas-dash-stat-n" style="color:' + MUTED_COLOR + '">'
+                + enc(ANAS.formatBytes(usable)) + '</div>'
+                + '<div class="anas-dash-muted" style="margin-top:4px">' + enc(t('Usable')) + '</div></div>';
+        }
+
+        var badge = '';
+        try {
+            if (gfx && typeof gfx.badge === 'function') {
+                badge = gfx.badge(t('AHR'), { title: t('ANAS Hybrid RAID') }) || '';
+            }
+        } catch (eB) {
+            badge = '';
+        }
+
+        var mountState = ap.mounted ? t('mounted') : t('not mounted');
+        var mountHtml = '<div class="anas-dash-muted" style="margin-top:4px">'
+            + enc(t('Mount') + ': ' + (ap.mountpoint || '—') + ' (' + mountState + ')') + '</div>';
+
+        var bands = ap.bands || [];
+        var bandHtml = '';
+        for (var i = 0; i < bands.length; i++) {
+            bandHtml += renderAhrBand(bands[i]);
+        }
+        bandHtml += renderAhrSpareBay(ap.spares);
+
+        return '<div class="anas-dash-pool anas-dash-pool-ahr" data-anas-nav="anas-ahr" '
+            + 'role="link" tabindex="0" title="' + enc(t('Open the Hybrid RAID view')) + '">'
+            + '<div class="anas-dash-pool-head">'
+            + capBlock
+            + '<div class="anas-dash-pool-main">'
+            + '<div class="anas-dash-pool-name">' + poolGlyph()
+            + '<span>' + enc(name) + '</span>' + badge + ahrStatePill(ap.state) + '</div>'
+            + mountHtml
+            + '</div></div>'
+            + bandHtml
+            + '</div>';
+    }
+
+    // Deep-link from a pool block to another ANAS view by selecting its node in
+    // the PVE config treelist (the selection drives the card switch AND keeps the
+    // menu highlight in sync). Best-effort + fail-open: it finds the treelist
+    // whose store actually contains the target node, so it is robust to the
+    // ancestor structure; any missing internal → no-op, never a throw.
+    function navigateToView(cardItemId) {
+        try {
+            var trees = (typeof Ext !== 'undefined' && Ext.ComponentQuery)
+                ? Ext.ComponentQuery.query('treelist') : [];
+            for (var i = 0; i < trees.length; i++) {
+                var tree = trees[i];
+                var store = tree && tree.getStore ? tree.getStore() : null;
+                var rec = store && store.getNodeById ? store.getNodeById(cardItemId) : null;
+                if (rec && typeof tree.setSelection === 'function') {
+                    tree.setSelection(rec);
+                    return true;
+                }
+            }
+        } catch (e) {
+            ANAS.warn('dashboard navigate failed: ' + ANAS.errText(e));
+        }
+        return false;
+    }
+
+    // Attach ONE delegated click/Enter handler on the pools section element so
+    // any pool block carrying data-anas-nav deep-links. The element persists
+    // across setHtml re-renders, so this wires once (guarded on the view).
+    function wirePoolNav(view) {
+        try {
+            if (!view || view._anasNavWired) { return; }
+            var cmp = view.down && view.down('#anasDashPools');
+            var el = cmp && cmp.getEl ? cmp.getEl() : null;
+            if (!el || typeof el.on !== 'function') { return; }
+            var go = function (e) {
+                try {
+                    var tgt = e && e.getTarget ? e.getTarget('[data-anas-nav]') : null;
+                    if (!tgt || !tgt.getAttribute) { return; }
+                    var dest = tgt.getAttribute('data-anas-nav');
+                    if (dest) { navigateToView(dest); }
+                } catch (err) {
+                    // fail-open — a click must never throw into the PVE UI
+                }
+            };
+            el.on('click', go);
+            el.on('keydown', function (e) {
+                try {
+                    var k = e && (e.getKey ? e.getKey() : e.keyCode);
+                    if (k === 13 || k === 32) { go(e); }
+                } catch (err) {
+                    // fail-open
+                }
+            });
+            view._anasNavWired = true;
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
     // ---- Pool → VDEV → Device composite (the headline) ---------------------
     //
     // ONE nested hierarchy per pool. State/capacity/scan come from /status; live I/O comes
@@ -1013,6 +1262,9 @@
         var tel = view && view._anasTelemetry;
         var statusPools = (st && st.pools) || [];
         var telPools = (tel && tel.pools) || [];
+        // AHR pools ride the SAME headline section (11.13), rendered AFTER the
+        // ZFS pools; [] fail-open so a ZFS-only node is visually unchanged.
+        var ahrPools = (st && st.ahrPools) || [];
 
         var telMap = {};
         for (var k = 0; k < telPools.length; k++) {
@@ -1025,7 +1277,7 @@
         // telemetry pools when status hasn't arrived so the section is never
         // empty on the first telemetry tick.
         var list = statusPools.length ? statusPools : telPools;
-        if (!list.length) {
+        if (!list.length && !ahrPools.length) {
             return heading(t('Pools')) + muted(t('No pools.'));
         }
 
@@ -1046,6 +1298,10 @@
             // pool, so use it directly for the I/O side too.
             var tp = telMap[name] || (statusPools.length ? null : p);
             body += renderPoolBlock(view, p, tp, dims);
+        }
+        // AHR pool blocks render AFTER the ZFS pools, in the same section.
+        for (var a = 0; a < ahrPools.length; a++) {
+            body += renderAhrPoolBlock(view, ahrPools[a]);
         }
         return heading(t('Pools')) + body;
     }
@@ -1144,6 +1400,9 @@
             // The Pools composite blends /status (state/capacity/scan) with the
             // cached /telemetry (I/O + vdevs). Re-render it from both caches.
             setSection(view, 'anasDashPools', renderPoolsComposite(view));
+            // AHR pool blocks deep-link to the Hybrid RAID view (11.13) — wire
+            // the delegated click handler once the section has an element.
+            wirePoolNav(view);
         }, function (err) {
             if (view.destroyed || view.destroying) {
                 return;
@@ -1172,6 +1431,7 @@
             setSection(view, 'anasDashArc', renderArc(view, tel));
             // Pool I/O now lives inside the composite — re-render it each tick.
             setSection(view, 'anasDashPools', renderPoolsComposite(view));
+            wirePoolNav(view);
             setSection(view, 'anasDashNet', renderNet(view, tel));
         }, function (err) {
             if (view.destroyed || view.destroying) {

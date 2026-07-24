@@ -364,5 +364,45 @@ describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () =>
     assert.ok(summary.pools.some(p => p.name === 'testpool'))
     // …and the AHR source degraded to nothing, without failing the request.
     assert.equal(summary.warnings.filter(w => w.category === 'ahr').length, 0)
+    // Both AHR sources fail-open independently — ahrPools is [], never absent.
+    assert.deepEqual(summary.ahrPools, [])
+  })
+})
+
+describe('GET /v1/status — ahrPools briefs (story 11.13, AHR-DESIGN §10 revision)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  async function status(srv: ReturnType<typeof createServer>): Promise<StatusSummary> {
+    const res = await srv.inject({ method: 'GET', url: '/v1/status', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    return (res.json() as { data: StatusSummary }).data
+  }
+
+  it('carries the healthy AHR pool in the /v1/status aggregate', async () => {
+    server = createServer({ mock: true, logger: false })
+    const summary = await status(server)
+
+    // The aggregate now has an ahrPools array (parallel to pools[]).
+    assert.ok(Array.isArray(summary.ahrPools))
+    const ahr0 = summary.ahrPools.find(p => p.name === 'ahr0')
+    assert.ok(ahr0, 'ahr0 present in ahrPools')
+    assert.equal(ahr0!.state, 'healthy')
+    assert.equal(ahr0!.mounted, true)
+    assert.ok(ahr0!.usableBytes > 0)
+    assert.notEqual(ahr0!.usedBytes, undefined) // mounted → used is trustworthy
+
+    // Bands render the composite: r1 raid5×3, r2 raid1×2.
+    assert.equal(ahr0!.bands.length, 2)
+    assert.equal(ahr0!.bands[0].level, 'raid5')
+    assert.equal(ahr0!.bands[0].memberCount, 3)
+    assert.equal(ahr0!.bands[1].level, 'raid1')
+
+    // A healthy pool still cards NOTHING (warnings stay failure-only, 11.10).
+    assert.equal(summary.warnings.filter(w => w.category === 'ahr').length, 0)
   })
 })

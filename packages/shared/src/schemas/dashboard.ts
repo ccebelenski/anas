@@ -1,5 +1,6 @@
 import { z } from 'zod'
-import { ISODateTime } from './common.js'
+import { AhrPoolState, ArrayLevel } from './ahr.js'
+import { DiskId, ISODateTime } from './common.js'
 import { PoolState, VdevRole, VdevState, VdevType } from './zfs.js'
 
 /**
@@ -71,6 +72,60 @@ export const JobBrief = z.object({
 })
 export type JobBrief = z.infer<typeof JobBrief>
 
+// ---- AHR pools on the dashboard (story 11.13, AHR-DESIGN §10 revision) --------
+
+/**
+ * A band-array member (or hot spare) disk, brief form for the dashboard
+ * composite: its stable by-id identity (never truncated in the UI) and the raw
+ * disk size that sizes its tile.
+ */
+export const AhrBandMemberBrief = z.object({
+  id: DiskId,
+  sizeBytes: z.number().int().nonnegative(),
+})
+export type AhrBandMemberBrief = z.infer<typeof AhrBandMemberBrief>
+
+/**
+ * One band's summary for the dashboard's Pool → band → member-disk composite:
+ * the band index, its RAID level, the redundant-member count, and the member
+ * disks (hot spares are reported at pool level, not inside a band).
+ */
+export const AhrBandBrief = z.object({
+  band: z.number().int().positive(),
+  level: ArrayLevel,
+  /** Redundant member count (excludes hot spares) — the "× N" of "RAID5 × 4". */
+  memberCount: z.number().int().nonnegative(),
+  members: z.array(AhrBandMemberBrief),
+})
+export type AhrBandBrief = z.infer<typeof AhrBandBrief>
+
+/**
+ * Compact per-AHR-pool summary for the dashboard's headline Pools section
+ * (11.13 — AHR pools render alongside ZFS pools). Derived from the live
+ * {@link import('./ahr.js').AhrPool} topology; carries only what the dashboard
+ * block renders. `usedBytes` is OMITTED when unavailable (an unmounted pool has
+ * no btrfs usage read) — never a wrong number. Fail-open `[]` on any AHR read
+ * error, same contract as every other /v1/status source.
+ */
+export const AhrPoolBrief = z.object({
+  name: z.string(),
+  state: AhrPoolState,
+  /** Bytes the filesystem sits on (LV size / btrfs device size). */
+  usableBytes: z.number().int().nonnegative(),
+  /** Bytes in use; omitted when unavailable (e.g. the pool is unmounted). */
+  usedBytes: z.number().int().nonnegative().optional(),
+  /** Mountpoint when mounted, else the LV device path (check `mounted`). */
+  mountpoint: z.string(),
+  mounted: z.boolean(),
+  /** Whether the pool carries the §12 @data/@snapshots subvolume layout. */
+  subvolLayout: z.boolean(),
+  /** Bands bottom-up, each with its RAID level + redundant members. */
+  bands: z.array(AhrBandBrief),
+  /** Hot spare disk(s) attached to the pool (labeled spare bay in the UI). */
+  spares: z.array(AhrBandMemberBrief),
+})
+export type AhrPoolBrief = z.infer<typeof AhrPoolBrief>
+
 export const StatusSummary = z.object({
   node: z.string(),
   pools: z.array(PoolStatusBrief),
@@ -78,6 +133,8 @@ export const StatusSummary = z.object({
   shares: ShareStatusBrief,
   jobs: z.array(JobBrief),
   warnings: z.array(DashboardWarning),
+  /** AHR pools for the headline Pools section (11.13); `[]` fail-open. */
+  ahrPools: z.array(AhrPoolBrief),
 })
 export type StatusSummary = z.infer<typeof StatusSummary>
 

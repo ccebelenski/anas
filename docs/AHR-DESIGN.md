@@ -195,7 +195,18 @@ So the persisted state is exactly one small record: the **`AhrExpansionIntent`**
 Reuses `ANAS.gfx` (disk/bay objects, activity strip) and the pool-composer patterns from 3.23.
 
 ### 6.1 Create composer (AHR-aware)
-- Disk multi-select (from `/v1/disks`, excluding ZFS/PVE/mounted/in-use disks, with the hands-off tagging already built).
+- ~~Disk multi-select~~ **Revised (operator, 2026-07-24 — parallel construction):** disk
+  selection is **drag-and-drop disk cards, exactly the ZFS vdev composer idiom** (3.23 /
+  `38-pool-composer.js`, `ANAS.gfx` drag toolkit) — an available-disks tray of the same
+  skeuomorphic disk cards, dragged into the pool bay; AHR needs no vdev arrangement, so
+  there is ONE drop target (the planner does the banding — that stays the point).
+  Same card contents (icon, labeled size, FULL by-id, never truncated), same
+  ineligible-disk treatment as the ZFS composer. An invalid drop (e.g. a too-small
+  spare) is refused at the drop with the stated reason. The same drag idiom applies to
+  the **expand wizard** (drag disks to add) and **spare attach** (drag a disk onto the
+  spare bay). Candidates from `/v1/disks`, excluding ZFS/PVE/mounted/in-use disks, with
+  the hands-off tagging already built. Live layout preview updates on every drop/removal,
+  as it did on every checkbox change.
 - Fault-tolerance toggle: **"1-disk fault tolerance (AHR-1)" / "2-disk fault tolerance (AHR-2)"** — lead with the meaning, not the acronym. btrfs is the filesystem (stated, not chosen; RAID-in-md note shown).
 - **Live sliced-layout visualization**: horizontal disks, stacked bands, each band colored by its array, protected bands solid, the wasted top slice hatched/greyed with its label. Driven by `/v1/ahr/layout/preview` on every selection change.
 - **Capacity readout** — the labeled `AhrCapacity` breakdown (usable / redundancy overhead / unprotected-wasted), never a bare number.
@@ -276,9 +287,19 @@ an AHR read error degrades the card, never the dashboard):
   consumed spare (§11) and a flat-layout snapshot advisory do NOT card — they are
   view-level advisories only.
 - **In-progress**: expansion/rebuild/scrub jobs already ride the shared jobs strip —
-  no new surface. Healthy/idle AHR pools add NOTHING to the dashboard (§7.3).
-- No AHR capacity tile in v1 — capacity lives in the Hybrid RAID view; the
-  dashboard only tells the operator when something needs them.
+  no new surface.
+- ~~Healthy/idle AHR pools add NOTHING; no capacity tile in v1~~ **Revised
+  (operator, 2026-07-24, after reviewing the live stunt dashboard):** healthy
+  invisibility reads as absence, not calm. AHR pools join the dashboard's
+  headline Pools section with the SAME structural presence ZFS pools get —
+  one block per pool: name + AHR badge + state, capacity (used/usable),
+  mountpoint, and the pool → band (raid level × members) → member-disk
+  composite in the existing gfx visual language; labeled spare bay when a
+  spare is attached; click-through to the Hybrid RAID view. Data: `/v1/status`
+  gains `ahrPools` (brief summaries, fail-open `[]` — same contract as every
+  source). Live I/O stays ZFS-only for now (`/v1/telemetry` is zpool-based);
+  the AHR block renders without an I/O strip rather than showing a wrong
+  number. Warning cards (above) are unchanged — cards stay failure-only.
 
 ## 11. Hot spares (designed 2026-07-23)
 

@@ -223,7 +223,9 @@
             grid: opts.grid,
             mode: opts.mode === 'expand' ? 'expand' : 'create',
             poolName: opts.poolName || '',
-            name: opts.poolName || 'tank',
+            // No default name (house rule, shared with the AHR composer): the
+            // operator names the pool; commit stays gated until the name is valid.
+            name: opts.poolName || '',
             disks: [],          // available Disk records
             diskById: {},       // id -> disk
             vdevs: [],          // staged/new vdevs (draft)
@@ -878,6 +880,7 @@
         } else {
             poolField = '<input type="text" class="anas-fld-composer-poolname" id="anasc-poolname"'
                 + ' value="' + enc(state.name) + '" spellcheck="false"'
+                + ' placeholder="' + enc(t('name')) + '"'
                 + ' style="font:inherit;color:var(--anas-ink);padding:5px 8px;border-radius:8px;'
                 + 'border:1px solid var(--anas-card-edge);background:linear-gradient(var(--anas-card-top),'
                 + 'var(--anas-card-bot));outline:none;width:180px">';

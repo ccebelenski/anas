@@ -98,6 +98,9 @@ export {
 
 // Dashboard schemas (Epic 2)
 export {
+  AhrBandBrief,
+  AhrBandMemberBrief,
+  AhrPoolBrief,
   ArcTelemetry,
   DashboardWarning,
   DiskHealthCounts,

@@ -2,6 +2,7 @@ import type {
   AhrArray,
   AhrArrayMember,
   AhrArraySync,
+  AhrBandBrief,
   AhrCapacity,
   AhrDisk,
   AhrDiskPartition,
@@ -13,7 +14,7 @@ import type {
 import type { CommandExecutor } from '../executor/types.js'
 import type { MdadmDetailExport } from '../parsers/mdadm-detail.js'
 import type { MdstatArray } from '../parsers/mdstat.js'
-import { AhrPool } from '@anas/shared'
+import { AhrPool, AhrPoolBrief } from '@anas/shared'
 import { btrfsUsageArgs, parseBtrfsUsage } from '../parsers/btrfs-usage.js'
 import { parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
@@ -676,6 +677,113 @@ export async function collectAhrWarnings(
       }
     }))
     return buildAhrWarnings(withIntents)
+  }
+  catch {
+    return []
+  }
+}
+
+// --- Dashboard pool briefs (story 11.13, AHR-DESIGN §10 revision) ------------
+
+/**
+ * Derive the dashboard's per-pool briefs from the live topology — the §10
+ * revision that puts healthy AHR pools in the headline Pools section with the
+ * same structural presence ZFS pools get. Purely a projection of
+ * {@link readAhrPools}' output (no re-parse, no extra system reads):
+ *  - bands: each band array's index + RAID level + its REDUNDANT members
+ *    (hot spares are excluded here — they are reported once at pool level so a
+ *    "RAID5 × 4" reads as four data/parity members, not five);
+ *  - spares: the pool's hot-spare disk(s), rendered in a labeled spare bay;
+ *  - usedBytes: only when the pool is mounted (an unmounted pool has no btrfs
+ *    usage read — capacity.usedBytes would be a placeholder 0, so it is OMITTED
+ *    rather than reported as a wrong number).
+ * Member/spare sizes are the raw DISK sizes (from the pool's disk list), the
+ * value the UI tiles present.
+ */
+export function buildAhrPoolBriefs(pools: AhrPool[]): AhrPoolBrief[] {
+  return pools.map((pool) => {
+    const sizeById = new Map(pool.disks.map(d => [d.id, d.sizeBytes]))
+    const bands: AhrBandBrief[] = pool.arrays.map((array) => {
+      // Redundant members only — a hot spare rides as a member row (memberState
+      // 'spare') but is not one of the array's data/parity slots.
+      const members = array.members.filter(m => m.memberState !== 'spare')
+      return {
+        band: array.band,
+        level: array.level,
+        memberCount: members.length,
+        members: members.map(m => ({ id: m.disk, sizeBytes: sizeById.get(m.disk) ?? 0 })),
+      }
+    })
+    const spares = pool.disks
+      .filter(d => d.role === 'spare')
+      .map(d => ({ id: d.id, sizeBytes: d.sizeBytes }))
+    return AhrPoolBrief.parse({
+      name: pool.name,
+      state: pool.state,
+      usableBytes: pool.capacity.usableBytes,
+      // Used bytes are only trustworthy when btrfs usage was read (mounted).
+      ...(pool.mounted ? { usedBytes: pool.capacity.usedBytes } : {}),
+      mountpoint: pool.mountpoint,
+      mounted: pool.mounted,
+      subvolLayout: pool.subvolLayout,
+      bands,
+      spares,
+    })
+  })
+}
+
+/**
+ * Capacity warning cards for AHR pools — PARALLEL CONSTRUCTION with ZFS pools
+ * (the dashboard's `buildWarnings` 'capacity' category). Identical thresholds
+ * (≥95% critical, ≥90% warning), identical wording shape ("AHR pool 'tank' is
+ * 94% full"), same 'capacity' category, same ref-is-pool-name navigation the
+ * AHR failure cards use — a filling AHR pool now warns exactly like a filling
+ * ZFS pool.
+ *
+ * Percent is derived from the brief's usedBytes/usableBytes. An unmounted pool
+ * (or one with no usedBytes read) carries NO usedBytes and produces NO card —
+ * never a wrong number (11.13's omission discipline). A pool with no usable
+ * capacity (usableBytes 0) likewise produces no card (no division by zero).
+ */
+export function buildAhrCapacityWarnings(briefs: AhrPoolBrief[]): DashboardWarning[] {
+  const warnings: DashboardWarning[] = []
+  for (const pool of briefs) {
+    // No usage read (unmounted) or no capacity → no honest percentage to card.
+    if (pool.usedBytes === undefined || pool.usableBytes <= 0)
+      continue
+    const capacity = Math.round((pool.usedBytes / pool.usableBytes) * 100)
+    if (capacity >= 95) {
+      warnings.push({
+        level: 'critical',
+        category: 'capacity',
+        message: `AHR pool '${pool.name}' is ${capacity}% full`,
+        ref: pool.name,
+      })
+    }
+    else if (capacity >= 90) {
+      warnings.push({
+        level: 'warning',
+        category: 'capacity',
+        message: `AHR pool '${pool.name}' is ${capacity}% full`,
+        ref: pool.name,
+      })
+    }
+  }
+  return warnings
+}
+
+/**
+ * Collect the dashboard AHR pool briefs from the live topology, fail-open
+ * (mirrors {@link collectAhrWarnings} and every other GET /v1/status source):
+ * any AHR read error degrades this source to `[]`, never the dashboard. The
+ * dashboard must never degrade because AHR is unreadable.
+ */
+export async function collectAhrPoolBriefs(
+  executor: CommandExecutor,
+  mdadmConfPath?: string,
+): Promise<AhrPoolBrief[]> {
+  try {
+    return buildAhrPoolBriefs(await readAhrPools(executor, mdadmConfPath))
   }
   catch {
     return []
