@@ -66,8 +66,10 @@ export const JobBrief = z.object({
   startedAt: ISODateTime.optional(),
   /** When the job reached a terminal state; omitted while still running. */
   finishedAt: ISODateTime.optional(),
-  /** Elapsed time in ms: finishedAt−startedAt for finished jobs, now−startedAt
-   *  for running ones. Omitted when the job never started. */
+  /**
+   * Elapsed time in ms: finishedAt−startedAt for finished jobs, now−startedAt
+   *  for running ones. Omitted when the job never started.
+   */
   durationMs: z.number().nonnegative().optional(),
 })
 export type JobBrief = z.infer<typeof JobBrief>
@@ -140,8 +142,10 @@ export type StatusSummary = z.infer<typeof StatusSummary>
 
 // ---- GET /v1/telemetry : live sampled performance (story 2.7) ----------------
 
-/** I/O rates over the sample window. Latency is the average wait in nanoseconds
- *  (`zpool iostat -pl`), null when the device was idle / unavailable. */
+/**
+ * I/O rates over the sample window. Latency is the average wait in nanoseconds
+ *  (`zpool iostat -pl`), null when the device was idle / unavailable.
+ */
 export const IoStats = z.object({
   readBytesPerSec: z.number().nonnegative(),
   writeBytesPerSec: z.number().nonnegative(),
@@ -153,8 +157,10 @@ export const IoStats = z.object({
 export type IoStats = z.infer<typeof IoStats>
 
 export const ArcTelemetry = z.object({
-  /** Hit ratio over the window, 0–1 (falls back to the lifetime ratio when the
-   *  window had no ARC accesses). */
+  /**
+   * Hit ratio over the window, 0–1 (falls back to the lifetime ratio when the
+   *  window had no ARC accesses).
+   */
   hitRatio: z.number().min(0).max(1),
   /** Current ARC size (bytes). */
   size: z.number().nonnegative(),
@@ -177,8 +183,10 @@ export const DiskTelemetry = IoStats.extend({
 })
 export type DiskTelemetry = z.infer<typeof DiskTelemetry>
 
-/** A vdev's aggregate I/O plus its topology (joined from `zpool status`) and
- *  the leaf disks it contains. */
+/**
+ * A vdev's aggregate I/O plus its topology (joined from `zpool status`) and
+ *  the leaf disks it contains.
+ */
 export const VdevTelemetry = IoStats.extend({
   /** ZFS vdev name, e.g. "mirror-0". */
   name: z.string(),
@@ -198,6 +206,46 @@ export const PoolTelemetry = IoStats.extend({
   vdevs: z.array(VdevTelemetry),
 })
 export type PoolTelemetry = z.infer<typeof PoolTelemetry>
+
+// ---- AHR pool I/O telemetry (story 11.15, AHR-DESIGN §10) --------------------
+//
+// The AHR analog of the ZFS pool → vdev → disk I/O tree, derived from two
+// /proc/diskstats samples ~1s apart (the same window ARC/net use): the pool's
+// LV (dm device) is the pool level, each band's md array is the vdev level, and
+// each band member's partition is the leaf disk. Same {@link IoStats} shape and
+// ZFS-parallel field names — so the dashboard renders an AHR block's I/O strip
+// with the SAME visual language as a ZFS block.
+//
+// LATENCY IS AWAIT, honestly labeled: `readLatencyNs`/`writeLatencyNs` are the
+// diskstats await (per-direction tick-delta / io-delta), the total wait a
+// request saw — NOT the device-service-time split ZFS's `disk_wait` gives. A
+// direction with no completed I/O in the window reports `null` (idle), never a
+// NaN or a fabricated 0.
+
+/**
+ * One band array's aggregate I/O (the md device) plus its member-disk leaves.
+ * Parallels {@link VdevTelemetry}: the md array is a band's vdev-analog. Hot
+ * spares carry no band I/O and are excluded (matching the §10 briefs).
+ */
+export const AhrBandTelemetry = IoStats.extend({
+  /** Band index (1-based, bottom-up) — matches the /v1/status brief's band. */
+  band: z.number().int().positive(),
+  level: ArrayLevel,
+  /** Member-disk I/O (each member partition's diskstats), keyed by disk by-id. */
+  disks: z.array(DiskTelemetry),
+})
+export type AhrBandTelemetry = z.infer<typeof AhrBandTelemetry>
+
+/**
+ * An AHR pool's aggregate I/O (its LV) plus the bands beneath it. Parallels
+ * {@link PoolTelemetry}; name-matched to the /v1/status `ahrPools` brief, the
+ * same way ZFS `pools` telemetry is name-matched to its status pool.
+ */
+export const AhrPoolTelemetry = IoStats.extend({
+  name: z.string(),
+  bands: z.array(AhrBandTelemetry),
+})
+export type AhrPoolTelemetry = z.infer<typeof AhrPoolTelemetry>
 
 export const NetInterface = z.object({
   name: z.string(),
@@ -220,6 +268,12 @@ export const Telemetry = z.object({
   arc: ArcTelemetry,
   /** Nested pool → vdevs[] → disks[] I/O tree. */
   pools: z.array(PoolTelemetry),
+  /**
+   * AHR pools' I/O tree (pool LV → band md → member disk), diskstats-derived
+   * (11.15). Name-matched to the /v1/status `ahrPools` briefs. `[]` fail-open —
+   * an AHR resolve error degrades this to empty without touching ZFS telemetry.
+   */
+  ahrPools: z.array(AhrPoolTelemetry),
   net: NetTelemetry,
 })
 export type Telemetry = z.infer<typeof Telemetry>

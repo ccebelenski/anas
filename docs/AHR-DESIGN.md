@@ -297,9 +297,22 @@ an AHR read error degrades the card, never the dashboard):
   composite in the existing gfx visual language; labeled spare bay when a
   spare is attached; click-through to the Hybrid RAID view. Data: `/v1/status`
   gains `ahrPools` (brief summaries, fail-open `[]` — same contract as every
-  source). Live I/O stays ZFS-only for now (`/v1/telemetry` is zpool-based);
+  source). ~~Live I/O stays ZFS-only for now (`/v1/telemetry` is zpool-based);
   the AHR block renders without an I/O strip rather than showing a wrong
-  number. Warning cards (above) are unchanged — cards stay failure-only.
+  number.~~ **Superseded (story 11.15, 2026-07-24): the AHR block gets the SAME
+  live I/O strip the ZFS block has.** `/v1/telemetry` gains `ahrPools` (same
+  IoStats shape as ZFS `pools`, name-matched to the status briefs), derived
+  from two `/proc/diskstats` samples ~1s apart — the AHR analog of the
+  `zpool iostat` sampling — for the pool's LV (dm device), each band's md
+  array, and each member disk (device names resolved at sample time from the
+  `/dev/md/<pool>-r<N>` pins and the LV mapper path; point-of-use kernel-name
+  rule, never persisted). This gives read/write throughput + IOPS at parity
+  with ZFS; **latency is `await` (per-direction tick-delta / io-delta), stated
+  honestly as the limit** — diskstats reports the total wait a request saw, not
+  the device-service-time split ZFS's `disk_wait` gives. A block with no sample
+  yet (first poll pending) still renders WITHOUT the strip — never a fabricated
+  zero. `ahrPools` fail-open `[]` independently of the ZFS telemetry. Warning
+  cards (above) are unchanged — cards stay failure-only.
 
 ## 11. Hot spares (designed 2026-07-23)
 

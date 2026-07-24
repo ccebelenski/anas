@@ -30,6 +30,7 @@ import { parseSmbConf } from '../parsers/smb-conf.js'
 import { nodeToIoStats, parseZpoolIostat } from '../parsers/zpool-iostat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
+import { collectAhrTelemetry } from '../services/ahr-io.js'
 import { buildAhrCapacityWarnings, collectAhrPoolBriefs, collectAhrWarnings } from '../services/ahr-topology.js'
 import { collectBackupWarnings } from '../services/backup-units.js'
 import { readConfig } from '../services/config-writer.js'
@@ -40,6 +41,7 @@ import { pathExists } from './shares-smb.js'
 
 const ARCSTATS_PATH = '/proc/spl/kstat/zfs/arcstats'
 const PROC_NET_DEV = '/proc/net/dev'
+const PROC_DISKSTATS = '/proc/diskstats'
 const ZPOOL = '/usr/sbin/zpool'
 const SYSTEMCTL = '/usr/bin/systemctl'
 
@@ -116,9 +118,11 @@ export async function dashboardRoutes(
     return { data: summary }
   })
 
-  /** Replication tasks whose last run failed → 'replication' warnings (5.5.3).
+  /**
+   * Replication tasks whose last run failed → 'replication' warnings (5.5.3).
    *  Reuses the same task-status derivation the Replication view uses; fail-open
-   *  to no warnings (units-as-store, ZFS + systemd truth). */
+   *  to no warnings (units-as-store, ZFS + systemd truth).
+   */
   async function collectReplicationWarnings(): Promise<DashboardWarning[]> {
     try {
       return buildReplicationWarnings(await collectTaskStatuses(executor, systemdDir))
@@ -289,8 +293,9 @@ export async function dashboardRoutes(
     const sampledAt = new Date().toISOString()
     try {
       // t0 snapshots of the cumulative counters, BEFORE the ~1s iostat window.
+      // /proc/diskstats rides the SAME window (AHR I/O, 11.15) as ARC/net.
       const t0 = Date.now()
-      const [arc0, net0] = await Promise.all([readArcstats(), readNetDev()])
+      const [arc0, net0, diskstats0] = await Promise.all([readArcstats(), readNetDev(), readDiskstats()])
 
       // Pool names for the iostat call (fail-open to none).
       let poolNames: string[] = []
@@ -315,14 +320,17 @@ export async function dashboardRoutes(
 
       // t1 snapshots, AFTER the window closed.
       const t1 = Date.now()
-      const [arc1, net1] = await Promise.all([readArcstats(), readNetDev()])
+      const [arc1, net1, diskstats1] = await Promise.all([readArcstats(), readNetDev(), readDiskstats()])
       const windowMs = t1 - t0
 
       const arc = computeArc(arc0, arc1)
       const net = computeNet(net0, net1, windowMs)
       const pools = await computeIo(iostatText)
+      // AHR I/O rides its own diskstats deltas (11.15), fully fail-open to []:
+      // an AHR resolve error never disturbs the ZFS/ARC/net telemetry above.
+      const ahrPools = await collectAhrTelemetry(executor, diskstats0, diskstats1, windowMs, mdadmConfPath)
 
-      return { sampledAt, windowMs, arc, pools, net }
+      return { sampledAt, windowMs, arc, pools, ahrPools, net }
     }
     catch {
       return emptyTelemetry(sampledAt)
@@ -494,6 +502,9 @@ async function readArcstats(): Promise<string | null> {
 async function readNetDev(): Promise<string | null> {
   return readProc(PROC_NET_DEV)
 }
+async function readDiskstats(): Promise<string | null> {
+  return readProc(PROC_DISKSTATS)
+}
 async function readProc(path: string): Promise<string | null> {
   try {
     return await readFile(path, 'utf-8')
@@ -510,6 +521,7 @@ function emptyTelemetry(sampledAt: string): Telemetry {
     windowMs: 0,
     arc: { hitRatio: 0, size: 0, target: 0, max: 0, l2: null },
     pools: [],
+    ahrPools: [],
     net: { interfaces: [], totalRxBytesPerSec: 0, totalTxBytesPerSec: 0 },
   }
 }

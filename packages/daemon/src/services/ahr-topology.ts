@@ -170,8 +170,12 @@ function toSyncAction(action: 'resync' | 'recovery' | 'reshape' | 'check'): AhrA
   return action === 'recovery' ? 'recover' : action
 }
 
-/** dm name of `<vg>/<lv>` (device-mapper escapes `-` as `--`). */
-function dmName(vg: string, lv: string): string {
+/**
+ * dm name of `<vg>/<lv>` (device-mapper escapes `-` as `--`). Exported so the
+ *  telemetry sampler (11.15) resolves the SAME `/dev/mapper/<dmName>` path this
+ *  topology reader uses to find the pool's LV.
+ */
+export function dmName(vg: string, lv: string): string {
   return `${vg.replaceAll('-', '--')}-${lv.replaceAll('-', '--')}`
 }
 

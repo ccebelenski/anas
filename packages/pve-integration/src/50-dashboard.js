@@ -26,16 +26,19 @@
  *                       loaded on show + manual Refresh. ahrPools[] (11.13) are
  *                       AHR pool briefs { name, state, usableBytes, usedBytes?,
  *                       mountpoint, mounted, subvolLayout, bands[], spares[] } —
- *                       rendered in the Pools section after the ZFS pools, with
- *                       no I/O strip (telemetry is zpool-based).
+ *                       rendered in the Pools section after the ZFS pools, with a
+ *                       live I/O strip (11.15) when telemetry is available.
  *   GET /v1/telemetry → { sampledAt, windowMs, arc{}, net{}, pools:[ { name,
  *                         ...ioStats, vdevs:[ { name,type,role,state,...ioStats,
- *                         disks:[ { id, ...ioStats } ] } ] } ] }
+ *                         disks:[ { id, ...ioStats } ] } ] } ],
+ *                         ahrPools:[ { name, ...ioStats, bands:[ { band, level,
+ *                         ...ioStats, disks:[ { id, ...ioStats } ] } ] } ] }
  *                       POLLED every POLL_MS while the panel is visible.
  *                       ioStats = { readBytesPerSec, writeBytesPerSec, readIops,
  *                       writeIops, readLatencyNs|null, writeLatencyNs|null }.
- *                       Disks are nested under vdevs under pools — there is no
- *                       flat top-level disks[] array.
+ *                       ZFS disks nest under vdevs under pools; AHR member disks
+ *                       nest under bands under ahrPools — no flat disks[] array.
+ *                       AHR latency is await (diskstats' honest limit).
  *
  * The Pools section needs BOTH endpoints (state/capacity/scan from /status, I/O
  * from /telemetry). We cache the last-good of each on the view (_anasStatus /
@@ -719,14 +722,19 @@
         return '';
     }
 
-    // ---- AHR pools in the headline Pools section (11.13, AHR-DESIGN §10) ----
+    // ---- AHR pools in the headline Pools section (11.13/11.15, §10) ----------
     //
     // AHR pools render alongside ZFS pools (AFTER them) with the SAME structural
-    // presence: name + AHR badge + state light, a used/usable capacity donut, a
-    // labeled mountpoint, and the Pool → band → member-disk composite in the gfx
-    // visual language. NO I/O strip — telemetry is zpool-based, so the AHR block
-    // simply omits it (never a faked/zeroed number). The whole block deep-links
-    // to the Hybrid RAID view. Fed by /v1/status ahrPools (fail-open []).
+    // presence AND the SAME live I/O strip (11.15 — /proc/diskstats parity with
+    // the ZFS pool I/O): name + AHR badge + state light, a used/usable capacity
+    // donut, a labeled mountpoint, the pool I/O summary + time chart, and the
+    // Pool → band → member-disk composite where each band (its md array) and each
+    // member carries its own live throughput + latency. Latency is shown as await
+    // (the honest diskstats limit). Structure comes from /v1/status ahrPools
+    // (fail-open []); live I/O from the name-matched /v1/telemetry ahrPools entry.
+    // A pool with no telemetry yet (first sample pending) renders WITHOUT the I/O
+    // strip, exactly as it did before — never a fabricated zero. The whole block
+    // deep-links to the Hybrid RAID view.
 
     // AHR pool state → gfx pill severity token (mirrors 39-ahr.js POOL_STATES):
     // busy states (expanding/scrubbing) stay NEUTRAL — activity, not fault.
@@ -758,11 +766,14 @@
         return level ? ('' + level).toUpperCase() : t('array');
     }
 
-    // A static member/spare disk tile: a skeuomorphic disk object + the FULL
-    // by-id (never truncated — .anas-dash-disk-id wraps break-all) + a labeled
-    // size. No I/O numbers (telemetry is zpool-based). `spare` shows the grey
-    // spare status dot.
-    function ahrDiskTile(id, sizeBytes, spare) {
+    // A member/spare disk tile: a skeuomorphic disk object + the FULL by-id
+    // (never truncated — .anas-dash-disk-id wraps break-all) + a labeled size.
+    // When `tmember` (this band member's live diskstats telemetry) is present it
+    // ALSO carries the live throughput + await latency, mirroring the ZFS device
+    // tile (renderDevice). `spare` shows the grey spare status dot and never gets
+    // an I/O readout (a spare carries no band I/O). `keyBase` scopes the rolling
+    // buffers per band+disk so the same disk in two bands doesn't collide.
+    function ahrDiskTile(view, id, sizeBytes, spare, tmember, keyBase) {
         id = '' + (id || 'disk');
         var iconHtml = '';
         try {
@@ -772,43 +783,105 @@
         } catch (e) {
             iconHtml = '';
         }
+        var ioHtml = '';
+        if (tmember && !spare) {
+            // Same rolling peak/avg machinery the ZFS device tile uses (idle 0s
+            // count), keyed per band+disk so multi-band disks stay distinct.
+            var kb = keyBase || ('ahrdisk.' + id);
+            var dr = pushSpark(view, kb + '.read', tmember.readBytesPerSec);
+            var dw = pushSpark(view, kb + '.write', tmember.writeBytesPerSec);
+            var dsR = bufStats(dr), dsW = bufStats(dw);
+            var histLine = (dr.length > 1 || dw.length > 1)
+                ? '<div class="anas-dash-disk-sub anas-dash-lat-hist">'
+                    + enc(t('peak') + ' ▼ ' + bps(dsR.peak) + ' ▲ ' + bps(dsW.peak)
+                        + ' · ' + t('avg') + ' ▼ ' + bps(dsR.avg) + ' ▲ ' + bps(dsW.avg))
+                    + '</div>'
+                : '';
+            ioHtml = '<div class="anas-dash-disk-sub">'
+                + enc('▼ ' + bps(tmember.readBytesPerSec) + '  ▲ ' + bps(tmember.writeBytesPerSec)) + '</div>'
+                + histLine
+                + latReadout(view, kb, tmember.readLatencyNs, tmember.writeLatencyNs, { compact: true });
+        }
         return '<div class="anas-dash-disk">' + iconHtml
             + '<div style="min-width:0;flex:1 1 auto">'
             + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(id) + '</div>'
             + '<div class="anas-dash-disk-sub">'
             + enc(t('Size') + ' ' + ANAS.formatBytes(num(sizeBytes))) + '</div>'
+            + ioHtml
             + '</div></div>';
     }
 
     // One band row: "BAND · band N — RAID5 × 4" head + the member disk tiles.
-    // Reuses the ZFS vdev tier's classes so a band reads visually as a vdev, but
-    // carries no I/O strip.
-    function renderAhrBand(band) {
+    // Reuses the ZFS vdev tier's classes so a band reads visually as a vdev; when
+    // `tband` (this band's md-array live telemetry) is present it gains the SAME
+    // aggregate IOPS + I/O/latency readout and read/write time chart a ZFS vdev
+    // has. `poolName`/`chartW` scope + size those. Members are matched to their
+    // telemetry by disk id (each carries its own per-band I/O).
+    function renderAhrBand(view, poolName, band, tband, chartW) {
         band = band || {};
         var n = num(band.band);
         var desc = '— ' + ahrLevelLabel(band.level) + ' × ' + num(band.memberCount);
         var members = band.members || [];
+
+        // Index this band's member telemetry by disk id (per-band partition I/O).
+        var tById = {};
+        var tdisks = (tband && tband.disks) || [];
+        for (var k = 0; k < tdisks.length; k++) {
+            if (tdisks[k] && tdisks[k].id != null) { tById['' + tdisks[k].id] = tdisks[k]; }
+        }
+
         var devHtml = '';
         for (var i = 0; i < members.length; i++) {
-            devHtml += ahrDiskTile(members[i] && members[i].id, members[i] && members[i].sizeBytes, false);
+            var mid = members[i] && members[i].id;
+            var tm = (mid != null) ? tById['' + mid] : null;
+            var kb = 'ahrdisk.' + poolName + '.b' + n + '.' + mid;
+            devHtml += ahrDiskTile(view, mid, members[i] && members[i].sizeBytes, false, tm, kb);
         }
+
+        // Aggregate band I/O (its md array): an IOPS line in the head + the
+        // two-row I/O/latency readout + a compact read/write chart, matching the
+        // ZFS vdev tier. Absent (no telemetry yet) → the band renders as before.
+        var ioHead = '';
+        var ioLatHtml = '';
+        var chartHtml = '';
+        if (tband) {
+            ioHead = '<span class="anas-dash-vdev-io">'
+                + enc(iops(tband.readIops) + '/' + iops(tband.writeIops) + ' IOPS') + '</span>';
+            var vKey = 'ahrband.' + poolName + '.' + n;
+            var br = pushSpark(view, vKey + '.read', tband.readBytesPerSec);
+            var bw = pushSpark(view, vKey + '.write', tband.writeBytesPerSec);
+            ioLatHtml = '<div class="anas-dash-vdev-lat anas-dash-muted anas-dash-io-lat">'
+                + ioLatRows(view, vKey, br, bw,
+                    tband.readBytesPerSec, tband.writeBytesPerSec,
+                    tband.readLatencyNs, tband.writeLatencyNs) + '</div>';
+            chartHtml = '<div class="anas-dash-vdev-chart">' + timeChartHtml(
+                [
+                    { label: t('Read'), color: READ_COLOR, values: br },
+                    { label: t('Write'), color: WRITE_COLOR, values: bw }
+                ],
+                { width: chartW > 0 ? chartW : 560, height: 120, windowMs: BUFFER_MS, sampleMs: POLL_MS }
+            ) + '</div>';
+        }
+
         return '<div class="anas-dash-vdev">'
             + '<div class="anas-dash-vdev-head">'
             + '<span class="anas-dash-vdev-tag">' + enc(t('BAND')) + '</span>'
             + '<span class="anas-dash-vdev-name">' + enc(t('band') + ' ' + n) + '</span>'
-            + '<span class="anas-dash-vdev-desc">' + enc(desc) + '</span></div>'
+            + '<span class="anas-dash-vdev-desc">' + enc(desc) + '</span>' + ioHead + '</div>'
+            + ioLatHtml
+            + chartHtml
             + (devHtml ? '<div class="anas-dash-devs">' + devHtml + '</div>' : '')
             + '</div>';
     }
 
     // The labeled hot-spare bay (§11 idiom, mirroring 39-ahr.js): a distinct
     // tier whose tiles carry the spare status dot. '' when no spare is attached.
-    function renderAhrSpareBay(spares) {
+    function renderAhrSpareBay(view, spares) {
         spares = spares || [];
         if (!spares.length) { return ''; }
         var devHtml = '';
         for (var i = 0; i < spares.length; i++) {
-            devHtml += ahrDiskTile(spares[i] && spares[i].id, spares[i] && spares[i].sizeBytes, true);
+            devHtml += ahrDiskTile(view, spares[i] && spares[i].id, spares[i] && spares[i].sizeBytes, true, null, null);
         }
         return '<div class="anas-dash-vdev anas-dash-vdev-spare">'
             + '<div class="anas-dash-vdev-head">'
@@ -822,11 +895,16 @@
 
     // One AHR pool block. Matches the ZFS block's visual language (name + state
     // pill + capacity donut) via gfx, adds a small AHR badge, labels the mount,
-    // renders the band → member-disk composite + spare bay, and DELIBERATELY
-    // omits the I/O strip (telemetry is zpool-based). data-anas-nav makes the
-    // whole block deep-link to the Hybrid RAID view.
-    function renderAhrPoolBlock(view, ap) {
+    // and — when the name-matched telemetry pool `tap` is present (11.15) —
+    // carries the SAME aggregate I/O summary + time chart the ZFS block has, plus
+    // per-band/per-member live I/O in the composite. Without telemetry yet it
+    // renders exactly as before (no strip). `dims` sizes the charts. data-anas-nav
+    // deep-links the whole block to the Hybrid RAID view.
+    function renderAhrPoolBlock(view, ap, tap, dims) {
         ap = ap || {};
+        dims = dims || {};
+        var poolW = dims.pool > 0 ? dims.pool : 620;
+        var bandW = dims.vdev > 0 ? dims.vdev : 560;
         var name = ap.name || 'pool';
         var usable = num(ap.usableBytes);
         var hasUsed = ap.usedBytes !== undefined && ap.usedBytes !== null && !isNaN(Number(ap.usedBytes));
@@ -879,12 +957,48 @@
         var mountHtml = '<div class="anas-dash-muted" style="margin-top:4px">'
             + enc(t('Mount') + ': ' + (ap.mountpoint || '—') + ' (' + mountState + ')') + '</div>';
 
+        // Aggregate pool I/O from the matched telemetry pool (its LV): an IOPS +
+        // I/O/latency summary in the head, and a headline read/write time chart —
+        // the SAME strip the ZFS block gets. Absent → rendered exactly as before.
+        var summaryHtml = '';
+        var chartHtml = '';
+        if (tap) {
+            var pr = pushSpark(view, 'ahrpool.' + name + '.read', tap.readBytesPerSec);
+            var pw = pushSpark(view, 'ahrpool.' + name + '.write', tap.writeBytesPerSec);
+            summaryHtml = '<div class="anas-dash-muted" style="margin-top:4px">'
+                + enc(iops(tap.readIops) + ' r · ' + iops(tap.writeIops) + ' w IOPS') + '</div>'
+                + '<div class="anas-dash-muted anas-dash-io-lat">'
+                + ioLatRows(view, 'ahrpool.' + name, pr, pw,
+                    tap.readBytesPerSec, tap.writeBytesPerSec,
+                    tap.readLatencyNs, tap.writeLatencyNs)
+                + '</div>';
+            chartHtml = '<div class="anas-dash-pool-io">' + timeChartHtml(
+                [
+                    { label: t('Read'), color: READ_COLOR, values: pr },
+                    { label: t('Write'), color: WRITE_COLOR, values: pw }
+                ],
+                {
+                    width: poolW, height: 160, windowMs: BUFFER_MS, sampleMs: POLL_MS,
+                    title: t('Pool I/O')
+                }
+            ) + '</div>';
+        }
+
+        // Match each band to its telemetry by band index (the md-array I/O).
+        var tbandByIndex = {};
+        var tbands = (tap && tap.bands) || [];
+        for (var b = 0; b < tbands.length; b++) {
+            if (tbands[b] && tbands[b].band != null) { tbandByIndex['' + tbands[b].band] = tbands[b]; }
+        }
+
         var bands = ap.bands || [];
         var bandHtml = '';
         for (var i = 0; i < bands.length; i++) {
-            bandHtml += renderAhrBand(bands[i]);
+            var bn = bands[i] && bands[i].band;
+            var tband = (bn != null) ? tbandByIndex['' + bn] : null;
+            bandHtml += renderAhrBand(view, name, bands[i], tband, bandW);
         }
-        bandHtml += renderAhrSpareBay(ap.spares);
+        bandHtml += renderAhrSpareBay(view, ap.spares);
 
         return '<div class="anas-dash-pool anas-dash-pool-ahr" data-anas-nav="anas-ahr" '
             + 'role="link" tabindex="0" title="' + enc(t('Open the Hybrid RAID view')) + '">'
@@ -894,7 +1008,9 @@
             + '<div class="anas-dash-pool-name">' + poolGlyph()
             + '<span>' + enc(name) + '</span>' + badge + ahrStatePill(ap.state) + '</div>'
             + mountHtml
+            + summaryHtml
             + '</div></div>'
+            + chartHtml
             + bandHtml
             + '</div>';
     }
@@ -1265,11 +1381,19 @@
         // AHR pools ride the SAME headline section (11.13), rendered AFTER the
         // ZFS pools; [] fail-open so a ZFS-only node is visually unchanged.
         var ahrPools = (st && st.ahrPools) || [];
+        // AHR live I/O (11.15): name-matched telemetry pools, same as ZFS.
+        var ahrTelPools = (tel && tel.ahrPools) || [];
 
         var telMap = {};
         for (var k = 0; k < telPools.length; k++) {
             if (telPools[k] && telPools[k].name != null) {
                 telMap['' + telPools[k].name] = telPools[k];
+            }
+        }
+        var ahrTelMap = {};
+        for (var at = 0; at < ahrTelPools.length; at++) {
+            if (ahrTelPools[at] && ahrTelPools[at].name != null) {
+                ahrTelMap['' + ahrTelPools[at].name] = ahrTelPools[at];
             }
         }
 
@@ -1299,9 +1423,12 @@
             var tp = telMap[name] || (statusPools.length ? null : p);
             body += renderPoolBlock(view, p, tp, dims);
         }
-        // AHR pool blocks render AFTER the ZFS pools, in the same section.
+        // AHR pool blocks render AFTER the ZFS pools, in the same section, each
+        // matched to its live telemetry pool by name (11.15).
         for (var a = 0; a < ahrPools.length; a++) {
-            body += renderAhrPoolBlock(view, ahrPools[a]);
+            var ap = ahrPools[a] || {};
+            var tap = ap.name != null ? ahrTelMap['' + ap.name] : null;
+            body += renderAhrPoolBlock(view, ap, tap, dims);
         }
         return heading(t('Pools')) + body;
     }

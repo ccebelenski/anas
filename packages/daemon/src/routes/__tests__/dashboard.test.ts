@@ -122,6 +122,53 @@ describe('GET /v1/telemetry — nested pool → vdev → disk tree', () => {
   })
 })
 
+describe('GET /v1/telemetry — ahrPools (story 11.15, AHR I/O telemetry)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  async function fetchTelemetry(srv: ReturnType<typeof createServer>): Promise<Telemetry> {
+    const res = await srv.inject({ method: 'GET', url: '/v1/telemetry', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    return (res.json() as { data: Telemetry }).data
+  }
+
+  it('the telemetry payload carries an ahrPools array parallel to pools', async () => {
+    server = createServer({ mock: true, logger: false })
+    const t = await fetchTelemetry(server)
+    // The AHR I/O tree rides alongside the ZFS pools tree, same contract shape.
+    assert.ok(Array.isArray(t.ahrPools), 'ahrPools is an array')
+    // Every entry (when any) has the IoStats + bands shape.
+    for (const ap of t.ahrPools) {
+      assert.equal(typeof ap.name, 'string')
+      assert.equal(typeof ap.writeBytesPerSec, 'number')
+      assert.ok(Array.isArray(ap.bands))
+    }
+  })
+
+  it('fail-open: an AHR resolve error leaves ahrPools [] without degrading ZFS telemetry', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as any).executor as MockExecutor
+    // Make the AHR reader's first read (cat /proc/mdstat) fail; ZFS iostat
+    // fixtures stay intact so the ZFS telemetry tree is unaffected.
+    mock.clearFixtures()
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', 'testpool', '1', '2'], result: mockFixtures.zpoolIostat() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
+    mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: { stdout: '', stderr: 'boom', exitCode: 1 } })
+
+    const t = await fetchTelemetry(server)
+    // AHR degraded to [] …
+    assert.deepEqual(t.ahrPools, [])
+    // … while the ZFS telemetry tree is still fully built.
+    assert.ok(t.pools.some(p => p.name === 'testpool'), 'ZFS telemetry unaffected')
+  })
+})
+
 describe('GET /v1/status — job durations', () => {
   let server: ReturnType<typeof createServer> | undefined
 
@@ -278,8 +325,10 @@ describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () =>
     mock.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: ok(loadFixture('btrfs-usage.txt')) })
   }
 
-  /** A bare Fastify server with ONLY dashboardRoutes and a controlled executor.
-   *  Every non-AHR source fail-opens (unmatched mock commands → exit 127). */
+  /**
+   * A bare Fastify server with ONLY dashboardRoutes and a controlled executor.
+   *  Every non-AHR source fail-opens (unmatched mock commands → exit 127).
+   */
   async function bareDashboardServer(executor: MockExecutor, tmp: string) {
     const srv = Fastify({ logger: false })
     await srv.register(dashboardRoutes, {

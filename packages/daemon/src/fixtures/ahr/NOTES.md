@@ -39,6 +39,26 @@ parser already tolerated, but now the fixtures are ground truth).
 | `btrfs-subvol-list-layout.txt` | live | plain `btrfs subvolume list /mnt/anas-ahr/tank` — `@data`, `@snapshots`, both operator snapshots, AND the writable `@snapshots/pre-rollback-*` preserve. The membership source `listAhrSnapshots` reads |
 | `btrfs-subvol-list-flat.txt` | live | empty output — captured on the pre-§12 FLAT `tank` before it was destroyed (a flat pool has no subvolumes) |
 
+## Genuine captures — story 11.15 I/O telemetry (added 2026-07-24)
+
+Live-captured on the stunt node (`anas-pve`, 192.168.200.50), pool `tank`
+(RAID5×4 + RAID5×4 over 5 disks + 1 hot spare `sde`), kernel 7.1 `/proc/diskstats`.
+Two snapshots taken ~1s apart with an 80 MiB `dd … oflag=direct` write to
+`/mnt/anas-ahr/tank` in between (probe file deleted after), so the delta carries
+a real write burst — the exact bytes `parseDiskstats` + `diskstatsToIoStats`
+target. Device map at capture time (resolved via the pin symlinks):
+`/dev/mapper/tank-tank--vol → dm-0`, `/dev/md/tank-r1 → md127`,
+`/dev/md/tank-r2 → md126`; band-r1 members `sdd1 sdf1 sdg1 sdm1` (+ spare `sde1`),
+band-r2 `sdd2 sdf2 sdg2 sdm2` (+ spare `sde2`).
+
+| File | Source | What it is |
+|------|--------|------------|
+| `diskstats-tank-t0.txt` | live | `/proc/diskstats` BEFORE the 80 MiB write — the t0 cumulative counters |
+| `diskstats-tank-t1.txt` | live | same, AFTER the write + `sync` + `sleep 1` — dm-0/md127 show the write delta (`wr_sectors` 59024→224032 on dm-0), md126 idle. The delta→rate / await derivation and the fail-open sampler are tested against this pair |
+
+The kernel `/proc/diskstats` format is documented-stable, but captured anyway
+per the ground-truth idiom (never build a parser against an assumed format).
+
 ## Reconstructed / synthetic (NOT verbatim captures — labeled honestly)
 
 | File | Status | Notes |

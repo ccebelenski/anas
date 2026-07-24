@@ -822,19 +822,10 @@
             var sampleMs = Number(opts.sampleMs) > 0 ? Number(opts.sampleMs) : 2500;
             var slots = Math.max(2, Math.round(windowMs / sampleMs));
 
-            // Plot geometry — margins reserved for the labels.
-            var ML = 52, MR = 12, MT = 20, MB = 18;
-            var plotW = W - ML - MR;
-            var plotH = H - MT - MB;
-            if (plotW < 12) { plotW = 12; }
-            if (plotH < 12) { plotH = 12; }
-            var x0 = ML;                    // left edge of plot
-            var xR = ML + plotW;            // right edge (newest sample)
-            var yTop = MT;                  // top of plot (= max)
-            var yBase = MT + plotH;         // baseline (= 0)
-
-            // Value scale: nice-rounded max across all series (or fixed opts.max),
-            // floored so an idle chart still has a readable scale.
+            // Value scale FIRST (before the margin): nice-rounded max across all
+            // series (or fixed opts.max), floored so an idle chart still has a
+            // readable scale. The Y labels are rendered from vmax/vmid/0, so their
+            // widths — not a fixed guess — must set the left margin below.
             var peak = 0, totalPts = 0, si, vi;
             for (si = 0; si < series.length; si++) {
                 var vals = (series[si] && series[si].values) || [];
@@ -855,6 +846,28 @@
             }
             if (!(vmax > 0)) { vmax = 1; }
             var vmid = vmax / 2;
+
+            // Plot geometry — the LEFT margin is derived from the widest rendered
+            // Y label (0 / mid / max), not a fixed 52: an 11-char label like
+            // "75.37 MiB/s" is ~63px at the 9.5px tabular-nums font (~5.7px/char),
+            // which right-anchored at x = ML-6 would spill past the SVG's left
+            // edge and lose its leading digits (75.37 → "5.37"). Size ML to fit
+            // the label + padding, floor 52, and let plotW shrink.
+            var ylabW = 0;
+            var yLabelVals = [vmax, vmid, 0];
+            for (var yl = 0; yl < yLabelVals.length; yl++) {
+                var lw = ('' + fmt(yLabelVals[yl])).length * 5.7;
+                if (lw > ylabW) { ylabW = lw; }
+            }
+            var ML = Math.max(52, Math.ceil(ylabW) + 8), MR = 12, MT = 20, MB = 18;
+            var plotW = W - ML - MR;
+            var plotH = H - MT - MB;
+            if (plotW < 12) { plotW = 12; }
+            if (plotH < 12) { plotH = 12; }
+            var x0 = ML;                    // left edge of plot
+            var xR = ML + plotW;            // right edge (newest sample)
+            var yTop = MT;                  // top of plot (= max)
+            var yBase = MT + plotH;         // baseline (= 0)
 
             function yFor(v) {
                 v = Number(v);
