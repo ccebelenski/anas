@@ -485,7 +485,7 @@ unused devices: <none>
         '--raid-devices=2',
         '--metadata=1.2',
         '--name=tank-r3',
-        '--data-offset=8192s', // 4 MiB for a sub-512GiB member (GT-5 policy)
+        '--data-offset=8192s', // 4 MiB for a sub-128GiB member (GT-5 policy)
         '--bitmap=internal',
         `/dev/disk/by-id/${W}-part3`,
         `/dev/disk/by-id/${V}-part3`,

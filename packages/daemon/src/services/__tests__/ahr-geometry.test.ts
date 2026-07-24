@@ -147,18 +147,22 @@ describe('planDiskPartitions', () => {
   })
 })
 
-describe('data-offset policy (GT-5, calibration-pending)', () => {
-  it('pins 4 MiB for small members, 128 MiB from 512 GiB up', () => {
+describe('data-offset policy (GT-5, calibrated 2026-07-24)', () => {
+  it('pins 4 MiB below the 128 GiB knee, 256 MiB from 128 GiB up', () => {
+    // Below mdadm's native plateau knee (128 GiB): small/test regime, 4 MiB.
     assert.equal(ahrDataOffsetBytes(1 * GIB), 4 * MIB)
-    assert.equal(ahrDataOffsetBytes(512 * GIB - 1), 4 * MIB)
-    assert.equal(ahrDataOffsetBytes(512 * GIB), 128 * MIB)
-    assert.equal(ahrDataOffsetBytes(14 * 1000 ** 4), 128 * MIB)
-    assert.equal(AHR_DATA_OFFSET.largeMemberThresholdBytes, 512 * GIB)
+    assert.equal(ahrDataOffsetBytes(128 * GIB - 1), 4 * MIB)
+    // At/above the knee (all production TB-scale disks): 256 MiB, ≥ mdadm's own
+    // native 129 MiB (264192 s), verified constant to 15.6 TiB on the stunt node.
+    assert.equal(ahrDataOffsetBytes(128 * GIB), 256 * MIB)
+    assert.equal(ahrDataOffsetBytes(14 * 1000 ** 4), 256 * MIB)
+    assert.equal(AHR_DATA_OFFSET.largeMemberThresholdBytes, 128 * GIB)
   })
 
   it('renders the mdadm argument in unambiguous sectors', () => {
     assert.equal(ahrDataOffsetArg(1 * GIB), '--data-offset=8192s')
-    assert.equal(ahrDataOffsetArg(4 * 1000 ** 4), '--data-offset=262144s')
+    // 256 MiB = 524288 sectors — dominates native (264192 s) with margin.
+    assert.equal(ahrDataOffsetArg(4 * 1000 ** 4), '--data-offset=524288s')
   })
 })
 

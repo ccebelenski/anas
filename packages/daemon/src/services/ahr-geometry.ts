@@ -31,18 +31,42 @@ export const SGDISK_RAID_TYPE = 'FD00'
 /**
  * The explicit `--data-offset` policy (§2.6 / GT-5): the mdadm DEFAULT varies
  * with member size, so ANAS pins a deterministic, generous offset at array
- * creation — the headroom is load-bearing for backup-file-free reshapes
- * (§5.1, GT-6: repeated grows shrink offsets).
+ * creation — the headroom is load-bearing for backup-file-free reshapes (§5.1).
  *
- * Values: 128 MiB for members ≥ 512 GiB, else 4 MiB. The TB-scale production
- * number is still uncalibrated on real hardware (GT-5).
+ * CALIBRATED on the stunt node 2026-07-24 (GT-5 closed; mdadm 4.4, 512K chunk,
+ * `--bitmap=internal` as production). Two facts drove the tiers:
+ *  1. mdadm's NATIVE data offset plateaus at **264192 sectors (129 MiB)** for
+ *     every member ≥ 128 GiB — empirically constant 256 GiB → 15.6 TiB, and the
+ *     mdadm headroom algorithm (128 MiB cap, halved only below 128 GiB) makes it
+ *     constant to 20 TiB and beyond. The old 128 MiB pin sat 1 MiB UNDER mdadm's
+ *     own choice — stingier than the default it replaced. Below the knee mdadm
+ *     halves (64 GiB → 133120 s / 65 MiB; ~1–2 GiB members → 2048–4096 s).
+ *  2. Offset consumed per backup-file-free grow does NOT accumulate linearly:
+ *     a 4-member RAID5 pinned at 8192 s (4 MiB) shifted to 4096 s on the FIRST
+ *     grow (4→5) then held at 4096 s across 5→6 and 6→7 — one bounded ~2 MiB
+ *     shift (chunk-scaled critical section), not GT-6's feared cumulative drain.
+ *
+ * So the budget question resolves in favour of a **generous round pin ≥ native**:
+ *  - Members ≥ 128 GiB (all production TB-scale disks; mdadm's own plateau knee):
+ *    **256 MiB**. Dominates native (129 MiB) with margin, is a clean power-of-two,
+ *    funds effectively unlimited grows (shift floors ~2 MiB), and wastes
+ *    0.00128 % on a 20 TB disk — irrelevant, per §2.5's floor-to-GiB doctrine.
+ *  - Members < 128 GiB (small/test members below mdadm's plateau, e.g. the 2 GiB
+ *    stunt pool): **4 MiB**. Backup-file-free grow proven at this offset (floors
+ *    ~2 MiB); kept small so the offset stays affordable on tiny members. This is
+ *    the value existing small pools (stunt `tank`) were minted with — unchanged.
+ *
+ * Existing pools keep whatever offset they were CREATED with (on-disk, immutable,
+ * legitimately divergent per member after grows — GT-6); these tiers bind only
+ * newly created arrays.
  */
 export const AHR_DATA_OFFSET = {
-  /** Member-partition size at which the large offset kicks in. */
-  largeMemberThresholdBytes: 512 * 1024 ** 3,
-  /** Offset for members ≥ the threshold. */
-  largeBytes: 128 * MIB,
-  /** Offset for smaller members. */
+  /** Member-partition size at which the large offset kicks in (mdadm's own
+   *  native-plateau knee — at/above it mdadm would itself reserve 129 MiB). */
+  largeMemberThresholdBytes: 128 * 1024 ** 3,
+  /** Offset for members ≥ the threshold (≥ native 129 MiB, generous round). */
+  largeBytes: 256 * MIB,
+  /** Offset for smaller members (below mdadm's plateau; proven grow-capable). */
   smallBytes: 4 * MIB,
 } as const
 

@@ -56,7 +56,60 @@ start=B_{i-1}, size=B_i−B_{i-1}; each disk's topmost slice runs to last-usable
 1 GiB members, 4096 on others here; 128 MiB typical on TB-scale disks). ANAS pins
 `--data-offset` explicitly at creation for determinism and reshape headroom.
 Calibrate the production value on TB-scale disks (offset also bounds unused-space
-headroom for future grows).
+headroom for future grows). **CLOSED 2026-07-24** — see the calibration below.
+
+**GT-5 CALIBRATION (2026-07-24, stunt node, mdadm 4.4, sparse files + loop
+devices, RAID5 `--assume-clean --bitmap=internal`, NO `--data-offset`):**
+
+*Native default offset vs member size* (mdadm's own choice; one member examined):
+
+| Member size | Native Data Offset | = MiB | Unused before / after |
+|-------------|--------------------|-------|-----------------------|
+| 64 GiB      | 133120 s           | 65    | 133040 s / 0          |
+| 256 GiB     | 264192 s           | 129   | 264112 s / 0          |
+| 512 GiB     | 264192 s           | 129   | 264112 s / 0          |
+| 1 TiB       | 264192 s           | 129   | 264112 s / 0          |
+| 4 TiB       | 264192 s           | 129   | 264112 s / 0          |
+| 8 TiB       | 264192 s           | 129   | 264112 s / 0          |
+| 15.6 TiB    | 264192 s           | 129   | 264104 s / 0          |
+| 4 TiB RAID6 | 264192 s           | 129   | 264112 s / 0          |
+
+Chunk 512K, internal bitmap 8 s from superblock, throughout. The native offset
+**plateaus at 264192 s (129 MiB) for every member ≥ 128 GiB** and is constant
+across a 60× size range (256 GiB → 15.6 TiB), RAID5 and RAID6 alike. mdadm's
+headroom algorithm caps at 128 MiB and only halves *below* the 128 GiB knee
+(64 GiB → 65 MiB), so 20 TiB is 129 MiB too — the literal 20 TiB reading was
+blocked only by ext4's 16 TiB max-file-size ceiling on the scratch fs, not by any
+change in mdadm's choice. **The old 128 MiB pin therefore sat 1 MiB UNDER mdadm's
+own default — stingier than the value it replaced.**
+
+*Offset consumed per backup-file-free grow* (4-member RAID5 pinned at 8192 s /
+4 MiB, `mdadm --wait` between each grow, all grows offset-shift, NO backup file):
+
+| Members | Data Offset (all members, uniform) | Consumed by this grow |
+|---------|-----------------------------------|-----------------------|
+| 4 (create) | 8192 s (4 MiB)                | —                     |
+| 5          | 4096 s (2 MiB)                | 4096 s (2 MiB)        |
+| 6          | 4096 s (2 MiB)                | 0                     |
+| 7          | 4096 s (2 MiB)                | 0                     |
+
+Consumption is **NOT cumulative-linear**: the first grow made a single bounded
+~2 MiB shift (a chunk-scaled critical-section reservation), then the offset held
+flat across the next two grows. GT-6's "repeated grows shrink offsets" was an
+over-generalization from a tiny 2048 s start; at any sane pinned offset the shift
+is one-time and small. Offsets stayed **uniform** across members here (contrast
+GT-6's divergence at 2048 s) — parsers must still not assume uniformity, but the
+budget math does not depend on per-grow accumulation.
+
+*Policy decision (landed in `ahr-geometry.ts`):* pin a **generous round offset
+≥ mdadm's native**. Members ≥ 128 GiB (all production TB-scale disks; mdadm's own
+plateau knee) → **256 MiB (524288 s)**: dominates native 129 MiB with margin,
+clean power-of-two, funds effectively unlimited grows (shift floors ~2 MiB), waste
+0.00128 % on a 20 TB disk. Members < 128 GiB (small/test, e.g. the 2 GiB stunt
+pool) → **4 MiB (8192 s)**, unchanged — proven backup-file-free and affordable on
+tiny members. **Applies to newly created arrays only**; existing pools (stunt
+`tank`, any operator pool) keep the offset they were minted with (on-disk,
+immutable), and that offset is their permanent reshape budget.
 
 **GT-6 — Backup-file-free grows CONFIRMED.** RAID5 3→4 grow proceeded with no
 `--backup-file`, via data-offset shift: the NEW member joined with data offset 1024
@@ -159,5 +212,6 @@ index.html.tpl handling). The `fields` param carries matcher-filterable metadata
 
 ## Still open after stage 0
 
-- **Production data-offset value (GT-5)**: calibrate on TB-scale disks.
+- ~~**Production data-offset value (GT-5)**~~: **CLOSED 2026-07-24** — calibrated
+  (see GT-5 above); pin is 256 MiB for members ≥ 128 GiB, 4 MiB below.
 - **mdadm.conf ARRAY pinning vs tolerate-both (GT-3)**: decide at build.
