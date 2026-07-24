@@ -39,6 +39,7 @@ export const mockFixtures = {
   ahrMdadmExportR1: () => fixtureResult('ahr', 'mdadm-export-r1.txt'),
   ahrMdadmExportR2: () => fixtureResult('ahr', 'mdadm-export-r2.txt'),
   ahrLsblk: () => fixtureResult('ahr', 'lsblk-ahr0.json'),
+  ahrPvs: () => fixtureResult('ahr', 'lvm-pvs.json'),
   ahrVgs: () => fixtureResult('ahr', 'lvm-vgs.json'),
   ahrLvs: () => fixtureResult('ahr', 'lvm-lvs.json'),
   ahrFindmnt: () => fixtureResult('ahr', 'findmnt-ahr0.json'),

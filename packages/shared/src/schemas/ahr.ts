@@ -276,6 +276,22 @@ export const AhrLayoutPreviewRequest = z.object({
 })
 export type AhrLayoutPreviewRequest = z.infer<typeof AhrLayoutPreviewRequest>
 
+// ---- Create ----------------------------------------------------------------
+
+/**
+ * POST /v1/ahr request: create a pool from a disk selection + tier — WIPES
+ * every listed disk (confirm-gated; the 409 warnings name each one). Disks are
+ * /v1/disks by-id identifiers and must be status 'available' (GT-12: the
+ * in-use/foreign-label exclusions are safety-critical). The tier is chosen
+ * here forever — there is no AHR-1 → AHR-2 conversion.
+ */
+export const AhrCreateRequest = z.object({
+  name: PoolName,
+  tier: AhrType,
+  disks: z.array(DiskId).min(1),
+})
+export type AhrCreateRequest = z.infer<typeof AhrCreateRequest>
+
 // ---- Expansion -------------------------------------------------------------
 
 /** What kicked off an expansion. */

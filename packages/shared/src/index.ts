@@ -16,6 +16,7 @@ export {
   AhrArrayMember,
   AhrArraySync,
   AhrCapacity,
+  AhrCreateRequest,
   AhrDisk,
   AhrDiskPartition,
   AhrDiskRole,

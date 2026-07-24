@@ -11,10 +11,11 @@ import { mockFixtures } from './fixtures/loader.js'
 import { JobQueue } from './jobs/queue.js'
 import { btrfsUsageArgs } from './parsers/btrfs-usage.js'
 import { LSBLK_ARGS } from './parsers/lsblk.js'
-import { LVS_ARGS, VGS_ARGS } from './parsers/lvm-report.js'
+import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from './parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from './parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from './parsers/mdstat.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
+import { ahrMutationRoutes } from './routes/ahr-mutate.js'
 import { ahrRoutes } from './routes/ahr.js'
 import { backupRoutes } from './routes/backup.js'
 import { dashboardRoutes } from './routes/dashboard.js'
@@ -79,6 +80,14 @@ export function createServer(opts?: ServerOptions) {
   // storage.cfg is parsed READ-ONLY for hands-off tagging.
   const envFstabPath = process.env.ANAS_FSTAB_PATH
   let fstabPath = envFstabPath ?? '/etc/fstab'
+
+  // AHR mutation-layer paths (Epic 11 + AHR): mdadm.conf (surgical ARRAY-pin
+  // edits) and the pool mount base. Env-overridable for tests/stunt; dev mock
+  // uses throwaway temps so a stray write never touches the host.
+  const mdadmConfPath = process.env.ANAS_MDADM_CONF
+    ?? (opts?.mock ? join(tmpdir(), `anas-mock-mdadm-${process.pid}.conf`) : undefined)
+  const ahrMountBase = process.env.ANAS_AHR_MOUNT_BASE
+    ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-${process.pid}`) : undefined)
   const credsDir = process.env.ANAS_CREDS_DIR
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-creds-${process.pid}`) : '/etc/anas/creds')
   let mountsStoragePath = process.env.ANAS_STORAGE_CFG // undefined = /etc/pve/storage.cfg default
@@ -399,6 +408,31 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
     mock.addFixture({ command: '/usr/sbin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+    // --- Epic 11 + AHR: mutation layer (create/destroy/scrub) -------------
+    // pvs backs the destroy teardown's checks-then-acts PV pass.
+    mock.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: mockFixtures.ahrPvs() })
+    // Dynamic-arg mutation commands succeed via command-only fallbacks. The
+    // mdadm fallback carries a generic MD_UUID so create's pin step can read
+    // an identity for ANY pool name (the exact md127/md126 export fixtures
+    // above still win for the ahr0 read layer); every command that ignores
+    // stdout (--create/--stop/--zero-superblock/--action=check) is unaffected.
+    mock.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: 'MD_UUID=aaaaaaaa:bbbbbbbb:cccccccc:dddddddd\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/sgdisk', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/udevadm', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/pvcreate', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/vgcreate', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/lvcreate', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/lvremove', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/vgremove', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/pvremove', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/mkfs.btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/update-initramfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // Scrub: command-only btrfs fallback (empty status → finished, clean); the
+    // exact `filesystem usage` fixture above still wins. realpath resolves the
+    // /dev/md/<name> symlink for the check-wait; perl is the PVE notifier.
+    mock.addFixture({ command: '/usr/sbin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
   }
 
   const confirmStore = new ConfirmStore()
@@ -433,10 +467,12 @@ export function createServer(opts?: ServerOptions) {
   server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
-  // AHR hybrid RAID (Epic 11 + AHR) — READ layer only (list/detail/preview).
-  // The mutation routes (`ahrMutationRoutes` from routes/ahr-mutate.ts —
-  // create/expand/replace/scrub/destroy jobs) register beside this line.
+  // AHR hybrid RAID (Epic 11 + AHR) — READ layer (list/detail/preview).
+  // The mutation routes (create/expand/replace/scrub/destroy jobs) register
+  // beside this line.
   server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache })
+  // AHR mutations: create/destroy/scrub (routes/ahr-mutate.ts).
+  server.register(ahrMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase: ahrMountBase })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, and job sources above, plus on-demand ARC/iostat/net sampling.
   server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath })
