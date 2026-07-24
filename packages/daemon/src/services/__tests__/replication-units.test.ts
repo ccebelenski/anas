@@ -109,6 +109,16 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
     assert.equal(parseServiceUnit('[Unit]\nDescription=something else\n'), null)
   })
 
+  // --- belt-and-suspenders: the unit writer refuses newline-bearing argv ----
+  // (the schema already forbids such datasets from reaching here — this proves
+  // the ExecStart writer is a hard boundary in its own right).
+  it('renderServiceUnit throws on a newline in a runner argument (unit injection)', () => {
+    const evil = makeTask({ source: { pool: 'testpool', dataset: 'media\nExecStart=/bin/sh -c id' } })
+    assert.throws(() => renderServiceUnit(evil), /newline or carriage return/)
+    const evilCr = makeTask({ target: { pool: 'backup', dataset: 'media\rfoo' } })
+    assert.throws(() => renderServiceUnit(evilCr), /newline or carriage return/)
+  })
+
   it('parseServiceUnit returns null for invalid task JSON', () => {
     assert.equal(parseServiceUnit('# X-ANAS-Task={"name":"BAD NAME","schedule":""}\n'), null)
   })

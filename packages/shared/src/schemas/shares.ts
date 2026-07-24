@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AbsolutePath, ShareName } from './common.js'
+import { AbsolutePath, ShareName, SingleLine } from './common.js'
 
 // ============================================================================
 // SMB (Samba) — shares are managed by surgical in-place edits to smb.conf.
@@ -23,16 +23,23 @@ export const SmbShare = z.object({
   name: ShareName,
   /** Shared directory */
   path: AbsolutePath,
-  comment: z.string().nullable(),
+  /**
+   * `comment` — free text, but single-line (a newline would forge extra
+   *  smb.conf parameters). Spaces/punctuation (e.g. "Bob's share") are fine.
+   */
+  comment: SingleLine.nullable(),
   browseable: z.boolean(),
   readOnly: z.boolean(),
   guestOk: z.boolean(),
-  /** `valid users` — names may be users or @groups (resolved via getent) */
-  validUsers: z.array(z.string()),
+  /**
+   * `valid users` — names may be users or @groups (resolved via getent).
+   *  Each entry is single-line (no control chars / smb.conf line injection).
+   */
+  validUsers: z.array(SingleLine),
   /** `hosts allow` — host/subnet allow-list (per-share client access) */
-  hostsAllow: z.array(z.string()),
+  hostsAllow: z.array(SingleLine),
   /** `hosts deny` */
-  hostsDeny: z.array(z.string()),
+  hostsDeny: z.array(SingleLine),
   /**
    * Whether `path` currently exists on disk — a READ-TIME observation, never
    * stored state (the daemon stats the path when it lists the share). A share
@@ -52,10 +59,16 @@ export type SmbShareDetail = z.infer<typeof SmbShareDetail>
 
 /** Samba `[global]` settings ANAS surfaces (GET/PUT /v1/shares/smb/global). */
 export const SmbGlobalConfig = z.object({
-  workgroup: z.string(),
-  serverString: z.string(),
-  /** `interfaces` — which NICs/IPs/subnets smbd serves on (multi-NIC lever) */
-  interfaces: z.array(z.string()),
+  /** `workgroup` — single-line (written verbatim as a `[global]` parameter). */
+  workgroup: SingleLine,
+  /** `server string` — single-line; may contain spaces and `%v`-style macros. */
+  serverString: SingleLine,
+  /**
+   * `interfaces` — which NICs/IPs/subnets smbd serves on (multi-NIC lever).
+   *  Each entry is single-line — they are space-joined into the `interfaces`
+   *  line, so a newline would forge another `[global]` parameter.
+   */
+  interfaces: z.array(SingleLine),
   /** `bind interfaces only` — actually restrict smbd to `interfaces` */
   bindInterfacesOnly: z.boolean(),
 })
@@ -65,13 +78,13 @@ export type SmbGlobalConfig = z.infer<typeof SmbGlobalConfig>
 export const CreateSmbShareRequest = z.object({
   name: ShareName,
   path: AbsolutePath,
-  comment: z.string().optional(),
+  comment: SingleLine.optional(),
   browseable: z.boolean().optional(),
   readOnly: z.boolean().optional(),
   guestOk: z.boolean().optional(),
-  validUsers: z.array(z.string()).optional(),
-  hostsAllow: z.array(z.string()).optional(),
-  hostsDeny: z.array(z.string()).optional(),
+  validUsers: z.array(SingleLine).optional(),
+  hostsAllow: z.array(SingleLine).optional(),
+  hostsDeny: z.array(SingleLine).optional(),
 })
 export type CreateSmbShareRequest = z.infer<typeof CreateSmbShareRequest>
 
@@ -91,10 +104,16 @@ export type UpdateSmbGlobalConfigRequest = z.infer<typeof UpdateSmbGlobalConfigR
 
 /** One client entry on an export: a host/subnet spec and its options. */
 export const NfsClient = z.object({
-  /** e.g. "10.0.0.0/24", "*", "host.example.com" */
-  spec: z.string(),
-  /** e.g. ["rw", "sync", "no_subtree_check", "root_squash"] */
-  options: z.array(z.string()),
+  /**
+   * e.g. "10.0.0.0/24", "*", "host.example.com". Single-line — it is written
+   *  verbatim into an /etc/exports line; a control char would corrupt the file.
+   */
+  spec: SingleLine,
+  /**
+   * e.g. ["rw", "sync", "no_subtree_check", "root_squash"]. Each option is
+   *  single-line (no control chars / exports line injection).
+   */
+  options: z.array(SingleLine),
 })
 export type NfsClient = z.infer<typeof NfsClient>
 

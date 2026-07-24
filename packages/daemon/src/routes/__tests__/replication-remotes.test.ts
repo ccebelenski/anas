@@ -196,7 +196,7 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
 
   it('test (pre-registration): unknown host key → hostkey-unknown + fingerprint', async () => {
     const mock = mockOf(server)
-    mock.addFixture({ command: SSH_KEYSCAN, args: ['-p', '22', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: SSH_KEYSCAN, args: ['-p', '22', '--', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, stderr: '', exitCode: 0 } })
     const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })
     assert.equal(res.statusCode, 200)
     const { data } = res.json()
@@ -206,7 +206,7 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
 
   it('test with ?pin=true pins the host key, then advances to ok + zfsVersion', async () => {
     const mock = mockOf(server)
-    mock.addFixture({ command: SSH_KEYSCAN, args: ['-p', '22', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: SSH_KEYSCAN, args: ['-p', '22', '--', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, stderr: '', exitCode: 0 } })
     sshFix(mock, ['true'], { stdout: '', stderr: '', exitCode: 0 })
     sshFix(mock, ['zfs', '--version'], { stdout: 'zfs-2.2.3\nzfs-kmod-2.2.3\n', stderr: '', exitCode: 0 })
     const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test?pin=true', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })

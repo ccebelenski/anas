@@ -17,3 +17,10 @@ test/stunt-node/config.local
 
 # Release tarballs (packaging/make-release.sh output)
 dist-release/
+
+# Credential material — never commit secrets, even test ones (belt-and-suspenders;
+# real secrets belong in root-only files on the node, never in the repo).
+*.pw
+*.cred
+*.secret
+**/creds/

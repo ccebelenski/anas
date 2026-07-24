@@ -51,9 +51,11 @@ export {
   DatasetPath,
   DevicePath,
   DiskId,
+  hasControlChars,
   ISODateTime,
   PoolName,
   ShareName,
+  SingleLine,
   SnapshotName,
   UUID,
 } from './schemas/common.js'
@@ -144,6 +146,7 @@ export {
   MountEntry,
   MountHealth,
   MountKind,
+  MountMode,
   MountNfsOptions,
   MountOptions,
   MountRequestOptions,
@@ -155,6 +158,7 @@ export {
   MountTestVerdict,
   MountType,
   MountUnit,
+  MountVers,
   UpdateMountRequest,
 } from './schemas/mounts.js'
 

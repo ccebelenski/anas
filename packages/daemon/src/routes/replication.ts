@@ -374,9 +374,12 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
         const sendArgs = d.mode === 'incremental' && d.baseSnapshot
           ? ['send', '-i', `@${d.baseSnapshot}`, srcSnapFull]
           : ['send', srcSnapFull]
+        // `--` ends zfs option parsing so `targetFull` is always the positional
+        // filesystem, never mistaken for a flag (defence in depth; the schema
+        // already restricts the dataset charset).
         const recvArgs = d.mode === 'full'
-          ? ['recv', '-o', 'readonly=on', targetFull]
-          : ['recv', targetFull]
+          ? ['recv', '-o', 'readonly=on', '--', targetFull]
+          : ['recv', '--', targetFull]
 
         let recvCmd = ZFS
         let recvArgv = recvArgs

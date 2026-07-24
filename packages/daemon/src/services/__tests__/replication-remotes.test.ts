@@ -140,7 +140,7 @@ describe('replication remotes registry (Epic 5.5.2 — corosync store)', () => {
     const mock = new MockExecutor()
     mock.addFixture({
       command: SSH_KEYSCAN,
-      args: ['-p', '22', '10.0.0.9'],
+      args: ['-p', '22', '--', '10.0.0.9'],
       result: { stdout: `10.0.0.9 ssh-rsa ${RSA_BLOB}\n10.0.0.9 ssh-ed25519 ${ED_BLOB}\n`, stderr: '', exitCode: 0 },
     })
     const fp = await pinHostKey(mock, paths, '10.0.0.9', 22)

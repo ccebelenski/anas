@@ -533,9 +533,11 @@ async function daemonReload(executor: CommandExecutor): Promise<void> {
  * entry's fields (the non-persistent path). Throws on failure.
  */
 async function doMount(executor: CommandExecutor, entry: MountEntry | undefined, mountpoint: string): Promise<void> {
+  // `--` ends option parsing so the positional spec/mountpoint can never be read
+  // as a `mount` flag (defence in depth; the schema already rejects control chars).
   const args = entry
-    ? ['-t', entry.fstype, '-o', serializeInlineOptions(entry), entry.spec, mountpoint]
-    : [mountpoint]
+    ? ['-t', entry.fstype, '-o', serializeInlineOptions(entry), '--', entry.spec, mountpoint]
+    : ['--', mountpoint]
   const r = await executor.exec(MOUNT, args)
   if (r.exitCode !== 0)
     throw new Error(r.stderr.trim() || `mount exited ${r.exitCode}`)

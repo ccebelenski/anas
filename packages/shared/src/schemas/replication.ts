@@ -1,5 +1,15 @@
 import { z } from 'zod'
-import { ISODateTime, PoolName } from './common.js'
+import { DatasetPath, hasControlChars, ISODateTime, PoolName, SingleLine, SnapshotName } from './common.js'
+
+/**
+ * A replication dataset field: a validated ZFS DatasetPath, OR the empty string.
+ * The empty string is load-bearing — it means "the pool root" for a source and
+ * "default to the source's relative path" for a target — so it must stay valid.
+ * Everything non-empty is charset-restricted (no shell metacharacters, no
+ * control chars) because these values flow into `zfs recv …` and `ssh <peer>
+ * zfs recv …` argv and into systemd `ExecStart=` lines.
+ */
+const ReplicationDataset = DatasetPath.or(z.literal(''))
 
 /**
  * Replication (Epic 5.5) — stage 1: LOCAL one-shot snapshot replication
@@ -22,20 +32,30 @@ import { ISODateTime, PoolName } from './common.js'
 export const ReplicationLocation = z.object({
   /** 'local' (default) | 'peer' (PVE cluster node) | 'remote' (registered). */
   kind: z.enum(['local', 'peer', 'remote']).default('local'),
-  /** Peer nodename or registered remote name (absent for local). */
-  name: z.string().optional(),
+  /**
+   * Peer nodename or registered remote name (absent for local). Single-line —
+   *  a peer name becomes the `ssh root@<name>` host and both are matched against
+   *  a known-nodes / registry set.
+   */
+  name: SingleLine.optional(),
 })
 export type ReplicationLocation = z.infer<typeof ReplicationLocation>
 
-/** Where a replication lands: a pool and optionally a dataset path within it
- *  (default: the source dataset's own path). Stage 1 is same-node only. */
+/**
+ * Where a replication lands: a pool and optionally a dataset path within it
+ *  (default: the source dataset's own path). Stage 1 is same-node only.
+ */
 export const ReplicationTarget = z.object({
   pool: PoolName,
-  /** Target dataset path relative to the pool (no leading slash). Defaults to
-   *  the source dataset's relative path. */
-  dataset: z.string().optional(),
-  /** Stage 3: where the target pool lives — local (default), a PVE cluster
-   *  peer, or a registered external remote. Additive; absent = local. */
+  /**
+   * Target dataset path relative to the pool (no leading slash). Defaults to
+   *  the source dataset's relative path. '' is treated as "default".
+   */
+  dataset: ReplicationDataset.optional(),
+  /**
+   * Stage 3: where the target pool lives — local (default), a PVE cluster
+   *  peer, or a registered external remote. Additive; absent = local.
+   */
   location: ReplicationLocation.optional(),
 })
 export type ReplicationTarget = z.infer<typeof ReplicationTarget>
@@ -43,8 +63,11 @@ export type ReplicationTarget = z.infer<typeof ReplicationTarget>
 /** Ask what a replication WOULD do (dry-run; mutates nothing). */
 export const ReplicatePlanRequest = z.object({
   target: ReplicationTarget,
-  /** Source snapshot to replicate up to (default: the newest snapshot). */
-  snapshot: z.string().optional(),
+  /**
+   * Source snapshot to replicate up to (default: the newest snapshot). ZFS
+   *  snapshot charset — flows into `zfs`/`ssh` argv as `<source>@<snapshot>`.
+   */
+  snapshot: SnapshotName.optional(),
 })
 export type ReplicatePlanRequest = z.infer<typeof ReplicatePlanRequest>
 
@@ -53,28 +76,37 @@ export const ReplicatePlan = z.object({
   /** 'incremental' when a common base snapshot exists on both sides. */
   mode: z.enum(['full', 'incremental']),
   /** The snapshot that will be sent (source-side name). */
-  snapshot: z.string(),
+  snapshot: SnapshotName,
   /** The common base snapshot (incremental mode only; name without dataset). */
-  baseSnapshot: z.string().optional(),
+  baseSnapshot: SnapshotName.optional(),
   /** Exact stream size in bytes from `zfs send -nvP`. */
   estimatedBytes: z.number().nonnegative(),
   /** Whether the target dataset already exists. */
   targetExists: z.boolean(),
-  /** True when the target exists but shares NO common snapshot — a full send
+  /**
+   * True when the target exists but shares NO common snapshot — a full send
    *  cannot proceed without destroying the target (out of stage-1 scope; the
-   *  UI must say so instead of offering the run). */
+   *  UI must say so instead of offering the run).
+   */
   targetDiverged: z.boolean(),
 })
 export type ReplicatePlan = z.infer<typeof ReplicatePlan>
 
-/** Run a replication (202 → job). Same fields as the plan request, plus an
- *  optional snapshot-first convenience. */
+/**
+ * Run a replication (202 → job). Same fields as the plan request, plus an
+ *  optional snapshot-first convenience.
+ */
 export const ReplicateRequest = z.object({
   target: ReplicationTarget,
-  /** Source snapshot to replicate up to (default: the newest snapshot). */
-  snapshot: z.string().optional(),
-  /** Create a fresh snapshot of the source first (name auto-generated like the
-   *  snapshot dialog default), then replicate up to it. */
+  /**
+   * Source snapshot to replicate up to (default: the newest snapshot). ZFS
+   *  snapshot charset — flows into `zfs`/`ssh` argv as `<source>@<snapshot>`.
+   */
+  snapshot: SnapshotName.optional(),
+  /**
+   * Create a fresh snapshot of the source first (name auto-generated like the
+   *  snapshot dialog default), then replicate up to it.
+   */
   snapshotFirst: z.boolean().optional(),
 })
 export type ReplicateRequest = z.infer<typeof ReplicateRequest>
@@ -98,7 +130,7 @@ export type ReplicationTaskName = z.infer<typeof ReplicationTaskName>
 export const ReplicationTask = z.object({
   name: ReplicationTaskName,
   /** Source dataset, pool-rooted ('' dataset = the pool root). */
-  source: z.object({ pool: PoolName, dataset: z.string() }),
+  source: z.object({ pool: PoolName, dataset: ReplicationDataset }),
   target: ReplicationTarget,
   /** systemd OnCalendar expression (e.g. 'daily', '02:00', 'Mon *-*-* 03:00'). */
   schedule: z.string().min(1),
@@ -135,10 +167,14 @@ export type ReplicationTaskStatus = z.infer<typeof ReplicationTaskStatus>
 export const ReplicationRemote = z.object({
   /** Registry key; also shows in target pickers. */
   name: ReplicationTaskName,
-  host: z.string().min(1),
+  /**
+   * Hostname / IP. Single-line (no control chars) — it is written into our
+   *  known_hosts file and into `ssh <user>@<host>` / `ssh-keyscan` argv.
+   */
+  host: z.string().min(1).refine(s => !hasControlChars(s), 'Control characters are not allowed'),
   port: z.number().int().min(1).max(65535).default(22),
   /** v1 connects as root (or the remote's admin); zfs-allow delegation later. */
-  user: z.string().min(1).default('root'),
+  user: z.string().min(1).refine(s => !hasControlChars(s), 'Control characters are not allowed').default('root'),
   /** Pinned SSH host-key fingerprint (SHA256:…), set on explicit confirm. */
   hostKeyFingerprint: z.string().optional(),
 })
@@ -177,4 +213,3 @@ export const RemoteTestResult = z.object({
   detail: z.string().optional(),
 })
 export type RemoteTestResult = z.infer<typeof RemoteTestResult>
-

@@ -96,22 +96,30 @@ export async function proxyToLocalSocket(
   }
 }
 
+let cachedCaPath: string | undefined
 let cachedCa: string | Buffer | undefined
-let caChecked = false
 
-/** Read the cluster CA once. Missing file → undefined (logged), TLS falls back to defaults. */
+/**
+ * Read the cluster CA, caching ONLY a successful load (keyed by path). A failed
+ * read is never cached, so a transient boot-race miss (a request that lands
+ * before pmxcfs mounts /etc/pve) self-heals: the next request re-reads and, once
+ * /etc/pve is up, succeeds. Returns undefined only when the CA is currently
+ * unreadable — the caller MUST then refuse to forward rather than fall back to
+ * Node's public trust store.
+ */
 function loadClusterCa(request: FastifyRequest, caPath: string): string | Buffer | undefined {
-  if (caChecked)
+  if (cachedCa !== undefined && cachedCaPath === caPath)
     return cachedCa
-  caChecked = true
   try {
-    cachedCa = readFileSync(caPath)
+    const ca = readFileSync(caPath)
+    cachedCa = ca
+    cachedCaPath = caPath
+    return ca
   }
   catch {
-    request.log.warn(`[gateway] Cluster CA ${caPath} unreadable — peer TLS uses default trust store`)
-    cachedCa = undefined
+    request.log.warn(`[gateway] Cluster CA ${caPath} unreadable — refusing to forward (peer TLS trust anchor unavailable)`)
+    return undefined
   }
-  return cachedCa
 }
 
 /**
@@ -128,6 +136,19 @@ export async function forwardToNode(
   opts: { node: string, port: number, clusterCa: string },
 ): Promise<void> {
   const ca = loadClusterCa(request, opts.clusterCa)
+  if (ca === undefined) {
+    // Fail CLOSED: without the cluster CA we cannot verify the peer's TLS
+    // identity, and building an HttpsAgent without it would silently fall back
+    // to Node's PUBLIC trust store — forwarding the operator's PVEAuthCookie
+    // over a hop we can't authenticate. Refuse instead.
+    await reply.code(502).send({
+      error: {
+        code: 'CLUSTER_CA_UNAVAILABLE',
+        message: `Cannot forward to node '${opts.node}': the cluster CA (peer TLS trust anchor) is unavailable, so the request is refused rather than sent over the public trust store.`,
+      },
+    })
+    return
+  }
 
   const headers: Record<string, string> = {
     accept: 'application/json',

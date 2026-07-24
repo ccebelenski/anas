@@ -82,8 +82,16 @@ export function runnerArgs(task: ReplicationTask): string[] {
  * Quote an ExecStart token so systemd's own splitter round-trips it (empty
  *  strings and any whitespace get double-quoted; ZFS/pool names are otherwise
  *  quote-free).
+ *
+ * Belt-and-suspenders: a newline or carriage return in a token would end the
+ * `ExecStart=` line and inject an arbitrary systemd directive. The shared
+ * schemas now forbid such values from ever reaching here, but this writer
+ * refuses them unconditionally — the unit file is a security boundary in its own
+ * right.
  */
 function quoteExecArg(a: string): string {
+  if (a.includes('\n') || a.includes('\r'))
+    throw new Error('ExecStart argument must not contain a newline or carriage return')
   if (a === '' || WHITESPACE_RE.test(a))
     return `"${a.replace(DQUOTE_RE, '\\"')}"`
   return a

@@ -164,7 +164,7 @@ describe('replication to a REMOTE target (Epic 5.5.2)', () => {
     assert.deepEqual(call.args1, ['send', `${SOURCE}@${SNAP}`])
     // Right (consumer) is ssh into the remote running `zfs recv -o readonly=on`.
     const resolved = resolvedRemoteFields(paths, REMOTE.host, REMOTE.port, REMOTE.user)
-    const expected = buildSshArgv(resolved, ['zfs', 'recv', '-o', 'readonly=on', TARGET])
+    const expected = buildSshArgv(resolved, ['zfs', 'recv', '-o', 'readonly=on', '--', TARGET])
     assert.equal(call.cmd2, expected[0])
     assert.deepEqual(call.args2, expected.slice(1))
 

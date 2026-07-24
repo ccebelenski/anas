@@ -1,5 +1,26 @@
 import { z } from 'zod'
-import { AbsolutePath } from './common.js'
+import { AbsolutePath, SingleLine } from './common.js'
+
+/**
+ * A filesystem-version token (NFS `vers`, CIFS `vers`): digits separated by
+ * dots, e.g. "4.2", "3.1.1", "3", "1.0". This is written verbatim as
+ * `vers=<value>` into an fstab option list and a `mount -o` argument — the
+ * numeric-only shape forecloses comma-based option injection (e.g. the
+ * `4.2,exec` payload) and control characters.
+ */
+export const MountVers = z
+  .string()
+  .regex(/^\d+(?:\.\d+)*$/, 'Version must be numeric dotted (e.g. "4.2", "3.1.1")')
+
+/**
+ * An octal permission mode (CIFS `file_mode=` / `dir_mode=`): 3 or 4 octal
+ * digits, e.g. "755", "0644". Written verbatim as a `mount -o` option token —
+ * the strict octal shape forecloses comma-based option injection (e.g. the
+ * `0644,exec` payload) and control characters.
+ */
+export const MountMode = z
+  .string()
+  .regex(/^[0-7]{3,4}$/, 'Mode must be 3–4 octal digits (e.g. "755", "0644")')
 
 /**
  * Mounts (Epic 18) — external & local storage.
@@ -83,7 +104,7 @@ export type MountCommonOptions = z.infer<typeof MountCommonOptions>
 
 /** NFS-specific options. vers defaults to 4.2, hard default. */
 export const MountNfsOptions = z.object({
-  vers: z.string().optional(),
+  vers: MountVers.optional(),
   hard: z.boolean().optional(),
   timeo: z.number().int().positive().optional(),
   retrans: z.number().int().nonnegative().optional(),
@@ -94,12 +115,15 @@ export type MountNfsOptions = z.infer<typeof MountNfsOptions>
 
 /** CIFS-specific options (vers defaults to 3.1.1). Credentials are separate. */
 export const MountCifsOptions = z.object({
-  vers: z.string().optional(),
-  domain: z.string().optional(),
+  vers: MountVers.optional(),
+  /** `domain=` — single-line (written verbatim as a mount option token). */
+  domain: SingleLine.optional(),
   uid: z.number().int().nonnegative().optional(),
   gid: z.number().int().nonnegative().optional(),
-  fileMode: z.string().optional(),
-  dirMode: z.string().optional(),
+  /** `file_mode=` — octal only (forecloses `0644,exec` option injection). */
+  fileMode: MountMode.optional(),
+  /** `dir_mode=` — octal only. */
+  dirMode: MountMode.optional(),
 })
 export type MountCifsOptions = z.infer<typeof MountCifsOptions>
 
@@ -119,7 +143,11 @@ export type MountOptions = z.infer<typeof MountOptions>
  * this is the interpreted view returned as `configuredOptions`/`entry`.
  */
 export const MountEntry = z.object({
-  spec: z.string(),
+  /**
+   * fs_spec (device / `//host/share` / `host:/export`). Single-line — written
+   *  verbatim as field 1 of an /etc/fstab line and as a `mount` argument.
+   */
+  spec: SingleLine,
   mountpoint: AbsolutePath,
   fstype: z.string(),
   options: MountOptions,
@@ -228,11 +256,18 @@ export type MountDetail = z.infer<typeof MountDetail>
 
 // ---- Requests ----------------------------------------------------------------
 
-/** CIFS credentials — WRITE-ONLY. Never returned in any response. */
+/**
+ * CIFS credentials — WRITE-ONLY. Never returned in any response. All three
+ * fields are written verbatim as `key=value` lines into a per-mount 0600 creds
+ * file, so each must be single-line: a control character (newline especially)
+ * would forge an extra creds line. Every printable password character — spaces,
+ * punctuation, symbols — is preserved; only control characters (which a
+ * line-based creds file cannot represent anyway) are rejected.
+ */
 export const MountCredentials = z.object({
-  username: z.string().min(1),
-  password: z.string().min(1),
-  domain: z.string().optional(),
+  username: SingleLine.pipe(z.string().min(1)),
+  password: SingleLine.pipe(z.string().min(1)),
+  domain: SingleLine.optional(),
 })
 export type MountCredentials = z.infer<typeof MountCredentials>
 
@@ -250,28 +285,31 @@ export const MountRequestOptions = z.object({
   /** x-systemd.idle-timeout seconds (automount). */
   idleTimeout: z.number().int().positive().optional(),
   // nfs
-  vers: z.string().optional(),
+  vers: MountVers.optional(),
   hard: z.boolean().optional(),
   timeo: z.number().int().positive().optional(),
   retrans: z.number().int().nonnegative().optional(),
   rsize: z.number().int().positive().optional(),
   wsize: z.number().int().positive().optional(),
   // cifs
-  domain: z.string().optional(),
+  domain: SingleLine.optional(),
   uid: z.number().int().nonnegative().optional(),
   gid: z.number().int().nonnegative().optional(),
-  fileMode: z.string().optional(),
-  dirMode: z.string().optional(),
+  fileMode: MountMode.optional(),
+  dirMode: MountMode.optional(),
 })
 export type MountRequestOptions = z.infer<typeof MountRequestOptions>
 
 /** Create a mount (POST /v1/mounts): write fstab (if persistent) + mount now. */
 export const CreateMountRequest = z.object({
   type: MountType,
-  /** Remote host (NFS/CIFS). */
-  server: z.string().optional(),
-  /** NFS export path (`/srv/nfs/export1`) or CIFS share name (`anastest`). */
-  remotePath: z.string().optional(),
+  /** Remote host (NFS/CIFS). Single-line — folded into the fstab `spec`. */
+  server: SingleLine.optional(),
+  /**
+   * NFS export path (`/srv/nfs/export1`) or CIFS share name (`anastest`).
+   *  Single-line — folded into the fstab `spec`.
+   */
+  remotePath: SingleLine.optional(),
   mountpoint: AbsolutePath,
   /** Write an /etc/fstab entry (default true). */
   persistent: z.boolean().default(true),
@@ -316,11 +354,11 @@ export type MountStateRequest = z.infer<typeof MountStateRequest>
 /** Diagnose a remote mount before commit: DNS → port → guarded probe mount. */
 export const MountTestRequest = z.object({
   type: z.enum(['nfs', 'cifs']),
-  server: z.string().min(1),
+  server: SingleLine.pipe(z.string().min(1)),
   /** NFS export path or CIFS share name. */
-  remotePath: z.string().optional(),
+  remotePath: SingleLine.optional(),
   /** Version to request (NFS "4.2" default, CIFS "3.1.1" default). */
-  vers: z.string().optional(),
+  vers: MountVers.optional(),
   /** CIFS credentials for the auth probe (write-only). */
   credentials: MountCredentials.optional(),
 })

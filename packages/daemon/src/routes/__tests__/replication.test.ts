@@ -237,7 +237,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
       cmd1: ZFS,
       args1: ['send', 'testpool/share1@repl-base'],
       cmd2: ZFS,
-      args2: ['recv', '-o', 'readonly=on', 'testpool2/share1'],
+      args2: ['recv', '-o', 'readonly=on', '--', 'testpool2/share1'],
     })
 
     // Holds placed on BOTH sides after success.
@@ -282,7 +282,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
       cmd1: ZFS,
       args1: ['send', '-i', '@repl-base', 'testpool/share1@repl-next'],
       cmd2: ZFS,
-      args2: ['recv', 'testpool2/share1'],
+      args2: ['recv', '--', 'testpool2/share1'],
     })
   })
 

@@ -1,8 +1,11 @@
 import type { Server } from 'node:http'
+import type { AddressInfo, Server as NetServer } from 'node:net'
 import type { AuthProvider, AuthUser } from '../auth/index.js'
 import type { GatewayConfig } from '../config.js'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
+import { createServer as createTcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
@@ -202,9 +205,25 @@ describe('local proxy → anasd socket', () => {
 })
 
 describe('remote node forwarding', () => {
-  it('returns 502 NODE_UNREACHABLE for an unresolvable node', async () => {
+  // Each test uses a UNIQUE cluster-CA path so the module-level (path-keyed)
+  // CA cache never leaks a value between them.
+  let caDir: string
+
+  before(() => {
+    caDir = mkdtempSync(join(tmpdir(), 'anas-clusterca-'))
+  })
+
+  after(() => {
+    rmSync(caDir, { recursive: true, force: true })
+  })
+
+  it('returns 502 NODE_UNREACHABLE for an unresolvable node (CA present)', async () => {
+    // A readable CA lets the request past the fail-closed gate so it reaches the
+    // actual forward attempt — which then fails DNS → NODE_UNREACHABLE.
+    const caPath = join(caDir, 'present.pem')
+    writeFileSync(caPath, 'test-ca-bytes')
     const server = createServer({
-      config: baseConfig(),
+      config: baseConfig({ clusterCa: caPath }),
       authProvider: new AcceptAuthProvider(),
       logger: false,
     })
@@ -218,6 +237,72 @@ describe('remote node forwarding', () => {
     assert.equal(body.error.code, 'NODE_UNREACHABLE')
     assert.match(body.error.message, /bogus\.example/)
     await server.close()
+  })
+
+  it('fails CLOSED with 502 CLUSTER_CA_UNAVAILABLE and does NOT forward when the CA is unreadable', async () => {
+    // A TCP stub stands in for the peer gateway and counts connection attempts:
+    // if the gateway wrongly fell back to the public trust store it would try to
+    // connect (and forward the cookie); we assert it never does.
+    let connections = 0
+    const peer: NetServer = createTcpServer((sock) => {
+      connections += 1
+      sock.destroy()
+    })
+    await new Promise<void>(resolve => peer.listen(0, '127.0.0.1', resolve))
+    const peerPort = (peer.address() as AddressInfo).port
+
+    const server = createServer({
+      config: baseConfig({
+        // Nonexistent CA path → unreadable.
+        clusterCa: join(caDir, 'missing.pem'),
+        // Point the "peer" at our local stub so any forward attempt is observable.
+        port: peerPort,
+      }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/nodes/127.0.0.1/v1/pools',
+      headers: { cookie: 'PVEAuthCookie=secret-ticket' },
+    })
+
+    assert.equal(res.statusCode, 502)
+    assert.equal(res.json().error.code, 'CLUSTER_CA_UNAVAILABLE')
+    // The load-bearing assertion: no forward was attempted at all.
+    assert.equal(connections, 0, 'the cookie must NOT be sent to any upstream when the CA is unavailable')
+
+    await server.close()
+    await new Promise<void>(resolve => peer.close(() => resolve()))
+  })
+
+  it('self-heals: a CA that is missing then present is picked up (no sticky-undefined cache)', async () => {
+    const caPath = join(caDir, 'appears.pem')
+    const config = baseConfig({ clusterCa: caPath, port: 9 })
+
+    // First request: CA absent → fail closed.
+    const s1 = createServer({ config, authProvider: new AcceptAuthProvider(), logger: false })
+    const r1 = await s1.inject({
+      method: 'GET',
+      url: '/api/nodes/127.0.0.1/v1/pools',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+    assert.equal(r1.json().error.code, 'CLUSTER_CA_UNAVAILABLE')
+    await s1.close()
+
+    // The CA appears (pmxcfs mounts /etc/pve).
+    writeFileSync(caPath, 'test-ca-bytes')
+
+    // Second request: the failed read was NOT cached, so it re-reads, gets past
+    // the gate, and now fails only because port 9 is unreachable → NODE_UNREACHABLE.
+    const s2 = createServer({ config, authProvider: new AcceptAuthProvider(), logger: false })
+    const r2 = await s2.inject({
+      method: 'GET',
+      url: '/api/nodes/127.0.0.1/v1/pools',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+    assert.equal(r2.json().error.code, 'NODE_UNREACHABLE')
+    await s2.close()
   })
 })
 

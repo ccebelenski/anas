@@ -229,7 +229,9 @@ function preferredKey(keys: ScannedKey[]): ScannedKey | null {
  * an unreachable host / empty scan.
  */
 export async function scanHostKeys(executor: CommandExecutor, host: string, port: number): Promise<ScannedKey[]> {
-  const r = await executor.exec(SSH_KEYSCAN, ['-p', String(port), host])
+  // `--` ends option parsing so a host that starts with `-` can never be read as
+  // an ssh-keyscan flag (defence in depth; the schema also rejects control chars).
+  const r = await executor.exec(SSH_KEYSCAN, ['-p', String(port), '--', host])
   if (!r.stdout.trim())
     return []
   return parseScan(r.stdout)
