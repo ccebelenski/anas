@@ -1199,20 +1199,59 @@
             return;
         }
         var win = null;
+        var GIB = 1073741824;
+        var spareAssigned = {};   // diskId -> 'spare' (single-slot bay)
+        var spareDrag = null;     // the shared drag-select controller
+        var topBoundary = 0;      // pool's top array boundary (bytes; 0 = unknown)
+        var diskById = {};
 
         function bodyEl() {
             var p = win ? win.down('#ahrSpareBody') : null;
             return (p && p.getEl()) ? p.getEl().dom : null;
         }
 
-        function submit() {
+        // Client-side §11 coverage HINT (the daemon re-checks authoritatively):
+        // usable = floor-to-GiB(raw) must reach the pool's top array boundary.
+        // Computed only when the boundary is known; else null → the API refusal
+        // (400) is the fallback. Conservative (never a false refusal): the
+        // boundary is summed from the arrays' data heights, so it never exceeds
+        // the daemon's true boundary.
+        function coverageShortfall(diskId) {
+            var d = diskById[diskId];
+            if (!d || !(topBoundary > 0)) {
+                return null;
+            }
+            var usable = Math.floor((Number(d.size) || 0) / GIB) * GIB;
+            if (usable >= topBoundary) {
+                return null;
+            }
+            var shortfall = topBoundary - usable;
+            return t('This disk cannot serve as a hot spare: it must cover every band '
+                + '(usable ≥ ') + fmtBytes(topBoundary) + t(', the pool\'s top array boundary) '
+                + 'but has ') + fmtBytes(usable) + t(' usable after rounding — ')
+                + fmtBytes(shortfall) + t(' short. A partial spare is refused (§11).');
+        }
+
+        function showRefusal(reason) {
             var root = bodyEl();
-            if (!root) {
+            var el = root ? root.querySelector('#ahrsp-refusal') : null;
+            if (!el) {
                 return;
             }
-            var diskId = checkedValues(root, 'ahrsp-disk')[0];
+            if (!reason) {
+                el.innerHTML = '';
+                return;
+            }
+            el.innerHTML = '<div style="font-size:12px;padding:8px 10px;border-radius:9px;'
+                + 'background:color-mix(in srgb,var(--anas-danger) 14%,transparent);'
+                + 'color:var(--anas-danger);display:flex;gap:7px;align-items:flex-start">'
+                + '<span>⛔</span><span>' + enc(reason) + '</span></div>';
+        }
+
+        function submit() {
+            var diskId = spareDrag ? spareDrag.selectedInBay('spare')[0] : null;
             if (!diskId) {
-                Ext.Msg.alert(t('Add hot spare'), t('Select the disk to attach as a spare.'));
+                Ext.Msg.alert(t('Add hot spare'), t('Drag the disk to attach onto the spare bay.'));
                 return;
             }
             ANAS.confirmAndRun({
@@ -1232,6 +1271,16 @@
                         win.close();
                     }
                     loadPools(grid, node);
+                },
+                // A validation refusal (e.g. a too-small spare the client hint
+                // didn't catch) surfaces the daemon's exact reason via the fail
+                // alert; bounce the staged disk back so another can be tried.
+                onFailed: function () {
+                    var k;
+                    for (k in spareAssigned) {
+                        if (spareAssigned.hasOwnProperty(k)) { delete spareAssigned[k]; }
+                    }
+                    if (spareDrag) { spareDrag.render(); }
                 },
                 onComplete: function () {
                     loadPools(grid, node);
@@ -1278,31 +1327,97 @@
         } catch (eL) {
             // non-fatal
         }
+        // Render the tray + single spare bay and mount the drag controller.
+        function renderSpareForm(avail) {
+            var p = win ? win.down('#ahrSpareBody') : null;
+            if (!p) {
+                return;
+            }
+            p.setHtml('<div style="padding:12px;font-size:12.5px;color:var(--anas-ink)">'
+                + '<div style="color:var(--anas-muted);font-size:11.5px;margin:0 0 8px">'
+                + enc(t('Drag a disk onto the spare bay. A hot spare must cover EVERY band: '
+                    + 'its usable size must reach the pool\'s top array boundary — a smaller disk '
+                    + 'is refused at the drop with the exact shortfall. The disk is wiped and '
+                    + 'sliced with the full band geometry; from then on md rebuilds onto it the '
+                    + 'moment any member fails, with no operator in the loop.'))
+                + '</div>'
+                + '<div style="display:flex;gap:12px;align-items:stretch;flex-wrap:wrap">'
+                + '<div style="flex:1 1 240px;min-width:0">'
+                + '<div style="' + SEC + ';margin:0 0 4px">' + enc(t('Available')) + '</div>'
+                + '<div data-anas-zone="tray" style="display:flex;flex-direction:column;min-height:74px;'
+                + 'border:1px solid var(--anas-card-edge);border-radius:11px;padding:4px;'
+                + 'background:var(--anas-panel)"></div></div>'
+                + '<div style="flex:1 1 240px;min-width:0">'
+                + '<div style="' + SEC + ';margin:0 0 4px">' + enc(t('Spare bay')) + '</div>'
+                + '<div class="anas-gfx-bay anas-grid-ahrsp-bay" data-anas-zone="bay:spare"'
+                + ' style="display:flex;flex-wrap:wrap;gap:8px;min-height:74px;border-radius:11px;'
+                + 'padding:10px;background:var(--anas-bay);box-shadow:inset 0 2px 6px rgba(0,0,0,.16)">'
+                + '</div></div></div>'
+                + '<div id="ahrsp-refusal" style="margin-top:10px"></div></div>');
+            var root = bodyEl();
+            if (!root) {
+                return;
+            }
+            if (ANAS.ahrComposer && typeof ANAS.ahrComposer.makeDragSelect === 'function') {
+                spareDrag = ANAS.ahrComposer.makeDragSelect({
+                    root: root,
+                    disks: avail,
+                    assigned: spareAssigned,
+                    bays: [{ id: 'spare', single: true }],
+                    cardClass: 'anas-ahrsp-disk',
+                    removeClass: 'anas-ahrsp-unassign',
+                    removeAttr: 'data-ahrsp-unassign',
+                    bayEmpty: function () {
+                        return '<div style="flex:1;min-width:140px;color:var(--anas-muted);font-size:12px;'
+                            + 'text-align:center;padding:14px 8px">' + enc(t('Drag one disk here')) + '</div>';
+                    },
+                    // §11 coverage: too-small spare refused AT THE DROP.
+                    blockDrop: function (diskId) { return coverageShortfall(diskId); },
+                    onRefuse: function (reason) { showRefusal(reason); },
+                    // A valid drop clears any prior refusal note.
+                    onChange: function () { showRefusal(null); },
+                });
+                spareDrag.render();
+            }
+        }
+
+        // Load the available disks AND the pool's arrays (the top boundary lets
+        // the client refuse a too-small spare at the drop; if it can't be had,
+        // the API 400 is the fallback).
         ANAS.api.get(node, '/disks').then(function (res) {
             if (!win || win.destroyed || win.destroying) {
                 return;
             }
-            win.setLoading(false);
             var all = (res && res.data) || [];
             var avail = [];
             for (var i = 0; i < all.length; i++) {
                 if (all[i].status === 'available') {
                     avail.push(all[i]);
+                    diskById[all[i].id] = all[i];
                 }
             }
-            var p = win.down('#ahrSpareBody');
-            if (p) {
-                p.setHtml('<div style="padding:12px;font-size:12.5px;color:var(--anas-ink)">'
-                    + '<div style="' + SEC + ';margin-top:2px">' + enc(t('Disk to attach')) + '</div>'
-                    + diskChecklistHtml(avail, 'ahrsp-disk', 'radio')
-                    + '<div style="color:var(--anas-muted);font-size:11.5px;margin-top:10px">'
-                    + enc(t('A hot spare must cover EVERY band: its usable size must reach the '
-                        + 'top array boundary of the pool — a smaller disk is refused with the '
-                        + 'exact shortfall. The disk is wiped and sliced with the full band '
-                        + 'geometry; from then on md rebuilds onto it automatically the moment '
-                        + 'any member fails, with no operator in the loop.'))
-                    + '</div></div>');
-            }
+            ANAS.api.get(node, '/ahr/' + encodeURIComponent(pool)).then(function (res2) {
+                if (!win || win.destroyed || win.destroying) {
+                    return;
+                }
+                win.setLoading(false);
+                var d = (res2 && res2.data) || {};
+                var arrays = d.arrays || [];
+                var sum = 0;
+                for (var j = 0; j < arrays.length; j++) {
+                    sum += Number(arrays[j].heightBytes) || 0;
+                }
+                topBoundary = sum;
+                renderSpareForm(avail);
+            }, function () {
+                if (!win || win.destroyed || win.destroying) {
+                    return;
+                }
+                // No pool detail → no client hint; the API 400 is the fallback.
+                win.setLoading(false);
+                topBoundary = 0;
+                renderSpareForm(avail);
+            });
         }, function (err) {
             if (!win || win.destroyed || win.destroying) {
                 return;
@@ -1581,6 +1696,8 @@
         var planBody = null;
         var formAvail = [];
         var formMembers = [];
+        var addAssigned = {};   // diskId -> 'pool' for the drag add-bay
+        var addDrag = null;     // the shared drag-select controller (add step)
 
         function bodyEl() {
             var p = win ? win.down('#ahrExpandBody') : null;
@@ -1590,15 +1707,31 @@
         function renderForm(avail, members) {
             formAvail = avail || [];
             formMembers = members || [];
+            addAssigned = {};
             var html = '<div style="padding:12px;font-size:12.5px;color:var(--anas-ink)">'
                 + '<div style="margin-bottom:8px">'
                 + '<label style="margin-right:16px"><input type="radio" name="ahrx-mode" value="add" checked> '
                 + enc(t('Add disks')) + '</label>'
                 + '<label><input type="radio" name="ahrx-mode" value="replace"> '
                 + enc(t('Replace a disk (larger)')) + '</label></div>'
+                // Add-disks step: the same drag idiom as the create composer —
+                // drag cards from Available into the add bay (§6.1 / 11.14).
                 + '<div id="ahrx-add">'
-                + '<div style="' + SEC + ';margin-top:2px">' + enc(t('Disks to add')) + '</div>'
-                + diskChecklistHtml(avail, 'ahrx-adddisk', 'checkbox') + '</div>'
+                + '<div style="color:var(--anas-muted);font-size:11.5px;margin:2px 0 8px">'
+                + enc(t('Drag disks into the add bay. Each added disk is WIPED. '
+                    + 'Drop a card back to Available to remove it.')) + '</div>'
+                + '<div style="display:flex;gap:12px;align-items:stretch;flex-wrap:wrap">'
+                + '<div style="flex:1 1 240px;min-width:0">'
+                + '<div style="' + SEC + ';margin:0 0 4px">' + enc(t('Available')) + '</div>'
+                + '<div data-anas-zone="tray" style="display:flex;flex-direction:column;min-height:74px;'
+                + 'border:1px solid var(--anas-card-edge);border-radius:11px;padding:4px;'
+                + 'background:var(--anas-panel)"></div></div>'
+                + '<div style="flex:1 1 240px;min-width:0">'
+                + '<div style="' + SEC + ';margin:0 0 4px">' + enc(t('Disks to add')) + '</div>'
+                + '<div class="anas-gfx-bay anas-grid-ahrx-bay" data-anas-zone="bay:pool"'
+                + ' style="display:flex;flex-wrap:wrap;gap:8px;min-height:74px;border-radius:11px;'
+                + 'padding:10px;background:var(--anas-bay);box-shadow:inset 0 2px 6px rgba(0,0,0,.16)">'
+                + '</div></div></div></div>'
                 + '<div id="ahrx-replace" style="display:none">'
                 + '<div style="' + SEC + ';margin-top:2px">' + enc(t('Member to replace')) + '</div>'
                 + diskChecklistHtml(members, 'ahrx-old', 'radio')
@@ -1613,6 +1746,23 @@
             var root = bodyEl();
             if (!root) {
                 return;
+            }
+            // Mount the add-disks drag tray/bay (shared controller, 11.14).
+            if (ANAS.ahrComposer && typeof ANAS.ahrComposer.makeDragSelect === 'function') {
+                addDrag = ANAS.ahrComposer.makeDragSelect({
+                    root: root,
+                    disks: avail,
+                    assigned: addAssigned,
+                    bays: [{ id: 'pool' }],
+                    cardClass: 'anas-ahrx-disk',
+                    removeClass: 'anas-ahrx-unassign',
+                    removeAttr: 'data-ahrx-unassign',
+                    bayEmpty: function () {
+                        return '<div style="flex:1;min-width:140px;color:var(--anas-muted);font-size:12px;'
+                            + 'text-align:center;padding:14px 8px">' + enc(t('Drag disks here')) + '</div>';
+                    },
+                });
+                addDrag.render();
             }
             var radios = root.querySelectorAll('input[name="ahrx-mode"]');
             for (var i = 0; i < radios.length; i++) {
@@ -1631,9 +1781,9 @@
             }
             var mode = (checkedValues(root, 'ahrx-mode')[0]) || 'add';
             if (mode === 'add') {
-                var add = checkedValues(root, 'ahrx-adddisk');
+                var add = addDrag ? addDrag.selectedInBay('pool') : [];
                 if (!add.length) {
-                    Ext.Msg.alert(t('Expand'), t('Select at least one disk to add.'));
+                    Ext.Msg.alert(t('Expand'), t('Drag at least one disk into the add bay.'));
                     return null;
                 }
                 return { addDisks: add };

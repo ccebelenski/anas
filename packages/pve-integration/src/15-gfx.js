@@ -1130,6 +1130,98 @@
         }
     };
 
+    // diskKindOf(disk) → 'hdd' | 'ssd' | 'nvme' from an inventory Disk record
+    // (rotational → hdd; else transport 'nvme' → nvme; else ssd). The single
+    // shared mapping so the ZFS and AHR composers classify disks identically.
+    function diskKindOf(d) {
+        d = d || {};
+        if (d.rotational === true) { return 'hdd'; }
+        var tr = ('' + (d.transport || '')).toLowerCase();
+        return tr === 'nvme' ? 'nvme' : 'ssd';
+    }
+    gfx.diskKindOf = diskKindOf;
+
+    // The kind badge used on a draggable disk card (filled pill: HDD/SSD/NVMe).
+    // Kept private-but-shared so both composers render the same swatch.
+    function dragKindBadge(kind) {
+        var colors = { hdd: 'var(--anas-series-5)', ssd: 'var(--anas-series-2)', nvme: 'var(--anas-series-3)' };
+        var label = kindLabel(kind);
+        return '<span style="font-size:10px;font-weight:800;letter-spacing:.3px;'
+            + 'padding:1px 6px;border-radius:999px;color:#fff;background:'
+            + colors[kind] + '">' + enc(label) + '</span>';
+    }
+
+    function dragFmtBytes(n) {
+        try {
+            return ANAS.formatBytes(n);
+        } catch (e) {
+            return '' + n;
+        }
+    }
+
+    // dragDisk(opts) → the shared DRAGGABLE disk card: a skeuomorphic disk object,
+    // a kind badge + size (+ optional model), and an optional remove control. It
+    // carries the CONVENTION class .anas-gfx-disk + a `data-id` so ANAS.gfx.drag
+    // can lift it onto a `[data-anas-zone]` bay. This is the single card used by
+    // BOTH the ZFS pool composer (38) and the AHR composer (39) so a disk you drag
+    // looks and behaves identically in either builder.
+    //   opts:
+    //     id, kind, size, model    disk data (kind from gfx.diskKindOf)
+    //     removable                show the ✕ remove control (default false)
+    //     cardClass                extra class on the card div (e.g. the
+    //                              composer's own hook class)
+    //     removeClass, removeAttr  class + data-attribute name on the ✕ button
+    //     removeTitle              already-translated tooltip for ✕
+    //     wrapId                   true → full id, wrapped, NEVER truncated;
+    //                              false (default) → single line, CSS-ellipsed
+    //                              (the full id is always in the card's title)
+    //     iconScale                disk icon scale (default 0.62)
+    // The div-level title always carries the FULL, clean by-id.
+    gfx.dragDisk = function (opts) {
+        try {
+            ensureInjected();
+            opts = opts || {};
+            var kind = (opts.kind === 'ssd' || opts.kind === 'nvme') ? opts.kind : 'hdd';
+            var id = opts.id == null ? '' : opts.id;
+            var scale = (typeof opts.iconScale === 'number' && opts.iconScale > 0) ? opts.iconScale : 0.62;
+            var icon = gfx.icon(kind, { scale: scale });
+            var model = opts.model || '';
+            var desc = dragKindBadge(kind) + ' ' + enc(dragFmtBytes(opts.size))
+                + (model ? ' · ' + enc(model) : '');
+            var extraCls = opts.cardClass ? ' ' + opts.cardClass : '';
+            var remove = '';
+            if (opts.removable) {
+                var rCls = opts.removeClass || 'anas-gfx-disk-remove';
+                var rAttr = opts.removeAttr || 'data-remove';
+                var rTitle = opts.removeTitle || 'Remove';
+                remove = '<button type="button" class="' + rCls + '" ' + rAttr + '="' + enc(id) + '"'
+                    + ' title="' + enc(rTitle) + '" aria-label="' + enc(rTitle) + '"'
+                    + ' style="margin-left:auto;border:0;background:transparent;color:var(--anas-muted);'
+                    + 'cursor:pointer;font-size:14px;line-height:1;padding:0 2px">✕</button>';
+            }
+            var idStyle = opts.wrapId
+                ? 'display:block;font-weight:650;font-size:12px;color:var(--anas-ink);overflow-wrap:anywhere'
+                : 'display:block;font-weight:650;font-size:12px;color:var(--anas-ink);'
+                    + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+            return '<div class="anas-gfx-disk' + extraCls + '" data-id="' + enc(id) + '"'
+                + ' data-size="' + enc(String(opts.size == null ? '' : opts.size)) + '"'
+                + ' title="' + enc(id) + '"'
+                + ' style="width:216px;display:inline-flex;align-items:center;gap:9px;padding:7px 9px;'
+                + 'margin:4px;border-radius:11px;cursor:grab;touch-action:none;box-sizing:border-box;'
+                + 'background:linear-gradient(var(--anas-card-top),var(--anas-card-bot));'
+                + 'border:1px solid var(--anas-card-edge);'
+                + 'box-shadow:var(--anas-shadow),inset 0 1px 0 var(--anas-card-hi)">'
+                + icon
+                + '<span style="min-width:0;line-height:1.25;flex:1">'
+                + '<span style="' + idStyle + '">' + enc(id) + '</span>'
+                + '<span style="display:block;font-size:11px;color:var(--anas-muted)">' + desc + '</span>'
+                + '</span>' + remove + '</div>';
+        } catch (e) {
+            warn('dragDisk failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
     // ======================================================================
     // DRAG — dependency-free pointer-events drag + dropzone helper.
     // ======================================================================

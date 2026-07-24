@@ -194,7 +194,12 @@
 
     // ---- disk kind mapping -------------------------------------------------
 
+    // Shared disk-kind mapping (ANAS.gfx.diskKindOf) — the advisor consumes it
+    // too, so keep a thin local alias with a fail-safe fallback.
     function diskKind(d) {
+        if (ANAS.gfx && typeof ANAS.gfx.diskKindOf === 'function') {
+            return ANAS.gfx.diskKindOf(d);
+        }
         if (d.rotational === true) {
             return 'hdd';
         }
@@ -203,14 +208,6 @@
             return 'nvme';
         }
         return 'ssd';
-    }
-    function kindBadge(kind) {
-        var colors = { hdd: 'var(--anas-series-5)', ssd: 'var(--anas-series-2)', nvme: 'var(--anas-series-3)' };
-        var label = ANAS.gfx && ANAS.gfx.kindLabel ? ANAS.gfx.kindLabel(kind)
-            : (kind === 'nvme' ? 'NVMe' : kind === 'ssd' ? 'SSD' : 'HDD');
-        return '<span style="font-size:10px;font-weight:800;letter-spacing:.3px;'
-            + 'padding:1px 6px;border-radius:999px;color:#fff;background:'
-            + colors[kind] + '">' + enc(label) + '</span>';
     }
 
     // ======================================================================
@@ -491,31 +488,18 @@
     // data-id). The title carries the FULL, clean by-id (no trailing ellipsis) —
     // the visible id is truncated with CSS, the tooltip is complete.
     function diskCardHtml(d, removable) {
-        var kind = diskKind(d);
-        var icon = ANAS.gfx.icon(kind, { scale: 0.62 });
-        var model = d.model || d.modelFamily || '';
-        var desc = kindBadge(kind) + ' ' + enc(fmtBytes(d.size))
-            + (model ? ' · ' + enc(model) : '');
-        var remove = removable
-            ? '<button type="button" class="anas-composer-unassign" data-unassign="' + enc(d.id) + '"'
-                + ' title="' + enc(t('Remove disk')) + '" aria-label="' + enc(t('Remove disk')) + '"'
-                + ' style="margin-left:auto;border:0;background:transparent;color:var(--anas-muted);'
-                + 'cursor:pointer;font-size:14px;line-height:1;padding:0 2px">✕</button>'
-            : '';
-        return '<div class="anas-gfx-disk anas-composer-disk" data-id="' + enc(d.id) + '"'
-            + ' data-size="' + enc(String(d.size == null ? '' : d.size)) + '"'
-            + ' title="' + enc(d.id) + '"'
-            + ' style="width:216px;display:inline-flex;align-items:center;gap:9px;padding:7px 9px;'
-            + 'margin:4px;border-radius:11px;cursor:grab;touch-action:none;box-sizing:border-box;'
-            + 'background:linear-gradient(var(--anas-card-top),var(--anas-card-bot));'
-            + 'border:1px solid var(--anas-card-edge);'
-            + 'box-shadow:var(--anas-shadow),inset 0 1px 0 var(--anas-card-hi)">'
-            + icon
-            + '<span style="min-width:0;line-height:1.25;flex:1">'
-            + '<span style="display:block;font-weight:650;font-size:12px;color:var(--anas-ink);'
-            + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + enc(d.id) + '</span>'
-            + '<span style="display:block;font-size:11px;color:var(--anas-muted)">' + desc + '</span>'
-            + '</span>' + remove + '</div>';
+        return ANAS.gfx.dragDisk({
+            id: d.id,
+            kind: diskKind(d),
+            size: d.size,
+            model: d.model || d.modelFamily || '',
+            removable: removable,
+            cardClass: 'anas-composer-disk',
+            removeClass: 'anas-composer-unassign',
+            removeAttr: 'data-unassign',
+            removeTitle: t('Remove disk'),
+            wrapId: false,
+        });
     }
 
     // A read-only leaf disk (expand mode existing topology): no drag, shows state.
