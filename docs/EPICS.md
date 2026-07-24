@@ -529,8 +529,8 @@ Stories marked *(V2?)* are explicitly deferred.
 ## V2 Backlog
 
 > **V2 priorities (operator call, 2026-07-18): homelab first.**
-> 1. **Epic 16 (PBS file backup) COMPLETE 2026-07-19** — designed from the operator's real scripts and live-proven against a disposable PBS, all in one arc. **Epic 18 (Mounts) COMPLETE 2026-07-18** — remote shares live-proven same-day; 18.4/18.6/18.7 descoped (NAS layer, not a Linux-mount manager). Next up: **Epic 11 + SHR** (the headline) and **Epic 17** (schedules).
-> 2. **Epic 11 + SHR** — promoted to the V2 headline: a Synology alternative. Mixed-drive-size arrays with **online expansion** matter precisely because disks are expensive — grow-as-you-buy beats forklift upgrades, and it's the thing neither ZFS nor PVE offers.
+> 1. **Epic 16 (PBS file backup) COMPLETE 2026-07-19** — designed from the operator's real scripts and live-proven against a disposable PBS, all in one arc. **Epic 18 (Mounts) COMPLETE 2026-07-18** — remote shares live-proven same-day; 18.4/18.6/18.7 descoped (NAS layer, not a Linux-mount manager). Next up: **Epic 11 + AHR** (the headline) and **Epic 17** (schedules).
+> 2. **Epic 11 + AHR** — promoted to the V2 headline: a Synology alternative. Mixed-drive-size arrays with **online expansion** matter precisely because disks are expensive — grow-as-you-buy beats forklift upgrades, and it's the thing neither ZFS nor PVE offers.
 > 3. **Epic 17** (scheduled snapshots & scrubs) — inked as its own epic 2026-07-18 (it needs a new screen); TrueNAS-parity table stakes, cheap relative to value — the replication timer/task-store machinery is the template.
 > 4. **12.1** (version-skew checks) — the one Epic 12 survivor; rides early ("easy now" post-10.10, and upgrade pain compounds as versions accumulate).
 > 5. **Epic 14 + NFSv4 ACLs (4.7.1)** — deferred as enterprise features; revisit when demand appears.
@@ -539,24 +539,24 @@ Stories marked *(V2?)* are explicitly deferred.
 
 > As a user, I can create and manage Linux software RAID arrays with md for environments where ZFS isn't appropriate.
 
-> **Priority: promoted 2026-07-18 (operator call) — Epic 11 + SHR are the V2 headline.** The draw is the Synology-alternative story: SHR-style mixed-size arrays and, above all, **expanding an existing array** — huge when disk prices make buy-all-drives-up-front painful. Epic 11's md basics are the prerequisite layer for SHR.
+> **Priority: promoted 2026-07-18 (operator call) — Epic 11 + AHR are the V2 headline.** The draw is the Synology-alternative story: SHR-style mixed-size arrays and, above all, **expanding an existing array** — huge when disk prices make buy-all-drives-up-front painful. Epic 11's md basics are the prerequisite layer for SHR.
 
 md provides RAID without ZFS's memory overhead, using standard Linux filesystems (ext4, xfs). This involves managing multiple layers: mdadm arrays, filesystem creation/formatting, mount points, and /etc/fstab. The share management side (SMB, NFS) is reusable — a path is a path. The storage management UI needs parallel workflows for md vs ZFS.
 
 Detailed stories to be written when this epic is prioritized.
 
-#### SHR-style hybrid RAID (V2 headline — promoted from "far future" 2026-07-18)
+#### AHR — ANAS Hybrid RAID (SHR-style; V2 headline — promoted from "far future" 2026-07-18)
 
 > As a user, I want Synology-SHR-style mixed-drive-size pooling with redundancy and online growth, so I can use drives of different sizes efficiently and expand incrementally — the thing ZFS fundamentally can't do (raidz is fixed-width to the smallest disk).
 
-The stack (bottom→top): **partition each disk into size-matched regions → one mdadm array per region (RAID5=SHR-1 / RAID6=SHR-2; redundancy lives HERE) → LVM concatenates the arrays into one logical volume → btrfs (or ext4) as the filesystem.** Critical design fact: redundancy is md's job; **btrfs is only the filesystem, NEVER btrfs-RAID5/6** (unstable) — btrfs runs on a single already-redundant LVM volume.
+**Design: docs/AHR-DESIGN.md** (reviewed w/ operator 2026-07-22: named **AHR** — can't ship the "S"; btrfs-only (ext4 = Synology vestige, dropped); tier conversion excluded; incremental expansion planner added (fresh-create banding ≠ expansion — existing bands are constraints); `mdadm --replace` for live-disk replace; backup-file-free reshapes mandated; resume = recompute-and-continue with only the approved-disk-set intent persisted. Next gate: stunt-node ground truth). The stack (bottom→top): **partition each disk into size-matched regions → one mdadm array per region (RAID5=AHR-1 / RAID6=AHR-2; redundancy lives HERE) → LVM concatenates the arrays into one logical volume → btrfs as the filesystem.** Critical design fact: redundancy is md's job; **btrfs is only the filesystem, NEVER btrfs-RAID5/6** (unstable) — btrfs runs on a single already-redundant LVM volume.
 
 The differentiated work (per Don't-Build-Undifferentiated: we wrap mdadm/LVM/btrfs, we build the orchestration no open tool provides):
-1. **Layout algorithm** — optimal region partitioning for arbitrary drive sizes, respecting SHR-1/SHR-2 minimum-overlap-per-region.
+1. **Layout algorithms** — fresh-create region partitioning for arbitrary drive sizes, plus the incremental expansion planner (existing bands are immutable constraints), respecting AHR-1/AHR-2 minimum-overlap-per-region.
 2. **Online growth (the hard/dangerous part)** — add/replace-with-bigger drive → re-partition + `mdadm --grow` + `pvresize`/`lvextend` + `btrfs resize`, as a long-running, RESUMABLE, multi-layer job where each layer can fail independently.
 3. Degraded/recovery handling across all three layers.
 
-Real prosumer draw (mismatched-drive efficiency), but big and data-integrity-sensitive. Builds on the md basics above; PVE offers nothing comparable. *(Promoted 2026-07-18: this is the V2 headline — the Synology-alternative feature, with online expansion as the killer capability given current disk prices. Still sequenced after Epic 16 and behind Epic 11's md basics.)*
+Real prosumer draw (mismatched-drive efficiency), but big and data-integrity-sensitive. Builds on the md basics above; PVE offers nothing comparable. *(Kickoff plan, 2026-07-20: SHR IS the headline — the md layer is an internal build stage of it, not a separate release (pure mdadm is uninteresting; end users would just use ZFS). Ground truth = BUILD the stack ourselves on the stunt node with mismatched-size virtual disks (SHR is orchestration over an open mdadm→LVM→btrfs stack, nothing proprietary), then drive a real expansion — including failure/resume paths — on throwaway data, watching /proc/mdstat + pvs/lvs + btrfs resize. (NOT a Synology: the operator's is pro-level HW without SHR, and non-disruptable — and unneeded: SHR's orchestration is proprietary but the layout is fully public. Ref: the OpenMediaVault "HowTo build an SHR – Sliced Hybrid Raid" thread builds the exact stack on plain Linux; slices sized to the NEXT-smallest disk, mdadm per slice-group, leftover regions → extra arrays, LVM concat, btrfs/ext4 on top, RAID always in md never btrfs-native.) Release discipline is the complexity guard; build long, gate hard, ship only when whole.)* *(Promoted 2026-07-18: this is the V2 headline — the Synology-alternative feature, with online expansion as the killer capability given current disk prices. Still sequenced after Epic 16 and behind Epic 11's md basics.)*
 
 ### Epic 12: Multi-Node / Cluster Management
 
