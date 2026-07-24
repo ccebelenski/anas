@@ -75,8 +75,8 @@ function baseExecutor(): MockExecutor {
 describe('scrubAhrPool (Epic 11 + AHR)', () => {
   it('runs btrfs scrub to completion, THEN per-array checks sequentially; clean → silent', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/sbin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
-    executor.addFixture({ command: '/usr/sbin/btrfs', args: ['scrub', 'status', MOUNTPOINT], results: [
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], results: [
       { stdout: scrubStatus('running', { percent: '42.50' }), stderr: '', exitCode: 0 },
       { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 },
     ] })
@@ -94,10 +94,10 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
     const calls = executor.calls
     const idx = (pred: (c: { command: string, args: string[] }) => boolean) => calls.findIndex(pred)
-    const scrubStart = idx(c => c.command === '/usr/sbin/btrfs' && c.args[1] === 'start')
+    const scrubStart = idx(c => c.command === '/usr/bin/btrfs' && c.args[1] === 'start')
     let lastStatus = -1
     for (const [i, c] of calls.entries()) {
-      if (c.command === '/usr/sbin/btrfs' && c.args[1] === 'status')
+      if (c.command === '/usr/bin/btrfs' && c.args[1] === 'status')
         lastStatus = i
     }
     const checkR1 = idx(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check' && c.args[1] === '/dev/md/t2-r1')
@@ -118,8 +118,8 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
   it('btrfs findings → PVE warning notification', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/sbin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
-    executor.addFixture({ command: '/usr/sbin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=2' }), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished', { summary: 'csum=2' }), stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 } })
 
     const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 })
@@ -134,7 +134,7 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
 
   it('aborted btrfs scrub fails the job', async () => {
     const executor = baseExecutor()
-    executor.addFixture({ command: '/usr/sbin/btrfs', result: { stdout: scrubStatus('aborted'), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: scrubStatus('aborted'), stderr: '', exitCode: 0 } })
     await assert.rejects(scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 }), /aborted/)
   })
 

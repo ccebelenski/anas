@@ -249,7 +249,7 @@ function mutatingCalls(executor: MockExecutor): { command: string, args: string[
   return executor.calls.filter((c) => {
     if (c.command === MDADM)
       return c.args[0] !== '--detail'
-    if (c.command === '/usr/sbin/btrfs')
+    if (c.command === '/usr/bin/btrfs')
       return c.args.includes('resize')
     return [SGDISK, '/usr/sbin/pvcreate', '/usr/sbin/pvresize', '/usr/sbin/vgextend', '/usr/sbin/lvextend', '/usr/sbin/update-initramfs'].includes(c.command)
   })
@@ -581,8 +581,8 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
         executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: vgsJson(0), stderr: '', exitCode: 0 } })
         executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: lvsJson(5 * GIB), stderr: '', exitCode: 0 } })
         executor.addFixture({ command: '/usr/bin/findmnt', result: { stdout: JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }] }), stderr: '', exitCode: 0 } })
-        executor.addFixture({ command: '/usr/sbin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: usage(deviceSize), stderr: '', exitCode: 0 } })
-        executor.addFixture({ command: '/usr/sbin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+        executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: usage(deviceSize), stderr: '', exitCode: 0 } })
+        executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
         return executor
       }
       // Already at LV size → skip.
@@ -594,7 +594,7 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
       executor = withTail(3 * GIB)
       outcome = await run(executor, mkPlan([B1, B2], [{ kind: 'fs-grow', target: 'tank-vol' }]), [X, Y, Z])
       assert.equal(outcome.ok, true, outcome.error)
-      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/sbin/btrfs', 'filesystem', 'resize', 'max', '/mnt/anas-ahr/tank']])
+      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/bin/btrfs', 'filesystem', 'resize', 'max', '/mnt/anas-ahr/tank']])
     })
   })
 

@@ -76,6 +76,10 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       args: ['--detail', '--export', '/dev/md/t2-r1'],
       result: { stdout: `MD_NAME=t2-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 },
     })
+    // Ghost-clearing pass: partitions resolve to kernel names with no md holders.
+    executor.addFixture({ command: '/usr/bin/realpath', args: [`/dev/disk/by-id/${SMALL}-part1`], result: { stdout: '/dev/sdx1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', args: [`/dev/disk/by-id/${BIG}-part1`], result: { stdout: '/dev/sdy1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/ls', result: { stdout: '', stderr: '', exitCode: 0 } })
 
     const result = await createAhrPool(
       executor,
@@ -97,6 +101,16 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${BIG}`] },
       // BIG's slice ends below its usable size → exact +size (2048M − 1M start).
       { command: '/usr/sbin/sgdisk', args: ['-n', '1:1M:+2047M', '-t', '1:FD00', '-c', '1:t2-d2-b1', `/dev/disk/by-id/${BIG}`] },
+      { command: '/usr/bin/udevadm', args: ['settle'] },
+      // Ghost-clearing (11.8 live-proof catch): old superblocks INSIDE the new
+      // partitions can be resurrected by udev incremental assembly — resolve
+      // each partition, check holders, wipe partition signatures, resettle.
+      { command: '/usr/bin/realpath', args: [`/dev/disk/by-id/${SMALL}-part1`] },
+      { command: '/usr/bin/ls', args: ['/sys/class/block/sdx1/holders'] },
+      { command: '/usr/sbin/wipefs', args: ['-a', `/dev/disk/by-id/${SMALL}-part1`] },
+      { command: '/usr/bin/realpath', args: [`/dev/disk/by-id/${BIG}-part1`] },
+      { command: '/usr/bin/ls', args: ['/sys/class/block/sdy1/holders'] },
+      { command: '/usr/sbin/wipefs', args: ['-a', `/dev/disk/by-id/${BIG}-part1`] },
       { command: '/usr/bin/udevadm', args: ['settle'] },
       // One array, explicit data offset (4 MiB = 8192 sectors for a <512 GiB member).
       { command: '/usr/sbin/mdadm', args: [

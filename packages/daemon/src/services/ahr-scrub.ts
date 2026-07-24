@@ -22,7 +22,7 @@ import { pveNotify } from './pve-notify.js'
  * healthy/idle shows nothing (dashboard policy §7.3).
  */
 
-const BTRFS = '/usr/sbin/btrfs'
+const BTRFS = '/usr/bin/btrfs'
 const MDADM = '/usr/sbin/mdadm'
 const CAT = '/usr/bin/cat'
 const REALPATH = '/usr/bin/realpath'

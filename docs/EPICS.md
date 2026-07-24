@@ -549,10 +549,10 @@ md provides RAID without ZFS's memory overhead, using standard Linux filesystems
 11.2. [done 2026-07-22] As a dev, I want the pure-computation layer: shared Zod schemas + the fresh-create banding and incremental expansion planners, exhaustively tested. *(packages/shared schemas/ahr.ts, daemon services/ahr-layout.ts.)*
 11.3. [done 2026-07-23] As a dev, I want the read layer built on captured ground truth: mdstat/mdadm/LVM/btrfs parsers with real fixtures, partition geometry, the live topology reader, and GET /v1/ahr + layout preview. *(GT-13 formats; everything keyed by-id/UUID.)*
 11.4. [done 2026-07-23] As a user, I want md events and AHR job milestones delivered through PVE's notification system with zero polling. *(mdadm.conf PROGRAM hook + PVE::Notify templates, GT-11/GT-17; installer ships mdadm/btrfs-progs per GT-1.)*
-11.5. [in build 2026-07-23] As a user, I can create, scrub, and destroy an AHR pool through the API/UI with confirm-gated safety listing every disk wiped.
-11.6. [in build 2026-07-23] As a user, I can expand a pool (add/replace disks) as a resumable multi-layer job — plan preview, degraded-refusal, halt/resume/abandon, the GT-8 boot recovery ladder — with the pool online throughout.
-11.7. [in build 2026-07-23] As a user, I get the AHR UI: Hybrid RAID menu, banded create composer with live layout preview, layered pool detail, expansion wizard with before→after and pending-capacity truth.
-11.8. As a dev, I want the whole arc live-proven end-to-end on the stunt node through the real API (create → expand → replace → destroy on throwaway data) before any release gate.
+11.5. [done 2026-07-23 — live-proven 11.8] As a user, I can create, scrub, and destroy an AHR pool through the API/UI with confirm-gated safety listing every disk wiped.
+11.6. [done 2026-07-23 — live-proven 11.8] As a user, I can expand a pool (add/replace disks) as a resumable multi-layer job — plan preview, degraded-refusal, halt/resume/abandon, the GT-8 boot recovery ladder — with the pool online throughout.
+11.7. [done 2026-07-23 — deployed to stunt node; operator visual review pending] As a user, I get the AHR UI: Hybrid RAID menu, banded create composer with live layout preview, layered pool detail, expansion wizard with before→after and pending-capacity truth.
+11.8. [done 2026-07-23 — full lifecycle through the real API on the stunt node: adopted the hand-built pool, destroyed it, created tank (RAID5×3+RAID1×2), expanded with live RAID1→RAID5 convert, replaced a disk live, scrubbed; canary data intact; pins/hook/intent verified; 2 live-proof catches fixed at source (btrfs path, ghost-superblock resurrection)] As a dev, I want the whole arc live-proven end-to-end on the stunt node through the real API (create → expand → replace → destroy on throwaway data) before any release gate.
 
 #### AHR — ANAS Hybrid RAID (SHR-style; V2 headline — promoted from "far future" 2026-07-18)
 

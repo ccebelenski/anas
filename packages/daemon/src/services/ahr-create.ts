@@ -38,6 +38,8 @@ const WIPEFS = '/usr/sbin/wipefs'
 const SGDISK = '/usr/sbin/sgdisk'
 const MDADM = '/usr/sbin/mdadm'
 const UDEVADM = '/usr/bin/udevadm'
+const REALPATH = '/usr/bin/realpath'
+const LS = '/usr/bin/ls'
 const PVCREATE = '/usr/sbin/pvcreate'
 const VGCREATE = '/usr/sbin/vgcreate'
 const LVCREATE = '/usr/sbin/lvcreate'
@@ -168,6 +170,28 @@ export async function createAhrPool(
     })
   }
   updateProgress('Settling udev (partition device nodes)')
+  await run(executor, UDEVADM, ['settle'])
+
+  // --- Clear ghost md state on the fresh partitions (11.8 live-proof catch) ---
+  // Old md superblocks live INSIDE partitions (metadata 1.2, 4 KiB in) — the
+  // whole-disk wipe above never touches them, and when a new slice lands at
+  // the same offset udev's incremental assembly can resurrect the dead array
+  // and hold the partition busy before --create runs. Stop any md holder of
+  // our new partitions, then wipe each partition's signatures.
+  updateProgress('Clearing stale md signatures on new partitions')
+  for (const disk of planned) {
+    for (const partNumber of disk.partNumberByBand.values()) {
+      const partPath = `/dev/disk/by-id/${disk.id}-part${partNumber}`
+      const real = await executor.exec(REALPATH, [partPath])
+      if (real.exitCode === 0) {
+        const kname = real.stdout.trim().split('/').pop()
+        const holders = await executor.exec(LS, [`/sys/class/block/${kname}/holders`])
+        for (const holder of holders.stdout.split(/\s+/).filter(h => h.startsWith('md')))
+          await executor.exec(MDADM, ['--stop', `/dev/${holder}`])
+      }
+      await executor.exec(WIPEFS, ['-a', partPath])
+    }
+  }
   await run(executor, UDEVADM, ['settle'])
 
   // --- One mdadm array per protected band ------------------------------------

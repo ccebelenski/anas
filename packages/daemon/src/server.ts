@@ -408,7 +408,7 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
     mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
     mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
-    mock.addFixture({ command: '/usr/sbin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+    mock.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
     // --- Epic 11 + AHR: mutation layer (create/destroy/scrub) -------------
     // pvs backs the destroy teardown's checks-then-acts PV pass.
     mock.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: mockFixtures.ahrPvs() })
@@ -431,7 +431,7 @@ export function createServer(opts?: ServerOptions) {
     // Scrub: command-only btrfs fallback (empty status → finished, clean); the
     // exact `filesystem usage` fixture above still wins. realpath resolves the
     // /dev/md/<name> symlink for the check-wait; perl is the PVE notifier.
-    mock.addFixture({ command: '/usr/sbin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
   }

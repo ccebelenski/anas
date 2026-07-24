@@ -57,7 +57,7 @@ const LVEXTEND = '/usr/sbin/lvextend'
 const PVS = '/usr/sbin/pvs'
 const VGS = '/usr/sbin/vgs'
 const LVS = '/usr/sbin/lvs'
-const BTRFS = '/usr/sbin/btrfs'
+const BTRFS = '/usr/bin/btrfs'
 const FINDMNT = '/usr/bin/findmnt'
 
 const MIB = 1024 ** 2
