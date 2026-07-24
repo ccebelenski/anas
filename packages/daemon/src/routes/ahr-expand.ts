@@ -10,18 +10,11 @@ import { AhrExpandRequest, AhrReplaceRequest, DiskId, PoolName } from '@anas/sha
 import { confirmGate } from '../safety/gate.js'
 import { executeExpansion, executeReadd, executeReplace, projectExistingBands } from '../services/ahr-expand-exec.js'
 import { AhrIntentConflictError, clearIntent, readIntent, writeIntent } from '../services/ahr-intent.js'
-import { AhrPlanError, planExpansion } from '../services/ahr-layout.js'
+import { AhrPlanError, fmtBytes, planExpansion } from '../services/ahr-layout.js'
 import { spareCoverageWarnings } from '../services/ahr-spare.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
-
-const GIB = 1024 ** 3
-
-function fmtCapacity(bytes: number): string {
-  const gib = bytes / GIB
-  return gib >= 1024 ? `${(gib / 1024).toFixed(2)} TiB` : `${Math.round(gib * 10) / 10} GiB`
-}
 
 export interface AhrExpandRouteOptions {
   executor: CommandExecutor
@@ -241,8 +234,8 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     const { before, after, plan } = bundle
     const pendingDelta = after.pendingBytes - before.pendingBytes
     return [
-      `Usable capacity ${fmtCapacity(before.usableBytes)} → ${fmtCapacity(after.usableBytes)}${
-        pendingDelta > 0 ? `; ${fmtCapacity(after.pendingBytes)} of capacity will be PENDING (physically present but locked — see below).` : '.'}`,
+      `Usable capacity ${fmtBytes(before.usableBytes)} → ${fmtBytes(after.usableBytes)}${
+        pendingDelta > 0 ? `; ${fmtBytes(after.pendingBytes)} of capacity will be PENDING (physically present but locked — see below).` : '.'}`,
       'The pool stays ONLINE during the reshape, but performance is reduced; on large arrays a reshape takes hours to DAYS.',
       'Do NOT remove disks while the expansion runs. Power loss is survivable (md checkpoints and resumes); pulling disks is not.',
       'A reshape cannot be cleanly cancelled once started.',
@@ -442,7 +435,7 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       message: `Abandon the halted expansion of pool '${pool.name}'`,
       warnings: [
         `The pool KEEPS its current reachable layout — nothing is rolled back at the block layer.`,
-        `Current layout: ${layout}; usable ${fmtCapacity(pool.capacity.usableBytes)}${pool.capacity.pendingBytes > 0 ? `, ${fmtCapacity(pool.capacity.pendingBytes)} pending` : ''}.`,
+        `Current layout: ${layout}; usable ${fmtBytes(pool.capacity.usableBytes)}${pool.capacity.pendingBytes > 0 ? `, ${fmtBytes(pool.capacity.pendingBytes)} pending` : ''}.`,
         `Steps that already completed (grown arrays, added capacity) remain in effect; the remaining steps simply never run.`,
         `The approved disk set (${intent.approvedDisks.join(', ')}) is forgotten.`,
       ],

@@ -1,6 +1,7 @@
 import type { AhrPool } from '@anas/shared'
-import type { CommandExecutor, ExecResult } from '../executor/types.js'
+import type { CommandExecutor } from '../executor/types.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
+import { run } from './ahr-exec.js'
 import { pveNotify } from './pve-notify.js'
 
 /**
@@ -76,14 +77,6 @@ async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms))
 }
 
-/** Run a command, throwing a stderr-carrying error on non-zero exit. */
-async function run(executor: CommandExecutor, command: string, args: string[]): Promise<ExecResult> {
-  const r = await executor.exec(command, args)
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `${command} ${args[0] ?? ''} exited ${r.exitCode}`)
-  return r
-}
-
 /**
  * Scrub an AHR pool: btrfs first, THEN each md array's check — never
  * concurrent. Progress is reported on every poll (never an unbounded silent
@@ -129,13 +122,15 @@ export async function scrubAhrPool(
     updateProgress(`Starting md check on ${label}`)
     await run(executor, MDADM, ['--action=check', array.device])
 
-    // /proc/mdstat keys arrays by transient kernel names (GT-2) — the topology
-    // read already resolved one; fall back to realpath when absent.
-    let kernelName = array.kernelName ?? null
-    if (!kernelName) {
-      const rp = await executor.exec(REALPATH, [array.device])
-      kernelName = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : null
-    }
+    // /proc/mdstat keys arrays by transient kernel names (GT-2). Resolve the
+    // CURRENT kernel name from the stable pin symlink (array.device is always
+    // /dev/md/<pool>-r<band>) at point-of-use — NEVER trust array.kernelName
+    // from the route-time topology read: the btrfs scrub above is unbounded
+    // (hours), and md kernel numbers re-enumerate AND get reused across any
+    // reassembly in that window, so a stale md127 could match a DIFFERENT
+    // array in mdstat and make us wait on the wrong device (or none).
+    const rp = await executor.exec(REALPATH, [array.device])
+    const kernelName = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : null
     if (!kernelName) {
       updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
       continue

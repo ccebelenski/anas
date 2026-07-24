@@ -1,5 +1,5 @@
 import type { AhrType, MountEntry } from '@anas/shared'
-import type { CommandExecutor, ExecResult } from '../executor/types.js'
+import type { CommandExecutor } from '../executor/types.js'
 import type { MdadmArrayPin } from '../parsers/mdadm-conf.js'
 import type { AhrBandSlice } from './ahr-geometry.js'
 import type { AhrLayoutDisk } from './ahr-layout.js'
@@ -7,6 +7,7 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { addMount, hasMount, parseFstab, removeMount } from '../parsers/fstab.js'
 import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
+import { run } from './ahr-exec.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { floorToGranularity, planFreshLayout } from './ahr-layout.js'
 import { installProgramHook, pinArrays } from './ahr-mdadm-conf.js'
@@ -80,14 +81,6 @@ export interface AhrCreateOptions {
   mdadmConfPath?: string
   /** Mount-base override (else ANAS_AHR_MOUNT_BASE / /mnt/anas-ahr). */
   mountBase?: string
-}
-
-/** Run a command, throwing a stderr-carrying error on non-zero exit. */
-async function run(executor: CommandExecutor, command: string, args: string[]): Promise<ExecResult> {
-  const r = await executor.exec(command, args)
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `${command} ${args[0] ?? ''} exited ${r.exitCode}`)
-  return r
 }
 
 /**

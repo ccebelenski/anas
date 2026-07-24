@@ -15,7 +15,7 @@ import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
-import { floorToGranularity } from './ahr-layout.js'
+import { floorToGranularity, fmtBytes } from './ahr-layout.js'
 import { pinArrays } from './ahr-mdadm-conf.js'
 import { AHR_FINDMNT_ARGS, stripSubvolSuffix } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
@@ -62,7 +62,6 @@ const BTRFS = '/usr/bin/btrfs'
 const FINDMNT = '/usr/bin/findmnt'
 
 const MIB = 1024 ** 2
-const GIB = 1024 ** 3
 
 /** mdadm stderr demanding a backup file — the GT-6 design-violation signal. */
 const BACKUP_FILE_RE = /backup[ -]?file/i
@@ -95,11 +94,6 @@ function byIdPath(diskId: string): string {
 
 function partByIdPath(diskId: string, partNumber: number): string {
   return `/dev/disk/by-id/${diskId}-part${partNumber}`
-}
-
-function fmtCapacity(bytes: number): string {
-  const gib = bytes / GIB
-  return gib >= 1024 ? `${(gib / 1024).toFixed(2)} TiB` : `${(Math.round(gib * 10) / 10)} GiB`
 }
 
 function sleep(ms: number): Promise<void> {
@@ -878,7 +872,7 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       if (!vg)
         throw new Error(`volume group '${pool.name}' not found — refusing to grow the filesystem`)
       if (vg.freeBytes >= VG_FREE_EPSILON_BYTES)
-        throw new Error(`lv-extend is not complete (VG '${pool.name}' still has ${fmtCapacity(vg.freeBytes)} free) — refusing to grow the filesystem before its block device`)
+        throw new Error(`lv-extend is not complete (VG '${pool.name}' still has ${fmtBytes(vg.freeBytes)} free) — refusing to grow the filesystem before its block device`)
       const lvs = parseLvsReport(await execChecked(executor, LVS, LVS_ARGS))
       const lv = lvs.find(l => l.vgName === pool.name && l.name === pool.lv.name)
       if (!lv)
@@ -984,9 +978,9 @@ export async function executeExpansion(
     executor,
     'info',
     `AHR expansion complete: ${input.pool.name}`,
-    `Usable capacity ${fmtCapacity(before.usableBytes)} → ${fmtCapacity(after.usableBytes)}.${
+    `Usable capacity ${fmtBytes(before.usableBytes)} → ${fmtBytes(after.usableBytes)}.${
       pendingDelta > 0
-        ? ` ${fmtCapacity(after.pendingBytes)} is pending — physically present but locked until more disks cross the top band boundary (§5.2).`
+        ? ` ${fmtBytes(after.pendingBytes)} is pending — physically present but locked until more disks cross the top band boundary (§5.2).`
         : ''}`,
   )
   log(`ahr.expand pool=${input.pool.name} status=complete usable=${before.usableBytes}->${after.usableBytes}`)

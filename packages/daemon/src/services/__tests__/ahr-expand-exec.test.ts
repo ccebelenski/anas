@@ -891,4 +891,49 @@ unused devices: <none>
       ['/dev/md127', '--re-add', `/dev/disk/by-id/${X}-part1`],
     ])
   })
+
+  // nvme partition-suffix guard: an nvme disk's partitions are `nvme0n1p1`
+  // (a `p` separator), NEVER `nvme0n11`. The stunt node is all sdX, so an
+  // nvme partition-naming regression is invisible to live-proof — pve14
+  // (production) has nvme disks. This locks the whole operational chain:
+  // PART_NUMBER_RE must extract `1` from `nvme0n1p1` (not `11`/`01`), the md
+  // member match must line up the p-separated kernel name, and every device
+  // handed to mdadm must go through the by-id `-part1` symlink (which udev
+  // creates uniformly for nvme AND sdX), never a `disk + '1'` concatenation.
+  it('nvme member: --re-add rides the by-id -part1 link, never a p-concat', async () => {
+    const NVME = 'nvme-SAMSUNG_MZVL2_TANK_X'
+    // md127 (r1) lists the returned nvme slice `nvme0n1p1` faulty by its
+    // p-separated kernel name; superblock UUID still matches r1.
+    const nvmeFaulty = `Personalities : [raid1] [raid5]
+md126 : active raid1 sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md127 : active raid5 sds1[2] sdr1[1] nvme0n1p1[0](F)
+      4190208 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [_UU]
+
+unused devices: <none>
+`
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], results: [nvmeFaulty, MDSTAT_BASE].map(s => ({ stdout: s, stderr: '', exitCode: 0 })) })
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md127'], result: { stdout: exportFor('tank-r1', 'raid5', 3, R1_UUID), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md126'], result: { stdout: exportFor('tank-r2', 'raid1', 2, R2_UUID), stderr: '', exitCode: 0 } })
+    // The returned disk is nvme: whole disk `nvme0n1`, partition `nvme0n1p1`.
+    executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${NVME}`), result: { stdout: diskJson('nvme0n1', SIZE_2G, [{ name: 'nvme0n1p1', size: B1_CLAMPED_2G, label: 'tank-d1-b1' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, args: ['--examine', '--export', `/dev/disk/by-id/${NVME}-part1`], result: { stdout: `MD_UUID=${R1_UUID}\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, args: ['/dev/md127', '--re-add', `/dev/disk/by-id/${NVME}-part1`], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    const out = await executeReadd(executor, { pool: mkPool(), diskId: NVME }, () => {}, { pollIntervalMs: 1, log: () => {} })
+    assert.deepEqual(out.bands, [{ band: 1, mode: 'differential' }])
+    const mdadmCalls = executor.calls.filter(c => c.command === MDADM && c.args[0] !== '--detail' && c.args[0] !== '--examine')
+    // partNumber 1 correctly extracted from `nvme0n1p1`; both the same-name
+    // faulty-slot removal and the --re-add use the by-id `-part1` link.
+    assert.deepEqual(mdadmCalls.map(c => c.args), [
+      ['/dev/md127', '--remove', `/dev/disk/by-id/${NVME}-part1`],
+      ['/dev/md127', '--re-add', `/dev/disk/by-id/${NVME}-part1`],
+    ])
+    // Belt-and-braces: nothing referenced a p-concatenated whole-disk path.
+    assert.ok(!executor.calls.some(c => c.args.some(a => typeof a === 'string' && a.includes('nvme0n11'))))
+  })
 })

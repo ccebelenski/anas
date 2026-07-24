@@ -118,6 +118,49 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     assert.ok(progress.some(m => m.includes('t2-r1')) && progress.some(m => m.includes('t2-r2')))
   })
 
+  // Regression: array.kernelName in the pool object is captured at ROUTE time
+  // (the topology read), but phase 2 runs AFTER an unbounded btrfs scrub. md
+  // kernel numbers re-enumerate and get REUSED across any reassembly in that
+  // window, so a stale md-number could match a DIFFERENT array in mdstat (or
+  // none) and make scrub wait on the wrong device — or skip the wait entirely,
+  // breaking the strictly-sequential guarantee (§4). Scrub must resolve the
+  // CURRENT kernel name from the stable pin symlink (realpath array.device) at
+  // point-of-use and ignore the route-time value.
+  it('ignores a STALE route-time array.kernelName — resolves fresh via the pin symlink', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+    // r1's check runs one poll then finishes; then r2's. The realpath fixtures
+    // (baseExecutor) map t2-r1→md127, t2-r2→md126 — the ONLY correct handles.
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], results: [
+      { stdout: mdstat([{ kernel: 'md127', checkPercent: 10 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126', checkPercent: 55 }]), stderr: '', exitCode: 0 },
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 },
+    ] })
+
+    // Poison the pool with STALE kernel names that no longer exist in mdstat
+    // (md0/md1). If scrub trusted them, mdstat.find would miss and it would
+    // NEVER wait — no /proc/mdstat poll would land between the two checks.
+    const stale = pool()
+    stale.arrays[0].kernelName = 'md0'
+    stale.arrays[1].kernelName = 'md1'
+
+    const result = await scrubAhrPool(executor, stale, () => {}, { pollIntervalMs: 1 })
+    assert.equal(result.checkedArrays, 2)
+
+    const calls = executor.calls
+    // The stable pin symlink is what gets resolved — never the stale name.
+    assert.ok(calls.some(c => c.command === '/usr/bin/realpath' && c.args[0] === '/dev/md/t2-r1'))
+    const checkR1 = calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check' && c.args[1] === '/dev/md/t2-r1')
+    const checkR2 = calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check' && c.args[1] === '/dev/md/t2-r2')
+    assert.ok(checkR1 >= 0 && checkR2 > checkR1, 'both checks issued, r1 before r2')
+    // r1's check WAS awaited via realpath-resolved md127 — polls sit between the
+    // two checks. A stale-name trust would produce zero polls between them.
+    const catsBetween = calls.slice(checkR1 + 1, checkR2).filter(c => c.command === '/usr/bin/cat').length
+    assert.ok(catsBetween >= 2, `r1 was awaited before r2 despite the stale kernelName (saw ${catsBetween} poll(s))`)
+  })
+
   it('btrfs findings → PVE warning notification', async () => {
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })

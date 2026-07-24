@@ -1,8 +1,9 @@
 import type { AhrPool, AhrPreviewBand } from '@anas/shared'
-import type { CommandExecutor, ExecResult } from '../executor/types.js'
+import type { CommandExecutor } from '../executor/types.js'
 import { clearGhostMdSignatures } from './ahr-create.js'
+import { run } from './ahr-exec.js'
 import { addSpareSlice, ensureDiskPartitions, projectExistingBands, readDiskTree, removeDetachedFaultySlots, resolveAhrArrays } from './ahr-expand-exec.js'
-import { floorToGranularity } from './ahr-layout.js'
+import { floorToGranularity, fmtBytes } from './ahr-layout.js'
 
 /**
  * AHR hot spares (story 11.11, docs/AHR-DESIGN.md §11) — pool-level spares.
@@ -31,24 +32,6 @@ const WIPEFS = '/usr/sbin/wipefs'
 const SGDISK = '/usr/sbin/sgdisk'
 const MDADM = '/usr/sbin/mdadm'
 const UDEVADM = '/usr/bin/udevadm'
-
-const GIB = 1024 ** 3
-
-/** Human-readable byte count (GiB / TiB, matching the layout warnings). */
-function fmtBytes(bytes: number): string {
-  const gib = bytes / GIB
-  if (gib >= 1024)
-    return `${Math.round((gib / 1024) * 100) / 100} TiB`
-  return `${Math.round(gib * 100) / 100} GiB`
-}
-
-/** Run a command, throwing a stderr-carrying error on non-zero exit. */
-async function run(executor: CommandExecutor, command: string, args: string[]): Promise<ExecResult> {
-  const r = await executor.exec(command, args)
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `${command} ${args[0] ?? ''} exited ${r.exitCode}`)
-  return r
-}
 
 function byIdPath(diskId: string): string {
   return `/dev/disk/by-id/${diskId}`

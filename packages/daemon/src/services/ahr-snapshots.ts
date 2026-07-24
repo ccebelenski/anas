@@ -1,5 +1,5 @@
 import type { AhrPool, AhrSnapshot } from '@anas/shared'
-import type { CommandExecutor, ExecResult } from '../executor/types.js'
+import type { CommandExecutor } from '../executor/types.js'
 import { mkdir, rmdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { AhrSnapshotName } from '@anas/shared'
@@ -10,6 +10,7 @@ import {
   otimeToIso,
   parseBtrfsSubvolList,
 } from '../parsers/btrfs-subvol-list.js'
+import { run } from './ahr-exec.js'
 
 /**
  * AHR btrfs subvolume snapshots (story 11.12, docs/AHR-DESIGN.md §12).
@@ -59,14 +60,6 @@ export interface AhrSnapshotOptions {
 
 function runtimeBase(opts?: AhrSnapshotOptions): string {
   return opts?.runtimeDir ?? process.env.ANAS_AHR_SUBVOL_RUNTIME_DIR ?? DEFAULT_SUBVOL_RUNTIME_DIR
-}
-
-/** Run a command, throwing a stderr-carrying error on non-zero exit. */
-async function run(executor: CommandExecutor, command: string, args: string[]): Promise<ExecResult> {
-  const r = await executor.exec(command, args)
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `${command} ${args[0] ?? ''} exited ${r.exitCode}`)
-  return r
 }
 
 /** The LV device path of a pool (`/dev/<vg>/<lv>`). */

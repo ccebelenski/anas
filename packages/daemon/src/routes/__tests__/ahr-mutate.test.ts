@@ -226,8 +226,8 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.equal(body.error.code, 'CONFIRMATION_REQUIRED')
     assert.ok(body.error.message.includes('WIPE'))
     assert.equal(body.error.warnings.length, 2)
-    assert.ok(body.error.warnings.some((w: string) => w.includes(BLANK_SMALL) && w.includes('BLANK SM') && w.includes('2.0 GiB')))
-    assert.ok(body.error.warnings.some((w: string) => w.includes(BLANK_BIG) && w.includes('BLANK BG') && w.includes('3.0 GiB')))
+    assert.ok(body.error.warnings.some((w: string) => w.includes(BLANK_SMALL) && w.includes('BLANK SM') && w.includes('2 GiB')))
+    assert.ok(body.error.warnings.some((w: string) => w.includes(BLANK_BIG) && w.includes('BLANK BG') && w.includes('3 GiB')))
     const code = first.headers['x-anas-confirm-code'] as string
     assert.ok(code)
     // A 409 must not have executed anything destructive.

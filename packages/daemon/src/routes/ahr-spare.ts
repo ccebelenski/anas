@@ -8,17 +8,11 @@ import { AhrSpareRequest, DiskId, PoolName } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
 import { projectExistingBands } from '../services/ahr-expand-exec.js'
 import { readIntent } from '../services/ahr-intent.js'
+import { fmtBytes } from '../services/ahr-layout.js'
 import { attachSpare, removeSpare, spareCoverage, spareShortfallMessage } from '../services/ahr-spare.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
-
-const GIB = 1024 ** 3
-
-function fmtSize(bytes: number): string {
-  const gib = bytes / GIB
-  return gib >= 1024 ? `${(gib / 1024).toFixed(1)} TiB` : `${gib.toFixed(1)} GiB`
-}
 
 export interface AhrSpareRouteOptions {
   executor: CommandExecutor
@@ -137,7 +131,7 @@ export async function ahrSpareRoutes(server: FastifyInstance, opts: AhrSpareRout
       params: { pool: pool.name, diskId },
       message: `Attaching '${diskId}' as a hot spare to pool '${pool.name}' WIPES the disk`,
       warnings: [
-        `${diskId} (${disk.model ?? 'unknown model'}, ${fmtSize(disk.size)}) will be completely erased and partitioned with the pool's band geometry`,
+        `${diskId} (${disk.model ?? 'unknown model'}, ${fmtBytes(disk.size)}) will be completely erased and partitioned with the pool's band geometry`,
         `The spare covers every band (${bandCount} array${bandCount === 1 ? '' : 's'}): when a member fails, md starts the rebuild onto it immediately — no operator action needed`,
         ...(hasFaulty
           ? ['Faulty slots whose device is gone are removed from the arrays first (slot hygiene); a faulty disk that is still attached is left for Re-add or Replace']

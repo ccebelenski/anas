@@ -1,5 +1,5 @@
 import type { AhrPool } from '@anas/shared'
-import type { CommandExecutor, ExecResult } from '../executor/types.js'
+import type { CommandExecutor } from '../executor/types.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { parseFstab, removeMount } from '../parsers/fstab.js'
 import { LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
@@ -7,6 +7,7 @@ import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { ahrLvPath } from './ahr-create.js'
+import { run } from './ahr-exec.js'
 import { DEFAULT_MDADM_CONF, unpinArrays } from './ahr-mdadm-conf.js'
 import { AHR_FINDMNT_ARGS } from './ahr-topology.js'
 import { editConfig, readConfig } from './config-writer.js'
@@ -48,14 +49,6 @@ export interface AhrDestroyOptions {
   fstabPath: string
   /** mdadm.conf override (else ANAS_MDADM_CONF / the Debian default). */
   mdadmConfPath?: string
-}
-
-/** Run a command, throwing a stderr-carrying error on non-zero exit. */
-async function run(executor: CommandExecutor, command: string, args: string[]): Promise<ExecResult> {
-  const r = await executor.exec(command, args)
-  if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `${command} ${args[0] ?? ''} exited ${r.exitCode}`)
-  return r
 }
 
 /**

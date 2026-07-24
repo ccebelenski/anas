@@ -127,10 +127,19 @@ function levelFor(tier: AhrType, members: number): ArrayLevel | null {
 }
 
 /**
- * Human-readable byte count for warnings. TB-scale values render in TiB (two
- * decimals) — "3.64 TiB pending", never "3724 GiB" (polish finding, 11.8).
+ * Human-readable byte count — the single canonical AHR size formatter, shared
+ * by every AHR confirm dialog, warning, and notification (previously
+ * re-implemented, with divergent rounding, in ahr-spare / ahr-mutate /
+ * ahr-expand / ahr-expand-exec).
+ *
+ * Convention (the 11.8 polish finding, made canonical): render in GiB below
+ * 1024 GiB, TiB at or above it, each rounded to at most two decimals with
+ * trailing zeros dropped — "3.64 TiB pending", "2 GiB", never "3724 GiB" or a
+ * noisy "2.00 GiB". Two decimals at TiB scale keeps ~10 GiB of resolution
+ * (0.1 TiB ≈ 100 GiB is too coarse for capacity deltas); dropping trailing
+ * zeros keeps whole-disk sizes clean in operator strings.
  */
-function fmtBytes(bytes: number): string {
+export function fmtBytes(bytes: number): string {
   const gib = bytes / AHR_SIZE_GRANULARITY_BYTES
   if (gib >= 1024)
     return `${Math.round((gib / 1024) * 100) / 100} TiB`

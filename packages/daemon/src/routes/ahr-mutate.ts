@@ -11,7 +11,7 @@ import { readConfig } from '../services/config-writer.js'
 import { confirmGate } from '../safety/gate.js'
 import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
-import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
+import { AhrPlanError, fmtBytes, planFreshLayout } from '../services/ahr-layout.js'
 import { scrubAhrPool } from '../services/ahr-scrub.js'
 import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
 import { collectDisks } from './disks.js'
@@ -19,7 +19,6 @@ import { requireIdentity } from './identity.js'
 
 const FINDMNT = '/usr/bin/findmnt'
 const VGS = '/usr/sbin/vgs'
-const GIB = 1024 ** 3
 
 export interface AhrMutationRouteOptions {
   executor: CommandExecutor
@@ -34,12 +33,6 @@ export interface AhrMutationRouteOptions {
   mountBase?: string
   /** Scrub poll interval override (tests). */
   scrubPollIntervalMs?: number
-}
-
-/** Human-readable size for confirm warnings (GiB/TiB, one decimal). */
-function fmtSize(bytes: number): string {
-  const gib = bytes / GIB
-  return gib >= 1024 ? `${(gib / 1024).toFixed(1)} TiB` : `${gib.toFixed(1)} GiB`
 }
 
 /**
@@ -167,7 +160,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       operation: 'ahr.create',
       params: { name: req.name },
       message: `Creating AHR pool '${req.name}' will WIPE ${selected.length} disk(s) — all data on them will be permanently erased`,
-      warnings: selected.map(d => `${d.id} (${d.model ?? 'unknown model'}, ${fmtSize(d.usableBytes)}) will be completely erased`),
+      warnings: selected.map(d => `${d.id} (${d.model ?? 'unknown model'}, ${fmtBytes(d.usableBytes)}) will be completely erased`),
     })) {
       return reply
     }
@@ -273,7 +266,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // Consumers under the mountpoint (submounts — shares/backups serving from
     // the pool stop with it). findmnt is the live truth.
     const warnings = [
-      `Pool '${name}' (${fmtSize(pool.capacity.usableBytes)} usable) will be permanently destroyed — every array, partition, and all data erased`,
+      `Pool '${name}' (${fmtBytes(pool.capacity.usableBytes)} usable) will be permanently destroyed — every array, partition, and all data erased`,
       `The filesystem at '${pool.mountpoint}' will be unmounted — anything serving from it (shares, backups, mounts) stops working`,
     ]
     const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
