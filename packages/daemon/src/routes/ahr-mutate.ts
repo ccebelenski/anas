@@ -230,7 +230,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       { ...identity, params: { name, mountpoint: mp } },
       async updateProgress => changeAhrMountpoint(
         executor,
-        { name: pool.name, mountpoint: pool.mountpoint, mounted: pool.mounted },
+        { name: pool.name, mountpoint: pool.mountpoint, mounted: pool.mounted, subvolLayout: pool.subvolLayout },
         mp,
         updateProgress,
         { fstabPath },

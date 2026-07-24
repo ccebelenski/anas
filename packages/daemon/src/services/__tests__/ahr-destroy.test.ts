@@ -72,6 +72,7 @@ function pool(mountpoint = MOUNTPOINT): AhrPool {
     lv: { name: 't2-vol', sizeBytes: 2 * GIB },
     capacity: { rawBytes: 5 * GIB, usableBytes: 2 * GIB, usedBytes: 0, freeBytes: 2 * GIB, redundancyOverheadBytes: 2 * GIB, unprotectedWastedBytes: GIB, pendingBytes: 0 },
     state: 'healthy',
+    subvolLayout: true,
     advisories: [],
   })
 }

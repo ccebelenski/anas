@@ -221,6 +221,7 @@ function mkPool(): AhrPool {
     mountpoint: '/mnt/anas-ahr/tank',
     mounted: true,
     disks: [],
+    subvolLayout: true,
     arrays: [
       { device: '/dev/md/tank-r1', band: 1, level: 'raid5', heightBytes: 2 * GIB, members: [member(X, '1'), member(Y, '1'), member(Z, '1')], state: 'clean' },
       { device: '/dev/md/tank-r2', band: 2, level: 'raid1', heightBytes: GIB, members: [member(Y, '2'), member(Z, '2')], state: 'clean' },

@@ -274,6 +274,17 @@ export const AhrPool = z.object({
   }),
   capacity: AhrCapacity,
   state: AhrPoolState,
+  /**
+   * Whether the pool carries the btrfs subvolume layout (§12): `@data`
+   * (mounted at the mountpoint via `subvol=@data`) + `@snapshots` (outside the
+   * mounted tree). `true` unlocks the snapshot verbs. Pools created before the
+   * §12 design report `false` — a flat single-tree filesystem where snapshots
+   * are unavailable; there is NO migration verb (destroy/recreate is the
+   * migration). Read live from the mount's `subvol=` option — the system is the
+   * source of truth (§5.3); an unmounted pool cannot advertise the layout and
+   * reports `false`.
+   */
+  subvolLayout: z.boolean(),
   /** Operator advisories (unlock hints, degraded-band guidance, …). */
   advisories: z.array(z.string()),
   /**
@@ -463,3 +474,55 @@ export const AhrSpareRequest = z.object({
   diskId: DiskId,
 })
 export type AhrSpareRequest = z.infer<typeof AhrSpareRequest>
+
+// ---- Snapshots (story 11.12, §12) -------------------------------------------
+
+/**
+ * A btrfs snapshot name — the label after `@snapshots/`. Charset-safe so it is
+ * always a single, injection-proof path segment: starts alphanumeric, then
+ * alphanumerics plus the safe punctuation `. _ - :` (a superset of the default
+ * UTC-timestamp name and the auto `pre-rollback-<ts>` preserve name). No `/`
+ * (never a nested path), no `@` (never addresses another subvolume), no `..`
+ * (no traversal), no leading `-` (no option injection into `btrfs`).
+ */
+export const AhrSnapshotName = z
+  .string()
+  .min(1)
+  .max(255)
+  .regex(/^[a-z0-9][\w.:-]*$/i, 'Must start alphanumeric and contain only letters, digits, and . _ - :')
+export type AhrSnapshotName = z.infer<typeof AhrSnapshotName>
+
+/**
+ * One btrfs snapshot under `@snapshots` (§12). Sizes are deliberately absent —
+ * per-snapshot usage needs btrfs qgroups, OUT of v1: showing an unlabeled or
+ * wrong number is worse than showing none.
+ */
+export const AhrSnapshot = z.object({
+  /** The snapshot label (the segment after `@snapshots/`). */
+  name: AhrSnapshotName,
+  /**
+   * Creation time (btrfs subvolume `otime`), ISO 8601 local (no timezone — the
+   * value btrfs reports). Null when btrfs did not record an otime for the
+   * subvolume (older subvolumes) — never fabricated.
+   */
+  createdAt: z.string().nullable(),
+  /**
+   * Whether the snapshot is read-only. Operator snapshots are created read-only
+   * (`btrfs subvolume snapshot -r`); the auto `pre-rollback-<ts>` preserve of a
+   * former `@data` is writable (`readonly: false`).
+   */
+  readonly: z.boolean(),
+})
+export type AhrSnapshot = z.infer<typeof AhrSnapshot>
+
+/**
+ * POST /v1/ahr/:name/snapshots request: take a read-only snapshot of `@data`
+ * into `@snapshots/<name>`. `name` is optional — the daemon defaults it to a
+ * UTC timestamp (charset-safe by construction). Refused when the pool is
+ * flat-layout (`subvolLayout: false`), has an expansion intent, or is in a bad
+ * state — consistent with the other AHR verbs' guards.
+ */
+export const AhrCreateSnapshotRequest = z.object({
+  name: AhrSnapshotName.optional(),
+})
+export type AhrCreateSnapshotRequest = z.infer<typeof AhrCreateSnapshotRequest>

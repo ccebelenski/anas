@@ -22,6 +22,7 @@ import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { readIntent } from './ahr-intent.js'
 import { AHR_MIN_DISKS, floorToGranularity } from './ahr-layout.js'
+import { isSubvolLayoutMount } from './ahr-snapshots.js'
 
 /**
  * AHR pool topology reader (Epic 11 + AHR, docs/AHR-DESIGN.md §3/§5.3).
@@ -170,13 +171,35 @@ function dmName(vg: string, lv: string): string {
   return `${vg.replaceAll('-', '--')}-${lv.replaceAll('-', '--')}`
 }
 
+/** Trailing `[/subvol]` findmnt appends to a btrfs subvolume mount's source. */
+const SUBVOL_SOURCE_SUFFIX_RE = /\[[^\]]*\]$/
+
+/**
+ * A findmnt mount source with any trailing btrfs-subvolume suffix removed:
+ * `/dev/mapper/tank-tank--vol[/@data]` → `/dev/mapper/tank-tank--vol`. A source
+ * with no suffix (a flat `subvol=/` mount, or a non-btrfs source) is unchanged.
+ */
+function stripSubvolSuffix(source: string): string {
+  return source.replace(SUBVOL_SOURCE_SUFFIX_RE, '')
+}
+
 /**
  * One band array's state, fused from mdstat (GT-8/GT-9 aware):
  *  - inactive (all-spares) → 'degraded' — the pool advisory names the
  *    condition; the schema deliberately gains no extra state for it.
- *  - degraded takes precedence over a concurrent sync (the drilled
- *    "clean, degraded, reshaping" case reports degraded; sync{} still
- *    carries the reshape progress).
+ *  - a running `recovery` → 'recovering', checked BEFORE the degraded verdict:
+ *    a recovery is md actively (re)building redundancy onto a target member —
+ *    the initial RAID5/6 build ("building — pool usable now", §3, reported
+ *    distinct from degraded), a spare AUTO-FAILOVER (§11, "no operator in the
+ *    loop" — story 11.11), or a re-add/replace rebuild. The array has (or is
+ *    restoring) protection with nobody in the loop, so it must NOT card as a
+ *    degraded failure (§10 "rebuild … no new surface"); pool state fuses to
+ *    'rebuilding' and the jobs/advisory layer carries the detail.
+ *  - only AFTER ruling out an active recovery does reduced redundancy read as
+ *    'degraded' — the drilled "clean, degraded, reshaping" disk-fault-during-
+ *    reshape case (§8) stays degraded because its sync is a `reshape`, not a
+ *    `recovery`; a genuinely-degraded array with no heal running stays degraded
+ *    and DOES card.
  *  - a lingering faulty slot with EVERY raid slot in sync (the consumed-spare
  *    §11 shape — the spare rebuilt in, the failed device is still attached)
  *    is NOT degraded: redundancy is intact, and the consumed-spare advisory
@@ -187,6 +210,10 @@ function dmName(vg: string, lv: string): string {
 function arrayState(md: MdstatArray): ArrayState {
   if (!md.active)
     return 'degraded'
+  // A recovery restores redundancy onto a target — it wins over the degraded
+  // verdict (initial build, spare failover, re-add/replace all report here).
+  if (md.sync?.action === 'recovery')
+    return 'recovering'
   const degraded = md.raidDevices !== null && md.activeDevices !== null
     ? md.activeDevices < md.raidDevices
     : md.members.some(m => m.faulty && !m.spare)
@@ -194,9 +221,9 @@ function arrayState(md: MdstatArray): ArrayState {
     return 'degraded'
   if (md.sync) {
     switch (md.sync.action) {
+      // 'recovery' is handled above (it wins over the degraded verdict).
       case 'resync': return 'resyncing'
       case 'reshape': return 'reshaping'
-      case 'recovery': return 'recovering'
       case 'check': return 'clean'
     }
   }
@@ -409,11 +436,23 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
     // ---- Mount + btrfs ------------------------------------------------------
     const lvName = lv?.name ?? `${poolName}-vol`
     const mapperPath = `/dev/mapper/${dmName(poolName, lvName)}`
-    const mount = mounts.find(m => m.source === mapperPath)
+    // findmnt appends the mounted subvolume path to the source of a btrfs
+    // subvolume mount, e.g. `/dev/mapper/tank-tank--vol[/@data]` — so an exact
+    // `source === mapperPath` match MISSES every §12 subvol-layout pool and
+    // falls through to the options-less lsblk fallback below, which then reads
+    // subvolLayout as false for a pool that IS `subvol=@data` (live catch,
+    // 11.12 proof). Strip the `[…]` suffix before matching so the real mount
+    // (carrying the subvol=@data option) is found and its options preserved.
+    const mount = mounts.find(m => stripSubvolSuffix(m.source) === mapperPath)
       ?? (lsblk.lvmByDmName.get(dmName(poolName, lvName))?.mountpoint
         ? { target: lsblk.lvmByDmName.get(dmName(poolName, lvName))!.mountpoint!, source: mapperPath, fstype: 'btrfs', options: '' }
         : null)
     const readonly = mount ? optionsReadOnly(mount.options) : false
+    // §12 subvolume layout: read live from the mount's `subvol=` option — a
+    // pool mounted `subvol=@data` carries the snapshot layout; a flat pool
+    // (subvol=/, subvolid=5) or an unmounted pool does not. The mount is the
+    // source of truth; nothing is precomputed or persisted (§5.3).
+    const subvolLayout = mount ? isSubvolLayoutMount(mount.options) : false
     if (!mount)
       advisories.push(`pool '${poolName}' filesystem is not mounted`)
 
@@ -515,6 +554,7 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
       },
       capacity,
       state,
+      subvolLayout,
       advisories,
     }))
   }

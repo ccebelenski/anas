@@ -23,6 +23,22 @@ pve-manager 9.2.4, kernel 7.0.14-5-pve, mdadm 4.4, LVM 2.03.31, btrfs-progs 6.14
 | `btrfs-usage-truncated.txt` | phase-b | Same command piped through `head -12` in the capture script — Overall block only. Kept as the format-drift tolerance case (GT-14: read free space, never precompute) |
 | `lsblk-ahr-capture.json` | phase-a | `lsblk -J -b -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,PARTLABEL` — verbatim. **Incomplete**: the capture script listed `/dev/sdb /dev/sdc /dev/sde` and sde did not exist, so disk sdd (HOT3) is missing from this genuine capture |
 
+## Genuine captures — story 11.12 subvolume-layout (added 2026-07-23)
+
+Live-captured on the stunt node (`anas-pve`, btrfs-progs **v6.14**) during the
+11.10–11.12 live-proof, on pool `tank` (subvol layout) AFTER a rollback — so the
+set includes the writable `pre-rollback-*` preserve. **These replaced the
+earlier synthetic modellings** (which used `top level 5` for snapshots; the real
+value is `top level 257` = the `@snapshots` subvolume id — a data difference the
+parser already tolerated, but now the fixtures are ground truth).
+
+| File | Source | What it is |
+|------|--------|------------|
+| `btrfs-subvol-list-s.txt` | live | `btrfs subvolume list -s /mnt/anas-ahr/tank` — the two operator snapshots (`cgen`+`otime`, `top level 257`) plus the post-rollback writable `@data` (itself a snapshot, `top level 5`). NOTE the pre-rollback preserve is ABSENT — a plain subvolume, invisible to `-s`; this is exactly why `listAhrSnapshots` enumerates the PLAIN list instead |
+| `btrfs-subvol-list-r.txt` | live | `btrfs subvolume list -r /mnt/anas-ahr/tank` — the read-only set (the two operator snapshots only; the writable pre-rollback and `@data` are excluded). No `otime`/`cgen` column in `-r` |
+| `btrfs-subvol-list-layout.txt` | live | plain `btrfs subvolume list /mnt/anas-ahr/tank` — `@data`, `@snapshots`, both operator snapshots, AND the writable `@snapshots/pre-rollback-*` preserve. The membership source `listAhrSnapshots` reads |
+| `btrfs-subvol-list-flat.txt` | live | empty output — captured on the pre-§12 FLAT `tank` before it was destroyed (a flat pool has no subvolumes) |
+
 ## Reconstructed / synthetic (NOT verbatim captures — labeled honestly)
 
 | File | Status | Notes |

@@ -191,6 +191,7 @@ function mkPool(opts: { spare?: AhrDisk } = {}): AhrPool {
     lv: { name: 'tank-vol', sizeBytes: 5 * GIB },
     capacity: CAP,
     state: 'healthy',
+    subvolLayout: true,
     advisories: [],
   }
 }

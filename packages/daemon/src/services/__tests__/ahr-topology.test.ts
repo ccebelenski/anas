@@ -8,7 +8,7 @@ import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, readAhrPools } from '../ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, buildAhrWarnings, readAhrPools } from '../ahr-topology.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/ahr')
@@ -235,17 +235,23 @@ describe('readAhrPools', () => {
       assert.ok(advisory!.includes(HOT1), 'names the failed disk')
     })
 
-    it('mid-failover (rebuilding onto the spare) is degraded WITH the consumed advisory', async () => {
+    it('mid-failover (rebuilding onto the spare) is recovering — NOT degraded — with the consumed advisory', async () => {
+      // md auto-failover rebuild: redundancy is being restored with no operator
+      // in the loop (§11, story 11.11), so the band reads `recovering` and the
+      // pool `rebuilding` — it must NOT card as a degraded failure (§10). The
+      // consumed-spare advisory carries the eventual "replace the failed disk".
       const pools = await readAhrPools(spareExecutor(MDSTAT_SPARE_REBUILDING))
       const pool = pools[0]
       const r1 = pool.arrays.find(a => a.band === 1)!
-      assert.equal(r1.state, 'degraded')
+      assert.equal(r1.state, 'recovering')
       assert.ok(r1.sync)
       assert.equal(r1.sync.action, 'recover')
-      assert.equal(pool.state, 'degraded')
+      assert.equal(pool.state, 'rebuilding')
       assert.ok(pool.advisories.some(a => a.includes('spare consumed by band 1')))
       // The consumed advisory REPLACES the generic degraded one for this band.
       assert.ok(!pool.advisories.some(a => a.includes('is degraded')))
+      // A rebuilding pool contributes NO dashboard card (only failures card).
+      assert.deepEqual(buildAhrWarnings([pool]), [])
     })
   })
 
@@ -277,6 +283,28 @@ describe('readAhrPools', () => {
     const pools = await readAhrPools(healthyExecutor({ findmnt }))
     assert.equal(pools[0].state, 'readonly')
     assert.ok(pools[0].advisories.some(a => a.includes('READ-ONLY')))
+  })
+
+  it('subvolLayout follows the mount subvol= option (§12)', async () => {
+    // The stage-0 fixture is FLAT (subvol=/): pre-§12, snapshots unavailable.
+    const flat = await readAhrPools(healthyExecutor())
+    assert.equal(flat[0].subvolLayout, false)
+
+    // A pool mounted subvol=@data carries the §12 subvolume layout. The source
+    // MUST carry findmnt's real `[/@data]` subvolume suffix (live-captured
+    // 2026-07-23): the exact-match mount lookup has to strip it, or the pool
+    // falls through to the options-less lsblk fallback and reads as flat.
+    const findmnt = JSON.stringify({
+      filesystems: [{
+        target: '/mnt/anas-ahr/ahr0',
+        source: '/dev/mapper/ahr0-ahr0--vol[/@data]',
+        fstype: 'btrfs',
+        options: 'rw,relatime,space_cache=v2,subvolid=256,subvol=/@data',
+      }],
+    })
+    const subvol = await readAhrPools(healthyExecutor({ findmnt }))
+    assert.equal(subvol[0].subvolLayout, true)
+    assert.equal(subvol[0].state, 'healthy')
   })
 
   it('falls back to the lsblk mountpoint when findmnt yields nothing', async () => {

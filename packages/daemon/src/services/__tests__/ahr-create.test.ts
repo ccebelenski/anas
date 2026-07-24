@@ -60,9 +60,11 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       '/usr/sbin/vgcreate',
       '/usr/sbin/lvcreate',
       '/usr/sbin/mkfs.btrfs',
+      '/usr/bin/btrfs', // subvolume create @data / @snapshots (§12)
       '/usr/sbin/update-initramfs',
       '/usr/bin/systemctl',
       '/usr/bin/mount',
+      '/usr/bin/umount', // top-level unmount after carving the subvolumes
       '/usr/bin/perl',
       '/usr/sbin/mdadm', // --create / fallback
     ])
@@ -134,6 +136,12 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       { command: '/usr/sbin/lvcreate', args: ['-y', '-l', '100%FREE', '-n', 't2-vol', 't2'] },
       // btrfs is always single-data/dup-metadata — never btrfs-RAID.
       { command: '/usr/sbin/mkfs.btrfs', args: ['-L', 't2', '-d', 'single', '-m', 'dup', '/dev/t2/t2-vol'] },
+      // §12 subvolume layout: mount the top-level, carve @data + @snapshots,
+      // unmount — then the pool mounts subvol=@data.
+      { command: '/usr/bin/mount', args: ['-t', 'btrfs', '-o', 'subvolid=5', '/dev/t2/t2-vol', join(mountBase, 't2')] },
+      { command: '/usr/bin/btrfs', args: ['subvolume', 'create', join(mountBase, 't2', '@data')] },
+      { command: '/usr/bin/btrfs', args: ['subvolume', 'create', join(mountBase, 't2', '@snapshots')] },
+      { command: '/usr/bin/umount', args: ['--', join(mountBase, 't2')] },
       { command: '/usr/bin/systemctl', args: ['daemon-reload'] },
       { command: '/usr/bin/mount', args: ['--', join(mountBase, 't2')] },
       executor.calls.at(-1)!, // perl notify — argv asserted below
@@ -146,7 +154,8 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     // fstab round-trip: seed preserved byte-for-byte, one appended line, nofail.
     const fstab = await readFile(fstabPath, 'utf8')
     assert.ok(fstab.startsWith(FSTAB_SEED.trimEnd()))
-    assert.ok(fstab.includes(`/dev/t2/t2-vol ${join(mountBase, 't2')} btrfs nofail 0 0`))
+    // fstab carries subvol=@data (§12) so the mountpoint mounts the data subvolume.
+    assert.ok(fstab.includes(`/dev/t2/t2-vol ${join(mountBase, 't2')} btrfs nofail,subvol=@data 0 0`))
 
     // mdadm.conf gained the ARRAY pin + the monitor PROGRAM hook.
     const conf = await readFile(confPath, 'utf8')

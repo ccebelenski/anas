@@ -193,7 +193,7 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     } })
     executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 0 } })
     // The create job's commands.
-    for (const command of ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/bin/udevadm', '/usr/sbin/pvcreate', '/usr/sbin/vgcreate', '/usr/sbin/lvcreate', '/usr/sbin/mkfs.btrfs', '/usr/sbin/update-initramfs', '/usr/bin/systemctl', '/usr/bin/mount', '/usr/bin/perl', '/usr/sbin/mdadm'])
+    for (const command of ['/usr/sbin/wipefs', '/usr/sbin/sgdisk', '/usr/bin/udevadm', '/usr/sbin/pvcreate', '/usr/sbin/vgcreate', '/usr/sbin/lvcreate', '/usr/sbin/mkfs.btrfs', '/usr/bin/btrfs', '/usr/sbin/update-initramfs', '/usr/bin/systemctl', '/usr/bin/mount', '/usr/bin/umount', '/usr/bin/perl', '/usr/sbin/mdadm'])
       executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
     executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/tpool-r1'], result: { stdout: `MD_NAME=tpool-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 } })
 
@@ -257,7 +257,7 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
 
     // fstab + mdadm.conf persisted.
     const fstab = await readFile(join(dir, 'fstab'), 'utf8')
-    assert.ok(fstab.includes(`/dev/tpool/tpool-vol ${join(dir, 'mnt', 'tpool')} btrfs nofail 0 0`))
+    assert.ok(fstab.includes(`/dev/tpool/tpool-vol ${join(dir, 'mnt', 'tpool')} btrfs nofail,subvol=@data 0 0`))
     const conf = await readFile(join(dir, 'mdadm.conf'), 'utf8')
     assert.ok(conf.includes('/dev/md/tpool-r1') && conf.includes(UUID_R1))
   })

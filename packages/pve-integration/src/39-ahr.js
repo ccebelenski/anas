@@ -708,6 +708,17 @@
             } catch (e) {
                 ANAS.warn('ahr detail render failed: ' + ANAS.errText(e));
             }
+            // 11.12: the Snapshots… button is live only for the §12 subvolume
+            // layout. A pre-§12 flat pool has no @data/@snapshots — disable it
+            // with the "snapshots unavailable" advisory (no migration verb).
+            var snapBtn = win.down('#ahrSnapshotsBtn');
+            if (snapBtn) {
+                var layout = !!(d && d.subvolLayout);
+                snapBtn.setDisabled(!layout);
+                snapBtn.setTooltip(layout
+                    ? t('Manage btrfs snapshots for this pool')
+                    : t('Snapshots unavailable: this pool predates the @data/@snapshots layout. Destroy and recreate it to gain snapshots (no in-place migration).'));
+            }
         }, function (err) {
             if (panel && !panel.destroyed && !panel.destroying) {
                 panel.setHtml('<div style="padding:14px;color:var(--anas-danger);font-size:12.5px">'
@@ -785,6 +796,15 @@
                         iconCls: 'fa fa-folder-open-o',
                         handler: function () { changeMountpoint(win, node, name); },
                     },
+                    {
+                        text: t('Snapshots…'),
+                        itemId: 'ahrSnapshotsBtn',
+                        cls: 'anas-btn-ahr-snapshots',
+                        iconCls: 'fa fa-camera',
+                        // Enabled once detail loads and reports subvolLayout true.
+                        disabled: true,
+                        handler: function () { openSnapshotManager(node, name); },
+                    },
                     '->',
                     {
                         text: t('Reload'),
@@ -799,6 +819,225 @@
             loadDetailInto(win, node, name);
         } catch (e) {
             ANAS.warn('ahr detail window failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // ---- Snapshots (story 11.12, AHR-DESIGN §12) ----------------------------
+    //
+    // A self-contained manager window over the §12 @data/@snapshots subvolume
+    // layout: a grid of snapshots (name, created, read-only) with Create /
+    // Delete / Rollback. Mirrors the ZFS snapshot idioms (60-datasets.js).
+    //   GET    /ahr/:name/snapshots
+    //   POST   /ahr/:name/snapshots {name?}      → 202 job
+    //   DELETE /ahr/:name/snapshots/:snap        → 409 confirm → 202 job
+    //   POST   /ahr/:name/snapshots/:snap/rollback → 409 confirm → 202 job
+
+    // A UTC-timestamp default name matching the daemon's charset (no colons).
+    function defaultSnapshotName() {
+        try {
+            return new Date().toISOString().replace(/\.\d+Z$/, 'Z').replace(/:/g, '');
+        } catch (e) {
+            return 'snapshot';
+        }
+    }
+
+    // Format a snapshot's ISO 8601 (local, no timezone) createdAt compactly.
+    function fmtSnapCreated(iso) {
+        if (!iso) {
+            return '—';
+        }
+        try {
+            var d = new Date(iso);
+            if (!isNaN(d.getTime())) {
+                return Ext.Date.format(d, 'Y-m-d H:i:s');
+            }
+        } catch (e) {
+            // fall through
+        }
+        return '' + iso;
+    }
+
+    function openSnapshotManager(node, name) {
+        if (!name) {
+            return;
+        }
+        var win = null;
+
+        function grid() {
+            return win ? win.down('#ahrSnapGrid') : null;
+        }
+        function selectedSnap() {
+            var g = grid();
+            var sel = g ? g.getSelection() : null;
+            return (sel && sel.length) ? sel[0].get('name') : null;
+        }
+        function reload() {
+            var g = grid();
+            if (!g || g.destroyed || g.destroying) {
+                return;
+            }
+            g.setLoading(true);
+            ANAS.api.get(node, '/ahr/' + encodeURIComponent(name) + '/snapshots').then(function (res) {
+                if (g.destroyed || g.destroying) {
+                    return;
+                }
+                g.setLoading(false);
+                g.getStore().loadData((res && res.data) || []);
+                updateSnapButtons();
+            }, function (err) {
+                if (g.destroyed || g.destroying) {
+                    return;
+                }
+                g.setLoading(false);
+                Ext.Msg.alert(t('Snapshots'), t('Failed to load snapshots') + ': ' + ANAS.errText(err));
+            });
+        }
+        function updateSnapButtons() {
+            var has = !!selectedSnap();
+            var del = win.down('#ahrSnapDelete');
+            var rb = win.down('#ahrSnapRollback');
+            if (del) { del.setDisabled(!has); }
+            if (rb) { rb.setDisabled(!has); }
+        }
+
+        function createSnap() {
+            Ext.Msg.prompt(t('Create snapshot'),
+                t('Snapshot name for') + ' <b>' + enc(name) + '</b>:',
+                function (btn, value) {
+                    if (btn !== 'ok') {
+                        return;
+                    }
+                    var snap = (value || '').replace(/\s+/g, '');
+                    if (!snap) {
+                        return;
+                    }
+                    ANAS.runJob({
+                        node: node,
+                        method: 'post',
+                        path: '/ahr/' + encodeURIComponent(name) + '/snapshots',
+                        body: { name: snap },
+                        view: win,
+                        failTitle: 'Create snapshot failed',
+                        successMsg: t('Snapshot created') + ': ' + snap,
+                        onComplete: reload,
+                    });
+                }, null, false, defaultSnapshotName());
+        }
+
+        function deleteSnap() {
+            var snap = selectedSnap();
+            if (!snap) {
+                return;
+            }
+            ANAS.confirmAndRun({
+                node: node,
+                method: 'delete',
+                path: '/ahr/' + encodeURIComponent(name) + '/snapshots/' + encodeURIComponent(snap),
+                view: win,
+                confirmTitle: 'Delete snapshot',
+                confirmIntro: t('Deleting snapshot') + ' <b>' + enc(snap) + '</b> '
+                    + t('from') + ' <b>' + enc(name) + '</b>:',
+                failTitle: 'Delete snapshot failed',
+                successMsg: t('Snapshot delete started') + ': ' + snap,
+                onSubmitted: reload,
+                onComplete: reload,
+            });
+        }
+
+        function rollbackSnap() {
+            var snap = selectedSnap();
+            if (!snap) {
+                return;
+            }
+            // The daemon's 409 warnings state the brief unmount and the
+            // auto-preserved pre-rollback snapshot (nothing is destroyed).
+            ANAS.confirmAndRun({
+                node: node,
+                method: 'post',
+                path: '/ahr/' + encodeURIComponent(name) + '/snapshots/'
+                    + encodeURIComponent(snap) + '/rollback',
+                body: {},
+                view: win,
+                confirmTitle: 'Roll back to snapshot',
+                confirmIntro: t('Rolling') + ' <b>' + enc(name) + '</b> '
+                    + t('back to snapshot') + ' <b>' + enc(snap) + '</b>:',
+                failTitle: 'Rollback failed',
+                successMsg: t('Rollback started on') + ' ' + name,
+                onSubmitted: reload,
+                onComplete: reload,
+            });
+        }
+
+        try {
+            var store = Ext.create('Ext.data.Store', {
+                fields: ['name', 'createdAt', 'readonly'],
+                data: [],
+            });
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-ahr-snapshots',
+                title: t('Snapshots') + ': ' + name,
+                modal: true,
+                width: 640,
+                height: 460,
+                layout: 'fit',
+                items: [{
+                    xtype: 'grid',
+                    itemId: 'ahrSnapGrid',
+                    cls: 'anas-grid-ahr-snapshots',
+                    store: store,
+                    border: false,
+                    emptyText: t('No snapshots'),
+                    columns: [
+                        { text: t('Name'), dataIndex: 'name', flex: 2, renderer: function (v) { return enc(v); } },
+                        { text: t('Created'), dataIndex: 'createdAt', flex: 1, renderer: fmtSnapCreated },
+                        {
+                            text: t('Read-only'),
+                            dataIndex: 'readonly',
+                            width: 100,
+                            renderer: function (v) { return v ? t('yes') : t('no'); },
+                        },
+                    ],
+                    listeners: {
+                        selectionchange: function () { updateSnapButtons(); },
+                        itemdblclick: function () { rollbackSnap(); },
+                    },
+                    tbar: [
+                        {
+                            text: t('Create…'),
+                            cls: 'anas-btn-ahr-snap-create',
+                            iconCls: 'fa fa-plus',
+                            handler: createSnap,
+                        },
+                        {
+                            text: t('Delete…'),
+                            itemId: 'ahrSnapDelete',
+                            cls: 'anas-btn-ahr-snap-delete',
+                            iconCls: 'fa fa-trash-o',
+                            disabled: true,
+                            handler: deleteSnap,
+                        },
+                        {
+                            text: t('Rollback…'),
+                            itemId: 'ahrSnapRollback',
+                            cls: 'anas-btn-ahr-snap-rollback',
+                            iconCls: 'fa fa-history',
+                            disabled: true,
+                            handler: rollbackSnap,
+                        },
+                        '->',
+                        {
+                            text: t('Reload'),
+                            iconCls: 'fa fa-refresh',
+                            handler: reload,
+                        },
+                    ],
+                }],
+                buttons: [{ text: t('Close'), handler: function () { win.close(); } }],
+            });
+            win.show();
+            reload();
+        } catch (e) {
+            ANAS.warn('ahr snapshot manager failed: ' + ANAS.errText(e));
         }
     }
 

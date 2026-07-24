@@ -10,6 +10,7 @@ import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { floorToGranularity, planFreshLayout } from './ahr-layout.js'
 import { installProgramHook, pinArrays } from './ahr-mdadm-conf.js'
+import { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
 import { editConfig } from './config-writer.js'
 import { pveNotify } from './pve-notify.js'
 
@@ -44,6 +45,7 @@ const PVCREATE = '/usr/sbin/pvcreate'
 const VGCREATE = '/usr/sbin/vgcreate'
 const LVCREATE = '/usr/sbin/lvcreate'
 const MKFS_BTRFS = '/usr/sbin/mkfs.btrfs'
+const BTRFS = '/usr/bin/btrfs'
 const UPDATE_INITRAMFS = '/usr/sbin/update-initramfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
 const MOUNT = '/usr/bin/mount'
@@ -116,8 +118,16 @@ export async function clearGhostMdSignatures(
   await run(executor, UDEVADM, ['settle'])
 }
 
-/** The canonical fstab entry for a pool: LV device, btrfs, nofail. */
-function ahrFstabEntry(name: string, mountpoint: string): MountEntry {
+/**
+ * The canonical fstab entry for a pool: LV device, btrfs, nofail. When
+ * `subvolLayout` is true (every pool created since §12) the entry carries
+ * `subvol=@data` so the mountpoint mounts the data subvolume, not the
+ * top-level — snapshots live under `@snapshots`, outside the mounted tree. A
+ * pre-§12 flat pool has no `@data` subvolume, so its entry omits the option;
+ * `changeAhrMountpoint` MUST pass the pool's real layout so a mountpoint move
+ * never rewrites a flat pool's line to reference a subvolume it lacks.
+ */
+function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean): MountEntry {
   return {
     spec: ahrLvPath(name),
     mountpoint,
@@ -135,7 +145,7 @@ function ahrFstabEntry(name: string, mountpoint: string): MountEntry {
         nodev: false,
         netdev: false,
       },
-      passthrough: '',
+      passthrough: subvolLayout ? `subvol=${SUBVOL_DATA}` : '',
     },
     dump: 0,
     pass: 0,
@@ -271,14 +281,28 @@ export async function createAhrPool(
   updateProgress('Creating btrfs filesystem')
   await run(executor, MKFS_BTRFS, ['-L', name, '-d', 'single', '-m', 'dup', lvPath])
 
-  // --- Mountpoint + fstab persistence + mount ---------------------------------
+  // --- Subvolume layout (§12): @data (mounted) + @snapshots (outside) ---------
+  // Mount the top-level briefly at the mountpoint dir, carve the two
+  // subvolumes, unmount — the pool then mounts `subvol=@data`, so snapshots
+  // live OUTSIDE the operator's tree and rollback is a subvolume swap.
   const mountpoint = spec.mountpoint ?? join(ahrMountBase(opts.mountBase), name)
-  updateProgress(`Mounting at ${mountpoint}`)
   await mkdir(mountpoint, { recursive: true })
+  updateProgress('Creating btrfs subvolume layout (@data, @snapshots)')
+  await run(executor, MOUNT, ['-t', 'btrfs', '-o', 'subvolid=5', lvPath, mountpoint])
+  try {
+    await run(executor, BTRFS, ['subvolume', 'create', join(mountpoint, SUBVOL_DATA)])
+    await run(executor, BTRFS, ['subvolume', 'create', join(mountpoint, SUBVOL_SNAPSHOTS)])
+  }
+  finally {
+    await run(executor, UMOUNT, ['--', mountpoint])
+  }
+
+  // --- Mountpoint + fstab persistence + mount (subvol=@data) -------------------
+  updateProgress(`Mounting at ${mountpoint}`)
   await editConfig(opts.fstabPath, (current) => {
     if (hasMount(current, mountpoint))
       throw new Error(`Mount '${mountpoint}' is already in /etc/fstab`)
-    return addMount(current, ahrFstabEntry(name, mountpoint))
+    return addMount(current, ahrFstabEntry(name, mountpoint, true))
   })
   await run(executor, SYSTEMCTL, ['daemon-reload'])
   await run(executor, MOUNT, ['--', mountpoint])
@@ -304,7 +328,7 @@ export async function createAhrPool(
  */
 export async function changeAhrMountpoint(
   executor: CommandExecutor,
-  pool: { name: string, mountpoint: string, mounted: boolean },
+  pool: { name: string, mountpoint: string, mounted: boolean, subvolLayout: boolean },
   newMountpoint: string,
   updateProgress: (message: string) => void,
   opts: { fstabPath: string },
@@ -320,10 +344,13 @@ export async function changeAhrMountpoint(
   updateProgress('Rewriting the fstab entry (surgical)')
   await editConfig(opts.fstabPath, (current) => {
     // The pool's line is found by mountpoint OR by LV spec (an unmounted or
-    // hand-edited pool still gets its line replaced, never duplicated).
+    // hand-edited pool still gets its line replaced, never duplicated). The
+    // pool's REAL layout carries through (§12): a subvol pool keeps
+    // subvol=@data, a flat pool keeps its plain entry — the move never
+    // fabricates a subvolume option the filesystem does not have.
     const existing = parseFstab(current).find(e => e.mountpoint === pool.mountpoint || e.spec === lvPath)
     const without = existing ? removeMount(current, existing.mountpoint) : current
-    return addMount(without, ahrFstabEntry(name, newMountpoint))
+    return addMount(without, ahrFstabEntry(name, newMountpoint, pool.subvolLayout))
   })
   await run(executor, SYSTEMCTL, ['daemon-reload'])
 

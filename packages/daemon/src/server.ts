@@ -17,6 +17,7 @@ import { MDSTAT_CAT_ARGS } from './parsers/mdstat.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
 import { ahrExpansionRoutes } from './routes/ahr-expand.js'
 import { ahrMutationRoutes } from './routes/ahr-mutate.js'
+import { ahrSnapshotRoutes } from './routes/ahr-snapshots.js'
 import { ahrSpareRoutes } from './routes/ahr-spare.js'
 import { ahrRoutes } from './routes/ahr.js'
 import { backupRoutes } from './routes/backup.js'
@@ -484,6 +485,10 @@ export function createServer(opts?: ServerOptions) {
   // AHR hot spares (story 11.11, AHR-DESIGN §11) — attach/remove, both
   // confirm-gated; md owns failover after attach.
   server.register(ahrSpareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, intentDir: ahrIntentDir })
+  // AHR btrfs snapshots (story 11.12, AHR-DESIGN §12) — list/create/delete/
+  // rollback over the @data/@snapshots subvolume layout; delete/rollback
+  // confirm-gated. Refused on flat-layout pools (no migration verb).
+  server.register(ahrSnapshotRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, intentDir: ahrIntentDir })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, job, and AHR (11.10) sources above, plus on-demand
   // ARC/iostat/net sampling.
