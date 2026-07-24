@@ -124,7 +124,8 @@ AhrPoolState = 'healthy' | 'degraded' | 'expanding' | 'rebuilding' | 'scrubbing'
 **`AhrLayoutPreview`** (dry-run, no mutation) — the composer's live feedback: `{ bands: [{ range, memberCount, level, heightBytes, usableBytes, protected: bool }], capacity: AhrCapacity, warnings, minDisksMet: bool }`
 
 **`AhrExpansionIntent`** (the ONLY persisted expansion state — see §5.3) —
-`{ id, trigger: 'add-disk'|'replace-disk', approvedDisks: [diskId], replacedDisk?: diskId, before: AhrCapacity, after: AhrCapacity, state: 'running'|'halted'|'done'|'abandoned' }`
+`{ id, trigger: 'add-disk'|'replace-disk', approvedDisks: [diskId], replacedDisk?: diskId, replacementDisk?: diskId, before: AhrCapacity, after: AhrCapacity, state: 'running'|'halted'|'done'|'abandoned' }`
+- `replacementDisk` pairs with `replacedDisk` (build finding, 11.6): resume of a replace halted *before* the physical swap must know which approved disk substitutes — the pair is intent, not derivable.
 
 **`AhrExpansionStep`** (derived, never persisted — recomputed by the §2.3 planner on every run/resume) —
 `{ index, kind, target, status: 'pending'|'running'|'done'|'failed', detail? }`

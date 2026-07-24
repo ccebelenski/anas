@@ -316,6 +316,14 @@ export const AhrExpansionIntent = z.object({
   approvedDisks: z.array(DiskId),
   /** For replace-disk: the outgoing member (its replacement is in approvedDisks). */
   replacedDisk: DiskId.optional(),
+  /**
+   * For replace-disk: the incoming disk (also present in approvedDisks). The
+   * §2.3 planner takes replacement as a declared {old, new} PAIR, and resume
+   * recomputes the plan from this intent — so the pair must be persisted:
+   * with only `replacedDisk`, a resume halted before the swap could not name
+   * which approved disk substitutes the old member.
+   */
+  replacementDisk: DiskId.optional(),
   /** Capacity before the expansion (for the before → after presentation). */
   before: AhrCapacity,
   /** Reachable capacity after the expansion (never fresh-ideal capacity). */
@@ -368,3 +376,37 @@ export const AhrExpansionStep = z.object({
   detail: z.string().optional(),
 })
 export type AhrExpansionStep = z.infer<typeof AhrExpansionStep>
+
+/** A declared disk substitution — the ONLY way a member may leave a pool. */
+export const AhrReplacePair = z.object({
+  /** The outgoing member disk (must currently serve at least one band). */
+  oldDiskId: DiskId,
+  /** The incoming disk (must be 'available' in the inventory). */
+  newDiskId: DiskId,
+})
+export type AhrReplacePair = z.infer<typeof AhrReplacePair>
+
+/**
+ * POST /v1/ahr/:name/expand/plan and POST /v1/ahr/:name/expand request body:
+ * grow the pool by adding disks, by a declared replacement, or both. At least
+ * one of the two must be present — an empty request plans nothing.
+ */
+export const AhrExpandRequest = z.object({
+  /** Disks to ADD to the pool (inventory status 'available' required). */
+  addDisks: z.array(DiskId).optional(),
+  /** A declared old → new substitution (§2.3: replace is never inferred). */
+  replace: AhrReplacePair.optional(),
+}).refine(
+  r => (r.addDisks !== undefined && r.addDisks.length > 0) || r.replace !== undefined,
+  'Provide addDisks and/or replace — an empty expansion request plans nothing',
+)
+export type AhrExpandRequest = z.infer<typeof AhrExpandRequest>
+
+/**
+ * POST /v1/ahr/:name/disk/:oldId/replace request body — the guided replace.
+ * The outgoing disk is the URL parameter; the body names its substitute.
+ */
+export const AhrReplaceRequest = z.object({
+  newDiskId: DiskId,
+})
+export type AhrReplaceRequest = z.infer<typeof AhrReplaceRequest>

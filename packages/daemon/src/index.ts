@@ -1,5 +1,7 @@
+import type { CommandExecutor } from './executor/types.js'
 import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
+import { ahrBootScan } from './services/ahr-boot-scan.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
 // no-env manual launch must NOT land the trust-boundary socket in world-writable
@@ -41,6 +43,21 @@ async function main() {
       server.log.warn(`could not chmod anasd socket to 0600: ${(err as Error).message}`)
     }
     server.log.info(`anasd listening on ${SOCKET_PATH}${MOCK ? ' (mock mode)' : ''}`)
+
+    // AHR boot scan (AHR-DESIGN §5.1/§8, GT-8): recover inactive-assembled
+    // arrays via the verified ladder, flip orphaned 'running' expansion
+    // intents to 'halted' (operator must Resume), and re-attach observation of
+    // kernel-owned reshapes. Non-blocking; failures are logged, never fatal.
+    // Skipped in mock mode — there is no real md state to recover.
+    if (!MOCK) {
+      const executor = (server as unknown as { executor: CommandExecutor }).executor
+      void ahrBootScan(executor).then((report) => {
+        if (report.recovered.length || report.haltedIntents.length || report.observedReshapes.length)
+          server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
+      }).catch((err) => {
+        server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
+      })
+    }
   }
   catch (err) {
     server.log.error(err)
