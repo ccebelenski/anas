@@ -134,6 +134,52 @@ describe('scrubAhrPool (Epic 11 + AHR)', () => {
     assert.ok(notify!.args[4].includes('csum=2'))
   })
 
+  // Bug #7 (code review): a `resync=PENDING` md check (syncPending set, sync
+  // still null — e.g. an auto-read-only array parks its check) is IN-FLIGHT,
+  // not finished. Treating it as done lets the next band's check start; when
+  // the pending one later fires, two full-device reads run concurrently,
+  // breaking the strictly-sequential guarantee (§4).
+  it('treats a resync=PENDING md check as in-flight — waits it out before the next band', async () => {
+    const executor = baseExecutor()
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'start', MOUNTPOINT], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: ['scrub', 'status', MOUNTPOINT], result: { stdout: scrubStatus('finished'), stderr: '', exitCode: 0 } })
+
+    // md127's check parks as PENDING first, then runs, then finishes; only then
+    // may md126's check start.
+    const pendingR1 = [
+      'Personalities : [raid1] ',
+      'md127 : active raid1 sdd1[1] sdc1[0]',
+      '      1044992 blocks super 1.2 [2/2] [UU]',
+      '      \tresync=PENDING',
+      '      ',
+      'md126 : active raid1 sdf1[1] sde1[0]',
+      '      1044992 blocks super 1.2 [2/2] [UU]',
+      '      ',
+      'unused devices: <none>',
+      '',
+    ].join('\n')
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], results: [
+      { stdout: pendingR1, stderr: '', exitCode: 0 }, // r1 PENDING → must NOT advance to r2
+      { stdout: mdstat([{ kernel: 'md127', checkPercent: 20 }, { kernel: 'md126' }]), stderr: '', exitCode: 0 }, // r1 running
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 }, // r1 done → r2
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126', checkPercent: 60 }]), stderr: '', exitCode: 0 }, // r2 running
+      { stdout: mdstat([{ kernel: 'md127' }, { kernel: 'md126' }]), stderr: '', exitCode: 0 }, // r2 done
+    ] })
+
+    const result = await scrubAhrPool(executor, pool(), () => {}, { pollIntervalMs: 1 })
+    assert.equal(result.checkedArrays, 2)
+
+    const calls = executor.calls
+    const checkR1 = calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check' && c.args[1] === '/dev/md/t2-r1')
+    const checkR2 = calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check' && c.args[1] === '/dev/md/t2-r2')
+    assert.ok(checkR1 >= 0 && checkR2 > checkR1, 'both checks issued, r1 before r2')
+    // The PENDING poll must NOT release r2: the pending + running polls both sit
+    // between the two checks. Without the fix, r2 starts right after the single
+    // PENDING poll (one cat between).
+    const catsBetween = calls.slice(checkR1 + 1, checkR2).filter(c => c.command === '/usr/bin/cat').length
+    assert.ok(catsBetween >= 2, `r1 was waited through PENDING before r2 started (saw ${catsBetween} poll(s))`)
+  })
+
   it('aborted btrfs scrub fails the job', async () => {
     const executor = baseExecutor()
     executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: scrubStatus('aborted'), stderr: '', exitCode: 0 } })

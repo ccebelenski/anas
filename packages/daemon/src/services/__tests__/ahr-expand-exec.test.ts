@@ -377,6 +377,55 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
       assert.equal((await readIntent('tank', dir))?.state, 'halted')
       assert.equal(notifyCalls(executor, 'error').length, 1)
     })
+
+    // Bug #6 (code review): with a hot spare (§11) attached, its slice sits as a
+    // spare in the same band. `--grow --raid-devices=N` may absorb the HOT SPARE
+    // into the new slot instead of the intended new slice — silently converting
+    // the spare disk to a data member. The grow must be made deterministic:
+    // remove the spare slice first, grow with only the new slice spare, re-add.
+    it('§11: pulls the hot-spare slice out BEFORE the grow, then re-adds it', async () => {
+      const S = 'ata-TANK_S'
+      const withSpare = `Personalities : [raid1] [raid5]
+md126 : active raid1 sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md127 : active raid5 sde1[4](S) sds1[2] sdr1[1] sdq1[0]
+      4190208 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+
+unused devices: <none>
+`
+      const afterGrow = `Personalities : [raid1] [raid5]
+md126 : active raid1 sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md127 : active raid5 sdt1[3] sds1[2] sdr1[1] sdq1[0]
+      4190208 blocks super 1.2 level 5, 512k chunk, algorithm 2 [4/4] [UUUU]
+
+unused devices: <none>
+`
+      const executor = world({ mdstat: [withSpare, afterGrow] })
+      executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${W}`), result: { stdout: diskJson('sdt', SIZE_4G, [{ name: 'sdt1', size: B1_INTERIOR, label: 'tank-d4-b1' }, { name: 'sdt2', size: B2_INTERIOR, label: 'tank-d4-b2' }]), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${S}`), result: { stdout: diskJson('sde', SIZE_2G, [{ name: 'sde1', size: B1_INTERIOR, label: 'tank-d5-b1' }]), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+      const spareDisk = { id: S, sizeBytes: SIZE_2G, usableBytes: 2 * GIB, model: null, serial: null, role: 'spare' as const, partitions: [{ device: `/dev/disk/by-id/${S}-part1`, band: 1, sizeBytes: B1_INTERIOR }] }
+      const poolWithSpare: AhrPool = { ...mkPool(), disks: [spareDisk] }
+
+      const outcome = await executeExpansion(
+        executor,
+        { pool: poolWithSpare, intent: mkIntent([X, Y, Z, W]), plan: mkPlan([B1_GROWN, B2], [{ kind: 'array-grow', target: 'md/tank-r1' }]) },
+        () => {},
+        { intentDir: dir, pollIntervalMs: 1, log: () => {} },
+      )
+      assert.equal(outcome.ok, true, outcome.error)
+      const md = mutatingCalls(executor).filter(c => c.command === MDADM)
+      assert.deepEqual(md.map(c => c.args), [
+        ['/dev/md127', '--add', `/dev/disk/by-id/${W}-part1`],
+        ['/dev/md127', '--remove', `/dev/disk/by-id/${S}-part1`], // spare pulled FIRST
+        ['--grow', '/dev/md127', '--raid-devices=4'],
+        ['/dev/md127', '--add-spare', `/dev/disk/by-id/${S}-part1`], // coverage restored
+      ])
+    })
   })
 
   describe('array-convert', () => {
@@ -599,6 +648,35 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
       assert.equal(outcome.ok, true, outcome.error)
       assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/bin/btrfs', 'filesystem', 'resize', 'max', '/mnt/anas-ahr/tank']])
     })
+
+    // Bug #3 (code review): findmnt appends the mounted subvolume to a btrfs
+    // source (`…-vol[/@data]`) — matching it raw against the mapper path MISSES
+    // every §12 subvol-layout pool, so fs-grow deterministically halted with
+    // "filesystem is not mounted" on EVERY new pool's expansion.
+    it('fs-grow matches a §12 subvol mount whose findmnt source carries [/@data]', async () => {
+      const usage = (deviceSize: number): string => [
+        'Overall:',
+        `    Device size:\t\t${deviceSize}`,
+        '    Used:\t\t1024',
+        `    Free (estimated):\t\t${deviceSize - 4096}\t(min: ${deviceSize - 8192})`,
+        '',
+      ].join('\n')
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: vgsJson(0), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: lvsJson(5 * GIB), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/findmnt', result: { stdout: JSON.stringify({ filesystems: [{
+        target: '/mnt/anas-ahr/tank',
+        source: '/dev/mapper/tank-tank--vol[/@data]', // the real subvol-layout source form
+        fstype: 'btrfs',
+        options: 'rw,relatime,subvolid=256,subvol=/@data',
+      }] }), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: usage(3 * GIB), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+      const outcome = await run(executor, mkPlan([B1, B2], [{ kind: 'fs-grow', target: 'tank-vol' }]), [X, Y, Z])
+      assert.equal(outcome.ok, true, outcome.error) // before the fix: halts "not mounted"
+      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/bin/btrfs', 'filesystem', 'resize', 'max', '/mnt/anas-ahr/tank']])
+    })
   })
 
   describe('completion bookkeeping', () => {
@@ -773,5 +851,44 @@ unused devices: <none>
       executeReadd(executor, { pool: mkPool(), diskId: 'ata-GONE' }, () => {}, { pollIntervalMs: 1 }),
       /not present/,
     )
+  })
+
+  // Bug #4 (code review): a disk that dropped and returned WITHOUT a reboot
+  // re-enumerates under a NEW kernel name, so the array's faulty slot still
+  // names the OLD (now-absent) node. Matching on the returning disk's CURRENT
+  // name misses it — the stale slot lingers, `--re-add` is refused, and the
+  // differential catch-up silently degrades to a full rebuild. The stale slot
+  // must be cleared by IDENTITY (detached), not by current name.
+  it('reboot-less return under a NEW kernel name: clears the DETACHED slot, then --re-add', async () => {
+    // md127 lists the OLD sdq1 faulty; X has come back as sdw (new name).
+    const stale = `Personalities : [raid1] [raid5]
+md126 : active raid1 sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md127 : active raid5 sds1[2] sdr1[1] sdq1[0](F)
+      4190208 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [_UU]
+
+unused devices: <none>
+`
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], results: [stale, MDSTAT_BASE].map(s => ({ stdout: s, stderr: '', exitCode: 0 })) })
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md127'], result: { stdout: exportFor('tank-r1', 'raid5', 3, R1_UUID), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, args: ['--detail', '--export', '/dev/md126'], result: { stdout: exportFor('tank-r2', 'raid1', 2, R2_UUID), stderr: '', exitCode: 0 } })
+    // X returns under a NEW kernel name (sdw), same by-id, same band label.
+    executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${X}`), result: { stdout: diskJson('sdw', SIZE_2G, [{ name: 'sdw1', size: B1_CLAMPED_2G, label: 'tank-d1-b1' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, args: ['--examine', '--export', `/dev/disk/by-id/${X}-part1`], result: { stdout: `MD_UUID=${R1_UUID}\n`, stderr: '', exitCode: 0 } })
+    // The stale faulty device sdq1 is now ABSENT (X re-enumerated) → detached.
+    executor.addFixture({ command: '/usr/bin/realpath', args: ['/dev/sdq1'], result: { stdout: '', stderr: 'No such file', exitCode: 1 } })
+    executor.addFixture({ command: MDADM, args: ['/dev/md127', '--re-add', `/dev/disk/by-id/${X}-part1`], result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    const out = await executeReadd(executor, { pool: mkPool(), diskId: X }, () => {}, { pollIntervalMs: 1, log: () => {} })
+    assert.deepEqual(out.bands, [{ band: 1, mode: 'differential' }], 'differential path taken, NOT a silent full rebuild')
+    const mdadmCalls = executor.calls.filter(c => c.command === MDADM && c.args[0] !== '--detail' && c.args[0] !== '--examine')
+    assert.deepEqual(mdadmCalls.map(c => c.args), [
+      ['/dev/md127', '--remove', 'detached'], // stale slot cleared by identity
+      ['/dev/md127', '--re-add', `/dev/disk/by-id/${X}-part1`],
+    ])
   })
 })

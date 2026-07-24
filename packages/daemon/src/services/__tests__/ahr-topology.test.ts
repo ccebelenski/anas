@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { describe, it } from 'node:test'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
 import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
@@ -323,5 +325,61 @@ describe('readAhrPools', () => {
     foreign.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: ok(loadFixture('mdstat-clean.txt')) })
     foreign.addFixture({ command: '/usr/sbin/mdadm', result: ok('MD_LEVEL=raid1\nMD_DEVNAME=foreign0\nMD_NAME=otherhost:foreign0\n') })
     assert.deepEqual(await readAhrPools(foreign), [])
+  })
+
+  // Bug #2 (code review): a `<pool>-r<N>`-NAMED bare md array (e.g. a hand-built
+  // `media-r1`) must NOT be claimed as an AHR pool unless there is evidence
+  // ANAS built it — the matching LVM VG, or an ANAS-authored mdadm.conf pin.
+  // Otherwise it cards critical and DELETE offers to zero its superblocks.
+  describe('foreign name-collision ownership gate', () => {
+    const MEDIA_UUID = 'dddddddd:dddddddd:dddddddd:dddddddd'
+    // A bare `media-r1` array — NO `media` VG in the vgs fixture (only ahr0).
+    const MEDIA_MDSTAT = `Personalities : [raid1]
+md40 : active raid1 sdy1[1] sdx1[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+unused devices: <none>
+`
+    const MEDIA_EXPORT = `MD_LEVEL=raid1\nMD_DEVICES=2\nMD_METADATA=1.2\nMD_UUID=${MEDIA_UUID}\nMD_DEVNAME=media-r1\nMD_NAME=anas-pve:media-r1\n`
+
+    function foreignExecutor(): MockExecutor {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: ok(MEDIA_MDSTAT) })
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md40'), result: ok(MEDIA_EXPORT) })
+      mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok('{"blockdevices":[]}') })
+      mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok('') })
+      // vgs/lvs have ONLY ahr0 — no `media` VG or LV.
+      mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(loadFixture('lvm-vgs.json')) })
+      mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(loadFixture('lvm-lvs.json')) })
+      mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('') })
+      return mock
+    }
+
+    let confDir: string
+    beforeEach(async () => {
+      confDir = await mkdtemp(join(tmpdir(), 'ahr-conf-'))
+    })
+    afterEach(async () => {
+      await rm(confDir, { recursive: true, force: true })
+    })
+
+    it('does NOT report a VG-less, unpinned name-collision array', async () => {
+      const confPath = join(confDir, 'mdadm.conf')
+      await writeFile(confPath, '# nothing ANAS pinned here\nMAILADDR root\n')
+      const pools = await readAhrPools(foreignExecutor(), confPath)
+      assert.deepEqual(pools, [], 'a bare foreign media-r1 is never claimed as pool "media"')
+    })
+
+    it('STILL reports a failed pool whose VG is gone but whose array is pinned', async () => {
+      // The ANAS-authored marker: an ARRAY pin by the array's UUID. VG is gone
+      // (not in the vgs fixture) → the pool is genuinely FAILED, which is
+      // exactly what must stay visible/reportable.
+      const confPath = join(confDir, 'mdadm.conf')
+      await writeFile(confPath, `ARRAY /dev/md/media-r1 metadata=1.2 UUID=${MEDIA_UUID}\n`)
+      const pools = await readAhrPools(foreignExecutor(), confPath)
+      assert.equal(pools.length, 1)
+      assert.equal(pools[0].name, 'media')
+      assert.equal(pools[0].state, 'failed', 'pinned-but-VG-gone reports as failed, not hidden')
+    })
   })
 })

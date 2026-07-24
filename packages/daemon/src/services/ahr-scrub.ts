@@ -143,9 +143,13 @@ export async function scrubAhrPool(
     for (;;) {
       const md = parseMdstat((await run(executor, CAT, MDSTAT_CAT_ARGS)).stdout)
         .find(a => a.kernelName === kernelName)
-      // Array gone from mdstat, or its check finished (and is not queued
-      // behind another sync): move to the next band.
-      if (!md || (md.sync?.action !== 'check' && !md.syncDelayed))
+      // Array gone from mdstat, or its check finished (and is not queued/parked
+      // behind another sync): move to the next band. A `resync=PENDING` check
+      // (syncPending, sync still null — e.g. an auto-read-only array parks its
+      // check until first write, GT-9) is IN-FLIGHT, not finished: treating it
+      // as done lets the next band's check start and the pending one later
+      // fires concurrently, breaking the strictly-sequential guarantee (§4).
+      if (!md || (md.sync?.action !== 'check' && !md.syncDelayed && !md.syncPending))
         break
       updateProgress(`md check on ${label}${md.sync ? ` (${md.sync.percent.toFixed(1)}%)` : ' (queued)'}`)
       await sleep(interval)

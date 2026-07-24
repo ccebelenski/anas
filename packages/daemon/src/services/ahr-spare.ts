@@ -1,7 +1,7 @@
 import type { AhrPool, AhrPreviewBand } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import { clearGhostMdSignatures } from './ahr-create.js'
-import { addSpareSlice, ensureDiskPartitions, projectExistingBands, readDiskTree, resolveAhrArrays } from './ahr-expand-exec.js'
+import { addSpareSlice, ensureDiskPartitions, projectExistingBands, readDiskTree, removeDetachedFaultySlots, resolveAhrArrays } from './ahr-expand-exec.js'
 import { floorToGranularity } from './ahr-layout.js'
 
 /**
@@ -31,7 +31,6 @@ const WIPEFS = '/usr/sbin/wipefs'
 const SGDISK = '/usr/sbin/sgdisk'
 const MDADM = '/usr/sbin/mdadm'
 const UDEVADM = '/usr/bin/udevadm'
-const REALPATH = '/usr/bin/realpath'
 
 const GIB = 1024 ** 3
 
@@ -183,22 +182,13 @@ export async function attachSpare(
 
   // --- Slot hygiene (§11): faulty slots whose device is ABSENT are removed.
   // `--remove detached` is md's own "absent" test — a faulty-but-PRESENT disk
-  // is deliberately left alone (Re-add 11.9 / Replace territory).
+  // is deliberately left alone (Re-add 11.9 / Replace territory). The shared
+  // helper (ahr-expand-exec) is the single implementation, reused by Re-add.
   for (const [band, arr] of [...arrays.entries()].sort((a, b) => a[0] - b[0])) {
-    const faulty = arr.md.members.filter(m => m.faulty)
-    if (faulty.length === 0)
-      continue
-    let anyAbsent = false
-    for (const m of faulty) {
-      const real = await executor.exec(REALPATH, [`/dev/${m.device}`])
-      if (real.exitCode !== 0)
-        anyAbsent = true
+    if (await removeDetachedFaultySlots(executor, arr.dev, arr.md.members)) {
+      updateProgress(`removed detached faulty slot(s) from ${pool.name}-r${band}`)
+      log(`ahr.spare pool=${pool.name} band=${band} hygiene=remove-detached`)
     }
-    if (!anyAbsent)
-      continue
-    updateProgress(`removing detached faulty slot(s) from ${pool.name}-r${band}`)
-    const r = await executor.exec(MDADM, [arr.dev, '--remove', 'detached'])
-    log(`ahr.spare pool=${pool.name} band=${band} hygiene=remove-detached result=${r.exitCode === 0 ? 'ok' : `failed detail=${r.stderr.trim()}`}`)
   }
 
   // --- Wipe + full band-slice geometry (§2.6 — the shared code paths).

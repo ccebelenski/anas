@@ -268,4 +268,22 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.equal(res.json().error.code, 'VALIDATION_ERROR')
     assert.ok(res.json().error.message.includes('at least 2 disks'))
   })
+
+  // Bug #5 (code review): the pool name becomes the LVM VG name, and vgcreate
+  // runs only AFTER the disks are wiped — so a name colliding with an existing
+  // VG (e.g. 'pve') would pass confirm, wipe disks, then die at vgcreate. The
+  // route must refuse BEFORE the confirm gate, with nothing touched.
+  it('refuses (409) when the pool name collides with an existing LVM VG — before wiping', async () => {
+    // A VG named 'tpool' already exists (and it is NOT an AHR pool).
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: JSON.stringify({ report: [{ vg: [
+      { vg_name: 'tpool', pv_count: '1', lv_count: '0', snap_count: '0', vg_attr: 'wz--n-', vg_size: '<2.49g', vg_free: '0 ' },
+    ] }] }), stderr: '', exitCode: 0 } })
+
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }) })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT', 'a hard block, not a confirm')
+    assert.ok(res.json().error.message.includes('volume group'))
+    assert.ok(!res.headers['x-anas-confirm-code'], 'refused before the confirm gate')
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'), 'no disk was wiped')
+  })
 })

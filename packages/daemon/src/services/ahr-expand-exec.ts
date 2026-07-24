@@ -17,7 +17,7 @@ import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
 import { floorToGranularity } from './ahr-layout.js'
 import { pinArrays } from './ahr-mdadm-conf.js'
-import { AHR_FINDMNT_ARGS } from './ahr-topology.js'
+import { AHR_FINDMNT_ARGS, stripSubvolSuffix } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
 
 /**
@@ -49,6 +49,7 @@ const LSBLK = '/usr/bin/lsblk'
 const SGDISK = '/usr/sbin/sgdisk'
 const MDADM = '/usr/sbin/mdadm'
 const UDEVADM = '/usr/bin/udevadm'
+const REALPATH = '/usr/bin/realpath'
 const UPDATE_INITRAMFS = '/usr/sbin/update-initramfs'
 const PVCREATE = '/usr/sbin/pvcreate'
 const PVRESIZE = '/usr/sbin/pvresize'
@@ -444,6 +445,36 @@ export async function addSpareSlice(
   return true
 }
 
+/**
+ * Slot hygiene shared by spare-attach (§11) and Re-add (11.9): remove any
+ * FAULTY member of `arrayDev` whose device node is now ABSENT — md's own
+ * "detached" test. This is the returned-disk case that a name match misses: a
+ * disk that dropped and came back WITHOUT a reboot re-enumerates under a NEW
+ * kernel name, so the array's faulty slot still names the OLD (now-absent)
+ * node. `mdadm --remove detached` clears exactly those slots (never a
+ * faulty-but-PRESENT disk — that stays for Replace/Re-add to own). Returns
+ * true when a `--remove detached` was actually issued.
+ */
+export async function removeDetachedFaultySlots(
+  executor: CommandExecutor,
+  arrayDev: string,
+  members: readonly MdstatArray['members'][number][],
+): Promise<boolean> {
+  const faulty = members.filter(m => m.faulty)
+  if (faulty.length === 0)
+    return false
+  let anyAbsent = false
+  for (const m of faulty) {
+    const real = await executor.exec(REALPATH, [`/dev/${m.device}`])
+    if (real.exitCode !== 0)
+      anyAbsent = true
+  }
+  if (!anyAbsent)
+    return false
+  await executor.exec(MDADM, [arrayDev, '--remove', 'detached'])
+  return true
+}
+
 // ---- reshape-wait ----------------------------------------------------------
 
 interface WaitContext {
@@ -542,6 +573,64 @@ function previewBand(ctx: StepContext, band: number): AhrPreviewBand {
   return pb
 }
 
+/** Pool hot spares whose §2.5-rounded usable size reaches this band's top edge. */
+function bandCoveringSpares(pool: AhrPool, pb: AhrPreviewBand): AhrPool['disks'] {
+  return pool.disks.filter(d => d.role === 'spare' && d.usableBytes >= pb.range.endBytes)
+}
+
+/**
+ * Detach the pool's hot-spare slices from a band array BEFORE a --grow /
+ * --convert reshape (§11, the spare-absorption guard): with BOTH the newly
+ * added member slice and a hot-spare slice sitting as spares, md's reshape may
+ * absorb the HOT SPARE into the new raid slot instead of the intended new
+ * slice — silently converting the spare disk into a data member while the new
+ * disk stays spare. Removing the spare slices first (a spare `--remove` is
+ * instant and safe) leaves ONLY the intended new slice as a spare, so md fills
+ * the new slot deterministically. Idempotent: a spare slice that is not
+ * currently a member of this band is skipped (resume path).
+ */
+async function detachBandSpares(
+  executor: CommandExecutor,
+  poolName: string,
+  band: number,
+  resolved: ResolvedArray,
+  spares: AhrPool['disks'],
+): Promise<void> {
+  const memberKernels = new Set(resolved.md.members.map(m => m.device))
+  for (const s of spares) {
+    const disk = await readDiskTree(executor, byIdPath(s.id))
+    const part = disk?.parts.find(p => p.partlabel !== null && bandLabelRe(poolName, band).test(p.partlabel))
+    if (!disk || !part || part.number === null || !memberKernels.has(part.name))
+      continue
+    await execChecked(executor, MDADM, [resolved.dev, '--remove', partByIdPath(s.id, part.number)])
+  }
+}
+
+/**
+ * Re-attach the pool's hot-spare slices to a band after a grow/convert — or
+ * confirm coverage on the no-op/resume path — so a spare NEVER silently loses
+ * coverage (§11). Best-effort: a transient refusal (e.g. mid-reshape) only
+ * logs; the next run re-ensures. `addSpareSlice` is idempotent (an
+ * already-attached slice is skipped).
+ */
+async function ensureBandSpares(
+  ctx: StepContext,
+  band: number,
+  arrayDev: string,
+  spares: AhrPool['disks'],
+  memberKernels: ReadonlySet<string>,
+): Promise<void> {
+  for (const s of spares) {
+    try {
+      if (await addSpareSlice(ctx.executor, ctx.pool.name, s.id, band, arrayDev, memberKernels))
+        ctx.log(`ahr.expand pool=${ctx.pool.name} band=${band} spare=${s.id} status=re-attached`)
+    }
+    catch (err) {
+      ctx.log(`ahr.expand pool=${ctx.pool.name} band=${band} spare=${s.id} warn=reattach-failed detail=${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+}
+
 /** Run one step. Returns true when the step was a detected no-op. */
 async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolean> {
   const { executor, pool } = ctx
@@ -558,17 +647,29 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       const resolved = arrays.get(band)
       if (!resolved)
         throw new Error(`array ${pool.name}-r${band} not found — cannot grow an array that does not exist`)
+      const spares = bandCoveringSpares(pool, pb)
       const current = new Set(resolved.md.members.map(m => m.device))
       const members = await expectedBandMembers(executor, pool.name, pb, ctx.intent.approvedDisks)
       const toAdd = members.filter(m => !current.has(m.partKernel))
       const raidDevices = resolved.detail.devices ?? resolved.md.raidDevices ?? 0
-      if (toAdd.length === 0 && raidDevices >= pb.memberCount)
+      if (toAdd.length === 0 && raidDevices >= pb.memberCount) {
+        // Already grown — still ensure the hot spares cover this band (a resume
+        // that landed after the grow must not leave coverage dropped).
+        await ensureBandSpares(ctx, band, resolved.dev, spares, current)
         return true
+      }
       for (const m of toAdd)
         await execChecked(executor, MDADM, [resolved.dev, '--add', m.partByIdPath])
       if (raidDevices < pb.memberCount) {
+        // §11 spare-absorption guard: pull the hot-spare slices out of THIS band
+        // first so md cannot absorb a spare into the new raid slot; grow with
+        // only the intended new slice present as a spare, then re-attach.
+        await detachBandSpares(executor, pool.name, band, resolved, spares)
         // NO --backup-file, ever (§5.1/GT-6): offsets carry the critical section.
         await execChecked(executor, MDADM, ['--grow', resolved.dev, `--raid-devices=${pb.memberCount}`])
+        const post = (await resolveAhrArrays(executor, pool.name)).get(band)
+        if (post)
+          await ensureBandSpares(ctx, band, post.dev, spares, new Set(post.md.members.map(m => m.device)))
       }
       return false
     }
@@ -582,14 +683,22 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       const resolved = arrays.get(band)
       if (!resolved)
         throw new Error(`array ${pool.name}-r${band} not found — cannot convert an array that does not exist`)
+      const spares = bandCoveringSpares(pool, pb)
       const raidDevices = resolved.detail.devices ?? resolved.md.raidDevices ?? 0
       const level = resolved.detail.level ?? resolved.md.personality
-      if (level === pb.level && raidDevices >= pb.memberCount)
-        return true // already converted
+      if (level === pb.level && raidDevices >= pb.memberCount) {
+        // Already converted — still confirm spare coverage (resume path).
+        await ensureBandSpares(ctx, band, resolved.dev, spares, new Set(resolved.md.members.map(m => m.device)))
+        return true
+      }
       const current = new Set(resolved.md.members.map(m => m.device))
       const members = await expectedBandMembers(executor, pool.name, pb, ctx.intent.approvedDisks)
       for (const m of members.filter(x => !current.has(x.partKernel)))
         await execChecked(executor, MDADM, [resolved.dev, '--add', m.partByIdPath])
+      // §11 spare-absorption guard (same as array-grow): a hot spare's slice
+      // sits in this band as a spare too; detach before the level/width reshape
+      // so md cannot absorb it into a new slot, then re-attach after.
+      await detachBandSpares(executor, pool.name, band, resolved, spares)
       if (level !== pb.level) {
         // One-shot level+count change (GT-7); offset-based, NO --backup-file.
         await execChecked(executor, MDADM, ['--grow', resolved.dev, `--level=${levelNumber(pb.level)}`, `--raid-devices=${pb.memberCount}`])
@@ -597,6 +706,9 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       else {
         await execChecked(executor, MDADM, ['--grow', resolved.dev, `--raid-devices=${pb.memberCount}`])
       }
+      const post = (await resolveAhrArrays(executor, pool.name)).get(band)
+      if (post)
+        await ensureBandSpares(ctx, band, post.dev, spares, new Set(post.md.members.map(m => m.device)))
       return false
     }
 
@@ -773,7 +885,11 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
         throw new Error(`logical volume '${pool.name}/${pool.lv.name}' not found — refusing to grow the filesystem`)
       const mapperPath = `/dev/mapper/${dmName(pool.name, pool.lv.name)}`
       const mounts = parseFindmnt(await execChecked(executor, FINDMNT, AHR_FINDMNT_ARGS))
-      const mount = mounts.find(m => m.source === mapperPath)
+      // findmnt appends the mounted subvolume to a btrfs source
+      // (`…-vol[/@data]`) — strip it before matching, else EVERY §12
+      // subvol-layout pool's fs-grow halts here (the same class of bug fixed in
+      // ahr-topology.ts; shared helper, never a raw `source === mapperPath`).
+      const mount = mounts.find(m => stripSubvolSuffix(m.source) === mapperPath)
       if (!mount)
         throw new Error(`pool '${pool.name}' filesystem is not mounted — btrfs can only be resized mounted`)
       const usageRes = await executor.exec(BTRFS, btrfsUsageArgs(mount.target))
@@ -1141,10 +1257,26 @@ export async function executeReadd(
   const degradedNotified = new Set<string>()
   for (const c of candidates) {
     const label = `${pool.name}-r${c.band}`
-    // Clear the faulty slot when the old incarnation is still attached.
+    // Clear the stale faulty slot so `--re-add` is ACCEPTED — identified by
+    // what the slot IS, not what the returning disk is called now:
+    //  - the returning partition itself, if still listed faulty (the disk came
+    //    back under the SAME kernel name, e.g. after a reboot);
+    //  - any faulty member whose device node is now ABSENT (detached) — the
+    //    reboot-less return re-enumerates under a NEW name, so the array's
+    //    faulty slot names the OLD (gone) node and a name match misses it.
+    // Without this, the stale slot lingers, `--re-add` is refused, and 11.9's
+    // differential catch-up silently degrades to a full rebuild.
     if (c.array.md.members.some(m => m.device === c.partKernel && m.faulty)) {
+      // Same-name return (e.g. after a reboot): the faulty slot IS this exact
+      // partition — remove it by path.
       updateProgress(`removing faulty slot ${c.partKernel} from ${label}`)
       await executor.exec(MDADM, [c.array.dev, '--remove', c.partPath])
+    }
+    else if (await removeDetachedFaultySlots(executor, c.array.dev, c.array.md.members)) {
+      // Reboot-less return: the disk re-enumerated under a NEW name, so the
+      // array's faulty slot names the OLD (now-absent) node — cleared as
+      // detached so the following `--re-add` is accepted.
+      updateProgress(`removed detached faulty slot(s) from ${label}`)
     }
 
     updateProgress(`re-adding ${c.partPath} to ${label}`)

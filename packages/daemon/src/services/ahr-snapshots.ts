@@ -1,6 +1,6 @@
 import type { AhrPool, AhrSnapshot } from '@anas/shared'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, rmdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { AhrSnapshotName } from '@anas/shared'
 import {
@@ -34,6 +34,7 @@ const BTRFS = '/usr/bin/btrfs'
 const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 const MV = '/usr/bin/mv'
+const FINDMNT = '/usr/bin/findmnt'
 
 /** Leading-slash strip for a `subvol=/@data` value. */
 const LEADING_SLASH_RE = /^\/+/
@@ -105,10 +106,44 @@ export function isSubvolLayoutMount(options: string): boolean {
 // ---- On-demand top-level mount ----------------------------------------------
 
 /**
+ * Per-mountpoint-path serialization for the on-demand top-level mount. Two
+ * concurrent snapshot jobs for the SAME pool would otherwise stack mounts on
+ * the one `/run/anas-ahr/<pool>.toplevel` path (JobQueue concurrency is 4 and
+ * the routes gate only on expansion intents) — the inner umount then leaves an
+ * outer mount live, and any cleanup of the path would be operating over a
+ * still-mounted btrfs top-level. Serializing on the mnt path makes stacking
+ * impossible; distinct pools (distinct paths) still run concurrently. The map
+ * holds at most one (non-rejecting) tail per path — bounded by pool count.
+ */
+const topLevelMountChains = new Map<string, Promise<unknown>>()
+
+function serializeOnPath<T>(path: string, task: () => Promise<T>): Promise<T> {
+  const prev = topLevelMountChains.get(path) ?? Promise.resolve()
+  const result = prev.then(task, task)
+  topLevelMountChains.set(path, result.then(() => undefined, () => undefined))
+  return result
+}
+
+/** Is `path` still an active mountpoint? (findmnt reads the kernel table only.) */
+async function isStillMountpoint(executor: CommandExecutor, path: string): Promise<boolean> {
+  const r = await executor.exec(FINDMNT, ['--mountpoint', path])
+  return r.exitCode === 0
+}
+
+/**
  * Mount the pool's filesystem TOP-LEVEL (`subvolid=5`, so `@data`/`@snapshots`
- * are both reachable) at a private runtime path, run `fn`, and ALWAYS unmount
- * + clean up afterwards — nothing new stays mounted (§12). The runtime path is
+ * are both reachable) at a private runtime path, run `fn`, and ALWAYS tear
+ * down afterwards — nothing new stays mounted (§12). The runtime path is
  * pool-scoped under /run (tmpfs, root-owned).
+ *
+ * Teardown safety (data-loss critical): the mountpoint is NEVER recursively
+ * removed — a recursive rm over a still-mounted btrfs top-level would unlink
+ * pool DATA. Instead: umount, and only remove the directory with a
+ * non-recursive `rmdir` (which cannot delete a non-empty/mounted dir — it just
+ * fails harmlessly). If the umount fails AND the path is verifiably still a
+ * mountpoint, the leak is surfaced LOUDLY (a job error) rather than swallowed,
+ * and nothing is removed. Concurrent ops on the same pool are serialized so
+ * two jobs can never stack mounts on the one path.
  */
 export async function withTopLevelMount<T>(
   executor: CommandExecutor,
@@ -117,16 +152,43 @@ export async function withTopLevelMount<T>(
   opts?: AhrSnapshotOptions,
 ): Promise<T> {
   const mnt = join(runtimeBase(opts), `${pool.name}.toplevel`)
-  await mkdir(mnt, { recursive: true })
-  await run(executor, MOUNT, ['-t', 'btrfs', '-o', 'subvolid=5', lvDevice(pool), mnt])
-  try {
-    return await fn(mnt)
-  }
-  finally {
-    // Best-effort teardown — a failed unmount must not mask the op's own error.
-    await executor.exec(UMOUNT, ['--', mnt])
-    await rm(mnt, { recursive: true, force: true }).catch(() => {})
-  }
+  return serializeOnPath(mnt, async () => {
+    await mkdir(mnt, { recursive: true })
+    await run(executor, MOUNT, ['-t', 'btrfs', '-o', 'subvolid=5', lvDevice(pool), mnt])
+
+    let opError: unknown
+    let result!: T
+    let ok = false
+    try {
+      result = await fn(mnt)
+      ok = true
+    }
+    catch (err) {
+      opError = err
+    }
+
+    // Teardown. A failed unmount must not mask the op's own error, but a
+    // genuinely leaked (still-mounted) path must surface loudly.
+    const um = await executor.exec(UMOUNT, ['--', mnt])
+    if (um.exitCode !== 0 && await isStillMountpoint(executor, mnt)) {
+      // Do NOT remove anything — the top-level is still mounted; a recursive
+      // wipe here is the data-loss the whole guard exists to prevent.
+      const leak = new Error(
+        `failed to unmount the on-demand top-level mount at '${mnt}' for pool '${pool.name}' `
+        + `(${um.stderr.trim() || `umount exited ${um.exitCode}`}) — it is still mounted; `
+        + `left in place to protect pool data. Free any holder and retry.`,
+      )
+      if (!ok)
+        throw opError // the op's own failure is the more informative one
+      throw leak
+    }
+    // Unmounted (or the umount 'failure' was a transient the path already
+    // cleared): non-recursive rmdir only — best-effort, never recursive.
+    await rmdir(mnt).catch(() => {})
+    if (!ok)
+      throw opError
+    return result
+  })
 }
 
 // ---- Naming -----------------------------------------------------------------

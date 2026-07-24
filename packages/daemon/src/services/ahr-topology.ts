@@ -18,11 +18,14 @@ import { btrfsUsageArgs, parseBtrfsUsage } from '../parsers/btrfs-usage.js'
 import { parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { LVS_ARGS, parseLvsReport, parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
+import { hasArray, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { readIntent } from './ahr-intent.js'
 import { AHR_MIN_DISKS, floorToGranularity } from './ahr-layout.js'
+import { DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
 import { isSubvolLayoutMount } from './ahr-snapshots.js'
+import { readConfig } from './config-writer.js'
 
 /**
  * AHR pool topology reader (Epic 11 + AHR, docs/AHR-DESIGN.md §3/§5.3).
@@ -178,8 +181,12 @@ const SUBVOL_SOURCE_SUFFIX_RE = /\[[^\]]*\]$/
  * A findmnt mount source with any trailing btrfs-subvolume suffix removed:
  * `/dev/mapper/tank-tank--vol[/@data]` → `/dev/mapper/tank-tank--vol`. A source
  * with no suffix (a flat `subvol=/` mount, or a non-btrfs source) is unchanged.
+ * Exported as the single home of this normalization: every findmnt-source
+ * comparison against a mapper path (topology here, fs-grow in ahr-expand-exec)
+ * MUST run through it — a raw `source === mapperPath` MISSES every §12
+ * subvol-layout pool.
  */
-function stripSubvolSuffix(source: string): string {
+export function stripSubvolSuffix(source: string): string {
   return source.replace(SUBVOL_SOURCE_SUFFIX_RE, '')
 }
 
@@ -235,7 +242,7 @@ function arrayState(md: MdstatArray): ArrayState {
  * {@link AhrPool} records; an empty list when no AHR arrays exist (or md is
  * absent entirely — fail-open, this is a guest).
  */
-export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]> {
+export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: string): Promise<AhrPool[]> {
   const mdstatRes = await executor.exec(CAT, MDSTAT_CAT_ARGS)
   if (mdstatRes.exitCode !== 0)
     return []
@@ -276,6 +283,14 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
   const lvs = parseLvsReport(lvsRes.stdout)
   const mounts = parseFindmnt(findmntRes.stdout)
 
+  // The ANAS-managed mdadm.conf — an ARRAY pin (by UUID) is the ANAS-authored
+  // ownership marker (§2.6, config-is-the-API). Read fail-open: an unreadable
+  // conf means "no pins", which only ever makes ownership STRICTER (a pool
+  // then needs its VG to be claimed) — never looser.
+  const mdadmConfDoc = parseMdadmConfDoc(
+    await readConfig(mdadmConfPath ?? process.env.ANAS_MDADM_CONF ?? DEFAULT_MDADM_CONF).catch(() => ''),
+  )
+
   // Group arrays by pool, bands ascending.
   const byPool = new Map<string, DiscoveredArray[]>()
   for (const d of discovered) {
@@ -289,6 +304,29 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
   const pools: AhrPool[] = []
   for (const [poolName, arrayEntries] of poolEntries) {
     arrayEntries.sort((a, b) => a.band - b.band)
+
+    // ---- Ownership gate (guest philosophy, §12) -----------------------------
+    // A `<pool>-r<N>`-NAMED md array is claimed as an AHR pool ONLY with
+    // evidence ANAS built (or can adopt) the full stack — otherwise a
+    // hand-built `media-r1` would be seized as pool "media", card critical,
+    // and offer to zero its superblocks + zap its disks. The evidence is
+    // either:
+    //   (a) the matching LVM VG exists — the adoptable mdadm→LVM→btrfs shape
+    //       (stateless adoption stays intact, §5.3), OR
+    //   (b) at least one of the pool's arrays is pinned by UUID in the
+    //       ANAS-managed mdadm.conf — the ANAS-authored marker that keeps a
+    //       genuinely FAILED ANAS pool (VG gone) still visible/reportable.
+    // A name-collision array with NEITHER is foreign: ignored (a log line at
+    // most), never reported.
+    const vg = vgs.find(v => v.name === poolName)
+    const pinned = arrayEntries.some(e => e.detail.uuid !== null && hasArray(mdadmConfDoc, e.detail.uuid))
+    if (!vg && !pinned) {
+      process.stderr.write(
+        `ahr.topology: ignoring foreign md array(s) named '${poolName}-r*' — no LVM VG and not pinned in mdadm.conf; not an ANAS pool\n`,
+      )
+      continue
+    }
+
     const advisories: string[] = []
 
     // ---- Arrays + membership ------------------------------------------------
@@ -423,7 +461,8 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
     })
 
     // ---- VG / LV ------------------------------------------------------------
-    const vg = vgs.find(v => v.name === poolName)
+    // `vg` resolved at the ownership gate above; a missing VG here means a
+    // pinned-but-failed pool (state fuses to 'failed', §3).
     if (!vg)
       advisories.push(`volume group '${poolName}' not found — the LVM layer of this pool is missing or inactive`)
     // The design's one-LV convention is `<pool>-vol`; tolerate a foreign-named

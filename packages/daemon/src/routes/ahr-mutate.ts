@@ -6,6 +6,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrCreateRequest, AhrMountpointRequest, PoolName } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
+import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { readConfig } from '../services/config-writer.js'
 import { confirmGate } from '../safety/gate.js'
 import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
@@ -17,6 +18,7 @@ import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
 
 const FINDMNT = '/usr/bin/findmnt'
+const VGS = '/usr/sbin/vgs'
 const GIB = 1024 ** 3
 
 export interface AhrMutationRouteOptions {
@@ -83,6 +85,18 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if ((await readAhrPools(executor)).some(p => p.name === req.name)) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `AHR pool '${req.name}' already exists` } }
+    }
+
+    // VG-name collision (pre-flight, BEFORE the confirm gate): the pool name
+    // becomes the LVM VG name, and `vgcreate` runs only AFTER the disks are
+    // wiped — so naming a pool after an existing VG (e.g. 'pve', the PVE root
+    // VG) would pass confirm, wipe disks, then die at vgcreate leaving an
+    // orphaned half-stack. Refuse now, while nothing has been touched.
+    const vgsRes = await executor.exec(VGS, VGS_ARGS)
+    const existingVgs = vgsRes.exitCode === 0 ? parseVgsReport(vgsRes.stdout) : []
+    if (existingVgs.some(v => v.name === req.name)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `an LVM volume group named '${req.name}' already exists — the pool name becomes its VG name, so this would collide at vgcreate (after the disks were wiped); choose another name` } }
     }
 
     // Mountpoint override (§2.6): never in PVE's namespace, never a path that

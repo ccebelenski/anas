@@ -1,9 +1,10 @@
 import type { AhrPool } from '@anas/shared'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { setImmediate as tick } from 'node:timers/promises'
 import { AhrSnapshotName } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import {
@@ -15,12 +16,14 @@ import {
   preRollbackName,
   rollbackAhrSnapshot,
   subvolFromMountOptions,
+  withTopLevelMount,
 } from '../ahr-snapshots.js'
 
 const BTRFS = '/usr/bin/btrfs'
 const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 const MV = '/usr/bin/mv'
+const FINDMNT = '/usr/bin/findmnt'
 
 const GIB = 1024 ** 3
 
@@ -265,5 +268,93 @@ describe('rollbackAhrSnapshot', () => {
       executor.calls.some(c => c.command === MOUNT && c.args[0] === '--' && c.args[1] === '/mnt/anas-ahr/tank'),
       'pool remounted in the finally despite the failure',
     )
+  })
+})
+
+// Bug #1 (code review): the withTopLevelMount teardown MUST never recursively
+// remove the mountpoint, and MUST serialize concurrent ops on one pool — a
+// recursive rm over a still-mounted btrfs top-level (from a failed umount or a
+// second job stacking a mount on the same path) would unlink POOL DATA.
+describe('withTopLevelMount teardown safety (data-loss guard)', () => {
+  const ok = { stdout: '', stderr: '', exitCode: 0 }
+  let runtimeDir: string
+  beforeEach(async () => {
+    runtimeDir = await mkdtemp(join(tmpdir(), 'ahr-toplevel-'))
+  })
+  afterEach(async () => {
+    await rm(runtimeDir, { recursive: true, force: true })
+  })
+
+  it('never recursively removes a still-mounted top-level; surfaces the leak loudly', async () => {
+    const pool = mkPool()
+    const mnt = join(runtimeDir, `${pool.name}.toplevel`)
+    await mkdir(mnt, { recursive: true })
+    // A sentinel standing in for pool data reachable through the live mount —
+    // the OLD `rm(mnt, {recursive:true})` would have destroyed it.
+    const sentinel = join(mnt, 'POOL_DATA')
+    await writeFile(sentinel, 'precious')
+
+    const ex = new MockExecutor()
+    ex.addFixture({ command: MOUNT, result: ok })
+    ex.addFixture({ command: UMOUNT, result: { stdout: '', stderr: 'target is busy', exitCode: 32 } })
+    // findmnt --mountpoint exits 0 → the path is STILL a mountpoint.
+    ex.addFixture({ command: FINDMNT, result: ok })
+
+    await assert.rejects(
+      withTopLevelMount(ex, pool, async () => 'done', { runtimeDir }),
+      /still mounted/,
+      'a leaked (still-mounted) teardown is surfaced as a job error, not swallowed',
+    )
+    assert.equal(await readFile(sentinel, 'utf8'), 'precious', 'pool data under the still-mounted path survives')
+  })
+
+  it('does not mask the op error, and never findmnt-probes when umount succeeds', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: MOUNT, result: ok })
+    ex.addFixture({ command: UMOUNT, result: ok })
+    await assert.rejects(
+      withTopLevelMount(ex, mkPool(), async () => { throw new Error('op boom') }, { runtimeDir }),
+      /op boom/,
+      'the operation\'s own error propagates',
+    )
+    assert.ok(!ex.calls.some(c => c.command === FINDMNT), 'no mountpoint probe on a clean umount')
+  })
+
+  it('serializes concurrent top-level mounts on the same pool (no stacked mounts)', async () => {
+    const pool = mkPool()
+    const ex = new MockExecutor()
+    ex.addFixture({ command: MOUNT, result: ok })
+    ex.addFixture({ command: UMOUNT, result: ok })
+    let release1: () => void = () => {}
+    const gate1 = new Promise<void>((r) => {
+      release1 = r
+    })
+    const order: string[] = []
+
+    const p1 = withTopLevelMount(ex, pool, async () => {
+      order.push('fn1-start')
+      await gate1
+      order.push('fn1-end')
+      return 1
+    }, { runtimeDir })
+    const p2 = withTopLevelMount(ex, pool, async () => {
+      order.push('fn2-start')
+      return 2
+    }, { runtimeDir })
+
+    // Wait until fn1 has actually started (real mkdir + mount precede it)...
+    for (let i = 0; i < 200 && order.length === 0; i++)
+      await tick()
+    // ...then give an UNSERIALIZED fn2 ample time to also start + mount (it must
+    // NOT: its whole task, mkdir + mount included, is gated behind fn1).
+    for (let i = 0; i < 100; i++)
+      await tick()
+    assert.deepEqual(order, ['fn1-start'], 'the second op does not start until the first finishes')
+    assert.equal(ex.calls.filter(c => c.command === MOUNT).length, 1, 'only one mount is live at a time')
+
+    release1()
+    assert.deepEqual(await Promise.all([p1, p2]), [1, 2])
+    assert.deepEqual(order, ['fn1-start', 'fn1-end', 'fn2-start'])
+    assert.equal(ex.calls.filter(c => c.command === MOUNT).length, 2)
   })
 })
