@@ -249,6 +249,7 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
       '--metadata=1.2',
       '--name=tpool-r1',
       '--data-offset=8192s',
+      '--bitmap=internal',
       '--run',
       `/dev/disk/by-id/${BLANK_SMALL}-part1`,
       `/dev/disk/by-id/${BLANK_BIG}-part1`,

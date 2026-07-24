@@ -8,7 +8,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { randomUUID } from 'node:crypto'
 import { AhrExpandRequest, AhrReplaceRequest, DiskId, PoolName } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
-import { executeExpansion, executeReplace, projectExistingBands } from '../services/ahr-expand-exec.js'
+import { executeExpansion, executeReadd, executeReplace, projectExistingBands } from '../services/ahr-expand-exec.js'
 import { AhrIntentConflictError, clearIntent, readIntent, writeIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planExpansion } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -505,6 +505,49 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       oldDiskId: replace.oldDiskId,
       newDiskId: replace.newDiskId,
     }, replace)
+    reply.code(202)
+    return { job }
+  })
+
+  // ---- POST /ahr/:name/disk/:id/readd — the returned-disk verb (11.9) ------
+  server.post<{ Params: { name: string, id: string } }>('/ahr/:name/disk/:id/readd', async (request, reply) => {
+    const idParsed = DiskId.safeParse(request.params.id)
+    if (!idParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid disk id: ${idParsed.error.issues[0]?.message}` } }
+    }
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+    const pool = await loadPool(request.params.name, reply)
+    if (!pool)
+      return
+    // Never interleave a member rejoin with a running/halted expansion.
+    if (await refuseExistingIntent(pool.name, reply))
+      return
+    if (pool.arrays.some(a => a.sync?.action === 'reshape')) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `pool '${pool.name}' is reshaping — wait for the reshape to finish before re-adding a member` } }
+    }
+
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'ahr.readd',
+      params: { pool: pool.name, diskId: idParsed.data },
+      message: `Re-adding disk '${idParsed.data}' to pool '${pool.name}'`,
+      warnings: [
+        'With the write-intent bitmap this is a fast differential catch-up (only regions written while the disk was away).',
+        'If md refuses the shortcut (stale member), it falls back to a FULL rebuild of that slice — redundancy is only restored when the rebuild completes.',
+        'Do NOT remove any disk until the recovery finishes.',
+      ],
+    })) {
+      return reply
+    }
+
+    const job = jobQueue.submit(
+      'ahr.readd',
+      { ...identity, params: { pool: pool.name, diskId: idParsed.data } },
+      async updateProgress => executeReadd(executor, { pool, diskId: idParsed.data }, updateProgress),
+    )
     reply.code(202)
     return { job }
   })

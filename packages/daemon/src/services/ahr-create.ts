@@ -218,6 +218,10 @@ export async function createAhrPool(
       // Explicit, deterministic data offset (GT-5) — the default varies with
       // member size and the headroom backs backup-file-free reshapes (GT-6).
       ahrDataOffsetArg(band.heightBytes),
+      // Explicit write-intent bitmap (mdadm only defaults it ≥100 GB members):
+      // md's differential-resilver analog — a transiently-offline member
+      // re-adds with a fast catch-up sync instead of a full rebuild.
+      '--bitmap=internal',
       '--run',
       ...members,
     ])

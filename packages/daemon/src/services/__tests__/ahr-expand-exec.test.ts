@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
-import { diskLsblkArgs, executeExpansion, executeReplace, projectExistingBands } from '../ahr-expand-exec.js'
+import { diskLsblkArgs, executeExpansion, executeReadd, executeReplace, projectExistingBands } from '../ahr-expand-exec.js'
 import { readIntent } from '../ahr-intent.js'
 import { planExpansion } from '../ahr-layout.js'
 
@@ -436,6 +436,7 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
         '--metadata=1.2',
         '--name=tank-r3',
         '--data-offset=8192s', // 4 MiB for a sub-512GiB member (GT-5 policy)
+        '--bitmap=internal',
         `/dev/disk/by-id/${W}-part3`,
         `/dev/disk/by-id/${V}-part3`,
       ])
@@ -696,5 +697,80 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
       assert.deepEqual(bands[0].members, [X, Y, Z])
       assert.deepEqual(bands[1].members, [Y, Z])
     })
+  })
+})
+
+describe('executeReadd (11.9 — the returned-disk verb)', () => {
+  // X's slice came back after a blip: mdstat lists sdq1 faulty, superblock
+  // UUID still matches r1.
+  const MDSTAT_X_FAULTY = `Personalities : [raid1] [raid5]
+md126 : active raid1 sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md127 : active raid5 sds1[2] sdr1[1] sdq1[0](F)
+      4190208 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [_UU]
+
+unused devices: <none>
+`
+  const MDSTAT_X_RECOVERED = MDSTAT_BASE
+
+  function readdWorld(opts: { examUuid?: string, readdExit?: number, mdstats?: string[] } = {}): MockExecutor {
+    const executor = world({ mdstat: opts.mdstats ?? [MDSTAT_X_FAULTY, MDSTAT_X_RECOVERED] })
+    executor.addFixture({
+      command: MDADM,
+      args: ['--examine', '--export', `/dev/disk/by-id/${X}-part1`],
+      result: { stdout: `MD_UUID=${opts.examUuid ?? R1_UUID}\nMD_NAME=anas-test:tank-r1\n`, stderr: '', exitCode: 0 },
+    })
+    executor.addFixture({
+      command: MDADM,
+      args: ['/dev/md127', '--re-add', `/dev/disk/by-id/${X}-part1`],
+      result: { stdout: '', stderr: opts.readdExit ? 'mdadm: --re-add for /dev/disk/by-id/... rejected' : '', exitCode: opts.readdExit ?? 0 },
+    })
+    executor.addFixture({ command: MDADM, result: { stdout: '', stderr: '', exitCode: 0 } }) // --remove / fallback
+    return executor
+  }
+
+  it('differential path: remove faulty slot → --re-add → wait → notify (exact argv)', async () => {
+    const executor = readdWorld()
+    const out = await executeReadd(executor, { pool: mkPool(), diskId: X }, () => {}, { pollIntervalMs: 1, log: () => {} })
+    assert.deepEqual(out.bands, [{ band: 1, mode: 'differential' }])
+    const mdadmCalls = executor.calls.filter(c => c.command === MDADM && c.args[0] !== '--detail' && c.args[0] !== '--examine')
+    assert.deepEqual(mdadmCalls.map(c => c.args), [
+      ['/dev/md127', '--remove', `/dev/disk/by-id/${X}-part1`],
+      ['/dev/md127', '--re-add', `/dev/disk/by-id/${X}-part1`],
+    ])
+    const notify = executor.calls.filter(c => c.command === PERL).at(-1)!
+    assert.equal(notify.args[2], 'info')
+    assert.ok(String(notify.args[4]).includes('differential catch-up'))
+  })
+
+  it('fallback path: --re-add refused → --zero-superblock + --add (full rebuild)', async () => {
+    const executor = readdWorld({ readdExit: 1 })
+    const out = await executeReadd(executor, { pool: mkPool(), diskId: X }, () => {}, { pollIntervalMs: 1, log: () => {} })
+    assert.deepEqual(out.bands, [{ band: 1, mode: 'full' }])
+    const mdadmArgs = executor.calls.filter(c => c.command === MDADM).map(c => c.args)
+    assert.ok(mdadmArgs.some(a => a[0] === '--zero-superblock' && a[1] === `/dev/disk/by-id/${X}-part1`))
+    assert.ok(mdadmArgs.some(a => a[0] === '/dev/md127' && a[1] === '--add'))
+    const notify = executor.calls.filter(c => c.command === PERL).at(-1)!
+    assert.ok(String(notify.args[4]).includes('full rebuild'))
+  })
+
+  it('identity check: a lookalike slice with a foreign superblock UUID is REFUSED', async () => {
+    const executor = readdWorld({ examUuid: 'ffffffff:ffffffff:ffffffff:ffffffff' })
+    await assert.rejects(
+      executeReadd(executor, { pool: mkPool(), diskId: X }, () => {}, { pollIntervalMs: 1, log: () => {} }),
+      /does not match array/,
+    )
+    // No mutating mdadm command was issued.
+    assert.ok(!executor.calls.some(c => c.command === MDADM && (c.args[1] === '--re-add' || c.args[1] === '--add')))
+  })
+
+  it('absent device is refused before any command', async () => {
+    const executor = world()
+    executor.addFixture({ command: LSBLK, args: diskLsblkArgs('/dev/disk/by-id/ata-GONE'), result: { stdout: '', stderr: 'not a block device', exitCode: 32 } })
+    await assert.rejects(
+      executeReadd(executor, { pool: mkPool(), diskId: 'ata-GONE' }, () => {}, { pollIntervalMs: 1 }),
+      /not present/,
+    )
   })
 })

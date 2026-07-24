@@ -121,6 +121,7 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
         '--metadata=1.2',
         '--name=t2-r1',
         '--data-offset=8192s',
+        '--bitmap=internal',
         '--run',
         `/dev/disk/by-id/${SMALL}-part1`,
         `/dev/disk/by-id/${BIG}-part1`,
@@ -197,8 +198,8 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
 
     const creates = executor.calls.filter(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--create')
     assert.deepEqual(creates.map(c => c.args), [
-      ['--create', '/dev/md/t3-r1', '--level=raid5', '--raid-devices=3', '--metadata=1.2', '--name=t3-r1', '--data-offset=8192s', '--run', `/dev/disk/by-id/${SMALL}-part1`, `/dev/disk/by-id/${MID}-part1`, `/dev/disk/by-id/${BIG}-part1`],
-      ['--create', '/dev/md/t3-r2', '--level=raid1', '--raid-devices=2', '--metadata=1.2', '--name=t3-r2', '--data-offset=8192s', '--run', `/dev/disk/by-id/${MID}-part2`, `/dev/disk/by-id/${BIG}-part2`],
+      ['--create', '/dev/md/t3-r1', '--level=raid5', '--raid-devices=3', '--metadata=1.2', '--name=t3-r1', '--data-offset=8192s', '--bitmap=internal', '--run', `/dev/disk/by-id/${SMALL}-part1`, `/dev/disk/by-id/${MID}-part1`, `/dev/disk/by-id/${BIG}-part1`],
+      ['--create', '/dev/md/t3-r2', '--level=raid1', '--raid-devices=2', '--metadata=1.2', '--name=t3-r2', '--data-offset=8192s', '--bitmap=internal', '--run', `/dev/disk/by-id/${MID}-part2`, `/dev/disk/by-id/${BIG}-part2`],
     ])
     // Every --create carries an explicit --data-offset (GT-5).
     assert.ok(creates.every(c => c.args.some(a => a.startsWith('--data-offset='))))

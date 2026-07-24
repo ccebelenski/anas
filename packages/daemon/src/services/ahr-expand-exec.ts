@@ -593,6 +593,9 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
         // Explicit generous data offset (§2.6/GT-5) — the reshape headroom that
         // keeps every future grow backup-file-free.
         ahrDataOffsetArg(pb.heightBytes),
+        // Explicit write-intent bitmap (see ahr-create.ts): fast differential
+        // re-add for transiently-offline members, never an implicit default.
+        '--bitmap=internal',
         ...members.map(m => m.partByIdPath),
       ])
       // Pin the new array + refresh the initramfs copy (§2.6). Best-effort:
@@ -1012,4 +1015,115 @@ async function waitForReplaceDone(executor: CommandExecutor, ctx: ReplaceWaitCon
     }
     return
   }
+}
+
+// ---- Re-add (story 11.9: the returned-disk verb) ---------------------------
+
+export interface ReaddBandResult {
+  band: number
+  /** 'differential' = --re-add rode the write-intent bitmap; 'full' = rebuild. */
+  mode: 'differential' | 'full'
+}
+
+/**
+ * Guided re-add of a disk that fell offline and came back (11.9, §8). For
+ * every partition on the disk whose label matches this pool AND whose md
+ * superblock UUID matches the band's array (the identity check — a lookalike
+ * slice from some other life is refused, never absorbed):
+ *
+ *   remove the faulty slot if still attached → `mdadm --re-add` (with the
+ *   §2.6 write-intent bitmap this is a differential catch-up — md's resilver
+ *   analog) → on refusal, fall back to a FULL member rebuild
+ *   (--zero-superblock + --add) → wait each recovery out sequentially.
+ *
+ * Throws when the device is absent or no slice qualifies — the route turns
+ * that into a 400 naming the reason.
+ */
+export async function executeReadd(
+  executor: CommandExecutor,
+  input: { pool: AhrPool, diskId: string },
+  updateProgress: (message: string) => void,
+  opts: { pollIntervalMs?: number, log?: (line: string) => void } = {},
+): Promise<{ bands: ReaddBandResult[] }> {
+  const { pool, diskId } = input
+  const log = opts.log ?? ((line: string) => process.stdout.write(`${line}\n`))
+  const pollIntervalMs = opts.pollIntervalMs ?? 3000
+
+  const disk = await readDiskTree(executor, byIdPath(diskId))
+  if (!disk)
+    throw new Error(`disk '${diskId}' is not present — re-add needs the returned device attached`)
+
+  const arrays = await resolveAhrArrays(executor, pool.name)
+  const candidates: { band: number, array: ResolvedArray, partPath: string, partKernel: string }[] = []
+  const rejects: string[] = []
+  for (const [band, array] of [...arrays.entries()].sort((a, b) => a[0] - b[0])) {
+    const part = disk.parts.find(p => p.partlabel !== null && bandLabelRe(pool.name, band).test(p.partlabel))
+    if (!part)
+      continue
+    // Already an active in-sync member? Nothing to do for this band.
+    const member = array.md.members.find(m => m.device === part.name)
+    if (member && !member.faulty)
+      continue
+    const partPath = `${byIdPath(diskId)}-part${part.number}`
+    // Identity check: the slice's superblock must belong to THIS band array.
+    const exam = await executor.exec(MDADM, ['--examine', '--export', partPath])
+    const examUuid = exam.exitCode === 0 ? parseMdadmDetailExport(exam.stdout).uuid : null
+    if (examUuid !== array.detail.uuid) {
+      rejects.push(`band ${band}: slice superblock ${examUuid ?? '(none)'} does not match array ${array.detail.uuid ?? '(unknown)'}`)
+      continue
+    }
+    candidates.push({ band, array, partPath, partKernel: part.name })
+  }
+  if (candidates.length === 0) {
+    throw new Error(
+      `disk '${diskId}' has no re-addable slice for pool '${pool.name}'`
+      + (rejects.length ? ` — ${rejects.join('; ')}` : ' — no matching band partitions found'),
+    )
+  }
+
+  const results: ReaddBandResult[] = []
+  const degradedNotified = new Set<string>()
+  for (const c of candidates) {
+    const label = `${pool.name}-r${c.band}`
+    // Clear the faulty slot when the old incarnation is still attached.
+    if (c.array.md.members.some(m => m.device === c.partKernel && m.faulty)) {
+      updateProgress(`removing faulty slot ${c.partKernel} from ${label}`)
+      await executor.exec(MDADM, [c.array.dev, '--remove', c.partPath])
+    }
+
+    updateProgress(`re-adding ${c.partPath} to ${label}`)
+    log(`ahr.readd pool=${pool.name} band=${c.band} part=${c.partPath} attempt=re-add`)
+    const readd = await executor.exec(MDADM, [c.array.dev, '--re-add', c.partPath])
+    let mode: ReaddBandResult['mode'] = 'differential'
+    if (readd.exitCode !== 0) {
+      // md refused the shortcut (no bitmap coverage / stale event count):
+      // full rebuild as a brand-new member — stated in the confirm upfront.
+      mode = 'full'
+      updateProgress(`--re-add refused for ${label} (${readd.stderr.trim() || 'no reason given'}) — full rebuild`)
+      log(`ahr.readd pool=${pool.name} band=${c.band} fallback=full-rebuild`)
+      await execChecked(executor, MDADM, ['--zero-superblock', c.partPath])
+      await execChecked(executor, MDADM, [c.array.dev, '--add', c.partPath])
+    }
+
+    await waitForArrayIdle(executor, {
+      poolName: pool.name,
+      label,
+      kernelName: c.array.kernelName,
+      pollIntervalMs,
+      updateProgress,
+      log,
+      degradedNotified,
+    })
+    results.push({ band: c.band, mode })
+  }
+
+  await pveNotify(
+    executor,
+    'info',
+    `AHR: disk re-added (${pool.name})`,
+    `Disk ${diskId} rejoined pool '${pool.name}': `
+    + results.map(r => `band ${r.band} (${r.mode === 'differential' ? 'differential catch-up' : 'full rebuild'})`).join(', ')
+    + '. Redundancy is restored.',
+  )
+  return { bands: results }
 }

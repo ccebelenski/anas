@@ -853,6 +853,71 @@
         if (abandonBtn) {
             abandonBtn.setHidden(!halted);
         }
+        // Re-add appears only when a member is faulty/missing (11.9).
+        var readdBtn = grid.down('#readd');
+        if (readdBtn) {
+            readdBtn.setHidden(!has || readdCandidates(sel[0]).length === 0);
+        }
+    }
+
+    // Disk ids with a faulty/missing member slot in any band (11.9).
+    function readdCandidates(rec) {
+        var out = [];
+        var seen = {};
+        var arrays = (rec && rec.get('arrays')) || [];
+        for (var i = 0; i < arrays.length; i++) {
+            var members = arrays[i].members || [];
+            for (var m = 0; m < members.length; m++) {
+                var st = members[m].memberState;
+                if ((st === 'faulty' || st === 'missing') && members[m].disk && !seen[members[m].disk]) {
+                    seen[members[m].disk] = true;
+                    out.push(members[m].disk);
+                }
+            }
+        }
+        return out;
+    }
+
+    function openReadd(grid, node) {
+        var pool = selectedPool(grid);
+        var sel = grid.getSelection();
+        if (!pool || !sel || !sel.length) {
+            return;
+        }
+        var candidates = readdCandidates(sel[0]);
+        function run(diskId) {
+            ANAS.confirmAndRun({
+                node: node,
+                method: 'post',
+                path: '/ahr/' + encodeURIComponent(pool) + '/disk/'
+                    + encodeURIComponent(diskId) + '/readd',
+                body: {},
+                view: grid,
+                confirmTitle: 'Re-add disk',
+                confirmIntro: t('Re-adding') + ' <b>' + enc(diskId) + '</b> '
+                    + t('to') + ' <b>' + enc(pool) + '</b>:',
+                failTitle: 'Re-add failed',
+                successMsg: t('Re-add started on') + ' ' + pool,
+                onSubmitted: function () {
+                    loadPools(grid, node);
+                },
+                onComplete: function () {
+                    loadPools(grid, node);
+                },
+            });
+        }
+        if (candidates.length === 1) {
+            run(candidates[0]);
+            return;
+        }
+        // Several faulty members (or a vanished one the daemon knows better
+        // than the UI): prompt with the first candidate prefilled, editable.
+        Ext.Msg.prompt(t('Re-add disk'), t('Disk id (by-id) to re-add into') + ' <b>' + enc(pool) + '</b>:',
+            function (btn, value) {
+                if (btn === 'ok' && value) {
+                    run(value.replace(/\s+/g, ''));
+                }
+            }, null, false, candidates[0] || '');
     }
 
     function resumeExpansion(grid, node) {
@@ -1633,6 +1698,18 @@
                             disabled: true,
                             handler: function (btn) {
                                 destroyPool(btn.up('grid'), node);
+                            },
+                        },
+                        // 11.9: visible only when the selected pool has a
+                        // faulty/missing member — the returned-disk verb.
+                        {
+                            text: t('Re-add disk'),
+                            itemId: 'readd',
+                            cls: 'anas-btn-ahr-readd',
+                            iconCls: 'fa fa-rotate-left',
+                            hidden: true,
+                            handler: function (btn) {
+                                openReadd(btn.up('grid'), node);
                             },
                         },
                         // §6.2: a halted expansion surfaces Resume/Abandon
