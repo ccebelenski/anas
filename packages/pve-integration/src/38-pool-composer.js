@@ -3,8 +3,8 @@
  *
  * The flagship graphical pool builder, built entirely on the ANAS.gfx layer
  * (15-gfx.js): skeuomorphic disk objects, native pointer-drag, capacity gauges,
- * themed chrome. It supersedes the old simple Create-Pool form (32-pool-create.js
- * rewires its toolbar action to launch this).
+ * themed chrome. 32-pool-create.js wires the Create toolbar action to launch
+ * this.
  *
  * Two modes:
  *   - create  (empty draft): compose a whole topology, commit ONE POST /pools
@@ -72,8 +72,8 @@
 
     // ---- vdev type + role metadata ----------------------------------------
     //
-    // Composer type keys mirror the spike (raidz1/2/3); the schema's VdevSpec
-    // uses 'raidz' for raidz1, so schemaType() maps on commit.
+    // Composer type keys are raidz1/2/3; the schema's VdevSpec uses 'raidz'
+    // for raidz1, so schemaType() maps on commit.
     var TYPES = {
         mirror: { label: 'mirror', min: 2 },
         raidz1: { label: 'raidz1', min: 3 },
@@ -1357,9 +1357,8 @@
     // Public surface. Launched from the Pools toolbar:
     //   Create    → ANAS.composer.open({ node, grid, mode:'create' })
     //   Add Vdevs → ANAS.composer.open({ node, grid, mode:'expand', poolName })
-    // The old dedicated Add-Vdev window (34-pool-addvdev.js) is RETIRED — the
-    // composer's expand mode is the single add-vdev path, staging any role and
-    // committing each with the correct AddVdevRequest.role.
+    // The composer's expand mode is the single add-vdev path, staging any
+    // role and committing each with the correct AddVdevRequest.role.
     ANAS.composer = ANAS.composer || {};
     ANAS.composer.open = function (o) {
         try {

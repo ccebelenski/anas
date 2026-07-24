@@ -145,9 +145,8 @@
     // runs ANAS) the daemon answers 200 and the view renders; on a node WITHOUT
     // ANAS the gateway can't reach its :3000 peer and returns 502, so this
     // rejects and the caller shows the clean "not installed on this node" panel.
-    // The old form probed the LOCAL gateway's /api/health, which always passed
-    // when connected through an ANAS node — so ANAS views on ANAS-less peer nodes
-    // rendered and then errored with raw "node unreachable" messages.
+    // (A LOCAL /api/health probe would always pass when connected through an
+    // ANAS node — views on ANAS-less peers would render, then error raw.)
     api.health = function (node) {
         return doFetch('GET', nodeBase(node) + '/health');
     };

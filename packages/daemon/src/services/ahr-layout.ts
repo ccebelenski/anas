@@ -19,9 +19,9 @@ import type {
  *    so the planner computes the reachable target and the ordered §5.1 step
  *    list to get there. It reports reachable capacity, never fresh-ideal.
  *
- * Nothing here touches the system: no exec, no fs, no md/LVM. The system-facing
- * layer (blocked on stunt-node ground truth) will feed these functions real
- * topology and execute the steps.
+ * Nothing here touches the system: no exec, no fs, no md/LVM. The
+ * system-facing layer (ahr-expand-exec.ts) feeds these functions live
+ * topology and executes the steps.
  */
 
 // ---- Constants -------------------------------------------------------------
@@ -29,9 +29,7 @@ import type {
 /**
  * Replacement-slack rounding granularity (§2.5): every disk's usable size is
  * floored to this before any band math, so a nominally-same replacement disk
- * (which can be tens of MB smaller) always fits. 1 GiB is the design proposal —
- * PENDING ground-truth calibration on the stunt node (real-world disk-size
- * variance measurement, AHR-DESIGN §9.2); revisit before the system layer ships.
+ * (which can be tens of MB smaller) always fits (AHR-DESIGN §9.2).
  */
 export const AHR_SIZE_GRANULARITY_BYTES = 1024 ** 3
 
@@ -127,17 +125,13 @@ function levelFor(tier: AhrType, members: number): ArrayLevel | null {
 }
 
 /**
- * Human-readable byte count — the single canonical AHR size formatter, shared
- * by every AHR confirm dialog, warning, and notification (previously
- * re-implemented, with divergent rounding, in ahr-spare / ahr-mutate /
- * ahr-expand / ahr-expand-exec).
+ * The single canonical AHR size formatter, shared by every AHR confirm
+ * dialog, warning, and notification.
  *
- * Convention (the 11.8 polish finding, made canonical): render in GiB below
- * 1024 GiB, TiB at or above it, each rounded to at most two decimals with
- * trailing zeros dropped — "3.64 TiB pending", "2 GiB", never "3724 GiB" or a
- * noisy "2.00 GiB". Two decimals at TiB scale keeps ~10 GiB of resolution
- * (0.1 TiB ≈ 100 GiB is too coarse for capacity deltas); dropping trailing
- * zeros keeps whole-disk sizes clean in operator strings.
+ * Convention: GiB below 1024 GiB, TiB at or above, at most two decimals with
+ * trailing zeros dropped — "3.64 TiB pending", "2 GiB", never "3724 GiB" or
+ * a noisy "2.00 GiB". Two decimals at TiB scale keeps ~10 GiB of resolution;
+ * dropping trailing zeros keeps whole-disk sizes clean in operator strings.
  */
 export function fmtBytes(bytes: number): string {
   const gib = bytes / AHR_SIZE_GRANULARITY_BYTES

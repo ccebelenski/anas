@@ -84,14 +84,13 @@ export interface AhrCreateOptions {
 }
 
 /**
- * Clear ghost md state on freshly carved partitions (11.8 live-proof catch).
+ * Clear ghost md state on freshly carved partitions (§2.6 ghost-clearing).
  * Old md superblocks live INSIDE partitions (metadata 1.2, 4 KiB in) — a
  * whole-disk wipe never touches them, and when a new slice lands at the same
  * offset udev's incremental assembly can resurrect the dead array and hold
  * the partition busy before --create/--add runs. Stop any md holder of each
  * partition, then wipe the partition's signatures, then settle udev.
- * Shared by pool creation and hot-spare attach (§11 — the same §2.6
- * partitioning doctrine, never duplicated).
+ * Shared by pool creation and hot-spare attach (§11).
  */
 export async function clearGhostMdSignatures(
   executor: CommandExecutor,
@@ -207,7 +206,7 @@ export async function createAhrPool(
   updateProgress('Settling udev (partition device nodes)')
   await run(executor, UDEVADM, ['settle'])
 
-  // --- Clear ghost md state on the fresh partitions (11.8 live-proof catch) ---
+  // --- Clear ghost md state on the fresh partitions (§2.6) --------------------
   updateProgress('Clearing stale md signatures on new partitions')
   await clearGhostMdSignatures(
     executor,

@@ -9,8 +9,7 @@ import {
 import { editConfig } from './config-writer.js'
 
 /**
- * AHR mdadm.conf pinning + monitor-hook wiring (AHR-DESIGN §2.6 / §7.2, both
- * operator-decided 2026-07-22).
+ * AHR mdadm.conf pinning + monitor-hook wiring (AHR-DESIGN §2.6 / §7.2).
  *
  * ARRAY pins make /dev/md/<pool>-r<band> names deterministic across assembly
  * paths (GT-3: the symlink otherwise flips to a homehost-prefixed form across

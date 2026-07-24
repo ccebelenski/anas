@@ -1,9 +1,9 @@
 /*
- * ANAS — Replication view (Epic 5.5: story 5.5.3 stage 2 + 5.5.2 stage 3).
+ * ANAS — Replication view (Epic 5.5: stories 5.5.1–5.5.3).
  *
- * Stage 3 (story 5.5.2) adds off-box replication: a cluster-wide Remotes
- * registry (the corosync store at /etc/pve/anas/remotes.json) managed here, and
- * a Target-location picker in the task + Replicate-Once dialogs so a replication
+ * Off-box replication (story 5.5.2): a cluster-wide Remotes registry (the
+ * corosync store at /etc/pve/anas/remotes.json) managed here, and a
+ * Target-location picker in the task + Replicate-Once dialogs so a replication
  * target can be This node, a cluster peer, or a registered external remote.
  *
  *   Remotes registry (paths relative to /v1):
@@ -25,7 +25,7 @@
  *   Task / once bodies carry target.location = { kind:'local'|'peer'|'remote', name? }
  *   (omitted for local); plan/run endpoints are otherwise unchanged.
  *
- * Stage-3 test hooks: toolbar 'anas-btn-repl-remotes'; manager window
+ * Remotes test hooks: toolbar 'anas-btn-repl-remotes'; manager window
  * 'anas-win-repl-remotes'; add/edit wizard 'anas-win-repl-remote-edit' with
  * staged-test result area 'anas-remote-test'; location combo (both dialogs)
  * 'anas-fld-repl-location'.
@@ -33,13 +33,12 @@
  * A dedicated top-level "Replication" menu item (sibling of Pools / Datasets /
  * Shares). Replication is an ongoing, scheduled process with configuration and
  * history — not a point-in-time dataset action — so it lives in its own view,
- * NOT bleeding into the Datasets menu (stage-1's surfaces were removed from
- * 60-datasets.js when this shipped).
+ * NOT bleeding into the Datasets menu.
  *
  * A task grid (source → target, schedule, lag, last run, next run, enabled),
- * create/edit/enable-disable/delete, and Run Now. Plus a relocated "Replicate
- * Once…" dialog — the stage-1 local one-shot send|recv with an honest plan
- * preview — whose source is now PICKED in the dialog (no dataset-row context).
+ * create/edit/enable-disable/delete, and Run Now. Plus the "Replicate Once…"
+ * dialog — a local one-shot send|recv with an honest plan preview — whose
+ * source is picked in the dialog (no dataset-row context).
  *
  * Task store = the systemd units themselves (the daemon generates/parses/rewrites
  * anas-repl-<name>.service + .timer). The grid reads their derived state; ZFS
@@ -56,7 +55,7 @@
  *   DELETE /replication/tasks/:name      → removes the schedule (units) only
  *   POST   /replication/tasks/:name/run  → { started: true }
  *
- * One-shot (relocated stage 1, story 5.5.1) — KEEP USING:
+ * One-shot (story 5.5.1):
  *   GET    /pools                                     → { data: PoolSummary[] }
  *   GET    /pools/:name/datasets                      → { data: Dataset[] } (flat)
  *   GET    /pools/:name/datasets/<path>/snapshots     → { data: Snapshot[] }

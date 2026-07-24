@@ -21,27 +21,23 @@ import { AHR_FINDMNT_ARGS, stripSubvolSuffix } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
 
 /**
- * AHR expansion step executor (Epic 11.6, docs/AHR-DESIGN.md §5) — the
- * dangerous part, kept deliberately dumb:
+ * AHR expansion step executor (11.6, §5) — the dangerous part, kept dumb:
+ * the planner owns every layout decision; this module only realizes the
+ * ordered step list. Each step is DETECT-THEN-DELTA (§5.1): read what the
+ * system IS, do only the remaining delta — that, not a persisted step log,
+ * is what makes resume "recompute-and-continue" (§5.3).
  *
- *   THE PLANNER OWNS EVERY LAYOUT DECISION. This module never invents a step —
- *   it realizes the ordered step list planExpansion produced, and each step is
- *   DETECT-THEN-DELTA (§5.1): it first reads what the system already IS and
- *   computes the remaining delta, so a re-run after any interruption is a
- *   no-op for completed work. That property — not a persisted step log — is
- *   what makes resume "recompute-and-continue" (§5.3).
- *
- * Hard rules encoded here:
- *  - NEVER `--backup-file`. AHR mandates offset-based reshapes (§5.1, GT-6);
- *    if mdadm errors demanding a backup file, the step FAILS with the exact
- *    stderr — that is a design-violation signal, never worked around.
- *  - NEVER re-issue a reshape. `reshape-wait` only observes /proc/mdstat; the
- *    kernel owns reshape resumability.
- *  - The filesystem grows LAST, and only after the LV beneath it is verified
- *    extended (never grow the fs before its block device).
- *  - A step failure halts the pipeline in a known state: intent → 'halted',
- *    PVE error notification naming the failed layer, return. The pool remains
- *    whatever it is (usually mounted and usable).
+ * Hard rules:
+ *  - NEVER `--backup-file` (§5.1/GT-6): offset-based reshapes only. mdadm
+ *    demanding one is a design-violation signal — fail with its stderr,
+ *    never work around.
+ *  - NEVER re-issue a reshape: `reshape-wait` only observes /proc/mdstat;
+ *    the kernel owns reshape resumability.
+ *  - The filesystem grows LAST, only after the LV beneath is verified
+ *    extended.
+ *  - A step failure halts in a known state: intent → 'halted', PVE error
+ *    notification naming the failed layer, return. The pool stays as it is
+ *    (usually mounted and usable).
  */
 
 const CAT = '/usr/bin/cat'
@@ -131,16 +127,11 @@ export interface ExpansionOutcome {
 
 /**
  * Project a live pool's arrays into the §2.3 planner's immutable
- * {@link ExistingBand} constraints. Boundaries are reconstructed from the
- * partition geometry, not guessed from disk sizes:
- *
- *  - an INTERIOR slice's size is exactly the band height (plus the 1 MiB GPT
- *    displacement for the bottom band — GT-4), so any member whose slice is
- *    not its disk's clamped top slice yields the exact boundary;
- *  - when EVERY member's slice clamps to its disk's end (the top band of a
- *    pool whose members all end there), the boundary is those disks' §2.5
- *    rounded usable size — which is, by construction, exactly where the
- *    clamped slice logically ends.
+ * {@link ExistingBand} constraints. Boundaries come from partition geometry,
+ * never disk-size guesses: an interior slice's size is exactly the band
+ * height (+1 MiB GPT displacement in band 0 — GT-4); when every member's
+ * slice clamps to its disk's end, the boundary is those disks' §2.5 rounded
+ * usable size — by construction where the clamped slice ends.
  */
 export function projectExistingBands(pool: AhrPool): ExistingBand[] {
   const arrays = [...pool.arrays]
@@ -414,10 +405,9 @@ function levelNumber(level: string): string {
 
 /**
  * Attach one disk's labeled band slice to its band array as a hot spare
- * (§11): `mdadm <array> --add-spare <slice>`. Detect-then-delta: a slice that
- * is already an array member (spare or otherwise) is left alone. Shared by
- * the spare-attach verb (services/ahr-spare.ts) and the expansion coupling
- * below. Returns true when a slice was actually added.
+ * (§11). Idempotent: an existing member (spare or otherwise) is left alone.
+ * Shared by the spare-attach verb (services/ahr-spare.ts) and the expansion
+ * coupling below. Returns true when a slice was actually added.
  */
 export async function addSpareSlice(
   executor: CommandExecutor,
@@ -440,14 +430,12 @@ export async function addSpareSlice(
 }
 
 /**
- * Slot hygiene shared by spare-attach (§11) and Re-add (11.9): remove any
- * FAULTY member of `arrayDev` whose device node is now ABSENT — md's own
- * "detached" test. This is the returned-disk case that a name match misses: a
- * disk that dropped and came back WITHOUT a reboot re-enumerates under a NEW
- * kernel name, so the array's faulty slot still names the OLD (now-absent)
- * node. `mdadm --remove detached` clears exactly those slots (never a
- * faulty-but-PRESENT disk — that stays for Replace/Re-add to own). Returns
- * true when a `--remove detached` was actually issued.
+ * Slot hygiene shared by spare-attach (§11) and Re-add (11.9): `--remove
+ * detached` any FAULTY member whose device node is now ABSENT. Covers the
+ * reboot-less return a name match misses: the disk re-enumerates under a NEW
+ * kernel name, so the faulty slot still names the old (gone) node. Never
+ * touches a faulty-but-PRESENT disk — that stays for Replace/Re-add to own.
+ * Returns true when a `--remove detached` was issued.
  */
 export async function removeDetachedFaultySlots(
   executor: CommandExecutor,
@@ -573,15 +561,12 @@ function bandCoveringSpares(pool: AhrPool, pb: AhrPreviewBand): AhrPool['disks']
 }
 
 /**
- * Detach the pool's hot-spare slices from a band array BEFORE a --grow /
- * --convert reshape (§11, the spare-absorption guard): with BOTH the newly
- * added member slice and a hot-spare slice sitting as spares, md's reshape may
- * absorb the HOT SPARE into the new raid slot instead of the intended new
- * slice — silently converting the spare disk into a data member while the new
- * disk stays spare. Removing the spare slices first (a spare `--remove` is
- * instant and safe) leaves ONLY the intended new slice as a spare, so md fills
- * the new slot deterministically. Idempotent: a spare slice that is not
- * currently a member of this band is skipped (resume path).
+ * Detach the pool's hot-spare slices from a band BEFORE a --grow/--convert
+ * reshape (§11 spare-absorption guard): with both the new member slice and a
+ * hot-spare slice sitting as spares, md may absorb the HOT SPARE into the
+ * new raid slot — spare disk silently becomes a data member while the new
+ * slice stays spare. A spare `--remove` is instant and safe; removing first
+ * leaves only the intended slice for md to fill. Idempotent (resume path).
  */
 async function detachBandSpares(
   executor: CommandExecutor,
@@ -647,17 +632,14 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       const toAdd = members.filter(m => !current.has(m.partKernel))
       const raidDevices = resolved.detail.devices ?? resolved.md.raidDevices ?? 0
       if (toAdd.length === 0 && raidDevices >= pb.memberCount) {
-        // Already grown — still ensure the hot spares cover this band (a resume
-        // that landed after the grow must not leave coverage dropped).
+        // Already grown — still re-ensure spare coverage (resume path).
         await ensureBandSpares(ctx, band, resolved.dev, spares, current)
         return true
       }
       for (const m of toAdd)
         await execChecked(executor, MDADM, [resolved.dev, '--add', m.partByIdPath])
       if (raidDevices < pb.memberCount) {
-        // §11 spare-absorption guard: pull the hot-spare slices out of THIS band
-        // first so md cannot absorb a spare into the new raid slot; grow with
-        // only the intended new slice present as a spare, then re-attach.
+        // §11 spare-absorption guard — see detachBandSpares.
         await detachBandSpares(executor, pool.name, band, resolved, spares)
         // NO --backup-file, ever (§5.1/GT-6): offsets carry the critical section.
         await execChecked(executor, MDADM, ['--grow', resolved.dev, `--raid-devices=${pb.memberCount}`])
@@ -689,9 +671,7 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       const members = await expectedBandMembers(executor, pool.name, pb, ctx.intent.approvedDisks)
       for (const m of members.filter(x => !current.has(x.partKernel)))
         await execChecked(executor, MDADM, [resolved.dev, '--add', m.partByIdPath])
-      // §11 spare-absorption guard (same as array-grow): a hot spare's slice
-      // sits in this band as a spare too; detach before the level/width reshape
-      // so md cannot absorb it into a new slot, then re-attach after.
+      // §11 spare-absorption guard — see detachBandSpares.
       await detachBandSpares(executor, pool.name, band, resolved, spares)
       if (level !== pb.level) {
         // One-shot level+count change (GT-7); offset-based, NO --backup-file.
@@ -727,11 +707,10 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
           `--raid-devices=${pb.memberCount}`,
           '--metadata=1.2',
           `--name=${name}`,
-          // Explicit generous data offset (§2.6/GT-5) — the reshape headroom that
-          // keeps every future grow backup-file-free.
+          // Generous data offset (§2.6/GT-5): reshape headroom keeps future
+          // grows backup-file-free.
           ahrDataOffsetArg(pb.heightBytes),
-          // Explicit write-intent bitmap (see ahr-create.ts): fast differential
-          // re-add for transiently-offline members, never an implicit default.
+          // Write-intent bitmap: fast differential --re-add (see ahr-create.ts).
           '--bitmap=internal',
           ...members.map(m => m.partByIdPath),
         ])
@@ -757,11 +736,10 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
         }
       }
 
-      // §11 expansion coupling: a new band automatically extends every attached
-      // spare that can reach its boundary — partition the new slice, then
-      // --add-spare. Evaluated on EVERY run (the already-created resume path
-      // must not skip it): a spare never silently loses coverage. Spares that
-      // cannot cover the taller band were already named in the plan warnings.
+      // §11 expansion coupling: a new band extends every attached spare that
+      // can reach its boundary (partition + --add-spare). Runs on EVERY pass —
+      // the already-created resume path must not skip it, or a spare silently
+      // loses coverage. Too-short spares were named in the plan warnings.
       const spares = pool.disks.filter(d => d.role === 'spare' && d.usableBytes >= pb.range.endBytes)
       let extended = 0
       if (spares.length > 0) {
@@ -880,9 +858,8 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       const mapperPath = `/dev/mapper/${dmName(pool.name, pool.lv.name)}`
       const mounts = parseFindmnt(await execChecked(executor, FINDMNT, AHR_FINDMNT_ARGS))
       // findmnt appends the mounted subvolume to a btrfs source
-      // (`…-vol[/@data]`) — strip it before matching, else EVERY §12
-      // subvol-layout pool's fs-grow halts here (the same class of bug fixed in
-      // ahr-topology.ts; shared helper, never a raw `source === mapperPath`).
+      // (`…-vol[/@data]`) — strip before matching, else every §12
+      // subvol-layout pool's fs-grow halts here.
       const mount = mounts.find(m => stripSubvolSuffix(m.source) === mapperPath)
       if (!mount)
         throw new Error(`pool '${pool.name}' filesystem is not mounted — btrfs can only be resized mounted`)
@@ -995,18 +972,16 @@ export interface ReplaceInput extends ExpansionInput {
 }
 
 /**
- * The guided single-disk replace (§5.1): partition the incoming disk, then per
- * band the outgoing disk serves — SEQUENTIALLY, bands share the one incoming
- * spindle (GT-10) — `mdadm --add` the new slice and `mdadm --replace --with`
- * (the outgoing member stays in-array during the copy: no degraded window).
- * A band whose outgoing member is already faulty/absent gets a plain `--add`
- * (rebuild) — `--replace` needs a live source; fail-then-rebuild is only ever
- * for disks that are already dead. After the swaps, any residual expansion
- * plan steps (new bands the replacement unlocks) run through
- * {@link executeExpansion}, which owns intent completion. Finally the outgoing
- * disk's superblocks are zeroed and its GPT zapped — ONLY when it is still
- * present and was healthy; a dead disk is left alone. Bands keep their names:
- * nothing is unpinned.
+ * Guided single-disk replace (§5.1): partition the incoming disk, then per
+ * band — SEQUENTIALLY, bands share the one incoming spindle (GT-10) —
+ * `mdadm --add` the new slice and `--replace --with` (outgoing member stays
+ * in-array during the copy: no degraded window). An already-faulty/absent
+ * outgoing member gets a plain `--add` rebuild — `--replace` needs a live
+ * source. Residual expansion steps (new bands the replacement unlocks) then
+ * run through {@link executeExpansion}, which owns intent completion.
+ * Finally the outgoing disk is superblock-zeroed and GPT-zapped — ONLY when
+ * still present and healthy; a dead disk is left alone. Bands keep their
+ * names: nothing is unpinned.
  */
 export async function executeReplace(
   executor: CommandExecutor,
@@ -1251,25 +1226,17 @@ export async function executeReadd(
   const degradedNotified = new Set<string>()
   for (const c of candidates) {
     const label = `${pool.name}-r${c.band}`
-    // Clear the stale faulty slot so `--re-add` is ACCEPTED — identified by
-    // what the slot IS, not what the returning disk is called now:
-    //  - the returning partition itself, if still listed faulty (the disk came
-    //    back under the SAME kernel name, e.g. after a reboot);
-    //  - any faulty member whose device node is now ABSENT (detached) — the
-    //    reboot-less return re-enumerates under a NEW name, so the array's
-    //    faulty slot names the OLD (gone) node and a name match misses it.
-    // Without this, the stale slot lingers, `--re-add` is refused, and 11.9's
-    // differential catch-up silently degrades to a full rebuild.
+    // Clear the stale faulty slot or `--re-add` is refused (and 11.9's
+    // differential catch-up silently degrades to a full rebuild). Matched by
+    // what the slot IS, not the disk's current name: a same-name return
+    // (reboot) leaves the returning partition itself listed faulty; a
+    // reboot-less return re-enumerates under a NEW name, so the slot names
+    // the old (gone) node and only `--remove detached` catches it.
     if (c.array.md.members.some(m => m.device === c.partKernel && m.faulty)) {
-      // Same-name return (e.g. after a reboot): the faulty slot IS this exact
-      // partition — remove it by path.
       updateProgress(`removing faulty slot ${c.partKernel} from ${label}`)
       await executor.exec(MDADM, [c.array.dev, '--remove', c.partPath])
     }
     else if (await removeDetachedFaultySlots(executor, c.array.dev, c.array.md.members)) {
-      // Reboot-less return: the disk re-enumerated under a NEW name, so the
-      // array's faulty slot names the OLD (now-absent) node — cleared as
-      // detached so the following `--re-add` is accepted.
       updateProgress(`removed detached faulty slot(s) from ${label}`)
     }
 

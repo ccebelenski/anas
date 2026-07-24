@@ -502,9 +502,9 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
   }
 
   /**
-   * NAS-surface guard (operator ruling 2026-07-18): ANAS mutates REMOTE share
-   * mounts only. Local filesystems are observe-only — the local-drive path is
-   * ZFS (later md/SHR), not generic mount management. Returns a 400 body when
+   * NAS-surface guard (operator ruling): ANAS mutates REMOTE share mounts
+   * only. Local filesystems are observe-only — the local-drive path is ZFS or
+   * AHR, not generic mount management. Returns a 400 body when
    * the target exists and is not an NFS/CIFS mount; unknown targets fall
    * through to the handlers' own 404s.
    */

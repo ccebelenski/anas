@@ -31,9 +31,8 @@ function relayHeaders(reply: FastifyReply, headers: UpstreamResult['headers']): 
  * Proxy the request to the local anasd Unix socket.
  *
  * Strips the `/api/nodes/<node>` prefix (the caller supplies `anasdPath`,
- * already `/v1/...` with query) and attaches the X-Anas-* identity headers
- * exactly as the retired Nuxt server did. Passes through status, body, and
- * the X-Anas-Confirm-* headers.
+ * already `/v1/...` with query) and attaches the X-Anas-* identity headers.
+ * Passes through status, body, and the X-Anas-Confirm-* headers.
  */
 export async function proxyToLocalSocket(
   request: FastifyRequest,

@@ -1381,9 +1381,8 @@
 
     // ---- Permissions: layered access editor (Epic 4.7.2) ------------------
     //
-    // Replaces the story-4.7 octal editor (Owner/Group combos + Mode textfield +
-    // Recursive checkbox). The base three principals (owner / owning-group /
-    // everyone) map to POSIX mode bits; extra named users/groups map to POSIX
+    // The base three principals (owner / owning-group / everyone) map to
+    // POSIX mode bits; extra named users/groups map to POSIX
     // ACL entries. Data contract: packages/shared/src/schemas/access.ts
     // (DatasetAccess on GET, SetAccessRequest on PUT). The daemon does the
     // acltype=posixacl enable + default-ACL inheritance; the UI only informs.
@@ -3009,8 +3008,8 @@
     //  Epic 15.4 — enriched-tree gfx retrofit
     //
     //  The datasets view stays a native ExtJS treepanel (hierarchy, lazy
-    //  loading, selection, keyboard nav, a11y come for free). We reproduce the
-    //  approved spike's VISUAL LANGUAGE inside it via column renderers that emit
+    //  loading, selection, keyboard nav, a11y come for free). The gfx VISUAL
+    //  LANGUAGE lives inside it via column renderers that emit
     //  ANAS.gfx markup, a pool-space donut hero above the tree, a pool-root row
     //  band, and PERSISTENT per-row line-icon action buttons (never hover-
     //  reveal). Everything is fail-open: a gfx gap degrades to the prior plain

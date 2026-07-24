@@ -16,9 +16,9 @@
  * in the PBS UI — the detail area LINKS there, never rebuilds or polls it.
  *
  * ---------------------------------------------------------------------------
- * DAEMON CONTRACT — field names this view ASSUMES beyond DESIGN.md's endpoint
- * table (the daemon is built in parallel; reconcile at merge time). Every read is
- * defensive: absent / renamed fields degrade to a muted dash, never an error.
+ * DAEMON CONTRACT — field names this view assumes beyond DESIGN.md's endpoint
+ * table. Every read is defensive: absent / renamed fields degrade to a muted
+ * dash, never an error.
  *
  *   GET /v1/backup/tasks → { data: TaskEntry[] }, each:
  *     { task, lastRunResult, lastRunAt, nextRunAt, overdue }
@@ -1167,7 +1167,7 @@
 
     // Open the on-demand Details window (modal:false, sized like the repos
     // manager). Snapshot semantics: it fetches once on open; the Reload button
-    // is the refresh. Everything the old docked area showed lives here.
+    // is the refresh.
     function openTaskDetailWindow(node, name) {
         if (!name) {
             return;

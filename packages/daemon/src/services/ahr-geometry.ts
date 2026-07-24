@@ -34,10 +34,8 @@ export const SGDISK_RAID_TYPE = 'FD00'
  * creation — the headroom is load-bearing for backup-file-free reshapes
  * (§5.1, GT-6: repeated grows shrink offsets).
  *
- * Values: 128 MiB for members ≥ 512 GiB, else 4 MiB.
- * CALIBRATION-PENDING (GT-5): the production number for TB-scale disks is
- * still to be measured on real hardware; revisit before the mutation layer
- * ships pool creation.
+ * Values: 128 MiB for members ≥ 512 GiB, else 4 MiB. The TB-scale production
+ * number is still uncalibrated on real hardware (GT-5).
  */
 export const AHR_DATA_OFFSET = {
   /** Member-partition size at which the large offset kicks in. */
@@ -131,9 +129,9 @@ export function planDiskPartitions(input: {
    * RAW disk size, when known. When the raw size leaves clear room past the
    * rounded boundary, the topmost slice is sized EXACTLY to the boundary
    * instead of clamping to the disk's end — the §2.5 rounding slack stays
-   * unpartitioned. (Live catch: a 2.5 G disk's clamped 1 GiB band-2 slice
-   * became a 1.5 GiB partition and skewed band-height reporting.) Without a
-   * raw size the topmost slice falls back to the clamp (safe, GT-4).
+   * unpartitioned, so a clamped slice can never exceed the band height and
+   * skew reporting. Without a raw size the topmost slice falls back to the
+   * clamp (safe, GT-4).
    */
   diskRawBytes?: number
   slices: AhrBandSlice[]

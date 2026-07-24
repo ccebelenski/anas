@@ -219,8 +219,8 @@
         return ('' + (disk.state || '')).toLowerCase();
     }
 
-    // Grid State column: render the pool state as a gfx status pill (matches the
-    // spike). Fail-open to the FA-icon renderState.
+    // Grid State column: render the pool state as a gfx status pill.
+    // Fail-open to the FA-icon renderState.
     function renderStatePill(value) {
         try {
             var gfx = ANAS.gfx;
@@ -1318,11 +1318,11 @@
 
     // ---- Add Vdevs action (stories 3.21 / 3.22 / 3.23) ---------------------
     //
-    // Expanding a pool is now the Pool Composer's job (expand mode): stage new
+    // Pool expansion is the Pool Composer's job (expand mode): stage new
     // Log/Cache/Spare/special/dedup/data vdevs against the selected pool and
-    // commit each via POST /pools/:name/vdevs with the right role. This RETIRES
-    // the old single-vdev window (34-pool-addvdev.js) — one add-vdev path only.
-    // Keeps the .anas-btn-addvdev test hook so existing toolbar specs resolve.
+    // commit each via POST /pools/:name/vdevs with the right role — the ONE
+    // add-vdev path. Keeps the .anas-btn-addvdev test hook so toolbar specs
+    // resolve.
     // PVE-managed pools must not be expandable → itemId is in PVE_HANDS_OFF.
     ANAS.pools.registerAction({
         itemId: 'addVdevs',

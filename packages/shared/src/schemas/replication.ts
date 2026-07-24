@@ -15,7 +15,7 @@ const ReplicationDataset = DatasetPath.or(z.literal(''))
  * Replication (Epic 5.5) — stage 1: LOCAL one-shot snapshot replication
  * (`zfs send | zfs recv` on the same node).
  *
- * Design (EPICS 5.5.x, agreed 2026-07-16): stateless — the incremental base is
+ * Design (EPICS 5.5.x): stateless — the incremental base is
  * DISCOVERED at run time as the newest snapshot common to source and target
  * (never bookkept); the destination is created `readonly=on`; the incremental
  * base carries a `zfs hold` (tag `anas-repl`) so cleanup cannot sever the

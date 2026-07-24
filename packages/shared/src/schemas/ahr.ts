@@ -2,23 +2,19 @@ import { z } from 'zod'
 import { AbsolutePath, DevicePath, DiskId, PoolName, UUID } from './common.js'
 
 /**
- * AHR — ANAS Hybrid RAID (Epic 11 + AHR, docs/AHR-DESIGN.md §3).
+ * AHR — ANAS Hybrid RAID wire shapes for /v1/ahr (Epic 11, AHR-DESIGN §3).
  *
- * SHR-style hybrid RAID as orchestration over a fully open stack:
+ * SHR-style hybrid RAID over a fully open stack:
  *
  *   disks → GPT partitions (size-matched band slices)
  *         → one mdadm array per band  (redundancy lives HERE)
  *         → LVM: all arrays concatenated into one VG → one LV
  *         → btrfs on the single LV
  *
- * btrfs is the only filesystem — stated, not chosen. There is deliberately NO
- * filesystem field anywhere in these shapes (AHR-DESIGN "deliberate
- * exclusions"), and btrfs is never configured for btrfs-native RAID: redundancy
- * is md's job, always.
- *
- * These are the wire shapes for `/v1/ahr`; the layout/planner computation that
- * produces the preview and step shapes lives in the daemon
- * (services/ahr-layout.ts). Validated at both boundaries, like everything else.
+ * btrfs is the only filesystem — stated, not chosen: deliberately NO
+ * filesystem field anywhere here, and btrfs-native RAID is never used
+ * (redundancy is md's job, always). Planner computation lives in the daemon
+ * (services/ahr-layout.ts).
  */
 
 // ---- Enums -----------------------------------------------------------------
@@ -51,8 +47,8 @@ export const ArrayState = z.enum([
 export type ArrayState = z.infer<typeof ArrayState>
 
 /**
- * Whole-pool state, fused across md + LVM + btrfs. Named `AhrPoolState` (the
- * design calls it PoolState) because zfs.ts already exports the ZFS `PoolState`.
+ * Whole-pool state, fused across md + LVM + btrfs. `AhrPoolState`, not the
+ * design's `PoolState` — zfs.ts already exports one.
  */
 export const AhrPoolState = z.enum([
   'healthy',
@@ -219,9 +215,6 @@ export type AhrExpansionState = z.infer<typeof AhrExpansionState>
  * the reachable target from (existing bands + approvedDisks) on every run and
  * resume. A missing disk is NEVER treated as intent to shrink; only an intent
  * naming `replacedDisk` may substitute a member.
- *
- * (Defined before AhrPool because the pool detail carries the live intent —
- * §6.2: a halted expansion surfaces Resume/Abandon loudly.)
  */
 export const AhrExpansionIntent = z.object({
   id: UUID,
@@ -231,11 +224,10 @@ export const AhrExpansionIntent = z.object({
   /** For replace-disk: the outgoing member (its replacement is in approvedDisks). */
   replacedDisk: DiskId.optional(),
   /**
-   * For replace-disk: the incoming disk (also present in approvedDisks). The
-   * §2.3 planner takes replacement as a declared {old, new} PAIR, and resume
-   * recomputes the plan from this intent — so the pair must be persisted:
-   * with only `replacedDisk`, a resume halted before the swap could not name
-   * which approved disk substitutes the old member.
+   * For replace-disk: the incoming disk (also in approvedDisks). Persisted as
+   * a pair with `replacedDisk` — resume recomputes the plan from this intent,
+   * and the §2.3 planner needs the declared {old, new} PAIR to know which
+   * approved disk substitutes the old member.
    */
   replacementDisk: DiskId.optional(),
   /** Capacity before the expansion (for the before → after presentation). */

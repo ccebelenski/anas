@@ -7,7 +7,7 @@ import { z } from 'zod'
 // (owner / owning-group / everyone) map to POSIX mode bits; extra named
 // principals map to POSIX ACL entries (acltype=posixacl). Granting a principal
 // also sets a matching DEFAULT ACL (+ setgid) so files created later inherit
-// the grant (decided 2026-07-14). NFSv4 ACLs are deferred to Epic 14.
+// the grant. NFSv4 ACLs are deferred to Epic 14.
 // ============================================================================
 
 /** Plain-language access level. POSIX max for a principal is rwx (read-write). */

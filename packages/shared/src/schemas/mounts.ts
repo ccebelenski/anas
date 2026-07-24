@@ -36,7 +36,7 @@ export const MountMode = z
  * `timeout`-guarded probe. PVE-owned mounts (read-only `storage.cfg` parse)
  * appear tagged hands-off and reject every mutation.
  *
- * Field names track the Stage-3 UI contract. Options are a STRUCTURED KNOWN TIER
+ * Field names track the UI contract. Options are a STRUCTURED KNOWN TIER
  * (common / NFS / CIFS) plus a verbatim passthrough for everything unrecognized
  * — a hand-edited entry keeps its exotica across an edit to an unrelated field.
  *
@@ -54,9 +54,9 @@ export type MountKind = z.infer<typeof MountKind>
 
 /**
  * The mount types ANAS can CREATE or mutate — remote shares ONLY (operator
- * ruling 2026-07-18): ANAS is a NAS layer, not a manager of local Linux
- * mounts. Local filesystems appear in the inventory (observe) but the
- * local-drive path is ZFS (later md/SHR, Epic 11) — never generic mounts.
+ * ruling): ANAS is a NAS layer, not a manager of local Linux mounts. Local
+ * filesystems appear in the inventory (observe) but the local-drive path is
+ * ZFS or AHR (Epic 11) — never generic mounts.
  */
 export const MountType = z.enum(['nfs', 'cifs'])
 export type MountType = z.infer<typeof MountType>

@@ -208,13 +208,11 @@ const SNAP_PREFIX = `${SUBVOL_SNAPSHOTS}/`
 /**
  * List a pool's snapshots (§12). Enumerates EVERY direct `@snapshots/<name>`
  * child from the PLAIN `btrfs subvolume list` — not `-s` — because a
- * `pre-rollback-<ts>` preserve of a former `@data` is a plain subvolume, NOT a
- * btrfs "snapshot", so `-s` omits it entirely (live catch 2026-07-23: the very
- * state the rollback confirm promises the operator can roll back to was
- * invisible to the list). `-s` still supplies `otime` (createdAt, joined by
- * path — null for a plain preserve, per the schema) and `-r` supplies the
- * read-only set (the readonly flag — false for the writable preserve). An
- * unmounted pool has nothing to list.
+ * `pre-rollback-<ts>` preserve of a former `@data` is a plain subvolume, NOT
+ * a btrfs "snapshot", and `-s` would omit exactly the state the rollback
+ * confirm promises is kept. `-s` still supplies `otime` (createdAt, joined by
+ * path — null for a plain preserve) and `-r` the read-only set (false for
+ * the writable preserve). An unmounted pool has nothing to list.
  */
 export async function listAhrSnapshots(
   executor: CommandExecutor,

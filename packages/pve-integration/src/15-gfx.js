@@ -3,10 +3,9 @@
  *
  * The shared graphical layer for ANAS's storage views: skeuomorphic SVG hardware
  * objects, flat line-icon controls, capacity gauges/bars, the pool-space donut,
- * and a dependency-free pointer-drag toolkit. Ported and cleaned up from three
- * reviewed local spikes (pool-composer, pools-status, datasets-tree). Consumed by
- * the Pool Composer, Pools status, and the enriched Datasets tree so a faulted
- * disk (etc.) looks identical everywhere.
+ * and a dependency-free pointer-drag toolkit. Consumed by the Pool Composer,
+ * Pools status, and the enriched Datasets tree so a faulted disk (etc.) looks
+ * identical everywhere.
  *
  * DESIGN CONTRACT (DESIGN.md → "ANAS.gfx — graphical visual language"):
  *   - SVG + DOM, never canvas — canvas has no DOM nodes → no test hooks, no CSS
@@ -591,9 +590,8 @@
     //   name  : add | snapshot | share | lock | props | trash (aliases accepted)
     //   label : tooltip text (also its accessible title)
     //   opts  : { danger:bool } → destructive hover styling (typically 'trash')
-    // Always-visible with a `title` tooltip (no hover-reveal, per the datasets v2
-    // spike). The button carries a `data-anas-ctl` attribute so handlers can be
-    // delegated by name.
+    // Always-visible with a `title` tooltip (never hover-reveal). The button
+    // carries a `data-anas-ctl` attribute so handlers can be delegated by name.
     gfx.ctl = function (name, label, opts) {
         try {
             ensureInjected();
@@ -1136,8 +1134,8 @@
     // DRAG — dependency-free pointer-events drag + dropzone helper.
     // ======================================================================
 
-    // drag(el, opts) → make `el` draggable onto dropzones. Generalised from the
-    // composer spike: pointerdown clones a ghost whose WIDTH is locked to the
+    // drag(el, opts) → make `el` draggable onto dropzones: pointerdown
+    // clones a ghost whose WIDTH is locked to the
     // source rect (no resize-on-lift), the ghost follows the pointer, dropzones
     // are hit-tested with elementFromPoint (ghost temporarily hidden so it never
     // tests itself), the hovered zone is highlighted, and pointerup fires onDrop.

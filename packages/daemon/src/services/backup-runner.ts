@@ -255,11 +255,11 @@ export async function runBackup(
   // path, which probes repo.namespace.
   const args = buildBackupArgs(task, task.namespace ?? repo.namespace)
 
-  // The fd cap must bind pbc ITSELF. pbc execs inside anasd (nofile 524288 —
+  // The fd cap must bind pbc ITSELF: pbc execs inside anasd (nofile 524288 —
   // Node raises soft→hard), not in the task unit's cgroup, so the unit's
-  // LimitNOFILE= never reaches it (live-proof finding A). prlimit around the
-  // exec is the operator's own proven mechanism: without the cap pbc hoards
-  // handles — worst in metadata mode — until the network stack degrades.
+  // LimitNOFILE= never reaches it. Hence prlimit around the exec: without the
+  // cap pbc hoards handles — worst in metadata mode — until the network
+  // stack degrades.
   const nofile = task.limitNofile ?? 1024
   updateProgress(`starting backup ${task.name} → ${repo.name}:${repo.datastore}`)
   const r = await executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env })

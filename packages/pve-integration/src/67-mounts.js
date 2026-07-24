@@ -12,8 +12,9 @@
  * hands-off and reject mutations — same pattern as PVE-managed pools in 30-pools.
  *
  * ---------------------------------------------------------------------------
- * DAEMON CONTRACT (Stage 2 is built in parallel; these are the field names this
- * view ASSUMES beyond DESIGN.md's endpoint table — reconcile at merge time).
+ * DAEMON CONTRACT — the field names this view assumes beyond DESIGN.md's
+ * endpoint table. Every read is defensive: aliases tolerated, absent fields
+ * degrade to a muted dash.
  *
  *   GET /v1/mounts → { data: Mount[] }, each Mount:
  *     mountpoint  (string, identity)   source (string: 'srv:/exp' | '//srv/shr'
@@ -53,11 +54,10 @@
  *   DELETE /v1/mounts/:mountpoint → 202/409   (unmount + drop fstab; busy → 409
  *     with confirm code + holding-process warnings).
  *
- *   ASSUMED (not in DESIGN's table): the pure mount/unmount toggle that does NOT
- *   touch fstab uses the pools action-subresource idiom:
+ *   The pure mount/unmount toggle that does NOT touch fstab uses the pools
+ *   action-subresource idiom:
  *     POST /v1/mounts/:mountpoint/state  body { action:'mount'|'unmount' } → 202
- *     (unmount busy → 409 + holding processes). If the daemon models this as
- *     PUT/DELETE variants instead, only mountToggle() needs to change.
+ *     (unmount busy → 409 + holding processes).
  * ---------------------------------------------------------------------------
  *
  * Test hooks: view 'anas-view anas-view-mounts'; grid 'anas-grid-mounts'; detail
@@ -505,8 +505,7 @@
 
     // Enable/disable selection-dependent actions. PVE-managed rows are hands-off
     // (30-pools pattern), and so are LOCAL filesystems — ANAS mutates remote
-    // shares only (operator ruling 2026-07-18: the local-drive path is ZFS, not
-    // generic mount management; local rows are observe-only inventory).
+    // shares only (operator ruling: local rows are observe-only inventory).
     function updateButtons(grid) {
         var rec = selectedMount(grid);
         var has = !!rec;

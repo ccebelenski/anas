@@ -1,19 +1,17 @@
 /*
- * ANAS — Dashboard view (Epic 2: stories 2.1–2.7; gfx retrofit 15.5;
- * information-architecture re-layout).
+ * ANAS — Dashboard view (Epic 2: stories 2.1–2.7; gfx retrofit 15.5).
  *
  * The real, gold-standard ANAS landing page. Top → bottom:
  *   1. Warnings   — critical/warning callouts (only when present).
  *   2. Disk Fleet — the at-a-glance healthy/warning/critical/unknown count tiles
  *                   plus a compact "Recent activity" jobs strip (relative time +
- *                   duration + outcome). Moved to the TOP.
+ *                   duration + outcome).
  *   3. Pools      — THE HEADLINE. One nested Pool → VDEV → Device hierarchy per
- *                   pool, absorbing the old "Pool health", "Pool I/O" and
- *                   "Disk I/O" sections: pool state pill + capacity donut +
- *                   aggregate live I/O + scan indicator; each vdev its own state
- *                   pill + type + aggregated I/O; each device its disk object +
- *                   live throughput + latency. Matches /status pools to
- *                   /telemetry pools by name.
+ *                   pool: pool state pill + capacity donut + aggregate live I/O
+ *                   + scan indicator; each vdev its own state pill + type +
+ *                   aggregated I/O; each device its disk object + live
+ *                   throughput + latency. Matches /status pools to /telemetry
+ *                   pools by name.
  *   4. ARC        — hit-ratio gauge + size/target + L2.
  *   5. Network    — total rx/tx time chart + per-interface rx/tx numbers.
  * All rendered in the ANAS.gfx visual language (15-gfx.js). Pool, per-vdev and
@@ -32,8 +30,8 @@
  *                       POLLED every POLL_MS while the panel is visible.
  *                       ioStats = { readBytesPerSec, writeBytesPerSec, readIops,
  *                       writeIops, readLatencyNs|null, writeLatencyNs|null }.
- *                       (The old flat top-level disks[] array is GONE — disks are
- *                       nested under vdevs under pools.)
+ *                       Disks are nested under vdevs under pools — there is no
+ *                       flat top-level disks[] array.
  *
  * The Pools section needs BOTH endpoints (state/capacity/scan from /status, I/O
  * from /telemetry). We cache the last-good of each on the view (_anasStatus /
@@ -57,8 +55,6 @@
  * 'anas-dash-warnings' / 'anas-dash-fleet' / 'anas-dash-pools' / 'anas-dash-arc'
  * / 'anas-dash-net' / 'anas-dash-status'; Refresh button 'anas-btn-dash-refresh';
  * latency now/peak/avg readout 'anas-dash-lat' (pool head, vdev line, device tile).
- * (The old 'anas-dash-overview' / 'anas-dash-io' / 'anas-dash-disks' /
- * 'anas-dash-shares' sections were folded away by the re-layout.)
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  */
@@ -663,7 +659,7 @@
 
     // 2.7 — ARC hit ratio gauge + size/target + max, L2ARC line when present.
     // Hit ratio is a natural 0..1 fullness, so the gauge already reads clearly —
-    // no time chart here (the sparkline earned no axes and was removed).
+    // no time chart here (a sparkline earned no axes).
     function renderArc(view, tel) {
         var arc = tel && tel.arc;
         if (!arc) {
@@ -714,8 +710,7 @@
 
     // ---- Pool → VDEV → Device composite (the headline) ---------------------
     //
-    // ONE nested hierarchy per pool, absorbing the old Pool-health / Pool-I/O /
-    // Disk-I/O sections. State/capacity/scan come from /status; live I/O comes
+    // ONE nested hierarchy per pool. State/capacity/scan come from /status; live I/O comes
     // from the matching /telemetry pool (by name); vdevs and devices come from
     // the telemetry pool's nested vdevs[].disks[]. Both caches live on the view
     // and this renders from whichever we have (fail-open, last-good preserved).

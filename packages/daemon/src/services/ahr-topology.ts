@@ -192,33 +192,25 @@ export function stripSubvolSuffix(source: string): string {
 
 /**
  * One band array's state, fused from mdstat (GT-8/GT-9 aware):
- *  - inactive (all-spares) → 'degraded' — the pool advisory names the
- *    condition; the schema deliberately gains no extra state for it.
- *  - a running `recovery` → 'recovering', checked BEFORE the degraded verdict:
- *    a recovery is md actively (re)building redundancy onto a target member —
- *    the initial RAID5/6 build ("building — pool usable now", §3, reported
- *    distinct from degraded), a spare AUTO-FAILOVER (§11, "no operator in the
- *    loop" — story 11.11), or a re-add/replace rebuild. The array has (or is
- *    restoring) protection with nobody in the loop, so it must NOT card as a
- *    degraded failure (§10 "rebuild … no new surface"); pool state fuses to
- *    'rebuilding' and the jobs/advisory layer carries the detail.
- *  - only AFTER ruling out an active recovery does reduced redundancy read as
- *    'degraded' — the drilled "clean, degraded, reshaping" disk-fault-during-
- *    reshape case (§8) stays degraded because its sync is a `reshape`, not a
- *    `recovery`; a genuinely-degraded array with no heal running stays degraded
- *    and DOES card.
+ *  - inactive (all-spares) → 'degraded'; the pool advisory names the
+ *    condition (the schema deliberately gains no extra state for it).
+ *  - a running `recovery` → 'recovering', checked BEFORE the degraded
+ *    verdict: recovery is md actively (re)building redundancy — the initial
+ *    RAID5/6 build ("building — pool usable now", §3), a §11 spare
+ *    auto-failover, or a re-add/replace rebuild. It must NOT card as a
+ *    degraded failure (§10); pool state fuses to 'rebuilding'.
+ *  - only after ruling out a recovery does reduced redundancy read as
+ *    'degraded' — the §8 disk-fault-during-reshape case stays degraded (its
+ *    sync is a `reshape`, not a `recovery`) and DOES card.
  *  - a lingering faulty slot with EVERY raid slot in sync (the consumed-spare
- *    §11 shape — the spare rebuilt in, the failed device is still attached)
- *    is NOT degraded: redundancy is intact, and the consumed-spare advisory
- *    carries the "remove/replace the failed disk" message instead.
+ *    §11 shape) is NOT degraded: redundancy is intact; the consumed-spare
+ *    advisory carries the "remove/replace the failed disk" message.
  *  - auto-read-only is NOT a fault (GT-9) — it maps to clean.
  *  - a running `check` keeps state clean/degraded; sync{} carries it.
  */
 function arrayState(md: MdstatArray): ArrayState {
   if (!md.active)
     return 'degraded'
-  // A recovery restores redundancy onto a target — it wins over the degraded
-  // verdict (initial build, spare failover, re-add/replace all report here).
   if (md.sync?.action === 'recovery')
     return 'recovering'
   const degraded = md.raidDevices !== null && md.activeDevices !== null
@@ -396,9 +388,8 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
 
       // md semantics: the SMALLEST member slice defines the band — a member
       // whose topmost partition spilled past the boundary (geometry clamp on
-      // a raw tail, e.g. a 2.5 G disk's 1 GiB band-2 slice) must not inflate
-      // the band height (live catch: it pushed derived boundaries past every
-      // disk and blanked the banded-layout bars).
+      // a raw tail) must not inflate the band height and push derived
+      // boundaries past every disk.
       const memberSizes = entry.mdstat.members
         .map(m => lsblk.partsByKernel.get(m.device)?.size ?? 0)
         .filter(s => s > 0)
@@ -475,13 +466,11 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     // ---- Mount + btrfs ------------------------------------------------------
     const lvName = lv?.name ?? `${poolName}-vol`
     const mapperPath = `/dev/mapper/${dmName(poolName, lvName)}`
-    // findmnt appends the mounted subvolume path to the source of a btrfs
-    // subvolume mount, e.g. `/dev/mapper/tank-tank--vol[/@data]` — so an exact
-    // `source === mapperPath` match MISSES every §12 subvol-layout pool and
-    // falls through to the options-less lsblk fallback below, which then reads
-    // subvolLayout as false for a pool that IS `subvol=@data` (live catch,
-    // 11.12 proof). Strip the `[…]` suffix before matching so the real mount
-    // (carrying the subvol=@data option) is found and its options preserved.
+    // findmnt appends the mounted subvolume to a btrfs source
+    // (`…-vol[/@data]`) — an exact `source === mapperPath` match MISSES every
+    // §12 subvol-layout pool and falls through to the options-less lsblk
+    // fallback below, which reads subvolLayout false. Strip the suffix so the
+    // real mount (carrying subvol=@data) is found and its options preserved.
     const mount = mounts.find(m => stripSubvolSuffix(m.source) === mapperPath)
       ?? (lsblk.lvmByDmName.get(dmName(poolName, lvName))?.mountpoint
         ? { target: lsblk.lvmByDmName.get(dmName(poolName, lvName))!.mountpoint!, source: mapperPath, fstype: 'btrfs', options: '' }

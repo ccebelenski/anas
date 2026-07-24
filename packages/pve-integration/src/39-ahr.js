@@ -17,9 +17,8 @@
  *   POST   /ahr/:name/scrub            → 202 { job }
  *   DELETE /ahr/:name                  → 409 confirm → 202 { job }
  *
- * Expand / Replace / Scrub are coded to the documented API shape; a daemon
- * that does not serve them yet answers 404 and the handlers degrade to a
- * clear "not available in this build" message (fail-open, never a raw error).
+ * Mutation handlers degrade to a clear "not available in this build" message
+ * when the daemon 404s a route (fail-open, never a raw error).
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  */
