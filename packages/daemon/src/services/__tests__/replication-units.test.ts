@@ -123,6 +123,42 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
     assert.equal(parseServiceUnit('# X-ANAS-Task={"name":"BAD NAME","schedule":""}\n'), null)
   })
 
+  // --- strict-on-write, LENIENT-ON-READ: a stored task whose dataset no longer
+  // passes the narrowed regex must STAY VISIBLE (flagged), never silently vanish
+  // while its timer keeps firing.
+  it('parseServiceUnit keeps a stored task with a now-invalid dataset VISIBLE, flagged invalid', () => {
+    const stored = makeTask({ source: { pool: 'testpool', dataset: 'media/movies/' } })
+    const unit = `# X-ANAS-Task=${JSON.stringify(stored)}\n`
+    const parsed = parseServiceUnit(unit)
+    assert.ok(parsed, 'task must not vanish')
+    assert.equal(parsed!.name, 'nightly-media')
+    assert.equal(parsed!.source.dataset, 'media/movies/') // preserved verbatim
+    assert.equal(parsed!.invalid, true)
+    assert.ok(parsed!.invalidReason && parsed!.invalidReason.length > 0)
+  })
+
+  it('parseServiceUnit does NOT flag a fully-valid stored task', () => {
+    const parsed = parseServiceUnit(renderServiceUnit(makeTask()))
+    assert.ok(parsed)
+    assert.equal(parsed!.invalid, undefined)
+  })
+
+  it('readAllTasks lists a lenient-flagged task alongside valid ones', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-repl-lenient-'))
+    try {
+      await writeFile(join(dir, serviceUnitName('good')), renderServiceUnit(makeTask({ name: 'good' })))
+      const bad = makeTask({ name: 'flagged', source: { pool: 'testpool', dataset: 'media/movies/' } })
+      await writeFile(join(dir, serviceUnitName('flagged')), `# X-ANAS-Task=${JSON.stringify(bad)}\n`)
+      const tasks = await readAllTasks(dir)
+      const byName = new Map(tasks.map(t => [t.name, t]))
+      assert.equal(byName.get('good')!.invalid, undefined)
+      assert.equal(byName.get('flagged')!.invalid, true)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   // --- schedule validation via systemd-analyze -----------------------------
   it('validateSchedule → ok on exit 0', async () => {
     const mock = new MockExecutor()

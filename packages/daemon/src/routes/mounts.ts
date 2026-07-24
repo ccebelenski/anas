@@ -11,6 +11,7 @@ import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js
 import { confirmGate } from '../safety/gate.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import {
+  ahrPinnedSpecs,
   buildBaseInventory,
   buildMountDetail,
   credsFilePath,
@@ -21,6 +22,7 @@ import {
   probeInventoryHealth,
   pveStorageFor,
   readFindmnt,
+  readMdadmConfText,
   removeCredentialsFile,
   runMountTest,
   writeCredentialsFile,
@@ -47,6 +49,12 @@ export interface MountsRouteOptions {
   credsDir: string
   /** storage.cfg location for read-only PVE tagging (undefined = default). */
   storagePath?: string
+  /**
+   * mdadm.conf location for read-only AHR-pin tagging (undefined = the default
+   * / ANAS_MDADM_CONF). A pinned pool's LV spec is matched against the fstab
+   * entry so AHR persistence stays hands-off in Mounts (§2.6).
+   */
+  mdadmConfPath?: string
 }
 
 /**
@@ -58,16 +66,22 @@ export interface MountsRouteOptions {
  * (guarded `stat -f` in a child process).
  */
 export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOptions) {
-  const { executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath } = opts
+  const { executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath, mdadmConfPath } = opts
+
+  /** AHR pin specs from the ANAS-managed mdadm.conf (empty when unconfigured). */
+  async function readAhrSpecs(): Promise<Set<string>> {
+    return mdadmConfPath ? ahrPinnedSpecs(await readMdadmConfText(mdadmConfPath)) : new Set<string>()
+  }
 
   // --- GET /mounts — inventory --------------------------------------------
   server.get('/mounts', async () => {
-    const [findmntText, fstabText, pveMountPaths] = await Promise.all([
+    const [findmntText, fstabText, pveMountPaths, ahrSpecs] = await Promise.all([
       readFindmnt(executor),
       readConfig(fstabPath),
       readPveMountPaths(storagePath),
+      readAhrSpecs(),
     ])
-    const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths)
+    const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths, ahrSpecs)
     await probeInventoryHealth(executor, rows)
     return { data: rows }
   })
@@ -77,7 +91,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const mp = parseMountpoint(request.params.mountpoint, reply)
     if (!mp)
       return
-    const detail = await buildMountDetail(executor, mp, { fstabPath, credsDir, storagePath })
+    const detail = await buildMountDetail(executor, mp, { fstabPath, credsDir, storagePath, mdadmConfPath })
     if (!detail) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Mount '${mp}' not found` } }
@@ -200,6 +214,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (rejected)
       return rejected
 
+    const rejectedAhr = await rejectIfAhr(mp, reply)
+    if (rejectedAhr)
+      return rejectedAhr
+
     const existing = getMount(await readConfig(fstabPath), mp)
     if (!existing) {
       reply.code(404)
@@ -259,6 +277,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const rejected = await rejectIfPve(mp, reply)
     if (rejected)
       return rejected
+
+    const rejectedAhr = await rejectIfAhr(mp, reply)
+    if (rejectedAhr)
+      return rejectedAhr
 
     const fstabText = await readConfig(fstabPath)
     const entry = getMount(fstabText, mp)
@@ -373,6 +395,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const rejected = await rejectIfPve(mp, reply)
     if (rejected)
       return rejected
+
+    const rejectedAhr = await rejectIfAhr(mp, reply)
+    if (rejectedAhr)
+      return rejectedAhr
 
     const fstabText = await readConfig(fstabPath)
     const entry = getMount(fstabText, mp)
@@ -504,6 +530,31 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (mountpointReservedByPve(mountpoint) || pveStorageFor(mountpoint, await readPveMountPaths(storagePath))) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mountpoint}' is PVE-owned (hands-off) and cannot be modified by ANAS` } }
+    }
+    return undefined
+  }
+
+  /**
+   * Reject a mutation on an AHR pool's persistence (hands-off — mirrors
+   * rejectIfPve). A Mounts unmount/delete/edit on a pool's LV entry would rip
+   * the pool's persistence out from under the Hybrid RAID feature. Matches on
+   * the LV SPEC via the shared inventory tagging (never the mountpoint), so a
+   * custom-mountpoint pool is still refused.
+   */
+  async function rejectIfAhr(mountpoint: string, reply: FastifyReply): Promise<object | undefined> {
+    if (!mdadmConfPath)
+      return undefined
+    const [findmntText, fstabText, ahrSpecs] = await Promise.all([
+      readFindmnt(executor),
+      readConfig(fstabPath),
+      readAhrSpecs(),
+    ])
+    if (ahrSpecs.size === 0)
+      return undefined
+    const row = buildBaseInventory(findmntText, fstabText, new Map(), ahrSpecs).find(r => r.mountpoint === mountpoint)
+    if (row?.ahrManaged) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mountpoint}' is an ANAS Hybrid RAID (AHR) pool — manage it from the Hybrid RAID view, not the Mounts feature` } }
     }
     return undefined
   }

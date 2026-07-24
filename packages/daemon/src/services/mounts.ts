@@ -22,7 +22,10 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { classifyKind, isPseudoFstype, isSystemMountTarget, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { getMount, parseFstab } from '../parsers/fstab.js'
+import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
+import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { readPveMountPaths } from '../parsers/pve-storage.js'
+import { ahrLvPath } from './ahr-create.js'
 import { readConfig } from './config-writer.js'
 
 /** `timeout` binary — wraps the probe so a dead NFS server can never hang us. */
@@ -53,6 +56,8 @@ const LEADING_SLASHES_RE = /^\/+/
 const SLASH_RE = /\//g
 /** Non-filename-safe characters (creds-filename derivation). */
 const UNSAFE_CHARS_RE = /[^\w.-]/g
+/** `/dev/md/` prefix on an mdadm ARRAY device path (AHR pin → pool derivation). */
+const DEV_MD_PREFIX_RE = /^\/dev\/md\//
 
 /** Is this kind a remote (network) filesystem? */
 export function isRemoteKind(kind: string): boolean {
@@ -74,6 +79,7 @@ export function buildBaseInventory(
   findmntText: string,
   fstabText: string,
   pveMountPaths: Map<string, string>,
+  ahrSpecs: Set<string> = new Set(),
 ): MountSummary[] {
   const nodes = parseFindmnt(findmntText).filter(n => !isPseudoFstype(n.fstype) && !isSystemMountTarget(n.target))
   const entries = parseFstab(fstabText)
@@ -109,6 +115,7 @@ export function buildBaseInventory(
       automount: isAutofs,
       disabled: false,
       pveManaged: false,
+      ahrManaged: false,
       readOnly: optionsReadOnly(node.options),
     })
   }
@@ -138,6 +145,7 @@ export function buildBaseInventory(
         automount: entry.options.common.automount,
         disabled: entry.disabled ?? false,
         pveManaged: false,
+        ahrManaged: false,
         readOnly: entry.options.common.readOnly,
       })
     }
@@ -150,9 +158,15 @@ export function buildBaseInventory(
       row.pveManaged = true
       row.pveStorage = pve
     }
+    const entry = entryByMount.get(row.mountpoint)
+    // Tag AHR pool persistence hands-off — match on the LV SPEC (never the
+    // mountpoint, which is operator-configurable). The fstab entry spec is the
+    // reliable identity; a mounted pool's findmnt `source` is the /dev/mapper
+    // name, so consult the configured spec too.
+    if (ahrSpecs.size > 0 && (ahrSpecs.has(row.source) || (entry && ahrSpecs.has(entry.spec))))
+      row.ahrManaged = true
     // Reflect fstab automount even where findmnt shows a plain nfs4 (already
     // handled), and keep automount truthful for configured rows.
-    const entry = entryByMount.get(row.mountpoint)
     if (entry)
       row.automount = row.automount || entry.options.common.automount
   }
@@ -160,6 +174,39 @@ export function buildBaseInventory(
   const rows = [...byTarget.values()]
   rows.sort((a, b) => a.mountpoint.localeCompare(b.mountpoint))
   return rows
+}
+
+/**
+ * The set of AHR pool LV specs pinned in the ANAS-managed mdadm.conf — the
+ * ownership marker mirrored from AHR (§2.6, config-is-the-API). Each ANAS ARRAY
+ * pin names a band `<pool>-r<band>`; the pool's fstab entry references the LV
+ * spec `/dev/<pool>/<pool>-vol`. The Mounts feature matches on this spec (never
+ * the mountpoint) so a pool's persistence stays hands-off even after a custom
+ * mountpoint move. Reuses the round-trip mdadm-conf parser AHR writes with;
+ * fail-open (an unreadable/empty conf → no pins → no AHR rows flagged, which
+ * only ever makes Mounts LESS restrictive, never wrongly seizes a foreign LV).
+ */
+export function ahrPinnedSpecs(mdadmConfText: string): Set<string> {
+  const specs = new Set<string>()
+  for (const array of getArrays(parseMdadmConfDoc(mdadmConfText))) {
+    // ANAS writes no `name=` token, so derive the pool from the device basename;
+    // matchAhrArrayName tolerates a homehost prefix and rejects foreign arrays.
+    const bandName = array.name ?? array.device.replace(DEV_MD_PREFIX_RE, '')
+    const named = matchAhrArrayName(bandName)
+    if (named)
+      specs.add(ahrLvPath(named.pool))
+  }
+  return specs
+}
+
+/** Read the ANAS-managed mdadm.conf for AHR pin derivation; '' on any failure. */
+export async function readMdadmConfText(path: string): Promise<string> {
+  try {
+    return await readConfig(path)
+  }
+  catch {
+    return ''
+  }
 }
 
 /** The PVE storage id owning `mountpoint`, or undefined (NOTES §3 tagging). */
@@ -256,7 +303,9 @@ export function buildMountWarnings(
 ): DashboardWarning[] {
   const warnings: DashboardWarning[] = []
   for (const s of summaries) {
-    if (!s.persistent || s.pveManaged)
+    // AHR pools have their own Hybrid RAID dashboard warnings — never
+    // double-warn from the Mounts category (hands-off, §2.6).
+    if (!s.persistent || s.pveManaged || s.ahrManaged)
       continue
     if (s.state === 'unreachable' || s.state === 'stale') {
       warnings.push({
@@ -289,15 +338,16 @@ export function buildMountWarnings(
  */
 export async function collectMountWarnings(
   executor: CommandExecutor,
-  opts: { fstabPath: string, storagePath?: string },
+  opts: { fstabPath: string, storagePath?: string, mdadmConfPath?: string },
 ): Promise<DashboardWarning[]> {
   try {
-    const [findmntText, fstabText, pveMountPaths] = await Promise.all([
+    const [findmntText, fstabText, pveMountPaths, mdadmConfText] = await Promise.all([
       readFindmnt(executor),
       readConfig(opts.fstabPath),
       readPveMountPaths(opts.storagePath),
+      opts.mdadmConfPath ? readMdadmConfText(opts.mdadmConfPath) : Promise.resolve(''),
     ])
-    const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths)
+    const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths, ahrPinnedSpecs(mdadmConfText))
     await probeInventoryHealth(executor, rows)
     const entriesByMount = new Map(parseFstab(fstabText).map(e => [e.mountpoint, e]))
     return buildMountWarnings(rows, entriesByMount)
@@ -683,14 +733,15 @@ export async function readUnitState(executor: CommandExecutor, mountpoint: strin
 export async function buildMountDetail(
   executor: CommandExecutor,
   mountpoint: string,
-  opts: { fstabPath: string, credsDir: string, storagePath?: string },
+  opts: { fstabPath: string, credsDir: string, storagePath?: string, mdadmConfPath?: string },
 ): Promise<MountDetail | null> {
-  const [findmntText, fstabText, pveMountPaths] = await Promise.all([
+  const [findmntText, fstabText, pveMountPaths, mdadmConfText] = await Promise.all([
     readFindmnt(executor),
     readConfig(opts.fstabPath),
     readPveMountPaths(opts.storagePath),
+    opts.mdadmConfPath ? readMdadmConfText(opts.mdadmConfPath) : Promise.resolve(''),
   ])
-  const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths)
+  const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths, ahrPinnedSpecs(mdadmConfText))
   const row = rows.find(r => r.mountpoint === mountpoint)
   if (!row)
     return null

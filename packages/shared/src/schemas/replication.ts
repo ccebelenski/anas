@@ -137,8 +137,33 @@ export const ReplicationTask = z.object({
   /** Snapshot the source before each run (recommended; default true). */
   snapshotFirst: z.boolean().default(true),
   enabled: z.boolean().default(true),
+  /**
+   * Read-path ONLY: set true (with a reason) when a STORED task failed STRICT
+   * validation but parsed leniently — e.g. a dataset that no longer matches the
+   * narrowed ReplicationDataset regex. Such a task stays VISIBLE in the list so
+   * the operator can delete/repair it (its systemd timer keeps firing
+   * regardless). NEVER set on create/update — those stay strict-gated — and
+   * omitted (undefined) from a valid task.
+   */
+  invalid: z.boolean().optional(),
+  /** Why the stored task failed strict validation (paired with `invalid`). */
+  invalidReason: z.string().optional(),
 })
 export type ReplicationTask = z.infer<typeof ReplicationTask>
+
+/**
+ * The LENIENT read-back form of ReplicationTask: the pool/dataset identity
+ * fields relax to plain single-line strings (still control-char-free — they
+ * flow into `zfs`/`ssh`/systemd argv on the read/status path) so a STORED task
+ * whose dataset no longer passes the narrowed ReplicationDataset regex stays
+ * parseable and VISIBLE (flagged `invalid`). Read path only; strict
+ * ReplicationTask remains the create/update gate.
+ */
+export const LenientReplicationTask = ReplicationTask.extend({
+  source: z.object({ pool: SingleLine, dataset: SingleLine }),
+  target: ReplicationTarget.extend({ pool: SingleLine, dataset: SingleLine.optional() }),
+})
+export type LenientReplicationTask = z.infer<typeof LenientReplicationTask>
 
 /** Live status of a task — derived, never stored (ZFS + systemd truth). */
 export const ReplicationTaskStatus = z.object({

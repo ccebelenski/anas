@@ -467,7 +467,7 @@ export function createServer(opts?: ServerOptions) {
   server.register(backupRoutes, { prefix: '/v1', executor, jobQueue, paths: backupReposPaths, systemdDir })
   // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
   // inventory + PVE-tagged hands-off + guarded status probe.
-  server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath })
+  server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
   // AHR hybrid RAID (Epic 11 + AHR). The per-pool AhrExpansionIntent store
@@ -492,7 +492,7 @@ export function createServer(opts?: ServerOptions) {
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, job, and AHR (11.10) sources above, plus on-demand
   // ARC/iostat/net sampling.
-  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath, ahrIntentDir })
+  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath, mdadmConfPath, ahrIntentDir })
 
   server.decorate('jobQueue', jobQueue)
   server.decorate('executor', executor)

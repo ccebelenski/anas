@@ -200,6 +200,7 @@ export {
 
 // Replication schemas (Epic 5.5)
 export {
+  LenientReplicationTask,
   RemotesFile,
   RemoteTestResult,
   ReplicatePlan,

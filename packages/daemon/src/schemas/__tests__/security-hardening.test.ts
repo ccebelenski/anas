@@ -139,13 +139,15 @@ describe('NFS fields — spec / options single-line', () => {
 })
 
 describe('Mount vers / spec / server — numeric vers, single-line spec', () => {
-  it('accepts realistic version tokens', () => {
-    for (const v of ['4.2', '3.1.1', '3', '1.0']) {
+  it('accepts realistic version tokens (incl. the documented CIFS "default")', () => {
+    for (const v of ['4.2', '3.1.1', '3', '1.0', 'default']) {
       assert.equal(MountVers.safeParse(v).success, true, `should accept ${v}`)
     }
   })
-  it('rejects the comma option-injection version payload', () => {
-    for (const v of ['4.2,exec', '3.1.1,suid', `4.2${NL}`, 'default']) {
+  it('rejects the comma option-injection version payload and other non-numeric words', () => {
+    // `default` is the ONLY non-numeric word admitted; everything else — comma
+    // injection, whitespace, control chars, other words — stays rejected.
+    for (const v of ['4.2,exec', '3.1.1,suid', `4.2${NL}`, 'default,exec', 'defaults', 'auto', '4 2', ' default']) {
       assert.equal(MountVers.safeParse(v).success, false, `should reject ${JSON.stringify(v)}`)
     }
   })

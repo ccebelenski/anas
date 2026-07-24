@@ -113,6 +113,14 @@ describe('replication task routes (Epic 5.5.3)', () => {
     assert.match(res.json().error.message, /Failed to parse calendar/)
   })
 
+  // Strict-on-WRITE: the lenient read path never loosens create. A dataset that
+  // fails the narrowed ReplicationDataset regex is still rejected at the boundary.
+  it('POST with a dataset that fails the narrowed regex → 400 (create stays strict)', async () => {
+    const res = await create({ ...TASK, source: { pool: 'testpool', dataset: 'media/movies/' } })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /Invalid replication task/)
+  })
+
   it('POST replicating a dataset onto itself → 400', async () => {
     const res = await create({ ...TASK, target: { pool: 'testpool', dataset: 'media' } })
     assert.equal(res.statusCode, 400)

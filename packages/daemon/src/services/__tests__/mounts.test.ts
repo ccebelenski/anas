@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
 import { parsePveMountPaths } from '../../parsers/pve-storage.js'
 import {
+  ahrPinnedSpecs,
   applyMountDefaults,
   buildBaseInventory,
   buildMountWarnings,
@@ -74,6 +75,60 @@ describe('buildBaseInventory', () => {
   })
 })
 
+describe('ahrPinnedSpecs — AHR pool LV specs from the ANAS-managed mdadm.conf', () => {
+  const conf = [
+    '# ANAS-managed pins',
+    'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:bbbbbbbb:cccccccc:dddddddd',
+    'ARRAY /dev/md/tank-r2 metadata=1.2 UUID=aaaaaaaa:bbbbbbbb:cccccccc:eeeeeeee',
+    'ARRAY /dev/md/media-r1 metadata=1.2 UUID=11111111:22222222:33333333:44444444',
+    'MAILADDR root',
+    '',
+  ].join('\n')
+
+  it('derives one `/dev/<pool>/<pool>-vol` spec per pinned pool (band-collapsed)', () => {
+    const specs = ahrPinnedSpecs(conf)
+    assert.ok(specs.has('/dev/tank/tank-vol'))
+    assert.ok(specs.has('/dev/media/media-vol'))
+    assert.equal(specs.size, 2) // tank-r1 + tank-r2 collapse to one pool
+  })
+
+  it('ignores foreign / non-AHR-named ARRAY lines and an empty conf', () => {
+    const foreign = 'ARRAY /dev/md/backup metadata=1.2 UUID=99999999:88888888:77777777:66666666\n'
+    assert.equal(ahrPinnedSpecs(foreign).size, 0)
+    assert.equal(ahrPinnedSpecs('').size, 0)
+  })
+})
+
+describe('buildBaseInventory — AHR pool persistence (ahrManaged) tagging', () => {
+  const mdadmConf = [
+    'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:bbbbbbbb:cccccccc:dddddddd',
+    '',
+  ].join('\n')
+  const ahrSpecs = ahrPinnedSpecs(mdadmConf)
+  // A pinned pool with a CUSTOM mountpoint, plus a non-AHR LVM mount whose spec
+  // merely LOOKS like the `/dev/<vg>/<vg>-vol` shape but is NOT pinned.
+  const fstab = [
+    '/dev/tank/tank-vol /srv/custom-location btrfs nofail,subvol=@data 0 0',
+    '/dev/foo/foo-vol /mnt/foo btrfs nofail 0 0',
+    '',
+  ].join('\n')
+  const rows = buildBaseInventory('{"filesystems":[]}', fstab, new Map(), ahrSpecs)
+  const by = (mp: string): MountSummary => rows.find(r => r.mountpoint === mp)!
+
+  it('flags a pinned pool even at a custom mountpoint (matched on spec, not mountpoint)', () => {
+    assert.equal(by('/srv/custom-location').ahrManaged, true)
+  })
+
+  it('does NOT flag a look-alike LVM mount that is not pinned in mdadm.conf', () => {
+    assert.equal(by('/mnt/foo').ahrManaged, false)
+  })
+
+  it('flags nothing when the mdadm.conf carries no pins (fail-open)', () => {
+    const none = buildBaseInventory('{"filesystems":[]}', fstab, new Map(), new Set())
+    assert.ok(none.every(r => r.ahrManaged === false))
+  })
+})
+
 describe('buildBaseInventory — disabled entry', () => {
   it('surfaces a marker-disabled entry as a visible row with state=disabled', () => {
     const fstab = '#ANAS 127.0.0.1:/srv/nfs/export1 /mnt/off nfs4 defaults,nofail 0 0\n'
@@ -121,8 +176,8 @@ describe('probeInventoryHealth skips armed / disabled / unmounted rows', () => {
     const exec = new MockExecutor()
     exec.addFixture({ command: '/usr/bin/timeout', result: { stdout: '4096 100 50 50', stderr: '', exitCode: 0 } })
     const rows: MountSummary[] = [
-      { mountpoint: '/mnt/live', source: 'h:/e', type: 'nfs', fstype: 'nfs4', state: 'unknown', mounted: true, persistent: true, remote: true, automount: false, disabled: false, pveManaged: false, readOnly: false },
-      { mountpoint: '/mnt/armed', source: 'systemd-1', type: 'autofs', fstype: 'autofs', state: 'armed', mounted: false, persistent: true, remote: false, automount: true, disabled: false, pveManaged: false, readOnly: false },
+      { mountpoint: '/mnt/live', source: 'h:/e', type: 'nfs', fstype: 'nfs4', state: 'unknown', mounted: true, persistent: true, remote: true, automount: false, disabled: false, pveManaged: false, ahrManaged: false, readOnly: false },
+      { mountpoint: '/mnt/armed', source: 'systemd-1', type: 'autofs', fstype: 'autofs', state: 'armed', mounted: false, persistent: true, remote: false, automount: true, disabled: false, pveManaged: false, ahrManaged: false, readOnly: false },
     ]
     await probeInventoryHealth(exec, rows)
     assert.equal(rows[0].state, 'ok')
@@ -217,6 +272,7 @@ describe('buildMountWarnings', () => {
     automount: false,
     disabled: false,
     pveManaged: false,
+    ahrManaged: false,
     readOnly: false,
     ...over,
   })

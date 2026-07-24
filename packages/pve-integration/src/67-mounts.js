@@ -163,6 +163,21 @@
         }
     }
 
+    // A mount row is AHR-managed (ANAS Hybrid RAID pool persistence) when the
+    // daemon flags ahrManaged — derived from the mdadm.conf ARRAY pins, matched
+    // on the LV spec. Hands-off here (same 30-pools pattern as PVE): the pool is
+    // managed from the Hybrid RAID view, never the Mounts feature.
+    function isAhrManaged(rec) {
+        try {
+            var get = (rec && typeof rec.get === 'function')
+                ? function (k) { return rec.get(k); }
+                : function (k) { return rec ? rec[k] : undefined; };
+            return get('ahrManaged') === true;
+        } catch (e) {
+            return false;
+        }
+    }
+
     // Remote vs local — prefer an explicit flag, else derive from the fstype.
     function isRemoteType(type) {
         var s = ('' + (type || '')).toLowerCase();
@@ -244,6 +259,23 @@
                 }
                 return mp + ' <span class="anas-mount-pve-badge" title="' + enc(tip) + '">'
                     + badge + '</span>';
+            }
+            if (isAhrManaged(rec)) {
+                // Mirror the PVE hands-off marker for AHR pool persistence.
+                var atip = t('ANAS Hybrid RAID pool — manage it from the Hybrid RAID view');
+                var abadge = '';
+                try {
+                    if (ANAS.gfx && typeof ANAS.gfx.badge === 'function') {
+                        abadge = ANAS.gfx.badge('AHR', { title: atip }) || '';
+                    }
+                } catch (eA) {
+                    abadge = '';
+                }
+                if (!abadge) {
+                    abadge = '<span class="anas-gfx-badge" title="' + enc(atip) + '">AHR</span>';
+                }
+                return mp + ' <span class="anas-mount-ahr-badge" title="' + enc(atip) + '">'
+                    + abadge + '</span>';
             }
         } catch (e) {
             // fall through to the plain mountpoint
@@ -355,6 +387,7 @@
             pveManaged: m.pveManaged === true
                 || !!(isArray(m.pveStorages) && m.pveStorages.length),
             pveStorages: m.pveStorages,
+            ahrManaged: m.ahrManaged === true,
             remote: (m.remote !== undefined ? m.remote : undefined),
             size: m.size,
             used: m.used,
@@ -478,16 +511,18 @@
         var rec = selectedMount(grid);
         var has = !!rec;
         var pve = has && isPveManaged(rec);
-        var mutable = has && !pve && isRemoteRec(rec);
+        var ahr = has && isAhrManaged(rec);
+        var mutable = has && !pve && !ahr && isRemoteRec(rec);
 
         setDisabled(grid, 'mountToggle', !mutable);
         setDisabled(grid, 'mountEdit', !mutable);
         setDisabled(grid, 'mountRemove', !mutable);
 
         var tip = pve ? t('Disabled — PVE manages this mount')
-            : (has && !isRemoteRec(rec)
-                ? t('View only — ANAS manages remote shares; local storage is ZFS territory')
-                : '');
+            : (ahr ? t('View only — this is an ANAS Hybrid RAID pool; manage it from the Hybrid RAID view')
+                : (has && !isRemoteRec(rec)
+                    ? t('View only — ANAS manages remote shares; local storage is ZFS territory')
+                    : ''));
         btnSetTip(grid, 'mountToggle', tip);
         btnSetTip(grid, 'mountEdit', tip);
         btnSetTip(grid, 'mountRemove', tip);
@@ -510,7 +545,7 @@
         var isOff = has && ('' + rec.get('state')).toLowerCase() === 'disabled';
         var persisted = has && first(rec.get('persistent'), rec.get('inFstab')) === true;
         setDisabled(grid, 'mountDisable', !(mutable && persisted));
-        btnSetTip(grid, 'mountDisable', pve ? tip
+        btnSetTip(grid, 'mountDisable', (pve || ahr) ? tip
             : (has && !persisted ? t('Only fstab-persisted mounts can be disabled') : ''));
         try {
             var dbtn = grid.down('#mountDisable');
@@ -1760,6 +1795,7 @@
                 { name: 'persistent', type: 'auto' },
                 { name: 'pveManaged', type: 'auto' },
                 { name: 'pveStorages', type: 'auto' },
+                { name: 'ahrManaged', type: 'auto' },
                 { name: 'remote', type: 'auto' },
                 { name: 'size', type: 'auto' },
                 { name: 'used', type: 'auto' },
@@ -1855,7 +1891,8 @@
                     viewConfig: {
                         getRowClass: function (record) {
                             try {
-                                return isPveManaged(record) ? 'anas-mount-pve-row' : '';
+                                return isPveManaged(record) ? 'anas-mount-pve-row'
+                                    : (isAhrManaged(record) ? 'anas-mount-ahr-row' : '');
                             } catch (e) {
                                 return '';
                             }
@@ -1904,7 +1941,7 @@
                             loadMountDetail(view, node, rec ? rec.get('mountpoint') : null);
                         },
                         itemdblclick: function (grid, rec) {
-                            if (!rec || isPveManaged(rec) || !isRemoteRec(rec)) {
+                            if (!rec || isPveManaged(rec) || isAhrManaged(rec) || !isRemoteRec(rec)) {
                                 return;
                             }
                             openMountEdit(grid.up('#mountsView'), node, rec.getData());

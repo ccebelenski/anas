@@ -70,11 +70,13 @@ export async function dashboardRoutes(
     fstabPath: string
     /** storage.cfg location for read-only PVE tagging (undefined = default). */
     storagePath?: string
+    /** mdadm.conf location for AHR-pin tagging (AHR pools skip mount warnings). */
+    mdadmConfPath?: string
     /** AHR expansion-intent dir (§5.3) — halted-expansion warnings (11.10). */
     ahrIntentDir?: string
   },
 ) {
-  const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath, ahrIntentDir } = opts
+  const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath, mdadmConfPath, ahrIntentDir } = opts
 
   // --- GET /v1/status ------------------------------------------------------
   server.get('/status', async () => {
@@ -86,7 +88,7 @@ export async function dashboardRoutes(
       collectShareStatus(),
       collectJobs(),
       collectReplicationWarnings(),
-      collectMountWarnings(executor, { fstabPath, storagePath }),
+      collectMountWarnings(executor, { fstabPath, storagePath, mdadmConfPath }),
       collectBackupWarnings(executor, systemdDir),
       // AHR (11.10): only bad states card (degraded/failed/readonly/halted
       // expansion); healthy pools contribute nothing, errors fail-open.

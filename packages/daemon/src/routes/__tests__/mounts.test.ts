@@ -233,3 +233,76 @@ describe('mount routes (Epic 18)', () => {
     })
   })
 })
+
+// AHR pool persistence is hands-off in the Mounts feature: a pinned pool's fstab
+// entry must be flagged ahrManaged and every Mounts mutation must refuse it, so
+// unmount/delete/edit can never rip a Hybrid RAID pool's persistence out from
+// under it (the headline regression).
+describe('mount routes — AHR pool persistence is hands-off', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let fstabPath: string
+  let mdadmConfPath: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-mounts-ahr-'))
+    fstabPath = join(dir, 'fstab')
+    mdadmConfPath = join(dir, 'mdadm.conf')
+    // A pinned pool `tank` at a CUSTOM mountpoint, plus a look-alike but
+    // unpinned LVM mount `/dev/foo/foo-vol` that must NOT be flagged.
+    await writeFile(fstabPath, [
+      '/dev/tank/tank-vol /srv/tank-data btrfs nofail,subvol=@data 0 0',
+      '/dev/foo/foo-vol /mnt/foo btrfs nofail 0 0',
+      '',
+    ].join('\n'))
+    await writeFile(mdadmConfPath, 'ARRAY /dev/md/tank-r1 metadata=1.2 UUID=aaaaaaaa:bbbbbbbb:cccccccc:dddddddd\n')
+    process.env.ANAS_FSTAB_PATH = fstabPath
+    process.env.ANAS_CREDS_DIR = join(dir, 'creds')
+    process.env.ANAS_STORAGE_CFG = STORAGE_CFG
+    process.env.ANAS_MDADM_CONF = mdadmConfPath
+    server = createServer({ mock: true, logger: false })
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    delete process.env.ANAS_FSTAB_PATH
+    delete process.env.ANAS_CREDS_DIR
+    delete process.env.ANAS_STORAGE_CFG
+    delete process.env.ANAS_MDADM_CONF
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('flags the pinned pool ahrManaged (custom mountpoint) and leaves the look-alike alone', async () => {
+    const res = await server!.inject({ method: 'GET', url: '/v1/mounts' })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: MountSummary[] }
+    assert.equal(data.find(r => r.mountpoint === '/srv/tank-data')!.ahrManaged, true)
+    assert.equal(data.find(r => r.mountpoint === '/mnt/foo')!.ahrManaged, false)
+  })
+
+  it('refuses DELETE / PUT / unmount on the pool with 400 naming the Hybrid RAID view', async () => {
+    const calls = [
+      { method: 'DELETE' as const, url: `/v1/mounts/${enc('/srv/tank-data')}`, payload: undefined },
+      { method: 'PUT' as const, url: `/v1/mounts/${enc('/srv/tank-data')}`, payload: { options: { ro: true } } },
+      { method: 'POST' as const, url: `/v1/mounts/${enc('/srv/tank-data')}/state`, payload: { action: 'unmount' } },
+    ]
+    for (const call of calls) {
+      // Only set the JSON content-type when there is a body — Fastify rejects an
+      // empty body under application/json before the handler runs.
+      const headers = call.payload === undefined ? IDENTITY_HEADERS : { ...IDENTITY_HEADERS, 'content-type': 'application/json' }
+      const res = await server!.inject({ method: call.method, url: call.url, headers, payload: call.payload })
+      assert.equal(res.statusCode, 400, `${call.method} ${call.url}`)
+      assert.match((res.json() as { error: { message: string } }).error.message, /Hybrid RAID/, `${call.method} ${call.url}`)
+    }
+    // The pool's fstab line is untouched — persistence was never at risk.
+    assert.ok((await readFile(fstabPath, 'utf8')).includes('/dev/tank/tank-vol /srv/tank-data'))
+  })
+
+  it('does NOT refuse the unpinned look-alike on the AHR guard (its own remote-only guard applies)', async () => {
+    const res = await server!.inject({ method: 'DELETE', url: `/v1/mounts/${enc('/mnt/foo')}`, headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 400)
+    // Rejected as a LOCAL fs, NOT as AHR — proof the look-alike was not seized.
+    assert.match((res.json() as { error: { message: string } }).error.message, /remote shares only/)
+  })
+})

@@ -75,6 +75,21 @@ if [ -f "${HOOK_DEST}" ]; then
   info "removed md-event hook ${HOOK_DEST}"
 fi
 
+# 3c. Remove the ANAS notification templates install.sh drops into pve-manager's
+# template dir. Only our own anas-named files are touched — never any other
+# template in that shared directory (guest philosophy).
+PVE_TEMPLATE_DIR="${PVE_TEMPLATE_DIR:-/usr/share/pve-manager/templates/default}"
+removed_template=0
+for tpl in anas-ahr-subject.txt.hbs anas-ahr-body.txt.hbs; do
+  if [ -f "${PVE_TEMPLATE_DIR}/${tpl}" ]; then
+    rm -f "${PVE_TEMPLATE_DIR}/${tpl}"
+    removed_template=1
+  fi
+done
+if [ "${removed_template}" -eq 1 ]; then
+  info "removed ANAS notification templates from ${PVE_TEMPLATE_DIR}"
+fi
+
 # 4. Remove the install prefix.
 if [ -d "${PREFIX}" ]; then
   info "removing ${PREFIX}"

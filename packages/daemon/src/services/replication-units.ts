@@ -2,7 +2,7 @@ import type { DashboardWarning, ReplicationTask, ReplicationTaskStatus, Snapshot
 import type { CommandExecutor } from '../executor/types.js'
 import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { ReplicationTask as ReplicationTaskSchema } from '@anas/shared'
+import { LenientReplicationTask as LenientReplicationTaskSchema, ReplicationTask as ReplicationTaskSchema } from '@anas/shared'
 import { parseSnapshotList, zfsSnapshotDetailArgs } from '../parsers/zfs-list.js'
 
 /**
@@ -136,22 +136,42 @@ export function renderTimerUnit(task: ReplicationTask): string {
 
 /**
  * Parse the canonical ReplicationTask out of a `.service` unit's body by reading
- * its `X-ANAS-Task=` line (with or without the leading `# `) and zod-validating
- * the JSON. Returns null when the marker is absent or the JSON is invalid — the
- * caller skips (and warns about) such files, fail-open.
+ * its `X-ANAS-Task=` line (with or without the leading `# `) and validating the
+ * JSON.
+ *
+ * Strict-on-write, LENIENT-ON-READ (the store's timer keeps firing whatever we
+ * think): a stored task that fails STRICT validation but parses under the
+ * lenient variant (a dataset that no longer matches the narrowed regex, say) is
+ * returned FLAGGED `invalid` — never silently dropped — so the UI shows it and
+ * the operator can delete/repair it. Returns null only when the marker is
+ * absent, the JSON is malformed, or it fails even lenient parsing (the caller
+ * skips those, logging to journald).
  */
 export function parseServiceUnit(content: string): ReplicationTask | null {
   for (const line of content.split('\n')) {
     const m = line.match(TASK_MARKER_RE)
     if (!m)
       continue
+    let json: unknown
     try {
-      const parsed = ReplicationTaskSchema.safeParse(JSON.parse(m[1]))
-      return parsed.success ? parsed.data : null
+      json = JSON.parse(m[1])
     }
     catch {
       return null
     }
+    const strict = ReplicationTaskSchema.safeParse(json)
+    if (strict.success)
+      return strict.data
+    // Strict failed — keep it visible if it parses leniently, flagged for repair.
+    const lenient = LenientReplicationTaskSchema.safeParse(json)
+    if (lenient.success) {
+      return {
+        ...lenient.data,
+        invalid: true,
+        invalidReason: strict.error.issues[0]?.message ?? 'failed strict validation',
+      }
+    }
+    return null
   }
   return null
 }
@@ -180,10 +200,10 @@ export async function readAllTasks(dir: string): Promise<ReplicationTask[]> {
       if (task)
         tasks.push(task)
       else
-        console.warn(`[replication] skipping ${file}: no valid X-ANAS-Task JSON`)
+        process.stderr.write(`[replication] skipping ${file}: no parseable X-ANAS-Task JSON\n`)
     }
     catch (err) {
-      console.warn(`[replication] skipping ${file}: ${err instanceof Error ? err.message : String(err)}`)
+      process.stderr.write(`[replication] skipping ${file}: ${err instanceof Error ? err.message : String(err)}\n`)
     }
   }
   return tasks

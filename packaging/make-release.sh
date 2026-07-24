@@ -178,8 +178,12 @@ fi
 # Gateway: boots and listens. Use the dev auth provider and no PVE certs so it
 # serves plain HTTP on a throwaway port — we only assert it does not crash on a
 # missing module. It talks to the daemon socket above.
+# ANAS_ALLOW_INSECURE_DEV_AUTH=1: the startup guard aborts dev auth on a real PVE
+# node (when /etc/pve/authkey.pub exists). Building a release ON a PVE node is a
+# legitimate case, and this is a throwaway localhost boot torn down seconds later
+# — the override lets the smoke check run without weakening the guard elsewhere.
 GATEWAY_LOG="$(mktemp)"
-ANASD_SOCKET="${SMOKE_SOCK}" ANAS_AUTH_PROVIDER=dev ANAS_PORT="${SMOKE_PORT}" \
+ANASD_SOCKET="${SMOKE_SOCK}" ANAS_AUTH_PROVIDER=dev ANAS_ALLOW_INSECURE_DEV_AUTH=1 ANAS_PORT="${SMOKE_PORT}" \
   node "${APP}/packages/gateway/dist/index.js" >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
 for _ in $(seq 1 30); do

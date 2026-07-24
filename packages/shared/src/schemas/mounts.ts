@@ -2,15 +2,19 @@ import { z } from 'zod'
 import { AbsolutePath, SingleLine } from './common.js'
 
 /**
- * A filesystem-version token (NFS `vers`, CIFS `vers`): digits separated by
- * dots, e.g. "4.2", "3.1.1", "3", "1.0". This is written verbatim as
- * `vers=<value>` into an fstab option list and a `mount -o` argument — the
- * numeric-only shape forecloses comma-based option injection (e.g. the
- * `4.2,exec` payload) and control characters.
+ * A filesystem-version token (NFS `vers`, CIFS `vers`): either digits separated
+ * by dots — e.g. "4.2", "3.1.1", "3", "1.0" — or the literal `default`, a
+ * documented mount.cifs(8) token (its actual default: negotiate the highest
+ * SMB2+ version both ends support). Only `default` is admitted as a non-numeric
+ * word; mount.nfs has no such literal, so nothing else is added. This is written
+ * verbatim as `vers=<value>` into an fstab option list and a `mount -o`
+ * argument, so the shape stays injection-hard — no commas (which would forge a
+ * `4.2,exec` extra option), no whitespace, no shell metacharacters, no control
+ * characters.
  */
 export const MountVers = z
   .string()
-  .regex(/^\d+(?:\.\d+)*$/, 'Version must be numeric dotted (e.g. "4.2", "3.1.1")')
+  .regex(/^(?:default|\d+(?:\.\d+)*)$/, 'Version must be numeric dotted (e.g. "4.2", "3.1.1") or "default"')
 
 /**
  * An octal permission mode (CIFS `file_mode=` / `dir_mode=`): 3 or 4 octal
@@ -187,6 +191,14 @@ export const MountSummary = z.object({
   pveManaged: z.boolean(),
   /** The owning PVE storage id, when pveManaged. */
   pveStorage: z.string().optional(),
+  /**
+   * ANAS Hybrid RAID (AHR) pool persistence — HANDS-OFF here; managed from the
+   * Hybrid RAID view, and every Mounts mutation is rejected. Derived from the
+   * ANAS-managed mdadm.conf ARRAY pins (§2.6): a pinned pool's LV spec
+   * (`/dev/<pool>/<pool>-vol`) matched against the fstab entry — never the
+   * mountpoint (operator-configurable).
+   */
+  ahrManaged: z.boolean(),
   readOnly: z.boolean(),
   /** Capacity (bytes) from the guarded `stat -f` (null when unmounted/unreachable). */
   size: z.number().nonnegative().nullable().optional(),

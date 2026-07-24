@@ -264,9 +264,20 @@ phase0b_install_deps() {
   if [ "${NEED_MDADM_INSTALL}" -eq 1 ] || [ "${NEED_BTRFS_INSTALL}" -eq 1 ]; then
     log "Installing mdadm + btrfs-progs..."
     # noninteractive: mdadm's postinst debconf-prompts about boot arrays/MAILADDR.
-    DEBIAN_FRONTEND=noninteractive apt-get install -y mdadm btrfs-progs
-    command -v mdadm      >/dev/null 2>&1 || { err "mdadm install failed"; exit 1; }
-    command -v mkfs.btrfs >/dev/null 2>&1 || { err "btrfs-progs install failed (mkfs.btrfs still missing)"; exit 1; }
+    # These are a HARD dependency (AHR / Hybrid RAID) — matching the node/acl
+    # pattern, they are installed at install time, never optional. Catch an apt
+    # failure explicitly (set -e would otherwise abort silently) and say exactly
+    # what is needed, that nothing has been changed yet, and how to preseed.
+    # This runs BEFORE the rollback trap arms, so no ANAS step has touched the node.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y mdadm btrfs-progs; then
+      err "failed to install the required packages 'mdadm' and 'btrfs-progs'."
+      err "ANAS requires them for AHR (Hybrid RAID) pools — they are a hard dependency, not optional."
+      err "Nothing on this node was modified (this step runs before any install action)."
+      err "On an air-gapped node, preseed them first (e.g. 'apt-get install -y --no-download mdadm btrfs-progs' from a local mirror, or pre-place the .deb files) and re-run this installer."
+      exit 1
+    fi
+    command -v mdadm      >/dev/null 2>&1 || { err "mdadm install failed (mdadm still missing) — ANAS requires it for AHR/Hybrid RAID; nothing was modified"; exit 1; }
+    command -v mkfs.btrfs >/dev/null 2>&1 || { err "btrfs-progs install failed (mkfs.btrfs still missing) — ANAS requires it for AHR/Hybrid RAID; nothing was modified"; exit 1; }
     info "mdadm + btrfs-progs installed"
   fi
 }

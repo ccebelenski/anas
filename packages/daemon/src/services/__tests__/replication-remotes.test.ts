@@ -98,6 +98,45 @@ describe('replication remotes registry (Epic 5.5.2 — corosync store)', () => {
     assert.equal((await readRemotes(paths)).version, 2)
   })
 
+  // --- per-row fail-open: one bad stored row must not sink the whole feature ---
+  it('readRemotes drops a single invalid row and keeps the good ones', async () => {
+    await mkdir(join(dir, 'sub'), { recursive: true })
+    const onDisk = {
+      version: 3,
+      updatedBy: 'node1',
+      updatedAt: new Date().toISOString(),
+      remotes: [
+        REMOTE,
+        { name: 'BROKEN NAME', host: '10.0.0.11' }, // invalid: name fails the schema
+        REMOTE_B,
+      ],
+    }
+    await writeFile(paths.registryFile, JSON.stringify(onDisk), 'utf-8')
+    const reg = await readRemotes(paths)
+    assert.equal(reg.version, 3) // envelope intact (CAS still works)
+    assert.deepEqual(reg.remotes.map(r => r.name), ['nas1', 'nas2']) // bad row dropped
+  })
+
+  it('readRemotes serves all rows when every row is valid', async () => {
+    await mkdir(join(dir, 'sub'), { recursive: true })
+    const onDisk = {
+      version: 5,
+      updatedBy: 'node1',
+      updatedAt: new Date().toISOString(),
+      remotes: [REMOTE, REMOTE_B],
+    }
+    await writeFile(paths.registryFile, JSON.stringify(onDisk), 'utf-8')
+    const reg = await readRemotes(paths)
+    assert.equal(reg.version, 5)
+    assert.deepEqual(reg.remotes.map(r => r.name), ['nas1', 'nas2'])
+  })
+
+  it('readRemotes still throws on a broken ENVELOPE (version drives CAS)', async () => {
+    await mkdir(join(dir, 'sub'), { recursive: true })
+    await writeFile(paths.registryFile, JSON.stringify({ updatedBy: 'x', remotes: [] }), 'utf-8')
+    await assert.rejects(readRemotes(paths), /invalid/)
+  })
+
   // --- keypair ---------------------------------------------------------------
   it('ensureKeypair runs ssh-keygen once with the fixed empty-passphrase argv', async () => {
     const mock = new MockExecutor()

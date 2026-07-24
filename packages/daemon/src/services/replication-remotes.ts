@@ -4,7 +4,8 @@ import { createHash } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
-import { RemotesFile as RemotesFileSchema } from '@anas/shared'
+import { ReplicationRemote as ReplicationRemoteSchema } from '@anas/shared'
+import { z } from 'zod'
 
 /**
  * Stage-3 remotes registry (Epic 5.5.2) — the COROSYNC STORE.
@@ -69,9 +70,25 @@ function emptyRegistry(): RemotesFile {
 }
 
 /**
- * Read + zod-validate the registry. An absent file is the empty registry
- * (version 0, no remotes). A present-but-invalid file throws — we never silently
- * discard a real registry we can't parse.
+ * The registry ENVELOPE (version + forensics) with the rows left UN-validated —
+ * `version` drives compare-and-swap, so it must be sound, but each remote is
+ * validated per-row below (fail-open) so one bad row can't sink the feature.
+ */
+const RemotesEnvelope = z.object({
+  version: z.number().int().nonnegative(),
+  updatedBy: z.string(),
+  updatedAt: z.string(),
+  remotes: z.array(z.unknown()),
+})
+
+/**
+ * Read + validate the registry, PER-ROW FAIL-OPEN. An absent/empty file is the
+ * empty registry (version 0, no remotes). The envelope (version/forensics) is
+ * validated strictly — a broken `version` would break CAS, so an unparseable
+ * file or bad envelope still throws — but each remote is validated
+ * INDIVIDUALLY: a single malformed row is dropped with a journald warning and
+ * the good rows keep serving. This keeps the whole remotes feature alive when
+ * one stored row goes bad, rather than 500-ing every request.
  */
 export async function readRemotes(paths: RemotesPaths): Promise<RemotesFile> {
   let text: string
@@ -85,10 +102,34 @@ export async function readRemotes(paths: RemotesPaths): Promise<RemotesFile> {
   }
   if (!text.trim())
     return emptyRegistry()
-  const parsed = RemotesFileSchema.safeParse(JSON.parse(text))
-  if (!parsed.success)
-    throw new Error(`remotes registry is invalid: ${parsed.error.issues[0]?.message}`)
-  return parsed.data
+
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  }
+  catch (err) {
+    throw new Error(`remotes registry is not valid JSON: ${err instanceof Error ? err.message : String(err)}`)
+  }
+
+  const envelope = RemotesEnvelope.safeParse(raw)
+  if (!envelope.success)
+    throw new Error(`remotes registry is invalid: ${envelope.error.issues[0]?.message}`)
+
+  const remotes: ReplicationRemote[] = []
+  for (const [i, row] of envelope.data.remotes.entries()) {
+    const parsed = ReplicationRemoteSchema.safeParse(row)
+    if (parsed.success)
+      remotes.push(parsed.data)
+    else
+      process.stderr.write(`[remotes] dropping invalid registry row ${i}: ${parsed.error.issues[0]?.message}\n`)
+  }
+
+  return {
+    version: envelope.data.version,
+    updatedBy: envelope.data.updatedBy,
+    updatedAt: envelope.data.updatedAt,
+    remotes,
+  }
 }
 
 /** Per-path promise chain — serializes CAS writes to the same file in-process. */
