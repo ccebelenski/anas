@@ -485,8 +485,9 @@ export function createServer(opts?: ServerOptions) {
   // confirm-gated; md owns failover after attach.
   server.register(ahrSpareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, intentDir: ahrIntentDir })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
-  // disk, share, and job sources above, plus on-demand ARC/iostat/net sampling.
-  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath })
+  // disk, share, job, and AHR (11.10) sources above, plus on-demand
+  // ARC/iostat/net sampling.
+  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath, ahrIntentDir })
 
   server.decorate('jobQueue', jobQueue)
   server.decorate('executor', executor)

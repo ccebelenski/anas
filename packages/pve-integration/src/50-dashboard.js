@@ -470,7 +470,8 @@
     function warnIcon(category) {
         var map = {
             pool: 'fa-database', capacity: 'fa-database', disk: 'fa-hdd-o',
-            scrub: 'fa-refresh', share: 'fa-share-alt', replication: 'fa-retweet'
+            scrub: 'fa-refresh', share: 'fa-share-alt', replication: 'fa-retweet',
+            ahr: 'fa-server'
         };
         var fa = map['' + (category || '')];
         if (!fa) { return ''; }

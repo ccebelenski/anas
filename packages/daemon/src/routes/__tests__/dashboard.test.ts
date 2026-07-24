@@ -1,13 +1,24 @@
-import type { JobBrief, PoolTelemetry, StatusSummary, Telemetry } from '@anas/shared'
-import type { MockExecutor } from '../../executor/mock.js'
+import type { AhrCapacity, AhrExpansionIntent, JobBrief, PoolTelemetry, StatusSummary, Telemetry } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
+import Fastify from 'fastify'
+import { MockExecutor } from '../../executor/mock.js'
 import { mockFixtures } from '../../fixtures/loader.js'
+import { JobQueue } from '../../jobs/queue.js'
+import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
+import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
+import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { createServer } from '../../server.js'
+import { writeIntent } from '../../services/ahr-intent.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
+import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
+import { dashboardRoutes } from '../dashboard.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -233,5 +244,125 @@ describe('GET /v1/status — stale-share warnings', () => {
     server = createServer({ mock: true, logger: false, smbConfPath })
     const summary = await status(server)
     assert.equal(summary.warnings.filter(w => w.category === 'share').length, 0)
+  })
+})
+
+describe('GET /v1/status — AHR warnings (story 11.10, AHR-DESIGN §10)', () => {
+  const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/ahr')
+  const loadFixture = (name: string): string => readFileSync(join(fixturesDir, name), 'utf-8')
+  const ok = (stdout: string) => ({ stdout, stderr: '', exitCode: 0 })
+
+  let server: ReturnType<typeof createServer> | Awaited<ReturnType<typeof bareDashboardServer>> | undefined
+  let dir: string | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    delete process.env.ANAS_AHR_INTENT_DIR
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true })
+      dir = undefined
+    }
+  })
+
+  /** Register the AHR read-layer fixtures on a mock (topology-test twin). */
+  function addAhrFixtures(mock: MockExecutor, mdstat: string): void {
+    mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: ok(mdstat) })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: ok(loadFixture('mdadm-export-r1.txt')) })
+    mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: ok(loadFixture('mdadm-export-r2.txt')) })
+    mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok(loadFixture('lsblk-ahr0.json')) })
+    mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(loadFixture('disk-by-id-ahr.txt')) })
+    mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(loadFixture('lvm-vgs.json')) })
+    mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(loadFixture('lvm-lvs.json')) })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok(loadFixture('findmnt-ahr0.json')) })
+    mock.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: ok(loadFixture('btrfs-usage.txt')) })
+  }
+
+  /** A bare Fastify server with ONLY dashboardRoutes and a controlled executor.
+   *  Every non-AHR source fail-opens (unmatched mock commands → exit 127). */
+  async function bareDashboardServer(executor: MockExecutor, tmp: string) {
+    const srv = Fastify({ logger: false })
+    await srv.register(dashboardRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue: new JobQueue(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      smbConfPath: join(tmp, 'smb.conf'),
+      exportsPath: join(tmp, 'exports'),
+      systemdDir: join(tmp, 'systemd'),
+      fstabPath: join(tmp, 'fstab'),
+    })
+    return srv
+  }
+
+  async function fetchStatus(srv: NonNullable<typeof server>): Promise<StatusSummary> {
+    const res = await srv.inject({ method: 'GET', url: '/v1/status', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    return (res.json() as { data: StatusSummary }).data
+  }
+
+  it('a healthy AHR pool adds nothing to the dashboard', async () => {
+    server = createServer({ mock: true, logger: false })
+    const summary = await fetchStatus(server)
+    assert.equal(summary.warnings.filter(w => w.category === 'ahr').length, 0)
+  })
+
+  it('a degraded AHR pool cards exactly once, target-first', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'anas-ahr-dash-'))
+    const mock = new MockExecutor()
+    addAhrFixtures(mock, loadFixture('mdstat-reshape-degraded.txt'))
+    server = await bareDashboardServer(mock, dir)
+    const summary = await fetchStatus(server)
+    const ahr = summary.warnings.filter(w => w.category === 'ahr')
+    assert.equal(ahr.length, 1)
+    assert.equal(ahr[0].level, 'warning')
+    assert.equal(ahr[0].ref, 'ahr0')
+    assert.ok(ahr[0].message.includes('ahr0-r1'), 'names the degraded array')
+    assert.ok(ahr[0].message.includes('scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1'), 'names the faulty member')
+  })
+
+  it('a halted expansion cards through the real server wiring (intent dir)', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'anas-ahr-dash-'))
+    process.env.ANAS_AHR_INTENT_DIR = dir
+    const capacity: AhrCapacity = { rawBytes: 0, usableBytes: 0, usedBytes: 0, freeBytes: 0, redundancyOverheadBytes: 0, unprotectedWastedBytes: 0, pendingBytes: 0 }
+    const intent: AhrExpansionIntent = {
+      id: randomUUID(),
+      trigger: 'add-disk',
+      approvedDisks: ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1'],
+      before: capacity,
+      after: capacity,
+      state: 'halted',
+    }
+    await writeIntent('ahr0', intent, { dir })
+
+    server = createServer({ mock: true, logger: false })
+    const summary = await fetchStatus(server)
+    const ahr = summary.warnings.filter(w => w.category === 'ahr')
+    assert.equal(ahr.length, 1)
+    assert.equal(ahr[0].ref, 'ahr0')
+    assert.ok(ahr[0].message.includes('Resume'), 'names the Resume verb')
+    assert.ok(ahr[0].message.includes('Abandon'), 'names the Abandon verb')
+  })
+
+  it('an AHR read error degrades the AHR source, never the dashboard (fail-open)', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'anas-ahr-dash-'))
+    // The AHR reader's first read (cat /proc/mdstat) THROWS; ZFS reads work.
+    class ThrowOnMdstat extends MockExecutor {
+      async exec(command: string, args: string[], opts?: Parameters<MockExecutor['exec']>[2]) {
+        if (command === '/usr/bin/cat')
+          throw new Error('boom')
+        return super.exec(command, args, opts)
+      }
+    }
+    const mock = new ThrowOnMdstat()
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
+
+    server = await bareDashboardServer(mock, dir)
+    const summary = await fetchStatus(server)
+    // The rest of the aggregate is intact — pools still reported…
+    assert.ok(summary.pools.some(p => p.name === 'testpool'))
+    // …and the AHR source degraded to nothing, without failing the request.
+    assert.equal(summary.warnings.filter(w => w.category === 'ahr').length, 0)
   })
 })

@@ -8,6 +8,7 @@ import type {
   AhrPoolState,
   ArrayLevel,
   ArrayState,
+  DashboardWarning,
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { MdadmDetailExport } from '../parsers/mdadm-detail.js'
@@ -19,6 +20,7 @@ import { optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { LVS_ARGS, parseLvsReport, parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
+import { readIntent } from './ahr-intent.js'
 import { AHR_MIN_DISKS, floorToGranularity } from './ahr-layout.js'
 
 /**
@@ -518,4 +520,96 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
   }
 
   return pools
+}
+
+// --- Dashboard warnings (story 11.10, AHR-DESIGN §10) ------------------------
+
+/**
+ * Which array/band + which member, for the degraded card. Every degraded
+ * array in the pool is named (the card stays ONE per pool); a degraded array
+ * with no faulty member listed (e.g. a member gone entirely, or the GT-8
+ * inactive state) reads "missing a member". Disk ids are never truncated.
+ */
+function degradedDetail(pool: AhrPool): string {
+  const parts: string[] = []
+  for (const array of pool.arrays) {
+    if (array.state !== 'degraded')
+      continue
+    const name = `${pool.name}-r${array.band} (band ${array.band})`
+    const faulty = array.members.filter(m => m.memberState === 'faulty')
+    if (faulty.length > 0)
+      parts.push(`array ${name} member ${faulty.map(m => `'${m.disk}'`).join(', ')} ${faulty.length === 1 ? 'is' : 'are'} faulty`)
+    else
+      parts.push(`array ${name} is missing a member`)
+  }
+  return parts.length > 0 ? parts.join('; ') : 'an array is degraded'
+}
+
+/**
+ * Dashboard warning cards for AHR pools (story 11.10, AHR-DESIGN §10 — the
+ * replication "only failures card" policy): ONE target-first card per pool in
+ * a bad state — `degraded` (naming which array/band + which member), `failed`,
+ * `readonly`, or a HALTED expansion (naming the Resume/Abandon verbs). Levels
+ * follow the §7.2 severity table: failed/readonly critical, degraded/halted
+ * warning. In-progress expanding/rebuilding/scrubbing states ride the shared
+ * jobs strip — no card; healthy/idle pools add NOTHING. View-level advisories
+ * (consumed spare, flat-layout snapshots) deliberately do not card.
+ */
+export function buildAhrWarnings(pools: AhrPool[]): DashboardWarning[] {
+  const warnings: DashboardWarning[] = []
+  for (const pool of pools) {
+    const clauses: string[] = []
+    let level: DashboardWarning['level'] = 'warning'
+    if (pool.state === 'failed') {
+      level = 'critical'
+      clauses.push('has FAILED — its LVM/filesystem layer is missing or inactive; see the Hybrid RAID view')
+    }
+    else if (pool.state === 'readonly') {
+      level = 'critical'
+      clauses.push('is mounted READ-ONLY — btrfs is protecting itself; diagnose before any remount')
+    }
+    else if (pool.state === 'degraded') {
+      clauses.push(`is degraded — ${degradedDetail(pool)}; replace the failed disk before a second failure`)
+    }
+    if (pool.expansion?.state === 'halted')
+      clauses.push('has a HALTED expansion — Resume (recompute-and-continue) or Abandon it in the Hybrid RAID view')
+    if (clauses.length === 0)
+      continue
+    warnings.push({
+      level,
+      category: 'ahr',
+      message: `AHR pool '${pool.name}' ${clauses.join('; ')}`,
+      ref: pool.name,
+    })
+  }
+  return warnings
+}
+
+/**
+ * Collect the dashboard 'ahr' warnings from the live topology + the per-pool
+ * expansion intent, fail-open (mirrors how replication/mount/backup warnings
+ * are wired into GET /v1/status): an AHR read error degrades this source to no
+ * warnings, never the dashboard; an unreadable intent file degrades only that
+ * pool's halted-expansion card.
+ */
+export async function collectAhrWarnings(
+  executor: CommandExecutor,
+  intentDir?: string,
+): Promise<DashboardWarning[]> {
+  try {
+    const pools = await readAhrPools(executor)
+    const withIntents = await Promise.all(pools.map(async (pool): Promise<AhrPool> => {
+      try {
+        const intent = await readIntent(pool.name, intentDir)
+        return intent ? { ...pool, expansion: intent } : pool
+      }
+      catch {
+        return pool
+      }
+    }))
+    return buildAhrWarnings(withIntents)
+  }
+  catch {
+    return []
+  }
 }
