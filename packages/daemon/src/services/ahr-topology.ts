@@ -175,15 +175,19 @@ function dmName(vg: string, lv: string): string {
  *  - degraded takes precedence over a concurrent sync (the drilled
  *    "clean, degraded, reshaping" case reports degraded; sync{} still
  *    carries the reshape progress).
+ *  - a lingering faulty slot with EVERY raid slot in sync (the consumed-spare
+ *    §11 shape — the spare rebuilt in, the failed device is still attached)
+ *    is NOT degraded: redundancy is intact, and the consumed-spare advisory
+ *    carries the "remove/replace the failed disk" message instead.
  *  - auto-read-only is NOT a fault (GT-9) — it maps to clean.
  *  - a running `check` keeps state clean/degraded; sync{} carries it.
  */
 function arrayState(md: MdstatArray): ArrayState {
   if (!md.active)
     return 'degraded'
-  const degraded
-    = (md.raidDevices !== null && md.activeDevices !== null && md.activeDevices < md.raidDevices)
-      || md.members.some(m => m.faulty)
+  const degraded = md.raidDevices !== null && md.activeDevices !== null
+    ? md.activeDevices < md.raidDevices
+    : md.members.some(m => m.faulty && !m.spare)
   if (degraded)
     return 'degraded'
   if (md.sync) {
@@ -277,7 +281,10 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
           diskKernel,
           band: entry.band,
           partSize: part?.size ?? 0,
-          spare: m.spare,
+          // Spare only counts on an ACTIVE array: an inactive array lists
+          // EVERY member as (S) (GT-8) and must not relabel real members as
+          // pool-level hot spares (§11 role fusion below).
+          spare: m.spare && entry.mdstat.active,
         })
         return {
           disk: diskId,
@@ -291,10 +298,25 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
       })
 
       const state = arrayState(entry.mdstat)
-      if (!entry.mdstat.active)
+      // Consumed-spare detection (§11): a faulty slot alongside a rebuild
+      // already running (md's automatic failover) or already finished (every
+      // raid slot back in sync) means a spare was consumed by this band. The
+      // advisory is view-level only — it deliberately does NOT card (§10).
+      const slotsFull = entry.mdstat.raidDevices !== null && entry.mdstat.activeDevices !== null
+        && entry.mdstat.activeDevices >= entry.mdstat.raidDevices
+      const spareConsumed = entry.mdstat.active
+        && entry.mdstat.members.some(m => m.faulty)
+        && (slotsFull || entry.mdstat.sync?.action === 'recovery')
+      if (!entry.mdstat.active) {
         advisories.push(`array ${poolName}-r${entry.band} is INACTIVE (assembled with all members as spares — the GT-8 post-power-loss state); the recovery ladder (mdadm --run, then --readwrite) is required`)
-      else if (state === 'degraded')
+      }
+      else if (spareConsumed) {
+        const failed = members.filter(m => m.memberState === 'faulty').map(m => m.disk)
+        advisories.push(`spare consumed by band ${entry.band} — add a new spare; remove/replace the failed disk${failed.length ? ` (${failed.join(', ')})` : ''}`)
+      }
+      else if (state === 'degraded') {
         advisories.push(`array ${poolName}-r${entry.band} is degraded — replace the failed disk before a second failure`)
+      }
 
       const sync: AhrArraySync | undefined = entry.mdstat.sync
         ? {

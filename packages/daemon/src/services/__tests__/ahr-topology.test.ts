@@ -24,19 +24,86 @@ const HOT2 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT2'
 const HOT3 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3'
 
 /** The stage-0 phase-A pool `ahr0`, healthy and mounted. */
-function healthyExecutor(overrides?: { mdstat?: string, findmnt?: string }): MockExecutor {
+function healthyExecutor(overrides?: { mdstat?: string, findmnt?: string, lsblk?: string, byId?: string }): MockExecutor {
   const mock = new MockExecutor()
   mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: ok(overrides?.mdstat ?? loadFixture('mdstat-clean.txt')) })
   mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: ok(loadFixture('mdadm-export-r1.txt')) })
   mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: ok(loadFixture('mdadm-export-r2.txt')) })
-  mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok(loadFixture('lsblk-ahr0.json')) })
-  mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(loadFixture('disk-by-id-ahr.txt')) })
+  mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok(overrides?.lsblk ?? loadFixture('lsblk-ahr0.json')) })
+  mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(overrides?.byId ?? loadFixture('disk-by-id-ahr.txt')) })
   mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(loadFixture('lvm-vgs.json')) })
   mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(loadFixture('lvm-lvs.json')) })
   mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok(overrides?.findmnt ?? loadFixture('findmnt-ahr0.json')) })
   mock.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: ok(loadFixture('btrfs-usage.txt')) })
   return mock
 }
+
+// ---- Hot-spare world (§11): ahr0 + a 2 GiB spare disk sde (HOT4) -----------
+
+const HOT4 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT4'
+
+/** lsblk-ahr0.json + the spare disk sde with its two labeled band slices. */
+function lsblkWithSpare(): string {
+  const tree = JSON.parse(loadFixture('lsblk-ahr0.json')) as { blockdevices: unknown[] }
+  tree.blockdevices.push({
+    name: 'sde',
+    size: 2147483648,
+    type: 'disk',
+    fstype: null,
+    mountpoint: null,
+    partlabel: null,
+    model: 'QEMU HARDDISK',
+    serial: 'ANAS_HOT4',
+    children: [
+      { name: 'sde1', size: 1072693248, type: 'part', fstype: 'linux_raid_member', mountpoint: null, partlabel: 'ahr0-d4-b1' },
+      { name: 'sde2', size: 536854016, type: 'part', fstype: 'linux_raid_member', mountpoint: null, partlabel: 'ahr0-d4-b2' },
+    ],
+  })
+  return JSON.stringify(tree)
+}
+
+const BY_ID_WITH_SPARE = `${loadFixture('disk-by-id-ahr.txt').trimEnd()}
+lrwxrwxrwx 1 root root   9 Jul 23 10:00 ${HOT4} -> ../../sde
+lrwxrwxrwx 1 root root  10 Jul 23 10:00 ${HOT4}-part1 -> ../../sde1
+lrwxrwxrwx 1 root root  10 Jul 23 10:00 ${HOT4}-part2 -> ../../sde2
+`
+
+/** mdstat-clean with sde's slices attached as (S) spares to both arrays. */
+const MDSTAT_WITH_SPARE = [
+  'Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] ',
+  'md126 : active raid1 sde2[2](S) sdd2[1] sdc2[0]',
+  '      523200 blocks super 1.2 [2/2] [UU]',
+  '',
+  'md127 : active raid5 sde1[4](S) sdd1[3] sdc1[1] sdb1[0]',
+  '      2089984 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]',
+  '',
+  'unused devices: <none>',
+].join('\n')
+
+/** The consumed-spare shape (§11): sde1 rebuilt IN, sdb1 still attached (F). */
+const MDSTAT_SPARE_CONSUMED = [
+  'Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] ',
+  'md126 : active raid1 sde2[2](S) sdd2[1] sdc2[0]',
+  '      523200 blocks super 1.2 [2/2] [UU]',
+  '',
+  'md127 : active raid5 sde1[4] sdd1[3] sdc1[1] sdb1[0](F)',
+  '      2089984 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]',
+  '',
+  'unused devices: <none>',
+].join('\n')
+
+/** Mid-failover: md is rebuilding onto the spare, the faulty slot remains. */
+const MDSTAT_SPARE_REBUILDING = [
+  'Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] ',
+  'md126 : active raid1 sde2[2](S) sdd2[1] sdc2[0]',
+  '      523200 blocks super 1.2 [2/2] [UU]',
+  '',
+  'md127 : active raid5 sde1[4] sdd1[3] sdc1[1] sdb1[0](F)',
+  '      2089984 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [_UU]',
+  '      [>....................]  recovery =  1.9% (20472/1044992) finish=0.8min speed=20472K/sec',
+  '',
+  'unused devices: <none>',
+].join('\n')
 
 describe('readAhrPools', () => {
   it('reconstructs the healthy stage-0 pool end to end', async () => {
@@ -122,6 +189,64 @@ describe('readAhrPools', () => {
     assert.ok(r1.members.every(m => m.memberState === 'spare'))
     assert.equal(pool.state, 'degraded')
     assert.ok(pool.advisories.some(a => a.includes('INACTIVE')))
+    // An inactive array lists EVERY member as (S) — that must never relabel
+    // real members as pool-level hot spares (§11 role fusion).
+    assert.ok(pool.disks.every(d => d.role === 'member'))
+  })
+
+  describe('hot spares (§11)', () => {
+    function spareExecutor(mdstat: string): MockExecutor {
+      return healthyExecutor({ mdstat, lsblk: lsblkWithSpare(), byId: BY_ID_WITH_SPARE })
+    }
+
+    it('reports the spare disk as role spare with its slices, EXCLUDED from rawBytes', async () => {
+      const pools = await readAhrPools(spareExecutor(MDSTAT_WITH_SPARE))
+      assert.equal(pools.length, 1)
+      const pool = pools[0]
+      assert.equal(pool.state, 'healthy')
+
+      const spare = pool.disks.find(d => d.id === HOT4)!
+      assert.equal(spare.role, 'spare')
+      assert.deepEqual(spare.partitions.map(p => p.band), [1, 2])
+      assert.deepEqual(pool.disks.filter(d => d.role === 'member').map(d => d.id), [HOT1, HOT2, HOT3])
+
+      // Spare capacity contributes NO usable bytes: rawBytes is exactly the
+      // healthy-world value (member disks only, §2.5-rounded).
+      assert.equal(pool.capacity.rawBytes, 4 * 1024 ** 3)
+      // (S) members are reported as such on the arrays.
+      const r1 = pool.arrays.find(a => a.band === 1)!
+      assert.equal(r1.members.filter(m => m.memberState === 'spare').length, 1)
+      assert.deepEqual(pool.advisories, [])
+    })
+
+    it('after failover the consumed spare yields the §11 advisory — and does NOT read degraded', async () => {
+      const pools = await readAhrPools(spareExecutor(MDSTAT_SPARE_CONSUMED))
+      const pool = pools[0]
+      const r1 = pool.arrays.find(a => a.band === 1)!
+      // Every raid slot is back in sync — redundancy is intact; the lingering
+      // faulty device is bookkeeping, not degradation (dashboard must not card).
+      assert.equal(r1.state, 'clean')
+      assert.equal(pool.state, 'healthy')
+      const advisory = pool.advisories.find(a => a.includes('spare consumed'))
+      assert.ok(advisory, JSON.stringify(pool.advisories))
+      assert.match(advisory!, /spare consumed by band 1/)
+      assert.match(advisory!, /add a new spare/)
+      assert.match(advisory!, /remove\/replace the failed disk/)
+      assert.ok(advisory!.includes(HOT1), 'names the failed disk')
+    })
+
+    it('mid-failover (rebuilding onto the spare) is degraded WITH the consumed advisory', async () => {
+      const pools = await readAhrPools(spareExecutor(MDSTAT_SPARE_REBUILDING))
+      const pool = pools[0]
+      const r1 = pool.arrays.find(a => a.band === 1)!
+      assert.equal(r1.state, 'degraded')
+      assert.ok(r1.sync)
+      assert.equal(r1.sync.action, 'recover')
+      assert.equal(pool.state, 'degraded')
+      assert.ok(pool.advisories.some(a => a.includes('spare consumed by band 1')))
+      // The consumed advisory REPLACES the generic degraded one for this band.
+      assert.ok(!pool.advisories.some(a => a.includes('is degraded')))
+    })
   })
 
   it('treats auto-read-only as healthy (GT-9)', async () => {

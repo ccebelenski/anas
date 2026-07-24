@@ -88,6 +88,34 @@ async function run(executor: CommandExecutor, command: string, args: string[]): 
   return r
 }
 
+/**
+ * Clear ghost md state on freshly carved partitions (11.8 live-proof catch).
+ * Old md superblocks live INSIDE partitions (metadata 1.2, 4 KiB in) — a
+ * whole-disk wipe never touches them, and when a new slice lands at the same
+ * offset udev's incremental assembly can resurrect the dead array and hold
+ * the partition busy before --create/--add runs. Stop any md holder of each
+ * partition, then wipe the partition's signatures, then settle udev.
+ * Shared by pool creation and hot-spare attach (§11 — the same §2.6
+ * partitioning doctrine, never duplicated).
+ */
+export async function clearGhostMdSignatures(
+  executor: CommandExecutor,
+  partitions: { diskId: string, partNumber: number }[],
+): Promise<void> {
+  for (const p of partitions) {
+    const partPath = `/dev/disk/by-id/${p.diskId}-part${p.partNumber}`
+    const real = await executor.exec(REALPATH, [partPath])
+    if (real.exitCode === 0) {
+      const kname = real.stdout.trim().split('/').pop()
+      const holders = await executor.exec(LS, [`/sys/class/block/${kname}/holders`])
+      for (const holder of holders.stdout.split(/\s+/).filter(h => h.startsWith('md')))
+        await executor.exec(MDADM, ['--stop', `/dev/${holder}`])
+    }
+    await executor.exec(WIPEFS, ['-a', partPath])
+  }
+  await run(executor, UDEVADM, ['settle'])
+}
+
 /** The canonical fstab entry for a pool: LV device, btrfs, nofail. */
 function ahrFstabEntry(name: string, mountpoint: string): MountEntry {
   return {
@@ -177,26 +205,11 @@ export async function createAhrPool(
   await run(executor, UDEVADM, ['settle'])
 
   // --- Clear ghost md state on the fresh partitions (11.8 live-proof catch) ---
-  // Old md superblocks live INSIDE partitions (metadata 1.2, 4 KiB in) — the
-  // whole-disk wipe above never touches them, and when a new slice lands at
-  // the same offset udev's incremental assembly can resurrect the dead array
-  // and hold the partition busy before --create runs. Stop any md holder of
-  // our new partitions, then wipe each partition's signatures.
   updateProgress('Clearing stale md signatures on new partitions')
-  for (const disk of planned) {
-    for (const partNumber of disk.partNumberByBand.values()) {
-      const partPath = `/dev/disk/by-id/${disk.id}-part${partNumber}`
-      const real = await executor.exec(REALPATH, [partPath])
-      if (real.exitCode === 0) {
-        const kname = real.stdout.trim().split('/').pop()
-        const holders = await executor.exec(LS, [`/sys/class/block/${kname}/holders`])
-        for (const holder of holders.stdout.split(/\s+/).filter(h => h.startsWith('md')))
-          await executor.exec(MDADM, ['--stop', `/dev/${holder}`])
-      }
-      await executor.exec(WIPEFS, ['-a', partPath])
-    }
-  }
-  await run(executor, UDEVADM, ['settle'])
+  await clearGhostMdSignatures(
+    executor,
+    planned.flatMap(disk => [...disk.partNumberByBand.values()].map(partNumber => ({ diskId: disk.id, partNumber }))),
+  )
 
   // --- One mdadm array per protected band ------------------------------------
   const mdDevices: string[] = []

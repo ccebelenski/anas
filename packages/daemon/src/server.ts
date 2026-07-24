@@ -17,6 +17,7 @@ import { MDSTAT_CAT_ARGS } from './parsers/mdstat.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
 import { ahrExpansionRoutes } from './routes/ahr-expand.js'
 import { ahrMutationRoutes } from './routes/ahr-mutate.js'
+import { ahrSpareRoutes } from './routes/ahr-spare.js'
 import { ahrRoutes } from './routes/ahr.js'
 import { backupRoutes } from './routes/backup.js'
 import { dashboardRoutes } from './routes/dashboard.js'
@@ -480,6 +481,9 @@ export function createServer(opts?: ServerOptions) {
   // AHR expansion engine (Epic 11.6, AHR-DESIGN §5) — plan/expand/resume/
   // abandon + guided replace.
   server.register(ahrExpansionRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, intentDir: ahrIntentDir })
+  // AHR hot spares (story 11.11, AHR-DESIGN §11) — attach/remove, both
+  // confirm-gated; md owns failover after attach.
+  server.register(ahrSpareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, intentDir: ahrIntentDir })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, and job sources above, plus on-demand ARC/iostat/net sampling.
   server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath })

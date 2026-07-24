@@ -11,6 +11,7 @@ import { confirmGate } from '../safety/gate.js'
 import { executeExpansion, executeReadd, executeReplace, projectExistingBands } from '../services/ahr-expand-exec.js'
 import { AhrIntentConflictError, clearIntent, readIntent, writeIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planExpansion } from '../services/ahr-layout.js'
+import { spareCoverageWarnings } from '../services/ahr-spare.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
@@ -66,12 +67,18 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     return pool
   }
 
-  /** Disk ids currently serving any band array of the pool. */
+  /**
+   * Disk ids currently serving any band array of the pool. Spare slices
+   * (mdstat `(S)`, §11) are NOT membership: a hot spare never enters the
+   * approved disk set and never counts toward band member totals.
+   */
   function memberIds(pool: AhrPool): Set<string> {
     const out = new Set<string>()
     for (const arr of pool.arrays) {
-      for (const m of arr.members)
-        out.add(m.disk)
+      for (const m of arr.members) {
+        if (m.memberState !== 'spare')
+          out.add(m.disk)
+      }
     }
     return out
   }
@@ -136,6 +143,13 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       approvedDisks: approved,
       replaced,
     })
+    // §11 expansion coupling: a spare that cannot reach the post-expansion
+    // top band is named in the PLAN warnings, before any confirm — it keeps
+    // covering the existing bands, but the new band gets no auto-rebuild.
+    plan.preview.warnings.push(...spareCoverageWarnings(
+      pool.disks.filter(d => d.role === 'spare').map(d => ({ id: d.id, usableBytes: d.usableBytes })),
+      plan.preview.bands,
+    ))
     const before = pool.capacity
     const after: AhrCapacity = {
       ...plan.preview.capacity,

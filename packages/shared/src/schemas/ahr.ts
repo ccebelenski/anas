@@ -448,3 +448,18 @@ export const AhrReplaceRequest = z.object({
   newDiskId: DiskId,
 })
 export type AhrReplaceRequest = z.infer<typeof AhrReplaceRequest>
+
+// ---- Hot spares (story 11.11, §11) ------------------------------------------
+
+/**
+ * POST /v1/ahr/:name/spare request body — attach a pool-level hot spare
+ * (confirm-gated: the disk is WIPED). A spare must cover EVERY band — its
+ * §2.5-rounded usable size must reach the pool's top array boundary; a partial
+ * spare is refused with the exact shortfall (§11: a spare that can't absorb
+ * every failure is a false promise). Removal is DELETE /v1/ahr/:name/spare/:id
+ * (confirm-gated — protection headroom drops), no body.
+ */
+export const AhrSpareRequest = z.object({
+  diskId: DiskId,
+})
+export type AhrSpareRequest = z.infer<typeof AhrSpareRequest>

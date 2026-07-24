@@ -264,3 +264,83 @@ Only failures and in-progress operations surface (the replication/backup policy)
 8. ~~mdadm.conf ARRAY pinning~~ **Resolved (operator decision 2026-07-22):** pin, via surgical ARRAY entries (§2.6); code still tolerates both name forms for unpinned/foreign arrays.
 
 ~~API home~~ **Resolved:** `/v1/ahr`, sibling of `/v1/pools` — decided with the naming.
+
+## 10. Dashboard integration (§7.3 made concrete — designed 2026-07-23)
+
+The dashboard aggregate gains an AHR source (fail-open like every other source:
+an AHR read error degrades the card, never the dashboard):
+
+- **Warning cards** (the §7.3 promise): one card per pool in a bad state, target-first
+  per the UI discipline — `degraded` (which array/band + member), `failed`,
+  `readonly`, and a **halted expansion** (names the Resume/Abandon verbs). A
+  consumed spare (§11) and a flat-layout snapshot advisory do NOT card — they are
+  view-level advisories only.
+- **In-progress**: expansion/rebuild/scrub jobs already ride the shared jobs strip —
+  no new surface. Healthy/idle AHR pools add NOTHING to the dashboard (§7.3).
+- No AHR capacity tile in v1 — capacity lives in the Hybrid RAID view; the
+  dashboard only tells the operator when something needs them.
+
+## 11. Hot spares (designed 2026-07-23)
+
+**Model:** pool-level spares. A spare must cover EVERY band — usable (rounded)
+size ≥ the pool's top array boundary; a partial spare is refused with the exact
+shortfall (a spare that can't absorb every failure is a false promise). Multiple
+spares are allowed; each is full-coverage.
+
+**Mechanics:** the spare disk is wiped and partitioned with the pool's full
+band-slice geometry (§2.6 rules, ghost-clearing pass included), then each slice
+is `mdadm --add-spare`'d to its band array. From there **md owns the failover**:
+a member failure triggers an immediate automatic rebuild onto the spare slice —
+no operator, no daemon, no polling (Principle 7). mdmonitor's `SpareActive` /
+`RebuildFinished` events flow through the existing hook.
+
+- **Topology:** spare slices show as mdstat `(S)` members; the disk reports
+  `role: 'spare'`. Spare capacity is EXCLUDED from `rawBytes` (it contributes no
+  usable bytes; the UI shows a labeled spare bay instead).
+- **After a failover** the spare has become a member. The pool advisory states
+  it plainly ("spare consumed by band N — add a new spare; remove/replace the
+  failed disk"). Adding the next spare first `--remove`s any faulty slots whose
+  device is ABSENT (slot hygiene); a faulty-but-present disk stays untouched —
+  that is Re-add's (11.9) or Replace's job.
+- **Expansion coupling:** a new band created by expansion automatically extends
+  every attached spare (partition the new slice + `--add-spare`) as part of the
+  `array-create` step — a spare never silently loses coverage. If a spare
+  cannot cover a new, taller top band, the expansion PLAN warns before confirm
+  (the spare keeps covering existing bands; the advisory names the gap).
+- **API (§4):** `POST /v1/ahr/:name/spare {diskId}` (409 confirm — the disk is
+  wiped) and `DELETE /v1/ahr/:name/spare/:id` (409 confirm — protection
+  headroom drops; slices removed from every array, disk zapped).
+- Promote-spare-to-member and shared spares across pools: OUT of v1.
+
+## 12. Snapshots — btrfs subvolume layout (designed 2026-07-23)
+
+**Layout decision:** NEW pools are created with a subvolume layout —
+`mkfs.btrfs` → mount the top-level briefly → `btrfs subvolume create @data` and
+`@snapshots` → remount with `subvol=@data` at the pool mountpoint (fstab
+carries the option). The operator sees exactly what they saw before; snapshots
+live OUTSIDE the mounted tree, so they never nest into the data and rollback is
+a subvolume swap. Pools created before this design (flat layout) report
+`subvolLayout: false` + an advisory — snapshots unavailable; **no migration
+verb** (moving data across subvolume boundaries is a copy; the only pre-design
+pools are throwaway test pools — destroy/recreate is the migration).
+
+**Operations** (top-level mounted on demand at a private runtime path,
+unmounted after each op — nothing new stays mounted):
+
+| Verb | Semantics |
+|---|---|
+| `GET /v1/ahr/:name/snapshots` | list (`btrfs subvolume list -s`, otime, readonly flag) |
+| `POST /v1/ahr/:name/snapshots {name?}` | read-only snapshot of `@data` → `@snapshots/<name>`; default name = UTC timestamp; charset-safe names | 202 job |
+| `DELETE /v1/ahr/:name/snapshots/:snap` | `btrfs subvolume delete` | 202 job / **409 confirm** |
+| `POST /v1/ahr/:name/snapshots/:snap/rollback` | **409 confirm**; brief unmount of the pool; current `@data` is PRESERVED as `@snapshots/pre-rollback-<ts>` (rename — instant), the chosen snapshot becomes the new writable `@data`, remount. Nothing is destroyed by a rollback, ever |
+| 202 job |
+
+- **Schema:** `AhrSnapshot { name, createdAt, readonly }`; `AhrPool` gains
+  `subvolLayout: boolean`. Snapshot sizes need qgroups — OUT of v1 (never show
+  an unlabeled or wrong number).
+- **UI:** a `Snapshots…` button in the Details window → manager window (list,
+  create, delete, rollback — rollback confirm states the unmount + the
+  auto-preserved pre-rollback snapshot). Mirrors the datasets snapshot idioms.
+- **Follow-ups inked, not built here:** Epic 16 snapshot-consistent backup for
+  AHR sources (snapshot → back up `@snapshots/<x>` → delete, exactly the ZFS
+  treatment); Epic 17 scheduled snapshots + scrubs gain AHR targets.

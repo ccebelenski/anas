@@ -181,7 +181,10 @@ export function projectExistingBands(pool: AhrPool): ExistingBand[] {
       startBytes: start,
       endBytes: end,
       level: arr.level,
-      members: arr.members.map(m => m.disk),
+      // Spare slices (mdstat `(S)`, §11) are NOT band members: the planner
+      // must never require the spare disk in the approved set, count it
+      // toward member totals, or treat it as growable membership.
+      members: arr.members.filter(m => m.memberState !== 'spare').map(m => m.disk),
     })
     start = end
   }
@@ -206,7 +209,7 @@ async function execChecked(executor: CommandExecutor, command: string, args: str
   return r.stdout
 }
 
-interface DiskTree {
+export interface DiskTree {
   /** Whole-disk kernel name. */
   kernel: string
   sizeBytes: number
@@ -214,7 +217,7 @@ interface DiskTree {
 }
 
 /** One disk's live partition view, or null when the device is absent. */
-async function readDiskTree(executor: CommandExecutor, device: string): Promise<DiskTree | null> {
+export async function readDiskTree(executor: CommandExecutor, device: string): Promise<DiskTree | null> {
   const r = await executor.exec(LSBLK, diskLsblkArgs(device))
   if (r.exitCode !== 0)
     return null
@@ -414,6 +417,33 @@ function levelNumber(level: string): string {
   return level.replace('raid', '')
 }
 
+/**
+ * Attach one disk's labeled band slice to its band array as a hot spare
+ * (§11): `mdadm <array> --add-spare <slice>`. Detect-then-delta: a slice that
+ * is already an array member (spare or otherwise) is left alone. Shared by
+ * the spare-attach verb (services/ahr-spare.ts) and the expansion coupling
+ * below. Returns true when a slice was actually added.
+ */
+export async function addSpareSlice(
+  executor: CommandExecutor,
+  poolName: string,
+  diskId: string,
+  band: number,
+  arrayDev: string,
+  currentMemberKernels: ReadonlySet<string>,
+): Promise<boolean> {
+  const disk = await readDiskTree(executor, byIdPath(diskId))
+  if (!disk)
+    throw new Error(`spare disk '${diskId}' is not present — a missing disk is never worked around`)
+  const part = disk.parts.find(p => p.partlabel !== null && bandLabelRe(poolName, band).test(p.partlabel))
+  if (!part || part.number === null)
+    throw new Error(`spare disk '${diskId}' has no partition for band ${band} — the partition step did not complete`)
+  if (currentMemberKernels.has(part.name))
+    return false // already attached (resume/no-op path)
+  await execChecked(executor, MDADM, [arrayDev, '--add-spare', partByIdPath(diskId, part.number)])
+  return true
+}
+
 // ---- reshape-wait ----------------------------------------------------------
 
 interface WaitContext {
@@ -576,48 +606,74 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       if (pb.level === null)
         throw new Error(`plan preview band ${band} has no level for array-create (planner bug)`)
       const before = await resolveAhrArrays(executor, pool.name)
-      if (before.has(band))
-        return true // already created (possibly still resyncing — reshape-wait follows)
-      const members = await expectedBandMembers(executor, pool.name, pb, ctx.intent.approvedDisks)
-      if (members.length !== pb.memberCount)
-        throw new Error(`band ${band} expects ${pb.memberCount} member slices but ${members.length} are present`)
-      const name = `${pool.name}-r${band}`
-      await execChecked(executor, MDADM, [
-        '--create',
-        `/dev/md/${name}`,
-        '--run',
-        `--level=${levelNumber(pb.level)}`,
-        `--raid-devices=${pb.memberCount}`,
-        '--metadata=1.2',
-        `--name=${name}`,
-        // Explicit generous data offset (§2.6/GT-5) — the reshape headroom that
-        // keeps every future grow backup-file-free.
-        ahrDataOffsetArg(pb.heightBytes),
-        // Explicit write-intent bitmap (see ahr-create.ts): fast differential
-        // re-add for transiently-offline members, never an implicit default.
-        '--bitmap=internal',
-        ...members.map(m => m.partByIdPath),
-      ])
-      // Pin the new array + refresh the initramfs copy (§2.6). Best-effort:
-      // pinning is boot-name determinism, not data safety — a failure is
-      // logged loudly but never halts a data-layer-complete step.
-      try {
-        const after = await resolveAhrArrays(executor, pool.name)
-        const uuid = after.get(band)?.detail.uuid
-        if (uuid) {
-          await pinArrays([{ name, uuid }])
-          const r = await executor.exec(UPDATE_INITRAMFS, ['-u'])
-          if (r.exitCode !== 0)
-            ctx.log(`ahr.expand pool=${pool.name} warn=update-initramfs-failed detail=${r.stderr.trim()}`)
+      let resolved = before.get(band)
+      const created = !resolved
+      if (!resolved) {
+        const members = await expectedBandMembers(executor, pool.name, pb, ctx.intent.approvedDisks)
+        if (members.length !== pb.memberCount)
+          throw new Error(`band ${band} expects ${pb.memberCount} member slices but ${members.length} are present`)
+        const name = `${pool.name}-r${band}`
+        await execChecked(executor, MDADM, [
+          '--create',
+          `/dev/md/${name}`,
+          '--run',
+          `--level=${levelNumber(pb.level)}`,
+          `--raid-devices=${pb.memberCount}`,
+          '--metadata=1.2',
+          `--name=${name}`,
+          // Explicit generous data offset (§2.6/GT-5) — the reshape headroom that
+          // keeps every future grow backup-file-free.
+          ahrDataOffsetArg(pb.heightBytes),
+          // Explicit write-intent bitmap (see ahr-create.ts): fast differential
+          // re-add for transiently-offline members, never an implicit default.
+          '--bitmap=internal',
+          ...members.map(m => m.partByIdPath),
+        ])
+        // Pin the new array + refresh the initramfs copy (§2.6). Best-effort:
+        // pinning is boot-name determinism, not data safety — a failure is
+        // logged loudly but never halts a data-layer-complete step.
+        try {
+          const after = await resolveAhrArrays(executor, pool.name)
+          resolved = after.get(band)
+          const uuid = resolved?.detail.uuid
+          if (uuid) {
+            await pinArrays([{ name, uuid }])
+            const r = await executor.exec(UPDATE_INITRAMFS, ['-u'])
+            if (r.exitCode !== 0)
+              ctx.log(`ahr.expand pool=${pool.name} warn=update-initramfs-failed detail=${r.stderr.trim()}`)
+          }
+          else {
+            ctx.log(`ahr.expand pool=${pool.name} warn=pin-skipped detail=no-uuid-for-${name}`)
+          }
         }
-        else {
-          ctx.log(`ahr.expand pool=${pool.name} warn=pin-skipped detail=no-uuid-for-${name}`)
+        catch (err) {
+          ctx.log(`ahr.expand pool=${pool.name} warn=pin-failed detail=${err instanceof Error ? err.message : String(err)}`)
         }
       }
-      catch (err) {
-        ctx.log(`ahr.expand pool=${pool.name} warn=pin-failed detail=${err instanceof Error ? err.message : String(err)}`)
+
+      // §11 expansion coupling: a new band automatically extends every attached
+      // spare that can reach its boundary — partition the new slice, then
+      // --add-spare. Evaluated on EVERY run (the already-created resume path
+      // must not skip it): a spare never silently loses coverage. Spares that
+      // cannot cover the taller band were already named in the plan warnings.
+      const spares = pool.disks.filter(d => d.role === 'spare' && d.usableBytes >= pb.range.endBytes)
+      let extended = 0
+      if (spares.length > 0) {
+        if (!resolved)
+          resolved = (await resolveAhrArrays(executor, pool.name)).get(band)
+        if (!resolved)
+          throw new Error(`array ${pool.name}-r${band} not found after create — cannot extend the pool's hot spares onto it`)
+        const memberKernels = new Set(resolved.md.members.map(m => m.device))
+        for (const s of spares) {
+          ctx.updateProgress(`extending hot spare ${s.id} to band ${band}`)
+          await ensureDiskPartitions(executor, pool.name, s.id, ctx.plan.preview.bands)
+          if (await addSpareSlice(executor, pool.name, s.id, band, resolved.dev, memberKernels)) {
+            extended++
+            ctx.log(`ahr.expand pool=${pool.name} step=array-create target=${step.target} spare=${s.id} status=extended`)
+          }
+        }
       }
-      return false
+      return !created && extended === 0
     }
 
     case 'reshape-wait': {

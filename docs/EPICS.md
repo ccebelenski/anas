@@ -556,6 +556,12 @@ md provides RAID without ZFS's memory overhead, using standard Linux filesystems
 
 11.8. [done 2026-07-23 — full lifecycle through the real API on the stunt node: adopted the hand-built pool, destroyed it, created tank (RAID5×3+RAID1×2), expanded with live RAID1→RAID5 convert, replaced a disk live, scrubbed; canary data intact; pins/hook/intent verified; 2 live-proof catches fixed at source (btrfs path, ghost-superblock resurrection)] As a dev, I want the whole arc live-proven end-to-end on the stunt node through the real API (create → expand → replace → destroy on throwaway data) before any release gate.
 
+11.10. As the dashboard, I want an AHR source in the status aggregate (fail-open like every source) — one target-first warning card per pool in a bad state (`degraded` naming the band+member, `failed`, `readonly`, halted expansion naming Resume/Abandon), in-progress ops riding the existing jobs strip, healthy pools adding NOTHING — so AHR problems are impossible to miss without dashboard noise. *(Design: AHR-DESIGN §10; spare-consumed and flat-layout advisories deliberately do not card.)*
+
+11.11. As a user, I can attach full-coverage hot spares to an AHR pool (usable size ≥ the top array boundary — partial spares refused with the exact shortfall; slices `--add-spare`'d to every band so **md owns the automatic failover**), remove them confirm-gated, see them as a labeled spare bay excluded from rawBytes, and trust that expansion auto-extends spare coverage to new bands — so a disk failure starts rebuilding immediately with no operator in the loop. *(Design: AHR-DESIGN §11; promote-to-member and shared spares OUT of v1.)*
+
+11.12. As a user, I get btrfs snapshots on AHR pools: new pools create an `@data`/`@snapshots` subvolume layout (snapshots live outside the mounted tree), I can list/create/delete snapshots and roll back — rollback preserves the replaced state as `pre-rollback-<ts>`, destroying nothing, ever — and pre-design flat-layout pools report `subvolLayout: false` with snapshots unavailable (no migration verb; destroy/recreate is the migration). *(Design: AHR-DESIGN §12; qgroup sizes OUT of v1.)*
+
 #### AHR — ANAS Hybrid RAID (SHR-style; V2 headline — promoted from "far future" 2026-07-18)
 
 > As a user, I want Synology-SHR-style mixed-drive-size pooling with redundancy and online growth, so I can use drives of different sizes efficiently and expand incrementally — the thing ZFS fundamentally can't do (raidz is fixed-width to the smallest disk).

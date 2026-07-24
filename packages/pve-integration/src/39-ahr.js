@@ -438,7 +438,9 @@
 
     // Per-disk bays: one gfx.bay per disk (full by-id in the label — never
     // truncated), the slice bar inside, model/size beneath. A faulted disk's
-    // bay is outlined in danger red.
+    // bay is outlined in danger red. Hot spares (§11) render in their OWN
+    // labelled bay group — excluded from raw capacity, labelled as the
+    // automatic rebuild target, never mixed in with the members.
     function disksHtml(d) {
         var gfx = ANAS.gfx;
         if (!gfx || typeof gfx.bay !== 'function' || typeof gfx.bayGroup !== 'function') {
@@ -457,13 +459,13 @@
                 maxBytes = u;
             }
         }
-        var bays = '';
-        for (i = 0; i < disks.length; i++) {
-            var disk = disks[i];
+        function bayFor(disk) {
             var faulted = !!bad[disk.id];
             var sub = (disk.model ? disk.model + ' · ' : '')
                 + fmtBytes(disk.usableBytes || disk.sizeBytes)
-                + (disk.role === 'spare' ? ' · ' + t('spare') : '');
+                + (disk.role === 'spare'
+                    ? ' · ' + t('hot spare — automatic rebuild target on any member failure')
+                    : '');
             var inner = '<div style="width:100%;min-width:340px">'
                 + '<div style="display:block;margin-bottom:5px">' + diskSliceBar(disk, maxBytes) + '</div>'
                 + '<div style="font-size:11px;color:var(--anas-muted)">' + enc(sub)
@@ -471,15 +473,28 @@
                 + '</div></div>';
             var bay = gfx.bay(disk.id, inner) || '';
             if (!bay) {
-                continue;
+                return '';
             }
             if (faulted) {
                 bay = '<div title="' + enc(disk.id + ' — ' + t('faulted member')) + '"'
                     + ' style="outline:2px solid var(--anas-danger);border-radius:11px">' + bay + '</div>';
             }
-            bays += '<div style="flex:1 1 380px;max-width:640px">' + bay + '</div>';
+            return '<div style="flex:1 1 380px;max-width:640px">' + bay + '</div>';
         }
-        return gfx.bayGroup(t('Disks — band slices'), bays) || '';
+        var memberBays = '';
+        var spareBays = '';
+        for (i = 0; i < disks.length; i++) {
+            if (disks[i].role === 'spare') {
+                spareBays += bayFor(disks[i]);
+            } else {
+                memberBays += bayFor(disks[i]);
+            }
+        }
+        var html = memberBays ? (gfx.bayGroup(t('Disks — band slices'), memberBays) || '') : '';
+        if (spareBays) {
+            html += gfx.bayGroup(t('Hot spare bay — excluded from capacity'), spareBays) || '';
+        }
+        return html;
     }
 
     // Per-array rows: band swatch, md device, level × members, state pill, and
@@ -834,7 +849,7 @@
     function updateButtons(grid) {
         var sel = grid.getSelection();
         var has = sel && sel.length > 0;
-        var ids = ['details', 'expand', 'replace', 'scrub', 'destroy'];
+        var ids = ['details', 'expand', 'replace', 'scrub', 'destroy', 'addSpare'];
         for (var i = 0; i < ids.length; i++) {
             var btn = grid.down('#' + ids[i]);
             if (btn) {
@@ -858,6 +873,23 @@
         if (readdBtn) {
             readdBtn.setHidden(!has || readdCandidates(sel[0]).length === 0);
         }
+        // Remove spare appears only when the pool actually has one (11.11).
+        var rmSpareBtn = grid.down('#removeSpare');
+        if (rmSpareBtn) {
+            rmSpareBtn.setHidden(!has || spareDisks(sel[0]).length === 0);
+        }
+    }
+
+    // The selected pool's hot-spare disks (11.11 — role fused daemon-side).
+    function spareDisks(rec) {
+        var out = [];
+        var disks = (rec && rec.get('disks')) || [];
+        for (var i = 0; i < disks.length; i++) {
+            if (disks[i].role === 'spare') {
+                out.push(disks[i]);
+            }
+        }
+        return out;
     }
 
     // Disk ids with a faulty/missing member slot in any band (11.9).
@@ -918,6 +950,174 @@
                     run(value.replace(/\s+/g, ''));
                 }
             }, null, false, candidates[0] || '');
+    }
+
+    // 11.11: attach a full-coverage hot spare. Disk picker over the available
+    // inventory; the daemon enforces the §11 coverage rule and a too-small
+    // disk is refused with the exact shortfall — shown verbatim here.
+    function openAddSpare(grid, node) {
+        var pool = selectedPool(grid);
+        if (!pool) {
+            return;
+        }
+        var win = null;
+
+        function bodyEl() {
+            var p = win ? win.down('#ahrSpareBody') : null;
+            return (p && p.getEl()) ? p.getEl().dom : null;
+        }
+
+        function submit() {
+            var root = bodyEl();
+            if (!root) {
+                return;
+            }
+            var diskId = checkedValues(root, 'ahrsp-disk')[0];
+            if (!diskId) {
+                Ext.Msg.alert(t('Add hot spare'), t('Select the disk to attach as a spare.'));
+                return;
+            }
+            ANAS.confirmAndRun({
+                node: node,
+                method: 'post',
+                path: '/ahr/' + encodeURIComponent(pool) + '/spare',
+                body: { diskId: diskId },
+                view: grid,
+                confirmTitle: 'Add hot spare',
+                confirmIntro: t('Attaching') + ' <b>' + enc(diskId) + '</b> '
+                    + t('as a hot spare to') + ' <b>' + enc(pool) + '</b> '
+                    + t('wipes the disk:'),
+                failTitle: 'Add hot spare failed',
+                successMsg: t('Hot spare attach started on') + ' ' + pool,
+                onSubmitted: function () {
+                    if (win && !win.destroyed && !win.destroying) {
+                        win.close();
+                    }
+                    loadPools(grid, node);
+                },
+                onComplete: function () {
+                    loadPools(grid, node);
+                },
+            });
+        }
+
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-ahr-spare',
+                title: t('Add hot spare') + ': ' + pool,
+                modal: true,
+                width: 620,
+                height: 440,
+                layout: 'fit',
+                items: [{
+                    xtype: 'panel',
+                    itemId: 'ahrSpareBody',
+                    border: false,
+                    scrollable: true,
+                    html: '',
+                }],
+                buttons: [
+                    {
+                        text: t('Cancel'),
+                        handler: function () {
+                            win.close();
+                        },
+                    },
+                    {
+                        text: t('Add hot spare'),
+                        cls: 'anas-btn-ahr-spare-exec',
+                        handler: submit,
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('ahr spare window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+        try {
+            win.setLoading(true);
+        } catch (eL) {
+            // non-fatal
+        }
+        ANAS.api.get(node, '/disks').then(function (res) {
+            if (!win || win.destroyed || win.destroying) {
+                return;
+            }
+            win.setLoading(false);
+            var all = (res && res.data) || [];
+            var avail = [];
+            for (var i = 0; i < all.length; i++) {
+                if (all[i].status === 'available') {
+                    avail.push(all[i]);
+                }
+            }
+            var p = win.down('#ahrSpareBody');
+            if (p) {
+                p.setHtml('<div style="padding:12px;font-size:12.5px;color:var(--anas-ink)">'
+                    + '<div style="' + SEC + ';margin-top:2px">' + enc(t('Disk to attach')) + '</div>'
+                    + diskChecklistHtml(avail, 'ahrsp-disk', 'radio')
+                    + '<div style="color:var(--anas-muted);font-size:11.5px;margin-top:10px">'
+                    + enc(t('A hot spare must cover EVERY band: its usable size must reach the '
+                        + 'top array boundary of the pool — a smaller disk is refused with the '
+                        + 'exact shortfall. The disk is wiped and sliced with the full band '
+                        + 'geometry; from then on md rebuilds onto it automatically the moment '
+                        + 'any member fails, with no operator in the loop.'))
+                    + '</div></div>');
+            }
+        }, function (err) {
+            if (!win || win.destroyed || win.destroying) {
+                return;
+            }
+            win.setLoading(false);
+            try {
+                Ext.Msg.alert(t('Error'), t('Failed to load disks') + ': ' + ANAS.errText(err));
+            } catch (e) {
+                ANAS.warn('ahr spare disk load failed: ' + ANAS.errText(err));
+            }
+        });
+    }
+
+    // 11.11: remove a hot spare (confirm-gated — protection headroom drops).
+    function openRemoveSpare(grid, node) {
+        var pool = selectedPool(grid);
+        var sel = grid.getSelection();
+        if (!pool || !sel || !sel.length) {
+            return;
+        }
+        var spares = spareDisks(sel[0]);
+        function run(diskId) {
+            ANAS.confirmAndRun({
+                node: node,
+                method: 'del',
+                path: '/ahr/' + encodeURIComponent(pool) + '/spare/'
+                    + encodeURIComponent(diskId),
+                view: grid,
+                confirmTitle: 'Remove hot spare',
+                confirmIntro: t('Removing hot spare') + ' <b>' + enc(diskId) + '</b> '
+                    + t('from') + ' <b>' + enc(pool) + '</b> '
+                    + t('drops its protection headroom:'),
+                failTitle: 'Remove hot spare failed',
+                successMsg: t('Hot spare removal started on') + ' ' + pool,
+                onSubmitted: function () {
+                    loadPools(grid, node);
+                },
+                onComplete: function () {
+                    loadPools(grid, node);
+                },
+            });
+        }
+        if (spares.length === 1) {
+            run(spares[0].id);
+            return;
+        }
+        // Multiple spares: prompt with the first prefilled (full by-id shown).
+        Ext.Msg.prompt(t('Remove hot spare'), t('Spare disk id (by-id) to remove from') + ' <b>' + enc(pool) + '</b>:',
+            function (btn, value) {
+                if (btn === 'ok' && value) {
+                    run(value.replace(/\s+/g, ''));
+                }
+            }, null, false, spares.length ? spares[0].id : '');
     }
 
     function resumeExpansion(grid, node) {
@@ -1698,6 +1898,28 @@
                             disabled: true,
                             handler: function (btn) {
                                 destroyPool(btn.up('grid'), node);
+                            },
+                        },
+                        // 11.11: pool-level hot spares — Add always offered
+                        // for a selected pool; Remove only when one exists.
+                        {
+                            text: t('Add spare'),
+                            itemId: 'addSpare',
+                            cls: 'anas-btn-ahr-add-spare',
+                            iconCls: 'fa fa-plus-square-o',
+                            disabled: true,
+                            handler: function (btn) {
+                                openAddSpare(btn.up('grid'), node);
+                            },
+                        },
+                        {
+                            text: t('Remove spare'),
+                            itemId: 'removeSpare',
+                            cls: 'anas-btn-ahr-remove-spare',
+                            iconCls: 'fa fa-minus-square-o',
+                            hidden: true,
+                            handler: function (btn) {
+                                openRemoveSpare(btn.up('grid'), node);
                             },
                         },
                         // 11.9: visible only when the selected pool has a

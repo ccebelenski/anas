@@ -35,6 +35,7 @@ export {
   AhrPreviewBand,
   AhrReplacePair,
   AhrReplaceRequest,
+  AhrSpareRequest,
   AhrStepStatus,
   AhrSyncAction,
   AhrType,
