@@ -127,9 +127,18 @@ export function planDiskPartitions(input: {
   diskNumber: number
   /** §2.5-rounded usable size of the disk. */
   diskUsableBytes: number
+  /**
+   * RAW disk size, when known. When the raw size leaves clear room past the
+   * rounded boundary, the topmost slice is sized EXACTLY to the boundary
+   * instead of clamping to the disk's end — the §2.5 rounding slack stays
+   * unpartitioned. (Live catch: a 2.5 G disk's clamped 1 GiB band-2 slice
+   * became a 1.5 GiB partition and skewed band-height reporting.) Without a
+   * raw size the topmost slice falls back to the clamp (safe, GT-4).
+   */
+  diskRawBytes?: number
   slices: AhrBandSlice[]
 }): AhrPartitionSpec[] {
-  const { poolName, diskNumber, diskUsableBytes } = input
+  const { poolName, diskNumber, diskUsableBytes, diskRawBytes } = input
   const slices = [...input.slices]
   slices.sort((a, b) => a.startBytes - b.startBytes)
   if (slices.length === 0)
@@ -156,8 +165,11 @@ export function planDiskPartitions(input: {
     // The disk's topmost slice — and ONLY a slice that nominally reaches the
     // disk's end — clamps to the last usable sector (end token `0`). A final
     // slice ending below that is sized exactly, leaving the region above it
-    // unpartitioned (§2.6: raw for future re-banding).
-    const clampsToEnd = i === slices.length - 1 && slice.endBytes >= diskUsableBytes
+    // unpartitioned (§2.6: raw for future re-banding). When the RAW size is
+    // known and leaves ≥2 MiB past the boundary (GPT tail is ~17 KiB), the
+    // exact size is used even at the rounded end — rounding slack stays raw.
+    const rawLeavesRoom = diskRawBytes !== undefined && diskRawBytes - slice.endBytes >= 2 * 1024 * 1024
+    const clampsToEnd = i === slices.length - 1 && slice.endBytes >= diskUsableBytes && !rawLeavesRoom
     const sizeBytes = clampsToEnd ? null : slice.endBytes - startBytes
     const endToken = clampsToEnd ? '0' : `+${mib(sizeBytes!, `size of band ${slice.band} slice`)}`
 

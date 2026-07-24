@@ -187,6 +187,11 @@
                 if (opts.onComplete) { opts.onComplete(null); }
                 return;
             }
+            // Fires the moment the daemon ACCEPTS the job (202) — long-job
+            // dialogs close/disable here; onComplete still fires at the end.
+            if (opts.onSubmitted) {
+                try { opts.onSubmitted(job); } catch (eSub) { ANAS.warn('onSubmitted failed: ' + ANAS.errText(eSub)); }
+            }
             ANAS.pollJob(node, job.id, opts);
         }, function (err) {
             if (err && err.status === 409 && err.confirmCode && opts.onConfirm) {

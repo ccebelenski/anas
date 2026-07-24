@@ -159,6 +159,12 @@ export const AhrArray = z.object({
   state: ArrayState,
   /** Present while a sync thread runs on this array. */
   sync: AhrArraySync.optional(),
+  /**
+   * Transient kernel device name (e.g. "md127") at read time. Convenience for
+   * consumers that must correlate with /proc/mdstat — NEVER persist or key on
+   * it (GT-2: kernel names reshuffle across operations and reboots).
+   */
+  kernelName: z.string().optional(),
 })
 export type AhrArray = z.infer<typeof AhrArray>
 
@@ -199,13 +205,60 @@ export const AhrCapacity = z.object({
 })
 export type AhrCapacity = z.infer<typeof AhrCapacity>
 
+/** What kicked off an expansion. */
+export const AhrExpansionTrigger = z.enum(['add-disk', 'replace-disk'])
+export type AhrExpansionTrigger = z.infer<typeof AhrExpansionTrigger>
+
+/** Lifecycle of an expansion intent. */
+export const AhrExpansionState = z.enum(['running', 'halted', 'done', 'abandoned'])
+export type AhrExpansionState = z.infer<typeof AhrExpansionState>
+
+/**
+ * The ONLY persisted expansion state (§5.3): the disk set the operator
+ * approved, nothing more. Steps are never persisted — the planner recomputes
+ * the reachable target from (existing bands + approvedDisks) on every run and
+ * resume. A missing disk is NEVER treated as intent to shrink; only an intent
+ * naming `replacedDisk` may substitute a member.
+ *
+ * (Defined before AhrPool because the pool detail carries the live intent —
+ * §6.2: a halted expansion surfaces Resume/Abandon loudly.)
+ */
+export const AhrExpansionIntent = z.object({
+  id: UUID,
+  trigger: AhrExpansionTrigger,
+  /** The full post-expansion disk set the operator approved. */
+  approvedDisks: z.array(DiskId),
+  /** For replace-disk: the outgoing member (its replacement is in approvedDisks). */
+  replacedDisk: DiskId.optional(),
+  /**
+   * For replace-disk: the incoming disk (also present in approvedDisks). The
+   * §2.3 planner takes replacement as a declared {old, new} PAIR, and resume
+   * recomputes the plan from this intent — so the pair must be persisted:
+   * with only `replacedDisk`, a resume halted before the swap could not name
+   * which approved disk substitutes the old member.
+   */
+  replacementDisk: DiskId.optional(),
+  /** Capacity before the expansion (for the before → after presentation). */
+  before: AhrCapacity,
+  /** Reachable capacity after the expansion (never fresh-ideal capacity). */
+  after: AhrCapacity,
+  state: AhrExpansionState,
+})
+export type AhrExpansionIntent = z.infer<typeof AhrExpansionIntent>
+
 /** An AHR pool (GET /v1/ahr/:name — the full §3 structure). */
 export const AhrPool = z.object({
   /** Pool name — also the VG name and the md-name prefix. */
   name: PoolName,
   ahrType: AhrType,
-  /** Pool-scoped mountpoint of the btrfs filesystem (never /mnt/pve). */
+  /**
+   * Pool-scoped mountpoint of the btrfs filesystem (never /mnt/pve). When
+   * `mounted` is false this carries the LV device path instead — always check
+   * `mounted` before treating it as a directory.
+   */
   mountpoint: AbsolutePath,
+  /** Whether the filesystem is currently mounted. */
+  mounted: z.boolean(),
   disks: z.array(AhrDisk),
   arrays: z.array(AhrArray),
   /** The one VG per pool (PVs are the md devices in band order). */
@@ -223,6 +276,12 @@ export const AhrPool = z.object({
   state: AhrPoolState,
   /** Operator advisories (unlock hints, degraded-band guidance, …). */
   advisories: z.array(z.string()),
+  /**
+   * The live expansion intent when one exists (§6.2): 'running' → show the
+   * job's progress; 'halted' → surface Resume/Abandon loudly. Absent when no
+   * expansion is in flight.
+   */
+  expansion: AhrExpansionIntent.optional(),
 })
 export type AhrPool = z.infer<typeof AhrPool>
 
@@ -289,48 +348,27 @@ export const AhrCreateRequest = z.object({
   name: PoolName,
   tier: AhrType,
   disks: z.array(DiskId).min(1),
+  /**
+   * Optional mountpoint override; defaults to the pool-scoped
+   * `/mnt/anas-ahr/<name>`. Never under /mnt/pve (§2.6 — PVE owns that
+   * namespace); the route also refuses paths already mounted or claimed in
+   * fstab.
+   */
+  mountpoint: AbsolutePath.optional(),
 })
 export type AhrCreateRequest = z.infer<typeof AhrCreateRequest>
 
-// ---- Expansion -------------------------------------------------------------
-
-/** What kicked off an expansion. */
-export const AhrExpansionTrigger = z.enum(['add-disk', 'replace-disk'])
-export type AhrExpansionTrigger = z.infer<typeof AhrExpansionTrigger>
-
-/** Lifecycle of an expansion intent. */
-export const AhrExpansionState = z.enum(['running', 'halted', 'done', 'abandoned'])
-export type AhrExpansionState = z.infer<typeof AhrExpansionState>
-
 /**
- * The ONLY persisted expansion state (§5.3): the disk set the operator
- * approved, nothing more. Steps are never persisted — the planner recomputes
- * the reachable target from (existing bands + approvedDisks) on every run and
- * resume. A missing disk is NEVER treated as intent to shrink; only an intent
- * naming `replacedDisk` may substitute a member.
+ * PUT /v1/ahr/:name/mountpoint — change where the pool mounts (the only
+ * mutable pool identity; name/tier/arrays are fixed at creation). Same
+ * constraints as the create-time override.
  */
-export const AhrExpansionIntent = z.object({
-  id: UUID,
-  trigger: AhrExpansionTrigger,
-  /** The full post-expansion disk set the operator approved. */
-  approvedDisks: z.array(DiskId),
-  /** For replace-disk: the outgoing member (its replacement is in approvedDisks). */
-  replacedDisk: DiskId.optional(),
-  /**
-   * For replace-disk: the incoming disk (also present in approvedDisks). The
-   * §2.3 planner takes replacement as a declared {old, new} PAIR, and resume
-   * recomputes the plan from this intent — so the pair must be persisted:
-   * with only `replacedDisk`, a resume halted before the swap could not name
-   * which approved disk substitutes the old member.
-   */
-  replacementDisk: DiskId.optional(),
-  /** Capacity before the expansion (for the before → after presentation). */
-  before: AhrCapacity,
-  /** Reachable capacity after the expansion (never fresh-ideal capacity). */
-  after: AhrCapacity,
-  state: AhrExpansionState,
+export const AhrMountpointRequest = z.object({
+  mountpoint: AbsolutePath,
 })
-export type AhrExpansionIntent = z.infer<typeof AhrExpansionIntent>
+export type AhrMountpointRequest = z.infer<typeof AhrMountpointRequest>
+
+// ---- Expansion -------------------------------------------------------------
 
 /**
  * Step kinds, in §5.1 pipeline order: partition first, one md mutation per

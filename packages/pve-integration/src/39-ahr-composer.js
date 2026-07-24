@@ -78,7 +78,9 @@
         return {
             node: opts.node,
             grid: opts.grid,
-            name: 'tank',
+            name: '',
+            mountpoint: '',
+            mountBad: false,
             tier: 'ahr1',
             disks: [],          // available disks (from /disks, status 'available')
             diskById: {},
@@ -185,9 +187,11 @@
     // Horizontal disk bars with stacked band segments: protected bands solid
     // (per-band series colour), unprotected hatched/greyed with a label. All
     // widths scale against the tallest usable boundary.
-    function previewBarsHtml(state) {
-        var p = state.preview;
-        var bands = (p && p.bands) || [];
+    // Shared core — also drives the expansion wizard's before→after picture
+    // (exported as ANAS.ahr.bandBarsHtml; this file loads before 39-ahr.js).
+    // diskList = [{id, size}] in any order.
+    function bandBarsHtml(bands, diskList) {
+        bands = bands || [];
         if (!bands.length) {
             return '';
         }
@@ -202,16 +206,9 @@
         if (!(topEnd > 0)) {
             return '';
         }
-        var ids = selectedIds(state);
         var rows = '';
         // Largest first — the banding reads top-down like the design's tables.
-        var sel = [];
-        for (i = 0; i < ids.length; i++) {
-            var d = state.diskById[ids[i]];
-            if (d) {
-                sel.push(d);
-            }
-        }
+        var sel = (diskList || []).slice();
         sel.sort(function (a, b) {
             return (Number(b.size) || 0) - (Number(a.size) || 0);
         });
@@ -274,6 +271,23 @@
         }
         return rows + '<div style="margin-top:10px">' + legend + '</div>';
     }
+
+    function previewBarsHtml(state) {
+        var ids = selectedIds(state);
+        var diskList = [];
+        for (var i = 0; i < ids.length; i++) {
+            var d = state.diskById[ids[i]];
+            if (d) {
+                diskList.push(d);
+            }
+        }
+        return bandBarsHtml((state.preview && state.preview.bands) || [], diskList);
+    }
+
+    // Shared with 39-ahr.js (loads after this file): the expansion wizard
+    // renders the plan's resulting layout with the same banded bars.
+    ANAS.ahr = ANAS.ahr || {};
+    ANAS.ahr.bandBarsHtml = bandBarsHtml;
 
     function capRow(label, value, emphasis) {
         return '<div style="display:flex;justify-content:space-between;gap:12px;padding:6px 0;'
@@ -385,6 +399,7 @@
             return;
         }
         var ok = nameValid(state.name)
+            && !state.mountBad
             && state.previewFresh
             && !!state.preview
             && state.preview.minDisksMet === true;
@@ -477,10 +492,19 @@
             + '<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">'
             + '<span style="' + SEC + ';margin:0">' + enc(t('Pool')) + '</span>'
             + '<input type="text" class="anas-fld-ahrc-name" id="ahrc-name" value="' + enc(state.name) + '"'
-            + ' spellcheck="false" style="font:inherit;color:var(--anas-ink);padding:5px 8px;'
+            + ' spellcheck="false" placeholder="' + enc(t('name')) + '"'
+            + ' style="font:inherit;color:var(--anas-ink);padding:5px 8px;'
             + 'border-radius:8px;border:1px solid var(--anas-card-edge);'
             + 'background:linear-gradient(var(--anas-card-top),var(--anas-card-bot));'
             + 'outline:none;width:170px">'
+            + '<span style="' + SEC + ';margin:0">' + enc(t('Mount at')) + '</span>'
+            + '<input type="text" class="anas-fld-ahrc-mount" id="ahrc-mount" value="' + enc(state.mountpoint || '') + '"'
+            + ' spellcheck="false" placeholder="' + enc('/mnt/anas-ahr/' + (state.name || '<name>')) + '"'
+            + ' title="' + enc(t('Optional. Absolute path; /mnt/pve is reserved for PVE. Empty = the default shown.')) + '"'
+            + ' style="font:inherit;color:var(--anas-ink);padding:5px 8px;'
+            + 'border-radius:8px;border:1px solid var(--anas-card-edge);'
+            + 'background:linear-gradient(var(--anas-card-top),var(--anas-card-bot));'
+            + 'outline:none;width:220px">'
             + '<span id="ahrc-tiers" style="display:inline-flex;gap:6px">'
             + tierButtonHtml(state, 'ahr1') + tierButtonHtml(state, 'ahr2') + '</span>'
             + '<span style="flex:1"></span>'
@@ -539,11 +563,29 @@
     function wireStatic(state) {
         var root = state.root;
         var nameInput = root.querySelector('#ahrc-name');
+        var mountInput = root.querySelector('#ahrc-mount');
         if (nameInput) {
             nameInput.addEventListener('input', function () {
                 state.name = nameInput.value;
                 nameInput.style.borderColor = nameValid(state.name)
                     ? 'var(--anas-card-edge)' : 'var(--anas-danger)';
+                // Keep the mountpoint placeholder tracking the default.
+                if (mountInput) {
+                    mountInput.placeholder = '/mnt/anas-ahr/' + (state.name || '<name>');
+                }
+                syncCreateButton(state);
+            });
+        }
+        if (mountInput) {
+            mountInput.addEventListener('input', function () {
+                state.mountpoint = mountInput.value.replace(/\s+/g, '');
+                // Optional field: empty = default. When set it must be an
+                // absolute path outside PVE's namespace (daemon re-validates).
+                var v = state.mountpoint;
+                var bad = v !== '' && (v.charAt(0) !== '/' || v === '/'
+                    || v === '/mnt/pve' || v.indexOf('/mnt/pve/') === 0);
+                mountInput.style.borderColor = bad ? 'var(--anas-danger)' : 'var(--anas-card-edge)';
+                state.mountBad = bad;
                 syncCreateButton(state);
             });
         }
@@ -554,14 +596,18 @@
 
     function commit(state) {
         var ids = selectedIds(state);
-        if (!ids.length || !nameValid(state.name)) {
+        if (!ids.length || !nameValid(state.name) || state.mountBad) {
             return;
+        }
+        var body = { name: state.name, tier: state.tier, disks: ids };
+        if (state.mountpoint) {
+            body.mountpoint = state.mountpoint;
         }
         ANAS.confirmAndRun({
             node: state.node,
             method: 'post',
             path: '/ahr',
-            body: { name: state.name, tier: state.tier, disks: ids },
+            body: body,
             view: state.win,
             confirmTitle: 'Create Hybrid RAID pool',
             // The daemon's 409 warnings list EVERY disk that will be wiped;

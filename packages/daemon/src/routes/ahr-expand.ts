@@ -288,6 +288,9 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       after: bundle.after,
       steps: bundle.plan.steps,
       warnings: bundle.plan.preview.warnings,
+      // The resulting band layout — the wizard renders the same banded disk
+      // bars as the create composer (§6.3 before→after visualization).
+      bands: bundle.plan.preview.bands,
     } }
   })
 

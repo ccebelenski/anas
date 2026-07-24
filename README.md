@@ -3,10 +3,11 @@
 **TrueNAS-style storage management for Proxmox VE, inside the Proxmox web UI.**
 
 ANAS adds the storage management layer that Proxmox's native UI doesn't cover:
-ZFS pools, datasets, snapshots and replication, SMB/NFS shares, and share
-security — presented as native panels injected into the PVE web UI itself (the
-same model Proxmox uses for Ceph). There is no separate web app to visit and no
-separate login: you use your existing PVE session.
+ZFS pools, datasets, snapshots and replication, SMB/NFS shares, share security,
+file backup to PBS, and **Hybrid RAID pools that mix drive sizes and grow one
+disk at a time** — presented as native panels injected into the PVE web UI
+itself (the same model Proxmox uses for Ceph). There is no separate web app to
+visit and no separate login: you use your existing PVE session.
 
 Think TrueNAS, but purpose-built to **complement** Proxmox rather than replace it.
 
@@ -22,6 +23,18 @@ Think TrueNAS, but purpose-built to **complement** Proxmox rather than replace i
   network throughput)
 - **ZFS pools** — create/import/export/destroy, scrub, topology view with
   per-bay disk health, device errors, properties
+- **Hybrid RAID (AHR)** — Synology-SHR-style pools from **mismatched disk
+  sizes**, using every drive's full height (a 12 TB next to 8 TBs contributes
+  all 12, not 8): disks are sliced into size-matched bands, each band is its
+  own md RAID5/6 array, LVM concatenates them under one btrfs filesystem
+  (checksums + scrub; redundancy always lives in md, never btrfs-RAID).
+  **Grow-as-you-buy online expansion** — add or live-replace one disk at a
+  time while the pool stays mounted; a live layout preview shows exactly what
+  each disk combination yields (and names any capacity that stays locked
+  until a matching disk arrives) before you commit. Expansion is a resumable
+  multi-layer job: power loss mid-reshape is survivable, interrupted runs
+  resume or abandon cleanly, and md events land in PVE's own notification
+  system
 - **Datasets** — create/manage, quotas, compression, permissions/ACLs, a
   layered access editor
 - **Snapshots** — create, rollback (gated), clone, destroy
@@ -33,6 +46,12 @@ Think TrueNAS, but purpose-built to **complement** Proxmox rather than replace i
 - **NFS exports** — same treatment for `/etc/exports`
 - **Share users/groups** — Samba user management for share access (no
   role/permission system — PVE owns identity)
+- **Mounts** — client-side NFS/CIFS mounts with surgical fstab persistence
+  (credentials in root-only files, never on a command line); local and
+  PVE-owned mounts inventoried read-only
+- **File backup (PBS)** — back up shares, datasets, or any mounted path to a
+  Proxmox Backup Server with `proxmox-backup-client` (dedup, encryption,
+  retention), ZFS-snapshot-consistent where the source supports it
 - **Disk health** — SMART + ZFS fused per-disk status
 
 ## How it's built (the guest philosophy)
@@ -60,6 +79,8 @@ ANAS treats your system as the source of truth and itself as a **guest**:
 - Proxmox VE node (single node or cluster)
 - Node.js ≥ 20 (installer can provide via `--install-deps`)
 - ZFS ≥ 2.2 (ANAS uses `zpool`'s JSON output)
+- `mdadm` + `btrfs-progs` for Hybrid RAID (the installer adds them — PVE
+  doesn't ship either)
 - Optional per-protocol: `samba` (SMB), `nfs-kernel-server` (NFS)
 
 ## Install

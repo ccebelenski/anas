@@ -305,7 +305,15 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
           }
         : undefined
 
-      const heightBytes = Math.max(0, ...entry.mdstat.members.map(m => lsblk.partsByKernel.get(m.device)?.size ?? 0))
+      // md semantics: the SMALLEST member slice defines the band — a member
+      // whose topmost partition spilled past the boundary (geometry clamp on
+      // a raw tail, e.g. a 2.5 G disk's 1 GiB band-2 slice) must not inflate
+      // the band height (live catch: it pushed derived boundaries past every
+      // disk and blanked the banded-layout bars).
+      const memberSizes = entry.mdstat.members
+        .map(m => lsblk.partsByKernel.get(m.device)?.size ?? 0)
+        .filter(s => s > 0)
+      const heightBytes = memberSizes.length ? Math.min(...memberSizes) : 0
       return {
         device: `/dev/md/${poolName}-r${entry.band}` as AhrArray['device'],
         band: entry.band,
@@ -314,6 +322,8 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
         members,
         state,
         ...(sync ? { sync } : {}),
+        // Transient convenience only — never persisted or keyed on (GT-2).
+        kernelName: entry.mdstat.kernelName,
       }
     })
 
@@ -467,6 +477,7 @@ export async function readAhrPools(executor: CommandExecutor): Promise<AhrPool[]
       // When unmounted there is no mountpoint to report; the LV device path is
       // the honest "where the filesystem lives" answer (never fabricated).
       mountpoint: mount?.target ?? `/dev/${poolName}/${lvName}`,
+      mounted: mount != null,
       disks,
       arrays,
       vg: {

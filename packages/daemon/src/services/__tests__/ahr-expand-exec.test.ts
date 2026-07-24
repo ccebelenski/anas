@@ -219,6 +219,7 @@ function mkPool(): AhrPool {
     name: 'tank',
     ahrType: 'ahr1',
     mountpoint: '/mnt/anas-ahr/tank',
+    mounted: true,
     disks: [],
     arrays: [
       { device: '/dev/md/tank-r1', band: 1, level: 'raid5', heightBytes: 2 * GIB, members: [member(X, '1'), member(Y, '1'), member(Z, '1')], state: 'clean' },
@@ -659,7 +660,9 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
 
       const muts = mutatingCalls(executor).map(c => [c.command, ...c.args])
       assert.deepEqual(muts, [
-        [SGDISK, '-n', '1:1M:0', '-t', '1:FD00', '-c', '1:tank-d4-b1', `/dev/disk/by-id/${N}`],
+        // Exact size — N's raw leaves room past the rounded boundary; the
+        // §2.5 slack stays unpartitioned (no clamp-to-end spill).
+        [SGDISK, '-n', '1:1M:+2047M', '-t', '1:FD00', '-c', '1:tank-d4-b1', `/dev/disk/by-id/${N}`],
         [MDADM, '/dev/md127', '--add', `/dev/disk/by-id/${N}-part1`],
         [MDADM, '/dev/md127', '--replace', '/dev/sdq1', '--with', `/dev/disk/by-id/${N}-part1`],
         [MDADM, '/dev/md127', '--remove', '/dev/sdq1'],

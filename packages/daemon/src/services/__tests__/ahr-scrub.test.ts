@@ -22,6 +22,7 @@ function pool(mountpoint = MOUNTPOINT): AhrPool {
     name: 't2',
     ahrType: 'ahr1',
     mountpoint,
+    mounted: !mountpoint.startsWith('/dev/'),
     disks: [
       { id: SMALL, sizeBytes: 2 * GIB, usableBytes: 2 * GIB, model: null, serial: null, role: 'member', partitions: [{ device: `/dev/disk/by-id/${SMALL}-part1`, band: 1, sizeBytes: GIB }] },
       { id: BIG, sizeBytes: 3 * GIB, usableBytes: 3 * GIB, model: null, serial: null, role: 'member', partitions: [{ device: `/dev/disk/by-id/${BIG}-part1`, band: 1, sizeBytes: GIB }] },

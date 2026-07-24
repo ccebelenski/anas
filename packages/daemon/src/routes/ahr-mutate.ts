@@ -3,10 +3,12 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
-import { AhrCreateRequest, PoolName } from '@anas/shared'
+import { AhrCreateRequest, AhrMountpointRequest, PoolName } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
+import { hasMount } from '../parsers/fstab.js'
+import { readConfig } from '../services/config-writer.js'
 import { confirmGate } from '../safety/gate.js'
-import { createAhrPool } from '../services/ahr-create.js'
+import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
 import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
 import { scrubAhrPool } from '../services/ahr-scrub.js'
@@ -83,6 +85,28 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       return { error: { code: 'CONFLICT', message: `AHR pool '${req.name}' already exists` } }
     }
 
+    // Mountpoint override (§2.6): never in PVE's namespace, never a path that
+    // is already mounted or claimed in fstab — the pool must not shadow or
+    // fight anything that exists.
+    if (req.mountpoint !== undefined) {
+      const mp = req.mountpoint.replace(/\/+$/, '') || '/'
+      if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved — /mnt/pve belongs to PVE (§2.6) and / is not a pool mountpoint` } }
+      }
+      const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
+      const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
+      if (mounts.some(m => m.target === mp)) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` } }
+      }
+      if (hasMount(await readConfig(fstabPath), mp)) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` } }
+      }
+      req.mountpoint = mp
+    }
+
     // Resolve every disk against the live inventory — only status 'available'
     // is eligible (GT-12: these exclusions are safety-critical, not cosmetic).
     const inventory = await collectDisks(executor, diskIdentityCache)
@@ -136,12 +160,80 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
 
     const job = jobQueue.submit(
       'ahr.create',
-      { ...identity, params: { name: req.name, tier: req.tier, disks: req.disks } },
+      { ...identity, params: { name: req.name, tier: req.tier, disks: req.disks, mountpoint: req.mountpoint ?? null } },
       async updateProgress => createAhrPool(
         executor,
-        { name: req.name, tier: req.tier, disks: selected },
+        { name: req.name, tier: req.tier, disks: selected, mountpoint: req.mountpoint },
         updateProgress,
         { fstabPath, mdadmConfPath, mountBase },
+      ),
+    )
+    reply.code(202)
+    return { job }
+  })
+
+  // --- PUT /ahr/:name/mountpoint — the one mutable pool identity -------------
+  server.put<{ Params: { name: string } }>('/ahr/:name/mountpoint', async (request, reply) => {
+    const name = parsePoolName(request.params.name, reply)
+    if (!name)
+      return
+
+    const parsed = AhrMountpointRequest.safeParse(request.body ?? {})
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid mountpoint request: ${parsed.error.issues[0]?.message}` } }
+    }
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const pool = (await readAhrPools(executor)).find(p => p.name === name)
+    if (!pool) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
+    }
+
+    const mp = parsed.data.mountpoint.replace(/\/+$/, '') || '/'
+    if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${parsed.data.mountpoint}' is reserved — /mnt/pve belongs to PVE (§2.6) and / is not a pool mountpoint` } }
+    }
+    if (mp === pool.mountpoint) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `'${mp}' is already this pool's mountpoint` } }
+    }
+    const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
+    const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
+    if (mounts.some(m => m.target === mp)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `'${mp}' is already a mountpoint — pick an unused path` } }
+    }
+    if (hasMount(await readConfig(fstabPath), mp)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` } }
+    }
+
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'ahr.mountpoint',
+      params: { name, mountpoint: mp },
+      message: `Moving pool '${name}' from '${pool.mountpoint}' to '${mp}' briefly unmounts it`,
+      warnings: [
+        `Anything serving from '${pool.mountpoint}' (shares, backups, mounts) stops working until re-pointed at '${mp}'`,
+        pool.mounted ? 'The filesystem is unmounted during the move — open files will block it (retry after closing them)' : 'The pool is currently unmounted — only fstab is rewritten, then it mounts at the new path',
+      ],
+    })) {
+      return reply
+    }
+
+    const job = jobQueue.submit(
+      'ahr.mountpoint',
+      { ...identity, params: { name, mountpoint: mp } },
+      async updateProgress => changeAhrMountpoint(
+        executor,
+        { name: pool.name, mountpoint: pool.mountpoint, mounted: pool.mounted },
+        mp,
+        updateProgress,
+        { fstabPath },
       ),
     )
     reply.code(202)

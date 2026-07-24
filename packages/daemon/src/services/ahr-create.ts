@@ -5,7 +5,7 @@ import type { AhrBandSlice } from './ahr-geometry.js'
 import type { AhrLayoutDisk } from './ahr-layout.js'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import { addMount, hasMount } from '../parsers/fstab.js'
+import { addMount, hasMount, parseFstab, removeMount } from '../parsers/fstab.js'
 import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { floorToGranularity, planFreshLayout } from './ahr-layout.js'
@@ -47,6 +47,7 @@ const MKFS_BTRFS = '/usr/sbin/mkfs.btrfs'
 const UPDATE_INITRAMFS = '/usr/sbin/update-initramfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
 const MOUNT = '/usr/bin/mount'
+const UMOUNT = '/usr/bin/umount'
 
 /** Default base for pool mountpoints (§2.6: pool-scoped, never /mnt/pve). */
 export const DEFAULT_AHR_MOUNT_BASE = '/mnt/anas-ahr'
@@ -66,6 +67,8 @@ export interface AhrCreateSpec {
   tier: AhrType
   /** Route-validated 'available' disks (by-id + usable bytes). */
   disks: AhrLayoutDisk[]
+  /** Route-validated mountpoint override (default: <mountBase>/<name>). */
+  mountpoint?: string
 }
 
 export interface AhrCreateOptions {
@@ -131,7 +134,7 @@ export async function createAhrPool(
   // Deterministic disk ordinals (the `d<n>` of partition labels): ascending
   // rounded size, id as tie-break — the same order §2.1 sorts by.
   const disks = spec.disks
-    .map(d => ({ id: d.id, roundedBytes: floorToGranularity(d.usableBytes) }))
+    .map(d => ({ id: d.id, rawBytes: d.usableBytes, roundedBytes: floorToGranularity(d.usableBytes) }))
     .sort((a, b) => a.roundedBytes - b.roundedBytes || a.id.localeCompare(b.id))
 
   // --- Wipe + partition (GT-12: prior signatures are a hazard, not residue) --
@@ -154,6 +157,7 @@ export async function createAhrPool(
       poolName: name,
       diskNumber: i + 1,
       diskUsableBytes: disk.roundedBytes,
+      diskRawBytes: disk.rawBytes,
       slices,
     })
 
@@ -251,7 +255,7 @@ export async function createAhrPool(
   await run(executor, MKFS_BTRFS, ['-L', name, '-d', 'single', '-m', 'dup', lvPath])
 
   // --- Mountpoint + fstab persistence + mount ---------------------------------
-  const mountpoint = join(ahrMountBase(opts.mountBase), name)
+  const mountpoint = spec.mountpoint ?? join(ahrMountBase(opts.mountBase), name)
   updateProgress(`Mounting at ${mountpoint}`)
   await mkdir(mountpoint, { recursive: true })
   await editConfig(opts.fstabPath, (current) => {
@@ -273,4 +277,44 @@ export async function createAhrPool(
   )
 
   return { created: name, mountpoint, arrays: arrayNames }
+}
+
+/**
+ * Change a pool's mountpoint (route-validated: absolute, not reserved, no
+ * collisions). Brief service interruption at the old path: umount → surgical
+ * fstab rewrite → mount at the new path. The only mutable identity an AHR
+ * pool has — everything else (md names, VG/LV) is fixed at creation.
+ */
+export async function changeAhrMountpoint(
+  executor: CommandExecutor,
+  pool: { name: string, mountpoint: string, mounted: boolean },
+  newMountpoint: string,
+  updateProgress: (message: string) => void,
+  opts: { fstabPath: string },
+): Promise<{ mountpoint: string }> {
+  const { name } = pool
+  const lvPath = ahrLvPath(name)
+
+  if (pool.mounted) {
+    updateProgress(`Unmounting ${pool.mountpoint}`)
+    await run(executor, UMOUNT, ['--', pool.mountpoint])
+  }
+
+  updateProgress('Rewriting the fstab entry (surgical)')
+  await editConfig(opts.fstabPath, (current) => {
+    // The pool's line is found by mountpoint OR by LV spec (an unmounted or
+    // hand-edited pool still gets its line replaced, never duplicated).
+    const existing = parseFstab(current).find(e => e.mountpoint === pool.mountpoint || e.spec === lvPath)
+    const without = existing ? removeMount(current, existing.mountpoint) : current
+    return addMount(without, ahrFstabEntry(name, newMountpoint))
+  })
+  await run(executor, SYSTEMCTL, ['daemon-reload'])
+
+  updateProgress(`Mounting at ${newMountpoint}`)
+  await mkdir(newMountpoint, { recursive: true })
+  await run(executor, MOUNT, ['--', newMountpoint])
+  // The old mountpoint directory stays (plain umount semantics — the mounts
+  // feature's recorded decision).
+
+  return { mountpoint: newMountpoint }
 }

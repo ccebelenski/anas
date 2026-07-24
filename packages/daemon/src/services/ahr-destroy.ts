@@ -88,7 +88,7 @@ export async function destroyAhrPool(
   }
 
   // --- umount (only when actually mounted; the directory stays) --------------
-  const mountpoint = pool.mountpoint.startsWith('/dev/') ? null : pool.mountpoint
+  const mountpoint = pool.mounted ? pool.mountpoint : null
   const findmntRes = await executor.exec(FINDMNT, AHR_FINDMNT_ARGS)
   const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
   if (mountpoint && mounts.some(m => m.target === mountpoint)) {

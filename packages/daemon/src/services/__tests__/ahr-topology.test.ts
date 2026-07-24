@@ -59,7 +59,7 @@ describe('readAhrPools', () => {
     assert.equal(r1.state, 'clean')
     assert.equal(r1.members.length, 3)
     assert.ok(r1.members.every(m => m.memberState === 'in_sync'))
-    assert.equal(r1.heightBytes, 1072693248)
+    assert.equal(r1.heightBytes, 1072676352) // MIN member slice (md semantics) — the clamped member is larger
     assert.equal(r2.device, '/dev/md/ahr0-r2')
     assert.equal(r2.level, 'raid1')
     assert.equal(r2.members.length, 2)

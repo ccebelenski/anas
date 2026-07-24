@@ -1,7 +1,9 @@
 import type { FastifyInstance } from 'fastify'
+import type { AhrPool } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrLayoutPreviewRequest, PoolName } from '@anas/shared'
+import { readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { collectDisks } from './disks.js'
@@ -22,13 +24,26 @@ import { collectDisks } from './disks.js'
  */
 export async function ahrRoutes(
   server: FastifyInstance,
-  opts: { executor: CommandExecutor, diskIdentityCache: DiskIdentityCache },
+  opts: { executor: CommandExecutor, diskIdentityCache: DiskIdentityCache, intentDir?: string },
 ) {
-  const { executor, diskIdentityCache } = opts
+  const { executor, diskIdentityCache, intentDir } = opts
+
+  // Attach the live expansion intent (§6.2: 'halted' must surface Resume/
+  // Abandon loudly). Best-effort — a corrupt intent file must not take the
+  // read path down; the expansion routes surface it properly on use.
+  const withIntent = async (pool: AhrPool): Promise<AhrPool> => {
+    try {
+      const intent = await readIntent(pool.name, intentDir)
+      return intent ? { ...pool, expansion: intent } : pool
+    }
+    catch {
+      return pool
+    }
+  }
 
   // --- GET /ahr — list pools ----------------------------------------------
   server.get('/ahr', async () => {
-    return { data: await readAhrPools(executor) }
+    return { data: await Promise.all((await readAhrPools(executor)).map(withIntent)) }
   })
 
   // --- GET /ahr/:name — full pool detail ----------------------------------
@@ -43,7 +58,7 @@ export async function ahrRoutes(
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${nameParsed.data}' not found` } }
     }
-    return { data: pool }
+    return { data: await withIntent(pool) }
   })
 
   // --- POST /ahr/layout/preview — dry-run, NO mutation ---------------------

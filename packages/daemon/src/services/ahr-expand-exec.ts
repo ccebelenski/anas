@@ -353,7 +353,7 @@ export async function ensureDiskPartitions(
     return { created: 0 }
 
   const diskNumber = await resolveDiskNumber(executor, poolName, disk)
-  const specs = planDiskPartitions({ poolName, diskNumber, diskUsableBytes: usable, slices })
+  const specs = planDiskPartitions({ poolName, diskNumber, diskUsableBytes: usable, diskRawBytes: disk.sizeBytes, slices })
   const missing = specs.filter((spec) => {
     if (disk.parts.some(p => p.partlabel !== null && bandLabelRe(poolName, spec.band).test(p.partlabel)))
       return false // slice already carved (any d-number)

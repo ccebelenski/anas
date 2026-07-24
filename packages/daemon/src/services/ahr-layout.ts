@@ -126,11 +126,14 @@ function levelFor(tier: AhrType, members: number): ArrayLevel | null {
   return members >= 4 ? 'raid6' : null
 }
 
-/** Human-readable byte count for warnings (whole GiB/TiB where exact). */
+/**
+ * Human-readable byte count for warnings. TB-scale values render in TiB (two
+ * decimals) — "3.64 TiB pending", never "3724 GiB" (polish finding, 11.8).
+ */
 function fmtBytes(bytes: number): string {
   const gib = bytes / AHR_SIZE_GRANULARITY_BYTES
-  if (gib >= 1024 && Number.isInteger(gib / 1024))
-    return `${gib / 1024} TiB`
+  if (gib >= 1024)
+    return `${Math.round((gib / 1024) * 100) / 100} TiB`
   return `${Math.round(gib * 100) / 100} GiB`
 }
 

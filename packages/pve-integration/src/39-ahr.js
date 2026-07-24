@@ -364,8 +364,16 @@
     }
 
     // Pool advisories from the daemon, rendered verbatim as warning callouts.
+    // A live expansion intent (§6.2) leads the list: halted = loud, running =
+    // informational (the jobs strip carries progress).
     function advisoriesHtml(d) {
-        var adv = d.advisories || [];
+        var adv = (d.advisories || []).slice();
+        var exp = d.expansion;
+        if (exp && exp.state === 'halted') {
+            adv.unshift(t('An expansion is HALTED mid-flight — the pool is stable at its current layout. Use Resume (safe, re-computes and continues) or Abandon in the toolbar.'));
+        } else if (exp && exp.state === 'running') {
+            adv.unshift(t('An expansion is running — the pool stays online; progress is in the job.'));
+        }
         if (!adv.length) {
             return '';
         }
@@ -562,12 +570,89 @@
             + '</div>';
     }
 
+    // Reconstruct the composer-style band map from live pool state: arrays
+    // are the protected bands (boundaries = cumulative heights, bottom-up);
+    // any disk capacity above the top array boundary renders as an
+    // unprotected pseudo-band (the §2.4 wasted-top-slice picture).
+    function poolBands(d) {
+        var arrays = ((d && d.arrays) || []).slice();
+        if (!arrays.length) {
+            return [];
+        }
+        arrays.sort(function (a, b) { return (a.band || 0) - (b.band || 0); });
+        // Partition heights run slightly under the nominal band (1 MiB start,
+        // GPT tail) — snap near-GiB heights up so boundaries land on the clean
+        // §2.5 grid and rounding slivers never render as phantom bands.
+        var GIB = 1073741824;
+        var SNAP_SLACK = 64 * 1048576;
+        function snapUp(bytes) {
+            var rem = bytes % GIB;
+            return (rem > 0 && (GIB - rem) <= SNAP_SLACK) ? (bytes - rem + GIB) : bytes;
+        }
+        var bands = [];
+        var start = 0;
+        var i;
+        for (i = 0; i < arrays.length; i++) {
+            var a = arrays[i];
+            var h = snapUp(Number(a.heightBytes) || 0);
+            var mc = (a.members || []).length;
+            bands.push({
+                band: a.band,
+                range: { startBytes: start, endBytes: start + h },
+                memberCount: mc,
+                level: a.level,
+                heightBytes: h,
+                usableBytes: h * Math.max(0, mc - (a.level === 'raid6' ? 2 : 1)),
+                'protected': true,
+            });
+            start += h;
+        }
+        var disks = (d && d.disks) || [];
+        var tallest = 0;
+        var above = 0;
+        for (i = 0; i < disks.length; i++) {
+            var s = Number(disks[i].usableBytes) || 0;
+            if (s > tallest) {
+                tallest = s;
+            }
+            if (s > start) {
+                above++;
+            }
+        }
+        if (tallest > start + SNAP_SLACK && above > 0) {
+            bands.push({
+                band: arrays.length ? (arrays[arrays.length - 1].band + 1) : 1,
+                range: { startBytes: start, endBytes: tallest },
+                memberCount: above,
+                level: null,
+                heightBytes: tallest - start,
+                usableBytes: 0,
+                'protected': false,
+            });
+        }
+        return bands;
+    }
+
+    function bandBarsSection(d) {
+        if (!(ANAS.ahr && typeof ANAS.ahr.bandBarsHtml === 'function')) {
+            return '';
+        }
+        var disks = ((d && d.disks) || []).map(function (x) {
+            return { id: x.id, size: Number(x.usableBytes) || 0 };
+        });
+        var html = ANAS.ahr.bandBarsHtml(poolBands(d), disks);
+        return html
+            ? ('<div style="' + SEC + '">' + enc(t('Banded layout')) + '</div>' + html)
+            : '';
+    }
+
     function detailHtml(d) {
         return '<div class="anas-ahr-detail-body" style="padding:12px 14px;color:var(--anas-ink);'
             + 'font:12.5px/1.45 -apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif">'
             + headerHtml(d)
             + advisoriesHtml(d)
             + pendingHtml(d)
+            + bandBarsSection(d)
             + '<div style="' + SEC + '">' + enc(t('Capacity')) + '</div>'
             + capacityHtml(d)
             + '<div style="' + SEC + '">' + enc(t('Layered stack')) + '</div>'
@@ -578,65 +663,128 @@
             + '</div>';
     }
 
-    function detailHint() {
-        return '<div style="padding:14px;color:var(--anas-muted);font-size:12.5px">'
-            + enc(t('Select a pool to see its layered stack: disks → band arrays → volume → filesystem.'))
-            + '</div>';
-    }
-
     // ---- data load ----------------------------------------------------------
 
     function gridOf(view) {
         return view ? view.down('#ahrGrid') : null;
-    }
-    function detailOf(view) {
-        return view ? view.down('#ahrDetail') : null;
     }
     function selectedPool(grid) {
         var sel = grid ? grid.getSelection() : null;
         return (sel && sel.length) ? sel[0].get('name') : null;
     }
 
-    function setDetailHtml(view, html) {
-        var panel = detailOf(view);
+    // On-demand Details window (the backup-view idiom — the grid owns the full
+    // height; vertical space is the scarce axis). Snapshot semantics: fetches
+    // on open, the Reload button is the only refresh.
+    function loadDetailInto(win, node, name) {
+        var panel = win ? win.down('#ahrDetailBody') : null;
         if (!panel || panel.destroyed || panel.destroying) {
             return;
         }
-        try {
-            panel.setHtml(html);
-        } catch (e) {
-            // non-fatal
-        }
-    }
-
-    function loadDetail(view, node, name) {
-        if (!name) {
-            setDetailHtml(view, detailHint());
-            return;
-        }
+        panel.setHtml('<div style="padding:14px;color:var(--anas-muted);font-size:12.5px">'
+            + enc(t('Loading…')) + '</div>');
         ANAS.api.get(node, '/ahr/' + encodeURIComponent(name)).then(function (res) {
-            if (!view || view.destroyed || view.destroying) {
+            if (!panel || panel.destroyed || panel.destroying) {
                 return;
             }
             var d = res && res.data;
-            if (!d) {
-                setDetailHtml(view, detailHint());
-                return;
-            }
             try {
-                setDetailHtml(view, detailHtml(d));
+                panel.setHtml(d ? detailHtml(d) : '');
             } catch (e) {
                 ANAS.warn('ahr detail render failed: ' + ANAS.errText(e));
-                setDetailHtml(view, detailHint());
             }
         }, function (err) {
-            if (!view || view.destroyed || view.destroying) {
-                return;
+            if (panel && !panel.destroyed && !panel.destroying) {
+                panel.setHtml('<div style="padding:14px;color:var(--anas-danger);font-size:12.5px">'
+                    + enc(t('Failed to load pool detail') + ': ' + ANAS.errText(err)) + '</div>');
             }
-            ANAS.warn('ahr detail load failed: ' + ANAS.errText(err));
-            setDetailHtml(view, '<div style="padding:14px;color:var(--anas-danger);font-size:12.5px">'
-                + enc(t('Failed to load pool detail') + ': ' + ANAS.errText(err)) + '</div>');
         });
+    }
+
+    // Change the pool's mountpoint (the ONE mutable pool identity). Prompt
+    // prefilled with the current path; the daemon validates (reserved paths,
+    // collisions) and confirm-gates the brief unmount.
+    function changeMountpoint(win, node, name) {
+        ANAS.api.get(node, '/ahr/' + encodeURIComponent(name)).then(function (res) {
+            var current = (res && res.data && res.data.mountpoint) || '';
+            Ext.Msg.prompt(t('Change mount'), t('New mountpoint for') + ' <b>' + enc(name) + '</b>:',
+                function (btn, value) {
+                    if (btn !== 'ok' || !value || value === current) {
+                        return;
+                    }
+                    ANAS.confirmAndRun({
+                        node: node,
+                        method: 'put',
+                        path: '/ahr/' + encodeURIComponent(name) + '/mountpoint',
+                        body: { mountpoint: value },
+                        view: win,
+                        confirmTitle: 'Change mount',
+                        confirmIntro: t('Moving') + ' <b>' + enc(name) + '</b> '
+                            + t('to') + ' <b>' + enc(value) + '</b>:',
+                        failTitle: 'Change mount failed',
+                        successMsg: t('Mountpoint changed') + ': ' + value,
+                        onComplete: function () {
+                            if (win && !win.destroyed && !win.destroying) {
+                                loadDetailInto(win, node, name);
+                            }
+                            if (ANAS.ahr && typeof ANAS.ahr.reload === 'function') {
+                                var grid = Ext.ComponentQuery.query('#ahrGrid')[0];
+                                if (grid) {
+                                    ANAS.ahr.reload(grid, node);
+                                }
+                            }
+                        },
+                    });
+                }, null, false, current);
+        }, function (err) {
+            Ext.Msg.alert(t('Change mount'), ANAS.errText(err));
+        });
+    }
+
+    function openPoolDetailWindow(node, name) {
+        if (!name) {
+            return;
+        }
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-ahr-detail',
+                title: t('Hybrid RAID pool') + ': ' + name,
+                modal: false,
+                width: 780,
+                height: 540,
+                resizable: true,
+                layout: 'fit',
+                items: [{
+                    xtype: 'panel',
+                    itemId: 'ahrDetailBody',
+                    cls: 'anas-ahr-detail',
+                    border: false,
+                    scrollable: true,
+                    html: '',
+                }],
+                buttons: [
+                    {
+                        text: t('Change mount…'),
+                        cls: 'anas-btn-ahr-remount',
+                        iconCls: 'fa fa-folder-open-o',
+                        handler: function () { changeMountpoint(win, node, name); },
+                    },
+                    '->',
+                    {
+                        text: t('Reload'),
+                        cls: 'anas-btn-ahr-detail-reload',
+                        iconCls: 'fa fa-refresh',
+                        handler: function () { loadDetailInto(win, node, name); },
+                    },
+                    { text: t('Close'), handler: function () { win.close(); } },
+                ],
+            });
+            win.show();
+            loadDetailInto(win, node, name);
+        } catch (e) {
+            ANAS.warn('ahr detail window failed: ' + ANAS.errText(e));
+        }
     }
 
     function loadPools(grid, node) {
@@ -686,13 +834,68 @@
     function updateButtons(grid) {
         var sel = grid.getSelection();
         var has = sel && sel.length > 0;
-        var ids = ['expand', 'replace', 'scrub', 'destroy'];
+        var ids = ['details', 'expand', 'replace', 'scrub', 'destroy'];
         for (var i = 0; i < ids.length; i++) {
             var btn = grid.down('#' + ids[i]);
             if (btn) {
                 btn.setDisabled(!has);
             }
         }
+        // Resume/Abandon only exist for a halted expansion (§6.2) — and while
+        // one is halted, a fresh Expand/Replace would 409 anyway, so swap them.
+        var exp = has && sel[0].get('expansion');
+        var halted = !!(exp && exp.state === 'halted');
+        var resumeBtn = grid.down('#resumeExpand');
+        var abandonBtn = grid.down('#abandonExpand');
+        if (resumeBtn) {
+            resumeBtn.setHidden(!halted);
+        }
+        if (abandonBtn) {
+            abandonBtn.setHidden(!halted);
+        }
+    }
+
+    function resumeExpansion(grid, node) {
+        var pool = selectedPool(grid);
+        if (!pool) {
+            return;
+        }
+        // Resume is recompute-and-continue (§5.3) — plain 202, no confirm.
+        ANAS.api.post(node, '/ahr/' + encodeURIComponent(pool) + '/expand/resume', {}).then(function (res) {
+            var job = res && res.job;
+            ANAS.toast(t('Expansion resumed on') + ' ' + pool);
+            if (job && job.id) {
+                ANAS.pollJob(node, job.id, {
+                    onDone: function () { loadPools(grid, node); },
+                });
+            }
+        }, function (err) {
+            if (!apiMissing(err, t('Expansion resume'))) {
+                Ext.Msg.alert(t('Resume expansion'), ANAS.errText(err));
+            }
+        });
+    }
+
+    function abandonExpansion(grid, node) {
+        var pool = selectedPool(grid);
+        if (!pool) {
+            return;
+        }
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/ahr/' + encodeURIComponent(pool) + '/expand/abandon',
+            body: {},
+            view: grid,
+            confirmTitle: 'Abandon expansion',
+            confirmIntro: t('Abandoning the halted expansion of') + ' <b>' + enc(pool) + '</b> '
+                + t('keeps the pool at its current layout — completed growth stays, nothing is rolled back:'),
+            failTitle: 'Abandon failed',
+            successMsg: t('Expansion abandoned') + ': ' + pool,
+            onComplete: function () {
+                loadPools(grid, node);
+            },
+        });
     }
 
     // Expose for the composer (mirror of ANAS.pools.reload).
@@ -767,10 +970,6 @@
             successMsg: t('Pool destroyed') + ': ' + pool,
             onComplete: function () {
                 loadPools(grid, node);
-                var view = grid.up('#ahrView');
-                if (view) {
-                    setDetailHtml(view, detailHint());
-                }
             },
         });
     }
@@ -780,16 +979,28 @@
     // Render an expansion plan (POST /ahr/:name/expand/plan response — before →
     // after capacity, the ordered step list, warnings verbatim). Coded to the
     // documented shape; every field is optional-guarded.
-    function planHtml(plan) {
+    function planHtml(plan, diskList) {
         var html = '';
+        // The resulting layout, drawn with the composer's banded disk bars
+        // (shared renderer — the same picture, before your eyes commit).
+        if (plan && plan.bands && plan.bands.length && diskList && diskList.length
+            && ANAS.ahr && typeof ANAS.ahr.bandBarsHtml === 'function') {
+            html += '<div style="' + SEC + '">' + enc(t('Resulting layout')) + '</div>'
+                + ANAS.ahr.bandBarsHtml(plan.bands, diskList);
+        }
         var before = plan && plan.before;
         var after = plan && plan.after;
         if (before && after) {
             var gain = (Number(after.usableBytes) || 0) - (Number(before.usableBytes) || 0);
-            html += '<div style="' + SEC + ';margin-top:4px">' + enc(t('Capacity')) + '</div>'
+            // Plan numbers are band math (estimates): the live result lands
+            // slightly lower after md metadata / LVM extent / btrfs overheads.
+            html += '<div style="' + SEC + ';margin-top:4px">' + enc(t('Capacity (estimated)')) + '</div>'
                 + capRow(t('Usable now'), fmtBytes(before.usableBytes))
-                + capRow(t('Usable after'), fmtBytes(after.usableBytes), true)
-                + capRow(t('Change'), (gain >= 0 ? '+' : '−') + fmtBytes(Math.abs(gain)));
+                + capRow(t('Usable after'), '~' + fmtBytes(after.usableBytes), true)
+                + capRow(t('Change'), (gain >= 0 ? '+~' : '−~') + fmtBytes(Math.abs(gain)))
+                + '<div style="color:var(--anas-muted);font-size:11px;margin-top:2px">'
+                + enc(t('Final sizes land slightly lower once metadata overheads are paid.'))
+                + '</div>';
             if (Number(after.pendingBytes) > 0) {
                 html += '<div style="margin-top:6px;color:var(--anas-warn);font-size:12px"><b>'
                     + enc(fmtBytes(after.pendingBytes) + ' ' + t('stays pending (locked)'))
@@ -865,6 +1076,8 @@
         }
         var win = null;
         var planBody = null;
+        var formAvail = [];
+        var formMembers = [];
 
         function bodyEl() {
             var p = win ? win.down('#ahrExpandBody') : null;
@@ -872,6 +1085,8 @@
         }
 
         function renderForm(avail, members) {
+            formAvail = avail || [];
+            formMembers = members || [];
             var html = '<div style="padding:12px;font-size:12.5px;color:var(--anas-ink)">'
                 + '<div style="margin-bottom:8px">'
                 + '<label style="margin-right:16px"><input type="radio" name="ahrx-mode" value="add" checked> '
@@ -944,7 +1159,27 @@
                     var root = bodyEl();
                     var target = root ? root.querySelector('#ahrx-plan') : null;
                     if (target) {
-                        target.innerHTML = planHtml(res && res.data);
+                        // Post-expansion disk set for the band-bar picture:
+                        // members ± the selected add/replace disks.
+                        var diskList = [];
+                        var di;
+                        var byId = {};
+                        for (di = 0; di < formAvail.length; di++) {
+                            byId[formAvail[di].id] = formAvail[di];
+                        }
+                        var oldId = body.replace ? body.replace.oldDiskId : null;
+                        for (di = 0; di < formMembers.length; di++) {
+                            if (formMembers[di].id !== oldId) {
+                                diskList.push(formMembers[di]);
+                            }
+                        }
+                        var addIds = body.addDisks || (body.replace ? [body.replace.newDiskId] : []);
+                        for (di = 0; di < addIds.length; di++) {
+                            if (byId[addIds[di]]) {
+                                diskList.push(byId[addIds[di]]);
+                            }
+                        }
+                        target.innerHTML = planHtml(res && res.data, diskList);
                     }
                     var exec = win.down('#ahrExpandExec');
                     if (exec) {
@@ -971,16 +1206,21 @@
                 method: 'post',
                 path: '/ahr/' + encodeURIComponent(pool) + '/expand',
                 body: planBody,
-                view: win,
+                view: grid,
                 confirmTitle: 'Expand pool',
                 confirmIntro: t('Expanding') + ' <b>' + enc(pool) + '</b> '
                     + t('starts a multi-hour, non-cancellable reshape:'),
                 failTitle: 'Expand failed',
                 successMsg: t('Expansion started on') + ' ' + pool,
-                onComplete: function () {
+                // The reshape runs for hours — close the dialog the moment the
+                // daemon accepts the job; the grid's state pill carries it on.
+                onSubmitted: function () {
                     if (win && !win.destroyed && !win.destroying) {
                         win.close();
                     }
+                    loadPools(grid, node);
+                },
+                onComplete: function () {
                     loadPools(grid, node);
                 },
             });
@@ -1111,17 +1351,22 @@
                 path: '/ahr/' + encodeURIComponent(pool) + '/disk/'
                     + encodeURIComponent(oldId) + '/replace',
                 body: { newDiskId: newId },
-                view: win,
+                view: grid,
                 confirmTitle: 'Replace disk',
                 confirmIntro: t('Replacing') + ' <b>' + enc(oldId) + '</b> '
                     + t('with') + ' <b>' + enc(newId) + '</b> '
                     + t('copies every band it carries onto the new disk:'),
                 failTitle: 'Replace failed',
                 successMsg: t('Replacement started on') + ' ' + pool,
-                onComplete: function () {
+                // Close on ACCEPT (202) — the copy runs for a while; the grid
+                // state pill and job strip carry it from here.
+                onSubmitted: function () {
                     if (win && !win.destroyed && !win.destroying) {
                         win.close();
                     }
+                    loadPools(grid, node);
+                },
+                onComplete: function () {
                     loadPools(grid, node);
                 },
             });
@@ -1231,10 +1476,12 @@
     function ahrView(node) {
         var store = Ext.create('Ext.data.Store', {
             fields: [
-                'name', 'ahrType', 'state', 'mountpoint',
+                'name', 'ahrType', 'state', 'mountpoint', 'mounted',
                 // Nested structures kept verbatim (auto fields): renderers and
                 // the detail panel read them directly.
                 'capacity', 'arrays', 'disks', 'advisories', 'vg', 'lv',
+                // Live expansion intent (§6.2) — drives Resume/Abandon.
+                'expansion',
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
@@ -1286,6 +1533,22 @@
                             renderer: renderUsable,
                         },
                         {
+                            text: t('Mount'),
+                            dataIndex: 'mountpoint',
+                            flex: 1,
+                            minWidth: 180,
+                            sortable: false,
+                            menuDisabled: true,
+                            renderer: function (v, meta, rec) {
+                                var mounted = rec && rec.get('mounted');
+                                var path = enc(v || '');
+                                return mounted
+                                    ? path
+                                    : path + ' <span style="color:var(--anas-warn);font-size:11px">('
+                                        + enc(t('not mounted')) + ')</span>';
+                            },
+                        },
+                        {
                             text: t('Activity'),
                             dataIndex: 'arrays',
                             width: 240,
@@ -1320,6 +1583,16 @@
                                 } catch (e) {
                                     ANAS.warn('ahr composer open failed: ' + ANAS.errText(e));
                                 }
+                            },
+                        },
+                        {
+                            text: t('Details'),
+                            itemId: 'details',
+                            cls: 'anas-btn-ahr-details',
+                            iconCls: 'fa fa-info-circle',
+                            disabled: true,
+                            handler: function (btn) {
+                                openPoolDetailWindow(node, selectedPool(btn.up('grid')));
                             },
                         },
                         {
@@ -1362,26 +1635,41 @@
                                 destroyPool(btn.up('grid'), node);
                             },
                         },
+                        // §6.2: a halted expansion surfaces Resume/Abandon
+                        // loudly — hidden unless the selected pool carries a
+                        // halted AhrExpansionIntent.
+                        {
+                            text: t('Resume expansion'),
+                            itemId: 'resumeExpand',
+                            cls: 'anas-btn-ahr-resume',
+                            iconCls: 'fa fa-play-circle',
+                            hidden: true,
+                            handler: function (btn) {
+                                resumeExpansion(btn.up('grid'), node);
+                            },
+                        },
+                        {
+                            text: t('Abandon expansion'),
+                            itemId: 'abandonExpand',
+                            cls: 'anas-btn-ahr-abandon',
+                            iconCls: 'fa fa-times-circle',
+                            hidden: true,
+                            handler: function (btn) {
+                                abandonExpansion(btn.up('grid'), node);
+                            },
+                        },
                     ],
                     listeners: {
-                        selectionchange: function (selModel, selected) {
-                            var grid = this;
-                            updateButtons(grid);
-                            var view = grid.up('#ahrView');
-                            var rec = (selected && selected.length) ? selected[0] : null;
-                            loadDetail(view, node, rec ? rec.get('name') : null);
+                        selectionchange: function () {
+                            updateButtons(this);
+                        },
+                        // Row double-click = Details (matches the other views).
+                        itemdblclick: function (grid, rec) {
+                            if (rec) {
+                                openPoolDetailWindow(node, rec.get('name'));
+                            }
                         },
                     },
-                },
-                {
-                    xtype: 'panel',
-                    itemId: 'ahrDetail',
-                    cls: 'anas-ahr-detail',
-                    height: 380,
-                    border: false,
-                    scrollable: true,
-                    bodyStyle: 'border-top:1px solid var(--anas-line,#dfe3e8);',
-                    html: detailHint(),
                 },
             ],
             listeners: {

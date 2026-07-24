@@ -83,6 +83,30 @@ describe('AHR mutation routes — validation & 404s (stock dev mock)', () => {
     assert.equal(res.statusCode, 401)
   })
 
+  it('POST /v1/ahr — mountpoint override: /mnt/pve namespace and relative paths are rejected', async () => {
+    for (const mountpoint of ['/mnt/pve', '/mnt/pve/x', '/']) {
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'newpool', tier: 'ahr1', disks: ['ata-x'], mountpoint }) })
+      assert.equal(res.statusCode, 400, mountpoint)
+      assert.equal(res.json().error.code, 'VALIDATION_ERROR', mountpoint)
+    }
+    const rel = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'newpool', tier: 'ahr1', disks: ['ata-x'], mountpoint: 'not/absolute' }) })
+    assert.equal(rel.statusCode, 400)
+  })
+
+  it('PUT /v1/ahr/:name/mountpoint — 404 unknown pool; reserved and same-path rejected; confirm shape on a valid move', async () => {
+    const gone = await server.inject({ method: 'PUT', url: '/v1/ahr/nosuch/mountpoint', headers: JSON_HEADERS, payload: JSON.stringify({ mountpoint: '/srv/x' }) })
+    assert.equal(gone.statusCode, 404)
+    const reserved = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: JSON_HEADERS, payload: JSON.stringify({ mountpoint: '/mnt/pve/x' }) })
+    assert.equal(reserved.statusCode, 400)
+    const same = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: JSON_HEADERS, payload: JSON.stringify({ mountpoint: '/mnt/anas-ahr/ahr0' }) })
+    assert.equal(same.statusCode, 400)
+    assert.ok(same.json().error.message.includes('already'))
+    const move = await server.inject({ method: 'PUT', url: '/v1/ahr/ahr0/mountpoint', headers: JSON_HEADERS, payload: JSON.stringify({ mountpoint: '/srv/newhome' }) })
+    assert.equal(move.statusCode, 409)
+    assert.ok(move.headers['x-anas-confirm-code'])
+    assert.ok(move.json().error.warnings.some((w: string) => w.includes('/mnt/anas-ahr/ahr0')))
+  })
+
   it('POST /v1/ahr — 409 CONFLICT when the pool name already exists', async () => {
     const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'ahr0', tier: 'ahr1', disks: ['ata-x'] }) })
     assert.equal(res.statusCode, 409)

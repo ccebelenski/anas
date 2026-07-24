@@ -97,7 +97,7 @@ export async function scrubAhrPool(
 ): Promise<AhrScrubResult> {
   const { name } = pool
   const interval = opts?.pollIntervalMs ?? AHR_SCRUB_POLL_MS
-  if (pool.mountpoint.startsWith('/dev/'))
+  if (!pool.mounted)
     throw new Error(`pool '${name}' is not mounted — btrfs scrub needs the filesystem online`)
 
   // --- Phase 1: btrfs scrub ---------------------------------------------------
@@ -129,10 +129,13 @@ export async function scrubAhrPool(
     updateProgress(`Starting md check on ${label}`)
     await run(executor, MDADM, ['--action=check', array.device])
 
-    // /proc/mdstat keys arrays by transient kernel names (GT-2) — resolve the
-    // deterministic /dev/md/<name> symlink once, then wait on that entry.
-    const rp = await executor.exec(REALPATH, [array.device])
-    const kernelName = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : null
+    // /proc/mdstat keys arrays by transient kernel names (GT-2) — the topology
+    // read already resolved one; fall back to realpath when absent.
+    let kernelName = array.kernelName ?? null
+    if (!kernelName) {
+      const rp = await executor.exec(REALPATH, [array.device])
+      kernelName = rp.exitCode === 0 ? rp.stdout.trim().replace(DEV_PREFIX_RE, '') : null
+    }
     if (!kernelName) {
       updateProgress(`Cannot resolve ${array.device} to a kernel device — not waiting on its check`)
       continue

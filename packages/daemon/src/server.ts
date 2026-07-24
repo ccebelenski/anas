@@ -468,16 +468,17 @@ export function createServer(opts?: ServerOptions) {
   server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
-  // AHR hybrid RAID (Epic 11 + AHR) — READ layer (list/detail/preview).
-  server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache })
+  // AHR hybrid RAID (Epic 11 + AHR). The per-pool AhrExpansionIntent store
+  // (§5.3 — the ONLY persisted expansion state) lives under /etc/anas/ahr;
+  // dev mock keeps it in a throwaway temp dir so nothing touches the host.
+  const ahrIntentDir = process.env.ANAS_AHR_INTENT_DIR
+    ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-intent-${process.pid}`) : '/etc/anas/ahr')
+  // READ layer (list/detail/preview) — detail carries the live intent (§6.2).
+  server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache, intentDir: ahrIntentDir })
   // AHR mutations: create/destroy/scrub (routes/ahr-mutate.ts).
   server.register(ahrMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase: ahrMountBase })
   // AHR expansion engine (Epic 11.6, AHR-DESIGN §5) — plan/expand/resume/
-  // abandon + guided replace. The per-pool AhrExpansionIntent store (§5.3 —
-  // the ONLY persisted expansion state) lives under /etc/anas/ahr; dev mock
-  // keeps it in a throwaway temp dir so nothing touches the host.
-  const ahrIntentDir = process.env.ANAS_AHR_INTENT_DIR
-    ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-intent-${process.pid}`) : '/etc/anas/ahr')
+  // abandon + guided replace.
   server.register(ahrExpansionRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, intentDir: ahrIntentDir })
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, and job sources above, plus on-demand ARC/iostat/net sampling.

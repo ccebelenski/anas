@@ -141,12 +141,13 @@ New resource `/v1/ahr` (parallel to `/v1/pools`; md/AHR is a distinct backend pe
 | `GET` | `/v1/ahr` | List AHR pools (summary) | 200 |
 | `GET` | `/v1/ahr/:name` | Full pool detail (the §3 structure) | 200 |
 | `POST` | `/v1/ahr/layout/preview` | Dry-run layout for a disk selection + tier — NO mutation | 200 |
-| `POST` | `/v1/ahr` | Create pool (wipes selected disks) | 202 job / **409 confirm** |
+| `POST` | `/v1/ahr` | Create pool (wipes selected disks); body may carry an optional `mountpoint` override — default `/mnt/anas-ahr/<name>`, never under `/mnt/pve`, never an already-mounted/fstab-claimed path | 202 job / **409 confirm** |
 | `POST` | `/v1/ahr/:name/expand/plan` | Compute the expansion plan (before→after) — NO mutation | 200 |
 | `POST` | `/v1/ahr/:name/expand` | Execute expansion (add or replace) | 202 job / **409 confirm** |
 | `POST` | `/v1/ahr/:name/expand/resume` | Re-run a halted expansion (recompute-and-continue) | 202 job |
 | `POST` | `/v1/ahr/:name/expand/abandon` | Abandon a halted expansion intent (pool stays as-is) | 202 job / **409 confirm** |
 | `POST` | `/v1/ahr/:name/disk/:id/replace` | Guided single-disk replace | 202 job / **409 confirm** |
+| `PUT` | `/v1/ahr/:name/mountpoint` | Change the pool's mountpoint — the ONE mutable pool identity (name/tier/arrays are fixed at creation; rename would require offline md superblock rewrites and is deliberately not offered). Same constraints as the create-time override; brief unmount during the move | 202 job / **409 confirm** |
 | `POST` | `/v1/ahr/:name/scrub` | btrfs scrub, then md `check` — sequenced, never concurrent | 202 job |
 | `DELETE` | `/v1/ahr/:name` | Destroy pool | 202 job / **409 confirm** |
 
