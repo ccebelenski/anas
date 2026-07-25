@@ -69,6 +69,36 @@ export function parseByIdToKernel(output: string): Map<string, string> {
 }
 
 /**
+ * Like {@link parseByIdToKernel} but PARTITION-GRANULAR: keeps the `-partN`
+ * suffix on BOTH sides, mapping each full by-id (`…-part1`) to its full kernel
+ * partition (`sdb1`, `nvme0n1p1`). Whole-disk entries map to whole-disk kernels.
+ *
+ * The destroy-cleanup ownership guard uses this to identify EXACTLY which
+ * partitions of a whole disk were the destroyed pool's leaves — so it can zap
+ * the GPT only when every other partition is unclaimed. It never string-concats
+ * a kernel partition name (the `sdb`+`1` vs `nvme0n1`+`p1` trap); the mapping is
+ * read straight from the by-id symlink targets, which are already nvme-safe.
+ */
+export function parseByIdToKernelFull(output: string): Map<string, string> {
+  const map = new Map<string, string>()
+
+  for (const line of output.split('\n')) {
+    const match = line.match(SYMLINK_RE)
+    if (!match)
+      continue
+
+    const byIdName = match[1]
+    const kernelName = match[2].replace(RELATIVE_PREFIX_RE, '')
+
+    // First occurrence wins; duplicate by-id names resolve to the same kernel.
+    if (!map.has(byIdName))
+      map.set(byIdName, kernelName)
+  }
+
+  return map
+}
+
+/**
  * Parse the output of `ls -la /dev/disk/by-id/` into a kernel-name → by-id mapping.
  * Each kernel device gets the highest-priority by-id name.
  * Partition entries (ending in -partN) are excluded — we want whole-disk IDs.

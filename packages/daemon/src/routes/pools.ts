@@ -2,9 +2,10 @@ import type { PoolDetail, PoolSummary, VdevSpec } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, PoolMountpointRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
-import { parseByIdToKernel, wholeDiskKernel } from '../parsers/disk-by-id.js'
+import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
@@ -20,9 +21,119 @@ import { resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
+const ZPOOL = '/usr/sbin/zpool'
+const WIPEFS = '/usr/sbin/wipefs'
+const SGDISK = '/usr/sbin/sgdisk'
+const LSBLK = '/usr/bin/lsblk'
 const FINDMNT = '/usr/bin/findmnt'
 /** findmnt args for live-mount collision checks (matches the AHR precedent). */
 const FINDMNT_ARGS = ['--json', '--real']
+
+const BY_ID_PREFIX = '/dev/disk/by-id/'
+const PART_BY_ID_RE = /-part\d+$/
+
+/** A destroyed pool's vdev leaf, resolved for disk hygiene (story 3.14). */
+interface PoolLeaf {
+  /**
+   * by-id of the ACTUAL vdev device — WITH any `-partN` suffix, because that is
+   * where ZFS wrote its four labels (two front, two back). `labelclear`/`wipefs`
+   * must target this, not the whole disk: the parser's `disk.id` already strips
+   * `-partN`, which would mis-target the whole-disk device and leave the
+   * partition's labels intact.
+   */
+  leafId: string
+  /** `/dev/disk/by-id/<leafId>` — labelclear + wipefs target. */
+  leafPath: string
+  /** by-id of the WHOLE disk (leafId minus `-partN`) — the GPT-zap target. */
+  wholeDiskId: string
+}
+
+/**
+ * Resolve a destroyed pool's leaves for cleanup. The leaf's real device node is
+ * `disk.path` (`…-part1` for a partition vdev, the whole-disk by-id for a bare-
+ * disk vdev); prefer it so labelclear hits the partition that actually holds the
+ * labels. `wholeDiskId` is derived by stripping the trailing `-partN` from the
+ * by-id name — uniform and nvme-safe (never a `sdb`+`1` / `nvme0n1`+`p1` concat).
+ */
+function leavesFromStatus(pool: ParsedPoolStatus): PoolLeaf[] {
+  const leaves: PoolLeaf[] = []
+  for (const group of pool.vdevGroups) {
+    for (const vdev of group.vdevs) {
+      for (const disk of vdev.disks) {
+        const leafId = disk.path.startsWith(BY_ID_PREFIX)
+          ? disk.path.slice(BY_ID_PREFIX.length)
+          : disk.id
+        leaves.push({
+          leafId,
+          leafPath: `${BY_ID_PREFIX}${leafId}`,
+          wholeDiskId: leafId.replace(PART_BY_ID_RE, ''),
+        })
+      }
+    }
+  }
+  return leaves
+}
+
+/** Whole-disk ownership verdict for the destroy-cleanup GPT-zap guard. */
+type DiskOwnership = 'exclusive' | 'shared' | 'uncertain'
+
+interface LsblkOwnChild { name?: string, type?: string, fstype?: string | null, mountpoint?: string | null, children?: unknown[] }
+
+/**
+ * SAFETY-CRITICAL guard: is a whole disk EXCLUSIVELY the destroyed pool's, so
+ * its GPT can be zapped, or is it SHARED physical media that must be left intact?
+ *
+ * Enumerate the disk's partitions (structured `lsblk -J`). Every partition that
+ * is NOT one of this pool's just-cleared leaves is examined for foreign use — a
+ * mountpoint, any filesystem/RAID/LVM/zpool signature, or an active device-mapper
+ * child. ANY such partition ⇒ `shared` (never zap; the neighbour's data is
+ * untouchable). ZFS's own blank reserved `-part9` carries none of these, so it
+ * does not block the zap. If the probe errors or can't be parsed ⇒ `uncertain`,
+ * and the CONSERVATIVE default leaves the disk partitioned.
+ */
+async function evaluateDiskOwnership(
+  executor: CommandExecutor,
+  wholeDiskId: string,
+  diskLeaves: PoolLeaf[],
+  byIdToKernel: Map<string, string>,
+): Promise<DiskOwnership> {
+  // Kernel names of OUR leaves on this disk — excluded from the foreign scan.
+  const ourKernels = new Set<string>()
+  for (const leaf of diskLeaves) {
+    const kernel = byIdToKernel.get(leaf.leafId)
+    if (kernel)
+      ourKernels.add(kernel)
+  }
+
+  const probe = await executor.exec(LSBLK, ['-Jb', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT', `${BY_ID_PREFIX}${wholeDiskId}`])
+  if (probe.exitCode !== 0)
+    return 'uncertain'
+
+  let dev: { children?: LsblkOwnChild[] } | undefined
+  try {
+    const parsed = JSON.parse(probe.stdout) as { blockdevices?: { children?: LsblkOwnChild[] }[] }
+    dev = parsed.blockdevices?.[0]
+  }
+  catch {
+    return 'uncertain'
+  }
+  if (!dev)
+    return 'uncertain'
+
+  for (const child of dev.children ?? []) {
+    if (child.type !== 'part' || !child.name)
+      continue
+    if (ourKernels.has(child.name))
+      continue // ours — already labelcleared + wiped, never foreign.
+    const inUse
+      = (child.mountpoint != null && child.mountpoint !== '')
+        || (child.fstype != null && child.fstype !== '')
+        || (Array.isArray(child.children) && child.children.length > 0)
+    if (inUse)
+      return 'shared'
+  }
+  return 'exclusive'
+}
 
 /** The pool root dataset's mountpoint + mounted flag (story 3.27). */
 interface PoolMount {
@@ -93,22 +204,26 @@ async function readExplicitChildMountpoints(
   return out
 }
 
-/** lsblk args to probe per-device discard support (Epic 4.12 trim gating).
+/**
+ * lsblk args to probe per-device discard support (Epic 4.12 trim gating).
  *  `-b` bytes, `-J` JSON, `-n` no headings, `-o NAME,DISC-GRAN`. A device is
- *  discard-capable iff its DISC-GRAN (discard granularity) is greater than 0. */
+ *  discard-capable iff its DISC-GRAN (discard granularity) is greater than 0.
+ */
 export const LSBLK_DISCARD_ARGS = ['-Jbno', 'NAME,DISC-GRAN']
 
-/** A leaf device reference from a pool's topology — enough to resolve it to a
- *  whole-disk kernel name via {@link resolveLeafKernel}. */
+/**
+ * A leaf device reference from a pool's topology — enough to resolve it to a
+ *  whole-disk kernel name via {@link resolveLeafKernel}.
+ */
 interface LeafRef {
   id: string
   path: string
 }
 
 interface LsblkDiscardRaw {
-  name: string
+  'name': string
   'disc-gran'?: number | string | null
-  children?: LsblkDiscardRaw[]
+  'children'?: LsblkDiscardRaw[]
 }
 
 /**
@@ -235,8 +350,10 @@ function vdevSpecArgs(vdev: VdevSpec): string[] {
   return args
 }
 
-/** Append a redundant allocation class (log/special/dedup): the class keyword
- *  once, then each vdev's spec args. No-op when the list is empty. */
+/**
+ * Append a redundant allocation class (log/special/dedup): the class keyword
+ *  once, then each vdev's spec args. No-op when the list is empty.
+ */
 function pushClassVdevs(args: string[], keyword: string, vdevs: VdevSpec[] | undefined): void {
   if (!vdevs || vdevs.length === 0)
     return
@@ -321,11 +438,15 @@ export async function poolRoutes(
     executor: CommandExecutor
     jobQueue: JobQueue
     confirmStore: ConfirmStore
-    /** /etc/fstab location (config IS the API) — for mountpoint collision checks.
-     *  Defaults to /etc/fstab; overridable via the env-driven server wiring. */
+    /**
+     * /etc/fstab location (config IS the API) — for mountpoint collision checks.
+     *  Defaults to /etc/fstab; overridable via the env-driven server wiring.
+     */
     fstabPath?: string
-    /** storage.cfg path for PVE-managed detection (story 3.25). Defaults to the
-     *  real PVE file; overridable so the hands-off guard is testable. */
+    /**
+     * storage.cfg path for PVE-managed detection (story 3.25). Defaults to the
+     *  real PVE file; overridable so the hands-off guard is testable.
+     */
     pveStoragePath?: string
   },
 ) {
@@ -339,22 +460,15 @@ export async function poolRoutes(
     return storages.get(poolName) ?? []
   }
 
-  /** Stable by-id identifiers of every leaf disk in a pool (for disk cleanup). */
-  async function poolMemberIds(poolName: string): Promise<string[]> {
-    const statusResult = await executor.exec('/usr/sbin/zpool', ['status', '-jv'])
+  /** Every leaf disk of a pool resolved for disk cleanup (labelclear + zap). */
+  async function poolMemberLeaves(poolName: string): Promise<PoolLeaf[]> {
+    const statusResult = await executor.exec(ZPOOL, ['status', '-jv'])
     if (statusResult.exitCode !== 0)
       return []
     const pool = parseZpoolStatusPool(statusResult.stdout, poolName)
     if (!pool)
       return []
-    const ids: string[] = []
-    for (const group of pool.vdevGroups) {
-      for (const vdev of group.vdevs) {
-        for (const disk of vdev.disks)
-          ids.push(disk.id)
-      }
-    }
-    return ids
+    return leavesFromStatus(pool)
   }
 
   server.get('/pools', async (_request, _reply) => {
@@ -1227,11 +1341,11 @@ export async function poolRoutes(
       'zpool.destroy',
       { ...identity, params: { pool: poolName, cleanup } },
       async (updateProgress) => {
-        // Capture the member disks by stable by-id BEFORE destroy — the pool
+        // Capture the member leaves by stable by-id BEFORE destroy — the pool
         // must still exist to enumerate them.
-        const memberIds = cleanup ? await poolMemberIds(poolName) : []
+        const leaves = cleanup ? await poolMemberLeaves(poolName) : []
 
-        const result = await executor.exec('/usr/sbin/zpool', ['destroy', poolName])
+        const result = await executor.exec(ZPOOL, ['destroy', poolName])
         if (result.exitCode !== 0) {
           // A busy destroy fails to unmount a dataset — name the holders (3.29).
           // The path comes from the ZFS error itself (`cannot unmount '<path>'`).
@@ -1239,21 +1353,77 @@ export async function poolRoutes(
           throw new Error(await enrichBusyError(executor, base))
         }
 
-        if (cleanup && memberIds.length > 0) {
-          // Best-effort: the pool is already destroyed, so a failed wipe must
-          // not fail the job. Report any disks we couldn't clean.
-          const failed: string[] = []
-          for (const id of memberIds) {
-            updateProgress(`Wiping ${id}`)
-            const wipe = await executor.exec('/usr/sbin/wipefs', ['-a', '--force', `/dev/disk/by-id/${id}`])
-            if (wipe.exitCode !== 0)
-              failed.push(id)
-          }
-          if (failed.length > 0)
-            return { destroyed: poolName, wipedFailed: failed }
-          return { destroyed: poolName, wiped: memberIds }
+        if (!(cleanup && leaves.length > 0))
+          return { destroyed: poolName }
+
+        // Opt-in disk hygiene ("Clean Up Disks"). All best-effort: the pool is
+        // already destroyed, so nothing here may fail the job — every failure is
+        // REPORTED in the result instead.
+        //
+        // (1) Per LEAF: `zpool labelclear` is ZFS's native all-four-labels clear
+        //     (front AND back of the vdev device — where `wipefs -a` alone leaves
+        //     the trailing pair, so the disk still reads as zfs_member). wipefs
+        //     follows as belt-and-suspenders.
+        // (2) Per WHOLE DISK: zap the GPT so the disk stops reading as
+        //     `partitioned` and the inventory / AHR composer offer it again — but
+        //     ONLY when the disk is EXCLUSIVELY this pool's. A shared disk (any
+        //     foreign in-use partition) is left partitioned; conservative on any
+        //     ownership-probe error. labelclear always runs BEFORE any zap.
+        const byIdListing = await executor.exec('/usr/bin/ls', ['-la', BY_ID_PREFIX])
+        const byIdToKernel = byIdListing.exitCode === 0
+          ? parseByIdToKernelFull(byIdListing.stdout)
+          : new Map<string, string>()
+
+        const wiped: string[] = []
+        const wipedFailed: string[] = []
+        for (const leaf of leaves) {
+          updateProgress(`Clearing ZFS labels on ${leaf.leafId}`)
+          const labelclear = await executor.exec(ZPOOL, ['labelclear', '-f', leaf.leafPath])
+          const wipe = await executor.exec(WIPEFS, ['-a', '--force', leaf.leafPath])
+          if (labelclear.exitCode === 0 && wipe.exitCode === 0)
+            wiped.push(leaf.leafId)
+          else
+            wipedFailed.push(leaf.leafId)
         }
-        return { destroyed: poolName }
+
+        // Group leaves by whole disk (dedup: many leaves on one disk ⇒ one zap).
+        const byWholeDisk = new Map<string, PoolLeaf[]>()
+        for (const leaf of leaves) {
+          const list = byWholeDisk.get(leaf.wholeDiskId) ?? []
+          list.push(leaf)
+          byWholeDisk.set(leaf.wholeDiskId, list)
+        }
+
+        const zapped: string[] = []
+        const preserved: { disk: string, reason: 'shared' | 'uncertain' }[] = []
+        for (const [wholeDiskId, diskLeaves] of byWholeDisk) {
+          const ownership = await evaluateDiskOwnership(executor, wholeDiskId, diskLeaves, byIdToKernel)
+          if (ownership !== 'exclusive') {
+            preserved.push({ disk: wholeDiskId, reason: ownership })
+            continue
+          }
+          updateProgress(`Zapping GPT on ${wholeDiskId}`)
+          await executor.exec(SGDISK, ['--zap-all', `${BY_ID_PREFIX}${wholeDiskId}`])
+          await executor.exec(WIPEFS, ['-a', `${BY_ID_PREFIX}${wholeDiskId}`])
+          zapped.push(wholeDiskId)
+        }
+
+        const cleanupResult: {
+          destroyed: string
+          wiped?: string[]
+          wipedFailed?: string[]
+          zapped?: string[]
+          preserved?: { disk: string, reason: 'shared' | 'uncertain' }[]
+        } = { destroyed: poolName }
+        if (wiped.length > 0)
+          cleanupResult.wiped = wiped
+        if (wipedFailed.length > 0)
+          cleanupResult.wipedFailed = wipedFailed
+        if (zapped.length > 0)
+          cleanupResult.zapped = zapped
+        if (preserved.length > 0)
+          cleanupResult.preserved = preserved
+        return cleanupResult
       },
     )
 
