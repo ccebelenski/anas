@@ -38,18 +38,22 @@ Think TrueNAS, but purpose-built to complement Proxmox rather than replace it.
 │    ANAS views are native ExtJS panels        │
 │    injected into pve-manager (Ceph model)    │
 └──────────────────┬──────────────────────────┘
-                   │ HTTPS (port 3000), CORS w/ credentials
-                   │ PVEAuthCookie (host-scoped, ports don't matter)
-                   │ /api/nodes/<node>/v1/...
+                   │ HTTPS to PVE's own :8006, path /anas/...
+                   │ (pveproxy fail-open hook → loopback gateway;
+                   │  same origin, no cert exception, no CORS)
+                   │ PVEAuthCookie flows same-origin
+                   │ /anas/api/nodes/<node>/v1/...
                    ▼
 ┌─────────────────────────────────────────────┐
 │           anas (API gateway)                 │
 │                                              │
+│  - Binds 127.0.0.1:3000, plain HTTP (no TLS, │
+│    no public origin — pveproxy terminates    │
+│    TLS at :8006 and proxies /anas here)      │
 │  - Verifies PVEAuthCookie (RSA-SHA1, local)  │
 │  - Input validation (Zod schemas)            │
-│  - CORS for the PVE UI origin                │
 │  - Node routing: self → local anasd socket,  │
-│    other → forwards to that node's anas      │
+│    other → forwards to <node>:8006/anas       │
 │    (ticket forwarded, cluster-CA TLS)        │
 │  - No system command execution, no pages     │
 │                                              │
@@ -75,6 +79,21 @@ Think TrueNAS, but purpose-built to complement Proxmox rather than replace it.
 └─────────────────────────────────────────────┘
 ```
 
+### Transport: single surface through pveproxy `:8006/anas`
+
+The gateway is **not** a public origin. It binds `127.0.0.1:3000` as a plain-HTTP
+loopback service; ANAS's API reaches the browser through **PVE's own `:8006`
+front door under the `/anas` path**, via a fail-open reverse-proxy hook in
+pveproxy that forwards to the loopback gateway. There is no separate `:3000`
+origin, no per-port certificate exception, and no CORS — same origin as the PVE
+UI, so the `PVEAuthCookie` flows automatically. "If the PVE UI loads, ANAS
+does." Cross-node forwarding targets `<node>:8006/anas`, with peers resolved via
+PVE cluster membership (`/etc/pve/.members`), not DNS. The hook is one additive
+block that runtime-requires an ANAS-owned Perl module, so a broken or missing
+ANAS side degrades `/anas` only and never `:8006`. See
+[`PROXY-TRANSPORT-DESIGN.md`](PROXY-TRANSPORT-DESIGN.md) for the authoritative
+detail (story 12.2).
+
 ### Why two processes?
 
 Both processes run as root (like Proxmox). The separation is architectural, not privilege-based:
@@ -98,7 +117,7 @@ Both processes run as root (like Proxmox). The separation is architectural, not 
 | Layer | Technology | Rationale |
 |-------|-----------|-----------|
 | UI | ExtJS panels injected into pve-manager (the Ceph model) | Native PVE look, theme, and interaction — no iframe, no style clash, users stay in the UI they know |
-| API gateway (anas) | Fastify (TypeScript) | Same stack as anasd; auth verification, validation, CORS, node forwarding |
+| API gateway (anas) | Fastify (TypeScript) | Same stack as anasd; auth verification, validation, node forwarding. Plain HTTP on loopback, fronted by pveproxy at `:8006/anas` (no TLS/CORS of its own) |
 | Config format | YAML (`/etc/anas/config.yaml`) | Human-readable, supports comments |
 | Auth | PVE ticket (verified locally against the replicated cluster authkey); Dev provider for testing | Proxmox owns the session; tickets are cluster-valid |
 | Daemon runtime | Node.js (TypeScript) | Same language as gateway, shared schemas, single npm package |
@@ -594,7 +613,7 @@ ANAS is always accessed through Proxmox UI — Proxmox owns the session.
 - **Dev mode** (`ANAS_AUTH_PROVIDER=dev`): skips cookie validation, sets a mock user on every request
 
 Proxmox integration:
-- Users logged into Proxmox UI are already authenticated to ANAS: the ANAS panels run inside the PVE UI page, and the browser sends PVEAuthCookie to the gateway automatically (same host — cookies ignore ports; the gateway must serve HTTPS with the host's PVE certs because the cookie is `Secure`). Cross-node operations are forwarded server-side — the browser never contacts another node (see **PVE UI Integration**)
+- Users logged into Proxmox UI are already authenticated to ANAS: the ANAS panels run inside the PVE UI page and reach the gateway same-origin through PVE's `:8006` under `/anas`, so the browser sends PVEAuthCookie automatically (the `Secure` cookie is satisfied by pveproxy's existing TLS — the gateway itself serves plain HTTP on loopback). Cross-node operations are forwarded server-side — the browser never contacts another node (see **PVE UI Integration**)
 - The PVE web UI gains an ANAS section via an injected integration script (see **PVE UI Integration**). PVE 9 has no official UI extension hook — the previously assumed `/usr/share/pve-manager/js/custom.js` mechanism does not exist
 
 Both services run as root — no dedicated service user.
@@ -664,16 +683,16 @@ A large modal composer launched from the Pools view, serving **create** (empty d
 
 ## Public API (browser ↔ anas gateway)
 
-The gateway exposes anasd's resource model with the **node as a path parameter**, following PVE's own convention (`/api2/json/nodes/<node>/...`):
+The gateway exposes anasd's resource model with the **node as a path parameter**, following PVE's own convention (`/api2/json/nodes/<node>/...`), served through PVE's `:8006` under the `/anas` prefix (see [`PROXY-TRANSPORT-DESIGN.md`](PROXY-TRANSPORT-DESIGN.md), story 12.2):
 
 ```
-https://<ui-host>:3000/api/nodes/<node>/v1/pools
-https://<ui-host>:3000/api/nodes/<node>/v1/pools/:name/scrub
-https://<ui-host>:3000/api/nodes/<node>/v1/jobs/:id
+https://<ui-host>:8006/anas/api/nodes/<node>/v1/pools
+https://<ui-host>:8006/anas/api/nodes/<node>/v1/pools/:name/scrub
+https://<ui-host>:8006/anas/api/nodes/<node>/v1/jobs/:id
 ```
 
-- **The browser only ever talks to the gateway on the host serving the PVE UI.** PVEAuthCookie flows automatically (same host — cookies ignore ports). The gateway answers CORS preflights for the PVE UI origin (`https://<same-host>:8006`) with credentials allowed, and only for that origin.
-- **Node routing:** if `<node>` is the local node, the gateway strips the prefix and forwards to the local anasd socket (`/v1/...`) — on a single-node install this branch is the whole story. Otherwise it forwards the request to `https://<node>:3000/api/nodes/<node>/v1/...`, passing the user's ticket; the remote gateway verifies the ticket against the replicated cluster authkey (`/etc/pve/authkey.pub`) exactly as for a direct request, and the TLS hop is verified against the cluster CA (`/etc/pve/pve-root-ca.pem`). No new trust infrastructure — this is PVE's own fabric (Principle 15).
+- **The browser only ever talks to the PVE `:8006` on the host serving the UI.** ANAS is same-origin under `/anas`, so `PVEAuthCookie` flows automatically — no CORS, no cert exception. pveproxy proxies `/anas` to the gateway on `127.0.0.1:3000`, which strips the prefix.
+- **Node routing:** if `<node>` is the local node, the gateway forwards to the local anasd socket (`/v1/...`) — on a single-node install this branch is the whole story. Otherwise it forwards the request to `https://<node>:8006/anas/api/nodes/<node>/v1/...`, resolving the peer's address from PVE cluster membership (`/etc/pve/.members`, not DNS) and passing the user's ticket; the remote gateway verifies the ticket against the replicated cluster authkey (`/etc/pve/authkey.pub`) exactly as for a direct request, and the TLS hop is verified against the cluster CA (`/etc/pve/pve-root-ca.pem`). A node without ANAS returns a clean `ANAS_NOT_INSTALLED` signal. No new trust infrastructure — this is PVE's own fabric (Principle 15).
 - anasd's `/v1/` API is unchanged — socket-only (Principle 9), reached exclusively through a gateway.
 
 ---
@@ -712,7 +731,7 @@ sudo systemctl enable --now anasd anas
 1. Creates `/run/anas/` directory (via tmpfiles.d)
 2. Installs `anasd.service` and `anas.service` systemd units
 3. Generates `/etc/anas/config.yaml` with defaults
-4. Configures TLS (detects Proxmox certs, falls back to self-signed generation)
+4. Installs the pveproxy `/anas` reverse-proxy hook (fail-open, `perl -c`-gated) so the loopback gateway is reachable through PVE's `:8006` — no TLS or certificate of ANAS's own (see [`PROXY-TRANSPORT-DESIGN.md`](PROXY-TRANSPORT-DESIGN.md))
 
 ### systemd units
 
@@ -732,7 +751,7 @@ RuntimeDirectory=anas
 WantedBy=multi-user.target
 ```
 
-**anas.service** (the API gateway — serves no pages; HTTPS with PVE certs)
+**anas.service** (the API gateway — serves no pages; plain HTTP on `127.0.0.1:3000`, fronted by pveproxy at `:8006/anas`)
 ```ini
 [Unit]
 Description=ANAS API Gateway
@@ -787,7 +806,7 @@ Browser ──cookie──→ gateway ──X-Anas-User──→ anasd ──aud
 
 ### Session security
 - Proxmox owns the session: PVEAuthCookie lifetime, renewal, and logout are PVE's
-- The gateway's CORS policy admits only the PVE UI origin, with credentials
+- ANAS is served same-origin under `:8006/anas`, so there is no CORS surface — the cookie flows automatically and cross-origin requests are impossible by construction
 - State-changing requests are same-site by construction (panels run in the PVE page)
 
 ---
@@ -856,20 +875,21 @@ The UI is native ExtJS inside pve-manager (see "UI: Native PVE Panels"). Key com
 YAML format (readable, supports comments, sysadmin-friendly). Generated by `anas setup` with sensible defaults.
 
 Contents:
-- Listen port (default: 3000)
-- TLS certificate and key paths
+- Loopback listen port (default: 3000, `127.0.0.1` only)
 - Session timeout (default: 30 min)
 - Log level
 - Socket path (default: `/run/anas/anasd.sock`)
 
-### 3. TLS: Proxmox Certificates with Self-Signed Fallback
+### 3. TLS: none of ANAS's own — pveproxy terminates it
 
-TLS certificate resolution order:
-1. Explicit paths in `/etc/anas/config.yaml` (user override)
-2. Proxmox node certificates (`/etc/pve/local/pve-ssl.pem`, `/etc/pve/local/pve-ssl.key`) — piggyback on existing trusted certs
-3. Self-signed certificate generated by `anas setup` into `/etc/anas/tls/`
-
-This means on a standard Proxmox install, ANAS uses the same certificate as the Proxmox UI with no extra configuration. Users who have set up trusted certs for Proxmox get that for free.
+The gateway serves plain HTTP on `127.0.0.1:3000`; it holds no certificate and
+opens no public origin. Browser-facing TLS is terminated by **pveproxy at
+`:8006`**, which proxies `/anas` to the loopback gateway — so ANAS inherits the
+exact certificate the Proxmox UI already uses, with nothing to configure and no
+per-port exception to accept. Cross-node forwarding is the one place the gateway
+speaks TLS as a client: `<node>:8006/anas` verified against the cluster CA
+(`/etc/pve/pve-root-ca.pem`), the peer resolved via cluster membership
+(`/etc/pve/.members`). See [`PROXY-TRANSPORT-DESIGN.md`](PROXY-TRANSPORT-DESIGN.md).
 
 ### 4. Job Persistence: In-Memory + journald Audit Logging
 

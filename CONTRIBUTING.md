@@ -74,7 +74,8 @@ packages/
 │                      Imported by daemon and gateway.
 ├── daemon/          @anas/daemon — anasd: Fastify on a Unix socket.
 │                      Parsers, command executor, job queue, audit logging.
-├── gateway/         @anas/gateway — anas: Fastify HTTPS gateway (:3000).
+├── gateway/         @anas/gateway — anas: Fastify gateway, plain HTTP on
+│                      loopback :3000, fronted by pveproxy at :8006/anas.
 │                      PVE ticket verification, validation, node routing.
 └── pve-integration/ ExtJS panels injected into the PVE web UI (Ceph model),
                        plus the inject/eject scripts.
@@ -90,8 +91,9 @@ Two processes:
 
 ```
 Browser — PVE web UI (:8006, ANAS panels injected)
-   → anas gateway (HTTPS :3000, PVE ticket auth)
-      → anasd (REST over /run/anas/anasd.sock)
+   → :8006/anas (pveproxy fail-open hook, same origin)
+      → anas gateway (plain HTTP, 127.0.0.1:3000, PVE ticket auth)
+         → anasd (REST over /run/anas/anasd.sock)
 ```
 
 - **anas** verifies the PVE ticket, validates input, and routes to the right

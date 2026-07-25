@@ -19,10 +19,13 @@ Think TrueNAS, but purpose-built to **complement** Proxmox rather than replace i
 ## Features
 
 - **Dashboard** — pool health, capacity, fleet disk health, shares, running
-  jobs, warnings, and live ZFS telemetry (ARC, per-pool/disk I/O with latency,
-  network throughput)
+  jobs, warnings, and live telemetry (ARC, network throughput, per-pool/disk
+  I/O with latency for both ZFS and AHR pools — the AHR strip breaks down to
+  per-band and per-member throughput/IOPS/latency)
 - **ZFS pools** — create/import/export/destroy, scrub, topology view with
-  per-bay disk health, device errors, properties
+  per-bay disk health, device errors, properties; a drag-to-build vdev
+  composer with a live capacity/redundancy preview and a rules-based pool
+  advisor
 - **Hybrid RAID (AHR)** — Synology-SHR-style pools from **mismatched disk
   sizes**, using every drive's full height (a 12 TB next to 8 TBs contributes
   all 12, not 8): disks are sliced into size-matched bands, each band is its
@@ -34,7 +37,11 @@ Think TrueNAS, but purpose-built to **complement** Proxmox rather than replace i
   until a matching disk arrives) before you commit. Expansion is a resumable
   multi-layer job: power loss mid-reshape is survivable, interrupted runs
   resume or abandon cleanly, and md events land in PVE's own notification
-  system
+  system. **Hot spares** — full-coverage spares sliced into every band so md
+  owns automatic failover; expansion auto-extends spare coverage to new bands.
+  **btrfs snapshots** — new pools get an `@data`/`@snapshots` subvolume layout;
+  list/create/delete and roll back, with rollback preserving the replaced state
+  (destroying nothing)
 - **Datasets** — create/manage, quotas, compression, permissions/ACLs, a
   layered access editor
 - **Snapshots** — create, rollback (gated), clone, destroy
@@ -47,8 +54,9 @@ Think TrueNAS, but purpose-built to **complement** Proxmox rather than replace i
 - **Share users/groups** — Samba user management for share access (no
   role/permission system — PVE owns identity)
 - **Mounts** — client-side NFS/CIFS mounts with surgical fstab persistence
-  (credentials in root-only files, never on a command line); local and
-  PVE-owned mounts inventoried read-only
+  (credentials in root-only files, never on a command line), a common option
+  set across both protocols and human-readable file/dir permission modes;
+  local and PVE-owned mounts inventoried read-only
 - **File backup (PBS)** — back up shares, datasets, or any mounted path to a
   Proxmox Backup Server with `proxmox-backup-client` (dedup, encryption,
   retention), ZFS-snapshot-consistent where the source supports it
