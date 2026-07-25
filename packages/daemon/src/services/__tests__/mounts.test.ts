@@ -141,6 +141,36 @@ describe('buildBaseInventory — disabled entry', () => {
   })
 })
 
+describe('buildBaseInventory — fstab pseudo/system entries never leak', () => {
+  // Regression: a `proc /proc` fstab line (standard on many nodes) used to slip
+  // past the fstab overlay — the active-mount filter dropped it, then the overlay
+  // re-added it as a ghost persistent+unmounted row → a bogus "configured but not
+  // mounted" dashboard warning. Both paths now share isIgnoredMount.
+  const fstab = [
+    'proc /proc proc defaults 0 0',
+    'sysfs /sys sysfs defaults 0 0',
+    'UUID=abcd none swap sw 0 0',
+    'tmpfs /run/lock tmpfs defaults 0 0',
+    '127.0.0.1:/srv/nfs/export /mnt/data nfs4 defaults 0 0',
+  ].join('\n') + '\n'
+  const rows = buildBaseInventory('{"filesystems":[]}', fstab, new Map())
+
+  it('drops proc/sys/swap/tmpfs fstab lines, keeps the real NFS mount', () => {
+    const mps = rows.map(r => r.mountpoint)
+    assert.ok(!mps.includes('/proc'), '/proc must not appear')
+    assert.ok(!mps.includes('/sys'), '/sys must not appear')
+    assert.ok(!mps.includes('none'), 'swap (none) must not appear')
+    assert.ok(!mps.includes('/run/lock'), 'tmpfs under /run must not appear')
+    assert.deepEqual(mps, ['/mnt/data'])
+  })
+
+  it('produces no mount warnings for the pseudo entries', () => {
+    const entriesByMount = new Map(rows.map(r => [r.mountpoint, undefined as never]))
+    const warnings = buildMountWarnings(rows.filter(r => r.mountpoint !== '/mnt/data'), entriesByMount)
+    assert.equal(warnings.length, 0)
+  })
+})
+
 // --- Status classification (the exit-code table, NOTES §4) -------------------
 
 describe('classifyStatHealth (timeout 2 stat -f exit codes)', () => {

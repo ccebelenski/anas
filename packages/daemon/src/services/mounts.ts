@@ -20,7 +20,7 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { classifyKind, isPseudoFstype, isSystemMountTarget, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
+import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { getMount, parseFstab } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
@@ -81,7 +81,7 @@ export function buildBaseInventory(
   pveMountPaths: Map<string, string>,
   ahrSpecs: Set<string> = new Set(),
 ): MountSummary[] {
-  const nodes = parseFindmnt(findmntText).filter(n => !isPseudoFstype(n.fstype) && !isSystemMountTarget(n.target))
+  const nodes = parseFindmnt(findmntText).filter(n => !isIgnoredMount(n.fstype, n.target))
   const entries = parseFstab(fstabText)
   const entryByMount = new Map(entries.map(e => [e.mountpoint, e]))
 
@@ -122,6 +122,11 @@ export function buildBaseInventory(
 
   // Overlay fstab: mark persistent / automount / disabled, add unmounted rows.
   for (const entry of entries) {
+    // Same ignore filter as the active-mount path above (shared predicate): an
+    // fstab `proc`/`sys`/`swap`/`tmpfs` line is OS plumbing, not a user mount —
+    // without this it reappears here as a ghost unmounted row + dashboard warning.
+    if (isIgnoredMount(entry.fstype, entry.mountpoint))
+      continue
     const row = byTarget.get(entry.mountpoint)
     if (row) {
       row.persistent = true

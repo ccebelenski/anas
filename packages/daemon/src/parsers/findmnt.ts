@@ -59,6 +59,9 @@ const PSEUDO_FSTYPES = new Set([
   'rpc_pipefs',
   'fuse',
   'fuse.lxcfs',
+  // swap is not a mount (findmnt never lists it), but an fstab `swap` line would
+  // otherwise leak through the fstab overlay as a bogus unmounted `none` row.
+  'swap',
 ])
 
 /** Is this fstype a kernel/system pseudo-filesystem (dropped from the inventory)? */
@@ -79,6 +82,17 @@ const SYSTEM_TARGET_PREFIXES = ['/proc/', '/sys/', '/dev/', '/run/']
 /** Is this mount target OS plumbing (`/proc/*`, `/sys/*`, `/dev/*`, `/run/*`)? */
 export function isSystemMountTarget(target: string): boolean {
   return SYSTEM_TARGET_PREFIXES.some(p => target.startsWith(p))
+}
+
+/**
+ * Should this mount (from findmnt OR fstab) be dropped from the inventory —
+ * kernel/system plumbing, not user storage. The SINGLE predicate both the
+ * active-mount filter and the fstab overlay share, so they can never disagree
+ * (a `proc /proc` fstab line once leaked through as a ghost "unconfigured" row
+ * because only the active path filtered).
+ */
+export function isIgnoredMount(fstype: string, mountpoint: string): boolean {
+  return isPseudoFstype(fstype) || isSystemMountTarget(mountpoint)
 }
 
 /** `host:/export` NFS source shape (host, then `:/`). */
