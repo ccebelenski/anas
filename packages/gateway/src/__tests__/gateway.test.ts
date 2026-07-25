@@ -12,10 +12,21 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { VERSION } from '@anas/shared'
-import { classifyUpstreamResponse } from '../proxy.js'
+import { classifyUpstreamResponse, resolveNodeAddress } from '../proxy.js'
 import { createServer } from '../server.js'
 
 const NODE = 'testnode'
+
+// PVE peers are resolved via cluster membership (/etc/pve/.members), NOT DNS.
+// A shared test members file maps the peer node names used below to loopback.
+const membersDir = mkdtempSync(join(tmpdir(), 'anas-members-'))
+const MEMBERS_PATH = join(membersDir, '.members')
+writeFileSync(MEMBERS_PATH, JSON.stringify({
+  nodelist: {
+    '127.0.0.1': { id: 2, online: 1, ip: '127.0.0.1' },
+    'peer1': { id: 3, online: 1, ip: '127.0.0.1' },
+  },
+}))
 
 /** Auth provider that accepts everything (like dev, but with a distinct name so the cookie path runs). */
 class AcceptAuthProvider implements AuthProvider {
@@ -42,6 +53,7 @@ function baseConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
     anasdSocket: '/run/anas/anasd.sock',
     authProvider: undefined,
     clusterCa: '/etc/pve/pve-root-ca.pem',
+    membersPath: MEMBERS_PATH,
     ...overrides,
   }
 }
@@ -205,9 +217,9 @@ describe('remote node forwarding', () => {
     rmSync(caDir, { recursive: true, force: true })
   })
 
-  it('returns 502 NODE_UNREACHABLE for an unresolvable node (CA present)', async () => {
+  it('returns 502 NODE_UNRESOLVED for a node not in cluster membership', async () => {
     // A readable CA lets the request past the fail-closed gate so it reaches the
-    // actual forward attempt — which then fails DNS → NODE_UNREACHABLE.
+    // resolution step — a node absent from /etc/pve/.members can't be addressed.
     const caPath = join(caDir, 'present.pem')
     writeFileSync(caPath, 'test-ca-bytes')
     const server = createServer({
@@ -217,13 +229,33 @@ describe('remote node forwarding', () => {
     })
     const res = await server.inject({
       method: 'GET',
-      url: '/api/nodes/bogus.example/v1/pools',
+      url: '/api/nodes/notamember/v1/pools',
       headers: { cookie: 'PVEAuthCookie=x' },
     })
     assert.equal(res.statusCode, 502)
     const body = res.json()
-    assert.equal(body.error.code, 'NODE_UNREACHABLE')
-    assert.match(body.error.message, /bogus\.example/)
+    assert.equal(body.error.code, 'NODE_UNRESOLVED')
+    assert.match(body.error.message, /notamember/)
+    await server.close()
+  })
+
+  it('returns 502 NODE_UNREACHABLE when a member node resolves but the peer is down', async () => {
+    const caPath = join(caDir, 'present2.pem')
+    writeFileSync(caPath, 'test-ca-bytes')
+    // node 127.0.0.1 is in membership → resolves to 127.0.0.1; port 9 (discard)
+    // refuses → the forward attempt errors → NODE_UNREACHABLE.
+    const server = createServer({
+      config: baseConfig({ clusterCa: caPath, pvePort: 9 }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/nodes/127.0.0.1/v1/pools',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+    assert.equal(res.statusCode, 502)
+    assert.equal(res.json().error.code, 'NODE_UNREACHABLE')
     await server.close()
   })
 
@@ -291,6 +323,19 @@ describe('remote node forwarding', () => {
     })
     assert.equal(r2.json().error.code, 'NODE_UNREACHABLE')
     await s2.close()
+  })
+})
+
+describe('resolveNodeAddress — cluster membership, not DNS', () => {
+  it('maps a node name to its IP from /etc/pve/.members', () => {
+    assert.equal(resolveNodeAddress('peer1', MEMBERS_PATH), '127.0.0.1')
+    assert.equal(resolveNodeAddress('127.0.0.1', MEMBERS_PATH), '127.0.0.1')
+  })
+  it('returns undefined for a node not in membership', () => {
+    assert.equal(resolveNodeAddress('notamember', MEMBERS_PATH), undefined)
+  })
+  it('returns undefined when the members file is unreadable', () => {
+    assert.equal(resolveNodeAddress('peer1', '/no/such/.members'), undefined)
   })
 })
 
@@ -415,9 +460,10 @@ describe('upstream classifier (ANAS_NOT_INSTALLED vs ANAS response)', () => {
 })
 
 describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
-  // A self-signed cert for 127.0.0.1 doubles as the cluster CA: the peer HTTPS
-  // stub presents it and the gateway verifies the hop against it — exercising the
-  // exact fail-closed cluster-CA machinery, not a bypass.
+  // A self-signed cert for the peer node NAME (peer1) doubles as the cluster CA:
+  // the gateway resolves peer1→127.0.0.1 via membership, connects to the IP but
+  // verifies with servername=peer1 against the cert's DNS SAN — mirroring how a
+  // real PVE node cert carries the node name in its SAN.
   let tlsDir: string
   let certPath: string
   let cert: Buffer
@@ -431,8 +477,8 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
       'req', '-x509', '-newkey', 'rsa:2048',
       '-keyout', keyPath, '-out', certPath,
       '-days', '1', '-nodes',
-      '-subj', '/CN=127.0.0.1',
-      '-addext', 'subjectAltName=IP:127.0.0.1',
+      '-subj', '/CN=peer1',
+      '-addext', 'subjectAltName=DNS:peer1',
     ])
     cert = readFileSync(certPath)
     key = readFileSync(keyPath)
@@ -460,7 +506,7 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     // node = 127.0.0.1 (a peer, not this node) → forwarded, not local.
     const res = await server.inject({
       method: 'GET',
-      url: '/api/nodes/127.0.0.1/v1/pools?verbose=1',
+      url: '/api/nodes/peer1/v1/pools?verbose=1',
       headers: { cookie: 'PVEAuthCookie=x' },
     })
 
@@ -468,7 +514,7 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     assert.deepEqual(res.json(), { data: [{ name: 'remotepool' }] })
     // Round-trip: the local pveproxy stripped /anas; the gateway forwards to the
     // peer with /anas re-added so the peer's pveproxy can route it.
-    assert.equal(received, '/anas/api/nodes/127.0.0.1/v1/pools?verbose=1')
+    assert.equal(received, '/anas/api/nodes/peer1/v1/pools?verbose=1')
 
     await server.close()
     await new Promise<void>(resolve => peer.close(() => resolve()))
@@ -490,14 +536,14 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     })
     const res = await server.inject({
       method: 'GET',
-      url: '/api/nodes/127.0.0.1/v1/pools',
+      url: '/api/nodes/peer1/v1/pools',
       headers: { cookie: 'PVEAuthCookie=x' },
     })
 
     assert.equal(res.statusCode, 502)
     const body = res.json()
     assert.equal(body.error.code, 'ANAS_NOT_INSTALLED')
-    assert.match(body.error.message, /127\.0\.0\.1/)
+    assert.match(body.error.message, /peer1/)
 
     await server.close()
     await new Promise<void>(resolve => peer.close(() => resolve()))
@@ -518,7 +564,7 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     })
     const res = await server.inject({
       method: 'GET',
-      url: '/api/nodes/127.0.0.1/v1/pools/nope',
+      url: '/api/nodes/peer1/v1/pools/nope',
       headers: { cookie: 'PVEAuthCookie=x' },
     })
 

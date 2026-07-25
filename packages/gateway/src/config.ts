@@ -24,6 +24,12 @@ export interface GatewayConfig {
   authProvider: string | undefined
   /** Cluster CA bundle used to verify the TLS hop to peer gateways. */
   clusterCa: string
+  /**
+   * PVE cluster membership file — maps node name → IP. PVE peers are NOT
+   * DNS-resolvable; PVE routes by the cluster's known addresses, so cross-node
+   * forwarding resolves the peer's IP here rather than trusting DNS.
+   */
+  membersPath: string
 }
 
 export function loadConfig(env = process.env): GatewayConfig {
@@ -35,5 +41,6 @@ export function loadConfig(env = process.env): GatewayConfig {
     anasdSocket: env.ANASD_SOCKET ?? '/run/anas/anasd.sock',
     authProvider: env.ANAS_AUTH_PROVIDER,
     clusterCa: env.ANAS_CLUSTER_CA ?? '/etc/pve/pve-root-ca.pem',
+    membersPath: env.ANAS_MEMBERS_PATH ?? '/etc/pve/.members',
   }
 }

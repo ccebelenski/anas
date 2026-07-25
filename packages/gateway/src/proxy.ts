@@ -26,6 +26,9 @@ interface UpstreamResult {
  */
 const ANAS_PROXY_PREFIX = '/anas'
 
+/** Cross-node forward timeout — a hung peer must not hang the browser request. */
+const FORWARD_TIMEOUT_MS = 15000
+
 /**
  * Classify a cross-node upstream response so we can tell an actual ANAS reply
  * apart from pveproxy's own "no such path" answer — which is what a peer's
@@ -197,10 +200,32 @@ function loadClusterCa(request: FastifyRequest, caPath: string): string | Buffer
  * Connection failure → 502 NODE_UNREACHABLE. A peer whose `:8006` answers but
  * lacks the `/anas` hook (ANAS not installed) → 502 ANAS_NOT_INSTALLED.
  */
+/**
+ * Resolve a cluster node name to its IP via PVE's membership file
+ * (`/etc/pve/.members`). PVE peers are NOT DNS names — PVE routes cross-node
+ * traffic by the cluster's own known addresses (corosync/pmxcfs), so we do the
+ * same rather than assuming `<node>` resolves via DNS/hosts (it usually does
+ * not). Re-read fresh each forward — membership (online state, IPs) changes.
+ * Returns the IP, or undefined if the node isn't in the membership or the file
+ * is unreadable.
+ */
+export function resolveNodeAddress(node: string, membersPath: string): string | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(membersPath, 'utf8')) as {
+      nodelist?: Record<string, { ip?: unknown }>
+    }
+    const ip = parsed.nodelist?.[node]?.ip
+    return typeof ip === 'string' && ip.length > 0 ? ip : undefined
+  }
+  catch {
+    return undefined
+  }
+}
+
 export async function forwardToNode(
   request: FastifyRequest,
   reply: FastifyReply,
-  opts: { node: string, pvePort: number, clusterCa: string },
+  opts: { node: string, pvePort: number, clusterCa: string, membersPath: string },
 ): Promise<void> {
   const ca = loadClusterCa(request, opts.clusterCa)
   if (ca === undefined) {
@@ -212,6 +237,19 @@ export async function forwardToNode(
       error: {
         code: 'CLUSTER_CA_UNAVAILABLE',
         message: `Cannot forward to node '${opts.node}': the cluster CA (peer TLS trust anchor) is unavailable, so the request is refused rather than sent over the public trust store.`,
+      },
+    })
+    return
+  }
+
+  // Resolve the peer's IP from PVE cluster membership — node names are not DNS
+  // names, so connecting to `<node>` directly fails to resolve (NODE_UNREACHABLE).
+  const address = resolveNodeAddress(opts.node, opts.membersPath)
+  if (address === undefined) {
+    await reply.code(502).send({
+      error: {
+        code: 'NODE_UNRESOLVED',
+        message: `Node '${opts.node}' is not in the PVE cluster membership (${opts.membersPath}); its address cannot be resolved. Is it a cluster member and online?`,
       },
     })
     return
@@ -237,7 +275,11 @@ export async function forwardToNode(
     const result = await new Promise<UpstreamResult>((resolve, reject) => {
       const req = httpsRequest(
         {
-          host: opts.node,
+          host: address,
+          // TLS SNI + cert-identity check uses the node NAME (PVE certs carry it
+          // in the SAN), while we connect to the resolved IP. Verified against
+          // the cluster CA below.
+          servername: opts.node,
           port: opts.pvePort,
           method: request.method,
           // Re-add the `/anas` prefix the local pveproxy stripped, so the peer's
@@ -245,6 +287,9 @@ export async function forwardToNode(
           path: `${ANAS_PROXY_PREFIX}${request.url}`,
           headers,
           agent: new HttpsAgent({ ca }),
+          // A down-but-not-refused peer (firewall drop, partition) must not hang
+          // the browser request — time out and surface NODE_UNREACHABLE instead.
+          timeout: FORWARD_TIMEOUT_MS,
         },
         (res) => {
           const chunks: Buffer[] = []
@@ -257,6 +302,7 @@ export async function forwardToNode(
         },
       )
       req.on('error', reject)
+      req.on('timeout', () => req.destroy(new Error(`connection to ${opts.node} timed out after ${FORWARD_TIMEOUT_MS}ms`)))
       if (body)
         req.write(body)
       req.end()
