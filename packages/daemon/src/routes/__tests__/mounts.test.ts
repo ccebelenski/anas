@@ -83,6 +83,43 @@ describe('mount routes (Epic 18)', () => {
       assert.ok(data.fstabLine?.includes('/mnt/anas-nfs'))
       assert.equal(data.health.state, 'ok')
       assert.ok(data.configuredOptions?.common.nofail)
+      // The edit dialog round-trips these — parsed from the fstab spec.
+      assert.equal(data.server, '127.0.0.1')
+      assert.equal(data.remotePath, '/srv/nfs/export1')
+    })
+
+    it('a CIFS create round-trips server/share + the saved username into detail', async () => {
+      const mountpoint = join(dir, 'cifsmnt')
+      const cres = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({
+          type: 'cifs',
+          server: 'nas.example.com',
+          remotePath: 'media',
+          mountpoint,
+          persistent: true,
+          options: { uid: 1002, gid: 1002, noatime: true },
+          credentials: { username: 'smbuser', password: 's3cret' },
+        }),
+      })
+      assert.equal(cres.statusCode, 202)
+      const cjob = await waitForJob(server!, cres.json().job.id)
+      assert.equal(cjob.status, 'completed', JSON.stringify(cjob.error))
+
+      const res = await server!.inject({ method: 'GET', url: `/v1/mounts/${enc(mountpoint)}`, headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: MountDetail }
+      assert.equal(data.type, 'cifs')
+      assert.equal(data.server, 'nas.example.com')
+      assert.equal(data.remotePath, 'media')
+      assert.equal(data.configuredOptions?.cifs?.uid, 1002)
+      assert.equal(data.configuredOptions?.cifs?.gid, 1002)
+      assert.equal(data.configuredOptions?.common.noatime, true)
+      // The secret is never returned, but the username is (for the edit dialog).
+      assert.equal(data.credentials?.set, true)
+      assert.equal(data.credentials?.username, 'smbuser')
     })
 
     it('404 for an unknown mountpoint', async () => {

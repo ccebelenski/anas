@@ -13,11 +13,13 @@ import {
   applyMountDefaults,
   buildBaseInventory,
   buildMountWarnings,
+  buildSpec,
   classifyStatHealth,
   credsFileName,
   formatCredentials,
   mapCifsFailure,
   mapNfsFailure,
+  parseSpec,
   parseStatCapacity,
   probeInventoryHealth,
   writeCredentialsFile,
@@ -72,6 +74,84 @@ describe('buildBaseInventory', () => {
 
   it('a live mount awaits the probe (state unknown until probed)', () => {
     assert.equal(by('/mnt/anas-nfs').state, 'unknown')
+  })
+
+  it('exposes parsed server/remotePath on the remote rows (edit round-trip)', () => {
+    const nfs = by('/mnt/anas-nfs')
+    assert.equal(nfs.server, '127.0.0.1')
+    assert.equal(nfs.remotePath, '/srv/nfs/export1')
+    const cifs = by('/mnt/anas-cifs')
+    assert.equal(cifs.server, '127.0.0.1')
+    assert.equal(cifs.remotePath, 'anastest')
+  })
+
+  it('never sets server/remotePath on a local row', () => {
+    const local = by('/mnttest') // ZFS
+    assert.equal(local.server, undefined)
+    assert.equal(local.remotePath, undefined)
+  })
+})
+
+describe('buildBaseInventory — server/remotePath on an option-rich cifs entry', () => {
+  const fstab = '//nas.example.com/media  /mnt/media  cifs  '
+    + 'credentials=/etc/anas/creds/media.cred,uid=1002,gid=1002,noatime,nofail  0  0\n'
+  const rows = buildBaseInventory('{"filesystems":[]}', fstab, new Map())
+  const media = rows.find(r => r.mountpoint === '/mnt/media')!
+
+  it('splits the spec even with credentials/uid/gid/noatime present', () => {
+    assert.equal(media.type, 'cifs')
+    assert.equal(media.server, 'nas.example.com')
+    assert.equal(media.remotePath, 'media')
+  })
+})
+
+describe('parseSpec — reverse of buildSpec (server/share from an fstab spec)', () => {
+  it('CIFS //server/share', () => {
+    assert.deepEqual(parseSpec('cifs', '//nas.example.com/media'), { server: 'nas.example.com', remotePath: 'media' })
+  })
+
+  it('CIFS backslashes \\\\server\\share', () => {
+    assert.deepEqual(parseSpec('cifs', '\\\\nas\\media'), { server: 'nas', remotePath: 'media' })
+  })
+
+  it('CIFS multi-segment share //server/share/sub', () => {
+    assert.deepEqual(parseSpec('cifs', '//nas/media/movies'), { server: 'nas', remotePath: 'media/movies' })
+  })
+
+  it('CIFS server-only //server', () => {
+    assert.deepEqual(parseSpec('cifs', '//nas'), { server: 'nas' })
+  })
+
+  it('NFS server:/export', () => {
+    assert.deepEqual(parseSpec('nfs', 'nas.example.com:/srv/export1'), { server: 'nas.example.com', remotePath: '/srv/export1' })
+  })
+
+  it('NFS bracketed IPv6 literal [addr]:/export', () => {
+    assert.deepEqual(parseSpec('nfs', '[2001:db8::1]:/export'), { server: '2001:db8::1', remotePath: '/export' })
+  })
+
+  it('NFS bare IPv6 splits at the colon before the export path', () => {
+    assert.deepEqual(parseSpec('nfs', '2001:db8::1:/export'), { server: '2001:db8::1', remotePath: '/export' })
+  })
+
+  it('malformed / empty specs fail graceful (no throw, {})', () => {
+    assert.deepEqual(parseSpec('nfs', ''), {})
+    assert.deepEqual(parseSpec('nfs', 'notaspec'), {})
+    assert.deepEqual(parseSpec('cifs', ''), {})
+    assert.deepEqual(parseSpec('cifs', '//'), {})
+  })
+
+  it('round-trips buildSpec across cifs / nfs / ipv6', () => {
+    const cases: Array<['nfs' | 'cifs', string, string]> = [
+      ['cifs', 'nas', 'media'],
+      ['cifs', 'nas', 'media/movies'],
+      ['nfs', 'nas.example.com', '/srv/export1'],
+      ['nfs', '2001:db8::1', '/export'],
+    ]
+    for (const [type, server, remotePath] of cases) {
+      const spec = buildSpec(type, { server, remotePath })
+      assert.deepEqual(parseSpec(type, spec), { server, remotePath }, `round-trip ${type} ${spec}`)
+    }
   })
 })
 

@@ -174,6 +174,16 @@ export function buildBaseInventory(
     // handled), and keep automount truthful for configured rows.
     if (entry)
       row.automount = row.automount || entry.options.common.automount
+    // Parse the spec back into server + remotePath for the remote kinds (nfs/cifs)
+    // — the edit dialog round-trips these. Prefer the configured fstab spec (the
+    // canonical identity); fall back to the findmnt source for a session mount.
+    if (isRemoteKind(row.type)) {
+      const { server, remotePath } = parseSpec(row.type, entry ? entry.spec : row.source)
+      if (server !== undefined)
+        row.server = server
+      if (remotePath !== undefined)
+        row.remotePath = remotePath
+    }
   }
 
   const rows = [...byTarget.values()]
@@ -427,6 +437,82 @@ export function buildSpec(type: MountType, req: { server?: string, remotePath?: 
   if (type === 'nfs')
     return `${req.server ?? ''}:${req.remotePath ?? '/'}`
   return `//${req.server ?? ''}/${req.remotePath ?? ''}`
+}
+
+/** Leading path separators on a CIFS spec (`//` or `\\`, mixed). */
+const CIFS_LEAD_RE = /^[/\\]+/
+/** Any run of forward- or back-slashes (CIFS segment splitter). */
+const CIFS_SEP_RE = /[/\\]+/
+
+/**
+ * Reverse of `buildSpec` (single source of truth for the spec<->parts mapping):
+ * split an fstab fs_spec / findmnt source back into `{ server, remotePath }` so
+ * the edit dialog can round-trip an existing entry. The exact inverse of the
+ * write-side device builder; `parseSpec(kind, buildSpec(type, { server, remotePath }))`
+ * recovers the original parts across cifs / nfs / ipv6.
+ *
+ * NOTE: the UI's `fstabDevice` (67-mounts.js) is a client-side PREVIEW mirror of
+ * `buildSpec` — the daemon owns the authoritative mapping in both directions;
+ * the UI write path is left intact (it only previews; the daemon rewrites fstab).
+ *
+ *  - CIFS `//server/share`, `\\server\share`, `//server/share/sub` — the first
+ *    segment is the server, the remainder (joined with `/`) is the share.
+ *  - NFS `server:/export`, bracketed IPv6 `[2001:db8::1]:/export`, and even a
+ *    bare IPv6 `2001:db8::1:/export` — the server ends at the colon that precedes
+ *    the absolute export path (`:/`), so embedded IPv6 colons never mis-split.
+ *
+ * Fields are omitted when absent; a malformed spec yields `{}` (never throws).
+ */
+export function parseSpec(kind: string, spec: string): { server?: string, remotePath?: string } {
+  const s = (spec ?? '').trim()
+  if (!s)
+    return {}
+
+  if (kind === 'cifs') {
+    const body = s.replace(CIFS_LEAD_RE, '')
+    const parts = body.split(CIFS_SEP_RE).filter(Boolean)
+    if (parts.length === 0)
+      return {}
+    const server = parts[0]
+    const remotePath = parts.slice(1).join('/')
+    return remotePath ? { server, remotePath } : { server }
+  }
+
+  if (kind === 'nfs') {
+    // Bracketed IPv6 literal: `[addr]:/export` (or `[addr]`).
+    if (s.startsWith('[')) {
+      const close = s.indexOf(']')
+      if (close !== -1) {
+        const server = s.slice(1, close)
+        let rest = s.slice(close + 1)
+        if (rest.startsWith(':'))
+          rest = rest.slice(1)
+        const out: { server?: string, remotePath?: string } = {}
+        if (server)
+          out.server = server
+        if (rest)
+          out.remotePath = rest
+        return out
+      }
+    }
+    // Split at the colon that precedes the absolute export path — this survives
+    // an unbracketed IPv6 server (whose own colons never precede a `/`).
+    let idx = s.indexOf(':/')
+    if (idx === -1)
+      idx = s.indexOf(':')
+    if (idx === -1)
+      return {} // no `host:` boundary — malformed, fail graceful
+    const server = s.slice(0, idx)
+    const remotePath = s.slice(idx + 1)
+    const out: { server?: string, remotePath?: string } = {}
+    if (server)
+      out.server = server
+    if (remotePath)
+      out.remotePath = remotePath
+    return out
+  }
+
+  return {}
 }
 
 /**

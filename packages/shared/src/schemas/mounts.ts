@@ -183,6 +183,18 @@ export const MountSummary = z.object({
   persistent: z.boolean(),
   /** NFS or CIFS. */
   remote: z.boolean(),
+  /**
+   * Remote host, parsed from the fstab spec / findmnt source (the inverse of the
+   * write-side `buildSpec`). Present for remote kinds only (nfs/cifs) — the edit
+   * dialog round-trips this back into the Server field. For CIFS `//host/share`
+   * it is `host`; for NFS `host:/export` (incl. `[ipv6]:/export`) it is `host`.
+   */
+  server: z.string().optional(),
+  /**
+   * Remote path parsed from the spec — the NFS export (`/srv/export1`) or the
+   * CIFS share (`share`, possibly multi-segment `share/sub`). Remote kinds only.
+   */
+  remotePath: z.string().optional(),
   /** x-systemd.automount configured. */
   automount: z.boolean(),
   /** Disabled-without-delete: fstab line marker-commented (`#ANAS `). Intentional. */

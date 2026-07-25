@@ -269,6 +269,26 @@
                 return mp + ' <span class="anas-mount-ahr-badge" title="' + enc(atip) + '">'
                     + abadge + '</span>';
             }
+            // Local (non-remote, non-PVE, non-AHR) rows are observe-only here —
+            // ANAS manages remote shares; local storage is ZFS/Pools territory.
+            // Mirror the PVE/AHR hands-off marker so the disabled action buttons
+            // have a visible explanation, not just a mute tooltip.
+            if (!isRemoteRec(rec)) {
+                var ltip = t('Local filesystem — managed under Pools (ZFS), not the Mounts feature');
+                var lbadge = '';
+                try {
+                    if (ANAS.gfx && typeof ANAS.gfx.badge === 'function') {
+                        lbadge = ANAS.gfx.badge('LOCAL', { title: ltip }) || '';
+                    }
+                } catch (eL) {
+                    lbadge = '';
+                }
+                if (!lbadge) {
+                    lbadge = '<span class="anas-gfx-badge" title="' + enc(ltip) + '">LOCAL</span>';
+                }
+                return mp + ' <span class="anas-mount-local-badge" title="' + enc(ltip) + '">'
+                    + lbadge + '</span>';
+            }
         } catch (e) {
             // fall through to the plain mountpoint
         }
@@ -1473,7 +1493,9 @@
                             fieldLabel: t('Server'),
                             emptyText: 'nas.example.com',
                             allowBlank: false,
-                            value: raw.server || '',
+                            // On edit this is filled from GET /mounts/:mp (detail.server),
+                            // which parses the fstab spec — the summary row has no parts.
+                            value: '',
                         },
                         {
                             xtype: 'textfield',
@@ -1482,7 +1504,8 @@
                             fieldLabel: protoType === 'nfs' ? t('Export path') : t('Share name'),
                             emptyText: protoType === 'nfs' ? '/srv/export1' : 'share1',
                             allowBlank: false,
-                            value: raw.remotePath || '',
+                            // Filled on edit from detail.remotePath (parsed spec).
+                            value: '',
                         },
                         {
                             xtype: 'textfield',
@@ -1613,6 +1636,110 @@
         win.show();
         applyType(win, protoType);
         onChange();
+
+        // On edit, the grid summary row lacks the structured options, the parsed
+        // server/share, and the saved username — those live only in the detail
+        // (GET /mounts/:mp). Fetch it and populate every field so the dialog
+        // round-trips the existing entry (blank Server/Share + disabled Save was
+        // the reported bug). onChange re-enables Save once the required fields fill.
+        if (isEdit) {
+            populateFromDetail(win, node, e.mountpoint || raw.mountpoint || '', onChange);
+        }
+    }
+
+    // Set a field's value by itemId selector, tolerating absent fields; skips
+    // undefined/null so an omitted option keeps the form default.
+    function setFld(win, sel, v) {
+        if (v === undefined || v === null) {
+            return;
+        }
+        try {
+            var f = win.down(sel);
+            if (f) { f.setValue(v); }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // Set a checkbox by itemId to an explicit boolean (false must uncheck).
+    function setChk(win, sel, on) {
+        try {
+            var f = win.down(sel);
+            if (f) { f.setValue(!!on); }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // Fetch GET /mounts/:mp (MountDetail) and populate the edit dialog from the
+    // parsed spec (server/remotePath), the structured configuredOptions, and the
+    // saved CIFS username. Password is deliberately left blank — the secret is
+    // never returned; a blank password on save means "keep the existing one".
+    function populateFromDetail(win, node, mountpoint, onChange) {
+        if (!mountpoint) {
+            return;
+        }
+        ANAS.api.get(node, '/mounts/' + encMp(mountpoint)).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var d = (res && res.data) || {};
+            var co = d.configuredOptions || {};
+            var common = co.common || {};
+
+            // Connection (parsed from the fstab spec by the daemon).
+            setFld(win, '#server', d.server);
+            setFld(win, '#remotePath', d.remotePath);
+
+            // Common options. The Access radiogroup has no itemId — address the
+            // sole radiogroup in the form; its change listener mirrors #optRo.
+            try {
+                var roGroup = win.down('#form radiogroup');
+                if (roGroup) { roGroup.setValue({ roMode: common.readOnly ? 'ro' : 'rw' }); }
+            } catch (eRo) {
+                // non-fatal
+            }
+            setChk(win, '#optNoatime', common.noatime);
+            setChk(win, '#optNosuid', common.nosuid);
+            setChk(win, '#optNodev', common.nodev);
+            setChk(win, '#optAutomount', common.automount);
+            setFld(win, '#optIdle', common.automountIdleTimeout);
+
+            // Persistence.
+            if (d.persistent === true || d.persistent === false) {
+                setChk(win, '#persist', d.persistent);
+            }
+
+            // NFS tier.
+            var nfs = co.nfs || {};
+            setFld(win, '#nfsVers', nfs.vers);
+            setChk(win, '#nfsHard', nfs.hard !== false); // default hard when unset
+            setFld(win, '#nfsTimeo', nfs.timeo);
+            setFld(win, '#nfsRetrans', nfs.retrans);
+            setFld(win, '#nfsRsize', nfs.rsize);
+            setFld(win, '#nfsWsize', nfs.wsize);
+
+            // CIFS tier.
+            var cifs = co.cifs || {};
+            setFld(win, '#cifsVers', cifs.vers);
+            setFld(win, '#credDomain', cifs.domain);
+            setFld(win, '#cifsUid', cifs.uid);
+            setFld(win, '#cifsGid', cifs.gid);
+            setFld(win, '#cifsFileMode', cifs.fileMode);
+            setFld(win, '#cifsDirMode', cifs.dirMode);
+
+            // Unrecognized options round-trip verbatim through the extra field.
+            setFld(win, '#extraOptions', co.passthrough);
+
+            // Saved CIFS username (never the password).
+            if (d.credentials && d.credentials.username) {
+                setFld(win, '#credUser', d.credentials.username);
+            }
+
+            if (typeof onChange === 'function') { onChange(); }
+        }, function (err) {
+            ANAS.warn('mount detail load for edit failed: ' + ANAS.errText(err));
+        });
     }
 
     function submitMount(win, view, node, isEdit) {
@@ -1691,15 +1818,23 @@
         if (type === 'cifs') {
             var user = ('' + (valOf(win, '#credUser') || '')).trim();
             var pass = valOf(win, '#credPass');
-            var creds = {};
-            if (user) { creds.username = user; }
-            // Password is write-only: on edit, an empty field means "unchanged"
-            // (do not send it); on create, send whatever was typed (may be empty
-            // for a guest share — the daemon decides).
-            if (pass) { creds.password = pass; }
-            if (dom) { creds.domain = dom; }
-            if (user || pass || dom || !isEdit) {
+            if (!isEdit) {
+                // Create: credentials are required (the daemon enforces it). Send
+                // whatever was typed; the schema requires username + password.
+                var creds = {};
+                if (user) { creds.username = user; }
+                if (pass) { creds.password = pass; }
+                if (dom) { creds.domain = dom; }
                 body.credentials = creds;
+            } else if (pass) {
+                // Edit: only ROTATE when a new password is entered. Username and
+                // password travel together (the creds file needs both, and the
+                // schema requires both). A blank password means "keep the existing
+                // credentials" — omit the block so the daemon leaves the 0600
+                // creds file untouched. (Domain still round-trips as a mount option.)
+                var creds2 = { username: user, password: pass };
+                if (dom) { creds2.domain = dom; }
+                body.credentials = creds2;
             }
         }
 
