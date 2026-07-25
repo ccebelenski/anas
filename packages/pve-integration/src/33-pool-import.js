@@ -26,14 +26,6 @@
         return ANAS.t ? ANAS.t(str) : str;
     }
 
-    function alertMsg(title, msg) {
-        try {
-            Ext.Msg.alert(t(title), t(msg));
-        } catch (e) {
-            ANAS.warn(msg);
-        }
-    }
-
     function scan(win, node) {
         var poolGrid = win.down('#importGrid');
         if (!poolGrid) {
@@ -52,7 +44,7 @@
             }
             poolGrid.setLoading(false);
             ANAS.warn('import scan failed: ' + ANAS.errText(err));
-            alertMsg('Error', t('Failed to scan for pools') + ': ' + ANAS.errText(err));
+            ANAS.alertMsg('Error', t('Failed to scan for pools') + ': ' + ANAS.errText(err));
         });
     }
 
@@ -63,7 +55,7 @@
         }
         var sel = poolGrid.getSelection() || [];
         if (!sel.length) {
-            alertMsg('Invalid input', 'Select a pool to import.');
+            ANAS.alertMsg('Invalid input', 'Select a pool to import.');
             return;
         }
         var rec = sel[0];

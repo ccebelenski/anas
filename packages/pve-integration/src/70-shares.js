@@ -72,14 +72,6 @@
         return ANAS.enc(s);
     }
 
-    function alertMsg(title, msg) {
-        try {
-            Ext.Msg.alert(t(title), msg);
-        } catch (e) {
-            ANAS.warn(msg);
-        }
-    }
-
     // Split a free-text list (comma / whitespace separated) into a trimmed,
     // empty-filtered array — used for hosts allow/deny and NFS export options.
     function splitList(str) {
@@ -603,11 +595,11 @@
         var name = (win.down('#name').getValue() || '').replace(/^\s+|\s+$/g, '');
         var path = (win.down('#path').getValue() || '').replace(/^\s+|\s+$/g, '');
         if (!isEdit && !name) {
-            alertMsg('Invalid input', t('Enter a share name.'));
+            ANAS.alertMsg('Invalid input', t('Enter a share name.'));
             return;
         }
         if (!path || path.charAt(0) !== '/') {
-            alertMsg('Invalid input', t('Enter an absolute path (starting with /).'));
+            ANAS.alertMsg('Invalid input', t('Enter an absolute path (starting with /).'));
             return;
         }
 
@@ -811,7 +803,7 @@
     function submitNfsExport(win, node, isEdit, existing, onDone) {
         var path = (win.down('#path').getValue() || '').replace(/^\s+|\s+$/g, '');
         if (!path || path.charAt(0) !== '/') {
-            alertMsg('Invalid input', t('Enter an absolute export path (starting with /).'));
+            ANAS.alertMsg('Invalid input', t('Enter an absolute export path (starting with /).'));
             return;
         }
         var grid = win.down('#clients');
@@ -827,7 +819,7 @@
             });
         }
         if (!clients.length) {
-            alertMsg('Invalid input', t('At least one client (host/subnet) is required.'));
+            ANAS.alertMsg('Invalid input', t('At least one client (host/subnet) is required.'));
             return;
         }
 
@@ -994,60 +986,6 @@
         return '/shares/nfs/' + encodeURIComponent(id);
     }
 
-    function runRemove(node, grid, proto, id, label, confirmCode) {
-        ANAS.runJob({
-            node: node,
-            method: 'del',
-            path: sharePath(proto, id),
-            confirmCode: confirmCode,
-            view: grid,
-            failTitle: 'Remove failed',
-            successMsg: t('Removed') + ' ' + label,
-            maxMs: 30000,
-            onComplete: function () {
-                loadShares(grid, node);
-            },
-        });
-    }
-
-    function showRemoveConfirm(node, grid, proto, id, label, confirmCode, warnings) {
-        var heading = proto === 'smb'
-            ? t('Remove SMB share') + ' "' + label + '"?'
-            : t('Remove NFS export') + ' "' + label + '"?';
-        var items = [{
-            xtype: 'component',
-            html: '<b>' + enc(heading) + '</b>'
-                + '<ul><li>'
-                + (warnings || []).map(function (w) { return enc(w); }).join('</li><li>')
-                + '</li></ul>',
-            margin: '0 0 8 0',
-        }];
-        var win = Ext.create('Ext.window.Window', {
-            title: proto === 'smb' ? t('Remove SMB share') : t('Remove NFS export'),
-            cls: 'anas-win-share-remove',
-            modal: true,
-            width: 480,
-            bodyPadding: 12,
-            layout: 'anchor',
-            items: items,
-            // Enter defaults to Cancel — the safe choice for a destructive op.
-            defaultButton: 'shareRemoveCancelBtn',
-            buttons: [{
-                text: t('Cancel'),
-                itemId: 'shareRemoveCancelBtn',
-                handler: function () { win.close(); },
-            }, {
-                text: t('Remove'),
-                cls: 'anas-btn-share-remove-confirm',
-                handler: function () {
-                    win.close();
-                    runRemove(node, grid, proto, id, label, confirmCode);
-                },
-            }],
-        });
-        win.show();
-    }
-
     function openRemove(node, grid, rec) {
         if (!rec) {
             return;
@@ -1056,18 +994,28 @@
         var raw = rec.get('raw') || {};
         var id = proto === 'smb' ? raw.name : raw.path;
         var label = rec.get('name');
-        // Step 1: unconfirmed DELETE → 409 challenge (code + warnings), or a
-        // hard error we surface directly.
-        ANAS.api.del(node, sharePath(proto, id)).then(function () {
-            // Unexpected: remove without confirmation should not succeed.
-            loadShares(grid, node);
-        }, function (err) {
-            if (err && err.status === 409 && err.confirmCode) {
-                var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
-                showRemoveConfirm(node, grid, proto, id, label, err.confirmCode, warnings);
-                return;
-            }
-            alertMsg('Remove failed', ANAS.errText(err));
+        var heading = proto === 'smb'
+            ? t('Remove SMB share') + ' "' + label + '"?'
+            : t('Remove NFS export') + ' "' + label + '"?';
+        // confirmAndRun fires the unconfirmed DELETE, then on the 409 challenge
+        // shows the warnings in a confirm window (no extra widgets here). A hard
+        // error surfaces via failTitle.
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'del',
+            path: sharePath(proto, id),
+            view: grid,
+            failTitle: 'Remove failed',
+            successMsg: t('Removed') + ' ' + label,
+            maxMs: 30000,
+            onComplete: function () { loadShares(grid, node); },
+            confirmWindow: true,
+            confirmTitle: proto === 'smb' ? 'Remove SMB share' : 'Remove NFS export',
+            confirmWidth: 480,
+            confirmIntro: '<b>' + enc(heading) + '</b>',
+            confirmButtonText: 'Remove',
+            confirmCls: 'anas-win-share-remove',
+            confirmButtonCls: 'anas-btn-share-remove-confirm',
         });
     }
 

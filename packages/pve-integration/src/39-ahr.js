@@ -732,37 +732,26 @@
     function changeMountpoint(win, node, name) {
         ANAS.api.get(node, '/ahr/' + encodeURIComponent(name)).then(function (res) {
             var current = (res && res.data && res.data.mountpoint) || '';
-            Ext.Msg.prompt(t('Change mount'), t('New mountpoint for') + ' <b>' + enc(name) + '</b>:',
-                function (btn, value) {
-                    if (btn !== 'ok' || !value || value === current) {
-                        return;
+            ANAS.changeMountpointFlow({
+                node: node,
+                resourcePath: '/ahr/' + encodeURIComponent(name),
+                label: name,
+                current: current,
+                view: win,
+                onDone: function () {
+                    if (win && !win.destroyed && !win.destroying) {
+                        loadDetailInto(win, node, name);
                     }
-                    ANAS.confirmAndRun({
-                        node: node,
-                        method: 'put',
-                        path: '/ahr/' + encodeURIComponent(name) + '/mountpoint',
-                        body: { mountpoint: value },
-                        view: win,
-                        confirmTitle: 'Change mount',
-                        confirmIntro: t('Moving') + ' <b>' + enc(name) + '</b> '
-                            + t('to') + ' <b>' + enc(value) + '</b>:',
-                        failTitle: 'Change mount failed',
-                        successMsg: t('Mountpoint changed') + ': ' + value,
-                        onComplete: function () {
-                            if (win && !win.destroyed && !win.destroying) {
-                                loadDetailInto(win, node, name);
-                            }
-                            if (ANAS.ahr && typeof ANAS.ahr.reload === 'function') {
-                                var grid = Ext.ComponentQuery.query('#ahrGrid')[0];
-                                if (grid) {
-                                    ANAS.ahr.reload(grid, node);
-                                }
-                            }
-                        },
-                    });
-                }, null, false, current);
+                    if (ANAS.ahr && typeof ANAS.ahr.reload === 'function') {
+                        var grid = Ext.ComponentQuery.query('#ahrGrid')[0];
+                        if (grid) {
+                            ANAS.ahr.reload(grid, node);
+                        }
+                    }
+                },
+            });
         }, function (err) {
-            Ext.Msg.alert(t('Change mount'), ANAS.errText(err));
+            ANAS.alertMsg('Change mount', ANAS.errText(err));
         });
     }
 
@@ -888,7 +877,7 @@
                     return;
                 }
                 g.setLoading(false);
-                Ext.Msg.alert(t('Snapshots'), t('Failed to load snapshots') + ': ' + ANAS.errText(err));
+                ANAS.alertMsg('Snapshots', t('Failed to load snapshots') + ': ' + ANAS.errText(err));
             });
         }
         function updateSnapButtons() {
@@ -1076,7 +1065,7 @@
             grid.setLoading(false);
             ANAS.warn('ahr load failed: ' + ANAS.errText(err));
             try {
-                Ext.Msg.alert(t('Error'),
+                ANAS.alertMsg('Error',
                     t('Failed to load Hybrid RAID pools') + ': ' + ANAS.errText(err));
             } catch (e) {
                 // non-fatal
@@ -1251,7 +1240,7 @@
         function submit() {
             var diskId = spareDrag ? spareDrag.selectedInBay('spare')[0] : null;
             if (!diskId) {
-                Ext.Msg.alert(t('Add hot spare'), t('Drag the disk to attach onto the spare bay.'));
+                ANAS.alertMsg('Add hot spare', t('Drag the disk to attach onto the spare bay.'));
                 return;
             }
             ANAS.confirmAndRun({
@@ -1424,7 +1413,7 @@
             }
             win.setLoading(false);
             try {
-                Ext.Msg.alert(t('Error'), t('Failed to load disks') + ': ' + ANAS.errText(err));
+                ANAS.alertMsg('Error', t('Failed to load disks') + ': ' + ANAS.errText(err));
             } catch (e) {
                 ANAS.warn('ahr spare disk load failed: ' + ANAS.errText(err));
             }
@@ -1489,7 +1478,7 @@
             }
         }, function (err) {
             if (!apiMissing(err, t('Expansion resume'))) {
-                Ext.Msg.alert(t('Resume expansion'), ANAS.errText(err));
+                ANAS.alertMsg('Resume expansion', ANAS.errText(err));
             }
         });
     }
@@ -1528,7 +1517,7 @@
     function apiMissing(err, what) {
         if (err && err.status === 404) {
             try {
-                Ext.Msg.alert(t('Not available'),
+                ANAS.alertMsg('Not available',
                     enc(what) + ' ' + t('is not available in this build of the ANAS daemon yet.'));
             } catch (e) {
                 ANAS.warn(what + ' unavailable (404)');
@@ -1564,7 +1553,7 @@
                 return;
             }
             try {
-                Ext.Msg.alert(t('Scrub failed'), ANAS.errText(err));
+                ANAS.alertMsg('Scrub failed', ANAS.errText(err));
             } catch (e) {
                 ANAS.warn('ahr scrub failed: ' + ANAS.errText(err));
             }
@@ -1783,7 +1772,7 @@
             if (mode === 'add') {
                 var add = addDrag ? addDrag.selectedInBay('pool') : [];
                 if (!add.length) {
-                    Ext.Msg.alert(t('Expand'), t('Drag at least one disk into the add bay.'));
+                    ANAS.alertMsg('Expand', t('Drag at least one disk into the add bay.'));
                     return null;
                 }
                 return { addDisks: add };
@@ -1791,7 +1780,7 @@
             var oldId = checkedValues(root, 'ahrx-old')[0];
             var newId = checkedValues(root, 'ahrx-new')[0];
             if (!oldId || !newId) {
-                Ext.Msg.alert(t('Expand'), t('Select the member to replace and its replacement.'));
+                ANAS.alertMsg('Expand', t('Select the member to replace and its replacement.'));
                 return null;
             }
             return { replace: { oldDiskId: oldId, newDiskId: newId } };
@@ -1843,7 +1832,7 @@
                         return;
                     }
                     try {
-                        Ext.Msg.alert(t('Plan failed'), ANAS.errText(err));
+                        ANAS.alertMsg('Plan failed', ANAS.errText(err));
                     } catch (e) {
                         ANAS.warn('ahr plan failed: ' + ANAS.errText(err));
                     }
@@ -1965,7 +1954,7 @@
             }
             win.setLoading(false);
             try {
-                Ext.Msg.alert(t('Error'), t('Failed to load disks') + ': ' + ANAS.errText(err));
+                ANAS.alertMsg('Error', t('Failed to load disks') + ': ' + ANAS.errText(err));
             } catch (e) {
                 ANAS.warn('ahr expand disk load failed: ' + ANAS.errText(err));
             }
@@ -1995,7 +1984,7 @@
             var oldId = checkedValues(root, 'ahrr-old')[0];
             var newId = checkedValues(root, 'ahrr-new')[0];
             if (!oldId || !newId) {
-                Ext.Msg.alert(t('Replace disk'), t('Select the member to replace and its replacement.'));
+                ANAS.alertMsg('Replace disk', t('Select the member to replace and its replacement.'));
                 return;
             }
             ANAS.confirmAndRun({
@@ -2103,7 +2092,7 @@
                 }
                 win.setLoading(false);
                 try {
-                    Ext.Msg.alert(t('Error'), t('Failed to load disks') + ': ' + ANAS.errText(err2));
+                    ANAS.alertMsg('Error', t('Failed to load disks') + ': ' + ANAS.errText(err2));
                 } catch (e) {
                     ANAS.warn('ahr replace disk load failed: ' + ANAS.errText(err2));
                 }
@@ -2117,7 +2106,7 @@
                 return;
             }
             try {
-                Ext.Msg.alert(t('Error'), t('Failed to load pool') + ': ' + ANAS.errText(err));
+                ANAS.alertMsg('Error', t('Failed to load pool') + ': ' + ANAS.errText(err));
             } catch (e) {
                 ANAS.warn('ahr replace pool load failed: ' + ANAS.errText(err));
             }
@@ -2185,22 +2174,8 @@
                             menuDisabled: true,
                             renderer: renderUsable,
                         },
-                        {
-                            text: t('Mount'),
-                            dataIndex: 'mountpoint',
-                            flex: 1,
-                            minWidth: 180,
-                            sortable: false,
-                            menuDisabled: true,
-                            renderer: function (v, meta, rec) {
-                                var mounted = rec && rec.get('mounted');
-                                var path = enc(v || '');
-                                return mounted
-                                    ? path
-                                    : path + ' <span style="color:var(--anas-warn);font-size:11px">('
-                                        + enc(t('not mounted')) + ')</span>';
-                            },
-                        },
+                        // Shared Mount column — identical to the Pools grid's.
+                        ANAS.gfx.mountColumn(),
                         {
                             text: t('Activity'),
                             dataIndex: 'arrays',
@@ -2232,7 +2207,7 @@
                                         ANAS.ahrComposer.open({ node: node, grid: grid });
                                         return;
                                     }
-                                    Ext.Msg.alert(t('Create'), t('The Hybrid RAID composer is unavailable.'));
+                                    ANAS.alertMsg('Create', t('The Hybrid RAID composer is unavailable.'));
                                 } catch (e) {
                                     ANAS.warn('ahr composer open failed: ' + ANAS.errText(e));
                                 }

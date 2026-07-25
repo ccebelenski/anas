@@ -1351,6 +1351,31 @@
         };
     };
 
+    // mountColumn(opts) → the shared ExtJS grid column config for a "Mount"
+    // column: the mountpoint path, with a muted warn-coloured "(not mounted)"
+    // suffix when the row's `mounted` flag is false. The Pools grid and the AHR
+    // grid render this byte-identically (a mount is a mount in either view).
+    //   opts : { text:String header override (default 'Mount') }
+    gfx.mountColumn = function (opts) {
+        opts = opts || {};
+        return {
+            text: ANAS.t(opts.text || 'Mount'),
+            dataIndex: 'mountpoint',
+            flex: 1,
+            minWidth: 180,
+            sortable: false,
+            menuDisabled: true,
+            renderer: function (v, meta, rec) {
+                var mounted = rec && rec.get('mounted');
+                var path = enc(v || '');
+                return mounted
+                    ? path
+                    : path + ' <span style="color:var(--anas-warn);font-size:11px">('
+                        + enc(ANAS.t('not mounted')) + ')</span>';
+            },
+        };
+    };
+
     // ---- publish + prime injection ----------------------------------------
 
     gfx.fillColorVar = fillColorVar; // exposed so views can colour-match custom bits

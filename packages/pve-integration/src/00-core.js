@@ -161,6 +161,19 @@
         }
     };
 
+    // Fail-open error alert: translate the TITLE, pass the body verbatim, and if
+    // Ext.Msg is unavailable fall back to a console warning rather than throw.
+    // The single home for the `try { Ext.Msg.alert(t(title), msg) } catch`
+    // idiom that every view used to redefine locally. Bodies are raw (callers
+    // that want a translated body call ANAS.t themselves); only the title is t()'d.
+    ANAS.alertMsg = function (title, msg) {
+        try {
+            Ext.Msg.alert(ANAS.t(title), msg);
+        } catch (e) {
+            ANAS.warn(msg);
+        }
+    };
+
     // A panel config that displays an error message — used as the fail-open
     // fallback when a view factory throws, so a broken view degrades to a
     // message instead of breaking the PVE content area.

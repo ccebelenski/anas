@@ -93,14 +93,6 @@
         return ANAS.enc(s);
     }
 
-    function alertMsg(title, msg) {
-        try {
-            Ext.Msg.alert(t(title), msg);
-        } catch (e) {
-            ANAS.warn(msg);
-        }
-    }
-
     function fmtBytes(v) {
         try {
             return ANAS.formatBytes(v);
@@ -1131,7 +1123,7 @@
         var server = ('' + (valOf(win, '#server') || '')).trim();
         var remotePath = ('' + (valOf(win, '#remotePath') || '')).trim();
         if (!server || !remotePath) {
-            alertMsg('Invalid input', t('Enter a server and a share/export path to test.'));
+            ANAS.alertMsg('Invalid input', t('Enter a server and a share/export path to test.'));
             return;
         }
         var area = win.down('#testResult');
@@ -1627,7 +1619,7 @@
         var form = win.down('#form');
         var basicForm = form && form.getForm();
         if (basicForm && basicForm.isValid && !basicForm.isValid()) {
-            alertMsg('Invalid input', t('Fill in the required fields.'));
+            ANAS.alertMsg('Invalid input', t('Fill in the required fields.'));
             return;
         }
         var type = valOf(win, '#type') || 'nfs';
@@ -1635,11 +1627,11 @@
         var remotePath = ('' + (valOf(win, '#remotePath') || '')).trim();
         var mountpoint = ('' + (valOf(win, '#mountpoint') || '')).trim();
         if (!server || !remotePath) {
-            alertMsg('Invalid input', t('Enter a server and a share/export path.'));
+            ANAS.alertMsg('Invalid input', t('Enter a server and a share/export path.'));
             return;
         }
         if (!MP_RE.test(mountpoint)) {
-            alertMsg('Invalid input', t('Mountpoint must be an absolute path (e.g. /mnt/nas-share).'));
+            ANAS.alertMsg('Invalid input', t('Mountpoint must be an absolute path (e.g. /mnt/nas-share).'));
             return;
         }
 

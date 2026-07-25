@@ -63,14 +63,6 @@
         return ANAS.enc(s);
     }
 
-    function alertMsg(title, msg) {
-        try {
-            Ext.Msg.alert(t(title), msg);
-        } catch (e) {
-            ANAS.warn(msg);
-        }
-    }
-
     function trim(v) {
         return ('' + (v == null ? '' : v)).replace(/^\s+|\s+$/g, '');
     }
@@ -424,14 +416,14 @@
         }
         var name = trim(win.down('#name').getValue());
         if (!name || !NAME_RE.test(name)) {
-            alertMsg('Invalid input', t('Enter a valid username (lowercase letters, digits, _ and -).'));
+            ANAS.alertMsg('Invalid input', t('Enter a valid username (lowercase letters, digits, _ and -).'));
             return;
         }
         var pw = win.down('#smbPassword').getValue() || '';
         var pwc = win.down('#smbPasswordConfirm').getValue() || '';
         if (pw || pwc) {
             if (pw !== pwc) {
-                alertMsg('Invalid input', t('The SMB passwords do not match.'));
+                ANAS.alertMsg('Invalid input', t('The SMB passwords do not match.'));
                 return;
             }
         }
@@ -543,11 +535,11 @@
         var pw = win.down('#password').getValue() || '';
         var pwc = win.down('#passwordConfirm').getValue() || '';
         if (!pw) {
-            alertMsg('Invalid input', t('Enter a password.'));
+            ANAS.alertMsg('Invalid input', t('Enter a password.'));
             return;
         }
         if (pw !== pwc) {
-            alertMsg('Invalid input', t('The passwords do not match.'));
+            ANAS.alertMsg('Invalid input', t('The passwords do not match.'));
             return;
         }
 
@@ -847,7 +839,7 @@
         }
         var name = trim(win.down('#name').getValue());
         if (!name || !NAME_RE.test(name)) {
-            alertMsg('Invalid input', t('Enter a valid group name (lowercase letters, digits, _ and -).'));
+            ANAS.alertMsg('Invalid input', t('Enter a valid group name (lowercase letters, digits, _ and -).'));
             return;
         }
 

@@ -260,8 +260,27 @@
         return { render: render, selectedInBay: idsInBay };
     }
 
-    // Shared with 39-ahr.js (loads after this file): the expand wizard's
-    // add-disks step and the spare bay reuse the same drag idiom.
+    // makeDragSelect is a gfx concern (it renders ANAS.gfx.dragDisk cards and
+    // wires ANAS.gfx.drag), so its canonical home is the gfx namespace. The old
+    // ANAS.ahrComposer.makeDragSelect name is kept as a back-compat alias so the
+    // existing 39-ahr.js callers (spare bay, expand add-disks) keep working.
+    //
+    // SEAM (S6, deliberately NOT merged): the ZFS pool composer
+    // (38-pool-composer.js) does NOT consume makeDragSelect. makeDragSelect is an
+    // all-or-nothing controller — it OWNS card rendering and a flat diskId→bayId
+    // `assigned` map, and its render() overwrites each bay's innerHTML with just
+    // cards. The pool composer instead owns a multi-vdev model where each bay is
+    // a typed, ordered, deletable vdev carrying its own <select data-vtype> +
+    // delete-vdev control interleaved with the cards, plus renderRacks/renderAvail
+    // rendering that is far richer than a flat card list. Taking "just the
+    // drag/unassign layer" is not possible without either rewriting that model
+    // (high risk, no UI test harness) or pulling the vdev machinery into the
+    // shared helper (explicitly out of scope). The one primitive both genuinely
+    // share — ANAS.gfx.drag — is already shared. So the pool composer keeps its
+    // own wireDynamic; this promotion stops at homing the name + documenting the
+    // seam.
+    ANAS.gfx = ANAS.gfx || {};
+    ANAS.gfx.makeDragSelect = ANAS.gfx.makeDragSelect || makeDragSelect;
     ANAS.ahrComposer = ANAS.ahrComposer || {};
     ANAS.ahrComposer.makeDragSelect = makeDragSelect;
 

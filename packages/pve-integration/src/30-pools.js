@@ -620,7 +620,7 @@
             grid.setLoading(false);
             ANAS.warn('pools load failed: ' + ANAS.errText(err));
             try {
-                Ext.Msg.alert(ANAS.t('Error'),
+                ANAS.alertMsg('Error',
                     ANAS.t('Failed to load pools') + ': ' + ANAS.errText(err));
             } catch (e) {
                 // non-fatal
@@ -977,24 +977,8 @@
                     width: 150,
                     renderer: renderCapacityBar,
                 },
-                {
-                    // story 3.27: mirrors the AHR grid's Mount column exactly —
-                    // same header, same unmounted presentation.
-                    text: ANAS.t('Mount'),
-                    dataIndex: 'mountpoint',
-                    flex: 1,
-                    minWidth: 180,
-                    sortable: false,
-                    menuDisabled: true,
-                    renderer: function (v, meta, rec) {
-                        var mounted = rec && rec.get('mounted');
-                        var path = encHtml(v || '');
-                        return mounted
-                            ? path
-                            : path + ' <span style="color:var(--anas-warn);font-size:11px">('
-                                + encHtml(ANAS.t('not mounted')) + ')</span>';
-                    },
-                },
+                // story 3.27: shared Mount column — identical to the AHR grid's.
+                ANAS.gfx.mountColumn(),
                 {
                     text: ANAS.t('Fragmentation'),
                     dataIndex: 'fragmentation',
@@ -1299,34 +1283,22 @@
     // prefilled with the current path; the daemon validates (reserved paths,
     // collisions, PVE hands-off) and confirm-gates the ZFS-native remount.
     function changeMountpoint(win, node, poolName, current) {
-        Ext.Msg.prompt(ANAS.t('Change mount'),
-            ANAS.t('New mountpoint for') + ' <b>' + encHtml(poolName) + '</b>:',
-            function (btn, value) {
-                if (btn !== 'ok' || !value || value === current) {
-                    return;
+        ANAS.changeMountpointFlow({
+            node: node,
+            resourcePath: '/pools/' + encodeURIComponent(poolName),
+            label: poolName,
+            current: current || '',
+            view: win,
+            onDone: function () {
+                if (win && !win.destroyed && !win.destroying && win._reload) {
+                    win._reload();
                 }
-                ANAS.confirmAndRun({
-                    node: node,
-                    method: 'put',
-                    path: '/pools/' + encodeURIComponent(poolName) + '/mountpoint',
-                    body: { mountpoint: value },
-                    view: win,
-                    confirmTitle: 'Change mount',
-                    confirmIntro: ANAS.t('Moving') + ' <b>' + encHtml(poolName) + '</b> '
-                        + ANAS.t('to') + ' <b>' + encHtml(value) + '</b>:',
-                    failTitle: 'Change mount failed',
-                    successMsg: ANAS.t('Mountpoint changed') + ': ' + value,
-                    onComplete: function () {
-                        if (win && !win.destroyed && !win.destroying && win._reload) {
-                            win._reload();
-                        }
-                        var grid = Ext.ComponentQuery.query('#poolsGrid')[0];
-                        if (grid) {
-                            loadPools(grid, node);
-                        }
-                    },
-                });
-            }, null, false, current || '');
+                var grid = Ext.ComponentQuery.query('#poolsGrid')[0];
+                if (grid) {
+                    loadPools(grid, node);
+                }
+            },
+        });
     }
 
     function showPoolDetail(node, poolName) {
@@ -1459,7 +1431,7 @@
                     });
                     return;
                 }
-                Ext.Msg.alert(ANAS.t('Add Vdevs'), ANAS.t('The Pool Composer is unavailable.'));
+                ANAS.alertMsg('Add Vdevs', ANAS.t('The Pool Composer is unavailable.'));
             } catch (e) {
                 ANAS.warn('add-vdevs (composer expand) failed: ' + ANAS.errText(e));
             }

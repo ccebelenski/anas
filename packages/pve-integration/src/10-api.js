@@ -251,31 +251,110 @@
         setTimeout(tick, interval);
     };
 
+    // Server-warnings → HTML bullet list. Single source for the
+    // '<ul><li>…</li></ul>' builder that confirmAndRun and every hand-rolled
+    // destructive-confirm window used to copy. Empty/absent → '' (no stray list).
+    ANAS.warningsHtml = function (warnings) {
+        warnings = warnings || [];
+        if (!warnings.length) { return ''; }
+        return '<ul><li>' + warnings.map(function (w) {
+            return ANAS.enc(w);
+        }).join('</li><li>') + '</li></ul>';
+    };
+
+    // Shallow-copy an opts object (own enumerable keys only).
+    function shallowCopy(o) {
+        var out = {};
+        var k;
+        for (k in o) { if (o.hasOwnProperty(k)) { out[k] = o[k]; } }
+        return out;
+    }
+
+    // Build the confirmed-resend runJob opts from the original opts + the 409's
+    // confirm code, folding in an optional { pathSuffix, bodyPatch } from a
+    // widget dialog's mapConfirm.
+    function buildRetry(opts, err, extra) {
+        var retry = shallowCopy(opts);
+        retry.confirmCode = err.confirmCode;
+        extra = extra || {};
+        if (extra.pathSuffix) { retry.path = opts.path + extra.pathSuffix; }
+        if (extra.bodyPatch) {
+            var body = shallowCopy(opts.body || {});
+            var pk;
+            for (pk in extra.bodyPatch) {
+                if (extra.bodyPatch.hasOwnProperty(pk)) { body[pk] = extra.bodyPatch[pk]; }
+            }
+            retry.body = body;
+        }
+        return retry;
+    }
+
+    // Widget-hosting confirm window: an Ext.window.Window (Ext.Msg.confirm cannot
+    // host a checkbox) with the warnings + any extraItems, a normal (non-flat)
+    // primary button, and Cancel as the default (Enter = the safe choice for a
+    // destructive op). On confirm, mapConfirm(win) may return
+    // { pathSuffix, bodyPatch } folded into the resend.
+    function confirmWindow(opts, err) {
+        var intro = opts.confirmIntro || ANAS.t('This operation requires confirmation:');
+        var items = [{
+            xtype: 'component',
+            html: intro + ANAS.warningsHtml((err.body && err.body.error && err.body.error.warnings) || []),
+            margin: '0 0 8 0',
+        }];
+        var extra = opts.extraItems || [];
+        for (var i = 0; i < extra.length; i++) { items.push(extra[i]); }
+        var win = Ext.create('Ext.window.Window', {
+            title: ANAS.t(opts.confirmTitle || 'Confirm'),
+            cls: opts.confirmCls || 'anas-win-confirm',
+            modal: true,
+            width: opts.confirmWidth || 460,
+            bodyPadding: 12,
+            layout: 'anchor',
+            items: items,
+            defaultButton: 'anasConfirmCancelBtn',
+            buttons: [{
+                text: ANAS.t('Cancel'),
+                itemId: 'anasConfirmCancelBtn',
+                handler: function () { win.close(); },
+            }, {
+                text: ANAS.t(opts.confirmButtonText || 'OK'),
+                cls: opts.confirmButtonCls,
+                handler: function () {
+                    var extraOut = (typeof opts.mapConfirm === 'function')
+                        ? (opts.mapConfirm(win) || {}) : {};
+                    win.close();
+                    ANAS.runJob(buildRetry(opts, err, extraOut));
+                },
+            }],
+        });
+        win.show();
+    }
+
     // Dangerous-operation wrapper (Principle 14): run a mutation; on a 409 with a
     // confirm code, show the server's warnings and, if the user confirms, resend
     // with the code. `opts` is a runJob opts object; `confirmTitle`/`confirmIntro`
     // customise the dialog.
+    //
+    // Two presentations:
+    //   * default — Ext.Msg.confirm (Yes/No) for a plain confirmation.
+    //   * widget window — set confirmWindow:true to render an Ext.window.Window
+    //     that can host extraItems:[checkboxCfg,…]; mapConfirm(win) → optional
+    //     { pathSuffix, bodyPatch } folds the widget values into the resend. Also
+    //     honours confirmCls / confirmButtonText / confirmButtonCls / confirmWidth.
     ANAS.confirmAndRun = function (opts) {
-        var base = {};
-        var k;
-        for (k in opts) { if (opts.hasOwnProperty(k)) { base[k] = opts[k]; } }
+        var base = shallowCopy(opts);
         base.onConfirm = function (err) {
-            var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
-            var intro = opts.confirmIntro || ANAS.t('This operation requires confirmation:');
-            var msg = intro;
-            if (warnings.length) {
-                msg += '<ul><li>' + warnings.map(function (w) {
-                    return Ext.String.htmlEncode(w);
-                }).join('</li><li>') + '</li></ul>';
-            }
             try {
+                if (opts.confirmWindow) {
+                    confirmWindow(opts, err);
+                    return;
+                }
+                var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
+                var intro = opts.confirmIntro || ANAS.t('This operation requires confirmation:');
+                var msg = intro + ANAS.warningsHtml(warnings);
                 Ext.Msg.confirm(ANAS.t(opts.confirmTitle || 'Confirm'), msg, function (btn) {
                     if (btn === 'yes') {
-                        var retry = {};
-                        var j;
-                        for (j in opts) { if (opts.hasOwnProperty(j)) { retry[j] = opts[j]; } }
-                        retry.confirmCode = err.confirmCode;
-                        ANAS.runJob(retry);
+                        ANAS.runJob(buildRetry(opts, err));
                     }
                 });
             } catch (e) {
@@ -283,5 +362,87 @@
             }
         };
         ANAS.runJob(base);
+    };
+
+    // CAS-aware mutation: POST/PUT/DELETE returning a 202 job. Success polls the
+    // job; a 409 whose error code is 'CONFLICT' (the registry moved under us) is
+    // routed to onConflict for a reload-and-retry — but any OTHER 409 (e.g.
+    // IN_USE: a repo still referenced by tasks) is a refusal whose message must
+    // surface, so it falls through to onError/alert and is never swallowed.
+    // Distinct from runJob/confirmAndRun: the registry 409 is a stale-version
+    // conflict, not an X-Anas-Confirm-Code challenge.
+    //   o: node, method('post'|'put'|'del'), path, body, view, successMsg,
+    //      failTitle, onComplete, onFailed, onConflict(err), onError(err)
+    ANAS.casWrite = function (o) {
+        var call;
+        if (o.method === 'put') {
+            call = api.put(o.node, o.path, o.body);
+        } else if (o.method === 'del') {
+            call = api.del(o.node, o.path);
+        } else {
+            call = api.post(o.node, o.path, o.body);
+        }
+        call.then(function (res) {
+            var job = res && res.job;
+            if (!job || !job.id) {
+                if (o.successMsg) { ANAS.toast(o.successMsg); }
+                if (o.onComplete) { o.onComplete(); }
+                return;
+            }
+            ANAS.pollJob(o.node, job.id, {
+                view: o.view,
+                successMsg: o.successMsg,
+                failTitle: o.failTitle,
+                onComplete: function () { if (o.onComplete) { o.onComplete(); } },
+                onFailed: o.onFailed,
+            });
+        }, function (err) {
+            if (err && err.status === 409) {
+                var code = err.body && err.body.error && err.body.error.code;
+                if (code === 'CONFLICT' && o.onConflict) {
+                    o.onConflict(err);
+                    return;
+                }
+            }
+            if (o.onError) {
+                o.onError(err);
+                return;
+            }
+            ANAS.alertMsg(o.failTitle || 'Operation failed', ANAS.errText(err));
+        });
+    };
+
+    // Change-mountpoint flow (shared by Pools and AHR): prompt for a new
+    // mountpoint prefilled with the current path, guard the value-unchanged case,
+    // then confirmAndRun the PUT (the daemon validates + confirm-gates the
+    // remount). Callers differ only in resourcePath, label, current, and onDone.
+    //   o: node, resourcePath (e.g. '/pools/tank' — '/mountpoint' is appended),
+    //      label (display name), current (prefill), view, onDone()
+    ANAS.changeMountpointFlow = function (o) {
+        var current = o.current || '';
+        try {
+            Ext.Msg.prompt(ANAS.t('Change mount'),
+                ANAS.t('New mountpoint for') + ' <b>' + ANAS.enc(o.label) + '</b>:',
+                function (btn, value) {
+                    if (btn !== 'ok' || !value || value === current) {
+                        return;
+                    }
+                    ANAS.confirmAndRun({
+                        node: o.node,
+                        method: 'put',
+                        path: o.resourcePath + '/mountpoint',
+                        body: { mountpoint: value },
+                        view: o.view,
+                        confirmTitle: 'Change mount',
+                        confirmIntro: ANAS.t('Moving') + ' <b>' + ANAS.enc(o.label) + '</b> '
+                            + ANAS.t('to') + ' <b>' + ANAS.enc(value) + '</b>:',
+                        failTitle: 'Change mount failed',
+                        successMsg: ANAS.t('Mountpoint changed') + ': ' + value,
+                        onComplete: function () { if (o.onDone) { o.onDone(); } },
+                    });
+                }, null, false, current);
+        } catch (e) {
+            ANAS.warn('changeMountpointFlow failed: ' + ANAS.errText(e));
+        }
     };
 })();

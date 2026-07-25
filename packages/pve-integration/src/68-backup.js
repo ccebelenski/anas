@@ -117,14 +117,6 @@
         return ANAS.enc(s);
     }
 
-    function alertMsg(title, msg) {
-        try {
-            Ext.Msg.alert(t(title), msg);
-        } catch (e) {
-            ANAS.warn(msg);
-        }
-    }
-
     function gfxReady() {
         return ANAS.gfx && ANAS.gfx.ready ? ANAS.gfx.ready() : false;
     }
@@ -801,52 +793,8 @@
         pickerBrowse(win, node, start);
     }
 
-    // ======================================================================
-    //  CAS-aware repo write (mirrors the replication remotes discipline)
-    // ======================================================================
-
-    function casWrite(o) {
-        var call;
-        if (o.method === 'put') {
-            call = ANAS.api.put(o.node, o.path, o.body);
-        } else if (o.method === 'del') {
-            call = ANAS.api.del(o.node, o.path);
-        } else {
-            call = ANAS.api.post(o.node, o.path, o.body);
-        }
-        call.then(function (res) {
-            var job = res && res.job;
-            if (!job || !job.id) {
-                if (o.successMsg) { ANAS.toast(o.successMsg); }
-                if (o.onComplete) { o.onComplete(); }
-                return;
-            }
-            ANAS.pollJob(o.node, job.id, {
-                view: o.view,
-                successMsg: o.successMsg,
-                failTitle: o.failTitle,
-                onComplete: function () { if (o.onComplete) { o.onComplete(); } },
-                onFailed: o.onFailed,
-            });
-        }, function (err) {
-            if (err && err.status === 409) {
-                // Only a CAS 'CONFLICT' (registry moved) gets the
-                // reload-and-retry treatment; any other 409 (e.g. IN_USE —
-                // repo still referenced by tasks) is a refusal whose message
-                // must be shown, not swallowed by "registry changed".
-                var code = err.body && err.body.error && err.body.error.code;
-                if (code === 'CONFLICT' && o.onConflict) {
-                    o.onConflict(err);
-                    return;
-                }
-            }
-            if (o.onError) {
-                o.onError(err);
-                return;
-            }
-            alertMsg(o.failTitle || 'Operation failed', ANAS.errText(err));
-        });
-    }
+    // CAS-aware repo writes go through the shared ANAS.casWrite (10-api.js) —
+    // the same registry-conflict discipline the replication remotes use.
 
     // ======================================================================
     //  Task grid load / reload
@@ -1572,38 +1520,38 @@
         var form = win.down('#form');
         var basicForm = form && form.getForm();
         if (basicForm && basicForm.isValid && !basicForm.isValid()) {
-            alertMsg('Invalid input', t('Fill in the required fields.'));
+            ANAS.alertMsg('Invalid input', t('Fill in the required fields.'));
             return;
         }
         var name = trim(valOf(win, '#name'));
         if (!NAME_RE.test(name) || name.length > 64) {
-            alertMsg('Invalid input',
+            ANAS.alertMsg('Invalid input',
                 t('Task name must be lowercase letters, digits and hyphens (≤64 chars).'));
             return;
         }
         var repository = valOf(win, '#repository');
         if (!repository) {
-            alertMsg('Invalid input', t('Choose a repository.'));
+            ANAS.alertMsg('Invalid input', t('Choose a repository.'));
             return;
         }
         var backupId = trim(valOf(win, '#backupId'));
         if (!backupId) {
-            alertMsg('Invalid input', t('Enter a backup ID (the PBS group identity).'));
+            ANAS.alertMsg('Invalid input', t('Enter a backup ID (the PBS group identity).'));
             return;
         }
         var schedule = trim(valOf(win, '#schedule'));
         if (!schedule) {
-            alertMsg('Invalid input', t('Enter a schedule.'));
+            ANAS.alertMsg('Invalid input', t('Enter a schedule.'));
             return;
         }
         var archives = readArchives(win);
         if (!archives.length) {
-            alertMsg('Invalid input', t('Add at least one archive (a name and a path).'));
+            ANAS.alertMsg('Invalid input', t('Add at least one archive (a name and a path).'));
             return;
         }
         for (var i = 0; i < archives.length; i++) {
             if (!archives[i].name || !archives[i].path) {
-                alertMsg('Invalid input', t('Every archive needs both a name and a path.'));
+                ANAS.alertMsg('Invalid input', t('Every archive needs both a name and a path.'));
                 return;
             }
         }
@@ -2056,7 +2004,7 @@
                 try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
             }
             ANAS.warn('backup repos load failed: ' + ANAS.errText(err));
-            alertMsg('Load failed', t('Failed to load the repositories registry') + ': ' + ANAS.errText(err));
+            ANAS.alertMsg('Load failed', t('Failed to load the repositories registry') + ': ' + ANAS.errText(err));
         });
     }
 
@@ -2103,7 +2051,7 @@
                         return;
                     }
                     var ver = win._registryVersion;
-                    casWrite({
+                    ANAS.casWrite({
                         node: node,
                         method: 'del',
                         path: '/backup/repos/' + encodeURIComponent(name)
@@ -2119,7 +2067,7 @@
                         // A "referenced by a task" refusal (or any non-CAS error)
                         // surfaces the daemon's message verbatim.
                         onError: function (err) {
-                            alertMsg('Delete failed', ANAS.errText(err));
+                            ANAS.alertMsg('Delete failed', ANAS.errText(err));
                         },
                     });
                 }
@@ -2364,7 +2312,7 @@
         var host = trim(valOf(win, '#host'));
         var datastore = trim(valOf(win, '#datastore'));
         if (!host || !datastore) {
-            alertMsg('Invalid input', t('Enter a host and a datastore to test.'));
+            ANAS.alertMsg('Invalid input', t('Enter a host and a datastore to test.'));
             return;
         }
         var area = win.down('#testResult');
@@ -2630,21 +2578,21 @@
         }
         var repo = repoBodyFromDialog(win);
         if (!NAME_RE.test(repo.name) || repo.name.length > 64) {
-            alertMsg('Invalid input',
+            ANAS.alertMsg('Invalid input',
                 t('Name must be lowercase letters, digits and hyphens (≤64 chars).'));
             return;
         }
         if (!repo.host) {
-            alertMsg('Invalid input', t('Enter a host.'));
+            ANAS.alertMsg('Invalid input', t('Enter a host.'));
             return;
         }
         if (!repo.datastore) {
-            alertMsg('Invalid input', t('Enter a datastore.'));
+            ANAS.alertMsg('Invalid input', t('Enter a datastore.'));
             return;
         }
         // On CREATE a secret is required (nothing stored yet); on edit blank = keep.
         if (!isEdit && !repo.secret) {
-            alertMsg('Invalid input', repo.authType === 'token'
+            ANAS.alertMsg('Invalid input', repo.authType === 'token'
                 ? t('Enter the token secret.') : t('Enter the password.'));
             return;
         }
@@ -2652,7 +2600,7 @@
             ? mgrWin._registryVersion : 0;
         var body = { repo: repo, expectedVersion: expectedVersion };
 
-        casWrite({
+        ANAS.casWrite({
             node: node,
             method: isEdit ? 'put' : 'post',
             path: isEdit ? ('/backup/repos/' + encodeURIComponent(repo.name)) : '/backup/repos',

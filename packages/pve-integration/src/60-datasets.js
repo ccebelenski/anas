@@ -88,14 +88,6 @@
         return ANAS.enc(s);
     }
 
-    function alertMsg(title, msg) {
-        try {
-            Ext.Msg.alert(t(title), msg);
-        } catch (e) {
-            ANAS.warn(msg);
-        }
-    }
-
     // ---- Path helpers ------------------------------------------------------
     //
     // The daemon addresses a dataset by its path relative to the pool: the full
@@ -516,7 +508,7 @@
                 // non-fatal
             }
             ANAS.warn('pools load failed: ' + ANAS.errText(err));
-            alertMsg('Error', t('Failed to load pools') + ': ' + ANAS.errText(err));
+            ANAS.alertMsg('Error', t('Failed to load pools') + ': ' + ANAS.errText(err));
         });
     }
 
@@ -647,12 +639,12 @@
         }
         if (!ANAS.shares || typeof ANAS.shares.openSmbCreate !== 'function'
             || typeof ANAS.shares.openNfsCreate !== 'function') {
-            alertMsg('Shares unavailable', t('The Shares view is not available.'));
+            ANAS.alertMsg('Shares unavailable', t('The Shares view is not available.'));
             return;
         }
         var mountpoint = rec.get('mountpoint');
         if (!mountpoint || mountpoint === 'none' || mountpoint === '-') {
-            alertMsg('Cannot share', t('This dataset has no mountpoint to share.'));
+            ANAS.alertMsg('Cannot share', t('This dataset has no mountpoint to share.'));
             return;
         }
         var preset = {
@@ -852,15 +844,15 @@
         // Normalise: strip leading/trailing slashes and collapse doubles.
         var path = rawPath.replace(/^\/+/, '').replace(/\/+$/, '').replace(/\/{2,}/g, '/');
         if (!pool) {
-            alertMsg('Invalid input', t('Select a pool.'));
+            ANAS.alertMsg('Invalid input', t('Select a pool.'));
             return;
         }
         if (!path) {
-            alertMsg('Invalid input', t('Enter a dataset path.'));
+            ANAS.alertMsg('Invalid input', t('Enter a dataset path.'));
             return;
         }
         if (!/^[\w-]+(?:\/[\w-]+)*$/.test(path)) {
-            alertMsg('Invalid input', t('Invalid dataset path.'));
+            ANAS.alertMsg('Invalid input', t('Invalid dataset path.'));
             return;
         }
 
@@ -1618,7 +1610,7 @@
                                 var name = (addWin.down('#name').getValue() || '').trim();
                                 var level = addWin.down('#level').getValue() || 'read';
                                 if (!name) {
-                                    alertMsg('Invalid input',
+                                    ANAS.alertMsg('Invalid input',
                                         t('Pick a user or group name.'));
                                     return;
                                 }
@@ -2127,67 +2119,6 @@
     // confirmed-DELETE flow. The recursive flag is chosen in the dialog and
     // appended to the confirmed request; the confirm code is not bound to it.
 
-    function runDestroy(node, tree, pool, fullName, confirmCode, recursive) {
-        var path = datasetPath(pool, fullName);
-        if (recursive) {
-            path += '?recursive=true';
-        }
-        ANAS.runJob({
-            node: node,
-            method: 'del',
-            path: path,
-            confirmCode: confirmCode,
-            view: tree,
-            failTitle: 'Destroy failed',
-            successMsg: t('Destroyed') + ' ' + fullName,
-            maxMs: 30000,
-            onComplete: function () {
-                loadTree(tree, node);
-            },
-        });
-    }
-
-    function showDestroyConfirm(node, tree, pool, fullName, confirmCode, warnings) {
-        var items = [{
-            xtype: 'component',
-            html: '<b>' + enc(t('Destroy dataset') + ' "' + fullName + '"?') + '</b>'
-                + '<ul><li>'
-                + (warnings || []).map(function (w) { return enc(w); }).join('</li><li>')
-                + '</li></ul>',
-            margin: '0 0 8 0',
-        }, {
-            xtype: 'checkbox',
-            itemId: 'recursive',
-            cls: 'anas-chk-ds-recursive',
-            boxLabel: t('Recursive (destroy children)'),
-        }];
-        var win = Ext.create('Ext.window.Window', {
-            title: t('Destroy dataset'),
-            cls: 'anas-win-dataset-destroy',
-            modal: true,
-            width: 460,
-            bodyPadding: 12,
-            layout: 'anchor',
-            items: items,
-            // Enter defaults to Cancel — the safe choice for a destructive op.
-            defaultButton: 'dsDestroyCancelBtn',
-            buttons: [{
-                text: t('Cancel'),
-                itemId: 'dsDestroyCancelBtn',
-                handler: function () { win.close(); },
-            }, {
-                text: t('Destroy'),
-                cls: 'anas-btn-dataset-destroy-confirm',
-                handler: function () {
-                    var recursive = win.down('#recursive').getValue();
-                    win.close();
-                    runDestroy(node, tree, pool, fullName, confirmCode, recursive);
-                },
-            }],
-        });
-        win.show();
-    }
-
     function openDestroy(node, tree, rec) {
         // Only child datasets are destroyable here. Story 3.26: the pool root is
         // NOT destroyable in the Datasets view (that ≈ destroying the pool — a
@@ -2202,18 +2133,34 @@
         }
         var pool = rec.get('pool');
         var fullName = rec.get('fullName');
-        // Step 1: unconfirmed DELETE → 409 challenge (code + warnings), or a
-        // hard error we surface directly.
-        ANAS.api.del(node, datasetPath(pool, fullName)).then(function () {
-            // Unexpected: destroy without confirmation should not succeed.
-            loadTree(tree, node);
-        }, function (err) {
-            if (err && err.status === 409 && err.confirmCode) {
-                var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
-                showDestroyConfirm(node, tree, pool, fullName, err.confirmCode, warnings);
-                return;
-            }
-            alertMsg('Destroy failed', ANAS.errText(err));
+        // confirmAndRun fires the unconfirmed DELETE, then on the 409 challenge
+        // shows the warnings + a "Recursive" checkbox; the flag is appended to the
+        // confirmed resend (the confirm code is not bound to it). A hard error
+        // surfaces via failTitle.
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'del',
+            path: datasetPath(pool, fullName),
+            view: tree,
+            failTitle: 'Destroy failed',
+            successMsg: t('Destroyed') + ' ' + fullName,
+            maxMs: 30000,
+            onComplete: function () { loadTree(tree, node); },
+            confirmWindow: true,
+            confirmTitle: 'Destroy dataset',
+            confirmIntro: '<b>' + enc(t('Destroy dataset') + ' "' + fullName + '"?') + '</b>',
+            confirmButtonText: 'Destroy',
+            confirmCls: 'anas-win-dataset-destroy',
+            confirmButtonCls: 'anas-btn-dataset-destroy-confirm',
+            extraItems: [{
+                xtype: 'checkbox',
+                itemId: 'recursive',
+                cls: 'anas-chk-ds-recursive',
+                boxLabel: t('Recursive (destroy children)'),
+            }],
+            mapConfirm: function (win) {
+                return win.down('#recursive').getValue() ? { pathSuffix: '?recursive=true' } : {};
+            },
         });
     }
 
@@ -2463,11 +2410,11 @@
         }
         var name = (win.down('#snapName').getValue() || '').trim();
         if (!name) {
-            alertMsg('Invalid input', t('Enter a snapshot name.'));
+            ANAS.alertMsg('Invalid input', t('Enter a snapshot name.'));
             return;
         }
         if (!validSnapName(name)) {
-            alertMsg('Invalid input', t('Invalid snapshot name.'));
+            ANAS.alertMsg('Invalid input', t('Invalid snapshot name.'));
             return;
         }
         var body = { name: name };
@@ -2498,80 +2445,38 @@
     // optional "force" checkbox and, on confirm, resend with the code. The code
     // is NOT bound to force — force is appended to the confirmed request.
 
-    function runRollback(node, ctx, confirmCode, force, onDone) {
-        var path = snapshotPath(ctx.pool, ctx.dataset, ctx.snapshotName, 'rollback');
-        if (force) {
-            path += '?force=true';
-        }
-        ANAS.runJob({
+    function openRollback(node, ctx, onDone) {
+        // confirmAndRun fires the unconfirmed POST, then on the 409 challenge
+        // shows the warnings + an optional "force" checkbox; force is appended to
+        // the confirmed resend (the code is NOT bound to it). A hard error
+        // surfaces via failTitle.
+        ANAS.confirmAndRun({
             node: node,
             method: 'post',
-            path: path,
-            confirmCode: confirmCode,
+            path: snapshotPath(ctx.pool, ctx.dataset, ctx.snapshotName, 'rollback'),
+            body: null,
             view: ctx.view,
             failTitle: 'Rollback failed',
             successMsg: t('Rolled back to') + ' ' + ctx.fullName,
             maxMs: 30000,
             onComplete: function () { if (onDone) { onDone(); } },
-        });
-    }
-
-    function showRollbackConfirm(node, ctx, confirmCode, warnings, onDone) {
-        var items = [{
-            xtype: 'component',
-            html: '<b>' + enc(t('Roll back to snapshot') + ' "' + ctx.fullName + '"?') + '</b>'
-                + '<ul><li>'
-                + (warnings || []).map(function (w) { return enc(w); }).join('</li><li>')
-                + '</li></ul>',
-            margin: '0 0 8 0',
-        }, {
-            xtype: 'checkbox',
-            itemId: 'force',
-            cls: 'anas-chk-snap-force',
-            boxLabel: t('Force (-r): destroy any more-recent snapshots and bookmarks'),
-        }];
-        var win = Ext.create('Ext.window.Window', {
-            title: t('Rollback snapshot'),
-            cls: 'anas-win-snap-rollback',
-            modal: true,
-            width: 480,
-            bodyPadding: 12,
-            layout: 'anchor',
-            items: items,
-            // Enter defaults to Cancel — the safe choice for a destructive op.
-            defaultButton: 'snapRollbackCancelBtn',
-            buttons: [{
-                text: t('Cancel'),
-                itemId: 'snapRollbackCancelBtn',
-                handler: function () { win.close(); },
-            }, {
-                text: t('Rollback'),
-                cls: 'anas-btn-snap-rollback-confirm',
-                handler: function () {
-                    var force = win.down('#force').getValue();
-                    win.close();
-                    runRollback(node, ctx, confirmCode, force, onDone);
-                },
+            confirmWindow: true,
+            confirmTitle: 'Rollback snapshot',
+            confirmWidth: 480,
+            confirmIntro: '<b>' + enc(t('Roll back to snapshot') + ' "' + ctx.fullName + '"?') + '</b>',
+            confirmButtonText: 'Rollback',
+            confirmCls: 'anas-win-snap-rollback',
+            confirmButtonCls: 'anas-btn-snap-rollback-confirm',
+            extraItems: [{
+                xtype: 'checkbox',
+                itemId: 'force',
+                cls: 'anas-chk-snap-force',
+                boxLabel: t('Force (-r): destroy any more-recent snapshots and bookmarks'),
             }],
-        });
-        win.show();
-    }
-
-    function openRollback(node, ctx, onDone) {
-        ANAS.api.post(node, snapshotPath(ctx.pool, ctx.dataset, ctx.snapshotName, 'rollback'), null).then(
-            function () {
-                // Unexpected: rollback without confirmation should not succeed.
-                if (onDone) { onDone(); }
+            mapConfirm: function (win) {
+                return win.down('#force').getValue() ? { pathSuffix: '?force=true' } : {};
             },
-            function (err) {
-                if (err && err.status === 409 && err.confirmCode) {
-                    var warnings = (err.body && err.body.error && err.body.error.warnings) || [];
-                    showRollbackConfirm(node, ctx, err.confirmCode, warnings, onDone);
-                    return;
-                }
-                alertMsg('Rollback failed', ANAS.errText(err));
-            }
-        );
+        });
     }
 
     // ---- Rename (story 5.4) -----------------------------------------------
@@ -2634,11 +2539,11 @@
         }
         var newName = (win.down('#newName').getValue() || '').trim();
         if (!newName) {
-            alertMsg('Invalid input', t('Enter a new snapshot name.'));
+            ANAS.alertMsg('Invalid input', t('Enter a new snapshot name.'));
             return;
         }
         if (!validSnapName(newName)) {
-            alertMsg('Invalid input', t('Invalid snapshot name.'));
+            ANAS.alertMsg('Invalid input', t('Invalid snapshot name.'));
             return;
         }
         if (newName === ctx.snapshotName) {
@@ -2741,13 +2646,13 @@
         }
         var target = (win.down('#target').getValue() || '').trim();
         if (!target) {
-            alertMsg('Invalid input', t('Enter a target dataset name.'));
+            ANAS.alertMsg('Invalid input', t('Enter a target dataset name.'));
             return;
         }
         // Mirror CloneSnapshotRequest's shape (pool/path) so obvious mistakes are
         // caught before the round-trip; the daemon revalidates.
         if (!/^[a-z0-9_][\w.:-]*(?:\/[\w.:-]+)*$/i.test(target)) {
-            alertMsg('Invalid input', t('Invalid target dataset name.'));
+            ANAS.alertMsg('Invalid input', t('Invalid target dataset name.'));
             return;
         }
         ANAS.runJob({
@@ -2846,7 +2751,7 @@
                 }
                 try { win.setLoading(false); } catch (e) { /* non-fatal */ }
                 ANAS.warn('snapshots popup load failed: ' + ANAS.errText(err));
-                alertMsg('Error', t('Failed to load snapshots') + ': ' + ANAS.errText(err));
+                ANAS.alertMsg('Error', t('Failed to load snapshots') + ': ' + ANAS.errText(err));
             });
         }
 

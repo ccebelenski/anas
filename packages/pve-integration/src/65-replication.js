@@ -94,14 +94,6 @@
         return ANAS.enc(s);
     }
 
-    function alertMsg(title, msg) {
-        try {
-            Ext.Msg.alert(t(title), msg);
-        } catch (e) {
-            ANAS.warn(msg);
-        }
-    }
-
     // ---- Path helpers (view-local; do NOT reference 60-datasets.js) --------
     //
     // The daemon addresses a dataset by its path relative to the pool. The pool
@@ -717,45 +709,7 @@
         };
     }
 
-    // A CAS-aware mutation: POST/PUT/DELETE that returns a 202 job. Success polls
-    // the job; a 409 is a registry-moved conflict routed to onConflict (never a
-    // blind retry); other failures alert. Distinct from ANAS.runJob because the
-    // registry's 409 is a stale-version conflict, not a confirm-code challenge.
-    function casWrite(o) {
-        var call;
-        if (o.method === 'put') {
-            call = ANAS.api.put(o.node, o.path, o.body);
-        } else if (o.method === 'del') {
-            call = ANAS.api.del(o.node, o.path);
-        } else {
-            call = ANAS.api.post(o.node, o.path, o.body);
-        }
-        call.then(function (res) {
-            var job = res && res.job;
-            if (!job || !job.id) {
-                if (o.successMsg) { ANAS.toast(o.successMsg); }
-                if (o.onComplete) { o.onComplete(); }
-                return;
-            }
-            ANAS.pollJob(o.node, job.id, {
-                view: o.view,
-                successMsg: o.successMsg,
-                failTitle: o.failTitle,
-                onComplete: function () { if (o.onComplete) { o.onComplete(); } },
-                onFailed: o.onFailed,
-            });
-        }, function (err) {
-            if (err && err.status === 409) {
-                if (o.onConflict) { o.onConflict(err); }
-                return;
-            }
-            if (o.onError) {
-                o.onError(err);
-                return;
-            }
-            alertMsg(o.failTitle || 'Operation failed', ANAS.errText(err));
-        });
-    }
+    // CAS-aware registry writes go through the shared ANAS.casWrite (10-api.js).
 
     // ======================================================================
     //  Remotes manager — 'anas-win-repl-remotes' (Build A)
@@ -902,7 +856,7 @@
                 try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
             }
             ANAS.warn('remotes load failed: ' + ANAS.errText(err));
-            alertMsg('Load failed', t('Failed to load the remotes registry') + ': ' + ANAS.errText(err));
+            ANAS.alertMsg('Load failed', t('Failed to load the remotes registry') + ': ' + ANAS.errText(err));
         });
     }
 
@@ -964,7 +918,7 @@
                         return;
                     }
                     var ver = win._registryVersion;
-                    casWrite({
+                    ANAS.casWrite({
                         node: node,
                         method: 'del',
                         path: '/replication/remotes/' + encodeURIComponent(name)
@@ -980,7 +934,7 @@
                         // A 400 "referenced by task" (or any non-409) surfaces the
                         // daemon's message verbatim.
                         onError: function (err) {
-                            alertMsg('Delete failed', ANAS.errText(err));
+                            ANAS.alertMsg('Delete failed', ANAS.errText(err));
                         },
                     });
                 }
@@ -1252,7 +1206,7 @@
     function runRemoteTest(win, node, pin) {
         var host = ('' + (valOf(win, '#host') || '')).trim();
         if (!host) {
-            alertMsg('Invalid input', t('Enter a host to test.'));
+            ANAS.alertMsg('Invalid input', t('Enter a host to test.'));
             return;
         }
         var port = parseInt(valOf(win, '#port'), 10);
@@ -1395,13 +1349,13 @@
         }
         var name = ('' + (valOf(win, '#name') || '')).trim();
         if (!NAME_RE.test(name) || name.length > 64) {
-            alertMsg('Invalid input',
+            ANAS.alertMsg('Invalid input',
                 t('Name must be lowercase letters, digits and hyphens (≤64 chars).'));
             return;
         }
         var host = ('' + (valOf(win, '#host') || '')).trim();
         if (!host) {
-            alertMsg('Invalid input', t('Enter a host.'));
+            ANAS.alertMsg('Invalid input', t('Enter a host.'));
             return;
         }
         var port = parseInt(valOf(win, '#port'), 10);
@@ -1412,7 +1366,7 @@
         var expectedVersion = mgrWin && mgrWin._registryVersion !== undefined ? mgrWin._registryVersion : 0;
         var body = { remote: remote, expectedVersion: expectedVersion };
 
-        casWrite({
+        ANAS.casWrite({
             node: node,
             method: isEdit ? 'put' : 'post',
             path: isEdit ? ('/replication/remotes/' + encodeURIComponent(name)) : '/replication/remotes',
@@ -1659,19 +1613,19 @@
         }
         var name = ('' + (valOf(win, '#name') || '')).trim();
         if (!NAME_RE.test(name) || name.length > 64) {
-            alertMsg('Invalid input',
+            ANAS.alertMsg('Invalid input',
                 t('Task name must be lowercase letters, digits and hyphens (≤64 chars).'));
             return;
         }
         var sourcePool = valOf(win, '#sourcePool');
         var targetPool = valOf(win, '#targetPool');
         if (!sourcePool || !targetPool) {
-            alertMsg('Invalid input', t('Select a source and target pool.'));
+            ANAS.alertMsg('Invalid input', t('Select a source and target pool.'));
             return;
         }
         var schedule = ('' + (valOf(win, '#schedule') || '')).trim();
         if (!schedule) {
-            alertMsg('Invalid input', t('Enter a schedule.'));
+            ANAS.alertMsg('Invalid input', t('Enter a schedule.'));
             return;
         }
         var sourceDataset = ('' + (valOf(win, '#sourceDataset') || '')).replace(/^\/+|\/+$/g, '');
@@ -1728,7 +1682,7 @@
             },
             function (err) {
                 ANAS.warn('replication run failed: ' + ANAS.errText(err));
-                alertMsg('Run failed', t('Failed to start replication') + ': ' + ANAS.errText(err));
+                ANAS.alertMsg('Run failed', t('Failed to start replication') + ': ' + ANAS.errText(err));
             }
         );
     }
@@ -1799,7 +1753,7 @@
                         },
                         function (err) {
                             ANAS.warn('replication delete failed: ' + ANAS.errText(err));
-                            alertMsg('Delete failed',
+                            ANAS.alertMsg('Delete failed',
                                 t('Failed to delete task') + ': ' + ANAS.errText(err));
                         }
                     );
@@ -2204,14 +2158,14 @@
         var srcRel = ('' + (valOf(win, '#srcDataset') || '')).replace(/^\/+|\/+$/g, '');
         var targetPool = valOf(win, '#targetPool');
         if (!srcPool || !targetPool) {
-            alertMsg('Invalid input', t('Select a source and target pool.'));
+            ANAS.alertMsg('Invalid input', t('Select a source and target pool.'));
             return;
         }
         var targetDs = ('' + (valOf(win, '#targetDataset') || '')).replace(/^\/+|\/+$/g, '');
         var snapFirst = !!valOf(win, '#snapshotFirst');
         var snap = snapFirst ? '' : valOf(win, '#snapshot');
         if (!snapFirst && !snap) {
-            alertMsg('Invalid input',
+            ANAS.alertMsg('Invalid input',
                 t('Choose a snapshot, or check "Snapshot now and replicate".'));
             return;
         }
