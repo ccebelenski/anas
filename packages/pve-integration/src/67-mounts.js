@@ -1,5 +1,6 @@
 /*
- * ANAS — Mounts view (Epic 18: story 18.3 + the UI half of 18.5).
+ * ANAS — Mounts view (Epic 18: story 18.3 + the UI half of 18.5 + the common
+ * CIFS/NFS option tier & human-readable mode display of 18.8).
  *
  * A native ExtJS grid over the mount inventory plus a bottom detail area, and an
  * Add / Edit Remote Share wizard (NFS / CIFS) with a preflight Test, tiered
@@ -42,9 +43,12 @@
  *
  *   POST /v1/mounts → 202 { job }   body (create):
  *     { type:'nfs'|'cifs', server, remotePath, mountpoint, persistent,
- *       automount, options:{ ro, noatime, nosuid, nodev, idleTimeout,
- *         vers, hard, timeo, retrans, rsize, wsize,          (NFS tier)
- *         domain, uid, gid, fileMode, dirMode },             (CIFS tier)
+ *       automount, options:{ ro, noatime, nosuid, nodev, noexec, netdev,
+ *         idleTimeout,                                        (common tier)
+ *         vers, hard, timeo, retrans, rsize, wsize, proto, sec, noac,
+ *         nconnect, bg, lookupcache, actimeo,                 (NFS tier)
+ *         domain, uid, gid, fileMode, dirMode, cache, mfsymlinks, forceuid,
+ *         forcegid, noserverino, nobrl, sec, iocharset },     (CIFS tier)
  *       extraOptions (free-text passthrough),
  *       credentials:{ username, password, domain } }         (CIFS; write-only)
  *     nofail is FORCED by the daemon (default mode) — the UI shows it locked-on
@@ -909,6 +913,50 @@
     var CIFS_VERS = ['3.1.1', '3.0', '2.1', '2.0', '1.0'];
     var NFS_VERS = ['4.2', '4.1', '4.0', '3'];
 
+    // Curated common-tier enum stores (mount.cifs(8) / nfs(5)); a leading blank
+    // means "unset" (server / kernel default) — the daemon owns the true default.
+    // [value, label] pairs; the free-text passthrough box carries the long tail.
+    var NFS_PROTO = [['', t('(default — tcp)')], ['tcp', 'tcp'], ['udp', 'udp'], ['rdma', 'rdma']];
+    var NFS_SEC = [['', t('(default — sys)')], ['sys', 'sys'], ['krb5', 'krb5'],
+        ['krb5i', 'krb5i'], ['krb5p', 'krb5p'], ['none', 'none']];
+    var NFS_LOOKUPCACHE = [['', t('(default — all)')], ['all', 'all'], ['none', 'none'],
+        ['pos', 'pos'], ['positive', 'positive']];
+    var CIFS_CACHE = [['', t('(default — strict)')], ['strict', 'strict'],
+        ['loose', 'loose'], ['none', 'none']];
+    var CIFS_SEC = [['', t('(default)')], ['ntlmssp', 'ntlmssp'], ['ntlmv2', 'ntlmv2'],
+        ['ntlmv2i', 'ntlmv2i'], ['ntlm', 'ntlm'], ['ntlmi', 'ntlmi'], ['krb5', 'krb5'],
+        ['krb5i', 'krb5i'], ['ntlmsspi', 'ntlmsspi'], ['none', 'none']];
+
+    // Live octal→human helper (single source of truth in 00-core). Returns an
+    // HTML fragment for the small hint under a mode field; empty when blank so an
+    // untouched field shows nothing, a red hint when the octal is malformed.
+    function modeHintHtml(octal) {
+        var s = ('' + (octal == null ? '' : octal)).trim();
+        if (!s) {
+            return '';
+        }
+        var m = (ANAS.fmtMode ? ANAS.fmtMode(s) : { valid: false });
+        if (!m.valid) {
+            return '<span style="color:var(--anas-danger,#c23b2c);">'
+                + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
+                + enc(t('not a valid octal mode (e.g. 0644)')) + '</span>';
+        }
+        return '<span style="font-family:monospace;">' + enc(m.symbolic) + '</span>'
+            + '<span style="color:var(--anas-muted,gray);"> &middot; ' + enc(m.plain) + '</span>';
+    }
+
+    // Update the human-readable hint next to a mode field (itemId → hint itemId).
+    function refreshModeHint(win, fieldSel, hintSel) {
+        try {
+            var hint = win.down(hintSel);
+            if (hint) {
+                hint.update(modeHintHtml(valOf(win, fieldSel)));
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
     // ---- Identity pickers (owner/group for CIFS uid/gid) -------------------
     //
     // CIFS has no Unix ownership of its own, so uid/gid are mount options mapping
@@ -983,8 +1031,14 @@
         if (valOf(win, '#optNodev')) {
             opts.push('nodev');
         }
+        if (valOf(win, '#optNoexec')) {
+            opts.push('noexec');
+        }
         if (valOf(win, '#optNoatime')) {
             opts.push('noatime');
+        }
+        if (valOf(win, '#optNetdev')) {
+            opts.push('_netdev');
         }
         if (valOf(win, '#optAutomount')) {
             opts.push('x-systemd.automount');
@@ -1015,10 +1069,40 @@
             if (!isNaN(wsize) && wsize > 0) {
                 opts.push('wsize=' + wsize);
             }
+            var proto = valOf(win, '#nfsProto');
+            if (proto) {
+                opts.push('proto=' + proto);
+            }
+            var nsec = valOf(win, '#nfsSec');
+            if (nsec) {
+                opts.push('sec=' + nsec);
+            }
+            var nconnect = parseInt(valOf(win, '#nfsNconnect'), 10);
+            if (!isNaN(nconnect) && nconnect > 0) {
+                opts.push('nconnect=' + nconnect);
+            }
+            var nactimeo = parseInt(valOf(win, '#nfsActimeo'), 10);
+            if (!isNaN(nactimeo) && nactimeo >= 0) {
+                opts.push('actimeo=' + nactimeo);
+            }
+            var lookupcache = valOf(win, '#nfsLookupcache');
+            if (lookupcache) {
+                opts.push('lookupcache=' + lookupcache);
+            }
+            if (valOf(win, '#nfsNoac')) {
+                opts.push('noac');
+            }
+            if (valOf(win, '#nfsBg')) {
+                opts.push('bg');
+            }
         } else if (type === 'cifs') {
             var cvers = valOf(win, '#cifsVers');
             if (cvers) {
                 opts.push('vers=' + cvers);
+            }
+            var ccache = valOf(win, '#cifsCache');
+            if (ccache) {
+                opts.push('cache=' + ccache);
             }
             var dom = ('' + (valOf(win, '#credDomain') || '')).trim();
             if (dom) {
@@ -1028,9 +1112,15 @@
             if (uid !== undefined && uid !== null && uid !== '') {
                 opts.push('uid=' + uid);
             }
+            if (valOf(win, '#cifsForceuid')) {
+                opts.push('forceuid');
+            }
             var gid = valOf(win, '#cifsGid');
             if (gid !== undefined && gid !== null && gid !== '') {
                 opts.push('gid=' + gid);
+            }
+            if (valOf(win, '#cifsForcegid')) {
+                opts.push('forcegid');
             }
             var fmode = ('' + (valOf(win, '#cifsFileMode') || '')).trim();
             if (fmode) {
@@ -1039,6 +1129,35 @@
             var dmode = ('' + (valOf(win, '#cifsDirMode') || '')).trim();
             if (dmode) {
                 opts.push('dir_mode=' + dmode);
+            }
+            var csec = valOf(win, '#cifsSec');
+            if (csec) {
+                opts.push('sec=' + csec);
+            }
+            var crsize = parseInt(valOf(win, '#cifsRsize'), 10);
+            if (!isNaN(crsize) && crsize > 0) {
+                opts.push('rsize=' + crsize);
+            }
+            var cwsize = parseInt(valOf(win, '#cifsWsize'), 10);
+            if (!isNaN(cwsize) && cwsize > 0) {
+                opts.push('wsize=' + cwsize);
+            }
+            var cactimeo = parseInt(valOf(win, '#cifsActimeo'), 10);
+            if (!isNaN(cactimeo) && cactimeo >= 0) {
+                opts.push('actimeo=' + cactimeo);
+            }
+            var iocharset = ('' + (valOf(win, '#cifsIocharset') || '')).trim();
+            if (iocharset) {
+                opts.push('iocharset=' + iocharset);
+            }
+            if (valOf(win, '#cifsMfsymlinks')) {
+                opts.push('mfsymlinks');
+            }
+            if (valOf(win, '#cifsNoserverino')) {
+                opts.push('noserverino');
+            }
+            if (valOf(win, '#cifsNobrl')) {
+                opts.push('nobrl');
             }
             // Credentials live in a root-only file — never inline. Shown in the
             // preview as the reference the daemon will write.
@@ -1241,6 +1360,21 @@
                 },
                 {
                     xtype: 'checkboxfield',
+                    itemId: 'optNoexec',
+                    boxLabel: t('noexec (forbid running programs from the share)'),
+                    hideLabel: true,
+                    margin: '0 0 0 154',
+                },
+                {
+                    xtype: 'checkboxfield',
+                    itemId: 'optNetdev',
+                    boxLabel: t('_netdev (wait for the network before mounting) — recommended for network shares'),
+                    hideLabel: true,
+                    checked: true,
+                    margin: '0 0 4 154',
+                },
+                {
+                    xtype: 'checkboxfield',
                     itemId: 'optAutomount',
                     fieldLabel: t('Automount'),
                     boxLabel: t('Mount on first access (x-systemd.automount) — good for flaky links'),
@@ -1286,6 +1420,15 @@
                     value: '4.2',
                 },
                 {
+                    xtype: 'combobox',
+                    itemId: 'nfsProto',
+                    fieldLabel: t('Transport (proto)'),
+                    store: NFS_PROTO,
+                    editable: false,
+                    queryMode: 'local',
+                    value: '',
+                },
+                {
                     xtype: 'checkboxfield',
                     itemId: 'nfsHard',
                     fieldLabel: t('Hard mount'),
@@ -1326,6 +1469,42 @@
                 {
                     xtype: 'numberfield', itemId: 'nfsWsize', fieldLabel: t('wsize (bytes)'),
                     minValue: 0, emptyText: t('negotiated'),
+                },
+                {
+                    xtype: 'fieldset',
+                    itemId: 'nfsAdvanced',
+                    title: t('Advanced NFS options'),
+                    collapsible: true,
+                    collapsed: true,
+                    titleCollapse: true,
+                    margin: '6 0 0 0',
+                    defaults: { anchor: '100%', labelWidth: 150 },
+                    items: [
+                        {
+                            xtype: 'combobox', itemId: 'nfsSec', fieldLabel: t('Security (sec)'),
+                            store: NFS_SEC, editable: false, queryMode: 'local', value: '',
+                        },
+                        {
+                            xtype: 'numberfield', itemId: 'nfsNconnect', fieldLabel: t('nconnect'),
+                            minValue: 1, maxValue: 16, emptyText: t('1 (default)'),
+                        },
+                        {
+                            xtype: 'numberfield', itemId: 'nfsActimeo', fieldLabel: t('actimeo (s)'),
+                            minValue: 0, emptyText: t('default'),
+                        },
+                        {
+                            xtype: 'combobox', itemId: 'nfsLookupcache', fieldLabel: t('lookupcache'),
+                            store: NFS_LOOKUPCACHE, editable: false, queryMode: 'local', value: '',
+                        },
+                        {
+                            xtype: 'checkboxfield', itemId: 'nfsNoac', hideLabel: true, margin: '0 0 0 154',
+                            boxLabel: t('noac (disable attribute caching — stronger consistency, slower)'),
+                        },
+                        {
+                            xtype: 'checkboxfield', itemId: 'nfsBg', hideLabel: true, margin: '0 0 0 154',
+                            boxLabel: t('bg (retry the mount in the background at boot)'),
+                        },
+                    ],
                 },
             ],
         };
@@ -1369,6 +1548,22 @@
                 },
                 {
                     xtype: 'combobox',
+                    itemId: 'cifsCache',
+                    fieldLabel: t('Cache'),
+                    store: CIFS_CACHE,
+                    editable: false,
+                    queryMode: 'local',
+                    value: '',
+                },
+                {
+                    xtype: 'checkboxfield',
+                    itemId: 'cifsMfsymlinks',
+                    hideLabel: true,
+                    margin: '0 0 4 154',
+                    boxLabel: t('mfsymlinks (support symlinks on servers without Unix extensions)'),
+                },
+                {
+                    xtype: 'combobox',
                     itemId: 'cifsUid',
                     fieldLabel: t('Owner (uid)'),
                     store: ownerStore,
@@ -1378,6 +1573,13 @@
                     editable: false,
                     emptyText: t('(default — root)'),
                     listeners: { change: function (f) { var w = f.up('window'); if (w) { updatePreview(w); } } },
+                },
+                {
+                    xtype: 'checkboxfield',
+                    itemId: 'cifsForceuid',
+                    hideLabel: true,
+                    margin: '0 0 4 154',
+                    boxLabel: t('forceuid (always apply the owner above, ignore what the server reports)'),
                 },
                 {
                     xtype: 'combobox',
@@ -1392,12 +1594,83 @@
                     listeners: { change: function (f) { var w = f.up('window'); if (w) { updatePreview(w); } } },
                 },
                 {
+                    xtype: 'checkboxfield',
+                    itemId: 'cifsForcegid',
+                    hideLabel: true,
+                    margin: '0 0 4 154',
+                    boxLabel: t('forcegid (always apply the group above, ignore what the server reports)'),
+                },
+                {
                     xtype: 'textfield', itemId: 'cifsFileMode', fieldLabel: t('file_mode'),
                     value: '0644', emptyText: '0644',
+                    listeners: {
+                        change: function (f) {
+                            var w = f.up('window');
+                            if (w) { refreshModeHint(w, '#cifsFileMode', '#cifsFileModeHint'); updatePreview(w); }
+                        },
+                    },
+                },
+                {
+                    xtype: 'component',
+                    itemId: 'cifsFileModeHint',
+                    style: 'margin:0 0 6 154px;font-size:11px;',
+                    html: '',
                 },
                 {
                     xtype: 'textfield', itemId: 'cifsDirMode', fieldLabel: t('dir_mode'),
                     value: '0755', emptyText: '0755',
+                    listeners: {
+                        change: function (f) {
+                            var w = f.up('window');
+                            if (w) { refreshModeHint(w, '#cifsDirMode', '#cifsDirModeHint'); updatePreview(w); }
+                        },
+                    },
+                },
+                {
+                    xtype: 'component',
+                    itemId: 'cifsDirModeHint',
+                    style: 'margin:0 0 6 154px;font-size:11px;',
+                    html: '',
+                },
+                {
+                    xtype: 'fieldset',
+                    itemId: 'cifsAdvanced',
+                    title: t('Advanced CIFS options'),
+                    collapsible: true,
+                    collapsed: true,
+                    titleCollapse: true,
+                    margin: '6 0 0 0',
+                    defaults: { anchor: '100%', labelWidth: 150 },
+                    items: [
+                        {
+                            xtype: 'combobox', itemId: 'cifsSec', fieldLabel: t('Security (sec)'),
+                            store: CIFS_SEC, editable: false, queryMode: 'local', value: '',
+                        },
+                        {
+                            xtype: 'numberfield', itemId: 'cifsRsize', fieldLabel: t('rsize (bytes)'),
+                            minValue: 0, emptyText: t('negotiated'),
+                        },
+                        {
+                            xtype: 'numberfield', itemId: 'cifsWsize', fieldLabel: t('wsize (bytes)'),
+                            minValue: 0, emptyText: t('negotiated'),
+                        },
+                        {
+                            xtype: 'numberfield', itemId: 'cifsActimeo', fieldLabel: t('actimeo (s)'),
+                            minValue: 0, emptyText: t('1 (default)'),
+                        },
+                        {
+                            xtype: 'textfield', itemId: 'cifsIocharset', fieldLabel: t('iocharset'),
+                            emptyText: 'utf8',
+                        },
+                        {
+                            xtype: 'checkboxfield', itemId: 'cifsNoserverino', hideLabel: true, margin: '0 0 0 154',
+                            boxLabel: t('noserverino (generate inode numbers locally)'),
+                        },
+                        {
+                            xtype: 'checkboxfield', itemId: 'cifsNobrl', hideLabel: true, margin: '0 0 0 154',
+                            boxLabel: t('nobrl (do not send byte-range locks — some legacy apps need this)'),
+                        },
+                    ],
                 },
             ],
         };
@@ -1576,8 +1849,12 @@
                             xtype: 'component',
                             itemId: 'mountPreview',
                             cls: 'anas-mount-preview',
+                            // line-height + min-height so the monospace line is not
+                            // vertically clipped; grows to content, long lines scroll
+                            // horizontally inside the box (see updatePreview's <pre>).
                             style: 'padding:8px 10px;border-radius:6px;background:rgba(127,127,127,0.10);'
-                                + 'font-family:monospace;font-size:12px;',
+                                + 'font-family:monospace;font-size:12px;line-height:1.5;'
+                                + 'min-height:20px;overflow-x:auto;',
                             html: '',
                         },
                     ],
@@ -1648,6 +1925,9 @@
         win.show();
         applyType(win, protoType);
         onChange();
+        // Seed the human-readable mode hints from the default field values.
+        refreshModeHint(win, '#cifsFileMode', '#cifsFileModeHint');
+        refreshModeHint(win, '#cifsDirMode', '#cifsDirModeHint');
 
         // On edit, the grid summary row lacks the structured options, the parsed
         // server/share, and the saved username — those live only in the detail
@@ -1714,6 +1994,8 @@
             setChk(win, '#optNoatime', common.noatime);
             setChk(win, '#optNosuid', common.nosuid);
             setChk(win, '#optNodev', common.nodev);
+            setChk(win, '#optNoexec', common.noexec);
+            setChk(win, '#optNetdev', common.netdev);
             setChk(win, '#optAutomount', common.automount);
             setFld(win, '#optIdle', common.automountIdleTimeout);
 
@@ -1730,17 +2012,37 @@
             setFld(win, '#nfsRetrans', nfs.retrans);
             setFld(win, '#nfsRsize', nfs.rsize);
             setFld(win, '#nfsWsize', nfs.wsize);
+            setFld(win, '#nfsProto', nfs.proto);
+            setFld(win, '#nfsSec', nfs.sec);
+            setFld(win, '#nfsNconnect', nfs.nconnect);
+            setFld(win, '#nfsActimeo', nfs.actimeo);
+            setFld(win, '#nfsLookupcache', nfs.lookupcache);
+            setChk(win, '#nfsNoac', nfs.noac === true);
+            setChk(win, '#nfsBg', nfs.bg === true);
 
             // CIFS tier.
             var cifs = co.cifs || {};
             setFld(win, '#cifsVers', cifs.vers);
+            setFld(win, '#cifsCache', cifs.cache);
             // Domain lives in the credentials section; for a hand-written inline
             // entry it is surfaced via d.credentials.domain (never a cifs option).
             setFld(win, '#credDomain', first(cifs.domain, d.credentials && d.credentials.domain));
             setFld(win, '#cifsUid', cifs.uid);
+            setChk(win, '#cifsForceuid', cifs.forceuid === true);
             setFld(win, '#cifsGid', cifs.gid);
+            setChk(win, '#cifsForcegid', cifs.forcegid === true);
             setFld(win, '#cifsFileMode', cifs.fileMode);
             setFld(win, '#cifsDirMode', cifs.dirMode);
+            setFld(win, '#cifsSec', cifs.sec);
+            setFld(win, '#cifsRsize', cifs.rsize);
+            setFld(win, '#cifsWsize', cifs.wsize);
+            setFld(win, '#cifsActimeo', cifs.actimeo);
+            setFld(win, '#cifsIocharset', cifs.iocharset);
+            setChk(win, '#cifsMfsymlinks', cifs.mfsymlinks === true);
+            setChk(win, '#cifsNoserverino', cifs.noserverino === true);
+            setChk(win, '#cifsNobrl', cifs.nobrl === true);
+            refreshModeHint(win, '#cifsFileMode', '#cifsFileModeHint');
+            refreshModeHint(win, '#cifsDirMode', '#cifsDirModeHint');
 
             // Unrecognized options round-trip verbatim through the extra field.
             setFld(win, '#extraOptions', co.passthrough);
@@ -1783,6 +2085,8 @@
             noatime: !!valOf(win, '#optNoatime'),
             nosuid: !!valOf(win, '#optNosuid'),
             nodev: !!valOf(win, '#optNodev'),
+            noexec: !!valOf(win, '#optNoexec'),
+            netdev: !!valOf(win, '#optNetdev'),
         };
         var automount = !!valOf(win, '#optAutomount');
         if (automount) {
@@ -1802,18 +2106,47 @@
             if (!isNaN(rsize) && rsize > 0) { options.rsize = rsize; }
             var wsize = parseInt(valOf(win, '#nfsWsize'), 10);
             if (!isNaN(wsize) && wsize > 0) { options.wsize = wsize; }
+            var proto = valOf(win, '#nfsProto');
+            if (proto) { options.proto = proto; }
+            var nsec = valOf(win, '#nfsSec');
+            if (nsec) { options.sec = nsec; }
+            var nconnect = parseInt(valOf(win, '#nfsNconnect'), 10);
+            if (!isNaN(nconnect) && nconnect > 0) { options.nconnect = nconnect; }
+            var nactimeo = parseInt(valOf(win, '#nfsActimeo'), 10);
+            if (!isNaN(nactimeo) && nactimeo >= 0) { options.actimeo = nactimeo; }
+            var lookupcache = valOf(win, '#nfsLookupcache');
+            if (lookupcache) { options.lookupcache = lookupcache; }
+            options.noac = !!valOf(win, '#nfsNoac');
+            options.bg = !!valOf(win, '#nfsBg');
         } else if (type === 'cifs') {
             options.vers = valOf(win, '#cifsVers') || '3.1.1';
+            var ccache = valOf(win, '#cifsCache');
+            if (ccache) { options.cache = ccache; }
             var dom = ('' + (valOf(win, '#credDomain') || '')).trim();
             if (dom) { options.domain = dom; }
             var uid = valOf(win, '#cifsUid');
             if (uid !== undefined && uid !== null && uid !== '') { options.uid = uid; }
+            options.forceuid = !!valOf(win, '#cifsForceuid');
             var gid = valOf(win, '#cifsGid');
             if (gid !== undefined && gid !== null && gid !== '') { options.gid = gid; }
+            options.forcegid = !!valOf(win, '#cifsForcegid');
             var fmode = ('' + (valOf(win, '#cifsFileMode') || '')).trim();
             if (fmode) { options.fileMode = fmode; }
             var dmode = ('' + (valOf(win, '#cifsDirMode') || '')).trim();
             if (dmode) { options.dirMode = dmode; }
+            var csec = valOf(win, '#cifsSec');
+            if (csec) { options.sec = csec; }
+            var crsize = parseInt(valOf(win, '#cifsRsize'), 10);
+            if (!isNaN(crsize) && crsize > 0) { options.rsize = crsize; }
+            var cwsize = parseInt(valOf(win, '#cifsWsize'), 10);
+            if (!isNaN(cwsize) && cwsize > 0) { options.wsize = cwsize; }
+            var cactimeo = parseInt(valOf(win, '#cifsActimeo'), 10);
+            if (!isNaN(cactimeo) && cactimeo >= 0) { options.actimeo = cactimeo; }
+            var iocharset = ('' + (valOf(win, '#cifsIocharset') || '')).trim();
+            if (iocharset) { options.iocharset = iocharset; }
+            options.mfsymlinks = !!valOf(win, '#cifsMfsymlinks');
+            options.noserverino = !!valOf(win, '#cifsNoserverino');
+            options.nobrl = !!valOf(win, '#cifsNobrl');
         }
 
         var body = {

@@ -236,5 +236,5 @@ describe('Replication snapshot / location.name — safe ZFS/argv charsets', () =
 
 /** A neutral MountCommonOptions bundle for MountEntry construction. */
 function baseCommon(): Record<string, unknown> {
-  return { readOnly: false, nofail: true, noauto: false, automount: false, noatime: false, nosuid: false, nodev: false, netdev: false }
+  return { readOnly: false, nofail: true, noauto: false, automount: false, noatime: false, nosuid: false, nodev: false, noexec: false, netdev: false }
 }

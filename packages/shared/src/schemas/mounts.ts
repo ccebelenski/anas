@@ -27,6 +27,69 @@ export const MountMode = z
   .regex(/^[0-7]{3,4}$/, 'Mode must be 3–4 octal digits (e.g. "755", "0644")')
 
 /**
+ * A charset name for CIFS `iocharset=` (e.g. "utf8", "iso8859-1"). Constrained to
+ * the character set of a real charset token — letters, digits, and `. _ -` — so
+ * it stays injection-hard (no commas → no `utf8,exec` option forgery, no
+ * whitespace, no control characters) when written verbatim as a mount option.
+ */
+export const MountCharset = z
+  .string()
+  .regex(/^[\w.-]+$/, 'Charset must be a plain token (e.g. "utf8", "iso8859-1")')
+
+// ---- Curated common-tier option enums (mount.cifs(8) / nfs(5)) ---------------
+
+/**
+ * CIFS `cache=` mode (mount.cifs(8)): `strict` (protocol-correct, the kernel
+ * default since 3.7), `loose` (relaxed, faster on a single client), `none` (no
+ * client caching). The common knob a NAS user actually turns.
+ */
+export const MountCifsCache = z.enum(['strict', 'loose', 'none'])
+export type MountCifsCache = z.infer<typeof MountCifsCache>
+
+/**
+ * CIFS `sec=` authentication flavour (mount.cifs(8)). The real-world set:
+ * `ntlmssp` (the modern default), `ntlmv2`/`ntlmv2i`, legacy `ntlm`/`ntlmi`,
+ * Kerberos `krb5`/`krb5i`, `ntlmsspi`, and `none` (null session). Exotic tails
+ * (e.g. multi-flavour lists) stay in passthrough.
+ */
+export const MountCifsSec = z.enum([
+  'ntlmssp',
+  'ntlmsspi',
+  'ntlmv2',
+  'ntlmv2i',
+  'ntlm',
+  'ntlmi',
+  'krb5',
+  'krb5i',
+  'none',
+])
+export type MountCifsSec = z.infer<typeof MountCifsSec>
+
+/** NFS `proto=` transport (nfs(5)): `tcp` (default), `udp`, `rdma`. */
+export const MountNfsProto = z.enum(['tcp', 'udp', 'rdma'])
+export type MountNfsProto = z.infer<typeof MountNfsProto>
+
+/**
+ * NFS `sec=` security flavour (nfs(5)): `sys` (default AUTH_SYS), Kerberos
+ * `krb5`/`krb5i`/`krb5p`, and `none`. A multi-flavour colon list stays in
+ * passthrough (single-flavour is the common case).
+ */
+export const MountNfsSec = z.enum(['sys', 'krb5', 'krb5i', 'krb5p', 'none'])
+export type MountNfsSec = z.infer<typeof MountNfsSec>
+
+/** NFS `lookupcache=` mode (nfs(5)): `all` (default), `none`, `pos`, `positive`. */
+export const MountLookupCache = z.enum(['all', 'none', 'pos', 'positive'])
+export type MountLookupCache = z.infer<typeof MountLookupCache>
+
+/**
+ * A `sec=` value accepted at the flat-request boundary — the union of the NFS and
+ * CIFS flavours (the request is one type, so the daemon narrows by fstype before
+ * assigning; an out-of-tier value is dropped rather than mis-applied).
+ */
+export const MountSec = z.union([MountNfsSec, MountCifsSec])
+export type MountSec = z.infer<typeof MountSec>
+
+/**
  * Mounts (Epic 18) — external & local storage.
  *
  * Pure management (18.5 design): ANAS writes /etc/fstab (surgical round-trip)
@@ -101,6 +164,8 @@ export const MountCommonOptions = z.object({
   nosuid: z.boolean(),
   /** nodev — default-on for remote mounts. */
   nodev: z.boolean(),
+  /** noexec — forbid direct execution of binaries (data-share hardening). */
+  noexec: z.boolean(),
   /** _netdev — order after network-online.target (default-on for nfs/cifs). */
   netdev: z.boolean(),
 })
@@ -109,11 +174,26 @@ export type MountCommonOptions = z.infer<typeof MountCommonOptions>
 /** NFS-specific options. vers defaults to 4.2, hard default. */
 export const MountNfsOptions = z.object({
   vers: MountVers.optional(),
+  /** hard (true) vs soft (false) recovery. Absent ⇒ mount.nfs default (hard). */
   hard: z.boolean().optional(),
   timeo: z.number().int().positive().optional(),
   retrans: z.number().int().nonnegative().optional(),
   rsize: z.number().int().positive().optional(),
   wsize: z.number().int().positive().optional(),
+  /** `proto=` transport (tcp/udp/rdma). */
+  proto: MountNfsProto.optional(),
+  /** `sec=` security flavour (sys/krb5/krb5i/krb5p/none). */
+  sec: MountNfsSec.optional(),
+  /** `noac` — disable attribute caching (true ⇒ noac; absent ⇒ ac default). */
+  noac: z.boolean().optional(),
+  /** `actimeo=<n>` — attribute-cache lifetime, seconds. */
+  actimeo: z.number().int().nonnegative().optional(),
+  /** `nconnect=<n>` — parallel transport connections (1–16; modern throughput). */
+  nconnect: z.number().int().positive().max(16).optional(),
+  /** `bg` — retry the mount in the background (true ⇒ bg; absent ⇒ fg default). */
+  bg: z.boolean().optional(),
+  /** `lookupcache=` mode (all/none/pos/positive). */
+  lookupcache: MountLookupCache.optional(),
 })
 export type MountNfsOptions = z.infer<typeof MountNfsOptions>
 
@@ -128,6 +208,28 @@ export const MountCifsOptions = z.object({
   fileMode: MountMode.optional(),
   /** `dir_mode=` — octal only. */
   dirMode: MountMode.optional(),
+  /** `cache=` client-caching mode (strict/loose/none). */
+  cache: MountCifsCache.optional(),
+  /** `mfsymlinks` — support Minshall+French symlinks on servers without Unix ext. */
+  mfsymlinks: z.boolean().optional(),
+  /** `forceuid` — always apply the `uid=` owner, ignoring any the server returns. */
+  forceuid: z.boolean().optional(),
+  /** `forcegid` — always apply the `gid=` group, ignoring any the server returns. */
+  forcegid: z.boolean().optional(),
+  /** `noserverino` — generate inode numbers locally (true ⇒ noserverino; absent ⇒ serverino default). */
+  noserverino: z.boolean().optional(),
+  /** `nobrl` — do not send byte-range lock requests (some legacy apps need this). */
+  nobrl: z.boolean().optional(),
+  /** `actimeo=<n>` — attribute-cache lifetime, seconds. */
+  actimeo: z.number().int().nonnegative().optional(),
+  /** `rsize=<n>` — maximum read size, bytes. */
+  rsize: z.number().int().positive().optional(),
+  /** `wsize=<n>` — maximum write size, bytes. */
+  wsize: z.number().int().positive().optional(),
+  /** `sec=` authentication flavour (ntlmssp/ntlmv2/krb5/…). */
+  sec: MountCifsSec.optional(),
+  /** `iocharset=` — local charset for path conversion (e.g. utf8). */
+  iocharset: MountCharset.optional(),
 })
 export type MountCifsOptions = z.infer<typeof MountCifsOptions>
 
@@ -334,6 +436,9 @@ export const MountRequestOptions = z.object({
   noatime: z.boolean().optional(),
   nosuid: z.boolean().optional(),
   nodev: z.boolean().optional(),
+  noexec: z.boolean().optional(),
+  /** _netdev — order after the network is up. Defaults on for remote when omitted. */
+  netdev: z.boolean().optional(),
   /** x-systemd.idle-timeout seconds (automount). */
   idleTimeout: z.number().int().positive().optional(),
   // nfs
@@ -343,12 +448,28 @@ export const MountRequestOptions = z.object({
   retrans: z.number().int().nonnegative().optional(),
   rsize: z.number().int().positive().optional(),
   wsize: z.number().int().positive().optional(),
+  proto: MountNfsProto.optional(),
+  noac: z.boolean().optional(),
+  nconnect: z.number().int().positive().max(16).optional(),
+  bg: z.boolean().optional(),
+  lookupcache: MountLookupCache.optional(),
+  /** attribute-cache lifetime (seconds) — shared by nfs & cifs. */
+  actimeo: z.number().int().nonnegative().optional(),
+  /** authentication flavour — narrowed to the fstype's tier by the daemon. */
+  sec: MountSec.optional(),
   // cifs
   domain: SingleLine.optional(),
   uid: z.number().int().nonnegative().optional(),
   gid: z.number().int().nonnegative().optional(),
   fileMode: MountMode.optional(),
   dirMode: MountMode.optional(),
+  cache: MountCifsCache.optional(),
+  mfsymlinks: z.boolean().optional(),
+  forceuid: z.boolean().optional(),
+  forcegid: z.boolean().optional(),
+  noserverino: z.boolean().optional(),
+  nobrl: z.boolean().optional(),
+  iocharset: MountCharset.optional(),
 })
 export type MountRequestOptions = z.infer<typeof MountRequestOptions>
 

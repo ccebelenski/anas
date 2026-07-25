@@ -371,7 +371,7 @@ describe('buildMountWarnings', () => {
     fstype: 'nfs4',
     dump: 0,
     pass: 0,
-    options: { common: { readOnly: false, nofail: true, noauto, automount, noatime: false, nosuid: true, nodev: true, netdev: true }, passthrough: '' },
+    options: { common: { readOnly: false, nofail: true, noauto, automount, noatime: false, nosuid: true, nodev: true, noexec: false, netdev: true }, passthrough: '' },
   })
   const row = (mp: string, over: Partial<MountSummary>): MountSummary => ({
     mountpoint: mp,
@@ -497,5 +497,5 @@ describe('inline-credential redaction (SECURITY — secret never crosses the bou
 
 /** A fully-populated common-options block for entry fixtures. */
 function baseCommon() {
-  return { readOnly: false, nofail: true, noauto: false, automount: false, noatime: false, nosuid: false, nodev: false, netdev: false }
+  return { readOnly: false, nofail: true, noauto: false, automount: false, noatime: false, nosuid: false, nodev: false, noexec: false, netdev: false }
 }

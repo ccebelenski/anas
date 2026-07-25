@@ -135,6 +135,7 @@ function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean):
         noatime: false,
         nosuid: false,
         nodev: false,
+        noexec: false,
         netdev: false,
       },
       passthrough: subvolLayout ? `subvol=${SUBVOL_DATA}` : '',

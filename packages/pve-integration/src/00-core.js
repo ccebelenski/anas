@@ -111,6 +111,38 @@
         return value ? ANAS.t('Yes') : ANAS.t('No');
     };
 
+    // Translate a POSIX octal mode ("0644", "755", "0000") into a human-readable
+    // form: the symbolic triad string ("rw-r--r--") plus a plain-English gloss
+    // ("Owner: read & write · Group: read · Others: read"). Single source of
+    // truth for every octal-mode display in the UI (CIFS file_mode/dir_mode today,
+    // dataset POSIX perms tomorrow). Accepts 3- or 4-digit octal (the leading
+    // special-bit digit of a 4-digit value is ignored for the rwx view); any
+    // invalid input returns { valid:false } with empty strings so callers can
+    // degrade gracefully as the operator types. Pure and side-effect-free.
+    ANAS.fmtMode = function (octal) {
+        var s = ('' + (octal === undefined || octal === null ? '' : octal)).trim();
+        if (!/^[0-7]{3,4}$/.test(s)) {
+            return { valid: false, octal: s, symbolic: '', plain: '' };
+        }
+        // Use the last three digits (owner/group/other); a 4-digit value's
+        // leading setuid/setgid/sticky bit does not change the rwx triads.
+        var triaDigits = s.slice(s.length - 3);
+        var who = [ANAS.t('Owner'), ANAS.t('Group'), ANAS.t('Others')];
+        var symbolic = '';
+        var glossParts = [];
+        for (var i = 0; i < 3; i++) {
+            var d = parseInt(triaDigits.charAt(i), 8);
+            symbolic += (d & 4 ? 'r' : '-') + (d & 2 ? 'w' : '-') + (d & 1 ? 'x' : '-');
+            var perms = [];
+            if (d & 4) { perms.push(ANAS.t('read')); }
+            if (d & 2) { perms.push(ANAS.t('write')); }
+            if (d & 1) { perms.push(ANAS.t('execute')); }
+            var desc = perms.length ? perms.join(' & ') : ANAS.t('no access');
+            glossParts.push(who[i] + ': ' + desc);
+        }
+        return { valid: true, octal: s, symbolic: symbolic, plain: glossParts.join(' · ') };
+    };
+
     // Render a ZFS pool/vdev state with a coloured Font Awesome icon, mirroring
     // PVE's own render_zfs_health column style. Extends it with SUSPENDED.
     ANAS.renderState = function (value) {

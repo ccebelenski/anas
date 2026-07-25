@@ -20,6 +20,7 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { MountCifsSec, MountNfsSec } from '@anas/shared'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
@@ -541,7 +542,8 @@ export function applyMountDefaults(
     noatime: o.noatime ?? false,
     nosuid: o.nosuid ?? remote,
     nodev: o.nodev ?? remote,
-    netdev: remote,
+    noexec: o.noexec ?? false,
+    netdev: o.netdev ?? remote,
     ...(o.idleTimeout !== undefined ? { automountIdleTimeout: o.idleTimeout } : {}),
   }
 
@@ -560,6 +562,25 @@ export function applyMountDefaults(
       nfs.rsize = o.rsize
     if (o.wsize !== undefined)
       nfs.wsize = o.wsize
+    if (o.proto !== undefined)
+      nfs.proto = o.proto
+    if (o.noac !== undefined)
+      nfs.noac = o.noac
+    if (o.actimeo !== undefined)
+      nfs.actimeo = o.actimeo
+    if (o.nconnect !== undefined)
+      nfs.nconnect = o.nconnect
+    if (o.bg !== undefined)
+      nfs.bg = o.bg
+    if (o.lookupcache !== undefined)
+      nfs.lookupcache = o.lookupcache
+    if (o.sec !== undefined) {
+      // `sec` is a union at the flat boundary; narrow to the NFS tier (an
+      // out-of-tier value — a CIFS-only flavour — is simply not applied).
+      const s = MountNfsSec.safeParse(o.sec)
+      if (s.success)
+        nfs.sec = s.data
+    }
     if (nfs.hard === false)
       warnings.push('Soft NFS mounts can silently corrupt data on a timeout — prefer hard,nofail unless you understand the risk.')
     options.nfs = nfs
@@ -576,6 +597,31 @@ export function applyMountDefaults(
       cifs.fileMode = o.fileMode
     if (o.dirMode !== undefined)
       cifs.dirMode = o.dirMode
+    if (o.cache !== undefined)
+      cifs.cache = o.cache
+    if (o.mfsymlinks !== undefined)
+      cifs.mfsymlinks = o.mfsymlinks
+    if (o.forceuid !== undefined)
+      cifs.forceuid = o.forceuid
+    if (o.forcegid !== undefined)
+      cifs.forcegid = o.forcegid
+    if (o.noserverino !== undefined)
+      cifs.noserverino = o.noserverino
+    if (o.nobrl !== undefined)
+      cifs.nobrl = o.nobrl
+    if (o.actimeo !== undefined)
+      cifs.actimeo = o.actimeo
+    if (o.rsize !== undefined)
+      cifs.rsize = o.rsize
+    if (o.wsize !== undefined)
+      cifs.wsize = o.wsize
+    if (o.iocharset !== undefined)
+      cifs.iocharset = o.iocharset
+    if (o.sec !== undefined) {
+      const s = MountCifsSec.safeParse(o.sec)
+      if (s.success)
+        cifs.sec = s.data
+    }
     if (cifs.vers === '1.0')
       warnings.push('SMB 1.0 (vers=1.0) is insecure and deprecated — use it only for very old servers that require it.')
     options.cifs = cifs

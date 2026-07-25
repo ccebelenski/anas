@@ -102,8 +102,11 @@ describe('classifyOptions — inline plaintext CIFS credentials (BUG-1 security)
     assert.ok(!options.passthrough.includes('password'))
     assert.ok(!options.passthrough.includes('username'))
     assert.ok(!options.passthrough.includes('Xy#zzy'))
-    // Genuinely-unrecognized options DO round-trip in passthrough.
-    assert.equal(options.passthrough, 'cache=strict,forceuid')
+    // cache=strict and forceuid are now MODELED into the CIFS tier (18.9), so
+    // nothing unrecognized remains — passthrough is empty.
+    assert.equal(options.cifs?.cache, 'strict')
+    assert.equal(options.cifs?.forceuid, true)
+    assert.equal(options.passthrough, '')
   })
 
   it('options AFTER a `#`-bearing password are still parsed (no mid-field comment truncation)', () => {
@@ -112,6 +115,78 @@ describe('classifyOptions — inline plaintext CIFS credentials (BUG-1 security)
     assert.equal(options.cifs?.gid, 100) // past the password — proves BUG-2 does not bite the option list
     assert.equal(options.common.readOnly, true)
     assert.equal(options.common.noatime, true)
+  })
+})
+
+describe('18.9 — common CIFS/NFS option tiers round-trip (parse → build → parse)', () => {
+  // Classify a comma option string, serialize the entry, re-parse it, and return
+  // both structured views — a proof the new options land in their tier and
+  // survive serialization identically (no drift into passthrough).
+  function roundtrip(fstype: string, spec: string, optStr: string) {
+    const { options, credentialsFile } = classifyOptions(fstype, optStr.split(','))
+    const entry = {
+      spec,
+      mountpoint: '/mnt/rt',
+      fstype,
+      options,
+      dump: 0,
+      pass: 0,
+      ...(credentialsFile !== undefined ? { credentialsFile } : {}),
+    }
+    const line = serializeMountLine(entry)
+    const reparsed = getMount(line, '/mnt/rt')!
+    return { options, line, reparsed }
+  }
+
+  it('a rich CIFS line: cache/mfsymlinks/forceuid/rsize/sec land in the CIFS tier, not passthrough', () => {
+    const { options, reparsed } = roundtrip(
+      'cifs',
+      '//nas/share',
+      'ro,nofail,vers=3.1.1,cache=strict,mfsymlinks,forceuid,forcegid,noserverino,nobrl,rsize=1048576,wsize=1048576,actimeo=30,sec=ntlmssp,iocharset=utf8,uid=1000,gid=100,file_mode=0644,dir_mode=0755,noexec',
+    )
+    assert.equal(options.cifs?.cache, 'strict')
+    assert.equal(options.cifs?.mfsymlinks, true)
+    assert.equal(options.cifs?.forceuid, true)
+    assert.equal(options.cifs?.forcegid, true)
+    assert.equal(options.cifs?.noserverino, true)
+    assert.equal(options.cifs?.nobrl, true)
+    assert.equal(options.cifs?.rsize, 1048576)
+    assert.equal(options.cifs?.wsize, 1048576)
+    assert.equal(options.cifs?.actimeo, 30)
+    assert.equal(options.cifs?.sec, 'ntlmssp')
+    assert.equal(options.cifs?.iocharset, 'utf8')
+    assert.equal(options.common.noexec, true)
+    assert.equal(options.passthrough, '') // every option recognized into a tier
+    // parse → build → parse identity.
+    assert.deepEqual(reparsed.options, options)
+  })
+
+  it('a rich NFS line: proto/soft/sec/nconnect land in the NFS tier, not passthrough', () => {
+    const { options, reparsed } = roundtrip(
+      'nfs4',
+      'nas:/export/data',
+      'nofail,_netdev,vers=4.2,soft,proto=tcp,sec=sys,nconnect=8,actimeo=60,noac,bg,lookupcache=pos,timeo=150,retrans=3,rsize=1048576,wsize=1048576',
+    )
+    assert.equal(options.nfs?.hard, false) // soft
+    assert.equal(options.nfs?.proto, 'tcp')
+    assert.equal(options.nfs?.sec, 'sys')
+    assert.equal(options.nfs?.nconnect, 8)
+    assert.equal(options.nfs?.actimeo, 60)
+    assert.equal(options.nfs?.noac, true)
+    assert.equal(options.nfs?.bg, true)
+    assert.equal(options.nfs?.lookupcache, 'pos')
+    assert.equal(options.common.netdev, true)
+    assert.equal(options.passthrough, '')
+    assert.deepEqual(reparsed.options, options)
+  })
+
+  it('an unrecognized enum value round-trips verbatim in passthrough (schema-safe)', () => {
+    const { options } = classifyOptions('cifs', 'nofail,cache=bogus,sec=weird,iocharset=bad$char'.split(','))
+    assert.equal(options.cifs?.cache, undefined)
+    assert.equal(options.cifs?.sec, undefined)
+    assert.equal(options.cifs?.iocharset, undefined)
+    // Each unrecognized value survives verbatim — never a schema violation on return.
+    assert.equal(options.passthrough, 'cache=bogus,sec=weird,iocharset=bad$char')
   })
 })
 
@@ -168,7 +243,7 @@ describe('surgical edits touch only the targeted line', () => {
 
   it('addMount appends before the trailing newline; removeMount drops one line', () => {
     const before = loadFixture('fstab-anas-managed')
-    const entry = { spec: 'UUID=xyz', mountpoint: '/mnt/new', fstype: 'ext4', options: { common: { readOnly: false, nofail: true, noauto: false, automount: false, noatime: false, nosuid: false, nodev: false, netdev: false }, passthrough: '' }, dump: 0, pass: 2 }
+    const entry = { spec: 'UUID=xyz', mountpoint: '/mnt/new', fstype: 'ext4', options: { common: { readOnly: false, nofail: true, noauto: false, automount: false, noatime: false, nosuid: false, nodev: false, noexec: false, netdev: false }, passthrough: '' }, dump: 0, pass: 2 }
     const added = addMount(before, entry)
     assert.ok(hasMount(added, '/mnt/new'))
     assert.equal(serializeMountLine(entry), 'UUID=xyz /mnt/new ext4 nofail 0 2')

@@ -4,7 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { mkdir, readdir } from 'node:fs/promises'
-import { AbsolutePath, CreateMountRequest, MountStateRequest, MountTestRequest, UpdateMountRequest } from '@anas/shared'
+import { AbsolutePath, CreateMountRequest, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, UpdateMountRequest } from '@anas/shared'
 import { classifyKind } from '../parsers/findmnt.js'
 import { addMount, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
@@ -632,17 +632,74 @@ function serializeInlineOptions(entry: MountEntry): string {
       t.push(`vers=${n.vers}`)
     if (n?.hard === false)
       t.push('soft')
+    if (n?.proto)
+      t.push(`proto=${n.proto}`)
+    if (n?.sec)
+      t.push(`sec=${n.sec}`)
+    if (n?.timeo !== undefined)
+      t.push(`timeo=${n.timeo}`)
+    if (n?.retrans !== undefined)
+      t.push(`retrans=${n.retrans}`)
+    if (n?.rsize !== undefined)
+      t.push(`rsize=${n.rsize}`)
+    if (n?.wsize !== undefined)
+      t.push(`wsize=${n.wsize}`)
+    if (n?.actimeo !== undefined)
+      t.push(`actimeo=${n.actimeo}`)
+    if (n?.nconnect !== undefined)
+      t.push(`nconnect=${n.nconnect}`)
+    if (n?.lookupcache)
+      t.push(`lookupcache=${n.lookupcache}`)
+    if (n?.noac === true)
+      t.push('noac')
+    if (n?.bg === true)
+      t.push('bg')
   }
   if (entry.fstype === 'cifs') {
-    if (entry.options.cifs?.vers)
-      t.push(`vers=${entry.options.cifs.vers}`)
+    const cf = entry.options.cifs
+    if (cf?.vers)
+      t.push(`vers=${cf.vers}`)
     if (entry.credentialsFile)
       t.push(`credentials=${entry.credentialsFile}`)
+    if (cf?.domain)
+      t.push(`domain=${cf.domain}`)
+    if (cf?.uid !== undefined)
+      t.push(`uid=${cf.uid}`)
+    if (cf?.gid !== undefined)
+      t.push(`gid=${cf.gid}`)
+    if (cf?.fileMode)
+      t.push(`file_mode=${cf.fileMode}`)
+    if (cf?.dirMode)
+      t.push(`dir_mode=${cf.dirMode}`)
+    if (cf?.cache)
+      t.push(`cache=${cf.cache}`)
+    if (cf?.sec)
+      t.push(`sec=${cf.sec}`)
+    if (cf?.rsize !== undefined)
+      t.push(`rsize=${cf.rsize}`)
+    if (cf?.wsize !== undefined)
+      t.push(`wsize=${cf.wsize}`)
+    if (cf?.actimeo !== undefined)
+      t.push(`actimeo=${cf.actimeo}`)
+    if (cf?.iocharset)
+      t.push(`iocharset=${cf.iocharset}`)
+    if (cf?.mfsymlinks === true)
+      t.push('mfsymlinks')
+    if (cf?.forceuid === true)
+      t.push('forceuid')
+    if (cf?.forcegid === true)
+      t.push('forcegid')
+    if (cf?.noserverino === true)
+      t.push('noserverino')
+    if (cf?.nobrl === true)
+      t.push('nobrl')
   }
   if (c.nosuid)
     t.push('nosuid')
   if (c.nodev)
     t.push('nodev')
+  if (c.noexec)
+    t.push('noexec')
   if (entry.options.passthrough)
     t.push(...entry.options.passthrough.split(','))
   return t.join(',')
@@ -706,6 +763,10 @@ function mergeEntry(
     common.nosuid = input.nosuid
   if (input?.nodev !== undefined)
     common.nodev = input.nodev
+  if (input?.noexec !== undefined)
+    common.noexec = input.noexec
+  if (input?.netdev !== undefined)
+    common.netdev = input.netdev
   if (input?.idleTimeout !== undefined)
     common.automountIdleTimeout = input.idleTimeout
   if (automount !== undefined)
@@ -730,6 +791,23 @@ function mergeEntry(
       nfs.rsize = input.rsize
     if (input?.wsize !== undefined)
       nfs.wsize = input.wsize
+    if (input?.proto !== undefined)
+      nfs.proto = input.proto
+    if (input?.noac !== undefined)
+      nfs.noac = input.noac
+    if (input?.actimeo !== undefined)
+      nfs.actimeo = input.actimeo
+    if (input?.nconnect !== undefined)
+      nfs.nconnect = input.nconnect
+    if (input?.bg !== undefined)
+      nfs.bg = input.bg
+    if (input?.lookupcache !== undefined)
+      nfs.lookupcache = input.lookupcache
+    if (input?.sec !== undefined) {
+      const s = MountNfsSec.safeParse(input.sec)
+      if (s.success)
+        nfs.sec = s.data
+    }
     options.nfs = nfs
   }
   if (existing.fstype === 'cifs') {
@@ -746,6 +824,31 @@ function mergeEntry(
       cifs.fileMode = input.fileMode
     if (input?.dirMode !== undefined)
       cifs.dirMode = input.dirMode
+    if (input?.cache !== undefined)
+      cifs.cache = input.cache
+    if (input?.mfsymlinks !== undefined)
+      cifs.mfsymlinks = input.mfsymlinks
+    if (input?.forceuid !== undefined)
+      cifs.forceuid = input.forceuid
+    if (input?.forcegid !== undefined)
+      cifs.forcegid = input.forcegid
+    if (input?.noserverino !== undefined)
+      cifs.noserverino = input.noserverino
+    if (input?.nobrl !== undefined)
+      cifs.nobrl = input.nobrl
+    if (input?.actimeo !== undefined)
+      cifs.actimeo = input.actimeo
+    if (input?.rsize !== undefined)
+      cifs.rsize = input.rsize
+    if (input?.wsize !== undefined)
+      cifs.wsize = input.wsize
+    if (input?.iocharset !== undefined)
+      cifs.iocharset = input.iocharset
+    if (input?.sec !== undefined) {
+      const s = MountCifsSec.safeParse(input.sec)
+      if (s.success)
+        cifs.sec = s.data
+    }
     options.cifs = cifs
   }
 

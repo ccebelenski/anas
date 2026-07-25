@@ -1,4 +1,14 @@
 import type { MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
+import { MountCifsCache, MountCifsSec, MountLookupCache, MountNfsProto, MountNfsSec } from '@anas/shared'
+
+/** Recognized enum-value sets, mirrored from the shared schema (never drift). */
+const CIFS_CACHE_VALUES = new Set<string>(MountCifsCache.options)
+const CIFS_SEC_VALUES = new Set<string>(MountCifsSec.options)
+const NFS_PROTO_VALUES = new Set<string>(MountNfsProto.options)
+const NFS_SEC_VALUES = new Set<string>(MountNfsSec.options)
+const NFS_LOOKUPCACHE_VALUES = new Set<string>(MountLookupCache.options)
+/** A plain charset token (mirrors MountCharset) — else the option round-trips raw. */
+const CHARSET_RE = /^[\w.-]+$/
 
 /**
  * Round-trip parser and surgical editor for /etc/fstab (see fstab(5)).
@@ -282,6 +292,7 @@ export function classifyOptions(
     noatime: false,
     nosuid: false,
     nodev: false,
+    noexec: false,
     netdev: false,
   }
   const nfs: MountNfsOptions = {}
@@ -362,6 +373,18 @@ function numOr(value: string, passthrough: string[], token: string): number | un
   return undefined
 }
 
+/**
+ * Recognize an enum-valued option: return the value when it is a member of
+ * `allowed`, else round-trip the raw token in passthrough (an exotic/malformed
+ * value survives verbatim and never violates the schema on the way back out).
+ */
+function enumOr(allowed: Set<string>, value: string, passthrough: string[], token: string): string | undefined {
+  if (allowed.has(value))
+    return value
+  passthrough.push(token)
+  return undefined
+}
+
 /** Common boolean flags → the field they set true (rw/idle-timeout handled separately). */
 const COMMON_TRUE_FLAGS: Record<string, keyof MountCommonOptions> = {
   'ro': 'readOnly',
@@ -370,6 +393,7 @@ const COMMON_TRUE_FLAGS: Record<string, keyof MountCommonOptions> = {
   'noatime': 'noatime',
   'nosuid': 'nosuid',
   'nodev': 'nodev',
+  'noexec': 'noexec',
   '_netdev': 'netdev',
   'x-systemd.automount': 'automount',
 }
@@ -424,6 +448,34 @@ function applyNfsToken(nfs: MountNfsOptions, token: string, key: string, value: 
     nfs.wsize = numOr(value, passthrough, token)
     return true
   }
+  if (token === 'noac') {
+    nfs.noac = true
+    return true
+  }
+  if (token === 'bg') {
+    nfs.bg = true
+    return true
+  }
+  if (key === 'proto') {
+    nfs.proto = enumOr(NFS_PROTO_VALUES, value, passthrough, token) as MountNfsOptions['proto']
+    return true
+  }
+  if (key === 'sec') {
+    nfs.sec = enumOr(NFS_SEC_VALUES, value, passthrough, token) as MountNfsOptions['sec']
+    return true
+  }
+  if (key === 'lookupcache') {
+    nfs.lookupcache = enumOr(NFS_LOOKUPCACHE_VALUES, value, passthrough, token) as MountNfsOptions['lookupcache']
+    return true
+  }
+  if (key === 'actimeo') {
+    nfs.actimeo = numOr(value, passthrough, token)
+    return true
+  }
+  if (key === 'nconnect') {
+    nfs.nconnect = numOr(value, passthrough, token)
+    return true
+  }
   return false
 }
 
@@ -453,6 +505,53 @@ function applyCifsToken(cifs: MountCifsOptions, key: string, value: string, pass
     cifs.dirMode = value
     return true
   }
+  if (key === 'mfsymlinks') {
+    cifs.mfsymlinks = true
+    return true
+  }
+  if (key === 'forceuid') {
+    cifs.forceuid = true
+    return true
+  }
+  if (key === 'forcegid') {
+    cifs.forcegid = true
+    return true
+  }
+  if (key === 'noserverino') {
+    cifs.noserverino = true
+    return true
+  }
+  if (key === 'nobrl') {
+    cifs.nobrl = true
+    return true
+  }
+  if (key === 'cache') {
+    cifs.cache = enumOr(CIFS_CACHE_VALUES, value, passthrough, `cache=${value}`) as MountCifsOptions['cache']
+    return true
+  }
+  if (key === 'sec') {
+    cifs.sec = enumOr(CIFS_SEC_VALUES, value, passthrough, `sec=${value}`) as MountCifsOptions['sec']
+    return true
+  }
+  if (key === 'rsize') {
+    cifs.rsize = numOr(value, passthrough, `rsize=${value}`)
+    return true
+  }
+  if (key === 'wsize') {
+    cifs.wsize = numOr(value, passthrough, `wsize=${value}`)
+    return true
+  }
+  if (key === 'actimeo') {
+    cifs.actimeo = numOr(value, passthrough, `actimeo=${value}`)
+    return true
+  }
+  if (key === 'iocharset') {
+    if (CHARSET_RE.test(value))
+      cifs.iocharset = value
+    else
+      passthrough.push(`iocharset=${value}`)
+    return true
+  }
   return false
 }
 
@@ -479,6 +578,20 @@ function buildOptionTokens(entry: MountEntry): string[] {
       t.push(`rsize=${n.rsize}`)
     if (n.wsize !== undefined)
       t.push(`wsize=${n.wsize}`)
+    if (n.proto !== undefined)
+      t.push(`proto=${n.proto}`)
+    if (n.sec !== undefined)
+      t.push(`sec=${n.sec}`)
+    if (n.actimeo !== undefined)
+      t.push(`actimeo=${n.actimeo}`)
+    if (n.nconnect !== undefined)
+      t.push(`nconnect=${n.nconnect}`)
+    if (n.lookupcache !== undefined)
+      t.push(`lookupcache=${n.lookupcache}`)
+    if (n.noac === true)
+      t.push('noac')
+    if (n.bg === true)
+      t.push('bg')
   }
 
   if (entry.fstype === 'cifs') {
@@ -497,6 +610,28 @@ function buildOptionTokens(entry: MountEntry): string[] {
       t.push(`file_mode=${cifs.fileMode}`)
     if (cifs?.dirMode !== undefined)
       t.push(`dir_mode=${cifs.dirMode}`)
+    if (cifs?.cache !== undefined)
+      t.push(`cache=${cifs.cache}`)
+    if (cifs?.sec !== undefined)
+      t.push(`sec=${cifs.sec}`)
+    if (cifs?.rsize !== undefined)
+      t.push(`rsize=${cifs.rsize}`)
+    if (cifs?.wsize !== undefined)
+      t.push(`wsize=${cifs.wsize}`)
+    if (cifs?.actimeo !== undefined)
+      t.push(`actimeo=${cifs.actimeo}`)
+    if (cifs?.iocharset !== undefined)
+      t.push(`iocharset=${cifs.iocharset}`)
+    if (cifs?.mfsymlinks === true)
+      t.push('mfsymlinks')
+    if (cifs?.forceuid === true)
+      t.push('forceuid')
+    if (cifs?.forcegid === true)
+      t.push('forcegid')
+    if (cifs?.noserverino === true)
+      t.push('noserverino')
+    if (cifs?.nobrl === true)
+      t.push('nobrl')
   }
 
   if (c.noatime)
@@ -505,6 +640,8 @@ function buildOptionTokens(entry: MountEntry): string[] {
     t.push('nosuid')
   if (c.nodev)
     t.push('nodev')
+  if (c.noexec)
+    t.push('noexec')
   if (c.noauto)
     t.push('noauto')
   if (c.nofail)
