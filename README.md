@@ -67,9 +67,11 @@ ANAS treats your system as the source of truth and itself as a **guest**:
 - **Leverage, don't rebuild.** PVE's certificates, auth tickets, journald,
   systemd timers, and cluster filesystem are used as-is. ANAS builds no
   scheduler, no notification system, no user database.
-- **Two processes, one boundary.** An API gateway (`anas`, HTTPS :3000 with
-  the node's PVE certificate) fronts a system daemon (`anasd`, REST over a
-  Unix socket). All mutations are queued jobs; every operation is audited to
+- **Two processes, one boundary.** An API gateway (`anas`, plain HTTP on the
+  loopback interface) fronts a system daemon (`anasd`, REST over a Unix socket).
+  The gateway is reached through PVE's own `:8006` front door under `/anas`
+  (a fail-open reverse-proxy hook in pveproxy) — no separate origin, no extra
+  certificate. All mutations are queued jobs; every operation is audited to
   journald with the requesting user's identity.
 - **Dangerous operations are gated.** Destructive actions require an explicit
   confirmation code round-trip — no accidental pool destroys.
@@ -97,9 +99,10 @@ sudo ./install.sh              # add --install-deps on a fresh node
 The installer preflights the node without touching it, then performs a
 transactional install (backup → install → health check → PVE UI integration)
 that rolls itself back completely on any failure. Re-running it is the upgrade
-path. See [`packaging/README.md`](packaging/README.md) for flags, the
-first-run certificate note (browsers scope trust per host:port — accept
-`https://<node>:3000` once), and uninstall.
+path. ANAS is served through pveproxy on `:8006` under `/anas`, so there is no
+separate origin and **no extra certificate to accept** — if the Proxmox web UI
+loads, ANAS does. See [`packaging/README.md`](packaging/README.md) for flags
+and uninstall.
 
 ## Building from source
 

@@ -39,16 +39,24 @@ const ANAS_PROXY_PREFIX = '/anas'
  * `'not-installed'` → surface a clean ANAS_NOT_INSTALLED for the node.
  */
 export function classifyUpstreamResponse(result: UpstreamResult): 'anas' | 'not-installed' {
-  // Only pveproxy's no-such-path shapes (404 Not Found / 501 Not Implemented)
-  // are candidates; any other status is unambiguously a real ANAS response.
-  if (result.status !== 404 && result.status !== 501)
+  // pveproxy's own "no such path" answer — what a peer's :8006 returns when the
+  // /anas hook is absent (ANAS not installed there) — surfaces differently
+  // across PVE releases: 404 Not Found, 501 Not Implemented, or (PVE 9, proven
+  // on the stunt node) a 500 whose plain-text body is `no such file '<path>'`
+  // (pveproxy's file fallthrough, NOT a gateway error). Any other status is
+  // unambiguously a real ANAS response.
+  const { status } = result
+  if (status !== 404 && status !== 501 && status !== 500)
     return 'anas'
 
+  // A genuine ANAS response — even a 404/500 — always carries the ANAS JSON
+  // error envelope ({ error: { code } }); pveproxy's fallback is plain text.
   const ct = result.headers['content-type']
   const contentType = Array.isArray(ct) ? ct[0] : ct
+  const bodyText = result.body.toString('utf8')
   if (contentType && contentType.includes('application/json')) {
     try {
-      const parsed = JSON.parse(result.body.toString('utf8')) as { error?: { code?: unknown } }
+      const parsed = JSON.parse(bodyText) as { error?: { code?: unknown } }
       if (parsed && typeof parsed.error?.code === 'string')
         return 'anas'
     }
@@ -56,6 +64,14 @@ export function classifyUpstreamResponse(result: UpstreamResult): 'anas' | 'not-
       // Not JSON → not an ANAS envelope → treat as pveproxy fallback below.
     }
   }
+
+  // A 500 is a not-installed signal ONLY when it is pveproxy's own no-such-file
+  // fallthrough (the PVE 9 shape). Any OTHER 500 — the hook's own 'ANAS proxy
+  // error', or a real gateway error — is a genuine (if degraded) response and
+  // must pass through, never be masked as "not installed".
+  if (status === 500 && !/^no such file\b/.test(bodyText))
+    return 'anas'
+
   return 'not-installed'
 }
 

@@ -365,6 +365,35 @@ describe('upstream classifier (ANAS_NOT_INSTALLED vs ANAS response)', () => {
     assert.equal(classifyUpstreamResponse(result), 'not-installed')
   })
 
+  it('classifies PVE 9 pveproxy 500 "no such file" fallthrough as not-installed', () => {
+    // PVE 9's pveproxy answers an unmatched path (hook absent) with a plain-text
+    // 500 `no such file '<path>'`, NOT 404/501 — proven on the stunt node.
+    const result = {
+      status: 500,
+      headers: {},
+      body: Buffer.from('no such file \'/anas/installed\''),
+    }
+    assert.equal(classifyUpstreamResponse(result), 'not-installed')
+  })
+
+  it('does NOT mask a non-fallthrough 500 (broken hook / gateway error) as not-installed', () => {
+    // The hook-present-but-module-throws case: pveproxy 500 'ANAS proxy error'.
+    // ANAS IS installed (just degraded) — must pass through, not read as missing.
+    assert.equal(
+      classifyUpstreamResponse({ status: 500, headers: {}, body: Buffer.from('ANAS proxy error') }),
+      'anas',
+    )
+    // A genuine ANAS 500 with the JSON error envelope is a real response too.
+    assert.equal(
+      classifyUpstreamResponse({
+        status: 500,
+        headers: jsonHeaders,
+        body: Buffer.from(JSON.stringify({ error: { code: 'INTERNAL', message: 'boom' } })),
+      }),
+      'anas',
+    )
+  })
+
   it('classifies a genuine ANAS 404 error envelope as an ANAS response', () => {
     const result = {
       status: 404,
@@ -374,7 +403,8 @@ describe('upstream classifier (ANAS_NOT_INSTALLED vs ANAS response)', () => {
     assert.equal(classifyUpstreamResponse(result), 'anas')
   })
 
-  it('treats any non-404/501 status as an ANAS response', () => {
+  it('treats a non-fallthrough status as an ANAS response', () => {
+    // 500 stays 'anas' here because the body is not pveproxy's no-such-file text.
     for (const status of [200, 202, 400, 409, 500]) {
       assert.equal(
         classifyUpstreamResponse({ status, headers: jsonHeaders, body: Buffer.from('{}') }),
