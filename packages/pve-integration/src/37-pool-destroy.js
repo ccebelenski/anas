@@ -63,13 +63,15 @@
                 bodyPadding: 12,
                 layout: 'anchor',
                 items: items,
+                // Enter defaults to Cancel — the safe choice for a destructive op.
+                defaultButton: 'destroyCancelBtn',
                 buttons: [{
                     text: ANAS.t('Cancel'),
+                    itemId: 'destroyCancelBtn',
                     handler: function () { win.close(); },
                 }, {
                     text: ANAS.t('Destroy'),
                     cls: 'anas-btn-destroy-confirm',
-                    ui: 'default-toolbar',
                     handler: function () {
                         var cleanup = win.down('#cleanup').getValue();
                         win.close();

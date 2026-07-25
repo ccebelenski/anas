@@ -1030,13 +1030,15 @@
             bodyPadding: 12,
             layout: 'anchor',
             items: items,
+            // Enter defaults to Cancel — the safe choice for a destructive op.
+            defaultButton: 'shareRemoveCancelBtn',
             buttons: [{
                 text: t('Cancel'),
+                itemId: 'shareRemoveCancelBtn',
                 handler: function () { win.close(); },
             }, {
                 text: t('Remove'),
                 cls: 'anas-btn-share-remove-confirm',
-                ui: 'default-toolbar',
                 handler: function () {
                     win.close();
                     runRemove(node, grid, proto, id, label, confirmCode);

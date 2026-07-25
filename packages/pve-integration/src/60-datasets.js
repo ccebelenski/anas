@@ -2169,13 +2169,15 @@
             bodyPadding: 12,
             layout: 'anchor',
             items: items,
+            // Enter defaults to Cancel — the safe choice for a destructive op.
+            defaultButton: 'dsDestroyCancelBtn',
             buttons: [{
                 text: t('Cancel'),
+                itemId: 'dsDestroyCancelBtn',
                 handler: function () { win.close(); },
             }, {
                 text: t('Destroy'),
                 cls: 'anas-btn-dataset-destroy-confirm',
-                ui: 'default-toolbar',
                 handler: function () {
                     var recursive = win.down('#recursive').getValue();
                     win.close();
@@ -2536,13 +2538,15 @@
             bodyPadding: 12,
             layout: 'anchor',
             items: items,
+            // Enter defaults to Cancel — the safe choice for a destructive op.
+            defaultButton: 'snapRollbackCancelBtn',
             buttons: [{
                 text: t('Cancel'),
+                itemId: 'snapRollbackCancelBtn',
                 handler: function () { win.close(); },
             }, {
                 text: t('Rollback'),
                 cls: 'anas-btn-snap-rollback-confirm',
-                ui: 'default-toolbar',
                 handler: function () {
                     var force = win.down('#force').getValue();
                     win.close();
