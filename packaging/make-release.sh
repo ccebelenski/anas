@@ -119,6 +119,11 @@ PVE_SRC="${REPO_ROOT}/packages/pve-integration"
 PVE_DST="${APP}/packages/pve-integration"
 mkdir -p "${PVE_DST}"
 cp -a "${PVE_SRC}/src" "${PVE_DST}/src"
+# The ANAS-owned reverse-proxy module (story 12.2). install.sh ships it to
+# /usr/share/anas/perl/AnasProxy.pm; the .t harness is dev-only, so copy just
+# the module.
+mkdir -p "${PVE_DST}/perl"
+install -m 0644 "${PVE_SRC}/perl/AnasProxy.pm" "${PVE_DST}/perl/AnasProxy.pm"
 install -m 0755 "${PVE_SRC}/install.sh"   "${PVE_DST}/install.sh"
 install -m 0755 "${PVE_SRC}/uninstall.sh" "${PVE_DST}/uninstall.sh"
 # Ship the README too if present (operator docs for the fragile tpl step).

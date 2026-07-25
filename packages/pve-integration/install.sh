@@ -26,10 +26,163 @@ PVE_TPL="${PVE_TPL:-/usr/share/pve-manager/index.html.tpl}"
 PVE_JS_DIR="${PVE_JS_DIR:-/usr/share/pve-manager/js}"
 APT_HOOK="${APT_HOOK:-/etc/apt/apt.conf.d/80anas-pve-integration}"
 
+# --- Reverse-proxy transport (story 12.2, docs/PROXY-TRANSPORT-DESIGN.md) ---
+# The :8006 → loopback-gateway bridge: AnasProxy.pm plus one additive hook block
+# spliced into PVE's HTTP server module. Paths are parameterised (production
+# defaults) so the splice/gate logic can be exercised against copies.
+PERL_BIN="${PERL_BIN:-perl}"
+PVE_HTTP_SERVER_PM="${PVE_HTTP_SERVER_PM:-/usr/share/perl5/PVE/APIServer/AnyEvent.pm}"
+ANAS_PERL_DIR="${ANAS_PERL_DIR:-/usr/share/anas/perl}"
+ANAS_PROXY_PM="${ANAS_PERL_DIR}/AnasProxy.pm"
+# Pristine backup of the PVE HTTP server module, captured once before we splice.
+PVE_HTTP_SERVER_PM_ORIG="${PVE_HTTP_SERVER_PM}.anas-orig"
+# Marks our additive block (idempotency check + surgical removal on uninstall).
+ANAS_HOOK_MARKER='# >>> ANAS proxy hook'
+# Source of the ANAS-owned proxy module, shipped alongside this installer.
+PROXY_SRC="${SCRIPT_DIR}/perl/AnasProxy.pm"
+# Command that (re)starts pveproxy after a perl-c-verified patch. Overridable so
+# the installer tests never touch the real service manager; default is the real
+# systemctl sequence.
+PVEPROXY_RESTART_CMD="${PVEPROXY_RESTART_CMD:-}"
+
 # The exact <script> source path we inject; the grep presence-check keys on it.
 SCRIPT_SRC="/pve2/js/anas.js"
 # The full line we insert, matching the template's 4-space indentation.
 SCRIPT_TAG='    <script type="text/javascript" src="/pve2/js/anas.js"></script>'
+
+# (Re)start pveproxy so a freshly-patched AnyEvent.pm (new dispatch + a fresh
+# require of AnasProxy.pm) takes effect. reset-failed first so a prior failed
+# state can't block the restart. Returns non-zero if the restart fails.
+restart_pveproxy() {
+  if [ -n "${PVEPROXY_RESTART_CMD}" ]; then
+    eval "${PVEPROXY_RESTART_CMD}"
+    return $?
+  fi
+  systemctl reset-failed pveproxy >/dev/null 2>&1 || true
+  systemctl restart pveproxy
+}
+
+# Emit the additive ANAS hook block (tabs match PVE's source; Perl ignores
+# indentation, the markers make it findable/removable regardless). The perl
+# sigils are escaped so this here-doc only expands the ANAS path/marker vars.
+anas_hook_block() {
+  cat <<HOOKEOF
+	${ANAS_HOOK_MARKER} (additive; restored on uninstall/upgrade-clobber)
+	if (\$path =~ m{^/anas(?:/|\$)}) {
+	    eval {
+		require '${ANAS_PROXY_PM}';
+		AnasProxy::handle(\$self, \$reqstate, \$method, \$r->uri);
+	    };
+	    \$self->error(\$reqstate, 500, 'ANAS proxy error') if \$@;
+	    return;
+	}
+	# <<< ANAS proxy hook
+HOOKEOF
+}
+
+# Splice the block from $2 into $1 (writing $3) immediately AFTER the closing
+# brace of the /api2 dispatch if-block — located by the exact 4-arg
+# handle_api2_request anchor, then the first lone `}` that follows it. Never
+# inserts anywhere else: with no anchor match nothing is added and the caller
+# detects the missing marker and aborts (never force onto a non-match).
+splice_proxy_hook() {
+  local src="$1" bf="$2" out="$3"
+  awk -v bf="${bf}" '
+    { print }
+    !anas_done && /handle_api2_request\(\$reqstate, \$auth, \$method, \$path\)/ { anas_seen = 1 }
+    anas_seen && !anas_done && /^[ \t]*}[ \t]*$/ {
+        while ((getline line < bf) > 0) { print line }
+        close(bf)
+        anas_seen = 0
+        anas_done = 1
+    }
+  ' "${src}" > "${out}"
+}
+
+# Install AnasProxy.pm and splice the additive proxy hook into the PVE HTTP
+# server module — perl-c-gated, idempotent, fail-open. Returns non-zero on a
+# real failure (missing/broken module, anchor mismatch, or a patch that fails
+# perl -c); the live PVE module is never left in a non-compiling state.
+install_anas_proxy() {
+  # 1. Ship AnasProxy.pm (ANAS-owned, upgrade-safe — dpkg doesn't own it).
+  if [ ! -f "${PROXY_SRC}" ]; then
+    echo "anas: ERROR: proxy module ${PROXY_SRC} not found" >&2
+    return 1
+  fi
+  if command -v "${PERL_BIN}" >/dev/null 2>&1; then
+    if ! "${PERL_BIN}" -c "${PROXY_SRC}" >/dev/null 2>&1; then
+      echo "anas: ERROR: ${PROXY_SRC} fails perl -c; aborting proxy install" >&2
+      return 1
+    fi
+  fi
+  install -D -m 0644 "${PROXY_SRC}" "${ANAS_PROXY_PM}"
+  echo "anas: installed ${ANAS_PROXY_PM}"
+
+  # 2. Splice the additive hook into the PVE HTTP server module.
+  if [ ! -f "${PVE_HTTP_SERVER_PM}" ]; then
+    echo "anas: WARNING: ${PVE_HTTP_SERVER_PM} not found; skipping proxy hook (/anas 404s until present)" >&2
+    return 0
+  fi
+  if grep -qF "${ANAS_HOOK_MARKER}" "${PVE_HTTP_SERVER_PM}"; then
+    echo "anas: proxy hook already present in ${PVE_HTTP_SERVER_PM} (nothing to do)"
+    return 0
+  fi
+  # Refuse to force onto a structure we don't recognise (guest philosophy).
+  if ! grep -qE 'handle_api2_request\(\$reqstate, \$auth, \$method, \$path\)' "${PVE_HTTP_SERVER_PM}"; then
+    echo "anas: ERROR: anchor (4-arg handle_api2_request) not found in ${PVE_HTTP_SERVER_PM}; refusing to patch" >&2
+    return 1
+  fi
+
+  # Back up the pristine module ONCE.
+  if [ ! -f "${PVE_HTTP_SERVER_PM_ORIG}" ]; then
+    cp -a "${PVE_HTTP_SERVER_PM}" "${PVE_HTTP_SERVER_PM_ORIG}"
+    echo "anas: saved pristine ${PVE_HTTP_SERVER_PM} -> ${PVE_HTTP_SERVER_PM_ORIG}"
+  fi
+
+  local blockfile patched
+  blockfile="$(mktemp)"
+  patched="$(mktemp)"
+  anas_hook_block > "${blockfile}"
+  # Splice a COPY; the live PVE module is only overwritten once the patch passes
+  # perl -c, so a bad splice can never leave :8006 with a non-compiling module.
+  splice_proxy_hook "${PVE_HTTP_SERVER_PM}" "${blockfile}" "${patched}"
+  rm -f "${blockfile}"
+
+  if ! grep -qF "${ANAS_HOOK_MARKER}" "${patched}"; then
+    rm -f "${patched}"
+    echo "anas: ERROR: proxy hook splice did not land (anchor mismatch); ${PVE_HTTP_SERVER_PM} untouched" >&2
+    return 1
+  fi
+
+  # perl -c GATE — the one hazard is a malformed PVE-owned module that won't
+  # compile at pveproxy startup (=> :8006 DOWN). Only adopt the patch on pass.
+  if command -v "${PERL_BIN}" >/dev/null 2>&1; then
+    if ! "${PERL_BIN}" -c "${patched}" >/dev/null 2>&1; then
+      rm -f "${patched}"
+      # The live module was never overwritten — it is still pristine — so there
+      # is nothing to restore. Do NOT restart pveproxy; clear any failed state
+      # defensively and abort.
+      systemctl reset-failed pveproxy >/dev/null 2>&1 || true
+      echo "anas: ERROR: patched ${PVE_HTTP_SERVER_PM} fails perl -c; left the live module pristine, did NOT restart pveproxy" >&2
+      return 1
+    fi
+  else
+    echo "anas: note: ${PERL_BIN} not found; skipping perl -c gate on the patched module" >&2
+  fi
+
+  # Gate passed — adopt the patched module and reload pveproxy.
+  cat "${patched}" > "${PVE_HTTP_SERVER_PM}"
+  rm -f "${patched}"
+  echo "anas: spliced ANAS proxy hook into ${PVE_HTTP_SERVER_PM}"
+
+  if restart_pveproxy; then
+    echo "anas: pveproxy restarted (proxy hook live)"
+  else
+    echo "anas: WARNING: pveproxy restart failed after patch; the patched module is valid and will load on the next restart" >&2
+    systemctl reset-failed pveproxy >/dev/null 2>&1 || true
+  fi
+  return 0
+}
 
 # 1. Generate and install our JS file (our file — upgrade-safe).
 #    anas.js is built by concatenating the per-view sources in src/ in lexical
@@ -126,15 +279,29 @@ else
   fi
 fi
 
-# 3. Install the apt hook so pve-manager upgrades re-apply the tpl line.
-#    DPkg::Post-Invoke runs after every dpkg transaction; the installer is
-#    idempotent, so re-running is cheap and safe. `|| true` keeps a failed
-#    re-apply from breaking the user's apt run.
+# 3. Install the ANAS reverse-proxy transport (AnasProxy.pm + the additive hook
+#    in PVE::APIServer::AnyEvent). This bridges pveproxy :8006 → the loopback
+#    gateway (story 12.2). Idempotent, perl-c-gated, fail-open. A real failure
+#    (broken module, anchor mismatch, or a patch that won't compile) aborts the
+#    install with a clear error; the live PVE module is never left broken.
+if ! install_anas_proxy; then
+  echo "anas: ERROR: proxy transport install failed — see message above" >&2
+  exit 1
+fi
+
+# 4. Install the apt hook so pve-manager / libpve-http-server-perl upgrades
+#    re-apply our patches. DPkg::Post-Invoke runs after every dpkg transaction;
+#    the installer is idempotent, so a pve-manager upgrade (which overwrites
+#    index.html.tpl) or a libpve-http-server-perl upgrade (which clobbers
+#    AnyEvent.pm, dropping the proxy hook) triggers a re-splice with the same
+#    perl-c gate. `|| true` keeps a failed re-apply from breaking the apt run.
 if [ -d "$(dirname "${APT_HOOK}")" ]; then
   cat > "${APT_HOOK}" <<EOF
-// Re-apply the ANAS PVE UI integration after package changes (pve-manager
-// upgrades overwrite /usr/share/pve-manager/index.html.tpl). Installed by
-// ANAS packages/pve-integration/install.sh. Idempotent.
+// Re-apply the ANAS PVE integration after package changes: pve-manager upgrades
+// overwrite /usr/share/pve-manager/index.html.tpl, and libpve-http-server-perl
+// upgrades overwrite /usr/share/perl5/PVE/APIServer/AnyEvent.pm (dropping the
+// ANAS proxy hook). Installed by ANAS packages/pve-integration/install.sh.
+// Idempotent; the re-splice is perl-c-gated so a bad patch never breaks :8006.
 DPkg::Post-Invoke { "if [ -x ${SCRIPT_DIR}/install.sh ]; then ${SCRIPT_DIR}/install.sh || true; fi"; };
 EOF
   echo "anas: installed apt hook ${APT_HOOK}"

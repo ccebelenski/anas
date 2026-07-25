@@ -1,12 +1,15 @@
 /*
  * ANAS — gateway API helper (ANAS.api).
  *
- * The browser only ever talks to the ANAS gateway on the host serving the PVE
- * UI (same host as :8006 — cookies ignore ports, so PVEAuthCookie flows on its
- * own with credentials: 'include'). The <node> path segment lets the gateway
+ * The browser talks to the ANAS gateway through PVE's own front door: every
+ * call goes to the same :8006 origin that serves the PVE UI, under the `/anas`
+ * base path (story 12.2 — docs/PROXY-TRANSPORT-DESIGN.md). pveproxy's additive
+ * hook strips `/anas` and forwards to the loopback gateway. Same origin means
+ * PVEAuthCookie flows on its own (credentials: 'include'), no CORS, and no
+ * separate cert exception. The <node> path segment lets the gateway
  * route/forward per-node server-side; the browser never contacts another node.
  *
- *   https://<window.location.hostname>:3000/api/nodes/<node>/v1<path>
+ *   /anas/api/nodes/<node>/v1<path>   (resolved against the :8006 UI origin)
  *
  * All calls return a Promise. Non-2xx rejects with an Error carrying `.status`
  * and `.body` (the parsed ApiError body when available). 202 is 2xx, so it
@@ -16,17 +19,14 @@
     'use strict';
 
     var ANAS = window.ANAS || (window.ANAS = {});
-    var GATEWAY_PORT = 3000;
 
-    function gatewayOrigin() {
-        var host = (typeof window !== 'undefined' && window.location && window.location.hostname)
-            ? window.location.hostname
-            : 'localhost';
-        return 'https://' + host + ':' + GATEWAY_PORT;
-    }
+    // Single base prefix for every gateway call. Relative, so it resolves
+    // against the current (:8006) origin; pveproxy proxies /anas to the
+    // loopback gateway, which strips the prefix — its route table is unchanged.
+    var API_BASE = '/anas';
 
     function nodeBase(node) {
-        return gatewayOrigin() + '/api/nodes/' + encodeURIComponent(node) + '/v1';
+        return API_BASE + '/api/nodes/' + encodeURIComponent(node) + '/v1';
     }
 
     // Low-level fetch → Promise. Parses JSON when the response advertises it,
@@ -143,8 +143,9 @@
     // Per-NODE availability probe (cluster-correct). Hits the node-scoped daemon
     // health through the gateway proxy: on the local node (or a peer that also
     // runs ANAS) the daemon answers 200 and the view renders; on a node WITHOUT
-    // ANAS the gateway can't reach its :3000 peer and returns 502, so this
-    // rejects and the caller shows the clean "not installed on this node" panel.
+    // ANAS the gateway can't reach its peer and returns 502 (or the peer's :8006
+    // 404s /anas), so this rejects and the caller shows the clean "not installed
+    // on this node" panel.
     // (A LOCAL /api/health probe would always pass when connected through an
     // ANAS node — views on ANAS-less peers would render, then error raw.)
     api.health = function (node) {

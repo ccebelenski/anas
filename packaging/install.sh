@@ -470,18 +470,12 @@ finish_success() {
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
   [ -n "${ip}" ] || ip="<node-ip>"
   echo
-  log "ANAS ${NEW_VERSION} installed — https://${ip}:${HEALTH_PORT}"
+  log "ANAS ${NEW_VERSION} installed — https://${ip}:8006 (the normal PVE web UI)"
   echo
-  info "FIRST RUN — trust the gateway certificate:"
-  info "  ANAS's gateway serves HTTPS on :${HEALTH_PORT} using this node's PVE"
-  info "  certificate. Browsers scope trust per host:port, so even though you've"
-  info "  accepted the cert for the PVE UI on :8006, you must ALSO trust :${HEALTH_PORT}"
-  info "  or ANAS shows \"not reachable\". Do ONE of:"
-  info "    - open https://${ip}:${HEALTH_PORT}/ once and accept the certificate, OR"
-  info "    - import the PVE cluster CA (/etc/pve/pve-root-ca.pem) into your browser"
-  info "      (trusts :8006 and :${HEALTH_PORT} together), OR"
-  info "    - install a browser-trusted cert on PVE (ACME / pveproxy-ssl.pem) — the"
-  info "      gateway auto-inherits it."
+  info "ANAS panels appear inside the Proxmox web UI you already use. The API is"
+  info "served through pveproxy on :8006 under /anas, so there is no separate"
+  info "origin and NO extra certificate to trust — if the PVE UI loads, ANAS does."
+  info "Log in to the PVE web UI and open a node to find the ANAS section."
   echo
   info "to remove: sudo ${SCRIPT_DIR}/uninstall.sh"
 }

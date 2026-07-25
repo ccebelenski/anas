@@ -62,20 +62,15 @@ cd anas-<version>
 sudo ./install.sh            # add --install-deps on a fresh node
 ```
 
-Open `https://<node-ip>:3000`. The ANAS panels appear inside the normal PVE web
-UI (no separate app).
+Open `https://<node-ip>:8006` — the normal Proxmox web UI. The ANAS panels
+appear inside it as a native section (open a node to find them); there is no
+separate app.
 
-> **First run — trust the gateway cert (or ANAS shows "not reachable").** The
-> gateway serves HTTPS on `:3000` with the node's PVE certificate (the same one
-> `:8006` uses). Browsers scope certificate trust **per host:port**, so accepting
-> the warning for the PVE UI on `:8006` does **not** cover `:3000` — the ANAS
-> panel's background request to `:3000` is silently blocked and the view reports
-> "not reachable on node". Do ONE of:
-> - open `https://<node-ip>:3000/` once and accept the certificate; **or**
-> - import the PVE cluster CA (`/etc/pve/pve-root-ca.pem`) into your browser —
->   trusts `:8006` and `:3000` together, no per-port clicks; **or**
-> - install a browser-trusted cert on PVE (built-in ACME/Let's Encrypt, or your
->   own at `pveproxy-ssl.pem`) — the gateway auto-inherits it.
+> **No separate certificate to trust.** ANAS's API is served through pveproxy on
+> `:8006` under the `/anas` path (story 12.2), the same origin as the PVE UI you
+> already use — so the browser's existing trust of `:8006` covers ANAS too. There
+> is no `:3000` origin and no per-port certificate exception to accept: if the
+> PVE web UI loads, ANAS does.
 
 ### Flags
 

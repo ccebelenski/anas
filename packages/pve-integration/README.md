@@ -3,9 +3,11 @@
 This package makes ANAS a **native** section inside the Proxmox web UI, modeled
 on how PVE presents **Ceph**: a collapsible group in the **node** menu whose
 items (Dashboard, Pools, Disks) render as native ExtJS panels in the content
-area. There is no separate web app and no iframe — the panels talk directly to
-the ANAS gateway on the same host (`https://<host>:3000`), and `PVEAuthCookie`
-flows automatically because cookies ignore ports.
+area. There is no separate web app and no iframe — the panels reach the ANAS
+gateway through PVE's own front door: same `:8006` origin as the PVE UI, under
+the `/anas` path (story 12.2; pveproxy proxies it to the loopback gateway). Same
+origin means `PVEAuthCookie` flows automatically, with no CORS and no separate
+cert exception.
 
 ```
 Node "pve1"
@@ -91,9 +93,9 @@ itself keeps working.
 
 ## Cross-node auth
 
-`PVEAuthCookie` is cluster-valid and, because cookies ignore ports, the browser
-sends it to the local gateway (`https://<ui-host>:3000`) automatically. The
-panels only ever call the **local** gateway; cross-node requests are forwarded
+`PVEAuthCookie` is cluster-valid and, because ANAS is served same-origin under
+`/anas` on the local `:8006`, the browser sends it automatically. The
+panels only ever call the **local** origin; cross-node requests are forwarded
 server-side by the gateway (node as a path parameter,
 `/api/nodes/<node>/v1/...`). There is no browser-side ticket handoff — that
 iframe-era mechanism was retired with the ExtJS-native pivot.
