@@ -3,13 +3,16 @@ import type { AddressInfo, Server as NetServer } from 'node:net'
 import type { AuthProvider, AuthUser } from '../auth/index.js'
 import type { GatewayConfig } from '../config.js'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer as createHttpServer } from 'node:http'
+import { createServer as createHttpsServer } from 'node:https'
 import { createServer as createTcpServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { VERSION } from '@anas/shared'
+import { classifyUpstreamResponse } from '../proxy.js'
 import { createServer } from '../server.js'
 
 const NODE = 'testnode'
@@ -32,12 +35,12 @@ class RejectAuthProvider implements AuthProvider {
 
 function baseConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
   return {
+    host: '127.0.0.1',
     port: 3000,
+    pvePort: 8006,
     nodeName: NODE,
     anasdSocket: '/run/anas/anasd.sock',
     authProvider: undefined,
-    tlsCert: undefined,
-    tlsKey: undefined,
     clusterCa: '/etc/pve/pve-root-ca.pem',
     ...overrides,
   }
@@ -72,45 +75,30 @@ describe('auth hook', () => {
   })
 })
 
-describe('cORS', () => {
-  it('answers OPTIONS preflight unauthenticated with PVE-origin headers', async () => {
-    const server = createServer({
-      config: baseConfig(),
-      authProvider: new RejectAuthProvider(),
-      logger: false,
-    })
-    const res = await server.inject({
-      method: 'OPTIONS',
-      url: '/api/nodes/testnode/v1/pools',
-      headers: { host: 'pve1.example.com:3000', origin: 'https://pve1.example.com:8006' },
-    })
-    assert.equal(res.statusCode, 204)
-    assert.equal(res.headers['access-control-allow-origin'], 'https://pve1.example.com:8006')
-    assert.equal(res.headers['access-control-allow-credentials'], 'true')
-    assert.match(String(res.headers['access-control-allow-methods']), /GET/)
-    assert.match(String(res.headers['access-control-allow-methods']), /DELETE/)
-    assert.match(String(res.headers['access-control-allow-headers']), /x-anas-confirm/)
-    await server.close()
-  })
-
-  it('derives the allowed origin from an IPv6 Host header', async () => {
+describe('no CORS (same-origin via :8006/anas)', () => {
+  it('emits no access-control-* headers even when an Origin is present', async () => {
+    // Requests now arrive same-origin through pveproxy; the CORS machinery is
+    // gone. A response must carry none of the allow/expose headers.
     const server = createServer({
       config: baseConfig(),
       authProvider: new AcceptAuthProvider(),
       logger: false,
     })
-    // The browser sends the matching Origin; the gateway echoes it only because
-    // it equals the host-derived PVE UI origin (port stripped from [addr]:port).
     const res = await server.inject({
       method: 'GET',
       url: '/api/health',
       headers: {
-        host: '[2001:db8::1]:3000',
-        origin: 'https://2001:db8::1:8006',
+        host: 'pve1.example.com:8006',
+        origin: 'https://pve1.example.com:8006',
         cookie: 'PVEAuthCookie=x',
       },
     })
-    assert.equal(res.headers['access-control-allow-origin'], 'https://2001:db8::1:8006')
+    assert.equal(res.statusCode, 200)
+    for (const h of Object.keys(res.headers)) {
+      assert.ok(!h.startsWith('access-control-'), `unexpected CORS header ${h}`)
+    }
+    // The version header still ships (same-origin needs no expose-header).
+    assert.equal(res.headers['x-anas-version'], VERSION)
     await server.close()
   })
 })
@@ -256,7 +244,7 @@ describe('remote node forwarding', () => {
         // Nonexistent CA path → unreadable.
         clusterCa: join(caDir, 'missing.pem'),
         // Point the "peer" at our local stub so any forward attempt is observable.
-        port: peerPort,
+        pvePort: peerPort,
       }),
       authProvider: new AcceptAuthProvider(),
       logger: false,
@@ -278,7 +266,7 @@ describe('remote node forwarding', () => {
 
   it('self-heals: a CA that is missing then present is picked up (no sticky-undefined cache)', async () => {
     const caPath = join(caDir, 'appears.pem')
-    const config = baseConfig({ clusterCa: caPath, port: 9 })
+    const config = baseConfig({ clusterCa: caPath, pvePort: 9 })
 
     // First request: CA absent → fail closed.
     const s1 = createServer({ config, authProvider: new AcceptAuthProvider(), logger: false })
@@ -323,5 +311,242 @@ describe('health endpoint', () => {
     // Version-skew visibility (12.1): every response names the gateway version.
     assert.equal(res.headers['x-anas-version'], VERSION)
     await server.close()
+  })
+})
+
+describe('unauthenticated /installed probe', () => {
+  it('returns 200 { name, version } with NO cookie (auth exempt)', async () => {
+    // Panels hit /anas/installed pre-login to detect ANAS presence; a 401 would
+    // defeat the probe. The reject provider proves auth is genuinely bypassed.
+    const server = createServer({
+      config: baseConfig(),
+      authProvider: new RejectAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({ method: 'GET', url: '/installed' })
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(res.json(), { name: 'anas', version: VERSION })
+    // Still stamped with the gateway version (skew visibility).
+    assert.equal(res.headers['x-anas-version'], VERSION)
+    await server.close()
+  })
+
+  it('authenticated routes still 401 without a cookie (probe is the only exemption)', async () => {
+    const server = createServer({
+      config: baseConfig(),
+      authProvider: new RejectAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({ method: 'GET', url: '/api/health' })
+    assert.equal(res.statusCode, 401)
+    assert.equal(res.json().error.code, 'UNAUTHORIZED')
+    await server.close()
+  })
+})
+
+describe('upstream classifier (ANAS_NOT_INSTALLED vs ANAS response)', () => {
+  const jsonHeaders = { 'content-type': 'application/json' }
+
+  it('classifies pveproxy no-such-path (404, non-JSON) as not-installed', () => {
+    const result = {
+      status: 404,
+      headers: { 'content-type': 'text/html' },
+      body: Buffer.from('<html><body>404 Not Found</body></html>'),
+    }
+    assert.equal(classifyUpstreamResponse(result), 'not-installed')
+  })
+
+  it('classifies pveproxy 501 Not Implemented as not-installed', () => {
+    const result = {
+      status: 501,
+      headers: {},
+      body: Buffer.from('Method \'GET /anas/...\' not implemented'),
+    }
+    assert.equal(classifyUpstreamResponse(result), 'not-installed')
+  })
+
+  it('classifies a genuine ANAS 404 error envelope as an ANAS response', () => {
+    const result = {
+      status: 404,
+      headers: jsonHeaders,
+      body: Buffer.from(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'no such pool' } })),
+    }
+    assert.equal(classifyUpstreamResponse(result), 'anas')
+  })
+
+  it('treats any non-404/501 status as an ANAS response', () => {
+    for (const status of [200, 202, 400, 409, 500]) {
+      assert.equal(
+        classifyUpstreamResponse({ status, headers: jsonHeaders, body: Buffer.from('{}') }),
+        'anas',
+      )
+    }
+  })
+})
+
+describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
+  // A self-signed cert for 127.0.0.1 doubles as the cluster CA: the peer HTTPS
+  // stub presents it and the gateway verifies the hop against it — exercising the
+  // exact fail-closed cluster-CA machinery, not a bypass.
+  let tlsDir: string
+  let certPath: string
+  let cert: Buffer
+  let key: Buffer
+
+  before(() => {
+    tlsDir = mkdtempSync(join(tmpdir(), 'anas-peer-tls-'))
+    certPath = join(tlsDir, 'cert.pem')
+    const keyPath = join(tlsDir, 'key.pem')
+    execFileSync('openssl', [
+      'req', '-x509', '-newkey', 'rsa:2048',
+      '-keyout', keyPath, '-out', certPath,
+      '-days', '1', '-nodes',
+      '-subj', '/CN=127.0.0.1',
+      '-addext', 'subjectAltName=IP:127.0.0.1',
+    ])
+    cert = readFileSync(certPath)
+    key = readFileSync(keyPath)
+  })
+
+  after(() => {
+    rmSync(tlsDir, { recursive: true, force: true })
+  })
+
+  it('re-adds the /anas prefix and hits the peer over the cluster CA', async () => {
+    let received: string | undefined
+    const peer = createHttpsServer({ cert, key }, (req, res) => {
+      received = req.url
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ data: [{ name: 'remotepool' }] }))
+    })
+    await new Promise<void>(resolve => peer.listen(0, '127.0.0.1', resolve))
+    const peerPort = (peer.address() as AddressInfo).port
+
+    const server = createServer({
+      config: baseConfig({ clusterCa: certPath, pvePort: peerPort }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    // node = 127.0.0.1 (a peer, not this node) → forwarded, not local.
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/nodes/127.0.0.1/v1/pools?verbose=1',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(res.json(), { data: [{ name: 'remotepool' }] })
+    // Round-trip: the local pveproxy stripped /anas; the gateway forwards to the
+    // peer with /anas re-added so the peer's pveproxy can route it.
+    assert.equal(received, '/anas/api/nodes/127.0.0.1/v1/pools?verbose=1')
+
+    await server.close()
+    await new Promise<void>(resolve => peer.close(() => resolve()))
+  })
+
+  it('returns 502 ANAS_NOT_INSTALLED when the peer :8006 answers no-such-path', async () => {
+    const peer = createHttpsServer({ cert, key }, (req, res) => {
+      // pveproxy's fallback when /anas is not hooked (ANAS absent on the node).
+      res.writeHead(404, { 'content-type': 'text/html' })
+      res.end('<html><body>404 Not Found</body></html>')
+    })
+    await new Promise<void>(resolve => peer.listen(0, '127.0.0.1', resolve))
+    const peerPort = (peer.address() as AddressInfo).port
+
+    const server = createServer({
+      config: baseConfig({ clusterCa: certPath, pvePort: peerPort }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/nodes/127.0.0.1/v1/pools',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+
+    assert.equal(res.statusCode, 502)
+    const body = res.json()
+    assert.equal(body.error.code, 'ANAS_NOT_INSTALLED')
+    assert.match(body.error.message, /127\.0\.0\.1/)
+
+    await server.close()
+    await new Promise<void>(resolve => peer.close(() => resolve()))
+  })
+
+  it('passes a genuine ANAS error envelope through untouched (not mislabeled)', async () => {
+    const peer = createHttpsServer({ cert, key }, (req, res) => {
+      res.writeHead(404, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 'NOT_FOUND', message: 'no such pool' } }))
+    })
+    await new Promise<void>(resolve => peer.listen(0, '127.0.0.1', resolve))
+    const peerPort = (peer.address() as AddressInfo).port
+
+    const server = createServer({
+      config: baseConfig({ clusterCa: certPath, pvePort: peerPort }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/nodes/127.0.0.1/v1/pools/nope',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+
+    // A real ANAS 404 is relayed verbatim, NOT turned into ANAS_NOT_INSTALLED.
+    assert.equal(res.statusCode, 404)
+    assert.equal(res.json().error.code, 'NOT_FOUND')
+
+    await server.close()
+    await new Promise<void>(resolve => peer.close(() => resolve()))
+  })
+})
+
+describe('loop-safety: own node is served locally, never forwarded out', () => {
+  const socketPath = join(tmpdir(), `anasd-loop-${process.pid}.sock`)
+  let stub: Server
+  let received: string | undefined
+
+  before(async () => {
+    stub = createHttpServer((req, res) => {
+      received = req.url
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ data: 'local' }))
+    })
+    await new Promise<void>(resolve => stub.listen(socketPath, resolve))
+  })
+
+  after(async () => {
+    await new Promise<void>(resolve => stub.close(() => resolve()))
+  })
+
+  it('a request for this node hits the local socket and opens no outbound :8006 hop', async () => {
+    // A TCP counter stands in for the peer front door. If the gateway ever
+    // forwarded its OWN node back out through :8006, this counter would tick.
+    let outbound = 0
+    const peer: NetServer = createTcpServer((sock) => {
+      outbound += 1
+      sock.destroy()
+    })
+    await new Promise<void>(resolve => peer.listen(0, '127.0.0.1', resolve))
+    const peerPort = (peer.address() as AddressInfo).port
+
+    const server = createServer({
+      // nodeName === the requested node → must be served locally.
+      config: baseConfig({ nodeName: NODE, anasdSocket: socketPath, pvePort: peerPort }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'GET',
+      url: `/api/nodes/${NODE}/v1/pools`,
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+
+    assert.equal(res.statusCode, 200)
+    assert.equal(received, '/v1/pools', 'served over the local anasd socket')
+    assert.equal(outbound, 0, 'the own node must never be forwarded out through :8006')
+
+    await server.close()
+    await new Promise<void>(resolve => peer.close(() => resolve()))
   })
 })

@@ -1,48 +1,15 @@
-import { existsSync, readFileSync } from 'node:fs'
 import { loadConfig } from './config.js'
 import { createServer } from './server.js'
 
-/** Candidate PVE cert pairs, in preference order (custom cert first, like pveproxy). */
-const PVE_CERT_CANDIDATES = [
-  { cert: '/etc/pve/local/pveproxy-ssl.pem', key: '/etc/pve/local/pveproxy-ssl.key' },
-  { cert: '/etc/pve/local/pve-ssl.pem', key: '/etc/pve/local/pve-ssl.key' },
-]
-
 /**
- * Resolve TLS material.
- *
- * ANAS_TLS_CERT/KEY override everything. Otherwise auto-detect the PVE certs
- * (custom preferred over node cert). If none exist we serve plain HTTP — dev
- * only; the PVEAuthCookie is Secure, so real auth needs HTTPS.
+ * The gateway is an internal loopback service: pveproxy terminates TLS at
+ * `:8006` and forwards `/anas/*` to `127.0.0.1:3000` over plain HTTP. There is
+ * no public origin and no TLS here — the cert lives on PVE's front door.
  */
-function resolveTls(
-  config: ReturnType<typeof loadConfig>,
-): { cert: Buffer, key: Buffer } | undefined {
-  if (config.tlsCert && config.tlsKey) {
-    return { cert: readFileSync(config.tlsCert), key: readFileSync(config.tlsKey) }
-  }
-
-  for (const pair of PVE_CERT_CANDIDATES) {
-    if (existsSync(pair.cert) && existsSync(pair.key)) {
-      return { cert: readFileSync(pair.cert), key: readFileSync(pair.key) }
-    }
-  }
-
-  return undefined
-}
-
 async function main() {
   const config = loadConfig()
-  const https = resolveTls(config)
 
-  const server = createServer({ config, https })
-
-  if (!https) {
-    server.log.warn(
-      '[gateway] No TLS certs found (ANAS_TLS_CERT/KEY or PVE certs) — serving plain HTTP. '
-      + 'The PVEAuthCookie is Secure, so browsers will withhold it: dev use only.',
-    )
-  }
+  const server = createServer({ config })
 
   const shutdown = async () => {
     server.log.info('Shutting down...')
@@ -53,9 +20,9 @@ async function main() {
   process.on('SIGINT', shutdown)
 
   try {
-    await server.listen({ port: config.port, host: '0.0.0.0' })
+    await server.listen({ port: config.port, host: config.host })
     server.log.info(
-      `anas gateway listening on ${https ? 'https' : 'http'}://0.0.0.0:${config.port} `
+      `anas gateway listening on http://${config.host}:${config.port} `
       + `(node '${config.nodeName}', anasd ${config.anasdSocket})`,
     )
   }

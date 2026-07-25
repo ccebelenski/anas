@@ -1,11 +1,9 @@
-import type { FastifyServerOptions } from 'fastify'
 import type { AuthProvider, AuthUser } from './auth/index.js'
 import type { GatewayConfig } from './config.js'
 import { VERSION } from '@anas/shared'
 import Fastify from 'fastify'
 import { createAuthProvider } from './auth/index.js'
 import { loadConfig } from './config.js'
-import { corsHook } from './cors.js'
 import { forwardToNode, proxyToLocalSocket } from './proxy.js'
 
 declare module 'fastify' {
@@ -25,8 +23,6 @@ export interface ServerOptions {
   authProvider?: AuthProvider
   /** Enable request logging. Default: true. Disable in unit tests. */
   logger?: boolean
-  /** HTTPS cert/key. Absent → plain HTTP. */
-  https?: { cert: string | Buffer, key: string | Buffer }
 }
 
 /** Read a named cookie out of a raw Cookie header. */
@@ -47,33 +43,34 @@ export function createServer(opts: ServerOptions = {}) {
   const config = opts.config ?? loadConfig()
   const provider = opts.authProvider ?? createAuthProvider(config.authProvider)
 
-  // Build a single options object and call Fastify once. Branching between two
-  // Fastify() calls would union the HTTP and HTTPS instance types and make the
-  // instance's own methods non-callable. `https` is read at runtime regardless
-  // of the (HTTP) static type we cast to.
-  const fastifyOpts = { logger: opts.logger ?? true } as FastifyServerOptions
-  if (opts.https)
-    (fastifyOpts as { https?: ServerOptions['https'] }).https = opts.https
-  const server = Fastify(fastifyOpts)
+  // pveproxy terminates TLS at :8006 and forwards to this loopback service, so
+  // the gateway is a plain-HTTP internal service — no TLS, no public origin.
+  const server = Fastify({ logger: opts.logger ?? true })
 
   // Pure gateway: never parse bodies — forward them verbatim as raw Buffers.
   server.removeAllContentTypeParsers()
   server.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => done(null, body))
 
-  // 1. CORS (also answers OPTIONS preflight, unauthenticated).
-  server.addHook('onRequest', corsHook)
-
   // Version-skew visibility (12.1): every response names this gateway's
   // version. Forwarded peer responses keep it too — relayHeaders never copies
   // the peer's copy — so the header always identifies the gateway the browser
-  // is actually talking to.
+  // is actually talking to. Requests are same-origin (via :8006/anas), so the
+  // header needs no CORS-expose.
   server.addHook('onRequest', async (_request, reply) => {
     reply.header('x-anas-version', VERSION)
   })
 
-  // 2. Auth: verify PVEAuthCookie (or dev), attach { name, uid } → 401 otherwise.
+  // Unauthenticated ANAS-presence probe: panels hit /anas/installed pre-login to
+  // detect whether ANAS is on a node without provoking a 401. Must bypass auth.
+  server.get('/installed', async () => {
+    return { name: 'anas', version: VERSION }
+  })
+
+  // Auth: verify PVEAuthCookie (or dev), attach { name, uid } → 401 otherwise.
   server.addHook('onRequest', async (request, reply) => {
-    if (request.method === 'OPTIONS')
+    // The unauthenticated presence probe is exempt (panels hit it pre-login).
+    const path = request.url.split('?', 1)[0]
+    if (request.method === 'GET' && path === '/installed')
       return
 
     if (provider.name === 'dev') {
@@ -132,7 +129,7 @@ export function createServer(opts: ServerOptions = {}) {
 
     await forwardToNode(request, reply, {
       node,
-      port: config.port,
+      pvePort: config.pvePort,
       clusterCa: config.clusterCa,
     })
   })

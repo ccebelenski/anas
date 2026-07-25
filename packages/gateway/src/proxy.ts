@@ -18,6 +18,47 @@ interface UpstreamResult {
   body: Buffer
 }
 
+/**
+ * The base prefix every ANAS request carries through PVE's `:8006` front door.
+ * The browser hits `/anas/...`; the local pveproxy strips it before the gateway
+ * sees the request, so when we forward cross-node we must re-add it for the peer
+ * pveproxy to route the request to that node's gateway.
+ */
+const ANAS_PROXY_PREFIX = '/anas'
+
+/**
+ * Classify a cross-node upstream response so we can tell an actual ANAS reply
+ * apart from pveproxy's own "no such path" answer — which is what a peer's
+ * `:8006` returns when ANAS is NOT installed there (the `/anas` hook is absent,
+ * so pveproxy falls through to its 404/501 fallback rather than reaching a
+ * gateway). A genuine ANAS response — even a 404 for a missing resource — always
+ * carries the ANAS JSON error envelope (`{ error: { code, message } }`);
+ * pveproxy's fallback does not.
+ *
+ * `'anas'`          → relay the response through verbatim.
+ * `'not-installed'` → surface a clean ANAS_NOT_INSTALLED for the node.
+ */
+export function classifyUpstreamResponse(result: UpstreamResult): 'anas' | 'not-installed' {
+  // Only pveproxy's no-such-path shapes (404 Not Found / 501 Not Implemented)
+  // are candidates; any other status is unambiguously a real ANAS response.
+  if (result.status !== 404 && result.status !== 501)
+    return 'anas'
+
+  const ct = result.headers['content-type']
+  const contentType = Array.isArray(ct) ? ct[0] : ct
+  if (contentType && contentType.includes('application/json')) {
+    try {
+      const parsed = JSON.parse(result.body.toString('utf8')) as { error?: { code?: unknown } }
+      if (parsed && typeof parsed.error?.code === 'string')
+        return 'anas'
+    }
+    catch {
+      // Not JSON → not an ANAS envelope → treat as pveproxy fallback below.
+    }
+  }
+  return 'not-installed'
+}
+
 /** Copy a header from the upstream response onto the client reply, if present. */
 function relayHeaders(reply: FastifyReply, headers: UpstreamResult['headers']): void {
   for (const name of PASSTHROUGH_RESPONSE_HEADERS) {
@@ -122,17 +163,28 @@ function loadClusterCa(request: FastifyRequest, caPath: string): string | Buffer
 }
 
 /**
- * Forward the whole request to a peer node's gateway over HTTPS.
+ * Forward the whole request to a peer node — through that node's PVE front door
+ * at `https://<node>:8006/anas/...`, the single ANAS surface for browser AND
+ * inter-node traffic (there is no `:3000` public origin anymore).
  *
- * Same path, forwarding the user's PVEAuthCookie so the remote gateway
- * verifies the ticket against the replicated cluster authkey exactly as for a
- * direct request. The TLS hop is verified against the cluster CA. Connection
- * failure → 502 NODE_UNREACHABLE naming the node.
+ * The gateway saw this request as `/api/nodes/<node>/v1/...` (the local pveproxy
+ * already stripped the `/anas` prefix), so we re-add `/anas` for the peer's
+ * pveproxy to route it to that node's loopback gateway. Round-trip:
+ *   browser  /anas/api/nodes/B/v1/x
+ *   → nodeA pveproxy strips → nodeA gateway sees /api/nodes/B/v1/x
+ *   → forward https://B:8006/anas/api/nodes/B/v1/x
+ *   → nodeB pveproxy strips → nodeB gateway sees /api/nodes/B/v1/x → served locally.
+ *
+ * The user's PVEAuthCookie rides along so the remote gateway verifies the ticket
+ * against the replicated cluster authkey exactly as for a direct request. The
+ * TLS hop is verified against the cluster CA (fail-closed if it is unreadable).
+ * Connection failure → 502 NODE_UNREACHABLE. A peer whose `:8006` answers but
+ * lacks the `/anas` hook (ANAS not installed) → 502 ANAS_NOT_INSTALLED.
  */
 export async function forwardToNode(
   request: FastifyRequest,
   reply: FastifyReply,
-  opts: { node: string, port: number, clusterCa: string },
+  opts: { node: string, pvePort: number, clusterCa: string },
 ): Promise<void> {
   const ca = loadClusterCa(request, opts.clusterCa)
   if (ca === undefined) {
@@ -170,9 +222,11 @@ export async function forwardToNode(
       const req = httpsRequest(
         {
           host: opts.node,
-          port: opts.port,
+          port: opts.pvePort,
           method: request.method,
-          path: request.url,
+          // Re-add the `/anas` prefix the local pveproxy stripped, so the peer's
+          // pveproxy routes this to that node's gateway.
+          path: `${ANAS_PROXY_PREFIX}${request.url}`,
           headers,
           agent: new HttpsAgent({ ca }),
         },
@@ -191,6 +245,19 @@ export async function forwardToNode(
         req.write(body)
       req.end()
     })
+
+    // The peer's :8006 is always up (it's PVE), so a "no such path" reply means
+    // ANAS is not installed on that node — surface a clean, distinguishable
+    // signal instead of relaying pveproxy's raw 404/501.
+    if (classifyUpstreamResponse(result) === 'not-installed') {
+      await reply.code(502).send({
+        error: {
+          code: 'ANAS_NOT_INSTALLED',
+          message: `ANAS is not installed on node '${opts.node}' (its Proxmox front door answered, but the /anas endpoint is not present).`,
+        },
+      })
+      return
+    }
 
     relayHeaders(reply, result.headers)
     await reply.code(result.status).send(result.body)
