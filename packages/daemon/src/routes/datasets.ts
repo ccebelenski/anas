@@ -12,6 +12,7 @@ import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { confirmGate } from '../safety/gate.js'
+import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { requireIdentity } from './identity.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
@@ -1167,8 +1168,12 @@ export async function datasetRoutes(
       { ...identity, params: { dataset: fullName, recursive } },
       async () => {
         const result = await executor.exec(ZFS, args)
-        if (result.exitCode !== 0)
-          throw new Error(result.stderr.trim() || `zfs destroy exited with code ${result.exitCode}`)
+        if (result.exitCode !== 0) {
+          // A busy dataset can't be unmounted for destroy — name the holders
+          // (3.29); the path comes from the ZFS error (`cannot unmount '<path>'`).
+          const base = result.stderr.trim() || `zfs destroy exited with code ${result.exitCode}`
+          throw new Error(await enrichBusyError(executor, base))
+        }
         return { destroyed: fullName }
       },
     )

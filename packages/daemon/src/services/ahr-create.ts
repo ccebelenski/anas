@@ -330,7 +330,7 @@ export async function changeAhrMountpoint(
 
   if (pool.mounted) {
     updateProgress(`Unmounting ${pool.mountpoint}`)
-    await run(executor, UMOUNT, ['--', pool.mountpoint])
+    await run(executor, UMOUNT, ['--', pool.mountpoint], { busyPath: pool.mountpoint })
   }
 
   updateProgress('Rewriting the fstab entry (surgical)')

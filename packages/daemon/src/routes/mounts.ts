@@ -9,6 +9,7 @@ import { classifyKind } from '../parsers/findmnt.js'
 import { addMount, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
+import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import {
   ahrPinnedSpecs,
@@ -365,7 +366,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
           if (r.exitCode !== 0 && !lazy)
-            throw new Error(r.stderr.trim() || `umount exited ${r.exitCode}`)
+            throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp))
         }
         if (disabling) {
           // Comment the fstab line with the marker; KEEP the credentials file.
@@ -431,7 +432,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
           if (r.exitCode !== 0 && !lazy)
-            throw new Error(r.stderr.trim() || `umount exited ${r.exitCode}`)
+            throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp))
         }
         if (entry) {
           updateProgress('Removing /etc/fstab entry')

@@ -86,7 +86,7 @@ export async function destroyAhrPool(
   const mounts = findmntRes.exitCode === 0 ? parseFindmnt(findmntRes.stdout) : []
   if (mountpoint && mounts.some(m => m.target === mountpoint)) {
     updateProgress(`Unmounting ${mountpoint}`)
-    await run(executor, UMOUNT, [mountpoint])
+    await run(executor, UMOUNT, [mountpoint], { busyPath: mountpoint })
   }
 
   // --- fstab: drop the pool's line (found by mountpoint OR by LV spec, so a

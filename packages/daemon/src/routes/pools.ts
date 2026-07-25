@@ -14,6 +14,7 @@ import { parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { confirmGate } from '../safety/gate.js'
 import { isRootPool } from '../safety/root-pool.js'
+import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
@@ -828,7 +829,10 @@ export async function poolRoutes(
         // every inheriting descendant) itself — no fstab, no manual mount/umount.
         const result = await executor.exec(ZFS, ['set', `mountpoint=${mp}`, poolName])
         if (result.exitCode !== 0) {
-          throw new Error(result.stderr.trim() || `zfs set mountpoint exited with code ${result.exitCode}`)
+          // `zfs set mountpoint` unmounts to move — a busy pool blocks it; name
+          // the holders (3.29). Path comes from the ZFS error (`cannot unmount`).
+          const base = result.stderr.trim() || `zfs set mountpoint exited with code ${result.exitCode}`
+          throw new Error(await enrichBusyError(executor, base))
         }
         return { pool: poolName, mountpoint: mp }
       },
@@ -1229,7 +1233,10 @@ export async function poolRoutes(
 
         const result = await executor.exec('/usr/sbin/zpool', ['destroy', poolName])
         if (result.exitCode !== 0) {
-          throw new Error(result.stderr.trim() || `zpool destroy exited with code ${result.exitCode}`)
+          // A busy destroy fails to unmount a dataset — name the holders (3.29).
+          // The path comes from the ZFS error itself (`cannot unmount '<path>'`).
+          const base = result.stderr.trim() || `zpool destroy exited with code ${result.exitCode}`
+          throw new Error(await enrichBusyError(executor, base))
         }
 
         if (cleanup && memberIds.length > 0) {

@@ -11,6 +11,7 @@ import {
   parseBtrfsSubvolList,
 } from '../parsers/btrfs-subvol-list.js'
 import { run } from './ahr-exec.js'
+import { diagnoseBusyPath, formatHolders } from './busy-diagnosis.js'
 
 /**
  * AHR btrfs subvolume snapshots (story 11.12, docs/AHR-DESIGN.md §12).
@@ -165,11 +166,14 @@ export async function withTopLevelMount<T>(
     const um = await executor.exec(UMOUNT, ['--', mnt])
     if (um.exitCode !== 0 && await isStillMountpoint(executor, mnt)) {
       // Do NOT remove anything — the top-level is still mounted; a recursive
-      // wipe here is the data-loss the whole guard exists to prevent.
+      // wipe here is the data-loss the whole guard exists to prevent. Name the
+      // holders keeping it mounted (story 3.29) so "free any holder" is actionable.
+      const clause = formatHolders(await diagnoseBusyPath(executor, mnt))
+      const holderSuffix = clause ? ` — ${clause}` : ''
       const leak = new Error(
         `failed to unmount the on-demand top-level mount at '${mnt}' for pool '${pool.name}' `
         + `(${um.stderr.trim() || `umount exited ${um.exitCode}`}) — it is still mounted; `
-        + `left in place to protect pool data. Free any holder and retry.`,
+        + `left in place to protect pool data. Free any holder and retry.${holderSuffix}`,
       )
       if (!ok)
         throw opError // the op's own failure is the more informative one
@@ -350,7 +354,7 @@ export async function rollbackAhrSnapshot(
 
   if (pool.mounted) {
     updateProgress(`Unmounting ${pool.mountpoint}`)
-    await run(executor, UMOUNT, ['--', pool.mountpoint])
+    await run(executor, UMOUNT, ['--', pool.mountpoint], { busyPath: pool.mountpoint })
   }
   try {
     await withTopLevelMount(executor, pool, async (top) => {
