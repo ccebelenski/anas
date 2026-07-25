@@ -131,6 +131,27 @@ export const MountCifsOptions = z.object({
 })
 export type MountCifsOptions = z.infer<typeof MountCifsOptions>
 
+/**
+ * Inline CIFS credentials EXTRACTED from a hand-written fstab entry — the
+ * `username=` / `password=` (and `domain=`) tokens some operators place directly
+ * in the option list (a plaintext-secret anti-pattern; 18.5 forbids it). The
+ * parser lifts them OUT of `passthrough` into this structured channel so the
+ * plaintext password never rides the verbatim passthrough into a response.
+ *
+ * Held TRANSIENTLY, daemon-side only: it is NEVER serialized back into an fstab
+ * line (`buildOptionTokens` ignores it) and the `password` is REDACTED (or the
+ * whole channel dropped) before any value crosses the API boundary. Its sole
+ * purpose is to MIGRATE the secret to the protected 0600 creds file on the next
+ * operator-initiated save. `password` present ⇒ the plaintext secret still lives
+ * inline and should be migrated.
+ */
+export const MountInlineCredentials = z.object({
+  username: z.string().optional(),
+  password: z.string().optional(),
+  domain: z.string().optional(),
+})
+export type MountInlineCredentials = z.infer<typeof MountInlineCredentials>
+
 /** The full structured-option bundle (all tiers), as parsed from fstab. */
 export const MountOptions = z.object({
   common: MountCommonOptions,
@@ -157,6 +178,13 @@ export const MountEntry = z.object({
   options: MountOptions,
   /** CIFS credentials file referenced (`credentials=…`) — path only, never the secret. */
   credentialsFile: z.string().optional(),
+  /**
+   * Inline plaintext CIFS credentials lifted out of a hand-written fstab options
+   * list (`username=`/`password=`/`domain=`). TRANSIENT, daemon-only — never
+   * serialized back to fstab, password REDACTED/stripped before any response.
+   * Drives one-time migration to the protected creds file on the next save.
+   */
+  inlineCredentials: MountInlineCredentials.optional(),
   dump: z.number().int().nonnegative(),
   pass: z.number().int().nonnegative(),
   /** Disabled-without-delete: the line is commented with the `#ANAS ` marker. */

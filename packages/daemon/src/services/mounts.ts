@@ -21,7 +21,7 @@ import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
-import { getMount, parseFstab } from '../parsers/fstab.js'
+import { getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { readPveMountPaths } from '../parsers/pve-storage.js'
@@ -812,6 +812,47 @@ export async function readUnitState(executor: CommandExecutor, mountpoint: strin
 }
 
 // ============================================================================
+// Inline-credential redaction (SECURITY — the secret never crosses the boundary)
+// ============================================================================
+
+/** Placeholder the plaintext password is replaced with in any client-facing string. */
+export const REDACTED_SECRET = '*****'
+/** `password=<value>` up to the next option separator (comma) or whitespace. */
+const INLINE_PASSWORD_RE = /(password=)[^,\s]*/gi
+/** Advisory shown when a mount still carries inline plaintext credentials. */
+export const INLINE_CREDS_WARNING
+  = 'Credentials are stored inline in /etc/fstab (plaintext); saving migrates them to a protected root-only file.'
+
+/**
+ * Redact the inline plaintext CIFS password from an fstab line so it can be
+ * returned as `MountDetail.fstabLine` without leaking the secret. Replaces the
+ * `password=<value>` token with `password=*****`; leaves everything else — incl.
+ * `username=` (already surfaced via credentials) — byte-for-byte.
+ */
+export function redactFstabLine(line: string): string {
+  return line.replace(INLINE_PASSWORD_RE, `$1${REDACTED_SECRET}`)
+}
+
+/**
+ * A response-safe copy of an entry: the transient `inlineCredentials` channel
+ * (which carries the plaintext password) is DROPPED entirely — its information
+ * is conveyed instead via `MountDetail.credentials` (presence + username/domain,
+ * never the secret) and a warning. Everything else is preserved.
+ */
+export function entryForResponse(entry: MountEntry): MountEntry {
+  if (!entry.inlineCredentials)
+    return entry
+  const { inlineCredentials: _drop, ...rest } = entry
+  return rest
+}
+
+/** True when an entry carries inline plaintext credentials (username or password inline). */
+export function hasInlineCredentials(entry: MountEntry | undefined): boolean {
+  const inline = entry?.inlineCredentials
+  return !!inline && (inline.username !== undefined || inline.password !== undefined)
+}
+
+// ============================================================================
 // Detail assembly (GET /v1/mounts/:mountpoint)
 // ============================================================================
 
@@ -866,9 +907,13 @@ export async function buildMountDetail(
   if (capacity)
     detail.capacity = capacity
   if (entry) {
-    detail.entry = entry
-    detail.configuredOptions = entry.options
-    detail.fstabLine = fstabLineFor(fstabText, mountpoint)
+    // SECURITY: never let the transient inline-credential channel (plaintext
+    // password) cross the boundary, and REDACT the password in the raw fstab line.
+    detail.entry = entryForResponse(entry)
+    detail.configuredOptions = detail.entry.options
+    const raw = fstabLineFor(fstabText, mountpoint)
+    if (raw !== undefined)
+      detail.fstabLine = redactFstabLine(raw)
   }
   if (effective)
     detail.effectiveOptions = effective.options
@@ -878,12 +923,26 @@ export async function buildMountDetail(
     detail.unit = unit
 
   if (row.type === 'cifs') {
-    const credPath = entry?.credentialsFile ?? credsFilePath(opts.credsDir, mountpoint)
-    const meta = await readCredentialsMeta(credPath)
-    detail.credentials = {
-      set: meta.set,
-      ...(meta.username ? { username: meta.username } : {}),
-      ...(meta.domain ? { domain: meta.domain } : {}),
+    if (hasInlineCredentials(entry)) {
+      // Inline plaintext credentials found (18.5 anti-pattern): reflect their
+      // presence + non-secret metadata (username/domain), NEVER the password, and
+      // guide the operator that a save migrates them to the protected creds file.
+      const inline = entry!.inlineCredentials!
+      detail.credentials = {
+        set: true,
+        ...(inline.username ? { username: inline.username } : {}),
+        ...(inline.domain ? { domain: inline.domain } : {}),
+      }
+      detail.warnings.push(INLINE_CREDS_WARNING)
+    }
+    else {
+      const credPath = entry?.credentialsFile ?? credsFilePath(opts.credsDir, mountpoint)
+      const meta = await readCredentialsMeta(credPath)
+      detail.credentials = {
+        set: meta.set,
+        ...(meta.username ? { username: meta.username } : {}),
+        ...(meta.domain ? { domain: meta.domain } : {}),
+      }
     }
   }
 
@@ -895,7 +954,9 @@ export function fstabLineFor(fstabText: string, mountpoint: string): string | un
   for (const raw of fstabText.split('\n')) {
     if (raw.trim().startsWith('#') || raw.trim() === '')
       continue
-    const hashIdx = raw.indexOf('#')
+    // Only a token-starting `#` is a trailing comment — a `#` inside a field (an
+    // option value such as a password) is data, never truncate on it (BUG-2).
+    const hashIdx = inlineCommentIndex(raw)
     const fieldsPart = hashIdx === -1 ? raw : raw.slice(0, hashIdx)
     const fields = fieldsPart.trim().split(WHITESPACE_RE)
     if (fields.length >= 2 && fields[1] === mountpoint)

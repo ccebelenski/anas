@@ -16,12 +16,15 @@ import {
   buildSpec,
   classifyStatHealth,
   credsFileName,
+  entryForResponse,
   formatCredentials,
+  hasInlineCredentials,
   mapCifsFailure,
   mapNfsFailure,
   parseSpec,
   parseStatCapacity,
   probeInventoryHealth,
+  redactFstabLine,
   writeCredentialsFile,
 } from '../mounts.js'
 
@@ -226,13 +229,13 @@ describe('buildBaseInventory — fstab pseudo/system entries never leak', () => 
   // past the fstab overlay — the active-mount filter dropped it, then the overlay
   // re-added it as a ghost persistent+unmounted row → a bogus "configured but not
   // mounted" dashboard warning. Both paths now share isIgnoredMount.
-  const fstab = [
+  const fstab = `${[
     'proc /proc proc defaults 0 0',
     'sysfs /sys sysfs defaults 0 0',
     'UUID=abcd none swap sw 0 0',
     'tmpfs /run/lock tmpfs defaults 0 0',
     '127.0.0.1:/srv/nfs/export /mnt/data nfs4 defaults 0 0',
-  ].join('\n') + '\n'
+  ].join('\n')}\n`
   const rows = buildBaseInventory('{"filesystems":[]}', fstab, new Map())
 
   it('drops proc/sys/swap/tmpfs fstab lines, keeps the real NFS mount', () => {
@@ -445,4 +448,54 @@ describe('writeCredentialsFile', () => {
     assert.equal(credsFileName('/mnt/anas-cifs'), 'mnt-anas-cifs.cred')
     assert.equal(credsFileName('/srv/data/share'), 'srv-data-share.cred')
   })
+
+  it('a comma-bearing password lands in the line-based creds file intact', async () => {
+    const credsDir = join(dir, 'creds')
+    const path = await writeCredentialsFile(credsDir, '/mnt/x', { username: 'u', password: 'a,b#c$d' })
+    assert.equal(await readFile(path, 'utf8'), 'username=u\npassword=a,b#c$d\n')
+  })
 })
+
+describe('inline-credential redaction (SECURITY — secret never crosses the boundary)', () => {
+  const line = '//10.0.0.114/chiap2 /chiapools/chiap2 cifs ro,nofail,username=ccebelenski,password=Xy#zzy!$,uid=1000,gid=100 0 0'
+
+  it('redactFstabLine replaces the password value with a placeholder', () => {
+    const redacted = redactFstabLine(line)
+    assert.ok(!redacted.includes('Xy#zzy'))
+    assert.ok(redacted.includes('password=*****'))
+    // Everything else — incl. username and the options past the password — is kept.
+    assert.ok(redacted.includes('username=ccebelenski'))
+    assert.ok(redacted.includes('uid=1000,gid=100'))
+  })
+
+  it('redactFstabLine is a no-op on a secure (credentials=file) line', () => {
+    const secure = '//127.0.0.1/anastest /mnt/c cifs credentials=/etc/anas/creds/x.cred,vers=3.1.1 0 0'
+    assert.equal(redactFstabLine(secure), secure)
+  })
+
+  it('entryForResponse drops the transient inlineCredentials channel', () => {
+    const entry: MountEntry = {
+      spec: '//h/s',
+      mountpoint: '/m',
+      fstype: 'cifs',
+      options: { common: baseCommon(), passthrough: '' },
+      inlineCredentials: { username: 'u', password: 'secret', domain: 'D' },
+      dump: 0,
+      pass: 0,
+    }
+    const safe = entryForResponse(entry)
+    assert.equal(safe.inlineCredentials, undefined)
+    assert.ok(!JSON.stringify(safe).includes('secret'))
+  })
+
+  it('hasInlineCredentials detects inline user/pass, ignores a secure entry', () => {
+    assert.equal(hasInlineCredentials({ spec: '//h/s', mountpoint: '/m', fstype: 'cifs', options: { common: baseCommon(), passthrough: '' }, inlineCredentials: { password: 'x' }, dump: 0, pass: 0 }), true)
+    assert.equal(hasInlineCredentials({ spec: '//h/s', mountpoint: '/m', fstype: 'cifs', options: { common: baseCommon(), passthrough: '' }, credentialsFile: '/etc/anas/creds/x.cred', dump: 0, pass: 0 }), false)
+    assert.equal(hasInlineCredentials(undefined), false)
+  })
+})
+
+/** A fully-populated common-options block for entry fixtures. */
+function baseCommon() {
+  return { readOnly: false, nofail: true, noauto: false, automount: false, noatime: false, nosuid: false, nodev: false, netdev: false }
+}

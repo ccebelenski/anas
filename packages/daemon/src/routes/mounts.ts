@@ -18,6 +18,7 @@ import {
   credsFilePath,
   entryFromRequest,
   fstabHasMount,
+  hasInlineCredentials,
   isRemoteKind,
   mountpointReservedByPve,
   probeInventoryHealth,
@@ -230,6 +231,11 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return rejectedLocal
 
     const merged = mergeEntry(existing, body.options, body.automount, body.extraOptions)
+    // SECURITY (BUG-1): a hand-written entry with inline plaintext credentials is
+    // MIGRATED on this operator-initiated save — the secret moves to the protected
+    // 0600 creds file and the rewritten fstab line carries `credentials=<file>`
+    // with NO inline username/password/domain.
+    const migrating = hasInlineCredentials(existing)
 
     const job = jobQueue.submit(
       'mount.update',
@@ -238,6 +244,26 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         if (body.credentials) {
           updateProgress('Rotating credentials file')
           merged.credentialsFile = await writeCredentialsFile(credsDir, mp, body.credentials)
+        }
+        else if (migrating && existing.inlineCredentials?.password !== undefined) {
+          // Operator did NOT retype the password: seed the creds file from the
+          // EXTRACTED inline secret (one-time migration) so the mount keeps working
+          // with its real password (specials like '#' preserved via the line-based
+          // creds format). The plaintext never returns to the fstab line.
+          updateProgress('Migrating inline credentials to a protected file')
+          merged.credentialsFile = await writeCredentialsFile(credsDir, mp, {
+            username: existing.inlineCredentials.username ?? '',
+            password: existing.inlineCredentials.password,
+            ...(existing.inlineCredentials.domain !== undefined ? { domain: existing.inlineCredentials.domain } : {}),
+          })
+        }
+        if (migrating) {
+          // Drop the inline tokens from the serialized entry (buildOptionTokens
+          // already ignores inlineCredentials; also drop the now-migrated domain
+          // option so it is not re-emitted inline).
+          delete merged.inlineCredentials
+          if (merged.options.cifs)
+            delete merged.options.cifs.domain
         }
         updateProgress('Rewriting /etc/fstab entry')
         await editConfig(fstabPath, (current) => {

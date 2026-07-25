@@ -186,6 +186,7 @@ export {
   MountDetail,
   MountEntry,
   MountHealth,
+  MountInlineCredentials,
   MountKind,
   MountMode,
   MountNfsOptions,

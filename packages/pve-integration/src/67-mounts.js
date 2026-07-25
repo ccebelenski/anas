@@ -737,6 +737,18 @@
             html += '<div style="margin-top:10px;color:var(--anas-muted,gray);font-size:0.9em;">'
                 + enc(t('Not persisted — this mount has no /etc/fstab entry.')) + '</div>';
         }
+
+        // Advisory warnings (e.g. inline plaintext credentials → migrate on save).
+        // Guide-don't-warn: surfaced here, never blocking.
+        if (d.warnings && d.warnings.length) {
+            var wHtml = '';
+            for (var wi = 0; wi < d.warnings.length; wi++) {
+                wHtml += '<div style="color:var(--anas-warn,#b06a12);font-size:0.9em;margin-top:4px;">'
+                    + '<i class="fa fa-exclamation-triangle" style="margin-right:6px;"></i>'
+                    + enc(d.warnings[wi]) + '</div>';
+            }
+            html += '<div style="margin-top:10px;">' + wHtml + '</div>';
+        }
         html += '</div>';
         return html;
     }
@@ -1722,7 +1734,9 @@
             // CIFS tier.
             var cifs = co.cifs || {};
             setFld(win, '#cifsVers', cifs.vers);
-            setFld(win, '#credDomain', cifs.domain);
+            // Domain lives in the credentials section; for a hand-written inline
+            // entry it is surfaced via d.credentials.domain (never a cifs option).
+            setFld(win, '#credDomain', first(cifs.domain, d.credentials && d.credentials.domain));
             setFld(win, '#cifsUid', cifs.uid);
             setFld(win, '#cifsGid', cifs.gid);
             setFld(win, '#cifsFileMode', cifs.fileMode);

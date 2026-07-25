@@ -1,4 +1,4 @@
-import type { MountCifsOptions, MountCommonOptions, MountEntry, MountNfsOptions, MountOptions } from '@anas/shared'
+import type { MountCifsOptions, MountCommonOptions, MountEntry, MountInlineCredentials, MountNfsOptions, MountOptions } from '@anas/shared'
 
 /**
  * Round-trip parser and surgical editor for /etc/fstab (see fstab(5)).
@@ -28,6 +28,26 @@ import type { MountCifsOptions, MountCommonOptions, MountEntry, MountNfsOptions,
 
 /** Whitespace splitter for the six fstab fields. */
 const FIELD_SPLIT = /\s+/
+
+/** Single whitespace char — the token boundary before an inline `#` comment. */
+const WS_CHAR = /\s/
+
+/**
+ * The index of a `#` that BEGINS an inline trailing comment — a `#` at column 0
+ * OR one immediately preceded by whitespace (i.e. it starts its own token). A
+ * `#` embedded WITHIN a field (e.g. a `password=Xy#zzy` option value) is NOT a
+ * comment: fstab fields are whitespace-separated, so libmount only treats a
+ * whitespace-preceded `#` as the start of a comment (ground-truth verified —
+ * `mount` receives the full option value when the `#` is mid-field). Returns -1
+ * when the line carries no trailing comment.
+ */
+export function inlineCommentIndex(raw: string): number {
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] === '#' && (i === 0 || WS_CHAR.test(raw[i - 1])))
+      return i
+  }
+  return -1
+}
 
 /**
  * Disable-without-delete marker (operator decision): a disabled ANAS entry is
@@ -197,8 +217,10 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
   if (trimmed === '' || trimmed.startsWith('#'))
     return null
 
-  // Split off an inline trailing comment (everything from the first `#`).
-  const hashIdx = raw.indexOf('#')
+  // Split off an inline trailing comment — a `#` that STARTS a token (column 0 or
+  // whitespace-preceded), never a `#` embedded inside a field (a `#` in an option
+  // value such as a password is data, not a comment: BUG-2 was truncating there).
+  const hashIdx = inlineCommentIndex(raw)
   const fieldsPart = hashIdx === -1 ? raw : raw.slice(0, hashIdx)
   const trailingComment = hashIdx === -1 ? '' : raw.slice(hashIdx)
 
@@ -213,7 +235,7 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
     return null
 
   const tokens = optStr.split(',').map(o => o.trim()).filter(Boolean)
-  const { options, credentialsFile } = classifyOptions(fstype, tokens)
+  const { options, credentialsFile, inlineCredentials } = classifyOptions(fstype, tokens)
 
   const entry: MountEntry = {
     spec,
@@ -225,6 +247,8 @@ function parseActiveEntry(raw: string): { entry: MountEntry, trailingComment: st
   }
   if (credentialsFile !== undefined)
     entry.credentialsFile = credentialsFile
+  if (inlineCredentials !== undefined)
+    entry.inlineCredentials = inlineCredentials
 
   return { entry, trailingComment }
 }
@@ -249,7 +273,7 @@ function isNfs(fstype: string): boolean {
 export function classifyOptions(
   fstype: string,
   tokens: string[],
-): { options: MountOptions, credentialsFile?: string } {
+): { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials } {
   const common: MountCommonOptions = {
     readOnly: false,
     nofail: false,
@@ -264,6 +288,7 @@ export function classifyOptions(
   const cifs: MountCifsOptions = {}
   const passthrough: string[] = []
   let credentialsFile: string | undefined
+  const inline: MountInlineCredentials = {}
   const nfsFs = isNfs(fstype)
   const cifsFs = fstype === 'cifs'
 
@@ -286,6 +311,26 @@ export function classifyOptions(
         credentialsFile = value
         continue
       }
+      // SECURITY (BUG-1): inline `username=`/`password=` are credential tokens,
+      // NOT passthrough — lifting them into the structured `inlineCredentials`
+      // channel keeps the plaintext password out of `passthrough` (which is
+      // returned to clients and round-tripped into fstab verbatim). They are
+      // migrated to the protected 0600 creds file on the next save.
+      if (key === 'username') {
+        inline.username = value
+        continue
+      }
+      if (key === 'password') {
+        inline.password = value
+        continue
+      }
+      // `domain=` is a credential-set token too; record it in the credentials
+      // channel (surfaced in the UI credentials section) while STILL classifying
+      // it into the cifs tier so a non-inline `domain=` option round-trips as
+      // before. Only when username/password are ALSO present is it treated as an
+      // inline-credential domain (migrated to the creds file, stripped inline).
+      if (key === 'domain')
+        inline.domain = value
       if (applyCifsToken(cifs, key, value, passthrough))
         continue
     }
@@ -300,7 +345,12 @@ export function classifyOptions(
   if (Object.keys(cifs).length > 0)
     options.cifs = cifs
 
-  return credentialsFile !== undefined ? { options, credentialsFile } : { options }
+  const result: { options: MountOptions, credentialsFile?: string, inlineCredentials?: MountInlineCredentials } = { options }
+  if (credentialsFile !== undefined)
+    result.credentialsFile = credentialsFile
+  if (Object.keys(inline).length > 0)
+    result.inlineCredentials = inline
+  return result
 }
 
 /** Parse a numeric option value; push the raw token to passthrough if not a number. */

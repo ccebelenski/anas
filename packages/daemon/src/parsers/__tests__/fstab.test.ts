@@ -11,6 +11,7 @@ import {
   enableMount,
   getMount,
   hasMount,
+  inlineCommentIndex,
   parseFstab,
   parseFstabDoc,
   removeMount,
@@ -76,12 +77,70 @@ describe('parseFstab — which lines are entries', () => {
 describe('classifyOptions — CIFS credentials + tiers', () => {
   it('extracts the credentials file path (never a secret) and cifs tier', () => {
     const tokens = 'credentials=/etc/anas/creds/anastest.cred,vers=3.1.1,uid=1002,gid=1002,nofail'.split(',')
-    const { options, credentialsFile } = classifyOptions('cifs', tokens)
+    const { options, credentialsFile, inlineCredentials } = classifyOptions('cifs', tokens)
     assert.equal(credentialsFile, '/etc/anas/creds/anastest.cred')
     assert.equal(options.cifs?.vers, '3.1.1')
     assert.equal(options.cifs?.uid, 1002)
     assert.equal(options.common.nofail, true)
     assert.equal(options.passthrough, '')
+    assert.equal(inlineCredentials, undefined) // secure entry — no inline creds
+  })
+})
+
+describe('classifyOptions — inline plaintext CIFS credentials (BUG-1 security)', () => {
+  // The production shape: username/password INLINE, password containing `#` and
+  // other specials, options both BEFORE and AFTER the credentials.
+  const tokens = 'ro,nofail,noatime,vers=3.1.1,cache=strict,username=ccebelenski,password=Xy#zzy!$,domain=CORP,uid=1000,forceuid,gid=100'.split(',')
+
+  it('extracts username/password/domain into the structured channel — NOT passthrough', () => {
+    const { options, inlineCredentials } = classifyOptions('cifs', tokens)
+    assert.ok(inlineCredentials)
+    assert.equal(inlineCredentials!.username, 'ccebelenski')
+    assert.equal(inlineCredentials!.password, 'Xy#zzy!$') // the `#`/specials survive WHOLE
+    assert.equal(inlineCredentials!.domain, 'CORP')
+    // The secret must never ride the verbatim passthrough (returned to clients).
+    assert.ok(!options.passthrough.includes('password'))
+    assert.ok(!options.passthrough.includes('username'))
+    assert.ok(!options.passthrough.includes('Xy#zzy'))
+    // Genuinely-unrecognized options DO round-trip in passthrough.
+    assert.equal(options.passthrough, 'cache=strict,forceuid')
+  })
+
+  it('options AFTER a `#`-bearing password are still parsed (no mid-field comment truncation)', () => {
+    const { options } = classifyOptions('cifs', tokens)
+    assert.equal(options.cifs?.uid, 1000)
+    assert.equal(options.cifs?.gid, 100) // past the password — proves BUG-2 does not bite the option list
+    assert.equal(options.common.readOnly, true)
+    assert.equal(options.common.noatime, true)
+  })
+})
+
+describe('inlineCommentIndex — token-starting `#` only (BUG-2)', () => {
+  it('finds a whitespace-preceded `#` (a genuine trailing comment)', () => {
+    assert.equal(inlineCommentIndex('a b c 0 0   # note'), 12)
+  })
+  it('ignores a `#` embedded inside a field (a password value)', () => {
+    assert.equal(inlineCommentIndex('//h/s /m cifs username=u,password=Xy#zzy,uid=1 0 0'), -1)
+  })
+  it('a leading `#` is column 0', () => {
+    assert.equal(inlineCommentIndex('# whole-line comment'), 0)
+  })
+})
+
+describe('a fstab line with a `#` inside the password parses whole + round-trips', () => {
+  const line = '//10.0.0.114/chiap2 /chiapools/chiap2 cifs ro,nofail,username=u,password=Xy#zzy,uid=1000,gid=100 0 0\n'
+
+  it('parseFstabDoc → serializeFstabDoc is byte-identical (raw preserved)', () => {
+    assert.equal(serializeFstabDoc(parseFstabDoc(line)), line)
+  })
+
+  it('the entry parses through the `#` — mountpoint, uid, gid, and inline creds all intact', () => {
+    const entry = getMount(line, '/chiapools/chiap2')!
+    assert.equal(entry.fstype, 'cifs')
+    assert.equal(entry.options.cifs?.uid, 1000)
+    assert.equal(entry.options.cifs?.gid, 100)
+    assert.equal(entry.inlineCredentials?.password, 'Xy#zzy')
+    assert.equal(entry.inlineCredentials?.username, 'u')
   })
 })
 
