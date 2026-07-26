@@ -163,3 +163,97 @@ export const RetentionPlan = z.object({
   skippedHeld: z.array(ScheduledSnapshot),
 })
 export type RetentionPlan = z.infer<typeof RetentionPlan>
+
+// ============================================================================
+// Stage 2 — the schedule STORE, its systemd-derived status, and periodic scrub.
+//
+// A snapshot schedule's systemd timer+service pair IS the store (the Epic 5.5
+// replication task-store pattern): the SnapshotSchedule above is embedded in the
+// `.service` unit as an `X-ANAS-Schedule=` comment and is the single source of
+// truth parsed back. Status is DERIVED from systemd (never stored), exactly like
+// a replication/backup task.
+// ============================================================================
+
+/**
+ * A schedule's last-run outcome, mapped from the oneshot service's systemd
+ * state. Mirrors the replication/backup task run-result vocabulary so the
+ * Schedules grid reads identically to those views.
+ */
+export const ScheduleRunResult = z.enum(['success', 'failure', 'running', 'unknown'])
+export type ScheduleRunResult = z.infer<typeof ScheduleRunResult>
+
+/**
+ * One snapshot schedule's live status, derived from persistent systemd state:
+ * the service's last result + last-run time, and the timer's next elapse.
+ * `overdue` = enabled AND the next elapse is in the past (a Persistent timer that
+ * never caught up). The uniform row the Schedules grid renders (17.3).
+ */
+export const SnapshotScheduleStatus = z.object({
+  schedule: SnapshotSchedule,
+  lastRunResult: ScheduleRunResult,
+  lastRunAt: z.string().nullable(),
+  nextRunAt: z.string().nullable(),
+  overdue: z.boolean(),
+})
+export type SnapshotScheduleStatus = z.infer<typeof SnapshotScheduleStatus>
+
+/**
+ * The result of firing a schedule once (take + prune) — the fire endpoint's job
+ * result and what the timer's runner prints to journald. `pruned`/`skippedHeld`
+ * are snapshot labels; `skippedHeld` are the held snapshots retained despite
+ * policy (the holds-vs-prune trap, GT-7) — surfaced, never a failed destroy.
+ */
+export const SnapshotScheduleRunResult = z.object({
+  schedule: ScheduleId,
+  /** The label of the snapshot just taken (`anas-<bucket>-<utc>`). */
+  taken: z.string(),
+  /** Labels of the snapshots pruned by retention. */
+  pruned: z.array(z.string()),
+  /** Labels of held snapshots retained despite policy (surfaced as intentional). */
+  skippedHeld: z.array(z.string()),
+})
+export type SnapshotScheduleRunResult = z.infer<typeof SnapshotScheduleRunResult>
+
+// ---- Periodic scrub (uniform surface, filesystem-native backend) ------------
+
+/**
+ * A periodic-scrub target: a ZFS pool or an AHR pool. Both are pool-level (the
+ * uniform "periodic scrub: on/off (monthly)" surface); only `kind` decides the
+ * backend the toggle drives.
+ */
+export const ScrubTarget = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('zfs'), pool: PoolName }),
+  z.object({ kind: z.literal('ahr'), pool: PoolName }),
+])
+export type ScrubTarget = z.infer<typeof ScrubTarget>
+
+/**
+ * The filesystem-native mechanism behind a pool's periodic scrub:
+ * - `zfs-property` — PVE's monthly cron, per-pool-gated by the pool root's
+ *   `org.debian:periodic-scrub` ZFS property (ANAS flips the property).
+ * - `mdcheck-timer` — mdadm's shipped `mdcheck_start`/`mdcheck_continue` systemd
+ *   timers (ANAS enables/disables them). NODE-GLOBAL: mdcheck verifies every md
+ *   array on the host, so this toggle governs md checks for ALL AHR pools at
+ *   once — the one place the uniform surface diverges from ZFS's per-pool knob.
+ */
+export const ScrubMechanism = z.enum(['zfs-property', 'mdcheck-timer'])
+export type ScrubMechanism = z.infer<typeof ScrubMechanism>
+
+/**
+ * A pool's periodic-scrub state, uniform across ZFS and AHR. `cadence` is
+ * `monthly` for both (ZFS: PVE's 2nd-Sunday cron; AHR: mdcheck's 1st-Sunday
+ * timer) — custom cadences are a later refinement (SCHEDULES-DESIGN §Scrub).
+ * `note` carries the mechanism caveat (e.g. mdcheck's node-global scope).
+ */
+export const PeriodicScrubState = z.object({
+  target: ScrubTarget,
+  enabled: z.boolean(),
+  cadence: z.literal('monthly'),
+  mechanism: ScrubMechanism,
+  note: z.string().optional(),
+})
+export type PeriodicScrubState = z.infer<typeof PeriodicScrubState>
+
+/** Toggle a pool's periodic scrub on/off. */
+export const ScrubToggleRequest = z.object({ enabled: z.boolean() })
+export type ScrubToggleRequest = z.infer<typeof ScrubToggleRequest>

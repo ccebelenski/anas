@@ -36,6 +36,7 @@ import { collectBackupWarnings } from '../services/backup-units.js'
 import { readConfig } from '../services/config-writer.js'
 import { collectMountWarnings } from '../services/mounts.js'
 import { buildReplicationWarnings, collectTaskStatuses } from '../services/replication-units.js'
+import { collectScheduleWarnings } from '../services/snapshot-schedule-units.js'
 import { collectDisks } from './disks.js'
 import { pathExists } from './shares-smb.js'
 
@@ -84,7 +85,7 @@ export async function dashboardRoutes(
   server.get('/status', async () => {
     // Each block is independently fail-open so one failing source (e.g. no ZFS)
     // never blanks the rest of the dashboard.
-    const [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, ahrWarnings, ahrPools] = await Promise.all([
+    const [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, ahrWarnings, ahrPools, scheduleWarnings] = await Promise.all([
       collectPoolStatus(),
       collectDiskHealth(),
       collectShareStatus(),
@@ -99,6 +100,9 @@ export async function dashboardRoutes(
       // section — healthy pools now render alongside ZFS pools; errors
       // fail-open to [] (the dashboard never degrades when AHR is unreadable).
       collectAhrPoolBriefs(executor, mdadmConfPath),
+      // Snapshot schedules (17.7): failed/overdue enabled schedules → 'schedule'
+      // warnings; healthy/idle and disabled contribute nothing, errors fail-open.
+      collectScheduleWarnings(executor, systemdDir),
     ])
 
     const summary: StatusSummary = {
@@ -112,7 +116,7 @@ export async function dashboardRoutes(
       // AHR pools get the SAME capacity cards ZFS pools do — parallel
       // construction, derived from the same briefs the Pools section renders
       // (11.13): identical ≥95/≥90 thresholds, same 'capacity' category.
-      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools)],
+      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...scheduleWarnings],
       ahrPools,
     }
     return { data: summary }

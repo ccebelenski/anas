@@ -31,6 +31,8 @@ import { mountsRoutes } from './routes/mounts.js'
 import { poolRoutes } from './routes/pools.js'
 import { replicationRemotesRoutes } from './routes/replication-remotes.js'
 import { replicationTaskRoutes } from './routes/replication-tasks.js'
+import { scheduleRoutes } from './routes/schedules.js'
+import { scrubRoutes } from './routes/scrub.js'
 import { shareIdentityRoutes } from './routes/share-identity.js'
 import { nfsExportRoutes } from './routes/shares-nfs.js'
 import { smbShareRoutes } from './routes/shares-smb.js'
@@ -471,6 +473,13 @@ export function createServer(opts?: ServerOptions) {
   // PBS file backup (Epic 16) — repositories registry (CAS + creds + test) and
   // the systemd units-as-store task CRUD + LOCAL-ONLY status + Run-Now.
   server.register(backupRoutes, { prefix: '/v1', executor, jobQueue, paths: backupReposPaths, systemdDir })
+  // Uniform snapshot schedules (Epic 17.3/17.4) — units-as-store CRUD + status +
+  // fire (take + prune). AHR targets mount @data on demand at subvolRuntimeDir.
+  const subvolRuntimeDir = process.env.ANAS_AHR_SUBVOL_RUNTIME_DIR
+    ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-subvol-${process.pid}`) : undefined)
+  server.register(scheduleRoutes, { prefix: '/v1', executor, jobQueue, systemdDir, subvolRuntimeDir })
+  // Periodic scrub (Epic 17.5) — uniform on/off surface; ZFS property + mdcheck.
+  server.register(scrubRoutes, { prefix: '/v1', executor, jobQueue })
   // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
   // inventory + PVE-tagged hands-off + guarded status probe.
   server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath })

@@ -230,13 +230,20 @@ export {
 
 // Schedule schemas (Epic 17 — uniform ANAS-owned snapshot schedules)
 export {
+  PeriodicScrubState,
   RetentionBucket,
   RetentionPlan,
   RetentionPolicy,
   ScheduledSnapshot,
   ScheduleId,
+  ScheduleRunResult,
+  ScrubMechanism,
+  ScrubTarget,
+  ScrubToggleRequest,
   SnapshotCadence,
   SnapshotSchedule,
+  SnapshotScheduleRunResult,
+  SnapshotScheduleStatus,
   SnapshotSource,
   SnapshotTarget,
 } from './schemas/schedules.js'

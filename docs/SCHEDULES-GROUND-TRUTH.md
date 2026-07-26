@@ -242,3 +242,89 @@ Consequences for 17.2:
 - The stunt node has no ZFS pool of its own; Epic 17 ZFS proofs need a
   throwaway loop zpool (as done here) or a real pool on pve5/pve10/pve14 (prod —
   observe only, never mutate).
+
+---
+
+# Stage 2 — Schedule store + systemd timers + scrub toggle (2026-07-26)
+
+> Captured live on the stunt node (`anas-pve`, 192.168.200.50) — systemd 257
+> (257.13-1~deb13u1), mdadm v4.4, kernel 7.0.14-6-pve. The daemon runs from
+> `/opt/anas/packages/daemon/dist/index.js`, so the schedule runner ships at
+> `/opt/anas/packages/daemon/dist/snapshot-task.js` (matches replicate-task /
+> backup-task). ZFS proof used a throwaway 300 MiB loop zpool `santest` (created,
+> exercised, destroyed). The AHR headline pool `tank` (md126/md127 raid5) was
+> READ ONLY throughout — never scrubbed or toggled.
+
+## Facts the code honors (stage-2, numbered continuing from GT-9)
+
+**SCHEDULES-GT-10 — cadence → OnCalendar, verified against `systemd-analyze
+calendar`.** Every retention bucket maps to a systemd calendar SHORTCUT except
+`frequently` (no shortcut → `*:0/15`). Normalized forms observed:
+`daily`→`*-*-* 00:00:00`, `hourly`→`*-*-* *:00:00`, `weekly`→`Mon *-*-* 00:00:00`,
+`monthly`→`*-*-01 00:00:00`, `yearly`→`*-01-01 00:00:00`, `*:0/15`→
+`*-*-* *:00/15:00`. The cadence that fires a snapshot is also the bucket it is
+named/retained in, so cadence and retention stay aligned by construction. The
+generated `.timer` (`OnCalendar=<cadence>`, `Persistent=true`,
+`WantedBy=timers.target`) passes `systemd-analyze verify` with ZERO warnings, as
+does the `.service` (`Type=oneshot`, `Environment=TZ=UTC`, ExecStart the runner).
+
+**SCHEDULES-GT-11 — the units-as-store pattern transfers verbatim from
+replication/backup.** `anas-snap-<id>.{service,timer}` with the canonical
+`SnapshotSchedule` JSON embedded as an `# X-ANAS-Schedule=` service comment (the
+ONLY thing parsed back). Create writes both files → `daemon-reload` →
+`enable --now` the timer; delete does `disable --now` → unlink both →
+`daemon-reload`. Live: create enabled the timer (`is-enabled` = `enabled`,
+`nextRunAt` = next 00:00 UTC); delete left NO files and `is-enabled` = not-found.
+Status is systemd-derived (a never-run oneshot reads `Result=success`,
+`ActiveState=inactive` → `lastRunResult:"success"` with `lastRunAt:null` until it
+first runs — same benign default as backup tasks).
+
+**SCHEDULES-GT-12 — the timer→runner→fire path works end to end.**
+`systemctl start anas-snap-<id>.service` ran `node dist/snapshot-task.js --id …`,
+which POSTed `/v1/schedules/:id/run` over the daemon socket; the daemon took the
+snapshot then pruned, and the runner printed the result JSON to journald:
+`{"schedule":"santest-daily","result":{"taken":"anas-daily-2026-07-26T194435Z",
+"pruned":[],"skippedHeld":[]}}`. A second fire 6 s later took a new
+`anas-daily-…194441Z` and PRUNED the older one (`retention daily=1` → exactly 1
+`anas-daily` snapshot survived). ExecStart exit 0; systemd's own last-result
+stayed truthful.
+
+**SCHEDULES-GT-13 — held-snapshot safety (17.6) confirmed on the new engine.**
+`zfs hold anasrepl <snap>` on the current `anas-daily`, then fired again with
+`daily=1`: the held snapshot SURVIVED (surfaced in `skippedHeld`, never handed to
+`zfs destroy`), a new snapshot was taken, and both remained — the hold intact
+afterward. Our engine excludes held snapshots up front and re-checks `userrefs`
+immediately before each destroy, so a replication base is never pruned (contrast
+sanoid GT-7, which tries-and-warns; we skip-and-surface).
+
+**SCHEDULES-GT-14 — ZFS periodic-scrub toggle is a clean property round-trip.**
+`PUT /v1/scrub/zfs/santest {enabled:false}` → `zfs get org.debian:periodic-scrub`
+= `disable`; `{enabled:true}` → `enable`. `GET /v1/scrub` reports each ZFS pool as
+`{mechanism:"zfs-property", cadence:"monthly", enabled}` (default-unset reads on).
+ANAS never touches the disabled `zfs-scrub-*@.timer`, so no double-schedule (GT-4).
+
+**SCHEDULES-GT-15 — AHR periodic scrub = mdadm's mdcheck timers, NODE-GLOBAL.**
+The stunt node ships `mdcheck_start.timer` (`OnCalendar=Sun *-*-1..7 1:00:00`,
+`RandomizedDelaySec=24h`, `Persistent=true`) + `mdcheck_continue.timer`, BOTH
+`enabled` by default (`WantedBy=mdmonitor.service`, `Also=mdcheck_continue.timer`).
+So a stock node with md arrays ALREADY runs a monthly md check (first Sunday) —
+the AHR analog of ZFS's monthly cron scrub. `GET /v1/scrub` surfaces the AHR pool
+as `{mechanism:"mdcheck-timer", cadence:"monthly", enabled}` with a `note` that the
+toggle is node-global (mdcheck verifies every array on the host — no per-pool
+granularity). The toggle enables/disables BOTH timers `--now`. Read-only here;
+`tank` left `enabled` and untouched.
+
+## Surprises / notes (stage 2)
+
+- **mdcheck is a THIRD timer mechanism**, distinct from ZFS's cron+property and
+  the disabled `zfs-scrub-*@.timer`. It is enabled-by-default (unlike the ZFS
+  systemd timers), so a fresh md host is already periodically checking — surface
+  it, don't add a second schedule.
+- **mdcheck has no per-pool knob.** It is the one place the uniform scrub surface
+  visibly diverges (parallel-construction: divergence only where tech differs,
+  made visible via the state's `note`). Per-pool AHR scrub cadence would need
+  ANAS-owned timers — deferred (not v1, per SCHEDULES-DESIGN §Scrub).
+- **Identity headers over the socket require a real UUID** for
+  `x-anas-request-id` (zod `.uuid()`), and a DELETE must not carry
+  `content-type: application/json` with an empty body (Fastify rejects empty JSON
+  bodies before the handler) — harness notes, not route bugs.
