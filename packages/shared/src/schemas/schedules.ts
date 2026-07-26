@@ -1,118 +1,165 @@
 import { z } from 'zod'
+import { DatasetPath, PoolName } from './common.js'
 
 // ============================================================================
-// sanoid.conf model (Epic 17 — Scheduled Snapshots & Scrubs)
+// Uniform snapshot schedules (Epic 17 — Schedules; docs/SCHEDULES-DESIGN.md).
 //
-// sanoid.conf is an INI file (SCHEDULES-GT-5): a `[version]` stanza, named
-// `[template_<name>]` stanzas, and per-dataset `[pool/dataset]` stanzas (the
-// dataset path has NO leading slash). Every setting is `key = value`; a value is
-// ALWAYS a raw string in the file — retention counts (`hourly = 48`), yes/no
-// flags (`autosnap = yes`), and monitoring ages that may carry a unit suffix
-// (`hourly_warn = 90m`). We keep the raw string for byte-fidelity and layer the
-// typed views (retention counts, booleans) on top, exactly as the round-trip
-// parsers do for fstab / smb.conf / exports.
+// The guiding principle: ZFS and AHR function EXACTLY THE SAME with respect to
+// snapshots, scrubbing, and pruning — one uniform user experience — even though
+// the underlying mechanisms differ. A schedule targets either a ZFS dataset or
+// an AHR pool; ANAS takes/prunes/lists snapshots through one policy and one set
+// of shapes, dispatching to the filesystem-appropriate backend behind them.
+//
+// Stage 1 (this file) is the uniform CORE: the schedule descriptor, the
+// retention policy + plan, and the inventory shape. The systemd timer/schedule
+// store, routes, scrub toggle, and UI are later stages. `cadence` here is a
+// PLACEHOLDER descriptor — the timer stage owns the systemd OnCalendar
+// translation; it is not modelled fully yet.
+//
+// Retention is LEARNED from sanoid (docs/SCHEDULES-GROUND-TRUTH.md): keep-N per
+// named period bucket, always keep the most recent, prune only our own
+// (naming-convention-scoped) snapshots, never a held one.
 // ============================================================================
 
 /**
- * A stanza's settings as written: raw `key → value` (string) pairs, last
- * definition winning. Values stay strings so nothing is lost or reformatted on
- * round-trip; typed interpretation is derived on demand.
+ * The six retention period buckets, learned from sanoid. Every ANAS-scheduled
+ * snapshot belongs to exactly one — recorded in its name (`anas-<bucket>-<utc>`)
+ * by the cadence that created it. Retention keeps the N newest per bucket.
  */
-export const SanoidSettings = z.record(z.string(), z.string())
-export type SanoidSettings = z.infer<typeof SanoidSettings>
-
-/** Recursion mode: `yes` (per-child) or `zfs` (atomic recursive). */
-export const SanoidRecursive = z.enum(['yes', 'zfs'])
-export type SanoidRecursive = z.infer<typeof SanoidRecursive>
-
-/** A named `[template_<name>]` stanza. `name` is the part after `template_`. */
-export const SanoidTemplate = z.object({
-  /** Template name (the `<name>` in `[template_<name>]`). */
-  name: z.string(),
-  /** Raw settings written in this template, in file order (last wins). */
-  settings: SanoidSettings,
-})
-export type SanoidTemplate = z.infer<typeof SanoidTemplate>
+export const RetentionBucket = z.enum([
+  'frequently',
+  'hourly',
+  'daily',
+  'weekly',
+  'monthly',
+  'yearly',
+])
+export type RetentionBucket = z.infer<typeof RetentionBucket>
 
 /**
- * A per-dataset `[pool/dataset]` stanza. The `dataset` is the ZFS path exactly
- * as written (no leading slash). `useTemplate` is the parsed comma list from
- * `use_template =` in listed order (order is significant — see the effective
- * policy). `settings` carries every inline key, including `use_template` and
- * `recursive` themselves, verbatim.
+ * A schedule's cadence — a PLACEHOLDER descriptor for stage 1. It names the
+ * bucket a fired snapshot is taken into; the timer stage will translate it to a
+ * concrete systemd `OnCalendar=` expression. Modelled as the bucket enum for
+ * now (a `daily` cadence takes `anas-daily-<utc>` snapshots).
  */
-export const SanoidDataset = z.object({
-  /** ZFS dataset path, no leading slash (e.g. `tank/media`). */
-  dataset: z.string(),
-  /** Templates named in `use_template =`, in listed (order-significant) order. */
-  useTemplate: z.array(z.string()),
-  /** Recursion mode if `recursive =` is set. */
-  recursive: SanoidRecursive.optional(),
-  /** Raw inline settings written in this stanza (last wins). */
-  settings: SanoidSettings,
-})
-export type SanoidDataset = z.infer<typeof SanoidDataset>
+export const SnapshotCadence = RetentionBucket
+export type SnapshotCadence = z.infer<typeof SnapshotCadence>
 
 /**
- * The interpreted view of a whole sanoid.conf: the `[version]` value plus the
- * template and dataset stanzas. The byte-for-byte document model lives in the
- * daemon parser; this is the typed read-model the API/screen consume.
+ * Keep-N per period bucket (learned from sanoid). Each value is the number of
+ * that bucket's snapshots to retain; an absent bucket is treated as `0` (keep
+ * none of that period — the newest overall is still always kept). `0` means
+ * "prune this period down to nothing" (sanoid's off/prune semantic, GT-7),
+ * subject to the always-keep-most-recent-overall guarantee.
  */
-export const SanoidConfig = z.object({
-  /** Value of `version =` in `[version]`, if present (e.g. `"2"`). */
-  version: z.string().optional(),
-  templates: z.array(SanoidTemplate),
-  datasets: z.array(SanoidDataset),
+export const RetentionPolicy = z.object({
+  frequently: z.number().int().nonnegative().optional(),
+  hourly: z.number().int().nonnegative().optional(),
+  daily: z.number().int().nonnegative().optional(),
+  weekly: z.number().int().nonnegative().optional(),
+  monthly: z.number().int().nonnegative().optional(),
+  yearly: z.number().int().nonnegative().optional(),
 })
-export type SanoidConfig = z.infer<typeof SanoidConfig>
+export type RetentionPolicy = z.infer<typeof RetentionPolicy>
 
 /**
- * The six snapshot cadences sanoid keeps counts for. `0` means "don't take, and
- * immediately prune this type" (SCHEDULES-GT-7). Resolved from the effective
- * settings chain.
+ * A snapshot schedule's target: either a ZFS dataset or an AHR pool. This is
+ * the discriminant the uniform take/prune/list services dispatch on — the ONE
+ * place the two filesystems diverge.
  */
-export const SanoidRetention = z.object({
-  frequently: z.number().int().nonnegative(),
-  hourly: z.number().int().nonnegative(),
-  daily: z.number().int().nonnegative(),
-  weekly: z.number().int().nonnegative(),
-  monthly: z.number().int().nonnegative(),
-  yearly: z.number().int().nonnegative(),
-})
-export type SanoidRetention = z.infer<typeof SanoidRetention>
+export const SnapshotTarget = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('zfs'),
+    /** Full ZFS dataset path (pool-qualified, e.g. `tank/media`). */
+    dataset: DatasetPath,
+  }),
+  z.object({
+    kind: z.literal('ahr'),
+    /** AHR pool name (the btrfs pool whose `@data` is snapshotted). */
+    pool: PoolName,
+  }),
+])
+export type SnapshotTarget = z.infer<typeof SnapshotTarget>
+
+/** Schedule identifier — a stable, filename-safe slug. */
+export const ScheduleId = z
+  .string()
+  .min(1)
+  .max(255)
+  .regex(/^[a-z0-9][\w.-]*$/i, 'Must start alphanumeric and contain only letters, digits, and . _ -')
+export type ScheduleId = z.infer<typeof ScheduleId>
 
 /**
- * A dataset's fully-resolved effective policy (SCHEDULES-GT-8): the values
- * sanoid would actually use, resolved through the chain
- * shipped-defaults → local `[template_default]` → `use_template` templates (in
- * listed order, later wins) → inline stanza overrides. `settings` is the full
- * merged raw map; `retention`/`autosnap`/`autoprune`/`recursive` are the typed
- * projections the policy-summary grid needs.
+ * A snapshot schedule: take a snapshot of `target` on `cadence`, keeping it per
+ * `retention`. The uniform record the Schedules screen edits — identical for a
+ * ZFS dataset and an AHR pool; only `target.kind` decides the backend.
  */
-export const SanoidEffectivePolicy = z.object({
-  /** Dataset this policy resolves for (no leading slash). */
-  dataset: z.string(),
-  /** The `use_template` chain that was applied, in order. */
-  templates: z.array(z.string()),
-  retention: SanoidRetention,
-  autosnap: z.boolean(),
-  autoprune: z.boolean(),
-  recursive: SanoidRecursive.optional(),
-  /** Every setting that resolves, merged (raw string values). */
-  settings: SanoidSettings,
+export const SnapshotSchedule = z.object({
+  /** Stable identifier (also the systemd unit instance name, later stage). */
+  id: ScheduleId,
+  /** Human label shown in the grid. */
+  name: z.string().min(1),
+  target: SnapshotTarget,
+  /** How often a snapshot is taken (placeholder descriptor — see SnapshotCadence). */
+  cadence: SnapshotCadence,
+  retention: RetentionPolicy,
+  /** ZFS: `zfs snapshot -r` (recurse into children). AHR: n/a (whole @data). */
+  recursive: z.boolean().optional(),
+  /** Whether the schedule is active (a disabled schedule keeps but never takes). */
+  enabled: z.boolean(),
 })
-export type SanoidEffectivePolicy = z.infer<typeof SanoidEffectivePolicy>
+export type SnapshotSchedule = z.infer<typeof SnapshotSchedule>
 
 /**
- * An unrecognized (non-whitelisted) setting found on READ. sanoid rejects
- * unknown keys FATALLY (SCHEDULES-GT-9), so the screen surfaces these as a
- * warning rather than silently dropping them — the parser preserves them
- * verbatim but never re-emits them on write.
+ * Where a snapshot came from. `anas` = created by an ANAS schedule (matches the
+ * `anas-<bucket>-<utc>` naming convention) — the ONLY snapshots retention is
+ * allowed to prune. `other` = a replication base, a manual ZFS snapshot, or an
+ * AHR-manual snapshot — surfaced in the inventory but NEVER pruned by us.
  */
-export const SanoidUnknownSetting = z.object({
-  /** Stanza header the key was found under (e.g. `backup/offsite`, `template_x`). */
-  stanza: z.string(),
-  /** The offending setting key. */
-  key: z.string(),
+export const SnapshotSource = z.enum(['anas', 'other'])
+export type SnapshotSource = z.infer<typeof SnapshotSource>
+
+/**
+ * One snapshot in the uniform inventory — the shape both backends produce. For
+ * an `anas` snapshot the `bucket` and the timestamp are decoded from the name;
+ * for an `other` snapshot `bucket` is null (it belongs to no ANAS period).
+ */
+export const ScheduledSnapshot = z.object({
+  /** Snapshot label (ZFS: the part after `@`; AHR: the `@snapshots/` child name). */
+  name: z.string().min(1),
+  target: SnapshotTarget,
+  /** ANAS retention period from the name, or null for `other` snapshots. */
+  bucket: RetentionBucket.nullable(),
+  /**
+   * Creation time. ZFS: from `creation` (a proper ISO-UTC instant). AHR: the
+   * btrfs `otime` (local, no timezone — as reported), or null when btrfs
+   * recorded none. Never fabricated.
+   */
+  createdAt: z.string().nullable(),
+  /**
+   * Whether the snapshot is protected from destroy. ZFS: `userrefs > 0` (a
+   * `zfs hold` — e.g. a replication base). AHR: always false (btrfs snapshots
+   * are not ZFS-held). A held snapshot is never pruned — it is surfaced as
+   * intentionally retained.
+   */
+  held: z.boolean().optional(),
+  source: SnapshotSource,
 })
-export type SanoidUnknownSetting = z.infer<typeof SanoidUnknownSetting>
+export type ScheduledSnapshot = z.infer<typeof ScheduledSnapshot>
+
+/**
+ * The outcome of applying a retention policy to an inventory:
+ * - `keep` — ANAS snapshots retained by the policy (incl. the always-kept newest).
+ * - `prune` — ANAS snapshots to destroy (never a held one; never an `other` one).
+ * - `skippedHeld` — held ANAS snapshots set aside, retained regardless of policy
+ *   and surfaced as intentionally kept (the holds-vs-prune trap, GT-7).
+ *
+ * `other`-source snapshots appear in NONE of these sets — they are outside ANAS
+ * retention entirely.
+ */
+export const RetentionPlan = z.object({
+  keep: z.array(ScheduledSnapshot),
+  prune: z.array(ScheduledSnapshot),
+  skippedHeld: z.array(ScheduledSnapshot),
+})
+export type RetentionPlan = z.infer<typeof RetentionPlan>

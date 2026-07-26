@@ -228,16 +228,17 @@ export {
   UpsertRemoteRequest,
 } from './schemas/replication.js'
 
-// Schedule schemas (Epic 17 — sanoid.conf snapshot policies)
+// Schedule schemas (Epic 17 — uniform ANAS-owned snapshot schedules)
 export {
-  SanoidConfig,
-  SanoidDataset,
-  SanoidEffectivePolicy,
-  SanoidRecursive,
-  SanoidRetention,
-  SanoidSettings,
-  SanoidTemplate,
-  SanoidUnknownSetting,
+  RetentionBucket,
+  RetentionPlan,
+  RetentionPolicy,
+  ScheduledSnapshot,
+  ScheduleId,
+  SnapshotCadence,
+  SnapshotSchedule,
+  SnapshotSource,
+  SnapshotTarget,
 } from './schemas/schedules.js'
 
 // Share schemas (SMB + NFS)
