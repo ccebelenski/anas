@@ -1,0 +1,72 @@
+# Representative sanoid.conf for the 17.2 round-trip parser test.
+# Structure and keys mirror the REAL shipped example + sanoid.defaults.conf
+# (both captured verbatim from the stunt node — see NOTES.md). This file is the
+# ONE authored fixture: it composes an ANAS-style deployment so the parser is
+# exercised against realistic templates, per-dataset stanzas, comment styles,
+# tab AND space indentation, inline overrides, and one deliberately-unknown key.
+#
+# GROUND TRUTH (SCHEDULES-GT-9): sanoid REJECTS unknown keys with a FATAL ERROR
+# (exit 255) — it whitelists every key against sanoid.defaults.conf. The
+# `anas_note` line below therefore must NEVER be written to a live config; it
+# exists only to prove the parser PRESERVES unknown directives on round-trip
+# (surgical fidelity), while ANAS validation rejects them before write.
+
+[version]
+version = 2
+
+##############################
+# per-dataset stanzas follow #
+##############################
+
+# a leaf dataset picking two templates (comma list, processed in order)
+[tank/media]
+	use_template = anas_frequent,anas_longterm
+	# inline override wins over the templates:
+	hourly = 12
+
+# recursive across all children, atomic form
+[tank/vmstore]
+	use_template = anas_frequent
+	recursive = zfs
+
+# recursive but leave THIS dataset alone, only manage children
+[rpool/data]
+	use_template = anas_longterm
+	recursive = yes
+	process_children_only = yes
+
+# a backup target — replicated in, so no local snapshots, prune only
+[backup/offsite]
+	use_template = anas_replica
+	anas_note = incremental-base-protected-by-zfs-hold   # UNKNOWN KEY — see header
+
+#############################
+# templates below this line #
+#############################
+
+[template_anas_frequent]
+	frequently = 0
+	hourly = 36
+	daily = 30
+	monthly = 3
+	yearly = 0
+	autosnap = yes
+	autoprune = yes
+
+[template_anas_longterm]
+	hourly = 0
+	daily = 90
+	weekly = 8
+	monthly = 12
+	yearly = 3
+	autosnap = yes
+	autoprune = yes
+
+[template_anas_replica]
+	### replicated in from source — do not snapshot locally, only prune
+	autosnap = no
+	autoprune = yes
+	hourly = 30
+	daily = 90
+	monthly = 12
+	yearly = 0

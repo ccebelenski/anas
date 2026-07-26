@@ -1,0 +1,14 @@
+[Unit]
+Description=Prune ZFS snapshots
+Documentation=man:sanoid(8)
+Requires=local-fs.target
+After=local-fs.target sanoid.service
+ConditionFileNotEmpty=/etc/sanoid/sanoid.conf
+
+[Service]
+Type=oneshot
+Environment=TZ=UTC
+ExecStart=/usr/sbin/sanoid --prune-snapshots --verbose
+
+[Install]
+WantedBy=sanoid.service
