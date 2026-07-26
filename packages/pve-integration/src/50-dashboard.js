@@ -481,7 +481,7 @@
         var map = {
             pool: 'fa-database', capacity: 'fa-database', disk: 'fa-hdd-o',
             scrub: 'fa-refresh', share: 'fa-share-alt', replication: 'fa-retweet',
-            ahr: 'fa-server'
+            ahr: 'fa-server', schedule: 'fa-clock-o'
         };
         var fa = map['' + (category || '')];
         if (!fa) { return ''; }
