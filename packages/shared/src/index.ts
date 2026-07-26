@@ -228,6 +228,18 @@ export {
   UpsertRemoteRequest,
 } from './schemas/replication.js'
 
+// Schedule schemas (Epic 17 — sanoid.conf snapshot policies)
+export {
+  SanoidConfig,
+  SanoidDataset,
+  SanoidEffectivePolicy,
+  SanoidRecursive,
+  SanoidRetention,
+  SanoidSettings,
+  SanoidTemplate,
+  SanoidUnknownSetting,
+} from './schemas/schedules.js'
+
 // Share schemas (SMB + NFS)
 export {
   CreateNfsExportRequest,
