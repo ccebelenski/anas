@@ -24,27 +24,35 @@ import { requireIdentity } from './identity.js'
  */
 
 const ZFS = '/usr/sbin/zfs'
-/** The remote-side zfs — UNQUALIFIED (rely on the remote login PATH; we don't
- *  own the remote and can't assume /usr/sbin). Used inside `ssh … zfs …`. */
+/**
+ * The remote-side zfs — UNQUALIFIED (rely on the remote login PATH; we don't
+ *  own the remote and can't assume /usr/sbin). Used inside `ssh … zfs …`.
+ */
 const ZFS_REMOTE = 'zfs'
 const HOLD_TAG = 'anas-repl'
 
-/** Dependencies handed in from datasetRoutes — its executor, queue, and the
- *  small dataset helper closures we reuse rather than duplicate. */
+/**
+ * Dependencies handed in from datasetRoutes — its executor, queue, and the
+ *  small dataset helper closures we reuse rather than duplicate.
+ */
 export interface ReplicationDeps {
   executor: CommandExecutor
   jobQueue: JobQueue
-  /** Resolve pool + wildcard tail → full dataset name (empty tail = pool root);
-   *  sends a 400 and returns null on an invalid path. */
+  /**
+   * Resolve pool + wildcard tail → full dataset name (empty tail = pool root);
+   *  sends a 400 and returns null on an invalid path.
+   */
   resolveDatasetName: (poolName: string, datasetPath: string, reply: FastifyReply) => string | null
   poolExists: (poolName: string) => Promise<boolean>
   datasetExists: (poolName: string, fullName: string) => Promise<boolean>
   /** A dataset's snapshots, newest-first (empty when it has none). */
   listSnapshotsDetail: (fullName: string) => Promise<Snapshot[]>
-  /** Story 3.25 boundary guard: is the pool PVE-managed (referenced by
+  /**
+   * Story 3.25 boundary guard: is the pool PVE-managed (referenced by
    *  /etc/pve/storage.cfg)? Replicating INTO PVE territory would create a
    *  dataset there, which ANAS never does. Fail-open: detection failure /
-   *  non-PVE host → false. */
+   *  non-PVE host → false.
+   */
   isPveManagedPool: (poolName: string) => Promise<boolean>
   /** Stage-3 remote/peer SSH transport (location resolution + remote zfs ops). */
   transport: Transport
@@ -73,7 +81,7 @@ export function parseSendDryRun(stdout: string): number {
   const first = lines.find(l => l.trim())
   if (first) {
     const parts = first.trim().split('\t')
-    const n = Number.parseInt(parts[parts.length - 1], 10)
+    const n = Number.parseInt(parts.at(-1) ?? '', 10)
     if (Number.isFinite(n))
       return n
   }
@@ -129,9 +137,11 @@ function discover(sourceSnaps: Snapshot[], targetSnaps: Snapshot[] | null, snaps
   return { mode: 'full', snapshot, targetExists: true, targetDiverged: true }
 }
 
+const ISO_PUNCT_RE = /[:.]/g
+
 /** Sortable, ZFS-legal default snapshot name for the snapshot-first convenience. */
 function defaultSnapName(): string {
-  return `snapshot-${new Date().toISOString().replace(/[:.]/g, '-')}`
+  return `snapshot-${new Date().toISOString().replace(ISO_PUNCT_RE, '-')}`
 }
 
 /** `zfs holds -H <snap>` → the set of tag names currently held (fail-open). */

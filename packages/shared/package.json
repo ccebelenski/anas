@@ -2,8 +2,8 @@
   "name": "@anas/shared",
   "type": "module",
   "version": "0.1.3",
-  "license": "AGPL-3.0-or-later",
   "private": true,
+  "license": "AGPL-3.0-or-later",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",

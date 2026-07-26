@@ -474,11 +474,21 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     certPath = join(tlsDir, 'cert.pem')
     const keyPath = join(tlsDir, 'key.pem')
     execFileSync('openssl', [
-      'req', '-x509', '-newkey', 'rsa:2048',
-      '-keyout', keyPath, '-out', certPath,
-      '-days', '1', '-nodes',
-      '-subj', '/CN=peer1',
-      '-addext', 'subjectAltName=DNS:peer1',
+      'req',
+      '-x509',
+      '-newkey',
+      'rsa:2048',
+      '-keyout',
+      keyPath,
+      '-out',
+      certPath,
+      '-days',
+      '1',
+      '-nodes',
+      '-subj',
+      '/CN=peer1',
+      '-addext',
+      'subjectAltName=DNS:peer1',
     ])
     cert = readFileSync(certPath)
     key = readFileSync(keyPath)

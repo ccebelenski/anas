@@ -33,6 +33,8 @@ export interface ArcStats {
  * so an older/newer kernel that omits one degrades gracefully rather than
  * throwing.
  */
+const WHITESPACE_RE = /\s+/
+
 export function parseArcstats(text: string): ArcStats {
   const values = new Map<string, number>()
   for (const rawLine of text.split('\n')) {
@@ -40,11 +42,11 @@ export function parseArcstats(text: string): ArcStats {
     if (!line)
       continue
     // `name  type  data` — split on whitespace; name is first, value is last.
-    const parts = line.split(/\s+/)
+    const parts = line.split(WHITESPACE_RE)
     if (parts.length < 3)
       continue
     const name = parts[0]
-    const value = Number(parts[parts.length - 1])
+    const value = Number(parts.at(-1))
     if (Number.isNaN(value))
       continue // skips the `name type data` header row (data === 'data')
     values.set(name, value)

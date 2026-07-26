@@ -29,6 +29,9 @@ const ANAS_PROXY_PREFIX = '/anas'
 /** Cross-node forward timeout — a hung peer must not hang the browser request. */
 const FORWARD_TIMEOUT_MS = 15000
 
+/** pveproxy's file-fallthrough 500 body prefix (a node without ANAS installed). */
+const NO_SUCH_FILE_RE = /^no such file\b/
+
 /**
  * Classify a cross-node upstream response so we can tell an actual ANAS reply
  * apart from pveproxy's own "no such path" answer — which is what a peer's
@@ -72,7 +75,7 @@ export function classifyUpstreamResponse(result: UpstreamResult): 'anas' | 'not-
   // fallthrough (the PVE 9 shape). Any OTHER 500 — the hook's own 'ANAS proxy
   // error', or a real gateway error — is a genuine (if degraded) response and
   // must pass through, never be masked as "not installed".
-  if (status === 500 && !/^no such file\b/.test(bodyText))
+  if (status === 500 && !NO_SUCH_FILE_RE.test(bodyText))
     return 'anas'
 
   return 'not-installed'

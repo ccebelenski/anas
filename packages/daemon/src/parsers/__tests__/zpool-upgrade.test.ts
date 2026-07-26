@@ -15,6 +15,7 @@ function loadFixture(name: string): string {
 describe('parseZpoolUpgrade', () => {
   it('lists the pools with disabled features', () => {
     const pools = parseZpoolUpgrade(loadFixture('zpool-upgrade-pools.txt'))
+    // eslint-disable-next-line e18e/prefer-array-to-sorted -- toSorted() is ES2023; this package targets ES2022 (no such lib member)
     assert.deepEqual([...pools].sort(), ['pond', 'tank'])
   })
 
@@ -49,6 +50,7 @@ describe('parseZpoolUpgrade', () => {
   it('handles CRLF line endings', () => {
     const crlf = loadFixture('zpool-upgrade-pools.txt').replace(/\n/g, '\r\n')
     const pools = parseZpoolUpgrade(crlf)
+    // eslint-disable-next-line e18e/prefer-array-to-sorted -- toSorted() is ES2023; this package targets ES2022 (no such lib member)
     assert.deepEqual([...pools].sort(), ['pond', 'tank'])
   })
 })

@@ -21,6 +21,8 @@ export interface NetCounters {
 /** The loopback device is never interesting for dashboard throughput. */
 const LOOPBACK = 'lo'
 
+const WHITESPACE_RE = /\s+/
+
 /** Parse /proc/net/dev into per-interface cumulative rx/tx byte counters. */
 export function parseProcNetDev(text: string): NetCounters[] {
   const out: NetCounters[] = []
@@ -32,7 +34,7 @@ export function parseProcNetDev(text: string): NetCounters[] {
     const name = line.slice(0, colon).trim()
     if (!name)
       continue
-    const fields = line.slice(colon + 1).trim().split(/\s+/).map(Number)
+    const fields = line.slice(colon + 1).trim().split(WHITESPACE_RE).map(Number)
     // Receive block is 8 columns: bytes is [0]; Transmit bytes follows at [8].
     if (fields.length < 9)
       continue

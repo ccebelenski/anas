@@ -1197,6 +1197,7 @@ export async function executeReadd(
   const arrays = await resolveAhrArrays(executor, pool.name)
   const candidates: { band: number, array: ResolvedArray, partPath: string, partKernel: string }[] = []
   const rejects: string[] = []
+  // eslint-disable-next-line e18e/prefer-array-to-sorted -- toSorted() is ES2023; this package targets ES2022 (no such lib member)
   for (const [band, array] of [...arrays.entries()].sort((a, b) => a[0] - b[0])) {
     const part = disk.parts.find(p => p.partlabel !== null && bandLabelRe(pool.name, band).test(p.partlabel))
     if (!part)
@@ -1217,8 +1218,8 @@ export async function executeReadd(
   }
   if (candidates.length === 0) {
     throw new Error(
-      `disk '${diskId}' has no re-addable slice for pool '${pool.name}'`
-      + (rejects.length ? ` — ${rejects.join('; ')}` : ' — no matching band partitions found'),
+      `disk '${diskId}' has no re-addable slice for pool '${pool.name}'${
+        rejects.length ? ` — ${rejects.join('; ')}` : ' — no matching band partitions found'}`,
     )
   }
 
@@ -1270,9 +1271,9 @@ export async function executeReadd(
     executor,
     'info',
     `AHR: disk re-added (${pool.name})`,
-    `Disk ${diskId} rejoined pool '${pool.name}': `
-    + results.map(r => `band ${r.band} (${r.mode === 'differential' ? 'differential catch-up' : 'full rebuild'})`).join(', ')
-    + '. Redundancy is restored.',
+    `Disk ${diskId} rejoined pool '${pool.name}': ${
+      results.map(r => `band ${r.band} (${r.mode === 'differential' ? 'differential catch-up' : 'full rebuild'})`).join(', ')
+    }. Redundancy is restored.`,
   )
   return { bands: results }
 }

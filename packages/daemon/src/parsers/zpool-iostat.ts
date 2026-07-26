@@ -61,6 +61,7 @@ const COL = {
 } as const
 
 const DASHES_RE = /^[\s-]+$/
+const WHITESPACE_RE = /\s+/
 
 /**
  * Parse the full multi-sample output into an array of samples, each an array of
@@ -93,7 +94,7 @@ export function parseZpoolIostat(text: string): IostatNode[][] {
 
     const indent = rawLine.length - rawLine.trimStart().length
     const depth = Math.floor(indent / 2)
-    const tokens = rawLine.trim().split(/\s+/)
+    const tokens = rawLine.trim().split(WHITESPACE_RE)
     const name = tokens[0]
     const values = tokens.slice(1)
 

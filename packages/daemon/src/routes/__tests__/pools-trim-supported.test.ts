@@ -7,15 +7,15 @@ import { parseDiscardCapableKernels, poolTrimSupported } from '../pools.js'
 // reduced to their whole disk.
 const LSBLK_MIXED = JSON.stringify({
   blockdevices: [
-    { name: 'sda', 'disc-gran': 512, children: [{ name: 'sda1', 'disc-gran': 512 }] },
-    { name: 'sdb', 'disc-gran': 0, children: [{ name: 'sdb1', 'disc-gran': 0 }] },
+    { 'name': 'sda', 'disc-gran': 512, 'children': [{ 'name': 'sda1', 'disc-gran': 512 }] },
+    { 'name': 'sdb', 'disc-gran': 0, 'children': [{ 'name': 'sdb1', 'disc-gran': 0 }] },
   ],
 })
 
 const LSBLK_ALL_ZERO = JSON.stringify({
   blockdevices: [
-    { name: 'sda', 'disc-gran': 0 },
-    { name: 'sdb', 'disc-gran': 0 },
+    { 'name': 'sda', 'disc-gran': 0 },
+    { 'name': 'sdb', 'disc-gran': 0 },
   ],
 })
 

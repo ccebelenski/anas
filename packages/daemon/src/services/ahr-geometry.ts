@@ -61,8 +61,10 @@ export const SGDISK_RAID_TYPE = 'FD00'
  * newly created arrays.
  */
 export const AHR_DATA_OFFSET = {
-  /** Member-partition size at which the large offset kicks in (mdadm's own
-   *  native-plateau knee — at/above it mdadm would itself reserve 129 MiB). */
+  /**
+   * Member-partition size at which the large offset kicks in (mdadm's own
+   *  native-plateau knee — at/above it mdadm would itself reserve 129 MiB).
+   */
   largeMemberThresholdBytes: 128 * 1024 ** 3,
   /** Offset for members ≥ the threshold (≥ native 129 MiB, generous round). */
   largeBytes: 256 * MIB,

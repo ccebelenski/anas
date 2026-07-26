@@ -52,6 +52,8 @@ const SYSTEMCTL = '/usr/bin/systemctl'
 const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 
+const WHITESPACE_RE = /\s+/
+
 /** Default base for pool mountpoints (§2.6: pool-scoped, never /mnt/pve). */
 export const DEFAULT_AHR_MOUNT_BASE = '/mnt/anas-ahr'
 
@@ -102,7 +104,7 @@ export async function clearGhostMdSignatures(
     if (real.exitCode === 0) {
       const kname = real.stdout.trim().split('/').pop()
       const holders = await executor.exec(LS, [`/sys/class/block/${kname}/holders`])
-      for (const holder of holders.stdout.split(/\s+/).filter(h => h.startsWith('md')))
+      for (const holder of holders.stdout.split(WHITESPACE_RE).filter(h => h.startsWith('md')))
         await executor.exec(MDADM, ['--stop', `/dev/${holder}`])
     }
     await executor.exec(WIPEFS, ['-a', partPath])
@@ -211,7 +213,7 @@ export async function createAhrPool(
   updateProgress('Clearing stale md signatures on new partitions')
   await clearGhostMdSignatures(
     executor,
-    planned.flatMap(disk => [...disk.partNumberByBand.values()].map(partNumber => ({ diskId: disk.id, partNumber }))),
+    planned.flatMap(disk => Array.from(disk.partNumberByBand.values(), partNumber => ({ diskId: disk.id, partNumber }))),
   )
 
   // --- One mdadm array per protected band ------------------------------------

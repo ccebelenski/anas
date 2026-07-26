@@ -167,6 +167,7 @@ export async function attachSpare(
   // `--remove detached` is md's own "absent" test — a faulty-but-PRESENT disk
   // is deliberately left alone (Re-add 11.9 / Replace territory). The shared
   // helper (ahr-expand-exec) is the single implementation, reused by Re-add.
+  // eslint-disable-next-line e18e/prefer-array-to-sorted -- toSorted() is ES2023; this package targets ES2022 (no such lib member)
   for (const [band, arr] of [...arrays.entries()].sort((a, b) => a[0] - b[0])) {
     if (await removeDetachedFaultySlots(executor, arr.dev, arr.md.members)) {
       updateProgress(`removed detached faulty slot(s) from ${pool.name}-r${band}`)
@@ -247,6 +248,7 @@ export async function removeSpare(
   }
 
   const partNumbers = new Map(tree.parts.filter(p => p.number !== null).map(p => [p.name, p.number!]))
+  // eslint-disable-next-line e18e/prefer-array-to-sorted -- toSorted() is ES2023; this package targets ES2022 (no such lib member)
   for (const [band, arr] of [...arrays.entries()].sort((a, b) => a[0] - b[0])) {
     const member = arr.md.members.find(m => partNumbers.has(m.device))
     if (!member)

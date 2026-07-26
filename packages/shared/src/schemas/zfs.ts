@@ -166,13 +166,17 @@ export const PoolSummary = z.object({
   dedupRatio: z.number().nonnegative(),
   /** Whether a scan (scrub/resilver) is currently running */
   scanRunning: z.boolean(),
-  /** Scan operation type — present ONLY while a scan runs. Lets the UI offer
-   *  "Stop Scrub" for a SCRUB but not a RESILVER (a resilver cannot be stopped). */
+  /**
+   * Scan operation type — present ONLY while a scan runs. Lets the UI offer
+   *  "Stop Scrub" for a SCRUB but not a RESILVER (a resilver cannot be stopped).
+   */
   scanFunction: ScanFunction.optional(),
   /** Any member device of the pool supports discard (TRIM). Gates the Trim action. */
   trimSupported: z.boolean().default(false),
-  /** The pool has supported-but-disabled features (a `zpool upgrade` would enable
-   *  them). Gates the Upgrade action. */
+  /**
+   * The pool has supported-but-disabled features (a `zpool upgrade` would enable
+   *  them). Gates the Upgrade action.
+   */
   upgradeAvailable: z.boolean().default(false),
   /** Health message, present only when pool is not ONLINE */
   health: PoolHealthMessage.optional(),
@@ -183,11 +187,15 @@ export const PoolSummary = z.object({
    * the Mount column (the UI then renders nothing). Mirrors AHR's `mountpoint`.
    */
   mountpoint: z.string().optional(),
-  /** Whether the pool root dataset is currently mounted. Mirrors AHR's `mounted`;
-   *  drives the "(not mounted)" presentation in the pool grid's Mount column. */
+  /**
+   * Whether the pool root dataset is currently mounted. Mirrors AHR's `mounted`;
+   *  drives the "(not mounted)" presentation in the pool grid's Mount column.
+   */
   mounted: z.boolean().optional(),
-  /** PVE storages referencing this pool (read-only, from /etc/pve/storage.cfg).
-   *  Empty ⇒ not PVE-managed. */
+  /**
+   * PVE storages referencing this pool (read-only, from /etc/pve/storage.cfg).
+   *  Empty ⇒ not PVE-managed.
+   */
   pveStorages: z.array(PveStorageRef).default([]),
 })
 export type PoolSummary = z.infer<typeof PoolSummary>
@@ -229,14 +237,18 @@ export const PoolDetail = z.object({
   scan: ScanStatus.nullable(),
   /** Pool properties */
   properties: PoolProperties,
-  /** The pool ROOT dataset's mountpoint (story 3.27) — a path, or the literal
+  /**
+   * The pool ROOT dataset's mountpoint (story 3.27) — a path, or the literal
    *  `legacy`/`none`/`-`. Read from `zfs get mountpoint <pool>`; absent on old
-   *  daemons. Prefilled into the Change mount prompt. Mirrors AHR's `mountpoint`. */
+   *  daemons. Prefilled into the Change mount prompt. Mirrors AHR's `mountpoint`.
+   */
   mountpoint: z.string().optional(),
   /** Whether the pool root dataset is currently mounted (mirrors AHR's `mounted`). */
   mounted: z.boolean().optional(),
-  /** PVE storages referencing this pool (read-only, from /etc/pve/storage.cfg).
-   *  Empty ⇒ not PVE-managed. */
+  /**
+   * PVE storages referencing this pool (read-only, from /etc/pve/storage.cfg).
+   *  Empty ⇒ not PVE-managed.
+   */
   pveStorages: z.array(PveStorageRef).default([]),
 })
 export type PoolDetail = z.infer<typeof PoolDetail>
@@ -280,12 +292,16 @@ export const CreatePoolRequest = z.object({
   dataVdevs: z.array(VdevSpec).min(1),
   /** Log (ZIL) vdevs */
   logVdevs: z.array(VdevSpec).optional(),
-  /** Special allocation-class vdevs (metadata / small blocks). Redundant vdevs,
+  /**
+   * Special allocation-class vdevs (metadata / small blocks). Redundant vdevs,
    *  not bare disks — their loss loses the WHOLE pool, so the daemon rejects a
-   *  non-redundant (stripe) special vdev at its boundary (story 3.22). */
+   *  non-redundant (stripe) special vdev at its boundary (story 3.22).
+   */
   specialVdevs: z.array(VdevSpec).optional(),
-  /** Dedup allocation-class vdevs (the dedup table). Redundant vdevs, not bare
-   *  disks — same pool-wide-loss risk as special vdevs (story 3.22). */
+  /**
+   * Dedup allocation-class vdevs (the dedup table). Redundant vdevs, not bare
+   *  disks — same pool-wide-loss risk as special vdevs (story 3.22).
+   */
   dedupVdevs: z.array(VdevSpec).optional(),
   /** Cache (L2ARC) disk IDs — always individual disks */
   cacheDisks: z.array(z.string()).optional(),
@@ -316,7 +332,8 @@ export type CreatePoolRequest = z.infer<typeof CreatePoolRequest>
  * mountpoint stays put. Same collision/reserved constraints as the create-time
  * override; `legacy`/`none` are refused (not absolute paths) — this is the
  * mounted-pool flow only. Mirrors AhrMountpointRequest. ANAS-managed pools only
- * (PVE-managed pools are hands-off per story 3.25 and the route 400s for them). */
+ * (PVE-managed pools are hands-off per story 3.25 and the route 400s for them).
+ */
 export const PoolMountpointRequest = z.object({
   mountpoint: AbsolutePath,
 })

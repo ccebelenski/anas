@@ -7,18 +7,20 @@ import { AhrCreateRequest, AhrMountpointRequest, PoolName } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
-import { readConfig } from '../services/config-writer.js'
 import { confirmGate } from '../safety/gate.js'
 import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
 import { AhrPlanError, fmtBytes, planFreshLayout } from '../services/ahr-layout.js'
 import { scrubAhrPool } from '../services/ahr-scrub.js'
 import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
+import { readConfig } from '../services/config-writer.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
 
 const FINDMNT = '/usr/bin/findmnt'
 const VGS = '/usr/sbin/vgs'
+
+const TRAILING_SLASHES_RE = /\/+$/
 
 export interface AhrMutationRouteOptions {
   executor: CommandExecutor
@@ -96,7 +98,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // is already mounted or claimed in fstab — the pool must not shadow or
     // fight anything that exists.
     if (req.mountpoint !== undefined) {
-      const mp = req.mountpoint.replace(/\/+$/, '') || '/'
+      const mp = req.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
       if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved — /mnt/pve belongs to PVE (§2.6) and / is not a pool mountpoint` } }
@@ -200,7 +202,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
     }
 
-    const mp = parsed.data.mountpoint.replace(/\/+$/, '') || '/'
+    const mp = parsed.data.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
     if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${parsed.data.mountpoint}' is reserved — /mnt/pve belongs to PVE (§2.6) and / is not a pool mountpoint` } }

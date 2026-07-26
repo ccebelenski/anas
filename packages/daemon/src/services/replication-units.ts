@@ -36,6 +36,9 @@ const TASK_MARKER = 'X-ANAS-Task='
 const TASK_MARKER_RE = /^#?\s*X-ANAS-Task=(.*)$/
 const WHITESPACE_RE = /\s/
 const DQUOTE_RE = /"/g
+const NA_RE = /^n\/a$/i
+const INFINITY_RE = /infinity/i
+const LEADING_WEEKDAY_RE = /^[A-Z][a-z]{2}\s+/
 
 /** Default systemd unit directory; overridable (env/dep) for tests. */
 export const DEFAULT_SYSTEMD_DIR = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
@@ -391,7 +394,7 @@ async function timerNextRun(executor: CommandExecutor, name: string): Promise<st
     if (r.exitCode !== 0 && !r.stdout.trim())
       return null
     const raw = parseShow(r.stdout).NextElapseUSecRealtime
-    if (!raw || raw === '0' || /^n\/a$/i.test(raw) || /infinity/i.test(raw))
+    if (!raw || raw === '0' || NA_RE.test(raw) || INFINITY_RE.test(raw))
       return null
     // Despite the property's name, `systemctl show` prints a HUMAN date string
     // ("Fri 2026-07-17 00:00:00 UTC"), not microseconds (verified live on
@@ -404,7 +407,7 @@ async function timerNextRun(executor: CommandExecutor, name: string): Promise<st
     }
     // Strip a leading weekday name ("Fri ") — Date.parse dislikes it combined
     // with the "UTC" suffix on some engines; the rest parses cleanly.
-    const cleaned = raw.replace(/^[A-Z][a-z]{2}\s+/, '')
+    const cleaned = raw.replace(LEADING_WEEKDAY_RE, '')
     const parsed = Date.parse(cleaned)
     return Number.isNaN(parsed) ? null : new Date(parsed).toISOString()
   }

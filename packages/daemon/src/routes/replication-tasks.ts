@@ -42,9 +42,11 @@ export interface ReplicationTaskRouteOptions {
   jobQueue: JobQueue
   /** systemd unit directory (the task store). Overridable for tests. */
   systemdDir: string
-  /** Stage-3 SSH transport — lets task STATUS read a non-local target's
+  /**
+   * Stage-3 SSH transport — lets task STATUS read a non-local target's
    *  snapshots so lag/last-replicated are real for remote tasks. Optional:
-   *  without it, remote-task lag honestly shows unknown. */
+   *  without it, remote-task lag honestly shows unknown.
+   */
   transport?: Transport
 }
 
@@ -61,17 +63,17 @@ export async function replicationTaskRoutes(
    */
   const remoteTargetNames: TargetNamesResolver | undefined = transport
     ? async (task, targetFull) => {
-        try {
-          const res = await transport.resolveLocation(task.target.location!)
-          if (!res.ok)
-            return null
-          const names = await transport.remoteSnapshotNames(res.resolved, targetFull)
-          return new Set(names)
-        }
-        catch {
+      try {
+        const res = await transport.resolveLocation(task.target.location!)
+        if (!res.ok)
           return null
-        }
+        const names = await transport.remoteSnapshotNames(res.resolved, targetFull)
+        return new Set(names)
       }
+      catch {
+        return null
+      }
+    }
     : undefined
 
   /**

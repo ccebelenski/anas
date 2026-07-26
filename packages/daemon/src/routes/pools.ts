@@ -31,6 +31,8 @@ const FINDMNT_ARGS = ['--json', '--real']
 
 const BY_ID_PREFIX = '/dev/disk/by-id/'
 const PART_BY_ID_RE = /-part\d+$/
+const TRAILING_CR_RE = /\r$/
+const TRAILING_SLASHES_RE = /\/+$/
 
 /** A destroyed pool's vdev leaf, resolved for disk hygiene (story 3.14). */
 interface PoolLeaf {
@@ -152,7 +154,7 @@ interface PoolMount {
 export function parsePoolMountpoints(text: string): Map<string, PoolMount> {
   const out = new Map<string, PoolMount>()
   for (const rawLine of text.split('\n')) {
-    const line = rawLine.replace(/\r$/, '')
+    const line = rawLine.replace(TRAILING_CR_RE, '')
     if (line.trim() === '')
       continue
     const parts = line.split('\t')
@@ -187,7 +189,7 @@ async function readExplicitChildMountpoints(
     return []
   const out: { name: string, value: string }[] = []
   for (const rawLine of res.stdout.split('\n')) {
-    const line = rawLine.replace(/\r$/, '')
+    const line = rawLine.replace(TRAILING_CR_RE, '')
     if (line.trim() === '')
       continue
     const parts = line.split('\t')
@@ -877,7 +879,7 @@ export async function poolRoutes(
       return { error: { code: 'VALIDATION_ERROR', message: `Pool '${poolName}' is managed by PVE (${pveStorages.map(s => s.storage).join(', ')}) — ANAS keeps its mountpoint hands-off (story 3.25)` } }
     }
 
-    const mp = bodyParsed.data.mountpoint.replace(/\/+$/, '') || '/'
+    const mp = bodyParsed.data.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
     if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${bodyParsed.data.mountpoint}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }
@@ -996,7 +998,7 @@ export async function poolRoutes(
     // owns the mount. (AbsolutePath already refused relative paths and
     // `legacy`/`none` at parse — this is the mounted-pool flow only.)
     if (req.mountpoint !== undefined) {
-      const mp = req.mountpoint.replace(/\/+$/, '') || '/'
+      const mp = req.mountpoint.replace(TRAILING_SLASHES_RE, '') || '/'
       if (mp === '/mnt/pve' || mp.startsWith('/mnt/pve/') || mp === '/') {
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: `mountpoint '${req.mountpoint}' is reserved — /mnt/pve belongs to PVE (story 3.25) and / is not a pool mountpoint` } }

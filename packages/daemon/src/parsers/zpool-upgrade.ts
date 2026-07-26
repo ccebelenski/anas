@@ -44,6 +44,8 @@ const POOL_NAME_RE = /^\S+$/
 const DASHES_RE = /^-+$/
 /** The "POOL  FEATURE" table header. */
 const HEADER_RE = /^POOL\s+FEATURE\b/
+const TRAILING_CR_RE = /\r$/
+const LEADING_WS_RE = /^\s/
 
 /**
  * Parse `zpool upgrade` (no args) into the set of pool names that have
@@ -62,7 +64,7 @@ export function parseZpoolUpgrade(stdout: string): Set<string> {
   // be rejected by POOL_NAME_RE anyway, but keying off the marker is explicit.
   let inSection = false
   for (const raw of lines) {
-    const line = raw.replace(/\r$/, '')
+    const line = raw.replace(TRAILING_CR_RE, '')
     if (!inSection) {
       if (NOT_ENABLED_MARKER.test(line))
         inSection = true
@@ -71,7 +73,7 @@ export function parseZpoolUpgrade(stdout: string): Set<string> {
     // Indented lines are feature names; skip. Blank lines, the table header
     // and the dashes separator are structural; skip. What remains at column 0
     // as a single bare token is a pool name.
-    if (line.length === 0 || /^\s/.test(line))
+    if (line.length === 0 || LEADING_WS_RE.test(line))
       continue
     if (HEADER_RE.test(line) || DASHES_RE.test(line))
       continue

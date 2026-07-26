@@ -198,8 +198,10 @@ describe('collectAhrWarnings (fail-open source for GET /v1/status)', () => {
 })
 
 describe('buildAhrPoolBriefs (story 11.13, AHR-DESIGN §10 revision)', () => {
-  /** Attach a hot-spare disk (§11 shape) to a base pool: a role:'spare' disk plus
-   *  a memberState:'spare' member row on every band array. */
+  /**
+   * Attach a hot-spare disk (§11 shape) to a base pool: a role:'spare' disk plus
+   *  a memberState:'spare' member row on every band array.
+   */
   function withSpare(base: AhrPool): AhrPool {
     const spare: AhrDisk = {
       id: HOT4,
