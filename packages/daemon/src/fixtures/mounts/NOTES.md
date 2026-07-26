@@ -343,8 +343,10 @@ Rebooted the VM once with an **unreachable-server `nofail` NFS entry**
 plus the existing nfs/cifs/automount entries.
 
 - **Boot completed.** `multi-user.target` reached (`active`); SSH + both ANAS
-  services (`anasd`, `anas`) came back on their own. External
-  `curl -k https://192.168.200.50:3000/api/health` returned JSON
+  services (`anasd`, `anas`) came back on their own. External health probe
+  returned JSON (historical capture, pre-`:8006`-transport — the reachable
+  origin was then the standalone `:3000` gateway; it is now served same-origin
+  through PVE at `https://192.168.200.50:8006/anas/v1/...`)
   (`{"error":{"code":"UNAUTHORIZED",...}}` = gateway up, PVE auth required). So
   **`nofail` did its core job: an absent server did not block boot.**
 - Healthy mounts recovered automatically: `/mnt/anas-nfs`, `/mnt/pve/anastest-nfs`
