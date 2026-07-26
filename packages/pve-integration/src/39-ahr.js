@@ -1077,7 +1077,7 @@
         var sel = grid.getSelection();
         var has = sel && sel.length > 0;
         var state = has ? sel[0].get('state') : '';
-        var ids = ['details', 'replace', 'scrub', 'destroy', 'addSpare'];
+        var ids = ['details', 'replace', 'destroy', 'addSpare'];
         for (var i = 0; i < ids.length; i++) {
             var btn = grid.down('#' + ids[i]);
             if (btn) {
@@ -1088,12 +1088,18 @@
         // one is halted, a fresh Expand/Replace would 409 anyway, so swap them.
         var exp = has && sel[0].get('expansion');
         var halted = !!(exp && exp.state === 'halted');
-        // Expand ONLY on a healthy, idle pool: a degraded/rebuilding/expanding/
-        // read-only pool (or one mid-expansion or halted) would 409 at the API —
-        // don't offer a dead button. Resume/Abandon cover the halted case.
+        // Expand AND Scrub ONLY on a healthy, idle pool: a degraded/rebuilding/
+        // expanding/read-only pool (or one mid- or halted-expansion) would 409 at
+        // the API (md won't scrub during recovery) — don't offer a dead button.
+        // Resume/Abandon cover the halted case.
+        var healthyIdle = has && state === 'healthy' && !halted;
         var expandBtn = grid.down('#expand');
         if (expandBtn) {
-            expandBtn.setDisabled(!(has && state === 'healthy' && !halted));
+            expandBtn.setDisabled(!healthyIdle);
+        }
+        var scrubBtn = grid.down('#scrub');
+        if (scrubBtn) {
+            scrubBtn.setDisabled(!healthyIdle);
         }
         var resumeBtn = grid.down('#resumeExpand');
         var abandonBtn = grid.down('#abandonExpand');

@@ -666,9 +666,13 @@
                 btnSetText(scrubBtn, 'Start Scrub');
                 btnSetTip(scrubBtn, '');
             } else {
-                scrubBtn.setDisabled(!has);
+                // Start Scrub only on a healthy (ONLINE) pool — parallel with the
+                // AHR Expand/Scrub gate: scrubbing a degraded/faulted pool piles
+                // load on already-vulnerable data; fix the fault first.
+                var online = has && rec.get('state') === 'ONLINE';
+                scrubBtn.setDisabled(!online);
                 btnSetText(scrubBtn, 'Start Scrub');
-                btnSetTip(scrubBtn, '');
+                btnSetTip(scrubBtn, online ? '' : ANAS.t('Resolve the pool health before scrubbing (pool is not ONLINE)'));
             }
         }
         // Trim is capability-gated (story 4.12): disabled unless a member device
