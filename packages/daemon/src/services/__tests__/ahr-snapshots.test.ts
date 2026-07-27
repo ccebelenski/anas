@@ -4,7 +4,6 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { setImmediate as tick } from 'node:timers/promises'
 import { AhrSnapshotName } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import {
@@ -329,10 +328,19 @@ describe('withTopLevelMount teardown safety (data-loss guard)', () => {
     const gate1 = new Promise<void>((r) => {
       release1 = r
     })
+    // Resolves the instant fn1 enters its critical section — a race-free signal,
+    // not a timing budget. fn1's real mkdir + mount (libuv I/O) complete before
+    // this fires, so awaiting it is deterministic under any load (the old
+    // fixed-tick poll could expire before the real mkdir landed → flaky []).
+    let signalStarted1: () => void = () => {}
+    const started1 = new Promise<void>((r) => {
+      signalStarted1 = r
+    })
     const order: string[] = []
 
     const p1 = withTopLevelMount(ex, pool, async () => {
       order.push('fn1-start')
+      signalStarted1()
       await gate1
       order.push('fn1-end')
       return 1
@@ -342,13 +350,11 @@ describe('withTopLevelMount teardown safety (data-loss guard)', () => {
       return 2
     }, { runtimeDir })
 
-    // Wait until fn1 has actually started (real mkdir + mount precede it)...
-    for (let i = 0; i < 200 && order.length === 0; i++)
-      await tick()
-    // ...then give an UNSERIALIZED fn2 ample time to also start + mount (it must
-    // NOT: its whole task, mkdir + mount included, is gated behind fn1).
-    for (let i = 0; i < 100; i++)
-      await tick()
+    // Block until fn1 is provably in its critical section (parked on gate1). At
+    // this point fn2's task is still chained behind fn1's unsettled promise
+    // (serializeOnPath's .then() queue), so it cannot have started or mounted —
+    // no drain/poll needed; the serialization is structural.
+    await started1
     assert.deepEqual(order, ['fn1-start'], 'the second op does not start until the first finishes')
     assert.equal(ex.calls.filter(c => c.command === MOUNT).length, 1, 'only one mount is live at a time')
 
