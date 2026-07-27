@@ -242,6 +242,7 @@ export {
   ScrubToggleRequest,
   SnapshotCadence,
   SnapshotSchedule,
+  SnapshotScheduleDetail,
   SnapshotScheduleRunResult,
   SnapshotScheduleStatus,
   SnapshotSource,

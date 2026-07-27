@@ -198,6 +198,31 @@ export const SnapshotScheduleStatus = z.object({
 export type SnapshotScheduleStatus = z.infer<typeof SnapshotScheduleStatus>
 
 /**
+ * One schedule's DETAIL — the status fields plus the last run's exit code, the
+ * unit files as written, and a recent journald blob. Mirrors the backup task
+ * detail ({@link BackupTaskDetail}): last-run logs + exit status are surfaced the
+ * SAME way for a snapshot schedule as for a backup task (parallel construction).
+ * The exit code is systemd's `ExecMainStatus`; `journal` is a bounded, recent-only
+ * `journalctl -u anas-snap-<id>.service` tail (older history is not retained).
+ */
+export const SnapshotScheduleDetail = z.object({
+  schedule: SnapshotSchedule,
+  lastRunResult: ScheduleRunResult,
+  lastRunAt: z.string().nullable(),
+  nextRunAt: z.string().nullable(),
+  overdue: z.boolean(),
+  /** The last run's exit code (systemd `ExecMainStatus`); null when never run. */
+  lastRunExitCode: z.number().int().nullable(),
+  /** The `.service` unit file, verbatim (config-is-the-API transparency). */
+  unit: z.string(),
+  /** The `.timer` unit file, verbatim. */
+  timer: z.string(),
+  /** Recent runs' raw journald output (may be empty; older history not retained). */
+  journal: z.string().optional(),
+})
+export type SnapshotScheduleDetail = z.infer<typeof SnapshotScheduleDetail>
+
+/**
  * The result of firing a schedule once (take + prune) — the fire endpoint's job
  * result and what the timer's runner prints to journald. `pruned`/`skippedHeld`
  * are snapshot labels; `skippedHeld` are the held snapshots retained despite

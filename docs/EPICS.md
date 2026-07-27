@@ -699,6 +699,35 @@ and schedules* the client invocation and surfaces status.
 > lifecycle live-proven on the stunt node via the real API (create→edit→run→take
 > real ZFS snapshot→toggle→delete; ZFS per-pool scrub toggle round-trip).
 
+> **Stage 4 landed 2026-07-27 (operator refinement, UI).** After reviewing the
+> Stage-3 screen the operator asked for two things: (1) **split** the single
+> Schedules screen into two menu entries, and (2) surface the **last-run logs +
+> exit status** of a snapshot schedule. Done:
+> - `69-schedules.js` split into `69-snapshots.js` (**Snapshots** menu — the
+>   snapshot-schedule grid + Create/Edit/Enable-Disable/Delete/Run-Now/**View log**
+>   + the create/edit dialog) and `69-scrubs.js` (**Scrubs** menu — the periodic-
+>   scrub grid + toggle + node-global mdcheck caveat). ORDER now `…replication,
+>   snapshots, scrubs, backup…`; the dead `schedules` view removed. The bits both
+>   views share (fs-tag chip, state pills, the visibility-gated poll loop) live
+>   ONCE in `69-schedules-common.js` (`ANAS.sched.*`) — no diverging second copy.
+> - **Last-run log + exit status** MIRRORS the backup task detail (parallel
+>   construction): `GET /v1/schedules/:id` now returns a **detail** —
+>   `lastRunExitCode` (systemd `ExecMainStatus`), the `.service`/`.timer` verbatim,
+>   and a bounded recent **`journal`** blob (`journalctl -u anas-snap-<id>.service
+>   -n 200 -o short-iso --no-pager`, same args/handling as backup's
+>   `readRecentJournal`). Shared schema `SnapshotScheduleDetail` mirrors
+>   `BackupTaskDetail`. A **View log** toolbar button opens an on-demand detail
+>   window (fetch-on-open + Reload, no polling) rendering the exit status
+>   (success/failure + the numeric exit code, labeled) and the journald `<pre>`
+>   with the same "older history is not retained" caveat as the backup detail.
+> - Live-proven on the stunt node via the real API on a throwaway file-backed ZFS
+>   pool: create→fire the service (timer's own path)→detail shows `journal` +
+>   `lastRunExitCode:0`/`success`; forced failure (target destroyed) →
+>   `lastRunExitCode:1`/`failure` with the failure in `journal`; Run-Now took a
+>   real snapshot; ZFS scrub toggle round-trip; delete→units gone. Daemon suite
+>   1206 (+1), gateway 34; typecheck + lint clean; every changed pve-integration
+>   file `node --check`-clean.
+
 ##### Observe
 17.3. **[done 2026-07-26, stage 3 — screen shipped]** As a user, I want the **Schedules** screen: one grid over both snapshot schedules and scrub schedules — target (dataset/pool, recursive flag), policy summary (e.g. "24h / 30d / 12m" or "monthly scrub"), enabled state, last run/result, next run, and overdue highlighted — including schedules created outside ANAS, so I have the complete picture. *(Authoritative state from the config file + systemd timer state + ZFS reality (`zfs list -t snapshot` counts, `zpool status` scrub dates); journald is run-detail forensics only, per the replication precedent.)* — **Backend:** `GET /v1/schedules` returns the uniform derived-status rows (systemd next/last/result/overdue); `GET /v1/scrub` the uniform periodic-scrub state across ZFS + AHR pools.
 

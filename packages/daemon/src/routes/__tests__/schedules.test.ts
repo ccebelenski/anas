@@ -12,6 +12,7 @@ import { parseServiceUnit } from '../../services/snapshot-schedule-units.js'
 const ZPOOL = '/usr/sbin/zpool'
 const ZFS = '/usr/sbin/zfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
+const JOURNALCTL = '/usr/bin/journalctl'
 
 const IDENTITY = {
   'x-anas-user': 'root@pam',
@@ -69,6 +70,8 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     // command-only success. zfs list -t snapshot returns empty → prune no-ops.
     mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    // journalctl backs the schedule DETAIL (last-run log) — command-only default.
+    mock.addFixture({ command: JOURNALCTL, result: { stdout: 'recent snap output', stderr: '', exitCode: 0 } })
   })
 
   afterEach(async () => {
@@ -132,10 +135,43 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
 
     const one = await server.inject({ method: 'GET', url: '/v1/schedules/nightly-media' })
     assert.equal(one.statusCode, 200)
-    assert.equal(one.json().data.name, 'Nightly media')
+    // GET :id is now the DETAIL shape (schedule nested, mirrors backup detail).
+    assert.equal(one.json().data.schedule.name, 'Nightly media')
 
     const missing = await server.inject({ method: 'GET', url: '/v1/schedules/nope' })
     assert.equal(missing.statusCode, 404)
+  })
+
+  it('GET :id detail surfaces the unit/timer text + recent journald + exit code', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    // Assert the EXACT journalctl args (mirrors backup.test.ts) so the last-run
+    // log query stays parallel: -u anas-snap-<id>.service -n 200 -o short-iso.
+    mockOf(server).addFixture({
+      command: JOURNALCTL,
+      args: ['-u', 'anas-snap-nightly-media.service', '-n', '200', '-o', 'short-iso', '--no-pager'],
+      result: { stdout: 'snap run log line 1\nsnap run log line 2', stderr: '', exitCode: 0 },
+    })
+
+    const res = await server.inject({ method: 'GET', url: '/v1/schedules/nightly-media' })
+    assert.equal(res.statusCode, 200)
+    const d = res.json().data as {
+      schedule: { id: string }
+      lastRunResult: string
+      lastRunExitCode: number | null
+      unit: string
+      timer: string
+      journal?: string
+    }
+    assert.equal(d.schedule.id, 'nightly-media')
+    // The units, verbatim: the service carries the embedded schedule JSON; the
+    // timer carries the cadence→OnCalendar translation.
+    assert.match(d.unit, /X-ANAS-Schedule=/)
+    assert.match(d.timer, /OnCalendar=daily/)
+    // The recent journald blob flows straight through from journalctl.
+    assert.equal(d.journal, 'snap run log line 1\nsnap run log line 2')
+    // Never run in this test (empty `systemctl show`) → exit code is null, not 0.
+    assert.equal(d.lastRunResult, 'unknown')
+    assert.equal(d.lastRunExitCode, null)
   })
 
   it('PUT toggles enabled (rewrites units); id mismatch → 400; unknown → 404', async () => {

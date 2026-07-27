@@ -1,47 +1,56 @@
 /*
- * ANAS — Schedules view (Epic 17: stories 17.3 / 17.4 / 17.5 / 17.7).
+ * ANAS — Snapshots view (Epic 17: stories 17.3 / 17.4 / 17.7).
  *
- * The UNIFORM snapshot-schedule + periodic-scrub surface. The guiding principle
- * (SCHEDULES-DESIGN.md): ZFS and AHR function EXACTLY THE SAME for snapshots,
- * scrubbing and pruning — one screen, one set of controls — even though the
- * backends differ. A schedule targets a ZFS dataset OR an AHR pool; the grid and
- * the create/edit dialog treat them identically. Only the target picker and the
- * scrub backend diverge, and where they must (mdcheck is NODE-GLOBAL) that
- * divergence is made VISIBLE, never hidden.
+ * The UNIFORM snapshot-SCHEDULE surface. Split from the former single "Schedules"
+ * screen: this owns snapshot schedules; the sibling Scrubs view (69-scrubs.js)
+ * owns periodic scrubs. Menu label "Snapshots". The guiding principle
+ * (SCHEDULES-DESIGN.md): ZFS and AHR function EXACTLY THE SAME for snapshots —
+ * one screen, one set of controls — even though the backends differ. A schedule
+ * targets a ZFS dataset OR an AHR pool; the grid and the create/edit dialog treat
+ * them identically. Only the target picker diverges.
  *
- * A dedicated top-level "Schedules" menu item (sibling of Replication / Backup).
+ * A dedicated top-level menu item (sibling of Replication / Scrubs / Backup).
  * Snapshot scheduling is an ongoing, unattended process with its own policy and
  * history — not a point-in-time dataset action — so it lives in its own view,
  * NOT bleeding into the Datasets / AHR menus (those own the snapshot INVENTORY;
- * Schedules owns the scheduled POLICY).
+ * this owns the scheduled POLICY).
  *
- * Data (paths relative to /v1 — see routes/schedules.ts + routes/scrub.ts):
+ * Data (paths relative to /v1 — see routes/schedules.ts):
  *   GET    /schedules            → { data: [ { schedule, lastRunResult, lastRunAt,
  *                                     nextRunAt, overdue } ] }
  *     schedule = { id, name, target:{kind:'zfs',dataset}|{kind:'ahr',pool},
  *                  cadence, retention:{frequently?..yearly?}, recursive?, enabled }
  *   POST   /schedules            → SnapshotSchedule body (create, 202 job)
+ *   GET    /schedules/:id        → { data: DETAIL } — the status fields PLUS the
+ *                                  last run's exit code, the unit files verbatim,
+ *                                  and a recent journald blob (last-run log). This
+ *                                  MIRRORS the backup task detail (GET
+ *                                  /backup/tasks/:name) — same last-run log + exit
+ *                                  status surface (parallel construction).
+ *     detail = { schedule, lastRunResult, lastRunAt, nextRunAt, overdue,
+ *                lastRunExitCode, unit, timer, journal? }
  *   PUT    /schedules/:id        → SnapshotSchedule body (edit / toggle, 202 job)
  *   DELETE /schedules/:id        → removes the units only (never the snapshots)
  *   POST   /schedules/:id/run    → fire now: take + prune (202 job; result carries
  *                                  { taken, pruned[], skippedHeld[] })
- *   GET    /scrub                → { data: [ { target:{kind,pool}, enabled,
- *                                     cadence:'monthly', mechanism, note? } ] }
- *   PUT    /scrub/zfs/:pool  {enabled}  → flip the ZFS periodic-scrub property
- *   PUT    /scrub/ahr/:pool  {enabled}  → flip the node's mdcheck timers (node-global)
  *
  * Target pickers reuse GET /pools (ANAS-managed ZFS pools + their datasets) and
  * GET /ahr (AHR pools; only subvolLayout:true pools can be snapshotted).
+ *
+ * Shared with the Scrubs view via ANAS.sched.* (69-schedules-common.js): the
+ * fs-tag chip, the state pills, and the visibility-gated poll loop — kept in ONE
+ * place so the two views read identically and never drift.
  *
  * Client-side validation MIRRORS the shared Zod schemas (ScheduleId regex,
  * non-negative keep-N, cadence enum) — the daemon re-validates with the real
  * @anas/shared schemas (defense in depth; Principle 6 + 14).
  *
- * Test hooks: view cls 'anas-view anas-view-schedules', grid cls
+ * Test hooks: view cls 'anas-view anas-view-snapshots', grid cls
  * 'anas-grid-schedules', toolbar buttons 'anas-btn-sched-new' /
- * 'anas-btn-sched-run' / 'anas-btn-sched-edit' / 'anas-btn-sched-toggle' /
- * 'anas-btn-sched-delete', dialog window 'anas-win-sched', scrub grid
- * 'anas-grid-scrub', scrub toggle 'anas-btn-scrub-toggle'.
+ * 'anas-btn-sched-run' / 'anas-btn-sched-log' / 'anas-btn-sched-edit' /
+ * 'anas-btn-sched-toggle' / 'anas-btn-sched-delete', dialog window
+ * 'anas-win-sched', detail/log window 'anas-win-sched-detail' (body
+ * 'anas-sched-detail', reload 'anas-btn-sched-detail-reload').
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  * Fail-open everywhere: a broken view renders an error panel, never breaks PVE.
@@ -55,8 +64,9 @@
 
     var ANAS = window.ANAS;
 
-    // Reload cadence while the view is visible — matches the replication view.
-    var POLL_MS = 10000;
+    // Shared schedules helpers (fs-tag chip, pills, poll loop) — ONE copy in
+    // 69-schedules-common.js, used by both this view and the Scrubs view.
+    var sched = ANAS.sched || {};
 
     // ScheduleId shape from packages/shared (schedules.ts): start alphanumeric,
     // then letters/digits/underscore/dot/hyphen; ≤255. The daemon is authoritative.
@@ -181,22 +191,18 @@
 
     // ---- Renderers ---------------------------------------------------------
 
+    // Presentational helpers live once in ANAS.sched (shared with the Scrubs
+    // view); thin local delegates keep the call sites here unchanged.
     function pillHtml(label, color, title) {
-        return '<span' + (title ? ' title="' + enc(title) + '"' : '')
-            + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
-            + 'color:#fff;background:' + color + ';">' + enc(label) + '</span>';
+        return sched.pillHtml(label, color, title);
     }
 
-    // Soft (tinted) pill — for muted / neutral states (disabled, dash).
     function softPill(label, color, title) {
-        return '<span' + (title ? ' title="' + enc(title) + '"' : '')
-            + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
-            + 'color:' + color + ';background:color-mix(in srgb,' + color + ' 15%,transparent);">'
-            + enc(label) + '</span>';
+        return sched.softPill(label, color, title);
     }
 
     function muted(html) {
-        return '<span style="color:var(--anas-muted,gray);">' + html + '</span>';
+        return sched.muted(html);
     }
 
     // Target: a filesystem-tag chip ("zfs"/"ahr") + the full path. The two
@@ -204,12 +210,7 @@
     function renderTarget(v, meta, rec) {
         var kind = rec.get('targetKind');
         var path = rec.get('targetPath');
-        var tag = '<span class="anas-sched-fs-tag" title="' + enc(kind === 'ahr' ? t('AHR pool') : t('ZFS dataset')) + '"'
-            + ' style="display:inline-block;padding:0 6px;margin-right:6px;border-radius:8px;'
-            + 'font-size:0.78em;text-transform:uppercase;letter-spacing:0.04em;'
-            + 'color:var(--anas-accent,#3468c0);'
-            + 'background:color-mix(in srgb,var(--anas-accent,#3468c0) 14%,transparent);">'
-            + enc(kind || 'zfs') + '</span>';
+        var tag = sched.fsTag(kind, kind === 'ahr' ? t('AHR pool') : t('ZFS dataset'));
         var rec2 = rec.get('recursive')
             ? ' <span title="' + enc(t('recursive (-r): includes child datasets')) + '"'
                 + ' style="color:var(--anas-muted,gray);font-size:0.85em;">(-r)</span>'
@@ -387,6 +388,7 @@
         var rec = selectedSchedule(grid);
         var has = !!rec;
         setDisabled(grid, 'schedRun', !has);
+        setDisabled(grid, 'schedLog', !has);
         setDisabled(grid, 'schedEdit', !has);
         setDisabled(grid, 'schedToggle', !has);
         setDisabled(grid, 'schedDelete', !has);
@@ -1105,289 +1107,190 @@
     }
 
     // ======================================================================
-    //  Periodic scrub panel — uniform surface, filesystem-native backend
-    //  (17.5). One "periodic scrub: on/off (monthly)" control for ZFS and AHR.
-    //  VISIBLE DIVERGENCE: AHR mdcheck is NODE-GLOBAL — surfaced per-row (Scope)
-    //  and confirmed on toggle.
+    //  Detail / last-run log — GET /schedules/:id. Mirrors the backup Details
+    //  window (68-backup.js): an on-demand snapshot (fetch on open + a Reload
+    //  button, no polling) that surfaces the last run's EXIT STATUS and the
+    //  recent journald blob the SAME way a backup task's detail does. This is
+    //  where the operator sees "what happened on the last run" for a schedule.
     // ======================================================================
 
-    function scrubRow(state) {
-        state = state || {};
-        var target = state.target || {};
-        return {
-            pool: target.pool,
-            kind: target.kind || 'zfs',
-            enabled: !!state.enabled,
-            cadence: state.cadence || 'monthly',
-            mechanism: state.mechanism || '',
-            note: state.note || '',
-            // A stable per-row key (kind+pool) so selection survives a poll.
-            rowKey: (target.kind || 'zfs') + ':' + (target.pool || '')
-        };
+    function kv(label, value) {
+        return '<tr><td style="padding:2px 14px 2px 0;color:var(--anas-muted,gray);'
+            + 'white-space:nowrap;vertical-align:top;">' + enc(label)
+            + '</td><td style="padding:2px 0;">' + value + '</td></tr>';
     }
 
-    function renderScrubPool(v, meta, rec) {
-        var tag = '<span style="display:inline-block;padding:0 6px;margin-right:6px;border-radius:8px;'
-            + 'font-size:0.78em;text-transform:uppercase;letter-spacing:0.04em;'
-            + 'color:var(--anas-accent,#3468c0);'
-            + 'background:color-mix(in srgb,var(--anas-accent,#3468c0) 14%,transparent);">'
-            + enc(rec.get('kind') || 'zfs') + '</span>';
-        return tag + '<span style="font-family:monospace;font-size:0.92em;">' + enc(rec.get('pool')) + '</span>';
+    function mono(s) {
+        return '<span style="font-family:monospace;font-size:0.92em;word-break:break-all;">'
+            + enc(s) + '</span>';
     }
 
-    function renderScrubEnabled(v, meta, rec) {
-        if (rec.get('enabled')) {
-            return pillHtml(t('On'), 'var(--anas-ok,#1f9c56)', t('periodic scrub is enabled'));
+    function unitBlock(title, text) {
+        if (!text) {
+            return '';
         }
-        return softPill(t('Off'), 'var(--anas-muted,gray)', t('periodic scrub is disabled'));
+        return '<div style="margin-top:10px;">'
+            + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
+            + enc(title) + '</div>'
+            + '<pre style="margin:0;padding:8px 10px;border-radius:6px;overflow-x:auto;'
+            + 'background:rgba(127,127,127,0.10);font-size:12px;white-space:pre;">'
+            + enc(text) + '</pre></div>';
     }
 
-    function renderScrubScope(v, meta, rec) {
-        var note = rec.get('note');
-        if (note) {
-            // The mdcheck node-global caveat (or any backend note) — surfaced, not hidden.
-            return '<span title="' + enc(note) + '"'
-                + ' style="color:var(--anas-warn,#b06a12);font-size:0.85em;">'
-                + '<i class="fa fa-info-circle" aria-hidden="true" style="margin-right:4px;"></i>'
-                + enc(note) + '</span>';
+    // The last-run status line: the result pill + the numeric exit code, LABELED
+    // (never a bare number). exit 0 on success; a nonzero code on failure. Null
+    // (never run) reads as an explicit "never run", not "exit 0".
+    function lastRunBlock(d) {
+        var result = '' + (d.lastRunResult || 'unknown');
+        var pill;
+        if (result === 'success') {
+            pill = pillHtml(t('success'), 'var(--anas-ok,#1f9c56)', '');
+        } else if (result === 'failure') {
+            pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)', '');
+        } else if (result === 'running') {
+            pill = pillHtml(t('running'), 'var(--anas-accent,#3468c0)', '');
+        } else {
+            pill = softPill(t('never run'), 'var(--anas-muted,gray)', '');
         }
-        return muted(t('per-pool'));
+        var when = d.lastRunAt
+            ? ' <span style="color:var(--anas-muted,gray);">' + enc(absTime(d.lastRunAt)) + '</span>'
+            : '';
+        var code = (d.lastRunExitCode !== undefined && d.lastRunExitCode !== null)
+            ? ' <span style="color:var(--anas-muted,gray);">('
+                + enc(t('exit code') + ' ' + d.lastRunExitCode) + ')</span>'
+            : '';
+        return pill + code + when;
     }
 
-    function loadScrub(scrubGrid, node, quiet) {
-        if (!scrubGrid || scrubGrid.destroyed || scrubGrid.destroying) {
+    // The recent journald blob — the run's own log, bounded + recent-only, the
+    // SAME "older history is not retained" caveat as the backup detail.
+    function journalBlock(d) {
+        var journal = d.journal;
+        var head = '<div style="margin-top:12px;">'
+            + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
+            + '<i class="fa fa-history" style="margin-right:5px;"></i>'
+            + enc(t('Recent runs (journald) — older history is not retained')) + '</div>';
+        var body;
+        if (journal) {
+            body = '<pre style="margin:0;padding:8px 10px;border-radius:6px;overflow-x:auto;'
+                + 'background:rgba(127,127,127,0.10);font-size:11px;white-space:pre-wrap;">'
+                + enc(journal) + '</pre>';
+        } else {
+            body = '<div style="color:var(--anas-muted,gray);font-size:0.9em;">'
+                + enc(t('No recent runs recorded.')) + '</div>';
+        }
+        return head + body + '</div>';
+    }
+
+    function scheduleDetailHtml(d) {
+        if (!d) {
+            return '<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
+                + enc(t('No detail returned for this schedule.')) + '</div>';
+        }
+        var s = d.schedule || {};
+        var target = s.target || {};
+        var targetText = sched.fsTag(target.kind, target.kind === 'ahr' ? t('AHR pool') : t('ZFS dataset'))
+            + '<span style="font-family:monospace;font-size:0.92em;">'
+            + enc(target.kind === 'ahr' ? (target.pool || '') : (target.dataset || '')) + '</span>';
+
+        var rows = ''
+            + kv(t('Schedule'), mono(s.name || s.id || ''))
+            + kv(t('Identifier'), mono(s.id || ''))
+            + kv(t('Target'), targetText)
+            + kv(t('Cadence'), enc('' + (s.cadence || '')))
+            + kv(t('Retention'), '<span style="font-family:monospace;font-size:0.9em;">'
+                + enc(retentionSummary(s.retention) || '—') + '</span>')
+            + kv(t('Enabled'), s.enabled !== false
+                ? '<span style="color:var(--anas-ok,#1f9c56);">' + enc(t('yes')) + '</span>'
+                : '<span style="color:var(--anas-muted,gray);">' + enc(t('no')) + '</span>')
+            + kv(t('Last run'), lastRunBlock(d))
+            + kv(t('Next run'), d.overdue
+                ? softPill(t('overdue'), 'var(--anas-warn,#b06a12)', '')
+                : (d.nextRunAt ? enc(absTime(d.nextRunAt)) : '<span style="color:gray;">&mdash;</span>'));
+
+        var html = '<div style="padding:10px 14px;">'
+            + '<table style="border-collapse:collapse;width:100%;">' + rows + '</table>';
+        html += journalBlock(d);
+        // The unit + timer, verbatim — config-is-the-API transparency (Principle 13),
+        // mirroring the backup detail.
+        html += unitBlock(t('systemd service unit (as written)'), d.unit);
+        html += unitBlock(t('systemd timer (as written)'), d.timer);
+        html += '</div>';
+        return html;
+    }
+
+    // Fetch GET /schedules/:id and render it into the detail window's body.
+    // Called on open and by the window's Reload button — no polling.
+    function loadDetailInto(win, node, id) {
+        if (!win || win.destroyed || win.destroying) {
             return;
         }
-        if (!quiet) {
-            try { scrubGrid.setLoading(true); } catch (e) { /* non-fatal */ }
+        var body = win.down('#detailBody');
+        if (!body) {
+            return;
         }
-        var priorKey = null;
-        try {
-            var sel = scrubGrid.getSelectionModel().getSelection();
-            priorKey = (sel && sel.length) ? sel[0].get('rowKey') : null;
-        } catch (eS) {
-            priorKey = null;
-        }
-        ANAS.api.get(node, '/scrub').then(function (res) {
-            if (scrubGrid.destroyed || scrubGrid.destroying) {
+        body.update('<div style="padding:12px 14px;color:var(--anas-muted,gray);">'
+            + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
+            + enc(t('loading…')) + '</div>');
+        ANAS.api.get(node, '/schedules/' + encodeURIComponent(id)).then(function (res) {
+            if (body.destroyed || body.destroying) {
                 return;
             }
-            if (!quiet) {
-                try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
-            }
-            var list = (res && res.data) || [];
-            var rows = [];
-            for (var i = 0; i < list.length; i++) {
-                rows.push(scrubRow(list[i]));
-            }
             try {
-                scrubGrid.getStore().loadData(rows);
-            } catch (e2) {
-                ANAS.warn('scrub grid load failed: ' + ANAS.errText(e2));
-            }
-            if (priorKey) {
-                try {
-                    var idx = scrubGrid.getStore().findExact('rowKey', priorKey);
-                    if (idx >= 0) {
-                        scrubGrid.getSelectionModel().select(idx, false, true);
-                    }
-                } catch (eSel) {
-                    // non-fatal
-                }
-            }
-            updateScrubButton(scrubGrid);
-        }, function (err) {
-            if (scrubGrid.destroyed || scrubGrid.destroying) {
-                return;
-            }
-            if (!quiet) {
-                try { scrubGrid.setLoading(false); } catch (e) { /* non-fatal */ }
-            }
-            ANAS.warn('scrub load failed: ' + ANAS.errText(err));
-        });
-    }
-
-    function selectedScrub(scrubGrid) {
-        var sel = scrubGrid ? scrubGrid.getSelection() : [];
-        return (sel && sel.length) ? sel[0] : null;
-    }
-
-    function updateScrubButton(scrubGrid) {
-        var rec = selectedScrub(scrubGrid);
-        var btn = scrubGrid.down('#scrubToggle');
-        if (!btn) {
-            return;
-        }
-        btn.setDisabled(!rec);
-        if (rec) {
-            var on = rec.get('enabled');
-            btn.setText(on ? t('Disable scrub') : t('Enable scrub'));
-            btn.setIconCls(on ? 'fa fa-pause' : 'fa fa-play');
-        }
-    }
-
-    function toggleScrub(node, scrubGrid, rec) {
-        if (!rec) {
-            return;
-        }
-        var kind = rec.get('kind');
-        var pool = rec.get('pool');
-        var next = !rec.get('enabled');
-        var path = '/scrub/' + (kind === 'ahr' ? 'ahr' : 'zfs') + '/' + encodeURIComponent(pool);
-
-        var doToggle = function () {
-            ANAS.runJob({
-                node: node,
-                method: 'put',
-                path: path,
-                body: { enabled: next },
-                view: scrubGrid,
-                failTitle: 'Scrub toggle failed',
-                successMsg: (next ? t('Periodic scrub enabled') : t('Periodic scrub disabled'))
-                    + ': ' + pool,
-                onComplete: function () { loadScrub(scrubGrid, node); }
-            });
-        };
-
-        // AHR mdcheck is NODE-GLOBAL — confirm the scope before flipping it, so the
-        // operator sees that this governs md checks for EVERY AHR pool on the host.
-        if (kind === 'ahr') {
-            try {
-                Ext.Msg.confirm(
-                    t('Periodic scrub (node-global)'),
-                    (rec.get('note') ? (enc(rec.get('note')) + '<br><br>') : '')
-                        + (next ? t('Enable') : t('Disable')) + ' '
-                        + t('md periodic checks for ALL AHR pools on this node?'),
-                    function (btn) {
-                        if (btn === 'yes') { doToggle(); }
-                    }
-                );
+                body.update(scheduleDetailHtml(res && res.data));
             } catch (e) {
-                ANAS.warn('scrub confirm failed: ' + ANAS.errText(e));
+                ANAS.warn('schedule detail render failed: ' + ANAS.errText(e));
             }
-            return;
-        }
-        doToggle();
-    }
-
-    function scrubPanel(node) {
-        var store = Ext.create('Ext.data.Store', {
-            fields: ['pool', 'kind', 'cadence', 'mechanism', 'note', 'rowKey',
-                { name: 'enabled', type: 'auto' }],
-            data: [],
-            sorters: [{ property: 'kind', direction: 'ASC' }, { property: 'pool', direction: 'ASC' }]
+        }, function (err) {
+            if (body.destroyed || body.destroying) {
+                return;
+            }
+            ANAS.warn('schedule detail load failed: ' + ANAS.errText(err));
+            body.update('<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
+                + enc(t('Failed to load detail') + ': ' + ANAS.errText(err)) + '</div>');
         });
-        return {
-            xtype: 'gridpanel',
-            itemId: 'scrubGrid',
-            cls: 'anas-grid-scrub',
-            title: t('Periodic scrub'),
-            collapsible: true,
-            border: false,
-            height: 220,
-            store: store,
-            selModel: { mode: 'SINGLE' },
-            emptyText: t('No pools found'),
-            columns: [
-                { text: t('Pool'), dataIndex: 'pool', flex: 1, minWidth: 160,
-                    sortable: false, menuDisabled: true, renderer: renderScrubPool },
-                { text: t('Periodic scrub'), dataIndex: 'enabled', width: 120, align: 'center',
-                    renderer: renderScrubEnabled },
-                { text: t('Cadence'), dataIndex: 'cadence', width: 110,
-                    renderer: function (v) { return enc(v || 'monthly'); } },
-                { text: t('Scope'), dataIndex: 'note', flex: 1, minWidth: 220,
-                    sortable: false, menuDisabled: true, renderer: renderScrubScope }
-            ],
-            tbar: [
-                {
-                    xtype: 'component',
-                    html: enc(t('Verify pools on a monthly cadence. ZFS: per-pool. '
-                        + 'AHR: node-global (mdcheck covers every array).')),
-                    style: 'color:var(--anas-muted,gray);font-size:11px;'
-                },
-                '->',
-                {
-                    text: t('Enable scrub'),
-                    itemId: 'scrubToggle',
-                    cls: 'anas-btn-scrub-toggle',
-                    iconCls: 'fa fa-play',
-                    disabled: true,
-                    handler: function (btn) {
-                        var g = btn.up('grid');
-                        toggleScrub(node, g, selectedScrub(g));
-                    }
-                }
-            ],
-            listeners: {
-                afterrender: function (g) { loadScrub(g, node); },
-                selectionchange: function () { updateScrubButton(this); }
-            }
-        };
     }
 
-    // ---- Poll loop control (visibility-gated; no leaked intervals) ---------
-
-    function refreshAll(view, node, quiet) {
-        try {
-            var g = view.down('#schedGrid');
-            if (g) { loadSchedules(g, node, quiet); }
-            var s = view.down('#scrubGrid');
-            if (s) { loadScrub(s, node, quiet); }
-        } catch (e) {
-            ANAS.warn('schedules refresh failed: ' + ANAS.errText(e));
-        }
-    }
-
-    function startPolling(view, node) {
-        if (!view || view.destroyed || view.destroying) {
+    // Open the on-demand detail/log window (modal:false, snapshot semantics —
+    // Reload is the refresh). Mirrors the backup Details window.
+    function openScheduleDetailWindow(node, id, name) {
+        if (!id) {
             return;
         }
-        stopPolling(view);
+        var win;
         try {
-            view._anasTimer = setInterval(function () {
-                try {
-                    if (!view || view.destroyed || view.destroying) {
-                        stopPolling(view);
-                        return;
-                    }
-                    if (typeof document !== 'undefined' && document.hidden) {
-                        return;
-                    }
-                    if (typeof view.isVisible === 'function' && !view.isVisible()) {
-                        return;
-                    }
-                    refreshAll(view, node, true);
-                } catch (tickErr) {
-                    ANAS.warn('schedules poll tick failed: ' + ANAS.errText(tickErr));
-                }
-            }, POLL_MS);
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-sched-detail',
+                title: t('Snapshot Schedule') + ': ' + (name || id),
+                modal: false,
+                width: 720,
+                height: 500,
+                resizable: true,
+                layout: 'fit',
+                items: [{
+                    xtype: 'panel',
+                    itemId: 'detailBody',
+                    cls: 'anas-sched-detail',
+                    border: false,
+                    scrollable: true,
+                    html: ''
+                }],
+                buttons: [
+                    {
+                        text: t('Reload'),
+                        cls: 'anas-btn-sched-detail-reload',
+                        iconCls: 'fa fa-refresh',
+                        handler: function () { loadDetailInto(win, node, id); }
+                    },
+                    { text: t('Close'), handler: function () { win.close(); } }
+                ]
+            });
         } catch (e) {
-            ANAS.warn('schedules interval start failed: ' + ANAS.errText(e));
+            ANAS.warn('schedule detail window failed: ' + ANAS.errText(e));
+            return;
         }
-    }
-
-    function stopPolling(view) {
-        try {
-            if (view && view._anasTimer) {
-                clearInterval(view._anasTimer);
-                view._anasTimer = null;
-            }
-        } catch (e) {
-            // non-fatal
-        }
-    }
-
-    function cleanup(view) {
-        stopPolling(view);
-        try {
-            if (view && view._anasVisHandler && typeof document !== 'undefined'
-                && document.removeEventListener) {
-                document.removeEventListener('visibilitychange', view._anasVisHandler);
-                view._anasVisHandler = null;
-            }
-        } catch (e) {
-            // non-fatal
-        }
+        win.show();
+        loadDetailInto(win, node, id);
     }
 
     // ---- View --------------------------------------------------------------
@@ -1407,14 +1310,24 @@
             sorters: [{ property: 'name', direction: 'ASC' }]
         });
 
+        // Reload just this view's grid (the poll loop lives in ANAS.sched).
+        var refresh = function (view, quiet) {
+            try {
+                var g = view.down('#schedGrid');
+                if (g) { loadSchedules(g, node, quiet); }
+            } catch (e) {
+                ANAS.warn('snapshots refresh failed: ' + ANAS.errText(e));
+            }
+        };
+
         var tbar = [
             {
                 text: t('Reload'),
                 cls: 'anas-btn-refresh',
                 iconCls: 'fa fa-refresh',
                 handler: function (btn) {
-                    var view = btn.up('panel');
-                    refreshAll(view, node, false);
+                    var g = btn.up('panel').down('#schedGrid');
+                    if (g) { loadSchedules(g, node, false); }
                 }
             },
             {
@@ -1435,6 +1348,20 @@
                 handler: function (btn) {
                     var grid = btn.up('grid');
                     runSchedule(node, grid, selectedSchedule(grid));
+                }
+            },
+            {
+                text: t('View log'),
+                itemId: 'schedLog',
+                cls: 'anas-btn-sched-log',
+                iconCls: 'fa fa-file-text-o',
+                disabled: true,
+                handler: function (btn) {
+                    var grid = btn.up('grid');
+                    var rec = selectedSchedule(grid);
+                    if (rec) {
+                        openScheduleDetailWindow(node, rec.get('id'), rec.get('name'));
+                    }
                 }
             },
             {
@@ -1475,8 +1402,8 @@
 
         return {
             xtype: 'panel',
-            cls: 'anas-view anas-view-schedules',
-            title: t('Schedules'),
+            cls: 'anas-view anas-view-snapshots',
+            title: t('Snapshots'),
             layout: { type: 'vbox', align: 'stretch' },
             border: false,
             items: [
@@ -1559,48 +1486,16 @@
                             openScheduleDialog(node, grid, rec ? (rec.get('raw') || scheduleFromRecord(rec)) : null);
                         }
                     }
-                },
-                scrubPanel(node)
+                }
             ],
-            listeners: {
-                afterrender: function (view) {
-                    refreshAll(view, node, false);
-                    startPolling(view, node);
-                    try {
-                        view._anasVisHandler = function () {
-                            try {
-                                if (document.hidden) {
-                                    stopPolling(view);
-                                } else if (typeof view.isVisible === 'function' && view.isVisible()) {
-                                    startPolling(view, node);
-                                }
-                            } catch (e2) {
-                                // non-fatal
-                            }
-                        };
-                        if (typeof document !== 'undefined' && document.addEventListener) {
-                            document.addEventListener('visibilitychange', view._anasVisHandler);
-                        }
-                    } catch (e3) {
-                        // non-fatal
-                    }
-                },
-                activate: function (view) {
-                    refreshAll(view, node, false);
-                    startPolling(view, node);
-                },
-                deactivate: function (view) { stopPolling(view); },
-                show: function (view) { startPolling(view, node); },
-                hide: function (view) { stopPolling(view); },
-                beforedestroy: function (view) { cleanup(view); },
-                destroy: function (view) { cleanup(view); }
-            }
+            // Refresh + visibility-gated poll loop live in ANAS.sched (shared).
+            listeners: sched.viewListeners(refresh)
         };
     }
 
     // Reconstruct a schedule object from a grid record when the raw form is absent.
     function scheduleFromRecord(rec) {
-        var sched = {
+        var out = {
             id: rec.get('id'),
             name: rec.get('name') || rec.get('id'),
             target: targetFromRecord(rec),
@@ -1609,22 +1504,22 @@
             enabled: !!rec.get('enabled')
         };
         if (rec.get('recursive')) {
-            sched.recursive = true;
+            out.recursive = true;
         }
-        return sched;
+        return out;
     }
 
     // ---- View registration -------------------------------------------------
 
-    ANAS.views['schedules'] = {
-        itemId: 'anas-schedules',
-        text: t('Schedules'),
+    ANAS.views['snapshots'] = {
+        itemId: 'anas-snapshots',
+        text: t('Snapshots'),
         iconCls: 'fa fa-clock-o',
         factory: function (node) {
             try {
                 return schedulesView(node);
             } catch (e) {
-                ANAS.warn('schedules view failed: ' + ANAS.errText(e));
+                ANAS.warn('snapshots view failed: ' + ANAS.errText(e));
                 return ANAS.errorPanel(ANAS.errText(e));
             }
         }

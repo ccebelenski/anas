@@ -8,6 +8,7 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import {
   collectScheduleStatuses,
+  deriveScheduleDetail,
   readSchedule,
   removeScheduleUnits,
   scheduleFileExists,
@@ -175,7 +176,10 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     return { job }
   })
 
-  // --- GET /schedules/:id — one schedule ------------------------------------
+  // --- GET /schedules/:id — one schedule's DETAIL ---------------------------
+  // The status fields PLUS the last run's exit code, the unit files as written,
+  // and a recent journald blob — the SAME last-run logs + exit-status surface as
+  // a backup task's detail (GET /backup/tasks/:name). Read-only (no job/identity).
   server.get<{ Params: { id: string } }>('/schedules/:id', async (request, reply) => {
     const idParsed = ScheduleId.safeParse(request.params.id)
     if (!idParsed.success) {
@@ -187,7 +191,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Snapshot schedule '${idParsed.data}' not found` } }
     }
-    return { data: schedule }
+    return { data: await deriveScheduleDetail(executor, systemdDir, schedule) }
   })
 
   // --- PUT /schedules/:id — update / rewrite --------------------------------

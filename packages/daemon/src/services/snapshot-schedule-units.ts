@@ -1,4 +1,4 @@
-import type { DashboardWarning, SnapshotCadence, SnapshotSchedule, SnapshotScheduleStatus } from '@anas/shared'
+import type { DashboardWarning, SnapshotCadence, SnapshotSchedule, SnapshotScheduleDetail, SnapshotScheduleStatus } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -28,10 +28,13 @@ import { deriveRunResult, parseShow, parseSystemdTimestamp } from './systemd-sta
  */
 
 const SYSTEMCTL = '/usr/bin/systemctl'
+const JOURNALCTL = '/usr/bin/journalctl'
 /** The timer executes this compiled runner (ships in dist — see snapshot-task.ts). */
 const RUNNER_NODE = '/usr/bin/node'
 const RUNNER_SCRIPT = '/opt/anas/packages/daemon/dist/snapshot-task.js'
 const UNIT_PREFIX = 'anas-snap-'
+/** How many recent journald lines the detail view surfaces (mirrors backup). */
+const JOURNAL_TAIL = 200
 /** The service-file line that carries the canonical schedule JSON (as a comment). */
 const SCHEDULE_MARKER = 'X-ANAS-Schedule='
 /** Matches the X-ANAS-Schedule line (with or without a leading `# `), capturing JSON. */
@@ -250,6 +253,48 @@ async function runSystemctl(executor: CommandExecutor, args: string[]): Promise<
 // --- Status derivation ------------------------------------------------------
 
 /**
+ * Pure: compute one schedule's status (and the last run's exit code) from
+ * already-fetched systemd props. Extracted so the list (status) and the detail
+ * (status + exit code + units + journal) derive from ONE implementation
+ * (single-source-of-truth). `overdue` = enabled AND the next elapse is in the
+ * past (a Persistent timer that never caught up). The exit code is meaningful
+ * only once the service has actually run — null before the first fire.
+ */
+function computeStatus(
+  schedule: SnapshotSchedule,
+  serviceProps: Record<string, string>,
+  nextRaw: string | undefined,
+): { status: SnapshotScheduleStatus, lastRunExitCode: number | null } {
+  const lastRunResult = deriveRunResult(serviceProps)
+  const lastRunAt = parseSystemdTimestamp(serviceProps.ExecMainExitTimestamp)
+    ?? parseSystemdTimestamp(serviceProps.InactiveEnterTimestamp)
+  const nextRunAt = parseSystemdTimestamp(nextRaw)
+
+  let overdue = false
+  if (schedule.enabled && nextRunAt) {
+    const next = Date.parse(nextRunAt)
+    if (!Number.isNaN(next) && next < Date.now())
+      overdue = true
+  }
+
+  // `ExecMainStatus` reads 0 before the unit has ever run — only surface it once
+  // there is evidence of a run (a recorded exit time or a settled result).
+  const ranAtLeastOnce = lastRunAt !== null || lastRunResult === 'success' || lastRunResult === 'failure'
+  const lastRunExitCode = ranAtLeastOnce ? parseExecMainStatus(serviceProps) : null
+
+  return { status: { schedule, lastRunResult, lastRunAt, nextRunAt, overdue }, lastRunExitCode }
+}
+
+/** Parse a service's `ExecMainStatus` (the last run's exit code) → number or null. */
+function parseExecMainStatus(props: Record<string, string>): number | null {
+  const raw = props.ExecMainStatus
+  if (raw === undefined || raw === '')
+    return null
+  const n = Number(raw)
+  return Number.isInteger(n) ? n : null
+}
+
+/**
  * Derive one schedule's status from persistent systemd state: the service's last
  * result + last-run time, and the timer's next elapse. `overdue` = enabled AND
  * the next elapse is in the past (a Persistent timer that never caught up).
@@ -263,20 +308,71 @@ export async function deriveScheduleStatus(
     showService(executor, schedule.id),
     showTimerNext(executor, schedule.id),
   ])
+  return computeStatus(schedule, serviceProps, nextRaw).status
+}
 
-  const lastRunResult = deriveRunResult(serviceProps)
-  const lastRunAt = parseSystemdTimestamp(serviceProps.ExecMainExitTimestamp)
-    ?? parseSystemdTimestamp(serviceProps.InactiveEnterTimestamp)
-  const nextRunAt = parseSystemdTimestamp(nextRaw)
-
-  let overdue = false
-  if (schedule.enabled && nextRunAt) {
-    const next = Date.parse(nextRunAt)
-    if (!Number.isNaN(next) && next < Date.now())
-      overdue = true
+/**
+ * Derive one schedule's DETAIL — the status plus the last run's exit code, the
+ * unit files as written, and a recent journald blob. Mirrors the backup task
+ * detail (routes/backup.ts + services/backup-units.ts): the SAME last-run
+ * logs + exit-status surface for a snapshot schedule as for a backup task.
+ * Fail-open per source (units/journal degrade to '' — never throws).
+ */
+export async function deriveScheduleDetail(
+  executor: CommandExecutor,
+  dir: string,
+  schedule: SnapshotSchedule,
+): Promise<SnapshotScheduleDetail> {
+  const [serviceProps, nextRaw, units, journal] = await Promise.all([
+    showService(executor, schedule.id),
+    showTimerNext(executor, schedule.id),
+    readScheduleUnitTexts(dir, schedule.id),
+    readRecentJournal(executor, schedule.id),
+  ])
+  const { status, lastRunExitCode } = computeStatus(schedule, serviceProps, nextRaw)
+  return {
+    ...status,
+    lastRunExitCode,
+    unit: units.unit,
+    timer: units.timer,
+    ...(journal ? { journal } : {}),
   }
+}
 
-  return { schedule, lastRunResult, lastRunAt, nextRunAt, overdue }
+/** The verbatim `.service` + `.timer` unit text for a schedule ('' when absent). */
+export async function readScheduleUnitTexts(
+  dir: string,
+  id: string,
+): Promise<{ unit: string, timer: string }> {
+  const [unit, timer] = await Promise.all([
+    readFile(join(dir, serviceUnitName(id)), 'utf-8').catch(() => ''),
+    readFile(join(dir, timerUnitName(id)), 'utf-8').catch(() => ''),
+  ])
+  return { unit, timer }
+}
+
+/**
+ * Recent journald output for a schedule's oneshot service — the run's own log +
+ * exit status. Bounded and recent-only (older history is not retained), exactly
+ * like the backup detail (services/backup-units.ts readRecentJournal): same args
+ * shape (`-u <svc> -n 200 -o short-iso --no-pager`), same fail-open-to-'' contract.
+ */
+export async function readRecentJournal(executor: CommandExecutor, id: string): Promise<string> {
+  try {
+    const r = await executor.exec(JOURNALCTL, [
+      '-u',
+      serviceUnitName(id),
+      '-n',
+      String(JOURNAL_TAIL),
+      '-o',
+      'short-iso',
+      '--no-pager',
+    ])
+    return r.exitCode === 0 ? r.stdout.trim() : ''
+  }
+  catch {
+    return ''
+  }
 }
 
 async function showService(executor: CommandExecutor, id: string): Promise<Record<string, string>> {
@@ -334,7 +430,7 @@ export function buildScheduleWarnings(statuses: SnapshotScheduleStatus[]): Dashb
       warnings.push({
         level: 'warning',
         category: 'schedule',
-        message: `Snapshot schedule '${s.schedule.name}' last run failed — check the Schedules view`,
+        message: `Snapshot schedule '${s.schedule.name}' last run failed — check the Snapshots view`,
         ref: s.schedule.id,
       })
     }
@@ -342,7 +438,7 @@ export function buildScheduleWarnings(statuses: SnapshotScheduleStatus[]): Dashb
       warnings.push({
         level: 'warning',
         category: 'schedule',
-        message: `Snapshot schedule '${s.schedule.name}' is overdue — check the Schedules view`,
+        message: `Snapshot schedule '${s.schedule.name}' is overdue — check the Snapshots view`,
         ref: s.schedule.id,
       })
     }
