@@ -1,6 +1,6 @@
 // @anas/shared — shared types, schemas, and validators
 
-export const VERSION = '0.1.3'
+export const VERSION = '0.2.0'
 
 // Access / permissions schemas (layered editor — Epic 4.7.2)
 export {
