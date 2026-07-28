@@ -37,6 +37,30 @@ interface ZfsScanStatsRaw {
   errors: string
 }
 
+/**
+ * RAIDZ-expansion reflow stats (`zpool status` "expand:" line), surfaced under
+ * the pool object in `zpool status -j`.
+ *
+ * GROUND-TRUTH CAVEAT (story 3.31): a live raidz reflow is hard to produce on
+ * demand, so these field names are based on the DOCUMENTED OpenZFS
+ * `pool_raidz_expand_stat_t` struct and the same friendly-snake_case convention
+ * `scan_stats` uses — NOT a live capture. Live-verify on pve5. The parser is
+ * deliberately tolerant: it keys "in progress" off the copied-vs-total counters
+ * and an unfinished end_time, so it survives field-name drift.
+ */
+interface ZfsRaidzExpandStatsRaw {
+  /** vdev being expanded — a GUID/index or (defensively) a name. */
+  expanding_vdev?: string | number
+  state?: string
+  start_time?: string
+  end_time?: string
+  /** Total bytes to reflow. */
+  to_reflow?: string
+  /** Bytes reflowed so far. */
+  reflowed?: string
+  waiting_for_resilver?: string | number
+}
+
 interface ZfsPoolStatusRaw {
   name: string
   state: string
@@ -46,6 +70,8 @@ interface ZfsPoolStatusRaw {
   msgid?: string
   moreinfo?: string
   scan_stats?: ZfsScanStatsRaw
+  /** RAIDZ-expansion reflow stats (story 3.31; doc-based — see caveat above). */
+  raidz_expand_stats?: ZfsRaidzExpandStatsRaw
   vdevs: Record<string, ZfsVdevRaw>
   /** Pool-level spares (separate from vdev tree) */
   spares?: Record<string, ZfsVdevRaw>
@@ -283,6 +309,69 @@ function diskId(raw: ZfsVdevRaw): string {
   if (raw.path && BY_ID_PATH_RE.test(raw.path))
     return stripPartSuffix(raw.path.replace(BY_ID_PATH_RE, ''))
   return stripPartSuffix(raw.name)
+}
+
+/**
+ * An in-progress operation that must block a new expansion (story 3.31 busy
+ * gate): a resilver, or a raidz-expansion reflow. A SCRUB is deliberately NOT
+ * reported here — ZFS auto-yields a scrub to a resilver/expansion, so it is a
+ * soft note, not a block.
+ */
+export interface PoolBusyState {
+  busy: boolean
+  operation?: 'resilver' | 'raidz-expand'
+  /** Progress 0–100 when derivable. */
+  percentComplete?: number
+  /** The reflowing vdev (raidz-expand only), when the field names a vdev. */
+  vdev?: string
+}
+
+/** Empty/`-`/`0` sentinels an `end_time` uses before a reflow finishes. */
+const REFLOW_UNFINISHED = new Set(['', '-', '0'])
+/** A reflow's `expanding_vdev` names a vdev only when it contains letters. */
+const VDEV_NAMELIKE_RE = /[a-z]/i
+
+function reflowInProgress(rx: ZfsRaidzExpandStatsRaw): boolean {
+  const total = parseHumanSize(rx.to_reflow ?? '')
+  const done = parseHumanSize(rx.reflowed ?? '')
+  const end = (rx.end_time ?? '').trim()
+  // Active when there is still work (copied < total) and the reflow has no end
+  // time yet. Tolerant of the doc-based field shape (see the raw-type caveat).
+  return total > 0 && done < total && REFLOW_UNFINISHED.has(end)
+}
+
+/**
+ * Detect a busy-gating operation on a pool from `zpool status -jv` JSON. A
+ * raidz-expansion reflow takes precedence over a resilver (it is the heavier,
+ * more specific op). Returns `{ busy: false }` when neither is running or the
+ * pool is absent — fail-soft.
+ */
+export function parsePoolBusyState(json: string | ZpoolStatusOutput, poolName: string): PoolBusyState {
+  const data: ZpoolStatusOutput = parseZfsJson(json, { pools: {} })
+  const pool = data.pools?.[poolName]
+  if (!pool)
+    return { busy: false }
+
+  const rx = pool.raidz_expand_stats
+  if (rx && reflowInProgress(rx)) {
+    const total = parseHumanSize(rx.to_reflow ?? '')
+    const done = parseHumanSize(rx.reflowed ?? '')
+    const percent = total > 0 ? Math.min(100, Math.round((done / total) * 10000) / 100) : 0
+    const vdev = typeof rx.expanding_vdev === 'string' && VDEV_NAMELIKE_RE.test(rx.expanding_vdev)
+      ? rx.expanding_vdev
+      : undefined
+    return { busy: true, operation: 'raidz-expand', percentComplete: percent, ...(vdev && { vdev }) }
+  }
+
+  const scan = pool.scan_stats
+  if (scan && scan.function === 'RESILVER' && scan.state === 'SCANNING') {
+    const total = parseHumanSize(scan.to_examine)
+    const examined = parseHumanSize(scan.examined)
+    const percent = total > 0 ? Math.min(100, Math.round((examined / total) * 10000) / 100) : 0
+    return { busy: true, operation: 'resilver', percentComplete: percent }
+  }
+
+  return { busy: false }
 }
 
 function parseScanStats(raw: ZfsScanStatsRaw): ScanStatus {

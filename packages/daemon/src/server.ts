@@ -192,6 +192,8 @@ export function createServer(opts?: ServerOptions) {
     // Reads need real JSON, so register them exactly (they take priority over
     // the command-only fallback below).
     mock.addFixture({ command: '/usr/sbin/zfs', args: zfsListArgs('testpool'), result: mockFixtures.zfsList() })
+    // Local OpenZFS version (story 3.31 — gates raidz expansion at ≥ 2.3.0).
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['version'], result: { stdout: 'zfs-2.3.1-1\nzfs-kmod-2.3.1-1\n', stderr: '', exitCode: 0 } })
     // Pool root mountpoint + mounted flag (story 3.27 — the grid's Mount column).
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint,mounted'], result: { stdout: 'testpool\t/testpool\tyes\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-j', 'all', 'testpool/media'], result: mockFixtures.zfsGetMedia() })

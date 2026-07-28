@@ -449,13 +449,138 @@ export const AddVdevRequest = z
   })
 export type AddVdevRequest = z.infer<typeof AddVdevRequest>
 
-/** Attach or replace a disk in a mirror (POST /v1/pools/:name/attach) */
-export const AttachDiskRequest = z.object({
-  /** Existing disk to attach to or replace */
-  existingDiskId: z.string(),
-  /** New disk to add */
-  newDiskId: z.string(),
-  /** true = replace, false = attach to mirror */
-  replace: z.boolean().default(false),
-})
+/**
+ * Attach/replace a leaf OR widen a raidz vdev (POST /v1/pools/:name/attach).
+ *
+ * Story 3.31 — drop-location is intent. The request carries EXACTLY ONE target:
+ *  - `existingDiskId` (a leaf by-id) → `zpool attach`/`replace` on that leaf:
+ *      • replace=false → add a mirror LEG (+redundancy, no capacity)
+ *      • replace=true  → swap a failed/old device
+ *  - `targetVdev` (a raidz vdev NAME, e.g. "raidz1-0") → RAIDZ EXPANSION: the
+ *      SAME `zpool attach` verb aimed at the VDEV widens it by one disk
+ *      (+capacity, reflow). NEW in 3.31; version/flag/busy-gated at the daemon.
+ *
+ * ONE disk per attach — OpenZFS has no atomic multi-disk widen.
+ */
+export const AttachDiskRequest = z
+  .object({
+    /** Existing leaf to mirror-attach-to or replace (by-id). Leaf target. */
+    existingDiskId: z.string().optional(),
+    /** Target raidz vdev NAME to widen (raidz-expand). Mutually excl. with existingDiskId. */
+    targetVdev: z.string().optional(),
+    /** New disk to add (by-id). */
+    newDiskId: z.string(),
+    /** true = replace (leaf only); false = attach mirror leg / raidz-expand. */
+    replace: z.boolean().default(false),
+  })
+  .check((ctx) => {
+    const { existingDiskId, targetVdev, replace } = ctx.value
+    const hasLeaf = existingDiskId !== undefined && existingDiskId !== ''
+    const hasVdev = targetVdev !== undefined && targetVdev !== ''
+    if (hasLeaf === hasVdev) {
+      ctx.issues.push({
+        code: 'custom',
+        message: 'exactly one of existingDiskId (mirror-attach/replace) or targetVdev (raidz-expand) is required',
+        path: ['existingDiskId'],
+        input: existingDiskId,
+      })
+    }
+    if (replace && hasVdev) {
+      ctx.issues.push({
+        code: 'custom',
+        message: 'replace targets a leaf device (existingDiskId), never a raidz vdev',
+        path: ['replace'],
+        input: replace,
+      })
+    }
+  })
 export type AttachDiskRequest = z.infer<typeof AttachDiskRequest>
+
+// --- Story 3.31: full pool expansion — eligibility/verdict read models -------
+
+/** What a disk dropped onto a target vdev does. */
+export const ExpansionOpKind = z.enum(['attach-leg', 'raidz-expand'])
+export type ExpansionOpKind = z.infer<typeof ExpansionOpKind>
+
+/**
+ * Why an expansion target is refused — the UI turns this into a guiding message.
+ *  - `version`     node's OpenZFS module is < 2.3.0 (no raidz expansion)
+ *  - `flag`        pool's feature@raidz_expansion is disabled (offer zpool upgrade)
+ *  - `busy`        a resilver or raidz-expansion reflow is in progress
+ *  - `degraded`    a raidz can't be widened while degraded
+ *  - `unsupported` the vdev type can't be expanded this way (e.g. draid)
+ */
+export const ExpansionGateReason = z.enum(['version', 'flag', 'busy', 'degraded', 'unsupported'])
+export type ExpansionGateReason = z.infer<typeof ExpansionGateReason>
+
+/** The node's raidz-expansion capability: module version × pool feature flag. */
+export const ExpansionCapability = z.object({
+  /** Detected local OpenZFS module version, e.g. "2.3.1"; null if undetectable. */
+  zfsVersion: z.string().nullable(),
+  /** Module is ≥ 2.3.0 (raidz expansion landed in OpenZFS 2.3.0). */
+  moduleSupported: z.boolean(),
+  /** Pool's feature@raidz_expansion state. */
+  featureState: z.enum(['disabled', 'enabled', 'active', 'unknown']),
+  /** feature is enabled or active (usable). */
+  featureEnabled: z.boolean(),
+  /** Both module + feature satisfied — raidz expansion is possible on this pool. */
+  raidzExpandAvailable: z.boolean(),
+})
+export type ExpansionCapability = z.infer<typeof ExpansionCapability>
+
+/** An in-progress resilver or raidz reflow that blocks any new expansion. */
+export const ExpansionBusyState = z.object({
+  busy: z.boolean(),
+  /** The operation in progress — present only when busy. */
+  operation: z.enum(['resilver', 'raidz-expand']).optional(),
+  /** Progress 0–100 — present when derivable. */
+  percentComplete: z.number().min(0).max(100).optional(),
+  /** The vdev being reflowed (raidz-expand only), when known. */
+  vdev: z.string().optional(),
+})
+export type ExpansionBusyState = z.infer<typeof ExpansionBusyState>
+
+/**
+ * Per top-level DATA vdev: what a disk-drop here does and whether it's allowed.
+ * Capacity figures are raidz-expand only and are ESTIMATES (see advisories) —
+ * live-verify on real hardware.
+ */
+export const ExpansionTarget = z.object({
+  /** vdev name, e.g. "mirror-0", "raidz1-0", or a single-disk vdev's leaf name. */
+  vdevName: z.string(),
+  vdevType: VdevType,
+  /** The operation a disk-drop performs here. */
+  kind: ExpansionOpKind,
+  allowed: z.boolean(),
+  /** Refusal reason — present only when !allowed. */
+  reason: ExpansionGateReason.optional(),
+  /** Guiding message when refused (states the fix). */
+  reasonDetail: z.string().optional(),
+  /**
+   * raidz-expand only: usable bytes of ONE added data column — the naive "+1
+   * disk" figure the UI must NOT present as the whole truth (see honest gain).
+   */
+  naiveUsableGainBytes: z.number().nonnegative().optional(),
+  /**
+   * raidz-expand only: the HONEST realized usable gain — LESS than naive because
+   * existing blocks keep their pre-expansion parity ratio until rewritten. An
+   * ESTIMATE; omitted when the vdev's allocation is unknown.
+   */
+  honestUsableGainBytes: z.number().nonnegative().optional(),
+  /** Advisories: rewrite-to-realize, wide-raidz1 widening, wasted excess, etc. */
+  advisories: z.array(z.string()).default([]),
+})
+export type ExpansionTarget = z.infer<typeof ExpansionTarget>
+
+/**
+ * GET /v1/pools/:name/expansion — the composer's expansion eligibility (READ,
+ * no mutation). One `targets` entry per top-level data vdev (the drag-drop
+ * targets), plus the node capability and any blocking busy state.
+ */
+export const PoolExpansionReport = z.object({
+  pool: PoolName,
+  capability: ExpansionCapability,
+  busy: ExpansionBusyState,
+  targets: z.array(ExpansionTarget),
+})
+export type PoolExpansionReport = z.infer<typeof PoolExpansionReport>

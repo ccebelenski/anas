@@ -72,6 +72,9 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
     assert.deepEqual(createCall(calls), [
       'create',
+      // Story 3.31a: ANAS-created pools default to autoexpand=on.
+      '-o',
+      'autoexpand=on',
       'newpool',
       'mirror',
       '/dev/disk/by-id/ata-DISK1',
@@ -99,6 +102,8 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
     assert.deepEqual(createCall(calls), [
       'create',
+      '-o',
+      'autoexpand=on',
       'rzpool',
       'raidz2',
       '/dev/disk/by-id/d1',
@@ -128,6 +133,8 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
     assert.deepEqual(createCall(calls), [
       'create',
+      '-o',
+      'autoexpand=on',
       'strp',
       '/dev/disk/by-id/d1',
       '/dev/disk/by-id/d2',
@@ -157,6 +164,8 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
     assert.deepEqual(createCall(calls), [
       'create',
+      '-o',
+      'autoexpand=on',
       'full',
       'mirror',
       '/dev/disk/by-id/d1',
@@ -194,6 +203,8 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
     assert.deepEqual(createCall(calls), [
       'create',
+      '-o',
+      'autoexpand=on',
       'alloc',
       'mirror',
       '/dev/disk/by-id/d1',
@@ -297,5 +308,43 @@ describe('create pool endpoint: POST /v1/pools', () => {
 
     assert.equal(res.statusCode, 401)
     assert.equal(res.json().error.code, 'UNAUTHORIZED')
+  })
+
+  // Story 3.31a: autoexpand default + override.
+  it('defaults autoexpand=on when the request says nothing about it', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'defexp', dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }] }),
+    })
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, (res.json() as JobAccepted).job.id)
+    const args = createCall(calls)!
+    assert.ok(args.join(' ').includes('-o autoexpand=on'), 'autoexpand=on defaulted')
+  })
+
+  it('honors an explicit autoexpand=false override (no default injected)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const calls = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        name: 'noexp',
+        dataVdevs: [{ type: 'mirror', disks: ['d1', 'd2'] }],
+        properties: { autoexpand: false },
+      }),
+    })
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, (res.json() as JobAccepted).job.id)
+    const joined = createCall(calls)!.join(' ')
+    assert.ok(joined.includes('autoexpand=off'), 'explicit off honored')
+    assert.ok(!joined.includes('autoexpand=on'), 'default not injected over an explicit override')
   })
 })

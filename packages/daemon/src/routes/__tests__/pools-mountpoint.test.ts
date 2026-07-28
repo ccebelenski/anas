@@ -70,6 +70,9 @@ describe('create pool: mountpoint override (3.27)', () => {
     await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.deepEqual(createCall(calls), [
       'create',
+      // Story 3.31a: autoexpand=on default precedes the mountpoint flag.
+      '-o',
+      'autoexpand=on',
       '-m',
       '/srv/tank',
       'newpool',

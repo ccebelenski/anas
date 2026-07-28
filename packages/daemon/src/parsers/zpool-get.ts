@@ -61,3 +61,21 @@ function parseFailmode(val: string): 'wait' | 'continue' | 'panic' {
     return val
   return 'wait' // default
 }
+
+/**
+ * Read a single pool feature-flag value (e.g. `feature@raidz_expansion`) from
+ * `zpool get all -j`. Feature values are `disabled` | `enabled` | `active`.
+ * Returns null when the pool or feature is absent (fail-soft). Used to gate
+ * raidz expansion, which requires the feature enabled/active (story 3.31).
+ */
+export function parseZpoolFeature(
+  json: string | ZpoolGetOutput,
+  poolName: string,
+  feature: string,
+): string | null {
+  const data: ZpoolGetOutput = parseZfsJson(json, { pools: {} })
+  const pool = data.pools[poolName]
+  if (!pool)
+    return null
+  return pool.properties[feature]?.value ?? null
+}

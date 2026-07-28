@@ -1,4 +1,4 @@
-import type { PoolDetail, PoolSummary, VdevSpec } from '@anas/shared'
+import type { ExpansionTarget, PoolDetail, PoolExpansionReport, PoolSummary, VdevSpec } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
@@ -9,14 +9,15 @@ import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../pa
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
-import { parseZpoolGet } from '../parsers/zpool-get.js'
+import { parseZpoolFeature, parseZpoolGet } from '../parsers/zpool-get.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
+import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
 import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { confirmGate } from '../safety/gate.js'
 import { isRootPool } from '../safety/root-pool.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
+import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -33,6 +34,8 @@ const BY_ID_PREFIX = '/dev/disk/by-id/'
 const PART_BY_ID_RE = /-part\d+$/
 const TRAILING_CR_RE = /\r$/
 const TRAILING_SLASHES_RE = /\/+$/
+/** ZFS vdev names (raidz1-0, mirror-0, …) — charset guard for raidz-expand. */
+const VDEV_NAME_RE = /^[\w-]+$/
 
 /** A destroyed pool's vdev leaf, resolved for disk hygiene (story 3.14). */
 interface PoolLeaf {
@@ -305,8 +308,8 @@ function buildCreateArgs(req: CreatePoolRequest): string[] {
   if (req.force)
     args.push('-f')
 
-  if (req.properties) {
-    const p = req.properties
+  const p = req.properties
+  if (p) {
     if (p.ashift !== undefined)
       args.push('-o', `ashift=${p.ashift}`)
     if (p.autoexpand !== undefined)
@@ -316,6 +319,11 @@ function buildCreateArgs(req: CreatePoolRequest): string[] {
     if (p.autotrim !== undefined)
       args.push('-o', `autotrim=${p.autotrim ? 'on' : 'off'}`)
   }
+  // Story 3.31a: ANAS-created pools default to autoexpand=on so a later
+  // replace-with-larger realizes the grown capacity automatically. Still
+  // overridable — only defaulted when the request said nothing about it.
+  if (p?.autoexpand === undefined)
+    args.push('-o', 'autoexpand=on')
 
   if (req.mountpoint)
     args.push('-m', req.mountpoint)
@@ -1178,9 +1186,55 @@ export async function poolRoutes(
     return { job }
   })
 
-  // Attach or replace a disk (story 3.12). AttachDiskRequest.replace selects the
-  // operation: false → `zpool attach` (add a mirror leg to an existing device),
-  // true → `zpool replace` (swap a failed/old device for a new one).
+  // Expansion eligibility (story 3.31, READ). For each top-level DATA vdev the
+  // composer gets what a dropped disk would do (attach-leg vs raidz-expand),
+  // whether it's allowed, the guiding refusal reason, and — for raidz — the
+  // HONEST usable-gain estimate. Disk-independent (the gain of adding one disk
+  // ≥ the column size depends only on the vdev, not which disk), so this needs
+  // no candidate disk. Fail-soft reads throughout.
+  server.get<{ Params: { name: string } }>('/pools/:name/expansion', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    const [statusResult, getResult, version] = await Promise.all([
+      executor.exec(ZPOOL, ['status', '-jv']),
+      executor.exec(ZPOOL, ['get', 'all', '-j']),
+      detectLocalZfsVersion(executor),
+    ])
+
+    const status = statusResult.exitCode === 0
+      ? parseZpoolStatusPool(statusResult.stdout, poolName)
+      : null
+    if (!status) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    const featureValue = getResult.exitCode === 0
+      ? parseZpoolFeature(getResult.stdout, poolName, RAIDZ_EXPANSION_FEATURE)
+      : null
+    const capability = buildCapability(version, featureValue)
+    const busy = statusResult.exitCode === 0
+      ? parsePoolBusyState(statusResult.stdout, poolName)
+      : { busy: false }
+    const targets: ExpansionTarget[] = buildExpansionTargets(status, poolName, capability, busy)
+
+    const report: PoolExpansionReport = { pool: poolName, capability, busy, targets }
+    return { data: report }
+  })
+
+  // Attach/replace a leaf OR widen a raidz vdev (stories 3.12 + 3.31). The
+  // request carries exactly one target — drop-location is intent:
+  //   existingDiskId + replace=false → `zpool attach <pool> <leaf> <new>`  (mirror leg, +redundancy)
+  //   existingDiskId + replace=true  → `zpool replace <pool> <old> <new>` (+ online -e realizes a larger disk)
+  //   targetVdev                     → `zpool attach <pool> <raidz-vdev> <new>` (RAIDZ EXPANSION, +capacity)
+  // Gates (3.31): raidz-expand needs OpenZFS ≥ 2.3.0 AND feature@raidz_expansion;
+  // mirror-attach AND raidz-expand refuse while a resilver/reflow is in progress
+  // (mirrors the AHR degraded-refusal altitude — a hard 409, no confirm bypass).
   server.post<{ Params: { name: string } }>('/pools/:name/attach', async (request, reply) => {
     const nameParsed = PoolName.safeParse(request.params.name)
     if (!nameParsed.success) {
@@ -1194,7 +1248,7 @@ export async function poolRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid attach request: ${bodyParsed.error.issues[0]?.message}` } }
     }
-    const { existingDiskId, newDiskId, replace } = bodyParsed.data
+    const { existingDiskId, targetVdev, newDiskId, replace } = bodyParsed.data
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -1205,8 +1259,89 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    const existingPath = byIdPath(existingDiskId)
     const newPath = byIdPath(newDiskId)
+
+    // ---- RAIDZ EXPANSION path (targetVdev present) -------------------------
+    if (targetVdev !== undefined) {
+      if (!VDEV_NAME_RE.test(targetVdev)) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid vdev name '${targetVdev}'` } }
+      }
+
+      const [statusResult, getResult, version] = await Promise.all([
+        executor.exec(ZPOOL, ['status', '-jv']),
+        executor.exec(ZPOOL, ['get', 'all', '-j']),
+        detectLocalZfsVersion(executor),
+      ])
+      const status = statusResult.exitCode === 0 ? parseZpoolStatusPool(statusResult.stdout, poolName) : null
+      if (!status) {
+        reply.code(404)
+        return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+      }
+
+      // The target must be an existing raidz DATA vdev.
+      const dataGroup = status.vdevGroups.find(g => g.role === 'data')
+      const vdev = dataGroup?.vdevs.find(v => v.name === targetVdev)
+      if (!vdev) {
+        reply.code(404)
+        return { error: { code: 'NOT_FOUND', message: `Vdev '${targetVdev}' not found in pool '${poolName}'` } }
+      }
+      if (raidzParity(vdev.type) === null) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Vdev '${targetVdev}' is a ${vdev.type}, not a raidz — raidz expansion needs a raidz vdev (attach a mirror leg via existingDiskId instead)` } }
+      }
+
+      // GATE 1 (version): raidz expansion landed in OpenZFS 2.3.0.
+      const featureValue = getResult.exitCode === 0 ? parseZpoolFeature(getResult.stdout, poolName, RAIDZ_EXPANSION_FEATURE) : null
+      const capability = buildCapability(version, featureValue)
+      if (!capability.moduleSupported) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', reason: 'version', message: `RAIDZ expansion needs OpenZFS ≥ 2.3.0; this node runs ${capability.zfsVersion ?? 'an undetectable version'}. This refusal has no confirm bypass.` } }
+      }
+      // GATE 1b (flag): feature@raidz_expansion must be enabled/active.
+      if (!capability.featureEnabled) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', reason: 'flag', message: `Pool '${poolName}' has feature@raidz_expansion ${capability.featureState}. Enable it first with: zpool upgrade ${poolName}` } }
+      }
+      // GATE 2 (busy): no new expansion while a resilver/reflow runs.
+      const busy = parsePoolBusyState(statusResult.stdout, poolName)
+      if (busy.busy) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', reason: 'busy', message: busyDetail(busy, poolName) } }
+      }
+
+      const job = jobQueue.submit(
+        'zpool.raidz-expand',
+        { ...identity, params: { pool: poolName, vdev: targetVdev, newDisk: newDiskId } },
+        async () => {
+          // SAME `zpool attach` verb aimed at the raidz VDEV NAME (not a leaf).
+          const result = await executor.exec(ZPOOL, ['attach', poolName, targetVdev, newPath])
+          if (result.exitCode !== 0)
+            throw new Error(result.stderr.trim() || `zpool attach (raidz expand) exited with code ${result.exitCode}`)
+          return { pool: poolName, vdev: targetVdev, expanded: newDiskId }
+        },
+      )
+      reply.code(202)
+      return { job }
+    }
+
+    // ---- LEAF path: mirror-attach or replace (story 3.12) ------------------
+    const existingPath = byIdPath(existingDiskId!)
+
+    // GATE 2 (busy) applies to a mirror-attach too — never start a second
+    // resilver-inducing op mid-resilver/reflow. Replace is exempt (you may be
+    // replacing the very disk that is degraded).
+    if (!replace) {
+      const statusResult = await executor.exec(ZPOOL, ['status', '-jv'])
+      if (statusResult.exitCode === 0) {
+        const busy = parsePoolBusyState(statusResult.stdout, poolName)
+        if (busy.busy) {
+          reply.code(409)
+          return { error: { code: 'CONFLICT', reason: 'busy', message: busyDetail(busy, poolName) } }
+        }
+      }
+    }
+
     const args = replace
       ? ['replace', poolName, existingPath, newPath]
       : ['attach', poolName, existingPath, newPath]
@@ -1220,6 +1355,14 @@ export async function poolRoutes(
           const verb = replace ? 'replace' : 'attach'
           throw new Error(result.stderr.trim() || `zpool ${verb} exited with code ${result.exitCode}`)
         }
+        // Story 3.31a: after a replace, realize any grown capacity on the NEW
+        // device even on autoexpand=off pools. `zpool online -e` expands the
+        // device to its full size; a no-op when the replacement is not larger.
+        // Guest philosophy: we only online -e the specific device we replaced —
+        // we never flip the pool's autoexpand property. Best-effort: a failure
+        // here does not fail the (already-succeeded) replace.
+        if (replace)
+          await executor.exec('/usr/sbin/zpool', ['online', '-e', poolName, newPath])
         return null
       },
     )
