@@ -16,6 +16,24 @@ Think TrueNAS, but purpose-built to **complement** Proxmox rather than replace i
 > own risk — and read the guest philosophy below for why the risk is smaller
 > than you'd think.
 
+## Screenshots
+
+![ANAS dashboard: pool health, capacity, and live per-pool and per-disk I/O and latency, with an AHR array expanding online](docs/images/dashboard.png)
+
+**Live dashboard** — pool health, capacity, and real-time per-pool and per-disk I/O + latency, for ZFS and AHR pools alike. Caught here with an AHR array expanding online, one disk at a time.
+
+![Hybrid RAID (AHR) composer: build a redundant pool from mixed-size disks, with a live sliced layout and an advisor that flags unsafe configurations](docs/images/ahr-composer.png)
+
+**Hybrid RAID (AHR)** — build a redundant pool from mixed-size disks by dragging them in, with a live sliced layout and honest capacity accounting. The advisor won't let you footgun it — here it flags that a single disk has no redundancy, and exactly what's needed to fix it, rather than silently building something unsafe.
+
+![Creating an SMB share with per-share access control in ANAS](docs/images/smb-shares.png)
+
+**SMB & NFS shares** — create and secure shares with per-share access control: valid users, browseable, read-only, and allowed/denied hosts.
+
+![Creating a scheduled snapshot with keep-N-per-period retention](docs/images/snapshot-schedule.png)
+
+**Scheduled snapshots & scrubs** — uniform snapshot schedules across ZFS and AHR, driven by systemd timers with keep-N-per-period retention and sane presets built in.
+
 ## Features
 
 - **Dashboard** — pool health, capacity, fleet disk health, shares, running
