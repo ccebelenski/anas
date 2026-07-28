@@ -1376,6 +1376,134 @@
         };
     };
 
+    // ======================================================================
+    // WARN GATE — the uniform advisory commit-gate shared by the ZFS pool
+    // composer (38, story 3.30) and the AHR create + expand composers (39,
+    // story 11.16). A composer feeds it its warnings list (client-computed for
+    // ZFS size-mismatch waste; the daemon's preview/plan `warnings` for AHR);
+    // this helper owns the SINGLE presentation of BOTH the ready/warn chip and
+    // the "review to continue" commit confirmation, so the three screens stay
+    // byte-identical (parallel construction, single source of truth).
+    //
+    // ADVISORY ONLY. This never touches the 409 / X-Anas-Confirm-Code path —
+    // that stays reserved for real data destruction (disk wipes, destroy).
+    // Right-sized severity: amber "review", never red "danger". When a flow
+    // ALSO server-confirms a wipe (AHR create/expand), applyToConfirm folds the
+    // advisory list INTO that existing confirm; when a flow does NOT (ZFS pool
+    // create uses already-available disks — no wipe, no 409), clientConfirm
+    // shows the same amber list as a pure client-side confirm. Either way the
+    // operator sees ONE dialog carrying the warnings + an "<X> anyway" button.
+    // ======================================================================
+    gfx.warnGate = {
+        // The ready-state chip. No warnings → green "✓ <readyText>"; one or
+        // more → amber "⚠ N warning(s) — review to continue". Same chip on
+        // every composer's summary/capacity readout.
+        chip: function (warnings, readyText) {
+            try {
+                ensureInjected();
+                warnings = warnings || [];
+                var n = warnings.length;
+                var amber = n > 0;
+                var bg = amber
+                    ? 'color-mix(in srgb,var(--anas-warn) 14%,transparent)'
+                    : 'color-mix(in srgb,var(--anas-ok) 13%,transparent)';
+                var fg = amber ? 'var(--anas-warn)' : 'var(--anas-ok)';
+                var text = amber
+                    ? ('⚠ ' + n + ' ' + ANAS.t(n === 1 ? 'warning' : 'warnings')
+                        + ' — ' + ANAS.t('review to continue'))
+                    : ('✓ ' + ANAS.t(readyText || 'Ready to create.'));
+                return '<div class="anas-gfx-warngate-chip" style="margin-top:10px;'
+                    + 'font-size:12px;padding:7px 9px;border-radius:9px;'
+                    + 'background:' + bg + ';color:' + fg + '">' + enc(text) + '</div>';
+            } catch (e) {
+                warn('warnGate.chip failed: ' + (e && e.message));
+                return '';
+            }
+        },
+
+        // The amber advisory-warnings block placed ABOVE a commit confirmation
+        // — the SAME markup whether prepended into a server wipe-confirm (AHR)
+        // or shown in a client-side confirm (ZFS). '' when no warnings.
+        section: function (warnings) {
+            warnings = warnings || [];
+            if (!warnings.length) {
+                return '';
+            }
+            var items = '';
+            for (var i = 0; i < warnings.length; i++) {
+                items += '<li style="margin:2px 0">' + enc(warnings[i]) + '</li>';
+            }
+            return '<div style="margin:0 0 10px;padding:8px 10px;border-radius:8px;'
+                + 'background:color-mix(in srgb,var(--anas-warn) 14%,transparent);color:var(--anas-warn)">'
+                + '<div style="font-weight:750;margin-bottom:2px">⚠ '
+                + enc(ANAS.t('Review before continuing')) + '</div>'
+                + '<ul style="margin:2px 0 0;padding-left:18px">' + items + '</ul></div>';
+        },
+
+        // Fold advisory warnings into a confirmAndRun opts object for the flows
+        // that ALREADY server-confirm (AHR create wipes disks; AHR expand
+        // starts a reshape — both return a 409 confirm). Prepends the amber
+        // section to the intro, switches to the widget confirm window so the
+        // primary button can read "<anyway>", and returns opts. No warnings →
+        // opts unchanged (the normal wipe-confirm shows exactly as before).
+        applyToConfirm: function (opts, warnings, anywayText) {
+            warnings = warnings || [];
+            if (!warnings.length) {
+                return opts;
+            }
+            opts.confirmIntro = gfx.warnGate.section(warnings) + (opts.confirmIntro || '');
+            opts.confirmWindow = true;
+            opts.confirmButtonText = anywayText || 'Create anyway';
+            return opts;
+        },
+
+        // Client-side advisory confirm for the flows that do NOT server-confirm
+        // (ZFS pool create uses already-available disks — no wipe, so no 409).
+        // No warnings → onProceed() runs immediately (the commit path is
+        // unchanged). Warnings → a modal listing them with an "<anyway>"
+        // primary + Cancel; onProceed() runs only on confirm. Pure client-side,
+        // never a confirm code. Fails open (a broken dialog must not trap a
+        // valid, advisory-only commit).
+        clientConfirm: function (spec) {
+            spec = spec || {};
+            var warnings = spec.warnings || [];
+            var proceed = typeof spec.onProceed === 'function' ? spec.onProceed : function () {};
+            if (!warnings.length) {
+                proceed();
+                return;
+            }
+            try {
+                var win = Ext.create('Ext.window.Window', {
+                    title: ANAS.t(spec.title || 'Review'),
+                    cls: 'anas-win-warngate',
+                    modal: true,
+                    width: 460,
+                    bodyPadding: 12,
+                    layout: 'anchor',
+                    items: [{
+                        xtype: 'component',
+                        html: gfx.warnGate.section(warnings)
+                            + (spec.intro ? '<div>' + enc(ANAS.t(spec.intro)) + '</div>' : ''),
+                    }],
+                    defaultButton: 'anasWarnGateCancelBtn',
+                    buttons: [{
+                        text: ANAS.t('Cancel'),
+                        itemId: 'anasWarnGateCancelBtn',
+                        handler: function () { win.close(); },
+                    }, {
+                        text: ANAS.t(spec.anywayText || 'Create anyway'),
+                        cls: 'anas-btn-warngate-anyway',
+                        handler: function () { win.close(); proceed(); },
+                    }],
+                });
+                win.show();
+            } catch (e) {
+                warn('warnGate.clientConfirm failed: ' + (e && e.message));
+                proceed();
+            }
+        },
+    };
+
     // ---- publish + prime injection ----------------------------------------
 
     gfx.fillColorVar = fillColorVar; // exposed so views can colour-match custom bits

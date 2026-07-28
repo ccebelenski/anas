@@ -191,6 +191,22 @@
         }
         return false; // stripe
     }
+    // Story 3.30: capacity STRANDED by size mismatch within one data vdev —
+    // Σ(member − smallest). A mirror or raidz caps every member to its smallest
+    // disk, so the excess of the larger disks is unusable (wasted, not
+    // redundancy). A stripe uses every disk fully, so it wastes nothing. This is
+    // the gap an AHR pool reclaims by banding mixed-size disks.
+    function vdevWaste(v, diskById) {
+        if (v.type === 'stripe') {
+            return 0;
+        }
+        var n = v.diskIds.length;
+        if (n < 2) {
+            return 0;
+        }
+        var mn = minDiskSize(v, diskById);
+        return Math.max(0, sumDiskSize(v, diskById) - mn * n);
+    }
 
     // ---- disk kind mapping -------------------------------------------------
 
@@ -381,6 +397,22 @@
         }
         if (striped) {
             warnings.push(t('A striped data vdev has no redundancy — a single disk failure loses the pool.'));
+        }
+
+        // Story 3.30: size-mismatch waste per data vdev — threshold is ANY
+        // waste > 0 (no floor; a 20 GiB mismatch warns too, the operator just
+        // acknowledges). Mirrors AHR create's treatment: the gap is surfaced,
+        // not silently green-lit.
+        for (i = 0; i < dv.length; i++) {
+            var w = vdevWaste(dv[i], state.diskById);
+            if (w > 0) {
+                var tl = TYPES[dv[i].type] ? TYPES[dv[i].type].label : dv[i].type;
+                var mn = minDiskSize(dv[i], state.diskById);
+                warnings.push(t('Size mismatch — this') + ' ' + tl + ' '
+                    + t('is sized to its smallest disk') + ' (' + fmtBytes(mn) + '); '
+                    + fmtBytes(w) + ' ' + t('of the larger disk(s) is unusable — wasted, not redundancy.')
+                    + ' ' + t('An AHR pool would reclaim that') + ' ' + fmtBytes(w) + '.');
+            }
         }
 
         return { valid: blocking.length === 0, blocking: blocking, warnings: warnings };
@@ -690,10 +722,12 @@
         var dv = dataVdevs(state);
         var usable = 0;
         var raw = 0;
+        var waste = 0;
         var i;
         for (i = 0; i < dv.length; i++) {
             usable += vdevUsable(dv[i], state.diskById);
             raw += sumDiskSize(dv[i], state.diskById);
+            waste += vdevWaste(dv[i], state.diskById);
         }
         var tol = null;
         for (i = 0; i < dv.length; i++) {
@@ -726,6 +760,12 @@
             }
             blocking = '<div style="margin-top:10px;display:flex;flex-direction:column;gap:6px">'
                 + '<div style="' + SEC + ';margin:2px 0 2px">' + enc(t('Blocking')) + '</div>' + b + '</div>';
+        } else if (ANAS.gfx && ANAS.gfx.warnGate) {
+            // Story 3.30/11.16: the uniform ready/warn chip — green when clean,
+            // amber "⚠ N warning(s) — review to continue" when the draft carries
+            // advisory warnings (e.g. size-mismatch waste). Same chip as AHR.
+            blocking = ANAS.gfx.warnGate.chip(result.warnings,
+                state.mode === 'expand' ? 'Ready to add vdevs.' : 'Ready to create.');
         } else {
             blocking = '<div style="margin-top:10px;font-size:12px;padding:7px 9px;border-radius:9px;'
                 + 'background:color-mix(in srgb,var(--anas-ok) 13%,transparent);color:var(--anas-ok)">'
@@ -736,6 +776,7 @@
             + '<div style="margin-bottom:10px">' + gauge + '</div>'
             + stat(t('Usable'), usable ? fmtBytes(usable) : '—')
             + stat(t('Raw data'), raw ? fmtBytes(raw) : '—')
+            + stat(t('Unprotected (wasted)'), waste ? fmtBytes(waste) : '—')
             + stat(t('Fault tolerance'), tolText)
             + stat(t('Vdevs'), '' + state.vdevs.length)
             + blocking;
@@ -1169,10 +1210,29 @@
 
     function commit(state) {
         try {
-            if (state.mode === 'expand') {
-                commitExpand(state);
+            var expand = state.mode === 'expand';
+            var run = function () {
+                if (expand) {
+                    commitExpand(state);
+                } else {
+                    commitCreate(state);
+                }
+            };
+            // Story 3.30/11.16 — advisory commit-gate. ZFS pool create/expand
+            // uses already-available disks (no wipe, so the daemon does not 409),
+            // so the shared warn-gate surfaces any advisory warnings as a
+            // client-side "<X> anyway" confirm before the mutation. No warnings →
+            // it proceeds straight through (unchanged behaviour).
+            if (ANAS.gfx && ANAS.gfx.warnGate) {
+                var result = validate(state);
+                ANAS.gfx.warnGate.clientConfirm({
+                    title: expand ? 'Add vdevs' : 'Create pool',
+                    warnings: result.warnings,
+                    anywayText: expand ? 'Add anyway' : 'Create anyway',
+                    onProceed: run,
+                });
             } else {
-                commitCreate(state);
+                run();
             }
         } catch (e) {
             ANAS.warn('composer commit failed: ' + ANAS.errText(e));

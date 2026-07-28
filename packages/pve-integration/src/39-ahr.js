@@ -1597,38 +1597,68 @@
 
     // ---- expand / replace windows ------------------------------------------
 
-    // Render an expansion plan (POST /ahr/:name/expand/plan response — before →
-    // after capacity, the ordered step list, warnings verbatim). Coded to the
-    // documented shape; every field is optional-guarded.
-    function planHtml(plan, diskList) {
+    // Advisor for the expand wizard — the daemon's plan warnings VERBATIM as
+    // amber callouts, the SAME treatment as the create composer's advisor
+    // (story 11.16 parallel construction). No warnings → a green "looks good".
+    function advisorHtml(warnings) {
+        warnings = warnings || [];
+        var html = '<div style="' + SEC + '">' + enc(t('Advisor')) + '</div>';
+        var i;
+        if (!warnings.length) {
+            if (ANAS.gfx && typeof ANAS.gfx.callout === 'function') {
+                return html + ANAS.gfx.callout(enc(t('Layout looks good — every band is protected.')), { level: 'ok' });
+            }
+            return html + '<div style="color:var(--anas-ok);font-size:12px">✓ '
+                + enc(t('Layout looks good — every band is protected.')) + '</div>';
+        }
+        for (i = 0; i < warnings.length; i++) {
+            if (ANAS.gfx && typeof ANAS.gfx.callout === 'function') {
+                html += '<div style="margin-bottom:6px">'
+                    + ANAS.gfx.callout(enc(warnings[i]), { level: 'warn' }) + '</div>';
+            } else {
+                html += '<div style="color:var(--anas-warn);font-size:12px;margin:5px 0">⚠ '
+                    + enc(warnings[i]) + '</div>';
+            }
+        }
+        return html;
+    }
+
+    // Render a LIVE expansion plan (POST /ahr/:name/expand/plan response) with
+    // the SAME surfaces as the create composer (story 11.16): the resulting
+    // sliced-layout bars, the labelled capacity readout (plan.after via the
+    // shared ANAS.ahr.capacityRowsHtml — incl. the Unprotected (wasted) line),
+    // the advisor (warnings verbatim), the uniform ready/warn chip, and the
+    // ordered step list. Every field is optional-guarded. `diskList` is the
+    // post-expansion disk set for the band bars.
+    function planLiveHtml(plan, diskList) {
         var html = '';
-        // The resulting layout, drawn with the composer's banded disk bars
-        // (shared renderer — the same picture, before your eyes commit).
+        // The resulting layout, drawn with the composer's banded disk bars.
         if (plan && plan.bands && plan.bands.length && diskList && diskList.length
             && ANAS.ahr && typeof ANAS.ahr.bandBarsHtml === 'function') {
             html += '<div style="' + SEC + '">' + enc(t('Resulting layout')) + '</div>'
                 + ANAS.ahr.bandBarsHtml(plan.bands, diskList);
         }
+        // The capacity readout — plan.after rendered with the create composer's
+        // shared rows (Usable / Raw / Redundancy overhead / Unprotected wasted).
         var before = plan && plan.before;
         var after = plan && plan.after;
-        if (before && after) {
-            var gain = (Number(after.usableBytes) || 0) - (Number(before.usableBytes) || 0);
-            // Plan numbers are band math (estimates): the live result lands
-            // slightly lower after md metadata / LVM extent / btrfs overheads.
-            html += '<div style="' + SEC + ';margin-top:4px">' + enc(t('Capacity (estimated)')) + '</div>'
-                + capRow(t('Usable now'), fmtBytes(before.usableBytes))
-                + capRow(t('Usable after'), '~' + fmtBytes(after.usableBytes), true)
-                + capRow(t('Change'), (gain >= 0 ? '+~' : '−~') + fmtBytes(Math.abs(gain)))
-                + '<div style="color:var(--anas-muted);font-size:11px;margin-top:2px">'
+        if (after && ANAS.ahr && typeof ANAS.ahr.capacityRowsHtml === 'function') {
+            html += '<div style="' + SEC + '">' + enc(t('Capacity after (estimated)')) + '</div>'
+                + ANAS.ahr.capacityRowsHtml(after);
+            if (before) {
+                var gain = (Number(after.usableBytes) || 0) - (Number(before.usableBytes) || 0);
+                html += capRow(t('Change'), (gain >= 0 ? '+~' : '−~') + fmtBytes(Math.abs(gain)), true);
+            }
+            html += '<div style="color:var(--anas-muted);font-size:11px;margin-top:2px">'
                 + enc(t('Final sizes land slightly lower once metadata overheads are paid.'))
                 + '</div>';
             if (Number(after.pendingBytes) > 0) {
-                html += '<div style="margin-top:6px;color:var(--anas-warn);font-size:12px"><b>'
-                    + enc(fmtBytes(after.pendingBytes) + ' ' + t('stays pending (locked)'))
-                    + '</b> — ' + enc(t('add one more disk above the top boundary to unlock it.'))
+                html += '<div style="margin-top:6px;color:var(--anas-warn);font-size:12px">'
+                    + enc(t('Add one more disk above the top boundary to unlock the pending capacity.'))
                     + '</div>';
             }
         }
+        // Steps.
         var steps = (plan && plan.steps) || [];
         if (steps.length) {
             html += '<div style="' + SEC + '">' + enc(t('Steps')) + '</div><ol style="margin:0;padding-left:20px">';
@@ -1639,10 +1669,10 @@
             }
             html += '</ol>';
         }
-        var warns = (plan && plan.warnings) || [];
-        for (var w = 0; w < warns.length; w++) {
-            html += '<div style="color:var(--anas-warn);font-size:12px;margin:5px 0">⚠ '
-                + enc(warns[w]) + '</div>';
+        // Advisor (warnings verbatim) + the uniform ready/warn chip.
+        html += advisorHtml((plan && plan.warnings) || []);
+        if (ANAS.gfx && ANAS.gfx.warnGate) {
+            html += ANAS.gfx.warnGate.chip((plan && plan.warnings) || [], 'Ready to expand.');
         }
         // §6.3 fixed truths, always shown with a plan.
         html += '<div style="color:var(--anas-muted);font-size:11.5px;margin-top:10px">'
@@ -1687,30 +1717,178 @@
         return out;
     }
 
-    // Expansion wizard (§6.3, minimal): pick add-disks OR a replace pair, plan
-    // (dry-run, before → after + steps + warnings), then execute via the
-    // confirm gate. Degrades cleanly when the daemon lacks the routes (404).
+    // Expansion wizard (§6.3): pick add-disks OR a replace pair; the plan
+    // recomputes LIVE on every change (story 11.16 — the separate "Compute
+    // plan" button is gone, matching the create composer's recalc-on-drop),
+    // rendering the same sliced layout + capacity + advisor + chip. Execute
+    // then commits through the confirm gate. Degrades cleanly when the daemon
+    // lacks the routes (404).
     function openExpand(grid, node) {
         var pool = selectedPool(grid);
         if (!pool) {
             return;
         }
         var win = null;
-        var planBody = null;
         var formAvail = [];
         var formMembers = [];
         var addAssigned = {};   // diskId -> 'pool' for the drag add-bay
         var addDrag = null;     // the shared drag-select controller (add step)
+        var plan = null;        // last live plan response
+        var planBody = null;    // the request body the live plan was computed from
+        var planSeq = 0;        // sequence guard — drop stale live responses
+        var planTimer = null;   // debounce timer
 
         function bodyEl() {
             var p = win ? win.down('#ahrExpandBody') : null;
             return (p && p.getEl()) ? p.getEl().dom : null;
+        }
+        function execBtn() {
+            return win ? win.down('#ahrExpandExec') : null;
+        }
+
+        // Build the request body from the current selection, or null if it is
+        // incomplete. silent=true suppresses popups (the live scheduler path).
+        function buildBody(silent) {
+            var root = bodyEl();
+            if (!root) {
+                return null;
+            }
+            var mode = (checkedValues(root, 'ahrx-mode')[0]) || 'add';
+            if (mode === 'add') {
+                var add = addDrag ? addDrag.selectedInBay('pool') : [];
+                if (!add.length) {
+                    if (!silent) {
+                        ANAS.alertMsg('Expand', t('Drag at least one disk into the add bay.'));
+                    }
+                    return null;
+                }
+                return { addDisks: add };
+            }
+            var oldId = checkedValues(root, 'ahrx-old')[0];
+            var newId = checkedValues(root, 'ahrx-new')[0];
+            if (!oldId || !newId) {
+                if (!silent) {
+                    ANAS.alertMsg('Expand', t('Select the member to replace and its replacement.'));
+                }
+                return null;
+            }
+            return { replace: { oldDiskId: oldId, newDiskId: newId } };
+        }
+
+        // The post-expansion disk set for the band-bar picture: members ± the
+        // selected add/replace disks.
+        function planDiskList(body) {
+            var diskList = [];
+            var byId = {};
+            var di;
+            for (di = 0; di < formAvail.length; di++) {
+                byId[formAvail[di].id] = formAvail[di];
+            }
+            var oldId = body.replace ? body.replace.oldDiskId : null;
+            for (di = 0; di < formMembers.length; di++) {
+                if (formMembers[di].id !== oldId) {
+                    diskList.push(formMembers[di]);
+                }
+            }
+            var addIds = body.addDisks || (body.replace ? [body.replace.newDiskId] : []);
+            for (di = 0; di < addIds.length; di++) {
+                if (byId[addIds[di]]) {
+                    diskList.push(byId[addIds[di]]);
+                }
+            }
+            return diskList;
+        }
+
+        function renderPlan(note) {
+            var root = bodyEl();
+            var target = root ? root.querySelector('#ahrx-plan') : null;
+            if (!target) {
+                return;
+            }
+            if (note) {
+                target.innerHTML = '<div style="color:var(--anas-muted);font-size:12px;padding:12px 0;'
+                    + 'text-align:center">' + enc(note) + '</div>';
+                return;
+            }
+            if (!plan || !planBody) {
+                target.innerHTML = '<div style="color:var(--anas-muted);font-size:12px;padding:12px 0;'
+                    + 'text-align:center">'
+                    + enc(t('Drop disks (or pick a replacement) to preview the resulting layout.'))
+                    + '</div>';
+                return;
+            }
+            target.innerHTML = planLiveHtml(plan, planDiskList(planBody));
+        }
+
+        // Debounced live plan — the create composer's schedulePreview/runPreview
+        // pattern (250 ms + a sequence guard), fired on every add-drag / replace
+        // / mode change instead of a "Compute plan" button.
+        function schedulePlan() {
+            var exec = execBtn();
+            if (exec) {
+                exec.setDisabled(true);  // stale until a fresh plan lands
+            }
+            planBody = null;
+            if (planTimer) {
+                clearTimeout(planTimer);
+            }
+            planTimer = setTimeout(runPlan, 250);
+        }
+
+        function runPlan() {
+            var body = buildBody(true);
+            if (!body) {
+                plan = null;
+                planBody = null;
+                renderPlan();
+                var exec0 = execBtn();
+                if (exec0) {
+                    exec0.setDisabled(true);
+                }
+                return;
+            }
+            var seq = ++planSeq;
+            ANAS.api.post(node, '/ahr/' + encodeURIComponent(pool) + '/expand/plan', body)
+                .then(function (res) {
+                    if (seq !== planSeq) {
+                        return;
+                    }
+                    if (!win || win.destroyed || win.destroying) {
+                        return;
+                    }
+                    plan = (res && res.data) || null;
+                    planBody = plan ? body : null;
+                    renderPlan();
+                    var exec = execBtn();
+                    if (exec) {
+                        exec.setDisabled(!plan);
+                    }
+                }, function (err) {
+                    if (seq !== planSeq) {
+                        return;
+                    }
+                    if (!win || win.destroyed || win.destroying) {
+                        return;
+                    }
+                    plan = null;
+                    planBody = null;
+                    var exec = execBtn();
+                    if (exec) {
+                        exec.setDisabled(true);
+                    }
+                    var note = (err && err.status === 404)
+                        ? t('Expansion planning is not available in this build of the ANAS daemon yet.')
+                        : (t('Preview failed') + ': ' + ANAS.errText(err));
+                    renderPlan(note);
+                });
         }
 
         function renderForm(avail, members) {
             formAvail = avail || [];
             formMembers = members || [];
             addAssigned = {};
+            plan = null;
+            planBody = null;
             var html = '<div style="padding:12px;font-size:12.5px;color:var(--anas-ink)">'
                 + '<div style="margin-bottom:8px">'
                 + '<label style="margin-right:16px"><input type="radio" name="ahrx-mode" value="add" checked> '
@@ -1750,7 +1928,8 @@
             if (!root) {
                 return;
             }
-            // Mount the add-disks drag tray/bay (shared controller, 11.14).
+            // Mount the add-disks drag tray/bay (shared controller, 11.14). Every
+            // drop recomputes the plan live (schedulePlan) — no Plan button.
             if (ANAS.ahrComposer && typeof ANAS.ahrComposer.makeDragSelect === 'function') {
                 addDrag = ANAS.ahrComposer.makeDragSelect({
                     root: root,
@@ -1764,6 +1943,7 @@
                         return '<div style="flex:1;min-width:140px;color:var(--anas-muted);font-size:12px;'
                             + 'text-align:center;padding:14px 8px">' + enc(t('Drag disks here')) + '</div>';
                     },
+                    onChange: schedulePlan,
                 });
                 addDrag.render();
             }
@@ -1773,91 +1953,22 @@
                     var mode = (checkedValues(root, 'ahrx-mode')[0]) || 'add';
                     root.querySelector('#ahrx-add').style.display = mode === 'add' ? '' : 'none';
                     root.querySelector('#ahrx-replace').style.display = mode === 'replace' ? '' : 'none';
+                    schedulePlan();
                 });
             }
-        }
-
-        function buildBody() {
-            var root = bodyEl();
-            if (!root) {
-                return null;
+            // Replace-mode selection also recomputes live (radio picks).
+            var picks = root.querySelectorAll('input[name="ahrx-old"], input[name="ahrx-new"]');
+            for (var q = 0; q < picks.length; q++) {
+                picks[q].addEventListener('change', schedulePlan);
             }
-            var mode = (checkedValues(root, 'ahrx-mode')[0]) || 'add';
-            if (mode === 'add') {
-                var add = addDrag ? addDrag.selectedInBay('pool') : [];
-                if (!add.length) {
-                    ANAS.alertMsg('Expand', t('Drag at least one disk into the add bay.'));
-                    return null;
-                }
-                return { addDisks: add };
-            }
-            var oldId = checkedValues(root, 'ahrx-old')[0];
-            var newId = checkedValues(root, 'ahrx-new')[0];
-            if (!oldId || !newId) {
-                ANAS.alertMsg('Expand', t('Select the member to replace and its replacement.'));
-                return null;
-            }
-            return { replace: { oldDiskId: oldId, newDiskId: newId } };
-        }
-
-        function computePlan() {
-            var body = buildBody();
-            if (!body) {
-                return;
-            }
-            planBody = null;
-            ANAS.api.post(node, '/ahr/' + encodeURIComponent(pool) + '/expand/plan', body)
-                .then(function (res) {
-                    if (!win || win.destroyed || win.destroying) {
-                        return;
-                    }
-                    planBody = body;
-                    var root = bodyEl();
-                    var target = root ? root.querySelector('#ahrx-plan') : null;
-                    if (target) {
-                        // Post-expansion disk set for the band-bar picture:
-                        // members ± the selected add/replace disks.
-                        var diskList = [];
-                        var di;
-                        var byId = {};
-                        for (di = 0; di < formAvail.length; di++) {
-                            byId[formAvail[di].id] = formAvail[di];
-                        }
-                        var oldId = body.replace ? body.replace.oldDiskId : null;
-                        for (di = 0; di < formMembers.length; di++) {
-                            if (formMembers[di].id !== oldId) {
-                                diskList.push(formMembers[di]);
-                            }
-                        }
-                        var addIds = body.addDisks || (body.replace ? [body.replace.newDiskId] : []);
-                        for (di = 0; di < addIds.length; di++) {
-                            if (byId[addIds[di]]) {
-                                diskList.push(byId[addIds[di]]);
-                            }
-                        }
-                        target.innerHTML = planHtml(res && res.data, diskList);
-                    }
-                    var exec = win.down('#ahrExpandExec');
-                    if (exec) {
-                        exec.setDisabled(false);
-                    }
-                }, function (err) {
-                    if (apiMissing(err, t('Expansion planning'))) {
-                        return;
-                    }
-                    try {
-                        ANAS.alertMsg('Plan failed', ANAS.errText(err));
-                    } catch (e) {
-                        ANAS.warn('ahr plan failed: ' + ANAS.errText(err));
-                    }
-                });
+            renderPlan();
         }
 
         function execute() {
             if (!planBody) {
                 return;
             }
-            ANAS.confirmAndRun({
+            var opts = {
                 node: node,
                 method: 'post',
                 path: '/ahr/' + encodeURIComponent(pool) + '/expand',
@@ -1879,7 +1990,13 @@
                 onComplete: function () {
                     loadPools(grid, node);
                 },
-            });
+            };
+            // Story 11.16: fold any advisory warnings into the existing reshape
+            // confirm — amber section prepended, button reads "Expand anyway".
+            if (ANAS.gfx && ANAS.gfx.warnGate) {
+                ANAS.gfx.warnGate.applyToConfirm(opts, (plan && plan.warnings) || [], t('Expand anyway'));
+            }
+            ANAS.confirmAndRun(opts);
         }
 
         try {
@@ -1888,7 +2005,7 @@
                 title: t('Expand Hybrid RAID pool') + ': ' + pool,
                 modal: true,
                 width: 660,
-                height: 560,
+                height: 620,
                 layout: 'fit',
                 items: [{
                     xtype: 'panel',
@@ -1905,12 +2022,6 @@
                         },
                     },
                     {
-                        text: t('Compute plan'),
-                        itemId: 'ahrExpandPlan',
-                        cls: 'anas-btn-ahr-plan',
-                        handler: computePlan,
-                    },
-                    {
                         text: t('Execute expansion'),
                         itemId: 'ahrExpandExec',
                         cls: 'anas-btn-ahr-expand-exec',
@@ -1918,6 +2029,13 @@
                         handler: execute,
                     },
                 ],
+                listeners: {
+                    destroy: function () {
+                        if (planTimer) {
+                            clearTimeout(planTimer);
+                        }
+                    },
+                },
             });
         } catch (e) {
             ANAS.warn('ahr expand window failed: ' + ANAS.errText(e));

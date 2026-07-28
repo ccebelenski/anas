@@ -444,6 +444,26 @@
             + (emphasis ? 'font-weight:750' : 'font-weight:600') + '">' + enc(value) + '</span></div>';
     }
 
+    // The labelled AhrCapacity rows — never a bare number (§6.1): usable /
+    // raw / redundancy overhead / unprotected-wasted (+ pending when locked).
+    // Shared with the expand wizard (39-ahr.js renders plan.after with the
+    // SAME rows, story 11.16 parallel construction), so exported on ANAS.ahr.
+    function capacityRowsHtml(cap) {
+        if (!cap) {
+            return '';
+        }
+        var html = capRow(t('Usable'), fmtBytes(cap.usableBytes), true)
+            + capRow(t('Raw (selected disks)'), fmtBytes(cap.rawBytes))
+            + capRow(t('Redundancy overhead'), fmtBytes(cap.redundancyOverheadBytes))
+            + capRow(t('Unprotected (wasted)'), fmtBytes(cap.unprotectedWastedBytes));
+        if (Number(cap.pendingBytes) > 0) {
+            html += capRow(t('Pending (locked)'), fmtBytes(cap.pendingBytes));
+        }
+        return html;
+    }
+    ANAS.ahr = ANAS.ahr || {};
+    ANAS.ahr.capacityRowsHtml = capacityRowsHtml;
+
     // The labelled AhrCapacity readout — never a bare number (§6.1). Values
     // rendered in human units (TiB with two decimals at TB scale) by the
     // shared formatter, independent of whatever text the API warnings carry.
@@ -459,12 +479,12 @@
             html += '<div style="color:var(--anas-muted);font-size:12px">'
                 + enc(t('Select disks to see the layout and capacity.')) + '</div>';
         } else {
-            html += capRow(t('Usable'), fmtBytes(cap.usableBytes), true)
-                + capRow(t('Raw (selected disks)'), fmtBytes(cap.rawBytes))
-                + capRow(t('Redundancy overhead'), fmtBytes(cap.redundancyOverheadBytes))
-                + capRow(t('Unprotected (wasted)'), fmtBytes(cap.unprotectedWastedBytes));
-            if (Number(cap.pendingBytes) > 0) {
-                html += capRow(t('Pending (locked)'), fmtBytes(cap.pendingBytes));
+            html += capacityRowsHtml(cap);
+            // Story 11.16: the uniform ready/warn chip — only when the layout is
+            // committable (minDisksMet). Amber when the daemon returned warnings,
+            // green otherwise. Same chip as the ZFS composer + AHR expand.
+            if (p.minDisksMet === true && ANAS.gfx && ANAS.gfx.warnGate) {
+                html += ANAS.gfx.warnGate.chip(p.warnings || [], 'Ready to create.');
             }
         }
         el.innerHTML = html;
@@ -764,7 +784,7 @@
         if (state.mountpoint) {
             body.mountpoint = state.mountpoint;
         }
-        ANAS.confirmAndRun({
+        var opts = {
             node: state.node,
             method: 'post',
             path: '/ahr',
@@ -785,7 +805,16 @@
                     ANAS.ahr.reload(state.grid, state.node);
                 }
             },
-        });
+        };
+        // Story 11.16: fold any advisory warnings (the daemon's preview
+        // warnings) into the existing wipe-confirm — the amber section is
+        // prepended and the button reads "Create anyway". No warnings → the
+        // normal wipe-confirm shows unchanged.
+        if (ANAS.gfx && ANAS.gfx.warnGate) {
+            ANAS.gfx.warnGate.applyToConfirm(opts,
+                (state.preview && state.preview.warnings) || [], t('Create anyway'));
+        }
+        ANAS.confirmAndRun(opts);
     }
 
     // ---- data + window ------------------------------------------------------
