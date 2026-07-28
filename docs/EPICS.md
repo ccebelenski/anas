@@ -491,6 +491,8 @@ Story numbering is for identification only, not implementation order. Within eac
 
 13.14. [done] As a dev, I want dev and integration tests reworked for the native panels (PVE login → ANAS section → panels render real data; not-installed path; scrub flow through the ExtJS UI), so that the new chain is verified end to end.
 
+13.15. [done] As an operator, I want the injected bundle cache-busted (`?v=<content-hash>` stamped at install) so "install → see the change" is reliable and an upgrade never serves a stale cached bundle — the unversioned tag cost a real debug detour, and same-version test cuts guaranteed it. *(Token = first 12 hex of `sha256sum` of the generated `anas.js`; deterministic — changes iff content changes. The tpl step is now insert-OR-update: no tag → insert with `?v=`; tag present (any/no `?v=`) → re-stamp to the current hash; same content → same hash → no-op. pveproxy ignores the query string, so it is a pure browser cache-buster. Uninstall/re-apply and the apt hook all handle the suffix. Verified by `test/tpl-inject.test.sh`.)*
+
 ---
 
 ## Epic 15: `ANAS.gfx` — Graphical Visual Language (backlog)

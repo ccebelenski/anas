@@ -46,9 +46,12 @@ PROXY_SRC="${SCRIPT_DIR}/perl/AnasProxy.pm"
 PVEPROXY_RESTART_CMD="${PVEPROXY_RESTART_CMD:-}"
 
 # The exact <script> source path we inject; the grep presence-check keys on it.
+# It is a substring of the versioned tag (…anas.js?v=<hash>), so every presence
+# grep and the tpl-removal in uninstall.sh match with or without a ?v= suffix.
 SCRIPT_SRC="/pve2/js/anas.js"
-# The full line we insert, matching the template's 4-space indentation.
-SCRIPT_TAG='    <script type="text/javascript" src="/pve2/js/anas.js"></script>'
+# The full <script> line is built at install time (step 1), once the bundle's
+# content hash is known, as: …src="/pve2/js/anas.js?v=<hash>"… (story 13.15).
+SCRIPT_TAG=""
 
 # (Re)start pveproxy so a freshly-patched AnyEvent.pm (new dispatch + a fresh
 # require of AnasProxy.pm) takes effect. reset-failed first so a prior failed
@@ -188,7 +191,7 @@ install_anas_proxy() {
 #    anas.js is built by concatenating the per-view sources in src/ in lexical
 #    order (00-core, 10-api, 20-notinstalled, 30-pools, 40-disks, 50-dashboard,
 #    90-register). No build step — plain ES5 files joined verbatim.
-SRC_DIR="${SCRIPT_DIR}/src"
+SRC_DIR="${ANAS_SRC_DIR:-${SCRIPT_DIR}/src}"
 if [ ! -d "${SRC_DIR}" ]; then
   echo "anas: ERROR: source dir ${SRC_DIR} not found" >&2
   exit 1
@@ -248,11 +251,56 @@ install -D -m 0644 "${gen}" "${PVE_JS_DIR}/anas.js"
 rm -f "${gen}"
 echo "anas: installed ${PVE_JS_DIR}/anas.js (generated from src/)"
 
-# 2. Insert the <script> line after pvemanagerlib.js, idempotently.
+# Cache-bust token (story 13.15): a content hash of the just-installed bundle,
+# stamped onto the injected tag as ?v=<hash>. Deterministic — it changes iff the
+# bundle content changes — so the browser re-fetches exactly when it must and an
+# upgrade (or a same-version dev cut) can never serve a stale cached bundle. We
+# hash the installed file so the token reflects precisely what pveproxy serves;
+# pveproxy ignores the query string, so ?v=<hash> is a pure browser cache-buster.
+# sha256sum ships on Debian/PVE; the first 12 hex chars are ample and keep the
+# URL short. If it is somehow absent, fall back to the unversioned tag rather
+# than emit a broken ?v= (correctness over cache-busting).
+ANAS_JS_HASH=""
+if command -v sha256sum >/dev/null 2>&1; then
+  ANAS_JS_HASH="$(sha256sum "${PVE_JS_DIR}/anas.js" | cut -c1-12)"
+fi
+if [ -n "${ANAS_JS_HASH}" ]; then
+  SCRIPT_TAG="    <script type=\"text/javascript\" src=\"/pve2/js/anas.js?v=${ANAS_JS_HASH}\"></script>"
+  echo "anas: bundle cache-bust token v=${ANAS_JS_HASH}"
+else
+  SCRIPT_TAG="    <script type=\"text/javascript\" src=\"/pve2/js/anas.js\"></script>"
+  echo "anas: WARNING: sha256sum not found; injecting unversioned anas.js tag (no cache-bust)" >&2
+fi
+
+# 2. Insert-OR-UPDATE the <script> line after pvemanagerlib.js (story 13.15).
+#    - No anas.js tag yet  -> insert the versioned tag after pvemanagerlib.js.
+#    - An anas.js tag present (with any ?v=, or none) -> rewrite that line to the
+#      current versioned tag, so an upgrade (or a re-apply) re-stamps the hash.
+#    Same bundle content => same hash => the line is unchanged (a content-level
+#    no-op). Idempotency is preserved at the content level, not by skipping.
 if [ ! -f "${PVE_TPL}" ]; then
   echo "anas: WARNING: template ${PVE_TPL} not found; skipping tpl injection" >&2
 elif grep -qF "${SCRIPT_SRC}" "${PVE_TPL}"; then
-  echo "anas: tpl line already present in ${PVE_TPL} (nothing to do)"
+  # A tag is already present — re-stamp it. We match the anas.js *path* as a
+  # literal substring (awk index(), so the ?v= query and the '.' in the name are
+  # not regex-special) and replace the WHOLE line with the current versioned
+  # tag, whatever ?v= it carried. The tag text is passed verbatim via -v to
+  # preserve its leading whitespace; every other line passes through untouched.
+  tmp="$(mktemp)"
+  awk -v tag="${SCRIPT_TAG}" -v src="${SCRIPT_SRC}" '
+    index($0, src) { print tag; next }
+    { print }
+  ' "${PVE_TPL}" > "${tmp}"
+  # Defensive: only replace the real file if the tag still landed.
+  if grep -qF "${SCRIPT_SRC}" "${tmp}"; then
+    cat "${tmp}" > "${PVE_TPL}"
+    rm -f "${tmp}"
+    echo "anas: re-stamped script line in ${PVE_TPL} (?v=${ANAS_JS_HASH:-none})"
+  else
+    rm -f "${tmp}"
+    echo "anas: ERROR: failed to update script line in ${PVE_TPL}" >&2
+    exit 1
+  fi
 elif ! grep -q 'pvemanagerlib\.js' "${PVE_TPL}"; then
   echo "anas: ERROR: no pvemanagerlib.js line in ${PVE_TPL}; refusing to guess" >&2
   exit 1
@@ -271,7 +319,7 @@ else
   if grep -qF "${SCRIPT_SRC}" "${tmp}"; then
     cat "${tmp}" > "${PVE_TPL}"
     rm -f "${tmp}"
-    echo "anas: inserted script line into ${PVE_TPL}"
+    echo "anas: inserted script line into ${PVE_TPL} (?v=${ANAS_JS_HASH:-none})"
   else
     rm -f "${tmp}"
     echo "anas: ERROR: failed to insert script line into ${PVE_TPL}" >&2

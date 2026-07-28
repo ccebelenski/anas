@@ -37,11 +37,15 @@ restart_pveproxy() {
 SCRIPT_SRC="/pve2/js/anas.js"
 
 # 1. Remove our line from the template — and only our line. We match on the
-#    exact script source so no other line can be touched. Removing the whole
-#    line (including its newline) leaves the file byte-identical to pristine.
+#    anas.js source *path* as a substring so the whole tag line is removed
+#    regardless of any ?v=<content-hash> cache-bust suffix it carries (story
+#    13.15). Removing the whole line (including its newline) leaves the file
+#    byte-identical to pristine.
 if [ -f "${PVE_TPL}" ] && grep -qF "${SCRIPT_SRC}" "${PVE_TPL}"; then
   tmp="$(mktemp)"
   # \|...|d uses | as the delimiter so the /pve2/js/... slashes need no escaping.
+  # The pattern is unanchored, so a trailing ?v=<hash> is inside the matched line
+  # and deleted with it.
   sed "\|${SCRIPT_SRC}|d" "${PVE_TPL}" > "${tmp}"
   cat "${tmp}" > "${PVE_TPL}"
   rm -f "${tmp}"
