@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a problem with ANAS
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting — the versions and steps below save a round-trip.
+        Please check existing issues first in case it's already known.
+
+  - type: input
+    id: anas-version
+    attributes:
+      label: ANAS version
+      description: The release/tarball you installed (e.g. 0.2.0).
+      placeholder: "0.2.0"
+    validations:
+      required: true
+
+  - type: input
+    id: pve-version
+    attributes:
+      label: Proxmox VE version
+      description: Output of `pveversion`.
+      placeholder: "pve-manager/8.x.x (running kernel: 6.x.x)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs (optional)
+      description: Anything from `journalctl -u anasd` around the time. Rendered as code — no backticks needed.
+      render: shell
+    validations:
+      required: false

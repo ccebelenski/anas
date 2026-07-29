@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest a capability or improvement for ANAS
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Describing the underlying need — not just the solution —
+        helps find the best fit. Please check existing issues first in case it's already requested.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The underlying need or workflow — what's awkward or missing today.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like ANAS to do?
+      description: Your proposed capability or behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds (optional)
+      description: Anything you've tried or considered.
+    validations:
+      required: false
