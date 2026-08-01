@@ -7,6 +7,7 @@ set -euo pipefail
 
 PREFIX="${PREFIX:-/opt/anas}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+ANAS_ENV_FILE="${ANAS_ENV_FILE:-/etc/default/anas}"
 
 log()  { printf '==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -88,6 +89,13 @@ for tpl in anas-ahr-subject.txt.hbs anas-ahr-body.txt.hbs; do
 done
 if [ "${removed_template}" -eq 1 ]; then
   info "removed ANAS notification templates from ${PVE_TEMPLATE_DIR}"
+fi
+
+# 3d. Remove the ANAS-owned gateway env file (issue #2). ANAS-owned, so it is
+# safe to delete outright (unlike the surgical edits above).
+if [ -f "${ANAS_ENV_FILE}" ]; then
+  rm -f "${ANAS_ENV_FILE}"
+  info "removed ${ANAS_ENV_FILE}"
 fi
 
 # 4. Remove the install prefix.

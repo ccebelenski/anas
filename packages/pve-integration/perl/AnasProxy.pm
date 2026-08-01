@@ -25,8 +25,58 @@ use warnings;
 use HTTP::Response ();
 use HTTP::Status ();
 
-# Loopback gateway origin (plain HTTP). Overridable for tests.
-our $GATEWAY = 'http://127.0.0.1:3000';
+# Gateway loopback port. NODE-LOCAL, operator-configurable (issue #2): the
+# installer writes ANAS_PORT into /etc/default/anas so the gateway service and
+# this hook agree on one port per node. Absent/unset/malformed file => 3000, so
+# behaviour is byte-identical to before when the file is not present.
+our $DEFAULT_PORT = 3000;
+
+# Env file the installer writes (KEY=VALUE). Overridable for tests.
+our $ENV_FILE = '/etc/default/anas';
+
+# Pure: extract ANAS_PORT from env-file *contents* (a string), returning a valid
+# port (1-65535) or undef. Shell semantics — last assignment wins. Tolerates an
+# optional 'export ', surrounding quotes, an inline '#' comment and whitespace.
+# Unit-testable without touching the filesystem.
+sub _parse_port {
+    my ($contents) = @_;
+    return undef if !defined $contents;
+    my $port;
+    for my $line (split /\n/, $contents) {
+        next if !defined $line;
+        next if $line =~ /^\s*#/;                 # comment line
+        next if $line !~ /^\s*(?:export\s+)?ANAS_PORT\s*=\s*(.*)$/;
+        my $val = $1;
+        $val =~ s/\s+#.*$//;                       # strip inline comment
+        $val =~ s/^(['"])(.*)\1$/$2/;              # strip matching quotes
+        $val =~ s/^\s+//; $val =~ s/\s+$//;        # trim
+        next if $val !~ /^\d+$/;
+        next if $val < 1 || $val > 65535;
+        $port = $val + 0;                          # last valid assignment wins
+    }
+    return $port;
+}
+
+# Read $ENV_FILE (or an explicit path, for tests) and build the loopback gateway
+# origin. Any failure to obtain a valid port falls back to $DEFAULT_PORT, so a
+# missing/unreadable/malformed file yields the historical http://127.0.0.1:3000.
+sub _resolve_gateway {
+    my ($path) = @_;
+    $path = $ENV_FILE if !defined $path;
+    my $port = $DEFAULT_PORT;
+    if (defined $path && open(my $fh, '<', $path)) {
+        local $/;
+        my $contents = <$fh>;
+        close $fh;
+        my $p = _parse_port($contents);
+        $port = $p if defined $p;
+    }
+    return "http://127.0.0.1:$port";
+}
+
+# Loopback gateway origin (plain HTTP). Resolved once at load time from the env
+# file; still overridable directly for tests (see t/AnasProxy.t).
+our $GATEWAY = _resolve_gateway();
 
 # Upstream request timeout (seconds). ANAS mutations return 202 immediately and
 # reads are quick, so a short ceiling is safe and stops a worker from lingering

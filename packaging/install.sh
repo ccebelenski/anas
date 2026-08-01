@@ -24,7 +24,21 @@ UNIT_SRC="${SCRIPT_DIR}/systemd"
 PREFIX="${PREFIX:-/opt/anas}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 NODE_BIN="${NODE_BIN:-node}"
-HEALTH_PORT="${HEALTH_PORT:-3000}"
+
+# Gateway loopback port (issue #2). NODE-LOCAL, operator-configurable. The
+# resolved value is written to ANAS_ENV_FILE (read by both anas.service via
+# EnvironmentFile and AnasProxy.pm) and drives the post-install health check.
+# ss/systemctl are indirected so the resolution logic is unit-testable.
+ANAS_ENV_FILE="${ANAS_ENV_FILE:-/etc/default/anas}"
+DEFAULT_PORT=3000
+SS_BIN="${SS_BIN:-ss}"
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
+PORT_FLAG=""            # set by --port; explicit operator intent
+RESOLVED_PORT=""        # filled by resolve_port()
+# HEALTH_PORT is derived from the resolved port (retires the old standalone
+# HEALTH_PORT that was never plumbed into the service — issue #2). Still
+# overridable for tests, but normally set by resolve_port().
+HEALTH_PORT="${HEALTH_PORT:-}"
 
 # Flags.
 INSTALL_DEPS=0
@@ -50,6 +64,10 @@ Options:
                    via the NodeSource setup_22.x repository if absent/too old.
   --yes            Non-interactive; assume "yes" to prompts.
   --prefix DIR     Install location (default: /opt/anas).
+  --port N         Loopback port for the ANAS gateway (default: ${DEFAULT_PORT}).
+                   Written to ${ANAS_ENV_FILE}. Use this when another service
+                   already holds ${DEFAULT_PORT}. An existing configured port is
+                   preserved across upgrades unless --port is given.
   --force          Skip the ZFS >= ${MIN_ZFS} version gate (ANAS needs 'zpool -j').
   -h, --help       Show this help.
 EOF
@@ -63,6 +81,8 @@ while [ "$#" -gt 0 ]; do
     --force)        FORCE=1 ;;
     --prefix)       shift; [ "$#" -gt 0 ] || { err "--prefix needs an argument"; exit 2; }; PREFIX="$1" ;;
     --prefix=*)     PREFIX="${1#*=}" ;;
+    --port)         shift; [ "$#" -gt 0 ] || { err "--port needs an argument"; exit 2; }; PORT_FLAG="$1" ;;
+    --port=*)       PORT_FLAG="${1#*=}" ;;
     -h|--help)      usage; exit 0 ;;
     *) err "unknown option: $1"; usage >&2; exit 2 ;;
   esac
@@ -85,6 +105,126 @@ version_ge() {
   local lo
   lo="$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)"
   [ "${lo}" = "$2" ]
+}
+
+# =============================================================================
+# Gateway port resolution (issue #2) — NODE-LOCAL, unit-testable.
+# =============================================================================
+
+# valid_port N -> 0 if N is an integer in 1..65535.
+valid_port() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+# read_env_port FILE -> echo the ANAS_PORT value from an existing env file (last
+# valid assignment wins, shell semantics), or nothing. Tolerates 'export ',
+# quotes, inline '#' comments and whitespace.
+read_env_port() {
+  local f="$1" line val
+  [ -f "${f}" ] || return 0
+  line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?ANAS_PORT[[:space:]]*=' "${f}" 2>/dev/null | tail -n1)" || true
+  [ -n "${line}" ] || return 0
+  val="${line#*=}"
+  val="${val%%#*}"                      # strip inline comment
+  val="${val#\"}"; val="${val%\"}"      # strip surrounding double quotes
+  val="${val#\'}"; val="${val%\'}"      # strip surrounding single quotes
+  val="$(printf '%s' "${val}" | tr -d '[:space:]')"
+  valid_port "${val}" || return 0
+  printf '%s' "${val}"
+}
+
+# our_configured_port -> the port THIS node's ANAS currently uses: the env-file
+# value, or the legacy default 3000 when no env file exists yet (upgrades from a
+# pre-env-file install ran on 3000).
+our_configured_port() {
+  local p
+  p="$(read_env_port "${ANAS_ENV_FILE}")"
+  [ -n "${p}" ] && { printf '%s' "${p}"; return 0; }
+  printf '%s' "${DEFAULT_PORT}"
+}
+
+# port_listening N -> 0 if something is LISTENing on N (via SS_BIN). If ss is
+# unavailable we cannot tell -> treat as free (return 1), matching the prior
+# best-effort behaviour.
+port_listening() {
+  local p="$1"
+  command -v "${SS_BIN}" >/dev/null 2>&1 || return 1
+  "${SS_BIN}" -ltn 2>/dev/null | grep -qE "[:.]${p}[[:space:]]"
+}
+
+# ours_on_port N -> 0 if a listener on N belongs to OUR gateway (the anas
+# service is active AND N is our configured port). Used so an in-place upgrade's
+# own listener is never mistaken for a foreign conflict.
+ours_on_port() {
+  local p="$1"
+  "${SYSTEMCTL_BIN}" is-active --quiet anas 2>/dev/null || return 1
+  [ "${p}" = "$(our_configured_port)" ]
+}
+
+# Resolve the gateway port into RESOLVED_PORT, with precedence (issue #2):
+#   1. --port N wins; a FOREIGN listener on it is a hard error (respect intent).
+#   2. else an existing ${ANAS_ENV_FILE} value is preserved (upgrades never re-pick).
+#   3. else default ${DEFAULT_PORT}; on a fresh install, if it is FOREIGN-held,
+#      auto-scan upward to the first free port and log the choice loudly.
+resolve_port() {
+  local existing
+  existing="$(read_env_port "${ANAS_ENV_FILE}")"
+
+  # 1. Explicit operator intent.
+  if [ -n "${PORT_FLAG}" ]; then
+    if ! valid_port "${PORT_FLAG}"; then
+      err "--port '${PORT_FLAG}' is not a valid port (1-65535)"
+      exit 2
+    fi
+    if port_listening "${PORT_FLAG}" && ! ours_on_port "${PORT_FLAG}"; then
+      err "--port ${PORT_FLAG} is already in use by another listener on this node."
+      err "Refusing to silently choose a different port. Free :${PORT_FLAG} or pass a different --port."
+      exit 1
+    fi
+    RESOLVED_PORT="${PORT_FLAG}"
+    info "gateway port: ${RESOLVED_PORT} (from --port)"
+    return 0
+  fi
+
+  # 2. Preserve an already-configured port across upgrades.
+  if [ -n "${existing}" ]; then
+    RESOLVED_PORT="${existing}"
+    info "gateway port: ${RESOLVED_PORT} (preserved from ${ANAS_ENV_FILE})"
+    return 0
+  fi
+
+  # 3. Fresh install: default, auto-scanning past a foreign listener.
+  local candidate="${DEFAULT_PORT}" scan
+  if port_listening "${candidate}" && ! ours_on_port "${candidate}"; then
+    for scan in $(seq $((DEFAULT_PORT + 1)) $((DEFAULT_PORT + 99))); do
+      if ! port_listening "${scan}"; then candidate="${scan}"; break; fi
+    done
+    if port_listening "${candidate}"; then
+      err "port ${DEFAULT_PORT} is in use and no free port was found in ${DEFAULT_PORT}-$((DEFAULT_PORT + 99))."
+      err "Specify one explicitly with --port N."
+      exit 1
+    fi
+    warn "port ${DEFAULT_PORT} is already in use by another process on this node."
+    warn "ANAS gateway will use :${candidate} instead (written to ${ANAS_ENV_FILE})."
+  fi
+  RESOLVED_PORT="${candidate}"
+  info "gateway port: ${RESOLVED_PORT} (default)"
+}
+
+# Write the ANAS-owned env file consumed by anas.service (EnvironmentFile) and
+# AnasProxy.pm. Fresh each install from the resolved port (the file is ours).
+write_env_file() {
+  local port="$1"
+  install -d -m 0755 "$(dirname "${ANAS_ENV_FILE}")"
+  cat > "${ANAS_ENV_FILE}" <<EOF
+# ANAS gateway configuration — managed by install.sh (issue #2). KEY=VALUE.
+# Loopback port the anas gateway binds and pveproxy forwards /anas requests to.
+# NODE-LOCAL: each node has its own value; nothing here is cluster-wide.
+ANAS_PORT=${port}
+EOF
+  chmod 0644 "${ANAS_ENV_FILE}"
+  info "wrote ${ANAS_ENV_FILE} (ANAS_PORT=${port})"
 }
 
 # =============================================================================
@@ -222,15 +362,17 @@ phase0_preflight() {
   command -v smbd     >/dev/null 2>&1 || warn "smbd (samba) not found — SMB shares will not work until samba is installed."
   command -v exportfs >/dev/null 2>&1 || warn "exportfs (nfs-kernel-server) not found — NFS shares will not work until nfs-kernel-server is installed."
 
-  # Port already in use? On an in-place upgrade the listener is our own
-  # gateway (stopped in Phase 1 before the copy) — that's routine, not a
-  # warning; only a FOREIGN listener deserves one.
-  if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -qE "[:.]${HEALTH_PORT}[[:space:]]"; then
-    if systemctl is-active --quiet anas 2>/dev/null; then
-      info "existing ANAS gateway is listening on :${HEALTH_PORT} — it will be stopped and upgraded"
-    else
-      warn "something is already LISTENing on :${HEALTH_PORT} — the gateway may fail to bind."
-    fi
+  # Resolve the gateway port (issue #2) before anything binds. This owns the
+  # port-in-use logic: --port intent, preserving a configured port on upgrade,
+  # and auto-scanning past a foreign listener on a fresh install. May exit here
+  # (still read-only — nothing mutated) if --port collides with a foreign
+  # listener. HEALTH_PORT is derived from the result and drives the health check.
+  resolve_port
+  HEALTH_PORT="${RESOLVED_PORT}"
+  # On an in-place upgrade our own gateway may currently hold the port — that is
+  # routine (Phase 1 stops it before the copy), not a warning.
+  if port_listening "${HEALTH_PORT}" && ours_on_port "${HEALTH_PORT}"; then
+    info "existing ANAS gateway is listening on :${HEALTH_PORT} — it will be stopped and upgraded"
   fi
 
   # Abort if any hard failure. Nothing has been mutated up to this point.
@@ -291,6 +433,7 @@ SERVICES_STOPPED=0
 BACKUP_PATH=""
 PREFIX_INSTALLED=0
 HOOK_INSTALLED=0
+ENV_FILE_FRESH=0        # set iff we CREATED ${ANAS_ENV_FILE} (removed on rollback)
 UNITS_INSTALLED=0
 SERVICES_STARTED=0
 UI_INSTALLED=0
@@ -321,6 +464,11 @@ rollback() {
   if [ "${HOOK_INSTALLED}" -eq 1 ]; then
     info "removing md-event hook"
     rm -f "${HOOK_DEST}"
+  fi
+
+  if [ "${ENV_FILE_FRESH}" -eq 1 ]; then
+    info "removing freshly-written ${ANAS_ENV_FILE}"
+    rm -f "${ANAS_ENV_FILE}"
   fi
 
   if [ "${PREFIX_INSTALLED}" -eq 1 ]; then
@@ -425,6 +573,13 @@ phase1_install() {
     install -m 0644 "${SCRIPT_DIR}/templates/anas-ahr-body.txt.hbs" "${PVE_TEMPLATE_DIR}/"
   fi
 
+  # 2d. Write the ANAS-owned gateway env file (issue #2) BEFORE the service
+  # starts, so anas.service's EnvironmentFile and AnasProxy.pm both read the
+  # resolved port. Track whether we created it so rollback removes only a file
+  # we introduced (an upgrade's pre-existing file is left in place).
+  [ -e "${ANAS_ENV_FILE}" ] || ENV_FILE_FRESH=1
+  write_env_file "${RESOLVED_PORT}"
+
   # 3. Install units, enable, (re)start.
   info "installing systemd units"
   install_units
@@ -481,7 +636,11 @@ finish_success() {
 }
 
 # --- main -------------------------------------------------------------------
-phase0_preflight
-phase0b_install_deps
-phase1_install
-finish_success
+# ANAS_INSTALL_LIB_ONLY lets the test harness source this file to exercise the
+# pure helpers (port resolution, env-file writing) without running the installer.
+if [ "${ANAS_INSTALL_LIB_ONLY:-0}" != "1" ]; then
+  phase0_preflight
+  phase0b_install_deps
+  phase1_install
+  finish_success
+fi

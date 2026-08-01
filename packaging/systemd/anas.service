@@ -10,6 +10,11 @@ Type=simple
 # serves HTTPS. PVE marks PVEAuthCookie as Secure, so this HTTPS is required
 # for auth to work at all (story 10.4).
 ExecStart=/usr/bin/node /opt/anas/packages/gateway/dist/index.js
+# Operator-configurable loopback port (issue #2). install.sh writes ANAS_PORT
+# here; AnasProxy.pm reads the same file so pveproxy forwards to the right port.
+# The leading '-' makes it optional: an absent file leaves the gateway on its
+# built-in default 3000, byte-identical to the pre-env-file behaviour.
+EnvironmentFile=-/etc/default/anas
 Environment=ANASD_SOCKET=/run/anas/anasd.sock
 Environment=ANAS_AUTH_PROVIDER=pve
 Restart=on-failure

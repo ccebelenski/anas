@@ -763,7 +763,12 @@ Type=simple
 ExecStart=/usr/bin/node /path/to/anas/packages/gateway/dist/index.js
 User=root
 Environment=NODE_ENV=production
-Environment=ANAS_PORT=3000
+# Operator-configurable loopback port (issue #2). install.sh writes ANAS_PORT
+# into /etc/default/anas; the leading '-' makes it optional so an absent file
+# leaves the built-in default 3000. AnasProxy.pm reads the same file, so the
+# pveproxy /anas hop always targets the port the gateway actually binds. The
+# port is NODE-LOCAL — nothing here is cluster-wide.
+EnvironmentFile=-/etc/default/anas
 
 [Install]
 WantedBy=multi-user.target

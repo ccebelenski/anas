@@ -13,8 +13,74 @@ use lib "$FindBin::Bin/..";
 use Test::More;
 use HTTP::Headers ();
 use URI ();
+use File::Temp ();
 
 require_ok('AnasProxy.pm');
+
+# --- _parse_port: pull ANAS_PORT out of env-file contents (issue #2) --------
+{
+    is(AnasProxy::_parse_port("ANAS_PORT=3001\n"), 3001,
+        'plain KEY=VALUE');
+    is(AnasProxy::_parse_port("ANAS_PORT=3001"), 3001,
+        'no trailing newline');
+    is(AnasProxy::_parse_port("export ANAS_PORT=3002\n"), 3002,
+        "'export ' prefix tolerated");
+    is(AnasProxy::_parse_port(qq{ANAS_PORT="3003"\n}), 3003,
+        'double-quoted value');
+    is(AnasProxy::_parse_port("ANAS_PORT='3004'\n"), 3004,
+        'single-quoted value');
+    is(AnasProxy::_parse_port("ANAS_PORT=3005  # the port\n"), 3005,
+        'inline comment stripped');
+    is(AnasProxy::_parse_port("  ANAS_PORT = 3006 \n"), 3006,
+        'surrounding whitespace tolerated');
+    is(AnasProxy::_parse_port("ANAS_PORT=3000\nANAS_PORT=3007\n"), 3007,
+        'last valid assignment wins (shell semantics)');
+    is(AnasProxy::_parse_port("# ANAS_PORT=9999\nANAS_PORT=3008\n"), 3008,
+        'commented-out line ignored');
+
+    is(AnasProxy::_parse_port("OTHER=1\n"), undef,
+        'no ANAS_PORT -> undef');
+    is(AnasProxy::_parse_port(""), undef,
+        'empty contents -> undef');
+    is(AnasProxy::_parse_port(undef), undef,
+        'undef contents -> undef');
+    is(AnasProxy::_parse_port("ANAS_PORT=abc\n"), undef,
+        'non-numeric value -> undef');
+    is(AnasProxy::_parse_port("ANAS_PORT=0\n"), undef,
+        'port 0 out of range -> undef');
+    is(AnasProxy::_parse_port("ANAS_PORT=70000\n"), undef,
+        'port > 65535 out of range -> undef');
+    is(AnasProxy::_parse_port("ANAS_PORT=\n"), undef,
+        'empty value -> undef');
+}
+
+# --- _resolve_gateway: env file -> loopback origin, 3000 fallback -----------
+{
+    my $dir = File::Temp->newdir;
+    my $good = "$dir/good";
+    open(my $g, '>', $good) or die $!;
+    print $g "ANAS_PORT=3210\n";
+    close $g;
+    is(AnasProxy::_resolve_gateway($good), 'http://127.0.0.1:3210',
+        'reads the configured port from the env file');
+
+    my $bad = "$dir/bad";
+    open(my $b, '>', $bad) or die $!;
+    print $b "ANAS_PORT=nonsense\n";
+    close $b;
+    is(AnasProxy::_resolve_gateway($bad), 'http://127.0.0.1:3000',
+        'malformed value falls back to 3000');
+
+    my $missingkey = "$dir/missingkey";
+    open(my $m, '>', $missingkey) or die $!;
+    print $m "SOMETHING_ELSE=1\n";
+    close $m;
+    is(AnasProxy::_resolve_gateway($missingkey), 'http://127.0.0.1:3000',
+        'missing ANAS_PORT falls back to 3000');
+
+    is(AnasProxy::_resolve_gateway("$dir/does-not-exist"), 'http://127.0.0.1:3000',
+        'absent file falls back to 3000 (byte-identical to pre-issue-#2)');
+}
 
 # --- _target_url: /anas prefix stripping + query preservation --------------
 {
