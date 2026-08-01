@@ -6,6 +6,7 @@ import { parseByIdToKernel, parseDiskByIdListing, wholeDiskKernel } from '../par
 import { LSBLK_ARGS, parseLsblk } from '../parsers/lsblk.js'
 import { parseSmartctl } from '../parsers/smartctl.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
+import { readAhrPools } from '../services/ahr-topology.js'
 
 const BY_ID_PATH_RE = /^\/dev\/disk\/by-id\/(.+)$/
 const KERNEL_PATH_RE = /^\/dev\/([a-z0-9]+)$/
@@ -58,6 +59,33 @@ export function resolveLeafKernel(
   return null
 }
 
+/** AHR context for a member disk, keyed by whole-disk kernel name. */
+interface AhrDiskInfo {
+  /** The AHR pool this disk belongs to. */
+  pool: string
+  /** Band-array label — the AHR parallel to a ZFS vdev name (see Disk.ahrArray). */
+  array: string
+}
+
+/**
+ * The `Disk.ahrArray` band label for one AHR member disk: a single-band disk
+ * reads "r1", a disk spanning bands reads the range "r1-r3", and a hot spare
+ * (which slices every band but carries no active membership) reads "spare".
+ * Bands are contiguous from the bottom up by AHR construction (§2.6), so a
+ * first→last range is faithful.
+ */
+export function ahrBandLabel(bands: number[], role: 'member' | 'spare'): string {
+  if (role === 'spare')
+    return 'spare'
+  const unique = [...new Set(bands)]
+  if (unique.length === 0)
+    return 'AHR'
+  if (unique.length === 1)
+    return `r${unique[0]}`
+  // Only the span matters for the label; take min/max directly (no sort).
+  return `r${Math.min(...unique)}-r${Math.max(...unique)}`
+}
+
 /** ZFS context for a pool-member disk, keyed by whole-disk kernel name. */
 interface PoolDiskInfo {
   pool: string
@@ -104,10 +132,15 @@ export async function collectDisks(
   executor: CommandExecutor,
   diskIdentityCache: DiskIdentityCache,
 ): Promise<Disk[]> {
-  const [lsblkResult, byIdResult, statusResult] = await Promise.all([
+  const [lsblkResult, byIdResult, statusResult, ahrPools] = await Promise.all([
     executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
     executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
     executor.exec('/usr/sbin/zpool', ['status', '-jv']),
+    // Single-source AHR membership from the topology reader (never re-parse
+    // mdstat here). Fail-soft: an AHR read error (or md absent) yields no AHR
+    // membership and disks fall through to their existing status — the disks
+    // endpoint must never crash because AHR is unreadable.
+    readAhrPools(executor).catch(() => []),
   ])
 
   const byIdMap = parseDiskByIdListing(byIdResult.stdout)
@@ -153,6 +186,21 @@ export async function collectDisks(
   for (const [kernel, info] of poolInfo)
     poolDisks.set(kernel, info.pool)
 
+  // AHR membership per disk, keyed by the SAME whole-disk kernel name the
+  // disk↔pool join uses (d.name). readAhrPools reports disks by their by-id;
+  // canonicalize each to its kernel via the complete by-id → kernel map so both
+  // AHR and physical disks agree on one identity (GT-2). A band member lives on
+  // a partition, but AhrDisk already resolves to the whole disk + its band
+  // slices — we read the bands straight off it, no partition re-parsing.
+  const ahrInfo = new Map<string, AhrDiskInfo>()
+  for (const pool of ahrPools) {
+    for (const disk of pool.disks) {
+      const kernel = byIdToKernel.get(disk.id) ?? disk.id
+      const bands = disk.partitions.map(p => p.band)
+      ahrInfo.set(kernel, { pool: pool.name, array: ahrBandLabel(bands, disk.role) })
+    }
+  }
+
   const disks = parseLsblk(lsblkResult.stdout, byIdMap, poolDisks)
 
   // Lazy-load identity cache for all disks in parallel
@@ -172,6 +220,15 @@ export async function collectDisks(
           zfsErrors: { read: info.read, write: info.write, checksum: info.checksum },
         }
       : { vdevName: null, vdevRole: null, zfsErrors: null }
+    // AHR membership (never a ZFS pool member at the same time — ZFS wins if,
+    // impossibly, both claim a disk). An AHR member is 'ahr_member' + its pool
+    // + band label, parallel to how a ZFS member becomes 'pool_member'. Fusing
+    // AHR array error state into healthStatus is OUT of scope here (a separate
+    // parity item), so healthStatus stays SMART-derived for AHR members.
+    const ahr = info ? undefined : ahrInfo.get(d.name)
+    const ahrContext = ahr
+      ? { status: 'ahr_member' as const, poolName: ahr.pool, ahrArray: ahr.array }
+      : {}
     return {
       ...d,
       modelFamily: identity ? identity.modelFamily : null,
@@ -179,6 +236,7 @@ export async function collectDisks(
       revision: identity?.firmwareVersion ?? d.revision,
       smartHealthy,
       ...zfsContext,
+      ...ahrContext,
       healthStatus: computeHealth(smartHealthy, info),
     }
   })

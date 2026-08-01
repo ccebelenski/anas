@@ -8,6 +8,11 @@ import { VdevRole } from './zfs.js'
 export const DiskUsageStatus = z.enum([
   'available',
   'pool_member',
+  // AHR (ANAS Hybrid RAID / mdadm-backed) member — a distinct, honest value:
+  // AHR membership is NOT ZFS pool membership (different tech, visible
+  // divergence). Like `pool_member`, it means the disk is IN USE — never
+  // offered as available.
+  'ahr_member',
   'system',
   'other',
 ])
@@ -77,10 +82,17 @@ export const Disk = z.object({
   smartHealthy: z.boolean().nullable(),
   /** Current usage status */
   status: DiskUsageStatus,
-  /** If pool_member, which pool */
+  /** If pool_member, the ZFS pool; if ahr_member, the AHR pool this disk is in */
   poolName: z.string().nullable(),
   /** If pool_member, the vdev this disk belongs to, e.g. "mirror-0" */
   vdevName: z.string().nullable(),
+  /**
+   * If ahr_member, the band-array label this disk participates in — the AHR
+   * parallel to a ZFS member's `vdevName`. A single-band disk reads "r1"; a
+   * disk spanning bands reads a range like "r1-r3"; a hot spare reads "spare".
+   * Null for every non-AHR disk (kept off the ZFS-documented `vdevName`).
+   */
+  ahrArray: z.string().nullable(),
   /** If pool_member, the vdev's role (data/log/cache/spare/special/dedup) */
   vdevRole: VdevRole.nullable(),
   /** Live ZFS error counts for this disk (null unless a pool member) */

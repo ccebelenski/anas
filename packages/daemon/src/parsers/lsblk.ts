@@ -100,6 +100,7 @@ export function parseLsblk(
         smartHealthy: null, // enriched by DiskIdentityCache
         status,
         poolName,
+        ahrArray: null, // enriched from AHR topology in the disks route
         vdevName: null, // enriched from zpool status in the disks route
         vdevRole: null, // enriched from zpool status in the disks route
         zfsErrors: null, // enriched from zpool status in the disks route

@@ -18,10 +18,12 @@
  *
  * GROUPING (story 3.20): the grid is grouped by a computed `groupKey` derived
  * from each disk's pool → vdev association, so a large fleet stays scannable.
- * Pool members group under "<pool> / <vdev>"; disks in no pool group by their
- * usage status — "Available" (genuinely blank), "System" (boot/OS), or "Other"
- * (in use / partitioned) — so a boot disk never shows under an Available
- * heading. This is pure ExtJS grid grouping (a
+ * ZFS pool members group under "<pool> / <vdev>"; AHR (ANAS Hybrid RAID)
+ * members group under "<pool> / <array>" (issue #3 — the same grouping shape,
+ * a visible/honest divergence since AHR is not ZFS); disks in no pool group by
+ * their usage status — "Available" (genuinely blank), "System" (boot/OS), or
+ * "Other" (in use / partitioned) — so a boot disk never shows under an
+ * Available heading. This is pure ExtJS grid grouping (a
  * `grouping` feature on a groupField), NOT a hand-rolled tree, and it degrades
  * to an ungrouped grid if the grouping feature cannot be built. Test hook on
  * the grid: `anas-grid-disks-grouped` (alongside the existing `anas-grid-disks`).
@@ -100,6 +102,16 @@
                 if (pool) {
                     var vdev = rec.get('vdevName') || rec.get('vdevRole') || '';
                     return vdev ? (pool + ' / ' + vdev) : pool;
+                }
+            }
+            // AHR members group under "<pool> / <array>", parallel to the ZFS
+            // "<pool> / <vdev>" branch above (AHR is not ZFS — a visible, honest
+            // divergence, but the grouping shape is the same).
+            if (status === 'ahr_member') {
+                var ahrPool = rec.get('poolName');
+                if (ahrPool) {
+                    var arr = rec.get('ahrArray') || '';
+                    return arr ? (ahrPool + ' / ' + arr) : ahrPool;
                 }
             }
             switch (status) {
@@ -275,6 +287,16 @@
                 parts.push(t(ROLE_LABELS[d.vdevRole] || d.vdevRole));
             }
             return enc(parts.join(' / '));
+        }
+        // AHR member: "pool / array" — the AHR parallel to the ZFS pool/vdev
+        // rendering above (never "Other").
+        if (d.status === 'ahr_member') {
+            var ahrParts = [];
+            ahrParts.push(d.poolName || '?');
+            if (d.ahrArray) {
+                ahrParts.push(d.ahrArray);
+            }
+            return enc(ahrParts.join(' / '));
         }
         switch (d.status) {
             case 'available':
@@ -546,7 +568,7 @@
             fields: [
                 'id', 'name', 'path', 'model', 'modelFamily', 'serial',
                 'transport', 'formFactor', 'status',
-                'poolName', 'vdevName', 'vdevRole', 'healthStatus',
+                'poolName', 'vdevName', 'vdevRole', 'ahrArray', 'healthStatus',
                 { name: 'size', type: 'number' },
                 { name: 'rotational', type: 'boolean' },
                 { name: 'smartHealthy' },
