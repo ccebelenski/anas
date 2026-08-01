@@ -130,6 +130,21 @@ separate origin and **no extra certificate to accept** — if the Proxmox web UI
 loads, ANAS does. See [`packaging/README.md`](packaging/README.md) for flags
 and uninstall.
 
+### Gateway port
+
+The gateway binds a loopback port (default **3000**) that only pveproxy talks
+to; it is never exposed and needs no certificate. If something else on the node
+already listens on 3000, pass another port:
+
+```sh
+sudo ./install.sh --port 3001
+```
+
+On a fresh install the installer auto-picks the next free port if 3000 is taken.
+The choice is written to `/etc/default/anas` and preserved across upgrades unless
+you pass `--port` again. It is per-node — nodes in a cluster need not agree,
+since cross-node traffic goes through each node's `:8006`.
+
 ## Building from source
 
 ```sh

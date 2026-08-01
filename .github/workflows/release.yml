@@ -47,7 +47,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          NOTES="docs/release-notes/${VERSION}.md"
+          # This repo commits direct to main (no PRs), so `--generate-notes`
+          # yields EMPTY notes (it summarizes merged PRs). Notes are hand-written
+          # per release and committed to the tagged commit; refuse to publish
+          # without them so the pipeline can never ship an empty release again.
+          if [ ! -f "${NOTES}" ]; then
+            echo "ERROR: release notes ${NOTES} not found in the tagged commit — refusing to publish." >&2
+            echo "Add hand-written notes at ${NOTES} and re-tag." >&2
+            exit 1
+          fi
           gh release create "${GITHUB_REF_NAME}" \
             "dist-release/anas-${VERSION}.tar.gz" \
             --title "ANAS ${VERSION}" \
-            --generate-notes
+            --notes-file "${NOTES}"
