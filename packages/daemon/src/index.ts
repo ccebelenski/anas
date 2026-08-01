@@ -1,4 +1,6 @@
 import type { CommandExecutor } from './executor/types.js'
+import type { JobQueue } from './jobs/queue.js'
+import type { DiskIdentityCache } from './services/disk-identity-cache.js'
 import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
@@ -44,16 +46,22 @@ async function main() {
     }
     server.log.info(`anasd listening on ${SOCKET_PATH}${MOCK ? ' (mock mode)' : ''}`)
 
-    // AHR boot scan (AHR-DESIGN §5.1/§8, GT-8): recover inactive-assembled
-    // arrays via the verified ladder, flip orphaned 'running' expansion
-    // intents to 'halted' (operator must Resume), and re-attach observation of
-    // kernel-owned reshapes. Non-blocking; failures are logged, never fatal.
-    // Skipped in mock mode — there is no real md state to recover.
+    // AHR boot scan (AHR-DESIGN §5.1/§5.3/§8, GT-8): recover inactive-assembled
+    // arrays via the verified ladder; RE-ATTACH to an orphaned 'running'
+    // expansion when the array is healthy (a reshape interrupted only by a
+    // daemon restart/upgrade — the kernel reshape never stopped, issue #1), else
+    // flip it to 'halted' (operator must Resume — degraded/GT-8 cases); and
+    // re-attach observation of kernel-owned reshapes. Non-blocking; failures are
+    // logged, never fatal. Skipped in mock mode — there is no real md state.
     if (!MOCK) {
-      const executor = (server as unknown as { executor: CommandExecutor }).executor
-      void ahrBootScan(executor).then((report) => {
-        if (report.recovered.length || report.haltedIntents.length || report.observedReshapes.length)
-          server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
+      const decorated = server as unknown as { executor: CommandExecutor, jobQueue: JobQueue, diskIdentityCache: DiskIdentityCache, ahrIntentDir: string }
+      void ahrBootScan(decorated.executor, {
+        intentDir: decorated.ahrIntentDir,
+        jobQueue: decorated.jobQueue,
+        diskCache: decorated.diskIdentityCache,
+      }).then((report) => {
+        if (report.recovered.length || report.haltedIntents.length || report.reattached.length || report.observedReshapes.length)
+          server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
       }).catch((err) => {
         server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
       })

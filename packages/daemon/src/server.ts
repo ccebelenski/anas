@@ -513,6 +513,11 @@ export function createServer(opts?: ServerOptions) {
 
   server.decorate('jobQueue', jobQueue)
   server.decorate('executor', executor)
+  // Exposed for the AHR daemon-start boot scan (index.ts): the shared §5.3
+  // resume core needs the disk-identity cache + the intent store dir to
+  // re-attach an interrupted expansion after a restart (issue #1).
+  server.decorate('diskIdentityCache', diskIdentityCache)
+  server.decorate('ahrIntentDir', ahrIntentDir)
 
   return server
 }
