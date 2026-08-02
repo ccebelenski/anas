@@ -4,7 +4,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { AhrExpansionPlan, AhrLayoutDisk, AhrReplacement } from './ahr-layout.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { collectDisks } from '../routes/disks.js'
-import { executeExpansion, executeReplace, projectExistingBands } from './ahr-expand-exec.js'
+import { executeExpansion, executeReplace, projectExistingBands, syncCompletionSteps, syncingAhrBands } from './ahr-expand-exec.js'
 import { AhrIntentConflictError, writeIntent } from './ahr-intent.js'
 import { AhrPlanError, planExpansion } from './ahr-layout.js'
 import { spareCoverageWarnings } from './ahr-spare.js'
@@ -106,6 +106,35 @@ export function computePlan(pool: AhrPool, approved: AhrLayoutDisk[], replaced: 
   return { plan, before, after }
 }
 
+/**
+ * Complete a RESUMED plan with the work an in-flight sync still owes
+ * (issue #4). §2.3 planning is pure and state-free: it compares the approved
+ * disk set against the pool's CURRENT topology, so a resume entered
+ * mid-reshape sees the new disk already an md member and plans no array-grow
+ * — and therefore no `reshape-wait` and no size-dependent tail either. The
+ * remaining work is nonetheless real: md publishes the grown array size only
+ * when the reshape ENDS, so the pv/lv/fs grow is still owed. Naming those
+ * steps in the plan is what gives the operator reshape progress (percent /
+ * speed / ETA) across the whole multi-day wait, exactly like a fresh expand.
+ *
+ * Bands the plan ALREADY waits on are left alone (their tail is planned too).
+ * The executor enforces the same invariant independently — this layer is the
+ * belt, that one is the braces.
+ */
+async function withInFlightSyncSteps(executor: CommandExecutor, pool: AhrPool, bundle: PlanBundle): Promise<PlanBundle> {
+  const planned = new Set(bundle.plan.steps.filter(s => s.kind === 'reshape-wait').map(s => s.target))
+  const bands = (await syncingAhrBands(executor, pool.name))
+    .filter(band => !planned.has(`md/${pool.name}-r${band}`))
+  if (bands.length === 0)
+    return bundle
+  const base = bundle.plan.steps.length
+  const steps = [
+    ...bundle.plan.steps,
+    ...syncCompletionSteps(pool.name, pool.lv.name, bands).map((s, i) => ({ ...s, index: base + i })),
+  ]
+  return { ...bundle, plan: { ...bundle.plan, steps } }
+}
+
 /** Collaborators the driving job needs (shared by every expansion caller). */
 export interface ExpansionDeps {
   executor: CommandExecutor
@@ -196,6 +225,17 @@ export async function resumeExpansion(input: ResumeExpansionInput): Promise<Resu
     if (err instanceof AhrPlanError)
       return { ok: false, reason: 'plan-error', message: err.message }
     throw err
+  }
+  try {
+    // Complete the recomputed plan with whatever an in-flight sync still owes
+    // (issue #4) — a mid-reshape resume otherwise plans NOTHING at all.
+    bundle = await withInFlightSyncSteps(executor, pool, bundle)
+  }
+  catch (err) {
+    // md's sync state could not be read, so we cannot tell whether a reshape
+    // is in flight. Fail closed (§5.3): refuse rather than drive a plan that
+    // might declare itself complete mid-reshape.
+    return { ok: false, reason: 'plan-error', message: `could not read md sync state: ${err instanceof Error ? err.message : String(err)}` }
   }
 
   const running: AhrExpansionIntent = { ...intent, state: 'running' }

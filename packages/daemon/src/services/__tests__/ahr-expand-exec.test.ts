@@ -2,6 +2,7 @@ import type { AhrCapacity, AhrExpansionIntent, AhrExpansionStep, AhrPool, AhrPre
 import type { AhrExpansionPlan } from '../ahr-layout.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,7 +10,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { diskLsblkArgs, executeExpansion, executeReadd, executeReplace, projectExistingBands } from '../ahr-expand-exec.js'
-import { readIntent } from '../ahr-intent.js'
+import { readIntent, writeIntent } from '../ahr-intent.js'
 import { planExpansion } from '../ahr-layout.js'
 
 const GIB = 1024 ** 3
@@ -260,6 +261,28 @@ function mutatingCalls(executor: MockExecutor): { command: string, args: string[
 function notifyCalls(executor: MockExecutor, severity: string): { command: string, args: string[] }[] {
   return executor.calls.filter(c => c.command === PERL && c.args[2] === severity)
 }
+
+// LVM/btrfs report shapes for the tail steps (and, since issue #4, for the
+// delivered-capacity read that completion reports).
+function pvsJson(rows: { name: string, vg: string | null, size: number }[]): string {
+  return JSON.stringify({ report: [{ pv: rows.map(r => ({ pv_name: r.name, vg_name: r.vg ?? '', pv_size: String(r.size), pv_free: '0' })) }] })
+}
+function vgsJson(free: number): string {
+  return JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '2', lv_count: '1', vg_size: String(5 * GIB), vg_free: String(free) }] }] })
+}
+function lvsJson(size: number): string {
+  return JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-ao----', lv_size: String(size) }] }] })
+}
+function btrfsUsageJson(deviceSize: number): string {
+  return [
+    'Overall:',
+    `    Device size:\t\t${deviceSize}`,
+    '    Used:\t\t1024',
+    `    Free (estimated):\t\t${deviceSize - 4096}\t(min: ${deviceSize - 8192})`,
+    '',
+  ].join('\n')
+}
+const R1_BYTES = 4190208 * 1024
 
 const B1 = pband(1, 0, 2 * GIB, 3, 'raid5')
 const B1_GROWN = pband(1, 0, 2 * GIB, 4, 'raid5')
@@ -527,14 +550,6 @@ unused devices: <none>
   })
 
   describe('LVM + filesystem tail', () => {
-    const pvsJson = (rows: { name: string, vg: string | null, size: number }[]) =>
-      JSON.stringify({ report: [{ pv: rows.map(r => ({ pv_name: r.name, vg_name: r.vg ?? '', pv_size: String(r.size), pv_free: '0' })) }] })
-    const vgsJson = (free: number) =>
-      JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '2', lv_count: '1', vg_size: String(5 * GIB), vg_free: String(free) }] }] })
-    const lvsJson = (size: number) =>
-      JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-ao----', lv_size: String(size) }] }] })
-    const R1_BYTES = 4190208 * 1024
-
     it('pv-create skips an existing PV and creates a missing one', async () => {
       const withR3 = () => {
         const executor = world({ mdstat: MDSTAT_WITH_R3 })
@@ -689,6 +704,212 @@ unused devices: <none>
       const info = notifyCalls(executor, 'info')
       assert.equal(info.length, 1)
       assert.match(info[0].args[4], /4 GiB → 6 GiB/)
+    })
+  })
+
+  // -------------------------------------------------------------------------
+  // Issue #4: resuming an expansion while the mdadm reshape is still in flight
+  // completed the job in 152 ms on a real 4→5 × 22 TB pool, cleared the intent
+  // and reported the PLANNED capacity — so when the kernel finished four days
+  // later nothing ran pvresize → lvextend → btrfs resize, and the pool's usable
+  // capacity silently never grew. These drive the REAL executor against a
+  // reshaping mdstat; a stubbed job queue cannot catch this class.
+  // -------------------------------------------------------------------------
+  describe('completion invariant — never complete mid-sync (issue #4)', () => {
+    // md publishes the GROWN size only when the reshape ENDS (4 members here,
+    // 3 data → 6285312 blocks, up from 4190208).
+    const MDSTAT_GROWN_IDLE = `Personalities : [raid1] [raid5]
+md126 : active raid1 sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md127 : active raid5 sdt1[3] sds1[2] sdr1[1] sdq1[0]
+      6285312 blocks super 1.2 level 5, 512k chunk, algorithm 2 [4/4] [UUUU]
+
+unused devices: <none>
+`
+    const GROWN_BYTES = 6285312 * 1024
+
+    /** The LVM/fs tail's fixtures: PV still at the OLD array size. */
+    function withTailFixtures(executor: MockExecutor, opts: { lvBytes: number, pvs?: { name: string, vg: string | null, size: number }[] }): MockExecutor {
+      executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: pvsJson(opts.pvs ?? [{ name: '/dev/md127', vg: 'tank', size: R1_BYTES }]), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/pvresize', result: { stdout: '', stderr: '', exitCode: 0 } })
+      // lv-extend sees free space; fs-grow (next read) must see it consumed.
+      executor.addFixture({ command: '/usr/sbin/vgs', results: [
+        { stdout: vgsJson(GIB), stderr: '', exitCode: 0 },
+        { stdout: vgsJson(0), stderr: '', exitCode: 0 },
+      ] })
+      executor.addFixture({ command: '/usr/sbin/lvextend', result: { stdout: '', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: lvsJson(opts.lvBytes), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/findmnt', result: { stdout: JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }] }), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: btrfsUsageJson(3 * GIB), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+      return executor
+    }
+
+    it('THE BUG: an empty resume plan holds for the in-flight reshape, then delivers the tail', async () => {
+      // mdstat reads: 1 invariant check, 2 reshape-wait resolve, 3 first poll
+      // (still reshaping), 4+ idle with the grown size.
+      const executor = withTailFixtures(
+        world({ mdstat: [MDSTAT_RESHAPING, MDSTAT_RESHAPING, MDSTAT_RESHAPING, MDSTAT_GROWN_IDLE] }),
+        { lvBytes: 6 * GIB },
+      )
+      const intent = mkIntent([X, Y, Z, W])
+      await writeIntent('tank', intent, { dir })
+      const intentPath = join(dir, 'tank.json')
+      const intentPresentDuringWait: boolean[] = []
+
+      // The plan a mid-reshape resume recomputes: the new disk is ALREADY an
+      // md member, so §2.3 has nothing left to plan — not even a reshape-wait.
+      const outcome = await executeExpansion(
+        executor,
+        { pool: mkPool(), intent, plan: mkPlan([B1_GROWN, B2], []) },
+        (m) => {
+          progress.push(m)
+          if (m.includes('reshape'))
+            intentPresentDuringWait.push(existsSync(intentPath))
+        },
+        { intentDir: dir, pollIntervalMs: 1, log: () => {} },
+      )
+
+      assert.equal(outcome.ok, true, outcome.error)
+      // Before the fix this returned instantly with ZERO steps.
+      assert.deepEqual(outcome.steps.map(s => s.kind), [
+        'reshape-wait',
+        'pv-create',
+        'pv-resize',
+        'vg-extend',
+        'lv-extend',
+        'fs-grow',
+      ])
+      assert.ok(intentPresentDuringWait.length > 0, 'the job actually waited on the reshape')
+      assert.ok(intentPresentDuringWait.every(Boolean), 'the intent survived the whole in-flight reshape')
+      assert.ok(progress.some(m => m.includes('reshape tank-r1') && m.includes('10.0%')), 'reshape progress is reported during the wait')
+
+      // The size-dependent steps ran only AFTER mdstat flipped to idle (read 4).
+      const firstResize = executor.calls.findIndex(c => c.command === '/usr/sbin/pvresize')
+      assert.ok(firstResize > 0, 'pvresize ran')
+      const mdstatReadsBefore = executor.calls.slice(0, firstResize).filter(c => c.command === '/usr/bin/cat').length
+      assert.ok(mdstatReadsBefore >= 4, `no size-dependent step ran before md published the grown size (${mdstatReadsBefore} mdstat reads)`)
+      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [
+        ['/usr/sbin/pvresize', '/dev/md127'],
+        ['/usr/sbin/lvextend', '-l', '+100%FREE', '/dev/tank/tank-vol'],
+        ['/usr/bin/btrfs', 'filesystem', 'resize', 'max', '/mnt/anas-ahr/tank'],
+      ])
+      // Only NOW is the expansion over.
+      assert.equal(await readIntent('tank', dir), null)
+      assert.ok(GROWN_BYTES > R1_BYTES) // the fixture really does grow
+    })
+
+    it('a plan that already contains its reshape-wait behaves exactly as before (nothing appended)', async () => {
+      const executor = world({ mdstat: [MDSTAT_RESHAPING, MDSTAT_RESHAPING, MDSTAT_GROWN_IDLE] })
+      const intent = mkIntent([X, Y, Z, W])
+      await writeIntent('tank', intent, { dir })
+      const outcome = await run(executor, mkPlan([B1_GROWN, B2], [{ kind: 'reshape-wait', target: 'md/tank-r1' }]), [X, Y, Z, W], intent)
+      assert.equal(outcome.ok, true, outcome.error)
+      // The invariant read finds every array idle → a pure no-op read.
+      assert.deepEqual(outcome.steps.map(s => s.kind), ['reshape-wait'])
+      assert.deepEqual(mutatingCalls(executor), [])
+      assert.equal(await readIntent('tank', dir), null)
+    })
+
+    it('a queued (DELAYED) sync holds completion too', async () => {
+      const delayed = `Personalities : [raid1] [raid5]
+md126 : active raid1 sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+      \tresync=DELAYED
+
+md127 : active raid5 sdt1[3] sds1[2] sdr1[1] sdq1[0]
+      6285312 blocks super 1.2 level 5, 512k chunk, algorithm 2 [4/4] [UUUU]
+
+unused devices: <none>
+`
+      const executor = withTailFixtures(world({ mdstat: [delayed, delayed, MDSTAT_GROWN_IDLE] }), {
+        lvBytes: 6 * GIB,
+        // r2's PV is already created and at size — only r1's grew.
+        pvs: [
+          { name: '/dev/md127', vg: 'tank', size: R1_BYTES },
+          { name: '/dev/md126', vg: 'tank', size: 1047552 * 1024 },
+        ],
+      })
+      const intent = mkIntent([X, Y, Z, W])
+      await writeIntent('tank', intent, { dir })
+      const outcome = await run(executor, mkPlan([B1_GROWN, B2], []), [X, Y, Z, W], intent)
+      assert.equal(outcome.ok, true, outcome.error)
+      assert.deepEqual(outcome.steps.map(s => s.kind), ['reshape-wait', 'pv-create', 'pv-resize', 'vg-extend', 'lv-extend', 'fs-grow'])
+      assert.equal(outcome.steps[0].target, 'md/tank-r2', 'the DELAYED band is the one held on')
+      assert.equal(await readIntent('tank', dir), null)
+    })
+
+    it('a scrub (md check) is NOT a hold — it cannot change the array size', async () => {
+      const checking = `Personalities : [raid1] [raid5]
+md126 : active raid1 sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md127 : active raid5 sds1[2] sdr1[1] sdq1[0]
+      4190208 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+      [==>..................]  check = 12.0% (251412/2095104) finish=300.0min speed=10240K/sec
+
+unused devices: <none>
+`
+      const executor = world({ mdstat: checking })
+      const intent = mkIntent([X, Y, Z])
+      await writeIntent('tank', intent, { dir })
+      const outcome = await run(executor, mkPlan([B1, B2], []), [X, Y, Z], intent)
+      assert.equal(outcome.ok, true, outcome.error)
+      assert.deepEqual(outcome.steps, [])
+      assert.equal(await readIntent('tank', dir), null)
+    })
+  })
+
+  describe('delivered-capacity verification (issue #4)', () => {
+    it('reports the MEASURED capacity, not the plan projection', async () => {
+      const executor = world()
+      executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: lvsJson(6 * GIB - 512 * MIB), stderr: '', exitCode: 0 } })
+      const lines: string[] = []
+      const intent = mkIntent([X, Y, Z]) // plan projects 6 GiB usable
+      await writeIntent('tank', intent, { dir })
+
+      const outcome = await executeExpansion(
+        executor,
+        { pool: mkPool(), intent, plan: mkPlan([B1, B2], []) },
+        () => {},
+        { intentDir: dir, pollIntervalMs: 1, log: line => lines.push(line) },
+      )
+      assert.equal(outcome.ok, true, outcome.error)
+      const info = notifyCalls(executor, 'info')
+      assert.equal(info.length, 1)
+      assert.match(info[0].args[4], /4 GiB → 5\.5 GiB/, 'the measured figure, not the planned 6 GiB')
+      const complete = lines.find(l => l.includes('status=complete'))!
+      assert.match(complete, /usable=4294967296->5905580032/)
+      assert.match(complete, /capacity=measured/)
+      assert.match(complete, /planned=6442450944/)
+      assert.equal(await readIntent('tank', dir), null)
+    })
+
+    it('a material shortfall HALTS instead of completing — the intent survives', async () => {
+      const executor = world()
+      // Every step reported done, but the volume is still 2 GiB short of plan.
+      executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: lvsJson(4 * GIB), stderr: '', exitCode: 0 } })
+      const intent = mkIntent([X, Y, Z])
+      await writeIntent('tank', intent, { dir })
+
+      const outcome = await run(executor, mkPlan([B1, B2], []), [X, Y, Z], intent)
+      assert.equal(outcome.ok, false)
+      assert.match(outcome.error!, /delivered 4 GiB .* projected 6 GiB — 2 GiB short/)
+      assert.equal((await readIntent('tank', dir))?.state, 'halted')
+      assert.equal(notifyCalls(executor, 'info').length, 0, 'completion is NOT declared')
+      assert.equal(notifyCalls(executor, 'error').length, 1)
+    })
+
+    it('layout overhead (data offsets + LVM rounding) is NOT a shortfall', async () => {
+      const executor = world()
+      // 6 GiB planned, delivered short by the §2.6 data offsets + LVM slack.
+      executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: lvsJson(6 * GIB - 200 * MIB), stderr: '', exitCode: 0 } })
+      const intent = mkIntent([X, Y, Z])
+      await writeIntent('tank', intent, { dir })
+      const outcome = await run(executor, mkPlan([B1, B2], []), [X, Y, Z], intent)
+      assert.equal(outcome.ok, true, outcome.error)
+      assert.equal(await readIntent('tank', dir), null)
     })
   })
 

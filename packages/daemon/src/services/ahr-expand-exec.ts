@@ -13,9 +13,9 @@ import { parseFindmnt } from '../parsers/findmnt.js'
 import { LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
-import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
+import { ahrDataOffsetArg, ahrDataOffsetBytes, planDiskPartitions } from './ahr-geometry.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
-import { floorToGranularity, fmtBytes } from './ahr-layout.js'
+import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes } from './ahr-layout.js'
 import { pinArrays } from './ahr-mdadm-conf.js'
 import { AHR_FINDMNT_ARGS, stripSubvolSuffix } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
@@ -33,6 +33,10 @@ import { pveNotify } from './pve-notify.js'
  *    never work around.
  *  - NEVER re-issue a reshape: `reshape-wait` only observes /proc/mdstat;
  *    the kernel owns reshape resumability.
+ *  - NEVER declare an expansion complete (or clear its intent) while one of
+ *    the pool's arrays is still syncing (issue #4) — md publishes a grown
+ *    array size only when the reshape ENDS, so every size-dependent step that
+ *    ran before then honestly no-op'd against the OLD size.
  *  - The filesystem grows LAST, only after the LV beneath is verified
  *    extended.
  *  - A step failure halts in a known state: intent → 'halted', PVE error
@@ -527,6 +531,119 @@ async function waitForArrayIdle(executor: CommandExecutor, ctx: WaitContext): Pr
   }
 }
 
+// ---- The completion invariant (issue #4) -----------------------------------
+
+/**
+ * The bands of `poolName` whose array still has a size-changing sync in
+ * flight or queued — the condition under which an expansion must NOT be
+ * declared complete (issue #4). Matches what {@link waitForArrayIdle} waits
+ * out: a running sync, or one `DELAYED`/`PENDING` behind another array.
+ *
+ * `check` (a scrub) is deliberately NOT a hold: it reads the array without
+ * ever changing its size, so it cannot orphan a size-dependent step, and
+ * blocking an expansion's completion behind a multi-hour scrub would be a
+ * false hold.
+ *
+ * Observation only — /proc/mdstat + `--detail --export`, no mutation.
+ */
+export async function syncingAhrBands(executor: CommandExecutor, poolName: string): Promise<number[]> {
+  const bands: number[] = []
+  for (const [band, resolved] of await resolveAhrArrays(executor, poolName)) {
+    const { md } = resolved
+    if ((md.sync !== null && md.sync.action !== 'check') || md.syncDelayed || md.syncPending)
+      bands.push(band)
+  }
+  bands.sort((a, b) => a - b)
+  return bands
+}
+
+/**
+ * The steps still owed to a pool whose arrays are mid-sync: the `reshape-wait`
+ * for each affected band, then the size-dependent tail that can only deliver
+ * once md publishes the grown size (§5.1 order — pv, then vg, then lv, then
+ * the filesystem LAST).
+ *
+ * ONE definition, shared by the two layers that need it (single source):
+ *  - the resume planner (services/ahr-expand-resume.ts) appends these to a
+ *    plan recomputed mid-reshape, so the operator sees the real remaining
+ *    work and gets reshape progress for the whole wait;
+ *  - {@link executeExpansion}'s completion invariant appends the same steps
+ *    as the backstop, whatever plan it was handed (including an empty one).
+ *
+ * Every step is detect-then-delta, so a band that is already pv-created /
+ * extended costs one read and logs "already done".
+ */
+export function syncCompletionSteps(
+  poolName: string,
+  lvName: string,
+  bands: readonly number[],
+): Omit<AhrExpansionStep, 'index'>[] {
+  if (bands.length === 0)
+    return []
+  const steps: Omit<AhrExpansionStep, 'index'>[] = bands.map(band => ({
+    kind: 'reshape-wait' as const,
+    target: `md/${poolName}-r${band}`,
+    status: 'pending' as const,
+    detail: 'sync in flight — no size-dependent step may run (or complete) before it ends',
+  }))
+  for (const band of bands) {
+    steps.push({ kind: 'pv-create', target: `md/${poolName}-r${band}`, status: 'pending' })
+    steps.push({ kind: 'pv-resize', target: `md/${poolName}-r${band}`, status: 'pending' })
+  }
+  steps.push({ kind: 'vg-extend', target: poolName, status: 'pending' })
+  steps.push({ kind: 'lv-extend', target: lvName, status: 'pending' })
+  steps.push({ kind: 'fs-grow', target: lvName, status: 'pending' })
+  return steps
+}
+
+/**
+ * The pool's DELIVERED usable capacity: the size of the LV the filesystem
+ * sits on — the very figure services/ahr-topology.ts reports as
+ * `capacity.usableBytes`, so "before → after" compares like with like.
+ * Returns null when it cannot be read (never throws): an unreadable `lvs` is
+ * a reason to stop CLAIMING a number, not to halt an expansion whose every
+ * step succeeded.
+ */
+async function readDeliveredUsableBytes(executor: CommandExecutor, pool: AhrPool): Promise<number | null> {
+  const r = await executor.exec(LVS, LVS_ARGS)
+  if (r.exitCode !== 0)
+    return null
+  try {
+    const lv = parseLvsReport(r.stdout).find(l => l.vgName === pool.name && l.name === pool.lv.name)
+    return lv?.sizeBytes ?? null
+  }
+  catch {
+    return null
+  }
+}
+
+/**
+ * How far BELOW the plan's projected usable capacity a fully-delivered pool
+ * legitimately lands. The planner projects band geometry; the LV that
+ * actually carries the filesystem is smaller by amounts the band math does
+ * not model, all of them knowable:
+ *
+ *  - the §2.6 data offset reserved ahead of every DATA member's payload
+ *    (256 MiB on TB-scale members) — the dominant term, and it grows with the
+ *    member count, so a FLAT 1 GiB margin would false-halt a real 4→5 × 22 TB
+ *    raid5 grow (four data members = 1 GiB of offset on its own);
+ *  - LVM PV metadata + extent rounding per array ({@link LVM_SLACK_BYTES});
+ *  - one §2.5 granularity unit of general slack.
+ *
+ * A genuine shortfall — the post-steps never delivering — is band-sized
+ * (TiB), so this separates the two without inventing a percentage.
+ */
+function plannedCapacityMarginBytes(plan: AhrExpansionPlan): number {
+  let margin = AHR_SIZE_GRANULARITY_BYTES
+  for (const b of plan.preview.bands) {
+    if (!b.protected || b.heightBytes <= 0)
+      continue
+    const dataMembers = Math.max(1, Math.round(b.usableBytes / b.heightBytes))
+    margin += dataMembers * ahrDataOffsetBytes(b.heightBytes) + LVM_SLACK_BYTES
+  }
+  return margin
+}
+
 // ---- The step executor ------------------------------------------------------
 
 interface StepContext {
@@ -902,10 +1019,55 @@ async function haltWithFailure(
 }
 
 /**
+ * Run an ordered step list. Returns the step that failed (its `detail` holds
+ * the message), or null when every step completed. The one execution path —
+ * the plan's steps and the completion invariant's steps both go through it.
+ */
+async function runStepList(ctx: StepContext, steps: AhrExpansionStep[]): Promise<AhrExpansionStep | null> {
+  for (const step of steps) {
+    step.status = 'running'
+    ctx.log(`ahr.expand pool=${ctx.pool.name} step=${step.kind} target=${step.target} status=running`)
+    ctx.updateProgress(`${step.kind}: ${step.target}`)
+    try {
+      const skipped = await runStep(ctx, step)
+      step.status = 'done'
+      ctx.log(`ahr.expand pool=${ctx.pool.name} step=${step.kind} target=${step.target} status=done${skipped ? ' (already done)' : ''}`)
+    }
+    catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      step.status = 'failed'
+      step.detail = message
+      ctx.log(`ahr.expand pool=${ctx.pool.name} step=${step.kind} target=${step.target} status=failed error=${message}`)
+      return step
+    }
+  }
+  return null
+}
+
+/**
  * Drive an expansion plan to completion (§5.1). Steps run strictly in the
  * planner's order; each is detect-then-delta. On the first failure the
  * pipeline halts: intent → 'halted', PVE 'error' notification naming the
  * failed layer, outcome returned (the job layer decides how to surface it).
+ *
+ * Before completion two things are enforced, both of them load-bearing
+ * (issue #4):
+ *
+ *  1. THE INVARIANT — an expansion is never complete, and its intent is never
+ *     cleared, while any of the pool's arrays is still syncing. A resume that
+ *     enters mid-reshape recomputes a plan with nothing left to do (the new
+ *     disk is already an md member), and md publishes the grown array size
+ *     only when the reshape ENDS — so without this hold the job would walk to
+ *     "complete" in milliseconds, having no-op'd every size-dependent step
+ *     against the OLD size, and the LVM/filesystem grow would be orphaned for
+ *     good when the kernel finished days later. The hold WAITS (never
+ *     re-issues, §5.1) and then runs the size-dependent tail, so the pv/lv/fs
+ *     steps deliver AFTER the new size exists.
+ *  2. THE REPORT — completion states the capacity actually MEASURED on the
+ *     pool, not the plan's projection, and a material shortfall against the
+ *     plan halts instead of silently completing (the intent survives for
+ *     operator review).
+ *
  * On completion the intent is CLEARED and an 'info' notification carries the
  * before → after capacity.
  */
@@ -917,9 +1079,10 @@ export async function executeExpansion(
 ): Promise<ExpansionOutcome> {
   const intentDir = opts.intentDir ?? defaultAhrIntentDir()
   const log = opts.log ?? ((line: string) => process.stdout.write(`${line}\n`))
+  const pool = input.pool
   const ctx: StepContext = {
     executor,
-    pool: input.pool,
+    pool,
     intent: input.intent,
     plan: input.plan,
     updateProgress,
@@ -929,38 +1092,70 @@ export async function executeExpansion(
   }
 
   const steps = input.plan.steps.map(s => ({ ...s }))
-  for (const step of steps) {
-    step.status = 'running'
-    log(`ahr.expand pool=${input.pool.name} step=${step.kind} target=${step.target} status=running`)
-    updateProgress(`${step.kind}: ${step.target}`)
-    try {
-      const skipped = await runStep(ctx, step)
-      step.status = 'done'
-      log(`ahr.expand pool=${input.pool.name} step=${step.kind} target=${step.target} status=done${skipped ? ' (already done)' : ''}`)
-    }
-    catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      step.status = 'failed'
-      step.detail = message
-      log(`ahr.expand pool=${input.pool.name} step=${step.kind} target=${step.target} status=failed error=${message}`)
-      await haltWithFailure(executor, input, intentDir, `step '${step.kind}' (${step.target})`, message)
-      return { ok: false, steps, failedStep: step, error: message }
-    }
+  const halt = async (layer: string, message: string, failedStep?: AhrExpansionStep): Promise<ExpansionOutcome> => {
+    await haltWithFailure(executor, input, intentDir, layer, message)
+    return { ok: false, steps, failedStep, error: message }
   }
 
-  await clearIntent(input.pool.name, intentDir)
+  const failed = await runStepList(ctx, steps)
+  if (failed)
+    return halt(`step '${failed.kind}' (${failed.target})`, failed.detail!, failed)
+
+  // ---- 1. The completion invariant (issue #4) -----------------------------
+  let holdBands: number[]
+  try {
+    holdBands = await syncingAhrBands(executor, pool.name)
+  }
+  catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    log(`ahr.expand pool=${pool.name} status=failed error=${message}`)
+    return halt('completion invariant (reading md sync state)', message)
+  }
+  if (holdBands.length > 0) {
+    log(`ahr.expand pool=${pool.name} status=hold bands=${holdBands.join(',')} reason=sync-in-flight`)
+    const base = steps.length
+    const extra = syncCompletionSteps(pool.name, pool.lv.name, holdBands)
+      .map((s, i) => ({ ...s, index: base + i }))
+    steps.push(...extra)
+    // The tail's vg-extend derives its PV list from the plan's pv-create
+    // steps — run it against a plan that includes the appended ones.
+    const holdCtx: StepContext = { ...ctx, plan: { ...input.plan, steps: [...input.plan.steps, ...extra] } }
+    const failedHold = await runStepList(holdCtx, extra)
+    if (failedHold)
+      return halt(`step '${failedHold.kind}' (${failedHold.target})`, failedHold.detail!, failedHold)
+  }
+
+  // ---- 2. Honest completion report ----------------------------------------
   const { before, after } = input.intent
+  const delivered = await readDeliveredUsableBytes(executor, pool)
+  if (delivered !== null && after.usableBytes - delivered > plannedCapacityMarginBytes(input.plan)) {
+    const message
+      = `the pool delivered ${fmtBytes(delivered)} of usable capacity but the plan projected `
+        + `${fmtBytes(after.usableBytes)} — ${fmtBytes(after.usableBytes - delivered)} short. Every step reported `
+        + `done, so the block layer and the volume/filesystem above it disagree; the expansion is NOT being `
+        + `reported complete. Check the pool's arrays, PV/VG/LV sizes and filesystem size, then Resume `
+        + `(recompute-and-continue) or Abandon.`
+    log(`ahr.expand pool=${pool.name} status=shortfall usable=${before.usableBytes}->${delivered} planned=${after.usableBytes}`)
+    return halt('delivered-capacity verification', message)
+  }
+
+  await clearIntent(pool.name, intentDir)
+  const usableBytes = delivered ?? after.usableBytes
   const pendingDelta = after.pendingBytes - before.pendingBytes
   await pveNotify(
     executor,
     'info',
-    `AHR expansion complete: ${input.pool.name}`,
-    `Usable capacity ${fmtBytes(before.usableBytes)} → ${fmtBytes(after.usableBytes)}.${
+    `AHR expansion complete: ${pool.name}`,
+    `Usable capacity ${fmtBytes(before.usableBytes)} → ${fmtBytes(usableBytes)}${
+      delivered === null ? ' (projected — the volume size could not be read)' : ''}.${
       pendingDelta > 0
         ? ` ${fmtBytes(after.pendingBytes)} is pending — physically present but locked until more disks cross the top band boundary (§5.2).`
         : ''}`,
   )
-  log(`ahr.expand pool=${input.pool.name} status=complete usable=${before.usableBytes}->${after.usableBytes}`)
+  log(
+    `ahr.expand pool=${pool.name} status=complete usable=${before.usableBytes}->${usableBytes} `
+    + `capacity=${delivered === null ? 'projected' : 'measured'} planned=${after.usableBytes}`,
+  )
   return { ok: true, steps }
 }
 
