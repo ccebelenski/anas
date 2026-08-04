@@ -26,6 +26,13 @@ interface UpstreamResult {
  */
 const ANAS_PROXY_PREFIX = '/anas'
 
+/**
+ * Marker stamped on every cross-node forward. A peer legitimately receives it
+ * and serves the request locally; a gateway that would forward a request
+ * ALREADY carrying it refuses instead (FORWARD_LOOP) — see server.ts.
+ */
+export const FORWARDED_HEADER = 'x-anas-forwarded'
+
 /** Cross-node forward timeout — a hung peer must not hang the browser request. */
 const FORWARD_TIMEOUT_MS = 15000
 
@@ -260,6 +267,9 @@ export async function forwardToNode(
 
   const headers: Record<string, string> = {
     accept: 'application/json',
+    // Mark the hop: the peer serves it locally, but a gateway asked to forward
+    // an already-forwarded request refuses (FORWARD_LOOP) rather than loop.
+    [FORWARDED_HEADER]: '1',
   }
   // Forward the credential and confirmation/content headers verbatim.
   for (const name of ['cookie', 'content-type', 'x-anas-confirm'] as const) {

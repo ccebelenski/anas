@@ -1,4 +1,5 @@
 import { loadConfig } from './config.js'
+import { DEFAULT_PVE_LOCAL_PATH, describeNodeNameSource } from './node-name.js'
 import { createServer } from './server.js'
 
 /**
@@ -21,9 +22,16 @@ async function main() {
 
   try {
     await server.listen({ port: config.port, host: config.host })
+    // Name the identity SOURCE: node identity decides local-vs-peer routing, so
+    // when it is wrong (issue #5) the operator must be able to see where it came
+    // from without guessing.
+    const nodeSource = describeNodeNameSource({
+      source: config.nodeNameSource ?? 'hostname',
+      pveLocalPath: config.pveLocalPath ?? DEFAULT_PVE_LOCAL_PATH,
+    })
     server.log.info(
       `anas gateway listening on http://${config.host}:${config.port} `
-      + `(node '${config.nodeName}', anasd ${config.anasdSocket})`,
+      + `(node '${config.nodeName}' (from ${nodeSource}), anasd ${config.anasdSocket})`,
     )
   }
   catch (err) {

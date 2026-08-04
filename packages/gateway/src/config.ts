@@ -1,4 +1,5 @@
-import os from 'node:os'
+import type { NodeNameSource } from './node-name.js'
+import { resolveNodeName } from './node-name.js'
 
 /**
  * Runtime configuration, resolved from the environment.
@@ -16,8 +17,17 @@ export interface GatewayConfig {
    * peer terminates TLS at `:8006` and routes `/anas/*` to that node's gateway.
    */
   pvePort: number
-  /** This node's name — used to decide local vs. remote routing. */
+  /**
+   * This node's PVE name — used to decide local vs. remote routing. Resolved
+   * once at startup from PVE itself (see node-name.ts), NOT guessed from
+   * `os.hostname()`: an FQDN hostname made a gateway fail to recognise its own
+   * node and forward requests to itself (issue #5).
+   */
   nodeName: string
+  /** Which tier of the resolution chain produced `nodeName` (startup log). */
+  nodeNameSource?: NodeNameSource
+  /** The `/etc/pve/local` path consulted while resolving `nodeName`. */
+  pveLocalPath?: string
   /** Path to the local anasd Unix socket. */
   anasdSocket: string
   /** Auth provider selector ('pve' | 'dev'). */
@@ -32,12 +42,18 @@ export interface GatewayConfig {
   membersPath: string
 }
 
-export function loadConfig(env = process.env): GatewayConfig {
+export function loadConfig(
+  env = process.env,
+  hostname?: () => string,
+): GatewayConfig {
+  const node = resolveNodeName(env, hostname)
   return {
     host: env.ANAS_HOST ?? '127.0.0.1',
     port: env.ANAS_PORT ? Number.parseInt(env.ANAS_PORT, 10) : 3000,
     pvePort: env.ANAS_PVE_PORT ? Number.parseInt(env.ANAS_PVE_PORT, 10) : 8006,
-    nodeName: env.ANAS_NODE_NAME ?? os.hostname(),
+    nodeName: node.nodeName,
+    nodeNameSource: node.source,
+    pveLocalPath: node.pveLocalPath,
     anasdSocket: env.ANASD_SOCKET ?? '/run/anas/anasd.sock',
     authProvider: env.ANAS_AUTH_PROVIDER,
     clusterCa: env.ANAS_CLUSTER_CA ?? '/etc/pve/pve-root-ca.pem',

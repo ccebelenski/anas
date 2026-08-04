@@ -4,7 +4,8 @@ import { VERSION } from '@anas/shared'
 import Fastify from 'fastify'
 import { createAuthProvider } from './auth/index.js'
 import { loadConfig } from './config.js'
-import { forwardToNode, proxyToLocalSocket } from './proxy.js'
+import { NODE_NAME_RE } from './node-name.js'
+import { FORWARDED_HEADER, forwardToNode, proxyToLocalSocket } from './proxy.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -12,9 +13,6 @@ declare module 'fastify' {
     user?: AuthUser
   }
 }
-
-/** Node names are hostnames: alphanumerics, dots, hyphens. */
-const NODE_NAME_RE = /^[a-z0-9.-]+$/i
 
 export interface ServerOptions {
   /** Resolved config. Defaults to loadConfig() (env). */
@@ -125,6 +123,23 @@ export function createServer(opts: ServerOptions = {}) {
         user: request.user,
       })
       return
+    }
+
+    // Loop guard (defense in depth). The legitimate cross-node flow is
+    // browser → entry gateway → peer :8006 → peer gateway → LOCAL socket: the
+    // peer receives the marker and serves locally (handled above). Reaching
+    // HERE with the marker means a gateway received an already-forwarded
+    // request and would forward it AGAIN — the shape of a node-identity
+    // mismatch (issue #5: an FQDN hostname made a gateway not recognise its own
+    // node, so it forwarded to itself through pveproxy until timeouts). Fail as
+    // one clean error instead of a request loop.
+    if (request.headers[FORWARDED_HEADER] !== undefined) {
+      return reply.code(502).send({
+        error: {
+          code: 'FORWARD_LOOP',
+          message: `Refusing to forward the request for node '${node}' a second time: it was already forwarded once, and this gateway does not recognise itself as '${node}' (its node identity is '${config.nodeName}'). The gateway's node name does not match the PVE node name.`,
+        },
+      })
     }
 
     await forwardToNode(request, reply, {

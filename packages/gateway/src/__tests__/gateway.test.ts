@@ -500,8 +500,10 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
 
   it('re-adds the /anas prefix and hits the peer over the cluster CA', async () => {
     let received: string | undefined
+    let receivedHeaders: Record<string, string | string[] | undefined> = {}
     const peer = createHttpsServer({ cert, key }, (req, res) => {
       received = req.url
+      receivedHeaders = req.headers
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ data: [{ name: 'remotepool' }] }))
     })
@@ -525,6 +527,9 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
     // Round-trip: the local pveproxy stripped /anas; the gateway forwards to the
     // peer with /anas re-added so the peer's pveproxy can route it.
     assert.equal(received, '/anas/api/nodes/peer1/v1/pools?verbose=1')
+    // The hop is marked: the peer serves it locally, but any gateway asked to
+    // forward it a SECOND time refuses (FORWARD_LOOP) instead of looping.
+    assert.equal(receivedHeaders['x-anas-forwarded'], '1')
 
     await server.close()
     await new Promise<void>(resolve => peer.close(() => resolve()))
