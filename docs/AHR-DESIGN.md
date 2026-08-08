@@ -178,7 +178,7 @@ The stage run passed decisively: 297/297 checksums intact across the transition,
 
 *Open item, deliberately not a claim:* while an array advertised 512-byte logical blocks with a 4096-byte member attached, READS were proven safe (O_DIRECT 512-byte reads succeeded, parity check clean). The equivalent **write-path** proof was not captured. Treat this as a watch item on the expand path's transient window, not as a verified guarantee.
 
-*Portability hazard, surfaced in both confirm gates:* md logs `array will not be assembled in old kernels that lack configurable LBS support (<= 6.18)`. A band whose logical block size is not the kernel default will NOT assemble on kernel 6.18 or older (PVE 8) — so downgrading the node, or moving the disks to an older host, leaves the pool unassembled. The operator sees this before confirming.
+*Kernel floor, noted in both confirm gates:* mixed-LBS bands need kernel 6.19+ to assemble (md logs `array will not be assembled in old kernels that lack configurable LBS support (<= 6.18)` at create). Every supported PVE qualifies, so the gates carry it as a one-line factual note, not a hazard warning — ANAS does not support PVE 8, and the confirm dialog shouldn't dramatize an unsupported scenario.
 
 All mutations are jobs (202). execFile only: `sgdisk`/`parted`, `mdadm`, `pvcreate`/`vgcreate`/`vgextend`/`lvcreate`/`lvextend`, `mkfs.btrfs`/`btrfs`, `wipefs`. Every user-derived value (pool name, disk id) is schema-constrained to a safe charset (the security-hardening pattern); `--` end-of-options guards on positional args. Scrub runs btrfs scrub and md `check` **sequentially** — both are full-device reads and would thrash each other concurrently. (Scheduled scrubs are Epic 17's job.)
 

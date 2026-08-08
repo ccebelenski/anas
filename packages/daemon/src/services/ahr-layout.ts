@@ -235,9 +235,7 @@ function mixedBlockSizeWarning(perBandInput: { band: number, protectedBand: bool
   return `${MIXED_SECTOR_WARNING_PREFIX} (${distinct.join('-byte and ')}-byte logical blocks) — `
     + `the bands will have differing logical block sizes (${detail}); the LVM stack is built with `
     + `allow_mixed_block_sizes, and btrfs uses a 4 KiB sector size either way. `
-    + `PORTABILITY: md logs "array will not be assembled in old kernels that lack configurable LBS support (<= 6.18)" — `
-    + `a band whose logical block size is not the kernel default will NOT assemble on kernel 6.18 or older `
-    + `(PVE 8), so downgrading this node or moving these disks to an older host would leave the pool unassembled`
+    + `These disks require kernel 6.19+ to assemble (any supported PVE qualifies)`
 }
 
 /** The min-disk warning text (mirrors the UI advisor copy). */

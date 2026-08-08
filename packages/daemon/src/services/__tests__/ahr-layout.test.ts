@@ -288,10 +288,11 @@ describe('AHR layout (Epic 11 + AHR — docs/AHR-DESIGN.md §2)', () => {
         assert.ok(!plan.preview.warnings.some(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)))
       })
 
-      // The array is unassemblable on an older kernel — a downgrade and
-      // disk-portability hazard the operator must see BEFORE confirming, not
-      // discover when a PVE 8 node refuses to bring the pool up.
-      it('names the kernel ≤6.18 assembly hazard', () => {
+      // Mixed-LBS bands need kernel 6.19+ to assemble. Every supported PVE
+      // qualifies, so this is a one-line factual note, not a hazard warning
+      // (operator call 2026-08-08: don't dramatize an unsupported-platform
+      // scenario).
+      it('notes the kernel 6.19+ assembly requirement', () => {
         const preview = planFreshLayout(
           [
             { id: 'd4kn', usableBytes: 2 * TiB, logicalSectorSize: 4096 },
@@ -301,8 +302,8 @@ describe('AHR layout (Epic 11 + AHR — docs/AHR-DESIGN.md §2)', () => {
           'ahr1',
         )
         const warning = preview.warnings.find(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX))!
-        assert.match(warning, /will NOT assemble on kernel 6\.18 or older/)
-        assert.match(warning, /PVE 8/)
+        assert.match(warning, /kernel 6\.19\+ to assemble/)
+        assert.match(warning, /any supported PVE qualifies/)
       })
 
       it('ignores UNPROTECTED bands — they carry no array, so no PV and no mix', () => {
