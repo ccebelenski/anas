@@ -8,6 +8,7 @@ import { executeExpansion, executeReplace, projectExistingBands, pvCatchUpSteps,
 import { AhrIntentConflictError, writeIntent } from './ahr-intent.js'
 import { AhrPlanError, planExpansion } from './ahr-layout.js'
 import { spareCoverageWarnings } from './ahr-spare.js'
+import { kernelInfo } from './kernel-version.js'
 
 /**
  * The shared AHR expansion resume core (Epic 11.6, docs/AHR-DESIGN.md §5.3,
@@ -93,6 +94,9 @@ export function computePlan(pool: AhrPool, approved: AhrLayoutDisk[], replaced: 
     existingBands,
     approvedDisks: approved,
     replaced,
+    // Identical treatment to create (§4): an expansion that would introduce a
+    // mixed-LBS band on a pre-floor kernel is refused at plan time.
+    kernel: kernelInfo(),
   })
   // §11 expansion coupling: a spare that cannot reach the post-expansion top
   // band is named in the PLAN warnings, before any confirm — it keeps covering

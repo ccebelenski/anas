@@ -12,6 +12,7 @@ import {
   planExpansion,
   planFreshLayout,
 } from '../ahr-layout.js'
+import { kernelInfo } from '../kernel-version.js'
 
 const GiB = AHR_SIZE_GRANULARITY_BYTES
 const TiB = 1024 * GiB
@@ -292,18 +293,83 @@ describe('AHR layout (Epic 11 + AHR — docs/AHR-DESIGN.md §2)', () => {
       // qualifies, so this is a one-line factual note, not a hazard warning
       // (operator call 2026-08-08: don't dramatize an unsupported-platform
       // scenario).
-      it('notes the kernel 6.19+ assembly requirement', () => {
-        const preview = planFreshLayout(
-          [
-            { id: 'd4kn', usableBytes: 2 * TiB, logicalSectorSize: 4096 },
-            { id: 'd512a', usableBytes: 3 * TiB, logicalSectorSize: 512 },
-            { id: 'd512b', usableBytes: 3 * TiB, logicalSectorSize: 512 },
-          ],
-          'ahr1',
-        )
+      /** A mixed 4Kn/512e selection: bands 1 and 2 disagree on block size. */
+      const MIXED_SELECTION: AhrLayoutDisk[] = [
+        { id: 'd4kn', usableBytes: 2 * TiB, logicalSectorSize: 4096 },
+        { id: 'd512a', usableBytes: 3 * TiB, logicalSectorSize: 512 },
+        { id: 'd512b', usableBytes: 3 * TiB, logicalSectorSize: 512 },
+      ]
+
+      // The gate is on the KERNEL, never on the PVE version: PVE 9 shipped with
+      // 6.14.8, so a fully supported node can sit below the md floor.
+      it('states the floor and THIS node\'s kernel — no distro-version claim', () => {
+        const preview = planFreshLayout(MIXED_SELECTION, 'ahr1', kernelInfo('7.0.14-8-pve'))
         const warning = preview.warnings.find(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX))!
-        assert.match(warning, /kernel 6\.19\+ to assemble/)
-        assert.match(warning, /any supported PVE qualifies/)
+        assert.match(warning, /require kernel 6\.19\+ to assemble/)
+        // Names the running kernel — cluster nodes differ, so the portability
+        // fact rides along implicitly rather than as a lecture.
+        assert.match(warning, /this node: 7\.0\.14-8-pve/)
+        assert.ok(!/PVE\s*8|any supported PVE/i.test(warning), 'no distro-version claim')
+      })
+
+      it('REFUSES a mixed layout below the 6.19 floor, before anything is touched', () => {
+        // The exact shipping-PVE-9 kernel that made "any supported PVE
+        // qualifies" wrong.
+        assert.throws(
+          () => planFreshLayout(MIXED_SELECTION, 'ahr1', kernelInfo('6.14.8-1-pve')),
+          (err: Error) => {
+            assert.ok(err instanceof AhrPlanError, 'must be the refusal every route maps to a 400')
+            assert.match(err.message, /mixes 4096\/512-byte logical blocks/)
+            assert.match(err.message, /needs kernel 6\.19\+ \(running: 6\.14\.8-1-pve\)/)
+            assert.match(err.message, /upgrade the kernel or use disks with matching sector geometry/)
+            return true
+          },
+        )
+      })
+
+      it('a UNIFORM layout is unaffected on an old kernel', () => {
+        const preview = planFreshLayout(
+          [disk('d2', 2), disk('d3', 3), disk('d4', 4)],
+          'ahr1',
+          kernelInfo('6.14.8-1-pve'),
+        )
+        assert.ok(!preview.warnings.some(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)))
+        assert.equal(preview.minDisksMet, true)
+      })
+
+      it('an UNPARSEABLE kernel refuses too — fail-safe for a wiping op', () => {
+        assert.throws(
+          () => planFreshLayout(MIXED_SELECTION, 'ahr1', kernelInfo('not-a-kernel')),
+          (err: Error) => {
+            // The unreadable string is quoted back, so the operator can see the
+            // problem is ANAS's reading, not their disks.
+            assert.match(err.message, /running: not-a-kernel/)
+            return true
+          },
+        )
+      })
+
+      it('the EXPANSION gate behaves identically (parallel construction)', () => {
+        const approvedDisks = [
+          { id: 'd2', usableBytes: 2 * TiB, logicalSectorSize: 512 },
+          { id: 'd3', usableBytes: 3 * TiB, logicalSectorSize: 512 },
+          { id: 'd4', usableBytes: 4 * TiB, logicalSectorSize: 512 },
+          { id: 'd4kn', usableBytes: 2 * TiB, logicalSectorSize: 4096 },
+        ]
+        assert.throws(
+          () => planExpansion({ poolName: 'tank', tier: 'ahr1', existingBands: existing234(), approvedDisks, kernel: kernelInfo('6.14.8-1-pve') }),
+          /needs kernel 6\.19\+ \(running: 6\.14\.8-1-pve\)/,
+        )
+        // …and passes with the same disks on a kernel at the floor.
+        const plan = planExpansion({ poolName: 'tank', tier: 'ahr1', existingBands: existing234(), approvedDisks, kernel: kernelInfo('6.19.0') })
+        assert.ok(plan.preview.warnings.some(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)))
+      })
+
+      it('omitting the kernel gates nothing (pure planner unit tests)', () => {
+        const preview = planFreshLayout(MIXED_SELECTION, 'ahr1')
+        const warning = preview.warnings.find(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX))!
+        assert.match(warning, /require kernel 6\.19\+ to assemble/)
+        assert.ok(!warning.includes('this node:'))
       })
 
       it('ignores UNPROTECTED bands — they carry no array, so no PV and no mix', () => {

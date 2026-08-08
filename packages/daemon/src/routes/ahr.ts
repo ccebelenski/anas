@@ -9,6 +9,7 @@ import { withAhrCreateStatus } from '../services/ahr-create-status.js'
 import { readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
 import { readAhrPools, withExpansionIntent } from '../services/ahr-topology.js'
+import { kernelInfo } from '../services/kernel-version.js'
 import { collectDisks } from './disks.js'
 
 /**
@@ -112,7 +113,7 @@ export async function ahrRoutes(
     }
 
     try {
-      return { data: planFreshLayout(selected, tier) }
+      return { data: planFreshLayout(selected, tier, kernelInfo()) }
     }
     catch (err) {
       if (err instanceof AhrPlanError) {

@@ -5,6 +5,8 @@ import type {
   AhrType,
   ArrayLevel,
 } from '@anas/shared'
+import type { KernelInfo } from './kernel-version.js'
+import { MD_MIXED_LBS_MIN_KERNEL_TEXT } from './kernel-version.js'
 
 /**
  * AHR layout computation (Epic 11 + AHR, docs/AHR-DESIGN.md §2) — PURE.
@@ -216,10 +218,17 @@ function bandRegionsAbove(disks: RoundedDisk[], floorBytes: number): Region[] {
  * it as a post-wipe job failure. Only PROTECTED bands count — an unprotected
  * band carries no array and therefore no PV.
  *
- * Advisory only: the mix changes nothing about the layout, and btrfs's 4 KiB
- * sector size satisfies the stacked LV either way.
+ * On a kernel that CAN assemble such an array this is advisory — the mix
+ * changes nothing about the layout, and btrfs's 4 KiB sector size satisfies the
+ * stacked LV either way. On a kernel that cannot, it THROWS: see the gate note
+ * on `kernel` in {@link planFreshLayout}.
+ *
+ * Pure: the kernel is passed IN (a value, never a system read from here).
  */
-function mixedBlockSizeWarning(perBandInput: { band: number, protectedBand: boolean, members: RoundedDisk[] }[]): string | null {
+function mixedBlockSizeWarning(
+  perBandInput: { band: number, protectedBand: boolean, members: RoundedDisk[] }[],
+  kernel: KernelInfo | undefined,
+): string | null {
   const perBand = perBandInput
     .map(b => ({
       band: b.band,
@@ -231,11 +240,31 @@ function mixedBlockSizeWarning(perBandInput: { band: number, protectedBand: bool
   if (distinct.length < 2)
     return null
   distinct.sort((a, b) => b - a)
+  const sizes = distinct.join('/')
+
+  // REFUSE below the floor. md on a pre-6.19 kernel has no configurable LBS, so
+  // what such a kernel does with these arrays is unproven — and the operation
+  // this gates WIPES DISKS. Refusing costs the operator a disk swap or a kernel
+  // upgrade; gambling costs them the array. This fires at plan time, so it
+  // lands as a 400 before any confirm code is minted and long before any disk
+  // is touched. A uniform-geometry layout is unaffected on every kernel.
+  if (kernel && !kernel.supportsMixedLbs) {
+    throw new AhrPlanError(
+      `this layout mixes ${sizes}-byte logical blocks, which needs kernel `
+      + `${MD_MIXED_LBS_MIN_KERNEL_TEXT}+ (running: ${kernel.release}) — `
+      + `upgrade the kernel or use disks with matching sector geometry`,
+    )
+  }
+
   const detail = perBand.map(b => `band ${b.band}: ${b.blockBytes}`).join(', ')
+  // One factual line about the floor. Naming THIS node's kernel carries the
+  // portability fact implicitly — cluster nodes can differ — without a lecture.
+  const note = kernel
+    ? ` These disks require kernel ${MD_MIXED_LBS_MIN_KERNEL_TEXT}+ to assemble (this node: ${kernel.release}).`
+    : ` These disks require kernel ${MD_MIXED_LBS_MIN_KERNEL_TEXT}+ to assemble.`
   return `${MIXED_SECTOR_WARNING_PREFIX} (${distinct.join('-byte and ')}-byte logical blocks) — `
     + `the bands will have differing logical block sizes (${detail}); the LVM stack is built with `
-    + `allow_mixed_block_sizes, and btrfs uses a 4 KiB sector size either way. `
-    + `These disks require kernel 6.19+ to assemble (any supported PVE qualifies)`
+    + `allow_mixed_block_sizes, and btrfs uses a 4 KiB sector size either way.${note}`
 }
 
 /** The min-disk warning text (mirrors the UI advisor copy). */
@@ -287,8 +316,13 @@ function buildCapacity(bands: AhrPreviewBand[], rawBytes: number, pendingBytes: 
  * `protected: false`, and their capacity is reported as
  * `unprotectedWastedBytes` with a warning naming the unlock condition — never
  * silently dropped.
+ *
+ * `kernel` gates mixed logical block sizes (§4): a layout whose protected bands
+ * would not all share one LBS THROWS {@link AhrPlanError} on a kernel below the
+ * md configurable-LBS floor, which every caller already maps to a 400. Passing
+ * it is a value, not a system read — this module never touches the host.
  */
-export function planFreshLayout(disks: AhrLayoutDisk[], tier: AhrType): AhrLayoutPreview {
+export function planFreshLayout(disks: AhrLayoutDisk[], tier: AhrType, kernel?: KernelInfo): AhrLayoutPreview {
   const rounded = roundDisks(disks, 'disk selection')
   const rawBytes = rounded.reduce((sum, d) => sum + d.roundedBytes, 0)
   const warnings: string[] = []
@@ -324,6 +358,7 @@ export function planFreshLayout(disks: AhrLayoutDisk[], tier: AhrType): AhrLayou
   }
   const mixed = mixedBlockSizeWarning(
     bands.map((b, i) => ({ band: b.band, protectedBand: b.protected, members: regions[i].members })),
+    kernel,
   )
   if (mixed)
     warnings.push(mixed)
@@ -384,6 +419,11 @@ export function planExpansion(input: {
   existingBands: ExistingBand[]
   approvedDisks: AhrLayoutDisk[]
   replaced?: AhrReplacement
+  /**
+   * The running kernel, for the mixed-LBS gate (§4). Passed IN so this module
+   * stays pure; omitted only by unit tests that are not exercising the gate.
+   */
+  kernel?: KernelInfo
 }): AhrExpansionPlan {
   const { poolName, tier, replaced } = input
   const existing = validateExistingBands(input.existingBands)
@@ -529,7 +569,7 @@ export function planExpansion(input: {
   // pool (or vice versa) lands the operator in exactly the geometry the create
   // path warns about, so it must say the same thing at the same moment — the
   // plan preview and the confirm gate, before anything is touched.
-  const mixed = mixedBlockSizeWarning(bandMembers)
+  const mixed = mixedBlockSizeWarning(bandMembers, input.kernel)
   if (mixed)
     warnings.push(mixed)
 

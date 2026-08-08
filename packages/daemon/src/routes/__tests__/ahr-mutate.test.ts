@@ -300,6 +300,74 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.deepEqual(vgcreate.args.slice(0, 2), ['--config', 'devices/allow_mixed_block_sizes=1'])
   })
 
+  // The gate is on the KERNEL, not the PVE version: PVE 9 shipped with 6.14.8,
+  // so a fully supported node can sit below the md configurable-LBS floor.
+  it('REFUSES a mixed selection below the 6.19 floor — 400, no confirm code, nothing touched', async () => {
+    const app = Fastify({ logger: false })
+    const jobQueue = new JobQueue()
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+      kernelRelease: '6.14.8-1-pve',
+    })
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/ahr',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_4KN, BLANK_SMALL, BLANK_BIG] }),
+      })
+      assert.equal(res.statusCode, 400)
+      assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+      assert.match(res.json().error.message, /needs kernel 6\.19\+ \(running: 6\.14\.8-1-pve\)/)
+      // A refusal, not a gate: no confirm code is minted, so there is nothing
+      // for the operator to override.
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+      assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'))
+    }
+    finally {
+      await app.close()
+    }
+  })
+
+  it('a UNIFORM selection is accepted on that same old kernel', async () => {
+    const app = Fastify({ logger: false })
+    const jobQueue = new JobQueue()
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+      kernelRelease: '6.14.8-1-pve',
+    })
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/ahr',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }),
+      })
+      // Reaches the confirm gate normally — the floor only ever gates a MIX.
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+    }
+    finally {
+      await app.close()
+    }
+  })
+
   it('a uniform 512e selection is NOT labeled — no phantom geometry warning', async () => {
     const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }) })
     assert.equal(res.statusCode, 409)

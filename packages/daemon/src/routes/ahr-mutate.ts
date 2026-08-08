@@ -15,6 +15,7 @@ import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } 
 import { scrubAhrPool } from '../services/ahr-scrub.js'
 import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
+import { kernelInfo } from '../services/kernel-version.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -36,6 +37,11 @@ export interface AhrMutationRouteOptions {
   mountBase?: string
   /** Scrub poll interval override (tests). */
   scrubPollIntervalMs?: number
+  /**
+   * Kernel release override (tests) — the mixed-LBS gate reads the RUNNING
+   * kernel, which a test cannot change. Production always omits it.
+   */
+  kernelRelease?: string
 }
 
 /**
@@ -51,7 +57,7 @@ export interface AhrMutationRouteOptions {
  * routes/ahr.ts.
  */
 export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutationRouteOptions) {
-  const { executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase } = opts
+  const { executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase, kernelRelease } = opts
 
   /** Parse + validate a pool-name param, or 400 and return null. */
   function parsePoolName(raw: string, reply: FastifyReply): string | null {
@@ -146,7 +152,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // create job will execute).
     let layout: ReturnType<typeof planFreshLayout>
     try {
-      layout = planFreshLayout(selected, req.tier)
+      // kernelInfo() gates mixed logical block sizes: below the md floor this
+      // THROWS and lands as the 400 below — before any confirm code is minted,
+      // and long before a disk is touched (§4).
+      layout = planFreshLayout(selected, req.tier, kernelInfo(kernelRelease))
     }
     catch (err) {
       if (err instanceof AhrPlanError) {

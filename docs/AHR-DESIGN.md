@@ -178,7 +178,14 @@ The stage run passed decisively: 297/297 checksums intact across the transition,
 
 *Open item, deliberately not a claim:* while an array advertised 512-byte logical blocks with a 4096-byte member attached, READS were proven safe (O_DIRECT 512-byte reads succeeded, parity check clean). The equivalent **write-path** proof was not captured. Treat this as a watch item on the expand path's transient window, not as a verified guarantee.
 
-*Kernel floor, noted in both confirm gates:* mixed-LBS bands need kernel 6.19+ to assemble (md logs `array will not be assembled in old kernels that lack configurable LBS support (<= 6.18)` at create). Every supported PVE qualifies, so the gates carry it as a one-line factual note, not a hazard warning — ANAS does not support PVE 8, and the confirm dialog shouldn't dramatize an unsupported scenario.
+*Kernel floor — gate on the KERNEL, never the distro version:* mixed-LBS bands need kernel **6.19+** to assemble (md logs `array will not be assembled in old kernels that lack configurable LBS support (<= 6.18)`). PVE 9 shipped with kernel **6.14.8**, so "any supported PVE qualifies" is false: a fully supported, fully up-to-date node can sit below the floor. Where there is a feature requirement, ANAS checks for the feature's kernel.
+
+The planner therefore takes the running kernel as an input (a value — it never reads the host itself) and:
+
+- **below 6.19 → REFUSES a mixed-LBS layout** with `AhrPlanError`, which every caller already maps to a **400** — so it lands before a confirm code is minted and long before a disk is touched. Behavior of mixed-LBS md creation on a pre-6.19 kernel is unproven, and refusing costs the operator a disk swap or a kernel upgrade where gambling costs them the array. An **unparseable** release fails the same way, deliberately: "we could not establish that this kernel is new enough" must land on refuse for an operation that wipes disks. The message quotes the release verbatim so the operator can tell a bad reading from bad hardware.
+- **at or above 6.19 →** the warning carries one factual line: *"These disks require kernel 6.19+ to assemble (this node: 7.0.14-8-pve)."* Naming THIS node's kernel carries the portability fact implicitly — cluster nodes can run different kernels — without a lecture.
+
+Uniform-geometry layouts are unaffected on every kernel. Create and expand get identical treatment through the shared planner.
 
 All mutations are jobs (202). execFile only: `sgdisk`/`parted`, `mdadm`, `pvcreate`/`vgcreate`/`vgextend`/`lvcreate`/`lvextend`, `mkfs.btrfs`/`btrfs`, `wipefs`. Every user-derived value (pool name, disk id) is schema-constrained to a safe charset (the security-hardening pattern); `--` end-of-options guards on positional args. Scrub runs btrfs scrub and md `check` **sequentially** — both are full-device reads and would thrash each other concurrently. (Scheduled scrubs are Epic 17's job.)
 
