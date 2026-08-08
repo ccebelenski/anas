@@ -8,7 +8,7 @@ import { AhrLayoutPreviewRequest, PoolName } from '@anas/shared'
 import { withAhrCreateStatus } from '../services/ahr-create-status.js'
 import { readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
-import { readAhrPools } from '../services/ahr-topology.js'
+import { readAhrPools, withExpansionIntent } from '../services/ahr-topology.js'
 import { collectDisks } from './disks.js'
 
 /**
@@ -48,7 +48,7 @@ export async function ahrRoutes(
   const withIntent = async (pool: AhrPool): Promise<AhrPool> => {
     try {
       const intent = await readIntent(pool.name, intentDir)
-      return withAhrCreateStatus(intent ? { ...pool, expansion: intent } : pool, jobQueue)
+      return withAhrCreateStatus(withExpansionIntent(pool, intent), jobQueue)
     }
     catch {
       return withAhrCreateStatus(pool, jobQueue)

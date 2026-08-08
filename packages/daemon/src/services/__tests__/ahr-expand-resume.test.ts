@@ -194,6 +194,105 @@ describe('resumeExpansion — the shared §5.3 recompute-and-continue core', () 
     assert.deepEqual(result.bundle.plan.steps, [])
   })
 
+  // -----------------------------------------------------------------------
+  // Issue #13, from the live stage run: the reshapes FINISHED, but the job
+  // died before pv-resize. §2.3 then plans nothing (arrays already match the
+  // approved set), the #4 completion invariant correctly refuses to call it
+  // done (13.96 vs 18 GiB delivered), and every further Resume is an identical
+  // ~300 ms failure — the capacity is stranded forever. The observed evidence
+  // was PV PSize < DevSize on the grown bands.
+  // -----------------------------------------------------------------------
+  describe('stranded PV capacity (issue #13)', () => {
+    /** `pvs` reporting a PV that never grew to cover its (grown) array. */
+    function withPvs(executor: MockExecutor, rows: { name: string, size: number, devSize: number }[]): MockExecutor {
+      executor.addFixture({
+        command: '/usr/sbin/pvs',
+        result: {
+          stdout: JSON.stringify({ report: [{ pv: rows.map(r => ({
+            pv_name: r.name,
+            vg_name: 'tank',
+            pv_size: String(r.size),
+            pv_free: '0',
+            dev_size: String(r.devSize),
+          })) }] }),
+          stderr: '',
+          exitCode: 0,
+        },
+      })
+      return executor
+    }
+
+    it('THE BUG: an idle, fully-grown pool with unresized PVs plans the pv-resize catch-up', async () => {
+      const executor = withPvs(buildExecutor(MDSTAT_IDLE), [
+        // Band 1 grew; its PV still reports the pre-reshape size.
+        { name: '/dev/md127', size: 4 * GIB, devSize: 6 * GIB },
+        // Band 2 is already whole — it must NOT be given busywork.
+        { name: '/dev/md126', size: GIB, devSize: GIB },
+      ])
+      const { result, submitted } = await resume(executor)
+      assert.equal(result.ok, true, result.ok ? '' : result.message)
+      assert.deepEqual(submitted, ['ahr.expand.resume'], 'the resume must actually run')
+      if (!result.ok)
+        return
+
+      // Without this fix the plan is EMPTY and the resume is a permanent no-op.
+      assert.deepEqual(result.bundle.plan.steps.map(s => s.kind), [
+        'pv-resize',
+        'vg-extend',
+        'lv-extend',
+        'fs-grow',
+      ])
+      // Only the stranded band is resized — derived from truth, not guessed.
+      assert.equal(result.bundle.plan.steps[0].target, 'md/tank-r1')
+      assert.deepEqual(result.bundle.plan.steps.map(s => s.index), [0, 1, 2, 3])
+      assert.match(result.bundle.plan.steps[0].detail!, /capacity is stranded below LVM/)
+      assert.equal((await readIntent('tank', dir))?.state, 'running')
+    })
+
+    it('PVs that already cover their arrays add nothing (idempotent, no busywork)', async () => {
+      const executor = withPvs(buildExecutor(MDSTAT_IDLE), [
+        { name: '/dev/md127', size: 6 * GIB, devSize: 6 * GIB },
+        { name: '/dev/md126', size: GIB, devSize: GIB },
+      ])
+      const { result } = await resume(executor)
+      assert.equal(result.ok, true, result.ok ? '' : result.message)
+      if (!result.ok)
+        return
+      assert.deepEqual(result.bundle.plan.steps, [])
+    })
+
+    it('a mid-reshape resume is not double-planned — the in-flight tail already covers it', async () => {
+      // Both augmentations could fire here; the pv one must defer to the sync
+      // one, which already plans a pv-resize for that band.
+      const executor = withPvs(buildExecutor(MDSTAT_RESHAPING), [
+        { name: '/dev/md127', size: 4 * GIB, devSize: 6 * GIB },
+      ])
+      const { result } = await resume(executor)
+      assert.equal(result.ok, true, result.ok ? '' : result.message)
+      if (!result.ok)
+        return
+      assert.deepEqual(result.bundle.plan.steps.map(s => s.kind), [
+        'reshape-wait',
+        'pv-create',
+        'pv-resize',
+        'vg-extend',
+        'lv-extend',
+        'fs-grow',
+      ])
+      assert.equal(result.bundle.plan.steps.filter(s => s.kind === 'pv-resize').length, 1)
+    })
+
+    it('an unreadable pvs leaves the plan alone — fail-open, never a blocked resume', async () => {
+      const executor = buildExecutor(MDSTAT_IDLE)
+      executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: '', stderr: 'pvs: command failed', exitCode: 5 } })
+      const { result } = await resume(executor)
+      assert.equal(result.ok, true, result.ok ? '' : result.message)
+      if (!result.ok)
+        return
+      assert.deepEqual(result.bundle.plan.steps, [])
+    })
+  })
+
   it('fails closed when md sync state cannot be read (never drives a plan that might complete mid-reshape)', async () => {
     const executor = new MockExecutor()
     executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: '', stderr: 'cat: /proc/mdstat: No such file', exitCode: 1 } })

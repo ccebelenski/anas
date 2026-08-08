@@ -63,10 +63,10 @@ describe('parsePvsReport', () => {
     // Shape check for the form the daemon actually runs (--units b --nosuffix);
     // no byte-form ground truth was captured in stage 0 (see fixtures NOTES.md).
     const json = JSON.stringify({
-      report: [{ pv: [{ pv_name: '/dev/md127', vg_name: 'ahr0', pv_size: '2140143616', pv_free: '0' }] }],
+      report: [{ pv: [{ pv_name: '/dev/md127', vg_name: 'ahr0', pv_size: '2140143616', pv_free: '0', dev_size: '2140143616' }] }],
     })
     assert.deepEqual(parsePvsReport(json), [
-      { name: '/dev/md127', vgName: 'ahr0', sizeBytes: 2140143616, freeBytes: 0 },
+      { name: '/dev/md127', vgName: 'ahr0', sizeBytes: 2140143616, freeBytes: 0, devSizeBytes: 2140143616 },
     ])
   })
 
@@ -104,7 +104,18 @@ describe('parseLvsReport', () => {
 describe('report ARGS', () => {
   it('always request json + exact bytes', () => {
     for (const args of [PVS_ARGS, VGS_ARGS, LVS_ARGS]) {
-      assert.deepEqual(args, ['--reportformat', 'json', '--units', 'b', '--nosuffix'])
+      assert.deepEqual(args.slice(0, 5), ['--reportformat', 'json', '--units', 'b', '--nosuffix'])
     }
+  })
+
+  // pvs additionally asks for the underlying device size, so a PV left smaller
+  // than its (grown) array is detectable from structured output (issue #13).
+  it('pvs appends dev_size WITHOUT dropping the default columns', () => {
+    assert.deepEqual(PVS_ARGS.slice(5), ['-o', '+dev_size'])
+  })
+
+  it('a report without dev_size reads 0 — never a spurious resize', () => {
+    const json = JSON.stringify({ report: [{ pv: [{ pv_name: '/dev/md127', vg_name: 'ahr0', pv_size: '100', pv_free: '0' }] }] })
+    assert.equal(parsePvsReport(json)[0].devSizeBytes, 0)
   })
 })

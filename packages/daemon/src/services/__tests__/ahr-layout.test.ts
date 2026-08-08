@@ -255,6 +255,56 @@ describe('AHR layout (Epic 11 + AHR — docs/AHR-DESIGN.md §2)', () => {
         assert.ok(!unknown.warnings.some(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)))
       })
 
+      // Parallel construction: an expansion that introduces the mix must say
+      // the same thing create does, in the plan preview and the confirm gate.
+      it('the EXPANSION plan carries the same label when a 4Kn disk joins a 512e pool', () => {
+        const plan = planExpansion({
+          poolName: 'tank',
+          tier: 'ahr1',
+          existingBands: existing234(),
+          approvedDisks: [
+            { id: 'd2', usableBytes: 2 * TiB, logicalSectorSize: 512 },
+            { id: 'd3', usableBytes: 3 * TiB, logicalSectorSize: 512 },
+            { id: 'd4', usableBytes: 4 * TiB, logicalSectorSize: 512 },
+            // The newcomer is 4Kn and only 2 TiB, so it joins band 1 (which
+            // becomes 4096) but cannot reach band 2 (which stays 512).
+            { id: 'd4kn', usableBytes: 2 * TiB, logicalSectorSize: 4096 },
+          ],
+        })
+        const warning = plan.preview.warnings.find(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX))
+        assert.ok(warning, `expected the expansion plan to label the mix, got: ${JSON.stringify(plan.preview.warnings)}`)
+        assert.match(warning, /band 1: 4096/)
+        assert.match(warning, /band 2: 512/)
+        assert.match(warning, /allow_mixed_block_sizes/)
+      })
+
+      it('a uniform expansion plans no geometry warning', () => {
+        const plan = planExpansion({
+          poolName: 'tank',
+          tier: 'ahr1',
+          existingBands: existing234(),
+          approvedDisks: [disk('d2', 2), disk('d3', 3), disk('d4', 4), disk('d5', 3)],
+        })
+        assert.ok(!plan.preview.warnings.some(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)))
+      })
+
+      // The array is unassemblable on an older kernel — a downgrade and
+      // disk-portability hazard the operator must see BEFORE confirming, not
+      // discover when a PVE 8 node refuses to bring the pool up.
+      it('names the kernel ≤6.18 assembly hazard', () => {
+        const preview = planFreshLayout(
+          [
+            { id: 'd4kn', usableBytes: 2 * TiB, logicalSectorSize: 4096 },
+            { id: 'd512a', usableBytes: 3 * TiB, logicalSectorSize: 512 },
+            { id: 'd512b', usableBytes: 3 * TiB, logicalSectorSize: 512 },
+          ],
+          'ahr1',
+        )
+        const warning = preview.warnings.find(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX))!
+        assert.match(warning, /will NOT assemble on kernel 6\.18 or older/)
+        assert.match(warning, /PVE 8/)
+      })
+
       it('ignores UNPROTECTED bands — they carry no array, so no PV and no mix', () => {
         // The 4Kn disk is the tallest, so its top slice is the §2.4 wasted band:
         // present in the band list, but never an md array. The two protected

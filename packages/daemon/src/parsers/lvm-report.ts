@@ -13,7 +13,14 @@
 /** Shared report flags — append to `pvs`/`vgs`/`lvs`. */
 const LVM_REPORT_FLAGS = ['--reportformat', 'json', '--units', 'b', '--nosuffix']
 
-export const PVS_ARGS = [...LVM_REPORT_FLAGS]
+/**
+ * `-o +dev_size` APPENDS the underlying device size to the default columns, so
+ * a PV that has not been resized after its md array grew is detectable from
+ * structured output alone (`pv_size < dev_size`) — the system truth a resume
+ * needs to plan its own catch-up pv-resize (issue #13). Appending keeps every
+ * default column, so existing consumers and fixtures are unaffected.
+ */
+export const PVS_ARGS = [...LVM_REPORT_FLAGS, '-o', '+dev_size']
 export const VGS_ARGS = [...LVM_REPORT_FLAGS]
 export const LVS_ARGS = [...LVM_REPORT_FLAGS]
 
@@ -24,6 +31,7 @@ interface RawPv {
   vg_name?: string
   pv_size?: string
   pv_free?: string
+  dev_size?: string
 }
 
 interface RawVg {
@@ -55,6 +63,14 @@ export interface LvmPv {
   vgName: string | null
   sizeBytes: number
   freeBytes: number
+  /**
+   * Size of the underlying device. `pv_size < devSizeBytes` means the PV has
+   * not been resized to cover a grown array — the stranded-capacity signature
+   * (issue #13). 0 when the report did not carry the column (older captures /
+   * fixtures), which reads as "nothing to reclaim" — fail-safe, never a
+   * spurious resize.
+   */
+  devSizeBytes: number
 }
 
 /** One volume group (one per AHR pool, named after it). */
@@ -148,6 +164,7 @@ export function parsePvsReport(json: string): LvmPv[] {
       vgName: r.vg_name ? r.vg_name : null,
       sizeBytes: parseLvmSize(r.pv_size),
       freeBytes: parseLvmSize(r.pv_free),
+      devSizeBytes: parseLvmSize(r.dev_size),
     }))
 }
 

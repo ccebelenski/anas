@@ -4,7 +4,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { AhrExpansionPlan, AhrLayoutDisk, AhrReplacement } from './ahr-layout.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { collectDisks } from '../routes/disks.js'
-import { executeExpansion, executeReplace, projectExistingBands, syncCompletionSteps, syncingAhrBands } from './ahr-expand-exec.js'
+import { executeExpansion, executeReplace, projectExistingBands, pvCatchUpSteps, syncCompletionSteps, syncingAhrBands, underSizedPvBands } from './ahr-expand-exec.js'
 import { AhrIntentConflictError, writeIntent } from './ahr-intent.js'
 import { AhrPlanError, planExpansion } from './ahr-layout.js'
 import { spareCoverageWarnings } from './ahr-spare.js'
@@ -53,12 +53,16 @@ export async function resolveApproved(
   const needInventory = approvedIds.some(id => !pool.disks.some(d => d.id === id))
   const inventory = needInventory ? await collectDisks(executor, diskCache) : []
   for (const id of approvedIds) {
+    // The inventory is the only source of logical sector size (AhrDisk carries
+    // none), and it is loaded whenever a disk is JOINING — which is exactly
+    // when a geometry mix can be introduced. Existing members are enriched from
+    // it too so the mixed-geometry check compares like with like (issue #8).
+    const inv = inventory.find(d => d.id === id)
     const poolDisk = pool.disks.find(d => d.id === id)
     if (poolDisk) {
-      approved.push({ id, usableBytes: poolDisk.sizeBytes })
+      approved.push({ id, usableBytes: poolDisk.sizeBytes, logicalSectorSize: inv?.logicalSectorSize })
       continue
     }
-    const inv = inventory.find(d => d.id === id)
     if (!inv) {
       problems.push(`disk '${id}' not found in the inventory`)
       continue
@@ -67,7 +71,7 @@ export async function resolveApproved(
       problems.push(`disk '${id}' is not available (status: ${inv.status}${inv.poolName ? `, pool '${inv.poolName}'` : ''})`)
       continue
     }
-    approved.push({ id, usableBytes: inv.size })
+    approved.push({ id, usableBytes: inv.size, logicalSectorSize: inv.logicalSectorSize })
   }
   return { approved, problems }
 }
@@ -131,6 +135,33 @@ async function withInFlightSyncSteps(executor: CommandExecutor, pool: AhrPool, b
   const steps = [
     ...bundle.plan.steps,
     ...syncCompletionSteps(pool.name, pool.lv.name, bands).map((s, i) => ({ ...s, index: base + i })),
+  ]
+  return { ...bundle, plan: { ...bundle.plan, steps } }
+}
+
+/**
+ * Add the pv-resize catch-up for bands whose reshape ALREADY finished but whose
+ * PV was never resized (issue #13).
+ *
+ * The sibling of {@link withInFlightSyncSteps}, for the window just after it:
+ * that one covers "the sync is still running, its tail is still owed", this one
+ * covers "the sync ended, the tail was never delivered". Both exist because
+ * §2.3 planning reads md state, and md state alone cannot distinguish an
+ * expansion that finished from one that stopped one step short of finishing.
+ *
+ * Bands already carrying a pv-resize in the plan are skipped — a fresh expand
+ * plans its own, and duplicating them would only re-run a no-op step.
+ */
+async function withPvCatchUpSteps(executor: CommandExecutor, pool: AhrPool, bundle: PlanBundle): Promise<PlanBundle> {
+  const planned = new Set(bundle.plan.steps.filter(s => s.kind === 'pv-resize').map(s => s.target))
+  const bands = (await underSizedPvBands(executor, pool.name))
+    .filter(band => !planned.has(`md/${pool.name}-r${band}`))
+  if (bands.length === 0)
+    return bundle
+  const base = bundle.plan.steps.length
+  const steps = [
+    ...bundle.plan.steps,
+    ...pvCatchUpSteps(pool.name, pool.lv.name, bands).map((s, i) => ({ ...s, index: base + i })),
   ]
   return { ...bundle, plan: { ...bundle.plan, steps } }
 }
@@ -237,6 +268,11 @@ export async function resumeExpansion(input: ResumeExpansionInput): Promise<Resu
     // might declare itself complete mid-reshape.
     return { ok: false, reason: 'plan-error', message: `could not read md sync state: ${err instanceof Error ? err.message : String(err)}` }
   }
+  // …and with the pv-resize catch-up for reshapes that finished but never had
+  // their capacity handed up to LVM (issue #13). Fail-open by construction:
+  // underSizedPvBands returns [] when it cannot read, so an unreadable `pvs`
+  // leaves the plan exactly as it was rather than blocking a resume.
+  bundle = await withPvCatchUpSteps(executor, pool, bundle)
 
   const running: AhrExpansionIntent = { ...intent, state: 'running' }
   try {

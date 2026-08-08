@@ -219,12 +219,12 @@ function bandRegionsAbove(disks: RoundedDisk[], floorBytes: number): Region[] {
  * Advisory only: the mix changes nothing about the layout, and btrfs's 4 KiB
  * sector size satisfies the stacked LV either way.
  */
-function mixedBlockSizeWarning(regions: Region[], bands: AhrPreviewBand[]): string | null {
-  const perBand = bands
-    .map((b, i) => ({
+function mixedBlockSizeWarning(perBandInput: { band: number, protectedBand: boolean, members: RoundedDisk[] }[]): string | null {
+  const perBand = perBandInput
+    .map(b => ({
       band: b.band,
-      protectedBand: b.protected,
-      blockBytes: regions[i].members.reduce((max, d) => Math.max(max, d.logicalBlockBytes), 0),
+      protectedBand: b.protectedBand,
+      blockBytes: b.members.reduce((max, d) => Math.max(max, d.logicalBlockBytes), 0),
     }))
     .filter(b => b.protectedBand && b.blockBytes > 0)
   const distinct = [...new Set(perBand.map(b => b.blockBytes))]
@@ -232,9 +232,12 @@ function mixedBlockSizeWarning(regions: Region[], bands: AhrPreviewBand[]): stri
     return null
   distinct.sort((a, b) => b - a)
   const detail = perBand.map(b => `band ${b.band}: ${b.blockBytes}`).join(', ')
-  return `${MIXED_SECTOR_WARNING_PREFIX} in this selection (${distinct.join('-byte and ')}-byte logical blocks) — `
-    + `the bands will have differing logical block sizes (${detail}); the LVM stack is created with `
-    + `allow_mixed_block_sizes, and btrfs uses a 4 KiB sector size either way`
+  return `${MIXED_SECTOR_WARNING_PREFIX} (${distinct.join('-byte and ')}-byte logical blocks) — `
+    + `the bands will have differing logical block sizes (${detail}); the LVM stack is built with `
+    + `allow_mixed_block_sizes, and btrfs uses a 4 KiB sector size either way. `
+    + `PORTABILITY: md logs "array will not be assembled in old kernels that lack configurable LBS support (<= 6.18)" — `
+    + `a band whose logical block size is not the kernel default will NOT assemble on kernel 6.18 or older `
+    + `(PVE 8), so downgrading this node or moving these disks to an older host would leave the pool unassembled`
 }
 
 /** The min-disk warning text (mirrors the UI advisor copy). */
@@ -321,7 +324,9 @@ export function planFreshLayout(disks: AhrLayoutDisk[], tier: AhrType): AhrLayou
       )
     }
   }
-  const mixed = mixedBlockSizeWarning(regions, bands)
+  const mixed = mixedBlockSizeWarning(
+    bands.map((b, i) => ({ band: b.band, protectedBand: b.protected, members: regions[i].members })),
+  )
   if (mixed)
     warnings.push(mixed)
 
@@ -402,6 +407,8 @@ export function planExpansion(input: {
   const partitionBands = new Map<string, number[]>() // disk id → new slice band indices
   const mdSteps: Omit<AhrExpansionStep, 'index'>[] = []
   const pvSteps: Omit<AhrExpansionStep, 'index'>[] = []
+  // Post-expansion membership per band — what the mixed-geometry check reads.
+  const bandMembers: { band: number, protectedBand: boolean, members: RoundedDisk[] }[] = []
 
   const addSlice = (diskId: string, band: number): void => {
     const list = partitionBands.get(diskId) ?? []
@@ -467,6 +474,7 @@ export function planExpansion(input: {
       usableBytes: heightBytes * (newCount - PARITY_DISKS[tier]),
       protected: true,
     })
+    bandMembers.push({ band: band.band, protectedBand: true, members: newMembers })
   }
 
   // --- New bands: strictly ABOVE the current top array boundary -------------
@@ -515,7 +523,17 @@ export function planExpansion(input: {
       usableBytes: level === null ? 0 : heightBytes * (memberCount - PARITY_DISKS[tier]),
       protected: level !== null,
     })
+    bandMembers.push({ band, protectedBand: level !== null, members: region.members })
   }
+
+  // --- Mixed sector geometries (issue #8) — the SAME label create shows ----
+  // Parallel construction: an expansion that introduces a 4Kn disk into a 512e
+  // pool (or vice versa) lands the operator in exactly the geometry the create
+  // path warns about, so it must say the same thing at the same moment — the
+  // plan preview and the confirm gate, before anything is touched.
+  const mixed = mixedBlockSizeWarning(bandMembers)
+  if (mixed)
+    warnings.push(mixed)
 
   // --- Stranded capacity: disks that end BETWEEN immovable boundaries -------
   // (e.g. an approved 2.5 TB disk against existing 2/3 TB boundaries: the

@@ -234,6 +234,15 @@ async function executeCreate(
     await run(executor, SGDISK, [...specs.flatMap(s => s.sgdiskArgs), devPath])
   }
   updateProgress('Settling udev (partition device nodes)')
+  // `udevadm settle` IS sufficient here, unlike on the expansion path (issue
+  // #12, which needs `partx -a`). The difference is holders, not luck: create
+  // only ever runs on disks the inventory reported 'available' and has just
+  // wiped, so nothing holds them and sgdisk's whole-table BLKRRPART re-read
+  // succeeds — the partitions exist by the time udev is asked about them.
+  // Expansion partitions disks whose OTHER slices are live md members, and the
+  // kernel refuses to re-read a held disk's table. If create ever gains the
+  // ability to partition an in-use disk, it needs the expansion path's
+  // partx-then-verify treatment.
   await run(executor, UDEVADM, ['settle'])
 
   // --- Clear ghost md state on the fresh partitions (§2.6) --------------------

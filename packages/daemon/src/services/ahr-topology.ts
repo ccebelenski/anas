@@ -6,6 +6,7 @@ import type {
   AhrCapacity,
   AhrDisk,
   AhrDiskPartition,
+  AhrExpansionIntent,
   AhrPoolState,
   ArrayLevel,
   ArrayState,
@@ -18,7 +19,7 @@ import { AhrPool, AhrPoolBrief } from '@anas/shared'
 import { btrfsUsageArgs, parseBtrfsUsage } from '../parsers/btrfs-usage.js'
 import { parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
-import { LVS_ARGS, parseLvsReport, parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
+import { LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { hasArray, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
@@ -53,6 +54,7 @@ const LSBLK = '/usr/bin/lsblk'
 const LS = '/usr/bin/ls'
 const VGS = '/usr/sbin/vgs'
 const LVS = '/usr/sbin/lvs'
+const PVS = '/usr/sbin/pvs'
 const BTRFS = '/usr/bin/btrfs'
 const FINDMNT = '/usr/bin/findmnt'
 
@@ -322,11 +324,15 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
   if (discovered.length === 0)
     return []
 
-  const [lsblkRes, byIdRes, vgsRes, lvsRes, findmntRes] = await Promise.all([
+  const [lsblkRes, byIdRes, vgsRes, lvsRes, pvsRes, findmntRes] = await Promise.all([
     executor.exec(LSBLK, AHR_LSBLK_ARGS),
     executor.exec(LS, ['-la', '/dev/disk/by-id/']),
     executor.exec(VGS, VGS_ARGS),
     executor.exec(LVS, LVS_ARGS),
+    // pvs joins the SAME parallel batch, so the extra truth costs no latency.
+    // It is what tells array capacity that LVM has not picked up (issue #13)
+    // from capacity that is genuinely unprotected.
+    executor.exec(PVS, PVS_ARGS),
     executor.exec(FINDMNT, AHR_FINDMNT_ARGS),
   ])
 
@@ -334,6 +340,7 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
   const byIdMap = parseDiskByIdListing(byIdRes.stdout)
   const vgs = parseVgsReport(vgsRes.stdout)
   const lvs = parseLvsReport(lvsRes.stdout)
+  const pvs = parsePvsReport(pvsRes.stdout)
   const mounts = parseFindmnt(findmntRes.stdout)
 
   // The ANAS-managed mdadm.conf — an ARRAY pin (by UUID) is the ANAS-authored
@@ -597,6 +604,26 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
         ? `${(pendingBytes / 1024 ** 3).toFixed(0)} GiB of capacity is present but not yet part of the pool — run an expansion to add it`
         : `${(pendingBytes / 1024 ** 3).toFixed(0)} GiB of capacity is pending — no new usable space until ${needed} more disk${needed === 1 ? '' : 's'} with capacity above the top band ${needed === 1 ? 'is' : 'are'} added`)
     }
+    // Capacity that IS inside a protected array but that LVM has not picked up:
+    // the array grew and its PV was never resized (issue #13). It is emphatically
+    // not `unprotectedWasted` — it sits under full RAID redundancy — so it is
+    // reported as PENDING, the bucket that means "present, not yet usable", with
+    // the concrete verb that reclaims it.
+    let belowLvmBytes = 0
+    for (const entry of arrayEntries) {
+      const arrayBytes = (entry.mdstat.blocks ?? 0) * 1024
+      const pv = pvs.find(p => p.name === `/dev/${entry.mdstat.kernelName}` || p.name === `/dev/md/${poolName}-r${entry.band}`)
+      if (!pv || arrayBytes <= 0 || pv.sizeBytes <= 0)
+        continue
+      belowLvmBytes += Math.max(0, arrayBytes - pv.sizeBytes)
+    }
+    if (belowLvmBytes > MIB) {
+      pendingBytes += belowLvmBytes
+      advisories.push(
+        `${(belowLvmBytes / 1024 ** 3).toFixed(0)} GiB is grown into the RAID arrays but not yet handed up to LVM — `
+        + `resume or re-run the expansion to deliver it (the capacity is protected, just not yet usable)`,
+      )
+    }
     const unprotectedWastedBytes = Math.max(0, rawBytes - usableBytes - redundancyOverheadBytes - pendingBytes)
     const capacity: AhrCapacity = {
       rawBytes,
@@ -687,6 +714,31 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
 export type AhrPoolDecorator = (pool: AhrPool) => AhrPool
 
 /**
+ * Attach a pool's expansion intent AND mirror it into `advisories[]`.
+ *
+ * The ONE place the intent is fused onto a pool read, because the two consumers
+ * disagreed before: a halted expansion raised a dashboard card while the pool's
+ * own `advisories[]` came back EMPTY, so the Hybrid RAID view showed a pool with
+ * a stalled expansion and nothing to say about it. Anything worth a card is
+ * worth an advisory — they are the same fact at two altitudes.
+ *
+ * Only `halted` advises: 'running' is an in-progress operation that rides the
+ * jobs strip (§10 — in-progress states deliberately do not card), and 'done' /
+ * 'abandoned' intents are cleared rather than displayed.
+ */
+export function withExpansionIntent(pool: AhrPool, intent: AhrExpansionIntent | null): AhrPool {
+  if (!intent)
+    return pool
+  const advisories = intent.state === 'halted'
+    ? [
+        ...pool.advisories,
+        `expansion is HALTED — Resume (recompute and continue) or Abandon it; no new capacity is delivered until one of the two runs`,
+      ]
+    : pool.advisories
+  return { ...pool, expansion: intent, advisories }
+}
+
+/**
  * Which array/band + which member, for the degraded card. Every degraded
  * array in the pool is named (the card stays ONE per pool); a degraded array
  * with no faulty member listed (e.g. a member gone entirely, or the GT-8
@@ -768,7 +820,7 @@ export async function collectAhrWarnings(
     const withIntents = await Promise.all(pools.map(async (pool): Promise<AhrPool> => {
       try {
         const intent = await readIntent(pool.name, intentDir)
-        return decorate(intent ? { ...pool, expansion: intent } : pool)
+        return decorate(withExpansionIntent(pool, intent))
       }
       catch {
         return decorate(pool)

@@ -181,6 +181,10 @@ function world(opts: { mdstat?: string | string[], r2Export?: string } = {}): Mo
   // Notifications + udev settle succeed quietly.
   executor.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/udevadm', result: { stdout: '', stderr: '', exitCode: 0 } })
+  // partx + the by-id link probe the partition step verifies with (issue #12).
+  // Command-only, so arg-specific realpath fixtures in individual tests still win.
+  executor.addFixture({ command: '/usr/sbin/partx', result: { stdout: '', stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/sdt1\n', stderr: '', exitCode: 0 } })
   return executor
 }
 
@@ -322,7 +326,13 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
 
     it('carves only the missing slices for a new disk, with labels + FD00', async () => {
       const executor = world()
-      executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${W}`), result: { stdout: diskJson('sdt', SIZE_4G, []), stderr: '', exitCode: 0 } })
+      // Before the carve the disk is bare; AFTER it the kernel must show the
+      // slices — the partition step now VERIFIES that (issue #12) instead of
+      // reporting done and failing minutes later.
+      executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${W}`), results: [
+        { stdout: diskJson('sdt', SIZE_4G, []), stderr: '', exitCode: 0 },
+        { stdout: diskJson('sdt', SIZE_4G, [{ name: 'sdt1', size: B1_INTERIOR, label: 'tank-d4-b1' }, { name: 'sdt2', size: B2_INTERIOR, label: 'tank-d4-b2' }]), stderr: '', exitCode: 0 },
+      ] })
       // Pool-wide label scan (fresh disk gets max(d)+1 = d4).
       const tree = { blockdevices: Object.values(DISK_PARTS).map(d => ({
         name: d.kernel,
@@ -362,6 +372,65 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
       const outcome = await run(executor, mkPlan([B1, B2], [{ kind: 'array-grow', target: 'md/tank-r1' }]), [X, Y, Z])
       assert.equal(outcome.ok, true, outcome.error)
       assert.deepEqual(mutatingCalls(executor), [])
+    })
+
+    // Issue #12: sgdisk writes the new slice to the GPT of a disk that is IN
+    // USE (its other slices are live md members), and the kernel refuses the
+    // whole-table BLKRRPART re-read that would publish it. `udevadm settle`
+    // cannot help — there is no event to wait for. The step used to report
+    // success and the job died ~6.5 minutes later in expectedBandMembers.
+    it('publishes a new slice with partx and VERIFIES it appeared', async () => {
+      const executor = world()
+      executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${W}`), results: [
+        { stdout: diskJson('sdt', SIZE_4G, []), stderr: '', exitCode: 0 },
+        { stdout: diskJson('sdt', SIZE_4G, [{ name: 'sdt1', size: B1_INTERIOR, label: 'tank-d4-b1' }, { name: 'sdt2', size: B2_INTERIOR, label: 'tank-d4-b2' }]), stderr: '', exitCode: 0 },
+      ] })
+      executor.addFixture({ command: LSBLK, args: ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL'], result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: SGDISK, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+      const outcome = await run(executor, mkPlan([B1_GROWN, B2_CONVERTED], [{ kind: 'partition', target: W }]), [X, Y, Z, W])
+      assert.equal(outcome.ok, true, outcome.error)
+
+      // BLKPG per-partition add — the mechanism that works on a held disk.
+      const partx = executor.calls.filter(c => c.command === '/usr/sbin/partx')
+      assert.deepEqual(partx.map(c => c.args), [['-a', `/dev/disk/by-id/${W}`]])
+      // …and it runs AFTER sgdisk wrote the table, not before.
+      const order = executor.calls.map(c => c.command)
+      assert.ok(order.indexOf(SGDISK) < order.indexOf('/usr/sbin/partx'))
+    })
+
+    it('FAILS THE PARTITION STEP when the slice never becomes a device', async () => {
+      const executor = world()
+      // sgdisk succeeds and partx runs, but the kernel never adopts the slice:
+      // the tree still shows a bare disk. The step must die HERE, naming the
+      // real cause, not six minutes downstream in an unrelated step.
+      executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${W}`), result: { stdout: diskJson('sdt', SIZE_4G, []), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: LSBLK, args: ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL'], result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: SGDISK, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+      const outcome = await run(executor, mkPlan([B1_GROWN, B2_CONVERTED], [{ kind: 'partition', target: W }]), [X, Y, Z, W])
+      assert.equal(outcome.ok, false)
+      assert.match(outcome.error!, /never appeared as/)
+      assert.match(outcome.error!, /the disk is in use, so a whole-table re-read is refused/)
+      // It never proceeded to touch md with a partition that does not exist.
+      assert.ok(!executor.calls.some(c => c.command === MDADM && c.args.includes('--add')))
+    })
+
+    it('a by-id link that never materializes also fails the step', async () => {
+      const executor = world()
+      executor.addFixture({ command: LSBLK, args: diskLsblkArgs(`/dev/disk/by-id/${W}`), results: [
+        { stdout: diskJson('sdt', SIZE_4G, []), stderr: '', exitCode: 0 },
+        { stdout: diskJson('sdt', SIZE_4G, [{ name: 'sdt1', size: B1_INTERIOR, label: 'tank-d4-b1' }, { name: 'sdt2', size: B2_INTERIOR, label: 'tank-d4-b2' }]), stderr: '', exitCode: 0 },
+      ] })
+      executor.addFixture({ command: LSBLK, args: ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL'], result: { stdout: JSON.stringify({ blockdevices: [] }), stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: SGDISK, result: { stdout: '', stderr: '', exitCode: 0 } })
+      // The kernel has the partition, but udev never made the -partN symlink
+      // the md steps address it by.
+      executor.addFixture({ command: '/usr/bin/realpath', args: [`/dev/disk/by-id/${W}-part1`], result: { stdout: '', stderr: 'no such file', exitCode: 1 } })
+
+      const outcome = await run(executor, mkPlan([B1_GROWN, B2_CONVERTED], [{ kind: 'partition', target: W }]), [X, Y, Z, W])
+      assert.equal(outcome.ok, false)
+      assert.match(outcome.error!, /never appeared as/)
     })
 
     it('adds the new member then grows — never with --backup-file', async () => {

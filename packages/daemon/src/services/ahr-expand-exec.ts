@@ -50,7 +50,16 @@ const LSBLK = '/usr/bin/lsblk'
 const SGDISK = '/usr/sbin/sgdisk'
 const MDADM = '/usr/sbin/mdadm'
 const UDEVADM = '/usr/bin/udevadm'
+const PARTX = '/usr/sbin/partx'
 const REALPATH = '/usr/bin/realpath'
+
+/**
+ * Bounded wait for a freshly added partition to become a device + by-id link.
+ * Short and few: BLKPG add is synchronous and the udev symlink follows within
+ * milliseconds — this exists to absorb that lag, not to mask a real refusal.
+ */
+const PARTITION_APPEAR_ATTEMPTS = 10
+const PARTITION_APPEAR_INTERVAL_MS = 200
 const UPDATE_INITRAMFS = '/usr/sbin/update-initramfs'
 const PVCREATE = '/usr/sbin/pvcreate'
 const PVRESIZE = '/usr/sbin/pvresize'
@@ -364,9 +373,74 @@ export async function ensureDiskPartitions(
     return { created: 0 }
 
   await execChecked(executor, SGDISK, [...missing.flatMap(s => s.sgdiskArgs), dev])
-  // Give udev a beat to create the -partN by-id symlinks (best-effort).
+
+  // sgdisk wrote the GPT, but on a disk that is IN USE (every member disk of a
+  // live pool is — md holds its existing slices) the kernel REFUSES the
+  // BLKRRPART whole-table re-read that would publish the new partition. The
+  // node never appears, and `udevadm settle` cannot help: it drains the udev
+  // queue for events that were never generated (issue #12 — the expansion then
+  // died ~6.5 minutes later in expectedBandMembers, far from the cause).
+  //
+  // `partx -a` uses BLKPG to add partitions ONE AT A TIME, which needs no
+  // exclusive re-read and works on a held disk. It reports "error adding
+  // partitions" for the ones the kernel already knows, which is expected and
+  // harmless here — we verify the real outcome below rather than trusting an
+  // exit code that conflates "already present" with "failed".
+  await executor.exec(PARTX, ['-a', dev])
+  // udev still owns the by-id SYMLINKS, and those it does emit events for.
   await executor.exec(UDEVADM, ['settle'])
+
+  // VERIFY, never assume. Reporting this step done without the devices present
+  // is what turned a partitioning failure into an unrelated error six minutes
+  // downstream. The step that creates a thing is the step that must prove it.
+  const expected = missing.map(s => s.number)
+  const appeared = await waitForPartitions(executor, dev, diskId, expected)
+  if (appeared.length > 0) {
+    throw new Error(
+      `partition${appeared.length === 1 ? '' : 's'} ${appeared.join(', ')} on '${diskId}' `
+      + `${appeared.length === 1 ? 'was' : 'were'} written to the GPT but never appeared as ${appeared.length === 1 ? 'a device' : 'devices'} — `
+      + `the kernel did not adopt the new partition table (the disk is in use, so a whole-table re-read is refused). `
+      + `Check \`partx -a ${dev}\` and \`dmesg\`; the slice exists on disk, so re-running the expansion is safe`,
+    )
+  }
   return { created: missing.length }
+}
+
+/**
+ * Wait (bounded) for each expected partition number to exist as BOTH a kernel
+ * device and its `-partN` by-id symlink — the two forms every later step uses.
+ * Returns the numbers that never showed up (empty = all present).
+ *
+ * Polling rather than a single check because BLKPG add and the udev symlink
+ * that follows it are asynchronous; polling rather than a fixed sleep because
+ * the normal case resolves in one pass.
+ */
+async function waitForPartitions(
+  executor: CommandExecutor,
+  dev: string,
+  diskId: string,
+  expected: readonly number[],
+): Promise<number[]> {
+  let outstanding = [...expected]
+  for (let attempt = 0; attempt < PARTITION_APPEAR_ATTEMPTS && outstanding.length > 0; attempt++) {
+    if (attempt > 0)
+      await sleep(PARTITION_APPEAR_INTERVAL_MS)
+    const tree = await readDiskTree(executor, dev)
+    const present = new Set((tree?.parts ?? []).map(p => p.number).filter((n): n is number => n !== null))
+    const stillMissing: number[] = []
+    for (const number of outstanding) {
+      if (!present.has(number)) {
+        stillMissing.push(number)
+        continue
+      }
+      // The kernel has it; the by-id link the md steps address it by may lag.
+      const link = await executor.exec(REALPATH, [`${byIdPath(diskId)}-part${number}`])
+      if (link.exitCode !== 0)
+        stillMissing.push(number)
+    }
+    outstanding = stillMissing
+  }
+  return outstanding
 }
 
 interface BandMember {
@@ -574,6 +648,72 @@ export async function syncingAhrBands(executor: CommandExecutor, poolName: strin
  * Every step is detect-then-delta, so a band that is already pv-created /
  * extended costs one read and logs "already done".
  */
+/**
+ * Bands whose PV has NOT been resized to cover its md array — read from system
+ * truth, `pv_size < dev_size` (issue #13).
+ *
+ * This is the stranded-capacity signature. §2.3 planning derives array growth
+ * from md state, and pv-resize steps ride array-grow steps — so a resume
+ * entered AFTER the reshapes finished but BEFORE pv-resize ran sees arrays
+ * already at their target width, plans no growth, and therefore plans no
+ * pv-resize either. The capacity is real and reachable, the plan is empty, and
+ * the #4 delivered-capacity invariant then correctly refuses to call the
+ * expansion done — making every further Resume an identical instant failure.
+ *
+ * Deriving it from the PVs instead makes Resume self-healing and idempotent,
+ * which is what §5.3's recompute-from-truth philosophy asks for: the plan
+ * describes the distance between the system as it IS and as it should be, no
+ * matter which step last succeeded.
+ *
+ * Fail-open: an unreadable `pvs`, or a report without the dev_size column,
+ * yields no bands — this may never invent work it cannot justify.
+ */
+export async function underSizedPvBands(executor: CommandExecutor, poolName: string): Promise<number[]> {
+  const res = await executor.exec(PVS, PVS_ARGS)
+  if (res.exitCode !== 0)
+    return []
+  const pvs = parsePvsReport(res.stdout)
+  const arrays = await resolveAhrArrays(executor, poolName)
+  const bands: number[] = []
+  for (const [band, resolved] of arrays) {
+    const pv = pvs.find(p => p.name === resolved.dev || p.name === `/dev/md/${poolName}-r${band}`)
+    if (!pv || pv.devSizeBytes <= 0)
+      continue
+    if (pv.sizeBytes < pv.devSizeBytes - LVM_SLACK_BYTES)
+      bands.push(band)
+  }
+  // Ascending band order — the steps must read bottom-up like every other plan.
+  bands.sort((a, b) => a - b)
+  return bands
+}
+
+/**
+ * The catch-up steps for bands whose arrays are already grown but whose PVs
+ * still hide the new capacity (issue #13): resize each stale PV, then the one
+ * shared tail that turns reclaimed PV space into filesystem space.
+ *
+ * Deliberately NO reshape-wait — these bands are done reshaping; that is
+ * precisely why they were missed.
+ */
+export function pvCatchUpSteps(
+  poolName: string,
+  lvName: string,
+  bands: readonly number[],
+): Omit<AhrExpansionStep, 'index'>[] {
+  if (bands.length === 0)
+    return []
+  const steps: Omit<AhrExpansionStep, 'index'>[] = bands.map(band => ({
+    kind: 'pv-resize' as const,
+    target: `md/${poolName}-r${band}`,
+    status: 'pending' as const,
+    detail: 'the array grew but its PV still reports the old size — capacity is stranded below LVM',
+  }))
+  steps.push({ kind: 'vg-extend', target: poolName, status: 'pending' })
+  steps.push({ kind: 'lv-extend', target: lvName, status: 'pending' })
+  steps.push({ kind: 'fs-grow', target: lvName, status: 'pending' })
+  return steps
+}
+
 export function syncCompletionSteps(
   poolName: string,
   lvName: string,

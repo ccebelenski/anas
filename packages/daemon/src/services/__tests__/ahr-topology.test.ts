@@ -10,7 +10,7 @@ import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
-import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, buildAhrWarnings, readAhrPools } from '../ahr-topology.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, buildAhrWarnings, readAhrPools, withExpansionIntent } from '../ahr-topology.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/ahr')
@@ -380,6 +380,73 @@ unused devices: <none>
       assert.equal(pools.length, 1)
       assert.equal(pools[0].name, 'media')
       assert.equal(pools[0].state, 'failed', 'pinned-but-VG-gone reports as failed, not hidden')
+    })
+  })
+
+  // --- Reporting nits from the live stage halt (issue #13) -------------------
+  describe('stranded-capacity reporting (issue #13)', () => {
+    /** ahr0 with md127's PV left smaller than the (grown) array. */
+    function stalePvExecutor(): MockExecutor {
+      const mock = healthyExecutor()
+      mock.addFixture({
+        command: '/usr/sbin/pvs',
+        result: ok(JSON.stringify({ report: [{ pv: [
+          // md127 = band 1: the array is 2089984 KiB; the PV covers only half.
+          { pv_name: '/dev/md127', vg_name: 'ahr0', pv_size: String(1000000 * 1024), pv_free: '0', dev_size: String(2089984 * 1024) },
+          { pv_name: '/dev/md126', vg_name: 'ahr0', pv_size: String(523200 * 1024), pv_free: '0', dev_size: String(523200 * 1024) },
+        ] }] })),
+      })
+      return mock
+    }
+
+    it('capacity inside the arrays but below LVM is PENDING, not unprotected waste', async () => {
+      const pool = (await readAhrPools(stalePvExecutor()))[0]
+      // It sits under full RAID5 redundancy — calling it "unprotected" was a lie.
+      assert.ok(pool.capacity.pendingBytes > 0, 'the stranded capacity must be reported as pending')
+      assert.ok(
+        pool.advisories.some(a => a.includes('not yet handed up to LVM') && a.includes('the capacity is protected')),
+        `expected a below-LVM advisory, got: ${JSON.stringify(pool.advisories)}`,
+      )
+    })
+
+    it('a pool whose PVs cover their arrays reports no stranded capacity', async () => {
+      const pool = (await readAhrPools(healthyExecutor()))[0]
+      assert.ok(!pool.advisories.some(a => a.includes('not yet handed up to LVM')))
+    })
+  })
+
+  // --- A halted expansion says so on the POOL, not only on the dashboard -----
+  describe('halted-expansion advisory mirrors the card (issue #13)', () => {
+    const intent = {
+      id: '11111111-2222-3333-4444-555555555555',
+      trigger: 'add-disk' as const,
+      approvedDisks: ['ata-A', 'ata-B'],
+      before: { rawBytes: 0, usableBytes: 0, usedBytes: 0, freeBytes: 0, redundancyOverheadBytes: 0, unprotectedWastedBytes: 0, pendingBytes: 0 },
+      after: { rawBytes: 0, usableBytes: 0, usedBytes: 0, freeBytes: 0, redundancyOverheadBytes: 0, unprotectedWastedBytes: 0, pendingBytes: 0 },
+    }
+
+    it('a HALTED intent adds a pool advisory alongside the dashboard card', async () => {
+      const pool = (await readAhrPools(healthyExecutor()))[0]
+      assert.deepEqual(pool.advisories, [], 'the base pool is quiet')
+
+      const halted = withExpansionIntent(pool, { ...intent, state: 'halted' })
+      // The card existed while advisories[] came back EMPTY — the Hybrid RAID
+      // view showed a stalled expansion with nothing to say about it.
+      assert.ok(halted.advisories.some(a => a.includes('expansion is HALTED') && a.includes('Resume') && a.includes('Abandon')))
+      assert.equal(buildAhrWarnings([halted]).length, 1, 'and the card is still raised')
+    })
+
+    it('a RUNNING intent attaches but does not advise (it rides the jobs strip)', async () => {
+      const pool = (await readAhrPools(healthyExecutor()))[0]
+      const running = withExpansionIntent(pool, { ...intent, state: 'running' })
+      assert.equal(running.expansion?.state, 'running')
+      assert.deepEqual(running.advisories, [])
+      assert.deepEqual(buildAhrWarnings([running]), [])
+    })
+
+    it('no intent leaves the pool untouched', async () => {
+      const pool = (await readAhrPools(healthyExecutor()))[0]
+      assert.equal(withExpansionIntent(pool, null), pool)
     })
   })
 
