@@ -225,6 +225,47 @@ describe('buildAhrPoolBriefs (story 11.13, AHR-DESIGN §10 revision)', () => {
     }
   }
 
+  // 11.19 — the three fields are a PURE PROJECTION of the AhrArray the brief is
+  // built from: already read, previously dropped. No extra system read.
+  it('projects each band\'s height, state and sync from the array it derives from', async () => {
+    const pool = await healthyPool()
+    const b = buildAhrPoolBriefs([pool])[0]
+
+    for (let i = 0; i < b.bands.length; i++) {
+      const array = pool.arrays[i]
+      assert.equal(b.bands[i].band, array.band)
+      // The SLICE size — what a member contributes to this band — not the
+      // member's whole disk size, which the tiles used to show against it.
+      assert.equal(b.bands[i].heightBytes, array.heightBytes)
+      assert.ok(b.bands[i].heightBytes! > 0)
+      assert.notEqual(b.bands[i].heightBytes, b.bands[i].members[0].sizeBytes)
+      assert.equal(b.bands[i].state, array.state)
+    }
+    // An idle pool has no sync to report — the field is ABSENT, never a zeroed
+    // placeholder the UI would render as a stalled 0% strip.
+    assert.ok(b.bands.every(band => band.sync === undefined))
+  })
+
+  it('carries a running sync, and marks a QUEUED band by its absence (issue #9)', async () => {
+    const pool = await healthyPool()
+    // Band 1 is rebuilding with live progress; band 2 is queued behind it —
+    // state 'recovering' with NO sync, which is exactly what the dashboard
+    // reads to say "queued behind another band".
+    const withSync = {
+      ...pool,
+      arrays: [
+        { ...pool.arrays[0], state: 'recovering' as const, sync: { action: 'recover' as const, percent: 1.8, speedBytesSec: 206465024, etaSeconds: 38016 } },
+        { ...pool.arrays[1], state: 'recovering' as const },
+      ],
+    }
+    const b = buildAhrPoolBriefs([withSync])[0]
+
+    assert.equal(b.bands[0].state, 'recovering')
+    assert.deepEqual(b.bands[0].sync, { action: 'recover', percent: 1.8, speedBytesSec: 206465024, etaSeconds: 38016 })
+    assert.equal(b.bands[1].state, 'recovering')
+    assert.equal(b.bands[1].sync, undefined, 'a queued band has no progress to report')
+  })
+
   it('derives the healthy pool: bands (level × members) + capacity + mount, no spare', async () => {
     const pool = await healthyPool()
     const briefs = buildAhrPoolBriefs([pool])

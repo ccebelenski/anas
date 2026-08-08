@@ -874,6 +874,12 @@ export function buildAhrPoolBriefs(pools: AhrPool[]): AhrPoolBrief[] {
         level: array.level,
         memberCount: members.length,
         members: members.map(m => ({ id: m.disk, sizeBytes: sizeById.get(m.disk) ?? 0 })),
+        // 11.19 — PURE PROJECTION: heightBytes/state/sync are already in hand on
+        // the AhrArray this brief is derived from; they were simply dropped.
+        // No extra system read, no extra command, no new truth.
+        heightBytes: array.heightBytes,
+        state: array.state,
+        ...(array.sync ? { sync: array.sync } : {}),
       }
     })
     const spares = pool.disks

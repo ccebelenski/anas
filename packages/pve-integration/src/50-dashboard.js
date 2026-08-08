@@ -775,7 +775,98 @@
     // tile (renderDevice). `spare` shows the grey spare status dot and never gets
     // an I/O readout (a spare carries no band I/O). `keyBase` scopes the rolling
     // buffers per band+disk so the same disk in two bands doesn't collide.
-    function ahrDiskTile(view, id, sizeBytes, spare, tmember, keyBase) {
+    // Band-array state → gfx pill token + label. Mirrors 39-ahr.js ARRAY_STATES
+    // EXACTLY (parallel construction — the two AHR surfaces must not disagree
+    // about what a band's state is called or how severe it looks).
+    var AHR_ARRAY_STATES = {
+        clean: { token: 'ONLINE', label: 'clean' },
+        degraded: { token: 'DEGRADED', label: 'degraded' },
+        resyncing: { token: '', label: 'building' },
+        reshaping: { token: '', label: 'reshaping' },
+        recovering: { token: 'DEGRADED', label: 'rebuilding' },
+        failed: { token: 'FAULTED', label: 'failed' }
+    };
+
+    function ahrArrayStatePill(state) {
+        if (!state) {
+            return ''; // pre-0.2.4 daemon: no band state on the wire, no pill
+        }
+        var meta = AHR_ARRAY_STATES[state] || { token: '', label: '' + state };
+        try {
+            if (gfx && typeof gfx.statePill === 'function') {
+                var html = gfx.statePill(meta.token, { label: t(meta.label) });
+                if (html) { return html; }
+            }
+        } catch (e) {
+            // fall through to plain text
+        }
+        return '<span class="anas-dash-muted">' + enc(t(meta.label)) + '</span>';
+    }
+
+    // Sync-action wording, mirroring 39-ahr.js SYNC_LABELS.
+    var AHR_SYNC_LABELS = {
+        resync: 'building', reshape: 'reshaping', recover: 'rebuilding', check: 'checking'
+    };
+
+    function ahrEta(seconds) {
+        var sec = num(seconds);
+        if (sec <= 0) { return ''; }
+        var h = Math.floor(sec / 3600);
+        var m = Math.floor((sec % 3600) / 60);
+        if (h > 0) { return h + 'h ' + m + 'm'; }
+        if (m > 0) { return m + 'm'; }
+        return Math.round(sec) + 's';
+    }
+
+    // The band's own sync progress (11.19) — percent / speed / ETA on the SAME
+    // gfx.activity strip the ZFS pool scan indicator uses, but determinate,
+    // because md gives us real progress where ZFS's scan flag does not.
+    //
+    // This is what makes the numbers around it legible: md-level recovery
+    // traffic is INVISIBLE in the band's own I/O counters by definition (the
+    // rebuild is the md layer's work, not filesystem I/O through it), so a band
+    // reading ~0 while its members each push ~200 MiB/s looks broken until the
+    // strip says "rebuilding 1.8%".
+    //
+    // A band whose sync is QUEUED behind another carries state 'recovering'
+    // with NO sync object — that is issue #9's DELAYED semantics, and this
+    // read leans on it directly, so the two move together.
+    function ahrBandSyncHtml(band) {
+        var st = band.state;
+        var sync = band.sync;
+        if (!sync) {
+            if (st === 'recovering') {
+                return '<div class="anas-dash-vdev-lat anas-dash-muted">'
+                    + enc(t('queued behind another band')) + '</div>';
+            }
+            return '';
+        }
+        var pc = num(sync.percent);
+        var strip = '';
+        try {
+            if (gfx && typeof gfx.activity === 'function') {
+                strip = gfx.activity(pc > 0 ? pc / 100 : null,
+                    { label: t(AHR_SYNC_LABELS[sync.action] || ('' + sync.action)) }) || '';
+            }
+        } catch (e) {
+            strip = '';
+        }
+        var stats = [pc.toFixed(1) + '%'];
+        if (num(sync.speedBytesSec) > 0) { stats.push(bps(sync.speedBytesSec)); }
+        var eta = ahrEta(sync.etaSeconds);
+        if (eta) { stats.push(t('ETA') + ' ' + eta); }
+        return '<div style="margin-top:8px">' + strip
+            + '<div class="anas-dash-muted" style="margin-top:3px;font-size:11px;'
+            + 'font-variant-numeric:tabular-nums">' + enc(stats.join('  ·  ')) + '</div></div>';
+    }
+
+    // `sliceBytes` (11.19): what this disk contributes to THIS band. A 20 TB
+    // member of a 7.28 TiB band gave "Size 20.01 TiB" — the disk's whole size,
+    // read against a band it dwarfs, which is simply the wrong number for the
+    // question the row is answering. When present the tile says "Slice 7.28
+    // TiB"; when absent (pre-0.2.4 daemon) it falls back to exactly the old
+    // "Size <disk>" line rather than showing nothing.
+    function ahrDiskTile(view, id, sizeBytes, spare, tmember, keyBase, sliceBytes) {
         id = '' + (id || 'disk');
         var iconHtml = '';
         try {
@@ -808,7 +899,9 @@
             + '<div style="min-width:0;flex:1 1 auto">'
             + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(id) + '</div>'
             + '<div class="anas-dash-disk-sub">'
-            + enc(t('Size') + ' ' + ANAS.formatBytes(num(sizeBytes))) + '</div>'
+            + enc(sliceBytes != null
+                ? t('Slice') + ' ' + ANAS.formatBytes(num(sliceBytes))
+                : t('Size') + ' ' + ANAS.formatBytes(num(sizeBytes))) + '</div>'
             + ioHtml
             + '</div></div>';
     }
@@ -823,6 +916,12 @@
         band = band || {};
         var n = num(band.band);
         var desc = '— ' + ahrLevelLabel(band.level) + ' × ' + num(band.memberCount);
+        // 11.19: the band's height, the same figure the Details view shows, so
+        // the two AHR surfaces describe a band identically. Omitted entirely on
+        // a pre-0.2.4 daemon rather than guessed.
+        if (band.heightBytes != null) {
+            desc += ' · ' + t('height') + ' ' + ANAS.formatBytes(num(band.heightBytes));
+        }
         var members = band.members || [];
 
         // Index this band's member telemetry by disk id (per-band partition I/O).
@@ -837,7 +936,8 @@
             var mid = members[i] && members[i].id;
             var tm = (mid != null) ? tById['' + mid] : null;
             var kb = 'ahrdisk.' + poolName + '.b' + n + '.' + mid;
-            devHtml += ahrDiskTile(view, mid, members[i] && members[i].sizeBytes, false, tm, kb);
+            devHtml += ahrDiskTile(view, mid, members[i] && members[i].sizeBytes, false, tm, kb,
+                band.heightBytes);
         }
 
         // Aggregate band I/O (its md array): an IOPS line in the head + the
@@ -869,7 +969,9 @@
             + '<div class="anas-dash-vdev-head">'
             + '<span class="anas-dash-vdev-tag">' + enc(t('BAND')) + '</span>'
             + '<span class="anas-dash-vdev-name">' + enc(t('band') + ' ' + n) + '</span>'
-            + '<span class="anas-dash-vdev-desc">' + enc(desc) + '</span>' + ioHead + '</div>'
+            + '<span class="anas-dash-vdev-desc">' + enc(desc) + '</span>'
+            + ahrArrayStatePill(band.state) + ioHead + '</div>'
+            + ahrBandSyncHtml(band)
             + ioLatHtml
             + chartHtml
             + (devHtml ? '<div class="anas-dash-devs">' + devHtml + '</div>' : '')

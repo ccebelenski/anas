@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AhrPoolState, ArrayLevel } from './ahr.js'
+import { AhrArraySync, AhrPoolState, ArrayLevel, ArrayState } from './ahr.js'
 import { DiskId, ISODateTime } from './common.js'
 import { PoolState, VdevRole, VdevState, VdevType } from './zfs.js'
 
@@ -98,6 +98,30 @@ export const AhrBandBrief = z.object({
   /** Redundant member count (excludes hot spares) — the "× N" of "RAID5 × 4". */
   memberCount: z.number().int().nonnegative(),
   members: z.array(AhrBandMemberBrief),
+  /**
+   * The band's SLICE size — the bytes each member contributes to this band,
+   * which is what a 20 TB disk actually gives a 7.28 TiB band (11.19). Distinct
+   * from `members[].sizeBytes`, which is the member's whole raw DISK size:
+   * showing the disk size against a band was the confusion this closes.
+   *
+   * OPTIONAL for version skew: a pre-0.2.4 daemon does not send it, and the UI
+   * falls back to exactly its previous rendering (the 0.2.0↔0.2.1 additive-field
+   * precedent). Never synthesized — an absent height is shown as absent.
+   */
+  heightBytes: z.number().int().nonnegative().optional(),
+  /**
+   * The band array's own state (11.19) — the dashboard band header renders the
+   * same pill the Details view does, so a degraded or rebuilding BAND is
+   * visible without opening the pool. Optional: version skew, as above.
+   */
+  state: ArrayState.optional(),
+  /**
+   * Progress of a sync running on THIS band (11.19). Present only while one
+   * runs — a band whose sync is QUEUED behind another carries `state:
+   * 'recovering'` with NO sync (see issue #9's DELAYED semantics), which is how
+   * consumers tell running from queued. Optional: version skew, as above.
+   */
+  sync: AhrArraySync.optional(),
 })
 export type AhrBandBrief = z.infer<typeof AhrBandBrief>
 
