@@ -24,7 +24,7 @@ import { hasArray, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { readIntent } from './ahr-intent.js'
-import { AHR_MIN_DISKS, floorToGranularity } from './ahr-layout.js'
+import { AHR_MIN_DISKS, floorToGranularity, isPvUnderSized } from './ahr-layout.js'
 import { DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
 import { isSubvolLayoutMount } from './ahr-snapshots.js'
 import { readConfig } from './config-writer.js'
@@ -618,13 +618,18 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     // the concrete verb that reclaims it.
     let belowLvmBytes = 0
     for (const entry of arrayEntries) {
-      const arrayBytes = (entry.mdstat.blocks ?? 0) * 1024
       const pv = pvs.find(p => p.name === `/dev/${entry.mdstat.kernelName}` || p.name === `/dev/md/${poolName}-r${entry.band}`)
-      if (!pv || arrayBytes <= 0 || pv.sizeBytes <= 0)
+      // Compared against dev_size — the same basis LVM itself reports, and the
+      // same predicate the resume planner uses, so the advisory and the plan
+      // can never disagree. The structural margin is what keeps a HEALTHY pool
+      // quiet: every fully-resized PV is a few MiB under its device (metadata
+      // + PE rounding), which a bare `<` comparison read as stranded capacity
+      // and rendered as the nonsensical "0 GiB is grown into the RAID arrays".
+      if (!pv || !isPvUnderSized(pv.sizeBytes, pv.devSizeBytes))
         continue
-      belowLvmBytes += Math.max(0, arrayBytes - pv.sizeBytes)
+      belowLvmBytes += pv.devSizeBytes - pv.sizeBytes
     }
-    if (belowLvmBytes > MIB) {
+    if (belowLvmBytes > 0) {
       pendingBytes += belowLvmBytes
       advisories.push(
         `${(belowLvmBytes / 1024 ** 3).toFixed(0)} GiB is grown into the RAID arrays but not yet handed up to LVM — `

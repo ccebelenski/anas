@@ -66,6 +66,41 @@ export interface AhrLayoutDisk {
 export const AHR_DEFAULT_LOGICAL_BLOCK_BYTES = 512
 
 /**
+ * How far a PV may sit below its underlying device before ANAS calls it
+ * UNDER-SIZED (i.e. an array that grew whose PV was never resized, issue #13).
+ *
+ * A healthy, fully-resized PV is ALWAYS a little smaller than its device: the
+ * LVM metadata area at `pe_start` plus physical-extent rounding legitimately
+ * eat a sliver. Ground truth, pve5 2026-08-09, all four PVs fully sized and
+ * healthy (dev_size − pv_size):
+ *
+ *   /dev/md124  chiaahr2   ~3.0 MiB
+ *   /dev/md125  chiaahr2   ~2.5 MiB
+ *   /dev/md126  chiaahr2   ~4.0 MiB
+ *   /dev/md127  chiaahr    ~2.0 MiB
+ *
+ * So the test must be STRUCTURAL, never `pv_size < dev_size` — the same lesson
+ * as issue #4's delivered-capacity shortfall margin. 1 GiB is deliberately
+ * generous against the observed 2–4 MiB: genuine stranded capacity is
+ * band-height scale (GiBs to TiBs — the stage case was 2 GiB per band), and
+ * sub-GiB never matters for capacity accounting. Being an order of magnitude
+ * clear of the noise is worth more than precision we have no use for.
+ */
+export const PV_UNDERSIZE_MARGIN_BYTES = AHR_SIZE_GRANULARITY_BYTES
+
+/**
+ * Whether a PV is meaningfully smaller than the device beneath it — the ONE
+ * predicate behind both the resume planner's pv-resize catch-up and the
+ * topology reader's stranded-capacity accounting, so the two can never disagree
+ * about what "stranded" means.
+ */
+export function isPvUnderSized(pvSizeBytes: number, deviceSizeBytes: number): boolean {
+  if (pvSizeBytes <= 0 || deviceSizeBytes <= 0)
+    return false
+  return deviceSizeBytes - pvSizeBytes >= PV_UNDERSIZE_MARGIN_BYTES
+}
+
+/**
  * Opening words of the mixed-logical-block-size advisory. Exported so the
  * create route can lift that ONE warning out of the layout's warning list into
  * the confirm gate without re-deriving the condition — the planner stays the

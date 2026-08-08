@@ -10,6 +10,7 @@ import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
+import { isPvUnderSized, PV_UNDERSIZE_MARGIN_BYTES } from '../ahr-layout.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, buildAhrWarnings, readAhrPools, withExpansionIntent } from '../ahr-topology.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -385,18 +386,28 @@ unused devices: <none>
 
   // --- Reporting nits from the live stage halt (issue #13) -------------------
   describe('stranded-capacity reporting (issue #13)', () => {
-    /** ahr0 with md127's PV left smaller than the (grown) array. */
-    function stalePvExecutor(): MockExecutor {
+    /** ahr0 with the given PV rows. */
+    function pvExecutor(rows: { name: string, size: number, devSize: number }[]): MockExecutor {
       const mock = healthyExecutor()
       mock.addFixture({
         command: '/usr/sbin/pvs',
-        result: ok(JSON.stringify({ report: [{ pv: [
-          // md127 = band 1: the array is 2089984 KiB; the PV covers only half.
-          { pv_name: '/dev/md127', vg_name: 'ahr0', pv_size: String(1000000 * 1024), pv_free: '0', dev_size: String(2089984 * 1024) },
-          { pv_name: '/dev/md126', vg_name: 'ahr0', pv_size: String(523200 * 1024), pv_free: '0', dev_size: String(523200 * 1024) },
-        ] }] })),
+        result: ok(JSON.stringify({ report: [{ pv: rows.map(r => ({
+          pv_name: r.name,
+          vg_name: 'ahr0',
+          pv_size: String(r.size),
+          pv_free: '0',
+          dev_size: String(r.devSize),
+        })) }] })),
       })
       return mock
+    }
+
+    /** md127's PV covers only half its (grown) array — genuinely stranded. */
+    function stalePvExecutor(): MockExecutor {
+      return pvExecutor([
+        { name: '/dev/md127', size: 1000000 * 1024, devSize: 2089984 * 1024 },
+        { name: '/dev/md126', size: 523200 * 1024, devSize: 523200 * 1024 },
+      ])
     }
 
     it('capacity inside the arrays but below LVM is PENDING, not unprotected waste', async () => {
@@ -412,6 +423,57 @@ unused devices: <none>
     it('a pool whose PVs cover their arrays reports no stranded capacity', async () => {
       const pool = (await readAhrPools(healthyExecutor()))[0]
       assert.ok(!pool.advisories.some(a => a.includes('not yet handed up to LVM')))
+    })
+
+    // A healthy, fully-resized PV is ALWAYS a few MiB under its device (LVM
+    // metadata area + physical-extent rounding). A bare `pv_size < dev_size`
+    // read that as stranded capacity and produced, on a brand-new pool with no
+    // expansion at all, the nonsensical advisory "0 GiB is grown into the RAID
+    // arrays but not yet handed up to LVM — resume or re-run the expansion".
+    // Real pve5 numbers, 2026-08-09, all four PVs healthy and fully sized.
+    it('the few-MiB metadata delta of a HEALTHY PV is not stranded capacity', async () => {
+      const pool = (await readAhrPools(pvExecutor([
+        // Δ ~4.0 MiB — the largest of the four observed.
+        { name: '/dev/md127', size: 32005014159360, devSize: 32005018353664 },
+        // Δ ~3.0 MiB.
+        { name: '/dev/md126', size: 11999597559808, devSize: 11999600705536 },
+      ])))[0]
+
+      assert.equal(pool.capacity.pendingBytes, 0, 'a metadata sliver is not pending capacity')
+      assert.ok(
+        !pool.advisories.some(a => a.includes('not yet handed up to LVM')),
+        `a healthy pool must stay quiet, got: ${JSON.stringify(pool.advisories)}`,
+      )
+    })
+
+    it('every observed pve5 delta stays below the margin', async () => {
+      // The full live set, including the unrelated healthy pool chiaahr.
+      const observed: [number, number][] = [
+        [11999597559808, 11999600705536], // md124 chiaahr2  Δ ~3.0 MiB
+        [17996177211392, 17996179832832], // md125 chiaahr2  Δ ~2.5 MiB
+        [32005014159360, 32005018353664], // md126 chiaahr2  Δ ~4.0 MiB
+        [88002797764608, 88002799861760], // md127 chiaahr   Δ ~2.0 MiB
+      ]
+      for (const [size, devSize] of observed) {
+        assert.ok(devSize - size < PV_UNDERSIZE_MARGIN_BYTES, `Δ ${devSize - size} must be under the margin`)
+        assert.equal(isPvUnderSized(size, devSize), false)
+      }
+      // …and the margin is an order of magnitude clear of the worst of them.
+      assert.ok(PV_UNDERSIZE_MARGIN_BYTES > 10 * (32005018353664 - 32005014159360))
+    })
+
+    it('a multi-GiB delta IS stranded, and says so with real numbers', async () => {
+      const pool = (await readAhrPools(pvExecutor([
+        // The stage-test shape: 2 GiB stranded below LVM on one band.
+        { name: '/dev/md127', size: 4 * 1024 ** 3, devSize: 6 * 1024 ** 3 },
+        { name: '/dev/md126', size: 11999597559808, devSize: 11999600705536 },
+      ])))[0]
+
+      assert.equal(pool.capacity.pendingBytes, 2 * 1024 ** 3)
+      const advisory = pool.advisories.find(a => a.includes('not yet handed up to LVM'))
+      assert.ok(advisory, 'a genuine stranded state must still be reported')
+      // Never the "0 GiB" that started this.
+      assert.match(advisory, /^2 GiB is grown into the RAID arrays/)
     })
   })
 

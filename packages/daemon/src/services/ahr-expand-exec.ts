@@ -16,7 +16,7 @@ import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
 import { LVM_MIXED_BLOCK_ARGS } from './ahr-exec.js'
 import { ahrDataOffsetArg, ahrDataOffsetBytes, planDiskPartitions } from './ahr-geometry.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
-import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes } from './ahr-layout.js'
+import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes, isPvUnderSized } from './ahr-layout.js'
 import { pinArrays } from './ahr-mdadm-conf.js'
 import { AHR_FINDMNT_ARGS, stripSubvolSuffix } from './ahr-topology.js'
 import { pveNotify } from './pve-notify.js'
@@ -679,7 +679,7 @@ export async function underSizedPvBands(executor: CommandExecutor, poolName: str
     const pv = pvs.find(p => p.name === resolved.dev || p.name === `/dev/md/${poolName}-r${band}`)
     if (!pv || pv.devSizeBytes <= 0)
       continue
-    if (pv.sizeBytes < pv.devSizeBytes - LVM_SLACK_BYTES)
+    if (isPvUnderSized(pv.sizeBytes, pv.devSizeBytes))
       bands.push(band)
   }
   // Ascending band order — the steps must read bottom-up like every other plan.

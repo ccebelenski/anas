@@ -249,6 +249,21 @@ describe('resumeExpansion — the shared §5.3 recompute-and-continue core', () 
       assert.equal((await readIntent('tank', dir))?.state, 'running')
     })
 
+    // A healthy, fully-resized PV always sits a few MiB under its device (LVM
+    // metadata + PE rounding). Real pve5 numbers, 2026-08-09 — a bare
+    // `pv_size < dev_size` would plan a cosmetic pv-resize for every band.
+    it('the few-MiB metadata delta of a HEALTHY PV plans nothing', async () => {
+      const executor = withPvs(buildExecutor(MDSTAT_IDLE), [
+        { name: '/dev/md127', size: 32005014159360, devSize: 32005018353664 },
+        { name: '/dev/md126', size: 11999597559808, devSize: 11999600705536 },
+      ])
+      const { result } = await resume(executor)
+      assert.equal(result.ok, true, result.ok ? '' : result.message)
+      if (!result.ok)
+        return
+      assert.deepEqual(result.bundle.plan.steps, [])
+    })
+
     it('PVs that already cover their arrays add nothing (idempotent, no busywork)', async () => {
       const executor = withPvs(buildExecutor(MDSTAT_IDLE), [
         { name: '/dev/md127', size: 6 * GIB, devSize: 6 * GIB },
