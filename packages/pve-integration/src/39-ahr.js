@@ -99,8 +99,34 @@
         failed: { token: 'FAULTED', label: 'failed' },
     };
 
-    function arrayStatePill(state) {
+    // A band laying down redundancy for the FIRST time is activity, not fault —
+    // the operator's #7 ruling, applied one level down. `recovering` covers two
+    // genuinely different situations and the tone must tell them apart:
+    //
+    //   • a fresh build → NEUTRAL "building": nothing has failed.
+    //   • a rebuild after a disk failure → DEGRADED amber: redundancy really is
+    //     reduced until it finishes. THIS DISTINCTION IS LOAD-BEARING.
+    //
+    // The discriminator is the POOL's state, not this array's members, and that
+    // is deliberate: "no faulty member" is not a safe test. A rebuild onto a
+    // spare comes in two shapes — the dead disk still attached and flagged
+    // `(F)`, or the dead disk PULLED, in which case md stops listing it and
+    // NOTHING in members[] looks wrong (readAhrPools never emits memberState
+    // 'missing'). Pool state `building` means the daemon applied the issue #9
+    // discriminator to every band using mdstat's raidDevices, which this
+    // payload does not carry — the same rule, evaluated where the evidence is.
+    //
+    // KNOWN LIMIT, tested in ahr-topology.test.ts: the pulled-disk shape is
+    // byte-identical to a fresh build in mdstat ([n/n-1], full device count, no
+    // (F)), so when EVERY band is rebuilding after a pull this reads neutral
+    // for what is really a degraded rebuild. The attached-(F) case — the common
+    // one — is separated correctly. Fixing the rest needs a signal mdstat does
+    // not have (array creation time is the candidate).
+    function arrayStatePill(state, poolBuilding) {
         var meta = ARRAY_STATES[state] || { token: '', label: '' + (state || '') };
+        if (state === 'recovering' && poolBuilding) {
+            meta = { token: '', label: 'building' };
+        }
         try {
             var gfx = ANAS.gfx;
             if (gfx && typeof gfx.statePill === 'function') {
@@ -615,7 +641,8 @@
                 + enc((a.level || '') + ' × ' + members.length
                     + (inSync < members.length ? ' (' + inSync + ' ' + t('in sync') + ')' : '')
                     + ' · ' + t('height') + ' ' + fmtBytes(a.heightBytes)) + '</span>'
-                + '<span style="flex:1"></span>' + arrayStatePill(a.state);
+                + '<span style="flex:1"></span>'
+                + arrayStatePill(a.state, d.state === 'building');
             var syncHtml = '';
             if (a.sync) {
                 var pc = Number(a.sync.percent);

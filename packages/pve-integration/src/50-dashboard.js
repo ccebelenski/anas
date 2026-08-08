@@ -787,11 +787,23 @@
         failed: { token: 'FAULTED', label: 'failed' }
     };
 
-    function ahrArrayStatePill(state) {
+    // `poolBuilding` neutral-tones a no-fault build, mirroring 39-ahr.js exactly
+    // (see that file for the full reasoning). The discriminator is the POOL
+    // state rather than this band's members, and that is the RIGHT test on both
+    // surfaces, not a dashboard compromise: "no faulty member" is unsafe
+    // because a PULLED disk leaves nothing wrong-looking in members[] at all.
+    // A rebuild with the dead disk still attached and flagged `(F)` keeps amber,
+    // which is the load-bearing case. KNOWN LIMIT (tested daemon-side): a
+    // pulled disk rebuilding across every band is indistinguishable from a
+    // fresh build in mdstat and reads neutral.
+    function ahrArrayStatePill(state, poolBuilding) {
         if (!state) {
             return ''; // pre-0.2.4 daemon: no band state on the wire, no pill
         }
         var meta = AHR_ARRAY_STATES[state] || { token: '', label: '' + state };
+        if (state === 'recovering' && poolBuilding) {
+            meta = { token: '', label: 'building' };
+        }
         try {
             if (gfx && typeof gfx.statePill === 'function') {
                 var html = gfx.statePill(meta.token, { label: t(meta.label) });
@@ -912,7 +924,7 @@
     // aggregate IOPS + I/O/latency readout and read/write time chart a ZFS vdev
     // has. `poolName`/`chartW` scope + size those. Members are matched to their
     // telemetry by disk id (each carries its own per-band I/O).
-    function renderAhrBand(view, poolName, band, tband, chartW) {
+    function renderAhrBand(view, poolName, band, tband, chartW, poolBuilding) {
         band = band || {};
         var n = num(band.band);
         var desc = '— ' + ahrLevelLabel(band.level) + ' × ' + num(band.memberCount);
@@ -970,7 +982,7 @@
             + '<span class="anas-dash-vdev-tag">' + enc(t('BAND')) + '</span>'
             + '<span class="anas-dash-vdev-name">' + enc(t('band') + ' ' + n) + '</span>'
             + '<span class="anas-dash-vdev-desc">' + enc(desc) + '</span>'
-            + ahrArrayStatePill(band.state) + ioHead + '</div>'
+            + ahrArrayStatePill(band.state, poolBuilding) + ioHead + '</div>'
             + ahrBandSyncHtml(band)
             + ioLatHtml
             + chartHtml
@@ -1100,7 +1112,7 @@
         for (var i = 0; i < bands.length; i++) {
             var bn = bands[i] && bands[i].band;
             var tband = (bn != null) ? tbandByIndex['' + bn] : null;
-            bandHtml += renderAhrBand(view, name, bands[i], tband, bandW);
+            bandHtml += renderAhrBand(view, name, bands[i], tband, bandW, ap.state === 'building');
         }
         bandHtml += renderAhrSpareBay(view, ap.spares);
 

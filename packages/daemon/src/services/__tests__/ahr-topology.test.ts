@@ -384,6 +384,47 @@ unused devices: <none>
     })
   })
 
+  // --- What the UI pill tone leans on --------------------------------------
+  // Both AHR surfaces neutral-tone a `recovering` band when the POOL reads
+  // `building` (11.19). These lock which side of that line each real situation
+  // falls on — the amber cases are load-bearing.
+  describe('pool `building` vs a genuine post-failure rebuild', () => {
+    it('a rebuild onto a spare with the DEAD DISK STILL ATTACHED stays amber', async () => {
+      // The (F) member is what gives it away: isBuildingMembership sees a
+      // faulty member, so the pool is `rebuilding`, and the UI keeps amber.
+      const pool = (await readAhrPools(healthyExecutor({ mdstat: MDSTAT_SPARE_REBUILDING })))[0]
+      assert.equal(pool.arrays.find(a => a.band === 1)!.state, 'recovering')
+      assert.notEqual(pool.state, 'building', 'a post-failure rebuild must NOT read as a build')
+      assert.equal(pool.state, 'rebuilding')
+    })
+
+    it('KNOWN LIMIT: a PULLED disk rebuilding onto a spare is indistinguishable', async () => {
+      // mdstat cannot separate these two situations:
+      //   fresh build   md127 : active raid5 sdd1[3] sdc1[1] sdb1[0]  [3/2] [UU_]
+      //   pulled+spare  md127 : active raid5 sde1[4] sdd1[3] sdc1[1]  [3/2] [_UU]
+      // Same device count, same slot count, NO (F) in either — md simply stops
+      // listing a disk that is gone, and readAhrPools never emits memberState
+      // 'missing'. So when EVERY band is in this shape the pool reads
+      // `building` and the UI shows a neutral pill for what is really a
+      // degraded rebuild. Asserted here so the limitation is visible and
+      // locked rather than discovered later.
+      const pulled = [
+        'Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] ',
+        'md126 : active raid1 sde2[2] sdd2[1]',
+        '      523200 blocks super 1.2 [2/1] [_U]',
+        '      \tresync=DELAYED',
+        '',
+        'md127 : active raid5 sde1[4] sdd1[3] sdc1[1]',
+        '      2089984 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [_UU]',
+        '      [>....................]  recovery =  1.9% (20472/1044992) finish=0.8min speed=20472K/sec',
+        '',
+        'unused devices: <none>',
+      ].join('\n')
+      const pool = (await readAhrPools(healthyExecutor({ mdstat: pulled })))[0]
+      assert.equal(pool.state, 'building', 'documents the limit — NOT an endorsement')
+    })
+  })
+
   // --- Reporting nits from the live stage halt (issue #13) -------------------
   describe('stranded-capacity reporting (issue #13)', () => {
     /** ahr0 with the given PV rows. */
