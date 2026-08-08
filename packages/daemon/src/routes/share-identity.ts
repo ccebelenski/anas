@@ -1,9 +1,11 @@
 import type { ShareGroup, ShareUser } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, ExecOptions, ExecResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { GroupEntry, PasswdEntry } from '../parsers/getent.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import { constants } from 'node:fs'
+import { access } from 'node:fs/promises'
 import {
   CreateGroupRequest,
   CreateShareUserRequest,
@@ -37,11 +39,46 @@ const PDBEDIT = '/usr/bin/pdbedit'
 
 const NOLOGIN = '/usr/sbin/nologin'
 
+/**
+ * The actionable "no samba on this node" sentence (issue #6). smbpasswd lives in
+ * `samba-common-bin`, which the `samba` package pulls in — naming the package
+ * the operator actually installs keeps the fix one apt command. The installer
+ * now guarantees samba, so this only fires on a node where it was removed.
+ */
+const SMB_NOT_INSTALLED
+  = `Samba is not installed on this node — ${SMBPASSWD} is missing. Install it with: apt install samba`
+
+/** The "useradd landed, smbpasswd didn't" wording, in one place. */
+function halfCreated(name: string, reason: string): string {
+  return `User '${name}' was created, but setting the SMB password failed: ${reason}`
+}
+
+/**
+ * Default samba probe: is the whitelisted smbpasswd there and executable?
+ * Stateless — asked fresh every time, never cached (Principle 11).
+ */
+async function smbpasswdIsInstalled(): Promise<boolean> {
+  try {
+    await access(SMBPASSWD, constants.X_OK)
+    return true
+  }
+  catch {
+    return false
+  }
+}
+
 export interface ShareIdentityRouteOptions {
   executor: CommandExecutor
   jobQueue: JobQueue
   /** Accepted for a uniform register signature; identity ops are never gated. */
   confirmStore: ConfirmStore
+  /**
+   * Is `smbpasswd` present and executable on this node? Defaults to a real
+   * access(X_OK) probe. The dev mock overrides it to `true` (nothing is ever
+   * really spawned there), and tests override it to `false` to prove the
+   * missing-samba path.
+   */
+  smbpasswdAvailable?: () => Promise<boolean>
 }
 
 export async function shareIdentityRoutes(
@@ -49,6 +86,27 @@ export async function shareIdentityRoutes(
   opts: ShareIdentityRouteOptions,
 ) {
   const { executor, jobQueue } = opts
+  const smbAvailable = opts.smbpasswdAvailable ?? smbpasswdIsInstalled
+
+  /**
+   * Run smbpasswd, turning a spawn failure into an actionable message. execFile
+   * REJECTS on ENOENT/EACCES instead of returning an exit code (see
+   * executor/prod.ts), so the `exitCode !== 0` guards at the call sites below
+   * never fire on a node without samba — the operator got Node's raw
+   * `spawn /usr/bin/smbpasswd ENOENT` instead (issue #6). The routes preflight
+   * with `smbAvailable()`; this is the belt-and-braces for samba going away
+   * between that check and the queued job actually running.
+   */
+  async function execSmbpasswd(args: string[], execOpts?: ExecOptions): Promise<ExecResult> {
+    try {
+      return await executor.exec(SMBPASSWD, args, execOpts)
+    }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+        throw new Error(SMB_NOT_INSTALLED)
+      throw err
+    }
+  }
 
   // --- getent-backed reads (source-agnostic — the Epic 8 seam) --------------
 
@@ -68,12 +126,25 @@ export async function shareIdentityRoutes(
     return parseGroups(r.stdout)
   }
 
-  /** Usernames with a Samba passdb entry (pdbedit -L). */
+  /**
+   * Usernames with a Samba passdb entry (pdbedit -L).
+   *
+   * FAIL-OPEN, never throws: pdbedit ships in the `samba` package, and execFile
+   * REJECTS (rather than returning an exit code) when the binary is missing, so
+   * on a node without samba this would otherwise 500 the whole Share Users list
+   * (issue #6). No passdb means nobody holds an SMB password, and
+   * `smbEnabled: false` for everyone is the honest answer.
+   */
   async function smbNames(): Promise<Set<string>> {
-    const r = await executor.exec(PDBEDIT, ['-L'])
-    if (r.exitCode !== 0 && !r.stdout.trim())
+    try {
+      const r = await executor.exec(PDBEDIT, ['-L'])
+      if (r.exitCode !== 0 && !r.stdout.trim())
+        return new Set()
+      return parsePdbeditNames(r.stdout)
+    }
+    catch {
       return new Set()
-    return parsePdbeditNames(r.stdout)
+    }
   }
 
   /** Names present in the LOCAL files DB → ANAS can manage them. */
@@ -238,6 +309,15 @@ export async function shareIdentityRoutes(
       }
     }
 
+    // Samba preflight (issue #6). Refuse BEFORE the job runs useradd, so a node
+    // without samba never ends up with a half-created user whose SMB password
+    // silently never landed. The API is the authority on what is possible
+    // (Principle 14) — the client just gets a 400 that says what to install.
+    if (req.smbPassword !== undefined && !(await smbAvailable())) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `${SMB_NOT_INSTALLED}. The user was NOT created.` } }
+    }
+
     // useradd -M -s /usr/sbin/nologin [-c <fullName>] [-G <groups>] <name>
     const args = ['-M', '-s', NOLOGIN]
     if (req.fullName !== undefined)
@@ -260,11 +340,19 @@ export async function shareIdentityRoutes(
         if (smbPassword !== undefined) {
           updateProgress(`Setting SMB password for '${req.name}'`)
           // Password on stdin (smbpasswd -s), never argv — never logged.
-          const smb = await executor.exec(SMBPASSWD, ['-a', '-s', req.name], {
-            stdin: `${smbPassword}\n${smbPassword}\n`,
-          })
+          let smb: ExecResult
+          try {
+            smb = await execSmbpasswd(['-a', '-s', req.name], {
+              stdin: `${smbPassword}\n${smbPassword}\n`,
+            })
+          }
+          catch (err) {
+            // Spawn failure (samba removed since the route preflight) — say so
+            // in the same "the account exists, the password doesn't" wording.
+            throw new Error(halfCreated(req.name, err instanceof Error ? err.message : String(err)))
+          }
           if (smb.exitCode !== 0)
-            throw new Error(`User '${req.name}' was created, but setting the SMB password failed: ${smb.stderr.trim() || `smbpasswd exited with code ${smb.exitCode}`}`)
+            throw new Error(halfCreated(req.name, smb.stderr.trim() || `smbpasswd exited with code ${smb.exitCode}`))
         }
         return { created: req.name, smbEnabled: smbPassword !== undefined }
       },
@@ -301,12 +389,18 @@ export async function shareIdentityRoutes(
     if (!(await isLocalUser(name)))
       return rejectDirectory(reply, 'user', name)
 
+    // Samba preflight (issue #6) — same reasoning as the create route above.
+    if (!(await smbAvailable())) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `${SMB_NOT_INSTALLED}. The password was NOT changed.` } }
+    }
+
     const job = jobQueue.submit(
       'identity.smbpasswd.set',
       { ...identity, params: { user: name } },
       async () => {
         // Password on stdin (smbpasswd -s), never argv — never logged.
-        const r = await executor.exec(SMBPASSWD, ['-a', '-s', name], {
+        const r = await execSmbpasswd(['-a', '-s', name], {
           stdin: `${password}\n${password}\n`,
         })
         if (r.exitCode !== 0)
@@ -366,11 +460,12 @@ export async function shareIdentityRoutes(
 
         // Toggle the SMB side only if the user actually has a passdb entry —
         // smbpasswd -d/-e errors on users with no entry, which is normal for a
-        // share user that never had an SMB password.
+        // share user that never had an SMB password. On a node without samba
+        // smbNames() fails open to empty, so this is skipped entirely.
         const hasSmb = (await smbNames()).has(name)
         if (hasSmb) {
           updateProgress(`${enabled ? 'Enabling' : 'Disabling'} SMB access for '${name}'`)
-          const smb = await executor.exec(SMBPASSWD, [enabled ? '-e' : '-d', name])
+          const smb = await execSmbpasswd([enabled ? '-e' : '-d', name])
           if (smb.exitCode !== 0)
             throw new Error(smb.stderr.trim() || `smbpasswd exited with code ${smb.exitCode}`)
         }

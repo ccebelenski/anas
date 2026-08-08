@@ -467,7 +467,15 @@ export function createServer(opts?: ServerOptions) {
   server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport })
   server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath })
   server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
-  server.register(shareIdentityRoutes, { prefix: '/v1', executor, jobQueue, confirmStore })
+  server.register(shareIdentityRoutes, {
+    prefix: '/v1',
+    executor,
+    jobQueue,
+    confirmStore,
+    // The dev mock never spawns anything, so probing the real /usr/bin/smbpasswd
+    // would make the SMB paths untestable on a machine without samba.
+    ...(opts?.mock ? { smbpasswdAvailable: async () => true } : {}),
+  })
   // Recurring replication tasks (Epic 5.5.3) — units-as-store CRUD + status.
   server.register(replicationTaskRoutes, { prefix: '/v1', executor, jobQueue, systemdDir, transport })
   // Stage-3 remotes registry (Epic 5.5.2) — corosync-store CRUD + diagnostics.

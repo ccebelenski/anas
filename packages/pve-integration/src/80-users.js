@@ -455,6 +455,12 @@
                 }
                 reloadAll(view, node);
             },
+            onFailed: function () {
+                // A create can fail halfway (the account lands, the SMB password
+                // doesn't); refresh to reflect partial state instead of leaving
+                // the new user invisible until a manual reload.
+                reloadAll(view, node);
+            },
         });
     }
 
@@ -557,6 +563,11 @@
                 }
                 loadUsers(usersGridOf(view), node);
             },
+            onFailed: function () {
+                // Refresh to reflect partial state (the passdb entry may or may
+                // not have changed); the dialog stays open with the error.
+                loadUsers(usersGridOf(view), node);
+            },
         });
     }
 
@@ -589,6 +600,11 @@
                     failTitle: 'Update failed',
                     successMsg: (enabled ? t('User enabled') : t('User disabled')) + ': ' + userName,
                     onComplete: function () {
+                        loadUsers(usersGridOf(view), node);
+                    },
+                    onFailed: function () {
+                        // The Unix and SMB sides toggle separately — refresh to
+                        // reflect whichever half landed.
                         loadUsers(usersGridOf(view), node);
                     },
                 });
@@ -855,6 +871,10 @@
                 if (!win.destroyed && !win.destroying) {
                     win.close();
                 }
+                loadGroups(groupsGridOf(view), node);
+            },
+            onFailed: function () {
+                // Refresh to reflect partial state; the dialog stays open.
                 loadGroups(groupsGridOf(view), node);
             },
         });

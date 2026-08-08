@@ -1,10 +1,15 @@
 import type { Job, JobAccepted, ShareGroup, ShareUser } from '@anas/shared'
-import type { MockExecutor } from '../../executor/mock.js'
-import type { ExecResult } from '../../executor/types.js'
+import type { FastifyInstance } from 'fastify'
+import type { ExecOptions, ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
+import Fastify from 'fastify'
+import { MockExecutor } from '../../executor/mock.js'
+import { JobQueue } from '../../jobs/queue.js'
+import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
+import { shareIdentityRoutes } from '../share-identity.js'
 
 interface Call { command: string, args: string[] }
 
@@ -50,6 +55,24 @@ async function waitForJob(server: ReturnType<typeof createServer>, id: string): 
 /** The decorated MockExecutor, for adding per-test fixtures. */
 function mockOf(server: ReturnType<typeof createServer>): MockExecutor {
   return (server as unknown as { executor: MockExecutor }).executor
+}
+
+/**
+ * Make one command REJECT the way execFile does when its binary is missing —
+ * the mock's fixtures only ever resolve, so a "samba isn't installed" node
+ * cannot be reproduced with fixtures alone (issue #6).
+ */
+function failToSpawn(server: ReturnType<typeof createServer>, command: string): void {
+  const mock = mockOf(server)
+  const orig = mock.exec.bind(mock)
+  mock.exec = async (cmd: string, args: string[], execOpts?: ExecOptions): Promise<ExecResult> => {
+    if (cmd === command) {
+      const err = new Error(`spawn ${command} ENOENT`) as NodeJS.ErrnoException
+      err.code = 'ENOENT'
+      throw err
+    }
+    return orig(cmd, args, execOpts)
+  }
 }
 
 describe('share-identity routes', () => {
@@ -405,6 +428,117 @@ describe('share-identity routes', () => {
         payload: JSON.stringify({}),
       })
       assert.equal(res.statusCode, 400)
+    })
+  })
+
+  // --- A node without samba (issue #6) ------------------------------------
+  //
+  // The installer now guarantees samba, but a node where it was removed (or an
+  // install that predates the fix) must degrade honestly instead of 500ing the
+  // list and leaving half-created users behind.
+  describe('samba missing', () => {
+    let bare: FastifyInstance | undefined
+
+    afterEach(async () => {
+      await bare?.close()
+      bare = undefined
+    })
+
+    /**
+     * The identity routes wired to a mock executor that reports samba ABSENT.
+     * The dev-mock server always answers "installed" (it never really spawns
+     * anything), so the preflight path needs its own wiring.
+     */
+    async function withoutSamba(): Promise<{ app: FastifyInstance, executor: MockExecutor }> {
+      const executor = new MockExecutor()
+      const app = Fastify({ logger: false })
+      await app.register(shareIdentityRoutes, {
+        prefix: '/v1',
+        executor,
+        jobQueue: new JobQueue(),
+        confirmStore: new ConfirmStore(),
+        smbpasswdAvailable: async () => false,
+      })
+      bare = app
+      return { app, executor }
+    }
+
+    it('still lists users when pdbedit is missing (smbEnabled false for everyone)', async () => {
+      server = createServer({ mock: true, logger: false })
+      failToSpawn(server, '/usr/bin/pdbedit')
+      const res = await server.inject({ method: 'GET', url: '/v1/identity/users' })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: ShareUser[] }
+      // The list is intact — only the SMB enrichment is missing.
+      assert.deepEqual(data.map(u => u.name).sort(), ['backup-svc', 'media', 'root'])
+      assert.ok(data.every(u => u.smbEnabled === false))
+    })
+
+    it('refuses to create a user with an SMB password, and does not run useradd', async () => {
+      const { app, executor } = await withoutSamba()
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/identity/users',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'frank', smbPassword: 'hunter2' }),
+      })
+      assert.equal(res.statusCode, 400)
+      assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+      assert.match(res.json().error.message, /apt install samba/)
+      assert.match(res.json().error.message, /NOT created/)
+      // Nothing half-created: the account is never made without its password.
+      assert.equal(executor.calls.some(c => c.command === '/usr/sbin/useradd'), false)
+    })
+
+    it('creates a user with no SMB password even when samba is missing', async () => {
+      const { app, executor } = await withoutSamba()
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/identity/users',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'gina' }),
+      })
+      assert.equal(res.statusCode, 202)
+      assert.equal((res.json() as JobAccepted).job.operation, 'identity.user.add')
+      assert.ok(executor.calls.length >= 1)
+    })
+
+    it('refuses to set an SMB password', async () => {
+      const { app, executor } = await withoutSamba()
+      const line = 'media:*:1000:1000:Media User:/home/media:/usr/sbin/nologin\n'
+      executor.addFixture({ command: '/usr/bin/getent', args: ['passwd', 'media'], result: { stdout: line, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/getent', args: ['-s', 'files', 'passwd', 'media'], result: { stdout: line, stderr: '', exitCode: 0 } })
+      const res = await app.inject({
+        method: 'POST',
+        url: '/v1/identity/users/media/smb-password',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ password: 's3cret' }),
+      })
+      assert.equal(res.statusCode, 400)
+      assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+      assert.match(res.json().error.message, /apt install samba/)
+      assert.match(res.json().error.message, /NOT changed/)
+      assert.equal(executor.calls.some(c => c.command === '/usr/bin/smbpasswd'), false)
+    })
+
+    it('rewrites a raw smbpasswd spawn failure into an actionable job error', async () => {
+      // samba removed between the route preflight and the job running: the job
+      // must still say what happened and what to install, not `spawn … ENOENT`.
+      server = createServer({ mock: true, logger: false })
+      failToSpawn(server, '/usr/bin/smbpasswd')
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/identity/users',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'erin', smbPassword: 'hunter2' }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      const message = job.error?.message ?? ''
+      assert.match(message, /was created, but setting the SMB password failed/)
+      assert.match(message, /apt install samba/)
+      assert.doesNotMatch(message, /ENOENT/)
     })
   })
 })

@@ -60,8 +60,10 @@ ANAS installer
 Usage: sudo ./install.sh [options]
 
 Options:
-  --install-deps   Auto-install missing dependencies: acl, and Node.js (>= ${MIN_NODE_MAJOR})
-                   via the NodeSource setup_22.x repository if absent/too old.
+  --install-deps   Auto-install Node.js (>= ${MIN_NODE_MAJOR}) via the NodeSource setup_22.x
+                   repository if it is absent or too old. Everything else ANAS
+                   requires (acl, mdadm, btrfs-progs, samba, nfs-kernel-server)
+                   is a HARD dependency and is installed regardless of this flag.
   --yes            Non-interactive; assume "yes" to prompts.
   --prefix DIR     Install location (default: /opt/anas).
   --port N         Loopback port for the ANAS gateway (default: ${DEFAULT_PORT}).
@@ -234,6 +236,8 @@ NEED_NODE_INSTALL=0
 NEED_ACL_INSTALL=0
 NEED_MDADM_INSTALL=0
 NEED_BTRFS_INSTALL=0
+NEED_SAMBA_INSTALL=0
+NEED_NFS_INSTALL=0
 FATAL=()
 
 phase0_preflight() {
@@ -358,9 +362,26 @@ phase0_preflight() {
     info "btrfs-progs (mkfs.btrfs) missing — will auto-install"
   fi
 
-  # Per-protocol tools — warn only (operator chooses which to run).
-  command -v smbd     >/dev/null 2>&1 || warn "smbd (samba) not found — SMB shares will not work until samba is installed."
-  command -v exportfs >/dev/null 2>&1 || warn "exportfs (nfs-kernel-server) not found — NFS shares will not work until nfs-kernel-server is installed."
+  # samba / nfs-kernel-server — required for SMB and NFS shares. PVE 9 ships
+  # neither; both are standard Debian packages. ANAS does NOT gate the share
+  # features on their presence — the Shares and Share Users screens are always
+  # there — so the binaries they need are HARD dependencies, exactly like
+  # mdadm/btrfs-progs (issue #6: a fresh node had no smbpasswd, and adding an
+  # SMB share user failed with a raw `spawn /usr/bin/smbpasswd ENOENT`).
+  # smbd comes from `samba`, smbpasswd from `samba-common-bin` (which `samba`
+  # pulls in) — probing both catches a node with only half of the pair.
+  if command -v smbd >/dev/null 2>&1 && command -v smbpasswd >/dev/null 2>&1; then
+    info "samba (smbd, smbpasswd) present"
+  else
+    NEED_SAMBA_INSTALL=1
+    info "samba (smbd/smbpasswd) missing — will auto-install"
+  fi
+  if command -v exportfs >/dev/null 2>&1; then
+    info "nfs-kernel-server (exportfs) present"
+  else
+    NEED_NFS_INSTALL=1
+    info "nfs-kernel-server (exportfs) missing — will auto-install"
+  fi
 
   # Resolve the gateway port (issue #2) before anything binds. This owns the
   # port-in-use logic: --port intent, preserving a configured port on upgrade,
@@ -386,9 +407,13 @@ phase0_preflight() {
   log "Preflight OK."
 }
 
-# Perform opted-in dependency installs (Node via NodeSource, acl). This mutates
-# the system but only adds standard packages the operator asked for; it is NOT
-# rolled back on a later failure (leaving deps installed is harmless).
+# Install the dependencies preflight marked missing: Node.js via NodeSource
+# (opted in with --install-deps), then the hard dependencies that are installed
+# regardless — acl, mdadm + btrfs-progs, samba + nfs-kernel-server. This mutates
+# the system but only adds standard Debian packages; it is NOT rolled back on a
+# later failure (leaving deps installed is harmless). It runs on every install
+# AND every upgrade, so an existing node picks up a dependency added by a newer
+# ANAS release the next time the installer is run.
 phase0b_install_deps() {
   if [ "${NEED_NODE_INSTALL}" -eq 1 ]; then
     log "Installing Node.js 22 via NodeSource..."
@@ -421,6 +446,35 @@ phase0b_install_deps() {
     command -v mdadm      >/dev/null 2>&1 || { err "mdadm install failed (mdadm still missing) — ANAS requires it for AHR/Hybrid RAID; nothing was modified"; exit 1; }
     command -v mkfs.btrfs >/dev/null 2>&1 || { err "btrfs-progs install failed (mkfs.btrfs still missing) — ANAS requires it for AHR/Hybrid RAID; nothing was modified"; exit 1; }
     info "mdadm + btrfs-progs installed"
+  fi
+  if [ "${NEED_SAMBA_INSTALL}" -eq 1 ] || [ "${NEED_NFS_INSTALL}" -eq 1 ]; then
+    local share_pkgs=()
+    [ "${NEED_SAMBA_INSTALL}" -eq 1 ] && share_pkgs+=("samba")
+    [ "${NEED_NFS_INSTALL}" -eq 1 ] && share_pkgs+=("nfs-kernel-server")
+    log "Installing ${share_pkgs[*]}..."
+    # noninteractive: samba's postinst debconf-prompts about the workgroup/WINS
+    # configuration. Same shape as mdadm/btrfs-progs above — the share features
+    # are not gated on these tools being present, so they are installed at
+    # install time, never optional (issue #6). Nothing here writes smb.conf or
+    # /etc/exports: the packages lay down their own defaults and ANAS edits them
+    # surgically from there (PRINCIPLES.md #12 — guest, not owner).
+    # This runs BEFORE the rollback trap arms, so no ANAS step has touched the node.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${share_pkgs[@]}"; then
+      err "failed to install the required package(s) '${share_pkgs[*]}'."
+      err "ANAS requires them for SMB/NFS shares and share users — the share screens are always available, so they are a hard dependency, not optional."
+      err "Nothing on this node was modified (this step runs before any install action)."
+      err "On an air-gapped node, preseed them first (e.g. 'apt-get install -y --no-download ${share_pkgs[*]}' from a local mirror, or pre-place the .deb files) and re-run this installer."
+      exit 1
+    fi
+    if [ "${NEED_SAMBA_INSTALL}" -eq 1 ]; then
+      command -v smbd      >/dev/null 2>&1 || { err "samba install failed (smbd still missing) — ANAS requires it for SMB shares; nothing was modified"; exit 1; }
+      command -v smbpasswd >/dev/null 2>&1 || { err "samba install failed (smbpasswd still missing) — ANAS requires it for SMB share users; nothing was modified"; exit 1; }
+    fi
+    if [ "${NEED_NFS_INSTALL}" -eq 1 ]; then
+      command -v exportfs >/dev/null 2>&1 || { err "nfs-kernel-server install failed (exportfs still missing) — ANAS requires it for NFS exports; nothing was modified"; exit 1; }
+    fi
+    info "${share_pkgs[*]} installed"
+    info "note: these packages enable and start their own services (smbd / nfs-server)"
   fi
 }
 

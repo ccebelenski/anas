@@ -105,11 +105,13 @@ ANAS treats your system as the source of truth and itself as a **guest**:
 ## Requirements
 
 - Proxmox VE node (single node or cluster)
-- Node.js ≥ 20 (installer can provide via `--install-deps`)
+- Node.js ≥ 20 (installer can provide via `--install-deps` — the only thing that
+  flag gates)
 - ZFS ≥ 2.2 (ANAS uses `zpool`'s JSON output)
-- `mdadm` + `btrfs-progs` for Hybrid RAID (the installer adds them — PVE
-  doesn't ship either)
-- Optional per-protocol: `samba` (SMB), `nfs-kernel-server` (NFS)
+- `mdadm` + `btrfs-progs` for Hybrid RAID, `samba` for SMB shares and share
+  users, `nfs-kernel-server` for NFS exports, `acl` for permissions — the
+  installer adds all of them, on fresh installs and upgrades alike (PVE ships
+  none of them, and ANAS never gates a feature on its tools being absent)
 
 ## Install
 

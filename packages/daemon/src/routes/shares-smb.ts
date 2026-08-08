@@ -55,21 +55,33 @@ export async function smbShareRoutes(
     return readConfig(smbConfPath)
   }
 
-  /** Live connections keyed by share (service), from smbstatus (JSON first). */
+  /**
+   * Live connections keyed by share (service), from smbstatus (JSON first).
+   *
+   * FAIL-OPEN, never throws: smbstatus ships in the `samba` package, and
+   * execFile REJECTS (rather than returning an exit code) when the binary is
+   * missing, so on a node without samba this would otherwise 500 the share
+   * detail view (issue #6). No smbstatus means no reportable connections.
+   */
   async function connectionsByShare(): Promise<Record<string, SmbConnection[]>> {
-    const json = await executor.exec(SMBSTATUS, ['--json'])
-    if (json.exitCode === 0 && json.stdout.trim().startsWith('{')) {
-      try {
-        return parseSmbStatusJson(json.stdout)
+    try {
+      const json = await executor.exec(SMBSTATUS, ['--json'])
+      if (json.exitCode === 0 && json.stdout.trim().startsWith('{')) {
+        try {
+          return parseSmbStatusJson(json.stdout)
+        }
+        catch {
+          // Fall through to the text parser below.
+        }
       }
-      catch {
-        // Fall through to the text parser below.
-      }
+      const text = await executor.exec(SMBSTATUS, ['-S'])
+      if (text.exitCode === 0 && text.stdout.trim())
+        return parseSmbStatusText(text.stdout)
+      return {}
     }
-    const text = await executor.exec(SMBSTATUS, ['-S'])
-    if (text.exitCode === 0 && text.stdout.trim())
-      return parseSmbStatusText(text.stdout)
-    return {}
+    catch {
+      return {}
+    }
   }
 
   /** Live connections for a given share, from smbstatus (JSON preferred). */

@@ -76,7 +76,7 @@ separate app.
 
 | Flag | Effect |
 | --- | --- |
-| `--install-deps` | Auto-install `acl`, and Node.js ≥ 20 via NodeSource `setup_22.x` if missing/old. |
+| `--install-deps` | Auto-install Node.js ≥ 20 via NodeSource `setup_22.x` if missing/old. Everything else (`acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server`) is a hard dependency and installs regardless. |
 | `--yes`, `-y` | Non-interactive (assume yes). |
 | `--prefix DIR` | Install location (default `/opt/anas`). Units are rewritten to match. |
 | `--force` | Skip the ZFS ≥ 2.2 gate (ANAS needs `zpool -j` JSON output). |
@@ -85,8 +85,13 @@ separate app.
 
 1. **Preflight (mutates nothing, aborts early):** reports the version transition
    (fresh / reinstall / `upgrade X -> Y`; a **downgrade** warns and asks for
-   confirmation); then root, PVE node, Node.js ≥ 20, ZFS ≥ 2.2, `acl`; warns on
-   missing `smbd`/`exportfs` and on a busy `:3000`.
+   confirmation); then root, PVE node, Node.js ≥ 20, ZFS ≥ 2.2, and the hard
+   dependencies (`acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server`) —
+   each missing one is marked for install; warns on a busy `:3000`.
+1b. **Dependency install:** the marked packages are installed with `apt-get`
+   before anything else is touched (an apt failure aborts with the node
+   unmodified). This step runs on upgrades too, so an existing node picks up a
+   dependency added by a newer ANAS release.
 2. **Transactional install:** back up any existing `/opt/anas`, copy the app,
    install + enable + start the units, **health-check** the gateway, then run the
    PVE UI injection. Any failure triggers a rollback that reverses every completed
@@ -108,4 +113,6 @@ pristine `index.html.tpl`), removes the unit files, and deletes the prefix.
 - Proxmox VE (provides `pveversion` and `/usr/share/pve-manager/index.html.tpl`).
 - Node.js ≥ 20 (install with `--install-deps`, or NodeSource `setup_22.x`).
 - ZFS ≥ 2.2.
-- `acl` (auto-installed). Optional per-protocol: `samba` (SMB), `nfs-kernel-server` (NFS).
+- `acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server` — all auto-installed
+  by `install.sh` (hard dependencies: the AHR, SMB and NFS features are never
+  gated on them being present, so the installer guarantees them).
