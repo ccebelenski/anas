@@ -68,6 +68,45 @@ last_sync_action() {
   [ -f "$_f" ] && cat "$_f" 2>/dev/null
 }
 
+# Whether the array's MEMBERSHIP is that of an initial build / rebuild rather
+# than a fault: no member is faulty, every raid slot has a device (the extra,
+# high-numbered one is the spare md is rebuilding INTO), and a sync is actually
+# running. Returns 0 (true) only when all three hold.
+#
+# This is the SAME rule the API state derivation applies — `isBuildingMembership`
+# in packages/daemon/src/services/ahr-topology.ts (issue #9). It is expressed
+# against sysfs here because this hook runs from mdadm's monitor loop with no
+# daemon, no socket and no node available; the logic cannot literally be shared,
+# so the two MUST be kept in step. Change one, change the other.
+#
+# Fail-safe direction is the OPPOSITE of the create-time kernel gate, and
+# deliberately so: unreadable sysfs returns false, so a DegradedArray we cannot
+# explain is still reported. Never silently swallow a degraded array.
+initial_build_shape() {
+  _md_real=$(readlink -f "$1" 2>/dev/null) || return 1
+  _md_dir="${MD_SYSFS_BLOCK}/${_md_real##*/}/md"
+  [ -d "$_md_dir" ] || return 1
+  _raid_disks=$(cat "$_md_dir/raid_disks" 2>/dev/null) || return 1
+  [ -n "$_raid_disks" ] || return 1
+  _members=0
+  for _d in "$_md_dir"/dev-*; do
+    [ -d "$_d" ] || continue
+    # A faulty member is a real fault, never an initial build.
+    grep -q faulty "$_d/state" 2>/dev/null && return 1
+    _members=$((_members + 1))
+  done
+  # Fewer devices than raid slots means a member is MISSING (dead/removed) —
+  # the shape of a genuinely degraded start, e.g. booting with a dead disk.
+  [ "$_members" -ge "$_raid_disks" ] 2>/dev/null || return 1
+  # …and redundancy must actually be being built right now. sysfs reports
+  # `recover` even for arrays whose sync is QUEUED behind another (live ground
+  # truth, issue #9), so this covers the DELAYED bands of a multi-band create.
+  case "$(cat "$_md_dir/sync_action" 2>/dev/null)" in
+    recover | resync) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Parity-mismatch counter after a check (valid once a check has run; a real
 # rebuild leaves it untouched). Prints nothing when unreadable.
 mismatch_count() {
@@ -96,6 +135,18 @@ if [ "$EVENT" = "RebuildFinished" ]; then
   fi
 fi
 
+# Issue #14: mdadm fires DegradedArray for any array that STARTS degraded — and
+# mdadm BUILDS RAID5/6 degraded-plus-recovering, so every fresh band of a new
+# pool trips it. Creating a 3-band mixed pool sent the operator three
+# "DegradedArray" alerts within seconds of pressing Create, for three arrays
+# that were doing exactly what they were supposed to. Apply the same
+# discrimination the API state derivation and the 11.17 sync-finished wording
+# already apply.
+BUILD_SHAPE=""
+if [ "$EVENT" = "DegradedArray" ] && initial_build_shape "$DEVICE"; then
+  BUILD_SHAPE=yes
+fi
+
 # Severity map (AHR-DESIGN §7.2): redundancy lost / at risk -> warning,
 # redundancy restored -> notice, everything informational -> info.
 case "$EVENT" in
@@ -110,12 +161,30 @@ case "$EVENT" in
     ;;
 esac
 
+# An initial build is activity, not lost redundancy — it is not a warning.
+if [ -n "$BUILD_SHAPE" ]; then
+  PRIORITY=info
+fi
+
 LOGLINE="EVENT=${EVENT} DEVICE=${DEVICE}"
 [ -n "$MEMBER" ] && LOGLINE="${LOGLINE} MEMBER=${MEMBER}"
 [ -n "$ACTION" ] && LOGLINE="${LOGLINE} ACTION=${ACTION}"
 [ -n "$MISMATCHES" ] && LOGLINE="${LOGLINE} MISMATCHES=${MISMATCHES}"
 [ -n "$BADBLOCKS" ] && LOGLINE="${LOGLINE} BADBLOCKS=${BADBLOCKS}"
+# Key=value throughout (the journald audit convention), so the suppression is
+# greppable: the record says the array started in initial-build recovery, that
+# this is expected during pool creation, and that no notification was sent.
+[ -n "$BUILD_SHAPE" ] && LOGLINE="${LOGLINE} BUILD=initial-recovery NOTIFY=suppressed REASON=expected-during-pool-creation"
 logger -t anas-ahr -p "daemon.${PRIORITY}" "$LOGLINE"
+
+# An array that STARTS degraded because md is building its redundancy is not a
+# fault: journald has the record and there is nothing for the operator to act
+# on. A GENUINELY degraded start (missing or faulty member) falls straight
+# through to the notification below, exactly as before — that path is
+# load-bearing and untouched.
+if [ -n "$BUILD_SHAPE" ]; then
+  exit 0
+fi
 
 # Forward redundancy-affecting events through the PVE notification system
 # (GT-17: PVE::Notify + the ANAS-shipped anas-ahr templates; args pass via

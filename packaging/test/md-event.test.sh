@@ -135,6 +135,80 @@ check "journald has ACTION=recover"     grep -q 'ACTION=recover' "${TMP}/logger.
 check "BBL outcome reported"            grep -q 'BADBLOCKS=0' "${TMP}/logger.log"
 check "rebuild wording kept"            grep -q 'reconstructed everything exactly' "${TMP}/perl.log"
 
+# --- issue #14: DegradedArray discrimination ---------------------------------
+# mdadm BUILDS RAID5/6 degraded-plus-recovering, and fires DegradedArray for
+# any array that STARTS degraded — so a fresh 3-band pool sent the operator
+# three "DegradedArray" alerts seconds after pressing Create. The initial-build
+# shape must log and stay quiet; a REAL degraded start must notify as before.
+#
+# Fresh sysfs per case so raid_disks / dev-* / state are unambiguous.
+build_sysfs() { # build_sysfs <raid_disks> <sync_action> <member-spec...>
+  rm -rf "${SYS}/md127"
+  mkdir -p "${SYS}/md127/md"
+  printf '%s\n' "$1" > "${SYS}/md127/md/raid_disks"
+  printf '%s\n' "$2" > "${SYS}/md127/md/sync_action"
+  shift 2
+  for _spec in "$@"; do
+    _name="${_spec%%:*}"
+    _state="${_spec#*:}"
+    mkdir -p "${SYS}/md127/md/dev-${_name}"
+    printf '%s\n' "${_state}" > "${SYS}/md127/md/dev-${_name}/state"
+  done
+}
+
+echo "== 10. DegradedArray on a fresh RAID5 building its parity =="
+# The real create shape: 3 raid slots, 3 devices, none faulty, the last one a
+# spare being recovered into. Nothing has failed.
+build_sysfs 3 recover sda1:in_sync sdb1:in_sync sdc1:spare
+run_hook DegradedArray /dev/md127
+check "exit 0"                          test "$?" -eq 0
+check "journald records the event"      grep -q 'EVENT=DegradedArray DEVICE=/dev/md127' "${TMP}/logger.log"
+check "marked as initial recovery"      grep -q 'BUILD=initial-recovery' "${TMP}/logger.log"
+check "says the notify was suppressed"  grep -q 'NOTIFY=suppressed REASON=expected-during-pool-creation' "${TMP}/logger.log"
+check "severity downgraded to info"     grep -q 'daemon.info' "${TMP}/logger.log"
+check "NO notification is sent"         bash -c "! test -s '${TMP}/perl.log'"
+
+echo "== 11. a QUEUED band (sync_action still 'recover') is also quiet =="
+# Live ground truth (issue #9): sysfs reports 'recover' even for the bands whose
+# sync is DELAYED behind another — so bands 2..N of a multi-band create match.
+build_sysfs 4 recover sda1:in_sync sdb1:in_sync sdc1:in_sync sdd1:spare
+run_hook DegradedArray /dev/md127
+check "no notification for band 2..N"   bash -c "! test -s '${TMP}/perl.log'"
+check "still journald-logged"           grep -q 'BUILD=initial-recovery' "${TMP}/logger.log"
+
+echo "== 12. a MISSING member still notifies (dead disk at boot) =="
+# Only 2 devices for 3 raid slots — a member is gone. This path is load-bearing.
+build_sysfs 3 recover sda1:in_sync sdb1:in_sync
+run_hook DegradedArray /dev/md127
+check "notification IS sent"            grep -q ' warning md DegradedArray' "${TMP}/perl.log"
+check "severity stays warning"          grep -q 'daemon.warning' "${TMP}/logger.log"
+check "not marked initial-recovery"     bash -c "! grep -q 'BUILD=initial-recovery' '${TMP}/logger.log'"
+
+echo "== 13. a FAULTY member still notifies =="
+build_sysfs 3 recover sda1:in_sync sdb1:faulty sdc1:spare
+run_hook DegradedArray /dev/md127
+check "notification IS sent"            grep -q ' warning md DegradedArray' "${TMP}/perl.log"
+check "not marked initial-recovery"     bash -c "! grep -q 'BUILD=initial-recovery' '${TMP}/logger.log'"
+
+echo "== 14. an IDLE degraded array still notifies (nothing is rebuilding) =="
+# Slots full and nothing faulty, but no sync running: redundancy is NOT being
+# restored, so this is a real degraded state the operator must hear about.
+build_sysfs 3 idle sda1:in_sync sdb1:in_sync sdc1:spare
+run_hook DegradedArray /dev/md127
+check "notification IS sent"            grep -q ' warning md DegradedArray' "${TMP}/perl.log"
+
+echo "== 15. unreadable sysfs still notifies (fail-safe direction) =="
+rm -rf "${SYS}/md127"
+run_hook DegradedArray /dev/md127
+check "notification IS sent"            grep -q ' warning md DegradedArray' "${TMP}/perl.log"
+check "not marked initial-recovery"     bash -c "! grep -q 'BUILD=initial-recovery' '${TMP}/logger.log'"
+
+echo "== 16. other events are untouched by the discriminator =="
+build_sysfs 3 recover sda1:in_sync sdb1:in_sync sdc1:spare
+run_hook Fail /dev/md127 /dev/sdb1
+check "Fail still notifies"             grep -q ' warning md Fail' "${TMP}/perl.log"
+check "Fail stays warning"              grep -q 'daemon.warning' "${TMP}/logger.log"
+
 echo
 echo "md-event tests: ${PASS} passed, ${FAIL} failed"
 [ "${FAIL}" -eq 0 ]

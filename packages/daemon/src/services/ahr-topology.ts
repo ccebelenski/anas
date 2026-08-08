@@ -229,6 +229,13 @@ export function notMountedAdvisory(pool: string): string {
  * or a slot count alone cannot. A removed disk shows FEWER members than slots;
  * a failed-but-attached disk shows `(F)`. Either way this returns false and the
  * array keeps its degraded verdict.
+ *
+ * THE SAME RULE IS IMPLEMENTED ONCE MORE, in sysfs, as `initial_build_shape()`
+ * in packaging/anas-md-event.sh (issue #14): mdadm fires `DegradedArray` for
+ * every array that STARTS degraded, which is every fresh RAID5/6 band, so the
+ * monitor hook needs this discrimination too. It cannot import this function —
+ * it runs from mdadm's monitor loop with no daemon and no node — so the two are
+ * deliberately parallel and MUST be kept in step. Change one, change the other.
  */
 function isBuildingMembership(md: MdstatArray): boolean {
   if (md.members.some(m => m.faulty))

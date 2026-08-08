@@ -271,6 +271,7 @@ AHR is the feature that justifies actually wiring the deferred Proxmox notificat
 | Event | Severity | Why it must notify |
 |---|---|---|
 | Array degraded (disk faulted) | warning | redundancy lost — replace before a second failure |
+| Array degraded because md is BUILDING it | *(suppressed)* | issue #14: nothing has failed — journald only |
 | Rebuild/recover complete | info | redundancy restored |
 | Reshape complete (expansion done) | info | new capacity available / unlock progressed |
 | Reshape/expansion FAILED | error | pool stuck mid-transition, needs attention |
@@ -278,6 +279,13 @@ AHR is the feature that justifies actually wiring the deferred Proxmox notificat
 | Second disk failure / array failed | **critical** | data loss imminent/occurring; pool may go read-only |
 | Pool read-only (btrfs forced ro) | **critical** | fs protecting itself |
 | Scrub found (and could/could not correct) errors | warning/error | latent corruption surfaced |
+
+**Event discrimination is mandatory, not cosmetic.** mdadm's monitor names things by mechanism, not by meaning, and forwarding it verbatim produces alarming nonsense:
+
+- mdadm calls EVERY sync operation "Rebuild*", so the scheduled parity check arrives as `RebuildFinished` — 11.17 reads `last_sync_action` to say whether a check or a real rebuild finished, and reports mismatches vs bad blocks accordingly.
+- mdadm fires `DegradedArray` for any array that STARTS degraded, and it BUILDS RAID5/6 degraded-plus-recovering — so every fresh band of a new pool trips it. Creating a 3-band pool sent three "DegradedArray" alerts within seconds of pressing Create (issue #14, live on pve5). The hook now applies the same discriminator the API state derivation uses (§ issue #9): **zero faulty members, every raid slot accounted for, and a sync actually running** ⇒ initial build ⇒ journald at `info` with `BUILD=initial-recovery NOTIFY=suppressed`, no notification. A genuinely degraded start — a MISSING member (dead disk at boot) or a FAULTY one — notifies exactly as before; that path is load-bearing. Unreadable sysfs also notifies: a `DegradedArray` we cannot explain is never silently swallowed.
+
+That rule is implemented twice on purpose — `isBuildingMembership` (TypeScript, from /proc/mdstat) and `initial_build_shape()` (POSIX sh, from sysfs) — because the monitor hook runs with no daemon, no socket and no node. They must be kept in step; each carries a comment pointing at the other.
 
 Routed through PVE's own notification targets/matchers (email/Gotify/etc. the operator already configured) — ANAS emits, PVE delivers. Leverage, not a new alerting system. **Mechanism (GT-17, proven live):** `PVE::Notify::<severity>('anas-ahr', {title, message}, fields)` with ANAS-shipped handlebars templates in `/usr/share/pve-manager/templates/default/` (apt-hook reinstalls after pve-manager upgrades); `fields` carries `type=anas-ahr` for operator matcher rules. **Evaluate first (per 9.4):** does ZED/mdadm's own `MAILADDR`/monitor already cover the disk-failure cases? Wire only the genuinely-missing events; don't duplicate `mdadm --monitor` if PVE can consume it directly.
 
