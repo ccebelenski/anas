@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { createAhrPool } from '../ahr-create.js'
+import { LVM_MIXED_BLOCK_ARGS } from '../ahr-exec.js'
 
 /**
  * AHR create — exact command-sequence (argv) regression against the small
@@ -131,11 +132,16 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       // Pin (UUID read) THEN initramfs (ARRAY_PIN_REQUIRES_INITRAMFS).
       { command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t2-r1'] },
       { command: '/usr/sbin/update-initramfs', args: ['-u'] },
-      { command: '/usr/sbin/pvcreate', args: ['/dev/md/t2-r1'] },
-      { command: '/usr/sbin/vgcreate', args: ['t2', '/dev/md/t2-r1'] },
-      { command: '/usr/sbin/lvcreate', args: ['-y', '-l', '100%FREE', '-n', 't2-vol', 't2'] },
-      // btrfs is always single-data/dup-metadata — never btrfs-RAID.
-      { command: '/usr/sbin/mkfs.btrfs', args: ['-L', 't2', '-d', 'single', '-m', 'dup', '/dev/t2/t2-vol'] },
+      // Every LVM call carries allow_mixed_block_sizes (issue #8): AHR bands
+      // legitimately differ in logical block size on mixed media, and LVM
+      // refuses that by default — after the disks are already wiped.
+      { command: '/usr/sbin/pvcreate', args: [...LVM_MIXED_BLOCK_ARGS, '/dev/md/t2-r1'] },
+      { command: '/usr/sbin/vgcreate', args: [...LVM_MIXED_BLOCK_ARGS, 't2', '/dev/md/t2-r1'] },
+      { command: '/usr/sbin/lvcreate', args: [...LVM_MIXED_BLOCK_ARGS, '-y', '-l', '100%FREE', '-n', 't2-vol', 't2'] },
+      // btrfs is always single-data/dup-metadata — never btrfs-RAID — and its
+      // sector size is EXPLICIT, not inherited from the CPU page size (it is
+      // what keeps a mixed-block-size LV mountable).
+      { command: '/usr/sbin/mkfs.btrfs', args: ['-L', 't2', '-d', 'single', '-m', 'dup', '--sectorsize', '4096', '/dev/t2/t2-vol'] },
       // §12 subvolume layout: mount the top-level, carve @data + @snapshots,
       // unmount — then the pool mounts subvol=@data.
       { command: '/usr/bin/mount', args: ['-t', 'btrfs', '-o', 'subvolid=5', '/dev/t2/t2-vol', join(mountBase, 't2')] },
@@ -214,11 +220,56 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     assert.ok(creates.every(c => c.args.some(a => a.startsWith('--data-offset='))))
 
     const vgcreate = executor.calls.find(c => c.command === '/usr/sbin/vgcreate')!
-    assert.deepEqual(vgcreate.args, ['t3', '/dev/md/t3-r1', '/dev/md/t3-r2'])
+    assert.deepEqual(vgcreate.args, [...LVM_MIXED_BLOCK_ARGS, 't3', '/dev/md/t3-r1', '/dev/md/t3-r2'])
 
     const conf = await readFile(confPath, 'utf8')
     assert.ok(conf.includes(UUID_R1))
     assert.ok(conf.includes(UUID_R2))
+  })
+
+  // Issue #8: the multi-band shape above is exactly the one that breaks when a
+  // 4Kn disk is in the mix — band 1 becomes a 4096-block array and band 2 a
+  // 512-block one, and vgcreate refuses AFTER the wipe and the mdadm --create.
+  // The flag is not decoration on one call; every LVM verb must carry it.
+  it('EVERY LVM call carries allow_mixed_block_sizes (issue #8)', async () => {
+    const executor = creationExecutor()
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t3-r1'], result: { stdout: `MD_NAME=t3-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t3-r2'], result: { stdout: `MD_NAME=t3-r2\nMD_UUID=${UUID_R2}\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/sdx1\n', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/ls', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    await createAhrPool(
+      executor,
+      {
+        name: 't3',
+        tier: 'ahr1',
+        // A genuinely mixed selection: the 4 GiB disk reports 4Kn.
+        disks: [
+          { id: SMALL, usableBytes: 2 * GIB },
+          { id: MID, usableBytes: 3 * GIB },
+          { id: BIG, usableBytes: 4 * GIB, logicalSectorSize: 4096 },
+        ],
+      },
+      m => progress.push(m),
+      { fstabPath, mdadmConfPath: confPath, mountBase },
+    )
+
+    for (const command of ['/usr/sbin/pvcreate', '/usr/sbin/vgcreate', '/usr/sbin/lvcreate']) {
+      const calls = executor.calls.filter(c => c.command === command)
+      assert.ok(calls.length > 0, `${command} was never called`)
+      for (const call of calls) {
+        assert.deepEqual(
+          call.args.slice(0, LVM_MIXED_BLOCK_ARGS.length),
+          LVM_MIXED_BLOCK_ARGS,
+          `${command} must lead with ${LVM_MIXED_BLOCK_ARGS.join(' ')}`,
+        )
+      }
+    }
+
+    // btrfs states its sector size rather than inheriting the CPU page size —
+    // 4096 is what satisfies the 4Kn band's logical block size.
+    const mkfs = executor.calls.find(c => c.command === '/usr/sbin/mkfs.btrfs')!
+    assert.deepEqual(mkfs.args.slice(-3), ['--sectorsize', '4096', '/dev/t3/t3-vol'])
   })
 
   it('refuses when no protected band is possible', async () => {

@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
+import { LVM_MIXED_BLOCK_ARGS } from '../ahr-exec.js'
 import { diskLsblkArgs, executeExpansion, executeReadd, executeReplace, projectExistingBands } from '../ahr-expand-exec.js'
 import { readIntent, writeIntent } from '../ahr-intent.js'
 import { planExpansion } from '../ahr-layout.js'
@@ -568,7 +569,7 @@ unused devices: <none>
       executor.addFixture({ command: '/usr/sbin/pvcreate', result: { stdout: '', stderr: '', exitCode: 0 } })
       outcome = await run(executor, mkPlan([B1, B2, B3], [{ kind: 'pv-create', target: 'md/tank-r3' }]), [X, Y, Z])
       assert.equal(outcome.ok, true, outcome.error)
-      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/sbin/pvcreate', '/dev/md125']])
+      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/sbin/pvcreate', ...LVM_MIXED_BLOCK_ARGS, '/dev/md125']])
     })
 
     it('pv-resize skips when the PV already matches the array size', async () => {
@@ -607,7 +608,7 @@ unused devices: <none>
       executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: pvsJson([{ name: '/dev/md125', vg: null, size: GIB }]), stderr: '', exitCode: 0 } })
       outcome = await run(executor, plan, [X, Y, Z])
       assert.equal(outcome.ok, true, outcome.error)
-      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/sbin/vgextend', 'tank', '/dev/md125']])
+      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/sbin/vgextend', ...LVM_MIXED_BLOCK_ARGS, 'tank', '/dev/md125']])
     })
 
     it('lv-extend consumes free space; skips when nothing is free', async () => {
@@ -617,7 +618,7 @@ unused devices: <none>
       executor.addFixture({ command: '/usr/sbin/lvextend', result: { stdout: '', stderr: '', exitCode: 0 } })
       let outcome = await run(executor, mkPlan([B1, B2], [{ kind: 'lv-extend', target: 'tank-vol' }]), [X, Y, Z])
       assert.equal(outcome.ok, true, outcome.error)
-      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/sbin/lvextend', '-l', '+100%FREE', '/dev/tank/tank-vol']])
+      assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [['/usr/sbin/lvextend', ...LVM_MIXED_BLOCK_ARGS, '-l', '+100%FREE', '/dev/tank/tank-vol']])
       // Nothing free → no-op.
       executor = world()
       executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: vgsJson(0), stderr: '', exitCode: 0 } })
@@ -792,7 +793,7 @@ unused devices: <none>
       assert.ok(mdstatReadsBefore >= 4, `no size-dependent step ran before md published the grown size (${mdstatReadsBefore} mdstat reads)`)
       assert.deepEqual(mutatingCalls(executor).map(c => [c.command, ...c.args]), [
         ['/usr/sbin/pvresize', '/dev/md127'],
-        ['/usr/sbin/lvextend', '-l', '+100%FREE', '/dev/tank/tank-vol'],
+        ['/usr/sbin/lvextend', ...LVM_MIXED_BLOCK_ARGS, '-l', '+100%FREE', '/dev/tank/tank-vol'],
         ['/usr/bin/btrfs', 'filesystem', 'resize', 'max', '/mnt/anas-ahr/tank'],
       ])
       // Only NOW is the expansion over.

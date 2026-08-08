@@ -27,7 +27,9 @@ import { jobRoutes } from '../jobs.js'
 const GIB = 1024 ** 3
 const BLANK_SMALL = 'ata-ANAS_TEST_BLANK_SMALL'
 const BLANK_BIG = 'ata-ANAS_TEST_BLANK_BIG'
+const BLANK_4KN = 'ata-ANAS_TEST_BLANK_4KN'
 const UUID_R1 = 'aaaaaaaa:bbbbbbbb:cccccccc:dddddddd'
+const UUID_R2 = '11111111:22222222:33333333:44444444'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -179,6 +181,9 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
       blockdevices: [
         { 'name': 'sdx', 'type': 'disk', 'size': 2 * GIB, 'model': 'BLANK SM', 'serial': 'A', 'tran': 'sata', 'fstype': null, 'mountpoint': null, 'rota': true, 'phy-sec': 4096, 'log-sec': 512 },
         { 'name': 'sdy', 'type': 'disk', 'size': 3 * GIB, 'model': 'BLANK BG', 'serial': 'B', 'tran': 'sata', 'fstype': null, 'mountpoint': null, 'rota': true, 'phy-sec': 4096, 'log-sec': 512 },
+        // A 4Kn disk, and the SMALLEST — so it reaches only the bottom band
+        // (issue #8): band 1 becomes a 4096-block array, band 2 stays 512.
+        { 'name': 'sdz', 'type': 'disk', 'size': 1 * GIB, 'model': 'BLANK 4KN', 'serial': 'C', 'tran': 'sata', 'fstype': null, 'mountpoint': null, 'rota': true, 'phy-sec': 4096, 'log-sec': 4096 },
       ],
     }
     executor.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: { stdout: JSON.stringify(lsblk), stderr: '', exitCode: 0 } })
@@ -186,6 +191,7 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
       stdout: [
         `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${BLANK_SMALL} -> ../../sdx`,
         `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${BLANK_BIG} -> ../../sdy`,
+        `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${BLANK_4KN} -> ../../sdz`,
         '',
       ].join('\n'),
       stderr: '',
@@ -260,6 +266,45 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.ok(fstab.includes(`/dev/tpool/tpool-vol ${join(dir, 'mnt', 'tpool')} btrfs nofail,subvol=@data 0 0`))
     const conf = await readFile(join(dir, 'mdadm.conf'), 'utf8')
     assert.ok(conf.includes('/dev/md/tpool-r1') && conf.includes(UUID_R1))
+  })
+
+  // Issue #8: a mixed 4Kn/512e selection is PROCEEDED with (the LVM stack is
+  // built with allow_mixed_block_sizes) but never silently — the operator meets
+  // the fact at the confirm gate, before the wipe, instead of as a job failure
+  // hours into the initial sync.
+  it('a mixed 4Kn/512e selection is labeled in the confirm gate, then proceeds', async () => {
+    const payload = JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_4KN, BLANK_SMALL, BLANK_BIG] })
+
+    const first = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload })
+    assert.equal(first.statusCode, 409)
+    const warnings = first.json().error.warnings as string[]
+    // Three wipe warnings + the geometry label.
+    assert.equal(warnings.length, 4)
+    const mixed = warnings.find(w => w.startsWith('mixed sector geometries'))
+    assert.ok(mixed, `expected a mixed-geometry warning, got: ${JSON.stringify(warnings)}`)
+    assert.match(mixed, /band 1: 4096/)
+    assert.match(mixed, /band 2: 512/)
+    assert.match(mixed, /allow_mixed_block_sizes/)
+    // Nothing destructive ran for a 409.
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'))
+
+    // Confirmed → it proceeds, and the LVM calls carry the flag.
+    const code = first.headers['x-anas-confirm-code'] as string
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/tpool-r2'], result: { stdout: `MD_NAME=tpool-r2\nMD_UUID=${UUID_R2}\n`, stderr: '', exitCode: 0 } })
+    const second = await server.inject({ method: 'POST', url: '/v1/ahr', headers: { ...JSON_HEADERS, 'x-anas-confirm': code }, payload })
+    assert.equal(second.statusCode, 202)
+    const job = await waitForJob(server, second.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+    const vgcreate = executor.calls.find(c => c.command === '/usr/sbin/vgcreate')!
+    assert.deepEqual(vgcreate.args.slice(0, 2), ['--config', 'devices/allow_mixed_block_sizes=1'])
+  })
+
+  it('a uniform 512e selection is NOT labeled — no phantom geometry warning', async () => {
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'tpool', tier: 'ahr1', disks: [BLANK_SMALL, BLANK_BIG] }) })
+    assert.equal(res.statusCode, 409)
+    const warnings = res.json().error.warnings as string[]
+    assert.ok(!warnings.some(w => w.startsWith('mixed sector geometries')))
   })
 
   it('minimum-disk rule: a 1-disk selection is rejected before any gate', async () => {

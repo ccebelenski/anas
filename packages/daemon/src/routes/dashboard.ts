@@ -1,4 +1,5 @@
 import type {
+  AhrPool,
   ArcTelemetry,
   DashboardWarning,
   Disk,
@@ -30,6 +31,7 @@ import { parseSmbConf } from '../parsers/smb-conf.js'
 import { nodeToIoStats, parseZpoolIostat } from '../parsers/zpool-iostat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
+import { withAhrCreateStatus } from '../services/ahr-create-status.js'
 import { collectAhrTelemetry } from '../services/ahr-io.js'
 import { buildAhrCapacityWarnings, collectAhrPoolBriefs, collectAhrWarnings } from '../services/ahr-topology.js'
 import { collectBackupWarnings } from '../services/backup-units.js'
@@ -81,6 +83,12 @@ export async function dashboardRoutes(
 ) {
   const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath, mdadmConfPath, ahrIntentDir } = opts
 
+  // A pool mid-create must not card as a CRITICAL failure for the whole build
+  // (issue #7): the half-built stack is genuinely VG-less, so only the live job
+  // can tell "being built" from "wrecked". Applied to both AHR /v1/status
+  // sources so the Pools section and the warning cards agree.
+  const ahrCreateStatus = (pool: AhrPool): AhrPool => withAhrCreateStatus(pool, jobQueue)
+
   // --- GET /v1/status ------------------------------------------------------
   server.get('/status', async () => {
     // Each block is independently fail-open so one failing source (e.g. no ZFS)
@@ -95,11 +103,11 @@ export async function dashboardRoutes(
       collectBackupWarnings(executor, systemdDir),
       // AHR (11.10): only bad states card (degraded/failed/readonly/halted
       // expansion); healthy pools contribute nothing, errors fail-open.
-      collectAhrWarnings(executor, ahrIntentDir),
+      collectAhrWarnings(executor, ahrIntentDir, ahrCreateStatus),
       // AHR (11.13, §10 revision): per-pool briefs for the headline Pools
       // section — healthy pools now render alongside ZFS pools; errors
       // fail-open to [] (the dashboard never degrades when AHR is unreadable).
-      collectAhrPoolBriefs(executor, mdadmConfPath),
+      collectAhrPoolBriefs(executor, mdadmConfPath, ahrCreateStatus),
       // Snapshot schedules (17.7): failed/overdue enabled schedules → 'schedule'
       // warnings; healthy/idle and disabled contribute nothing, errors fail-open.
       collectScheduleWarnings(executor, systemdDir),

@@ -50,7 +50,26 @@ export interface AhrLayoutDisk {
   id: string
   /** Usable size in bytes (pre-rounding; both planners floor it via §2.5). */
   usableBytes: number
+  /**
+   * Logical sector size in bytes from the inventory (`lsblk LOG-SEC`) — 512 on
+   * 512n/512e disks, 4096 on 4Kn. Optional: absent/null is treated as 512, the
+   * overwhelmingly common case, so callers that do not care (the expansion
+   * planner's size math) need not thread it. Used ONLY to label a mixed-geometry
+   * selection (issue #8) — it never changes band boundaries.
+   */
+  logicalSectorSize?: number | null
 }
+
+/** Assumed logical block size when the inventory did not report one. */
+export const AHR_DEFAULT_LOGICAL_BLOCK_BYTES = 512
+
+/**
+ * Opening words of the mixed-logical-block-size advisory. Exported so the
+ * create route can lift that ONE warning out of the layout's warning list into
+ * the confirm gate without re-deriving the condition — the planner stays the
+ * single place that decides whether a selection is mixed.
+ */
+export const MIXED_SECTOR_WARNING_PREFIX = 'mixed sector geometries'
 
 /**
  * One existing band array as an immutable planner constraint (§2.3): its
@@ -143,6 +162,7 @@ export function fmtBytes(bytes: number): string {
 interface RoundedDisk {
   id: string
   roundedBytes: number
+  logicalBlockBytes: number
 }
 
 /** Round + sanity-check a disk list (duplicate ids are a caller bug). */
@@ -152,7 +172,13 @@ function roundDisks(disks: AhrLayoutDisk[], context: string): RoundedDisk[] {
     if (seen.has(d.id))
       throw new AhrPlanError(`duplicate disk id '${d.id}' in ${context}`)
     seen.add(d.id)
-    return { id: d.id, roundedBytes: floorToGranularity(d.usableBytes) }
+    return {
+      id: d.id,
+      roundedBytes: floorToGranularity(d.usableBytes),
+      logicalBlockBytes: d.logicalSectorSize && d.logicalSectorSize > 0
+        ? d.logicalSectorSize
+        : AHR_DEFAULT_LOGICAL_BLOCK_BYTES,
+    }
   })
 }
 
@@ -177,6 +203,38 @@ function bandRegionsAbove(disks: RoundedDisk[], floorBytes: number): Region[] {
     start = end
   }
   return regions
+}
+
+/**
+ * The mixed-logical-block-size advisory (issue #8), or null when every
+ * protected band lands on the same block size.
+ *
+ * An md array inherits `max(logical_block_size)` of its members, so a band
+ * containing a 4Kn disk is 4096 while a band of 512e disks only is 512. LVM
+ * refuses such a VG by default; ANAS passes `allow_mixed_block_sizes=1`
+ * (services/ahr-exec.ts) and SAYS SO here rather than letting the operator meet
+ * it as a post-wipe job failure. Only PROTECTED bands count — an unprotected
+ * band carries no array and therefore no PV.
+ *
+ * Advisory only: the mix changes nothing about the layout, and btrfs's 4 KiB
+ * sector size satisfies the stacked LV either way.
+ */
+function mixedBlockSizeWarning(regions: Region[], bands: AhrPreviewBand[]): string | null {
+  const perBand = bands
+    .map((b, i) => ({
+      band: b.band,
+      protectedBand: b.protected,
+      blockBytes: regions[i].members.reduce((max, d) => Math.max(max, d.logicalBlockBytes), 0),
+    }))
+    .filter(b => b.protectedBand && b.blockBytes > 0)
+  const distinct = [...new Set(perBand.map(b => b.blockBytes))]
+  if (distinct.length < 2)
+    return null
+  distinct.sort((a, b) => b - a)
+  const detail = perBand.map(b => `band ${b.band}: ${b.blockBytes}`).join(', ')
+  return `${MIXED_SECTOR_WARNING_PREFIX} in this selection (${distinct.join('-byte and ')}-byte logical blocks) — `
+    + `the bands will have differing logical block sizes (${detail}); the LVM stack is created with `
+    + `allow_mixed_block_sizes, and btrfs uses a 4 KiB sector size either way`
 }
 
 /** The min-disk warning text (mirrors the UI advisor copy). */
@@ -234,7 +292,8 @@ export function planFreshLayout(disks: AhrLayoutDisk[], tier: AhrType): AhrLayou
   const rawBytes = rounded.reduce((sum, d) => sum + d.roundedBytes, 0)
   const warnings: string[] = []
 
-  const bands: AhrPreviewBand[] = bandRegionsAbove(rounded, 0).map((region, i) => {
+  const regions = bandRegionsAbove(rounded, 0)
+  const bands: AhrPreviewBand[] = regions.map((region, i) => {
     const memberCount = region.members.length
     const level = levelFor(tier, memberCount)
     const heightBytes = region.endBytes - region.startBytes
@@ -262,6 +321,9 @@ export function planFreshLayout(disks: AhrLayoutDisk[], tier: AhrType): AhrLayou
       )
     }
   }
+  const mixed = mixedBlockSizeWarning(regions, bands)
+  if (mixed)
+    warnings.push(mixed)
 
   return { bands, capacity: buildCapacity(bands, rawBytes, 0), warnings, minDisksMet }
 }

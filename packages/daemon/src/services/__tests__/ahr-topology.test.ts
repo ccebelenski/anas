@@ -382,4 +382,141 @@ unused devices: <none>
       assert.equal(pools[0].state, 'failed', 'pinned-but-VG-gone reports as failed, not hidden')
     })
   })
+
+  // --- The mixed-media first build (issues #7 + #9) --------------------------
+  // Driven by the LIVE pve5 capture: three `chiaahr2` bands building at once,
+  // md126 running the recovery and md124/md125 QUEUED behind it. A queued sync
+  // prints no progress line, so those two sit at `[3/2]`/`[4/3]` — which used
+  // to read as degraded arrays with failed disks on a pool minutes old.
+  describe('mixed-media first build (issues #7, #9)', () => {
+    /** vgs/lvs carrying BOTH real pools — the building one and the clean one. */
+    const TWO_POOL_VGS = JSON.stringify({
+      report: [{ vg: [
+        { vg_name: 'chiaahr2', pv_count: '3', lv_count: '1', snap_count: '0', vg_attr: 'wz--n-', vg_size: '55.00t', vg_free: '0 ' },
+        { vg_name: 'chiaahr', pv_count: '1', lv_count: '1', snap_count: '0', vg_attr: 'wz--n-', vg_size: '80.04t', vg_free: '0 ' },
+      ] }],
+      log: [],
+    })
+    const TWO_POOL_LVS = JSON.stringify({
+      report: [{ lv: [
+        { lv_name: 'chiaahr2-vol', vg_name: 'chiaahr2', lv_attr: '-wi-a-----', lv_size: '55.00t' },
+        { lv_name: 'chiaahr-vol', vg_name: 'chiaahr', lv_attr: '-wi-a-----', lv_size: '80.04t' },
+      ] }],
+      log: [],
+    })
+
+    /** Band index → kernel array, exactly as captured (r1 is the TALLEST band). */
+    const ARRAYS: Record<string, string> = {
+      '/dev/md126': 'chiaahr2-r1',
+      '/dev/md125': 'chiaahr2-r2',
+      '/dev/md124': 'chiaahr2-r3',
+      '/dev/md127': 'chiaahr-r1',
+    }
+
+    function buildingExecutor(mdstat?: string): MockExecutor {
+      const mock = new MockExecutor()
+      mock.addFixture({
+        command: '/usr/bin/cat',
+        args: MDSTAT_CAT_ARGS,
+        result: ok(mdstat ?? loadFixture('mdstat-initial-recovery-delayed-raid5.txt')),
+      })
+      for (const [dev, name] of Object.entries(ARRAYS)) {
+        mock.addFixture({
+          command: '/usr/sbin/mdadm',
+          args: mdadmDetailExportArgs(dev),
+          result: ok(`MD_LEVEL=raid5\nMD_METADATA=1.2\nMD_UUID=${dev.slice(-3)}0000:0:0:0\nMD_NAME=pve5:${name}\n`),
+        })
+      }
+      mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok('{"blockdevices":[]}') })
+      mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok('') })
+      mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(TWO_POOL_VGS) })
+      mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(TWO_POOL_LVS) })
+      mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('') })
+      return mock
+    }
+
+    async function buildingPool(mdstat?: string) {
+      const pools = await readAhrPools(buildingExecutor(mdstat))
+      const pool = pools.find(p => p.name === 'chiaahr2')
+      assert.ok(pool, 'the building pool must be reported')
+      return pool
+    }
+
+    it('a QUEUED band is recovering, not degraded — no failed disk is claimed', async () => {
+      const pool = await buildingPool()
+      const byBand = new Map(pool.arrays.map(a => [a.band, a]))
+
+      // The running one: md has a progress line, and always did read right.
+      assert.equal(byBand.get(1)!.state, 'recovering')
+      assert.equal(byBand.get(1)!.sync?.action, 'recover')
+
+      // The queued ones: `[4/3]` and `[3/2]` with NO progress line. This is the
+      // regression — both used to be 'degraded'.
+      assert.equal(byBand.get(2)!.state, 'recovering', 'band 2 is queued, not faulted')
+      assert.equal(byBand.get(3)!.state, 'recovering', 'band 3 is queued, not faulted')
+      // A queued band has no sync{} to report — there is no progress to show.
+      assert.equal(byBand.get(2)!.sync, undefined)
+
+      // No member is faulty anywhere: nothing failed, nothing to replace.
+      assert.ok(pool.arrays.every(a => a.members.every(m => m.memberState !== 'faulty')))
+    })
+
+    it('the queued bands advise "no action needed", never "replace the failed disk"', async () => {
+      const pool = await buildingPool()
+      assert.ok(
+        !pool.advisories.some(a => a.includes('replace the failed disk')),
+        'a pool minutes old must never be told to replace a disk',
+      )
+      for (const band of [2, 3]) {
+        assert.ok(
+          pool.advisories.some(a => a.includes(`chiaahr2-r${band}`) && a.includes('building redundancy (queued behind another band)') && a.includes('no action needed')),
+          `band ${band} must be described as queued, with no action asked of the operator`,
+        )
+      }
+    })
+
+    it('the pool fuses to BUILDING, and cards nothing', async () => {
+      const pool = await buildingPool()
+      assert.equal(pool.state, 'building')
+
+      // Activity, not fault: the §10 "only failures card" policy must stay
+      // silent for the whole multi-day build.
+      assert.deepEqual(buildAhrWarnings([pool]), [])
+    })
+
+    it('the unrelated clean pool in the same mdstat stays healthy', async () => {
+      const pools = await readAhrPools(buildingExecutor())
+      const other = pools.find(p => p.name === 'chiaahr')
+      assert.ok(other)
+      assert.equal(other.state, 'healthy', 'one pool building must not colour another')
+    })
+
+    it('a GENUINE fault still reads degraded, with the replace-disk advisory', async () => {
+      // Same capture, but band 2 now carries a faulted member — the shape a
+      // real disk failure makes. The queued marker must NOT launder it.
+      const withFault = loadFixture('mdstat-initial-recovery-delayed-raid5.txt')
+        .replace('sdd2[4] sdl2[2] sdb2[1] sdo2[0]', 'sdd2[4] sdl2[2] sdb2[1](F) sdo2[0]')
+      const pool = await buildingPool(withFault)
+      const band2 = pool.arrays.find(a => a.band === 2)!
+
+      assert.equal(band2.state, 'degraded')
+      assert.ok(band2.members.some(m => m.memberState === 'faulty'))
+      assert.ok(pool.advisories.some(a => a.includes('chiaahr2-r2') && a.includes('replace the failed disk')))
+      // One faulted band is enough to deny the whole pool the building label.
+      assert.equal(pool.state, 'degraded')
+      assert.equal(buildAhrWarnings([pool])[0]?.level, 'warning')
+    })
+
+    it('a MISSING member still reads degraded — fewer members than raid slots', async () => {
+      // The other real-fault shape: the disk is gone entirely, so there is no
+      // `(F)` to find. Slot count is the only evidence, and it must still bite.
+      const withMissing = loadFixture('mdstat-initial-recovery-delayed-raid5.txt')
+        .replace('sdd2[4] sdl2[2] sdb2[1] sdo2[0]', 'sdd2[4] sdl2[2] sdo2[0]')
+      const pool = await buildingPool(withMissing)
+
+      assert.equal(pool.arrays.find(a => a.band === 2)!.state, 'degraded')
+      assert.equal(pool.state, 'degraded')
+      assert.ok(buildAhrWarnings([pool])[0]?.message.includes('is missing a member'))
+    })
+  })
 })

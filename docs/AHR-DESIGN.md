@@ -105,11 +105,13 @@ New `packages/shared/src/schemas/ahr.ts`. All validated at both boundaries.
 AhrType      = 'ahr1' | 'ahr2'
 ArrayLevel   = 'raid1' | 'raid5' | 'raid6'
 ArrayState   = 'clean' | 'degraded' | 'resyncing' | 'reshaping' | 'recovering' | 'failed'
-AhrPoolState = 'healthy' | 'degraded' | 'expanding' | 'rebuilding' | 'scrubbing' | 'failed' | 'readonly'
+AhrPoolState = 'healthy' | 'building' | 'degraded' | 'expanding' | 'rebuilding' | 'scrubbing' | 'failed' | 'readonly'
 ```
 (`AhrPoolState`, not `PoolState` — zfs.ts already owns that export name.)
 
 (Initial RAID5/6 sync after create reports as `resyncing`; the UI copy must present it as "building — pool usable now", distinct from degraded.)
+
+(`building` is the whole-pool form of that: EVERY band syncing or queued, with no faulty or absent member anywhere. md serializes syncs across arrays sharing physical disks, so a mixed-media pool's later bands sit `resync=DELAYED` at `[n/n-1]` with no progress line — a shape that must read as build activity, never as a degraded array with a failed disk. It is a NEUTRAL pill, not a fault, and it suppresses the failure card for the whole multi-day build. A pool being built by a live `ahr.create` job reports `building` even before its VG exists: the half-built stack is indistinguishable on disk from a create that died, so the read layer consults the job queue — jobs are runtime state, not shadow state, and after a daemon restart the answer honestly reverts to `failed`.)
 
 **`AhrDisk`** — `{ id (by-id), sizeBytes, usableBytes (rounded), model, serial, role: 'member'|'spare', partitions: [{ device, band, sizeBytes }] }`
 
@@ -156,6 +158,8 @@ New resource `/v1/ahr` (parallel to `/v1/pools`; md/AHR is a distinct backend pe
 **Confirm-gated (Principle 14, the 409 + X-Anas-Confirm-Code flow):** create (wipes disks — lists every disk that will be erased in the warnings), expand/replace (announces reshape duration estimate + the pending-capacity reality), abandon (leaves the pool at reachable-but-not-target layout — states exactly what that layout is), destroy. The confirm warnings carry the *concrete* consequence (which disks, how long, how much data at risk), not a generic "are you sure".
 
 **Pre-checks:** `expand` REFUSES to start while any array is degraded (reshaping a degraded array voluntarily enters the double-failure window — replace/rebuild first). A replacement disk smaller than the reserved usable size is rejected before any destructive action (§2.5).
+
+**Mixed sector geometries (4Kn + 512e):** an md array inherits `max(logical_block_size)` of its members, so a 4Kn disk that reaches only some bands leaves the pool's bands disagreeing — which LVM refuses by default. Every AHR LVM call (create AND expand) therefore passes `--config devices/allow_mixed_block_sizes=1`; `/etc/lvm/lvm.conf` is never edited (Principle 12 — PVE's own storage runs on LVM). `mkfs.btrfs` states `--sectorsize 4096` explicitly rather than inheriting the CPU page size, which is what keeps the stacked LV satisfied. The planner LABELS a mixed selection in the layout-preview warnings and the create confirm gate — the operator learns it before the wipe, never as a post-wipe job failure hours into the initial sync.
 
 All mutations are jobs (202). execFile only: `sgdisk`/`parted`, `mdadm`, `pvcreate`/`vgcreate`/`vgextend`/`lvcreate`/`lvextend`, `mkfs.btrfs`/`btrfs`, `wipefs`. Every user-derived value (pool name, disk id) is schema-constrained to a safe charset (the security-hardening pattern); `--` end-of-options guards on positional args. Scrub runs btrfs scrub and md `check` **sequentially** — both are full-device reads and would thrash each other concurrently. (Scheduled scrubs are Epic 17's job.)
 

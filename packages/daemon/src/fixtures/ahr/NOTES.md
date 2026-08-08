@@ -12,6 +12,7 @@ pve-manager 9.2.4, kernel 7.0.14-5-pve, mdadm 4.4, LVM 2.03.31, btrfs-progs 6.14
 | File | Source | What it is |
 |------|--------|------------|
 | `mdstat-initial-recovery.txt` | phase-a | `/proc/mdstat` right after create: md127 raid5 in initial `recovery` (percent/finish/speed line, `[3/2] [UU_]`), md126 raid1 with the tab-indented `resync=DELAYED` marker |
+| `mdstat-initial-recovery-delayed-raid5.txt` | pve5, issue #7 | The MIXED-MEDIA first build, live from a real node: three `chiaahr2` bands (md124/125/126) building at once — md126 running `recovery`, md124 and md125 QUEUED behind it (`resync=DELAYED`, no progress line) and therefore sitting at `[3/2] [UU_]` / `[4/3] [UUU_]`. md127 is the unrelated, already-clean `chiaahr` pool in the same mdstat. Corroborated at capture time by sysfs `sync_action` = `recover` for ALL THREE building arrays (delayed ones included), `array_state` = `clean`, and `mdadm --detail` = "clean, degraded, resyncing (DELAYED)" with `Failed Devices : 0` and a spare rebuilding. This is the shape that used to read as a degraded array with a failed disk (issue #9) |
 | `mdstat-clean.txt` | phase-a | Same two arrays after initial sync — no sync lines, `[3/3] [UUU]` |
 | `mdstat-expanded.txt` | phase-b | Three arrays after online expansion (r2 converted raid1→raid5, new md125 r3). Note kernel numbers INVERTED from creation order (GT-2) |
 | `mdstat-reshape-degraded.txt` | phase-c1 | The failure-gauntlet state: md127 `reshape` line + faulted member `sdb1[0](F)`, `[5/4] [_UUUU]` — the "clean, degraded, reshaping" drill |

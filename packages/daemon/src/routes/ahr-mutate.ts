@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { AhrLayoutDisk } from '../services/ahr-layout.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrCreateRequest, AhrMountpointRequest, PoolName } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
@@ -10,7 +11,7 @@ import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
 import { confirmGate } from '../safety/gate.js'
 import { changeAhrMountpoint, createAhrPool } from '../services/ahr-create.js'
 import { destroyAhrPool } from '../services/ahr-destroy.js'
-import { AhrPlanError, fmtBytes, planFreshLayout } from '../services/ahr-layout.js'
+import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } from '../services/ahr-layout.js'
 import { scrubAhrPool } from '../services/ahr-scrub.js'
 import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
@@ -120,7 +121,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // is eligible (GT-12: these exclusions are safety-critical, not cosmetic).
     const inventory = await collectDisks(executor, diskIdentityCache)
     const problems: string[] = []
-    const selected: { id: string, usableBytes: number, model: string | null }[] = []
+    // logicalSectorSize rides along: a mixed 4Kn/512e selection gives the bands
+    // differing logical block sizes, which the LVM stack must be told to accept
+    // (issue #8). The planner labels it; nothing here refuses it.
+    const selected: (AhrLayoutDisk & { model: string | null })[] = []
     for (const id of req.disks) {
       const disk = inventory.find(d => d.id === id)
       if (!disk) {
@@ -131,7 +135,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         problems.push(`disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
         continue
       }
-      selected.push({ id: disk.id, usableBytes: disk.size, model: disk.model })
+      selected.push({ id: disk.id, usableBytes: disk.size, logicalSectorSize: disk.logicalSectorSize, model: disk.model })
     }
     if (problems.length > 0) {
       reply.code(400)
@@ -162,7 +166,14 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       operation: 'ahr.create',
       params: { name: req.name },
       message: `Creating AHR pool '${req.name}' will WIPE ${selected.length} disk(s) — all data on them will be permanently erased`,
-      warnings: selected.map(d => `${d.id} (${d.model ?? 'unknown model'}, ${fmtBytes(d.usableBytes)}) will be completely erased`),
+      warnings: [
+        ...selected.map(d => `${d.id} (${d.model ?? 'unknown model'}, ${fmtBytes(d.usableBytes)}) will be completely erased`),
+        // Geometry advisories the planner raised — the mixed 4Kn/512e label
+        // (issue #8) belongs in front of the operator BEFORE the wipe, not as a
+        // post-wipe job failure. The layout's own capacity warnings already ride
+        // the composer preview; only the sector-geometry one is confirm-worthy.
+        ...layout.warnings.filter(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)),
+      ],
     })) {
       return reply
     }
@@ -314,7 +325,7 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     }
     // Never concurrent (§4): a scrub and a resync/reshape are all full-device
     // passes — refuse while one is already running.
-    if (pool.state === 'scrubbing' || pool.state === 'rebuilding' || pool.state === 'expanding') {
+    if (pool.state === 'scrubbing' || pool.state === 'building' || pool.state === 'rebuilding' || pool.state === 'expanding') {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is ${pool.state} — a scrub would thrash the running operation; wait for it to finish` } }
     }

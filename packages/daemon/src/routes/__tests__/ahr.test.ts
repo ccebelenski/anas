@@ -3,8 +3,15 @@ import assert from 'node:assert/strict'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
+import { mockFixtures } from '../../fixtures/loader.js'
+import { JobQueue } from '../../jobs/queue.js'
+import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
 import { LSBLK_ARGS } from '../../parsers/lsblk.js'
+import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
+import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { createServer } from '../../server.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
 import { ahrRoutes } from '../ahr.js'
 
@@ -18,6 +25,24 @@ const BLANK_A = 'ata-ANAS_TEST_BLANK_A'
 const BLANK_B = 'ata-ANAS_TEST_BLANK_B'
 const BLANK_C = 'ata-ANAS_TEST_BLANK_C'
 const TB = 1000 ** 4
+
+/**
+ * Register the dev-mock AHR topology (the stage-0 `ahr0` pool) on an executor,
+ * reusing the SAME fixture loader the mock server uses — so a route test can
+ * bring its own JobQueue without re-stating fixture bytes.
+ */
+function mockAhrTopologyExecutor(executor: MockExecutor): MockExecutor {
+  executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+  executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+  executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+  executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+  executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+  executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+  executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+  executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+  executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+  return executor
+}
 
 /** A bare Fastify server with ONLY ahrRoutes and a controlled disk inventory. */
 async function previewServer() {
@@ -64,6 +89,39 @@ describe('AHR routes (Epic 11 + AHR — read layer)', () => {
       assert.equal(data[0].ahrType, 'ahr1')
       assert.equal(data[0].state, 'healthy')
       assert.equal(data[0].arrays.length, 2)
+    })
+
+    // Issue #7: the read routes consult the job queue so a pool mid-create
+    // reads BUILDING rather than the half-built stack's honest-but-alarming
+    // `failed`. Wired end to end here — the mock pool is healthy, so a running
+    // create for it proves only the plumbing, which is the part that breaks.
+    it('a running ahr.create for the pool surfaces as BUILDING with its progress', async () => {
+      const executor = new MockExecutor()
+      const jobQueue = new JobQueue()
+      jobQueue.submit(
+        'ahr.create',
+        { user: 'test', uid: 0, params: { name: 'ahr0' } },
+        async (updateProgress) => {
+          updateProgress('Creating array ahr0-r2 (raid1×2)')
+          return new Promise(() => {})
+        },
+      )
+      const app = Fastify({ logger: false })
+      await app.register(ahrRoutes, {
+        prefix: '/v1',
+        executor: mockAhrTopologyExecutor(executor),
+        diskIdentityCache: new DiskIdentityCache(executor),
+        jobQueue,
+      })
+      try {
+        const res = await app.inject({ method: 'GET', url: '/v1/ahr' })
+        const { data } = res.json() as { data: AhrPool[] }
+        assert.equal(data[0].state, 'building')
+        assert.equal(data[0].advisories[0], `pool 'ahr0' is being created — Creating array ahr0-r2 (raid1×2)`)
+      }
+      finally {
+        await app.close()
+      }
     })
   })
 

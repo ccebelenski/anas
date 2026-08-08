@@ -1,0 +1,21 @@
+Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] 
+md124 : active raid5 sdd3[3] sdl3[1] sdb3[0]
+      11718360064 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [UU_]
+      	resync=DELAYED
+      bitmap: 1/44 pages [4KB], 65536KB chunk
+
+md125 : active raid5 sdd2[4] sdl2[2] sdb2[1] sdo2[0]
+      17574394368 blocks super 1.2 level 5, 512k chunk, algorithm 2 [4/3] [UUU_]
+      	resync=DELAYED
+      bitmap: 1/44 pages [4KB], 65536KB chunk
+
+md126 : active raid5 sdd1[5] sdl1[3] sdb1[2] sdo1[1] sdc1[0]
+      31254900736 blocks super 1.2 level 5, 512k chunk, algorithm 2 [5/4] [UUUU_]
+      [>....................]  recovery =  1.8% (148139520/7813725184) finish=633.6min speed=201626K/sec
+      bitmap: 1/59 pages [4KB], 65536KB chunk
+
+md127 : active raid5 sda1[5] sdm1[2] sdp1[0] sdg1[1] sdj1[4]
+      85940234240 blocks super 1.2 level 5, 512k chunk, algorithm 2 [5/5] [UUUUU]
+      bitmap: 0/161 pages [0KB], 65536KB chunk
+
+unused devices: <none>

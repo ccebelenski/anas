@@ -737,9 +737,11 @@
     // deep-links to the Hybrid RAID view.
 
     // AHR pool state → gfx pill severity token (mirrors 39-ahr.js POOL_STATES):
-    // busy states (expanding/scrubbing) stay NEUTRAL — activity, not fault.
+    // busy states (building/expanding/scrubbing) stay NEUTRAL — activity, not
+    // fault. 'building' is the first-build window (issue #7), the AHR analog of
+    // the ZFS resilver indicator: long-running, expected, and not a failure.
     var AHR_PILL_TOKEN = {
-        healthy: 'ONLINE', degraded: 'DEGRADED', expanding: '',
+        healthy: 'ONLINE', building: '', degraded: 'DEGRADED', expanding: '',
         rebuilding: 'DEGRADED', scrubbing: '', failed: 'FAULTED', readonly: 'FAULTED'
     };
 

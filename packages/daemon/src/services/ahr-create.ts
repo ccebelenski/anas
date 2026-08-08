@@ -7,7 +7,7 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { addMount, hasMount, parseFstab, removeMount } from '../parsers/fstab.js'
 import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
-import { run } from './ahr-exec.js'
+import { LVM_MIXED_BLOCK_ARGS, run } from './ahr-exec.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { floorToGranularity, planFreshLayout } from './ahr-layout.js'
 import { installProgramHook, pinArrays } from './ahr-mdadm-conf.js'
@@ -53,6 +53,13 @@ const MOUNT = '/usr/bin/mount'
 const UMOUNT = '/usr/bin/umount'
 
 const WHITESPACE_RE = /\s+/
+
+/**
+ * btrfs sector size, stated explicitly rather than inherited from the CPU page
+ * size. It must be ≥ the LV's logical block size, which on a mixed-media pool
+ * is the 4096 of its 4Kn band (issue #8) — 4 KiB satisfies every AHR stack.
+ */
+const BTRFS_SECTOR_SIZE = 4096
 
 /** Default base for pool mountpoints (§2.6: pool-scoped, never /mnt/pve). */
 export const DEFAULT_AHR_MOUNT_BASE = '/mnt/anas-ahr'
@@ -265,16 +272,23 @@ export async function createAhrPool(
   await run(executor, UPDATE_INITRAMFS, ['-u'])
 
   // --- LVM: PVs in band order → one VG → one LV -------------------------------
+  // LVM_MIXED_BLOCK_ARGS on every call: a mixed-media pool's bands legitimately
+  // differ in logical block size (a 4Kn member makes its band 4096), which LVM
+  // refuses by default — issue #8, where a 4Kn + 512e create died at vgcreate
+  // AFTER the disks were wiped and the initial sync was already running.
   updateProgress('Creating LVM stack (PVs → VG → LV)')
   for (const mdDev of mdDevices)
-    await run(executor, PVCREATE, [mdDev])
-  await run(executor, VGCREATE, [name, ...mdDevices])
-  await run(executor, LVCREATE, ['-y', '-l', '100%FREE', '-n', `${name}-vol`, name])
+    await run(executor, PVCREATE, [...LVM_MIXED_BLOCK_ARGS, mdDev])
+  await run(executor, VGCREATE, [...LVM_MIXED_BLOCK_ARGS, name, ...mdDevices])
+  await run(executor, LVCREATE, [...LVM_MIXED_BLOCK_ARGS, '-y', '-l', '100%FREE', '-n', `${name}-vol`, name])
 
   // --- btrfs on the single LV (filesystem ONLY — never btrfs-RAID) ------------
+  // --sectorsize 4096 is EXPLICIT, not inherited from the CPU page size: it is
+  // what makes a mixed-block-size LV safe (4096 ≥ the LV's stacked logical
+  // block size, always), so the guarantee must not depend on the host's arch.
   const lvPath = ahrLvPath(name)
   updateProgress('Creating btrfs filesystem')
-  await run(executor, MKFS_BTRFS, ['-L', name, '-d', 'single', '-m', 'dup', lvPath])
+  await run(executor, MKFS_BTRFS, ['-L', name, '-d', 'single', '-m', 'dup', '--sectorsize', String(BTRFS_SECTOR_SIZE), lvPath])
 
   // --- Subvolume layout (§12): @data (mounted) + @snapshots (outside) ---------
   // Mount the top-level briefly at the mountpoint dir, carve the two

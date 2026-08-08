@@ -1,8 +1,11 @@
 import type { AhrPool } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
+import type { JobQueue } from '../jobs/queue.js'
+import type { AhrLayoutDisk } from '../services/ahr-layout.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrLayoutPreviewRequest, PoolName } from '@anas/shared'
+import { withAhrCreateStatus } from '../services/ahr-create-status.js'
 import { readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -24,20 +27,31 @@ import { collectDisks } from './disks.js'
  */
 export async function ahrRoutes(
   server: FastifyInstance,
-  opts: { executor: CommandExecutor, diskIdentityCache: DiskIdentityCache, intentDir?: string },
+  opts: {
+    executor: CommandExecutor
+    diskIdentityCache: DiskIdentityCache
+    intentDir?: string
+    /**
+     * Job queue — consulted (never mutated) so a pool being built by a live
+     * `ahr.create` reads `building` instead of the half-stack's `failed`
+     * (issue #7). Optional: without it the read falls back to pure system truth.
+     */
+    jobQueue?: JobQueue
+  },
 ) {
-  const { executor, diskIdentityCache, intentDir } = opts
+  const { executor, diskIdentityCache, intentDir, jobQueue } = opts
 
   // Attach the live expansion intent (§6.2: 'halted' must surface Resume/
-  // Abandon loudly). Best-effort — a corrupt intent file must not take the
-  // read path down; the expansion routes surface it properly on use.
+  // Abandon loudly), then the live create job's status (issue #7). Best-effort —
+  // a corrupt intent file must not take the read path down; the expansion routes
+  // surface it properly on use.
   const withIntent = async (pool: AhrPool): Promise<AhrPool> => {
     try {
       const intent = await readIntent(pool.name, intentDir)
-      return intent ? { ...pool, expansion: intent } : pool
+      return withAhrCreateStatus(intent ? { ...pool, expansion: intent } : pool, jobQueue)
     }
     catch {
-      return pool
+      return withAhrCreateStatus(pool, jobQueue)
     }
   }
 
@@ -76,7 +90,10 @@ export async function ahrRoutes(
     // exclusions are safety-critical, not cosmetic).
     const inventory = await collectDisks(executor, diskIdentityCache)
     const problems: string[] = []
-    const selected: { id: string, usableBytes: number }[] = []
+    // logicalSectorSize rides along so the preview can label a mixed 4Kn/512e
+    // selection (issue #8) — the composer's live feedback is where the operator
+    // should learn about it, long before anything is wiped.
+    const selected: AhrLayoutDisk[] = []
     for (const id of requestedIds) {
       const disk = inventory.find(d => d.id === id)
       if (!disk) {
@@ -87,7 +104,7 @@ export async function ahrRoutes(
         problems.push(`disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
         continue
       }
-      selected.push({ id: disk.id, usableBytes: disk.size })
+      selected.push({ id: disk.id, usableBytes: disk.size, logicalSectorSize: disk.logicalSectorSize })
     }
     if (problems.length > 0) {
       reply.code(400)

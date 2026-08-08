@@ -501,7 +501,7 @@ export function createServer(opts?: ServerOptions) {
   const ahrIntentDir = process.env.ANAS_AHR_INTENT_DIR
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-intent-${process.pid}`) : '/etc/anas/ahr')
   // READ layer (list/detail/preview) — detail carries the live intent (§6.2).
-  server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache, intentDir: ahrIntentDir })
+  server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache, intentDir: ahrIntentDir, jobQueue })
   // AHR mutations: create/destroy/scrub (routes/ahr-mutate.ts).
   server.register(ahrMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase: ahrMountBase })
   // AHR expansion engine (Epic 11.6, AHR-DESIGN §5) — plan/expand/resume/

@@ -83,6 +83,31 @@ export class JobQueue {
     return this.jobs.get(id)?.job
   }
 
+  /**
+   * The most recently submitted job for `operation` that named `target` as its
+   * `params.name` — the in-process correlation from a job back to the resource
+   * it acts on.
+   *
+   * Submitter params are deliberately NOT on the wire `Job` shape, so this is
+   * the only way a read path can ask "is a create running for THIS pool?".
+   * That question has no answer in the system itself (a half-built stack looks
+   * identical whether a job is still driving it or died an hour ago), and jobs
+   * are the daemon's one legitimate piece of runtime state — no shadow state is
+   * introduced, and after a restart the answer honestly reverts to "unknown".
+   */
+  findByOperation(operation: string, target: string): Job | undefined {
+    let latest: Job | undefined
+    // Map iteration is insertion order, so a later job with an equal timestamp
+    // still wins.
+    for (const record of this.jobs.values()) {
+      if (record.job.operation !== operation || record.submitter.params?.name !== target)
+        continue
+      if (!latest || record.job.createdAt >= latest.createdAt)
+        latest = record.job
+    }
+    return latest
+  }
+
   /** List jobs, optionally filtered by status. */
   list(status?: JobStatus): Job[] {
     const all = Array.from(this.jobs.values(), r => r.job)

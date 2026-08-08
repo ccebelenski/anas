@@ -13,6 +13,7 @@ import { parseFindmnt } from '../parsers/findmnt.js'
 import { LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
+import { LVM_MIXED_BLOCK_ARGS } from './ahr-exec.js'
 import { ahrDataOffsetArg, ahrDataOffsetBytes, planDiskPartitions } from './ahr-geometry.js'
 import { clearIntent, defaultAhrIntentDir, writeIntent } from './ahr-intent.js'
 import { AHR_SIZE_GRANULARITY_BYTES, floorToGranularity, fmtBytes } from './ahr-layout.js'
@@ -904,7 +905,10 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       const pvs = parsePvsReport(await execChecked(executor, PVS, PVS_ARGS))
       if (pvs.some(p => p.name === resolved.dev || p.name === `/dev/md/${pool.name}-r${band}`))
         return true
-      await execChecked(executor, PVCREATE, [resolved.dev])
+      // Mixed logical block sizes across bands are legitimate on mixed media
+      // (issue #8) — the create path passes the same flag; a band added by an
+      // expansion must not be the one LVM refuses.
+      await execChecked(executor, PVCREATE, [...LVM_MIXED_BLOCK_ARGS, resolved.dev])
       return false
     }
 
@@ -945,7 +949,7 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
       }
       if (toAdd.length === 0)
         return true
-      await execChecked(executor, VGEXTEND, [pool.name, ...toAdd])
+      await execChecked(executor, VGEXTEND, [...LVM_MIXED_BLOCK_ARGS, pool.name, ...toAdd])
       return false
     }
 
@@ -956,7 +960,7 @@ async function runStep(ctx: StepContext, step: AhrExpansionStep): Promise<boolea
         throw new Error(`volume group '${pool.name}' not found — cannot extend its LV`)
       if (vg.freeBytes < VG_FREE_EPSILON_BYTES)
         return true // nothing left to extend into — already done
-      await execChecked(executor, LVEXTEND, ['-l', '+100%FREE', `/dev/${pool.name}/${pool.lv.name}`])
+      await execChecked(executor, LVEXTEND, [...LVM_MIXED_BLOCK_ARGS, '-l', '+100%FREE', `/dev/${pool.name}/${pool.lv.name}`])
       return false
     }
 

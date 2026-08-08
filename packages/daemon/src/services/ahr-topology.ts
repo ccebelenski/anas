@@ -196,6 +196,45 @@ export function stripSubvolSuffix(source: string): string {
 }
 
 /**
+ * The three MISSING-LAYER advisories, as functions rather than inline strings
+ * so the create-status overlay can recognise and drop them (issue #7): while a
+ * pool is being built — or after a create job died partway — "volume group not
+ * found" is the expected consequence of where the job got to, not an
+ * independent diagnosis, and repeating it alongside the job's real error buries
+ * the one line the operator needs.
+ */
+export function missingVgAdvisory(pool: string): string {
+  return `volume group '${pool}' not found — the LVM layer of this pool is missing or inactive`
+}
+
+/** @see missingVgAdvisory */
+export function missingLvAdvisory(pool: string): string {
+  return `logical volume '${pool}-vol' not found — the pool's filesystem volume is missing`
+}
+
+/** @see missingVgAdvisory */
+export function notMountedAdvisory(pool: string): string {
+  return `pool '${pool}' filesystem is not mounted`
+}
+
+/**
+ * Whether an array's MEMBERSHIP is that of a build/rebuild rather than a fault:
+ * no member is faulty, and there are at least as many member devices as raid
+ * slots (the extra/high-numbered device is the spare md is rebuilding INTO).
+ *
+ * This is the one honest way to tell "redundancy is still being built" from
+ * "a disk failed" when no progress line is present — a queued sync (issue #9)
+ * or a slot count alone cannot. A removed disk shows FEWER members than slots;
+ * a failed-but-attached disk shows `(F)`. Either way this returns false and the
+ * array keeps its degraded verdict.
+ */
+function isBuildingMembership(md: MdstatArray): boolean {
+  if (md.members.some(m => m.faulty))
+    return false
+  return md.raidDevices !== null && md.members.length >= md.raidDevices
+}
+
+/**
  * One band array's state, fused from mdstat (GT-8/GT-9 aware):
  *  - inactive (all-spares) → 'degraded'; the pool advisory names the
  *    condition (the schema deliberately gains no extra state for it).
@@ -204,9 +243,18 @@ export function stripSubvolSuffix(source: string): string {
  *    RAID5/6 build ("building — pool usable now", §3), a §11 spare
  *    auto-failover, or a re-add/replace rebuild. It must NOT card as a
  *    degraded failure (§10); pool state fuses to 'rebuilding'.
- *  - only after ruling out a recovery does reduced redundancy read as
- *    'degraded' — the §8 disk-fault-during-reshape case stays degraded (its
- *    sync is a `reshape`, not a `recovery`) and DOES card.
+ *  - a QUEUED sync (`resync=DELAYED`/`PENDING`) on an array with every slot
+ *    populated and no faulty member → 'recovering' too (issue #9). The kernel
+ *    serializes syncs across arrays that share physical disks, and a queued one
+ *    prints NO progress line — so a mixed-media pool's second and third RAID5/6
+ *    bands sit at `[n/n-1]` with `sync === null` and used to read as a DEGRADED
+ *    ARRAY WITH A FAILED DISK on a pool minutes old. Live ground truth (pve5,
+ *    issue #7): sysfs `sync_action` reads `recover` for the delayed arrays too,
+ *    `mdadm --detail` says "clean, degraded, resyncing (DELAYED)" with
+ *    `Failed Devices : 0` and a spare rebuilding.
+ *  - only after ruling out a running OR queued recovery does reduced redundancy
+ *    read as 'degraded' — the §8 disk-fault-during-reshape case stays degraded
+ *    (its sync is a `reshape`, not a `recovery`) and DOES card.
  *  - a lingering faulty slot with EVERY raid slot in sync (the consumed-spare
  *    §11 shape) is NOT degraded: redundancy is intact; the consumed-spare
  *    advisory carries the "remove/replace the failed disk" message.
@@ -217,6 +265,14 @@ function arrayState(md: MdstatArray): ArrayState {
   if (!md.active)
     return 'degraded'
   if (md.sync?.action === 'recovery')
+    return 'recovering'
+  // A sync the kernel has QUEUED behind another array's (they share physical
+  // disks) prints no progress line, so an initial RAID5/6 build reads `[n/n-1]`
+  // with no sync — indistinguishable from a failed member by slot counts alone.
+  // The discriminator is the membership: an initial build (or any rebuild) has
+  // every slot populated and NO faulty member, while a real fault always leaves
+  // an `(F)` member or one fewer member than raid slots (issue #9).
+  if ((md.syncDelayed || md.syncPending) && isBuildingMembership(md))
     return 'recovering'
   const degraded = md.raidDevices !== null && md.activeDevices !== null
     ? md.activeDevices < md.raidDevices
@@ -378,6 +434,13 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
         const failed = members.filter(m => m.memberState === 'faulty').map(m => m.disk)
         advisories.push(`spare consumed by band ${entry.band} — add a new spare; remove/replace the failed disk${failed.length ? ` (${failed.join(', ')})` : ''}`)
       }
+      else if (state === 'recovering' && (entry.mdstat.syncDelayed || entry.mdstat.syncPending)) {
+        // Queued behind another band's sync (issue #9). Slot counts look
+        // degraded and there is no progress line — say what it IS, and say that
+        // there is nothing to do. NEVER the replace-the-failed-disk line: the
+        // disks here are minutes old and nothing has failed.
+        advisories.push(`array ${poolName}-r${entry.band} is building redundancy (queued behind another band) — no action needed`)
+      }
       else if (state === 'degraded') {
         advisories.push(`array ${poolName}-r${entry.band} is degraded — replace the failed disk before a second failure`)
       }
@@ -460,13 +523,13 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     // `vg` resolved at the ownership gate above; a missing VG here means a
     // pinned-but-failed pool (state fuses to 'failed', §3).
     if (!vg)
-      advisories.push(`volume group '${poolName}' not found — the LVM layer of this pool is missing or inactive`)
+      advisories.push(missingVgAdvisory(poolName))
     // The design's one-LV convention is `<pool>-vol`; tolerate a foreign-named
     // single LV in the VG rather than reporting nothing.
     const lv = lvs.find(l => l.vgName === poolName && l.name === `${poolName}-vol`)
       ?? lvs.find(l => l.vgName === poolName)
     if (!lv)
-      advisories.push(`logical volume '${poolName}-vol' not found — the pool's filesystem volume is missing`)
+      advisories.push(missingLvAdvisory(poolName))
 
     // ---- Mount + btrfs ------------------------------------------------------
     const lvName = lv?.name ?? `${poolName}-vol`
@@ -487,7 +550,7 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     // source of truth; nothing is precomputed or persisted (§5.3).
     const subvolLayout = mount ? isSubvolLayoutMount(mount.options) : false
     if (!mount)
-      advisories.push(`pool '${poolName}' filesystem is not mounted`)
+      advisories.push(notMountedAdvisory(poolName))
 
     let btrfs = null
     if (mount) {
@@ -550,6 +613,20 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     const anyReshape = arrayEntries.some(e => e.mdstat.sync?.action === 'reshape')
     const anySync = arrayEntries.some(e => e.mdstat.sync?.action === 'resync' || e.mdstat.sync?.action === 'recovery')
     const anyCheck = arrayEntries.some(e => e.mdstat.sync?.action === 'check')
+    // First-build (issue #7): EVERY band is laying down redundancy — each one
+    // running or queued for a resync/recovery, with intact membership (no
+    // faulty, no absent member) — which is exactly a freshly created pool. A
+    // reshaping band fails this test (its action is 'reshape'), so an expansion
+    // still fuses to 'expanding'; a single band syncing while others are clean
+    // fails it too and stays 'rebuilding'.
+    const allBuilding = arrayEntries.length > 0 && arrayEntries.every((e) => {
+      const md = e.mdstat
+      if (!md.active || !isBuildingMembership(md))
+        return false
+      if (md.syncDelayed || md.syncPending)
+        return true
+      return md.sync?.action === 'resync' || md.sync?.action === 'recovery'
+    })
     let state: AhrPoolState
     if (!vg || !lv)
       state = 'failed'
@@ -559,6 +636,8 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       state = 'degraded'
     else if (anyReshape)
       state = 'expanding'
+    else if (allBuilding)
+      state = 'building'
     else if (anySync)
       state = 'rebuilding'
     else if (anyCheck)
@@ -598,10 +677,24 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
 // --- Dashboard warnings (story 11.10, AHR-DESIGN §10) ------------------------
 
 /**
+ * A per-pool decoration applied between the live read and the dashboard
+ * projections — how the create-job status overlay (issue #7) reaches the
+ * /v1/status sources without this module importing it. Injected as a function
+ * ON PURPOSE: the topology reader is pure system truth and must not grow a
+ * dependency on the job queue (nor a cycle through the overlay that consumes
+ * its advisories). Default is identity, so every existing caller is unchanged.
+ */
+export type AhrPoolDecorator = (pool: AhrPool) => AhrPool
+
+/**
  * Which array/band + which member, for the degraded card. Every degraded
  * array in the pool is named (the card stays ONE per pool); a degraded array
  * with no faulty member listed (e.g. a member gone entirely, or the GT-8
  * inactive state) reads "missing a member". Disk ids are never truncated.
+ *
+ * Bands merely BUILDING redundancy never reach here: {@link arrayState} resolves
+ * a running or queued recovery with intact membership to 'recovering' (issue
+ * #9), so this function only ever describes a real fault.
  */
 function degradedDetail(pool: AhrPool): string {
   const parts: string[] = []
@@ -668,16 +761,17 @@ export function buildAhrWarnings(pools: AhrPool[]): DashboardWarning[] {
 export async function collectAhrWarnings(
   executor: CommandExecutor,
   intentDir?: string,
+  decorate: AhrPoolDecorator = p => p,
 ): Promise<DashboardWarning[]> {
   try {
     const pools = await readAhrPools(executor)
     const withIntents = await Promise.all(pools.map(async (pool): Promise<AhrPool> => {
       try {
         const intent = await readIntent(pool.name, intentDir)
-        return intent ? { ...pool, expansion: intent } : pool
+        return decorate(intent ? { ...pool, expansion: intent } : pool)
       }
       catch {
-        return pool
+        return decorate(pool)
       }
     }))
     return buildAhrWarnings(withIntents)
@@ -785,9 +879,10 @@ export function buildAhrCapacityWarnings(briefs: AhrPoolBrief[]): DashboardWarni
 export async function collectAhrPoolBriefs(
   executor: CommandExecutor,
   mdadmConfPath?: string,
+  decorate: AhrPoolDecorator = p => p,
 ): Promise<AhrPoolBrief[]> {
   try {
-    return buildAhrPoolBriefs(await readAhrPools(executor, mdadmConfPath))
+    return buildAhrPoolBriefs((await readAhrPools(executor, mdadmConfPath)).map(decorate))
   }
   catch {
     return []

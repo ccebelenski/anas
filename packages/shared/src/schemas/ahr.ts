@@ -49,9 +49,18 @@ export type ArrayState = z.infer<typeof ArrayState>
 /**
  * Whole-pool state, fused across md + LVM + btrfs. `AhrPoolState`, not the
  * design's `PoolState` — zfs.ts already exports one.
+ *
+ * `building` is the first-build state: EVERY band is syncing or queued and no
+ * band has a faulty or absent member — a brand-new pool laying down redundancy
+ * for the first time, or one rebuilding all of it with nothing failed. It is
+ * activity, not fault, and is deliberately distinct from `rebuilding` (which
+ * carries the "some redundancy is being restored" connotation) and from
+ * `degraded`. A mixed-media pool spends its first hours-to-days here because md
+ * serializes band syncs, so this state must NOT read as a failure (issue #7).
  */
 export const AhrPoolState = z.enum([
   'healthy',
+  'building',
   'degraded',
   'expanding',
   'rebuilding',

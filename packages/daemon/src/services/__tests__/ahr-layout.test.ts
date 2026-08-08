@@ -8,6 +8,7 @@ import {
   AHR_SIZE_GRANULARITY_BYTES,
   AhrPlanError,
   floorToGranularity,
+  MIXED_SECTOR_WARNING_PREFIX,
   planExpansion,
   planFreshLayout,
 } from '../ahr-layout.js'
@@ -204,6 +205,73 @@ describe('AHR layout (Epic 11 + AHR — docs/AHR-DESIGN.md §2)', () => {
       assert.ok(preview.bands.every(b => !b.protected))
       assert.ok(preview.warnings.some(w => w.includes('at least 4 disks')))
       assertCapacityIdentity(preview)
+    })
+
+    // --- mixed sector geometries (issue #8) ---------------------------------
+    // An md array inherits max(logical_block_size) of its members, so a 4Kn
+    // disk that reaches only SOME bands makes those bands 4096 and leaves the
+    // rest at 512. LVM refuses that VG by default — and used to do so only
+    // AFTER the disks were wiped and the initial sync was running.
+    describe('mixed sector geometries (issue #8)', () => {
+      it('labels a 4Kn + 512e selection whose bands end up with different block sizes', () => {
+        // d4 is 4Kn and is the ONLY disk reaching band 2, so band 1 (all three
+        // disks) is 4096 and band 2 (d3 + d4) is... also 4096. Use a shape
+        // where a band excludes the 4Kn disk entirely: d2/d3 are 512e and
+        // taller than the 4Kn d4.
+        const preview = planFreshLayout(
+          [
+            { id: 'd4kn', usableBytes: 2 * TiB, logicalSectorSize: 4096 },
+            { id: 'd512a', usableBytes: 3 * TiB, logicalSectorSize: 512 },
+            { id: 'd512b', usableBytes: 3 * TiB, logicalSectorSize: 512 },
+          ],
+          'ahr1',
+        )
+        AhrLayoutPreview.parse(preview)
+        const warning = preview.warnings.find(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX))
+        assert.ok(warning, 'a mixed-geometry selection must be labeled')
+        // Band 1 spans all three disks → 4096; band 2 is the two 512e disks.
+        assert.match(warning, /band 1: 4096/)
+        assert.match(warning, /band 2: 512/)
+        assert.match(warning, /allow_mixed_block_sizes/)
+        // Advisory only — it must not disturb the layout or the capacity math.
+        assert.equal(preview.minDisksMet, true)
+        assertCapacityIdentity(preview)
+      })
+
+      it('says nothing when every band lands on the same block size', () => {
+        const all4kn = planFreshLayout(
+          [
+            { id: 'a', usableBytes: 2 * TiB, logicalSectorSize: 4096 },
+            { id: 'b', usableBytes: 3 * TiB, logicalSectorSize: 4096 },
+            { id: 'c', usableBytes: 4 * TiB, logicalSectorSize: 4096 },
+          ],
+          'ahr1',
+        )
+        assert.ok(!all4kn.warnings.some(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)))
+
+        // A missing logicalSectorSize is treated as 512 — the overwhelmingly
+        // common case — so callers that never thread it get no phantom warning.
+        const unknown = planFreshLayout([disk('d2', 2), disk('d3', 3), disk('d4', 4)], 'ahr1')
+        assert.ok(!unknown.warnings.some(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)))
+      })
+
+      it('ignores UNPROTECTED bands — they carry no array, so no PV and no mix', () => {
+        // The 4Kn disk is the tallest, so its top slice is the §2.4 wasted band:
+        // present in the band list, but never an md array. The two protected
+        // bands are pure 512e, so there is nothing to warn about.
+        const preview = planFreshLayout(
+          [
+            { id: 'd512a', usableBytes: 2 * TiB, logicalSectorSize: 512 },
+            { id: 'd512b', usableBytes: 3 * TiB, logicalSectorSize: 512 },
+            { id: 'd4kn', usableBytes: 4 * TiB, logicalSectorSize: 4096 },
+          ],
+          'ahr1',
+        )
+        // Bands 1 and 2 both include the 4Kn disk → both 4096; band 3 is the
+        // unprotected top slice. No mix among the protected bands.
+        assert.equal(preview.bands[2].protected, false)
+        assert.ok(!preview.warnings.some(w => w.startsWith(MIXED_SECTOR_WARNING_PREFIX)))
+      })
     })
   })
 

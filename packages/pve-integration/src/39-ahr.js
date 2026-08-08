@@ -57,9 +57,13 @@
 
     // Map an AhrPoolState to the gfx pill severity token + a human label.
     // 'resyncing' arrays after create are "building — pool usable now", so the
-    // pool-level expanding/scrubbing states stay NEUTRAL (activity, not fault).
+    // pool-level building/expanding/scrubbing states stay NEUTRAL (activity, not
+    // fault) — 'building' especially: a mixed-media pool lives there for its
+    // first hours-to-days while md serializes the band syncs, and an amber
+    // fault pill for that whole window is a lie (issue #7).
     var POOL_STATES = {
         healthy: { token: 'ONLINE', label: 'healthy' },
+        building: { token: '', label: 'building' },
         degraded: { token: 'DEGRADED', label: 'degraded' },
         expanding: { token: '', label: 'expanding' },
         rebuilding: { token: 'DEGRADED', label: 'rebuilding' },
@@ -1088,9 +1092,10 @@
         // one is halted, a fresh Expand/Replace would 409 anyway, so swap them.
         var exp = has && sel[0].get('expansion');
         var halted = !!(exp && exp.state === 'halted');
-        // Expand AND Scrub ONLY on a healthy, idle pool: a degraded/rebuilding/
-        // expanding/read-only pool (or one mid- or halted-expansion) would 409 at
-        // the API (md won't scrub during recovery) — don't offer a dead button.
+        // Expand AND Scrub ONLY on a healthy, idle pool: a degraded/building/
+        // rebuilding/expanding/read-only pool (or one mid- or halted-expansion)
+        // would 409 at the API (md won't scrub during a build or a recovery) —
+        // don't offer a dead button.
         // Resume/Abandon cover the halted case.
         var healthyIdle = has && state === 'healthy' && !halted;
         var expandBtn = grid.down('#expand');
