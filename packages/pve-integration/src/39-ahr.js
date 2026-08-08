@@ -500,8 +500,93 @@
         return html;
     }
 
-    // Per-array rows: band swatch, md device, level × members, state pill, and
-    // the sync progress strip (percent / speed / ETA) while a sync runs.
+    // ---- band members (11.18) -----------------------------------------------
+
+    // One-time <style> for the member expander (scoped; injected once — the
+    // 38-pool-composer ensureComposerStyle idiom). Needed because a marker that
+    // flips with the open state is a CSS-state rule, not an inline style.
+    function ensureAhrStyle() {
+        try {
+            if (document.getElementById('anas-ahr-style')) {
+                return;
+            }
+            var css = '.anas-ahr-mem>summary{list-style:none;cursor:pointer;display:flex;'
+                + 'align-items:center;gap:5px;width:fit-content;user-select:none;'
+                + 'font-size:11.5px;color:var(--anas-muted)}'
+                + '.anas-ahr-mem>summary::-webkit-details-marker{display:none}'
+                + '.anas-ahr-mem>summary::before{content:"\\25B8";display:inline-block;'
+                + 'width:9px;font-size:10px;line-height:1}'
+                + '.anas-ahr-mem[open]>summary::before{content:"\\25BE"}'
+                + '.anas-ahr-mem>summary:hover{color:var(--anas-ink)}'
+                + '.anas-ahr-mem>summary:focus-visible{outline:1px solid var(--anas-accent);'
+                + 'outline-offset:2px;border-radius:3px}'
+                + '.anas-ahr-mem[open]>summary .anas-ahr-mem-c{display:none}'
+                + '.anas-ahr-mem:not([open])>summary .anas-ahr-mem-o{display:none}';
+            var style = document.createElement('style');
+            style.id = 'anas-ahr-style';
+            style.type = 'text/css';
+            style.appendChild(document.createTextNode(css));
+            (document.head || document.documentElement).appendChild(style);
+        } catch (e) {
+            // non-fatal — without it the expander still opens, just unstyled
+        }
+    }
+
+    // Per-member state. faulty/missing are the two that mean something is
+    // wrong; they carry the file's danger treatment. 'spare' is included
+    // because hot-spare slices really are members of every band (§11) — the
+    // list reports what md reports, never a curated subset.
+    var MEMBER_STATES = {
+        in_sync: { label: 'in sync', danger: false },
+        rebuilding: { label: 'rebuilding', danger: false },
+        spare: { label: 'spare', danger: false },
+        faulty: { label: 'faulty', danger: true },
+        missing: { label: 'missing', danger: true },
+    };
+
+    function memberStateHtml(state) {
+        var meta = MEMBER_STATES[state] || { label: '' + (state || ''), danger: false };
+        var css = 'font-size:11px;flex:0 0 auto;'
+            + (meta.danger
+                ? 'color:var(--anas-danger);font-weight:700'
+                : 'color:var(--anas-muted)');
+        return '<span style="' + css + '">' + enc(t(meta.label)) + '</span>';
+    }
+
+    // Which partitions actually form this band (11.18). Collapsed by default so
+    // the array row keeps its shape; a native <details> carries the open state,
+    // so there is no bespoke expander machinery and nothing to lose across a
+    // Reload. AHR diverges from the ZFS vdev rows here on purpose: ZFS members
+    // are whole leaf devices, AHR members are partitions.
+    function membersHtml(a) {
+        var members = a.members || [];
+        if (!members.length) {
+            return '';
+        }
+        var lines = '';
+        for (var i = 0; i < members.length; i++) {
+            var m = members[i];
+            // NEVER truncated: the by-id embeds the disk identity, which is the
+            // entire reason to show it. Long ids wrap instead of being clipped.
+            lines += '<div style="display:flex;gap:8px;align-items:baseline;padding:2px 0">'
+                + '<span style="font-size:11.5px;color:var(--anas-ink);word-break:break-all">'
+                + enc(m.partition || m.disk || '—') + '</span>'
+                + '<span style="flex:1"></span>'
+                + memberStateHtml(m.memberState) + '</div>';
+        }
+        var count = members.length + ' '
+            + t(members.length === 1 ? 'member' : 'members');
+        return '<details class="anas-ahr-mem" style="margin-top:7px">'
+            + '<summary><span class="anas-ahr-mem-c">' + enc(count) + '</span>'
+            + '<span class="anas-ahr-mem-o">' + enc(t('members')) + '</span></summary>'
+            + '<div style="margin:5px 0 1px 14px;padding-left:9px;'
+            + 'border-left:2px solid var(--anas-line)">' + lines + '</div>'
+            + '</details>';
+    }
+
+    // Per-array rows: band swatch, md device, level × members, state pill, the
+    // sync progress strip (percent / speed / ETA) while a sync runs, and the
+    // collapsed member list (11.18).
     function arraysHtml(d) {
         var arrays = (d.arrays || []).slice();
         if (!arrays.length) {
@@ -510,6 +595,7 @@
         arrays.sort(function (a, b) {
             return (a.band || 0) - (b.band || 0);
         });
+        ensureAhrStyle();
         var rows = '';
         for (var i = 0; i < arrays.length; i++) {
             var a = arrays[i];
@@ -562,7 +648,7 @@
             rows += '<div style="padding:8px 10px;border:1px solid var(--anas-line);border-radius:9px;'
                 + 'margin-bottom:6px;background:var(--anas-panel)">'
                 + '<div style="display:flex;align-items:center;gap:9px;flex-wrap:wrap">' + head + '</div>'
-                + syncHtml + '</div>';
+                + syncHtml + membersHtml(a) + '</div>';
         }
         return '<div style="' + SEC + '">' + enc(t('Band arrays (mdadm)')) + '</div>' + rows;
     }
