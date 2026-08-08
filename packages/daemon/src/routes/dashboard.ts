@@ -31,7 +31,7 @@ import { parseSmbConf } from '../parsers/smb-conf.js'
 import { nodeToIoStats, parseZpoolIostat } from '../parsers/zpool-iostat.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
-import { withAhrCreateStatus } from '../services/ahr-create-status.js'
+import { buildFailedCreateWarnings, withAhrCreateStatus } from '../services/ahr-create-status.js'
 import { collectAhrTelemetry } from '../services/ahr-io.js'
 import { buildAhrCapacityWarnings, collectAhrPoolBriefs, collectAhrWarnings } from '../services/ahr-topology.js'
 import { collectBackupWarnings } from '../services/backup-units.js'
@@ -124,7 +124,10 @@ export async function dashboardRoutes(
       // AHR pools get the SAME capacity cards ZFS pools do — parallel
       // construction, derived from the same briefs the Pools section renders
       // (11.13): identical ≥95/≥90 thresholds, same 'capacity' category.
-      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...scheduleWarnings],
+      // A create that failed and rolled itself back leaves NO pool behind, so
+      // it can only be surfaced from the job side (issue #11) — without this the
+      // failure would be discoverable nowhere in the UI.
+      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...buildFailedCreateWarnings(ahrPools.map(p => p.name), jobQueue), ...scheduleWarnings],
       ahrPools,
     }
     return { data: summary }

@@ -1,4 +1,3 @@
-import type { AhrPool } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { parseFstab, removeMount } from '../parsers/fstab.js'
@@ -6,9 +5,9 @@ import { LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
-import { ahrLvPath } from './ahr-create.js'
 import { run } from './ahr-exec.js'
 import { DEFAULT_MDADM_CONF, unpinArrays } from './ahr-mdadm-conf.js'
+import { ahrLvPath } from './ahr-paths.js'
 import { AHR_FINDMNT_ARGS } from './ahr-topology.js'
 import { editConfig, readConfig } from './config-writer.js'
 
@@ -44,6 +43,29 @@ const FINDMNT = '/usr/bin/findmnt'
 /** ARRAY-pin device path of one band array (`/dev/md/<pool>-r<N>`). */
 const PIN_DEVICE_RE = /^\/dev\/md\/(.+)$/
 
+/**
+ * What destroy actually needs to know — a structural subset of {@link AhrPool},
+ * so the route keeps passing a full topology read while the failed-create
+ * rollback (issue #11) can pass exactly what it knows without fabricating
+ * capacity/state numbers for a pool that never finished existing.
+ *
+ * Everything else destroy needs (which arrays are live, which PVs/VG/LV exist,
+ * what is mounted) it reads from the system at run time — which is what makes it
+ * safe to invoke against a stack half-built to ANY depth.
+ */
+export interface AhrDestroyTarget {
+  /** Pool name — also the VG name and the md-name prefix. */
+  name: string
+  /**
+   * Whether to consider the mountpoint at all. A live findmnt check still gates
+   * the actual umount, so passing `true` speculatively is safe.
+   */
+  mounted: boolean
+  mountpoint: string
+  /** The disks to scrub, with the member partitions to zero superblocks on. */
+  disks: { id: string, partitions: { device: string }[] }[]
+}
+
 export interface AhrDestroyOptions {
   /** /etc/fstab location. */
   fstabPath: string
@@ -52,13 +74,16 @@ export interface AhrDestroyOptions {
 }
 
 /**
- * Destroy an AHR pool. `pool` is the topology read taken at route time — it
- * names the disks and member partitions to scrub even after upper layers are
- * gone. Idempotent per step (checks-then-acts throughout).
+ * Destroy an AHR pool. `pool` names the disks and member partitions to scrub
+ * even after the upper layers are gone — the live topology read for an
+ * operator-initiated Destroy, or the create's own plan when a failed create
+ * rolls itself back (issue #11). Idempotent per step (checks-then-acts
+ * throughout), which is what lets BOTH callers point it at a stack built to any
+ * depth: absent layers are skipped, not errors.
  */
 export async function destroyAhrPool(
   executor: CommandExecutor,
-  pool: AhrPool,
+  pool: AhrDestroyTarget,
   updateProgress: (message: string) => void,
   opts: AhrDestroyOptions,
 ): Promise<{ destroyed: string }> {

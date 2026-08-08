@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { AhrPool as AhrPoolSchema } from '@anas/shared'
 import { JobQueue } from '../../jobs/queue.js'
-import { AHR_CREATE_OPERATION, withAhrCreateStatus } from '../ahr-create-status.js'
+import { AHR_CREATE_OPERATION, buildFailedCreateWarnings, ROLLED_BACK_MARKER, withAhrCreateStatus } from '../ahr-create-status.js'
 import { missingLvAdvisory, missingVgAdvisory, notMountedAdvisory } from '../ahr-topology.js'
 
 /**
@@ -128,6 +128,67 @@ describe('withAhrCreateStatus (issue #7)', () => {
     await new Promise(resolve => setImmediate(resolve))
     const pool = halfBuiltPool()
     assert.equal(withAhrCreateStatus(pool, queue), pool)
+  })
+})
+
+describe('rolled-back creates (issue #11)', () => {
+  it('a pool still visible after a rollback is told to RETRY, never to Destroy', async () => {
+    const queue = await queueWithFailedCreate(
+      'Creating LVM stack (PVs → VG → LV)',
+      `Devices have inconsistent logical block sizes (4096 and 512).${ROLLED_BACK_MARKER}`,
+    )
+    const pool = withAhrCreateStatus(halfBuiltPool(), queue)
+
+    assert.match(pool.advisories[1], /already rolled back — retry the create/)
+    assert.ok(
+      !pool.advisories.some(a => a.includes('Destroy pool')),
+      'the disks are blank — there is nothing left to destroy',
+    )
+  })
+
+  it('a create that failed WITHOUT rollback still points at Destroy', async () => {
+    const queue = await queueWithFailedCreate('Mounting', 'the rollback ALSO FAILED: sgdisk busy')
+    const pool = withAhrCreateStatus(halfBuiltPool(), queue)
+    assert.match(pool.advisories[1], /Destroy pool 'chiaahr2' and retry the create/)
+  })
+
+  // The visibility gap a successful rollback opens: the pool vanishes from the
+  // topology, so an operator who was not watching the create dialog would find
+  // the failure nowhere in the UI.
+  it('a failed create whose pool no longer EXISTS still cards on the dashboard', async () => {
+    const queue = await queueWithFailedCreate(
+      'Creating LVM stack (PVs → VG → LV)',
+      `Devices have inconsistent logical block sizes (4096 and 512).${ROLLED_BACK_MARKER}`,
+    )
+    const warnings = buildFailedCreateWarnings([], queue)
+
+    assert.equal(warnings.length, 1)
+    assert.equal(warnings[0].category, 'ahr')
+    assert.equal(warnings[0].ref, POOL)
+    // Not critical: nothing is broken and no data is at risk.
+    assert.equal(warnings[0].level, 'warning')
+    assert.match(warnings[0].message, /was NOT created/)
+    assert.match(warnings[0].message, /at 'Creating LVM stack/)
+    assert.match(warnings[0].message, /inconsistent logical block sizes/)
+    assert.match(warnings[0].message, /create can be retried/)
+  })
+
+  it('does NOT card when the pool still exists — the failed-pool card already covers it', async () => {
+    const queue = await queueWithFailedCreate('Mounting', 'boom')
+    assert.deepEqual(buildFailedCreateWarnings([POOL], queue), [])
+  })
+
+  it('a successful retry silences the earlier failure', async () => {
+    const queue = await queueWithFailedCreate('Mounting', 'boom')
+    assert.equal(buildFailedCreateWarnings([], queue).length, 1)
+    // The operator retried and it worked; the pool exists again.
+    queue.submit(AHR_CREATE_OPERATION, { user: 'test', uid: 0, params: { name: POOL } }, async () => ({ created: POOL }))
+    await new Promise(resolve => setImmediate(resolve))
+    assert.deepEqual(buildFailedCreateWarnings([POOL], queue), [])
+  })
+
+  it('no queue (a request-less caller) cards nothing', () => {
+    assert.deepEqual(buildFailedCreateWarnings([], undefined), [])
   })
 })
 

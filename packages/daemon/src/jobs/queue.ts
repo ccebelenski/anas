@@ -108,6 +108,22 @@ export class JobQueue {
     return latest
   }
 
+  /**
+   * Every distinct `params.name` target seen for `operation`, in first-submitted
+   * order. Pairs with {@link findByOperation} for "what has this operation been
+   * asked to do, and how did the latest attempt on each end up?" — the question
+   * behind surfacing a failed create whose pool no longer exists.
+   */
+  targetsByOperation(operation: string): string[] {
+    const targets = new Set<string>()
+    for (const record of this.jobs.values()) {
+      const target = record.submitter.params?.name
+      if (record.job.operation === operation && typeof target === 'string' && target.length > 0)
+        targets.add(target)
+    }
+    return [...targets]
+  }
+
   /** List jobs, optionally filtered by status. */
   list(status?: JobStatus): Job[] {
     const all = Array.from(this.jobs.values(), r => r.job)

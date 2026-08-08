@@ -7,13 +7,18 @@ import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { addMount, hasMount, parseFstab, removeMount } from '../parsers/fstab.js'
 import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
+import { ROLLED_BACK_MARKER } from './ahr-create-status.js'
+import { destroyAhrPool } from './ahr-destroy.js'
 import { LVM_MIXED_BLOCK_ARGS, run } from './ahr-exec.js'
 import { ahrDataOffsetArg, planDiskPartitions } from './ahr-geometry.js'
 import { floorToGranularity, planFreshLayout } from './ahr-layout.js'
 import { installProgramHook, pinArrays } from './ahr-mdadm-conf.js'
+import { ahrLvPath, ahrMountBase } from './ahr-paths.js'
 import { SUBVOL_DATA, SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
 import { editConfig } from './config-writer.js'
 import { pveNotify } from './pve-notify.js'
+
+export { ahrLvPath, ahrMountBase, DEFAULT_AHR_MOUNT_BASE } from './ahr-paths.js'
 
 /**
  * AHR pool creation (Epic 11 + AHR, docs/AHR-DESIGN.md §4/§2.6) — the CREATE
@@ -60,19 +65,6 @@ const WHITESPACE_RE = /\s+/
  * is the 4096 of its 4Kn band (issue #8) — 4 KiB satisfies every AHR stack.
  */
 const BTRFS_SECTOR_SIZE = 4096
-
-/** Default base for pool mountpoints (§2.6: pool-scoped, never /mnt/pve). */
-export const DEFAULT_AHR_MOUNT_BASE = '/mnt/anas-ahr'
-
-/** The mount base: explicit override > ANAS_AHR_MOUNT_BASE (stunt/tests) > default. */
-export function ahrMountBase(override?: string): string {
-  return override ?? process.env.ANAS_AHR_MOUNT_BASE ?? DEFAULT_AHR_MOUNT_BASE
-}
-
-/** The LV device path of a pool (`/dev/<pool>/<pool>-vol`). */
-export function ahrLvPath(name: string): string {
-  return `/dev/${name}/${name}-vol`
-}
 
 export interface AhrCreateSpec {
   name: string
@@ -154,16 +146,44 @@ function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean):
   }
 }
 
+/** One disk as the create planned it — the rollback's list of what to scrub. */
+interface PlannedDisk {
+  id: string
+  devPath: string
+  /** band → GPT partition number on this disk. */
+  partNumberByBand: Map<number, number>
+}
+
 /**
- * Create an AHR pool. `spec.disks` must already be validated (available, no
- * duplicates); this recomputes the §2.1 layout and executes it. Progress is
- * reported at every stage; the initial md sync continues in the background.
+ * What the in-flight create has touched, for the automatic rollback (issue
+ * #11). Deliberately tiny and in-memory only: it lives exactly as long as the
+ * job that owns it. This is NOT shadow state — nothing reads it to describe the
+ * system, and nothing survives the job.
  */
-export async function createAhrPool(
+interface CreateLedger {
+  /**
+   * Whether the FIRST destructive command has run. Before it, a failure has
+   * changed nothing and must simply propagate; after it, the selected disks
+   * hold only what this attempt built.
+   */
+  destructive: boolean
+  /** The pool mountpoint, resolved up front so rollback has it at every stage. */
+  mountpoint: string
+  /** Disks recorded as the plan reaches them — including a half-partitioned one. */
+  planned: PlannedDisk[]
+}
+
+/**
+ * The create pipeline itself. Everything it touches is recorded in `ledger` as
+ * it goes, so a failure at ANY point can be rolled back by the caller — see
+ * {@link createAhrPool}.
+ */
+async function executeCreate(
   executor: CommandExecutor,
   spec: AhrCreateSpec,
   updateProgress: (message: string) => void,
   opts: AhrCreateOptions,
+  ledger: CreateLedger,
 ): Promise<{ created: string, mountpoint: string, arrays: string[] }> {
   const { name, tier } = spec
   const layout = planFreshLayout(spec.disks, tier)
@@ -178,13 +198,7 @@ export async function createAhrPool(
     .sort((a, b) => a.roundedBytes - b.roundedBytes || a.id.localeCompare(b.id))
 
   // --- Wipe + partition (GT-12: prior signatures are a hazard, not residue) --
-  interface PlannedDisk {
-    id: string
-    devPath: string
-    /** band → GPT partition number on this disk. */
-    partNumberByBand: Map<number, number>
-  }
-  const planned: PlannedDisk[] = []
+  const planned = ledger.planned
   for (const [i, disk] of disks.entries()) {
     const devPath = `/dev/disk/by-id/${disk.id}`
     // Only protected bands are partitioned (§2.6); a disk participates in a
@@ -201,17 +215,23 @@ export async function createAhrPool(
       slices,
     })
 
-    updateProgress(`Wiping ${disk.id} (${i + 1}/${disks.length})`)
-    await run(executor, WIPEFS, ['-a', devPath])
-    await run(executor, SGDISK, ['--zap-all', devPath])
-    updateProgress(`Partitioning ${disk.id} (${specs.length} band slice${specs.length === 1 ? '' : 's'})`)
-    await run(executor, SGDISK, [...specs.flatMap(s => s.sgdiskArgs), devPath])
-
+    // Recorded BEFORE the disk is touched: rollback must know about a disk
+    // whose wipe or partitioning failed HALFWAY, not just the finished ones.
     planned.push({
       id: disk.id,
       devPath,
       partNumberByBand: new Map(specs.map(s => [s.band, s.number])),
     })
+
+    updateProgress(`Wiping ${disk.id} (${i + 1}/${disks.length})`)
+    // THE POINT OF NO RETURN. Everything before this is planning; from here on
+    // the selected disks carry only what THIS attempt put there, which is what
+    // makes an automatic rollback safe (issue #11).
+    ledger.destructive = true
+    await run(executor, WIPEFS, ['-a', devPath])
+    await run(executor, SGDISK, ['--zap-all', devPath])
+    updateProgress(`Partitioning ${disk.id} (${specs.length} band slice${specs.length === 1 ? '' : 's'})`)
+    await run(executor, SGDISK, [...specs.flatMap(s => s.sgdiskArgs), devPath])
   }
   updateProgress('Settling udev (partition device nodes)')
   await run(executor, UDEVADM, ['settle'])
@@ -294,7 +314,7 @@ export async function createAhrPool(
   // Mount the top-level briefly at the mountpoint dir, carve the two
   // subvolumes, unmount — the pool then mounts `subvol=@data`, so snapshots
   // live OUTSIDE the operator's tree and rollback is a subvolume swap.
-  const mountpoint = spec.mountpoint ?? join(ahrMountBase(opts.mountBase), name)
+  const { mountpoint } = ledger
   await mkdir(mountpoint, { recursive: true })
   updateProgress('Creating btrfs subvolume layout (@data, @snapshots)')
   await run(executor, MOUNT, ['-t', 'btrfs', '-o', 'subvolid=5', lvPath, mountpoint])
@@ -327,6 +347,106 @@ export async function createAhrPool(
   )
 
   return { created: name, mountpoint, arrays: arrayNames }
+}
+
+/**
+ * Create an AHR pool, rolling the partial stack back if anything fails (issue
+ * #11).
+ *
+ * WHY AUTOMATIC TEARDOWN IS SAFE HERE, and nowhere else in ANAS: create WIPES
+ * the selected disks as its first destructive act. From that instant the disks
+ * contain only what this very attempt built, so tearing it down can destroy no
+ * operator data — the alternative (leaving it) strands the disks in a half-built
+ * state that no verb but a manual Destroy can clear, while the useless initial
+ * sync grinds on for hours.
+ *
+ * The teardown REUSES {@link destroyAhrPool} — the same checks-then-acts path
+ * the operator's own Destroy takes, proven on pve5 against a half-built
+ * mid-recovery stack. There is deliberately no second teardown implementation to
+ * drift out of step with the first.
+ *
+ * It calls the SERVICE, not the route: the 409 confirm gate exists to make an
+ * operator state their intent to destroy data that is theirs. Here the job is
+ * cleaning up what it ITSELF created seconds ago, on disks the operator already
+ * confirmed for wiping when they started the create. A second confirmation would
+ * have nothing new to tell them, and there is no operator in the loop to answer
+ * it — the job is already failing.
+ *
+ * The job always fails with the ORIGINAL error (the actual diagnosis), annotated
+ * with what happened to the partial pool. If the rollback ALSO fails, both are
+ * reported: the original first, because it is still the thing that went wrong.
+ *
+ * KNOWN LIMITATION (accepted, out of scope): this is in-process. A daemon crash
+ * or restart mid-create cannot run it, and the boot scan has no create branch
+ * (unlike expansions, which persist an intent). Such a pool surfaces as `failed`
+ * with Destroy available — visible and actionable, just not automatic.
+ */
+export async function createAhrPool(
+  executor: CommandExecutor,
+  spec: AhrCreateSpec,
+  updateProgress: (message: string) => void,
+  opts: AhrCreateOptions,
+): Promise<{ created: string, mountpoint: string, arrays: string[] }> {
+  const ledger: CreateLedger = {
+    destructive: false,
+    mountpoint: spec.mountpoint ?? join(ahrMountBase(opts.mountBase), spec.name),
+    planned: [],
+  }
+
+  try {
+    return await executeCreate(executor, spec, updateProgress, opts, ledger)
+  }
+  catch (err) {
+    const original = err instanceof Error ? err.message : String(err)
+    // Nothing destructive ran — the disks are untouched and there is nothing to
+    // undo. Propagate the diagnosis unchanged; annotating it would imply a
+    // cleanup that never needed to happen.
+    if (!ledger.destructive)
+      throw err
+
+    updateProgress('Create FAILED — rolling back the partial pool')
+    let rollbackError: string | null = null
+    try {
+      await destroyAhrPool(
+        executor,
+        {
+          name: spec.name,
+          // `mounted: true` lets destroy CONSIDER the mountpoint; its own live
+          // findmnt check decides whether anything is actually mounted, so this
+          // is correct at every stage — before the first mount and after it.
+          mounted: true,
+          mountpoint: ledger.mountpoint,
+          disks: ledger.planned.map(d => ({
+            id: d.id,
+            partitions: Array.from(d.partNumberByBand.values(), n => ({ device: `/dev/disk/by-id/${d.id}-part${n}` })),
+          })),
+        },
+        m => updateProgress(`Rollback: ${m}`),
+        { fstabPath: opts.fstabPath, mdadmConfPath: opts.mdadmConfPath },
+      )
+    }
+    catch (rbErr) {
+      rollbackError = rbErr instanceof Error ? rbErr.message : String(rbErr)
+    }
+
+    // Tell the operator either way — a create that failed while they were not
+    // watching must never be discoverable only by reading job history. PVE's own
+    // notification channel is the one that survives a daemon restart.
+    await pveNotify(
+      executor,
+      'warning',
+      'AHR pool creation failed',
+      rollbackError === null
+        ? `Creating pool '${spec.name}' failed: ${original}\n\nThe partial pool was rolled back — the selected disks are blank and the create can be retried.`
+        : `Creating pool '${spec.name}' failed: ${original}\n\nThe automatic rollback ALSO failed: ${rollbackError}\n\nThe partial pool is still on the disks — destroy it from the Hybrid RAID view before retrying.`,
+    ).catch(() => {
+      // Best-effort: a notification failure must never mask the real error.
+    })
+
+    if (rollbackError === null)
+      throw new Error(`${original}${ROLLED_BACK_MARKER}`)
+    throw new Error(`${original} — the automatic rollback ALSO FAILED: ${rollbackError}; the partial pool is still on the disks and must be destroyed manually before retrying`)
+  }
 }
 
 /**

@@ -26,7 +26,7 @@ import { getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { readPveMountPaths } from '../parsers/pve-storage.js'
-import { ahrLvPath } from './ahr-create.js'
+import { ahrLvPath } from './ahr-paths.js'
 import { readConfig } from './config-writer.js'
 
 /** `timeout` binary — wraps the probe so a dead NFS server can never hang us. */

@@ -1,3 +1,4 @@
+import type { MockFixture } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -51,8 +52,15 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     await rm(dir, { recursive: true, force: true })
   })
 
-  function creationExecutor(): MockExecutor {
+  /**
+   * `priority` fixtures are registered FIRST so they win: the mock resolves a
+   * command-only fixture by first registration, so a failure injected after the
+   * blanket success list would simply never match.
+   */
+  function creationExecutor(priority: MockFixture[] = []): MockExecutor {
     const executor = new MockExecutor()
+    for (const fixture of priority)
+      executor.addFixture(fixture)
     okOnly(executor, [
       '/usr/sbin/wipefs',
       '/usr/sbin/sgdisk',
@@ -284,5 +292,215 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       /no protected band/,
     )
     assert.equal(executor.calls.length, 0) // nothing was touched
+  })
+
+  // --- Automatic rollback of a failed create (issue #11) --------------------
+  // Create WIPES the selected disks as its first destructive act, so from that
+  // instant the disks hold only what this attempt built — which is what makes
+  // tearing it down automatically safe. Every failure below leaves the disks
+  // blank and the create retryable.
+  describe('rollback on failure', () => {
+    const T3_DISKS = [
+      { id: SMALL, usableBytes: 2 * GIB },
+      { id: MID, usableBytes: 3 * GIB },
+      { id: BIG, usableBytes: 4 * GIB },
+    ]
+
+    /**
+     * The 3-disk/2-band world, with both band UUIDs readable for pinning.
+     * `priority` fixtures are injected ahead of the blanket success list.
+     */
+    function t3Executor(priority: MockFixture[] = []): MockExecutor {
+      const executor = creationExecutor(priority)
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t3-r1'], result: { stdout: `MD_NAME=t3-r1\nMD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t3-r2'], result: { stdout: `MD_NAME=t3-r2\nMD_UUID=${UUID_R2}\n`, stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/sdx1\n', stderr: '', exitCode: 0 } })
+      executor.addFixture({ command: '/usr/bin/ls', result: { stdout: '', stderr: '', exitCode: 0 } })
+      return executor
+    }
+
+    const create = (executor: MockExecutor) => createAhrPool(
+      executor,
+      { name: 't3', tier: 'ahr1', disks: T3_DISKS },
+      m => progress.push(m),
+      { fstabPath, mdadmConfPath: confPath, mountBase },
+    )
+
+    /**
+     * Progress lines the ROLLBACK emitted. Keyed off the 'Rollback: ' prefix
+     * rather than argv, because create's own wipe also runs `sgdisk --zap-all` —
+     * counting raw calls cannot tell the two apart.
+     */
+    function rollbackSteps(): string[] {
+      return progress.filter(m => m.startsWith('Rollback: ')).map(m => m.slice('Rollback: '.length))
+    }
+
+    // The real-world case: issue #8's vgcreate refusal, one minute in, with the
+    // arrays already pinned and their initial sync already running.
+    it('THE CASE: failure at the LVM step rolls back, and the SAME create then succeeds', async () => {
+      const executor = t3Executor([{
+        command: '/usr/sbin/vgcreate',
+        result: { stdout: '', stderr: 'Devices have inconsistent logical block sizes (4096 and 512).', exitCode: 5 },
+      }])
+
+      await assert.rejects(create(executor), (err: Error) => {
+        // The ORIGINAL diagnosis leads — the annotation only says what became
+        // of the partial pool.
+        assert.match(err.message, /^Devices have inconsistent logical block sizes/)
+        assert.match(err.message, /partial pool was rolled back; disks are blank and create can be retried/)
+        return true
+      })
+
+      // The system is clean: every disk zapped by the ROLLBACK (not just by the
+      // create's own wipe), and no ANAS pins left behind.
+      const steps = rollbackSteps()
+      assert.deepEqual(
+        steps.filter(m => m.startsWith('Zapping partition table on')),
+        [`Zapping partition table on ${SMALL}`, `Zapping partition table on ${MID}`, `Zapping partition table on ${BIG}`],
+      )
+      assert.ok(steps.includes('Zeroing md superblocks'))
+      assert.ok(steps.includes('Unpinning arrays from mdadm.conf'))
+      const afterRollback = await readFile(confPath, 'utf8')
+      assert.ok(!afterRollback.includes(UUID_R1), 'band 1 pin must be gone')
+      assert.ok(!afterRollback.includes(UUID_R2), 'band 2 pin must be gone')
+      // The pin removal must reach early boot too.
+      assert.ok(steps.includes('Updating initramfs (mdadm.conf changed)'))
+      // fstab is untouched — the failure came long before the mount stage.
+      assert.equal(await readFile(fstabPath, 'utf8'), FSTAB_SEED)
+      // The operator is told through PVE's own channel, not just job history.
+      const notify = executor.calls.filter(c => c.command === '/usr/bin/perl')
+      assert.equal(notify.at(-1)!.args[2], 'warning')
+      assert.equal(notify.at(-1)!.args[3], 'AHR pool creation failed')
+
+      // IDEMPOTENCY: the same call, same params, against the rolled-back system.
+      progress.length = 0
+      const result = await create(t3Executor())
+      assert.deepEqual(result, { created: 't3', mountpoint: join(mountBase, 't3'), arrays: ['t3-r1', 't3-r2'] })
+      assert.deepEqual(rollbackSteps(), [], 'the retry must not roll anything back')
+      const afterRetry = await readFile(confPath, 'utf8')
+      assert.ok(afterRetry.includes(UUID_R1) && afterRetry.includes(UUID_R2), 'the retry re-pins both bands')
+    })
+
+    it('failure MID-BAND-CREATION rolls back the bands already built', async () => {
+      // Band 1 is created; band 2's mdadm --create fails.
+      const executor = t3Executor([{
+        command: '/usr/sbin/mdadm',
+        args: [
+          '--create',
+          '/dev/md/t3-r2',
+          '--level=raid1',
+          '--raid-devices=2',
+          '--metadata=1.2',
+          '--name=t3-r2',
+          '--data-offset=8192s',
+          '--bitmap=internal',
+          '--run',
+          `/dev/disk/by-id/${MID}-part2`,
+          `/dev/disk/by-id/${BIG}-part2`,
+        ],
+        result: { stdout: '', stderr: 'mdadm: cannot open /dev/disk/by-id/x: Device or resource busy', exitCode: 1 },
+      }])
+
+      await assert.rejects(create(executor), /Device or resource busy[\s\S]*rolled back/)
+
+      const steps = rollbackSteps()
+      // Nothing was pinned yet (pinArrays runs after ALL bands), so the unpin +
+      // initramfs step must correctly NO-OP rather than fail.
+      assert.equal(await readFile(confPath, 'utf8').catch(() => ''), '')
+      assert.ok(!steps.includes('Unpinning arrays from mdadm.conf'))
+      // The disks are still scrubbed — partitions and the one built band.
+      assert.equal(steps.filter(m => m.startsWith('Zapping partition table on')).length, 3)
+      assert.ok(steps.includes('Zeroing md superblocks'))
+    })
+
+    it('failure at mkfs rolls back the whole stack including LVM', async () => {
+      const executor = t3Executor([
+        { command: '/usr/sbin/mkfs.btrfs', result: { stdout: '', stderr: 'mkfs.btrfs: unable to open /dev/t3/t3-vol', exitCode: 1 } },
+        // The LVM layer now EXISTS, so destroy must find and remove it.
+        { command: '/usr/sbin/lvs', result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 't3-vol', vg_name: 't3', lv_size: '5.00g' }] }] }), stderr: '', exitCode: 0 } },
+        { command: '/usr/sbin/vgs', result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 't3', vg_size: '5.00g', vg_free: '0 ' }] }] }), stderr: '', exitCode: 0 } },
+        { command: '/usr/sbin/pvs', result: { stdout: JSON.stringify({ report: [{ pv: [{ pv_name: '/dev/md/t3-r1', vg_name: 't3' }, { pv_name: '/dev/md/t3-r2', vg_name: 't3' }] }] }), stderr: '', exitCode: 0 } },
+        { command: '/usr/sbin/lvremove', result: { stdout: '', stderr: '', exitCode: 0 } },
+        { command: '/usr/sbin/vgremove', result: { stdout: '', stderr: '', exitCode: 0 } },
+        { command: '/usr/sbin/pvremove', result: { stdout: '', stderr: '', exitCode: 0 } },
+      ])
+
+      await assert.rejects(create(executor), /unable to open[\s\S]*rolled back/)
+
+      // Top-down teardown: LV, then VG, then both PVs.
+      assert.ok(executor.calls.some(c => c.command === '/usr/sbin/lvremove' && c.args.includes('t3/t3-vol')))
+      assert.ok(executor.calls.some(c => c.command === '/usr/sbin/vgremove' && c.args.includes('t3')))
+      assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/pvremove').length, 2)
+      // Pins existed by this stage, so they must be removed.
+      assert.ok(rollbackSteps().includes('Unpinning arrays from mdadm.conf'))
+      assert.ok(!(await readFile(confPath, 'utf8')).includes(UUID_R1))
+    })
+
+    it('failure during PARTITIONING still rolls back — including the half-done disk', async () => {
+      // The first disk is zapped, then its partitioning fails.
+      const executor = t3Executor([{
+        command: '/usr/sbin/sgdisk',
+        results: [
+          { stdout: '', stderr: '', exitCode: 0 }, // --zap-all on disk 1
+          { stdout: '', stderr: 'sgdisk: could not create partition', exitCode: 4 },
+          { stdout: '', stderr: '', exitCode: 0 }, // everything after (the rollback's zaps)
+        ],
+      }])
+
+      await assert.rejects(create(executor), /could not create partition[\s\S]*rolled back/)
+
+      // The disk whose partitioning failed is recorded and zapped — a disk left
+      // half-touched is exactly what must not survive.
+      assert.ok(rollbackSteps().includes(`Zapping partition table on ${SMALL}`))
+      // Only the disk reached so far is in the ledger; the untouched two are not.
+      assert.equal(rollbackSteps().filter(m => m.startsWith('Zapping partition table on')).length, 1)
+      // No arrays were ever made, so no --stop was attempted.
+      assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--stop'))
+    })
+
+    it('a failure BEFORE anything destructive is NOT annotated — there was nothing to undo', async () => {
+      const executor = creationExecutor()
+      await assert.rejects(
+        createAhrPool(
+          executor,
+          { name: 'bad', tier: 'ahr2', disks: [{ id: SMALL, usableBytes: 2 * GIB }, { id: BIG, usableBytes: 3 * GIB }] },
+          () => {},
+          { fstabPath, mdadmConfPath: confPath, mountBase },
+        ),
+        (err: Error) => {
+          assert.match(err.message, /no protected band/)
+          assert.ok(!err.message.includes('rolled back'), 'no rollback claim when nothing was touched')
+          return true
+        },
+      )
+      assert.equal(executor.calls.length, 0)
+    })
+
+    it('when the ROLLBACK also fails, both errors surface — original first', async () => {
+      const executor = t3Executor([
+        { command: '/usr/sbin/vgcreate', result: { stdout: '', stderr: 'vgcreate exploded', exitCode: 5 } },
+        // Create's own six sgdisk calls succeed; the rollback's first zap does not.
+        { command: '/usr/sbin/sgdisk', results: [
+          { stdout: '', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: 'sgdisk: device is busy', exitCode: 2 },
+        ] },
+      ])
+
+      await assert.rejects(create(executor), (err: Error) => {
+        // The original diagnosis is still the headline — it is what went wrong.
+        assert.match(err.message, /^vgcreate exploded/)
+        assert.match(err.message, /rollback ALSO FAILED: sgdisk: device is busy/)
+        assert.match(err.message, /must be destroyed manually before retrying/)
+        assert.ok(!err.message.includes('disks are blank'), 'must never claim blank disks it could not blank')
+        return true
+      })
+      const notify = executor.calls.filter(c => c.command === '/usr/bin/perl')
+      assert.equal(notify.at(-1)!.args[2], 'warning')
+    })
   })
 })
