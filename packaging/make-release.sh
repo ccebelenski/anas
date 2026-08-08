@@ -54,6 +54,16 @@ if [ "${SRC_VERSION}" != "${VERSION}" ]; then
   err "version drift: shared VERSION const is '${SRC_VERSION}', root is ${VERSION} — run: npm run version:bump -- ${VERSION}"
   exit 1
 fi
+# Dev builds stamp the commit into the version (0.2.3+dev.06dfa5c) so a
+# deployed node is distinguishable from the real release it was cut between —
+# /opt/anas/VERSION, /v1/health, and the tarball name all carry it. The repo's
+# package.json/shared const are NOT touched; only the staged copies are. Field
+# lesson 2026-08-08: a dev tarball deployed fleet-wide was indistinguishable
+# from released 0.2.3 on every node.
+if [ "${DEV_BUILD}" -eq 1 ]; then
+  GIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  VERSION="${VERSION}+dev.${GIT_SHA}"
+fi
 RELEASE_NAME="anas-${VERSION}"
 log "Release version: ${VERSION}"
 
@@ -113,6 +123,19 @@ for p in "${WORKSPACES[@]}"; do
   cp -a "${src}/dist" "${dst}/dist"
   cp "${src}/package.json" "${dst}/package.json"
 done
+
+# Dev stamp into the STAGED shared const only — this is what /v1/health and
+# the x-anas-version header report at runtime. Fail loudly if the const ever
+# moves and the sed stops matching.
+if [ "${DEV_BUILD}" -eq 1 ]; then
+  STAGED_SHARED="${APP}/packages/shared/dist/index.js"
+  if ! grep -q "^export const VERSION = " "${STAGED_SHARED}"; then
+    err "dev stamp: VERSION const not found in ${STAGED_SHARED}"
+    exit 1
+  fi
+  sed -i "s|^export const VERSION = .*$|export const VERSION = '${VERSION}';|" "${STAGED_SHARED}"
+  log "Dev build: staged runtime version stamped ${VERSION}"
+fi
 
 # app/packages/pve-integration/{src,install.sh,uninstall.sh} (no build step).
 PVE_SRC="${REPO_ROOT}/packages/pve-integration"
