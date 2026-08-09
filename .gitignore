@@ -24,3 +24,4 @@ dist-release/
 *.cred
 *.secret
 **/creds/
+unsloth_compiled_cache/
