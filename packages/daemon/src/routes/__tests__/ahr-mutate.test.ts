@@ -215,6 +215,11 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
       fstabPath: join(dir, 'fstab'),
       mdadmConfPath: join(dir, 'mdadm.conf'),
       mountBase: join(dir, 'mnt'),
+      // Pinned: without this the suite reads the RUNNER's kernel, and the
+      // mixed-geometry tests flip between 409-gate and 400-refusal depending
+      // on whether the host clears the 6.19 LBS floor (caught by CI on a
+      // 6.x runner while dev machines pass on 7.x).
+      kernelRelease: '7.0.14-8-pve',
     })
     server = app as unknown as TestServer
   })
