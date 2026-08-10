@@ -5,6 +5,7 @@ import {
   ahrDataOffsetArg,
   ahrDataOffsetBytes,
   AhrGeometryError,
+  matchPartitionLabel,
   partitionLabel,
   planDiskPartitions,
 } from '../ahr-geometry.js'
@@ -170,5 +171,22 @@ describe('partitionLabel', () => {
   it('follows the deterministic <pool>-d<n>-b<band> convention', () => {
     assert.equal(partitionLabel('ahr0', 2, 1), 'ahr0-d2-b1')
     assert.equal(partitionLabel('tank', 12, 4), 'tank-d12-b4')
+  })
+
+  // The inverse is what recognizes a member partition NOTHING claims any more —
+  // the premise of destroy's partlabel sweep (issue #16) and of the topology
+  // reader's not-yet-arrayed slices. Both must read a label the same way.
+  it('matchPartitionLabel inverts it exactly, and matches nothing else', () => {
+    assert.deepEqual(matchPartitionLabel('ahr0', partitionLabel('ahr0', 2, 1)), { diskNumber: 2, band: 1 })
+    assert.deepEqual(matchPartitionLabel('tank', 'tank-d12-b4'), { diskNumber: 12, band: 4 })
+    // Another pool's label, a partial pool-name match, and a non-member label on
+    // the right pool are all rejected — the sweep zeroes superblocks, so a loose
+    // match would scrub a disk that is not ours.
+    assert.equal(matchPartitionLabel('tank', 'tank2-d1-b1'), null)
+    assert.equal(matchPartitionLabel('tank2', 'tank-d1-b1'), null)
+    assert.equal(matchPartitionLabel('tank', 'tank-b1'), null)
+    assert.equal(matchPartitionLabel('tank', 'tank-d1'), null)
+    assert.equal(matchPartitionLabel('tank', 'tank-d1-b1-old'), null)
+    assert.equal(matchPartitionLabel('tank', 'pve-swap'), null)
   })
 })

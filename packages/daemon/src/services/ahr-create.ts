@@ -29,7 +29,9 @@ export { ahrLvPath, ahrMountBase, DEFAULT_AHR_MOUNT_BASE } from './ahr-paths.js'
  *       bands get partitions — §2.6, unused regions stay raw)
  *     → one mdadm array per band, metadata 1.2, deterministic name
  *       `<pool>-r<band>`, EXPLICIT --data-offset (GT-5/GT-6: the headroom is
- *       load-bearing for backup-file-free reshapes)
+ *       load-bearing for backup-file-free reshapes), then `wipefs -a` on the
+ *       fresh md device (issue #17: PV labels at the data offset outlive every
+ *       partition-level wipe and resurrect the old VG on an identical recreate)
  *     → ARRAY pins in mdadm.conf + the monitor PROGRAM hook, then
  *       update-initramfs -u (ARRAY_PIN_REQUIRES_INITRAMFS)
  *     → LVM: pvcreate per array, one VG, one 100%FREE LV
@@ -279,6 +281,19 @@ async function executeCreate(
       '--run',
       ...members,
     ])
+    // Wipe the fresh array's signatures IMMEDIATELY, unconditionally: a device
+    // ANAS created one command ago can hold nothing but residue. That residue is
+    // real, and NOTHING ELSE REACHES IT — an LVM PV label + VG metadata live at
+    // the md DATA OFFSET (~128 MiB deep, INSIDE the member partitions), far
+    // below anything partition- or disk-level wiping touches, and destroy's
+    // `pvremove` can only clear PVs that LVM could still SEE. Recreating the
+    // same deterministic geometry re-exposes the dead pool's labels byte for
+    // byte, LVM "finds" the old VG, and pvcreate rightly refuses without -ff
+    // (issue #17, pve5 2026-08-09).
+    // Wiping here — before mdadm --detail, the pins, and any udev/LVM scan —
+    // makes create immune to the whole resurrection class, whatever destroy
+    // could or could not reach.
+    await run(executor, WIPEFS, ['-a', mdDev])
     mdDevices.push(mdDev)
     arrayNames.push(arrayName)
   }

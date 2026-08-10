@@ -93,6 +93,28 @@ export function partitionLabel(pool: string, diskNumber: number, band: number): 
   return `${pool}-d${diskNumber}-b${band}`
 }
 
+/** The `d<n>-b<band>` tail of a member label, once the pool prefix is stripped. */
+const LABEL_TAIL_RE = /^d(\d+)-b(\d+)$/
+
+/**
+ * The exact inverse of {@link partitionLabel}: the disk ordinal and band a GPT
+ * partition label encodes, or null when the label is not a member label of
+ * `pool`. Prefix-then-tail rather than an interpolated regex, so a pool name is
+ * never compiled as a pattern.
+ *
+ * This is the one place that knows what "a member partition of pool X" looks
+ * like on disk, and it is the ONLY way to recognize a member partition that no
+ * array currently claims — the destroy sweep's whole premise (issue #16).
+ */
+export function matchPartitionLabel(pool: string, label: string): { diskNumber: number, band: number } | null {
+  if (!label.startsWith(`${pool}-`))
+    return null
+  const m = label.slice(pool.length + 1).match(LABEL_TAIL_RE)
+  if (!m)
+    return null
+  return { diskNumber: Number.parseInt(m[1], 10), band: Number.parseInt(m[2], 10) }
+}
+
 /** One band slice assigned to this disk by the planner ([startBytes, endBytes)). */
 export interface AhrBandSlice {
   /** Band index (1-based, append-only across pool life). */

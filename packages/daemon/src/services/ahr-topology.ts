@@ -23,6 +23,7 @@ import { LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS
 import { hasArray, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
+import { matchPartitionLabel } from './ahr-geometry.js'
 import { readIntent } from './ahr-intent.js'
 import { AHR_MIN_DISKS, floorToGranularity, isPvUnderSized } from './ahr-layout.js'
 import { DEFAULT_MDADM_CONF } from './ahr-mdadm-conf.js'
@@ -84,14 +85,14 @@ interface LsblkNode {
   children?: LsblkNode[]
 }
 
-interface DiskInfo {
+export interface DiskInfo {
   name: string
   size: number
   model: string | null
   serial: string | null
 }
 
-interface PartInfo {
+export interface PartInfo {
   name: string
   size: number
   partlabel: string | null
@@ -105,17 +106,21 @@ interface LvmInfo {
   mountpoint: string | null
 }
 
-interface LsblkIndex {
+export interface LsblkIndex {
   partsByKernel: Map<string, PartInfo>
   lvmByDmName: Map<string, LvmInfo>
 }
 
 const PART_NUMBER_RE = /(\d+)$/
 
-/** `<pool>-d<n>-b<band>` partition-label band suffix. */
-const LABEL_BAND_RE = /-b(\d+)$/
-
-function indexLsblk(json: string): LsblkIndex {
+/**
+ * Index one `lsblk AHR_LSBLK_ARGS` tree by kernel name: every partition (with
+ * its label and its parent disk) and every LVM node. Exported as the single
+ * home of this walk — destroy's partlabel sweep (issue #16) reads the SAME tree
+ * this reader does, so the two can never disagree about which partitions of
+ * which disk carry a pool's labels.
+ */
+export function indexLsblk(json: string): LsblkIndex {
   const index: LsblkIndex = { partsByKernel: new Map(), lvmByDmName: new Map() }
   let root: { blockdevices?: LsblkNode[] }
   try {
@@ -502,16 +507,17 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       const id = byIdMap.get(kernel) ?? kernel
       const mine = memberships.filter(m => m.diskKernel === kernel)
       // Every AHR partition on this disk, banded via array membership first,
-      // then the `-b<N>` label suffix (covers not-yet-arrayed slices).
+      // then its member LABEL (covers not-yet-arrayed slices). The label is
+      // read through matchPartitionLabel — the inverse of the function CREATE
+      // writes labels with, and the same recognizer destroy's sweep uses
+      // (issue #16), so no two AHR paths can disagree about what a member
+      // partition of this pool looks like on disk.
       const partitions: AhrDiskPartition[] = []
       for (const [partKernel, part] of lsblk.partsByKernel) {
         if (part.disk.name !== kernel)
           continue
-        const labelBand = part.partlabel?.startsWith(`${poolName}-`)
-          ? part.partlabel.match(LABEL_BAND_RE)
-          : null
-        const band = bandByPartKernel.get(partKernel)
-          ?? (labelBand ? Number.parseInt(labelBand[1], 10) : null)
+        const labeled = part.partlabel !== null ? matchPartitionLabel(poolName, part.partlabel) : null
+        const band = bandByPartKernel.get(partKernel) ?? labeled?.band ?? null
         if (band === null)
           continue
         const device = byIdMap.has(kernel) && part.partNumber !== null

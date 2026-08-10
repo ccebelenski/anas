@@ -137,6 +137,9 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
         `/dev/disk/by-id/${SMALL}-part1`,
         `/dev/disk/by-id/${BIG}-part1`,
       ] },
+      // The fresh array is wiped before ANYTHING reads it (issue #17): stale
+      // LVM PV labels sit at the md data offset, INSIDE the member partitions.
+      { command: '/usr/sbin/wipefs', args: ['-a', '/dev/md/t2-r1'] },
       // Pin (UUID read) THEN initramfs (ARRAY_PIN_REQUIRES_INITRAMFS).
       { command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t2-r1'] },
       { command: '/usr/sbin/update-initramfs', args: ['-u'] },
@@ -278,6 +281,46 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     // 4096 is what satisfies the 4Kn band's logical block size.
     const mkfs = executor.calls.find(c => c.command === '/usr/sbin/mkfs.btrfs')!
     assert.deepEqual(mkfs.args.slice(-3), ['--sectorsize', '4096', '/dev/t3/t3-vol'])
+  })
+
+  // Issue #17 (pve5, 2026-08-09): recreating a just-destroyed pool with the same
+  // deterministic geometry died at `pvcreate` — "Can't initialize physical volume
+  // "/dev/md126" of volume group "chiaahr2" without -ff". The dead pool's PV
+  // label + VG metadata sit at the md DATA OFFSET, inside the member partitions,
+  // which no partition- or disk-level wipe reaches and which destroy's `pvremove`
+  // could not see (its arrays were dead, so LVM never listed those PVs at all).
+  // Wiping each fresh md device closes the whole resurrection class.
+  it('wipes every fresh md device BEFORE pvcreate (issue #17)', async () => {
+    const executor = creationExecutor()
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t3-r1'], result: { stdout: `MD_UUID=${UUID_R1}\n`, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md/t3-r2'], result: { stdout: `MD_UUID=${UUID_R2}\n`, stderr: '', exitCode: 0 } })
+
+    await createAhrPool(
+      executor,
+      { name: 't3', tier: 'ahr1', disks: [
+        { id: SMALL, usableBytes: 2 * GIB },
+        { id: MID, usableBytes: 3 * GIB },
+        { id: BIG, usableBytes: 4 * GIB },
+      ] },
+      m => progress.push(m),
+      { fstabPath, mdadmConfPath: confPath, mountBase },
+    )
+
+    // Per band: created → wiped → handed to LVM, in that order.
+    for (const mdDev of ['/dev/md/t3-r1', '/dev/md/t3-r2']) {
+      const created = executor.calls.findIndex(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--create' && c.args[1] === mdDev)
+      const wiped = executor.calls.findIndex(c => c.command === '/usr/sbin/wipefs' && c.args.at(-1) === mdDev)
+      const pvcreate = executor.calls.findIndex(c => c.command === '/usr/sbin/pvcreate' && c.args.at(-1) === mdDev)
+      assert.ok(created >= 0, `${mdDev} was created`)
+      assert.ok(wiped >= 0, `${mdDev} was wiped — a fresh array can hold only residue`)
+      assert.ok(pvcreate >= 0, `${mdDev} became a PV`)
+      assert.ok(created < wiped, `${mdDev}: the wipe follows the array creation`)
+      assert.ok(wiped < pvcreate, `${mdDev}: the wipe precedes pvcreate — after it, LVM has already found the old VG`)
+    }
+    // Unconditional by design: nothing probes first (a device ANAS created one
+    // command ago can hold nothing but stale residue), so there is no dry-run
+    // inspection pass to make the wipe conditional on.
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs' && c.args.includes('-n')))
   })
 
   it('refuses when no protected band is possible', async () => {
