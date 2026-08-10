@@ -181,6 +181,28 @@ export function parseVgsReport(json: string): LvmVg[] {
     }))
 }
 
+/**
+ * Whether an LV is ACTIVE, read from `lv_attr` field 5 (index 4) — lvm's State
+ * field, and a structured column of the report (never scraped prose). ONLY `a`
+ * means active; every other documented value means the volume is not usable:
+ * `-` not active, `s`/`S` suspended (snapshot), `I` invalid snapshot,
+ * `m`/`M` (suspended) snapshot merge failed, `d` mapped device without tables,
+ * `i` mapped device with an inactive table, `X` unknown.
+ *
+ * An AHR pool whose band arrays did not all start comes up exactly here: the LV
+ * is still listed by `lvs` and still sized, its VG is partial, and it is NOT
+ * active — the volume is offline and no data can be read (issue #18).
+ *
+ * Returns `null` when the attr string is absent or too short to carry the field
+ * (older captures and fixtures that dropped the column): UNKNOWN, never
+ * "inactive" — a column we did not get must not manufacture a failure verdict.
+ */
+export function lvIsActive(attr: string): boolean | null {
+  if (attr.length < 5)
+    return null
+  return attr[4] === 'a'
+}
+
 /** Parse `lvs --reportformat json` output. */
 export function parseLvsReport(json: string): LvmLv[] {
   return reportRows<'lv', RawLv>(json, 'lv')

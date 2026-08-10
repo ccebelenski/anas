@@ -120,6 +120,27 @@ describe('buildAhrWarnings (story 11.10, AHR-DESIGN §10)', () => {
     assert.ok(warnings[0].message.includes('READ-ONLY'))
   })
 
+  it('offline: exactly one CRITICAL card saying the data is unavailable (issue #18)', async () => {
+    // The LV half of the offline evidence, live-derived: the arrays are fine but
+    // the volume is not active (`-wi-----p-` — an LV over a partial VG), so the
+    // pool serves nothing. It must card CRITICAL, never as amber degraded.
+    const lvs = JSON.stringify({
+      report: [{ lv: [{ lv_name: 'ahr0-vol', vg_name: 'ahr0', lv_attr: '-wi-----p-', lv_size: '<2.49g' }] }],
+      log: [],
+    })
+    const pools = await readAhrPools(healthyExecutor({ lvs }))
+    assert.equal(pools[0].state, 'offline')
+    const warnings = buildAhrWarnings(pools)
+    assert.equal(warnings.length, 1)
+    assert.equal(warnings[0].level, 'critical')
+    assert.equal(warnings[0].category, 'ahr')
+    assert.equal(warnings[0].ref, 'ahr0')
+    assert.ok(warnings[0].message.includes('is OFFLINE'))
+    assert.ok(warnings[0].message.includes(`the logical volume 'ahr0-vol' is not active`), warnings[0].message)
+    assert.ok(warnings[0].message.includes('its data is unavailable'), warnings[0].message)
+    assert.ok(warnings[0].message.includes('see the Hybrid RAID view'))
+  })
+
   it('halted expansion: exactly one card naming the Resume/Abandon verbs', async () => {
     const pool: AhrPool = { ...(await healthyPool()), expansion: intent('halted') }
     const warnings = buildAhrWarnings([pool])
@@ -152,8 +173,8 @@ describe('buildAhrWarnings (story 11.10, AHR-DESIGN §10)', () => {
   })
 
   it('view-level advisories (pending capacity etc.) do not card', async () => {
-    // A healthy pool that carries advisories still adds nothing — only the
-    // four bad states card (spare-consumed/snapshot advisories stay view-level).
+    // A healthy pool that carries advisories still adds nothing — only the bad
+    // states card (spare-consumed/snapshot advisories stay view-level).
     const pool: AhrPool = { ...(await healthyPool()), advisories: ['spare consumed', 'flat-layout snapshot advisory'] }
     assert.deepEqual(buildAhrWarnings([pool]), [])
   })

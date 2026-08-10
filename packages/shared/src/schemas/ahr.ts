@@ -57,6 +57,17 @@ export type ArrayState = z.infer<typeof ArrayState>
  * carries the "some redundancy is being restored" connotation) and from
  * `degraded`. A mixed-media pool spends its first hours-to-days here because md
  * serializes band syncs, so this state must NOT read as a failure (issue #7).
+ *
+ * `offline` is TOTAL UNAVAILABILITY, and it is deliberately NOT `degraded`: at
+ * least one band md array cannot start (inactive / "FAILED, Not Started"), or
+ * the pool's LV is not active — either way the concatenated volume is missing a
+ * piece, the filesystem cannot be mounted, and NO data can be read. `degraded`
+ * means reduced redundancy while still serving; a pool that serves nothing must
+ * not wear the same badge. It therefore OUTRANKS degraded/building/rebuilding/
+ * expanding/scrubbing/readonly in the fusion, and only `failed` (the LVM layer
+ * missing outright) ranks above it (issue #18: after a node lockup a pool with
+ * one band degraded and two bands not started reported `degraded`, which reads
+ * as reduced-redundancy-but-functioning while the volume was in fact offline).
  */
 export const AhrPoolState = z.enum([
   'healthy',
@@ -65,6 +76,7 @@ export const AhrPoolState = z.enum([
   'expanding',
   'rebuilding',
   'scrubbing',
+  'offline',
   'failed',
   'readonly',
 ])

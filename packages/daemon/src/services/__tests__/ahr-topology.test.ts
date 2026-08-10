@@ -108,6 +108,87 @@ const MDSTAT_SPARE_REBUILDING = [
   'unused devices: <none>',
 ].join('\n')
 
+// ---- The pve5 world: two real pools in one mdstat ---------------------------
+// The LIVE pve5 capture behind two failure stories — the mixed-media first
+// build (issues #7/#9) and the post-lockup multi-tier failure (issue #18).
+// ONE fixture world, so the two cannot describe the same node differently.
+// lsblk/by-id are deliberately EMPTY here: this world exercises md + LVM state
+// fusion, and the reader must survive disks it cannot resolve.
+
+/** Band index → kernel array, exactly as captured (r1 is the TALLEST band). */
+const PVE5_ARRAYS: Record<string, string> = {
+  '/dev/md126': 'chiaahr2-r1',
+  '/dev/md125': 'chiaahr2-r2',
+  '/dev/md124': 'chiaahr2-r3',
+  '/dev/md127': 'chiaahr-r1',
+}
+
+/** vgs carrying BOTH real pools; `partial` marks chiaahr2's VG missing PVs. */
+function pve5Vgs(partial = false): string {
+  return JSON.stringify({
+    report: [{ vg: [
+      { vg_name: 'chiaahr2', pv_count: '3', lv_count: '1', snap_count: '0', vg_attr: partial ? 'wz-pn-' : 'wz--n-', vg_size: '55.00t', vg_free: '0 ' },
+      { vg_name: 'chiaahr', pv_count: '1', lv_count: '1', snap_count: '0', vg_attr: 'wz--n-', vg_size: '80.04t', vg_free: '0 ' },
+    ] }],
+    log: [],
+  })
+}
+
+/**
+ * lvs for both pools. `chiaahr2Attr` is the load-bearing knob: `-wi-a-----` is
+ * the healthy form (state field = `a`), `-wi-----p-` is what an LV over a
+ * partial VG reports — NOT active (field 5 = `-`) and flagged partial (`p`).
+ */
+function pve5Lvs(chiaahr2Attr = '-wi-a-----'): string {
+  return JSON.stringify({
+    report: [{ lv: [
+      { lv_name: 'chiaahr2-vol', vg_name: 'chiaahr2', lv_attr: chiaahr2Attr, lv_size: '55.00t' },
+      { lv_name: 'chiaahr-vol', vg_name: 'chiaahr', lv_attr: '-wi-a-----', lv_size: '80.04t' },
+    ] }],
+    log: [],
+  })
+}
+
+/**
+ * A canonical md superblock UUID (mdadm's 8:8:8:8 hex form) derived from the
+ * kernel number, so an mdadm.conf ARRAY pin can actually name one of these
+ * arrays — the conf parser only accepts the canonical shape.
+ */
+function pve5Uuid(dev: string): string {
+  const hextet = `${dev.slice(-3)}00000`
+  return [hextet, hextet, hextet, hextet].join(':')
+}
+
+function pve5Executor(overrides?: { mdstat?: string, vgs?: string, lvs?: string }): MockExecutor {
+  const mock = new MockExecutor()
+  mock.addFixture({
+    command: '/usr/bin/cat',
+    args: MDSTAT_CAT_ARGS,
+    result: ok(overrides?.mdstat ?? loadFixture('mdstat-initial-recovery-delayed-raid5.txt')),
+  })
+  for (const [dev, name] of Object.entries(PVE5_ARRAYS)) {
+    mock.addFixture({
+      command: '/usr/sbin/mdadm',
+      args: mdadmDetailExportArgs(dev),
+      result: ok(`MD_LEVEL=raid5\nMD_METADATA=1.2\nMD_UUID=${pve5Uuid(dev)}\nMD_NAME=pve5:${name}\n`),
+    })
+  }
+  mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok('{"blockdevices":[]}') })
+  mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok('') })
+  mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(overrides?.vgs ?? pve5Vgs()) })
+  mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(overrides?.lvs ?? pve5Lvs()) })
+  mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('') })
+  return mock
+}
+
+/** The `chiaahr2` pool as this world's fixtures describe it. */
+async function pve5Pool(overrides?: { mdstat?: string, vgs?: string, lvs?: string }) {
+  const pools = await readAhrPools(pve5Executor(overrides))
+  const pool = pools.find(p => p.name === 'chiaahr2')
+  assert.ok(pool, 'the pool must be reported')
+  return pool
+}
+
 describe('readAhrPools', () => {
   it('reconstructs the healthy stage-0 pool end to end', async () => {
     const pools = await readAhrPools(healthyExecutor())
@@ -182,16 +263,22 @@ describe('readAhrPools', () => {
     assert.ok(pool.advisories.some(a => a.includes('degraded')))
   })
 
-  it('surfaces the GT-8 inactive-all-spares state as degraded + advisory', async () => {
+  it('surfaces the GT-8 inactive-all-spares state as an OFFLINE pool + advisory', async () => {
     const mock = healthyExecutor({ mdstat: loadFixture('mdstat-inactive-spares.txt') })
     const pools = await readAhrPools(mock)
     const pool = pools[0]
     const r1 = pool.arrays[0]
-    // No new schema state — degraded, with the advisory naming the condition.
+    // The BAND keeps its degraded state (no new array-level state for this) with
+    // the advisory naming the condition and the recovery ladder…
     assert.equal(r1.state, 'degraded')
     assert.ok(r1.members.every(m => m.memberState === 'spare'))
-    assert.equal(pool.state, 'degraded')
     assert.ok(pool.advisories.some(a => a.includes('INACTIVE')))
+    // …but the POOL is offline, not degraded (issue #18): a band that cannot
+    // start takes its PV with it, so the concatenated volume serves nothing.
+    assert.equal(pool.state, 'offline')
+    // Only md127 is in this mdstat, so md IS the whole membership story: one
+    // band, and it cannot start.
+    assert.ok(pool.advisories[0].includes('1 of 1 band array cannot start (ahr0-r1)'), pool.advisories[0])
     // An inactive array lists EVERY member as (S) — that must never relabel
     // real members as pool-level hot spares (§11 role fusion).
     assert.ok(pool.disks.every(d => d.role === 'member'))
@@ -559,61 +646,8 @@ unused devices: <none>
   // prints no progress line, so those two sit at `[3/2]`/`[4/3]` — which used
   // to read as degraded arrays with failed disks on a pool minutes old.
   describe('mixed-media first build (issues #7, #9)', () => {
-    /** vgs/lvs carrying BOTH real pools — the building one and the clean one. */
-    const TWO_POOL_VGS = JSON.stringify({
-      report: [{ vg: [
-        { vg_name: 'chiaahr2', pv_count: '3', lv_count: '1', snap_count: '0', vg_attr: 'wz--n-', vg_size: '55.00t', vg_free: '0 ' },
-        { vg_name: 'chiaahr', pv_count: '1', lv_count: '1', snap_count: '0', vg_attr: 'wz--n-', vg_size: '80.04t', vg_free: '0 ' },
-      ] }],
-      log: [],
-    })
-    const TWO_POOL_LVS = JSON.stringify({
-      report: [{ lv: [
-        { lv_name: 'chiaahr2-vol', vg_name: 'chiaahr2', lv_attr: '-wi-a-----', lv_size: '55.00t' },
-        { lv_name: 'chiaahr-vol', vg_name: 'chiaahr', lv_attr: '-wi-a-----', lv_size: '80.04t' },
-      ] }],
-      log: [],
-    })
-
-    /** Band index → kernel array, exactly as captured (r1 is the TALLEST band). */
-    const ARRAYS: Record<string, string> = {
-      '/dev/md126': 'chiaahr2-r1',
-      '/dev/md125': 'chiaahr2-r2',
-      '/dev/md124': 'chiaahr2-r3',
-      '/dev/md127': 'chiaahr-r1',
-    }
-
-    function buildingExecutor(mdstat?: string): MockExecutor {
-      const mock = new MockExecutor()
-      mock.addFixture({
-        command: '/usr/bin/cat',
-        args: MDSTAT_CAT_ARGS,
-        result: ok(mdstat ?? loadFixture('mdstat-initial-recovery-delayed-raid5.txt')),
-      })
-      for (const [dev, name] of Object.entries(ARRAYS)) {
-        mock.addFixture({
-          command: '/usr/sbin/mdadm',
-          args: mdadmDetailExportArgs(dev),
-          result: ok(`MD_LEVEL=raid5\nMD_METADATA=1.2\nMD_UUID=${dev.slice(-3)}0000:0:0:0\nMD_NAME=pve5:${name}\n`),
-        })
-      }
-      mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: ok('{"blockdevices":[]}') })
-      mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok('') })
-      mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: ok(TWO_POOL_VGS) })
-      mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: ok(TWO_POOL_LVS) })
-      mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: ok('') })
-      return mock
-    }
-
-    async function buildingPool(mdstat?: string) {
-      const pools = await readAhrPools(buildingExecutor(mdstat))
-      const pool = pools.find(p => p.name === 'chiaahr2')
-      assert.ok(pool, 'the building pool must be reported')
-      return pool
-    }
-
     it('a QUEUED band is recovering, not degraded — no failed disk is claimed', async () => {
-      const pool = await buildingPool()
+      const pool = await pve5Pool()
       const byBand = new Map(pool.arrays.map(a => [a.band, a]))
 
       // The running one: md has a progress line, and always did read right.
@@ -632,7 +666,7 @@ unused devices: <none>
     })
 
     it('the queued bands advise "no action needed", never "replace the failed disk"', async () => {
-      const pool = await buildingPool()
+      const pool = await pve5Pool()
       assert.ok(
         !pool.advisories.some(a => a.includes('replace the failed disk')),
         'a pool minutes old must never be told to replace a disk',
@@ -646,7 +680,7 @@ unused devices: <none>
     })
 
     it('the pool fuses to BUILDING, and cards nothing', async () => {
-      const pool = await buildingPool()
+      const pool = await pve5Pool()
       assert.equal(pool.state, 'building')
 
       // Activity, not fault: the §10 "only failures card" policy must stay
@@ -655,7 +689,7 @@ unused devices: <none>
     })
 
     it('the unrelated clean pool in the same mdstat stays healthy', async () => {
-      const pools = await readAhrPools(buildingExecutor())
+      const pools = await readAhrPools(pve5Executor())
       const other = pools.find(p => p.name === 'chiaahr')
       assert.ok(other)
       assert.equal(other.state, 'healthy', 'one pool building must not colour another')
@@ -666,7 +700,7 @@ unused devices: <none>
       // real disk failure makes. The queued marker must NOT launder it.
       const withFault = loadFixture('mdstat-initial-recovery-delayed-raid5.txt')
         .replace('sdd2[4] sdl2[2] sdb2[1] sdo2[0]', 'sdd2[4] sdl2[2] sdb2[1](F) sdo2[0]')
-      const pool = await buildingPool(withFault)
+      const pool = await pve5Pool({ mdstat: withFault })
       const band2 = pool.arrays.find(a => a.band === 2)!
 
       assert.equal(band2.state, 'degraded')
@@ -682,11 +716,131 @@ unused devices: <none>
       // `(F)` to find. Slot count is the only evidence, and it must still bite.
       const withMissing = loadFixture('mdstat-initial-recovery-delayed-raid5.txt')
         .replace('sdd2[4] sdl2[2] sdb2[1] sdo2[0]', 'sdd2[4] sdl2[2] sdo2[0]')
-      const pool = await buildingPool(withMissing)
+      const pool = await pve5Pool({ mdstat: withMissing })
 
       assert.equal(pool.arrays.find(a => a.band === 2)!.state, 'degraded')
       assert.equal(pool.state, 'degraded')
       assert.ok(buildAhrWarnings([pool])[0]?.message.includes('is missing a member'))
+    })
+  })
+
+  // --- The post-lockup multi-tier failure (issue #18) ------------------------
+  // The pve5 incident of 2026-08-09: after a node lockup chiaahr2 came up with
+  // band r1 active but down a member, bands r2 and r3 INACTIVE ("active,
+  // FAILED, Not Started"), the VG partial and the LV not active — the volume
+  // was OFFLINE and its data unreachable, while the badge said "degraded".
+  describe('post-lockup multi-tier failure (issue #18)', () => {
+    /** The incident, exactly: 1 band degraded + 2 bands unstartable + LV down. */
+    function incident() {
+      return pve5Pool({
+        mdstat: loadFixture('mdstat-inactive-bands-post-lockup.txt'),
+        vgs: pve5Vgs(true),
+        lvs: pve5Lvs('-wi-----p-'),
+      })
+    }
+
+    it('the pool reads OFFLINE, never degraded', async () => {
+      const pool = await incident()
+      // THE REGRESSION: this pool used to report 'degraded', which reads as
+      // reduced-redundancy-but-functioning. Nothing was being served at all.
+      assert.equal(pool.state, 'offline')
+      // The bands still describe themselves truthfully at their own level
+      // (11.19): r1 IS degraded, and r2/r3 are the GT-8 inactive shape.
+      const byBand = new Map(pool.arrays.map(a => [a.band, a]))
+      assert.equal(byBand.get(1)!.state, 'degraded')
+      for (const band of [2, 3])
+        assert.ok(byBand.get(band)!.members.every(m => m.memberState === 'spare'), `band ${band} is inactive (all members (S))`)
+    })
+
+    it('the advisory names WHICH bands cannot start, and says the data is unavailable', async () => {
+      const pool = await incident()
+      const advisory = pool.advisories[0]
+      assert.ok(advisory.startsWith(`pool 'chiaahr2' is OFFLINE — `), `the verdict leads the list, got: ${advisory}`)
+      // Counted AND named — bands ascending, ids never truncated.
+      assert.ok(advisory.includes('2 of 3 band arrays cannot start (chiaahr2-r2, chiaahr2-r3)'), advisory)
+      // The other half of the evidence: the volume itself is down.
+      assert.ok(advisory.includes(`the logical volume 'chiaahr2-vol' is not active`), advisory)
+      assert.ok(advisory.includes('the filesystem cannot be mounted and its data is unavailable'), advisory)
+      // A cause we have NOT earned is never invented: an inactive array can be
+      // the recoverable GT-8 all-spares assembly, and the per-array advisories
+      // are what carry the recovery ladder.
+      assert.ok(!advisory.includes('missing members'), advisory)
+      for (const band of [2, 3])
+        assert.ok(pool.advisories.some(a => a.includes(`chiaahr2-r${band}`) && a.includes('INACTIVE')), `band ${band} keeps its own INACTIVE advisory`)
+    })
+
+    it('the dashboard cards it CRITICAL, with the same sentence the view shows', async () => {
+      const pool = await incident()
+      const warnings = buildAhrWarnings([pool])
+      assert.equal(warnings.length, 1, 'ONE card per pool')
+      const w = warnings[0]
+      assert.equal(w.level, 'critical', 'total unavailability is not a warning')
+      assert.equal(w.category, 'ahr')
+      assert.equal(w.ref, 'chiaahr2')
+      // One wording, two altitudes: the card is the pool's own advisory with the
+      // subject supplied by the card, so headline and detail cannot disagree.
+      assert.equal(
+        w.message,
+        `AHR pool 'chiaahr2' ${pool.advisories[0].slice(`pool 'chiaahr2' `.length)}; see the Hybrid RAID view`,
+      )
+    })
+
+    it('an offline pool does not colour the healthy pool beside it', async () => {
+      const pools = await readAhrPools(pve5Executor({
+        mdstat: loadFixture('mdstat-inactive-bands-post-lockup.txt'),
+        vgs: pve5Vgs(true),
+        lvs: pve5Lvs('-wi-----p-'),
+      }))
+      const other = pools.find(p => p.name === 'chiaahr')
+      assert.ok(other)
+      assert.equal(other.state, 'healthy')
+      assert.equal(buildAhrWarnings(pools).length, 1, 'only the offline pool cards')
+    })
+
+    describe('precedence: offline outranks every state below it', () => {
+      it('beats degraded — one unstartable band is enough, LV or no LV', async () => {
+        // Band r1 down a member and r3 unstartable, but the LV still reads
+        // active: the md evidence ALONE must carry the offline verdict.
+        const pool = await pve5Pool({ mdstat: loadFixture('mdstat-inactive-bands-post-lockup.txt') })
+        assert.equal(pool.arrays.find(a => a.band === 1)!.state, 'degraded')
+        assert.equal(pool.state, 'offline')
+        const advisory = pool.advisories[0]
+        assert.ok(advisory.includes('2 of 3 band arrays cannot start'), advisory)
+        assert.ok(!advisory.includes('logical volume'), 'an active LV is not claimed as evidence')
+      })
+
+      it('beats building — the whole first build is moot if the volume is down', async () => {
+        // The unmodified issue #7 capture: all three bands building, which fuses
+        // to 'building' and cards NOTHING. Flip ONLY the LV to inactive and the
+        // pool is offline — a build that cannot be reached is not "activity".
+        assert.equal((await pve5Pool()).state, 'building')
+        const pool = await pve5Pool({ lvs: pve5Lvs('-wi-----p-') })
+        assert.equal(pool.state, 'offline')
+        assert.equal(buildAhrWarnings([pool])[0]?.level, 'critical')
+      })
+
+      it('is outranked only by `failed` — a missing LVM layer has no volume to call offline', async () => {
+        // The VG is gone entirely, so there is nothing left to be offline: the
+        // pool is `failed`, and its missing-layer advisories already say why.
+        // (Kept visible by the ANAS-authored mdadm.conf pin on band r1.)
+        const confDir = await mkdtemp(join(tmpdir(), 'ahr-conf-'))
+        try {
+          const confPath = join(confDir, 'mdadm.conf')
+          await writeFile(confPath, `ARRAY /dev/md/chiaahr2-r1 metadata=1.2 UUID=${pve5Uuid('/dev/md126')}\n`)
+          const pools = await readAhrPools(pve5Executor({
+            mdstat: loadFixture('mdstat-inactive-bands-post-lockup.txt'),
+            vgs: JSON.stringify({ report: [{ vg: [] }], log: [] }),
+            lvs: JSON.stringify({ report: [{ lv: [] }], log: [] }),
+          }), confPath)
+          const pool = pools.find(p => p.name === 'chiaahr2')
+          assert.ok(pool, 'a pinned pool stays visible even with its VG gone')
+          assert.equal(pool.state, 'failed')
+          assert.ok(!pool.advisories.some(a => a.includes('is OFFLINE')), 'no offline verdict without a volume')
+        }
+        finally {
+          await rm(confDir, { recursive: true, force: true })
+        }
+      })
     })
   })
 })

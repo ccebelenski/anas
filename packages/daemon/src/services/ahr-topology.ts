@@ -19,7 +19,7 @@ import { AhrPool, AhrPoolBrief } from '@anas/shared'
 import { btrfsUsageArgs, parseBtrfsUsage } from '../parsers/btrfs-usage.js'
 import { parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
-import { LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
+import { lvIsActive, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { hasArray, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
@@ -222,6 +222,58 @@ export function missingLvAdvisory(pool: string): string {
 /** @see missingVgAdvisory */
 export function notMountedAdvisory(pool: string): string {
   return `pool '${pool}' filesystem is not mounted`
+}
+
+/**
+ * The `pool '<name>' ` subject the offline advisory opens with — defined once
+ * because the dashboard card strips exactly this prefix to reuse the sentence
+ * (a card supplies its own subject). Not a general advisory helper.
+ */
+function advisorySubject(pool: string): string {
+  return `pool '${pool}' `
+}
+
+/**
+ * The verdict clause that opens the offline advisory — the marker the dashboard
+ * card matches on to lift the SAME sentence (see {@link buildAhrWarnings}), so
+ * the two altitudes share one string instead of two that can drift.
+ */
+const OFFLINE_VERDICT = 'is OFFLINE — '
+
+/** The evidence behind an `offline` verdict, as {@link readAhrPools} found it. */
+interface OfflineDetail {
+  /** Names of the band arrays that could not start, bands ascending. */
+  cannotStart: string[]
+  /** How many band arrays the pool has in total (the "N of M" denominator). */
+  arrayCount: number
+  lvName: string
+  /** The LV is listed but its state field is not `a` (parsers/lvm-report). */
+  lvInactive: boolean
+}
+
+/**
+ * The `offline` advisory (issue #18) — WHY the volume is unreachable, stated as
+ * evidence rather than diagnosis: which of the pool's band arrays cannot start
+ * (named in full, never counted anonymously or truncated) and whether the LV
+ * itself is inactive, then the consequence the badge alone cannot carry.
+ *
+ * It deliberately does NOT guess a cause. An inactive band array can be the GT-8
+ * assemble-as-all-spares state (recoverable with `mdadm --run`) or genuinely
+ * missing members; the per-array advisories say which, and inventing "missing
+ * members" here would be a diagnosis we have not earned.
+ */
+function offlineAdvisory(pool: string, detail: OfflineDetail): string {
+  const causes: string[] = []
+  if (detail.cannotStart.length > 0) {
+    causes.push(
+      `${detail.cannotStart.length} of ${detail.arrayCount} band array${detail.arrayCount === 1 ? '' : 's'} `
+      + `cannot start (${detail.cannotStart.join(', ')})`,
+    )
+  }
+  if (detail.lvInactive)
+    causes.push(`the logical volume '${detail.lvName}' is not active`)
+  return `${advisorySubject(pool)}${OFFLINE_VERDICT}${causes.join(' and ')}; `
+    + `the filesystem cannot be mounted and its data is unavailable`
 }
 
 /**
@@ -672,9 +724,34 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
         return true
       return md.sync?.action === 'resync' || md.sync?.action === 'recovery'
     })
+    // OFFLINE (issue #18): a band array that cannot START takes its PV with it,
+    // so the VG comes up partial and the concatenated LV cannot be activated —
+    // no data is reachable through ANY band, not even the bands that DID start.
+    // That is categorically not `degraded` (reduced redundancy, still serving),
+    // and the pve5 post-lockup shape proved why the distinction has to exist:
+    // r1 active-degraded (4/5), r2 and r3 "active, FAILED, Not Started", VG
+    // missing 2 of 3 PVs, LV not active — the volume was unreachable while the
+    // badge said "degraded", which reads as reduced-redundancy-but-functioning.
+    //
+    // Two independent pieces of evidence, either one sufficient:
+    //  - an INACTIVE band array (mdstat's `inactive`, the GT-8 shape);
+    //  - the LV present but not active (lv_attr state field ≠ 'a').
+    // A `null` from lvIsActive (attr column absent) reads as active — fail-safe:
+    // an offline verdict is never manufactured from evidence we do not have.
+    const cannotStart = arrayEntries.filter(e => !e.mdstat.active).map(e => `${poolName}-r${e.band}`)
+    const lvInactive = lv !== undefined && lvIsActive(lv.attr) === false
+    const offline = cannotStart.length > 0 || lvInactive
+
     let state: AhrPoolState
     if (!vg || !lv)
       state = 'failed'
+    // Total unavailability OUTRANKS every other verdict below it: a pool that
+    // serves nothing must not wear a reduced-redundancy (`degraded`), an
+    // in-progress (`building`/`expanding`/`rebuilding`/`scrubbing`) or a
+    // still-readable (`readonly`) badge. Only `failed` — the LVM layer gone
+    // outright — ranks above it.
+    else if (offline)
+      state = 'offline'
     else if (readonly)
       state = 'readonly'
     else if (anyDegraded)
@@ -688,6 +765,12 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     else if (anyCheck)
       state = 'scrubbing'
     else state = 'healthy'
+    // Keyed off the FUSED state, so the advisory exists exactly when the badge
+    // says offline. It leads the list: the pool-level verdict comes before the
+    // per-band detail (a missing VG/LV reads `failed`, whose own advisories
+    // already say the LVM layer is gone).
+    if (state === 'offline')
+      advisories.unshift(offlineAdvisory(poolName, { cannotStart, arrayCount: arrayEntries.length, lvName, lvInactive }))
     if (readonly)
       advisories.push(`pool '${poolName}' is mounted READ-ONLY — btrfs is protecting itself; diagnose before any remount`)
 
@@ -784,19 +867,33 @@ function degradedDetail(pool: AhrPool): string {
 /**
  * Dashboard warning cards for AHR pools (story 11.10, AHR-DESIGN §10 — the
  * replication "only failures card" policy): ONE target-first card per pool in
- * a bad state — `degraded` (naming which array/band + which member), `failed`,
- * `readonly`, or a HALTED expansion (naming the Resume/Abandon verbs). Levels
- * follow the §7.2 severity table: failed/readonly critical, degraded/halted
- * warning. In-progress expanding/rebuilding/scrubbing states ride the shared
- * jobs strip — no card; healthy/idle pools add NOTHING. View-level advisories
- * (consumed spare, flat-layout snapshots) deliberately do not card.
+ * a bad state — `offline` (naming which band arrays cannot start), `degraded`
+ * (naming which array/band + which member), `failed`, `readonly`, or a HALTED
+ * expansion (naming the Resume/Abandon verbs). Levels follow the §7.2 severity
+ * table: offline/failed/readonly critical, degraded/halted warning. In-progress
+ * expanding/rebuilding/scrubbing states ride the shared jobs strip — no card;
+ * healthy/idle pools add NOTHING. View-level advisories (consumed spare,
+ * flat-layout snapshots) deliberately do not card.
  */
 export function buildAhrWarnings(pools: AhrPool[]): DashboardWarning[] {
   const warnings: DashboardWarning[] = []
   for (const pool of pools) {
     const clauses: string[] = []
     let level: DashboardWarning['level'] = 'warning'
-    if (pool.state === 'failed') {
+    if (pool.state === 'offline') {
+      level = 'critical'
+      // Reuse the pool's OWN offline advisory (readAhrPools built it where the
+      // evidence is) minus the `pool '<name>' ` subject the card supplies
+      // itself — so the card names the same arrays the Hybrid RAID view does
+      // and the two can never disagree. The fallback covers a record that
+      // reached here with the state but not the advisory (a decorated pool).
+      const subject = advisorySubject(pool.name)
+      const advisory = pool.advisories.find(a => a.startsWith(`${subject}${OFFLINE_VERDICT}`))
+      clauses.push(advisory
+        ? `${advisory.slice(subject.length)}; see the Hybrid RAID view`
+        : `${OFFLINE_VERDICT}a band array cannot start or the volume is not active; its data is unavailable — see the Hybrid RAID view`)
+    }
+    else if (pool.state === 'failed') {
       level = 'critical'
       clauses.push('has FAILED — its LVM/filesystem layer is missing or inactive; see the Hybrid RAID view')
     }

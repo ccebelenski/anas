@@ -61,6 +61,13 @@
     // fault) — 'building' especially: a mixed-media pool lives there for its
     // first hours-to-days while md serializes the band syncs, and an amber
     // fault pill for that whole window is a lie (issue #7).
+    //
+    // 'offline' is the other end of that same discipline (issue #18): a pool
+    // whose volume cannot be assembled serves NOTHING, so it wears the RED pill
+    // and an uppercase label — amber "degraded" beside a lowercase word read as
+    // reduced-redundancy-but-functioning while the data was unreachable. WHICH
+    // bands cannot start comes from the daemon's advisory, rendered verbatim by
+    // advisoriesHtml() like every other pool advisory.
     var POOL_STATES = {
         healthy: { token: 'ONLINE', label: 'healthy' },
         building: { token: '', label: 'building' },
@@ -68,6 +75,7 @@
         expanding: { token: '', label: 'expanding' },
         rebuilding: { token: 'DEGRADED', label: 'rebuilding' },
         scrubbing: { token: '', label: 'scrubbing' },
+        offline: { token: 'OFFLINE', label: 'OFFLINE' },
         failed: { token: 'FAULTED', label: 'failed' },
         readonly: { token: 'FAULTED', label: 'read-only' },
     };

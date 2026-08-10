@@ -740,14 +740,25 @@
     // busy states (building/expanding/scrubbing) stay NEUTRAL — activity, not
     // fault. 'building' is the first-build window (issue #7), the AHR analog of
     // the ZFS resilver indicator: long-running, expected, and not a failure.
+    // 'offline' is red and UPPERCASE (issue #18): the volume cannot be assembled,
+    // so the pool serves nothing — it must not look like amber degraded, which
+    // reads as reduced-redundancy-but-functioning. The failure card carries WHICH
+    // band arrays cannot start.
     var AHR_PILL_TOKEN = {
         healthy: 'ONLINE', building: '', degraded: 'DEGRADED', expanding: '',
-        rebuilding: 'DEGRADED', scrubbing: '', failed: 'FAULTED', readonly: 'FAULTED'
+        rebuilding: 'DEGRADED', scrubbing: '', offline: 'OFFLINE',
+        failed: 'FAULTED', readonly: 'FAULTED'
     };
+
+    // States whose LABEL is not simply the state word (39-ahr.js POOL_STATES
+    // carries the same two): 'read-only' hyphenates, and 'offline' shouts —
+    // uppercase alongside the red pill, because a lowercase word beside amber
+    // was exactly what read as reduced-redundancy-but-functioning (issue #18).
+    var AHR_PILL_LABEL = { readonly: 'read-only', offline: 'OFFLINE' };
 
     function ahrStatePill(state) {
         var token = AHR_PILL_TOKEN.hasOwnProperty(state) ? AHR_PILL_TOKEN[state] : '';
-        var label = state === 'readonly' ? t('read-only') : t('' + (state || ''));
+        var label = t(AHR_PILL_LABEL.hasOwnProperty(state) ? AHR_PILL_LABEL[state] : ('' + (state || '')));
         try {
             if (gfx && typeof gfx.statePill === 'function') {
                 var html = gfx.statePill(token, { label: label });

@@ -105,13 +105,15 @@ New `packages/shared/src/schemas/ahr.ts`. All validated at both boundaries.
 AhrType      = 'ahr1' | 'ahr2'
 ArrayLevel   = 'raid1' | 'raid5' | 'raid6'
 ArrayState   = 'clean' | 'degraded' | 'resyncing' | 'reshaping' | 'recovering' | 'failed'
-AhrPoolState = 'healthy' | 'building' | 'degraded' | 'expanding' | 'rebuilding' | 'scrubbing' | 'failed' | 'readonly'
+AhrPoolState = 'healthy' | 'building' | 'degraded' | 'expanding' | 'rebuilding' | 'scrubbing' | 'offline' | 'failed' | 'readonly'
 ```
 (`AhrPoolState`, not `PoolState` — zfs.ts already owns that export name.)
 
 (Initial RAID5/6 sync after create reports as `resyncing`; the UI copy must present it as "building — pool usable now", distinct from degraded.)
 
 (`building` is the whole-pool form of that: EVERY band syncing or queued, with no faulty or absent member anywhere. md serializes syncs across arrays sharing physical disks, so a mixed-media pool's later bands sit `resync=DELAYED` at `[n/n-1]` with no progress line — a shape that must read as build activity, never as a degraded array with a failed disk. It is a NEUTRAL pill, not a fault, and it suppresses the failure card for the whole multi-day build. A pool being built by a live `ahr.create` job reports `building` even before its VG exists: the half-built stack is indistinguishable on disk from a create that died, so the read layer consults the job queue — jobs are runtime state, not shadow state, and after a daemon restart the answer honestly reverts to `failed`.)
+
+(`offline` is TOTAL UNAVAILABILITY, and it exists because `degraded` was being asked to carry it (issue #18): after a node lockup, `chiaahr2` came up with band r1 active-degraded, bands r2 and r3 INACTIVE ("active, FAILED, Not Started"), the VG missing 2 of 3 PVs and the LV not active — nothing was readable, and the badge said "degraded". Derivation: **any** band md array inactive/failed/not-started, **or** the pool's LV present but not active (`lv_attr` state field ≠ `a`). A band that cannot start takes its PV with it, so the concatenated volume is missing a piece and NO band is reachable — not a reduced-redundancy state at all. It therefore **outranks** degraded/building/expanding/rebuilding/scrubbing/readonly in the fusion; only `failed` (the LVM layer gone outright) ranks above it. Red pill, uppercase label, critical card, and the advisory names which band arrays cannot start. It does NOT diagnose a cause — an inactive array may be the recoverable GT-8 all-spares assembly (§5.1's ladder) or genuinely missing members, and the per-array advisories are what say which.)
 
 **`AhrDisk`** — `{ id (by-id), sizeBytes, usableBytes (rounded), model, serial, role: 'member'|'spare', partitions: [{ device, band, sizeBytes }] }`
 
@@ -283,6 +285,7 @@ AHR is the feature that justifies actually wiring the deferred Proxmox notificat
 | Reshape/expansion FAILED | error | pool stuck mid-transition, needs attention |
 | Disk failed DURING reshape | error | reshape continues degraded — combined-risk state (§8) |
 | Second disk failure / array failed | **critical** | data loss imminent/occurring; pool may go read-only |
+| Pool OFFLINE (a band cannot start, or the LV is inactive) | **critical** | the volume cannot be assembled — data unavailable, not merely unprotected (issue #18) |
 | Pool read-only (btrfs forced ro) | **critical** | fs protecting itself |
 | Scrub found (and could/could not correct) errors | warning/error | latent corruption surfaced |
 
@@ -296,7 +299,7 @@ That rule is implemented twice on purpose — `isBuildingMembership` (TypeScript
 Routed through PVE's own notification targets/matchers (email/Gotify/etc. the operator already configured) — ANAS emits, PVE delivers. Leverage, not a new alerting system. **Mechanism (GT-17, proven live):** `PVE::Notify::<severity>('anas-ahr', {title, message}, fields)` with ANAS-shipped handlebars templates in `/usr/share/pve-manager/templates/default/` (apt-hook reinstalls after pve-manager upgrades); `fields` carries `type=anas-ahr` for operator matcher rules. **Evaluate first (per 9.4):** does ZED/mdadm's own `MAILADDR`/monitor already cover the disk-failure cases? Wire only the genuinely-missing events; don't duplicate `mdadm --monitor` if PVE can consume it directly.
 
 ### 7.3 Dashboard
-Only failures and in-progress operations surface (the replication/backup policy): a degraded/failed/read-only pool → warning card; a running reshape/rebuild → the jobs strip with progress. Healthy/idle shows nothing.
+Only failures and in-progress operations surface (the replication/backup policy): an offline/degraded/failed/read-only pool → warning card (offline/failed/read-only at `critical`); a running reshape/rebuild → the jobs strip with progress. Healthy/idle shows nothing.
 
 ## 8. Failure & recovery model
 
@@ -330,7 +333,8 @@ The dashboard aggregate gains an AHR source (fail-open like every other source:
 an AHR read error degrades the card, never the dashboard):
 
 - **Warning cards** (the §7.3 promise): one card per pool in a bad state, target-first
-  per the UI discipline — `degraded` (which array/band + member), `failed`,
+  per the UI discipline — `offline` (which band arrays cannot start + that the data
+  is unavailable), `degraded` (which array/band + member), `failed`,
   `readonly`, and a **halted expansion** (names the Resume/Abandon verbs). A
   consumed spare (§11) and a flat-layout snapshot advisory do NOT card — they are
   view-level advisories only.

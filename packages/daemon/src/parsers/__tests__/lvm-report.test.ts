@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
+  lvIsActive,
   LVS_ARGS,
   parseLvmSize,
   parseLvsReport,
@@ -98,6 +99,31 @@ describe('parseLvsReport', () => {
     assert.equal(lv.vgName, 'ahr0')
     assert.equal(lv.attr, '-wi-a-----')
     assert.equal(lv.sizeBytes, Math.round(2.49 * 1024 ** 3))
+  })
+})
+
+// The LV state field (issue #18) — what says a volume over a partial VG is not
+// merely reduced but UNREACHABLE.
+describe('lvIsActive', () => {
+  it('reads the healthy stage-0 LV as active', () => {
+    assert.equal(lvIsActive(parseLvsReport(loadFixture('lvm-lvs.json'))[0].attr), true)
+  })
+
+  it('an LV over a PARTIAL vg is NOT active (the state field is what matters)', () => {
+    // `-wi-----p-`: state field `-`, and lvm's `p` health flag for partial. The
+    // volume is listed and sized, and cannot be read.
+    assert.equal(lvIsActive('-wi-----p-'), false)
+    assert.equal(lvIsActive('-wi-------'), false)
+  })
+
+  it('every non-`a` state code reads as not active', () => {
+    for (const state of ['-', 's', 'S', 'I', 'm', 'M', 'd', 'i', 'X'])
+      assert.equal(lvIsActive(`-wi-${state}-----`), false, `state '${state}'`)
+  })
+
+  it('an absent or truncated attr column is UNKNOWN, never a failure verdict', () => {
+    assert.equal(lvIsActive(''), null)
+    assert.equal(lvIsActive('-wi-'), null)
   })
 })
 
