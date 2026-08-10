@@ -14,6 +14,19 @@
 # The single fragile point is step 2: pve-manager upgrades overwrite
 # index.html.tpl. See README.md.
 #
+# COEXISTENCE (issue #20): a sibling project (ADOCK) may splice its own hook
+# block into the same PVE module and inject its own <script> line into the same
+# template. Nothing here may cost it either.
+#   * IDEMPOTENT: presence is keyed on OUR marker only, so a re-run is a no-op
+#     and never a double-insert, whatever else is in the file.
+#   * ADDITIVE: our block is inserted after the /api2 dispatch's closing brace,
+#     which is where a sibling puts its block too. Whichever installs second
+#     lands its block adjacent to — never inside, never instead of — the other's.
+#   * TOLERANT: a foreign hook block already present is detected and PRESERVED.
+#     We refuse to capture a "pristine" backup that already contains someone
+#     else's splice, and uninstall then removes our block SURGICALLY (by marker)
+#     rather than restoring a whole-file backup that would clobber the sibling.
+#
 # Paths are parameterised (with production defaults) so the tpl logic can be
 # tested against a copy without a real PVE install:
 #   PVE_TPL=/tmp/x/index.html.tpl PVE_JS_DIR=/tmp/x/js APT_HOOK=/tmp/x/hook ./install.sh
@@ -34,7 +47,8 @@ PERL_BIN="${PERL_BIN:-perl}"
 PVE_HTTP_SERVER_PM="${PVE_HTTP_SERVER_PM:-/usr/share/perl5/PVE/APIServer/AnyEvent.pm}"
 ANAS_PERL_DIR="${ANAS_PERL_DIR:-/usr/share/anas/perl}"
 ANAS_PROXY_PM="${ANAS_PERL_DIR}/AnasProxy.pm"
-# Pristine backup of the PVE HTTP server module, captured once before we splice.
+# Pristine backup of the PVE HTTP server module, captured once before we splice —
+# and ONLY when no foreign hook is present (see capture_pristine_backup).
 PVE_HTTP_SERVER_PM_ORIG="${PVE_HTTP_SERVER_PM}.anas-orig"
 # Marks our additive block (idempotency check + surgical removal on uninstall).
 ANAS_HOOK_MARKER='# >>> ANAS proxy hook'
@@ -65,6 +79,20 @@ restart_pveproxy() {
   systemctl restart pveproxy
 }
 
+# True if $1 carries a third-party proxy-hook block that is NOT ours (issue #20).
+# Generic on purpose: today that means ADOCK's '# >>> ADOCK proxy hook', but any
+# sibling using the same additive marker convention must be preserved the same
+# way. The marker lines are captured into a variable rather than piped into a
+# second grep: `grep | grep -q` under `set -o pipefail` is the issue-#21 SIGPIPE
+# shape, and a wrong answer here silently costs the sibling its hook.
+has_foreign_hook() {
+  local f="$1" markers
+  [ -f "${f}" ] || return 1
+  markers="$(grep -E '^[[:space:]]*# >>> .+ proxy hook' "${f}" 2>/dev/null || true)"
+  [ -n "${markers}" ] || return 1
+  grep -qv 'ANAS proxy hook' <<<"${markers}"
+}
+
 # Emit the additive ANAS hook block (tabs match PVE's source; Perl ignores
 # indentation, the markers make it findable/removable regardless). The perl
 # sigils are escaped so this here-doc only expands the ANAS path/marker vars.
@@ -88,6 +116,12 @@ HOOKEOF
 # handle_api2_request anchor, then the first lone `}` that follows it. Never
 # inserts anywhere else: with no anchor match nothing is added and the caller
 # detects the missing marker and aborts (never force onto a non-match).
+#
+# The anchor + first-lone-brace pair is what makes this splice ADDITIVE when a
+# sibling project (ADOCK) has already patched the module: a sibling's block sits
+# AFTER that brace, so the rule resolves to the same /api2 close in a pristine
+# file and in an already-spliced one, landing our block beside theirs — never
+# inside it, never instead of it.
 splice_proxy_hook() {
   local src="$1" bf="$2" out="$3"
   awk -v bf="${bf}" '
@@ -100,6 +134,24 @@ splice_proxy_hook() {
         anas_done = 1
     }
   ' "${src}" > "${out}"
+}
+
+# Back up the pristine PVE module ONCE — but only when it is genuinely pristine.
+# If a sibling project has already spliced it, a whole-file "restore" from this
+# backup would silently delete the sibling's hook (issue #20), so we do not take
+# one and say why. Uninstall handles that case surgically instead.
+capture_pristine_backup() {
+  if [ -f "${PVE_HTTP_SERVER_PM_ORIG}" ]; then
+    return 0
+  fi
+  if has_foreign_hook "${PVE_HTTP_SERVER_PM}"; then
+    echo "anas: note: ${PVE_HTTP_SERVER_PM} already carries another project's proxy hook (ADOCK?);"
+    echo "anas:       skipping the whole-file backup so an uninstall can never clobber it —"
+    echo "anas:       our block will be removed surgically by marker instead."
+    return 0
+  fi
+  cp -a "${PVE_HTTP_SERVER_PM}" "${PVE_HTTP_SERVER_PM_ORIG}"
+  echo "anas: saved pristine ${PVE_HTTP_SERVER_PM} -> ${PVE_HTTP_SERVER_PM_ORIG}"
 }
 
 # Install AnasProxy.pm and splice the additive proxy hook into the PVE HTTP
@@ -136,11 +188,10 @@ install_anas_proxy() {
     return 1
   fi
 
-  # Back up the pristine module ONCE.
-  if [ ! -f "${PVE_HTTP_SERVER_PM_ORIG}" ]; then
-    cp -a "${PVE_HTTP_SERVER_PM}" "${PVE_HTTP_SERVER_PM_ORIG}"
-    echo "anas: saved pristine ${PVE_HTTP_SERVER_PM} -> ${PVE_HTTP_SERVER_PM_ORIG}"
+  if has_foreign_hook "${PVE_HTTP_SERVER_PM}"; then
+    echo "anas: another project's proxy hook is present — splicing ADDITIVELY alongside it"
   fi
+  capture_pristine_backup
 
   local blockfile patched
   blockfile="$(mktemp)"
@@ -154,6 +205,15 @@ install_anas_proxy() {
   if ! grep -qF "${ANAS_HOOK_MARKER}" "${patched}"; then
     rm -f "${patched}"
     echo "anas: ERROR: proxy hook splice did not land (anchor mismatch); ${PVE_HTTP_SERVER_PM} untouched" >&2
+    return 1
+  fi
+
+  # Coexistence assertion (issue #20): if a foreign hook was there before the
+  # splice, it MUST still be there after. A splice that ate the sibling's block
+  # is a bug, not a patch — refuse it and leave the live module alone.
+  if has_foreign_hook "${PVE_HTTP_SERVER_PM}" && ! has_foreign_hook "${patched}"; then
+    rm -f "${patched}"
+    echo "anas: ERROR: the splice would have removed another project's proxy hook; ${PVE_HTTP_SERVER_PM} untouched" >&2
     return 1
   fi
 

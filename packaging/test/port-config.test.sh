@@ -30,7 +30,9 @@ check(){ if eval "$2"; then ok "$1"; else bad "$1"; fi; }
 
 # Per-test scratch + fakes. FAKE_SS_PORTS (space-separated) are the ports the
 # fake ss reports as LISTENing; FAKE_ANAS_ACTIVE=1 makes the fake systemctl
-# report the anas service active.
+# report the anas service active. FAKE_SS_PAD appends that many further LISTEN
+# lines AFTER the interesting ones — a long listing, which is what exposes the
+# issue-#21 SIGPIPE race (a reader that stops early kills the writer mid-write).
 setup_env() {
   WORK="$(mktemp -d)"
   ENV_FILE="${WORK}/anas.env"
@@ -39,6 +41,8 @@ setup_env() {
   cat > "${FAKE_SS}" <<'EOF'
 #!/usr/bin/env bash
 for p in ${FAKE_SS_PORTS:-}; do printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\n' "$p"; done
+[ "${FAKE_SS_PAD:-0}" -gt 0 ] || exit 0
+awk -v n="${FAKE_SS_PAD}" 'BEGIN { for (i = 0; i < n; i++) printf "LISTEN 0 128 127.0.0.1:%d 0.0.0.0:*\n", 40000 + i % 20000 }'
 EOF
   cat > "${FAKE_SYSTEMCTL}" <<'EOF'
 #!/usr/bin/env bash
@@ -47,6 +51,7 @@ exit 0
 EOF
   chmod +x "${FAKE_SS}" "${FAKE_SYSTEMCTL}"
   FAKE_SS_PORTS=""
+  FAKE_SS_PAD=0
   FAKE_ANAS_ACTIVE=0
 }
 
@@ -58,7 +63,8 @@ lib() {
   ANAS_INSTALL_LIB_ONLY=1 \
   ANAS_ENV_FILE="${ENV_FILE}" \
   SS_BIN="${FAKE_SS}" SYSTEMCTL_BIN="${FAKE_SYSTEMCTL}" \
-  FAKE_SS_PORTS="${FAKE_SS_PORTS}" FAKE_ANAS_ACTIVE="${FAKE_ANAS_ACTIVE}" \
+  FAKE_SS_PORTS="${FAKE_SS_PORTS}" FAKE_SS_PAD="${FAKE_SS_PAD}" \
+  FAKE_ANAS_ACTIVE="${FAKE_ANAS_ACTIVE}" \
     bash -c "source \"\$0\"; ${snippet}" "${INSTALL}" "$@"
 }
 
@@ -151,6 +157,25 @@ rm -rf "${WORK}"
 echo "== 10. the shipped anas.service unit carries the EnvironmentFile line =="
 check "systemd/anas.service references /etc/default/anas" \
   "grep -qF 'EnvironmentFile=-/etc/default/anas' '${UNIT_SRC}/anas.service'"
+
+echo "== 11. port_listening on a LONG ss listing: still a true positive (issue #21) =="
+# The match is on the FIRST line and ~60k lines follow it — far past the pipe
+# buffer. `ss | grep -q` would let grep exit on that first hit, SIGPIPE ss (141)
+# and, under `set -o pipefail`, report the pipeline as FAILED: a LISTENING port
+# read as FREE, intermittently, exactly where the conflict guard lives.
+setup_env
+FAKE_SS_PORTS="3000"; FAKE_SS_PAD=60000; FAKE_ANAS_ACTIVE=0
+out="$(lib 'if port_listening 3000; then printf "@@1@@"; else printf "@@0@@"; fi' 2>/dev/null)"; rc=$?
+check "exits 0" "[ ${rc} -eq 0 ]"
+check "a listening port reads as LISTENING, not free" "[ \"\$(port_of '${out}')\" = '1' ]"
+out="$(lib 'if port_listening 3001; then printf "@@1@@"; else printf "@@0@@"; fi' 2>/dev/null)"
+check "a free port still reads as free" "[ \"\$(port_of '${out}')\" = '0' ]"
+# And the guard that depends on it holds: the busy default is scanned past.
+out="$(lib 'resolve_port; printf "@@%s@@" "$RESOLVED_PORT"' 2>/dev/null)"
+check "fresh install scans past the busy default" "[ \"\$(port_of '${out}')\" = '3001' ]"
+out="$(lib 'resolve_port' --port 3000 2>&1)"; rc=$?
+check "--port on the busy port is still a hard error" "[ ${rc} -ne 0 ]"
+rm -rf "${WORK}"
 
 echo
 echo "port-config tests: ${PASS} passed, ${FAIL} failed"

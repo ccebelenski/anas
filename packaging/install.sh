@@ -150,9 +150,18 @@ our_configured_port() {
 # unavailable we cannot tell -> treat as free (return 1), matching the prior
 # best-effort behaviour.
 port_listening() {
-  local p="$1"
+  local p="$1" out
   command -v "${SS_BIN}" >/dev/null 2>&1 || return 1
-  "${SS_BIN}" -ltn 2>/dev/null | grep -qE "[:.]${p}[[:space:]]"
+  # Capture the listing FIRST, then match against a here-string (issue #21).
+  # Piping ss straight into `grep -q` lets grep exit on its first hit, killing ss
+  # with SIGPIPE (exit 141), which `set -o pipefail` then reports as a pipeline
+  # FAILURE — i.e. "port free" for a port that is demonstrably listening. On a
+  # short listing ss usually finishes writing before grep exits, so the bug only
+  # shows up when the listing is long: a genuinely intermittent wrong answer
+  # about a port conflict, and an intermittent escape of the conflict guard. No
+  # pipe, no race. `|| true` keeps a non-zero ss from tripping `set -e`.
+  out="$("${SS_BIN}" -ltn 2>/dev/null || true)"
+  grep -qE "[:.]${p}[[:space:]]" <<<"${out}"
 }
 
 # ours_on_port N -> 0 if a listener on N belongs to OUR gateway (the anas

@@ -47,7 +47,7 @@ joined verbatim.
 | `src/50-dashboard.js`  | Dashboard view.                                                  |
 | `src/90-register.js`   | Wires `ANAS.views` into the node menu in a fixed order.          |
 | `install.sh`           | Idempotent installer — concatenates `src/*.js` → `/usr/share/pve-manager/js/anas.js` (served at `/pve2/js/anas.js`), inserts the tpl line, installs the apt hook. |
-| `uninstall.sh`         | Surgical uninstaller — restores the pristine template.           |
+| `uninstall.sh`         | Surgical uninstaller — removes only our tpl line and only our proxy-hook block. |
 
 ## Mechanism
 
@@ -90,6 +90,31 @@ the one fragile point in the whole integration. Mitigations:
 If the line is ever lost between an upgrade and the next apt run, the only
 symptom is that the ANAS section disappears until `install.sh` runs again — PVE
 itself keeps working.
+
+### Sharing AnyEvent.pm with a sibling project (issue #20)
+
+The reverse-proxy transport (story 12.2) splices an additive, marker-delimited
+block into PVE's `AnyEvent.pm`. A sibling project — ADOCK — uses the same
+convention in the same file, so **neither install order may cost the other its
+hook**:
+
+- Presence is keyed on **our** marker only, so a re-run is a no-op and never a
+  double-insert, whatever else is in the file. Both projects anchor on the
+  `/api2` dispatch's closing brace, so the second block lands *beside* the
+  first, never inside or instead of it.
+- The one-time whole-file `.anas-orig` backup is **not taken** when a foreign
+  hook is already present — it would enshrine the sibling's block as "pristine".
+- Uninstall therefore prefers **marker excision** and only falls back to the
+  whole-file restore when no foreign block exists. Restoring a backup that
+  predates a sibling's splice would silently delete their hook — and the same
+  staleness bites after a `libpve-http-server-perl` upgrade rewrites the module.
+- Either removal route must pass **`perl -c` before it is adopted**, exactly as
+  the install gates its patch. A module that won't compile means `:8006` is
+  down, so on a gate failure the live file and our block are left untouched with
+  a warning naming the block to remove by hand.
+
+A "foreign hook" is any `# >>> … proxy hook` marker line that isn't ours, so the
+rule holds for any sibling adopting the convention — not just ADOCK.
 
 ## Cross-node auth
 
