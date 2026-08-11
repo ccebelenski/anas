@@ -161,7 +161,8 @@ case "$EVENT" in
     ;;
 esac
 
-# An initial build is activity, not lost redundancy — it is not a warning.
+# A running sync with no fault recorded is activity, not lost redundancy — it is
+# not a warning.
 if [ -n "$BUILD_SHAPE" ]; then
   PRIORITY=info
 fi
@@ -172,16 +173,19 @@ LOGLINE="EVENT=${EVENT} DEVICE=${DEVICE}"
 [ -n "$MISMATCHES" ] && LOGLINE="${LOGLINE} MISMATCHES=${MISMATCHES}"
 [ -n "$BADBLOCKS" ] && LOGLINE="${LOGLINE} BADBLOCKS=${BADBLOCKS}"
 # Key=value throughout (the journald audit convention), so the suppression is
-# greppable: the record says the array started in initial-build recovery, that
-# this is expected during pool creation, and that no notification was sent.
-[ -n "$BUILD_SHAPE" ] && LOGLINE="${LOGLINE} BUILD=initial-recovery NOTIFY=suppressed REASON=expected-during-pool-creation"
+# greppable. The record says exactly what sysfs showed and no more (issue #15):
+# a sync is running, no member is faulty, no slot is missing — NOT that this is
+# an initial build, because this shape cannot tell a first build from a rebuild
+# onto a spare whose dead disk was pulled.
+[ -n "$BUILD_SHAPE" ] && LOGLINE="${LOGLINE} SYNC=running FAULT=none-recorded NOTIFY=suppressed REASON=no-fault-recorded"
 logger -t anas-ahr -p "daemon.${PRIORITY}" "$LOGLINE"
 
-# An array that STARTS degraded because md is building its redundancy is not a
-# fault: journald has the record and there is nothing for the operator to act
-# on. A GENUINELY degraded start (missing or faulty member) falls straight
-# through to the notification below, exactly as before — that path is
-# load-bearing and untouched.
+# An array that STARTS degraded with a sync running and NO fault recorded gets
+# the journald record and no alert (issue #14 — a fresh 3-band pool must not fire
+# three DegradedArray alerts). The suppressed record says only what was observed,
+# never that nothing needs doing (issue #15). A GENUINELY degraded start (missing
+# or faulty member) falls straight through to the notification below, exactly as
+# before — that path is load-bearing and untouched.
 if [ -n "$BUILD_SHAPE" ]; then
   exit 0
 fi

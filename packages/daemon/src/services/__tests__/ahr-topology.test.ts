@@ -495,6 +495,12 @@ unused devices: <none>
       // `building` and the UI shows a neutral pill for what is really a
       // degraded rebuild. Asserted here so the limitation is visible and
       // locked rather than discovered later.
+      //
+      // Issue #15 is what the ADVISORY does about it: it can only report the
+      // observation ("syncing onto <disk> — no fault recorded"), never the old
+      // "building redundancy — no action needed", which was a confident verdict
+      // on the one question the kernel cannot answer — and the exactly wrong one
+      // for this shape.
       const pulled = [
         'Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] [linear] ',
         'md126 : active raid1 sde2[2] sdd2[1]',
@@ -509,6 +515,18 @@ unused devices: <none>
       ].join('\n')
       const pool = (await readAhrPools(healthyExecutor({ mdstat: pulled })))[0]
       assert.equal(pool.state, 'building', 'documents the limit — NOT an endorsement')
+
+      // The wording is what has to hold up in BOTH readings of this mdstat.
+      const r1 = pool.advisories.find(a => a.includes('ahr0-r1'))
+      assert.ok(r1, JSON.stringify(pool.advisories))
+      assert.match(r1!, /syncing onto sde — no fault recorded$/)
+      const r2 = pool.advisories.find(a => a.includes('ahr0-r2'))
+      assert.ok(r2, JSON.stringify(pool.advisories))
+      assert.match(r2!, /sync queued behind another band — no fault recorded$/)
+      for (const advisory of pool.advisories) {
+        assert.ok(!advisory.includes('no action needed'), `over-claims: ${advisory}`)
+        assert.ok(!advisory.includes('building redundancy'), `over-claims: ${advisory}`)
+      }
     })
   })
 
@@ -665,17 +683,32 @@ unused devices: <none>
       assert.ok(pool.arrays.every(a => a.members.every(m => m.memberState !== 'faulty')))
     })
 
-    it('the queued bands advise "no action needed", never "replace the failed disk"', async () => {
+    it('the queued bands advise what md is doing, never "replace the failed disk"', async () => {
       const pool = await pve5Pool()
       assert.ok(
         !pool.advisories.some(a => a.includes('replace the failed disk')),
-        'a pool minutes old must never be told to replace a disk',
+        'a pool with no fault recorded must never be told to replace a disk',
       )
       for (const band of [2, 3]) {
         assert.ok(
-          pool.advisories.some(a => a.includes(`chiaahr2-r${band}`) && a.includes('building redundancy (queued behind another band)') && a.includes('no action needed')),
-          `band ${band} must be described as queued, with no action asked of the operator`,
+          pool.advisories.some(a => a.includes(`chiaahr2-r${band}`) && a.includes('sync queued behind another band') && a.includes('no fault recorded')),
+          `band ${band} must be described as queued, stating only what is known`,
         )
+      }
+    })
+
+    // Issue #15: the advisory may state the OBSERVATION and nothing more. mdstat
+    // cannot tell a first build from a rebuild onto a spare whose dead disk was
+    // PULLED, so "building redundancy — no action needed" was a confident claim
+    // the system has no evidence for — and exactly wrong for the pulled case.
+    it('a syncing band states the observation — never "no action needed"', async () => {
+      const pool = await pve5Pool()
+      const running = pool.advisories.find(a => a.includes('chiaahr2-r1'))
+      assert.ok(running, JSON.stringify(pool.advisories))
+      assert.match(running!, /syncing onto sdd — no fault recorded$/)
+      for (const advisory of pool.advisories) {
+        assert.ok(!advisory.includes('no action needed'), `over-claims: ${advisory}`)
+        assert.ok(!advisory.includes('building redundancy'), `over-claims: ${advisory}`)
       }
     })
 

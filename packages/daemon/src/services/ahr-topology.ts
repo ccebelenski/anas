@@ -301,6 +301,38 @@ function isBuildingMembership(md: MdstatArray): boolean {
 }
 
 /**
+ * Index (into `md.members`) of the member md is syncing ONTO, when the array's
+ * shape identifies exactly one: the extra device beyond the raid slots — the
+ * unique highest `[n]` with `n >= raidDevices`, which is the spare a build or a
+ * rebuild is laying down (live ground truth: pve5's building bands are
+ * `sdd1[5] sdl1[3] sdb1[2] sdo1[1] sdc1[0]` on `[5/4]`).
+ *
+ * Returns null whenever that member cannot be picked out unambiguously — a tied
+ * maximum, no device beyond the slots, or an unknown slot count. The advisory
+ * then names no disk at all: mdstat is the only evidence here, and a WRONG disk
+ * id in an advisory is worse than no disk id (issue #15).
+ */
+function syncTargetIndex(md: MdstatArray): number | null {
+  const slots = md.raidDevices
+  if (slots === null)
+    return null
+  let best: number | null = null
+  let tied = false
+  md.members.forEach((m, i) => {
+    if (m.faulty || m.number < slots)
+      return
+    if (best === null || m.number > md.members[best].number) {
+      best = i
+      tied = false
+    }
+    else if (m.number === md.members[best].number) {
+      tied = true
+    }
+  })
+  return tied ? null : best
+}
+
+/**
  * One band array's state, fused from mdstat (GT-8/GT-9 aware):
  *  - inactive (all-spares) → 'degraded'; the pool advisory names the
  *    condition (the schema deliberately gains no extra state for it).
@@ -507,10 +539,28 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       }
       else if (state === 'recovering' && (entry.mdstat.syncDelayed || entry.mdstat.syncPending)) {
         // Queued behind another band's sync (issue #9). Slot counts look
-        // degraded and there is no progress line — say what it IS, and say that
-        // there is nothing to do. NEVER the replace-the-failed-disk line: the
-        // disks here are minutes old and nothing has failed.
-        advisories.push(`array ${poolName}-r${entry.band} is building redundancy (queued behind another band) — no action needed`)
+        // degraded and there is no progress line — say what it IS, and no more.
+        // NEVER the replace-the-failed-disk line: no fault is recorded here.
+        advisories.push(`array ${poolName}-r${entry.band}: sync queued behind another band — no fault recorded`)
+      }
+      else if (state === 'recovering' && isBuildingMembership(entry.mdstat)) {
+        // A sync is running with zero faulty members and every raid slot
+        // accounted for. THAT IS ALL THE SYSTEM KNOWS (issue #15): mdstat is
+        // byte-identical between a fresh array's first build and a rebuild onto
+        // a spare whose dead disk was PULLED rather than failed in place —
+        //   fresh build   md127 : active raid5 sdd1[3] sdc1[1] sdb1[0]  [3/2] [UU_]
+        //   pulled+spare  md127 : active raid5 sde1[4] sdd1[3] sdc1[1]  [3/2] [_UU]
+        // no (F) in either, and the superblock records no "has ever been
+        // optimal". So the advisory states the observation — which member is
+        // being synced onto, and that no fault is recorded — and makes NO claim
+        // about which of the two situations this is, and never that there is
+        // nothing to do. If a disk really was pulled, the operator's own
+        // knowledge (and the mdadm monitor notification fired at the moment of
+        // the pull) completes the picture; a confident "no action needed" would
+        // actively contradict it.
+        const target = syncTargetIndex(entry.mdstat)
+        const onto = target !== null ? ` onto ${members[target].disk}` : ''
+        advisories.push(`array ${poolName}-r${entry.band}: syncing${onto} — no fault recorded`)
       }
       else if (state === 'degraded') {
         advisories.push(`array ${poolName}-r${entry.band} is degraded — replace the failed disk before a second failure`)

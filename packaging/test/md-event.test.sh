@@ -138,8 +138,10 @@ check "rebuild wording kept"            grep -q 'reconstructed everything exactl
 # --- issue #14: DegradedArray discrimination ---------------------------------
 # mdadm BUILDS RAID5/6 degraded-plus-recovering, and fires DegradedArray for
 # any array that STARTS degraded — so a fresh 3-band pool sent the operator
-# three "DegradedArray" alerts seconds after pressing Create. The initial-build
-# shape must log and stay quiet; a REAL degraded start must notify as before.
+# three "DegradedArray" alerts seconds after pressing Create. A sync running with
+# no fault recorded must log and stay quiet; a REAL degraded start must notify as
+# before. The suppressed record states only what sysfs showed (issue #15) — it
+# must not claim an initial build, which this shape cannot prove.
 #
 # Fresh sysfs per case so raid_disks / dev-* / state are unambiguous.
 build_sysfs() { # build_sysfs <raid_disks> <sync_action> <member-spec...>
@@ -156,15 +158,16 @@ build_sysfs() { # build_sysfs <raid_disks> <sync_action> <member-spec...>
   done
 }
 
-echo "== 10. DegradedArray on a fresh RAID5 building its parity =="
+echo "== 10. DegradedArray on a RAID5 syncing with no fault recorded =="
 # The real create shape: 3 raid slots, 3 devices, none faulty, the last one a
-# spare being recovered into. Nothing has failed.
+# spare being recovered into. No fault is recorded — which is all sysfs shows.
 build_sysfs 3 recover sda1:in_sync sdb1:in_sync sdc1:spare
 run_hook DegradedArray /dev/md127
 check "exit 0"                          test "$?" -eq 0
 check "journald records the event"      grep -q 'EVENT=DegradedArray DEVICE=/dev/md127' "${TMP}/logger.log"
-check "marked as initial recovery"      grep -q 'BUILD=initial-recovery' "${TMP}/logger.log"
-check "says the notify was suppressed"  grep -q 'NOTIFY=suppressed REASON=expected-during-pool-creation' "${TMP}/logger.log"
+check "marked as a no-fault sync"       grep -q 'SYNC=running FAULT=none-recorded' "${TMP}/logger.log"
+check "says the notify was suppressed"  grep -q 'NOTIFY=suppressed REASON=no-fault-recorded' "${TMP}/logger.log"
+check "claims no initial build"         bash -c "! grep -qi 'initial\|pool-creation' '${TMP}/logger.log'"
 check "severity downgraded to info"     grep -q 'daemon.info' "${TMP}/logger.log"
 check "NO notification is sent"         bash -c "! test -s '${TMP}/perl.log'"
 
@@ -174,7 +177,7 @@ echo "== 11. a QUEUED band (sync_action still 'recover') is also quiet =="
 build_sysfs 4 recover sda1:in_sync sdb1:in_sync sdc1:in_sync sdd1:spare
 run_hook DegradedArray /dev/md127
 check "no notification for band 2..N"   bash -c "! test -s '${TMP}/perl.log'"
-check "still journald-logged"           grep -q 'BUILD=initial-recovery' "${TMP}/logger.log"
+check "still journald-logged"           grep -q 'SYNC=running FAULT=none-recorded' "${TMP}/logger.log"
 
 echo "== 12. a MISSING member still notifies (dead disk at boot) =="
 # Only 2 devices for 3 raid slots — a member is gone. This path is load-bearing.
@@ -182,13 +185,13 @@ build_sysfs 3 recover sda1:in_sync sdb1:in_sync
 run_hook DegradedArray /dev/md127
 check "notification IS sent"            grep -q ' warning md DegradedArray' "${TMP}/perl.log"
 check "severity stays warning"          grep -q 'daemon.warning' "${TMP}/logger.log"
-check "not marked initial-recovery"     bash -c "! grep -q 'BUILD=initial-recovery' '${TMP}/logger.log'"
+check "not marked a no-fault sync"      bash -c "! grep -q 'FAULT=none-recorded' '${TMP}/logger.log'"
 
 echo "== 13. a FAULTY member still notifies =="
 build_sysfs 3 recover sda1:in_sync sdb1:faulty sdc1:spare
 run_hook DegradedArray /dev/md127
 check "notification IS sent"            grep -q ' warning md DegradedArray' "${TMP}/perl.log"
-check "not marked initial-recovery"     bash -c "! grep -q 'BUILD=initial-recovery' '${TMP}/logger.log'"
+check "not marked a no-fault sync"      bash -c "! grep -q 'FAULT=none-recorded' '${TMP}/logger.log'"
 
 echo "== 14. an IDLE degraded array still notifies (nothing is rebuilding) =="
 # Slots full and nothing faulty, but no sync running: redundancy is NOT being
@@ -201,7 +204,7 @@ echo "== 15. unreadable sysfs still notifies (fail-safe direction) =="
 rm -rf "${SYS}/md127"
 run_hook DegradedArray /dev/md127
 check "notification IS sent"            grep -q ' warning md DegradedArray' "${TMP}/perl.log"
-check "not marked initial-recovery"     bash -c "! grep -q 'BUILD=initial-recovery' '${TMP}/logger.log'"
+check "not marked a no-fault sync"      bash -c "! grep -q 'FAULT=none-recorded' '${TMP}/logger.log'"
 
 echo "== 16. other events are untouched by the discriminator =="
 build_sysfs 3 recover sda1:in_sync sdb1:in_sync sdc1:spare
