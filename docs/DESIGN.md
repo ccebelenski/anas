@@ -504,6 +504,7 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `zpool.replace` | `zpool replace <name> <old-device> <new-device>` |
 | `zpool.import` | `zpool import [opts]` |
 | `zpool.export` | `zpool export <name>` |
+| `zpool.import-unit` | `systemctl enable\|disable zfs-import@<escaped-pool>.service` (boot-import; side effect of create/import/destroy) |
 | `disk.wipe` | `wipefs -a --force <device>` (optional cleanup after pool destroy) |
 | `zfs.list` | `zfs list -j -t all` (JSON — Principle 13, matches the pool parsers; ZFS 2.3+) |
 | `zfs.create` | `zfs create [opts] <dataset>` |
@@ -513,6 +514,8 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `zfs.snapshot` | `zfs snapshot <dataset>@<name>` |
 | `zfs.rollback` | `zfs rollback <snapshot>` |
 | `zfs.clone` | `zfs clone <snapshot> <target-dataset>` — Epic 5.7 |
+
+> **Boot import (issue #22):** `/etc/zfs/zpool.cache` alone is not a reliable boot import on PVE — a pool can simply be missing after a reboot. Creating or importing a pool therefore also enables its `zfs-import@<pool>.service`, and destroying one disables it, exactly as PVE does in `PVE/API2/Disks/ZFS.pm` (their fix for Proxmox bug #2554). The instance name is systemd-escaped in-process (no `systemd-escape` shell-out). It is a **side effect of the mutation**, not an API call, and best-effort: the pool operation has already succeeded, so a `systemctl` failure is reported as a job warning rather than failing the job.
 
 > **Associated shares (Epic 4.4):** a dataset's detail lists SMB/NFS shares serving its mountpoint by matching the mountpoint against `smb.conf` share paths and `/etc/exports` paths (read-only; reuses the share parsers). The same lookup feeds the destroy-confirmation warnings.
 

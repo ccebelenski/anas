@@ -18,6 +18,7 @@ import { isRootPool } from '../safety/root-pool.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
+import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
 import { resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -1041,7 +1042,12 @@ export async function poolRoutes(
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool create exited with code ${result.exitCode}`)
         }
-        return null
+        // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and
+        // issue #22: zpool.cache alone is not a reliable boot import, so enable
+        // the pool's own zfs-import@<pool>.service as a second, independent path.
+        // Best-effort — the pool exists, so a systemctl hiccup only warns.
+        const warning = await syncZfsImportUnit(executor, req.name, 'enable')
+        return warning ? { warnings: [warning] } : null
       },
     )
 
@@ -1086,11 +1092,31 @@ export async function poolRoutes(
       'zpool.import',
       { ...identity, params: { target, force: req.force ?? false } },
       async () => {
+        // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and
+        // issue #22: an imported pool needs its zfs-import@<pool>.service enabled
+        // too — zpool.cache alone is not a reliable boot import. The request may
+        // target a name OR a guid, and a guid import never tells us the name, so
+        // the newly imported pool(s) are the DIFF of the pool list across the
+        // import (falling back to the requested name if the diff comes up empty).
+        const before = await listPoolNames()
+
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
           throw new Error(result.stderr.trim() || `zpool import exited with code ${result.exitCode}`)
         }
-        return null
+
+        const after = await listPoolNames()
+        const imported = after.filter(name => !before.includes(name))
+        const pools = imported.length > 0 ? imported : (req.name ? [req.name] : [])
+
+        // Best-effort — the pool is imported, so a systemctl hiccup only warns.
+        const warnings: string[] = []
+        for (const pool of pools) {
+          const warning = await syncZfsImportUnit(executor, pool, 'enable')
+          if (warning)
+            warnings.push(warning)
+        }
+        return warnings.length > 0 ? { warnings } : null
       },
     )
 
@@ -1098,10 +1124,15 @@ export async function poolRoutes(
     return { job }
   })
 
-  async function poolExists(poolName: string): Promise<boolean> {
+  /** Names of the currently imported pools ([] when the listing fails). */
+  async function listPoolNames(): Promise<string[]> {
     const listResult = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
     const pools = listResult.exitCode === 0 ? parseZpoolList(listResult.stdout) : []
-    return pools.some(p => p.name === poolName)
+    return pools.map(p => p.name)
+  }
+
+  async function poolExists(poolName: string): Promise<boolean> {
+    return (await listPoolNames()).includes(poolName)
   }
 
   // Add a vdev to an existing pool (stories 3.11, 3.21, 3.22). Expands the pool
@@ -1498,8 +1529,16 @@ export async function poolRoutes(
           throw new Error(await enrichBusyError(executor, base))
         }
 
+        // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and
+        // issue #22: the create/import path enables zfs-import@<pool>.service, so
+        // destroy disables it — otherwise the unit outlives the pool and fails at
+        // every boot. The root pool can never get here (blocked above), so this
+        // never touches rpool's unit. Best-effort: the pool is already gone.
+        const unitWarning = await syncZfsImportUnit(executor, poolName, 'disable')
+        const unitWarnings = unitWarning ? [unitWarning] : []
+
         if (!(cleanup && leaves.length > 0))
-          return { destroyed: poolName }
+          return { destroyed: poolName, ...(unitWarning ? { warnings: unitWarnings } : {}) }
 
         // Opt-in disk hygiene ("Clean Up Disks"). All best-effort: the pool is
         // already destroyed, so nothing here may fail the job — every failure is
@@ -1559,7 +1598,10 @@ export async function poolRoutes(
           wipedFailed?: string[]
           zapped?: string[]
           preserved?: { disk: string, reason: 'shared' | 'uncertain' }[]
+          warnings?: string[]
         } = { destroyed: poolName }
+        if (unitWarnings.length > 0)
+          cleanupResult.warnings = unitWarnings
         if (wiped.length > 0)
           cleanupResult.wiped = wiped
         if (wipedFailed.length > 0)
