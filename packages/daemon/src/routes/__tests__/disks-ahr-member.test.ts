@@ -20,8 +20,9 @@ import { collectDisks } from '../disks.js'
  * 'other' as they did when the disks endpoint only knew ZFS membership. The AHR
  * membership is sourced from readAhrPools (single source), so this reuses the
  * stage-0 `ahr0` AHR fixtures verbatim and layers on a flat disks-view world
- * that ALSO carries a ZFS pool member and a genuinely-free disk, proving the
- * three classifications coexist.
+ * that ALSO carries a ZFS pool member, a Ceph OSD (issue #29) and a
+ * genuinely-free disk, proving the classifications coexist and that the AHR
+ * enrichment claims only its own disks.
  *
  * The `ahr0` pool (from the fixtures): sdb slices band 1 only, sdc bands 1–2,
  * sdd bands 1–3 (band 3 is a labeled-but-not-yet-arrayed slice).
@@ -75,6 +76,21 @@ const FLAT_LSBLK = JSON.stringify({
     flatDisk('sde', 'ZFS_MEMBER', [flatPart('sde1', 'zfs_member')]),
     // A genuinely blank disk — must stay 'available'.
     flatDisk('sdf', 'BLANK', []),
+    // A Ceph OSD (issue #29) — the AHR enrichment must not stomp it.
+    flatDisk('sdg', 'CEPH_OSD', [{
+      name: 'sdg1',
+      type: 'part',
+      size: 1072676352,
+      fstype: 'LVM2_member',
+      mountpoint: null,
+      children: [{
+        name: 'ceph--aaaaaaaa--1111--2222--3333--444444444444-osd--block--bbbbbbbb--5555--6666--7777--888888888888',
+        type: 'lvm',
+        size: 1072676352,
+        fstype: 'ceph_bluestore',
+        mountpoint: null,
+      }],
+    }]),
   ],
 })
 
@@ -187,6 +203,13 @@ describe('collectDisks — AHR members classify as ahr_member (issue #3)', () =>
     assert.equal(sdf.status, 'available')
     assert.equal(sdf.poolName, null)
     assert.equal(sdf.ahrArray, null)
+  })
+
+  it('a Ceph OSD stays ceph_osd through the AHR enrichment (issue #29)', async () => {
+    const sdg = (await collect()).get('sdg')!
+    assert.equal(sdg.status, 'ceph_osd')
+    assert.equal(sdg.poolName, null)
+    assert.equal(sdg.ahrArray, null)
   })
 
   it('fail-soft: an AHR read error leaves members as their pre-AHR status', async () => {

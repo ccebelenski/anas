@@ -121,3 +121,60 @@ describe('parseLsblk', () => {
     }
   })
 })
+
+/**
+ * Issue #29: a Ceph OSD disk is IN USE and must classify 'ceph_osd', not fall
+ * through to 'other' (which reads as leftover partitions). The fixture is the
+ * live shape from a converged PVE/Ceph node — LVM2_member disk, Ceph LV
+ * beneath — with the four cases the two-signal detection has to separate.
+ */
+describe('parseLsblk — Ceph OSD disks (issue #29)', () => {
+  function cephDisks() {
+    const disks = parseLsblk(loadJson('lsblk-ceph.json'), new Map())
+    return new Map(disks.map(d => [d.name, d]))
+  }
+
+  it('a whole-disk OSD (ceph_bluestore LV) reads ceph_osd', () => {
+    const nvme0 = cephDisks().get('nvme0n1')!
+    assert.ok(nvme0)
+    assert.equal(nvme0.status, 'ceph_osd')
+    // Ceph names no pool ANAS can see — the ZFS/AHR fields stay null.
+    assert.equal(nvme0.poolName, null)
+    assert.equal(nvme0.ahrArray, null)
+  })
+
+  it('a ceph-- LV with no bluestore label (DB/WAL device) still reads ceph_osd', () => {
+    const nvme1 = cephDisks().get('nvme1n1')!
+    assert.equal(nvme1.status, 'ceph_osd')
+  })
+
+  it('an OSD on a partition reads ceph_osd (the walk nests part → lvm)', () => {
+    const sdb = cephDisks().get('sdb')!
+    assert.equal(sdb.status, 'ceph_osd')
+  })
+
+  it('a plain LVM2_member disk with a non-ceph VG stays other', () => {
+    const sdc = cephDisks().get('sdc')!
+    assert.equal(sdc.status, 'other')
+  })
+
+  it('a system disk carrying a Ceph LV is still system (system wins)', () => {
+    const sda = cephDisks().get('sda')!
+    assert.equal(sda.status, 'system')
+  })
+
+  it('a ZFS pool claim outranks the Ceph signal', () => {
+    // Impossible in practice, but the ladder must be deterministic: a live pool
+    // membership is authoritative over an on-disk Ceph signature.
+    const disks = parseLsblk(loadJson('lsblk-ceph.json'), new Map(), new Map([['nvme0n1', 'tank']]))
+    const nvme0 = disks.find(d => d.name === 'nvme0n1')!
+    assert.equal(nvme0.status, 'pool_member')
+    assert.equal(nvme0.poolName, 'tank')
+  })
+
+  it('a node with no Ceph is unaffected — zero matches', () => {
+    const byIdMap = parseDiskByIdListing(loadText('disk-by-id.txt'))
+    const disks = parseLsblk(loadJson('lsblk.json'), byIdMap)
+    assert.equal(disks.filter(d => d.status === 'ceph_osd').length, 0)
+  })
+})

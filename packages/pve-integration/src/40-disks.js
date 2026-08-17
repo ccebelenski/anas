@@ -20,7 +20,9 @@
  * from each disk's pool → vdev association, so a large fleet stays scannable.
  * ZFS pool members group under "<pool> / <vdev>"; AHR (ANAS Hybrid RAID)
  * members group under "<pool> / <array>" (issue #3 — the same grouping shape,
- * a visible/honest divergence since AHR is not ZFS); disks in no pool group by
+ * a visible/honest divergence since AHR is not ZFS); Ceph OSD disks group under
+ * "Ceph" (issue #29 — Ceph names no pool ANAS can see, so the heading is the
+ * technology); disks in no pool group by
  * their usage status — "Available" (genuinely blank), "System" (boot/OS), or
  * "Other" (in use / partitioned) — so a boot disk never shows under an
  * Available heading. This is pure ExtJS grid grouping (a
@@ -119,6 +121,11 @@
                     return t('Available');
                 case 'system':
                     return t('System');
+                // Ceph OSDs group under the technology: the OSD's cluster and
+                // id are not in the disks payload, so there is no "<pool> /
+                // <member>" pair to render honestly.
+                case 'ceph_osd':
+                    return t('Ceph');
                 default:
                     return t('Other');
             }
@@ -274,7 +281,7 @@
     }
 
     // Usage in ZFS terms: for a pool member, "pool / vdev / role"; otherwise the
-    // plain usage status (available / system / other).
+    // plain usage status (available / system / Ceph OSD / other).
     function renderUsage(v, meta, rec) {
         var d = rec.data;
         if (d.status === 'pool_member') {
@@ -303,6 +310,8 @@
                 return t('Available');
             case 'system':
                 return t('System');
+            case 'ceph_osd':
+                return t('Ceph OSD');
             case 'other':
             default:
                 if (d.partitions && d.partitions.length) {

@@ -13,6 +13,11 @@ export const DiskUsageStatus = z.enum([
   // divergence). Like `pool_member`, it means the disk is IN USE — never
   // offered as available.
   'ahr_member',
+  // Ceph OSD member — the disk backs a Ceph OSD (bluestore block, or a
+  // dedicated DB/WAL device). Distinct from `pool_member` because it is NOT
+  // ZFS (different tech, visible divergence). Like the other membership
+  // values it means the disk is IN USE — never offered as available.
+  'ceph_osd',
   'system',
   'other',
 ])

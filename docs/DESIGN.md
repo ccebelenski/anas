@@ -248,6 +248,8 @@ The edit (`PUT`) flow is **validate-then-commit and verify-delivered** (issues #
 | `GET` | `/v1/disks/:id` | Disk detail (id = by-id identifier) | `200` |
 | `GET` | `/v1/disks/:id/smart` | SMART health data | `200` |
 
+> **Usage classification:** a disk's `status` names who owns it — `system`, `pool_member` (ZFS), `ahr_member` (issue #3), `ceph_osd` (issue #29), `available` (genuinely blank), `other`. Every membership value means IN USE; only `available` is ever offered for pool/array composition. Ceph OSDs are read structurally out of the lsblk tree ANAS already fetches — an LVM descendant whose fstype is `ceph_bluestore`, or whose LV sits under the `ceph--` VG naming convention (which also catches dedicated DB/WAL devices carrying no bluestore label) — so the classification needs no ceph tooling and costs nothing on a node without Ceph.
+
 #### Backup — PBS file backup (Epic 16; designed 2026-07-18)
 
 Mirrors the replication API shape. Repositories live in the cluster-wide CAS-versioned registry (`/etc/pve/anas/backup-repos.json`, pmxcfs) with per-repo secrets in `/etc/anas/creds/` (0600, write-only via API — token secret or password, user's choice). Tasks ARE systemd units (`anas-backup-<name>.service`/`.timer`) — no second config source. **Status is local-only** (persistent systemd state + journald + jobs): the only PBS-server contacts are backup runs and the explicit user-initiated repository test.

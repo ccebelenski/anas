@@ -14,6 +14,8 @@ interface LsblkPartRaw {
   size: number
   fstype: string | null
   mountpoint: string | null
+  /** lsblk nests descendants: a disk's partition can itself host an LVM node. */
+  children?: LsblkPartRaw[]
 }
 
 interface LsblkDeviceRaw {
@@ -73,6 +75,11 @@ export function parseLsblk(
         status = 'system'
       else if (poolName)
         status = 'pool_member'
+      else if (hasCephOsd(dev.children))
+        // A Ceph OSD owns the disk as surely as a ZFS pool does. It reports as
+        // its own status rather than falling through to 'other', which reads
+        // as "leftover partitions" and hides the claim.
+        status = 'ceph_osd'
       else if (hasAnySignature(dev, partitions))
         // Any partition (including a leftover zfs_member label) or a whole-disk
         // filesystem means the disk is NOT empty. Such disks are never offered
@@ -137,6 +144,27 @@ function isSystemDisk(dev: LsblkDeviceRaw, partitions: DiskPartition[]): boolean
   }
   if (dev.mountpoint === '/')
     return true
+  return false
+}
+
+/**
+ * True if any descendant of the disk is an LVM node belonging to a Ceph OSD.
+ * Read from the lsblk tree alone — no ceph tooling, which exists only on Ceph
+ * nodes. Either signal suffices:
+ *  - fstype `ceph_bluestore` — util-linux detects the bluestore superblock;
+ *  - an LV under the `ceph--<vg-uuid>` VG naming convention — this also covers
+ *    dedicated DB/WAL LVs (`…-osd--db--…`, `…-osd--wal--…`), which carry no
+ *    bluestore label.
+ * Descendants nest (disk → part → lvm), so the walk is recursive: an OSD built
+ * on a partition classifies the same as one built on the whole disk.
+ */
+function hasCephOsd(children: LsblkPartRaw[] | undefined): boolean {
+  for (const child of children ?? []) {
+    if (child.type === 'lvm' && (child.fstype === 'ceph_bluestore' || child.name.startsWith('ceph--')))
+      return true
+    if (hasCephOsd(child.children))
+      return true
+  }
   return false
 }
 
