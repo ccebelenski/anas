@@ -263,12 +263,14 @@ Mirrors the replication API shape. Repositories live in the cluster-wide CAS-ver
 | `POST` | `/v1/backup/repos/test` | User-initiated diagnosis: dns / tcp / tls-fingerprint / auth / datastore / namespace verdicts | `200` |
 | `GET` | `/v1/backup/tasks` | Task grid: schedule, enabled, last result, next run, overdue (systemd state) | `200` |
 | `GET` | `/v1/backup/tasks/:name` | Detail: full config, unit/timer as written, recent journald runs (labeled recent-only) | `200` |
-| `POST` | `/v1/backup/tasks` | Create task (repo ref + namespace + backup-id + archives[{name,path,excludes[]}] + mode + schedule) | `202` with job |
+| `POST` | `/v1/backup/tasks` | Create task (repo ref + namespace + backup-id + archives[{name,path,excludes[]}] + mode + schedule *or* cadence) | `202` with job |
 | `PUT` | `/v1/backup/tasks/:name` | Update / enable / disable | `202` with job |
 | `DELETE` | `/v1/backup/tasks/:name` | Remove task (units removed; PBS data untouched) | `202`/`409` |
 | `POST` | `/v1/backup/tasks/:name/run` | Run now (job with progress from client output) | `202` with job |
 
 The fd cap (default 1024, per-task override) binds pbc via `prlimit --nofile=N:N` around the daemon's exec — pbc hoards file handles, worst in metadata change-detection mode; the unit's `LimitNOFILE=` only bounds the thin helper (pbc runs inside anasd, not the unit cgroup — live-proof finding). Dashboard warning category `backup`: failures and silently-overdue only.
+
+**Task cadence (16.10).** A task may carry a structured `cadence` alongside its `schedule`: `{ kind: weekly|biweekly|monthly|custom, days[] (Mon..Sun), time (HH:MM), parity? (even|odd) }`. When present the daemon **generates** `OnCalendar=` from it (the cadence is authoritative, and the generated expression is validated with `systemd-analyze calendar` like any other); when absent the raw `schedule` stands — which is what every pre-16.10 task carries, so nothing migrates. Weekly/monthly/custom are pure OnCalendar with `Persistent=true` as their missed-run heal; **biweekly** is the one case systemd's calendar cannot express, so it runs on a WEEKLY timer and the daemon gates each SCHEDULED fire on ISO-week parity (`date +%V` semantics, parity explicit config — never derived). An off-week fire completes as a first-class **skipped** run (the runner's `SuccessExitStatus=75`: systemd records success, `ExecMainStatus` says no backup was taken); a Run Now is never gated; and an off-week fire runs anyway when the last successful run is older than one full period (the heal — at most one shortened interval, the phase never flips). Overdue is measured against the cadence's own period, so a healthy off-week skip never reads as overdue.
 
 
 #### Filesystem browse (read-only UI support; designed 2026-07-20)

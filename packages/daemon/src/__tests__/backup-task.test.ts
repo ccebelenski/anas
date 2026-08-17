@@ -1,7 +1,8 @@
 import type { Requester, RunnerResponse } from '../backup-task.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { parseRunnerArgs, runBackupTask } from '../backup-task.js'
+import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK } from '@anas/shared'
+import { exitCodeForResult, parseRunnerArgs, runBackupTask } from '../backup-task.js'
 
 describe('backup-task runner (Epic 16 — timer entrypoint)', () => {
   describe('parseRunnerArgs', () => {
@@ -63,6 +64,15 @@ describe('backup-task runner (Epic 16 — timer entrypoint)', () => {
   it('throws when the submit is not 202', async () => {
     const requester: Requester = async () => ({ statusCode: 404, body: { error: { code: 'NOT_FOUND', message: 'task gone' } } })
     await assert.rejects(runBackupTask(requester, 'x', { sleep: noSleep }), /submit failed \(HTTP 404\): task gone/)
+  })
+
+  it('a deliberate off-week skip exits with the declared skip status, not 0 (16.10)', () => {
+    // The unit declares SuccessExitStatus=<code>, so systemd still calls the run a
+    // success — the code is what tells the status derivation nothing was backed up.
+    assert.equal(exitCodeForResult({ status: BACKUP_SKIPPED_OFF_WEEK }), BACKUP_SKIP_EXIT_CODE)
+    assert.equal(exitCodeForResult({ status: 'success' }), 0)
+    assert.equal(exitCodeForResult({ status: 'skipped' }), 0) // the benign too-soon collision
+    assert.equal(exitCodeForResult(undefined), 0)
   })
 
   it('encodes the task name in the run URL', async () => {

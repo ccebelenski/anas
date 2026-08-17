@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+import { isoWeekParity } from '../../services/backup-cadence.js'
 
 /** A real `pbs` stanza (ground truth 16.8) — a password-auth PVE-defined repo. */
 const PVE_STORAGE_CFG = [
@@ -362,6 +363,186 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
+    assert.equal((job.result as { status: string }).status, 'success')
+  })
+
+  // ==========================================================================
+  //  Cadence (16.10) — structured schedules end to end
+  // ==========================================================================
+
+  /** Make the daemon see this run as a TIMER fire (see classifyTrigger). */
+  function scheduleTrigger(name: string, when: Date): void {
+    const stamp = when.toUTCString()
+    const mock = mockOf(server)
+    mock.addFixture({ command: '/usr/bin/systemctl', args: ['show', `anas-backup-${name}.timer`, '-p', 'LastTriggerUSec'], result: { stdout: `LastTriggerUSec=${stamp}\n`, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/systemctl', args: ['show', `anas-backup-${name}.service`, '-p', 'InactiveExitTimestamp'], result: { stdout: `InactiveExitTimestamp=${stamp}\n`, stderr: '', exitCode: 0 } })
+  }
+
+  /** The ISO week this test process is in — used to pick an on/off week fire. */
+  function weekParity(d: Date): 'even' | 'odd' {
+    return isoWeekParity(d)
+  }
+
+  const CADENCE_TASK = {
+    name: 'pictures',
+    repository: 'pbs-main',
+    backupId: 'pictures',
+    archives: [{ name: 'pictures', path: '/srv/pictures', excludes: [] }],
+    changeDetectionMode: 'default',
+    enabled: true,
+  }
+
+  it('POST /backup/tasks with a cadence GENERATES the OnCalendar and validates it with systemd', async () => {
+    await createRepo()
+    const mock = mockOf(server)
+    mock.calls.length = 0
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks',
+      headers: JSON_HEADERS,
+      // No `schedule` at all: the UI sends the cadence and the daemon derives the
+      // expression — the generator lives in exactly one place.
+      payload: { ...CADENCE_TASK, cadence: { kind: 'weekly', days: ['Thu', 'Tue'], time: '02:00' } },
+    })
+    assert.equal(res.statusCode, 202)
+    assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
+    // systemd is the authority on the GENERATED expression too, not just typed ones.
+    assert.ok(mock.calls.some(c => c.command === '/usr/bin/systemd-analyze'
+      && c.args[0] === 'calendar' && c.args[1] === 'Tue,Thu 02:00'))
+
+    const detail = await server.inject({ method: 'GET', url: '/v1/backup/tasks/pictures', headers: IDENTITY })
+    const { data } = detail.json() as { data: BackupTaskDetail }
+    assert.equal(data.task.schedule, 'Tue,Thu 02:00')
+    assert.deepEqual(data.task.cadence, { kind: 'weekly', days: ['Tue', 'Thu'], time: '02:00' })
+    assert.match(data.timer, /OnCalendar=Tue,Thu 02:00/)
+    assert.match(data.unit, /SuccessExitStatus=75/)
+  })
+
+  it('an invalid cadence is a 400 before anything is written', async () => {
+    await createRepo()
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks',
+      headers: JSON_HEADERS,
+      // biweekly without an explicit parity — the phase is never guessed.
+      payload: { ...CADENCE_TASK, cadence: { kind: 'biweekly', days: ['Tue'], time: '02:00' } },
+    })
+    assert.equal(res.statusCode, 400)
+  })
+
+  it('a biweekly OFF-WEEK scheduled fire completes as a visible skip — no pbc, no failure', async () => {
+    await createRepo()
+    const now = new Date()
+    // Configure the phase we are NOT in, so this fire is deliberately an off week.
+    const parity = weekParity(now) === 'even' ? 'odd' : 'even'
+    const create = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks',
+      headers: JSON_HEADERS,
+      payload: { ...CADENCE_TASK, cadence: { kind: 'biweekly', days: ['Tue'], time: '02:00', parity } },
+    })
+    assert.equal((await waitForJob(server, await jobIdFrom(create))).status, 'completed')
+
+    scheduleTrigger('pictures', now)
+    // A successful run 7 days ago: within one period, so the heal must NOT fire.
+    const mock = mockOf(server)
+    const lastSuccess = new Date(now.getTime() - 7 * 24 * 3600_000).toISOString().replace('.000Z', '+0000')
+    mock.addFixture({
+      command: '/usr/bin/journalctl',
+      args: ['-u', 'anas-backup-pictures.service', '-n', '200', '-o', 'short-iso', '--no-pager'],
+      result: { stdout: `${lastSuccess} pve anas-backup-pictures[900]: {"task":"pictures","result":{"status":"success","archives":[]}}`, stderr: '', exitCode: 0 },
+    })
+    mock.calls.length = 0
+
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    // A skip is a COMPLETED job with its own status — not a failure, and not a
+    // success that pretends a backup happened.
+    assert.equal(job.status, 'completed')
+    const result = job.result as { status: string, reason: string }
+    assert.equal(result.status, 'skipped-off-week')
+    assert.match(result.reason, /off week/)
+    assert.equal(mock.calls.some(c => c.command === '/usr/bin/prlimit'), false) // pbc never ran
+  })
+
+  it('an ON-WEEK scheduled fire of the same task backs up normally', async () => {
+    await createRepo()
+    const now = new Date()
+    const parity = weekParity(now)
+    const create = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks',
+      headers: JSON_HEADERS,
+      payload: { ...CADENCE_TASK, cadence: { kind: 'biweekly', days: ['Tue'], time: '02:00', parity } },
+    })
+    assert.equal((await waitForJob(server, await jobIdFrom(create))).status, 'completed')
+    scheduleTrigger('pictures', now)
+
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    assert.equal((job.result as { status: string }).status, 'success')
+  })
+
+  it('Run Now bypasses the gate: an off-week task started by hand still backs up', async () => {
+    await createRepo()
+    const now = new Date()
+    const parity = weekParity(now) === 'even' ? 'odd' : 'even'
+    const create = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks',
+      headers: JSON_HEADERS,
+      payload: { ...CADENCE_TASK, cadence: { kind: 'biweekly', days: ['Tue'], time: '02:00', parity } },
+    })
+    assert.equal((await waitForJob(server, await jobIdFrom(create))).status, 'completed')
+    // The timer last fired 8 hours ago; THIS run started now → started by hand.
+    scheduleTrigger('pictures', new Date(now.getTime() - 8 * 3600_000))
+
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    assert.equal((job.result as { status: string }).status, 'success')
+  })
+
+  it('a heal runs an off-week fire when a full period passed with no success', async () => {
+    await createRepo()
+    const now = new Date()
+    const parity = weekParity(now) === 'even' ? 'odd' : 'even'
+    const create = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks',
+      headers: JSON_HEADERS,
+      payload: { ...CADENCE_TASK, cadence: { kind: 'biweekly', days: ['Tue'], time: '02:00', parity } },
+    })
+    assert.equal((await waitForJob(server, await jobIdFrom(create))).status, 'completed')
+    scheduleTrigger('pictures', now)
+    // Last success 15 days ago — an on-week fire was missed or failed.
+    const mock = mockOf(server)
+    const lastSuccess = new Date(now.getTime() - 15 * 24 * 3600_000).toISOString().replace('.000Z', '+0000')
+    mock.addFixture({
+      command: '/usr/bin/journalctl',
+      args: ['-u', 'anas-backup-pictures.service', '-n', '200', '-o', 'short-iso', '--no-pager'],
+      result: { stdout: `${lastSuccess} pve anas-backup-pictures[900]: {"task":"pictures","result":{"status":"success","archives":[]}}`, stderr: '', exitCode: 0 },
+    })
+
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/pictures/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    assert.equal((job.result as { status: string }).status, 'success')
+  })
+
+  it('a pre-16.10 raw-schedule task is untouched end to end', async () => {
+    await createRepo()
+    await createTask() // TASK carries `schedule` and no cadence
+    const detail = await server.inject({ method: 'GET', url: '/v1/backup/tasks/nightly-etc', headers: IDENTITY })
+    const { data } = detail.json() as { data: BackupTaskDetail }
+    assert.equal(data.task.schedule, '*-*-* 02:00:00')
+    assert.equal(data.task.cadence, undefined)
+    assert.match(data.timer, /OnCalendar=\*-\*-\* 02:00:00/)
+    // Its scheduled fire is never gated — no cadence, nothing to gate.
+    scheduleTrigger('nightly-etc', new Date())
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal((job.result as { status: string }).status, 'success')
   })
 })

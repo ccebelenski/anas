@@ -1,8 +1,11 @@
 import type { BackupRunResult, BackupTask, DashboardWarning } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { BackupTrigger, CadenceGateDecision } from './backup-cadence.js'
 import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { BackupTask as BackupTaskSchema } from '@anas/shared'
+import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, BackupTask as BackupTaskSchema, cadenceToOnCalendar } from '@anas/shared'
+import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
+import { deriveRunResult as deriveSystemdRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
 
 /**
  * Backup TASKS (Epic 16.3) — the systemd units ARE the store, exactly the
@@ -38,10 +41,14 @@ const TASK_MARKER = 'X-ANAS-Task='
 const TASK_MARKER_RE = /^#?\s*X-ANAS-Task=(.*)$/
 /** How many recent journald lines the detail view surfaces. */
 const JOURNAL_TAIL = 200
-/** systemd 'n/a' sentinel + a leading weekday name on a human timestamp. */
-const NA_RE = /^n\/a$/i
-const INFINITY_RE = /infinity/i
-const WEEKDAY_PREFIX_RE = /^[A-Z][a-z]{2}\s+/
+/**
+ * Slack when deciding whether a timer (rather than a hand) started this run.
+ * systemd prints these timestamps at 1-second resolution, and the trigger always
+ * precedes the start; 5s covers the granularity without spanning anything real.
+ */
+const TRIGGER_SLACK_MS = 5000
+/** journalctl `short-iso` numeric zone (`+0000`) → the ISO form Date.parse wants. */
+const JOURNAL_TZ_RE = /([+-]\d{2})(\d{2})$/
 
 /** Default systemd unit directory; overridable (env/dep) for tests. */
 export const DEFAULT_SYSTEMD_DIR = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
@@ -67,6 +74,12 @@ export function runnerArgs(task: BackupTask): string[] {
  * task JSON (single line) — the ONLY thing the parser reads back. ExecStart is
  * for systemd to actually run; it is never parsed by us. `LimitNOFILE=` is the
  * per-task fd backpressure knob (default 1024).
+ *
+ * `SuccessExitStatus=` declares the runner's deliberate-skip code (16.10): a
+ * biweekly off-week fire did nothing ON PURPOSE, so systemd must record success
+ * (no dashboard warning, no failed unit) while `ExecMainStatus` still tells the
+ * status derivation that no backup was taken. Emitted for every task so the unit
+ * shape stays uniform — pbc itself only ever exits 0 or 255.
  */
 export function renderServiceUnit(task: BackupTask): string {
   const execStart = [RUNNER_NODE, RUNNER_SCRIPT, ...runnerArgs(task)].join(' ')
@@ -79,9 +92,23 @@ export function renderServiceUnit(task: BackupTask): string {
     'Type=oneshot',
     '# per-task file-handle backpressure (pbc hoards fds, worst in metadata mode)',
     `LimitNOFILE=${task.limitNofile}`,
+    '# a deliberate skip (biweekly off week) is a success, not a failure',
+    `SuccessExitStatus=${BACKUP_SKIP_EXIT_CODE}`,
     `ExecStart=${execStart}`,
     '',
   ].join('\n')
+}
+
+/**
+ * The OnCalendar expression a task's timer actually gets. A structured cadence
+ * GENERATES it (the cadence is authoritative — a hand-edited unit can never make
+ * the timer disagree with the cadence it claims); a raw-schedule task keeps the
+ * expression it was given verbatim. Note a BIWEEKLY cadence generates a WEEKLY
+ * expression on purpose: systemd fires every week and the parity gate skips the
+ * off ones (see backup-cadence.ts).
+ */
+export function effectiveSchedule(task: BackupTask): string {
+  return (task.cadence ? cadenceToOnCalendar(task.cadence) : null) ?? task.schedule
 }
 
 /** Render the `.timer` unit for a task's schedule. */
@@ -91,7 +118,7 @@ export function renderTimerUnit(task: BackupTask): string {
     `Description=ANAS backup timer ${task.name}`,
     '',
     '[Timer]',
-    `OnCalendar=${task.schedule}`,
+    `OnCalendar=${effectiveSchedule(task)}`,
     'Persistent=true',
     '',
     '[Install]',
@@ -258,55 +285,28 @@ async function runSystemctl(executor: CommandExecutor, args: string[]): Promise<
 }
 
 // --- Status derivation ------------------------------------------------------
+//
+// The `systemctl show` parsing, systemd's timestamp forms, and the base
+// ActiveState/Result → run-result map are the SHARED helpers in
+// systemd-status.ts (one implementation across replication / backup / snapshot
+// schedules). Re-exported here so this module stays the one import a backup
+// caller needs.
 
-/** Parse `systemctl show` `key=value` lines into a map. */
-function parseShow(stdout: string): Record<string, string> {
-  const props: Record<string, string> = {}
-  for (const line of stdout.split('\n')) {
-    const eq = line.indexOf('=')
-    if (eq > 0)
-      props[line.slice(0, eq)] = line.slice(eq + 1)
-  }
-  return props
-}
+export { parseSystemdTimestamp }
 
 /**
- * Parse a systemd timestamp property to ISO, or null. On PVE 9 / systemd these
- * print a HUMAN date string ("Sun 2026-07-19 02:00:00 UTC"), NOT microseconds
- * (verified live) — handle both the µs form and the day-name-prefixed date.
- */
-export function parseSystemdTimestamp(raw: string | undefined): string | null {
-  if (!raw || raw === '0' || NA_RE.test(raw) || INFINITY_RE.test(raw))
-    return null
-  const usec = Number(raw)
-  if (Number.isFinite(usec) && usec > 0) {
-    const d = new Date(Math.floor(usec / 1000))
-    return Number.isNaN(d.getTime()) ? null : d.toISOString()
-  }
-  // Strip a leading weekday name ("Sun ") — Date.parse dislikes it combined with
-  // the "UTC" suffix on some engines; the rest parses cleanly.
-  const cleaned = raw.replace(WEEKDAY_PREFIX_RE, '')
-  const parsed = Date.parse(cleaned)
-  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString()
-}
-
-/**
- * Map a service's systemd state to a run result. A oneshot is 'activating' (or
- * 'active') while running; after it exits, Result carries the outcome and
- * ActiveState becomes 'failed' on failure.
+ * Map a service's systemd state to a backup run result — the shared oneshot map
+ * plus the one thing that is backup-specific: a run that exited with the
+ * runner's deliberate-skip code. The unit declares that code as
+ * `SuccessExitStatus=`, so systemd reports success (correctly — nothing went
+ * wrong) and `ExecMainStatus` is what distinguishes "skipped on purpose" from
+ * "backed up". No journal read, no second state source.
  */
 export function deriveRunResult(props: Record<string, string>): BackupRunResult {
-  const active = props.ActiveState
-  if (active === 'activating' || active === 'active' || active === 'reloading')
-    return 'running'
-  if (active === 'failed')
-    return 'failure'
-  const result = props.Result
-  if (result === 'success')
-    return 'success'
-  if (result && result.length > 0)
-    return 'failure'
-  return 'unknown'
+  const base = deriveSystemdRunResult(props)
+  if (base === 'success' && props.ExecMainStatus === String(BACKUP_SKIP_EXIT_CODE))
+    return 'skipped'
+  return base
 }
 
 export interface BackupTaskStatus {
@@ -314,17 +314,29 @@ export interface BackupTaskStatus {
   lastRunAt: string | null
   nextRunAt: string | null
   overdue: boolean
+  /**
+   * When the task last completed a real backup (ISO), or null when there is no
+   * record. Cheap when the last run itself succeeded; otherwise read from the
+   * journal, and only for a cadence whose period makes staleness meaningful.
+   */
+  lastSuccessAt: string | null
 }
 
 /**
  * Derive one task's LOCAL-ONLY status from persistent systemd state: the
- * service's last result + last-run time, and the timer's next elapse. Overdue =
- * enabled AND the next elapse is in the past (a Persistent timer that never
- * caught up). Fail-open to unknown/nulls per source.
+ * service's last result + last-run time, and the timer's next elapse. Fail-open
+ * to unknown/nulls per source.
+ *
+ * Overdue is CADENCE-AWARE (16.10): the timer-never-caught-up rule still applies
+ * to every task, and a task with a structured cadence is additionally overdue
+ * once a full period has passed with no successful run — measured against the
+ * cadence's own period, so a biweekly off-week skip (a healthy no-op on a weekly
+ * timer) never reads as overdue. `now` is injectable so tests need no wall clock.
  */
 export async function deriveTaskStatus(
   executor: CommandExecutor,
   task: BackupTask,
+  now: number = Date.now(),
 ): Promise<BackupTaskStatus> {
   const [serviceProps, nextRaw] = await Promise.all([
     showService(executor, task.name),
@@ -336,14 +348,22 @@ export async function deriveTaskStatus(
     ?? parseSystemdTimestamp(serviceProps.InactiveEnterTimestamp)
   const nextRunAt = parseSystemdTimestamp(nextRaw)
 
-  let overdue = false
-  if (task.enabled && nextRunAt) {
-    const next = Date.parse(nextRunAt)
-    if (!Number.isNaN(next) && next < Date.now())
-      overdue = true
-  }
+  // A successful last run IS the last success — systemd already told us when.
+  // Only when it wasn't (a skip, a failure, nothing yet) do we pay for a journal
+  // read, and only when a cadence period makes the answer matter at all.
+  let lastSuccessAt = lastRunResult === 'success' ? lastRunAt : null
+  if (lastSuccessAt === null && overdueWindowMs(task.cadence) !== undefined)
+    lastSuccessAt = await readLastSuccessAt(executor, task.name)
 
-  return { lastRunResult, lastRunAt, nextRunAt, overdue }
+  const overdue = isTaskOverdue({
+    enabled: task.enabled,
+    cadence: task.cadence,
+    nextRunAt,
+    lastSuccessAt,
+    now,
+  })
+
+  return { lastRunResult, lastRunAt, nextRunAt, overdue, lastSuccessAt }
 }
 
 async function showService(executor: CommandExecutor, name: string): Promise<Record<string, string>> {
@@ -397,6 +417,128 @@ export async function readRecentJournal(executor: CommandExecutor, name: string)
   catch {
     return ''
   }
+}
+
+// --- Cadence gate inputs: last success + who triggered this run (16.10) ------
+
+/** journalctl `short-iso` stamps its zone as `+0000`; Date.parse wants `+00:00`. */
+function parseJournalTimestamp(line: string): string | null {
+  const stamp = line.split(' ')[0]
+  if (!stamp)
+    return null
+  const ms = Date.parse(stamp.replace(JOURNAL_TZ_RE, '$1:$2'))
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString()
+}
+
+/**
+ * When the task last completed a REAL backup, from the unit's own journal — the
+ * only local record of a success that an off-week skip or a later failure has
+ * since overwritten in systemd's last-result. The runner prints its result JSON
+ * on every completion, so the newest line whose result is `success` is the
+ * answer.
+ *
+ * LOCAL-ONLY by operator ruling: ANAS never asks the PBS server when it last
+ * received a backup. The journal rotates, so null genuinely means "no record" —
+ * and every caller treats that as "fail toward running / do not cry overdue",
+ * never as evidence of a missed backup. Fail-open to null.
+ */
+export async function readLastSuccessAt(executor: CommandExecutor, name: string): Promise<string | null> {
+  const journal = await readRecentJournal(executor, name)
+  if (!journal)
+    return null
+  const lines = journal.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const msg = messageFromJournalLine(lines[i])
+    if (!msg.startsWith('{'))
+      continue
+    try {
+      const obj = JSON.parse(msg) as { result?: HelperResult }
+      if (obj?.result?.status === 'success')
+        return parseJournalTimestamp(lines[i])
+    }
+    catch {
+      // Not the JSON result line — keep scanning.
+    }
+  }
+  return null
+}
+
+/**
+ * Which trigger started the run currently executing.
+ *
+ * The `direct` flag on POST /run does NOT answer this: BOTH a timer fire and a
+ * UI Run-Now reach the daemon as `direct:true`, because Run-Now deliberately goes
+ * through the task's own unit (16.5 Fix 1) and the unit's ExecStart is the same
+ * either way. systemd itself is the authority instead — a timer stamps
+ * `LastTriggerUSec` on the TIMER when it elapses, and a `systemctl start` by hand
+ * does not. So: this run was scheduled iff the timer's last trigger is not older
+ * than this invocation's start.
+ *
+ * Unknowable (never-fired timer, unreadable props) → 'manual', which leaves the
+ * gate open: a redundant backup is safe, a missed one is not.
+ */
+export function classifyTrigger(
+  timerProps: Record<string, string>,
+  serviceProps: Record<string, string>,
+): BackupTrigger {
+  const trigger = parseSystemdTimestamp(timerProps.LastTriggerUSec)
+  const started = parseSystemdTimestamp(serviceProps.InactiveExitTimestamp)
+  if (!trigger || !started)
+    return 'manual'
+  return Date.parse(trigger) + TRIGGER_SLACK_MS >= Date.parse(started) ? 'scheduled' : 'manual'
+}
+
+/** Read the two systemd props {@link classifyTrigger} needs (fail-open to manual). */
+export async function deriveTriggerSource(executor: CommandExecutor, name: string): Promise<BackupTrigger> {
+  const [timerProps, serviceProps] = await Promise.all([
+    showProps(executor, timerUnitName(name), 'LastTriggerUSec'),
+    showProps(executor, serviceUnitName(name), 'InactiveExitTimestamp'),
+  ])
+  return classifyTrigger(timerProps, serviceProps)
+}
+
+/** `systemctl show <unit> -p <props>` → a prop map (fail-open to {}). */
+async function showProps(executor: CommandExecutor, unit: string, props: string): Promise<Record<string, string>> {
+  try {
+    const r = await executor.exec(SYSTEMCTL, ['show', unit, '-p', props])
+    if (r.exitCode !== 0 && !r.stdout.trim())
+      return {}
+    return parseShow(r.stdout)
+  }
+  catch {
+    return {}
+  }
+}
+
+/**
+ * Decide whether this fire of a task should actually back up: the pure cadence
+ * decision (backup-cadence.ts) plus the two LOCAL reads it needs — who triggered
+ * the run, and when the task last succeeded. The last-success lookup is done only
+ * when the decision can still turn on it (an off-week biweekly fire), so an
+ * ordinary run costs nothing extra.
+ */
+export async function gateRun(
+  executor: CommandExecutor,
+  task: BackupTask,
+  now: Date = new Date(),
+): Promise<CadenceGateDecision> {
+  // Nothing but a biweekly cadence is gated, so nothing else pays for the two
+  // systemd reads the trigger check costs.
+  if (!task.cadence || task.cadence.kind !== 'biweekly')
+    return decideCadenceRun({ cadence: task.cadence, trigger: 'scheduled', now, lastSuccessAt: null })
+
+  const trigger = await deriveTriggerSource(executor, task.name)
+  // Cheap pre-check: on the task's own week (or a manual run) the last-success
+  // time cannot change the answer, so it is never read.
+  const cheap = decideCadenceRun({ cadence: task.cadence, trigger, now, lastSuccessAt: null })
+  if (cheap.reason !== 'no-record')
+    return cheap
+  return decideCadenceRun({
+    cadence: task.cadence,
+    trigger,
+    now,
+    lastSuccessAt: await readLastSuccessAt(executor, task.name),
+  })
 }
 
 // --- Run-Now supervision (LOCAL-ONLY: systemd + journald, never PBS) ---------
@@ -470,13 +612,18 @@ export function isRunActive(props: Record<string, string>): boolean {
 /**
  * Did a TERMINAL run fail? A oneshot's failure shows as ActiveState=failed, or a
  * non-success Result, or a non-zero ExecMainStatus (NOTES §7 confirms these
- * props). Benign too-soon exits 0 → NOT a failure here (Result=success).
+ * props). Benign too-soon exits 0 → NOT a failure here (Result=success), and
+ * neither is the runner's deliberate-skip code, which the unit declares as
+ * `SuccessExitStatus=` — a Run-Now that lands on an in-flight off-week fire must
+ * report a skip, not a failure.
  */
 export function runFailed(props: Record<string, string>): boolean {
   if (props.ActiveState === 'failed')
     return true
   if (props.Result && props.Result !== 'success')
     return true
+  if (props.ExecMainStatus === String(BACKUP_SKIP_EXIT_CODE))
+    return false
   if (props.ExecMainStatus && props.ExecMainStatus !== '0')
     return true
   return false
@@ -575,7 +722,11 @@ async function classifyTerminalRun(
     throw new Error(failureDetailFromJournal(journal) ?? `backup task '${name}' failed (see the recent journal)`)
   }
   const helper = parseHelperResult(journal)
-  const status: SuperviseRunResult['status'] = helper?.status === 'skipped' ? 'skipped' : 'success'
+  // Both skip flavours report as 'skipped' to the caller — the benign too-soon
+  // collision and a gated off-week fire (which a Run-Now can only meet by landing
+  // on one already in flight). The helper's own `reason` says which.
+  const skipped = helper?.status === 'skipped' || helper?.status === BACKUP_SKIPPED_OFF_WEEK
+  const status: SuperviseRunResult['status'] = skipped ? 'skipped' : 'success'
   const result: SuperviseRunResult = { status, alreadyRunning }
   if (helper?.archives?.length)
     result.archives = helper.archives

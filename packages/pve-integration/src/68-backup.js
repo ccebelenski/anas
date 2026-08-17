@@ -1,5 +1,5 @@
 /*
- * ANAS — Backup view (Epic 16: PBS file backup — stories 16.4 / 16.5 UI / 16.6).
+ * ANAS — Backup view (Epic 16: PBS file backup — 16.4 / 16.5 UI / 16.6 / 16.10).
  *
  * A native ExtJS "Backup" menu item (sibling of Replication / Mounts). File-level
  * backup of host paths to a Proxmox Backup Server via proxmox-backup-client. The
@@ -26,8 +26,16 @@
  *              from the repos list), namespace?, backupId (alias `backup-id`/
  *              `backupID`), archives:[{name, path, excludes:[]}],
  *              changeDetectionMode ('default'|'metadata'; alias `changeDetection`),
- *              schedule (OnCalendar), enabled (bool) }
- *     lastRunResult ('success'|'failure'|'running'|'unknown'), lastRunAt (ISO),
+ *              schedule (OnCalendar), enabled (bool),
+ *              cadence? (16.10 — the STRUCTURED schedule:
+ *                { kind:'weekly'|'biweekly'|'monthly'|'custom', days:[Mon..Sun],
+ *                  time:'HH:MM', parity?:'even'|'odd' }. Present ⇒ the daemon
+ *                GENERATED `schedule` from it and the cadence is authoritative;
+ *                absent ⇒ `schedule` is a hand-written expression, which is what
+ *                every pre-16.10 task carries) }
+ *     lastRunResult ('success'|'failure'|'running'|'skipped'|'unknown' — 'skipped'
+ *     is a biweekly off-week fire: it ran and deliberately did nothing, which is
+ *     neither a success nor a failure), lastRunAt (ISO),
  *     nextRunAt (ISO), overdue (bool — a silently-overdue task counts as failed,
  *     the replication policy).
  *
@@ -65,7 +73,9 @@
  *   DELETE /v1/backup/tasks/:name    (units removed; PBS data untouched) → 202/409
  *   POST /v1/backup/tasks/:name/run  (Run Now; job carries progress) → 202 { job }
  *     TaskWrite = { name, repository, namespace?, backupId, archives, mode
- *       (=changeDetectionMode), schedule, enabled }.
+ *       (=changeDetectionMode), enabled, and EITHER `cadence` (structured — the
+ *       daemon derives the OnCalendar; this view never generates one) OR
+ *       `schedule` (the raw expression, for the Custom kind)}.
  *
  *   Path-picker candidates (convenience, best-effort — free-typing always works):
  *     GET /v1/mounts (mountpoints) + GET /v1/pools then
@@ -77,7 +87,9 @@
  * '-delete' / '-details'; detail window 'anas-win-backup-detail' (body
  * 'anas-backup-detail', reload 'anas-btn-backup-detail-reload'); task window
  * 'anas-win-backup-task' (submit 'anas-btn-backup-task-submit', archives
- * 'anas-backup-archives', per-row path browse 'anas-btn-backup-arch-browse');
+ * 'anas-backup-archives', per-row path browse 'anas-btn-backup-arch-browse',
+ * schedule fieldset 'anas-backup-schedule' with 'anas-fld-backup-cadence' /
+ * '-day' / '-single-day' / '-parity' / '-time' / '-schedule');
  * directory picker 'anas-win-fs-picker' (grid 'anas-grid-fs-picker', path field
  * 'anas-fld-fs-path', select 'anas-btn-fs-select'); repos manager
  * 'anas-win-backup-repos' (grid 'anas-grid-backup-repos'); repo edit
@@ -247,6 +259,69 @@
         return out;
     }
 
+    // ---- Cadence (16.10) ---------------------------------------------------
+    //
+    // A task's schedule is still an OnCalendar expression; `cadence` is the
+    // structured form this wizard edits, and the DAEMON generates the expression
+    // from it (the generator lives once, in the shared schema — this file never
+    // reimplements systemd calendar syntax). A task without a cadence is a raw
+    // OnCalendar task, which is what every pre-16.10 task is: it opens on the
+    // Custom tab with its expression prefilled, and saving it changes nothing.
+
+    var WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+    var WEEKDAY_LABEL = {
+        Mon: 'Monday', Tue: 'Tuesday', Wed: 'Wednesday', Thu: 'Thursday',
+        Fri: 'Friday', Sat: 'Saturday', Sun: 'Sunday',
+    };
+    var CADENCE_KINDS = ['weekly', 'biweekly', 'monthly', 'custom'];
+    var TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+    // The fire time the operator's own jobs use — a sane default, freely editable.
+    var DEFAULT_TIME = '02:00';
+
+    // A task's cadence, normalised; null when the task carries a raw schedule.
+    function cadenceOf(task) {
+        var c = task && task.cadence;
+        if (!c || CADENCE_KINDS.indexOf('' + c.kind) < 0 || c.kind === 'custom') {
+            return null;
+        }
+        var days = [];
+        var raw = isArray(c.days) ? c.days : [];
+        for (var i = 0; i < WEEKDAYS.length; i++) {
+            for (var j = 0; j < raw.length; j++) {
+                if (raw[j] === WEEKDAYS[i]) {
+                    days.push(WEEKDAYS[i]);
+                    break;
+                }
+            }
+        }
+        return {
+            kind: '' + c.kind,
+            days: days,
+            time: '' + (c.time || ''),
+            parity: c.parity ? ('' + c.parity) : '',
+        };
+    }
+
+    // A cadence in words. Deliberately spells out what the timer alone cannot say
+    // (which weeks a biweekly task runs) — the whole point of the feature.
+    function cadenceText(c) {
+        if (!c) {
+            return '';
+        }
+        var days = c.days.join(', ');
+        if (c.kind === 'weekly') {
+            return t('Weekly') + ' · ' + days + ' · ' + c.time;
+        }
+        if (c.kind === 'biweekly') {
+            return t('Every other week') + ' · ' + days + ' · ' + c.time + ' · '
+                + (c.parity === 'even' ? t('even ISO weeks') : t('odd ISO weeks'));
+        }
+        if (c.kind === 'monthly') {
+            return t('Monthly') + ' · ' + t('first') + ' ' + days + ' · ' + c.time;
+        }
+        return '';
+    }
+
     function repoNameOf(task) {
         return first(task && task.repository, task && task.repo) || '';
     }
@@ -284,6 +359,7 @@
             archiveCount: archives.length,
             mode: modeOf(task),
             schedule: task.schedule,
+            cadence: cadenceOf(task),
             enabled: task.enabled !== false,
             lastRunResult: first(entry.lastRunResult, entry.result) || 'unknown',
             lastRunAt: first(entry.lastRunAt, entry.lastRun),
@@ -307,6 +383,7 @@
             archives: [],
             changeDetectionMode: rec.get('mode'),
             schedule: rec.get('schedule'),
+            cadence: rec.get('cadence') || undefined,
             enabled: !!rec.get('enabled'),
         };
     }
@@ -357,10 +434,20 @@
         return '<span title="' + enc(label) + '">' + enc(label) + '</span>';
     }
 
-    function renderSchedule(v) {
+    // A structured cadence reads in words (it says which weeks a biweekly task
+    // runs — the thing the OnCalendar expression cannot); a raw schedule reads as
+    // the expression itself. Either way the generated expression is in the tooltip,
+    // never truncated.
+    function renderSchedule(v, meta, rec) {
         var s = '' + (v == null ? '' : v);
-        if (!s) {
+        var c = rec ? rec.get('cadence') : null;
+        var text = cadenceText(c);
+        if (!s && !text) {
             return '<span style="color:gray;">&mdash;</span>';
+        }
+        if (text) {
+            return '<span title="' + enc(text + (s ? ' — OnCalendar: ' + s : '')) + '">'
+                + enc(text) + '</span>';
         }
         return '<span title="' + enc(s) + '" style="font-family:monospace;font-size:0.92em;">'
             + enc(s) + '</span>';
@@ -375,6 +462,12 @@
         var pill;
         if (result === 'success' && !overdue) {
             pill = pillHtml(t('success'), 'var(--anas-ok,#1f9c56)', absTime(at));
+        } else if (result === 'skipped' && !overdue) {
+            // A biweekly off week: the fire happened and deliberately did nothing.
+            // Neither a success (no backup was taken) nor a failure (nothing broke).
+            pill = pillHtml(t('skipped (off week)'), 'var(--anas-muted,gray)',
+                t('An off-week fire of an every-other-week task — nothing was backed up, '
+                    + 'and nothing is wrong.') + (at ? ' ' + absTime(at) : ''));
         } else if (result === 'failure') {
             pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)', absTime(at));
         } else if (result === 'running') {
@@ -1044,6 +1137,27 @@
             + enc(msg) + link + '</div>';
     }
 
+    // The schedule as the detail shows it: the cadence in words with the generated
+    // OnCalendar underneath (config-is-the-API transparency — the operator sees
+    // exactly what the timer got), or just the expression for a raw-schedule task.
+    function scheduleDetailHtml(task) {
+        var expr = task && task.schedule
+            ? '<span style="font-family:monospace;font-size:0.92em;">' + enc(task.schedule) + '</span>'
+            : '<span style="color:gray;">&mdash;</span>';
+        var text = cadenceText(cadenceOf(task));
+        if (!text) {
+            return expr;
+        }
+        var note = cadenceOf(task).kind === 'biweekly'
+            ? '<div style="color:var(--anas-muted,gray);font-size:0.85em;">'
+                + enc(t('The timer fires weekly; ANAS skips the off weeks (systemd calendars '
+                    + 'cannot express "every other week"). A missed period heals on the next fire.'))
+                + '</div>'
+            : '';
+        return enc(text) + '<div style="color:var(--anas-muted,gray);font-size:0.85em;">'
+            + 'OnCalendar: ' + expr + '</div>' + note;
+    }
+
     function taskDetailHtml(d) {
         if (!d) {
             return '<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
@@ -1062,9 +1176,7 @@
             + kv(t('Repository'), '<span style="font-family:monospace;font-size:0.92em;">' + repoText + '</span>')
             + kv(t('Backup ID'), mono('host/' + backupIdOf(task)))
             + kv(t('Change detection'), enc(modeLabel))
-            + kv(t('Schedule'), task.schedule
-                ? '<span style="font-family:monospace;font-size:0.92em;">' + enc(task.schedule) + '</span>'
-                : '<span style="color:gray;">&mdash;</span>')
+            + kv(t('Schedule'), scheduleDetailHtml(task))
             + kv(t('Enabled'), task.enabled !== false
                 ? '<span style="color:var(--anas-ok,#1f9c56);">' + enc(t('yes')) + '</span>'
                 : '<span style="color:var(--anas-muted,gray);">' + enc(t('no')) + '</span>');
@@ -1298,6 +1410,233 @@
         return out;
     }
 
+    // ---- Schedule / cadence picker (16.10) ---------------------------------
+    //
+    // NOTHING here mirrors form state through a hiddenfield (issue #26): a
+    // Text-class getValue() hands back DOM strings, where the string 'false' is
+    // truthy. Every value is read straight off its own field by itemId, radios by
+    // string compare and checkboxes by an explicit === true.
+
+    function weekdayOptions() {
+        var data = [];
+        for (var i = 0; i < WEEKDAYS.length; i++) {
+            data.push({ v: WEEKDAYS[i], label: t(WEEKDAY_LABEL[WEEKDAYS[i]]) });
+        }
+        return data;
+    }
+
+    var CADENCE_NOTE = {
+        weekly: 'Fires on each chosen weekday. A run missed while the node was off '
+            + 'is caught up once on the next boot.',
+        biweekly: 'Fires on that weekday in even or odd ISO week numbers (the same '
+            + 'week numbering as "date +%V"). systemd calendars cannot say "every other '
+            + 'week", so the timer fires weekly and ANAS skips the off weeks — visibly, '
+            + 'as a skipped run. If a full period ever passes without a successful '
+            + 'backup, the next fire runs regardless and then returns to the chosen weeks.',
+        monthly: 'Fires on the first such weekday of each month.',
+        custom: 'systemd OnCalendar — e.g. "daily", "02:00", "Mon *-*-* 03:00". '
+            + 'Validated when saved.',
+    };
+
+    // The Schedule fieldset. `cadence` is null for a raw-OnCalendar task, which
+    // opens on Custom with its expression prefilled — no migration, no surprise.
+    function scheduleFieldset(cadence, task, onChange) {
+        var kind = cadence ? cadence.kind : 'custom';
+        var days = cadence ? cadence.days : [];
+        var time = (cadence && cadence.time) || DEFAULT_TIME;
+        var parity = (cadence && cadence.parity) || 'even';
+        var oneDay = days.length ? days[0] : 'Sun';
+
+        var dayBoxes = [];
+        for (var i = 0; i < WEEKDAYS.length; i++) {
+            var d = WEEKDAYS[i];
+            dayBoxes.push({
+                xtype: 'checkboxfield',
+                itemId: 'day' + d,
+                cls: 'anas-fld-backup-day',
+                boxLabel: t(d),
+                checked: days.indexOf(d) >= 0,
+                width: 66,
+            });
+        }
+
+        return {
+            xtype: 'fieldset',
+            title: t('Schedule'),
+            cls: 'anas-backup-schedule',
+            collapsible: false,
+            defaults: { anchor: '100%', labelWidth: 130 },
+            items: [
+                {
+                    xtype: 'radiogroup',
+                    itemId: 'cadenceKind',
+                    cls: 'anas-fld-backup-cadence',
+                    columns: 2,
+                    items: [
+                        { boxLabel: t('Weekly'), name: 'cadenceKind', inputValue: 'weekly', checked: kind === 'weekly' },
+                        { boxLabel: t('Every other week'), name: 'cadenceKind', inputValue: 'biweekly', checked: kind === 'biweekly' },
+                        { boxLabel: t('Monthly'), name: 'cadenceKind', inputValue: 'monthly', checked: kind === 'monthly' },
+                        { boxLabel: t('Custom (OnCalendar)'), name: 'cadenceKind', inputValue: 'custom', checked: kind === 'custom' },
+                    ],
+                    listeners: {
+                        change: function () {
+                            try {
+                                onChange();
+                            } catch (e) {
+                                ANAS.warn('backup cadence toggle failed: ' + ANAS.errText(e));
+                            }
+                        },
+                    },
+                },
+                {
+                    xtype: 'fieldcontainer',
+                    itemId: 'weeklyDaysRow',
+                    fieldLabel: t('Days'),
+                    layout: 'hbox',
+                    defaults: { margin: '0 4 0 0' },
+                    items: dayBoxes,
+                },
+                {
+                    xtype: 'combobox',
+                    itemId: 'singleDay',
+                    cls: 'anas-fld-backup-single-day',
+                    fieldLabel: t('Day'),
+                    store: Ext.create('Ext.data.Store', { fields: ['v', 'label'], data: weekdayOptions() }),
+                    valueField: 'v',
+                    displayField: 'label',
+                    queryMode: 'local',
+                    editable: false,
+                    forceSelection: true,
+                    value: oneDay,
+                },
+                {
+                    xtype: 'radiogroup',
+                    itemId: 'parityGroup',
+                    cls: 'anas-fld-backup-parity',
+                    fieldLabel: t('Weeks'),
+                    columns: 2,
+                    items: [
+                        { boxLabel: t('Even ISO weeks'), name: 'parity', inputValue: 'even', checked: parity !== 'odd' },
+                        { boxLabel: t('Odd ISO weeks'), name: 'parity', inputValue: 'odd', checked: parity === 'odd' },
+                    ],
+                },
+                {
+                    xtype: 'textfield',
+                    itemId: 'cadenceTime',
+                    cls: 'anas-fld-backup-time',
+                    fieldLabel: t('Time'),
+                    emptyText: DEFAULT_TIME,
+                    width: 260,
+                    anchor: null,
+                    value: time,
+                    regex: TIME_RE,
+                    regexText: t('A 24-hour time, HH:MM.'),
+                },
+                {
+                    xtype: 'textfield',
+                    itemId: 'schedule',
+                    cls: 'anas-fld-backup-schedule',
+                    fieldLabel: t('OnCalendar'),
+                    emptyText: 'daily',
+                    value: (task.schedule || ''),
+                },
+                {
+                    xtype: 'component',
+                    itemId: 'cadenceNote',
+                    style: 'color:var(--anas-muted,gray);font-size:11px;margin:2px 0 0 134px;',
+                    html: enc(t(CADENCE_NOTE[kind] || CADENCE_NOTE.custom)),
+                },
+            ],
+        };
+    }
+
+    // The chosen cadence kind, read off the radiogroup by itemId (string compare).
+    function cadenceKindOf(win) {
+        try {
+            var g = win.down('#cadenceKind');
+            var v = g && g.getValue();
+            var k = '' + ((v && v.cadenceKind) || '');
+            return CADENCE_KINDS.indexOf(k) >= 0 ? k : 'custom';
+        } catch (e) {
+            return 'custom';
+        }
+    }
+
+    // Show only the fields the chosen kind actually uses.
+    function syncCadenceFields(win) {
+        var kind = cadenceKindOf(win);
+        var show = function (sel, on) {
+            try {
+                var c = win.down(sel);
+                if (c) {
+                    c.setHidden(!on);
+                }
+            } catch (e) {
+                // A missing field is not worth breaking the dialog for.
+            }
+        };
+        show('#weeklyDaysRow', kind === 'weekly');
+        show('#singleDay', kind === 'biweekly' || kind === 'monthly');
+        show('#parityGroup', kind === 'biweekly');
+        show('#cadenceTime', kind !== 'custom');
+        show('#schedule', kind === 'custom');
+        try {
+            var note = win.down('#cadenceNote');
+            if (note) {
+                note.update(enc(t(CADENCE_NOTE[kind] || CADENCE_NOTE.custom)));
+            }
+        } catch (e2) {
+            ANAS.warn('backup cadence note failed: ' + ANAS.errText(e2));
+        }
+    }
+
+    // Build the cadence object for a non-custom kind, or null after alerting.
+    // Validated here AND in the daemon (defence in depth, never frontend-only).
+    function readCadence(win) {
+        var kind = cadenceKindOf(win);
+        var time = trim(valOf(win, '#cadenceTime'));
+        if (!TIME_RE.test(time)) {
+            ANAS.alertMsg('Invalid input', t('Enter a time as HH:MM (24-hour).'));
+            return null;
+        }
+        var days = [];
+        if (kind === 'weekly') {
+            var row = win.down('#weeklyDaysRow');
+            for (var i = 0; i < WEEKDAYS.length; i++) {
+                var cb = row && row.down('#day' + WEEKDAYS[i]);
+                if (cb && cb.getValue() === true) {
+                    days.push(WEEKDAYS[i]);
+                }
+            }
+            if (!days.length) {
+                ANAS.alertMsg('Invalid input', t('Choose at least one weekday.'));
+                return null;
+            }
+        } else {
+            var one = trim(valOf(win, '#singleDay'));
+            if (WEEKDAYS.indexOf(one) < 0) {
+                ANAS.alertMsg('Invalid input', t('Choose a weekday.'));
+                return null;
+            }
+            days = [one];
+        }
+        var cadence = { kind: kind, days: days, time: time };
+        if (kind === 'biweekly') {
+            var parity = 'even';
+            try {
+                var pg = win.down('#parityGroup');
+                var pv = pg && pg.getValue();
+                if (pv && pv.parity === 'odd') {
+                    parity = 'odd';
+                }
+            } catch (e) {
+                // even stands
+            }
+            cadence.parity = parity;
+        }
+        return cadence;
+    }
+
     function openTaskDialog(view, node, existing) {
         var isEdit = !!existing;
         var task = existing || {};
@@ -1321,6 +1660,9 @@
         }
         var defaultId = backupIdOf(task) || node; // hostname is the default backup-id
         var mode = modeOf(task);
+        // No cadence = a raw-OnCalendar task (everything created before 16.10):
+        // it opens on Custom with its expression prefilled and round-trips as-is.
+        var cadence = cadenceOf(task);
 
         var win;
         try {
@@ -1450,21 +1792,13 @@
                                 },
                             ],
                         },
-                        {
-                            xtype: 'textfield',
-                            itemId: 'schedule',
-                            cls: 'anas-fld-backup-schedule',
-                            fieldLabel: t('Schedule'),
-                            emptyText: 'daily',
-                            allowBlank: false,
-                            value: (task.schedule || ''),
-                        },
-                        {
-                            xtype: 'component',
-                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
-                            html: enc(t('systemd OnCalendar — e.g. "daily", "02:00", '
-                                + '"Mon *-*-* 03:00". Validated when saved.')),
-                        },
+                        // The window is synced once on show as well; this guard just
+                        // ignores a change fired while the config is still building.
+                        scheduleFieldset(cadence, task, function () {
+                            if (win) {
+                                syncCadenceFields(win);
+                            }
+                        }),
                         {
                             xtype: 'checkboxfield',
                             itemId: 'enabled',
@@ -1497,6 +1831,7 @@
         }
 
         win.show();
+        syncCadenceFields(win); // show only the fields the opening cadence uses
         loadPathCandidates(node, pathStore);
 
         // Seed the archive rows. Edit → the task's archives; new → the suggested
@@ -1539,10 +1874,23 @@
             ANAS.alertMsg('Invalid input', t('Enter a backup ID (the PBS group identity).'));
             return;
         }
-        var schedule = trim(valOf(win, '#schedule'));
-        if (!schedule) {
-            ANAS.alertMsg('Invalid input', t('Enter a schedule.'));
-            return;
+        // Custom = the raw OnCalendar the user typed; every other kind sends the
+        // structured cadence and lets the DAEMON generate the expression (one
+        // generator, in the shared schema — never a second copy here).
+        var cadenceKind = cadenceKindOf(win);
+        var schedule = '';
+        var cadence = null;
+        if (cadenceKind === 'custom') {
+            schedule = trim(valOf(win, '#schedule'));
+            if (!schedule) {
+                ANAS.alertMsg('Invalid input', t('Enter a schedule.'));
+                return;
+            }
+        } else {
+            cadence = readCadence(win);
+            if (!cadence) {
+                return; // readCadence already said what is wrong
+            }
         }
         var archives = readArchives(win);
         if (!archives.length) {
@@ -1574,9 +1922,13 @@
             archives: archives,
             mode: mode,
             changeDetectionMode: mode, // send both spellings — daemon picks one
-            schedule: schedule,
             enabled: !!valOf(win, '#enabled'),
         };
+        if (cadence) {
+            body.cadence = cadence;
+        } else {
+            body.schedule = schedule;
+        }
         if (namespace) {
             body.namespace = namespace;
         }
@@ -2694,6 +3046,7 @@
                 'name', 'repository', 'datastore', 'namespace', 'backupId',
                 'schedule', 'mode', 'lastRunResult', 'lastRunAt', 'nextRunAt',
                 { name: 'archiveCount', type: 'auto' },
+                { name: 'cadence', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
                 { name: 'overdue', type: 'auto' },
                 { name: 'raw', type: 'auto' },
@@ -2824,7 +3177,9 @@
                             align: 'center', renderer: renderArchives,
                         },
                         {
-                            text: t('Schedule'), dataIndex: 'schedule', width: 130,
+                            // Wide enough for a spelled-out cadence ("Every other
+                            // week · Tue · 02:00 · even ISO weeks") — never truncated.
+                            text: t('Schedule'), dataIndex: 'schedule', width: 260,
                             renderer: renderSchedule,
                         },
                         {

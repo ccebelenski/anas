@@ -72,6 +72,140 @@ export type BackupAuthType = z.infer<typeof BackupAuthType>
 export const ChangeDetectionMode = z.enum(['default', 'metadata'])
 export type ChangeDetectionMode = z.infer<typeof ChangeDetectionMode>
 
+// ---- Cadence (16.10) -------------------------------------------------------
+//
+// A task's schedule stays a systemd `OnCalendar=` expression — `cadence` is the
+// STRUCTURED form the UI edits, and when present the daemon GENERATES the
+// expression from it (the cadence is then authoritative; see cadenceToOnCalendar
+// and BackupTaskRequest). Absent cadence = a hand-written OnCalendar, which is
+// what every task created before 16.10 carries — those keep working verbatim.
+//
+// ANAS adds run-time logic ONLY where OnCalendar cannot express the schedule:
+//   weekly / monthly / custom → pure OnCalendar, NO gate. systemd's
+//     `Persistent=true` is the missed-run heal there (it coalesces missed fires
+//     into one catch-up, which is the correct behaviour for a backup).
+//   biweekly → a WEEKLY timer plus an ISO-week parity gate in the daemon's run
+//     path, because OnCalendar has no "every other week" (see backup-cadence.ts).
+
+/**
+ * Weekday abbreviations — deliberately systemd's OWN OnCalendar spelling, so a
+ * generated expression is a plain join with no translation table in between.
+ */
+export const BackupWeekday = z.enum(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
+export type BackupWeekday = z.infer<typeof BackupWeekday>
+
+/** ISO-8601 weekday order (Mon..Sun); generated expressions are always sorted. */
+export const BACKUP_WEEKDAYS: readonly BackupWeekday[] = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+/**
+ * The cadence shapes ANAS can express structurally. `custom` is the raw
+ * OnCalendar escape hatch — identical in behaviour to an absent cadence, and the
+ * reason no existing task needs migrating.
+ */
+export const BackupCadenceKind = z.enum(['weekly', 'biweekly', 'monthly', 'custom'])
+export type BackupCadenceKind = z.infer<typeof BackupCadenceKind>
+
+/**
+ * Which ISO-week parity a biweekly task runs in. EXPLICIT config, never derived
+ * from a creation date: real biweekly fleets stagger their jobs across both
+ * phases deliberately, and a migration must be able to state the phase it wants.
+ */
+export const BackupWeekParity = z.enum(['even', 'odd'])
+export type BackupWeekParity = z.infer<typeof BackupWeekParity>
+
+/** A 24-hour `HH:MM` fire time (the OnCalendar time component). */
+export const BackupTimeOfDay = z
+  .string()
+  .regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/, 'a 24-hour HH:MM time')
+export type BackupTimeOfDay = z.infer<typeof BackupTimeOfDay>
+
+/**
+ * The structured schedule. Per-kind shape (enforced below, so an impossible
+ * cadence cannot be stored):
+ *   weekly    — 1..7 days, a time. Fires on each chosen weekday.
+ *   biweekly  — exactly ONE day, a time, and an explicit ISO-week `parity`.
+ *   monthly   — exactly ONE day, a time. Fires on that weekday's FIRST
+ *               occurrence in the month.
+ *   custom    — no days/time/parity; the task's raw `schedule` stands.
+ */
+export const BackupCadence = z
+  .object({
+    kind: BackupCadenceKind,
+    /** Weekdays this cadence fires on (unused for `custom`). */
+    days: z.array(BackupWeekday).max(7).default([]),
+    /** Fire time, `HH:MM` (unused for `custom`). */
+    time: BackupTimeOfDay.optional(),
+    /** biweekly ONLY: which ISO-week parity actually runs. */
+    parity: BackupWeekParity.optional(),
+  })
+  .superRefine((c, ctx) => {
+    const issue = (message: string, path: string): void => {
+      ctx.addIssue({ code: 'custom', message, path: [path] })
+    }
+    if (c.kind === 'custom') {
+      if (c.days.length)
+        issue('a custom cadence carries no weekdays — the raw schedule stands', 'days')
+      return
+    }
+    if (!c.time)
+      issue('a time (HH:MM) is required', 'time')
+    if (c.kind === 'weekly' && c.days.length < 1)
+      issue('choose at least one weekday', 'days')
+    if (c.kind !== 'weekly' && c.days.length !== 1)
+      issue(`a ${c.kind} cadence runs on exactly one weekday`, 'days')
+    if (c.kind === 'biweekly' && !c.parity)
+      issue('a biweekly cadence needs an explicit even/odd ISO-week parity', 'parity')
+    if (c.kind !== 'biweekly' && c.parity)
+      issue('week parity applies to a biweekly cadence only', 'parity')
+  })
+  // Normalise the weekdays on the way IN — deduped and in ISO order — so the
+  // stored cadence and the expression generated from it can never disagree, and
+  // two spellings of the same schedule are the same config.
+  .transform(c => ({ ...c, days: BACKUP_WEEKDAYS.filter(d => c.days.includes(d)) }))
+export type BackupCadence = z.infer<typeof BackupCadence>
+
+/**
+ * Translate a cadence into the systemd `OnCalendar=` expression that drives its
+ * timer. Returns null for `custom` (the task's raw schedule is the expression).
+ *
+ * The generated forms — all validated against `systemd-analyze calendar`, and
+ * re-validated by the daemon on every write:
+ *   weekly    `Tue,Thu 02:00`          → Tue,Thu *-*-* 02:00:00
+ *   biweekly  `Tue 02:00`              → Tue *-*-* 02:00:00 (the parity gate
+ *                                        skips the off weeks — the timer cannot)
+ *   monthly   `Sun *-*-01..07 02:00`   → the first Sun of each month (a 7-day
+ *                                        window holds exactly one of each weekday)
+ * Days are emitted deduped and in ISO order, so the same cadence always renders
+ * the same string (a rewrite never churns the unit file).
+ */
+export function cadenceToOnCalendar(cadence: BackupCadence): string | null {
+  if (cadence.kind === 'custom' || !cadence.time)
+    return null
+  const days = BACKUP_WEEKDAYS.filter(d => cadence.days.includes(d))
+  if (!days.length)
+    return null
+  if (cadence.kind === 'monthly')
+    return `${days[0]} *-*-01..07 ${cadence.time}`
+  return `${days.join(',')} ${cadence.time}`
+}
+
+/**
+ * Exit status the task runner uses for a deliberate no-op skip (today: a
+ * biweekly off-week fire). The generated unit declares it as
+ * `SuccessExitStatus=`, so systemd records the run as a SUCCESS (a skip is not a
+ * failure) while `ExecMainStatus` still says plainly that nothing was backed up
+ * — one `systemctl show` tells the whole story, with no journal read and no
+ * second state source. 75 is EX_TEMPFAIL; pbc itself only ever exits 0 or 255.
+ */
+export const BACKUP_SKIP_EXIT_CODE = 75
+
+/**
+ * The run-result `status` a gated (off-week) fire reports. It travels daemon job
+ * → runner stdout → journald → the Run-Now supervisor, which is why the three of
+ * them share this one spelling rather than three string literals.
+ */
+export const BACKUP_SKIPPED_OFF_WEEK = 'skipped-off-week'
+
 // ---- Repositories ----------------------------------------------------------
 
 /**
@@ -222,8 +356,16 @@ export const BackupTask = z.object({
   /** 1..N archives (the operator's multi-archive shape). */
   archives: z.array(BackupArchive).min(1),
   changeDetectionMode: ChangeDetectionMode.default('default'),
-  /** systemd OnCalendar expression. */
+  /**
+   * systemd OnCalendar expression. GENERATED from `cadence` when one is present
+   * (the cadence is authoritative); hand-written otherwise.
+   */
   schedule: z.string().min(1),
+  /**
+   * The structured schedule (16.10). Absent = the raw `schedule` above is the
+   * whole story — which is exactly what every pre-16.10 task carries.
+   */
+  cadence: BackupCadence.optional(),
   enabled: z.boolean().default(true),
   /** LimitNOFILE= on the generated unit (pbc hoards fds in metadata mode). */
   limitNofile: z.number().int().positive().default(1024),
@@ -234,12 +376,26 @@ export type BackupTask = z.infer<typeof BackupTask>
  * Create/update request. The UI sends `changeDetectionMode` AND a legacy `mode`
  * alias — accept either (prefer changeDetectionMode). `limitNofile` is optional
  * (default 1024). Normalized to a BackupTask before use.
+ *
+ * When a structured `cadence` is present, the OnCalendar expression is DERIVED
+ * here from it and overwrites whatever `schedule` the client sent: the cadence is
+ * authoritative, the generator lives in exactly one place, and the UI therefore
+ * never has to reimplement systemd calendar syntax. A `custom` cadence (or none)
+ * leaves the client's raw `schedule` untouched.
  */
 export const BackupTaskRequest = z.preprocess((raw) => {
   if (raw && typeof raw === 'object') {
     const o = { ...(raw as Record<string, unknown>) }
     if (o.changeDetectionMode === undefined && o.mode !== undefined)
       o.changeDetectionMode = o.mode
+    if (o.cadence !== undefined) {
+      // Parse defensively: an invalid cadence falls through to full validation
+      // below, which reports the real problem rather than a schedule error.
+      const cadence = BackupCadence.safeParse(o.cadence)
+      const generated = cadence.success ? cadenceToOnCalendar(cadence.data) : null
+      if (generated)
+        o.schedule = generated
+    }
     return o
   }
   return raw
@@ -268,8 +424,13 @@ export const BackupRunRequest = z.object({
 })
 export type BackupRunRequest = z.infer<typeof BackupRunRequest>
 
-/** systemd-derived run result (LOCAL-ONLY). */
-export const BackupRunResult = z.enum(['success', 'failure', 'running', 'unknown'])
+/**
+ * systemd-derived run result (LOCAL-ONLY). `skipped` is a run that deliberately
+ * did nothing and says so — today a biweekly off-week fire, recognised by the
+ * runner's {@link BACKUP_SKIP_EXIT_CODE}. It is neither a fake success (no
+ * backup was taken) nor a failure (nothing went wrong).
+ */
+export const BackupRunResult = z.enum(['success', 'failure', 'running', 'skipped', 'unknown'])
 export type BackupRunResult = z.infer<typeof BackupRunResult>
 
 /** A task grid entry: the task + its LOCAL-ONLY runtime status. */

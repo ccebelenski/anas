@@ -57,8 +57,13 @@ export {
 
 // Backup schemas (Epic 16 — PBS file backup)
 export {
+  BACKUP_SKIP_EXIT_CODE,
+  BACKUP_SKIPPED_OFF_WEEK,
+  BACKUP_WEEKDAYS,
   BackupArchive,
   BackupAuthType,
+  BackupCadence,
+  BackupCadenceKind,
   BackupName,
   BackupRecentRun,
   BackupRepo,
@@ -76,6 +81,10 @@ export {
   BackupTaskEntry,
   BackupTaskRequest,
   BackupTaskView,
+  BackupTimeOfDay,
+  BackupWeekday,
+  BackupWeekParity,
+  cadenceToOnCalendar,
   ChangeDetectionMode,
   PVE_REPO_PREFIX,
   UpsertBackupRepoRequest,

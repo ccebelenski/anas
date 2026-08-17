@@ -1,6 +1,7 @@
 import type { Job, JobRef } from '@anas/shared'
 import { randomUUID } from 'node:crypto'
 import { request as httpRequest } from 'node:http'
+import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK } from '@anas/shared'
 
 /**
  * Backup task RUNNER (Epic 16) — the entrypoint each `anas-backup-<name>` timer
@@ -125,6 +126,19 @@ export async function runBackupTask(
   throw new Error(`backup job ${jobRef.id} did not reach a terminal state after ${maxAttempts} polls`)
 }
 
+/**
+ * The exit status a completed job should produce. A gated off-week fire exits
+ * with the deliberate-skip code, which the generated unit declares as
+ * `SuccessExitStatus=`: systemd counts the run as a success (nothing went wrong)
+ * while `ExecMainStatus` still says plainly that no backup was taken, so the task
+ * status can show "skipped" from one `systemctl show` (16.10). Everything else
+ * that completed exits 0.
+ */
+export function exitCodeForResult(result: unknown): number {
+  const status = (result as { status?: string } | undefined)?.status
+  return status === BACKUP_SKIPPED_OFF_WEEK ? BACKUP_SKIP_EXIT_CODE : 0
+}
+
 /** Pull an error message out of a `{ error: { message } }` body if present. */
 function errorMessage(body: unknown): string | undefined {
   return (body as { error?: { message?: string } } | undefined)?.error?.message
@@ -169,7 +183,11 @@ export function socketRequester(socketPath: string): Requester {
   })
 }
 
-/** CLI entrypoint. Exits 0 on completed, 1 on job failure, 2 on bad args/transport. */
+/**
+ * CLI entrypoint. Exits 0 on completed, {@link BACKUP_SKIP_EXIT_CODE} on a
+ * deliberate off-week skip (a success as far as systemd is concerned — the unit
+ * declares it), 1 on job failure, 2 on bad args/transport.
+ */
 export async function main(argv: string[]): Promise<number> {
   let opts: RunnerOptions
   try {
@@ -184,7 +202,7 @@ export async function main(argv: string[]): Promise<number> {
     const job = await runBackupTask(socketRequester(opts.socket), opts.name)
     if (job.status === 'completed') {
       process.stdout.write(`${JSON.stringify({ task: opts.name, result: job.result })}\n`)
-      return 0
+      return exitCodeForResult(job.result)
     }
     process.stderr.write(`${job.error?.message ?? 'backup job failed'}\n`)
     return 1

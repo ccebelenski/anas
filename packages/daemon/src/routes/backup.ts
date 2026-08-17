@@ -12,6 +12,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { BackupReposPaths } from '../services/backup-repos.js'
 import {
+  BACKUP_SKIPPED_OFF_WEEK,
   BackupName,
   BackupRepoTestRequest,
   BackupRunRequest,
@@ -46,6 +47,8 @@ import {
 } from '../services/backup-runner.js'
 import {
   deriveTaskStatus,
+  effectiveSchedule,
+  gateRun,
   readAllTasks,
   readRecentJournal,
   readTask,
@@ -475,10 +478,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
    * first failure.
    */
   async function guardTask(task: BackupTask, reply: FastifyReply): Promise<boolean> {
-    const schedule = await validateSchedule(executor, task.schedule)
+    // The EFFECTIVE expression — the one a cadence generated, when there is one.
+    // systemd stays the authority on calendar syntax for generated expressions
+    // exactly as it is for hand-written ones (16.10).
+    const expression = effectiveSchedule(task)
+    const schedule = await validateSchedule(executor, expression)
     if (!schedule.ok) {
       reply.code(400)
-      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid schedule '${task.schedule}': ${schedule.error}` } })
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid schedule '${expression}': ${schedule.error}` } })
       return false
     }
     const known = isPveRepoName(task.repository)
@@ -697,6 +704,22 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         const task = await readTask(systemdDir, name)
         if (!task)
           throw new Error(`Backup task '${name}' not found`)
+
+        // Cadence gate (16.10): a biweekly task runs on a WEEKLY timer because
+        // OnCalendar cannot say "every other week", so an off-week SCHEDULED fire
+        // stops here. It completes as a first-class, visible skip — a journal
+        // line, an exit status systemd counts as success, and a `skipped` task
+        // status — never a fake success-with-backup and never a failure. A Run Now
+        // is not gated (explicit user intent), and every other cadence is pure
+        // OnCalendar with nothing to gate.
+        const gate = await gateRun(executor, task)
+        if (!gate.run) {
+          updateProgress(`backup task '${name}': ${gate.detail}`)
+          return { status: BACKUP_SKIPPED_OFF_WEEK, archives: [], reason: gate.detail }
+        }
+        if (gate.reason === 'heal' || gate.reason === 'no-record')
+          updateProgress(`backup task '${name}': ${gate.detail}`)
+
         // Resolve tier-2 (registry) or tier-1 (pve:<id>) repo + secret FRESH.
         // A tier-1 secret is read from /etc/pve/priv/storage/<id>.pw here, at
         // exec time — never copied, never cached (PVE rotation is instant).

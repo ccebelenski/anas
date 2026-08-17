@@ -5,19 +5,25 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { BACKUP_SKIP_EXIT_CODE } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import {
   buildBackupWarnings,
+  classifyTrigger,
   collectBackupWarnings,
   deriveRunResult,
   deriveTaskStatus,
+  deriveTriggerSource,
+  effectiveSchedule,
   failureDetailFromJournal,
+  gateRun,
   isRunActive,
   messageFromJournalLine,
   parseHelperResult,
   parseServiceUnit,
   parseSystemdTimestamp,
   readAllTasks,
+  readLastSuccessAt,
   readRecentJournal,
   removeTaskUnits,
   renderServiceUnit,
@@ -66,6 +72,8 @@ describe('backup units — the systemd units ARE the store (Epic 16.3, NOTES §7
     const unit = renderServiceUnit(makeTask({ limitNofile: 2048 }))
     assert.match(unit, /Type=oneshot/)
     assert.match(unit, /LimitNOFILE=2048/)
+    // A deliberate skip must not read as a failed unit (16.10).
+    assert.match(unit, new RegExp(`SuccessExitStatus=${BACKUP_SKIP_EXIT_CODE}`))
     assert.match(unit, /ExecStart=\/usr\/bin\/node \/opt\/anas\/packages\/daemon\/dist\/backup-task\.js --name nightly-etc/)
     assert.match(unit, /Description=ANAS backup task nightly-etc/)
   })
@@ -80,6 +88,30 @@ describe('backup units — the systemd units ARE the store (Epic 16.3, NOTES §7
   it('parseServiceUnit returns null for a missing marker or invalid JSON', () => {
     assert.equal(parseServiceUnit('[Unit]\nDescription=x\n'), null)
     assert.equal(parseServiceUnit('# X-ANAS-Task={"name":"BAD NAME"}\n'), null)
+  })
+
+  it('a task with a CADENCE round-trips it too, and the timer gets the generated expression', () => {
+    const biweekly = makeTask({
+      name: 'pictures',
+      schedule: 'Tue 02:00',
+      cadence: { kind: 'biweekly', days: ['Tue'], time: '02:00', parity: 'odd' },
+    })
+    assert.deepEqual(parseServiceUnit(renderServiceUnit(biweekly)), biweekly)
+    // The timer is WEEKLY on purpose — the parity gate skips the off weeks.
+    assert.match(renderTimerUnit(biweekly), /OnCalendar=Tue 02:00/)
+    assert.equal(effectiveSchedule(biweekly), 'Tue 02:00')
+
+    const weekly = makeTask({ schedule: 'stale', cadence: { kind: 'weekly', days: ['Tue', 'Thu'], time: '02:00' } })
+    // The cadence is authoritative: a hand-edited unit cannot make the timer lie.
+    assert.equal(effectiveSchedule(weekly), 'Tue,Thu 02:00')
+    assert.match(renderTimerUnit(weekly), /OnCalendar=Tue,Thu 02:00/)
+  })
+
+  it('a task with NO cadence keeps its raw expression verbatim (pre-16.10 tasks)', () => {
+    const raw = makeTask({ schedule: '*-*-* 02:00:00' })
+    assert.equal(effectiveSchedule(raw), '*-*-* 02:00:00')
+    assert.match(renderTimerUnit(raw), /OnCalendar=\*-\*-\* 02:00:00/)
+    assert.equal(parseServiceUnit(renderServiceUnit(raw))?.cadence, undefined)
   })
 
   it('validateSchedule → ok on exit 0, surfaces systemd stderr on failure', async () => {
@@ -198,6 +230,152 @@ describe('backup units — LOCAL-ONLY status derivation', () => {
   it('lastRunAt derives from ExecMainExitTimestamp', async () => {
     const st = await deriveTaskStatus(statusMock({ exitTs: 'Sun 2026-07-19 02:00:12 UTC' }), makeTask())
     assert.equal(st.lastRunAt, '2026-07-19T02:00:12.000Z')
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  Cadence at run time (16.10): the skip status, who triggered a run, the
+//  last-success lookup the heal needs, and cadence-aware overdue.
+// ---------------------------------------------------------------------------
+
+const DAY_MS = 24 * 60 * 60 * 1000
+const BIWEEKLY = { kind: 'biweekly' as const, days: ['Tue' as const], time: '02:00', parity: 'even' as const }
+
+/** A journal blob whose newest helper result is a real success at `at`. */
+function successJournal(at: string, after: string[] = []): string {
+  return [
+    `${at} anas-pve anas-backup-nightly-etc[900]: {"task":"nightly-etc","result":{"status":"success","archives":["etc.pxar: had to backup 82 KiB"]}}`,
+    ...after,
+  ].join('\n')
+}
+
+/** A mock whose journalctl returns `journal` for the task's unit. */
+function journalMock(journal: string): MockExecutor {
+  const mock = new MockExecutor()
+  mock.addFixture({
+    command: JOURNALCTL,
+    args: ['-u', serviceUnitName('nightly-etc'), '-n', '200', '-o', 'short-iso', '--no-pager'],
+    result: { stdout: journal, stderr: '', exitCode: 0 },
+  })
+  return mock
+}
+
+describe('backup cadence at run time — skip status, trigger, last success', () => {
+  it('deriveRunResult reads the deliberate-skip exit code as its own state', () => {
+    const skipped = { ActiveState: 'inactive', Result: 'success', ExecMainStatus: String(BACKUP_SKIP_EXIT_CODE) }
+    assert.equal(deriveRunResult(skipped), 'skipped')
+    // …and it is neither a success nor a failure anywhere else.
+    assert.equal(deriveRunResult({ ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0' }), 'success')
+    assert.equal(runFailed(skipped), false)
+  })
+
+  it('classifyTrigger: the TIMER fired it iff its last trigger is not older than this run', () => {
+    // The `direct` flag cannot answer this — a Run-Now goes through the unit too.
+    const started = 'Tue 2026-08-18 02:00:00 UTC'
+    assert.equal(classifyTrigger({ LastTriggerUSec: started }, { InactiveExitTimestamp: started }), 'scheduled')
+    assert.equal(
+      classifyTrigger({ LastTriggerUSec: 'Tue 2026-08-18 02:00:00 UTC' }, { InactiveExitTimestamp: 'Tue 2026-08-18 10:31:07 UTC' }),
+      'manual',
+    )
+    // Unknowable → manual, which leaves the gate open (never a missed backup).
+    assert.equal(classifyTrigger({ LastTriggerUSec: 'n/a' }, { InactiveExitTimestamp: started }), 'manual')
+    assert.equal(classifyTrigger({}, {}), 'manual')
+  })
+
+  it('deriveTriggerSource reads the timer + service props (fail-open to manual)', async () => {
+    const mock = new MockExecutor()
+    const stamp = 'Tue 2026-08-18 02:00:00 UTC'
+    mock.addFixture({ command: SYSTEMCTL, args: ['show', timerUnitName('nightly-etc'), '-p', 'LastTriggerUSec'], result: { stdout: `LastTriggerUSec=${stamp}\n`, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: SYSTEMCTL, args: ['show', serviceUnitName('nightly-etc'), '-p', 'InactiveExitTimestamp'], result: { stdout: `InactiveExitTimestamp=${stamp}\n`, stderr: '', exitCode: 0 } })
+    assert.equal(await deriveTriggerSource(mock, 'nightly-etc'), 'scheduled')
+    assert.equal(await deriveTriggerSource(new MockExecutor(), 'nightly-etc'), 'manual')
+  })
+
+  it('readLastSuccessAt finds the newest REAL success, past skips and failures', async () => {
+    const journal = successJournal('2026-08-04T02:00:07+0000', [
+      '2026-08-11T02:00:01+0000 anas-pve anas-backup-nightly-etc[930]: {"task":"nightly-etc","result":{"status":"skipped-off-week","reason":"ISO week 33 is odd…"}}',
+      '2026-08-18T02:00:03+0000 anas-pve anas-backup-nightly-etc[940]: Error: permission check failed.',
+    ])
+    assert.equal(await readLastSuccessAt(journalMock(journal), 'nightly-etc'), '2026-08-04T02:00:07.000Z')
+    // No record (rotated journal / never run) is null, never a guess.
+    assert.equal(await readLastSuccessAt(journalMock(''), 'nightly-etc'), null)
+    assert.equal(await readLastSuccessAt(new MockExecutor(), 'nightly-etc'), null)
+  })
+
+  it('gateRun: an on-week scheduled fire runs WITHOUT paying for a journal read', async () => {
+    const mock = journalMock(successJournal('2026-08-04T02:00:07+0000'))
+    const stamp = 'Tue 2026-08-18 02:00:00 UTC'
+    mock.addFixture({ command: SYSTEMCTL, args: ['show', timerUnitName('nightly-etc'), '-p', 'LastTriggerUSec'], result: { stdout: `LastTriggerUSec=${stamp}\n`, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: SYSTEMCTL, args: ['show', serviceUnitName('nightly-etc'), '-p', 'InactiveExitTimestamp'], result: { stdout: `InactiveExitTimestamp=${stamp}\n`, stderr: '', exitCode: 0 } })
+    const task = makeTask({ schedule: 'Tue 02:00', cadence: BIWEEKLY })
+    const d = await gateRun(mock, task, new Date(2026, 7, 18, 2, 0)) // ISO week 34 (even)
+    assert.equal(d.run, true)
+    assert.equal(d.reason, 'on-week')
+    assert.equal(mock.calls.some(c => c.command === JOURNALCTL), false)
+  })
+
+  it('gateRun: an off-week scheduled fire skips, reading the journal for the heal check', async () => {
+    const mock = journalMock(successJournal('2026-08-18T02:00:07+0000'))
+    const stamp = 'Tue 2026-08-25 02:00:00 UTC'
+    mock.addFixture({ command: SYSTEMCTL, args: ['show', timerUnitName('nightly-etc'), '-p', 'LastTriggerUSec'], result: { stdout: `LastTriggerUSec=${stamp}\n`, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: SYSTEMCTL, args: ['show', serviceUnitName('nightly-etc'), '-p', 'InactiveExitTimestamp'], result: { stdout: `InactiveExitTimestamp=${stamp}\n`, stderr: '', exitCode: 0 } })
+    const task = makeTask({ schedule: 'Tue 02:00', cadence: BIWEEKLY })
+    const d = await gateRun(mock, task, new Date(2026, 7, 25, 2, 0)) // ISO week 35 (odd)
+    assert.equal(d.run, false)
+    assert.equal(d.reason, 'off-week')
+    assert.ok(mock.calls.some(c => c.command === JOURNALCTL))
+  })
+
+  it('gateRun: a task with no cadence is never gated and reads nothing at all', async () => {
+    const mock = new MockExecutor()
+    const d = await gateRun(mock, makeTask(), new Date(2026, 7, 25))
+    assert.equal(d.run, true)
+    assert.equal(d.reason, 'ungated')
+    assert.equal(mock.calls.length, 0)
+  })
+})
+
+describe('backup cadence — overdue measured against the cadence, not the timer', () => {
+  /** systemctl show fixtures + a journal, for a task whose last run was a skip. */
+  function skippedTaskMock(journal: string, nextTs: string): MockExecutor {
+    const mock = journalMock(journal)
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['show', serviceUnitName('nightly-etc'), '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'],
+      result: { stdout: `ActiveState=inactive\nResult=success\nExecMainStatus=${BACKUP_SKIP_EXIT_CODE}\nExecMainExitTimestamp=\nInactiveEnterTimestamp=\n`, stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['show', timerUnitName('nightly-etc'), '-p', 'NextElapseUSecRealtime'],
+      result: { stdout: `NextElapseUSecRealtime=${nextTs}\n`, stderr: '', exitCode: 0 },
+    })
+    return mock
+  }
+
+  const now = Date.UTC(2026, 7, 25, 2, 0, 0)
+  const futureUsec = String((now + DAY_MS) * 1000)
+  const task = () => makeTask({ schedule: 'Tue 02:00', cadence: BIWEEKLY })
+
+  it('8 days after the last success (an off-week skip in between) is NOT overdue', async () => {
+    const journal = successJournal(new Date(now - 8 * DAY_MS).toISOString().replace('.000Z', '+0000'))
+    const st = await deriveTaskStatus(skippedTaskMock(journal, futureUsec), task(), now)
+    assert.equal(st.lastRunResult, 'skipped')
+    assert.equal(st.overdue, false)
+    assert.equal(st.lastSuccessAt, new Date(now - 8 * DAY_MS).toISOString())
+  })
+
+  it('15 days after the last success IS overdue (a whole period went by)', async () => {
+    const journal = successJournal(new Date(now - 15 * DAY_MS).toISOString().replace('.000Z', '+0000'))
+    const st = await deriveTaskStatus(skippedTaskMock(journal, futureUsec), task(), now)
+    assert.equal(st.overdue, true)
+  })
+
+  it('a raw-schedule task never pays for the journal read (no period to measure)', async () => {
+    const mock = skippedTaskMock('', futureUsec)
+    const st = await deriveTaskStatus(mock, makeTask(), now)
+    assert.equal(st.overdue, false)
+    assert.equal(st.lastSuccessAt, null)
+    assert.equal(mock.calls.some(c => c.command === JOURNALCTL), false)
   })
 })
 
