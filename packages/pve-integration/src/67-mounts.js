@@ -53,8 +53,9 @@
  *       credentials:{ username, password, domain } }         (CIFS; write-only)
  *     nofail is FORCED by the daemon (default mode) — the UI shows it locked-on
  *     and does NOT send it as a choice.
- *   PUT /v1/mounts/:mountpoint → 202 { job }   same body (edit; password omitted
- *     when left blank = "unchanged").
+ *   PUT /v1/mounts/:mountpoint → 202 { job }   same body minus `persistent`
+ *     (create-time only — the PUT does not act on it) and minus `credentials`
+ *     unless the operator typed a new password ("unchanged" otherwise).
  *   DELETE /v1/mounts/:mountpoint → 202/409   (unmount + drop fstab; busy → 409
  *     with confirm code + holding-process warnings).
  *
@@ -118,6 +119,20 @@
             return f ? f.getValue() : undefined;
         } catch (e) {
             return undefined;
+        }
+    }
+
+    // Access radio → boolean, for the preview and the submit alike. The
+    // radiogroup is the only source of truth: a hidden-field mirror is a
+    // Text-class field, so a mirrored boolean comes back as the truthy string
+    // 'false' and every save reads read-only (issue #26). Compare strings.
+    function roOf(win) {
+        try {
+            var g = win.down('#roGroup');
+            var v = g && g.getValue();
+            return !!(v && v.roMode === 'ro');
+        } catch (e) {
+            return false;
         }
     }
 
@@ -1018,7 +1033,7 @@
     // nofail is FORCED and shown first; this is a preview only.
     function buildOptionList(win, type) {
         var opts = [];
-        if (valOf(win, '#optRo')) {
+        if (roOf(win)) {
             opts.push('ro');
         } else {
             opts.push('rw');
@@ -1308,6 +1323,7 @@
             items: [
                 {
                     xtype: 'radiogroup',
+                    itemId: 'roGroup',
                     fieldLabel: t('Access'),
                     columns: 2,
                     items: [
@@ -1316,18 +1332,15 @@
                     ],
                     listeners: {
                         change: function (f) {
-                            // Mirror into a hidden itemId-addressable field for the
-                            // preview/submit readers (radiogroup has no itemId get).
+                            // The group itself is read at preview/submit time (roOf);
+                            // this listener only keeps the preview current.
                             var win = f.up('window');
                             if (win) {
-                                var ro = win.down('#optRo');
-                                if (ro) { ro.setValue(f.getValue().roMode === 'ro'); }
                                 updatePreview(win);
                             }
                         },
                     },
                 },
-                { xtype: 'hiddenfield', itemId: 'optRo', value: false },
                 {
                     xtype: 'component',
                     cls: 'anas-mount-nofail',
@@ -1693,11 +1706,39 @@
                 {
                     xtype: 'textfield', itemId: 'credUser', fieldLabel: t('Username'),
                     emptyText: 'smbuser',
+                    // This dialog lives in the PVE origin: a user/password pair is
+                    // exactly the shape a password manager autofills (issue #23).
+                    inputAttrTpl: 'autocomplete="off"',
                 },
                 {
                     xtype: 'textfield', itemId: 'credPass', fieldLabel: t('Password'),
                     inputType: 'password',
                     emptyText: isEdit ? t('(unchanged)') : '',
+                    // 'new-password' is the hint browsers honour on password inputs;
+                    // bare 'off' is routinely ignored there.
+                    inputAttrTpl: 'autocomplete="new-password"',
+                    listeners: {
+                        afterrender: function (f) {
+                            // Second layer: on edit, only a secret the operator
+                            // actually typed or pasted may rotate the creds file —
+                            // an injected value must not (submitMount reads the flag).
+                            try {
+                                var el = f.inputEl && f.inputEl.dom;
+                                if (!el) {
+                                    // Cannot observe interaction: fall back to the
+                                    // value test alone rather than blocking rotation.
+                                    f._userTyped = true;
+                                    return;
+                                }
+                                var mark = function () { f._userTyped = true; };
+                                el.addEventListener('keydown', mark);
+                                el.addEventListener('paste', mark);
+                            } catch (eTyped) {
+                                f._userTyped = true;
+                                ANAS.warn('mount password wiring failed: ' + ANAS.errText(eTyped));
+                            }
+                        },
+                    },
                 },
                 {
                     xtype: 'textfield', itemId: 'credDomain', fieldLabel: t('Domain (optional)'),
@@ -1838,6 +1879,7 @@
                             cls: 'anas-fld-mount-persist',
                             fieldLabel: t('Persist'),
                             boxLabel: t('Write an /etc/fstab entry (off = mount now only)'),
+                            readOnly: isEdit, // identity — cannot change on edit
                             checked: (first(raw.persistent, raw.inFstab) !== false),
                         },
                         {
@@ -1983,10 +2025,10 @@
             setFld(win, '#server', d.server);
             setFld(win, '#remotePath', d.remotePath);
 
-            // Common options. The Access radiogroup has no itemId — address the
-            // sole radiogroup in the form; its change listener mirrors #optRo.
+            // Common options. Access is a radiogroup, not a checkbox — set the
+            // group's value map (roOf reads the same group back at submit time).
             try {
-                var roGroup = win.down('#form radiogroup');
+                var roGroup = win.down('#roGroup');
                 if (roGroup) { roGroup.setValue({ roMode: common.readOnly ? 'ro' : 'rw' }); }
             } catch (eRo) {
                 // non-fatal
@@ -2081,7 +2123,7 @@
         // Structured known-tier options + free-text passthrough. nofail is FORCED
         // by the daemon, so we do NOT send it as a choice.
         var options = {
-            ro: !!valOf(win, '#optRo'),
+            ro: roOf(win),
             noatime: !!valOf(win, '#optNoatime'),
             nosuid: !!valOf(win, '#optNosuid'),
             nodev: !!valOf(win, '#optNodev'),
@@ -2154,17 +2196,25 @@
             server: server,
             remotePath: remotePath,
             mountpoint: mountpoint,
-            persistent: !!valOf(win, '#persist'),
             automount: automount,
             options: options,
         };
+        if (!isEdit) {
+            // Persistence is create-time only — the PUT does not act on it, so
+            // sending it would be a control that lies (issue #27).
+            body.persistent = !!valOf(win, '#persist');
+        }
         var extra = ('' + (valOf(win, '#extraOptions') || '')).trim();
         if (extra) {
             body.extraOptions = extra;
         }
         if (type === 'cifs') {
             var user = ('' + (valOf(win, '#credUser') || '')).trim();
-            var pass = valOf(win, '#credPass');
+            var passFld = win.down('#credPass');
+            var pass = passFld ? passFld.getValue() : '';
+            // A password manager can fill this field inside the PVE origin; only a
+            // typed/pasted secret counts as a rotation on edit (issue #23).
+            var passTyped = !!(passFld && passFld._userTyped);
             if (!isEdit) {
                 // Create: credentials are required (the daemon enforces it). Send
                 // whatever was typed; the schema requires username + password.
@@ -2173,12 +2223,13 @@
                 if (pass) { creds.password = pass; }
                 if (dom) { creds.domain = dom; }
                 body.credentials = creds;
-            } else if (pass) {
+            } else if (pass && passTyped) {
                 // Edit: only ROTATE when a new password is entered. Username and
                 // password travel together (the creds file needs both, and the
-                // schema requires both). A blank password means "keep the existing
-                // credentials" — omit the block so the daemon leaves the 0600
-                // creds file untouched. (Domain still round-trips as a mount option.)
+                // schema requires both). A blank (or merely autofilled) password
+                // means "keep the existing credentials" — omit the block so the
+                // daemon leaves the 0600 creds file untouched. (Domain still
+                // round-trips as a mount option.)
                 var creds2 = { username: user, password: pass };
                 if (dom) { creds2.domain = dom; }
                 body.credentials = creds2;
