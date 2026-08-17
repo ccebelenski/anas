@@ -47,6 +47,30 @@ and modes actually stored), never a pattern the product follows.
 | `backup-failure-taxonomy.txt` | 11 probes (baseline + unreachable / wrong-port / DNS-fail / bad-fingerprint / wrong-password / bad-token / revoked-token / no-permission / bad-datastore / bad-namespace), verbatim stderr + exit code, with a discriminator summary. |
 | `timer-shape.txt` | Hand-written `anas-backup-test.service`+`.timer` (LimitNOFILE=1024, OnCalendar), `systemctl list-timers`, and `systemctl show` trimmed to the props `replication-units.ts` reads. Units removed after. |
 
+### Retention / prune index (story 16.11, captured 2026-08-17)
+
+Same stunt PBS harness (PBS 4.2.3), **datastore recreated dir-backed** after the
+original `testpool` was lost — with a trap worth recording: `proxmox-backup-manager
+datastore remove` **PURGES the path's ACLs**, so the token's permissions had to be
+re-granted before anything worked again. The 11-snapshot history was synthetic,
+built with backdated `--backup-time` in **OLDEST-FIRST order** because **PBS refuses
+any backup older than the group's latest snapshot** (there is no backfill — build
+history forward or not at all). The group `host/prune-gt2` (namespace `anastest`)
+was **left in place** for the live-proof stage.
+
+| File | What it is |
+|------|------------|
+| `prune-output-format-json.txt` | **The product path.** `prune host/prune-gt2 --ns anastest --dry-run --keep-last 2 --output-format json`, exit 0 → the structured array (`backup-id`, `backup-time` (unix s), `backup-type`, `keep`, `ns`, `protected`). Dry-run and REAL prune emit the SAME shape. This is the only prune output ANAS parses (Principle 13). |
+| `prune-dry-run-keep-last.txt` | Default (no `--output-format`) `--dry-run --keep-last 3` — the box-drawing HUMAN table. Kept to document the path we deliberately never parse. |
+| `prune-dry-run-buckets.txt` | Human table, bucket keeps (`--keep-daily/weekly/monthly`) — shows PBS's own bucketing (an old snapshot the buckets do not claim is removed). |
+| `prune-real-buckets.txt` | The same buckets **for real** (no `--dry-run`), plus `--keep-yearly 1` — the yearly bucket rescues the 2025 snapshot the dry run above dropped. |
+| `prune-noop-after.txt` | Re-running the same real prune: everything `keep` — prune is idempotent. |
+| `verify-snapshot-list-after.txt` | `snapshot list --output-format json` after the real prune: 7 snapshots remain (the removed one is gone). Verification of the capture only — the product never polls the server for status. |
+| `prune-no-keep-flags.txt` | `prune` with NO keep flags: keep-all, exit 0. Documents WHY ANAS never runs this path — an absent policy simply does not invoke prune. |
+| `prune-missing-group.txt` | Missing GROUP → `Error: ENOENT: No such file or directory`, exit 255. |
+| `prune-bad-namespace.txt` | Missing NAMESPACE → **byte-identical** `Error: ENOENT: No such file or directory`, exit 255. The two are INDISTINGUISHABLE — the verdict must say "group or namespace", never guess. |
+| `prune-no-permission.txt` | Token without prune rights → `Error: permission check failed - missing Datastore.Modify\|Datastore.Prune on /datastore/<store>/<ns>`, exit 255 → the "lacks prune privileges" verdict, naming the privileges. |
+
 ---
 
 ## 1. The env-var contract (both auth styles)
@@ -261,6 +285,36 @@ replication-store pattern transfers directly to backup:
 (rename `anas-repl-` → `anas-backup-`, add `LimitNOFILE=` to the rendered service). No
 new status mechanism needed; the LOCAL-ONLY status ruling is satisfied by the exact
 systemd props the replication code already reads.
+
+---
+
+## 8. Retention / prune (story 16.11, 2026-08-17)
+
+`proxmox-backup-client prune <group> [--ns <ns>] --keep-* N … [--dry-run]
+--output-format json` — the ONLY prune ANAS runs, and only ever with the task's
+own keep flags.
+
+- **`--output-format json` is the contract**: exit 0 → an array of
+  `{backup-id, backup-time, backup-type, keep, ns, protected}`. `keep:false` = the
+  snapshot is (or would be) removed. **Dry-run and real prune emit the identical
+  shape**, so ONE parser serves both the post-backup prune and the preview.
+- **`backup-time` is unix SECONDS**, not ms and not an ISO string.
+- **No keep flags = keep-all, exit 0** — a documented no-op. ANAS never invokes it:
+  an absent policy means prune is not run at all.
+- **ENOENT is ambiguous by design**: a missing group and a missing namespace both
+  print `Error: ENOENT: No such file or directory` (exit 255), byte for byte. The
+  verdict wording says "the backup group or the namespace" and stops there.
+- **Permission**: `Error: permission check failed - missing
+  Datastore.Modify|Datastore.Prune on /datastore/<store>/<ns>` (exit 255) — the
+  credential authenticated but may not prune.
+- **Prune is idempotent** (`prune-noop-after.txt`) and **only marks**: space is
+  reclaimed by the datastore's garbage collection, which stays PBS-side. ANAS
+  never surfaces or triggers GC.
+- **Capture traps** (cost real time, recorded so they are not re-learned):
+  `proxmox-backup-manager datastore remove` **purges the path's ACLs**; and PBS
+  **refuses any backup older than the group's latest snapshot**, so a synthetic
+  history must be built with `--backup-time` in OLDEST-FIRST order (no backfill
+  exists).
 
 ---
 

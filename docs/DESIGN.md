@@ -252,7 +252,7 @@ The edit (`PUT`) flow is **validate-then-commit and verify-delivered** (issues #
 
 #### Backup — PBS file backup (Epic 16; designed 2026-07-18)
 
-Mirrors the replication API shape. Repositories live in the cluster-wide CAS-versioned registry (`/etc/pve/anas/backup-repos.json`, pmxcfs) with per-repo secrets in `/etc/anas/creds/` (0600, write-only via API — token secret or password, user's choice). Tasks ARE systemd units (`anas-backup-<name>.service`/`.timer`) — no second config source. **Status is local-only** (persistent systemd state + journald + jobs): the only PBS-server contacts are backup runs and the explicit user-initiated repository test.
+Mirrors the replication API shape. Repositories live in the cluster-wide CAS-versioned registry (`/etc/pve/anas/backup-repos.json`, pmxcfs) with per-repo secrets in `/etc/anas/creds/` (0600, write-only via API — token secret or password, user's choice). Tasks ARE systemd units (`anas-backup-<name>.service`/`.timer`) — no second config source. **Status is local-only** (persistent systemd state + journald + jobs): the only PBS-server contacts are backup runs, the explicit user-initiated repository test, and — since 16.11 — the post-backup retention prune plus its user-initiated dry-run preview. Never polling, never background.
 
 | Method | Path | Description | Response |
 |--------|------|-------------|----------|
@@ -263,10 +263,13 @@ Mirrors the replication API shape. Repositories live in the cluster-wide CAS-ver
 | `POST` | `/v1/backup/repos/test` | User-initiated diagnosis: dns / tcp / tls-fingerprint / auth / datastore / namespace verdicts | `200` |
 | `GET` | `/v1/backup/tasks` | Task grid: schedule, enabled, last result, next run, overdue (systemd state) | `200` |
 | `GET` | `/v1/backup/tasks/:name` | Detail: full config, unit/timer as written, recent journald runs (labeled recent-only) | `200` |
-| `POST` | `/v1/backup/tasks` | Create task (repo ref + namespace + backup-id + archives[{name,path,excludes[]}] + mode + schedule *or* cadence) | `202` with job |
+| `POST` | `/v1/backup/tasks` | Create task (repo ref + namespace + backup-id + archives[{name,path,excludes[]}] + mode + optional retention + schedule *or* cadence) | `202` with job |
 | `PUT` | `/v1/backup/tasks/:name` | Update / enable / disable | `202` with job |
 | `DELETE` | `/v1/backup/tasks/:name` | Remove task (units removed; PBS data untouched) | `202`/`409` |
 | `POST` | `/v1/backup/tasks/:name/run` | Run now (job with progress from client output) | `202` with job |
+| `POST` | `/v1/backup/tasks/:name/prune-preview` | Retention DRY RUN (`prune --dry-run --output-format json`): the wizard's Preview button. User-initiated, one-shot, non-mutating; body may carry the task inline so an unsaved task previews | `200` |
+
+**Retention (16.11) is OPTIONAL and per task** — `{keepLast?,keepDaily?,keepWeekly?,keepMonthly?,keepYearly?}` (positive ints), stored in the task's unit JSON like every other field. Absent = **ANAS never invokes prune** (PBS-side retention stays the default posture; a keep-flag-less prune is a server-side keep-all no-op we do not even run). Present: after a **successful** run the same job executes `proxmox-backup-client prune host/<backup-id> [--ns] --keep-* … --output-format json` and reports kept/removed/protected counts; a failed run and a skip never prune. **A prune failure never fails the job** — the backup data is already safe, so the job completes carrying `warnings[]` (vzdump's own posture). Prune only marks; **GC stays PBS-side** and is never surfaced or triggered. This widens the sanctioned PBS-contact list by exactly two calls (the post-backup prune, the user-initiated preview) — the never-poll rule is untouched.
 
 The fd cap (default 1024, per-task override) binds pbc via `prlimit --nofile=N:N` around the daemon's exec — pbc hoards file handles, worst in metadata change-detection mode; the unit's `LimitNOFILE=` only bounds the thin helper (pbc runs inside anasd, not the unit cgroup — live-proof finding). Dashboard warning category `backup`: failures and silently-overdue only.
 

@@ -1,0 +1,3 @@
+$ proxmox-backup-client prune host/prune-gt2 --ns anastest --dry-run --keep-last 1
+Error: permission check failed - missing Datastore.Modify|Datastore.Prune on /datastore/anastest-store/anastest
+exit=255

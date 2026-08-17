@@ -1,4 +1,5 @@
 import type {
+  BackupPrunePreviewResponse,
   BackupRepo,
   BackupRepoResponse,
   BackupRepoTestResult,
@@ -14,12 +15,15 @@ import type { BackupReposPaths } from '../services/backup-repos.js'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
   BackupName,
+  BackupPrunePreviewRequest,
   BackupRepoTestRequest,
   BackupRunRequest,
   BackupTaskRequest,
+  hasRetentionKeeps,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
 import { readPbsStorages } from '../parsers/pve-storage.js'
+import { pruneAfterBackup, pruneGroup, runPrune } from '../services/backup-prune.js'
 import {
   isPveRepoName,
   pbsDefToRepo,
@@ -78,10 +82,12 @@ import { requireIdentity } from './identity.js'
  *   DELETE /v1/backup/tasks/:name      → remove units (PBS data untouched)
  *   POST   /v1/backup/tasks/:name/run  → Run Now (UI: start+supervise the unit;
  *                                        direct:true: the unit's own pbc exec)
+ *   POST   /v1/backup/tasks/:name/prune-preview → retention dry-run (16.11)
  *
  * Mutations are identity-gated jobs (202 → { job }); registry writes are
  * COMPARE-AND-SWAP. Status is LOCAL-ONLY — ANAS never contacts the PBS server
- * except for backup runs and the explicit user-initiated Test.
+ * except for backup runs, the explicit user-initiated Test, the post-backup
+ * retention prune, and this story's user-initiated prune preview. Never polls.
  */
 export interface BackupRouteOptions {
   executor: CommandExecutor
@@ -732,11 +738,117 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             ? `No PBS credential file for '${task.repository}' (${paths.pvePrivStorageDir}/${pveStorageId(task.repository)}.pw is missing) — set it in Datacenter → Storage`
             : `No secret stored for repository '${repo.name}' — set its credentials first`)
         }
-        return runBackup(executor, { task, repo, secret }, updateProgress)
+        const result = await runBackup(executor, { task, repo, secret }, updateProgress)
+        // Retention (16.11): prune ONLY after a run that actually backed up. A
+        // 'skipped' run (the benign too-soon collision — and any future cadence
+        // skip) never prunes, and a FAILED run threw long before this line. A
+        // task with no retention prunes nothing at all (the default posture);
+        // a prune failure rides back as a warning, never a job failure.
+        if (result.status !== 'success')
+          return result
+        const retention = await pruneAfterBackup(executor, {
+          task,
+          repo,
+          secret,
+          onProgress: updateProgress,
+          log: (message, level) => (level === 'warn' ? server.log.warn(message) : server.log.info(message)),
+        })
+        return { ...result, ...retention }
       },
     )
     reply.code(202)
     return { job }
+  })
+
+  // --- POST /backup/tasks/:name/prune-preview — dry-run retention preview ----
+  // USER-INITIATED, one-shot, NON-MUTATING (`--dry-run`): the wizard's Preview
+  // button. It is the second (and last) PBS contact this story sanctions, the
+  // save-time namespace-verify precedent reapplied — never polled, never
+  // background. Every field may be supplied inline so an UNSAVED task can be
+  // previewed; omitted fields fall back to the stored task's own values.
+  server.post<{ Params: { name: string } }>('/backup/tasks/:name/prune-preview', async (request, reply) => {
+    const nameParsed = BackupName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid task name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const name = nameParsed.data
+
+    const bodyParsed = BackupPrunePreviewRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid preview request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const req = bodyParsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const stored = await readTask(systemdDir, name)
+    const repository = req.repository ?? stored?.repository
+    const backupId = req.backupId ?? stored?.backupId
+    const retention = req.retention ?? stored?.retention
+    if (!repository || !backupId) {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: `Backup task '${name}' is not saved yet — send repository and backupId with the preview request`,
+        },
+      }
+    }
+    if (!hasRetentionKeeps(retention)) {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'Set at least one retention keep before previewing — with no keep flags PBS keeps everything, so ANAS never runs prune',
+        },
+      }
+    }
+
+    const resolved = await resolveRepoAndSecret(repository)
+    if (!resolved) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Repository '${repository}' not found` } }
+    }
+    const { repo, secret } = resolved
+    if (secret === null) {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: isPveRepoName(repository)
+            ? `No PBS credential file for '${repository}' — set it in Datacenter → Storage`
+            : `No secret stored for repository '${repo.name}' — set its credentials first`,
+        },
+      }
+    }
+
+    // Effective namespace: the request's, else the stored task's, else the
+    // repo's own — the same fallback the run path uses.
+    const namespace = req.namespace ?? stored?.namespace ?? repo.namespace
+    const outcome = await runPrune(executor, {
+      repo,
+      secret,
+      backupId,
+      ...(namespace ? { namespace } : {}),
+      retention: retention as NonNullable<typeof retention>,
+      dryRun: true,
+    })
+
+    const data: BackupPrunePreviewResponse = outcome.ok
+      ? { verdict: 'ok', result: outcome.result }
+      : { verdict: outcome.verdict, detail: outcome.detail }
+
+    // Fire-and-forget audit record (journald) — mirrors the repo Test endpoint.
+    jobQueue.submit(
+      'backup.task.prune-preview',
+      { ...identity, params: { task: name, repo: repo.name, group: pruneGroup(backupId) } },
+      async () => ({ verdict: data.verdict }),
+    )
+    return { data }
   })
 }
 

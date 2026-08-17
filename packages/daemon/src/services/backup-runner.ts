@@ -1,4 +1,4 @@
-import type { BackupRepo, BackupRepoTestResult, BackupTask } from '@anas/shared'
+import type { BackupPruneResult, BackupRepo, BackupRepoTestResult, BackupTask } from '@anas/shared'
 import type { PeerCertificate } from 'node:tls'
 import type { CommandExecutor } from '../executor/types.js'
 import { lookup } from 'node:dns/promises'
@@ -102,6 +102,16 @@ export function buildBackupArgs(task: BackupTask, namespace?: string): string[] 
   if (task.changeDetectionMode === 'metadata')
     args.push('--change-detection-mode=metadata')
   return args
+}
+
+/**
+ * The EFFECTIVE namespace for a task against a repo: the task's if set, else the
+ * repo's own (a PVE-defined storage often carries one — zero re-entry, 16.8).
+ * The ONE place that fallback is expressed; the backup argv, the prune argv and
+ * the test path all read it from here.
+ */
+export function effectiveNamespace(task: BackupTask, repo: BackupRepo): string | undefined {
+  return task.namespace ?? repo.namespace
 }
 
 /**
@@ -234,6 +244,13 @@ export interface BackupRunResult {
   nofileWarning?: string
   /** Present for a benign too-soon skip (explains why it did nothing). */
   reason?: string
+  /** Retention prune counts, when the task configured one and it ran (16.11). */
+  prune?: BackupPruneResult
+  /**
+   * Completed-with-warning detail — a prune that failed AFTER a successful
+   * backup never fails the job (the data is safe); it rides here instead.
+   */
+  warnings?: string[]
 }
 
 /**
@@ -253,7 +270,7 @@ export async function runBackup(
   // Effective namespace: the task's if set, else the repo's (zero re-entry for a
   // repo that already carries one, e.g. a PVE-defined storage). Mirrors the test
   // path, which probes repo.namespace.
-  const args = buildBackupArgs(task, task.namespace ?? repo.namespace)
+  const args = buildBackupArgs(task, effectiveNamespace(task, repo))
 
   // The fd cap must bind pbc ITSELF: pbc execs inside anasd (nofile 524288 —
   // Node raises soft→hard), not in the task unit's cgroup, so the unit's

@@ -1,4 +1,4 @@
-import type { BackupRunResult, BackupTask, DashboardWarning } from '@anas/shared'
+import type { BackupPruneResult, BackupRunResult, BackupTask, DashboardWarning } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { BackupTrigger, CadenceGateDecision } from './backup-cadence.js'
 import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
@@ -593,6 +593,10 @@ export interface SuperviseRunResult {
   nofileWarning?: string
   /** Why a run did nothing (too-soon) or is still running (ceiling). */
   reason?: string
+  /** Retention prune counts recovered from the helper's result (16.11). */
+  prune?: BackupPruneResult
+  /** Completed-with-warning detail (e.g. a prune that failed after a good backup). */
+  warnings?: string[]
 }
 
 /** The shape the backup-task helper prints as JSON (its `job.result`). */
@@ -602,6 +606,8 @@ interface HelperResult {
   target?: string
   nofileWarning?: string
   reason?: string
+  prune?: BackupPruneResult
+  warnings?: string[]
 }
 
 /** Is a `systemctl show` snapshot in a still-running state? */
@@ -734,6 +740,13 @@ async function classifyTerminalRun(
     result.target = helper.target
   if (helper?.nofileWarning)
     result.nofileWarning = helper.nofileWarning
+  // Retention (16.11): the counts — and a prune that failed after a SUCCESSFUL
+  // backup — travel through the helper's result JSON, so a UI Run-Now surfaces
+  // them exactly like a scheduled run's journal does.
+  if (helper?.prune)
+    result.prune = helper.prune
+  if (helper?.warnings?.length)
+    result.warnings = helper.warnings
   if (helper?.reason)
     result.reason = helper.reason
   else if (status === 'skipped')

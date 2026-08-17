@@ -63,9 +63,18 @@ describe('backup units — the systemd units ARE the store (Epic 16.3, NOTES §7
         { name: 'documents', path: '/root/anas-src/documents', excludes: ['*.tmp'] },
         { name: 'pictures', path: '/root/anas-src/pictures', excludes: [] },
       ] }),
+      // Retention (16.11) rides the same X-ANAS-Task JSON — units ARE the store.
+      makeTask({ name: 'kept', retention: { keepLast: 3, keepDaily: 7, keepWeekly: 4, keepMonthly: 6, keepYearly: 1 } }),
+      makeTask({ name: 'kept-one', retention: { keepDaily: 14 } }),
     ]) {
       assert.deepEqual(parseServiceUnit(renderServiceUnit(task)), task)
     }
+  })
+
+  it('a task with NO retention round-trips with no retention key at all', () => {
+    const unit = renderServiceUnit(makeTask())
+    assert.ok(!unit.includes('retention'))
+    assert.equal(parseServiceUnit(unit)!.retention, undefined)
   })
 
   it('service is a oneshot carrying LimitNOFILE + the backup-task ExecStart', () => {
@@ -508,6 +517,25 @@ describe('backup Run-Now supervision (Fix 1 — through the unit)', () => {
     assert.equal(r!.status, 'success')
     assert.ok(r!.archives!.some(l => l.startsWith('etc.pxar:')))
     assert.equal(parseHelperResult(FAILED_JOURNAL), null) // a failure logs no result JSON
+  })
+
+  it('retention counts + a prune warning survive the helper journal (16.11)', async () => {
+    const journal = [
+      '2026-08-17T21:06:32+0000 anas-pve anas-backup-nightly-etc[999]: {"task":"nightly-etc","result":{"status":"success","archives":[],"prune":{"group":"host/anas-pve","namespace":"anastest","dryRun":false,"kept":2,"removed":5,"protectedCount":0,"snapshots":[]},"warnings":["Backup succeeded, but the retention prune did not run: nope"]}}',
+      '2026-08-17T21:06:32+0000 anas-pve systemd[1]: anas-backup-nightly-etc.service: Deactivated successfully.',
+    ].join('\n')
+    const exec = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        { ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0', InvocationID: 'NEW' },
+      ],
+      journal,
+    })
+    const res = await superviseRun(exec, 'nightly-etc', FAST)
+    assert.equal(res.status, 'success')
+    assert.equal(res.prune!.kept, 2)
+    assert.equal(res.prune!.removed, 5)
+    assert.match(res.warnings![0], /retention prune did not run/)
   })
 
   it('failureDetailFromJournal returns pbc\'s verbatim Error line', () => {

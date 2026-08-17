@@ -206,6 +206,103 @@ export const BACKUP_SKIP_EXIT_CODE = 75
  */
 export const BACKUP_SKIPPED_OFF_WEEK = 'skipped-off-week'
 
+// ---- Retention (story 16.11) -----------------------------------------------
+
+/**
+ * OPTIONAL per-task retention — PBS's own `--keep-*` flags, verbatim (the CLI is
+ * the API; we neither invent a policy language nor re-implement bucketing —
+ * `proxmox-backup-client prune` owns that).
+ *
+ * ABSENT (or every field unset) means ANAS **never invokes prune** — today's
+ * behavior, PBS-side retention (server prune jobs) stays the default posture. A
+ * prune with no keep flags is a keep-all no-op on the server (ground truth
+ * `prune-no-keep-flags.txt`); we do not even run it. Keeps are POSITIVE ints —
+ * `0`/negative are rejected rather than silently meaning "keep none".
+ */
+export const BackupRetention = z.object({
+  keepLast: z.number().int().positive().optional(),
+  keepDaily: z.number().int().positive().optional(),
+  keepWeekly: z.number().int().positive().optional(),
+  keepMonthly: z.number().int().positive().optional(),
+  keepYearly: z.number().int().positive().optional(),
+})
+export type BackupRetention = z.infer<typeof BackupRetention>
+
+/**
+ * Does a retention policy actually ask for anything? The ONE place that question
+ * is answered (daemon runner, routes, and the task-request normalizer all call
+ * it): an absent policy — or one whose every keep is unset — never prunes.
+ */
+export function hasRetentionKeeps(retention: BackupRetention | undefined | null): boolean {
+  if (!retention)
+    return false
+  return (['keepLast', 'keepDaily', 'keepWeekly', 'keepMonthly', 'keepYearly'] as const)
+    .some(k => typeof retention[k] === 'number')
+}
+
+/**
+ * One snapshot as `prune --output-format json` reports it (ground truth
+ * `prune-output-format-json.txt`): PBS's kebab-case keys mapped to the domain
+ * shape. Dry-run and real prune emit the SAME array; `keep:false` means the
+ * snapshot is (or would be) removed. `protected` snapshots are always kept.
+ */
+export const BackupPruneSnapshot = z.object({
+  backupId: z.string(),
+  backupType: z.string(),
+  /** PBS `backup-time` — unix seconds. */
+  backupTime: z.number().int(),
+  keep: z.boolean(),
+  /** The namespace PBS echoed back (absent at the datastore root). */
+  namespace: z.string().optional(),
+  protected: z.boolean(),
+})
+export type BackupPruneSnapshot = z.infer<typeof BackupPruneSnapshot>
+
+/** A prune (or dry-run preview) that RAN: the parsed list plus its counts. */
+export const BackupPruneResult = z.object({
+  /** The PBS group pruned, e.g. `host/pictures`. */
+  group: z.string(),
+  namespace: z.string().optional(),
+  /** True for the preview endpoint (`--dry-run`); false for a real prune. */
+  dryRun: z.boolean(),
+  kept: z.number().int().nonnegative(),
+  removed: z.number().int().nonnegative(),
+  /** Protected snapshots — PBS keeps them regardless of the policy. */
+  protectedCount: z.number().int().nonnegative(),
+  snapshots: z.array(BackupPruneSnapshot),
+})
+export type BackupPruneResult = z.infer<typeof BackupPruneResult>
+
+/**
+ * Why a prune did not run. Ground truth (16.11): a missing GROUP and a missing
+ * NAMESPACE are INDISTINGUISHABLE (both `Error: ENOENT: No such file or
+ * directory`, exit 255) — `not-found` says so honestly rather than guessing.
+ */
+export const BackupPruneVerdict = z.enum(['ok', 'not-found', 'permission', 'error'])
+export type BackupPruneVerdict = z.infer<typeof BackupPruneVerdict>
+
+/**
+ * Dry-run preview request for the wizard's Preview button. Every field is an
+ * override so an UNSAVED task can be previewed (the repos-test precedent: an
+ * inline shape, or the stored task's own values when omitted). Non-mutating.
+ */
+export const BackupPrunePreviewRequest = z.object({
+  repository: BackupRepoRef.optional(),
+  namespace: z.string().optional(),
+  backupId: z.string().min(1).optional(),
+  retention: BackupRetention.optional(),
+})
+export type BackupPrunePreviewRequest = z.infer<typeof BackupPrunePreviewRequest>
+
+/** Preview response: the verdict, plus the keep/remove list when it ran. */
+export const BackupPrunePreviewResponse = z.object({
+  verdict: BackupPruneVerdict,
+  /** Human detail for a non-ok verdict (never contains the secret). */
+  detail: z.string().optional(),
+  result: BackupPruneResult.optional(),
+})
+export type BackupPrunePreviewResponse = z.infer<typeof BackupPrunePreviewResponse>
+
 // ---- Repositories ----------------------------------------------------------
 
 /**
@@ -357,6 +454,11 @@ export const BackupTask = z.object({
   archives: z.array(BackupArchive).min(1),
   changeDetectionMode: ChangeDetectionMode.default('default'),
   /**
+   * OPTIONAL retention (16.11): after a SUCCESSFUL run the job prunes the task's
+   * group with exactly these `--keep-*` flags. Absent = ANAS never prunes.
+   */
+  retention: BackupRetention.optional(),
+  /**
    * systemd OnCalendar expression. GENERATED from `cadence` when one is present
    * (the cadence is authoritative); hand-written otherwise.
    */
@@ -382,6 +484,10 @@ export type BackupTask = z.infer<typeof BackupTask>
  * authoritative, the generator lives in exactly one place, and the UI therefore
  * never has to reimplement systemd calendar syntax. A `custom` cadence (or none)
  * leaves the client's raw `schedule` untouched.
+ *
+ * A retention object with NO keeps set is dropped entirely, so a wizard whose
+ * five fields are all blank stores no policy at all (absent = never prune)
+ * rather than an empty `{}` riding the unit JSON forever.
  */
 export const BackupTaskRequest = z.preprocess((raw) => {
   if (raw && typeof raw === 'object') {
@@ -395,6 +501,11 @@ export const BackupTaskRequest = z.preprocess((raw) => {
       const generated = cadence.success ? cadenceToOnCalendar(cadence.data) : null
       if (generated)
         o.schedule = generated
+    }
+    if (o.retention !== undefined) {
+      const parsed = BackupRetention.safeParse(o.retention)
+      if (parsed.success && !hasRetentionKeeps(parsed.data))
+        delete o.retention
     }
     return o
   }

@@ -26,6 +26,8 @@
  *              from the repos list), namespace?, backupId (alias `backup-id`/
  *              `backupID`), archives:[{name, path, excludes:[]}],
  *              changeDetectionMode ('default'|'metadata'; alias `changeDetection`),
+ *              retention? ({keepLast?,keepDaily?,keepWeekly?,keepMonthly?,keepYearly?}
+ *                — positive ints; ABSENT means ANAS never prunes, 16.11),
  *              schedule (OnCalendar), enabled (bool),
  *              cadence? (16.10 — the STRUCTURED schedule:
  *                { kind:'weekly'|'biweekly'|'monthly'|'custom', days:[Mon..Sun],
@@ -73,9 +75,20 @@
  *   DELETE /v1/backup/tasks/:name    (units removed; PBS data untouched) → 202/409
  *   POST /v1/backup/tasks/:name/run  (Run Now; job carries progress) → 202 { job }
  *     TaskWrite = { name, repository, namespace?, backupId, archives, mode
- *       (=changeDetectionMode), enabled, and EITHER `cadence` (structured — the
- *       daemon derives the OnCalendar; this view never generates one) OR
- *       `schedule` (the raw expression, for the Custom kind)}.
+ *       (=changeDetectionMode), retention?, enabled, and EITHER `cadence`
+ *       (structured — the daemon derives the OnCalendar; this view never
+ *       generates one) OR `schedule` (the raw expression, for the Custom kind)}.
+ *     The finished job's `result` may carry `prune` ({group, namespace?, dryRun,
+ *       kept, removed, protectedCount, snapshots[]}) and `warnings[]` — a prune
+ *       that failed AFTER a successful backup is a WARNING on a COMPLETED job,
+ *       never a failure (the backup data is already safe).
+ *   POST /v1/backup/tasks/:name/prune-preview → { data: { verdict, detail?,
+ *       result? } } — the retention DRY RUN behind the wizard's Preview button
+ *       (16.11). verdict: 'ok'|'not-found'|'permission'|'error' ('not-found'
+ *       honestly covers group OR namespace — PBS cannot tell them apart). Body
+ *       may carry { repository, namespace?, backupId, retention } inline so an
+ *       UNSAVED task previews; omitted fields fall back to the stored task.
+ *       User-initiated, one-shot, non-mutating — never polled.
  *
  *   Path-picker candidates (convenience, best-effort — free-typing always works):
  *     GET /v1/mounts (mountpoints) + GET /v1/pools then
@@ -90,6 +103,9 @@
  * 'anas-backup-archives', per-row path browse 'anas-btn-backup-arch-browse',
  * schedule fieldset 'anas-backup-schedule' with 'anas-fld-backup-cadence' /
  * '-day' / '-single-day' / '-parity' / '-time' / '-schedule');
+ * retention fieldset 'anas-backup-retention' with 'anas-fld-backup-keeplast' …
+ * 'anas-fld-backup-keepyearly', preview 'anas-btn-backup-retention-preview'
+ * rendering into 'anas-backup-retention-preview');
  * directory picker 'anas-win-fs-picker' (grid 'anas-grid-fs-picker', path field
  * 'anas-fld-fs-path', select 'anas-btn-fs-select'); repos manager
  * 'anas-win-backup-repos' (grid 'anas-grid-backup-repos'); repo edit
@@ -342,6 +358,53 @@
     function modeOf(task) {
         return ('' + (first(task && task.changeDetectionMode, task && task.changeDetection,
             task && task.mode) || 'default')).toLowerCase();
+    }
+
+    // ---- Retention (16.11) -------------------------------------------------
+    // The five PBS --keep-* values, in the order the fieldset and the summary
+    // show them. Blank/absent = unset: ANAS then never runs prune at all.
+    var KEEP_FIELDS = [
+        { key: 'keepLast', label: 'Keep last' },
+        { key: 'keepDaily', label: 'Keep daily' },
+        { key: 'keepWeekly', label: 'Keep weekly' },
+        { key: 'keepMonthly', label: 'Keep monthly' },
+        { key: 'keepYearly', label: 'Keep yearly' }
+    ];
+
+    // A task's retention as a plain object of the keeps actually set (positive
+    // integers only) — anything else is dropped, so a broken value can never
+    // become a keep flag.
+    function retentionOf(task) {
+        var raw = (task && task.retention) || {};
+        var out = {};
+        for (var i = 0; i < KEEP_FIELDS.length; i++) {
+            var n = Number(raw[KEEP_FIELDS[i].key]);
+            if (!isNaN(n) && n > 0 && n === Math.floor(n)) {
+                out[KEEP_FIELDS[i].key] = n;
+            }
+        }
+        return out;
+    }
+
+    function hasKeeps(retention) {
+        for (var k in retention) {
+            if (Object.prototype.hasOwnProperty.call(retention, k)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // "keep last 3, daily 7" — the labels the PBS flags carry, never a guess.
+    function retentionSummary(retention) {
+        var parts = [];
+        for (var i = 0; i < KEEP_FIELDS.length; i++) {
+            var v = retention[KEEP_FIELDS[i].key];
+            if (v !== undefined) {
+                parts.push(KEEP_FIELDS[i].label.toLowerCase().replace(/^keep /, '') + ' ' + v);
+            }
+        }
+        return parts.length ? (t('keep') + ' ' + parts.join(', ')) : '';
     }
 
     // Flatten a { task, ...runtime } entry into a grid record; keep the raw task
@@ -1158,6 +1221,20 @@
             + 'OnCalendar: ' + expr + '</div>' + note;
     }
 
+    // The detail's Retention row: the configured keeps, or the honest statement
+    // that ANAS prunes nothing and retention stays PBS-side (the default).
+    function retentionRowHtml(task) {
+        var keeps = retentionOf(task);
+        if (!hasKeeps(keeps)) {
+            return '<span style="color:var(--anas-muted,gray);">'
+                + enc(t('none — ANAS never prunes this group (retention stays PBS-side)')) + '</span>';
+        }
+        return '<span style="font-family:monospace;font-size:0.92em;">' + enc(retentionSummary(keeps)) + '</span>'
+            + ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+            + enc(t('— pruned after each successful backup; garbage collection stays PBS-side'))
+            + '</span>';
+    }
+
     function taskDetailHtml(d) {
         if (!d) {
             return '<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
@@ -1176,6 +1253,7 @@
             + kv(t('Repository'), '<span style="font-family:monospace;font-size:0.92em;">' + repoText + '</span>')
             + kv(t('Backup ID'), mono('host/' + backupIdOf(task)))
             + kv(t('Change detection'), enc(modeLabel))
+            + kv(t('Retention'), retentionRowHtml(task))
             + kv(t('Schedule'), scheduleDetailHtml(task))
             + kv(t('Enabled'), task.enabled !== false
                 ? '<span style="color:var(--anas-ok,#1f9c56);">' + enc(t('yes')) + '</span>'
@@ -1637,6 +1715,162 @@
         return cadence;
     }
 
+    // ---- Retention fieldset (16.11) ----------------------------------------
+
+    // The five keep numberfields, seeded from the task. Blank = unset (no
+    // hiddenfields anywhere — issue #26; numberfields are read directly).
+    function retentionItems(task) {
+        var current = retentionOf(task);
+        var items = [];
+        for (var i = 0; i < KEEP_FIELDS.length; i++) {
+            var f = KEEP_FIELDS[i];
+            items.push({
+                xtype: 'numberfield',
+                itemId: f.key,
+                cls: 'anas-fld-backup-' + f.key.toLowerCase(),
+                fieldLabel: t(f.label),
+                emptyText: t('(none)'),
+                value: current[f.key] === undefined ? null : current[f.key],
+                minValue: 1,
+                allowDecimals: false,
+                allowBlank: true,
+                hideTrigger: false,
+                width: 260,
+            });
+        }
+        return items;
+    }
+
+    // Read the keep fields back: positive whole numbers only; everything else
+    // (blank, 0, junk) is simply absent — the daemon then stores no policy.
+    function readRetention(win) {
+        var out = {};
+        for (var i = 0; i < KEEP_FIELDS.length; i++) {
+            var key = KEEP_FIELDS[i].key;
+            var n = Number(valOf(win, '#' + key));
+            if (!isNaN(n) && n > 0 && n === Math.floor(n)) {
+                out[key] = n;
+            }
+        }
+        return out;
+    }
+
+    // Preview needs a repository, a backup-id and at least one keep — with no
+    // keep flags PBS keeps everything, so there is nothing to preview.
+    function syncRetentionControls(win) {
+        var btn = win.down('#retentionPreview');
+        if (!btn) {
+            return;
+        }
+        var ready = !!valOf(win, '#repository') && !!trim(valOf(win, '#backupId'))
+            && hasKeeps(readRetention(win));
+        try {
+            btn.setDisabled(!ready);
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    function previewOut(win, html) {
+        var out = win.down('#retentionPreviewOut');
+        if (out && !out.destroyed && !out.destroying) {
+            try {
+                out.update(html);
+            } catch (e) {
+                ANAS.warn('retention preview render failed: ' + ANAS.errText(e));
+            }
+        }
+    }
+
+    // A prune snapshot's timestamp (PBS backup-time — unix SECONDS).
+    function snapTime(sec) {
+        var n = Number(sec);
+        if (isNaN(n)) {
+            return '';
+        }
+        try {
+            return absTime(new Date(n * 1000).toISOString());
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function prunePreviewHtml(result) {
+        var snaps = (result && result.snapshots) || [];
+        if (!isArray(snaps) || !snaps.length) {
+            return '<div style="color:var(--anas-muted,gray);font-size:11px;">'
+                + enc(t('No snapshots in this group yet — nothing to prune.')) + '</div>';
+        }
+        var kept = Number(result.kept) || 0;
+        var removed = Number(result.removed) || 0;
+        var head = '<div style="font-size:11px;margin-bottom:4px;">'
+            + enc(kept + ' ' + t('would be kept') + ', ' + removed + ' ' + t('would be removed'))
+            + (result.protectedCount
+                ? enc(', ' + result.protectedCount + ' ' + t('protected (always kept)')) : '')
+            + '</div>';
+        var rows = '';
+        for (var i = 0; i < snaps.length; i++) {
+            var s = snaps[i] || {};
+            var keep = s.keep === true;
+            var color = keep ? 'var(--anas-ok,#1f9c56)' : 'var(--anas-danger,#c23b2c)';
+            rows += '<tr><td style="padding:1px 10px 1px 0;color:' + color + ';white-space:nowrap;">'
+                + enc(keep ? t('keep') : t('remove')) + '</td>'
+                + '<td style="padding:1px 0;font-family:monospace;font-size:11px;white-space:nowrap;">'
+                + enc(snapTime(s.backupTime)) + '</td>'
+                + '<td style="padding:1px 0 1px 10px;color:var(--anas-muted,gray);font-size:11px;">'
+                + enc(s.protected === true ? t('protected') : '') + '</td></tr>';
+        }
+        return head + '<div style="max-height:150px;overflow:auto;">'
+            + '<table style="border-collapse:collapse;">' + rows + '</table></div>';
+    }
+
+    // The dry-run preview: USER-INITIATED and one-shot (the save-time namespace
+    // check is the precedent) — never polled, never automatic. The whole task
+    // shape is sent inline so an unsaved task previews too.
+    function previewRetention(win, node) {
+        var name = trim(valOf(win, '#name'));
+        var retention = readRetention(win);
+        if (!hasKeeps(retention)) {
+            return;
+        }
+        var body = {
+            repository: valOf(win, '#repository'),
+            backupId: trim(valOf(win, '#backupId')),
+            retention: retention,
+        };
+        var ns = trim(valOf(win, '#namespace'));
+        if (ns) {
+            body.namespace = ns;
+        }
+        previewOut(win, '<div style="color:var(--anas-muted,gray);font-size:11px;">'
+            + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
+            + enc(t('asking the server…')) + '</div>');
+        // The URL name is only a label for an unsaved task — the body carries
+        // the values. A not-yet-valid name falls back to a placeholder.
+        var urlName = NAME_RE.test(name) ? name : 'preview';
+        ANAS.api.post(node, '/backup/tasks/' + encodeURIComponent(urlName) + '/prune-preview', body).then(
+            function (res) {
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                var d = (res && res.data) || {};
+                if (d.verdict === 'ok' && d.result) {
+                    previewOut(win, prunePreviewHtml(d.result));
+                    return;
+                }
+                previewOut(win, '<div style="color:var(--anas-danger,#c23b2c);font-size:11px;">'
+                    + enc(t('Could not preview') + ': ' + (d.detail || d.verdict || t('unknown error'))) + '</div>');
+            },
+            function (err) {
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                previewOut(win, '<div style="color:var(--anas-danger,#c23b2c);font-size:11px;">'
+                    + enc(t('Could not preview') + ': ' + ANAS.errText(err)) + '</div>');
+            }
+        );
+    }
+
     function openTaskDialog(view, node, existing) {
         var isEdit = !!existing;
         var task = existing || {};
@@ -1800,6 +2034,71 @@
                             }
                         }),
                         {
+                            xtype: 'fieldset',
+                            title: t('Retention (optional)'),
+                            cls: 'anas-backup-retention',
+                            collapsible: false,
+                            defaults: { anchor: '100%' },
+                            items: retentionItems(task).concat([
+                                {
+                                    xtype: 'component',
+                                    style: 'color:var(--anas-muted,gray);font-size:11px;margin-top:2px;',
+                                    html: enc(t('Leave every field blank and ANAS never prunes — retention stays '
+                                        + 'entirely PBS-side. Set any value and ANAS runs a PBS prune with exactly '
+                                        + 'these keeps after each SUCCESSFUL backup. Pruning only marks snapshots '
+                                        + 'removed; space is reclaimed by the datastore\'s own garbage collection, '
+                                        + 'which stays PBS-side.')),
+                                },
+                                {
+                                    xtype: 'container',
+                                    layout: 'hbox',
+                                    margin: '6 0 0 0',
+                                    items: [
+                                        {
+                                            xtype: 'button',
+                                            itemId: 'retentionPreview',
+                                            cls: 'anas-btn-backup-retention-preview',
+                                            text: t('Preview'),
+                                            iconCls: 'fa fa-eye',
+                                            disabled: true,
+                                            handler: function () {
+                                                previewRetention(win, node);
+                                            },
+                                        },
+                                        {
+                                            xtype: 'component',
+                                            flex: 1,
+                                            margin: '4 0 0 8',
+                                            style: 'color:var(--anas-muted,gray);font-size:11px;',
+                                            html: enc(t('a dry run against the server — nothing is removed')),
+                                        },
+                                    ],
+                                },
+                                {
+                                    xtype: 'component',
+                                    itemId: 'retentionPreviewOut',
+                                    cls: 'anas-backup-retention-preview',
+                                    margin: '6 0 0 0',
+                                    html: '',
+                                },
+                            ]),
+                        },
+                        {
+                            xtype: 'textfield',
+                            itemId: 'schedule',
+                            cls: 'anas-fld-backup-schedule',
+                            fieldLabel: t('Schedule'),
+                            emptyText: 'daily',
+                            allowBlank: false,
+                            value: (task.schedule || ''),
+                        },
+                        {
+                            xtype: 'component',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                            html: enc(t('systemd OnCalendar — e.g. "daily", "02:00", '
+                                + '"Mon *-*-* 03:00". Validated when saved.')),
+                        },
+                        {
                             xtype: 'checkboxfield',
                             itemId: 'enabled',
                             cls: 'anas-fld-backup-enabled',
@@ -1833,6 +2132,24 @@
         win.show();
         syncCadenceFields(win); // show only the fields the opening cadence uses
         loadPathCandidates(node, pathStore);
+
+        // Preview stays disabled until a repository, a backup-id AND at least one
+        // keep are present — the three things the dry run needs.
+        var watched = ['#repository', '#backupId'];
+        for (var w = 0; w < KEEP_FIELDS.length; w++) {
+            watched.push('#' + KEEP_FIELDS[w].key);
+        }
+        for (var wi = 0; wi < watched.length; wi++) {
+            try {
+                var fld = win.down(watched[wi]);
+                if (fld && fld.on) {
+                    fld.on('change', function () { syncRetentionControls(win); });
+                }
+            } catch (eWatch) {
+                // non-fatal: the button simply stays as it is
+            }
+        }
+        syncRetentionControls(win);
 
         // Seed the archive rows. Edit → the task's archives; new → the suggested
         // etc.pxar:/etc default (the operator's own habit; removable = dismissible).
@@ -1931,6 +2248,12 @@
         }
         if (namespace) {
             body.namespace = namespace;
+        }
+        // Retention rides the task config (16.11). All-blank = omitted entirely:
+        // no policy stored, and ANAS never prunes.
+        var retention = readRetention(win);
+        if (hasKeeps(retention)) {
+            body.retention = retention;
         }
 
         var proceed = function () {
@@ -2104,8 +2427,33 @@
             view: grid,
             maxMs: 600000, // a real backup can run for minutes — keep polling
             failTitle: 'Run failed',
-            successMsg: t('Backup finished') + ': ' + name,
-            onComplete: function () {
+            onComplete: function (job) {
+                // Retention (16.11): the prune counts ride the job result, and a
+                // prune that failed AFTER a good backup comes back as a warning
+                // on a COMPLETED job — surface it, never as a failure.
+                var msg = t('Backup finished') + ': ' + name;
+                var warnings = [];
+                try {
+                    var result = (job && job.result) || {};
+                    if (result.prune) {
+                        msg += ' — ' + t('pruned') + ': '
+                            + (Number(result.prune.kept) || 0) + ' ' + t('kept') + ', '
+                            + (Number(result.prune.removed) || 0) + ' ' + t('removed');
+                    }
+                    if (isArray(result.warnings)) {
+                        warnings = result.warnings;
+                    }
+                } catch (e) {
+                    // best-effort summary
+                }
+                ANAS.toast(msg);
+                if (warnings.length) {
+                    try {
+                        Ext.Msg.alert(t('Backup finished with a warning'), ANAS.warningsHtml(warnings));
+                    } catch (eMsg) {
+                        ANAS.warn(warnings.join(' '));
+                    }
+                }
                 loadTasks(view, node);
             },
         });
@@ -2134,6 +2482,12 @@
         var ns = first(raw.namespace, rec.get('namespace'));
         if (ns) {
             body.namespace = ns;
+        }
+        // Carry the retention policy through an enable/disable — a toggle must
+        // never silently drop it (the PUT rewrites the whole task).
+        var keeps = retentionOf(raw);
+        if (hasKeeps(keeps)) {
+            body.retention = keeps;
         }
         ANAS.runJob({
             node: node,

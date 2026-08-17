@@ -253,6 +253,212 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(mock.calls.some(c => c.command === '/usr/bin/prlimit'), false)
   })
 
+  // ---- Retention (story 16.11) -------------------------------------------
+  // Prune runs AFTER a successful backup, with exactly the task's keep flags.
+  // Ground truth: fixtures/backup/prune-*.txt (2026-08-17).
+
+  /** Three entries of the real `prune --output-format json` array (2 keep, 1 remove). */
+  const PRUNE_JSON = JSON.stringify([
+    { 'backup-id': 'anas-pve', 'backup-time': 1750712754, 'backup-type': 'host', 'keep': false, 'ns': 'anastest', 'protected': false },
+    { 'backup-id': 'anas-pve', 'backup-time': 1786914356, 'backup-type': 'host', 'keep': true, 'ns': 'anastest', 'protected': false },
+    { 'backup-id': 'anas-pve', 'backup-time': 1787000792, 'backup-type': 'host', 'keep': true, 'ns': 'anastest', 'protected': false },
+  ])
+  const PBC_CMD = '/usr/bin/proxmox-backup-client'
+  const RETAINED_TASK = { ...TASK, name: 'retained', retention: { keepLast: 2, keepDaily: 7 } }
+  /**
+   * The exact prlimit-wrapped pbc BACKUP argv for RETAINED_TASK — an args-exact
+   * fixture, because the suite's command-only prlimit fixture (a success) would
+   * otherwise win and no failure/skip could be scripted.
+   */
+  const RETAINED_BACKUP_ARGS = [
+    '--nofile=1024:1024',
+    '--',
+    PBC_CMD,
+    'backup',
+    'etc.pxar:/etc',
+    '--backup-id',
+    'anas-pve',
+    '--change-detection-mode=metadata',
+  ]
+
+  async function createTaskPayload(payload: Record<string, unknown>): Promise<void> {
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks', headers: JSON_HEADERS, payload })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+  }
+
+  /** Every pbc prune invocation the mock recorded. */
+  function pruneCalls(mock: MockExecutor): { command: string, args: string[] }[] {
+    return mock.calls.filter(c => c.command === PBC_CMD && c.args[0] === 'prune')
+  }
+
+  it('a successful run prunes with EXACTLY the configured keeps + json output', async () => {
+    await createRepo()
+    await createTaskPayload(RETAINED_TASK)
+    const mock = mockOf(server)
+    mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    const result = job.result as { status: string, prune?: { kept: number, removed: number, dryRun: boolean }, warnings?: string[] }
+    assert.equal(result.status, 'success')
+    assert.equal(result.prune!.kept, 2)
+    assert.equal(result.prune!.removed, 1)
+    assert.equal(result.prune!.dryRun, false)
+    assert.equal(result.warnings, undefined)
+    assert.deepEqual(pruneCalls(mock), [{
+      command: PBC_CMD,
+      args: ['prune', 'host/anas-pve', '--keep-last', '2', '--keep-daily', '7', '--output-format', 'json'],
+    }])
+  })
+
+  it('a prune FAILURE never fails the job — it completes with a warning', async () => {
+    await createRepo()
+    await createTaskPayload(RETAINED_TASK)
+    const mock = mockOf(server)
+    mock.addFixture({ command: PBC_CMD, result: { stdout: '', stderr: 'Error: ENOENT: No such file or directory', exitCode: 255 } })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    // The backup data is safe — the job COMPLETES, carrying the prune problem.
+    assert.equal(job.status, 'completed')
+    const result = job.result as { status: string, prune?: unknown, warnings?: string[] }
+    assert.equal(result.status, 'success')
+    assert.equal(result.prune, undefined)
+    assert.match(result.warnings![0], /Backup succeeded, but the retention prune did not run/)
+    assert.match(result.warnings![0], /group or the namespace/)
+  })
+
+  it('a task with NO retention never invokes prune at all', async () => {
+    await createRepo()
+    await createTask()
+    const mock = mockOf(server)
+    mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    assert.deepEqual(pruneCalls(mock), [])
+  })
+
+  it('a FAILED backup never prunes (the job fails, retention is untouched)', async () => {
+    await createRepo()
+    await createTaskPayload(RETAINED_TASK)
+    const mock = mockOf(server)
+    mock.addFixture({ command: '/usr/bin/prlimit', args: RETAINED_BACKUP_ARGS, result: { stdout: '', stderr: 'Error: no such datastore \'store1\'', exitCode: 255 } })
+    mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'failed')
+    assert.deepEqual(pruneCalls(mock), [])
+  })
+
+  it('a SKIPPED run never prunes (nothing new landed)', async () => {
+    await createRepo()
+    await createTaskPayload(RETAINED_TASK)
+    const mock = mockOf(server)
+    // The benign 1-second collision — the same shape a cadence skip takes: a
+    // run that backed nothing up must not touch retention.
+    mock.addFixture({ command: '/usr/bin/prlimit', args: RETAINED_BACKUP_ARGS, result: { stdout: '', stderr: 'Error: backup timestamp is older than last backup.', exitCode: 255 } })
+    mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    assert.equal((job.result as { status: string }).status, 'skipped')
+    assert.deepEqual(pruneCalls(mock), [])
+  })
+
+  it('POST /backup/tasks rejects a zero or negative keep', async () => {
+    await createRepo()
+    for (const retention of [{ keepLast: 0 }, { keepDaily: -1 }, { keepWeekly: 1.5 }]) {
+      const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks', headers: JSON_HEADERS, payload: { ...TASK, name: 'bad-keep', retention } })
+      assert.equal(res.statusCode, 400, JSON.stringify(retention))
+    }
+  })
+
+  it('an all-blank retention is stored as NO retention (never an empty policy)', async () => {
+    await createRepo()
+    await createTaskPayload({ ...TASK, name: 'blank-keep', retention: {} })
+    const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks/blank-keep', headers: IDENTITY })
+    const { data } = res.json() as { data: BackupTaskDetail }
+    assert.equal(data.task.retention, undefined)
+    assert.ok(!data.unit.includes('retention'))
+  })
+
+  it('prune-preview dry-runs the SAVED task and returns the keep/remove list', async () => {
+    await createRepo()
+    await createTaskPayload(RETAINED_TASK)
+    const mock = mockOf(server)
+    mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/prune-preview', headers: JSON_HEADERS, payload: {} })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: { verdict: string, result?: { kept: number, removed: number, dryRun: boolean, snapshots: unknown[] } } }
+    assert.equal(data.verdict, 'ok')
+    assert.equal(data.result!.kept, 2)
+    assert.equal(data.result!.removed, 1)
+    assert.equal(data.result!.dryRun, true)
+    assert.equal(data.result!.snapshots.length, 3)
+    // Non-mutating: --dry-run is always present on the preview path.
+    assert.ok(pruneCalls(mock)[0].args.includes('--dry-run'))
+  })
+
+  it('prune-preview accepts an INLINE spec, so an unsaved task can be previewed', async () => {
+    await createRepo()
+    const mock = mockOf(server)
+    mock.addFixture({ command: PBC_CMD, result: { stdout: PRUNE_JSON, stderr: '', exitCode: 0 } })
+    mock.calls.length = 0
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/not-saved-yet/prune-preview',
+      headers: JSON_HEADERS,
+      payload: { repository: 'pbs-main', backupId: 'pictures', namespace: 'anastest', retention: { keepMonthly: 3 } },
+    })
+    assert.equal(res.statusCode, 200)
+    assert.equal((res.json() as { data: { verdict: string } }).data.verdict, 'ok')
+    assert.deepEqual(pruneCalls(mock)[0].args, [
+      'prune',
+      'host/pictures',
+      '--ns',
+      'anastest',
+      '--keep-monthly',
+      '3',
+      '--dry-run',
+      '--output-format',
+      'json',
+    ])
+  })
+
+  it('prune-preview verdicts: ENOENT is honestly "group or namespace"; no privilege is named', async () => {
+    await createRepo()
+    await createTaskPayload(RETAINED_TASK)
+    const mock = mockOf(server)
+    mock.addFixture({ command: PBC_CMD, results: [
+      { stdout: '', stderr: 'Error: ENOENT: No such file or directory', exitCode: 255 },
+      { stdout: '', stderr: 'Error: permission check failed - missing Datastore.Modify|Datastore.Prune on /datastore/store1/anastest', exitCode: 255 },
+    ] })
+    const first = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/prune-preview', headers: JSON_HEADERS, payload: {} })
+    const firstData = (first.json() as { data: { verdict: string, detail: string } }).data
+    assert.equal(firstData.verdict, 'not-found')
+    assert.match(firstData.detail, /group or the namespace/)
+
+    const second = await server.inject({ method: 'POST', url: '/v1/backup/tasks/retained/prune-preview', headers: JSON_HEADERS, payload: {} })
+    const secondData = (second.json() as { data: { verdict: string, detail: string } }).data
+    assert.equal(secondData.verdict, 'permission')
+    assert.match(secondData.detail, /Datastore\.Prune/)
+  })
+
+  it('prune-preview without any keep is a 400 (a keep-all prune is never run)', async () => {
+    await createRepo()
+    await createTask()
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/prune-preview', headers: JSON_HEADERS, payload: {} })
+    assert.equal(res.statusCode, 400)
+    assert.match((res.json() as { error: { message: string } }).error.message, /at least one retention keep/)
+  })
+
   it('DELETE /backup/repos refuses (409) while a task references it', async () => {
     await createRepo()
     await createTask()
