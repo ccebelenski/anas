@@ -1,6 +1,6 @@
 import type { MountEntry, MountOptions, MountRequestOptions } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
-import type { CommandExecutor } from '../executor/types.js'
+import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { mkdir, readdir } from 'node:fs/promises'
@@ -9,13 +9,15 @@ import { classifyKind } from '../parsers/findmnt.js'
 import { addMount, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
-import { enrichBusyError } from '../services/busy-diagnosis.js'
+import { diagnoseBusyPath, enrichBusyError, formatHolders } from '../services/busy-diagnosis.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
 import {
   ahrPinnedSpecs,
   buildBaseInventory,
   buildMountDetail,
+  cleanMountStderr,
   credsFilePath,
+  deliveredMatchesIntent,
   entryFromRequest,
   fstabHasMount,
   hasInlineCredentials,
@@ -23,9 +25,11 @@ import {
   mountpointReservedByPve,
   probeInventoryHealth,
   pveStorageFor,
+  readEffectiveOptions,
   readFindmnt,
   readMdadmConfText,
   removeCredentialsFile,
+  rotateCredentialsFile,
   runMountTest,
   writeCredentialsFile,
 } from '../services/mounts.js'
@@ -239,11 +243,16 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
 
     const job = jobQueue.submit(
       'mount.update',
-      { ...identity, params: { mountpoint: mp } },
+      // The changed options ride the audit entry: a live diagnosis of "the edit
+      // completed but nothing changed" (issue #25) had only the mountpoint to go on.
+      { ...identity, params: { mountpoint: mp, ...(body.options ? { options: body.options } : {}) } },
       async (updateProgress) => {
+        // VALIDATE-THEN-COMMIT (issue #24): the new secret is proven against the
+        // server BEFORE anything is written. Nothing below this point runs on a
+        // rejected password, so the live creds file and fstab stay untouched.
         if (body.credentials) {
-          updateProgress('Rotating credentials file')
-          merged.credentialsFile = await writeCredentialsFile(credsDir, mp, body.credentials)
+          updateProgress('Validating credentials')
+          merged.credentialsFile = await rotateCredentialsFile(executor, credsDir, merged, body.credentials)
         }
         else if (migrating && existing.inlineCredentials?.password !== undefined) {
           // Operator did NOT retype the password: seed the creds file from the
@@ -274,8 +283,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
         updateProgress('Reloading systemd (daemon-reload)')
         await daemonReload(executor)
         updateProgress(`Remounting ${mp}`)
-        await executor.exec(UMOUNT, [mp]).catch(() => {})
-        await doMount(executor, undefined, mp)
+        await remountEntry(executor, merged)
         return { updated: mp }
       },
     )
@@ -619,6 +627,52 @@ async function doMount(executor: CommandExecutor, entry: MountEntry | undefined,
   const r = await executor.exec(MOUNT, args)
   if (r.exitCode !== 0)
     throw new Error(r.stderr.trim() || `mount exited ${r.exitCode}`)
+}
+
+/**
+ * Apply an edited fstab entry to the LIVE mount and PROVE the new options
+ * landed (issue #25). umount + `mount <mp>` is the honest path; a mountpoint
+ * that will not unmount (busy — virtiofsd, an open shell) falls back to
+ * `mount -o remount`, which applies the remountable changes in place without
+ * evicting the holders. A REFUSED unmount is never mounted over: util-linux
+ * treats an already-mounted target as success, which is how a busy edit used to
+ * complete green while the old options stayed live. On that path the KERNEL
+ * MOUNT TABLE — not an exit code — decides whether the edit was delivered.
+ */
+async function remountEntry(executor: CommandExecutor, entry: MountEntry): Promise<void> {
+  const mp = entry.mountpoint
+  const u = await executor.exec(UMOUNT, [mp])
+  if (u.exitCode !== 0 && (await readEffectiveOptions(executor, mp)) !== undefined) {
+    const r = await executor.exec(MOUNT, ['-o', 'remount', '--', mp])
+    const effective = await readEffectiveOptions(executor, mp)
+    if (effective !== undefined) {
+      if (r.exitCode !== 0 || !deliveredMatchesIntent(effective, entry))
+        throw new Error(await remountRefusedError(executor, mp, r, u))
+      return
+    }
+    // Gone after all — fall through and mount it as written.
+  }
+  await doMount(executor, undefined, mp)
+}
+
+/**
+ * The honest failure when the live mount survived the edit: the previous options
+ * are still in force, with the underlying error and the processes holding the
+ * mountpoint named — the same fuser-backed diagnosis the busy paths use (`lsof`
+ * is not installed on a stock PVE node).
+ */
+async function remountRefusedError(
+  executor: CommandExecutor,
+  mountpoint: string,
+  remount: ExecResult,
+  umount: ExecResult,
+): Promise<string> {
+  const detail = remount.exitCode !== 0
+    ? cleanMountStderr(remount.stderr) || `mount -o remount exited ${remount.exitCode}`
+    : umount.stderr.trim()
+  const base = `Could not remount '${mountpoint}' — still mounted with previous options${detail ? ` (${detail})` : ''}`
+  const holders = formatHolders(await diagnoseBusyPath(executor, mountpoint))
+  return holders ? `${base}, ${holders}` : base
 }
 
 /** Build a `-o` option string for a direct (non-fstab) mount of an entry. */

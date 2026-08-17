@@ -500,10 +500,12 @@ export type CreateMountRequest = z.infer<typeof CreateMountRequest>
 
 /**
  * Update a mount (PUT /v1/mounts/:mountpoint): surgical fstab rewrite + remount;
- * credential rotation. The mountpoint (identity), type, and source are fixed.
+ * credential rotation. The mountpoint (identity), type, and source are fixed —
+ * and so is `persistent`: an edit acts ON the fstab entry, so persistence is
+ * edit-time IDENTITY (like type/server), not an editable field. It stays on
+ * CreateMountRequest only; a body that still carries it is ignored (stripped).
  */
 export const UpdateMountRequest = z.object({
-  persistent: z.boolean().optional(),
   automount: z.boolean().optional(),
   options: MountRequestOptions.optional(),
   extraOptions: z.string().optional(),

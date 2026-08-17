@@ -15,6 +15,7 @@ import type {
   MountUnit,
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { FindmntNode } from '../parsers/findmnt.js'
 import { lookup } from 'node:dns/promises'
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
@@ -384,6 +385,36 @@ export async function readFindmnt(executor: CommandExecutor): Promise<string> {
   }
 }
 
+/**
+ * The REAL (non-autofs) findmnt node for a mountpoint. An automount target
+ * carries a stacked `autofs` placeholder that is never the filesystem itself,
+ * so it is skipped here — the caller asking "what is actually mounted, with
+ * which options" must not be answered with the placeholder.
+ */
+export function effectiveMountNode(findmntText: string, mountpoint: string): FindmntNode | undefined {
+  return parseFindmnt(findmntText).find(n => n.target === mountpoint && n.fstype !== 'autofs')
+}
+
+/**
+ * The LIVE (kernel) option string for a mountpoint, or undefined when nothing is
+ * mounted there. The kernel mount table is the only honest answer to "did the
+ * change land" — `mount` exits 0 on an already-mounted target.
+ */
+export async function readEffectiveOptions(executor: CommandExecutor, mountpoint: string): Promise<string | undefined> {
+  return effectiveMountNode(await readFindmnt(executor), mountpoint)?.options
+}
+
+/**
+ * Does the live option string deliver the entry's intent? Narrow BY DESIGN:
+ * `ro`/`rw` only — the one flag findmnt reports verbatim for every filesystem
+ * and the one an in-place remount can silently fail to apply. The rest of the
+ * tier is negotiated (the server answers with options of its own), so it can
+ * never be a pass/fail signal.
+ */
+export function deliveredMatchesIntent(effectiveOptions: string, entry: MountEntry): boolean {
+  return optionsReadOnly(effectiveOptions) === entry.options.common.readOnly
+}
+
 // ============================================================================
 // Failure taxonomy → POST /v1/mounts/test verdicts (NOTES §6)
 // ============================================================================
@@ -414,6 +445,14 @@ export function mapCifsFailure(stderr: string): MountTestVerdict {
     default: return 'unreachable'
   }
 }
+
+/**
+ * The CIFS auth advice, worded ONCE (the UI's test verdicts mirror it): a wrong
+ * username and a wrong password come back as the same EACCES, so the message can
+ * never name which one is wrong. Used by the preflight verdict and by a rejected
+ * credential rotation alike.
+ */
+const CIFS_AUTH_ADVICE = 'check the username or password (CIFS cannot tell the two apart)'
 
 /** Strip the boilerplate `Refer to the mount.cifs(8)…` tail from stderr. */
 export function cleanMountStderr(stderr: string): string {
@@ -672,6 +711,21 @@ export function parseCredentialsMeta(text: string): { username?: string, domain?
 }
 
 /**
+ * Write ONE credentials file: ensure `dir` (0700 root) and write `path` 0600.
+ * The single place the creds-file format and permissions are applied — the
+ * atomic write and the validate-then-commit rotation both go through it.
+ */
+async function writeCredsFileAt(
+  dir: string,
+  path: string,
+  creds: { username: string, password: string, domain?: string },
+): Promise<void> {
+  await mkdir(dir, { recursive: true, mode: 0o700 })
+  await chmod(dir, 0o700).catch(() => {})
+  await writeFile(path, formatCredentials(creds), { encoding: 'utf8', mode: 0o600 })
+}
+
+/**
  * Write a per-mount credentials file atomically: ensure `dir` (0700 root), write
  * `<dir>/<name>.cred` 0600. The secret never touches argv/logs. Returns the file
  * path (referenced from fstab as `credentials=<path>`).
@@ -681,14 +735,70 @@ export async function writeCredentialsFile(
   mountpoint: string,
   creds: { username: string, password: string, domain?: string },
 ): Promise<string> {
-  await mkdir(dir, { recursive: true, mode: 0o700 })
-  await chmod(dir, 0o700).catch(() => {})
   const path = credsFilePath(dir, mountpoint)
   const tmp = join(dirname(path), `.${credsFileName(mountpoint)}.anas.tmp`)
-  await writeFile(tmp, formatCredentials(creds), { encoding: 'utf8', mode: 0o600 })
+  await writeCredsFileAt(dir, tmp, creds)
   await rename(tmp, path)
   await chmod(path, 0o600).catch(() => {})
   return path
+}
+
+/**
+ * Rotate a CIFS credentials file VALIDATE-THEN-COMMIT (issue #24). The candidate
+ * secret goes to a sibling 0600 `.<name>.validating` file and is PROVEN by a
+ * probe mount of the entry's OWN spec before it replaces the live file; only
+ * then is it renamed into place. A rejected secret used to be written first and
+ * survive on disk while the failed remount left the mount alive on its stale
+ * kernel session — the mount then died at the next automount cycle or reboot,
+ * where `nofail` hid it. The probe needs the server: an unreachable server means
+ * the new secret cannot be proven, and nothing is committed.
+ *
+ * A non-CIFS entry has nothing to prove a secret against (`mount.nfs` reads no
+ * credentials file), so it keeps the plain atomic write.
+ */
+export async function rotateCredentialsFile(
+  executor: CommandExecutor,
+  dir: string,
+  entry: MountEntry,
+  creds: { username: string, password: string, domain?: string },
+): Promise<string> {
+  if (classifyKind(entry.fstype, entry.spec) !== 'cifs')
+    return writeCredentialsFile(dir, entry.mountpoint, creds)
+
+  const live = credsFilePath(dir, entry.mountpoint)
+  const candidate = join(dir, `.${credsFileName(entry.mountpoint)}.validating`)
+  await writeCredsFileAt(dir, candidate, creds)
+  try {
+    const probe = await probeMountSpec(executor, {
+      type: 'cifs',
+      spec: entry.spec,
+      ...(entry.options.cifs?.vers !== undefined ? { vers: entry.options.cifs.vers } : {}),
+      credentialsFile: candidate,
+    })
+    if (probe.verdict !== 'ok')
+      throw new Error(credentialProbeError(entry.mountpoint, probe))
+    await rename(candidate, live)
+    await chmod(live, 0o600).catch(() => {})
+    return live
+  }
+  catch (err) {
+    await rm(candidate, { force: true }).catch(() => {})
+    throw err
+  }
+}
+
+/**
+ * The failure a rejected candidate secret reports: the established auth wording
+ * (CIFS returns the same EACCES for a wrong user and a wrong password — the UI
+ * verdict says so in the same words) plus the underlying mount error, and the
+ * fact that NOTHING was committed.
+ */
+function credentialProbeError(mountpoint: string, probe: ProbeOutcome): string {
+  const underlying = probe.stderr || probe.detail || probe.verdict
+  const lead = probe.verdict === 'auth-failed'
+    ? `The new credentials for '${mountpoint}' were rejected — ${CIFS_AUTH_ADVICE}`
+    : `The new credentials for '${mountpoint}' could not be proven (${probe.verdict})`
+  return `${lead}: ${underlying}. Nothing was changed — the saved credentials and /etc/fstab are untouched.`
 }
 
 /** Read a credentials file's non-secret metadata; { set:false } if absent. */
@@ -733,8 +843,9 @@ export async function runMountTest(
   if (!portReachable)
     return { verdict: 'unreachable', stage: 'tcp', dnsResolved: true, portReachable: false, detail: `No answer on ${req.server}:${port}` }
 
-  const probe = await probeMountAttempt(executor, req)
-  return { ...probe, stage: 'mount', dnsResolved: true, portReachable: true }
+  const { verdict, detail } = await probeMountAttempt(executor, req)
+  // `stderr` stays daemon-side: the wire result carries the curated detail only.
+  return { verdict, ...(detail !== undefined ? { detail } : {}), stage: 'mount', dnsResolved: true, portReachable: true }
 }
 
 /** DNS resolvable? */
@@ -763,35 +874,40 @@ function tcpReachable(host: string, port: number): Promise<boolean> {
   })
 }
 
+/** What a probe mount is asked to prove: one spec, at one version, one secret. */
+interface ProbeMountSpec {
+  type: MountType
+  /** fs_spec to mount (`//host/share`, `host:/export`). */
+  spec: string
+  /** Version to request (NFS 4.2 / CIFS 3.1.1 default). */
+  vers?: string
+  /** CIFS credentials FILE to authenticate with — path only, never argv. */
+  credentialsFile?: string
+}
+
 /**
- * A guarded probe mount into a throwaway private dir, then unmount. Returns the
- * verdict + detail; the mount is always cleaned up. CIFS credentials ride a temp
- * 0600 file (never argv).
+ * A probe outcome. `stderr` is the cleaned mount error kept for daemon-side
+ * messages (a failed credential rotation quotes it); it never crosses the API
+ * boundary — the wire result carries `detail`.
  */
-async function probeMountAttempt(
-  executor: CommandExecutor,
-  req: MountTestRequest,
-): Promise<{ verdict: MountTestVerdict, detail?: string }> {
+interface ProbeOutcome {
+  verdict: MountTestVerdict
+  detail?: string
+  stderr?: string
+}
+
+/**
+ * A guarded probe mount of `spec` into a throwaway private dir, then unmount —
+ * the ONE probe both the preflight test and the credential rotation use, so the
+ * two can never diagnose the same server differently. The mount is always
+ * cleaned up; the caller owns the credentials file's lifetime.
+ */
+async function probeMountSpec(executor: CommandExecutor, probe: ProbeMountSpec): Promise<ProbeOutcome> {
   const probeDir = await mkdtemp(join(tmpdir(), 'anas-mount-probe-'))
-  let credsPath: string | undefined
   try {
-    let args: string[]
-    if (req.type === 'nfs') {
-      const vers = req.vers ?? '4.2'
-      const spec = `${req.server}:${req.remotePath ?? '/'}`
-      args = ['15', MOUNT, '-t', 'nfs4', '-o', `vers=${vers},soft,timeo=10,retrans=1,retry=0`, spec, probeDir]
-    }
-    else {
-      const vers = req.vers ?? '3.1.1'
-      const spec = `//${req.server}/${req.remotePath ?? ''}`
-      let opts = `vers=${vers}`
-      if (req.credentials) {
-        credsPath = join(probeDir, '.probe.cred')
-        await writeFile(credsPath, formatCredentials(req.credentials), { encoding: 'utf8', mode: 0o600 })
-        opts += `,credentials=${credsPath}`
-      }
-      args = ['15', MOUNT, '-t', 'cifs', '-o', opts, spec, probeDir]
-    }
+    const args = probe.type === 'nfs'
+      ? ['15', MOUNT, '-t', 'nfs4', '-o', `vers=${probe.vers ?? '4.2'},soft,timeo=10,retrans=1,retry=0`, probe.spec, probeDir]
+      : ['15', MOUNT, '-t', 'cifs', '-o', cifsProbeOptions(probe), probe.spec, probeDir]
 
     const r = await executor.exec(TIMEOUT, args)
     if (r.exitCode === 0) {
@@ -799,20 +915,45 @@ async function probeMountAttempt(
       return { verdict: 'ok' }
     }
     const stderr = cleanMountStderr(r.stderr)
-    const verdict = req.type === 'nfs' ? mapNfsFailure(stderr) : mapCifsFailure(stderr)
-    return { verdict, detail: verdictDetail(req.type, verdict, stderr) }
+    const verdict = probe.type === 'nfs' ? mapNfsFailure(stderr) : mapCifsFailure(stderr)
+    return { verdict, detail: verdictDetail(probe.type, verdict, stderr), stderr }
   }
   finally {
-    if (credsPath)
-      await rm(credsPath, { force: true }).catch(() => {})
     await rm(probeDir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+/** The CIFS probe's `-o` list: the version, plus the creds file when there is one. */
+function cifsProbeOptions(probe: ProbeMountSpec): string {
+  const opts = `vers=${probe.vers ?? '3.1.1'}`
+  return probe.credentialsFile ? `${opts},credentials=${probe.credentialsFile}` : opts
+}
+
+/**
+ * The preflight probe for a test request: build the spec the write path would
+ * write (`buildSpec`) and prove it. CIFS credentials ride a temp 0600 file in a
+ * private dir (never argv), removed with the dir.
+ */
+async function probeMountAttempt(executor: CommandExecutor, req: MountTestRequest): Promise<ProbeOutcome> {
+  const spec = buildSpec(req.type, req)
+  if (req.type === 'nfs' || !req.credentials)
+    return probeMountSpec(executor, { type: req.type, spec, ...(req.vers !== undefined ? { vers: req.vers } : {}) })
+
+  const credsDir = await mkdtemp(join(tmpdir(), 'anas-mount-probe-creds-'))
+  const credentialsFile = join(credsDir, 'probe.cred')
+  try {
+    await writeFile(credentialsFile, formatCredentials(req.credentials), { encoding: 'utf8', mode: 0o600 })
+    return await probeMountSpec(executor, { type: req.type, spec, ...(req.vers !== undefined ? { vers: req.vers } : {}), credentialsFile })
+  }
+  finally {
+    await rm(credsDir, { recursive: true, force: true }).catch(() => {})
   }
 }
 
 /** A human detail line for a verdict — never contains the secret. */
 function verdictDetail(type: 'nfs' | 'cifs', verdict: MountTestVerdict, stderr: string): string {
   if (type === 'cifs' && verdict === 'auth-failed')
-    return 'Authentication failed — check the username or password (SMB cannot tell which is wrong).'
+    return `Authentication failed — ${CIFS_AUTH_ADVICE}.`
   return stderr || verdict
 }
 
@@ -947,7 +1088,7 @@ export async function buildMountDetail(
   }
 
   const entry = getMount(fstabText, mountpoint)
-  const effective = parseFindmnt(findmntText).find(n => n.target === mountpoint && n.fstype !== 'autofs')
+  const effective = effectiveMountNode(findmntText, mountpoint)
 
   const detail: MountDetail = { ...row, health, warnings: [] }
   if (capacity)

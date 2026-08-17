@@ -1,13 +1,21 @@
 import type { Job, MountDetail, MountSummary } from '@anas/shared'
+import type { FastifyInstance } from 'fastify'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { CreateMountRequest, UpdateMountRequest } from '@anas/shared'
+import Fastify from 'fastify'
+import { MockExecutor } from '../../executor/mock.js'
+import { JobQueue } from '../../jobs/queue.js'
+import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
+import { jobRoutes } from '../jobs.js'
+import { mountsRoutes } from '../mounts.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/mounts')
@@ -24,7 +32,7 @@ function enc(path: string): string {
   return encodeURIComponent(path)
 }
 
-async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
+async function waitForJob(server: { inject: FastifyInstance['inject'] }, id: string): Promise<Job> {
   for (let i = 0; i < 100; i++) {
     const res = await server.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY_HEADERS })
     const { job } = res.json() as { job: Job }
@@ -188,6 +196,17 @@ describe('mount routes (Epic 18)', () => {
     it('rejects a PVE-owned mount', async () => {
       const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc('/mnt/pve/anastest-nfs')}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ options: { ro: true } }) })
       assert.equal(res.statusCode, 400)
+    })
+
+    // Issue #27: persistence is edit-time IDENTITY. A body that still carries it
+    // (an older UI) must be harmless — stripped at the schema, never a 400.
+    it('ignores a `persistent` field in the update body', async () => {
+      const res = await server!.inject({ method: 'PUT', url: `/v1/mounts/${enc('/mnt/anas-nfs')}`, headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ persistent: false, options: { ro: true } }) })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      // Still persisted — the entry was rewritten, never dropped.
+      assert.ok((await readFile(fstabPath, 'utf8')).includes('/mnt/anas-nfs'))
     })
   })
 
@@ -396,5 +415,249 @@ describe('mount routes — AHR pool persistence is hands-off', () => {
     assert.equal(res.statusCode, 400)
     // Rejected as a LOCAL fs, NOT as AHR — proof the look-alike was not seized.
     assert.match((res.json() as { error: { message: string } }).error.message, /remote shares only/)
+  })
+})
+
+// ============================================================================
+// PUT /v1/mounts/:mountpoint — the edit flow's two live failures (issues #24, #25)
+// ============================================================================
+//
+// These build their own app over a private MockExecutor (the busy-enrichment
+// idiom) because both regressions are decided by the EXACT command sequence and
+// by the kernel mount table changing — or refusing to change — mid-job, neither
+// of which the shared dev-fixture executor can express.
+
+const FINDMNT = '/usr/bin/findmnt'
+const MOUNT = '/usr/bin/mount'
+const UMOUNT = '/usr/bin/umount'
+const TIMEOUT = '/usr/bin/timeout'
+const FUSER = '/usr/bin/fuser'
+const SYSTEMCTL = '/usr/bin/systemctl'
+const OK = { stdout: '', stderr: '', exitCode: 0 }
+
+const CIFS_MP = '/mnt/edit-cifs'
+const NFS_MP = '/mnt/edit-nfs'
+const OLD_CREDS = 'username=smbuser\npassword=oldpass\n'
+
+/** One `findmnt --json` mount table. */
+function findmntJson(rows: Array<{ target: string, source: string, fstype: string, options: string }>): string {
+  return JSON.stringify({ filesystems: rows })
+}
+
+/** The NFS test mount, live with the given options. */
+function nfsTable(options: string): string {
+  return findmntJson([{ target: NFS_MP, source: '10.0.0.9:/export', fstype: 'nfs4', options }])
+}
+
+interface EditHarness {
+  app: FastifyInstance
+  executor: MockExecutor
+  dir: string
+  fstabPath: string
+  credsDir: string
+}
+
+/**
+ * A mounts app over a private executor. `mountTables` is the SEQUENCE of
+ * `findmnt --json` answers (the last repeats) — that is how a test scripts the
+ * kernel mount table under the job.
+ */
+async function createEditServer(
+  fstab: (credsDir: string) => string,
+  mountTables: string[],
+): Promise<EditHarness> {
+  const dir = await mkdtemp(join(tmpdir(), 'anas-mount-edit-'))
+  const fstabPath = join(dir, 'fstab')
+  const credsDir = join(dir, 'creds')
+  await writeFile(fstabPath, fstab(credsDir))
+
+  const executor = new MockExecutor()
+  executor.addFixture({ command: FINDMNT, args: ['--json'], results: mountTables.map(stdout => ({ stdout, stderr: '', exitCode: 0 })) })
+  executor.addFixture({ command: SYSTEMCTL, args: ['daemon-reload'], result: OK })
+  executor.addFixture({ command: MOUNT, result: OK })
+  executor.addFixture({ command: UMOUNT, result: OK })
+
+  const app = Fastify({ logger: false })
+  const jobQueue = new JobQueue()
+  await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+  await app.register(mountsRoutes, {
+    prefix: '/v1',
+    executor,
+    jobQueue,
+    confirmStore: new ConfirmStore(),
+    fstabPath,
+    credsDir,
+    storagePath: join(dir, 'no-storage.cfg'),
+  })
+  return { app, executor, dir, fstabPath, credsDir }
+}
+
+/** Was this exact command+argv issued? */
+function called(executor: MockExecutor, command: string, args: string[]): boolean {
+  return executor.calls.some(c => c.command === command && c.args.length === args.length && c.args.every((a, i) => a === args[i]))
+}
+
+describe('PUT /v1/mounts — credentials are proven before anything is committed (issue #24)', () => {
+  let h: EditHarness | undefined
+
+  const cifsFstab = (credsDir: string): string =>
+    `//10.0.0.9/media ${CIFS_MP} cifs credentials=${join(credsDir, 'mnt-edit-cifs.cred')},vers=3.1.1,nofail 0 0\n`
+
+  beforeEach(async () => {
+    h = await createEditServer(cifsFstab, [findmntJson([])])
+    await mkdir(h.credsDir, { recursive: true, mode: 0o700 })
+    await writeFile(join(h.credsDir, 'mnt-edit-cifs.cred'), OLD_CREDS, { mode: 0o600 })
+  })
+
+  afterEach(async () => {
+    await h?.app.close()
+    await rm(h!.dir, { recursive: true, force: true })
+    h = undefined
+  })
+
+  async function putCredentials(password: string): Promise<Job> {
+    const res = await h!.app.inject({
+      method: 'PUT',
+      url: `/v1/mounts/${enc(CIFS_MP)}`,
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ credentials: { username: 'smbuser', password }, options: { ro: true } }),
+    })
+    assert.equal(res.statusCode, 202)
+    return waitForJob(h!.app, (res.json() as { job: Job }).job.id)
+  }
+
+  it('a rejected password fails the job and leaves the creds file AND fstab untouched', async () => {
+    // The probe mount answers EACCES — the live `mount error(13)` shape.
+    h!.executor.addFixture({ command: TIMEOUT, result: {
+      stdout: '',
+      stderr: 'mount error(13): Permission denied\nRefer to the mount.cifs(8) manual page (mount.cifs -h)\n',
+      exitCode: 32,
+    } })
+    const before = await readFile(h!.fstabPath, 'utf8')
+
+    const job = await putCredentials('wrong')
+    assert.equal(job.status, 'failed')
+    const msg = job.error!.message
+    assert.match(msg, /username or password/, msg)
+    assert.match(msg, /mount error\(13\)/, msg)
+
+    // THE regression: nothing was committed on the way to the failure.
+    assert.equal(await readFile(join(h!.credsDir, 'mnt-edit-cifs.cred'), 'utf8'), OLD_CREDS)
+    assert.equal(await readFile(h!.fstabPath, 'utf8'), before)
+    // …and the candidate secret is not left lying in the creds dir.
+    assert.deepEqual(await readdir(h!.credsDir), ['mnt-edit-cifs.cred'])
+    // The probe authenticated from the CANDIDATE file, never the live one.
+    const probe = h!.executor.calls.find(c => c.command === TIMEOUT)!
+    assert.match(probe.args.join(' '), /credentials=.*\.mnt-edit-cifs\.cred\.validating/)
+    // No fstab rewrite means no reload and no remount attempt either.
+    assert.ok(!called(h!.executor, SYSTEMCTL, ['daemon-reload']))
+    assert.ok(!called(h!.executor, UMOUNT, [CIFS_MP]))
+  })
+
+  it('a proven password is committed, the fstab rewritten and the mount applied', async () => {
+    h!.executor.addFixture({ command: TIMEOUT, result: OK }) // the probe mount succeeds
+
+    const job = await putCredentials('n3wp@ss')
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+    const credsPath = join(h!.credsDir, 'mnt-edit-cifs.cred')
+    const creds = await readFile(credsPath, 'utf8')
+    assert.ok(creds.includes('password=n3wp@ss'), creds)
+    assert.equal((await stat(credsPath)).mode & 0o777, 0o600)
+    assert.deepEqual(await readdir(h!.credsDir), ['mnt-edit-cifs.cred'])
+
+    const line = (await readFile(h!.fstabPath, 'utf8')).split('\n').find(l => l.includes(CIFS_MP))!
+    assert.ok(line.includes(`credentials=${credsPath}`), line)
+    assert.ok(line.split(/\s+/)[3].split(',').includes('ro'), line)
+    assert.ok(called(h!.executor, MOUNT, ['--', CIFS_MP]))
+  })
+})
+
+describe('PUT /v1/mounts — a completed edit means the new options are LIVE (issue #25)', () => {
+  let h: EditHarness | undefined
+
+  const nfsFstab = (): string => `10.0.0.9:/export ${NFS_MP} nfs4 defaults,nofail 0 0\n`
+  const RW = 'rw,relatime,vers=4.2,hard,proto=tcp,addr=10.0.0.9'
+  const RO = 'ro,relatime,vers=4.2,hard,proto=tcp,addr=10.0.0.9'
+
+  afterEach(async () => {
+    await h?.app.close()
+    await rm(h!.dir, { recursive: true, force: true })
+    h = undefined
+  })
+
+  /** A busy mountpoint: the unmount is refused, exactly as util-linux reports it. */
+  function refuseUnmount(executor: MockExecutor): void {
+    executor.addFixture({ command: UMOUNT, args: [NFS_MP], result: {
+      stdout: '',
+      stderr: `umount: ${NFS_MP}: target is busy.`,
+      exitCode: 32,
+    } })
+  }
+
+  async function putReadOnly(): Promise<Job> {
+    const res = await h!.app.inject({
+      method: 'PUT',
+      url: `/v1/mounts/${enc(NFS_MP)}`,
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ options: { ro: true } }),
+    })
+    assert.equal(res.statusCode, 202)
+    return waitForJob(h!.app, (res.json() as { job: Job }).job.id)
+  }
+
+  it('a refused unmount falls back to `mount -o remount` and succeeds once the options land', async () => {
+    // Mount table: still rw after the refused unmount, ro after the remount.
+    h = await createEditServer(nfsFstab, [nfsTable(RW), nfsTable(RO)])
+    refuseUnmount(h.executor)
+
+    const job = await putReadOnly()
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(called(h.executor, MOUNT, ['-o', 'remount', '--', NFS_MP]))
+    // A busy target is NEVER mounted over — `mount <mp>` reports success on an
+    // already-mounted target and would have hidden the whole failure.
+    assert.ok(!called(h.executor, MOUNT, ['--', NFS_MP]))
+  })
+
+  it('options that never land fail the job and name the holders', async () => {
+    // The mount table keeps answering rw — the remount changed nothing.
+    h = await createEditServer(nfsFstab, [nfsTable(RW)])
+    refuseUnmount(h.executor)
+    // fuser names THIS test process as the holder → /proc/<pid>/comm is real.
+    h.executor.addFixture({ command: FUSER, args: ['-m', NFS_MP], result: { stdout: `${process.pid}\n`, stderr: '', exitCode: 0 } })
+
+    const job = await putReadOnly()
+    assert.equal(job.status, 'failed')
+    const msg = job.error!.message
+    assert.match(msg, /still mounted with previous options/, msg)
+    assert.match(msg, /target is busy/, msg)
+    assert.match(msg, /held open by:/, msg)
+    assert.ok(msg.includes(`(${process.pid})`), msg)
+    // The fstab carries the intent (the next mount is ro) — only the LIVE mount
+    // could not be changed, and the job says exactly that.
+    assert.ok((await readFile(h.fstabPath, 'utf8')).includes('ro,'))
+  })
+
+  it('an entry that is not mounted at all is simply mounted from fstab', async () => {
+    h = await createEditServer(nfsFstab, [findmntJson([])])
+    const job = await putReadOnly()
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(called(h.executor, MOUNT, ['--', NFS_MP]))
+    assert.ok(!called(h.executor, MOUNT, ['-o', 'remount', '--', NFS_MP]))
+  })
+})
+
+describe('UpdateMountRequest — persistence is edit-time identity (issue #27)', () => {
+  it('strips `persistent` from an update body; create still owns it', () => {
+    const parsed = UpdateMountRequest.parse({ persistent: false, options: { ro: true } })
+    assert.ok(!('persistent' in parsed))
+    assert.equal(parsed.options?.ro, true)
+    assert.equal(CreateMountRequest.parse({ type: 'nfs', mountpoint: '/mnt/x', persistent: false }).persistent, false)
+  })
+
+  it('does not typecheck a `persistent` update body', () => {
+    // @ts-expect-error persistence is identity on an edit — not an updatable field.
+    const body: UpdateMountRequest = { persistent: true }
+    assert.deepEqual(body, { persistent: true })
   })
 })
