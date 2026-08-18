@@ -1,6 +1,6 @@
 import type { Job, JobRef } from '@anas/shared'
-import { randomUUID } from 'node:crypto'
-import { request as httpRequest } from 'node:http'
+import type { Requester, RunLoopOptions } from './runner-poll.js'
+import { defaultSocket, errorMessage, identityHeaders, pollJobToTerminal, socketRequester } from './runner-poll.js'
 
 /**
  * Replication task RUNNER (Epic 5.5.3) — the entrypoint each `anas-repl-<name>`
@@ -11,10 +11,12 @@ import { request as httpRequest } from 'node:http'
  * completion / nonzero on failure (so systemd's own last-result is truthful).
  *
  * No custom scheduling, no state: the timer schedules, the daemon does the work,
- * ZFS + systemd hold the truth. Everything here is I/O plumbing.
+ * ZFS + systemd hold the truth. Everything here is I/O plumbing, with the shared
+ * poll loop (interval, 24h backstop) in runner-poll.ts.
  */
 
-const DEFAULT_SOCKET = process.env.ANASD_SOCKET ?? '/run/anas/anasd.sock'
+export type { Requester, RunLoopOptions, RunnerResponse } from './runner-poll.js'
+export { socketRequester } from './runner-poll.js'
 
 export interface RunnerOptions {
   pool: string
@@ -35,7 +37,7 @@ export interface RunnerOptions {
  *  missing required flag or a value-less flag.
  */
 export function parseRunnerArgs(argv: string[]): RunnerOptions {
-  const opts: Partial<RunnerOptions> & { snapshotFirst: boolean } = { snapshotFirst: false, socket: DEFAULT_SOCKET }
+  const opts: Partial<RunnerOptions> & { snapshotFirst: boolean } = { snapshotFirst: false, socket: defaultSocket() }
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i]
     const takesValue = flag !== '--snapshot-first'
@@ -77,7 +79,7 @@ export function parseRunnerArgs(argv: string[]): RunnerOptions {
     ...(opts.locationKind !== undefined ? { locationKind: opts.locationKind } : {}),
     ...(opts.locationName !== undefined ? { locationName: opts.locationName } : {}),
     snapshotFirst: opts.snapshotFirst,
-    socket: opts.socket ?? DEFAULT_SOCKET,
+    socket: opts.socket ?? defaultSocket(),
   }
 }
 
@@ -107,41 +109,6 @@ export function replicateBody(opts: RunnerOptions): Record<string, unknown> {
   }
 }
 
-export interface RunnerResponse {
-  statusCode: number
-  body: unknown
-}
-
-/**
- * A single JSON request over the daemon socket. Abstracted so the run loop is
- *  unit-testable with a fake requester.
- */
-export type Requester = (req: {
-  method: string
-  path: string
-  headers: Record<string, string>
-  body?: unknown
-}) => Promise<RunnerResponse>
-
-/** System identity headers the daemon's requireIdentity expects for a mutation. */
-function identityHeaders(): Record<string, string> {
-  return {
-    'content-type': 'application/json',
-    'x-anas-user': 'root@pam',
-    'x-anas-user-uid': '0',
-    'x-anas-request-id': randomUUID(),
-  }
-}
-
-export interface RunLoopOptions {
-  /** Poll interval in ms (default 1000). */
-  intervalMs?: number
-  /** Max poll attempts before giving up (default 3600 ≈ 1h at 1s). */
-  maxAttempts?: number
-  /** Injectable sleep (tests pass a no-op). */
-  sleep?: (ms: number) => Promise<void>
-}
-
 /**
  * Submit the replicate job and poll it to a terminal state. Resolves with the
  * finished Job (completed OR failed); rejects only on transport/protocol
@@ -152,15 +119,10 @@ export async function runReplication(
   opts: RunnerOptions,
   loop: RunLoopOptions = {},
 ): Promise<Job> {
-  const intervalMs = loop.intervalMs ?? 1000
-  const maxAttempts = loop.maxAttempts ?? 3600
-  const sleep = loop.sleep ?? (ms => new Promise<void>(r => setTimeout(r, ms)))
-
-  const headers = identityHeaders()
   const submit = await requester({
     method: 'POST',
     path: replicatePath(opts.pool, opts.dataset),
-    headers,
+    headers: identityHeaders(),
     body: replicateBody(opts),
   })
   if (submit.statusCode !== 202) {
@@ -171,65 +133,7 @@ export async function runReplication(
   if (!jobRef?.id)
     throw new Error(`replicate submit returned no job id: ${JSON.stringify(submit.body)}`)
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const poll = await requester({
-      method: 'GET',
-      path: `/v1/jobs/${jobRef.id}`,
-      headers,
-    })
-    if (poll.statusCode === 200) {
-      const job = (poll.body as { job?: Job }).job
-      if (job && (job.status === 'completed' || job.status === 'failed'))
-        return job
-    }
-    await sleep(intervalMs)
-  }
-  throw new Error(`replicate job ${jobRef.id} did not reach a terminal state after ${maxAttempts} polls`)
-}
-
-/** Pull an error message out of a `{ error: { message } }` body if present. */
-function errorMessage(body: unknown): string | undefined {
-  const err = (body as { error?: { message?: string } } | undefined)?.error
-  return err?.message
-}
-
-/** Real requester: one JSON round-trip over the daemon's unix socket. */
-export function socketRequester(socketPath: string): Requester {
-  return req => new Promise<RunnerResponse>((resolve, reject) => {
-    const payload = req.body !== undefined ? JSON.stringify(req.body) : undefined
-    const clientReq = httpRequest(
-      {
-        socketPath,
-        method: req.method,
-        path: req.path,
-        headers: {
-          ...req.headers,
-          ...(payload !== undefined ? { 'content-length': Buffer.byteLength(payload).toString() } : {}),
-        },
-      },
-      (res) => {
-        let data = ''
-        res.setEncoding('utf-8')
-        res.on('data', (chunk) => {
-          data += chunk
-        })
-        res.on('end', () => {
-          let body: unknown = data
-          try {
-            body = data ? JSON.parse(data) : undefined
-          }
-          catch {
-            // Non-JSON body: hand back the raw text.
-          }
-          resolve({ statusCode: res.statusCode ?? 0, body })
-        })
-      },
-    )
-    clientReq.on('error', reject)
-    if (payload !== undefined)
-      clientReq.write(payload)
-    clientReq.end()
-  })
+  return pollJobToTerminal(requester, jobRef, 'replicate', loop)
 }
 
 /** CLI entrypoint. Exits 0 on completed, 1 on job failure, 2 on bad args/transport. */
