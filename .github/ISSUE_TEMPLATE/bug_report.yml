@@ -1,7 +1,7 @@
 name: Bug report
 description: Report a problem with ANAS
-title: "[Bug]: "
-labels: ["bug"]
+title: '[Bug]: '
+labels: [bug]
 body:
   - type: markdown
     attributes:
@@ -14,7 +14,7 @@ body:
     attributes:
       label: ANAS version
       description: The release/tarball you installed (e.g. 0.2.0).
-      placeholder: "0.2.0"
+      placeholder: 0.2.0
     validations:
       required: true
 
@@ -23,7 +23,7 @@ body:
     attributes:
       label: Proxmox VE version
       description: Output of `pveversion`.
-      placeholder: "pve-manager/8.x.x (running kernel: 6.x.x)"
+      placeholder: 'pve-manager/8.x.x (running kernel: 6.x.x)'
     validations:
       required: true
 

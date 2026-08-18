@@ -1,7 +1,7 @@
 name: Feature request
 description: Suggest a capability or improvement for ANAS
-title: "[Feature]: "
-labels: ["enhancement"]
+title: '[Feature]: '
+labels: [enhancement]
 body:
   - type: markdown
     attributes:
