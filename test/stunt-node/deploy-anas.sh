@@ -136,7 +136,7 @@ fi
 # AHR md-event hook: the mdadm --monitor PROGRAM target. The rsync above
 # already placed packaging/ under /opt/anas/, so install from its synced copy
 # (same pattern as the pve-integration scripts). Idempotent on every deploy.
-$SSH_CMD "install -m 0755 /opt/anas/packaging/anas-md-event.sh /usr/local/bin/anas-md-event && install -d /usr/share/pve-manager/templates/default && install -m 0644 /opt/anas/packaging/templates/anas-ahr-*.hbs /usr/share/pve-manager/templates/default/"
+$SSH_CMD "install -m 0755 /opt/anas/packaging/anas-md-event.sh /usr/local/bin/anas-md-event && install -d /usr/share/pve-manager/templates/default && install -m 0644 /opt/anas/packaging/templates/anas-*.hbs /usr/share/pve-manager/templates/default/"
 echo "  ✓ anas-md-event hook installed (/usr/local/bin/anas-md-event)"
 # smbd (samba) and exportfs (nfs-kernel-server) are per-protocol and the
 # operator chooses which to run, so warn but never auto-install or fail.
