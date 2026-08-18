@@ -334,8 +334,16 @@ function syncTargetIndex(md: MdstatArray): number | null {
 
 /**
  * One band array's state, fused from mdstat (GT-8/GT-9 aware):
- *  - inactive (all-spares) → 'degraded'; the pool advisory names the
- *    condition (the schema deliberately gains no extra state for it).
+ *  - an array that CANNOT START (mdstat `inactive`, the GT-8 all-spares shape)
+ *    → 'inactive', checked first and reported as what mdstat says it is. This
+ *    is the same `md.active === false` the pool-state fusion below reads for its
+ *    `offline` verdict, so the two levels cannot disagree: a band with this
+ *    state always sits in an offline pool. It used to return 'degraded' (issue
+ *    #18 widened the POOL state and left the band as it was), which flattened
+ *    two different facts into one amber word — a band down a member still
+ *    serves its stripe, a band that cannot start serves nothing and pulls its
+ *    PV out of the VG. Naming the difference is what tells the operator which
+ *    bands the recovery ladder (§5.1) actually has to address.
  *  - a running `recovery` → 'recovering', checked BEFORE the degraded
  *    verdict: recovery is md actively (re)building redundancy — the initial
  *    RAID5/6 build ("building — pool usable now", §3), a §11 spare
@@ -361,7 +369,7 @@ function syncTargetIndex(md: MdstatArray): number | null {
  */
 function arrayState(md: MdstatArray): ArrayState {
   if (!md.active)
-    return 'degraded'
+    return 'inactive'
   if (md.sync?.action === 'recovery')
     return 'recovering'
   // A sync the kernel has QUEUED behind another array's (they share physical
@@ -756,6 +764,10 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     }
 
     // ---- Pool state fusion --------------------------------------------------
+    // 'inactive' bands are deliberately NOT counted here: they are the evidence
+    // for `offline`, which is decided below and outranks degraded outright. The
+    // two tests read the same `md.active` flag, so a band that cannot start can
+    // never fall between them and go unbadged.
     const anyDegraded = arrays.some(a => a.state === 'degraded')
     const anyReshape = arrayEntries.some(e => e.mdstat.sync?.action === 'reshape')
     const anySync = arrayEntries.some(e => e.mdstat.sync?.action === 'resync' || e.mdstat.sync?.action === 'recovery')
@@ -892,8 +904,12 @@ export function withExpansionIntent(pool: AhrPool, intent: AhrExpansionIntent | 
 /**
  * Which array/band + which member, for the degraded card. Every degraded
  * array in the pool is named (the card stays ONE per pool); a degraded array
- * with no faulty member listed (e.g. a member gone entirely, or the GT-8
- * inactive state) reads "missing a member". Disk ids are never truncated.
+ * with no faulty member listed (a member gone entirely) reads "missing a
+ * member". Disk ids are never truncated.
+ *
+ * A band that cannot start never reaches here twice over: it carries state
+ * 'inactive', and its pool is `offline`, which cards through its own branch
+ * naming the unstartable bands.
  *
  * Bands merely BUILDING redundancy never reach here: {@link arrayState} resolves
  * a running or queued recovery with intact membership to 'recovering' (issue

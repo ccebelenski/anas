@@ -268,9 +268,11 @@ describe('readAhrPools', () => {
     const pools = await readAhrPools(mock)
     const pool = pools[0]
     const r1 = pool.arrays[0]
-    // The BAND keeps its degraded state (no new array-level state for this) with
-    // the advisory naming the condition and the recovery ladder…
-    assert.equal(r1.state, 'degraded')
+    // The BAND says what mdstat says: it cannot start. This assertion USED to
+    // read 'degraded' — the #18 follow-up: a band down a member still serves
+    // its stripe, a band that cannot start serves nothing, and flattening the
+    // two into one amber word hid which bands the recovery ladder must address.
+    assert.equal(r1.state, 'inactive')
     assert.ok(r1.members.every(m => m.memberState === 'spare'))
     assert.ok(pool.advisories.some(a => a.includes('INACTIVE')))
     // …but the POOL is offline, not degraded (issue #18): a band that cannot
@@ -778,11 +780,32 @@ unused devices: <none>
       // reduced-redundancy-but-functioning. Nothing was being served at all.
       assert.equal(pool.state, 'offline')
       // The bands still describe themselves truthfully at their own level
-      // (11.19): r1 IS degraded, and r2/r3 are the GT-8 inactive shape.
+      // (11.19), and they do NOT all say the same thing: r1 really is up and
+      // down a member, r2/r3 really cannot start. Painting all three the same
+      // colour — either amber, or red because the POOL is offline — would erase
+      // the one fact recovery turns on, so each band keeps its own verdict.
       const byBand = new Map(pool.arrays.map(a => [a.band, a]))
       assert.equal(byBand.get(1)!.state, 'degraded')
-      for (const band of [2, 3])
+      for (const band of [2, 3]) {
+        assert.equal(byBand.get(band)!.state, 'inactive', `band ${band} cannot start`)
         assert.ok(byBand.get(band)!.members.every(m => m.memberState === 'spare'), `band ${band} is inactive (all members (S))`)
+      }
+    })
+
+    it('a band that cannot start is never counted as merely degraded', async () => {
+      const pool = await incident()
+      // The band state and the pool verdict read the SAME mdstat flag, so they
+      // cannot drift: every 'inactive' band implies an offline pool, and no
+      // unstartable band hides inside the degraded count that feeds the amber
+      // pool badge. If a future edit reorders the fusion, this is what bites.
+      assert.deepEqual(pool.arrays.filter(a => a.state === 'inactive').map(a => a.band), [2, 3])
+      assert.deepEqual(pool.arrays.filter(a => a.state === 'degraded').map(a => a.band), [1])
+      assert.equal(pool.state, 'offline')
+      // The degraded card's detail describes only bands that ARE degraded — the
+      // unstartable ones are named by the offline advisory instead, once each.
+      const card = buildAhrWarnings([pool])[0]
+      assert.equal(card.level, 'critical')
+      assert.ok(!card.message.includes('missing a member'), card.message)
     })
 
     it('the advisory names WHICH bands cannot start, and says the data is unavailable', async () => {

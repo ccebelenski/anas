@@ -789,12 +789,16 @@
     // Band-array state → gfx pill token + label. Mirrors 39-ahr.js ARRAY_STATES
     // EXACTLY (parallel construction — the two AHR surfaces must not disagree
     // about what a band's state is called or how severe it looks).
+    // 'inactive' = the band cannot start (the pool is OFFLINE): red pill, and the
+    // label says "CANNOT START" in the same words as the daemon advisory and the
+    // failure card. Bands that DID start keep their own honest state beside it.
     var AHR_ARRAY_STATES = {
         clean: { token: 'ONLINE', label: 'clean' },
         degraded: { token: 'DEGRADED', label: 'degraded' },
         resyncing: { token: '', label: 'building' },
         reshaping: { token: '', label: 'reshaping' },
         recovering: { token: 'DEGRADED', label: 'rebuilding' },
+        inactive: { token: 'OFFLINE', label: 'CANNOT START' },
         failed: { token: 'FAULTED', label: 'failed' }
     };
 

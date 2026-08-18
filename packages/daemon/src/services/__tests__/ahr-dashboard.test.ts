@@ -267,6 +267,31 @@ describe('buildAhrPoolBriefs (story 11.13, AHR-DESIGN §10 revision)', () => {
     assert.ok(b.bands.every(band => band.sync === undefined))
   })
 
+  it('an OFFLINE pool\'s band strip says WHICH band cannot start (issue #18 follow-up)', async () => {
+    // The dashboard strip is where the two states sit side by side, and the
+    // whole point of the band split: the strip used to paint both bands amber
+    // "degraded" under a red OFFLINE pool badge, so it showed the operator a
+    // severity that understated the pool and a shape that named no culprit.
+    // The post-lockup shape, at this layer: one band up and down a member, one
+    // that never started. (readAhrPools' own derivation of these states from
+    // the pve5 capture is pinned in ahr-topology.test.ts; what matters here is
+    // that the strip PROJECTS them rather than flattening them.)
+    const healthy = await healthyPool()
+    const pool: AhrPool = {
+      ...healthy,
+      state: 'offline',
+      arrays: [
+        { ...healthy.arrays[0], state: 'degraded' as const },
+        { ...healthy.arrays[1], state: 'inactive' as const },
+      ],
+    }
+
+    const bands = buildAhrPoolBriefs([pool])[0].bands
+    assert.deepEqual(bands.map(b => b.state), ['degraded', 'inactive'])
+    // The two surfaces read the same array states, so they cannot disagree.
+    assert.deepEqual(bands.map(b => b.state), pool.arrays.map(a => a.state))
+  })
+
   it('carries a running sync, and marks a QUEUED band by its absence (issue #9)', async () => {
     const pool = await healthyPool()
     // Band 1 is rebuilding with live progress; band 2 is queued behind it —

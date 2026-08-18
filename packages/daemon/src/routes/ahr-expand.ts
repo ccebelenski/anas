@@ -125,16 +125,32 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     }
   }
 
-  /** §4 pre-check: never start a reshape on a degraded/failed/readonly pool. */
+  /**
+   * §4 pre-check: never start a reshape on a degraded/inactive/failed/readonly/
+   * offline pool.
+   *
+   * `inactive` and `offline` are named explicitly rather than left to the
+   * degraded catch: a band that cannot start used to report `degraded` and was
+   * caught by this gate on that word alone, and an `offline` pool whose only
+   * fault is an inactive LV never had a bad ARRAY to catch it at all. Both are
+   * spelled out so the refusal survives the state split.
+   */
   function refuseDegraded(pool: AhrPool, reply: FastifyReply): boolean {
-    const badArray = pool.arrays.find(a => a.state === 'degraded' || a.state === 'failed')
-    if (badArray || pool.state === 'failed' || pool.state === 'readonly') {
+    const badArray = pool.arrays.find(a => a.state === 'degraded' || a.state === 'inactive' || a.state === 'failed')
+    if (badArray || pool.state === 'offline' || pool.state === 'failed' || pool.state === 'readonly') {
+      // An unreachable volume is refused for a different reason than a
+      // reduced-redundancy one, and says so: there is no double-failure window
+      // to warn about when nothing is being served in the first place.
+      const unreachable = pool.state === 'offline' || badArray?.state === 'inactive'
       const what = badArray
         ? `array ${pool.name}-r${badArray.band} is ${badArray.state}`
         : `pool '${pool.name}' is ${pool.state}`
+      const why = unreachable
+        ? `The volume is not assembled, so there is nothing to reshape — bring the pool back online first.`
+        : `Reshaping a degraded pool voluntarily enters the double-failure window (§4) — replace/rebuild first.`
       reply.code(409).send({ error: {
         code: 'CONFLICT',
-        message: `Cannot expand: ${what}. Reshaping a degraded pool voluntarily enters the double-failure window (§4) — replace/rebuild first. This refusal has no confirm bypass.`,
+        message: `Cannot expand: ${what}. ${why} This refusal has no confirm bypass.`,
       } })
       return true
     }

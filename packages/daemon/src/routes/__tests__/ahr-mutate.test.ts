@@ -7,10 +7,16 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
+import { mockFixtures } from '../../fixtures/loader.js'
 import { JobQueue } from '../../jobs/queue.js'
+import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
 import { LSBLK_ARGS } from '../../parsers/lsblk.js'
+import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
+import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
 import { ahrMutationRoutes } from '../ahr-mutate.js'
 import { jobRoutes } from '../jobs.js'
@@ -403,5 +409,69 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     assert.ok(res.json().error.message.includes('volume group'))
     assert.ok(!res.headers['x-anas-confirm-code'], 'refused before the confirm gate')
     assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/wipefs'), 'no disk was wiped')
+  })
+})
+
+/**
+ * The scrub gate against an OFFLINE pool (issue #18 follow-up). The stock dev
+ * mock's `ahr0` is healthy, so this builds the same read layer from the same
+ * shipped fixtures with ONE byte changed: the LV's attr state field, 'a' →
+ * '-', which is exactly what an LV that is present but not active reports.
+ */
+describe('POST /v1/ahr/:name/scrub — an OFFLINE pool is refused', () => {
+  let server: TestServer
+  let executor: MockExecutor
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-scrub-offline-'))
+    await writeFile(join(dir, 'fstab'), '# empty\n')
+
+    executor = new MockExecutor()
+    const lvs = mockFixtures.ahrLvs()
+    executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+    executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+    executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+    executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+    executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: { ...lvs, stdout: lvs.stdout.replace('"-wi-a-----"', '"-wi-------"') } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+    executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+
+    const app = Fastify({ logger: false })
+    const jobQueue = new JobQueue()
+    await app.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await app.register(ahrMutationRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      diskIdentityCache: new DiskIdentityCache(executor),
+      fstabPath: join(dir, 'fstab'),
+      mdadmConfPath: join(dir, 'mdadm.conf'),
+      mountBase: join(dir, 'mnt'),
+    })
+    server = app as unknown as TestServer
+  })
+  afterEach(async () => {
+    await server.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('409s naming the condition, and starts no scrub', async () => {
+    const res = await server.inject({ method: 'POST', url: '/v1/ahr/ahr0/scrub', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFLICT')
+    const { message } = res.json().error
+    // The condition, not a symptom: "is offline" + why, never "is not mounted".
+    assert.ok(message.includes('is offline'), message)
+    assert.ok(message.includes('the volume is not assembled'), message)
+    // This gate predates `offline` — the pool used to arrive here reading
+    // `degraded`, which is not in the busy list, so the scrub was ALLOWED.
+    assert.ok(!message.includes('would thrash'), message)
+    // Nothing was started: no btrfs scrub, no md check.
+    assert.ok(!executor.calls.some(c => c.command === '/usr/bin/btrfs' && c.args[0] === 'scrub'), 'no btrfs scrub')
+    assert.ok(!executor.calls.some(c => c.command === '/usr/sbin/mdadm' && c.args[0] === '--action=check'), 'no md check')
   })
 })

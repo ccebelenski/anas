@@ -71,7 +71,8 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
   /**
    * The shared guard for a snapshot MUTATION (create/delete/rollback): the pool
    * must carry the §12 subvolume layout, have no expansion intent, and not be
-   * in a failed/read-only state. Returns true (and sends the 409) on refusal.
+   * in an offline/failed/read-only state. Returns true (and sends the 409) on
+   * refusal.
    */
   async function refuseUnsafe(pool: AhrPool, reply: FastifyReply): Promise<boolean> {
     if (!pool.subvolLayout) {
@@ -86,6 +87,18 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
       reply.code(409).send({ error: {
         code: 'CONFLICT',
         message: `Pool '${pool.name}' has an expansion intent (state '${intent.state}') — snapshots can change once it completes or is abandoned.`,
+      } })
+      return true
+    }
+    // `offline` (issue #18) belongs in this gate for the same reason `failed`
+    // does: no filesystem is mounted, so a snapshot create/delete/rollback has
+    // nothing to act on. It was reachable here while an unassembled pool still
+    // read `degraded` — btrfs would then refuse on its own, but a pool-state
+    // refusal that names the actual condition beats an errno from a subcommand.
+    if (pool.state === 'offline') {
+      reply.code(409).send({ error: {
+        code: 'CONFLICT',
+        message: `Pool '${pool.name}' is offline — the volume is not assembled, so there is no filesystem to snapshot. See the Hybrid RAID view for which band arrays cannot start.`,
       } })
       return true
     }

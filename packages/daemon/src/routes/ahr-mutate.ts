@@ -332,6 +332,17 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
     }
+    // Unreachable before busy (issue #18): a scrub reads every byte through the
+    // btrfs filesystem and then checks each band array, and an offline pool has
+    // neither — the volume is not assembled. This gate predates the `offline`
+    // state, so an unassembled pool used to arrive here reading `degraded` and
+    // pass; the mount check below would usually stop it, but a lingering mount
+    // entry is not a guarantee, and "is offline" names the condition where
+    // "is not mounted" only describes a symptom.
+    if (pool.state === 'offline') {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `AHR pool '${name}' is offline — the volume is not assembled, so there is nothing to scrub; see the Hybrid RAID view for which band arrays cannot start` } }
+    }
     // Never concurrent (§4): a scrub and a resync/reshape are all full-device
     // passes — refuse while one is already running.
     if (pool.state === 'scrubbing' || pool.state === 'building' || pool.state === 'rebuilding' || pool.state === 'expanding') {

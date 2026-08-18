@@ -48,6 +48,20 @@ md127 : active raid5 sds1[2] sdr1[1] sdq1[0]
 unused devices: <none>
 `
 
+// md127 assembled but NOT STARTED (every member (S), the GT-8 shape) → the band
+// reads `inactive` and the pool `offline`. Before that split the band reported
+// `degraded`, which is the only reason the §4 gate caught it; the gate now names
+// both states, and this pins that it still refuses.
+const MDSTAT_INACTIVE = `Personalities : [raid1] [raid5]
+md126 : active raid1 sds2[1] sdr2[0]
+      1047552 blocks super 1.2 [2/2] [UU]
+
+md127 : inactive sds1[2](S) sdr1[1](S) sdq1[0](S)
+      4190208 blocks super 1.2
+
+unused devices: <none>
+`
+
 // A member lost from md127 → the pool reads degraded (the §4 refusal case).
 const MDSTAT_DEGRADED = `Personalities : [raid1] [raid5]
 md126 : active raid1 sds2[1] sdr2[0]
@@ -270,6 +284,20 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       assert.equal(error.code, 'CONFLICT')
       assert.match(error.message, /degraded/)
       assert.equal(res.headers['x-anas-confirm-code'], undefined, 'degraded refusal must not mint a confirm code')
+    })
+
+    it('REFUSES a pool whose band cannot start, for the honest reason', async () => {
+      await build({ mdstat: MDSTAT_INACTIVE })
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand', headers: IDENTITY_HEADERS, payload: { addDisks: [W] } })
+      assert.equal(res.statusCode, 409)
+      const { error } = res.json()
+      assert.equal(error.code, 'CONFLICT')
+      assert.match(error.message, /is inactive/)
+      // An unreachable volume gets its own reason: there is no double-failure
+      // window to warn about when nothing is being served at all.
+      assert.match(error.message, /nothing to reshape/)
+      assert.ok(!error.message.includes('double-failure'), error.message)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined, 'no confirm bypass')
     })
 
     it('REFUSES a second expansion while an intent exists (409)', async () => {

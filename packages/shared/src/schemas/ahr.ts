@@ -35,6 +35,21 @@ export type ArrayLevel = z.infer<typeof ArrayLevel>
  * One band array's state. Initial RAID5/6 sync after create reports as
  * `resyncing` — UI copy presents that as "building — pool usable now",
  * distinct from degraded.
+ *
+ * `inactive` is the band-level counterpart of the pool's `offline`: the md array
+ * exists but CANNOT START (mdstat's `inactive` — "active, FAILED, Not Started",
+ * the GT-8 all-spares assembly), so it serves nothing and takes its PV out of
+ * the VG with it. It is read straight off mdstat's array header, never inferred
+ * — the same single piece of evidence that carries the pool's `offline` verdict,
+ * reported at the level it was observed.
+ *
+ * It used to report `degraded`: issue #18 shipped the pool state and left the
+ * band alone as "no schema widening for a tone". The follow-up look found it is
+ * not a tone. On the pve5 post-lockup shape r1 was genuinely active and degraded
+ * while r2 and r3 could not start at all, and one amber word for both hid the
+ * fact that matters most for recovery — WHICH bands failed to assemble. A band
+ * that cannot start is a different fact from a band down a member, and the
+ * daemon has always known which is which.
  */
 export const ArrayState = z.enum([
   'clean',
@@ -42,6 +57,7 @@ export const ArrayState = z.enum([
   'resyncing',
   'reshaping',
   'recovering',
+  'inactive',
   'failed',
 ])
 export type ArrayState = z.infer<typeof ArrayState>

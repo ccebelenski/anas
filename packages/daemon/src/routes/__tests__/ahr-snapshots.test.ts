@@ -122,14 +122,20 @@ function findmntJson(subvol: string): string {
   }] })
 }
 
-function buildExecutor(opts: { subvol?: string } = {}): MockExecutor {
+/**
+ * `lvAttr` drives the pool's state: the 5th field is LVM's state flag, so
+ * '-wi-----p-' (not 'a') is a present-but-inactive LV — the issue #18 offline
+ * evidence, and the cheapest way to put this pool's read layer into the state
+ * the mutation gate has to refuse.
+ */
+function buildExecutor(opts: { subvol?: string, lvAttr?: string } = {}): MockExecutor {
   const executor = new MockExecutor()
   executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: MDSTAT, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: 'MD_LEVEL=raid5\nMD_DEVICES=3\nMD_METADATA=1.2\nMD_UUID=aaaa:aaaa:aaaa:aaaa\nMD_DEVNAME=tank-r1\nMD_NAME=anas-test:tank-r1\n', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: { stdout: ahrLsblkJson(), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: `${DISKS.map(d => `lrwxrwxrwx 1 root root 9 Jul 23 10:00 ${d.id} -> ../../${d.kernel}`).join('\n')}\n`, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '1', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-ao----', lv_size: String(LV_SIZE) }] }] }), stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: opts.lvAttr ?? '-wi-ao----', lv_size: String(LV_SIZE) }] }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: findmntJson(opts.subvol ?? 'subvolid=256,subvol=/@data'), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: BTRFS_USAGE, stderr: '', exitCode: 0 } })
   // Snapshot listing against the live @data mount: the plain list is the
@@ -162,7 +168,7 @@ describe('AHR snapshot routes (story 11.12)', () => {
   let jobQueue: JobQueue
   let server: ReturnType<typeof Fastify>
 
-  async function build(opts: { subvol?: string } = {}) {
+  async function build(opts: { subvol?: string, lvAttr?: string } = {}) {
     executor = buildExecutor(opts)
     jobQueue = new JobQueue()
     server = Fastify({ logger: false })
@@ -290,6 +296,26 @@ describe('AHR snapshot routes (story 11.12)', () => {
       const res = await server.inject({ ...req, headers: req.payload ? JSON_HEADERS : IDENTITY })
       assert.equal(res.statusCode, 409, `${req.method} ${req.url}`)
       assert.ok(res.json().error.message.includes('flat layout'), req.url)
+    }
+    assert.equal(mutatingCalls().length, 0)
+  })
+
+  it('refuses every mutation on an OFFLINE pool — nothing is mounted to snapshot', async () => {
+    // The gate predates `offline` (issue #18): an unassembled pool read
+    // `degraded` and walked straight through it, leaving btrfs to fail with an
+    // errno that names a path instead of the condition.
+    await build({ lvAttr: '-wi-----p-' })
+    for (const req of [
+      { method: 'POST' as const, url: '/v1/ahr/tank/snapshots', payload: '{}' },
+      { method: 'DELETE' as const, url: '/v1/ahr/tank/snapshots/nightly' },
+      { method: 'POST' as const, url: '/v1/ahr/tank/snapshots/nightly/rollback', payload: '{}' },
+    ]) {
+      const res = await server.inject({ ...req, headers: req.payload ? JSON_HEADERS : IDENTITY })
+      assert.equal(res.statusCode, 409, `${req.method} ${req.url}`)
+      const { message } = res.json().error
+      assert.ok(message.includes('is offline'), message)
+      // Says WHY, and where to look — never a bare state word.
+      assert.ok(message.includes('the volume is not assembled'), message)
     }
     assert.equal(mutatingCalls().length, 0)
   })

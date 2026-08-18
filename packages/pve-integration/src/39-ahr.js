@@ -98,12 +98,20 @@
 
     // Array-level state pill (clean/degraded/resyncing/...). Initial resync is
     // presented as "building" per the design note, distinct from degraded.
+    //
+    // 'inactive' is the band-level end of the pool's OFFLINE discipline: a band
+    // that CANNOT START serves nothing, so it wears the red pill and says so in
+    // the operator's words — "cannot start", the same phrase the daemon's
+    // advisory and the dashboard card use. Only the bands that actually failed
+    // to assemble go red; a sibling band that is genuinely up-and-degraded keeps
+    // its amber, because WHICH band died is the fact recovery turns on.
     var ARRAY_STATES = {
         clean: { token: 'ONLINE', label: 'clean' },
         degraded: { token: 'DEGRADED', label: 'degraded' },
         resyncing: { token: '', label: 'building' },
         reshaping: { token: '', label: 'reshaping' },
         recovering: { token: 'DEGRADED', label: 'rebuilding' },
+        inactive: { token: 'OFFLINE', label: 'CANNOT START' },
         failed: { token: 'FAULTED', label: 'failed' },
     };
 
