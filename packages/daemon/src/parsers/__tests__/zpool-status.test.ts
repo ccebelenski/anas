@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { parseZpoolStatus } from '../zpool-status.js'
+import { lastScrubFromScan, parseLastScrubs, parseZpoolStatus } from '../zpool-status.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/zfs')
@@ -253,5 +253,101 @@ describe('parseZpoolStatus', () => {
     const disk = pool.vdevGroups[0].vdevs[0].disks[0]
     assert.equal(disk.id, 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1')
     assert.notEqual(disk.id, 'sdb')
+  })
+})
+
+// The verdict half of the same scan record: what the Scrubs screen reports as
+// "last scrub". Every completed form ZFS can print, from the real captures where
+// they exist and from the canonical fixture where producing one would mean
+// damaging a pool (repairs / errors / cancel — see its `_comment`).
+describe('lastScrubFromScan — the completed-pass verdict', () => {
+  it('a finished clean scrub: repaired 0, 0 errors, real duration + end date', () => {
+    const [pool] = parseZpoolStatus(loadFixture('zpool-status-online.json'))
+    const last = lastScrubFromScan(pool.scan)
+    assert.ok(last)
+    assert.equal(last.function, 'SCRUB')
+    assert.equal(last.state, 'FINISHED')
+    assert.equal(last.repairedBytes, 0)
+    assert.equal(last.errors, 0)
+    assert.equal(last.finishedAt, '2026-03-15T02:09:34.000Z')
+    // 02:00:00 → 02:09:34 = 9m34s, the "in 00:09:34" ZFS prints.
+    assert.equal(last.durationSeconds, 574)
+  })
+
+  it('a finished scrub that repaired bytes and found errors reports both', () => {
+    const byPool = parseLastScrubs(loadFixture('zpool-status-scrub-verdicts.json'))
+    const last = byPool.get('repairpool')
+    assert.ok(last)
+    assert.equal(last.state, 'FINISHED')
+    assert.equal(last.repairedBytes, 1572864) // ZFS `processed` "1.50M"
+    assert.equal(last.errors, 2)
+    assert.equal(last.durationSeconds, 19391) // 02:00:00 → 07:23:11
+  })
+
+  it('a canceled scrub is reported as canceled (a partial pass, not a clean bill)', () => {
+    const byPool = parseLastScrubs(loadFixture('zpool-status-scrub-verdicts.json'))
+    const last = byPool.get('cancelpool')
+    assert.ok(last)
+    assert.equal(last.state, 'CANCELED')
+    assert.equal(last.errors, 0)
+    assert.equal(last.finishedAt, '2026-08-03T02:41:07.000Z')
+    assert.equal(last.durationSeconds, 2467)
+  })
+
+  it('a finished resilver is reported as a resilver, not a scrub', () => {
+    const [pool] = parseZpoolStatus(loadFixture('zpool-status-resilvering.json'))
+    const last = lastScrubFromScan(pool.scan)
+    assert.ok(last)
+    assert.equal(last.function, 'RESILVER')
+    assert.equal(last.state, 'FINISHED')
+    assert.equal(last.repairedBytes, 18432) // "18K"
+  })
+
+  it('a scrub still in progress has no verdict yet → null', () => {
+    const [pool] = parseZpoolStatus(loadFixture('zpool-status-scrubbing.json'))
+    assert.equal(pool.scan?.state, 'SCANNING')
+    assert.equal(lastScrubFromScan(pool.scan), null)
+  })
+
+  it('a pool with no scan record ("none requested") → null, never fabricated', () => {
+    const [pool] = parseZpoolStatus(loadFixture('zpool-status-online-fresh.json'))
+    assert.equal(pool.scan, null)
+    assert.equal(lastScrubFromScan(pool.scan), null)
+  })
+
+  it('a NONE scan state → null', () => {
+    assert.equal(lastScrubFromScan({
+      function: 'SCRUB',
+      state: 'NONE',
+      startedAt: '2026-08-03T02:00:00.000Z',
+      finishedAt: '2026-08-03T02:00:00.000Z',
+      totalBytes: 0,
+      examinedBytes: 0,
+      processedBytes: 0,
+      errors: 0,
+      percentComplete: 0,
+    }), null)
+  })
+
+  it('an unrecorded start time yields duration 0, not a 56-year scrub', () => {
+    const last = lastScrubFromScan({
+      function: 'SCRUB',
+      state: 'FINISHED',
+      // What parseScanStats substitutes when ZFS recorded no start time.
+      startedAt: new Date(0).toISOString(),
+      finishedAt: '2026-08-03T02:41:07.000Z',
+      totalBytes: 0,
+      examinedBytes: 0,
+      processedBytes: 0,
+      errors: 0,
+      percentComplete: 0,
+    })
+    assert.ok(last)
+    assert.equal(last.durationSeconds, 0)
+  })
+
+  it('parseLastScrubs keys every pool in one status read', () => {
+    const byPool = parseLastScrubs(loadFixture('zpool-status-scrub-verdicts.json'))
+    assert.deepEqual([...byPool.keys()], ['repairpool', 'cancelpool'])
   })
 })

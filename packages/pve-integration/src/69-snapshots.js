@@ -142,22 +142,10 @@
         }
     }
 
+    // Shared with the Scrubs view (ANAS.sched.absTime) so both screens print a
+    // timestamp identically — one copy, no drift.
     function absTime(iso) {
-        if (!iso) {
-            return '';
-        }
-        try {
-            var d = new Date(iso);
-            if (isNaN(d.getTime())) {
-                return '' + iso;
-            }
-            if (typeof Ext !== 'undefined' && Ext.Date && typeof Ext.Date.format === 'function') {
-                return Ext.Date.format(d, 'Y-m-d H:i');
-            }
-            return d.toLocaleString();
-        } catch (e) {
-            return '' + iso;
-        }
+        return sched.absTime ? sched.absTime(iso) : ('' + (iso || ''));
     }
 
     function gfxReady() {

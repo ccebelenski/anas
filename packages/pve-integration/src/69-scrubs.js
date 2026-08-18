@@ -12,9 +12,18 @@
  * governs md checks for EVERY AHR pool on the host. Surfaced per-row (the Scope
  * column's note) and confirmed on toggle.
  *
+ * SECOND VISIBLE DIVERGENCE — the "Last scrub" column. ZFS records the verdict of
+ * the last completed pass and we say it in words ("repaired 0 B, 0 errors — <date>
+ * (took 5h 23m)"). md records NOTHING of the kind: no completion time, no result.
+ * An AHR row therefore says so out loud instead of showing an empty cell — ANAS
+ * does not mine journald and does not keep a state file to manufacture a record
+ * it was never given (stateless — the system is the source of truth).
+ *
  * Data (paths relative to /v1 — see routes/scrub.ts):
  *   GET  /scrub                → { data: [ { target:{kind,pool}, enabled,
- *                                   cadence:'monthly', mechanism, note? } ] }
+ *                                   cadence:'monthly', mechanism, note?,
+ *                                   lastScrub: {function,state,finishedAt,
+ *                                     durationSeconds,repairedBytes,errors}|null } ] }
  *   PUT  /scrub/zfs/:pool  {enabled}  → flip the ZFS periodic-scrub property
  *   PUT  /scrub/ahr/:pool  {enabled}  → flip the node's mdcheck timers (node-global)
  *
@@ -61,6 +70,36 @@
         return sched.muted(html);
     }
 
+    // Absolute local timestamp — shared with the Snapshots view (one copy).
+    function absTime(iso) {
+        return sched.absTime ? sched.absTime(iso) : ('' + (iso || ''));
+    }
+
+    // A pass's wall-clock length, the "in 05:23:11" ZFS prints, said plainly:
+    // "45s" / "12m" / "5h 23m" / "2d 3h". Empty for an unknown (0) duration so
+    // the caller can drop the "(took …)" clause entirely rather than claim 0.
+    function fmtDuration(seconds) {
+        var s = Number(seconds);
+        if (!isFinite(s) || s <= 0) {
+            return '';
+        }
+        if (s < 60) {
+            return Math.round(s) + 's';
+        }
+        var mins = Math.floor(s / 60);
+        if (mins < 60) {
+            return mins + 'm';
+        }
+        var hours = Math.floor(mins / 60);
+        var restMins = mins % 60;
+        if (hours < 24) {
+            return hours + 'h' + (restMins ? ' ' + restMins + 'm' : '');
+        }
+        var days = Math.floor(hours / 24);
+        var restHours = hours % 24;
+        return days + 'd' + (restHours ? ' ' + restHours + 'h' : '');
+    }
+
     // ---- Row shape + renderers ---------------------------------------------
 
     function scrubRow(state) {
@@ -73,6 +112,9 @@
             cadence: state.cadence || 'monthly',
             mechanism: state.mechanism || '',
             note: state.note || '',
+            // The last completed verify pass, or null when the filesystem keeps
+            // no record of one (always so for AHR — see the header).
+            lastScrub: state.lastScrub || null,
             // A stable per-row key (kind+pool) so selection survives a poll.
             rowKey: (target.kind || 'zfs') + ':' + (target.pool || '')
         };
@@ -90,6 +132,56 @@
             return pillHtml(t('On'), 'var(--anas-ok,#1f9c56)', t('periodic scrub is enabled'));
         }
         return softPill(t('Off'), 'var(--anas-muted,gray)', t('periodic scrub is disabled'));
+    }
+
+    // Last scrub: the VERDICT of the pool's last completed verify pass, in words
+    // — "repaired 0 B, 0 errors — 2026-08-03 07:23 (took 5h 23m)". Anything
+    // repaired or any error found is coloured warn: those are the rows an
+    // operator should look at, and burying them in body text would hide them.
+    //
+    // Three honest absences, each said rather than left blank:
+    //   AHR      — md keeps no completion record at all (nothing to report, ever).
+    //   ZFS      — no pass on record yet (never scrubbed).
+    //   canceled — a pass stopped early verified only PART of the pool, so its
+    //              "0 errors" is not a clean bill of health and is never shown as one.
+    function renderLastScrub(v, meta, rec) {
+        var last = rec.get('lastScrub');
+        if (!last) {
+            if (rec.get('kind') === 'ahr') {
+                return '<span title="' + enc(t('md records no completion time or result for a check; '
+                    + 'ANAS reports only what the system records')) + '">'
+                    + muted('&mdash; ' + enc(t('(md keeps no completion record)'))) + '</span>';
+            }
+            return '<span title="' + enc(t('ZFS reports no completed scrub or resilver for this pool')) + '">'
+                + muted(enc(t('never scrubbed'))) + '</span>';
+        }
+
+        var when = absTime(last.finishedAt);
+        if (last.state === 'CANCELED') {
+            return '<span title="' + enc(t('the pass was stopped before it finished, so only part of the pool was verified'))
+                + '" style="color:var(--anas-warn,#b06a12);">'
+                + enc(t('canceled') + ' — ' + when) + '</span>';
+        }
+
+        // ZFS keeps ONE scan record per pool — a resilver overwrites the scrub's.
+        // Name the pass that actually ran instead of calling a resilver a scrub.
+        var resilver = last.function === 'RESILVER';
+        var errors = Number(last.errors) || 0;
+        var repaired = Number(last.repairedBytes) || 0;
+        var verdict = (resilver ? t('resilvered') : t('repaired'))
+            + ' ' + ANAS.formatBytes(repaired)
+            + ', ' + errors + ' ' + (errors === 1 ? t('error') : t('errors'));
+        var head = (repaired > 0 || errors > 0)
+            ? '<span style="color:var(--anas-warn,#b06a12);">' + enc(verdict) + '</span>'
+            : enc(verdict);
+
+        var duration = fmtDuration(last.durationSeconds);
+        var tail = '— ' + when + (duration ? ' (' + t('took') + ' ' + duration + ')' : '');
+        var title = resilver
+            ? t('the pool\'s last completed pass was a RESILVER, not a scrub — ZFS keeps one scan record per pool')
+            : t('the pool\'s last completed scrub');
+        return '<span title="' + enc(title) + '">' + head
+            + ' <span style="color:var(--anas-muted,gray);">' + enc(tail) + '</span></span>';
     }
 
     function renderScrubScope(v, meta, rec) {
@@ -231,7 +323,8 @@
     function scrubsView(node) {
         var store = Ext.create('Ext.data.Store', {
             fields: ['pool', 'kind', 'cadence', 'mechanism', 'note', 'rowKey',
-                { name: 'enabled', type: 'auto' }],
+                { name: 'enabled', type: 'auto' },
+                { name: 'lastScrub', type: 'auto' }],
             data: [],
             sorters: [{ property: 'kind', direction: 'ASC' }, { property: 'pool', direction: 'ASC' }]
         });
@@ -269,6 +362,8 @@
                             renderer: renderScrubEnabled },
                         { text: t('Cadence'), dataIndex: 'cadence', width: 110,
                             renderer: function (v) { return enc(v || 'monthly'); } },
+                        { text: t('Last scrub'), dataIndex: 'lastScrub', flex: 1, minWidth: 280,
+                            sortable: false, menuDisabled: true, renderer: renderLastScrub },
                         { text: t('Scope'), dataIndex: 'note', flex: 1, minWidth: 220,
                             sortable: false, menuDisabled: true, renderer: renderScrubScope }
                     ],

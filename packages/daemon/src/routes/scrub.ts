@@ -1,9 +1,10 @@
-import type { PeriodicScrubState } from '@anas/shared'
+import type { LastScrub, PeriodicScrubState } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import { PoolName, ScrubToggleRequest } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
+import { parseLastScrubs } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import {
   readAhrScrubState,
@@ -24,6 +25,11 @@ const ZPOOL = '/usr/sbin/zpool'
  *   GET /v1/scrub                → uniform state for every ZFS + AHR pool
  *   PUT /v1/scrub/zfs/:pool  {enabled}  → flip the ZFS property (202 job)
  *   PUT /v1/scrub/ahr/:pool  {enabled}  → flip the node's mdcheck timers (202 job)
+ *
+ * Each state also carries `lastScrub` — the pool's last COMPLETED verify pass
+ * (17.3's "`zpool status` scrub dates"). ZFS records one; md records NONE, so an
+ * AHR state's `lastScrub` is always null and the screen says so in words rather
+ * than inventing a record from journald or a state file.
  *
  * Toggles are jobs (Principle 4). ANAS deliberately does NOT touch the (disabled)
  * systemd `zfs-scrub-*@.timer` for ZFS, so the property remains the single lever
@@ -59,11 +65,27 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     }
   }
 
+  /**
+   * Each ZFS pool's last COMPLETED verify pass, from the one `zpool status`
+   * ZFS already reports it in (no new source, one read for every pool).
+   * Fail-open to an empty map — an unreadable status means "no record", which
+   * is exactly how a pool that has never scrubbed reads.
+   */
+  async function zfsLastScrubs(): Promise<Map<string, LastScrub | null>> {
+    try {
+      const r = await executor.exec(ZPOOL, ['status', '-jv'])
+      return r.exitCode === 0 && r.stdout.trim() ? parseLastScrubs(r.stdout) : new Map()
+    }
+    catch {
+      return new Map()
+    }
+  }
+
   // --- GET /scrub — uniform periodic-scrub state across ZFS + AHR pools ------
   server.get('/scrub', async () => {
-    const [zfsPools, ahrPools] = await Promise.all([zfsPoolNames(), ahrPoolNames()])
+    const [zfsPools, ahrPools, lastScrubs] = await Promise.all([zfsPoolNames(), ahrPoolNames(), zfsLastScrubs()])
     const states: PeriodicScrubState[] = [
-      ...await Promise.all(zfsPools.map(p => readZfsScrubState(executor, p))),
+      ...await Promise.all(zfsPools.map(p => readZfsScrubState(executor, p, lastScrubs.get(p) ?? null))),
       ...await Promise.all(ahrPools.map(p => readAhrScrubState(executor, p))),
     ]
     return { data: states }

@@ -1,0 +1,156 @@
+{
+    "_comment": [
+        "CANONICAL FORMS — NOT a node capture (unlike every other zpool-status fixture here).",
+        "The real stunt/fleet captures cover the common scan records already:",
+        "  zpool-status-online.json      SCRUB / FINISHED, processed 0B, 0 errors  ('scrub repaired 0B in ... with 0 errors on ...')",
+        "  zpool-status-resilvering.json RESILVER / FINISHED                       ('resilvered 18K in ... with 0 errors on ...')",
+        "  zpool-status-scrubbing.json   SCRUB / SCANNING, end_time '-'            ('scrub in progress since ...')",
+        "  zpool-status-online-fresh.json  no scan_stats at all                    ('scan: none requested')",
+        "What no capture contains is a scrub that actually REPAIRED something, a scrub that",
+        "found errors, and a CANCELED scrub ('zpool scrub -s') — producing those on demand",
+        "means damaging a real pool. The two pools below are those forms, written in the",
+        "field shape the captures above prove OpenZFS emits (same keys, same value syntax:",
+        "human sizes, ctime dates, string counts). Provenance is documented so nobody mistakes",
+        "them for observed output; if a live one is ever captured, replace these with it.",
+        "'processed' is the field ZFS's own 'repaired %s' text prints, and the duration ZFS",
+        "prints as 'in %s' is end_time - start_time."
+    ],
+    "output_version": {
+        "command": "zpool status",
+        "vers_major": 0,
+        "vers_minor": 1
+    },
+    "pools": {
+        "repairpool": {
+            "name": "repairpool",
+            "state": "ONLINE",
+            "pool_guid": "1111111111111111111",
+            "txg": "12345",
+            "spa_version": "5000",
+            "zpl_version": "5",
+            "scan_stats": {
+                "function": "SCRUB",
+                "state": "FINISHED",
+                "start_time": "Sun Aug  3 02:00:00 UTC 2026",
+                "end_time": "Sun Aug  3 07:23:11 UTC 2026",
+                "to_examine": "8.20T",
+                "examined": "8.20T",
+                "skipped": "0B",
+                "processed": "1.50M",
+                "errors": "2",
+                "bytes_per_scan": "0B",
+                "pass_start": "1785729600",
+                "scrub_pause": "-",
+                "scrub_spent_paused": "0",
+                "issued_bytes_per_scan": "8.20T",
+                "issued": "8.20T"
+            },
+            "vdevs": {
+                "repairpool": {
+                    "name": "repairpool",
+                    "vdev_type": "root",
+                    "guid": "1111111111111111111",
+                    "state": "ONLINE",
+                    "alloc_space": "8.20T",
+                    "total_space": "10.9T",
+                    "read_errors": "0",
+                    "write_errors": "0",
+                    "checksum_errors": "0",
+                    "vdevs": {
+                        "mirror-0": {
+                            "name": "mirror-0",
+                            "vdev_type": "mirror",
+                            "guid": "2222222222222222222",
+                            "state": "ONLINE",
+                            "alloc_space": "8.20T",
+                            "total_space": "10.9T",
+                            "read_errors": "0",
+                            "write_errors": "0",
+                            "checksum_errors": "2",
+                            "vdevs": {
+                                "scsi-0QEMU_QEMU_HARDDISK_ANAS_C1": {
+                                    "name": "scsi-0QEMU_QEMU_HARDDISK_ANAS_C1",
+                                    "vdev_type": "disk",
+                                    "guid": "3333333333333333333",
+                                    "path": "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_C1-part1",
+                                    "devid": "scsi-0QEMU_QEMU_HARDDISK_ANAS_C1-part1",
+                                    "state": "ONLINE",
+                                    "read_errors": "0",
+                                    "write_errors": "0",
+                                    "checksum_errors": "2",
+                                    "slow_ios": "0"
+                                },
+                                "scsi-0QEMU_QEMU_HARDDISK_ANAS_C2": {
+                                    "name": "scsi-0QEMU_QEMU_HARDDISK_ANAS_C2",
+                                    "vdev_type": "disk",
+                                    "guid": "4444444444444444444",
+                                    "path": "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_C2-part1",
+                                    "devid": "scsi-0QEMU_QEMU_HARDDISK_ANAS_C2-part1",
+                                    "state": "ONLINE",
+                                    "read_errors": "0",
+                                    "write_errors": "0",
+                                    "checksum_errors": "0",
+                                    "slow_ios": "0"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "error_count": "2"
+        },
+        "cancelpool": {
+            "name": "cancelpool",
+            "state": "ONLINE",
+            "pool_guid": "5555555555555555555",
+            "txg": "6789",
+            "spa_version": "5000",
+            "zpl_version": "5",
+            "scan_stats": {
+                "function": "SCRUB",
+                "state": "CANCELED",
+                "start_time": "Sun Aug  3 02:00:00 UTC 2026",
+                "end_time": "Sun Aug  3 02:41:07 UTC 2026",
+                "to_examine": "3.00T",
+                "examined": "412G",
+                "skipped": "0B",
+                "processed": "0B",
+                "errors": "0",
+                "bytes_per_scan": "0B",
+                "pass_start": "1785729600",
+                "scrub_pause": "-",
+                "scrub_spent_paused": "0",
+                "issued_bytes_per_scan": "412G",
+                "issued": "412G"
+            },
+            "vdevs": {
+                "cancelpool": {
+                    "name": "cancelpool",
+                    "vdev_type": "root",
+                    "guid": "5555555555555555555",
+                    "state": "ONLINE",
+                    "alloc_space": "412G",
+                    "total_space": "3.00T",
+                    "read_errors": "0",
+                    "write_errors": "0",
+                    "checksum_errors": "0",
+                    "vdevs": {
+                        "scsi-0QEMU_QEMU_HARDDISK_ANAS_C3": {
+                            "name": "scsi-0QEMU_QEMU_HARDDISK_ANAS_C3",
+                            "vdev_type": "disk",
+                            "guid": "6666666666666666666",
+                            "path": "/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_C3-part1",
+                            "devid": "scsi-0QEMU_QEMU_HARDDISK_ANAS_C3-part1",
+                            "state": "ONLINE",
+                            "read_errors": "0",
+                            "write_errors": "0",
+                            "checksum_errors": "0",
+                            "slow_ios": "0"
+                        }
+                    }
+                }
+            },
+            "error_count": "0"
+        }
+    }
+}

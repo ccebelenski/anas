@@ -3,7 +3,7 @@
  * Extracts: pool state, vdev topology, scan status, health messages.
  */
 
-import type { PoolDisk, PoolHealthMessage, PoolState, ScanStatus, Vdev, VdevGroup, VdevRole, VdevState, VdevType } from '@anas/shared'
+import type { LastScrub, PoolDisk, PoolHealthMessage, PoolState, ScanStatus, Vdev, VdevGroup, VdevRole, VdevState, VdevType } from '@anas/shared'
 import { parseHumanSize, parseIntOrZero, parseZfsDate, parseZfsJson } from './utils.js'
 
 /** Raw ZFS JSON types (what `zpool status -j` actually returns) */
@@ -395,4 +395,58 @@ function parseScanStats(raw: ZfsScanStatsRaw): ScanStatus {
     errors: parseIntOrZero(raw.errors),
     percentComplete,
   }
+}
+
+/**
+ * The last COMPLETED verify pass on a pool, derived from the SAME `scan_stats`
+ * the in-progress {@link ScanStatus} already comes from — no extra command, no
+ * second source. `zpool status` keeps exactly one scan record per pool: while a
+ * pass runs it reads as progress ("scrub in progress since …"); once the pass
+ * ends the very same record is the verdict ZFS prints as
+ * `scrub repaired 0B in 05:23:11 with 0 errors on Sun Aug  3 …`. This reads the
+ * verdict form; `parseScanStats` above reads the record, this interprets it.
+ *
+ * Returns null — an honest "no record", never a fabricated one — when:
+ *   - the pool has no scan record at all (`scan: null`, printed as "none
+ *     requested": a pool that has never been scrubbed or resilvered),
+ *   - a pass is still `SCANNING` (its verdict is not written yet, and the
+ *     previous pass's record is already overwritten — ZFS keeps only one),
+ *   - the record is `NONE`, or ZFS recorded no usable end time.
+ *
+ * `repairedBytes` is ZFS's `processed` — the field its own "repaired %s" text
+ * prints. Duration is end − start (the "in %s" figure), clamped at 0. A
+ * `CANCELED` pass is reported as such: it verified only part of the pool, so the
+ * caller must not present its error count as a clean bill of health.
+ */
+export function lastScrubFromScan(scan: ScanStatus | null): LastScrub | null {
+  if (!scan || (scan.state !== 'FINISHED' && scan.state !== 'CANCELED'))
+    return null
+  if (!scan.finishedAt)
+    return null
+
+  // `parseScanStats` substitutes the epoch for a start time ZFS didn't record;
+  // treat that (and any unparseable pair) as "duration unknown" = 0 rather than
+  // reporting a 56-year scrub.
+  const started = Date.parse(scan.startedAt)
+  const finished = Date.parse(scan.finishedAt)
+  const durationSeconds = Number.isNaN(started) || Number.isNaN(finished) || started <= 0
+    ? 0
+    : Math.max(0, Math.round((finished - started) / 1000))
+
+  return {
+    function: scan.function,
+    state: scan.state,
+    finishedAt: scan.finishedAt,
+    durationSeconds,
+    repairedBytes: scan.processedBytes,
+    errors: scan.errors,
+  }
+}
+
+/**
+ * Pool name → its last completed verify pass (null when the pool records none),
+ * for every pool in one `zpool status -jv` read.
+ */
+export function parseLastScrubs(json: string | ZpoolStatusOutput): Map<string, LastScrub | null> {
+  return new Map(parseZpoolStatus(json).map(pool => [pool.name, lastScrubFromScan(pool.scan)]))
 }

@@ -1,4 +1,4 @@
-import type { PeriodicScrubState } from '@anas/shared'
+import type { LastScrub, PeriodicScrubState } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 
 /**
@@ -60,10 +60,15 @@ export function zfsScrubSetArgs(pool: string, enabled: boolean): string[] {
 /**
  * Read a ZFS pool's periodic-scrub state (fail-open to enabled = the distro
  * default, so an unreadable property never falsely claims scrubbing is off).
+ *
+ * `lastScrub` is the pool's last COMPLETED pass, read by the caller from the
+ * `zpool status` it already runs (see `parseLastScrubs`) and passed in so one
+ * status read serves every pool. Null = no completed pass on record.
  */
 export async function readZfsScrubState(
   executor: CommandExecutor,
   pool: string,
+  lastScrub: LastScrub | null = null,
 ): Promise<PeriodicScrubState> {
   let enabled = true
   try {
@@ -74,7 +79,7 @@ export async function readZfsScrubState(
   catch {
     // fail-open to the distro default (on)
   }
-  return { target: { kind: 'zfs', pool }, enabled, cadence: 'monthly', mechanism: 'zfs-property' }
+  return { target: { kind: 'zfs', pool }, enabled, cadence: 'monthly', mechanism: 'zfs-property', lastScrub }
 }
 
 /** Flip a ZFS pool's periodic-scrub property (surgical `zfs set`). Throws on failure. */
@@ -100,6 +105,12 @@ export function parseMdcheckEnabled(isEnabledStdout: string): boolean {
  * Read the node's mdcheck (AHR periodic scrub) state for a given AHR pool. The
  * state is node-global (see MDCHECK_NOTE); each AHR pool reflects it. Fail-open
  * to disabled — an unreadable/absent mdcheck timer means no periodic md check.
+ *
+ * `lastScrub` is ALWAYS null here, and that is the honest answer, not a gap: md
+ * keeps no completion record of a check — no last-run timestamp, no verdict. We
+ * neither mine journald for one nor keep a state file to manufacture one
+ * (stateless — the system is the source of truth). The Scrubs screen says so in
+ * words rather than leaving the cell blank.
  */
 export async function readAhrScrubState(
   executor: CommandExecutor,
@@ -114,7 +125,7 @@ export async function readAhrScrubState(
   catch {
     // fail-open to off
   }
-  return { target: { kind: 'ahr', pool }, enabled, cadence: 'monthly', mechanism: 'mdcheck-timer', note: MDCHECK_NOTE }
+  return { target: { kind: 'ahr', pool }, enabled, cadence: 'monthly', mechanism: 'mdcheck-timer', note: MDCHECK_NOTE, lastScrub: null }
 }
 
 /**

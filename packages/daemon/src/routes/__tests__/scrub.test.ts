@@ -23,6 +23,37 @@ function zpoolListJson(names: string[]): string {
   return JSON.stringify({ pools })
 }
 
+/**
+ * `zpool status -jv` with a completed scrub on `tank` and none on `rpool` — the
+ * two last-scrub shapes the Scrubs screen has to render (a verdict, and an
+ * honest "no record"). Trimmed to the fields the last-scrub read uses.
+ */
+function zpoolStatusJson(): string {
+  return JSON.stringify({
+    pools: {
+      tank: {
+        name: 'tank',
+        state: 'ONLINE',
+        pool_guid: '1',
+        scan_stats: {
+          function: 'SCRUB',
+          state: 'FINISHED',
+          start_time: 'Sun Aug  3 02:00:00 UTC 2026',
+          end_time: 'Sun Aug  3 07:23:11 UTC 2026',
+          to_examine: '8.20T',
+          examined: '8.20T',
+          processed: '0B',
+          errors: '0',
+        },
+        vdevs: {},
+        error_count: '0',
+      },
+      // Never scrubbed — no scan record at all.
+      rpool: { name: 'rpool', state: 'ONLINE', pool_guid: '2', vdevs: {}, error_count: '0' },
+    },
+  })
+}
+
 function mockOf(server: ReturnType<typeof createServer>): MockExecutor {
   return (server as unknown as { executor: MockExecutor }).executor
 }
@@ -65,6 +96,36 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
     assert.equal(byPool.get('tank')?.enabled, true)
     assert.equal(byPool.get('rpool')?.enabled, false)
     assert.ok(states.every(s => s.mechanism === 'zfs-property' && s.cadence === 'monthly'))
+  })
+
+  it('GET /scrub carries each ZFS pool\'s last completed scrub verdict', async () => {
+    mockOf(server).addFixture({
+      command: ZPOOL,
+      args: ['status', '-jv'],
+      result: { stdout: zpoolStatusJson(), stderr: '', exitCode: 0 },
+    })
+    const res = await server.inject({ method: 'GET', url: '/v1/scrub' })
+    const byPool = new Map((res.json() as { data: PeriodicScrubState[] }).data.map(s => [s.target.pool, s]))
+    const tank = byPool.get('tank')?.lastScrub
+    assert.ok(tank, 'expected tank to carry a last-scrub verdict')
+    assert.equal(tank.function, 'SCRUB')
+    assert.equal(tank.state, 'FINISHED')
+    assert.equal(tank.repairedBytes, 0)
+    assert.equal(tank.errors, 0)
+    assert.equal(tank.finishedAt, '2026-08-03T07:23:11.000Z')
+    assert.equal(tank.durationSeconds, 19391)
+    // A pool ZFS records no completed pass for reads as null — never fabricated.
+    assert.equal(byPool.get('rpool')?.lastScrub, null)
+  })
+
+  it('GET /scrub still answers when the status read fails (last scrub = no record)', async () => {
+    // `zpool status -jv` is unmocked here → exit 127. The uniform state must
+    // still come back, with the verdict honestly absent.
+    const res = await server.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 200)
+    const states = (res.json() as { data: PeriodicScrubState[] }).data
+    assert.equal(states.length, 2)
+    assert.ok(states.every(s => s.lastScrub === null))
   })
 
   it('PUT /scrub/zfs/:pool flips the property (202 job)', async () => {
@@ -114,6 +175,9 @@ describe('periodic scrub routes — AHR mdcheck timers (Epic 17.5)', () => {
     assert.ok(ahr, 'expected an AHR scrub state')
     assert.equal(ahr!.mechanism, 'mdcheck-timer')
     assert.match(ahr!.note ?? '', /node-global/)
+    // md keeps no completion record — always null, never mined from journald
+    // and never a state file we wrote (the sanctioned divergence).
+    assert.equal(ahr!.lastScrub, null)
   })
 
   it('PUT /scrub/ahr/ahr0 toggles the node mdcheck timers (202 job)', async () => {

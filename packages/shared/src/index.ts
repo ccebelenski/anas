@@ -246,6 +246,7 @@ export {
 
 // Schedule schemas (Epic 17 — uniform ANAS-owned snapshot schedules)
 export {
+  LastScrub,
   PeriodicScrubState,
   RetentionBucket,
   RetentionPlan,

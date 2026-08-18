@@ -28,7 +28,7 @@ describe('scrub schedules — ZFS org.debian:periodic-scrub property (GT-2)', ()
   it('readZfsScrubState reflects the property and fails open to enabled', async () => {
     const on = new MockExecutor()
     on.addFixture({ command: ZFS, args: zfsScrubGetArgs('tank'), result: { stdout: '-\n', stderr: '', exitCode: 0 } })
-    assert.deepEqual(await readZfsScrubState(on, 'tank'), { target: { kind: 'zfs', pool: 'tank' }, enabled: true, cadence: 'monthly', mechanism: 'zfs-property' })
+    assert.deepEqual(await readZfsScrubState(on, 'tank'), { target: { kind: 'zfs', pool: 'tank' }, enabled: true, cadence: 'monthly', mechanism: 'zfs-property', lastScrub: null })
 
     const off = new MockExecutor()
     off.addFixture({ command: ZFS, args: zfsScrubGetArgs('tank'), result: { stdout: 'disable\n', stderr: '', exitCode: 0 } })
@@ -38,6 +38,18 @@ describe('scrub schedules — ZFS org.debian:periodic-scrub property (GT-2)', ()
     const err = new MockExecutor()
     err.addFixture({ command: ZFS, args: zfsScrubGetArgs('tank'), result: { stdout: '', stderr: 'no such pool', exitCode: 1 } })
     assert.equal((await readZfsScrubState(err, 'tank')).enabled, true)
+
+    // The caller's last-scrub verdict (read once from `zpool status` for every
+    // pool) rides the state; absent, the pool honestly records none.
+    const verdict = {
+      function: 'SCRUB',
+      state: 'FINISHED',
+      finishedAt: '2026-08-03T07:23:11.000Z',
+      durationSeconds: 19391,
+      repairedBytes: 0,
+      errors: 0,
+    } as const
+    assert.deepEqual((await readZfsScrubState(on, 'tank', verdict)).lastScrub, verdict)
   })
 
   it('setZfsScrubEnabled writes enable/disable surgically', async () => {

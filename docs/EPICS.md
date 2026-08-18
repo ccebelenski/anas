@@ -747,6 +747,39 @@ and schedules* the client invocation and surfaces status.
 >   1206 (+1), gateway 34; typecheck + lint clean; every changed pve-integration
 >   file `node --check`-clean.
 
+> **Stage 5 landed 2026-08-17 (operator-approved feature — last scrub + verdict).**
+> The Scrubs screen said whether a pool *would* be scrubbed but never whether one
+> *had* been. It now carries a **Last scrub** column, completing 17.3's
+> "authoritative state from … `zpool status` scrub dates":
+> - **ZFS — nearly free, no new source.** `zpool status -jv`'s `scan_stats` is the
+>   same record `parseScanStats` already reads for in-progress state; once a pass
+>   ends, that record IS the verdict ZFS prints as `scrub repaired 0B in 05:23:11
+>   with 0 errors on …`. New `lastScrubFromScan` / `parseLastScrubs`
+>   (`parsers/zpool-status.ts`) interpret the finished form — pass type, outcome,
+>   end date, duration (end − start), repaired bytes (ZFS's `processed`), errors —
+>   into shared `LastScrub`, carried on every `PeriodicScrubState` from
+>   `GET /v1/scrub` (one status read serves every pool). The screen says it in
+>   words: "repaired 0 B, 0 errors — 2026-08-03 07:23 (took 5h 23m)", warn-coloured
+>   when anything was repaired or any error found. A **canceled** pass reads
+>   "canceled — <date>" (it verified only PART of the pool, so its 0 errors is
+>   never shown as a clean bill of health); a **resilver** is named as a resilver
+>   (ZFS keeps one scan record per pool, not one of each).
+> - **AHR — honest absence, the SANCTIONED DIVERGENCE.** md keeps no completion
+>   record at all, so an AHR row's `lastScrub` is always null and the cell says
+>   "— (md keeps no completion record)" instead of sitting blank. Explicitly NOT
+>   built: journald archaeology, and any ANAS-written state file (stateless,
+>   Principle 11 — we report what the system records and nothing else).
+> - Tests cover every scan-record form: finished clean scrub, finished scrub that
+>   repaired bytes and found errors, canceled scrub, finished resilver, in-progress
+>   (no verdict yet), "none requested", and an unrecorded start time — plus the
+>   route carrying the verdict and still answering when the status read fails. New
+>   fixture `fixtures/zfs/zpool-status-scrub-verdicts.json` holds the two forms no
+>   node capture has (repairs/errors, cancel), flagged in its own `_comment` as
+>   **canonical forms, not node captures**. `ANAS.sched.absTime` extracted to
+>   `69-schedules-common.js` so both schedule views print timestamps from one copy.
+>   Daemon suite 1477 (+11), gateway 46; typecheck + lint clean; changed
+>   pve-integration files `node --check`-clean. **Not yet reviewed on a node.**
+
 ##### Observe
 17.3. **[done 2026-07-26, stage 3 — screen shipped]** As a user, I want the **Schedules** screen: one grid over both snapshot schedules and scrub schedules — target (dataset/pool, recursive flag), policy summary (e.g. "24h / 30d / 12m" or "monthly scrub"), enabled state, last run/result, next run, and overdue highlighted — including schedules created outside ANAS, so I have the complete picture. *(Authoritative state from the config file + systemd timer state + ZFS reality (`zfs list -t snapshot` counts, `zpool status` scrub dates); journald is run-detail forensics only, per the replication precedent.)* — **Backend:** `GET /v1/schedules` returns the uniform derived-status rows (systemd next/last/result/overdue); `GET /v1/scrub` the uniform periodic-scrub state across ZFS + AHR pools.
 

@@ -1,5 +1,6 @@
 import { z } from 'zod'
-import { DatasetPath, PoolName } from './common.js'
+import { DatasetPath, ISODateTime, PoolName } from './common.js'
+import { ScanFunction } from './zfs.js'
 
 // ============================================================================
 // Uniform snapshot schedules (Epic 17 — Schedules; docs/SCHEDULES-DESIGN.md).
@@ -265,6 +266,40 @@ export const ScrubMechanism = z.enum(['zfs-property', 'mdcheck-timer'])
 export type ScrubMechanism = z.infer<typeof ScrubMechanism>
 
 /**
+ * The LAST COMPLETED verify pass on a pool, as the filesystem itself recorded
+ * it — the verdict half of the Scrubs screen (17.3: authoritative state from
+ * "ZFS reality … `zpool status` scrub dates"). ZFS keeps exactly one scan record
+ * per pool and prints its finished form as the familiar
+ * `scrub repaired 0B in 05:23:11 with 0 errors on Sun Aug  3 …` line; ANAS
+ * surfaces those same facts structured, computed from nothing else.
+ *
+ * SANCTIONED DIVERGENCE (visible, never hidden): md keeps NO completion record
+ * of its own, so an AHR pool's `lastScrub` is ALWAYS null and the screen says so
+ * in words. ANAS does not mine journald for one and does not write a state file
+ * to manufacture one — the system is the source of truth, and when it records
+ * nothing we report nothing (Principle 11).
+ */
+export const LastScrub = z.object({
+  /** Which pass completed — ZFS keeps the most recent scrub OR resilver, not one of each. */
+  function: ScanFunction,
+  /**
+   * How it ended. `FINISHED` ran to completion; `CANCELED` was stopped early
+   * (`zpool scrub -s`) and therefore verified only part of the pool — its
+   * "0 errors" is not a clean bill of health and must not be rendered as one.
+   */
+  state: z.enum(['FINISHED', 'CANCELED']),
+  /** When the pass ended (ZFS `end_time`) — the "on <date>" of the scan line. */
+  finishedAt: ISODateTime,
+  /** Wall-clock length of the pass (end − start) — the "in 05:23:11" figure. */
+  durationSeconds: z.number().int().nonnegative(),
+  /** Bytes repaired by the pass — ZFS's `processed`, the "repaired 0B" figure. */
+  repairedBytes: z.number().nonnegative(),
+  /** Errors the pass found — the "with 0 errors" figure. */
+  errors: z.number().int().nonnegative(),
+})
+export type LastScrub = z.infer<typeof LastScrub>
+
+/**
  * A pool's periodic-scrub state, uniform across ZFS and AHR. `cadence` is
  * `monthly` for both (ZFS: PVE's 2nd-Sunday cron; AHR: mdcheck's 1st-Sunday
  * timer) — custom cadences are a later refinement (SCHEDULES-DESIGN §Scrub).
@@ -276,6 +311,11 @@ export const PeriodicScrubState = z.object({
   cadence: z.literal('monthly'),
   mechanism: ScrubMechanism,
   note: z.string().optional(),
+  /**
+   * The last completed verify pass, or null when the filesystem records none —
+   * a ZFS pool never scrubbed, and EVERY AHR pool (see {@link LastScrub}).
+   */
+  lastScrub: LastScrub.nullable(),
 })
 export type PeriodicScrubState = z.infer<typeof PeriodicScrubState>
 

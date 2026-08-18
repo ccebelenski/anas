@@ -62,6 +62,28 @@
         return '<span style="color:var(--anas-muted,gray);">' + html + '</span>';
     };
 
+    // Absolute local timestamp ("2026-08-03 07:23") for an ISO instant. Both
+    // views print times — the Snapshots last/next run and the Scrubs last-scrub
+    // verdict — and they must read identically, so the formatting lives here
+    // once. Fail-soft: an unparseable value is echoed rather than blanked.
+    sched.absTime = function (iso) {
+        if (!iso) {
+            return '';
+        }
+        try {
+            var d = new Date(iso);
+            if (isNaN(d.getTime())) {
+                return '' + iso;
+            }
+            if (typeof Ext !== 'undefined' && Ext.Date && typeof Ext.Date.format === 'function') {
+                return Ext.Date.format(d, 'Y-m-d H:i');
+            }
+            return d.toLocaleString();
+        } catch (e) {
+            return '' + iso;
+        }
+    };
+
     // ---- Visibility-gated poll loop (no leaked intervals) ------------------
     // Each view supplies its own `refresh(quiet)` closure (which grids to reload);
     // this owns the interval + the visibilitychange handler, stored on the view so
