@@ -244,6 +244,49 @@
         return html;
     }
 
+    // Grid Used / Free columns: the two numbers an operator checks free space
+    // with, first-class beside Usable exactly as the ZFS Pools grid carries
+    // Allocated/Free (issue #28 — capacity display is not a place AHR and ZFS
+    // diverge). Blank when capacity is absent, matching renderUsable.
+    function renderUsed(value, meta, record) {
+        var cap = capOf(record);
+        return cap ? enc(fmtBytes(cap.usedBytes)) : '';
+    }
+
+    function renderFree(value, meta, record) {
+        var cap = capOf(record);
+        return cap ? enc(fmtBytes(cap.freeBytes)) : '';
+    }
+
+    // Grid Capacity column: used ÷ usable through the shared gfx bar — the same
+    // call the ZFS grid makes, so the fullness thresholds are one definition
+    // (gfx fillColorVar), not a second copy. Falls back to plain percent text.
+    function renderCapacityPct(value, meta, record) {
+        var cap = capOf(record);
+        if (!cap) {
+            return '';
+        }
+        var usable = Number(cap.usableBytes);
+        var used = Number(cap.usedBytes);
+        if (!(usable > 0) || isNaN(used)) {
+            return '';
+        }
+        var frac = used / usable;
+        var label = fmtBytes(used) + ' ' + t('used of') + ' ' + fmtBytes(usable) + ' ' + t('usable');
+        try {
+            var gfx = ANAS.gfx;
+            if (gfx && typeof gfx.bar === 'function') {
+                var html = gfx.bar(frac, { title: label });
+                if (html) {
+                    return html;
+                }
+            }
+        } catch (e) {
+            // fall through to text
+        }
+        return enc(ANAS.formatPercent(frac * 100));
+    }
+
     // ---- arrays / sync helpers ---------------------------------------------
 
     function arraysOf(rec) {
@@ -2431,6 +2474,32 @@
                             sortable: false,
                             menuDisabled: true,
                             renderer: renderUsable,
+                        },
+                        // Used / Free / Capacity at the Pools grid's widths —
+                        // the same first-class space breakdown ZFS shows.
+                        {
+                            text: t('Used'),
+                            dataIndex: 'capacity',
+                            width: 110,
+                            sortable: false,
+                            menuDisabled: true,
+                            renderer: renderUsed,
+                        },
+                        {
+                            text: t('Free'),
+                            dataIndex: 'capacity',
+                            width: 110,
+                            sortable: false,
+                            menuDisabled: true,
+                            renderer: renderFree,
+                        },
+                        {
+                            text: t('Capacity'),
+                            dataIndex: 'capacity',
+                            width: 150,
+                            sortable: false,
+                            menuDisabled: true,
+                            renderer: renderCapacityPct,
                         },
                         // Shared Mount column — identical to the Pools grid's.
                         ANAS.gfx.mountColumn(),
