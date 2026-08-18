@@ -2084,21 +2084,6 @@
                             ]),
                         },
                         {
-                            xtype: 'textfield',
-                            itemId: 'schedule',
-                            cls: 'anas-fld-backup-schedule',
-                            fieldLabel: t('Schedule'),
-                            emptyText: 'daily',
-                            allowBlank: false,
-                            value: (task.schedule || ''),
-                        },
-                        {
-                            xtype: 'component',
-                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
-                            html: enc(t('systemd OnCalendar — e.g. "daily", "02:00", '
-                                + '"Mon *-*-* 03:00". Validated when saved.')),
-                        },
-                        {
                             xtype: 'checkboxfield',
                             itemId: 'enabled',
                             cls: 'anas-fld-backup-enabled',
