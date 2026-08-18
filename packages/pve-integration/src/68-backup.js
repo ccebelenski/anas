@@ -2532,6 +2532,13 @@
         if (hasKeeps(keeps)) {
             body.retention = keeps;
         }
+        // The structured cadence rides too — dropping it here would keep the
+        // generated weekly OnCalendar but silently discard a biweekly task's
+        // parity gate (the daemon regenerates from cadence when present).
+        var cad = cadenceOf(raw);
+        if (cad) {
+            body.cadence = cad;
+        }
         ANAS.runJob({
             node: node,
             method: 'put',
