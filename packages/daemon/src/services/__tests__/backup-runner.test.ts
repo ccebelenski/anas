@@ -41,6 +41,7 @@ function makeTask(over: Partial<BackupTask> = {}): BackupTask {
     backupId: 'anas-pve',
     archives: [{ name: 'documents', path: '/root/anas-src/documents', excludes: [] }],
     changeDetectionMode: 'default',
+    notify: 'always',
     schedule: 'daily',
     enabled: true,
     limitNofile: 1024,

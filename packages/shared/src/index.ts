@@ -65,6 +65,7 @@ export {
   BackupCadence,
   BackupCadenceKind,
   BackupName,
+  BackupNotifyMode,
   BackupPrunePreviewRequest,
   BackupPrunePreviewResponse,
   BackupPruneResult,

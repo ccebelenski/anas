@@ -28,6 +28,9 @@
  *              changeDetectionMode ('default'|'metadata'; alias `changeDetection`),
  *              retention? ({keepLast?,keepDaily?,keepWeekly?,keepMonthly?,keepYearly?}
  *                — positive ints; ABSENT means ANAS never prunes, 16.11),
+ *              notify ('always'|'on-failure' — when a finished run notifies
+ *                through PVE, 16.12; ABSENT means 'always', the daemon's
+ *                default and vzdump's),
  *              schedule (OnCalendar), enabled (bool),
  *              cadence? (16.10 — the STRUCTURED schedule:
  *                { kind:'weekly'|'biweekly'|'monthly'|'custom', days:[Mon..Sun],
@@ -75,7 +78,7 @@
  *   DELETE /v1/backup/tasks/:name    (units removed; PBS data untouched) → 202/409
  *   POST /v1/backup/tasks/:name/run  (Run Now; job carries progress) → 202 { job }
  *     TaskWrite = { name, repository, namespace?, backupId, archives, mode
- *       (=changeDetectionMode), retention?, enabled, and EITHER `cadence`
+ *       (=changeDetectionMode), retention?, notify, enabled, and EITHER `cadence`
  *       (structured — the daemon derives the OnCalendar; this view never
  *       generates one) OR `schedule` (the raw expression, for the Custom kind)}.
  *     The finished job's `result` may carry `prune` ({group, namespace?, dryRun,
@@ -106,6 +109,7 @@
  * retention fieldset 'anas-backup-retention' with 'anas-fld-backup-keeplast' …
  * 'anas-fld-backup-keepyearly', preview 'anas-btn-backup-retention-preview'
  * rendering into 'anas-backup-retention-preview');
+ * notification mode combo 'anas-fld-backup-notify';
  * directory picker 'anas-win-fs-picker' (grid 'anas-grid-fs-picker', path field
  * 'anas-fld-fs-path', select 'anas-btn-fs-select'); repos manager
  * 'anas-win-backup-repos' (grid 'anas-grid-backup-repos'); repo edit
@@ -386,6 +390,16 @@
         return out;
     }
 
+    // ---- Notifications (16.12) ---------------------------------------------
+    // When a finished run notifies through PVE — vzdump's own two modes, with
+    // vzdump's own default. ABSENT means 'always' (the daemon's schema default),
+    // which is exactly what every task created before 16.12 reads back as.
+    function notifyOf(task) {
+        return ('' + (first(task && task.notify) || 'always')).toLowerCase() === 'on-failure'
+            ? 'on-failure'
+            : 'always';
+    }
+
     function hasKeeps(retention) {
         for (var k in retention) {
             if (Object.prototype.hasOwnProperty.call(retention, k)) {
@@ -423,6 +437,7 @@
             mode: modeOf(task),
             schedule: task.schedule,
             cadence: cadenceOf(task),
+            notify: notifyOf(task),
             enabled: task.enabled !== false,
             lastRunResult: first(entry.lastRunResult, entry.result) || 'unknown',
             lastRunAt: first(entry.lastRunAt, entry.lastRun),
@@ -447,6 +462,7 @@
             changeDetectionMode: rec.get('mode'),
             schedule: rec.get('schedule'),
             cadence: rec.get('cadence') || undefined,
+            notify: rec.get('notify') || 'always',
             enabled: !!rec.get('enabled'),
         };
     }
@@ -1235,6 +1251,17 @@
             + '</span>';
     }
 
+    // The detail's Notifications row: which runs mail, in the words the wizard
+    // uses. Delivery itself is PVE's — the matchers and targets live there.
+    function notifyRowHtml(task) {
+        var mode = notifyOf(task);
+        var text = mode === 'on-failure'
+            ? t('on failure — only a failed run, or one that completed with warnings, notifies')
+            : t('always — every run that happened notifies (a skipped off week never does)');
+        return enc(text) + ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+            + enc(t('— delivered by the Proxmox notification system (type anas-backup)')) + '</span>';
+    }
+
     function taskDetailHtml(d) {
         if (!d) {
             return '<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
@@ -1254,6 +1281,7 @@
             + kv(t('Backup ID'), mono('host/' + backupIdOf(task)))
             + kv(t('Change detection'), enc(modeLabel))
             + kv(t('Retention'), retentionRowHtml(task))
+            + kv(t('Notifications'), notifyRowHtml(task))
             + kv(t('Schedule'), scheduleDetailHtml(task))
             + kv(t('Enabled'), task.enabled !== false
                 ? '<span style="color:var(--anas-ok,#1f9c56);">' + enc(t('yes')) + '</span>'
@@ -2084,6 +2112,30 @@
                             ]),
                         },
                         {
+                            xtype: 'combobox',
+                            itemId: 'notifyMode',
+                            cls: 'anas-fld-backup-notify',
+                            fieldLabel: t('Notification mode'),
+                            store: [
+                                ['always', t('Always')],
+                                ['on-failure', t('On failure')],
+                            ],
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            allowBlank: false,
+                            value: notifyOf(task),
+                        },
+                        {
+                            xtype: 'component',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                            html: enc(t('A finished run notifies through the Proxmox notification system '
+                                + '(type anas-backup) — the same matchers and targets the rest of PVE uses. '
+                                + '"Always" mails every run that happened, with its archive lines, duration, '
+                                + 'prune counts and warnings; "On failure" mails only a failed run or one that '
+                                + 'completed with warnings. A skipped off week never notifies.')),
+                        },
+                        {
                             xtype: 'checkboxfield',
                             itemId: 'enabled',
                             cls: 'anas-fld-backup-enabled',
@@ -2224,6 +2276,9 @@
             archives: archives,
             mode: mode,
             changeDetectionMode: mode, // send both spellings — daemon picks one
+            // Read straight off the combo by itemId — no hiddenfield mirroring
+            // (issue #26). An unreadable field falls back to the default mode.
+            notify: valOf(win, '#notifyMode') === 'on-failure' ? 'on-failure' : 'always',
             enabled: !!valOf(win, '#enabled'),
         };
         if (cadence) {
@@ -2462,6 +2517,9 @@
             mode: modeOf(raw),
             changeDetectionMode: modeOf(raw),
             schedule: raw.schedule || rec.get('schedule'),
+            // A toggle rewrites the whole task — carry the notification mode
+            // through it, exactly like the retention policy below.
+            notify: notifyOf(raw),
             enabled: next,
         };
         var ns = first(raw.namespace, rec.get('namespace'));
@@ -3383,7 +3441,7 @@
         var store = Ext.create('Ext.data.Store', {
             fields: [
                 'name', 'repository', 'datastore', 'namespace', 'backupId',
-                'schedule', 'mode', 'lastRunResult', 'lastRunAt', 'nextRunAt',
+                'schedule', 'mode', 'notify', 'lastRunResult', 'lastRunAt', 'nextRunAt',
                 { name: 'archiveCount', type: 'auto' },
                 { name: 'cadence', type: 'auto' },
                 { name: 'enabled', type: 'auto' },

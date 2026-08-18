@@ -242,6 +242,8 @@ export interface BackupRunResult {
   archives: string[]
   /** Present when pbc emitted the metadata-mode low-fd warning. */
   nofileWarning?: string
+  /** pbc's own `Duration: …` line, when it printed one (16.12's honest timing). */
+  duration?: string
   /** Present for a benign too-soon skip (explains why it did nothing). */
   reason?: string
   /** Retention prune counts, when the task configured one and it ran (16.11). */
@@ -303,6 +305,8 @@ export async function runBackup(
     result.target = progress.target
   if (progress.nofileWarning)
     result.nofileWarning = progress.nofileWarning
+  if (progress.duration)
+    result.duration = progress.duration
   if (outcome.kind === 'too-soon')
     result.reason = 'snapshot timestamp collision (1-second resolution) — nothing new to back up yet'
   return result

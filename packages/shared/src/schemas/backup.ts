@@ -303,6 +303,25 @@ export const BackupPrunePreviewResponse = z.object({
 })
 export type BackupPrunePreviewResponse = z.infer<typeof BackupPrunePreviewResponse>
 
+// ---- Notifications (story 16.12) -------------------------------------------
+
+/**
+ * When a finished backup run emits a PVE notification — vzdump's own two modes,
+ * with vzdump's own DEFAULT (`always`): the cron jobs this epic replaced mailed
+ * every run's full output, and the operator wants the detailed on-completion
+ * mail, not just the failure one.
+ *
+ * `always`     — every run that DID something notifies (success = info,
+ *                completed-with-warnings = warning, failure = error).
+ * `on-failure` — only the runs that went wrong notify (warning + error).
+ *
+ * A deliberate off-week skip ({@link BACKUP_SKIPPED_OFF_WEEK}) NEVER notifies in
+ * either mode: the cadence gate produced no run, and the cron jobs it replaces
+ * produced no mail either — a non-event is a non-event.
+ */
+export const BackupNotifyMode = z.enum(['always', 'on-failure'])
+export type BackupNotifyMode = z.infer<typeof BackupNotifyMode>
+
 // ---- Repositories ----------------------------------------------------------
 
 /**
@@ -458,6 +477,12 @@ export const BackupTask = z.object({
    * group with exactly these `--keep-*` flags. Absent = ANAS never prunes.
    */
   retention: BackupRetention.optional(),
+  /**
+   * When a finished run notifies through PVE (16.12). ABSENT = `always` — the
+   * schema default, which is also vzdump's, so every task written before 16.12
+   * reads back as an always-notifying task with no migration at all.
+   */
+  notify: BackupNotifyMode.default('always'),
   /**
    * systemd OnCalendar expression. GENERATED from `cadence` when one is present
    * (the cadence is authoritative); hand-written otherwise.

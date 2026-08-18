@@ -81,7 +81,8 @@ fi
 # template in that shared directory (guest philosophy).
 PVE_TEMPLATE_DIR="${PVE_TEMPLATE_DIR:-/usr/share/pve-manager/templates/default}"
 removed_template=0
-for tpl in anas-ahr-subject.txt.hbs anas-ahr-body.txt.hbs; do
+for tpl in anas-ahr-subject.txt.hbs anas-ahr-body.txt.hbs \
+           anas-backup-subject.txt.hbs anas-backup-body.txt.hbs; do
   if [ -f "${PVE_TEMPLATE_DIR}/${tpl}" ]; then
     rm -f "${PVE_TEMPLATE_DIR}/${tpl}"
     removed_template=1

@@ -751,4 +751,164 @@ describe('backup routes (Epic 16)', () => {
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal((job.result as { status: string }).status, 'success')
   })
+
+  // ==========================================================================
+  //  Run notifications (16.12) — the emission matrix at the ONE emission point
+  // ==========================================================================
+  // Every real run (timer fire AND UI Run Now) reaches the daemon's run job
+  // through the task's own unit, so this branch is where the notification is
+  // emitted — one site, both triggers.
+
+  const PERL = '/usr/bin/perl'
+
+  /** Every PVE notification the run emitted (severity, title, body). */
+  function notifications(mock: MockExecutor): { severity: string, title: string, body: string, perl: string }[] {
+    return mock.calls
+      .filter(c => c.command === PERL)
+      .map(c => ({ perl: c.args[1], severity: c.args[2], title: c.args[3], body: c.args[4] }))
+  }
+
+  function allowNotify(exitCode = 0): MockExecutor {
+    const mock = mockOf(server)
+    mock.addFixture({ command: PERL, result: { stdout: '', stderr: exitCode ? 'no target configured' : '', exitCode } })
+    return mock
+  }
+
+  it('a successful run notifies `info` with the archive lines in the body (mode: always)', async () => {
+    await createRepo()
+    await createTask() // no `notify` in the payload → the schema default, always
+    const mock = allowNotify()
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    const sent = notifications(mock)
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].severity, 'info')
+    assert.match(sent[0].title, /backup 'nightly-etc' succeeded/)
+    // The detail that replaces the cron mail: target, group, and pbc's own lines.
+    assert.match(sent[0].body, /Repository:\s+pbs-main:store1/)
+    assert.match(sent[0].body, /Backup ID:\s+host\/anas-pve/)
+    assert.ok(sent[0].body.includes('etc.pxar: had to backup 82.957 KiB'))
+    assert.match(sent[0].body, /Duration:\s+0\.12s/)
+    // Backup events carry their own template + matcher type.
+    assert.ok(sent[0].perl.includes('anas-backup'))
+  })
+
+  it('a successful run of an ON-FAILURE task is silent', async () => {
+    await createRepo()
+    await createTaskPayload({ ...TASK, name: 'quiet', notify: 'on-failure' })
+    const mock = allowNotify()
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/quiet/run', headers: JSON_HEADERS, payload: { direct: true } })
+    assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
+    assert.deepEqual(notifications(mock), [])
+  })
+
+  it('completed-with-warnings notifies `warning` in BOTH modes, warnings verbatim', async () => {
+    await createRepo()
+    for (const notify of ['always', 'on-failure'] as const) {
+      const name = `warned-${notify}`
+      await createTaskPayload({ ...RETAINED_TASK, name, notify })
+      const mock = allowNotify()
+      // The prune fails AFTER a good backup (16.11) — the job completes carrying it.
+      mock.addFixture({ command: PBC_CMD, result: { stdout: '', stderr: 'Error: ENOENT: No such file or directory', exitCode: 255 } })
+      mock.calls.length = 0
+      const res = await server.inject({ method: 'POST', url: `/v1/backup/tasks/${name}/run`, headers: JSON_HEADERS, payload: { direct: true } })
+      const job = await waitForJob(server, await jobIdFrom(res))
+      assert.equal(job.status, 'completed', notify)
+      const sent = notifications(mock)
+      assert.equal(sent.length, 1, notify)
+      assert.equal(sent[0].severity, 'warning', notify)
+      assert.match(sent[0].title, /completed with warnings/)
+      assert.match(sent[0].body, /Backup succeeded, but the retention prune did not run/)
+      // The backup itself still reports its archives — the operator sees both.
+      assert.ok(sent[0].body.includes('etc.pxar: had to backup 82.957 KiB'))
+      await server.inject({ method: 'DELETE', url: `/v1/backup/tasks/${name}`, headers: JSON_HEADERS })
+    }
+  })
+
+  it('a FAILED run notifies `error` in BOTH modes, carrying the real error', async () => {
+    await createRepo()
+    for (const notify of ['always', 'on-failure'] as const) {
+      const name = `failing-${notify}`
+      await createTaskPayload({ ...TASK, name, notify })
+      const mock = allowNotify()
+      mock.addFixture({ command: '/usr/bin/prlimit', args: RETAINED_BACKUP_ARGS, result: { stdout: '', stderr: 'Error: no such datastore \'store1\'', exitCode: 255 } })
+      mock.calls.length = 0
+      const res = await server.inject({ method: 'POST', url: `/v1/backup/tasks/${name}/run`, headers: JSON_HEADERS, payload: { direct: true } })
+      const job = await waitForJob(server, await jobIdFrom(res))
+      assert.equal(job.status, 'failed', notify)
+      const sent = notifications(mock)
+      assert.equal(sent.length, 1, notify)
+      assert.equal(sent[0].severity, 'error', notify)
+      assert.match(sent[0].title, /FAILED/)
+      assert.ok(sent[0].body.includes('Error: no such datastore \'store1\''))
+      await server.inject({ method: 'DELETE', url: `/v1/backup/tasks/${name}`, headers: JSON_HEADERS })
+    }
+  })
+
+  it('an off-week SKIP notifies in NEITHER mode (the gate produced no run)', async () => {
+    await createRepo()
+    const now = new Date()
+    const parity = weekParity(now) === 'even' ? 'odd' : 'even'
+    for (const notify of ['always', 'on-failure'] as const) {
+      const name = `skipper-${notify}`
+      const create = await server.inject({
+        method: 'POST',
+        url: '/v1/backup/tasks',
+        headers: JSON_HEADERS,
+        payload: { ...CADENCE_TASK, name, notify, cadence: { kind: 'biweekly', days: ['Tue'], time: '02:00', parity } },
+      })
+      assert.equal((await waitForJob(server, await jobIdFrom(create))).status, 'completed')
+      scheduleTrigger(name, now)
+      const mock = allowNotify()
+      // A success 7 days ago: inside one period, so the heal must not fire.
+      const lastSuccess = new Date(now.getTime() - 7 * 24 * 3600_000).toISOString().replace('.000Z', '+0000')
+      mock.addFixture({
+        command: '/usr/bin/journalctl',
+        args: ['-u', `anas-backup-${name}.service`, '-n', '200', '-o', 'short-iso', '--no-pager'],
+        result: { stdout: `${lastSuccess} pve anas-backup-${name}[900]: {"task":"${name}","result":{"status":"success","archives":[]}}`, stderr: '', exitCode: 0 },
+      })
+      mock.calls.length = 0
+      const res = await server.inject({ method: 'POST', url: `/v1/backup/tasks/${name}/run`, headers: JSON_HEADERS, payload: { direct: true } })
+      const job = await waitForJob(server, await jobIdFrom(res))
+      assert.equal((job.result as { status: string }).status, 'skipped-off-week', notify)
+      assert.deepEqual(notifications(mock), [], notify)
+    }
+  })
+
+  it('a notification that cannot be delivered never fails the run job (best-effort)', async () => {
+    await createRepo()
+    await createTask()
+    const mock = allowNotify(255) // perl runs, PVE has no target → non-zero exit
+    mock.calls.length = 0
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: { direct: true } })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    assert.equal((job.result as { status: string }).status, 'success')
+    assert.equal(notifications(mock).length, 1)
+  })
+
+  it('the notify mode rides the unit JSON and round-trips through an edit', async () => {
+    await createRepo()
+    await createTaskPayload({ ...TASK, name: 'moody', notify: 'on-failure' })
+    const first = await server.inject({ method: 'GET', url: '/v1/backup/tasks/moody', headers: IDENTITY })
+    const stored = (first.json() as { data: BackupTaskDetail }).data
+    assert.equal(stored.task.notify, 'on-failure')
+    assert.match(stored.unit, /"notify":"on-failure"/)
+    // Editing back to always rewrites the same single source of truth.
+    const edit = await server.inject({ method: 'PUT', url: '/v1/backup/tasks/moody', headers: JSON_HEADERS, payload: { ...TASK, name: 'moody', notify: 'always' } })
+    assert.equal((await waitForJob(server, await jobIdFrom(edit))).status, 'completed')
+    const second = await server.inject({ method: 'GET', url: '/v1/backup/tasks/moody', headers: IDENTITY })
+    assert.equal((second.json() as { data: BackupTaskDetail }).data.task.notify, 'always')
+  })
+
+  it('a task saved with no notify mode at all defaults to always (pre-16.12 shape)', async () => {
+    await createRepo()
+    await createTask()
+    const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks', headers: IDENTITY })
+    const { data } = res.json() as { data: BackupTaskEntry[] }
+    assert.equal(data[0].task.notify, 'always')
+  })
 })

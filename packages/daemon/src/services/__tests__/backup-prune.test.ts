@@ -49,6 +49,7 @@ function makeTask(over: Partial<BackupTask> = {}): BackupTask {
     backupId: 'prune-gt2',
     archives: [{ name: 'data', path: '/root/prune-src', excludes: [] }],
     changeDetectionMode: 'default',
+    notify: 'always',
     schedule: 'daily',
     enabled: true,
     limitNofile: 1024,

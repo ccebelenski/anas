@@ -23,6 +23,7 @@ import {
   UpsertBackupRepoRequest,
 } from '@anas/shared'
 import { readPbsStorages } from '../parsers/pve-storage.js'
+import { notifyBackupRun } from '../services/backup-notify.js'
 import { pruneAfterBackup, pruneGroup, runPrune } from '../services/backup-prune.js'
 import {
   isPveRepoName,
@@ -42,6 +43,7 @@ import {
   buildBackupEnv,
   buildProbeArgs,
   classifyTestVerdict,
+  effectiveNamespace,
   fetchServerFingerprint,
   normalizeFingerprint,
   PBC,
@@ -711,49 +713,74 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         if (!task)
           throw new Error(`Backup task '${name}' not found`)
 
-        // Cadence gate (16.10): a biweekly task runs on a WEEKLY timer because
-        // OnCalendar cannot say "every other week", so an off-week SCHEDULED fire
-        // stops here. It completes as a first-class, visible skip — a journal
-        // line, an exit status systemd counts as success, and a `skipped` task
-        // status — never a fake success-with-backup and never a failure. A Run Now
-        // is not gated (explicit user intent), and every other cadence is pure
-        // OnCalendar with nothing to gate.
-        const gate = await gateRun(executor, task)
-        if (!gate.run) {
-          updateProgress(`backup task '${name}': ${gate.detail}`)
-          return { status: BACKUP_SKIPPED_OFF_WEEK, archives: [], reason: gate.detail }
-        }
-        if (gate.reason === 'heal' || gate.reason === 'no-record')
-          updateProgress(`backup task '${name}': ${gate.detail}`)
+        // 16.12: this branch is the ONE place every real run converges (a timer
+        // fire and a UI Run Now both arrive here through the task's own unit),
+        // so it is also the one place a run notification is emitted. What is
+        // known when the run ends rides the notification, which is why the repo
+        // is tracked outside the try — a failure before it resolves still names
+        // the task's configured repository.
+        const startedAt = Date.now()
+        let repo: BackupRepo | undefined
+        let namespace: string | undefined
+        try {
+          // Cadence gate (16.10): a biweekly task runs on a WEEKLY timer because
+          // OnCalendar cannot say "every other week", so an off-week SCHEDULED fire
+          // stops here. It completes as a first-class, visible skip — a journal
+          // line, an exit status systemd counts as success, and a `skipped` task
+          // status — never a fake success-with-backup and never a failure. A Run Now
+          // is not gated (explicit user intent), and every other cadence is pure
+          // OnCalendar with nothing to gate. It NEVER notifies (16.12): the gate
+          // produced no run, and the cron jobs it replaces produced no mail.
+          const gate = await gateRun(executor, task)
+          if (!gate.run) {
+            updateProgress(`backup task '${name}': ${gate.detail}`)
+            return { status: BACKUP_SKIPPED_OFF_WEEK, archives: [], reason: gate.detail }
+          }
+          if (gate.reason === 'heal' || gate.reason === 'no-record')
+            updateProgress(`backup task '${name}': ${gate.detail}`)
 
-        // Resolve tier-2 (registry) or tier-1 (pve:<id>) repo + secret FRESH.
-        // A tier-1 secret is read from /etc/pve/priv/storage/<id>.pw here, at
-        // exec time — never copied, never cached (PVE rotation is instant).
-        const resolved = await resolveRepoAndSecret(task.repository)
-        if (!resolved)
-          throw new Error(`Repository '${task.repository}' is not registered`)
-        const { repo, secret } = resolved
-        if (secret === null) {
-          throw new Error(isPveRepoName(task.repository)
-            ? `No PBS credential file for '${task.repository}' (${paths.pvePrivStorageDir}/${pveStorageId(task.repository)}.pw is missing) — set it in Datacenter → Storage`
-            : `No secret stored for repository '${repo.name}' — set its credentials first`)
+          // Resolve tier-2 (registry) or tier-1 (pve:<id>) repo + secret FRESH.
+          // A tier-1 secret is read from /etc/pve/priv/storage/<id>.pw here, at
+          // exec time — never copied, never cached (PVE rotation is instant).
+          const resolved = await resolveRepoAndSecret(task.repository)
+          if (!resolved)
+            throw new Error(`Repository '${task.repository}' is not registered`)
+          const secret = resolved.secret
+          repo = resolved.repo
+          namespace = effectiveNamespace(task, repo)
+          if (secret === null) {
+            throw new Error(isPveRepoName(task.repository)
+              ? `No PBS credential file for '${task.repository}' (${paths.pvePrivStorageDir}/${pveStorageId(task.repository)}.pw is missing) — set it in Datacenter → Storage`
+              : `No secret stored for repository '${repo.name}' — set its credentials first`)
+          }
+          const result = await runBackup(executor, { task, repo, secret }, updateProgress)
+          // Retention (16.11): prune ONLY after a run that actually backed up. A
+          // 'skipped' run (the benign too-soon collision — and any future cadence
+          // skip) never prunes, and a FAILED run threw long before this line. A
+          // task with no retention prunes nothing at all (the default posture);
+          // a prune failure rides back as a warning, never a job failure.
+          const final = result.status === 'success'
+            ? {
+                ...result,
+                ...(await pruneAfterBackup(executor, {
+                  task,
+                  repo,
+                  secret,
+                  onProgress: updateProgress,
+                  log: (message, level) => (level === 'warn' ? server.log.warn(message) : server.log.info(message)),
+                })),
+              }
+            : result
+          // Best-effort by contract: notifyBackupRun never throws, so a broken
+          // mail target cannot turn a good backup into a failed job.
+          await notifyBackupRun(executor, { task, repo, namespace, result: final, elapsedMs: Date.now() - startedAt })
+          return final
         }
-        const result = await runBackup(executor, { task, repo, secret }, updateProgress)
-        // Retention (16.11): prune ONLY after a run that actually backed up. A
-        // 'skipped' run (the benign too-soon collision — and any future cadence
-        // skip) never prunes, and a FAILED run threw long before this line. A
-        // task with no retention prunes nothing at all (the default posture);
-        // a prune failure rides back as a warning, never a job failure.
-        if (result.status !== 'success')
-          return result
-        const retention = await pruneAfterBackup(executor, {
-          task,
-          repo,
-          secret,
-          onProgress: updateProgress,
-          log: (message, level) => (level === 'warn' ? server.log.warn(message) : server.log.info(message)),
-        })
-        return { ...result, ...retention }
+        catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          await notifyBackupRun(executor, { task, repo, namespace, error: message, elapsedMs: Date.now() - startedAt })
+          throw err
+        }
       },
     )
     reply.code(202)

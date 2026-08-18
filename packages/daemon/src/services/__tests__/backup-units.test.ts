@@ -47,6 +47,7 @@ function makeTask(over: Partial<BackupTask> = {}): BackupTask {
     backupId: 'anas-pve',
     archives: [{ name: 'etc', path: '/etc', excludes: [] }],
     changeDetectionMode: 'default',
+    notify: 'always',
     schedule: '*-*-* 02:00:00',
     enabled: true,
     limitNofile: 1024,
@@ -66,9 +67,28 @@ describe('backup units — the systemd units ARE the store (Epic 16.3, NOTES §7
       // Retention (16.11) rides the same X-ANAS-Task JSON — units ARE the store.
       makeTask({ name: 'kept', retention: { keepLast: 3, keepDaily: 7, keepWeekly: 4, keepMonthly: 6, keepYearly: 1 } }),
       makeTask({ name: 'kept-one', retention: { keepDaily: 14 } }),
+      // Notification mode (16.12) rides the same JSON — units ARE the store.
+      makeTask({ name: 'quiet', notify: 'on-failure' }),
     ]) {
       assert.deepEqual(parseServiceUnit(renderServiceUnit(task)), task)
     }
+  })
+
+  it('a unit written before 16.12 (no `notify` key) reads back as `always`', () => {
+    // A verbatim pre-16.12 service unit — the notify field simply is not there.
+    const legacy = [
+      '[Unit]',
+      'Description=ANAS backup task nightly-etc',
+      '# X-ANAS-Task={"name":"nightly-etc","repository":"pbs-main","backupId":"anas-pve",'
+      + '"archives":[{"name":"etc","path":"/etc","excludes":[]}],"changeDetectionMode":"default",'
+      + '"schedule":"*-*-* 02:00:00","enabled":true,"limitNofile":1024}',
+      '',
+    ].join('\n')
+    const parsed = parseServiceUnit(legacy)
+    assert.ok(parsed, 'a pre-16.12 unit still parses')
+    assert.equal(parsed.notify, 'always')
+    // And rewriting it stores the default explicitly (no second config source).
+    assert.match(renderServiceUnit(parsed), /"notify":"always"/)
   })
 
   it('a task with NO retention round-trips with no retention key at all', () => {

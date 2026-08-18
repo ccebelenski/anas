@@ -96,9 +96,11 @@ install -m 0755 "${SCRIPT_DIR}/install.sh"   "${REL_ROOT}/install.sh"
 install -m 0755 "${SCRIPT_DIR}/uninstall.sh" "${REL_ROOT}/uninstall.sh"
 # mdadm --monitor PROGRAM hook — install.sh preflight requires it (AHR §7.2).
 install -m 0755 "${SCRIPT_DIR}/anas-md-event.sh" "${REL_ROOT}/anas-md-event.sh"
+# PVE notification templates — one subject/body pair per event type (anas-ahr
+# array/pool events, anas-backup run results). install.sh's preflight requires
+# every one of them, so they ship as a set.
 install -d "${REL_ROOT}/templates"
-install -m 0644 "${SCRIPT_DIR}/templates/anas-ahr-subject.txt.hbs" "${REL_ROOT}/templates/"
-install -m 0644 "${SCRIPT_DIR}/templates/anas-ahr-body.txt.hbs" "${REL_ROOT}/templates/"
+install -m 0644 "${SCRIPT_DIR}"/templates/anas-*.txt.hbs "${REL_ROOT}/templates/"
 printf '%s\n' "${VERSION}" > "${REL_ROOT}/VERSION"
 # Also inside app/ — cp -a carries it to /opt/anas, so an installed node can
 # report its release on disk (install.sh reads it for upgrade/downgrade logs).

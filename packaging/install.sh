@@ -48,6 +48,18 @@ FORCE=0
 MIN_NODE_MAJOR=20
 MIN_ZFS="2.2"
 
+# The PVE notification templates ANAS ships (one subject/body pair per event
+# TYPE, so operators can match on the kind of event): anas-ahr = array/pool
+# events (AHR §7.2), anas-backup = backup-run results (16.12). Listed once —
+# the preflight check and the install step both read this list, and
+# uninstall.sh removes exactly the same names.
+NOTIFY_TEMPLATES=(
+  anas-ahr-subject.txt.hbs
+  anas-ahr-body.txt.hbs
+  anas-backup-subject.txt.hbs
+  anas-backup-body.txt.hbs
+)
+
 log()  { printf '==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -280,8 +292,10 @@ phase0_preflight() {
     || FATAL+=("release incomplete: systemd/ unit files not found")
   [ -f "${SCRIPT_DIR}/anas-md-event.sh" ] \
     || FATAL+=("release incomplete: anas-md-event.sh not found next to install.sh")
-  [ -f "${SCRIPT_DIR}/templates/anas-ahr-subject.txt.hbs" ] && [ -f "${SCRIPT_DIR}/templates/anas-ahr-body.txt.hbs" ] \
-    || FATAL+=("release incomplete: templates/anas-ahr-*.txt.hbs not found next to install.sh")
+  for tpl in "${NOTIFY_TEMPLATES[@]}"; do
+    [ -f "${SCRIPT_DIR}/templates/${tpl}" ] \
+      || FATAL+=("release incomplete: templates/${tpl} not found next to install.sh")
+  done
 
   # Root.
   if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -632,8 +646,9 @@ phase1_install() {
   if [ -d "$(dirname "${PVE_TEMPLATE_DIR}")" ]; then
     info "installing PVE notification templates -> ${PVE_TEMPLATE_DIR}"
     install -d "${PVE_TEMPLATE_DIR}"
-    install -m 0644 "${SCRIPT_DIR}/templates/anas-ahr-subject.txt.hbs" "${PVE_TEMPLATE_DIR}/"
-    install -m 0644 "${SCRIPT_DIR}/templates/anas-ahr-body.txt.hbs" "${PVE_TEMPLATE_DIR}/"
+    for tpl in "${NOTIFY_TEMPLATES[@]}"; do
+      install -m 0644 "${SCRIPT_DIR}/templates/${tpl}" "${PVE_TEMPLATE_DIR}/"
+    done
   fi
 
   # 2d. Write the ANAS-owned gateway env file (issue #2) BEFORE the service
