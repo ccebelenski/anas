@@ -12,6 +12,12 @@
  * a guarded probe. PVE-owned mounts (read-only storage.cfg parse) appear tagged
  * hands-off and reject mutations — same pattern as PVE-managed pools in 30-pools.
  *
+ * The grid carries two derived facets in columns of their own (operator review
+ * 2026-08-19): "Managed by" — who owns the mount (PVE / AHR / ANAS / LOCAL), the
+ * same classification that gates the hands-off buttons — and "Persist", which
+ * names the MECHANISM that brings the mount back (fstab / zfs / storage.cfg),
+ * leaving "session" to mean what it says: nothing does.
+ *
  * ---------------------------------------------------------------------------
  * DAEMON CONTRACT — the field names this view assumes beyond DESIGN.md's
  * endpoint table. Every read is defensive: aliases tolerated, absent fields
@@ -71,7 +77,10 @@
  * Test hooks: view 'anas-view anas-view-mounts'; grid 'anas-grid-mounts'; detail
  * 'anas-mount-detail'; toolbar 'anas-btn-mount-refresh' / 'anas-btn-mount-add' /
  * 'anas-btn-mount-toggle' / 'anas-btn-mount-edit' / 'anas-btn-mount-remove';
- * PVE badge 'anas-mount-pve-badge'; wizard window 'anas-win-mount-edit' with test
+ * Managed-by column cells 'anas-mount-managed-by' + the per-owner class
+ * 'anas-mount-pve-badge' / 'anas-mount-ahr-badge' / 'anas-mount-anas-badge' /
+ * 'anas-mount-local-badge'; Persist cells 'anas-mount-persist' +
+ * 'anas-mount-persist-<mechanism>'; wizard window 'anas-win-mount-edit' with test
  * area 'anas-mount-test', preview 'anas-mount-preview', save 'anas-btn-mount-save'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
@@ -159,22 +168,30 @@
         }
     }
 
+    // One field getter for both shapes we classify: an Ext record (grid renderer,
+    // selection) and a plain row object (store normalisation, before the record
+    // exists). Every classifier below reads through this — one accessor, no
+    // copies to diverge.
+    function getf(rec, key) {
+        try {
+            if (rec && typeof rec.get === 'function') {
+                return rec.get(key);
+            }
+            return rec ? rec[key] : undefined;
+        } catch (e) {
+            return undefined;
+        }
+    }
+
     // A mount row is PVE-managed when pveManaged is true OR (pools precedent) a
     // non-empty pveStorages[] is present. Fail-open: anything we cannot classify
     // stays ANAS-managed so we never wrongly block a real ANAS mount.
     function isPveManaged(rec) {
-        try {
-            var get = (rec && typeof rec.get === 'function')
-                ? function (k) { return rec.get(k); }
-                : function (k) { return rec ? rec[k] : undefined; };
-            if (get('pveManaged') === true) {
-                return true;
-            }
-            var ps = get('pveStorages');
-            return !!(isArray(ps) && ps.length);
-        } catch (e) {
-            return false;
+        if (getf(rec, 'pveManaged') === true) {
+            return true;
         }
+        var ps = getf(rec, 'pveStorages');
+        return !!(isArray(ps) && ps.length);
     }
 
     // A mount row is AHR-managed (ANAS Hybrid RAID pool persistence) when the
@@ -182,14 +199,7 @@
     // on the LV spec. Hands-off here (same 30-pools pattern as PVE): the pool is
     // managed from the Hybrid RAID view, never the Mounts feature.
     function isAhrManaged(rec) {
-        try {
-            var get = (rec && typeof rec.get === 'function')
-                ? function (k) { return rec.get(k); }
-                : function (k) { return rec ? rec[k] : undefined; };
-            return get('ahrManaged') === true;
-        } catch (e) {
-            return false;
-        }
+        return getf(rec, 'ahrManaged') === true;
     }
 
     // Remote vs local — prefer an explicit flag, else derive from the fstype.
@@ -200,15 +210,46 @@
     }
 
     function isRemoteRec(rec) {
-        try {
-            var r = rec.get('remote');
-            if (r === true || r === false) {
-                return r;
-            }
-        } catch (e) {
-            // fall through to type derivation
+        var r = getf(rec, 'remote');
+        if (r === true || r === false) {
+            return r;
         }
-        return isRemoteType(rec && rec.get ? rec.get('type') : '');
+        return isRemoteType(getf(rec, 'type'));
+    }
+
+    // ---- Ownership (the "Managed by" facet) --------------------------------
+    //
+    // Who owns this mount — the single classification behind the Managed-by
+    // column, the hands-off action gating and the row styling. Precedence
+    // matches updateButtons: PVE first (storage.cfg is authoritative), then AHR
+    // pool persistence, then ANAS's own remote shares, then plain local storage.
+    var OWNER_SPEC = {
+        pve: {
+            label: 'PVE', cls: 'anas-mount-pve-badge',
+            title: 'Managed by PVE (storage.cfg) — view only',
+        },
+        ahr: {
+            label: 'AHR', cls: 'anas-mount-ahr-badge',
+            title: 'ANAS Hybrid RAID pool — manage it from the Hybrid RAID view',
+        },
+        anas: {
+            label: 'ANAS', cls: 'anas-mount-anas-badge',
+            title: 'Remote NFS/CIFS mount managed by ANAS',
+        },
+        local: {
+            label: 'LOCAL', cls: 'anas-mount-local-badge',
+            title: 'Local filesystem — managed under Pools (ZFS), not the Mounts feature',
+        },
+    };
+
+    function ownerOf(rec) {
+        if (isPveManaged(rec)) {
+            return 'pve';
+        }
+        if (isAhrManaged(rec)) {
+            return 'ahr';
+        }
+        return isRemoteRec(rec) ? 'anas' : 'local';
     }
 
     // ---- Small pill / badge builders (mount-state vocabulary) --------------
@@ -246,75 +287,66 @@
             + enc(t(spec.label)) + '</span>';
     }
 
-    function tagBadge(text, color, title) {
+    // `flush` drops the leading margin — a badge that stands alone in its own
+    // column has nothing to sit beside.
+    function tagBadge(text, color, title, flush) {
         return '<span class="anas-mount-tag" title="' + enc(title || '') + '"'
-            + ' style="display:inline-block;padding:0 7px;border-radius:8px;margin-left:5px;'
+            + ' style="display:inline-block;padding:0 7px;border-radius:8px;'
+            + (flush ? '' : 'margin-left:5px;')
             + 'font-size:0.8em;color:#fff;background:' + color + ';">' + enc(text) + '</span>';
+    }
+
+    // A muted pill for the Persist column — same shape as the state pills, one
+    // colour per persistence mechanism.
+    function mechPill(key, label, color, title) {
+        return '<span class="anas-mount-persist anas-mount-persist-' + enc(key)
+            + '" title="' + enc(title) + '"'
+            + ' style="display:inline-block;padding:1px 8px;border-radius:9px;font-size:0.82em;'
+            + 'color:' + color + ';'
+            + 'background:color-mix(in srgb,' + color + ' 15%,transparent);">'
+            + enc(t(label)) + '</span>';
     }
 
     // ---- Renderers ---------------------------------------------------------
 
+    // The mountpoint is a plain identifier — never truncated, never decorated.
+    // Ownership rides the Managed-by column (operator review 2026-08-19: tags
+    // belong in a column of their own, not stapled to a value).
     function renderMountpoint(v, meta, rec) {
-        var mp = enc(v);
-        try {
-            if (isPveManaged(rec)) {
-                // The standout hands-off marker (mirrors 30-pools' PVE badge).
-                var tip = t('Managed by PVE (storage.cfg) — view only');
-                var badge = '';
-                try {
-                    if (ANAS.gfx && typeof ANAS.gfx.badge === 'function') {
-                        badge = ANAS.gfx.badge('PVE', { title: tip }) || '';
-                    }
-                } catch (eB) {
-                    badge = '';
-                }
-                if (!badge) {
-                    badge = '<span class="anas-gfx-badge" title="' + enc(tip) + '">PVE</span>';
-                }
-                return mp + ' <span class="anas-mount-pve-badge" title="' + enc(tip) + '">'
-                    + badge + '</span>';
-            }
-            if (isAhrManaged(rec)) {
-                // Mirror the PVE hands-off marker for AHR pool persistence.
-                var atip = t('ANAS Hybrid RAID pool — manage it from the Hybrid RAID view');
-                var abadge = '';
-                try {
-                    if (ANAS.gfx && typeof ANAS.gfx.badge === 'function') {
-                        abadge = ANAS.gfx.badge('AHR', { title: atip }) || '';
-                    }
-                } catch (eA) {
-                    abadge = '';
-                }
-                if (!abadge) {
-                    abadge = '<span class="anas-gfx-badge" title="' + enc(atip) + '">AHR</span>';
-                }
-                return mp + ' <span class="anas-mount-ahr-badge" title="' + enc(atip) + '">'
-                    + abadge + '</span>';
-            }
-            // Local (non-remote, non-PVE, non-AHR) rows are observe-only here —
-            // ANAS manages remote shares; local storage is ZFS/Pools territory.
-            // Mirror the PVE/AHR hands-off marker so the disabled action buttons
-            // have a visible explanation, not just a mute tooltip.
-            if (!isRemoteRec(rec)) {
-                var ltip = t('Local filesystem — managed under Pools (ZFS), not the Mounts feature');
-                var lbadge = '';
-                try {
-                    if (ANAS.gfx && typeof ANAS.gfx.badge === 'function') {
-                        lbadge = ANAS.gfx.badge('LOCAL', { title: ltip }) || '';
-                    }
-                } catch (eL) {
-                    lbadge = '';
-                }
-                if (!lbadge) {
-                    lbadge = '<span class="anas-gfx-badge" title="' + enc(ltip) + '">LOCAL</span>';
-                }
-                return mp + ' <span class="anas-mount-local-badge" title="' + enc(ltip) + '">'
-                    + lbadge + '</span>';
-            }
-        } catch (e) {
-            // fall through to the plain mountpoint
+        var mp = '' + (v == null ? '' : v);
+        if (!mp) {
+            return '<span style="color:gray;">&mdash;</span>';
         }
-        return mp;
+        return '<span title="' + enc(mp) + '">' + enc(mp) + '</span>';
+    }
+
+    // The ownership badge, alone in its column. PVE / AHR / LOCAL keep the gfx
+    // hands-off badge they carried on the Mountpoint cell; the ANAS-managed
+    // remote share keeps the colour of the old Type-column "remote" pill, so the
+    // visual language survives the move.
+    function renderManagedBy(v, meta, rec) {
+        var owner = Object.prototype.hasOwnProperty.call(OWNER_SPEC, '' + v)
+            ? ('' + v) : ownerOf(rec);
+        var spec = OWNER_SPEC[owner] || OWNER_SPEC.local;
+        var tip = t(spec.title);
+        if (owner === 'anas') {
+            return '<span class="anas-mount-managed-by ' + spec.cls + '">'
+                + tagBadge(t(spec.label), 'var(--anas-series-2,#7a3fb0)', tip, true) + '</span>';
+        }
+        var badge = '';
+        try {
+            if (ANAS.gfx && typeof ANAS.gfx.badge === 'function') {
+                badge = ANAS.gfx.badge(spec.label, { title: tip }) || '';
+            }
+        } catch (eB) {
+            badge = '';
+        }
+        if (!badge) {
+            badge = '<span class="anas-gfx-badge" title="' + enc(tip) + '">'
+                + enc(spec.label) + '</span>';
+        }
+        return '<span class="anas-mount-managed-by ' + spec.cls + '" title="' + enc(tip) + '">'
+            + badge + '</span>';
     }
 
     function renderSource(v, meta, rec) {
@@ -332,15 +364,8 @@
         if (!type) {
             return '<span style="color:gray;">&mdash;</span>';
         }
-        var out = '<span class="anas-mount-type">' + enc(type) + '</span>';
-        try {
-            if (isRemoteRec(rec)) {
-                out += tagBadge(t('remote'), 'var(--anas-series-2,#7a3fb0)', t('Remote filesystem'));
-            }
-        } catch (e) {
-            // non-fatal
-        }
-        return out;
+        // Plain value — the remote/ANAS facet lives in the Managed-by column.
+        return '<span class="anas-mount-type">' + enc(type) + '</span>';
     }
 
     function renderState(v, meta, rec) {
@@ -372,26 +397,52 @@
         return '<span title="' + enc(label) + '">' + enc(label) + '</span>';
     }
 
-    // fstab persistence — a filled badge when persisted, a muted "session" chip
-    // otherwise (a mount-now-only entry that is gone after reboot).
-    function renderPersisted(v, meta, rec) {
-        var persisted = first(rec.get('persistent'), rec.get('inFstab'));
+    // Persist names the MECHANISM that brings this mount back, not merely
+    // "fstab or not" (operator review 2026-08-19: a ZFS pool, a cephfs and a PVE
+    // storage mount are not "session" mounts — calling them that is false).
+    // Precedence: an fstab entry wins; then ZFS's own mountpoint property; then
+    // PVE's storage.cfg; only a mount with NO owner at all is a session mount.
+    // Derived entirely from facts the row already carries.
+    function persistMechanism(rec) {
+        var persisted = first(getf(rec, 'persistent'), getf(rec, 'inFstab'));
         if (persisted === true) {
-            return '<span class="anas-mount-fstab" title="'
-                + enc(t('Persisted — has an /etc/fstab entry')) + '"'
-                + ' style="display:inline-block;padding:1px 8px;border-radius:9px;font-size:0.82em;'
-                + 'color:var(--anas-ok,#1f9c56);'
-                + 'background:color-mix(in srgb,var(--anas-ok,#1f9c56) 15%,transparent);">'
-                + enc(t('fstab')) + '</span>';
+            return 'fstab';
         }
-        if (persisted === false) {
-            return '<span title="' + enc(t('Mounted now only — not in fstab, gone after reboot')) + '"'
-                + ' style="display:inline-block;padding:1px 8px;border-radius:9px;font-size:0.82em;'
-                + 'color:var(--anas-muted,gray);'
-                + 'background:color-mix(in srgb,var(--anas-muted,gray) 16%,transparent);">'
-                + enc(t('session')) + '</span>';
+        if (('' + (getf(rec, 'type') || '')).toLowerCase() === 'zfs') {
+            return 'zfs';
         }
-        return '<span style="color:gray;">&mdash;</span>';
+        if (isPveManaged(rec)) {
+            return 'storage.cfg';
+        }
+        return persisted === false ? 'session' : '';
+    }
+
+    var PERSIST_SPEC = {
+        'fstab': {
+            key: 'fstab', color: 'var(--anas-ok,#1f9c56)',
+            title: 'Persisted — has an /etc/fstab entry',
+        },
+        'zfs': {
+            key: 'zfs', color: 'var(--anas-series-3,#147d68)',
+            title: 'Mounted by ZFS on pool import (mountpoint property) — no fstab entry needed',
+        },
+        'storage.cfg': {
+            key: 'storagecfg', color: 'var(--anas-series-5,#2f6f8f)',
+            title: 'Mounted by PVE from storage.cfg',
+        },
+        'session': {
+            key: 'session', color: 'var(--anas-muted,gray)',
+            title: 'Mounted now only — nothing brings this mount back after a reboot',
+        },
+    };
+
+    function renderPersisted(v, meta, rec) {
+        var mech = persistMechanism(rec);
+        var spec = PERSIST_SPEC[mech];
+        if (!spec) {
+            return '<span style="color:gray;">&mdash;</span>';
+        }
+        return mechPill(spec.key, mech, spec.color, t(spec.title));
     }
 
     // ---- Grid load / reload ------------------------------------------------
@@ -412,7 +463,7 @@
     // Normalise a raw mount object into a grid record (tolerate `fstype` alias).
     function mountRow(m) {
         m = m || {};
-        return {
+        var row = {
             mountpoint: m.mountpoint,
             source: m.source,
             type: first(m.type, m.fstype) || '',
@@ -428,6 +479,10 @@
             automount: !!m.automount,
             raw: m,
         };
+        // Materialise the ownership facet so the Managed-by column has a real
+        // dataIndex to sort on (the renderer re-derives it defensively anyway).
+        row.managedBy = ownerOf(row);
+        return row;
     }
 
     // `quiet` skips the grid loading mask — the timed poll refreshes in place
@@ -2395,6 +2450,7 @@
                 { name: 'pveManaged', type: 'auto' },
                 { name: 'pveStorages', type: 'auto' },
                 { name: 'ahrManaged', type: 'auto' },
+                { name: 'managedBy', type: 'auto' },
                 { name: 'remote', type: 'auto' },
                 { name: 'size', type: 'auto' },
                 { name: 'used', type: 'auto' },
@@ -2508,8 +2564,12 @@
                             renderer: renderSource,
                         },
                         {
-                            text: t('Type'), dataIndex: 'type', width: 130,
+                            text: t('Type'), dataIndex: 'type', width: 100,
                             renderer: renderType,
+                        },
+                        {
+                            text: t('Managed by'), dataIndex: 'managedBy', width: 110,
+                            align: 'center', menuDisabled: true, renderer: renderManagedBy,
                         },
                         {
                             text: t('State'), dataIndex: 'state', width: 150,
@@ -2520,8 +2580,8 @@
                             sortable: false, menuDisabled: true, renderer: renderCapacity,
                         },
                         {
-                            text: t('Persist'), dataIndex: 'persistent', width: 90,
-                            align: 'center', renderer: renderPersisted,
+                            text: t('Persist'), dataIndex: 'persistent', width: 110,
+                            align: 'center', menuDisabled: true, renderer: renderPersisted,
                         },
                     ],
                     tbar: tbar,
