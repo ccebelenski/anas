@@ -313,6 +313,90 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.equal(mock.pipelineCalls.length, 0)
   })
 
+  // ==========================================================================
+  //  Run notifications (story 9.4) — FAILURE ONLY, at the ONE emission point
+  // ==========================================================================
+  // A replication task's timer runner is a thin client of THIS endpoint, so the
+  // replicate job is where both an unattended fire and a UI replicate converge —
+  // one emission site. A healthy replication says nothing (16.7's policy).
+
+  const PERL = '/usr/bin/perl'
+
+  /** Every PVE notification the run emitted (template, severity, title, body). */
+  function notifications(mock: MockExecutor): { perl: string, severity: string, title: string, body: string }[] {
+    return mock.calls
+      .filter(c => c.command === PERL)
+      .map(c => ({ perl: c.args[1], severity: c.args[2], title: c.args[3], body: c.args[4] }))
+  }
+
+  /** The diverged-target setup (a real, unattended-visible failure) + perl. */
+  function armDivergedRun(perlExit = 0): MockExecutor {
+    const mock = mockOf(server!)
+    mock.clearFixtures()
+    mock.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: perlExit } })
+    mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2', 'testpool2/share1']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool2/share1'), result: { stdout: snapshotListJson('testpool2/share1', [{ name: 'stranger', txg: 500 }]), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    return mock
+  }
+
+  async function replicateShare1(): Promise<Job> {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/share1/replicate',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ target: { pool: 'testpool2' } }),
+    })
+    assert.equal(res.statusCode, 202)
+    return waitForJob(server!, (res.json() as JobAccepted).job.id)
+  }
+
+  it('a FAILED replication notifies `error` through the anas-replication template', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = armDivergedRun()
+    const job = await replicateShare1()
+    assert.equal(job.status, 'failed')
+    const sent = notifications(mock)
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].severity, 'error')
+    assert.match(sent[0].title, /replication testpool\/share1 → testpool2\/share1 FAILED/)
+    // The route, the snapshot the run had settled on, and the error verbatim.
+    assert.match(sent[0].body, /Source:\s+testpool\/share1/)
+    assert.match(sent[0].body, /Target:\s+testpool2\/share1/)
+    assert.match(sent[0].body, /Snapshot:\s+testpool\/share1@repl-base/)
+    assert.ok(sent[0].body.includes('has diverged'))
+    assert.ok(sent[0].perl.includes('anas-replication'))
+  })
+
+  it('a SUCCESSFUL replication is silent — healthy runs never mail', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = mockOf(server)
+    mock.clearFixtures()
+    mock.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    const job = await replicateShare1()
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(notifications(mock), [])
+  })
+
+  it('a notification that cannot be delivered leaves the failed job exactly as it was', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = armDivergedRun(255) // perl runs, PVE has no target → non-zero exit
+    const job = await replicateShare1()
+    assert.equal(job.status, 'failed')
+    assert.match(job.error!.message, /diverged/)
+    assert.equal(notifications(mock).length, 1)
+  })
+
   // --- replicate: unauthenticated ----------------------------------------
   it('replicate → 401 without identity headers', async () => {
     server = createServer({ mock: true, logger: false })

@@ -220,4 +220,72 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     const res = await server.inject({ method: 'POST', url: '/v1/schedules/ghost/run', headers: JSON_HEADERS, payload: '{}' })
     assert.equal(res.statusCode, 404)
   })
+
+  // ==========================================================================
+  //  Run notifications (story 9.4) — FAILURE ONLY, at the ONE emission point
+  // ==========================================================================
+  // A timer fire and a UI Run Now both reach the daemon's run job, so that job
+  // is where the notification is emitted — one site, both triggers. A schedule
+  // can fire hourly, so a healthy run says nothing at all (17.7's policy).
+
+  const PERL = '/usr/bin/perl'
+
+  /** Every PVE notification the fire emitted (template, severity, title, body). */
+  function notifications(mock: MockExecutor): { perl: string, severity: string, title: string, body: string }[] {
+    return mock.calls
+      .filter(c => c.command === PERL)
+      .map(c => ({ perl: c.args[1], severity: c.args[2], title: c.args[3], body: c.args[4] }))
+  }
+
+  /** Re-arm the fixtures with perl allowed, and (optionally) a failing zfs. */
+  function armNotify(opts: { zfs?: { stderr: string, exitCode: number }, perlExit?: number } = {}): MockExecutor {
+    const mock = mockOf(server)
+    mock.clearFixtures()
+    mock.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: opts.perlExit ?? 0 } })
+    mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: JOURNALCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({
+      command: ZFS,
+      result: opts.zfs
+        ? { stdout: '', stderr: opts.zfs.stderr, exitCode: opts.zfs.exitCode }
+        : { stdout: '', stderr: '', exitCode: 0 },
+    })
+    return mock
+  }
+
+  it('a FAILED fire notifies `error` through the anas-snapshot template, error verbatim', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const failure = 'cannot create snapshot \'testpool/media@anas-daily-x\': out of space'
+    const mock = armNotify({ zfs: { stderr: failure, exitCode: 1 } })
+    const run = await server.inject({ method: 'POST', url: '/v1/schedules/nightly-media/run', headers: JSON_HEADERS, payload: '{}' })
+    const done = await waitForJob(server, run.json().job.id)
+    assert.equal(done.status, 'failed')
+    const sent = notifications(mock)
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].severity, 'error')
+    assert.match(sent[0].title, /snapshot schedule 'Nightly media' FAILED/)
+    assert.match(sent[0].body, /Target:\s+ZFS dataset testpool\/media/)
+    assert.match(sent[0].body, /Cadence:\s+daily/)
+    assert.ok(sent[0].body.includes(failure))
+    // Snapshot events carry their own template + matcher type.
+    assert.ok(sent[0].perl.includes('anas-snapshot'))
+  })
+
+  it('a SUCCESSFUL fire is silent — healthy schedules never mail', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const mock = armNotify()
+    const run = await server.inject({ method: 'POST', url: '/v1/schedules/nightly-media/run', headers: JSON_HEADERS, payload: '{}' })
+    assert.equal((await waitForJob(server, run.json().job.id)).status, 'completed')
+    assert.deepEqual(notifications(mock), [])
+  })
+
+  it('a notification that cannot be delivered leaves the failed job exactly as it was', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const mock = armNotify({ zfs: { stderr: 'dataset is busy', exitCode: 1 }, perlExit: 255 })
+    const run = await server.inject({ method: 'POST', url: '/v1/schedules/nightly-media/run', headers: JSON_HEADERS, payload: '{}' })
+    const done = await waitForJob(server, run.json().job.id)
+    assert.equal(done.status, 'failed')
+    assert.match(done.error?.message ?? '', /dataset is busy/)
+    assert.equal(notifications(mock).length, 1)
+  })
 })

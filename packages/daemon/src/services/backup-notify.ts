@@ -4,6 +4,10 @@ import type { PveNotifySeverity } from './pve-notify.js'
 import { BACKUP_SKIPPED_OFF_WEEK } from '@anas/shared'
 import { pruneSummaryLine } from './backup-prune.js'
 import { ANAS_BACKUP_NOTIFY_TEMPLATE, pveNotify } from './pve-notify.js'
+import { formatElapsed } from './unattended-notify.js'
+
+/** Re-exported for the callers (and tests) that have always imported it here. */
+export { formatElapsed }
 
 /**
  * Backup run NOTIFICATIONS (story 16.12) — the run job tells the operator what
@@ -116,18 +120,6 @@ export function backupTargetLine(ctx: BackupNotifyContext): string {
   const datastore = ctx.repo?.datastore
   const namespace = ctx.namespace ?? ctx.task.namespace ?? ctx.repo?.namespace
   return `${repoName}${datastore ? `:${datastore}` : ''}${namespace ? ` / ${namespace}` : ''}`
-}
-
-/** A short elapsed-time rendering (`42s`, `7m 12s`) for the job's own clock. */
-export function formatElapsed(ms: number): string {
-  const total = Math.max(0, Math.round(ms / 1000))
-  if (total < 60)
-    return `${total}s`
-  const minutes = Math.floor(total / 60)
-  const seconds = total % 60
-  if (minutes < 60)
-    return `${minutes}m ${seconds}s`
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m ${seconds}s`
 }
 
 /**

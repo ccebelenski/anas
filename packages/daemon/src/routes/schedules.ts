@@ -6,6 +6,7 @@ import { ScheduleId, SnapshotSchedule } from '@anas/shared'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { readAhrPools } from '../services/ahr-topology.js'
+import { notifyScheduleRun } from '../services/snapshot-notify.js'
 import {
   collectScheduleStatuses,
   deriveScheduleDetail,
@@ -296,7 +297,24 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     const job = jobQueue.submit(
       'schedule.run',
       { ...identity, params: { schedule: id } },
-      async updateProgress => fireSchedule(schedule, updateProgress),
+      async (updateProgress) => {
+        // 9.4: this job is the ONE place every fire converges (the timer's
+        // runner and a UI Run Now both submit it), so it is also the one place
+        // a run notification is emitted. Failure-only, and best-effort by
+        // contract: notifyScheduleRun never throws, so a broken mail target
+        // cannot turn a good snapshot into a failed job.
+        const startedAt = Date.now()
+        try {
+          const result = await fireSchedule(schedule, updateProgress)
+          await notifyScheduleRun(executor, { schedule, result, elapsedMs: Date.now() - startedAt })
+          return result
+        }
+        catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          await notifyScheduleRun(executor, { schedule, error: message, elapsedMs: Date.now() - startedAt })
+          throw err
+        }
+      },
     )
     reply.code(202)
     return { job }

@@ -2,8 +2,10 @@ import type { ReplicatePlan, ReplicationTarget, Snapshot } from '@anas/shared'
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { ReplicationNotifyContext } from '../services/replication-notify.js'
 import type { ResolvedLocation, Transport } from '../services/replication-transport.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
+import { notifyReplicationRun } from '../services/replication-notify.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -337,137 +339,162 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       return { error: { code: 'VALIDATION_ERROR', message: `Cannot replicate '${source}' onto itself — choose a different target dataset` } }
     }
 
+    // 9.4 notification context. Built BEFORE the job so a run that dies early
+    // still names source → target (and the peer/remote it was going to); the
+    // run records the snapshot it settles on as soon as it knows it.
+    const notify: ReplicationNotifyContext = {
+      source,
+      target: targetFull,
+      ...(loc.isRemote && target.location ? { location: target.location } : {}),
+    }
+
     const job = jobQueue.submit(
       'zfs.replicate',
       { ...identity, params: { source, target: targetFull, ...(loc.isRemote ? { location: target.location } : {}) } },
       async (updateProgress) => {
-        // 1) Optional snapshot-first — create a fresh, sortable snapshot to send up to.
-        let snapName = snapshot
-        if (snapshotFirst) {
-          const name = defaultSnapName()
-          updateProgress(`zfs snapshot ${source}@${name}`)
-          const snapR = await executor.exec(ZFS, ['snapshot', `${source}@${name}`])
-          if (snapR.exitCode !== 0)
-            throw new Error(snapR.stderr.trim() || `zfs snapshot exited with code ${snapR.exitCode}`)
-          snapName = name
-        }
-
-        // 2) Recompute the plan INSIDE the job — state may have changed since planning.
-        const sourceSnaps = await listSnapshotsDetail(source)
-        if (sourceSnaps.length === 0)
-          throw new Error(`Dataset '${source}' has no snapshots — create a snapshot first`)
-        if (!snapName)
-          snapName = sourceSnaps[0].snapshotName
-        else if (!sourceSnaps.some(s => s.snapshotName === snapName))
-          throw new Error(`Snapshot '${source}@${snapName}' does not exist on source`)
-
-        const targetSnaps = await targetSnapshots(loc, target.pool, targetFull)
-        const d = discover(sourceSnaps, targetSnaps, snapName)
-        if (d.targetDiverged)
-          throw new Error(`Target '${targetFull}' has diverged — no common snapshot; remove the target dataset or replicate to a new path`)
-
-        const srcSnapFull = `${source}@${snapName}`
-
-        // 3) Estimate bytes (best-effort) for the job result — always a LOCAL dry-run.
-        const dryArgs = ['send', '-nvP']
-        if (d.mode === 'incremental' && d.baseSnapshot)
-          dryArgs.push('-i', `@${d.baseSnapshot}`)
-        dryArgs.push(srcSnapFull)
-        const dry = await executor.exec(ZFS, dryArgs)
-        const bytesEstimated = parseSendDryRun(dry.stdout)
-
-        // 4) Run the send|recv pipeline. readonly=on only on CREATE (full send);
-        //    an incremental recv into the existing (already-readonly) target
-        //    must not re-set the property, which -o would reject. For a remote/
-        //    peer target the recv side runs over ssh (`… | ssh <host> zfs recv`);
-        //    for a local target it is a second local `zfs` process.
-        const sendArgs = d.mode === 'incremental' && d.baseSnapshot
-          ? ['send', '-i', `@${d.baseSnapshot}`, srcSnapFull]
-          : ['send', srcSnapFull]
-        // `--` ends zfs option parsing so `targetFull` is always the positional
-        // filesystem, never mistaken for a flag (defence in depth; the schema
-        // already restricts the dataset charset).
-        const recvArgs = d.mode === 'full'
-          ? ['recv', '-o', 'readonly=on', '--', targetFull]
-          : ['recv', '--', targetFull]
-
-        let recvCmd = ZFS
-        let recvArgv = recvArgs
-        if (loc.isRemote) {
-          const argv = transport.buildSshArgv(loc.resolved, [ZFS_REMOTE, ...recvArgs])
-          recvCmd = argv[0]
-          recvArgv = argv.slice(1)
-        }
-
-        updateProgress(`zfs send ${srcSnapFull} | zfs recv ${targetFull}`)
-        const pipe = await executor.pipeline(ZFS, sendArgs, recvCmd, recvArgv)
-        if (pipe.leftExitCode !== 0 || pipe.rightExitCode !== 0) {
-          const detail = pipe.rightStderr.trim()
-            ? `recv: ${pipe.rightStderr.trim()}`
-            : pipe.leftStderr.trim()
-              ? `send: ${pipe.leftStderr.trim()}`
-              : `send exited ${pipe.leftExitCode}, recv exited ${pipe.rightExitCode}`
-          throw new Error(`Replication failed — ${detail}`)
-        }
-
-        // 5) Hold the newest replicated base on BOTH sides, then release the
-        //    older anas-repl holds so exactly the newest base stays pinned. The
-        //    SOURCE is always local; the TARGET hold/release goes over ssh for a
-        //    peer/remote. Fail-open: hiccups are warnings, not job failures.
-        const warnings: string[] = []
-        const targetSnapFull = `${targetFull}@${snapName}`
-
-        const srcHold = await executor.exec(ZFS, ['hold', HOLD_TAG, srcSnapFull])
-        if (srcHold.exitCode !== 0)
-          warnings.push(`Could not place ${HOLD_TAG} hold on ${srcSnapFull}: ${srcHold.stderr.trim() || `exit ${srcHold.exitCode}`}`)
-
-        const tgtHold = loc.isRemote
-          ? await transport.remoteHold(loc.resolved, targetSnapFull, HOLD_TAG)
-          : await executor.exec(ZFS, ['hold', HOLD_TAG, targetSnapFull])
-        if (tgtHold.exitCode !== 0)
-          warnings.push(`Could not place ${HOLD_TAG} hold on ${targetSnapFull}: ${tgtHold.stderr.trim() || `exit ${tgtHold.exitCode}`}`)
-
-        // Release stale holds on OLDER source snapshots (keep only snapName).
-        const releaseOlderLocal = async (datasetFull: string, snaps: Snapshot[]): Promise<void> => {
-          for (const s of snaps) {
-            if (s.snapshotName === snapName)
-              continue
-            const full = `${datasetFull}@${s.snapshotName}`
-            if (!(await heldTags(executor, full)).includes(HOLD_TAG))
-              continue
-            const rel = await executor.exec(ZFS, ['release', HOLD_TAG, full])
-            if (rel.exitCode !== 0)
-              warnings.push(`Could not release ${HOLD_TAG} hold on ${full}: ${rel.stderr.trim() || `exit ${rel.exitCode}`}`)
+        // 9.4: this job is the ONE place every replication converges (a task
+        // timer's runner and a UI replicate both submit it), so it is also the
+        // one place a run notification is emitted. Failure-only, and best-effort
+        // by contract: notifyReplicationRun never throws, so a broken mail
+        // target cannot turn a good replication into a failed job.
+        const startedAt = Date.now()
+        try {
+          // 1) Optional snapshot-first — create a fresh, sortable snapshot to send up to.
+          let snapName = snapshot
+          if (snapshotFirst) {
+            const name = defaultSnapName()
+            updateProgress(`zfs snapshot ${source}@${name}`)
+            const snapR = await executor.exec(ZFS, ['snapshot', `${source}@${name}`])
+            if (snapR.exitCode !== 0)
+              throw new Error(snapR.stderr.trim() || `zfs snapshot exited with code ${snapR.exitCode}`)
+            snapName = name
           }
-        }
-        await releaseOlderLocal(source, sourceSnaps)
 
-        // Release stale holds on OLDER target snapshots — local or over ssh.
-        if (loc.isRemote) {
-          const resolved = loc.resolved
-          for (const name of await transport.remoteSnapshotNames(resolved, targetFull)) {
-            if (name === snapName)
-              continue
-            const full = `${targetFull}@${name}`
-            if (!(await transport.remoteHeldTags(resolved, full)).includes(HOLD_TAG))
-              continue
-            const rel = await transport.remoteRelease(resolved, full, HOLD_TAG)
-            if (rel.exitCode !== 0)
-              warnings.push(`Could not release ${HOLD_TAG} hold on ${full}: ${rel.stderr.trim() || `exit ${rel.exitCode}`}`)
+          // 2) Recompute the plan INSIDE the job — state may have changed since planning.
+          const sourceSnaps = await listSnapshotsDetail(source)
+          if (sourceSnaps.length === 0)
+            throw new Error(`Dataset '${source}' has no snapshots — create a snapshot first`)
+          if (!snapName)
+            snapName = sourceSnaps[0].snapshotName
+          else if (!sourceSnaps.some(s => s.snapshotName === snapName))
+            throw new Error(`Snapshot '${source}@${snapName}' does not exist on source`)
+          notify.snapshot = snapName
+
+          const targetSnaps = await targetSnapshots(loc, target.pool, targetFull)
+          const d = discover(sourceSnaps, targetSnaps, snapName)
+          if (d.targetDiverged)
+            throw new Error(`Target '${targetFull}' has diverged — no common snapshot; remove the target dataset or replicate to a new path`)
+
+          const srcSnapFull = `${source}@${snapName}`
+
+          // 3) Estimate bytes (best-effort) for the job result — always a LOCAL dry-run.
+          const dryArgs = ['send', '-nvP']
+          if (d.mode === 'incremental' && d.baseSnapshot)
+            dryArgs.push('-i', `@${d.baseSnapshot}`)
+          dryArgs.push(srcSnapFull)
+          const dry = await executor.exec(ZFS, dryArgs)
+          const bytesEstimated = parseSendDryRun(dry.stdout)
+
+          // 4) Run the send|recv pipeline. readonly=on only on CREATE (full send);
+          //    an incremental recv into the existing (already-readonly) target
+          //    must not re-set the property, which -o would reject. For a remote/
+          //    peer target the recv side runs over ssh (`… | ssh <host> zfs recv`);
+          //    for a local target it is a second local `zfs` process.
+          const sendArgs = d.mode === 'incremental' && d.baseSnapshot
+            ? ['send', '-i', `@${d.baseSnapshot}`, srcSnapFull]
+            : ['send', srcSnapFull]
+          // `--` ends zfs option parsing so `targetFull` is always the positional
+          // filesystem, never mistaken for a flag (defence in depth; the schema
+          // already restricts the dataset charset).
+          const recvArgs = d.mode === 'full'
+            ? ['recv', '-o', 'readonly=on', '--', targetFull]
+            : ['recv', '--', targetFull]
+
+          let recvCmd = ZFS
+          let recvArgv = recvArgs
+          if (loc.isRemote) {
+            const argv = transport.buildSshArgv(loc.resolved, [ZFS_REMOTE, ...recvArgs])
+            recvCmd = argv[0]
+            recvArgv = argv.slice(1)
           }
-        }
-        else {
-          // Re-read the target's snapshots — the recv just added snapName there.
-          await releaseOlderLocal(targetFull, await listSnapshotsDetail(targetFull))
-        }
 
-        return {
-          mode: d.mode,
-          snapshot: snapName,
-          ...(d.baseSnapshot ? { baseSnapshot: d.baseSnapshot } : {}),
-          bytesEstimated,
-          target: targetFull,
-          ...(warnings.length ? { warnings } : {}),
+          updateProgress(`zfs send ${srcSnapFull} | zfs recv ${targetFull}`)
+          const pipe = await executor.pipeline(ZFS, sendArgs, recvCmd, recvArgv)
+          if (pipe.leftExitCode !== 0 || pipe.rightExitCode !== 0) {
+            const detail = pipe.rightStderr.trim()
+              ? `recv: ${pipe.rightStderr.trim()}`
+              : pipe.leftStderr.trim()
+                ? `send: ${pipe.leftStderr.trim()}`
+                : `send exited ${pipe.leftExitCode}, recv exited ${pipe.rightExitCode}`
+            throw new Error(`Replication failed — ${detail}`)
+          }
+
+          // 5) Hold the newest replicated base on BOTH sides, then release the
+          //    older anas-repl holds so exactly the newest base stays pinned. The
+          //    SOURCE is always local; the TARGET hold/release goes over ssh for a
+          //    peer/remote. Fail-open: hiccups are warnings, not job failures.
+          const warnings: string[] = []
+          const targetSnapFull = `${targetFull}@${snapName}`
+
+          const srcHold = await executor.exec(ZFS, ['hold', HOLD_TAG, srcSnapFull])
+          if (srcHold.exitCode !== 0)
+            warnings.push(`Could not place ${HOLD_TAG} hold on ${srcSnapFull}: ${srcHold.stderr.trim() || `exit ${srcHold.exitCode}`}`)
+
+          const tgtHold = loc.isRemote
+            ? await transport.remoteHold(loc.resolved, targetSnapFull, HOLD_TAG)
+            : await executor.exec(ZFS, ['hold', HOLD_TAG, targetSnapFull])
+          if (tgtHold.exitCode !== 0)
+            warnings.push(`Could not place ${HOLD_TAG} hold on ${targetSnapFull}: ${tgtHold.stderr.trim() || `exit ${tgtHold.exitCode}`}`)
+
+          // Release stale holds on OLDER source snapshots (keep only snapName).
+          const releaseOlderLocal = async (datasetFull: string, snaps: Snapshot[]): Promise<void> => {
+            for (const s of snaps) {
+              if (s.snapshotName === snapName)
+                continue
+              const full = `${datasetFull}@${s.snapshotName}`
+              if (!(await heldTags(executor, full)).includes(HOLD_TAG))
+                continue
+              const rel = await executor.exec(ZFS, ['release', HOLD_TAG, full])
+              if (rel.exitCode !== 0)
+                warnings.push(`Could not release ${HOLD_TAG} hold on ${full}: ${rel.stderr.trim() || `exit ${rel.exitCode}`}`)
+            }
+          }
+          await releaseOlderLocal(source, sourceSnaps)
+
+          // Release stale holds on OLDER target snapshots — local or over ssh.
+          if (loc.isRemote) {
+            const resolved = loc.resolved
+            for (const name of await transport.remoteSnapshotNames(resolved, targetFull)) {
+              if (name === snapName)
+                continue
+              const full = `${targetFull}@${name}`
+              if (!(await transport.remoteHeldTags(resolved, full)).includes(HOLD_TAG))
+                continue
+              const rel = await transport.remoteRelease(resolved, full, HOLD_TAG)
+              if (rel.exitCode !== 0)
+                warnings.push(`Could not release ${HOLD_TAG} hold on ${full}: ${rel.stderr.trim() || `exit ${rel.exitCode}`}`)
+            }
+          }
+          else {
+            // Re-read the target's snapshots — the recv just added snapName there.
+            await releaseOlderLocal(targetFull, await listSnapshotsDetail(targetFull))
+          }
+
+          const result = {
+            mode: d.mode,
+            snapshot: snapName,
+            ...(d.baseSnapshot ? { baseSnapshot: d.baseSnapshot } : {}),
+            bytesEstimated,
+            target: targetFull,
+            ...(warnings.length ? { warnings } : {}),
+          }
+          await notifyReplicationRun(executor, { ...notify, result, elapsedMs: Date.now() - startedAt })
+          return result
+        }
+        catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          await notifyReplicationRun(executor, { ...notify, error: message, elapsedMs: Date.now() - startedAt })
+          throw err
         }
       },
     )
