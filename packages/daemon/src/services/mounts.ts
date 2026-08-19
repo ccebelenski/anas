@@ -17,7 +17,7 @@ import type {
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import { lookup } from 'node:dns/promises'
-import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -817,6 +817,45 @@ export async function readCredentialsMeta(
 /** Remove a per-mount credentials file (best-effort). */
 export async function removeCredentialsFile(path: string): Promise<void> {
   await rm(path, { force: true })
+}
+
+/**
+ * Remove a deleted mount's OWN mountpoint directory (18.5 refinement, opt-in
+ * via `?removeMountpointDir=true`). The only path ever touched is the
+ * mountpoint the delete was addressed to.
+ *
+ * RMDIR SEMANTICS ONLY — `rmdir(2)`, never recursive, never `rm -rf`: the
+ * kernel itself refuses a directory with anything in it (ENOTEMPTY) and a
+ * directory that is still a mountpoint (EBUSY), so the destructive case cannot
+ * be reached even by mistake. `stillMounted` is the belt to that braces: a lazy
+ * unmount can leave the mount in the table until its holders let go, and a live
+ * mountpoint is never rmdir'd. Guest philosophy: ANAS tidies up the empty
+ * directory its own mount lifecycle created and nothing else.
+ *
+ * NEVER THROWS. A leftover directory is not worth failing the delete the user
+ * asked for, so every refusal comes back as a warning string naming why the
+ * directory stayed; `undefined` means it is gone (or was never there).
+ */
+export async function removeEmptyMountpointDir(
+  mountpoint: string,
+  stillMounted: boolean,
+): Promise<string | undefined> {
+  if (stillMounted)
+    return `'${mountpoint}' is still mounted — the directory was left in place.`
+  try {
+    await rmdir(mountpoint)
+    return undefined
+  }
+  catch (err) {
+    const e = err as NodeJS.ErrnoException
+    if (e.code === 'ENOENT')
+      return undefined // nothing there — the outcome the caller asked for
+    if (e.code === 'ENOTEMPTY' || e.code === 'EEXIST')
+      return `'${mountpoint}' is not empty — the directory was left in place (only an empty directory is removed).`
+    if (e.code === 'EBUSY')
+      return `'${mountpoint}' is still in use — the directory was left in place.`
+    return `Could not remove the directory '${mountpoint}' (${e.code ?? e.message}) — it was left in place.`
+  }
 }
 
 // ============================================================================

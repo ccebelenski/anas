@@ -4,7 +4,7 @@ import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { mkdir, readdir } from 'node:fs/promises'
-import { AbsolutePath, CreateMountRequest, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, UpdateMountRequest } from '@anas/shared'
+import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, UpdateMountRequest } from '@anas/shared'
 import { classifyKind } from '../parsers/findmnt.js'
 import { addMount, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
@@ -29,6 +29,7 @@ import {
   readFindmnt,
   readMdadmConfText,
   removeCredentialsFile,
+  removeEmptyMountpointDir,
   rotateCredentialsFile,
   runMountTest,
   writeCredentialsFile,
@@ -418,10 +419,19 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
   })
 
   // --- DELETE /mounts/:mountpoint — unmount + drop entry ------------------
-  server.delete<{ Params: { mountpoint: string } }>('/mounts/:mountpoint', async (request, reply) => {
+  server.delete<{ Params: { mountpoint: string }, Querystring: { removeMountpointDir?: string } }>('/mounts/:mountpoint', async (request, reply) => {
     const mp = parseMountpoint(request.params.mountpoint, reply)
     if (!mp)
       return
+
+    // Opt-in tidy-up (18.5 refinement): also rmdir the now-empty mountpoint
+    // directory. Absent ⇒ false ⇒ the pre-flag behaviour, byte for byte.
+    const query = DeleteMountQuery.safeParse(request.query ?? {})
+    if (!query.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid delete mount query: ${query.error.issues[0]?.message}` } }
+    }
+    const { removeMountpointDir } = query.data
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -460,8 +470,9 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
 
     const job = jobQueue.submit(
       'mount.remove',
-      { ...identity, params: { mountpoint: mp } },
+      { ...identity, params: { mountpoint: mp, ...(removeMountpointDir ? { removeMountpointDir } : {}) } },
       async (updateProgress) => {
+        const warnings: string[] = []
         if (mounted) {
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
@@ -478,7 +489,16 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           updateProgress('Removing credentials file')
           await removeCredentialsFile(credentialsFile)
         }
-        return { removed: mp }
+        if (removeMountpointDir) {
+          // rmdir semantics only, and only once the mount is really gone. A
+          // directory that will not go (not empty, still held) NEVER fails the
+          // delete the user asked for — it rides the result as a warning.
+          updateProgress(`Removing the mountpoint directory ${mp}`)
+          const left = await removeEmptyMountpointDir(mp, await isMounted(mp))
+          if (left)
+            warnings.push(left)
+        }
+        return { removed: mp, ...(warnings.length > 0 ? { warnings } : {}) }
       },
     )
 

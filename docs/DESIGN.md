@@ -234,7 +234,7 @@ Identity is the URL-encoded mountpoint (the NFS-exports precedent). Pure managem
 | `POST` | `/v1/mounts` | Create: write fstab (if persistent) + mount now | `202` with job |
 | `GET` | `/v1/mounts/:mountpoint` | Detail: fstab line as written, effective options, health, capacity | `200` |
 | `PUT` | `/v1/mounts/:mountpoint` | Edit options/credentials → fstab rewrite + remount | `202` with job |
-| `DELETE` | `/v1/mounts/:mountpoint` | Unmount + drop fstab entry; busy → 409 listing holding processes, force/lazy behind confirm | `202`/`409` |
+| `DELETE` | `/v1/mounts/:mountpoint` | Unmount + drop fstab entry; busy → 409 listing holding processes, force/lazy behind confirm. Optional `?removeMountpointDir=true` (default false — an older client is unchanged) also removes the mountpoint DIRECTORY with **rmdir semantics only**: empty, never recursive, never a still-mounted path. A dir that stayed rides the completed job's `warnings[]` — never a failure | `202`/`409` |
 | `POST` | `/v1/mounts/:mountpoint/state` | `{action: mount\|unmount\|disable\|enable}` — kernel-state and boot-config toggles WITHOUT deleting the entry. `unmount` = kernel now, returns at boot; `disable` = unmount + comment the fstab line as `#ANAS <original line verbatim>` (survives reboot as off, credentials kept, byte-identical restore on `enable`); busy-unmount → 409 as above. Added at Stage-2/3 reconciliation 2026-07-18 (operator: "deleting the mount entry and unmounting are two different things" + the `#ANAS` disable marker). Pools action-subresource idiom. | `202`/`409` |
 | `POST` | `/v1/mounts/test` | Preflight diagnosis: DNS → port (2049/445) → timeout-guarded probe mount → unreachable / auth / not-found / protocol / OK | `200` |
 

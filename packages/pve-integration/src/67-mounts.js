@@ -57,7 +57,10 @@
  *     (create-time only — the PUT does not act on it) and minus `credentials`
  *     unless the operator typed a new password ("unchanged" otherwise).
  *   DELETE /v1/mounts/:mountpoint → 202/409   (unmount + drop fstab; busy → 409
- *     with confirm code + holding-process warnings).
+ *     with confirm code + holding-process warnings). Optional
+ *     ?removeMountpointDir=true also removes the mountpoint DIRECTORY — rmdir
+ *     semantics only (empty, never recursive); a directory that stayed comes
+ *     back in the completed job's result.warnings, never as a failure.
  *
  *   The pure mount/unmount toggle that does NOT touch fstab uses the pools
  *   action-subresource idiom:
@@ -880,6 +883,55 @@
     }
 
     // ---- Remove (unmount + drop the fstab entry) ---------------------------
+    //
+    // The dialog also decides what happens to the mountpoint DIRECTORY: a plain
+    // umount leaves it behind, which is clutter, so the checkbox is CHECKED by
+    // default and the choice rides the DELETE as ?removeMountpointDir=true. The
+    // daemon removes it with rmdir semantics ONLY — never recursive — so only an
+    // empty directory the mount lifecycle itself created can go; a directory
+    // with anything in it stays and comes back as a warning on the completed
+    // job (a leftover directory never fails the removal).
+
+    // Fire the DELETE. `removeDir` appends the daemon's opt-in flag.
+    function runRemoveMount(view, node, mp, removeDir) {
+        var grid = mountsGridOf(view);
+        // Busy → 409 with holding processes; confirmAndRun surfaces them and
+        // resends with the confirm code (force/lazy behind the gate,
+        // daemon-side) — the flag rides the path, so it survives the resend.
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'del',
+            path: '/mounts/' + encMp(mp) + (removeDir ? '?removeMountpointDir=true' : ''),
+            view: grid,
+            confirmTitle: 'Remove busy mount',
+            confirmIntro: t('Processes are using this mount:'),
+            failTitle: 'Remove failed',
+            successMsg: t('Removed') + ' ' + mp,
+            onComplete: function (job) {
+                // The mount is gone either way; a directory that could not be
+                // removed (not empty, still held) rides the COMPLETED job as a
+                // warning — same shape as a backup run's warnings.
+                var warnings = [];
+                try {
+                    var result = (job && job.result) || {};
+                    if (isArray(result.warnings)) {
+                        warnings = result.warnings;
+                    }
+                } catch (eRes) {
+                    warnings = [];
+                }
+                if (warnings.length) {
+                    try {
+                        Ext.Msg.alert(t('Mount removed'), ANAS.warningsHtml(warnings));
+                    } catch (eMsg) {
+                        ANAS.warn(warnings.join(' '));
+                    }
+                }
+                loadMounts(view, node);
+                loadMountDetail(view, node, null);
+            },
+        });
+    }
 
     function removeMount(view, node, rec) {
         if (!rec) {
@@ -891,30 +943,53 @@
             ? t('Unmount and remove the /etc/fstab entry for')
             : t('Unmount');
         try {
-            Ext.Msg.confirm(t('Remove Mount'), intro + ' "' + enc(mp) + '"?',
-                function (btn) {
-                    if (btn !== 'yes') {
-                        return;
-                    }
-                    var grid = mountsGridOf(view);
-                    // Busy → 409 with holding processes; confirmAndRun surfaces
-                    // them and resends with the confirm code (force/lazy behind
-                    // the gate, daemon-side).
-                    ANAS.confirmAndRun({
-                        node: node,
-                        method: 'del',
-                        path: '/mounts/' + encMp(mp),
-                        view: grid,
-                        confirmTitle: 'Remove busy mount',
-                        confirmIntro: t('Processes are using this mount:'),
-                        failTitle: 'Remove failed',
-                        successMsg: t('Removed') + ' ' + mp,
-                        onComplete: function () {
-                            loadMounts(view, node);
-                            loadMountDetail(view, node, null);
-                        },
-                    });
-                });
+            var win = Ext.create('Ext.window.Window', {
+                title: t('Remove Mount'),
+                cls: 'anas-win-mount-remove',
+                modal: true,
+                width: 480,
+                bodyPadding: 12,
+                layout: 'anchor',
+                items: [{
+                    xtype: 'component',
+                    html: '<b>' + enc(intro + ' "' + mp + '"?') + '</b>',
+                    margin: '0 0 10 0',
+                }, {
+                    xtype: 'checkboxfield',
+                    itemId: 'removeDir',
+                    cls: 'anas-chk-mount-rmdir',
+                    hideLabel: true,
+                    checked: true,
+                    boxLabel: enc(t('Also remove the empty directory') + ' ' + mp),
+                }, {
+                    xtype: 'component',
+                    margin: '2 0 0 20',
+                    html: '<span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+                        + enc(t('Only an empty directory is removed. If anything is left in it, '
+                            + 'the directory stays and the removal still succeeds.'))
+                        + '</span>',
+                }],
+                defaultButton: 'anasMountRemoveCancel',
+                buttons: [{
+                    text: t('Cancel'),
+                    itemId: 'anasMountRemoveCancel',
+                    handler: function () { win.close(); },
+                }, {
+                    text: t('Remove'),
+                    cls: 'anas-btn-mount-remove-confirm',
+                    handler: function () {
+                        var removeDir = false;
+                        try {
+                            removeDir = win.down('#removeDir').getValue() === true;
+                        } catch (eChk) {
+                            removeDir = false;
+                        }
+                        win.close();
+                        runRemoveMount(view, node, mp, removeDir);
+                    },
+                }],
+            });
+            win.show();
         } catch (e) {
             ANAS.warn('mount remove confirm failed: ' + ANAS.errText(e));
         }

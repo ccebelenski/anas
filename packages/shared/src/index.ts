@@ -195,6 +195,7 @@ export {
 // Mount schemas (Epic 18 — external & local storage)
 export {
   CreateMountRequest,
+  DeleteMountQuery,
   MountCapacity,
   MountCharset,
   MountCifsCache,
@@ -214,6 +215,7 @@ export {
   MountNfsProto,
   MountNfsSec,
   MountOptions,
+  MountQueryFlag,
   MountRequestOptions,
   MountSec,
   MountState,

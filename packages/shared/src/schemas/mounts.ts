@@ -515,6 +515,34 @@ export const UpdateMountRequest = z.object({
 export type UpdateMountRequest = z.infer<typeof UpdateMountRequest>
 
 /**
+ * A boolean carried on a URL query string, where every value arrives as text:
+ * `?flag=true` / `?flag=1` mean true, `false`/`0` (and an absent field) mean
+ * false. A real boolean is accepted too, so the same schema validates a parsed
+ * body. Mirrors the `?cleanup=true` / `?recursive=true` vocabulary the other
+ * DELETE flags already use.
+ */
+export const MountQueryFlag = z
+  .union([z.boolean(), z.enum(['true', '1', 'false', '0'])])
+  .transform(v => v === true || v === 'true' || v === '1')
+
+/**
+ * Query params for DELETE /v1/mounts/:mountpoint (18.5 refinement).
+ *
+ * `removeMountpointDir` decides the one thing a plain `umount` leaves behind:
+ * the now-empty mountpoint directory. It defaults to FALSE so a client that
+ * knows nothing about the flag deletes exactly as before; the Mounts dialog
+ * opts IN (its checkbox is checked by default — a leftover directory is
+ * clutter). The daemon removes it with **rmdir semantics only** — never
+ * recursive — so only an empty directory the mount lifecycle itself owns can
+ * ever go, and a directory that is not empty (or still busy) is LEFT and named
+ * in the job result's warnings rather than failing the delete.
+ */
+export const DeleteMountQuery = z.object({
+  removeMountpointDir: MountQueryFlag.default(false),
+})
+export type DeleteMountQuery = z.infer<typeof DeleteMountQuery>
+
+/**
  * Mount / unmount without touching the fstab entry (POST
  * /v1/mounts/:mountpoint/state). A persisted mount can thus be temporarily
  * unmounted and remounted; unmount-busy → 409 confirm (force/lazy behind the gate).

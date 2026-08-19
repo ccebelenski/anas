@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { CreateMountRequest, UpdateMountRequest } from '@anas/shared'
+import { CreateMountRequest, DeleteMountQuery, UpdateMountRequest } from '@anas/shared'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
 import { JobQueue } from '../../jobs/queue.js'
@@ -309,6 +309,71 @@ describe('mount routes (Epic 18)', () => {
     it('rejects a PVE-owned mount', async () => {
       const res = await server!.inject({ method: 'DELETE', url: `/v1/mounts/${enc('/mnt/pve/anastest-nfs')}`, headers: IDENTITY_HEADERS })
       assert.equal(res.statusCode, 400)
+    })
+
+    // --- the mountpoint directory (18.5 refinement) ---
+    //
+    // A plain umount leaves the directory behind. The delete now takes an
+    // OPT-IN `?removeMountpointDir=true` that rmdirs it — empty only, never
+    // recursive — and a directory that will not go is a warning on a COMPLETED
+    // job, never a failure.
+
+    /** Create a persisted NFS mount at `mountpoint` (fstab entry + directory). */
+    async function createNfsMountAt(mountpoint: string): Promise<void> {
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ type: 'nfs', server: '127.0.0.1', remotePath: '/srv/nfs/export9', mountpoint }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    }
+
+    /** DELETE the mount, optionally with the flag, and wait for its job. */
+    async function deleteMount(mountpoint: string, query = ''): Promise<Job> {
+      const res = await server!.inject({ method: 'DELETE', url: `/v1/mounts/${enc(mountpoint)}${query}`, headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 202)
+      return waitForJob(server!, res.json().job.id)
+    }
+
+    it('?removeMountpointDir=true also removes the now-empty mountpoint directory', async () => {
+      const mp = join(dir, 'tidied')
+      await createNfsMountAt(mp)
+      const job = await deleteMount(mp, '?removeMountpointDir=true')
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.equal((job.result as { warnings?: string[] }).warnings, undefined)
+      await assert.rejects(stat(mp), 'the mountpoint directory is gone')
+    })
+
+    it('a NON-EMPTY directory is left in place: the delete still succeeds, carrying a warning', async () => {
+      const mp = join(dir, 'not-empty')
+      await createNfsMountAt(mp)
+      await writeFile(join(mp, 'local-data.txt'), 'left by something else\n')
+      const job = await deleteMount(mp, '?removeMountpointDir=1')
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const warnings = (job.result as { warnings?: string[] }).warnings ?? []
+      assert.equal(warnings.length, 1)
+      assert.match(warnings[0], /not empty/)
+      // The fstab entry still went — the leftover directory failed nothing.
+      assert.ok(!(await readFile(fstabPath, 'utf8')).includes(mp))
+      assert.deepEqual(await readdir(mp), ['local-data.txt'])
+    })
+
+    it('without the flag the directory is left exactly as before (wire-compatible default)', async () => {
+      const mp = join(dir, 'left-behind')
+      await createNfsMountAt(mp)
+      const job = await deleteMount(mp)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.equal((job.result as { warnings?: string[] }).warnings, undefined)
+      assert.ok((await stat(mp)).isDirectory(), 'the empty directory survives an unflagged delete')
+    })
+
+    it('rejects a flag value that is neither true nor false at the schema boundary', async () => {
+      const res = await server!.inject({ method: 'DELETE', url: `/v1/mounts/${enc('/mnt/anas-nfs')}?removeMountpointDir=maybe`, headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 400)
+      assert.match((res.json() as { error: { message: string } }).error.message, /delete mount query/)
     })
   })
 
@@ -659,5 +724,23 @@ describe('UpdateMountRequest — persistence is edit-time identity (issue #27)',
     // @ts-expect-error persistence is identity on an edit — not an updatable field.
     const body: UpdateMountRequest = { persistent: true }
     assert.deepEqual(body, { persistent: true })
+  })
+})
+
+describe('DeleteMountQuery — the mountpoint-directory flag (18.5 refinement)', () => {
+  it('defaults to false: an old client\'s delete keeps today\'s behaviour', () => {
+    assert.equal(DeleteMountQuery.parse({}).removeMountpointDir, false)
+  })
+
+  it('accepts the query-string vocabulary and a real boolean', () => {
+    for (const v of ['true', '1', true])
+      assert.equal(DeleteMountQuery.parse({ removeMountpointDir: v }).removeMountpointDir, true, `${String(v)}`)
+    for (const v of ['false', '0', false])
+      assert.equal(DeleteMountQuery.parse({ removeMountpointDir: v }).removeMountpointDir, false, `${String(v)}`)
+  })
+
+  it('rejects anything else rather than guessing', () => {
+    assert.equal(DeleteMountQuery.safeParse({ removeMountpointDir: 'yes' }).success, false)
+    assert.equal(DeleteMountQuery.safeParse({ removeMountpointDir: 2 }).success, false)
   })
 })

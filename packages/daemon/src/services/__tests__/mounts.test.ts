@@ -1,7 +1,7 @@
 import type { MountEntry, MountSummary } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -25,6 +25,7 @@ import {
   parseStatCapacity,
   probeInventoryHealth,
   redactFstabLine,
+  removeEmptyMountpointDir,
   writeCredentialsFile,
 } from '../mounts.js'
 
@@ -492,6 +493,49 @@ describe('inline-credential redaction (SECURITY — secret never crosses the bou
     assert.equal(hasInlineCredentials({ spec: '//h/s', mountpoint: '/m', fstype: 'cifs', options: { common: baseCommon(), passthrough: '' }, inlineCredentials: { password: 'x' }, dump: 0, pass: 0 }), true)
     assert.equal(hasInlineCredentials({ spec: '//h/s', mountpoint: '/m', fstype: 'cifs', options: { common: baseCommon(), passthrough: '' }, credentialsFile: '/etc/anas/creds/x.cred', dump: 0, pass: 0 }), false)
     assert.equal(hasInlineCredentials(undefined), false)
+  })
+})
+
+// --- Mountpoint-directory tidy-up (18.5 refinement) --------------------------
+//
+// rmdir SEMANTICS ONLY: an empty directory goes, anything else STAYS and comes
+// back as a warning — a leftover directory never fails the delete.
+
+describe('removeEmptyMountpointDir', () => {
+  let dir: string
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-mpdir-test-'))
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('removes an empty directory and reports no warning', async () => {
+    const mp = join(dir, 'empty')
+    await mkdir(mp)
+    assert.equal(await removeEmptyMountpointDir(mp, false), undefined)
+    await assert.rejects(stat(mp))
+  })
+
+  it('leaves a NON-EMPTY directory alone, warning why (never recursive)', async () => {
+    const mp = join(dir, 'full')
+    await mkdir(mp)
+    await writeFile(join(mp, 'local-data.txt'), 'not ours to delete\n')
+    const warning = await removeEmptyMountpointDir(mp, false)
+    assert.match(String(warning), /not empty/)
+    assert.deepEqual(await readdir(mp), ['local-data.txt'])
+  })
+
+  it('never touches a directory that is still a mountpoint', async () => {
+    const mp = join(dir, 'still-mounted')
+    await mkdir(mp)
+    const warning = await removeEmptyMountpointDir(mp, true)
+    assert.match(String(warning), /still mounted/)
+    assert.ok((await stat(mp)).isDirectory())
+  })
+
+  it('an absent directory is the asked-for outcome, not a warning', async () => {
+    assert.equal(await removeEmptyMountpointDir(join(dir, 'never-existed'), false), undefined)
   })
 })
 
