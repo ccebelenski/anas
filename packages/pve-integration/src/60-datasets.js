@@ -31,7 +31,9 @@
  * 'anas-btn-ds-share-smb' / 'anas-btn-ds-share-nfs', Epic 6/7 — opens the
  * Shares create flow pre-filled from the dataset), windows
  * 'anas-win-dataset-create' /
- * 'anas-win-dataset-detail'. The layered access editor (Epic 4.7.2) opens
+ * 'anas-win-dataset-detail'. PVE-managed rows carry cls 'anas-ds-pve-row' plus
+ * an 'anas-ds-pve-badge' PVE tag in the Name cell whose tooltip explains the
+ * hands-off rule (story 3.25). The layered access editor (Epic 4.7.2) opens
  * 'anas-win-dataset-access' — its full test-hook list is documented in a
  * comment above openPermissions.
  *
@@ -624,12 +626,13 @@
     // ANAS.shares exists by the time a user clicks. Fail-open: if it is somehow
     // absent, warn rather than throw.
 
-    function shareDatasetFromTree(node, tree, proto, rec) {
-        // `rec` is optional — the toolbar submenu relies on the tree selection,
-        // while the per-row action icon (Epic 15.4) passes the clicked record.
-        rec = rec || selectedRecord(tree);
+    function shareDatasetFromTree(node, tree, proto) {
+        // Driven by the toolbar's "Share…" submenu, so the tree selection is the
+        // subject (the per-row Share icon that used to pass a record is gone —
+        // toolbar-first, 2026-08-19).
+        var rec = selectedRecord(tree);
         // Story 3.26: the pool root shares too (isFsShareable). Story 3.25: a
-        // PVE-managed row is hands-off — soft-gate here as well as at the row.
+        // PVE-managed row is hands-off — soft-gate here as well as on the toolbar.
         if (!isFsShareable(rec)) {
             return;
         }
@@ -2919,10 +2922,17 @@
     //  The datasets view stays a native ExtJS treepanel (hierarchy, lazy
     //  loading, selection, keyboard nav, a11y come for free). The gfx VISUAL
     //  LANGUAGE lives inside it via column renderers that emit
-    //  ANAS.gfx markup, a pool-space donut hero above the tree, a pool-root row
-    //  band, and PERSISTENT per-row line-icon action buttons (never hover-
-    //  reveal). Everything is fail-open: a gfx gap degrades to the prior plain
+    //  ANAS.gfx markup, a pool-space donut hero above the tree, and a pool-root
+    //  row band. Everything is fail-open: a gfx gap degrades to the prior plain
     //  rendering and never breaks the tree or PVE.
+    //
+    //  Operator ruling 2026-08-19: the per-row line-icon ACTIONS COLUMN is gone.
+    //  Every icon was verb-for-verb redundant with the toolbar (which already
+    //  does the full PVE-managed gating in updateButtons), and this was the last
+    //  row-icon surface in the UI — toolbar-first everywhere, and the column's
+    //  width goes back to the Name column. The one thing the greyed icons
+    //  uniquely carried, the EXPLANATION of why a PVE-managed row is hands-off,
+    //  now lives in the PVE badge's tooltip in the Name cell.
     // ======================================================================
 
     function gfxReady() {
@@ -2937,28 +2947,36 @@
         }
     }
 
-    // Story 3.25: a soft-disabled (greyed) gfx control. Renders the same button
-    // as gfx.ctl but visually inert — the affordance stays VISIBLE with an
-    // explaining tooltip, so a future homelab opt-in can flip it back on. The
-    // click still routes through the cellclick delegate to dispatchRowCtl, which
-    // authoritatively no-ops on PVE-managed rows (never mutating PVE's pool).
-    function gatedCtl(name, tip, danger) {
+    // Story 3.25 — the hands-off EXPLANATION. Until 2026-08-19 this lived on the
+    // tooltips of the greyed per-row action icons; with that column gone (the
+    // toolbar gates the same verbs), the PVE badge's tooltip is the ONE place
+    // that tells the user WHY this row is untouchable. Strings are kept verbatim
+    // from the removed gated controls.
+    function pveHandsOffTip() {
+        return t('PVE-managed storage — hands-off in ANAS.') + ' '
+            + t("PVE manages this pool — ANAS won't add datasets here.") + ' '
+            + t('Detail stays available, read-only.');
+    }
+
+    // The PVE tag for a managed row's Name cell — the standout hands-off marker,
+    // mirroring the Mounts/Pools views' badge idiom (67-mounts.js renderMountpoint,
+    // 30-pools.js renderPoolName): gfx.badge when the foundation is there, a plain
+    // inline tag otherwise, and the explaining tooltip on both.
+    function pveBadgeHtml() {
+        var tip = pveHandsOffTip();
+        var badge = '';
         try {
-            if (!gfxReady() || typeof ANAS.gfx.ctl !== 'function') {
-                return '';
+            if (ANAS.gfx && typeof ANAS.gfx.badge === 'function') {
+                badge = ANAS.gfx.badge('PVE', { title: tip }) || '';
             }
-            var html = ANAS.gfx.ctl(name, tip, danger ? { danger: true } : undefined);
-            if (!html) {
-                return '';
-            }
-            // Mark the button gated + grey it inline (no gfx CSS is added here).
-            // Keep data-anas-ctl so cellclick still delegates it to the soft gate.
-            return html.replace('<button type="button" ',
-                '<button type="button" data-anas-gated="1" aria-disabled="true"'
-                + ' style="opacity:.38;cursor:not-allowed" ');
-        } catch (e) {
-            return '';
+        } catch (eB) {
+            badge = '';
         }
+        if (!badge) {
+            badge = '<span class="anas-gfx-badge" title="' + enc(tip) + '">PVE</span>';
+        }
+        return ' <span class="anas-ds-pve-badge" title="' + enc(tip) + '">'
+            + badge + '</span>';
     }
 
     // Name column: draw the gfx object icon (pool vs open/closed folder) ahead
@@ -2967,18 +2985,16 @@
     function renderName(v, meta, rec) {
         var label = enc(v == null ? '' : v);
         try {
-            if (!gfxReady() || typeof ANAS.gfx.objectIcon !== 'function') {
-                return label;
-            }
             var kind = rec.get('kind');
-            // Story 3.25: tag PVE-managed rows so they read as PVE's territory.
-            // Prominent 'PVE' badge on the pool root; a subtle one on each of its
-            // datasets. gfx.badge is optional — degrade to no badge if absent.
+            // Story 3.25: tag PVE-managed rows so they read as PVE's territory,
+            // the tooltip carrying the hands-off "why". The badge survives a
+            // missing gfx foundation (plain tag), so the explanation always shows.
             var pveBadge = '';
-            if (recPveManaged(rec) && typeof ANAS.gfx.badge === 'function') {
-                pveBadge = ' ' + ANAS.gfx.badge('PVE', {
-                    title: t('PVE-managed — VM/LXC storage'),
-                });
+            if ((kind === 'pool' || kind === 'dataset') && recPveManaged(rec)) {
+                pveBadge = pveBadgeHtml();
+            }
+            if (!gfxReady() || typeof ANAS.gfx.objectIcon !== 'function') {
+                return label + pveBadge;
             }
             if (kind === 'pool') {
                 return ANAS.gfx.objectIcon('pool', { title: t('Pool') })
@@ -3122,184 +3138,6 @@
             return parts.join(' ');
         } catch (e) {
             return '';
-        }
-    }
-
-    // Actions column: persistent (always-visible) gfx line-icon buttons, each
-    // with a tooltip. Pool root → add (new top-level dataset) + props (root
-    // filesystem). Dataset → add (child) + snapshot + share/lock (filesystems
-    // only) + props + trash. Wired to the existing handlers via the tree
-    // cellclick delegate below.
-    function renderDsActions(v, meta, rec) {
-        try {
-            if (!gfxReady() || typeof ANAS.gfx.ctl !== 'function') {
-                return '';
-            }
-            var kind = rec.get('kind');
-            if (kind !== 'pool' && kind !== 'dataset') {
-                return '';
-            }
-            // Pool roots are filesystems; datasets may be zvols (no share/lock).
-            var isFs = (kind === 'pool') ? true : (rec.get('type') === 'filesystem');
-
-            // ---- Thread 1 (story 3.25): PVE-managed pool + its datasets are
-            // hands-off. Every structural action is rendered but soft-disabled
-            // (greyed, explained); only a read-only "View properties" is live.
-            if (recPveManaged(rec)) {
-                var addTip = t("PVE manages this pool — ANAS won't add datasets here.");
-                var handsOff = t('PVE-managed storage — hands-off in ANAS.');
-                var g = gatedCtl('add', addTip)
-                    + gatedCtl('snapshot', handsOff);
-                if (isFs) {
-                    g += gatedCtl('share', handsOff)
-                        + gatedCtl('lock', handsOff);
-                }
-                // Live, read-only view of properties (opens the Detail window).
-                g += ANAS.gfx.ctl('props', t('View properties (PVE-managed, read-only)'));
-                // Destroy is offered (greyed) on child datasets only; the pool
-                // root never shows destroy here (that is a Pools-view op).
-                if (kind === 'dataset') {
-                    g += gatedCtl('trash', handsOff, true);
-                }
-                return g;
-            }
-
-            // ---- Thread 2 (story 3.26): ANAS-managed pool ROOT is first-class —
-            // add child, snapshot, share, permissions, editable props. NO destroy
-            // (destroying the root ≈ destroying the pool → Pools view).
-            if (kind === 'pool') {
-                var p = ANAS.gfx.ctl('add', t('New top-level dataset'))
-                    + ANAS.gfx.ctl('snapshot', t('Take snapshot'));
-                if (isFs) {
-                    p += ANAS.gfx.ctl('share', t('Share…'))
-                        + ANAS.gfx.ctl('lock', t('Permissions'));
-                }
-                p += ANAS.gfx.ctl('props', t('Edit root properties'));
-                return p;
-            }
-
-            // ---- ANAS-managed child dataset: the full action set.
-            var out = ANAS.gfx.ctl('add', t('New child dataset'))
-                + ANAS.gfx.ctl('snapshot', t('Take snapshot'));
-            if (isFs) {
-                out += ANAS.gfx.ctl('share', t('Share…'))
-                    + ANAS.gfx.ctl('lock', t('Permissions'));
-            }
-            out += ANAS.gfx.ctl('props', t('Edit properties'))
-                + ANAS.gfx.ctl('trash', t('Destroy…'), { danger: true });
-            return out;
-        } catch (e) {
-            return '';
-        }
-    }
-
-    // Small SMB/NFS chooser for the per-row Share icon (mirrors the toolbar
-    // submenu). Anchored at the click point; reuses shareDatasetFromTree.
-    function openShareMenu(node, tree, rec, ev) {
-        try {
-            var menu = Ext.create('Ext.menu.Menu', {
-                cls: 'anas-menu-ds-share',
-                items: [
-                    {
-                        text: t('SMB Share…'),
-                        cls: 'anas-btn-ds-share-smb',
-                        iconCls: 'fa fa-windows',
-                        handler: function () {
-                            shareDatasetFromTree(node, tree, 'smb', rec);
-                        },
-                    },
-                    {
-                        text: t('NFS Export…'),
-                        cls: 'anas-btn-ds-share-nfs',
-                        iconCls: 'fa fa-hdd-o',
-                        handler: function () {
-                            shareDatasetFromTree(node, tree, 'nfs', rec);
-                        },
-                    },
-                ],
-            });
-            if (ev && typeof ev.getXY === 'function') {
-                menu.showAt(ev.getXY());
-            } else {
-                menu.show();
-            }
-        } catch (e) {
-            ANAS.warn('dataset share menu failed: ' + ANAS.errText(e));
-        }
-    }
-
-    // Dispatch a per-row action-icon click to the EXISTING handler for the
-    // clicked record. `name` is the gfx control name (add|snapshot|share|lock|
-    // props|trash). Fail-open — an unknown name or a thrown handler is swallowed.
-    function dispatchRowCtl(node, tree, rec, name, ev) {
-        try {
-            if (!rec) {
-                return;
-            }
-            var kind = rec.get('kind');
-
-            // Thread 1 (story 3.25): PVE-managed rows are hands-off. The ONLY live
-            // action is the read-only "View properties" (Detail); every structural
-            // action is soft-gated here so even a stray click cannot mutate PVE's
-            // pool. This is the authoritative gate — the greying is cosmetic.
-            if (recPveManaged(rec)) {
-                if (name === 'props') {
-                    openDetail(node, rec);
-                } else if (name === 'add') {
-                    ANAS.toast(t("PVE manages this pool — ANAS won't add datasets here."));
-                } else {
-                    ANAS.toast(t('PVE-managed storage — this action is disabled in ANAS.'));
-                }
-                return;
-            }
-
-            if (name === 'add') {
-                // openCreate seeds the parent from the record: a dataset → child,
-                // the pool root → a new top-level dataset in that pool.
-                openCreate(node, tree, rec);
-                return;
-            }
-
-            // Thread 2 (story 3.26): the ANAS pool ROOT gets the full dataset
-            // action set (minus destroy). Its pool === fullName and its relative
-            // path is empty, which datasetPath/snapshotsPath already handle.
-            if (kind === 'pool') {
-                if (name === 'snapshot') {
-                    var ppool = rec.get('pool');
-                    var pfull = rec.get('fullName');
-                    openCreateSnapshot(node, ppool, pfull, function () {
-                        refreshTreeSnapshots(node, tree, ppool, pfull, true);
-                    });
-                } else if (name === 'share') {
-                    openShareMenu(node, tree, rec, ev);
-                } else if (name === 'lock') {
-                    openPermissions(node, tree, rec);
-                } else if (name === 'props') {
-                    openEdit(node, tree, rec);
-                }
-                return;
-            }
-
-            if (kind !== 'dataset') {
-                return;
-            }
-            if (name === 'snapshot') {
-                var pool = rec.get('pool');
-                var fullName = rec.get('fullName');
-                openCreateSnapshot(node, pool, fullName, function () {
-                    refreshTreeSnapshots(node, tree, pool, fullName, true);
-                });
-            } else if (name === 'share') {
-                openShareMenu(node, tree, rec, ev);
-            } else if (name === 'lock') {
-                openPermissions(node, tree, rec);
-            } else if (name === 'props') {
-                openEdit(node, tree, rec);
-            } else if (name === 'trash') {
-                openDestroy(node, tree, rec);
-            }
-        } catch (e) {
-            ANAS.warn('dataset row action failed: ' + ANAS.errText(e));
         }
     }
 
@@ -3459,11 +3297,10 @@
             // Suppress the default tree node glyph for pool/dataset rows so only
             // the gfx object icon shows (snapshot rows keep their fa icon).
             css.push('.anas-grid-datasets .anas-tree-obj{display:none!important}');
-            // Actions cell: keep the persistent buttons tight and right-aligned.
-            css.push('.anas-grid-datasets .anas-ds-actions-cell .x-grid-cell-inner{'
-                + 'padding-top:2px;padding-bottom:2px;white-space:nowrap;text-align:right}');
-            css.push('.anas-grid-datasets .anas-ds-actions-cell .anas-gfx-ctl{'
-                + 'vertical-align:middle}');
+            // PVE hands-off tag in the Name cell (story 3.25) — sits beside the
+            // name without stretching the row.
+            css.push('.anas-grid-datasets .anas-ds-pve-badge{vertical-align:middle;'
+                + 'cursor:help}');
             // Space-of-pool cell lets the gfx bar fill the column width.
             css.push('.anas-grid-datasets .anas-ds-space-cell .x-grid-cell-inner{'
                 + 'padding-top:4px;padding-bottom:4px}');
@@ -3760,18 +3597,6 @@
                         align: 'right',
                         renderer: renderQuota,
                     },
-                    {
-                        // Epic 15.4: persistent per-row action icons (add /
-                        // snapshot / share / lock / props / trash). Wired to the
-                        // existing handlers via the cellclick delegate below.
-                        text: t('Actions'),
-                        dataIndex: 'kind',
-                        width: 210,
-                        sortable: false,
-                        menuDisabled: true,
-                        tdCls: 'anas-ds-actions-cell',
-                        renderer: renderDsActions,
-                    },
                 ],
                 tbar: tbar,
                 // Tag pool-root / snapshot / overflow rows for styling + hooks.
@@ -3822,26 +3647,6 @@
                             }
                         } catch (e) {
                             // hero is optional
-                        }
-                    },
-                    // Persistent per-row action icons: delegate a click on any
-                    // gfx control button to its existing handler (Epic 15.4).
-                    cellclick: function (view, td, cellIndex, record, tr, rowIndex, e) {
-                        try {
-                            var target = e && e.target;
-                            var btn = (target && target.closest)
-                                ? target.closest('[data-anas-ctl]') : null;
-                            if (!btn) {
-                                return;
-                            }
-                            if (e && e.stopEvent) {
-                                e.stopEvent();
-                            }
-                            var name = btn.getAttribute('data-anas-ctl');
-                            var tree = view.up('treepanel') || view;
-                            dispatchRowCtl(node, tree, record, name, e);
-                        } catch (err) {
-                            ANAS.warn('dataset cellclick failed: ' + ANAS.errText(err));
                         }
                     },
                     // Lazy-load a dataset's snapshots the first time it expands.

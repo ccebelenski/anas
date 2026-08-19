@@ -13,12 +13,16 @@ import { poolExists } from './fixtures/stunt-node'
  *   - '.anas-grid-datasets' still the native tree (Epic 4 hook, unchanged)
  *   - Space-of-pool bars      '.anas-gfx-bar'
  *   - Property chips          '.anas-gfx-chip'
- *   - Persistent action icons '.anas-gfx-ctl' (each an always-visible <button>)
  *   - Pool-root row band      '.anas-ds-pool-row'
  *   - Donut hero              '.anas-ds-hero' + '.anas-gfx-donut'
  *
+ * Operator ruling 2026-08-19: the per-row line-icon ACTIONS COLUMN is gone —
+ * every icon duplicated a toolbar button (which already gates PVE-managed rows),
+ * so the tree is toolbar-first like every other view. These specs now assert its
+ * ABSENCE alongside the surviving gfx enrichment.
+ *
  * Read-only: no mutations here (the base spec + api specs cover the flows the
- * icons dispatch to). ExtJS boot is slow → generous timeouts.
+ * toolbar dispatches to). ExtJS boot is slow → generous timeouts.
  */
 
 test.beforeEach(async () => {
@@ -41,13 +45,13 @@ test.describe('ANAS Datasets enriched tree — Epic 15.4 gfx retrofit', () => {
     // Enriched columns render gfx markup inside the tree rows.
     await expect(grid.locator('.anas-gfx-bar').first()).toBeVisible({ timeout: 45_000 })
 
-    // Persistent (always-visible) per-row action icons — NOT hover-reveal.
-    const ctls = grid.locator('.anas-gfx-ctl')
-    await expect(ctls.first()).toBeVisible({ timeout: 45_000 })
-    // The pool root exposes an "add" (new top-level dataset) control.
-    await expect(grid.locator('.anas-gfx-ctl-add').first()).toBeVisible()
-    // Each action icon carries a tooltip (nothing is unlabelled).
-    await expect(ctls.first()).toHaveAttribute('title', /.+/)
+    // No per-row action icons anywhere in the tree — the verbs live on the
+    // toolbar only (operator ruling 2026-08-19), and the reclaimed width goes
+    // back to the flexed Name column.
+    await expect(grid.locator('.anas-gfx-ctl')).toHaveCount(0)
+    await expect(grid.locator('.anas-ds-actions-cell')).toHaveCount(0)
+    // The toolbar carries those verbs instead.
+    await expect(page.locator('.anas-btn-ds-create')).toBeVisible()
   })
 
   test('the pool root has a distinct row band and a pool/folder object icon', async ({ page }) => {

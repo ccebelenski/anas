@@ -56,11 +56,21 @@ test.describe('ANAS PVE-managed pools (stunt node)', () => {
     const grid = page.locator('.anas-grid-datasets')
     await expect(grid).toBeVisible({ timeout: 45_000 })
 
-    // datapool's row is PVE-banded and shows at least one gated (soft-disabled)
-    // action control — the "+ create child" the user specifically called out.
+    // datapool's row is PVE-banded and carries the PVE badge whose tooltip
+    // explains the hands-off rule. (Operator ruling 2026-08-19: the row-icon
+    // Actions column is gone — the badge tooltip is now the only home of that
+    // explanation, and the toolbar does the gating.)
     const pveRow = grid.locator('.anas-ds-pve-row', { hasText: 'datapool' }).first()
     await expect(pveRow).toBeVisible({ timeout: 20_000 })
-    await expect(pveRow.locator('[data-anas-gated]').first()).toBeVisible({ timeout: 20_000 })
+    const badge = pveRow.locator('.anas-ds-pve-badge').first()
+    await expect(badge).toBeVisible({ timeout: 20_000 })
+    await expect(badge).toHaveAttribute('title', /hands-off/i)
+
+    // Selecting it gates the structural toolbar actions; read-only Detail stays.
+    await pveRow.click()
+    await expect(page.locator('.anas-btn-ds-create')).toHaveClass(DISABLED, { timeout: 20_000 })
+    await expect(page.locator('.anas-btn-ds-destroy')).toHaveClass(DISABLED)
+    await expect(page.locator('.anas-btn-ds-detail')).not.toHaveClass(DISABLED)
 
     // testpool (ANAS-managed) is never PVE-banded — the marker is specific.
     await expect(grid.locator('.anas-ds-pve-row', { hasText: 'testpool' })).toHaveCount(0)
