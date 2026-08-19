@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { lastScrubFromScan, parseLastScrubs, parseZpoolStatus } from '../zpool-status.js'
+import { lastScrubFromScan, parseLastScrubs, parseScrubScans, parseZpoolStatus, scrubRunningFromScan } from '../zpool-status.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/zfs')
@@ -349,5 +349,93 @@ describe('lastScrubFromScan — the completed-pass verdict', () => {
   it('parseLastScrubs keys every pool in one status read', () => {
     const byPool = parseLastScrubs(loadFixture('zpool-status-scrub-verdicts.json'))
     assert.deepEqual([...byPool.keys()], ['repairpool', 'cancelpool'])
+  })
+})
+
+// The OTHER half of the same record (Epic 17 stage 6): while a pass runs there
+// is no verdict yet, and the Scrubs screen shows the progress instead of going
+// quiet. Same scan record, same single status read — nothing new is executed.
+describe('scrubRunningFromScan — the pass in flight', () => {
+  it('a running scrub is reported with its function and percent', () => {
+    const [pool] = parseZpoolStatus(loadFixture('zpool-status-scrubbing.json'))
+    const running = scrubRunningFromScan(pool.scan)
+    assert.ok(running)
+    assert.equal(running.function, 'SCRUB')
+    // examined == to_examine in this capture (a tiny pool caught at the end).
+    assert.equal(running.percent, 100)
+    // ZFS's scan record carries NO rate and NO time-to-go — we do not invent them.
+    assert.equal(running.speedBytesSec, undefined)
+    assert.equal(running.etaSeconds, undefined)
+  })
+
+  it('a mid-pass scan reports the derived percentage', () => {
+    const running = scrubRunningFromScan({
+      function: 'SCRUB',
+      state: 'SCANNING',
+      startedAt: '2026-08-03T02:00:00.000Z',
+      finishedAt: null,
+      totalBytes: 1000,
+      examinedBytes: 432,
+      processedBytes: 0,
+      errors: 0,
+      percentComplete: 43.2,
+    })
+    assert.deepEqual(running, { function: 'SCRUB', percent: 43.2 })
+  })
+
+  it('a running RESILVER is named as one (it is not a scrub, and cannot be stopped)', () => {
+    const running = scrubRunningFromScan({
+      function: 'RESILVER',
+      state: 'SCANNING',
+      startedAt: '2026-08-03T02:00:00.000Z',
+      finishedAt: null,
+      totalBytes: 1000,
+      examinedBytes: 100,
+      processedBytes: 0,
+      errors: 0,
+      percentComplete: 10,
+    })
+    assert.equal(running?.function, 'RESILVER')
+  })
+
+  it('nothing to examine → no percent at all (0% would read as a stalled pass)', () => {
+    const running = scrubRunningFromScan({
+      function: 'SCRUB',
+      state: 'SCANNING',
+      startedAt: '2026-08-03T02:00:00.000Z',
+      finishedAt: null,
+      totalBytes: 0,
+      examinedBytes: 0,
+      processedBytes: 0,
+      errors: 0,
+      percentComplete: 0,
+    })
+    assert.deepEqual(running, { function: 'SCRUB' })
+  })
+
+  it('a finished pass and a pool with no scan record are both "not running"', () => {
+    const [finished] = parseZpoolStatus(loadFixture('zpool-status-online.json'))
+    assert.equal(scrubRunningFromScan(finished.scan), null)
+    const [fresh] = parseZpoolStatus(loadFixture('zpool-status-online-fresh.json'))
+    assert.equal(scrubRunningFromScan(fresh.scan), null)
+  })
+
+  it('parseScrubScans reads BOTH halves per pool from one status read', () => {
+    // Running: progress, and deliberately no verdict (the previous pass's
+    // record is already overwritten — ZFS keeps exactly one).
+    const scanning = parseScrubScans(loadFixture('zpool-status-scrubbing.json')).get('testpool-rz')
+    assert.equal(scanning?.running?.function, 'SCRUB')
+    assert.equal(scanning?.lastScrub, null)
+
+    // Idle: the stage-5 verdict, untouched, and nothing running.
+    const verdicts = parseScrubScans(loadFixture('zpool-status-scrub-verdicts.json'))
+    assert.deepEqual([...verdicts.keys()], ['repairpool', 'cancelpool'])
+    assert.equal(verdicts.get('repairpool')?.running, null)
+    assert.equal(verdicts.get('repairpool')?.lastScrub?.errors, 2)
+    assert.equal(verdicts.get('cancelpool')?.lastScrub?.state, 'CANCELED')
+
+    // Never scrubbed, never scrubbing: both halves honestly absent.
+    const fresh = parseScrubScans(loadFixture('zpool-status-online-fresh.json'))
+    assert.deepEqual([...fresh.values()], [{ lastScrub: null, running: null }])
   })
 })

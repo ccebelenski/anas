@@ -300,6 +300,43 @@ export const LastScrub = z.object({
 export type LastScrub = z.infer<typeof LastScrub>
 
 /**
+ * A verify pass RUNNING RIGHT NOW on a pool — the other half of the Scrubs
+ * screen's "Last scrub" cell (stage 6). While a pass runs there is no verdict
+ * yet (ZFS keeps ONE scan record per pool and overwrites the previous one), so
+ * the cell would otherwise go quiet exactly when something is happening.
+ *
+ * Every field is OPTIONAL because the two filesystems record DIFFERENT things,
+ * and we report only what each actually records (Principle 11 — no fabricated
+ * numbers, no derived-from-wall-clock estimates dressed up as measurements):
+ *
+ *   | field         | ZFS (`zpool status -jv` scan_stats)      | AHR (/proc/mdstat) |
+ *   |---------------|------------------------------------------|--------------------|
+ *   | function      | SCRUB or RESILVER (the record names it)   | absent (md's check is not a ZFS scan) |
+ *   | percent       | examined ÷ to_examine                     | the progress line's `check = N%` |
+ *   | speedBytesSec | ABSENT — scan_stats has no rate field      | `speed=NK/sec` |
+ *   | etaSeconds    | ABSENT — scan_stats has no ETA field       | `finish=N.Nmin` |
+ *
+ * ZFS's own CLI prints a rate and a time-to-go, but it DERIVES them at print
+ * time from the pass counters and the current clock; the record itself carries
+ * neither, so ANAS does not manufacture them here. AHR's figures come from the
+ * band arrays currently checking: `percent` is the LEAST-ADVANCED of them (the
+ * pool's check is not finished until the last band is), `speedBytesSec` their
+ * combined throughput, and `etaSeconds` the longest of theirs — a FLOOR, not a
+ * promise, since bands still queued behind them are not in the figure.
+ */
+export const ScrubRunning = z.object({
+  /** Which pass is running, where the filesystem names it (ZFS only). */
+  function: ScanFunction.optional(),
+  /** Progress 0–100, when the filesystem reports enough to compute it. */
+  percent: z.number().min(0).max(100).optional(),
+  /** Current throughput in bytes/second, when reported. */
+  speedBytesSec: z.number().nonnegative().optional(),
+  /** Estimated seconds remaining, when reported. */
+  etaSeconds: z.number().nonnegative().optional(),
+})
+export type ScrubRunning = z.infer<typeof ScrubRunning>
+
+/**
  * A pool's periodic-scrub state, uniform across ZFS and AHR. `cadence` is
  * `monthly` for both (ZFS: PVE's 2nd-Sunday cron; AHR: mdcheck's 1st-Sunday
  * timer) — custom cadences are a later refinement (SCHEDULES-DESIGN §Scrub).
@@ -316,6 +353,13 @@ export const PeriodicScrubState = z.object({
    * a ZFS pool never scrubbed, and EVERY AHR pool (see {@link LastScrub}).
    */
   lastScrub: LastScrub.nullable(),
+  /**
+   * The pass running RIGHT NOW, when one is (stage 6). ABSENT when the pool is
+   * idle — and absent from an older daemon entirely, which is why it is
+   * optional: a new screen against an old daemon renders exactly the verdict-
+   * only cell it renders today (the additive-field version-skew rule).
+   */
+  running: ScrubRunning.optional(),
 })
 export type PeriodicScrubState = z.infer<typeof PeriodicScrubState>
 

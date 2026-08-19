@@ -1,13 +1,42 @@
 import type { Job, PeriodicScrubState } from '@anas/shared'
-import type { MockExecutor } from '../../executor/mock.js'
+import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import Fastify from 'fastify'
+import { MockExecutor } from '../../executor/mock.js'
+import { mockFixtures } from '../../fixtures/loader.js'
+import { JobQueue } from '../../jobs/queue.js'
+import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
+import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
+import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { createServer } from '../../server.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
+import { scrubRoutes } from '../scrub.js'
 
 const ZPOOL = '/usr/sbin/zpool'
 const ZFS = '/usr/sbin/zfs'
 const SYSTEMCTL = '/usr/bin/systemctl'
+
+/**
+ * The dev-mock AHR topology (the stage-0 `ahr0` pool) on a fresh executor, with
+ * the /proc/mdstat read swappable — the mock server registers the IDLE capture
+ * and first fixture wins, so a running-check test has to bring its own read
+ * layer. Same fixture loader, same registration idiom as the AHR route tests.
+ */
+function mockAhrTopologyExecutor(executor: MockExecutor, mdstat: ExecResult): MockExecutor {
+  executor.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mdstat })
+  executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+  executor.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+  executor.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: mockFixtures.ahrLsblk() })
+  executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+  executor.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+  executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+  executor.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: mockFixtures.ahrFindmnt() })
+  executor.addFixture({ command: '/usr/bin/btrfs', args: btrfsUsageArgs('/mnt/anas-ahr/ahr0'), result: mockFixtures.ahrBtrfsUsage() })
+  return executor
+}
 
 const IDENTITY = {
   'x-anas-user': 'root@pam',
@@ -49,6 +78,36 @@ function zpoolStatusJson(): string {
         error_count: '0',
       },
       // Never scrubbed — no scan record at all.
+      rpool: { name: 'rpool', state: 'ONLINE', pool_guid: '2', vdevs: {}, error_count: '0' },
+    },
+  })
+}
+
+/**
+ * The same read with a scrub IN PROGRESS on `tank` (`state: SCANNING`, half the
+ * pool examined) and nothing at all on `rpool` — the running/idle pair the
+ * stage-6 Last scrub cell has to tell apart.
+ */
+function zpoolStatusScanningJson(): string {
+  return JSON.stringify({
+    pools: {
+      tank: {
+        name: 'tank',
+        state: 'ONLINE',
+        pool_guid: '1',
+        scan_stats: {
+          function: 'SCRUB',
+          state: 'SCANNING',
+          start_time: 'Sun Aug  3 02:00:00 UTC 2026',
+          end_time: '-',
+          to_examine: '8.20T',
+          examined: '4.10T',
+          processed: '0B',
+          errors: '0',
+        },
+        vdevs: {},
+        error_count: '0',
+      },
       rpool: { name: 'rpool', state: 'ONLINE', pool_guid: '2', vdevs: {}, error_count: '0' },
     },
   })
@@ -118,14 +177,31 @@ describe('periodic scrub routes — ZFS property (Epic 17.5)', () => {
     assert.equal(byPool.get('rpool')?.lastScrub, null)
   })
 
-  it('GET /scrub still answers when the status read fails (last scrub = no record)', async () => {
+  it('GET /scrub carries a RUNNING pass in place of a verdict (stage 6)', async () => {
+    mockOf(server).addFixture({
+      command: ZPOOL,
+      args: ['status', '-jv'],
+      result: { stdout: zpoolStatusScanningJson(), stderr: '', exitCode: 0 },
+    })
+    const res = await server.inject({ method: 'GET', url: '/v1/scrub' })
+    const byPool = new Map((res.json() as { data: PeriodicScrubState[] }).data.map(s => [s.target.pool, s]))
+    assert.deepEqual(byPool.get('tank')?.running, { function: 'SCRUB', percent: 50 })
+    // ZFS keeps ONE scan record per pool: while it holds progress there is no
+    // verdict to report, and we report none rather than a stale one.
+    assert.equal(byPool.get('tank')?.lastScrub, null)
+    // An idle pool carries no `running` key at all.
+    assert.equal('running' in (byPool.get('rpool') as object), false)
+  })
+
+  it('GET /scrub still answers when the status read fails (no verdict, nothing running)', async () => {
     // `zpool status -jv` is unmocked here → exit 127. The uniform state must
-    // still come back, with the verdict honestly absent.
+    // still come back, with both scan-derived halves honestly absent.
     const res = await server.inject({ method: 'GET', url: '/v1/scrub' })
     assert.equal(res.statusCode, 200)
     const states = (res.json() as { data: PeriodicScrubState[] }).data
     assert.equal(states.length, 2)
     assert.ok(states.every(s => s.lastScrub === null))
+    assert.ok(states.every(s => !('running' in s)))
   })
 
   it('PUT /scrub/zfs/:pool flips the property (202 job)', async () => {
@@ -187,5 +263,29 @@ describe('periodic scrub routes — AHR mdcheck timers (Epic 17.5)', () => {
     assert.equal(done.status, 'completed', JSON.stringify(done.error))
     const call = mockOf(server).calls.find(c => c.args[0] === 'enable' && c.args.includes('mdcheck_start.timer'))
     assert.ok(call && call.args.includes('mdcheck_continue.timer'))
+  })
+
+  it('GET /scrub reports a RUNNING md check on the AHR pool (stage 6)', async () => {
+    // A bare server so the mdstat fixture can be the mid-`check` one (the mock
+    // server's default replays the idle capture, and first fixture wins).
+    const executor = mockAhrTopologyExecutor(new MockExecutor(), mockFixtures.ahrMdstatCheck())
+    executor.addFixture({ command: SYSTEMCTL, result: { stdout: 'enabled\n', stderr: '', exitCode: 0 } })
+    const bare = Fastify({ logger: false })
+    await bare.register(scrubRoutes, { prefix: '/v1', executor, jobQueue: new JobQueue() })
+
+    const res = await bare.inject({ method: 'GET', url: '/v1/scrub' })
+    assert.equal(res.statusCode, 200)
+    const ahr = (res.json() as { data: PeriodicScrubState[] }).data.find(s => s.target.kind === 'ahr')
+    assert.ok(ahr, 'expected an AHR scrub state')
+    // Least-advanced band (r1 at 12.4%), both bands' throughput summed, the
+    // longer of the two ETAs (1.2min) — see `ahrScrubRunning`.
+    assert.deepEqual(ahr.running, {
+      percent: 12.4,
+      speedBytesSec: (64800 + 53973) * 1024,
+      etaSeconds: 72,
+    })
+    // Still no COMPLETION record — live progress does not create one.
+    assert.equal(ahr.lastScrub, null)
+    await bare.close()
   })
 })

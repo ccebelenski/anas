@@ -258,6 +258,7 @@ export {
   ScheduleId,
   ScheduleRunResult,
   ScrubMechanism,
+  ScrubRunning,
   ScrubTarget,
   ScrubToggleRequest,
   SnapshotCadence,

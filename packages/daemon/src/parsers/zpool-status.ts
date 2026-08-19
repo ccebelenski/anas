@@ -3,7 +3,7 @@
  * Extracts: pool state, vdev topology, scan status, health messages.
  */
 
-import type { LastScrub, PoolDisk, PoolHealthMessage, PoolState, ScanStatus, Vdev, VdevGroup, VdevRole, VdevState, VdevType } from '@anas/shared'
+import type { LastScrub, PoolDisk, PoolHealthMessage, PoolState, ScanStatus, ScrubRunning, Vdev, VdevGroup, VdevRole, VdevState, VdevType } from '@anas/shared'
 import { parseHumanSize, parseIntOrZero, parseZfsDate, parseZfsJson } from './utils.js'
 
 /** Raw ZFS JSON types (what `zpool status -j` actually returns) */
@@ -444,9 +444,53 @@ export function lastScrubFromScan(scan: ScanStatus | null): LastScrub | null {
 }
 
 /**
+ * The pass RUNNING RIGHT NOW on a pool, from the SAME `scan_stats` record
+ * {@link lastScrubFromScan} reads the verdict out of — while `state` is
+ * `SCANNING` that record is progress, not a verdict, and this is its other
+ * half (stage 6). Null when nothing is running.
+ *
+ * What the record actually carries (ground truth, `zpool status -jv`):
+ * `function`, `state`, `start_time`, `end_time`, `to_examine`, `examined`,
+ * `skipped`, `processed`, `errors`, `bytes_per_scan`, `pass_start`,
+ * `scrub_pause`, `scrub_spent_paused`, `issued_bytes_per_scan`, `issued`.
+ * There is NO rate field and NO time-to-go field — ZFS's CLI derives the
+ * "at 1.2G/s, 3h to go" text at print time from the counters and the current
+ * clock. We therefore report `percent` only and leave speed/ETA absent rather
+ * than manufacture a second, clock-dependent estimate (Principle 11).
+ *
+ * `percent` is omitted when ZFS reports nothing to examine: the 0 that
+ * {@link ScanStatus.percentComplete} substitutes there is a placeholder, not a
+ * measurement, and "0%" on screen would read as a stalled pass.
+ */
+export function scrubRunningFromScan(scan: ScanStatus | null): ScrubRunning | null {
+  if (!scan || scan.state !== 'SCANNING')
+    return null
+  return {
+    function: scan.function,
+    ...(scan.totalBytes > 0 && { percent: scan.percentComplete }),
+  }
+}
+
+/**
  * Pool name → its last completed verify pass (null when the pool records none),
  * for every pool in one `zpool status -jv` read.
  */
 export function parseLastScrubs(json: string | ZpoolStatusOutput): Map<string, LastScrub | null> {
   return new Map(parseZpoolStatus(json).map(pool => [pool.name, lastScrubFromScan(pool.scan)]))
+}
+
+/**
+ * Pool name → BOTH scan-derived scrub facts (the last completed pass and the
+ * one running now) from a single `zpool status -jv` read. The two are mutually
+ * exclusive by construction — one `scan_stats` record per pool is either
+ * progress or a verdict — and reading them together keeps the Scrubs screen on
+ * the ONE status read it already costs (no second system read for stage 6).
+ */
+export function parseScrubScans(
+  json: string | ZpoolStatusOutput,
+): Map<string, { lastScrub: LastScrub | null, running: ScrubRunning | null }> {
+  return new Map(parseZpoolStatus(json).map(pool => [
+    pool.name,
+    { lastScrub: lastScrubFromScan(pool.scan), running: scrubRunningFromScan(pool.scan) },
+  ]))
 }

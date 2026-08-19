@@ -1,12 +1,13 @@
-import type { LastScrub, PeriodicScrubState } from '@anas/shared'
+import type { AhrPool, LastScrub, PeriodicScrubState, ScrubRunning } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import { PoolName, ScrubToggleRequest } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
-import { parseLastScrubs } from '../parsers/zpool-status.js'
+import { parseScrubScans } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import {
+  ahrScrubRunning,
   readAhrScrubState,
   readZfsScrubState,
   setAhrScrubEnabled,
@@ -30,6 +31,14 @@ const ZPOOL = '/usr/sbin/zpool'
  * (17.3's "`zpool status` scrub dates"). ZFS records one; md records NONE, so an
  * AHR state's `lastScrub` is always null and the screen says so in words rather
  * than inventing a record from journald or a state file.
+ *
+ * …and `running` when a pass is in flight (stage 6), so the screen keeps saying
+ * something while a scrub runs instead of going quiet exactly then. Both halves
+ * come out of reads this route ALREADY makes: ZFS from the one `zpool status
+ * -jv` the verdict comes from, AHR from the topology read that enumerates the
+ * pools. No new system read, no new endpoint — the run/stop verbs on the Scrubs
+ * screen are a second door to `POST /v1/pools/:name/scrub` and
+ * `POST /v1/ahr/:name/scrub`.
  *
  * Toggles are jobs (Principle 4). ANAS deliberately does NOT touch the (disabled)
  * systemd `zfs-scrub-*@.timer` for ZFS, so the property remains the single lever
@@ -55,26 +64,32 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
     }
   }
 
-  /** Live AHR pool names (fail-open to []). */
-  async function ahrPoolNames(): Promise<string[]> {
+  /** Live AHR pools, topology and all (fail-open to []). */
+  async function ahrPools(): Promise<AhrPool[]> {
     try {
-      return (await readAhrPools(executor)).map(p => p.name)
+      return await readAhrPools(executor)
     }
     catch {
       return []
     }
   }
 
+  /** Live AHR pool names (fail-open to []). */
+  async function ahrPoolNames(): Promise<string[]> {
+    return (await ahrPools()).map(p => p.name)
+  }
+
   /**
-   * Each ZFS pool's last COMPLETED verify pass, from the one `zpool status`
-   * ZFS already reports it in (no new source, one read for every pool).
-   * Fail-open to an empty map — an unreadable status means "no record", which
-   * is exactly how a pool that has never scrubbed reads.
+   * Each ZFS pool's scan-derived scrub facts — the last COMPLETED verify pass
+   * and the one running now — from the one `zpool status` ZFS already reports
+   * them in (no new source, one read for every pool, both halves of the same
+   * record). Fail-open to an empty map: an unreadable status means "no record",
+   * which is exactly how an idle, never-scrubbed pool reads.
    */
-  async function zfsLastScrubs(): Promise<Map<string, LastScrub | null>> {
+  async function zfsScrubScans(): Promise<Map<string, { lastScrub: LastScrub | null, running: ScrubRunning | null }>> {
     try {
       const r = await executor.exec(ZPOOL, ['status', '-jv'])
-      return r.exitCode === 0 && r.stdout.trim() ? parseLastScrubs(r.stdout) : new Map()
+      return r.exitCode === 0 && r.stdout.trim() ? parseScrubScans(r.stdout) : new Map()
     }
     catch {
       return new Map()
@@ -83,10 +98,17 @@ export async function scrubRoutes(server: FastifyInstance, opts: ScrubRouteOptio
 
   // --- GET /scrub — uniform periodic-scrub state across ZFS + AHR pools ------
   server.get('/scrub', async () => {
-    const [zfsPools, ahrPools, lastScrubs] = await Promise.all([zfsPoolNames(), ahrPoolNames(), zfsLastScrubs()])
+    const [zfsPools, ahr, scans] = await Promise.all([zfsPoolNames(), ahrPools(), zfsScrubScans()])
     const states: PeriodicScrubState[] = [
-      ...await Promise.all(zfsPools.map(p => readZfsScrubState(executor, p, lastScrubs.get(p) ?? null))),
-      ...await Promise.all(ahrPools.map(p => readAhrScrubState(executor, p))),
+      ...await Promise.all(zfsPools.map(p => readZfsScrubState(
+        executor,
+        p,
+        scans.get(p)?.lastScrub ?? null,
+        scans.get(p)?.running ?? null,
+      ))),
+      // The AHR running check comes out of the topology read this route already
+      // makes to enumerate the pools — no extra mdstat read for it.
+      ...await Promise.all(ahr.map(p => readAhrScrubState(executor, p.name, ahrScrubRunning(p)))),
     ]
     return { data: states }
   })

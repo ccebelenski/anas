@@ -19,20 +19,40 @@
  * does not mine journald and does not keep a state file to manufacture a record
  * it was never given (stateless — the system is the source of truth).
  *
+ * STAGE 6 — the screen becomes a console. Run now / Stop verbs and live progress:
+ *   - Run now / Stop reuse the EXISTING endpoints verbatim (a second door to the
+ *     same routes the Pools and Hybrid RAID views drive — no second implementation).
+ *   - While a pass runs, the Last scrub cell shows it ("scrubbing — 43.0% · …")
+ *     instead of going quiet: ZFS keeps ONE scan record per pool, so during a pass
+ *     there IS no verdict to print.
+ *   - THIRD VISIBLE DIVERGENCE — Stop is ZFS-only. `zpool scrub -s` stops a scrub;
+ *     the AHR scrub is a multi-phase JOB (btrfs scrub, then a per-band md check)
+ *     with no cancel path in the daemon, and this story does not build one. The
+ *     AHR row's Stop is disabled with the reason in its tooltip rather than
+ *     silently missing.
+ *
  * Data (paths relative to /v1 — see routes/scrub.ts):
  *   GET  /scrub                → { data: [ { target:{kind,pool}, enabled,
  *                                   cadence:'monthly', mechanism, note?,
  *                                   lastScrub: {function,state,finishedAt,
- *                                     durationSeconds,repairedBytes,errors}|null } ] }
+ *                                     durationSeconds,repairedBytes,errors}|null,
+ *                                   running?: {function?,percent?,speedBytesSec?,
+ *                                     etaSeconds?} } ] }
  *   PUT  /scrub/zfs/:pool  {enabled}  → flip the ZFS periodic-scrub property
  *   PUT  /scrub/ahr/:pool  {enabled}  → flip the node's mdcheck timers (node-global)
+ *   POST /pools/:pool/scrub {action}  → start/stop a ZFS scrub (Epic 4.12's route)
+ *   POST /ahr/:pool/scrub   {}        → AHR scrub job (Epic 11's route; no stop)
+ *
+ * `running` is OPTIONAL on the wire: an older daemon omits it and every row then
+ * renders exactly the verdict-only cell it renders today (additive-field skew rule).
  *
  * Shared with the Snapshots view via ANAS.sched.* (69-schedules-common.js): the
  * fs-tag chip, the state pills, and the visibility-gated poll loop — one place so
  * the two views read identically and never drift.
  *
  * Test hooks: view cls 'anas-view anas-view-scrubs', grid cls 'anas-grid-scrub',
- * scrub toggle 'anas-btn-scrub-toggle'.
+ * scrub toggle 'anas-btn-scrub-toggle', run 'anas-btn-scrub-run', stop
+ * 'anas-btn-scrub-stop'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  * Fail-open everywhere: a broken view renders an error panel, never breaks PVE.
@@ -100,6 +120,18 @@
         return days + 'd' + (restHours ? ' ' + restHours + 'h' : '');
     }
 
+    // Set (or clear) a toolbar button's tooltip — the reason a verb is greyed
+    // out belongs ON the button, never in a silent absence (the 30-pools idiom).
+    function btnSetTip(btn, msg) {
+        try {
+            if (btn && typeof btn.setTooltip === 'function') {
+                btn.setTooltip(msg || '');
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
     // ---- Row shape + renderers ---------------------------------------------
 
     function scrubRow(state) {
@@ -115,6 +147,9 @@
             // The last completed verify pass, or null when the filesystem keeps
             // no record of one (always so for AHR — see the header).
             lastScrub: state.lastScrub || null,
+            // The pass running RIGHT NOW, or null when the pool is idle (and
+            // always null against a daemon too old to report it).
+            running: state.running || null,
             // A stable per-row key (kind+pool) so selection survives a poll.
             rowKey: (target.kind || 'zfs') + ':' + (target.pool || '')
         };
@@ -134,6 +169,59 @@
         return softPill(t('Off'), 'var(--anas-muted,gray)', t('periodic scrub is disabled'));
     }
 
+    // What the running pass is called. ZFS names it in the scan record (a
+    // RESILVER is never called a scrub); md's check has no such name, so an AHR
+    // row says "check running" — the words md itself uses.
+    function runningLabel(kind, fn) {
+        if (fn === 'RESILVER') {
+            return t('resilvering');
+        }
+        if (fn === 'SCRUB') {
+            return t('scrubbing');
+        }
+        return kind === 'ahr' ? t('check running') : t('scrubbing');
+    }
+
+    // The live pass, rendered IN PLACE of the verdict — while a pass runs there
+    // is no verdict to show (ZFS keeps one scan record per pool and it currently
+    // holds progress, not a result). Coloured accent (in progress), never
+    // warn/ok: nothing has been judged yet.
+    //
+    // Every figure is optional and each is printed only when the filesystem
+    // actually reported it — ZFS's scan record carries a percentage but neither
+    // a rate nor a time-to-go, md's progress line carries all three. Absent
+    // fields are simply left out; none is ever invented.
+    function renderRunning(running, kind) {
+        var parts = [];
+        // A number ONLY when one was actually sent — an absent field must not
+        // become a "0.0%" the filesystem never claimed.
+        var num = function (v) {
+            return typeof v === 'number' && isFinite(v) ? v : null;
+        };
+        var pct = num(running.percent);
+        if (pct !== null) {
+            parts.push(pct.toFixed(1) + '%');
+        }
+        var speed = num(running.speedBytesSec);
+        if (speed !== null && speed > 0) {
+            parts.push(ANAS.formatBytes(speed) + '/s');
+        }
+        var eta = fmtDuration(running.etaSeconds);
+        if (eta) {
+            parts.push(t('ETA') + ' ' + eta);
+        }
+        var title = kind === 'ahr'
+            ? t('an md check is running — the figures cover the bands checking right now; '
+                + 'any ETA is a floor, because bands still queued behind them are not counted')
+            : t('a verify pass is running — ZFS records its progress but neither a rate nor a '
+                + 'time-to-go, so only the percentage is shown');
+        return '<span title="' + enc(title) + '" style="color:var(--anas-accent,#3468c0);">'
+            + '<i class="fa fa-refresh" aria-hidden="true" style="margin-right:5px;"></i>'
+            + enc(runningLabel(kind, running.function))
+            + (parts.length ? enc(' — ' + parts.join(' · ')) : '')
+            + '</span>';
+    }
+
     // Last scrub: the VERDICT of the pool's last completed verify pass, in words
     // — "repaired 0 B, 0 errors — 2026-08-03 07:23 (took 5h 23m)". Anything
     // repaired or any error found is coloured warn: those are the rows an
@@ -145,6 +233,14 @@
     //   canceled — a pass stopped early verified only PART of the pool, so its
     //              "0 errors" is not a clean bill of health and is never shown as one.
     function renderLastScrub(v, meta, rec) {
+        // A pass in flight OUTRANKS the verdict cell: it is what is true now.
+        // Absent (idle pool, or a daemon that doesn't report it) → everything
+        // below renders byte-identically to before stage 6.
+        var running = rec.get('running');
+        if (running) {
+            return renderRunning(running, rec.get('kind'));
+        }
+
         var last = rec.get('lastScrub');
         if (!last) {
             if (rec.get('kind') === 'ahr') {
@@ -184,16 +280,19 @@
             + ' <span style="color:var(--anas-muted,gray);">' + enc(tail) + '</span></span>';
     }
 
+    // Scope: a narrow GLYPH column (stage 6). Only two states exist — a ZFS row
+    // has no note (scrub is per-pool, the unremarkable case) and an AHR row
+    // carries the one constant mdcheck node-global caveat — so a full-width
+    // column of prose bought nothing but width the Last scrub column now needs.
+    // The note is not lost: it is the icon's tooltip here, and it is still
+    // spelled out in the toggle-confirm dialog, where it actually matters.
     function renderScrubScope(v, meta, rec) {
         var note = rec.get('note');
-        if (note) {
-            // The mdcheck node-global caveat (or any backend note) — surfaced, not hidden.
-            return '<span title="' + enc(note) + '"'
-                + ' style="color:var(--anas-warn,#b06a12);font-size:0.85em;">'
-                + '<i class="fa fa-info-circle" aria-hidden="true" style="margin-right:4px;"></i>'
-                + enc(note) + '</span>';
+        if (!note) {
+            return '';
         }
-        return muted(t('per-pool'));
+        return '<i class="fa fa-info-circle" aria-hidden="true" title="' + enc(note) + '"'
+            + ' style="color:var(--anas-warn,#b06a12);"></i>';
     }
 
     // ---- Load / reload ------------------------------------------------------
@@ -241,7 +340,7 @@
                     // non-fatal
                 }
             }
-            updateScrubButton(scrubGrid);
+            updateScrubButtons(scrubGrid);
         }, function (err) {
             if (scrubGrid.destroyed || scrubGrid.destroying) {
                 return;
@@ -260,17 +359,50 @@
         return (sel && sel.length) ? sel[0] : null;
     }
 
-    function updateScrubButton(scrubGrid) {
+    // Selection-dependent toolbar state (the 30-pools idiom): Run now is off
+    // while a pass already runs, Stop is on only when the selected row is
+    // running something that CAN be stopped, and every greyed-out verb carries
+    // the reason in its tooltip.
+    function updateScrubButtons(scrubGrid) {
         var rec = selectedScrub(scrubGrid);
+        var running = rec ? rec.get('running') : null;
+        var kind = rec ? rec.get('kind') : null;
+
         var btn = scrubGrid.down('#scrubToggle');
-        if (!btn) {
-            return;
+        if (btn) {
+            btn.setDisabled(!rec);
+            if (rec) {
+                var on = rec.get('enabled');
+                btn.setText(on ? t('Disable scrub') : t('Enable scrub'));
+                btn.setIconCls(on ? 'fa fa-pause' : 'fa fa-play');
+            }
         }
-        btn.setDisabled(!rec);
-        if (rec) {
-            var on = rec.get('enabled');
-            btn.setText(on ? t('Disable scrub') : t('Enable scrub'));
-            btn.setIconCls(on ? 'fa fa-pause' : 'fa fa-play');
+
+        var runBtn = scrubGrid.down('#scrubRun');
+        if (runBtn) {
+            runBtn.setDisabled(!rec || !!running);
+            btnSetTip(runBtn, running ? t('a verify pass is already running on this pool') : '');
+        }
+
+        // Stop is ZFS-only, and that asymmetry is STATED, never silent: `zpool
+        // scrub -s` stops a scrub, while the AHR scrub is a multi-phase job
+        // (btrfs scrub, then a per-band md check) the daemon has no cancel path
+        // for. A resilver cannot be stopped at all — same rule as the Pools view.
+        var stopBtn = scrubGrid.down('#scrubStop');
+        if (stopBtn) {
+            var reason = '';
+            if (!rec) {
+                reason = '';
+            } else if (!running) {
+                reason = t('nothing is running on this pool');
+            } else if (kind === 'ahr') {
+                reason = t('an AHR scrub cannot be stopped: it is a two-phase job '
+                    + '(btrfs scrub, then each band\'s md check) with no cancel path');
+            } else if (running.function === 'RESILVER') {
+                reason = t('a resilver cannot be stopped — only a scrub can');
+            }
+            stopBtn.setDisabled(!rec || !!reason);
+            btnSetTip(stopBtn, reason);
         }
     }
 
@@ -318,13 +450,53 @@
         doToggle();
     }
 
+    // ---- Run now / Stop -----------------------------------------------------
+
+    // The on-demand verbs, driving the EXISTING per-filesystem scrub endpoints
+    // verbatim — deliberately a second door to the routes the Pools (4.12) and
+    // Hybrid RAID (11.x) views already use, never a second implementation. Those
+    // views keep their own buttons; this screen just puts them where the scrub
+    // story is told.
+    //
+    // Every safety rule stays where it belongs — in the API (Principle 14): the
+    // daemon 409s a scrub on a resilvering ZFS pool or a degraded/busy/unmounted
+    // AHR pool, and runJob shows that message. The screen gates only on what it
+    // can honestly see: whether a pass is already running.
+    function runScrub(node, scrubGrid, rec, stop) {
+        if (!rec) {
+            return;
+        }
+        var kind = rec.get('kind');
+        var pool = rec.get('pool');
+        var zfs = kind !== 'ahr';
+        ANAS.runJob({
+            node: node,
+            method: 'post',
+            path: zfs
+                ? '/pools/' + encodeURIComponent(pool) + '/scrub'
+                : '/ahr/' + encodeURIComponent(pool) + '/scrub',
+            // ZFS takes the start/stop action; the AHR scrub route takes no body.
+            body: zfs ? { action: stop ? 'stop' : 'start' } : {},
+            view: scrubGrid,
+            failTitle: stop ? 'Stop scrub failed' : 'Scrub failed',
+            // A scrub runs for hours — the 202 is the news, not the completion,
+            // so say it (and pick up the running state) the moment it lands.
+            onSubmitted: function () {
+                ANAS.toast((stop ? t('Stopping scrub on') : t('Scrub started on')) + ' ' + pool);
+                loadScrub(scrubGrid, node, true);
+            },
+            onComplete: function () { loadScrub(scrubGrid, node, true); }
+        });
+    }
+
     // ---- View ---------------------------------------------------------------
 
     function scrubsView(node) {
         var store = Ext.create('Ext.data.Store', {
             fields: ['pool', 'kind', 'cadence', 'mechanism', 'note', 'rowKey',
                 { name: 'enabled', type: 'auto' },
-                { name: 'lastScrub', type: 'auto' }],
+                { name: 'lastScrub', type: 'auto' },
+                { name: 'running', type: 'auto' }],
             data: [],
             sorters: [{ property: 'kind', direction: 'ASC' }, { property: 'pool', direction: 'ASC' }]
         });
@@ -362,9 +534,11 @@
                             renderer: renderScrubEnabled },
                         { text: t('Cadence'), dataIndex: 'cadence', width: 110,
                             renderer: function (v) { return enc(v || 'monthly'); } },
-                        { text: t('Last scrub'), dataIndex: 'lastScrub', flex: 1, minWidth: 280,
+                        // Widened with the room the Scope column gave back — this
+                        // is where the live-progress strip now lives.
+                        { text: t('Last scrub'), dataIndex: 'lastScrub', flex: 2, minWidth: 340,
                             sortable: false, menuDisabled: true, renderer: renderLastScrub },
-                        { text: t('Scope'), dataIndex: 'note', flex: 1, minWidth: 220,
+                        { text: t('Scope'), dataIndex: 'note', width: 70, align: 'center',
                             sortable: false, menuDisabled: true, renderer: renderScrubScope }
                     ],
                     tbar: [
@@ -386,6 +560,29 @@
                         },
                         '->',
                         {
+                            text: t('Run now'),
+                            itemId: 'scrubRun',
+                            cls: 'anas-btn-scrub-run',
+                            iconCls: 'fa fa-play-circle',
+                            disabled: true,
+                            handler: function (btn) {
+                                var g = btn.up('grid');
+                                runScrub(node, g, selectedScrub(g), false);
+                            }
+                        },
+                        {
+                            text: t('Stop'),
+                            itemId: 'scrubStop',
+                            cls: 'anas-btn-scrub-stop',
+                            iconCls: 'fa fa-stop',
+                            disabled: true,
+                            handler: function (btn) {
+                                var g = btn.up('grid');
+                                runScrub(node, g, selectedScrub(g), true);
+                            }
+                        },
+                        '-',
+                        {
                             text: t('Enable scrub'),
                             itemId: 'scrubToggle',
                             cls: 'anas-btn-scrub-toggle',
@@ -398,7 +595,7 @@
                         }
                     ],
                     listeners: {
-                        selectionchange: function () { updateScrubButton(this); }
+                        selectionchange: function () { updateScrubButtons(this); }
                     }
                 }
             ],

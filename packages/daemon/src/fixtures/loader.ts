@@ -36,6 +36,8 @@ export const mockFixtures = {
   zpoolIostat: () => fixtureResult('telemetry', 'zpool-iostat-plv.txt'),
   // --- AHR (Epic 11 + AHR) — the stage-0 pool `ahr0` replayed as dev sample.
   ahrMdstat: () => fixtureResult('ahr', 'mdstat-clean.txt'),
+  /** The same two arrays mid-`check` — the periodic md scrub in flight (17 stage 6). */
+  ahrMdstatCheck: () => fixtureResult('ahr', 'mdstat-check.txt'),
   ahrMdadmExportR1: () => fixtureResult('ahr', 'mdadm-export-r1.txt'),
   ahrMdadmExportR2: () => fixtureResult('ahr', 'mdadm-export-r2.txt'),
   ahrLsblk: () => fixtureResult('ahr', 'lsblk-ahr0.json'),

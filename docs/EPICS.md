@@ -781,7 +781,66 @@ and schedules* the client invocation and surfaces status.
 >   **canonical forms, not node captures**. `ANAS.sched.absTime` extracted to
 >   `69-schedules-common.js` so both schedule views print timestamps from one copy.
 >   Daemon suite 1477 (+11), gateway 46; typecheck + lint clean; changed
->   pve-integration files `node --check`-clean. **Not yet reviewed on a node.**
+>   pve-integration files `node --check`-clean. **Operator-verified on a
+>   production node 2026-08-19 (screenshot review): AHR rows show the honest
+>   "— (md keeps no completion record)" absence, ZFS rows render the canceled
+>   verdict warn-coloured with date and no clean-bill wording — and the column
+>   immediately did its job, surfacing that every ZFS pool's last monthly scrub
+>   had been canceled rather than completed.**
+
+> **Stage 6 landed 2026-08-19 (operator-requested — the Scrubs screen becomes a
+> console).** The screen could say whether a pool scrubs and how the last pass
+> went, but not *run* one, and it fell silent while one was running. Three parts,
+> and NO new endpoints, NO new system reads:
+> - **Run now / Stop** — selection-dependent toolbar buttons driving the EXISTING
+>   verbs verbatim: `POST /v1/pools/:name/scrub {action:start|stop}` (Epic 4.12)
+>   and `POST /v1/ahr/:name/scrub` (Epic 11). Deliberately a **second door** to the
+>   same routes — the Pools and Hybrid RAID buttons stay exactly where they are, and
+>   there is no second implementation behind either. Safety stays in the API
+>   (Principle 14): the daemon still 409s a scrub on a resilvering ZFS pool or a
+>   degraded/busy/unmounted AHR pool, and the screen shows that message rather than
+>   pre-judging health it cannot see.
+> - **THIRD SANCTIONED DIVERGENCE — Stop is ZFS-only, and says so.** `zpool scrub
+>   -s` stops a scrub; the AHR scrub is a multi-phase JOB (btrfs scrub, then each
+>   band's `mdadm --action=check`) with **no cancel path in the daemon**, and this
+>   story did not build one — a cancel engine for a two-phase full-device job is its
+>   own piece of work, not a toolbar button. An AHR row's Stop is therefore disabled
+>   with the reason in its tooltip, never silently missing. (A ZFS **resilver** is
+>   likewise unstoppable — same rule the Pools view already applies.)
+> - **In-progress visibility** — new OPTIONAL `running` on `PeriodicScrubState`
+>   (shared Zod `ScrubRunning`), rendered inline in the Last scrub cell in place of
+>   the verdict that does not exist yet ("scrubbing — 43.0% · 1.2 GiB/s · ETA 3h"),
+>   accent-coloured as in-progress rather than warn/ok. Both halves come from reads
+>   the route ALREADY makes: ZFS from the one `zpool status -jv` the verdict comes
+>   from (`scrubRunningFromScan`/`parseScrubScans` beside stage 5's
+>   `lastScrubFromScan`), AHR from the topology read that enumerates the pools
+>   (`ahrScrubRunning` over the band arrays' already-parsed `/proc/mdstat` sync).
+>   **Every figure is only what the filesystem actually records:** ZFS's scan record
+>   carries a percentage but NO rate and NO time-to-go (its CLI derives those at
+>   print time from the counters and the clock), so ANAS prints the percentage and
+>   nothing else; md's progress line carries all three, so an AHR row shows all
+>   three — least-advanced band's percent, the checking bands' summed throughput,
+>   and the longest of their ETAs, stated in the tooltip as a floor because queued
+>   bands are not in it. Idle rows render byte-identically to stage 5, and an old
+>   daemon (no `running` on the wire) renders exactly today's screen — the additive-
+>   field version-skew rule.
+> - **Scope column → icon** (operator ruling): only two states ever existed — ZFS
+>   rows have no note, AHR rows carry the one constant mdcheck node-global caveat —
+>   so the full-width prose column became a 70px `fa-info-circle` whose tooltip is
+>   the note; ZFS rows show nothing. The caveat still appears in full in the
+>   toggle-confirm dialog, where it actually gates a decision. The reclaimed width
+>   went to **Last scrub**, which is where the running strip now lives.
+> - Tests: the in-progress scan form → `running` populated (function + percent, no
+>   invented rate/ETA), a finished pass → `running` absent with the stage-5 verdict
+>   untouched, a status-read failure → both halves honestly absent (fail-open as
+>   before), and the AHR aggregation across bands (min/sum/max, queued bands
+>   contributing nothing, a rebuild/reshape not counting as a check) — plus the
+>   route carrying both, end-to-end, for a ZFS pool and an AHR pool. New fixture
+>   `fixtures/ahr/mdstat-check.txt` (labeled **synthetic** in that directory's
+>   NOTES.md: the two captured arrays with a `check` progress line, whose format is
+>   the genuine one from the live `recovery` capture). Daemon suite 1525 (+16),
+>   gateway 46; typecheck + lint clean; changed pve-integration files
+>   `node --check`-clean. **Not yet reviewed on a node.**
 
 ##### Observe
 17.3. **[done 2026-07-26, stage 3 — screen shipped]** As a user, I want the **Schedules** screen: one grid over both snapshot schedules and scrub schedules — target (dataset/pool, recursive flag), policy summary (e.g. "24h / 30d / 12m" or "monthly scrub"), enabled state, last run/result, next run, and overdue highlighted — including schedules created outside ANAS, so I have the complete picture. *(Authoritative state from the config file + systemd timer state + ZFS reality (`zfs list -t snapshot` counts, `zpool status` scrub dates); journald is run-detail forensics only, per the replication precedent.)* — **Backend:** `GET /v1/schedules` returns the uniform derived-status rows (systemd next/last/result/overdue); `GET /v1/scrub` the uniform periodic-scrub state across ZFS + AHR pools.
