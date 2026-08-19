@@ -883,17 +883,6 @@
             } catch (e) {
                 ANAS.warn('ahr detail render failed: ' + ANAS.errText(e));
             }
-            // 11.12: the Snapshots… button is live only for the §12 subvolume
-            // layout. A pre-§12 flat pool has no @data/@snapshots — disable it
-            // with the "snapshots unavailable" advisory (no migration verb).
-            var snapBtn = win.down('#ahrSnapshotsBtn');
-            if (snapBtn) {
-                var layout = !!(d && d.subvolLayout);
-                snapBtn.setDisabled(!layout);
-                snapBtn.setTooltip(layout
-                    ? t('Manage btrfs snapshots for this pool')
-                    : t('Snapshots unavailable: this pool predates the @data/@snapshots layout. Destroy and recreate it to gain snapshots (no in-place migration).'));
-            }
         }, function (err) {
             if (panel && !panel.destroyed && !panel.destroying) {
                 panel.setHtml('<div style="padding:14px;color:var(--anas-danger);font-size:12.5px">'
@@ -904,8 +893,13 @@
 
     // Change the pool's mountpoint (the ONE mutable pool identity). Prompt
     // prefilled with the current path; the daemon validates (reserved paths,
-    // collisions) and confirm-gates the brief unmount.
-    function changeMountpoint(win, node, name) {
+    // collisions) and confirm-gates the brief unmount. Driven from the grid
+    // toolbar (the pools-view idiom — the detail window is display only).
+    function changeMountpoint(grid, node) {
+        var name = selectedPool(grid);
+        if (!name) {
+            return;
+        }
         ANAS.api.get(node, '/ahr/' + encodeURIComponent(name)).then(function (res) {
             var current = (res && res.data && res.data.mountpoint) || '';
             ANAS.changeMountpointFlow({
@@ -913,22 +907,26 @@
                 resourcePath: '/ahr/' + encodeURIComponent(name),
                 label: name,
                 current: current,
-                view: win,
+                view: grid,
                 onDone: function () {
-                    if (win && !win.destroyed && !win.destroying) {
-                        loadDetailInto(win, node, name);
-                    }
-                    if (ANAS.ahr && typeof ANAS.ahr.reload === 'function') {
-                        var grid = Ext.ComponentQuery.query('#ahrGrid')[0];
-                        if (grid) {
-                            ANAS.ahr.reload(grid, node);
-                        }
+                    if (grid && !grid.destroyed && !grid.destroying) {
+                        loadPools(grid, node);
                     }
                 },
             });
         }, function (err) {
             ANAS.alertMsg('Change mount', ANAS.errText(err));
         });
+    }
+
+    // 11.12: snapshots exist only for the §12 @data/@snapshots subvolume
+    // layout. A pre-§12 flat pool has no @snapshots — the verb is disabled
+    // with this advisory (there is no in-place migration). ONE wording, shared
+    // by every place that gates the button.
+    function snapshotsTooltip(subvolLayout) {
+        return subvolLayout
+            ? t('Manage btrfs snapshots for this pool')
+            : t('Snapshots unavailable: this pool predates the @data/@snapshots layout. Destroy and recreate it to gain snapshots (no in-place migration).');
     }
 
     function openPoolDetailWindow(node, name) {
@@ -953,23 +951,9 @@
                     scrollable: true,
                     html: '',
                 }],
+                // Display only — every pool verb lives on the grid toolbar
+                // (the Pools-view rule; actions on a pop-up are too hidden).
                 buttons: [
-                    {
-                        text: t('Change mount…'),
-                        cls: 'anas-btn-ahr-remount',
-                        iconCls: 'fa fa-folder-open-o',
-                        handler: function () { changeMountpoint(win, node, name); },
-                    },
-                    {
-                        text: t('Snapshots…'),
-                        itemId: 'ahrSnapshotsBtn',
-                        cls: 'anas-btn-ahr-snapshots',
-                        iconCls: 'fa fa-camera',
-                        // Enabled once detail loads and reports subvolLayout true.
-                        disabled: true,
-                        handler: function () { openSnapshotManager(node, name); },
-                    },
-                    '->',
                     {
                         text: t('Reload'),
                         cls: 'anas-btn-ahr-detail-reload',
@@ -1253,12 +1237,20 @@
         var sel = grid.getSelection();
         var has = sel && sel.length > 0;
         var state = has ? sel[0].get('state') : '';
-        var ids = ['details', 'replace', 'destroy', 'addSpare'];
+        var ids = ['details', 'replace', 'destroy', 'addSpare', 'changeMount'];
         for (var i = 0; i < ids.length; i++) {
             var btn = grid.down('#' + ids[i]);
             if (btn) {
                 btn.setDisabled(!has);
             }
+        }
+        // 11.12: Snapshots needs the §12 @data/@snapshots layout — a flat pool
+        // stays disabled and says why (same wording the detail view carried).
+        var snapBtn = grid.down('#snapshots');
+        if (snapBtn) {
+            var layout = has && !!sel[0].get('subvolLayout');
+            snapBtn.setDisabled(!layout);
+            snapBtn.setTooltip(has ? snapshotsTooltip(layout) : '');
         }
         // Resume/Abandon only exist for a halted expansion (§6.2) — and while
         // one is halted, a fresh Expand/Replace would 409 anyway, so swap them.
@@ -2428,6 +2420,8 @@
         var store = Ext.create('Ext.data.Store', {
             fields: [
                 'name', 'ahrType', 'state', 'mountpoint', 'mounted',
+                // 11.12 §12 layout flag — gates the Snapshots… button.
+                'subvolLayout',
                 // Nested structures kept verbatim (auto fields): renderers and
                 // the detail panel read them directly.
                 'capacity', 'arrays', 'disks', 'advisories', 'vg', 'lv',
@@ -2586,6 +2580,30 @@
                             disabled: true,
                             handler: function (btn) {
                                 startScrub(btn.up('grid'), node);
+                            },
+                        },
+                        // 11.12: the snapshot manager — a grid verb like every
+                        // other pool action. Live only for a §12 subvolume-
+                        // layout pool; a flat pool keeps it disabled with the
+                        // "snapshots unavailable" advisory.
+                        {
+                            text: t('Snapshots…'),
+                            itemId: 'snapshots',
+                            cls: 'anas-btn-ahr-snapshots',
+                            iconCls: 'fa fa-camera',
+                            disabled: true,
+                            handler: function (btn) {
+                                openSnapshotManager(node, selectedPool(btn.up('grid')));
+                            },
+                        },
+                        {
+                            text: t('Change mount…'),
+                            itemId: 'changeMount',
+                            cls: 'anas-btn-ahr-remount',
+                            iconCls: 'fa fa-folder-open-o',
+                            disabled: true,
+                            handler: function (btn) {
+                                changeMountpoint(btn.up('grid'), node);
                             },
                         },
                         {

@@ -426,9 +426,12 @@ unmounted after each op — nothing new stays mounted):
 - **Schema:** `AhrSnapshot { name, createdAt, readonly }`; `AhrPool` gains
   `subvolLayout: boolean`. Snapshot sizes need qgroups — OUT of v1 (never show
   an unlabeled or wrong number).
-- **UI:** a `Snapshots…` button in the Details window → manager window (list,
+- **UI:** a `Snapshots…` button on the Hybrid RAID **grid toolbar** (selection-
+  dependent, disabled with the advisory on a flat pool) → manager window (list,
   create, delete, rollback — rollback confirm states the unmount + the
   auto-preserved pre-rollback snapshot). Mirrors the datasets snapshot idioms.
+  *(2026-08-19: moved off the Details window — actions live on the grid toolbar,
+  the detail window is display, per the Pools view.)*
 - **Follow-ups inked, not built here:** Epic 16 snapshot-consistent backup for
   AHR sources (snapshot → back up `@snapshots/<x>` → delete, exactly the ZFS
   treatment); Epic 17 scheduled snapshots + scrubs gain AHR targets.
