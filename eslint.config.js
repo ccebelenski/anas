@@ -19,6 +19,10 @@ export default antfu({
     // per-view sources in src/ plus the generated anas.js — not part of the
     // Node/Vue codebase, so the repo's TS/modern-JS style rules do not apply.
     'packages/pve-integration/**/*.js',
+    // Render harnesses for those same ES5 sources: standalone node scripts
+    // whose console output IS the test report (run directly, not via the test
+    // runner) — product-code style rules (no-console etc.) do not apply.
+    'packages/pve-integration/test/*.harness.mjs',
   ],
   rules: {
     // Node globals are fine — both processes run on Node.js
