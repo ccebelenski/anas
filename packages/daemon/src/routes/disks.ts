@@ -8,7 +8,7 @@ import { parseSmartctl } from '../parsers/smartctl.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 
-const BY_ID_PATH_RE = /^\/dev\/disk\/by-id\/(.+)$/
+const BY_ID_PATH_RE = /^\/dev\/disk\/by-(?:id|partuuid)\/(.+)$/
 const KERNEL_PATH_RE = /^\/dev\/([a-z0-9]+)$/
 const PART_SUFFIX_RE = /-part\d+$/
 const BARE_KERNEL_RE = /^(?:sd|vd|hd)[a-z]+\d*$|^nvme\d+n\d+/
@@ -24,8 +24,9 @@ const BARE_KERNEL_RE = /^(?:sd|vd|hd)[a-z]+\d*$|^nvme\d+n\d+/
  * Precedence, mirroring `zpool-status`'s own `diskId()` inputs:
  *   1. the leaf `id` (its `devid`, or a by-id derived from `path`/`name`),
  *      looked up in the complete by-id → kernel map;
- *   2. the leaf `path`: a `/dev/disk/by-id/<x>` form is stripped + mapped; a
- *      `/dev/sdX[N]` / `/dev/nvmeXnY[pN]` form is reduced to its parent kernel;
+ *   2. the leaf `path`: a `/dev/disk/by-id/<x>` or `/dev/disk/by-partuuid/<x>`
+ *      form is stripped + mapped (partuuid GUIDs ride the same map — issue #32);
+ *      a `/dev/sdX[N]` / `/dev/nvmeXnY[pN]` form is reduced to its parent kernel;
  *   3. the leaf `id` treated as a bare kernel name.
  * Returns null when nothing resolves — that leaf simply won't cross-reference.
  */
@@ -132,9 +133,15 @@ export async function collectDisks(
   executor: CommandExecutor,
   diskIdentityCache: DiskIdentityCache,
 ): Promise<Disk[]> {
-  const [lsblkResult, byIdResult, statusResult, ahrPools] = await Promise.all([
+  const [lsblkResult, byIdResult, byPartuuidResult, statusResult, ahrPools] = await Promise.all([
     executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
     executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
+    // Some pools reference vdev members by GPT partition GUID (`zpool status`
+    // leaves under /dev/disk/by-partuuid/ — issue #32); this listing is the only
+    // way to resolve those to a kernel device. Fail-soft: no listing (dir absent,
+    // exec error) just means partuuid leaves won't cross-reference.
+    executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-partuuid/'])
+      .catch(() => ({ stdout: '', stderr: '', exitCode: 1 })),
     executor.exec('/usr/sbin/zpool', ['status', '-jv']),
     // Single-source AHR membership from the topology reader (never re-parse
     // mdstat here). Fail-soft: an AHR read error (or md absent) yields no AHR
@@ -148,6 +155,14 @@ export async function collectDisks(
   // canonicalize both the zpool-status leaves and the physical disks to the
   // same kernel device before joining. See resolveLeafKernel.
   const byIdToKernel = parseByIdToKernel(byIdResult.stdout)
+  // Fold the partuuid GUIDs into the same leaf-resolve map (a GUID key cannot
+  // collide with a by-id name, and the listing shape is identical).
+  if (byPartuuidResult.exitCode === 0) {
+    for (const [guid, kernel] of parseByIdToKernel(byPartuuidResult.stdout)) {
+      if (!byIdToKernel.has(guid))
+        byIdToKernel.set(guid, kernel)
+    }
+  }
 
   // Rich ZFS context per disk (vdev/role/state/error counts), keyed by the
   // whole-disk KERNEL name — the identity both zpool-status and lsblk share.

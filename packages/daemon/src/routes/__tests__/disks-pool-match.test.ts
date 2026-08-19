@@ -35,6 +35,14 @@ const BY_ID_LISTING = [
   '',
 ].join('\n')
 
+// GPT partition GUIDs → kernel partitions (issue #32): some pools reference
+// vdev members by-partuuid, a listing with the same symlink shape as by-id.
+const BY_PARTUUID_LISTING = [
+  'lrwxrwxrwx 1 root root 10 Jul 16 10:00 23e189bc-fade-4bd4-883c-385ccf8d5621 -> ../../sdf1',
+  'lrwxrwxrwx 1 root root 10 Jul 16 10:00 7c1a2f00-0000-4bd4-883c-000000000001 -> ../../sdb1',
+  '',
+].join('\n')
+
 const LSBLK_JSON = JSON.stringify({
   blockdevices: [
     disk('sdb', 'WD-HET1'),
@@ -42,6 +50,7 @@ const LSBLK_JSON = JSON.stringify({
     disk('sdd', 'SATA3'),
     nvmeDisk('nvme0n1', 'NVME4'),
     disk('sde', 'QEMU5'),
+    disk('sdf', 'PARTGUID6'),
   ],
 })
 
@@ -138,6 +147,13 @@ const ZPOOL_STATUS_JSON = JSON.stringify({
               path: '/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_drive0-part1',
               devid: 'scsi-0QEMU_QEMU_HARDDISK_drive0-part1',
             }),
+            // (5) PARTUUID leaf (issue #32): a pool membered by GPT partition
+            //     GUID — id is the bare GUID, path is by-partuuid, no devid.
+            //     Real-node capture shape.
+            'sdf-leaf': leaf({
+              name: '23e189bc-fade-4bd4-883c-385ccf8d5621',
+              path: '/dev/disk/by-partuuid/23e189bc-fade-4bd4-883c-385ccf8d5621',
+            }),
           },
         },
       },
@@ -149,6 +165,7 @@ function makeExecutor(): MockExecutor {
   const mock = new MockExecutor()
   mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: { stdout: LSBLK_JSON, stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: BY_ID_LISTING, stderr: '', exitCode: 0 } })
+  mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-partuuid/'], result: { stdout: BY_PARTUUID_LISTING, stderr: '', exitCode: 0 } })
   mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: ZPOOL_STATUS_JSON, stderr: '', exitCode: 0 } })
   // smartctl is left unfixtured → empty identity (fail-open), fine for join.
   return mock
@@ -204,8 +221,29 @@ describe('collectDisks — disk↔pool join canonicalizes to the kernel device',
     assert.equal(sde.status, 'pool_member')
   })
 
+  it('matches a partuuid leaf (bare GUID id, /dev/disk/by-partuuid/ path) — issue #32', async () => {
+    const byName = await collect()
+    const sdf = byName.get('sdf')!
+    assert.equal(sdf.poolName, 'hetpool')
+    assert.equal(sdf.status, 'pool_member')
+    assert.notEqual(sdf.zfsErrors, null)
+  })
+
   it('every pool leaf resolves — no disk is left without pool membership', async () => {
     const byName = await collect()
+    for (const name of ['sdb', 'sdc', 'sdd', 'nvme0n1', 'sde', 'sdf'])
+      assert.equal(byName.get(name)!.poolName, 'hetpool', `${name} matched`)
+  })
+
+  it('fail-soft: no by-partuuid listing → GUID leaf unattributed, every other leaf still matches', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/bin/lsblk', args: LSBLK_ARGS, result: { stdout: LSBLK_JSON, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: BY_ID_LISTING, stderr: '', exitCode: 0 } })
+    // NO by-partuuid fixture → the mock's command-not-found result (exit 127).
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: ZPOOL_STATUS_JSON, stderr: '', exitCode: 0 } })
+    const disks = await collectDisks(mock, new DiskIdentityCache(mock))
+    const byName = new Map(disks.map(d => [d.name, d]))
+    assert.equal(byName.get('sdf')!.poolName, null)
     for (const name of ['sdb', 'sdc', 'sdd', 'nvme0n1', 'sde'])
       assert.equal(byName.get(name)!.poolName, 'hetpool', `${name} matched`)
   })
