@@ -394,10 +394,12 @@
     // When a finished run notifies through PVE — vzdump's own two modes, with
     // vzdump's own default. ABSENT means 'always' (the daemon's schema default),
     // which is exactly what every task created before 16.12 reads back as.
+    //
+    // The normalizer + combo live in ANAS.notifyMode (00-core) since 9.4 gave
+    // snapshot schedules and replication the same knob; backup keeps only its own
+    // DEFAULT here, which is deliberately the loud one (see NotifyMode).
     function notifyOf(task) {
-        return ('' + (first(task && task.notify) || 'always')).toLowerCase() === 'on-failure'
-            ? 'on-failure'
-            : 'always';
+        return ANAS.notifyMode.of(first(task && task.notify), 'always');
     }
 
     function hasKeeps(retention) {
@@ -2111,21 +2113,15 @@
                                 },
                             ]),
                         },
-                        {
-                            xtype: 'combobox',
+                        // 9.4 gave snapshots + replication the same knob, so the
+                        // combo itself moved to ANAS.notifyMode (00-core) and all
+                        // three dialogs render one field. Only the DEFAULT and the
+                        // hint below stay backup's own.
+                        ANAS.notifyMode.field({
                             itemId: 'notifyMode',
                             cls: 'anas-fld-backup-notify',
-                            fieldLabel: t('Notification mode'),
-                            store: [
-                                ['always', t('Always')],
-                                ['on-failure', t('On failure')],
-                            ],
-                            queryMode: 'local',
-                            editable: false,
-                            forceSelection: true,
-                            allowBlank: false,
                             value: notifyOf(task),
-                        },
+                        }),
                         {
                             xtype: 'component',
                             style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',

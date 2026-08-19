@@ -54,8 +54,9 @@ export function timerUnitName(name: string): string {
 
 /**
  * The argv the timer passes to the runner. Source dataset is pool-relative
- * ('' = the pool root); the target dataset is only passed when explicitly set
- * (the runner otherwise defaults it, mirroring the stage-1 endpoint).
+ * ('' = the pool root); everything else is passed only when it DIFFERS from the
+ * endpoint's own default, the idiom this ExecStart has always used (the runner
+ * is a dumb conduit and the endpoint owns the defaults).
  */
 export function runnerArgs(task: ReplicationTask): string[] {
   const args = [
@@ -78,6 +79,15 @@ export function runnerArgs(task: ReplicationTask): string[] {
   }
   if (task.snapshotFirst)
     args.push('--snapshot-first')
+  // 9.4: the notification MODE is stored in the task JSON above, but the ONE
+  // place that actually notifies is the one-shot replicate endpoint — which
+  // knows nothing about tasks — so the runner has to carry it there. Emitted
+  // ONLY for the opt-in `always`: the endpoint already defaults to 'on-failure',
+  // so a quiet task's ExecStart stays byte-identical to what it was before the
+  // field existed (and a unit rewritten by a newer daemon never hands an older
+  // runner a flag it cannot parse).
+  if (task.notify === 'always')
+    args.push('--notify', task.notify)
   return args
 }
 

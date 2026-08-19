@@ -51,6 +51,7 @@ function makeTask(over: Partial<ReplicationTask> = {}): ReplicationTask {
     schedule: 'daily',
     snapshotFirst: true,
     enabled: true,
+    notify: 'on-failure',
     ...over,
   }
 }
@@ -96,6 +97,26 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
   it('stage-3: a local (default) target emits NO --location-* args', () => {
     const unit = renderServiceUnit(makeTask({ target: { pool: 'backup', dataset: 'media', location: { kind: 'local' } } }))
     assert.doesNotMatch(unit, /--location-kind/)
+  })
+
+  // --- 9.4: the notification mode rides the store, and the ExecStart ---------
+
+  it('9.4: notify round-trips through X-ANAS-Task, and an ABSENT one reads as on-failure', () => {
+    const loud = makeTask({ notify: 'always' })
+    assert.deepEqual(parseServiceUnit(renderServiceUnit(loud)), loud)
+
+    // A unit written before the field existed — the store must keep firing it,
+    // with exactly the failure-only behaviour it had.
+    const legacy = renderServiceUnit(makeTask()).replace(/,"notify":"on-failure"/, '')
+    assert.doesNotMatch(legacy, /"notify"/)
+    assert.equal(parseServiceUnit(legacy)?.notify, 'on-failure')
+  })
+
+  it('9.4: ExecStart carries --notify ONLY for the opt-in `always`', () => {
+    assert.match(renderServiceUnit(makeTask({ notify: 'always' })), /--notify always/)
+    // The endpoint already defaults to on-failure, so a quiet task's ExecStart
+    // stays byte-identical to what a pre-9.4 daemon wrote.
+    assert.doesNotMatch(renderServiceUnit(makeTask({ notify: 'on-failure' })), /--notify/)
   })
 
   it('pool-root source emits --dataset "" and no --target-dataset by default', () => {

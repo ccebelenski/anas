@@ -314,11 +314,13 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
   })
 
   // ==========================================================================
-  //  Run notifications (story 9.4) — FAILURE ONLY, at the ONE emission point
+  //  Run notifications (story 9.4) — the per-run mode, one emission point
   // ==========================================================================
   // A replication task's timer runner is a thin client of THIS endpoint, so the
   // replicate job is where both an unattended fire and a UI replicate converge —
-  // one emission site. A healthy replication says nothing (16.7's policy).
+  // one emission site. The endpoint knows nothing about tasks, so the MODE
+  // arrives in the request body: absent → `on-failure` (a healthy replication
+  // says nothing, 16.7's policy), `always` → the run mails its receipt too.
 
   const PERL = '/usr/bin/perl'
 
@@ -343,12 +345,26 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     return mock
   }
 
-  async function replicateShare1(): Promise<Job> {
+  /** Fixtures for a replication that actually completes (no diverged target). */
+  function armSuccessfulRun(): MockExecutor {
+    const mock = mockOf(server!)
+    mock.clearFixtures()
+    mock.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+    return mock
+  }
+
+  async function replicateShare1(extra: Record<string, unknown> = {}): Promise<Job> {
     const res = await server!.inject({
       method: 'POST',
       url: '/v1/pools/testpool/datasets/share1/replicate',
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
-      payload: JSON.stringify({ target: { pool: 'testpool2' } }),
+      payload: JSON.stringify({ target: { pool: 'testpool2' }, ...extra }),
     })
     assert.equal(res.statusCode, 202)
     return waitForJob(server!, (res.json() as JobAccepted).job.id)
@@ -362,7 +378,7 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     const sent = notifications(mock)
     assert.equal(sent.length, 1)
     assert.equal(sent[0].severity, 'error')
-    assert.match(sent[0].title, /replication testpool\/share1 → testpool2\/share1 FAILED/)
+    assert.match(sent[0].title, /replication testpool\/share1 -> testpool2\/share1 FAILED/)
     // The route, the snapshot the run had settled on, and the error verbatim.
     assert.match(sent[0].body, /Source:\s+testpool\/share1/)
     assert.match(sent[0].body, /Target:\s+testpool2\/share1/)
@@ -371,21 +387,43 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.ok(sent[0].perl.includes('anas-replication'))
   })
 
-  it('a SUCCESSFUL replication is silent — healthy runs never mail', async () => {
+  it('a SUCCESSFUL replication is silent when the request names no mode', async () => {
+    // No `notify` in the body — the schema's `on-failure` applies, which is what
+    // an interactive replicate and every pre-9.4 task runner send.
     server = createServer({ mock: true, logger: false })
-    const mock = mockOf(server)
-    mock.clearFixtures()
-    mock.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2']), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/share1'), result: { stdout: snapshotListJson('testpool/share1', [{ name: 'repl-base', txg: 100 }]), stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, args: ['send', '-nvP', 'testpool/share1@repl-base'], result: { stdout: FULL_DRYRUN, stderr: '', exitCode: 0 } })
-    mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
-
+    const mock = armSuccessfulRun()
     const job = await replicateShare1()
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
     assert.deepEqual(notifications(mock), [])
+  })
+
+  it('`notify: always` in the body mails a SUCCESSFUL replication as `info`', async () => {
+    // This is how a task whose stored mode is `always` reaches the endpoint: its
+    // runner forwards the flag, and the run mails its own receipt.
+    server = createServer({ mock: true, logger: false })
+    const mock = armSuccessfulRun()
+    const job = await replicateShare1({ notify: 'always' })
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const sent = notifications(mock)
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].severity, 'info')
+    assert.match(sent[0].title, /replication testpool\/share1 -> testpool2\/share1 succeeded/)
+    assert.match(sent[0].body, /Result:\s+success/)
+    assert.match(sent[0].body, /Snapshot:\s+testpool\/share1@repl-base/)
+    assert.match(sent[0].body, /Mode:\s+full/)
+    assert.ok(sent[0].perl.includes('anas-replication'))
+  })
+
+  it('an invalid `notify` is rejected at the boundary → 400', async () => {
+    server = createServer({ mock: true, logger: false })
+    armSuccessfulRun()
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/share1/replicate',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ target: { pool: 'testpool2' }, notify: 'sometimes' }),
+    })
+    assert.equal(res.statusCode, 400)
   })
 
   it('a notification that cannot be delivered leaves the failed job exactly as it was', async () => {

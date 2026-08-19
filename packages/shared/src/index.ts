@@ -106,6 +106,7 @@ export {
   DiskId,
   hasControlChars,
   ISODateTime,
+  NotifyMode,
   PoolName,
   ShareName,
   SingleLine,

@@ -1,10 +1,11 @@
 import type { BackupNotifyMode, BackupPruneResult, BackupRepo, BackupTask } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { PveNotifySeverity } from './pve-notify.js'
+import type { NotifyOutcome } from './unattended-notify.js'
 import { BACKUP_SKIPPED_OFF_WEEK } from '@anas/shared'
 import { pruneSummaryLine } from './backup-prune.js'
 import { ANAS_BACKUP_NOTIFY_TEMPLATE, pveNotify } from './pve-notify.js'
-import { formatElapsed } from './unattended-notify.js'
+import { formatElapsed, notifySeverity, shouldNotify } from './unattended-notify.js'
 
 /** Re-exported for the callers (and tests) that have always imported it here. */
 export { formatElapsed }
@@ -29,16 +30,13 @@ const DURATION_LABEL_RE = /^Duration:\s*/i
 /** The `Starting backup: ` prefix on pbc's group line (the body says Snapshot:). */
 const STARTING_LABEL_RE = /^Starting backup:\s*/
 
-/** What a finished run amounts to, for notification purposes. */
-export type BackupNotifyOutcome
-  /** A run that backed up (or benignly had nothing new) and reported no problem. */
-  = | 'success'
-  /** Completed, but carrying warnings — e.g. a prune that failed after a good backup. */
-    | 'warning'
-  /** The run job failed; the error text rides the body. */
-    | 'failure'
-  /** A deliberate no-op (the biweekly off-week gate) — never notifies. */
-    | 'skip'
+/**
+ * What a finished run amounts to, for notification purposes. This IS the shared
+ * {@link NotifyOutcome} — 9.4 gave snapshot schedules and replication the same
+ * four outcomes, so the union (and the gate below) live in unattended-notify.ts
+ * and every family classifies into one vocabulary.
+ */
+export type BackupNotifyOutcome = NotifyOutcome
 
 /** The result shape a finished run hands back (runner result, or a gated skip). */
 export interface BackupNotifyResult {
@@ -82,27 +80,17 @@ export function backupNotifyOutcome(ctx: BackupNotifyContext): BackupNotifyOutco
 }
 
 /**
- * Does this outcome notify in this mode? `always` (the default) notifies every
- * real run; `on-failure` notifies only what went wrong — and a
- * completed-with-warnings run counts as wrong enough to mail (the prune
- * problem is precisely what an on-failure operator asked to hear about). A skip
- * notifies in neither mode.
+ * Does this outcome notify in this mode? The shared gate under a backup-shaped
+ * name — see {@link shouldNotify}: `always` notifies every real run,
+ * `on-failure` only warning + failure, a skip neither.
  */
 export function shouldNotifyBackup(mode: BackupNotifyMode, outcome: BackupNotifyOutcome): boolean {
-  if (outcome === 'skip')
-    return false
-  if (outcome === 'success')
-    return mode === 'always'
-  return true
+  return shouldNotify(mode, outcome)
 }
 
 /** Severity per outcome — PVE routes on it, so it is not decoration. */
 export function backupNotifySeverity(outcome: BackupNotifyOutcome): PveNotifySeverity {
-  if (outcome === 'failure')
-    return 'error'
-  if (outcome === 'warning')
-    return 'warning'
-  return 'info'
+  return notifySeverity(outcome)
 }
 
 /** The subject line's title (the template renders `ANAS: <title>`). */
@@ -114,12 +102,22 @@ export function backupNotifyTitle(task: BackupTask, outcome: BackupNotifyOutcome
   return `backup '${task.name}' succeeded`
 }
 
-/** `repo:datastore / namespace` — the target, spelled out, never truncated. */
+/**
+ * `repo:datastore / namespace` — the target, spelled out, never truncated.
+ *
+ * The datastore suffix is appended only when the repo NAME does not already end
+ * in it. A PVE-sourced repository is named `pve:<datastore>`, so the
+ * unconditional append rendered `pve:store1:store1` in a real notification
+ * (ground truth 2026-08-19) — the name already carried the datastore. An exact
+ * suffix check, not a contains: a repo genuinely named for a DIFFERENT datastore
+ * must still say so.
+ */
 export function backupTargetLine(ctx: BackupNotifyContext): string {
   const repoName = ctx.repo?.name ?? ctx.task.repository
   const datastore = ctx.repo?.datastore
   const namespace = ctx.namespace ?? ctx.task.namespace ?? ctx.repo?.namespace
-  return `${repoName}${datastore ? `:${datastore}` : ''}${namespace ? ` / ${namespace}` : ''}`
+  const suffix = datastore && !repoName.endsWith(`:${datastore}`) ? `:${datastore}` : ''
+  return `${repoName}${suffix}${namespace ? ` / ${namespace}` : ''}`
 }
 
 /**
@@ -141,6 +139,13 @@ function durationLine(ctx: BackupNotifyContext): string | null {
  * is what replaces reading the cron mail. Nothing here can carry a secret (pbc
  * keeps them in the environment, and every string below comes from the task
  * config or pbc's own stderr).
+ *
+ * ASCII ONLY, deliberately (ground truth 2026-08-19): an em-dash in the closing
+ * line arrived as mojibake on a real gotify target — something between PVE's
+ * notification pipeline and the delivery agent reads our UTF-8 as Latin-1. We do
+ * not own that pipeline and cannot fix it, so we stop giving it anything to get
+ * wrong. Same rule in every notify builder (snapshot + replication); guarded by
+ * a test in each family.
  */
 export function buildBackupNotifyBody(ctx: BackupNotifyContext): string {
   const outcome = backupNotifyOutcome(ctx)
@@ -151,7 +156,7 @@ export function buildBackupNotifyBody(ctx: BackupNotifyContext): string {
     ? 'FAILED'
     : outcome === 'warning'
       ? 'completed with warnings'
-      : result?.status === 'skipped' ? 'completed — nothing new to back up' : 'success'
+      : result?.status === 'skipped' ? 'completed - nothing new to back up' : 'success'
 
   lines.push(`Task:        ${ctx.task.name}`)
   lines.push(`Repository:  ${backupTargetLine(ctx)}`)
@@ -172,7 +177,7 @@ export function buildBackupNotifyBody(ctx: BackupNotifyContext): string {
   }
   else if (outcome !== 'failure') {
     lines.push('')
-    lines.push(`Archives:    none reported${result?.reason ? ` — ${result.reason}` : ''}`)
+    lines.push(`Archives:    none reported${result?.reason ? ` - ${result.reason}` : ''}`)
   }
 
   if (result?.prune) {
@@ -200,8 +205,8 @@ export function buildBackupNotifyBody(ctx: BackupNotifyContext): string {
 
   lines.push('')
   lines.push(`Schedule:    ${ctx.task.schedule}${ctx.task.enabled ? '' : ' (task disabled)'}`)
-  lines.push('Server-side snapshot history and verification state live in the PBS UI — '
-    + 'ANAS never reads them.')
+  // The body ends on the facts. No closing pointer, no editorial: the operator
+  // reading this run's mail knows where the UI is.
   return lines.join('\n')
 }
 

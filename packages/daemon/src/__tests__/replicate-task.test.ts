@@ -77,6 +77,25 @@ describe('replicate-task runner (Epic 5.5.3)', () => {
     )
   })
 
+  // --- 9.4: the notification mode is carried through, never invented --------
+
+  it('parses --notify and forwards it verbatim in the body', () => {
+    const opts = parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'backup', '--notify', 'always'])
+    assert.equal(opts.notify, 'always')
+    assert.deepEqual(
+      replicateBody(opts),
+      { notify: 'always', target: { pool: 'backup' }, snapshotFirst: false },
+    )
+  })
+
+  it('with NO --notify the body omits it — the endpoint owns the default', () => {
+    // A unit written before the flag existed must still work, and the runner
+    // must not substitute an opinion of its own (it is a dumb conduit).
+    const opts = parseRunnerArgs(['--pool', 'p', '--dataset', 'd', '--target-pool', 'backup'])
+    assert.equal(opts.notify, undefined)
+    assert.ok(!('notify' in replicateBody(opts)))
+  })
+
   // --- run loop (mocked requester) -----------------------------------------
   const OPTS = { pool: 'testpool', dataset: 'media', targetPool: 'backup', snapshotFirst: true, socket: '/x' }
   const noSleep = async () => {}

@@ -143,6 +143,74 @@
         return { valid: true, octal: s, symbolic: symbolic, plain: glossParts.join(' · ') };
     };
 
+    // ---- Notification mode (16.12 backup / 9.4 snapshots + replication) ----
+    // Three views now offer the SAME per-task knob, so the combo and its
+    // normalizer live here ONCE — the Backup, Snapshots and Replication dialogs
+    // must read identically (parallel construction), and three copies of a
+    // two-value enum would drift. The DEFAULT is per-family and passed in:
+    // backup defaults to 'always' (vzdump parity), snapshots and replication to
+    // 'on-failure' (a schedule can fire every 15 minutes).
+    ANAS.notifyMode = {
+        // Normalize whatever the daemon sent (or nothing at all) to a mode.
+        // An ABSENT value is the family's default — which is exactly what a task
+        // stored before the field existed reads back as.
+        of: function (value, dflt) {
+            var fallback = dflt === 'always' ? 'always' : 'on-failure';
+            var s = ('' + (value === undefined || value === null ? '' : value)).toLowerCase();
+            if (s === 'always') {
+                return 'always';
+            }
+            if (s === 'on-failure') {
+                return 'on-failure';
+            }
+            return fallback;
+        },
+
+        // The combo itself. `cfg` carries the per-view bits: itemId, cls, value.
+        field: function (cfg) {
+            cfg = cfg || {};
+            return {
+                xtype: 'combobox',
+                itemId: cfg.itemId || 'notifyMode',
+                cls: cfg.cls,
+                fieldLabel: cfg.fieldLabel || ANAS.t('Notification mode'),
+                store: [
+                    ['always', ANAS.t('Always')],
+                    ['on-failure', ANAS.t('On failure')]
+                ],
+                queryMode: 'local',
+                editable: false,
+                forceSelection: true,
+                allowBlank: false,
+                value: cfg.value
+            };
+        },
+
+        // A detail view's "Notifications" row — the mode in the words the dialog
+        // uses. (Backup's own detail says the same thing plus its off-week-skip
+        // caveat, which no other family has, so it keeps its own sentence.)
+        rowHtml: function (mode, what, type) {
+            var text = mode === 'on-failure'
+                ? ANAS.t('on failure — only a failed ' + what + ', or one that completed with warnings, notifies')
+                : ANAS.t('always — every ' + what + ' notifies, including a successful one');
+            return ANAS.enc(text) + ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+                + ANAS.enc(ANAS.t('— delivered by the Proxmox notification system (type ' + type + ')'))
+                + '</span>';
+        },
+
+        // The muted hint under the combo. `what` names the thing that runs
+        // ("run", "fire") and `type` the PVE notification type it is delivered
+        // as, so each view says the same sentence about its own events.
+        hintHtml: function (what, type) {
+            return '<span style="color:var(--anas-muted,gray);font-size:11px;">'
+                + ANAS.enc(ANAS.t('A finished ' + what + ' notifies through the Proxmox notification system '
+                    + '(type ' + type + ') — the same matchers and targets the rest of PVE uses. '
+                    + '"Always" also mails a ' + what + ' that succeeded; "On failure" mails only a failed '
+                    + what + ' or one that completed with warnings.'))
+                + '</span>';
+        }
+    };
+
     // Render a ZFS pool/vdev state with a coloured Font Awesome icon, mirroring
     // PVE's own render_zfs_health column style. Extends it with SUSPENDED.
     ANAS.renderState = function (value) {

@@ -32,6 +32,7 @@ function makeSchedule(over: Partial<SnapshotSchedule> = {}): SnapshotSchedule {
     retention: { daily: 7, weekly: 4, monthly: 6 },
     recursive: false,
     enabled: true,
+    notify: 'on-failure',
     ...over,
   }
 }
@@ -72,6 +73,17 @@ describe('snapshot schedule units — the systemd units ARE the store', () => {
       assert.match(unit, /Type=oneshot/)
       assert.match(unit, /Environment=TZ=UTC/)
     }
+  })
+
+  it('9.4: notify round-trips through X-ANAS-Schedule, and an ABSENT one reads as on-failure', () => {
+    const loud = makeSchedule({ notify: 'always' })
+    assert.deepEqual(parseServiceUnit(renderServiceUnit(loud)), loud)
+
+    // A unit written before 9.4 gained the knob — the store must keep firing it,
+    // with exactly the failure-only behaviour it had.
+    const legacy = renderServiceUnit(makeSchedule()).replace(/,"notify":"on-failure"/, '')
+    assert.doesNotMatch(legacy, /"notify"/)
+    assert.equal(parseServiceUnit(legacy)?.notify, 'on-failure')
   })
 
   it('parseServiceUnit returns null for a unit without the marker or with bad JSON', () => {

@@ -1,26 +1,30 @@
 import type { RetentionBucket, RetentionPolicy, SnapshotSchedule, SnapshotTarget } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
-import type { UnattendedNotifyBase, UnattendedOutcome } from './unattended-notify.js'
+import type { NotifyOutcome, UnattendedNotifyBase } from './unattended-notify.js'
 import { ANAS_SNAPSHOT_NOTIFY_TEMPLATE, pveNotify } from './pve-notify.js'
 import {
   elapsedLine,
-  shouldNotifyUnattended,
+  notifySeverity,
+  shouldNotify,
   unattendedOutcome,
-  unattendedSeverity,
 } from './unattended-notify.js'
 
 /**
  * Snapshot SCHEDULE run notifications (story 9.4, riding 16.12's machinery) —
- * an unattended take+prune that FAILS tells the operator through PVE's own
+ * an unattended take+prune tells the operator what happened through PVE's own
  * notification system, instead of waiting to be noticed on the dashboard.
  *
- * Failure-only by design (see unattended-notify.ts): a schedule can fire hourly,
- * so a success mail per fire would be noise, and 17.7 already says healthy is
- * silent. The body is shaped like the backup one (16.12) — plain text,
- * scannable, and detailed enough to read INSTEAD of the run: which schedule,
- * which target, the error verbatim, and the cadence/retention it runs under.
- * Nothing here can carry a secret (every string comes from the schedule's own
- * unit JSON or from `zfs`/`btrfs` stderr).
+ * FULL parity with backup (operator ruling 2026-08-19, "we should notify on
+ * successes too"): the same per-schedule two-mode knob, the same four outcomes,
+ * the same gate — with a quieter DEFAULT (`on-failure`), because a schedule can
+ * fire every 15 minutes and 17.7 already says healthy is silent on the dashboard.
+ * `always` is the opt-in for the operator who wants the take/prune receipt.
+ *
+ * The body is shaped like the backup one (16.12) — plain text, scannable, and
+ * detailed enough to read INSTEAD of the run: which schedule, which target, what
+ * was taken, what retention did, and on a failure the error verbatim. Nothing
+ * here can carry a secret (every string comes from the schedule's own unit JSON
+ * or from `zfs`/`btrfs` stderr).
  */
 
 /** Bucket order + label, oldest-to-newest, mirroring the shared RetentionBucket. */
@@ -40,9 +44,20 @@ export interface SnapshotNotifyContext extends UnattendedNotifyBase {
   result?: SnapshotNotifyResult
 }
 
-/** Classify a finished schedule fire (failure-only policy: error, or nothing). */
-export function snapshotNotifyOutcome(ctx: SnapshotNotifyContext): UnattendedOutcome {
-  return unattendedOutcome(ctx)
+/**
+ * Did this fire complete with something worth flagging? A prune that SKIPPED
+ * held snapshots is exactly that (the 17.6 `skippedHeld` surface, GT-7): the
+ * snapshot itself was taken, but retention could not do what policy asked, so
+ * the target keeps growing until the hold is released. That is a warning, not a
+ * failure — and it is precisely what an `on-failure` operator asked to hear.
+ */
+function fireHasWarnings(ctx: SnapshotNotifyContext): boolean {
+  return (ctx.result?.skippedHeld.length ?? 0) > 0
+}
+
+/** Classify a finished schedule fire into the shared four-outcome vocabulary. */
+export function snapshotNotifyOutcome(ctx: SnapshotNotifyContext): NotifyOutcome {
+  return unattendedOutcome(ctx, fireHasWarnings(ctx))
 }
 
 /**
@@ -65,31 +80,59 @@ export function retentionSummaryLine(retention: RetentionPolicy): string {
   return parts.length ? parts.join(' / ') : 'nothing kept by policy (newest is always kept)'
 }
 
+/**
+ * What the prune actually DID, in counts — the success body's receipt (backup's
+ * `Retention: …` line, in snapshot terms). Held snapshots are reported as
+ * retained, never as failed destroys.
+ */
+export function pruneSummaryLine(result: SnapshotNotifyResult): string {
+  const parts = [`${result.pruned.length} destroyed`]
+  if (result.skippedHeld.length)
+    parts.push(`${result.skippedHeld.length} held (kept despite policy)`)
+  return parts.join(', ')
+}
+
 /** The subject line's title (the template renders `ANAS: <title>`). */
-export function snapshotNotifyTitle(schedule: SnapshotSchedule, outcome: UnattendedOutcome): string {
-  return outcome === 'failure'
-    ? `snapshot schedule '${schedule.name}' FAILED`
-    : `snapshot schedule '${schedule.name}' succeeded`
+export function snapshotNotifyTitle(schedule: SnapshotSchedule, outcome: NotifyOutcome): string {
+  if (outcome === 'failure')
+    return `snapshot schedule '${schedule.name}' FAILED`
+  if (outcome === 'warning')
+    return `snapshot schedule '${schedule.name}' completed with warnings`
+  return `snapshot schedule '${schedule.name}' succeeded`
 }
 
 /** The notification BODY — plain text, scannable, error verbatim. */
 export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
-  const { schedule } = ctx
+  const { schedule, result } = ctx
   const outcome = snapshotNotifyOutcome(ctx)
   const lines: string[] = []
 
+  const status = outcome === 'failure'
+    ? 'FAILED'
+    : outcome === 'warning' ? 'completed with warnings' : 'success'
+
   lines.push(`Schedule:    ${schedule.name} (${schedule.id})`)
   lines.push(`Target:      ${snapshotTargetLine(schedule.target)}`)
-  lines.push(`Result:      ${outcome === 'failure' ? 'FAILED' : 'success'}`)
+  lines.push(`Result:      ${status}`)
   const duration = elapsedLine(ctx.elapsedMs)
   if (duration)
     lines.push(`Duration:    ${duration}`)
-  if (ctx.result?.taken)
-    lines.push(`Snapshot:    ${ctx.result.taken}`)
-  if (ctx.result?.pruned.length)
-    lines.push(`Pruned:      ${ctx.result.pruned.join(', ')}`)
-  if (ctx.result?.skippedHeld.length)
-    lines.push(`Held:        ${ctx.result.skippedHeld.join(', ')} (retained, never pruned)`)
+  if (result?.taken)
+    lines.push(`Snapshot:    ${result.taken}`)
+  if (result)
+    lines.push(`Pruned:      ${pruneSummaryLine(result)}`)
+  if (result?.pruned.length) {
+    lines.push('')
+    lines.push('Destroyed:')
+    for (const name of result.pruned)
+      lines.push(`  ${name}`)
+  }
+  if (result?.skippedHeld.length) {
+    lines.push('')
+    lines.push('Held (retained, never pruned):')
+    for (const name of result.skippedHeld)
+      lines.push(`  ${name}`)
+  }
 
   if (ctx.error !== undefined) {
     lines.push('')
@@ -101,29 +144,29 @@ export function buildSnapshotNotifyBody(ctx: SnapshotNotifyContext): string {
   lines.push(`Cadence:     ${schedule.cadence}${schedule.recursive ? ', recursive' : ''}`
     + `${schedule.enabled ? '' : ' (schedule disabled)'}`)
   lines.push(`Retention:   ${retentionSummaryLine(schedule.retention)}`)
-  lines.push('Snapshot inventory and the schedule\'s own last-run log live in the ANAS '
-    + 'Snapshots view.')
+  // The body ends on the facts (backup's rule) - no closing pointer to the UI.
   return lines.join('\n')
 }
 
 /**
- * Emit the schedule-run notification when the run failed. Called at the ONE
- * place every fire converges on — the daemon's run job (a timer fire and a UI
- * Run Now both arrive there), so one site covers both triggers.
+ * Emit the schedule-run notification, if this schedule's mode wants one. Called
+ * at the ONE place every fire converges on — the daemon's run job (a timer fire
+ * and a UI Run Now both arrive there), so one site covers both triggers.
  *
- * Never throws: the gate returns before anything is executed on a good run, and
- * pve-notify swallows delivery problems.
+ * Never throws: the mode check happens before anything is executed, so a
+ * schedule left on `on-failure` costs a good fire nothing at all, and pve-notify
+ * swallows delivery problems.
  */
 export async function notifyScheduleRun(
   executor: CommandExecutor,
   ctx: SnapshotNotifyContext,
 ): Promise<void> {
   const outcome = snapshotNotifyOutcome(ctx)
-  if (!shouldNotifyUnattended(outcome))
+  if (!shouldNotify(ctx.schedule.notify, outcome))
     return
   await pveNotify(
     executor,
-    unattendedSeverity(outcome),
+    notifySeverity(outcome),
     snapshotNotifyTitle(ctx.schedule, outcome),
     buildSnapshotNotifyBody(ctx),
     ANAS_SNAPSHOT_NOTIFY_TEMPLATE,

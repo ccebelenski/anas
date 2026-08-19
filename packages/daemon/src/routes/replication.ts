@@ -301,7 +301,7 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid replicate request: ${bodyParsed.error.issues[0]?.message}` } }
     }
-    const { target, snapshot, snapshotFirst } = bodyParsed.data
+    const { target, snapshot, snapshotFirst, notify: notifyMode } = bodyParsed.data
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -341,11 +341,14 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
 
     // 9.4 notification context. Built BEFORE the job so a run that dies early
     // still names source → target (and the peer/remote it was going to); the
-    // run records the snapshot it settles on as soon as it knows it.
+    // run records the snapshot it settles on as soon as it knows it. The MODE
+    // rides the request (a task's runner forwards its stored one; an interactive
+    // replicate omits it and the schema defaults to 'on-failure').
     const notify: ReplicationNotifyContext = {
       source,
       target: targetFull,
       ...(loc.isRemote && target.location ? { location: target.location } : {}),
+      notify: notifyMode,
     }
 
     const job = jobQueue.submit(
@@ -354,9 +357,10 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       async (updateProgress) => {
         // 9.4: this job is the ONE place every replication converges (a task
         // timer's runner and a UI replicate both submit it), so it is also the
-        // one place a run notification is emitted. Failure-only, and best-effort
-        // by contract: notifyReplicationRun never throws, so a broken mail
-        // target cannot turn a good replication into a failed job.
+        // one place a run notification is emitted — success, warning or failure,
+        // gated by the run's own mode. Best-effort by contract:
+        // notifyReplicationRun never throws, so a broken mail target cannot turn
+        // a good replication into a failed job.
         const startedAt = Date.now()
         try {
           // 1) Optional snapshot-first — create a fresh, sortable snapshot to send up to.

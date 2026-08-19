@@ -1,4 +1,4 @@
-import type { Job, JobRef } from '@anas/shared'
+import type { Job, JobRef, NotifyMode } from '@anas/shared'
 import type { Requester, RunLoopOptions } from './runner-poll.js'
 import { defaultSocket, errorMessage, identityHeaders, pollJobToTerminal, socketRequester } from './runner-poll.js'
 
@@ -29,6 +29,12 @@ export interface RunnerOptions {
   /** Peer nodename or registered remote name (with a non-local kind). */
   locationName?: string
   snapshotFirst: boolean
+  /**
+   * 9.4: the task's notification mode, forwarded verbatim to the endpoint that
+   * actually notifies. Absent = the endpoint's own default ('on-failure') — the
+   * runner has no opinion and never substitutes one.
+   */
+  notify?: NotifyMode
   socket: string
 }
 
@@ -56,6 +62,8 @@ export function parseRunnerArgs(argv: string[]): RunnerOptions {
       opts.locationKind = value as RunnerOptions['locationKind']
     else if (flag === '--location-name')
       opts.locationName = value
+    else if (flag === '--notify')
+      opts.notify = value as NotifyMode
     else if (flag === '--socket')
       opts.socket = value
     else if (flag === '--snapshot-first')
@@ -78,6 +86,7 @@ export function parseRunnerArgs(argv: string[]): RunnerOptions {
     ...(opts.targetDataset !== undefined ? { targetDataset: opts.targetDataset } : {}),
     ...(opts.locationKind !== undefined ? { locationKind: opts.locationKind } : {}),
     ...(opts.locationName !== undefined ? { locationName: opts.locationName } : {}),
+    ...(opts.notify !== undefined ? { notify: opts.notify } : {}),
     snapshotFirst: opts.snapshotFirst,
     socket: opts.socket ?? defaultSocket(),
   }
@@ -93,9 +102,15 @@ export function replicatePath(pool: string, dataset: string): string {
     : `/v1/pools/${pool}/datasets/${dataset}/replicate`
 }
 
-/** The replicate request body (newest source snapshot; optional snapshot-first). */
+/**
+ * The replicate request body (newest source snapshot; optional snapshot-first).
+ * 9.4: `notify` is forwarded only when the unit passed one — omitting it lets
+ * the endpoint's schema apply the default, which is also what an OLD unit
+ * (written before the flag existed) produces.
+ */
 export function replicateBody(opts: RunnerOptions): Record<string, unknown> {
   return {
+    ...(opts.notify !== undefined ? { notify: opts.notify } : {}),
     target: {
       pool: opts.targetPool,
       ...(opts.targetDataset !== undefined && opts.targetDataset !== '' ? { dataset: opts.targetDataset } : {}),

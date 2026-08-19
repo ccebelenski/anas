@@ -300,7 +300,9 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       async (updateProgress) => {
         // 9.4: this job is the ONE place every fire converges (the timer's
         // runner and a UI Run Now both submit it), so it is also the one place
-        // a run notification is emitted. Failure-only, and best-effort by
+        // a run notification is emitted — success, warning (a prune that had to
+        // skip held snapshots) or failure, gated by the SCHEDULE'S OWN mode
+        // (`schedule.notify`, which rode in with the unit JSON). Best-effort by
         // contract: notifyScheduleRun never throws, so a broken mail target
         // cannot turn a good snapshot into a failed job.
         const startedAt = Date.now()

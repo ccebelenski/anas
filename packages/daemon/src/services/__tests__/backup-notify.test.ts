@@ -150,13 +150,57 @@ describe('backup notifications — the body (16.12)', () => {
       repo: REPO,
       result: { status: 'skipped', archives: [], reason: 'snapshot timestamp collision (1-second resolution)' },
     })
-    assert.match(body, /Result:\s+completed — nothing new to back up/)
-    assert.match(body, /Archives:\s+none reported — snapshot timestamp collision/)
+    assert.match(body, /Result:\s+completed - nothing new to back up/)
+    assert.match(body, /Archives:\s+none reported - snapshot timestamp collision/)
   })
 
   it('the target line falls back to the task\'s configured repo when none resolved', () => {
     assert.equal(backupTargetLine({ task: makeTask() }), 'pbs-main')
     assert.equal(backupTargetLine({ task: makeTask(), repo: REPO }), 'pbs-main:store1')
+  })
+
+  it('a PVE-named repo does not double its datastore (ground truth 2026-08-19)', () => {
+    // A PVE-sourced repository is NAMED `pve:<datastore>`, so the old
+    // unconditional append rendered `pve:store1:store1` in a real notification.
+    const pveRepo: BackupRepo = { ...REPO, name: 'pve:store1' }
+    assert.equal(
+      backupTargetLine({ task: makeTask({ repository: 'pve:store1' }), repo: pveRepo }),
+      'pve:store1',
+    )
+    assert.equal(
+      backupTargetLine({ task: makeTask({ repository: 'pve:store1' }), repo: pveRepo, namespace: 'testing' }),
+      'pve:store1 / testing',
+    )
+    // Exact suffix, not a contains: a name ending in a DIFFERENT datastore, or
+    // merely containing this one, still gets the datastore spelled out.
+    assert.equal(
+      backupTargetLine({ task: makeTask(), repo: { ...REPO, name: 'pve:store2' } }),
+      'pve:store2:store1',
+    )
+    assert.equal(
+      backupTargetLine({ task: makeTask(), repo: { ...REPO, name: 'store1-mirror' } }),
+      'store1-mirror:store1',
+    )
+  })
+
+  it('the body ends on the facts — no closing pointer to the PBS UI', () => {
+    const body = buildBackupNotifyBody({ task: makeTask(), repo: REPO, result: { status: 'success', archives: [ARCHIVE_LINE] } })
+    assert.ok(!body.includes('PBS UI'), 'no editorial closing line')
+    assert.match(body.trimEnd(), /Schedule:\s+\*-\*-\* 02:00:00$/)
+  })
+
+  it('every body and title is pure ASCII — the delivery pipeline mangles anything else', () => {
+    // Ground truth 2026-08-19: an em-dash arrived as mojibake on a real gotify
+    // target. Nothing we build may contain a character that can be mangled.
+    const asciiOnly = /^[\x20-\x7E\n]*$/
+    for (const ctx of [
+      { task: makeTask(), repo: REPO, namespace: 'anastest', result: { status: 'success', archives: [ARCHIVE_LINE], duration: 'Duration: 4321.10s' } },
+      { task: makeTask(), repo: REPO, result: { status: 'skipped', archives: [], reason: 'snapshot timestamp collision (1-second resolution)' } },
+      { task: makeTask({ enabled: false }), repo: REPO, error: 'Error: permission check failed', elapsedMs: 1_000 },
+    ]) {
+      assert.match(buildBackupNotifyBody(ctx), asciiOnly)
+      assert.match(backupNotifyTitle(ctx.task, backupNotifyOutcome(ctx)), asciiOnly)
+    }
   })
 
   it('the title names the task and the outcome (the subject template renders it)', () => {

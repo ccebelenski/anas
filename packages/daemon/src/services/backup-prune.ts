@@ -161,14 +161,16 @@ export function classifyPruneVerdict(
   if (PRUNE_PERM_RE.test(stderr)) {
     return {
       verdict: 'permission',
-      detail: 'The credential lacks prune privileges — PBS wants Datastore.Modify or '
+      // ASCII only: this detail is embedded verbatim in the run notification's
+      // Warnings block, and that pipeline mangles non-ASCII (see backup-notify).
+      detail: 'The credential lacks prune privileges - PBS wants Datastore.Modify or '
         + `Datastore.Prune on this datastore/namespace (${firstErrorLine(stderr)}).`,
     }
   }
   if (PRUNE_ENOENT_RE.test(stderr)) {
     return {
       verdict: 'not-found',
-      detail: 'The backup group or the namespace does not exist on the server — PBS reports '
+      detail: 'The backup group or the namespace does not exist on the server - PBS reports '
         + 'the same ENOENT for both, so which one is missing cannot be told apart.',
     }
   }

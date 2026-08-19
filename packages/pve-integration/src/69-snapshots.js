@@ -19,7 +19,10 @@
  *   GET    /schedules            → { data: [ { schedule, lastRunResult, lastRunAt,
  *                                     nextRunAt, overdue } ] }
  *     schedule = { id, name, target:{kind:'zfs',dataset}|{kind:'ahr',pool},
- *                  cadence, retention:{frequently?..yearly?}, recursive?, enabled }
+ *                  cadence, retention:{frequently?..yearly?}, recursive?, enabled,
+ *                  notify ('always'|'on-failure' — when a finished fire notifies
+ *                  through PVE; 9.4. ABSENT = 'on-failure', the quiet default a
+ *                  schedule stored before the field reads back as) }
  *   POST   /schedules            → SnapshotSchedule body (create, 202 job)
  *   GET    /schedules/:id        → { data: DETAIL } — the status fields PLUS the
  *                                  last run's exit code, the unit files verbatim,
@@ -332,6 +335,15 @@
         });
     }
 
+    // ---- Notifications (9.4) -----------------------------------------------
+    // When a finished fire notifies through PVE — backup's own two modes, but
+    // with the QUIET default: a schedule can fire every 15 minutes. ABSENT means
+    // 'on-failure' (the daemon's schema default), which is exactly what every
+    // schedule created before the field existed reads back as.
+    function notifyOf(sched) {
+        return ANAS.notifyMode.of(sched && sched.notify, 'on-failure');
+    }
+
     // Flatten a SnapshotScheduleStatus into a grid record; keep the raw schedule
     // under 'raw' so edit / toggle round-trip it exactly.
     function scheduleRow(status) {
@@ -346,6 +358,7 @@
             cadence: sched.cadence,
             retention: sched.retention || {},
             recursive: !!sched.recursive,
+            notify: notifyOf(sched),
             enabled: sched.enabled !== false,
             lastRunResult: status.lastRunResult || 'unknown',
             lastRunAt: status.lastRunAt,
@@ -780,6 +793,17 @@
                                 }
                             ].concat(BUCKETS.map(retentionFieldRow))
                         },
+                        // --- Notifications (9.4) — the same knob Backup has ---
+                        ANAS.notifyMode.field({
+                            itemId: 'notifyMode',
+                            cls: 'anas-fld-sched-notify',
+                            value: notifyOf(sched)
+                        }),
+                        {
+                            xtype: 'component',
+                            style: 'margin:-4px 0 8px 152px;',
+                            html: ANAS.notifyMode.hintHtml('fire', 'anas-snapshot')
+                        },
                         {
                             xtype: 'checkboxfield',
                             itemId: 'enabled',
@@ -940,6 +964,7 @@
             target: target,
             cadence: valOf(win, '#cadence') || 'daily',
             retention: retention,
+            notify: ANAS.notifyMode.of(valOf(win, '#notifyMode'), 'on-failure'),
             enabled: !!valOf(win, '#enabled')
         };
         if (kind === 'zfs' && valOf(win, '#recursive')) {
@@ -1021,6 +1046,9 @@
             target: raw.target || targetFromRecord(rec),
             cadence: raw.cadence || rec.get('cadence'),
             retention: raw.retention || rec.get('retention') || {},
+            // 9.4: carry the notify mode through, or a toggle silently resets it
+            // (the same trap the biweekly-cadence fix closed for backup tasks).
+            notify: raw.notify || rec.get('notify') || 'on-failure',
             enabled: next
         };
         if (raw.recursive || (raw.target === undefined && rec.get('recursive'))) {
@@ -1188,6 +1216,7 @@
             + kv(t('Cadence'), enc('' + (s.cadence || '')))
             + kv(t('Retention'), '<span style="font-family:monospace;font-size:0.9em;">'
                 + enc(retentionSummary(s.retention) || '—') + '</span>')
+            + kv(t('Notifications'), ANAS.notifyMode.rowHtml(notifyOf(s), t('fire'), 'anas-snapshot'))
             + kv(t('Enabled'), s.enabled !== false
                 ? '<span style="color:var(--anas-ok,#1f9c56);">' + enc(t('yes')) + '</span>'
                 : '<span style="color:var(--anas-muted,gray);">' + enc(t('no')) + '</span>')
@@ -1286,7 +1315,7 @@
     function schedulesView(node) {
         var store = Ext.create('Ext.data.Store', {
             fields: [
-                'id', 'name', 'targetKind', 'targetPath', 'cadence',
+                'id', 'name', 'targetKind', 'targetPath', 'cadence', 'notify',
                 'lastRunResult', 'lastRunAt', 'nextRunAt',
                 { name: 'retention', type: 'auto' },
                 { name: 'recursive', type: 'auto' },
@@ -1489,6 +1518,7 @@
             target: targetFromRecord(rec),
             cadence: rec.get('cadence'),
             retention: rec.get('retention') || {},
+            notify: rec.get('notify') || 'on-failure',
             enabled: !!rec.get('enabled')
         };
         if (rec.get('recursive')) {

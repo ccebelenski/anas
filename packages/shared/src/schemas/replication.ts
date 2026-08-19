@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { DatasetPath, hasControlChars, ISODateTime, PoolName, SingleLine, SnapshotName } from './common.js'
+import { DatasetPath, hasControlChars, ISODateTime, NotifyMode, PoolName, SingleLine, SnapshotName } from './common.js'
 
 /**
  * A replication dataset field: a validated ZFS DatasetPath, OR the empty string.
@@ -108,6 +108,18 @@ export const ReplicateRequest = z.object({
    *  snapshot dialog default), then replicate up to it.
    */
   snapshotFirst: z.boolean().optional(),
+  /**
+   * When THIS run notifies through PVE (story 9.4). The mode has to arrive with
+   * the REQUEST because the one-shot endpoint is the single place every
+   * replication converges and it deliberately knows nothing about tasks — a
+   * recurring task's runner forwards its own stored mode here (see
+   * {@link ReplicationTask.notify}), while an interactive replicate simply omits
+   * the field and gets the quiet default.
+   *
+   * Additive + defaulted, so an OLD client (or the pre-9.4 runner) that sends no
+   * `notify` keeps the failure-only behaviour rather than erroring.
+   */
+  notify: NotifyMode.default('on-failure'),
 })
 export type ReplicateRequest = z.infer<typeof ReplicateRequest>
 
@@ -137,6 +149,17 @@ export const ReplicationTask = z.object({
   /** Snapshot the source before each run (recommended; default true). */
   snapshotFirst: z.boolean().default(true),
   enabled: z.boolean().default(true),
+  /**
+   * When a finished run notifies through PVE (story 9.4, backup 16.12's modes).
+   * DEFAULT `on-failure`, deliberately quieter than backup's `always` — and the
+   * behaviour every task stored before the field existed keeps, since an absent
+   * value parses back to it.
+   *
+   * The task JSON is where the mode LIVES; the timer's runner carries it to the
+   * one-shot endpoint that actually notifies (services/replication-units.ts
+   * runnerArgs → replicate-task.ts → {@link ReplicateRequest.notify}).
+   */
+  notify: NotifyMode.default('on-failure'),
   /**
    * Read-path ONLY: set true (with a reason) when a STORED task failed STRICT
    * validation but parsed leniently — e.g. a dataset that no longer matches the

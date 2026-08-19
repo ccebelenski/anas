@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AbsolutePath, ISODateTime } from './common.js'
+import { AbsolutePath, ISODateTime, NotifyMode } from './common.js'
 
 /**
  * PBS file backup (Epic 16) — back up host FILE data (shares, datasets, any
@@ -306,21 +306,24 @@ export type BackupPrunePreviewResponse = z.infer<typeof BackupPrunePreviewRespon
 // ---- Notifications (story 16.12) -------------------------------------------
 
 /**
- * When a finished backup run emits a PVE notification — vzdump's own two modes,
- * with vzdump's own DEFAULT (`always`): the cron jobs this epic replaced mailed
- * every run's full output, and the operator wants the detailed on-completion
- * mail, not just the failure one.
+ * When a finished backup run emits a PVE notification. This IS the shared
+ * {@link NotifyMode} (9.4 extended the same two modes to snapshot schedules and
+ * replication, so the enum moved to common.ts and every family reads it from
+ * there); the name is kept as an alias because 16.12's callers and tests import
+ * it, and because it is the natural word at a backup call site.
  *
- * `always`     — every run that DID something notifies (success = info,
- *                completed-with-warnings = warning, failure = error).
- * `on-failure` — only the runs that went wrong notify (warning + error).
+ * Backup's DEFAULT is `always` — vzdump parity: the cron jobs this epic replaced
+ * mailed every run's full output, and the operator wants the detailed
+ * on-completion mail, not just the failure one. That is a BACKUP ruling, not a
+ * global one: snapshot schedules and replication deliberately default to
+ * `on-failure` (see NotifyMode).
  *
  * A deliberate off-week skip ({@link BACKUP_SKIPPED_OFF_WEEK}) NEVER notifies in
  * either mode: the cadence gate produced no run, and the cron jobs it replaces
  * produced no mail either — a non-event is a non-event.
  */
-export const BackupNotifyMode = z.enum(['always', 'on-failure'])
-export type BackupNotifyMode = z.infer<typeof BackupNotifyMode>
+export const BackupNotifyMode = NotifyMode
+export type BackupNotifyMode = NotifyMode
 
 // ---- Repositories ----------------------------------------------------------
 

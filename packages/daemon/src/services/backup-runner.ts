@@ -4,6 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import { lookup } from 'node:dns/promises'
 import { createConnection } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
+import { backupTargetLine } from './backup-notify.js'
 
 /**
  * Backup RUNNER logic (Epic 16.7) — assembles the pbc environment + argv,
@@ -280,7 +281,9 @@ export async function runBackup(
   // cap pbc hoards handles — worst in metadata mode — until the network
   // stack degrades.
   const nofile = task.limitNofile ?? 1024
-  updateProgress(`starting backup ${task.name} → ${repo.name}:${repo.datastore}`)
+  // Same un-doubled target rendering as the notification body (a pve-sourced
+  // repo is NAMED pve:<datastore>, so a blind `:datastore` suffix duplicates).
+  updateProgress(`starting backup ${task.name} -> ${backupTargetLine({ task, repo })}`)
   const r = await executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env })
 
   const progress = parseBackupProgress(r.stderr)
@@ -291,7 +294,9 @@ export async function runBackup(
   const outcome = classifyBackupResult(r.exitCode, r.stderr)
   if (outcome.kind === 'failure') {
     const prefix = outcome.owner
-      ? 'backup owner mismatch — this backup-id is owned by a different auth-id; '
+      // ASCII only: this text becomes the run job's error and is embedded
+      // verbatim in the notification body (see backup-notify's ASCII rule).
+      ? 'backup owner mismatch - this backup-id is owned by a different auth-id; '
       + 'switching a repo\'s auth style needs a server-side change-owner. '
       : ''
     throw new Error(`${prefix}${outcome.detail}`)
@@ -308,7 +313,7 @@ export async function runBackup(
   if (progress.duration)
     result.duration = progress.duration
   if (outcome.kind === 'too-soon')
-    result.reason = 'snapshot timestamp collision (1-second resolution) — nothing new to back up yet'
+    result.reason = 'snapshot timestamp collision (1-second resolution) - nothing new to back up yet'
   return result
 }
 

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { DatasetPath, ISODateTime, PoolName } from './common.js'
+import { DatasetPath, ISODateTime, NotifyMode, PoolName } from './common.js'
 import { ScanFunction } from './zfs.js'
 
 // ============================================================================
@@ -108,6 +108,17 @@ export const SnapshotSchedule = z.object({
   recursive: z.boolean().optional(),
   /** Whether the schedule is active (a disabled schedule keeps but never takes). */
   enabled: z.boolean(),
+  /**
+   * When a finished fire notifies through PVE (story 9.4, backup 16.12's modes).
+   * DEFAULT `on-failure`, deliberately quieter than backup's `always`: a schedule
+   * can fire every 15 minutes, so success mail per fire is spam. `always` is the
+   * explicit opt-in for the operator who wants the take/prune receipt.
+   *
+   * Additive + defaulted, so a schedule STORED before the field existed parses
+   * back as `on-failure` — exactly the failure-only behaviour 9.4 first shipped,
+   * i.e. the upgrade changes nothing until someone opts in.
+   */
+  notify: NotifyMode.default('on-failure'),
 })
 export type SnapshotSchedule = z.infer<typeof SnapshotSchedule>
 

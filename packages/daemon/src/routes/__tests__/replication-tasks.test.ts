@@ -97,7 +97,24 @@ describe('replication task routes (Epic 5.5.3)', () => {
     assert.ok(files.includes('anas-repl-nightly-media.service'))
     assert.ok(files.includes('anas-repl-nightly-media.timer'))
     const parsed = parseServiceUnit(await readFile(join(dir, 'anas-repl-nightly-media.service'), 'utf-8'))
-    assert.deepEqual(parsed, TASK)
+    // A body that omits `notify` (9.4) is STORED with the schema's default, so
+    // the unit always spells the mode out rather than leaving it implicit.
+    assert.deepEqual(parsed, { ...TASK, notify: 'on-failure' })
+  })
+
+  it('9.4: the notify mode round-trips through the unit store — an edit sticks', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const put = await server.inject({
+      method: 'PUT',
+      url: '/v1/replication/tasks/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...TASK, notify: 'always' }),
+    })
+    await waitForJob(server, put.json().job.id)
+    const stored = parseServiceUnit(await readFile(join(dir, 'anas-repl-nightly-media.service'), 'utf-8'))
+    assert.equal(stored?.notify, 'always')
+    // The runner has to CARRY it to the endpoint that actually notifies.
+    assert.match(await readFile(join(dir, 'anas-repl-nightly-media.service'), 'utf-8'), /--notify always/)
   })
 
   it('POST a duplicate name → 409', async () => {

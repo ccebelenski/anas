@@ -49,7 +49,10 @@
  *                                            lastReplicatedAt, snapshotsBehind,
  *                                            lastRunResult, nextRunAt } ] }
  *     task = { name, source:{pool,dataset}, target:{pool,dataset?}, schedule,
- *              snapshotFirst, enabled }
+ *              snapshotFirst, enabled,
+ *              notify ('always'|'on-failure' — when a finished run notifies
+ *              through PVE; 9.4. ABSENT = 'on-failure', the quiet default a task
+ *              stored before the field reads back as) }
  *   POST   /replication/tasks            → ReplicationTask body (create)
  *   PUT    /replication/tasks/:name      → ReplicationTask body (edit / toggle)
  *   DELETE /replication/tasks/:name      → removes the schedule (units) only
@@ -371,6 +374,14 @@
         });
     }
 
+    // ---- Notifications (9.4) -----------------------------------------------
+    // When a finished run notifies through PVE — backup's own two modes, but with
+    // the QUIET default. ABSENT means 'on-failure' (the daemon's schema default),
+    // which is exactly what every task created before the field reads back as.
+    function notifyOf(task) {
+        return ANAS.notifyMode.of(task && task.notify, 'on-failure');
+    }
+
     // Flatten a { task, ...runtime } entry into a grid record; keep the raw task
     // object under 'raw' so edit / enable-disable can round-trip it.
     function taskRow(entry) {
@@ -389,6 +400,7 @@
             targetLocationName: loc.name || '',
             schedule: task.schedule,
             snapshotFirst: !!task.snapshotFirst,
+            notify: notifyOf(task),
             enabled: task.enabled !== false,
             lastReplicatedSnapshot: entry.lastReplicatedSnapshot,
             lastReplicatedAt: entry.lastReplicatedAt,
@@ -1528,6 +1540,17 @@
                             boxLabel: t('Take a fresh snapshot before each run'),
                             checked: task.snapshotFirst !== false,
                         },
+                        // --- Notifications (9.4) — the same knob Backup has ---
+                        ANAS.notifyMode.field({
+                            itemId: 'notifyMode',
+                            cls: 'anas-fld-repl-notify',
+                            value: notifyOf(task),
+                        }),
+                        {
+                            xtype: 'component',
+                            style: 'margin:-4px 0 8px 152px;',
+                            html: ANAS.notifyMode.hintHtml('run', 'anas-replication'),
+                        },
                         {
                             xtype: 'checkboxfield',
                             itemId: 'enabled',
@@ -1637,6 +1660,7 @@
             target: { pool: targetPool },
             schedule: schedule,
             snapshotFirst: !!valOf(win, '#snapshotFirst'),
+            notify: ANAS.notifyMode.of(valOf(win, '#notifyMode'), 'on-failure'),
             enabled: !!valOf(win, '#enabled'),
         };
         if (targetDataset) {
@@ -1703,6 +1727,9 @@
             target: raw.target || { pool: rec.get('targetPool') },
             schedule: raw.schedule || rec.get('schedule'),
             snapshotFirst: raw.snapshotFirst !== undefined ? !!raw.snapshotFirst : !!rec.get('snapshotFirst'),
+            // 9.4: carry the notify mode through, or a toggle silently resets it
+            // (the same trap the biweekly-cadence fix closed for backup tasks).
+            notify: raw.notify || rec.get('notify') || 'on-failure',
             enabled: next,
         };
         if (!body.target.dataset && rec.get('targetDataset')) {
@@ -2272,7 +2299,7 @@
             fields: [
                 'name', 'sourcePool', 'sourceDataset', 'targetPool', 'targetDataset',
                 'targetLocationKind', 'targetLocationName',
-                'schedule', 'lastReplicatedSnapshot', 'lastReplicatedAt', 'lastRunResult', 'nextRunAt',
+                'schedule', 'notify', 'lastReplicatedSnapshot', 'lastReplicatedAt', 'lastRunResult', 'nextRunAt',
                 { name: 'snapshotFirst', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
                 { name: 'snapshotsBehind', type: 'auto' },
@@ -2498,6 +2525,7 @@
             target: target,
             schedule: rec.get('schedule'),
             snapshotFirst: !!rec.get('snapshotFirst'),
+            notify: rec.get('notify') || 'on-failure',
             enabled: !!rec.get('enabled'),
         };
     }

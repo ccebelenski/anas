@@ -96,7 +96,12 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     const files = await readdir(dir)
     assert.ok(files.includes('anas-snap-nightly-media.service'))
     assert.ok(files.includes('anas-snap-nightly-media.timer'))
-    assert.deepEqual(parseServiceUnit(await readFile(join(dir, 'anas-snap-nightly-media.service'), 'utf-8')), SCHEDULE)
+    // A body that omits `notify` (9.4) is STORED with the schema's default, so
+    // the unit always spells the mode out rather than leaving it implicit.
+    assert.deepEqual(
+      parseServiceUnit(await readFile(join(dir, 'anas-snap-nightly-media.service'), 'utf-8')),
+      { ...SCHEDULE, notify: 'on-failure' },
+    )
     // The timer carries the cadence→OnCalendar translation.
     assert.match(await readFile(join(dir, 'anas-snap-nightly-media.timer'), 'utf-8'), /OnCalendar=daily/)
   })
@@ -222,11 +227,13 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
   })
 
   // ==========================================================================
-  //  Run notifications (story 9.4) — FAILURE ONLY, at the ONE emission point
+  //  Run notifications (story 9.4) — the per-schedule mode, one emission point
   // ==========================================================================
   // A timer fire and a UI Run Now both reach the daemon's run job, so that job
-  // is where the notification is emitted — one site, both triggers. A schedule
-  // can fire hourly, so a healthy run says nothing at all (17.7's policy).
+  // is where the notification is emitted — one site, both triggers. The mode is
+  // the SCHEDULE's own (`notify`, riding the unit JSON): the default
+  // `on-failure` keeps a healthy hourly schedule silent (17.7's policy), and the
+  // opt-in `always` mails the take/prune receipt too.
 
   const PERL = '/usr/bin/perl'
 
@@ -271,12 +278,52 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     assert.ok(sent[0].perl.includes('anas-snapshot'))
   })
 
-  it('a SUCCESSFUL fire is silent — healthy schedules never mail', async () => {
+  it('a SUCCESSFUL fire is silent on the DEFAULT mode — healthy schedules never mail', async () => {
+    // SCHEDULE carries no `notify`, so the schema's `on-failure` applies: the
+    // behaviour 9.4 first shipped, unchanged by the arrival of the knob.
     await waitForJob(server, (await create()).json().job.id)
     const mock = armNotify()
     const run = await server.inject({ method: 'POST', url: '/v1/schedules/nightly-media/run', headers: JSON_HEADERS, payload: '{}' })
     assert.equal((await waitForJob(server, run.json().job.id)).status, 'completed')
     assert.deepEqual(notifications(mock), [])
+  })
+
+  it('an `always` schedule mails a SUCCESSFUL fire as `info`, with the take/prune receipt', async () => {
+    await waitForJob(server, (await create({ ...SCHEDULE, notify: 'always' })).json().job.id)
+    const mock = armNotify()
+    const run = await server.inject({ method: 'POST', url: '/v1/schedules/nightly-media/run', headers: JSON_HEADERS, payload: '{}' })
+    assert.equal((await waitForJob(server, run.json().job.id)).status, 'completed')
+    const sent = notifications(mock)
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].severity, 'info')
+    assert.match(sent[0].title, /snapshot schedule 'Nightly media' succeeded/)
+    assert.match(sent[0].body, /Result:\s+success/)
+    assert.match(sent[0].body, /Snapshot:\s+anas-daily-/)
+    assert.match(sent[0].body, /Pruned:\s+0 destroyed/)
+    assert.ok(sent[0].perl.includes('anas-snapshot'))
+  })
+
+  it('an `always` schedule still mails a FAILED fire as `error`', async () => {
+    await waitForJob(server, (await create({ ...SCHEDULE, notify: 'always' })).json().job.id)
+    const mock = armNotify({ zfs: { stderr: 'out of space', exitCode: 1 } })
+    const run = await server.inject({ method: 'POST', url: '/v1/schedules/nightly-media/run', headers: JSON_HEADERS, payload: '{}' })
+    assert.equal((await waitForJob(server, run.json().job.id)).status, 'failed')
+    const sent = notifications(mock)
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].severity, 'error')
+  })
+
+  it('the mode round-trips through the unit store — an edit that sets it sticks', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const put = await server.inject({
+      method: 'PUT',
+      url: '/v1/schedules/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...SCHEDULE, notify: 'always' }),
+    })
+    await waitForJob(server, put.json().job.id)
+    const detail = await server.inject({ method: 'GET', url: '/v1/schedules/nightly-media' })
+    assert.equal(detail.json().data.schedule.notify, 'always')
   })
 
   it('a notification that cannot be delivered leaves the failed job exactly as it was', async () => {

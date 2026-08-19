@@ -99,3 +99,25 @@ export const UUID = z.string().uuid()
 
 /** Disk by-id identifier, e.g. "scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT1" */
 export const DiskId = z.string().min(1).regex(/^[\w.-]+$/, 'Invalid disk by-id identifier')
+
+/**
+ * WHEN a finished unattended run emits a PVE notification — vzdump's own two
+ * modes, spelled ONCE for every family that has runs (backup 16.12, snapshot
+ * schedules and replication 9.4). One vocabulary, one gate, one combo: the three
+ * views must read identically (parallel construction), and a second enum would
+ * be the same decision made twice.
+ *
+ * `always`     — every run that DID something notifies (success = info,
+ *                completed-with-warnings = warning, failure = error).
+ * `on-failure` — only the runs that went wrong notify (warning + error).
+ *
+ * The DEFAULT is deliberately per-family, not global — it is a judgement about
+ * that family's run frequency, not about the modes:
+ *   - backup defaults to `always` (vzdump parity; the cron mail it replaced sent
+ *     every run's full output),
+ *   - snapshot schedules and replication default to `on-failure` (a schedule can
+ *     fire every 15 minutes; an `always` there would be spam nobody reads, and
+ *     it keeps the pre-9.4-knob behaviour for schedules that predate the field).
+ */
+export const NotifyMode = z.enum(['always', 'on-failure'])
+export type NotifyMode = z.infer<typeof NotifyMode>
