@@ -90,16 +90,12 @@ test.describe('ANAS dashboard (stunt node)', () => {
 
     // When live telemetry lands, the Pool → VDEV → Device nesting appears:
     // devices (.anas-dash-disk) live INSIDE a vdev (.anas-dash-vdev) inside a
-    // pool, and each vdev carries its own time chart. Per-device tiles are live
-    // numbers + a bar only — never a chart. Tolerant of telemetry not (yet)
-    // being available — fail-open.
+    // pool. Per-device tiles are live numbers + a bar only — never a chart.
+    // Tolerant of telemetry not (yet) being available — fail-open.
     const vdevCount = await view.locator('.anas-dash-pools .anas-dash-vdev').count()
     if (vdevCount > 0) {
       await expect(
         view.locator('.anas-dash-pools .anas-dash-vdev').first(),
-      ).toBeVisible({ timeout: 20_000 })
-      await expect(
-        view.locator('.anas-dash-pools .anas-dash-vdev .anas-gfx-timechart').first(),
       ).toBeVisible({ timeout: 20_000 })
       const nestedDisks = await view
         .locator('.anas-dash-pools .anas-dash-vdev .anas-dash-disk')
@@ -110,13 +106,41 @@ test.describe('ANAS dashboard (stunt node)', () => {
         view.locator('.anas-dash-pools .anas-dash-vdev .anas-dash-disk .anas-gfx-timechart'),
       ).toHaveCount(0)
 
-      // Latency is shown as a now/peak/avg readout (instantaneous, plus peak and
-      // average over the rolling 5-minute window) at the pool, vdev and device
-      // levels — each carrying the .anas-dash-lat hook. Present once telemetry
-      // lands, which is guaranteed inside this vdev-present branch.
+      // A pool's SOLE vdev/band is collapsed: it keeps its header row and its
+      // member tiles, but its chart and readouts would only repeat the pool
+      // block's, so they are dropped. Two or more and each renders in full.
+      const pools = view.locator('.anas-dash-pools .anas-dash-pool')
+      for (let i = 0; i < await pools.count(); i++) {
+        const pool = pools.nth(i)
+        // The spare bay is a tier without I/O of its own — not a vdev/band.
+        const tiers = pool.locator('.anas-dash-vdev:not(.anas-dash-vdev-spare)')
+        const n = await tiers.count()
+        if (n === 1) {
+          await expect(tiers.first()).toHaveClass(/anas-dash-vdev-solo/)
+          await expect(tiers.first().locator('.anas-gfx-timechart')).toHaveCount(0)
+          await expect(tiers.first().locator('.anas-dash-disk').first()).toBeVisible()
+        }
+        else if (n > 1) {
+          for (let v = 0; v < n; v++) {
+            await expect(tiers.nth(v)).not.toHaveClass(/anas-dash-vdev-solo/)
+            await expect(tiers.nth(v).locator('.anas-gfx-timechart').first()).toBeVisible()
+          }
+        }
+      }
+
+      // Latency is shown as a labelled readout (a short rolling average, plus
+      // peak and average over the rolling 5-minute window) at the pool, vdev and
+      // device levels — each carrying the .anas-dash-lat hook. Present once
+      // telemetry lands, which is guaranteed inside this vdev-present branch.
       await expect(
         view.locator('.anas-dash-pools .anas-dash-lat').first(),
       ).toBeVisible({ timeout: 20_000 })
+
+      // Every figure names its direction and its window — no bare ▼/▲ glyphs,
+      // and no unlabelled "current" figure claiming a bursty pool is idle.
+      const poolsText = (await view.locator('.anas-dash-pools').textContent()) ?? ''
+      expect(poolsText).not.toMatch(/[▼▲]/)
+      expect(poolsText).toContain('avg 10s R ')
     }
   })
 

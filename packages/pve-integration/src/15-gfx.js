@@ -51,6 +51,9 @@
  *     .anas-gfx-donut                breakdown ring
  *     .anas-gfx-legend / -legend-row donut legend
  *     .anas-gfx-timechart            labelled time-series chart (axes + legend)
+ *     .anas-gfx-tc-avg               rolling-average overlay line
+ *     .anas-gfx-tc-nodata            hatched not-yet-sampled region
+ *     .anas-gfx-tc-fit               manual scale re-fit control ([data-anas-tcfit])
  *   Status & labels (monitor side)
  *     .anas-gfx-pill / -pill-<lvl>   pool/vdev state pill (online|degraded|faulted)
  *     .anas-gfx-chip / -chip-good    dataset property chip
@@ -159,6 +162,12 @@
             + '<stop offset="0" stop-color="#3a4048"/><stop offset="1" stop-color="#22262c"/></linearGradient>'
             + '<linearGradient id="anasMDead" x1="0" y1="0" x2="0" y2="1">'
             + '<stop offset="0" stop-color="#c9b3b0"/><stop offset="1" stop-color="#9a8582"/></linearGradient>'
+            // Diagonal hatch for a time chart's not-yet-sampled region. A flat
+            // tint would read as another data band; a hatch reads as "nothing
+            // here". Neutral grey so it works over both theme backgrounds.
+            + '<pattern id="anasTcNoData" width="6" height="6" patternUnits="userSpaceOnUse" '
+            + 'patternTransform="rotate(45)">'
+            + '<line x1="0" y1="0" x2="0" y2="6" stroke="#8a93a0" stroke-width="1"/></pattern>'
             + '</defs></svg>';
     }
 
@@ -262,6 +271,30 @@
         css.push('.anas-gfx-timechart .anas-gfx-tc-title{fill:var(--anas-muted);font-size:10.5px;font-weight:700}');
         css.push('.anas-gfx-timechart .anas-gfx-tc-legend{fill:var(--anas-ink);font-size:11px;font-variant-numeric:tabular-nums}');
         css.push('.anas-gfx-timechart .anas-gfx-tc-empty{fill:var(--anas-muted);font-size:11px}');
+        // "avg Ns" tag naming what the legend numbers are.
+        css.push('.anas-gfx-timechart .anas-gfx-tc-avgtag{fill:var(--anas-muted);font-size:9.5px;'
+            + 'font-weight:700;letter-spacing:.3px}');
+        // Rolling-average overlay: same series colour, deliberately subordinate to
+        // the raw line (thin + translucent) so it reads as a guide, not the data.
+        css.push('.anas-gfx-timechart .anas-gfx-tc-avg{stroke-width:1;stroke-opacity:.62}');
+        // Unsampled region: hatch + its label.
+        css.push('.anas-gfx-timechart .anas-gfx-tc-nodata{fill:url(#anasTcNoData);opacity:.5}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-nodatalab{fill:var(--anas-muted);font-size:9.5px}');
+        // Manual re-fit control: a quiet line-icon in the control register (see
+        // the three-register contract) — muted until hovered, never competing
+        // with the data it sits beside.
+        css.push('.anas-gfx-timechart .anas-gfx-tc-fit{cursor:pointer}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-fit rect{fill:transparent;'
+            + 'stroke:var(--anas-line);stroke-width:1}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-fit path,.anas-gfx-timechart .anas-gfx-tc-fit line{'
+            + 'fill:none;stroke:var(--anas-muted);stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-fit:hover rect,'
+            + '.anas-gfx-timechart .anas-gfx-tc-fit:focus rect{stroke:var(--anas-accent);'
+            + 'fill:var(--anas-slot)}');
+        css.push('.anas-gfx-timechart .anas-gfx-tc-fit:hover path,'
+            + '.anas-gfx-timechart .anas-gfx-tc-fit:hover line,'
+            + '.anas-gfx-timechart .anas-gfx-tc-fit:focus path,'
+            + '.anas-gfx-timechart .anas-gfx-tc-fit:focus line{stroke:var(--anas-accent)}');
 
         // Status pill: pool/vdev state chip with a coloured dot (monitor side).
         css.push('.anas-gfx-pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;'
@@ -758,20 +791,90 @@
         }
     };
 
-    // Round a positive value UP to a "nice" 1/2/5 × 10ⁿ boundary so the chart's
-    // top gridline is a readable round number (e.g. 118 MB/s → 200 MB/s).
-    function niceCeil(v) {
+    // ---- The 1-2-5 scale ladder (operator design review, 2026-08-19) --------
+    //
+    // A chart's top gridline comes off a FIXED ladder of rungs — 1, 2, 5 and
+    // their ×10 multiples WITHIN each binary unit family:
+    //     … 500 KiB/s · 1 MiB/s · 2 · 5 · 10 · 20 · 50 · 100 · 200 · 500 MiB/s
+    //       · 1 GiB/s · 2 …
+    // so a scale maximum is always a number a human already has a name for, and
+    // the mid gridline (half a rung) is always clean too (5 → 2.5, 1 GiB → 512
+    // MiB, 20 → 10). This replaces the old data-driven decimal rounding, which
+    // produced maxima like "4.77 MiB/s" — arithmetically correct and unreadable.
+    //
+    // Note the family boundary: 500 KiB/s is followed by 1 MiB/s (= 1024 KiB/s),
+    // NOT 1000 KiB/s. The ladder is binary because every value we plot is.
+    var RUNG_M = [1, 2, 5, 10, 20, 50, 100, 200, 500];
+    var RUNG_FAMILIES = 7; // B … EiB
+
+    // Smallest ladder rung >= v (v itself when v is already a rung).
+    function rungCeil(v) {
         v = Number(v);
-        if (!(v > 0)) { return 1; }
-        var exp = Math.floor(Math.log(v) / Math.LN10);
-        var base = Math.pow(10, exp);
-        var f = v / base; // 1 .. <10
-        var nice;
-        if (f <= 1) { nice = 1; }
-        else if (f <= 2) { nice = 2; }
-        else if (f <= 5) { nice = 5; }
-        else { nice = 10; }
-        return nice * base;
+        if (!(v > 0)) { return RUNG_M[0]; }
+        var unit = 1;
+        for (var u = 0; u < RUNG_FAMILIES; u++) {
+            for (var i = 0; i < RUNG_M.length; i++) {
+                var rung = RUNG_M[i] * unit;
+                if (rung >= v) { return rung; }
+            }
+            unit *= 1024;
+        }
+        return unit; // past the ladder's top — unreachable for real I/O
+    }
+    gfx.scaleRung = rungCeil;
+
+    // Render a ladder rung (or its half) in its own binary unit, with the FEWEST
+    // digits that stay exact: "50 KiB", "2.5 MiB", "512 MiB", "1 GiB". The
+    // shared byte formatter is 2-decimal by contract ("5.00 MiB"), which is right
+    // for a measurement and wrong for an axis label.
+    var BIN_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB'];
+    function rungLabel(v) {
+        v = Number(v);
+        if (!(v > 0)) { return '0 B'; }
+        var o = 0, s = v;
+        while (s >= 1024 && o < BIN_UNITS.length - 1) { s = s / 1024; o++; }
+        var txt = (Math.abs(s - Math.round(s)) < 0.001) ? ('' + Math.round(s)) : s.toFixed(1);
+        return txt + ' ' + BIN_UNITS[o];
+    }
+    gfx.rungLabel = rungLabel;
+
+    // Widest Y label the ladder can EVER produce ("512 MiB/s" — 3 mantissa
+    // digits or "n.5", a 3-char binary unit, and the rate suffix). The left
+    // margin is sized from this constant rather than from the labels of the
+    // moment, so the plot's left edge does not jitter by a few px every time
+    // the ratchet moves the scale — a chart that shifts under a live series
+    // reads as noise. A caller-supplied format keeps the per-render derivation
+    // (story 11.15) because its label widths are unknowable up front.
+    var LADDER_LABEL_CHARS = (function () {
+        var w = 0, unit = 1;
+        for (var u = 0; u < RUNG_FAMILIES; u++) {
+            for (var i = 0; i < RUNG_M.length; i++) {
+                var r = RUNG_M[i] * unit;
+                var a = (rungLabel(r) + '/s').length;
+                var b = (rungLabel(r / 2) + '/s').length;
+                if (a > w) { w = a; }
+                if (b > w) { w = b; }
+            }
+            unit *= 1024;
+        }
+        return w;
+    }());
+
+    // Trailing rolling mean of `values` over the last `n` samples, index-aligned
+    // with the input (NaN in → NaN out, so a gap never shifts the series). Feeds
+    // the chart's average overlay AND its legend readout.
+    function rollingAvg(values, n) {
+        var out = [], q = [], sum = 0;
+        if (!values) { return out; }
+        for (var i = 0; i < values.length; i++) {
+            var v = Number(values[i]);
+            if (isNaN(v)) { out.push(NaN); continue; }
+            q.push(v);
+            sum += v;
+            while (q.length > n) { sum -= q.shift(); }
+            out.push(sum / q.length);
+        }
+        return out;
     }
 
     function tcColor(i) {
@@ -793,15 +896,37 @@
     //            SHORTER than the window (right-aligned: newest at the right edge).
     //   opts   : { width:px (REQUIRED — caller measures the container),
     //              height:px (default 150), windowMs (default 5min),
-    //              sampleMs (default 2500), max:Number (fixed; else nice-auto),
-    //              minMax:Number (floor for the auto max so an idle chart still
-    //              has a scale; default 1), format:fn(v)->str (Y labels + readout;
-    //              default ANAS.formatBytes(v)+'/s'), title:String }
-    // Renders: 0 / mid / nice-max Y gridlines with labels; a time X axis spanning
-    // windowMs with ~1-minute ticks (now, 1m, 2m…); each series as a 2px polyline
-    // over a faint filled area; a legend + latest-value readout per series.
+    //              sampleMs (default 2500), max:Number (pinned; disables the
+    //              ladder AND the ratchet), minMax:Number (floor for the auto max
+    //              so an idle chart still has a scale; default 1 KiB/s),
+    //              format:fn(v)->str (readout + Y labels; default
+    //              ANAS.formatBytes(v)+'/s' for the readout and the ladder's own
+    //              rung label for the axis), title:String,
+    //              scale:{max} CALLER-OWNED ratchet state (see below),
+    //              fitId:String id for the manual re-fit control,
+    //              avgSamples:Number rolling-average window in samples }
+    // Renders: 0 / mid / ladder-max Y gridlines with labels; a time X axis
+    // spanning windowMs with ~1-minute ticks (now, 1m, 2m…); each series as a 2px
+    // polyline over a faint filled area, plus (avgSamples > 1) a thin
+    // rolling-average overlay in the same colour; the not-yet-sampled left region
+    // hatched; a legend readout per series.
+    //
+    // SCALE RATCHET (operator design review 2026-08-19). `opts.scale` is a plain
+    // object the CALLER owns and keeps for the life of its view — timeChart reads
+    // and writes `scale.max` on it, and holds no state of its own:
+    //   • a sample above the held rung raises the scale IMMEDIATELY (a clipped
+    //     spike is worse than a jumping axis);
+    //   • the scale NEVER falls on its own — once up it holds, even after the
+    //     peak ages out of the window, so a "back to normal" chart can't be
+    //     mistaken for a rescaled one;
+    //   • the operator drops it with the re-fit control (`fitId`), which appears
+    //     ONLY while the held scale sits above the window's own fit rung. The
+    //     caller clears `scale.max` on click and the ratchet resumes from there.
+    // Because the state object lives on the view, closing the panel resets it —
+    // same lifetime as the sample buffers feeding the chart.
+    //
     // Fail-open: <2 total points → framed empty axes + muted "collecting…"; any
-    // throw → ''. Test hook: .anas-gfx-timechart.
+    // throw → ''. Test hook: .anas-gfx-timechart (re-fit: [data-anas-tcfit]).
     gfx.timeChart = function (series, opts) {
         try {
             ensureInjected();
@@ -813,22 +938,31 @@
             if (!(W > 0)) { return ''; }
             if (!(H > 40)) { H = 40; }
 
-            var fmt = (typeof opts.format === 'function')
-                ? opts.format
-                : function (v) {
-                    return (ANAS.formatBytes ? ANAS.formatBytes(v) : ('' + Math.round(v))) + '/s';
-                };
+            var customFmt = (typeof opts.format === 'function') ? opts.format : null;
+            var fmt = customFmt || function (v) {
+                return (ANAS.formatBytes ? ANAS.formatBytes(v) : ('' + Math.round(v))) + '/s';
+            };
+            // The Y labels are ladder rungs and their halves, so they render from
+            // the ladder's own exact-digits formatter rather than the 2-decimal
+            // byte formatter ("2.5 MiB/s", not "2.50 MiB/s"). A caller-supplied
+            // format still wins outright — it owns the units.
+            var axisFmt = customFmt || function (v) { return rungLabel(v) + '/s'; };
             var windowMs = Number(opts.windowMs) > 0 ? Number(opts.windowMs) : 5 * 60 * 1000;
             var sampleMs = Number(opts.sampleMs) > 0 ? Number(opts.sampleMs) : 2500;
             var slots = Math.max(2, Math.round(windowMs / sampleMs));
+            var avgN = Math.round(Number(opts.avgSamples) || 0);
+            var avgOn = avgN > 1;
 
-            // Value scale FIRST (before the margin): nice-rounded max across all
-            // series (or fixed opts.max), floored so an idle chart still has a
-            // readable scale. The Y labels are rendered from vmax/vmid/0, so their
-            // widths — not a fixed guess — must set the left margin below.
-            var peak = 0, totalPts = 0, si, vi;
+            // Value scale FIRST (before the margin): the ladder rung above the
+            // window's peak (or a pinned opts.max), floored so an idle chart still
+            // has a readable scale. The Y labels are rendered from vmax/vmid/0, so
+            // their widths — not a fixed guess — must set the left margin below.
+            // `maxLen` (longest series) also tells us how much of the window has
+            // actually been sampled, for the unsampled-region hatch.
+            var peak = 0, totalPts = 0, maxLen = 0, si, vi;
             for (si = 0; si < series.length; si++) {
                 var vals = (series[si] && series[si].values) || [];
+                if (vals.length > maxLen) { maxLen = vals.length; }
                 for (vi = 0; vi < vals.length; vi++) {
                     var pv = Number(vals[vi]);
                     if (!isNaN(pv)) {
@@ -837,27 +971,48 @@
                     }
                 }
             }
-            var floor = Number(opts.minMax) > 0 ? Number(opts.minMax) : 1;
+            if (maxLen > slots) { maxLen = slots; }
+
+            // 1 KiB/s floor (not 1 B/s): an idle chart then reads
+            // "1 KiB/s · 512 B/s · 0 B/s" instead of splitting a single byte.
+            var floor = Number(opts.minMax) > 0 ? Number(opts.minMax) : 1024;
+            var pinned = Number(opts.max) > 0;
+            var ratchet = (!pinned && opts.scale && typeof opts.scale === 'object')
+                ? opts.scale : null;
+            var fitMax = rungCeil(peak > floor ? peak : floor);
             var vmax;
-            if (Number(opts.max) > 0) {
+            if (pinned) {
                 vmax = Number(opts.max);
+            } else if (ratchet) {
+                var held = Number(ratchet.max);
+                vmax = (held > 0 && held > fitMax) ? held : fitMax;
+                ratchet.max = vmax;
             } else {
-                vmax = niceCeil(peak > floor ? peak : floor);
+                vmax = fitMax;
             }
             if (!(vmax > 0)) { vmax = 1; }
             var vmid = vmax / 2;
+            // The re-fit control earns its place ONLY while the held scale is
+            // above what this window actually needs — otherwise it would be a
+            // permanent no-op button competing with the data.
+            var canFit = !!(ratchet && opts.fitId && vmax > fitMax);
 
             // Plot geometry — the LEFT margin is derived from the widest rendered
             // Y label (0 / mid / max), not a fixed 52: an 11-char label like
             // "75.37 MiB/s" is ~63px at the 9.5px tabular-nums font (~5.7px/char),
             // which right-anchored at x = ML-6 would spill past the SVG's left
             // edge and lose its leading digits (75.37 → "5.37"). Size ML to fit
-            // the label + padding, floor 52, and let plotW shrink.
-            var ylabW = 0;
-            var yLabelVals = [vmax, vmid, 0];
-            for (var yl = 0; yl < yLabelVals.length; yl++) {
-                var lw = ('' + fmt(yLabelVals[yl])).length * 5.7;
-                if (lw > ylabW) { ylabW = lw; }
+            // the label + padding, floor 52, and let plotW shrink. (The ladder
+            // keeps these labels short and their width stable, but the derivation
+            // stays: a caller-supplied `format` can still render anything.)
+            var ylabW = LADDER_LABEL_CHARS * 5.7;
+            if (customFmt) {
+                ylabW = 0;
+                var yLabelVals = [vmax, vmid, 0];
+                for (var yl = 0; yl < yLabelVals.length; yl++) {
+                    var lw = ('' + axisFmt(yLabelVals[yl])).length * 5.7;
+                    if (lw > ylabW) { ylabW = lw; }
+                }
             }
             var ML = Math.max(52, Math.ceil(ylabW) + 8), MR = 12, MT = 20, MB = 18;
             var plotW = W - ML - MR;
@@ -876,12 +1031,33 @@
                 return yBase - (v / vmax) * plotH;
             }
 
+            var spacing = plotW / (slots - 1);
+
             var parts = [];
             parts.push('<svg class="anas-gfx-timechart" width="' + W + '" height="' + H + '" '
-                + 'viewBox="0 0 ' + W + ' ' + H + '" aria-hidden="true">');
+                + 'viewBox="0 0 ' + W + ' ' + H + '"'
+                // aria-hidden only while the chart is purely decorative; the
+                // re-fit control is a real control and must stay reachable.
+                + (canFit ? '' : ' aria-hidden="true"') + '>');
             // Plot background frame.
             parts.push('<rect class="anas-gfx-tc-frame" x="' + x0 + '" y="' + yTop
                 + '" width="' + plotW + '" height="' + plotH + '" rx="3"/>');
+
+            // UNSAMPLED REGION. The buffers start empty when the view opens, so
+            // until the window fills, the left of the plot is time we never
+            // measured — and blank canvas on a zero baseline reads as "idle",
+            // which is a lie. Hatch what we have no samples for, and say so.
+            var xData = (maxLen >= 1) ? (xR - (maxLen - 1) * spacing) : xR;
+            if (maxLen < slots && xData > x0 + 1) {
+                parts.push('<rect class="anas-gfx-tc-nodata" x="' + x0 + '" y="' + yTop
+                    + '" width="' + (xData - x0).toFixed(1) + '" height="' + plotH + '"/>');
+                if (totalPts >= 2 && (xData - x0) > 96) {
+                    parts.push('<text class="anas-gfx-tc-nodatalab" x="'
+                        + ((x0 + xData) / 2).toFixed(1) + '" y="'
+                        + ((yTop + yBase) / 2 + 3).toFixed(1) + '" text-anchor="middle">'
+                        + enc('no samples yet') + '</text>');
+                }
+            }
 
             // Horizontal gridlines + Y labels at 0 / mid / max.
             var yLines = [[vmax, yTop], [vmid, (yTop + yBase) / 2], [0, yBase]];
@@ -891,7 +1067,7 @@
                 parts.push('<line class="' + cls + '" x1="' + x0 + '" y1="' + gy.toFixed(1)
                     + '" x2="' + xR + '" y2="' + gy.toFixed(1) + '"/>');
                 parts.push('<text class="anas-gfx-tc-ylab" x="' + (x0 - 6) + '" y="'
-                    + (gy + 3).toFixed(1) + '" text-anchor="end">' + enc(fmt(yLines[g][0])) + '</text>');
+                    + (gy + 3).toFixed(1) + '" text-anchor="end">' + enc(axisFmt(yLines[g][0])) + '</text>');
             }
 
             // Time X axis: ticks + labels at ~1-minute intervals (now, 1m, 2m…).
@@ -913,7 +1089,6 @@
                     + '" y="' + ((yTop + yBase) / 2 + 4).toFixed(1) + '" text-anchor="middle">'
                     + enc('collecting…') + '</text>');
             } else {
-                var spacing = plotW / (slots - 1);
                 for (si = 0; si < series.length; si++) {
                     var s = series[si] || {};
                     var v2 = s.values || [];
@@ -935,8 +1110,27 @@
                         parts.push('<path d="M' + first + ',' + yBase.toFixed(1) + ' L'
                             + pts.join(' L') + ' L' + last + ',' + yBase.toFixed(1) + ' Z" '
                             + 'fill="' + col + '" fill-opacity="0.12" stroke="none"/>');
+                        // The RAW per-sample line, unsmoothed — a txg stall or a
+                        // single-sample spike is real behaviour and must stay
+                        // visible. The average rides ON TOP of it, never instead.
                         parts.push('<polyline points="' + pts.join(' ') + '" fill="none" stroke="'
                             + col + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>');
+                        if (avgOn) {
+                            var av = rollingAvg(v2, avgN);
+                            var apts = [];
+                            for (vi = start; vi < av.length; vi++) {
+                                var av1 = Number(av[vi]);
+                                if (isNaN(av1)) { continue; }
+                                var apx = xR - (av.length - 1 - vi) * spacing;
+                                if (apx < x0) { apx = x0; }
+                                apts.push(apx.toFixed(1) + ',' + yFor(av1).toFixed(1));
+                            }
+                            if (apts.length >= 2) {
+                                parts.push('<polyline class="anas-gfx-tc-avg" points="'
+                                    + apts.join(' ') + '" fill="none" stroke="' + col
+                                    + '" stroke-linejoin="round" stroke-linecap="round"/>');
+                            }
+                        }
                     } else {
                         var pc = pts[0].split(',');
                         parts.push('<circle cx="' + pc[0] + '" cy="' + pc[1] + '" r="2" fill="' + col + '"/>');
@@ -944,24 +1138,39 @@
                 }
             }
 
-            // Title (top-left) + legend/readout (top-right, latest value per series).
+            // Header row: title (top-left) + an "avg Ns" tag naming what the
+            // legend numbers are, then the legend, then the re-fit control at the
+            // far right edge.
+            var charW = 6.3, swGap = 13, entryGap = 14;
+            var headMin = x0;
             if (opts.title) {
                 parts.push('<text class="anas-gfx-tc-title" x="2" y="13">' + enc(opts.title) + '</text>');
+                headMin = 2 + ('' + opts.title).length * charW + 8;
             }
-            var charW = 6.3, swGap = 13, entryGap = 14;
+            // The legend readout is the SAME short-window average the summary
+            // rows lead with — a bursty pool's newest raw sample is routinely 0
+            // between flushes and would label a busy chart "idle". Tagged once
+            // here rather than repeated per entry.
+            var avgTag = avgOn ? ('avg ' + Math.round(avgN * sampleMs / 1000) + 's') : '';
+            if (avgTag) {
+                parts.push('<text class="anas-gfx-tc-avgtag" x="' + headMin.toFixed(1)
+                    + '" y="13">' + enc(avgTag) + '</text>');
+                headMin += avgTag.length * charW + 8;
+            }
+
             var entries = [];
             var totalW = 0;
             for (si = 0; si < series.length; si++) {
                 var se = series[si] || {};
-                var lv = latestVal(se.values);
+                var lv = avgOn ? latestVal(rollingAvg(se.values, avgN)) : latestVal(se.values);
                 var txt = (se.label ? se.label + ' ' : '') + (lv == null ? '—' : fmt(lv));
                 var wEst = swGap + txt.length * charW + entryGap;
                 entries.push({ color: se.color || tcColor(si), text: txt, w: wEst });
                 totalW += wEst;
             }
-            var lx = xR - totalW;
-            var titleMin = opts.title ? (2 + ('' + opts.title).length * charW + 8) : x0;
-            if (lx < titleMin) { lx = titleMin; }
+            var legendR = canFit ? (xR - 20) : xR;
+            var lx = legendR - totalW;
+            if (lx < headMin) { lx = headMin; }
             for (si = 0; si < entries.length; si++) {
                 var e = entries[si];
                 parts.push('<rect x="' + lx.toFixed(1) + '" y="5" width="9" height="9" rx="2" fill="'
@@ -969,6 +1178,23 @@
                 parts.push('<text class="anas-gfx-tc-legend" x="' + (lx + swGap).toFixed(1)
                     + '" y="13">' + enc(e.text) + '</text>');
                 lx += e.w;
+            }
+
+            // Manual re-fit: a quiet chevron-to-a-floor glyph at the chart's right
+            // edge, present only while the ratchet holds the scale above the
+            // window's fit rung. The CALLER owns the click (delegated on
+            // [data-anas-tcfit]) — it clears scale.max and re-renders.
+            if (canFit) {
+                var fx = xR - 15;
+                var fitTip = 'Fit scale to current data';
+                parts.push('<g class="anas-gfx-tc-fit" data-anas-tcfit="' + enc(opts.fitId) + '" '
+                    + 'role="button" tabindex="0" aria-label="' + enc(fitTip) + '">'
+                    + '<title>' + enc(fitTip) + '</title>'
+                    + '<rect x="' + fx + '" y="3.5" width="15" height="12" rx="3"/>'
+                    + '<path d="M' + (fx + 4) + ' 6.6 L' + (fx + 7.5) + ' 10.1 L'
+                    + (fx + 11) + ' 6.6"/>'
+                    + '<line x1="' + (fx + 4) + '" y1="12.6" x2="' + (fx + 11) + '" y2="12.6"/>'
+                    + '</g>');
             }
 
             parts.push('</svg>');

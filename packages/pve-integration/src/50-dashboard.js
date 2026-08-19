@@ -19,6 +19,21 @@
  * rolling 5-minute buffers; ARC keeps its gauge and per-device rows are live
  * numbers + an activity bar.
  *
+ * TELEMETRY LEGIBILITY (operator design review 2026-08-19). Four rules, applied
+ * identically to ZFS and AHR because the chart is one shared component:
+ *   1. Chart scales come off a 1-2-5 binary ladder and RATCHET — up on any
+ *      sample that would clip, never down on their own; the quiet re-fit control
+ *      at a chart's right edge is the only way down (see wireChartFit).
+ *   2. A pool's ONLY vdev / ONLY band keeps its header row and its member tiles
+ *      but drops the readouts and chart that merely repeat the pool block. Per-
+ *      member tiles are never collapsed — a failing disk diverges there.
+ *   3. Every headline figure LEADS with a labelled ~10s rolling average, because
+ *      an instantaneous figure reads "idle" between txg flushes. The charts keep
+ *      the raw per-sample line untouched and add a thin average overlay.
+ *   4. The unsampled left of a chart is hatched, not left blank (blank canvas on
+ *      a zero baseline is indistinguishable from a measured idle), and every
+ *      number names its direction (R/W) and its window (avg 10s / peak 5m).
+ *
  * Data contract (two endpoints, read as JSON; no compile dependency):
  *   GET /v1/status    → { node, pools[], disks{healthy,warning,critical,unknown,
  *                         total}, shares{}, jobs[{id,kind,status,startedAt?,
@@ -61,7 +76,8 @@
  * Test hooks: view cls 'anas-view anas-view-dashboard'; section classes
  * 'anas-dash-warnings' / 'anas-dash-fleet' / 'anas-dash-pools' / 'anas-dash-arc'
  * / 'anas-dash-net' / 'anas-dash-status'; Refresh button 'anas-btn-dash-refresh';
- * latency now/peak/avg readout 'anas-dash-lat' (pool head, vdev line, device tile).
+ * latency readout 'anas-dash-lat' (pool head, vdev line, device tile);
+ * collapsed sole vdev/band 'anas-dash-vdev-solo'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  */
@@ -82,6 +98,17 @@
     var POLL_MS = 2500;
     var BUFFER_MS = 5 * 60 * 1000;
     var BUFFER_MAX = Math.max(2, Math.round(BUFFER_MS / POLL_MS));
+
+    // Short-window average (operator design review 2026-08-19). An instantaneous
+    // figure is a lie on a txg-cadence workload: ZFS flushes in bursts, so a pool
+    // genuinely moving hundreds of MiB/s reads "0 B/s · 0 r · 0 w IOPS" in most
+    // sample windows. Every headline slot therefore LEADS with a labelled ~10s
+    // average taken off the same rolling ring the charts already hold — no new
+    // data, no server round trip. peak/avg over the full window stay as they are.
+    var SHORT_MS = 10000;
+    var SHORT_N = Math.max(2, Math.round(SHORT_MS / POLL_MS));
+    var SHORT_LBL = 'avg ' + Math.round((SHORT_N * POLL_MS) / 1000) + 's';
+    var WINDOW_LBL = Math.round(BUFFER_MS / 60000) + 'm';
 
     // Owning card's itemId (see ANAS.makeCard → itemId: view.itemId). We attach
     // the card-layout activate/deactivate listeners here so polling follows the
@@ -263,8 +290,8 @@
                 + '.anas-dash-vdev-lat{margin-top:4px;font-size:11px}'
                 + '.anas-dash-lat-hist{opacity:.85}'
                 // Aligned two-row (I/O, then latency) readout at pool/vdev level:
-                // a fixed-width label column keeps the ▼/▲ values vertically lined
-                // up so the eye can scan now/peak/avg down the rows.
+                // a fixed-width label column keeps the R/W values vertically lined
+                // up so the eye can scan the windows down the rows.
                 + '.anas-dash-io-lat{margin-top:4px}'
                 + '.anas-dash-mrow{display:flex;gap:8px;align-items:baseline;'
                 + 'font-variant-numeric:tabular-nums}'
@@ -299,18 +326,61 @@
 
     // ---- Rolling buffers + time-series charts ------------------------------
 
+    // ONE sample per telemetry tick, however many times we render it.
+    //
+    // The buffers are filled as a side effect of rendering, but a render is not
+    // a measurement: the Pools composite is re-rendered by /status, by the manual
+    // Refresh and by the re-fit control as well as by the telemetry poll, and
+    // each of those would otherwise duplicate the current sample — bending peak,
+    // average and the chart's own time axis. `_anasSampleSeq` is bumped once per
+    // telemetry tick; a buffer accepts one push per key per seq and returns
+    // itself unchanged for any further render at that seq.
+    function pushBuf(view, bufKey, seenKey, key, value, cap) {
+        var buf = view[bufKey] || (view[bufKey] = {});
+        var seen = view[seenKey] || (view[seenKey] = {});
+        var arr = buf[key] || (buf[key] = []);
+        var seq = view._anasSampleSeq || 0;
+        if (seen[key] !== seq || arr.length === 0) {
+            seen[key] = seq;
+            arr.push(value);
+            while (arr.length > cap) {
+                arr.shift();
+            }
+        }
+        return arr;
+    }
+
     // Push a sample onto the rolling buffer for `key`, capped at BUFFER_MAX (the
     // 5-minute window), and return the (mutated, oldest→newest) buffer. The
     // buffers feed gfx.timeChart; they live on the view so they reset with the
     // panel and never touch the server (no persisted history — Principle 7).
     function pushSpark(view, key, value) {
-        var buf = view._anasSpark || (view._anasSpark = {});
-        var arr = buf[key] || (buf[key] = []);
-        arr.push(num(value));
-        while (arr.length > BUFFER_MAX) {
-            arr.shift();
+        return pushBuf(view, '_anasSpark', '_anasSeenSpark', key, num(value), BUFFER_MAX);
+    }
+
+    // The ratchet state gfx.timeChart reads and writes for a chart, keyed by the
+    // same string that scopes the chart's sample buffers. It lives on the view,
+    // so a held scale survives every re-render but resets when the panel closes —
+    // exactly the lifetime the samples themselves have.
+    function scaleFor(view, key) {
+        var st = view._anasScale || (view._anasScale = {});
+        return st[key] || (st[key] = {});
+    }
+
+    // Mean of the last `n` usable samples of a rolling buffer (nulls skipped but
+    // still occupying their slot, so the window is a true N seconds). null when
+    // the tail holds nothing usable — an idle latency window reads "—", never 0.
+    function tailAvg(arr, n) {
+        if (!arr || !arr.length) { return null; }
+        var start = Math.max(0, arr.length - n);
+        var sum = 0, count = 0;
+        for (var i = start; i < arr.length; i++) {
+            var v = arr[i];
+            if (v === null || v === undefined || isNaN(Number(v))) { continue; }
+            sum += Number(v);
+            count++;
         }
-        return arr;
+        return count > 0 ? sum / count : null;
     }
 
     // ---- Latency rolling buffers + high-water / average readout ------------
@@ -325,15 +395,9 @@
     // the window is a true 5 minutes with no faked zeros. Lives on the view
     // (_anasLat) so it resets with the panel and never touches the server.
     function pushLat(view, key, value) {
-        var buf = view._anasLat || (view._anasLat = {});
-        var arr = buf[key] || (buf[key] = []);
         var n = (value === null || value === undefined || isNaN(Number(value)))
             ? null : Number(value);
-        arr.push(n);
-        while (arr.length > BUFFER_MAX) {
-            arr.shift();
-        }
-        return arr;
+        return pushBuf(view, '_anasLat', '_anasSeenLat', key, n, BUFFER_MAX);
     }
 
     // Peak (max) and average (mean) over the usable samples of a rolling buffer —
@@ -360,16 +424,27 @@
         return { peak: peak, avg: count > 0 ? sum / count : null, count: count };
     }
 
-    // One aligned "<label> ▼ <read> ▲ <write> · peak ▼/▲ · avg ▼/▲" metric row,
+    // "R <read> W <write>" — every number says which direction it is. The old
+    // ▼/▲ glyphs were compact and unlabelled, and nothing on screen said which
+    // way was which.
+    function rw(fmt, r, w) {
+        return 'R ' + fmt(r) + ' W ' + fmt(w);
+    }
+
+    // One aligned metric row:
+    //   "<label>  avg 10s R … W …  ·  peak 5m R … W …  ·  avg 5m R … W …"
     // shared by the I/O (bps) and latency (fmtLat) readouts so the two rows line
-    // up. `fmt` formats each value; `sR`/`sW` are the read/write bufStats. peak/avg
-    // are appended only once `hasHist` (real history in the window); `extraCls`
-    // carries hooks (e.g. anas-dash-lat). A title tooltip spells out the window.
-    function metricRow(label, extraCls, fmt, nowR, nowW, sR, sW, hasHist, tip) {
-        var seg = '▼ ' + fmt(nowR) + ' ▲ ' + fmt(nowW);
+    // up. `fmt` formats each value; `sR`/`sW` are the read/write bufStats over the
+    // full window; `shR`/`shW` are the short-window averages the row LEADS with
+    // (see SHORT_MS — the instantaneous figure it replaces was misreading bursty
+    // pools as idle). peak/avg are appended only once `hasHist` (real history in
+    // the window); every window is spelled out in the label so no figure is left
+    // without its context. `extraCls` carries hooks (e.g. anas-dash-lat).
+    function metricRow(label, extraCls, fmt, shR, shW, sR, sW, hasHist, tip) {
+        var seg = SHORT_LBL + ' ' + rw(fmt, shR, shW);
         if (hasHist) {
-            seg += ' · ' + t('peak') + ' ▼ ' + fmt(sR.peak) + ' ▲ ' + fmt(sW.peak)
-                + ' · ' + t('avg') + ' ▼ ' + fmt(sR.avg) + ' ▲ ' + fmt(sW.avg);
+            seg += ' · ' + t('peak') + ' ' + WINDOW_LBL + ' ' + rw(fmt, sR.peak, sW.peak)
+                + ' · ' + t('avg') + ' ' + WINDOW_LBL + ' ' + rw(fmt, sR.avg, sW.avg);
         }
         return '<div class="anas-dash-mrow' + (extraCls ? ' ' + extraCls : '') + '"'
             + (tip ? ' title="' + enc(tip) + '"' : '') + '>'
@@ -384,41 +459,49 @@
     // over them INCLUDE idle 0s. Latency pushes its own null-for-idle buffers here
     // keyed by keyBase, and its peak/avg SKIP the idle windows. The latency row
     // keeps the .anas-dash-lat hook; a shared tooltip explains the 5-minute window.
-    function ioLatRows(view, keyBase, rBuf, wBuf, nowRB, nowWB, latRNs, latWNs) {
+    function ioLatRows(view, keyBase, rBuf, wBuf, latRNs, latWNs) {
         var ioR = bufStats(rBuf), ioW = bufStats(wBuf);
         var ioHist = rBuf.length > 1 || wBuf.length > 1;
-        var lr = bufStats(pushLat(view, keyBase + '.read', latRNs));
-        var lw = bufStats(pushLat(view, keyBase + '.write', latWNs));
+        var latRBuf = pushLat(view, keyBase + '.read', latRNs);
+        var latWBuf = pushLat(view, keyBase + '.write', latWNs);
+        var lr = bufStats(latRBuf), lw = bufStats(latWBuf);
         var latHist = lr.count > 0 || lw.count > 0;
-        var tip = t('now · peak / average over the last 5 minutes');
-        return metricRow(t('I/O'), '', bps, nowRB, nowWB, ioR, ioW, ioHist, tip)
-            + metricRow(t('latency'), 'anas-dash-lat', fmtLat, latRNs, latWNs, lr, lw, latHist, tip);
+        var tip = t('rolling averages over the last ' + SHORT_MS / 1000
+            + ' seconds and ' + BUFFER_MS / 60000 + ' minutes; peak is the '
+            + BUFFER_MS / 60000 + '-minute high-water mark');
+        return metricRow(t('I/O'), '', bps,
+            tailAvg(rBuf, SHORT_N), tailAvg(wBuf, SHORT_N), ioR, ioW, ioHist, tip)
+            + metricRow(t('latency'), 'anas-dash-lat', fmtLat,
+                tailAvg(latRBuf, SHORT_N), tailAvg(latWBuf, SHORT_N), lr, lw, latHist, tip);
     }
 
-    // A read/write latency pair: "<label> ▼ <read> ▲ <write>" (▼ = read, ▲ =
-    // write, matching the throughput glyphs elsewhere). fmtLat renders null as a
-    // muted em dash, so idle directions read as "–" not "0".
+    // A read/write latency pair: "<label> R <read> W <write>". fmtLat renders
+    // null as a muted em dash, so idle directions read as "—" not "0".
     function latPair(label, r, w) {
-        return label + ' ▼ ' + fmtLat(r) + ' ▲ ' + fmtLat(w);
+        return label + ' ' + rw(fmtLat, r, w);
     }
 
-    // Compact 3-part latency readout (now / peak / avg, read & write) for an
-    // entity, pushing THIS poll's read+write samples onto the entity's rolling
-    // buffers first. `keyBase` scopes the buffers (pool by name / vdev by
-    // pool+name / disk by id). While no non-null sample has landed in the window
-    // yet, only the instantaneous "now" shows (no fake peak/avg zeros). A title
-    // tooltip spells out the peak/average-over-5-minutes meaning. `opts.compact`
+    // Compact 3-part latency readout (short avg / peak / window avg, read &
+    // write) for an entity, pushing THIS poll's read+write samples onto the
+    // entity's rolling buffers first. `keyBase` scopes the buffers (pool by name
+    // / vdev by pool+name / disk by id). While no non-null sample has landed in
+    // the window yet, only the short average shows (no fake peak/avg zeros). A
+    // title tooltip spells out what each window is. `opts.compact`
     // renders the two-muted-line form for the small device tiles; the default is
     // the inline pool/vdev form. Every readout carries the .anas-dash-lat hook.
     function latReadout(view, keyBase, readNs, writeNs, opts) {
         opts = opts || {};
-        var rs = bufStats(pushLat(view, keyBase + '.read', readNs));
-        var ws = bufStats(pushLat(view, keyBase + '.write', writeNs));
+        var rBuf = pushLat(view, keyBase + '.read', readNs);
+        var wBuf = pushLat(view, keyBase + '.write', writeNs);
+        var rs = bufStats(rBuf), ws = bufStats(wBuf);
         var hasHist = rs.count > 0 || ws.count > 0;
-        var now = latPair(t('latency'), readNs, writeNs);
-        var peak = latPair(t('peak'), rs.peak, ws.peak);
-        var avg = latPair(t('avg'), rs.avg, ws.avg);
-        var tip = t('now · peak / average over the last 5 minutes');
+        var now = latPair(t('latency') + ' ' + SHORT_LBL,
+            tailAvg(rBuf, SHORT_N), tailAvg(wBuf, SHORT_N));
+        var peak = latPair(t('peak') + ' ' + WINDOW_LBL, rs.peak, ws.peak);
+        var avg = latPair(t('avg') + ' ' + WINDOW_LBL, rs.avg, ws.avg);
+        var tip = t('rolling averages over the last ' + SHORT_MS / 1000
+            + ' seconds and ' + BUFFER_MS / 60000 + ' minutes; peak is the '
+            + BUFFER_MS / 60000 + '-minute high-water mark');
         if (opts.compact) {
             var line1 = '<div class="anas-dash-disk-sub anas-dash-lat" title="'
                 + enc(tip) + '">' + enc(now) + '</div>';
@@ -450,8 +533,52 @@
         return fallback || 620;
     }
 
+    // The aggregate IOPS readout for a pool / vdev / band. Same treatment as the
+    // byte figures: led by the short-window average (the raw counter reads
+    // "0 r · 0 w" between txg flushes on a busy pool) and labelled per direction.
+    // The IOPS counters are already on the wire — this only rings them so the
+    // average has something to average. `keyBase` scopes the ring.
+    function iopsLine(view, keyBase, readIops, writeIops) {
+        var r = pushSpark(view, keyBase + '.riops', readIops);
+        var w = pushSpark(view, keyBase + '.wiops', writeIops);
+        return SHORT_LBL + ' R ' + iops(tailAvg(r, SHORT_N))
+            + ' · W ' + iops(tailAvg(w, SHORT_N)) + ' IOPS';
+    }
+
+    // The read/write throughput lead line for a device tile: the same labelled
+    // short-window average the pool and vdev rows lead with, on the same ring
+    // that already feeds the tile's peak/avg line.
+    function deviceIoLead(rBuf, wBuf) {
+        return SHORT_LBL + ' ' + rw(bps, tailAvg(rBuf, SHORT_N), tailAvg(wBuf, SHORT_N));
+    }
+
+    // The tile's window peak/avg line — '' until real history has landed.
+    function deviceIoHist(rBuf, wBuf) {
+        if (!(rBuf.length > 1 || wBuf.length > 1)) { return ''; }
+        var sR = bufStats(rBuf), sW = bufStats(wBuf);
+        return '<div class="anas-dash-disk-sub anas-dash-lat-hist">'
+            + enc(t('peak') + ' ' + WINDOW_LBL + ' ' + rw(bps, sR.peak, sW.peak)
+                + ' · ' + t('avg') + ' ' + WINDOW_LBL + ' ' + rw(bps, sR.avg, sW.avg))
+            + '</div>';
+    }
+
     // Render a bicolor gfx.timeChart, degrading to a muted note if gfx is absent
     // or the chart fails open (returns ''). Never throws into the caller.
+    //
+    // `chartOpts(view, key, width, height, title)` builds the shared option set
+    // every telemetry chart uses, so ZFS and AHR cannot drift apart: the ratchet
+    // state and the re-fit control id both come off the SAME key that scopes the
+    // chart's sample buffers, and the average overlay uses the SAME short window
+    // the summary rows lead with.
+    function chartOpts(view, key, width, height, title) {
+        var o = {
+            width: width, height: height, windowMs: BUFFER_MS, sampleMs: POLL_MS,
+            scale: scaleFor(view, key), fitId: key, avgSamples: SHORT_N
+        };
+        if (title) { o.title = title; }
+        return o;
+    }
+
     function timeChartHtml(series, opts) {
         try {
             if (gfx && typeof gfx.timeChart === 'function') {
@@ -910,16 +1037,8 @@
             var kb = keyBase || ('ahrdisk.' + id);
             var dr = pushSpark(view, kb + '.read', tmember.readBytesPerSec);
             var dw = pushSpark(view, kb + '.write', tmember.writeBytesPerSec);
-            var dsR = bufStats(dr), dsW = bufStats(dw);
-            var histLine = (dr.length > 1 || dw.length > 1)
-                ? '<div class="anas-dash-disk-sub anas-dash-lat-hist">'
-                    + enc(t('peak') + ' ▼ ' + bps(dsR.peak) + ' ▲ ' + bps(dsW.peak)
-                        + ' · ' + t('avg') + ' ▼ ' + bps(dsR.avg) + ' ▲ ' + bps(dsW.avg))
-                    + '</div>'
-                : '';
-            ioHtml = '<div class="anas-dash-disk-sub">'
-                + enc('▼ ' + bps(tmember.readBytesPerSec) + '  ▲ ' + bps(tmember.writeBytesPerSec)) + '</div>'
-                + histLine
+            ioHtml = '<div class="anas-dash-disk-sub">' + enc(deviceIoLead(dr, dw)) + '</div>'
+                + deviceIoHist(dr, dw)
                 + latReadout(view, kb, tmember.readLatencyNs, tmember.writeLatencyNs, { compact: true });
         }
         return '<div class="anas-dash-disk">' + iconHtml
@@ -939,7 +1058,14 @@
     // aggregate IOPS + I/O/latency readout and read/write time chart a ZFS vdev
     // has. `poolName`/`chartW` scope + size those. Members are matched to their
     // telemetry by disk id (each carries its own per-band I/O).
-    function renderAhrBand(view, poolName, band, tband, chartW, poolBuilding) {
+    //
+    // `solo` (this pool's ONLY band) collapses the duplicated readouts exactly as
+    // a solo ZFS vdev does — the AHR band strip is deliberately the same shape as
+    // the vdev strip, so it duplicates the pool block in the same way and gets the
+    // same answer (parallel construction). The band's own SYNC strip is never
+    // collapsed: a rebuild's progress exists nowhere else on the block, and md
+    // recovery traffic is invisible in the pool's I/O counters by definition.
+    function renderAhrBand(view, poolName, band, tband, chartW, poolBuilding, solo) {
         band = band || {};
         var n = num(band.band);
         var desc = '— ' + ahrLevelLabel(band.level) + ' × ' + num(band.memberCount);
@@ -973,26 +1099,25 @@
         var ioHead = '';
         var ioLatHtml = '';
         var chartHtml = '';
-        if (tband) {
-            ioHead = '<span class="anas-dash-vdev-io">'
-                + enc(iops(tband.readIops) + '/' + iops(tband.writeIops) + ' IOPS') + '</span>';
+        if (tband && !solo) {
             var vKey = 'ahrband.' + poolName + '.' + n;
+            ioHead = '<span class="anas-dash-vdev-io">'
+                + enc(iopsLine(view, vKey, tband.readIops, tband.writeIops)) + '</span>';
             var br = pushSpark(view, vKey + '.read', tband.readBytesPerSec);
             var bw = pushSpark(view, vKey + '.write', tband.writeBytesPerSec);
             ioLatHtml = '<div class="anas-dash-vdev-lat anas-dash-muted anas-dash-io-lat">'
                 + ioLatRows(view, vKey, br, bw,
-                    tband.readBytesPerSec, tband.writeBytesPerSec,
                     tband.readLatencyNs, tband.writeLatencyNs) + '</div>';
             chartHtml = '<div class="anas-dash-vdev-chart">' + timeChartHtml(
                 [
                     { label: t('Read'), color: READ_COLOR, values: br },
                     { label: t('Write'), color: WRITE_COLOR, values: bw }
                 ],
-                { width: chartW > 0 ? chartW : 560, height: 120, windowMs: BUFFER_MS, sampleMs: POLL_MS }
+                chartOpts(view, vKey, chartW > 0 ? chartW : 560, 120)
             ) + '</div>';
         }
 
-        return '<div class="anas-dash-vdev">'
+        return '<div class="anas-dash-vdev' + (solo ? ' anas-dash-vdev-solo' : '') + '">'
             + '<div class="anas-dash-vdev-head">'
             + '<span class="anas-dash-vdev-tag">' + enc(t('BAND')) + '</span>'
             + '<span class="anas-dash-vdev-name">' + enc(t('band') + ' ' + n) + '</span>'
@@ -1094,24 +1219,20 @@
         var summaryHtml = '';
         var chartHtml = '';
         if (tap) {
-            var pr = pushSpark(view, 'ahrpool.' + name + '.read', tap.readBytesPerSec);
-            var pw = pushSpark(view, 'ahrpool.' + name + '.write', tap.writeBytesPerSec);
+            var pKey = 'ahrpool.' + name;
+            var pr = pushSpark(view, pKey + '.read', tap.readBytesPerSec);
+            var pw = pushSpark(view, pKey + '.write', tap.writeBytesPerSec);
             summaryHtml = '<div class="anas-dash-muted" style="margin-top:4px">'
-                + enc(iops(tap.readIops) + ' r · ' + iops(tap.writeIops) + ' w IOPS') + '</div>'
+                + enc(iopsLine(view, pKey, tap.readIops, tap.writeIops)) + '</div>'
                 + '<div class="anas-dash-muted anas-dash-io-lat">'
-                + ioLatRows(view, 'ahrpool.' + name, pr, pw,
-                    tap.readBytesPerSec, tap.writeBytesPerSec,
-                    tap.readLatencyNs, tap.writeLatencyNs)
+                + ioLatRows(view, pKey, pr, pw, tap.readLatencyNs, tap.writeLatencyNs)
                 + '</div>';
             chartHtml = '<div class="anas-dash-pool-io">' + timeChartHtml(
                 [
                     { label: t('Read'), color: READ_COLOR, values: pr },
                     { label: t('Write'), color: WRITE_COLOR, values: pw }
                 ],
-                {
-                    width: poolW, height: 160, windowMs: BUFFER_MS, sampleMs: POLL_MS,
-                    title: t('Pool I/O')
-                }
+                chartOpts(view, pKey, poolW, 160, t('Pool I/O'))
             ) + '</div>';
         }
 
@@ -1123,11 +1244,15 @@
         }
 
         var bands = ap.bands || [];
+        // A lone band IS the pool at the I/O layer — same collapse the solo ZFS
+        // vdev gets. Member tiles and the band's sync strip stay in full.
+        var soloBand = bands.length === 1;
         var bandHtml = '';
         for (var i = 0; i < bands.length; i++) {
             var bn = bands[i] && bands[i].band;
             var tband = (bn != null) ? tbandByIndex['' + bn] : null;
-            bandHtml += renderAhrBand(view, name, bands[i], tband, bandW, ap.state === 'building');
+            bandHtml += renderAhrBand(view, name, bands[i], tband, bandW,
+                ap.state === 'building', soloBand);
         }
         bandHtml += renderAhrSpareBay(view, ap.spares);
 
@@ -1204,6 +1329,74 @@
         }
     }
 
+    // ---- Manual scale re-fit (the chart's quiet right-edge control) ---------
+    //
+    // gfx.timeChart ratchets a chart's scale UP and never down; the operator
+    // drops it here. The control is an SVG <g> inside the chart carrying
+    // data-anas-tcfit="<chart key>" — the SAME key that scopes the chart's
+    // sample buffers and its ratchet state — so clearing that state and
+    // re-rendering the owning section is the whole handler. Re-rendering does
+    // NOT re-sample (see pushBuf), so a click cannot bend the history.
+
+    // Walk up from an event target looking for the re-fit control. A manual walk
+    // rather than a selector match: these are SVG nodes, where className is not a
+    // string and framework selector helpers are unreliable.
+    function fitKeyFor(node) {
+        var n = node;
+        for (var i = 0; i < 8 && n; i++) {
+            if (n.getAttribute) {
+                var k = n.getAttribute('data-anas-tcfit');
+                if (k) { return k; }
+            }
+            n = n.parentNode;
+        }
+        return null;
+    }
+
+    function refitChart(view, key) {
+        var st = view._anasScale && view._anasScale[key];
+        if (!st) { return; }
+        st.max = 0; // next render fits the window, then the ratchet resumes
+        if (key.indexOf('net.') === 0) {
+            if (view._anasTelemetry) {
+                setSection(view, 'anasDashNet', renderNet(view, view._anasTelemetry));
+            }
+        } else {
+            setSection(view, 'anasDashPools', renderPoolsComposite(view));
+        }
+    }
+
+    // ONE delegated click/Enter handler on the whole view element, which persists
+    // across every setHtml re-render (guarded on the view, wired once).
+    function wireChartFit(view) {
+        try {
+            if (!view || view._anasFitWired) { return; }
+            var el = view.getEl ? view.getEl() : null;
+            if (!el || typeof el.on !== 'function') { return; }
+            var go = function (e) {
+                try {
+                    var tgt = e && (e.target || (e.getTarget ? e.getTarget() : null));
+                    var key = fitKeyFor(tgt);
+                    if (key) { refitChart(view, key); }
+                } catch (err) {
+                    // fail-open — a click must never throw into the PVE UI
+                }
+            };
+            el.on('click', go);
+            el.on('keydown', function (e) {
+                try {
+                    var k = e && (e.getKey ? e.getKey() : e.keyCode);
+                    if (k === 13 || k === 32) { go(e); }
+                } catch (err) {
+                    // fail-open
+                }
+            });
+            view._anasFitWired = true;
+        } catch (e) {
+            // non-fatal — the chart still renders, it just won't re-fit on click
+        }
+    }
+
     // ---- Pool → VDEV → Device composite (the headline) ---------------------
     //
     // ONE nested hierarchy per pool. State/capacity/scan come from /status; live I/O comes
@@ -1243,25 +1436,19 @@
             barHtml = fallbackBar(frac, 'var(--anas-accent,#3468c0)');
         }
 
-        // Device-level I/O peak/avg: small rolling buffers (same _anasSpark rolling
+        // Device-level I/O: small rolling buffers (same _anasSpark rolling
         // machinery the pool/vdev throughput uses — idle 0s count) keyed by disk
-        // id. peak/avg only once real history has landed (>1 sample).
+        // id. peak/avg only once real history has landed (>1 sample). A member
+        // tile is NEVER collapsed or reduced — a failing disk diverges from its
+        // siblings at exactly this layer, so its numbers always stay in full.
         var dr = pushSpark(view, 'disk.' + id + '.read', dev.readBytesPerSec);
         var dw = pushSpark(view, 'disk.' + id + '.write', dev.writeBytesPerSec);
-        var dsR = bufStats(dr), dsW = bufStats(dw);
-        var ioHistLine = (dr.length > 1 || dw.length > 1)
-            ? '<div class="anas-dash-disk-sub anas-dash-lat-hist">'
-                + enc(t('peak') + ' ▼ ' + bps(dsR.peak) + ' ▲ ' + bps(dsW.peak)
-                    + ' · ' + t('avg') + ' ▼ ' + bps(dsR.avg) + ' ▲ ' + bps(dsW.avg))
-                + '</div>'
-            : '';
 
         return '<div class="anas-dash-disk">' + iconHtml
             + '<div style="min-width:0;flex:1 1 auto">'
             + '<div class="anas-dash-disk-id" title="' + enc(id) + '">' + enc(id) + '</div>'
-            + '<div class="anas-dash-disk-sub">'
-            + enc('▼ ' + bps(dev.readBytesPerSec) + '  ▲ ' + bps(dev.writeBytesPerSec)) + '</div>'
-            + ioHistLine
+            + '<div class="anas-dash-disk-sub">' + enc(deviceIoLead(dr, dw)) + '</div>'
+            + deviceIoHist(dr, dw)
             + latReadout(view, 'disk.' + id, dev.readLatencyNs, dev.writeLatencyNs, { compact: true })
             + '<div style="margin-top:5px">' + barHtml + '</div>'
             + '</div></div>';
@@ -1296,7 +1483,16 @@
     // + a *-degraded/-faulted class make a degraded vdev read as degraded even at
     // a glance (colour keyed off gfx.pillLevel). `chartW` is the measured pixel
     // width for its time chart; `poolName` scopes the rolling-buffer keys.
-    function renderVdev(view, vdev, poolName, chartW) {
+    //
+    // SOLO COLLAPSE (`solo` — this is the pool's ONLY vdev). All of the pool's
+    // I/O goes through one vdev, so the vdev's IOPS, throughput, latency and
+    // chart are the pool block's numbers repeated verbatim a few pixels lower.
+    // A solo vdev therefore keeps its header row — name, type, device count,
+    // state pill, which are the things the pool block does NOT say — and drops
+    // the duplicated readouts and chart entirely. Two or more vdevs and every
+    // one of them renders in full, because then they can disagree. The device
+    // tiles below are untouched either way.
+    function renderVdev(view, vdev, poolName, chartW, solo) {
         vdev = vdev || {};
         var lvl = '';
         try {
@@ -1338,32 +1534,36 @@
         var identHtml = '<span class="anas-dash-vdev-tag">' + enc(t('VDEV')) + '</span>'
             + nameHtml
             + '<span class="anas-dash-vdev-desc">' + enc('— ' + descParts.join(' · ')) + '</span>';
-        var io = '<span class="anas-dash-vdev-io">'
-            + enc(iops(vdev.readIops) + '/' + iops(vdev.writeIops) + ' IOPS') + '</span>';
-
-        // Push the throughput spark buffers first, then reuse those SAME arrays for
-        // the I/O peak/avg readout and the time chart (no duplicate buffers).
         var vKey = 'vdev.' + poolName + '.' + keyName;
-        var vr = pushSpark(view, vKey + '.read', vdev.readBytesPerSec);
-        var vw = pushSpark(view, vKey + '.write', vdev.writeBytesPerSec);
+        var io = '';
+        var ioLatHtml = '';
+        var chartHtml = '';
+        if (!solo) {
+            io = '<span class="anas-dash-vdev-io">'
+                + enc(iopsLine(view, vKey, vdev.readIops, vdev.writeIops)) + '</span>';
 
-        // Aligned I/O + latency now/peak/avg for the whole vdev, on its own line
-        // under the head (the head carries identity + IOPS; the two-row block keeps
-        // bytes-throughput and latency peak/avg legible without crowding the head).
-        var ioLatHtml = '<div class="anas-dash-vdev-lat anas-dash-muted anas-dash-io-lat">'
-            + ioLatRows(view, vKey, vr, vw,
-                vdev.readBytesPerSec, vdev.writeBytesPerSec,
-                vdev.readLatencyNs, vdev.writeLatencyNs) + '</div>';
+            // Push the throughput spark buffers first, then reuse those SAME arrays
+            // for the I/O peak/avg readout and the time chart (no duplicate buffers).
+            var vr = pushSpark(view, vKey + '.read', vdev.readBytesPerSec);
+            var vw = pushSpark(view, vKey + '.write', vdev.writeBytesPerSec);
 
-        // Per-vdev bicolor read/write time chart (compact — visual hierarchy under
-        // the pool chart — but still fully labelled with axes + legend).
-        var chart = timeChartHtml(
-            [
-                { label: t('Read'), color: READ_COLOR, values: vr },
-                { label: t('Write'), color: WRITE_COLOR, values: vw }
-            ],
-            { width: chartW, height: 120, windowMs: BUFFER_MS, sampleMs: POLL_MS }
-        );
+            // Aligned I/O + latency for the whole vdev, on its own line under the
+            // head (the head carries identity + IOPS; the two-row block keeps
+            // bytes-throughput and latency legible without crowding the head).
+            ioLatHtml = '<div class="anas-dash-vdev-lat anas-dash-muted anas-dash-io-lat">'
+                + ioLatRows(view, vKey, vr, vw,
+                    vdev.readLatencyNs, vdev.writeLatencyNs) + '</div>';
+
+            // Per-vdev bicolor read/write time chart (compact — visual hierarchy
+            // under the pool chart — but still fully labelled with axes + legend).
+            chartHtml = '<div class="anas-dash-vdev-chart">' + timeChartHtml(
+                [
+                    { label: t('Read'), color: READ_COLOR, values: vr },
+                    { label: t('Write'), color: WRITE_COLOR, values: vw }
+                ],
+                chartOpts(view, vKey, chartW, 120)
+            ) + '</div>';
+        }
 
         var devs = vdev.disks || [];
         var refMax = 0;
@@ -1375,11 +1575,12 @@
         for (var i = 0; i < devs.length; i++) {
             devHtml += renderDevice(view, devs[i], refMax);
         }
-        return '<div class="anas-dash-vdev' + (lvl ? ' anas-dash-vdev-' + lvl : '') + '">'
+        return '<div class="anas-dash-vdev' + (lvl ? ' anas-dash-vdev-' + lvl : '')
+            + (solo ? ' anas-dash-vdev-solo' : '') + '">'
             + '<div class="anas-dash-vdev-head">'
             + identHtml + pill + io + '</div>'
             + ioLatHtml
-            + '<div class="anas-dash-vdev-chart">' + chart + '</div>'
+            + chartHtml
             + (devHtml ? '<div class="anas-dash-devs">' + devHtml + '</div>' : '')
             + '</div>';
     }
@@ -1439,24 +1640,20 @@
             // Push the throughput spark buffers FIRST, then reuse the very same
             // arrays for both the I/O peak/avg readout and the time chart below
             // (no duplicate buffers for a series the chart already holds).
-            var pr = pushSpark(view, 'pool.' + name + '.read', tp.readBytesPerSec);
-            var pw = pushSpark(view, 'pool.' + name + '.write', tp.writeBytesPerSec);
+            var pKey = 'pool.' + name;
+            var pr = pushSpark(view, pKey + '.read', tp.readBytesPerSec);
+            var pw = pushSpark(view, pKey + '.write', tp.writeBytesPerSec);
             summaryHtml = '<div class="anas-dash-muted" style="margin-top:4px">'
-                + enc(iops(tp.readIops) + ' r · ' + iops(tp.writeIops) + ' w IOPS') + '</div>'
+                + enc(iopsLine(view, pKey, tp.readIops, tp.writeIops)) + '</div>'
                 + '<div class="anas-dash-muted anas-dash-io-lat">'
-                + ioLatRows(view, 'pool.' + name, pr, pw,
-                    tp.readBytesPerSec, tp.writeBytesPerSec,
-                    tp.readLatencyNs, tp.writeLatencyNs)
+                + ioLatRows(view, pKey, pr, pw, tp.readLatencyNs, tp.writeLatencyNs)
                 + '</div>';
             chartHtml = '<div class="anas-dash-pool-io">' + timeChartHtml(
                 [
                     { label: t('Read'), color: READ_COLOR, values: pr },
                     { label: t('Write'), color: WRITE_COLOR, values: pw }
                 ],
-                {
-                    width: poolW, height: 160, windowMs: BUFFER_MS, sampleMs: POLL_MS,
-                    title: t('Pool I/O')
-                }
+                chartOpts(view, pKey, poolW, 160, t('Pool I/O'))
             ) + '</div>';
         } else {
             chartHtml = '<div class="anas-dash-pool-io">' + muted(t('Live I/O collecting…')) + '</div>';
@@ -1482,9 +1679,12 @@
         }
 
         var vdevs = (tp && tp.vdevs) || [];
+        // A lone vdev IS the pool at the I/O layer — collapse its duplicated
+        // readouts (see renderVdev). Its member tiles stay in full.
+        var solo = vdevs.length === 1;
         var vdevHtml = '';
         for (var i = 0; i < vdevs.length; i++) {
-            vdevHtml += renderVdev(view, vdevs[i], name, vdevW);
+            vdevHtml += renderVdev(view, vdevs[i], name, vdevW, solo);
         }
 
         return '<div class="anas-dash-pool">'
@@ -1582,14 +1782,13 @@
                     { label: t('RX'), color: RX_COLOR, values: nrx },
                     { label: t('TX'), color: TX_COLOR, values: ntx }
                 ],
-                {
-                    width: netW, height: 150, windowMs: BUFFER_MS, sampleMs: POLL_MS,
-                    title: t('Total throughput')
-                }
+                chartOpts(view, 'net.total', netW, 150, t('Total throughput'))
             )
             + '</div>';
         // Per-interface live numeric readout (no chart — the total chart carries
-        // the trend; interfaces are a compact rx/tx number pair).
+        // the trend; interfaces are a compact rx/tx number pair). RX/TX already
+        // name the direction, so the ▼/▲ glyphs that used to lead these lines
+        // were saying nothing the words did not.
         var ifs = net.interfaces || [];
         var perIf = '';
         for (var i = 0; i < ifs.length; i++) {
@@ -1598,9 +1797,9 @@
             perIf += '<div class="anas-dash-card" style="min-width:200px;flex:1 1 220px">'
                 + '<div class="anas-dash-card-title"><span>' + enc(nm) + '</span></div>'
                 + '<div class="anas-dash-disk-sub">'
-                + enc('▼ ' + t('RX') + ' ' + bps(f.rxBytesPerSec)) + '</div>'
+                + enc(t('RX') + ' ' + bps(f.rxBytesPerSec)) + '</div>'
                 + '<div class="anas-dash-disk-sub">'
-                + enc('▲ ' + t('TX') + ' ' + bps(f.txBytesPerSec)) + '</div>'
+                + enc(t('TX') + ' ' + bps(f.txBytesPerSec)) + '</div>'
                 + '</div>';
         }
         return heading(t('Network — link utilization vs storage throughput'))
@@ -1661,6 +1860,7 @@
             // AHR pool blocks deep-link to the Hybrid RAID view (11.13) — wire
             // the delegated click handler once the section has an element.
             wirePoolNav(view);
+            wireChartFit(view);
         }, function (err) {
             if (view.destroyed || view.destroying) {
                 return;
@@ -1685,11 +1885,15 @@
             var tel = unwrap(res, 'arc');
             view._anasTelemetry = tel; // cache for the composite
             view._anasHadTelemetry = true;
+            // A new measurement — the rolling buffers accept exactly one sample
+            // per key at this sequence, however many renders follow (pushBuf).
+            view._anasSampleSeq = (view._anasSampleSeq || 0) + 1;
             setSection(view, 'anasDashStatus', statusLine(true, t('just now')));
             setSection(view, 'anasDashArc', renderArc(view, tel));
             // Pool I/O now lives inside the composite — re-render it each tick.
             setSection(view, 'anasDashPools', renderPoolsComposite(view));
             wirePoolNav(view);
+            wireChartFit(view);
             setSection(view, 'anasDashNet', renderNet(view, tel));
         }, function (err) {
             if (view.destroyed || view.destroying) {
