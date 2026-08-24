@@ -225,6 +225,62 @@ describe('buildBaseInventory — disabled entry', () => {
   })
 })
 
+// An IDLED-OUT automount (issue #35). Once the mount idles away, findmnt shows
+// only the autofs placeholder — source `systemd-1`, fstype `autofs`, which
+// classifies as a local kind. Projected verbatim, the row lost its remote
+// identity and the UI disabled Edit / Unmount / Remove on it ("local storage is
+// ZFS territory"). The fstab entry is the identity; the placeholder only gets to
+// say the STATE.
+describe('buildBaseInventory — an ARMED automount keeps its remote identity (#35)', () => {
+  const armedFindmnt = JSON.stringify({
+    filesystems: [{ target: '/mnt/idle-cifs', source: 'systemd-1', fstype: 'autofs', options: 'rw,relatime,fd=52,pgrp=1,timeout=60' }],
+  })
+  const fstab = '//nas.example.com/media /mnt/idle-cifs cifs '
+    + 'credentials=/etc/anas/creds/idle.cred,nofail,_netdev,x-systemd.automount,x-systemd.idle-timeout=60 0 0\n'
+  const row = buildBaseInventory(armedFindmnt, fstab, new Map()).find(r => r.mountpoint === '/mnt/idle-cifs')!
+
+  it('projects type / remote / source from the fstab entry, not the placeholder', () => {
+    assert.equal(row.type, 'cifs')
+    assert.equal(row.remote, true)
+    assert.equal(row.source, '//nas.example.com/media')
+    assert.equal(row.fstype, 'cifs')
+  })
+
+  it('still reports the LIVE state: armed, not mounted, but persistent + automount', () => {
+    assert.equal(row.state, 'armed')
+    assert.equal(row.mounted, false)
+    assert.equal(row.persistent, true)
+    assert.equal(row.automount, true)
+  })
+
+  it('carries the parsed server / share the edit dialog round-trips', () => {
+    assert.equal(row.server, 'nas.example.com')
+    assert.equal(row.remotePath, 'media')
+  })
+
+  it('leaves a MOUNTED automount alone (the real fs already wins the projection)', () => {
+    const mountedFindmnt = JSON.stringify({
+      filesystems: [
+        { target: '/mnt/idle-cifs', source: 'systemd-1', fstype: 'autofs', options: 'rw,relatime' },
+        { target: '/mnt/idle-cifs', source: '//nas.example.com/media', fstype: 'cifs', options: 'rw,relatime' },
+      ],
+    })
+    const live = buildBaseInventory(mountedFindmnt, fstab, new Map()).find(r => r.mountpoint === '/mnt/idle-cifs')!
+    assert.equal(live.mounted, true)
+    assert.equal(live.state, 'unknown') // awaiting the guarded probe
+    assert.equal(live.type, 'cifs')
+    assert.equal(live.remote, true)
+  })
+
+  it('an armed autofs with NO fstab entry keeps the honest placeholder identity', () => {
+    // Nothing to project from — inventing a remote identity would be shadow state.
+    const orphan = buildBaseInventory(armedFindmnt, '', new Map()).find(r => r.mountpoint === '/mnt/idle-cifs')!
+    assert.equal(orphan.type, 'autofs')
+    assert.equal(orphan.remote, false)
+    assert.equal(orphan.state, 'armed')
+  })
+})
+
 describe('buildBaseInventory — fstab pseudo/system entries never leak', () => {
   // Regression: a `proc /proc` fstab line (standard on many nodes) used to slip
   // past the fstab overlay — the active-mount filter dropped it, then the overlay

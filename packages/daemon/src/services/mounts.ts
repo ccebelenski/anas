@@ -133,6 +133,20 @@ export function buildBaseInventory(
     if (row) {
       row.persistent = true
       row.automount = row.automount || entry.options.common.automount
+      // An ARMED automount is a PLACEHOLDER, not an identity (issue #35). The
+      // live autofs record says `systemd-1` / `autofs` / not-remote, which is
+      // true of the placeholder and false of the mount: an idled-out CIFS share
+      // arrived in the UI as local storage and lost Edit/Unmount/Remove with it.
+      // The fstab entry IS the identity here — the only thing the placeholder
+      // gets to say is the STATE ('armed', set above and left untouched).
+      if (row.state === 'armed') {
+        const kind = classifyKind(entry.fstype, entry.spec)
+        row.source = entry.spec
+        row.fstype = entry.fstype
+        row.type = kind
+        row.remote = isRemoteKind(kind)
+        row.readOnly = entry.options.common.readOnly
+      }
       if (entry.disabled) {
         row.disabled = true
         row.state = 'disabled'
@@ -556,24 +570,71 @@ export function parseSpec(kind: string, spec: string): { server?: string, remote
 }
 
 /**
+ * Apply ONE flat request option onto a structured option tier, under the clear
+ * contract (issue #34): a value SETS the option, `null` CLEARS it (the key
+ * leaves the object, so the fstab renderer emits no token for it), `undefined`
+ * KEEPS whatever is already there.
+ *
+ * The single implementation both write paths share — create
+ * (`applyMountDefaults`, onto a fresh tier) and edit (`mergeEntry`, onto the
+ * parsed entry) — so a newly added option cannot gain clear semantics on one
+ * path and quietly lack them on the other.
+ */
+export function applyOption<T extends object, K extends keyof T>(
+  tier: T,
+  key: K,
+  value: T[K] | null | undefined,
+): void {
+  if (value === null)
+    delete (tier as Partial<T>)[key]
+  else if (value !== undefined)
+    tier[key] = value
+}
+
+/**
+ * `sec=` is a UNION at the flat request boundary (the NFS and CIFS flavours
+ * share one field), so it is narrowed to the tier's own vocabulary before it is
+ * applied — an out-of-tier value is dropped rather than mis-applied. `null`
+ * clears, exactly like every other option.
+ */
+export function applySecOption<S extends string>(
+  tier: { sec?: S },
+  value: string | null | undefined,
+  flavours: readonly S[],
+): void {
+  if (value === null) {
+    delete tier.sec
+    return
+  }
+  if (value === undefined)
+    return
+  if ((flavours as readonly string[]).includes(value))
+    tier.sec = value as S
+}
+
+/**
  * Apply the server-enforced option defaults (18.5), returning the resolved
  * structured options + advisory warnings:
  *  - `nofail` FORCED on every ANAS-written entry.
  *  - `_netdev`, `nosuid`, `nodev` default-on for nfs/cifs (respecting explicit off).
  *  - NFS `vers=4.2` + `hard` default; `soft` surfaces a corruption warning.
  *  - CIFS `vers=3.1.1` default; explicit `vers=1.0` surfaces a loud warning.
+ *
+ * A `null` option (the clear contract, #34) means "no such option": on this
+ * create path there is nothing to remove, so it simply declines the default
+ * where one exists (`vers`/`hard`) and is otherwise a no-op.
  */
 export function applyMountDefaults(
   type: MountType,
   input: MountRequestOptions | undefined,
   automount: boolean,
-  extraOptions?: string,
+  extraOptions?: string | null,
 ): { options: MountOptions, warnings: string[] } {
   const warnings: string[] = []
   const remote = type === 'nfs' || type === 'cifs'
   const o = input ?? {}
 
-  const common = {
+  const common: MountOptions['common'] = {
     readOnly: o.ro ?? false,
     nofail: true, // FORCED
     noauto: false,
@@ -583,84 +644,55 @@ export function applyMountDefaults(
     nodev: o.nodev ?? remote,
     noexec: o.noexec ?? false,
     netdev: o.netdev ?? remote,
-    ...(o.idleTimeout !== undefined ? { automountIdleTimeout: o.idleTimeout } : {}),
   }
+  applyOption(common, 'automountIdleTimeout', o.idleTimeout)
+  // An idle timeout is an AUTOMOUNT setting: without x-systemd.automount the
+  // token is inert clutter, so it never survives an un-automounted entry.
+  if (!automount)
+    delete common.automountIdleTimeout
 
   const options: MountOptions = { common, passthrough: extraOptions ?? '' }
 
   if (type === 'nfs') {
-    const nfs: NonNullable<MountOptions['nfs']> = {
-      vers: o.vers ?? '4.2',
-      hard: o.hard ?? true,
-    }
-    if (o.timeo !== undefined)
-      nfs.timeo = o.timeo
-    if (o.retrans !== undefined)
-      nfs.retrans = o.retrans
-    if (o.rsize !== undefined)
-      nfs.rsize = o.rsize
-    if (o.wsize !== undefined)
-      nfs.wsize = o.wsize
-    if (o.proto !== undefined)
-      nfs.proto = o.proto
-    if (o.noac !== undefined)
-      nfs.noac = o.noac
-    if (o.actimeo !== undefined)
-      nfs.actimeo = o.actimeo
-    if (o.nconnect !== undefined)
-      nfs.nconnect = o.nconnect
-    if (o.bg !== undefined)
-      nfs.bg = o.bg
-    if (o.lookupcache !== undefined)
-      nfs.lookupcache = o.lookupcache
-    if (o.sec !== undefined) {
-      // `sec` is a union at the flat boundary; narrow to the NFS tier (an
-      // out-of-tier value — a CIFS-only flavour — is simply not applied).
-      const s = MountNfsSec.safeParse(o.sec)
-      if (s.success)
-        nfs.sec = s.data
-    }
+    const nfs: NonNullable<MountOptions['nfs']> = {}
+    // vers/hard carry a server default; `null` (the operator blanked the field)
+    // declines it — the mount then uses the kernel/mount.nfs default.
+    applyOption(nfs, 'vers', o.vers === undefined ? '4.2' : o.vers)
+    applyOption(nfs, 'hard', o.hard === undefined ? true : o.hard)
+    applyOption(nfs, 'timeo', o.timeo)
+    applyOption(nfs, 'retrans', o.retrans)
+    applyOption(nfs, 'rsize', o.rsize)
+    applyOption(nfs, 'wsize', o.wsize)
+    applyOption(nfs, 'proto', o.proto)
+    applyOption(nfs, 'noac', o.noac)
+    applyOption(nfs, 'actimeo', o.actimeo)
+    applyOption(nfs, 'nconnect', o.nconnect)
+    applyOption(nfs, 'bg', o.bg)
+    applyOption(nfs, 'lookupcache', o.lookupcache)
+    applySecOption(nfs, o.sec, MountNfsSec.options)
     if (nfs.hard === false)
       warnings.push('Soft NFS mounts can silently corrupt data on a timeout — prefer hard,nofail unless you understand the risk.')
     options.nfs = nfs
   }
   else if (type === 'cifs') {
-    const cifs: NonNullable<MountOptions['cifs']> = { vers: o.vers ?? '3.1.1' }
-    if (o.domain !== undefined)
-      cifs.domain = o.domain
-    if (o.uid !== undefined)
-      cifs.uid = o.uid
-    if (o.gid !== undefined)
-      cifs.gid = o.gid
-    if (o.fileMode !== undefined)
-      cifs.fileMode = o.fileMode
-    if (o.dirMode !== undefined)
-      cifs.dirMode = o.dirMode
-    if (o.cache !== undefined)
-      cifs.cache = o.cache
-    if (o.mfsymlinks !== undefined)
-      cifs.mfsymlinks = o.mfsymlinks
-    if (o.forceuid !== undefined)
-      cifs.forceuid = o.forceuid
-    if (o.forcegid !== undefined)
-      cifs.forcegid = o.forcegid
-    if (o.noserverino !== undefined)
-      cifs.noserverino = o.noserverino
-    if (o.nobrl !== undefined)
-      cifs.nobrl = o.nobrl
-    if (o.actimeo !== undefined)
-      cifs.actimeo = o.actimeo
-    if (o.rsize !== undefined)
-      cifs.rsize = o.rsize
-    if (o.wsize !== undefined)
-      cifs.wsize = o.wsize
-    if (o.iocharset !== undefined)
-      cifs.iocharset = o.iocharset
-    if (o.sec !== undefined) {
-      const s = MountCifsSec.safeParse(o.sec)
-      if (s.success)
-        cifs.sec = s.data
-    }
+    const cifs: NonNullable<MountOptions['cifs']> = {}
+    applyOption(cifs, 'vers', o.vers === undefined ? '3.1.1' : o.vers)
+    applyOption(cifs, 'domain', o.domain)
+    applyOption(cifs, 'uid', o.uid)
+    applyOption(cifs, 'gid', o.gid)
+    applyOption(cifs, 'fileMode', o.fileMode)
+    applyOption(cifs, 'dirMode', o.dirMode)
+    applyOption(cifs, 'cache', o.cache)
+    applyOption(cifs, 'mfsymlinks', o.mfsymlinks)
+    applyOption(cifs, 'forceuid', o.forceuid)
+    applyOption(cifs, 'forcegid', o.forcegid)
+    applyOption(cifs, 'noserverino', o.noserverino)
+    applyOption(cifs, 'nobrl', o.nobrl)
+    applyOption(cifs, 'actimeo', o.actimeo)
+    applyOption(cifs, 'rsize', o.rsize)
+    applyOption(cifs, 'wsize', o.wsize)
+    applyOption(cifs, 'iocharset', o.iocharset)
+    applySecOption(cifs, o.sec, MountCifsSec.options)
     if (cifs.vers === '1.0')
       warnings.push('SMB 1.0 (vers=1.0) is insecure and deprecated — use it only for very old servers that require it.')
     options.cifs = cifs

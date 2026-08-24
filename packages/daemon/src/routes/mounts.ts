@@ -13,6 +13,8 @@ import { diagnoseBusyPath, enrichBusyError, formatHolders } from '../services/bu
 import { editConfig, readConfig } from '../services/config-writer.js'
 import {
   ahrPinnedSpecs,
+  applyOption,
+  applySecOption,
   buildBaseInventory,
   buildMountDetail,
   cleanMountStderr,
@@ -819,14 +821,17 @@ async function dirContents(path: string): Promise<string[] | null> {
 }
 
 /**
- * Merge an update's flat option changes onto an existing entry. Provided fields
- * override; omitted fields are kept. `nofail` stays forced true.
+ * Merge an update's flat option changes onto an existing entry, under the clear
+ * contract (issue #34): a value OVERRIDES, `null` REMOVES the stored option, and
+ * an omitted field KEEPS it. Before the null case existed, a blanked dialog
+ * field looked exactly like an untouched one, so an option could be set but
+ * never unset. `nofail` stays forced true.
  */
 function mergeEntry(
   existing: MountEntry,
   input: MountRequestOptions | undefined,
   automount: boolean | undefined,
-  extraOptions: string | undefined,
+  extraOptions: string | null | undefined,
 ): MountEntry {
   const common = { ...existing.options.common }
   if (input?.ro !== undefined)
@@ -841,88 +846,59 @@ function mergeEntry(
     common.noexec = input.noexec
   if (input?.netdev !== undefined)
     common.netdev = input.netdev
-  if (input?.idleTimeout !== undefined)
-    common.automountIdleTimeout = input.idleTimeout
+  applyOption(common, 'automountIdleTimeout', input?.idleTimeout)
   if (automount !== undefined)
     common.automount = automount
+  // Turning Automount OFF takes its idle timeout with it: the renderer emits
+  // x-systemd.idle-timeout independently of x-systemd.automount, so a stale
+  // timeout would otherwise outlive the automount that gave it meaning. The
+  // renderer stays dumb; the merge decides.
+  if (automount === false)
+    delete common.automountIdleTimeout
   common.nofail = true // always forced
 
   const options: MountOptions = {
     common,
-    passthrough: extraOptions ?? existing.options.passthrough,
+    // An EMPTY (or null) extraOptions clears the passthrough — the operator
+    // blanked the field. Only an omitted field keeps what was there.
+    passthrough: extraOptions === undefined ? existing.options.passthrough : (extraOptions ?? ''),
   }
   if (existing.fstype === 'nfs4' || existing.fstype === 'nfs') {
     const nfs = { ...existing.options.nfs }
-    if (input?.vers !== undefined)
-      nfs.vers = input.vers
-    if (input?.hard !== undefined)
-      nfs.hard = input.hard
-    if (input?.timeo !== undefined)
-      nfs.timeo = input.timeo
-    if (input?.retrans !== undefined)
-      nfs.retrans = input.retrans
-    if (input?.rsize !== undefined)
-      nfs.rsize = input.rsize
-    if (input?.wsize !== undefined)
-      nfs.wsize = input.wsize
-    if (input?.proto !== undefined)
-      nfs.proto = input.proto
-    if (input?.noac !== undefined)
-      nfs.noac = input.noac
-    if (input?.actimeo !== undefined)
-      nfs.actimeo = input.actimeo
-    if (input?.nconnect !== undefined)
-      nfs.nconnect = input.nconnect
-    if (input?.bg !== undefined)
-      nfs.bg = input.bg
-    if (input?.lookupcache !== undefined)
-      nfs.lookupcache = input.lookupcache
-    if (input?.sec !== undefined) {
-      const s = MountNfsSec.safeParse(input.sec)
-      if (s.success)
-        nfs.sec = s.data
-    }
+    applyOption(nfs, 'vers', input?.vers)
+    applyOption(nfs, 'hard', input?.hard)
+    applyOption(nfs, 'timeo', input?.timeo)
+    applyOption(nfs, 'retrans', input?.retrans)
+    applyOption(nfs, 'rsize', input?.rsize)
+    applyOption(nfs, 'wsize', input?.wsize)
+    applyOption(nfs, 'proto', input?.proto)
+    applyOption(nfs, 'noac', input?.noac)
+    applyOption(nfs, 'actimeo', input?.actimeo)
+    applyOption(nfs, 'nconnect', input?.nconnect)
+    applyOption(nfs, 'bg', input?.bg)
+    applyOption(nfs, 'lookupcache', input?.lookupcache)
+    applySecOption(nfs, input?.sec, MountNfsSec.options)
     options.nfs = nfs
   }
   if (existing.fstype === 'cifs') {
     const cifs = { ...existing.options.cifs }
-    if (input?.vers !== undefined)
-      cifs.vers = input.vers
-    if (input?.domain !== undefined)
-      cifs.domain = input.domain
-    if (input?.uid !== undefined)
-      cifs.uid = input.uid
-    if (input?.gid !== undefined)
-      cifs.gid = input.gid
-    if (input?.fileMode !== undefined)
-      cifs.fileMode = input.fileMode
-    if (input?.dirMode !== undefined)
-      cifs.dirMode = input.dirMode
-    if (input?.cache !== undefined)
-      cifs.cache = input.cache
-    if (input?.mfsymlinks !== undefined)
-      cifs.mfsymlinks = input.mfsymlinks
-    if (input?.forceuid !== undefined)
-      cifs.forceuid = input.forceuid
-    if (input?.forcegid !== undefined)
-      cifs.forcegid = input.forcegid
-    if (input?.noserverino !== undefined)
-      cifs.noserverino = input.noserverino
-    if (input?.nobrl !== undefined)
-      cifs.nobrl = input.nobrl
-    if (input?.actimeo !== undefined)
-      cifs.actimeo = input.actimeo
-    if (input?.rsize !== undefined)
-      cifs.rsize = input.rsize
-    if (input?.wsize !== undefined)
-      cifs.wsize = input.wsize
-    if (input?.iocharset !== undefined)
-      cifs.iocharset = input.iocharset
-    if (input?.sec !== undefined) {
-      const s = MountCifsSec.safeParse(input.sec)
-      if (s.success)
-        cifs.sec = s.data
-    }
+    applyOption(cifs, 'vers', input?.vers)
+    applyOption(cifs, 'domain', input?.domain)
+    applyOption(cifs, 'uid', input?.uid)
+    applyOption(cifs, 'gid', input?.gid)
+    applyOption(cifs, 'fileMode', input?.fileMode)
+    applyOption(cifs, 'dirMode', input?.dirMode)
+    applyOption(cifs, 'cache', input?.cache)
+    applyOption(cifs, 'mfsymlinks', input?.mfsymlinks)
+    applyOption(cifs, 'forceuid', input?.forceuid)
+    applyOption(cifs, 'forcegid', input?.forcegid)
+    applyOption(cifs, 'noserverino', input?.noserverino)
+    applyOption(cifs, 'nobrl', input?.nobrl)
+    applyOption(cifs, 'actimeo', input?.actimeo)
+    applyOption(cifs, 'rsize', input?.rsize)
+    applyOption(cifs, 'wsize', input?.wsize)
+    applyOption(cifs, 'iocharset', input?.iocharset)
+    applySecOption(cifs, input?.sec, MountCifsSec.options)
     options.cifs = cifs
   }
 

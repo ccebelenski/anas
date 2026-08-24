@@ -429,6 +429,24 @@ export type MountCredentials = z.infer<typeof MountCredentials>
  * Flat request options (UI contract). All optional; the server enforces defaults
  * — `nofail` forced, `_netdev`/`nosuid`/`nodev` for remote, vers defaults. The
  * UI never sends `nofail`.
+ *
+ * THE CLEAR CONTRACT (issue #34). Every VALUE-BEARING option is `T | null`, and
+ * the three cases are distinct:
+ *
+ *   - a value    → SET the option;
+ *   - `null`     → CLEAR it (the option leaves the stored entry entirely);
+ *   - omitted    → KEEP whatever the entry already has.
+ *
+ * Without the middle case a blanked dialog field is indistinguishable from an
+ * untouched one, so an option could never be removed once set — the operator
+ * blanked the field, the UI omitted it, and the daemon dutifully kept the old
+ * value ("blank it and it comes back"). The UI therefore sends every option
+ * field UNCONDITIONALLY: its value when set, `null` when the field is blank.
+ *
+ * Pure BOOLEAN flags need no null: `false` already renders as "no token", which
+ * is exactly the cleared state. The ONE exception is `hard`, which is a
+ * tri-state at the fstab level — `hard` / `soft` / neither (kernel default) —
+ * so it carries the null too.
  */
 export const MountRequestOptions = z.object({
   // common
@@ -439,37 +457,38 @@ export const MountRequestOptions = z.object({
   noexec: z.boolean().optional(),
   /** _netdev — order after the network is up. Defaults on for remote when omitted. */
   netdev: z.boolean().optional(),
-  /** x-systemd.idle-timeout seconds (automount). */
-  idleTimeout: z.number().int().positive().optional(),
+  /** x-systemd.idle-timeout seconds (automount). `null` clears it. */
+  idleTimeout: z.number().int().positive().nullable().optional(),
   // nfs
-  vers: MountVers.optional(),
-  hard: z.boolean().optional(),
-  timeo: z.number().int().positive().optional(),
-  retrans: z.number().int().nonnegative().optional(),
-  rsize: z.number().int().positive().optional(),
-  wsize: z.number().int().positive().optional(),
-  proto: MountNfsProto.optional(),
+  vers: MountVers.nullable().optional(),
+  /** hard (true) / soft (false) / `null` = neither token, i.e. the mount default. */
+  hard: z.boolean().nullable().optional(),
+  timeo: z.number().int().positive().nullable().optional(),
+  retrans: z.number().int().nonnegative().nullable().optional(),
+  rsize: z.number().int().positive().nullable().optional(),
+  wsize: z.number().int().positive().nullable().optional(),
+  proto: MountNfsProto.nullable().optional(),
   noac: z.boolean().optional(),
-  nconnect: z.number().int().positive().max(16).optional(),
+  nconnect: z.number().int().positive().max(16).nullable().optional(),
   bg: z.boolean().optional(),
-  lookupcache: MountLookupCache.optional(),
+  lookupcache: MountLookupCache.nullable().optional(),
   /** attribute-cache lifetime (seconds) — shared by nfs & cifs. */
-  actimeo: z.number().int().nonnegative().optional(),
+  actimeo: z.number().int().nonnegative().nullable().optional(),
   /** authentication flavour — narrowed to the fstype's tier by the daemon. */
-  sec: MountSec.optional(),
+  sec: MountSec.nullable().optional(),
   // cifs
-  domain: SingleLine.optional(),
-  uid: z.number().int().nonnegative().optional(),
-  gid: z.number().int().nonnegative().optional(),
-  fileMode: MountMode.optional(),
-  dirMode: MountMode.optional(),
-  cache: MountCifsCache.optional(),
+  domain: SingleLine.nullable().optional(),
+  uid: z.number().int().nonnegative().nullable().optional(),
+  gid: z.number().int().nonnegative().nullable().optional(),
+  fileMode: MountMode.nullable().optional(),
+  dirMode: MountMode.nullable().optional(),
+  cache: MountCifsCache.nullable().optional(),
   mfsymlinks: z.boolean().optional(),
   forceuid: z.boolean().optional(),
   forcegid: z.boolean().optional(),
   noserverino: z.boolean().optional(),
   nobrl: z.boolean().optional(),
-  iocharset: MountCharset.optional(),
+  iocharset: MountCharset.nullable().optional(),
 })
 export type MountRequestOptions = z.infer<typeof MountRequestOptions>
 
@@ -491,8 +510,8 @@ export const CreateMountRequest = z.object({
   /** Run `mount` now (default true). */
   mountNow: z.boolean().default(true),
   options: MountRequestOptions.optional(),
-  /** Verbatim extra mount options (round-tripped in passthrough). */
-  extraOptions: z.string().optional(),
+  /** Verbatim extra mount options (round-tripped in passthrough). Empty/`null` = none. */
+  extraOptions: z.string().nullable().optional(),
   /** CIFS credentials (write-only) — required to authenticate a CIFS mount. */
   credentials: MountCredentials.optional(),
 })
@@ -504,11 +523,20 @@ export type CreateMountRequest = z.infer<typeof CreateMountRequest>
  * and so is `persistent`: an edit acts ON the fstab entry, so persistence is
  * edit-time IDENTITY (like type/server), not an editable field. It stays on
  * CreateMountRequest only; a body that still carries it is ignored (stripped).
+ *
+ * Because `server`/`remotePath` are not on this schema, an edit CANNOT move a
+ * mount to another server or export — so the dialog renders both read-only and
+ * tests the STORED spec rather than an edited one (issue #38: they were live
+ * controls whose values the save silently dropped).
  */
 export const UpdateMountRequest = z.object({
   automount: z.boolean().optional(),
   options: MountRequestOptions.optional(),
-  extraOptions: z.string().optional(),
+  /**
+   * Verbatim passthrough options. Under the clear contract (#34) an EMPTY string
+   * (or `null`) drops the stored passthrough; omitting the field keeps it.
+   */
+  extraOptions: z.string().nullable().optional(),
   /** Rotate CIFS credentials (write-only). */
   credentials: MountCredentials.optional(),
 })

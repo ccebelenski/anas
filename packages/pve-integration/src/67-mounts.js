@@ -59,9 +59,15 @@
  *       credentials:{ username, password, domain } }         (CIFS; write-only)
  *     nofail is FORCED by the daemon (default mode) — the UI shows it locked-on
  *     and does NOT send it as a choice.
+ *     THE CLEAR CONTRACT (#34): every value-bearing option travels on EVERY
+ *     save — its value when the field is filled, `null` when it is blank. `null`
+ *     REMOVES the option from the entry; an omitted field would only ever mean
+ *     "keep", which is why a blanked field used to come back on the next load.
  *   PUT /v1/mounts/:mountpoint → 202 { job }   same body minus `persistent`
  *     (create-time only — the PUT does not act on it) and minus `credentials`
- *     unless the operator typed a new password ("unchanged" otherwise).
+ *     unless the operator typed a new password ("unchanged" otherwise). The
+ *     server/export path are IDENTITY on an edit — the schema carries neither,
+ *     so the dialog shows both read-only and tests the stored spec (#38).
  *   DELETE /v1/mounts/:mountpoint → 202/409   (unmount + drop fstab; busy → 409
  *     with confirm code + holding-process warnings). Optional
  *     ?removeMountpointDir=true also removes the mountpoint DIRECTORY — rmdir
@@ -146,6 +152,40 @@
         } catch (e) {
             return false;
         }
+    }
+
+    // ---- The clear contract (issue #34) ------------------------------------
+    //
+    // Every VALUE-BEARING option travels on every save: its value when the field
+    // is filled, and null when the field is BLANK. null tells the daemon to
+    // REMOVE the option from the fstab entry. Omitting a blank field (what this
+    // dialog used to do) is indistinguishable from not touching it, so an option
+    // could be set but never unset — blank the field, save, and it came back.
+    //
+    // Pure checkboxes need no null: false already renders as "no token".
+
+    // A blank text field → null; otherwise the trimmed string.
+    function textOrNull(win, sel) {
+        var v = valOf(win, sel);
+        v = ('' + (v === undefined || v === null ? '' : v)).trim();
+        return v === '' ? null : v;
+    }
+
+    // A combobox with nothing chosen → null; otherwise the chosen value.
+    function pickOrNull(win, sel) {
+        var v = valOf(win, sel);
+        return (v === undefined || v === null || v === '') ? null : v;
+    }
+
+    // A numeric field → an integer, or null when blank / unparseable. `positive`
+    // mirrors the schema's own floor (`.positive()` vs `.nonnegative()`), so a
+    // value the daemon would reject leaves as a clear instead of a 400.
+    function numOrNull(win, sel, positive) {
+        var n = parseInt(valOf(win, sel), 10);
+        if (isNaN(n) || n < 0 || (positive && n < 1)) {
+            return null;
+        }
+        return n;
     }
 
     // ---- Field aliasing (defensive: tolerate absent / renamed fields) -------
@@ -1197,7 +1237,14 @@
             if (vers) {
                 opts.push('vers=' + vers);
             }
-            opts.push(valOf(win, '#nfsHard') === false ? 'soft' : 'hard');
+            // Same tri-state the save uses — an entry that carried neither token
+            // keeps carrying neither, and the preview says so.
+            var hard = hardOption(win);
+            if (hard === false) {
+                opts.push('soft');
+            } else if (hard === true) {
+                opts.push('hard');
+            }
             var timeo = parseInt(valOf(win, '#nfsTimeo'), 10);
             if (!isNaN(timeo) && timeo > 0) {
                 opts.push('timeo=' + timeo);
@@ -1354,12 +1401,31 @@
 
     // ---- Test connection (POST /v1/mounts/test) ----------------------------
 
-    function testBody(win) {
-        var type = valOf(win, '#type') || 'nfs';
-        var body = {
-            type: type,
+    // The spec Test connection probes. On an edit that is the STORED spec (what
+    // the mount actually points at), never a field value — the PUT cannot move a
+    // mount, so a diagnosis of some other server would be a verdict about a
+    // configuration this dialog can never save (issue #38).
+    function testSpec(win) {
+        var stored = win._stored;
+        if (stored && stored.server) {
+            return {
+                server: ('' + stored.server).trim(),
+                remotePath: ('' + (stored.remotePath || '')).trim(),
+            };
+        }
+        return {
             server: ('' + (valOf(win, '#server') || '')).trim(),
             remotePath: ('' + (valOf(win, '#remotePath') || '')).trim(),
+        };
+    }
+
+    function testBody(win) {
+        var type = valOf(win, '#type') || 'nfs';
+        var spec = testSpec(win);
+        var body = {
+            type: type,
+            server: spec.server,
+            remotePath: spec.remotePath,
         };
         if (type === 'cifs') {
             var user = ('' + (valOf(win, '#credUser') || '')).trim();
@@ -1416,8 +1482,9 @@
     }
 
     function runTest(win, node) {
-        var server = ('' + (valOf(win, '#server') || '')).trim();
-        var remotePath = ('' + (valOf(win, '#remotePath') || '')).trim();
+        var spec = testSpec(win);
+        var server = spec.server;
+        var remotePath = spec.remotePath;
         if (!server || !remotePath) {
             ANAS.alertMsg('Invalid input', t('Enter a server and a share/export path to test.'));
             return;
@@ -1536,10 +1603,13 @@
                     xtype: 'numberfield',
                     itemId: 'optIdle',
                     fieldLabel: t('Idle timeout (s)'),
-                    minValue: 0,
+                    // 1, not 0: the daemon's schema is `.positive()`, and a blank
+                    // field is now how you CLEAR the timeout (#34) — 0 was a
+                    // value the dialog offered and the API refused.
+                    minValue: 1,
                     value: 60,
                     disabled: true,
-                    emptyText: '60',
+                    emptyText: t('none'),
                 },
             ],
         };
@@ -1597,9 +1667,11 @@
                         + enc(t('soft mounts can silently corrupt data on a server hiccup — '
                             + 'an I/O error is returned mid-write. Prefer hard unless you know why.')),
                 },
+                // minValue mirrors the shared schema exactly: `.positive()` → 1,
+                // `.nonnegative()` → 0. Blank is how an option is CLEARED (#34).
                 {
                     xtype: 'numberfield', itemId: 'nfsTimeo', fieldLabel: t('timeo (deciseconds)'),
-                    minValue: 0, emptyText: t('server default'),
+                    minValue: 1, emptyText: t('server default'),
                 },
                 {
                     xtype: 'numberfield', itemId: 'nfsRetrans', fieldLabel: t('retrans'),
@@ -1607,11 +1679,11 @@
                 },
                 {
                     xtype: 'numberfield', itemId: 'nfsRsize', fieldLabel: t('rsize (bytes)'),
-                    minValue: 0, emptyText: t('negotiated'),
+                    minValue: 1, emptyText: t('negotiated'),
                 },
                 {
                     xtype: 'numberfield', itemId: 'nfsWsize', fieldLabel: t('wsize (bytes)'),
-                    minValue: 0, emptyText: t('negotiated'),
+                    minValue: 1, emptyText: t('negotiated'),
                 },
                 {
                     xtype: 'fieldset',
@@ -1791,11 +1863,11 @@
                         },
                         {
                             xtype: 'numberfield', itemId: 'cifsRsize', fieldLabel: t('rsize (bytes)'),
-                            minValue: 0, emptyText: t('negotiated'),
+                            minValue: 1, emptyText: t('negotiated'),
                         },
                         {
                             xtype: 'numberfield', itemId: 'cifsWsize', fieldLabel: t('wsize (bytes)'),
-                            minValue: 0, emptyText: t('negotiated'),
+                            minValue: 1, emptyText: t('negotiated'),
                         },
                         {
                             xtype: 'numberfield', itemId: 'cifsActimeo', fieldLabel: t('actimeo (s)'),
@@ -1951,6 +2023,12 @@
                             allowBlank: false,
                             // On edit this is filled from GET /mounts/:mp (detail.server),
                             // which parses the fstab spec — the summary row has no parts.
+                            // READ-ONLY there: the spec is identity, exactly like the
+                            // mountpoint. UpdateMountRequest carries no server, so an
+                            // edited value was silently dropped by the save — a control
+                            // that lied, and one Test connection would happily validate
+                            // (issue #38). Re-point a share by removing and re-adding it.
+                            readOnly: isEdit,
                             value: '',
                         },
                         {
@@ -1961,6 +2039,7 @@
                             emptyText: protoType === 'nfs' ? '/srv/export1' : 'share1',
                             allowBlank: false,
                             // Filled on edit from detail.remotePath (parsed spec).
+                            readOnly: isEdit, // identity, same as Server (issue #38)
                             value: '',
                         },
                         {
@@ -2125,6 +2204,21 @@
         }
     }
 
+    // Set a field EXACTLY as the entry has it: an absent option BLANKS the field
+    // rather than leaving the field config's own default showing. A default the
+    // operator never chose (vers=4.2 / 3.1.1, file_mode=0644, dir_mode=0755,
+    // idle-timeout=60) that is left showing in an edit gets written on the next
+    // save — the entry silently grows options it never had (#43 item 3). Blank
+    // means absent, both ways: the submit sends null for a blank field.
+    function setFldExact(win, sel, v) {
+        try {
+            var f = win.down(sel);
+            if (f) { f.setValue(v === undefined || v === null ? null : v); }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
     // Set a checkbox by itemId to an explicit boolean (false must uncheck).
     function setChk(win, sel, on) {
         try {
@@ -2151,9 +2245,18 @@
             var co = d.configuredOptions || {};
             var common = co.common || {};
 
-            // Connection (parsed from the fstab spec by the daemon).
+            // The STORED spec — the identity an edit cannot change (the PUT
+            // schema carries no server/remotePath). Both fields are read-only
+            // here, and Test connection probes these values, never a typed one
+            // the save would drop on the floor (issue #38).
+            win._stored = { server: d.server, remotePath: d.remotePath };
             setFld(win, '#server', d.server);
             setFld(win, '#remotePath', d.remotePath);
+
+            // What the entry ACTUALLY carries, for the options whose absence the
+            // form cannot draw (a checked box cannot mean "no token"). Read back
+            // at submit time so an untouched save round-trips byte-identically.
+            win._prefill = { hard: (co.nfs || {}).hard };
 
             // Common options. Access is a radiogroup, not a checkbox — set the
             // group's value map (roOf reads the same group back at submit time).
@@ -2169,47 +2272,47 @@
             setChk(win, '#optNoexec', common.noexec);
             setChk(win, '#optNetdev', common.netdev);
             setChk(win, '#optAutomount', common.automount);
-            setFld(win, '#optIdle', common.automountIdleTimeout);
+            setFldExact(win, '#optIdle', common.automountIdleTimeout);
 
             // Persistence.
             if (d.persistent === true || d.persistent === false) {
                 setChk(win, '#persist', d.persistent);
             }
 
-            // NFS tier.
+            // NFS tier — every field EXACT (an absent option leaves it blank).
             var nfs = co.nfs || {};
-            setFld(win, '#nfsVers', nfs.vers);
+            setFldExact(win, '#nfsVers', nfs.vers);
             setChk(win, '#nfsHard', nfs.hard !== false); // default hard when unset
-            setFld(win, '#nfsTimeo', nfs.timeo);
-            setFld(win, '#nfsRetrans', nfs.retrans);
-            setFld(win, '#nfsRsize', nfs.rsize);
-            setFld(win, '#nfsWsize', nfs.wsize);
-            setFld(win, '#nfsProto', nfs.proto);
-            setFld(win, '#nfsSec', nfs.sec);
-            setFld(win, '#nfsNconnect', nfs.nconnect);
-            setFld(win, '#nfsActimeo', nfs.actimeo);
-            setFld(win, '#nfsLookupcache', nfs.lookupcache);
+            setFldExact(win, '#nfsTimeo', nfs.timeo);
+            setFldExact(win, '#nfsRetrans', nfs.retrans);
+            setFldExact(win, '#nfsRsize', nfs.rsize);
+            setFldExact(win, '#nfsWsize', nfs.wsize);
+            setFldExact(win, '#nfsProto', nfs.proto);
+            setFldExact(win, '#nfsSec', nfs.sec);
+            setFldExact(win, '#nfsNconnect', nfs.nconnect);
+            setFldExact(win, '#nfsActimeo', nfs.actimeo);
+            setFldExact(win, '#nfsLookupcache', nfs.lookupcache);
             setChk(win, '#nfsNoac', nfs.noac === true);
             setChk(win, '#nfsBg', nfs.bg === true);
 
             // CIFS tier.
             var cifs = co.cifs || {};
-            setFld(win, '#cifsVers', cifs.vers);
-            setFld(win, '#cifsCache', cifs.cache);
+            setFldExact(win, '#cifsVers', cifs.vers);
+            setFldExact(win, '#cifsCache', cifs.cache);
             // Domain lives in the credentials section; for a hand-written inline
             // entry it is surfaced via d.credentials.domain (never a cifs option).
-            setFld(win, '#credDomain', first(cifs.domain, d.credentials && d.credentials.domain));
-            setFld(win, '#cifsUid', cifs.uid);
+            setFldExact(win, '#credDomain', first(cifs.domain, d.credentials && d.credentials.domain));
+            setFldExact(win, '#cifsUid', cifs.uid);
             setChk(win, '#cifsForceuid', cifs.forceuid === true);
-            setFld(win, '#cifsGid', cifs.gid);
+            setFldExact(win, '#cifsGid', cifs.gid);
             setChk(win, '#cifsForcegid', cifs.forcegid === true);
-            setFld(win, '#cifsFileMode', cifs.fileMode);
-            setFld(win, '#cifsDirMode', cifs.dirMode);
-            setFld(win, '#cifsSec', cifs.sec);
-            setFld(win, '#cifsRsize', cifs.rsize);
-            setFld(win, '#cifsWsize', cifs.wsize);
-            setFld(win, '#cifsActimeo', cifs.actimeo);
-            setFld(win, '#cifsIocharset', cifs.iocharset);
+            setFldExact(win, '#cifsFileMode', cifs.fileMode);
+            setFldExact(win, '#cifsDirMode', cifs.dirMode);
+            setFldExact(win, '#cifsSec', cifs.sec);
+            setFldExact(win, '#cifsRsize', cifs.rsize);
+            setFldExact(win, '#cifsWsize', cifs.wsize);
+            setFldExact(win, '#cifsActimeo', cifs.actimeo);
+            setFldExact(win, '#cifsIocharset', cifs.iocharset);
             setChk(win, '#cifsMfsymlinks', cifs.mfsymlinks === true);
             setChk(win, '#cifsNoserverino', cifs.noserverino === true);
             setChk(win, '#cifsNobrl', cifs.nobrl === true);
@@ -2217,7 +2320,7 @@
             refreshModeHint(win, '#cifsDirMode', '#cifsDirModeHint');
 
             // Unrecognized options round-trip verbatim through the extra field.
-            setFld(win, '#extraOptions', co.passthrough);
+            setFldExact(win, '#extraOptions', co.passthrough);
 
             // Saved CIFS username (never the password).
             if (d.credentials && d.credentials.username) {
@@ -2228,6 +2331,70 @@
         }, function (err) {
             ANAS.warn('mount detail load for edit failed: ' + ANAS.errText(err));
         });
+    }
+
+    // The whole flat options body for a save, under the clear contract (#34):
+    // every value-bearing field is present on EVERY save — its value when set,
+    // null when blank (= remove the option). Checkboxes stay plain booleans.
+    function mountOptionsBody(win, type) {
+        var options = {
+            ro: roOf(win),
+            noatime: !!valOf(win, '#optNoatime'),
+            nosuid: !!valOf(win, '#optNosuid'),
+            nodev: !!valOf(win, '#optNodev'),
+            noexec: !!valOf(win, '#optNoexec'),
+            netdev: !!valOf(win, '#optNetdev'),
+            // An idle timeout belongs to Automount: unchecking it clears the
+            // timeout too (the daemon enforces the same rule).
+            idleTimeout: valOf(win, '#optAutomount') ? numOrNull(win, '#optIdle', true) : null,
+        };
+        if (type === 'nfs') {
+            options.vers = pickOrNull(win, '#nfsVers');
+            options.hard = hardOption(win);
+            options.timeo = numOrNull(win, '#nfsTimeo', true);
+            options.retrans = numOrNull(win, '#nfsRetrans');
+            options.rsize = numOrNull(win, '#nfsRsize', true);
+            options.wsize = numOrNull(win, '#nfsWsize', true);
+            options.proto = pickOrNull(win, '#nfsProto');
+            options.sec = pickOrNull(win, '#nfsSec');
+            options.nconnect = numOrNull(win, '#nfsNconnect', true);
+            options.actimeo = numOrNull(win, '#nfsActimeo');
+            options.lookupcache = pickOrNull(win, '#nfsLookupcache');
+            options.noac = !!valOf(win, '#nfsNoac');
+            options.bg = !!valOf(win, '#nfsBg');
+        } else if (type === 'cifs') {
+            options.vers = pickOrNull(win, '#cifsVers');
+            options.cache = pickOrNull(win, '#cifsCache');
+            options.domain = textOrNull(win, '#credDomain');
+            options.uid = numOrNull(win, '#cifsUid');
+            options.forceuid = !!valOf(win, '#cifsForceuid');
+            options.gid = numOrNull(win, '#cifsGid');
+            options.forcegid = !!valOf(win, '#cifsForcegid');
+            options.fileMode = textOrNull(win, '#cifsFileMode');
+            options.dirMode = textOrNull(win, '#cifsDirMode');
+            options.sec = pickOrNull(win, '#cifsSec');
+            options.rsize = numOrNull(win, '#cifsRsize', true);
+            options.wsize = numOrNull(win, '#cifsWsize', true);
+            options.actimeo = numOrNull(win, '#cifsActimeo');
+            options.iocharset = textOrNull(win, '#cifsIocharset');
+            options.mfsymlinks = !!valOf(win, '#cifsMfsymlinks');
+            options.noserverino = !!valOf(win, '#cifsNoserverino');
+            options.nobrl = !!valOf(win, '#cifsNobrl');
+        }
+        return options;
+    }
+
+    // `hard` is the one TRI-STATE at the fstab level: `hard`, `soft`, or NEITHER
+    // token (mount.nfs's own default, which is hard). A checked box on an entry
+    // that carried neither token stays neither — writing `hard` onto it would
+    // change the line without changing the behaviour, which is exactly the
+    // silent-default class this dialog is meant to stop writing (#43 item 3).
+    // On a create there is no prefill, so the explicit `hard` is written.
+    function hardOption(win) {
+        if (valOf(win, '#nfsHard') === false) {
+            return false; // soft — explicit, and warned about
+        }
+        return (win._prefill && win._prefill.hard === undefined) ? null : true;
     }
 
     function submitMount(win, view, node, isEdit) {
@@ -2251,75 +2418,11 @@
         }
 
         // Structured known-tier options + free-text passthrough. nofail is FORCED
-        // by the daemon, so we do NOT send it as a choice.
-        var options = {
-            ro: roOf(win),
-            noatime: !!valOf(win, '#optNoatime'),
-            nosuid: !!valOf(win, '#optNosuid'),
-            nodev: !!valOf(win, '#optNodev'),
-            noexec: !!valOf(win, '#optNoexec'),
-            netdev: !!valOf(win, '#optNetdev'),
-        };
+        // by the daemon, so we do NOT send it as a choice. Every value-bearing
+        // option goes UNCONDITIONALLY — value or null (the clear contract, #34).
+        var options = mountOptionsBody(win, type);
         var automount = !!valOf(win, '#optAutomount');
-        if (automount) {
-            var idle = parseInt(valOf(win, '#optIdle'), 10);
-            if (!isNaN(idle) && idle > 0) {
-                options.idleTimeout = idle;
-            }
-        }
-        if (type === 'nfs') {
-            options.vers = valOf(win, '#nfsVers') || '4.2';
-            options.hard = valOf(win, '#nfsHard') !== false;
-            var timeo = parseInt(valOf(win, '#nfsTimeo'), 10);
-            if (!isNaN(timeo)) { options.timeo = timeo; }
-            var retrans = parseInt(valOf(win, '#nfsRetrans'), 10);
-            if (!isNaN(retrans)) { options.retrans = retrans; }
-            var rsize = parseInt(valOf(win, '#nfsRsize'), 10);
-            if (!isNaN(rsize) && rsize > 0) { options.rsize = rsize; }
-            var wsize = parseInt(valOf(win, '#nfsWsize'), 10);
-            if (!isNaN(wsize) && wsize > 0) { options.wsize = wsize; }
-            var proto = valOf(win, '#nfsProto');
-            if (proto) { options.proto = proto; }
-            var nsec = valOf(win, '#nfsSec');
-            if (nsec) { options.sec = nsec; }
-            var nconnect = parseInt(valOf(win, '#nfsNconnect'), 10);
-            if (!isNaN(nconnect) && nconnect > 0) { options.nconnect = nconnect; }
-            var nactimeo = parseInt(valOf(win, '#nfsActimeo'), 10);
-            if (!isNaN(nactimeo) && nactimeo >= 0) { options.actimeo = nactimeo; }
-            var lookupcache = valOf(win, '#nfsLookupcache');
-            if (lookupcache) { options.lookupcache = lookupcache; }
-            options.noac = !!valOf(win, '#nfsNoac');
-            options.bg = !!valOf(win, '#nfsBg');
-        } else if (type === 'cifs') {
-            options.vers = valOf(win, '#cifsVers') || '3.1.1';
-            var ccache = valOf(win, '#cifsCache');
-            if (ccache) { options.cache = ccache; }
-            var dom = ('' + (valOf(win, '#credDomain') || '')).trim();
-            if (dom) { options.domain = dom; }
-            var uid = valOf(win, '#cifsUid');
-            if (uid !== undefined && uid !== null && uid !== '') { options.uid = uid; }
-            options.forceuid = !!valOf(win, '#cifsForceuid');
-            var gid = valOf(win, '#cifsGid');
-            if (gid !== undefined && gid !== null && gid !== '') { options.gid = gid; }
-            options.forcegid = !!valOf(win, '#cifsForcegid');
-            var fmode = ('' + (valOf(win, '#cifsFileMode') || '')).trim();
-            if (fmode) { options.fileMode = fmode; }
-            var dmode = ('' + (valOf(win, '#cifsDirMode') || '')).trim();
-            if (dmode) { options.dirMode = dmode; }
-            var csec = valOf(win, '#cifsSec');
-            if (csec) { options.sec = csec; }
-            var crsize = parseInt(valOf(win, '#cifsRsize'), 10);
-            if (!isNaN(crsize) && crsize > 0) { options.rsize = crsize; }
-            var cwsize = parseInt(valOf(win, '#cifsWsize'), 10);
-            if (!isNaN(cwsize) && cwsize > 0) { options.wsize = cwsize; }
-            var cactimeo = parseInt(valOf(win, '#cifsActimeo'), 10);
-            if (!isNaN(cactimeo) && cactimeo >= 0) { options.actimeo = cactimeo; }
-            var iocharset = ('' + (valOf(win, '#cifsIocharset') || '')).trim();
-            if (iocharset) { options.iocharset = iocharset; }
-            options.mfsymlinks = !!valOf(win, '#cifsMfsymlinks');
-            options.noserverino = !!valOf(win, '#cifsNoserverino');
-            options.nobrl = !!valOf(win, '#cifsNobrl');
-        }
+        var dom = textOrNull(win, '#credDomain');
 
         var body = {
             type: type,
@@ -2334,10 +2437,9 @@
             // sending it would be a control that lies (issue #27).
             body.persistent = !!valOf(win, '#persist');
         }
-        var extra = ('' + (valOf(win, '#extraOptions') || '')).trim();
-        if (extra) {
-            body.extraOptions = extra;
-        }
+        // Always sent: a BLANKED passthrough field must drop the stored
+        // passthrough, which an omitted field could never say (#34).
+        body.extraOptions = ('' + (valOf(win, '#extraOptions') || '')).trim();
         if (type === 'cifs') {
             var user = ('' + (valOf(win, '#credUser') || '')).trim();
             var passFld = win.down('#credPass');

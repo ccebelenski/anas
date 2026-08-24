@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { CreateMountRequest, DeleteMountQuery, UpdateMountRequest } from '@anas/shared'
+import { CreateMountRequest, DeleteMountQuery, MountRequestOptions, UpdateMountRequest } from '@anas/shared'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
 import { JobQueue } from '../../jobs/queue.js'
@@ -208,6 +208,265 @@ describe('mount routes (Epic 18)', () => {
       // Still persisted — the entry was rewritten, never dropped.
       assert.ok((await readFile(fstabPath, 'utf8')).includes('/mnt/anas-nfs'))
     })
+  })
+
+  // ==========================================================================
+  // THE CLEAR CONTRACT (issue #34)
+  //
+  // A blanked option field sends `null`, and `null` REMOVES the option from the
+  // entry. The class guard below walks EVERY key of MountRequestOptions: set it,
+  // clear it, and prove the rendered fstab line gained then lost exactly that
+  // token. An option added later without clear semantics fails here — that is
+  // the point of iterating the schema rather than a hand-listed subset.
+  // ==========================================================================
+  describe('PUT /v1/mounts — every option can be CLEARED (class guard, #34)', () => {
+    const NFS_GUARD = '/mnt/guard-nfs'
+    const CIFS_GUARD = '/mnt/guard-cifs'
+
+    beforeEach(async () => {
+      await writeFile(fstabPath, `${FSTAB_FIXTURE
+      }10.0.0.9:/export ${NFS_GUARD} nfs4 nofail,_netdev 0 0\n`
+      + `//10.0.0.9/media ${CIFS_GUARD} cifs credentials=/etc/anas/creds/guard.cred,nofail,_netdev 0 0\n`)
+    })
+
+    /** The option TOKENS of a mountpoint's fstab line (field 4), exact — never a substring. */
+    async function tokensOf(mountpoint: string): Promise<string[]> {
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(` ${mountpoint} `))
+      assert.ok(line, `no fstab line for ${mountpoint}`)
+      return line.trim().split(/\s+/)[3].split(',')
+    }
+
+    /** PUT one option body and wait for the job to complete. */
+    async function put(mountpoint: string, body: object): Promise<void> {
+      const res = await server!.inject({
+        method: 'PUT',
+        url: `/v1/mounts/${enc(mountpoint)}`,
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify(body),
+      })
+      assert.equal(res.statusCode, 202, res.payload)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    }
+
+    /**
+     * One option's proof: which fstype's entry carries it, a value that renders
+     * a token, the value that must make the token go away (`null` for every
+     * value-bearing option; `false` for a plain flag, which renders nothing when
+     * off), and the exact token the value produces.
+     */
+    interface OptionProof {
+      on: 'nfs' | 'cifs'
+      set: unknown
+      clear: unknown
+      token: string
+    }
+
+    const PROOFS: Record<keyof MountRequestOptions, OptionProof> = {
+      // common
+      ro: { on: 'nfs', set: true, clear: false, token: 'ro' },
+      noatime: { on: 'nfs', set: true, clear: false, token: 'noatime' },
+      nosuid: { on: 'nfs', set: true, clear: false, token: 'nosuid' },
+      nodev: { on: 'nfs', set: true, clear: false, token: 'nodev' },
+      noexec: { on: 'nfs', set: true, clear: false, token: 'noexec' },
+      netdev: { on: 'nfs', set: true, clear: false, token: '_netdev' },
+      idleTimeout: { on: 'nfs', set: 30, clear: null, token: 'x-systemd.idle-timeout=30' },
+      // nfs tier
+      vers: { on: 'nfs', set: '4.1', clear: null, token: 'vers=4.1' },
+      hard: { on: 'nfs', set: true, clear: null, token: 'hard' },
+      timeo: { on: 'nfs', set: 150, clear: null, token: 'timeo=150' },
+      retrans: { on: 'nfs', set: 4, clear: null, token: 'retrans=4' },
+      rsize: { on: 'nfs', set: 32768, clear: null, token: 'rsize=32768' },
+      wsize: { on: 'nfs', set: 32768, clear: null, token: 'wsize=32768' },
+      proto: { on: 'nfs', set: 'udp', clear: null, token: 'proto=udp' },
+      noac: { on: 'nfs', set: true, clear: false, token: 'noac' },
+      nconnect: { on: 'nfs', set: 4, clear: null, token: 'nconnect=4' },
+      bg: { on: 'nfs', set: true, clear: false, token: 'bg' },
+      lookupcache: { on: 'nfs', set: 'none', clear: null, token: 'lookupcache=none' },
+      actimeo: { on: 'nfs', set: 30, clear: null, token: 'actimeo=30' },
+      // `sec=` is the one union field (NFS and CIFS flavours share it); krb5 is
+      // in both vocabularies, so one proof covers the shared boundary.
+      sec: { on: 'nfs', set: 'krb5', clear: null, token: 'sec=krb5' },
+      // cifs tier
+      domain: { on: 'cifs', set: 'WORKGROUP', clear: null, token: 'domain=WORKGROUP' },
+      uid: { on: 'cifs', set: 1002, clear: null, token: 'uid=1002' },
+      gid: { on: 'cifs', set: 1003, clear: null, token: 'gid=1003' },
+      fileMode: { on: 'cifs', set: '0640', clear: null, token: 'file_mode=0640' },
+      dirMode: { on: 'cifs', set: '0750', clear: null, token: 'dir_mode=0750' },
+      cache: { on: 'cifs', set: 'loose', clear: null, token: 'cache=loose' },
+      mfsymlinks: { on: 'cifs', set: true, clear: false, token: 'mfsymlinks' },
+      forceuid: { on: 'cifs', set: true, clear: false, token: 'forceuid' },
+      forcegid: { on: 'cifs', set: true, clear: false, token: 'forcegid' },
+      noserverino: { on: 'cifs', set: true, clear: false, token: 'noserverino' },
+      nobrl: { on: 'cifs', set: true, clear: false, token: 'nobrl' },
+      iocharset: { on: 'cifs', set: 'utf8', clear: null, token: 'iocharset=utf8' },
+    }
+
+    it('covers every MountRequestOptions key (a new option must declare how it CLEARS)', () => {
+      assert.deepEqual(
+        Object.keys(MountRequestOptions.shape).sort(),
+        Object.keys(PROOFS).sort(),
+        'a request option was added or renamed without a set/clear proof — give it clear semantics (null) and list it here',
+      )
+    })
+
+    for (const [key, proof] of Object.entries(PROOFS)) {
+      it(`${key}: sets '${proof.token}', and clearing it drops the token`, async () => {
+        const mp = proof.on === 'nfs' ? NFS_GUARD : CIFS_GUARD
+
+        await put(mp, { options: { [key]: proof.set } })
+        assert.ok((await tokensOf(mp)).includes(proof.token), `expected '${proof.token}' after setting ${key}`)
+
+        await put(mp, { options: { [key]: proof.clear } })
+        assert.ok(!(await tokensOf(mp)).includes(proof.token), `'${proof.token}' survived clearing ${key}`)
+      })
+    }
+
+    it('an omitted option is KEPT — only null clears (the three cases stay distinct)', async () => {
+      await put(NFS_GUARD, { options: { timeo: 150, retrans: 4 } })
+      await put(NFS_GUARD, { options: { retrans: null } }) // timeo omitted
+      const tokens = await tokensOf(NFS_GUARD)
+      assert.ok(tokens.includes('timeo=150'), 'an omitted option must survive the edit')
+      assert.ok(!tokens.includes('retrans=4'))
+    })
+
+    it('a blanked Additional options field clears the stored passthrough', async () => {
+      await put(NFS_GUARD, { extraOptions: 'x-anas-note=keepme,local_lock=none' })
+      assert.ok((await tokensOf(NFS_GUARD)).includes('x-anas-note=keepme'))
+
+      await put(NFS_GUARD, { extraOptions: '' })
+      const tokens = await tokensOf(NFS_GUARD)
+      assert.ok(!tokens.includes('x-anas-note=keepme'))
+      assert.ok(!tokens.includes('local_lock=none'))
+    })
+
+    it('unchecking Automount takes its idle timeout with it', async () => {
+      await put(NFS_GUARD, { automount: true, options: { idleTimeout: 60 } })
+      let tokens = await tokensOf(NFS_GUARD)
+      assert.ok(tokens.includes('x-systemd.automount'))
+      assert.ok(tokens.includes('x-systemd.idle-timeout=60'))
+
+      await put(NFS_GUARD, { automount: false })
+      tokens = await tokensOf(NFS_GUARD)
+      assert.ok(!tokens.includes('x-systemd.automount'))
+      assert.ok(!tokens.some(tk => tk.startsWith('x-systemd.idle-timeout')), 'an idle timeout must not outlive the automount')
+    })
+  })
+
+  // ==========================================================================
+  // An UNTOUCHED edit changes nothing (#43 item 3, the silent-default class)
+  //
+  // The dialog pre-fills from the entry EXACTLY — a field the entry has no
+  // value for shows blank — and every blank field is sent as null. So opening
+  // an entry and pressing Save must rewrite the line byte-for-byte. Before the
+  // fix, field-config defaults the operator never chose (vers=4.2 / 3.1.1,
+  // file_mode=0644, dir_mode=0755, idle-timeout=60) rode the save into entries
+  // that never had them.
+  // ==========================================================================
+  describe('PUT /v1/mounts — an untouched save round-trips the line byte-identically', () => {
+    const RT_NFS = '/mnt/rt-nfs'
+    const RT_CIFS = '/mnt/rt-cifs'
+    // Deliberately LEAN lines: no vers, no hard/soft, no modes, no idle timeout.
+    const LINES = [
+      `10.0.0.9:/export ${RT_NFS} nfs4 nofail,_netdev 0 0`,
+      `//10.0.0.9/media ${RT_CIFS} cifs credentials=/etc/anas/creds/rt.cred,nosuid,nodev,nofail,_netdev 0 0`,
+    ]
+
+    beforeEach(async () => {
+      await writeFile(fstabPath, `${FSTAB_FIXTURE + LINES.join('\n')}\n`)
+    })
+
+    function lineOf(fstab: string, mountpoint: string): string {
+      return fstab.split('\n').find(l => l.includes(` ${mountpoint} `))!
+    }
+
+    /** A value the entry does not carry pre-fills BLANK, and a blank field is sent as null. */
+    function orNull<T>(v: T | undefined): T | null {
+      return v === undefined ? null : v
+    }
+
+    /**
+     * The body the dialog sends when an operator opens this entry and saves it
+     * untouched — the daemon-side model of the fixed pre-fill + submit contract
+     * (every option present: its stored value, or null where the entry has none).
+     */
+    function bodyFromPrefill(detail: MountDetail): UpdateMountRequest {
+      const co = detail.configuredOptions!
+      const c = co.common
+      const options: MountRequestOptions = {
+        ro: c.readOnly,
+        noatime: c.noatime,
+        nosuid: c.nosuid,
+        nodev: c.nodev,
+        noexec: c.noexec,
+        netdev: c.netdev,
+        idleTimeout: c.automount ? orNull(c.automountIdleTimeout) : null,
+      }
+      if (detail.type === 'nfs') {
+        const n = co.nfs ?? {}
+        Object.assign(options, {
+          vers: orNull(n.vers),
+          hard: orNull(n.hard),
+          timeo: orNull(n.timeo),
+          retrans: orNull(n.retrans),
+          rsize: orNull(n.rsize),
+          wsize: orNull(n.wsize),
+          proto: orNull(n.proto),
+          sec: orNull(n.sec),
+          nconnect: orNull(n.nconnect),
+          actimeo: orNull(n.actimeo),
+          lookupcache: orNull(n.lookupcache),
+          noac: n.noac === true,
+          bg: n.bg === true,
+        })
+      }
+      else {
+        const f = co.cifs ?? {}
+        Object.assign(options, {
+          vers: orNull(f.vers),
+          cache: orNull(f.cache),
+          domain: orNull(f.domain),
+          uid: orNull(f.uid),
+          gid: orNull(f.gid),
+          fileMode: orNull(f.fileMode),
+          dirMode: orNull(f.dirMode),
+          sec: orNull(f.sec),
+          rsize: orNull(f.rsize),
+          wsize: orNull(f.wsize),
+          actimeo: orNull(f.actimeo),
+          iocharset: orNull(f.iocharset),
+          forceuid: f.forceuid === true,
+          forcegid: f.forcegid === true,
+          mfsymlinks: f.mfsymlinks === true,
+          noserverino: f.noserverino === true,
+          nobrl: f.nobrl === true,
+        })
+      }
+      return { automount: c.automount, options, extraOptions: co.passthrough }
+    }
+
+    for (const mountpoint of [RT_NFS, RT_CIFS]) {
+      it(`${mountpoint}: parse → pre-fill → save leaves the line untouched`, async () => {
+        const before = lineOf(await readFile(fstabPath, 'utf8'), mountpoint)
+
+        const detail = (await server!.inject({ method: 'GET', url: `/v1/mounts/${enc(mountpoint)}`, headers: IDENTITY_HEADERS })).json() as { data: MountDetail }
+        const res = await server!.inject({
+          method: 'PUT',
+          url: `/v1/mounts/${enc(mountpoint)}`,
+          headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+          payload: JSON.stringify(bodyFromPrefill(detail.data)),
+        })
+        assert.equal(res.statusCode, 202, res.payload)
+        const job = await waitForJob(server!, res.json().job.id)
+        assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+        const after = lineOf(await readFile(fstabPath, 'utf8'), mountpoint)
+        assert.equal(after, before)
+        // Named explicitly: these are the defaults that used to leak in.
+        for (const ghost of ['vers=', 'file_mode=', 'dir_mode=', 'x-systemd.idle-timeout='])
+          assert.ok(!after.includes(ghost), `an unshown default (${ghost}) was written onto an entry that never had it`)
+      })
+    }
   })
 
   describe('inline plaintext CIFS credentials — BUG-1 security + migration on save', () => {
