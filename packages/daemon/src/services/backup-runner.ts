@@ -2,7 +2,7 @@ import type { BackupPruneResult, BackupRepo, BackupRepoTestResult, BackupTask } 
 import type { PeerCertificate } from 'node:tls'
 import type { CommandExecutor } from '../executor/types.js'
 import { lookup } from 'node:dns/promises'
-import { createConnection } from 'node:net'
+import { createConnection, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import { backupTargetLine } from './backup-notify.js'
 
@@ -392,7 +392,10 @@ export function tcpReachable(host: string, port: number, timeoutMs = 3000): Prom
  */
 export function fetchServerFingerprint(host: string, port: number, timeoutMs = 5000): Promise<string | null> {
   return new Promise((resolve) => {
-    const socket = tlsConnect({ host, port, rejectUnauthorized: false, servername: host }, () => {
+    // TLS ServerName must be a DNS name — Node throws synchronously on an IP
+    // (ERR_INVALID_ARG_VALUE), which would escape this promise as a rejection
+    // and turn a repo test against `server <ip>` into a 500 (#44).
+    const socket = tlsConnect({ host, port, rejectUnauthorized: false, servername: isIP(host) ? undefined : host }, () => {
       const cert = socket.getPeerCertificate() as PeerCertificate | undefined
       const raw = cert && cert.fingerprint256 ? cert.fingerprint256 : ''
       finish(raw ? normalizeFingerprint(raw) : null)

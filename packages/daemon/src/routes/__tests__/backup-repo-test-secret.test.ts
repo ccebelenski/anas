@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { createServer as createTlsServer } from 'node:tls'
 import { createServer } from '../../server.js'
+import { fetchServerFingerprint } from '../../services/backup-runner.js'
 
 /**
  * POST /backup/repos/test — the STORED-SECRET branch (issue #41).
@@ -251,5 +252,26 @@ describe('POST /backup/repos/test — stored-secret fallback (#41)', () => {
   it('name-only for a repo that does not exist is still a 404', async () => {
     const res = await server.inject({ method: 'POST', url: '/v1/backup/repos/test', headers: JSON_HEADERS, payload: { name: 'nope' } })
     assert.equal(res.statusCode, 404)
+  })
+})
+
+// #44: TLS ServerName must not be an IP — Node throws synchronously
+// (ERR_INVALID_ARG_VALUE) and the rejection escaped fetchServerFingerprint,
+// turning a repo test against `server <ip>` into a 500. The probe must treat
+// an IP host like any other reachable server: connect without SNI and return
+// the fingerprint.
+describe('fetchServerFingerprint — IP-addressed server (#44)', () => {
+  it('returns the fingerprint for an IP host instead of throwing on SNI', async () => {
+    const tls = createTlsServer({ key: TEST_KEY, cert: TEST_CERT })
+    tls.on('tlsClientError', () => {})
+    await new Promise<void>(resolve => tls.listen(0, '127.0.0.1', resolve))
+    const port = (tls.address() as { port: number }).port
+    try {
+      const fp = await fetchServerFingerprint('127.0.0.1', port, 2000)
+      assert.equal(fp, CERT_FINGERPRINT)
+    }
+    finally {
+      await new Promise<void>(resolve => tls.close(() => resolve()))
+    }
   })
 })
