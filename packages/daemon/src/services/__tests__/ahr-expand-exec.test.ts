@@ -183,7 +183,7 @@ function world(opts: { mdstat?: string | string[], r2Export?: string } = {}): Mo
   executor.addFixture({ command: '/usr/bin/udevadm', result: { stdout: '', stderr: '', exitCode: 0 } })
   // partx + the by-id link probe the partition step verifies with (issue #12).
   // Command-only, so arg-specific realpath fixtures in individual tests still win.
-  executor.addFixture({ command: '/usr/sbin/partx', result: { stdout: '', stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/partx', result: { stdout: '', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/sdt1\n', stderr: '', exitCode: 0 } })
   return executor
 }
@@ -392,11 +392,11 @@ describe('ahr-expand-exec (Epic 11.6 — detect-then-delta steps)', () => {
       assert.equal(outcome.ok, true, outcome.error)
 
       // BLKPG per-partition add — the mechanism that works on a held disk.
-      const partx = executor.calls.filter(c => c.command === '/usr/sbin/partx')
+      const partx = executor.calls.filter(c => c.command === '/usr/bin/partx')
       assert.deepEqual(partx.map(c => c.args), [['-a', `/dev/disk/by-id/${W}`]])
       // …and it runs AFTER sgdisk wrote the table, not before.
       const order = executor.calls.map(c => c.command)
-      assert.ok(order.indexOf(SGDISK) < order.indexOf('/usr/sbin/partx'))
+      assert.ok(order.indexOf(SGDISK) < order.indexOf('/usr/bin/partx'))
     })
 
     it('FAILS THE PARTITION STEP when the slice never becomes a device', async () => {

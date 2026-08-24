@@ -140,7 +140,7 @@ function world(opts: { mdstat?: string | string[] } = {}): MockExecutor {
   executor.addFixture({ command: '/usr/bin/udevadm', result: { stdout: '', stderr: '', exitCode: 0 } })
   // The partition step's verification probes (issue #12). Command-only, so the
   // arg-specific realpath fixtures individual tests register still take priority.
-  executor.addFixture({ command: '/usr/sbin/partx', result: { stdout: '', stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/partx', result: { stdout: '', stderr: '', exitCode: 0 } })
   executor.addFixture({ command: REALPATH, result: { stdout: '/dev/sdq1\n', stderr: '', exitCode: 0 } })
   return executor
 }

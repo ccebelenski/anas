@@ -50,7 +50,7 @@ const LSBLK = '/usr/bin/lsblk'
 const SGDISK = '/usr/sbin/sgdisk'
 const MDADM = '/usr/sbin/mdadm'
 const UDEVADM = '/usr/bin/udevadm'
-const PARTX = '/usr/sbin/partx'
+const PARTX = '/usr/bin/partx'
 const REALPATH = '/usr/bin/realpath'
 
 /**
