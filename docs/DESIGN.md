@@ -542,11 +542,13 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 
 The base three principals (owner / owning-group / everyone) are **mode bits** (`chown`/`chmod`); extra named principals are **POSIX ACL entries**. A named entry requires the `acl` package (feature-detected — if `setfacl` is absent, the base editor still works and named grants are disabled with an "install acl" hint) AND `acltype=posixacl` on the dataset (auto-enabled on first named grant, with a notice). Granting a principal also writes a matching **default ACL** (+ setgid on the dir) so new files inherit; `applyToExisting` recurses. Level → perms: none=`---`, read=`r-x`/`X`, read-write=`rwx`. Mask is managed so the reported group level stays truthful.
 
+**Destruction is explicit, never inferred.** A `SetAccessRequest` whose `entries` list carries no named user/group row means "I am not changing the named grants" — the daemon preserves them (restating them in the declarative `setfacl --set`, which is also the only correct way to move the base levels on an ACL'd directory: a plain `chmod` writes the ACL *mask*, not `group::`). Named entries are removed only for `clearNamed: true`, which may not be combined with named entries. This is the contract for any list-valued field whose emptiness would destroy data: a client that failed to pre-fill itself produces the same empty list as a deliberate one, so absence can never carry intent. Likewise, when `acltype` is `posixacl` but `getfacl` cannot be read, `GET .../access` reports `aclEnabled: false` with `aclDegraded: true` rather than presenting mode-bit guesses as a healthy ACL.
+
 | Operation | Command |
 |-----------|---------|
 | `fs.acl.get` | `getfacl -pcE <mountpoint>` (and `getfacl` on a probe for feature-detect) |
 | `fs.acl.set` | `setfacl [-R] -m <spec>[,…] <mountpoint>` (access + `-d` default entries) |
-| `fs.acl.clear` | `setfacl [-R] -b -k <mountpoint>` (remove access + default ACLs) |
+| `fs.acl.clear` | `setfacl [-R] -b -k <mountpoint>` (remove access + default ACLs) — **explicit `clearNamed: true` only** |
 | `fs.acltype.enable` | `zfs set acltype=posixacl xattr=sa <dataset>` (first named grant only) |
 | `fs.acltype.get` | `zfs get -Hp -o value acltype <dataset>` |
 

@@ -146,6 +146,7 @@ export {
   DatasetProperties,
   DatasetType,
   MountpointPermissions,
+  RecordSize,
   SetPermissionsRequest,
   UpdateDatasetPropertiesRequest,
 } from './schemas/datasets.js'

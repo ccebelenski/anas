@@ -102,13 +102,27 @@ export type DatasetDetail = z.infer<typeof DatasetDetail>
 
 // --- Write models ---
 
+/**
+ * ZFS `recordsize` in bytes: a power of two between 512 and 16M — exactly what
+ * ZFS itself accepts. Validated here (Principles 6 + 14) so a blanked UI field
+ * or a careless client is refused at the boundary with a 400 instead of
+ * reaching `zfs set recordsize=0`, which ZFS rejects mid-apply (#43).
+ */
+export const RecordSize = z
+  .number()
+  .int()
+  .min(512, 'recordsize must be at least 512 bytes')
+  .max(16 * 1024 * 1024, 'recordsize must be at most 16M')
+  .refine(n => (n & (n - 1)) === 0, 'recordsize must be a power of two')
+export type RecordSize = z.infer<typeof RecordSize>
+
 /** Create a dataset (POST /v1/pools/:name/datasets). `path` is relative to the pool. */
 export const CreateDatasetRequest = z.object({
   path: DatasetPath,
   properties: z
     .object({
       compression: z.string().optional(),
-      recordsize: z.number().int().nonnegative().optional(),
+      recordsize: RecordSize.optional(),
       quota: z.number().nonnegative().optional(),
       reservation: z.number().nonnegative().optional(),
       mountpoint: AbsolutePath.optional(),
@@ -122,7 +136,7 @@ export const UpdateDatasetPropertiesRequest = z.object({
   properties: z
     .object({
       compression: z.string().optional(),
-      recordsize: z.number().int().nonnegative().optional(),
+      recordsize: RecordSize.optional(),
       quota: z.number().nonnegative().optional(),
       reservation: z.number().nonnegative().optional(),
       refquota: z.number().nonnegative().optional(),

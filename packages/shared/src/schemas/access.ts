@@ -47,8 +47,20 @@ export const DatasetAccess = z.object({
   group: z.string(),
   /** `setfacl`/`getfacl` present on the host — named entries are possible */
   aclSupported: z.boolean(),
-  /** `acltype=posixacl` on this dataset — named ACL entries are in effect */
+  /**
+   * `acltype=posixacl` on this dataset AND the ACL was readable — named ACL
+   * entries below are the real thing. False when ACLs are off, and also when
+   * they are on but `getfacl` failed (see `aclDegraded`): the entries are then
+   * a mode-bit approximation, and claiming healthy ACLs would be a lie the
+   * client acts on (#37).
+   */
   aclEnabled: z.boolean(),
+  /**
+   * `acltype` says POSIX ACLs are on, but `getfacl` could not be read — the
+   * entries are derived from the mode bits and any named grants are NOT shown.
+   * The client must not present this as the truth or offer a destructive edit.
+   */
+  aclDegraded: z.boolean().optional(),
   /** Base three (always) + any named user/group entries */
   entries: z.array(AccessEntry),
   /** Raw `getfacl` text for the Advanced panel, or null when no/unsupported ACLs */
@@ -58,18 +70,31 @@ export type DatasetAccess = z.infer<typeof DatasetAccess>
 
 /**
  * Set access (PUT /v1/pools/:name/datasets/*path/access). `entries` is the
- * full desired set (base + named). Naming a user/group entry enables POSIX
- * ACLs on the dataset (acltype=posixacl) as a side effect, with a default ACL
- * so new files inherit. `applyToExisting` recurses over current descendants.
+ * desired set of the principals it mentions. Naming a user/group entry enables
+ * POSIX ACLs on the dataset (acltype=posixacl) as a side effect, with a default
+ * ACL so new files inherit. `applyToExisting` recurses over current descendants.
+ *
+ * DESTRUCTION IS EXPLICIT (#37): an `entries` list carrying no named user/group
+ * row means "I am not changing the named grants", NEVER "delete them all". The
+ * daemon strips named ACL entries only for `clearNamed: true`. A list that is
+ * empty because a client failed to pre-fill itself is indistinguishable from a
+ * deliberate one, so absence can never be read as intent — this is the contract
+ * for any list-valued field whose emptiness would destroy data.
  */
 export const SetAccessRequest = z.object({
   owner: z.string().optional(),
   group: z.string().optional(),
   entries: z.array(AccessEntry).optional(),
+  /** Remove every named (user/group) ACL entry — the only way to clear them. */
+  clearNamed: z.boolean().optional(),
   applyToExisting: z.boolean().optional(),
 })
   .refine(
-    b => b.owner !== undefined || b.group !== undefined || b.entries !== undefined,
-    'set at least one of owner, group, entries',
+    b => b.owner !== undefined || b.group !== undefined || b.entries !== undefined || b.clearNamed === true,
+    'set at least one of owner, group, entries, clearNamed',
+  )
+  .refine(
+    b => !(b.clearNamed === true && (b.entries ?? []).some(e => e.kind === 'user' || e.kind === 'group')),
+    'clearNamed cannot be combined with named user/group entries',
   )
 export type SetAccessRequest = z.infer<typeof SetAccessRequest>

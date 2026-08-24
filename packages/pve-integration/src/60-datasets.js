@@ -677,10 +677,13 @@
         ];
     }
 
-    // Common record sizes as byte values; '' means inherit (send nothing).
-    function recordsizeStore() {
+    // Common record sizes as byte values. The blank row means "send nothing":
+    // on Create that is inherit-from-parent, on Edit it is leave-unchanged (ANAS
+    // has no `zfs inherit` operation, so Edit must not promise one). The caller
+    // supplies the label so each dialog says what its blank actually does.
+    function recordsizeStore(blankLabel) {
         return [
-            { value: '', label: t('(inherit)') },
+            { value: '', label: blankLabel },
             { value: 16384, label: '16K' },
             { value: 32768, label: '32K' },
             { value: 65536, label: '64K' },
@@ -689,6 +692,21 @@
             { value: 524288, label: '512K' },
             { value: 1048576, label: '1M' },
         ];
+    }
+
+    // Make sure the Edit picker can display the dataset's CURRENT record size
+    // even when it is not one of the common sizes we offer — otherwise an
+    // unlisted value would render as the blank row and read as "unchanged".
+    function ensureRecordsizeOption(form, bytes) {
+        try {
+            if (!form || !bytes) { return; }
+            var field = form.findField('recordsize');
+            var store = field && field.getStore && field.getStore();
+            if (!store || store.findExact('value', bytes) !== -1) { return; }
+            store.add({ value: bytes, label: ANAS.formatBytes(bytes) });
+        } catch (e) {
+            // non-fatal — the field simply shows the blank row
+        }
     }
 
     // ---- Create Dataset (story 4.5) ----------------------------------------
@@ -785,7 +803,7 @@
                             fieldLabel: t('Record size'),
                             store: Ext.create('Ext.data.Store', {
                                 fields: ['value', 'label'],
-                                data: recordsizeStore(),
+                                data: recordsizeStore(t('(inherit)')),
                             }),
                             valueField: 'value',
                             displayField: 'label',
@@ -1144,10 +1162,25 @@
                 forceSelection: false,
             },
             {
-                xtype: 'numberfield',
+                // A picker, not a free numberfield: ZFS only accepts a power of
+                // two in [512, 16M], and a BLANKED numberfield used to submit
+                // recordsize=0 — which ZFS refuses, failing the edit partway
+                // through (#43). The blank row is now an explicit "leave this
+                // alone" choice that sends nothing at all.
+                xtype: 'combobox',
                 name: 'recordsize',
-                fieldLabel: t('Record size (bytes)'),
-                minValue: 0,
+                cls: 'anas-fld-recordsize',
+                fieldLabel: t('Record size'),
+                store: Ext.create('Ext.data.Store', {
+                    fields: ['value', 'label'],
+                    data: recordsizeStore(t('(leave unchanged)')),
+                }),
+                valueField: 'value',
+                displayField: 'label',
+                queryMode: 'local',
+                editable: false,
+                forceSelection: true,
+                value: '',
             },
             {
                 xtype: 'numberfield',
@@ -1286,6 +1319,10 @@
                 }
                 ANAS.api.get(node, datasetPath(pool, fullName)).then(function (res) {
                     var p = (res && res.data && res.data.properties) || {};
+                    // The live record size may not be one of the common sizes we
+                    // offer — add a row for it so the picker shows the truth
+                    // instead of falling back to a blank ("leave unchanged").
+                    ensureRecordsizeOption(form, Number(p.recordsize) || 0);
                     original = {
                         compression: p.compression || '',
                         recordsize: Number(p.recordsize) || 0,
@@ -1306,9 +1343,15 @@
             },
 
             submit: function (form, win) {
+                // '' (leave unchanged) → null, never 0: `recordsize=0` is not a
+                // ZFS value, and sending it failed the edit AFTER earlier
+                // properties had already been written (#43).
+                var rsRaw = form.findField('recordsize').getValue();
+                var recordsize = (rsRaw === '' || rsRaw === null
+                    || rsRaw === undefined) ? null : Number(rsRaw);
                 var current = {
                     compression: '' + (form.findField('compression').getValue() || ''),
-                    recordsize: Number(form.findField('recordsize').getValue()) || 0,
+                    recordsize: recordsize,
                     quota: Number(form.findField('quota').getValue()) || 0,
                     reservation: Number(form.findField('reservation').getValue()) || 0,
                     refquota: Number(form.findField('refquota').getValue()) || 0,
@@ -1323,7 +1366,8 @@
                 if (current.compression && current.compression !== original.compression) {
                     changed.compression = current.compression;
                 }
-                if (current.recordsize !== original.recordsize) {
+                if (current.recordsize !== null
+                    && current.recordsize !== original.recordsize) {
                     changed.recordsize = current.recordsize;
                 }
                 if (current.quota !== original.quota) {
@@ -1411,6 +1455,16 @@
     //   aclEnabled === false (but supported) — adding a named principal is
     //     allowed and shows a subtle note that it will enable POSIX ACLs
     //     (acltype=posixacl) on the dataset; the daemon performs the enable.
+    //   aclDegraded === true — acltype is posixacl but getfacl failed: the
+    //     levels shown are mode-bit guesses and named grants are missing, so
+    //     Apply and Add are DISABLED with a note. Same rule as the failed
+    //     pre-fill below: a window that doesn't know the current state never
+    //     offers to replace it (#37).
+    //
+    // Clearing named grants is EXPLICIT (schemas/access.ts): an entries list
+    // with no named rows means "unchanged". Emptying the grid sends
+    // clearNamed:true, and only when the pre-fill proved there was something
+    // there to remove.
 
     // Plain-language level dropdown options (label ↔ schema value).
     function accessLevelStore() {
@@ -1714,6 +1768,13 @@
                                         queryMode: 'local',
                                         editable: true,
                                         forceSelection: false,
+                                        // A blanked owner used to be accepted
+                                        // and then silently dropped from the
+                                        // request (#43) — refuse the gesture
+                                        // instead of pretending to honour it.
+                                        allowBlank: false,
+                                        blankText: t('An owner is required — clear it and the '
+                                            + 'change would be silently discarded.'),
                                         emptyText: t('user'),
                                     },
                                     {
@@ -1750,6 +1811,11 @@
                                         queryMode: 'local',
                                         editable: true,
                                         forceSelection: false,
+                                        // Same as the owner picker above: blank
+                                        // is refused, not quietly ignored (#43).
+                                        allowBlank: false,
+                                        blankText: t('An owning group is required — clear it and the '
+                                            + 'change would be silently discarded.'),
                                         emptyText: t('group'),
                                     },
                                     {
@@ -1946,6 +2012,7 @@
                     },
                     {
                         text: t('Apply'),
+                        itemId: 'applyBtn',
                         cls: 'anas-btn-dataset-access-submit',
                         handler: function () {
                             try {
@@ -1970,14 +2037,23 @@
             // non-fatal
         }
 
+        // The pre-fill MUST fail closed. It used to warn and return null, which
+        // left this window live showing hard-coded defaults over an empty named
+        // grid; an Apply on that state wiped every named grant on the dataset
+        // and the job reported success (#37). A window that does not know the
+        // current state cannot offer to replace it.
         var accessCall = ANAS.api.get(node, datasetPath(pool, fullName, 'access')).then(
             function (res) {
                 // Reads are wrapped in { data }; tolerate a bare object too.
-                return (res && res.data) ? res.data : res;
+                var data = (res && res.data) ? res.data : res;
+                return data
+                    ? { data: data }
+                    : { error: t('The current permissions could not be read.') };
             },
             function (err) {
                 ANAS.warn('dataset access load failed: ' + ANAS.errText(err));
-                return null;
+                return { error: t('The current permissions could not be read')
+                    + ': ' + ANAS.errText(err) };
             });
 
         Promise.all([
@@ -1994,13 +2070,29 @@
                 // non-fatal
             }
             var acc = results[2];
-            if (!acc) {
+            if (!acc || acc.error || !acc.data) {
+                // Close rather than leave a live Apply over invented defaults —
+                // the same shape ANAS.editWindow uses when its load fails.
+                var msg = (acc && acc.error)
+                    || t('The current permissions could not be read.');
+                try {
+                    Ext.Msg.alert(t('Error'), msg);
+                } catch (e) {
+                    ANAS.warn(msg);
+                }
+                win.close();
                 return;
             }
             try {
-                populateAccess(win, namedStore, acc);
+                populateAccess(win, namedStore, acc.data);
             } catch (e) {
                 ANAS.warn('populate access failed: ' + ANAS.errText(e));
+                try {
+                    Ext.Msg.alert(t('Error'), t('The current permissions could not be read.'));
+                } catch (e2) {
+                    ANAS.warn('populate access failed');
+                }
+                win.close();
             }
         });
     }
@@ -2030,6 +2122,11 @@
             }
         }
         namedStore.loadData(named);
+        // Remember what the dataset actually had: an empty grid at submit time
+        // means "remove these" ONLY if there was something here to remove. The
+        // daemon never infers a clear from an empty list (#37), so the UI has to
+        // say so explicitly — and can only say it because the pre-fill worked.
+        win._loadedNamedCount = named.length;
 
         // Surface an orphaned owner/group (uid/gid deleted outside ANAS) next to
         // the pickers so a bare number isn't mistaken for a real account.
@@ -2049,6 +2146,24 @@
         win._aclEnabled = enabled;
         var addBtn = win.down('#addBtn');
         var note = win.down('#aclNote');
+
+        // The daemon read acltype=posixacl but could not read the ACL itself:
+        // the levels above are a mode-bit approximation and any named grants are
+        // NOT in the grid. Editing from here would be editing a guess, so the
+        // window becomes read-only rather than offering a destructive Apply.
+        if (acc.aclDegraded === true) {
+            var applyBtn = win.down('#applyBtn');
+            if (applyBtn) { applyBtn.setDisabled(true); }
+            if (addBtn) { addBtn.setDisabled(true); }
+            if (note) {
+                note.setHtml(enc(t('POSIX ACLs are enabled on this dataset but could not be '
+                    + 'read, so any named users/groups are missing from this view. '
+                    + 'Permissions cannot be changed until the ACL is readable.')));
+                note.setHidden(false);
+            }
+            return;
+        }
+
         if (!supported) {
             if (addBtn) { addBtn.setDisabled(true); }
             if (note) {
@@ -2070,6 +2185,14 @@
     }
 
     function submitAccess(win, node, tree, pool, fullName, namedStore) {
+        // Owner/group are allowBlank:false — a cleared picker is a refused
+        // gesture, not a silently discarded one (#43).
+        var baseForm = win.down('#baseForm');
+        var basicForm = baseForm && baseForm.getForm && baseForm.getForm();
+        if (basicForm && basicForm.isValid && !basicForm.isValid()) {
+            ANAS.toast(t('An owner and an owning group are required.'));
+            return;
+        }
         var owner = (win.down('#owner').getValue() || '').trim();
         var group = (win.down('#group').getValue() || '').trim();
         var ownerLevel = win.down('#ownerLevel').getValue() || 'none';
@@ -2083,9 +2206,11 @@
             { kind: 'owning-group', level: groupLevel },
             { kind: 'everyone', level: everyoneLevel },
         ];
+        var namedCount = 0;
         namedStore.each(function (r) {
             var name = (r.get('name') || '').trim();
             if (!name) { return; }
+            namedCount++;
             entries.push({
                 kind: r.get('kind') === 'group' ? 'group' : 'user',
                 name: name,
@@ -2096,6 +2221,12 @@
         var body = { entries: entries, applyToExisting: applyToExisting };
         if (owner) { body.owner = owner; }
         if (group) { body.group = group; }
+        // Removing the last named grant is a real gesture — say it out loud.
+        // The empty list alone means nothing to the daemon (#37), so only a grid
+        // that we KNOW started non-empty asks for the clear.
+        if (!namedCount && win._loadedNamedCount > 0) {
+            body.clearNamed = true;
+        }
 
         ANAS.runJob({
             node: node,

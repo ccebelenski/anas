@@ -1,5 +1,6 @@
 import type { Dataset, DatasetDetail, Job, JobAccepted } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
+import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -23,6 +24,26 @@ async function waitForJob(server: ReturnType<typeof createServer>, id: string): 
     await new Promise(resolve => setTimeout(resolve, 10))
   }
   throw new Error(`Job ${id} did not finish`)
+}
+
+/**
+ * Record every command the route issues, optionally overriding results. Lets a
+ * test assert the exact argument arrays (e.g. that ONE `zfs set` carries the
+ * whole property edit) and pose a command as failing.
+ */
+interface Call { command: string, args: string[] }
+function recordCalls(
+  server: ReturnType<typeof createServer>,
+  override?: (command: string, args: string[]) => ExecResult | undefined,
+): Call[] {
+  const mock = (server as unknown as { executor: MockExecutor }).executor
+  const calls: Call[] = []
+  const orig = mock.exec.bind(mock)
+  mock.exec = async (command: string, args: string[]): Promise<ExecResult> => {
+    calls.push({ command, args })
+    return override?.(command, args) ?? orig(command, args)
+  }
+  return calls
 }
 
 // smb.conf + /etc/exports whose share paths match testpool/media's mountpoint
@@ -267,6 +288,103 @@ describe('datasets routes', () => {
         url: '/v1/pools/testpool/datasets/media',
         headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
         payload: JSON.stringify({ properties: {} }),
+      })
+      assert.equal(res.statusCode, 400)
+    })
+  })
+
+  // --- #43: a property edit is all-or-nothing ----------------------------
+  //
+  // The bug: a blanked "Record size" field sent recordsize=0, ZFS rejected it,
+  // and because properties were applied one `zfs set` at a time the failure
+  // landed AFTER the earlier properties were already written — a half-applied
+  // edit the operator never asked for. Two guards: the value is refused at the
+  // API boundary, and the apply is a single command either way.
+  describe('PUT /v1/pools/:name/datasets/*path — all-or-nothing apply (#43)', () => {
+    it('applies every property in ONE zfs set (no per-property sequence to fail halfway)', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = recordCalls(server)
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ properties: { compression: 'zstd', recordsize: 1048576, atime: false, quota: 0 } }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+
+      const sets = calls.filter(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set')
+      assert.equal(sets.length, 1, 'exactly one zfs set carries the whole edit')
+      assert.deepEqual(sets[0].args, [
+        'set',
+        'compression=zstd',
+        'recordsize=1048576',
+        'quota=none',
+        'atime=off',
+        'testpool/media',
+      ])
+    })
+
+    it('a rejected zfs set writes nothing — the job fails after a single attempt', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = recordCalls(server, (command, args) =>
+        command === '/usr/sbin/zfs' && args[0] === 'set'
+          ? { stdout: '', stderr: 'cannot set property for \'testpool/media\': invalid property value', exitCode: 1 }
+          : undefined)
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ properties: { compression: 'zstd', atime: false } }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /invalid property value/)
+      assert.equal(calls.filter(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set').length, 1)
+    })
+
+    it('rejects a blanked record size (recordsize=0) at the boundary — nothing is applied', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = recordCalls(server)
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ properties: { compression: 'zstd', recordsize: 0 } }),
+      })
+      assert.equal(res.statusCode, 400)
+      assert.match(res.json().error.message, /recordsize/)
+      // The 400 lands before the job exists, so the compression change that
+      // would have gone first never happens.
+      assert.equal(calls.filter(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'set').length, 0)
+    })
+
+    it('rejects a recordsize that is not a power of two, and one out of range', async () => {
+      server = createServer({ mock: true, logger: false })
+      const put = (recordsize: number) => server!.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ properties: { recordsize } }),
+      })
+      assert.equal((await put(100000)).statusCode, 400) // not a power of two
+      assert.equal((await put(256)).statusCode, 400) // below the 512 floor
+      assert.equal((await put(32 * 1024 * 1024)).statusCode, 400) // above the 16M ceiling
+      assert.equal((await put(131072)).statusCode, 202) // 128K is fine
+    })
+
+    it('rejects recordsize=0 on create too (same shared constraint)', async () => {
+      server = createServer({ mock: true, logger: false })
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/datasets',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ path: 'projects', properties: { recordsize: 0 } }),
       })
       assert.equal(res.statusCode, 400)
     })

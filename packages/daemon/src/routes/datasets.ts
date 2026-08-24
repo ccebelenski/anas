@@ -66,6 +66,11 @@ function buildCreateArgs(fullName: string, req: CreateDatasetRequest): string[] 
  * Booleans map to on/off; a 0 quota/reservation means 'none'; the rest pass
  * through as-is. Only the settable properties in the shared schema are mapped —
  * anything else is silently absent (structured operations, Principle 5).
+ *
+ * `recordsize` has no 0 → 'none' mapping because ZFS has no such value: the
+ * shared schema constrains it to a power of two in [512, 16M], so a blanked
+ * field is a 400 at the boundary rather than a `recordsize=0` that ZFS refuses
+ * partway through the apply (#43).
  */
 function buildSetPairs(p: UpdateDatasetPropertiesRequest['properties']): string[] {
   const pairs: string[] = []
@@ -740,12 +745,17 @@ export async function datasetRoutes(
       'zfs.set',
       { ...identity, params: { dataset: fullName, properties: bodyParsed.data.properties } },
       async (updateProgress) => {
-        for (const pair of pairs) {
-          updateProgress(`Setting ${pair} on ${fullName}`)
-          const result = await executor.exec(ZFS, ['set', pair, fullName])
-          if (result.exitCode !== 0)
-            throw new Error(result.stderr.trim() || `zfs set ${pair} exited with code ${result.exitCode}`)
-        }
+        // ONE `zfs set` carrying every pair, not one call per property (#43).
+        // ZFS validates the whole property list before it writes any of it, so
+        // a value it rejects can no longer land AFTER earlier properties were
+        // already applied — the half-applied edit is structurally impossible,
+        // not merely unlikely. (Values are also validated at the API boundary
+        // by the shared schema, so a bad one rarely reaches ZFS at all.)
+        const spec = pairs.join(' ')
+        updateProgress(`Setting ${spec} on ${fullName}`)
+        const result = await executor.exec(ZFS, ['set', ...pairs, fullName])
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `zfs set ${spec} exited with code ${result.exitCode}`)
         return { dataset: fullName, applied: pairs }
       },
     )
@@ -844,6 +854,8 @@ export async function datasetRoutes(
 
     let entries: AccessEntry[]
     let aclText: string | null = null
+    /** acltype says posixacl, but the ACL itself could not be read (#37). */
+    let aclDegraded = false
 
     // A principal whose uid/gid no longer resolves shows as a bare number
     // (getfacl/stat print the numeric id) — an orphan from a delete outside
@@ -866,7 +878,12 @@ export async function datasetRoutes(
         ]
       }
       else {
-        // ACLs enabled but unreadable — fall back to the mode bits.
+        // ACLs enabled but unreadable. The mode bits are all we have, so the
+        // entries below are an APPROXIMATION and any named grants are missing
+        // from them. Say so (aclDegraded) and stop claiming healthy ACLs —
+        // a client that believed `aclEnabled: true` here would present an empty
+        // named list as the truth and let the operator "apply" it (#37).
+        aclDegraded = true
         entries = baseEntriesFromMode(perm.mode, ownerOrphan, groupOrphan)
       }
       // Raw ACL text (with header, no effective comments) for the Advanced panel.
@@ -882,10 +899,12 @@ export async function datasetRoutes(
       owner: perm.owner,
       group: perm.group,
       aclSupported: supported,
-      aclEnabled: enabled,
+      aclEnabled: enabled && !aclDegraded,
       entries,
       aclText,
     }
+    if (aclDegraded)
+      data.aclDegraded = true
     return { data }
   }
 
@@ -915,9 +934,10 @@ export async function datasetRoutes(
 
     const recursive = req.applyToExisting === true
 
-    const named = (req.entries ?? []).filter(isNamed)
-    const hasNamed = named.length > 0
+    const requestedNamed = (req.entries ?? []).filter(isNamed)
     const baseChanged = req.entries !== undefined
+    /** Named grants are stripped ONLY on an explicit request (#37). */
+    const clearNamed = req.clearNamed === true
 
     // owner/group only when actually changing (respect the current identity).
     const ownerChanged = req.owner !== undefined && req.owner !== perm.owner
@@ -927,10 +947,9 @@ export async function datasetRoutes(
     // permissions path resolves the mountpoint outside the job.
     const supported = await aclSupported()
     const enabled = isPosixAcl(await getAcltype(fullName))
-    const aclAutoEnabled = hasNamed && supported && !enabled
 
     // When ACLs are live, read the ACL once up front and reuse it for BOTH the
-    // base-level fallback (below) and the clearAcls detection — one getfacl.
+    // base-level fallback and the named grants we must preserve — one getfacl.
     let liveAcl: ParsedAcl | null = null
     if (enabled && supported) {
       const r = await executor.exec(GETFACL, ['-pcE', mountpoint])
@@ -959,9 +978,23 @@ export async function datasetRoutes(
       'everyone': levelOf('everyone'),
     }
 
-    // Base-only request that clears existing named ACLs → we must strip them so
-    // the mode bits are the whole truth again. Reuse the ACL read above.
-    const clearAcls = !hasNamed && baseChanged && (liveAcl?.named.length ?? 0) > 0
+    // A base-only edit PRESERVES the live named grants — it never deletes them
+    // by omission (#37). Restating them in the declarative `setfacl --set` is
+    // also the only correct way to move the base levels on an ACL'd directory:
+    // a plain chmod would write the ACL MASK, not `group::`. When there is
+    // nothing to preserve (no live ACL, or the caller asked to clear) this list
+    // is empty and the mode-bit path below runs as before.
+    const preservedNamed: NamedEntry[] = (baseChanged && requestedNamed.length === 0 && !clearNamed)
+      ? (liveAcl?.named ?? []).map(n => ({ kind: n.type, name: n.name, level: permsToLevel(n.perms) }))
+      : []
+    const named = requestedNamed.length > 0 ? requestedNamed : preservedNamed
+    const hasNamed = named.length > 0
+    const aclAutoEnabled = hasNamed && supported && !enabled
+
+    // Strip the named ACL entries only when the caller explicitly said so. The
+    // acltype check (rather than "we saw named entries") means an explicit
+    // clear still runs when the ACL could not be read — the operator asked.
+    const clearAcls = clearNamed && supported && enabled
 
     const job = jobQueue.submit(
       'fs.setAccess',
@@ -974,13 +1007,16 @@ export async function datasetRoutes(
           groupChanged,
           baseChanged,
           namedCount: named.length,
+          preservedNamedCount: preservedNamed.length,
+          clearNamed,
           applyToExisting: recursive,
           aclAutoEnabled,
         },
       },
       async (updateProgress) => {
         // Named grants need the acl package. Gate BEFORE any mutation so a
-        // missing tool never leaves a half-applied state.
+        // missing tool never leaves a half-applied state. (Only a REQUESTED
+        // grant can hit this — preserved entries imply a readable live ACL.)
         if (hasNamed && !supported)
           throw new Error('The acl package (setfacl) is not installed; named user/group grants require it. Install it (apt install acl), or grant owner/group/everyone only.')
 
@@ -1039,29 +1075,30 @@ export async function datasetRoutes(
           return { dataset: fullName, mountpoint, aclEnabled: true, aclAutoEnabled, namedCount: named.length }
         }
 
-        // No named entries → pure mode bits.
-        if (baseChanged) {
-          // Strip stale ACLs first so the mode bits are the whole truth.
-          if (clearAcls) {
-            const clearArgs = recursive ? ['-R', '-b', '-k', mountpoint] : ['-b', '-k', mountpoint]
-            updateProgress(`setfacl -b -k ${mountpoint}`)
-            const clearR = await executor.exec(SETFACL, clearArgs)
-            if (clearR.exitCode !== 0)
-              throw new Error(clearR.stderr.trim() || `setfacl -b -k exited with code ${clearR.exitCode}`)
-            // Also drop the setgid bit we set for ACL inheritance — with the
-            // named grants gone there is nothing to inherit, and a leftover
-            // setgid would make the reported mode (e.g. 2775 vs 775) misleading.
-            // Non-recursive: a cheap standalone chmod on the single directory.
-            // Recursive: the setgid-clear is folded into the mode chmod below
-            // (one `-R` walk instead of two — the `g-s` clause rides along with
-            // the base-perm clauses in a single traversal).
-            if (!recursive) {
-              updateProgress(`chmod g-s ${mountpoint}`)
-              const unsetR = await executor.exec(CHMOD, ['g-s', mountpoint])
-              if (unsetR.exitCode !== 0)
-                throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
-            }
+        // No named entries to apply → mode bits, plus an EXPLICIT ACL clear.
+        // Strip the requested-away ACLs first so the mode bits are the whole
+        // truth. This runs only for `clearNamed: true` — never inferred.
+        if (clearAcls) {
+          const clearArgs = recursive ? ['-R', '-b', '-k', mountpoint] : ['-b', '-k', mountpoint]
+          updateProgress(`setfacl -b -k ${mountpoint}`)
+          const clearR = await executor.exec(SETFACL, clearArgs)
+          if (clearR.exitCode !== 0)
+            throw new Error(clearR.stderr.trim() || `setfacl -b -k exited with code ${clearR.exitCode}`)
+          // Also drop the setgid bit we set for ACL inheritance — with the
+          // named grants gone there is nothing to inherit, and a leftover
+          // setgid would make the reported mode (e.g. 2775 vs 775) misleading.
+          // A recursive clear that ALSO sets the base levels folds `g-s` into
+          // that one mode chmod below (one `-R` walk instead of two); every
+          // other shape needs its own call.
+          if (!recursive || !baseChanged) {
+            const gsArgs = recursive ? ['-R', 'g-s', mountpoint] : ['g-s', mountpoint]
+            updateProgress(`chmod g-s ${mountpoint}`)
+            const unsetR = await executor.exec(CHMOD, gsArgs)
+            if (unsetR.exitCode !== 0)
+              throw new Error(unsetR.stderr.trim() || `chmod g-s exited with code ${unsetR.exitCode}`)
           }
+        }
+        if (baseChanged) {
           // Recursive: symbolic perms with capital `X` so execute is applied only
           // to directories (and already-executable files), never sprinkled onto
           // plain data files. When we cleared ACLs, append `,g-s` so the setgid
@@ -1082,7 +1119,7 @@ export async function datasetRoutes(
             throw new Error(modeR.stderr.trim() || `chmod ${mode} exited with code ${modeR.exitCode}`)
         }
 
-        return { dataset: fullName, mountpoint, aclEnabled: enabled, aclAutoEnabled: false, namedCount: 0 }
+        return { dataset: fullName, mountpoint, aclEnabled: enabled, aclAutoEnabled: false, namedCount: 0, clearedNamed: clearAcls }
       },
     )
 

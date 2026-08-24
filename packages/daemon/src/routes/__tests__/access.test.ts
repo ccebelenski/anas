@@ -4,6 +4,7 @@ import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { afterEach, describe, it } from 'node:test'
+import { SetAccessRequest } from '@anas/shared'
 import { createServer } from '../../server.js'
 
 const IDENTITY_HEADERS = {
@@ -296,18 +297,21 @@ describe('access routes', () => {
   })
 
   // --- PUT /access: remove all named entries (back to mode bits) ----------
+  // Removal is EXPLICIT (#37): `clearNamed: true`. An entries list that simply
+  // carries no named row means "not changing the grants" — see the regression
+  // suite below for why an empty list must never be read as "delete them all".
   describe('PUT /v1/pools/:name/datasets/*path/access — remove named', () => {
-    it('clears the ACL then chmods when a base-only request lands on an ACL dataset', async () => {
+    it('clears the ACL then chmods when clearNamed is requested on an ACL dataset', async () => {
       server = createServer({ mock: true, logger: false })
       // Pose the dataset as posixacl with a live named entry (server fixture
-      // getfacl -pcE returns alice), so the base-only request must strip it.
+      // getfacl -pcE returns alice), so the explicit clear must strip it.
       const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
 
       const res = await server.inject({
         method: 'PUT',
         url: '/v1/pools/testpool/datasets/media/access',
         headers: JSON_HEADERS,
-        payload: JSON.stringify({ entries: [
+        payload: JSON.stringify({ clearNamed: true, entries: [
           { kind: 'owner', level: 'read-write' },
           { kind: 'owning-group', level: 'read' },
           { kind: 'everyone', level: 'read' },
@@ -316,6 +320,7 @@ describe('access routes', () => {
       assert.equal(res.statusCode, 202)
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed')
+      assert.equal((job.result as { clearedNamed: boolean }).clearedNamed, true)
 
       assert.deepEqual(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), ['-b', '-k', MP])
       // Clearing the ACLs also drops the setgid bit we set for inheritance, so
@@ -335,7 +340,7 @@ describe('access routes', () => {
         method: 'PUT',
         url: '/v1/pools/testpool/datasets/media/access',
         headers: JSON_HEADERS,
-        payload: JSON.stringify({ entries: [
+        payload: JSON.stringify({ clearNamed: true, entries: [
           { kind: 'owner', level: 'read-write' },
           { kind: 'owning-group', level: 'read' },
           { kind: 'everyone', level: 'read' },
@@ -354,6 +359,98 @@ describe('access routes', () => {
       assert.deepEqual(chmodR[0].args, ['-R', 'u=rwX,g=rX,o=rX,g-s', MP])
       // No standalone `chmod -R g-s`.
       assert.equal(find(calls, '/usr/bin/chmod', a => a.length === 3 && a[0] === '-R' && a[1] === 'g-s'), undefined)
+    })
+  })
+
+  // --- #37: named grants are never destroyed by omission ------------------
+  //
+  // The bug: the Permissions dialog's pre-fill failed open (warn + null), the
+  // window stayed live with hard-coded defaults and an EMPTY named grid, and
+  // Apply sent that empty list. The daemon read "no named entries + base
+  // changed" as "delete every named grant", stripped the ACL, and reported the
+  // job as a success. The contract now: absence is not intent.
+  describe('PUT /v1/pools/:name/datasets/*path/access — implicit-clear guard (#37)', () => {
+    it('a base-only update with no named entries LEAVES existing named ACLs alone', async () => {
+      server = createServer({ mock: true, logger: false })
+      // posixacl dataset whose live ACL grants alice rwx (server fixture).
+      const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        // Exactly the payload the fail-open dialog used to send.
+        payload: JSON.stringify({ entries: [
+          { kind: 'owner', level: 'read-write' },
+          { kind: 'owning-group', level: 'read' },
+          { kind: 'everyone', level: 'none' },
+        ] }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+
+      // NOTHING is stripped: no `setfacl -b`, no setgid drop.
+      assert.equal(find(calls, '/usr/bin/setfacl', a => a.includes('-b')), undefined)
+      assert.equal(find(calls, '/usr/bin/chmod', a => a.includes('g-s')), undefined)
+      // alice survives, restated in the declarative set alongside the new base
+      // levels — and the base lands on `g::`, not on the ACL mask a chmod would
+      // have moved instead.
+      const spec = find(calls, '/usr/bin/setfacl', a => a[0] === '--set')
+      assert.deepEqual(spec, ['--set', 'u::rwx,g::r-x,o::---,u:alice:rwx,m::rwx', MP])
+      assert.equal((job.result as { namedCount: number }).namedCount, 1)
+    })
+
+    it('an owner-only update touches neither the ACL nor the mode bits', async () => {
+      server = createServer({ mock: true, logger: false })
+      const calls = installExecutor(server, [{ command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') }])
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/pools/testpool/datasets/media/access',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ owner: 'media' }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+
+      assert.deepEqual(find(calls, '/usr/bin/chown', () => true), ['media', MP])
+      assert.equal(find(calls, '/usr/bin/setfacl', () => true), undefined)
+      assert.equal(find(calls, '/usr/bin/chmod', () => true), undefined)
+    })
+
+    it('the request schema requires an explicit flag for a destructive clear', async () => {
+      // Class guard: a list-valued field whose emptiness would destroy data must
+      // never carry that meaning implicitly. Asserted on the SCHEMA so a future
+      // field that infers "clear" from an empty list is caught here.
+      const noFlag = SetAccessRequest.parse({ entries: [{ kind: 'owner', level: 'read' }] })
+      assert.equal(noFlag.clearNamed, undefined, 'an empty named list carries no clear intent')
+      assert.equal(SetAccessRequest.parse({ clearNamed: true }).clearNamed, true)
+      // The flag and named entries are contradictory — refused at the boundary.
+      const contradiction = SetAccessRequest.safeParse({
+        clearNamed: true,
+        entries: [{ kind: 'user', name: 'alice', level: 'read' }],
+      })
+      assert.equal(contradiction.success, false)
+    })
+
+    it('an unreadable getfacl is reported as degraded, not as healthy ACLs', async () => {
+      server = createServer({ mock: true, logger: false })
+      // acltype says posixacl but the ACL itself cannot be read.
+      installExecutor(server, [
+        { command: '/usr/sbin/zfs', args: ACLTYPE_MEDIA, result: ok('posixacl\n') },
+        { command: '/usr/bin/getfacl', args: ['-pcE', MP], result: { stdout: '', stderr: 'Permission denied', exitCode: 1 } },
+      ])
+
+      const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets/media/access', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: DatasetAccess }
+      assert.equal(data.aclDegraded, true, 'the degradation is surfaced')
+      // The entries are a mode-bit approximation with no named grants in them —
+      // reporting aclEnabled:true would invite the client to apply that as truth.
+      assert.equal(data.aclEnabled, false)
+      assert.equal(data.entries.length, 3)
     })
   })
 
