@@ -389,7 +389,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
     // Resolve to a repo-like target + secret: a registered repo OR a tier-1
     // PVE-defined repo (both by name, secret loaded fresh) OR an inline config
-    // (from the dialog, with its secret).
+    // (from the dialog, with its secret — or, when the secret was left blank on
+    // an edit, the stored one; see the fallback in the inline branch).
     let repo: BackupRepo
     let secret: string | null
     if (!req.host && req.name) {
@@ -423,7 +424,18 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         ...(req.username ? { username: req.username } : {}),
         ...(req.fingerprint ? { fingerprint: normalizeFingerprint(req.fingerprint) } : {}),
       }
+      // The secret is WRITE-ONLY: it is never read back, so the edit dialog
+      // sends none when the operator left the field blank — its '(unchanged)'
+      // promise, and exactly what the save path then honours. Test has to make
+      // the same promise, or it fails auth on a repo that saves and runs fine.
+      // The fallback is keyed on the NAME while the rest of the config comes
+      // from the request, so a repo whose host/datastore/token-id were edited is
+      // tested as it would actually be SAVED: the new fields, the stored secret.
       secret = req.secret ?? null
+      if (!secret && req.name) {
+        const resolved = await resolveRepoAndSecret(req.name)
+        secret = resolved?.secret ?? null
+      }
     }
 
     const result = await diagnose(repo, secret)

@@ -402,6 +402,19 @@
         return ANAS.notifyMode.of(first(task && task.notify), 'always');
     }
 
+    // ---- LimitNOFILE -------------------------------------------------------
+    // The generated unit carries LimitNOFILE=<task.limitNofile> — a real prlimit
+    // on pbc, raised by hand on nodes where metadata mode hoards descriptors.
+    // No dialog control edits it, so every PUT (edit AND enable/disable, both of
+    // which rewrite the WHOLE task) has to carry the stored value through, or
+    // the next save silently resets a hand-raised limit to the schema default
+    // and rewrites the unit. Same rule as cadence, notify and retention.
+    function limitNofileOf(task) {
+        var n = Number(first(task && task.limitNofile, task && task.limitNoFile,
+            task && task['limit-nofile']));
+        return (!isNaN(n) && n > 0 && n === Math.floor(n)) ? n : undefined;
+    }
+
     function hasKeeps(retention) {
         for (var k in retention) {
             if (Object.prototype.hasOwnProperty.call(retention, k)) {
@@ -440,6 +453,7 @@
             schedule: task.schedule,
             cadence: cadenceOf(task),
             notify: notifyOf(task),
+            limitNofile: limitNofileOf(task),
             enabled: task.enabled !== false,
             lastRunResult: first(entry.lastRunResult, entry.result) || 'unknown',
             lastRunAt: first(entry.lastRunAt, entry.lastRun),
@@ -465,6 +479,7 @@
             schedule: rec.get('schedule'),
             cadence: rec.get('cadence') || undefined,
             notify: rec.get('notify') || 'always',
+            limitNofile: rec.get('limitNofile') || undefined,
             enabled: !!rec.get('enabled'),
         };
     }
@@ -2149,7 +2164,7 @@
                         cls: 'anas-btn-backup-task-submit',
                         handler: function () {
                             try {
-                                submitTask(win, view, node, isEdit);
+                                submitTask(win, view, node, isEdit, task);
                             } catch (e) {
                                 ANAS.warn('backup task submit failed: ' + ANAS.errText(e));
                             }
@@ -2201,7 +2216,9 @@
         }
     }
 
-    function submitTask(win, view, node, isEdit) {
+    // `task` is the task being edited (empty on create): the source for every
+    // field the dialog does NOT show but a PUT would otherwise drop.
+    function submitTask(win, view, node, isEdit, task) {
         var form = win.down('#form');
         var basicForm = form && form.getForm();
         if (basicForm && basicForm.isValid && !basicForm.isValid()) {
@@ -2290,6 +2307,12 @@
         var retention = readRetention(win);
         if (hasKeeps(retention)) {
             body.retention = retention;
+        }
+        // No dialog control for LimitNOFILE — carry the task's own value through
+        // the save so an edit never resets a hand-raised limit to the default.
+        var limitNofile = limitNofileOf(task);
+        if (limitNofile !== undefined) {
+            body.limitNofile = limitNofile;
         }
 
         var proceed = function () {
@@ -2534,6 +2557,13 @@
         var cad = cadenceOf(raw);
         if (cad) {
             body.cadence = cad;
+        }
+        // And so does LimitNOFILE — the dialog never shows it, so a toggle is
+        // the easiest place to lose it (the PUT rewrites the whole task and the
+        // schema default would silently re-cap the unit at 1024).
+        var lim = limitNofileOf(raw);
+        if (lim !== undefined) {
+            body.limitNofile = lim;
         }
         ANAS.runJob({
             node: node,
@@ -3447,6 +3477,7 @@
                 'schedule', 'mode', 'notify', 'lastRunResult', 'lastRunAt', 'nextRunAt',
                 { name: 'archiveCount', type: 'auto' },
                 { name: 'cadence', type: 'auto' },
+                { name: 'limitNofile', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
                 { name: 'overdue', type: 'auto' },
                 { name: 'raw', type: 'auto' },

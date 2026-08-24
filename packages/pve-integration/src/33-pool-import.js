@@ -60,12 +60,22 @@
         }
         var rec = sel[0];
         var name = rec.get('name');
+        var guid = '' + (rec.get('guid') || '');
+
+        // Import by GUID whenever the scan gave us one: the GUID identifies THIS
+        // pool, the name does not — two exported pools may share a name, which is
+        // the whole reason the scan reports a GUID and the column shows it. The
+        // daemon accepts either (ImportPoolRequest), prefers `name` when both are
+        // present, and derives the imported pool's name from the pool-list diff,
+        // so a GUID import loses nothing. Name-only stays the fallback for a scan
+        // row without a GUID.
+        var body = guid ? { guid: guid } : { name: name };
 
         ANAS.runJob({
             node: node,
             method: 'post',
             path: '/pools/import',
-            body: { name: name },
+            body: body,
             view: win,
             failTitle: 'Import failed',
             successMsg: t('Pool imported') + ': ' + name,

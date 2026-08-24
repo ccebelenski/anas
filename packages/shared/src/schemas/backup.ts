@@ -402,6 +402,14 @@ export type UpsertBackupRepoRequest = z.infer<typeof UpsertBackupRepoRequest>
  * Test-connection request. Either an inline repo (pre-registration, with the
  * secret from the dialog) OR `{ name }` for a registered repo (the daemon loads
  * the stored secret). Distinguished by the presence of `host`.
+ *
+ * The secret is write-only everywhere in this API, so an ABSENT `secret` on an
+ * inline body means "the one already stored", not "no credential": when `name`
+ * names a registered (or PVE-defined) repo, the daemon falls back to that repo's
+ * stored secret and tests the request's own host/datastore/token fields with it.
+ * That is what makes Test truthful for an edit-in-progress — it exercises the
+ * config that would actually be SAVED, with the credential that would survive
+ * the save.
  */
 export const BackupRepoTestRequest = z.object({
   /**
