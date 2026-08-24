@@ -654,7 +654,13 @@
 
     // ---- NFS export create / edit -----------------------------------------
 
+    // Seeded into NEW client rows as a real, editable value (a sane read-write
+    // export), NOT as ghost text: clearing the cell exports the client with NO
+    // option list, and the kernel then applies ITS defaults — which are
+    // read-only. See NFS_BLANK_OPTS_HINT.
     var DEFAULT_NFS_OPTS = 'rw,sync,no_subtree_check,root_squash';
+    // What a BLANK options cell actually does (exports(5) defaults).
+    var NFS_BLANK_OPTS_HINT = 'blank = NFS defaults (ro, sync, root_squash)';
 
     function clientRowsFromExport(exp) {
         var rows = [];
@@ -741,11 +747,22 @@
                                 text: t('Options'),
                                 dataIndex: 'options',
                                 flex: 1,
-                                renderer: Ext.String.htmlEncode,
+                                // A blank cell is legal (empty option list) —
+                                // say what it will actually do rather than show
+                                // options we are not going to write.
+                                renderer: function (v) {
+                                    if (v) {
+                                        return Ext.String.htmlEncode(v);
+                                    }
+                                    return '<span style="color:var(--anas-muted,gray);">'
+                                        + Ext.String.htmlEncode(t(NFS_BLANK_OPTS_HINT)) + '</span>';
+                                },
                                 editor: {
                                     xtype: 'textfield',
                                     cls: 'anas-fld-client-options',
-                                    emptyText: DEFAULT_NFS_OPTS,
+                                    // Ghost text states what LEAVING IT BLANK
+                                    // does — it is not a value we would write.
+                                    emptyText: t(NFS_BLANK_OPTS_HINT),
                                 },
                             },
                         ],

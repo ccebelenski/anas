@@ -156,10 +156,16 @@ describe('serializeExportLine', () => {
     )
   })
 
-  it('omits parens for a client with no options', () => {
+  // An empty option list is LEGAL and means "whatever the kernel defaults to"
+  // (exports(5): ro, sync, root_squash) — NOT the read-write set ANAS seeds new
+  // rows with. The editor's ghost text says so rather than showing options we
+  // would not write (issue #42).
+  it('omits parens for a client with no options — the kernel then applies its own', () => {
     assert.equal(
       serializeExportLine({ path: '/data', clients: [{ spec: 'host', options: [] }] }),
       '/data host',
     )
+    // And it round-trips: a blank option list stays blank, never re-seeded.
+    assert.deepEqual(parseExports('/data host\n')[0].clients, [{ spec: 'host', options: [] }])
   })
 })

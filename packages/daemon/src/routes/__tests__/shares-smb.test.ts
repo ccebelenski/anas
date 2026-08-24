@@ -205,6 +205,53 @@ describe('SMB share routes', () => {
       assert.ok(readFileSync(confPath!, 'utf8').includes('\tinterfaces = lo'))
     })
 
+    // The SMB Settings dialog always sends all four fields. On a stock config
+    // that names neither, blanks must NOT become empty directives (issue #42).
+    it('a blank workgroup / server string writes no empty directives', async () => {
+      const stock = [
+        '[global]',
+        '\tlog level = 1',
+        '',
+        '[media]',
+        '\tpath = /tank/media',
+        '',
+      ].join('\n')
+      const s = startServer(stock)
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/global',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({
+          workgroup: '',
+          serverString: '',
+          interfaces: [],
+          bindInterfacesOnly: false,
+        }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+      const written = readFileSync(confPath!, 'utf8')
+      assert.ok(!written.includes('workgroup'), 'no empty workgroup directive')
+      assert.ok(!written.includes('server string'), 'no empty server string directive')
+      assert.equal(written, stock, 'an untouched settings save changes nothing')
+    })
+
+    it('clears an existing workgroup rather than blanking it', async () => {
+      const s = startServer()
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/global',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ workgroup: '' }),
+      })
+      assert.equal(res.statusCode, 202)
+      await waitForJob(s, (res.json() as JobAccepted).job.id)
+      const written = readFileSync(confPath!, 'utf8')
+      assert.ok(!written.includes('workgroup'), 'the directive is gone, not left empty')
+      assert.ok(written.includes('\tserver string = ANAS Storage'), 'siblings untouched')
+    })
+
     it('does NOT gate a reorder-only interfaces change (functionally a no-op)', async () => {
       const s = startServer()
       const res = await s.inject({
@@ -320,6 +367,67 @@ describe('SMB share routes', () => {
         payload: JSON.stringify({ readOnly: true }),
       })
       assert.equal(res.statusCode, 404)
+    })
+
+    // The edit dialog always sends the FULL field set, so a save is normally a
+    // removal (cleared list / blank comment) AND an insert in one request —
+    // the shape that used to write into the NEXT stanza (issue #36).
+    it('keeps a full-field-set save inside the edited stanza (issue #36)', async () => {
+      const s = startServer()
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/media',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({
+          path: '/tank/media',
+          comment: '',
+          browseable: true,
+          readOnly: false,
+          guestOk: true, // absent in [media] → an insert
+          validUsers: [], // present in [media] → a removal
+          hostsAllow: [],
+          hostsDeny: [],
+        }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed')
+
+      const list = await s.inject({ method: 'GET', url: '/v1/shares/smb' })
+      const shares = (list.json() as { data: SmbShare[] }).data
+      const media = shares.find(x => x.name === 'media')!
+      const archive = shares.find(x => x.name === 'archive')!
+      assert.equal(media.guestOk, true)
+      assert.deepEqual(media.validUsers, [])
+      // The neighbouring stanza did NOT inherit the guest access.
+      assert.equal(archive.guestOk, false)
+      assert.equal(archive.readOnly, true)
+      // [archive] is byte-identical, and no empty comment was injected.
+      const written = readFileSync(confPath!, 'utf8')
+      assert.ok(written.includes('[archive]\n\tpath = /tank/archive\n\tread only = yes\n'))
+      assert.ok(!written.includes('comment = \n'), 'no empty comment directive')
+    })
+
+    it('a save that changes nothing leaves smb.conf byte-identical', async () => {
+      const s = startServer()
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/media',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({
+          path: '/tank/media',
+          comment: 'Media library',
+          browseable: true,
+          readOnly: false,
+          guestOk: false,
+          validUsers: ['media', '@smbusers'],
+          hostsAllow: [],
+          hostsDeny: [],
+        }),
+      })
+      assert.equal(res.statusCode, 202)
+      await waitForJob(s, (res.json() as JobAccepted).job.id)
+      assert.equal(readFileSync(confPath!, 'utf8'), SAMPLE_CONF)
     })
   })
 

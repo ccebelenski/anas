@@ -107,7 +107,18 @@ function isContinued(line: string): boolean {
  */
 export function parseDoc(text: string): SmbConfDoc {
   const lines = text.split('\n')
+  return { lines, sections: computeSections(lines) }
+}
 
+/**
+ * Build the section overlay for a line array.
+ *
+ * Spans are INDEXES into `lines`, so they go stale the moment the array is
+ * spliced. Any editor that adds or removes lines must recompute them (see
+ * `reindexSections`) before using a span again — a stale `end` is how an insert
+ * lands in the NEXT stanza (issue #36).
+ */
+function computeSections(lines: string[]): SectionSpan[] {
   // Collect header line indices (skipping comments) to build section spans.
   const headers: { index: number, name: string }[] = []
   for (let i = 0; i < lines.length; i++) {
@@ -119,9 +130,10 @@ export function parseDoc(text: string): SmbConfDoc {
   const sections: SectionSpan[] = []
   if (headers.length === 0) {
     // Whole file is a headerless preamble (comments / blanks / stray keys).
-    if (text.length > 0)
+    // `''.split('\n')` is `['']` — an empty file has no section at all.
+    if (lines.length > 1 || lines[0] !== '')
       sections.push({ name: null, key: null, headerIndex: null, start: 0, end: lines.length })
-    return { lines, sections }
+    return sections
   }
 
   // Leading preamble before the first header.
@@ -140,7 +152,12 @@ export function parseDoc(text: string): SmbConfDoc {
     })
   }
 
-  return { lines, sections }
+  return sections
+}
+
+/** Recompute the section overlay after `doc.lines` has been spliced. */
+function reindexSections(doc: SmbConfDoc): void {
+  doc.sections = computeSections(doc.lines)
 }
 
 /** Reconstruct the file text from the document model (byte-for-byte on no-op). */
@@ -154,12 +171,29 @@ function findSection(doc: SmbConfDoc, name: string): SectionSpan | null {
   return doc.sections.find(s => s.key === key) ?? null
 }
 
+/** One `key = value` definition inside a section (continuation lines folded in). */
+interface KeyDef {
+  /** Normalised parameter name (case- and space-folded). */
+  key: string
+  /** Value, with trailing-backslash continuation lines joined in. */
+  value: string
+  /** Index of the `key =` line. */
+  first: number
+  /** Index of its last continuation line (=== `first` when there is none). */
+  last: number
+}
+
 /**
- * Collect a section's effective key → value map (last definition wins, as
- * Samba does), joining trailing-backslash continuation lines.
+ * Every parameter definition in a section, IN FILE ORDER, with continuation
+ * lines folded into the value (and skipped by the scan, so a continuation that
+ * happens to contain `=` is never mistaken for a parameter).
+ *
+ * This is the one place lines are interpreted: both the read-models and the
+ * surgical editor work from it, so what ANAS shows and what ANAS edits can
+ * never disagree.
  */
-function sectionKeys(doc: SmbConfDoc, span: SectionSpan): Record<string, string> {
-  const out: Record<string, string> = {}
+function sectionDefs(doc: SmbConfDoc, span: SectionSpan): KeyDef[] {
+  const defs: KeyDef[] = []
   for (let i = span.start; i < span.end; i++) {
     if (i === span.headerIndex)
       continue
@@ -167,14 +201,16 @@ function sectionKeys(doc: SmbConfDoc, span: SectionSpan): Record<string, string>
     if (!parsed)
       continue
     let value = parsed.value
+    let last = i
     // Absorb continuation lines (value ends in `\`).
-    while (isContinued(doc.lines[i]) && i + 1 < span.end) {
-      value = `${value.slice(0, -1)} ${content(doc.lines[i + 1]).trim()}`
-      i++
+    while (isContinued(doc.lines[last]) && last + 1 < span.end) {
+      value = `${value.slice(0, -1)} ${content(doc.lines[last + 1]).trim()}`
+      last++
     }
-    out[parsed.key] = value.trim()
+    defs.push({ key: parsed.key, value: value.trim(), first: i, last })
+    i = last
   }
-  return out
+  return defs
 }
 
 // ============================================================================
@@ -206,57 +242,127 @@ function parseList(value: string | undefined): string[] {
 }
 
 // ============================================================================
-// Typed read-models (SmbShare / SmbGlobalConfig) built from key maps.
+// The parameter table — Samba's documented synonyms, in ONE place.
+//
+// Samba parameter names are case- and space-insensitive AND several have
+// documented synonyms ("hosts allow" ≡ "allow hosts") or inverted synonyms
+// ("read only" ≡ NOT "writeable"). Reading and editing consult this same table,
+// so a stanza spelled the alternate way is read correctly AND edited in place —
+// never shadowed by a second, canonically-spelled line (issue #42).
+// ============================================================================
+
+/** A managed parameter: how ANAS writes it, and every spelling Samba accepts. */
+interface SmbParam {
+  /** Canonical spelling used when a new line is inserted. */
+  canonical: string
+  /** Normalised spellings that mean this parameter. */
+  norms: string[]
+  /** Normalised spellings whose value is the INVERSE of this parameter. */
+  inverse?: string[]
+  /**
+   * What Samba does when the parameter is absent. It is the read fallback, and
+   * it also means an edit that asks for exactly this need not write a line: a
+   * stanza that relies on the default keeps relying on it.
+   */
+  unset?: string
+}
+
+const PARAM = {
+  // `directory` is a documented synonym of `path`.
+  path: { canonical: 'path', norms: ['path', 'directory'] },
+  comment: { canonical: 'comment', norms: ['comment'] },
+  // `browsable` is the alternate spelling of `browseable`.
+  browseable: { canonical: 'browseable', norms: ['browseable', 'browsable'], unset: 'yes' },
+  // `writeable`/`writable`/`write ok` are inverted synonyms of `read only`.
+  readOnly: { canonical: 'read only', norms: ['readonly'], inverse: ['writeable', 'writable', 'writeok'], unset: 'yes' },
+  // `public` is a synonym of `guest ok`.
+  guestOk: { canonical: 'guest ok', norms: ['guestok', 'public'], unset: 'no' },
+  validUsers: { canonical: 'valid users', norms: ['validusers'] },
+  // `allow hosts` / `deny hosts` are synonyms of `hosts allow` / `hosts deny`.
+  hostsAllow: { canonical: 'hosts allow', norms: ['hostsallow', 'allowhosts'] },
+  hostsDeny: { canonical: 'hosts deny', norms: ['hostsdeny', 'denyhosts'] },
+  workgroup: { canonical: 'workgroup', norms: ['workgroup'] },
+  serverString: { canonical: 'server string', norms: ['serverstring'] },
+  interfaces: { canonical: 'interfaces', norms: ['interfaces'] },
+  bindInterfacesOnly: { canonical: 'bind interfaces only', norms: ['bindinterfacesonly'], unset: 'no' },
+} as const satisfies Record<string, SmbParam>
+
+/** One definition of a parameter, flagged when it uses an inverted spelling. */
+interface ParamHit {
+  def: KeyDef
+  /** The line spells the INVERSE parameter (`writeable` for `read only`). */
+  inverted: boolean
+}
+
+/** Every definition of a parameter in a section, any spelling, in file order. */
+function paramHits(defs: KeyDef[], param: SmbParam): ParamHit[] {
+  const hits: ParamHit[] = []
+  for (const def of defs) {
+    if (param.norms.includes(def.key))
+      hits.push({ def, inverted: false })
+    else if (param.inverse?.includes(def.key))
+      hits.push({ def, inverted: true })
+  }
+  return hits
+}
+
+/** Flip a boolean value string (for inverted synonyms). */
+function invertBool(value: string): string {
+  return boolStr(!parseBool(value, false))
+}
+
+/**
+ * The EFFECTIVE value of a parameter, in this parameter's own sense: Samba
+ * takes the LAST definition in the section whatever spelling it used, so we do
+ * too. `undefined` = the section never sets it.
+ */
+function paramValue(defs: KeyDef[], param: SmbParam): string | undefined {
+  const hit = paramHits(defs, param).at(-1)
+  if (!hit)
+    return undefined
+  return hit.inverted ? invertBool(hit.def.value) : hit.def.value
+}
+
+/** A boolean parameter's value, falling back to what Samba does when it is unset. */
+function paramBool(defs: KeyDef[], param: SmbParam): boolean {
+  const fallback = parseBool(param.unset, false)
+  return parseBool(paramValue(defs, param) ?? param.unset, fallback)
+}
+
+// ============================================================================
+// Typed read-models (SmbShare / SmbGlobalConfig) built from a section's defs.
 // ============================================================================
 
 /**
- * Build an SmbShare from a section's key map, or null if it has no path — such
- * sections (e.g. `[homes]`, `[printers]`) are not path-based file shares ANAS
- * manages, and would not satisfy the schema's AbsolutePath.
+ * Build an SmbShare from a section's definitions, or null if it has no path —
+ * such sections (e.g. `[homes]`, `[printers]`) are not path-based file shares
+ * ANAS manages, and would not satisfy the schema's AbsolutePath.
  */
-function toSmbShare(name: string, keys: Record<string, string>): SmbShare | null {
-  // `path` and `directory` are Samba synonyms.
-  const path = keys.path ?? keys.directory
+function toSmbShare(name: string, defs: KeyDef[]): SmbShare | null {
+  const path = paramValue(defs, PARAM.path)
   if (!path)
     return null
-
-  // read only ↔ writeable/writable/write ok (inverse). read only defaults to
-  // Samba's own default (yes) when neither form is present.
-  let readOnly: boolean
-  if (keys.readonly !== undefined)
-    readOnly = parseBool(keys.readonly, true)
-  else if (keys.writeable !== undefined)
-    readOnly = !parseBool(keys.writeable, false)
-  else if (keys.writable !== undefined)
-    readOnly = !parseBool(keys.writable, false)
-  else if (keys.writeok !== undefined)
-    readOnly = !parseBool(keys.writeok, false)
-  else
-    readOnly = true
 
   return {
     name,
     path,
-    comment: keys.comment ?? null,
-    // `browsable` is the alternate spelling; Samba default is yes.
-    browseable: parseBool(keys.browseable ?? keys.browsable, true),
-    readOnly,
-    // `public` is a synonym for `guest ok`; default no.
-    guestOk: parseBool(keys.guestok ?? keys.public, false),
-    validUsers: parseList(keys.validusers),
-    // `allow hosts` / `deny hosts` are synonyms.
-    hostsAllow: parseList(keys.hostsallow ?? keys.allowhosts),
-    hostsDeny: parseList(keys.hostsdeny ?? keys.denyhosts),
+    comment: paramValue(defs, PARAM.comment) ?? null,
+    browseable: paramBool(defs, PARAM.browseable),
+    readOnly: paramBool(defs, PARAM.readOnly),
+    guestOk: paramBool(defs, PARAM.guestOk),
+    validUsers: parseList(paramValue(defs, PARAM.validUsers)),
+    hostsAllow: parseList(paramValue(defs, PARAM.hostsAllow)),
+    hostsDeny: parseList(paramValue(defs, PARAM.hostsDeny)),
   }
 }
 
-/** Build the SmbGlobalConfig read-model from the `[global]` key map. */
-function toGlobalConfig(keys: Record<string, string>): SmbGlobalConfig {
+/** Build the SmbGlobalConfig read-model from the `[global]` definitions. */
+function toGlobalConfig(defs: KeyDef[]): SmbGlobalConfig {
   return {
-    workgroup: keys.workgroup ?? '',
-    serverString: keys.serverstring ?? '',
-    interfaces: parseList(keys.interfaces),
-    bindInterfacesOnly: parseBool(keys.bindinterfacesonly, false),
+    workgroup: paramValue(defs, PARAM.workgroup) ?? '',
+    serverString: paramValue(defs, PARAM.serverString) ?? '',
+    interfaces: parseList(paramValue(defs, PARAM.interfaces)),
+    bindInterfacesOnly: paramBool(defs, PARAM.bindInterfacesOnly),
   }
 }
 
@@ -269,18 +375,18 @@ export interface SmbConfView {
 /** Parse smb.conf text into the typed global config + share list. */
 export function parseSmbConf(text: string): SmbConfView {
   const doc = parseDoc(text)
-  let global: SmbGlobalConfig = toGlobalConfig({})
+  let global: SmbGlobalConfig = toGlobalConfig([])
   const shares: SmbShare[] = []
 
   for (const span of doc.sections) {
     if (span.key === null)
       continue // preamble
-    const keys = sectionKeys(doc, span)
+    const defs = sectionDefs(doc, span)
     if (span.key === 'global') {
-      global = toGlobalConfig(keys)
+      global = toGlobalConfig(defs)
       continue
     }
-    const share = toSmbShare(span.name as string, keys)
+    const share = toSmbShare(span.name as string, defs)
     if (share)
       shares.push(share)
   }
@@ -294,7 +400,7 @@ export function getShare(text: string, name: string): SmbShare | null {
   const span = findSection(doc, name)
   if (!span || span.key === 'global')
     return null
-  return toSmbShare(span.name as string, sectionKeys(doc, span))
+  return toSmbShare(span.name as string, sectionDefs(doc, span))
 }
 
 /** Does a share section by this name exist? (case-insensitive). */
@@ -308,14 +414,31 @@ export function hasShare(text: string, name: string): boolean {
 // (and, within it, only the target keys). All other bytes pass through verbatim.
 // ============================================================================
 
-/** The canonical smb.conf key + serialised value for a share field. */
+/** The desired end-state of ONE parameter in a section. */
 interface KeyEdit {
-  /** Normalised key used to locate an existing line. */
-  norm: string
-  /** Canonical key spelling written when inserting a new line. */
-  canonical: string
-  /** New value, or null to REMOVE the key. */
+  /** Which parameter (with its synonym spellings) to write. */
+  param: SmbParam
+  /** How an existing value is compared, so a no-op save rewrites nothing. */
+  kind: 'text' | 'bool' | 'list'
+  /** New value, or null to REMOVE every definition of the parameter. */
   value: string | null
+}
+
+/** Does the config already say this? (Compared in the value's own dialect.) */
+function sameValue(kind: KeyEdit['kind'], existing: string, wanted: string): boolean {
+  if (kind === 'bool')
+    return parseBool(existing, false) === parseBool(wanted, false)
+  if (kind === 'list') {
+    const a = parseList(existing)
+    const b = parseList(wanted)
+    return a.length === b.length && a.every((v, i) => v === b[i])
+  }
+  return existing === wanted
+}
+
+/** Blank is not a value: '' (or whitespace) means REMOVE the directive. */
+function blankIsRemoval(value: string | null | undefined): string | null {
+  return value === null || value === undefined || value.trim() === '' ? null : value
 }
 
 /** Detect the leading whitespace used by entries in a section (default a tab). */
@@ -329,27 +452,6 @@ function sectionIndent(doc: SmbConfDoc, span: SectionSpan): string {
     }
   }
   return '\t'
-}
-
-/**
- * Find the line index (and its last continuation line) of a normalised key in
- * a section, or null. Only the LAST definition is returned (Samba precedence),
- * so an edit changes the effective value.
- */
-function findKeyLine(doc: SmbConfDoc, span: SectionSpan, norm: string): { first: number, last: number } | null {
-  let found: { first: number, last: number } | null = null
-  for (let i = span.start; i < span.end; i++) {
-    if (i === span.headerIndex)
-      continue
-    const parsed = parseKeyLine(doc.lines[i])
-    if (!parsed || parsed.key !== norm)
-      continue
-    let last = i
-    while (isContinued(doc.lines[last]) && last + 1 < span.end)
-      last++
-    found = { first: i, last }
-  }
-  return found
 }
 
 /** Replace ONLY the value portion of a `key = value` line, preserving prefix. */
@@ -367,35 +469,61 @@ function replaceValue(line: string, value: string): string {
 }
 
 /**
- * Apply a set of key edits to one section, splicing `doc.lines` in place.
- * Existing keys have only their value line rewritten; removed keys drop their
- * line(s); new keys are inserted after the section's last content line.
+ * Apply a set of parameter edits to one section, splicing `doc.lines` in place.
+ *
+ * Per parameter, and honouring every synonym spelling:
+ *  - already says this   → nothing is written (an untouched save is byte-identical),
+ *  - defined, changed    → only the value on the EFFECTIVE (last) line is rewritten,
+ *                          in that line's own spelling and sense,
+ *  - remove (value null) → EVERY definition goes; leaving an earlier one would
+ *                          silently keep the parameter set,
+ *  - not defined         → a canonical line is inserted after the section's last
+ *                          content line.
+ *
+ * Line indexes go stale the moment a removal splices the array, so the section
+ * overlay is recomputed before the insert scan — the insert must land inside
+ * THIS section, never in the next stanza (issue #36).
  */
 function applyEditsToSection(doc: SmbConfDoc, sectionName: string, edits: KeyEdit[], indent: string): void {
   const span = findSection(doc, sectionName)
   if (!span)
     return
+  const defs = sectionDefs(doc, span)
 
   const toInsert: string[] = []
   const removals: { first: number, last: number }[] = []
   const replacements: { line: number, value: string }[] = []
 
   for (const edit of edits) {
-    const loc = findKeyLine(doc, span, edit.norm)
+    const hits = paramHits(defs, edit.param)
+
     if (edit.value === null) {
-      if (loc)
-        removals.push(loc)
+      for (const hit of hits)
+        removals.push({ first: hit.def.first, last: hit.def.last })
       continue
     }
-    if (loc) {
-      // Rewrite the value on the key's first line; drop any continuation lines.
-      replacements.push({ line: loc.first, value: edit.value })
-      if (loc.last > loc.first)
-        removals.push({ first: loc.first + 1, last: loc.last })
+
+    const effective = hits.at(-1)
+    if (!effective) {
+      // Absent means Samba's own default. If that is already what was asked
+      // for, write nothing: a stanza that relies on the default keeps relying
+      // on it, and an untouched save stays byte-identical.
+      if (edit.param.unset !== undefined && sameValue(edit.kind, edit.param.unset, edit.value))
+        continue
+      toInsert.push(`${indent}${edit.param.canonical} = ${edit.value}`)
+      continue
     }
-    else {
-      toInsert.push(`${indent}${edit.canonical} = ${edit.value}`)
-    }
+
+    // Compare in this parameter's sense (`writeable = no` already says read-only).
+    const current = effective.inverted ? invertBool(effective.def.value) : effective.def.value
+    if (sameValue(edit.kind, current, edit.value))
+      continue
+
+    // Write in the line's own sense so the existing spelling keeps its meaning.
+    const written = effective.inverted ? invertBool(edit.value) : edit.value
+    replacements.push({ line: effective.def.first, value: written })
+    if (effective.def.last > effective.def.first)
+      removals.push({ first: effective.def.first + 1, last: effective.def.last })
   }
 
   // Apply value replacements (single-line, index-stable).
@@ -403,13 +531,18 @@ function applyEditsToSection(doc: SmbConfDoc, sectionName: string, edits: KeyEdi
     doc.lines[r.line] = replaceValue(doc.lines[r.line], r.value)
 
   // Apply removals bottom-up so indices stay valid.
-  removals.sort((a, b) => b.first - a.first)
-  for (const r of removals)
-    doc.lines.splice(r.first, r.last - r.first + 1)
+  if (removals.length > 0) {
+    removals.sort((a, b) => b.first - a.first)
+    for (const r of removals)
+      doc.lines.splice(r.first, r.last - r.first + 1)
+    reindexSections(doc) // every span past a removal moved
+  }
 
   // Insert new keys after the section's last content line (before trailing blanks).
   if (toInsert.length > 0) {
-    const fresh = findSection(doc, sectionName)! // indices shifted by removals
+    const fresh = findSection(doc, sectionName)
+    if (!fresh)
+      return // unreachable: a header line is never removed
     let insertAt = fresh.headerIndex !== null ? fresh.headerIndex + 1 : fresh.start
     for (let i = fresh.start; i < fresh.end; i++) {
       if (i === fresh.headerIndex)
@@ -424,24 +557,26 @@ function applyEditsToSection(doc: SmbConfDoc, sectionName: string, edits: KeyEdi
 /** Build the ordered key edits for the mutable SMB share fields present in `req`. */
 function shareEdits(req: UpdateSmbShareRequest | CreateSmbShareRequest): KeyEdit[] {
   const edits: KeyEdit[] = []
-  const push = (norm: string, canonical: string, value: string | null) => edits.push({ norm, canonical, value })
+  const push = (param: SmbParam, kind: KeyEdit['kind'], value: string | null) => edits.push({ param, kind, value })
 
   if ('path' in req && req.path !== undefined)
-    push('path', 'path', req.path)
+    push(PARAM.path, 'text', req.path)
+  // A blank comment is not a comment: remove the directive rather than litter
+  // the stanza with `comment = ` (the UI always sends the field — issue #42).
   if (req.comment !== undefined)
-    push('comment', 'comment', req.comment === null ? null : req.comment)
+    push(PARAM.comment, 'text', blankIsRemoval(req.comment))
   if (req.browseable !== undefined)
-    push('browseable', 'browseable', boolStr(req.browseable))
+    push(PARAM.browseable, 'bool', boolStr(req.browseable))
   if (req.readOnly !== undefined)
-    push('readonly', 'read only', boolStr(req.readOnly))
+    push(PARAM.readOnly, 'bool', boolStr(req.readOnly))
   if (req.guestOk !== undefined)
-    push('guestok', 'guest ok', boolStr(req.guestOk))
+    push(PARAM.guestOk, 'bool', boolStr(req.guestOk))
   if (req.validUsers !== undefined)
-    push('validusers', 'valid users', req.validUsers.length ? req.validUsers.join(' ') : null)
+    push(PARAM.validUsers, 'list', req.validUsers.length ? req.validUsers.join(' ') : null)
   if (req.hostsAllow !== undefined)
-    push('hostsallow', 'hosts allow', req.hostsAllow.length ? req.hostsAllow.join(' ') : null)
+    push(PARAM.hostsAllow, 'list', req.hostsAllow.length ? req.hostsAllow.join(' ') : null)
   if (req.hostsDeny !== undefined)
-    push('hostsdeny', 'hosts deny', req.hostsDeny.length ? req.hostsDeny.join(' ') : null)
+    push(PARAM.hostsDeny, 'list', req.hostsDeny.length ? req.hostsDeny.join(' ') : null)
 
   return edits
 }
@@ -449,21 +584,22 @@ function shareEdits(req: UpdateSmbShareRequest | CreateSmbShareRequest): KeyEdit
 /** Render a brand-new share stanza (no surrounding blank lines). */
 function renderStanza(req: CreateSmbShareRequest, indent: string): string {
   const lines = [`[${req.name}]`]
-  const add = (canonical: string, value: string) => lines.push(`${indent}${canonical} = ${value}`)
+  const add = (param: SmbParam, value: string) => lines.push(`${indent}${param.canonical} = ${value}`)
 
-  add('path', req.path)
-  if (req.comment !== undefined && req.comment !== null && req.comment !== '')
-    add('comment', req.comment)
+  add(PARAM.path, req.path)
+  const comment = blankIsRemoval(req.comment)
+  if (comment !== null)
+    add(PARAM.comment, comment)
   // Near-zero-typing defaults (DESIGN 5d): browseable=yes, read-only=no, guest=no.
-  add('browseable', boolStr(req.browseable ?? true))
-  add('read only', boolStr(req.readOnly ?? false))
-  add('guest ok', boolStr(req.guestOk ?? false))
+  add(PARAM.browseable, boolStr(req.browseable ?? true))
+  add(PARAM.readOnly, boolStr(req.readOnly ?? false))
+  add(PARAM.guestOk, boolStr(req.guestOk ?? false))
   if (req.validUsers && req.validUsers.length)
-    add('valid users', req.validUsers.join(' '))
+    add(PARAM.validUsers, req.validUsers.join(' '))
   if (req.hostsAllow && req.hostsAllow.length)
-    add('hosts allow', req.hostsAllow.join(' '))
+    add(PARAM.hostsAllow, req.hostsAllow.join(' '))
   if (req.hostsDeny && req.hostsDeny.length)
-    add('hosts deny', req.hostsDeny.join(' '))
+    add(PARAM.hostsDeny, req.hostsDeny.join(' '))
 
   return lines.join('\n')
 }
@@ -514,16 +650,18 @@ export function removeShare(text: string, name: string): string {
 /** Build the ordered key edits for the mutable `[global]` fields present in `req`. */
 function globalEdits(req: UpdateSmbGlobalConfigRequest): KeyEdit[] {
   const edits: KeyEdit[] = []
-  const push = (norm: string, canonical: string, value: string | null) => edits.push({ norm, canonical, value })
+  const push = (param: SmbParam, kind: KeyEdit['kind'], value: string | null) => edits.push({ param, kind, value })
 
+  // Blank means "not set" — remove the directive instead of writing an empty
+  // one, so saving an untouched stock config adds nothing (issue #42).
   if (req.workgroup !== undefined)
-    push('workgroup', 'workgroup', req.workgroup)
+    push(PARAM.workgroup, 'text', blankIsRemoval(req.workgroup))
   if (req.serverString !== undefined)
-    push('serverstring', 'server string', req.serverString)
+    push(PARAM.serverString, 'text', blankIsRemoval(req.serverString))
   if (req.interfaces !== undefined)
-    push('interfaces', 'interfaces', req.interfaces.length ? req.interfaces.join(' ') : null)
+    push(PARAM.interfaces, 'list', req.interfaces.length ? req.interfaces.join(' ') : null)
   if (req.bindInterfacesOnly !== undefined)
-    push('bindinterfacesonly', 'bind interfaces only', boolStr(req.bindInterfacesOnly))
+    push(PARAM.bindInterfacesOnly, 'bool', boolStr(req.bindInterfacesOnly))
 
   return edits
 }
@@ -540,6 +678,10 @@ export function updateGlobal(text: string, req: UpdateSmbGlobalConfigRequest): s
   let workingText = text
   let doc = parseDoc(workingText)
   if (!findSection(doc, 'global')) {
+    // Nothing to write (every field blank/empty) — do not conjure a [global]
+    // section just to delete directives that were never there.
+    if (edits.every(e => e.value === null))
+      return text
     // Prepend a [global] header (with a blank separator before existing content)
     // so the new keys have a home. Existing lines shift down, unchanged.
     workingText = text === '' ? '[global]\n' : `[global]\n\n${text}`
