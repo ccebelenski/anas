@@ -223,7 +223,14 @@ export const ReplicationRemote = z.object({
   port: z.number().int().min(1).max(65535).default(22),
   /** v1 connects as root (or the remote's admin); zfs-allow delegation later. */
   user: z.string().min(1).refine(s => !hasControlChars(s), 'Control characters are not allowed').default('root'),
-  /** Pinned SSH host-key fingerprint (SHA256:…), set on explicit confirm. */
+  /**
+   * Pinned SSH host-key fingerprint (SHA256:…), set on explicit confirm. The
+   * registry MIRRORS what is actually pinned in known_hosts: the test-connection
+   * route writes this field whenever a probe resolves the pinned fingerprint
+   * (pin, deliberate re-trust, or simply reading an already-pinned host), so the
+   * Remotes grid can show the real key instead of a permanent "not pinned".
+   * known_hosts stays the source of truth — this is the readable copy.
+   */
   hostKeyFingerprint: z.string().optional(),
 })
 export type ReplicationRemote = z.infer<typeof ReplicationRemote>
@@ -251,12 +258,32 @@ export type UpsertRemoteRequest = z.infer<typeof UpsertRemoteRequest>
 
 /** Diagnosing test-connection result — says WHAT failed, not just that it did. */
 export const RemoteTestResult = z.object({
-  /** How far the probe got. 'ok' = ssh + zfs both answered. */
-  stage: z.enum(['unreachable', 'hostkey-unknown', 'auth-failed', 'no-zfs', 'ok']),
+  /**
+   * How far the probe got. 'ok' = ssh + zfs both answered.
+   *
+   * 'hostkey-unknown' and 'hostkey-changed' are DIFFERENT facts and must stay
+   * distinct: nothing is pinned yet (first contact) versus the host now presents
+   * a key that is NOT the one we pinned. The second is the rebuilt/rekeyed
+   * remote — and, with the same evidence, what a machine-in-the-middle looks
+   * like — so it gets its own deliberate re-trust flow instead of being reported
+   * as a generic 'unreachable' the operator can only fix by hand-editing
+   * known_hosts.
+   */
+  stage: z.enum(['unreachable', 'hostkey-unknown', 'hostkey-changed', 'auth-failed', 'no-zfs', 'ok']),
   /** Remote's zfs version when stage === 'ok'. */
   zfsVersion: z.string().optional(),
-  /** The host-key fingerprint seen (for the explicit-confirm flow). */
+  /**
+   * The host-key fingerprint SEEN: the pinned one for a host we already trust,
+   * the freshly scanned one on 'hostkey-unknown' / 'hostkey-changed' (i.e. the
+   * key the host presents NOW — the one an explicit confirm would trust).
+   */
   fingerprint: z.string().optional(),
+  /**
+   * The fingerprint currently PINNED, on 'hostkey-changed' only. Paired with
+   * `fingerprint` (old vs new) so the re-trust confirmation can show both —
+   * re-trusting without showing what changed would defeat the pinning.
+   */
+  knownFingerprint: z.string().optional(),
   /** Human detail for the failure stages (stderr excerpt). */
   detail: z.string().optional(),
 })

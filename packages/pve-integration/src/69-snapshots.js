@@ -32,7 +32,11 @@
  *                                  status surface (parallel construction).
  *     detail = { schedule, lastRunResult, lastRunAt, nextRunAt, overdue,
  *                lastRunExitCode, unit, timer, journal? }
- *   PUT    /schedules/:id        → SnapshotSchedule body (edit / toggle, 202 job)
+ *   PUT    /schedules/:id        → SnapshotSchedule body (edit / toggle, 202 job).
+ *                                  The TARGET is immutable: the daemon rejects a
+ *                                  PUT that moves it (retarget = delete + create),
+ *                                  and this dialog never substitutes a stored
+ *                                  kind/pool that inventory failed to list.
  *   DELETE /schedules/:id        → removes the units only (never the snapshots)
  *   POST   /schedules/:id/run    → fire now: take + prune (202 job; result carries
  *                                  { taken, pruned[], skippedHeld[] })
@@ -53,7 +57,8 @@
  * 'anas-btn-sched-run' / 'anas-btn-sched-log' / 'anas-btn-sched-edit' /
  * 'anas-btn-sched-toggle' / 'anas-btn-sched-delete', dialog window
  * 'anas-win-sched', detail/log window 'anas-win-sched-detail' (body
- * 'anas-sched-detail', reload 'anas-btn-sched-detail-reload').
+ * 'anas-sched-detail', reload 'anas-btn-sched-detail-reload'), edit-guard
+ * blocked-Save note 'anas-edit-guard'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  * Fail-open everywhere: a broken view renders an error panel, never breaks PVE.
@@ -370,6 +375,10 @@
 
     ANAS.schedules = ANAS.schedules || {};
     ANAS.schedules.reload = loadSchedules;
+    // The schedule dialog's entry point, exposed so the edit-guard harness
+    // (test/edit-retarget.harness.mjs) can open a real edit against stubbed
+    // inventory. The view's own toolbar calls the local function directly.
+    ANAS.schedules.openDialog = openScheduleDialog;
 
     // ---- Selection + toolbar state -----------------------------------------
 
@@ -496,12 +505,91 @@
         );
     }
 
+    // A pool row for a combo store. `label` is what the operator reads, so a
+    // value inventory no longer lists can say so instead of silently looking
+    // like any other pick.
+    function poolRow(name, unavailable) {
+        return {
+            name: name,
+            label: unavailable ? (name + ' ' + UNAVAILABLE) : name,
+            unavailable: !!unavailable
+        };
+    }
+
     function poolComboStore(names) {
         var data = [];
         for (var i = 0; i < names.length; i++) {
-            data.push({ name: names[i] });
+            data.push(poolRow(names[i], false));
         }
-        return Ext.create('Ext.data.Store', { fields: ['name'], data: data });
+        return Ext.create('Ext.data.Store', { fields: ['name', 'label', 'unavailable'], data: data });
+    }
+
+    // ======================================================================
+    //  Edit guard — an edit dialog NEVER substitutes stored identity (#40)
+    // ======================================================================
+    //
+    // Both target inventories above are FAIL-OPEN: a failed or slow /pools or
+    // /ahr answers []. On a create that only costs an empty picker; on an EDIT
+    // it used to silently move the schedule — the filesystem kind flipped to
+    // whichever inventory did answer, and an AHR pool fell back to the first in
+    // the list. So the stored kind and pool stand no matter what came back, the
+    // missing value is shown marked "(unavailable)", and Save is BLOCKED with a
+    // named reason. The daemon backs this up: a PUT may not change a schedule's
+    // target at all (retarget = delete + create).
+    //
+    // NOTE: 65-replication.js carries these same edit-guard helpers for the
+    // task dialog (#39) — deliberately identical, since the rule is one rule.
+    // Their natural home is a shared ANAS.* helper in 10-api.js.
+
+    var UNAVAILABLE = t('(unavailable)');
+
+    function saveBlockReason(win) {
+        var blocks = win._saveBlocks || {};
+        var keys = Object.keys(blocks);
+        for (var i = 0; i < keys.length; i++) {
+            if (blocks[keys[i]]) {
+                return blocks[keys[i]];
+            }
+        }
+        return '';
+    }
+
+    // Disable Save and show WHY, in the dialog, in the operator's words.
+    function refreshSaveGate(win) {
+        var reason = saveBlockReason(win);
+        try {
+            var btn = win.down('#submit');
+            if (btn) {
+                btn.setDisabled(!!reason);
+            }
+            var note = win.down('#guardNote');
+            if (note) {
+                note.setHidden(!reason);
+                note.setHtml(reason
+                    ? '<div style="color:var(--anas-danger,#c23b2c);font-size:12px;">' + enc(reason) + '</div>'
+                    : '');
+            }
+        } catch (e) {
+            // Cosmetic only — submitSchedule re-checks the gate before it sends.
+        }
+    }
+
+    function blockSave(win, key, reason) {
+        win._saveBlocks = win._saveBlocks || {};
+        win._saveBlocks[key] = reason;
+        refreshSaveGate(win);
+    }
+
+    // The note the gate writes into, placed at the top of the dialog's form.
+    function guardNoteCfg() {
+        return {
+            xtype: 'component',
+            itemId: 'guardNote',
+            cls: 'anas-edit-guard',
+            hidden: true,
+            margin: '0 0 8 0',
+            html: ''
+        };
     }
 
     function valOf(win, sel) {
@@ -609,7 +697,10 @@
             }
             var zfsPools = r[0] || [];
             var ahrPools = r[1] || [];
-            if (!zfsPools.length && !ahrPools.length) {
+            // Nothing to point a NEW schedule at. An EDIT still opens: the
+            // schedule already has a target, and the dialog's job is then to say
+            // that the inventory is missing — not to disappear.
+            if (!zfsPools.length && !ahrPools.length && !existing) {
                 ANAS.toast(t('No ANAS-managed ZFS dataset or AHR pool is available to schedule.'));
                 return;
             }
@@ -631,14 +722,45 @@
         var kindData = [];
         if (zfsPools.length) { kindData.push({ kind: 'zfs', label: t('ZFS dataset') }); }
         if (ahrPools.length) { kindData.push({ kind: 'ahr', label: t('AHR pool') }); }
-        if (kindData.length && kindData.map(function (k) { return k.kind; }).indexOf(startKind) < 0) {
-            startKind = kindData[0].kind;
+        var kindKnown = kindData.map(function (k) { return k.kind; }).indexOf(startKind) >= 0;
+        // A missing KIND is a missing inventory, never a reason to switch
+        // filesystem: on edit the stored kind stays (with its own row, marked),
+        // and only a create falls back to whatever did answer.
+        var kindMissing = '';
+        if (!kindKnown) {
+            if (isEdit) {
+                kindMissing = startKind;
+                kindData.push({ kind: startKind,
+                    label: (startKind === 'ahr' ? t('AHR pool') : t('ZFS dataset')) + ' ' + UNAVAILABLE });
+            } else if (kindData.length) {
+                startKind = kindData[0].kind;
+            }
         }
 
-        var defaultZfsPool = (target.kind === 'zfs' && target.dataset)
-            ? target.dataset.split('/')[0] : (zfsPools[0] || '');
-        var defaultAhrPool = (target.kind === 'ahr' && target.pool && ahrPools.indexOf(target.pool) >= 0)
-            ? target.pool : (ahrPools[0] || '');
+        // Same rule for the pool itself: preserve, mark, and block — the ZFS
+        // branch already preserved its stored pool, and AHR now reads the same.
+        var zfsMissing = '';
+        var ahrMissing = '';
+        var defaultZfsPool;
+        var defaultAhrPool;
+        if (target.kind === 'zfs' && target.dataset) {
+            defaultZfsPool = target.dataset.split('/')[0];
+            if (isEdit && zfsPools.indexOf(defaultZfsPool) < 0) {
+                zfsMissing = defaultZfsPool;
+                zfsPoolStore.add(poolRow(defaultZfsPool, true));
+            }
+        } else {
+            defaultZfsPool = zfsPools[0] || '';
+        }
+        if (target.kind === 'ahr' && target.pool) {
+            defaultAhrPool = target.pool;
+            if (isEdit && ahrPools.indexOf(defaultAhrPool) < 0) {
+                ahrMissing = defaultAhrPool;
+                ahrPoolStore.add(poolRow(defaultAhrPool, true));
+            }
+        } else {
+            defaultAhrPool = ahrPools[0] || '';
+        }
 
         var startPreset = isEdit ? matchPreset(sched.retention || {}) : 'balanced';
 
@@ -660,6 +782,7 @@
                     scrollable: true,
                     defaults: { anchor: '100%', labelWidth: 150 },
                     items: [
+                        guardNoteCfg(),
                         {
                             xtype: 'textfield',
                             itemId: 'name',
@@ -709,7 +832,7 @@
                             fieldLabel: t('ZFS pool'),
                             store: zfsPoolStore,
                             valueField: 'name',
-                            displayField: 'name',
+                            displayField: 'label',
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -739,7 +862,7 @@
                             fieldLabel: t('AHR pool'),
                             store: ahrPoolStore,
                             valueField: 'name',
-                            displayField: 'name',
+                            displayField: 'label',
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -818,6 +941,7 @@
                     { text: t('Cancel'), handler: function () { win.close(); } },
                     {
                         text: isEdit ? t('Save') : t('Create'),
+                        itemId: 'submit',
                         cls: 'anas-btn-sched-submit',
                         handler: function () {
                             try {
@@ -905,6 +1029,25 @@
         }
 
         win.show();
+        // Inventory that came back without the schedule's own target blocks Save
+        // by name (#40) — the stored target stays on screen either way.
+        if (kindMissing) {
+            blockSave(win, 'targetKind', t('This schedule targets')
+                + ' ' + (kindMissing === 'ahr' ? t('an AHR pool') : t('a ZFS dataset'))
+                + ', ' + t('but no such filesystem was listed just now (the inventory may '
+                    + 'have failed to load). Saving is blocked so the schedule cannot be '
+                    + 'moved to a different filesystem — reload the view, or cancel.'));
+        }
+        if (zfsMissing) {
+            blockSave(win, 'zfsPool', t('ZFS pool') + ' "' + zfsMissing + '" '
+                + t('was not listed just now. Saving is blocked so this schedule cannot '
+                    + 'be moved to another pool — reload the view, or cancel.'));
+        }
+        if (ahrMissing) {
+            blockSave(win, 'ahrPool', t('AHR pool') + ' "' + ahrMissing + '" '
+                + t('was not listed just now. Saving is blocked so this schedule cannot '
+                    + 'be moved to another pool — reload the view, or cancel.'));
+        }
         applyKind(startKind);
         if (startKind === 'zfs') {
             loadZfsDatasets(defaultZfsPool,
@@ -924,6 +1067,13 @@
         var form = win.down('#form');
         var basicForm = form && form.getForm();
         if (basicForm && basicForm.isValid && !basicForm.isValid()) {
+            return;
+        }
+        // The edit guard has the last word: a blocked dialog sends NOTHING, even
+        // if the disabled button was somehow reached (#40).
+        var blocked = saveBlockReason(win);
+        if (blocked) {
+            ANAS.alertMsg('Cannot save', blocked);
             return;
         }
         var name = ('' + (valOf(win, '#name') || '')).trim();

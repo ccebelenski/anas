@@ -15,9 +15,15 @@
  *       A 409 CONFLICT on any write = the registry moved under us: reload +
  *       toast + re-prompt, NEVER blind-retry.
  *     POST   /replication/remotes/test       body {host,port?,user?}   (pre-registration)
- *     POST   /replication/remotes/:name/test  ?pin=true optional
- *       → { data:{ stage:'unreachable'|'hostkey-unknown'|'auth-failed'|'no-zfs'|'ok',
- *                  zfsVersion?, fingerprint?, detail? } }
+ *     POST   /replication/remotes/:name/test  ?pin=true / ?retrust=true optional
+ *       → { data:{ stage:'unreachable'|'hostkey-unknown'|'hostkey-changed'
+ *                        |'auth-failed'|'no-zfs'|'ok',
+ *                  zfsVersion?, fingerprint?, knownFingerprint?, detail? } }
+ *       'hostkey-changed' = the host presents a key that is NOT the pinned one
+ *       (rebuilt/rekeyed remote — or something else answering). It carries BOTH
+ *       fingerprints and is repaired only through the deliberate re-trust:
+ *       show pinned vs presented, confirm, then re-test with ?retrust=true,
+ *       which REPLACES the pinned key. Never automatic.
  *   Target locations:
  *     GET    /replication/locations          → { data:{ peers:string[], remotes:string[] } }
  *     GET    /replication/peers/:name/pools   → { data:string[] }
@@ -27,8 +33,10 @@
  *
  * Remotes test hooks: toolbar 'anas-btn-repl-remotes'; manager window
  * 'anas-win-repl-remotes'; add/edit wizard 'anas-win-repl-remote-edit' with
- * staged-test result area 'anas-remote-test'; location combo (both dialogs)
- * 'anas-fld-repl-location'.
+ * staged-test result area 'anas-remote-test', trust button
+ * 'anas-btn-remote-trust' and re-trust button 'anas-btn-remote-retrust';
+ * location combo (both dialogs) 'anas-fld-repl-location'; the edit guard's
+ * blocked-Save note 'anas-edit-guard'.
  *
  * A dedicated top-level "Replication" menu item (sibling of Pools / Datasets /
  * Shares). Replication is an ongoing, scheduled process with configuration and
@@ -54,7 +62,11 @@
  *              through PVE; 9.4. ABSENT = 'on-failure', the quiet default a task
  *              stored before the field reads back as) }
  *   POST   /replication/tasks            → ReplicationTask body (create)
- *   PUT    /replication/tasks/:name      → ReplicationTask body (edit / toggle)
+ *   PUT    /replication/tasks/:name      → ReplicationTask body (edit / toggle);
+ *                                          ?retarget=true when the edit MOVES the
+ *                                          source or target (the daemon refuses an
+ *                                          unflagged move — an edit dialog may
+ *                                          never substitute a stored endpoint)
  *   DELETE /replication/tasks/:name      → removes the schedule (units) only
  *   POST   /replication/tasks/:name/run  → { started: true }
  *
@@ -512,12 +524,97 @@
         );
     }
 
+    // A pool row for a combo store. `label` is what the operator reads, so a
+    // value inventory no longer lists can say so instead of silently looking
+    // like any other pick.
+    function poolRow(name, unavailable) {
+        return {
+            name: name,
+            label: unavailable ? (name + ' ' + UNAVAILABLE) : name,
+            unavailable: !!unavailable,
+        };
+    }
+
     function poolComboStore(names) {
         var data = [];
         for (var i = 0; i < names.length; i++) {
-            data.push({ name: names[i] });
+            data.push(poolRow(names[i], false));
         }
-        return Ext.create('Ext.data.Store', { fields: ['name'], data: data });
+        return Ext.create('Ext.data.Store', { fields: ['name', 'label', 'unavailable'], data: data });
+    }
+
+    // ======================================================================
+    //  Edit guard — an edit dialog NEVER substitutes stored identity (#39)
+    // ======================================================================
+    //
+    // A CREATE dialog may pick a sensible default. An EDIT dialog may not: when
+    // a stored pool or target location is missing from freshly-loaded inventory
+    // (a pool exported, a remote de-registered, an endpoint that answered with
+    // an empty list), falling back to the first row silently rewrites where the
+    // task reads from or writes to. So the stored value stays on screen marked
+    // "(unavailable)" and Save is BLOCKED with a named reason until the operator
+    // decides — and the daemon refuses an unflagged retarget regardless.
+    //
+    // NOTE: 69-snapshots.js carries these same edit-guard helpers for the
+    // schedule dialog (#40) — deliberately identical, since the rule is one
+    // rule. Their natural home is a shared ANAS.* helper in 10-api.js.
+
+    var UNAVAILABLE = t('(unavailable)');
+
+    function saveBlockReason(win) {
+        var blocks = win._saveBlocks || {};
+        var keys = Object.keys(blocks);
+        for (var i = 0; i < keys.length; i++) {
+            if (blocks[keys[i]]) {
+                return blocks[keys[i]];
+            }
+        }
+        return '';
+    }
+
+    // Disable Save and show WHY, in the dialog, in the operator's words.
+    function refreshSaveGate(win) {
+        var reason = saveBlockReason(win);
+        try {
+            var btn = win.down('#submit');
+            if (btn) {
+                btn.setDisabled(!!reason);
+            }
+            var note = win.down('#guardNote');
+            if (note) {
+                note.setHidden(!reason);
+                note.setHtml(reason
+                    ? '<div style="color:var(--anas-danger,#c23b2c);font-size:12px;">' + enc(reason) + '</div>'
+                    : '');
+            }
+        } catch (e) {
+            // Cosmetic only — submitTask re-checks the gate before it sends.
+        }
+    }
+
+    function blockSave(win, key, reason) {
+        win._saveBlocks = win._saveBlocks || {};
+        win._saveBlocks[key] = reason;
+        refreshSaveGate(win);
+    }
+
+    function unblockSave(win, key) {
+        if (win._saveBlocks) {
+            delete win._saveBlocks[key];
+        }
+        refreshSaveGate(win);
+    }
+
+    // The note the gate writes into, placed at the top of a dialog's form.
+    function guardNoteCfg() {
+        return {
+            xtype: 'component',
+            itemId: 'guardNote',
+            cls: 'anas-edit-guard',
+            hidden: true,
+            margin: '0 0 8 0',
+            html: '',
+        };
     }
 
     // ======================================================================
@@ -558,20 +655,29 @@
     }
 
     // Resolve the location currently selected in a dialog to { kind, name }.
+    // A value with no row in the store is UNRESOLVED, not local: it is flagged
+    // so a caller can refuse rather than quietly write a same-node target (the
+    // stored location's row is re-asserted on edit, so this is the safety net
+    // behind that, not the normal path).
     function selectedLocation(win) {
+        var value = '';
         try {
             var combo = win.down('#targetLocation');
             if (!combo) {
                 return { kind: 'local', name: '' };
             }
-            var rec = combo.getStore().findRecord('value', combo.getValue(), 0, false, false, true);
+            value = combo.getValue();
+            var rec = combo.getStore().findRecord('value', value, 0, false, false, true);
             if (rec) {
                 return { kind: rec.get('kind'), name: rec.get('name') };
             }
         } catch (e) {
-            // fall through to local
+            return { kind: 'local', name: '' };
         }
-        return { kind: 'local', name: '' };
+        if (!value || value === 'local') {
+            return { kind: 'local', name: '' };
+        }
+        return { kind: 'local', name: '', unresolved: '' + value };
     }
 
     // Resolve the target-pool candidates for a location. Local → ANAS pools;
@@ -615,10 +721,16 @@
     // known pool set stays a strict pick-list; an empty/failed list flips the
     // combo to free-text with a hint. Honours win._pendingTargetPool (an edit's
     // saved pool) as the preselection, once.
+    //
+    // The preselection is NEVER substituted (#39): a saved target pool the
+    // location no longer lists is kept, marked "(unavailable)", and blocks Save.
+    // Only when there is no preselection at all — a create, or the operator
+    // actively switching location — does the first pool become the default.
+    // Returns a promise that settles once the combo reflects the location.
     function applyLocationToPoolCombo(win, node, loc) {
         var combo = win.down('#targetPool');
         if (!combo) {
-            return;
+            return Promise.resolve();
         }
         var preselect = win._pendingTargetPool;
         win._pendingTargetPool = undefined;
@@ -628,7 +740,9 @@
             // non-fatal
         }
         setEmpty(combo, t('(loading pools…)'));
-        loadLocationPools(node, loc).then(function (r) {
+        // Hold Save while the list is in flight — the combo is empty right now.
+        blockSave(win, 'targetPool', t('Loading target pools…'));
+        return loadLocationPools(node, loc).then(function (r) {
             if (win.destroyed || win.destroying) {
                 return;
             }
@@ -636,7 +750,11 @@
                 var store = combo.getStore();
                 var data = [];
                 for (var i = 0; i < r.names.length; i++) {
-                    data.push({ name: r.names[i] });
+                    data.push(poolRow(r.names[i], false));
+                }
+                var missing = preselect && r.names.indexOf(preselect) < 0 ? preselect : '';
+                if (missing && !r.freeText) {
+                    data.push(poolRow(missing, true));
                 }
                 store.loadData(data);
                 if (r.freeText) {
@@ -651,11 +769,20 @@
                     combo.forceSelection = true;
                     combo.setEditable(false);
                     setEmpty(combo, '');
-                    var want = (preselect && r.names.indexOf(preselect) >= 0) ? preselect : (r.names[0] || '');
-                    combo.setValue(want);
+                    combo.setValue(missing || preselect || r.names[0] || '');
+                }
+                if (missing && !r.freeText) {
+                    blockSave(win, 'targetPool', t('Target pool') + ' "' + missing + '" '
+                        + t('is not in this location\'s pool list any more. Saving now would '
+                            + 'replicate somewhere else — pick a target deliberately, or cancel.'));
+                } else {
+                    unblockSave(win, 'targetPool');
                 }
             } catch (e) {
                 ANAS.warn('replication pool combo repopulate failed: ' + ANAS.errText(e));
+                // The combo is in an unknown state — keep Save shut, and say so.
+                blockSave(win, 'targetPool', t('The target pool list could not be built')
+                    + ': ' + ANAS.errText(e));
             }
         });
     }
@@ -663,12 +790,18 @@
     // Wire a location combo (already added to the form as '#targetLocation') and
     // load its rows. `onAfterApply` (optional) fires after each repopulation so
     // the once dialog can re-plan. On edit, pass preLoc/prePool to preselect.
+    //
+    // The picker is ASYNCHRONOUS, and that window used to be open: a Save issued
+    // before the locations answered wrote a LOCAL target over a remote task.
+    // Save is therefore blocked from the moment the dialog opens until the store
+    // has resolved AND the stored location has been re-asserted (#39).
     function wireLocationPicker(win, node, opts) {
         opts = opts || {};
         var combo = win.down('#targetLocation');
         if (!combo) {
             return;
         }
+        blockSave(win, 'location', t('Loading target locations…'));
         var apply = function () {
             applyLocationToPoolCombo(win, node, selectedLocation(win));
             if (opts.onAfterApply) {
@@ -685,9 +818,23 @@
                 return;
             }
             try {
-                combo.getStore().loadData(locationRows(locs));
+                var rows = locationRows(locs);
                 var preKey = opts.preLoc && opts.preLoc.kind && opts.preLoc.kind !== 'local'
                     ? locKey(opts.preLoc.kind, opts.preLoc.name) : 'local';
+                // A saved peer/remote that is no longer registered keeps its row
+                // — marked "(unavailable)" — so the dialog shows the truth and
+                // the value can never resolve to 'This node' behind the operator.
+                var known = false;
+                for (var i = 0; i < rows.length; i++) {
+                    if (rows[i].value === preKey) { known = true; break; }
+                }
+                var lost = '';
+                if (!known) {
+                    lost = opts.preLoc.kind + ': ' + (opts.preLoc.name || '');
+                    rows.push({ value: preKey, label: lost + ' ' + UNAVAILABLE,
+                        kind: opts.preLoc.kind, name: opts.preLoc.name });
+                }
+                combo.getStore().loadData(rows);
                 if (preKey !== 'local') {
                     // Preselect the saved remote/peer and its pool (edit path).
                     win._pendingTargetPool = opts.prePool;
@@ -697,8 +844,17 @@
                     // Local default: leave the pre-seeded ANAS pool list intact
                     // (the change handler above only re-applies on user action).
                 }
+                if (lost) {
+                    blockSave(win, 'location', t('Target location') + ' "' + lost + '" '
+                        + t('is not registered on this node any more. Saving now would '
+                            + 'replicate somewhere else — re-register it, pick another '
+                            + 'location deliberately, or cancel.'));
+                } else {
+                    unblockSave(win, 'location');
+                }
             } catch (e) {
                 ANAS.warn('replication location load failed: ' + ANAS.errText(e));
+                unblockSave(win, 'location');
             }
         });
     }
@@ -767,6 +923,8 @@
             'ok': { good: true, label: zfsVersion ? ('ok — zfs ' + zfsVersion) : 'ok',
                 title: zfsVersion ? (t('reachable; zfs') + ' ' + zfsVersion) : t('reachable') },
             'hostkey-unknown': { warn: true, label: t('host key?'), title: t('host key not confirmed') },
+            'hostkey-changed': { bad: true, label: t('host key changed'),
+                title: t('the host presents a different key than the one pinned') },
             'auth-failed': { bad: true, label: t('auth failed'), title: t('key not authorized on the remote yet') },
             'no-zfs': { warn: true, label: t('no zfs'), title: t('connected, but no zfs on the remote') },
             'unreachable': { bad: true, label: t('unreachable'), title: detail || t('unreachable') },
@@ -902,6 +1060,17 @@
                 rec.set('testStage', d.stage || 'unreachable');
                 rec.set('testDetail', d.detail || '');
                 rec.set('testZfs', d.zfsVersion || '');
+                // The probe resolves what is actually PINNED (the daemon mirrors
+                // it onto the registry row too) — show it now, not next reload.
+                // A key the operator has not trusted yet is NOT a pinned key.
+                if (d.fingerprint && d.stage !== 'hostkey-unknown' && d.stage !== 'hostkey-changed') {
+                    rec.set('fingerprint', d.fingerprint);
+                }
+                if (d.stage === 'hostkey-changed') {
+                    // The repair lives in the wizard, where both fingerprints fit.
+                    ANAS.toast(t('Host key changed for') + ' ' + name + ' — '
+                        + t('open Edit → Test connection to compare both fingerprints.'));
+                }
             },
             function (err) {
                 try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
@@ -1123,14 +1292,51 @@
 
     ANAS.replication = ANAS.replication || {};
     ANAS.replication.openRemotes = openRemotesManager;
+    // The task dialog's entry point, exposed so the edit-guard harness
+    // (test/edit-retarget.harness.mjs) can open a real edit against stubbed
+    // inventory. The view's own toolbar calls the local function directly.
+    ANAS.replication.openTaskDialog = openTaskDialog;
 
     // ======================================================================
     //  Add / edit remote wizard — 'anas-win-repl-remote-edit' (Build B)
     // ======================================================================
 
+    // One fingerprint, shown whole and monospaced — never truncated: an operator
+    // comparing it against the remote needs every character.
+    function fingerprintBox(fp) {
+        return '<div style="font-family:monospace;font-size:12px;margin:6px 0;padding:6px 8px;'
+            + 'background:rgba(127,127,127,0.1);border-radius:6px;word-break:break-all;">'
+            + enc(fp || t('(no fingerprint returned)')) + '</div>';
+    }
+
+    // The deliberate re-trust: a second, explicit yes that repeats BOTH
+    // fingerprints. Pinning only means something if replacing a pinned key takes
+    // a decision, so this is never folded into the ordinary Test button.
+    function confirmRetrust(win, node, data) {
+        try {
+            Ext.Msg.confirm(
+                t('Replace the pinned host key'),
+                enc(t('Replace the pinned key for this host?')) + '<br><br>'
+                    + enc(t('Pinned:')) + '<br><code>' + enc(data.knownFingerprint || '—') + '</code><br><br>'
+                    + enc(t('Presented now:')) + '<br><code>' + enc(data.fingerprint || '—') + '</code><br><br>'
+                    + enc(t('Only do this if you know the remote was rebuilt or rekeyed, and '
+                        + 'the new fingerprint matches what the remote itself reports. '
+                        + 'Afterwards ANAS trusts the new key for every replication to this host.')),
+                function (btn) {
+                    if (btn === 'yes') {
+                        runRemoteTest(win, node, { retrust: true });
+                    }
+                }
+            );
+        } catch (e) {
+            ANAS.warn('re-trust confirm failed: ' + ANAS.errText(e));
+        }
+    }
+
     // Render the staged Test-connection result into the '#testResult' area. On
     // 'hostkey-unknown' it shows the fingerprint prominently + a trust button
-    // that re-tests with ?pin=true, continuing the staged flow.
+    // that re-tests with ?pin=true; on 'hostkey-changed' it shows the pinned AND
+    // the presented fingerprint behind a separate, deliberate re-trust.
     function renderTestStage(win, node, data) {
         var area = win.down('#testResult');
         if (!area) {
@@ -1139,15 +1345,18 @@
         data = data || {};
         var stage = data.stage || 'unreachable';
         win._tested = (stage === 'ok');
+        // Remember what the probe found pinned, so a save can record it (the
+        // Host key column reads this) — never a not-yet-trusted key.
+        if (data.fingerprint && stage !== 'hostkey-unknown' && stage !== 'hostkey-changed') {
+            win._fingerprint = data.fingerprint;
+        }
         var items = [];
         if (stage === 'hostkey-unknown') {
             items.push({
                 xtype: 'component',
                 html: '<div style="color:var(--anas-warn,#b06a12);font-weight:600;">'
                     + enc(t('Unknown host key — confirm the fingerprint before trusting:')) + '</div>'
-                    + '<div style="font-family:monospace;font-size:12px;margin:6px 0;padding:6px 8px;'
-                    + 'background:rgba(127,127,127,0.1);border-radius:6px;word-break:break-all;">'
-                    + enc(data.fingerprint || t('(no fingerprint returned)')) + '</div>',
+                    + fingerprintBox(data.fingerprint),
             });
             items.push({
                 xtype: 'button',
@@ -1155,7 +1364,34 @@
                 text: t('Confirm & trust this host'),
                 iconCls: 'fa fa-check',
                 margin: '2 0 0 0',
-                handler: function () { runRemoteTest(win, node, true); },
+                handler: function () { runRemoteTest(win, node, { pin: true }); },
+            });
+        } else if (stage === 'hostkey-changed') {
+            // The remote answered with a key that is NOT the pinned one. Show
+            // both keys and say plainly what the two explanations are — pinning
+            // exists exactly for this moment, so the operator decides, not us.
+            items.push({
+                xtype: 'component',
+                html: '<div style="color:var(--anas-danger,#c23b2c);font-weight:600;">'
+                    + enc(t('The host key CHANGED — this connection is refused until you decide.')) + '</div>'
+                    + '<div style="font-size:12px;margin-top:4px;">' + enc(t('Pinned:')) + '</div>'
+                    + fingerprintBox(data.knownFingerprint)
+                    + '<div style="font-size:12px;">' + enc(t('Presented now:')) + '</div>'
+                    + fingerprintBox(data.fingerprint)
+                    + '<div style="font-size:12px;color:var(--anas-muted,gray);">'
+                    + enc(t('Expected if the remote was rebuilt or its SSH host keys were '
+                        + 'regenerated. If nothing like that happened, something else is '
+                        + 'answering on this address — verify the new fingerprint on the '
+                        + 'remote itself (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) '
+                        + 'before replacing the pinned key.')) + '</div>',
+            });
+            items.push({
+                xtype: 'button',
+                cls: 'anas-btn-remote-retrust',
+                text: t('Replace the pinned key…'),
+                iconCls: 'fa fa-exchange',
+                margin: '6 0 0 0',
+                handler: function () { confirmRetrust(win, node, data); },
             });
         } else if (stage === 'auth-failed') {
             items.push({
@@ -1214,8 +1450,10 @@
     }
 
     // Drive the pre-registration staged test with the values typed in the dialog.
-    // pin=true re-runs after the operator confirms an unknown host key.
-    function runRemoteTest(win, node, pin) {
+    // opts.pin re-runs after the operator confirms an unknown host key;
+    // opts.retrust after they confirm REPLACING a changed one.
+    function runRemoteTest(win, node, opts) {
+        opts = opts || {};
         var host = ('' + (valOf(win, '#host') || '')).trim();
         if (!host) {
             ANAS.alertMsg('Invalid input', t('Enter a host to test.'));
@@ -1225,7 +1463,8 @@
         if (isNaN(port) || port <= 0) { port = 22; }
         var user = ('' + (valOf(win, '#user') || 'root')).trim() || 'root';
         var body = { host: host, port: port, user: user };
-        var path = '/replication/remotes/test' + (pin ? '?pin=true' : '');
+        var path = '/replication/remotes/test'
+            + (opts.retrust ? '?retrust=true' : (opts.pin ? '?pin=true' : ''));
         setTestBusy(win);
         ANAS.api.post(node, path, body).then(function (res) {
             if (win.destroyed || win.destroying) {
@@ -1307,7 +1546,7 @@
                             iconCls: 'fa fa-plug',
                             margin: '4 0 0 0',
                             width: 150,
-                            handler: function () { runRemoteTest(win, node, false); },
+                            handler: function () { runRemoteTest(win, node, {}); },
                         },
                         {
                             xtype: 'container',
@@ -1350,6 +1589,9 @@
             ANAS.warn('remote edit window failed: ' + ANAS.errText(e));
             return;
         }
+        // The row as stored — its pinned fingerprint survives an edit that never
+        // re-tests (submitRemote re-sends it rather than dropping the field).
+        win._existing = r;
         win.show();
     }
 
@@ -1375,6 +1617,13 @@
         var user = ('' + (valOf(win, '#user') || 'root')).trim() || 'root';
 
         var remote = { name: name, host: host, port: port, user: user };
+        // Carry the pinned fingerprint: the one this dialog's test just resolved,
+        // else whatever the row already recorded. An edit must not blank it —
+        // that is what made the Host key column read "not pinned" forever.
+        var fingerprint = win._fingerprint || (win._existing && win._existing.hostKeyFingerprint);
+        if (fingerprint) {
+            remote.hostKeyFingerprint = fingerprint;
+        }
         var expectedVersion = mgrWin && mgrWin._registryVersion !== undefined ? mgrWin._registryVersion : 0;
         var body = { remote: remote, expectedVersion: expectedVersion };
 
@@ -1421,7 +1670,10 @@
             if (grid.destroyed || grid.destroying) {
                 return;
             }
-            if (!names.length) {
+            // Nothing to point a NEW task at. An EDIT still opens: the task
+            // already has its endpoints, and the dialog's job is then to say the
+            // pool list is missing — not to disappear (mirrors 69-snapshots.js).
+            if (!names.length && !isEdit) {
                 ANAS.toast(t('No ANAS-managed pool is available for replication.'));
                 return;
             }
@@ -1434,8 +1686,24 @@
         var tgtPoolStore = poolComboStore(names);
         var srcDsStore = Ext.create('Ext.data.Store', { fields: ['rel', 'label'], data: [] });
 
-        var defaultSrcPool = src.pool && names.indexOf(src.pool) >= 0 ? src.pool : names[0];
-        var defaultTgtPool = tgt.pool && names.indexOf(tgt.pool) >= 0 ? tgt.pool : names[0];
+        // Seed a pool combo WITHOUT substituting on edit (#39). On create the
+        // first pool is a fine default; on edit a stored pool the inventory no
+        // longer lists is kept as an "(unavailable)" row and reported so the
+        // caller can block Save.
+        var seedPool = function (stored, store) {
+            if (isEdit && stored) {
+                if (names.indexOf(stored) < 0) {
+                    store.add(poolRow(stored, true));
+                    return { value: stored, missing: stored };
+                }
+                return { value: stored, missing: '' };
+            }
+            return { value: (stored && names.indexOf(stored) >= 0) ? stored : names[0], missing: '' };
+        };
+        var srcSeed = seedPool(src.pool, srcPoolStore);
+        var tgtSeed = seedPool(tgt.pool, tgtPoolStore);
+        var defaultSrcPool = srcSeed.value;
+        var defaultTgtPool = tgtSeed.value;
 
         var win;
         try {
@@ -1454,6 +1722,7 @@
                     border: false,
                     defaults: { anchor: '100%', labelWidth: 150 },
                     items: [
+                        guardNoteCfg(),
                         {
                             xtype: 'textfield',
                             itemId: 'name',
@@ -1474,7 +1743,7 @@
                             fieldLabel: t('Source pool'),
                             store: srcPoolStore,
                             valueField: 'name',
-                            displayField: 'name',
+                            displayField: 'label',
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -1502,7 +1771,7 @@
                             fieldLabel: t('Target pool'),
                             store: tgtPoolStore,
                             valueField: 'name',
-                            displayField: 'name',
+                            displayField: 'label',
                             queryMode: 'local',
                             editable: false,
                             forceSelection: true,
@@ -1568,6 +1837,7 @@
                     },
                     {
                         text: isEdit ? t('Save') : t('Create'),
+                        itemId: 'submit',
                         cls: 'anas-btn-repl-task-submit',
                         handler: function () {
                             try {
@@ -1608,7 +1878,23 @@
             ANAS.warn('replication task wiring failed: ' + ANAS.errText(eWire));
         }
 
+        // What the task reads and writes TODAY — the yardstick submitTask uses to
+        // notice a retarget (and the daemon re-checks against the stored unit).
+        win._storedEndpoints = isEdit ? taskEndpoints(task) : null;
+
         win.show();
+        // A stored pool the inventory no longer lists blocks Save by name (#39).
+        if (srcSeed.missing) {
+            blockSave(win, 'sourcePool', t('Source pool') + ' "' + srcSeed.missing + '" '
+                + t('is not in this node\'s pool list any more (exported, or the pool '
+                    + 'list failed to load). Saving now would replicate a different '
+                    + 'dataset — fix the pool, or cancel.'));
+        }
+        if (tgtSeed.missing) {
+            blockSave(win, 'targetPool', t('Target pool') + ' "' + tgtSeed.missing + '" '
+                + t('is not in this node\'s pool list any more. Saving now would '
+                    + 'replicate somewhere else — pick a target deliberately, or cancel.'));
+        }
         // Initial dataset list — preselect the existing source dataset on edit.
         loadSrcDatasets(defaultSrcPool, isEdit ? (src.dataset || '') : undefined);
         // Target-location picker: default 'This node'; on edit, preselect the
@@ -1617,6 +1903,25 @@
             preLoc: isEdit ? tgt.location : null,
             prePool: isEdit ? tgt.pool : undefined,
         });
+    }
+
+    // A task's data identity — where it reads from and where it writes — as two
+    // comparable strings. Mirrors the daemon's own retarget check
+    // (routes/replication-tasks.ts), so both ends agree on what "moved" means.
+    function taskEndpoints(task) {
+        task = task || {};
+        var src = task.source || {};
+        var tgt = task.target || {};
+        var loc = tgt.location;
+        var where = loc && loc.kind && loc.kind !== 'local' ? (loc.kind + ':' + (loc.name || '')) : 'local';
+        var srcRel = src.dataset || '';
+        // Absent and empty are the same instruction ("the source's own relative
+        // path") — exactly the daemon's normalisation.
+        var tgtRel = tgt.dataset || srcRel;
+        return {
+            source: (src.pool || '') + (srcRel ? '/' + srcRel : ''),
+            target: where + ':' + (tgt.pool || '') + (tgtRel ? '/' + tgtRel : ''),
+        };
     }
 
     function valOf(win, sel) {
@@ -1632,6 +1937,13 @@
         var form = win.down('#form');
         var basicForm = form && form.getForm();
         if (basicForm && basicForm.isValid && !basicForm.isValid()) {
+            return;
+        }
+        // The edit guard has the last word: a blocked dialog sends NOTHING, even
+        // if the disabled button was somehow reached (#39).
+        var blocked = saveBlockReason(win);
+        if (blocked) {
+            ANAS.alertMsg('Cannot save', blocked);
             return;
         }
         var name = ('' + (valOf(win, '#name') || '')).trim();
@@ -1667,29 +1979,81 @@
             body.target.dataset = targetDataset;
         }
         var loc = selectedLocation(win);
+        if (loc.unresolved) {
+            // The combo holds a location with no row behind it — refuse rather
+            // than send a same-node target the operator never chose.
+            ANAS.alertMsg('Cannot save', t('The target location') + ' "' + loc.unresolved + '" '
+                + t('could not be resolved. Reopen the task once the peer or remote is '
+                    + 'reachable, or pick a location deliberately.'));
+            return;
+        }
         if (loc.kind === 'peer' || loc.kind === 'remote') {
             body.target.location = { kind: loc.kind, name: loc.name };
         }
 
-        // Create → POST; edit → PUT :name. The daemon may answer with a job
-        // (202 { job }) or a plain 200 — runJob handles both (a jobless response
-        // resolves straight to onComplete).
-        ANAS.runJob({
-            node: node,
-            method: isEdit ? 'put' : 'post',
-            path: isEdit ? ('/replication/tasks/' + encodeURIComponent(name)) : '/replication/tasks',
-            body: body,
-            view: win,
-            failTitle: isEdit ? 'Save failed' : 'Create failed',
-            successMsg: isEdit ? (t('Replication task saved') + ': ' + name)
-                : (t('Replication task created') + ': ' + name),
-            onComplete: function () {
-                if (!win.destroyed && !win.destroying) {
-                    win.close();
+        var send = function (retarget) {
+            // Create → POST; edit → PUT :name. The daemon may answer with a job
+            // (202 { job }) or a plain 200 — runJob handles both (a jobless
+            // response resolves straight to onComplete).
+            ANAS.runJob({
+                node: node,
+                method: isEdit ? 'put' : 'post',
+                path: isEdit
+                    ? ('/replication/tasks/' + encodeURIComponent(name) + (retarget ? '?retarget=true' : ''))
+                    : '/replication/tasks',
+                body: body,
+                view: win,
+                failTitle: isEdit ? 'Save failed' : 'Create failed',
+                successMsg: isEdit ? (t('Replication task saved') + ': ' + name)
+                    : (t('Replication task created') + ': ' + name),
+                onComplete: function () {
+                    if (!win.destroyed && !win.destroying) {
+                        win.close();
+                    }
+                    loadTasks(grid, node);
+                },
+            });
+        };
+
+        // A DELIBERATE retarget is allowed; a silent one is not. When the edit
+        // moves the source or the target, name the move and let the operator
+        // confirm — the daemon refuses the write without ?retarget=true anyway.
+        var moved = isEdit ? movedEndpoints(win._storedEndpoints, taskEndpoints(body)) : [];
+        if (!moved.length) {
+            send(false);
+            return;
+        }
+        try {
+            Ext.Msg.confirm(
+                t('Retarget replication task'),
+                t('This edit moves where the task replicates:') + '<br><br>'
+                    + moved.join('<br>') + '<br><br>'
+                    + t('Data already at the old target is left untouched; the next run '
+                        + 'replicates to the new one. Continue?'),
+                function (btn) {
+                    if (btn === 'yes') {
+                        send(true);
+                    }
                 }
-                loadTasks(grid, node);
-            },
-        });
+            );
+        } catch (e) {
+            ANAS.warn('retarget confirm failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // Which endpoints an edit moves, as readable "was → now" lines ([] = none).
+    function movedEndpoints(was, now) {
+        if (!was || !now) {
+            return [];
+        }
+        var lines = [];
+        if (was.source !== now.source) {
+            lines.push(enc(t('source') + ': ' + was.source + ' → ' + now.source));
+        }
+        if (was.target !== now.target) {
+            lines.push(enc(t('target') + ': ' + was.target + ' → ' + now.target));
+        }
+        return lines;
     }
 
     // ---- Run Now -----------------------------------------------------------

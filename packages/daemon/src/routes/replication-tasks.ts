@@ -8,6 +8,7 @@ import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import {
   collectTaskStatuses,
+  readTask,
   removeTaskUnits,
   resolveTaskDatasets,
   serviceUnitName,
@@ -103,15 +104,25 @@ export async function replicationTaskRoutes(
 
   /**
    * The shared create/update guards (reused from the stage-1 replicate handler):
-   * the schedule must be valid systemd calendar syntax, the target pool must
-   * exist and NOT be PVE-managed, and a task may not replicate a dataset onto
-   * itself. Sends the appropriate 4xx and returns false on the first failure.
+   * the schedule must be valid systemd calendar syntax, the SOURCE pool must
+   * exist, the target pool must exist and NOT be PVE-managed, and a task may not
+   * replicate a dataset onto itself. Sends the appropriate 4xx and returns false
+   * on the first failure.
    */
   async function guardTask(task: ReplicationTask, reply: FastifyReply): Promise<boolean> {
     const schedule = await validateSchedule(executor, task.schedule)
     if (!schedule.ok) {
       reply.code(400)
       reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid schedule '${task.schedule}': ${schedule.error}` } })
+      return false
+    }
+    // The SOURCE is always local (a task reads from this node and sends outward),
+    // so `zpool list` is authoritative for it exactly as it is for a local
+    // target. It was never checked: a task could be written pointing at a pool
+    // that does not exist, and only fail at 03:00 in a timer run.
+    if (!(await poolExists(task.source.pool))) {
+      reply.code(400)
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Source pool '${task.source.pool}' does not exist` } })
       return false
     }
     if (!(await poolExists(task.target.pool))) {
@@ -131,6 +142,25 @@ export async function replicationTaskRoutes(
       return false
     }
     return true
+  }
+
+  /**
+   * A task's DATA IDENTITY: what it reads and where it writes. Rendered as one
+   * comparable string so an edit can be checked against the stored task without
+   * caring about key order or an absent-vs-'local' location.
+   */
+  function endpoints(task: ReplicationTask): { source: string, target: string } {
+    const loc = task.target.location
+    const where = loc && loc.kind !== 'local' ? `${loc.kind}:${loc.name ?? ''}` : 'local'
+    const sourceRel = task.source.dataset || ''
+    // An absent and an empty target dataset are the SAME instruction ("the
+    // source's own relative path"), so they must compare equal — a round-trip
+    // through a client that drops the empty string is not a move.
+    const targetRel = task.target.dataset || sourceRel
+    return {
+      source: sourceRel ? `${task.source.pool}/${sourceRel}` : task.source.pool,
+      target: `${where}:${task.target.pool}${targetRel ? `/${targetRel}` : ''}`,
+    }
   }
 
   // --- GET /replication/tasks — derived statuses (read-only) ----------------
@@ -173,7 +203,14 @@ export async function replicationTaskRoutes(
   })
 
   // --- PUT /replication/tasks/:name — update / rewrite ----------------------
-  server.put<{ Params: { name: string } }>('/replication/tasks/:name', async (request, reply) => {
+  // A PUT that MOVES the task's source or target must say so: `?retarget=true`.
+  // Editing a schedule or a notify mode is routine; changing where the data
+  // comes from or goes is a different operation wearing the same clothes, and an
+  // edit dialog that silently substitutes a value it could not find in a
+  // freshly-loaded inventory would otherwise rewrite the destination without
+  // anyone deciding to. The flag is the CLIENT DECLARING INTENT, and it is
+  // opt-in so that a client which knows nothing about it cannot retarget at all.
+  server.put<{ Params: { name: string }, Querystring: { retarget?: string } }>('/replication/tasks/:name', async (request, reply) => {
     const nameParsed = ReplicationTaskName.safeParse(request.params.name)
     if (!nameParsed.success) {
       reply.code(400)
@@ -201,6 +238,29 @@ export async function replicationTaskRoutes(
     if (!(await taskFileExists(systemdDir, name))) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Replication task '${name}' not found` } }
+    }
+
+    // Retarget guard: compare against the STORED task, not against what the
+    // client believes it loaded. A unit file we cannot parse at all has no
+    // endpoints to preserve, so that PUT is a repair and passes through.
+    const stored = await readTask(systemdDir, name)
+    if (stored && request.query.retarget !== 'true') {
+      const was = endpoints(stored)
+      const now = endpoints(task)
+      const moved = [
+        ...(was.source !== now.source ? [`source ${was.source} → ${now.source}`] : []),
+        ...(was.target !== now.target ? [`target ${was.target} → ${now.target}`] : []),
+      ]
+      if (moved.length) {
+        reply.code(400)
+        return {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: `This edit would move replication task '${name}' (${moved.join('; ')}). `
+              + 'Retargeting changes where data is read from and written to — resend with ?retarget=true to confirm it is intended.',
+          },
+        }
+      }
     }
 
     if (!(await guardTask(task, reply)))

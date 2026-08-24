@@ -194,6 +194,68 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     assert.equal(unknown.statusCode, 404)
   })
 
+  // ==========================================================================
+  //  Target immutability (#40) — an edit changes POLICY, never the filesystem
+  // ==========================================================================
+  // Both target inventories the dialog reads are fail-open: a failed /pools or
+  // /ahr answers []. An edit dialog that then fell back to "the first thing that
+  // did answer" would repoint the schedule at a different filesystem. What a
+  // schedule snapshots is part of its identity, exactly like its id — so the
+  // daemon refuses to move it at all, however the request was built.
+
+  it('PUT that moves the target dataset → 400, units untouched', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/schedules/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/other' } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /targets zfs:testpool\/media/)
+    assert.match(res.json().error.message, /cannot move it to zfs:testpool\/other/)
+    assert.deepEqual(
+      parseServiceUnit(await readFile(join(dir, 'anas-snap-nightly-media.service'), 'utf-8'))?.target,
+      { kind: 'zfs', dataset: 'testpool/media' },
+    )
+  })
+
+  it('PUT that flips the filesystem KIND → 400 (the #40 substitution, refused at the API)', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/schedules/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...SCHEDULE, target: { kind: 'ahr', pool: 'vault' } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /cannot move it to ahr:vault/)
+  })
+
+  it('PUT keeping the same target still edits policy → 202', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/schedules/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...SCHEDULE, cadence: 'hourly', retention: { hourly: 24 } }),
+    })
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, res.json().job.id)
+    assert.equal(
+      parseServiceUnit(await readFile(join(dir, 'anas-snap-nightly-media.service'), 'utf-8'))?.cadence,
+      'hourly',
+    )
+  })
+
+  it('POST onto an AHR pool that live topology does not list → 400 (fail-open inventory never creates)', async () => {
+    // No mdstat/mdadm fixtures → readAhrPools sees nothing, exactly what the UI's
+    // fail-open loader would have shown as an empty list.
+    const res = await create({ ...SCHEDULE, id: 'ahr-sched', target: { kind: 'ahr', pool: 'vault' } })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /AHR pool 'vault' not found/)
+  })
+
   it('DELETE removes the units → 202; unknown → 404', async () => {
     await waitForJob(server, (await create()).json().job.id)
     const del = await server.inject({ method: 'DELETE', url: '/v1/schedules/nightly-media', headers: IDENTITY })

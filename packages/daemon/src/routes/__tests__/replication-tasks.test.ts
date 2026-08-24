@@ -150,6 +150,120 @@ describe('replication task routes (Epic 5.5.3)', () => {
     assert.match(res.json().error.message, /does not exist/)
   })
 
+  // The SOURCE was never validated (#39): a task could be stored reading from a
+  // pool that does not exist and only fail at 03:00, in a timer run nobody watches.
+  it('POST from a non-existent SOURCE pool → 400, naming the source', async () => {
+    const res = await create({ ...TASK, source: { pool: 'nopool', dataset: 'media' } })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /Source pool 'nopool' does not exist/)
+  })
+
+  it('PUT onto a non-existent SOURCE pool → 400 (the guard holds on edit too)', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/replication/tasks/nightly-media?retarget=true',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...TASK, source: { pool: 'nopool', dataset: 'media' } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /Source pool 'nopool' does not exist/)
+  })
+
+  // ==========================================================================
+  //  Retarget guard (#39) — an edit may not MOVE a task without saying so
+  // ==========================================================================
+  // A dialog that silently substitutes a pool it could not find in a
+  // freshly-loaded inventory would rewrite the destination with nobody deciding
+  // to. The daemon compares against the STORED unit, so the guard holds however
+  // the request was built; `?retarget=true` is the client declaring intent.
+
+  /** The task as the unit store holds it right now. */
+  async function stored() {
+    return parseServiceUnit(await readFile(join(dir, 'anas-repl-nightly-media.service'), 'utf-8'))
+  }
+
+  it('PUT that moves the TARGET without ?retarget=true → 400, unit untouched', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/replication/tasks/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...TASK, target: { pool: 'testpool', dataset: 'elsewhere' } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /would move replication task 'nightly-media'/)
+    assert.match(res.json().error.message, /target local:backup\/media → local:testpool\/elsewhere/)
+    assert.match(res.json().error.message, /\?retarget=true/)
+    // Nothing was written: the stored task still points where it did.
+    assert.deepEqual((await stored())?.target, { pool: 'backup', dataset: 'media' })
+  })
+
+  it('PUT that moves the SOURCE without ?retarget=true → 400, unit untouched', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/replication/tasks/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...TASK, source: { pool: 'testpool', dataset: 'other' } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /source testpool\/media → testpool\/other/)
+    assert.deepEqual((await stored())?.source, { pool: 'testpool', dataset: 'media' })
+  })
+
+  it('PUT that adds a REMOTE location without ?retarget=true → 400 (location is part of the target)', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/replication/tasks/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...TASK, target: { ...TASK.target, location: { kind: 'remote', name: 'nas1' } } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /target local:backup\/media → remote:nas1:backup\/media/)
+    assert.equal((await stored())?.target.location, undefined)
+  })
+
+  it('PUT with ?retarget=true performs the move — a deliberate retarget still works', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/replication/tasks/nightly-media?retarget=true',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...TASK, target: { pool: 'testpool', dataset: 'elsewhere' } }),
+    })
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, res.json().job.id)
+    assert.deepEqual((await stored())?.target, { pool: 'testpool', dataset: 'elsewhere' })
+  })
+
+  it('an edit that changes only policy needs no flag — and an absent target dataset is not a move', async () => {
+    await waitForJob(server, (await create()).json().job.id)
+    // Same endpoints, different schedule + notify: routine, unflagged, allowed.
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/replication/tasks/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...TASK, schedule: 'daily', notify: 'always', enabled: false }),
+    })
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, res.json().job.id)
+    assert.equal((await stored())?.notify, 'always')
+
+    // An OMITTED target dataset means "the source's own relative path" — for
+    // this task, exactly the 'media' it already stores. Same destination, so no
+    // flag is demanded: the guard tests where the data goes, not JSON shape.
+    const same = await server.inject({
+      method: 'PUT',
+      url: '/v1/replication/tasks/nightly-media',
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ ...TASK, target: { pool: 'backup' } }),
+    })
+    assert.equal(same.statusCode, 202)
+    await waitForJob(server, same.json().job.id)
+  })
+
   it('POST without identity → 401', async () => {
     const res = await server.inject({ method: 'POST', url: '/v1/replication/tasks', headers: { 'content-type': 'application/json' }, payload: JSON.stringify(TASK) })
     assert.equal(res.statusCode, 401)

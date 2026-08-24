@@ -28,7 +28,6 @@ const SSH_KEYSCAN = '/usr/bin/ssh-keyscan'
 
 const TRAILING_EQUALS_RE = /=+$/
 const WHITESPACE_RE = /\s+/
-const TRAILING_NEWLINES_RE = /\n+$/
 
 /** All the corosync-store paths — overridable for tests. */
 export interface RemotesPaths {
@@ -278,15 +277,37 @@ export async function scanHostKeys(executor: CommandExecutor, host: string, port
   return parseScan(r.stdout)
 }
 
+/** Does a known_hosts line's host field cover this host:port? */
+function lineMatchesHost(line: string, field: string): boolean {
+  const parts = line.trim().split(WHITESPACE_RE)
+  return parts.length >= 3 && parts[0].split(',').includes(field)
+}
+
+export interface PinOptions {
+  /**
+   * REPLACE this host's pinned line(s) instead of appending (deliberate
+   * re-trust after a key change). Append-only pinning is right for first
+   * contact — it can never quietly overwrite a trusted key — but it leaves a
+   * rebuilt/rekeyed remote unfixable from the UI: the stale line keeps failing
+   * verification forever. Replacement is therefore a SEPARATE, explicitly
+   * requested act (routes gate it behind the operator confirming old vs new
+   * fingerprints), never a side effect of an ordinary pin.
+   */
+  replace?: boolean
+}
+
 /**
- * Pin a host's key(s): scan, append every new line to our known_hosts, and
- * return the (preferred) fingerprint. Returns null when nothing was scanned.
+ * Pin a host's key(s): scan, write every new line into our known_hosts, and
+ * return the (preferred) fingerprint. Returns null when nothing was scanned
+ * (unreachable host / closed port) — and in that case known_hosts is left
+ * exactly as it was, so a failed scan can never un-trust a working remote.
  */
 export async function pinHostKey(
   executor: CommandExecutor,
   paths: RemotesPaths,
   host: string,
   port: number,
+  opts: PinOptions = {},
 ): Promise<string | null> {
   const keys = await scanHostKeys(executor, host, port)
   const chosen = preferredKey(keys)
@@ -300,11 +321,16 @@ export async function pinHostKey(
   catch {
     // First pin — no file yet.
   }
-  const have = new Set(existing.split('\n').map(l => l.trim()).filter(Boolean))
+  const field = knownHostField(host, port)
+  const previous = existing.split('\n').map(l => l.trim()).filter(Boolean)
+  // Re-trust drops every line that covers THIS host:port (and only those —
+  // other hosts' pins are untouched, as is anything we cannot parse).
+  const kept = opts.replace ? previous.filter(l => !lineMatchesHost(l, field)) : previous
+  const have = new Set(kept)
   const additions = keys.map(k => k.line).filter(l => !have.has(l))
-  if (additions.length) {
+  if (additions.length || kept.length !== previous.length) {
     await mkdir(dirname(paths.knownHostsFile), { recursive: true })
-    const body = `${[existing.replace(TRAILING_NEWLINES_RE, ''), ...additions].filter(Boolean).join('\n')}\n`
+    const body = `${[...kept, ...additions].join('\n')}\n`
     const tmp = join(dirname(paths.knownHostsFile), `.${basename(paths.knownHostsFile)}.anas.tmp`)
     await writeFile(tmp, body, { encoding: 'utf-8', mode: 0o600 })
     await rename(tmp, paths.knownHostsFile)

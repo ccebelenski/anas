@@ -31,6 +31,12 @@ import { requireIdentity } from './identity.js'
  *   GET    /v1/replication/remotes/:name/pools→ remote zpool names (fail-open [])
  *   GET    /v1/replication/peers/:name/pools  → peer zpool names (fail-open [])
  *
+ * Both probes take ?pin=true (trust a first-contact key) and ?retrust=true
+ * (REPLACE the pinned key of a host whose key changed — the rebuilt/rekeyed
+ * remote). They are separate flags on purpose: an ordinary pin can never
+ * overwrite an existing pin, and a re-trust is only ever sent after the operator
+ * has been shown the old and the new fingerprint.
+ *
  * Registry writes are COMPARE-AND-SWAP: the pre-check 409s on a stale version or
  * a duplicate name, and the write itself (inside the quick audit job, matching
  * the stage-2 pattern) re-CASes so a concurrent writer can never be clobbered.
@@ -49,6 +55,13 @@ export interface ReplicationRemotesRouteOptions {
 
 /** ssh stderr that indicates an AUTH failure (vs an unreachable host). */
 const AUTH_FAIL_RE = /permission denied|publickey|password|authentication/
+
+/**
+ * ssh stderr that means THE PINNED KEY NO LONGER MATCHES — the host answered,
+ * presented a host key, and it is not the one we trust. OpenSSH says this two
+ * ways depending on the key type and options; both are the same fact.
+ */
+const HOSTKEY_CHANGED_RE = /remote host identification has changed|host key verification failed/
 
 function CONFLICT(version: number) {
   return {
@@ -214,17 +227,41 @@ export async function replicationRemotesRoutes(
   )
 
   // --- Test-connection: staged diagnosis ------------------------------------
+  /** How a probe is allowed to touch the pinned host key. */
+  interface PinIntent {
+    /** Trust a host we have NOTHING pinned for yet (first contact). */
+    pin: boolean
+    /**
+     * REPLACE the pinned key for a host whose key CHANGED. Deliberate and
+     * separate from `pin`: the client asks for it only after the operator has
+     * been shown the old and the new fingerprint and confirmed. Never implied.
+     */
+    retrust: boolean
+  }
+
   /**
    * Probe a remote in three stages, reporting WHAT failed (RemoteTestResult):
    *   1) host key known to our known_hosts? if not → keyscan → 'hostkey-unknown'
    *      + fingerprint (the UI confirms → re-run with pin to trust it).
-   *   2) `ssh … true` → 'auth-failed' vs 'unreachable' (from stderr / exit).
+   *   2) `ssh … true` → 'auth-failed' vs 'unreachable' (from stderr / exit), or
+   *      'hostkey-changed' when ssh says the presented key is not the pinned one
+   *      (rebuilt/rekeyed remote — repairable through the explicit re-trust flow
+   *      rather than by hand-editing known_hosts).
    *   3) `ssh … zfs --version` → 'no-zfs' vs 'ok' + zfsVersion.
    */
-  async function diagnose(host: string, port: number, resolved: ResolvedRemote, pin: boolean): Promise<RemoteTestResult> {
+  async function diagnose(host: string, port: number, resolved: ResolvedRemote, intent: PinIntent): Promise<RemoteTestResult> {
     let known = await fingerprintOf(paths, host, port)
+    if (known && intent.retrust) {
+      // Deliberate re-trust: swap the stale pin for what the host presents now.
+      // A scan that comes back empty changes nothing (pinHostKey leaves the file
+      // alone), so a flaky network cannot silently un-trust a good remote.
+      const fp = await pinHostKey(executor, paths, host, port, { replace: true })
+      if (!fp)
+        return { stage: 'unreachable', detail: 'ssh-keyscan returned no host key (host unreachable or port closed)', knownFingerprint: known }
+      known = fp
+    }
     if (!known) {
-      if (pin) {
+      if (intent.pin || intent.retrust) {
         const fp = await pinHostKey(executor, paths, host, port)
         if (!fp)
           return { stage: 'unreachable', detail: 'ssh-keyscan returned no host key (host unreachable or port closed)' }
@@ -242,10 +279,25 @@ export async function replicationRemotesRoutes(
     const auth = await transport.sshExec(resolved, ['true'])
     if (auth.exitCode !== 0) {
       const err = (auth.stderr || '').toLowerCase()
+      const detail = auth.stderr.trim() || `ssh exited ${auth.exitCode}`
+      if (HOSTKEY_CHANGED_RE.test(err)) {
+        // The host answered with a key that is not ours. Report it as its own
+        // stage carrying BOTH fingerprints — pinned and presented — so the UI
+        // can ask for a real decision instead of showing a permanent
+        // 'unreachable' whose only cure is editing known_hosts by hand.
+        const keys = await scanHostKeys(executor, host, port)
+        const chosen = keys.find(k => k.keyType === 'ssh-ed25519') ?? keys[0]
+        return {
+          stage: 'hostkey-changed',
+          detail,
+          knownFingerprint: known,
+          ...(chosen ? { fingerprint: chosen.fingerprint } : {}),
+        }
+      }
       const authFailed = AUTH_FAIL_RE.test(err)
       return {
         stage: authFailed ? 'auth-failed' : 'unreachable',
-        detail: auth.stderr.trim() || `ssh exited ${auth.exitCode}`,
+        detail,
         ...(known ? { fingerprint: known } : {}),
       }
     }
@@ -262,6 +314,39 @@ export async function replicationRemotesRoutes(
     return { stage: 'ok', zfsVersion, ...(known ? { fingerprint: known } : {}) }
   }
 
+  /** The pin intent a test request carries (?pin=true / ?retrust=true). */
+  function pinIntent(query: { pin?: string, retrust?: string }): PinIntent {
+    return { pin: query.pin === 'true', retrust: query.retrust === 'true' }
+  }
+
+  /**
+   * Mirror the PINNED fingerprint onto the registry row so the Remotes grid can
+   * show the real key. known_hosts stays the source of truth; this is the
+   * readable copy, refreshed whenever a probe resolved what is actually pinned
+   * (the stages that report a not-yet-trusted key are excluded — nothing is
+   * pinned then). Best-effort by contract: a CAS conflict or write failure is
+   * swallowed, because a diagnostic probe must never fail on bookkeeping.
+   */
+  async function mirrorFingerprint(name: string, result: RemoteTestResult): Promise<void> {
+    if (!result.fingerprint || result.stage === 'hostkey-unknown' || result.stage === 'hostkey-changed')
+      return
+    try {
+      const reg = await readRemotes(paths)
+      const row = reg.remotes.find(r => r.name === name)
+      if (!row || row.hostKeyFingerprint === result.fingerprint)
+        return
+      await writeRemotes(
+        paths,
+        reg.version,
+        reg.remotes.map(r => (r.name === name ? { ...r, hostKeyFingerprint: result.fingerprint } : r)),
+      )
+    }
+    catch {
+      // Another node moved the registry, or the store is unwritable — the probe
+      // result is still correct and known_hosts is still authoritative.
+    }
+  }
+
   /** Fire-and-forget audit job for a test-connection probe (journald record). */
   function auditTest(identity: NonNullable<ReturnType<typeof requireIdentity>>, params: Record<string, unknown>, result: RemoteTestResult): void {
     jobQueue.submit(
@@ -272,7 +357,7 @@ export async function replicationRemotesRoutes(
   }
 
   // --- POST /replication/remotes/test — PRE-registration probe ---------------
-  server.post<{ Querystring: { pin?: string } }>('/replication/remotes/test', async (request, reply) => {
+  server.post<{ Querystring: { pin?: string, retrust?: string } }>('/replication/remotes/test', async (request, reply) => {
     const body = (request.body ?? {}) as { host?: unknown, port?: unknown, user?: unknown }
     if (typeof body.host !== 'string' || !body.host) {
       reply.code(400)
@@ -289,15 +374,15 @@ export async function replicationRemotesRoutes(
     if (!identity)
       return
 
-    const pin = request.query.pin === 'true'
+    const intent = pinIntent(request.query)
     const resolved = resolvedRemoteFields(paths, body.host, port, user)
-    const result = await diagnose(body.host, port, resolved, pin)
-    auditTest(identity, { host: body.host, port, user, pin }, result)
+    const result = await diagnose(body.host, port, resolved, intent)
+    auditTest(identity, { host: body.host, port, user, ...intent }, result)
     return { data: result }
   })
 
   // --- POST /replication/remotes/:name/test — registered-remote probe --------
-  server.post<{ Params: { name: string }, Querystring: { pin?: string } }>(
+  server.post<{ Params: { name: string }, Querystring: { pin?: string, retrust?: string } }>(
     '/replication/remotes/:name/test',
     async (request, reply) => {
       const nameParsed = ReplicationTaskName.safeParse(request.params.name)
@@ -318,10 +403,11 @@ export async function replicationRemotesRoutes(
         return { error: { code: 'NOT_FOUND', message: `Remote '${name}' not found` } }
       }
 
-      const pin = request.query.pin === 'true'
+      const intent = pinIntent(request.query)
       const resolved = resolvedRemoteFields(paths, remote.host, remote.port, remote.user)
-      const result = await diagnose(remote.host, remote.port, resolved, pin)
-      auditTest(identity, { remote: name, pin }, result)
+      const result = await diagnose(remote.host, remote.port, resolved, intent)
+      await mirrorFingerprint(name, result)
+      auditTest(identity, { remote: name, ...intent }, result)
       return { data: result }
     },
   )

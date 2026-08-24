@@ -30,7 +30,8 @@ const ZPOOL = '/usr/sbin/zpool'
  *   GET    /v1/schedules            → derived statuses (systemd + the store)
  *   POST   /v1/schedules            → create (write units, enable timer)
  *   GET    /v1/schedules/:id        → one schedule
- *   PUT    /v1/schedules/:id        → update/rewrite (incl. toggle enabled)
+ *   PUT    /v1/schedules/:id        → update/rewrite (incl. toggle enabled); the
+ *                                     TARGET is immutable — retarget = delete + create
  *   DELETE /v1/schedules/:id        → remove units (NEVER touches snapshots)
  *   POST   /v1/schedules/:id/run    → fire now: take + prune (the timer's own path)
  *
@@ -118,6 +119,14 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       return false
     }
     return true
+  }
+
+  /**
+   * A target rendered as one comparable string ('zfs:tank/media' / 'ahr:media')
+   * — what the schedule actually snapshots, independent of key order.
+   */
+  function targetKey(target: SnapshotTarget): string {
+    return target.kind === 'zfs' ? `zfs:${target.dataset}` : `ahr:${target.pool}`
   }
 
   /** Fire a schedule once: take a snapshot into its cadence bucket, then prune. */
@@ -224,6 +233,26 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     if (!(await scheduleFileExists(systemdDir, id))) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Snapshot schedule '${id}' not found` } }
+    }
+
+    // The TARGET is part of a schedule's identity, exactly like its id: what it
+    // snapshots is what it IS. An in-place edit changes policy — cadence,
+    // retention, notify, enabled — never the filesystem underneath. Repointing
+    // is delete + create, which the UI already assumes (the target fields are
+    // read-only on edit), so enforcing it here costs nothing and closes the
+    // whole class: a dialog that fell back to the first pool of a
+    // fail-open-empty inventory can no longer rewrite a schedule onto a
+    // different filesystem.
+    const stored = await readSchedule(systemdDir, id)
+    if (stored && targetKey(stored.target) !== targetKey(schedule.target)) {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: `Snapshot schedule '${id}' targets ${targetKey(stored.target)}; an edit cannot move it to `
+            + `${targetKey(schedule.target)} — delete the schedule and create one for the new target`,
+        },
+      }
     }
     if (!(await guardTarget(schedule.target, reply)))
       return reply

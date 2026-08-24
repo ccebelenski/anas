@@ -3,7 +3,7 @@ import type { MockExecutor } from '../../executor/mock.js'
 import type { RemotesPaths } from '../../services/replication-remotes.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -22,6 +22,8 @@ const IDENTITY = {
 const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }
 
 const ED_BLOB = 'AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExamp1'
+/** A DIFFERENT host key — the one a rebuilt/rekeyed remote presents. */
+const NEW_BLOB = 'AAAAC3NzaC1lZDI1NTE5AAAAIRebuiltRebuiltRebuiltRebuiltRebuiltReb2'
 
 const REMOTE = { name: 'nas1', host: '10.0.0.9', port: 22, user: 'root' }
 
@@ -233,7 +235,7 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
     assert.equal(noZfsRes.json().data.stage, 'no-zfs')
   })
 
-  it('named-remote test (:name/test) probes the registered remote → ok', async () => {
+  it('named-remote test (:name/test) probes the registered remote → ok, and MIRRORS the pinned fingerprint', async () => {
     await createRemote(0)
     const mock = mockOf(server)
     await writeFile(paths.knownHostsFile, `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, 'utf-8')
@@ -241,6 +243,85 @@ describe('replication remotes routes (Epic 5.5.2)', () => {
     sshFix(mock, ['zfs', '--version'], { stdout: 'zfs-2.2.0\n', stderr: '', exitCode: 0 })
     const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/nas1/test', headers: JSON_HEADERS, payload: '{}' })
     assert.equal(res.json().data.stage, 'ok')
+    // hostKeyFingerprint was never written by any daemon code, so the Remotes
+    // grid's Host key column said "not pinned" forever. The probe now records
+    // what known_hosts actually holds.
+    const { data } = (await server.inject({ method: 'GET', url: '/v1/replication/remotes', headers: IDENTITY })).json()
+    assert.equal(data.remotes[0].hostKeyFingerprint, fingerprintFromBlob(ED_BLOB))
+  })
+
+  // --- rekeyed remote: its own stage, and a deliberate re-trust --------------
+  // A rebuilt/rekeyed remote used to report 'unreachable' forever: pinning is
+  // append-only, so the stale line kept failing verification and the only repair
+  // was hand-editing known_hosts.
+
+  /** ssh's answer when the presented host key is not the pinned one. */
+  const CHANGED_STDERR = '@@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@@\n'
+    + 'Host key verification failed.'
+
+  it('a rekeyed host reports hostkey-changed with BOTH fingerprints, and pins nothing', async () => {
+    const mock = mockOf(server)
+    await writeFile(paths.knownHostsFile, `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, 'utf-8')
+    mock.addFixture({ command: SSH_KEYSCAN, args: ['-p', '22', '--', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${NEW_BLOB}\n`, stderr: '', exitCode: 0 } })
+    sshFix(mock, ['true'], { stdout: '', stderr: CHANGED_STDERR, exitCode: 255 })
+
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })
+    const { data } = res.json()
+    assert.equal(data.stage, 'hostkey-changed')
+    // Distinct from 'hostkey-unknown' (nothing pinned) and from 'unreachable'.
+    assert.equal(data.knownFingerprint, fingerprintFromBlob(ED_BLOB), 'the key we pinned')
+    assert.equal(data.fingerprint, fingerprintFromBlob(NEW_BLOB), 'the key the host presents now')
+    // Diagnosing must never trust: known_hosts is byte-for-byte unchanged.
+    assert.equal(await readFile(paths.knownHostsFile, 'utf-8'), `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`)
+  })
+
+  it('an ordinary ?pin=true never overwrites an existing pin', async () => {
+    const mock = mockOf(server)
+    await writeFile(paths.knownHostsFile, `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, 'utf-8')
+    mock.addFixture({ command: SSH_KEYSCAN, args: ['-p', '22', '--', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${NEW_BLOB}\n`, stderr: '', exitCode: 0 } })
+    sshFix(mock, ['true'], { stdout: '', stderr: CHANGED_STDERR, exitCode: 255 })
+
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test?pin=true', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })
+    assert.equal(res.json().data.stage, 'hostkey-changed')
+    assert.equal(await readFile(paths.knownHostsFile, 'utf-8'), `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`)
+  })
+
+  it('?retrust=true REPLACES the pinned key (other hosts untouched) and the probe then completes', async () => {
+    await createRemote(0)
+    const mock = mockOf(server)
+    await writeFile(
+      paths.knownHostsFile,
+      `other.example ssh-ed25519 ${ED_BLOB}\n${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`,
+      'utf-8',
+    )
+    mock.addFixture({ command: SSH_KEYSCAN, args: ['-p', '22', '--', REMOTE.host], result: { stdout: `${REMOTE.host} ssh-ed25519 ${NEW_BLOB}\n`, stderr: '', exitCode: 0 } })
+    sshFix(mock, ['true'], { stdout: '', stderr: '', exitCode: 0 })
+    sshFix(mock, ['zfs', '--version'], { stdout: 'zfs-2.2.3\n', stderr: '', exitCode: 0 })
+
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/nas1/test?retrust=true', headers: JSON_HEADERS, payload: '{}' })
+    const { data } = res.json()
+    assert.equal(data.stage, 'ok')
+    assert.equal(data.fingerprint, fingerprintFromBlob(NEW_BLOB))
+
+    const known = await readFile(paths.knownHostsFile, 'utf-8')
+    assert.ok(known.includes(`${REMOTE.host} ssh-ed25519 ${NEW_BLOB}`), 'the new key is pinned')
+    assert.ok(!known.includes(`${REMOTE.host} ssh-ed25519 ${ED_BLOB}`), 'the stale key is gone — replaced, not appended')
+    assert.ok(known.includes(`other.example ssh-ed25519 ${ED_BLOB}`), 'another host\'s pin is untouched')
+
+    // And the registry now shows the key the grid should display.
+    const reg = (await server.inject({ method: 'GET', url: '/v1/replication/remotes', headers: IDENTITY })).json()
+    assert.equal(reg.data.remotes[0].hostKeyFingerprint, fingerprintFromBlob(NEW_BLOB))
+  })
+
+  it('a re-trust whose keyscan comes back empty changes nothing — a flaky network cannot un-trust a host', async () => {
+    const mock = mockOf(server)
+    await writeFile(paths.knownHostsFile, `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`, 'utf-8')
+    mock.addFixture({ command: SSH_KEYSCAN, args: ['-p', '22', '--', REMOTE.host], result: { stdout: '', stderr: 'timed out', exitCode: 1 } })
+
+    const res = await server.inject({ method: 'POST', url: '/v1/replication/remotes/test?retrust=true', headers: JSON_HEADERS, payload: JSON.stringify({ host: REMOTE.host }) })
+    assert.equal(res.json().data.stage, 'unreachable')
+    assert.equal(res.json().data.knownFingerprint, fingerprintFromBlob(ED_BLOB))
+    assert.equal(await readFile(paths.knownHostsFile, 'utf-8'), `${REMOTE.host} ssh-ed25519 ${ED_BLOB}\n`)
   })
 
   // --- locations + pool pickers ---------------------------------------------
