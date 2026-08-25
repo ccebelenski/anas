@@ -1,0 +1,211 @@
+D core
+D core/fileio_1
+D core/fileio_1/gtiscsi_lun2
+D core/fileio_1/gtiscsi_lun2/action
+F core/fileio_1/gtiscsi_lun2/alias = 
+F core/fileio_1/gtiscsi_lun2/alua_lu_gp = LU Group Alias: default_lu_gp\nLU Group ID: 0
+D core/fileio_1/gtiscsi_lun2/attrib
+F core/fileio_1/gtiscsi_lun2/attrib/alua_support = 1
+F core/fileio_1/gtiscsi_lun2/attrib/atomic_alignment = 0
+F core/fileio_1/gtiscsi_lun2/attrib/atomic_granularity = 0
+F core/fileio_1/gtiscsi_lun2/attrib/atomic_max_boundary = 0
+F core/fileio_1/gtiscsi_lun2/attrib/atomic_max_len = 0
+F core/fileio_1/gtiscsi_lun2/attrib/atomic_max_with_boundary = 0
+F core/fileio_1/gtiscsi_lun2/attrib/block_size = 512
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_3pc = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_caw = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_dpo = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_fua_read = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_fua_write = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_model_alias = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_pr = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_rest_reord = 0
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_rsoc = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_tas = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_tpu = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_tpws = 1
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_ua_intlck_ctrl = 0
+F core/fileio_1/gtiscsi_lun2/attrib/emulate_write_cache = 0
+F core/fileio_1/gtiscsi_lun2/attrib/enforce_pr_isids = 1
+F core/fileio_1/gtiscsi_lun2/attrib/force_pr_aptpl = 0
+F core/fileio_1/gtiscsi_lun2/attrib/hw_block_size = 512
+F core/fileio_1/gtiscsi_lun2/attrib/hw_max_sectors = 16384
+F core/fileio_1/gtiscsi_lun2/attrib/hw_pi_prot_type = 0
+F core/fileio_1/gtiscsi_lun2/attrib/hw_queue_depth = 128
+F core/fileio_1/gtiscsi_lun2/attrib/is_nonrot = 0
+F core/fileio_1/gtiscsi_lun2/attrib/max_unmap_block_desc_count = 1
+F core/fileio_1/gtiscsi_lun2/attrib/max_unmap_lba_count = 262144
+F core/fileio_1/gtiscsi_lun2/attrib/max_write_same_len = 4096
+F core/fileio_1/gtiscsi_lun2/attrib/optimal_sectors = 16384
+F core/fileio_1/gtiscsi_lun2/attrib/pgr_support = 1
+F core/fileio_1/gtiscsi_lun2/attrib/pi_prot_format = 0
+F core/fileio_1/gtiscsi_lun2/attrib/pi_prot_type = 0
+F core/fileio_1/gtiscsi_lun2/attrib/pi_prot_verify = 0
+F core/fileio_1/gtiscsi_lun2/attrib/queue_depth = 128
+F core/fileio_1/gtiscsi_lun2/attrib/submit_type = 0
+F core/fileio_1/gtiscsi_lun2/attrib/unmap_granularity = 1
+F core/fileio_1/gtiscsi_lun2/attrib/unmap_granularity_alignment = 0
+F core/fileio_1/gtiscsi_lun2/attrib/unmap_zeroes_data = 0
+F core/fileio_1/gtiscsi_lun2/control = 
+F core/fileio_1/gtiscsi_lun2/enable = 1
+F core/fileio_1/gtiscsi_lun2/info = Status: ACTIVATED  Max Queue Depth: 128  SectorSize: 512  HwMaxSectors: 16384\n        TCM FILEIO ID: 0        File: /gtiscsi/images/lun2.raw  Size: 1073741824  Mode: O_DSYNC Async: 0
+F core/fileio_1/gtiscsi_lun2/lba_map = 
+F core/fileio_1/gtiscsi_lun2/udev_path = /gtiscsi/images/lun2.raw
+D core/fileio_1/gtiscsi_lun2/wwn
+F core/fileio_1/gtiscsi_lun2/wwn/company_id = 0x001405
+F core/fileio_1/gtiscsi_lun2/wwn/pd_text_id_info = 
+F core/fileio_1/gtiscsi_lun2/wwn/product_id = gtiscsi_lun2
+F core/fileio_1/gtiscsi_lun2/wwn/revision = 4.0
+F core/fileio_1/gtiscsi_lun2/wwn/vendor_id = LIO-ORG
+F core/fileio_1/gtiscsi_lun2/wwn/vpd_assoc_logical_unit = 
+F core/fileio_1/gtiscsi_lun2/wwn/vpd_assoc_scsi_target_device = 
+F core/fileio_1/gtiscsi_lun2/wwn/vpd_assoc_target_port = 
+F core/fileio_1/gtiscsi_lun2/wwn/vpd_protocol_identifier = 
+F core/fileio_1/gtiscsi_lun2/wwn/vpd_unit_serial = T10 VPD Unit Serial Number: 689844a4-1d20-4cba-8516-bdc52a402645
+F core/fileio_1/hba_info = HBA Index: 2 plugin: fileio version: v5.0
+F core/fileio_1/hba_mode = 0
+F dbroot = /etc/rtslib-fb-target
+D iscsi
+F iscsi/cpus_allowed_list = 0-3
+D iscsi/discovery_auth
+F iscsi/discovery_auth/authenticate_target = 0
+F iscsi/discovery_auth/enforce_discovery_auth = 0
+F iscsi/discovery_auth/password = NULL
+F iscsi/discovery_auth/password_mutual = NULL
+F iscsi/discovery_auth/userid = NULL
+F iscsi/discovery_auth/userid_mutual = NULL
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/param
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/param/cmd_completion_affinity = -1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/param/default_submit_type = 1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/param/direct_submit_supported = 1
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib/authentication = -1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib/dataout_timeout = 3
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib/dataout_timeout_retries = 5
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib/default_erl = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib/nopin_response_timeout = 30
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib/nopin_timeout = 15
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib/random_datain_pdu_offsets = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib/random_datain_seq_offsets = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/attrib/random_r2t_offsets = 0
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/auth
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/auth/authenticate_target = 1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/auth/password = REDACTED-16char
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/auth/password_mutual = REDACTED-16char
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/auth/userid = gtacluser
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/auth/userid_mutual = gttargetuser
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/cmdsn_depth = 64
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/info = No active iSCSI Session for Initiator Endpoint: iqn.1993-08.org.debian:01:ae3d2ec18ad
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/lun_1
+L iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/lun_1/f1319608a8 -> ../../../../../../../target/iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/lun/lun_1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/lun_1/write_protect = 0
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/DataPDUInOrder = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/DataSequenceInOrder = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/DefaultTime2Retain = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/DefaultTime2Wait = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/ErrorRecoveryLevel = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/FirstBurstLength = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/ImmediateData = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/InitialR2T = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/MaxBurstLength = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/MaxConnections = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/param/MaxOutstandingR2T = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.1993-08.org.debian:01:ae3d2ec18ad/tag = 
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib/authentication = -1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib/dataout_timeout = 3
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib/dataout_timeout_retries = 5
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib/default_erl = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib/nopin_response_timeout = 30
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib/nopin_timeout = 15
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib/random_datain_pdu_offsets = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib/random_datain_seq_offsets = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/attrib/random_r2t_offsets = 0
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/auth
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/auth/authenticate_target = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/auth/password = 
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/auth/password_mutual = 
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/auth/userid = 
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/auth/userid_mutual = 
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/cmdsn_depth = 64
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/info = No active iSCSI Session for Initiator Endpoint: iqn.2026-08.dev.anas.gtiscsi:allowed2
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/lun_1
+L iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/lun_1/eae6c94ddb -> ../../../../../../../target/iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/lun/lun_1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/lun_1/write_protect = 0
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/DataPDUInOrder = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/DataSequenceInOrder = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/DefaultTime2Retain = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/DefaultTime2Wait = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/ErrorRecoveryLevel = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/FirstBurstLength = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/ImmediateData = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/InitialR2T = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/MaxBurstLength = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/MaxConnections = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/param/MaxOutstandingR2T = No Active iSCSI Session
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/acls/iqn.2026-08.dev.anas.gtiscsi:allowed2/tag = 
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/authentication = 1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/cache_dynamic_acls = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/default_cmdsn_depth = 64
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/default_erl = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/demo_mode_discovery = 1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/demo_mode_write_protect = 1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/fabric_prot_type = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/generate_node_acls = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/login_keys_workaround = 1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/login_timeout = 15
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/prod_mode_write_protect = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/t10_pi = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/attrib/tpg_enabled_sendtargets = 1
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/auth
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/auth/authenticate_target = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/auth/password = REDACTED-16char
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/auth/password_mutual = 
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/auth/userid = gtiscsiuser
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/auth/userid_mutual = 
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/dynamic_sessions = 
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/enable = 1
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/lun
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/lun/lun_1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/lun/lun_1/alua_tg_pt_gp = TG Port Alias: default_tg_pt_gp\nTG Port Group ID: 0\nTG Port Primary Access State: Active/Optimized\nTG Port Primary Access Status: None\nTG Port Secondary Access State: None\nTG Port Secondary Access Status: None
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/lun/lun_1/alua_tg_pt_offline = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/lun/lun_1/alua_tg_pt_status = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/lun/lun_1/alua_tg_pt_write_md = 0
+L iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/lun/lun_1/eb9482b72d -> ../../../../../../target/core/fileio_1/gtiscsi_lun2
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/np
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/np/192.168.200.50:3260
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/np/192.168.200.50:3260/cxgbit = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/np/192.168.200.50:3260/iser = 0
+D iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/AuthMethod = CHAP
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/DataDigest = CRC32C,None
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/DataPDUInOrder = Yes
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/DataSequenceInOrder = Yes
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/DefaultTime2Retain = 20
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/DefaultTime2Wait = 2
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/ErrorRecoveryLevel = 0
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/FirstBurstLength = 65536
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/HeaderDigest = CRC32C,None
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/IFMarkInt = Reject
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/IFMarker = No
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/ImmediateData = Yes
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/InitialR2T = Yes
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/MaxBurstLength = 262144
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/MaxConnections = 1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/MaxOutstandingR2T = 1
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/MaxRecvDataSegmentLength = 8192
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/MaxXmitDataSegmentLength = 262144
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/OFMarkInt = Reject
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/OFMarker = No
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/param/TargetAlias = LIO Target
+F iscsi/iqn.2026-08.dev.anas.gtiscsi:target1/tpgt_1/rtpi = 0x1
+F iscsi/lio_version = Datera Inc. iSCSI Target v4.1.0
+F version = Target Engine Core ConfigFS Infrastructure v5.0 on Linux/x86_64 on 7.0.14-12-pve

@@ -60,11 +60,14 @@ stripped ssh banner line in `boot-ordering-units.txt`. Nothing else was touched.
 | `anasd-v1-disks.json` | `curl --unix-socket /run/anas/anasd.sock http://localhost/v1/disks` (anasd 0.2.11) | real capture |
 | `rtslib-backup-dir.txt` | `ls -la /etc/rtslib-fb-target/backup/` — targetcli's own rotating `.gz` backups | real capture |
 | `error-texts.txt` | 11 numbered failure/edge cases, each with initiator-side text, exit code and the target-side kernel journal | real capture |
+| `configfs-live.manifest` | The whole live configfs subtree the read layer touches (`/sys/kernel/config/target`, minus `statistics/`, `alua/`, `pr/`, `fabric_statistics/` and `core/alua`), captured **2026-08-25 for story `iscsi.2`** as a flat one-line-per-node manifest: `D <rel>` / `L <rel> -> <target>` / `F <rel> = <content, newline-escaped>`. Materialised into a temp directory by `src/fixtures/configfs-manifest.ts` so the path-injectable configfs reader can be pointed at it. Same node, same target, after the GT-47 reboot (hence `zd16`). | real capture, redacted* |
+| `configfs-restore-hole.manifest` | **DERIVED, not a raw capture** — `configfs-live.manifest` with the `core/iblock_0`, `tpgt_1/lun/lun_0` and `acls/*/lun_0` subtrees deleted, reproducing the GT-20/GT-21 state: the block backing device was missing at restore, so LIO skipped the storage object and the LUN while systemd still reported success. Paired with `saveconfig-final.json` (which still has both LUNs) it is the restore-hole diff. | derived from the real capture |
 | `reboot-real.txt` | the **real reboot** at the end of the run: unit timeline, service result, the `zd0`→`zd16` move, serials after boot, and the initiator's identity + verified marker checksum. The single leading `Warning: Permanently added …` ssh line was deleted; nothing else edited. | real capture |
 
 \* **Redactions (the only edits made to any file):** the two throwaway 16-character CHAP
 secret values (one incoming, one mutual) were replaced with the literal
-`REDACTED-16char` (same length) in `saveconfig-*.json` and `tpg-attrs-params-auth.txt`.
+`REDACTED-16char` (same length) in `saveconfig-*.json`, `tpg-attrs-params-auth.txt` and
+the `auth/password*` lines of the two `configfs-*.manifest` files.
 The JSON keys (`chap_password`, `chap_mutual_password`), the userids
 (`gtiscsiuser`, `gtacluser`, `gttargetuser`) and every other byte are untouched.
 The real values are recorded in `/root/anas-iscsi-gt-handles.txt` (0600) on the node.

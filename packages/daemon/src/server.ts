@@ -26,6 +26,7 @@ import { datasetRoutes } from './routes/datasets.js'
 import { diskRoutes } from './routes/disks.js'
 import { fsRoutes } from './routes/fs.js'
 import { healthRoutes } from './routes/health.js'
+import { iscsiRoutes } from './routes/iscsi.js'
 import { jobRoutes } from './routes/jobs.js'
 import { mountsRoutes } from './routes/mounts.js'
 import { poolRoutes } from './routes/pools.js'
@@ -493,6 +494,18 @@ export function createServer(opts?: ServerOptions) {
   // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
   // inventory + PVE-tagged hands-off + guarded status probe.
   server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath })
+  // iSCSI reads (iscsi epic, story iscsi.2) — LIO's persisted saveconfig.json
+  // joined against live configfs. Read-only; every mutation is iscsi.4's. The
+  // paths default inside the service to the real host locations and are
+  // overridable so tests (and a dev box with no LIO) never read the kernel.
+  server.register(iscsiRoutes, {
+    prefix: '/v1',
+    executor,
+    configfsRoot: process.env.ANAS_ISCSI_CONFIGFS,
+    blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
+    saveconfigPath: process.env.ANAS_ISCSI_SAVECONFIG,
+    pveStorageCfg: process.env.ANAS_STORAGE_CFG,
+  })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
   // AHR hybrid RAID (Epic 11 + AHR). The per-pool AhrExpansionIntent store
