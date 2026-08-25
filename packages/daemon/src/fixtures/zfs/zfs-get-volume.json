@@ -1,0 +1,353 @@
+{
+    "output_version": {
+        "command": "zfs get",
+        "vers_major": 0,
+        "vers_minor": 1
+    },
+    "datasets": {
+        "gtiscsi/vol1": {
+            "name": "gtiscsi/vol1",
+            "type": "VOLUME",
+            "pool": "gtiscsi",
+            "createtxg": "9",
+            "properties": {
+                "type": {
+                    "value": "volume",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "creation": {
+                    "value": "Tue Aug 25 19:15 2026",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "used": {
+                    "value": "2.03G",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "available": {
+                    "value": "5.20G",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "referenced": {
+                    "value": "60.5K",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "compressratio": {
+                    "value": "23.93x",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "reservation": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "volsize": {
+                    "value": "2G",
+                    "source": {
+                        "type": "LOCAL",
+                        "data": "-"
+                    }
+                },
+                "volblocksize": {
+                    "value": "16K",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "checksum": {
+                    "value": "on",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "compression": {
+                    "value": "on",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "readonly": {
+                    "value": "off",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "createtxg": {
+                    "value": "9",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "copies": {
+                    "value": "1",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "refreservation": {
+                    "value": "2.03G",
+                    "source": {
+                        "type": "LOCAL",
+                        "data": "-"
+                    }
+                },
+                "guid": {
+                    "value": "12705534995224000801",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "primarycache": {
+                    "value": "all",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "secondarycache": {
+                    "value": "all",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "usedbysnapshots": {
+                    "value": "0B",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "usedbydataset": {
+                    "value": "60.5K",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "usedbychildren": {
+                    "value": "0B",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "usedbyrefreservation": {
+                    "value": "2.03G",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "logbias": {
+                    "value": "latency",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "objsetid": {
+                    "value": "89",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "dedup": {
+                    "value": "off",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "mlslabel": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "sync": {
+                    "value": "standard",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "refcompressratio": {
+                    "value": "23.93x",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "written": {
+                    "value": "60.5K",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "logicalused": {
+                    "value": "1.02M",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "logicalreferenced": {
+                    "value": "1.02M",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "volmode": {
+                    "value": "default",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "snapshot_limit": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "snapshot_count": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "snapdev": {
+                    "value": "hidden",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "context": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "fscontext": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "defcontext": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "rootcontext": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "redundant_metadata": {
+                    "value": "all",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "encryption": {
+                    "value": "off",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "keylocation": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "keyformat": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "pbkdf2iters": {
+                    "value": "0",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "special_small_blocks": {
+                    "value": "0",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "snapshots_changed": {
+                    "value": "Tue Aug 25 19:32:16 2026",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "prefetch": {
+                    "value": "all",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "volthreading": {
+                    "value": "on",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                }
+            }
+        }
+    }
+}

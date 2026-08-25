@@ -143,12 +143,15 @@ export {
   CreateDatasetRequest,
   Dataset,
   DatasetDetail,
+  DatasetListDefaults,
   DatasetProperties,
   DatasetType,
   MountpointPermissions,
   RecordSize,
   SetPermissionsRequest,
   UpdateDatasetPropertiesRequest,
+  VolBlockSize,
+  VolSize,
 } from './schemas/datasets.js'
 
 // Disk schemas

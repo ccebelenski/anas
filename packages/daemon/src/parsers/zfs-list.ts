@@ -38,7 +38,8 @@ interface ZfsListOutput {
  * `properties` map the same way `zfs get` does.
  */
 export const ZFS_LIST_PROPS
-  = 'name,used,available,referenced,quota,mountpoint,compression,compressratio,type'
+  = 'name,used,available,referenced,quota,mountpoint,compression,compressratio,type,'
+    + 'volsize,volblocksize,refreservation'
 
 /** `zfs list` argument array for a pool's dataset tree (filesystems + volumes). */
 export function zfsListArgs(pool: string): string[] {
@@ -68,6 +69,38 @@ function normalizeMountpoint(value: string): string | null {
   if (!value || value === '-' || value === 'none' || value === 'legacy')
     return null
   return value
+}
+
+/**
+ * The volume-only fields of a Dataset (story iscsi.3), or `{}` for anything
+ * that is not a zvol. Additive + optional by contract: on a filesystem the keys
+ * are ABSENT, never zero, so "no volsize" and "volsize 0" stay distinguishable.
+ *
+ * `sparse` is derived, not read: ZFS has no `sparse` property. What `zfs create
+ * -s` actually does is omit the refreservation, so a volume is thin exactly
+ * when `refreservation` is `none`. (It stays honest afterwards too: an operator
+ * who clears the refreservation by hand has thinned the volume, and this
+ * reports it.) A volume list that predates the extra columns simply yields
+ * `undefined` for each and the UI degrades.
+ */
+function volumeFields(
+  type: 'filesystem' | 'volume',
+  prop: (name: string) => string,
+): { volsize?: number, volblocksize?: number, sparse?: boolean } {
+  if (type !== 'volume')
+    return {}
+
+  const out: { volsize?: number, volblocksize?: number, sparse?: boolean } = {}
+  const volsize = prop('volsize')
+  if (volsize && volsize !== '-')
+    out.volsize = parseHumanSize(volsize)
+  const volblocksize = prop('volblocksize')
+  if (volblocksize && volblocksize !== '-')
+    out.volblocksize = parseHumanSize(volblocksize)
+  const refres = prop('refreservation')
+  if (refres && refres !== '-')
+    out.sparse = parseHumanSize(refres) === 0
+  return out
 }
 
 /** Map the raw ZFS dataset kind to the shared enum, or null if not a dataset. */
@@ -104,10 +137,41 @@ export function parseZfsList(json: string | ZfsListOutput): Dataset[] {
       compression: prop('compression') || 'off',
       compressratio: parseDedupRatio(prop('compressratio')),
       quota: parseHumanSize(prop('quota')),
+      ...volumeFields(type, prop),
     })
   }
 
   return result
+}
+
+/**
+ * ZFS's OWN default `volblocksize`, in bytes, read out of a `zfs list -j` that
+ * already carries the column — or null when nothing in the output can attest to
+ * it (story iscsi.3).
+ *
+ * The Create dialog must STATE the default rather than hard-code one, because
+ * `volblocksize` is create-only and OpenZFS has moved the default before (8K to
+ * 16K in 2.2). There is no module parameter to read it from — checked on a real
+ * node, `/sys/module/zfs/parameters` has no such knob — so the only honest
+ * source is an existing volume whose value ZFS reports as DEFAULT-sourced. That
+ * lives in the list output we already fetched, so this costs no extra command.
+ *
+ * Null is a real answer ("this pool has no volume to learn it from"), and the
+ * dialog says "ZFS default" with no number rather than inventing one.
+ */
+export function parseVolblocksizeDefault(json: string | ZfsListOutput): number | null {
+  const data: ZfsListOutput = parseZfsJson(json, { datasets: {} })
+  for (const ds of Object.values(data.datasets)) {
+    if (ds.type.toLowerCase() !== 'volume')
+      continue
+    const raw = ds.properties.volblocksize
+    if (!raw || raw.source?.type !== 'DEFAULT')
+      continue
+    const bytes = parseHumanSize(raw.value)
+    if (bytes > 0)
+      return bytes
+  }
+  return null
 }
 
 /** Snapshot names from a `zfs list -t snapshot` output. */
@@ -198,6 +262,7 @@ export function parseDatasetGet(
     compression: prop('compression') || 'off',
     compressratio: parseDedupRatio(prop('compressratio')),
     quota: parseHumanSize(prop('quota')),
+    ...volumeFields(type, prop),
   }
 
   const all: Record<string, string> = {}

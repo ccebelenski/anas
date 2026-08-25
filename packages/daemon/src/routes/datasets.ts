@@ -1,4 +1,4 @@
-import type { AccessEntry, AssociatedShare, CreateDatasetRequest, Dataset, DatasetAccess, DatasetDetail, MountpointPermissions, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
+import type { AccessEntry, AssociatedShare, CreateDatasetRequest, Dataset, DatasetAccess, DatasetDetail, DatasetListDefaults, MountpointPermissions, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
@@ -10,7 +10,7 @@ import { parseExports } from '../parsers/exports.js'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
-import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
+import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { confirmGate } from '../safety/gate.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
@@ -41,9 +41,26 @@ interface BaseLevels {
 /** Whitespace splitter for `stat` output (owner group mode). */
 const WHITESPACE_RE = /\s+/
 
-/** Build the `zfs create` argument array from a validated request. */
+/**
+ * Build the `zfs create` argument array from a validated request — for a
+ * filesystem OR a volume. A volume is a dataset of another type, not another
+ * resource, so it shares this one builder rather than forking a parallel path.
+ *
+ * The zvol flags follow zfs(8)'s own order — `zfs create [-s] [-b blocksize]
+ * [-o property=value]... -V size volume` — and the schema has already
+ * guaranteed that `volsize` is present and that no filesystem-only property
+ * (mountpoint / recordsize / quota) came along for the ride, because ZFS does
+ * not have those properties on a zvol at all.
+ */
 function buildCreateArgs(fullName: string, req: CreateDatasetRequest): string[] {
   const args = ['create']
+  const isVolume = req.type === 'volume'
+  // Sparse (thin) FIRST: `-s` is what omits the refreservation, and the absence
+  // of a refreservation is the whole meaning of `sparse` on the way back out.
+  if (isVolume && req.sparse)
+    args.push('-s')
+  if (isVolume && req.volblocksize !== undefined)
+    args.push('-b', String(req.volblocksize))
   const p = req.properties
   if (p) {
     if (p.compression !== undefined)
@@ -57,6 +74,8 @@ function buildCreateArgs(fullName: string, req: CreateDatasetRequest): string[] 
     if (p.mountpoint !== undefined)
       args.push('-o', `mountpoint=${p.mountpoint}`)
   }
+  if (isVolume && req.volsize !== undefined)
+    args.push('-V', String(req.volsize))
   args.push(fullName)
   return args
 }
@@ -95,7 +114,76 @@ function buildSetPairs(p: UpdateDatasetPropertiesRequest['properties']): string[
     pairs.push(`readonly=${p.readonly ? 'on' : 'off'}`)
   if (p.dedup !== undefined)
     pairs.push(`dedup=${p.dedup}`)
+  // Volumes only (story iscsi.3). No 0 -> 'none' mapping: `volsize` has no such
+  // value, and the schema's 1 MiB floor means a blanked field is a 400 at the
+  // boundary rather than a `volsize=0` that ZFS would refuse mid-apply (#43).
+  if (p.volsize !== undefined)
+    pairs.push(`volsize=${p.volsize}`)
   return pairs
+}
+
+// ============================================================================
+// The one volume-mutation gate (story iscsi.3, extended by iscsi.6).
+// ============================================================================
+
+/** Mutations that a LUN's claim on a volume must be able to veto (iscsi.6). */
+export type VolumeOp = 'grow' | 'rollback' | 'rename' | 'destroy'
+
+/** A refusal from {@link assertVolumeMutable} — 409, Level 1, no confirm code. */
+export interface VolumeRefusal {
+  reason: string
+  message: string
+}
+
+/**
+ * THE seam for "may this volume be mutated this way?" — one function, one call
+ * site per verb, so story iscsi.6 adds the LUN-held refusal HERE and nowhere
+ * else.
+ *
+ * Today it enforces exactly one rule: **volsize never shrinks.** ZFS itself
+ * allows a shrink and truncates silently — it does not even refuse under a live
+ * iSCSI session — so the refusal has to be ANAS's, and it is a Level 1 block
+ * (409, no confirm code) rather than a confirm gate: there is no safe way to
+ * take blocks away from a block device from the outside.
+ *
+ * The other three ops are listed and pass through untouched today. That is
+ * deliberate rather than an oversight: `rollback`, `rename` and `destroy` also
+ * succeed silently in ZFS while a LUN is serving the volume (destroy is the one
+ * ZFS does refuse, and only while the backstore holds the device open). ANAS
+ * cannot yet tell whether a LUN references a volume — that read layer is
+ * `iscsi.2` — so this function accepts them and iscsi.6 turns them into
+ * refusals by adding a single branch below. Every dataset verb that can touch a
+ * volume already routes through here so that branch reaches all of them at
+ * once; a future dataset RENAME endpoint must call it too.
+ *
+ * `current` is the volume's dataset row (null when the caller could not read
+ * it, in which case nothing is asserted — fail-open, the same posture as the
+ * other pre-flight reads here). `next` carries the requested new state.
+ */
+export function assertVolumeMutable(
+  name: string,
+  op: VolumeOp,
+  current: Dataset | null,
+  next?: { volsize?: number },
+): VolumeRefusal | null {
+  if (!current || current.type !== 'volume')
+    return null
+
+  if (op === 'grow' && next?.volsize !== undefined && current.volsize !== undefined) {
+    if (next.volsize < current.volsize) {
+      return {
+        reason: 'shrink',
+        message: `Volume '${name}' is ${current.volsize} bytes; a volsize of ${next.volsize} bytes would SHRINK it. `
+          + `ZFS would truncate it silently and anything written past the new end — a partition table, a filesystem, a LUN's data — would be gone. `
+          + `Destroy and recreate the volume at the smaller size instead. This refusal has no confirm bypass.`,
+      }
+    }
+  }
+
+  // iscsi.6 extends this function (and only this function) with: "held by LUN
+  // <target>/<n>" for rollback / rename / destroy / grow while a backstore
+  // references the volume, read from configfs via busy-diagnosis.ts.
+  return null
 }
 
 // ============================================================================
@@ -275,12 +363,27 @@ export async function datasetRoutes(
     return pools.some(p => p.name === poolName)
   }
 
-  /** The pool's flat dataset list (filesystems + volumes). */
-  async function listDatasets(poolName: string): Promise<Dataset[]> {
+  /**
+   * The pool's flat dataset list PLUS the ZFS-owned defaults the Create dialog
+   * quotes (story iscsi.3), from ONE `zfs list` — the default `volblocksize`
+   * rides in the same JSON the tree is built from, so stating it instead of
+   * hard-coding it costs no extra command (Principle 7).
+   */
+  async function listDatasetsAndDefaults(
+    poolName: string,
+  ): Promise<{ datasets: Dataset[], defaults: DatasetListDefaults }> {
     const r = await executor.exec(ZFS, zfsListArgs(poolName))
     if (r.exitCode !== 0 || !r.stdout.trim())
-      return []
-    return parseZfsList(r.stdout)
+      return { datasets: [], defaults: { volblocksize: null } }
+    return {
+      datasets: parseZfsList(r.stdout),
+      defaults: { volblocksize: parseVolblocksizeDefault(r.stdout) },
+    }
+  }
+
+  /** The pool's flat dataset list (filesystems + volumes). */
+  async function listDatasets(poolName: string): Promise<Dataset[]> {
+    return (await listDatasetsAndDefaults(poolName)).datasets
   }
 
   /** Snapshot names below a dataset (for destroy warnings). */
@@ -295,6 +398,36 @@ export async function datasetRoutes(
   async function datasetExists(poolName: string, fullName: string): Promise<boolean> {
     const datasets = await listDatasets(poolName)
     return datasets.some(d => d.name === fullName)
+  }
+
+  /**
+   * The dataset row for one full name, or null. Fail-open by design: every
+   * caller uses it to feed {@link assertVolumeMutable}, which asserts nothing on
+   * a null (the verb then proceeds exactly as it did before this story).
+   */
+  async function datasetRow(poolName: string, fullName: string): Promise<Dataset | null> {
+    const datasets = await listDatasets(poolName)
+    return datasets.find(d => d.name === fullName) ?? null
+  }
+
+  /**
+   * Run the volume gate and, if it refuses, send the Level 1 409 (no confirm
+   * code — there is no override path, per Safety Semantics). Returns true when
+   * the caller has been answered and must stop.
+   */
+  async function volumeGateRefused(
+    poolName: string,
+    fullName: string,
+    op: VolumeOp,
+    reply: FastifyReply,
+    next?: { volsize?: number },
+  ): Promise<boolean> {
+    const refusal = assertVolumeMutable(fullName, op, await datasetRow(poolName, fullName), next)
+    if (!refusal)
+      return false
+    reply.code(409)
+    reply.send({ error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } })
+    return true
   }
 
   /** A dataset's snapshots, newest-first (empty when it has none). */
@@ -484,7 +617,7 @@ export async function datasetRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    const datasets = await listDatasets(poolName)
+    const { datasets, defaults } = await listDatasetsAndDefaults(poolName)
 
     // Enrich the flat feed so the UI can light up share badges + a snapshot
     // count on collapsed rows (Epic 4.4 / 15.4). Both sources are gathered ONCE
@@ -518,7 +651,11 @@ export async function datasetRoutes(
       // fail-open — omit the enrichment fields rather than fail the list
     }
 
-    return { data: datasets }
+    // Story iscsi.3: `defaults` carries the ZFS-owned volblocksize the Create
+    // dialog quotes. Optional and additive — an older UI ignores it, and a newer
+    // UI against an older daemon simply gets nothing and says "ZFS default"
+    // with no number rather than inventing one.
+    return { data: datasets, defaults }
   })
 
   // --- GET /pools/:name/datasets/*path — detail ---------------------------
@@ -729,16 +866,40 @@ export async function datasetRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid property update: ${bodyParsed.error.issues[0]?.message}` } }
     }
-    const pairs = buildSetPairs(bodyParsed.data.properties)
+    const props = bodyParsed.data.properties
+    const pairs = buildSetPairs(props)
 
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
 
     const existing = await listDatasets(poolName)
-    if (!existing.some(d => d.name === fullName)) {
+    const target = existing.find(d => d.name === fullName)
+    if (!target) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+
+    // Story iscsi.3 — a volume and a filesystem accept DIFFERENT properties, and
+    // ZFS reports the mismatch as an opaque failure part-way through the set.
+    // Refuse the mismatch at the boundary instead, naming the property.
+    if (target.type === 'volume') {
+      const notOnVolume = (['recordsize', 'quota', 'refquota', 'atime'] as const)
+        .filter(k => props[k] !== undefined)
+      if (notOnVolume.length > 0) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `'${fullName}' is a volume; ${notOnVolume.join(', ')} ${notOnVolume.length > 1 ? 'are filesystem properties' : 'is a filesystem property'} and ZFS does not carry ${notOnVolume.length > 1 ? 'them' : 'it'} on a volume` } }
+      }
+      // THE gate: grow yes, shrink never (assertVolumeMutable, the one seam).
+      const refusal = assertVolumeMutable(fullName, 'grow', target, { volsize: props.volsize })
+      if (refusal) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
+      }
+    }
+    else if (props.volsize !== undefined) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `'${fullName}' is a filesystem; volsize applies only to a volume` } }
     }
 
     const job = jobQueue.submit(
@@ -1165,6 +1326,15 @@ export async function datasetRoutes(
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
     }
 
+    // Story iscsi.3: destroy of a VOLUME routes through the one gate as well
+    // (ZFS does refuse a destroy while a backstore holds the device open, but
+    // that is ZFS's rule, not ANAS's — iscsi.6 turns it into a named refusal).
+    const volumeRefusal = assertVolumeMutable(fullName, 'destroy', targetDataset)
+    if (volumeRefusal) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: volumeRefusal.reason, message: volumeRefusal.message } }
+    }
+
     const children = datasets.filter(d => d.name.startsWith(`${fullName}/`))
     const snapshots = await snapshotNames(fullName)
     // Shares serving this dataset's mountpoint will break when it's destroyed
@@ -1413,6 +1583,14 @@ export async function datasetRoutes(
     // are the ones ahead of the target in the list.
     const targetIndex = snapshots.findIndex(s => s.name === snapName)
     const laterSnapshots = snapshots.slice(0, targetIndex).map(s => s.snapshotName)
+
+    // Story iscsi.3: a rollback of a VOLUME goes through the one gate, so
+    // iscsi.6's "held by LUN" refusal reaches it without touching this handler.
+    // ZFS itself permits rolling a zvol back under a live iSCSI session — it
+    // returns exit 0 with a filesystem mounted on the initiator — so nothing
+    // below ANAS is going to stop it.
+    if (await volumeGateRefused(poolName, fullName, 'rollback', reply))
+      return reply
 
     const warnings = [
       `Rolling back discards all changes to '${fullName}' since snapshot '${snap}'.`,

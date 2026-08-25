@@ -1,0 +1,264 @@
+{
+    "output_version": {
+        "command": "zfs list",
+        "vers_major": 0,
+        "vers_minor": 1
+    },
+    "datasets": {
+        "gtiscsi": {
+            "name": "gtiscsi",
+            "type": "FILESYSTEM",
+            "pool": "gtiscsi",
+            "createtxg": "1",
+            "properties": {
+                "used": {
+                    "value": "2.16G",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "available": {
+                    "value": "3.17G",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "referenced": {
+                    "value": "24K",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "quota": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "mountpoint": {
+                    "value": "/gtiscsi",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "compression": {
+                    "value": "on",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "compressratio": {
+                    "value": "1.00x",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "type": {
+                    "value": "filesystem",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "volsize": {
+                    "value": "-",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "volblocksize": {
+                    "value": "-",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "refreservation": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                }
+            }
+        },
+        "gtiscsi/images": {
+            "name": "gtiscsi/images",
+            "type": "FILESYSTEM",
+            "pool": "gtiscsi",
+            "createtxg": "8",
+            "properties": {
+                "used": {
+                    "value": "128M",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "available": {
+                    "value": "3.17G",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "referenced": {
+                    "value": "128M",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "quota": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "mountpoint": {
+                    "value": "/gtiscsi/images",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "compression": {
+                    "value": "on",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "compressratio": {
+                    "value": "1.00x",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "type": {
+                    "value": "filesystem",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "volsize": {
+                    "value": "-",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "volblocksize": {
+                    "value": "-",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "refreservation": {
+                    "value": "none",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                }
+            }
+        },
+        "gtiscsi/vol1": {
+            "name": "gtiscsi/vol1",
+            "type": "VOLUME",
+            "pool": "gtiscsi",
+            "createtxg": "9",
+            "properties": {
+                "used": {
+                    "value": "2.03G",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "available": {
+                    "value": "5.20G",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "referenced": {
+                    "value": "60.5K",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "quota": {
+                    "value": "-",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "mountpoint": {
+                    "value": "-",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "compression": {
+                    "value": "on",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "compressratio": {
+                    "value": "23.93x",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "type": {
+                    "value": "volume",
+                    "source": {
+                        "type": "NONE",
+                        "data": "-"
+                    }
+                },
+                "volsize": {
+                    "value": "2G",
+                    "source": {
+                        "type": "LOCAL",
+                        "data": "-"
+                    }
+                },
+                "volblocksize": {
+                    "value": "16K",
+                    "source": {
+                        "type": "DEFAULT",
+                        "data": "-"
+                    }
+                },
+                "refreservation": {
+                    "value": "2.03G",
+                    "source": {
+                        "type": "LOCAL",
+                        "data": "-"
+                    }
+                }
+            }
+        }
+    }
+}

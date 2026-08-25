@@ -46,6 +46,27 @@ export const Dataset = z.object({
    * Tallied from one recursive `zfs list -t snapshot` pass (not N+1).
    */
   snapshotCount: z.number().int().nonnegative().optional(),
+  /**
+   * VOLUMES (zvols) only — the iscsi epic, story iscsi.3. All three are
+   * optional and additive (version-skew ruling): an older daemon simply omits
+   * them and the UI degrades to what it already drew. They are absent on
+   * filesystems, never zero-filled, so "absent" and "0" never get confused.
+   *
+   * `volsize` is the exported logical size in bytes — the number the initiator
+   * sees. It is NOT `used`: a sparse volume's `used` is what has actually been
+   * written, a thick one's is `volsize` plus the refreservation overhead.
+   */
+  volsize: z.number().int().nonnegative().optional(),
+  /** Volumes only: the volume block size in bytes (create-only in ZFS). */
+  volblocksize: z.number().int().nonnegative().optional(),
+  /**
+   * Volumes only: thin-provisioned? Derived from `refreservation` — ZFS has no
+   * `sparse` property, it is the ABSENCE of a refreservation that makes a
+   * volume thin. A thick volume never shows reclaim in `used` (the
+   * refreservation holds the space), so this flag is what makes "thin"
+   * meaningful in the UI.
+   */
+  sparse: z.boolean().optional(),
 })
 export type Dataset = z.infer<typeof Dataset>
 
@@ -116,19 +137,109 @@ export const RecordSize = z
   .refine(n => (n & (n - 1)) === 0, 'recordsize must be a power of two')
 export type RecordSize = z.infer<typeof RecordSize>
 
-/** Create a dataset (POST /v1/pools/:name/datasets). `path` is relative to the pool. */
-export const CreateDatasetRequest = z.object({
-  path: DatasetPath,
-  properties: z
-    .object({
-      compression: z.string().optional(),
-      recordsize: RecordSize.optional(),
-      quota: z.number().nonnegative().optional(),
-      reservation: z.number().nonnegative().optional(),
-      mountpoint: AbsolutePath.optional(),
-    })
-    .optional(),
+/**
+ * ZFS `volsize` in bytes (story iscsi.3). A byte COUNT, never a human string —
+ * the dialog does the unit arithmetic. The 1 MiB floor is ANAS's, not ZFS's:
+ * ZFS itself would happily make a 64 KiB "disk", which is never what anyone
+ * means. ZFS rounds the value up to a multiple of `volblocksize`, so the
+ * created volume can be marginally larger than asked.
+ */
+export const VolSize = z
+  .number()
+  .int('volsize must be a whole number of bytes')
+  .min(1024 * 1024, 'volsize must be at least 1 MiB')
+export type VolSize = z.infer<typeof VolSize>
+
+/**
+ * ZFS `volblocksize` in bytes: a power of two between 512 and 1M — exactly what
+ * ZFS accepts. Validated here (Principles 6 + 14) so a bad value is a 400 at
+ * the boundary rather than a `zfs create` that dies half-way. NO default is
+ * encoded: `volblocksize` is create-only and ZFS owns the default, so the
+ * dialog READS the running default off an existing volume (`zfs get`) instead
+ * of this file asserting one that a future OpenZFS could change.
+ */
+export const VolBlockSize = z
+  .number()
+  .int('volblocksize must be a whole number of bytes')
+  .min(512, 'volblocksize must be at least 512 bytes')
+  .max(1024 * 1024, 'volblocksize must be at most 1M')
+  .refine(n => (n & (n - 1)) === 0, 'volblocksize must be a power of two')
+export type VolBlockSize = z.infer<typeof VolBlockSize>
+
+/**
+ * Node-observed ZFS defaults, returned alongside the dataset list so the Create
+ * dialog can STATE the default instead of hard-coding one (story iscsi.3).
+ * Additive and optional (version-skew ruling) — an older daemon omits the whole
+ * object and the dialog says "ZFS default" with no number.
+ */
+export const DatasetListDefaults = z.object({
+  /**
+   * ZFS's own default `volblocksize` in bytes, read from an existing volume
+   * whose value is DEFAULT-sourced. `null` when the pool has no volume to read
+   * it from — an honest absence, never a guess.
+   */
+  volblocksize: z.number().int().positive().nullable(),
 })
+export type DatasetListDefaults = z.infer<typeof DatasetListDefaults>
+
+/**
+ * Create a dataset (POST /v1/pools/:name/datasets). `path` is relative to the
+ * pool. A volume is a dataset of another TYPE, not another resource: the same
+ * endpoint, the same body, with `type: 'volume'` plus the three zvol fields.
+ *
+ * `type` is optional and absent means `filesystem`, so an older client's body
+ * (which has no `type` at all) is still exactly a filesystem create — the
+ * version-skew rule cuts both ways.
+ */
+export const CreateDatasetRequest = z
+  .object({
+    path: DatasetPath,
+    /** `volume` creates a zvol; absent/`filesystem` is the pre-iscsi.3 behaviour. */
+    type: DatasetType.optional(),
+    /** Volumes only, REQUIRED for one: the exported size in bytes. */
+    volsize: VolSize.optional(),
+    /** Volumes only: block size. Omitted then ZFS's own default applies. */
+    volblocksize: VolBlockSize.optional(),
+    /** Volumes only: thin-provision it (`zfs create -s`, no refreservation). */
+    sparse: z.boolean().optional(),
+    properties: z
+      .object({
+        compression: z.string().optional(),
+        recordsize: RecordSize.optional(),
+        quota: z.number().nonnegative().optional(),
+        reservation: z.number().nonnegative().optional(),
+        mountpoint: AbsolutePath.optional(),
+      })
+      .optional(),
+  })
+  .superRefine((req, ctx) => {
+    const isVolume = req.type === 'volume'
+    if (isVolume) {
+      if (req.volsize === undefined) {
+        ctx.addIssue({ code: 'custom', path: ['volsize'], message: 'a volume needs a volsize' })
+      }
+      // A zvol has no mountpoint, no recordsize and no quota — ZFS does not
+      // even list those properties on one (verified against a real volume).
+      // Refuse them here rather than letting `zfs create` fail mid-apply.
+      const p = req.properties
+      if (p?.mountpoint !== undefined) {
+        ctx.addIssue({ code: 'custom', path: ['properties', 'mountpoint'], message: 'a volume has no mountpoint' })
+      }
+      if (p?.recordsize !== undefined) {
+        ctx.addIssue({ code: 'custom', path: ['properties', 'recordsize'], message: 'recordsize does not apply to a volume — use volblocksize' })
+      }
+      if (p?.quota !== undefined) {
+        ctx.addIssue({ code: 'custom', path: ['properties', 'quota'], message: 'quota does not apply to a volume — volsize is its size' })
+      }
+    }
+    else {
+      for (const key of ['volsize', 'volblocksize', 'sparse'] as const) {
+        if (req[key] !== undefined) {
+          ctx.addIssue({ code: 'custom', path: [key], message: `${key} applies only to type 'volume'` })
+        }
+      }
+    }
+  })
 export type CreateDatasetRequest = z.infer<typeof CreateDatasetRequest>
 
 /** Update dataset properties (PUT /v1/pools/:name/datasets/*path). */
@@ -145,6 +256,16 @@ export const UpdateDatasetPropertiesRequest = z.object({
       sync: z.enum(['standard', 'always', 'disabled']).optional(),
       readonly: z.boolean().optional(),
       dedup: z.string().optional(),
+      /**
+       * VOLUMES only (story iscsi.3): GROW the volume. `zfs set volsize=` is
+       * live under a LUN — the initiator rescans and sees the new size. The
+       * schema can only enforce the floor and the byte-count shape; whether a
+       * given value is a grow or a SHRINK depends on the current size, so the
+       * shrink refusal lives at the daemon boundary (assertVolumeMutable).
+       * ZFS would silently truncate, which is why this is refused outright
+       * rather than confirm-gated.
+       */
+      volsize: VolSize.optional(),
     })
     .refine(p => Object.keys(p).length > 0, 'at least one property required'),
 })

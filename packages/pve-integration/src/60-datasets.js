@@ -14,7 +14,7 @@
  *
  * Data (paths relative to /v1):
  *   GET    /pools                              → { data: PoolSummary[] }
- *   GET    /pools/:name/datasets               → { data: Dataset[] } (flat)
+ *   GET    /pools/:name/datasets               → { data: Dataset[], defaults? } (flat)
  *   GET    /pools/:name/datasets/<path>        → { data: DatasetDetail }
  *   POST   /pools/:name/datasets               → 202 { job }  (CreateDatasetRequest)
  *   PUT    /pools/:name/datasets/<path>        → 202 { job }  (UpdateDatasetPropertiesRequest)
@@ -27,7 +27,7 @@
  * Test hooks: view panel cls 'anas-view anas-view-datasets', tree cls
  * 'anas-grid-datasets', action buttons 'anas-btn-ds-create' /
  * 'anas-btn-ds-detail' / 'anas-btn-ds-edit' / 'anas-btn-ds-perms' /
- * 'anas-btn-ds-destroy', the contextual 'anas-btn-ds-share' (submenu items
+ * 'anas-btn-ds-resize' / 'anas-btn-ds-destroy', the contextual 'anas-btn-ds-share' (submenu items
  * 'anas-btn-ds-share-smb' / 'anas-btn-ds-share-nfs', Epic 6/7 — opens the
  * Shares create flow pre-filled from the dataset), windows
  * 'anas-win-dataset-create' /
@@ -63,6 +63,26 @@
  *        the Clone action is button 'anas-btn-snap-clone' (tree toolbar +
  *        snapshots popup). POST …/snapshots/:snap/clone { target }, then the tree
  *        reloads so the new dataset appears.
+ *
+ * Volumes (story iscsi.3): a ZFS volume (zvol) is a dataset of another TYPE,
+ * not another resource — same tree, same endpoints, same Create dialog. What
+ * differs is what a block device HAS: no mountpoint, so no Share and no
+ * Permissions; no recordsize/quota/atime, so no filesystem-property editor;
+ * and a `volsize` that can grow but must never shrink. Hooks:
+ *   tree      volume rows draw ANAS.gfx.objectIcon('volume', …) and carry
+ *             labelled vol/blocks/sparse chips in the Properties cell.
+ *   create    type picker 'anas-fld-ds-type' (itemId 'dsType') swaps the field
+ *             set: 'anas-fld-vol-size' + 'anas-fld-vol-unit' +
+ *             'anas-fld-volblocksize' + 'anas-fld-vol-sparse' for a volume,
+ *             record size / quota / reservation for a filesystem. A filesystem
+ *             body still carries NO `type` key, so it is byte-identical to what
+ *             this dialog sent before the story (version skew).
+ *   resize    toolbar 'anas-btn-ds-resize' (itemId 'dsResize') opens window
+ *             'anas-win-volume-resize' — grow only, submit
+ *             'anas-btn-volume-resize-submit'.
+ *   gating    Edit Properties / Permissions / Share… are disabled on a volume
+ *             row and each carries a tooltip saying why (VOLUME_TIPS).
+ * Image-file LUNs are NOT created here — that is the iSCSI menu's job.
  *
  * Replication is NOT a Datasets-view function — it lives entirely in the
  * dedicated Replication view (65-replication.js, story 5.5.3). No replication
@@ -251,6 +271,12 @@
             // absent on older daemons, in which case the badges/chip degrade.
             sharedOver: ds.sharedOver,
             snapshotCount: ds.snapshotCount,
+            // Story iscsi.3: zvol facts. Present only on `type === 'volume'`
+            // rows and only from a daemon that knows about them — the renderers
+            // and the toolbar all treat `undefined` as "unknown", never as 0.
+            volsize: ds.volsize,
+            volblocksize: ds.volblocksize,
+            sparse: ds.sparse,
             // Total capacity of the owning pool (bytes) — feeds the "Space of
             // pool" gfx bar (Epic 15.4). Threaded from the GET /pools summary.
             poolSize: poolSize,
@@ -277,6 +303,9 @@
         node.quota = ds.quota;
         node.sharedOver = ds.sharedOver;
         node.snapshotCount = ds.snapshotCount;
+        node.volsize = ds.volsize;
+        node.volblocksize = ds.volblocksize;
+        node.sparse = ds.sparse;
     }
 
     // Ensure an intermediate parent node exists for parentName (defensive — in
@@ -481,6 +510,24 @@
                 } catch (ePool) {
                     // non-fatal
                 }
+                // Story iscsi.3: the ZFS-observed default volblocksize, so the
+                // Create dialog can STATE the default instead of hard-coding
+                // one. Any pool that reports it answers for the node (it is a
+                // ZFS-wide default, not a per-pool one); undefined when no pool
+                // could attest to it, and the dialog then says so.
+                try {
+                    var vbd;
+                    for (var d = 0; d < results.length; d++) {
+                        var dflt = results[d] && results[d].defaults;
+                        if (dflt && dflt.volblocksize) {
+                            vbd = Number(dflt.volblocksize);
+                            break;
+                        }
+                    }
+                    tree.anasVolblocksizeDefault = vbd;
+                } catch (eVbd) {
+                    // non-fatal — the dialog degrades to "(ZFS default)"
+                }
                 try {
                     // Replace the whole root atomically. Incrementally mutating
                     // an already-rendered root (removeAll + appendChild) can leave
@@ -519,11 +566,18 @@
     function loadPoolDatasets(node, pool) {
         return ANAS.api.get(node, '/pools/' + encodeURIComponent(pool.name) + '/datasets').then(
             function (res) {
-                return { pool: pool, datasets: (res && res.data) || [] };
+                // `defaults` (story iscsi.3) carries the ZFS-observed default
+                // volblocksize. Optional and additive: an older daemon omits it
+                // and the Create dialog says "(ZFS default)" with no number.
+                return {
+                    pool: pool,
+                    datasets: (res && res.data) || [],
+                    defaults: (res && res.defaults) || null,
+                };
             },
             function (err) {
                 ANAS.warn('datasets load failed for ' + pool.name + ': ' + ANAS.errText(err));
-                return { pool: pool, datasets: [] };
+                return { pool: pool, datasets: [], defaults: null };
             }
         );
     }
@@ -544,6 +598,14 @@
 
     function isFilesystem(rec) {
         return isDataset(rec) && rec.get('type') === 'filesystem';
+    }
+
+    // Story iscsi.3: a ZFS volume (zvol) — a dataset of another type, not
+    // another kind of row. It has no mountpoint, so nothing that needs a path
+    // (Share, Permissions) applies to it, and none of the filesystem
+    // properties (recordsize/quota/atime) exist on it in ZFS at all.
+    function isVolume(rec) {
+        return isDataset(rec) && rec.get('type') === 'volume';
     }
 
     // Story 3.26: the pool ROOT is a first-class filesystem too. Share and
@@ -600,14 +662,23 @@
         // toolbar actions are gated alongside the primary per-row gate; only
         // read-only Detail / snapshot-listing stay enabled.
         var pve = recPveManaged(rec);
+        // Story iscsi.3: a volume takes the filesystem-property editor and the
+        // path-based actions OFF the toolbar and puts Resize Volume ON it. The
+        // reason travels with the button as its tooltip, so a disabled control
+        // still explains itself (never a dead grey button with no story).
+        var vol = isVolume(rec);
         setDisabled(tree, 'dsCreate', pve);
         setDisabled(tree, 'dsDetail', !dsOrRoot);
-        setDisabled(tree, 'dsEdit', !dsOrRoot || pve);
+        setDisabled(tree, 'dsEdit', !dsOrRoot || pve || vol);
         setDisabled(tree, 'dsPerms', !fs || pve);
         // Contextual "Share…" is offered on filesystem datasets only — they
-        // have a mountpoint path to share (DESIGN 5a/5d). zvols cannot.
+        // have a mountpoint path to share (DESIGN 5a/5d). zvols cannot: a zvol
+        // is a block device, and block export is the iSCSI menu's job.
         setDisabled(tree, 'dsShare', !fs || pve);
         setDisabled(tree, 'dsDestroy', !ds || pve);
+        // Grow — volumes only, and never on PVE's own zvols (3.25).
+        setDisabled(tree, 'dsResize', !vol || pve);
+        applyVolumeTips(tree, rec, vol, pve);
         // Snapshot actions: create/list act on a selected dataset or the pool
         // root; the rollback/rename/destroy trio act on a selected snapshot row.
         setDisabled(tree, 'snapCreate', !dsOrRoot || pve);
@@ -615,6 +686,52 @@
         setDisabled(tree, 'snapRename', !snap);
         setDisabled(tree, 'snapClone', !snap);
         setDisabled(tree, 'snapDestroy', !snap);
+    }
+
+    // Story iscsi.3 — say WHY a button is off on a volume row. The reason has
+    // to ride the button itself: a toolbar that greys out three controls with no
+    // explanation reads as a bug, and ExtJS keeps a disabled button's `title`
+    // tooltip live. Restores each button's standing tooltip when the selection
+    // moves off a volume, so the reason never lingers on a filesystem row.
+    var VOLUME_TIPS = {
+        dsEdit: 'Filesystem properties (record size, quota, atime) do not exist '
+            + 'on a ZFS volume. Use Resize Volume to grow it.',
+        dsPerms: 'A volume has no mountpoint, so it has no file permissions to edit.',
+        dsShare: 'A volume is a block device with no path to share. Block export '
+            + 'is the iSCSI menu, not a file share.',
+    };
+
+    function setTip(tree, itemId, text) {
+        try {
+            var btn = tree.down('#' + itemId);
+            if (!btn) {
+                return;
+            }
+            if (typeof btn.setTooltip === 'function') {
+                btn.setTooltip(text || undefined);
+            }
+            btn.tooltip = text || undefined;
+        } catch (e) {
+            // a missing tooltip never breaks the toolbar
+        }
+    }
+
+    function applyVolumeTips(tree, rec, vol, pve) {
+        try {
+            for (var id in VOLUME_TIPS) {
+                if (Object.prototype.hasOwnProperty.call(VOLUME_TIPS, id)) {
+                    setTip(tree, id, vol ? t(VOLUME_TIPS[id]) : '');
+                }
+            }
+            // Resize is the volume-only action: on any other row, say so.
+            setTip(tree, 'dsResize',
+                vol
+                    ? (pve ? t('PVE manages this pool — its volumes are hands-off in ANAS.') : '')
+                    : t('Select a ZFS volume to resize. Filesystem datasets grow '
+                        + 'on demand and are bounded by their quota instead.'));
+        } catch (e) {
+            // fail-open — tooltips are an explanation, not a gate
+        }
     }
 
     // ---- Contextual "Share…" (Epic 6/7, DESIGN 5d) -------------------------
@@ -694,6 +811,80 @@
         ];
     }
 
+    // ---- Volume sizing (story iscsi.3) ------------------------------------
+    //
+    // A zvol's size is a byte COUNT on the wire (the shared VolSize schema), but
+    // nobody types 2147483648. The dialogs pair a number with a unit picker and
+    // do the arithmetic here, in one place, so Create and Resize can never
+    // disagree about what "2 GiB" means.
+
+    var SIZE_UNITS = [
+        { value: 1048576, label: 'MiB' },
+        { value: 1073741824, label: 'GiB' },
+        { value: 1099511627776, label: 'TiB' },
+    ];
+
+    function sizeUnitStore() {
+        return SIZE_UNITS.slice();
+    }
+
+    // Bytes → { amount, unit } using the largest unit that divides exactly, so
+    // a size we round-trip comes back as the same number the user typed.
+    function splitSize(bytes) {
+        var n = Number(bytes) || 0;
+        for (var i = SIZE_UNITS.length - 1; i >= 0; i--) {
+            var u = SIZE_UNITS[i].value;
+            if (n >= u && n % u === 0) {
+                return { amount: n / u, unit: u };
+            }
+        }
+        return { amount: n / SIZE_UNITS[0].value, unit: SIZE_UNITS[0].value };
+    }
+
+    // Read a #size + #unit pair back into bytes. Returns 0 on anything the
+    // caller should refuse (blank, non-numeric, non-positive).
+    function readSize(win) {
+        try {
+            var amount = Number(win.down('#size').getValue());
+            var unit = Number(win.down('#unit').getValue()) || SIZE_UNITS[0].value;
+            if (!amount || isNaN(amount) || amount <= 0) {
+                return 0;
+            }
+            return Math.round(amount * unit);
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // Volume block sizes ZFS accepts, as byte values. The blank row means "send
+    // nothing" — ZFS then applies its OWN default, which is the honest choice
+    // for a create-only property whose default has moved between OpenZFS
+    // releases. `blankLabel` names that default when the daemon could observe
+    // it, so the dialog states a fact rather than a hard-coded guess.
+    function volblocksizeStore(blankLabel) {
+        return [
+            { value: '', label: blankLabel },
+            { value: 4096, label: '4K' },
+            { value: 8192, label: '8K' },
+            { value: 16384, label: '16K' },
+            { value: 32768, label: '32K' },
+            { value: 65536, label: '64K' },
+            { value: 131072, label: '128K' },
+        ];
+    }
+
+    // The label for that blank row: "(ZFS default — 16K)" when the daemon told
+    // us what the running ZFS actually defaults to, plain "(ZFS default)" when
+    // it could not (no volume on the pool to read it from, or an older daemon
+    // that does not send `defaults`). Never invents a number.
+    function volblocksizeBlankLabel(bytes) {
+        var n = Number(bytes);
+        if (!n || isNaN(n)) {
+            return t('(ZFS default)');
+        }
+        return t('(ZFS default') + ' — ' + ANAS.formatBytes(n) + ')';
+    }
+
     // Make sure the Edit picker can display the dataset's CURRENT record size
     // even when it is not one of the common sizes we offer — otherwise an
     // unlisted value would render as the blank row and read as "unchanged".
@@ -745,6 +936,17 @@
             data: poolData,
         });
 
+        // Story iscsi.3: the ZFS-observed default volblocksize, stashed on the
+        // tree by loadTree from the dataset list's `defaults`. Undefined when
+        // the daemon is older or the pool has no volume to read it from — the
+        // dialog then says "(ZFS default)" with no number.
+        var volblockDefault;
+        try {
+            volblockDefault = tree && tree.anasVolblocksizeDefault;
+        } catch (eDef) {
+            volblockDefault = undefined;
+        }
+
         var win;
         try {
             win = Ext.create('Ext.window.Window', {
@@ -782,6 +984,34 @@
                             emptyText: 'media/movies',
                             allowBlank: false,
                             value: parentRel,
+                        },
+                        {
+                            // Story iscsi.3. A volume is a dataset of another
+                            // TYPE — same endpoint, same dialog, a different
+                            // field set below. Choosing it swaps the ZFS
+                            // filesystem properties (which a zvol does not
+                            // have) for the zvol ones.
+                            xtype: 'combobox',
+                            itemId: 'dsType',
+                            cls: 'anas-fld-ds-type',
+                            fieldLabel: t('Type'),
+                            store: Ext.create('Ext.data.Store', {
+                                fields: ['value', 'label'],
+                                data: [
+                                    { value: 'filesystem', label: t('Filesystem') },
+                                    { value: 'volume', label: t('Volume (zvol — block device)') },
+                                ],
+                            }),
+                            valueField: 'value',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            value: 'filesystem',
+                            listeners: {
+                                change: function (f) { syncCreateType(win); },
+                                afterrender: function (f) { syncCreateType(win); },
+                            },
                         },
                         {
                             xtype: 'combobox',
@@ -825,6 +1055,72 @@
                             minValue: 0,
                             value: 0,
                         },
+                        // ---- Volume-only fields (hidden for a filesystem) ----
+                        {
+                            xtype: 'numberfield',
+                            itemId: 'size',
+                            cls: 'anas-fld-vol-size',
+                            fieldLabel: t('Size'),
+                            minValue: 0,
+                            value: 8,
+                            hidden: true,
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'unit',
+                            cls: 'anas-fld-vol-unit',
+                            fieldLabel: t('Size unit'),
+                            store: Ext.create('Ext.data.Store', {
+                                fields: ['value', 'label'],
+                                data: sizeUnitStore(),
+                            }),
+                            valueField: 'value',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            value: 1073741824,
+                            hidden: true,
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'volblocksize',
+                            cls: 'anas-fld-volblocksize',
+                            fieldLabel: t('Block size'),
+                            store: Ext.create('Ext.data.Store', {
+                                fields: ['value', 'label'],
+                                data: volblocksizeStore(volblocksizeBlankLabel(volblockDefault)),
+                            }),
+                            valueField: 'value',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            value: '',
+                            hidden: true,
+                        },
+                        {
+                            xtype: 'checkboxfield',
+                            itemId: 'sparse',
+                            cls: 'anas-fld-vol-sparse',
+                            fieldLabel: t('Sparse'),
+                            boxLabel: t('Thin-provision (no reservation)'),
+                            hidden: true,
+                        },
+                        {
+                            // The honest caveat behind that checkbox: a THICK
+                            // volume holds its whole size via the refreservation
+                            // and never shows reclaim in `used`, so "thin" only
+                            // means anything when this box is ticked.
+                            xtype: 'component',
+                            itemId: 'anasSparseNote',
+                            hidden: true,
+                            margin: '0 0 8 0',
+                            style: 'color:gray;font-size:11px;',
+                            html: enc(t('Block size cannot be changed after creation. '
+                                + 'Without Sparse the volume reserves its full size up '
+                                + 'front and never releases freed blocks back to the pool.')),
+                        },
                     ],
                 }],
                 buttons: [
@@ -854,6 +1150,52 @@
         win.show();
     }
 
+    // Story iscsi.3: swap the Create dialog's field set between the two dataset
+    // types. Hidden AND disabled: hiding alone would leave a stale value that
+    // submitCreate could still read, and the whole point is that a filesystem
+    // body carries no zvol keys and a volume body carries no filesystem ones.
+    var FS_ONLY_FIELDS = ['recordsize', 'quota', 'reservation'];
+    var VOL_ONLY_FIELDS = ['size', 'unit', 'volblocksize', 'sparse', 'anasSparseNote'];
+
+    function showFields(win, ids, show) {
+        for (var i = 0; i < ids.length; i++) {
+            var f = win.down('#' + ids[i]);
+            if (!f) {
+                continue;
+            }
+            try {
+                f.setHidden(!show);
+            } catch (eHide) {
+                f.hidden = !show;
+            }
+            if (typeof f.setDisabled === 'function') {
+                f.setDisabled(!show);
+            }
+        }
+    }
+
+    function createTypeOf(win) {
+        try {
+            var f = win && win.down('#dsType');
+            return (f && f.getValue()) === 'volume' ? 'volume' : 'filesystem';
+        } catch (e) {
+            return 'filesystem';
+        }
+    }
+
+    function syncCreateType(win) {
+        try {
+            if (!win) {
+                return;
+            }
+            var isVol = createTypeOf(win) === 'volume';
+            showFields(win, FS_ONLY_FIELDS, !isVol);
+            showFields(win, VOL_ONLY_FIELDS, isVol);
+        } catch (e) {
+            ANAS.warn('dataset type switch failed: ' + ANAS.errText(e));
+        }
+    }
+
     function submitCreate(win, node, tree) {
         var form = win.down('#form');
         var basicForm = form && form.getForm();
@@ -877,25 +1219,60 @@
             return;
         }
 
+        var isVolume = createTypeOf(win) === 'volume';
+
         var props = {};
         var compression = win.down('#compression').getValue();
         if (compression) {
             props.compression = compression;
         }
-        var recordsize = win.down('#recordsize').getValue();
-        if (recordsize) {
-            props.recordsize = Number(recordsize);
-        }
-        var quota = Number(win.down('#quota').getValue()) || 0;
-        if (quota > 0) {
-            props.quota = quota;
-        }
-        var reservation = Number(win.down('#reservation').getValue()) || 0;
-        if (reservation > 0) {
-            props.reservation = reservation;
+        // Filesystem-only properties: ZFS does not carry recordsize or quota on
+        // a zvol at all, and the shared schema refuses a body that sends them
+        // with type 'volume'. Reading them only on the filesystem branch keeps
+        // the two bodies disjoint by construction.
+        if (!isVolume) {
+            var recordsize = win.down('#recordsize').getValue();
+            if (recordsize) {
+                props.recordsize = Number(recordsize);
+            }
+            var quota = Number(win.down('#quota').getValue()) || 0;
+            if (quota > 0) {
+                props.quota = quota;
+            }
+            var reservation = Number(win.down('#reservation').getValue()) || 0;
+            if (reservation > 0) {
+                props.reservation = reservation;
+            }
         }
 
         var body = { path: path };
+
+        if (isVolume) {
+            var volsize = readSize(win);
+            if (!volsize) {
+                ANAS.alertMsg('Invalid input', t('Enter a volume size.'));
+                return;
+            }
+            if (volsize < 1048576) {
+                ANAS.alertMsg('Invalid input', t('A volume must be at least 1 MiB.'));
+                return;
+            }
+            // `type` is sent ONLY for a volume, so a filesystem create is the
+            // byte-identical body it was before this story — an older daemon
+            // that has never heard of volumes still handles it (version skew).
+            body.type = 'volume';
+            body.volsize = volsize;
+            var vbs = win.down('#volblocksize').getValue();
+            if (vbs) {
+                // Blank = send nothing = ZFS's own default. Never a hard-coded
+                // number: volblocksize is create-only and the default has moved.
+                body.volblocksize = Number(vbs);
+            }
+            if (win.down('#sparse').getValue()) {
+                body.sparse = true;
+            }
+        }
+
         if (Object.keys(props).length) {
             body.properties = props;
         }
@@ -907,7 +1284,8 @@
             body: body,
             view: win,
             failTitle: 'Create failed',
-            successMsg: t('Dataset created') + ': ' + pool + '/' + path,
+            successMsg: (isVolume ? t('Volume created') : t('Dataset created'))
+                + ': ' + pool + '/' + path,
             onComplete: function () {
                 if (!win.destroyed && !win.destroying) {
                     win.close();
@@ -928,34 +1306,68 @@
         return Number(v) === 0 ? '&mdash;' : enc(ANAS.formatBytes(v));
     }
 
+    // Story iscsi.3: a value the daemon did not report is "unknown", which is a
+    // different statement from zero. Say so rather than printing "0 B".
+    function unknownOrBytes(v) {
+        if (v === undefined || v === null) {
+            return '<span style="color:gray;">' + enc(t('unknown')) + '</span>';
+        }
+        return enc(ANAS.formatBytes(v));
+    }
+
     function usageHtml(d) {
+        var isVol = d.type === 'volume';
         var rows = ''
             + kv(t('Name'), enc(d.name))
-            + kv(t('Type'), enc(d.type))
-            + kv(t('Mountpoint'), enc(d.mountpoint || '—'))
-            + kv(t('Used'), enc(ANAS.formatBytes(d.used)))
+            + kv(t('Type'), enc(isVol ? t('volume (zvol)') : d.type));
+        if (isVol) {
+            // Story iscsi.3 — the three facts that define a zvol. `volsize` is
+            // the exported size; `used` is what the pool actually spends on it,
+            // which on a THICK volume is the refreservation rather than what has
+            // been written, so the two are shown together and never conflated.
+            rows += kv(t('Volume size (volsize)'), unknownOrBytes(d.volsize))
+                + kv(t('Block size (volblocksize)'), unknownOrBytes(d.volblocksize))
+                + kv(t('Provisioning'), d.sparse === undefined || d.sparse === null
+                    ? '<span style="color:gray;">' + enc(t('unknown')) + '</span>'
+                    : enc(d.sparse
+                        ? t('sparse (thin — no refreservation)')
+                        : t('thick (refreservation holds the full size)')));
+        } else {
+            rows += kv(t('Mountpoint'), enc(d.mountpoint || '—'));
+        }
+        rows += kv(t('Used'), enc(ANAS.formatBytes(d.used)))
             + kv(t('Available'), enc(ANAS.formatBytes(d.available)))
-            + kv(t('Referenced'), enc(ANAS.formatBytes(d.referenced)))
-            + kv(t('Quota'), dashOrBytes(d.quota))
-            + kv(t('Compression'), enc(d.compression)
-                + (Number(d.compressratio) > 0
-                    ? ' <span class="anas-detail-compressratio">('
-                        + Number(d.compressratio).toFixed(2) + 'x)</span>'
-                    : ''));
+            + kv(t('Referenced'), enc(ANAS.formatBytes(d.referenced)));
+        if (!isVol) {
+            rows += kv(t('Quota'), dashOrBytes(d.quota));
+        }
+        rows += kv(t('Compression'), enc(d.compression)
+            + (Number(d.compressratio) > 0
+                ? ' <span class="anas-detail-compressratio">('
+                    + Number(d.compressratio).toFixed(2) + 'x)</span>'
+                : ''));
         return '<table style="border-collapse:collapse;">' + rows + '</table>';
     }
 
-    function propsHtml(p) {
+    // `type` decides which property rows are real: ZFS does not carry
+    // recordsize, quota, refquota or atime on a volume AT ALL (verified against
+    // a real zvol's `zfs get all`), so listing them there would print zeros for
+    // properties that do not exist.
+    function propsHtml(p, type) {
         p = p || {};
-        var rows = ''
-            + kv(t('compression'), enc(p.compression))
-            + kv(t('recordsize'), enc(ANAS.formatBytes(p.recordsize)))
-            + kv(t('quota'), dashOrBytes(p.quota))
-            + kv(t('reservation'), dashOrBytes(p.reservation))
-            + kv(t('refquota'), dashOrBytes(p.refquota))
-            + kv(t('refreservation'), dashOrBytes(p.refreservation))
-            + kv(t('atime'), enc(ANAS.formatBool(p.atime)))
-            + kv(t('sync'), enc(p.sync))
+        var isVol = type === 'volume';
+        var rows = '' + kv(t('compression'), enc(p.compression));
+        if (!isVol) {
+            rows += kv(t('recordsize'), enc(ANAS.formatBytes(p.recordsize)))
+                + kv(t('quota'), dashOrBytes(p.quota))
+                + kv(t('refquota'), dashOrBytes(p.refquota));
+        }
+        rows += kv(t('reservation'), dashOrBytes(p.reservation))
+            + kv(t('refreservation'), dashOrBytes(p.refreservation));
+        if (!isVol) {
+            rows += kv(t('atime'), enc(ANAS.formatBool(p.atime)));
+        }
+        rows += kv(t('sync'), enc(p.sync))
             + kv(t('readonly'), enc(ANAS.formatBool(p.readonly)))
             + kv(t('dedup'), enc(p.dedup));
         return '<table style="border-collapse:collapse;">' + rows + '</table>';
@@ -1010,7 +1422,7 @@
             content.add(ANAS.errorPanel(t('No dataset detail returned.')));
             return;
         }
-        content.add([
+        var panels = [
             {
                 xtype: 'panel',
                 title: t('Usage'),
@@ -1023,24 +1435,31 @@
                 title: t('Properties'),
                 bodyPadding: 10,
                 border: false,
-                html: propsHtml(d.properties),
+                html: propsHtml(d.properties, d.type),
             },
-            {
+        ];
+        // Story iscsi.3: a volume has no mountpoint, so it has neither POSIX
+        // permissions nor shares. Those panels are dropped rather than shown
+        // empty — an empty "Associated Shares" on a zvol invites the question
+        // "how do I share it?", whose answer is the iSCSI menu, not this window.
+        if (d.type !== 'volume') {
+            panels.push({
                 xtype: 'panel',
                 title: t('Permissions'),
                 bodyPadding: 10,
                 border: false,
                 html: permsHtml(d.permissions),
-            },
-            {
+            });
+            panels.push({
                 xtype: 'panel',
                 cls: 'anas-detail-shares',
                 title: t('Associated Shares'),
                 bodyPadding: 10,
                 border: false,
                 html: sharesHtml(d.associatedShares),
-            },
-        ]);
+            });
+        }
+        content.add(panels);
     }
 
     function openDetail(node, rec) {
@@ -1296,6 +1715,13 @@
             ANAS.toast(t('PVE manages this pool — properties are read-only in ANAS.'));
             return;
         }
+        // Story iscsi.3: this dialog edits FILESYSTEM properties — recordsize,
+        // quota, atime — none of which ZFS carries on a zvol. Soft gate to
+        // match the toolbar, pointing at the action that does apply.
+        if (isVolume(rec)) {
+            ANAS.toast(t('A volume has no filesystem properties — use Resize Volume to grow it.'));
+            return;
+        }
         if (typeof ANAS.editWindow !== 'function') {
             ANAS.warn('ANAS.editWindow unavailable — cannot edit dataset properties');
             return;
@@ -1414,6 +1840,162 @@
                         loadTree(tree, node);
                     },
                 });
+            },
+        });
+    }
+
+    // ---- Resize Volume (story iscsi.3) ------------------------------------
+    //
+    // GROW only. `zfs set volsize=` is live — under an iSCSI LUN the initiator
+    // simply rescans and sees the bigger disk — but ZFS will just as happily
+    // SHRINK a volume, truncating it silently, with a live session and a
+    // mounted filesystem on the other end. So the daemon refuses a shrink with
+    // a Level 1 409 and this dialog refuses it first, saying why.
+    //
+    // Test hooks: window 'anas-win-volume-resize', size 'anas-fld-vol-size',
+    // unit 'anas-fld-vol-unit', submit 'anas-btn-volume-resize-submit'.
+
+    function openVolumeResize(node, tree, rec) {
+        if (!isVolume(rec)) {
+            return;
+        }
+        // Story 3.25: PVE's own zvols are hands-off, exactly like its datasets —
+        // the same pool-level tag, not a second check.
+        if (recPveManaged(rec)) {
+            ANAS.toast(t('PVE manages this pool — its volumes are read-only in ANAS.'));
+            return;
+        }
+
+        var pool = rec.get('pool');
+        var fullName = rec.get('fullName');
+        var current = Number(rec.get('volsize')) || 0;
+        if (!current) {
+            ANAS.alertMsg('Cannot resize', t('This volume\'s current size is unknown, so a grow cannot be checked against it.'));
+            return;
+        }
+        var split = splitSize(current);
+
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-volume-resize',
+                title: t('Resize Volume') + ': ' + fullName,
+                modal: true,
+                width: 480,
+                resizable: false,
+                layout: 'fit',
+                items: [{
+                    xtype: 'form',
+                    itemId: 'form',
+                    bodyPadding: 12,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 170 },
+                    items: [
+                        {
+                            xtype: 'displayfield',
+                            itemId: 'currentSize',
+                            fieldLabel: t('Current size'),
+                            value: enc(ANAS.formatBytes(current)),
+                        },
+                        {
+                            xtype: 'numberfield',
+                            itemId: 'size',
+                            cls: 'anas-fld-vol-size',
+                            fieldLabel: t('New size'),
+                            minValue: 0,
+                            value: split.amount,
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'unit',
+                            cls: 'anas-fld-vol-unit',
+                            fieldLabel: t('Size unit'),
+                            store: Ext.create('Ext.data.Store', {
+                                fields: ['value', 'label'],
+                                data: sizeUnitStore(),
+                            }),
+                            valueField: 'value',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            value: split.unit,
+                        },
+                        {
+                            xtype: 'component',
+                            margin: '4 0 0 0',
+                            style: 'color:gray;font-size:11px;',
+                            html: enc(t('A volume can only grow. Shrinking truncates it — '
+                                + 'ZFS does this silently, even while something is using the '
+                                + 'device — so it is refused. Growth takes effect immediately; '
+                                + 'anything using the volume has to rescan to see the new size.')),
+                        },
+                    ],
+                }],
+                buttons: [
+                    {
+                        text: t('Cancel'),
+                        handler: function () {
+                            win.close();
+                        },
+                    },
+                    {
+                        text: t('Resize'),
+                        cls: 'anas-btn-volume-resize-submit',
+                        handler: function () {
+                            try {
+                                submitVolumeResize(win, node, tree, pool, fullName, current);
+                            } catch (e) {
+                                ANAS.warn('volume resize submit failed: ' + ANAS.errText(e));
+                            }
+                        },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('volume resize window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+    }
+
+    function submitVolumeResize(win, node, tree, pool, fullName, current) {
+        var next = readSize(win);
+        if (!next) {
+            ANAS.alertMsg('Invalid input', t('Enter a new size.'));
+            return;
+        }
+        // An UNTOUCHED edit sends nothing at all — the dialog↔daemon contract:
+        // reopening and saving without changing anything must not mutate the
+        // volume (and must not even reach the daemon).
+        if (next === current) {
+            ANAS.toast(t('No changes to save'));
+            win.close();
+            return;
+        }
+        if (next < current) {
+            // Refused here AND at the daemon (Principle 14 — the API is the
+            // authority; this is the same refusal said early, not instead).
+            ANAS.alertMsg('Cannot shrink', t('A volume can only grow.') + ' '
+                + fullName + ' ' + t('is') + ' ' + ANAS.formatBytes(current) + '; '
+                + ANAS.formatBytes(next) + ' ' + t('is smaller. Destroy and recreate '
+                    + 'the volume to make it smaller.'));
+            return;
+        }
+
+        ANAS.runJob({
+            node: node,
+            method: 'put',
+            path: datasetPath(pool, fullName),
+            body: { properties: { volsize: next } },
+            view: win,
+            failTitle: 'Resize failed',
+            successMsg: t('Volume resized') + ': ' + fullName + ' → ' + ANAS.formatBytes(next),
+            onComplete: function () {
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+                loadTree(tree, node);
             },
         });
     }
@@ -3132,14 +3714,20 @@
                     + '<span class="anas-ds-nm">' + label + '</span>' + pveBadge;
             }
             if (kind === 'dataset') {
+                // Story iscsi.3: a volume is a block device, not a container of
+                // files — it gets the shared layer's own object glyph rather
+                // than a folder that would misdescribe it.
+                if (rec.get('type') === 'volume') {
+                    return ANAS.gfx.objectIcon('volume', { title: t('Volume (zvol)') })
+                        + '<span class="anas-ds-nm">' + label + '</span>' + pveBadge;
+                }
                 var open = false;
                 try {
                     open = !!(rec.isExpanded && rec.isExpanded());
                 } catch (e0) {
                     open = false;
                 }
-                var title = rec.get('type') === 'volume' ? t('Volume') : t('Filesystem');
-                return ANAS.gfx.objectIcon('folder', { open: open, title: title })
+                return ANAS.gfx.objectIcon('folder', { open: open, title: t('Filesystem') })
                     + '<span class="anas-ds-nm">' + label + '</span>' + pveBadge;
             }
             return label;
@@ -3224,6 +3812,33 @@
                 return '';
             }
             var parts = [];
+            // Story iscsi.3: a volume's SIZE is its volsize — the number an
+            // initiator sees — and it is not `used`, not `available` and not
+            // `quota`, so it cannot ride any existing column. It goes here as a
+            // labelled chip ("numbers carry labeled context"), together with the
+            // create-only block size and whether the volume is thin or thick.
+            if (rec.get('type') === 'volume') {
+                var vsize = Number(rec.get('volsize'));
+                if (vsize > 0) {
+                    parts.push(ANAS.gfx.chip(t('vol') + ' ' + fmtBytes(vsize), {
+                        title: t('Volume size (volsize) — what an initiator sees'),
+                    }));
+                }
+                var vbs = Number(rec.get('volblocksize'));
+                if (vbs > 0) {
+                    parts.push(ANAS.gfx.chip(fmtBytes(vbs) + ' ' + t('blocks'), {
+                        title: t('Volume block size (volblocksize) — fixed at creation'),
+                    }));
+                }
+                var sparse = rec.get('sparse');
+                if (sparse !== undefined && sparse !== null) {
+                    parts.push(ANAS.gfx.chip(sparse ? t('sparse') : t('thick'), {
+                        title: sparse
+                            ? t('Thin-provisioned — no refreservation held')
+                            : t('Thick — a refreservation holds the full size, so freed blocks never return to the pool'),
+                    }));
+                }
+            }
             var comp = rec.get('compression');
             if (comp) {
                 var ratio = Number(rec.get('compressratio'));
@@ -3500,6 +4115,12 @@
                 // collapsed rows). Both optional; degrade to nothing if absent.
                 { name: 'sharedOver', type: 'auto' },
                 { name: 'snapshotCount', type: 'auto' },
+                // Story iscsi.3: the zvol trio. 'auto' so an absent field stays
+                // undefined instead of being coerced to 0/false — "this daemon
+                // does not report it" and "it is zero" are different answers.
+                { name: 'volsize', type: 'auto' },
+                { name: 'volblocksize', type: 'auto' },
+                { name: 'sparse', type: 'auto' },
                 // Story 3.25: whole-pool PVE ownership, stamped on every pool +
                 // dataset node so row renderers/handlers branch hands-off (PVE)
                 // vs first-class-root (ANAS). pveStorages kept for future detail.
@@ -3584,6 +4205,21 @@
                         },
                     },
                 ],
+            },
+            {
+                // Story iscsi.3 — the volume's own editor. It earns a button of
+                // its own rather than overloading "Edit Properties", because it
+                // is a different operation with a different gate: growth only,
+                // live, and irreversible in the other direction.
+                text: t('Resize Volume'),
+                itemId: 'dsResize',
+                cls: 'anas-btn-ds-resize',
+                iconCls: 'fa fa-arrows-h',
+                disabled: true,
+                handler: function (btn) {
+                    var tree = btn.up('treepanel');
+                    openVolumeResize(node, tree, selectedRecord(tree));
+                },
             },
             {
                 text: t('Destroy'),

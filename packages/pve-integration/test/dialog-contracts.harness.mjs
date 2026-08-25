@@ -21,6 +21,13 @@
  *      of the WHOLE task, so it drops fields just as easily as the dialog.
  *   3. Import Pool sends the GUID it displays — duplicate-name imports are the
  *      whole reason the scan reports a GUID.
+ *   4. Datasets: a VOLUME (zvol) and a FILESYSTEM are the same dialog sending
+ *      two different bodies (story iscsi.3). Guards that a filesystem create is
+ *      still byte-identical to what it was before volumes existed (version
+ *      skew), that a volume create carries the zvol keys and NO filesystem
+ *      ones, that Resize Volume grows only — an untouched edit sends nothing, a
+ *      shrink sends nothing — and the toolbar gating matrix for a volume row,
+ *      including the tooltip reason on each disabled control.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -54,6 +61,38 @@ function eq(label, actual, expected) {
 function makeRecord(data) {
   const d = { ...data }
   return { data: d, get: k => d[k], set: (k, v) => { d[k] = v } }
+}
+
+/**
+ * A tree node as the ES5 sources use one: get()/set(), childNodes, isExpanded().
+ * Built from the plain `{ …fields, children: [] }` objects buildPoolNode emits.
+ */
+function makeNode(cfg, parent) {
+  const data = { ...cfg }
+  const kids = data.children || []
+  delete data.children
+  const node = {
+    data,
+    parentNode: parent || null,
+    get: k => data[k],
+    set: (k, v) => { data[k] = v },
+    isExpanded: () => !!data.expanded,
+    childNodes: [],
+  }
+  for (const kid of kids) { node.childNodes.push(makeNode(kid, node)) }
+  return node
+}
+
+function makeTreeStore(cfg) {
+  const store = {
+    isStore: true,
+    isTreeStore: true,
+    fields: (cfg.fields || []).map(f => (typeof f === 'string' ? f : f.name)),
+    root: makeNode(cfg.root || { children: [] }, null),
+    getRootNode() { return this.root },
+    setRootNode(rootCfg) { this.root = makeNode(rootCfg, null); return this.root },
+  }
+  return store
 }
 
 function makeStore(cfg) {
@@ -181,6 +220,17 @@ function makeComponent(cfg, parent) {
 
   c.getStore = () => c.store
   c.getSelection = () => c._selection.slice()
+  // Tree panels delegate the root to their store (the ES5 sources call both).
+  c.getRootNode = () => (c.store && c.store.getRootNode ? c.store.getRootNode() : null)
+  c.setRootNode = function (rootCfg) {
+    return c.store && c.store.setRootNode ? c.store.setRootNode(rootCfg) : null
+  }
+  /** Select a TREE node (as opposed to a grid row) and fire selectionchange. */
+  c.selectNode = function (node) {
+    c._selection = node ? [node] : []
+    c.fireEvent('selectionchange', {}, c._selection)
+    return node
+  }
   c.getSelectionModel = () => ({
     select(idx) {
       const rec = c.store.getAt(idx)
@@ -220,7 +270,9 @@ function makeComponent(cfg, parent) {
 const created = { windows: [] }
 
 const Ext = {
+  ComponentQuery: { query: () => [] },
   create(cls, cfg) {
+    if (cls === 'Ext.data.TreeStore') { return makeTreeStore(cfg || {}) }
     if (cls === 'Ext.data.Store') { return makeStore(cfg || {}) }
     const cmp = makeComponent({ xtype: 'window', ...(cfg || {}) }, null)
     if (cls === 'Ext.window.Window') { created.windows.push(cmp) }
@@ -254,6 +306,13 @@ function makeAnas(routes) {
   return {
     views: {},
     pools: { registerAction(a) { this._actions = (this._actions || []).concat([a]) }, reload() {} },
+    datasets: {},
+    // The Datasets view degrades gracefully without the gfx layer (every call
+    // site checks gfxReady first), and this harness is about what the dialogs
+    // SEND, not what they draw — so gfx stays absent here on purpose.
+    formatBytes: n => `${Number(n) || 0} B`,
+    formatBool: b => (b ? 'on' : 'off'),
+    editWindow: () => null,
     t: s => s,
     enc: s => String(s == null ? '' : s),
     warn(m) { warnings.push(m) },
@@ -295,10 +354,16 @@ function makeAnas(routes) {
 }
 
 function loadSource(file, routes) {
+  const head = { appendChild() {} }
   const doc = {
     hidden: false,
+    head,
+    documentElement: head,
     addEventListener() {},
     removeEventListener() {},
+    getElementById: () => null,
+    getElementsByTagName: () => [head],
+    createTextNode: text => ({ text }),
     createElement: () => ({ style: {}, appendChild() {}, setAttribute() {} }),
   }
   const win = { document: doc, ANAS: makeAnas(routes) }
@@ -475,11 +540,247 @@ async function poolImportChecks() {
   ok('import: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+
+// ============================================================================
+//  4. Datasets: filesystem vs volume — what each one sends, and what a volume
+//     row does to the toolbar (story iscsi.3)
+// ============================================================================
+
+const GiB = 1024 * 1024 * 1024
+
+// One ANAS-managed pool with a filesystem and a real-shaped zvol, and one
+// PVE-managed pool whose zvol must stay hands-off (story 3.25 — the SAME
+// pool-level tag as its datasets, not a second check).
+const DS_POOLS = [
+  { name: 'tank', size: 8 * GiB, pveStorages: [] },
+  { name: 'pvepool', size: 8 * GiB, pveStorages: [{ id: 'local-zfs', type: 'zfspool' }] },
+]
+
+const TANK_DATASETS = [
+  { name: 'tank', pool: 'tank', type: 'filesystem', used: 1, available: 1, referenced: 1, mountpoint: '/tank', compression: 'lz4', compressratio: 1, quota: 0 },
+  { name: 'tank/media', pool: 'tank', type: 'filesystem', used: 1, available: 1, referenced: 1, mountpoint: '/tank/media', compression: 'lz4', compressratio: 1, quota: 0 },
+  { name: 'tank/vol1', pool: 'tank', type: 'volume', used: 2 * GiB, available: 1, referenced: 1, mountpoint: null, compression: 'on', compressratio: 1, quota: 0, volsize: 2 * GiB, volblocksize: 16384, sparse: false },
+]
+
+const PVE_DATASETS = [
+  { name: 'pvepool', pool: 'pvepool', type: 'filesystem', used: 1, available: 1, referenced: 1, mountpoint: '/pvepool', compression: 'on', compressratio: 1, quota: 0 },
+  { name: 'pvepool/vm-100-disk-0', pool: 'pvepool', type: 'volume', used: GiB, available: 1, referenced: 1, mountpoint: null, compression: 'on', compressratio: 1, quota: 0, volsize: GiB, volblocksize: 8192, sparse: true },
+]
+
+const DATASET_ROUTES = {
+  'GET /pools': { data: DS_POOLS },
+  // `defaults` is the ZFS-observed volblocksize the Create dialog must QUOTE
+  // rather than hard-code.
+  'GET /pools/tank/datasets': { data: TANK_DATASETS, defaults: { volblocksize: 16384 } },
+  'GET /pools/pvepool/datasets': { data: PVE_DATASETS, defaults: { volblocksize: 16384 } },
+}
+
+/** Find a node in the loaded tree by its full ZFS name. */
+function findNode(tree, fullName) {
+  const walk = (node) => {
+    if (node.get && node.get('fullName') === fullName) { return node }
+    for (const kid of node.childNodes || []) {
+      const hit = walk(kid)
+      if (hit) { return hit }
+    }
+    return null
+  }
+  return walk(tree.getRootNode())
+}
+
+/** The toolbar's disabled/tooltip state, keyed by itemId. */
+function toolbarState(tree, ids) {
+  const out = {}
+  for (const id of ids) {
+    const btn = tree.down(`#${id}`)
+    out[id] = btn ? { disabled: !!btn.disabled, tip: btn.tooltip || '' } : null
+  }
+  return out
+}
+
+async function datasetsChecks() {
+  const ANAS = loadSource('60-datasets.js', DATASET_ROUTES)
+  const view = makeComponent(ANAS.views.datasets.factory('harness'), null)
+  const tree = view.down('#dsTree')
+  ok('datasets: the tree panel exists', !!tree)
+  tree.fireEvent('afterrender', tree)
+  await settle()
+
+  const fsNode = findNode(tree, 'tank/media')
+  const volNode = findNode(tree, 'tank/vol1')
+  const pveVolNode = findNode(tree, 'pvepool/vm-100-disk-0')
+  ok('datasets: the filesystem row loaded', !!fsNode)
+  ok('datasets: the volume row loaded', !!volNode)
+  ok('datasets: the PVE-owned zvol loaded', !!pveVolNode)
+  if (!fsNode || !volNode || !pveVolNode) { return }
+
+  eq('datasets: the volume row carries volsize', volNode.get('volsize'), 2 * GiB)
+  eq('datasets: the volume row carries volblocksize', volNode.get('volblocksize'), 16384)
+  eq('datasets: the volume row carries sparse', volNode.get('sparse'), false)
+  eq('datasets: a filesystem row carries NO volsize', fsNode.get('volsize'), undefined)
+  eq('datasets: the observed ZFS default reached the tree', tree.anasVolblocksizeDefault, 16384)
+
+  // --- 4a. The gating matrix -------------------------------------------------
+  const GATED = ['dsEdit', 'dsPerms', 'dsShare', 'dsResize', 'dsDestroy', 'dsDetail']
+
+  tree.selectNode(fsNode)
+  let state = toolbarState(tree, GATED)
+  ok('gating(filesystem): Edit Properties enabled', state.dsEdit.disabled === false)
+  ok('gating(filesystem): Permissions enabled', state.dsPerms.disabled === false)
+  ok('gating(filesystem): Share… enabled', state.dsShare.disabled === false)
+  ok('gating(filesystem): Destroy enabled', state.dsDestroy.disabled === false)
+  ok('gating(filesystem): Resize Volume DISABLED', state.dsResize.disabled === true)
+  ok('gating(filesystem): Resize says why it is off', /volume/i.test(state.dsResize.tip), state.dsResize.tip)
+  ok('gating(filesystem): Edit carries no volume excuse', state.dsEdit.tip === '', state.dsEdit.tip)
+
+  tree.selectNode(volNode)
+  state = toolbarState(tree, GATED)
+  ok('gating(volume): Edit Properties DISABLED', state.dsEdit.disabled === true)
+  ok('gating(volume): Permissions DISABLED', state.dsPerms.disabled === true)
+  ok('gating(volume): Share… DISABLED', state.dsShare.disabled === true)
+  ok('gating(volume): Resize Volume ENABLED', state.dsResize.disabled === false)
+  ok('gating(volume): Destroy stays enabled', state.dsDestroy.disabled === false)
+  ok('gating(volume): Detail stays enabled', state.dsDetail.disabled === false)
+  // Every disabled control explains ITSELF — a greyed button with no reason
+  // reads as a bug rather than as a rule.
+  ok('gating(volume): Edit says filesystem properties do not exist', /Resize Volume/.test(state.dsEdit.tip), state.dsEdit.tip)
+  ok('gating(volume): Permissions says there is no mountpoint', /mountpoint/.test(state.dsPerms.tip), state.dsPerms.tip)
+  ok('gating(volume): Share says a volume has no path', /iSCSI/.test(state.dsShare.tip), state.dsShare.tip)
+
+  tree.selectNode(pveVolNode)
+  state = toolbarState(tree, GATED)
+  ok('gating(PVE volume): Resize DISABLED (3.25 hands-off)', state.dsResize.disabled === true)
+  ok('gating(PVE volume): Destroy DISABLED', state.dsDestroy.disabled === true)
+  ok('gating(PVE volume): Edit DISABLED', state.dsEdit.disabled === true)
+  ok('gating(PVE volume): Detail still enabled (read-only is allowed)', state.dsDetail.disabled === false)
+
+  // --- 4b. Create: filesystem body is unchanged, volume body is new ----------
+  tree.selectNode(fsNode)
+  jobs.length = 0
+  let btn = tree.down('#dsCreate')
+  btn.handler(btn)
+  await settle()
+  let dlg = openWindow()
+  ok('create: the dialog opened', !!dlg && !!dlg.down('#dsType'))
+  if (!dlg) { return }
+  eq('create: it defaults to Filesystem', dlg.down('#dsType').getValue(), 'filesystem')
+  ok('create: the volume fields start hidden', dlg.down('#size').hidden === true)
+  ok('create: the filesystem fields start visible', dlg.down('#recordsize').hidden === false)
+
+  dlg.down('#path').setValue('media/movies')
+  dlg.down('#recordsize').setValue(131072)
+  let submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-dataset-create-submit')
+  submit.handler(submit)
+  await settle()
+  eq('create(filesystem): one job', jobs.length, 1)
+  eq('create(filesystem): posts to the pool', jobs[0].path, '/pools/tank/datasets')
+  // The body must be EXACTLY what it was before volumes existed: no `type`, no
+  // zvol keys. An older daemon has to keep understanding it (version skew).
+  eq('create(filesystem): the body is unchanged by this story',
+    jobs[0].body, { path: 'media/movies', properties: { recordsize: 131072 } })
+
+  // Now the volume branch of the same dialog.
+  jobs.length = 0
+  btn = tree.down('#dsCreate')
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#dsType').setValue('volume')
+  await settle()
+  ok('create(volume): the volume fields appear', dlg.down('#size').hidden === false)
+  ok('create(volume): the block-size picker appears', dlg.down('#volblocksize').hidden === false)
+  ok('create(volume): the filesystem fields go away', dlg.down('#recordsize').hidden === true)
+  ok('create(volume): and are disabled, so a stale value cannot be read back',
+    dlg.down('#recordsize').disabled === true)
+  // The blank block-size row STATES the observed ZFS default rather than
+  // hard-coding one.
+  const blankRow = dlg.down('#volblocksize').getStore().getAt(0)
+  eq('create(volume): the blank block-size row means "send nothing"', blankRow.get('value'), '')
+  ok('create(volume): it names the observed ZFS default', /ZFS default/.test(blankRow.get('label')), blankRow.get('label'))
+
+  dlg.down('#path').setValue('vol2')
+  dlg.down('#size').setValue(4)
+  dlg.down('#unit').setValue(GiB)
+  dlg.down('#volblocksize').setValue(8192)
+  dlg.down('#sparse').setValue(true)
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-dataset-create-submit')
+  submit.handler(submit)
+  await settle()
+  eq('create(volume): one job', jobs.length, 1)
+  eq('create(volume): the body carries type + the zvol trio, and no filesystem keys',
+    jobs[0].body, { path: 'vol2', type: 'volume', volsize: 4 * GiB, volblocksize: 8192, sparse: true })
+
+  // Blank block size ⇒ the key is ABSENT, so ZFS applies its own default.
+  jobs.length = 0
+  btn = tree.down('#dsCreate')
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#dsType').setValue('volume')
+  dlg.down('#path').setValue('vol3')
+  dlg.down('#size').setValue(512)
+  dlg.down('#unit').setValue(1024 * 1024)
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-dataset-create-submit')
+  submit.handler(submit)
+  await settle()
+  eq('create(volume): a default block size sends no volblocksize at all',
+    jobs[0].body, { path: 'vol3', type: 'volume', volsize: 512 * 1024 * 1024 })
+
+  // --- 4c. Resize Volume: grow only -----------------------------------------
+  tree.selectNode(volNode)
+
+  // (i) An UNTOUCHED edit sends nothing — the dialog↔daemon contract.
+  jobs.length = 0
+  btn = tree.down('#dsResize')
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  ok('resize: the window opened', !!dlg && !!dlg.down('#size'))
+  eq('resize: it pre-fills the CURRENT size, in the largest exact unit',
+    [dlg.down('#size').getValue(), dlg.down('#unit').getValue()], [2, GiB])
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-volume-resize-submit')
+  submit.handler(submit)
+  await settle()
+  eq('resize: an untouched edit sends NOTHING', jobs.length, 0)
+  ok('resize: an untouched edit closes the window', dlg.destroyed === true)
+
+  // (ii) A SHRINK is refused before it can reach the daemon.
+  jobs.length = 0
+  warnings.length = 0
+  btn = tree.down('#dsResize')
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#size').setValue(1)
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-volume-resize-submit')
+  submit.handler(submit)
+  await settle()
+  eq('resize: a shrink sends NOTHING', jobs.length, 0)
+  ok('resize: a shrink says why', warnings.some(w => /Cannot shrink/.test(w)), warnings.join(' | '))
+  ok('resize: a shrink leaves the window open to fix', dlg.destroyed === false)
+
+  // (iii) A GROW is a PUT of volsize alone.
+  jobs.length = 0
+  warnings.length = 0
+  dlg.down('#size').setValue(8)
+  submit.handler(submit)
+  await settle()
+  eq('resize: one job', jobs.length, 1)
+  eq('resize: it is a PUT', jobs[0].method, 'put')
+  eq('resize: it targets the volume', jobs[0].path, '/pools/tank/datasets/vol1')
+  eq('resize: it sends volsize and nothing else',
+    jobs[0].body, { properties: { volsize: 8 * GiB } })
+
+  ok('datasets: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 // ============================================================================
 
 await backupChecks()
 warnings.length = 0
 await poolImportChecks()
+warnings.length = 0
+await datasetsChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

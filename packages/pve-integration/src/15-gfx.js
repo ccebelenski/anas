@@ -34,8 +34,8 @@
  *     .anas-gfx-icon-dead            faulted/dead greyscale variant
  *     .anas-gfx-status               health status dot overlay
  *     .anas-gfx-status-<state>       +online|degraded|faulted|resilvering|spare
- *     .anas-gfx-obj                  object line-icon wrapper (pool/folder)
- *     .anas-gfx-obj-pool | -folder   object kind
+ *     .anas-gfx-obj                  object line-icon wrapper (pool/folder/volume)
+ *     .anas-gfx-obj-pool | -folder | -volume   object kind
  *     .anas-gfx-disk                 CONVENTION class for a consumer disk card
  *                                    (gfx does not emit it; views add it so the
  *                                    whole draggable tile is targetable — used by
@@ -219,6 +219,9 @@
         css.push('.anas-gfx-obj{display:inline-flex;flex:0 0 auto;color:var(--anas-muted);line-height:0}');
         css.push('.anas-gfx-obj-pool{color:var(--anas-accent)}');
         css.push('.anas-gfx-obj-folder{color:color-mix(in srgb,var(--anas-accent) 70%,var(--anas-ink))}');
+        // A block object reads as hardware, not as accent-coloured structure —
+        // the ink tone separates it from the folders it sits beside.
+        css.push('.anas-gfx-obj-volume{color:color-mix(in srgb,var(--anas-ink) 70%,var(--anas-muted))}');
         css.push('.anas-gfx-obj svg{width:17px;height:17px;fill:none;stroke:currentColor;'
             + 'stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}');
 
@@ -566,17 +569,27 @@
 
     gfx.kindLabel = kindLabel;
 
-    // Object line icons (pool = stacked layers; folder = open/closed).
+    // Object line icons (pool = stacked layers; folder = open/closed;
+    // volume = a drum, the universal block-device shape).
     var OBJ_ICONS = {
         pool: '<path d="M12 3l8 4-8 4-8-4 8-4z"/><path d="M4 12l8 4 8-4"/><path d="M4 16.5l8 4 8-4"/>',
         folderOpen: '<path d="M4 8V6a1 1 0 0 1 1-1h4l2 2h7a1 1 0 0 1 1 1v1"/>'
             + '<path d="M3.3 10h17.4l-1.8 8.2a1 1 0 0 1-1 .8H6.1a1 1 0 0 1-1-.8z"/>',
         folderClosed: '<path d="M4 6a1 1 0 0 1 1-1h4l2 2h8a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1z"/>',
+        // A block object is NOT a container of files, so it must not read as a
+        // folder: a rounded drum with a banded midline says "raw device" at a
+        // glance and cannot be mistaken for the pool's angular stacked layers.
+        volume: '<ellipse cx="12" cy="6.4" rx="6.8" ry="2.9"/>'
+            + '<path d="M5.2 6.4v11.2c0 1.6 3 2.9 6.8 2.9s6.8-1.3 6.8-2.9V6.4"/>'
+            + '<path d="M5.2 12c0 1.6 3 2.9 6.8 2.9s6.8-1.3 6.8-2.9"/>',
     };
 
     // objectIcon(kind, opts) → line-icon object span.
-    //   kind : 'pool' | 'folder'
+    //   kind : 'pool' | 'volume' | 'folder' (anything else = folder)
     //   opts : { open:bool (folder), title:String }
+    // 'volume' is the ZFS zvol / block object (story iscsi.3). It lives here
+    // rather than in the Datasets view because the shared visual layer owns
+    // every object glyph — the iSCSI screen draws the same object later.
     gfx.objectIcon = function (kind, opts) {
         try {
             ensureInjected();
@@ -585,6 +598,9 @@
             if (kind === 'pool') {
                 path = OBJ_ICONS.pool;
                 objCls = 'anas-gfx-obj anas-gfx-obj-pool';
+            } else if (kind === 'volume') {
+                path = OBJ_ICONS.volume;
+                objCls = 'anas-gfx-obj anas-gfx-obj-volume';
             } else {
                 path = opts.open ? OBJ_ICONS.folderOpen : OBJ_ICONS.folderClosed;
                 objCls = 'anas-gfx-obj anas-gfx-obj-folder';
