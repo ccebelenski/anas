@@ -617,6 +617,33 @@ describe('backup Run-Now supervision (Fix 1 — through the unit)', () => {
     assert.match(res.warnings![0], /retention prune did not run/)
   })
 
+  it('includedNested survives the supervised Run-Now (backup2.2, live-proof wave 1)', async () => {
+    const journal = [
+      '2026-08-25T21:19:14+0000 anas-pve anas-backup-nightly-etc[999]: {"task":"nightly-etc","result":{"status":"success","archives":[],"includedNested":{"gtbackup":["/gtbackup/cdm","/gtbackup/lp"]}}}',
+      '2026-08-25T21:19:14+0000 anas-pve systemd[1]: anas-backup-nightly-etc.service: Deactivated successfully.',
+    ].join('\n')
+    const exec = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        { ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0', InvocationID: 'NEW' },
+      ],
+      journal,
+    })
+    const res = await superviseRun(exec, 'nightly-etc', FAST)
+    assert.equal(res.status, 'success')
+    assert.deepEqual(res.includedNested, { gtbackup: ['/gtbackup/cdm', '/gtbackup/lp'] })
+    // An absent field stays absent — never an empty object on a run that
+    // crossed nothing (the `none` default must read as absent everywhere).
+    const plain = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        { ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0', InvocationID: 'NEW' },
+      ],
+      journal: OK_JOURNAL,
+    })
+    assert.equal((await superviseRun(plain, 'nightly-etc', FAST)).includedNested, undefined)
+  })
+
   it('failureDetailFromJournal returns pbc\'s verbatim Error line', () => {
     assert.equal(failureDetailFromJournal(FAILED_JOURNAL), 'Error: permission check failed.')
   })

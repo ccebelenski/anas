@@ -597,6 +597,13 @@ export interface SuperviseRunResult {
   prune?: BackupPruneResult
   /** Completed-with-warning detail (e.g. a prune that failed after a good backup). */
   warnings?: string[]
+  /**
+   * Nested filesystems the run actually CROSSED, per archive (backup2.2). The
+   * positive half of the never-silent contract: `warnings` names what was left
+   * out, this names what was taken in. Live-proof wave 1 found it recovered by
+   * the direct (unit) path and dropped by the supervised one.
+   */
+  includedNested?: Record<string, string[]>
 }
 
 /** The shape the backup-task helper prints as JSON (its `job.result`). */
@@ -608,6 +615,7 @@ interface HelperResult {
   reason?: string
   prune?: BackupPruneResult
   warnings?: string[]
+  includedNested?: Record<string, string[]>
 }
 
 /** Is a `systemctl show` snapshot in a still-running state? */
@@ -747,6 +755,10 @@ async function classifyTerminalRun(
     result.prune = helper.prune
   if (helper?.warnings?.length)
     result.warnings = helper.warnings
+  // backup2.2: what the run DID cross travels the same way the omissions do —
+  // a Run-Now must not report only half the boundary story.
+  if (helper?.includedNested && Object.keys(helper.includedNested).length)
+    result.includedNested = helper.includedNested
   if (helper?.reason)
     result.reason = helper.reason
   else if (status === 'skipped')
