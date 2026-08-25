@@ -19,7 +19,11 @@
  *      lost, after `cadence` before it.)
  *   2. The enable/disable toggle round-trips every field too: a toggle is a PUT
  *      of the WHOLE task, so it drops fields just as easily as the dialog.
- *   3. Import Pool sends the GUID it displays — duplicate-name imports are the
+ *   3. `includeNested` (backup2.2) has set / clear / keep semantics: an explicit
+ *      choice round-trips, clearing to None sends NO key, and an archive that
+ *      never chose one still sends nothing after an untouched edit — which is
+ *      what keeps a pre-backup2.2 unit byte-identical on save.
+ *   4. Import Pool sends the GUID it displays — duplicate-name imports are the
  *      whole reason the scan reports a GUID.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
@@ -311,7 +315,8 @@ function loadSource(file, routes) {
     Ext,
     setInterval: () => 1,
     clearInterval: () => {},
-    setTimeout: fn => fn(),
+    setTimeout: (fn) => { fn(); return 1 },
+    clearTimeout: () => {},
   }
   vm.runInNewContext(readFileSync(join(SRC, file), 'utf8'), sandbox, { filename: file })
   return win.ANAS
@@ -334,9 +339,13 @@ const TASK = {
   repository: 'pbs-main',
   namespace: 'anas/pictures',
   backupId: 'pictures',
+  // Three archives so backup2.2's three `includeNested` states are all present:
+  // an explicit `all`, an explicit path list, and — the one that matters most —
+  // an archive that never chose, whose field must stay ABSENT through a save.
   archives: [
-    { name: 'pictures', path: '/mnt/pictures', excludes: ['**/*.tmp', '**/cache'] },
-    { name: 'etc', path: '/etc', excludes: [] },
+    { name: 'pictures', path: '/mnt/pictures', excludes: ['**/*.tmp', '**/cache'], includeNested: 'all' },
+    { name: 'etc', path: '/etc', excludes: [], includeNested: ['/etc/pve'] },
+    { name: 'srv', path: '/srv', excludes: [] },
   ],
   changeDetectionMode: 'metadata',
   retention: { keepLast: 3, keepDaily: 7, keepWeekly: 4, keepMonthly: 6, keepYearly: 2 },
@@ -351,11 +360,45 @@ const TASK = {
   limitNofile: 65536,
 }
 
+/**
+ * The wizard's LOCAL boundary scan (backup2.2). Real shape, real product-level
+ * example: `/etc` has `/etc/pve` (pmxcfs) nested under it — the case that is
+ * silently stored as an empty directory today.
+ */
+const NESTED_BY_PATH = {
+  '/etc': [{ path: '/etc/pve', relativePath: 'pve', kind: 'pmxcfs', fstype: 'fuse' }],
+  '/mnt/pictures': [{ path: '/mnt/pictures/raw', relativePath: 'raw', kind: 'dataset', fstype: 'zfs' }],
+  '/srv': [{ path: '/srv/nfs', relativePath: 'nfs', kind: 'nfs', fstype: 'nfs4' }],
+}
+
+/** Every preview-nested body the dialog sent (the endpoint must be user-driven). */
+const nestedPreviews = []
+
+function nestedPreviewRoute(body) {
+  nestedPreviews.push(body)
+  const choice = (body && body.includeNested) || 'none'
+  const found = NESTED_BY_PATH[body && body.path] || []
+  const covers = p => choice === 'all' || (Array.isArray(choice) && choice.indexOf(p) >= 0)
+  return {
+    data: {
+      archives: [{
+        path: body && body.path,
+        exists: true,
+        includeNested: choice,
+        nested: found.map(n => ({ ...n, included: covers(n.path) })),
+        truncated: false,
+        warnings: [],
+      }],
+    },
+  }
+}
+
 const BACKUP_ROUTES = {
   'GET /backup/repos': { data: { version: 1, repos: [{ name: 'pbs-main', datastore: 'store1', source: 'anas' }] } },
   'GET /backup/tasks': { data: [{ task: TASK, lastRunResult: 'success', enabled: true }] },
   'GET /mounts': { data: [] },
   'GET /pools': { data: [] },
+  'POST /backup/tasks/preview-nested': nestedPreviewRoute,
 }
 
 /**
@@ -430,6 +473,124 @@ async function backupChecks() {
 }
 
 // ============================================================================
+//  1b. backup2.2 — includeNested: set / clear / keep, and the untouched edit
+// ============================================================================
+
+/** The archive editor rows of an open task dialog, in order. */
+function archiveRows(dlg) {
+  const cont = dlg.down('#archivesContainer')
+  return cont ? cont.items.getRange() : []
+}
+
+/** Open the task dialog fresh from the grid's Edit button. */
+async function openEdit(grid) {
+  const editBtn = grid.down('#backupEdit')
+  editBtn.handler(editBtn)
+  await settle()
+  return openWindow()
+}
+
+/** Press Save and hand back the body the dialog sent. */
+async function save(dlg) {
+  jobs.length = 0
+  const btn = dlg.down('#taskSubmitBtn')
+  btn.handler(btn)
+  await settle()
+  return jobs.length ? jobs[0].body : null
+}
+
+async function nestedChecks() {
+  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  grid.selectRow(0)
+
+  // --- KEEP: an untouched edit rewrites every archive exactly as stored ---
+  nestedPreviews.length = 0
+  let dlg = await openEdit(grid)
+  let rows = archiveRows(dlg)
+  eq('nested: the dialog built one row per archive', rows.length, TASK.archives.length)
+  eq('nested: the stored `all` prefills as All', rows[0].down('#archNested').getValue(), 'all')
+  eq('nested: a stored path list prefills as Choose…', rows[1].down('#archNested').getValue(), 'choose')
+  eq('nested: the stored paths prefill verbatim', rows[1].down('#archNestedPaths').getValue(), '/etc/pve')
+  eq('nested: an ABSENT choice prefills as None', rows[2].down('#archNested').getValue(), 'none')
+  ok('nested: the path list is hidden unless Choose… is picked', rows[2].down('#archNestedPaths').hidden === true)
+
+  // The preview is user-driven and LOCAL: one call per row, carrying that row's
+  // own path and its own choice. It is never a PBS contact.
+  ok('nested: the wizard previewed every row', nestedPreviews.length >= TASK.archives.length,
+    `${nestedPreviews.length} previews`)
+  ok('nested: a preview carries the row path and choice',
+    nestedPreviews.some(b => b.path === '/srv' && b.includeNested === 'none'),
+    JSON.stringify(nestedPreviews))
+
+  // The alert names what the current choice would silently omit.
+  ok('nested: the None row alerts about the filesystem it would skip',
+    /\/srv\/nfs/.test(rows[2].down('#archNestedAlert').html || '')
+    && /empty directories/.test(rows[2].down('#archNestedAlert').html || ''),
+    rows[2].down('#archNestedAlert').html)
+  ok('nested: the alert names the KIND, not just the path',
+    /NFS mount/.test(rows[2].down('#archNestedAlert').html || ''),
+    rows[2].down('#archNestedAlert').html)
+  ok('nested: a covered row does NOT alert',
+    !/empty directories/.test(rows[0].down('#archNestedAlert').html || ''),
+    rows[0].down('#archNestedAlert').html)
+  ok('nested: a covered row still LISTS what is nested, with its kind',
+    /\/mnt\/pictures\/raw/.test(rows[0].down('#archNestedAlert').html || '')
+    && /child dataset/.test(rows[0].down('#archNestedAlert').html || ''),
+    rows[0].down('#archNestedAlert').html)
+
+  let body = await save(dlg)
+  ok('nested: the untouched edit saved', !!body)
+  eq('nested (keep): `all` survives untouched', body.archives[0].includeNested, 'all')
+  eq('nested (keep): the path list survives untouched', body.archives[1].includeNested, ['/etc/pve'])
+  ok('nested (keep): an archive that never chose sends NO key at all',
+    !('includeNested' in body.archives[2]), JSON.stringify(body.archives[2]))
+
+  // --- SET: None → All, and None → Choose… with a path ---
+  dlg = await openEdit(grid)
+  rows = archiveRows(dlg)
+  rows[2].down('#archNested').setValue('all')
+  await settle()
+  body = await save(dlg)
+  eq('nested (set): choosing All sends `all`', body.archives[2].includeNested, 'all')
+
+  dlg = await openEdit(grid)
+  rows = archiveRows(dlg)
+  rows[2].down('#archNested').setValue('choose')
+  await settle()
+  ok('nested (set): Choose… reveals the path list', rows[2].down('#archNestedPaths').hidden === false)
+  rows[2].down('#archNestedPaths').setValue('/srv/nfs\n')
+  await settle()
+  body = await save(dlg)
+  eq('nested (set): the typed paths are sent as a list', body.archives[2].includeNested, ['/srv/nfs'])
+
+  // --- CLEAR: All → None sends NOTHING (archives are replaced wholesale, so an
+  // omitted field IS the clear — and it is the same on-disk shape as absent) ---
+  dlg = await openEdit(grid)
+  rows = archiveRows(dlg)
+  rows[0].down('#archNested').setValue('none')
+  await settle()
+  body = await save(dlg)
+  ok('nested (clear): clearing to None sends no key',
+    !('includeNested' in body.archives[0]), JSON.stringify(body.archives[0]))
+  eq('nested (clear): the OTHER archives are untouched', body.archives[1].includeNested, ['/etc/pve'])
+
+  // --- Choose… with an empty list is None, not an empty array ---
+  dlg = await openEdit(grid)
+  rows = archiveRows(dlg)
+  rows[1].down('#archNestedPaths').setValue('')
+  await settle()
+  body = await save(dlg)
+  ok('nested: an emptied Choose… list is None, never []',
+    !('includeNested' in body.archives[1]), JSON.stringify(body.archives[1]))
+
+  ok('nested: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
 //  3. Import Pool sends the GUID it shows
 // ============================================================================
 
@@ -478,6 +639,8 @@ async function poolImportChecks() {
 // ============================================================================
 
 await backupChecks()
+warnings.length = 0
+await nestedChecks()
 warnings.length = 0
 await poolImportChecks()
 

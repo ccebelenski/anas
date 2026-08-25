@@ -14,6 +14,7 @@ import {
   normalizeFingerprint,
   parseBackupProgress,
   progressSummary,
+  skippedWarnings,
 } from '../backup-runner.js'
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/backup')
@@ -137,6 +138,111 @@ describe('backup runner — env + argv assembly (Epic 16, NOTES §1)', () => {
     assert.equal(overridden[j + 1], 'repo-ns')
   })
 
+  // ---- backup2.2: includeNested → --include-dev, and NEVER --all-file-systems
+
+  /** Every `--include-dev <path>` in an argv, in emission order. */
+  function includeDevs(args: string[]): string[] {
+    const out: string[] = []
+    args.forEach((a, i) => {
+      if (a === '--include-dev')
+        out.push(args[i + 1])
+    })
+    return out
+  }
+
+  it('includeNested `none` (and ABSENT) emit NO nested flag at all', () => {
+    const absent = buildBackupArgs(makeTask())
+    assert.ok(!absent.includes('--include-dev'))
+    // An explicit `none` is the same argv as an absent field — one behaviour.
+    const explicit = buildBackupArgs(makeTask({
+      archives: [{ name: 'etc', path: '/etc', excludes: [], includeNested: 'none' }],
+    }))
+    assert.deepEqual(explicit, buildBackupArgs(makeTask({
+      archives: [{ name: 'etc', path: '/etc', excludes: [] }],
+    })))
+  })
+
+  it('`--all-file-systems` is NEVER emitted — it is per-invocation, we are per-archive', () => {
+    const args = buildBackupArgs(
+      makeTask({
+        archives: [
+          { name: 'a', path: '/mnt/a', excludes: [], includeNested: 'all' },
+          { name: 'b', path: '/mnt/b', excludes: [] },
+        ],
+      }),
+      undefined,
+      { a: ['/mnt/a/child'] },
+    )
+    assert.ok(!args.includes('--all-file-systems'), args.join(' '))
+  })
+
+  it('`all` with ZERO boundaries resolves to no flag at all (nothing to cross)', () => {
+    const args = buildBackupArgs(
+      makeTask({ archives: [{ name: 'a', path: '/mnt/a', excludes: [], includeNested: 'all' }] }),
+      undefined,
+      { a: [] },
+    )
+    assert.deepEqual(includeDevs(args), [])
+    assert.ok(!args.includes('--include-dev'))
+  })
+
+  it('`all` with ONE boundary resolves to exactly that one --include-dev', () => {
+    const args = buildBackupArgs(
+      makeTask({ archives: [{ name: 'etc', path: '/etc', excludes: [], includeNested: 'all' }] }),
+      undefined,
+      { etc: ['/etc/pve'] },
+    )
+    assert.deepEqual(includeDevs(args), ['/etc/pve'])
+  })
+
+  it('`all` with a NESTED-INSIDE-NESTED boundary passes BOTH — pbc does not recurse for us', () => {
+    // A child dataset inside a child dataset: naming only the outer one would
+    // still lose the inner tree, because --include-dev names devices, not trees.
+    const args = buildBackupArgs(
+      makeTask({ archives: [{ name: 'pool', path: '/gtbackup', excludes: [], includeNested: 'all' }] }),
+      undefined,
+      { pool: ['/gtbackup/cdm', '/gtbackup/cdm/inner'] },
+    )
+    assert.deepEqual(includeDevs(args), ['/gtbackup/cdm', '/gtbackup/cdm/inner'])
+  })
+
+  it('`all` with NO resolution (a failed scan) falls back to the client default', () => {
+    const task = makeTask({ archives: [{ name: 'a', path: '/mnt/a', excludes: [], includeNested: 'all' }] })
+    // No entry for 'a' at all — the run crosses nothing rather than guessing.
+    assert.deepEqual(includeDevs(buildBackupArgs(task, undefined, {})), [])
+    assert.ok(!buildBackupArgs(task, undefined, {}).includes('--all-file-systems'))
+  })
+
+  it('includeNested [paths] emits one --include-dev per path, deduped and sorted', () => {
+    const args = buildBackupArgs(makeTask({
+      archives: [
+        { name: 'etc', path: '/etc', excludes: [], includeNested: ['/etc/pve'] },
+        { name: 'pool', path: '/gtbackup', excludes: [], includeNested: ['/gtbackup/cdm', '/etc/pve'] },
+      ],
+    }))
+    assert.deepEqual(includeDevs(args), ['/etc/pve', '/gtbackup/cdm'])
+  })
+
+  it('two archives, one `all` and one `none`: ONLY the first gets --include-dev flags', () => {
+    // The whole point of resolving `all` per archive: 'b' must be untouched.
+    const args = buildBackupArgs(
+      makeTask({
+        archives: [
+          { name: 'a', path: '/mnt/a', excludes: [], includeNested: 'all' },
+          { name: 'b', path: '/mnt/b', excludes: [] },
+        ],
+      }),
+      undefined,
+      { a: ['/mnt/a/child', '/mnt/a/child/deeper'], b: [] },
+    )
+    assert.deepEqual(includeDevs(args), ['/mnt/a/child', '/mnt/a/child/deeper'])
+    // Nothing under 'b' is named, and no invocation-wide flag leaks onto it.
+    assert.ok(!args.some(x => x.startsWith('/mnt/b/')))
+    assert.ok(!args.includes('--all-file-systems'))
+    // Both archives are still in the SAME invocation — that is why this matters.
+    assert.ok(args.includes('a.pxar:/mnt/a') && args.includes('b.pxar:/mnt/b'))
+  })
+
   it('probe argv is snapshot list [--ns] --output-format json', () => {
     assert.deepEqual(buildProbeArgs('anastest'), ['snapshot', 'list', '--ns', 'anastest', '--output-format', 'json'])
     assert.deepEqual(buildProbeArgs(), ['snapshot', 'list', '--output-format', 'json'])
@@ -178,6 +284,54 @@ describe('backup runner — STDERR progress parsing (NOTES §3, SURPRISE C)', ()
     const s = progressSummary(p)
     assert.ok(s.includes('w.ppxar:') || s.includes('w.mpxar:'))
     assert.ok(s.includes('resource limit for open file handles low'))
+  })
+
+  // ---- backup2.2: the client's own `skipping mount point:` lines -----------
+
+  it('parses the REAL `skipping mount point:` capture and attributes it to its archive', () => {
+    // btrfs-nested-subvol.txt is the real backup2.1 capture: FOUR runs, three of
+    // which print the line — for the live subvolume AND for the ro snapshot
+    // (GT-54), and none for the `--all-file-systems` live run (GT-55).
+    const p = parseBackupProgress(fixture('btrfs-nested-subvol.txt'))
+    assert.equal(p.skipped.length, 2, JSON.stringify(p.skipped))
+    assert.deepEqual(p.skipped[0], {
+      archive: 'btr',
+      root: '/mnt/gtbtrfs/snap1',
+      relativePath: 'photos',
+      path: '/mnt/gtbtrfs/snap1/photos',
+    })
+    // The SECOND run's line belongs to the SECOND archive — the `Upload
+    // directory … as <name>` header is what attributes it.
+    assert.equal(p.skipped[1].archive, 'btrlive')
+    assert.equal(p.skipped[1].path, '/mnt/gtbtrfs/@data/photos')
+  })
+
+  it('a skip line with no preceding upload header keeps the relative path honestly', () => {
+    const p = parseBackupProgress('skipping mount point: "photos"\n')
+    assert.equal(p.skipped.length, 1)
+    assert.equal(p.skipped[0].path, 'photos')
+    assert.equal(p.skipped[0].archive, undefined)
+  })
+
+  it('the client skip lines are SECONDARY: ones our own walk already named are dropped', () => {
+    const skipped = [
+      { archive: 'etc', root: '/etc', relativePath: 'pve', path: '/etc/pve' },
+      { archive: 'etc', root: '/etc', relativePath: 'late', path: '/etc/late' },
+      // A duplicate of the first — one omission is one warning.
+      { archive: 'etc', root: '/etc', relativePath: 'pve', path: '/etc/pve' },
+    ]
+    const lines = skippedWarnings(skipped, [{
+      archive: 'etc',
+      path: '/etc',
+      exists: true,
+      includeNested: 'none' as const,
+      truncated: false,
+      warnings: [],
+      nested: [{ path: '/etc/pve', relativePath: 'pve', kind: 'pmxcfs' as const, included: false }],
+    }])
+    assert.equal(lines.length, 1)
+    assert.match(lines[0], /\/etc\/late/)
+    assert.match(lines[0], /empty directory/)
   })
 })
 

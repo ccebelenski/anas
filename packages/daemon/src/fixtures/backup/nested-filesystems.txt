@@ -1,0 +1,164 @@
+# ==============================================================================
+# ANAS story backup2.2 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# PVE 9.2.11, kernel 7.0.14-12-pve, ZFS 2.4.3-pve1, util-linux 2.41.5,
+# GNU findutils 4.10.0, btrfs-progs 6.14. Captured 2026-08-25 (READ-ONLY probes:
+# nothing was created, modified or destroyed on the node).
+# Trees: the file-backed pool `gtbackup` (child dataset `gtbackup/cdm`) and the
+# node's own `/etc` (whose only nested filesystem is PVE's pmxcfs at /etc/pve).
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: nested-filesystem detection - the st_dev walk, and what NAMES it
+# ==============================================================================
+
+############ NESTED-FILESYSTEM DETECTION (st_dev walk) ############
+=== the mount tree the walk is named from ===
+### $ findmnt -J --target /gtbackup
+{
+   "filesystems": [
+      {
+         "target": "/gtbackup",
+         "source": "gtbackup",
+         "fstype": "zfs",
+         "options": "rw,relatime,xattr,posixacl,casesensitive"
+      }
+   ]
+}
+### exit=0
+
+### $ findmnt -J --target /gtbackup/cdm
+{
+   "filesystems": [
+      {
+         "target": "/gtbackup/cdm",
+         "source": "gtbackup/cdm",
+         "fstype": "zfs",
+         "options": "rw,relatime,xattr,posixacl,casesensitive"
+      }
+   ]
+}
+### exit=0
+
+### $ findmnt -J --target /etc/pve
+{
+   "filesystems": [
+      {
+         "target": "/etc/pve",
+         "source": "/dev/fuse",
+         "fstype": "fuse",
+         "options": "rw,nosuid,nodev,relatime,user_id=0,group_id=0,default_permissions,allow_other"
+      }
+   ]
+}
+### exit=0
+
+=== st_dev of the roots and their nested filesystems ===
+### $ stat -c %d %i %n /gtbackup /gtbackup/cdm /gtbackup/data /etc /etc/pve
+46 34 /gtbackup
+49 34 /gtbackup/cdm
+46 1093 /gtbackup/data
+2049 121 /etc
+55 1 /etc/pve
+### exit=0
+
+=== THE WALK: find -xdev -type d -printf '%D\t%p\n' ===
+--- a ZFS pool root with ONE child dataset (gtbackup/cdm) under it ---
+### $ find -P /gtbackup -xdev -maxdepth 8 -type d -printf %D\t%p\n
+46	/gtbackup
+46	/gtbackup/images
+49	/gtbackup/cdm
+46	/gtbackup/data
+46	/gtbackup/data/empty
+46	/gtbackup/data/sub
+46	/gtbackup/data/sub/deep
+46	/gtbackup/data/docs
+### exit=0
+
+--- the SAME tree WITHOUT -xdev: the child's own subtree is walked too ---
+### $ find -P /gtbackup -maxdepth 3 -type d -printf %D\t%p\n
+46	/gtbackup
+46	/gtbackup/images
+49	/gtbackup/cdm
+49	/gtbackup/cdm/tree
+49	/gtbackup/cdm/tree/d
+49	/gtbackup/cdm/tree/c
+49	/gtbackup/cdm/tree/b
+49	/gtbackup/cdm/tree/a
+46	/gtbackup/data
+46	/gtbackup/data/empty
+46	/gtbackup/data/sub
+46	/gtbackup/data/sub/deep
+46	/gtbackup/data/docs
+### exit=0
+
+--- /etc: the product-level example (only /etc/pve differs) ---
+### $ sh -c find -P /etc -xdev -type d -printf '%D\t%p\n' | awk -F'\t' '$1 != 2049'
+55	/etc/pve
+### exit=0
+
+### $ sh -c find -P /etc -xdev -type d | wc -l
+257
+### exit=0
+
+--- with the nested filesystem PRUNED by path (the remote/hang-trap form) ---
+### $ find -P /gtbackup -xdev -maxdepth 8 ( -path /gtbackup/cdm -o -name .zfs ) -prune -o -type d -printf %D\t%p\n
+46	/gtbackup
+46	/gtbackup/images
+46	/gtbackup/data
+46	/gtbackup/data/empty
+46	/gtbackup/data/sub
+46	/gtbackup/data/sub/deep
+46	/gtbackup/data/docs
+### exit=0
+
+--- a nonexistent path ---
+### $ find -P /gtbackup/nope -xdev -maxdepth 8 -type d -printf %D\t%p\n
+find: ‘/gtbackup/nope’: No such file or directory
+### exit=1
+
+=== .zfs/snapshot automounts - what must be EXCLUDED ===
+### $ zfs get -H snapdir gtbackup/cdm
+gtbackup/cdm	snapdir	hidden	default
+### exit=0
+
+### $ sh -c ls /gtbackup/cdm/.zfs/snapshot
+s1
+s2
+s3
+### exit=0
+
+### $ stat -c %d %n /gtbackup/cdm/.zfs /gtbackup/cdm/.zfs/snapshot /gtbackup/cdm/.zfs/snapshot/s1
+49 /gtbackup/cdm/.zfs
+49 /gtbackup/cdm/.zfs/snapshot
+61 /gtbackup/cdm/.zfs/snapshot/s1
+### exit=0
+
+### $ sh -c findmnt -J | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+out=[]
+def w(f):
+    out.append(f)
+    for c in f.get("children",[]): w(c)
+for f in d["filesystems"]: w(f)
+for f in out:
+    if "@" in (f.get("source") or ""): print(json.dumps(f))'
+{"target": "/gtbackup/cdm/.zfs/snapshot/s1", "source": "gtbackup/cdm@s1", "fstype": "zfs", "options": "ro,relatime,xattr,posixacl,casesensitive"}
+### exit=0
+
+--- and the walk NEVER sees .zfs with snapdir=hidden (the default) ---
+### $ find -P /gtbackup/cdm -xdev -maxdepth 3 -type d -printf %D\t%p\n
+49	/gtbackup/cdm
+49	/gtbackup/cdm/tree
+49	/gtbackup/cdm/tree/d
+49	/gtbackup/cdm/tree/c
+49	/gtbackup/cdm/tree/b
+49	/gtbackup/cdm/tree/a
+### exit=0
+
+=== versions ===
+### $ sh -c findmnt --version; find --version | head -1; btrfs --version | head -1; uname -r
+findmnt from util-linux 2.41.5
+find (GNU findutils) 4.10.0
+btrfs-progs v6.14
+7.0.14-12-pve
+### exit=0
+

@@ -71,6 +71,17 @@ was **left in place** for the live-proof stage.
 | `prune-bad-namespace.txt` | Missing NAMESPACE → **byte-identical** `Error: ENOENT: No such file or directory`, exit 255. The two are INDISTINGUISHABLE — the verdict must say "group or namespace", never guess. |
 | `prune-no-permission.txt` | Token without prune rights → `Error: permission check failed - missing Datastore.Modify\|Datastore.Prune on /datastore/<store>/<ns>`, exit 255 → the "lacks prune privileges" verdict, naming the privileges. |
 
+### Nested-filesystem index (story backup2.2, captured 2026-08-25)
+
+Read-only probes on the same stunt node (util-linux 2.41.5, GNU findutils 4.10.0,
+btrfs-progs 6.14). Nothing on the node was created, modified or destroyed.
+
+| File | What it is |
+|------|------------|
+| `nested-filesystems.txt` | **The st_dev walk.** `findmnt -J --target` for `/gtbackup`, `/gtbackup/cdm` and `/etc/pve`; `stat -c '%d %i %n'`; and the walk itself — `find -P <path> -xdev -maxdepth N -type d -printf '%D\t%p\n'` — proving that `-xdev` **prints the boundary directory carrying the NESTED filesystem's device number and does not descend into it** (`46 /gtbackup` … `49 /gtbackup/cdm`, nothing below). Also: the same walk WITHOUT `-xdev` (for contrast), the `-path … -prune` form used for remote mounts (the hang trap), the missing-path error (`exit=1`), and the `.zfs/snapshot` automount — invisible to the walk with the default `snapdir=hidden`, and a real `findmnt` row whose SOURCE carries an `@` once accessed (GT-51). The product-level example is here in full: `/etc` has exactly ONE nested filesystem, `/etc/pve` (pmxcfs, dev 55 vs 2049). |
+| `findmnt-nested.json` | The node's whole `findmnt --json` tree, verbatim — the naming input for the walk above. Contains the zfs parent + child (`/gtbackup`, `/gtbackup/cdm`), PVE's `/etc/pve` fuse mount, an `autofs` placeholder, and the pseudo-filesystems the parser filters. |
+| `btrfs-nested-subvol.txt` | *(backup2.1 capture, reused here)* The **`skipping mount point: "photos"`** line the parser keys on — real bytes, on stderr, quoted, archive-root-relative — plus `btrfs subvolume show` in both its forms (a real subvolume, and `ERROR: Not a Btrfs subvolume` for the empty placeholder a ro snapshot leaves). |
+
 ---
 
 ## 1. The env-var contract (both auth styles)

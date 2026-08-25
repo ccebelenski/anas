@@ -49,6 +49,12 @@ export interface BackupNotifyResult {
   nofileWarning?: string
   prune?: BackupPruneResult
   warnings?: string[]
+  /**
+   * Archive name → the filesystem boundaries the run crossed (`--include-dev`).
+   * What an `all` choice RESOLVED to is a per-run fact, so the body states it
+   * rather than leaving the reader to infer it from the task config (backup2.2).
+   */
+  includedNested?: Record<string, string[]>
 }
 
 export interface BackupNotifyContext {
@@ -183,6 +189,15 @@ export function buildBackupNotifyBody(ctx: BackupNotifyContext): string {
   if (result?.prune) {
     lines.push('')
     lines.push(`Retention:   ${pruneSummaryLine(result.prune)}`)
+  }
+
+  if (result?.includedNested && Object.keys(result.includedNested).length) {
+    lines.push('')
+    lines.push('Nested filesystems crossed:')
+    for (const [archive, paths] of Object.entries(result.includedNested)) {
+      for (const path of paths)
+        lines.push(`  ${archive}: ${path}`)
+    }
   }
 
   if (result?.nofileWarning) {

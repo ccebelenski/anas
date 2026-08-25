@@ -445,6 +445,184 @@ export const BackupRepoTestResult = z.object({
 })
 export type BackupRepoTestResult = z.infer<typeof BackupRepoTestResult>
 
+// ---- Nested filesystems (story backup2.2) ----------------------------------
+//
+// pbc walks ONE filesystem: every directory under the source whose `st_dev`
+// differs from the source root's is stored as an EMPTY DIRECTORY and the client
+// prints a single `skipping mount point: "<archive-relative path>"` line on
+// stderr (ground truth GT-54). That is the silent omission this story ends.
+//
+// Detection is an `st_dev` walk, NOT a `findmnt` enumeration: a btrfs nested
+// subvolume — and even the empty placeholder a read-only btrfs snapshot leaves
+// behind — carries its own `st_dev` but has NO mount table entry (GT-52/53), and
+// `st_dev` is exactly what the client keys on. `findmnt` then NAMES what the
+// walk found. See services/nested-filesystems.ts in the daemon.
+
+/**
+ * What a nested filesystem IS, once named. `dataset` = a ZFS child dataset,
+ * `subvolume` = a btrfs subvolume (or the empty placeholder a ro snapshot left),
+ * `nfs`/`cifs` = a remote mount (never descended into — the hang trap),
+ * `pmxcfs` = PVE's `/etc/pve` fuse mount, `automount` = an armed autofs
+ * placeholder (armed, never "local" — the mounts-family rule, issue #35),
+ * `local` = another local filesystem, `unknown` = a distinct `st_dev` with no
+ * mount line and no subvolume identity.
+ */
+/** Trailing slashes on an absolute path (stripped before a prefix compare). */
+const TRAILING_SLASHES_RE = /\/+$/
+
+export const BackupNestedKind = z.enum([
+  'dataset',
+  'subvolume',
+  'nfs',
+  'cifs',
+  'local',
+  'pmxcfs',
+  'automount',
+  'unknown',
+])
+export type BackupNestedKind = z.infer<typeof BackupNestedKind>
+
+/**
+ * Which nested filesystems under an archive's source get backed up:
+ *   `none`      — the client's own default: nothing. Each nested filesystem is
+ *                 stored as an empty directory (and warned about).
+ *   `all`       — every filesystem under this archive's source. It is RESOLVED
+ *                 at run time into one `--include-dev <path>` per boundary the
+ *                 daemon's descending `st_dev` scan finds, so the choice applies
+ *                 to THIS archive only. **`--all-file-systems` is never used**:
+ *                 it is a per-INVOCATION flag and ANAS puts every archive of a
+ *                 task in one `backup` call, so it would silently apply one
+ *                 archive's choice to all the others.
+ *   `[paths]`   — one `--include-dev <path>` per entry. ABSOLUTE paths (that is
+ *                 what `--include-dev` takes, and what the detector reports);
+ *                 each must lie under its archive's own `path`.
+ *
+ * ABSENT means `none` — see {@link effectiveIncludeNested}. The field is
+ * OPTIONAL rather than `.default()`ed on purpose: an untouched edit of a task
+ * written before this story must rewrite the unit BYTE-IDENTICALLY (the
+ * dialog ↔ daemon contract), so a value nobody chose is never written. An
+ * explicit `none` normalizes back to absent in {@link BackupTaskRequest} —
+ * "no nested filesystems" has exactly one spelling on disk.
+ */
+export const BackupIncludeNested = z.union([
+  z.literal('none'),
+  z.literal('all'),
+  z.array(AbsolutePath).min(1).max(256),
+])
+export type BackupIncludeNested = z.infer<typeof BackupIncludeNested>
+
+/**
+ * The ONE place "absent means none" is expressed. Every caller — the runner's
+ * argv, the run-time warning pass, the task detail's coverage flags and the
+ * wizard preview — reads the effective choice from here, so an absent field can
+ * never mean two different things in two places.
+ */
+export function effectiveIncludeNested(
+  archive: { includeNested?: BackupIncludeNested | null } | null | undefined,
+): BackupIncludeNested {
+  const chosen = archive?.includeNested
+  if (chosen === 'all')
+    return 'all'
+  if (Array.isArray(chosen) && chosen.length)
+    return chosen
+  return 'none'
+}
+
+/**
+ * Does an `includeNested` choice COVER a given nested filesystem path? `all`
+ * covers everything the scan found; a path list covers an exact match
+ * (that is what `--include-dev <path>` means — it names the device by one path
+ * on it), and a path list entry also covers anything BELOW it that sits on the
+ * same device. Note a device the client was NOT told about still stops it, which
+ * is why `all` is resolved from a scan that descends through the boundaries it
+ * is including rather than from the first layer alone.
+ */
+export function nestedIncluded(choice: BackupIncludeNested, path: string): boolean {
+  if (choice === 'all')
+    return true
+  if (choice === 'none')
+    return false
+  return choice.some(p => p === path || path.startsWith(`${p.replace(TRAILING_SLASHES_RE, '')}/`))
+}
+
+/** Is `child` the same path as, or below, `parent`? (both absolute, normalized) */
+export function isPathWithin(parent: string, child: string): boolean {
+  if (child === parent)
+    return true
+  const base = parent === '/' ? '' : parent.replace(TRAILING_SLASHES_RE, '')
+  return child.startsWith(`${base}/`)
+}
+
+/**
+ * One nested filesystem the detector found under a source, named as well as the
+ * system allows. `included` answers the only question the screen asks: does the
+ * archive's CURRENT `includeNested` cover it, or will it be backed up as an
+ * empty directory?
+ */
+export const BackupNestedEntry = z.object({
+  /** Absolute path of the nested filesystem's root directory. */
+  path: AbsolutePath,
+  /** The same path relative to the archive source (what pbc's skip line quotes). */
+  relativePath: z.string(),
+  kind: BackupNestedKind,
+  /** findmnt SOURCE when it is a real mount (dataset name, `//host/share`, …). */
+  source: z.string().optional(),
+  /** findmnt FSTYPE when it is a real mount. */
+  fstype: z.string().optional(),
+  /** Extra honesty (e.g. a btrfs ro-snapshot placeholder, a remote not descended). */
+  detail: z.string().optional(),
+  /** Does the archive's current includeNested choice cover this one? */
+  included: z.boolean(),
+})
+export type BackupNestedEntry = z.infer<typeof BackupNestedEntry>
+
+/** The detector's answer for ONE archive source. */
+export const BackupNestedScan = z.object({
+  /** The archive name this scan belongs to (absent for a bare-path preview). */
+  archive: z.string().optional(),
+  /** The source path scanned. */
+  path: z.string(),
+  /** False when the path does not exist (or could not be read at all). */
+  exists: z.boolean(),
+  /** The effective choice the `included` flags were computed against. */
+  includeNested: BackupIncludeNested,
+  nested: z.array(BackupNestedEntry),
+  /**
+   * True when the walk hit its depth budget or its timeout — the list is then a
+   * FLOOR, not a complete answer, and the UI says so rather than implying none.
+   */
+  truncated: z.boolean(),
+  /** Non-fatal problems (unreadable directory, walk timeout). Never secrets. */
+  warnings: z.array(z.string()).default([]),
+})
+export type BackupNestedScan = z.infer<typeof BackupNestedScan>
+
+/**
+ * Preview request for the wizard — the save-time verify pattern (the namespace
+ * check, `prune-preview`) reapplied: user-initiated, one-shot, NON-mutating and
+ * with NO PBS contact at all (this one never leaves the node). Either a bare
+ * `path` (one archive row's Choose… picker) or the whole `archives` list.
+ */
+export const BackupNestedPreviewRequest = z.object({
+  path: AbsolutePath.optional(),
+  includeNested: BackupIncludeNested.optional(),
+  archives: z
+    .array(z.object({
+      name: z.string().optional(),
+      path: AbsolutePath,
+      includeNested: BackupIncludeNested.optional(),
+    }))
+    .max(64)
+    .optional(),
+})
+export type BackupNestedPreviewRequest = z.infer<typeof BackupNestedPreviewRequest>
+
+/** Preview response: one scan per requested source, in request order. */
+export const BackupNestedPreviewResponse = z.object({
+  archives: z.array(BackupNestedScan),
+})
+export type BackupNestedPreviewResponse = z.infer<typeof BackupNestedPreviewResponse>
+
 // ---- Tasks -----------------------------------------------------------------
 
 /**
@@ -452,16 +630,38 @@ export type BackupRepoTestResult = z.infer<typeof BackupRepoTestResult>
  * exclude patterns (passed to pbc as `--exclude`). The name is the bare archive
  * name (no `.pxar` suffix); paths are absolute.
  */
-export const BackupArchive = z.object({
-  /** Bare archive name — pbc stores it as `<name>.pxar` (or mpxar/ppxar). */
-  name: z
-    .string()
-    .min(1)
-    .max(128)
-    .regex(/^[\w.-]+$/, 'letters, digits, dots, underscores and dashes'),
-  path: AbsolutePath,
-  excludes: z.array(z.string()).default([]),
-})
+export const BackupArchive = z
+  .object({
+    /** Bare archive name — pbc stores it as `<name>.pxar` (or mpxar/ppxar). */
+    name: z
+      .string()
+      .min(1)
+      .max(128)
+      .regex(/^[\w.-]+$/, 'letters, digits, dots, underscores and dashes'),
+    path: AbsolutePath,
+    excludes: z.array(z.string()).default([]),
+    /**
+     * Nested filesystems under `path` (backup2.2). ABSENT = `none` (the client's
+     * own behaviour, and PVE's lead) — read it through
+     * {@link effectiveIncludeNested}, never by truthiness.
+     */
+    includeNested: BackupIncludeNested.optional(),
+  })
+  .superRefine((a, ctx) => {
+    if (!Array.isArray(a.includeNested))
+      return
+    for (const p of a.includeNested) {
+      // An --include-dev outside the archive's own source is meaningless: pbc
+      // only crosses boundaries it meets while walking THIS root.
+      if (!isPathWithin(a.path, p)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `nested filesystem '${p}' is not under the archive path '${a.path}'`,
+          path: ['includeNested'],
+        })
+      }
+    }
+  })
 export type BackupArchive = z.infer<typeof BackupArchive>
 
 /**
@@ -524,12 +724,30 @@ export type BackupTask = z.infer<typeof BackupTask>
  * A retention object with NO keeps set is dropped entirely, so a wizard whose
  * five fields are all blank stores no policy at all (absent = never prune)
  * rather than an empty `{}` riding the unit JSON forever.
+ *
+ * The same rule applies to `includeNested` (backup2.2): `none`, `null` and an
+ * empty list all mean "the client's default", which is what an ABSENT field
+ * already means — so they normalize to absent and an untouched edit of a
+ * pre-backup2.2 task rewrites its unit byte-for-byte.
  */
 export const BackupTaskRequest = z.preprocess((raw) => {
   if (raw && typeof raw === 'object') {
     const o = { ...(raw as Record<string, unknown>) }
     if (o.changeDetectionMode === undefined && o.mode !== undefined)
       o.changeDetectionMode = o.mode
+    if (Array.isArray(o.archives)) {
+      o.archives = o.archives.map((a) => {
+        if (!a || typeof a !== 'object')
+          return a
+        const arch = { ...(a as Record<string, unknown>) }
+        const chosen = arch.includeNested
+        if (chosen === 'none' || chosen === null || chosen === undefined
+          || (Array.isArray(chosen) && chosen.length === 0)) {
+          delete arch.includeNested
+        }
+        return arch
+      })
+    }
     if (o.cadence !== undefined) {
       // Parse defensively: an invalid cadence falls through to full validation
       // below, which reports the real problem rather than a schedule error.
@@ -615,5 +833,12 @@ export const BackupTaskDetail = z.object({
   recentRuns: z.array(BackupRecentRun).optional(),
   /** Raw recent journald output (fallback when structured runs aren't parsed). */
   journal: z.string().optional(),
+  /**
+   * Nested filesystems under each archive source RIGHT NOW, and whether the
+   * task's current `includeNested` covers each (backup2.2). Local-only: an
+   * `st_dev` walk plus `findmnt`, no PBS contact. Absent when the scan could
+   * not be run at all — a missing key is "not known", never "none found".
+   */
+  nested: z.array(BackupNestedScan).optional(),
 })
 export type BackupTaskDetail = z.infer<typeof BackupTaskDetail>

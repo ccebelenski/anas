@@ -1,4 +1,6 @@
 import type {
+  BackupNestedPreviewResponse,
+  BackupNestedScan,
   BackupPrunePreviewResponse,
   BackupRepo,
   BackupRepoResponse,
@@ -15,10 +17,12 @@ import type { BackupReposPaths } from '../services/backup-repos.js'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
   BackupName,
+  BackupNestedPreviewRequest,
   BackupPrunePreviewRequest,
   BackupRepoTestRequest,
   BackupRunRequest,
   BackupTaskRequest,
+  effectiveIncludeNested,
   hasRetentionKeeps,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
@@ -65,6 +69,7 @@ import {
   validateSchedule,
   writeTaskUnits,
 } from '../services/backup-units.js'
+import { scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -85,6 +90,8 @@ import { requireIdentity } from './identity.js'
  *   POST   /v1/backup/tasks/:name/run  → Run Now (UI: start+supervise the unit;
  *                                        direct:true: the unit's own pbc exec)
  *   POST   /v1/backup/tasks/:name/prune-preview → retention dry-run (16.11)
+ *   POST   /v1/backup/tasks/preview-nested → nested-filesystem scan (backup2.2;
+ *                                        LOCAL-ONLY: no PBS contact at all)
  *
  * Mutations are identity-gated jobs (202 → { job }); registry writes are
  * COMPARE-AND-SWAP. Status is LOCAL-ONLY — ANAS never contacts the PBS server
@@ -539,6 +546,43 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     return { data }
   })
 
+  // --- POST /backup/tasks/preview-nested — the wizard's boundary scan -------
+  // USER-INITIATED, one-shot, NON-MUTATING and entirely LOCAL: an `st_dev` walk
+  // of the source plus `findmnt` to name what it found. NO PBS contact at all —
+  // this is the save-time verify pattern (the namespace check, `prune-preview`)
+  // with nothing to verify remotely. It is registered BEFORE `/backup/tasks/:name`
+  // so the literal segment can never be read as a task name.
+  server.post('/backup/tasks/preview-nested', async (request, reply) => {
+    const bodyParsed = BackupNestedPreviewRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid preview request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const req = bodyParsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!req.path && !req.archives?.length) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: 'Send a path, or the archives to scan' } }
+    }
+
+    const archives: BackupNestedScan[] = req.archives?.length
+      ? await scanArchives(executor, req.archives.map(a => ({
+          ...(a.name ? { name: a.name } : {}),
+          path: a.path,
+          includeNested: effectiveIncludeNested(a),
+        })))
+      : [await scanNestedFilesystems(executor, req.path as string, {
+          includeNested: effectiveIncludeNested({ includeNested: req.includeNested ?? 'none' }),
+        })]
+
+    const data: BackupNestedPreviewResponse = { archives }
+    return { data }
+  })
+
   // --- GET /backup/tasks/:name — detail ------------------------------------
   server.get<{ Params: { name: string } }>('/backup/tasks/:name', async (request, reply) => {
     const nameParsed = BackupName.safeParse(request.params.name)
@@ -554,11 +598,20 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'NOT_FOUND', message: `Backup task '${name}' not found` } }
     }
 
-    const [reg, st, units, journal] = await Promise.all([
+    const [reg, st, units, journal, nested] = await Promise.all([
       readBackupRepos(paths),
       deriveTaskStatus(executor, task),
       readUnitTexts(systemdDir, name),
       readRecentJournal(executor, name),
+      // backup2.2 — what is nested under each source RIGHT NOW, and whether the
+      // task's current includeNested covers it. LOCAL-ONLY (an st_dev walk plus
+      // findmnt); no PBS contact, so the never-poll rule is untouched. Fail-open:
+      // a scan that throws leaves the key ABSENT ("not known"), never an empty
+      // array pretending nothing is nested.
+      scanArchives(executor, task.archives).catch((err: unknown) => {
+        server.log.warn(`[backup] nested scan for task ${name} failed: ${err instanceof Error ? err.message : String(err)}`)
+        return null
+      }),
     ])
     const joinRepos = await reposForJoin(reg.repos)
     const detail: BackupTaskDetail = {
@@ -570,6 +623,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       unit: units.unit,
       timer: units.timer,
       ...(journal ? { journal } : {}),
+      ...(nested ? { nested } : {}),
     }
     return { data: detail }
   })
@@ -771,18 +825,25 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           // skip) never prunes, and a FAILED run threw long before this line. A
           // task with no retention prunes nothing at all (the default posture);
           // a prune failure rides back as a warning, never a job failure.
-          const final = result.status === 'success'
-            ? {
-                ...result,
-                ...(await pruneAfterBackup(executor, {
-                  task,
-                  repo,
-                  secret,
-                  onProgress: updateProgress,
-                  log: (message, level) => (level === 'warn' ? server.log.warn(message) : server.log.info(message)),
-                })),
-              }
-            : result
+          let final = result
+          if (result.status === 'success') {
+            const pruned = await pruneAfterBackup(executor, {
+              task,
+              repo,
+              secret,
+              onProgress: updateProgress,
+              log: (message, level) => (level === 'warn' ? server.log.warn(message) : server.log.info(message)),
+            })
+            // MERGE the warning lists rather than letting the spread clobber
+            // them: the run already carries this story's nested-filesystem
+            // omissions (backup2.2), and a prune warning must not erase them.
+            const warnings = [...(result.warnings ?? []), ...(pruned.warnings ?? [])]
+            final = {
+              ...result,
+              ...pruned,
+              ...(warnings.length ? { warnings } : {}),
+            }
+          }
           // Best-effort by contract: notifyBackupRun never throws, so a broken
           // mail target cannot turn a good backup into a failed job.
           await notifyBackupRun(executor, { task, repo, namespace, result: final, elapsedMs: Date.now() - startedAt })

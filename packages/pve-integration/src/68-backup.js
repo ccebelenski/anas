@@ -24,7 +24,10 @@
  *     { task, lastRunResult, lastRunAt, nextRunAt, overdue }
  *     task = { name, repository (repo NAME; alias `repo`), datastore? (else joined
  *              from the repos list), namespace?, backupId (alias `backup-id`/
- *              `backupID`), archives:[{name, path, excludes:[]}],
+ *              `backupID`), archives:[{name, path, excludes:[],
+                includeNested? ('none'|'all'|[absolute paths] — backup2.2;
+                  ABSENT means 'none', the client's own behaviour, and the
+                  dialog NEVER writes a default on an untouched save)}],
  *              changeDetectionMode ('default'|'metadata'; alias `changeDetection`),
  *              retention? ({keepLast?,keepDaily?,keepWeekly?,keepMonthly?,keepYearly?}
  *                — positive ints; ABSENT means ANAS never prunes, 16.11),
@@ -104,6 +107,9 @@
  * 'anas-backup-detail', reload 'anas-btn-backup-detail-reload'); task window
  * 'anas-win-backup-task' (submit 'anas-btn-backup-task-submit', archives
  * 'anas-backup-archives', per-row path browse 'anas-btn-backup-arch-browse',
+ * per-row nested choice 'anas-fld-backup-arch-nested' with its path list
+ * 'anas-fld-backup-arch-nested-paths' and inline alert
+ * 'anas-backup-arch-nested-alert',
  * schedule fieldset 'anas-backup-schedule' with 'anas-fld-backup-cadence' /
  * '-day' / '-single-day' / '-parity' / '-time' / '-schedule');
  * retention fieldset 'anas-backup-retention' with 'anas-fld-backup-keeplast' …
@@ -269,12 +275,87 @@
         }
         for (var i = 0; i < raw.length; i++) {
             var a = raw[i] || {};
-            out.push({
+            var row = {
                 name: bareArchive(first(a.name, a.archive) || ''),
                 path: '' + (a.path == null ? '' : a.path),
                 excludes: isArray(a.excludes) ? a.excludes
                     : (isArray(a.exclude) ? a.exclude : []),
-            });
+            };
+            // backup2.2 — carry the nested choice through VERBATIM, and only
+            // when it is really there. ABSENT stays absent (that is what makes
+            // an untouched edit byte-identical); 'none' is dropped because it
+            // means exactly the same thing and would otherwise be written.
+            var nested = nestedChoiceOf(a);
+            if (nested !== 'none') {
+                row.includeNested = nested;
+            }
+            out.push(row);
+        }
+        return out;
+    }
+
+    // ---- Nested filesystems (backup2.2) ------------------------------------
+    //
+    // pbc walks ONE filesystem: anything under a source with a different st_dev
+    // (a child dataset, a btrfs subvolume, /etc/pve, an NFS/CIFS mount) is stored
+    // as an EMPTY DIRECTORY unless the archive says otherwise. The daemon detects
+    // them (POST /backup/tasks/preview-nested — LOCAL only, no PBS contact); this
+    // file only shows what it found and carries the choice.
+
+    /** 'none' | 'all' | [paths] — the one reader of the stored field. */
+    function nestedChoiceOf(archive) {
+        var v = archive && archive.includeNested;
+        if (v === 'all') {
+            return 'all';
+        }
+        if (isArray(v)) {
+            var paths = [];
+            for (var i = 0; i < v.length; i++) {
+                var p = trim(v[i]);
+                if (p) {
+                    paths.push(p);
+                }
+            }
+            if (paths.length) {
+                return paths;
+            }
+        }
+        return 'none';
+    }
+
+    /** Which of the three radio/combo positions a stored choice maps to. */
+    function nestedModeOf(archive) {
+        var choice = nestedChoiceOf(archive);
+        return choice === 'all' ? 'all' : (choice === 'none' ? 'none' : 'choose');
+    }
+
+    var NESTED_KIND_LABEL = {
+        dataset: 'child dataset',
+        subvolume: 'btrfs subvolume',
+        nfs: 'NFS mount',
+        cifs: 'SMB/CIFS mount',
+        local: 'local filesystem',
+        pmxcfs: 'pmxcfs',
+        automount: 'automount (armed)',
+        unknown: 'unknown filesystem',
+    };
+
+    function nestedKindLabel(kind) {
+        var k = '' + (kind || 'unknown');
+        return NESTED_KIND_LABEL[k] || k;
+    }
+
+    /** The entries a scan says are NOT covered by the current choice. */
+    function excludedNested(scan) {
+        var out = [];
+        var list = (scan && scan.nested) || [];
+        if (!isArray(list)) {
+            return out;
+        }
+        for (var i = 0; i < list.length; i++) {
+            if (list[i] && list[i].included !== true) {
+                out.push(list[i]);
+            }
         }
         return out;
     }
@@ -1145,7 +1226,70 @@
             + enc(text) + '</pre></div>';
     }
 
-    function archivesBlock(task) {
+    // The scan the daemon ran for THIS archive, matched by name then by path
+    // (a task written before backup2.2 has no per-archive key to match on).
+    function nestedScanFor(scans, archive) {
+        if (!isArray(scans)) {
+            return null;
+        }
+        for (var i = 0; i < scans.length; i++) {
+            var s = scans[i] || {};
+            if (s.archive && archive.name && s.archive === archive.name) {
+                return s;
+            }
+        }
+        for (var j = 0; j < scans.length; j++) {
+            if ((scans[j] || {}).path === archive.path) {
+                return scans[j];
+            }
+        }
+        return null;
+    }
+
+    /** The per-archive nested summary line for the detail window (backup2.2). */
+    function nestedDetailHtml(archive, scan) {
+        var choice = nestedChoiceOf(archive);
+        var label = choice === 'all'
+            ? t('nested filesystems: all')
+            : (isArray(choice)
+                ? (t('nested filesystems') + ': ' + choice.join('  '))
+                : t('nested filesystems: none'));
+        var out = '<div style="color:var(--anas-muted,gray);margin-top:2px;">' + enc(label) + '</div>';
+        if (!scan) {
+            return out;
+        }
+        var excluded = excludedNested(scan);
+        var found = isArray(scan.nested) ? scan.nested : [];
+        if (excluded.length) {
+            var names = [];
+            for (var e = 0; e < excluded.length; e++) {
+                names.push((excluded[e].path || '') + ' (' + nestedKindLabel(excluded[e].kind) + ')');
+            }
+            out += '<div style="margin-top:3px;">'
+                + pillHtml(excluded.length + ' ' + t('excluded'), 'var(--anas-warn,#c9820b)',
+                    t('backed up as empty directories') + ': ' + names.join(', '))
+                + '<span style="color:var(--anas-muted,gray);margin-left:6px;">'
+                + enc(t('backed up as empty directories')) + '</span></div>';
+        }
+        // Every nested filesystem under the source, with its kind — included or
+        // not. What is there is never hidden just because it is covered.
+        for (var i = 0; i < found.length; i++) {
+            var n = found[i] || {};
+            var on = n.included === true;
+            out += '<div style="margin-left:2px;color:'
+                + (on ? 'var(--anas-muted,gray)' : 'var(--anas-warn,#c9820b)') + ';">'
+                + '<span style="font-family:monospace;">' + enc(n.path || '') + '</span> ('
+                + enc(nestedKindLabel(n.kind)) + ') — '
+                + enc(on ? t('included') : t('stored as an empty directory')) + '</div>';
+        }
+        if (scan.truncated === true) {
+            out += '<div style="color:var(--anas-muted,gray);margin-top:2px;">'
+                + enc(t('The boundary scan did not finish — there may be more than listed.')) + '</div>';
+        }
+        return out;
+    }
+
+    function archivesBlock(task, scans) {
         var archives = archivesOf(task);
         if (!archives.length) {
             return '<div style="margin-top:10px;color:var(--anas-muted,gray);font-size:0.9em;">'
@@ -1164,7 +1308,8 @@
                 : '';
             html += '<tr><td style="padding:3px 12px 3px 0;vertical-align:top;font-family:monospace;'
                 + 'white-space:nowrap;color:var(--anas-accent,#3468c0);">' + enc(name) + '</td>'
-                + '<td style="padding:3px 0;">' + mono(a.path) + excl + '</td></tr>';
+                + '<td style="padding:3px 0;">' + mono(a.path) + excl
+                + nestedDetailHtml(a, nestedScanFor(scans, a)) + '</td></tr>';
         }
         html += '</table></div>';
         return html;
@@ -1306,7 +1451,7 @@
 
         var html = '<div style="padding:10px 14px;">'
             + '<table style="border-collapse:collapse;width:100%;">' + rows + '</table>';
-        html += archivesBlock(task);
+        html += archivesBlock(task, d.nested);
         // The unit + timer, verbatim — config-is-the-API transparency (Principle 13).
         html += unitBlock(t('systemd service unit (as written)'), first(d.unit, d.serviceUnit));
         html += unitBlock(t('systemd timer (as written)'), first(d.timer, d.timerUnit));
@@ -1470,6 +1615,12 @@
                                 anyMatch: true,
                                 emptyText: '/etc',
                                 value: data.path || '',
+                                listeners: {
+                                    // A new source has different boundaries — rescan.
+                                    // DEBOUNCED: `change` fires per keystroke, and each
+                                    // scan is a real tree walk on the node.
+                                    change: function () { scheduleNestedScan(fs, node); },
+                                },
                             },
                             {
                                 xtype: 'button',
@@ -1498,12 +1649,217 @@
                         emptyText: t('one pattern per line — e.g. **/*.tmp'),
                         value: (isArray(data.excludes) ? data.excludes.join('\n') : (data.excludes || '')),
                     },
+                    {
+                        // backup2.2 — filesystem boundaries are a CHOICE, never a
+                        // silent omission. None is the client's own behaviour
+                        // (and PVE's lead); absent shows as None and saves as
+                        // nothing at all.
+                        xtype: 'combobox',
+                        itemId: 'archNested',
+                        cls: 'anas-fld-backup-arch-nested',
+                        fieldLabel: t('Include nested filesystems'),
+                        labelWidth: 170,
+                        editable: false,
+                        queryMode: 'local',
+                        valueField: 'mode',
+                        displayField: 'label',
+                        store: Ext.create('Ext.data.Store', {
+                            fields: ['mode', 'label'],
+                            data: [
+                                { mode: 'none', label: t('None (default) — nested filesystems are stored empty') },
+                                { mode: 'all', label: t('All — every filesystem under this path') },
+                                { mode: 'choose', label: t('Choose…') },
+                            ],
+                        }),
+                        value: nestedModeOf(data),
+                        listeners: {
+                            change: function () {
+                                syncArchiveNested(fs);
+                                scanArchiveNested(fs, node);
+                            },
+                        },
+                    },
+                    {
+                        xtype: 'textareafield',
+                        itemId: 'archNestedPaths',
+                        cls: 'anas-fld-backup-arch-nested-paths',
+                        fieldLabel: t('Nested paths'),
+                        labelWidth: 170,
+                        height: 54,
+                        hidden: nestedModeOf(data) !== 'choose',
+                        emptyText: t('one absolute path per line — e.g. /etc/pve'),
+                        value: (function () {
+                            var choice = nestedChoiceOf(data);
+                            return isArray(choice) ? choice.join('\n') : '';
+                        }()),
+                        listeners: {
+                            blur: function () { scheduleNestedScan(fs, node); },
+                        },
+                    },
+                    {
+                        xtype: 'component',
+                        itemId: 'archNestedAlert',
+                        cls: 'anas-backup-arch-nested-alert',
+                        margin: '2 0 0 0',
+                        html: '',
+                    },
                 ],
             });
         } catch (e) {
             ANAS.warn('archive row add failed: ' + ANAS.errText(e));
         }
+        if (fs) {
+            syncArchiveNested(fs);
+            scanArchiveNested(fs, node);
+        }
         return fs;
+    }
+
+    // Show the path list only for Choose… — the two other modes have nothing to
+    // type. Read by itemId off the ROW, never win.down() (itemIds repeat).
+    function syncArchiveNested(fs) {
+        try {
+            if (!fs || fs.destroyed || fs.destroying) {
+                return;
+            }
+            var modeF = fs.down('#archNested');
+            // Read the CONTROL, not the derived value: an empty Choose… list is
+            // still Choose… (deriving it would hide the field being typed into).
+            var mode = modeF ? ('' + (modeF.getValue() || 'none')) : 'none';
+            var paths = fs.down('#archNestedPaths');
+            if (paths) {
+                paths.setVisible(mode === 'choose');
+            }
+        } catch (e) {
+            ANAS.warn('nested control sync failed: ' + ANAS.errText(e));
+        }
+    }
+
+    /** The row's current choice, in the stored shape ('none' | 'all' | [paths]). */
+    function nestedFromRow(fs) {
+        var modeF = fs && fs.down ? fs.down('#archNested') : null;
+        var mode = modeF ? ('' + (modeF.getValue() || 'none')) : 'none';
+        if (mode === 'all') {
+            return 'all';
+        }
+        if (mode !== 'choose') {
+            return 'none';
+        }
+        var pathsF = fs.down('#archNestedPaths');
+        var paths = splitLines(pathsF ? pathsF.getValue() : '');
+        return paths.length ? paths : 'none';
+    }
+
+    function nestedAlertOut(fs, html) {
+        try {
+            var out = fs && fs.down ? fs.down('#archNestedAlert') : null;
+            if (out && !out.destroyed && !out.destroying) {
+                out.update(html);
+            }
+        } catch (e) {
+            ANAS.warn('nested alert render failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // One line per nested filesystem found under the source, ALWAYS naming its
+    // kind — included ones in the muted/ok colour, excluded ones amber under an
+    // alert that says exactly what happens to them.
+    function nestedAlertHtml(scan) {
+        var found = (scan && isArray(scan.nested)) ? scan.nested : [];
+        var excluded = excludedNested(scan);
+        var truncated = scan && scan.truncated === true;
+        if (!found.length && !truncated) {
+            return '';
+        }
+        var head = '';
+        if (excluded.length) {
+            head = '<div style="font-size:11px;color:var(--anas-warn,#c9820b);">'
+                + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
+                + enc(excluded.length + ' '
+                    + (excluded.length === 1 ? t('nested filesystem') : t('nested filesystems'))
+                    + ' ' + t('will be backed up as empty directories')) + '</div>';
+        } else if (found.length) {
+            head = '<div style="font-size:11px;color:var(--anas-ok,#1f9c56);">'
+                + '<i class="fa fa-check" style="margin-right:5px;"></i>'
+                + enc(found.length + ' '
+                    + (found.length === 1 ? t('nested filesystem') : t('nested filesystems'))
+                    + ' ' + t('will be included')) + '</div>';
+        }
+        var rows = '';
+        for (var i = 0; i < found.length; i++) {
+            var n = found[i] || {};
+            var on = n.included === true;
+            var colour = on ? 'var(--anas-muted,gray)' : 'var(--anas-warn,#c9820b)';
+            rows += '<div style="font-size:11px;margin-left:18px;color:' + colour + ';">'
+                + '<span style="font-family:monospace;">' + enc(n.path || '') + '</span> ('
+                + enc(nestedKindLabel(n.kind)) + ') — '
+                + enc(on ? t('included') : t('stored as an empty directory')) + '</div>';
+        }
+        var note = truncated
+            ? '<div style="font-size:11px;color:var(--anas-muted,gray);margin-left:18px;">'
+                + enc(t('The scan did not finish — there may be more than listed.')) + '</div>'
+            : '';
+        return head + rows + note;
+    }
+
+    // Coalesce the scans a typed path would otherwise fire per keystroke — one
+    // walk per pause, never one per character.
+    var NESTED_SCAN_DEBOUNCE_MS = 400;
+
+    function scheduleNestedScan(fs, node) {
+        if (!fs || fs.destroyed || fs.destroying) {
+            return;
+        }
+        try {
+            if (fs.anasNestedTimer) {
+                clearTimeout(fs.anasNestedTimer);
+            }
+            fs.anasNestedTimer = setTimeout(function () {
+                fs.anasNestedTimer = null;
+                scanArchiveNested(fs, node);
+            }, NESTED_SCAN_DEBOUNCE_MS);
+        } catch (e) {
+            // No timers? Scan straight away rather than not at all.
+            scanArchiveNested(fs, node);
+        }
+    }
+
+    // Ask the daemon what is nested under this row's path. USER-INITIATED (a row
+    // opened or edited), one-shot, non-mutating and entirely local — the
+    // save-time verify pattern, with no PBS contact at all.
+    function scanArchiveNested(fs, node) {
+        if (!fs || fs.destroyed || fs.destroying) {
+            return;
+        }
+        var pathF = fs.down('#archPath');
+        var path = trim(pathF ? pathF.getValue() : '');
+        if (!path || path.charAt(0) !== '/') {
+            nestedAlertOut(fs, '');
+            return;
+        }
+        var body = { path: path, includeNested: nestedFromRow(fs) };
+        nestedAlertOut(fs, '<div style="font-size:11px;color:var(--anas-muted,gray);">'
+            + '<i class="fa fa-refresh fa-spin" style="margin-right:5px;"></i>'
+            + enc(t('checking for nested filesystems…')) + '</div>');
+        ANAS.api.post(node, '/backup/tasks/preview-nested', body).then(
+            function (res) {
+                if (fs.destroyed || fs.destroying) {
+                    return;
+                }
+                var d = (res && res.data) || {};
+                var scans = isArray(d.archives) ? d.archives : [];
+                nestedAlertOut(fs, nestedAlertHtml(scans[0]));
+            },
+            function (err) {
+                if (fs.destroyed || fs.destroying) {
+                    return;
+                }
+                // Fail-open and HONEST: an unavailable scan says so, it never
+                // renders as "nothing is nested".
+                nestedAlertOut(fs, '<div style="font-size:11px;color:var(--anas-muted,gray);">'
+                    + enc(t('Could not check for nested filesystems') + ': ' + ANAS.errText(err)) + '</div>');
+            }
+        );
     }
 
     function readArchives(win) {
@@ -1524,11 +1880,20 @@
             if (!name && !path) {
                 return; // skip a wholly-empty row
             }
-            out.push({
+            var row = {
                 name: name,
                 path: path,
                 excludes: splitLines(exclF ? exclF.getValue() : ''),
-            });
+            };
+            // backup2.2 — set / clear / keep: a chosen value is SENT, and None
+            // is sent as NOTHING. Archives are replaced wholesale on every save,
+            // so an omitted field IS the clear — and a task that never chose one
+            // rewrites its unit byte-for-byte (the dialog ↔ daemon contract).
+            var nested = nestedFromRow(fs);
+            if (nested !== 'none') {
+                row.includeNested = nested;
+            }
+            out.push(row);
         });
         return out;
     }
