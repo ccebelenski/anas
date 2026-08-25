@@ -191,6 +191,8 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `PUT` | `/v1/pools/:name/datasets/*path` | Update dataset properties | `202` with job |
 | `DELETE` | `/v1/pools/:name/datasets/*path` | Destroy a dataset | `202`/`409` |
 
+**Volumes (iscsi epic, 2026-08-25):** a dataset of `type: volume` is first-class in the same resource — `POST` accepts `{type: 'volume', volsize, volblocksize, sparse}`; `PUT` may grow `volsize` (live under a LUN — the initiator rescans) but a shrink, a rename, or a rollback of a volume referenced by a LUN is refused (ZFS lets all three through silently). Volumes have no mountpoint and cannot be shared; PVE-owned `vm-*` zvols stay hands-off.
+
 #### ZFS Snapshots (nested under datasets)
 
 | Method | Path | Description | Response |
@@ -252,6 +254,27 @@ Request options carry a **clear contract** (issue #34): every value-bearing opti
 
 > **Usage classification:** a disk's `status` names who owns it — `system`, `pool_member` (ZFS), `ahr_member` (issue #3), `ceph_osd` (issue #29), `available` (genuinely blank), `other`. Every membership value means IN USE; only `available` is ever offered for pool/array composition. Ceph OSDs are read structurally out of the lsblk tree ANAS already fetches — an LVM descendant whose fstype is `ceph_bluestore`, or whose LV sits under the `ceph--` VG naming convention (which also catches dedicated DB/WAL devices carrying no bluestore label) — so the classification needs no ceph tooling and costs nothing on a node without Ceph.
 
+#### iSCSI — block storage (iscsi epic; designed 2026-08-25, ground truth `docs/ISCSI-GROUND-TRUTH.md`)
+
+ANAS is the **target side only** — a generic iSCSI target on LIO (kernel target) driven by `targetcli-fb`; PVE and guests are ordinary initiators and `storage.cfg` is never written. Identity: a target is its URL-encoded IQN; a LUN is its index `n` within the target. Two backing kinds: `zvol` (ZFS) and `file` (a sparse raw image on a dataset or AHR pool — AHR's only kind). Read model = `saveconfig.json` (persisted) + configfs (live); writes = one `targetcli` command per invocation (stdin batching always exits 0 and autosaves half-applied state) behind a daemon mutex, then `saveconfig`.
+
+| Method | Path | Description | Response |
+|--------|------|-------------|----------|
+| `GET` | `/v1/iscsi/targets` | All targets on the node: ANAS-managed (ownership derived from the backing path + naming, never shadow state) and foreign ones tagged hands-off; per target: portals, LUN count, session count, enabled, health | `200` |
+| `POST` | `/v1/iscsi/targets` | Create a target: user-facing name → stable ANAS-generated IQN (immutable after creation — a "rename" is a new target), portals (address picked from PVE's network config; IPv6 ULA ok, link-local refused by LIO), initiator ACLs, auth (`none` / CHAP / mutual CHAP; secrets write-only). The auto-added `0.0.0.0:3260` portal is removed; `demo_mode_discovery=0`, `generate_node_acls=0` | `202` with job |
+| `GET` | `/v1/iscsi/targets/:iqn` | Detail: portals, LUNs (kind, backing, size, **serial**, attributes), ACLs (`credentialsSet`, never the secret), live sessions (from `acls/<iqn>/info`), restore holes (saveconfig ⟷ configfs diff) | `200` |
+| `PUT` | `/v1/iscsi/targets/:iqn` | Edit portals / ACLs / auth (rotate secrets: written to configfs, never argv) | `202` with job |
+| `DELETE` | `/v1/iscsi/targets/:iqn` | Delete target + its LUN mappings (backing objects are NOT destroyed); live sessions → `409` with the initiator list, confirm to force | `202`/`409` |
+| `POST` | `/v1/iscsi/targets/:iqn/state` | `{action: enable\|disable}` — TPG enable flag; `disable` is also the entry gate a LUN restore uses | `202` with job |
+| `POST` | `/v1/iscsi/targets/:iqn/luns` | Add a LUN: `{name, kind: zvol\|file, backing}` — `zvol` names an existing ANAS-managed volume (PVE `vm-*` zvols never eligible); `file` names a dataset or AHR pool + `size` and creates the sparse image. `name` is the SCSI model string initiators see (validated). ANAS sets `emulate_tpu=1`, `emulate_tpws=1`, `max_unmap_lba_count`, fileio `write_back=0`; `block_size` chosen here (immutable once mapped); serial generated and stored | `202` with job |
+| `GET` | `/v1/iscsi/targets/:iqn/luns/:n` | LUN detail incl. serial, attributes, connected initiators, backup/restore eligibility | `200` |
+| `PUT` | `/v1/iscsi/targets/:iqn/luns/:n` | Resize (zvol: live grow; file: delete + recreate replaying **serial and attributes** — shrink refused), attribute changes (`write_back` behind a warning); live sessions → `409` | `202`/`409` |
+| `DELETE` | `/v1/iscsi/targets/:iqn/luns/:n` | Unmap + delete backstore; `?destroyBacking=true` also destroys the zvol / image (confirm-gated); live sessions → `409` | `202`/`409` |
+| `GET` | `/v1/iscsi/sessions` | Every live session on the node (initiator IQN, target, LUNs, addresses) — the cross-feature gates and the dashboard read this | `200` |
+| `GET` | `/v1/iscsi/health` | saveconfig ⟷ configfs diff (LUNs whose backing device was missing at restore, portals bound to addresses no interface carries, foreign changes) — feeds the `iscsi` dashboard warning category | `200` |
+
+Key decisions: **serial + attributes are replayed on every backstore recreate** (boot restore, fileio resize, image restore) — initiators, ESXi, Windows and PVE's own volids identify a LUN by the serial, and LIO drops attributes on recreate. Backstores reference `/dev/zvol/<pool>/<vol>` (the `zd*` name changes across reboots). **Boot restore reports systemd success even when a LUN is missing**, so `/v1/iscsi/health` diffs rather than trusting the unit, and ANAS never runs `saveconfig` over a degraded restore. LIO's own 10 rotating `saveconfig` copies are the config backup; every mutation is a journald audit line. `rtslib-fb-targetctl` is ordered after `zfs-volumes.target` and AHR activation via a drop-in. Cross-feature gates (Pools/Datasets/AHR/Mounts): destroy/export of a claimed zvol already fails in ZFS (`busy-diagnosis` names the LUN from configfs — `fuser`/`lsof` see nothing); **rollback, rename, volsize shrink and removal of a backing file succeed silently in ZFS and are refused by ANAS** while a LUN references the object. The disk inventory excludes `zd*` and tags iSCSI-transport disks whose serial matches a LUN served by this node.
+
 #### Backup — PBS file backup (Epic 16; designed 2026-07-18)
 
 Mirrors the replication API shape. Repositories live in the cluster-wide CAS-versioned registry (`/etc/pve/anas/backup-repos.json`, pmxcfs) with per-repo secrets in `/etc/anas/creds/` (0600, write-only via API — token secret or password, user's choice). Tasks ARE systemd units (`anas-backup-<name>.service`/`.timer`) — no second config source. **Status is local-only** (persistent systemd state + journald + jobs): the only PBS-server contacts are backup runs, the explicit user-initiated repository test, and — since 16.11 — the post-backup retention prune plus its user-initiated dry-run preview. Never polling, never background.
@@ -279,6 +302,16 @@ The fd cap (default 1024, per-task override) binds pbc via `prlimit --nofile=N:N
 
 **Task cadence (16.10).** A task may carry a structured `cadence` alongside its `schedule`: `{ kind: weekly|biweekly|monthly|custom, days[] (Mon..Sun), time (HH:MM), parity? (even|odd) }`. When present the daemon **generates** `OnCalendar=` from it (the cadence is authoritative, and the generated expression is validated with `systemd-analyze calendar` like any other); when absent the raw `schedule` stands — which is what every pre-16.10 task carries, so nothing migrates. Weekly/monthly/custom are pure OnCalendar with `Persistent=true` as their missed-run heal; **biweekly** is the one case systemd's calendar cannot express, so it runs on a WEEKLY timer and the daemon gates each SCHEDULED fire on ISO-week parity (`date +%V` semantics, parity explicit config — never derived). An off-week fire completes as a first-class **skipped** run (the runner's `SuccessExitStatus=75`: systemd records success, `ExecMainStatus` says no backup was taken); a Run Now is never gated; and an off-week fire runs anyway when the last successful run is older than one full period (the heal — at most one shortened interval, the phase never flips). Overdue is measured against the cadence's own period, so a healthy off-week skip never reads as overdue.
 
+
+
+**Phase 2 (backup2 epic; designed 2026-08-25, ground truth `docs/BACKUP-RESTORE-GROUND-TRUTH.md`).** Restore is two types by nature — **files are selective, block images are whole**. Every call below is a user-initiated PBS contact (sanctioned; the never-poll rule is unchanged). Archives gain `kind: pxar | img` and `includeNested: none | all | [paths]` (default `none`); snapshot-consistent runs expand one archive root per nested filesystem at run time.
+
+| Method | Path | Description | Response |
+|--------|------|-------------|----------|
+| `GET` | `/v1/backup/tasks/:name/snapshots` | Points in time for the task's group (`snapshot list --output-format json`; ANAS composes `<type>/<id>/<RFC3339>` — the client's JSON has no `snapshot` field and is unsorted; `files[].size` is the restore space estimate) | `200` |
+| `GET` | `/v1/backup/repos/:name/groups?ns=` | Task-less entry point: groups (and their snapshots on `?group=`) in a repository/namespace — archives whose task was renamed or deleted | `200` |
+| `POST` | `/v1/backup/restore/browse` | `{repo, ns, snapshot, archive, path}` → one directory level of the archive via **`catalog shell` over a pipe** (never FUSE: a black-holed server leaves FUSE readers in D state that `timeout` cannot kill and `stat -f` calls the mount healthy). Hardlink groups are returned as one unit | `200` |
+| `POST` | `/v1/backup/restore` | Files: `{…, selections[], target: {mode: sideBySide\|inPlace, path}, options: {ignoreOwnership, ignoreAcls, ignoreXattrs, ignorePermissions}}` → `restore --pattern` per selection (`/`-anchored, `\ * ? [ ]` escaped; hardlink groups together), `--allow-existing-dirs --overwrite` only for `inPlace` (a MERGE, never a sync); in-place TREE restore → `409` confirm; pre-flight write test + space check; the job verifies the restored set against the catalog (a no-match pattern is a silent client success). Image: `{…, kind: image, lun}` → target LUN disabled for the duration, manifest size must equal the target size (the client writes until ENOSPC otherwise), image streamed via `restore … -` into the device or `map` + `dd`, serial + attributes preserved, LUN re-enabled | `202`/`409` with job |
 
 #### Filesystem browse (read-only UI support; designed 2026-07-20)
 
@@ -598,6 +631,21 @@ Users/groups are read **only** via `getent`/nsswitch (source-agnostic — local,
 | `identity.smbpasswd.clear` | `smbpasswd -x <name>` |
 
 > **Permissions editor (Epic 4.7 → 4.7.1):** the layered access UI is backed by **POSIX ACLs** (`getfacl`/`setfacl`, `acltype=posixacl`) — owner/group/mode for the base rows, named-user/group ACL entries for extra principals, and a default ACL + setgid for inheritance. NFSv4 ACLs are **deferred to Epic 14** (they earn their complexity only for Windows-file-server parity, which pairs with an AD join). No `passwd`/`chpasswd` — ANAS never sets a Unix login password.
+
+### iSCSI Operations (LIO — iscsi epic)
+
+- `targetcli <one command>` — create/delete/set for backstores, targets, TPGs, portals, LUNs, ACLs; `saveconfig`; always ONE command per invocation (real exit code), serialized behind a daemon mutex
+- direct configfs writes under `/sys/kernel/config/target/` for CHAP secrets only (argv-free; round-trips through `saveconfig`)
+- reads: `/etc/rtslib-fb-target/saveconfig.json`, configfs (`acls/<iqn>/info` for sessions, `CLAIMED`/`udev_path` for the busy diagnosis)
+- `systemctl restart rtslib-fb-targetctl` never issued by ANAS (a restore over a degraded state persists the hole); enable/disable via `targetcli`
+
+### Backup restore operations (proxmox-backup-client — backup2 epic)
+
+- `proxmox-backup-client snapshot list --output-format json`, `list`
+- `proxmox-backup-client catalog shell <snap> <archive>` driven over a pipe (`ls`, `stat`, `find`) — the archive browser; never `mount` (FUSE)
+- `proxmox-backup-client restore <snap> <archive> <target|-> [--pattern …] [--allow-existing-dirs --overwrite] [--ignore-*] [--rate]`
+- `proxmox-backup-client map` / `unmap` (`unmap` with no argument = sweep of stale loop devices)
+- `zfs set snapdev=visible` / `zfs inherit snapdev` around a zvol snapshot backup (`set snapdev=hidden` would leave `source=local`)
 
 ### Parameter validation
 
