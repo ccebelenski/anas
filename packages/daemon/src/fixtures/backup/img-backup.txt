@@ -1,0 +1,117 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: .img archives: regular sparse file and zvol device as sources; re-run reuse lines
+# COMMAND LOG: 13-img.sh
+# ==============================================================================
+
+############ .img ARCHIVES ############
+=== prepare: sparse raw image file + zvol ===
+-rw-r--r-- 1 root root 536870912 Aug 25 19:28 /gtbackup/images/lun.raw
+512M	/gtbackup/images/lun.raw
+512	/gtbackup/images/lun.raw
+total 0
+lrwxrwxrwx 1 root root 10 Aug 25 19:28 vol1 -> ../../zd16
+536870912
+
+=== GT: back up a REGULAR FILE as .img ===
+### $ proxmox-backup-client backup lun.img:/gtbackup/images/lun.raw --ns gtrestore --backup-id gtimg
+Starting backup: [gtrestore]:host/gtimg/2026-08-25T19:28:36Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:28:36 2026    
+No previous manifest available.    
+Upload image '/gtbackup/images/lun.raw' to 'root@pam!anas-test@localhost:8007:anastest-store' as lun.img.fidx    
+lun.img: had to backup 12 MiB of 512 MiB (compressed 536 B) in 0.54 s (average 22.176 MiB/s)
+lun.img: backup was done incrementally, reused 500 MiB (97.7%)
+Duration: 0.56s    
+End Time: Tue Aug 25 19:28:37 2026    
+### exit=0
+
+=== GT: back up a ZVOL DEVICE as .img (same group, 2nd archive name) ===
+### $ proxmox-backup-client backup vol.img:/dev/zvol/gtbackup/vol1 --ns gtrestore --backup-id gtimgvol
+Starting backup: [gtrestore]:host/gtimgvol/2026-08-25T19:28:37Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:28:37 2026    
+No previous manifest available.    
+Upload image '/dev/zvol/gtbackup/vol1' to 'root@pam!anas-test@localhost:8007:anastest-store' as vol.img.fidx    
+vol.img: had to backup 16 MiB of 512 MiB (compressed 4.001 MiB) in 0.79 s (average 20.173 MiB/s)
+vol.img: backup was done incrementally, reused 496 MiB (96.9%)
+Duration: 0.84s    
+End Time: Tue Aug 25 19:28:38 2026    
+### exit=0
+
+=== GT: both in ONE snapshot ===
+### $ proxmox-backup-client backup lun.img:/gtbackup/images/lun.raw vol.img:/dev/zvol/gtbackup/vol1 --ns gtrestore --backup-id gtimgboth
+Starting backup: [gtrestore]:host/gtimgboth/2026-08-25T19:28:38Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:28:38 2026    
+No previous manifest available.    
+Upload image '/gtbackup/images/lun.raw' to 'root@pam!anas-test@localhost:8007:anastest-store' as lun.img.fidx    
+lun.img: had to backup 12 MiB of 512 MiB (compressed 536 B) in 0.68 s (average 17.744 MiB/s)
+lun.img: backup was done incrementally, reused 500 MiB (97.7%)
+Upload image '/dev/zvol/gtbackup/vol1' to 'root@pam!anas-test@localhost:8007:anastest-store' as vol.img.fidx    
+vol.img: had to backup 16 MiB of 512 MiB (compressed 4.001 MiB) in 0.81 s (average 19.86 MiB/s)
+vol.img: backup was done incrementally, reused 496 MiB (96.9%)
+Duration: 1.51s    
+End Time: Tue Aug 25 19:28:39 2026    
+### exit=0
+
+=== snapshot files for the .img group ===
+SNAP(gtimg)=host/gtimg/2026-08-25T19:28:36Z
+### $ proxmox-backup-client snapshot files 'host/gtimg/2026-08-25T19:28:36Z' --ns gtrestore --output-format json
+[{"crypt-mode":"none","filename":"lun.img.fidx","size":536870912},{"crypt-mode":"none","filename":"index.json.blob","size":308}]
+### exit=0
+
+### $ proxmox-backup-client snapshot list host/gtimg --ns gtrestore --output-format json
+[{"backup-id":"gtimg","backup-time":1787686116,"backup-type":"host","files":[{"crypt-mode":"none","filename":"lun.img.fidx","size":536870912},{"crypt-mode":"none","filename":"index.json.blob","size":308}],"owner":"root@pam!anas-test","protected":false,"size":536871220}]
+### exit=0
+
+=== catalog dump on an .img snapshot ===
+### $ proxmox-backup-client catalog dump 'host/gtimg/2026-08-25T19:28:36Z' --ns gtrestore
+Error: manifest does not contain file 'catalog.pcat1.didx'
+### exit=255
+
+
+=== 2nd run, NO CHANGE (default mode) ===
+### $ proxmox-backup-client backup lun.img:/gtbackup/images/lun.raw --ns gtrestore --backup-id gtimg
+Starting backup: [gtrestore]:host/gtimg/2026-08-25T19:28:39Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:28:39 2026    
+Downloading previous manifest (Tue Aug 25 19:28:36 2026)    
+Upload image '/gtbackup/images/lun.raw' to 'root@pam!anas-test@localhost:8007:anastest-store' as lun.img.fidx    
+lun.img: had to backup 0 B of 512 MiB (compressed 0 B) in 0.56 s (average 0 B/s)
+lun.img: backup was done incrementally, reused 512 MiB (100.0%)
+Duration: 0.58s    
+End Time: Tue Aug 25 19:28:40 2026    
+### exit=0
+
+=== 3rd run, SMALL CHANGE (24 bytes at offset 0) ===
+### $ proxmox-backup-client backup lun.img:/gtbackup/images/lun.raw --ns gtrestore --backup-id gtimg
+Starting backup: [gtrestore]:host/gtimg/2026-08-25T19:28:40Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:28:40 2026    
+Downloading previous manifest (Tue Aug 25 19:28:39 2026)    
+Upload image '/gtbackup/images/lun.raw' to 'root@pam!anas-test@localhost:8007:anastest-store' as lun.img.fidx    
+lun.img: had to backup 4 MiB of 512 MiB (compressed 182 B) in 0.57 s (average 7.027 MiB/s)
+lun.img: backup was done incrementally, reused 508 MiB (99.2%)
+Duration: 0.63s    
+End Time: Tue Aug 25 19:28:41 2026    
+### exit=0
+
+=== 4th run, metadata change-detection mode on an .img ===
+### $ proxmox-backup-client backup lun.img:/gtbackup/images/lun.raw --ns gtrestore --backup-id gtimg --change-detection-mode=metadata
+Starting backup: [gtrestore]:host/gtimg/2026-08-25T19:28:41Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:28:41 2026    
+Downloading previous manifest (Tue Aug 25 19:28:40 2026)    
+Upload image '/gtbackup/images/lun.raw' to 'root@pam!anas-test@localhost:8007:anastest-store' as lun.img.fidx    
+lun.img: had to backup 0 B of 512 MiB (compressed 0 B) in 0.64 s (average 0 B/s)
+lun.img: backup was done incrementally, reused 512 MiB (100.0%)
+Duration: 0.67s    
+End Time: Tue Aug 25 19:28:41 2026    
+### exit=0
+

@@ -1,0 +1,252 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: THE 10 TB QUESTION: metadata-mode continuity when the archive root moves live -> .zfs/snapshot
+# COMMAND LOG: 18-cdm.sh
+# ==============================================================================
+
+############ METADATA CHANGE-DETECTION CONTINUITY: live root -> snapshot root ############
+=== build a dedicated dataset with 2000 files ===
+### $ zfs list gtbackup/cdm
+NAME           USED  AVAIL  REFER  MOUNTPOINT
+gtbackup/cdm  4.28M  4.97G  4.28M  /gtbackup/cdm
+### exit=0
+
+file count: 2000
+snapdir property: hidden
+
+================ METADATA MODE ================
+### RUN 1 — live path /gtbackup/cdm/tree, metadata mode
+### $ proxmox-backup-client backup cdm.pxar:/gtbackup/cdm/tree --ns gtrestore --backup-id gtcdm --change-detection-mode=metadata
+Starting backup: [gtrestore]:host/gtcdm/2026-08-25T19:33:25Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:33:25 2026    
+No previous manifest available.    
+Upload directory '/gtbackup/cdm/tree' to 'root@pam!anas-test@localhost:8007:anastest-store' as cdm.mpxar.didx    
+cdm.mpxar: had to backup 267.813 KiB of 267.813 KiB (compressed 24.785 KiB) in 0.05 s (average 5.219 MiB/s)
+cdm.ppxar: had to backup 3.937 MiB of 3.937 MiB (compressed 3.937 MiB) in 0.06 s (average 69.574 MiB/s)
+Duration: 0.09s    
+End Time: Tue Aug 25 19:33:26 2026    
+### exit=0
+
+>>> WALL: 128 ms
+### RUN 2 — SAME live path, unchanged, metadata mode
+### $ proxmox-backup-client backup cdm.pxar:/gtbackup/cdm/tree --ns gtrestore --backup-id gtcdm --change-detection-mode=metadata
+Starting backup: [gtrestore]:host/gtcdm/2026-08-25T19:33:28Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:33:28 2026    
+Downloading previous manifest (Tue Aug 25 19:33:25 2026)    
+Upload directory '/gtbackup/cdm/tree' to 'root@pam!anas-test@localhost:8007:anastest-store' as cdm.mpxar.didx    
+Using previous index as metadata reference for 'cdm.mpxar.didx'    
+Change detection summary:
+ - 2000 total files (0 hardlinks)
+ - 2000 unchanged, reusable files with 3.937 MiB data
+ - 0 changed or non-reusable files with 0 B data
+ - 32 B padding in 2 partially reused chunks
+cdm.mpxar: had to backup 267.813 KiB of 267.813 KiB (compressed 24.779 KiB) in 0.06 s (average 4.724 MiB/s)
+cdm.ppxar: reused 3.937 MiB from previous snapshot for unchanged files (4 chunks)
+cdm.ppxar: had to backup 32 B of 3.937 MiB (compressed 56 B) in 0.06 s (average 573 B/s)
+cdm.ppxar: backup was done incrementally, reused 3.937 MiB (100.0%)
+Duration: 0.11s    
+End Time: Tue Aug 25 19:33:28 2026    
+### exit=0
+
+>>> WALL: 172 ms
+
+=== take snapshot s1 ===
+### $ zfs snapshot gtbackup/cdm@s1
+### exit=0
+
+### $ ls -la /gtbackup/cdm/.zfs/snapshot/
+total 0
+drwxrwxrwx 3 root root 2 Aug 25 19:33 .
+drwxrwxrwx 1 root root 0 Aug 25 19:33 ..
+drwxrwxrwx 1 root root 0 Aug 25 19:33 s1
+### exit=0
+
+--- inode comparison LIVE vs SNAPSHOT ---
+### $ stat -c %i %d %n /gtbackup/cdm/tree/a/f1.bin /gtbackup/cdm/.zfs/snapshot/s1/tree/a/f1.bin
+7 60 /gtbackup/cdm/tree/a/f1.bin
+7 61 /gtbackup/cdm/.zfs/snapshot/s1/tree/a/f1.bin
+### exit=0
+
+### $ stat -c %i %d %n /gtbackup/cdm/tree /gtbackup/cdm/.zfs/snapshot/s1/tree
+2 60 /gtbackup/cdm/tree
+2 61 /gtbackup/cdm/.zfs/snapshot/s1/tree
+### exit=0
+
+### $ stat -c %y %n /gtbackup/cdm/tree/a/f1.bin /gtbackup/cdm/.zfs/snapshot/s1/tree/a/f1.bin
+2026-08-25 19:33:21.354789617 +0000 /gtbackup/cdm/tree/a/f1.bin
+2026-08-25 19:33:21.354789617 +0000 /gtbackup/cdm/.zfs/snapshot/s1/tree/a/f1.bin
+### exit=0
+
+--- st_dev of the live dataset vs the snapshot mount ---
+### $ findmnt -T /gtbackup/cdm/.zfs/snapshot/s1 -o TARGET,SOURCE,FSTYPE
+TARGET                         SOURCE          FSTYPE
+/gtbackup/cdm/.zfs/snapshot/s1 gtbackup/cdm@s1 zfs
+### exit=0
+
+### RUN 3 — SAME backup-id + archive name, ARCHIVE ROOT SWITCHED to the snapshot
+### $ proxmox-backup-client backup cdm.pxar:/gtbackup/cdm/.zfs/snapshot/s1/tree --ns gtrestore --backup-id gtcdm --change-detection-mode=metadata
+Starting backup: [gtrestore]:host/gtcdm/2026-08-25T19:33:30Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:33:30 2026    
+Downloading previous manifest (Tue Aug 25 19:33:28 2026)    
+Upload directory '/gtbackup/cdm/.zfs/snapshot/s1/tree' to 'root@pam!anas-test@localhost:8007:anastest-store' as cdm.mpxar.didx    
+Using previous index as metadata reference for 'cdm.mpxar.didx'    
+Change detection summary:
+ - 2000 total files (0 hardlinks)
+ - 2000 unchanged, reusable files with 3.937 MiB data
+ - 0 changed or non-reusable files with 0 B data
+ - 32 B padding in 2 partially reused chunks
+cdm.ppxar: reused 3.937 MiB from previous snapshot for unchanged files (4 chunks)
+cdm.ppxar: had to backup 0 B of 3.937 MiB (compressed 0 B) in 0.04 s (average 0 B/s)
+cdm.ppxar: backup was done incrementally, reused 3.937 MiB (100.0%)
+cdm.mpxar: had to backup 0 B of 267.813 KiB (compressed 0 B) in 0.04 s (average 0 B/s)
+Duration: 0.08s    
+End Time: Tue Aug 25 19:33:30 2026    
+### exit=0
+
+>>> WALL: 114 ms
+### RUN 3b — repeat run 3 (snapshot -> snapshot, SAME snapshot) for a baseline
+### $ proxmox-backup-client backup cdm.pxar:/gtbackup/cdm/.zfs/snapshot/s1/tree --ns gtrestore --backup-id gtcdm --change-detection-mode=metadata
+Starting backup: [gtrestore]:host/gtcdm/2026-08-25T19:33:32Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:33:32 2026    
+Downloading previous manifest (Tue Aug 25 19:33:30 2026)    
+Upload directory '/gtbackup/cdm/.zfs/snapshot/s1/tree' to 'root@pam!anas-test@localhost:8007:anastest-store' as cdm.mpxar.didx    
+Using previous index as metadata reference for 'cdm.mpxar.didx'    
+Change detection summary:
+ - 2000 total files (0 hardlinks)
+ - 2000 unchanged, reusable files with 3.937 MiB data
+ - 0 changed or non-reusable files with 0 B data
+ - 32 B padding in 2 partially reused chunks
+cdm.ppxar: reused 3.937 MiB from previous snapshot for unchanged files (4 chunks)
+cdm.ppxar: had to backup 0 B of 3.937 MiB (compressed 0 B) in 0.06 s (average 0 B/s)
+cdm.ppxar: backup was done incrementally, reused 3.937 MiB (100.0%)
+cdm.mpxar: had to backup 0 B of 267.813 KiB (compressed 0 B) in 0.07 s (average 0 B/s)
+Duration: 0.13s    
+End Time: Tue Aug 25 19:33:32 2026    
+### exit=0
+
+>>> WALL: 168 ms
+
+=== touch ONE file, take snapshot s2 ===
+### $ zfs snapshot gtbackup/cdm@s2
+### exit=0
+
+### $ stat -c %i %n /gtbackup/cdm/.zfs/snapshot/s1/tree/a/f1.bin /gtbackup/cdm/.zfs/snapshot/s2/tree/a/f1.bin /gtbackup/cdm/.zfs/snapshot/s2/tree/a/f2.bin /gtbackup/cdm/tree/a/f2.bin
+7 /gtbackup/cdm/.zfs/snapshot/s1/tree/a/f1.bin
+7 /gtbackup/cdm/.zfs/snapshot/s2/tree/a/f1.bin
+8 /gtbackup/cdm/.zfs/snapshot/s2/tree/a/f2.bin
+8 /gtbackup/cdm/tree/a/f2.bin
+### exit=0
+
+### RUN 4 — from a SECOND snapshot s2, one file changed
+### $ proxmox-backup-client backup cdm.pxar:/gtbackup/cdm/.zfs/snapshot/s2/tree --ns gtrestore --backup-id gtcdm --change-detection-mode=metadata
+Starting backup: [gtrestore]:host/gtcdm/2026-08-25T19:33:34Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:33:34 2026    
+Downloading previous manifest (Tue Aug 25 19:33:32 2026)    
+Upload directory '/gtbackup/cdm/.zfs/snapshot/s2/tree' to 'root@pam!anas-test@localhost:8007:anastest-store' as cdm.mpxar.didx    
+Using previous index as metadata reference for 'cdm.mpxar.didx'    
+Change detection summary:
+ - 2000 total files (0 hardlinks)
+ - 1999 unchanged, reusable files with 3.935 MiB data
+ - 1 changed or non-reusable files with 2.023 KiB data
+ - 2.047 KiB padding in 2 partially reused chunks
+cdm.ppxar: reused 3.937 MiB from previous snapshot for unchanged files (4 chunks)
+cdm.ppxar: had to backup 2.039 KiB of 3.939 MiB (compressed 2.051 KiB) in 0.07 s (average 30.925 KiB/s)
+cdm.ppxar: backup was done incrementally, reused 3.937 MiB (99.9%)
+cdm.mpxar: had to backup 267.813 KiB of 267.813 KiB (compressed 24.791 KiB) in 0.07 s (average 3.726 MiB/s)
+Duration: 0.12s    
+End Time: Tue Aug 25 19:33:34 2026    
+### exit=0
+
+>>> WALL: 170 ms
+### RUN 5 — back to the LIVE path after two snapshot runs
+### $ proxmox-backup-client backup cdm.pxar:/gtbackup/cdm/tree --ns gtrestore --backup-id gtcdm --change-detection-mode=metadata
+Starting backup: [gtrestore]:host/gtcdm/2026-08-25T19:33:36Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:33:36 2026    
+Downloading previous manifest (Tue Aug 25 19:33:34 2026)    
+Upload directory '/gtbackup/cdm/tree' to 'root@pam!anas-test@localhost:8007:anastest-store' as cdm.mpxar.didx    
+Using previous index as metadata reference for 'cdm.mpxar.didx'    
+Change detection summary:
+ - 2000 total files (0 hardlinks)
+ - 1999 unchanged, reusable files with 3.935 MiB data
+ - 1 changed or non-reusable files with 2.023 KiB data
+ - 2.047 KiB padding in 2 partially reused chunks
+cdm.ppxar: reused 3.937 MiB from previous snapshot for unchanged files (4 chunks)
+cdm.ppxar: had to backup 0 B of 3.939 MiB (compressed 0 B) in 0.05 s (average 0 B/s)
+cdm.ppxar: backup was done incrementally, reused 3.939 MiB (100.0%)
+cdm.mpxar: had to backup 0 B of 267.813 KiB (compressed 0 B) in 0.05 s (average 0 B/s)
+Duration: 0.10s    
+End Time: Tue Aug 25 19:33:36 2026    
+### exit=0
+
+>>> WALL: 134 ms
+
+================ DEFAULT MODE (same comparison) ================
+### D1 — live path, default mode
+### $ proxmox-backup-client backup cdm.pxar:/gtbackup/cdm/tree --ns gtrestore --backup-id gtcdmdef
+Starting backup: [gtrestore]:host/gtcdmdef/2026-08-25T19:33:38Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:33:38 2026    
+No previous manifest available.    
+Upload directory '/gtbackup/cdm/tree' to 'root@pam!anas-test@localhost:8007:anastest-store' as cdm.pxar.didx    
+cdm.pxar: had to backup 4.137 MiB of 4.137 MiB (compressed 3.948 MiB) in 0.07 s (average 55.648 MiB/s)
+Uploaded backup catalog (32.854 KiB)
+Duration: 0.11s    
+End Time: Tue Aug 25 19:33:39 2026    
+### exit=0
+
+>>> WALL: 143 ms
+### D2 — same live path unchanged, default mode
+### $ proxmox-backup-client backup cdm.pxar:/gtbackup/cdm/tree --ns gtrestore --backup-id gtcdmdef
+Starting backup: [gtrestore]:host/gtcdmdef/2026-08-25T19:33:41Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:33:41 2026    
+Downloading previous manifest (Tue Aug 25 19:33:38 2026)    
+Upload directory '/gtbackup/cdm/tree' to 'root@pam!anas-test@localhost:8007:anastest-store' as cdm.pxar.didx    
+cdm.pxar: had to backup 0 B of 4.137 MiB (compressed 0 B) in 0.05 s (average 0 B/s)
+cdm.pxar: backup was done incrementally, reused 4.137 MiB (100.0%)
+Uploaded backup catalog (32.854 KiB)
+Duration: 0.07s    
+End Time: Tue Aug 25 19:33:41 2026    
+### exit=0
+
+>>> WALL: 84 ms
+=== snapshot s3 of the CURRENT live state ===
+### $ zfs snapshot gtbackup/cdm@s3
+### exit=0
+
+### D3 — SAME backup-id, archive root switched to the snapshot, default mode
+### $ proxmox-backup-client backup cdm.pxar:/gtbackup/cdm/.zfs/snapshot/s3/tree --ns gtrestore --backup-id gtcdmdef
+Starting backup: [gtrestore]:host/gtcdmdef/2026-08-25T19:33:45Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:33:45 2026    
+Downloading previous manifest (Tue Aug 25 19:33:41 2026)    
+Upload directory '/gtbackup/cdm/.zfs/snapshot/s3/tree' to 'root@pam!anas-test@localhost:8007:anastest-store' as cdm.pxar.didx    
+cdm.pxar: had to backup 0 B of 4.137 MiB (compressed 0 B) in 0.03 s (average 0 B/s)
+cdm.pxar: backup was done incrementally, reused 4.137 MiB (100.0%)
+Uploaded backup catalog (32.854 KiB)
+Duration: 0.08s    
+End Time: Tue Aug 25 19:33:45 2026    
+### exit=0
+
+>>> WALL: 112 ms
+
+=== snapshot list for both groups ===
+### $ proxmox-backup-client snapshot list host/gtcdm --ns gtrestore --output-format json
+[{"backup-id":"gtcdm","backup-time":1787686412,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.ppxar.didx","size":4128064},{"crypt-mode":"none","filename":"cdm.mpxar.didx","size":274240},{"crypt-mode":"none","filename":"index.json.blob","size":361}],"owner":"root@pam!anas-test","protected":false,"size":4402665},{"backup-id":"gtcdm","backup-time":1787686408,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.ppxar.didx","size":4128064},{"crypt-mode":"none","filename":"cdm.mpxar.didx","size":274240},{"crypt-mode":"none","filename":"index.json.blob","size":368}],"owner":"root@pam!anas-test","protected":false,"size":4402672},{"backup-id":"gtcdm","backup-time":1787686410,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.ppxar.didx","size":4128064},{"crypt-mode":"none","filename":"cdm.mpxar.didx","size":274240},{"crypt-mode":"none","filename":"index.json.blob","size":358}],"owner":"root@pam!anas-test","protected":false,"size":4402662},{"backup-id":"gtcdm","backup-time":1787686405,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.ppxar.didx","size":4128032},{"crypt-mode":"none","filename":"cdm.mpxar.didx","size":274240},{"crypt-mode":"none","filename":"index.json.blob","size":370}],"owner":"root@pam!anas-test","protected":false,"size":4402642},{"backup-id":"gtcdm","backup-time":1787686414,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.ppxar.didx","size":4130136},{"crypt-mode":"none","filename":"cdm.mpxar.didx","size":274240},{"crypt-mode":"none","filename":"index.json.blob","size":368}],"owner":"root@pam!anas-test","protected":false,"size":4404744},{"backup-id":"gtcdm","backup-time":1787686416,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.ppxar.didx","size":4130136},{"crypt-mode":"none","filename":"cdm.mpxar.didx","size":274240},{"crypt-mode":"none","filename":"index.json.blob","size":361}],"owner":"root@pam!anas-test","protected":false,"size":4404737}]
+### exit=0
+
+### $ proxmox-backup-client snapshot list host/gtcdmdef --ns gtrestore --output-format json
+[{"backup-id":"gtcdmdef","backup-time":1787686418,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.pxar.didx","size":4338224},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":33643},{"crypt-mode":"none","filename":"index.json.blob","size":378}],"owner":"root@pam!anas-test","protected":false,"size":4372245},{"backup-id":"gtcdmdef","backup-time":1787686425,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.pxar.didx","size":4338224},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":33643},{"crypt-mode":"none","filename":"index.json.blob","size":375}],"owner":"root@pam!anas-test","protected":false,"size":4372242},{"backup-id":"gtcdmdef","backup-time":1787686421,"backup-type":"host","files":[{"crypt-mode":"none","filename":"cdm.pxar.didx","size":4338224},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":33643},{"crypt-mode":"none","filename":"index.json.blob","size":377}],"owner":"root@pam!anas-test","protected":false,"size":4372244}]
+### exit=0
+

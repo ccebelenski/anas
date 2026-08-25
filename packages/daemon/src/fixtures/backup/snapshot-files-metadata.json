@@ -1,0 +1,17 @@
+[
+  {
+    "crypt-mode": "none",
+    "filename": "cdm.ppxar.didx",
+    "size": 4130136
+  },
+  {
+    "crypt-mode": "none",
+    "filename": "cdm.mpxar.didx",
+    "size": 274240
+  },
+  {
+    "crypt-mode": "none",
+    "filename": "index.json.blob",
+    "size": 361
+  }
+]

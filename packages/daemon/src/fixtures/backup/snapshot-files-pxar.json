@@ -1,0 +1,17 @@
+[
+  {
+    "crypt-mode": "none",
+    "filename": "data.pxar.didx",
+    "size": 2607
+  },
+  {
+    "crypt-mode": "none",
+    "filename": "catalog.pcat1.didx",
+    "size": 327
+  },
+  {
+    "crypt-mode": "none",
+    "filename": "index.json.blob",
+    "size": 375
+  }
+]

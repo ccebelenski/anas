@@ -1,0 +1,128 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: restore failure modes + connect-error discrimination on pbc 4.2.5
+# COMMAND LOG: 20-restore-fail.sh, 21-connect.sh
+# ==============================================================================
+
+SNAP=host/gtrestore/2026-08-25T19:16:45Z  BIG=host/gtbig/2026-08-25T19:22:02Z
+
+############ RESTORE FAILURE TAXONOMY ############
+=== F1 missing SNAPSHOT (group exists, timestamp does not) ===
+### $ proxmox-backup-client restore 'host/gtrestore/2020-01-01T00:00:00Z' data.pxar /gtbackup/ft --ns gtrestore
+Error: snapshot host/gtrestore/2020-01-01T00:00:00Z does not exist.
+### exit=255
+
+=== F2 missing GROUP ===
+### $ proxmox-backup-client restore 'host/nosuchgroup/2026-08-25T19:16:45Z' data.pxar /gtbackup/ft --ns gtrestore
+Error: snapshot host/nosuchgroup/2026-08-25T19:16:45Z does not exist.
+### exit=255
+
+=== F2b GROUP path with no timestamp (client accepts a group?) ===
+### $ proxmox-backup-client restore 'host/gtrestore' data.pxar /gtbackup/ft --ns gtrestore
+restore complete (2.546 KiB processed in <0.1s, average 777.059 KiB/s)    
+### exit=0
+
+=== F3 missing NAMESPACE ===
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/ft --ns nosuchns
+Error: snapshot host/gtrestore/2026-08-25T19:16:45Z does not exist.
+### exit=255
+
+=== F4 missing ARCHIVE NAME (valid suffix, not in the snapshot) ===
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' nosuch.pxar /gtbackup/ft --ns gtrestore
+Error: archive not found in manifest
+### exit=255
+
+=== F5 archive name with an unknown suffix ===
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.zzz /gtbackup/ft --ns gtrestore
+Error: failed to parse archive type for 'data.zzz'
+### exit=255
+
+=== F6 bad pattern matching nothing ===
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/ft --ns gtrestore --pattern nosuchthing
+restore complete (2.546 KiB processed in <0.1s, average 2.886 MiB/s)    
+### exit=0
+
+  (target contents after F6): 19 entries
+=== F7 target path is an EXISTING REGULAR FILE (not a dir) ===
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/ftfile --ns gtrestore
+Error: error extracting archive - failed to initialize extractor: error creating directory "/gtbackup/ftfile": ENOTDIR: Not a directory
+### exit=255
+
+=== F8 target path UNWRITABLE (read-only dataset) ===
+### $ touch /gtbackup/rodata/target/x
+touch: cannot touch '/gtbackup/rodata/target/x': Read-only file system
+### exit=1
+
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/rodata/target --ns gtrestore
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "acl-xattr.txt": failed to extract file: failed to create file "acl-xattr.txt": EROFS: Read-only file system
+### exit=255
+
+=== F8b target under a 0555 dir as root (root ignores perms) ===
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/ro2/sub --ns gtrestore
+restore complete (2.546 KiB processed in <0.1s, average 1.015 MiB/s)    
+### exit=0
+
+=== F9 target path parent does not exist (deep) ===
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/nope/a/b/c --ns gtrestore
+restore complete (2.546 KiB processed in <0.1s, average 988.224 KiB/s)    
+### exit=0
+
+  exists? /gtbackup/nope/a/b/c
+=== F10 PBS unreachable BEFORE the restore starts ===
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/ft --ns gtrestore
+Error: client error (Connect)
+
+Caused by:
+    error connecting to https://localhost:8007/ - tcp connect error: Connection refused (os error 111)
+### exit=255
+
+=== F11 no-permission token ===
+### $ PBS_REPOSITORY='root@pam!anas-noperm@localhost:anastest-store' PBS_PASSWORD='3038ff79-c13d-4c51-af34-155639fd4ba4' proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/ft --ns gtrestore
+Error: no permissions on /datastore/anastest-store/gtrestore
+### exit=255
+
+
+
+# ------------------------------------------------------------------------------
+# 21-connect.sh - dns vs tcp vs tls, now separable via the 'Caused by:' block
+# ------------------------------------------------------------------------------
+
+### PBC 4.2.5: is DNS-failure distinguishable from TCP-refused/unreachable now?
+=== A. unresolvable hostname ===
+### $ PBS_REPOSITORY='root@pam!anas-test@nosuchhost.invalid:anastest-store' timeout 30 proxmox-backup-client snapshot list --ns gtrestore
+Error: client error (Connect)
+
+Caused by:
+    error connecting to https://nosuchhost.invalid:8007/ - dns error: failed to lookup address information: Name or service not known
+### exit=255
+
+=== B. closed port on localhost ===
+### $ PBS_REPOSITORY='root@pam!anas-test@localhost:anastest-store' timeout 30 proxmox-backup-client snapshot list --ns gtrestore --port 8999
+Error: --datastore is required when not using --repository
+### exit=255
+
+=== C. unreachable IP (RFC5737 TEST-NET-1) ===
+### $ PBS_REPOSITORY='root@pam!anas-test@192.0.2.1:anastest-store' timeout 25 proxmox-backup-client snapshot list --ns gtrestore
+Error: client error (Connect)
+
+Caused by:
+    error connecting to https://192.0.2.1:8007/ - tcp connect error: deadline has elapsed
+### exit=255
+
+=== D. bad fingerprint ===
+### $ PBS_FINGERPRINT='aa:b8:a0:35:60:b9:5f:77:10:e8:c2:62:ce:1e:dd:08:b8:03:0a:82:f7:62:09:bf:e8:f5:44:7e:8b:3e:2c:1d' timeout 30 proxmox-backup-client snapshot list --ns gtrestore
+WARNING: certificate fingerprint does not match expected fingerprint!
+expected:    aa:b8:a0:35:60:b9:5f:77:10:e8:c2:62:ce:1e:dd:08:b8:03:0a:82:f7:62:09:bf:e8:f5:44:7e:8b:3e:2c:1d
+certificate validation failed - Certificate fingerprint was not confirmed.
+Error: client error (Connect)
+
+Caused by:
+    0: error:0A000086:SSL routines:tls_post_process_server_certificate:certificate verify failed:../ssl/statem/statem_clnt.c:2124:
+    1: error:0A000086:SSL routines:tls_post_process_server_certificate:certificate verify failed:../ssl/statem/statem_clnt.c:2124:
+### exit=255
+

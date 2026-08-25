@@ -1,0 +1,259 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: catalog dump stream, catalog shell (non-FUSE browser), index.json manifest, in-place single-file restore
+# COMMAND LOG: 24-extras.sh, 25-catshell.sh
+# ==============================================================================
+
+SNAP=host/gtrestore/2026-08-25T19:16:45Z
+############ catalog dump: which stream? ############
+--- 2>/dev/null (keep stdout only) ---
+0
+--- 1>/dev/null (keep stderr only) ---
+971
+
+############ catalog shell — a NON-FUSE archive browser? ############
+### $ printf 'ls\npwd\nhelp\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns gtrestore
+Starting interactive shell    
+acl-xattr.txt
+alpha.txt
+beta.txt
+bracket[1].txt
+docs
+empty
+hard-a.txt
+hard-b.txt
+link-to-alpha
+mix [a] * b.txt
+star*name.txt
+sub
+with space.txt
+"/"
+Usage:
+
+cd [<path>]
+clear-selected
+deselect <path>
+exit
+find <pattern> [OPTIONS]
+help [{<command>}] [OPTIONS]
+list-selected [OPTIONS]
+ls [<path>]
+pwd
+restore <target> [OPTIONS]
+restore-selected <target>
+select <path>
+stat <path>
+### exit=0
+
+--- non-interactive (no tty), scripted find + restore ---
+### $ printf 'find *.txt\nselect alpha.txt\nrestore-selected /gtbackup/csh\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns gtrestore
+Starting interactive shell    
+/acl-xattr.txt
+/alpha.txt
+/beta.txt
+/bracket[1].txt
+/docs/notes.txt
+/hard-a.txt
+/hard-b.txt
+/mix [a] * b.txt
+/star*name.txt
+/sub/deep/deep.txt
+/sub/mid.txt
+/with space.txt
+added path: "/alpha.txt"
+### exit=0
+
+  /gtbackup/csh
+  /gtbackup/csh/alpha.txt
+
+############ manifest / index.json — what a space check can read ############
+### $ proxmox-backup-client snapshot files 'host/gtrestore/2026-08-25T19:16:45Z' --ns gtrestore --output-format json-pretty
+[
+  {
+    "crypt-mode": "none",
+    "filename": "data.pxar.didx",
+    "size": 2607
+  },
+  {
+    "crypt-mode": "none",
+    "filename": "catalog.pcat1.didx",
+    "size": 327
+  },
+  {
+    "crypt-mode": "none",
+    "filename": "index.json.blob",
+    "size": 375
+  }
+]
+### exit=0
+
+--- the raw index.json.blob via restore to stdout ---
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' index.json.blob - --ns gtrestore
+{
+  "backup-id": "gtrestore",
+  "backup-time": 1787685405,
+  "backup-type": "host",
+  "files": [
+    {
+      "crypt-mode": "none",
+      "csum": "29640eedbaac955b9e7e70f2945a2939e152e9bc49faa11c53018b888bb65257",
+      "filename": "data.pxar.didx",
+      "size": 2607
+    },
+    {
+      "crypt-mode": "none",
+      "csum": "b9887d44090f6211a0f23678fd84992edb54fe479f1cb2f13d05ba707a735063",
+      "filename": "catalog.pcat1.didx",
+      "size": 327
+    }
+  ],
+  "signature": null,
+  "unprotected": {
+    "chunk_upload_stats": {
+      "compressed_size": 1169,
+      "count": 2,
+      "duplicates": 0,
+      "size": 3243
+    }
+  }
+}### exit=0
+
+
+############ in-place restore of ONE picked file (the backup2.6 checkbox case) ############
+before: alpha.txt=alpha file contents MODIFIED  readme=readme MODIFIED
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/data --ns gtrestore --pattern /alpha.txt --overwrite true
+restore complete (2.546 KiB processed in <0.1s, average 1.099 MiB/s)    
+### exit=0
+
+after:  alpha.txt=alpha file contents v1  readme=readme MODIFIED
+--- one NESTED picked file in place (needs --allow-existing-dirs for its parent?) ---
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/data --ns gtrestore --pattern /docs/readme.md --overwrite true
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "readme.md": failed to extract file: failed to get parent directory file descriptor: EEXIST: File exists
+### exit=255
+
+after:  readme=readme MODIFIED
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/data --ns gtrestore --pattern /docs/readme.md --overwrite true --allow-existing-dirs true
+restore complete (2.546 KiB processed in <0.1s, average 2.788 MiB/s)    
+### exit=0
+
+after:  readme=readme v1
+
+############ snapshot list for a group that does not exist ############
+### $ proxmox-backup-client snapshot list host/nosuchgroup --ns gtrestore --output-format json
+[]
+### exit=0
+
+############ snapshot list in a namespace with NO groups ############
+### $ proxmox-backup-client namespace create gtempty
+### exit=0
+
+### $ proxmox-backup-client snapshot list --ns gtempty --output-format json
+[]
+### exit=0
+
+### $ proxmox-backup-client list --ns gtempty --output-format json
+[]
+### exit=0
+
+### $ proxmox-backup-client namespace delete gtempty
+### exit=0
+
+
+
+# ------------------------------------------------------------------------------
+# 25-catshell.sh - catalog shell / mount across archive kinds
+# ------------------------------------------------------------------------------
+
+METADATA snap=host/gtcdm/2026-08-25T19:33:36Z   IMG snap=host/gtimg/2026-08-25T19:28:41Z   DEFAULT snap=host/gtrestore/2026-08-25T19:16:45Z
+=== catalog shell on a METADATA-mode archive (no catalog.pcat1) ===
+### $ printf 'ls\nexit\n' | proxmox-backup-client catalog shell 'host/gtcdm/2026-08-25T19:33:36Z' cdm.mpxar --ns gtrestore 2>&1 | head -12
+Starting interactive shell    
+a
+b
+c
+d
+### exit=0
+
+### $ printf 'ls\nexit\n' | proxmox-backup-client catalog shell 'host/gtcdm/2026-08-25T19:33:36Z' cdm.pxar --ns gtrestore 2>&1 | head -6
+Starting interactive shell    
+a
+b
+c
+d
+### exit=0
+
+=== catalog dump on a METADATA-mode snapshot ===
+### $ proxmox-backup-client catalog dump 'host/gtcdm/2026-08-25T19:33:36Z' --ns gtrestore 2>&1 | head -6
+d "./cdm.mpxar.didx/a"
+f "./cdm.mpxar.didx/a/f1.bin" 2056 2026-08-25T19:33:32Z
+f "./cdm.mpxar.didx/a/f10.bin" 2048 2026-08-25T19:33:21Z
+f "./cdm.mpxar.didx/a/f100.bin" 2048 2026-08-25T19:33:21Z
+f "./cdm.mpxar.didx/a/f101.bin" 2048 2026-08-25T19:33:21Z
+f "./cdm.mpxar.didx/a/f102.bin" 2048 2026-08-25T19:33:21Z
+### exit=0
+
+=== catalog shell on an .img snapshot ===
+### $ printf 'ls\nexit\n' | proxmox-backup-client catalog shell 'host/gtimg/2026-08-25T19:28:41Z' lun.img --ns gtrestore 2>&1 | head -6
+Error: Can only mount pxar archives.
+### exit=0
+
+=== mount a METADATA-mode archive over FUSE ===
+### $ proxmox-backup-client mount 'host/gtcdm/2026-08-25T19:33:36Z' cdm.mpxar /run/anas-gt-mnt --ns gtrestore
+FUSE library version: 3.17.2
+### exit=0
+
+a
+b
+c
+d
+ls exit=0
+f1.bin
+f10.bin
+f100.bin
+2056
+umount exit=0
+=== mount an .img archive over FUSE (expect refusal) ===
+### $ proxmox-backup-client mount 'host/gtimg/2026-08-25T19:28:41Z' lun.img /run/anas-gt-mnt --ns gtrestore
+Error: use the 'map' command to map drive images
+### exit=0
+
+TARGET FSTYPE
+/run   tmpfs
+=== catalog shell restore --pattern help ===
+### $ printf 'help restore\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns gtrestore 2>&1 | head -25
+Starting interactive shell    
+Usage: restore <target> [OPTIONS]
+
+Restore the sub-archive given by the current working directory to target.
+
+By further providing a pattern, the restore can be limited to a narrower
+subset of this sub-archive.
+If pattern is not present or empty, the full archive is restored to target.
+
+ <target>   <string>
+             target path for restore on local filesystem.
+
+Optional parameters:
+
+ --pattern  <string>
+             Path or match pattern for matching filenames.
+### exit=0
+
+=== catalog shell stat on a weird name ===
+### $ printf 'stat /star*name.txt\nstat "/mix [a] * b.txt"\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns gtrestore 2>&1 | head -20
+Starting interactive shell    
+  File: /star*name.txt
+  Size: 8             Type: file
+Access: (644/-rw-r--r--  )  Uid: 0     Gid: 0    
+Modify: 2026-08-25 19:16:23
+  File: /mix [a] * b.txt
+  Size: 10            Type: file
+Access: (644/-rw-r--r--  )  Uid: 0     Gid: 0    
+Modify: 2026-08-25 19:16:23
+### exit=0
+

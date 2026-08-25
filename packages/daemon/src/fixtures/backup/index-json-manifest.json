@@ -1,0 +1,28 @@
+{
+  "backup-id": "gtrestore",
+  "backup-time": 1787685405,
+  "backup-type": "host",
+  "files": [
+    {
+      "crypt-mode": "none",
+      "csum": "29640eedbaac955b9e7e70f2945a2939e152e9bc49faa11c53018b888bb65257",
+      "filename": "data.pxar.didx",
+      "size": 2607
+    },
+    {
+      "crypt-mode": "none",
+      "csum": "b9887d44090f6211a0f23678fd84992edb54fe479f1cb2f13d05ba707a735063",
+      "filename": "catalog.pcat1.didx",
+      "size": 327
+    }
+  ],
+  "signature": null,
+  "unprotected": {
+    "chunk_upload_stats": {
+      "compressed_size": 1169,
+      "count": 2,
+      "duplicates": 0,
+      "size": 3243
+    }
+  }
+}

@@ -1,0 +1,166 @@
+[
+  {
+    "backup-count": 1,
+    "backup-id": "gtbtrfslive",
+    "backup-type": "host",
+    "files": [
+      "catalog.pcat1.didx",
+      "index.json.blob",
+      "btrlive.pxar.didx"
+    ],
+    "last-backup": 1787686460,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 4,
+    "backup-id": "gtimg",
+    "backup-type": "host",
+    "files": [
+      "index.json.blob",
+      "lun.img.fidx"
+    ],
+    "last-backup": 1787686121,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 1,
+    "backup-id": "gtrestore",
+    "backup-type": "host",
+    "files": [
+      "catalog.pcat1.didx",
+      "index.json.blob",
+      "data.pxar.didx"
+    ],
+    "last-backup": 1787685405,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 1,
+    "backup-id": "gtbig",
+    "backup-type": "host",
+    "files": [
+      "catalog.pcat1.didx",
+      "index.json.blob",
+      "big.pxar.didx"
+    ],
+    "last-backup": 1787685722,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 2,
+    "backup-id": "gtdup",
+    "backup-type": "host",
+    "files": [
+      "catalog.pcat1.didx",
+      "index.json.blob",
+      "dup.pxar.didx"
+    ],
+    "last-backup": 1787687030,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 1,
+    "backup-id": "gtbtrfsall",
+    "backup-type": "host",
+    "files": [
+      "catalog.pcat1.didx",
+      "index.json.blob",
+      "btrall.pxar.didx"
+    ],
+    "last-backup": 1787686460,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 1,
+    "backup-id": "gtimgboth",
+    "backup-type": "host",
+    "files": [
+      "vol.img.fidx",
+      "index.json.blob",
+      "lun.img.fidx"
+    ],
+    "last-backup": 1787686118,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 6,
+    "backup-id": "gtcdm",
+    "backup-type": "host",
+    "files": [
+      "cdm.ppxar.didx",
+      "index.json.blob",
+      "cdm.mpxar.didx"
+    ],
+    "last-backup": 1787686416,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 3,
+    "backup-id": "gtcdmdef",
+    "backup-type": "host",
+    "files": [
+      "catalog.pcat1.didx",
+      "index.json.blob",
+      "cdm.pxar.didx"
+    ],
+    "last-backup": 1787686425,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 2,
+    "backup-id": "gtsnapdev",
+    "backup-type": "host",
+    "files": [
+      "index.json.blob",
+      "snap.img.fidx"
+    ],
+    "last-backup": 1787686352,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 1,
+    "backup-id": "gtbtrfssnapall",
+    "backup-type": "host",
+    "files": [
+      "catalog.pcat1.didx",
+      "index.json.blob",
+      "btrsnapall.pxar.didx"
+    ],
+    "last-backup": 1787686460,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 1,
+    "backup-id": "gtimgvol",
+    "backup-type": "host",
+    "files": [
+      "vol.img.fidx",
+      "index.json.blob"
+    ],
+    "last-backup": 1787686117,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 1,
+    "backup-id": "gtimgfs",
+    "backup-type": "host",
+    "files": [
+      "index.json.blob",
+      "fs.img.fidx"
+    ],
+    "last-backup": 1787686316,
+    "owner": "root@pam!anas-test"
+  },
+  {
+    "backup-count": 1,
+    "backup-id": "gtbtrfs",
+    "backup-type": "host",
+    "files": [
+      "catalog.pcat1.didx",
+      "index.json.blob",
+      "btr.pxar.didx"
+    ],
+    "last-backup": 1787686460,
+    "owner": "root@pam!anas-test"
+  }
+]

@@ -1,0 +1,162 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: FUSE mount while the PBS server is STOPPED (connection refused): fast EIO, never recovers
+# COMMAND LOG: 09-fuse-hang.sh, 11-fuse-hang2.sh
+# ==============================================================================
+
+=== PBS server units ===
+  proxmox-backup-proxy.service      loaded active running Proxmox Backup API Proxy Server
+  proxmox-backup.service            loaded active running Proxmox Backup API Server
+  proxmox-backup-daily-update.timer loaded active waiting Daily Proxmox Backup Server update and maintenance activities
+
+=== mount ===
+FUSE library version: 3.17.2
+mount exit=0
+client pid=355563
+warm ls exit=0
+
+=== STOP the PBS server (proxmox-backup-proxy + proxmox-backup) ===
+inactive
+inactive
+(nothing listening on 8007)
+
+--- client process still alive? ---
+    PID STAT COMMAND
+ 355563 Ssl  proxmox-backup-client mount host/gtrestore/2026-08-25T19:16:45Z data.pxar /run/anas-gt-mnt --ns gtrestore
+--- findmnt ---
+TARGET           FSTYPE
+/run/anas-gt-mnt fuse
+
+--- timeout 5 stat $M/sub/deep/deep.txt (cold path) ---
+  File: /run/anas-gt-mnt/sub/deep/deep.txt
+  Size: 8         	Blocks: 0          IO Block: 4096   regular file
+Device: 0,60	Inode: 9223372036854777616  Links: 1
+Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2026-08-25 19:16:23.330932347 +0000
+Modify: 2026-08-25 19:16:23.330932347 +0000
+Change: 2026-08-25 19:16:23.330932347 +0000
+ Birth: -
+stat exit=0
+/root/gt-backup2/09-fuse-hang.sh: line 24: bc: command not found
+elapsed=
+--- timeout 5 ls $M ---
+total 0
+drwxr-xr-x  2 root   root      0 Aug 25 19:16 .
+drwxr-xr-x 43 root   root   1700 Aug 25 19:21 ..
+-rw-rw-r--  1 root   root     13 Aug 25 19:16 acl-xattr.txt
+-rw-r--r--  1 root   root     23 Aug 25 19:16 alpha.txt
+-rw-r-----  1 debian debian   22 Aug 25 19:16 beta.txt
+-rw-r--r--  1 root   root     11 Aug 25 19:16 bracket[1].txt
+drwxr-xr-x  2 root   root      0 Aug 25 19:16 docs
+drwxr-xr-x  2 root   root      0 Aug 25 19:16 empty
+-rw-r--r--  1 root   root     17 Aug 25 19:16 hard-a.txt
+-rw-r--r--  1 root   root     17 Aug 25 19:16 hard-b.txt
+lrwxrwxrwx  1 root   root      0 Aug 25 19:16 link-to-alpha -> alpha.txt
+-rw-r--r--  1 root   root     10 Aug 25 19:16 mix [a] * b.txt
+-rw-r--r--  1 root   root      8 Aug 25 19:16 star*name.txt
+drwxr-xr-x  2 root   root      0 Aug 25 19:16 sub
+-rw-r--r--  1 root   root      9 Aug 25 19:16 with space.txt
+ls exit=0
+/root/gt-backup2/09-fuse-hang.sh: line 26: bc: command not found
+elapsed=
+--- timeout 5 cat a NEVER-READ file (forces a chunk fetch) ---
+all three
+cat exit=0
+/root/gt-backup2/09-fuse-hang.sh: line 28: bc: command not found
+elapsed=
+--- timeout 5 stat -f $M (mounts.ts liveness probe) ---
+stat -f exit=0
+/root/gt-backup2/09-fuse-hang.sh: line 30: bc: command not found
+elapsed=
+--- timeout 30 cat another never-read file (does it EVER return?) ---
+notes v1
+cat exit=0
+/root/gt-backup2/09-fuse-hang.sh: line 32: bc: command not found
+elapsed=
+--- ps state of the client now ---
+    PID STAT WCHAN                    COMMAND
+ 355563 Ssl  futex_do_wait            proxmox-backup-client mount host/gtrestore/2026-08-25T19:16:45Z data.pxar /run/anas-gt-mnt --ns gtrestore
+
+=== RESTART the PBS server ===
+active
+active
+--- does the mount recover? ---
+notes v1
+cat exit=0
+/root/gt-backup2/09-fuse-hang.sh: line 40: bc: command not found
+elapsed=
+--- cleanup ---
+fusermount3 exit=0
+(no client left)
+TARGET FSTYPE
+/run   tmpfs
+
+
+# ------------------------------------------------------------------------------
+# 11-fuse-hang2.sh - same test on a 250 MiB archive so cold chunks must be fetched
+# ------------------------------------------------------------------------------
+
+SNAP=host/gtbig/2026-08-25T19:22:02Z (250 MiB incompressible, 10 x 25 MiB files) mount=/run/anas-gt-mnt
+FUSE library version: 3.17.2
+mount exit=0
+client pid=356062
+--- warm: read ONE file fully while PBS is up ---
+661ce4236e455d9597fb50930bffd937  /run/anas-gt-mnt/part/f1.bin
+exit=0
+elapsed=302 ms
+
+=== STOP PBS ===
+(nothing on 8007)
+
+--- timeout 5 ls $M/part (metadata, likely cached) ---
+ls: reading directory '/run/anas-gt-mnt/part': Input/output error
+total 0
+exit=2
+elapsed=9 ms
+--- timeout 5 stat $M/part/f7.bin (cold metadata) ---
+stat: cannot statx '/run/anas-gt-mnt/part/f7.bin': Input/output error
+exit=1
+elapsed=7 ms
+--- timeout 5 stat -f $M (mounts.ts liveness probe) ---
+exit=0
+elapsed=8 ms
+--- timeout 5 head -c 1M $M/part/f7.bin (COLD DATA, needs a chunk fetch) ---
+head: cannot open '/run/anas-gt-mnt/part/f7.bin' for reading: Input/output error
+0
+exit=1
+elapsed=8 ms
+--- timeout 20 head -c 1M $M/part/f8.bin (does it EVER return?) ---
+head: cannot open '/run/anas-gt-mnt/part/f8.bin' for reading: Input/output error
+0
+exit=1
+elapsed=8 ms
+--- timeout 60 md5sum $M/part/f9.bin ---
+md5sum: /run/anas-gt-mnt/part/f9.bin: Input/output error
+exit=1
+elapsed=8 ms
+--- client process state ---
+    PID STAT WCHAN                    COMMAND
+ 356062 Ssl  futex_do_wait            proxmox-backup-client mount host/gtbig/2026-08-25T19:22:02Z big.pxar /run/anas-gt-mnt --ns gtrestore
+--- a SECOND process touching the mount while the first is stuck ---
+ls exit=0
+elapsed=10 ms
+
+=== RESTART PBS ===
+active
+--- does the SAME mount recover after the server comes back? ---
+md5sum: /run/anas-gt-mnt/part/f9.bin: Input/output error
+exit=1
+elapsed=12 ms
+md5sum: /run/anas-gt-mnt/part/f10.bin: Input/output error
+exit=1
+elapsed=33 ms
+--- cleanup ---
+fusermount3 exit=0
+(no client left)
+TARGET FSTYPE
+/run   tmpfs

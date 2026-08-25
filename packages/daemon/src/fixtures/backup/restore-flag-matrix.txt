@@ -1,0 +1,552 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: restore into an EXISTING tree - the --overwrite* / --allow-existing-dirs ladder
+# COMMAND LOG: 03-restore-matrix.sh
+# ==============================================================================
+
+SNAPSHOT UNDER TEST: host/gtrestore/2026-08-25T19:16:45Z   (namespace gtrestore, archive data.pxar)
+SOURCE TREE at backup time: see 01-backup.log / catalog dump
+
+================================================================
+PROBE: A. no flags (into existing tree)
+FLAGS: 
+----------------------------------------------------------------
+--- restore ---
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "acl-xattr.txt": failed to extract file: failed to create file "acl-xattr.txt": EEXIST: File exists
+### exit=255
+--- tree state AFTER ---
+f -rw------- 1001:1001 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 29 /gtbackup/data/alpha.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 16 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 1 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 1 27 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 4 /gtbackup/data/link-to-alpha -> docs
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents MODIFIED
+beta.txt: ABSENT
+docs/readme.md: readme MODIFIED
+hard-a.txt: hard original v1
+hard-b.txt: hard-b is now its own file
+--- inodes hard-a/hard-b ---
+15 /gtbackup/data/hard-a.txt
+148 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-	#effective:---
+group::r--	#effective:---
+mask::---
+other::---
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: B. --allow-existing-dirs only
+FLAGS: --allow-existing-dirs true
+----------------------------------------------------------------
+--- restore ---
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "acl-xattr.txt": failed to extract file: failed to create file "acl-xattr.txt": EEXIST: File exists
+### exit=255
+--- tree state AFTER ---
+f -rw------- 1001:1001 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 29 /gtbackup/data/alpha.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 16 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 1 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 1 27 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 4 /gtbackup/data/link-to-alpha -> docs
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents MODIFIED
+beta.txt: ABSENT
+docs/readme.md: readme MODIFIED
+hard-a.txt: hard original v1
+hard-b.txt: hard-b is now its own file
+--- inodes hard-a/hard-b ---
+273 /gtbackup/data/hard-a.txt
+150 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-	#effective:---
+group::r--	#effective:---
+mask::---
+other::---
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: C. --overwrite-files only
+FLAGS: --overwrite-files true
+----------------------------------------------------------------
+--- restore ---
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "docs": failed to enter directory: EEXIST: File exists
+### exit=255
+--- tree state AFTER ---
+f -rw-rw-r-- 0:0 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 23 /gtbackup/data/alpha.txt
+f -rw-r----- 1000:1000 1 22 /gtbackup/data/beta.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 16 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 1 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 1 27 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 4 /gtbackup/data/link-to-alpha -> docs
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents v1
+beta.txt: beta file contents v1
+docs/readme.md: readme MODIFIED
+hard-a.txt: hard original v1
+hard-b.txt: hard-b is now its own file
+--- inodes hard-a/hard-b ---
+30 /gtbackup/data/hard-a.txt
+152 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: D. --allow-existing-dirs + --overwrite-files
+FLAGS: --allow-existing-dirs true --overwrite-files true
+----------------------------------------------------------------
+--- restore ---
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "hard-b.txt": failed to extract hardlink: EEXIST: File exists
+### exit=255
+--- tree state AFTER ---
+f -rw-rw-r-- 0:0 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 23 /gtbackup/data/alpha.txt
+f -rw-r----- 1000:1000 1 22 /gtbackup/data/beta.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 1 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 1 27 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 4 /gtbackup/data/link-to-alpha -> docs
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents v1
+beta.txt: beta file contents v1
+docs/readme.md: readme v1
+hard-a.txt: hard original v1
+hard-b.txt: hard-b is now its own file
+--- inodes hard-a/hard-b ---
+49 /gtbackup/data/hard-a.txt
+154 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: E. --overwrite only
+FLAGS: --overwrite true
+----------------------------------------------------------------
+--- restore ---
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "docs": failed to enter directory: EEXIST: File exists
+### exit=255
+--- tree state AFTER ---
+f -rw-rw-r-- 0:0 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 23 /gtbackup/data/alpha.txt
+f -rw-r----- 1000:1000 1 22 /gtbackup/data/beta.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 16 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 1 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 1 27 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 4 /gtbackup/data/link-to-alpha -> docs
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents v1
+beta.txt: beta file contents v1
+docs/readme.md: readme MODIFIED
+hard-a.txt: hard original v1
+hard-b.txt: hard-b is now its own file
+--- inodes hard-a/hard-b ---
+162 /gtbackup/data/hard-a.txt
+57 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: F. --allow-existing-dirs + --overwrite
+FLAGS: --allow-existing-dirs true --overwrite true
+----------------------------------------------------------------
+--- restore ---
+restore complete (2.546 KiB processed in <0.1s, average 508.919 KiB/s)    
+### exit=0
+--- tree state AFTER ---
+f -rw-rw-r-- 0:0 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 23 /gtbackup/data/alpha.txt
+f -rw-r----- 1000:1000 1 22 /gtbackup/data/beta.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 2 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 2 17 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 9 /gtbackup/data/link-to-alpha -> alpha.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 3 4 /gtbackup/data/sub
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub/deep
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/sub/deep/deep.txt
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents v1
+beta.txt: beta file contents v1
+docs/readme.md: readme v1
+hard-a.txt: hard original v1
+hard-b.txt: hard original v1
+--- inodes hard-a/hard-b ---
+65 /gtbackup/data/hard-a.txt
+65 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: G. AED + overwrite-files + overwrite-symlinks
+FLAGS: --allow-existing-dirs true --overwrite-files true --overwrite-symlinks true
+----------------------------------------------------------------
+--- restore ---
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "hard-b.txt": failed to extract hardlink: EEXIST: File exists
+### exit=255
+--- tree state AFTER ---
+f -rw-rw-r-- 0:0 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 23 /gtbackup/data/alpha.txt
+f -rw-r----- 1000:1000 1 22 /gtbackup/data/beta.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 1 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 1 27 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 4 /gtbackup/data/link-to-alpha -> docs
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents v1
+beta.txt: beta file contents v1
+docs/readme.md: readme v1
+hard-a.txt: hard original v1
+hard-b.txt: hard-b is now its own file
+--- inodes hard-a/hard-b ---
+180 /gtbackup/data/hard-a.txt
+293 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: H. AED + overwrite-files + overwrite-symlinks + overwrite-hardlinks
+FLAGS: --allow-existing-dirs true --overwrite-files true --overwrite-symlinks true --overwrite-hardlinks true
+----------------------------------------------------------------
+--- restore ---
+restore complete (2.546 KiB processed in <0.1s, average 980.436 KiB/s)    
+### exit=0
+--- tree state AFTER ---
+f -rw-rw-r-- 0:0 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 23 /gtbackup/data/alpha.txt
+f -rw-r----- 1000:1000 1 22 /gtbackup/data/beta.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 2 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 2 17 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 9 /gtbackup/data/link-to-alpha -> alpha.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 3 4 /gtbackup/data/sub
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub/deep
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/sub/deep/deep.txt
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents v1
+beta.txt: beta file contents v1
+docs/readme.md: readme v1
+hard-a.txt: hard original v1
+hard-b.txt: hard original v1
+--- inodes hard-a/hard-b ---
+301 /gtbackup/data/hard-a.txt
+301 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: I. AED + overwrite + --ignore-ownership
+FLAGS: --allow-existing-dirs true --overwrite true --ignore-ownership true
+----------------------------------------------------------------
+--- restore ---
+restore complete (2.546 KiB processed in <0.1s, average 2.08 MiB/s)    
+### exit=0
+--- tree state AFTER ---
+f -rw-rw-r-- 1001:1001 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 23 /gtbackup/data/alpha.txt
+f -rw-r----- 0:0 1 22 /gtbackup/data/beta.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 2 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 2 17 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 9 /gtbackup/data/link-to-alpha -> alpha.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 3 4 /gtbackup/data/sub
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub/deep
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/sub/deep/deep.txt
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents v1
+beta.txt: beta file contents v1
+docs/readme.md: readme v1
+hard-a.txt: hard original v1
+hard-b.txt: hard original v1
+--- inodes hard-a/hard-b ---
+313 /gtbackup/data/hard-a.txt
+313 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: J. AED + overwrite + --ignore-ownership --ignore-permissions --ignore-acls --ignore-xattrs
+FLAGS: --allow-existing-dirs true --overwrite true --ignore-ownership true --ignore-permissions true --ignore-acls true --ignore-xattrs true
+----------------------------------------------------------------
+--- restore ---
+restore complete (2.546 KiB processed in <0.1s, average 1.16 MiB/s)    
+### exit=0
+--- tree state AFTER ---
+f -rw------- 1001:1001 1 13 /gtbackup/data/acl-xattr.txt
+f -rw-r--r-- 0:0 1 23 /gtbackup/data/alpha.txt
+f -rw------- 0:0 1 22 /gtbackup/data/beta.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/data/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/data/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/docs/notes.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/data/empty
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/extra-not-in-backup
+f -rw-r--r-- 0:0 1 2 /gtbackup/data/extra-not-in-backup/x.txt
+f -rw-r--r-- 0:0 2 17 /gtbackup/data/hard-a.txt
+f -rw-r--r-- 0:0 2 17 /gtbackup/data/hard-b.txt
+l lrwxrwxrwx 0:0 1 9 /gtbackup/data/link-to-alpha -> alpha.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/data/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/data/star*name.txt
+d drwxr-xr-x 0:0 3 4 /gtbackup/data/sub
+d drwxr-xr-x 0:0 2 3 /gtbackup/data/sub/deep
+f -rw------- 0:0 1 8 /gtbackup/data/sub/deep/deep.txt
+f -rw-r--r-- 0:0 1 7 /gtbackup/data/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/data/with space.txt
+--- contents ---
+alpha.txt: alpha file contents v1
+beta.txt: beta file contents v1
+docs/readme.md: readme v1
+hard-a.txt: hard original v1
+hard-b.txt: hard original v1
+--- inodes hard-a/hard-b ---
+89 /gtbackup/data/hard-a.txt
+89 /gtbackup/data/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-	#effective:---
+group::r--	#effective:---
+mask::---
+other::---
+
+# file: /gtbackup/data/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: K. restore into a NEW EMPTY DIR (the default the UI uses)
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/restore-new --ns gtrestore
+restore complete (2.546 KiB processed in <0.1s, average 598.873 KiB/s)    
+### exit=0
+
+--- tree state AFTER ---
+f -rw-rw-r-- 0:0 1 13 /gtbackup/restore-new/acl-xattr.txt
+f -rw-r--r-- 0:0 1 23 /gtbackup/restore-new/alpha.txt
+f -rw-r----- 1000:1000 1 22 /gtbackup/restore-new/beta.txt
+f -rw-r--r-- 0:0 1 11 /gtbackup/restore-new/bracket[1].txt
+d drwxr-xr-x 0:0 2 4 /gtbackup/restore-new/docs
+f -rw-r--r-- 0:0 1 9 /gtbackup/restore-new/docs/notes.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/restore-new/docs/readme.md
+d drwxr-xr-x 0:0 2 2 /gtbackup/restore-new/empty
+f -rw-r--r-- 0:0 2 17 /gtbackup/restore-new/hard-a.txt
+f -rw-r--r-- 0:0 2 17 /gtbackup/restore-new/hard-b.txt
+l lrwxrwxrwx 0:0 1 9 /gtbackup/restore-new/link-to-alpha -> alpha.txt
+f -rw-r--r-- 0:0 1 10 /gtbackup/restore-new/mix [a] * b.txt
+f -rw-r--r-- 0:0 1 8 /gtbackup/restore-new/star*name.txt
+d drwxr-xr-x 0:0 3 4 /gtbackup/restore-new/sub
+d drwxr-xr-x 0:0 2 3 /gtbackup/restore-new/sub/deep
+f -rw-r--r-- 0:0 1 8 /gtbackup/restore-new/sub/deep/deep.txt
+f -rw-r--r-- 0:0 1 7 /gtbackup/restore-new/sub/mid.txt
+f -rw-r--r-- 0:0 1 9 /gtbackup/restore-new/with space.txt
+--- contents ---
+alpha.txt: alpha file contents v1
+beta.txt: beta file contents v1
+docs/readme.md: readme v1
+hard-a.txt: hard original v1
+hard-b.txt: hard original v1
+--- inodes hard-a/hard-b ---
+108 /gtbackup/restore-new/hard-a.txt
+108 /gtbackup/restore-new/hard-b.txt
+--- acl/xattr acl-xattr.txt ---
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/restore-new/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+================================================================
+PROBE: L. restore into a NON-EXISTENT dir path
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar /gtbackup/restore-missing --ns gtrestore
+restore complete (2.546 KiB processed in <0.1s, average 700.175 KiB/s)    
+### exit=0
+
+exists after? 
+total 8
+drwxr-xr-x  5 root   root   15 Aug 25 19:16 .
+drwxr-xr-x  5 root   root    5 Aug 25 19:17 ..
+-rw-rw-r--+ 1 root   root   13 Aug 25 19:16 acl-xattr.txt
+-rw-r--r--  1 root   root   23 Aug 25 19:16 alpha.txt
+
+================================================================
+PROBE: M. archive-name given WITHOUT the .pxar suffix
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data /gtbackup/restore-noext --ns gtrestore
+Error: failed to parse archive type for 'data'
+### exit=255
+
+
+================================================================
+PROBE: N. archive-name given as the stored file name data.pxar.didx
+### $ proxmox-backup-client restore 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar.didx /gtbackup/restore-didx --ns gtrestore
+restore complete (2.546 KiB processed in <0.1s, average 650.661 KiB/s)    
+### exit=0
+
+

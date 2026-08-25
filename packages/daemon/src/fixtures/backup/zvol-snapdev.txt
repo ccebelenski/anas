@@ -1,0 +1,136 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: snapdev=visible: node timing, read-only-ness, backing up a zvol SNAPSHOT device
+# COMMAND LOG: 17-snapdev.sh
+# ==============================================================================
+
+############ ZVOL SNAPSHOT DEVICE (snapdev) ############
+=== default snapdev value ===
+### $ zfs get -Hp snapdev gtbackup gtbackup/vol1
+gtbackup	snapdev	hidden	default
+gtbackup/vol1	snapdev	hidden	default
+### exit=0
+
+=== take a snapshot with snapdev at its default (hidden) ===
+### $ zfs snapshot gtbackup/vol1@s1
+### exit=0
+
+### $ udevadm settle
+### exit=0
+
+--- does the snapshot device node exist? ---
+### $ ls -l /dev/zvol/gtbackup/
+total 0
+lrwxrwxrwx 1 root root 10 Aug 25 19:28 vol1 -> ../../zd16
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 vol2 -> ../../zd32
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 vol3 -> ../../zd48
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 vol4 -> ../../zd64
+### exit=0
+
+### $ ls -l /dev/zvol/gtbackup/vol1@s1
+ls: cannot access '/dev/zvol/gtbackup/vol1@s1': No such file or directory
+### exit=2
+
+### $ test -e /dev/zvol/gtbackup/vol1@s1
+### exit=1
+
+
+=== set snapdev=visible and TIME how long the node takes to appear ===
+zfs set returned after 44 ms
+node present after 54 ms (poll iteration 1)
+### $ udevadm settle
+### exit=0
+
+udevadm settle returned at 64 ms after the set
+### $ ls -l /dev/zvol/gtbackup/
+total 0
+lrwxrwxrwx 1 root root 10 Aug 25 19:28 vol1 -> ../../zd16
+lrwxrwxrwx 1 root root 10 Aug 25 19:32 vol1@s1 -> ../../zd80
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 vol2 -> ../../zd32
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 vol3 -> ../../zd48
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 vol4 -> ../../zd64
+### exit=0
+
+### $ readlink -f /dev/zvol/gtbackup/vol1@s1
+/dev/zd80
+### exit=0
+
+### $ blockdev --getsize64 /dev/zvol/gtbackup/vol1@s1
+536870912
+### exit=0
+
+### $ blockdev --getro /dev/zvol/gtbackup/vol1@s1
+1
+### exit=0
+
+--- content of the snapshot device (head/tail) ---
+  head24: ANAS-GT-IMG-ZVOL-HEAD-v1
+  tail24: ANAS-GT-IMG-ZVOL-TAIL-v1
+--- write to the snapshot device (expect refusal) ---
+### $ dd if=/dev/zero of=/dev/zvol/gtbackup/vol1@s1 bs=512 count=1
+dd: failed to open '/dev/zvol/gtbackup/vol1@s1': Read-only file system
+### exit=1
+
+
+=== back the SNAPSHOT DEVICE up as an .img archive ===
+### $ proxmox-backup-client backup snap.img:'/dev/zvol/gtbackup/vol1@s1' --ns gtrestore --backup-id gtsnapdev
+Starting backup: [gtrestore]:host/gtsnapdev/2026-08-25T19:32:31Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:32:31 2026    
+No previous manifest available.    
+Upload image '/dev/zvol/gtbackup/vol1@s1' to 'root@pam!anas-test@localhost:8007:anastest-store' as snap.img.fidx    
+snap.img: had to backup 16 MiB of 512 MiB (compressed 4.001 MiB) in 0.69 s (average 23.18 MiB/s)
+snap.img: backup was done incrementally, reused 496 MiB (96.9%)
+Duration: 0.72s    
+End Time: Tue Aug 25 19:32:32 2026    
+### exit=0
+
+=== change the LIVE zvol, then re-back-up the SAME snapshot device (must be unchanged) ===
+  live head24 now: LIVE-CHANGED-AFTER-SNAP1
+  snap head24 now: ANAS-GT-IMG-ZVOL-HEAD-v1
+### $ proxmox-backup-client backup snap.img:'/dev/zvol/gtbackup/vol1@s1' --ns gtrestore --backup-id gtsnapdev
+Starting backup: [gtrestore]:host/gtsnapdev/2026-08-25T19:32:32Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:32:32 2026    
+Downloading previous manifest (Tue Aug 25 19:32:31 2026)    
+Upload image '/dev/zvol/gtbackup/vol1@s1' to 'root@pam!anas-test@localhost:8007:anastest-store' as snap.img.fidx    
+snap.img: had to backup 0 B of 512 MiB (compressed 0 B) in 0.86 s (average 0 B/s)
+snap.img: backup was done incrementally, reused 512 MiB (100.0%)
+Duration: 0.91s    
+End Time: Tue Aug 25 19:32:33 2026    
+### exit=0
+
+
+=== set snapdev back to hidden; time the node disappearing ===
+### $ zfs set snapdev=hidden gtbackup/vol1
+### exit=0
+
+node gone after 33 ms (poll iteration 1)
+### $ udevadm settle
+### exit=0
+
+### $ ls -l /dev/zvol/gtbackup/
+total 0
+lrwxrwxrwx 1 root root 10 Aug 25 19:28 vol1 -> ../../zd16
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 vol2 -> ../../zd32
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 vol3 -> ../../zd48
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 vol4 -> ../../zd64
+### exit=0
+
+### $ zfs get -Hp snapdev gtbackup/vol1
+gtbackup/vol1	snapdev	hidden	local
+### exit=0
+
+
+=== does snapdev inherit from the POOL? (set on the pool, check a child) ===
+### $ zfs get -Hp -o name,value,source snapdev gtbackup gtbackup/vol1 gtbackup/vol2
+gtbackup	hidden	default
+gtbackup/vol1	hidden	local
+gtbackup/vol2	hidden	default
+### exit=0
+

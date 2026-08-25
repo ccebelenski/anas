@@ -1,0 +1,164 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: proxmox-backup-client mount: daemonization, mount options, kill -9, fusermount3 -u
+# COMMAND LOG: 08-fuse.sh
+# ==============================================================================
+
+SNAP=host/gtrestore/2026-08-25T19:16:45Z  mountpoint=/run/anas-gt-mnt
+=== fuse deps ===
+crw-rw-rw- 1 root root 10, 229 Aug 24 16:42 /dev/fuse
+ii  fuse3          3.17.2-3     amd64        Filesystem in Userspace (3.x version)
+
+=== 1. default mount (no --verbose): does it fork? ===
+1787685664.699992334
+FUSE library version: 3.17.2
+1787685664.756689044
+### mount exit=0  (shell returned => daemonized)
+--- client processes ---
+    PID    PPID STAT ELAPSED COMMAND
+    772       1 Ssl    95896 /usr/lib/x86_64-linux-gnu/proxmox-backup/proxmox-backup-api
+    828       1 Ssl    95896 /usr/lib/x86_64-linux-gnu/proxmox-backup/proxmox-backup-proxy
+ 355221       1 Ssl        0 proxmox-backup-client mount host/gtrestore/2026-08-25T19:16:45Z data.pxar /run/anas-gt-mnt --ns gtrestore
+--- findmnt ---
+TARGET           SOURCE    FSTYPE OPTIONS
+/run/anas-gt-mnt /dev/fuse fuse   ro,nosuid,nodev,relatime,user_id=0,group_id=0,default_permissions
+{
+   "filesystems": [
+      {
+         "target": "/run/anas-gt-mnt",
+         "source": "/dev/fuse",
+         "fstype": "fuse",
+         "options": "ro,nosuid,nodev,relatime,user_id=0,group_id=0,default_permissions"
+      }
+   ]
+}
+--- ls over the mount ---
+total 0
+drwxr-xr-x  2 root   root      0 Aug 25 19:16 .
+drwxr-xr-x 43 root   root   1700 Aug 25 19:21 ..
+-rw-rw-r--  1 root   root     13 Aug 25 19:16 acl-xattr.txt
+-rw-r--r--  1 root   root     23 Aug 25 19:16 alpha.txt
+-rw-r-----  1 debian debian   22 Aug 25 19:16 beta.txt
+-rw-r--r--  1 root   root     11 Aug 25 19:16 bracket[1].txt
+drwxr-xr-x  2 root   root      0 Aug 25 19:16 docs
+drwxr-xr-x  2 root   root      0 Aug 25 19:16 empty
+-rw-r--r--  1 root   root     17 Aug 25 19:16 hard-a.txt
+-rw-r--r--  1 root   root     17 Aug 25 19:16 hard-b.txt
+lrwxrwxrwx  1 root   root      0 Aug 25 19:16 link-to-alpha -> alpha.txt
+-rw-r--r--  1 root   root     10 Aug 25 19:16 mix [a] * b.txt
+-rw-r--r--  1 root   root      8 Aug 25 19:16 star*name.txt
+drwxr-xr-x  2 root   root      0 Aug 25 19:16 sub
+-rw-r--r--  1 root   root      9 Aug 25 19:16 with space.txt
+ls exit=0
+--- stat a file ---
+  File: /run/anas-gt-mnt/alpha.txt
+  Size: 23        	Blocks: 0          IO Block: 4096   regular file
+Device: 0,60	Inode: 9223372036854776098  Links: 1
+Access: (0644/-rw-r--r--)  Uid: (    0/    root)   Gid: (    0/    root)
+Access: 2026-08-25 19:16:23.330932347 +0000
+Modify: 2026-08-25 19:16:23.330932347 +0000
+Change: 2026-08-25 19:16:23.330932347 +0000
+ Birth: -
+stat exit=0
+--- cat a file ---
+alpha file contents v1
+cat exit=0
+--- nested + weird names ---
+d 0 /run/anas-gt-mnt
+f 13 /run/anas-gt-mnt/acl-xattr.txt
+f 23 /run/anas-gt-mnt/alpha.txt
+f 22 /run/anas-gt-mnt/beta.txt
+f 11 /run/anas-gt-mnt/bracket[1].txt
+d 0 /run/anas-gt-mnt/docs
+f 9 /run/anas-gt-mnt/docs/notes.txt
+f 10 /run/anas-gt-mnt/docs/readme.md
+d 0 /run/anas-gt-mnt/empty
+f 17 /run/anas-gt-mnt/hard-a.txt
+f 17 /run/anas-gt-mnt/hard-b.txt
+l 0 /run/anas-gt-mnt/link-to-alpha
+f 10 /run/anas-gt-mnt/mix [a] * b.txt
+f 8 /run/anas-gt-mnt/star*name.txt
+d 0 /run/anas-gt-mnt/sub
+d 0 /run/anas-gt-mnt/sub/deep
+f 8 /run/anas-gt-mnt/sub/deep/deep.txt
+f 7 /run/anas-gt-mnt/sub/mid.txt
+f 9 /run/anas-gt-mnt/with space.txt
+--- getfacl/getfattr over FUSE ---
+# file: /run/anas-gt-mnt/acl-xattr.txt
+# owner: root
+# group: root
+user::rw-
+group::rw-
+other::r--
+
+# file: /run/anas-gt-mnt/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+--- hardlink/symlink over FUSE ---
+9223372036854776951 1 /run/anas-gt-mnt/hard-a.txt
+9223372036854776951 1 /run/anas-gt-mnt/hard-b.txt
+alpha.txt
+--- write attempt (must be read-only) ---
+touch: cannot touch '/run/anas-gt-mnt/newfile': Read-only file system
+touch exit=1
+
+=== 2. clean unmount with fusermount3 -u ===
+fusermount3 exit=0
+    PID COMMAND
+    772 /usr/lib/x86_64-linux-gnu/proxmox-backup/proxmox-backup-api
+    828 /usr/lib/x86_64-linux-gnu/proxmox-backup/proxmox-backup-proxy
+TARGET FSTYPE
+/run   tmpfs
+total 0
+drwxr-xr-x  2 root root   40 Aug 25 19:21 .
+drwxr-xr-x 43 root root 1700 Aug 25 19:21 ..
+ls exit=0
+
+=== 3. mount again, then KILL -9 the client ===
+FUSE library version: 3.17.2
+mount exit=0
+client pid=355272
+kill exit=0
+--- ps after kill ---
+    PID COMMAND
+    772 /usr/lib/x86_64-linux-gnu/proxmox-backup/proxmox-backup-api
+    828 /usr/lib/x86_64-linux-gnu/proxmox-backup/proxmox-backup-proxy
+--- findmnt after kill ---
+TARGET           SOURCE    FSTYPE OPTIONS
+/run/anas-gt-mnt /dev/fuse fuse   ro,nosuid,nodev,relatime,user_id=0,group_id=0,default_permissions
+findmnt exit=0
+--- findmnt --json ---
+{
+   "filesystems": [
+      {
+         "target": "/run/anas-gt-mnt",
+         "source": "/dev/fuse",
+         "fstype": "fuse",
+         "options": "ro,nosuid,nodev,relatime,user_id=0,group_id=0,default_permissions"
+      }
+   ]
+}
+--- ls on the dir after kill ---
+ls: cannot access '/run/anas-gt-mnt': Transport endpoint is not connected
+ls exit=2
+--- stat -f (the mounts.ts liveness probe) ---
+stat: cannot read file system information for '/run/anas-gt-mnt': Transport endpoint is not connected
+stat -f exit=1
+--- stat a file after kill ---
+stat: cannot statx '/run/anas-gt-mnt/alpha.txt': Transport endpoint is not connected
+stat exit=1
+--- fusermount3 -u after kill ---
+fusermount3 exit=0
+--- findmnt after cleanup ---
+TARGET FSTYPE
+/run   tmpfs
+findmnt exit=0
+total 0
+drwxr-xr-x  2 root root   40 Aug 25 19:21 .
+drwxr-xr-x 43 root root 1700 Aug 25 19:21 ..
+ls exit=0

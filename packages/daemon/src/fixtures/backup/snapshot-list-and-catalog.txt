@@ -1,0 +1,158 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: snapshot list / list / snapshot files JSON shapes + catalog dump
+# COMMAND LOG: 01-backup.sh, 02-catalog.sh
+# ==============================================================================
+
+=== proxmox-backup-client version ===
+### $ proxmox-backup-client version
+client version: 4.2.5
+server version: 4.2.5
+### exit=0
+
+### $ proxmox-backup-client version --output-format json
+{"client":{"release":"5","repoid":"5f890fcb6dc07148c22568ad03bf9c079bcad249","version":"4.2"},"server":{"release":"5","repoid":"5f890fcb6dc07148c22568ad03bf9c079bcad249","version":"4.2"}}
+### exit=0
+
+=== BACKUP 1: default mode pxar, backup-id gtrestore, archive data.pxar ===
+### $ cd / && proxmox-backup-client backup data.pxar:/gtbackup/data --ns gtrestore --backup-id gtrestore
+Starting backup: [gtrestore]:host/gtrestore/2026-08-25T19:16:45Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:16:45 2026    
+No previous manifest available.    
+Upload directory '/gtbackup/data' to 'root@pam!anas-test@localhost:8007:anastest-store' as data.pxar.didx    
+data.pxar: had to backup 2.546 KiB of 2.546 KiB (compressed 894 B) in 0.02 s (average 105.85 KiB/s)
+Uploaded backup catalog (327 B)
+Duration: 0.07s    
+End Time: Tue Aug 25 19:16:46 2026    
+### exit=0
+
+=== snapshot list (whole namespace) --output-format json ===
+### $ proxmox-backup-client snapshot list --ns gtrestore --output-format json
+[{"backup-id":"gtrestore","backup-time":1787685405,"backup-type":"host","files":[{"crypt-mode":"none","filename":"data.pxar.didx","size":2607},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":327},{"crypt-mode":"none","filename":"index.json.blob","size":375}],"owner":"root@pam!anas-test","protected":false,"size":3309}]
+### exit=0
+
+=== snapshot list (group host/gtrestore) --output-format json ===
+### $ proxmox-backup-client snapshot list host/gtrestore --ns gtrestore --output-format json
+[{"backup-id":"gtrestore","backup-time":1787685405,"backup-type":"host","files":[{"crypt-mode":"none","filename":"data.pxar.didx","size":2607},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":327},{"crypt-mode":"none","filename":"index.json.blob","size":375}],"owner":"root@pam!anas-test","protected":false,"size":3309}]
+### exit=0
+
+=== snapshot list (no --output-format, human) ===
+### $ proxmox-backup-client snapshot list --ns gtrestore
+┌─────────────────────────────────────┬───────────┬────────────────────────────────────┐
+│ snapshot                            │      size │ files                              │
+╞═════════════════════════════════════╪═══════════╪════════════════════════════════════╡
+│ host/gtrestore/2026-08-25T19:16:45Z │ 3.231 KiB │ catalog.pcat1 data.pxar index.json │
+└─────────────────────────────────────┴───────────┴────────────────────────────────────┘
+### exit=0
+
+=== snapshot list --output-format json-pretty (one snapshot) ===
+### $ proxmox-backup-client snapshot list host/gtrestore --ns gtrestore --output-format json-pretty
+[
+  {
+    "backup-id": "gtrestore",
+    "backup-time": 1787685405,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "data.pxar.didx",
+        "size": 2607
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 327
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 375
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 3309
+  }
+]
+### exit=0
+
+=== list (groups) --output-format json ===
+### $ proxmox-backup-client list --ns gtrestore --output-format json
+[{"backup-count":1,"backup-id":"gtrestore","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","data.pxar.didx"],"last-backup":1787685405,"owner":"root@pam!anas-test"}]
+### exit=0
+
+=== snapshot files <snap> --output-format json ===
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json,sys; print(json.load(sys.stdin)[-1]["snapshot"])
+                           ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+KeyError: 'snapshot'
+
+
+# ------------------------------------------------------------------------------
+# 02-catalog.sh - snapshot files + catalog dump (note: catalog dump has NO
+# --output-format, and writes to STDERR)
+# ------------------------------------------------------------------------------
+
+SNAP=host/gtrestore/2026-08-25T19:16:45Z
+### $ proxmox-backup-client snapshot files 'host/gtrestore/2026-08-25T19:16:45Z' --ns gtrestore --output-format json
+[{"crypt-mode":"none","filename":"data.pxar.didx","size":2607},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":327},{"crypt-mode":"none","filename":"index.json.blob","size":375}]
+### exit=0
+
+=== catalog dump ===
+### $ proxmox-backup-client catalog dump 'host/gtrestore/2026-08-25T19:16:45Z' --ns gtrestore
+d "./data.pxar.didx"    
+f "./data.pxar.didx/acl-xattr.txt" 13 2026-08-25T19:16:23Z    
+f "./data.pxar.didx/alpha.txt" 23 2026-08-25T19:16:23Z    
+f "./data.pxar.didx/beta.txt" 22 2026-08-25T19:16:23Z    
+f "./data.pxar.didx/bracket[1].txt" 11 2026-08-25T19:16:23Z    
+d "./data.pxar.didx/docs"    
+f "./data.pxar.didx/docs/notes.txt" 9 2026-08-25T19:16:23Z    
+f "./data.pxar.didx/docs/readme.md" 10 2026-08-25T19:16:23Z    
+d "./data.pxar.didx/empty"    
+f "./data.pxar.didx/hard-a.txt" 17 2026-08-25T19:16:23Z    
+h "./data.pxar.didx/hard-b.txt"    
+l "./data.pxar.didx/link-to-alpha"    
+f "./data.pxar.didx/mix [a] * b.txt" 10 2026-08-25T19:16:23Z    
+f "./data.pxar.didx/star*name.txt" 8 2026-08-25T19:16:23Z    
+d "./data.pxar.didx/sub"    
+d "./data.pxar.didx/sub/deep"    
+f "./data.pxar.didx/sub/deep/deep.txt" 8 2026-08-25T19:16:23Z    
+f "./data.pxar.didx/sub/mid.txt" 7 2026-08-25T19:16:23Z    
+f "./data.pxar.didx/with space.txt" 9 2026-08-25T19:16:23Z    
+### exit=0
+
+=== catalog dump --output-format json ===
+### $ proxmox-backup-client catalog dump 'host/gtrestore/2026-08-25T19:16:45Z' --ns gtrestore --output-format json
+Error: parameter verification failed - 'output-format': schema does not allow additional properties.
+Usage: proxmox-backup-client catalog dump <snapshot> [OPTIONS]
+
+ <snapshot> <string>
+             Snapshot path.
+
+Optional parameters:
+
+ --auth-id  <string>
+             Authentication ID
+ --datastore <string>
+             Datastore name.
+ --keyfd    <integer> (0 - N)
+             Pass an encryption key via an already opened file descriptor.
+ --keyfile  <string>
+             Path to encryption key.
+ --ns       <string>
+             Namespace.
+ --port     <integer> (1 - 65535)   (default=8007)
+             Backup server port. Default: 8007
+ --repository <string>
+             Repository URL: [[auth-id@]server[:port]:]datastore
+ --server   <string>
+             Backup server address (hostname or IP). Default: localhost
+### exit=255
+

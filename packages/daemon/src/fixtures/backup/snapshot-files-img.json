@@ -1,0 +1,17 @@
+[
+  {
+    "crypt-mode": "none",
+    "filename": "lun.img.fidx",
+    "size": 536870912
+  },
+  {
+    "crypt-mode": "none",
+    "filename": "vol.img.fidx",
+    "size": 536870912
+  },
+  {
+    "crypt-mode": "none",
+    "filename": "index.json.blob",
+    "size": 368
+  }
+]

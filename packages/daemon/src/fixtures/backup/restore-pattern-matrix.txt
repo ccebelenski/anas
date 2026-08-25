@@ -1,0 +1,509 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: --pattern syntax, anchoring, globbing and escaping
+# COMMAND LOG: 05-pattern.sh, 06-pattern2.sh, 07-anchor.sh
+# ==============================================================================
+
+SNAPSHOT: host/gtrestore/2026-08-25T19:16:45Z  archive data.pxar  ns gtrestore
+ARCHIVE ROOT CONTENTS (from catalog dump, paths relative to archive root):
+  acl-xattr.txt alpha.txt beta.txt 'bracket[1].txt' docs/ docs/notes.txt docs/readme.md
+  empty/ hard-a.txt hard-b.txt(hardlink) link-to-alpha(symlink) 'mix [a] * b.txt'
+  'star*name.txt' sub/ sub/deep/ sub/deep/deep.txt sub/mid.txt 'with space.txt'
+
+================================================================
+PATTERN PROBE: 1  relative filename, no slash
+ARGV: [--pattern] [alpha.txt]
+restore complete (2.546 KiB processed in <0.1s, average 2.336 MiB/s)    
+### exit=0
+--- restored ---
+f alpha.txt
+(count: 1)
+
+================================================================
+PATTERN PROBE: 2  leading slash
+ARGV: [--pattern] [/alpha.txt]
+restore complete (2.546 KiB processed in <0.1s, average 1.795 MiB/s)    
+### exit=0
+--- restored ---
+f alpha.txt
+(count: 1)
+
+================================================================
+PATTERN PROBE: 3  directory name, no slash
+ARGV: [--pattern] [docs]
+restore complete (2.546 KiB processed in <0.1s, average 1.978 MiB/s)    
+### exit=0
+--- restored ---
+d docs
+f docs/notes.txt
+f docs/readme.md
+(count: 3)
+
+================================================================
+PATTERN PROBE: 4  directory name, leading slash
+ARGV: [--pattern] [/docs]
+restore complete (2.546 KiB processed in <0.1s, average 2.151 MiB/s)    
+### exit=0
+--- restored ---
+d docs
+f docs/notes.txt
+f docs/readme.md
+(count: 3)
+
+================================================================
+PATTERN PROBE: 5  directory name, trailing slash
+ARGV: [--pattern] [docs/]
+restore complete (2.546 KiB processed in <0.1s, average 1.3 MiB/s)    
+### exit=0
+--- restored ---
+d docs
+f docs/notes.txt
+f docs/readme.md
+(count: 3)
+
+================================================================
+PATTERN PROBE: 6  directory glob docs/*
+ARGV: [--pattern] [docs/*]
+restore complete (2.546 KiB processed in <0.1s, average 1.198 MiB/s)    
+### exit=0
+--- restored ---
+d docs
+f docs/notes.txt
+f docs/readme.md
+(count: 3)
+
+================================================================
+PATTERN PROBE: 7  single star *.txt
+ARGV: [--pattern] [*.txt]
+restore complete (2.546 KiB processed in <0.1s, average 851.577 KiB/s)    
+### exit=0
+--- restored ---
+f acl-xattr.txt
+f alpha.txt
+f beta.txt
+f bracket[1].txt
+d docs
+f docs/notes.txt
+f hard-a.txt
+f hard-b.txt
+f mix [a] * b.txt
+f star*name.txt
+d sub
+d sub/deep
+f sub/deep/deep.txt
+f sub/mid.txt
+f with space.txt
+(count: 15)
+
+================================================================
+PATTERN PROBE: 8  double star **/*.txt
+ARGV: [--pattern] [**/*.txt]
+restore complete (2.546 KiB processed in <0.1s, average 1.216 MiB/s)    
+### exit=0
+--- restored ---
+f acl-xattr.txt
+f alpha.txt
+f beta.txt
+f bracket[1].txt
+d docs
+f docs/notes.txt
+f hard-a.txt
+f hard-b.txt
+f mix [a] * b.txt
+f star*name.txt
+d sub
+d sub/deep
+f sub/deep/deep.txt
+f sub/mid.txt
+f with space.txt
+(count: 15)
+
+================================================================
+PATTERN PROBE: 9  sub/**
+ARGV: [--pattern] [sub/**]
+restore complete (2.546 KiB processed in <0.1s, average 3.815 MiB/s)    
+### exit=0
+--- restored ---
+d sub
+d sub/deep
+f sub/deep/deep.txt
+f sub/mid.txt
+(count: 4)
+
+================================================================
+PATTERN PROBE: 10 question mark ?lpha.txt
+ARGV: [--pattern] [?lpha.txt]
+restore complete (2.546 KiB processed in <0.1s, average 2.972 MiB/s)    
+### exit=0
+--- restored ---
+f alpha.txt
+(count: 1)
+
+================================================================
+PATTERN PROBE: 11 nested exact path sub/deep/deep.txt
+ARGV: [--pattern] [sub/deep/deep.txt]
+restore complete (2.546 KiB processed in <0.1s, average 4.438 MiB/s)    
+### exit=0
+--- restored ---
+d sub
+d sub/deep
+f sub/deep/deep.txt
+(count: 3)
+
+================================================================
+PATTERN PROBE: 12 nested exact leading slash
+ARGV: [--pattern] [/sub/deep/deep.txt]
+restore complete (2.546 KiB processed in <0.1s, average 3.007 MiB/s)    
+### exit=0
+--- restored ---
+d sub
+d sub/deep
+f sub/deep/deep.txt
+(count: 3)
+
+================================================================
+PATTERN PROBE: 13 literal-star filename UNESCAPED
+ARGV: [--pattern] [star*name.txt]
+restore complete (2.546 KiB processed in <0.1s, average 4.846 MiB/s)    
+### exit=0
+--- restored ---
+f star*name.txt
+(count: 1)
+
+================================================================
+PATTERN PROBE: 14 literal-star filename BACKSLASH-escaped
+ARGV: [--pattern] [star\*name.txt]
+restore complete (2.546 KiB processed in <0.1s, average 3.366 MiB/s)    
+### exit=0
+--- restored ---
+f star*name.txt
+(count: 1)
+
+================================================================
+PATTERN PROBE: 15 literal-star filename BRACKET-escaped
+ARGV: [--pattern] [star[*]name.txt]
+restore complete (2.546 KiB processed in <0.1s, average 3.06 MiB/s)    
+### exit=0
+--- restored ---
+f star*name.txt
+(count: 1)
+
+================================================================
+PATTERN PROBE: 16 bracket filename UNESCAPED
+ARGV: [--pattern] [bracket[1].txt]
+restore complete (2.546 KiB processed in <0.1s, average 3.445 MiB/s)    
+### exit=0
+--- restored ---
+(count: 0)
+
+================================================================
+PATTERN PROBE: 17 bracket filename BACKSLASH-escaped
+ARGV: [--pattern] [bracket\[1\].txt]
+restore complete (2.546 KiB processed in <0.1s, average 3.737 MiB/s)    
+### exit=0
+--- restored ---
+f bracket[1].txt
+(count: 1)
+
+================================================================
+PATTERN PROBE: 18 space in filename
+ARGV: [--pattern] [with space.txt]
+restore complete (2.546 KiB processed in <0.1s, average 1.345 MiB/s)    
+### exit=0
+--- restored ---
+f with space.txt
+(count: 1)
+
+================================================================
+PATTERN PROBE: 19 all-three filename literal
+ARGV: [--pattern] [mix \[a\] \* b.txt]
+restore complete (2.546 KiB processed in <0.1s, average 1.434 MiB/s)    
+### exit=0
+--- restored ---
+f mix [a] * b.txt
+(count: 1)
+
+================================================================
+PATTERN PROBE: 20 multiple --pattern
+ARGV: [--pattern] [alpha.txt] [--pattern] [docs/readme.md]
+restore complete (2.546 KiB processed in <0.1s, average 863.246 KiB/s)    
+### exit=0
+--- restored ---
+f alpha.txt
+d docs
+f docs/readme.md
+(count: 3)
+
+================================================================
+PATTERN PROBE: 21 pattern matching NOTHING
+ARGV: [--pattern] [nosuchfile.txt]
+restore complete (2.546 KiB processed in <0.1s, average 1.516 MiB/s)    
+### exit=0
+--- restored ---
+(count: 0)
+
+================================================================
+PATTERN PROBE: 22 pattern = root slash
+ARGV: [--pattern] [/]
+Error: parameter verification failed - 'pattern': value does not match the regex pattern
+Usage: proxmox-backup-client restore <snapshot> <archive-name> <target> [OPTIONS]
+
+ <snapshot> <string>
+             Group/Snapshot path.
+
+ <archive-name> <string>
+             Backup archive name.
+
+ <target>   <string>
+             Target directory path. Use '-' to write to standard output.
+
+             We do not extract '.pxar' archives when writing to standard output.
+
+Optional parameters:
+
+ --allow-existing-dirs <boolean>   (default=false)
+             Do not fail if directories already exists.
+ --auth-id  <string>
+             Authentication ID
+ --burst    <string>
+             Size of the token bucket (for Token bucket filter) in bytes with
+             optional unit (B, KB (base 10), MB, GB, ..., KiB (base 2), MiB,
+             Gib, ...).
+ --crypt-mode none|encrypt|sign-only   (default=encrypt)
+             Defines whether data is encrypted (using an AEAD cipher), only
+             signed, or neither.
+ --datastore <string>
+             Datastore name.
+ --ignore-acls <boolean>   (default=false)
+             ignore acl settings
+ --ignore-extract-device-errors <boolean>   (default=false)
+             ignore errors that occur during device node extraction
+ --ignore-ownership <boolean>   (default=false)
+             ignore owner settings (no chown)
+ --ignore-permissions <boolean>   (default=false)
+             ignore permission settings (no chmod)
+ --ignore-xattrs <boolean>   (default=false)
+             ignore xattr settings
+ --keyfd    <integer> (0 - N)
+             Pass an encryption key via an already opened file descriptor.
+ --keyfile  <string>
+             Path to encryption key. All data will be encrypted using this key.
+ --ns       <string>
+             Namespace.
+ --overwrite <boolean>   (default=false)
+             overwrite already existing files
+ --overwrite-files <boolean>   (default=false)
+             overwrite already existing files
+ --overwrite-hardlinks <boolean>   (default=false)
+             overwrite already existing entries by archives hardlink
+ --overwrite-symlinks <boolean>   (default=false)
+             overwrite already existing entries by archives symlink
+ --pattern  <string>
+             Path or match pattern to limit files that get restored. Can be
+             specified more than once.
+ --port     <integer> (1 - 65535)   (default=8007)
+             Backup server port. Default: 8007
+ --prelude-target <string>
+             Path to restore prelude to, (pxar v2 archives only).
+ --rate     <string>
+             Rate limit (for Token bucket filter) in bytes/s with optional unit
+             (B, KB (base 10), MB, GB, ..., KiB (base 2), MiB, Gib, ...).
+ --repository <string>
+             Repository URL: [[auth-id@]server[:port]:]datastore
+ --server   <string>
+             Backup server address (hostname or IP). Default: localhost
+### exit=255
+--- restored ---
+(count: 0)
+
+================================================================
+PATTERN PROBE: 23 char class [ab]*
+ARGV: [--pattern] [[ab]*]
+restore complete (2.546 KiB processed in <0.1s, average 2.414 MiB/s)    
+### exit=0
+--- restored ---
+f acl-xattr.txt
+f alpha.txt
+f beta.txt
+f bracket[1].txt
+(count: 4)
+
+================================================================
+PATTERN PROBE: 24 symlink by name
+ARGV: [--pattern] [link-to-alpha]
+restore complete (2.546 KiB processed in <0.1s, average 3.97 MiB/s)    
+### exit=0
+--- restored ---
+l link-to-alpha
+(count: 1)
+
+================================================================
+PATTERN PROBE: 25 hardlink second name only
+ARGV: [--pattern] [hard-b.txt]
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "hard-b.txt": failed to extract hardlink: ENOENT: No such file or directory
+### exit=255
+--- restored ---
+(count: 0)
+
+================================================================
+PATTERN PROBE: 26 empty dir by name
+ARGV: [--pattern] [empty]
+restore complete (2.546 KiB processed in <0.1s, average 3.339 MiB/s)    
+### exit=0
+--- restored ---
+(count: 0)
+
+================================================================
+PATTERN PROBE: 27 absolute host path (wrong idea)
+ARGV: [--pattern] [/gtbackup/data/alpha.txt]
+restore complete (2.546 KiB processed in <0.1s, average 1.807 MiB/s)    
+### exit=0
+--- restored ---
+(count: 0)
+
+
+
+# ------------------------------------------------------------------------------
+# 06-pattern2.sh - anchoring vs path-suffix matching
+# ------------------------------------------------------------------------------
+
+--- A bare basename of a NESTED file (no slash)
+ARGV: [--pattern] [deep.txt]
+exit=0  restored: d:sub d:sub/deep f:sub/deep/deep.txt 
+
+--- B partial path with slash NOT at root
+ARGV: [--pattern] [deep/deep.txt]
+exit=0  restored: d:sub d:sub/deep f:sub/deep/deep.txt 
+
+--- C partial path with slash NOT at root #2
+ARGV: [--pattern] [docs/../docs/notes.txt]
+exit=0  restored: 
+
+--- D anchored one level */notes.txt
+ARGV: [--pattern] [*/notes.txt]
+exit=0  restored: d:docs f:docs/notes.txt 
+
+--- E bare '**'
+ARGV: [--pattern] [**]
+exit=0  restored: f:star*name.txt f:beta.txt f:bracket[1].txt f:hard-a.txt d:docs f:docs/readme.md f:docs/notes.txt f:alpha.txt f:with space.txt l:link-to-alpha f:acl-xattr.txt d:sub f:sub/mid.txt d:sub/deep f:sub/deep/deep.txt f:hard-b.txt f:mix [a] * b.txt 
+
+--- F bare '*'
+ARGV: [--pattern] [*]
+Error: parameter verification failed - 'pattern': value does not match the regex pattern
+Usage: proxmox-backup-client restore <snapshot> <archive-name> <target> [OPTIONS]
+
+ <snapshot> <string>
+             Group/Snapshot path.
+
+ <archive-name> <string>
+             Backup archive name.
+
+ <target>   <string>
+             Target directory path. Use '-' to write to standard output.
+
+             We do not extract '.pxar' archives when writing to standard output.
+
+Optional parameters:
+
+ --allow-existing-dirs <boolean>   (default=false)
+             Do not fail if directories already exists.
+ --auth-id  <string>
+             Authentication ID
+ --burst    <string>
+             Size of the token bucket (for Token bucket filter) in bytes with
+             optional unit (B, KB (base 10), MB, GB, ..., KiB (base 2), MiB,
+             Gib, ...).
+ --crypt-mode none|encrypt|sign-only   (default=encrypt)
+             Defines whether data is encrypted (using an AEAD cipher), only
+             signed, or neither.
+ --datastore <string>
+             Datastore name.
+ --ignore-acls <boolean>   (default=false)
+             ignore acl settings
+ --ignore-extract-device-errors <boolean>   (default=false)
+             ignore errors that occur during device node extraction
+ --ignore-ownership <boolean>   (default=false)
+             ignore owner settings (no chown)
+ --ignore-permissions <boolean>   (default=false)
+             ignore permission settings (no chmod)
+ --ignore-xattrs <boolean>   (default=false)
+             ignore xattr settings
+ --keyfd    <integer> (0 - N)
+             Pass an encryption key via an already opened file descriptor.
+ --keyfile  <string>
+             Path to encryption key. All data will be encrypted using this key.
+ --ns       <string>
+             Namespace.
+ --overwrite <boolean>   (default=false)
+             overwrite already existing files
+ --overwrite-files <boolean>   (default=false)
+             overwrite already existing files
+ --overwrite-hardlinks <boolean>   (default=false)
+             overwrite already existing entries by archives hardlink
+ --overwrite-symlinks <boolean>   (default=false)
+             overwrite already existing entries by archives symlink
+ --pattern  <string>
+             Path or match pattern to limit files that get restored. Can be
+             specified more than once.
+ --port     <integer> (1 - 65535)   (default=8007)
+             Backup server port. Default: 8007
+ --prelude-target <string>
+             Path to restore prelude to, (pxar v2 archives only).
+ --rate     <string>
+             Rate limit (for Token bucket filter) in bytes/s with optional unit
+             (B, KB (base 10), MB, GB, ..., KiB (base 2), MiB, Gib, ...).
+ --repository <string>
+             Repository URL: [[auth-id@]server[:port]:]datastore
+ --server   <string>
+             Backup server address (hostname or IP). Default: localhost
+exit=255  restored: 
+
+--- G no-slash glob mid*
+ARGV: [--pattern] [mid*]
+exit=0  restored: d:sub f:sub/mid.txt 
+
+--- H no-slash glob *.md
+ARGV: [--pattern] [*.md]
+exit=0  restored: d:docs f:docs/readme.md 
+
+--- I anchored glob sub/*.txt
+ARGV: [--pattern] [sub/*.txt]
+exit=0  restored: d:sub f:sub/mid.txt 
+
+--- J anchored deep glob sub/*/*.txt
+ARGV: [--pattern] [sub/*/*.txt]
+exit=0  restored: d:sub d:sub/deep f:sub/deep/deep.txt 
+
+--- K trailing-slash-dir + overwrite in place check: docs plus alpha
+ARGV: [--pattern] [docs] [--pattern] [alpha.txt]
+exit=0  restored: d:docs f:docs/notes.txt f:docs/readme.md f:alpha.txt 
+
+
+
+# ------------------------------------------------------------------------------
+# 07-anchor.sh - duplicate basenames at three depths (the picker trap)
+# ------------------------------------------------------------------------------
+
+Uploaded backup catalog (125 B)
+Duration: 0.07s    
+End Time: Tue Aug 25 19:43:50 2026    
+SNAP=host/gtdup/2026-08-25T19:43:50Z
+--- UNANCHORED alpha.txt
+exit=0 restored: sub/alpha.txt sub/nest/alpha.txt alpha.txt 
+--- ANCHORED /alpha.txt
+exit=0 restored: alpha.txt 
+--- ANCHORED /sub/alpha.txt
+exit=0 restored: sub/alpha.txt 
+--- UNANCHORED sub/alpha.txt
+exit=0 restored: sub/alpha.txt 
+--- ANCHORED /sub/nest/alpha.txt
+exit=0 restored: sub/nest/alpha.txt 
+--- ANCHORED glob /sub/*
+exit=0 restored: sub/alpha.txt sub/nest/alpha.txt 
+--- ANCHORED /sub/**
+exit=0 restored: sub/nest/alpha.txt sub/alpha.txt 

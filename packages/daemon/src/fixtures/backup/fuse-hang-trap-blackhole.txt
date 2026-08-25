@@ -1,0 +1,70 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: THE HANG TRAP: PBS reachable-but-black-holed - D-state readers that 'timeout' cannot kill
+# COMMAND LOG: 26-blackhole.sh
+# ==============================================================================
+
+########## THE FUSE HANG TRAP: PBS REACHABLE-BUT-BLACK-HOLED ##########
+# Setup: proxmox-backup stays RUNNING; a temporary nft table (inet anasgt,
+# created and destroyed by this script only) DROPS tcp dport 8007, so packets
+# vanish instead of being refused. This is the remote-PBS-behind-a-dead-link case.
+# Archive: 250 MiB incompressible, 10 x 25 MiB files -> cold chunks must be fetched.
+
+FUSE library version: 3.17.2
+mount exit=0
+client pid=368585   FUSE connection id (st_dev of the mountpoint) = 61
+warm read (server up) exit=0
+
+### install the DROP rule
+table inet anasgt {
+	chain out {
+		type filter hook output priority filter; policy accept;
+		tcp dport 8007 drop
+	}
+}
+
+### timeout 5 ls $M/part   -- run in the background so this script survives
+  12 s later, 7 s after SIGTERM was due:
+ 368585 Ssl  futex_do_wait            proxmox-backup-client mount host/gtbig/2026-08-25T19:22:02Z big.pxar /run/anas-gt-mnt --ns gtrestore
+ 368609 S    sigsuspend.isra.0        timeout 5 ls /run/anas-gt-mnt/part
+ 368611 D    request_wait_answer      ls /run/anas-gt-mnt/part
+  ==> 'timeout 5' fired at 5 s and the child is STILL ALIVE in D state.
+  outstanding FUSE requests: 1
+
+### can fusermount3 -u clean it while a request is in flight?
+fusermount3: failed to unmount /run/anas-gt-mnt: Device or resource busy
+  fusermount3 -u exit=1
+  elapsed=2 ms
+
+### can a LAZY unmount (-uz) release the stuck reader?
+  fusermount3 -uz exit=0
+  elapsed=9 ms
+  findmnt after the lazy unmount:
+TARGET FSTYPE
+/run   tmpfs
+  stuck processes after the lazy unmount:
+ 368585 Ssl  futex_do_wait            proxmox-backup-client mount host/gtbig/2026-08-25T19:22:02Z big.pxar /run/anas-gt-mnt --ns gtrestore
+ 368609 S    sigsuspend.isra.0        timeout 5 ls /run/anas-gt-mnt/part
+ 368611 D    request_wait_answer      ls /run/anas-gt-mnt/part
+  ==> the mount is detached from the namespace but the reader is STILL stuck.
+
+### the only lever that frees it: abort the FUSE connection
+  /sys/fs/fuse/connections/61/waiting = 1
+  abort write exit=0
+  elapsed=1 ms
+  processes after the abort:
+    (none - reader, timeout and mount client all released)
+  connection 61 still present? 0
+  what the stuck 'ls' finally printed:
+
+### teardown: remove the DROP rule
+0
+TARGET FSTYPE
+/run   tmpfs
+(no mount client left)
+/root/gt-backup2/26-blackhole.sh: line 13: /sys/fs/fuse/connections/61/abort: No such file or directory

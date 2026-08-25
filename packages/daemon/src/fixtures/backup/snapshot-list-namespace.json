@@ -1,0 +1,612 @@
+[
+  {
+    "backup-id": "gtbtrfslive",
+    "backup-time": 1787686460,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "btrlive.pxar.didx",
+        "size": 652
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 92
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 376
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 1120
+  },
+  {
+    "backup-id": "gtimg",
+    "backup-time": 1787686121,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "lun.img.fidx",
+        "size": 536870912
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 301
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 536871213
+  },
+  {
+    "backup-id": "gtimg",
+    "backup-time": 1787686116,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "lun.img.fidx",
+        "size": 536870912
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 308
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 536871220
+  },
+  {
+    "backup-id": "gtimg",
+    "backup-time": 1787686120,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "lun.img.fidx",
+        "size": 536870912
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 310
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 536871222
+  },
+  {
+    "backup-id": "gtimg",
+    "backup-time": 1787686119,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "lun.img.fidx",
+        "size": 536870912
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 300
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 536871212
+  },
+  {
+    "backup-id": "gtrestore",
+    "backup-time": 1787685405,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "data.pxar.didx",
+        "size": 2607
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 327
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 375
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 3309
+  },
+  {
+    "backup-id": "gtbig",
+    "backup-time": 1787685722,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "big.pxar.didx",
+        "size": 262145428
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 218
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 376
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 262146022
+  },
+  {
+    "backup-id": "gtdup",
+    "backup-time": 1787687030,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "dup.pxar.didx",
+        "size": 911
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 125
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 371
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 1407
+  },
+  {
+    "backup-id": "gtdup",
+    "backup-time": 1787685631,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "dup.pxar.didx",
+        "size": 911
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 125
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 368
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 1404
+  },
+  {
+    "backup-id": "gtbtrfsall",
+    "backup-time": 1787686460,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "btrall.pxar.didx",
+        "size": 1191
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 146
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 374
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 1711
+  },
+  {
+    "backup-id": "gtimgboth",
+    "backup-time": 1787686118,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "lun.img.fidx",
+        "size": 536870912
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "vol.img.fidx",
+        "size": 536870912
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 368
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 1073742192
+  },
+  {
+    "backup-id": "gtcdm",
+    "backup-time": 1787686412,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.ppxar.didx",
+        "size": 4128064
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.mpxar.didx",
+        "size": 274240
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 361
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 4402665
+  },
+  {
+    "backup-id": "gtcdm",
+    "backup-time": 1787686408,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.ppxar.didx",
+        "size": 4128064
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.mpxar.didx",
+        "size": 274240
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 368
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 4402672
+  },
+  {
+    "backup-id": "gtcdm",
+    "backup-time": 1787686410,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.ppxar.didx",
+        "size": 4128064
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.mpxar.didx",
+        "size": 274240
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 358
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 4402662
+  },
+  {
+    "backup-id": "gtcdm",
+    "backup-time": 1787686405,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.ppxar.didx",
+        "size": 4128032
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.mpxar.didx",
+        "size": 274240
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 370
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 4402642
+  },
+  {
+    "backup-id": "gtcdm",
+    "backup-time": 1787686414,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.ppxar.didx",
+        "size": 4130136
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.mpxar.didx",
+        "size": 274240
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 368
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 4404744
+  },
+  {
+    "backup-id": "gtcdm",
+    "backup-time": 1787686416,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.ppxar.didx",
+        "size": 4130136
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.mpxar.didx",
+        "size": 274240
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 361
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 4404737
+  },
+  {
+    "backup-id": "gtcdmdef",
+    "backup-time": 1787686418,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.pxar.didx",
+        "size": 4338224
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 33643
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 378
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 4372245
+  },
+  {
+    "backup-id": "gtcdmdef",
+    "backup-time": 1787686425,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.pxar.didx",
+        "size": 4338224
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 33643
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 375
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 4372242
+  },
+  {
+    "backup-id": "gtcdmdef",
+    "backup-time": 1787686421,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "cdm.pxar.didx",
+        "size": 4338224
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 33643
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 377
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 4372244
+  },
+  {
+    "backup-id": "gtsnapdev",
+    "backup-time": 1787686352,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "snap.img.fidx",
+        "size": 536870912
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 305
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 536871217
+  },
+  {
+    "backup-id": "gtsnapdev",
+    "backup-time": 1787686351,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "snap.img.fidx",
+        "size": 536870912
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 314
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 536871226
+  },
+  {
+    "backup-id": "gtbtrfssnapall",
+    "backup-time": 1787686460,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "btrsnapall.pxar.didx",
+        "size": 652
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 95
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 380
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 1127
+  },
+  {
+    "backup-id": "gtimgvol",
+    "backup-time": 1787686117,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "vol.img.fidx",
+        "size": 536870912
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 317
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 536871229
+  },
+  {
+    "backup-id": "gtimgfs",
+    "backup-time": 1787686316,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "fs.img.fidx",
+        "size": 268435456
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 311
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 268435767
+  },
+  {
+    "backup-id": "gtbtrfs",
+    "backup-time": 1787686460,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "btr.pxar.didx",
+        "size": 652
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 88
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 372
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 1112
+  }
+]

@@ -1,0 +1,269 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: .img restore to file/device (the client REFUSES every existing target), stdout restore, map/unmap, size mismatch
+# COMMAND LOG: 14-img-restore.sh, 15-img-map.sh, 16b-img-size.sh
+# ==============================================================================
+
+SNAP=host/gtimgboth/2026-08-25T19:28:38Z  archives: lun.img (from a regular sparse file), vol.img (from a zvol)
+
+=== (a) restore .img to a FRESH FILE PATH ===
+### $ proxmox-backup-client restore 'host/gtimgboth/2026-08-25T19:28:38Z' lun.img /gtbackup/images/restored-a.raw --ns gtrestore
+restore complete (512 MiB processed in 0.4s, average 1.15 GiB/s)    
+### exit=0
+
+-rw-r--r-- 1 root root 536870912 Aug 25 19:29 /gtbackup/images/restored-a.raw
+5.5K	/gtbackup/images/restored-a.raw
+  head24: ANAS-GT-IMG-FILE-HEAD-v1
+  tail24: ANAS-GT-IMG-FILE-TAIL-v1
+
+=== (b) restore .img OVER AN EXISTING REGULAR FILE (no flags) ===
+-rw-r--r-- 1 root root 104857600 Aug 25 19:29 /gtbackup/images/restored-b.raw
+inode=586 size=104857600
+### $ proxmox-backup-client restore 'host/gtimgboth/2026-08-25T19:28:38Z' lun.img /gtbackup/images/restored-b.raw --ns gtrestore
+Error: unable to create target file "/gtbackup/images/restored-b.raw" - File exists (os error 17)
+### exit=255
+
+-rw-r--r-- 1 root root 104857600 Aug 25 19:29 /gtbackup/images/restored-b.raw
+inode=586 size=104857600
+  head24: PREEXISTING-CONTENT-XXXX
+  tail24: 
+  (b2) same again WITH --overwrite
+### $ proxmox-backup-client restore 'host/gtimgboth/2026-08-25T19:28:38Z' lun.img /gtbackup/images/restored-b.raw --ns gtrestore --overwrite true
+Error: unable to create target file "/gtbackup/images/restored-b.raw" - File exists (os error 17)
+### exit=255
+
+inode=586 size=104857600
+
+=== (c) restore .img ONTO THE ZVOL DEVICE PATH /dev/zvol/gtbackup/vol1 (same size) ===
+lrwxrwxrwx 1 root root 10 Aug 25 19:28 /dev/zvol/gtbackup/vol1 -> ../../zd16
+/dev/zd16
+type=symbolic link inode=838
+type=block special file rdev=e6:10
+  before: WIPED-BEFORE-RESTORE-XXX
+### $ proxmox-backup-client restore 'host/gtimgboth/2026-08-25T19:28:38Z' vol.img /dev/zvol/gtbackup/vol1 --ns gtrestore
+Error: unable to create target file "/dev/zvol/gtbackup/vol1" - File exists (os error 17)
+### exit=255
+
+--- AFTER: is the path still a symlink to a block device, or a regular file? ---
+lrwxrwxrwx 1 root root 10 Aug 25 19:28 /dev/zvol/gtbackup/vol1 -> ../../zd16
+type=symbolic link inode=838 size=10
+type=block special file
+brw-rw---- 1 root disk 230, 16 Aug 25 19:29 /dev/zd16
+--- content read back THROUGH the device ---
+  head24: WIPED-BEFORE-RESTORE-XXX
+  tail24: ANAS-GT-IMG-ZVOL-TAIL-v1
+--- zfs still sees the volume? ---
+NAME            USED  AVAIL  REFER  MOUNTPOINT
+gtbackup/vol1   522M  7.02G    18K  -
+gtiscsi/vol1   2.03G  5.20G  59.5K  -
+
+=== (c2) restore onto the RESOLVED device node /dev/zd16 ===
+DEV=/dev/zd16
+### $ proxmox-backup-client restore 'host/gtimgboth/2026-08-25T19:28:38Z' vol.img /dev/zd16 --ns gtrestore
+Error: unable to create target file "/dev/zd16" - File exists (os error 17)
+### exit=255
+
+brw-rw---- 1 root disk 230, 16 Aug 25 19:29 /dev/zd16
+type=block special file
+  head24: 
+  tail24: ANAS-GT-IMG-ZVOL-TAIL-v1
+
+
+# ------------------------------------------------------------------------------
+# 15-img-map.sh - restore to stdout, map
+# ------------------------------------------------------------------------------
+
+SNAP=host/gtimgboth/2026-08-25T19:28:38Z
+
+=== (e) restore .img to STDOUT ('-') piped into dd onto the zvol ===
+  before: 
+### $ proxmox-backup-client restore 'host/gtimgboth/2026-08-25T19:28:38Z' vol.img - --ns gtrestore > /dev/zvol/gtbackup/vol1
+restore complete (512 MiB processed in 0.6s, average 802.99 MiB/s)    
+### exit=0
+
+  head24: ANAS-GT-IMG-ZVOL-HEAD-v1
+  tail24: ANAS-GT-IMG-ZVOL-TAIL-v1
+lrwxrwxrwx 1 root root 10 Aug 25 19:28 /dev/zvol/gtbackup/vol1 -> ../../zd16
+type=block special file size=0
+  (does stdout restore print progress to stderr?) --- rerun with stdout to /dev/null:
+### $ proxmox-backup-client restore 'host/gtimgboth/2026-08-25T19:28:38Z' vol.img - --ns gtrestore 1>/dev/null
+restore complete (512 MiB processed in 0.3s, average 1.688 GiB/s)    
+### exit=0
+
+
+=== (f) map / unmap the .img ===
+### $ proxmox-backup-client map 'host/gtimgboth/2026-08-25T19:28:38Z' vol.img --ns gtrestore
+Image 'root@pam!anas-test@localhost:8007:anastest-store:host/gtimgboth/2026-08-25T19:28:38Z/vol.img' mapped on /dev/loop1    
+### exit=0
+
+--- what appeared? ---
+/dev/loop1: [0060]:1 (/run/pbs-loopdev/root\x40pam\x21anas\x2dtest\x40localhost\x3a8007\x3aanastest\x2dstore\x3ahost-gtimgboth-2026\x2d08\x2d25T19\x3a28\x3a38Z-vol.img)
+/dev/loop0: [2049]:46697 (/var/tmp/gtloop.img)
+NAME     SIZE TYPE RO MOUNTPOINT
+loop0      2G loop  0 
+loop1    512M loop  1 
+crw-rw---- 1 root disk 10, 237 Aug 24 16:42 /dev/loop-control
+brw-rw---- 1 root disk  7,   0 Aug 25 19:29 /dev/loop0
+brw-rw---- 1 root disk  7,   1 Aug 24 16:42 /dev/loop1
+brw-rw---- 1 root disk  7,   2 Aug 24 16:42 /dev/loop2
+brw-rw---- 1 root disk  7,   3 Aug 24 16:42 /dev/loop3
+brw-rw---- 1 root disk  7,   4 Aug 24 16:42 /dev/loop4
+brw-rw---- 1 root disk  7,   5 Aug 24 16:42 /dev/loop5
+brw-rw---- 1 root disk  7,   6 Aug 24 16:42 /dev/loop6
+brw-rw---- 1 root disk  7,   7 Aug 24 16:42 /dev/loop7
+### $ proxmox-backup-client map list --output-format json
+Error: parameter verification failed - 'archive-name': missing argument
+Usage: proxmox-backup-client map <snapshot> <archive-name> [OPTIONS]
+
+ <snapshot> <string>
+             Group/Snapshot path.
+
+ <archive-name> <string>
+             Backup archive name.
+
+Optional parameters:
+
+ --auth-id  <string>
+             Authentication ID
+ --datastore <string>
+             Datastore name.
+ --keyfile  <string>
+             Path to encryption key.
+ --ns       <string>
+             Namespace.
+ --port     <integer> (1 - 65535)   (default=8007)
+             Backup server port. Default: 8007
+ --repository <string>
+             Repository URL: [[auth-id@]server[:port]:]datastore
+ --server   <string>
+             Backup server address (hostname or IP). Default: localhost
+ --verbose  <boolean>   (default=false)
+             Verbose output and stay in foreground.
+### exit=255
+
+### $ proxmox-backup-client map list
+Error: parameter verification failed - 'archive-name': missing argument
+Usage: proxmox-backup-client map <snapshot> <archive-name> [OPTIONS]
+
+ <snapshot> <string>
+             Group/Snapshot path.
+
+ <archive-name> <string>
+             Backup archive name.
+
+Optional parameters:
+
+ --auth-id  <string>
+             Authentication ID
+ --datastore <string>
+             Datastore name.
+ --keyfile  <string>
+             Path to encryption key.
+ --ns       <string>
+             Namespace.
+ --port     <integer> (1 - 65535)   (default=8007)
+             Backup server port. Default: 8007
+ --repository <string>
+             Repository URL: [[auth-id@]server[:port]:]datastore
+ --server   <string>
+             Backup server address (hostname or IP). Default: localhost
+ --verbose  <boolean>   (default=false)
+             Verbose output and stay in foreground.
+### exit=255
+
+
+
+# ------------------------------------------------------------------------------
+# 16b-img-size.sh - size mismatch both directions, blkid on a mapped filesystem image
+# ------------------------------------------------------------------------------
+
+SNAP=host/gtimgboth/2026-08-25T19:28:38Z  MAPDEV=/dev/loop1
+=== (d) SIZE MISMATCH: 512 MiB image onto a 256 MiB zvol ===
+lrwxrwxrwx 1 root root 10 Aug 25 19:31 /dev/zvol/gtbackup/vol2 -> ../../zd32
+268435456
+--- d1: restore to stdout redirected onto the SMALLER device ---
+### $ proxmox-backup-client restore 'host/gtimgboth/2026-08-25T19:28:38Z' vol.img - --ns gtrestore > /dev/zvol/gtbackup/vol2
+Error: No space left on device (os error 28)
+### exit=255
+
+  head24 on the small device: ANAS-GT-IMG-ZVOL-HEAD-v1
+  size still: 268435456
+--- d2: dd from the MAPPED device onto the SMALLER device ---
+### $ dd if=/dev/loop1 of=/dev/zvol/gtbackup/vol2 bs=1M conv=notrunc
+dd: error writing '/dev/zvol/gtbackup/vol2': No space left on device
+257+0 records in
+256+0 records out
+268435456 bytes (268 MB, 256 MiB) copied, 0.545055 s, 492 MB/s
+### exit=1
+
+
+=== (d4) 512 MiB image onto a LARGER (1 GiB) zvol ===
+### $ proxmox-backup-client restore 'host/gtimgboth/2026-08-25T19:28:38Z' vol.img - --ns gtrestore > /dev/zvol/gtbackup/vol3
+restore complete (512 MiB processed in 0.7s, average 749.662 MiB/s)    
+### exit=0
+
+  head24: ANAS-GT-IMG-ZVOL-HEAD-v1
+  at 1e9 (beyond the image; was pre-existing): LARGER-DEV-PREEXISTING-X
+  size still: 1073741824
+
+=== (h) blkid on a mapped image that DOES carry a filesystem ===
+/dev/zvol/gtbackup/vol4: LABEL="GTIMGFS" UUID="de48d59b-cde9-4db3-a33a-3c845ff136b1" BLOCK_SIZE="1024" TYPE="ext4"
+### $ proxmox-backup-client backup fs.img:/dev/zvol/gtbackup/vol4 --ns gtrestore --backup-id gtimgfs
+Starting backup: [gtrestore]:host/gtimgfs/2026-08-25T19:31:56Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:31:56 2026    
+No previous manifest available.    
+Upload image '/dev/zvol/gtbackup/vol4' to 'root@pam!anas-test@localhost:8007:anastest-store' as fs.img.fidx    
+fs.img: had to backup 48 MiB of 256 MiB (compressed 12.329 KiB) in 0.39 s (average 122.157 MiB/s)
+fs.img: backup was done incrementally, reused 208 MiB (81.2%)
+Duration: 0.42s    
+End Time: Tue Aug 25 19:31:57 2026    
+### exit=0
+
+### $ proxmox-backup-client map 'host/gtimgfs/2026-08-25T19:31:56Z' fs.img --ns gtrestore
+Image 'root@pam!anas-test@localhost:8007:anastest-store:host/gtimgfs/2026-08-25T19:31:56Z/fs.img' mapped on /dev/loop0    
+### exit=0
+
+/dev/loop1: [0060]:1 (/run/pbs-loopdev/root\x40pam\x21anas\x2dtest\x40localhost\x3a8007\x3aanastest\x2dstore\x3ahost-gtimgboth-2026\x2d08\x2d25T19\x3a28\x3a38Z-vol.img)
+/dev/loop0: [0061]:1 (/run/pbs-loopdev/root\x40pam\x21anas\x2dtest\x40localhost\x3a8007\x3aanastest\x2dstore\x3ahost-gtimgfs-2026\x2d08\x2d25T19\x3a31\x3a56Z-fs.img)
+FSDEV=/dev/loop0
+### $ blkid /dev/loop0
+/dev/loop0: LABEL="GTIMGFS" UUID="de48d59b-cde9-4db3-a33a-3c845ff136b1" BLOCK_SIZE="1024" TYPE="ext4"
+### exit=0
+
+### $ blkid -p /dev/loop0
+/dev/loop0: LABEL="GTIMGFS" UUID="de48d59b-cde9-4db3-a33a-3c845ff136b1" VERSION="1.0" FSBLOCKSIZE="1024" BLOCK_SIZE="1024" FSLASTBLOCK="262144" FSSIZE="268435456" TYPE="ext4" USAGE="filesystem"
+### exit=0
+
+### $ lsblk -o NAME,SIZE,TYPE,RO,FSTYPE,LABEL /dev/loop0
+NAME   SIZE TYPE RO FSTYPE LABEL
+loop0  256M loop  1 ext4   GTIMGFS
+### exit=0
+
+### $ mount -o ro /dev/loop0 /run/anas-gt-imgmnt
+### exit=0
+
+### $ ls -la /run/anas-gt-imgmnt
+total 13
+drwxr-xr-x  3 root root  1024 Aug 25 19:31 .
+drwxr-xr-x 45 root root  1760 Aug 25 19:31 ..
+drwx------  2 root root 12288 Aug 25 19:31 lost+found
+### exit=0
+
+
+=== cleanup mappings ===
+### $ proxmox-backup-client unmap /dev/loop0
+### exit=0
+
+### $ proxmox-backup-client unmap /dev/loop1
+### exit=0
+
+### $ proxmox-backup-client unmap
+Nothing mapped.    
+### exit=0
+

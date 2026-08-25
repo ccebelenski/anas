@@ -1,0 +1,34 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: restore progress output shape on a long (rate-limited) restore
+# COMMAND LOG: 22-progress.sh
+# ==============================================================================
+
+BIG=host/gtbig/2026-08-25T19:22:02Z (250 MiB, 10 x 25 MiB incompressible files)
+
+############ P1: rate-limited restore (3 MB/s) — is ANYTHING printed before completion? ############
+[+  5983 ms] progress 4% (12.409 MiB of 250.001 MiB in 6s, 2.084 MiB/s)    
+[+ 16154 ms] progress 17% (43.939 MiB of 250.001 MiB in 16.1s, 3.1 MiB/s)    
+[+ 36154 ms] progress 40% (101.305 MiB of 250.001 MiB in 36.1s, 2.868 MiB/s)    
+[+ 78875 ms] progress 86% (216.344 MiB of 250.001 MiB in 1m 18.8s, 2.693 MiB/s)    
+[+ 87547 ms] restore complete (250.001 MiB processed in 1m 27.5s, average 2.857 MiB/s)    
+[STDERR ABOVE] exit=0
+--- and what went to STDOUT? ---
+(stdout only; exit=0)
+
+############ P2: same restore under a PTY (does a TTY unlock a progress bar?) ############
+--- pty capture, control chars visible ---
+Script started on 2026-08-25 19:45:49+00:00 [COMMAND="proxmox-backup-client restore 'host/gtbig/2026-08-25T19:22:02Z' big.pxar /gtbackup/prog --ns gtrestore --rate 3MB" <not executed on terminal>]
+progress 4% (12.409 MiB of 250.001 MiB in 5.9s, 2.088 MiB/s)    ^M
+progress 17% (43.939 MiB of 250.001 MiB in 16.1s, 3.096 MiB/s)    ^M
+progress 41% (103.156 MiB of 250.001 MiB in 36.9s, 2.85 MiB/s)    ^M
+progress 86% (216.344 MiB of 250.001 MiB in 1m 18.8s, 2.7 MiB/s)    ^M
+restore complete (250.001 MiB processed in 1m 27.5s, average 2.856 MiB/s)    ^M
+
+Script done on 2026-08-25 19:47:16+00:00 [COMMAND_EXIT_CODE="0"]
+--- byte count: 614 ---

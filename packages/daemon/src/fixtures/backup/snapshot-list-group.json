@@ -1,0 +1,27 @@
+[
+  {
+    "backup-id": "gtrestore",
+    "backup-time": 1787685405,
+    "backup-type": "host",
+    "files": [
+      {
+        "crypt-mode": "none",
+        "filename": "data.pxar.didx",
+        "size": 2607
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "catalog.pcat1.didx",
+        "size": 327
+      },
+      {
+        "crypt-mode": "none",
+        "filename": "index.json.blob",
+        "size": 375
+      }
+    ],
+    "owner": "root@pam!anas-test",
+    "protected": false,
+    "size": 3309
+  }
+]

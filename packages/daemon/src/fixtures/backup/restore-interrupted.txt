@@ -1,0 +1,75 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: kill -9 / SIGTERM / server-death mid-restore; what is left behind
+# COMMAND LOG: 23-interrupt.sh
+# ==============================================================================
+
+BIG=host/gtbig/2026-08-25T19:22:02Z   IMGS=host/gtimgboth/2026-08-25T19:28:38Z
+
+############ K1: kill -9 the client mid-restore (pxar into a fresh dir) ############
+--- target BEFORE the kill ---
+total 3
+drwxr-xr-x  3 root root  3 Aug 25 19:39 .
+drwxr-xr-x 15 root root 16 Aug 25 19:39 ..
+drwxr-xr-x  2 root root  5 Aug 25 19:39 part
+total 49381
+drwxr-xr-x 2 root root        5 Aug 25 19:39 .
+drwxr-xr-x 3 root root        3 Aug 25 19:39 ..
+-rw-r--r-- 1 root root 26214400 Aug 25 19:22 f1.bin
+-rw-r--r-- 1 root root 26214400 Aug 25 19:22 f10.bin
+-rw------- 1 root root  2129920 Aug 25 19:39 f2.bin
+49M	/gtbackup/kill1
+client killed, wait status=137
+--- client output up to the kill ---
+progress 4% (12.409 MiB of 250.001 MiB in 5.9s, 2.091 MiB/s)    
+progress 17% (43.939 MiB of 250.001 MiB in 16.1s, 3.097 MiB/s)    
+--- target AFTER the kill ---
+d 3 /gtbackup/kill1
+d 5 /gtbackup/kill1/part
+f 26214400 /gtbackup/kill1/part/f1.bin
+f 26214400 /gtbackup/kill1/part/f10.bin
+f 2129920 /gtbackup/kill1/part/f2.bin
+49M	/gtbackup/kill1
+--- ANY marker/temp/hidden file? ---
+  total 3
+  drwxr-xr-x  3 root root  3 Aug 25 19:39 .
+  drwxr-xr-x 15 root root 16 Aug 25 19:39 ..
+  drwxr-xr-x  2 root root  5 Aug 25 19:39 part
+--- xattrs on the partial file? ---
+LAST=/gtbackup/kill1/part/f2.bin
+  size=2129920 alloc=1*512 name=/gtbackup/kill1/part/f2.bin
+
+############ K2: SIGTERM (not -9) mid-restore ############
+SIGTERM wait status=143
+progress 4% (12.409 MiB of 250.001 MiB in 5.9s, 2.09 MiB/s)    
+d 3 /gtbackup/kill2
+d 4 /gtbackup/kill2/part
+f 26214400 /gtbackup/kill2/part/f1.bin
+f 16711680 /gtbackup/kill2/part/f10.bin
+
+############ K3: PBS stopped MID-restore ############
+--- stopping PBS now ---
+### restore exit=255
+progress 4% (12.409 MiB of 250.001 MiB in 5.9s, 2.094 MiB/s)    
+progress 17% (43.939 MiB of 250.001 MiB in 16.1s, 3.09 MiB/s)    
+HTTP/2.0 connection failed
+Error: error extracting archive - encountered unexpected error during extraction: error at entry "f2.bin": failed to extract file: failed to copy file contents: connection closed because of a broken pipe
+--- target after the server died ---
+d 3 /gtbackup/kill3
+d 5 /gtbackup/kill3/part
+f 26214400 /gtbackup/kill3/part/f1.bin
+f 26214400 /gtbackup/kill3/part/f10.bin
+f 2134016 /gtbackup/kill3/part/f2.bin
+active
+
+############ K4: kill -9 mid .img restore to a file ############
+/root/gt-backup2/23-interrupt.sh: line 61: kill: (367338) - No such process
+restore complete (512 MiB processed in 0.4s, average 1.337 GiB/s)    
+-rw-r--r-- 1 root root 536870912 Aug 25 19:40 /gtbackup/images/killimg.raw
+size=536870912 blocks=17
+  head24: ANAS-GT-IMG-FILE-HEAD-v1

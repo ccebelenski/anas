@@ -1,0 +1,81 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: --ignore-acls / -xattrs / -ownership / -permissions into a FRESH target
+# COMMAND LOG: 04-ignore-fresh.sh
+# ==============================================================================
+
+=== baseline (no ignore flags)   flags:  ===
+restore complete (2.546 KiB processed in <0.1s, average 1.07 MiB/s)    
+### exit=0
+-rw-rw-r--+ 1    0    0 13 Aug 25 19:16 /gtbackup/f0/acl-xattr.txt
+-rw-r-----  1 1000 1000 22 Aug 25 19:16 /gtbackup/f0/beta.txt
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/f0/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+=== --ignore-acls   flags: --ignore-acls true ===
+restore complete (2.546 KiB processed in <0.1s, average 2.209 MiB/s)    
+### exit=0
+-rw-rw-r-- 1    0    0 13 Aug 25 19:16 /gtbackup/f1/acl-xattr.txt
+-rw-r----- 1 1000 1000 22 Aug 25 19:16 /gtbackup/f1/beta.txt
+user::rw-
+group::rw-
+other::r--
+
+# file: /gtbackup/f1/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+=== --ignore-xattrs   flags: --ignore-xattrs true ===
+restore complete (2.546 KiB processed in <0.1s, average 1.974 MiB/s)    
+### exit=0
+-rw-rw-r--+ 1    0    0 13 Aug 25 19:16 /gtbackup/f2/acl-xattr.txt
+-rw-r-----  1 1000 1000 22 Aug 25 19:16 /gtbackup/f2/beta.txt
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+
+=== --ignore-ownership   flags: --ignore-ownership true ===
+restore complete (2.546 KiB processed in <0.1s, average 1.63 MiB/s)    
+### exit=0
+-rw-rw-r--+ 1 0 0 13 Aug 25 19:16 /gtbackup/f3/acl-xattr.txt
+-rw-r-----  1 0 0 22 Aug 25 19:16 /gtbackup/f3/beta.txt
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/f3/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+
+=== --ignore-permissions   flags: --ignore-permissions true ===
+restore complete (2.546 KiB processed in <0.1s, average 2.459 MiB/s)    
+### exit=0
+-rw-rw-r--+ 1    0    0 13 Aug 25 19:16 /gtbackup/f4/acl-xattr.txt
+-rw-------  1 1000 1000 22 Aug 25 19:16 /gtbackup/f4/beta.txt
+user::rw-
+user:nobody:rw-
+group::r--
+mask::rw-
+other::r--
+
+# file: /gtbackup/f4/acl-xattr.txt
+user.anas.gt="gtvalue1"
+
+

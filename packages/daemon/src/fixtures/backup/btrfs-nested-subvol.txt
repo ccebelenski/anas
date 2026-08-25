@@ -1,0 +1,240 @@
+# ==============================================================================
+# ANAS story backup2.1 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve,
+# ZFS 2.4.3-pve1, btrfs-progs 6.14, fuse3 3.17.2-3. Captured 2026-08-25.
+# Datastore anastest-store (dir-backed), namespace gtrestore, pool gtbackup.
+# Nothing was edited: these are the exact bytes the commands produced.
+# ==============================================================================
+# CAPTURE: btrfs nested subvolumes under a read-only snapshot (AHR shape)
+# COMMAND LOG: 19-btrfs.sh
+# ==============================================================================
+
+############ AHR / BTRFS NESTED SUBVOLUMES UNDER A RO SNAPSHOT ############
+=== set up a 2 GiB loop-backed btrfs (my own; /var/tmp/gtbtrfs.img) ===
+LOOP=/dev/loop0  (mine; the other agent's loop files are untouched)
+### $ mkfs.btrfs -q -L GTBTRFS /dev/loop0
+### exit=0
+
+### $ mount /dev/loop0 /mnt/gtbtrfs
+### exit=0
+
+### $ btrfs --version
+btrfs-progs v6.14
+-EXPERIMENTAL -INJECT -STATIC +LZO +ZSTD +UDEV +FSVERITY +ZONED CRYPTO=builtin
+### exit=0
+
+
+=== create subvol @data, a NESTED subvol photos inside it, and a plain dir ===
+### $ btrfs subvolume create /mnt/gtbtrfs/@data
+Create subvolume '/mnt/gtbtrfs/@data'
+### exit=0
+
+### $ btrfs subvolume create /mnt/gtbtrfs/@data/photos
+Create subvolume '/mnt/gtbtrfs/@data/photos'
+### exit=0
+
+### $ btrfs subvolume list /mnt/gtbtrfs
+ID 256 gen 9 top level 5 path @data
+ID 257 gen 9 top level 256 path @data/photos
+### exit=0
+
+
+=== take a READ-ONLY snapshot of @data ===
+### $ btrfs subvolume snapshot -r /mnt/gtbtrfs/@data /mnt/gtbtrfs/snap1
+Create readonly snapshot of '/mnt/gtbtrfs/@data' in '/mnt/gtbtrfs/snap1'
+### exit=0
+
+### $ btrfs subvolume list /mnt/gtbtrfs
+ID 256 gen 10 top level 5 path @data
+ID 257 gen 9 top level 256 path @data/photos
+ID 258 gen 10 top level 5 path snap1
+### exit=0
+
+
+=== is snap1/photos EMPTY? ===
+### $ ls -la /mnt/gtbtrfs/snap1
+total 20
+drwxr-xr-x 1 root root 42 Aug 25 19:34 .
+drwxr-xr-x 1 root root 20 Aug 25 19:34 ..
+drwxr-xr-x 1 root root  0 Aug 25 19:34 photos
+drwxr-xr-x 1 root root 10 Aug 25 19:34 plaindir
+-rw-r--r-- 1 root root 15 Aug 25 19:34 top.txt
+### exit=0
+
+### $ ls -la /mnt/gtbtrfs/snap1/photos
+total 0
+drwxr-xr-x 1 root root  0 Aug 25 19:34 .
+drwxr-xr-x 1 root root 42 Aug 25 19:34 ..
+### exit=0
+
+  entries under snap1/photos: 0
+### $ find /mnt/gtbtrfs/snap1 -printf %y %s %p\n
+d 42 /mnt/gtbtrfs/snap1
+d 0 /mnt/gtbtrfs/snap1/photos
+d 10 /mnt/gtbtrfs/snap1/plaindir
+f 15 /mnt/gtbtrfs/snap1/plaindir/p.txt
+f 15 /mnt/gtbtrfs/snap1/top.txt
+### exit=0
+
+
+=== stat -c %d (st_dev) for each ===
+### $ stat -c %d %i %n /mnt/gtbtrfs /mnt/gtbtrfs/@data /mnt/gtbtrfs/@data/photos /mnt/gtbtrfs/@data/plaindir /mnt/gtbtrfs/snap1 /mnt/gtbtrfs/snap1/photos /mnt/gtbtrfs/snap1/plaindir
+65 256 /mnt/gtbtrfs
+66 256 /mnt/gtbtrfs/@data
+67 256 /mnt/gtbtrfs/@data/photos
+66 257 /mnt/gtbtrfs/@data/plaindir
+68 256 /mnt/gtbtrfs/snap1
+64 2 /mnt/gtbtrfs/snap1/photos
+68 257 /mnt/gtbtrfs/snap1/plaindir
+### exit=0
+
+--- findmnt around the btrfs mount ---
+### $ findmnt -R /mnt/gtbtrfs -o TARGET,SOURCE,FSTYPE,OPTIONS
+TARGET       SOURCE     FSTYPE OPTIONS
+/mnt/gtbtrfs /dev/loop0 btrfs  rw,relatime,discard=async,space_cache=v2,subvolid=5,subvol=/
+### exit=0
+
+--- btrfs subvolume show ---
+### $ btrfs subvolume show /mnt/gtbtrfs/@data
+@data
+	Name: 			@data
+	UUID: 			b63a5c58-66a6-9a4f-8618-219d42d666fb
+	Parent UUID: 		-
+	Received UUID: 		-
+	Creation time: 		2026-08-25 19:34:20 +0000
+	Subvolume ID: 		256
+	Generation: 		10
+	Gen at creation: 	9
+	Parent ID: 		5
+	Top level ID: 		5
+	Flags: 			-
+	Send transid: 		0
+	Send time: 		2026-08-25 19:34:20 +0000
+	Receive transid: 	0
+	Receive time: 		-
+	Snapshot(s):
+				snap1
+	Quota group:		n/a
+### exit=0
+
+### $ btrfs subvolume show /mnt/gtbtrfs/snap1
+snap1
+	Name: 			snap1
+	UUID: 			fe5ff61e-0b50-e340-a2e6-8437f2fc69c5
+	Parent UUID: 		b63a5c58-66a6-9a4f-8618-219d42d666fb
+	Received UUID: 		-
+	Creation time: 		2026-08-25 19:34:20 +0000
+	Subvolume ID: 		258
+	Generation: 		10
+	Gen at creation: 	10
+	Parent ID: 		5
+	Top level ID: 		5
+	Flags: 			readonly
+	Send transid: 		0
+	Send time: 		2026-08-25 19:34:20 +0000
+	Receive transid: 	0
+	Receive time: 		-
+	Snapshot(s):
+	Quota group:		n/a
+### exit=0
+
+### $ btrfs subvolume show /mnt/gtbtrfs/snap1/photos
+ERROR: Not a Btrfs subvolume: Invalid argument
+### exit=1
+
+
+=== BACK UP snap1 with the client (pxar, default mode) ===
+### $ proxmox-backup-client backup btr.pxar:/mnt/gtbtrfs/snap1 --ns gtrestore --backup-id gtbtrfs
+Starting backup: [gtrestore]:host/gtbtrfs/2026-08-25T19:34:20Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:34:20 2026    
+No previous manifest available.    
+Upload directory '/mnt/gtbtrfs/snap1' to 'root@pam!anas-test@localhost:8007:anastest-store' as btr.pxar.didx    
+skipping mount point: "photos"
+btr.pxar: had to backup 652 B of 652 B (compressed 275 B) in 0.01 s (average 80.536 KiB/s)
+Uploaded backup catalog (88 B)
+Duration: 0.08s    
+End Time: Tue Aug 25 19:34:20 2026    
+### exit=0
+
+=== catalog dump: is photos an EMPTY DIR? ===
+SNAP=host/gtbtrfs/2026-08-25T19:34:20Z
+### $ proxmox-backup-client catalog dump 'host/gtbtrfs/2026-08-25T19:34:20Z' --ns gtrestore
+d "./btr.pxar.didx"    
+d "./btr.pxar.didx/photos"    
+d "./btr.pxar.didx/plaindir"    
+f "./btr.pxar.didx/plaindir/p.txt" 15 2026-08-25T19:34:20Z    
+f "./btr.pxar.didx/top.txt" 15 2026-08-25T19:34:20Z    
+### exit=0
+
+
+=== BACK UP the LIVE @data too (same question, live) ===
+### $ proxmox-backup-client backup btrlive.pxar:/mnt/gtbtrfs/@data --ns gtrestore --backup-id gtbtrfslive
+Starting backup: [gtrestore]:host/gtbtrfslive/2026-08-25T19:34:20Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:34:20 2026    
+No previous manifest available.    
+Upload directory '/mnt/gtbtrfs/@data' to 'root@pam!anas-test@localhost:8007:anastest-store' as btrlive.pxar.didx    
+skipping mount point: "photos"
+btrlive.pxar: had to backup 652 B of 652 B (compressed 274 B) in 0.00 s (average 209.584 KiB/s)
+Uploaded backup catalog (92 B)
+Duration: 0.04s    
+End Time: Tue Aug 25 19:34:20 2026    
+### exit=0
+
+### $ proxmox-backup-client catalog dump 'host/gtbtrfslive/2026-08-25T19:34:20Z' --ns gtrestore
+d "./btrlive.pxar.didx"    
+d "./btrlive.pxar.didx/photos"    
+d "./btrlive.pxar.didx/plaindir"    
+f "./btrlive.pxar.didx/plaindir/p.txt" 15 2026-08-25T19:34:20Z    
+f "./btrlive.pxar.didx/top.txt" 15 2026-08-25T19:34:20Z    
+### exit=0
+
+
+=== --all-file-systems on the live @data ===
+### $ proxmox-backup-client backup btrall.pxar:/mnt/gtbtrfs/@data --ns gtrestore --backup-id gtbtrfsall --all-file-systems
+Starting backup: [gtrestore]:host/gtbtrfsall/2026-08-25T19:34:20Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:34:20 2026    
+No previous manifest available.    
+Upload directory '/mnt/gtbtrfs/@data' to 'root@pam!anas-test@localhost:8007:anastest-store' as btrall.pxar.didx    
+btrall.pxar: had to backup 1.163 KiB of 1.163 KiB (compressed 421 B) in 0.01 s (average 119.217 KiB/s)
+Uploaded backup catalog (146 B)
+Duration: 0.07s    
+End Time: Tue Aug 25 19:34:20 2026    
+### exit=0
+
+### $ proxmox-backup-client catalog dump 'host/gtbtrfsall/2026-08-25T19:34:20Z' --ns gtrestore
+d "./btrall.pxar.didx"    
+d "./btrall.pxar.didx/photos"    
+f "./btrall.pxar.didx/photos/one.jpg" 10 2026-08-25T19:34:20Z    
+d "./btrall.pxar.didx/photos/sub"    
+f "./btrall.pxar.didx/photos/sub/three.jpg" 17 2026-08-25T19:34:20Z    
+f "./btrall.pxar.didx/photos/two.jpg" 10 2026-08-25T19:34:20Z    
+d "./btrall.pxar.didx/plaindir"    
+f "./btrall.pxar.didx/plaindir/p.txt" 15 2026-08-25T19:34:20Z    
+f "./btrall.pxar.didx/top.txt" 15 2026-08-25T19:34:20Z    
+### exit=0
+
+
+=== --all-file-systems on the RO SNAPSHOT ===
+### $ proxmox-backup-client backup btrsnapall.pxar:/mnt/gtbtrfs/snap1 --ns gtrestore --backup-id gtbtrfssnapall --all-file-systems
+Starting backup: [gtrestore]:host/gtbtrfssnapall/2026-08-25T19:34:20Z    
+Client name: anas-pve    
+Starting backup protocol: Tue Aug 25 19:34:20 2026    
+No previous manifest available.    
+Upload directory '/mnt/gtbtrfs/snap1' to 'root@pam!anas-test@localhost:8007:anastest-store' as btrsnapall.pxar.didx    
+btrsnapall.pxar: had to backup 652 B of 652 B (compressed 275 B) in 0.01 s (average 86.675 KiB/s)
+Uploaded backup catalog (95 B)
+Duration: 0.06s    
+End Time: Tue Aug 25 19:34:20 2026    
+### exit=0
+
+### $ proxmox-backup-client catalog dump 'host/gtbtrfssnapall/2026-08-25T19:34:20Z' --ns gtrestore
+d "./btrsnapall.pxar.didx"    
+d "./btrsnapall.pxar.didx/photos"    
+d "./btrsnapall.pxar.didx/plaindir"    
+f "./btrsnapall.pxar.didx/plaindir/p.txt" 15 2026-08-25T19:34:20Z    
+f "./btrsnapall.pxar.didx/top.txt" 15 2026-08-25T19:34:20Z    
+### exit=0
+

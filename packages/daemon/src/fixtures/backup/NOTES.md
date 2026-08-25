@@ -5,7 +5,7 @@ Environment: `pve-manager/9.2.4`, kernel `7.0.14-4-pve`, Debian 13 (trixie),
 `proxmox-backup-client 4.2.3-1` and `proxmox-backup-server 4.2.3-1` (installed
 **on the stunt node itself** from the `pbs-no-subscription` trixie repo — coexists
 with PVE fine, listens on `:8007`). **The operator's real PBS boxes
-(10.0.0.96/10.0.0.97) were never touched.**
+were never touched.**
 
 These are the **exact bytes** `proxmox-backup-client` (pbc) produced. They exist to
 drive the stage-2 parser/schema/verdict work for Epic 16 (PBS file backup). No parser
@@ -345,3 +345,88 @@ own keep flags.
 8. **Task store = replication's `*-units.ts` pattern reapplied** (X-ANAS-Task comment,
    oneshot service + timer, `LimitNOFILE=1024`); the LOCAL-ONLY status reads the same
    systemd props the replication code already parses.
+
+---
+
+## Restore / mount / `.img` / continuity index (story `backup2.1`, captured 2026-08-25)
+
+Same disposable stunt PBS, **but the node has been upgraded since 16.1**: the client
+and server are now **`proxmox-backup-client` / `proxmox-backup-server` 4.2.5-1** (not
+4.2.3), on PVE `pve-manager/9.2.11`, kernel `7.0.14-12-pve`, ZFS `2.4.3-pve1`,
+`btrfs-progs v6.14`, `fuse3 3.17.2-3`. The write-up is
+**`docs/BACKUP-RESTORE-GROUND-TRUTH.md`** (facts GT-1 … GT-62 with a "Design impacts"
+section per story); this section is only the file index.
+
+**Every file below is a REAL CAPTURE** — verbatim stdout+stderr of the commands named
+in each file's header, unedited. **Nothing in this section is synthetic.** (The
+earlier Epic 16 sections above still stand as written; the only correction this
+capture forces on them is noted at the end.)
+
+> **Test topology.** New namespace **`gtrestore`** in the existing dir-backed
+> datastore `anastest-store`, reached with the existing API token
+> `root@pam!anas-test`. All source trees lived on a **new file-backed pool
+> `gtbackup`** (`/var/tmp/gtbackup.img`, 8 GiB, `acltype=posixacl xattr=sa`). The
+> btrfs test used a temporary loop-backed volume (`/var/tmp/gtbtrfs.img`) that was
+> destroyed afterwards. A temporary nft table `inet anasgt` (dropping tcp dport 8007)
+> was created and removed by the black-hole script only.
+
+### Text captures
+
+| File | What it is |
+|------|------------|
+| `restore-flag-matrix.txt` | **The in-place restore ladder.** 14 probes: no flags / `--allow-existing-dirs` / `--overwrite-files` / `--overwrite` / the three specific `--overwrite-*` / `--ignore-*`, each against a freshly drifted tree, with the full tree state after. Establishes that **`--allow-existing-dirs --overwrite` is the minimal in-place pair** and that `--overwrite` does NOT imply `--allow-existing-dirs`. Also: restore into a new empty dir, into a non-existent dir, and the archive-name suffix rules. |
+| `restore-ignore-flags.txt` | `--ignore-acls` / `--ignore-xattrs` / `--ignore-ownership` / `--ignore-permissions` against a **fresh** target, with `ls -ln` + `getfacl` + `getfattr` after each. |
+| `restore-pattern-matrix.txt` | **`--pattern` semantics.** 27 probes (anchoring, `*` vs `**` vs `?`, char classes, directories, the empty dir, escaping `*`/`[`/space, multiple patterns, no match) + 11 disambiguation probes + a 7-probe capture over three files all named `alpha.txt` at three depths that proves **unanchored patterns match a path SUFFIX at any depth**. |
+| `restore-failure-taxonomy.txt` | 11 restore failure probes (missing snapshot/group/namespace/archive, bad suffix, no-match pattern, target-is-a-file, read-only target, server down, no-permission token) with verbatim `Error:` strings and exit codes; plus the 4.2.5 connect-error probes showing the **new `Caused by:` block that separates dns / tcp-refused / route / tls** (this supersedes the 16.1 "indistinguishable" finding, which was captured on 4.2.3). |
+| `restore-progress.txt` | The progress output of a rate-limited (3 MB/s) 250 MiB restore, timestamped per line, plus the same run under a pty with `cat -v` so the trailing `\r` is visible. Progress is on **stderr**, `\r`-terminated, and the interval **doubles** (6 s, 16 s, 36 s, 79 s) rather than being periodic. |
+| `restore-interrupted.txt` | `kill -9`, `SIGTERM`, and **PBS stopped mid-restore**, each with the partial target listed afterwards. Proves there is **no marker of any kind** on a partial restore — the only hint is that an in-flight file is short and mode `0600`. |
+| `snapshot-list-and-catalog.txt` | The point-in-time picker's read: `snapshot list` (namespace form, group form, human table, json-pretty), `list`, `snapshot files`, and `catalog dump` — including `catalog dump --output-format json` being **rejected outright**. |
+| `catalog-shell-and-manifest.txt` | Proof that `catalog dump` writes to **stderr** (0 bytes on stdout, 971 on stderr); **`catalog shell` driven non-interactively over a pipe** (`ls`/`find`/`select`/`restore-selected`/`stat`) — a complete non-FUSE archive browser; the raw `index.json` manifest; in-place single-file restores; and `catalog shell`/`mount` across default / metadata / `.img` archives. |
+| `fuse-mount-lifecycle.txt` | `mount` daemonizing (PPID 1), the `findmnt` line and mount options, what the FUSE view carries (xattrs yes, **POSIX ACLs no**, hardlinks report `Links: 1`), clean `fusermount3 -u`, and `kill -9` of the client → stale mount that fails fast with `Transport endpoint is not connected`. |
+| `fuse-server-stopped.txt` | The mount with the PBS server **stopped**: fast `EIO` (~8 ms), and it **never recovers** after the server returns. Includes the 2.5 KiB-archive run that was inconclusive (fully cached) and the 250 MiB run that settled it. Also shows `stat -f` returning **exit 0 on a dead mount** — the `mounts.ts` liveness probe does not transfer. |
+| `fuse-hang-trap-blackhole.txt` | **The headline capture.** PBS running but `tcp dport 8007` dropped: `ls` goes to `D`/`request_wait_answer` and **`timeout 5` cannot kill it** (still alive 7 s after SIGTERM was due); `fusermount3 -u` → EBUSY; `fusermount3 -uz` detaches the mount but leaves the reader stuck; only `echo 1 > /sys/fs/fuse/connections/<st_dev>/abort` frees everything. |
+| `img-backup.txt` | `.img` archives from a **regular sparse file** (accepted directly — no `losetup` needed) and from a **zvol device**, both in one snapshot; first-run vs unchanged vs 24-bytes-changed reuse lines (4 MiB fixed chunks); `--change-detection-mode=metadata` shown to be a **no-op** for images; `catalog dump` refusing an `.img` snapshot. |
+| `img-restore-and-map.txt` | **`restore` refusing every existing `.img` target** — regular file, zvol symlink, and resolved `/dev/zdNN` — with `--overwrite` making no difference; the two paths that DO work (`restore … -` redirected onto the device, and `map` + `dd`); `map`/`unmap` incl. `unmap` with no argument as the sweep; `blkid -p` / `lsblk` / `mount -o ro` on a mapped ext4 image; and the **destructive** size-mismatch failure (`No space left on device`, target half-overwritten) in both directions. |
+| `zvol-snapdev.txt` | `snapdev` default (`hidden`, node absent), `snapdev=visible` with the node appearing ~10 ms after `zfs set` returns (44 ms → 54 ms → `udevadm settle` at 64 ms), the node's read-only-ness, backing up a zvol **snapshot device** and proving it is a stable point-in-time view, and the fact that `zfs set snapdev=hidden` leaves `source=local` (only `zfs inherit` restores `default`). |
+| `change-detection-continuity.txt` | **The 10 TB question, settled.** 2000-file dataset, same backup-id + archive name: live → live-unchanged → **root switched to `.zfs/snapshot/s1`** → same snapshot again → a second snapshot with one file touched → back to live; plus the same live→snapshot comparison in **default** mode, and the inode/`st_dev`/mtime comparison that explains it. Run 3 reports **`2000 unchanged, reusable files`** and **`had to backup 0 B`** — the metadata reference survives the root switch. |
+| `btrfs-nested-subvol.txt` | The AHR shape on a loop-backed btrfs: subvol `@data` with a nested subvol `photos` and a plain dir; `btrfs subvolume snapshot -r` leaving **`snap1/photos` EMPTY**; `stat -c %d` per entry (the placeholder reports the fs-root `st_dev` and inode 2); the client's `skipping mount point: "photos"` line; and the proof that **`--all-file-systems` rescues the LIVE subvolume but cannot rescue the read-only snapshot**. |
+
+### JSON captures (`--output-format json-pretty`, unedited)
+
+| File | What it is |
+|------|------------|
+| `snapshot-list-group.json` | `snapshot list <type>/<id> --ns <ns>` — one group. Note there is **no `snapshot` field**: the caller composes `<backup-type>/<backup-id>/<RFC3339 backup-time>`. |
+| `snapshot-list-namespace.json` | `snapshot list --ns <ns>` — every group in the namespace, same element shape, **not sorted by `backup-time`**. |
+| `group-list.json` | `list --ns <ns>` — the group listing, whose `files` is an array of **strings** (vs objects in `snapshot list`). |
+| `snapshot-files-pxar.json` | `snapshot files` for a default-mode pxar snapshot (`data.pxar.didx` + `catalog.pcat1.didx` + `index.json.blob`). |
+| `snapshot-files-metadata.json` | The same for a metadata-mode snapshot (`cdm.mpxar.didx` + `cdm.ppxar.didx`, **no catalog file**). |
+| `snapshot-files-img.json` | The same for an `.img` snapshot (`lun.img.fidx` + `vol.img.fidx`, `size` = the **full logical device size**). |
+| `index-json-manifest.json` | The raw manifest, read with `restore <snap> index.json.blob -`. Carries a `csum` per file and `unprotected.chunk_upload_stats`; `index.json.blob` is **not** in its own `files` array. |
+
+### Handles left on the node (unchanged from 16.1 unless noted)
+
+- PBS `:8007`, datastore `anastest-store` (`/testpool/pbs-store`), namespaces
+  `anastest` (16.1/16.11) and **`gtrestore` (new, backup2.1)**.
+- **Secrets stay in `/root/anas-pbs-test-handles.txt` (0600, root-only)** — never in
+  the repo. That file was updated with the 4.2.5 version note and the new namespace.
+- Left in place for later stories: pool **`gtbackup`** (file-backed,
+  `/var/tmp/gtbackup.img`) with `gtbackup/data` (the awkward-names source tree),
+  `gtbackup/cdm` (2000-file continuity dataset + snapshots `s1`/`s2`/`s3`),
+  `gtbackup/images/lun.raw` (512 MiB sparse image) and the zvol `gtbackup/vol1`
+  (+ snapshot `@s1`); the `gtrestore` namespace's groups `gtrestore`, `gtdup`,
+  `gtbig`, `gtimg`, `gtimgvol`, `gtimgboth`, `gtimgfs`, `gtsnapdev`, `gtcdm`,
+  `gtcdmdef`, `gtbtrfs`, `gtbtrfslive`, `gtbtrfsall`, `gtbtrfssnapall`.
+- Removed after the capture: the loop-backed btrfs (`/var/tmp/gtbtrfs.img`), all
+  FUSE mounts, all `map` loop devices, the temporary nft table, and every restore
+  target directory.
+
+### Correction this capture forces on the sections above
+
+**§3's shorthand "metadata → … **NO catalog**" is about the stored
+`catalog.pcat1.didx` FILE only.** `catalog dump` and `catalog shell` both work fine on
+a metadata-mode snapshot (they read the `.mpxar`) — see
+`catalog-shell-and-manifest.txt`. And **§6's "pbc cannot tell dns from tcp from
+route" was true on 4.2.3 but is no longer true on 4.2.5**, which appends a `Caused
+by:` block naming `dns error:` / `tcp connect error: Connection refused` / `tcp
+connect error: deadline has elapsed` — see `restore-failure-taxonomy.txt`. Neither
+finding changes any shipped ruling; both are recorded so they are not re-derived.
