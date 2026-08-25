@@ -191,7 +191,7 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `PUT` | `/v1/pools/:name/datasets/*path` | Update dataset properties | `202` with job |
 | `DELETE` | `/v1/pools/:name/datasets/*path` | Destroy a dataset | `202`/`409` |
 
-**Volumes (iscsi epic, 2026-08-25):** a dataset of `type: volume` is first-class in the same resource — `POST` accepts `{type: 'volume', volsize, volblocksize, sparse}`; `PUT` may grow `volsize` (live under a LUN — the initiator rescans) but a shrink, a rename, or a rollback of a volume referenced by a LUN is refused (ZFS lets all three through silently). Volumes have no mountpoint and cannot be shared; PVE-owned `vm-*` zvols stay hands-off.
+**Volumes (iscsi epic, 2026-08-25):** a dataset of `type: volume` is first-class in the same resource — `POST` accepts `{type: 'volume', volsize, volblocksize, sparse}`; `PUT` may grow `volsize` — carried under `properties` like every other ZFS property (`zfs set volsize=`) — (live under a LUN — the initiator rescans) but a shrink, a rename, or a rollback of a volume referenced by a LUN is refused (ZFS lets all three through silently). Volumes have no mountpoint and cannot be shared; PVE-owned `vm-*` zvols stay hands-off.
 
 #### ZFS Snapshots (nested under datasets)
 
