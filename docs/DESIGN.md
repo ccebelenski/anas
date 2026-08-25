@@ -312,6 +312,8 @@ The fd cap (default 1024, per-task override) binds pbc via `prlimit --nofile=N:N
 |--------|------|-------------|----------|
 | `GET` | `/v1/backup/tasks/:name/snapshots` | Points in time for the task's group (`snapshot list --output-format json`; ANAS composes `<type>/<id>/<RFC3339>` — the client's JSON has no `snapshot` field and is unsorted; `files[].size` is the restore space estimate) | `200` |
 | `GET` | `/v1/backup/repos/:name/groups?ns=` | Task-less entry point: groups (and their snapshots on `?group=`) in a repository/namespace — archives whose task was renamed or deleted | `200` |
+| `GET` | `/v1/backup/tasks/:name` (phase 2 addition) | Task detail gains, per archive, `nested[]` `{path, relativePath, kind, included, source, fstype, detail}` — the nested filesystems currently under the source and whether `includeNested` covers each; absent (not `[]`) when the scan could not run | `200` |
+| `POST` | `/v1/backup/tasks/preview-nested` | `{path}` or `{archives[]}` → the nested-filesystem scan the wizard shows before save (user-initiated, no PBS contact; the save-time-verify pattern) | `200` |
 | `POST` | `/v1/backup/restore/browse` | `{repo, ns, snapshot, archive, path}` → one directory level of the archive via **`catalog shell` over a pipe** (never FUSE: a black-holed server leaves FUSE readers in D state that `timeout` cannot kill and `stat -f` calls the mount healthy). Hardlink groups are returned as one unit | `200` |
 | `POST` | `/v1/backup/restore` | Files: `{…, selections[], target: {mode: sideBySide\|inPlace, path}, options: {ignoreOwnership, ignoreAcls, ignoreXattrs, ignorePermissions}}` → `restore --pattern` per selection (`/`-anchored, `\ * ? [ ]` escaped; hardlink groups together), `--allow-existing-dirs --overwrite` only for `inPlace` (a MERGE, never a sync); in-place TREE restore → `409` confirm; pre-flight write test + space check; the job verifies the restored set against the catalog (a no-match pattern is a silent client success). Image: `{…, kind: image, lun}` → target LUN disabled for the duration, manifest size must equal the target size (the client writes until ENOSPC otherwise), image streamed via `restore … -` into the device or `map` + `dd`, serial + attributes preserved, LUN re-enabled | `202`/`409` with job |
 
@@ -645,6 +647,7 @@ Users/groups are read **only** via `getent`/nsswitch (source-agnostic — local,
 
 ### Backup restore operations (proxmox-backup-client — backup2 epic)
 
+- nested-filesystem detection (backup2.2): `timeout <s> find -P <path> -xdev -maxdepth N -type d -printf '%D\t%p\n'` (our own machine format — no structured tool walks `st_dev`), `findmnt --json`, `btrfs subvolume show <path>`; the backup call gains `--include-dev <path>` per included boundary — **`includeNested: all` is resolved at run time into per-archive `--include-dev` paths; `--all-file-systems` is never emitted** (it is per-invocation and would spill onto sibling archives)
 - `proxmox-backup-client snapshot list --output-format json`, `list`
 - `proxmox-backup-client catalog shell <snap> <archive>` driven over a pipe (`ls`, `stat`, `find`) — the archive browser; never `mount` (FUSE)
 - `proxmox-backup-client restore <snap> <archive> <target|-> [--pattern …] [--allow-existing-dirs --overwrite] [--ignore-*] [--rate]`
