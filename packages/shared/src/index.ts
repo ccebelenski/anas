@@ -184,6 +184,39 @@ export {
   UpdateGroupMembersRequest,
 } from './schemas/identity.js'
 
+// iSCSI schemas (iscsi epic — LIO block storage, target side only)
+export {
+  ANAS_IQN_AUTHORITY_LABEL,
+  anasIqn,
+  anasIqnAuthority,
+  anasTargetName,
+  isAnasIqn,
+  ISCSI_BACKSTORE_PLUGINS,
+  IscsiAcl,
+  IscsiAvailability,
+  IscsiForeignChange,
+  IscsiForeignChangeKind,
+  IscsiHealth,
+  IscsiIqn,
+  IscsiLun,
+  IscsiLunAttributes,
+  IscsiLunKind,
+  IscsiMissingLun,
+  IscsiOwnership,
+  IscsiOwnershipReason,
+  IscsiOwnershipTag,
+  IscsiPortal,
+  IscsiPortalWithoutInterface,
+  IscsiSession,
+  IscsiSessionConnection,
+  IscsiSessionList,
+  IscsiTargetDetail,
+  IscsiTargetList,
+  IscsiTargetName,
+  IscsiTargetSecurity,
+  IscsiTargetSummary,
+} from './schemas/iscsi.js'
+
 // Job schemas
 export {
   Job,
