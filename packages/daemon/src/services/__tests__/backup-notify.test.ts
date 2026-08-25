@@ -133,6 +133,34 @@ describe('backup notifications — the body (16.12)', () => {
     assert.ok(body.includes('Backup succeeded, but the retention prune did not run: ENOENT'))
   })
 
+  it('the body names the filesystem boundaries the run actually crossed (backup2.2)', () => {
+    // What `all` RESOLVED to is a per-run fact, so the mail states it rather
+    // than leaving the reader to infer it from the task config.
+    const body = buildBackupNotifyBody({
+      task: makeTask(),
+      repo: REPO,
+      result: {
+        status: 'success',
+        archives: [ARCHIVE_LINE],
+        includedNested: { pool: ['/mnttest/data', '/mnttest/data/deep'] },
+      },
+    })
+    assert.match(body, /Nested filesystems crossed:/)
+    assert.ok(body.includes('  pool: /mnttest/data'))
+    assert.ok(body.includes('  pool: /mnttest/data/deep'))
+    // Crossing a boundary is not a warning — a clean run stays a clean run.
+    assert.match(body, /Result:\s+success/)
+  })
+
+  it('a run that crossed nothing says nothing about boundaries', () => {
+    const body = buildBackupNotifyBody({
+      task: makeTask(),
+      repo: REPO,
+      result: { status: 'success', archives: [ARCHIVE_LINE] },
+    })
+    assert.ok(!body.includes('Nested filesystems crossed'))
+  })
+
   it('a failure body carries the error text verbatim', () => {
     const body = buildBackupNotifyBody({
       task: makeTask(),

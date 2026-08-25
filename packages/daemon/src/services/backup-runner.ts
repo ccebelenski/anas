@@ -1,10 +1,12 @@
-import type { BackupPruneResult, BackupRepo, BackupRepoTestResult, BackupTask } from '@anas/shared'
+import type { BackupNestedScan, BackupPruneResult, BackupRepo, BackupRepoTestResult, BackupTask } from '@anas/shared'
 import type { PeerCertificate } from 'node:tls'
 import type { CommandExecutor } from '../executor/types.js'
 import { lookup } from 'node:dns/promises'
 import { createConnection, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
+import { effectiveIncludeNested } from '@anas/shared'
 import { backupTargetLine } from './backup-notify.js'
+import { nestedRunWarnings, resolveNestedIncludes, scanArchives } from './nested-filesystems.js'
 
 /**
  * Backup RUNNER logic (Epic 16.7) — assembles the pbc environment + argv,
@@ -24,6 +26,12 @@ import { backupTargetLine } from './backup-notify.js'
 
 export const PBC = '/usr/bin/proxmox-backup-client'
 export const PRLIMIT = '/usr/bin/prlimit'
+/**
+ * Wall-clock budget for the run-time boundary scan. Generous next to a backup
+ * (which is minutes to hours) and still bounded — a truncated scan says so in
+ * the warnings rather than pretending it found nothing.
+ */
+export const NESTED_SCAN_RUN_TIMEOUT_S = 60
 
 /** Per-archive stats / reuse line (parse by the filename token, not position). */
 const ARCHIVE_LINE_RE = /^\S+\.(?:pxar|mpxar|ppxar):\s/
@@ -31,6 +39,18 @@ const ARCHIVE_LINE_RE = /^\S+\.(?:pxar|mpxar|ppxar):\s/
 const NOFILE_WARNING_RE = /resource limit for open file handles low:\s*\d+/
 /** The group line: `Starting backup: [ns]:host/<backup-id>/<ISO-timestamp>`. */
 const STARTING_RE = /^Starting backup:/
+/**
+ * `Upload directory '<root>' to '<repo>' as <name>.pxar.didx` — the line that
+ * says which archive the following skip lines belong to (real capture:
+ * `backup-multi-archive.txt`, `btrfs-nested-subvol.txt`).
+ */
+const UPLOAD_DIR_RE = /^Upload directory '(.+?)' to '.*' as (\S+?)\.(?:pxar|mpxar|ppxar)\.didx$/
+/**
+ * The client's own boundary report: `skipping mount point: "<path>"` — quoted,
+ * unescaped, ARCHIVE-ROOT-RELATIVE, one per omitted filesystem (GT-54). This is
+ * the SECONDARY signal; ANAS's own st_dev walk is the authoritative one.
+ */
+const SKIPPING_MOUNT_RE = /^skipping mount point:\s*"(.*)"\s*$/
 const DURATION_RE = /^Duration:/
 /** The benign 1-second-resolution collision from a Run-Now just after a run. */
 const TOO_SOON_RE = /backup timestamp is older than last backup/i
@@ -40,6 +60,10 @@ const OWNER_MISMATCH_RE = /backup owner check failed/i
 const TRAILING_WS_RE = /\s+$/
 /** Leading `sha256:`/`sha256=` prefix stripped when normalizing a fingerprint. */
 const SHA256_PREFIX_RE = /^sha256[:=]?/i
+/** Trailing slashes on an archive root (joining a client skip path onto it). */
+const TRAILING_SLASHES_RE = /\/+$/
+/** Leading slashes on the client's archive-relative skip path. */
+const LEADING_SLASHES_RE = /^\/+/
 
 // Test-verdict discriminators (verbatim pbc `Error:` strings; NOTES §6).
 const DATASTORE_RE = /no such datastore/i
@@ -81,14 +105,37 @@ export function buildBackupEnv(repo: BackupRepo, secret: string): Record<string,
  * The pbc `backup` argv (no secrets — those are env-only). Archives become
  * `<name>.pxar:<path>` args in order; each archive's excludes become `--exclude
  * <pattern>` (pbc applies --exclude across the whole invocation); then
- * `--backup-id`, optional `--ns`, and the metadata mode flag.
+ * `--backup-id`, optional `--ns`, the metadata mode flag, and the
+ * nested-filesystem flags (backup2.2).
+ *
+ * `includeNested` reaches pbc in exactly ONE form — `--include-dev <path>`:
+ *   `none`     → no flag (the client's own behaviour: one filesystem only)
+ *   `[paths]`  → one `--include-dev` per stored path
+ *   `all`      → one `--include-dev` per boundary the run-time scan RESOLVED
+ *                for that archive (`resolveNestedIncludes`), passed here in
+ *                `resolvedNested`
+ *
+ * **`--all-file-systems` is never emitted.** It is a per-INVOCATION flag and
+ * ANAS puts every archive of a task in one `backup` call, so it would silently
+ * apply one archive's choice to all the others — the per-archive control the
+ * wizard shows would not be the contract pbc receives. Resolving `all` into
+ * explicit paths says the same thing with the intended scope and leaves the
+ * other archives alone.
+ *
+ * Paths are deduplicated across archives (two archives naming the same boundary
+ * are one device to pbc), and emitted in a stable sorted order so the same task
+ * always produces the same argv.
  *
  * `namespace` overrides the task's when supplied — the caller resolves the
  * EFFECTIVE namespace (task's, else the repo's) so a repo that already carries a
  * namespace (e.g. a PVE-defined `pbs` storage with `namespace anastest`) needs
  * zero re-entry on the task, matching the test path which probes `repo.namespace`.
  */
-export function buildBackupArgs(task: BackupTask, namespace?: string): string[] {
+export function buildBackupArgs(
+  task: BackupTask,
+  namespace?: string,
+  resolvedNested: Record<string, string[]> = {},
+): string[] {
   const args: string[] = ['backup']
   for (const a of task.archives)
     args.push(`${a.name}.pxar:${a.path}`)
@@ -102,6 +149,25 @@ export function buildBackupArgs(task: BackupTask, namespace?: string): string[] 
     args.push('--ns', ns)
   if (task.changeDetectionMode === 'metadata')
     args.push('--change-detection-mode=metadata')
+
+  const devs = new Set<string>()
+  for (const a of task.archives) {
+    const choice = effectiveIncludeNested(a)
+    // `all` is only ever as good as the scan that resolved it; with no resolution
+    // (a scan that failed, or a caller with nothing to hand over) the archive
+    // gets NO flag and the client default stands — never a guessed subset.
+    const paths = choice === 'all'
+      ? (resolvedNested[a.name] ?? [])
+      : (Array.isArray(choice) ? choice : [])
+    for (const p of paths)
+      devs.add(p)
+  }
+  // Sorted in place on an array we own, so the same task always yields the same
+  // argv (a stable argv keeps unit diffs and journald lines comparable).
+  const ordered = [...devs]
+  ordered.sort()
+  for (const p of ordered)
+    args.push('--include-dev', p)
   return args
 }
 
@@ -130,6 +196,18 @@ export function buildProbeArgs(namespace?: string): string[] {
 
 // --- STDERR progress parsing ------------------------------------------------
 
+/** One `skipping mount point:` line, attributed to the archive it followed. */
+export interface SkippedMountPoint {
+  /** The archive name from the preceding `Upload directory … as <name>` line. */
+  archive?: string
+  /** The archive root that line named (so the path can be made absolute). */
+  root?: string
+  /** The path pbc printed — relative to the archive root. */
+  relativePath: string
+  /** `<root>/<relativePath>` when the root is known; the relative path otherwise. */
+  path: string
+}
+
 export interface BackupProgress {
   /** The `Starting backup: …` group line, if seen. */
   target: string | null
@@ -141,6 +219,8 @@ export interface BackupProgress {
   nofileWarning: string | null
   /** The `Duration: …` line, if seen. */
   duration: string | null
+  /** Filesystem boundaries the CLIENT reported skipping (backup2.2, secondary). */
+  skipped: SkippedMountPoint[]
 }
 
 /** Parse pbc STDERR into the progress units (per-archive stats + summary block). */
@@ -151,14 +231,37 @@ export function parseBackupProgress(stderr: string): BackupProgress {
     changeDetectionSummary: [],
     nofileWarning: null,
     duration: null,
+    skipped: [],
   }
   const lines = stderr.split('\n')
   let inSummary = false
+  // Which archive the `skipping mount point:` lines below belong to: the client
+  // prints one `Upload directory … as <name>.pxar.didx` header per archive and
+  // the skips follow it (real capture, backup-multi-archive + btrfs-nested).
+  let currentArchive: string | undefined
+  let currentRoot: string | undefined
   for (const raw of lines) {
     const line = raw.replace(TRAILING_WS_RE, '')
     const trimmed = line.trim()
     if (!trimmed)
       continue
+    const upload = trimmed.match(UPLOAD_DIR_RE)
+    if (upload) {
+      currentRoot = upload[1]
+      currentArchive = upload[2]
+      continue
+    }
+    const skip = trimmed.match(SKIPPING_MOUNT_RE)
+    if (skip) {
+      const relativePath = skip[1]
+      progress.skipped.push({
+        ...(currentArchive ? { archive: currentArchive } : {}),
+        ...(currentRoot ? { root: currentRoot } : {}),
+        relativePath,
+        path: currentRoot ? joinUnder(currentRoot, relativePath) : relativePath,
+      })
+      continue
+    }
     if (STARTING_RE.test(trimmed))
       progress.target = trimmed
     if (NOFILE_WARNING_RE.test(trimmed))
@@ -181,6 +284,13 @@ export function parseBackupProgress(stderr: string): BackupProgress {
       progress.archiveStats.push(trimmed)
   }
   return progress
+}
+
+/** `<root>/<relative>` with exactly one separator (root may be `/`). */
+function joinUnder(root: string, relative: string): string {
+  const base = root.replace(TRAILING_SLASHES_RE, '')
+  const rel = relative.replace(LEADING_SLASHES_RE, '')
+  return `${base}/${rel}`
 }
 
 /** A compact one-liner for the job's `progress` field (never a secret). */
@@ -251,9 +361,19 @@ export interface BackupRunResult {
   prune?: BackupPruneResult
   /**
    * Completed-with-warning detail — a prune that failed AFTER a successful
-   * backup never fails the job (the data is safe); it rides here instead.
+   * backup never fails the job (the data is safe); it rides here instead, as do
+   * this story's nested-filesystem omissions (backup2.2). They flow verbatim
+   * into the 16.12 notification body and the task detail.
    */
   warnings?: string[]
+  /** The run-time boundary scan, per archive (backup2.2). */
+  nested?: BackupNestedScan[]
+  /**
+   * Archive name → the filesystem boundaries this run actually crossed (the
+   * `--include-dev` paths). What `all` RESOLVED to is a fact about the run, not
+   * about the config, so it is reported here rather than inferred from the task.
+   */
+  includedNested?: Record<string, string[]>
 }
 
 /**
@@ -270,10 +390,6 @@ export async function runBackup(
 ): Promise<BackupRunResult> {
   const { task, repo, secret } = deps
   const env = buildBackupEnv(repo, secret)
-  // Effective namespace: the task's if set, else the repo's (zero re-entry for a
-  // repo that already carries one, e.g. a PVE-defined storage). Mirrors the test
-  // path, which probes repo.namespace.
-  const args = buildBackupArgs(task, effectiveNamespace(task, repo))
 
   // The fd cap must bind pbc ITSELF: pbc execs inside anasd (nofile 524288 —
   // Node raises soft→hard), not in the task unit's cgroup, so the unit's
@@ -284,6 +400,31 @@ export async function runBackup(
   // Same un-doubled target rendering as the notification body (a pve-sourced
   // repo is NAMED pve:<datastore>, so a blind `:datastore` suffix duplicates).
   updateProgress(`starting backup ${task.name} -> ${backupTargetLine({ task, repo })}`)
+
+  // backup2.2 — the AUTHORITATIVE boundary pass, BEFORE the client runs. Our own
+  // st_dev walk is primary because it names what will be omitted (and can say a
+  // btrfs subvolume is one); the client's `skipping mount point:` lines below are
+  // the secondary confirmation. Both are captured and deduplicated by path.
+  // It is ALSO what makes `all` concrete: the walk descends through the
+  // boundaries an `all` archive is including, and every one it finds becomes an
+  // explicit `--include-dev` for THAT archive only.
+  // Fail-open: the scan never fails a backup — it only ever adds warnings.
+  const scanned = await scanArchives(executor, task.archives, { timeoutSeconds: NESTED_SCAN_RUN_TIMEOUT_S })
+  const resolution = resolveNestedIncludes(task.archives, scanned)
+  const scans = resolution.scans
+  const warnings: string[] = [...nestedRunWarnings(scans), ...resolution.warnings]
+
+  // Effective namespace: the task's if set, else the repo's (zero re-entry for a
+  // repo that already carries one, e.g. a PVE-defined storage). Mirrors the test
+  // path, which probes repo.namespace.
+  const args = buildBackupArgs(task, effectiveNamespace(task, repo), resolution.byArchive)
+
+  // Say on the record exactly which boundaries this run crossed — journald gets
+  // it from the job progress, and it rides the 16.12 notification body.
+  const includedNested = includedNestedOf(resolution.byArchive)
+  for (const [archive, paths] of Object.entries(includedNested))
+    updateProgress(`archive '${archive}': crossing ${paths.length} filesystem boundary/boundaries - ${paths.join(' ')}`)
+
   const r = await executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env })
 
   const progress = parseBackupProgress(r.stderr)
@@ -314,7 +455,59 @@ export async function runBackup(
     result.duration = progress.duration
   if (outcome.kind === 'too-soon')
     result.reason = 'snapshot timestamp collision (1-second resolution) - nothing new to back up yet'
+
+  // The SECONDARY signal: whatever the client itself reported skipping and our
+  // own walk did not already name. Deduplicated by absolute path so one
+  // omission is one warning, never two (backup2.2).
+  for (const line of skippedWarnings(progress.skipped, scans))
+    warnings.push(line)
+  if (scans.length)
+    result.nested = scans
+  if (Object.keys(includedNested).length)
+    result.includedNested = includedNested
+  if (warnings.length)
+    result.warnings = warnings
   return result
+}
+
+/** Drop the archives that cross nothing — an empty list is not a fact worth showing. */
+function includedNestedOf(byArchive: Record<string, string[]>): Record<string, string[]> {
+  const out: Record<string, string[]> = {}
+  for (const [archive, paths] of Object.entries(byArchive)) {
+    if (!paths.length)
+      continue
+    const ordered = [...paths]
+    ordered.sort()
+    out[archive] = ordered
+  }
+  return out
+}
+
+/**
+ * Turn the client's own `skipping mount point:` lines into warnings, DROPPING
+ * every one our detection already named (same absolute path). A skip line the
+ * walk missed is the interesting one — it means reality moved between the scan
+ * and the run, or the walk was truncated.
+ */
+export function skippedWarnings(
+  skipped: SkippedMountPoint[],
+  scans: BackupNestedScan[],
+): string[] {
+  const known = new Set<string>()
+  for (const scan of scans) {
+    for (const n of scan.nested)
+      known.add(n.path)
+  }
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const s of skipped) {
+    if (known.has(s.path) || seen.has(s.path))
+      continue
+    seen.add(s.path)
+    const who = s.archive ? `archive '${s.archive}'` : 'the backup'
+    out.push(`${who}: the client skipped mount point "${s.relativePath}" (${s.path}) - it was stored as an empty directory`)
+  }
+  return out
 }
 
 // --- Test-endpoint verdict (the pbc probe stage) ----------------------------

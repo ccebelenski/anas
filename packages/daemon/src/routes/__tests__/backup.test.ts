@@ -451,6 +451,293 @@ describe('backup routes (Epic 16)', () => {
     assert.match(secondData.detail, /Datastore\.Prune/)
   })
 
+  // ---- backup2.2: nested filesystems -------------------------------------
+  //
+  // The mock server already serves the mounts family's own `findmnt --json`
+  // tree, which carries a REAL nested pair: the pool `/mnttest` with the child
+  // dataset `/mnttest/data`. The walk is stubbed on its EXACT argv, so these
+  // tests also pin the command the daemon runs.
+
+  /** The exact `timeout <s> find …` argv the scan builds for a source path. */
+  function walkArgs(path: string, timeoutSeconds = 20, maxDepth = 12): string[] {
+    return [
+      String(timeoutSeconds),
+      '/usr/bin/find',
+      '-P',
+      path,
+      '-xdev',
+      '-maxdepth',
+      String(maxDepth),
+      '(',
+      '-name',
+      '.zfs',
+      ')',
+      '-prune',
+      '-o',
+      '-type',
+      'd',
+      '-printf',
+      '%D\\t%p\\n',
+    ]
+  }
+
+  /**
+   * The walk result for `/mnttest`: the pool root (dev 66) plus its child
+   * dataset (dev 67) — the shape the real capture produced for `/gtbackup`.
+   * Registered on the EXACT argv so it beats the mock server's generic
+   * `timeout … stat -f` liveness fixture.
+   */
+  function mockNestedWalk(timeoutSeconds = 20): void {
+    mockOf(server).addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/mnttest', timeoutSeconds),
+      result: { stdout: '66\t/mnttest\n66\t/mnttest/sub\n67\t/mnttest/data\n', stderr: '', exitCode: 0 },
+    })
+  }
+
+  /**
+   * The DESCENT an `all` choice needs: a second walk rooted at the boundary the
+   * first one found, one depth level shallower (the budget is shared). Here
+   * `/mnttest/data` has a further boundary of its own — the nested-inside-nested
+   * case `--include-dev` must be told about explicitly.
+   */
+  function mockNestedDescent(timeoutSeconds = 20): void {
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/mnttest/data', timeoutSeconds, 11),
+      result: { stdout: '67\t/mnttest/data\n68\t/mnttest/data/deep\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/mnttest/data/deep', timeoutSeconds, 10),
+      result: { stdout: '68\t/mnttest/data/deep\n', stderr: '', exitCode: 0 },
+    })
+  }
+
+  const NESTED_TASK = {
+    ...TASK,
+    name: 'pool-task',
+    archives: [{ name: 'pool', path: '/mnttest', excludes: [] }],
+  }
+
+  it('preview-nested scans a bare path and never contacts PBS (backup2.2)', async () => {
+    mockNestedWalk()
+    const mock = mockOf(server)
+    mock.calls.length = 0
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/preview-nested',
+      headers: JSON_HEADERS,
+      payload: { path: '/mnttest' },
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: { archives: Array<{ path: string, includeNested: unknown, nested: Array<Record<string, unknown>> }> } }
+    assert.equal(data.archives.length, 1)
+    assert.equal(data.archives[0].path, '/mnttest')
+    assert.equal(data.archives[0].includeNested, 'none')
+    assert.deepEqual(data.archives[0].nested, [{
+      path: '/mnttest/data',
+      relativePath: 'data',
+      kind: 'dataset',
+      source: 'mnttest/data',
+      fstype: 'zfs',
+      included: false,
+    }])
+    // The one PBS-contact rule: this endpoint never calls the client at all.
+    assert.ok(!mock.calls.some(c => c.command === PBC_CMD || c.command === '/usr/bin/prlimit'))
+    // And the walk really is the bounded, symlink-free, directory-only form.
+    const walk = mock.calls.find(c => c.command === '/usr/bin/timeout' && c.args.includes('-xdev'))
+    assert.deepEqual(walk?.args, walkArgs('/mnttest'))
+  })
+
+  it('preview-nested reports coverage per archive, against each own choice', async () => {
+    mockNestedWalk()
+    mockNestedDescent()
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/preview-nested',
+      headers: JSON_HEADERS,
+      payload: { archives: [
+        { name: 'none', path: '/mnttest' },
+        { name: 'all', path: '/mnttest', includeNested: 'all' },
+        { name: 'listed', path: '/mnttest', includeNested: ['/mnttest/data'] },
+      ] },
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: { archives: Array<{ archive: string, nested: Array<{ included: boolean }> }> } }
+    assert.deepEqual(data.archives.map(a => a.archive), ['none', 'all', 'listed'])
+    assert.equal(data.archives[0].nested[0].included, false)
+    assert.equal(data.archives[1].nested[0].included, true)
+    assert.equal(data.archives[2].nested[0].included, true)
+    // `all` DESCENDED: the wizard shows the nested-inside-nested one too, which
+    // `none` and a one-path list never needed to look for.
+    assert.equal(data.archives[0].nested.length, 1)
+    assert.equal(data.archives[2].nested.length, 1)
+  })
+
+  it('preview-nested with neither a path nor archives is a 400', async () => {
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/preview-nested', headers: JSON_HEADERS, payload: {} })
+    assert.equal(res.statusCode, 400)
+    assert.match((res.json() as { error: { message: string } }).error.message, /Send a path/)
+  })
+
+  it('the task detail reports what is nested under each source and whether it is covered', async () => {
+    await createRepo()
+    await createTaskPayload(NESTED_TASK)
+    mockNestedWalk()
+    const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks/pool-task', headers: IDENTITY })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: BackupTaskDetail }
+    assert.ok(data.nested, 'the detail carries the boundary scan')
+    assert.equal(data.nested!.length, 1)
+    assert.equal(data.nested![0].archive, 'pool')
+    assert.equal(data.nested![0].nested[0].path, '/mnttest/data')
+    assert.equal(data.nested![0].nested[0].kind, 'dataset')
+    assert.equal(data.nested![0].nested[0].included, false)
+  })
+
+  it('a task that CHOOSES a nested path stores it and reports it covered', async () => {
+    await createRepo()
+    await createTaskPayload({
+      ...NESTED_TASK,
+      name: 'pool-chosen',
+      archives: [{ name: 'pool', path: '/mnttest', excludes: [], includeNested: ['/mnttest/data'] }],
+    })
+    mockNestedWalk()
+    const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks/pool-chosen', headers: IDENTITY })
+    const { data } = res.json() as { data: BackupTaskDetail }
+    assert.deepEqual(data.task.archives[0].includeNested, ['/mnttest/data'])
+    assert.ok(data.unit.includes('includeNested'))
+    assert.equal(data.nested![0].nested[0].included, true)
+  })
+
+  it('a task with NO nested choice stores no such key (the untouched-edit rule)', async () => {
+    await createRepo()
+    await createTaskPayload({ ...TASK, name: 'no-nested' })
+    const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks/no-nested', headers: IDENTITY })
+    const { data } = res.json() as { data: BackupTaskDetail }
+    assert.equal(data.task.archives[0].includeNested, undefined)
+    assert.ok(!data.unit.includes('includeNested'))
+  })
+
+  it('an includeNested path outside its archive is a 400 at the route boundary', async () => {
+    await createRepo()
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks',
+      headers: JSON_HEADERS,
+      payload: { ...TASK, name: 'bad-nested', archives: [{ name: 'etc', path: '/etc', excludes: [], includeNested: ['/srv/other'] }] },
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match((res.json() as { error: { message: string } }).error.message, /not under the archive path/)
+  })
+
+  it('a run WARNS about every nested filesystem its choice omits (never silent)', async () => {
+    await createRepo()
+    await createTaskPayload(NESTED_TASK)
+    // The run path gives the walk a longer budget than the wizard's.
+    mockNestedWalk(60)
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/pool-task/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    const result = job.result as { warnings?: string[], nested?: unknown[] }
+    const omitted = result.warnings?.some(w => w.includes('/mnttest/data') && w.includes('empty directory'))
+    assert.ok(omitted, JSON.stringify(result.warnings))
+    assert.equal(result.nested?.length, 1)
+  })
+
+  it('an `all` archive reaches pbc as explicit --include-dev flags, never --all-file-systems', async () => {
+    await createRepo()
+    await createTaskPayload({
+      ...NESTED_TASK,
+      name: 'pool-all',
+      archives: [
+        { name: 'pool', path: '/mnttest', excludes: [], includeNested: 'all' },
+        // A second archive in the SAME invocation that asked for nothing: the
+        // whole reason `all` is resolved per archive instead of being a flag.
+        { name: 'etc', path: '/etc', excludes: [] },
+      ],
+    })
+    mockNestedWalk(60)
+    mockNestedDescent(60)
+    const mock = mockOf(server)
+    // /etc has no boundary of its own in this tree.
+    mock.addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/etc', 60),
+      result: { stdout: '2049\t/etc\n', stderr: '', exitCode: 0 },
+    })
+    mock.calls.length = 0
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/pool-all/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+
+    const pbc = mock.calls.find(c => c.command === '/usr/bin/prlimit')
+    assert.ok(pbc, 'pbc ran')
+    assert.ok(!pbc.args.includes('--all-file-systems'), pbc.args.join(' '))
+    const devs: string[] = []
+    pbc.args.forEach((a, i) => {
+      if (a === '--include-dev')
+        devs.push(pbc.args[i + 1])
+    })
+    // Both boundaries under /mnttest, and NOTHING for the other archive.
+    assert.deepEqual(devs, ['/mnttest/data', '/mnttest/data/deep'])
+
+    // The run says on the record exactly which boundaries it crossed.
+    const result = job.result as { includedNested?: Record<string, string[]>, warnings?: string[] }
+    assert.deepEqual(result.includedNested, { pool: ['/mnttest/data', '/mnttest/data/deep'] })
+    // Nothing was omitted, so no omission warning was raised.
+    assert.ok(!(result.warnings ?? []).some(w => w.includes('empty directory')), JSON.stringify(result.warnings))
+  })
+
+  it('an `all` archive whose scan FAILS crosses nothing and says why (no silent partial)', async () => {
+    await createRepo()
+    await createTaskPayload({
+      ...NESTED_TASK,
+      name: 'pool-all-timeout',
+      archives: [{ name: 'pool', path: '/mnttest', excludes: [], includeNested: 'all' }],
+    })
+    // The first walk TIMES OUT after reporting one boundary: a partial answer.
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/mnttest', 60),
+      result: { stdout: '66\t/mnttest\n67\t/mnttest/data\n', stderr: '', exitCode: 124 },
+    })
+    mock.calls.length = 0
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/pool-all-timeout/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed', 'a failed scan never fails the backup')
+
+    const pbc = mock.calls.find(c => c.command === '/usr/bin/prlimit')
+    assert.ok(pbc && !pbc.args.includes('--include-dev'), pbc?.args.join(' '))
+    assert.ok(!pbc.args.includes('--all-file-systems'))
+    const result = job.result as { includedNested?: unknown, warnings?: string[] }
+    assert.equal(result.includedNested, undefined)
+    const said = (result.warnings ?? []).some(w => w.includes('\'all\' could not be resolved'))
+    assert.ok(said, JSON.stringify(result.warnings))
+  })
+
   it('prune-preview without any keep is a 400 (a keep-all prune is never run)', async () => {
     await createRepo()
     await createTask()

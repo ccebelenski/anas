@@ -5,7 +5,7 @@ import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { BACKUP_SKIP_EXIT_CODE } from '@anas/shared'
+import { BACKUP_SKIP_EXIT_CODE, BackupTaskRequest } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import {
   buildBackupWarnings,
@@ -69,9 +69,68 @@ describe('backup units — the systemd units ARE the store (Epic 16.3, NOTES §7
       makeTask({ name: 'kept-one', retention: { keepDaily: 14 } }),
       // Notification mode (16.12) rides the same JSON — units ARE the store.
       makeTask({ name: 'quiet', notify: 'on-failure' }),
+      // Nested filesystems (backup2.2) ride the same JSON, in both set forms.
+      makeTask({ name: 'nested-all', archives: [{ name: 'etc', path: '/etc', excludes: [], includeNested: 'all' }] }),
+      makeTask({ name: 'nested-list', archives: [
+        { name: 'etc', path: '/etc', excludes: [], includeNested: ['/etc/pve'] },
+        { name: 'srv', path: '/srv', excludes: [] },
+      ] }),
     ]) {
       assert.deepEqual(parseServiceUnit(renderServiceUnit(task)), task)
     }
+  })
+
+  it('an archive with NO includeNested round-trips with no such key (backup2.2)', () => {
+    // The untouched-edit rule: a task written before backup2.2 must rewrite
+    // byte-for-byte. ABSENT means `none`, and absent is what stays on disk.
+    const unit = renderServiceUnit(makeTask())
+    assert.ok(!unit.includes('includeNested'), unit)
+    assert.equal(parseServiceUnit(unit)!.archives[0].includeNested, undefined)
+  })
+
+  it('an untouched edit of a pre-backup2.2 unit rewrites it BYTE-IDENTICALLY', () => {
+    // A verbatim pre-backup2.2 service unit: no `includeNested` anywhere.
+    const legacy = renderServiceUnit(makeTask({
+      name: 'legacy',
+      archives: [
+        { name: 'etc', path: '/etc', excludes: [] },
+        { name: 'srv', path: '/srv', excludes: ['*.tmp'] },
+      ],
+    }))
+    const parsed = parseServiceUnit(legacy)
+    assert.ok(parsed)
+    // Parse → (the dialog opens, nothing is touched) → the request normalizer →
+    // render. Not one byte moves.
+    const resaved = BackupTaskRequest.parse(JSON.parse(JSON.stringify(parsed)))
+    assert.equal(renderServiceUnit(resaved), legacy)
+  })
+
+  it('an explicit `none` / null / [] normalizes to ABSENT on the way in', () => {
+    // "No nested filesystems" has exactly ONE spelling on disk, so a wizard that
+    // sends the default cannot make an untouched save churn the unit.
+    for (const value of ['none', null, []] as unknown[]) {
+      const task = BackupTaskRequest.parse({
+        ...makeTask(),
+        archives: [{ name: 'etc', path: '/etc', excludes: [], includeNested: value }],
+      })
+      assert.equal(task.archives[0].includeNested, undefined, JSON.stringify(value))
+      assert.ok(!renderServiceUnit(task).includes('includeNested'))
+    }
+    // A real choice survives the same normalizer untouched.
+    const kept = BackupTaskRequest.parse({
+      ...makeTask(),
+      archives: [{ name: 'etc', path: '/etc', excludes: [], includeNested: ['/etc/pve'] }],
+    })
+    assert.deepEqual(kept.archives[0].includeNested, ['/etc/pve'])
+  })
+
+  it('an includeNested path OUTSIDE its archive is refused (--include-dev would be a lie)', () => {
+    const bad = BackupTaskRequest.safeParse({
+      ...makeTask(),
+      archives: [{ name: 'etc', path: '/etc', excludes: [], includeNested: ['/srv/elsewhere'] }],
+    })
+    assert.equal(bad.success, false)
+    assert.match(bad.error!.issues[0]!.message, /not under the archive path/)
   })
 
   it('a unit written before 16.12 (no `notify` key) reads back as `always`', () => {
