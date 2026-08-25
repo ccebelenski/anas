@@ -436,6 +436,9 @@ targetcli exit=1
 ```
 
 **GT-28 — zvol grow is live, end to end, no LIO action needed.**
+
+> **Amendment (iscsi.2 build, 2026-08-25):** the size is NOT in configfs — the `iblock` backstore `info` carries only Status / Max Queue Depth / SectorSize / HwMaxSectors / device / UDEV PATH / Major / Minor / CLAIMED; only `targetcli ls` renders a size (it computes one). The read layer takes a block LUN's size from `/sys/class/block/<kernel>/size × 512`, with the kernel name resolved at point of use (GT-48). Also: `stat -c %s` on any configfs value file is always 4096 — emptiness must be judged from content, never size.
+
 `zfs set volsize=2G` → `targetcli ls` and configfs `info` immediately report 2.0 GiB →
 `iscsiadm -m session --rescan` → the initiator sees it:
 
