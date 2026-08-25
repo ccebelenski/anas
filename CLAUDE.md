@@ -3,7 +3,7 @@
 ## Before writing any code
 
 1. Read `docs/PRINCIPLES.md` — these are non-negotiable. If your planned change conflicts with a principle, stop and discuss with the user.
-2. Read `docs/EPICS.md` — only implement work that traces to a story. If it's not in a story, it's not in scope.
+2. Read `docs/EPICS.md` — only implement work that traces to a story. If it's not in a story, it's not in scope. Its §2 standing rulings are binding; `docs/EPICS-HISTORY.md` holds the shipped-story ledger and is consulted only for the rationale behind a ruling.
 3. Read `docs/DESIGN.md` — the architecture, API, and tech stack are decided. Do not introduce new dependencies, change the API shape, or alter the architecture without discussion.
 
 ## Key decisions (do not revisit without discussion)

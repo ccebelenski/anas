@@ -82,7 +82,8 @@ packages/
 packaging/           Release tarball build, versioning, and the transactional
                        installer. See packaging/README.md.
 docs/                DESIGN.md (architecture/API), PRINCIPLES.md
-                       (non-negotiable), EPICS.md (story backlog).
+                       (non-negotiable), EPICS.md (live plan + standing rulings),
+                       EPICS-HISTORY.md (frozen shipped-story ledger).
 ```
 
 ## Architecture

@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 /**
- * Busy-unmount root-cause diagnosis (story 3.29, docs/EPICS.md Epic 3).
+ * Busy-unmount root-cause diagnosis (story 3.29, docs/EPICS-HISTORY.md Epic 3).
  *
  * When an unmount fails because the filesystem is busy, the raw error names WHAT
  * failed but not WHY: the pve5 incident surfaced only
