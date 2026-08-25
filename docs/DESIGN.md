@@ -951,7 +951,7 @@ This means ANAS can manage any share or export, regardless of whether ANAS creat
 
 ANAS manages shares by editing `smb.conf` / `/etc/exports` directly. It does **NOT** use ZFS's `sharesmb`/`sharenfs` dataset properties, even though those are useful and used elsewhere. Rationale: a share is just a directory **path** plus protocol options — it doesn't care what filesystem backs it. Editing the Samba/NFS config keeps the share layer completely decoupled from the storage backend, so the **same** share management works over ZFS datasets today and md + LVM + btrfs later (Epic 11). Tying shares to `sharesmb` would fork the share layer per backend. So: a filesystem dataset's mountpoint is the *usual* share path, but the share machinery only knows about paths and config files.
 
-Consequence: the "Share this" action is offered only on **filesystem** datasets (they have a mountpoint); ZFS **volumes** (zvols) are block devices with no path to share — that's iSCSI territory: Epic 19 exports volumes (and raw image files) as LUNs through its own menu, outside the share layer. A dataset's "associated shares" (story 4.4) are resolved by matching share paths against the dataset's mountpoint.
+Consequence: the "Share this" action is offered only on **filesystem** datasets (they have a mountpoint); ZFS **volumes** (zvols) are block devices with no path to share — that's iSCSI territory: the iSCSI epic (`docs/EPICS.md`) exports volumes (and raw image files) as LUNs through its own menu, outside the share layer. A dataset's "associated shares" (story 4.4) are resolved by matching share paths against the dataset's mountpoint.
 
 ### 5b. Concurrency safety for config-file writes
 
