@@ -1,0 +1,13 @@
+open-iscsi 2.1.11-1+deb13u2
+python3-configshell-fb 1:2.0.0-2
+python3-gi 3.50.0-4+b1
+python3-pyparsing 3.1.2-1
+python3-pyudev 0.24.3-1
+python3-rtslib-fb 2.1.76-3
+sg3-utils 1.48-2+pmx1
+targetcli-fb 1:2.1.53-1.3
+--- node ---
+pve-manager/9.2.11/f6997e698c7933ea (running kernel: 7.0.14-12-pve)
+7.0.14-12-pve
+zfs-2.4.3-pve1
+zfs-kmod-2.4.3-pve1

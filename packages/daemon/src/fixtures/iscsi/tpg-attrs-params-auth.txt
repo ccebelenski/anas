@@ -1,0 +1,176 @@
+ATTRIBUTE CONFIG GROUP
+======================
+authentication=1
+----------------
+If set to 1, enforce authentication for this TPG.
+
+cache_dynamic_acls=0
+--------------------
+If set to 1 in demo mode, cache dynamically generated ACLs.
+
+default_cmdsn_depth=64
+----------------------
+Default CmdSN (Command Sequence Number) depth.
+
+default_erl=0
+-------------
+Default Error Recovery Level.
+
+demo_mode_discovery=1
+---------------------
+If set to 1 in demo mode, enable discovery.
+
+demo_mode_write_protect=1
+-------------------------
+If set to 1 in demo mode, prevent writes to LUNs.
+
+fabric_prot_type=0
+------------------
+Fabric DIF protection type.
+
+generate_node_acls=0
+--------------------
+If set to 1, allow all initiators to login (i.e. demo mode).
+
+login_keys_workaround=1
+-----------------------
+
+
+login_timeout=15
+----------------
+Login timeout value in seconds.
+
+prod_mode_write_protect=0
+-------------------------
+If set to 1, prevent writes to LUNs.
+
+t10_pi=0
+--------
+If set to 1, enable T10 Protection Information.
+
+tpg_enabled_sendtargets=1
+-------------------------
+If set to 1, the SendTargets discovery response advertises the TPG only if the TPG is enabled.
+PARAMETER CONFIG GROUP
+======================
+AuthMethod=CHAP
+---------------
+Authentication method used by the TPG.
+
+DataDigest=CRC32C,None
+----------------------
+If set to CRC32C, the integrity of the PDU data part is verified.
+
+DataPDUInOrder=Yes
+------------------
+If set to Yes, the data PDUs within sequences must be in order.
+
+DataSequenceInOrder=Yes
+-----------------------
+If set to Yes, the data sequences must be in order.
+
+DefaultTime2Retain=20
+---------------------
+Maximum time, in seconds, after an initial wait, before which an active task reassignment is still possible after an unexpected connection termination or a connection reset.
+
+DefaultTime2Wait=2
+------------------
+Minimum time, in seconds, to wait before attempting an explicit/implicit logout or an active task reassignment after an unexpected connection termination or a connection reset.
+
+ErrorRecoveryLevel=0
+--------------------
+Recovery levels represent a combination of recovery capabilities.
+
+FirstBurstLength=65536
+----------------------
+Maximum amount in bytes of unsolicited data an initiator may send.
+
+HeaderDigest=CRC32C,None
+------------------------
+If set to CRC32C, the integrity of the PDU header part is verified.
+
+IFMarkInt=Reject
+----------------
+Deprecated according to RFC 7143.
+
+IFMarker=No
+-----------
+Deprecated according to RFC 7143.
+
+ImmediateData=Yes
+-----------------
+Immediate data support.
+
+InitialR2T=Yes
+--------------
+If set to No, the default use of R2T (Ready To Transfer) is disabled.
+
+MaxBurstLength=262144
+---------------------
+Maximum SCSI data payload in bytes in a Data-In or a solicited Data-Out iSCSI sequence.
+
+MaxConnections=1
+----------------
+Maximum number of connections acceptable.
+
+MaxOutstandingR2T=1
+-------------------
+Maximum number of outstanding R2Ts per task.
+
+MaxRecvDataSegmentLength=8192
+-----------------------------
+Maximum data segment length in bytes the target can receive in an iSCSI PDU.
+
+MaxXmitDataSegmentLength=262144
+-------------------------------
+Outgoing MaxRecvDataSegmentLength sent over the wire during iSCSI login response.
+
+OFMarkInt=Reject
+----------------
+Deprecated according to RFC 7143.
+
+OFMarker=No
+-----------
+Deprecated according to RFC 7143.
+
+TargetAlias=LIO Target
+----------------------
+Human-readable target name or description.
+AUTH CONFIG GROUP
+=================
+mutual_password=
+----------------
+The mutual_password auth parameter.
+
+mutual_userid=
+--------------
+The mutual_userid auth parameter.
+
+password=REDACTED-16char
+-------------------------
+The password auth parameter.
+
+userid=gtiscsiuser
+------------------
+The userid auth parameter.
+DISCOVERY_AUTH CONFIG GROUP
+===========================
+enable=False
+------------
+The enable discovery_auth parameter.
+
+mutual_password=
+----------------
+The mutual_password discovery_auth parameter.
+
+mutual_userid=
+--------------
+The mutual_userid discovery_auth parameter.
+
+password=
+---------
+The password discovery_auth parameter.
+
+userid=
+-------
+The userid discovery_auth parameter.

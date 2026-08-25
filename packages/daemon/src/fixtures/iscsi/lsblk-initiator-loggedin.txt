@@ -1,0 +1,14 @@
+NAME    TYPE TRAN   HCTL       SERIAL                               WWN                                VENDOR   MODEL          SIZE
+loop0   loop                                                                                                                     2G
+sda     disk        0:0:0:0    drive-scsi0-0-0-0                                                       QEMU     QEMU HARDDISK   32G
+├─sda1  part                                                                                                                  31.9G
+├─sda14 part                                                                                                                     3M
+└─sda15 part                                                                                                                   124M
+sdb     disk iscsi  7:0:0:0    9bc6e907-6015-4267-be4f-5a0617cb3d71 0x60014059bc6e90760154267be4f5a061 LIO-ORG  gtiscsi_vol1     2G
+sdc     disk iscsi  7:0:0:1    689844a4-1d20-4cba-8516-bdc52a402645 0x6001405689844a41d204cba8516bdc52 LIO-ORG  gtiscsi_lun2     1G
+sr0     rom  sata   2:0:0:0    QM00003                                                                 QEMU     QEMU DVD-ROM   368K
+zd0     disk                                                                                                                     2G
+zd16    disk                                                                                                                   512M
+zd32    disk                                                                                                                   256M
+zd48    disk                                                                                                                     1G
+zd64    disk                                                                                                                   256M

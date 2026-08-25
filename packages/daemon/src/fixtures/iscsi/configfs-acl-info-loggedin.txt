@@ -1,0 +1,10 @@
+InitiatorName: iqn.1993-08.org.debian:01:ae3d2ec18ad
+InitiatorAlias: anas-pve
+LIO Session ID: 7   ISID: 0x00 02 3d 00 00 16  TSIH: 24  SessionType: Normal
+Session State: TARG_SESS_STATE_LOGGED_IN
+---------------------[iSCSI Session Values]-----------------------
+  CmdSN/WR  :  CmdSN/WC  :  ExpCmdSN  :  MaxCmdSN  :     ITT    :     TTT
+ 0x00000040   0x00000040   0x000000e4   0x00000123   0x00000068   0x000000e0
+----------------------[iSCSI Connections]-------------------------
+CID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN
+   Address 192.168.200.50 TCP  StatSN: 0x48e7cb00

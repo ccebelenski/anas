@@ -1,0 +1,33 @@
+===== REAL REBOOT — boot 2026-08-25 19:56:48 UTC =====
+
+--- unit timeline (journalctl -b -o short-precise) ---
+Aug 25 19:56:52.320472 anas-pve systemd[1]: Starting zfs-import-cache.service - Import ZFS pools by cache file...
+Aug 25 19:56:52.588368 anas-pve systemd[1]: Finished zfs-import-cache.service - Import ZFS pools by cache file.
+Aug 25 19:56:52.589363 anas-pve systemd[1]: Starting zfs-mount.service - Mount ZFS filesystems...
+Aug 25 19:56:52.592070 anas-pve systemd[1]: Starting zfs-volume-wait.service - Wait for ZFS Volume (zvol) links in /dev...
+Aug 25 19:56:52.621646 anas-pve systemd[1]: Finished zfs-volume-wait.service - Wait for ZFS Volume (zvol) links in /dev.
+Aug 25 19:56:52.628356 anas-pve systemd[1]: Finished zfs-mount.service - Mount ZFS filesystems.
+Aug 25 19:56:53.851540 anas-pve systemd[1]: Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+Aug 25 19:56:54.019848 anas-pve systemd[1]: Finished rtslib-fb-targetctl.service - Restore LIO kernel target configuration.
+
+--- rtslib-fb-targetctl result ---
+Result=success
+ExecMainStatus=0
+ActiveState=active
+
+--- zvol kernel name moved across the reboot: zd0 -> zd16 ---
+lrwxrwxrwx 1 root root 10 Aug 25 19:56 /dev/zvol/gtiscsi/vol1 -> ../../zd16
+Status: ACTIVATED  Max Queue Depth: 128  SectorSize: 512  HwMaxSectors: 32768
+        iBlock device: zd16  UDEV PATH: /dev/zvol/gtiscsi/vol1  readonly: 0
+  exclusive: 1
+        Major: 230 Minor: 16  CLAIMED: IBLOCK
+
+--- serials after boot ---
+/sys/kernel/config/target/core/fileio_1/gtiscsi_lun2: T10 VPD Unit Serial Number: 689844a4-1d20-4cba-8516-bdc52a402645
+/sys/kernel/config/target/core/iblock_0/gtiscsi_vol1: T10 VPD Unit Serial Number: 9bc6e907-6015-4267-be4f-5a0617cb3d71
+
+--- initiator identity + data after boot ---
+sdb        2G 9bc6e907-6015-4267-be4f-5a0617cb3d71 0x60014059bc6e90760154267be4f5a061 gtiscsi_vol1  iscsi
+sdc        1G 689844a4-1d20-4cba-8516-bdc52a402645 0x6001405689844a41d204cba8516bdc52 gtiscsi_lun2  iscsi
+marker sha256 (expected af2555880d1a59c5ee708cc0b76efa51c8d3187cd8aede1df888960a6b85ad17):
+af2555880d1a59c5ee708cc0b76efa51c8d3187cd8aede1df888960a6b85ad17  /mnt/gtlun0/marker.txt

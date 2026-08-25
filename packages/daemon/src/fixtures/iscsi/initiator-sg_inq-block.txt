@@ -1,0 +1,60 @@
+standard INQUIRY:
+  PQual=0  PDT=0  RMB=0  LU_CONG=0  hot_pluggable=0  version=0x06  [SPC-4]
+  [AERC=0]  [TrmTsk=0]  NormACA=0  HiSUP=0  Resp_data_format=2
+  SCCS=1  ACC=0  TPGS=3  3PC=1  Protect=0  [BQue=0]
+  EncServ=0  MultiP=0  [MChngr=0]  [ACKREQQ=0]  Addr16=0
+  [RelAdr=0]  WBus16=0  Sync=0  [Linked=0]  [TranDis=0]  CmdQue=1
+  [SPI: Clocking=0x0  QAS=0  IUS=0]
+    length=96 (0x60)   Peripheral device type: disk
+ Vendor identification: LIO-ORG 
+ Product identification: gtiscsi_vol1    
+ Product revision level: 4.0 
+Unit serial number VPD page:
+  Product serial number: 9bc6e907-6015-4267-be4f-5a0617cb3d71
+Device Identification VPD page:
+  Addressed logical unit:
+    designator type: NAA,  code set: Binary
+      0x60014059bc6e90760154267be4f5a061
+    designator type: T10 vendor identification,  code set: ASCII
+      vendor id: LIO-ORG 
+      vendor specific: gtiscsi_vol1:9bc6e907-6015-4267-be4f-5a0617cb3d71
+    designator type: Logical unit group,  code set: Binary
+      Logical unit group: 0x0
+  Target port:
+    designator type: Relative target port,  code set: Binary
+     transport: Internet SCSI (iSCSI)
+      Relative target port: 0x1
+    designator type: Target port group,  code set: Binary
+     transport: Internet SCSI (iSCSI)
+      Target port group: 0x0
+    designator type: SCSI name string,  code set: UTF-8
+     transport: Internet SCSI (iSCSI)
+      SCSI name string:
+      iqn.2026-08.dev.anas.gtiscsi:target1,t,0x0001
+  Target device that contains addressed lu:
+    designator type: SCSI name string,  code set: UTF-8
+     transport: Internet SCSI (iSCSI)
+      SCSI name string:
+      iqn.2026-08.dev.anas.gtiscsi:target1
+Block limits VPD page (SBC)
+  Write same non-zero (WSNZ): 1
+  Maximum compare and write length: 0x1
+  Optimal transfer length granularity: 0x20
+  Maximum transfer length: 0x8000
+  Optimal transfer length: 0x10000
+  Maximum prefetch length: 0 blocks [not reported]
+  Maximum unmap LBA count: 0x80000
+  Maximum unmap block descriptor count: 0x1
+  Optimal unmap granularity: 0x20
+  Unmap granularity alignment valid: false
+  Maximum write same length: 0xffff
+Logical block provisioning VPD page (SBC)
+  LBPU=1
+  LBPWS=1
+  LBPWS10=1
+  LBPRZ=0x0
+  ANC_SUP=0
+  DP=0
+  Minimum percentage: 0 [not reported]
+  Provisioning type: not known or fully provisioned
+  Threshold percentage: 0 [percentages not supported]

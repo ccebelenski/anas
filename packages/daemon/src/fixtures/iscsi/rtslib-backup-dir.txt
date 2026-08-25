@@ -1,0 +1,12 @@
+total 44
+drw------- 2 root root 4096 Aug 25 19:35 .
+drw------- 3 root root 4096 Aug 25 19:40 ..
+-rw------- 1 root root  113 Aug 25 19:17 saveconfig-20260825-19:17:50-json.gz
+-rw------- 1 root root 1712 Aug 25 19:22 saveconfig-20260825-19:22:27-json.gz
+-rw------- 1 root root 1717 Aug 25 19:26 saveconfig-20260825-19:26:29-json.gz
+-rw------- 1 root root 1792 Aug 25 19:26 saveconfig-20260825-19:26:49-json.gz
+-rw------- 1 root root 1799 Aug 25 19:26 saveconfig-20260825-19:26:50-json.gz
+-rw------- 1 root root 1792 Aug 25 19:27 saveconfig-20260825-19:27:12-json.gz
+-rw------- 1 root root 1750 Aug 25 19:30 saveconfig-20260825-19:30:45-json.gz
+-rw------- 1 root root 1744 Aug 25 19:33 saveconfig-20260825-19:33:27-json.gz
+-rw------- 1 root root 1745 Aug 25 19:35 saveconfig-20260825-19:35:39-json.gz

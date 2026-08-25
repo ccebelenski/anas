@@ -1,0 +1,131 @@
+########## 1. ACL rejection: initiator NOT in the ACL ##########
+--- discovery from a NON-ACLed initiator (demo_mode_discovery=1): SUCCEEDS ---
+192.168.200.50:3260,1 iqn.2026-08.dev.anas.gtiscsi:target1
+--- initiator side ---
+iscsiadm: Could not login to [iface: default, target: iqn.2026-08.dev.anas.gtiscsi:target1, portal: 192.168.200.50,3260].
+iscsiadm: initiator reported error (24 - iSCSI login failed due to authorization failure)
+iscsiadm: Could not log into all portals
+iscsiadm exit=24
+--- target side (kernel journal) ---
+Aug 25 19:34:09 anas-pve kernel: iSCSI Initiator Node: iqn.1993-08.org.debian:01:gtnotallowed is not authorized to access iSCSI target portal group: 1.
+Aug 25 19:34:09 anas-pve kernel: iSCSI Login negotiation failed.
+Aug 25 19:34:09 anas-pve kernel:  connection15:0: detected conn error (1020)
+
+########## 2. CHAP: target enforcing, initiator has no credentials ##########
+--- initiator side ---
+iscsiadm: Could not login to [iface: default, target: iqn.2026-08.dev.anas.gtiscsi:target1, portal: 192.168.200.50,3260].
+iscsiadm: initiator reported error (24 - iSCSI login failed due to authorization failure)
+iscsiadm: Could not log into all portals
+iscsiadm exit=24
+--- target side (kernel journal) ---
+Aug 25 19:34:09 anas-pve kernel: iSCSI Login negotiation failed.
+Aug 25 19:34:12 anas-pve kernel: Initiator is requesting CSG: 1, has not been successfully authenticated, and the Target is enforcing iSCSI Authentication, login failed.
+Aug 25 19:34:12 anas-pve kernel: iSCSI Login negotiation failed.
+
+########## 3. CHAP: WRONG secret ##########
+iscsiadm: Could not login to [iface: default, target: iqn.2026-08.dev.anas.gtiscsi:target1, portal: 192.168.200.50,3260].
+iscsiadm: initiator reported error (24 - iSCSI login failed due to authorization failure)
+iscsiadm: Could not log into all portals
+iscsiadm exit=24
+Aug 25 19:34:09 anas-pve kernel: iSCSI Login negotiation failed.
+Aug 25 19:34:12 anas-pve kernel: iSCSI Login negotiation failed.
+Aug 25 19:34:13 anas-pve kernel: iSCSI Login negotiation failed.
+
+########## 4. CHAP: WRONG MUTUAL secret (initiator rejects target) ##########
+iscsiadm: Could not login to [iface: default, target: iqn.2026-08.dev.anas.gtiscsi:target1, portal: 192.168.200.50,3260].
+iscsiadm: initiator reported error (19 - encountered non-retryable iSCSI login failure)
+iscsiadm: Could not log into all portals
+iscsiadm exit=19
+
+########## 5. CHAP one-way + mutual SUCCESS ##########
+Login to [iface: default, target: iqn.2026-08.dev.anas.gtiscsi:target1, portal: 192.168.200.50,3260] successful.
+iscsiadm exit=0
+alias: anas-pve	sid: 5 type: Normal session-state: LOGGED_IN
+    name: iqn.1993-08.org.debian:01:ae3d2ec18ad (authenticated)
+    mapped-lun: 0 backstore: block/gtiscsi_vol1 mode: rw
+    mapped-lun: 1 backstore: fileio/gtiscsi_lun2 mode: rw
+    address: 192.168.200.50 (TCP)  cid: 0 connection-state: LOGGED_IN
+
+########## 6. IPv6 LINK-LOCAL portal refused ##########
+Using default IP port 3260
+Could not create NetworkPortal in configFS
+targetcli exit=1
+
+########## 7. block_size change on an ACTIVATED backstore ##########
+Cannot set attribute block_size: [Errno 22] Invalid argument
+targetcli exit=1
+
+########## 8. targetcli argv mode: failing command ##########
+Could not open /dev/does-not-exist
+targetcli exit=1
+
+########## 9. targetcli STDIN BATCH mode: failing command mid-batch (exit 0, continues, AUTO-SAVES) ##########
+targetcli shell version 2.1.53
+Copyright 2011-2013 by Datera, Inc and others.
+For help on commands, type 'help'.
+
+/> Could not open /dev/does-not-exist
+/> o- block ...................................................................................................... [Storage Objects: 1]
+  o- gtiscsi_vol1 ........................................................... [/dev/zvol/gtiscsi/vol1 (2.0GiB) write-thru activated]
+    o- alua ....................................................................................................... [ALUA Groups: 1]
+      o- default_tg_pt_gp ........................................................................... [ALUA state: Active/optimized]
+/> Global pref auto_save_on_exit=true
+Configuration saved to /etc/rtslib-fb-target/saveconfig.json
+targetcli(pipe) exit=0
+
+########## 10. ZFS collisions under a live LUN ##########
+--- zpool export gtiscsi (fileio file open by LIO) ---
+cannot unmount '/gtiscsi/images': pool or dataset is busy
+exit=1
+--- zfs destroy gtiscsi/vol1 (zvol claimed by LIO iblock) ---
+cannot destroy 'gtiscsi/vol1': dataset is busy
+exit=1
+--- fuser -m /dev/zd0 / lsof /dev/zd0 / holders: NOTHING names LIO ---
+fuser exit=1
+lsof exit=1
+total 0
+drwxr-xr-x 2 root root 0 Aug 25 19:34 .
+drwxr-xr-x 8 root root 0 Aug 25 19:28 ..
+--- the ONLY place the claim is visible: configfs ---
+Status: ACTIVATED  Max Queue Depth: 128  SectorSize: 512  HwMaxSectors: 32768
+        iBlock device: zd0  UDEV PATH: /dev/zvol/gtiscsi/vol1  readonly: 0
+  exclusive: 1
+        Major: 230 Minor: 0  CLAIMED: IBLOCK
+
+########## 11. Boot restore with backing devices MISSING (from this session's journal) ##########
+Aug 25 19:14:56 anas-pve systemd[1]: Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+Aug 25 19:14:56 anas-pve systemd[1]: Finished rtslib-fb-targetctl.service - Restore LIO kernel target configuration.
+Aug 25 19:27:13 anas-pve systemd[1]: Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+Aug 25 19:27:13 anas-pve target[358541]: Could not create StorageObject gtiscsi_vol1: Device /dev/zvol/gtiscsi/vol1 is not a TYPE_DISK block device, skipped
+Aug 25 19:27:13 anas-pve target[358541]: Could not find matching StorageObject for LUN 0, skipped
+Aug 25 19:27:13 anas-pve target[358541]: Could not find matching TPG LUN 0 for MappedLUN 0, skipped
+Aug 25 19:27:13 anas-pve target[358541]: Could not find matching TPG LUN 0 for MappedLUN 0, skipped
+Aug 25 19:27:13 anas-pve systemd[1]: Finished rtslib-fb-targetctl.service - Restore LIO kernel target configuration.
+Aug 25 19:27:36 anas-pve systemd[1]: Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+Aug 25 19:27:36 anas-pve systemd[1]: Finished rtslib-fb-targetctl.service - Restore LIO kernel target configuration.
+Aug 25 19:27:52 anas-pve systemd[1]: Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+Aug 25 19:27:52 anas-pve target[358845]: Could not create StorageObject gtiscsi_vol1: Device /dev/zvol/gtiscsi/vol1 is not a TYPE_DISK block device, skipped
+Aug 25 19:27:52 anas-pve target[358845]: Could not create StorageObject gtiscsi_lun2: [Errno 2] No such file or directory, skipped
+Aug 25 19:27:52 anas-pve target[358845]: Could not find matching StorageObject for LUN 0, skipped
+Aug 25 19:27:52 anas-pve target[358845]: Could not find matching StorageObject for LUN 1, skipped
+Aug 25 19:27:52 anas-pve target[358845]: Could not find matching TPG LUN 0 for MappedLUN 0, skipped
+Aug 25 19:27:52 anas-pve target[358845]: Could not find matching TPG LUN 1 for MappedLUN 1, skipped
+Aug 25 19:27:52 anas-pve target[358845]: Could not find matching TPG LUN 0 for MappedLUN 0, skipped
+Aug 25 19:27:52 anas-pve target[358845]: Could not find matching TPG LUN 1 for MappedLUN 1, skipped
+Aug 25 19:27:52 anas-pve systemd[1]: Finished rtslib-fb-targetctl.service - Restore LIO kernel target configuration.
+Aug 25 19:28:07 anas-pve systemd[1]: Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+Aug 25 19:28:07 anas-pve target[358979]: Could not create StorageObject gtiscsi_vol1: Device /dev/zvol/gtiscsi/vol1 is not a TYPE_DISK block device, skipped
+Aug 25 19:28:07 anas-pve target[358979]: Could not create StorageObject gtiscsi_lun2: [Errno 2] No such file or directory, skipped
+Aug 25 19:28:07 anas-pve target[358979]: Could not find matching StorageObject for LUN 0, skipped
+Aug 25 19:28:07 anas-pve target[358979]: Could not find matching StorageObject for LUN 1, skipped
+Aug 25 19:28:07 anas-pve target[358979]: Could not find matching TPG LUN 0 for MappedLUN 0, skipped
+Aug 25 19:28:07 anas-pve target[358979]: Could not find matching TPG LUN 1 for MappedLUN 1, skipped
+Aug 25 19:28:07 anas-pve target[358979]: Could not find matching TPG LUN 0 for MappedLUN 0, skipped
+Aug 25 19:28:07 anas-pve target[358979]: Could not find matching TPG LUN 1 for MappedLUN 1, skipped
+Aug 25 19:28:07 anas-pve systemd[1]: Finished rtslib-fb-targetctl.service - Restore LIO kernel target configuration.
+Aug 25 19:28:22 anas-pve systemd[1]: Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+Aug 25 19:28:22 anas-pve systemd[1]: Finished rtslib-fb-targetctl.service - Restore LIO kernel target configuration.
+Aug 25 19:28:40 anas-pve systemd[1]: Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+Aug 25 19:28:40 anas-pve systemd[1]: Finished rtslib-fb-targetctl.service - Restore LIO kernel target configuration.
+Aug 25 19:28:57 anas-pve systemd[1]: Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+Aug 25 19:28:57 anas-pve systemd[1]: Finished rtslib-fb-targetctl.service - Restore LIO kernel target configuration.

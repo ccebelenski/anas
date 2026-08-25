@@ -1,0 +1,93 @@
+GLOBAL CONFIG GROUP
+===================
+auto_add_default_portal=true
+----------------------------
+If true, adds a portal listening on all IPs to new targets.
+
+auto_add_mapped_luns=true
+-------------------------
+If true, automatically create node ACLs mapped LUNs after creating a new target LUN or a new node ACL
+
+auto_cd_after_create=false
+--------------------------
+If true, changes current path to newly created objects.
+
+auto_enable_tpgt=true
+---------------------
+If true, automatically enables TPGTs upon creation.
+
+auto_save_on_exit=true
+----------------------
+If true, saves configuration on exit.
+
+auto_use_daemon=false
+---------------------
+If true, commands will be sent to targetclid.
+
+color_command=cyan
+------------------
+Color to use for command completions.
+
+color_default=none
+------------------
+Default text display color.
+
+color_keyword=cyan
+------------------
+Color to use for keyword completions.
+
+color_mode=true
+---------------
+Console color display mode.
+
+color_parameter=magenta
+-----------------------
+Color to use for parameter completions.
+
+color_path=magenta
+------------------
+Color to use for path completions
+
+daemon_use_batch_mode=false
+---------------------------
+If true, use batch mode for daemonized approach.
+
+export_backstore_name_as_model=true
+-----------------------------------
+If true, the backstore name is used for the scsi inquiry model name.
+
+logfile=/root/.targetcli/log.txt
+--------------------------------
+Logfile to use.
+
+loglevel_console=info
+---------------------
+Log level for messages going to the console.
+
+loglevel_file=debug
+-------------------
+Log level for messages going to the log file.
+
+max_backup_files=10
+-------------------
+Max no. of configurations to be backed up in /etc/rtslib-fb-target/backup/ directory.
+
+prompt_length=30
+----------------
+Max length of the shell prompt path, 0 for infinite.
+
+tree_max_depth=0
+----------------
+Maximum depth of displayed node tree.
+
+tree_round_nodes=true
+---------------------
+Tree node display style.
+
+tree_show_root=true
+-------------------
+Whether or not to display tree root.
+
+tree_status_mode=true
+---------------------
+Whether or not to display status in tree.

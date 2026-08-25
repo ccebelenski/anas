@@ -1,0 +1,172 @@
+aio: False
+dev: /gtiscsi/images/lun2.raw
+name: gtiscsi_lun2
+plugin: fileio
+size: 1073741824
+write_back: False
+wwn: 689844a4-1d20-4cba-8516-bdc52a402645
+ATTRIBUTE CONFIG GROUP
+======================
+alua_support=1
+--------------
+
+
+atomic_alignment=0 [ro]
+-----------------------
+
+
+atomic_granularity=0 [ro]
+-------------------------
+
+
+atomic_max_boundary=0 [ro]
+--------------------------
+
+
+atomic_max_len=0 [ro]
+---------------------
+
+
+atomic_max_with_boundary=0 [ro]
+-------------------------------
+
+
+block_size=512
+--------------
+Block size of the underlying device.
+
+emulate_3pc=1
+-------------
+If set to 1, enable Third Party Copy.
+
+emulate_caw=1
+-------------
+If set to 1, enable Compare and Write.
+
+emulate_dpo=1
+-------------
+If set to 1, turn on Disable Page Out.
+
+emulate_fua_read=1
+------------------
+If set to 1, enable Force Unit Access read.
+
+emulate_fua_write=1
+-------------------
+If set to 1, enable Force Unit Access write.
+
+emulate_model_alias=1
+---------------------
+If set to 1, use the backend device name for the model alias.
+
+emulate_pr=1
+------------
+If set to 1, enable SCSI Reservations.
+
+emulate_rest_reord=0
+--------------------
+If set to 0, the Queue Algorithm Modifier is Restricted Reordering.
+
+emulate_rsoc=1
+--------------
+
+
+emulate_tas=1
+-------------
+If set to 1, enable Task Aborted Status.
+
+emulate_tpu=1
+-------------
+If set to 1, enable Thin Provisioning Unmap.
+
+emulate_tpws=1
+--------------
+If set to 1, enable Thin Provisioning Write Same.
+
+emulate_ua_intlck_ctrl=0
+------------------------
+If set to 1, enable Unit Attention Interlock.
+
+emulate_write_cache=0
+---------------------
+If set to 1, turn on Write Cache Enable.
+
+enforce_pr_isids=1
+------------------
+If set to 1, enforce persistent reservation ISIDs.
+
+force_pr_aptpl=0
+----------------
+If set to 1, force SPC-3 PR Activate Persistence across Target Power Loss operation.
+
+hw_block_size=512 [ro]
+----------------------
+Hardware block size in bytes.
+
+hw_max_sectors=16384 [ro]
+-------------------------
+Maximum number of sectors the hardware can transfer at once.
+
+hw_pi_prot_type=0 [ro]
+----------------------
+If non-zero, DIF protection is enabled on the underlying hardware.
+
+hw_queue_depth=128 [ro]
+-----------------------
+Hardware queue depth.
+
+is_nonrot=0
+-----------
+If set to 1, the backstore is a non rotational device.
+
+max_unmap_block_desc_count=1
+----------------------------
+Maximum number of block descriptors for UNMAP.
+
+max_unmap_lba_count=262144
+--------------------------
+Maximum number of LBA for UNMAP.
+
+max_write_same_len=4096
+-----------------------
+Maximum length for WRITE_SAME.
+
+optimal_sectors=16384
+---------------------
+Optimal request size in sectors.
+
+pgr_support=1
+-------------
+
+
+pi_prot_format=0
+----------------
+DIF protection format.
+
+pi_prot_type=0
+--------------
+DIF protection type.
+
+pi_prot_verify=0
+----------------
+
+
+queue_depth=128
+---------------
+Queue depth.
+
+submit_type=0
+-------------
+
+
+unmap_granularity=1
+-------------------
+UNMAP granularity.
+
+unmap_granularity_alignment=0
+-----------------------------
+UNMAP granularity alignment.
+
+unmap_zeroes_data=0
+-------------------
+If set to 1, zeroes are read back after an UNMAP.

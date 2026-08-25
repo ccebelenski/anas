@@ -1,0 +1,68 @@
+{
+   "blockdevices": [
+      {
+         "name": "loop0",
+         "type": "loop",
+         "kname": "loop0",
+         "serial": null,
+         "size": "2G"
+      },{
+         "name": "sda",
+         "type": "disk",
+         "kname": "sda",
+         "serial": "drive-scsi0-0-0-0",
+         "size": "32G",
+         "children": [
+            {
+               "name": "sda1",
+               "type": "part",
+               "kname": "sda1",
+               "serial": null,
+               "size": "31.9G"
+            },{
+               "name": "sda14",
+               "type": "part",
+               "kname": "sda14",
+               "serial": null,
+               "size": "3M"
+            },{
+               "name": "sda15",
+               "type": "part",
+               "kname": "sda15",
+               "serial": null,
+               "size": "124M"
+            }
+         ]
+      },{
+         "name": "sdb",
+         "type": "disk",
+         "kname": "sdb",
+         "serial": "9bc6e907-6015-4267-be4f-5a0617cb3d71",
+         "size": "2G"
+      },{
+         "name": "sdc",
+         "type": "disk",
+         "kname": "sdc",
+         "serial": "689844a4-1d20-4cba-8516-bdc52a402645",
+         "size": "1G"
+      },{
+         "name": "sr0",
+         "type": "rom",
+         "kname": "sr0",
+         "serial": "QM00003",
+         "size": "368K"
+      },{
+         "name": "zd0",
+         "type": "disk",
+         "kname": "zd0",
+         "serial": null,
+         "size": "2G"
+      },{
+         "name": "zd16",
+         "type": "disk",
+         "kname": "zd16",
+         "serial": null,
+         "size": "512M"
+      }
+   ]
+}

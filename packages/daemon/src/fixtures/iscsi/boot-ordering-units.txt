@@ -1,0 +1,144 @@
+===== zfs-import@.service =====
+# /usr/lib/systemd/system/zfs-import@.service
+[Unit]
+Description=Import ZFS pool %i
+Documentation=man:zpool(8)
+DefaultDependencies=no
+After=systemd-udev-settle.service
+After=cryptsetup.target
+After=multipathd.target
+Before=zfs-import.target
+Before=zfs-import-scan.service
+Before=zfs-import-cache.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/zpool import -N -d /dev/disk/by-id -o cachefile=none %I
+
+[Install]
+WantedBy=zfs-import.target
+is-enabled: indirect
+
+===== zfs-import.target =====
+# /usr/lib/systemd/system/zfs-import.target
+[Unit]
+Description=ZFS pool import target
+Before=dracut-mount.service
+
+[Install]
+WantedBy=zfs.target
+is-enabled: enabled
+
+===== zfs-import-cache.service =====
+# /usr/lib/systemd/system/zfs-import-cache.service
+[Unit]
+Description=Import ZFS pools by cache file
+Documentation=man:zpool(8)
+DefaultDependencies=no
+Requires=systemd-udev-settle.service
+After=systemd-udev-settle.service
+After=cryptsetup.target
+After=multipathd.service
+After=systemd-remount-fs.service
+Before=zfs-import.target
+ConditionFileNotEmpty=/etc/zfs/zpool.cache
+ConditionPathIsDirectory=/sys/module/zfs
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/zfs
+ExecStart=/usr/sbin/zpool import -c /etc/zfs/zpool.cache -aN $ZPOOL_IMPORT_OPTS
+
+[Install]
+WantedBy=zfs-import.target
+is-enabled: enabled
+
+===== zfs-mount.service =====
+# /usr/lib/systemd/system/zfs-mount.service
+[Unit]
+Description=Mount ZFS filesystems
+Documentation=man:zfs(8)
+DefaultDependencies=no
+After=systemd-udev-settle.service
+After=zfs-import.target
+After=systemd-remount-fs.service
+Before=local-fs.target
+ConditionPathIsDirectory=/sys/module/zfs
+
+# This merely tells the service manager
+# that unmounting everything undoes the
+# effect of this service. No extra logic
+# is ran as a result of these settings.
+Conflicts=umount.target
+Before=umount.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/zfs
+ExecStart=/usr/sbin/zfs mount -a
+
+[Install]
+WantedBy=zfs.target
+is-enabled: enabled
+
+===== zfs-volume-wait.service =====
+# /usr/lib/systemd/system/zfs-volume-wait.service
+[Unit]
+Description=Wait for ZFS Volume (zvol) links in /dev
+DefaultDependencies=no
+After=systemd-udev-settle.service
+After=zfs-import.target
+ConditionPathIsDirectory=/sys/module/zfs
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/default/zfs
+ExecStart=/usr/bin/zvol_wait
+
+[Install]
+WantedBy=zfs-volumes.target
+is-enabled: enabled
+
+===== zfs-volumes.target =====
+# /usr/lib/systemd/system/zfs-volumes.target
+[Unit]
+Description=ZFS volumes are ready
+After=zfs-volume-wait.service
+Requires=zfs-volume-wait.service
+
+[Install]
+WantedBy=zfs.target
+is-enabled: enabled
+
+===== zfs.target =====
+# /usr/lib/systemd/system/zfs.target
+[Unit]
+Description=ZFS startup target
+
+[Install]
+WantedBy=multi-user.target
+is-enabled: enabled
+
+===== rtslib-fb-targetctl.service =====
+# /usr/lib/systemd/system/rtslib-fb-targetctl.service
+[Unit]
+Description=Restore LIO kernel target configuration
+Requires=sys-kernel-config.mount
+After=sys-kernel-config.mount network.target local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=mkdir -p /etc/rtslib-fb-target
+ExecStart=/usr/bin/targetctl restore
+ExecStop=/usr/bin/targetctl clear
+SyslogIdentifier=target
+
+[Install]
+WantedBy=multi-user.target
+is-enabled: enabled
+

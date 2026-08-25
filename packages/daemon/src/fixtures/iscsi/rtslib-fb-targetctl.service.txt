@@ -1,0 +1,16 @@
+# /usr/lib/systemd/system/rtslib-fb-targetctl.service
+[Unit]
+Description=Restore LIO kernel target configuration
+Requires=sys-kernel-config.mount
+After=sys-kernel-config.mount network.target local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=mkdir -p /etc/rtslib-fb-target
+ExecStart=/usr/bin/targetctl restore
+ExecStop=/usr/bin/targetctl clear
+SyslogIdentifier=target
+
+[Install]
+WantedBy=multi-user.target

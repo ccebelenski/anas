@@ -1,0 +1,11 @@
+iscsi_tcp              24576  1
+libiscsi_tcp           32768  1 iscsi_tcp
+libiscsi               77824  2 libiscsi_tcp,iscsi_tcp
+scsi_transport_iscsi   172032  4 libiscsi_tcp,iscsi_tcp,libiscsi
+target_core_user       65536  0
+uio                    28672  1 target_core_user
+target_core_pscsi      28672  0
+target_core_file       24576  2
+target_core_iblock     28672  2
+iscsi_target_mod      389120  12
+target_core_mod       520192  23 target_core_file,target_core_iblock,iscsi_target_mod,target_core_pscsi,target_core_user

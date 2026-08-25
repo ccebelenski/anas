@@ -1,0 +1,12 @@
+total 0
+drwxr-xr-x  2 root root 220 Aug 25 19:40 .
+drwxr-xr-x 10 root root 200 Aug 25 19:34 ..
+lrwxrwxrwx  1 root root   9 Aug 24 16:42 ata-QEMU_DVD-ROM_QM00003 -> ../../sr0
+lrwxrwxrwx  1 root root   9 Aug 24 16:42 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0 -> ../../sda
+lrwxrwxrwx  1 root root  10 Aug 24 16:42 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0-part1 -> ../../sda1
+lrwxrwxrwx  1 root root  11 Aug 24 16:42 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0-part14 -> ../../sda14
+lrwxrwxrwx  1 root root  11 Aug 24 16:42 scsi-0QEMU_QEMU_HARDDISK_drive-scsi0-0-0-0-part15 -> ../../sda15
+lrwxrwxrwx  1 root root   9 Aug 25 19:40 scsi-36001405689844a41d204cba8516bdc52 -> ../../sdc
+lrwxrwxrwx  1 root root   9 Aug 25 19:40 scsi-360014059bc6e90760154267be4f5a061 -> ../../sdb
+lrwxrwxrwx  1 root root   9 Aug 25 19:40 wwn-0x6001405689844a41d204cba8516bdc52 -> ../../sdc
+lrwxrwxrwx  1 root root   9 Aug 25 19:40 wwn-0x60014059bc6e90760154267be4f5a061 -> ../../sdb

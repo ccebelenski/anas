@@ -1,0 +1,6 @@
+alias: anas-pve	sid: 7 type: Normal session-state: LOGGED_IN
+    name: iqn.1993-08.org.debian:01:ae3d2ec18ad (authenticated)
+    mapped-lun: 0 backstore: block/gtiscsi_vol1 mode: rw
+    mapped-lun: 1 backstore: fileio/gtiscsi_lun2 mode: rw
+    address: 192.168.200.50 (TCP)  cid: 0 connection-state: LOGGED_IN
+alias: anas-pve	sid: 7 type: Normal session-state: LOGGED_IN
