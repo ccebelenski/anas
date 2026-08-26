@@ -3,6 +3,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { AhrExpansionPlan, AhrLayoutDisk, AhrReplacement } from './ahr-layout.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
+import { isComposableDisk } from '@anas/shared'
 import { collectDisks } from '../routes/disks.js'
 import { executeExpansion, executeReplace, projectExistingBands, pvCatchUpSteps, syncCompletionSteps, syncingAhrBands, underSizedPvBands } from './ahr-expand-exec.js'
 import { AhrIntentConflictError, writeIntent } from './ahr-intent.js'
@@ -68,8 +69,10 @@ export async function resolveApproved(
       problems.push(`disk '${id}' not found in the inventory`)
       continue
     }
-    if (requireAvailable && inv.status !== 'available') {
-      problems.push(`disk '${id}' is not available (status: ${inv.status}${inv.poolName ? `, pool '${inv.poolName}'` : ''})`)
+    if (requireAvailable && !isComposableDisk(inv)) {
+      problems.push(inv.handsOff
+        ? `disk '${id}' is hands-off: ${inv.handsOffReason ?? inv.handsOff}`
+        : `disk '${id}' is not available (status: ${inv.status}${inv.poolName ? `, pool '${inv.poolName}'` : ''})`)
       continue
     }
     approved.push({ id, usableBytes: inv.size, logicalSectorSize: inv.logicalSectorSize })

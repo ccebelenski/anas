@@ -1,9 +1,13 @@
 import type { CommandExecutor } from '../executor/types.js'
+import type { ConfigfsOptions, LunHolder } from './iscsi-configfs.js'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { zvolDevicePath } from '@anas/shared'
+import { describeLunHolder, lunHoldingDevice } from './iscsi-configfs.js'
 
 /**
- * Busy-unmount root-cause diagnosis (story 3.29, docs/EPICS-HISTORY.md Epic 3).
+ * Busy-unmount root-cause diagnosis (story 3.29, docs/EPICS-HISTORY.md Epic 3;
+ * the LIO branch is story `iscsi.6`).
  *
  * When an unmount fails because the filesystem is busy, the raw error names WHAT
  * failed but not WHY: the pve5 incident surfaced only
@@ -22,6 +26,19 @@ import { join } from 'node:path'
  * not; see fixtures/busy/NOTES.md) and is the tool the operator reached for. The
  * terse `fuser -m <path>` form is used (bare PIDs on stdout, single-stream);
  * the command name is read from `/proc/<pid>/comm`.
+ *
+ * **The LIO branch (story `iscsi.6`).** There is one holder `fuser` cannot see.
+ * When the kernel iSCSI target is serving a zvol or an image file, `fuser -m`,
+ * `lsof` and `/sys/block/<dev>/holders/` ALL report nothing (GT-41) — the claim
+ * exists only in configfs, as `CLAIMED: IBLOCK` plus the backstore's
+ * `udev_path`. So a `zpool export` or a `zfs destroy` that hits `dataset is
+ * busy` because of a LUN produces, today, a busy error with an EMPTY holder
+ * list: the worst possible answer, because it reads as "nothing is holding it,
+ * try again". {@link diagnoseLunHolder} asks configfs, and when it answers,
+ * `fuser` is NOT consulted at all — it has nothing to add and its silence is
+ * exactly what made the original message useless. Same fail-open posture as
+ * every other branch: no LIO, no match, any throw ⇒ fall straight through to
+ * the process-based diagnosis.
  */
 
 const FUSER = '/usr/bin/fuser'
@@ -36,6 +53,13 @@ const BUSY_RE = /busy/i
 const UMOUNT_PATH_RE = /umount:\s+(\/[^:]+):/
 /** A `'…'`-quoted absolute path (ZFS `cannot unmount '<path>'`). */
 const QUOTED_PATH_RE = /'(\/[^']+)'/
+/**
+ * A `'…'`-quoted ZFS DATASET name — `cannot destroy 'tank/vol1': dataset is
+ * busy`. Not a path, so `QUOTED_PATH_RE` (which demands a leading `/`) misses
+ * it entirely, which is why a busy zvol destroy has never carried a holder
+ * clause. A dataset name is `pool/child…`, no leading slash, no spaces.
+ */
+const QUOTED_TOKEN_RE = /'([^'\s]+)'/
 /** Whitespace splitter for `fuser` terse PID tokens. */
 const WHITESPACE_RE = /\s+/
 /** Leading digits of a `fuser` PID token (drops any trailing access letter). */
@@ -49,9 +73,21 @@ export interface BusyHolder {
   pid: number
 }
 
-export interface BusyDiagnosisOptions {
+/**
+ * Injection points for the two diagnoses. `root`/`blockRoot` come from
+ * {@link ConfigfsOptions} and are the LIO configfs tree — overridable so a test
+ * (and a dev box with no LIO) never reads the kernel.
+ */
+export interface BusyDiagnosisOptions extends ConfigfsOptions {
   /** /proc root — overridable so `/proc/<pid>/comm` reads are testable. */
   procRoot?: string
+  /**
+   * The ZFS dataset the caller was operating on, when it knows one. A zvol's
+   * busy error names the DATASET (`cannot destroy 'tank/vol1'`), not a path, so
+   * without this the LIO branch would have to trust the message alone. Callers
+   * that know better say so; the message is still parsed as a fallback.
+   */
+  dataset?: string
 }
 
 /**
@@ -76,6 +112,27 @@ export function extractBusyPath(text: string): string | null {
   if (quoted)
     return quoted[1]
   return null
+}
+
+/**
+ * The ZFS DATASET a busy error names, if it names one rather than a path.
+ *
+ * `zfs destroy` of a claimed zvol says `cannot destroy 'tank/vol1': dataset is
+ * busy` — the quoted token is a dataset name with no leading slash, so
+ * {@link extractBusyPath} (which requires one) returns null and the whole
+ * diagnosis used to stop there. A zvol has no mountpoint to run `fuser` against
+ * anyway; what it has is `/dev/zvol/<dataset>`, which is exactly what LIO
+ * stores as the backstore's `udev_path` (GT-48). Null when the message quotes a
+ * path, quotes nothing, or quotes a bare pool name (no `/`).
+ */
+export function extractBusyDataset(text: string): string | null {
+  const quoted = text.match(QUOTED_TOKEN_RE)
+  if (!quoted)
+    return null
+  const token = quoted[1]
+  if (token.startsWith('/') || !token.includes('/'))
+    return null
+  return token
 }
 
 /**
@@ -141,14 +198,65 @@ export async function diagnoseBusyPath(
 }
 
 /**
+ * The LIO branch (story `iscsi.6`): which iSCSI LUN, if any, is holding this?
+ *
+ * Tries each identity the caller and the message between them can supply, in
+ * order of certainty:
+ *
+ *   1. the caller's known path (a mountpoint, an image file, a device node);
+ *   2. the path the busy message quotes;
+ *   3. `/dev/zvol/<dataset>` for the dataset the caller knows or the message
+ *      quotes — the stable by-name path LIO actually stores (never `/dev/zdN`,
+ *      GT-48).
+ *
+ * A directory argument also matches any LUN backed by a file underneath it,
+ * which is what a busy `zpool export` or a busy dataset destroy needs.
+ *
+ * FAIL-OPEN: no LIO, no configfs, no match, any throw ⇒ null, and the caller
+ * falls through to the process-based diagnosis exactly as before.
+ */
+export async function diagnoseLunHolder(
+  errorText: string,
+  path?: string,
+  opts?: BusyDiagnosisOptions,
+): Promise<LunHolder | null> {
+  const dataset = opts?.dataset ?? extractBusyDataset(errorText)
+  const candidates = [
+    path,
+    extractBusyPath(errorText),
+    dataset ? zvolDevicePath(dataset) : null,
+  ]
+  for (const candidate of candidates) {
+    if (!candidate)
+      continue
+    try {
+      const holder = await lunHoldingDevice(candidate, opts)
+      if (holder)
+        return holder
+    }
+    catch {
+      // Unreadable configfs — fall through to the next candidate, then to fuser.
+    }
+  }
+  return null
+}
+
+/**
  * The wire-up entry point. Given a surfaced error and (optionally) the known
- * target path, append the holding-process clause IFF the error is a busy
- * failure AND a path is known or derivable AND holders are found. In every other
- * case the original error text is returned VERBATIM — diagnosis never masks the
- * primary failure.
+ * target path, append the holder clause IFF the error is a busy failure AND a
+ * holder is found. In every other case the original error text is returned
+ * VERBATIM — diagnosis never masks the primary failure.
  *
  *   enrichBusyError(exec, "cannot unmount '/tank': pool or dataset is busy")
  *     → "cannot unmount '/tank': pool or dataset is busy — held open by: smbd(567)"
+ *
+ * TWO diagnoses, tried in that order and never both (story `iscsi.6`):
+ *
+ *   1. **the LIO branch** — configfs knows whether the kernel target is serving
+ *      this object. When it is, `fuser` is NOT run: it would return nothing
+ *      (GT-41) and "held open by: " with an empty list is worse than silence.
+ *   2. **the process branch** — the original 3.29 `fuser`/`comm` diagnosis,
+ *      byte-for-byte unchanged for every path LIO is not holding.
  */
 export async function enrichBusyError(
   executor: CommandExecutor,
@@ -158,6 +266,10 @@ export async function enrichBusyError(
 ): Promise<string> {
   if (!isBusyError(errorText))
     return errorText
+  // The one holder `fuser` cannot see. Asked first, and answered exclusively.
+  const lun = await diagnoseLunHolder(errorText, path, opts)
+  if (lun)
+    return `${errorText} — ${describeLunHolder(lun)}`
   const target = path ?? extractBusyPath(errorText)
   if (!target)
     return errorText

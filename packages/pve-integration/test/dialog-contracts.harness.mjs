@@ -250,6 +250,10 @@ function makeComponent(cfg, parent) {
     return c.store && c.store.setRootNode ? c.store.setRootNode(rootCfg) : null
   }
   /** Select a TREE node (as opposed to a grid row) and fire selectionchange. */
+  // ExtJS's own setter. Two sources (67-mounts, 39-ahr) set a disabled button's
+  // reason through it rather than assigning `.tooltip`, so the stub must model
+  // it or their tooltips would be untestable.
+  c.setTooltip = function (v) { c.tooltip = v || '' }
   c.selectNode = function (node) {
     c._selection = node ? [node] : []
     c.fireEvent('selectionchange', {}, c._selection)
@@ -417,6 +421,17 @@ function makeAnas(routes) {
 }
 
 function loadSource(file, routes) {
+  return loadSources([file], routes)
+}
+
+/**
+ * Load SEVERAL sources into one sandbox, sharing one ANAS object — which is how
+ * the real page works. The Pools grid's toolbar is built from
+ * `ANAS.pools.actions`, a list that `36-pool-export.js` and `37-pool-destroy.js`
+ * push into; loading `30-pools.js` alone would produce a toolbar with no
+ * Export/Destroy buttons to gate.
+ */
+function loadSources(files, routes) {
   const head = { appendChild() {} }
   const doc = {
     hidden: false,
@@ -442,7 +457,8 @@ function loadSource(file, routes) {
     setTimeout: (fn) => { fn(); return 1 },
     clearTimeout: () => {},
   }
-  vm.runInNewContext(readFileSync(join(SRC, file), 'utf8'), sandbox, { filename: file })
+  for (const file of files)
+    vm.runInNewContext(readFileSync(join(SRC, file), 'utf8'), sandbox, { filename: file })
   return win.ANAS
 }
 
@@ -2162,6 +2178,394 @@ async function iscsiAddressFallbackChecks() {
 }
 
 // ============================================================================
+//  7. Held by a LUN (story iscsi.6) — every refused verb's button carries the
+//     reason, and an ABSENT field gates nothing.
+//
+//  The daemon answers the question ONCE, on the row (`heldByLun`), and all four
+//  screens read that one answer: no extra request per row, no second rule, and
+//  the tooltip is the daemon's own `detail` sentence — so a greyed button and
+//  the 409 it would have produced say the same thing.
+//
+//  The absent case is the version-skew ruling made testable: a new UI against a
+//  pre-iscsi.6 daemon gets no field at all and must render today's screen.
+// ============================================================================
+
+const HELD_VOL = {
+  targetIqn: 'iqn.2026-08.nas.anas:vmstore',
+  index: 0,
+  name: 'vmdisk1',
+  backingPath: '/dev/zvol/tank/vol1',
+  connectedInitiators: ['iqn.1993-08.org.debian:01:abc'],
+  detail: 'held by iSCSI LUN 0 \'vmdisk1\' of target iqn.2026-08.nas.anas:vmstore (/dev/zvol/tank/vol1) with 1 live session',
+}
+
+const HELD_FS = {
+  targetIqn: 'iqn.2026-08.nas.anas:vmstore',
+  index: 1,
+  name: 'vmdisk2',
+  backingPath: '/tank/media/lun2.raw',
+  connectedInitiators: [],
+  detail: 'held by iSCSI LUN 1 \'vmdisk2\' of target iqn.2026-08.nas.anas:vmstore (/tank/media/lun2.raw)',
+}
+
+/** The same datasets as section 4, with the two held rows stamped. */
+const HELD_IMAGES_DATASET = {
+  name: 'tank/images',
+  pool: 'tank',
+  type: 'filesystem',
+  used: 1,
+  available: 1,
+  referenced: 1,
+  mountpoint: '/tank/images',
+  compression: 'lz4',
+  compressratio: 1,
+  quota: 0,
+  heldByLun: HELD_FS,
+}
+
+// `tank/vol1` is held as the LUN's own backing device; `tank/images` is held
+// because a LUN's IMAGE FILE lives under its mountpoint. `tank/media` is the
+// control and must stay fully usable.
+const HELD_DATASETS = [
+  ...TANK_DATASETS.map(d => (d.name === 'tank/vol1' ? { ...d, heldByLun: HELD_VOL } : d)),
+  HELD_IMAGES_DATASET,
+]
+
+const HELD_DATASET_ROUTES = {
+  ...DATASET_ROUTES,
+  'GET /pools/tank/datasets': { data: HELD_DATASETS, defaults: { volblocksize: 16384 } },
+}
+
+/** A snapshot row as the tree builds one, hung off `parent`. */
+function snapshotRecord(parent, name) {
+  const data = {
+    name: `@${name}`,
+    fullName: `${parent.get('fullName')}@${name}`,
+    pool: parent.get('pool'),
+    dataset: parent.get('fullName'),
+    snapshotName: name,
+    kind: 'snapshot',
+  }
+  return { data, get: k => data[k], set: (k, v) => { data[k] = v }, parentNode: parent }
+}
+
+async function openDatasetTree(routes) {
+  const ANAS = loadSource('60-datasets.js', routes)
+  const view = makeComponent(ANAS.views.datasets.factory('harness'), null)
+  const tree = view.down('#dsTree')
+  tree.fireEvent('afterrender', tree)
+  await settle()
+  return { ANAS, tree }
+}
+
+async function heldByLunDatasetChecks() {
+  const GATED = ['dsDestroy', 'dsResize', 'snapRollback']
+  const { tree } = await openDatasetTree(HELD_DATASET_ROUTES)
+
+  const volNode = findNode(tree, 'tank/vol1')
+  const fsNode = findNode(tree, 'tank/images')
+  const freeNode = findNode(tree, 'tank/media')
+  ok('held(datasets): the held volume row loaded', !!volNode)
+  ok('held(datasets): the held filesystem row loaded', !!fsNode)
+  if (!volNode || !fsNode || !freeNode) { return }
+
+  // The row carries the daemon's answer verbatim — the UI never re-derives it.
+  eq('held(datasets): the field reached the tree node', volNode.get('heldByLun'), HELD_VOL)
+
+  tree.selectNode(volNode)
+  let state = toolbarState(tree, GATED)
+  ok('held(volume): Destroy DISABLED', state.dsDestroy.disabled === true)
+  ok('held(volume): Destroy names the holding target', state.dsDestroy.tip.includes(HELD_VOL.targetIqn),
+    state.dsDestroy.tip)
+  ok('held(volume): Destroy names the LUN', /LUN 0 'vmdisk1'/.test(state.dsDestroy.tip), state.dsDestroy.tip)
+  ok('held(volume): Destroy says what to do next', /iSCSI screen/.test(state.dsDestroy.tip), state.dsDestroy.tip)
+  // A GROW is the supported live resize — refusing it would take away the only
+  // safe way to change a served volume's size.
+  ok('held(volume): Resize Volume STAYS ENABLED (grow is the live path)',
+    state.dsResize.disabled === false)
+
+  tree.selectNode(fsNode)
+  state = toolbarState(tree, GATED)
+  ok('held(filesystem): Destroy DISABLED (a LUN image lives under its mountpoint)',
+    state.dsDestroy.disabled === true)
+  ok('held(filesystem): Destroy names the LUN', /LUN 1 'vmdisk2'/.test(state.dsDestroy.tip), state.dsDestroy.tip)
+
+  // The rollback subject is the snapshot's PARENT dataset.
+  tree.selectNode(snapshotRecord(volNode, 'before-grow'))
+  state = toolbarState(tree, GATED)
+  ok('held(snapshot): Rollback DISABLED on a snapshot of a held volume',
+    state.snapRollback.disabled === true)
+  ok('held(snapshot): Rollback names the LUN', /LUN 0 'vmdisk1'/.test(state.snapRollback.tip),
+    state.snapRollback.tip)
+
+  tree.selectNode(snapshotRecord(freeNode, 'nightly'))
+  state = toolbarState(tree, GATED)
+  ok('held(snapshot): Rollback stays ENABLED on a snapshot of an unheld dataset',
+    state.snapRollback.disabled === false)
+  ok('held(snapshot): and carries no leftover excuse', state.snapRollback.tip === '',
+    state.snapRollback.tip)
+
+  // Selecting an unheld row must CLEAR the reason, not leave it stuck.
+  tree.selectNode(freeNode)
+  state = toolbarState(tree, GATED)
+  ok('held(unheld): Destroy enabled again', state.dsDestroy.disabled === false)
+  ok('held(unheld): and the reason is gone', state.dsDestroy.tip === '', state.dsDestroy.tip)
+  ok('held(datasets): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function heldByLunAbsentFieldChecks() {
+  // The SAME screen against a pre-iscsi.6 daemon: no `heldByLun` anywhere.
+  const { tree } = await openDatasetTree(DATASET_ROUTES)
+  const volNode = findNode(tree, 'tank/vol1')
+  const fsNode = findNode(tree, 'tank/media')
+  if (!volNode || !fsNode) { ok('skew: the rows loaded', false); return }
+
+  eq('skew: the row carries no heldByLun at all', volNode.get('heldByLun'), undefined)
+
+  tree.selectNode(volNode)
+  let state = toolbarState(tree, ['dsDestroy', 'dsResize'])
+  ok('skew(volume): Destroy stays ENABLED — absent means no gating',
+    state.dsDestroy.disabled === false)
+  ok('skew(volume): and carries no reason', state.dsDestroy.tip === '', state.dsDestroy.tip)
+
+  tree.selectNode(fsNode)
+  state = toolbarState(tree, ['dsDestroy'])
+  ok('skew(filesystem): Destroy stays ENABLED', state.dsDestroy.disabled === false)
+
+  tree.selectNode(snapshotRecord(volNode, 'before-grow'))
+  state = toolbarState(tree, ['snapRollback'])
+  ok('skew(snapshot): Rollback stays ENABLED', state.snapRollback.disabled === false)
+  ok('skew: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ---- Pools / Hybrid RAID / Mounts: the same field, three more toolbars ------
+
+const HELD_POOL = {
+  targetIqn: 'iqn.2026-08.nas.anas:vmstore',
+  index: 0,
+  name: 'vmdisk1',
+  backingPath: '/dev/zvol/tank/vol1',
+  connectedInitiators: [],
+  detail: 'held by iSCSI LUN 0 \'vmdisk1\' of target iqn.2026-08.nas.anas:vmstore (/dev/zvol/tank/vol1)',
+}
+
+function poolRow(name, extra) {
+  return {
+    name,
+    state: 'ONLINE',
+    size: 8 * GiB,
+    allocated: GiB,
+    free: 7 * GiB,
+    capacity: 12,
+    fragmentation: 0,
+    dedupRatio: 1,
+    scanRunning: false,
+    trimSupported: false,
+    upgradeAvailable: false,
+    mountpoint: `/${name}`,
+    mounted: true,
+    pveStorages: [],
+    ...extra,
+  }
+}
+
+async function heldByLunPoolChecks() {
+  // Export and Destroy are registered by their own action files, which push
+  // into the `ANAS.pools.actions` list the grid's toolbar is built from — so
+  // all three sources have to share ONE sandbox.
+  const ANAS = loadSources(['15-gfx.js', '30-pools.js', '36-pool-export.js', '37-pool-destroy.js'], {
+    'GET /pools': { data: [poolRow('tank', { heldByLun: HELD_POOL }), poolRow('spare')] },
+  })
+  // `ANAS.views.pools.factory` returns the grid itself (no wrapping panel).
+  const view = makeComponent(ANAS.views.pools.factory('harness'), null)
+  const grid = view.itemId === 'poolsGrid' ? view : view.down('#poolsGrid')
+  ok('held(pools): the grid exists', !!grid, JSON.stringify(warnings))
+  if (!grid) { return }
+  grid.fireEvent('afterrender', grid)
+  await settle()
+
+  const GATED = ['exportPool', 'destroyPool']
+  const rowOf = name => grid.getStore().findExact('name', name)
+  grid.selectRow(rowOf('tank'))
+  let state = toolbar(grid, GATED)
+  ok('held(pools): the action buttons exist', !!state.destroyPool && !!state.exportPool)
+  if (!state.destroyPool || !state.exportPool) { return }
+  ok('held(pools): Destroy DISABLED', state.destroyPool.disabled === true)
+  ok('held(pools): Export DISABLED', state.exportPool.disabled === true)
+  ok('held(pools): Destroy names the LUN', /LUN 0 'vmdisk1'/.test(state.destroyPool.tip), state.destroyPool.tip)
+  ok('held(pools): Export names the LUN', /LUN 0 'vmdisk1'/.test(state.exportPool.tip), state.exportPool.tip)
+
+  grid.selectRow(rowOf('spare'))
+  state = toolbar(grid, GATED)
+  ok('held(pools): an unheld pool keeps Destroy', state.destroyPool.disabled === false)
+  ok('held(pools): and carries no leftover reason', state.destroyPool.tip === '', state.destroyPool.tip)
+  ok('held(pools): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+const AHR_HELD = {
+  targetIqn: 'iqn.2026-08.nas.anas:blockstore',
+  index: 0,
+  name: 'ahrblock1',
+  backingPath: '/mnt/anas-ahr/ahr0/images/block1.raw',
+  connectedInitiators: [],
+  detail: 'held by iSCSI LUN 0 \'ahrblock1\' of target iqn.2026-08.nas.anas:blockstore (/mnt/anas-ahr/ahr0/images/block1.raw)',
+}
+
+function ahrPoolRow(name, extra) {
+  return {
+    name,
+    ahrType: 'ahr1',
+    state: 'healthy',
+    mountpoint: `/mnt/anas-ahr/${name}`,
+    mounted: true,
+    subvolLayout: true,
+    disks: [],
+    arrays: [],
+    vg: { name, sizeBytes: 8 * GiB, freeBytes: 0 },
+    lv: { name: `${name}-vol`, sizeBytes: 8 * GiB },
+    capacity: { rawBytes: 8 * GiB, usableBytes: 6 * GiB, usedBytes: GiB, freeBytes: 5 * GiB },
+    advisories: [],
+    ...extra,
+  }
+}
+
+async function heldByLunAhrChecks() {
+  const ANAS = loadSources(['15-gfx.js', '39-ahr.js'], {
+    'GET /ahr': { data: [ahrPoolRow('ahr0', { heldByLun: AHR_HELD }), ahrPoolRow('ahr1')] },
+  })
+  const view = makeComponent(ANAS.views.ahr.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.itemId === 'ahrGrid' ? view : view.down('#ahrGrid')
+  ok('held(ahr): the grid exists', !!grid, JSON.stringify(warnings))
+  if (!grid) { return }
+
+  const GATED = ['destroy', 'changeMount']
+  const rowOf = name => grid.getStore().findExact('name', name)
+  grid.selectRow(rowOf('ahr0'))
+  let state = toolbar(grid, GATED)
+  ok('held(ahr): the action buttons exist', !!state.destroy && !!state.changeMount)
+  if (!state.destroy || !state.changeMount) { return }
+  ok('held(ahr): Destroy DISABLED', state.destroy.disabled === true)
+  ok('held(ahr): Change mount DISABLED', state.changeMount.disabled === true)
+  ok('held(ahr): Destroy names the LUN', /LUN 0 'ahrblock1'/.test(state.destroy.tip), state.destroy.tip)
+  ok('held(ahr): Change mount names the LUN', /LUN 0 'ahrblock1'/.test(state.changeMount.tip), state.changeMount.tip)
+
+  grid.selectRow(rowOf('ahr1'))
+  state = toolbar(grid, GATED)
+  ok('held(ahr): an unheld pool keeps Destroy', state.destroy.disabled === false)
+  ok('held(ahr): and carries no leftover reason', state.destroy.tip === '', state.destroy.tip)
+  ok('held(ahr): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+const MOUNT_HELD = {
+  targetIqn: 'iqn.2026-08.nas.anas:vmstore',
+  index: 1,
+  name: 'vmdisk2',
+  backingPath: '/mnt/anas-nfs/blocks/lun.raw',
+  connectedInitiators: [],
+  detail: 'held by iSCSI LUN 1 \'vmdisk2\' of target iqn.2026-08.nas.anas:vmstore (/mnt/anas-nfs/blocks/lun.raw)',
+}
+
+function mountRow(mountpoint, extra) {
+  return {
+    mountpoint,
+    source: 'nas.example.test:/export/blocks',
+    type: 'nfs',
+    fstype: 'nfs4',
+    state: 'ok',
+    mounted: true,
+    persistent: true,
+    remote: true,
+    automount: false,
+    disabled: false,
+    pveManaged: false,
+    ahrManaged: false,
+    readOnly: false,
+    ...extra,
+  }
+}
+
+async function heldByLunMountChecks() {
+  const ANAS = loadSource('67-mounts.js', {
+    'GET /mounts': { data: [mountRow('/mnt/anas-nfs', { heldByLun: MOUNT_HELD }), mountRow('/mnt/other')] },
+  })
+  const view = makeComponent(ANAS.views.mounts.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#mountsGrid')
+  ok('held(mounts): the grid exists', !!grid)
+  if (!grid) { return }
+
+  const GATED = ['mountToggle', 'mountRemove', 'mountDisable']
+  const rowOf = mp => grid.getStore().findExact('mountpoint', mp)
+  grid.selectRow(rowOf('/mnt/anas-nfs'))
+  let state = toolbar(grid, GATED)
+  ok('held(mounts): the action buttons exist', !!state.mountToggle && !!state.mountRemove)
+  if (!state.mountToggle || !state.mountRemove) { return }
+  ok('held(mounts): Unmount DISABLED', state.mountToggle.disabled === true)
+  ok('held(mounts): Remove DISABLED', state.mountRemove.disabled === true)
+  ok('held(mounts): Unmount names the LUN', /LUN 1 'vmdisk2'/.test(state.mountToggle.tip), state.mountToggle.tip)
+  ok('held(mounts): Remove names the LUN', /LUN 1 'vmdisk2'/.test(state.mountRemove.tip), state.mountRemove.tip)
+
+  grid.selectRow(rowOf('/mnt/other'))
+  state = toolbar(grid, GATED)
+  ok('held(mounts): an unheld mount keeps Unmount', state.mountToggle.disabled === false)
+  ok('held(mounts): and Remove', state.mountRemove.disabled === false)
+  ok('held(mounts): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ---- The iSCSI screen's own two additions (story iscsi.6, clauses 4 and 7) --
+
+async function iscsiBackingOwnerChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { ANAS } = await openIscsiView(ISCSI_ROUTES)
+  const owner = ANAS.iscsi.backingOwner
+  const rec = data => ({ data, get: k => data[k] })
+
+  // NAME ONLY — no navigation machinery, no deep link, no cross-view router.
+  eq('owner: a zvol points at Datasets, by dataset name',
+    owner(rec({ kind: 'zvol', dataset: 'tank/vol1', backingPath: '/dev/zvol/tank/vol1' })),
+    { screen: 'Datasets', name: 'tank/vol1' })
+  eq('owner: a file on a dataset points at Datasets',
+    owner(rec({ kind: 'file', dataset: 'tank/images', pool: 'tank', backingPath: '/tank/images/lun.raw' })),
+    { screen: 'Datasets', name: 'tank/images' })
+  eq('owner: a file on an AHR pool points at Hybrid RAID, by pool name',
+    owner(rec({ kind: 'file', pool: 'ahr0', backingPath: '/mnt/anas-ahr/ahr0/lun.raw' })),
+    { screen: 'Hybrid RAID', name: 'ahr0' })
+  eq('owner: any other resolvable file points at Mounts, by its directory',
+    owner(rec({ kind: 'file', backingPath: '/mnt/anas-nfs/blocks/lun.raw' })),
+    { screen: 'Mounts', name: '/mnt/anas-nfs/blocks' })
+  eq('owner: a foreign backing names no screen (none of ours owns it)',
+    owner(rec({ kind: 'foreign', backingPath: '/dev/sdz' })), null)
+  eq('owner: an unresolved backing names no screen either',
+    owner(rec({ kind: 'unresolved', backingPath: '/gone/lun.raw' })), null)
+  ok('owner: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiPortalWarningChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { ANAS } = await openIscsiView(ISCSI_ROUTES)
+  const warn = ANAS.iscsi.portalAddressWarning
+  const carried = [{ address: '192.168.200.50', iface: 'vmbr0' }]
+  const missing = warn(carried, '203.0.113.77')
+
+  eq('portal: an address the node carries warns about nothing',
+    warn(carried, '192.168.200.50'), '')
+  ok('portal: an address NO interface carries warns (LIO binds it silently — GT-24)',
+    missing.includes('203.0.113.77'), missing)
+  ok('portal: the warning says LIO will never tell you', /never tell you/.test(missing), missing)
+  // A WARNING, never a block: an address about to exist is legitimate.
+  ok('portal: it still says the portal would be created', /bind the portal anyway/.test(missing), missing)
+  eq('portal: an EMPTY address list says nothing (PVE\'s network API was unreadable)',
+    warn([], '203.0.113.77'), '')
+  eq('portal: a blank field says nothing', warn(carried, ''), '')
+  eq('portal: matching is case-insensitive (IPv6)',
+    warn([{ address: 'fd00:6774:0:1::1' }], 'FD00:6774:0:1::1'), '')
+  ok('portal: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
 
 await backupChecks()
 warnings.length = 0
@@ -2188,6 +2592,15 @@ for (const check of [
   iscsiAddressFallbackChecks,
   iscsiRepairChecks,
   iscsiUnresolvedLunChecks,
+  // Story iscsi.6 — the held-by-LUN gating on all four screens, the version-skew
+  // absent case, and the iSCSI screen's backing-owner label + portal warning.
+  heldByLunDatasetChecks,
+  heldByLunAbsentFieldChecks,
+  heldByLunPoolChecks,
+  heldByLunAhrChecks,
+  heldByLunMountChecks,
+  iscsiBackingOwnerChecks,
+  iscsiPortalWarningChecks,
 ]) {
   warnings.length = 0
   // `created.windows` is module-global; a dialog a previous section left open

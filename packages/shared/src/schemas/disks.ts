@@ -23,6 +23,21 @@ export const DiskUsageStatus = z.enum([
 ])
 export type DiskUsageStatus = z.infer<typeof DiskUsageStatus>
 
+/**
+ * Why a disk ANAS can see is nonetheless hands-off (story `iscsi.6`).
+ *
+ * `iscsi-served-here` — the disk arrived over the iSCSI transport and its SCSI
+ * serial is one of THIS node's own LUN serials: the node's initiator is logged
+ * in to the node's own target. `lsblk` reports a perfectly blank SCSI disk
+ * (GT-43) and nothing in the inventory can tell it apart from a real remote
+ * array — pooling it would build storage on top of itself.
+ *
+ * An enum rather than a boolean so a second reason can be added without a new
+ * field, and so the UI badge can key off the reason rather than parse prose.
+ */
+export const DiskHandsOffTag = z.enum(['iscsi-served-here'])
+export type DiskHandsOffTag = z.infer<typeof DiskHandsOffTag>
+
 /** Derived disk-health level (fuses SMART pass/fail with ZFS error counts) */
 export const DiskHealthStatus = z.enum([
   'healthy',
@@ -118,8 +133,35 @@ export const Disk = z.object({
   healthStatus: DiskHealthStatus,
   /** Partitions on this disk */
   partitions: z.array(DiskPartition),
+  /**
+   * Hands-off tag (story `iscsi.6`) — the disk is a real, blank SCSI device
+   * from the kernel's point of view, so `status` stays honest, but ANAS knows
+   * something about it the inventory cannot see and must not offer it for
+   * composition. Additive and optional: absent means nothing is claiming it,
+   * and an older daemon omits it entirely (version-skew ruling).
+   */
+  handsOff: DiskHandsOffTag.optional(),
+  /** Why the disk is hands-off — one sentence, ready for a badge tooltip. */
+  handsOffReason: z.string().optional(),
 })
 export type Disk = z.infer<typeof Disk>
+
+/**
+ * May this disk be offered for composition — a ZFS vdev, an AHR band, a spare?
+ *
+ * TWO conditions, and they answer different questions. `status === 'available'`
+ * is the BLOCK LAYER's answer: the disk is blank, no partitions, no labels, no
+ * pool. `handsOff === undefined` is ANAS's: nothing outside the block layer is
+ * claiming it. A LUN this node serves to its own initiator satisfies the first
+ * and fails the second (story `iscsi.6`, GT-43) — `lsblk` sees a pristine SCSI
+ * disk and cannot possibly know it is a zvol on the same box.
+ *
+ * ONE predicate, called by every candidacy check (composer, AHR composer, spare
+ * picker, expansion resume) rather than each re-deriving "available means…".
+ */
+export function isComposableDisk(disk: Pick<Disk, 'status'> & { handsOff?: DiskHandsOffTag }): boolean {
+  return disk.status === 'available' && disk.handsOff === undefined
+}
 
 /** A single SMART attribute (SATA/SAS) */
 export const SmartAttribute = z.object({

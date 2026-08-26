@@ -323,7 +323,7 @@ describe('lunHoldingDevice — the busy-diagnosis seam (GT-41)', () => {
     assert.equal(holder.claimed, 'IBLOCK')
     assert.match(
       describeLunHolder(holder),
-      /held by LUN 0 of iSCSI target iqn\.2026-08\.dev\.anas\.gtiscsi:target1/,
+      /held by iSCSI LUN 0 'gtiscsi_vol1' of target iqn\.2026-08\.dev\.anas\.gtiscsi:target1/,
     )
   })
 

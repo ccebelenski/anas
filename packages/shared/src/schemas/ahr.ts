@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { AbsolutePath, DevicePath, DiskId, PoolName, UUID } from './common.js'
+import { IscsiHeldByLun } from './iscsi.js'
 
 /**
  * AHR — ANAS Hybrid RAID wire shapes for /v1/ahr (Epic 11, AHR-DESIGN §3).
@@ -322,6 +323,14 @@ export const AhrPool = z.object({
    * expansion is in flight.
    */
   expansion: AhrExpansionIntent.optional(),
+  /**
+   * An iSCSI LUN currently holds an image file on this pool (story `iscsi.6`).
+   * A file on the btrfs volume IS the AHR block object, so Destroy, Unmount and
+   * Change mount are refused while a LUN serves one. Present only when something
+   * holds it; an older daemon omits it (version-skew ruling: no field ⇒ no
+   * gating).
+   */
+  heldByLun: IscsiHeldByLun.optional(),
 })
 export type AhrPool = z.infer<typeof AhrPool>
 

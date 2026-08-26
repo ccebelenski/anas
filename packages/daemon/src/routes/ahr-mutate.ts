@@ -4,7 +4,8 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { AhrLayoutDisk } from '../services/ahr-layout.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
-import { AhrCreateRequest, AhrMountpointRequest, PoolName } from '@anas/shared'
+import type { IscsiPaths } from '../services/iscsi.js'
+import { AhrCreateRequest, AhrMountpointRequest, isComposableDisk, PoolName } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
 import { parseVgsReport, VGS_ARGS } from '../parsers/lvm-report.js'
@@ -15,6 +16,7 @@ import { AhrPlanError, fmtBytes, MIXED_SECTOR_WARNING_PREFIX, planFreshLayout } 
 import { scrubAhrPool } from '../services/ahr-scrub.js'
 import { AHR_FINDMNT_ARGS, readAhrPools } from '../services/ahr-topology.js'
 import { readConfig } from '../services/config-writer.js'
+import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
 import { collectDisks } from './disks.js'
 import { requireIdentity } from './identity.js'
@@ -42,6 +44,12 @@ export interface AhrMutationRouteOptions {
    * kernel, which a test cannot change. Production always omits it.
    */
   kernelRelease?: string
+  /**
+   * iSCSI read-layer path overrides (story iscsi.6) — Destroy and Change mount
+   * refuse while a LUN's image file lives on the pool. Real host paths by
+   * default; overridable so a test never reads the kernel.
+   */
+  iscsiPaths?: IscsiPaths
 }
 
 /**
@@ -58,6 +66,24 @@ export interface AhrMutationRouteOptions {
  */
 export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutationRouteOptions) {
   const { executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase, kernelRelease } = opts
+  const iscsiPaths = opts.iscsiPaths ?? {}
+
+  /**
+   * Is an iSCSI LUN's image file living on this AHR pool (story iscsi.6)?
+   *
+   * A file on the btrfs volume IS the AHR block object — AHR's only backing kind
+   * — so it is matched two ways: by the pool NAME (`classifyBacking` resolves an
+   * AHR-hosted file onto its pool) and by the MOUNTPOINT (which still answers
+   * when the pool could not be classified). `rm` of a backing file succeeds
+   * silently and LIO keeps serving the unlinked inode (GT-40), so an unmount or
+   * a destroy under a LUN is data loss with no error anywhere.
+   */
+  async function ahrPoolHeldByLun(pool: { name: string, mountpoint: string, mounted: boolean }) {
+    const subject: { pool: string, path?: string } = { pool: pool.name }
+    if (pool.mounted && pool.mountpoint.startsWith('/'))
+      subject.path = pool.mountpoint
+    return heldByLun(createIscsiClaimCache(executor, iscsiPaths), subject)
+  }
 
   /** Parse + validate a pool-name param, or 400 and return null. */
   function parsePoolName(raw: string, reply: FastifyReply): string | null {
@@ -137,8 +163,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         problems.push(`disk '${id}' not found`)
         continue
       }
-      if (disk.status !== 'available') {
-        problems.push(`disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
+      if (!isComposableDisk(disk)) {
+        problems.push(disk.handsOff
+          ? `disk '${id}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`
+          : `disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
         continue
       }
       selected.push({ id: disk.id, usableBytes: disk.size, logicalSectorSize: disk.logicalSectorSize, model: disk.model })
@@ -242,6 +270,16 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       return { error: { code: 'CONFLICT', message: `'${mp}' is already claimed in fstab — pick an unused path` } }
     }
 
+    // Story iscsi.6: moving the mountpoint UNMOUNTS the filesystem, which pulls
+    // the image file out from under a live LIO backstore. A hard 409 with no
+    // confirm bypass — "unsafe now", before anything is touched.
+    const moveHeld = await ahrPoolHeldByLun(pool)
+    if (moveHeld) {
+      const refusal = heldByLunRefusal(`the mountpoint of AHR pool '${name}'`, 'Changing', moveHeld)
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
+    }
+
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'ahr.mountpoint',
       params: { name, mountpoint: mp },
@@ -283,6 +321,17 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     if (!pool) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${name}' not found` } }
+    }
+
+    // Story iscsi.6: a LUN's image file on this pool makes the destroy unsafe
+    // NOW — every array, partition and byte goes, including the file LIO is
+    // serving, and nothing in ZFS/btrfs/md is going to refuse it. Hard 409, no
+    // confirm bypass, before the confirm code is minted.
+    const destroyHeld = await ahrPoolHeldByLun(pool)
+    if (destroyHeld) {
+      const refusal = heldByLunRefusal(`AHR pool '${name}'`, 'Destroying', destroyHeld)
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
     }
 
     // Consumers under the mountpoint (submounts — shares/backups serving from

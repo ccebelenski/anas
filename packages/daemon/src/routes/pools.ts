@@ -4,6 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { IscsiPaths } from '../services/iscsi.js'
 import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, PoolMountpointRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
@@ -17,6 +18,7 @@ import { confirmGate } from '../safety/gate.js'
 import { isRootPool } from '../safety/root-pool.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
+import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
 import { resolveLeafKernel } from './disks.js'
@@ -459,11 +461,42 @@ export async function poolRoutes(
      *  real PVE file; overridable so the hands-off guard is testable.
      */
     pveStoragePath?: string
+    /**
+     * iSCSI read-layer path overrides (story iscsi.6) — the held-by-LUN gate on
+     * Destroy/Export reads configfs. Defaults to the real host locations.
+     */
+    iscsiPaths?: IscsiPaths
   },
 ) {
   const { executor, jobQueue, confirmStore } = opts
   const fstabPath = opts.fstabPath ?? '/etc/fstab'
   const pveCfgPath = opts.pveStoragePath ?? PVE_STORAGE_CFG
+  const iscsiPaths = opts.iscsiPaths ?? {}
+
+  /**
+   * Is an iSCSI LUN holding anything on this pool (story iscsi.6)?
+   *
+   * A zvol served as a block backstore, or an image file on one of the pool's
+   * datasets — both resolve onto the pool root in the claim, so ONE question
+   * covers both backing kinds.
+   */
+  async function poolHeldByLun(poolName: string) {
+    return heldByLun(createIscsiClaimCache(executor, iscsiPaths), { pool: poolName })
+  }
+
+  /** Stamp `heldByLun` onto every pool a LUN holds — one read for the grid. */
+  async function annotatePoolsHeldByLun(pools: PoolSummary[]): Promise<void> {
+    if (pools.length === 0)
+      return
+    const cache = createIscsiClaimCache(executor, iscsiPaths)
+    if ((await cache.claims()).length === 0)
+      return
+    for (const pool of pools) {
+      const held = await heldByLun(cache, { pool: pool.name })
+      if (held)
+        pool.heldByLun = held
+    }
+  }
 
   /** The PVE storages that reference a pool (story 3.25) — empty ⇒ ANAS-managed. */
   async function poolPveStorages(poolName: string): Promise<{ storage: string }[]> {
@@ -567,6 +600,12 @@ export async function poolRoutes(
         pveStorages: pveStorages.get(pool.name) ?? [],
       }
     })
+
+    // Story iscsi.6: which pools a LUN is holding, so the grid can grey Destroy
+    // and Export with the reason in the tooltip rather than letting the operator
+    // discover it from a 409. ONE claims read for the whole grid — never one per
+    // row — and additive: a pool nothing holds carries no field at all.
+    await annotatePoolsHeldByLun(pools)
 
     return { data: pools }
   })
@@ -957,7 +996,7 @@ export async function poolRoutes(
           // `zfs set mountpoint` unmounts to move — a busy pool blocks it; name
           // the holders (3.29). Path comes from the ZFS error (`cannot unmount`).
           const base = result.stderr.trim() || `zfs set mountpoint exited with code ${result.exitCode}`
-          throw new Error(await enrichBusyError(executor, base))
+          throw new Error(await enrichBusyError(executor, base, undefined, configfsOptionsFrom(iscsiPaths)))
         }
         return { pool: poolName, mountpoint: mp }
       },
@@ -1428,6 +1467,19 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
+    // Story iscsi.6: a LUN on this pool makes the export unsafe NOW, so it is a
+    // hard 409 with no confirm bypass — BEFORE the confirm gate and before
+    // `zpool export`. ZFS does refuse an export whose dataset is open (GT-40),
+    // but only with `pool or dataset is busy` and only for the FILE kind that
+    // holds a mount; naming the LUN up front is the difference between "try
+    // again" and "here is what to do". Fail-open: no LIO ⇒ nothing held.
+    const exportHeld = await poolHeldByLun(poolName)
+    if (exportHeld) {
+      const refusal = heldByLunRefusal(`pool '${poolName}'`, 'Exporting', exportHeld)
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
+    }
+
     // No cheap signal for active shares yet (Epics 6–7) — warn generically that
     // the pool becomes unavailable. Share-aware warnings land with share support.
     const warnings = [
@@ -1451,7 +1503,11 @@ export async function poolRoutes(
       async () => {
         const result = await executor.exec('/usr/sbin/zpool', args)
         if (result.exitCode !== 0) {
-          throw new Error(result.stderr.trim() || `zpool export exited with code ${result.exitCode}`)
+          // A LUN added between the pre-flight refusal above and this exec still
+          // reaches ZFS, and ZFS's `pool or dataset is busy` names nothing that
+          // `fuser` can find (GT-41) — the LIO branch of the diagnosis does.
+          const base = result.stderr.trim() || `zpool export exited with code ${result.exitCode}`
+          throw new Error(await enrichBusyError(executor, base, undefined, configfsOptionsFrom(iscsiPaths)))
         }
         return null
       },
@@ -1493,6 +1549,17 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
+    // Story iscsi.6: refuse a destroy while a LUN serves anything on the pool.
+    // Unlike export, `zpool destroy` is NOT reliably refused by ZFS for a zvol
+    // backstore — and a destroy that gets through takes the data with it. Hard
+    // 409, no confirm bypass, before the confirm gate is even minted.
+    const destroyHeld = await poolHeldByLun(poolName)
+    if (destroyHeld) {
+      const refusal = heldByLunRefusal(`pool '${poolName}'`, 'Destroying', destroyHeld)
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
+    }
+
     const warnings = [
       `Destroying '${poolName}' is irreversible — all data in the pool is permanently lost.`,
       `Every dataset, snapshot, and volume in '${poolName}' will be destroyed.`,
@@ -1526,7 +1593,7 @@ export async function poolRoutes(
           // A busy destroy fails to unmount a dataset — name the holders (3.29).
           // The path comes from the ZFS error itself (`cannot unmount '<path>'`).
           const base = result.stderr.trim() || `zpool destroy exited with code ${result.exitCode}`
-          throw new Error(await enrichBusyError(executor, base))
+          throw new Error(await enrichBusyError(executor, base, undefined, configfsOptionsFrom(iscsiPaths)))
         }
 
         // PVE parity (PVE/API2/Disks/ZFS.pm, their fix for Proxmox bug #2554) and

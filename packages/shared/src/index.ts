@@ -179,9 +179,11 @@ export {
 // Disk schemas
 export {
   Disk,
+  DiskHandsOffTag,
   DiskHealthStatus,
   DiskPartition,
   DiskUsageStatus,
+  isComposableDisk,
   SmartAttribute,
   SmartData,
   SmartHealth,
@@ -238,9 +240,11 @@ export {
   IscsiChapUserid,
   IscsiClaim,
   IscsiClaimList,
+  IscsiFirewallAdvisory,
   IscsiForeignChange,
   IscsiForeignChangeKind,
   IscsiHealth,
+  IscsiHeldByLun,
   IscsiIqn,
   IscsiLun,
   IscsiLunAttributes,

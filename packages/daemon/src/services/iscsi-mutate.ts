@@ -52,7 +52,7 @@ import { hostname } from 'node:os'
 import { join } from 'node:path'
 import { anasIqn, IscsiIqn } from '@anas/shared'
 import { readAhrPools } from './ahr-topology.js'
-import { CONFIGFS_TARGET_ROOT } from './iscsi-configfs.js'
+import { CONFIGFS_TARGET_ROOT, describeLunHolder } from './iscsi-configfs.js'
 import { computeIscsiHealth } from './iscsi-health.js'
 import { classifyBacking } from './iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from './iscsi.js'
@@ -1292,7 +1292,14 @@ export function claimsFromTargets(targets: IscsiTargetDetail[]): IscsiClaim[] {
         lunIndex: lun.index,
         backstoreName: lun.name,
         connectedInitiators: lun.connectedInitiators,
-        detail: `held by LUN ${lun.index} of iSCSI target ${target.iqn} (backstore '${lun.name}', ${lun.backingPath})${
+        // ONE phrasing, shared with `busy-diagnosis`'s LIO branch and every
+        // `iscsi.6` refusal body (describeLunHolder — single source).
+        detail: `${describeLunHolder({
+          lunIndex: lun.index,
+          backstoreName: lun.name,
+          targetIqn: target.iqn,
+          backingPath: lun.backingPath,
+        })}${
           lun.connectedInitiators.length > 0
             ? ` with ${lun.connectedInitiators.length} live session${lun.connectedInitiators.length === 1 ? '' : 's'}`
             : ''}`,

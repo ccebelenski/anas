@@ -28,6 +28,15 @@ file contents from the stunt node. **No file is synthetic.** Only two kinds of e
 made, both noted in the table below: the CHAP-secret redaction (see "Redactions") and one
 stripped ssh banner line in `boot-ordering-units.txt`. Nothing else was touched.
 
+## Added for `iscsi.6` (2026-08-25, second read-only pass on the same stunt node)
+
+Two more real captures, both plain stdout, nothing written to the node:
+
+| File | What it is | Provenance |
+|---|---|---|
+| `lsblk-zd-tran.json` | `lsblk -J -o NAME,TYPE,KNAME,SERIAL,SIZE,TRAN` | REAL capture. Three `zd*` entries reported as `"type": "disk"` — the GT-43 inventory hazard, now the fixture for the `parsers/lsblk.ts` filter. **The node's own initiator was logged OUT for this capture** (the wave-1 live proof left it that way and it was deliberately not logged back in), so no `tran: "iscsi"` row appears here; the iSCSI-transport rows with their real serials are in `anasd-v1-disks.json` from the `iscsi.1` run. |
+| `pve-firewall-status-disabled.txt` | `pve-firewall status` | REAL capture, exit 0. The node's firewall was never enabled (GT open question 5), so this is the DISABLED half of the advisory only. `/etc/pve/firewall/` was an empty directory — no `cluster.fw`, no `host.fw`. The ENABLED cases (rule present / rule absent) could not be captured read-only and are driven from `.fw` files written into a temp dir by `services/__tests__/pve-firewall.test.ts`, which labels them as such; **they owe a live proof in `iscsi.7`**. |
+
 | File | What it is | Provenance |
 |---|---|---|
 | `package-versions.txt` | `dpkg-query -W` + `pveversion` + `uname -r` + `zfs --version` | real capture |

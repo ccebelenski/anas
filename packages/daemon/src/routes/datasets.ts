@@ -1,9 +1,10 @@
-import type { AccessEntry, AssociatedShare, CreateDatasetRequest, Dataset, DatasetAccess, DatasetDetail, DatasetListDefaults, MountpointPermissions, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
+import type { AccessEntry, AssociatedShare, CreateDatasetRequest, Dataset, DatasetAccess, DatasetDetail, DatasetListDefaults, IscsiHeldByLun, MountpointPermissions, Snapshot, UpdateDatasetPropertiesRequest } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedAcl } from '../parsers/getfacl.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { IscsiPaths } from '../services/iscsi.js'
 import type { Transport } from '../services/replication-transport.js'
 import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, PoolName, RenameSnapshotRequest, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { parseExports } from '../parsers/exports.js'
@@ -15,6 +16,7 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { confirmGate } from '../safety/gate.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
+import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 import { createReplicationHandlers } from './replication.js'
@@ -138,53 +140,78 @@ export interface VolumeRefusal {
 
 /**
  * THE seam for "may this volume be mutated this way?" — one function, one call
- * site per verb, so story iscsi.6 adds the LUN-held refusal HERE and nowhere
- * else.
+ * site per verb, so the LUN-held refusal lives HERE and nowhere else.
  *
- * Today it enforces exactly one rule: **volsize never shrinks.** ZFS itself
- * allows a shrink and truncates silently — it does not even refuse under a live
- * iSCSI session — so the refusal has to be ANAS's, and it is a Level 1 block
- * (409, no confirm code) rather than a confirm gate: there is no safe way to
- * take blocks away from a block device from the outside.
+ * Two rules, and they are refused at DIFFERENT altitudes for the same reason:
+ * both are irreversible from the outside, and neither has a safe confirm.
  *
- * The other three ops are listed and pass through untouched today. That is
- * deliberate rather than an oversight: `rollback`, `rename` and `destroy` also
- * succeed silently in ZFS while a LUN is serving the volume (destroy is the one
- * ZFS does refuse, and only while the backstore holds the device open). ANAS
- * cannot yet tell whether a LUN references a volume — that read layer is
- * `iscsi.2` — so this function accepts them and iscsi.6 turns them into
- * refusals by adding a single branch below. Every dataset verb that can touch a
- * volume already routes through here so that branch reaches all of them at
- * once; a future dataset RENAME endpoint must call it too.
+ *  1. **volsize never shrinks** (story iscsi.3). ZFS allows it and truncates
+ *     silently — it does not even refuse under a live iSCSI session — so the
+ *     refusal has to be ANAS's. Unconditional: a volume nothing is serving is
+ *     just as truncated as one under a LUN.
+ *  2. **nothing is mutated while a LUN holds it** (story iscsi.6). `rollback`,
+ *     `rename` and a `volsize` change all return exit 0 with a live session and
+ *     a mounted filesystem on the initiator (GT-40); `destroy` is the one ZFS
+ *     itself refuses, and only with a bare `dataset is busy` that names nothing.
+ *     `fuser`, `lsof` and sysfs `holders/` see NOTHING (GT-41) — the claim is in
+ *     configfs and this is the only place it can be turned into an answer.
  *
- * `current` is the volume's dataset row (null when the caller could not read
- * it, in which case nothing is asserted — fail-open, the same posture as the
- * other pre-flight reads here). `next` carries the requested new state.
+ * The two compose: a shrink of a held volume names the LUN as well, because
+ * "you cannot shrink this" and "something is serving it right now" are both
+ * things the operator needs before deciding what to do.
+ *
+ * A GROW of a held volume is deliberately ALLOWED — it is the supported live
+ * path (`iscsi.3`: the zvol grows, the initiator rescans and sees the new size),
+ * and refusing it would take away the only safe resize there is.
+ *
+ * `current` is the volume's dataset row (null when the caller could not read it,
+ * in which case nothing is asserted — fail-open, the same posture as the other
+ * pre-flight reads here). `next` carries the requested new state. `held` is the
+ * holding LUN from `heldByLun()`, or null when nothing holds it (which is also
+ * what an unreadable LIO tree yields — fail-open again).
+ *
+ * Every dataset verb that can touch a volume routes through here. **There is no
+ * dataset RENAME endpoint today** (`zfs rename` is not exposed by any route);
+ * `rename` is nonetheless a first-class op here so that the day one is added it
+ * has a gate to call and a test that fails if it does not.
  */
 export function assertVolumeMutable(
   name: string,
   op: VolumeOp,
   current: Dataset | null,
   next?: { volsize?: number },
+  held?: IscsiHeldByLun | null,
 ): VolumeRefusal | null {
   if (!current || current.type !== 'volume')
     return null
 
-  if (op === 'grow' && next?.volsize !== undefined && current.volsize !== undefined) {
-    if (next.volsize < current.volsize) {
-      return {
-        reason: 'shrink',
-        message: `Volume '${name}' is ${current.volsize} bytes; a volsize of ${next.volsize} bytes would SHRINK it. `
-          + `ZFS would truncate it silently and anything written past the new end — a partition table, a filesystem, a LUN's data — would be gone. `
-          + `Destroy and recreate the volume at the smaller size instead. This refusal has no confirm bypass.`,
-      }
+  const shrinking = op === 'grow'
+    && next?.volsize !== undefined
+    && current.volsize !== undefined
+    && next.volsize < current.volsize
+
+  if (shrinking) {
+    const heldClause = held
+      ? ` It is also ${held.detail}${held.connectedInitiators.length > 0 ? ` with ${held.connectedInitiators.length} initiator(s) logged in` : ''}.`
+      : ''
+    return {
+      reason: 'shrink',
+      message: `Volume '${name}' is ${current.volsize} bytes; a volsize of ${next.volsize} bytes would SHRINK it. `
+        + `ZFS would truncate it silently and anything written past the new end — a partition table, a filesystem, a LUN's data — would be gone.${heldClause} `
+        + `Destroy and recreate the volume at the smaller size instead. This refusal has no confirm bypass.`,
     }
   }
 
-  // iscsi.6 extends this function (and only this function) with: "held by LUN
-  // <target>/<n>" for rollback / rename / destroy / grow while a backstore
-  // references the volume, read from configfs via busy-diagnosis.ts.
-  return null
+  // A grow is the one mutation a LUN does not veto: it is live and safe, and it
+  // is the whole point of `iscsi.3`'s Resize Volume.
+  if (!held || op === 'grow')
+    return null
+
+  const action = op === 'rollback'
+    ? `Rolling back volume`
+    : op === 'rename' ? `Renaming volume` : `Destroying volume`
+  const refusal = heldByLunRefusal(`'${name}'`, action, held)
+  return { reason: refusal.reason, message: refusal.message }
 }
 
 // ============================================================================
@@ -328,9 +355,16 @@ export async function datasetRoutes(
     exportsPath?: string
     /** Stage-3 remote/peer SSH transport for replication (Epic 5.5.2). */
     transport: Transport
+    /**
+     * iSCSI read-layer path overrides (story iscsi.6) — the held-by-LUN gate
+     * reads configfs. Defaults inside the service to the real host locations;
+     * overridable so a test (and a dev box with no LIO) never reads the kernel.
+     */
+    iscsiPaths?: IscsiPaths
   },
 ) {
   const { executor, jobQueue, confirmStore, transport } = opts
+  const iscsiPaths = opts.iscsiPaths ?? {}
 
   // Replication (Epic 5.5.1) shares this file's dataset `*` wildcard (find-my-way
   // permits only one wildcard route per method+path). The send/recv logic lives
@@ -412,9 +446,56 @@ export async function datasetRoutes(
   }
 
   /**
+   * Is an iSCSI LUN holding this dataset (story iscsi.6)?
+   *
+   * The dataset name catches the zvol itself AND any zvol beneath it (a `-r`
+   * destroy of `tank/vms` sweeps `tank/vms/lun1`); the mountpoint catches an
+   * image FILE living inside a filesystem dataset, which is the AHR-shaped
+   * backing kind and the one ZFS's own `dataset is busy` explains worst.
+   *
+   * One `iscsiClaims()` read per call — the verbs here are single-row, so there
+   * is nothing to amortise and nothing that outlives the request (Principle 11).
+   */
+  async function datasetHeldByLun(row: Dataset | null, fullName: string): Promise<IscsiHeldByLun | null> {
+    const subject: { dataset: string, path?: string } = { dataset: fullName }
+    if (row?.mountpoint && row.mountpoint.startsWith('/'))
+      subject.path = row.mountpoint
+    return heldByLun(createIscsiClaimCache(executor, iscsiPaths), subject)
+  }
+
+  /**
+   * Stamp `heldByLun` onto every row a LUN holds (story iscsi.6).
+   *
+   * ONE `iscsiClaims()` read for the whole list, shared through the per-request
+   * cache — the version-skew ruling makes the field additive, so a row nothing
+   * holds carries nothing and an older daemon carries nothing at all. Fail-open:
+   * on any read failure no row is stamped and the list is exactly what it was.
+   */
+  async function annotateHeldByLun(datasets: Dataset[]): Promise<void> {
+    if (datasets.length === 0)
+      return
+    const cache = createIscsiClaimCache(executor, iscsiPaths)
+    if ((await cache.claims()).length === 0)
+      return
+    for (const d of datasets) {
+      const subject: { dataset: string, path?: string } = { dataset: d.name }
+      if (d.mountpoint && d.mountpoint.startsWith('/'))
+        subject.path = d.mountpoint
+      const held = await heldByLun(cache, subject)
+      if (held)
+        d.heldByLun = held
+    }
+  }
+
+  /**
    * Run the volume gate and, if it refuses, send the Level 1 409 (no confirm
    * code — there is no override path, per Safety Semantics). Returns true when
    * the caller has been answered and must stop.
+   *
+   * Story iscsi.6: the gate now also needs to know whether a LUN holds the
+   * volume, so the claims read happens HERE, before the gate — and therefore
+   * before any destructive command, which is the whole point of a pre-flight
+   * refusal.
    */
   async function volumeGateRefused(
     poolName: string,
@@ -423,7 +504,9 @@ export async function datasetRoutes(
     reply: FastifyReply,
     next?: { volsize?: number },
   ): Promise<boolean> {
-    const refusal = assertVolumeMutable(fullName, op, await datasetRow(poolName, fullName), next)
+    const row = await datasetRow(poolName, fullName)
+    const held = row?.type === 'volume' ? await datasetHeldByLun(row, fullName) : null
+    const refusal = assertVolumeMutable(fullName, op, row, next, held)
     if (!refusal)
       return false
     reply.code(409)
@@ -651,6 +734,12 @@ export async function datasetRoutes(
     catch {
       // fail-open — omit the enrichment fields rather than fail the list
     }
+
+    // Story iscsi.6: which rows a LUN is holding, so the toolbar can grey
+    // Destroy/Rollback with the reason attached instead of letting the operator
+    // find out from a 409. ONE claims read for the whole list (the per-request
+    // cache) — never a request per row.
+    await annotateHeldByLun(datasets)
 
     // Story iscsi.3: `defaults` carries the ZFS-owned volblocksize the Create
     // dialog quotes. Optional and additive — an older UI ignores it, and a newer
@@ -892,7 +981,15 @@ export async function datasetRoutes(
         return { error: { code: 'VALIDATION_ERROR', message: `'${fullName}' is a volume; ${notOnVolume.join(', ')} ${notOnVolume.length > 1 ? 'are filesystem properties' : 'is a filesystem property'} and ZFS does not carry ${notOnVolume.length > 1 ? 'them' : 'it'} on a volume` } }
       }
       // THE gate: grow yes, shrink never (assertVolumeMutable, the one seam).
-      const refusal = assertVolumeMutable(fullName, 'grow', target, { volsize: props.volsize })
+      // Story iscsi.6: the holding LUN rides in too, so a refused shrink names
+      // what is serving the volume as well as why the shrink itself is refused.
+      const refusal = assertVolumeMutable(
+        fullName,
+        'grow',
+        target,
+        { volsize: props.volsize },
+        target?.type === 'volume' ? await datasetHeldByLun(target, fullName) : null,
+      )
       if (refusal) {
         reply.code(409)
         return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
@@ -1327,13 +1424,30 @@ export async function datasetRoutes(
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
     }
 
-    // Story iscsi.3: destroy of a VOLUME routes through the one gate as well
-    // (ZFS does refuse a destroy while a backstore holds the device open, but
-    // that is ZFS's rule, not ANAS's — iscsi.6 turns it into a named refusal).
-    const volumeRefusal = assertVolumeMutable(fullName, 'destroy', targetDataset)
+    // Story iscsi.6: BEFORE the confirm gate and before any `zfs destroy`, ask
+    // configfs whether a LUN is serving this dataset — the volume itself, a
+    // child zvol a `-r` destroy would sweep, or an image file inside a
+    // filesystem's mountpoint. ZFS refuses a destroy of a claimed object with a
+    // bare `dataset is busy` that names nothing, and a `-r` destroy whose CHILD
+    // is the claimed one is worse: the parent's other children are destroyed
+    // first, then it stops. Refusing up front is the only non-destructive
+    // answer. Fail-open — an unreadable LIO tree holds nothing.
+    const heldForDestroy = await datasetHeldByLun(targetDataset, fullName)
+    // A volume routes through the ONE gate (story iscsi.3); a filesystem gets
+    // the same refusal built from the same helper, so the two never drift.
+    const volumeRefusal = assertVolumeMutable(fullName, 'destroy', targetDataset, undefined, heldForDestroy)
     if (volumeRefusal) {
       reply.code(409)
       return { error: { code: 'CONFLICT', reason: volumeRefusal.reason, message: volumeRefusal.message } }
+    }
+    if (heldForDestroy && targetDataset.type !== 'volume') {
+      const refusal = heldByLunRefusal(
+        `dataset '${fullName}'${recursive ? ' (recursive)' : ''}`,
+        'Destroying',
+        heldForDestroy,
+      )
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
     }
 
     const children = datasets.filter(d => d.name.startsWith(`${fullName}/`))
@@ -1380,7 +1494,13 @@ export async function datasetRoutes(
           // A busy dataset can't be unmounted for destroy — name the holders
           // (3.29); the path comes from the ZFS error (`cannot unmount '<path>'`).
           const base = result.stderr.trim() || `zfs destroy exited with code ${result.exitCode}`
-          throw new Error(await enrichBusyError(executor, base))
+          // Story iscsi.6: name the dataset explicitly so the LIO branch can
+          // look up `/dev/zvol/<dataset>` even when ZFS's message quotes a
+          // MOUNTPOINT (a busy filesystem) rather than the dataset itself.
+          throw new Error(await enrichBusyError(executor, base, undefined, {
+            ...configfsOptionsFrom(iscsiPaths),
+            dataset: fullName,
+          }))
         }
         return { destroyed: fullName }
       },
@@ -1582,13 +1702,28 @@ export async function datasetRoutes(
     const targetIndex = snapshots.findIndex(s => s.name === snapName)
     const laterSnapshots = snapshots.slice(0, targetIndex).map(s => s.snapshotName)
 
-    // Story iscsi.3: a rollback of a VOLUME goes through the one gate, so
-    // iscsi.6's "held by LUN" refusal reaches it without touching this handler.
-    // ZFS itself permits rolling a zvol back under a live iSCSI session — it
-    // returns exit 0 with a filesystem mounted on the initiator — so nothing
-    // below ANAS is going to stop it.
+    // Story iscsi.3: a rollback of a VOLUME goes through the one gate, which
+    // iscsi.6 taught the "held by LUN" refusal. ZFS itself permits rolling a
+    // zvol back under a live iSCSI session — exit 0, with a filesystem mounted
+    // on the initiator (GT-40) — so nothing below ANAS is going to stop it.
     if (await volumeGateRefused(poolName, fullName, 'rollback', reply))
       return reply
+
+    // Story iscsi.6: the same applies to a FILESYSTEM dataset holding a LUN's
+    // image file. A rollback rewrites that file's contents underneath a LIO
+    // backstore that is still serving it — the initiator's filesystem does not
+    // even know, and there is no rescan that repairs it. Refused before the
+    // confirm gate, before `zfs rollback`.
+    const rollbackRow = await datasetRow(poolName, fullName)
+    if (rollbackRow?.type !== 'volume') {
+      const held = await datasetHeldByLun(rollbackRow, fullName)
+      if (held) {
+        const refusal = heldByLunRefusal(`dataset '${fullName}' to snapshot '${snap}'`, 'Rolling back', held)
+        reply.code(409)
+        reply.send({ error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } })
+        return reply
+      }
+    }
 
     const warnings = [
       `Rolling back discards all changes to '${fullName}' since snapshot '${snap}'.`,

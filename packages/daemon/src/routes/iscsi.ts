@@ -5,6 +5,7 @@ import type { IscsiPaths } from '../services/iscsi.js'
 import { IscsiIqn } from '@anas/shared'
 import { computeIscsiHealth } from '../services/iscsi-health.js'
 import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, readIscsiContext, toTargetSummary } from '../services/iscsi.js'
+import { readPveFirewallAdvisory } from '../services/pve-firewall.js'
 
 /**
  * iSCSI — the READ layer (story `iscsi.2`).
@@ -28,10 +29,12 @@ import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, readIscsiCo
  */
 export interface IscsiRouteOptions extends IscsiPaths {
   executor: CommandExecutor
+  /** `/etc/pve/firewall` override (story iscsi.6) — read-only, tests only. */
+  firewallDir?: string
 }
 
 export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptions) {
-  const { executor, ...paths } = opts
+  const { executor, firewallDir, ...paths } = opts
 
   // --- GET /iscsi/targets --------------------------------------------------
   server.get('/iscsi/targets', async () => {
@@ -95,6 +98,11 @@ export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptio
         },
       }
     }
-    return { data: target }
+    // Story iscsi.6: a portal can be perfectly healthy and still unreachable
+    // because PVE's firewall drops 3260/tcp — LIO will never say so, and neither
+    // will `ss`. Read-only, fail-open, and NEVER a rule ANAS writes: the advisory
+    // points at PVE. Absent (not null-filled) when there is nothing to say.
+    const firewall = await readPveFirewallAdvisory(executor, firewallDir === undefined ? {} : { firewallDir })
+    return { data: { ...target, firewall } }
   })
 }

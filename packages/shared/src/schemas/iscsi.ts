@@ -522,6 +522,26 @@ export const IscsiTargetSecurity = z.object({
 export type IscsiTargetSecurity = z.infer<typeof IscsiTargetSecurity>
 
 /** The grid row: one target, enough to list it without reading its detail. */
+/**
+ * The PVE-firewall advisory on a target's detail (story `iscsi.6`).
+ *
+ * ANAS NEVER writes a firewall rule — `pve-firewall status` and the `.fw` files
+ * are read, and the operator is pointed at PVE. Fail-open in both directions:
+ * `enabled: null` means the check itself could not run (no `pve-firewall`
+ * binary, an unreadable file) and `admits3260: null` means the rules could not
+ * be read. An advisory is only ever raised on a POSITIVE "the firewall is
+ * enabled AND nothing readable admits 3260/tcp".
+ */
+export const IscsiFirewallAdvisory = z.object({
+  /** Is PVE's firewall enabled on this node? Null = could not tell. */
+  enabled: z.boolean().nullable(),
+  /** Does any readable rule admit 3260/tcp inbound? Null = could not tell. */
+  admits3260: z.boolean().nullable(),
+  /** The one-line advisory, or null when there is nothing to say. */
+  advisory: z.string().nullable(),
+})
+export type IscsiFirewallAdvisory = z.infer<typeof IscsiFirewallAdvisory>
+
 export const IscsiTargetSummary = z.object({
   iqn: z.string(),
   /** The `:<name>` half for an ANAS target; null for a foreign one. */
@@ -555,6 +575,13 @@ export const IscsiTargetDetail = IscsiTargetSummary.extend({
   luns: z.array(IscsiLun),
   acls: z.array(IscsiAcl),
   sessions: z.array(IscsiSession),
+  /**
+   * PVE-firewall advisory (story `iscsi.6`) — a portal can listen perfectly and
+   * still be unreachable because `pve-firewall` drops 3260/tcp. ANAS reads the
+   * firewall and says so; it never edits a rule. Optional and additive: an
+   * older daemon omits it and the detail window shows nothing (version skew).
+   */
+  firewall: IscsiFirewallAdvisory.optional(),
 })
 export type IscsiTargetDetail = z.infer<typeof IscsiTargetDetail>
 
@@ -1221,3 +1248,30 @@ export const IscsiClaimList = IscsiAvailability.extend({
   claims: z.array(IscsiClaim),
 })
 export type IscsiClaimList = z.infer<typeof IscsiClaimList>
+
+/**
+ * The additive "a LUN holds this object" field carried by the Pools, Datasets,
+ * AHR and Mounts read models (story `iscsi.6`).
+ *
+ * It is a REDUCTION of {@link IscsiClaim}, not a second source: the daemon
+ * derives it from the same `iscsiClaims()` read, and its `detail` is the same
+ * one sentence the refusals use. The UI never asks a second question per row —
+ * the field rides the list response it already fetches, and an older daemon
+ * simply omits it (version-skew ruling: absent ⇒ no gating, exactly today's
+ * screen).
+ */
+export const IscsiHeldByLun = z.object({
+  /** The holding target's IQN — never truncated. */
+  targetIqn: z.string(),
+  /** LUN number within that target's TPG. */
+  index: z.number().int().nonnegative(),
+  /** The backstore name = the SCSI model string initiators see. */
+  name: z.string(),
+  /** The backing object the LUN holds (`/dev/zvol/<pool>/<vol>` or the image). */
+  backingPath: z.string(),
+  /** Initiator IQNs with a live session mapping this LUN (may be empty). */
+  connectedInitiators: z.array(z.string()),
+  /** The one holder sentence, ready for a tooltip or a refusal message. */
+  detail: z.string(),
+})
+export type IscsiHeldByLun = z.infer<typeof IscsiHeldByLun>

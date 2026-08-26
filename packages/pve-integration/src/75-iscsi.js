@@ -553,6 +553,10 @@
 
     ANAS.iscsi = ANAS.iscsi || {};
     ANAS.iscsi.reload = loadTargets;
+    // Story iscsi.6 — pure helpers, exposed so the dialog-contract harness can
+    // assert on them directly rather than through a rendered cell.
+    ANAS.iscsi.portalAddressWarning = portalAddressWarning;
+    ANAS.iscsi.backingOwner = backingOwner;
 
     // ---- Toolbar state -----------------------------------------------------
 
@@ -1098,6 +1102,62 @@
         return win;
     }
 
+    /**
+     * Story iscsi.6 — the picker warns when the chosen address is not one this
+     * node currently carries.
+     *
+     * LIO binds a portal to an address that does not exist, reports [OK], keeps
+     * it across an interface deletion AND a service restart, and never writes a
+     * single log line (GT-24). Nothing downstream will ever tell the operator.
+     * The picker is the first and cheapest place to say it.
+     *
+     * A WARNING, never a block, for two reasons: an address that is about to
+     * exist (a VLAN being built, a VIP that fails over) is a legitimate thing to
+     * configure, and an EMPTY address list means PVE's network API could not be
+     * read — in which case saying "no interface carries this" would be a lie.
+     * Empty list ⇒ silence.
+     *
+     * Returns the warning sentence, or '' when there is nothing to say. Pure, so
+     * the dialog-contract harness can assert on it directly.
+     */
+    function portalAddressWarning(addresses, address) {
+        var addr = ('' + (address == null ? '' : address)).trim();
+        var list = isArray(addresses) ? addresses : [];
+        if (!addr || list.length === 0) {
+            return '';
+        }
+        for (var i = 0; i < list.length; i++) {
+            var known = '' + ((list[i] && list[i].address) || list[i] || '');
+            if (known.toLowerCase() === addr.toLowerCase()) {
+                return '';
+            }
+        }
+        return t('No interface on this node currently carries ') + addr
+            + t('. LIO will bind the portal anyway, report it as healthy, and never '
+                + 'tell you it is unreachable — check the address, or create it first.');
+    }
+
+    // Attach the warning to one portal-address field (and evaluate it now).
+    // Fail-open at every step: an explanation must never break a dialog.
+    function applyPortalAddressWarning(win, field) {
+        try {
+            if (!field) {
+                return;
+            }
+            var msg = portalAddressWarning((win && win.anasAddresses) || [],
+                typeof field.getValue === 'function' ? field.getValue() : '');
+            field.anasAddressWarning = msg;
+            if (typeof field.setTooltip === 'function') {
+                field.setTooltip(msg || '');
+            }
+            if (typeof field.setFieldStyle === 'function') {
+                field.setFieldStyle(msg ? 'background-color:#fff8e1;' : '');
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
     function applyAddressStore(win, row) {
         try {
             var list = (win && win.anasAddresses) || [];
@@ -1113,6 +1173,19 @@
                 });
             }
             field.setStore(Ext.create('Ext.data.Store', { fields: ['address', 'label'], data: data }));
+            // Story iscsi.6: evaluate the "no interface carries this" warning
+            // now (a pre-filled edit) and on every later change.
+            applyPortalAddressWarning(win, field);
+            try {
+                if (typeof field.on === 'function' && !field.anasAddressWarningWired) {
+                    field.anasAddressWarningWired = true;
+                    field.on('change', function () {
+                        applyPortalAddressWarning(win, field);
+                    });
+                }
+            } catch (eW) {
+                // non-fatal
+            }
         } catch (e) {
             // non-fatal — the field stays free-text
         }
@@ -1446,6 +1519,55 @@
             + '" style="font-family:monospace;font-size:0.88em;">' + enc(s) + '</span>';
     }
 
+    /**
+     * Which ANAS screen owns a LUN's backing object, and what it is called
+     * there (story iscsi.6).
+     *
+     * NAME ONLY — no navigation machinery, no cross-view router, no deep link.
+     * The point is that an operator looking at a LUN can see where the thing it
+     * serves lives, and go there by hand. Everything below is derived from what
+     * the read layer already classified; nothing is guessed:
+     *
+     *   zvol, or a file on a ZFS dataset  → Datasets, by dataset name
+     *   a file on an AHR pool (no dataset) → Hybrid RAID, by pool name
+     *   any other resolvable file          → Mounts, by its directory
+     *   a foreign/unresolved backing       → nothing (no ANAS screen owns it)
+     */
+    function backingOwner(rec) {
+        try {
+            var kind = getf(rec, 'kind');
+            var pool = getf(rec, 'pool');
+            var dataset = getf(rec, 'dataset');
+            var path = '' + (getf(rec, 'backingPath') || '');
+            if (kind === 'zvol') {
+                return dataset ? { screen: t('Datasets'), name: dataset } : null;
+            }
+            if (kind !== 'file') {
+                return null;
+            }
+            if (dataset) {
+                return { screen: t('Datasets'), name: dataset };
+            }
+            if (pool) {
+                return { screen: t('Hybrid RAID'), name: pool };
+            }
+            var cut = path.lastIndexOf('/');
+            return cut > 0 ? { screen: t('Mounts'), name: path.substring(0, cut) } : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function backingOwnerHtml(rec) {
+        var owner = backingOwner(rec);
+        if (!owner) {
+            return '';
+        }
+        var tip = t('This object lives on the ') + owner.screen + t(' screen, as ') + owner.name;
+        return ' <span class="anas-lun-owner" title="' + enc(tip) + '" style="color:gray;font-size:0.85em;">'
+            + enc('→ ' + owner.screen + ': ' + owner.name) + '</span>';
+    }
+
     function renderBacking(v, meta, rec) {
         var s = '' + (v == null ? '' : v);
         if (!s) {
@@ -1460,7 +1582,8 @@
                 + '"><i class="fa fa-exclamation-circle"></i> ' + enc(s) + '</span>';
         }
         return '<span class="anas-lun-backing" title="' + enc(s)
-            + '" style="font-family:monospace;font-size:0.88em;">' + enc(s) + '</span>';
+            + '" style="font-family:monospace;font-size:0.88em;">' + enc(s) + '</span>'
+            + backingOwnerHtml(rec);
     }
 
     function renderLunSessions(v) {
@@ -1601,6 +1724,7 @@
                 ANAS.warn('luns load failed: ' + ANAS.errText(e2));
             }
             renderSessionPanel(win, detail);
+            renderFirewallAdvisory(win, detail);
             updateLunButtons(win);
         }, function (err) {
             if (grid.destroyed || grid.destroying) {
@@ -1615,6 +1739,44 @@
             }
             ANAS.warn('luns load failed: ' + ANAS.errText(err));
         });
+    }
+
+    /**
+     * The PVE-firewall advisory (story iscsi.6).
+     *
+     * A portal can bind, listen, and be counted healthy everywhere in ANAS while
+     * `pve-firewall` quietly drops every SYN to 3260. The daemon reads the
+     * firewall (read-only, never a write) and hands over one sentence; this
+     * shows it and nothing more.
+     *
+     * Shown ONLY on a positive verdict. The daemon nulls `advisory` when the
+     * firewall is off, when it could not tell, and when a rule does admit the
+     * port — and an older daemon sends no `firewall` object at all, in which case
+     * this is silent too (version-skew ruling).
+     */
+    function renderFirewallAdvisory(win, detail) {
+        var panel = win.down ? win.down('#lunFirewall') : null;
+        if (!panel) {
+            return;
+        }
+        var advisory = '';
+        try {
+            advisory = '' + ((detail && detail.firewall && detail.firewall.advisory) || '');
+        } catch (e) {
+            advisory = '';
+        }
+        try {
+            if (!advisory) {
+                panel.setHidden(true);
+                panel.update('');
+                return;
+            }
+            panel.update('<span class="anas-iscsi-firewall-advisory" style="color:var(--anas-warning,#b8860b);">'
+                + '<i class="fa fa-exclamation-triangle"></i> ' + enc(advisory) + '</span>');
+            panel.setHidden(false);
+        } catch (e2) {
+            // non-fatal — an advisory must never break the detail window
+        }
     }
 
     // Sessions are the live half of the detail window: who is logged in, from
@@ -1809,6 +1971,17 @@
                         xtype: 'component',
                         itemId: 'lunAttributes',
                         cls: 'anas-iscsi-lun-attrs',
+                        html: ''
+                    },
+                    {
+                        // Story iscsi.6: the PVE-firewall advisory. One line,
+                        // hidden unless the daemon positively reports "enabled
+                        // and nothing admits 3260/tcp".
+                        xtype: 'component',
+                        itemId: 'lunFirewall',
+                        cls: 'anas-iscsi-firewall-note',
+                        hidden: true,
+                        style: 'border-top:1px solid var(--anas-line,#dfe3e8);padding:5px 4px;',
                         html: ''
                     },
                     {

@@ -761,7 +761,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.equal(data.claims[0].dataset, 'tank/vol1')
       assert.equal(data.claims[0].targetIqn, ANAS_IQN)
       assert.equal(data.claims[0].lunIndex, 0)
-      assert.match(data.claims[0].detail, /held by LUN 0/)
+      assert.match(data.claims[0].detail, /held by iSCSI LUN 0 '.+' of target/)
     })
 
     it('reports live sessions on the claim, which is what gates a rollback', async () => {

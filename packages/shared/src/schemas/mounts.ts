@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { AbsolutePath, SingleLine } from './common.js'
+import { IscsiHeldByLun } from './iscsi.js'
 
 /**
  * A filesystem-version token (NFS `vers`, CIFS `vers`): either digits separated
@@ -345,6 +346,14 @@ export const MountSummary = z.object({
   /** Capacity (bytes) from the guarded `stat -f` (null when unmounted/unreachable). */
   size: z.number().nonnegative().nullable().optional(),
   used: z.number().nonnegative().nullable().optional(),
+  /**
+   * An iSCSI LUN's image file lives under this mountpoint (story `iscsi.6`).
+   * Unmount and Remove are refused while it does — LIO keeps serving the
+   * unlinked inode and the data dies with the backstore (GT-40). Present only
+   * when something holds it; an older daemon omits it (version-skew ruling: no
+   * field ⇒ no gating).
+   */
+  heldByLun: IscsiHeldByLun.optional(),
 })
 export type MountSummary = z.infer<typeof MountSummary>
 

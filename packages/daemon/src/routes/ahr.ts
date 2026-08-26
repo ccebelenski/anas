@@ -4,11 +4,13 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { AhrLayoutDisk } from '../services/ahr-layout.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
-import { AhrLayoutPreviewRequest, PoolName } from '@anas/shared'
+import type { IscsiPaths } from '../services/iscsi.js'
+import { AhrLayoutPreviewRequest, isComposableDisk, PoolName } from '@anas/shared'
 import { withAhrCreateStatus } from '../services/ahr-create-status.js'
 import { readIntent } from '../services/ahr-intent.js'
 import { AhrPlanError, planFreshLayout } from '../services/ahr-layout.js'
 import { readAhrPools, withExpansionIntent } from '../services/ahr-topology.js'
+import { createIscsiClaimCache, heldByLun } from '../services/iscsi-held.js'
 import { kernelInfo } from '../services/kernel-version.js'
 import { collectDisks } from './disks.js'
 
@@ -38,9 +40,33 @@ export async function ahrRoutes(
      * (issue #7). Optional: without it the read falls back to pure system truth.
      */
     jobQueue?: JobQueue
+    /** iSCSI read-layer path overrides (story iscsi.6) — the heldByLun field. */
+    iscsiPaths?: IscsiPaths
   },
 ) {
   const { executor, diskIdentityCache, intentDir, jobQueue } = opts
+  const iscsiPaths = opts.iscsiPaths ?? {}
+
+  /**
+   * Stamp `heldByLun` onto every AHR pool a LUN's image file lives on (story
+   * iscsi.6) — the field the Hybrid RAID toolbar greys Destroy / Unmount /
+   * Change mount from. ONE claims read for the whole list; additive, so a pool
+   * nothing holds carries no field.
+   */
+  async function annotateHeldByLun(pools: AhrPool[]): Promise<AhrPool[]> {
+    if (pools.length === 0)
+      return pools
+    const cache = createIscsiClaimCache(executor, iscsiPaths)
+    if ((await cache.claims()).length === 0)
+      return pools
+    return Promise.all(pools.map(async (pool) => {
+      const subject: { pool: string, path?: string } = { pool: pool.name }
+      if (pool.mounted && pool.mountpoint.startsWith('/'))
+        subject.path = pool.mountpoint
+      const held = await heldByLun(cache, subject)
+      return held ? { ...pool, heldByLun: held } : pool
+    }))
+  }
 
   // Attach the live expansion intent (§6.2: 'halted' must surface Resume/
   // Abandon loudly), then the live create job's status (issue #7). Best-effort —
@@ -58,7 +84,8 @@ export async function ahrRoutes(
 
   // --- GET /ahr — list pools ----------------------------------------------
   server.get('/ahr', async () => {
-    return { data: await Promise.all((await readAhrPools(executor)).map(withIntent)) }
+    const pools = await Promise.all((await readAhrPools(executor)).map(withIntent))
+    return { data: await annotateHeldByLun(pools) }
   })
 
   // --- GET /ahr/:name — full pool detail ----------------------------------
@@ -73,7 +100,7 @@ export async function ahrRoutes(
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `AHR pool '${nameParsed.data}' not found` } }
     }
-    return { data: await withIntent(pool) }
+    return { data: (await annotateHeldByLun([await withIntent(pool)]))[0] }
   })
 
   // --- POST /ahr/layout/preview — dry-run, NO mutation ---------------------
@@ -101,8 +128,10 @@ export async function ahrRoutes(
         problems.push(`disk '${id}' not found`)
         continue
       }
-      if (disk.status !== 'available') {
-        problems.push(`disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
+      if (!isComposableDisk(disk)) {
+        problems.push(disk.handsOff
+          ? `disk '${id}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`
+          : `disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
         continue
       }
       selected.push({ id: disk.id, usableBytes: disk.size, logicalSectorSize: disk.logicalSectorSize })

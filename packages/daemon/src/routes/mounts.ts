@@ -1,8 +1,9 @@
-import type { MountEntry, MountOptions, MountRequestOptions } from '@anas/shared'
+import type { MountEntry, MountOptions, MountRequestOptions, MountSummary } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { IscsiPaths } from '../services/iscsi.js'
 import { mkdir, readdir } from 'node:fs/promises'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, UpdateMountRequest } from '@anas/shared'
 import { classifyKind } from '../parsers/findmnt.js'
@@ -11,6 +12,7 @@ import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js
 import { confirmGate } from '../safety/gate.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders } from '../services/busy-diagnosis.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
+import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import {
   ahrPinnedSpecs,
   applyOption,
@@ -64,6 +66,12 @@ export interface MountsRouteOptions {
    * entry so AHR persistence stays hands-off in Mounts (§2.6).
    */
   mdadmConfPath?: string
+  /**
+   * iSCSI read-layer path overrides (story iscsi.6) — Unmount and Remove refuse
+   * while a LUN's image file sits under the mountpoint. Real host paths by
+   * default; overridable so a test never reads the kernel.
+   */
+  iscsiPaths?: IscsiPaths
 }
 
 /**
@@ -76,6 +84,43 @@ export interface MountsRouteOptions {
  */
 export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOptions) {
   const { executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath, mdadmConfPath } = opts
+  const iscsiPaths = opts.iscsiPaths ?? {}
+
+  /**
+   * Refuse an unmount/remove while a LUN's image file lives under the
+   * mountpoint (story iscsi.6). Returns true when the 409 has been sent.
+   *
+   * This is the mount-side twin of the shares/backup-task cross-check the verb
+   * ladder already does — with one difference that makes it a HARD refusal
+   * rather than a warning: `umount` of a filesystem holding an open fileio
+   * backing file does not fail the way a share does. LIO holds the INODE, so an
+   * unmount can succeed and leave the LUN serving a file that is no longer
+   * reachable by any path — and `fuser`/`lsof` show nothing at all (GT-41).
+   * "Unsafe now", no confirm bypass, before `umount` runs.
+   */
+  async function lunHeldRefused(mountpoint: string, action: string, reply: FastifyReply): Promise<boolean> {
+    const held = await heldByLun(createIscsiClaimCache(executor, iscsiPaths), { path: mountpoint })
+    if (!held)
+      return false
+    const refusal = heldByLunRefusal(`mount '${mountpoint}'`, action, held)
+    reply.code(409)
+    reply.send({ error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } })
+    return true
+  }
+
+  /** Stamp `heldByLun` onto every mount a LUN's image sits under. */
+  async function annotateHeldByLun(rows: MountSummary[]): Promise<void> {
+    if (rows.length === 0)
+      return
+    const cache = createIscsiClaimCache(executor, iscsiPaths)
+    if ((await cache.claims()).length === 0)
+      return
+    for (const row of rows) {
+      const held = await heldByLun(cache, { path: row.mountpoint })
+      if (held)
+        row.heldByLun = held
+    }
+  }
 
   /** AHR pin specs from the ANAS-managed mdadm.conf (empty when unconfigured). */
   async function readAhrSpecs(): Promise<Set<string>> {
@@ -92,6 +137,10 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     ])
     const rows = buildBaseInventory(findmntText, fstabText, pveMountPaths, ahrSpecs)
     await probeInventoryHealth(executor, rows)
+    // Story iscsi.6: which mounts a LUN's image file sits under, so Unmount and
+    // Remove can be greyed with the reason attached. ONE claims read for the
+    // whole grid; additive, so a mount nothing holds carries no field.
+    await annotateHeldByLun(rows)
     return { data: rows }
   })
 
@@ -387,6 +436,13 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       return { error: { code: 'NOT_FOUND', message: `Mount '${mp}' is not currently mounted` } }
     }
 
+    // Story iscsi.6: BEFORE the busy gate — the busy gate offers a lazy unmount
+    // behind a confirm code, and a lazy unmount is precisely the wrong answer to
+    // a LUN (the backstore keeps the inode and the data quietly detaches). Hard
+    // 409, no bypass.
+    if (await lunHeldRefused(mp, disabling ? 'Disabling' : 'Unmounting', reply))
+      return reply
+
     let lazy = false
     if (mounted) {
       const gate = await busyGate(mp, `mount.${action}`, request, reply)
@@ -403,7 +459,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
           if (r.exitCode !== 0 && !lazy)
-            throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp))
+            throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp, configfsOptionsFrom(iscsiPaths)))
         }
         if (disabling) {
           // Comment the fstab line with the marker; KEEP the credentials file.
@@ -459,6 +515,12 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (rejectedLocal)
       return rejectedLocal
 
+    // Story iscsi.6 — same hard refusal as unmount, and for the same reason:
+    // remove unmounts first, and a LUN under the mountpoint must not be handed a
+    // lazy unmount behind a confirm code.
+    if (await lunHeldRefused(mp, 'Removing', reply))
+      return reply
+
     let lazy = false
     if (mounted) {
       const gate = await busyGate(mp, 'mount.remove', request, reply)
@@ -479,7 +541,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
           updateProgress(`Unmounting ${mp}${lazy ? ' (lazy)' : ''}`)
           const r = await executor.exec(UMOUNT, lazy ? ['-l', mp] : [mp])
           if (r.exitCode !== 0 && !lazy)
-            throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp))
+            throw new Error(await enrichBusyError(executor, r.stderr.trim() || `umount exited ${r.exitCode}`, mp, configfsOptionsFrom(iscsiPaths)))
         }
         if (entry) {
           updateProgress('Removing /etc/fstab entry')

@@ -464,6 +464,17 @@
         modifyProps: 1,
     };
 
+    // Story iscsi.6: the verbs the daemon REFUSES outright while an iSCSI LUN
+    // is serving something on the pool. Destroy would take the LUN's data with
+    // it; Export would pull the block device out from under a live target. Both
+    // are hard 409s with no confirm bypass, so the button is greyed and carries
+    // the reason — a click that can only ever produce a refusal is not an
+    // affordance.
+    var LUN_HELD_BLOCKS = {
+        exportPool: 1,
+        destroyPool: 1,
+    };
+
     function isArray(v) {
         try {
             return Object.prototype.toString.call(v) === '[object Array]';
@@ -541,6 +552,27 @@
         } catch (e) {
             return name;
         }
+    }
+
+    // The holding LUN on the selected pool, or null (story iscsi.6).
+    //
+    // ABSENT ⇒ null ⇒ no gating: an older daemon does not send the field at all,
+    // and the version-skew ruling says today's screen must keep working against
+    // it (the daemon still refuses — the UI just cannot pre-empt it).
+    function heldByLun(rec) {
+        try {
+            var held = rec && rec.get ? rec.get('heldByLun') : null;
+            return (held && held.targetIqn) ? held : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // The one sentence a greyed button carries. Built from the daemon's own
+    // `detail` so the tooltip and the 409 say the same thing.
+    function lunHeldTip(held) {
+        return ANAS.t('Disabled — this pool is ') + held.detail
+            + ANAS.t('. Delete the LUN from the iSCSI screen first.');
     }
 
     // Set/clear the "why disabled" tooltip on a hands-off button. Guarded — a
@@ -712,6 +744,7 @@
         // Upgrade/Detail (base toolbar) and Refresh stay enabled. Create/Import
         // are not selection-bound (needsSelection false) so the loop skips them.
         var scanningSel = has && rec.get('scanRunning');
+        var held = has ? heldByLun(rec) : null;
         var actions = ANAS.pools.actions;
         for (var i = 0; i < actions.length; i++) {
             var a = actions[i];
@@ -723,9 +756,14 @@
                 continue;
             }
             var pveBlock = !!(pveManaged && PVE_HANDS_OFF[a.itemId]);
+            var lunBlock = !!(held && LUN_HELD_BLOCKS[a.itemId]);
             btn.setDisabled(!has || (a.disableWhileScanning && scanningSel)
-                || pveBlock);
-            setPveTooltip(btn, pveBlock);
+                || pveBlock || lunBlock);
+            if (lunBlock) {
+                btnSetTip(btn, lunHeldTip(held));
+            } else {
+                setPveTooltip(btn, pveBlock);
+            }
         }
     }
 
@@ -862,6 +900,10 @@
                 // story 3.25: PVE-managed classification. Auto field keeps the
                 // array verbatim; empty/absent ⇒ ANAS-managed (see isPveManaged).
                 'pveStorages',
+                // story iscsi.6: the holding iSCSI LUN, when one is serving
+                // something on this pool. AUTO field — absent on old daemons
+                // leaves get() undefined and nothing is gated (version skew).
+                'heldByLun',
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
