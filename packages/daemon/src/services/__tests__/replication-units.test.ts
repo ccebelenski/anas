@@ -299,6 +299,24 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
       assert.equal(st.snapshotsBehind, 1)
     })
 
+    it('⚠ an in-flight anas-backup-* transient does NOT make a current task look behind', async () => {
+      // backup2.3: a snapshot-consistent backup takes a transient on the SOURCE
+      // and destroys it in a `finally`. It is never replicated by design, so
+      // counting it would report a healthy task as "1 behind" for the duration
+      // of every backup run — and the count would then silently fix itself.
+      const mock = statusMock({
+        source: [
+          { name: 'anas-backup-nightly-media-1756000000', txg: 300 },
+          { name: 's2', txg: 200, creation: 'Wed Jul 15 3:00 2026' },
+          { name: 's1', txg: 100 },
+        ],
+        target: [{ name: 's2', txg: 200 }, { name: 's1', txg: 100 }],
+      })
+      const st = await deriveTaskStatus(mock, makeTask())
+      assert.equal(st.lastReplicatedSnapshot, 's2')
+      assert.equal(st.snapshotsBehind, 0)
+    })
+
     it('never replicated: no common snapshot → all source snaps behind, null last', async () => {
       const mock = statusMock({
         source: [{ name: 's2', txg: 200 }, { name: 's1', txg: 100 }],

@@ -360,6 +360,77 @@
         return out;
     }
 
+    /** The entries a scan says ARE covered — the ones that become archives. */
+    function includedNestedOf(scan) {
+        var out = [];
+        var list = (scan && scan.nested) || [];
+        if (!isArray(list)) {
+            return out;
+        }
+        for (var i = 0; i < list.length; i++) {
+            if (list[i] && list[i].included === true) {
+                out.push(list[i]);
+            }
+        }
+        return out;
+    }
+
+    // ---- Snapshot consistency (backup2.3) ----------------------------------
+    //
+    // READ-ONLY. The daemon DERIVES whether a source can be backed up from a
+    // point-in-time snapshot (ZFS dataset, AHR pool on the @data/@snapshots
+    // layout) or has to be read live (remote mounts, foreign filesystems, a flat
+    // AHR pool). Nothing here is editable and nothing is sent back — this file
+    // only renders the verdict and its reason. It arrives on the SAME
+    // preview-nested scan the boundary alert already uses.
+
+    /** The derived consistency of one scan, or null when the daemon did not say. */
+    function consistencyOf(scan) {
+        var c = scan && scan.consistency;
+        if (!c || typeof c !== 'object') {
+            return null;
+        }
+        return c.consistency === 'snapshot' ? c : (c.consistency === 'live' ? c : null);
+    }
+
+    /**
+     * The read-only chip. `snapshot` is the good state (one instant captured);
+     * `live` is neither an error nor a warning — it is the honest statement that
+     * this filesystem cannot give a point in time — so it renders muted, with
+     * the daemon's own reason as the tooltip.
+     */
+    function consistencyChipHtml(scan) {
+        var c = consistencyOf(scan);
+        if (!c) {
+            return '';
+        }
+        var snap = c.consistency === 'snapshot';
+        return pillHtml(snap ? t('snapshot') : t('live'),
+            snap ? 'var(--anas-ok,#1f9c56)' : 'var(--anas-muted,gray)',
+            '' + (c.reason || ''));
+    }
+
+    /**
+     * "N nested filesystems → N+1 archives" — what snapshot mode will actually
+     * hand the backup client. Only shown when the source IS snapshot-capable AND
+     * the current choice covers at least one nested filesystem: a live source
+     * expands into nothing, and `none` keeps exactly one archive.
+     */
+    function expansionLineHtml(scan) {
+        var c = consistencyOf(scan);
+        if (!c || c.consistency !== 'snapshot') {
+            return '';
+        }
+        var included = includedNestedOf(scan);
+        if (!included.length) {
+            return '';
+        }
+        var n = included.length;
+        return enc(n + ' '
+            + (n === 1 ? t('nested filesystem') : t('nested filesystems'))
+            + ' → ' + (n + 1) + ' ' + t('archives'));
+    }
+
     // ---- Cadence (16.10) ---------------------------------------------------
     //
     // A task's schedule is still an OnCalendar expression; `cadence` is the
@@ -1254,7 +1325,19 @@
             : (isArray(choice)
                 ? (t('nested filesystems') + ': ' + choice.join('  '))
                 : t('nested filesystems: none'));
-        var out = '<div style="color:var(--anas-muted,gray);margin-top:2px;">' + enc(label) + '</div>';
+        var out = '';
+        // backup2.3 — the DERIVED consistency, read-only, with the daemon's own
+        // reason as the tooltip. First line: it frames everything below it.
+        var chip = consistencyChipHtml(scan);
+        if (chip) {
+            var expansion = expansionLineHtml(scan);
+            out += '<div style="margin-top:3px;">' + chip
+                + (expansion
+                    ? '<span style="color:var(--anas-muted,gray);margin-left:6px;">' + expansion + '</span>'
+                    : '')
+                + '</div>';
+        }
+        out += '<div style="color:var(--anas-muted,gray);margin-top:2px;">' + enc(label) + '</div>';
         if (!scan) {
             return out;
         }
@@ -1313,6 +1396,75 @@
         }
         html += '</table></div>';
         return html;
+    }
+
+    // ---- Last run: snapshots + expansion (backup2.3) -----------------------
+    //
+    // journald is FORENSICS, never correctness (standing ruling) — so this block
+    // is derived from the recent-runs text the detail already carries and is
+    // labeled as recent-only, exactly like the block below it. Nothing is stored
+    // to make it: the run writes these two progress lines, and if journald has
+    // rotated them away the block is simply absent.
+
+    /** `snapshotting <target> as/@ <label>` — one line per transient snapshot. */
+    var RUN_SNAPSHOT_RE = /^\s*snapshotting\s+(.+)$/;
+    /** `archive '<name>' <- <root>` — one line per expanded archive root. */
+    var RUN_ARCHIVE_RE = /^\s*archive '([^']+)' <- (.+)$/;
+
+    /** Every recent-run output blob the detail carries, newest first. */
+    function runOutputs(d) {
+        var out = [];
+        var runs = first(d.recentRuns, d.runs);
+        if (isArray(runs)) {
+            for (var i = 0; i < runs.length; i++) {
+                if (runs[i] && runs[i].output) {
+                    out.push('' + runs[i].output);
+                }
+            }
+        }
+        var journal = first(d.journal, d.recentOutput);
+        if (!out.length && journal) {
+            out.push('' + journal);
+        }
+        return out;
+    }
+
+    function lastRunSnapshotBlock(d) {
+        var blobs = runOutputs(d);
+        var snapshots = [];
+        var roots = [];
+        for (var b = 0; b < blobs.length && !snapshots.length && !roots.length; b++) {
+            var lines = ('' + blobs[b]).split('\n');
+            for (var i = 0; i < lines.length; i++) {
+                var arch = RUN_ARCHIVE_RE.exec(lines[i]);
+                if (arch) {
+                    roots.push({ name: arch[1], root: arch[2] });
+                    continue;
+                }
+                var snap = RUN_SNAPSHOT_RE.exec(lines[i]);
+                if (snap) {
+                    snapshots.push(trim(snap[1]));
+                }
+            }
+        }
+        if (!snapshots.length && !roots.length) {
+            return '';
+        }
+        var html = '<div style="margin-top:12px;">'
+            + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
+            + '<i class="fa fa-camera" style="margin-right:5px;"></i>'
+            + enc(t('Last run: snapshot + archive roots (from journald — recent only)')) + '</div>';
+        for (var s = 0; s < snapshots.length; s++) {
+            html += '<div style="font-size:12px;font-family:monospace;">' + enc(snapshots[s]) + '</div>';
+        }
+        for (var r = 0; r < roots.length; r++) {
+            html += '<div style="font-size:12px;">'
+                + '<span style="font-family:monospace;color:var(--anas-accent,#3468c0);">'
+                + enc(roots[r].name + '.pxar') + '</span>'
+                + '<span style="color:var(--anas-muted,gray);"> ← </span>'
+                + '<span style="font-family:monospace;">' + enc(roots[r].root) + '</span></div>';
+        }
+        return html + '</div>';
     }
 
     function recentRunsBlock(d) {
@@ -1455,6 +1607,7 @@
         // The unit + timer, verbatim — config-is-the-API transparency (Principle 13).
         html += unitBlock(t('systemd service unit (as written)'), first(d.unit, d.serviceUnit));
         html += unitBlock(t('systemd timer (as written)'), first(d.timer, d.timerUnit));
+        html += lastRunSnapshotBlock(d);
         html += recentRunsBlock(d);
         html += pbsLinkBlock(task);
         html += '</div>';
@@ -1768,18 +1921,30 @@
         var found = (scan && isArray(scan.nested)) ? scan.nested : [];
         var excluded = excludedNested(scan);
         var truncated = scan && scan.truncated === true;
+        // backup2.3 — the consistency chip is shown even when nothing is nested:
+        // "this source is backed up live" is exactly the fact Epic 16 never said
+        // out loud, and the wizard is where it belongs.
+        var chip = consistencyChipHtml(scan);
+        var expansion = expansionLineHtml(scan);
+        var consistencyRow = chip
+            ? ('<div style="font-size:11px;margin-bottom:3px;">' + chip
+                + (expansion
+                    ? '<span style="color:var(--anas-muted,gray);margin-left:6px;">' + expansion + '</span>'
+                    : '')
+                + '</div>')
+            : '';
         if (!found.length && !truncated) {
-            return '';
+            return consistencyRow;
         }
-        var head = '';
+        var head = consistencyRow;
         if (excluded.length) {
-            head = '<div style="font-size:11px;color:var(--anas-warn,#c9820b);">'
+            head += '<div style="font-size:11px;color:var(--anas-warn,#c9820b);">'
                 + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
                 + enc(excluded.length + ' '
                     + (excluded.length === 1 ? t('nested filesystem') : t('nested filesystems'))
                     + ' ' + t('will be backed up as empty directories')) + '</div>';
         } else if (found.length) {
-            head = '<div style="font-size:11px;color:var(--anas-ok,#1f9c56);">'
+            head += '<div style="font-size:11px;color:var(--anas-ok,#1f9c56);">'
                 + '<i class="fa fa-check" style="margin-right:5px;"></i>'
                 + enc(found.length + ' '
                     + (found.length === 1 ? t('nested filesystem') : t('nested filesystems'))

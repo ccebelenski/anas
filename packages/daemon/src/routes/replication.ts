@@ -6,6 +6,8 @@ import type { ReplicationNotifyContext } from '../services/replication-notify.js
 import type { ResolvedLocation, Transport } from '../services/replication-transport.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
 import { notifyReplicationRun } from '../services/replication-notify.js'
+import { isTransientBackupSnapshot } from '../services/snapshot-naming.js'
+import { createZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -122,17 +124,26 @@ interface Discovered {
  * snapshot older than `snapshot` (in creation order) that also exists on the
  * target. Target absent → full. Target present but no common base → diverged
  * (reported as a full send whose bytes we still estimate; stage 1 cannot run it).
+ *
+ * ⚠ TRANSIENT BACKUP SNAPSHOTS ARE NEVER A BASE (backup2.3). A snapshot-consistent
+ * backup run takes `anas-backup-<task>-<ts>` on the source and destroys it in a
+ * `finally`. If one were ever adopted as an incremental base, the destroy would
+ * pull the base out from under the next incremental send and break the chain —
+ * so they are filtered out of BOTH sides of the comparison, using the one shared
+ * predicate in `snapshot-naming.ts`.
  */
 function discover(sourceSnaps: Snapshot[], targetSnaps: Snapshot[] | null, snapshot: string): Discovered {
   if (targetSnaps === null)
     return { mode: 'full', snapshot, targetExists: false, targetDiverged: false }
 
-  const targetNames = new Set(targetSnaps.map(s => s.snapshotName))
+  const targetNames = new Set(
+    targetSnaps.map(s => s.snapshotName).filter(n => !isTransientBackupSnapshot(n)),
+  )
   // sourceSnaps is newest-first; snapshots OLDER than `snapshot` are the ones
   // after it in the list — a valid `-i` base must be older than what we send.
   const snapIdx = sourceSnaps.findIndex(s => s.snapshotName === snapshot)
   const older = snapIdx === -1 ? [] : sourceSnaps.slice(snapIdx + 1)
-  const common = older.find(s => targetNames.has(s.snapshotName))
+  const common = older.find(s => !isTransientBackupSnapshot(s.snapshotName) && targetNames.has(s.snapshotName))
   if (common)
     return { mode: 'incremental', snapshot, baseSnapshot: common.snapshotName, targetExists: true, targetDiverged: false }
   // Target exists but shares no common base → divergence (out of stage-1 scope).
@@ -368,9 +379,9 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           if (snapshotFirst) {
             const name = defaultSnapName()
             updateProgress(`zfs snapshot ${source}@${name}`)
-            const snapR = await executor.exec(ZFS, ['snapshot', `${source}@${name}`])
-            if (snapR.exitCode !== 0)
-              throw new Error(snapR.stderr.trim() || `zfs snapshot exited with code ${snapR.exitCode}`)
+            // The ONE zfs-snapshot verb (backup2.3's extraction) — same argv,
+            // same error text, one definition.
+            await createZfsSnapshot(executor, { dataset: source, name })
             snapName = name
           }
 

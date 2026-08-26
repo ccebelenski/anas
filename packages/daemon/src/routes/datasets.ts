@@ -15,6 +15,7 @@ import { parseZpoolList } from '../parsers/zpool-list.js'
 import { confirmGate } from '../safety/gate.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
+import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 import { createReplicationHandlers } from './replication.js'
 
@@ -1449,15 +1450,14 @@ export async function datasetRoutes(
       return { error: { code: 'CONFLICT', message: `Snapshot '${snapName}' already exists` } }
     }
 
-    const args = recursive ? ['snapshot', '-r', snapName] : ['snapshot', snapName]
-
     const job = jobQueue.submit(
       'zfs.snapshot',
       { ...identity, params: { snapshot: snapName, recursive: recursive ?? false } },
       async () => {
-        const result = await executor.exec(ZFS, args)
-        if (result.exitCode !== 0)
-          throw new Error(result.stderr.trim() || `zfs snapshot exited with code ${result.exitCode}`)
+        // The ONE zfs-snapshot verb (backup2.3's extraction) — same argv, same
+        // error text, one definition shared with the schedules service and the
+        // backup runner.
+        await createZfsSnapshot(executor, { dataset: fullName, name, recursive: recursive === true })
         return { created: snapName }
       },
     )
@@ -1539,9 +1539,7 @@ export async function datasetRoutes(
       'zfs.destroy',
       { ...identity, params: { snapshot: snapName } },
       async () => {
-        const result = await executor.exec(ZFS, ['destroy', snapName])
-        if (result.exitCode !== 0)
-          throw new Error(result.stderr.trim() || `zfs destroy exited with code ${result.exitCode}`)
+        await destroyZfsSnapshot(executor, { dataset: fullName, name: snapParsed.data })
         return { destroyed: snapName }
       },
     )

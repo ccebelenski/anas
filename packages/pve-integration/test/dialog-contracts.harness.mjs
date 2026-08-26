@@ -436,6 +436,31 @@ const NESTED_BY_PATH = {
   '/srv': [{ path: '/srv/nfs', relativePath: 'nfs', kind: 'nfs', fstype: 'nfs4' }],
 }
 
+/**
+ * backup2.3 — the DERIVED consistency the daemon attaches to the SAME scan.
+ * READ-ONLY: it appears in the response, never in a request body. `/mnt/pictures`
+ * is a ZFS dataset (snapshot-capable); `/etc` sits on the ext4 root and `/srv`
+ * likewise, so both are honestly live.
+ */
+const CONSISTENCY_BY_PATH = {
+  '/mnt/pictures': {
+    consistency: 'snapshot',
+    reason: '/mnt/pictures is on the ZFS dataset tank/pictures; the run takes a recursive snapshot',
+    backend: 'zfs',
+    target: 'tank/pictures',
+    mountpoint: '/mnt/pictures',
+    relativePath: '',
+  },
+  '/etc': {
+    consistency: 'live',
+    reason: '/etc is on /dev/sda1 (ext4), which has no snapshot mechanism ANAS can drive - the backup is live',
+  },
+  '/srv': {
+    consistency: 'live',
+    reason: '/srv is on /dev/sda1 (ext4), which has no snapshot mechanism ANAS can drive - the backup is live',
+  },
+}
+
 /** Every preview-nested body the dialog sent (the endpoint must be user-driven). */
 const nestedPreviews = []
 
@@ -444,6 +469,7 @@ function nestedPreviewRoute(body) {
   const choice = (body && body.includeNested) || 'none'
   const found = NESTED_BY_PATH[body && body.path] || []
   const covers = p => choice === 'all' || (Array.isArray(choice) && choice.indexOf(p) >= 0)
+  const consistency = CONSISTENCY_BY_PATH[body && body.path]
   return {
     data: {
       archives: [{
@@ -453,6 +479,7 @@ function nestedPreviewRoute(body) {
         nested: found.map(n => ({ ...n, included: covers(n.path) })),
         truncated: false,
         warnings: [],
+        ...(consistency ? { consistency } : {}),
       }],
     },
   }
@@ -653,6 +680,65 @@ async function nestedChecks() {
     !('includeNested' in body.archives[1]), JSON.stringify(body.archives[1]))
 
   ok('nested: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  1c. backup2.3 — the consistency chip is READ-ONLY, and nothing new is writable
+// ============================================================================
+
+async function consistencyChecks() {
+  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  grid.selectRow(0)
+
+  nestedPreviews.length = 0
+  const dlg = await openEdit(grid)
+  const rows = archiveRows(dlg)
+
+  // --- The chip renders the DERIVED verdict, with the daemon's own reason ---
+  const picturesAlert = rows[0].down('#archNestedAlert').html || ''
+  ok('consistency: a ZFS source shows the `snapshot` chip',
+    />snapshot</.test(picturesAlert), picturesAlert)
+  ok('consistency: the chip carries the daemon\'s reason as its tooltip',
+    picturesAlert.includes('recursive snapshot'), picturesAlert)
+
+  const etcAlert = rows[1].down('#archNestedAlert').html || ''
+  ok('consistency: a non-snapshottable source shows the `live` chip',
+    />live</.test(etcAlert), etcAlert)
+  ok('consistency: the live chip explains WHY, verbatim from the daemon',
+    etcAlert.includes('no snapshot mechanism'), etcAlert)
+
+  // --- The expansion preview line: N nested filesystems -> N+1 archives ---
+  // Archive 0 is `all` over a ZFS source with one nested child dataset.
+  ok('consistency: a snapshot source with an included child previews the expansion',
+    /1 nested filesystem → 2 archives/.test(picturesAlert), picturesAlert)
+  // A LIVE source expands into nothing, whatever its choice — the line is absent.
+  ok('consistency: a live source shows NO expansion preview',
+    !/→ \d+ archives/.test(etcAlert), etcAlert)
+
+  // --- READ-ONLY: no control exists for it, and no save carries it ---
+  ok('consistency: the archive row has no consistency control at all',
+    !rows[0].down('#archConsistency'), 'a control would make a derived fact editable')
+
+  const body = await save(dlg)
+  ok('consistency: an untouched save still produced a body', !!body)
+  for (let i = 0; i < body.archives.length; i++) {
+    ok(`consistency: archive ${i} sends no consistency key`,
+      !('consistency' in body.archives[i]), JSON.stringify(body.archives[i]))
+    ok(`consistency: archive ${i} sends no snapshot/expansion key`,
+      !('snapshots' in body.archives[i]) && !('expansion' in body.archives[i]),
+      JSON.stringify(body.archives[i]))
+  }
+  ok('consistency: the task body itself carries no derived key',
+    !('consistency' in body) && !('snapshots' in body) && !('expansion' in body),
+    Object.keys(body).join(','))
+  // The class guard: an untouched edit is still byte-for-byte the stored task.
+  sweepFields('consistency: untouched edit', body, TASK)
+
+  ok('consistency: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 // ============================================================================
@@ -940,6 +1026,8 @@ async function datasetsChecks() {
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
+warnings.length = 0
+await consistencyChecks()
 warnings.length = 0
 await poolImportChecks()
 warnings.length = 0

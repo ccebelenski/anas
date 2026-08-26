@@ -11,6 +11,7 @@ import { run } from './ahr-exec.js'
 import { createAhrSnapshot, deleteAhrSnapshot, listAhrSnapshots } from './ahr-snapshots.js'
 import { formatScheduledName, parseScheduledName } from './snapshot-naming.js'
 import { planRetention } from './snapshot-retention.js'
+import { createZfsSnapshot, destroyZfsSnapshot, zfsSnapshotFullName } from './zfs-snapshot.js'
 
 /**
  * Uniform snapshot take/prune/list (Epic 17, stage 1). ONE service surface that
@@ -68,11 +69,6 @@ function requirePool(target: Extract<SnapshotTarget, { kind: 'ahr' }>, opts?: Sn
   return pool
 }
 
-/** The full ZFS snapshot name (`<dataset>@<label>`) for a target + label. */
-function zfsSnapshotFullName(dataset: string, label: string): string {
-  return `${dataset}@${label}`
-}
-
 // ---- Take -------------------------------------------------------------------
 
 /** The result of taking one scheduled snapshot. */
@@ -96,8 +92,9 @@ export async function takeSnapshot(
 ): Promise<TakeSnapshotResult> {
   const name = formatScheduledName(bucket, opts?.now ?? new Date())
   if (target.kind === 'zfs') {
-    const args = ['snapshot', ...(opts?.recursive ? ['-r'] : []), zfsSnapshotFullName(target.dataset, name)]
-    await run(executor, ZFS, args)
+    // The ONE zfs-snapshot verb (backup2.3's extraction): identical argv, shared
+    // with the datasets route, replication's snapshot-first and the backup runner.
+    await createZfsSnapshot(executor, { dataset: target.dataset, name, recursive: opts?.recursive === true })
   }
   else {
     const pool = requirePool(target, opts)
@@ -226,7 +223,7 @@ export async function pruneSnapshots(
         continue
       }
       progress(`Destroying ${full}`)
-      await run(executor, ZFS, ['destroy', full])
+      await destroyZfsSnapshot(executor, { dataset: target.dataset, name: snap.name })
       pruned.push(snap)
     }
   }

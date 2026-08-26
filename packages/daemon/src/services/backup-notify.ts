@@ -1,4 +1,12 @@
-import type { BackupNotifyMode, BackupPruneResult, BackupRepo, BackupTask } from '@anas/shared'
+import type {
+  BackupArchiveConsistency,
+  BackupExpandedArchive,
+  BackupNotifyMode,
+  BackupPruneResult,
+  BackupRepo,
+  BackupTask,
+  BackupTransientSnapshot,
+} from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { PveNotifySeverity } from './pve-notify.js'
 import type { NotifyOutcome } from './unattended-notify.js'
@@ -55,6 +63,17 @@ export interface BackupNotifyResult {
    * rather than leaving the reader to infer it from the task config (backup2.2).
    */
   includedNested?: Record<string, string[]>
+  /**
+   * backup2.3 — the DERIVED consistency of each archive source, in task order.
+   * `snapshot <name>` or `live`: the operator reading this mail must be able to
+   * tell whether the run captured one instant or a moving tree, without opening
+   * the UI. Absent on an old daemon (version skew: additive, warn-don't-fail).
+   */
+  consistency?: BackupArchiveConsistency[]
+  /** The transient snapshots the run took (and destroyed before this body existed). */
+  snapshots?: BackupTransientSnapshot[]
+  /** One entry per archive root pbc was actually handed (the expansion). */
+  expansion?: BackupExpandedArchive[]
 }
 
 export interface BackupNotifyContext {
@@ -141,6 +160,29 @@ function durationLine(ctx: BackupNotifyContext): string | null {
 }
 
 /**
+ * The per-archive "Consistency:" lines (backup2.3). One per configured archive,
+ * naming the archive, the verdict, and — for `snapshot` — the transient snapshot
+ * the run read from. Empty when the daemon that produced the result predates the
+ * field, which is the version-skew rule: additive, warn-don't-fail, and a body
+ * that says nothing is better than one that guesses `live`.
+ */
+export function consistencyBlock(ctx: BackupNotifyContext): string[] {
+  const result = ctx.result
+  const derived = result?.consistency
+  if (!derived?.length)
+    return []
+  const snapshots = result?.snapshots ?? []
+  return derived.map((c, i) => {
+    const archive = ctx.task.archives[i]?.name ?? `archive ${i + 1}`
+    if (c.consistency !== 'snapshot')
+      return `${archive}: live`
+    // The snapshot taken on THIS archive's target — never truncated.
+    const snap = snapshots.find(s => s.target === c.target && s.backend === c.backend)
+    return `${archive}: snapshot ${snap ? snap.full : (c.target ?? '')}`
+  })
+}
+
+/**
  * The notification BODY — plain text, scannable, and detailed on purpose: this
  * is what replaces reading the cron mail. Nothing here can carry a secret (pbc
  * keeps them in the environment, and every string below comes from the task
@@ -184,6 +226,26 @@ export function buildBackupNotifyBody(ctx: BackupNotifyContext): string {
   else if (outcome !== 'failure') {
     lines.push('')
     lines.push(`Archives:    none reported${result?.reason ? ` - ${result.reason}` : ''}`)
+  }
+
+  // backup2.3 — was this one instant, or a moving tree? Short and per-archive:
+  // `snapshot <name>` when the run took (and destroyed) a point-in-time
+  // snapshot, `live` when the filesystem could not give one. ASCII only.
+  const consistencyLines = consistencyBlock(ctx)
+  if (consistencyLines.length) {
+    lines.push('')
+    lines.push('Consistency:')
+    for (const line of consistencyLines)
+      lines.push(`  ${line}`)
+  }
+
+  // The archive roots pbc was actually handed — one per nested filesystem the
+  // run expanded into, so a `data` + `data__photos` pair is visible as such.
+  if (result?.expansion && result.expansion.length > (result.consistency?.length ?? 0)) {
+    lines.push('')
+    lines.push('Archive roots:')
+    for (const e of result.expansion)
+      lines.push(`  ${e.name}.pxar <- ${e.root}`)
   }
 
   if (result?.prune) {

@@ -4,6 +4,7 @@ import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { LenientReplicationTask as LenientReplicationTaskSchema, ReplicationTask as ReplicationTaskSchema } from '@anas/shared'
 import { parseSnapshotList, zfsSnapshotDetailArgs } from '../parsers/zfs-list.js'
+import { isTransientBackupSnapshot } from './snapshot-naming.js'
 
 /**
  * Recurring replication TASKS (Epic 5.5.3) — the systemd units ARE the store.
@@ -447,7 +448,13 @@ export async function deriveTaskStatus(
 ): Promise<ReplicationTaskStatus> {
   const { sourceFull, targetFull } = resolveTaskDatasets(task)
 
-  const sourceSnaps = await listSnapshots(executor, sourceFull) // newest-first
+  // newest-first. ⚠ Transient backup snapshots (`anas-backup-<task>-<ts>`) are
+  // dropped here as well as in the base discovery (backup2.3): they are never
+  // replicated by design, so counting them would report a healthy task as N
+  // behind for as long as a backup run is in flight — and the count would then
+  // silently fix itself when the run's `finally` destroyed them.
+  const sourceSnaps = (await listSnapshots(executor, sourceFull))
+    .filter(s => !isTransientBackupSnapshot(s.snapshotName))
   let lastReplicatedSnapshot: string | null = null
   let lastReplicatedAt: string | null = null
   let snapshotsBehind: number | null = null

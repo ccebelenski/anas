@@ -135,6 +135,63 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.equal(data.targetDiverged, false)
   })
 
+  // --- ⚠ plan: a transient backup snapshot is NEVER an incremental base ----
+  //
+  // backup2.3's flagged risk, in situ. A snapshot-consistent backup run takes
+  // `anas-backup-<task>-<ts>` on the source and destroys it in a `finally`. Here
+  // it is the NEWEST snapshot common to both sides — exactly the shape the base
+  // discovery reaches for — and adopting it would leave the next incremental
+  // send pointing at a base that no longer exists.
+  it('plan → the newest common snapshot IGNORES an anas-backup-* transient', async () => {
+    server = createServer({ mock: true, logger: false })
+    const mock = mockOf(server)
+    mock.clearFixtures()
+    mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool', 'testpool2']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool'), result: { stdout: zfsListJson(['testpool', 'testpool/share1']), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: ZFS, args: zfsListArgs('testpool2'), result: { stdout: zfsListJson(['testpool2', 'testpool2/share1']), stderr: '', exitCode: 0 } })
+    // repl-base (oldest), the transient (NEWER than the base), repl-next (newest).
+    mock.addFixture({
+      command: ZFS,
+      args: zfsSnapshotDetailArgs('testpool/share1'),
+      result: {
+        stdout: snapshotListJson('testpool/share1', [
+          { name: 'repl-base', txg: 100 },
+          { name: 'anas-backup-nightly-share1-1756000000', txg: 150 },
+          { name: 'repl-next', txg: 200 },
+        ]),
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    // The target carries BOTH — so without the filter the transient wins.
+    mock.addFixture({
+      command: ZFS,
+      args: zfsSnapshotDetailArgs('testpool2/share1'),
+      result: {
+        stdout: snapshotListJson('testpool2/share1', [
+          { name: 'repl-base', txg: 100 },
+          { name: 'anas-backup-nightly-share1-1756000000', txg: 150 },
+        ]),
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    mock.addFixture({ command: ZFS, args: ['send', '-nvP', '-i', '@repl-base', 'testpool/share1@repl-next'], result: { stdout: INCR_DRYRUN, stderr: '', exitCode: 0 } })
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/share1/replicate/plan',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ target: { pool: 'testpool2' } }),
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: ReplicatePlan }
+    assert.equal(data.mode, 'incremental')
+    assert.equal(data.baseSnapshot, 'repl-base', 'a transient must never become an incremental base')
+    // And the dry run was estimated against that base, not the transient.
+    assert.equal(data.estimatedBytes, 8411760)
+  })
+
   // --- plan: diverged (target exists, no common snapshot) ----------------
   it('plan → targetDiverged when the target exists but shares no snapshot', async () => {
     server = createServer({ mock: true, logger: false })
