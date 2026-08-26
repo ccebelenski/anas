@@ -250,6 +250,15 @@ describe('heldByLunRefusal — the guiding 409 body', () => {
     const held = toHeldByLun(ZVOL_CLAIM)
     assert.deepEqual(heldByLunRefusal('x', 'Destroying', held).heldByLun, held)
   })
+
+  it('names no backend — the same sentence serves ZFS, AHR and mounts (live-proof wave 2)', () => {
+    // Rendered verbatim for AHR (btrfs on LVM on md) pools and for remote
+    // mounts as well as for ZFS, so a ZFS-specific claim was simply false there.
+    const r = heldByLunRefusal(`AHR pool 'lpahr'`, 'Destroying', toHeldByLun(FILE_CLAIM))
+    assert.ok(!r.message.includes('ZFS'), 'the refusal blames no particular backend')
+    assert.ok(!r.message.includes('dataset is busy'))
+    assert.ok(r.message.includes('Nothing underneath stops this on its own'))
+  })
 })
 
 describe('heldByLun — against the REAL configfs capture (iscsi.1)', () => {

@@ -282,7 +282,11 @@ export function heldByLunRefusal(
   return {
     reason: 'held-by-lun',
     message: `${action} ${what} is refused: it is ${held.detail}.${live} `
-      + `ZFS does not stop this on its own — it would either fail with a bare 'dataset is busy' or succeed silently and corrupt what the initiator sees. `
+      // Backend-neutral on purpose: this one sentence is rendered for ZFS pools
+      // and datasets, AHR (btrfs on LVM on md) pools and remote mounts alike, so
+      // naming ZFS made it a false statement on three of the four (live-proof
+      // wave 2 read an AHR pool refusal that blamed ZFS).
+      + `Nothing underneath stops this on its own — the operation would either fail with a bare 'busy' error or succeed silently and corrupt what the initiator sees. `
       + `Delete LUN ${held.index} ('${held.name}') of target ${held.targetIqn} from the iSCSI screen first, `
       + `or delete it with destroyBacking=true to remove the backing object in the same step. `
       + `This refusal has no confirm bypass.`,
