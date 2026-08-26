@@ -1,0 +1,273 @@
+# ==============================================================================
+# ANAS story backup2.5 - REAL CAPTURE from the disposable stunt node (anas-pve).
+# proxmox-backup-client / -server 4.2.5-1, PVE 9.2.11, kernel 7.0.14-12-pve.
+# Datastore anastest-store (dir-backed), namespace gtrestore. READ-ONLY probes:
+# nothing on the node was created, modified or destroyed.
+# ==============================================================================
+# CAPTURE: what `catalog shell` ACTUALLY gives a directory picker - the shape of
+# `ls`, the shape of `stat`, the argument-quoting rules, the error channel, the
+# real exit codes, and the cost of a session. Nothing here was edited: these are
+# the exact bytes the commands produced.
+# ==============================================================================
+
+############ 1. `ls` PRINTS BARE NAMES - no type, no size, no marker ############
+### $ printf 'ls\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+acl-xattr.txt
+alpha.txt
+beta.txt
+bracket[1].txt
+docs
+empty
+hard-a.txt
+hard-b.txt
+link-to-alpha
+mix [a] * b.txt
+star*name.txt
+sub
+with space.txt
+### exit=0
+
+--- stdout only (cat -A: no trailing markers, one plain name per line) ---
+acl-xattr.txt$
+alpha.txt$
+beta.txt$
+bracket[1].txt$
+docs$
+empty$
+hard-a.txt$
+hard-b.txt$
+link-to-alpha$
+mix [a] * b.txt$
+star*name.txt$
+sub$
+with space.txt$
+--- stderr only: the banner is the ONLY thing on stderr for a clean run ---
+Starting interactive shell    $
+
+############ 2. `ls` of a FILE echoes the file itself (not an error) ############
+### $ printf 'ls /alpha.txt\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+alpha.txt
+### exit=0
+
+############ 3. `stat` IS the type source: dir / file / symlink / HARDLINK ############
+### $ printf 'stat /docs\nstat /alpha.txt\nstat /link-to-alpha\nstat /hard-a.txt\nstat /hard-b.txt\nstat /empty\nstat /\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+  File: /docs
+  Size: 0             Type: directory
+Access: (755/drwxr-xr-x  )  Uid: 0     Gid: 0    
+Modify: 2026-08-25 19:16:23
+  File: /alpha.txt
+  Size: 23            Type: file
+Access: (644/-rw-r--r--  )  Uid: 0     Gid: 0    
+Modify: 2026-08-25 19:16:23
+  File: /link-to-alpha -> "alpha.txt"
+  Size: 0             Type: symlink
+Access: (777/lrwxrwxrwx  )  Uid: 0     Gid: 0    
+Modify: 2026-08-25 19:16:23
+  File: /hard-a.txt
+  Size: 17            Type: file
+Access: (644/-rw-r--r--  )  Uid: 0     Gid: 0    
+Modify: 2026-08-25 19:16:23
+  File: /hard-b.txt -> "hard-a.txt"
+  Size: 0             Type: symlink
+Access: (0/L---------  )  Uid: 0     Gid: 0    
+Modify: 1970-01-01 00:00:00
+  File: /empty
+  Size: 0             Type: directory
+Access: (755/drwxr-xr-x  )  Uid: 0     Gid: 0    
+Modify: 2026-08-25 19:16:23
+  File: /
+  Size: 0             Type: directory
+Access: (755/drwxr-xr-x  )  Uid: 0     Gid: 0    
+Modify: 2026-08-25 19:16:23
+### exit=0
+
+############ 4. ARGUMENT QUOTING - what the shell accepts ############
+--- unquoted space: SPLIT into two arguments (the trap) ---
+### $ printf 'ls /with space.txt\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+Error: got additional arguments: ["space.txt"]
+Usage:  ls [<path>]
+
+ <path>     <string>
+             target path.
+### exit=0
+
+--- double quotes / single quotes / unquoted BACKSLASH-escape: all work ---
+### $ printf 'ls "/with space.txt"\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+with space.txt
+### exit=0
+
+### $ printf 'ls '/with space.txt'\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+with space.txt
+### exit=0
+
+### $ printf 'ls /with\\ space.txt\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+with space.txt
+### exit=0
+
+--- a backslash INSIDE double quotes is LITERAL (quoting cannot be rescued) ---
+### $ printf 'ls "/with\\ space.txt"\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+Error: no such file or directory: "with\\ space.txt"
+### exit=0
+
+--- * and [ ] are NEVER globbed; backslash-escaping them is safe ---
+### $ printf 'ls /star\\*name.txt\nls /bracket\\[1\\].txt\nls /mix\\ \\[a\\]\\ \\*\\ b.txt\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+star*name.txt
+bracket[1].txt
+mix [a] * b.txt
+### exit=0
+
+--- a double quote inside a single-quoted argument survives ---
+### $ printf 'ls '/with"space.txt'\nls /docs\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+Error: no such file or directory: "with\"space.txt"
+notes.txt
+readme.md
+### exit=0
+
+--- an empty argument, and a trailing slash, both mean the directory ---
+### $ printf 'ls ""\nls "/docs/"\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+acl-xattr.txt
+alpha.txt
+beta.txt
+bracket[1].txt
+docs
+empty
+hard-a.txt
+hard-b.txt
+link-to-alpha
+mix [a] * b.txt
+star*name.txt
+sub
+with space.txt
+notes.txt
+readme.md
+### exit=0
+
+############ 5. AN ERROR INSIDE THE SHELL: stderr, exit 0, shell CONTINUES ############
+### $ printf 'ls /nosuchdir\nls /docs\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+Error: no such file or directory: "nosuchdir"
+notes.txt
+readme.md
+### exit=0
+
+--- one command per line: a `;` is parsed as more ARGUMENTS, never a separator ---
+### $ printf 'ls /docs; ls /sub\nexit\n' | proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' data.pxar --ns $NS
+Starting interactive shell    
+Error: got additional arguments: ["ls", "/sub"]
+Usage:  ls [<path>]
+
+ <path>     <string>
+             target path.
+### exit=0
+
+############ 6. REAL EXIT CODES when the shell cannot start (no pipe) ############
+### $ proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' 'nosuch.pxar' --ns $NS   (ls; exit)
+### exit=255
+--- stdout ---
+--- stderr ---
+Error: archive not found in manifest
+
+### $ proxmox-backup-client catalog shell 'host/gtrestore/2020-01-01T00:00:00Z' 'data.pxar' --ns $NS   (ls; exit)
+### exit=255
+--- stdout ---
+--- stderr ---
+Error: snapshot host/gtrestore/2020-01-01T00:00:00Z does not exist.
+
+### $ proxmox-backup-client catalog shell 'host/gtrestore/2026-08-25T19:16:45Z' 'data' --ns $NS   (ls; exit)
+### exit=255
+--- stdout ---
+--- stderr ---
+Error: failed to parse archive type for 'data'
+
+### $ catalog shell on an .img archive
+### exit=255
+--- stderr ---
+Error: Can only mount pxar archives.
+
+### $ catalog shell against a closed port (PBS down)
+### exit=255
+--- stderr ---
+Error: client error (Connect)
+
+Caused by:
+    error connecting to https://localhost:9999/ - tcp connect error: Connection refused (os error 111)
+
+### $ catalog shell with a token that has NO permission
+### exit=255
+--- stderr ---
+Error: no permissions on /datastore/anastest-store/gtrestore
+
+### $ snapshot list / list with that same no-perm token (DIFFERENT wording)
+### exit=255
+--- stderr ---
+Error: permission check failed - missing Datastore.Audit|Datastore.Backup on /datastore/anastest-store/gtrestore
+
+### $ snapshot list / list on a NONEXISTENT namespace (vs an empty one = [])
+### exit=255
+--- stderr ---
+Error: ENOENT: No such file or directory
+### list exit=255
+--- stderr ---
+Error: ENOENT: No such file or directory
+
+############ 7. `catalog shell` browses .pxar, .mpxar AND .ppxar ############
+### $ ls on cdm.pxar
+Starting interactive shell    
+a
+b
+c
+d
+### $ ls on cdm.mpxar
+Starting interactive shell    
+a
+b
+c
+d
+### $ ls on cdm.ppxar (the metadata-mode PAYLOAD file)
+Starting interactive shell    
+a
+b
+c
+d
+
+############ 8. COST: one session is one process and one catalog fetch ############
+--- ls only, small archive (2.5 KiB) ---
+
+real	0m0.028s
+user	0m0.010s
+sys	0m0.006s
+--- ls only, 250 MiB archive ---
+
+real	0m0.063s
+user	0m0.027s
+sys	0m0.026s
+--- ls + 500 stats in ONE session (a 500-entry directory) ---
+
+real	0m0.083s
+user	0m0.053s
+sys	0m0.017s
+exit=0  stdout lines: 2500  (500 names + 500 x 4 stat lines)
+
+############ 9. THE COMPOSED ID ROUND-TRIPS (GT-1: the client returns no id) ############
+### $ snapshot list host/gtrestore --ns $NS --output-format json
+[{"backup-id":"gtrestore","backup-time":1787685405,"backup-type":"host","files":[{"crypt-mode":"none","filename":"data.pxar.didx","size":2607},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":327},{"crypt-mode":"none","filename":"index.json.blob","size":375}],"owner":"root@pam!anas-test","protected":false,"size":3309}]
+### exit=0
+### $ snapshot files host/gtbig/2026-08-25T19:22:02Z --ns $NS --output-format json   (the id ANAS composed)
+[{"crypt-mode":"none","filename":"big.pxar.didx","size":262145428},{"crypt-mode":"none","filename":"catalog.pcat1.didx","size":218},{"crypt-mode":"none","filename":"index.json.blob","size":376}]
+### exit=0
+
+############ 10. `list` - the GROUP listing (files are bare STRINGS: GT-3) ############
+### $ proxmox-backup-client list --ns $NS --output-format json
+[{"backup-count":1,"backup-id":"gtbtrfslive","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","btrlive.pxar.didx"],"last-backup":1787686460,"owner":"root@pam!anas-test"},{"backup-count":4,"backup-id":"gtimg","backup-type":"host","files":["index.json.blob","lun.img.fidx"],"last-backup":1787686121,"owner":"root@pam!anas-test"},{"backup-count":1,"backup-id":"gtrestore","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","data.pxar.didx"],"last-backup":1787685405,"owner":"root@pam!anas-test"},{"backup-count":1,"backup-id":"gtbig","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","big.pxar.didx"],"last-backup":1787685722,"owner":"root@pam!anas-test"},{"backup-count":2,"backup-id":"gtdup","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","dup.pxar.didx"],"last-backup":1787687030,"owner":"root@pam!anas-test"},{"backup-count":1,"backup-id":"gtbtrfsall","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","btrall.pxar.didx"],"last-backup":1787686460,"owner":"root@pam!anas-test"},{"backup-count":1,"backup-id":"gtimgboth","backup-type":"host","files":["vol.img.fidx","index.json.blob","lun.img.fidx"],"last-backup":1787686118,"owner":"root@pam!anas-test"},{"backup-count":4,"backup-id":"liveproof-nested","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","gtbackup.pxar.didx"],"last-backup":1787693577,"owner":"root@pam"},{"backup-count":6,"backup-id":"gtcdm","backup-type":"host","files":["cdm.ppxar.didx","index.json.blob","cdm.mpxar.didx"],"last-backup":1787686416,"owner":"root@pam!anas-test"},{"backup-count":3,"backup-id":"gtcdmdef","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","cdm.pxar.didx"],"last-backup":1787686425,"owner":"root@pam!anas-test"},{"backup-count":2,"backup-id":"gtsnapdev","backup-type":"host","files":["index.json.blob","snap.img.fidx"],"last-backup":1787686352,"owner":"root@pam!anas-test"},{"backup-count":1,"backup-id":"gtbtrfssnapall","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","btrsnapall.pxar.didx"],"last-backup":1787686460,"owner":"root@pam!anas-test"},{"backup-count":1,"backup-id":"gtimgvol","backup-type":"host","files":["vol.img.fidx","index.json.blob"],"last-backup":1787686117,"owner":"root@pam!anas-test"},{"backup-count":1,"backup-id":"gtimgfs","backup-type":"host","files":["index.json.blob","fs.img.fidx"],"last-backup":1787686316,"owner":"root@pam!anas-test"},{"backup-count":1,"backup-id":"gtbtrfs","backup-type":"host","files":["catalog.pcat1.didx","index.json.blob","btr.pxar.didx"],"last-backup":1787686460,"owner":"root@pam!anas-test"}]
+### exit=0

@@ -25,6 +25,11 @@
  *      what keeps a pre-backup2.2 unit byte-identical on save.
  *   4. Import Pool sends the GUID it displays — duplicate-name imports are the
  *      whole reason the scan reports a GUID.
+ *   5. backup2.5: the shared path picker — lazy tree loads, breadcrumbs,
+ *      type-ahead, multi-select set semantics, hardlink groups as ONE unit, and
+ *      the archive backend carrying its snapshot context. Plus the one that
+ *      matters most to the wizard: the archive-path body is BYTE-IDENTICAL
+ *      whether the path was typed or picked.
  *   4. Datasets: a VOLUME (zvol) and a FILESYSTEM are the same dialog sending
  *      two different bodies (story iscsi.3). Guards that a filesystem create is
  *      still byte-identical to what it was before volumes existed (version
@@ -82,6 +87,18 @@ function makeNode(cfg, parent) {
     set: (k, v) => { data[k] = v },
     isExpanded: () => !!data.expanded,
     childNodes: [],
+    // The lazy-load surface the backup2.5 path picker drives: a level is
+    // appended into a node, and expanding a node that has not loaded yet is what
+    // triggers the next browse call.
+    appendChild(childCfg) {
+      const child = childCfg && childCfg.get ? childCfg : makeNode(childCfg, node)
+      child.parentNode = node
+      node.childNodes.push(child)
+      return child
+    },
+    removeAll() { node.childNodes.length = 0 },
+    expand() { data.expanded = true },
+    collapse() { data.expanded = false },
   }
   for (const kid of kids) { node.childNodes.push(makeNode(kid, node)) }
   return node
@@ -236,11 +253,20 @@ function makeComponent(cfg, parent) {
     return node
   }
   c.getSelectionModel = () => ({
-    select(idx) {
-      const rec = c.store.getAt(idx)
+    // Real ExtJS: select(what, keepExisting, suppressEvent). A grid selects by
+    // index, a tree selects the node object — and unless suppressEvent is set it
+    // FIRES selectionchange, which is exactly how a widget that writes a field
+    // from its own selection can loop. The harness reproduces that.
+    select(what, _keepExisting, suppressEvent) {
+      const rec = (what && typeof what === 'object') ? what : (c.store ? c.store.getAt(what) : null)
       c._selection = rec ? [rec] : []
+      if (!suppressEvent) { c.fireEvent('selectionchange', {}, c._selection) }
+      return rec
     },
+    getSelection: () => c._selection.slice(),
+    deselectAll() { c._selection = [] },
   })
+  c.ensureVisible = () => c
   /** What a click on a row does: set the selection and fire the grid's listener. */
   c.selectRow = function (idx) {
     const rec = c.store.getAt(idx)
@@ -357,7 +383,7 @@ function makeAnas(routes) {
   }
 }
 
-function loadSource(file, routes) {
+function loadSource(files, routes) {
   const head = { appendChild() {} }
   const doc = {
     hidden: false,
@@ -383,7 +409,12 @@ function loadSource(file, routes) {
     setTimeout: (fn) => { fn(); return 1 },
     clearTimeout: () => {},
   }
-  vm.runInNewContext(readFileSync(join(SRC, file), 'utf8'), sandbox, { filename: file })
+  // A view may depend on a shared widget file (68-backup.js on 12-picker.js);
+  // load them into the SAME sandbox, in bundle order, exactly as install.sh
+  // concatenates them.
+  for (const file of (Array.isArray(files) ? files : [files])) {
+    vm.runInNewContext(readFileSync(join(SRC, file), 'utf8'), sandbox, { filename: file })
+  }
   return win.ANAS
 }
 
@@ -1022,6 +1053,485 @@ async function datasetsChecks() {
 }
 
 // ============================================================================
+//  5. backup2.5 — the shared path picker (12-picker.js), both backends
+//
+//  What this guards:
+//    · the wizard's archive-path body is BYTE-IDENTICAL whether the path was
+//      typed or picked — the picker is a convenience, never a second contract
+//    · the tree lazy-loads: expanding a node asks the right endpoint for THAT
+//      node's path, not the root's
+//    · breadcrumb navigation and type-ahead jump/filter
+//    · multi-select set semantics (de-duplicated, order preserved)
+//    · the archive backend carries the snapshot context on every call
+//    · a hardlink group is ONE selection — its primary comes along (GT-25)
+// ============================================================================
+
+/** The live filesystem the picker walks in these checks. */
+const LIVE_TREE = {
+  '/': { dirs: ['etc', 'mnt', 'srv'], files: ['swap.img'] },
+  '/mnt': { dirs: ['pictures', 'photos-old'], files: [] },
+  '/mnt/pictures': { dirs: ['2024', '2025'], files: ['cover.raw'] },
+}
+
+function liveRoute(path, wantFiles) {
+  const level = LIVE_TREE[path]
+  if (!level) {
+    return { data: { path, exists: false, type: 'missing', dirs: [] } }
+  }
+  // The daemon sends `files` ONLY when `files=1` was asked for — absent is
+  // "not requested", never "none there".
+  const data = { path, exists: true, type: 'dir', dirs: level.dirs.slice() }
+  if (wantFiles) { data.files = level.files.slice() }
+  return { data }
+}
+
+/** One directory level inside a pxar archive, in the daemon's own shape. */
+const ARCHIVE_TREE = {
+  '/': {
+    verdict: 'ok',
+    archiveKind: 'pxar',
+    path: '/',
+    entries: [
+      { name: 'docs', path: '/docs', type: 'dir' },
+      { name: 'alpha.txt', path: '/alpha.txt', type: 'file', size: 23, modified: '2026-08-25 19:16:23' },
+      { name: 'hard-a.txt', path: '/hard-a.txt', type: 'file', size: 17, modified: '2026-08-25 19:16:23' },
+      { name: 'hard-b.txt', path: '/hard-b.txt', type: 'hardlink', target: 'hard-a.txt' },
+      { name: 'link-to-alpha', path: '/link-to-alpha', type: 'symlink', target: 'alpha.txt' },
+    ],
+    warnings: [],
+  },
+  '/docs': {
+    verdict: 'ok',
+    archiveKind: 'pxar',
+    path: '/docs',
+    entries: [
+      { name: 'notes.txt', path: '/docs/notes.txt', type: 'file', size: 9 },
+      { name: 'readme.md', path: '/docs/readme.md', type: 'file', size: 10 },
+    ],
+    warnings: [],
+  },
+}
+
+/** Every browse request the picker made, in order. */
+const browseCalls = []
+
+const PICKER_ROUTES = {
+  ...BACKUP_ROUTES,
+  'GET /fs/browse': null, // replaced below by a function-aware get
+  'POST /backup/restore/browse': (body) => {
+    browseCalls.push(body)
+    const level = ARCHIVE_TREE[body.path]
+    if (!level) {
+      return { data: { verdict: 'not-found', detail: `'${body.path}' is not in this archive.`, entries: [], warnings: [] } }
+    }
+    return { data: level }
+  },
+  'GET /backup/tasks/nightly-pictures/snapshots': {
+    data: {
+      verdict: 'ok',
+      repository: 'pbs-main',
+      namespace: 'anas/pictures',
+      group: 'host/pictures',
+      snapshots: [
+        {
+          snapshot: 'host/pictures/2026-08-25T19:16:45Z',
+          backupType: 'host',
+          backupId: 'pictures',
+          backupTime: 1787685405,
+          backupTimeIso: '2026-08-25T19:16:45Z',
+          size: 3309,
+          files: [
+            { filename: 'data.pxar.didx', archive: 'data.pxar', kind: 'pxar', size: 2607 },
+            { filename: 'catalog.pcat1.didx', kind: 'other', size: 327 },
+            { filename: 'index.json.blob', kind: 'other', size: 375 },
+          ],
+        },
+        {
+          snapshot: 'host/pictures/2026-08-24T19:16:45Z',
+          backupType: 'host',
+          backupId: 'pictures',
+          backupTime: 1787599005,
+          backupTimeIso: '2026-08-24T19:16:45Z',
+          files: [{ filename: 'lun.img.fidx', archive: 'lun.img', kind: 'img', size: 536870912 }],
+        },
+      ],
+    },
+  },
+}
+
+/**
+ * The picker's own ANAS sandbox. `GET /fs/browse` needs the QUERY (the path and
+ * the files flag), which the shared route table keys away — so this wraps
+ * `loadSource`'s ANAS with a get that records the full URL.
+ */
+const liveCalls = []
+function loadPickerSources(files) {
+  const ANAS = loadSource(files, PICKER_ROUTES)
+  ANAS.api.get = (_node, path) => {
+    const [base, query] = path.split('?')
+    if (base === '/fs/browse') {
+      liveCalls.push(path)
+      const params = new URLSearchParams(query || '')
+      return Promise.resolve(liveRoute(params.get('path') || '/', params.get('files') === '1'))
+    }
+    const key = `GET ${base}`
+    return key in PICKER_ROUTES && PICKER_ROUTES[key]
+      ? Promise.resolve(PICKER_ROUTES[key])
+      : Promise.reject(new Error(`unexpected GET ${base}`))
+  }
+  return ANAS
+}
+
+async function pickerChecks() {
+  browseCalls.length = 0
+  liveCalls.length = 0
+  const ANAS = loadPickerSources(['12-picker.js'])
+  const P = ANAS.picker
+
+  // --- pure path helpers ---------------------------------------------------
+  eq('picker: normalize collapses slashes and drops the trailing one', P.normalizePath('//mnt//pictures/'), '/mnt/pictures')
+  eq('picker: the root normalizes to itself', P.normalizePath('/'), '/')
+  eq('picker: parent of the root is the root', P.parentDir('/'), '/')
+  eq('picker: parent of a top-level dir is the root', P.parentDir('/etc'), '/')
+  eq('picker: parent of a nested dir', P.parentDir('/mnt/pictures/2025'), '/mnt/pictures')
+  eq('picker: join does not double the root slash', P.joinPath('/', 'etc'), '/etc')
+  eq('picker: join a nested child', P.joinPath('/mnt', 'pictures'), '/mnt/pictures')
+  eq('picker: basename of a path', P.baseName('/mnt/pictures'), 'pictures')
+
+  // --- breadcrumbs ---------------------------------------------------------
+  eq('picker: the root breadcrumb is one segment', P.crumbs('/'), [{ label: '/', path: '/' }])
+  eq('picker: a nested breadcrumb walks the whole path', P.crumbs('/mnt/pictures/2025'), [
+    { label: '/', path: '/' },
+    { label: 'mnt', path: '/mnt' },
+    { label: 'pictures', path: '/mnt/pictures' },
+    { label: '2025', path: '/mnt/pictures/2025' },
+  ])
+  // Ids are never truncated — a long segment is carried whole.
+  const longSeg = 'a-very-long-directory-name-that-a-picker-must-not-shorten'
+  ok('picker: a long segment is never truncated',
+    P.crumbs(`/mnt/${longSeg}`).some(c => c.label === longSeg))
+
+  // --- what may be selected ------------------------------------------------
+  ok('picker: dir mode selects a directory', P.isSelectable('dir', 'dir') === true)
+  ok('picker: dir mode refuses a file', P.isSelectable('file', 'dir') === false)
+  ok('picker: file mode refuses a directory', P.isSelectable('dir', 'file') === false)
+  ok('picker: any mode takes both', P.isSelectable('dir', 'any') && P.isSelectable('file', 'any'))
+  ok('picker: a hardlink is selectable in file mode', P.isSelectable('hardlink', 'file') === true)
+  ok('picker: the whole-image pseudo-entry is selectable', P.isSelectable('image', 'any') === true)
+  ok('picker: an unknown entry kind is never selectable', P.isSelectable('other', 'any') === false)
+
+  // --- hardlink groups are ONE selection (GT-25) ---------------------------
+  eq('picker: a plain file selects only itself',
+    P.selectionFor({ path: '/alpha.txt', type: 'file' }), ['/alpha.txt'])
+  eq('picker: a symlink selects only itself (its target is not restored with it)',
+    P.selectionFor({ path: '/link-to-alpha', type: 'symlink', target: 'alpha.txt' }), ['/link-to-alpha'])
+  eq('picker: a hardlink brings its group primary along',
+    P.selectionFor({ path: '/hard-b.txt', type: 'hardlink', target: 'hard-a.txt' }),
+    ['/hard-b.txt', '/hard-a.txt'])
+  eq('picker: a hardlink in a subdirectory resolves its primary as a sibling',
+    P.selectionFor({ path: '/docs/hard-b.txt', type: 'hardlink', target: 'hard-a.txt' }),
+    ['/docs/hard-b.txt', '/docs/hard-a.txt'])
+  eq('picker: an archive-absolute hardlink target is taken as given',
+    P.selectionFor({ path: '/docs/hard-b.txt', type: 'hardlink', target: '/hard-a.txt' }),
+    ['/docs/hard-b.txt', '/hard-a.txt'])
+
+  // --- multi-select set semantics -----------------------------------------
+  eq('picker: a selection set is de-duplicated, order preserved',
+    P.selectionPaths([
+      { path: '/hard-b.txt', type: 'hardlink', target: 'hard-a.txt' },
+      { path: '/hard-a.txt', type: 'file' },
+      { path: '/alpha.txt', type: 'file' },
+    ]),
+    ['/hard-b.txt', '/hard-a.txt', '/alpha.txt'])
+  eq('picker: an empty set is an empty list', P.selectionPaths([]), [])
+
+  // --- the request each backend builds ------------------------------------
+  eq('picker: a directory picker never asks for the file listing',
+    P.liveBrowseUrl('/mnt/pictures', false), '/fs/browse?path=%2Fmnt%2Fpictures')
+  eq('picker: a file picker opts IN to files',
+    P.liveBrowseUrl('/mnt/pictures', true), '/fs/browse?path=%2Fmnt%2Fpictures&files=1')
+  eq('picker: the archive body carries the whole snapshot context',
+    P.archiveBrowseBody({ repo: 'pbs-main', ns: 'anas/pictures', snapshot: 'host/pictures/2026-08-25T19:16:45Z', archive: 'data.pxar' }, '/docs'),
+    { repo: 'pbs-main', snapshot: 'host/pictures/2026-08-25T19:16:45Z', archive: 'data.pxar', path: '/docs', ns: 'anas/pictures' })
+  ok('picker: an absent namespace sends NO ns key (absent means the repo’s own)',
+    !('ns' in P.archiveBrowseBody({ repo: 'r', snapshot: 's', archive: 'a.pxar' }, '/')))
+
+  // --- entry normalization -------------------------------------------------
+  const liveRows = P.entriesFromLive(liveRoute('/mnt/pictures', true).data, '/mnt/pictures', 'any')
+  eq('picker: the live backend lists directories first, then files',
+    liveRows.map(r => r.name), ['2024', '2025', 'cover.raw'])
+  eq('picker: a live child path is joined onto its parent', liveRows[0].path, '/mnt/pictures/2024')
+  ok('picker: only directories expand', liveRows[0].expandable === true && liveRows[2].expandable === false)
+  const dirOnly = P.entriesFromLive({ path: '/mnt', dirs: ['pictures'] }, '/mnt', 'dir')
+  eq('picker: an absent files key lists no files at all', dirOnly.map(r => r.name), ['pictures'])
+  const volunteered = P.entriesFromLive({ path: '/mnt', dirs: ['pictures'], files: ['stray.img'] }, '/mnt', 'dir')
+  eq('picker: a directory picker hides a file even if the daemon volunteers one',
+    volunteered.map(r => r.name), ['pictures'])
+
+  const archRows = P.entriesFromArchive(ARCHIVE_TREE['/'], '/', 'any')
+  eq('picker: the archive backend keeps the daemon’s order (folders first)',
+    archRows.map(r => r.name), ['docs', 'alpha.txt', 'hard-a.txt', 'hard-b.txt', 'link-to-alpha'])
+  eq('picker: a hardlink row carries its group primary', archRows[3].target, 'hard-a.txt')
+  eq('picker: sizes and mtimes are carried through verbatim',
+    [archRows[1].size, archRows[1].modified], [23, '2026-08-25 19:16:23'])
+
+  // --- the archive backend surfaces a verdict as a failure ----------------
+  const archBackend = P.makeBackend({
+    node: 'harness',
+    backend: 'archive',
+    mode: 'any',
+    archive: { repo: 'pbs-main', ns: 'anas/pictures', snapshot: 'host/pictures/2026-08-25T19:16:45Z', archive: 'data.pxar' },
+  })
+  const level = await archBackend.load('/docs')
+  eq('picker: the archive backend asked for THAT path',
+    browseCalls[browseCalls.length - 1].path, '/docs')
+  eq('picker: the archive backend carried the snapshot on the call',
+    browseCalls[browseCalls.length - 1].snapshot, 'host/pictures/2026-08-25T19:16:45Z')
+  eq('picker: the level came back as rows', level.rows.map(r => r.name), ['notes.txt', 'readme.md'])
+  let rejected = null
+  await archBackend.load('/nosuch').then(() => {}, (e) => { rejected = e })
+  ok('picker: a non-ok verdict rejects with the daemon’s own detail',
+    rejected && /is not in this archive/.test(rejected.message), String(rejected))
+  eq('picker: the rejection carries the verdict', rejected && rejected.verdict, 'not-found')
+
+  // --- the tree: lazy load, breadcrumb, type-ahead ------------------------
+  liveCalls.length = 0
+  let picked = null
+  const win = ANAS.pathPicker({
+    node: 'harness',
+    backend: 'live',
+    mode: 'dir',
+    value: '/mnt',
+    onSelect: (v) => { picked = v },
+  })
+  await settle()
+  ok('picker: the window opened', !!win)
+  eq('picker: the first browse is the starting directory', liveCalls[0], '/fs/browse?path=%2Fmnt')
+
+  const tree = win.down('#pickerTree')
+  const root = tree.getRootNode()
+  eq('picker: the root level loaded its children',
+    root.childNodes.map(n => n.get('name')), ['pictures', 'photos-old'])
+
+  // Expanding a child asks for THAT child's path — the lazy load.
+  liveCalls.length = 0
+  const child = root.childNodes[0]
+  tree.fireEvent('beforeitemexpand', child)
+  await settle()
+  eq('picker: expanding a node browses that node’s own path',
+    liveCalls[0], '/fs/browse?path=%2Fmnt%2Fpictures')
+  eq('picker: the expanded node holds its own level',
+    child.childNodes.map(n => n.get('name')), ['2024', '2025'])
+  ok('picker: an expanded node is marked loaded, so it is not fetched twice',
+    child.get('loaded') === true)
+  liveCalls.length = 0
+  tree.fireEvent('beforeitemexpand', child)
+  await settle()
+  eq('picker: re-expanding a loaded node makes no call', liveCalls.length, 0)
+
+  // Clicking a row fills the path field — the field stays the value.
+  tree.selectNode(root.childNodes[1])
+  eq('picker: clicking a row fills the path field',
+    win.down('#pickerPath').getValue(), '/mnt/photos-old')
+
+  // Breadcrumb navigation: jump back to the root.
+  liveCalls.length = 0
+  ok('picker: the breadcrumb rendered every segment',
+    /data-path="\/mnt"/.test(win.down('#pickerCrumbs').html), win.down('#pickerCrumbs').html)
+
+  // Type-ahead: typing a path in ANOTHER directory jumps there and selects the
+  // matching row; typing a tail in THIS directory just filters.
+  liveCalls.length = 0
+  win.down('#pickerPath').setValue('/mnt/pictures/20')
+  await settle()
+  eq('picker: type-ahead jumped to the typed parent',
+    liveCalls[0], '/fs/browse?path=%2Fmnt%2Fpictures')
+  eq('picker: type-ahead selected the first matching child',
+    tree.getSelection().length && tree.getSelection()[0].get('name'), '2024')
+
+  // Typing a deeper tail INSIDE the current directory only filters — no browse.
+  liveCalls.length = 0
+  win.down('#pickerPath').setValue('/mnt/pictures/2025')
+  await settle()
+  eq('picker: a tail in the current directory filters without a new browse', liveCalls.length, 0)
+  eq('picker: and the cursor moved to the match',
+    tree.getSelection().length && tree.getSelection()[0].get('name'), '2025')
+
+  // The type-ahead must not chase its own tail: moving the cursor writes the
+  // path field, and the field drives the type-ahead. One keystroke, ONE browse.
+  liveCalls.length = 0
+  win.down('#pickerPath').setValue('/mnt/photos')
+  await settle()
+  eq('picker: a jump settles — one browse, no field/selection loop', liveCalls.length, 1)
+  eq('picker: the jump landed on the matching row',
+    tree.getSelection().length && tree.getSelection()[0].get('name'), 'photos-old')
+
+  // Keyboard: ENTER on a row is the Select button. In DIRECTORY mode a folder
+  // IS the answer, so ENTER finishes rather than descending.
+  const ENTER = { getKey: () => 13, ENTER: 13, stopEvent() {} }
+  tree.fireEvent('itemkeydown', tree, root.childNodes[0], null, 0, ENTER)
+  eq('picker: ENTER on a folder in directory mode selects it', picked, '/mnt/pictures')
+  ok('picker: and it closed the window', win.destroyed === true)
+
+  // A fresh picker for the remaining single-select checks (the last one closed).
+  picked = null
+  const win2 = ANAS.pathPicker({
+    node: 'harness',
+    backend: 'live',
+    mode: 'dir',
+    value: '/mnt',
+    onSelect: (v) => { picked = v },
+  })
+  await settle()
+
+  // Select: free-form typing is AUTHORITATIVE — a path the tree never showed is
+  // still a legitimate answer.
+  win2.down('#pickerPath').setValue('/mnt/not-browsed-yet')
+  const selectBtn = win2.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  selectBtn.handler(selectBtn)
+  eq('picker: Select returns the TYPED path, not the tree cursor', picked, '/mnt/not-browsed-yet')
+
+  // --- multi-select against the archive backend ---------------------------
+  browseCalls.length = 0
+  let multi = null
+  const mwin = ANAS.pathPicker({
+    node: 'harness',
+    backend: 'archive',
+    mode: 'any',
+    multiSelect: true,
+    archive: { repo: 'pbs-main', ns: 'anas/pictures', snapshot: 'host/pictures/2026-08-25T19:16:45Z', archive: 'data.pxar' },
+    onSelect: (v) => { multi = v },
+  })
+  await settle()
+  eq('picker: the archive picker opened at the archive root', browseCalls[0].path, '/')
+  const mtree = mwin.down('#pickerTree')
+  const mroot = mtree.getRootNode()
+  eq('picker: the archive root listed its entries',
+    mroot.childNodes.map(n => n.get('name')),
+    ['docs', 'alpha.txt', 'hard-a.txt', 'hard-b.txt', 'link-to-alpha'])
+  // Pick the hardlink and an ordinary file.
+  mtree._selection = [mroot.childNodes[3], mroot.childNodes[1]]
+  mtree.fireEvent('selectionchange', {}, mtree._selection)
+  const mSelect = mwin.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  mSelect.handler(mSelect)
+  eq('picker: multi-select returns a set, hardlink group intact',
+    multi, ['/hard-b.txt', '/hard-a.txt', '/alpha.txt'])
+
+  // A row the mode cannot take is DROPPED and said out loud — never returned as
+  // a path the caller silently did not agree to.
+  const dirWin = ANAS.pathPicker({
+    node: 'harness',
+    backend: 'archive',
+    mode: 'file',
+    multiSelect: true,
+    archive: { repo: 'pbs-main', snapshot: 'host/pictures/2026-08-25T19:16:45Z', archive: 'data.pxar' },
+    onSelect: (v) => { multi = v },
+  })
+  await settle()
+  const dtree = dirWin.down('#pickerTree')
+  const droot = dtree.getRootNode()
+  dtree._selection = [droot.childNodes[0], droot.childNodes[1]]
+  dtree.fireEvent('selectionchange', {}, dtree._selection)
+  const dSelect = dirWin.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  dSelect.handler(dSelect)
+  eq('picker: a file-mode multi-select drops the directory', multi, ['/alpha.txt'])
+  ok('picker: and says it dropped something',
+    /cannot be picked here/.test(dirWin.down('#pickerNote').html), dirWin.down('#pickerNote').html)
+
+  // --- the point-in-time picker ------------------------------------------
+  eq('picker: the task door is the task’s own snapshots endpoint',
+    P.snapshotListUrl({ task: 'nightly-pictures' }), '/backup/tasks/nightly-pictures/snapshots')
+  eq('picker: the task-less door is the repository groups endpoint',
+    P.snapshotListUrl({ repo: 'pbs-main', ns: 'anas/pictures', group: 'host/pictures' }),
+    '/backup/repos/pbs-main/groups?ns=anas%2Fpictures&group=host%2Fpictures')
+  eq('picker: a bare repository door has no query at all',
+    P.snapshotListUrl({ repo: 'pbs-main' }), '/backup/repos/pbs-main/groups')
+
+  const snapRows = P.snapshotRows(PICKER_ROUTES['GET /backup/tasks/nightly-pictures/snapshots'].data)
+  eq('picker: the daemon’s newest-first order is preserved',
+    snapRows.map(r => r.backupTimeIso), ['2026-08-25T19:16:45Z', '2026-08-24T19:16:45Z'])
+  eq('picker: bookkeeping files are never offered as archives',
+    snapRows[0].archives.map(a => a.archive), ['data.pxar'])
+  eq('picker: an image archive is listed with its kind',
+    snapRows[1].archives, [{ archive: 'lun.img', kind: 'img', size: 536870912 }])
+  eq('picker: the composed id rides every row', snapRows[0].snapshot, 'host/pictures/2026-08-25T19:16:45Z')
+
+  let chosen = null
+  const swin = ANAS.snapshotPicker({ node: 'harness', task: 'nightly-pictures', onSelect: (v) => { chosen = v } })
+  await settle()
+  const sgrid = swin.down('#snapGrid')
+  eq('picker: the snapshot grid loaded both points in time', sgrid.getStore().getCount(), 2)
+  sgrid.selectRow(0)
+  const sSelect = swin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  sSelect.handler(sSelect)
+  eq('picker: choosing a point in time hands back the FULL id (never a bare group)',
+    chosen && chosen.snapshot, 'host/pictures/2026-08-25T19:16:45Z')
+  ok('picker: the chosen point in time carries its archives',
+    chosen && chosen.archives.length === 1 && chosen.archives[0].archive === 'data.pxar')
+
+  ok('picker: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  5b. The wizard's archive path: TYPED and PICKED must send the same bytes
+// ============================================================================
+
+async function pickedPathChecks() {
+  liveCalls.length = 0
+  const ANAS = loadPickerSources(['12-picker.js', '68-backup.js'])
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  grid.selectRow(0)
+
+  const NEW_PATH = '/mnt/pictures/2025'
+
+  // (a) TYPED: open the dialog, type the path into the archive row, save.
+  const typedDlg = await openEdit(grid)
+  archiveRows(typedDlg)[0].down('#archPath').setValue(NEW_PATH)
+  await settle()
+  const typedBody = await save(typedDlg)
+  ok('picked-path: the typed save produced a body', !!typedBody)
+
+  // (b) PICKED: open the dialog, open the picker from the row's Browse button,
+  //     walk to the same directory and Select — then save.
+  const pickedDlg = await openEdit(grid)
+  const row = archiveRows(pickedDlg)[0]
+  // The Browse button sits beside #archPath and is identified by its cls (the
+  // harness's down() matches itemIds and xtypes only), so walk for it.
+  let btn = null
+  const findByCls = (cmp) => {
+    for (const kid of cmp.childCmps()) {
+      if (kid.cls === 'anas-btn-backup-arch-browse') { btn = kid }
+      findByCls(kid)
+    }
+  }
+  findByCls(row)
+  ok('picked-path: the archive row still has its Browse button', !!btn)
+  btn.handler(btn)
+  await settle()
+
+  const pickerWin = openWindow()
+  ok('picked-path: Browse opened the SHARED path picker', pickerWin && pickerWin.cls === 'anas-win-path-picker')
+  // Walk: the picker opened on the row's current path; navigate to the target
+  // through the tree exactly as a click would, then Select.
+  pickerWin.down('#pickerPath').setValue(NEW_PATH)
+  const pickBtn = pickerWin.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  pickBtn.handler(pickBtn)
+  await settle()
+  eq('picked-path: Select filled the wizard field',
+    archiveRows(pickedDlg)[0].down('#archPath').getValue(), NEW_PATH)
+  const pickedBody = await save(pickedDlg)
+
+  // The check is only meaningful if the path really changed — otherwise both
+  // bodies would be the stored task and the comparison would prove nothing.
+  eq('picked-path: the typed save actually carried the new path',
+    typedBody && typedBody.archives[0].path, NEW_PATH)
+  eq('picked-path: typed and picked send byte-identical bodies', pickedBody, typedBody)
+}
+
+// ============================================================================
 
 await backupChecks()
 warnings.length = 0
@@ -1032,6 +1542,10 @@ warnings.length = 0
 await poolImportChecks()
 warnings.length = 0
 await datasetsChecks()
+warnings.length = 0
+await pickerChecks()
+warnings.length = 0
+await pickedPathChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

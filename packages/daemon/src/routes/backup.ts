@@ -1,10 +1,13 @@
 import type {
+  BackupBrowseResult,
+  BackupGroupList,
   BackupNestedPreviewResponse,
   BackupNestedScan,
   BackupPrunePreviewResponse,
   BackupRepo,
   BackupRepoResponse,
   BackupRepoTestResult,
+  BackupSnapshotList,
   BackupTask,
   BackupTaskDetail,
   BackupTaskEntry,
@@ -16,21 +19,26 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { BackupReposPaths } from '../services/backup-repos.js'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
+  BackupBrowseRequest,
   BackupName,
   BackupNestedPreviewRequest,
   BackupPrunePreviewRequest,
+  BackupRepoRef,
   BackupRepoTestRequest,
   BackupRunRequest,
   BackupTaskRequest,
+  composeGroupId,
   effectiveIncludeNested,
   hasRetentionKeeps,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
 import { readPbsStorages } from '../parsers/pve-storage.js'
 import { readAhrPools } from '../services/ahr-topology.js'
+import { browseArchiveLevel } from '../services/backup-catalog.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyBackupRun } from '../services/backup-notify.js'
 import { pruneAfterBackup, pruneGroup, runPrune } from '../services/backup-prune.js'
+import { listGroups, listSnapshots } from '../services/backup-reads.js'
 import {
   isPveRepoName,
   pbsDefToRepo,
@@ -94,6 +102,11 @@ import { requireIdentity } from './identity.js'
  *   POST   /v1/backup/tasks/:name/prune-preview → retention dry-run (16.11)
  *   POST   /v1/backup/tasks/preview-nested → nested-filesystem scan (backup2.2;
  *                                        LOCAL-ONLY: no PBS contact at all)
+ *   GET    /v1/backup/tasks/:name/snapshots → the task group's points in time
+ *   GET    /v1/backup/repos/:name/groups → groups (and, with ?group=, their
+ *                                        snapshots) — the task-less door
+ *   POST   /v1/backup/restore/browse   → one directory level of an archive,
+ *                                        via catalog shell over a pipe (backup2.5)
  *
  * Mutations are identity-gated jobs (202 → { job }); registry writes are
  * COMPARE-AND-SWAP. Status is LOCAL-ONLY — ANAS never contacts the PBS server
@@ -980,6 +993,171 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       { ...identity, params: { task: name, repo: repo.name, group: pruneGroup(backupId) } },
       async () => ({ verdict: data.verdict }),
     )
+    return { data }
+  })
+
+  // ==========================================================================
+  //  Restore reads (story backup2.5) — user-initiated PBS contacts
+  //
+  //  Three READS, all 200 (never a job — nothing changes anywhere). They join
+  //  the run, the Test and the prune preview on Epic 16's sanctioned-contact
+  //  list; phase 2 added exactly these. Nothing here is ever polled: each call
+  //  is a click.
+  //
+  //  A LOCAL fault (unknown task, unknown repository, no stored credential) is
+  //  a 4xx — it is ANAS's own resource that is wrong. A PBS-side outcome is a
+  //  200 carrying a VERDICT, the prune-preview / repo-Test pattern: the picker
+  //  renders one message either way, and "diagnose, don't just fail" holds.
+  // ==========================================================================
+
+  /**
+   * Resolve a repository reference to the repo + its FRESH secret, or send the
+   * 404 / 400 that says which local thing is missing. Returns null when it has
+   * already replied.
+   */
+  async function readDepsFor(
+    reference: string,
+    reply: FastifyReply,
+    namespaceOverride?: string,
+  ): Promise<{ repo: BackupRepo, secret: string, namespace?: string } | null> {
+    const resolved = await resolveRepoAndSecret(reference)
+    if (!resolved) {
+      reply.code(404)
+      reply.send({ error: { code: 'NOT_FOUND', message: `Repository '${reference}' not found` } })
+      return null
+    }
+    const { repo, secret } = resolved
+    if (secret === null) {
+      reply.code(400)
+      reply.send({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: isPveRepoName(reference)
+            ? `No PBS credential file for '${reference}' — set it in Datacenter → Storage`
+            : `No secret stored for repository '${repo.name}' — set its credentials first`,
+        },
+      })
+      return null
+    }
+    // The effective namespace: the caller's, else the repo's own (a PVE-defined
+    // storage often carries one) — the same fallback every other path uses.
+    const namespace = namespaceOverride ?? repo.namespace
+    return { repo, secret, ...(namespace ? { namespace } : {}) }
+  }
+
+  // --- GET /backup/tasks/:name/snapshots — the task's points in time --------
+  //
+  // The task knows its repository, its effective namespace and its backup-id,
+  // so the caller supplies nothing: one click, one listing of its own group.
+  // GT-1: the client's JSON has no composite id — listSnapshots composes it;
+  // GT-2: the client's array is unsorted, so it comes back newest-first.
+  server.get<{ Params: { name: string } }>('/backup/tasks/:name/snapshots', async (request, reply) => {
+    const nameParsed = BackupName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid task name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const name = nameParsed.data
+
+    const task = await readTask(systemdDir, name)
+    if (!task) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Backup task '${name}' not found` } }
+    }
+
+    const deps = await readDepsFor(task.repository, reply, task.namespace)
+    if (!deps)
+      return
+
+    // PBS file backups are always type `host` (16.1 ground truth) — the group
+    // is `host/<backup-id>`, never derived from the hostname.
+    const group = composeGroupId('host', task.backupId)
+    const outcome = await listSnapshots(executor, deps, group)
+    const data: BackupSnapshotList = outcome.ok
+      ? {
+          verdict: 'ok',
+          repository: task.repository,
+          ...(deps.namespace ? { namespace: deps.namespace } : {}),
+          group,
+          snapshots: outcome.data,
+        }
+      : {
+          verdict: outcome.verdict,
+          detail: outcome.detail,
+          repository: task.repository,
+          ...(deps.namespace ? { namespace: deps.namespace } : {}),
+          group,
+          snapshots: [],
+        }
+    return { data }
+  })
+
+  // --- GET /backup/repos/:name/groups?ns=&group= — the TASK-LESS door -------
+  //
+  // For archives whose task was renamed or deleted: list a namespace's groups,
+  // or (with ?group=) that group's snapshots in exactly the same shape the task
+  // endpoint returns — one picker, one parser, two doors.
+  server.get<{
+    Params: { name: string }
+    Querystring: { ns?: string, group?: string }
+  }>('/backup/repos/:name/groups', async (request, reply) => {
+    const refParsed = BackupRepoRef.safeParse(request.params.name)
+    if (!refParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid repository name: ${refParsed.error.issues[0]?.message}` } }
+    }
+    const reference = refParsed.data
+    const requestedNs = request.query.ns?.trim() || undefined
+    const requestedGroup = request.query.group?.trim() || undefined
+
+    const deps = await readDepsFor(reference, reply, requestedNs)
+    if (!deps)
+      return
+
+    const base = {
+      repository: reference,
+      ...(deps.namespace ? { namespace: deps.namespace } : {}),
+    }
+
+    if (requestedGroup) {
+      const outcome = await listSnapshots(executor, deps, requestedGroup)
+      const data: BackupGroupList = outcome.ok
+        ? { verdict: 'ok', ...base, groups: [], group: requestedGroup, snapshots: outcome.data }
+        : { verdict: outcome.verdict, detail: outcome.detail, ...base, groups: [], group: requestedGroup, snapshots: [] }
+      return { data }
+    }
+
+    const outcome = await listGroups(executor, deps)
+    const data: BackupGroupList = outcome.ok
+      ? { verdict: 'ok', ...base, groups: outcome.data }
+      : { verdict: outcome.verdict, detail: outcome.detail, ...base, groups: [] }
+    return { data }
+  })
+
+  // --- POST /backup/restore/browse — ONE directory level of an archive ------
+  //
+  // A POST because the key is compound (repo + ns + snapshot + archive + path),
+  // not because anything changes: it is a read, 200, never a job. The driver is
+  // `catalog shell` over a pipe, wrapped in `timeout` — NEVER the FUSE `mount`,
+  // whose black-holed-server D-state readers cannot be killed at all (GT-33).
+  server.post('/backup/restore/browse', async (request, reply) => {
+    const parsed = BackupBrowseRequest.safeParse(request.body ?? {})
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid browse request: ${parsed.error.issues[0]?.message}` } }
+    }
+    const req = parsed.data
+
+    const deps = await readDepsFor(req.repo, reply, req.ns?.trim() || undefined)
+    if (!deps)
+      return
+
+    const data: BackupBrowseResult = await browseArchiveLevel(executor, {
+      ...deps,
+      snapshot: req.snapshot,
+      archive: req.archive,
+      path: req.path,
+    })
     return { data }
   })
 }
