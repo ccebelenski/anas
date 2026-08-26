@@ -261,6 +261,7 @@ describe('computeIscsiHealth — the restore hole (GT-20/GT-21)', () => {
     assert.equal(health.configfsPresent, true)
     assert.equal(health.saveconfigPresent, true)
     assert.deepEqual(health.missingLuns, [])
+    assert.deepEqual(health.targetsServingNothing, [])
     assert.deepEqual(health.portalsWithoutInterface, [])
     assert.deepEqual(health.foreignChanges, [])
     assert.equal(health.degraded, false)
@@ -294,6 +295,51 @@ describe('computeIscsiHealth — the restore hole (GT-20/GT-21)', () => {
     assert.equal(targets[0].lunCount, 2)
     assert.equal(targets[0].luns[0].present, false)
     assert.equal(targets[0].luns[1].present, true)
+  })
+
+  it('one hole out of two LUNs is NOT a target serving nothing', async () => {
+    const ctx = await context(hole, { addresses: ['192.168.200.50'] })
+    const health = computeIscsiHealth(ctx, await buildIscsiTargets(ctx))
+    assert.equal(health.missingLuns.length, 1)
+    assert.deepEqual(health.targetsServingNothing, [])
+  })
+
+  it('the whole pool late: the target comes up enabled with ZERO LUNs (GT-21)', async () => {
+    // The second half of the finding. Both LUNs are holes, so the target is
+    // live, enabled and listening while an initiator that logs in sees no disks
+    // at all — and systemd reported success throughout.
+    const empty = await materialize('configfs-restore-empty.manifest')
+    try {
+      const ctx = await context(empty, { addresses: ['192.168.200.50'] })
+      const targets = await buildIscsiTargets(ctx)
+      const health = computeIscsiHealth(ctx, targets)
+
+      assert.equal(targets[0].present, true)
+      assert.equal(targets[0].enabled, true)
+      assert.equal(health.missingLuns.length, 2)
+      assert.deepEqual(health.targetsServingNothing, [{
+        targetIqn: 'iqn.2026-08.dev.anas.gtiscsi:target1',
+        tpgTag: 1,
+        persistedLunCount: 2,
+        enabled: true,
+      }])
+      assert.equal(health.degraded, true)
+    }
+    finally {
+      await rm(empty.dir, { recursive: true, force: true })
+    }
+  })
+
+  it('a persisted target that did not restore at all is not "serving nothing"', async () => {
+    // Nothing is live, so nothing is lying to an initiator — that is the
+    // `target-not-restored` finding instead.
+    const ctx = await readIscsiContext(executorWithAddresses(['192.168.200.50']), {
+      configfsRoot: join(tmpdir(), 'anas-no-such-configfs-2'),
+      saveconfigPath: join(fixturesDir, 'saveconfig-final.json'),
+      pveStorageCfg: join(fixturesDir, 'no-such-storage.cfg'),
+    })
+    const health = computeIscsiHealth(ctx, await buildIscsiTargets(ctx))
+    assert.deepEqual(health.targetsServingNothing, [])
   })
 
   it('a missing LUN still carries its serial and size from the persisted config', async () => {
@@ -389,6 +435,7 @@ describe('the not-installed path is a first-class state, never an error', () => 
     assert.deepEqual(targets, [])
     const health = computeIscsiHealth(ctx, targets)
     assert.deepEqual(health.missingLuns, [])
+    assert.deepEqual(health.targetsServingNothing, [])
     assert.deepEqual(health.portalsWithoutInterface, [])
     assert.deepEqual(health.foreignChanges, [])
     assert.equal(health.degraded, false)

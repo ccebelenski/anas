@@ -12,6 +12,7 @@ node with a careful, transactional installer.
 | `install.sh` | Transactional installer, runs on the target PVE node (shipped in the tarball). |
 | `uninstall.sh` | Clean, idempotent removal (shipped in the tarball). |
 | `systemd/anasd.service`, `systemd/anas.service` | The two systemd units. |
+| `systemd/rtslib-fb-targetctl.service.d/anas-ordering.conf` | Boot-ordering drop-in for LIO's restore service (story `iscsi.5`) — installed to `/etc/systemd/system/`, never an edit of the vendor unit. Orders the iSCSI restore after `zfs-volumes.target` / `zfs-volume-wait.service` (and `local-fs.target` for AHR), so a LUN's backing device exists before the restore looks for it; `After=` is also stop-before, which gives the shutdown half for free. |
 
 ## Versioning (story 10.10)
 
@@ -76,7 +77,7 @@ separate app.
 
 | Flag | Effect |
 | --- | --- |
-| `--install-deps` | Auto-install Node.js ≥ 20 via NodeSource `setup_22.x` if missing/old. Everything else (`acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server`) is a hard dependency and installs regardless. |
+| `--install-deps` | Auto-install Node.js ≥ 20 via NodeSource `setup_22.x` if missing/old. Everything else (`acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server`, `targetcli-fb`, `python3-rtslib-fb`) is a hard dependency and installs regardless. |
 | `--yes`, `-y` | Non-interactive (assume yes). |
 | `--prefix DIR` | Install location (default `/opt/anas`). Units are rewritten to match. |
 | `--force` | Skip the ZFS ≥ 2.2 gate (ANAS needs `zpool -j` JSON output). |
@@ -86,8 +87,9 @@ separate app.
 1. **Preflight (mutates nothing, aborts early):** reports the version transition
    (fresh / reinstall / `upgrade X -> Y`; a **downgrade** warns and asks for
    confirmation); then root, PVE node, Node.js ≥ 20, ZFS ≥ 2.2, and the hard
-   dependencies (`acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server`) —
-   each missing one is marked for install; warns on a busy `:3000`.
+   dependencies (`acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server`,
+   `targetcli-fb` + `python3-rtslib-fb`) — each missing one is marked for
+   install; warns on a busy `:3000`.
 1b. **Dependency install:** the marked packages are installed with `apt-get`
    before anything else is touched (an apt failure aborts with the node
    unmodified). This step runs on upgrades too, so an existing node picks up a
@@ -106,13 +108,22 @@ sudo ./uninstall.sh          # or: sudo /opt/anas/../uninstall.sh --prefix /opt/
 ```
 
 Stops/disables the services, reverts the PVE UI integration (restoring the
-pristine `index.html.tpl`), removes the unit files, and deletes the prefix.
+pristine `index.html.tpl`), removes the unit files and the iSCSI ordering
+drop-in, and deletes the prefix.
+
+It never removes a dependency package, and it never touches
+`/etc/rtslib-fb-target/saveconfig.json` — that file is the node's iSCSI
+configuration, including every LUN's unit serial (the identity initiators, ESXi,
+Windows and PVE volids key on). It is data, and it stays.
 
 ## Prerequisites (target node)
 
 - Proxmox VE (provides `pveversion` and `/usr/share/pve-manager/index.html.tpl`).
 - Node.js ≥ 20 (install with `--install-deps`, or NodeSource `setup_22.x`).
 - ZFS ≥ 2.2.
-- `acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server` — all auto-installed
-  by `install.sh` (hard dependencies: the AHR, SMB and NFS features are never
-  gated on them being present, so the installer guarantees them).
+- `acl`, `mdadm`, `btrfs-progs`, `samba`, `nfs-kernel-server`, `targetcli-fb`,
+  `python3-rtslib-fb` — all auto-installed by `install.sh` (hard dependencies:
+  the AHR, SMB, NFS and iSCSI features are never gated on them being present, so
+  the installer guarantees them). `python3-rtslib-fb`'s own postinst enables and
+  starts `rtslib-fb-targetctl.service`; the installer does not, and only adds an
+  ordering drop-in beside it (see below).

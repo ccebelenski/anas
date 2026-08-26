@@ -109,6 +109,12 @@ printf '%s\n' "${VERSION}" > "${APP}/VERSION"
 mkdir -p "${REL_ROOT}/systemd"
 cp "${SCRIPT_DIR}/systemd/anasd.service" "${REL_ROOT}/systemd/anasd.service"
 cp "${SCRIPT_DIR}/systemd/anas.service"  "${REL_ROOT}/systemd/anas.service"
+# The iSCSI boot-ordering drop-in (story iscsi.5) — a drop-in beside
+# rtslib-fb-targetctl.service, never an edit of that vendor unit. install.sh's
+# preflight requires it, so a release without it fails before touching the node.
+install -d "${REL_ROOT}/systemd/rtslib-fb-targetctl.service.d"
+install -m 0644 "${SCRIPT_DIR}/systemd/rtslib-fb-targetctl.service.d/anas-ordering.conf" \
+  "${REL_ROOT}/systemd/rtslib-fb-targetctl.service.d/anas-ordering.conf"
 
 # app/ root manifest (the workspace root package.json — carries the "type":
 # "module" and workspaces glob the daemon/gateway rely on for resolution).

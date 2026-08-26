@@ -232,10 +232,15 @@ describe('deriveOwnership — both halves are required, and the reason is shown'
     assert.match(tag.detail, /'not-ok'/)
   })
 
-  it('foreign: a target with no LUNs has nothing tying it to ANAS storage', () => {
+  it('anas: a target with no LUNs is still ANAS\'s (iscsi.5)', () => {
+    // Two real states produce this: a target created a second ago, and one whose
+    // whole pool was late at boot (GT-21). Neither is evidence of anyone else's
+    // ownership, and calling it foreign made the first one impossible to add a
+    // LUN to.
     const tag = deriveOwnership(anas, [], inputs())
-    assert.equal(tag.ownership, 'foreign')
+    assert.equal(tag.ownership, 'anas')
     assert.equal(tag.reason, 'no-luns')
+    assert.match(tag.detail, /has no LUNs/)
   })
 
   it('a STALE backing path does not change hands — it stays ANAS\'s to fix', () => {
@@ -246,5 +251,92 @@ describe('deriveOwnership — both halves are required, and the reason is shown'
       { name: 'lun0', backingPath: '/dev/zvol/tank/renamed-away' },
     ], inputs())
     assert.equal(tag.ownership, 'anas')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// The `unresolved` tier — story iscsi.5, live-proof finding F2
+// ---------------------------------------------------------------------------
+
+describe('the unresolved backing tier (iscsi.5 / F2)', () => {
+  const anas = anasIqn('vmstore', { nodeName: 'nas.example.com', date: new Date(Date.UTC(2026, 7, 25)) })
+
+  it('classifyBacking: absent + unmatched is unresolved, present + unmatched is foreign', () => {
+    // The SAME path (an EXPORTED pool: no mountpoint matches it), and only the
+    // existence answer differs.
+    assert.equal(classifyBacking('/coldpool/images/lun.raw', inputs(), false).kind, 'unresolved')
+    assert.equal(classifyBacking('/coldpool/images/lun.raw', inputs(), true).kind, 'foreign')
+  })
+
+  it('classifyBacking: unchecked (undefined / null) keeps the pre-iscsi.5 foreign verdict', () => {
+    // The create paths call it this way on purpose: an image that does not exist
+    // YET must still be refused when its directory is not ANAS's.
+    assert.equal(classifyBacking('/srv/exports/lun.img', inputs()).kind, 'foreign')
+    assert.equal(classifyBacking('/srv/exports/lun.img', inputs(), null).kind, 'foreign')
+  })
+
+  it('classifyBacking: existence never overrides a path that DID resolve', () => {
+    const mps: ZfsMountpoint[] = [{ mountpoint: '/tank', dataset: 'tank', pool: 'tank' }]
+    // A file on a mounted ANAS dataset stays `file` even when the file is gone…
+    assert.equal(classifyBacking('/tank/images/lun.raw', inputs({ zfsMountpoints: mps }), false).kind, 'file')
+    // …and a zvol path names its own pool, so it is never `unresolved` (GT-40).
+    assert.equal(classifyBacking('/dev/zvol/tank/vol1', inputs(), false).kind, 'zvol')
+    // A raw block device that has gone away IS unresolved, not foreign.
+    assert.equal(classifyBacking('/dev/sdb', inputs(), false).kind, 'unresolved')
+  })
+
+  it('F2: an ANAS target whose file LUN sits on an EXPORTED pool stays ANAS\'s', () => {
+    // The exact live-proof state: the pool is not imported, so no mountpoint
+    // matches and the image file is not there. Before iscsi.5 this read
+    // `foreign` and flipped the whole target to hands-off — removing the tools
+    // at the moment they were needed.
+    const tag = deriveOwnership(anas, [
+      { name: 'vmstore-lun0', backingPath: '/coldpool/images/lun0.raw', backingExists: false },
+    ], inputs())
+    assert.equal(tag.ownership, 'anas')
+    assert.equal(tag.reason, 'backing-unresolved')
+    assert.match(tag.detail, /coldpool\/images\/lun0\.raw/)
+    assert.match(tag.detail, /not a change of ownership/)
+  })
+
+  it('a genuinely foreign backing STILL flips the target', () => {
+    // Same shape, one difference: the backing is actually there. That is a
+    // positive verdict about someone else's storage, and it still wins.
+    const tag = deriveOwnership(anas, [
+      { name: 'vmstore-lun0', backingPath: '/srv/exports/lun0.raw', backingExists: true },
+    ], inputs())
+    assert.equal(tag.ownership, 'foreign')
+    assert.equal(tag.reason, 'backing-not-anas-storage')
+  })
+
+  it('a PVE-managed backing flips even when it is absent — the pool is named, not guessed', () => {
+    // `/dev/zvol/datapool/...` names its pool from the path, so `storage.cfg`
+    // answers the question without the device being there at all.
+    const tag = deriveOwnership(anas, [
+      { name: 'lun0', backingPath: '/dev/zvol/datapool/mylun', backingExists: false },
+    ], inputs())
+    assert.equal(tag.ownership, 'foreign')
+    assert.equal(tag.reason, 'backing-pve-storage')
+  })
+
+  it('one resolvable-foreign LUN outranks an unresolved sibling', () => {
+    const tag = deriveOwnership(anas, [
+      { name: 'gone', backingPath: '/coldpool/images/a.raw', backingExists: false },
+      { name: 'theirs', backingPath: '/dev/sdb', backingExists: true },
+    ], inputs())
+    assert.equal(tag.ownership, 'foreign')
+    assert.equal(tag.reason, 'backing-not-anas-storage')
+    assert.match(tag.detail, /'theirs'/)
+  })
+
+  it('a mix of healthy and unresolved LUNs stays anas and counts honestly', () => {
+    const mps: ZfsMountpoint[] = [{ mountpoint: '/tank', dataset: 'tank', pool: 'tank' }]
+    const tag = deriveOwnership(anas, [
+      { name: 'ok', backingPath: '/dev/zvol/tank/lun0', backingExists: true },
+      { name: 'gone', backingPath: '/coldpool/images/a.raw', backingExists: false },
+    ], inputs({ zfsMountpoints: mps }))
+    assert.equal(tag.ownership, 'anas')
+    assert.equal(tag.reason, 'backing-unresolved')
+    assert.match(tag.detail, /1 of 2 LUNs/)
   })
 })

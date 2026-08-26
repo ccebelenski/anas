@@ -27,13 +27,21 @@
  * AUTOMATIC one when a stdin-mode targetcli session exits — writes the truncated
  * config over the file and the LUN is gone for good (GT-22).
  *
- * `iscsi.2` deliberately stops at the shape: the dashboard warning category and
- * a `collectIscsiWarnings` belong to `iscsi.5`. Every element here already
- * carries its target reference and a rendered sentence so that consumer needs no
- * second read.
+ * `iscsi.2` stopped at the shape; `iscsi.5` added the two consumers, and neither
+ * re-reads anything this file already knows:
+ *
+ *  - `services/iscsi-warnings.ts` turns this into `iscsi` dashboard cards;
+ *  - `services/iscsi-repair.ts` turns `missingLuns` into the surgical replay
+ *    that puts the holes back once their backing devices are present.
+ *
+ * `iscsi.5` also added `targetsServingNothing` — the GT-21 whole-pool-late case,
+ * where the target restores enabled and listening with ZERO LUNs. It is not just
+ * a count of `missingLuns`: the consequence is different in kind (an initiator
+ * logs in successfully and sees nothing), so it is its own finding and its own
+ * card.
  */
 
-import type { IscsiForeignChange, IscsiHealth, IscsiMissingLun, IscsiPortalWithoutInterface, IscsiTargetDetail } from '@anas/shared'
+import type { IscsiForeignChange, IscsiHealth, IscsiMissingLun, IscsiPortalWithoutInterface, IscsiTargetDetail, IscsiTargetServingNothing } from '@anas/shared'
 import type { IscsiReadContext } from './iscsi.js'
 import { iscsiAvailability, normalizePlugin } from './iscsi.js'
 
@@ -47,6 +55,7 @@ export function computeIscsiHealth(
   now: Date = new Date(),
 ): IscsiHealth {
   const missingLuns: IscsiMissingLun[] = []
+  const targetsServingNothing: IscsiTargetServingNothing[] = []
   const portalsWithoutInterface: IscsiPortalWithoutInterface[] = []
   const foreignChanges: IscsiForeignChange[] = []
 
@@ -76,6 +85,23 @@ export function computeIscsiHealth(
         backingPath: backstore?.dev ?? lun.backingPath,
         backingExists: lun.backingExists,
       })
+    }
+
+    // --- a target that restored with NONE of its LUNs (GT-21) ---------------
+    // Worse in kind than the holes it is made of: the target is live, the TPG is
+    // enabled and the portals are listening, so an initiator logs in
+    // successfully and sees no disks at all. systemd reported success.
+    {
+      const persistedLuns = persistedByIqn.get(target.iqn)?.tpgs.find(t => t.tag === target.tpgTag)?.luns ?? []
+      const liveLunCount = target.luns.filter(l => l.present).length
+      if (target.present && persistedLuns.length > 0 && liveLunCount === 0) {
+        targetsServingNothing.push({
+          targetIqn: target.iqn,
+          tpgTag: target.tpgTag,
+          persistedLunCount: persistedLuns.length,
+          enabled: target.enabled,
+        })
+      }
     }
 
     // --- portals bound to addresses no interface carries --------------------
@@ -163,6 +189,7 @@ export function computeIscsiHealth(
   return {
     ...iscsiAvailability(ctx),
     missingLuns,
+    targetsServingNothing,
     portalsWithoutInterface,
     foreignChanges,
     // A hole in the live config makes every `saveconfig` destructive (GT-22).

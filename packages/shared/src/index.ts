@@ -256,6 +256,7 @@ export {
   IscsiTargetList,
   IscsiTargetName,
   IscsiTargetSecurity,
+  IscsiTargetServingNothing,
   IscsiTargetStateRequest,
   IscsiTargetSummary,
   unbracketAddress,

@@ -18,6 +18,7 @@ import {
 } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
+import { computeIscsiHealth } from '../services/iscsi-health.js'
 import {
   addIscsiLun,
   assertInstalled,
@@ -43,6 +44,7 @@ import {
   withIscsiLock,
   zvolDataset,
 } from '../services/iscsi-mutate.js'
+import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
 import { iscsiAvailability } from '../services/iscsi.js'
 import { requireIdentity } from './identity.js'
 
@@ -56,6 +58,7 @@ import { requireIdentity } from './identity.js'
  *   POST   /v1/iscsi/targets/:iqn/luns            add a LUN (zvol | file)
  *   PUT    /v1/iscsi/targets/:iqn/luns/:n         grow / write-cache
  *   DELETE /v1/iscsi/targets/:iqn/luns/:n         unmap + delete backstore
+ *   POST   /v1/iscsi/health/repair                put a boot-restore hole back
  *   GET    /v1/iscsi/claims                       the iscsi.6 seam
  *
  * Every mutation is a job (202) with a journald audit line through the queue,
@@ -66,11 +69,13 @@ import { requireIdentity } from './identity.js'
  * Three pre-flight refusals happen HERE rather than inside the job, because a
  * refusal the operator can act on is worth more than a failed job:
  *
- *  - **LIO not installed** — a guiding 409 naming the two packages. Installing
- *    them is `iscsi.5`'s story, not this one's, so this only says so.
+ *  - **LIO not installed** — a guiding 409 naming the two packages. `install.sh`
+ *    installs them like samba/nfs since `iscsi.5`; this refusal is what a node
+ *    that predates that (or had them removed) gets.
  *  - **A degraded restore** — a 409 naming the missing LUNs. Every sequence ends
  *    in `saveconfig`, and saving over an incomplete restore writes the hole into
- *    `saveconfig.json` permanently (GT-22).
+ *    `saveconfig.json` permanently (GT-22). `POST /iscsi/health/repair` is the
+ *    ONE route exempt from this gate, because it is the way out of it.
  *  - **A live session**, on the operations where one makes the result silently
  *    wrong. LIO offers no protection at all here: a LUN delete or backstore
  *    delete with a live session returns exit 0, leaves a stale device on the
@@ -758,6 +763,54 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         },
         destroyBacking,
       )),
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
+  // --- POST /iscsi/health/repair — the restore-hole repair door (iscsi.5) ---
+  //
+  // The ONE mutation that is allowed to run while the tree is degraded, because
+  // it is the thing that ends the degradation. So it deliberately does NOT use
+  // `preflight()` — that refuses exactly this state.
+  //
+  // What it does NOT do is `targetctl restore`: that call takes rtslib's
+  // `clear_existing=True` default, which wipes the whole live tree — every
+  // healthy target and every logged-in initiator on the node — before rebuilding
+  // (and there is no CLI form that passes `False`; rtslib would refuse anyway
+  // because the surviving targets are already there). `services/iscsi-repair.ts`
+  // carries the source that proves it. Repair is a surgical replay of the
+  // PERSISTED record instead: create with `wwn=`, replay every attribute, map at
+  // the stored index — the same `{serial, attributes}` contract every other
+  // recreate path uses, so the disk comes back as the SAME disk.
+  server.post('/iscsi/health/repair', async (request, reply) => {
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const state = await readIscsiState(executor, paths)
+    const notInstalled = assertInstalled(state.ctx)
+    if (notInstalled)
+      return sendRefusal(reply, notInstalled)
+
+    const health = computeIscsiHealth(state.ctx, state.targets)
+    const plan = planIscsiRepair(state.ctx, health, state.targets)
+    const refusal = assertRepairable(plan)
+    if (refusal)
+      return sendRefusal(reply, refusal)
+
+    const job = jobQueue.submit(
+      'iscsi.health.repair',
+      {
+        ...identity,
+        params: {
+          repairable: plan.repairable.length,
+          blocked: plan.blocked.length,
+          targets: [...new Set(plan.repairable.map(r => r.targetIqn))].join(', '),
+        },
+      },
+      async updateProgress => withIscsiLock(async () => repairIscsiHoles(mutateOptions(updateProgress), plan)),
     )
 
     reply.code(202)

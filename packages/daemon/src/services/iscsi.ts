@@ -71,7 +71,20 @@ export interface IscsiReadContext {
   nodeAddresses: Set<string> | null
 }
 
-/** Availability from a gathered context — the honest "is LIO even here" shape. */
+/**
+ * Availability from a gathered context — the honest "is LIO even here" shape.
+ *
+ * **Kernel modules are not ANAS's to manage, and there is no load-on-first-use
+ * to arrange** (story `iscsi.5`, GT-4). `targetctl restore` with no saved config
+ * loads `target_core_mod` alone; the FIRST `targetcli` invocation that touches a
+ * backstore or a fabric loads the lot — `target_core_user`, `uio`,
+ * `target_core_pscsi`, `target_core_file`, `target_core_iblock`,
+ * `iscsi_target_mod` — including the two plugins ANAS never uses, because rtslib
+ * probes every backstore plugin it has. That is rtslib's behaviour, it is
+ * all-or-nothing, and nothing on ANAS's side can make it lazy. So ANAS loads no
+ * module itself (no `modprobe` anywhere in this codebase), builds nothing, and
+ * the reason below says so rather than implying a knob exists.
+ */
 export function iscsiAvailability(ctx: IscsiReadContext): IscsiAvailability {
   const configfsPresent = ctx.live.present
   const saveconfigPresent = ctx.persisted !== null
@@ -82,7 +95,10 @@ export function iscsiAvailability(ctx: IscsiReadContext): IscsiAvailability {
     installed,
     configfsPresent,
     saveconfigPresent,
-    reason: 'The LIO iSCSI target stack is not present on this node (no configfs target tree and no saved configuration) — install targetcli-fb to serve block storage',
+    reason: 'The LIO iSCSI target stack is not present on this node (no configfs target tree and no saved configuration) '
+      + '— install targetcli-fb and python3-rtslib-fb to serve block storage. Installing them costs nothing at rest: '
+      + 'the target kernel modules arrive with the first real targetcli call, and rtslib loads every backstore plugin '
+      + 'at once — there is no load-on-first-use to arrange, and ANAS never loads one itself.',
   }
 }
 
@@ -244,7 +260,7 @@ function attributesFromLive(b: ConfigfsBackstore): IscsiLunAttributes {
  * The saveconfig `attributes{}` set is NOT the same set as configfs's (GT-12),
  * so this is used only when there is nothing live to read.
  */
-function attributesFromPersisted(s: SaveconfigStorageObject): IscsiLunAttributes {
+export function attributesFromPersisted(s: SaveconfigStorageObject): IscsiLunAttributes {
   const a = s.attributes
   const out: IscsiLunAttributes = {}
   if (a.emulate_tpu !== undefined)
@@ -394,14 +410,21 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
         liveBackstore?.plugin ?? liveLun?.plugin ?? persistedBackstore?.plugin ?? persistedLun?.plugin ?? '',
       )
       const backingPath = liveBackstore?.udevPath || persistedBackstore?.dev || ''
-      const classification = classifyBacking(backingPath, ctx.inputs)
+      // The existence check comes FIRST because the classification depends on
+      // it: a backing that resolves onto nothing ANAS manages is `foreign` only
+      // when it is actually THERE. When it is not, it is `unresolved` — the
+      // boot-restore hole — and that must not cost the target its ownership
+      // (story `iscsi.5`, live-proof F2).
+      const exists = backingPath ? await backingExists(backingPath) : null
+      const classification = classifyBacking(backingPath, ctx.inputs, exists)
 
       const lun: IscsiLun = {
         index,
         name,
-        // A LUN whose backing path resolves onto nothing ANAS knows is
-        // `foreign`; a zvol/file whose path has merely gone stale keeps its kind
-        // and reports `backingExists: false` instead (GT-40).
+        // A backing that positively resolves onto storage ANAS does not manage
+        // is `foreign`; one that resolves onto nothing at all is `unresolved`; a
+        // zvol/file whose path has merely gone stale keeps its kind and reports
+        // `backingExists: false` instead (GT-40).
         kind: classification.kind,
         plugin,
         backingPath,
@@ -419,7 +442,7 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
           .filter(s => s.mappedLuns.includes(index))
           .map(s => s.initiatorIqn),
         present: liveLun !== undefined && liveBackstore !== undefined,
-        backingExists: backingPath ? await backingExists(backingPath) : null,
+        backingExists: exists,
       }
       if (classification.pool)
         lun.pool = classification.pool
@@ -429,7 +452,11 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
     }
 
     // --- ownership ---------------------------------------------------------
-    const ownershipLuns: OwnershipLun[] = luns.map(l => ({ name: l.name, backingPath: l.backingPath }))
+    const ownershipLuns: OwnershipLun[] = luns.map(l => ({
+      name: l.name,
+      backingPath: l.backingPath,
+      backingExists: l.backingExists,
+    }))
     const ownership = deriveOwnership(iqn, ownershipLuns, ctx.inputs)
 
     const portalList = [...portals.values()]

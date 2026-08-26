@@ -608,7 +608,11 @@
         var map = {
             pool: 'fa-database', capacity: 'fa-database', disk: 'fa-hdd-o',
             scrub: 'fa-refresh', share: 'fa-share-alt', replication: 'fa-retweet',
-            ahr: 'fa-server', schedule: 'fa-clock-o'
+            ahr: 'fa-server', schedule: 'fa-clock-o',
+            // iSCSI (iscsi.5): block storage handed out over the network — a
+            // plug, deliberately not the plain disk glyph, so a restore hole
+            // does not read as a failing drive.
+            iscsi: 'fa-plug'
         };
         var fa = map['' + (category || '')];
         if (!fa) { return ''; }

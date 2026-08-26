@@ -102,8 +102,14 @@ function anasManifest(opts: { session?: boolean } = {}): string {
   return `${lines.join('\n')}\n`
 }
 
-/** SYNTHETIC: the persisted half that matches {@link anasManifest}. */
-function anasSaveconfig(extraLun = false): string {
+/**
+ * SYNTHETIC: the persisted half that matches {@link anasManifest}.
+ *
+ * `extraLun` adds the GT-21 restore hole. `holeDev` points that hole's backing
+ * at a path that EXISTS, which is the only difference between "cannot repair
+ * yet" and "repair now" (story `iscsi.5`).
+ */
+function anasSaveconfig(extraLun = false, holeDev = '/dev/zvol/tank/gone'): string {
   const storageObjects: unknown[] = [{
     name: 'vmdisk1',
     plugin: 'block',
@@ -121,7 +127,7 @@ function anasSaveconfig(extraLun = false): string {
     storageObjects.push({
       name: 'ghost',
       plugin: 'block',
-      dev: '/dev/zvol/tank/gone',
+      dev: holeDev,
       wwn: 'deadbeef-0000-0000-0000-000000000000',
       readonly: false,
       write_back: false,
@@ -200,10 +206,10 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
   }
 
   /** The ANAS-owned tree every mutation test runs against. */
-  async function serveAnas(opts: { session?: boolean, hole?: boolean } = {}) {
+  async function serveAnas(opts: { session?: boolean, hole?: boolean, holeDev?: string } = {}) {
     await serve({
       manifest: anasManifest({ session: opts.session ?? false }),
-      saveconfigText: anasSaveconfig(opts.hole ?? false),
+      saveconfigText: anasSaveconfig(opts.hole ?? false, opts.holeDev),
     })
   }
 
@@ -693,6 +699,54 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
   })
 
   // --- the iscsi.6 seam ----------------------------------------------------
+
+  // --- the repair door (story iscsi.5) -------------------------------------
+
+  describe('POST /v1/iscsi/health/repair — the way OUT of a degraded restore', () => {
+    it('is the one mutation NOT blocked by the degraded gate', async () => {
+      // Every other verb answers `degraded-restore` here. This one has to get
+      // past that, or the node is stuck: the gate exists because a save over an
+      // incomplete restore is permanent, and repair is what makes it complete.
+      await serveAnas({ hole: true, holeDev: join(dir, 'backing-present.img') })
+      await writeFile(join(dir, 'backing-present.img'), 'x')
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 202)
+      assert.ok(res.body.job)
+    })
+
+    it('refuses with a 409 NAMING the paths while the backing is still absent', async () => {
+      await serveAnas({ hole: true })
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'backing-absent')
+      assert.match(res.body.error!.message, /ghost/)
+      assert.match(res.body.error!.message, /\/dev\/zvol\/tank\/gone/)
+      assert.match(res.body.error!.message, /import the pool, restore the image/)
+      // Recreating over an absent device is how the hole was made: no bypass.
+      assert.ok(!res.headers['x-anas-confirm-code'])
+    })
+
+    it('refuses with a 409 when there is no hole at all', async () => {
+      await serveAnas()
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'nothing-to-repair')
+      assert.match(res.body.error!.message, /already matches the saved one/)
+    })
+
+    it('refuses like everything else when LIO is not installed', async () => {
+      await serve()
+      const res = await call('POST', '/v1/iscsi/health/repair')
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'lio-not-installed')
+    })
+
+    it('needs an identity, like every other mutation', async () => {
+      await serveAnas({ hole: true })
+      const res = await server!.inject({ method: 'POST', url: '/v1/iscsi/health/repair' })
+      assert.equal(res.statusCode, 401)
+    })
+  })
 
   describe('GET /v1/iscsi/claims — the cross-feature seam', () => {
     it('answers "is this object held by a LUN?" in one call', async () => {

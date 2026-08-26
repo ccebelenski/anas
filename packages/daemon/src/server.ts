@@ -534,7 +534,10 @@ export function createServer(opts?: ServerOptions) {
   // Dashboard aggregate + live telemetry (Epic 2). Read-only; composes the pool,
   // disk, share, job, and AHR (11.10) sources above, plus on-demand
   // ARC/iostat/net sampling.
-  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath, mdadmConfPath, ahrIntentDir })
+  // The dashboard takes the SAME injectable iSCSI paths the read routes do, so
+  // the `iscsi` warning category (story iscsi.5) reads the fixture tree in tests
+  // and the real one in production, and never a mix of the two.
+  server.register(dashboardRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath: mountsStoragePath, mdadmConfPath, ahrIntentDir, iscsiPaths })
 
   server.decorate('jobQueue', jobQueue)
   server.decorate('executor', executor)

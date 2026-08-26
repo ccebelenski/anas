@@ -21,6 +21,26 @@
  * leaves `udev_path` dangling (GT-40), so an ANAS target can acquire a broken LUN
  * without changing hands. Broken is reported as broken (`backingExists: false`),
  * and a target whose LUNs are on ANAS storage stays ANAS's problem to fix.
+ *
+ * Story `iscsi.5` made that third thing explicit and load-bearing. Live-proof
+ * wave 1 (finding F2) hit the exact state this epic exists to surface — a
+ * file-backed LUN whose pool was not imported — and watched ANAS hand its OWN
+ * target a hands-off badge, because "resolves onto nothing" and "resolves onto
+ * someone else's storage" were the same verdict here. They are not:
+ *
+ *   - `foreign`    — the backing IS there and it is NOT ours (a raw block device,
+ *                    a PVE pool, a file on unmanaged storage). A positive fact.
+ *   - `unresolved` — the backing is not there at all right now. An absence.
+ *
+ * An absence proves nothing about ownership, so **only a POSITIVE foreign
+ * verdict takes a target away from ANAS**; the IQN convention decides the rest.
+ * Getting that backwards removes the repair tools at precisely the moment they
+ * are needed.
+ *
+ * The existence check is the CALLER's: `classifyBacking` takes the answer as an
+ * argument rather than doing I/O of its own, so it stays pure, and the read
+ * layer pays for exactly one `stat` per backing path (which it was already
+ * doing, for `backingExists`).
  */
 
 import type { IscsiLunKind, IscsiOwnershipTag, PveStorageRef } from '@anas/shared'
@@ -44,7 +64,11 @@ const TRAILING_SLASH_RE = /\/+$/
 
 /** What ANAS knows about the storage a LUN's backing object sits on. */
 export interface BackingClassification {
-  /** `zvol`, `file`, or `foreign` when it resolves onto nothing ANAS knows. */
+  /**
+   * `zvol` / `file` when the path resolves onto storage ANAS manages;
+   * `unresolved` when it resolves onto nothing AND was checked to be absent;
+   * `foreign` otherwise.
+   */
   kind: IscsiLunKind
   /** The ZFS pool root, when the path resolves onto ZFS. */
   pool: string | null
@@ -117,20 +141,41 @@ function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): ZfsMountpo
  * (a `/dev/zdN` name does not, GT-48).
  *
  * Any other absolute path is a file, and its pool is whichever ZFS dataset (or
- * AHR pool) hosts it. A file that sits on neither is `foreign`: it may be a
+ * AHR pool) hosts it. A file that sits on neither is `foreign` — it may be a
  * plain block device someone exported by hand, or an image on storage ANAS does
- * not manage.
+ * not manage — UNLESS `backingExists` says the path is not there at all, in
+ * which case it is `unresolved` and proves nothing (story `iscsi.5`).
+ *
+ * `backingExists` is deliberately three-valued and only ONE value changes the
+ * verdict:
+ *
+ *   - `false`               — checked, absent  ⇒ `unresolved`
+ *   - `true`                — checked, present ⇒ `foreign` (a positive verdict)
+ *   - `null` / omitted      — not checked, or the check itself failed (EACCES,
+ *                             EIO) ⇒ `foreign`, the pre-existing behaviour. The
+ *                             create paths (`resolveZvolBacking`,
+ *                             `resolveFileBackingDir`) call it this way on
+ *                             purpose: an image that does not exist YET must
+ *                             still be refused if its directory is not ANAS's.
+ *
+ * A `/dev/zvol/...` path is NEVER `unresolved`: it names its own pool and
+ * volume, so a missing device there is a stale path on a known object, which is
+ * already reported as `backingExists: false` on the LUN (GT-40).
  */
-export function classifyBacking(devPath: string, inputs: OwnershipInputs): BackingClassification {
-  const empty: BackingClassification = {
-    kind: 'foreign',
+export function classifyBacking(
+  devPath: string,
+  inputs: OwnershipInputs,
+  backingExists?: boolean | null,
+): BackingClassification {
+  const unmatched: BackingClassification = {
+    kind: backingExists === false ? 'unresolved' : 'foreign',
     pool: null,
     dataset: null,
     pveManaged: false,
     pveGuestVolume: false,
   }
   if (!devPath.startsWith('/'))
-    return empty
+    return unmatched
 
   const zvol = ZVOL_PATH_RE.exec(devPath)
   if (zvol) {
@@ -146,9 +191,10 @@ export function classifyBacking(devPath: string, inputs: OwnershipInputs): Backi
   }
 
   // Any other /dev/ path is a raw block device LIO was pointed at directly —
-  // not a kind ANAS creates, so it is foreign whatever it is.
+  // not a kind ANAS creates, so it is foreign whatever it is (or unresolved,
+  // when the device node itself has gone).
   if (devPath.startsWith('/dev/'))
-    return empty
+    return unmatched
 
   const mp = matchMountpoint(devPath, inputs.zfsMountpoints)
   if (mp) {
@@ -176,7 +222,7 @@ export function classifyBacking(devPath: string, inputs: OwnershipInputs): Backi
       return { kind: 'file', pool: best.pool, dataset: null, pveManaged: false, pveGuestVolume: false }
   }
 
-  return { ...empty, kind: 'foreign' }
+  return unmatched
 }
 
 /** One LUN, reduced to what ownership needs to know about it. */
@@ -185,18 +231,38 @@ export interface OwnershipLun {
   name: string
   /** The backing path from saveconfig `dev` / configfs `udev_path`. */
   backingPath: string
+  /**
+   * Does that path resolve on this node RIGHT NOW? `false` is the only value
+   * that turns an unmatched backing into `unresolved` rather than `foreign`
+   * (see {@link classifyBacking}); `null`/omitted means "not checked".
+   */
+  backingExists?: boolean | null
 }
 
 /**
  * Derive a target's ownership from its IQN and its LUNs.
  *
- * `anas` requires BOTH halves — an ANAS-generated IQN and every LUN on
- * ANAS-managed storage. Everything else is `foreign` and carries the reason,
- * so the UI explains its hands-off badge instead of merely wearing one.
+ * The IQN is checked FIRST and it is the AUTHORITY for `anas`: a target ANAS did
+ * not create is foreign no matter whose storage it happens to sit on, and a
+ * target ANAS did create stays ANAS's unless some LUN's backing POSITIVELY
+ * resolves onto storage that is somebody else's (story `iscsi.5`).
  *
- * The IQN is checked FIRST: a target ANAS did not create is foreign no matter
- * whose storage it happens to sit on, and saying so is a cheaper, truer
- * explanation than a storage verdict.
+ * That leaves exactly three ways to lose a target — a PVE guest volume, a
+ * PVE-managed pool, or a resolvable backing on unmanaged storage — and each one
+ * carries its reason, so the UI explains its hands-off badge instead of merely
+ * wearing one.
+ *
+ * Two states that are NOT foreign, and used to be:
+ *
+ *  - **an `unresolved` LUN.** The pool is exported, the dataset was renamed, the
+ *    image file is gone. That is the boot-restore hole this epic exists to
+ *    surface (GT-20/GT-21), reported through `/v1/iscsi/health` and repairable
+ *    through `POST /v1/iscsi/health/repair` — both of which need the target to
+ *    still be ANAS's.
+ *  - **no LUNs at all.** A target created a second ago has none; a target whose
+ *    whole pool was late at boot comes up enabled with none (GT-21). Neither is
+ *    evidence of anyone else's ownership, and marking them hands-off made the
+ *    first one impossible to add a LUN to.
  */
 export function deriveOwnership(
   iqn: string,
@@ -213,14 +279,15 @@ export function deriveOwnership(
 
   if (luns.length === 0) {
     return {
-      ownership: 'foreign',
+      ownership: 'anas',
       reason: 'no-luns',
-      detail: `Target '${iqn}' has no LUNs, so no backing object ties it to ANAS-managed storage`,
+      detail: `IQN follows the ANAS naming convention; the target has no LUNs (newly created, or its backing storage did not come up at boot)`,
     }
   }
 
+  const unresolved: OwnershipLun[] = []
   for (const lun of luns) {
-    const c = classifyBacking(lun.backingPath, inputs)
+    const c = classifyBacking(lun.backingPath, inputs, lun.backingExists)
     if (c.pveGuestVolume) {
       return {
         ownership: 'foreign',
@@ -243,6 +310,19 @@ export function deriveOwnership(
         reason: 'backing-not-anas-storage',
         detail: `LUN '${lun.name}' is backed by ${lun.backingPath}, which is not on storage ANAS manages`,
       }
+    }
+    if (c.kind === 'unresolved')
+      unresolved.push(lun)
+  }
+
+  if (unresolved.length > 0) {
+    const named = unresolved.map(l => `'${l.name}' (${l.backingPath})`).join(', ')
+    return {
+      ownership: 'anas',
+      reason: 'backing-unresolved',
+      detail: `IQN follows the ANAS naming convention; ${unresolved.length} of ${luns.length} LUN${luns.length === 1 ? '' : 's'} `
+        + `resolve${unresolved.length === 1 ? 's' : ''} onto no storage on this node right now — ${named}. `
+        + `An absent backing is a hole to repair, not a change of ownership.`,
     }
   }
 

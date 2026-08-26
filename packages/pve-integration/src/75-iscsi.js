@@ -2,9 +2,11 @@
  * ANAS — iSCSI view (story iscsi.4: the iSCSI menu and every mutation).
  *
  * A native ExtJS grid over the node's iSCSI targets plus a toolbar (Create,
- * Edit, Enable/Disable, Delete, LUNs…) and a LUNs detail window that is DISPLAY
- * plus its own LUN toolbar (Add LUN, Resize, Delete). One menu per feature; no
- * row-icon action columns.
+ * Edit, Enable/Disable, Delete, LUNs…, Repair) and a LUNs detail window that is
+ * DISPLAY plus its own LUN toolbar (Add LUN, Resize, Delete). One menu per
+ * feature; no row-icon action columns.
+ *
+ * `Repair` (story iscsi.5) is the node-level door out of a boot-restore hole.
  *
  * ANAS is the TARGET side only. PVE and guests are ordinary initiators; nothing
  * here writes storage.cfg or offers a pvesm snippet.
@@ -33,6 +35,16 @@
  *    correct target-side attributes; Linux's default discard path is rejected by
  *    LIO for fileio. The Add LUN summary says it plainly instead of promising
  *    "thin".
+ *  - **A boot restore with a missing backing device reports SUCCESS.** systemd
+ *    logs `Result=success` while the LUN silently vanishes; with a whole pool
+ *    late the target comes up enabled with zero LUNs and an initiator logs in
+ *    happily and sees nothing. `Repair` is fed by the saveconfig ⟷ configfs diff
+ *    and is live only when a hole's backing object is BACK — the tooltip names
+ *    what is still missing otherwise. The replay carries the stored serial and
+ *    attributes, so a repaired LUN is the same disk.
+ *  - **"Not on this node right now" is not "somebody else's".** A LUN whose pool
+ *    is exported reads `Unresolved`, not `Foreign`, and its target stays ANAS's —
+ *    otherwise the hands-off badge would take away the very tools that fix it.
  *
  * ---------------------------------------------------------------------------
  * DAEMON CONTRACT (docs/DESIGN.md "iSCSI — block storage")
@@ -51,6 +63,9 @@
  *   POST /v1/iscsi/targets/:iqn/luns { name, kind, backing, size?, blockSize? }
  *   PUT  /v1/iscsi/targets/:iqn/luns/:n { size?, writeBack? }          → 202/409
  *   DELETE /v1/iscsi/targets/:iqn/luns/:n[?destroyBacking=true]        → 202/409
+ *   GET  /v1/iscsi/health   → { …envelope, missingLuns[], targetsServingNothing[],
+ *        portalsWithoutInterface[], foreignChanges[], degraded, interfacesUnknown }
+ *   POST /v1/iscsi/health/repair                                       → 202/409
  *
  *   THE CLEAR CONTRACT: on an ACL, every credential field means set / clear /
  *   keep by value / null / OMITTED. A blank password box sends NO key, so the
@@ -63,7 +78,7 @@
  *
  * Test hooks: view 'anas-view anas-view-iscsi'; grid 'anas-grid-iscsi'; toolbar
  * 'anas-btn-iscsi-refresh' / '-create' / '-edit' / '-toggle' / '-delete' /
- * '-luns'; target dialog 'anas-win-iscsi-target' with submit
+ * '-luns' / '-repair'; target dialog 'anas-win-iscsi-target' with submit
  * 'anas-btn-iscsi-target-submit'; LUNs window 'anas-win-iscsi-luns' with
  * 'anas-btn-lun-add' / 'anas-btn-lun-resize' / 'anas-btn-lun-delete'; Add LUN
  * dialog 'anas-win-iscsi-lun' with 'anas-btn-iscsi-lun-submit'; Resize dialog
@@ -358,7 +373,7 @@
         if (!grid) {
             return;
         }
-        var ids = ['iscsiCreate', 'iscsiEdit', 'iscsiToggle', 'iscsiDelete', 'iscsiLuns'];
+        var ids = ['iscsiCreate', 'iscsiEdit', 'iscsiToggle', 'iscsiDelete', 'iscsiLuns', 'iscsiRepair'];
         for (var i = 0; i < ids.length; i++) {
             setDisabled(grid, ids[i], true);
         }
@@ -369,6 +384,95 @@
             btnSetTip(grid, 'iscsiCreate', t('Install targetcli-fb and python3-rtslib-fb on this node first'));
         }
         grid.anasInstalled = installed;
+    }
+
+    // ---- Restore holes: the health read behind the Repair button -----------
+    //
+    // A boot restore whose backing device was missing exits 0 and systemd calls
+    // it a success, so the ONLY way anyone learns a LUN vanished is this diff of
+    // the saved configuration against what the kernel actually has. The button
+    // is live only when at least one hole's backing object is BACK — repairing
+    // over an absent device is how the hole was made.
+
+    function repairableHoles(health) {
+        var missing = (health && isArray(health.missingLuns)) ? health.missingLuns : [];
+        var out = [];
+        for (var i = 0; i < missing.length; i++) {
+            if (missing[i] && missing[i].backingExists === true) {
+                out.push(missing[i]);
+            }
+        }
+        return out;
+    }
+
+    function applyHealth(view, health) {
+        var grid = gridOf(view);
+        if (!grid) {
+            return;
+        }
+        grid.anasHealth = health || null;
+        if (grid.anasInstalled === false) {
+            return;
+        }
+        var missing = (health && isArray(health.missingLuns)) ? health.missingLuns : [];
+        var ready = repairableHoles(health);
+        setDisabled(grid, 'iscsiRepair', ready.length === 0);
+        var tip;
+        if (!missing.length) {
+            tip = t('Nothing to repair — the live configuration matches the saved one.');
+        } else if (!ready.length) {
+            var paths = [];
+            for (var i = 0; i < missing.length; i++) {
+                paths.push('' + (missing[i].backingPath || ''));
+            }
+            tip = t('Waiting on the backing storage: ') + paths.join(', ')
+                + t('. Import the pool or restore the image, then Repair.');
+        } else {
+            tip = ready.length + ' ' + (ready.length === 1 ? t('LUN') : t('LUNs'))
+                + ' ' + t('can be put back now — the same serial and attributes are replayed, '
+                    + 'so the initiator sees the same disk.');
+        }
+        btnSetTip(grid, 'iscsiRepair', tip);
+    }
+
+    function loadHealth(view, node) {
+        var grid = gridOf(view);
+        if (!grid || grid.destroyed || grid.destroying) {
+            return;
+        }
+        ANAS.api.get(node, '/iscsi/health').then(function (res) {
+            if (grid.destroyed || grid.destroying) {
+                return;
+            }
+            applyHealth(view, (res && res.data) || null);
+        }, function () {
+            // Fail-open: no health read means no Repair button, never a broken
+            // screen. The grid itself has already loaded.
+            if (!grid.destroyed && !grid.destroying) {
+                applyHealth(view, null);
+            }
+        });
+    }
+
+    function repairHoles(view, node) {
+        var grid = gridOf(view);
+        var ready = repairableHoles(grid && grid.anasHealth);
+        if (!ready.length) {
+            return;
+        }
+        ANAS.runJob({
+            node: node,
+            method: 'post',
+            path: '/iscsi/health/repair',
+            body: {},
+            view: view,
+            failTitle: 'Repair failed',
+            successMsg: t('Restore holes repaired') + ': ' + ready.length + ' '
+                + (ready.length === 1 ? t('LUN') : t('LUNs')),
+            onComplete: function () {
+                loadTargets(view, node);
+            }
+        });
     }
 
     function loadTargets(view, node, quiet, onDone) {
@@ -422,6 +526,12 @@
             }
             grid.anasReloading = false;
             updateButtons(grid);
+            // The saveconfig ⟷ configfs diff behind the Repair button. A second
+            // read, deliberately: it is the only source for a hole systemd
+            // reported as a success, and it must never delay or break the grid.
+            if (env.installed) {
+                loadHealth(view, node);
+            }
             if (onDone) {
                 onDone(env);
             }
@@ -1310,6 +1420,16 @@
                 t('A raw image on a dataset or an AHR pool. Its size is fixed at creation, so a grow '
                     + 'recreates the backstore with the same identity.'));
         }
+        // `unresolved` is NOT `foreign` (story iscsi.5): the backing is not on
+        // this node right now — an exported pool, a renamed dataset, a missing
+        // image — which says nothing about who owns it. It is a hole to repair,
+        // and the target stays ANAS's.
+        if (s === 'unresolved') {
+            return pill('anas-lun-kind anas-lun-kind-unresolved', t('Unresolved'), 'var(--anas-warn,#b7791f)',
+                t('The backing object is not on this node right now — the pool is not imported, the '
+                    + 'dataset is gone, or the image file is missing. This is a restore hole, not a '
+                    + 'foreign disk: bring the storage back and use Repair.'));
+        }
         return pill('anas-lun-kind anas-lun-kind-foreign', t('Foreign'), 'var(--anas-muted,gray)',
             t('Backed by something ANAS does not manage'));
     }
@@ -1410,7 +1530,12 @@
         var rec = selectedLun(win);
         var has = !!rec;
         var live = has && (rec.get('connectedInitiators') || []).length > 0;
-        var kindOk = has && rec.get('kind') !== 'foreign';
+        // A resize needs a backing object ANAS manages AND one that is actually
+        // there: an `unresolved` LUN's zvol or image is not on this node right
+        // now, so there is nothing to grow (story iscsi.5).
+        var kind = has ? rec.get('kind') : '';
+        var unresolved = kind === 'unresolved';
+        var kindOk = has && kind !== 'foreign' && !unresolved;
 
         setDisabled(grid, 'lunAdd', foreign);
         setDisabled(grid, 'lunResize', foreign || !has || live || !kindOk);
@@ -1422,7 +1547,12 @@
             + 'kernel message. Log the initiator out first.');
         btnSetTip(grid, 'lunAdd', foreign ? foreignTip : '');
         btnSetTip(grid, 'lunResize', foreign ? foreignTip
-            : (live ? liveTip : (has && !kindOk ? t('The backing object is not storage ANAS manages') : '')));
+            : (live
+                ? liveTip
+                : (unresolved
+                    ? t('The backing object is not on this node right now — bring the storage back, '
+                        + 'then Repair, before resizing.')
+                    : (has && !kindOk ? t('The backing object is not storage ANAS manages') : ''))));
         btnSetTip(grid, 'lunDelete', foreign ? foreignTip : (live ? liveTip : ''));
     }
 
@@ -2408,6 +2538,23 @@
                 handler: function (btn) {
                     var view = btn.up('#iscsiView');
                     deleteTarget(view, node, selectedTarget(gridOf(view)));
+                }
+            },
+            '->',
+            {
+                // Node-level, not per-target: a restore hole is a property of
+                // the boot, and one repair puts back every LUN whose backing
+                // object is available again. Disabled — with the reason in the
+                // tooltip — whenever there is nothing to do or the storage is
+                // still missing.
+                text: t('Repair'),
+                itemId: 'iscsiRepair',
+                cls: 'anas-btn-iscsi-repair',
+                iconCls: 'fa fa-wrench',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#iscsiView');
+                    repairHoles(view, node);
                 }
             }
         ];

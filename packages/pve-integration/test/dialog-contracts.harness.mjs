@@ -39,6 +39,13 @@
  *      a resize grows only, destroying a LUN's backing object is a separate
  *      ticked choice that becomes a query flag, and a foreign target or a live
  *      session greys the right controls with the reason attached.
+ *   6. iSCSI boot lifecycle (story iscsi.5): the Repair button is live ONLY when
+ *      a restore hole's backing object is BACK, and says what is still missing
+ *      otherwise — a boot restore with a missing device exits 0 and systemd
+ *      calls it a success, so this button is the operator's only handle on it.
+ *      And an `unresolved` LUN does NOT make its target hands-off: "not on this
+ *      node right now" is not "somebody else's", and reading it that way would
+ *      take away the very tools that fix it.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -1205,8 +1212,41 @@ const ISCSI_POOL_ROUTES = {
   'GET /ahr/pools': { data: [{ name: 'ahrpool', mountpoint: '/ahrpool' }] },
 }
 
+/** The saveconfig ⟷ configfs diff behind the Repair button (story iscsi.5). */
+function iscsiHealth(opts = {}) {
+  const missing = opts.missing || []
+  return {
+    data: {
+      installed: true,
+      configfsPresent: true,
+      saveconfigPresent: true,
+      missingLuns: missing,
+      targetsServingNothing: opts.servingNothing || [],
+      portalsWithoutInterface: [],
+      foreignChanges: [],
+      degraded: missing.length > 0,
+      interfacesUnknown: false,
+      checkedAt: '2026-08-25T20:00:00.000Z',
+    },
+  }
+}
+
+/** One restore hole; `backingExists` is the whole gate on Repair. */
+function iscsiHole(backingExists) {
+  return {
+    targetIqn: ISCSI_IQN,
+    tpgTag: 1,
+    lunIndex: 0,
+    backstoreName: 'vmdisk1',
+    plugin: 'block',
+    backingPath: '/dev/zvol/tank/vol1',
+    backingExists,
+  }
+}
+
 const ISCSI_ROUTES = {
   'GET /iscsi/targets': { data: ISCSI_TARGETS },
+  'GET /iscsi/health': iscsiHealth(),
   [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: iscsiDetail() },
   [`GET /iscsi/targets/${encodeURIComponent(ISCSI_FOREIGN)}`]: { data: { ...ISCSI_TARGETS.targets[1], luns: [], acls: [], sessions: [] } },
   ...ISCSI_POOL_ROUTES,
@@ -1289,7 +1329,13 @@ async function iscsiGridChecks() {
 
 async function iscsiNotInstalledChecks() {
   ajax.responses = { '/network': PVE_NETWORK }
-  const reason = 'The LIO iSCSI target stack is not present on this node (no configfs target tree and no saved configuration) — install targetcli-fb to serve block storage'
+  // Verbatim from `iscsiAvailability` — including the modules half (GT-4): there
+  // is no load-on-first-use to arrange, so the envelope says so instead of
+  // implying a knob exists.
+  const reason = 'The LIO iSCSI target stack is not present on this node (no configfs target tree and no saved configuration) '
+    + '— install targetcli-fb and python3-rtslib-fb to serve block storage. Installing them costs nothing at rest: '
+    + 'the target kernel modules arrive with the first real targetcli call, and rtslib loads every backstore plugin '
+    + 'at once — there is no load-on-first-use to arrange, and ANAS never loads one itself.'
   const { view, grid } = await openIscsiView({
     'GET /iscsi/targets': {
       data: {
@@ -1766,6 +1812,114 @@ async function iscsiForeignLunChecks() {
   ok('foreign luns: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+// ---------------------------------------------------------------------------
+//  iscsi.5 — the Repair door and the `unresolved` backing tier
+// ---------------------------------------------------------------------------
+//
+// A boot restore whose backing device was missing exits 0 and systemd logs
+// `Result=success`, so the Repair button is the operator's only handle on it.
+// It has to be live ONLY when a hole's backing object is actually back —
+// recreating a backstore over an absent device is how the hole was made — and
+// when it is not live it has to say what is still missing.
+
+async function iscsiRepairChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+
+  // 1. Healthy: nothing to repair, and the button says so rather than sitting
+  //    greyed with no explanation.
+  let view = (await openIscsiView(ISCSI_ROUTES)).view
+  let grid = view.down('#iscsiGrid')
+  let state = toolbar(grid, ['iscsiRepair'])
+  ok('repair(healthy): the button exists on the iSCSI toolbar', state.iscsiRepair !== null)
+  ok('repair(healthy): DISABLED', state.iscsiRepair.disabled === true)
+  ok('repair(healthy): says there is nothing to repair',
+    /Nothing to repair/.test(state.iscsiRepair.tip), state.iscsiRepair.tip)
+
+  // 2. A hole whose backing is STILL MISSING: refused, and the tooltip names
+  //    the path so the operator knows what to bring back.
+  created.windows.length = 0
+  view = (await openIscsiView({ ...ISCSI_ROUTES, 'GET /iscsi/health': iscsiHealth({ missing: [iscsiHole(false)] }) })).view
+  grid = view.down('#iscsiGrid')
+  state = toolbar(grid, ['iscsiRepair'])
+  ok('repair(absent): still DISABLED — a recreate over an absent device made the hole',
+    state.iscsiRepair.disabled === true)
+  ok('repair(absent): names the backing path that has to come back',
+    /\/dev\/zvol\/tank\/vol1/.test(state.iscsiRepair.tip), state.iscsiRepair.tip)
+
+  // 3. The backing is BACK: live, and it POSTs the node-level repair.
+  created.windows.length = 0
+  jobs.length = 0
+  view = (await openIscsiView({
+    ...ISCSI_ROUTES,
+    'GET /iscsi/health': iscsiHealth({ missing: [iscsiHole(true)] }),
+  })).view
+  grid = view.down('#iscsiGrid')
+  state = toolbar(grid, ['iscsiRepair'])
+  ok('repair(present): ENABLED once the backing object resolves again',
+    state.iscsiRepair.disabled === false)
+  ok('repair(present): the tooltip promises the SAME disk, not a new one',
+    /same serial and attributes/.test(state.iscsiRepair.tip), state.iscsiRepair.tip)
+  const btn = grid.down('#iscsiRepair')
+  btn.handler(btn)
+  await settle()
+  eq('repair(present): POSTs the node-level repair, with no per-target path',
+    { method: jobs[0].method, path: jobs[0].path }, { method: 'post', path: '/iscsi/health/repair' })
+
+  // 4. Not installed: the whole toolbar is flat, Repair included.
+  created.windows.length = 0
+  view = (await openIscsiView({
+    'GET /iscsi/targets': { data: { installed: false, configfsPresent: false, saveconfigPresent: false, reason: 'no LIO', targets: [] } },
+  })).view
+  grid = view.down('#iscsiGrid')
+  ok('repair(not-installed): DISABLED with the rest of the toolbar',
+    toolbar(grid, ['iscsiRepair']).iscsiRepair.disabled === true)
+
+  ok('repair: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiUnresolvedLunChecks() {
+  // "Not on this node right now" is NOT "somebody else's" (live-proof F2): the
+  // target stays ANAS's — the toolbar is live — but the LUN itself cannot be
+  // resized, because there is no backing object to grow.
+  ajax.responses = { '/network': PVE_NETWORK }
+  const detail = iscsiDetail()
+  detail.ownershipReason = 'backing-unresolved'
+  detail.luns[1] = { ...detail.luns[1], kind: 'unresolved', backingExists: false, present: false, pool: undefined, dataset: undefined }
+  const targets = { ...ISCSI_TARGETS, targets: [{ ...ISCSI_TARGETS.targets[0], ownershipReason: 'backing-unresolved' }, ISCSI_TARGETS.targets[1]] }
+
+  const { grid } = await openIscsiView({
+    ...ISCSI_ROUTES,
+    'GET /iscsi/targets': { data: targets },
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: detail },
+  })
+
+  // The target is still ANAS's: every verb stays available.
+  grid.selectRow(iscsiRowOf(grid, ISCSI_IQN))
+  const targetState = toolbar(grid, ['iscsiEdit', 'iscsiDelete', 'iscsiLuns'])
+  ok('unresolved: an unresolved LUN does NOT make its target hands-off',
+    targetState.iscsiEdit.disabled === false && targetState.iscsiDelete.disabled === false)
+
+  const btn = grid.down('#iscsiLuns')
+  btn.handler(btn)
+  await settle()
+  const win = openWindow()
+  const lunsGrid = win.down('#lunsGrid')
+  const rec = lunsGrid.getStore().getAt(1)
+  ok('unresolved: the row carries the new kind', rec.get('kind') === 'unresolved')
+
+  lunsGrid.selectRow(1)
+  const state = toolbar(lunsGrid, ['lunResize', 'lunDelete'])
+  ok('unresolved: Resize is DISABLED — there is nothing on this node to grow',
+    state.lunResize.disabled === true)
+  ok('unresolved: and it says why, pointing at Repair',
+    /not on this node right now/i.test(state.lunResize.tip) && /Repair/.test(state.lunResize.tip),
+    state.lunResize.tip)
+  // Unmapping a LUN whose backing is gone is still legitimate cleanup.
+  ok('unresolved: Delete stays available', state.lunDelete.disabled === false)
+
+  ok('unresolved: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 async function iscsiAddressFallbackChecks() {
   // PVE's network API is unreadable: the picker must degrade to a free-text
   // field rather than leaving the operator with no way to enter an address.
@@ -1810,6 +1964,8 @@ for (const check of [
   iscsiSessionGatingChecks,
   iscsiForeignLunChecks,
   iscsiAddressFallbackChecks,
+  iscsiRepairChecks,
+  iscsiUnresolvedLunChecks,
 ]) {
   warnings.length = 0
   // `created.windows` is module-global; a dialog a previous section left open

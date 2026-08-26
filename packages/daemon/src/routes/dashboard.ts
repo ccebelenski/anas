@@ -21,6 +21,7 @@ import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
+import type { IscsiPaths } from '../services/iscsi.js'
 import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { computeArcTelemetry, parseArcstats } from '../parsers/arcstats.js'
@@ -36,6 +37,7 @@ import { collectAhrTelemetry } from '../services/ahr-io.js'
 import { buildAhrCapacityWarnings, collectAhrPoolBriefs, collectAhrWarnings } from '../services/ahr-topology.js'
 import { collectBackupWarnings } from '../services/backup-units.js'
 import { readConfig } from '../services/config-writer.js'
+import { collectIscsiWarnings } from '../services/iscsi-warnings.js'
 import { collectMountWarnings } from '../services/mounts.js'
 import { buildReplicationWarnings, collectTaskStatuses } from '../services/replication-units.js'
 import { collectScheduleWarnings } from '../services/snapshot-schedule-units.js'
@@ -79,9 +81,11 @@ export async function dashboardRoutes(
     mdadmConfPath?: string
     /** AHR expansion-intent dir (§5.3) — halted-expansion warnings (11.10). */
     ahrIntentDir?: string
+    /** iSCSI read paths (configfs / saveconfig) — defaults are production. */
+    iscsiPaths?: IscsiPaths
   },
 ) {
-  const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath, mdadmConfPath, ahrIntentDir } = opts
+  const { executor, jobQueue, diskIdentityCache, smbConfPath, exportsPath, systemdDir, fstabPath, storagePath, mdadmConfPath, ahrIntentDir, iscsiPaths } = opts
 
   // A pool mid-create must not card as a CRITICAL failure for the whole build
   // (issue #7): the half-built stack is genuinely VG-less, so only the live job
@@ -93,7 +97,7 @@ export async function dashboardRoutes(
   server.get('/status', async () => {
     // Each block is independently fail-open so one failing source (e.g. no ZFS)
     // never blanks the rest of the dashboard.
-    const [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, ahrWarnings, ahrPools, scheduleWarnings] = await Promise.all([
+    const [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, ahrWarnings, ahrPools, scheduleWarnings, iscsiWarnings] = await Promise.all([
       collectPoolStatus(),
       collectDiskHealth(),
       collectShareStatus(),
@@ -111,6 +115,13 @@ export async function dashboardRoutes(
       // Snapshot schedules (17.7): failed/overdue enabled schedules → 'schedule'
       // warnings; healthy/idle and disabled contribute nothing, errors fail-open.
       collectScheduleWarnings(executor, systemdDir),
+      // iSCSI (iscsi.5): the saveconfig ⟷ configfs diff → 'iscsi' warnings. A
+      // boot restore whose backing device was missing reports systemd SUCCESS
+      // and silently drops the LUN, so this PULL is the ONLY place a missing
+      // LUN, a target serving nothing or a portal on a dead address is ever
+      // surfaced. Healthy adds nothing; a node without LIO costs two stats and
+      // adds nothing; errors fail-open to [].
+      collectIscsiWarnings(executor, iscsiPaths ?? {}),
     ])
 
     const summary: StatusSummary = {
@@ -127,7 +138,7 @@ export async function dashboardRoutes(
       // A create that failed and rolled itself back leaves NO pool behind, so
       // it can only be surfaced from the job side (issue #11) — without this the
       // failure would be discoverable nowhere in the UI.
-      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...buildFailedCreateWarnings(ahrPools.map(p => p.name), jobQueue), ...scheduleWarnings],
+      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...buildFailedCreateWarnings(ahrPools.map(p => p.name), jobQueue), ...scheduleWarnings, ...iscsiWarnings],
       ahrPools,
     }
     return { data: summary }

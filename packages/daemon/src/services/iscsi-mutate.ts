@@ -350,7 +350,18 @@ export interface IscsiRefusal {
   message: string
 }
 
-/** LIO not installed — a guiding refusal naming the packages, not a stack trace. */
+/**
+ * LIO not installed — a guiding refusal naming the packages, not a stack trace.
+ *
+ * `install.sh` installs both as hard dependencies since story `iscsi.5`, exactly
+ * like samba and nfs-kernel-server, so this is what a node that predates that
+ * (or had them removed) gets. Two things it deliberately does NOT offer to do:
+ * enable the restore service — `python3-rtslib-fb`'s postinst already symlinks
+ * and starts `rtslib-fb-targetctl.service` itself (GT-1) — and load a kernel
+ * module, because there is nothing to arrange there: rtslib loads every
+ * backstore plugin at once on the first real `targetcli` call, all-or-nothing
+ * (GT-4).
+ */
 export function assertInstalled(ctx: IscsiReadContext): IscsiRefusal | null {
   const availability = iscsiAvailability(ctx)
   if (availability.installed)
@@ -358,7 +369,8 @@ export function assertInstalled(ctx: IscsiReadContext): IscsiRefusal | null {
   return {
     reason: 'lio-not-installed',
     message: `The LIO iSCSI target stack is not present on this node, so nothing can be created: `
-      + `install '${ISCSI_PACKAGES}' first. The packages enable and start the restore service themselves.`,
+      + `install '${ISCSI_PACKAGES}' first. The packages enable and start the restore service themselves, `
+      + `and the kernel modules load on the first targetcli call — nothing else has to be arranged.`,
   }
 }
 

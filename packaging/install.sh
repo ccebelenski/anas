@@ -65,6 +65,14 @@ NOTIFY_TEMPLATES=(
   anas-replication-body.txt.hbs
 )
 
+# The iSCSI boot-ordering drop-in (story iscsi.5). rtslib-fb-targetctl.service
+# belongs to python3-rtslib-fb; ANAS never edits it, it adds this drop-in beside
+# it so an apt upgrade of the package cannot lose the ordering and uninstall.sh
+# has exactly one file to remove. Listed once — the preflight completeness check,
+# the install step and uninstall.sh all read these two names.
+ISCSI_DROPIN_DIR="rtslib-fb-targetctl.service.d"
+ISCSI_DROPIN_FILE="anas-ordering.conf"
+
 log()  { printf '==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -79,8 +87,9 @@ Usage: sudo ./install.sh [options]
 Options:
   --install-deps   Auto-install Node.js (>= ${MIN_NODE_MAJOR}) via the NodeSource setup_22.x
                    repository if it is absent or too old. Everything else ANAS
-                   requires (acl, mdadm, btrfs-progs, samba, nfs-kernel-server)
-                   is a HARD dependency and is installed regardless of this flag.
+                   requires (acl, mdadm, btrfs-progs, samba, nfs-kernel-server,
+                   targetcli-fb, python3-rtslib-fb) is a HARD dependency and is
+                   installed regardless of this flag.
   --yes            Non-interactive; assume "yes" to prompts.
   --prefix DIR     Install location (default: /opt/anas).
   --port N         Loopback port for the ANAS gateway (default: ${DEFAULT_PORT}).
@@ -264,6 +273,7 @@ NEED_MDADM_INSTALL=0
 NEED_BTRFS_INSTALL=0
 NEED_SAMBA_INSTALL=0
 NEED_NFS_INSTALL=0
+NEED_TARGETCLI_INSTALL=0
 FATAL=()
 
 phase0_preflight() {
@@ -297,6 +307,8 @@ phase0_preflight() {
     || FATAL+=("release incomplete: systemd/ unit files not found")
   [ -f "${SCRIPT_DIR}/anas-md-event.sh" ] \
     || FATAL+=("release incomplete: anas-md-event.sh not found next to install.sh")
+  [ -f "${UNIT_SRC}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}" ] \
+    || FATAL+=("release incomplete: systemd/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE} not found next to install.sh")
   for tpl in "${NOTIFY_TEMPLATES[@]}"; do
     [ -f "${SCRIPT_DIR}/templates/${tpl}" ] \
       || FATAL+=("release incomplete: templates/${tpl} not found next to install.sh")
@@ -411,6 +423,23 @@ phase0_preflight() {
     info "nfs-kernel-server (exportfs) missing — will auto-install"
   fi
 
+  # targetcli-fb / python3-rtslib-fb — required to SERVE iSCSI block storage
+  # (LIO, the kernel target). PVE 9 ships neither, though it does ship the
+  # INITIATOR side (open-iscsi) for its own `iscsi:` storage type — ANAS never
+  # touches that half. Same rule as samba/nfs: the iSCSI screen is always there,
+  # not gated on the tooling, so the tooling is a HARD dependency.
+  # `targetcli` comes from targetcli-fb; the python3 module import proves
+  # python3-rtslib-fb, which is the half that owns the restore service and the
+  # persisted /etc/rtslib-fb-target/saveconfig.json — probing both catches a node
+  # with only one of the pair.
+  if command -v targetcli >/dev/null 2>&1 \
+     && python3 -c 'import rtslib_fb' >/dev/null 2>&1; then
+    info "targetcli-fb + python3-rtslib-fb present"
+  else
+    NEED_TARGETCLI_INSTALL=1
+    info "targetcli-fb/python3-rtslib-fb missing — will auto-install"
+  fi
+
   # Resolve the gateway port (issue #2) before anything binds. This owns the
   # port-in-use logic: --port intent, preserving a configured port on upgrade,
   # and auto-scanning past a foreign listener on a fresh install. May exit here
@@ -437,7 +466,8 @@ phase0_preflight() {
 
 # Install the dependencies preflight marked missing: Node.js via NodeSource
 # (opted in with --install-deps), then the hard dependencies that are installed
-# regardless — acl, mdadm + btrfs-progs, samba + nfs-kernel-server. This mutates
+# regardless — acl, mdadm + btrfs-progs, samba + nfs-kernel-server,
+# targetcli-fb + python3-rtslib-fb. This mutates
 # the system but only adds standard Debian packages; it is NOT rolled back on a
 # later failure (leaving deps installed is harmless). It runs on every install
 # AND every upgrade, so an existing node picks up a dependency added by a newer
@@ -504,6 +534,33 @@ phase0b_install_deps() {
     info "${share_pkgs[*]} installed"
     info "note: these packages enable and start their own services (smbd / nfs-server)"
   fi
+  if [ "${NEED_TARGETCLI_INSTALL}" -eq 1 ]; then
+    log "Installing targetcli-fb + python3-rtslib-fb..."
+    # Same shape as samba/nfs above: the iSCSI screen is always available, so
+    # the tooling is a hard dependency, not optional. Nothing here writes any
+    # LIO configuration — the packages lay down their own empty state and ANAS
+    # edits it through targetcli from there (PRINCIPLES.md #12 — guest, not
+    # owner). This runs BEFORE the rollback trap arms, so no ANAS step has
+    # touched the node.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y targetcli-fb python3-rtslib-fb; then
+      err "failed to install the required packages 'targetcli-fb' and 'python3-rtslib-fb'."
+      err "ANAS requires them to serve iSCSI block storage (LIO) — the iSCSI screen is always available, so they are a hard dependency, not optional."
+      err "Nothing on this node was modified (this step runs before any install action)."
+      err "On an air-gapped node, preseed them first (e.g. 'apt-get install -y --no-download targetcli-fb python3-rtslib-fb' from a local mirror, or pre-place the .deb files) and re-run this installer."
+      exit 1
+    fi
+    command -v targetcli >/dev/null 2>&1 \
+      || { err "targetcli-fb install failed (targetcli still missing) — ANAS requires it to serve iSCSI block storage; nothing was modified"; exit 1; }
+    python3 -c 'import rtslib_fb' >/dev/null 2>&1 \
+      || { err "python3-rtslib-fb install failed (the rtslib_fb module is still missing) — ANAS requires it for the LIO boot restore; nothing was modified"; exit 1; }
+    info "targetcli-fb + python3-rtslib-fb installed"
+    # Deliberately NOT enabled or started here: the python3-rtslib-fb postinst
+    # already symlinks rtslib-fb-targetctl.service into
+    # multi-user.target.wants/ and starts it (it exits immediately with "No
+    # saved config file at /etc/rtslib-fb-target/saveconfig.json, ok, exiting").
+    # ANAS's only job on that unit is the ordering drop-in, installed in Phase 1.
+    info "note: python3-rtslib-fb enables and starts rtslib-fb-targetctl.service itself"
+  fi
 }
 
 # =============================================================================
@@ -516,6 +573,7 @@ BACKUP_PATH=""
 PREFIX_INSTALLED=0
 HOOK_INSTALLED=0
 ENV_FILE_FRESH=0        # set iff we CREATED ${ANAS_ENV_FILE} (removed on rollback)
+ISCSI_DROPIN_FRESH=0    # set iff we CREATED the iSCSI ordering drop-in (removed on rollback)
 UNITS_INSTALLED=0
 SERVICES_STARTED=0
 UI_INSTALLED=0
@@ -546,6 +604,14 @@ rollback() {
   if [ "${HOOK_INSTALLED}" -eq 1 ]; then
     info "removing md-event hook"
     rm -f "${HOOK_DEST}"
+  fi
+
+  # Only a drop-in THIS run created is withdrawn; an upgrade over an existing
+  # one leaves it in place (the restore path below re-installs it anyway).
+  if [ "${ISCSI_DROPIN_FRESH}" -eq 1 ]; then
+    info "removing iSCSI ordering drop-in"
+    rm -f "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}"
+    rmdir "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}" >/dev/null 2>&1 || true
   fi
 
   if [ "${ENV_FILE_FRESH}" -eq 1 ]; then
@@ -581,6 +647,28 @@ install_units() {
     sed "s#/opt/anas#${PREFIX}#g" "${UNIT_SRC}/${u}.service" > "${SYSTEMD_DIR}/${u}.service"
     chmod 0644 "${SYSTEMD_DIR}/${u}.service"
   done
+  install_iscsi_dropin
+}
+
+# Install the iSCSI boot-ordering drop-in (story iscsi.5).
+#
+# rtslib-fb-targetctl.service is python3-rtslib-fb's, and ANAS is a guest: the
+# vendor unit is never edited, a drop-in is added beside it. The unit's own
+# ordering stops at local-fs.target, so nothing waits for /dev/zvol/* — and a
+# restore whose backing device is missing reports systemd SUCCESS while the LUN
+# silently vanishes (ISCSI-GROUND-TRUTH GT-3/GT-20/GT-21). The drop-in prevents
+# the race; the `iscsi` dashboard warnings catch whatever still slips through.
+#
+# Idempotent: a plain overwrite, so a re-run (upgrade) re-applies the current
+# content over an older one. It is installed unconditionally — the unit may not
+# exist yet in the same run that apt is installing the package, and a drop-in
+# for a not-yet-present unit is inert, not an error. daemon-reload is the
+# caller's job (Phase 1 does one for the ANAS units anyway, and it covers this).
+install_iscsi_dropin() {
+  [ -e "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}" ] || ISCSI_DROPIN_FRESH=1
+  install -d -m 0755 "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}"
+  install -m 0644 "${UNIT_SRC}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}" \
+    "${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}"
 }
 
 # Health check: services active AND the gateway answers on the port. Any HTTP
@@ -663,9 +751,12 @@ phase1_install() {
   [ -e "${ANAS_ENV_FILE}" ] || ENV_FILE_FRESH=1
   write_env_file "${RESOLVED_PORT}"
 
-  # 3. Install units, enable, (re)start.
+  # 3. Install units, enable, (re)start. install_units also lays down the iSCSI
+  # boot-ordering drop-in (iscsi.5) — a drop-in beside the vendor unit, never an
+  # edit of it — and the daemon-reload below is what makes it take effect.
   info "installing systemd units"
   install_units
+  info "installed iSCSI ordering drop-in -> ${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}"
   systemctl daemon-reload
   UNITS_INSTALLED=1
   systemctl enable anasd anas >/dev/null 2>&1

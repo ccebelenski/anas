@@ -109,7 +109,8 @@ ANAS treats your system as the source of truth and itself as a **guest**:
   flag gates)
 - ZFS ≥ 2.2 (ANAS uses `zpool`'s JSON output)
 - `mdadm` + `btrfs-progs` for Hybrid RAID, `samba` for SMB shares and share
-  users, `nfs-kernel-server` for NFS exports, `acl` for permissions — the
+  users, `nfs-kernel-server` for NFS exports, `acl` for permissions,
+  `targetcli-fb` + `python3-rtslib-fb` for serving iSCSI block storage — the
   installer adds all of them, on fresh installs and upgrades alike (PVE ships
   none of them, and ANAS never gates a feature on its tools being absent)
 

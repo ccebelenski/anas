@@ -19,7 +19,7 @@ import { PoolState, VdevRole, VdevState, VdevType } from './zfs.js'
 /** A problem surfaced prominently on the dashboard (2.5). */
 export const DashboardWarning = z.object({
   level: z.enum(['warning', 'critical']),
-  category: z.enum(['pool', 'disk', 'scrub', 'share', 'capacity', 'replication', 'mount', 'backup', 'ahr', 'schedule']),
+  category: z.enum(['pool', 'disk', 'scrub', 'share', 'capacity', 'replication', 'mount', 'backup', 'ahr', 'schedule', 'iscsi']),
   message: z.string(),
   /** Optional target name (pool/disk/share) the UI can deep-link to. */
   ref: z.string().optional(),

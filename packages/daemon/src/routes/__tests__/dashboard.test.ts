@@ -8,6 +8,7 @@ import { afterEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
+import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
@@ -453,5 +454,84 @@ describe('GET /v1/status — ahrPools briefs (story 11.13, AHR-DESIGN §10 revis
 
     // A healthy pool still cards NOTHING (warnings stay failure-only, 11.10).
     assert.equal(summary.warnings.filter(w => w.category === 'ahr').length, 0)
+  })
+})
+
+describe('GET /v1/status — iSCSI warnings (story iscsi.5)', () => {
+  const iscsiFixtures = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/iscsi')
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    delete process.env.ANAS_ISCSI_CONFIGFS
+    delete process.env.ANAS_ISCSI_SAVECONFIG
+    delete process.env.ANAS_ISCSI_SYS_BLOCK
+    delete process.env.ANAS_STORAGE_CFG
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true })
+      dir = undefined
+    }
+  })
+
+  async function status(): Promise<StatusSummary> {
+    const res = await server!.inject({ method: 'GET', url: '/v1/status', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    return (res.json() as { data: StatusSummary }).data
+  }
+
+  /** Point the daemon's injectable iSCSI paths at a materialised fixture tree. */
+  async function serveIscsi(manifest: string | null, saveconfig: string | null): Promise<void> {
+    dir = mkdtempSync(join(tmpdir(), 'anas-dash-iscsi-'))
+    if (manifest) {
+      const root = join(dir, 'target')
+      await materializeConfigfsManifest(readFileSync(join(iscsiFixtures, manifest), 'utf-8'), root)
+      process.env.ANAS_ISCSI_CONFIGFS = root
+    }
+    else {
+      process.env.ANAS_ISCSI_CONFIGFS = join(dir, 'absent-configfs')
+    }
+    process.env.ANAS_ISCSI_SAVECONFIG = saveconfig
+      ? join(iscsiFixtures, saveconfig)
+      : join(dir, 'absent-saveconfig.json')
+    process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
+    mkdirSync(join(dir, 'block', 'zd16'), { recursive: true })
+    writeFileSync(join(dir, 'block', 'zd16', 'size'), '4194304\n')
+    process.env.ANAS_ISCSI_SYS_BLOCK = join(dir, 'block')
+    server = createServer({ mock: true, logger: false })
+  }
+
+  it('a node with no LIO at all cards NOTHING', async () => {
+    await serveIscsi(null, null)
+    const summary = await status()
+    assert.equal(summary.warnings.filter(w => w.category === 'iscsi').length, 0)
+  })
+
+  it('a healthy LIO configuration cards NOTHING', async () => {
+    await serveIscsi('configfs-live.manifest', 'saveconfig-final.json')
+    const summary = await status()
+    assert.equal(summary.warnings.filter(w => w.category === 'iscsi').length, 0)
+  })
+
+  it('the restore hole reaches the aggregate as `iscsi` cards', async () => {
+    // The whole point of the category: systemd reported this boot a SUCCESS.
+    await serveIscsi('configfs-restore-hole.manifest', 'saveconfig-final.json')
+    const summary = await status()
+    const iscsi = summary.warnings.filter(w => w.category === 'iscsi')
+    assert.equal(iscsi.length, 2)
+    assert.ok(iscsi.some(w => /LUN 0 'gtiscsi_vol1'/.test(w.message) && w.level === 'warning'))
+    assert.ok(iscsi.some(w => /mutations are refused/.test(w.message) && w.level === 'critical'))
+    // Target-first: the per-LUN card deep-links to its target.
+    assert.ok(iscsi.some(w => w.ref === 'iqn.2026-08.dev.anas.gtiscsi:target1'))
+  })
+
+  it('a target that restored with zero LUNs cards as critical', async () => {
+    await serveIscsi('configfs-restore-empty.manifest', 'saveconfig-final.json')
+    const summary = await status()
+    const serving = summary.warnings.filter(w => w.category === 'iscsi' && /restored with none of its/.test(w.message))
+    assert.equal(serving.length, 1)
+    assert.equal(serving[0].level, 'critical')
+    assert.match(serving[0].message, /accepting logins with no disks behind it/)
   })
 })
