@@ -14,6 +14,7 @@ import {
   deriveRunResult,
   deriveTaskStatus,
   deriveTriggerSource,
+  DISABLED_HISTORY_NOTE,
   effectiveSchedule,
   failureDetailFromJournal,
   gateRun,
@@ -418,6 +419,89 @@ describe('backup units — LOCAL-ONLY status derivation', () => {
   it('lastRunAt derives from ExecMainExitTimestamp', async () => {
     const st = await deriveTaskStatus(statusMock({ exitTs: 'Sun 2026-07-19 02:00:12 UTC' }), makeTask())
     assert.equal(st.lastRunAt, '2026-07-19T02:00:12.000Z')
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  The DISABLED hole (live-proof F9). systemd unloads an inactive unit nothing
+//  references, and a disabled task has no timer to reference its service — so
+//  its run history is garbage-collected and `systemctl show` answers from
+//  property DEFAULTS. Measured on the node, after a real, journal-attested,
+//  SUCCESSFUL run of a task saved with `enabled: false`:
+//
+//    $ systemctl show anas-backup-lp-ahr.service \
+//        -p Result -p ExecMainExitTimestamp -p InactiveEnterTimestamp
+//    Result=success
+//    ExecMainExitTimestamp=
+//    InactiveEnterTimestamp=
+//
+//  Composed with "no result reads as success", that reported success/never
+//  regardless of what happened — including after a failure.
+// ---------------------------------------------------------------------------
+describe('backup units — a DISABLED task has no run history to report (F9)', () => {
+  /** The exact `systemctl show` shape of a garbage-collected unit. */
+  const COLLECTED = {
+    ActiveState: 'inactive',
+    Result: 'success',
+    ExecMainStatus: '0',
+    ExecMainExitTimestamp: '',
+    InactiveEnterTimestamp: '',
+  }
+
+  it('the collected shape reads `disabled`, never a fabricated success', () => {
+    assert.equal(deriveRunResult(COLLECTED, { enabled: false }), 'disabled')
+    // `Result=success` is a DEFAULT here, not an outcome: the same shape after a
+    // FAILED run is identical, which is exactly why it cannot be trusted.
+    assert.equal(deriveRunResult({ ...COLLECTED, Result: '' }, { enabled: false }), 'disabled')
+  })
+
+  it('an ENABLED task is untouched — the unit is referenced, so it keeps its history', () => {
+    assert.equal(deriveRunResult(COLLECTED, { enabled: true }), 'success')
+    // …and so is a caller that does not say (an old call site).
+    assert.equal(deriveRunResult(COLLECTED), 'success')
+  })
+
+  it('a disabled task that is RUNNING right now says so — Run Now goes through the unit', () => {
+    assert.equal(
+      deriveRunResult({ ...COLLECTED, ActiveState: 'activating' }, { enabled: false }),
+      'running',
+    )
+  })
+
+  it('a disabled task whose unit is still LOADED keeps its real result, skip code included', () => {
+    const loaded = { ...COLLECTED, ExecMainExitTimestamp: 'Sun 2026-07-19 02:00:12 UTC' }
+    assert.equal(deriveRunResult(loaded, { enabled: false }), 'success')
+    assert.equal(
+      deriveRunResult({ ...loaded, ExecMainStatus: String(BACKUP_SKIP_EXIT_CODE) }, { enabled: false }),
+      'skipped',
+    )
+    assert.equal(
+      deriveRunResult({ ...loaded, ActiveState: 'failed', Result: 'exit-code' }, { enabled: false }),
+      'failure',
+    )
+  })
+
+  it('deriveTaskStatus reports disabled / never, not success / never', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['show', serviceUnitName('nightly-etc'), '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'],
+      result: { stdout: 'ActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=\nInactiveEnterTimestamp=\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['show', timerUnitName('nightly-etc'), '-p', 'NextElapseUSecRealtime'],
+      result: { stdout: 'NextElapseUSecRealtime=n/a\n', stderr: '', exitCode: 0 },
+    })
+    const st = await deriveTaskStatus(mock, makeTask({ enabled: false }))
+    assert.equal(st.lastRunResult, 'disabled')
+    assert.equal(st.lastRunAt, null)
+    assert.equal(st.nextRunAt, null)
+    assert.equal(st.overdue, false)
+  })
+
+  it('the caveat is one sentence, stated once, shared by all three stores', () => {
+    assert.equal(DISABLED_HISTORY_NOTE, 'run history is not retained while a task is disabled')
   })
 })
 

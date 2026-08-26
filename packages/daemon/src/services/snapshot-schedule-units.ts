@@ -3,7 +3,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { SnapshotSchedule as SnapshotScheduleSchema } from '@anas/shared'
-import { deriveRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
+import { deriveRunResult, DISABLED_HISTORY_NOTE, parseShow, parseSystemdTimestamp } from './systemd-status.js'
 
 /**
  * Snapshot SCHEDULES (Epic 17.3/17.4/17.5) — the systemd units ARE the store,
@@ -265,7 +265,10 @@ function computeStatus(
   serviceProps: Record<string, string>,
   nextRaw: string | undefined,
 ): { status: SnapshotScheduleStatus, lastRunExitCode: number | null } {
-  const lastRunResult = deriveRunResult(serviceProps)
+  // `enabled` is passed to the shared map so a DISABLED schedule whose run
+  // history systemd garbage-collected reads `disabled`, not the default-valued
+  // `Result=success` (live-proof F9 — same hole, same fix, all three stores).
+  const lastRunResult = deriveRunResult(serviceProps, { enabled: schedule.enabled })
   const lastRunAt = parseSystemdTimestamp(serviceProps.ExecMainExitTimestamp)
     ?? parseSystemdTimestamp(serviceProps.InactiveEnterTimestamp)
   const nextRunAt = parseSystemdTimestamp(nextRaw)
@@ -336,6 +339,10 @@ export async function deriveScheduleDetail(
     unit: units.unit,
     timer: units.timer,
     ...(journal ? { journal } : {}),
+    // F9 — say WHY there is no result to show, on the one screen that has room
+    // for the sentence. The journald tail below it is the only history a
+    // disabled schedule has left, and it is already labelled recent-only.
+    ...(status.lastRunResult === 'disabled' ? { statusNote: DISABLED_HISTORY_NOTE } : {}),
   }
 }
 

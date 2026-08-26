@@ -3,6 +3,16 @@ export interface ExecResult {
   stdout: string
   stderr: string
   exitCode: number
+  /**
+   * The POSIX signal name that killed the child (`SIGKILL`), when one did.
+   * A signal death has NO exit code, so `exitCode` reports a plain 1 and the
+   * only honest record of what happened is here. Optional and additive: absent
+   * means the process exited normally (or the executor could not tell).
+   *
+   * It exists because a killed `proxmox-backup-client` says nothing on stderr
+   * but progress, and a progress line is not a reason (live-proof F16).
+   */
+  signal?: string
 }
 
 /**

@@ -267,11 +267,17 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
       active?: string
       result?: string
       nextUsec?: string
+      /** Empty = systemd retains no run history for this unit (the F9 shape). */
+      exitStamp?: string
     }): MockExecutor {
       const mock = new MockExecutor()
       mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('testpool/media'), result: { stdout: opts.source ? snapshotListJson('testpool/media', opts.source) : '', stderr: '', exitCode: 0 } })
       mock.addFixture({ command: ZFS, args: zfsSnapshotDetailArgs('backup/media'), result: { stdout: opts.target ? snapshotListJson('backup/media', opts.target) : '', stderr: '', exitCode: 0 } })
-      mock.addFixture({ command: SYSTEMCTL, args: ['show', serviceUnitName('nightly-media'), '-p', 'ActiveState,Result,ExecMainStatus'], result: { stdout: `ActiveState=${opts.active ?? 'inactive'}\nResult=${opts.result ?? 'success'}\nExecMainStatus=0\n`, stderr: '', exitCode: 0 } })
+      // The timestamps are part of the argv since backup2.8: they are what
+      // separates "systemd still holds this unit's history" from "systemd
+      // unloaded it and is answering from defaults" (live-proof F9).
+      const exitStamp = opts.exitStamp ?? 'Wed 2026-07-15 03:00:12 UTC'
+      mock.addFixture({ command: SYSTEMCTL, args: ['show', serviceUnitName('nightly-media'), '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'], result: { stdout: `ActiveState=${opts.active ?? 'inactive'}\nResult=${opts.result ?? 'success'}\nExecMainStatus=0\nExecMainExitTimestamp=${exitStamp}\nInactiveEnterTimestamp=${exitStamp}\n`, stderr: '', exitCode: 0 } })
       mock.addFixture({ command: SYSTEMCTL, args: ['show', timerUnitName('nightly-media'), '-p', 'NextElapseUSecRealtime'], result: { stdout: `NextElapseUSecRealtime=${opts.nextUsec ?? '0'}\n`, stderr: '', exitCode: 0 } })
       return mock
     }
@@ -287,6 +293,18 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
       assert.equal(st.snapshotsBehind, 0)
       assert.equal(st.lastRunResult, 'success')
       assert.notEqual(st.lastReplicatedAt, null)
+    })
+
+    it('a DISABLED task whose history systemd collected reads `disabled` (F9)', async () => {
+      // Same hole, same shared map: an inactive unit nothing references is
+      // unloaded, and `systemctl show` answers from defaults (`Result=success`,
+      // empty timestamps) — a success that never happened.
+      const mock = statusMock({ result: 'success', exitStamp: '' })
+      const st = await deriveTaskStatus(mock, makeTask({ enabled: false }))
+      assert.equal(st.lastRunResult, 'disabled')
+      // ZFS is still the authority for what actually replicated — untouched.
+      const enabled = await deriveTaskStatus(statusMock({ result: 'success', exitStamp: '' }), makeTask())
+      assert.equal(enabled.lastRunResult, 'success')
     })
 
     it('behind: target has the older snapshot only → 1 behind', async () => {

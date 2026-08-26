@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { LenientReplicationTask as LenientReplicationTaskSchema, ReplicationTask as ReplicationTaskSchema } from '@anas/shared'
 import { parseSnapshotList, zfsSnapshotDetailArgs } from '../parsers/zfs-list.js'
 import { isTransientBackupSnapshot } from './snapshot-naming.js'
+import { deriveRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
 
 /**
  * Recurring replication TASKS (Epic 5.5.3) — the systemd units ARE the store.
@@ -37,9 +38,6 @@ const TASK_MARKER = 'X-ANAS-Task='
 const TASK_MARKER_RE = /^#?\s*X-ANAS-Task=(.*)$/
 const WHITESPACE_RE = /\s/
 const DQUOTE_RE = /"/g
-const NA_RE = /^n\/a$/i
-const INFINITY_RE = /infinity/i
-const LEADING_WEEKDAY_RE = /^[A-Z][a-z]{2}\s+/
 
 /** Default systemd unit directory; overridable (env/dep) for tests. */
 export const DEFAULT_SYSTEMD_DIR = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd/system'
@@ -347,51 +345,34 @@ async function listSnapshots(executor: CommandExecutor, fullDataset: string): Pr
   }
 }
 
-/** Parse `systemctl show` `key=value` lines into a map. */
-function parseShow(stdout: string): Record<string, string> {
-  const props: Record<string, string> = {}
-  for (const line of stdout.split('\n')) {
-    const eq = line.indexOf('=')
-    if (eq > 0)
-      props[line.slice(0, eq)] = line.slice(eq + 1)
-  }
-  return props
-}
-
 /**
- * Map a service's systemd state to a run result. A oneshot is 'activating' (or
- * 'active') while running; after it exits, Result carries the outcome
- * ('success' vs anything else) and ActiveState becomes 'failed' on failure.
+ * `systemctl show <service>` → run result.
+ *
+ * The `key=value` parse, systemd's two timestamp forms and the oneshot
+ * ActiveState/Result map all live in `systemd-status.ts` — ONE implementation
+ * shared with backup and snapshot schedules (single-source-of-truth). This
+ * module used to carry byte-identical private copies, which is exactly how the
+ * disabled-task hole below could have been fixed in two places and missed here.
+ *
+ * The timestamps are requested because they are what distinguishes "systemd
+ * still holds this unit's history" from "systemd unloaded it and is answering
+ * from property defaults" — the DISABLED case (live-proof F9).
  */
-function deriveRunResult(props: Record<string, string>): ReplicationTaskStatus['lastRunResult'] {
-  const active = props.ActiveState
-  if (active === 'activating' || active === 'active' || active === 'reloading')
-    return 'running'
-  if (active === 'failed')
-    return 'failure'
-  const result = props.Result
-  if (result === 'success')
-    return 'success'
-  if (result && result.length > 0)
-    return 'failure'
-  return 'unknown'
-}
-
-/** `systemctl show <service> -p ActiveState,Result,ExecMainStatus` → run result. */
 async function serviceRunResult(
   executor: CommandExecutor,
   name: string,
+  enabled: boolean,
 ): Promise<ReplicationTaskStatus['lastRunResult']> {
   try {
     const r = await executor.exec(SYSTEMCTL, [
       'show',
       serviceUnitName(name),
       '-p',
-      'ActiveState,Result,ExecMainStatus',
+      'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp',
     ])
     if (r.exitCode !== 0 && !r.stdout.trim())
       return 'unknown'
-    return deriveRunResult(parseShow(r.stdout))
+    return deriveRunResult(parseShow(r.stdout), { enabled })
   }
   catch {
     return 'unknown'
@@ -404,23 +385,11 @@ async function timerNextRun(executor: CommandExecutor, name: string): Promise<st
     const r = await executor.exec(SYSTEMCTL, ['show', timerUnitName(name), '-p', 'NextElapseUSecRealtime'])
     if (r.exitCode !== 0 && !r.stdout.trim())
       return null
-    const raw = parseShow(r.stdout).NextElapseUSecRealtime
-    if (!raw || raw === '0' || NA_RE.test(raw) || INFINITY_RE.test(raw))
-      return null
     // Despite the property's name, `systemctl show` prints a HUMAN date string
     // ("Fri 2026-07-17 00:00:00 UTC"), not microseconds (verified live on
-    // PVE 9 / systemd 257). Handle both forms: numeric µs (older systemd /
-    // machine formats) and the day-name-prefixed date string.
-    const usec = Number(raw)
-    if (Number.isFinite(usec) && usec > 0) {
-      const d = new Date(Math.floor(usec / 1000))
-      return Number.isNaN(d.getTime()) ? null : d.toISOString()
-    }
-    // Strip a leading weekday name ("Fri ") — Date.parse dislikes it combined
-    // with the "UTC" suffix on some engines; the rest parses cleanly.
-    const cleaned = raw.replace(LEADING_WEEKDAY_RE, '')
-    const parsed = Date.parse(cleaned)
-    return Number.isNaN(parsed) ? null : new Date(parsed).toISOString()
+    // PVE 9 / systemd 257). The shared parser handles both forms and systemd's
+    // n/a / infinity sentinels.
+    return parseSystemdTimestamp(parseShow(r.stdout).NextElapseUSecRealtime)
   }
   catch {
     return null
@@ -491,7 +460,7 @@ export async function deriveTaskStatus(
   }
 
   const [lastRunResult, nextRunAt] = await Promise.all([
-    serviceRunResult(executor, task.name),
+    serviceRunResult(executor, task.name, task.enabled),
     timerNextRun(executor, task.name),
   ])
 

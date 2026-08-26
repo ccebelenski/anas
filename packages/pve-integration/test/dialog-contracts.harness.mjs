@@ -702,6 +702,25 @@ async function backupChecks() {
   ok('backup: the row carries the raw task', rec && rec.get('raw') && rec.get('raw').name === TASK.name)
   ok('backup: selecting a row enables Edit', grid.down('#backupEdit').disabled === false)
 
+  // --- 0b. A DISABLED task has no run result to show (live-proof F9) --------
+  // systemd unloads a disabled unit nothing references and answers from
+  // property defaults (`Result=success`, empty timestamps), so the grid read
+  // "success / never" no matter what had happened — including after a failure.
+  const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
+  ok('backup: the grid has a Last run column', !!lastRunCol)
+  const disabledRec = {
+    get: (k) => ({ lastRunResult: 'disabled', lastRunAt: null, overdue: false }[k]),
+  }
+  const disabledCell = lastRunCol.renderer('disabled', {}, disabledRec)
+  ok('backup: a disabled task reads "disabled", never a fabricated success',
+    /disabled/.test(disabledCell) && !/success/.test(disabledCell), disabledCell)
+  ok('backup: and it explains that systemd keeps no history for one',
+    /run history|does not keep the run history/i.test(disabledCell), disabledCell)
+  const successCell = lastRunCol.renderer('success', {}, {
+    get: (k) => ({ lastRunResult: 'success', lastRunAt: null, overdue: false }[k]),
+  })
+  ok('backup: an enabled task still reads success', /success/.test(successCell), successCell)
+
   // --- 1. Edit → Save ---
   jobs.length = 0
   const editBtn = grid.down('#backupEdit')
@@ -2638,8 +2657,11 @@ const ARCHIVE_TREE = {
     path: '/',
     entries: [
       { name: 'docs', path: '/docs', type: 'dir' },
-      { name: 'alpha.txt', path: '/alpha.txt', type: 'file', size: 23, modified: '2026-08-25 19:16:23' },
-      { name: 'hard-a.txt', path: '/hard-a.txt', type: 'file', size: 17, modified: '2026-08-25 19:16:23' },
+      // F11 — the daemon marks every archive mtime as the NODE's local time:
+      // `catalog shell` renders `Modify:` in the READING process's timezone and
+      // prints no offset at all, so a UI that assumed UTC was wrong by it.
+      { name: 'alpha.txt', path: '/alpha.txt', type: 'file', size: 23, modified: '2026-08-25 19:16:23', mtimeZone: 'node-local' },
+      { name: 'hard-a.txt', path: '/hard-a.txt', type: 'file', size: 17, modified: '2026-08-25 19:16:23', mtimeZone: 'node-local' },
       { name: 'hard-b.txt', path: '/hard-b.txt', type: 'hardlink', target: 'hard-a.txt' },
       { name: 'link-to-alpha', path: '/link-to-alpha', type: 'symlink', target: 'alpha.txt' },
     ],
@@ -2819,6 +2841,10 @@ async function pickerChecks() {
   eq('picker: a hardlink row carries its group primary', archRows[3].target, 'hard-a.txt')
   eq('picker: sizes and mtimes are carried through verbatim',
     [archRows[1].size, archRows[1].modified], [23, '2026-08-25 19:16:23'])
+  // F11 — the row carries the daemon's marker so the column can LABEL the time
+  // instead of a reader assuming UTC. Nothing is converted.
+  eq('picker: an archive mtime is marked as the node’s local time', archRows[1].mtimeZone, 'node-local')
+  eq('picker: a row with no mtime carries no marker either', archRows[0].mtimeZone, undefined)
 
   // --- the archive backend surfaces a verdict as a failure ----------------
   const archBackend = P.makeBackend({
@@ -2954,6 +2980,23 @@ async function pickerChecks() {
   eq('picker: the archive root listed its entries',
     mroot.childNodes.map(n => n.get('name')),
     ['docs', 'alpha.txt', 'hard-a.txt', 'hard-b.txt', 'link-to-alpha'])
+  // F11 — the Modified column LABELS a node-local time rather than leaving a
+  // reader to assume UTC: a header tooltip, and the words on the marked cell.
+  const modCol = (mtree.columns || []).find(c => c.dataIndex === 'modified')
+  ok('picker: the Modified column has a node-local-time tooltip',
+    !!modCol && /node local time/i.test(modCol.tooltip || ''), modCol && modCol.tooltip)
+  ok('picker: it says the time is not UTC and not converted',
+    !!modCol && /not UTC/.test(modCol.tooltip || ''), modCol && modCol.tooltip)
+  const alphaCell = modCol.renderer('2026-08-25 19:16:23', {}, mroot.childNodes[1]);
+  ok('picker: a marked cell carries the verbatim time', /2026-08-25 19:16:23/.test(alphaCell), alphaCell)
+  ok('picker: and says node local time on the cell', /node local time/.test(alphaCell), alphaCell)
+  // The tooltip is allowed to SAY "not UTC"; what is displayed must not be a
+  // converted time or wear a zone suffix of its own.
+  const alphaShown = alphaCell.replace(/data-qtip="[^"]*"/g, '');
+  ok('picker: nothing converts it or claims UTC', !/UTC|GMT|\+\d\d:\d\d/.test(alphaShown), alphaShown)
+  eq('picker: an entry with no mtime renders nothing at all',
+    modCol.renderer('', {}, mroot.childNodes[0]), '')
+
   // Pick the hardlink and an ordinary file.
   mtree._selection = [mroot.childNodes[3], mroot.childNodes[1]]
   mtree.fireEvent('selectionchange', {}, mtree._selection)

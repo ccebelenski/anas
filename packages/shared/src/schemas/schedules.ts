@@ -190,8 +190,13 @@ export type RetentionPlan = z.infer<typeof RetentionPlan>
  * A schedule's last-run outcome, mapped from the oneshot service's systemd
  * state. Mirrors the replication/backup task run-result vocabulary so the
  * Schedules grid reads identically to those views.
+ *
+ * `disabled` is the ABSENCE of a result: systemd garbage-collects the run
+ * history of a disabled unit nothing references, so `systemctl show` answers
+ * from defaults and a real outcome cannot be read at all (live-proof F9).
+ * Additive — the field stays required and every earlier value still parses.
  */
-export const ScheduleRunResult = z.enum(['success', 'failure', 'running', 'unknown'])
+export const ScheduleRunResult = z.enum(['success', 'failure', 'running', 'unknown', 'disabled'])
 export type ScheduleRunResult = z.infer<typeof ScheduleRunResult>
 
 /**
@@ -231,6 +236,13 @@ export const SnapshotScheduleDetail = z.object({
   timer: z.string(),
   /** Recent runs' raw journald output (may be empty; older history not retained). */
   journal: z.string().optional(),
+  /**
+   * One line explaining a status the systemd store cannot answer — today only
+   * the disabled case (`lastRunResult: 'disabled'`), where the unit's run
+   * history has been garbage-collected. Absent when there is nothing to explain.
+   * Same field, same wording as {@link BackupTaskDetail} (parallel construction).
+   */
+  statusNote: z.string().optional(),
 })
 export type SnapshotScheduleDetail = z.infer<typeof SnapshotScheduleDetail>
 

@@ -111,10 +111,68 @@ const ENOSPC_RE = /ENOSPC|No space left on device/i
 const BROKEN_PIPE_RE = /broken pipe|connection closed|HTTP\/2\.0 connection failed/i
 
 /**
- * Exit codes a KILLED client leaves (GT-60: `SIGTERM` behaves like `kill -9` —
- * exit 143 / 137, no cleanup, no marker).
+ * Exit codes a KILLED client leaves, mapped to the SIGNAL each one encodes
+ * (GT-60: `SIGTERM` behaves like `kill -9` — exit 143 / 137, no cleanup, no
+ * marker). A shell reports a signal death as 128+N; the daemon's executor does
+ * NOT (a signal has no exit code, so `exec` reports a plain 1 and carries the
+ * signal NAME separately). Both routes have to be readable here, because the
+ * captures were taken through a shell and the running system goes through the
+ * executor. `timeout`'s own 124 is NOT in here — it is the guard's exit, not
+ * the client's, and it gets its own wording.
  */
-const SIGNAL_EXITS = new Set([124, 130, 137, 143])
+const SIGNAL_EXITS = new Map<number, number>([[130, 2], [137, 9], [143, 15]])
+/** `timeout` exits 124 when it had to kill the child it was guarding. */
+const TIMEOUT_GUARD_EXIT = 124
+
+/** POSIX numbers for the signals a killed client can actually arrive with. */
+const SIGNAL_NUMBERS: Record<string, number> = {
+  SIGHUP: 1,
+  SIGINT: 2,
+  SIGQUIT: 3,
+  SIGABRT: 6,
+  SIGKILL: 9,
+  SIGPIPE: 13,
+  SIGALRM: 14,
+  SIGTERM: 15,
+}
+
+/**
+ * How the client's process ENDED, in one clause — `killed (signal 9)` or
+ * `exit 1`. This is what the partial marker's `reason:` falls back to when the
+ * client left no error of its own (live-proof F16); it is never a progress line
+ * and never invents a cause.
+ */
+export function describeAbnormalExit(exitCode: number, signal?: string): string {
+  if (signal) {
+    const named = SIGNAL_NUMBERS[signal]
+    return named === undefined ? `killed (${signal})` : `killed (signal ${named})`
+  }
+  if (exitCode === TIMEOUT_GUARD_EXIT)
+    return 'exit 124 (the timeout guard killed it)'
+  const fromCode = SIGNAL_EXITS.get(exitCode)
+  if (fromCode !== undefined)
+    return `killed (signal ${fromCode})`
+  return `exit ${exitCode}`
+}
+
+/**
+ * Is this line one of the client's PROGRESS lines (or its completion line)?
+ * They are the last thing on stderr when a client is killed, and they are not a
+ * reason for anything — the whole point of F16.
+ */
+export function isRestoreProgressLine(line: string): boolean {
+  const trimmed = line.replace(TRAILING_WS_RE, '')
+  return PROGRESS_RE.test(trimmed) || COMPLETE_RE.test(trimmed)
+}
+
+/**
+ * Did the client say anything that could serve as a reason? An `Error:` line, or
+ * any non-progress line (`HTTP/2.0 connection failed` is one). Progress alone is
+ * silence.
+ */
+export function hasRestoreErrorText(stderr: string): boolean {
+  return restoreLines(stderr).some(l => l.trim().length > 0 && !isRestoreProgressLine(l))
+}
 
 /** Split pbc output on BOTH `\r` and `\n` — a progress line is CR-terminated. */
 export function restoreLines(stderr: string): string[] {
@@ -234,10 +292,16 @@ export function progressSummaryLine(parsed: ParsedRestoreProgress): string {
 export function classifyRestoreFailure(
   exitCode: number,
   stderr: string,
+  signal?: string,
 ): { detail: string, interrupted: boolean } {
-  if (SIGNAL_EXITS.has(exitCode) && !stderr.includes('Error:')) {
+  // The client said NOTHING usable — a kill leaves only progress lines behind,
+  // and a progress line is not a reason (live-proof F16). Name how the process
+  // ended instead; that is the only fact there is. Checked first because every
+  // branch below reads stderr for a cause that is not in there.
+  if (!hasRestoreErrorText(stderr)) {
     return {
-      detail: `The restore was interrupted (the client exited ${exitCode}) - what it had already written is still there.`,
+      detail: `The restore was interrupted - the client ended with ${describeAbnormalExit(exitCode, signal)} `
+        + `and reported no error of its own; what it had already written is still there.`,
       interrupted: true,
     }
   }
@@ -284,10 +348,42 @@ export function classifyRestoreFailure(
   return { detail: shared.detail, interrupted: false }
 }
 
-/** The client-safe `Error:` line (pbc's stderr never carries the secret). */
+/**
+ * The `reason:` line of the `.anas-restore-partial` marker (live-proof F16).
+ *
+ * The client's own ERROR line when it left one — else, when its whole stderr is
+ * progress, how the process ENDED (`killed (signal 9)` / `exit 1`). NEVER a
+ * progress line: a killed pbc's last words are `progress 22% (…)`, and writing
+ * that into `reason:` reads as though the progress WAS the reason. The last
+ * progress line has its own field in the marker, right below this one.
+ */
+export function partialMarkerReason(exitCode: number, stderr: string, signal?: string): string {
+  const lines = restoreLines(stderr).map(l => l.trim()).filter(Boolean)
+  // Two steps on an array we own — `toReversed()` is not in this package's TS
+  // lib target (the same note as `backup-snapshots.ts`).
+  const newestFirst = [...lines]
+  newestFirst.reverse()
+  const said = lines.find(l => l.startsWith('Error:'))
+    ?? newestFirst.find(l => !isRestoreProgressLine(l))
+  return said ?? describeAbnormalExit(exitCode, signal)
+}
+
+/**
+ * The client-safe `Error:` line (pbc's stderr never carries the secret).
+ *
+ * The fallback skips PROGRESS lines: pbc's last words before a kill are
+ * `progress 22% (…)`, and quoting that as the failure reads as though the
+ * progress WAS the reason (live-proof F16). When there is nothing but progress
+ * there is nothing to quote, and the caller says so instead.
+ */
 export function firstRestoreError(stderr: string): string {
   const lines = restoreLines(stderr).map(l => l.trim()).filter(Boolean)
-  return lines.find(l => l.startsWith('Error:')) ?? lines.at(-1) ?? 'restore failed'
+  const error = lines.find(l => l.startsWith('Error:'))
+  if (error)
+    return error
+  const newestFirst = [...lines]
+  newestFirst.reverse()
+  return newestFirst.find(l => !isRestoreProgressLine(l)) ?? 'restore failed'
 }
 
 // --- argv --------------------------------------------------------------------
@@ -609,7 +705,7 @@ export async function runFileRestore(
     ...(deps.rate ? { rate: deps.rate } : {}),
   })
 
-  let r: { exitCode: number, stderr: string }
+  let r: { exitCode: number, stderr: string, signal?: string }
   try {
     r = await executor.exec(PBC, args, { env: buildBackupEnv(deps.repo, deps.secret) })
   }
@@ -640,14 +736,15 @@ export async function runFileRestore(
   }
 
   if (r.exitCode !== 0) {
-    const { detail } = classifyRestoreFailure(r.exitCode, r.stderr)
+    const { detail } = classifyRestoreFailure(r.exitCode, r.stderr, r.signal)
     const partialText = [
       'ANAS restore did not finish.',
       `snapshot: ${deps.snapshot}`,
       `archive: ${deps.archive}`,
       `target: ${deps.target}`,
       `selections: ${deps.selections.length}`,
-      `reason: ${detail}`,
+      `reason: ${partialMarkerReason(r.exitCode, r.stderr, r.signal)}`,
+      `detail: ${detail}`,
       `last progress: ${progressSummaryLine(parsed)}`,
       'The Proxmox backup client leaves no marker of its own; this file is written by ANAS.',
       'An in-flight file is short AND mode 0600 - that is the only hint the client leaves.',

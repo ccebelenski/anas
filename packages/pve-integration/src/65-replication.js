@@ -271,6 +271,10 @@
             + 'color:#fff;background:' + color + ';">' + enc(label) + '</span>';
     }
 
+    // The one sentence a `disabled` result carries — same words as the backup
+    // and snapshot grids; one hole, one explanation (F9).
+    var DISABLED_RESULT_TIP = 'Disabled — systemd does not keep the run history of a task whose timer is off, so there is no last result to show. The recent journald output on the detail is the only record left.';
+
     // Last run: a result pill + the relative time of the last replicated snapshot.
     function renderLastRun(v, meta, rec) {
         var result = '' + (rec.get('lastRunResult') || 'unknown');
@@ -286,6 +290,14 @@
                 + 'color:#fff;background:var(--anas-accent,#3468c0);">'
                 + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
                 + enc(t('running')) + '</span>';
+        } else if (result === 'disabled') {
+            // Live-proof F9 — a disabled task's unit is unreferenced, so systemd
+            // collects its run history and `Result=success` is only a property
+            // default. ZFS still answers what actually replicated, beside this.
+            pill = '<span title="' + enc(t(DISABLED_RESULT_TIP)) + '"'
+                + ' style="display:inline-block;padding:0 8px;border-radius:9px;font-size:0.85em;'
+                + 'color:var(--anas-muted,gray);border:1px solid var(--anas-muted,gray);">'
+                + enc(t('disabled')) + '</span>';
         } else {
             pill = pillHtml(t('unknown'), 'var(--anas-muted,gray)', '');
         }

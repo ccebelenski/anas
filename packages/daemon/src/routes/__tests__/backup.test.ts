@@ -205,6 +205,53 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(data.journal, 'recent run output')
   })
 
+  it('a DISABLED task reports `disabled`, and the detail says why (live-proof F9)', async () => {
+    await createRepo()
+    await createTask()
+    // The exact shape systemd prints for a unit it has unloaded: `Result=success`
+    // (a property DEFAULT, not an outcome) with both timestamps empty. Measured
+    // on the node after a real, successful, journal-attested run of a disabled
+    // task — which then read "success / never" regardless of what happened.
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: '/usr/bin/systemctl',
+      args: ['show', 'anas-backup-nightly-etc.service', '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'],
+      result: { stdout: 'ActiveState=inactive\nResult=success\nExecMainStatus=0\nExecMainExitTimestamp=\nInactiveEnterTimestamp=\n', stderr: '', exitCode: 0 },
+    })
+    const off = await server.inject({
+      method: 'PUT',
+      url: '/v1/backup/tasks/nightly-etc',
+      headers: JSON_HEADERS,
+      payload: { ...TASK, enabled: false },
+    })
+    assert.equal(off.statusCode, 202)
+    assert.equal((await waitForJob(server, await jobIdFrom(off))).status, 'completed')
+
+    const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks/nightly-etc', headers: IDENTITY })
+    const { data } = res.json() as { data: BackupTaskDetail }
+    assert.equal(data.lastRunResult, 'disabled')
+    assert.equal(data.lastRunAt, null)
+    assert.equal(data.statusNote, 'run history is not retained while a task is disabled')
+    // The grid reads the same status from the list endpoint.
+    const list = await server.inject({ method: 'GET', url: '/v1/backup/tasks', headers: IDENTITY })
+    const entries = (list.json() as { data: BackupTaskEntry[] }).data
+    assert.equal(entries.find(e => e.task.name === 'nightly-etc')?.lastRunResult, 'disabled')
+
+    // An ENABLED task with the very same systemd answer is untouched: its unit
+    // is referenced by its timer, so the history is really there.
+    const on = await server.inject({
+      method: 'PUT',
+      url: '/v1/backup/tasks/nightly-etc',
+      headers: JSON_HEADERS,
+      payload: { ...TASK, enabled: true },
+    })
+    assert.equal((await waitForJob(server, await jobIdFrom(on))).status, 'completed')
+    const again = await server.inject({ method: 'GET', url: '/v1/backup/tasks/nightly-etc', headers: IDENTITY })
+    const back = (again.json() as { data: BackupTaskDetail }).data
+    assert.equal(back.lastRunResult, 'success')
+    assert.equal(back.statusNote, undefined)
+  })
+
   it('POST /run { direct:true } runs pbc IN the daemon (the unit\'s own exec) — never systemctl', async () => {
     await createRepo()
     await createTask()

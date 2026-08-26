@@ -498,8 +498,14 @@ export async function browseArchiveLevel(
     const entry: BackupBrowseEntry = { name, path, type: browseEntryType(stat) }
     if (stat.size !== undefined && Number.isFinite(stat.size))
       entry.size = stat.size
-    if (stat.modified)
+    if (stat.modified) {
       entry.modified = stat.modified
+      // F11 — `catalog shell` renders `Modify:` in the READING process's local
+      // timezone and prints no offset (GT amendment 20). The reading process is
+      // this daemon, so the string is the NODE's local time. Say so on the row
+      // rather than leaving the UI to assume UTC and be wrong by the offset.
+      entry.mtimeZone = 'node-local'
+    }
     if (stat.mode)
       entry.mode = stat.mode
     if (stat.target !== undefined)

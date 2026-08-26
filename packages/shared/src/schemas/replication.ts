@@ -197,8 +197,12 @@ export const ReplicationTaskStatus = z.object({
   lastReplicatedAt: ISODateTime.nullable(),
   /** Source snapshots newer than the last replicated one (lag). */
   snapshotsBehind: z.number().int().nonnegative().nullable(),
-  /** systemd: last trigger result ('success' | 'failure' | 'running' | 'unknown'). */
-  lastRunResult: z.enum(['success', 'failure', 'running', 'unknown']),
+  /**
+   * systemd: last trigger result. `disabled` is the ABSENCE of a result —
+   * systemd garbage-collects the run history of a disabled unit nothing
+   * references, so no real outcome can be read (live-proof F9). Additive.
+   */
+  lastRunResult: z.enum(['success', 'failure', 'running', 'unknown', 'disabled']),
   /** systemd timer: next scheduled trigger. */
   nextRunAt: ISODateTime.nullable(),
 })

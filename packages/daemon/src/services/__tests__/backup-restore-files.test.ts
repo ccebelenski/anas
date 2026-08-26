@@ -20,18 +20,23 @@ import {
   bareArchiveName,
   buildRestoreArgs,
   classifyRestoreFailure,
+  describeAbnormalExit,
   directoryHasEntries,
   estimateSpace,
   hardlinkPrimaryPath,
+  hasRestoreErrorText,
   isArchiveRootSelection,
+  isRestoreProgressLine,
   parentDirectory,
   parseHumanBytes,
   parseRestoreProgress,
   PARTIAL_MARKER_NAME,
+  partialMarkerReason,
   pathExists,
   progressSummaryLine,
   pveTerritoryReason,
   readSelectionFacts,
+  restoreLines,
   runFileRestore,
   targetPathFor,
   verifyRestored,
@@ -555,6 +560,94 @@ describe('backup2.6 — classifyRestoreFailure', () => {
 })
 
 // ============================================================================
+//  6b. The partial marker's `reason:` (live-proof F16)
+//
+//  A killed client says NOTHING — its stderr ends on a progress line, and the
+//  marker recorded that as the reason, which reads as though the progress WAS
+//  the reason. The captures are real: `restore-interrupted.txt` (K1 kill -9,
+//  wait status 137; K2 SIGTERM, 143; K3 the server dying mid-stream) and
+//  `restore-progress.txt` (a clean run's progress + completion lines).
+//
+//  Note the exit code the DAEMON sees is not the shell's 137: a signal death
+//  has no exit code, so the executor reports a plain 1 and carries the signal
+//  NAME separately. Both routes are covered.
+// ============================================================================
+
+describe('backup2.8 — the partial marker\'s reason is never a progress line (F16)', () => {
+  /** K1's real bytes: two progress lines, and that is ALL a SIGKILL leaves. */
+  const KILLED_STDERR = [
+    'progress 4% (12.409 MiB of 250.001 MiB in 5.9s, 2.091 MiB/s)    ',
+    'progress 17% (43.939 MiB of 250.001 MiB in 16.1s, 3.097 MiB/s)    ',
+    '',
+  ].join('\r')
+
+  it('a progress line is recognised as progress, in both captures', () => {
+    for (const line of restoreLines(KILLED_STDERR))
+      assert.equal(isRestoreProgressLine(line), true, line)
+    // The clean run's completion line is progress too — also not a reason.
+    assert.equal(
+      isRestoreProgressLine('restore complete (250.001 MiB processed in 1m 27.5s, average 2.857 MiB/s)'),
+      true,
+    )
+    assert.equal(isRestoreProgressLine('Error: error extracting archive'), false)
+    assert.equal(isRestoreProgressLine('HTTP/2.0 connection failed'), false)
+  })
+
+  it('K1 (kill -9): the reason is the SIGNAL, never the last progress line', () => {
+    // Through the executor: exit 1 + signal name.
+    assert.equal(partialMarkerReason(1, KILLED_STDERR, 'SIGKILL'), 'killed (signal 9)')
+    // Through a shell (the capture's own `wait status=137`): the code decodes.
+    assert.equal(partialMarkerReason(137, KILLED_STDERR), 'killed (signal 9)')
+    assert.doesNotMatch(partialMarkerReason(137, KILLED_STDERR), /progress/)
+  })
+
+  it('K2 (SIGTERM): same rule, signal 15', () => {
+    const stderr = 'progress 4% (12.409 MiB of 250.001 MiB in 5.9s, 2.09 MiB/s)    \r'
+    assert.equal(partialMarkerReason(1, stderr, 'SIGTERM'), 'killed (signal 15)')
+    assert.equal(partialMarkerReason(143, stderr), 'killed (signal 15)')
+  })
+
+  it('an ordinary non-zero exit with nothing to say reads `exit N`, not progress', () => {
+    assert.equal(partialMarkerReason(255, KILLED_STDERR), 'exit 255')
+    assert.equal(describeAbnormalExit(2), 'exit 2')
+    // 124 is the GUARD's exit, not a signal the client carried — named as such.
+    assert.equal(describeAbnormalExit(124), 'exit 124 (the timeout guard killed it)')
+  })
+
+  it('K3 (server died): the client DID say why, so its ERROR line is the reason', () => {
+    const k3 = fixture('restore-interrupted.txt')
+      .split('############ K3')[1]!
+      .split('############ K4')[0]!
+    const reason = partialMarkerReason(255, k3)
+    assert.match(reason, /^Error: /)
+    assert.match(reason, /broken pipe/)
+    assert.doesNotMatch(reason, /progress/)
+  })
+
+  it('the classifier says the client reported nothing, and names how it ended', () => {
+    const { detail, interrupted } = classifyRestoreFailure(1, KILLED_STDERR, 'SIGKILL')
+    assert.equal(interrupted, true)
+    assert.match(detail, /killed \(signal 9\)/)
+    assert.match(detail, /reported no error/)
+    assert.match(detail, /still there/)
+    assert.doesNotMatch(detail, /progress \d+%/)
+  })
+
+  it('a clean run\'s own output is entirely progress — nothing there is a reason', () => {
+    // The real P1 lines, with the capture harness's `[+ N ms] ` arrival stamps
+    // stripped, exactly as the progress parser sees them.
+    const p1 = fixture('restore-progress.txt').split('############ P2')[0]!
+    const stderr = restoreLines(p1)
+      .filter(l => l.startsWith('[+'))
+      .map(l => l.replace(/^\[\+\s*\d+ ms\] /, ''))
+      .join('\n')
+    assert.equal(restoreLines(stderr).length, 5, stderr)
+    assert.equal(hasRestoreErrorText(stderr), false)
+    assert.equal(partialMarkerReason(1, stderr, 'SIGKILL'), 'killed (signal 9)')
+  })
+})
+
+// ============================================================================
 //  7. Protected targets — PVE territory and live LUN backings
 // ============================================================================
 
@@ -847,11 +940,11 @@ describe('backup2.6 — local pre-flight probes', () => {
 describe('backup2.6 — runFileRestore', () => {
   /** A mock whose pbc call answers `pbc`, and whose probes answer `probe`. */
   function restoreMock(
-    pbc: { stdout?: string, stderr?: string, exitCode: number },
+    pbc: { stdout?: string, stderr?: string, exitCode: number, signal?: string },
     probes: { stdout?: string, stderr?: string, exitCode: number }[] = [],
   ): MockExecutor {
     const mock = new MockExecutor()
-    mock.addFixture({ command: PBC, result: { stdout: pbc.stdout ?? '', stderr: pbc.stderr ?? '', exitCode: pbc.exitCode } })
+    mock.addFixture({ command: PBC, result: { stdout: pbc.stdout ?? '', stderr: pbc.stderr ?? '', exitCode: pbc.exitCode, ...(pbc.signal ? { signal: pbc.signal } : {}) } })
     mock.addFixture({
       command: TIMEOUT,
       results: probes.length
@@ -944,6 +1037,33 @@ describe('backup2.6 — runFileRestore', () => {
       assert.match(marker, /ANAS restore did not finish/)
       assert.match(marker, /last progress: progress 17%/)
       assert.match(marker, /mode 0600/)
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('a KILLED client\'s marker blames the SIGNAL, never the last progress line (F16)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-restore-partial-'))
+    try {
+      // K1 of the real capture: two progress lines, and that is everything a
+      // SIGKILL leaves. Through the daemon's executor a signal death has no
+      // exit code (a plain 1) and carries the signal name instead.
+      const mock = restoreMock(
+        {
+          stderr: 'progress 4% (12.409 MiB of 250.001 MiB in 5.9s, 2.091 MiB/s)    \r'
+            + 'progress 17% (43.939 MiB of 250.001 MiB in 16.1s, 3.097 MiB/s)    \r',
+          exitCode: 1,
+          signal: 'SIGKILL',
+        },
+        [{ stdout: '..', exitCode: 0 }],
+      )
+      await assert.rejects(() => runFileRestore(mock, deps({ target: dir }), () => {}), /PARTIAL tree/)
+      const marker = await readFile(join(dir, PARTIAL_MARKER_NAME), 'utf8')
+      const reason = marker.split('\n').find(l => l.startsWith('reason: '))!
+      assert.equal(reason, 'reason: killed (signal 9)')
+      // The progress still has its OWN field — it is context, not a cause.
+      assert.match(marker, /last progress: progress 17%/)
     }
     finally {
       await rm(dir, { recursive: true, force: true })

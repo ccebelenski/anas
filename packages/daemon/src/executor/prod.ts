@@ -55,14 +55,19 @@ export class ProdExecutor implements CommandExecutor {
           // (NOT `err.status`, which is a spawnSync-only field); preserving it
           // is load-bearing for callers that classify by the exact code — e.g.
           // `timeout` exit 124 → mount 'unreachable' (Epic 18). A signal kill
-          // (err.code === null) has no exit code, so fall back to 1.
+          // (err.code === null) has no exit code, so fall back to 1 — but the
+          // signal NAME is on the error, and it is the only record of what
+          // actually happened, so carry it through (live-proof F16).
           const errCode = err ? (err as { code?: unknown }).code : undefined
           const exitCode = err ? (typeof errCode === 'number' ? errCode : 1) : 0
+          const errSignal = err ? (err as { signal?: unknown }).signal : undefined
+          const signal = typeof errSignal === 'string' && errSignal ? errSignal : undefined
 
           resolve({
             stdout: stdout ?? '',
             stderr: stderr ?? '',
             exitCode,
+            ...(signal ? { signal } : {}),
           })
         },
       )

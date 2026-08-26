@@ -232,6 +232,10 @@
             + ' style="font-family:monospace;font-size:0.9em;">' + enc(summary) + '</span>';
     }
 
+    // The one sentence a `disabled` result carries, wherever it is rendered.
+    // Same words as the backup grid — one hole, one explanation (F9).
+    var DISABLED_RESULT_TIP = 'Disabled — systemd does not keep the run history of a task whose timer is off, so there is no last result to show. The recent journald output on the detail is the only record left.';
+
     // Last run: a result pill (success / failure / running / unknown) + relative
     // time. A `failure` here is exactly the dashboard's 17.7 warning surfaced inline.
     function renderLastRun(v, meta, rec) {
@@ -248,6 +252,11 @@
                 + 'color:#fff;background:var(--anas-accent,#3468c0);">'
                 + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
                 + enc(t('running')) + '</span>';
+        } else if (result === 'disabled') {
+            // Live-proof F9 — the same hole as the backup grid, and the same
+            // answer: a disabled unit's history is garbage-collected, so there
+            // is no result to report, and "never run" would be a guess.
+            pill = softPill(t('disabled'), 'var(--anas-muted,gray)', t(DISABLED_RESULT_TIP));
         } else {
             pill = softPill(t('never run'), 'var(--anas-muted,gray)', t('no run recorded yet'));
         }
@@ -1315,6 +1324,8 @@
             pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)', '');
         } else if (result === 'running') {
             pill = pillHtml(t('running'), 'var(--anas-accent,#3468c0)', '');
+        } else if (result === 'disabled') {
+            pill = softPill(t('disabled'), 'var(--anas-muted,gray)', t(DISABLED_RESULT_TIP));
         } else {
             pill = softPill(t('never run'), 'var(--anas-muted,gray)', '');
         }
@@ -1325,7 +1336,11 @@
             ? ' <span style="color:var(--anas-muted,gray);">('
                 + enc(t('exit code') + ' ' + d.lastRunExitCode) + ')</span>'
             : '';
-        return pill + code + when;
+        // The daemon's one-line reason there is nothing to show (F9).
+        var note = d.statusNote
+            ? ' <span style="color:var(--anas-muted,gray);">' + enc('\u2014 ' + d.statusNote) + '</span>'
+            : '';
+        return pill + code + when + note;
     }
 
     // The recent journald blob — the run's own log, bounded + recent-only, the

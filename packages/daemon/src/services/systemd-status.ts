@@ -8,8 +8,22 @@
  * Pure computation, no I/O — the caller runs `systemctl show` and feeds stdout.
  */
 
-/** A run's outcome, mapped from a oneshot service's systemd state. */
-export type SystemdRunResult = 'success' | 'failure' | 'running' | 'unknown'
+/**
+ * A run's outcome, mapped from a oneshot service's systemd state.
+ *
+ * `disabled` is not an outcome the unit reported — it is the honest answer when
+ * systemd is holding NO answer at all. See {@link hasRetainedRunHistory}.
+ */
+export type SystemdRunResult = 'success' | 'failure' | 'running' | 'unknown' | 'disabled'
+
+/**
+ * The one-line caveat a DISABLED task's detail carries, so a reader who sees
+ * `disabled` where a result used to be knows it is a systemd lifetime fact and
+ * not a lost run. Defined once and rendered by backup, snapshot schedules and
+ * replication alike (live-proof F9).
+ */
+export const DISABLED_HISTORY_NOTE
+  = 'run history is not retained while a task is disabled'
 
 /** systemd 'n/a' sentinel + a leading weekday name on a human timestamp. */
 const NA_RE = /^n\/a$/i
@@ -49,16 +63,57 @@ export function parseSystemdTimestamp(raw: string | undefined): string | null {
 }
 
 /**
+ * Does systemd still hold a record of this unit having run?
+ *
+ * `Result=` is a DEFAULT-VALUED property: an unloaded unit prints `Result=success`
+ * having never run at all. The exit/inactive timestamps are not defaulted — they
+ * are empty exactly when there is no run to date them — so they are the reliable
+ * "is there any history here" signal. Either one is enough.
+ */
+export function hasRetainedRunHistory(props: Record<string, string>): boolean {
+  return parseSystemdTimestamp(props.ExecMainExitTimestamp) !== null
+    || parseSystemdTimestamp(props.InactiveEnterTimestamp) !== null
+}
+
+/** What the caller knows that `systemctl show` does not. */
+export interface RunResultContext {
+  /**
+   * Whether the task/schedule is ENABLED (its timer installed). Absent means
+   * "not known", which behaves exactly as it did before this option existed.
+   */
+  enabled?: boolean
+}
+
+/**
  * Map a service's systemd state to a run result. A oneshot is 'activating' (or
  * 'active') while running; after it exits, Result carries the outcome and
  * ActiveState becomes 'failed' on failure.
+ *
+ * **The disabled hole (live-proof F9).** systemd unloads an inactive unit that
+ * nothing references, and a DISABLED task has no installed timer to reference
+ * its service — so its run history is garbage-collected, and `systemctl show`
+ * then answers from property DEFAULTS: `Result=success` with empty timestamps.
+ * Composed with "no result reads as success", a disabled task reported
+ * `success` / next run `never` no matter what had actually happened to it,
+ * including a failure. That is a fabricated outcome, which is worse than no
+ * outcome, so when the caller says the task is disabled AND systemd retains no
+ * history, the answer is `disabled` — there is no run to report.
+ *
+ * A disabled unit that is running RIGHT NOW (Run Now goes through the unit) or
+ * that still has its timestamps is reported truthfully; the caveat is only for
+ * the state where systemd genuinely knows nothing.
  */
-export function deriveRunResult(props: Record<string, string>): SystemdRunResult {
+export function deriveRunResult(
+  props: Record<string, string>,
+  ctx: RunResultContext = {},
+): SystemdRunResult {
   const active = props.ActiveState
   if (active === 'activating' || active === 'active' || active === 'reloading')
     return 'running'
   if (active === 'failed')
     return 'failure'
+  if (ctx.enabled === false && !hasRetainedRunHistory(props))
+    return 'disabled'
   const result = props.Result
   if (result === 'success')
     return 'success'

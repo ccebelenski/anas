@@ -281,6 +281,17 @@ describe('backup restore reads (story backup2.5)', () => {
     assert.equal(data.entries[2]!.type, 'hardlink')
     assert.equal(data.entries[2]!.target, 'hard-a.txt')
 
+    // F11 — the `Modify:` string is carried VERBATIM (no invented offset) and is
+    // MARKED as the node's local time: `catalog shell` renders it in the READING
+    // process's timezone with no marker at all, so the same entry reads
+    // `15:06:53` under `Etc/UTC` and `11:06:53` under `America/New_York`
+    // (GT amendment 20). The reader is this daemon, so the answer is node-local.
+    assert.equal(data.entries[1]!.modified, '2026-08-25 19:16:23')
+    assert.equal(data.entries[1]!.mtimeZone, 'node-local')
+    assert.equal(data.entries[0]!.mtimeZone, 'node-local')
+    // Nothing was converted, and nothing claims UTC.
+    assert.ok(!data.entries.some(e => /Z$|UTC|\+\d\d:\d\d/.test(e.modified ?? '')))
+
     const shellCalls = mock.calls.filter(c => c.command === TIMEOUT)
     assert.equal(shellCalls.length, 2)
     assert.deepEqual(shellCalls[0]!.args.slice(1, 6), [PBC, 'catalog', 'shell', SNAP, 'data.pxar'])

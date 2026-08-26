@@ -17,17 +17,29 @@ import { createServer } from '../../server.js'
  * It is the iSCSI READ LAYER seen from the backup side, so it is tested against
  * the same real captures the iSCSI routes are (`configfs-live.manifest` +
  * `saveconfig-final.json`, from story `iscsi.1`): one zvol-backed LUN and one
- * file-backed LUN on a target whose IQN is not ANAS's.
+ * file-backed LUN.
  *
- * The two things this endpoint adds over the iSCSI read are exactly what is
- * asserted here: the FILTER (nothing ANAS cannot resolve, nothing PVE owns) and
- * the DERIVED consistency per LUN.
+ * The captured target's IQN is `iqn.2026-08.dev.anas.gtiscsi:target1`, whose
+ * naming authority ends in `gtiscsi`, not `anas` — so the real capture is a
+ * FOREIGN, hands-off target. Since backup2.8 (live-proof F7) that alone keeps
+ * its LUNs out of the picker, because `POST /v1/backup/restore` refuses to
+ * restore an image onto a target ANAS does not own: a source you can back up
+ * and never restore is not a source. The ANAS-owned cases below replay the SAME
+ * capture with the ONE byte that decides ownership changed — the IQN's
+ * authority — so everything else stays the node's own output.
+ *
+ * The three things this endpoint adds over the iSCSI read are exactly what is
+ * asserted here: the OWNERSHIP gate, the backing FILTER (nothing ANAS cannot
+ * resolve, nothing PVE owns) and the DERIVED consistency per LUN.
  */
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/iscsi')
 
-const GT_IQN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
+/** The captured IQN. Authority `dev.anas.gtiscsi` — NOT ANAS's (F7). */
+const FOREIGN_IQN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
+/** The same target with an ANAS naming authority (`…anas:<name>`). */
+const GT_IQN = 'iqn.2026-08.dev.gtiscsi.anas:target1'
 const ZVOL_PATH = '/dev/zvol/gtiscsi/vol1'
 
 const IDENTITY = {
@@ -48,6 +60,16 @@ function loadFixture(name: string): string {
   return readFileSync(join(fixturesDir, name), 'utf-8')
 }
 
+/**
+ * The capture with the target's IQN rewritten to an ANAS naming authority. The
+ * IQN is a plain string everywhere it appears (configfs directory names,
+ * `saveconfig.json`), and it is the ONLY thing ownership turns on here, so a
+ * verbatim substitution changes exactly the axis under test and nothing else.
+ */
+function asAnasOwned(text: string): string {
+  return text.split(FOREIGN_IQN).join(GT_IQN)
+}
+
 describe('GET /v1/backup/lun-sources — the img archive picker (backup2.4)', () => {
   let dir: string
   let server: ReturnType<typeof createServer> | undefined
@@ -58,18 +80,30 @@ describe('GET /v1/backup/lun-sources — the img archive picker (backup2.4)', ()
     storage: process.env.ANAS_STORAGE_CFG,
   }
 
-  async function serve(opts: { manifest?: string, saveconfig?: string, storageCfg?: string } = {}) {
+  async function serve(opts: {
+    manifest?: string
+    saveconfig?: string
+    storageCfg?: string
+    /** Replay the capture with a FOREIGN IQN (the bytes as captured). */
+    foreignTarget?: boolean
+  } = {}) {
+    const rewrite = opts.foreignTarget ? (t: string) => t : asAnasOwned
     if (opts.manifest) {
       const root = join(dir, 'target')
-      await materializeConfigfsManifest(loadFixture(opts.manifest), root)
+      await materializeConfigfsManifest(rewrite(loadFixture(opts.manifest)), root)
       process.env.ANAS_ISCSI_CONFIGFS = root
     }
     else {
       process.env.ANAS_ISCSI_CONFIGFS = join(dir, 'absent-configfs')
     }
-    process.env.ANAS_ISCSI_SAVECONFIG = opts.saveconfig
-      ? join(fixturesDir, opts.saveconfig)
-      : join(dir, 'absent-saveconfig.json')
+    if (opts.saveconfig) {
+      const path = join(dir, 'saveconfig.json')
+      await writeFile(path, rewrite(loadFixture(opts.saveconfig)))
+      process.env.ANAS_ISCSI_SAVECONFIG = path
+    }
+    else {
+      process.env.ANAS_ISCSI_SAVECONFIG = join(dir, 'absent-saveconfig.json')
+    }
     if (opts.storageCfg !== undefined) {
       const path = join(dir, 'storage.cfg')
       await writeFile(path, opts.storageCfg)
@@ -149,6 +183,36 @@ describe('GET /v1/backup/lun-sources — the img archive picker (backup2.4)', ()
     // before) — ANAS cannot say what backs it, so it cannot say what backing it
     // up would capture.
     assert.equal(res.data!.luns.some(l => l.path.endsWith('lun2.raw')), false, JSON.stringify(res.data!.luns))
+  })
+
+  it('a FOREIGN target\'s LUNs are NOT offered — the image restore refuses them (F7)', async () => {
+    // The capture verbatim: authority `dev.anas.gtiscsi`, so `isAnasIqn` is
+    // false and the target is hands-off. Live proof watched this exact target's
+    // LUNs get offered here and then refused by `POST /v1/backup/restore` with
+    // `409 foreign-target` — a source that can be backed up and never restored.
+    await serve({
+      manifest: 'configfs-live.manifest',
+      saveconfig: 'saveconfig-final.json',
+      foreignTarget: true,
+    })
+    const res = await lunSources()
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.data!.installed, true)
+    assert.equal(
+      res.data!.luns.some(l => l.targetIqn === FOREIGN_IQN),
+      false,
+      JSON.stringify(res.data!.luns),
+    )
+    assert.deepEqual(res.data!.luns, [])
+  })
+
+  it('an ANAS-owned target\'s LUNs ARE offered — the same capture, ANAS IQN (F7)', async () => {
+    await serve({ manifest: 'configfs-live.manifest', saveconfig: 'saveconfig-final.json' })
+    const res = await lunSources()
+    assert.equal(res.statusCode, 200)
+    // Same node, same backstores, same serial: ownership is the only difference.
+    assert.deepEqual(res.data!.luns.map(l => l.path), [ZVOL_PATH])
+    assert.equal(res.data!.luns[0].targetIqn, GT_IQN)
   })
 
   it('a zvol on a PVE-managed pool is NEVER offered (PVE territory is hands-off)', async () => {

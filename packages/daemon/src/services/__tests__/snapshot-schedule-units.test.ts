@@ -8,6 +8,7 @@ import { MockExecutor } from '../../executor/mock.js'
 import {
   buildScheduleWarnings,
   cadenceToOnCalendar,
+  deriveScheduleDetail,
   deriveScheduleStatus,
   parseServiceUnit,
   readAllSchedules,
@@ -173,6 +174,31 @@ describe('snapshot schedule units — status derivation + dashboard warnings', (
   it('a disabled schedule is never overdue even with a past next-elapse', async () => {
     const st = await deriveScheduleStatus(statusMock({ nextTs: 'Mon 2020-01-01 00:00:00 UTC' }), makeSchedule({ enabled: false }))
     assert.equal(st.overdue, false)
+  })
+
+  // Live-proof F9, reached through the SAME shared map as backup: systemd
+  // unloads a disabled unit nothing references and answers from property
+  // DEFAULTS (`Result=success`, both timestamps empty), which read as a
+  // successful run that never happened.
+  it('a DISABLED schedule whose history systemd collected reads `disabled` (F9)', async () => {
+    const st = await deriveScheduleStatus(
+      statusMock({ result: 'success', exitTs: '' }),
+      makeSchedule({ enabled: false }),
+    )
+    assert.equal(st.lastRunResult, 'disabled')
+    assert.equal(st.lastRunAt, null)
+    // The same shape while ENABLED is untouched — the unit is referenced there.
+    const on = await deriveScheduleStatus(statusMock({ result: 'success', exitTs: '' }), makeSchedule({ enabled: true }))
+    assert.equal(on.lastRunResult, 'success')
+  })
+
+  it('the schedule DETAIL states why there is no result, and shows no exit code (F9)', async () => {
+    const mock = statusMock({ result: 'success', exitTs: '' })
+    const detail = await deriveScheduleDetail(mock, join(tmpdir(), 'anas-no-such-unit-dir'), makeSchedule({ enabled: false }))
+    assert.equal(detail.lastRunResult, 'disabled')
+    assert.equal(detail.statusNote, 'run history is not retained while a task is disabled')
+    // `ExecMainStatus=0` is a default too — it must not be shown as "exit 0".
+    assert.equal(detail.lastRunExitCode, null)
   })
 
   it('buildScheduleWarnings warns only on enabled failed/overdue schedules', () => {

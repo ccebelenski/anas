@@ -65,6 +65,16 @@ function ok(stdout: string): ExecResult {
   return { stdout, stderr: '', exitCode: 0 }
 }
 
+/**
+ * `timeout` now wraps TWO different things: the `find` walk, and (since
+ * backup2.8 / live-proof F8) the mounts family's `timeout 2 stat -f` liveness
+ * probe of each remote mount under the source. Every assertion about the walk
+ * argv has to say which one it means.
+ */
+function walkCalls(ex: MockExecutor): { command: string, args: string[] }[] {
+  return ex.calls.filter(c => c.command === TIMEOUT && c.args[1] === FIND)
+}
+
 /** A mock wired with the real findmnt tree plus a chosen walk result. */
 function makeExecutor(walk: ExecResult, findmnt = REAL_FINDMNT): MockExecutor {
   const ex = new MockExecutor()
@@ -200,7 +210,7 @@ describe('nested filesystems — the scan against the REAL captured node', () =>
       included: false,
     })
     // The walk is one bounded command through the executor, wrapped in `timeout`.
-    const walkCall = ex.calls.find(c => c.command === TIMEOUT)
+    const walkCall = walkCalls(ex)[0]
     assert.ok(walkCall, 'the walk ran through timeout')
     assert.equal(walkCall.args[1], FIND)
     assert.ok(walkCall.args.includes('-xdev'))
@@ -247,7 +257,7 @@ describe('nested filesystems — the scan against the REAL captured node', () =>
     assert.equal(scan.nested[0].kind, 'nfs')
     assert.match(scan.nested[0].detail ?? '', /hang trap/)
     // The dead mount is PRUNED in the argv — find never gets to stat it.
-    const walkCall = ex.calls.find(c => c.command === TIMEOUT)
+    const walkCall = walkCalls(ex)[0]
     assert.ok(walkCall, 'the walk ran')
     assert.ok(walkCall.args.includes('/srv/dead'))
     assert.ok(walkCall.args.includes('-prune'))
@@ -405,7 +415,7 @@ describe('nested filesystems — `all` DESCENDS, so nested-inside-nested is foun
 
   /** The roots the scan actually walked, in order. */
   function walkRoots(ex: MockExecutor): string[] {
-    return ex.calls.filter(c => c.command === TIMEOUT).map(c => c.args[3])
+    return walkCalls(ex).map(c => c.args[3])
   }
 
   it('`none` stops at the FIRST boundary — the inner one is never walked for', async () => {
@@ -453,7 +463,7 @@ describe('nested filesystems — `all` DESCENDS, so nested-inside-nested is foun
     // NO walk is ever rooted at it — it is named from the mount table only …
     assert.ok(!walkRoots(ex).includes('/gtbackup/cdm/remote'), walkRoots(ex).join(' '))
     // … and it is PRUNED out of the walks that pass near it.
-    const cdmWalk = ex.calls.find(c => c.command === TIMEOUT && c.args[3] === '/gtbackup/cdm')
+    const cdmWalk = walkCalls(ex).find(c => c.args[3] === '/gtbackup/cdm')
     assert.ok(cdmWalk?.args.includes('/gtbackup/cdm/remote') && cdmWalk.args.includes('-prune'))
     const resolution = resolveNestedIncludes(
       [{ name: 'pool', path: '/gtbackup', includeNested: 'all' }],
@@ -470,8 +480,7 @@ describe('nested filesystems — `all` DESCENDS, so nested-inside-nested is foun
       '/gtbackup/cdm/inner': ok('52\t/gtbackup/cdm/inner\n'),
     })
     await scanNestedFilesystems(ex, '/gtbackup', { includeNested: 'all', maxDepth: 4 })
-    const depths = ex.calls
-      .filter(c => c.command === TIMEOUT)
+    const depths = walkCalls(ex)
       .map(c => Number(c.args[c.args.indexOf('-maxdepth') + 1]))
     // 4 at the root, 3 one level down, 2 two levels down — never a fresh budget.
     assert.deepEqual(depths, [4, 3, 2])
@@ -573,5 +582,182 @@ describe('nested filesystems — run warnings', () => {
     ])
     assert.equal(lines.length, 1)
     assert.match(lines[0], /incomplete/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  The scan is hang-BOUNDED, not hang-proof (live-proof F8).
+//
+//  `find` lstats an entry BEFORE the expression that would prune it runs, so
+//  `-path <dead mount> -prune` protects nothing. Measured on the node with a
+//  black-holed NFS mount under the source and a cold dentry cache:
+//
+//    POST /v1/backup/tasks/preview-nested {"path":"/gtbackup/data"}  real 20.111s
+//      truncated: true
+//      warnings: ["… did not finish within 20s — the list below is a floor …"]
+//
+//    $ timeout 8 find -P /gtbackup/data -xdev -maxdepth 3 \
+//        \( -name .zfs -o -path /gtbackup/data/remote \) -prune -o -type d -printf '%D\t%p\n'
+//      exit=124   (and it printed NOTHING, not even the source root)
+//
+//  …and on /gtbackup only the dead mount came back: the two real child datasets
+//  were lost. The fix probes each remote FIRST with the mounts family's own
+//  `timeout 2 stat -f`, then prunes the dead one's PARENT so the walk still runs
+//  on everything else.
+// ---------------------------------------------------------------------------
+describe('nested filesystems — a DEAD remote mount does not cost the whole scan (F8)', () => {
+  const STAT = 'stat'
+  const DEAD = '/gtbackup/data/remote'
+
+  const FINDMNT_WITH_DEAD = JSON.stringify({
+    filesystems: [
+      { target: '/gtbackup', source: 'gtbackup', fstype: 'zfs', options: 'rw' },
+      { target: '/gtbackup/cdm', source: 'gtbackup/cdm', fstype: 'zfs', options: 'rw' },
+      { target: '/gtbackup/img2', source: 'gtbackup/img2', fstype: 'zfs', options: 'rw' },
+      { target: DEAD, source: 'deadserver:/export', fstype: 'nfs4', options: 'rw' },
+    ],
+  })
+
+  /** The walk that CAN run once /gtbackup/data is pruned out. */
+  const WALK_WITHOUT_DATA = [
+    '46\t/gtbackup',
+    '46\t/gtbackup/images',
+    '49\t/gtbackup/cdm',
+    '51\t/gtbackup/img2',
+    '',
+  ].join('\n')
+
+  /** `timeout 2 stat -f …` — dead (124, the guard fired) or alive (0). */
+  function probeFixture(target: string, alive: boolean) {
+    return {
+      command: TIMEOUT,
+      args: ['2', STAT, '-f', '-c', '%S %b %f %a', target],
+      result: alive
+        ? ok('4096 100 50 50\n')
+        : { stdout: '', stderr: '', exitCode: 124 },
+    }
+  }
+
+  function executorWith(alive: boolean, walk: ExecResult = ok(WALK_WITHOUT_DATA)): MockExecutor {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: FINDMNT, args: ['--json'], result: ok(FINDMNT_WITH_DEAD) })
+    ex.addFixture(probeFixture(DEAD, alive))
+    ex.addFixture({ command: TIMEOUT, result: walk })
+    return ex
+  }
+
+  it('the dead remote is probed with the MOUNTS family probe, not a second one', async () => {
+    const ex = executorWith(false)
+    await scanNestedFilesystems(ex, '/gtbackup')
+    const probe = ex.calls.find(c => c.command === TIMEOUT && c.args[1] === STAT)
+    assert.ok(probe, 'the guarded stat -f probe ran')
+    // `timeout 2 stat -f -c '%S %b %f %a' <mountpoint>` — Epic 18's exact shape.
+    assert.deepEqual(probe.args, ['2', STAT, '-f', '-c', '%S %b %f %a', DEAD])
+  })
+
+  it('the walk prunes the dead mount\'s PARENT, and still finds the boundaries elsewhere', async () => {
+    const ex = executorWith(false)
+    const scan = await scanNestedFilesystems(ex, '/gtbackup')
+
+    const walk = walkCalls(ex)[0]
+    assert.ok(walk, 'the walk still ran — the point of the fix')
+    // The PARENT is the term that helps: find lstats an entry before the
+    // expression runs, so pruning the mountpoint itself protects nothing.
+    assert.ok(walk.args.includes('/gtbackup/data'), walk.args.join(' '))
+    assert.ok(walk.args.includes('-prune'))
+
+    // The two real child datasets the timeout used to swallow are back.
+    assert.deepEqual(
+      scan.nested.map(n => n.path).sort(),
+      ['/gtbackup/cdm', '/gtbackup/data/remote', '/gtbackup/img2'],
+    )
+  })
+
+  it('the dead mount is recorded as a boundary, marked unreachable', async () => {
+    const scan = await scanNestedFilesystems(executorWith(false), '/gtbackup')
+    const entry = scan.nested.find(n => n.path === DEAD)
+    assert.ok(entry)
+    assert.equal(entry.kind, 'nfs')
+    assert.match(entry.detail ?? '', /^unreachable/)
+  })
+
+  it('the scan is TRUNCATED and the reason names the subtree that was not walked', async () => {
+    const scan = await scanNestedFilesystems(executorWith(false), '/gtbackup')
+    assert.equal(scan.truncated, true)
+    const reason = scan.warnings.find(w => w.includes(DEAD))
+    assert.ok(reason, scan.warnings.join(' | '))
+    assert.match(reason, /liveness probe/)
+    assert.match(reason, /\/gtbackup\/data/)
+    // …and the run warnings repeat the incompleteness, never a silent floor.
+    assert.ok(nestedRunWarnings([scan]).some(w => /was incomplete/.test(w)))
+  })
+
+  it('a LIVE remote behaves exactly as before: walked around, recorded, not truncated', async () => {
+    const ex = executorWith(true, ok([
+      '46\t/gtbackup',
+      '46\t/gtbackup/images',
+      '49\t/gtbackup/cdm',
+      '51\t/gtbackup/img2',
+      '46\t/gtbackup/data',
+      '',
+    ].join('\n')))
+    const scan = await scanNestedFilesystems(ex, '/gtbackup')
+    assert.equal(scan.truncated, false)
+    assert.deepEqual(scan.warnings, [])
+    // The dead-mount PARENT is not pruned — only the mount itself, as always.
+    const walk = walkCalls(ex)[0]
+    assert.ok(walk.args.includes(DEAD), walk.args.join(' '))
+    assert.ok(!walk.args.includes('/gtbackup/data'), walk.args.join(' '))
+    const entry = scan.nested.find(n => n.path === DEAD)
+    assert.match(entry?.detail ?? '', /hang trap/)
+    assert.deepEqual(
+      scan.nested.map(n => n.path).sort(),
+      ['/gtbackup/cdm', '/gtbackup/data/remote', '/gtbackup/img2'],
+    )
+  })
+
+  it('when the dead mount is a CHILD OF THE SOURCE, nothing is walked — and it says so', async () => {
+    // The F8 capture's own shape: /gtbackup/data/remote under /gtbackup/data.
+    // The parent IS the source root, so no walk can run safely. The honest
+    // answer is an immediate truncated scan, not 20 seconds and a floor.
+    const ex = new MockExecutor()
+    ex.addFixture({ command: FINDMNT, args: ['--json'], result: ok(FINDMNT_WITH_DEAD) })
+    ex.addFixture(probeFixture(DEAD, false))
+    ex.addFixture({ command: TIMEOUT, result: ok('') })
+    const scan = await scanNestedFilesystems(ex, '/gtbackup/data')
+    assert.equal(scan.truncated, true)
+    assert.equal(walkCalls(ex).length, 0, 'no find ran at all')
+    assert.deepEqual(scan.nested.map(n => n.path), [DEAD])
+    assert.ok(scan.warnings.some(w => w.includes(DEAD)))
+  })
+
+  it('an ARMED automount is never probed — stat is what would trigger the mount', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({
+      command: FINDMNT,
+      args: ['--json'],
+      result: ok(JSON.stringify({
+        filesystems: [
+          { target: '/srv', source: '/dev/sda2', fstype: 'ext4', options: 'rw' },
+          { target: '/srv/media', source: 'systemd-1', fstype: 'autofs', options: 'rw' },
+        ],
+      })),
+    })
+    ex.addFixture({ command: TIMEOUT, result: ok('2049\t/srv\n') })
+    const scan = await scanNestedFilesystems(ex, '/srv')
+    assert.equal(ex.calls.some(c => c.command === TIMEOUT && c.args[1] === STAT), false)
+    assert.equal(scan.truncated, false)
+    assert.equal(scan.nested[0]?.kind, 'automount')
+  })
+
+  it('a probe that cannot answer counts as ALIVE — an inconclusive read never skips a subtree', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: FINDMNT, args: ['--json'], result: ok(FINDMNT_WITH_DEAD) })
+    // exit 1 "No such file" → `unknown`, not `unreachable`.
+    ex.addFixture({ command: TIMEOUT, args: ['2', STAT, '-f', '-c', '%S %b %f %a', DEAD], result: { stdout: '', stderr: 'stat: cannot read file system information', exitCode: 1 } })
+    ex.addFixture({ command: TIMEOUT, result: ok('46\t/gtbackup\n49\t/gtbackup/cdm\n') })
+    const scan = await scanNestedFilesystems(ex, '/gtbackup')
+    assert.equal(scan.truncated, false)
+    assert.equal(walkCalls(ex).length, 1)
   })
 })

@@ -33,7 +33,8 @@
  *     → { verdict:'ok'|'not-found'|'permission'|'unreachable'|'error', detail?,
  *         archiveKind:'pxar'|'img'|'other', path,
  *         entries:[{ name, path, type:'dir'|'file'|'symlink'|'hardlink'|'image'
- *                    |'other', size?, modified?, mode?, target? }],
+ *                    |'other', size?, modified?, mtimeZone?:'node-local',
+ *                    mode?, target? }],
  *         truncated?, warnings:[] }
  *
  *   GET /v1/backup/tasks/:name/snapshots
@@ -78,6 +79,17 @@
 
     function errText(e) {
         return ANAS.errText ? ANAS.errText(e) : ('' + e);
+    }
+
+    // The archive backend's `modified` is whatever `catalog shell` printed, and
+    // `catalog shell` renders `Modify:` in the READING process's local timezone
+    // with no offset — so it is the NODE's clock, not yours and not UTC
+    // (live-proof F11). Said once, used by the column header and every cell.
+    function nodeLocalTimeTip() {
+        return t(
+            'Node local time \u2014 the backup client prints this timestamp with no timezone, '
+            + 'in the timezone of the node that read the archive. It is not converted, and it is not UTC.',
+        );
     }
 
     // ======================================================================
@@ -154,7 +166,8 @@
     // ======================================================================
     //  Entry normalization — both backends produce the SAME row shape
     //
-    //  { name, path, type, size?, modified?, target?, expandable, selectable }
+    //  { name, path, type, size?, modified?, mtimeZone?, target?,
+    //    expandable, selectable }
     // ======================================================================
 
     // The live backend's answer → rows. Directories first, then files (each
@@ -198,6 +211,13 @@
             }
             if (e.modified) {
                 row.modified = '' + e.modified;
+                // The daemon marks an archive mtime as the NODE's local time
+                // (the backup client prints `Modify:` with no offset at all).
+                // Carried so the Modified column can LABEL it instead of
+                // leaving a reader to assume UTC — live-proof F11.
+                if (e.mtimeZone) {
+                    row.mtimeZone = '' + e.mtimeZone;
+                }
             }
             if (e.target !== undefined && e.target !== null) {
                 row.target = '' + e.target;
@@ -427,6 +447,7 @@
                 kind: r.type,
                 size: r.size,
                 modified: r.modified,
+                mtimeZone: r.mtimeZone,
                 target: r.target,
                 selectable: r.selectable,
                 leaf: !r.expandable,
@@ -708,7 +729,7 @@
         try {
             store = Ext.create('Ext.data.TreeStore', {
                 fields: [
-                    'name', 'path', 'kind', 'target', 'modified',
+                    'name', 'path', 'kind', 'target', 'modified', 'mtimeZone',
                     { name: 'size', type: 'auto' },
                     { name: 'selectable', type: 'auto' },
                 ],
@@ -873,14 +894,28 @@
                             {
                                 // pbc prints an archive mtime with NO timezone, so
                                 // it is shown exactly as it came. Nothing here
-                                // invents an offset.
+                                // invents an offset. The daemon marks it
+                                // `node-local` (the catalog shell renders it in
+                                // the READING process's zone — live-proof F11),
+                                // and that is said in the header tooltip and on
+                                // every marked cell, never guessed as UTC.
                                 text: t('Modified'),
                                 dataIndex: 'modified',
-                                width: 160,
+                                width: 190,
                                 sortable: false,
                                 menuDisabled: true,
-                                renderer: function (v) {
-                                    return v ? enc(v) : '';
+                                tooltip: nodeLocalTimeTip(),
+                                renderer: function (v, meta, rec) {
+                                    if (!v) {
+                                        return '';
+                                    }
+                                    if (rec && rec.get('mtimeZone') === 'node-local') {
+                                        return '<span data-qtip="' + enc(nodeLocalTimeTip()) + '">'
+                                            + enc(v)
+                                            + ' <span style="color:var(--anas-muted,gray);font-size:0.85em;">'
+                                            + enc(t('node local time')) + '</span></span>';
+                                    }
+                                    return enc(v);
                                 },
                             },
                         ],

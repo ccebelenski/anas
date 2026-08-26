@@ -98,6 +98,7 @@ import {
 } from '../services/backup-runner.js'
 import {
   deriveTaskStatus,
+  DISABLED_HISTORY_NOTE,
   effectiveSchedule,
   gateRun,
   readAllTasks,
@@ -707,6 +708,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   // read as a task name.
   //
   // WHAT IS LEFT OUT, and why:
+  //   - a LUN of a FOREIGN target (live-proof F7). The whole-image restore
+  //     (backup2.7) refuses a target ANAS does not own, so offering its LUNs
+  //     here would let a user back something up that can never be restored
+  //     through the same product. The picker and the door now agree; a foreign
+  //     target stays hands-off on both sides;
   //   - a LUN whose backing does not resolve onto storage ANAS knows (`foreign`)
   //     — ANAS cannot say what backs it, so it cannot say what backing it up
   //     would capture, and offering it in a picker would imply it can;
@@ -747,6 +753,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
     const luns: BackupLunSource[] = []
     for (const target of targets) {
+      // F7 — ANAS-owned targets only. `deriveOwnership` is the ONE authority
+      // (iscsi.2), and it is the same answer `POST /v1/backup/restore` checks
+      // before an image restore, so the two doors cannot drift apart.
+      if (target.ownership !== 'anas')
+        continue
       for (const lun of target.luns) {
         // `foreign` = positively not ANAS storage; `unresolved` (iscsi.5) = resolves onto
         // no known storage NOW — either way ANAS cannot say what a backup would capture.
@@ -818,6 +829,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       timer: units.timer,
       ...(journal ? { journal } : {}),
       ...(nested ? { nested } : {}),
+      // F9 — when there is no result to show, say WHY on the one screen that has
+      // room for the sentence. The journald tail is the only history a disabled
+      // task has left, and it is already labelled recent-only.
+      ...(st.lastRunResult === 'disabled' ? { statusNote: DISABLED_HISTORY_NOTE } : {}),
     }
     return { data: detail }
   })

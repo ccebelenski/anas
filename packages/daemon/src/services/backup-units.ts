@@ -5,7 +5,7 @@ import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, BackupTask as BackupTaskSchema, cadenceToOnCalendar } from '@anas/shared'
 import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
-import { deriveRunResult as deriveSystemdRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
+import { deriveRunResult as deriveSystemdRunResult, DISABLED_HISTORY_NOTE, parseShow, parseSystemdTimestamp } from './systemd-status.js'
 
 /**
  * Backup TASKS (Epic 16.3) — the systemd units ARE the store, exactly the
@@ -292,7 +292,7 @@ async function runSystemctl(executor: CommandExecutor, args: string[]): Promise<
 // schedules). Re-exported here so this module stays the one import a backup
 // caller needs.
 
-export { parseSystemdTimestamp }
+export { DISABLED_HISTORY_NOTE, parseSystemdTimestamp }
 
 /**
  * Map a service's systemd state to a backup run result — the shared oneshot map
@@ -301,9 +301,17 @@ export { parseSystemdTimestamp }
  * `SuccessExitStatus=`, so systemd reports success (correctly — nothing went
  * wrong) and `ExecMainStatus` is what distinguishes "skipped on purpose" from
  * "backed up". No journal read, no second state source.
+ *
+ * `enabled` is passed through to the shared map so a DISABLED task whose run
+ * history systemd has garbage-collected reads `disabled` rather than the
+ * default-valued `Result=success` (live-proof F9). A disabled unit that DID run
+ * recently enough to still be loaded keeps its real result, skip code included.
  */
-export function deriveRunResult(props: Record<string, string>): BackupRunResult {
-  const base = deriveSystemdRunResult(props)
+export function deriveRunResult(
+  props: Record<string, string>,
+  ctx: { enabled?: boolean } = {},
+): BackupRunResult {
+  const base = deriveSystemdRunResult(props, ctx)
   if (base === 'success' && props.ExecMainStatus === String(BACKUP_SKIP_EXIT_CODE))
     return 'skipped'
   return base
@@ -343,7 +351,7 @@ export async function deriveTaskStatus(
     showTimerNext(executor, task.name),
   ])
 
-  const lastRunResult = deriveRunResult(serviceProps)
+  const lastRunResult = deriveRunResult(serviceProps, { enabled: task.enabled })
   const lastRunAt = parseSystemdTimestamp(serviceProps.ExecMainExitTimestamp)
     ?? parseSystemdTimestamp(serviceProps.InactiveEnterTimestamp)
   const nextRunAt = parseSystemdTimestamp(nextRaw)

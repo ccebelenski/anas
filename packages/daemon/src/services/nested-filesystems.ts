@@ -3,6 +3,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import { effectiveArchiveKind, effectiveIncludeNested, isPathWithin, nestedIncluded } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
+import { probeMount } from './mounts.js'
 
 /**
  * Nested-filesystem detection (story backup2.2) — the SINGLE source; backup2.3's
@@ -32,12 +33,34 @@ import { parseFindmnt } from '../parsers/findmnt.js'
  *     `snapdir=hidden` the walk never even sees `.zfs`; `-name .zfs -prune`
  *     covers a `snapdir=visible` dataset.
  *   - **The hang trap** (the mounts-family rule, Epic 18): a remote mount is
- *     recorded from `findmnt` and PRUNED from the walk — never stat'ed, never
- *     descended. `findmnt` reads `/proc/self/mountinfo` and cannot hang; a dead
- *     NFS server can hang a `stat` forever. The walk itself is additionally
- *     wrapped in `timeout` so nothing else can wedge the daemon either.
+ *     recorded from `findmnt` and PRUNED from the walk. `findmnt` reads
+ *     `/proc/self/mountinfo` and cannot hang; a dead NFS server can hang a
+ *     `stat` forever. The walk itself is additionally wrapped in `timeout` so
+ *     nothing else can wedge the daemon either.
+ *
+ *     **But pruning is not enough, and this scan is hang-BOUNDED, not
+ *     hang-proof** (live-proof F8 / GT amendment 16). `find` `lstat`s an entry
+ *     BEFORE the expression that would prune it runs, so `-path <dead mount>
+ *     -prune` does not protect anything: measured, the whole walk printed
+ *     NOTHING and died on the 20 s ceiling — losing the two real child datasets
+ *     that were nowhere near the dead server. The `timeout` works, and the
+ *     truncation was reported honestly, but a floor is not an answer.
+ *
+ *     So before walking, every REMOTE mount `findmnt` reports under the source
+ *     is put through the mounts family's own guarded liveness probe
+ *     (`probeMount` — `timeout 2 stat -f`, the ONE probe, not a second copy).
+ *     A dead one is recorded as an `unreachable` boundary, the scan is marked
+ *     `truncated` with a reason naming it, and its PARENT DIRECTORY is pruned
+ *     from the walk — the parent's own `lstat` is fine, and pruning it is what
+ *     stops `find` from ever reading the directory entry that hangs. The walk
+ *     then runs on the remainder, so boundaries elsewhere are not lost, and the
+ *     warning says exactly which subtree went unwalked.
  *   - An armed `autofs` placeholder is reported ARMED, never "local" (issue #35)
- *     — and it is pruned too, because walking into one triggers the mount.
+ *     — and it is pruned too, because walking into one triggers the mount. It is
+ *     deliberately NOT probed: `stat`ing an armed automount is what triggers it,
+ *     and Epic 18's ruling is that ANAS never touches one (its identity comes
+ *     from its fstab entry). A placeholder that HAS been triggered is a real
+ *     nfs/cifs row in the mount index by then, and that row is probed.
  */
 
 /** Trailing slashes on an absolute path (`/` itself is preserved). */
@@ -184,6 +207,31 @@ export function isUnwalkableKind(kind: BackupNestedKind): boolean {
 }
 
 /**
+ * Kinds that get a LIVENESS PROBE before the walk (live-proof F8): the real
+ * remote filesystems, whose server can be gone. An armed `automount` is
+ * deliberately absent — probing one is what triggers the mount, and a read
+ * endpoint must not mount anything (Epic 18).
+ */
+export function isProbeableKind(kind: BackupNestedKind): boolean {
+  return kind === 'nfs' || kind === 'cifs'
+}
+
+/**
+ * The directory that must be pruned so `find` never reads the entry for
+ * `mountpoint`. NOT the mountpoint itself: `find` `lstat`s an entry before the
+ * expression that would prune it runs (GT amendment 16), so the only term that
+ * helps is one that stops the PARENT's directory from being read at all. The
+ * parent's own `lstat` is a local one and is fine.
+ */
+export function parentOf(path: string): string {
+  const base = normalizePath(path)
+  if (base === '/')
+    return '/'
+  const cut = base.lastIndexOf('/')
+  return cut <= 0 ? '/' : base.slice(0, cut)
+}
+
+/**
  * Pick, for each path, the effective findmnt row: the LAST row for a target wins
  * (a stacked real filesystem over an autofs placeholder — the mounts-family
  * precedence). Rows for `.zfs/snapshot` automounts are dropped outright.
@@ -291,6 +339,30 @@ export async function scanNestedFilesystems(
   // are recorded from the table instead — findmnt never touches a filesystem.
   const prune = prunePathsUnder(root, mounts)
 
+  // 2b. LIVENESS, before anything walks (live-proof F8). Pruning a dead mount is
+  // not protection: `find` lstats an entry before the expression that would
+  // prune it runs, and one black-holed NFS mount took the WHOLE walk down with
+  // it — real child datasets elsewhere under the source were lost to the 20 s
+  // ceiling. So each remote mount under the source is put through the mounts
+  // family's ONE guarded probe first (`timeout 2 stat -f`, never a second copy
+  // of it), and a dead one costs its PARENT directory instead of the scan.
+  const dead = await probeDeadRemotes(executor, root, prune, mounts)
+  for (const target of dead) {
+    // The parent is what has to be pruned; the mountpoint's own entry is read
+    // (and hangs) while the parent's directory is being listed. Two dead mounts
+    // in one directory prune it once.
+    const parent = parentOf(target)
+    if (!prune.includes(parent))
+      prune.push(parent)
+    scan.truncated = true
+    warnings.push(
+      `${target} did not answer a 2s liveness probe (the server is unreachable) — `
+      + `everything under ${parent} was left unwalked, because reading that directory `
+      + `is what hangs; nested filesystems elsewhere under ${root} were still scanned`,
+    )
+  }
+  prune.sort()
+
   // 3. The bounded walk(s). ONE shared wall-clock deadline and ONE shared depth
   // budget measured from the ORIGINAL root, so descending can never turn a
   // 20-second scan into an unbounded one.
@@ -313,6 +385,14 @@ export async function scanNestedFilesystems(
       warnings.push(`the scan budget ran out before ${current} could be examined — there may be more nested filesystems below it`)
       continue
     }
+    // A dead remote's parent is unreadable, so a walk ROOTED at or inside it
+    // cannot run at all — including the source root itself, when the dead mount
+    // is one of its own children. The pruned mounts are still recorded below.
+    if (dead.some(target => isPathWithin(parentOf(target), current))) {
+      scan.truncated = true
+      recordPruned(root, current, prune, mounts, choice, recorded, dead)
+      continue
+    }
 
     // Everything this walk learns is recorded before the iteration ends —
     // including on an early exit, which is why the pruned mounts are recorded in
@@ -323,7 +403,7 @@ export async function scanNestedFilesystems(
       await walkFrom()
     }
     finally {
-      recordPruned(root, current, prune, mounts, choice, recorded)
+      recordPruned(root, current, prune, mounts, choice, recorded, dead)
     }
 
     async function walkFrom(): Promise<void> {
@@ -395,6 +475,42 @@ export async function scanNestedFilesystems(
 }
 
 /**
+ * Which of the remote mounts under `root` are DEAD (live-proof F8).
+ *
+ * Reuses the mounts family's `probeMount` — `timeout 2 stat -f` — rather than
+ * writing a second probe: one implementation of "is this server answering",
+ * one 2 s bound, one classification of the timeout. Probes run in parallel so
+ * N dead servers cost 2 s, not 2N; a probe that throws counts as ALIVE, because
+ * the point of the probe is to avoid a hang and an inconclusive answer is not
+ * grounds for skipping a subtree.
+ *
+ * Armed automounts are excluded on purpose ({@link isProbeableKind}).
+ */
+async function probeDeadRemotes(
+  executor: CommandExecutor,
+  root: string,
+  prune: string[],
+  mounts: Map<string, FindmntNode>,
+): Promise<string[]> {
+  const candidates = prune.filter((target) => {
+    const node = mounts.get(target)
+    return node !== undefined && isProbeableKind(kindOfMount(node)) && isPathWithin(root, target)
+  })
+  if (!candidates.length)
+    return []
+  const verdicts = await Promise.all(candidates.map(async (target) => {
+    try {
+      const probe = await probeMount(executor, target)
+      return probe.state === 'unreachable' ? target : null
+    }
+    catch {
+      return null
+    }
+  }))
+  return verdicts.filter((t): t is string => t !== null)
+}
+
+/**
  * Record the pruned (remote / autofs) mounts that are boundaries of the walk
  * rooted at `current` — that is, those with no OTHER recorded boundary between
  * them and `current`. They are named entirely from the mount table.
@@ -406,6 +522,7 @@ function recordPruned(
   mounts: Map<string, FindmntNode>,
   choice: BackupIncludeNested,
   recorded: Map<string, BackupNestedEntry>,
+  dead: string[] = [],
 ): void {
   for (const target of prune) {
     if (recorded.has(target) || !isPathWithin(current, target) || target === current)
@@ -419,11 +536,21 @@ function recordPruned(
     recorded.set(target, entry(root, target, kind, choice, {
       source: node.source,
       fstype: node.fstype,
-      detail: kind === 'automount'
-        ? 'armed automount — not walked into (walking one triggers the mount)'
-        : 'remote mount — recorded from the mount table, never probed (the hang trap)',
+      detail: prunedDetail(target, kind, dead.includes(target)),
     }))
   }
+}
+
+/** Why a pruned mount was not walked into — the honest one-liner on the row. */
+function prunedDetail(target: string, kind: BackupNestedKind, isDead: boolean): string {
+  if (isDead) {
+    return `unreachable — the server did not answer a 2s liveness probe; recorded from the mount `
+      + `table, never walked into, and ${parentOf(target)} was left unwalked because reading it is `
+      + `what hangs`
+  }
+  if (kind === 'automount')
+    return 'armed automount — not walked into (walking one triggers the mount)'
+  return 'remote mount — recorded from the mount table, never probed (the hang trap)'
 }
 
 /** Is there a recorded boundary strictly between `current` and `target`? */

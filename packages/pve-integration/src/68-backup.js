@@ -766,6 +766,22 @@
             + enc(s) + '</span>';
     }
 
+    // The one sentence a `disabled` result carries, wherever it is rendered
+    // (grid pill and task detail). Live-proof F9.
+    // The daemon's own sentence, repeated here only as the fallback for an older
+    // daemon that has the status but not the note.
+    var DISABLED_HISTORY_SENTENCE = 'run history is not retained while a task is disabled';
+
+    var DISABLED_RESULT_TIP = 'Disabled — systemd does not keep the run history of a task whose timer is off, so there is no last result to show. The recent journald output on the detail is the only record left.';
+
+    // A muted, outlined pill — for a state that is an ABSENCE of a result
+    // rather than an outcome, so it must not wear an outcome's solid colour.
+    function softPill(label, color, title) {
+        return '<span' + (title ? ' title="' + enc(title) + '"' : '')
+            + ' style="display:inline-block;padding:0 8px;border-radius:9px;font-size:0.85em;'
+            + 'color:' + color + ';border:1px solid ' + color + ';">' + enc(label) + '</span>';
+    }
+
     // Last run: a result pill + the relative time. An overdue task is flagged
     // (silently-overdue counts as failed — the replication policy).
     function renderLastRun(v, meta, rec) {
@@ -789,6 +805,12 @@
                 + 'color:#fff;background:var(--anas-accent,#3468c0);">'
                 + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
                 + enc(t('running')) + '</span>';
+        } else if (result === 'disabled') {
+            // Live-proof F9: a DISABLED task has no timer referencing its unit,
+            // so systemd unloads it and garbage-collects the run history. The
+            // grid used to read `success / never` regardless of what actually
+            // happened — a fabricated outcome. Say there is none.
+            pill = softPill(t('disabled'), 'var(--anas-muted,gray)', t(DISABLED_RESULT_TIP));
         } else if (overdue) {
             pill = pillHtml(t('overdue'), 'var(--anas-danger,#c23b2c)',
                 t('Past its schedule without a successful run — treated as failed.'));
@@ -1603,6 +1625,21 @@
         return html + '</div>';
     }
 
+    // The last-run row. It exists for ONE case (live-proof F9): a DISABLED task
+    // whose run history systemd has garbage-collected has no result at all, and
+    // the detail must say that in words rather than leave the grid's pill to
+    // carry it alone. Nothing is shown for any other status — the grid already
+    // has it, and a second copy would be clutter.
+    function lastRunRow(d) {
+        if (('' + (d.lastRunResult || '')) !== 'disabled') {
+            return '';
+        }
+        var note = d.statusNote || DISABLED_HISTORY_SENTENCE;
+        return kv(t('Last run'),
+            softPill(t('disabled'), 'var(--anas-muted,gray)', t(DISABLED_RESULT_TIP))
+            + ' <span style="color:var(--anas-muted,gray);">' + enc('\u2014 ' + note) + '</span>');
+    }
+
     function recentRunsBlock(d) {
         var runs = first(d.recentRuns, d.runs);
         var journal = first(d.journal, d.recentOutput);
@@ -1735,7 +1772,8 @@
             + kv(t('Schedule'), scheduleDetailHtml(task))
             + kv(t('Enabled'), task.enabled !== false
                 ? '<span style="color:var(--anas-ok,#1f9c56);">' + enc(t('yes')) + '</span>'
-                : '<span style="color:var(--anas-muted,gray);">' + enc(t('no')) + '</span>');
+                : '<span style="color:var(--anas-muted,gray);">' + enc(t('no')) + '</span>')
+            + lastRunRow(d);
 
         var html = '<div style="padding:10px 14px;">'
             + '<table style="border-collapse:collapse;width:100%;">' + rows + '</table>';

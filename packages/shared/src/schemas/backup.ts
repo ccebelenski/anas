@@ -1130,8 +1130,16 @@ export type BackupRunRequest = z.infer<typeof BackupRunRequest>
  * did nothing and says so — today a biweekly off-week fire, recognised by the
  * runner's {@link BACKUP_SKIP_EXIT_CODE}. It is neither a fake success (no
  * backup was taken) nor a failure (nothing went wrong).
+ *
+ * `disabled` is the ABSENCE of a result, not an outcome: systemd unloads an
+ * inactive unit nothing references, and a disabled task has no timer to
+ * reference its service — so the run history is garbage-collected and
+ * `systemctl show` answers from defaults (`Result=success`, empty timestamps).
+ * Reporting that as a success is a fabricated outcome. The member is ADDITIVE:
+ * the field stays required and every previously valid value still parses
+ * (live-proof F9).
  */
-export const BackupRunResult = z.enum(['success', 'failure', 'running', 'skipped', 'unknown'])
+export const BackupRunResult = z.enum(['success', 'failure', 'running', 'skipped', 'unknown', 'disabled'])
 export type BackupRunResult = z.infer<typeof BackupRunResult>
 
 /** A task grid entry: the task + its LOCAL-ONLY runtime status. */
@@ -1169,6 +1177,12 @@ export const BackupTaskDetail = z.object({
   recentRuns: z.array(BackupRecentRun).optional(),
   /** Raw recent journald output (fallback when structured runs aren't parsed). */
   journal: z.string().optional(),
+  /**
+   * One line explaining a status the systemd store cannot answer — today only
+   * the disabled-task case (`lastRunResult: 'disabled'`), where the unit's run
+   * history has been garbage-collected. Absent when there is nothing to explain.
+   */
+  statusNote: z.string().optional(),
   /**
    * Nested filesystems under each archive source RIGHT NOW, and whether the
    * task's current `includeNested` covers each (backup2.2). Local-only: an
@@ -1451,6 +1465,16 @@ export const BackupBrowseEntry = z.object({
    * ISO conversion here would be an invented offset.
    */
   modified: z.string().optional(),
+  /**
+   * What timezone {@link modified} is in, when it is known. `catalog shell`
+   * renders `Modify:` in the READING PROCESS's local timezone with no marker —
+   * the same entry reads `15:06:53` under `Etc/UTC` and `11:06:53` under
+   * `America/New_York` (live-proof F11 / GT amendment 20). The reading process
+   * is the daemon, so the answer is always the NODE's local time; the marker
+   * exists so the UI can LABEL it instead of guessing UTC. Additive and
+   * optional: absent means "not stated", never "UTC".
+   */
+  mtimeZone: z.literal('node-local').optional(),
   /** Octal permission bits as pbc printed them (`644`, `755`). Display only. */
   mode: z.string().optional(),
   /**
