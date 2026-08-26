@@ -126,6 +126,9 @@ engineered from ANAS's side; it is rtslib's behaviour and it is all-or-nothing.
 ### Driving targetcli
 
 **GT-5 — one command per invocation; `targetcli CMD` is the ONLY form with a trustworthy
+
+> **Amendment (iscsi.4 build, 2026-08-25):** `targetcli` joins its argv with spaces and parses ONE configshell command line — so the daemon passes `['/iscsi', 'create', iqn]` as plain argv (no shell quoting anywhere); `"cd /x; ls"` is rejected as two positional parameters, and configshell refuses batching by construction.
+
 exit code.** Three forms exist and they differ dangerously:
 
 | form | multiple commands | exit code on failure | auto-saves |
@@ -523,6 +526,9 @@ secrets were all accepted by `targetcli` and written to configfs verbatim. The 1
 Windows rule is a *client* rule; if ANAS wants it enforced it must do it in the Zod schema.
 
 **GT-35 — secrets are plaintext in three places, and targetcli puts them on argv.**
+
+> **Amendment (iscsi.4 build, 2026-08-25):** LIO's kernel auth store treats the literal string `NULL` as "clear this credential"; a zero-length write stores an EMPTY credential and marks it SET. Clearing therefore writes `NULL`, and the read layer treats `NULL` as unset (`credentialsSet:false`) — the iscsi.2 parser/configfs reader originally reported a cleared secret as set; fixed in iscsi.4.
+
 `.../auth/password` in configfs and `chap_password` in `saveconfig.json` are readable
 plaintext (both root-only), and `targetcli "/iscsi/…/acls/… set auth password=X"` puts the
 secret in the process command line. **A direct configfs write avoids argv entirely and is
