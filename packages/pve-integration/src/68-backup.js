@@ -96,6 +96,18 @@
  *       UNSAVED task previews; omitted fields fall back to the stored task.
  *       User-initiated, one-shot, non-mutating — never polled.
  *
+ *   POST /v1/backup/tasks/preview-nested → { data: { archives:[Scan] } } — the
+ *       wizard's LOCAL boundary scan + the DERIVED per-source `consistency`.
+ *       Body { path, includeNested, kind? } for one row, or { archives:[…] }.
+ *       An 'img' row sends kind:'img' and the daemon skips the tree walk.
+ *   GET /v1/backup/lun-sources → { data: { installed, reason?, luns:[
+ *       {targetIqn, index, name, kind:'zvol'|'file', path, serial, size,
+ *        backingExists, consistency?}] } } — the 'img' path field's LUN picker
+ *       (backup2.4).
+ *       READ-ONLY, LOCAL-ONLY, and a convenience: free-typing a device or image
+ *       path stays first-class. `installed:false` is a normal answer, not an
+ *       error — most nodes serve no block storage.
+ *
  *   Path-picker candidates (convenience, best-effort — free-typing always works):
  *     GET /v1/mounts (mountpoints) + GET /v1/pools then
  *     GET /v1/pools/:name/datasets (dataset mountpoints).
@@ -110,6 +122,10 @@
  * per-row nested choice 'anas-fld-backup-arch-nested' with its path list
  * 'anas-fld-backup-arch-nested-paths' and inline alert
  * 'anas-backup-arch-nested-alert',
+ * per-row kind 'anas-fld-backup-arch-kind' with its name suffix
+ * 'anas-backup-arch-suffix', LUN button 'anas-btn-backup-arch-lun' and image
+ * note 'anas-backup-arch-image-note'; LUN picker 'anas-win-backup-lun-picker'
+ * (grid 'anas-grid-backup-lun-picker', select 'anas-btn-backup-lun-select');
  * schedule fieldset 'anas-backup-schedule' with 'anas-fld-backup-cadence' /
  * '-day' / '-single-day' / '-parity' / '-time' / '-schedule');
  * retention fieldset 'anas-backup-retention' with 'anas-fld-backup-keeplast' …
@@ -253,10 +269,11 @@
         return out;
     }
 
-    // A task's archive names carry an implied `.pxar`; the wizard shows the bare
-    // name. Strip a trailing `.pxar` a user typed so we never double it.
+    // A task's archive names carry an implied suffix (`.pxar`, or `.img` for a
+    // block image — backup2.4); the wizard shows the bare name. Strip a suffix a
+    // user typed so we never double it.
     function bareArchive(name) {
-        return trim(name).replace(/\.pxar$/i, '');
+        return trim(name).replace(/\.(?:pxar|img)$/i, '');
     }
 
     function pillHtml(label, color, title) {
@@ -289,9 +306,56 @@
             if (nested !== 'none') {
                 row.includeNested = nested;
             }
+            // backup2.4 — same rule for the archive KIND and the LUN record:
+            // absent means 'pxar', so 'pxar' is never written back.
+            if (archiveKindOf(a) === 'img') {
+                row.kind = 'img';
+                var lun = lunRefOf(a);
+                if (lun) {
+                    row.lun = lun;
+                }
+            }
             out.push(row);
         }
         return out;
+    }
+
+    // ---- Archive kind (backup2.4) ------------------------------------------
+    //
+    // An archive is either a FILE ARCHIVE of a directory tree (`pxar`, every
+    // archive before this story) or a BLOCK IMAGE of a device or a raw image
+    // file (`img`). The two are not variations of one thing:
+    //   - excludes and nested-filesystem coverage mean nothing on a block image
+    //     (the daemon REFUSES both on an `img` archive), so the wizard hides AND
+    //     disables those controls rather than leaving stale values readable;
+    //   - the change-detection mode does not apply at all, and every run reads
+    //     the whole image — both stated in the row, because a silent surprise on
+    //     a 512 GiB LUN is the expensive kind;
+    //   - a live LUN's image is CRASH-consistent, which is a weaker promise than
+    //     a snapshot and is said out loud.
+
+    /** 'pxar' | 'img' — the one reader of the stored field (absent = pxar). */
+    function archiveKindOf(archive) {
+        return (archive && archive.kind === 'img') ? 'img' : 'pxar';
+    }
+
+    /** The stored { targetIqn, index } LUN record, or null. Never invented. */
+    function lunRefOf(archive) {
+        var l = archive && archive.lun;
+        if (!l || typeof l !== 'object') {
+            return null;
+        }
+        var iqn = trim(l.targetIqn);
+        var idx = l.index;
+        if (!iqn || typeof idx !== 'number' || idx < 0) {
+            return null;
+        }
+        return { targetIqn: iqn, index: idx };
+    }
+
+    /** `<target> LUN <n>` — the LUN identity, spelled out, never truncated. */
+    function lunLabel(lun) {
+        return lun ? (lun.targetIqn + '  ' + t('LUN') + ' ' + lun.index) : '';
     }
 
     // ---- Nested filesystems (backup2.2) ------------------------------------
@@ -1134,6 +1198,226 @@
         pickerBrowse(win, node, start);
     }
 
+    // ---- LUN picker (backup2.4) --------------------------------------------
+    //
+    // The block-storage sibling of the directory picker, and exactly as
+    // OPTIONAL: it fills the path field, and typing a device or image path by
+    // hand keeps working. The list comes from GET /backup/lun-sources — the
+    // iSCSI read layer, filtered to what ANAS can actually say something about
+    // (no unresolvable backings, no PVE-owned volumes) and carrying each LUN's
+    // DERIVED consistency, so the choice is informed before it is made.
+
+    function lunConsistencyChip(rec) {
+        var c = rec && rec.consistency;
+        if (!c || typeof c !== 'object') {
+            return '';
+        }
+        var snap = c.consistency === 'snapshot';
+        if (!snap && c.consistency !== 'live') {
+            return '';
+        }
+        return pillHtml(snap ? t('snapshot') : t('live'),
+            snap ? 'var(--anas-ok,#1f9c56)' : 'var(--anas-muted,gray)',
+            '' + (c.reason || ''));
+    }
+
+    function openLunPicker(node, onSelect) {
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-backup-lun-picker',
+                title: t('Choose an iSCSI LUN'),
+                modal: true,
+                width: 720,
+                height: 420,
+                resizable: true,
+                layout: { type: 'vbox', align: 'stretch' },
+                items: [
+                    {
+                        xtype: 'component',
+                        itemId: 'lunNote',
+                        padding: '8 10 4 10',
+                        html: '',
+                    },
+                    {
+                        xtype: 'gridpanel',
+                        itemId: 'lunGrid',
+                        cls: 'anas-grid-backup-lun-picker',
+                        flex: 1,
+                        border: false,
+                        store: Ext.create('Ext.data.Store', {
+                            fields: ['targetIqn', 'index', 'name', 'kind', 'path', 'serial', 'size', 'backingExists', 'consistency'],
+                            data: [],
+                        }),
+                        emptyText: t('No backup-eligible LUNs on this node'),
+                        columns: [
+                            {
+                                text: t('Target'),
+                                dataIndex: 'targetIqn',
+                                flex: 2,
+                                sortable: false,
+                                menuDisabled: true,
+                                // IQNs are never truncated (the ids rule).
+                                renderer: function (v) { return '<span style="font-family:monospace;">' + enc(v) + '</span>'; },
+                            },
+                            {
+                                text: t('LUN'),
+                                dataIndex: 'index',
+                                width: 60,
+                                sortable: false,
+                                menuDisabled: true,
+                            },
+                            {
+                                text: t('Name'),
+                                dataIndex: 'name',
+                                flex: 1,
+                                sortable: false,
+                                menuDisabled: true,
+                            },
+                            {
+                                text: t('Backing'),
+                                dataIndex: 'path',
+                                flex: 2,
+                                sortable: false,
+                                menuDisabled: true,
+                                renderer: function (v, meta, rec) {
+                                    var kind = rec.get('kind') === 'zvol' ? t('ZFS volume') : t('image file');
+                                    var size = rec.get('size');
+                                    var sizeText = (typeof size === 'number' && size >= 0 && ANAS.formatBytes)
+                                        ? ('  ' + ANAS.formatBytes(size))
+                                        : '';
+                                    // A backing object that does not resolve right
+                                    // now is SHOWN and named — a row that quietly
+                                    // vanished would explain nothing.
+                                    var gone = rec.get('backingExists') === false
+                                        ? '<span style="color:var(--anas-warn,#c9820b);"> — '
+                                            + enc(t('the backing object does not resolve on this node right now'))
+                                            + '</span>'
+                                        : '';
+                                    return '<span style="font-family:monospace;">' + enc(v) + '</span>'
+                                        + '<span style="color:var(--anas-muted,gray);"> (' + enc(kind + sizeText) + ')</span>'
+                                        + gone;
+                                },
+                            },
+                            {
+                                // The SCSI unit serial is the identity an
+                                // initiator (and a PVE volid) pins — shown in
+                                // full, never truncated.
+                                text: t('Serial'),
+                                dataIndex: 'serial',
+                                flex: 1,
+                                sortable: false,
+                                menuDisabled: true,
+                                renderer: function (v) {
+                                    return v
+                                        ? '<span style="font-family:monospace;">' + enc(v) + '</span>'
+                                        : '<span style="color:var(--anas-muted,gray);">' + enc(t('not readable')) + '</span>';
+                                },
+                            },
+                            {
+                                text: t('Consistency'),
+                                dataIndex: 'consistency',
+                                width: 120,
+                                sortable: false,
+                                menuDisabled: true,
+                                renderer: function (v, meta, rec) {
+                                    return lunConsistencyChip({ consistency: rec.get('consistency') });
+                                },
+                            },
+                        ],
+                        listeners: {
+                            itemdblclick: function (g, rec) {
+                                selectLun(win, rec, onSelect);
+                            },
+                        },
+                    },
+                ],
+                buttons: [
+                    { text: t('Cancel'), handler: function () { win.close(); } },
+                    {
+                        text: t('Select'),
+                        cls: 'anas-btn-backup-lun-select',
+                        handler: function () {
+                            var grid = win.down('#lunGrid');
+                            var sel = grid ? grid.getSelection() : [];
+                            if (!sel || !sel.length) {
+                                return;
+                            }
+                            selectLun(win, sel[0], onSelect);
+                        },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('LUN picker window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+        loadLunSources(win, node);
+    }
+
+    function selectLun(win, rec, onSelect) {
+        if (onSelect) {
+            try {
+                onSelect({
+                    targetIqn: '' + rec.get('targetIqn'),
+                    index: rec.get('index'),
+                    path: '' + rec.get('path'),
+                });
+            } catch (e) {
+                ANAS.warn('LUN select failed: ' + ANAS.errText(e));
+            }
+        }
+        win.close();
+    }
+
+    function lunNoteOut(win, html) {
+        try {
+            var out = win && win.down ? win.down('#lunNote') : null;
+            if (out && !out.destroyed && !out.destroying) {
+                out.update(html);
+            }
+        } catch (e) {
+            ANAS.warn('LUN picker note render failed: ' + ANAS.errText(e));
+        }
+    }
+
+    function loadLunSources(win, node) {
+        var grid = win.down('#lunGrid');
+        if (grid) {
+            try { grid.setLoading(true); } catch (e) { /* non-fatal */ }
+        }
+        ANAS.api.get(node, '/backup/lun-sources').then(
+            function (res) {
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                if (grid) {
+                    try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
+                }
+                var d = (res && res.data) || {};
+                var rows = isArray(d.luns) ? d.luns : [];
+                try { grid.getStore().loadData(rows); } catch (e2) { /* non-fatal */ }
+                // "Not installed" is a first-class state, not an error: say it
+                // plainly instead of showing an empty grid with no explanation.
+                lunNoteOut(win, d.installed === false
+                    ? ('<div style="font-size:11px;color:var(--anas-muted,gray);">'
+                        + enc('' + (d.reason || t('This node does not serve iSCSI block storage.'))) + '</div>')
+                    : '');
+            },
+            function (err) {
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                if (grid) {
+                    try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
+                }
+                lunNoteOut(win, '<div style="font-size:11px;color:var(--anas-muted,gray);">'
+                    + enc(t('Could not list iSCSI LUNs') + ': ' + ANAS.errText(err)) + '</div>');
+            }
+        );
+    }
+
     // CAS-aware repo writes go through the shared ANAS.casWrite (10-api.js) —
     // the same registry-conflict discipline the replication remotes use.
 
@@ -1372,6 +1656,30 @@
         return out;
     }
 
+    /**
+     * The per-archive detail for a BLOCK IMAGE (backup2.4). It says three things
+     * a file archive's block never has to: the kind, the LUN identity when the
+     * source was picked as one, and the two facts about how an image is read.
+     * There is no nested-filesystem line — an image has none.
+     */
+    function imageDetailHtml(archive, scan) {
+        var out = '';
+        var chip = consistencyChipHtml(scan);
+        if (chip) {
+            out += '<div style="margin-top:3px;">' + chip + '</div>';
+        }
+        out += '<div style="color:var(--anas-muted,gray);margin-top:2px;">'
+            + enc(t('block image — every run reads the full image; the change-detection mode does not apply'))
+            + '</div>';
+        var lun = lunRefOf(archive);
+        if (lun) {
+            out += '<div style="color:var(--anas-muted,gray);margin-top:2px;">'
+                + enc(t('iSCSI LUN') + ': ')
+                + '<span style="font-family:monospace;">' + enc(lunLabel(lun)) + '</span></div>';
+        }
+        return out;
+    }
+
     function archivesBlock(task, scans) {
         var archives = archivesOf(task);
         if (!archives.length) {
@@ -1384,7 +1692,9 @@
         html += '<table style="border-collapse:collapse;width:100%;font-size:12px;">';
         for (var i = 0; i < archives.length; i++) {
             var a = archives[i];
-            var name = (a.name || '') + '.pxar';
+            // backup2.4 — the archive's real name on the server carries its kind.
+            var img = archiveKindOf(a) === 'img';
+            var name = (a.name || '') + (img ? '.img' : '.pxar');
             var excl = (a.excludes && a.excludes.length)
                 ? '<div style="color:var(--anas-muted,gray);margin-top:2px;">'
                     + enc(t('excludes') + ': ' + a.excludes.join('  ')) + '</div>'
@@ -1392,7 +1702,10 @@
             html += '<tr><td style="padding:3px 12px 3px 0;vertical-align:top;font-family:monospace;'
                 + 'white-space:nowrap;color:var(--anas-accent,#3468c0);">' + enc(name) + '</td>'
                 + '<td style="padding:3px 0;">' + mono(a.path) + excl
-                + nestedDetailHtml(a, nestedScanFor(scans, a)) + '</td></tr>';
+                + (img
+                    ? imageDetailHtml(a, nestedScanFor(scans, a))
+                    : nestedDetailHtml(a, nestedScanFor(scans, a)))
+                + '</td></tr>';
         }
         html += '</table></div>';
         return html;
@@ -1429,6 +1742,23 @@
         return out;
     }
 
+    /**
+     * The suffix a run-log archive name should be shown with. journald's line is
+     * `archive '<name>' <- <root>` and carries no kind, so it is looked up in the
+     * task's OWN archives by exact name — a derived child (`<name>__<child>`) is
+     * always a file archive, and an unknown name degrades to `.pxar` rather than
+     * guessing from the root path.
+     */
+    function runArchiveSuffix(task, name) {
+        var archives = archivesOf(task);
+        for (var i = 0; i < archives.length; i++) {
+            if (archives[i].name === name) {
+                return archiveKindOf(archives[i]) === 'img' ? '.img' : '.pxar';
+            }
+        }
+        return '.pxar';
+    }
+
     function lastRunSnapshotBlock(d) {
         var blobs = runOutputs(d);
         var snapshots = [];
@@ -1460,7 +1790,7 @@
         for (var r = 0; r < roots.length; r++) {
             html += '<div style="font-size:12px;">'
                 + '<span style="font-family:monospace;color:var(--anas-accent,#3468c0);">'
-                + enc(roots[r].name + '.pxar') + '</span>'
+                + enc(roots[r].name + runArchiveSuffix(d.task || d, roots[r].name)) + '</span>'
                 + '<span style="color:var(--anas-muted,gray);"> ← </span>'
                 + '<span style="font-family:monospace;">' + enc(roots[r].root) + '</span></div>';
         }
@@ -1724,10 +2054,15 @@
                                 value: bareArchive(data.name || ''),
                             },
                             {
+                                // The stored suffix, shown so the archive's real
+                                // name on the server is never a guess. It follows
+                                // the Kind control (backup2.4).
                                 xtype: 'component',
+                                itemId: 'archSuffix',
+                                cls: 'anas-backup-arch-suffix',
                                 margin: '0 0 0 6',
                                 style: 'line-height:24px;color:var(--anas-muted,gray);font-family:monospace;',
-                                html: '.pxar',
+                                html: archiveKindOf(data) === 'img' ? '.img' : '.pxar',
                             },
                             {
                                 xtype: 'button',
@@ -1744,6 +2079,34 @@
                                 },
                             },
                         ],
+                    },
+                    {
+                        // backup2.4 — Files or Block image. Changing it rewrites
+                        // what the rest of the row means, so every dependent
+                        // control is re-synced (and re-scanned) on change.
+                        xtype: 'combobox',
+                        itemId: 'archKind',
+                        cls: 'anas-fld-backup-arch-kind',
+                        fieldLabel: t('Kind'),
+                        labelWidth: 120,
+                        editable: false,
+                        queryMode: 'local',
+                        valueField: 'kind',
+                        displayField: 'label',
+                        store: Ext.create('Ext.data.Store', {
+                            fields: ['kind', 'label'],
+                            data: [
+                                { kind: 'pxar', label: t('Files — a directory tree') },
+                                { kind: 'img', label: t('Block image — a device or a raw image file') },
+                            ],
+                        }),
+                        value: archiveKindOf(data),
+                        listeners: {
+                            change: function () {
+                                syncArchiveKind(fs);
+                                scanArchiveNested(fs, node);
+                            },
+                        },
                     },
                     {
                         // The path field + a folder button that opens the
@@ -1772,11 +2135,18 @@
                                     // A new source has different boundaries — rescan.
                                     // DEBOUNCED: `change` fires per keystroke, and each
                                     // scan is a real tree walk on the node.
-                                    change: function () { scheduleNestedScan(fs, node); },
+                                    // The kind sync rides along so a LUN identity
+                                    // stops being shown the moment the path stops
+                                    // being the one it was picked at.
+                                    change: function () {
+                                        syncArchiveKind(fs);
+                                        scheduleNestedScan(fs, node);
+                                    },
                                 },
                             },
                             {
                                 xtype: 'button',
+                                itemId: 'archBrowse',
                                 cls: 'anas-btn-backup-arch-browse',
                                 iconCls: 'fa fa-folder-open',
                                 tooltip: t('Browse for a directory'),
@@ -1788,6 +2158,34 @@
                                         if (f) {
                                             f.setValue(chosen);
                                         }
+                                    });
+                                },
+                            },
+                            {
+                                // backup2.4 — the block-storage sibling of the
+                                // directory picker. It FILLS the path field (and
+                                // records which LUN was picked); typing a device
+                                // or file path by hand stays first-class.
+                                xtype: 'button',
+                                itemId: 'archLun',
+                                cls: 'anas-btn-backup-arch-lun',
+                                iconCls: 'fa fa-hdd-o',
+                                text: t('LUN…'),
+                                tooltip: t('Pick an iSCSI LUN served by this node'),
+                                margin: '0 0 0 6',
+                                hidden: archiveKindOf(data) !== 'img',
+                                handler: function () {
+                                    openLunPicker(node, function (chosen) {
+                                        var f = fs.down('#archPath');
+                                        if (f) {
+                                            f.setValue(chosen.path);
+                                        }
+                                        // The record follows the PATH: it is only
+                                        // sent while the field still holds the
+                                        // path this LUN was picked at.
+                                        fs.anasLun = { targetIqn: chosen.targetIqn, index: chosen.index };
+                                        fs.anasLunPath = chosen.path;
+                                        syncArchiveKind(fs);
                                     });
                                 },
                             },
@@ -1850,6 +2248,17 @@
                         },
                     },
                     {
+                        // backup2.4 — the two facts about a block image that
+                        // cost money if they are learned later, plus the LUN
+                        // identity when the source was picked as one.
+                        xtype: 'component',
+                        itemId: 'archImageNote',
+                        cls: 'anas-backup-arch-image-note',
+                        margin: '2 0 0 0',
+                        hidden: archiveKindOf(data) !== 'img',
+                        html: '',
+                    },
+                    {
                         xtype: 'component',
                         itemId: 'archNestedAlert',
                         cls: 'anas-backup-arch-nested-alert',
@@ -1862,10 +2271,94 @@
             ANAS.warn('archive row add failed: ' + ANAS.errText(e));
         }
         if (fs) {
+            // The stored LUN record travels with the row and with the PATH it
+            // was recorded at — see readArchives.
+            fs.anasLun = lunRefOf(data);
+            fs.anasLunPath = fs.anasLun ? ('' + (data.path == null ? '' : data.path)) : '';
+            syncArchiveKind(fs);
             syncArchiveNested(fs);
             scanArchiveNested(fs, node);
         }
         return fs;
+    }
+
+    // Kind decides what the rest of the row MEANS. For a block image the
+    // excludes and nested-filesystem controls are hidden AND DISABLED — the
+    // daemon refuses both on an `img` archive, so leaving a readable stale value
+    // behind would turn a kind switch into a rejected save with no visible
+    // cause. Read by itemId off the ROW (itemIds repeat across rows).
+    function syncArchiveKind(fs) {
+        try {
+            if (!fs || fs.destroyed || fs.destroying) {
+                return;
+            }
+            var kindF = fs.down('#archKind');
+            var img = kindF ? ('' + (kindF.getValue() || 'pxar')) === 'img' : false;
+            var suffix = fs.down('#archSuffix');
+            if (suffix) {
+                suffix.update(img ? '.img' : '.pxar');
+            }
+            var lunBtn = fs.down('#archLun');
+            if (lunBtn) {
+                lunBtn.setVisible(img);
+            }
+            var browse = fs.down('#archBrowse');
+            if (browse) {
+                browse.setVisible(!img);
+            }
+            var fields = ['#archExcludes', '#archNested', '#archNestedPaths'];
+            for (var i = 0; i < fields.length; i++) {
+                var f = fs.down(fields[i]);
+                if (!f) {
+                    continue;
+                }
+                f.setVisible(!img);
+                f.setDisabled(img);
+            }
+            var note = fs.down('#archImageNote');
+            if (note) {
+                note.setVisible(img);
+                note.update(img ? imageNoteHtml(fs) : '');
+            }
+            if (!img) {
+                // A file archive carries no LUN record — dropping it here is the
+                // same "absent is the clear" rule the save path uses.
+                fs.anasLun = null;
+                fs.anasLunPath = '';
+                syncArchiveNested(fs);
+            }
+        } catch (e) {
+            ANAS.warn('archive kind sync failed: ' + ANAS.errText(e));
+        }
+    }
+
+    /**
+     * The two honest statements every block-image archive carries, and the LUN
+     * identity when there is one. Both statements are ground truth, not caution:
+     * `--change-detection-mode` is a complete no-op for an image (there is no
+     * metadata/payload split at all), and an image of a LIVE device is
+     * crash-consistent — what a power cut would have left, not a quiesced state.
+     */
+    function imageNoteHtml(fs) {
+        // The LUN identity is shown only while the path field still holds the
+        // path it was picked at — exactly the condition under which it is SENT.
+        var pathF = fs && fs.down ? fs.down('#archPath') : null;
+        var current = trim(pathF ? pathF.getValue() : '');
+        var lun = (fs && fs.anasLun && fs.anasLunPath === current) ? fs.anasLun : null;
+        var lines = '<div style="font-size:11px;color:var(--anas-muted,gray);">'
+            + '<i class="fa fa-info-circle" style="margin-right:5px;"></i>'
+            + enc(t('Every run reads the full image (the change-detection mode does not apply to an image).'))
+            + '</div>'
+            + '<div style="font-size:11px;color:var(--anas-muted,gray);">'
+            + '<i class="fa fa-info-circle" style="margin-right:5px;"></i>'
+            + enc(t('A backup of a live LUN is crash-consistent.'))
+            + '</div>';
+        if (lun) {
+            lines += '<div style="font-size:11px;color:var(--anas-muted,gray);">'
+                + '<i class="fa fa-hdd-o" style="margin-right:5px;"></i>'
+                + '<span style="font-family:monospace;">' + enc(lunLabel(lun)) + '</span></div>';
+        }
+        return lines;
     }
 
     // Show the path list only for Choose… — the two other modes have nothing to
@@ -2002,10 +2495,17 @@
             nestedAlertOut(fs, '');
             return;
         }
-        var body = { path: path, includeNested: nestedFromRow(fs) };
+        var kindF = fs.down('#archKind');
+        var img = kindF ? ('' + (kindF.getValue() || 'pxar')) === 'img' : false;
+        var body = { path: path, includeNested: img ? 'none' : nestedFromRow(fs) };
+        if (img) {
+            // The daemon skips the tree walk for an image source and answers with
+            // the derived consistency alone — nothing is stat'ed.
+            body.kind = 'img';
+        }
         nestedAlertOut(fs, '<div style="font-size:11px;color:var(--anas-muted,gray);">'
             + '<i class="fa fa-refresh fa-spin" style="margin-right:5px;"></i>'
-            + enc(t('checking for nested filesystems…')) + '</div>');
+            + enc(img ? t('checking this image source…') : t('checking for nested filesystems…')) + '</div>');
         ANAS.api.post(node, '/backup/tasks/preview-nested', body).then(
             function (res) {
                 if (fs.destroyed || fs.destroying) {
@@ -2045,18 +2545,34 @@
             if (!name && !path) {
                 return; // skip a wholly-empty row
             }
+            var kindF = fs.down('#archKind');
+            var img = kindF ? ('' + (kindF.getValue() || 'pxar')) === 'img' : false;
             var row = {
                 name: name,
                 path: path,
-                excludes: splitLines(exclF ? exclF.getValue() : ''),
+                // A block image has no excludes — the daemon refuses them, so the
+                // (disabled) field's contents are never read for one.
+                excludes: img ? [] : splitLines(exclF ? exclF.getValue() : ''),
             };
             // backup2.2 — set / clear / keep: a chosen value is SENT, and None
             // is sent as NOTHING. Archives are replaced wholesale on every save,
             // so an omitted field IS the clear — and a task that never chose one
             // rewrites its unit byte-for-byte (the dialog ↔ daemon contract).
-            var nested = nestedFromRow(fs);
+            var nested = img ? 'none' : nestedFromRow(fs);
             if (nested !== 'none') {
                 row.includeNested = nested;
+            }
+            // backup2.4 — the same rule for kind: 'img' is sent, Files is sent as
+            // NOTHING (absent already means pxar), so a pre-backup2.4 archive
+            // still rewrites byte-for-byte. The LUN record rides along only while
+            // the path field still holds the path it was recorded at — a
+            // re-typed path is a different source, and a stale LUN reference
+            // would be a lie the restore story would act on.
+            if (img) {
+                row.kind = 'img';
+                if (fs.anasLun && fs.anasLunPath === path) {
+                    row.lun = { targetIqn: fs.anasLun.targetIqn, index: fs.anasLun.index };
+                }
             }
             out.push(row);
         });

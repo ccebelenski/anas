@@ -271,3 +271,86 @@ describe('backup expansion — deterministic archive roots (backup2.3)', () => {
     assert.deepEqual(plan.archives[1].excludes, ['/thumbs', '*.tmp'])
   })
 })
+
+/**
+ * backup2.4 — an `img` archive never expands. A block image is one object: no
+ * nested filesystems, no excludes (the schema refuses both), and exactly one
+ * root whether the run is live or snapshot-consistent.
+ */
+describe('backup expansion — block images (backup2.4)', () => {
+  const ZVOL: BackupArchiveConsistency = {
+    consistency: 'snapshot',
+    reason: 'the ZFS volume tank/vol1',
+    backend: 'zfs',
+    target: 'tank/vol1',
+    zvolDevice: '/dev/zvol/tank/vol1',
+  }
+
+  it('a zvol image root is the snapshot DEVICE, not a .zfs/snapshot path', () => {
+    assert.equal(snapshotRoot(ZVOL, SNAP), `/dev/zvol/tank/vol1@${SNAP}`)
+  })
+
+  it('a zvol plan is exactly one root, named `img`, with no excludes', () => {
+    const plan = planExpansion({
+      archive: { name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img' },
+      consistency: ZVOL,
+      snapshot: SNAP,
+    })
+    assert.deepEqual(plan.archives, [{
+      name: 'lun0',
+      from: 'lun0',
+      root: `/dev/zvol/tank/vol1@${SNAP}`,
+      relativePath: '',
+      excludes: [],
+      kind: 'img',
+    }])
+    assert.deepEqual(plan.warnings, [])
+    assert.deepEqual(plan.ahrSubvolumeSnapshots, [])
+  })
+
+  it('an image FILE on a dataset takes the .zfs/snapshot root, still one archive', () => {
+    const plan = planExpansion({
+      archive: { name: 'lun0', path: '/tank/media/images/lun.raw', excludes: [], kind: 'img' },
+      consistency: { ...ZFS, relativePath: 'images/lun.raw' },
+      snapshot: SNAP,
+    })
+    assert.equal(plan.archives.length, 1)
+    assert.equal(plan.archives[0].root, `/tank/media/.zfs/snapshot/${SNAP}/images/lun.raw`)
+    assert.equal(plan.archives[0].kind, 'img')
+  })
+
+  it('an image never expands, even when a scan somehow reports nested entries', () => {
+    const plan = planExpansion({
+      archive: { name: 'lun0', path: '/tank/media/images/lun.raw', excludes: [], kind: 'img' },
+      consistency: { ...ZFS, relativePath: 'images/lun.raw' },
+      scan: scan('/tank/media/images/lun.raw', [entry('/tank/media/images/lun.raw/child')]),
+      snapshot: SNAP,
+    })
+    assert.equal(plan.archives.length, 1)
+  })
+
+  it('a LIVE image is read where it is, and still carries its kind', () => {
+    const plan = planExpansion({
+      archive: { name: 'lun0', path: '/dev/sdb', excludes: [], kind: 'img' },
+      consistency: LIVE,
+      snapshot: SNAP,
+    })
+    assert.deepEqual(plan.archives, [{
+      name: 'lun0',
+      from: 'lun0',
+      root: '/dev/sdb',
+      relativePath: '',
+      excludes: [],
+      kind: 'img',
+    }])
+  })
+
+  it('a pxar archive still carries NO kind key at all (version skew: absent = pxar)', () => {
+    const plan = planExpansion({
+      archive: { name: 'media', path: '/tank/media', excludes: [] },
+      consistency: ZFS,
+      snapshot: SNAP,
+    })
+    assert.equal('kind' in plan.archives[0], false, JSON.stringify(plan.archives[0]))
+  })
+})

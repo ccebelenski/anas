@@ -57,17 +57,23 @@ export {
 
 // Backup schemas (Epic 16 — PBS file backup)
 export {
+  archiveSpecType,
   BACKUP_SKIP_EXIT_CODE,
   BACKUP_SKIPPED_OFF_WEEK,
   BACKUP_WEEKDAYS,
   BackupArchive,
   BackupArchiveConsistency,
+  BackupArchiveKind,
   BackupAuthType,
   BackupCadence,
   BackupCadenceKind,
   BackupConsistency,
   BackupExpandedArchive,
   BackupIncludeNested,
+  BackupLunRef,
+  BackupLunSource,
+  BackupLunSourceKind,
+  BackupLunSourceList,
   BackupName,
   BackupNestedEntry,
   BackupNestedKind,
@@ -104,6 +110,7 @@ export {
   BackupWeekParity,
   cadenceToOnCalendar,
   ChangeDetectionMode,
+  effectiveArchiveKind,
   effectiveIncludeNested,
   expandedArchiveName,
   hasRetentionKeeps,
@@ -262,6 +269,9 @@ export {
   unbracketAddress,
   UpdateIscsiLunRequest,
   UpdateIscsiTargetRequest,
+  ZVOL_PATH_PREFIX,
+  zvolDatasetFromPath,
+  zvolDevicePath,
 } from './schemas/iscsi.js'
 
 // Job schemas

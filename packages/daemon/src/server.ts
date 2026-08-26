@@ -484,7 +484,22 @@ export function createServer(opts?: ServerOptions) {
   server.register(replicationRemotesRoutes, { prefix: '/v1', executor, jobQueue, paths: remotesPaths, transport, systemdDir })
   // PBS file backup (Epic 16) — repositories registry (CAS + creds + test) and
   // the systemd units-as-store task CRUD + LOCAL-ONLY status + Run-Now.
-  server.register(backupRoutes, { prefix: '/v1', executor, jobQueue, paths: backupReposPaths, systemdDir })
+  // The iSCSI read layer's paths ride along for backup2.4's LUN-source picker —
+  // the SAME overrides the iSCSI routes take below, so one env points both at a
+  // materialised capture and neither ever reads the kernel in a test.
+  server.register(backupRoutes, {
+    prefix: '/v1',
+    executor,
+    jobQueue,
+    paths: backupReposPaths,
+    systemdDir,
+    iscsiPaths: {
+      configfsRoot: process.env.ANAS_ISCSI_CONFIGFS,
+      blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
+      saveconfigPath: process.env.ANAS_ISCSI_SAVECONFIG,
+      pveStorageCfg: process.env.ANAS_STORAGE_CFG,
+    },
+  })
   // Uniform snapshot schedules (Epic 17.3/17.4) — units-as-store CRUD + status +
   // fire (take + prune). AHR targets mount @data on demand at subvolRuntimeDir.
   const subvolRuntimeDir = process.env.ANAS_AHR_SUBVOL_RUNTIME_DIR

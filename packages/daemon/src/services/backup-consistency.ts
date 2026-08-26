@@ -1,7 +1,9 @@
 import type { AhrPool, BackupArchiveConsistency } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
-import { isPathWithin } from '@anas/shared'
+import { isPathWithin, zvolDatasetFromPath, zvolDevicePath } from '@anas/shared'
+import { PVE_STORAGE_CFG, readPveStorages } from '../parsers/pve-storage.js'
+import { PVE_GUEST_VOLUME_RE } from './iscsi-ownership.js'
 import { mountIndex, normalizePath, relativeTo } from './nested-filesystems.js'
 
 /**
@@ -47,6 +49,26 @@ import { mountIndex, normalizePath, relativeTo } from './nested-filesystems.js'
  * (backup-expansion.ts) — because a snapshot of the root captures the root's
  * filesystem and nothing else, on BOTH backends (GT-52 for btrfs; a ZFS child
  * dataset is simply a different filesystem).
+ *
+ * BLOCK SOURCES (story backup2.4). An `img` archive's path is a device or a
+ * regular file, and the same three verdicts apply — with one branch added ahead
+ * of the mount lookup:
+ *
+ *   ZVOL  → `snapshot`, via `zvolDevice`. A `/dev/zvol/<pool>/<vol>` path is not
+ *           in the mount table and has no `.zfs/snapshot` directory, so the run
+ *           snapshots the VOLUME (`zfs snapshot -r <pool>/<vol>@<label>`, the
+ *           backup2.3 lifecycle unchanged) and reads the snapshot's own device
+ *           node, published for the duration with `zfs set snapdev=visible` and
+ *           restored with `zfs inherit snapdev` (GT-44/GT-45/GT-46).
+ *           PVE territory is excluded first: a guest volume (`vm-N-disk-M`) or a
+ *           zvol on a PVE-managed pool is hands-off, so it is honestly `live`.
+ *   FILE  → exactly the directory rules above. An image file on a ZFS dataset or
+ *           an AHR `@data` subvolume backs up from that filesystem's snapshot,
+ *           with the file's own relative path under the snapshot root (GT-34: a
+ *           regular file is a first-class `.img` source — no loop device).
+ *   other → `live`, and a live block image is CRASH-CONSISTENT: the reason says
+ *           so, because that is a different (and weaker) promise than a live
+ *           file tree's.
  */
 
 const FINDMNT = '/usr/bin/findmnt'
@@ -62,6 +84,14 @@ export interface ConsistencyFacts {
   mounts: Map<string, FindmntNode>
   /** Live AHR topology (empty when it could not be read). */
   ahrPools: AhrPool[]
+  /**
+   * ZFS pool roots PVE manages, from `storage.cfg` (backup2.4). Only the zvol
+   * branch needs them: PVE territory is read-only and hands-off, so ANAS never
+   * takes a transient snapshot of a zvol PVE owns. Empty when the file could not
+   * be read — which derives to `snapshot` for a non-guest-named volume, the same
+   * posture `/v1/pools` already takes when storage.cfg is unreadable.
+   */
+  pvePools: Set<string>
 }
 
 /**
@@ -73,6 +103,7 @@ export interface ConsistencyFacts {
 export async function readConsistencyFacts(
   executor: CommandExecutor,
   readAhrPools: (executor: CommandExecutor) => Promise<AhrPool[]>,
+  opts: { pveStorageCfg?: string } = {},
 ): Promise<ConsistencyFacts> {
   let mounts = new Map<string, FindmntNode>()
   try {
@@ -90,7 +121,17 @@ export async function readConsistencyFacts(
   catch {
     ahrPools = []
   }
-  return { mounts, ahrPools }
+  // One file read, no `zfs list`: the zvol branch only needs the zfspool
+  // storages, which `readPveStorages` resolves without mountpoints. Fail-open
+  // (the parser already is): an unreadable storage.cfg yields an empty map.
+  let pvePools = new Set<string>()
+  try {
+    pvePools = new Set((await readPveStorages(opts.pveStorageCfg ?? PVE_STORAGE_CFG)).keys())
+  }
+  catch {
+    pvePools = new Set()
+  }
+  return { mounts, ahrPools, pvePools }
 }
 
 /**
@@ -130,6 +171,41 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     return {
       consistency: 'live',
       reason: `${source} is already inside a ZFS snapshot - it is read-only and unchanging, so nothing is snapshotted for it`,
+    }
+  }
+
+  // --- Block sources (backup2.4) -----------------------------------------
+  // A device path is answered BEFORE the mount table is consulted: `/dev` is
+  // itself a mount (devtmpfs), so a longest-prefix match would gladly report a
+  // zvol as "on udev (devtmpfs)" and call it live for the wrong reason.
+  const zvol = zvolDatasetFromPath(source)
+  if (zvol) {
+    const pool = zvol.split('/')[0]
+    const volume = zvol.split('/').at(-1) ?? zvol
+    if (PVE_GUEST_VOLUME_RE.test(volume)) {
+      return {
+        consistency: 'live',
+        reason: `${source} is a PVE guest volume - PVE owns its guests' disks and their snapshots, so ANAS takes none and the image is read live (crash-consistent)`,
+      }
+    }
+    if (facts.pvePools.has(pool)) {
+      return {
+        consistency: 'live',
+        reason: `${source} is on pool '${pool}', which PVE manages - PVE territory is hands-off, so ANAS takes no snapshot and the image is read live (crash-consistent)`,
+      }
+    }
+    return {
+      consistency: 'snapshot',
+      reason: `${source} is the ZFS volume ${zvol}; the run snapshots the volume and reads the snapshot's own read-only device node (snapdev is published for the run and restored afterwards)`,
+      backend: 'zfs',
+      target: zvol,
+      zvolDevice: zvolDevicePath(zvol),
+    }
+  }
+  if (source.startsWith('/dev/')) {
+    return {
+      consistency: 'live',
+      reason: `${source} is a block device ANAS does not manage - only a ZFS volume can be snapshotted, so the image is read live (crash-consistent: whatever the device holds while the run reads it)`,
     }
   }
 
@@ -220,4 +296,14 @@ export async function deriveArchiveConsistency(
 ): Promise<BackupArchiveConsistency[]> {
   const facts = await readConsistencyFacts(executor, readAhrPools)
   return archives.map(a => deriveConsistency(a.path, facts))
+}
+
+/**
+ * Is this derived consistency a ZVOL source (backup2.4)? The one predicate the
+ * runner, the expansion planner and the routes ask — so "a zvol is the one
+ * snapshot source with no mountpoint" is stated once, not re-derived from the
+ * shape of the object in three places.
+ */
+export function isZvolConsistency(c: BackupArchiveConsistency): boolean {
+  return c.consistency === 'snapshot' && typeof c.zvolDevice === 'string' && c.zvolDevice.length > 0
 }

@@ -23,6 +23,11 @@
  *      choice round-trips, clearing to None sends NO key, and an archive that
  *      never chose one still sends nothing after an untouched edit — which is
  *      what keeps a pre-backup2.2 unit byte-identical on save.
+ *   3b. `kind` (backup2.4) has the same set / clear / keep semantics, and an
+ *      `img` row hides AND DISABLES the controls that cannot apply to a block
+ *      image — a stale exclude read back off a hidden field would be refused by
+ *      the daemon with nothing on screen to explain it. The LUN record follows
+ *      the PATH: retype the path and the record is not sent.
  *   4. Import Pool sends the GUID it displays — duplicate-name imports are the
  *      whole reason the scan reports a GUID.
  *   4. Datasets: a VOLUME (zvol) and a FILESYSTEM are the same dialog sending
@@ -465,6 +470,10 @@ const TASK = {
     { name: 'pictures', path: '/mnt/pictures', excludes: ['**/*.tmp', '**/cache'], includeNested: 'all' },
     { name: 'etc', path: '/etc', excludes: [], includeNested: ['/etc/pve'] },
     { name: 'srv', path: '/srv', excludes: [] },
+    // backup2.4 — a BLOCK IMAGE with the LUN record it was picked at. Its
+    // excludes/nested controls must be hidden AND disabled, and an untouched
+    // edit must send `kind` and `lun` back verbatim.
+    { name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', lun: { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 } },
   ],
   changeDetectionMode: 'metadata',
   retention: { keepLast: 3, keepDaily: 7, keepWeekly: 4, keepMonthly: 6, keepYearly: 2 },
@@ -513,7 +522,44 @@ const CONSISTENCY_BY_PATH = {
     consistency: 'live',
     reason: '/srv is on /dev/sda1 (ext4), which has no snapshot mechanism ANAS can drive - the backup is live',
   },
+  // backup2.4 — a zvol answers through its snapshot DEVICE, not a `.zfs` path.
+  '/dev/zvol/tank/vol1': {
+    consistency: 'snapshot',
+    reason: '/dev/zvol/tank/vol1 is the ZFS volume tank/vol1; the run snapshots the volume and reads the snapshot device (snapdev is published for the run and restored afterwards)',
+    backend: 'zfs',
+    target: 'tank/vol1',
+    zvolDevice: '/dev/zvol/tank/vol1',
+  },
 }
+
+/**
+ * backup2.4 — what `GET /backup/lun-sources` returns: the read layer's
+ * backup-eligible LUNs, already filtered (nothing foreign, nothing PVE-owned)
+ * and carrying each one's derived consistency.
+ */
+const LUN_SOURCES = [
+  {
+    targetIqn: 'iqn.2026-08.anas:vmstore',
+    index: 0,
+    name: 'tank_vol1',
+    kind: 'zvol',
+    path: '/dev/zvol/tank/vol1',
+    serial: '9bc6e907-6015-4267-be4f-5a0617cb3d71',
+    size: 2147483648,
+    backingExists: true,
+    consistency: CONSISTENCY_BY_PATH['/dev/zvol/tank/vol1'],
+  },
+  {
+    targetIqn: 'iqn.2026-08.anas:vmstore',
+    index: 1,
+    name: 'tank_lun2',
+    kind: 'file',
+    path: '/tank/images/lun2.raw',
+    serial: '689844a4-1d20-4cba-8516-bdc52a402645',
+    size: 1073741824,
+    backingExists: true,
+  },
+]
 
 /** Every preview-nested body the dialog sent (the endpoint must be user-driven). */
 const nestedPreviews = []
@@ -545,6 +591,7 @@ const BACKUP_ROUTES = {
   'GET /mounts': { data: [] },
   'GET /pools': { data: [] },
   'POST /backup/tasks/preview-nested': nestedPreviewRoute,
+  'GET /backup/lun-sources': { data: { installed: true, luns: LUN_SOURCES } },
 }
 
 /**
@@ -793,6 +840,177 @@ async function consistencyChecks() {
   sweepFields('consistency: untouched edit', body, TASK)
 
   ok('consistency: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  1d. backup2.4 — archive kind: what an `img` row shows, disables and SENDS
+// ============================================================================
+
+async function imageKindChecks() {
+  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  grid.selectRow(0)
+
+  nestedPreviews.length = 0
+  let dlg = await openEdit(grid)
+  let rows = archiveRows(dlg)
+  eq('kind: the dialog built one row per archive', rows.length, TASK.archives.length)
+
+  // --- The stored kind prefills, and absent prefills as Files ---
+  eq('kind: a stored `img` prefills as Block image', rows[3].down('#archKind').getValue(), 'img')
+  eq('kind: an ABSENT kind prefills as Files', rows[0].down('#archKind').getValue(), 'pxar')
+  eq('kind: the archive-name suffix follows the kind', rows[3].down('#archSuffix').html, '.img')
+  eq('kind: a file archive still shows .pxar', rows[0].down('#archSuffix').html, '.pxar')
+
+  // --- The controls that do not apply are hidden AND disabled ---
+  ok('kind(img): excludes are hidden', rows[3].down('#archExcludes').hidden === true)
+  ok('kind(img): excludes are DISABLED, so a stale value cannot be read back',
+    rows[3].down('#archExcludes').disabled === true)
+  ok('kind(img): the nested choice is hidden', rows[3].down('#archNested').hidden === true)
+  ok('kind(img): the nested choice is DISABLED', rows[3].down('#archNested').disabled === true)
+  ok('kind(img): the nested path list is hidden', rows[3].down('#archNestedPaths').hidden === true)
+  ok('kind(img): the LUN button is shown', rows[3].down('#archLun').hidden === false)
+  ok('kind(img): the directory Browse button is hidden', rows[3].down('#archBrowse').hidden === true)
+  ok('kind(pxar): the LUN button is hidden', rows[0].down('#archLun').hidden === true)
+  ok('kind(pxar): excludes stay enabled', rows[0].down('#archExcludes').disabled === false)
+
+  // --- The two honest statements, and the LUN identity ---
+  const note = rows[3].down('#archImageNote').html || ''
+  ok('kind(img): the row states that every run reads the full image',
+    /every run reads the full image/i.test(note), note)
+  ok('kind(img): and that the change-detection mode does not apply',
+    /change-detection mode does not apply/i.test(note), note)
+  ok('kind(img): and that a live LUN backup is crash-consistent',
+    /crash-consistent/i.test(note), note)
+  ok('kind(img): the LUN identity is shown in full, never truncated',
+    note.includes('iqn.2026-08.anas:vmstore') && /LUN 0/.test(note), note)
+  eq('kind(pxar): a file archive shows no image note', rows[0].down('#archImageNote').html || '', '')
+
+  // --- The preview for an image row says `img` and asks for no walk ---
+  ok('kind(img): the preview carries kind:img for the image row',
+    nestedPreviews.some(b => b.path === '/dev/zvol/tank/vol1' && b.kind === 'img'),
+    JSON.stringify(nestedPreviews))
+  ok('kind(pxar): a file row still sends NO kind at all',
+    nestedPreviews.filter(b => b.path === '/srv').every(b => !('kind' in b)),
+    JSON.stringify(nestedPreviews))
+  const imgAlert = rows[3].down('#archNestedAlert').html || ''
+  ok('kind(img): the consistency chip is shown for an image source',
+    />snapshot</.test(imgAlert), imgAlert)
+  ok('kind(img): an image row never claims a nested filesystem',
+    !/empty directories/.test(imgAlert), imgAlert)
+
+  // --- KEEP: an untouched edit round-trips kind AND lun verbatim ---
+  let body = await save(dlg)
+  ok('kind: the untouched edit saved', !!body)
+  eq('kind (keep): `img` survives untouched', body.archives[3].kind, 'img')
+  eq('kind (keep): the LUN record survives untouched', body.archives[3].lun,
+    { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 })
+  ok('kind (keep): a file archive sends NO kind key at all',
+    !('kind' in body.archives[0]), JSON.stringify(body.archives[0]))
+  ok('kind (keep): a file archive sends NO lun key at all',
+    !('lun' in body.archives[0]), JSON.stringify(body.archives[0]))
+  // The class guard: an untouched edit is still byte-for-byte the stored task.
+  sweepFields('kind: untouched edit', body, TASK)
+
+  // --- SET: Files → Block image sends `kind`, and nothing that cannot apply ---
+  dlg = await openEdit(grid)
+  rows = archiveRows(dlg)
+  rows[0].down('#archKind').setValue('img')
+  await settle()
+  ok('kind (set): switching to Block image disables the nested choice',
+    rows[0].down('#archNested').disabled === true)
+  body = await save(dlg)
+  eq('kind (set): the switched archive sends kind:img', body.archives[0].kind, 'img')
+  eq('kind (set): its excludes are dropped — they do not apply to an image',
+    body.archives[0].excludes, [])
+  ok('kind (set): and its nested choice is dropped too',
+    !('includeNested' in body.archives[0]), JSON.stringify(body.archives[0]))
+  ok('kind (set): no LUN is invented for a hand-typed path',
+    !('lun' in body.archives[0]), JSON.stringify(body.archives[0]))
+
+  // --- CLEAR: Block image → Files sends NO kind, and drops the LUN record ---
+  dlg = await openEdit(grid)
+  rows = archiveRows(dlg)
+  rows[3].down('#archKind').setValue('pxar')
+  await settle()
+  body = await save(dlg)
+  ok('kind (clear): switching back to Files sends no kind key',
+    !('kind' in body.archives[3]), JSON.stringify(body.archives[3]))
+  ok('kind (clear): the LUN record goes with it',
+    !('lun' in body.archives[3]), JSON.stringify(body.archives[3]))
+  eq('kind (clear): the OTHER archives are untouched', body.archives[1].includeNested, ['/etc/pve'])
+
+  // --- The LUN record follows the PATH: retype it and the record is dropped ---
+  dlg = await openEdit(grid)
+  rows = archiveRows(dlg)
+  rows[3].down('#archPath').setValue('/dev/zvol/tank/other')
+  await settle()
+  body = await save(dlg)
+  eq('kind: a retyped path keeps the image kind', body.archives[3].kind, 'img')
+  ok('kind: but the stale LUN record is NOT sent (the path is a different source)',
+    !('lun' in body.archives[3]), JSON.stringify(body.archives[3]))
+
+  // --- A typed `.img` suffix is stripped, exactly as `.pxar` always was ---
+  dlg = await openEdit(grid)
+  rows = archiveRows(dlg)
+  rows[3].down('#archName').setValue('lun0.img')
+  await settle()
+  body = await save(dlg)
+  eq('kind: a typed .img suffix is stripped, never doubled', body.archives[3].name, 'lun0')
+
+  ok('kind: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  1e. backup2.4 — the LUN picker fills the path and records the LUN
+// ============================================================================
+
+async function lunPickerChecks() {
+  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  grid.selectRow(0)
+
+  const dlg = await openEdit(grid)
+  const rows = archiveRows(dlg)
+
+  // Open the picker from the image row's LUN button.
+  const lunBtn = rows[3].down('#archLun')
+  lunBtn.handler(lunBtn)
+  await settle()
+  const picker = openWindow()
+  ok('picker: the LUN picker window opened', !!picker && !!picker.down('#lunGrid'))
+  if (!picker) { return }
+
+  const lunGrid = picker.down('#lunGrid')
+  eq('picker: it listed the daemon\'s LUN sources', lunGrid.getStore().getCount(), LUN_SOURCES.length)
+  ok('picker: the IQN column is present and never truncated',
+    (lunGrid.columns || []).some(col => col.dataIndex === 'targetIqn'))
+  ok('picker: the serial is on screen', (lunGrid.columns || []).some(col => col.dataIndex === 'serial'))
+  ok('picker: the derived consistency is on screen',
+    (lunGrid.columns || []).some(col => col.dataIndex === 'consistency'))
+
+  // Pick the FILE-backed LUN: a different path AND a different LUN number, so
+  // neither can round-trip by accident.
+  lunGrid.selectRow(1)
+  const select = picker.buttonCmps.find(b => b.cls === 'anas-btn-backup-lun-select')
+  ok('picker: the Select button exists', !!select)
+  select.handler(select)
+  await settle()
+
+  eq('picker: it filled the path field', rows[3].down('#archPath').getValue(), '/tank/images/lun2.raw')
+  const body = await save(dlg)
+  eq('picker: the saved path is the picked one', body.archives[3].path, '/tank/images/lun2.raw')
+  eq('picker: and the LUN record is the picked one', body.archives[3].lun,
+    { targetIqn: 'iqn.2026-08.anas:vmstore', index: 1 })
+  eq('picker: the archive is still a block image', body.archives[3].kind, 'img')
+
+  ok('picker: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 // ============================================================================
@@ -1950,6 +2168,10 @@ warnings.length = 0
 await nestedChecks()
 warnings.length = 0
 await consistencyChecks()
+warnings.length = 0
+await imageKindChecks()
+warnings.length = 0
+await lunPickerChecks()
 warnings.length = 0
 await poolImportChecks()
 warnings.length = 0

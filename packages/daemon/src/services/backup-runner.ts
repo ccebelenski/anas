@@ -12,12 +12,13 @@ import type {
 import type { PeerCertificate } from 'node:tls'
 import type { CommandExecutor } from '../executor/types.js'
 import type { BackupSnapshotOptions, TakenSnapshot } from './backup-snapshots.js'
+import type { ZvolSnapdevOptions } from './backup-zvol.js'
 import { lookup } from 'node:dns/promises'
 import { createConnection, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
-import { effectiveIncludeNested } from '@anas/shared'
+import { archiveSpecType, effectiveArchiveKind, effectiveIncludeNested } from '@anas/shared'
 import { readAhrPools } from './ahr-topology.js'
-import { deriveConsistency, readConsistencyFacts } from './backup-consistency.js'
+import { deriveConsistency, isZvolConsistency, readConsistencyFacts } from './backup-consistency.js'
 import { planExpansion } from './backup-expansion.js'
 import { backupTargetLine } from './backup-notify.js'
 import {
@@ -29,6 +30,7 @@ import {
   takeZfsTransient,
   withTopLevelMounts,
 } from './backup-snapshots.js'
+import { withZvolSnapshotDevices } from './backup-zvol.js'
 import { nestedRunWarnings, resolveNestedIncludes, scanArchives } from './nested-filesystems.js'
 import { formatTransientBackupSnapshot } from './snapshot-naming.js'
 
@@ -57,8 +59,14 @@ export const PRLIMIT = '/usr/bin/prlimit'
  */
 export const NESTED_SCAN_RUN_TIMEOUT_S = 60
 
-/** Per-archive stats / reuse line (parse by the filename token, not position). */
-const ARCHIVE_LINE_RE = /^\S+\.(?:pxar|mpxar|ppxar):\s/
+/**
+ * Per-archive stats / reuse line (parse by the filename token, not position).
+ * `img` is here for backup2.4: an image archive prints the SAME two-line shape
+ * (`<name>.img: had to backup …` and `<name>.img: backup was done
+ * incrementally, reused …`, GT-35), so the notification body and the job
+ * progress carry it exactly as they carry a pxar archive's.
+ */
+const ARCHIVE_LINE_RE = /^\S+\.(?:pxar|mpxar|ppxar|img):\s/
 /** The metadata-mode preflight fd warning (metadata mode only). */
 const NOFILE_WARNING_RE = /resource limit for open file handles low:\s*\d+/
 /** The group line: `Starting backup: [ns]:host/<backup-id>/<ISO-timestamp>`. */
@@ -69,6 +77,14 @@ const STARTING_RE = /^Starting backup:/
  * `backup-multi-archive.txt`, `btrfs-nested-subvol.txt`).
  */
 const UPLOAD_DIR_RE = /^Upload directory '(.+?)' to '.*' as (\S+?)\.(?:pxar|mpxar|ppxar)\.didx$/
+/**
+ * The `img` counterpart (backup2.4, real capture `img-backup.txt`):
+ * `Upload image '<source>' to '<repo>' as <name>.img.fidx` — a FIXED-index
+ * upload, not a dynamic one, which is the whole difference between a chunked
+ * tree and a 4 MiB-chunked block image. It names which source became which
+ * archive, and it is the only place the run says so.
+ */
+const UPLOAD_IMAGE_RE = /^Upload image '(.+?)' to '.*' as (\S+?)\.img\.fidx$/
 /**
  * The client's own boundary report: `skipping mount point: "<path>"` — quoted,
  * unescaped, ARCHIVE-ROOT-RELATIVE, one per omitted filesystem (GT-54). This is
@@ -168,11 +184,15 @@ export function buildBackupArgs(
   // that pair is pbc's change-detection identity, and GT-47/48 proved a switch
   // between the live root and the snapshot root costs nothing as long as it
   // holds.
-  const roots: { name: string, path: string, excludes: string[] }[] = expansion?.length
-    ? expansion.map(e => ({ name: e.name, path: e.root, excludes: e.excludes }))
-    : task.archives.map(a => ({ name: a.name, path: a.path, excludes: a.excludes }))
+  const roots: { name: string, path: string, excludes: string[], kind: string }[] = expansion?.length
+    ? expansion.map(e => ({ name: e.name, path: e.root, excludes: e.excludes, kind: archiveSpecType(e.kind ?? 'pxar') }))
+    : task.archives.map(a => ({ name: a.name, path: a.path, excludes: a.excludes, kind: archiveSpecType(effectiveArchiveKind(a)) }))
+  // backup2.4 — the archive spec's TYPE token is what tells pbc whether the
+  // source is a tree (`<name>.pxar:<dir>`) or a fixed-chunk block image
+  // (`<name>.img:<device-or-file>`). A regular file is a first-class `.img`
+  // source: no loop device, no `losetup` (GT-34).
   for (const a of roots)
-    args.push(`${a.name}.pxar:${a.path}`)
+    args.push(`${a.name}.${a.kind}:${a.path}`)
   // `--exclude` is a per-INVOCATION flag (Epic 16's finding, unchanged here), so
   // the union is emitted once, deduplicated — a pattern repeated across two
   // expanded roots of the same archive is one flag, not two.
@@ -189,7 +209,13 @@ export function buildBackupArgs(
   const ns = namespace ?? task.namespace
   if (ns)
     args.push('--ns', ns)
-  if (task.changeDetectionMode === 'metadata')
+  // `--change-detection-mode` is a COMPLETE NO-OP for an `.img` archive (GT-37:
+  // byte-identical output shape, no mpxar/ppxar split, no change-detection
+  // summary), so a task whose archives are ALL images does not get the flag at
+  // all — an argv that claims a mode nothing will honour is a lie in the unit
+  // and in journald. A mixed task still emits it once, for its pxar archives;
+  // the image archives ignore it exactly as pbc does.
+  if (task.changeDetectionMode === 'metadata' && roots.some(a => a.kind !== 'img'))
     args.push('--change-detection-mode=metadata')
 
   const devs = new Set<string>()
@@ -260,11 +286,26 @@ export interface SkippedMountPoint {
   path: string
 }
 
+/** One `Upload image … as <name>.img.fidx` line (backup2.4). */
+export interface UploadedImage {
+  /** The archive name from the line (`<name>` of `<name>.img.fidx`). */
+  archive: string
+  /** The device or file pbc actually read — a snapshot device in snapshot mode. */
+  source: string
+}
+
 export interface BackupProgress {
   /** The `Starting backup: …` group line, if seen. */
   target: string | null
-  /** Per-archive `had to backup / reused / incremental` lines (any pxar kind). */
+  /** Per-archive `had to backup / reused / incremental` lines (any archive kind). */
   archiveStats: string[]
+  /**
+   * The image archives this run uploaded, in argv order (backup2.4). Reported
+   * separately from `archiveStats` because the `Upload image` line names the
+   * SOURCE — and in snapshot mode that is the snapshot device, which is the one
+   * fact that proves the run did not read the live volume.
+   */
+  images: UploadedImage[]
   /** The metadata `Change detection summary:` block (header + ` - …` lines). */
   changeDetectionSummary: string[]
   /** The metadata-only `resource limit for open file handles low: N` line. */
@@ -280,6 +321,7 @@ export function parseBackupProgress(stderr: string): BackupProgress {
   const progress: BackupProgress = {
     target: null,
     archiveStats: [],
+    images: [],
     changeDetectionSummary: [],
     nofileWarning: null,
     duration: null,
@@ -301,6 +343,14 @@ export function parseBackupProgress(stderr: string): BackupProgress {
     if (upload) {
       currentRoot = upload[1]
       currentArchive = upload[2]
+      continue
+    }
+    const image = trimmed.match(UPLOAD_IMAGE_RE)
+    if (image) {
+      // An image archive has no tree, so no `skipping mount point:` line can
+      // belong to it — the skip attribution is deliberately left where the last
+      // DIRECTORY upload put it rather than pointed at an image.
+      progress.images.push({ archive: image[2], source: image[1] })
       continue
     }
     const skip = trimmed.match(SKIPPING_MOUNT_RE)
@@ -402,6 +452,18 @@ export interface BackupRunDeps {
    */
   now?: Date
   snapshotOptions?: BackupSnapshotOptions
+  /**
+   * backup2.4 test seam: how the `snapdev` publish checks for the snapshot
+   * device node and how long it waits. Absent = a real `stat` and the real poll
+   * budget.
+   */
+  snapdevOptions?: ZvolSnapdevOptions
+  /**
+   * backup2.4 test seam: where the consistency derivation reads PVE's
+   * `storage.cfg` from (the zvol branch's hands-off guard). Absent = the real
+   * `/etc/pve/storage.cfg`, fail-open when it is not there.
+   */
+  consistencyOptions?: { pveStorageCfg?: string }
 }
 
 export interface BackupRunResult {
@@ -410,6 +472,12 @@ export interface BackupRunResult {
   target?: string
   /** Per-archive stats lines (the job-progress units). */
   archives: string[]
+  /**
+   * backup2.4 — the image archives this run uploaded and the SOURCE each was
+   * read from. In snapshot mode that source is the snapshot's own device node,
+   * which is the record that the run did not read the live volume.
+   */
+  images?: UploadedImage[]
   /** Present when pbc emitted the metadata-mode low-fd warning. */
   nofileWarning?: string
   /** pbc's own `Duration: …` line, when it printed one (16.12's honest timing). */
@@ -493,7 +561,7 @@ export async function runBackup(
   // plus the live AHR topology. Read once for the whole task; both probes fail
   // open to `live` with a stated reason, so a derivation that cannot see the
   // system NEVER claims a snapshot it did not take.
-  const facts = await readConsistencyFacts(executor, readAhrPools)
+  const facts = await readConsistencyFacts(executor, readAhrPools, deps.consistencyOptions ?? {})
   const consistency = task.archives.map(a => deriveConsistency(a.path, facts))
   // The scans carry it to the screens (one endpoint, not two — the two answers
   // come from the same mount table).
@@ -599,9 +667,22 @@ export async function runBackup(
       for (const e of expansion)
         updateProgress(`archive '${e.name}' <- ${e.root}`)
 
-      r = ahrTargets.length
-        ? await withTopLevelMounts(executor, ahrTargets, async () => exec(args), snapshotOptions)
-        : await exec(args)
+      // backup2.4 — a snapshotted ZVOL's device node does not exist until
+      // `snapdev` publishes it (GT-43), so the publish wraps the ONE pbc call
+      // and the property is put back with `zfs inherit` (or its exact prior
+      // local value) in that helper's own `finally`, whatever happens here.
+      // Deduplicated by volume: two archives of the same zvol are one property
+      // change and one restore, never two.
+      const byVolume = new Map<string, { volume: string, device: string, label: string }>()
+      for (const c of consistency.filter(isZvolConsistency))
+        byVolume.set(c.target as string, { volume: c.target as string, device: c.zvolDevice as string, label })
+      const zvolSources = [...byVolume.values()]
+      const runPbc = async (): Promise<{ exitCode: number, stderr: string }> =>
+        ahrTargets.length
+          ? withTopLevelMounts(executor, ahrTargets, async () => exec(args), snapshotOptions)
+          : exec(args)
+
+      r = await withZvolSnapshotDevices(executor, zvolSources, runPbc, warnings, updateProgress, deps.snapdevOptions)
     }
     finally {
       // Success, failure or timeout alike. Destroy failures are warnings on an
@@ -636,6 +717,8 @@ export async function runBackup(
     result.nofileWarning = progress.nofileWarning
   if (progress.duration)
     result.duration = progress.duration
+  if (progress.images.length)
+    result.images = progress.images
   if (outcome.kind === 'too-soon')
     result.reason = 'snapshot timestamp collision (1-second resolution) - nothing new to back up yet'
 

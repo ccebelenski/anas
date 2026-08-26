@@ -45,7 +45,7 @@
 
 import type { IscsiLunKind, IscsiOwnershipTag, PveStorageRef } from '@anas/shared'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
-import { isAnasIqn } from '@anas/shared'
+import { isAnasIqn, ZVOL_PATH_PREFIX, zvolDatasetFromPath } from '@anas/shared'
 
 /**
  * PVE's guest-volume naming on a `zfspool` storage: `vm-<vmid>-disk-<n>` for a
@@ -55,9 +55,6 @@ import { isAnasIqn } from '@anas/shared'
  * candidate.
  */
 export const PVE_GUEST_VOLUME_RE = /^(?:vm|base|subvol)-\d+-disk-\d+$/
-
-/** `/dev/zvol/<pool>/<path/to/vol>` — the stable zvol path (never `/dev/zdN`). */
-const ZVOL_PATH_RE = /^\/dev\/zvol\/(.+)$/
 
 /** Trailing slashes, stripped before any path comparison. */
 const TRAILING_SLASH_RE = /\/+$/
@@ -177,9 +174,13 @@ export function classifyBacking(
   if (!devPath.startsWith('/'))
     return unmatched
 
-  const zvol = ZVOL_PATH_RE.exec(devPath)
-  if (zvol) {
-    const dataset = stripTrailingSlash(zvol[1])
+  // `/dev/zvol/<pool>/<vol>` — parsed by the ONE shared helper, which the
+  // backup consistency derivation (backup2.4) reads the same way. The fallback
+  // keeps the pre-existing behaviour for the degenerate `/dev/zvol/<pool>` form
+  // the helper (rightly) does not call a volume.
+  const dataset = zvolDatasetFromPath(devPath)
+    ?? (devPath.startsWith(ZVOL_PATH_PREFIX) ? stripTrailingSlash(devPath.slice(ZVOL_PATH_PREFIX.length)) : '')
+  if (dataset) {
     const pool = poolRoot(dataset)
     return {
       kind: 'zvol',

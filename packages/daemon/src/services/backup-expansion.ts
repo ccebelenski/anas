@@ -1,11 +1,12 @@
 import type {
   BackupArchiveConsistency,
+  BackupArchiveKind,
   BackupExpandedArchive,
   BackupIncludeNested,
   BackupNestedEntry,
   BackupNestedScan,
 } from '@anas/shared'
-import { expandedArchiveName, isPathWithin } from '@anas/shared'
+import { effectiveArchiveKind, expandedArchiveName, isPathWithin } from '@anas/shared'
 import { isUnwalkableKind, normalizePath, relativeTo } from './nested-filesystems.js'
 
 /**
@@ -45,7 +46,14 @@ import { isUnwalkableKind, normalizePath, relativeTo } from './nested-filesystem
 
 /** One archive to expand, with everything the plan needs about it. */
 export interface ExpansionInput {
-  archive: { name: string, path: string, excludes: string[], includeNested?: BackupIncludeNested }
+  archive: {
+    name: string
+    path: string
+    excludes: string[]
+    includeNested?: BackupIncludeNested
+    /** backup2.4 — absent = `pxar`. An `img` archive is always exactly one root. */
+    kind?: BackupArchiveKind
+  }
   /** The derived consistency (backup-consistency.ts). */
   consistency: BackupArchiveConsistency
   /** The backup2.2 boundary scan for this source (absent = nothing to expand). */
@@ -90,6 +98,11 @@ function joinPath(a: string, b: string): string {
  */
 export function snapshotRoot(consistency: BackupArchiveConsistency, snapshot: string, topLevel?: string): string | null {
   const relative = consistency.relativePath ?? ''
+  // backup2.4 — a ZVOL source has no mountpoint and no `.zfs/snapshot` tree: the
+  // snapshot is a DEVICE NODE, `/dev/zvol/<pool>/<vol>@<snapshot>`, published by
+  // `snapdev` for the duration of the run (GT-44/GT-45).
+  if (consistency.zvolDevice)
+    return `${consistency.zvolDevice}@${snapshot}`
   if (consistency.backend === 'zfs' && consistency.mountpoint)
     return joinPath(joinPath(consistency.mountpoint, `.zfs/snapshot/${snapshot}`), relative)
   if (consistency.backend === 'ahr' && topLevel)
@@ -139,11 +152,26 @@ export function planExpansion(input: ExpansionInput): ExpansionPlan {
   const warnings: string[] = []
   const ahrSubvolumeSnapshots: { label: string, subvolume: string }[] = []
 
+  const kind = effectiveArchiveKind(archive)
+  const kindKey = kind === 'img' ? { kind } : {}
+
   const root = snapshotRoot(consistency, snapshot, topLevel)
   if (consistency.consistency !== 'snapshot' || !root) {
     // Live archive: exactly one root, the configured path, no expansion at all.
     return {
-      archives: [{ name: archive.name, from: archive.name, root: normalizePath(archive.path), relativePath: '', excludes: [...archive.excludes] }],
+      archives: [{ name: archive.name, from: archive.name, root: normalizePath(archive.path), relativePath: '', excludes: [...archive.excludes], ...kindKey }],
+      warnings,
+      ahrSubvolumeSnapshots,
+    }
+  }
+
+  // backup2.4 — a BLOCK IMAGE is one object, not a tree: it has no nested
+  // filesystems to expand into and no excludes to rebase (the schema refuses
+  // both on an `img` archive). Snapshot mode changes exactly one thing about it
+  // — WHICH object pbc reads — so the plan is the single root and nothing else.
+  if (kind === 'img') {
+    return {
+      archives: [{ name: archive.name, from: archive.name, root, relativePath: '', excludes: [], kind }],
       warnings,
       ahrSubvolumeSnapshots,
     }
