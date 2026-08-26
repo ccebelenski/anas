@@ -6,6 +6,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
+import { mockFixtures } from '../../fixtures/loader.js'
+import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
+import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../ahr-topology.js'
 import {
   ACL_AUTH_NULL,
   aclAuthPath,
@@ -30,6 +35,7 @@ import {
   nextLunIndex,
   replayAttributes,
   resizeFileLun,
+  resolveFileBackingDir,
   resolveZvolBacking,
   runTargetcli,
   SecretOnArgvError,
@@ -884,6 +890,92 @@ describe('resolveZvolBacking — PVE territory is never a candidate', () => {
     assert.equal(zvolDevicePath('tank/vol1'), '/dev/zvol/tank/vol1')
     assert.equal(zvolDevicePath('/dev/zvol/tank/vol1'), '/dev/zvol/tank/vol1')
     assert.equal(zvolDataset('/dev/zvol/tank/vol1'), 'tank/vol1')
+  })
+})
+
+/** A node of the `lsblk -J` tree, as far as the unmounted variant needs. */
+interface LsblkNode {
+  type?: string
+  mountpoint?: string | null
+  children?: LsblkNode[]
+}
+
+/** Clear every LVM child's MOUNTPOINT — the unmounted half of a pool. */
+function clearLvmMountpoints(nodes: LsblkNode[]): void {
+  for (const n of nodes) {
+    if (n.type === 'lvm')
+      n.mountpoint = null
+    if (n.children)
+      clearLvmMountpoints(n.children)
+  }
+}
+
+/**
+ * A MockExecutor on which `readAhrPools` reports the fixture pool `ahr0`
+ * (arrays r1+r2, VG `ahr0`, LV `ahr0-vol`). `mountpoint` sets the findmnt half:
+ * the fixture mount when given, NO mount when omitted — the pool then reports
+ * `mounted: false` while its `mountpoint` field still carries the LV device
+ * path, the exact shape the name branch must not mistake for a directory.
+ */
+function ahrExecutor(mountpoint?: string): MockExecutor {
+  const mock = new MockExecutor()
+  const lsblk: { blockdevices: LsblkNode[] } = JSON.parse(mockFixtures.ahrLsblk().stdout)
+  if (mountpoint === undefined)
+    clearLvmMountpoints(lsblk.blockdevices)
+  const filesystems = mountpoint === undefined
+    ? []
+    : [{ target: mountpoint, source: '/dev/mapper/ahr0-ahr0--vol', fstype: 'btrfs', options: 'rw,relatime,subvolid=5,subvol=/' }]
+  mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+  mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+  mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+  mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: { stdout: JSON.stringify(lsblk), stderr: '', exitCode: 0 } })
+  mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+  mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+  mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+  mock.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: mockFixtures.ahrPvs() })
+  mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: JSON.stringify({ filesystems }), stderr: '', exitCode: 0 } })
+  return mock
+}
+
+describe('resolveFileBackingDir — an AHR pool name is a backing, like a dataset name', () => {
+  it('resolves a MOUNTED AHR pool name onto its mountpoint directory', async () => {
+    const r = await resolveFileBackingDir(ahrExecutor('/mnt/anas-ahr/ahr0'), 'ahr0', emptyCtx())
+    assert.ok('ok' in r)
+    assert.equal(r.ok.dir, '/mnt/anas-ahr/ahr0')
+    assert.equal(r.ok.pool, 'ahr0')
+    assert.equal(r.ok.dataset, undefined)
+    assert.deepEqual(r.ok.ahr, { name: 'ahr0', mountpoint: '/mnt/anas-ahr/ahr0' })
+  })
+
+  it('refuses an UNMOUNTED AHR pool by name — naming it, saying to mount it', async () => {
+    const r = await resolveFileBackingDir(ahrExecutor(), 'ahr0', emptyCtx())
+    assert.ok('refusal' in r)
+    assert.equal(r.refusal.reason, 'ahr-pool-unmounted')
+    assert.match(r.refusal.message, /'ahr0' is an AHR pool, but it is not mounted — mount it first, then place the image/)
+  })
+
+  it('still resolves a ZFS dataset name to its mountpoint — without ever reading the AHR topology', async () => {
+    const mock = ahrExecutor('/mnt/anas-ahr/ahr0')
+    const ctx = emptyCtx({
+      inputs: {
+        pveStorages: new Map(),
+        zfsMountpoints: [{ dataset: 'tank/images', mountpoint: '/tank/images', pool: 'tank' }],
+      },
+    } as never)
+    const r = await resolveFileBackingDir(mock, 'tank/images', ctx)
+    assert.ok('ok' in r)
+    assert.equal(r.ok.dir, '/tank/images')
+    assert.equal(r.ok.dataset, 'tank/images')
+    assert.equal(r.ok.pool, 'tank')
+    assert.equal(r.ok.ahr, undefined)
+    assert.equal(mock.calls.length, 0)
+  })
+
+  it('still refuses a name that is neither a dataset nor a pool, with the existing message', async () => {
+    const r = await resolveFileBackingDir(ahrExecutor('/mnt/anas-ahr/ahr0'), 'nosuch', emptyCtx())
+    assert.ok('refusal' in r)
+    assert.equal(r.refusal.reason, 'backing-not-found')
+    assert.match(r.refusal.message, /'nosuch' is neither a mounted ZFS dataset nor an AHR pool on this node/)
   })
 })
 

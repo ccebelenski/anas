@@ -1577,7 +1577,10 @@ const ISCSI_POOL_ROUTES = {
     // candidate — the same three prefixes the daemon refuses.
     { name: 'tank/vm-101-disk-0', type: 'volume', volsize: GiB_ },
   ] },
-  'GET /ahr/pools': { data: [{ name: 'ahrpool', mountpoint: '/ahrpool' }] },
+  // The picker reads the same GET /ahr the AHR menu makes (the daemon has no
+  // /ahr/pools) and offers only MOUNTED pools — the image directory IS the
+  // mountpoint, and an unmounted pool has none to hold one in.
+  'GET /ahr': { data: [{ name: 'ahrpool', mountpoint: '/mnt/anas-ahr/ahrpool', mounted: true }] },
 }
 
 /** The saveconfig ⟷ configfs diff behind the Repair button (story iscsi.5). */

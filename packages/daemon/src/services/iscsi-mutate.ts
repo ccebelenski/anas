@@ -911,7 +911,8 @@ export function resolveZvolBacking(
  * `backing` may be a ZFS dataset (`tank/images`), an AHR pool name, or an
  * absolute directory. AHR is not an afterthought here: a file on the btrfs
  * volume IS the AHR block object, the parallel of a zvol on ZFS, and it is
- * AHR's only kind.
+ * AHR's only kind. An AHR pool that is not mounted has no directory yet — it
+ * is refused by name, saying what to do about it.
  */
 export async function resolveFileBackingDir(
   executor: CommandExecutor,
@@ -961,10 +962,19 @@ export async function resolveFileBackingDir(
     return { ok: { dir: mp.mountpoint, dataset: mp.dataset, pool: mp.pool } }
   }
 
-  // An AHR pool name.
+  // An AHR pool name: its mountpoint is the directory — while it is mounted.
   const ahr = await ahrPoolByName(executor, backing)
-  if (ahr)
-    return { ok: { dir: ahr.mountpoint, pool: ahr.name, ahr } }
+  if (ahr) {
+    if (!ahr.mounted) {
+      return {
+        refusal: {
+          reason: 'ahr-pool-unmounted',
+          message: `'${backing}' is an AHR pool, but it is not mounted — mount it first, then place the image`,
+        },
+      }
+    }
+    return { ok: { dir: ahr.mountpoint, pool: ahr.name, ahr: { name: ahr.name, mountpoint: ahr.mountpoint } } }
+  }
 
   return {
     refusal: {
@@ -1016,11 +1026,23 @@ async function ahrPoolFor(executor: CommandExecutor, path: string): Promise<Reso
   return null
 }
 
-/** The AHR pool named `name`, with its mountpoint, or null. */
-async function ahrPoolByName(executor: CommandExecutor, name: string): Promise<ResolvedAhrPool | null> {
+/**
+ * The AHR pool named `name` — mounted or not — or null when no such pool
+ * exists.
+ *
+ * The caller must see an UNMOUNTED pool, not just a missing one: the refusal
+ * for it says "mount it", while a name that is no pool at all gets the plain
+ * not-found refusal. `mounted` is the test, NOT `mountpoint`'s truthiness —
+ * an unmounted pool still carries a mountpoint (the LV device path), which is
+ * not a directory an image can live in.
+ */
+async function ahrPoolByName(
+  executor: CommandExecutor,
+  name: string,
+): Promise<{ name: string, mountpoint: string, mounted: boolean } | null> {
   try {
     const pool = (await readAhrPools(executor)).find(p => p.name === name)
-    return pool?.mountpoint ? { name: pool.name, mountpoint: pool.mountpoint } : null
+    return pool ? { name: pool.name, mountpoint: pool.mountpoint, mounted: pool.mounted } : null
   }
   catch {
     return null
