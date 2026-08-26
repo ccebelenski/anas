@@ -766,7 +766,7 @@
                                 },
                             },
                         ],
-                        tbar: [
+                        tbar: ANAS.tbar([
                             {
                                 text: t('Add Client'),
                                 cls: 'anas-btn-nfs-client-add',
@@ -787,7 +787,7 @@
                                     }
                                 },
                             },
-                        ],
+                        ]),
                     },
                 ],
                 buttons: [
@@ -1348,7 +1348,7 @@
                         renderer: renderActive,
                     },
                 ],
-                tbar: [
+                tbar: ANAS.tbar([
                     {
                         text: t('Reload'),
                         cls: 'anas-btn-refresh',
@@ -1421,7 +1421,7 @@
                             openRemove(node, grid, selectedShare(grid));
                         },
                     },
-                ],
+                ]),
                 listeners: {
                     afterrender: function (grid) {
                         loadShares(grid, node);

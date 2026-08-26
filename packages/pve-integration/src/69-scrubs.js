@@ -541,7 +541,7 @@
                         { text: t('Scope'), dataIndex: 'note', width: 70, align: 'center',
                             sortable: false, menuDisabled: true, renderer: renderScrubScope }
                     ],
-                    tbar: [
+                    tbar: ANAS.tbar([
                         {
                             text: t('Reload'),
                             cls: 'anas-btn-refresh',
@@ -593,7 +593,7 @@
                                 toggleScrub(node, g, selectedScrub(g));
                             }
                         }
-                    ],
+                    ]),
                     listeners: {
                         selectionchange: function () { updateScrubButtons(this); }
                     }

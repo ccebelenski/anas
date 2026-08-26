@@ -2012,7 +2012,7 @@
                 scrollable: true,
                 bodyPadding: 16,
                 border: false,
-                tbar: [
+                tbar: ANAS.tbar([
                     {
                         text: t('Refresh'),
                         cls: 'anas-btn-dash-refresh',
@@ -2035,7 +2035,7 @@
                         html: '<span class="dot" style="background:' + MUTED_COLOR + '"></span>'
                             + enc(t('Connecting…'))
                     }
-                ],
+                ]),
                 items: [
                     {
                         xtype: 'component',

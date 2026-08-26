@@ -718,7 +718,7 @@
                         renderer: renderSmart,
                     },
                 ],
-                tbar: [
+                tbar: ANAS.tbar([
                     {
                         text: t('Reload'),
                         cls: 'anas-btn-refresh',
@@ -740,7 +740,7 @@
                     },
                     '->',
                     { xtype: 'tbtext', html: legendHtml() },
-                ],
+                ]),
                 listeners: {
                     selectionchange: function (sm, selected) {
                         var btn = this.down('#anasBtnSmart');

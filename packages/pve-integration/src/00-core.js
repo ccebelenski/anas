@@ -289,6 +289,22 @@
         };
     };
 
+    // Toolbar config with overflow handling. A plain `tbar` array
+    // gives ExtJS's default toolbar, which has NO overflow handling — when the
+    // window is narrow the buttons are clipped instead of collapsing into the
+    // standard `»` overflow menu. PVE's own views opt in per view, and we must
+    // NOT override Ext.toolbar.Toolbar globally (that would change Proxmox's
+    // own UI), so every ANAS grid/window builds its toolbar through this one
+    // helper. `overflowHandler: 'menu'` is the ExtJS 7 spelling; PVE ships the
+    // ExtJS 7 bundle (this integration runs in pve-manager's page).
+    ANAS.tbar = function (items) {
+        return {
+            xtype: 'toolbar',
+            overflowHandler: 'menu',
+            items: items,
+        };
+    };
+
     // ---- Menu injection machinery -----------------------------------------
 
     // Inject the ANAS group + child items into an already-initialised

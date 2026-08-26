@@ -134,7 +134,7 @@
                             renderer: Ext.String.htmlEncode,
                         },
                     ],
-                    tbar: [
+                    tbar: ANAS.tbar([
                         {
                             text: t('Rescan'),
                             iconCls: 'fa fa-refresh',
@@ -142,7 +142,7 @@
                                 scan(btn.up('window'), node);
                             },
                         },
-                    ],
+                    ]),
                 }],
                 buttons: [
                     {

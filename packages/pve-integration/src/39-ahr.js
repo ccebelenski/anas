@@ -1149,7 +1149,7 @@
                         selectionchange: function () { updateSnapButtons(); },
                         itemdblclick: function () { rollbackSnap(); },
                     },
-                    tbar: [
+                    tbar: ANAS.tbar([
                         {
                             text: t('Create…'),
                             cls: 'anas-btn-ahr-snap-create',
@@ -1178,7 +1178,7 @@
                             iconCls: 'fa fa-refresh',
                             handler: reload,
                         },
-                    ],
+                    ]),
                 }],
                 buttons: [{ text: t('Close'), handler: function () { win.close(); } }],
             });
@@ -2557,7 +2557,7 @@
                             renderer: renderActivity,
                         },
                     ],
-                    tbar: [
+                    tbar: ANAS.tbar([
                         {
                             text: t('Reload'),
                             itemId: 'refresh',
@@ -2716,7 +2716,7 @@
                                 abandonExpansion(btn.up('grid'), node);
                             },
                         },
-                    ],
+                    ]),
                     listeners: {
                         selectionchange: function () {
                             updateButtons(this);

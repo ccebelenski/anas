@@ -179,7 +179,10 @@ function makeComponent(cfg, parent) {
   c._selection = []
 
   const kids = []
-  const build = list => (list || [])
+  // `list` is a plain array (items/buttons) or a toolbar config object —
+  // ANAS.tbar wraps every tbar in { xtype:'toolbar', items:[…] }, so the
+  // stub materialises the object's items, flattening as it always did.
+  const build = list => (Array.isArray(list) ? list : (list && list.items) || [])
     .filter(x => x && typeof x === 'object')
     .map((k) => { const kc = makeComponent(k, c); kids.push(kc); return kc })
 
@@ -404,6 +407,9 @@ function makeAnas(routes) {
     toast() {},
     alertMsg(title, msg) { warnings.push(`alert: ${title}: ${msg}`) },
     errorPanel: msg => ({ xtype: 'component', html: msg }),
+    // The real 00-core.js helper (this stub stands in for it) — every tbar is
+    // a toolbar config object, and build() materialises its items.
+    tbar: items => ({ xtype: 'toolbar', items }),
     warningsHtml: () => '',
     renderState: s => String(s),
     notifyMode: {

@@ -1973,7 +1973,7 @@
                             { text: t('Serial'), dataIndex: 'serial', flex: 2, minWidth: 260, sortable: false, renderer: renderSerial },
                             { text: t('Connected now'), dataIndex: 'connectedInitiators', width: 140, align: 'center', sortable: false, renderer: renderLunSessions }
                         ],
-                        tbar: [
+                        tbar: ANAS.tbar([
                             {
                                 text: t('Add LUN…'),
                                 itemId: 'lunAdd',
@@ -2016,7 +2016,7 @@
                                     deleteLun(w, view, node, iqn, selectedLun(w));
                                 }
                             }
-                        ],
+                        ]),
                         listeners: {
                             selectionchange: function (selModel, selected) {
                                 var w = this.up();
@@ -3406,7 +3406,7 @@
                         { text: t('State'), dataIndex: 'enabled', width: 110, align: 'center', renderer: renderEnabled },
                         { text: t('Managed by'), dataIndex: 'ownership', width: 110, align: 'center', menuDisabled: true, renderer: renderOwnership }
                     ],
-                    tbar: tbar,
+                    tbar: ANAS.tbar(tbar),
                     listeners: {
                         selectionchange: function (selModel, selected) {
                             var grid = this;

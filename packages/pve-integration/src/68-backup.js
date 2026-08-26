@@ -3836,7 +3836,7 @@
                         { text: t('Test'), dataIndex: 'testStage', width: 120, align: 'center',
                             sortable: false, menuDisabled: true, renderer: renderRepoTestChip },
                     ],
-                    tbar: [
+                    tbar: ANAS.tbar([
                         {
                             text: t('Add…'),
                             cls: 'anas-btn-backup-repo-add',
@@ -3875,7 +3875,7 @@
                                 deleteRepo(node, win, selectedRepo(btn.up('grid')));
                             },
                         },
-                    ],
+                    ]),
                     listeners: {
                         selectionchange: function () {
                             updateRepoButtons(this);
@@ -4574,7 +4574,7 @@
                             align: 'center', renderer: renderEnabled,
                         },
                     ],
-                    tbar: tbar,
+                    tbar: ANAS.tbar(tbar),
                     listeners: {
                         selectionchange: function (selModel, selected) {
                             var grid = this;

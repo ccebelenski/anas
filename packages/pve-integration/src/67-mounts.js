@@ -2726,7 +2726,7 @@
                             align: 'center', menuDisabled: true, renderer: renderPersisted,
                         },
                     ],
-                    tbar: tbar,
+                    tbar: ANAS.tbar(tbar),
                     listeners: {
                         selectionchange: function (selModel, selected) {
                             var grid = this;

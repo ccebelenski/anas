@@ -249,6 +249,7 @@ function loadUi() {
     toast: m => state.toasts.push(m),
     alertMsg: (title, msg) => state.alerts.push({ title, msg }),
     errorPanel: m => ({ html: m }),
+    tbar: items => ({ xtype: 'toolbar', items }), // real 00-core.js helper
     pollJob: () => Promise.resolve({}),
     gfx: { ready: () => false },
     sched: { absTime: v => String(v || '') },

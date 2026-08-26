@@ -249,6 +249,7 @@ function loadUi() {
     },
     warn(m) { throw new Error(`dashboard warned: ${m}`) },
     errText: e => String((e && e.message) || e),
+    tbar: items => ({ xtype: 'toolbar', items }), // real 00-core.js helper
     api: {
       get(_node, path) {
         if (path === '/status') { return Promise.resolve(STATUS) }

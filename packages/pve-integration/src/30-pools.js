@@ -1040,7 +1040,7 @@
                     },
                 },
             ],
-            tbar: tbar,
+            tbar: ANAS.tbar(tbar),
             listeners: {
                 afterrender: function (grid) {
                     loadPools(grid, node);
@@ -1358,7 +1358,7 @@
                 height: 640,
                 resizable: true,
                 layout: 'fit',
-                tbar: [
+                tbar: ANAS.tbar([
                     {
                         text: ANAS.t('Reload'),
                         iconCls: 'fa fa-refresh',
@@ -1382,7 +1382,7 @@
                             }
                         },
                     },
-                ],
+                ]),
                 items: [{
                     xtype: 'panel',
                     itemId: 'content',

@@ -1536,7 +1536,7 @@
                 height: 560,
                 resizable: true,
                 layout: 'fit',
-                tbar: [
+                tbar: ANAS.tbar([
                     {
                         text: t('Reload'),
                         iconCls: 'fa fa-refresh',
@@ -1544,7 +1544,7 @@
                             loadDetail();
                         },
                     },
-                ],
+                ]),
                 items: [{
                     xtype: 'panel',
                     itemId: 'content',
@@ -2573,7 +2573,7 @@
                                 },
                             },
                         ],
-                        tbar: [
+                        tbar: ANAS.tbar([
                             {
                                 text: t('Add user or group'),
                                 itemId: 'addBtn',
@@ -2590,7 +2590,7 @@
                                     }
                                 },
                             },
-                        ],
+                        ]),
                     },
                     {
                         // Inline note for acl-unsupported / not-enabled states.
@@ -3559,7 +3559,7 @@
                         colUsed(),
                         colReferenced(),
                     ],
-                    tbar: [
+                    tbar: ANAS.tbar([
                         {
                             text: t('Reload'),
                             iconCls: 'fa fa-refresh',
@@ -3621,7 +3621,7 @@
                                 if (ctx) { destroySnapshotConfirm(node, ctx, afterMutation); }
                             },
                         },
-                    ],
+                    ]),
                     listeners: {
                         selectionchange: function () { updatePopupButtons(); },
                         itemdblclick: function (g, rec) {
@@ -4423,7 +4423,7 @@
                         renderer: renderQuota,
                     },
                 ],
-                tbar: tbar,
+                tbar: ANAS.tbar(tbar),
                 // Tag pool-root / snapshot / overflow rows for styling + hooks.
                 viewConfig: {
                     getRowClass: function (record) {

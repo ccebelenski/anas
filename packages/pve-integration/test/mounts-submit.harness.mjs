@@ -235,6 +235,7 @@ function loadUi() {
     warn(m) { failures.push(`view warned: ${m}`) },
     errText: e => String((e && e.message) || e),
     errorPanel: m => ({ html: m }),
+    tbar: items => ({ xtype: 'toolbar', items }), // real 00-core.js helper
     warningsHtml: w => String(w),
     alertMsg(title, msg) { failures.push(`unexpected alert: ${title} — ${msg}`) },
     fmtMode: () => ({ valid: true, symbolic: 'rw-r--r--', gloss: '' }),
@@ -307,7 +308,9 @@ function makeView() {
 
 function toolbarButton(cfg, text) {
   const grid = cfg.items[0]
-  return grid.tbar.find(b => b && b.text === text)
+  // ANAS.tbar wraps the tbar in a toolbar config object — accept both shapes.
+  const tbar = Array.isArray(grid.tbar) ? grid.tbar : (grid.tbar && grid.tbar.items) || []
+  return tbar.find(b => b && b.text === text)
 }
 
 const flush = () => new Promise(resolve => setImmediate(resolve))

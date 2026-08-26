@@ -979,7 +979,7 @@
                                 renderer: Ext.String.htmlEncode,
                             },
                         ],
-                        tbar: [
+                        tbar: ANAS.tbar([
                             {
                                 text: t('Remove'),
                                 cls: 'anas-btn-group-member-remove',
@@ -992,7 +992,7 @@
                                     }
                                 },
                             },
-                        ],
+                        ]),
                     },
                 ],
                 buttons: [
@@ -1152,7 +1152,7 @@
                             renderer: renderSource,
                         },
                     ],
-                    tbar: [
+                    tbar: ANAS.tbar([
                         {
                             text: t('Reload'),
                             cls: 'anas-btn-refresh',
@@ -1203,7 +1203,7 @@
                                 openUserGroups(node, findView(btn), selectedRow(grid));
                             },
                         },
-                    ],
+                    ]),
                     listeners: {
                         afterrender: function (grid) {
                             loadUsers(grid, node);
@@ -1249,7 +1249,7 @@
                             renderer: renderSource,
                         },
                     ],
-                    tbar: [
+                    tbar: ANAS.tbar([
                         {
                             text: t('New Group'),
                             cls: 'anas-btn-group-add',
@@ -1269,7 +1269,7 @@
                                 openGroupMembers(node, findView(btn), selectedRow(grid));
                             },
                         },
-                    ],
+                    ]),
                     listeners: {
                         afterrender: function (grid) {
                             loadGroups(grid, node);

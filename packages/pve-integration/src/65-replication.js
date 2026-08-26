@@ -1191,7 +1191,7 @@
                             { text: t('Test'), dataIndex: 'testStage', width: 130, align: 'center',
                                 sortable: false, menuDisabled: true, renderer: renderTestChip },
                         ],
-                        tbar: [
+                        tbar: ANAS.tbar([
                             {
                                 text: t('Add…'),
                                 cls: 'anas-btn-remote-add',
@@ -1233,7 +1233,7 @@
                                     deleteRemote(node, win, selectedRemote(btn.up('grid')));
                                 },
                             },
-                        ],
+                        ]),
                         listeners: {
                             selectionchange: function () {
                                 updateRemoteButtons(this);
@@ -2789,7 +2789,7 @@
                         renderer: renderEnabled,
                     },
                 ],
-                tbar: tbar,
+                tbar: ANAS.tbar(tbar),
                 listeners: {
                     afterrender: function (grid) {
                         loadTasks(grid, node);

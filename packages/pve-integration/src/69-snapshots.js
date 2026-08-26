@@ -1626,7 +1626,7 @@
                             renderer: renderEnabled
                         }
                     ],
-                    tbar: tbar,
+                    tbar: ANAS.tbar(tbar),
                     listeners: {
                         selectionchange: function () { updateButtons(this); },
                         itemdblclick: function (grid, rec) {
