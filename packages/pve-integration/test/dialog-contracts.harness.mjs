@@ -389,9 +389,18 @@ const jobs = []
 /** Every GET the UI issued, with its query — the read-contract record. */
 const apiGets = []
 
+/** The real autofill opt-out from 00-core.js — every credential dialog
+ * references it while building its fields, so the fake must mirror it. */
+const noAutofill = (() => {
+  const sandbox = { window: {} }
+  vm.runInNewContext(readFileSync(join(SRC, '00-core.js'), 'utf8'), sandbox, { filename: '00-core.js' })
+  return sandbox.window.ANAS.noAutofill
+})()
+
 function makeAnas(routes) {
   return {
     views: {},
+    noAutofill,
     pools: { registerAction(a) { this._actions = (this._actions || []).concat([a]) }, reload() {} },
     datasets: {},
     // The Datasets view degrades gracefully without the gfx layer (every call
