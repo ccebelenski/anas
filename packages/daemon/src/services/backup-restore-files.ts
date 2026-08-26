@@ -753,25 +753,35 @@ export interface SelectionFacts {
   warnings: string[]
 }
 
-/** The last `/`-separated segment of an archive path, stripped off. */
-const LAST_SEGMENT_RE = /\/[^/]*$/
-
 /**
  * Resolve one hardlink `stat` block's target into an archive-absolute path.
  *
- * pbc renders a hardlink as a symlink pointing at the group's PRIMARY name. An
- * ABSOLUTE target is archive-absolute already; a BARE one is a sibling of the
- * entry that named it. Which form the client emits for a cross-directory
- * hardlink is not settled by any capture we hold, so both are handled.
+ * pbc renders a hardlink as a symlink pointing at the group's PRIMARY name, and
+ * live-proof wave 2 settled the form the client actually emits: the primary's
+ * path **relative to the ARCHIVE ROOT, without a leading slash** — never a
+ * sibling name, wherever the two names sit:
+ *
+ *     File: /a/z      -> "a/x"        (same directory)
+ *     File: /b/y      -> "a/x"        (different directory)
+ *     File: /c/deep/w -> "a/x"        (deeper directory)
+ *     File: /rootlink -> "rootfile"   (archive root — where the two readings coincide,
+ *                                      which is why the earlier capture read as "bare sibling")
+ *
+ * Reading a bare target as a sibling produced `/b/a/x` for the second case: a
+ * pattern that matches nothing, so the completed group was not in fact complete
+ * and pbc died with `failed to extract hardlink: ENOENT` — the exact GT-25
+ * failure the completion exists to prevent.
+ *
+ * An ABSOLUTE target is kept as-is: it is archive-absolute already, and leaving
+ * that branch in costs nothing if a future client version emits it.
  */
-export function hardlinkPrimaryPath(selection: string, target: string): string | null {
+export function hardlinkPrimaryPath(_selection: string, target: string): string | null {
   if (!target)
     return null
   if (target.startsWith('/'))
     return target.replace(TRAILING_SLASHES_RE, '') || '/'
-  const parent = selection.replace(TRAILING_SLASHES_RE, '').replace(LAST_SEGMENT_RE, '')
-  const joined = `${parent}/${target}`
-  return joined.startsWith('/') ? joined : `/${joined}`
+  const rooted = `/${target.replace(TRAILING_SLASHES_RE, '')}`
+  return rooted === '/' ? null : rooted
 }
 
 /**

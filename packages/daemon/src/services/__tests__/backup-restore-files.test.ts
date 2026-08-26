@@ -677,10 +677,20 @@ describe('backup2.6 — readSelectionFacts', () => {
     assert.match(facts.warnings[0]!, /catalog could not be read/)
   })
 
-  it('resolves a hardlink primary in both the bare and the absolute form', () => {
-    assert.equal(hardlinkPrimaryPath('/docs/hard-b.txt', 'hard-a.txt'), '/docs/hard-a.txt')
+  it('a bare hardlink target is ARCHIVE-ROOT-relative, not a sibling (live-proof wave 2)', () => {
+    // Read off the real client: every non-primary name prints the primary's
+    // path relative to the ARCHIVE ROOT with no leading slash, wherever the two
+    // names sit — `/a/z -> "a/x"`, `/b/y -> "a/x"`, `/c/deep/w -> "a/x"`,
+    // `/rootlink -> "rootfile"`. Reading it as a sibling gave `/b/a/x`, a
+    // pattern matching nothing, and the restore died with GT-25's
+    // `failed to extract hardlink: ENOENT`.
+    assert.equal(hardlinkPrimaryPath('/b/y', 'a/x'), '/a/x')
+    assert.equal(hardlinkPrimaryPath('/c/deep/w', 'a/x'), '/a/x')
+    assert.equal(hardlinkPrimaryPath('/a/z', 'a/x'), '/a/x')
+    // The archive root is where the two readings coincide — still right.
+    assert.equal(hardlinkPrimaryPath('/rootlink', 'rootfile'), '/rootfile')
+    // An absolute target is archive-absolute already.
     assert.equal(hardlinkPrimaryPath('/docs/hard-b.txt', '/other/hard-a.txt'), '/other/hard-a.txt')
-    assert.equal(hardlinkPrimaryPath('/hard-b.txt', 'hard-a.txt'), '/hard-a.txt')
     assert.equal(hardlinkPrimaryPath('/hard-b.txt', ''), null)
   })
 })
