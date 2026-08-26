@@ -8,7 +8,7 @@ import type {
   PipelineResult,
 } from './types.js'
 import { execFile, spawn } from 'node:child_process'
-import { close, createWriteStream, fsync, open } from 'node:fs'
+import { close, fsync, open, readFileSync } from 'node:fs'
 
 /** Promisified `open(2)` — the caller owns the fd, so the stream cannot close it. */
 function openFd(path: string, flags: string | number): Promise<number> {
@@ -16,6 +16,9 @@ function openFd(path: string, flags: string | number): Promise<number> {
     open(path, flags, (err, fd) => (err ? reject(err) : resolve(fd)))
   })
 }
+
+/** `pos:` line of `/proc/self/fdinfo/<fd>` — the open file description's offset. */
+const FDINFO_POS_RE = /^pos:\s*(\d+)$/m
 
 /** Best-effort close: the outcome is already decided by the time this runs. */
 function closeFd(fd: number): void {
@@ -170,12 +173,21 @@ export class ProdExecutor implements CommandExecutor {
   }
 
   /**
-   * Run `command args` with its STDOUT streamed into `target` (story
-   * backup2.7). NO shell, NO redirect string — spawn with an argv array and an
-   * `fs.createWriteStream` ANAS owns.
+   * Run `command args` with its STDOUT going straight into `target` (story
+   * backup2.7). NO shell, NO redirect string — spawn with an argv array and a
+   * descriptor ANAS opened itself.
    *
-   * The three things that are load-bearing here:
+   * The four things that are load-bearing here:
    *
+   *  - **The child's fd 1 IS our descriptor**, handed to `spawn` as a raw fd
+   *    rather than a Node pipe the parent copies out of. Live-proof wave 2
+   *    found out why that matters: libuv backs a `'pipe'` stdio slot with a
+   *    `socketpair(2)`, and `proxmox-backup-client`'s `-` target opens
+   *    `/dev/stdout` BY PATH — which on a socket fails with
+   *    `unable to open /dev/stdout - No such device or address (os error 6)`,
+   *    so every image restore died before writing a byte. A real file or block
+   *    descriptor reopens through `/proc/self/fd/1` exactly as the shell
+   *    redirect the ground truth used does.
    *  - **The flags come from the caller.** A block device is opened `O_WRONLY`
    *    (no `O_CREAT`, no `O_TRUNC`); an image file is opened `'w'`, which keeps
    *    the inode so the LIO fileio backstore never has to be recreated.
@@ -185,7 +197,9 @@ export class ProdExecutor implements CommandExecutor {
    *  - **`bytesWritten` is reported even on failure.** It is the ONLY evidence
    *    that a mid-stream failure left a half-written device: pbc leaves no
    *    marker of any kind (GT-60), so this number is what the job's "the image
-   *    was partially written" verdict is built on.
+   *    was partially written" verdict is built on. The child writes through the
+   *    SAME open file description, so the offset it advanced is ours to read
+   *    back from `/proc/self/fdinfo/<fd>`.
    */
   async execToStream(
     command: string,
@@ -193,100 +207,84 @@ export class ProdExecutor implements CommandExecutor {
     target: ExecStreamTarget,
     opts?: ExecStreamOptions,
   ): Promise<ExecStreamResult> {
-    // The fd is opened HERE rather than by the stream, and `autoClose: false`
-    // keeps it ours: an fsync has to happen on a still-open descriptor, and a
-    // stream that closes its own fd on 'finish' races the sync away.
+    // The fd is opened HERE and stays ours: an fsync has to happen on a
+    // still-open descriptor, and the byte count is read off it after the child
+    // exits.
     const fd = await openFd(target.path, target.flags)
     return new Promise((resolve, reject) => {
-      const out = createWriteStream('', { fd, autoClose: false })
-
-      const child = spawn(command, args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
-        ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
-      })
+      let child
+      try {
+        child = spawn(command, args, {
+          // fd 1 is the descriptor itself — see the note above.
+          stdio: ['ignore', fd, 'pipe'],
+          ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
+        })
+      }
+      catch (err) {
+        closeFd(fd)
+        reject(err instanceof Error ? err : new Error(String(err)))
+        return
+      }
 
       let stderr = ''
-      let exitCode: number | null = null
-      let childClosed = false
-      let streamClosed = false
       let settled = false
-      let failure: Error | null = null
 
-      const fail = (err: Error): void => {
+      const settle = (exitCode: number): void => {
         if (settled)
           return
         settled = true
-        child.kill('SIGTERM')
-        out.destroy()
-        closeFd(fd)
-        reject(err)
-      }
-
-      const maybeResolve = (): void => {
-        if (settled || !childClosed || !streamClosed)
-          return
-        settled = true
-        if (failure) {
-          reject(failure)
-          return
-        }
-        resolve({
-          stderr,
-          // A signal kill leaves no numeric code; report it as a failure rather
-          // than inventing a zero.
-          exitCode: exitCode === null ? 1 : exitCode,
-          bytesWritten: out.bytesWritten,
+        const bytesWritten = fdPosition(fd)
+        // FSYNC on a descriptor that is still ours: the child has exited, so
+        // every byte it wrote is in the page cache and nowhere else yet.
+        fsync(fd, (err) => {
+          closeFd(fd)
+          if (err && exitCode === 0) {
+            reject(err)
+            return
+          }
+          resolve({ stderr, exitCode, bytesWritten })
         })
       }
 
-      child.stderr.on('data', (d) => {
+      child.stderr?.on('data', (d) => {
         const chunk = String(d)
         stderr += chunk
         opts?.onStderr?.(chunk)
       })
 
-      child.stdout.pipe(out)
-      // EPIPE when the target dies first: the exit code and the byte count are
-      // the real signal, and the stream's own 'error' below carries the detail.
-      child.stdout.on('error', () => {})
-
-      out.on('error', (err) => {
-        if (!failure)
-          failure = err
-        // Stop the producer: without this, pbc keeps streaming into a dead pipe
-        // long after there is anywhere for the bytes to go. This is the ENOSPC
-        // path GT-42 describes, and the target is half-overwritten by now.
-        child.stdout.unpipe(out)
-        child.kill('SIGTERM')
-        if (streamClosed)
+      child.on('error', (err) => {
+        if (settled)
           return
-        streamClosed = true
+        settled = true
         closeFd(fd)
-        maybeResolve()
+        reject(err)
       })
-
-      // FSYNC on a descriptor that is still ours: 'finish' means every byte was
-      // handed to the OS, and `autoClose: false` means the fd is still open, so
-      // the sync — then the close — happen here, before the promise settles.
-      out.on('finish', () => {
-        fsync(fd, (err) => {
-          if (err && !failure)
-            failure = err
-          if (streamClosed)
-            return
-          streamClosed = true
-          closeFd(fd)
-          maybeResolve()
-        })
-      })
-
-      child.on('error', err => fail(err))
 
       child.on('close', (code) => {
-        childClosed = true
-        exitCode = code
-        maybeResolve()
+        // A signal kill leaves no numeric code; report it as a failure rather
+        // than inventing a zero.
+        settle(code === null ? 1 : code)
       })
     })
+  }
+}
+
+/**
+ * How far the shared file description has advanced — the byte count a child
+ * that inherited our fd wrote. `pos:` in `/proc/self/fdinfo/<fd>` is the
+ * offset of the open file description, which the child shares with us because
+ * `spawn` dup'd the descriptor rather than opening its own.
+ *
+ * Best-effort by design: an unreadable fdinfo must not turn a good restore into
+ * a failure, so it reads as 0 and the caller's own "the client said complete but
+ * N bytes arrived" warning is what surfaces the disagreement.
+ */
+function fdPosition(fd: number): number {
+  try {
+    const m = FDINFO_POS_RE.exec(readFileSync(`/proc/self/fdinfo/${fd}`, 'utf8'))
+    return m ? Number(m[1]) : 0
+  }
+  catch {
+    return 0
   }
 }

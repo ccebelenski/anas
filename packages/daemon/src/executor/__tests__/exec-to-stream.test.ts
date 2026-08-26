@@ -23,6 +23,7 @@ const PRINTF = '/usr/bin/printf'
 const CAT = '/usr/bin/cat'
 const FALSE = '/usr/bin/false'
 const ENV = '/usr/bin/env'
+const SH = '/bin/sh'
 
 describe('ProdExecutor.execToStream (real processes, real fds)', () => {
   let dir: string
@@ -42,6 +43,27 @@ describe('ProdExecutor.execToStream (real processes, real fds)', () => {
     assert.equal(r.exitCode, 0)
     assert.equal(r.bytesWritten, 11)
     assert.equal(await readFile(path, 'utf-8'), 'hello world')
+  })
+
+  it('the child can open /dev/stdout BY PATH — the pbc `-` target (live-proof wave 2)', async () => {
+    // `proxmox-backup-client restore … -` does not write to fd 1: it OPENS
+    // `/dev/stdout`. libuv backs a `'pipe'` stdio slot with a socketpair(2), and
+    // reopening a socket through /proc/self/fd fails with ENXIO — live on the
+    // stunt node EVERY image restore died with
+    //   Error: unable to open /dev/stdout - No such device or address (os error 6)
+    // before a single byte was written. Handing the child our real descriptor as
+    // fd 1 is what makes the redirect the ground truth used work here too.
+    const exec = new ProdExecutor()
+    const path = join(dir, 'viapath.raw')
+    const r = await exec.execToStream(SH, ['-c', 'printf IMAGE-BYTES > /dev/stdout'], { path, flags: 'w' })
+    assert.equal(r.exitCode, 0)
+    assert.equal(r.stderr, '')
+    assert.equal(await readFile(path, 'utf-8'), 'IMAGE-BYTES')
+    // And the honest consequence: a child that REOPENS /dev/stdout gets its own
+    // file description, so the offset of the descriptor ANAS holds never moves.
+    // `imageBytesWritten` (services/backup-restore.ts) is what turns the
+    // client's own progress into the byte evidence in that case.
+    assert.equal(r.bytesWritten, 0)
   })
 
   it('`w` rewrites an existing file IN PLACE — the inode is kept', async () => {

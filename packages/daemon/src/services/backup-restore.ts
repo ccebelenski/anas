@@ -173,6 +173,41 @@ export interface RestoreProgress {
   complete: string | null
 }
 
+/** How many image bytes reached the target, and whether that number is exact. */
+export interface ImageBytesWritten {
+  bytes: number
+  /** True when the number is a LOWER BOUND read off the client's own progress. */
+  estimated: boolean
+}
+
+/**
+ * How much of the image actually reached the LUN.
+ *
+ * The obvious source — the descriptor ANAS opened — is only right when the
+ * child writes to fd 1. `proxmox-backup-client restore … -` does not: it OPENS
+ * `/dev/stdout`, which gives it its own file description on the same object, so
+ * OUR offset never moves (live-proof wave 2). The count is therefore taken from
+ * the descriptor when it did move, and from the client's own progress otherwise:
+ * a completed restore wrote the whole image (pbc's `restore complete` line says
+ * so), and an interrupted one wrote AT LEAST what its last percentage claimed —
+ * a lower bound, labelled as one, which is exactly what the partial verdict
+ * needs (a device carries no marker of its own, GT-60).
+ */
+export function imageBytesWritten(
+  descriptorBytes: number,
+  progress: RestoreProgress,
+  imageSize: number,
+  exitCode: number,
+): ImageBytesWritten {
+  if (descriptorBytes > 0)
+    return { bytes: descriptorBytes, estimated: false }
+  if (exitCode === 0 && progress.complete)
+    return { bytes: imageSize, estimated: false }
+  if (progress.percent !== null && progress.percent > 0)
+    return { bytes: Math.floor((progress.percent / 100) * imageSize), estimated: true }
+  return { bytes: 0, estimated: false }
+}
+
 /**
  * Parse pbc restore STDERR.
  *
@@ -497,8 +532,9 @@ export async function runImageRestore(
         }
       },
     })
-    bytesWritten = r.bytesWritten
     const progress = parseRestoreProgress(r.stderr)
+    const written = imageBytesWritten(r.bytesWritten, progress, deps.imageSize, r.exitCode)
+    bytesWritten = written.bytes
     if (progress.complete)
       duration = progress.complete
 
@@ -507,9 +543,9 @@ export async function runImageRestore(
       if (bytesWritten > 0) {
         // The half-written state, stated in the words the story asks for. The
         // device has no marker of its own; this sentence IS the record.
-        partial = `the image was partially written (${bytesWritten} of ${deps.imageSize} bytes reached `
-          + `${lun.backingPath}); the LUN is disabled until you restore again or accept the state. `
-          + `${detail}`
+        partial = `the image was partially written (${written.estimated ? 'at least ' : ''}${bytesWritten} `
+          + `of ${deps.imageSize} bytes reached ${lun.backingPath}); the LUN is disabled until you restore `
+          + `again or accept the state. ${detail}`
         throw new Error(partial)
       }
       throw new Error(`${detail} Nothing was written to ${lun.backingPath}.`)

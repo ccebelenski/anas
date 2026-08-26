@@ -11,6 +11,7 @@ import {
   assertSizeMatch,
   explainRestoreFailure,
   imageArchiveSize,
+  imageBytesWritten,
   imageRestoreArgs,
   parseRestoreProgress,
   readBackWarnings,
@@ -275,6 +276,44 @@ describe('parseRestoreProgress — STDERR, CR-terminated, doubling interval (GT-
 
   it('silence is not a stall — no progress line yields nulls, never a zero', () => {
     assert.deepEqual(parseRestoreProgress(''), { percent: null, lastLine: null, complete: null })
+  })
+})
+
+describe('imageBytesWritten — how much of the image reached the LUN (live-proof wave 2)', () => {
+  const SIZE = 2147483648
+
+  it('trusts the descriptor when it moved', () => {
+    assert.deepEqual(
+      imageBytesWritten(1234, { percent: 10, lastLine: null, complete: null }, SIZE, 1),
+      { bytes: 1234, estimated: false },
+    )
+  })
+
+  it('a COMPLETED restore wrote the whole image even though our offset never moved', () => {
+    // `restore … -` OPENS /dev/stdout: the client gets its own file description
+    // on the same device, so the descriptor ANAS holds stays at 0. Without this
+    // the success path would warn "the client reported a complete restore but 0
+    // bytes reached …" on every single restore.
+    assert.deepEqual(
+      imageBytesWritten(0, { percent: 86, lastLine: null, complete: 'restore complete (2 GiB processed in 7.3s)' }, SIZE, 0),
+      { bytes: SIZE, estimated: false },
+    )
+  })
+
+  it('an INTERRUPTED restore reports the last percentage as a labelled LOWER BOUND', () => {
+    // The number the "partially written" verdict is built on. Reporting 0 here
+    // would say "Nothing was written" over a half-overwritten device.
+    assert.deepEqual(
+      imageBytesWritten(0, { percent: 22, lastLine: 'progress 22% (…)', complete: null }, SIZE, 1),
+      { bytes: Math.floor(0.22 * SIZE), estimated: true },
+    )
+  })
+
+  it('a failure before the first progress line really is zero bytes', () => {
+    assert.deepEqual(
+      imageBytesWritten(0, { percent: null, lastLine: null, complete: null }, SIZE, 1),
+      { bytes: 0, estimated: false },
+    )
   })
 })
 
