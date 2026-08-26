@@ -639,6 +639,17 @@ export const IscsiMissingLun = z.object({
   backingPath: z.string(),
   /** Does that path exist now? Null when it could not be checked. */
   backingExists: z.boolean().nullable(),
+  /**
+   * The path holds a PLACEHOLDER right now — a 0-byte file `targetctl restore`
+   * created for itself, or a file on the wrong filesystem (story `iscsi.8`).
+   *
+   * It is the difference between "your image is not here" and "something that
+   * looks like your image is here and it is empty", and it survives the
+   * quarantine: once ANAS has unmapped a stub the LUN is an ordinary hole, and
+   * without this the card would stop saying what actually happened. Derived
+   * fresh from the filesystem on every read — no state is kept.
+   */
+  stubBacking: z.boolean().optional(),
 })
 export type IscsiMissingLun = z.infer<typeof IscsiMissingLun>
 
@@ -675,6 +686,87 @@ export const IscsiTargetServingNothing = z.object({
   enabled: z.boolean(),
 })
 export type IscsiTargetServingNothing = z.infer<typeof IscsiTargetServingNothing>
+
+/**
+ * A fileio LUN that is being served over a PLACEHOLDER file (story `iscsi.8`).
+ *
+ * The worst finding of the 0.3.0 wave-2 live proof (F2): `targetctl restore`
+ * does not skip a fileio backing whose file is missing — it **creates** the file
+ * at the recorded size, as long as the mountpoint DIRECTORY still exists. A
+ * filesystem that failed to mount, or mounted late, therefore yields a LUN that
+ * is `ACTIVATED`, the right size, carrying the right serial, and full of zeros.
+ * Nothing is missing, so the restore diff has nothing to report, and the only
+ * signal that moves points the wrong way (the LUN's backing no longer resolves
+ * onto ANAS storage, so ownership used to flip to `foreign` at the exact moment
+ * the target needed managing).
+ *
+ * Two independent signals, either of which is enough to call a backing a stub:
+ *
+ *  - **`zeroSized`** — the file is 0 bytes while the saved configuration says it
+ *    is bigger. ANAS creates image files with `ftruncate`, so a real (even
+ *    completely sparse) image always reports its full `st_size`; only LIO's
+ *    placeholder is 0.
+ *  - **`wrongMount`** — the filesystem that actually contains the file
+ *    (`findmnt`, longest prefix) is not the mountpoint of the ZFS dataset or AHR
+ *    pool the path belongs to, i.e. the parent filesystem is holding a file that
+ *    should live one mount deeper.
+ *
+ * A stub is never served: ANAS unmaps that LUN and deletes the stub backstore
+ * (`quarantined`), leaving the persisted record alone so the hole becomes an
+ * ordinary `missingLuns` entry that Repair puts back — with the same serial and
+ * attributes — once the filesystem is mounted again.
+ */
+export const IscsiStubLun = z.object({
+  targetIqn: z.string(),
+  tpgTag: z.number().int().nonnegative(),
+  lunIndex: z.number().int().nonnegative(),
+  backstoreName: z.string(),
+  /** The image path LIO is serving. */
+  backingPath: z.string(),
+  /** The size the saved configuration records for it. */
+  persistedSize: z.number().int().nonnegative(),
+  /** The file's real `st_size`; null when it could not be read. */
+  actualSize: z.number().int().nonnegative().nullable(),
+  /** The mount that actually contains the file; null when it is unknown. */
+  containingMount: z.string().nullable(),
+  /** The mountpoint of the dataset/pool the path belongs to; null when unknown. */
+  expectedMount: z.string().nullable(),
+  /** Signal 1: 0 bytes against a persisted size greater than 0. */
+  zeroSized: z.boolean(),
+  /** Signal 2: the containing mount is not the expected one. */
+  wrongMount: z.boolean(),
+  /** Did ANAS take this LUN offline in this pass? */
+  quarantined: z.boolean(),
+  /** Was the 0-byte placeholder file removed? Only ever when BOTH signals agree. */
+  fileRemoved: z.boolean(),
+})
+export type IscsiStubLun = z.infer<typeof IscsiStubLun>
+
+/**
+ * An ANAS-owned target whose TPG is DISABLED — it is serving nothing (live-proof
+ * F12).
+ *
+ * ANAS creates targets enabled and only ever disables one deliberately: the
+ * whole-image restore door takes the TARGET offline for the duration (LIO's
+ * enable flag lives on the TPG, not the LUN) and, after a mid-stream failure,
+ * LEAVES it disabled on purpose — a half-written LUN must not be served, and
+ * re-enabling is the operator's acknowledgement. That decision is correct and it
+ * was invisible: the job that made it is ephemeral by design, so nothing on the
+ * dashboard said the target was dark.
+ */
+export const IscsiDisabledTarget = z.object({
+  targetIqn: z.string(),
+  tpgTag: z.number().int().nonnegative(),
+  /** How many LUNs are behind the disabled TPG. */
+  lunCount: z.number().int().nonnegative(),
+  /**
+   * Why, when a retained job says so — the partially-written image restore that
+   * left it disabled. Absent when nothing recorded a reason (journald is
+   * forensics, never correctness: ANAS stores no state to remember this).
+   */
+  detail: z.string().optional(),
+})
+export type IscsiDisabledTarget = z.infer<typeof IscsiDisabledTarget>
 
 /**
  * A live/persisted divergence that is NOT a missing LUN: something exists in the
@@ -716,11 +808,20 @@ export const IscsiHealth = IscsiAvailability.extend({
   missingLuns: z.array(IscsiMissingLun),
   /** Targets that came up with none of their saved LUNs (GT-21). */
   targetsServingNothing: z.array(IscsiTargetServingNothing),
+  /**
+   * fileio LUNs found to be serving a placeholder file, and what ANAS did about
+   * them (story `iscsi.8`). Reported for the pass that FOUND them: once a stub
+   * is quarantined it is an ordinary `missingLuns` hole on every later read.
+   */
+  stubLuns: z.array(IscsiStubLun),
+  /** ANAS-owned targets whose TPG is disabled — serving nothing (F12). */
+  disabledTargets: z.array(IscsiDisabledTarget),
   portalsWithoutInterface: z.array(IscsiPortalWithoutInterface),
   foreignChanges: z.array(IscsiForeignChange),
   /**
    * True when the live config is known to be an INCOMPLETE restore (any missing
-   * LUN). While this is true nothing may run `saveconfig`.
+   * LUN, or a stub found in this pass). While this is true nothing may run
+   * `saveconfig`.
    */
   degraded: z.boolean(),
   /**

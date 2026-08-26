@@ -407,6 +407,26 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
   const health = computeIscsiHealth(ctx, targets)
   if (!health.degraded)
     return null
+
+  // A stub is reported first because it is the state the operator has NOT been
+  // told about by anything else: the LUN is live and looks perfect (story
+  // `iscsi.8`). The quarantine turns it into an ordinary hole within one health
+  // read, so this branch is what a mutation attempted in that window gets.
+  if (health.stubLuns.length > 0) {
+    const stubs = health.stubLuns
+      .map(l => `LUN ${l.lunIndex} of ${l.targetIqn} (backstore '${l.backstoreName}', ${l.backingPath})`)
+      .join('; ')
+    return {
+      reason: 'stub-backing',
+      message: `The live iSCSI configuration is serving ${health.stubLuns.length} `
+        + `LUN${health.stubLuns.length === 1 ? '' : 's'} over a PLACEHOLDER file the restore service created `
+        + `because the filesystem was not mounted: ${stubs}. ANAS takes such a LUN offline and leaves the saved `
+        + `record intact so Repair can put it back, and refuses every other mutation meanwhile — a `
+        + `'targetcli saveconfig' now would write the loss into /etc/rtslib-fb-target/saveconfig.json `
+        + `permanently. Mount the filesystem, then use Repair.`,
+    }
+  }
+
   const missing = health.missingLuns
     .map(l => `LUN ${l.lunIndex} of ${l.targetIqn} (backstore '${l.backstoreName}', ${l.backingPath})`)
     .join('; ')
@@ -897,13 +917,13 @@ export async function resolveFileBackingDir(
   executor: CommandExecutor,
   backing: string,
   ctx: IscsiReadContext,
-): Promise<{ ok: { dir: string, dataset?: string, pool?: string } } | { refusal: BackingRefusal }> {
+): Promise<{ ok: ResolvedFileDir } | { refusal: BackingRefusal }> {
   if (backing.startsWith('/')) {
     const c = classifyBacking(backing, ctx.inputs)
     if (c.kind === 'foreign') {
-      const ahr = await ahrMountpointFor(executor, backing)
+      const ahr = await ahrPoolFor(executor, backing)
       if (ahr)
-        return { ok: { dir: backing, pool: ahr } }
+        return { ok: { dir: backing, pool: ahr.name, ahr } }
       return {
         refusal: {
           reason: 'backing-not-anas-storage',
@@ -919,7 +939,7 @@ export async function resolveFileBackingDir(
         },
       }
     }
-    const ok: { dir: string, dataset?: string, pool?: string } = { dir: backing }
+    const ok: ResolvedFileDir = { dir: backing }
     if (c.dataset)
       ok.dataset = c.dataset
     if (c.pool)
@@ -942,9 +962,9 @@ export async function resolveFileBackingDir(
   }
 
   // An AHR pool name.
-  const ahrDir = await ahrMountpointByName(executor, backing)
-  if (ahrDir)
-    return { ok: { dir: ahrDir, pool: backing } }
+  const ahr = await ahrPoolByName(executor, backing)
+  if (ahr)
+    return { ok: { dir: ahr.mountpoint, pool: ahr.name, ahr } }
 
   return {
     refusal: {
@@ -954,14 +974,39 @@ export async function resolveFileBackingDir(
   }
 }
 
+/**
+ * The AHR pool a resolved image directory belongs to.
+ *
+ * Both halves — the NAME and the MOUNTPOINT — because the caller needs both: the
+ * name identifies the pool, and the mountpoint is what finds its `/etc/fstab`
+ * line for the boot-ordering option (story `iscsi.8`). The image directory may
+ * be a subdirectory of the mountpoint, so the two are not interchangeable.
+ */
+export interface ResolvedAhrPool {
+  name: string
+  mountpoint: string
+}
+
+/** Where a `file` LUN's image will live, and what storage that is. */
+export interface ResolvedFileDir {
+  /** The directory the image file is created in. */
+  dir: string
+  /** The ZFS dataset hosting it, when it is ZFS. */
+  dataset?: string
+  /** The ZFS pool or AHR pool name. */
+  pool?: string
+  /** Set only for an AHR pool — carries the mountpoint its fstab line uses. */
+  ahr?: ResolvedAhrPool
+}
+
 /** The AHR pool whose mountpoint contains `path`, or null. */
-async function ahrMountpointFor(executor: CommandExecutor, path: string): Promise<string | null> {
+async function ahrPoolFor(executor: CommandExecutor, path: string): Promise<ResolvedAhrPool | null> {
   try {
     for (const pool of await readAhrPools(executor)) {
       if (!pool.mountpoint)
         continue
       if (path === pool.mountpoint || path.startsWith(`${pool.mountpoint}/`))
-        return pool.name
+        return { name: pool.name, mountpoint: pool.mountpoint }
     }
   }
   catch {
@@ -971,11 +1016,11 @@ async function ahrMountpointFor(executor: CommandExecutor, path: string): Promis
   return null
 }
 
-/** The mountpoint of the AHR pool named `name`, or null. */
-async function ahrMountpointByName(executor: CommandExecutor, name: string): Promise<string | null> {
+/** The AHR pool named `name`, with its mountpoint, or null. */
+async function ahrPoolByName(executor: CommandExecutor, name: string): Promise<ResolvedAhrPool | null> {
   try {
     const pool = (await readAhrPools(executor)).find(p => p.name === name)
-    return pool?.mountpoint || null
+    return pool?.mountpoint ? { name: pool.name, mountpoint: pool.mountpoint } : null
   }
   catch {
     return null

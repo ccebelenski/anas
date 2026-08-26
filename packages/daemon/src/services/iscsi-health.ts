@@ -41,9 +41,29 @@
  * card.
  */
 
-import type { IscsiForeignChange, IscsiHealth, IscsiMissingLun, IscsiPortalWithoutInterface, IscsiTargetDetail, IscsiTargetServingNothing } from '@anas/shared'
+import type { IscsiDisabledTarget, IscsiForeignChange, IscsiHealth, IscsiMissingLun, IscsiPortalWithoutInterface, IscsiStubLun, IscsiTargetDetail, IscsiTargetServingNothing } from '@anas/shared'
 import type { IscsiReadContext } from './iscsi.js'
 import { iscsiAvailability, normalizePlugin } from './iscsi.js'
+
+/** What the health diff needs beyond the gathered state. */
+export interface IscsiHealthOptions {
+  /** Timestamp for `checkedAt`; defaults to now. */
+  now?: Date
+  /**
+   * Why an ANAS target is disabled, when something retained the reason
+   * (live-proof F12). ANAS stores no state of its own to answer this, so the
+   * caller supplies it from the job queue — the dashboard route does, the read
+   * route does not, and both are honest.
+   */
+  disabledDetail?: (target: IscsiTargetDetail) => string | undefined
+  /**
+   * Stub LUNs already acted on in this pass, keyed by backing path. The
+   * quarantine hands these back so the health it returns AFTER the tear-down
+   * still says what was found and what was done — by the time it runs again the
+   * stub is an ordinary missing LUN and the explanation would be gone.
+   */
+  quarantined?: Map<string, { quarantined: boolean, fileRemoved: boolean }>
+}
 
 /**
  * Compute the health diff from a gathered context and the targets already built
@@ -52,12 +72,15 @@ import { iscsiAvailability, normalizePlugin } from './iscsi.js'
 export function computeIscsiHealth(
   ctx: IscsiReadContext,
   targets: IscsiTargetDetail[],
-  now: Date = new Date(),
+  opts: IscsiHealthOptions = {},
 ): IscsiHealth {
+  const now = opts.now ?? new Date()
   const missingLuns: IscsiMissingLun[] = []
   const targetsServingNothing: IscsiTargetServingNothing[] = []
   const portalsWithoutInterface: IscsiPortalWithoutInterface[] = []
   const foreignChanges: IscsiForeignChange[] = []
+  const stubLuns: IscsiStubLun[] = []
+  const disabledTargets: IscsiDisabledTarget[] = []
 
   const liveByIqn = new Map(ctx.live.targets.map(t => [t.iqn, t]))
   const persistedByIqn = new Map((ctx.persisted?.targets ?? []).map(t => [t.iqn, t]))
@@ -76,14 +99,74 @@ export function computeIscsiHealth(
       if (!persistedLun)
         continue
       const backstore = persistedLun.backstoreName ? persistedBackstores.get(persistedLun.backstoreName) : undefined
+      const backingPath = backstore?.dev ?? lun.backingPath
       missingLuns.push({
         targetIqn: target.iqn,
         tpgTag: target.tpgTag,
         lunIndex: lun.index,
         backstoreName: persistedLun.backstoreName ?? lun.name,
         plugin: normalizePlugin(backstore?.plugin ?? persistedLun.plugin ?? lun.plugin),
-        backingPath: backstore?.dev ?? lun.backingPath,
+        backingPath,
         backingExists: lun.backingExists,
+        // A hole whose path holds a placeholder is a DIFFERENT thing to fix, and
+        // the quarantine is what turned it into a hole in the first place. The
+        // fact is re-derived from the filesystem here, so it keeps being told
+        // for as long as it is true and stops the moment it is not.
+        ...(ctx.stubs.has(backingPath) ? { stubBacking: true } : {}),
+      })
+    }
+
+    // --- LUNs being served over a PLACEHOLDER (story iscsi.8) ---------------
+    // Not a hole: the LUN is ACTIVATED, the right size, the right serial — and
+    // full of zeros, because `targetctl restore` CREATED the backing file when
+    // the filesystem that should hold it was not mounted (live-proof F2). The
+    // verdict was reached during the build (it decides the LUN's kind); this
+    // only reports it, with the numbers that produced it so the card can say
+    // WHY rather than just that something is wrong.
+    for (const lun of target.luns) {
+      const facts = lun.backingPath ? ctx.stubs.get(lun.backingPath) : undefined
+      if (!facts)
+        continue
+      // Only a LIVE LUN is serving anything, and only a live LUN can be
+      // quarantined. Once one has been, its persisted record still resolves onto
+      // the leftover placeholder — which keeps the LUN `unresolved` and keeps
+      // Repair refusing (that is deliberate) — but it is a `missingLuns` hole
+      // now, and re-reporting it here would have the quarantine chase a LUN that
+      // is already gone on every single health read.
+      if (!lun.present)
+        continue
+      const acted = opts.quarantined?.get(lun.backingPath)
+      stubLuns.push({
+        targetIqn: target.iqn,
+        tpgTag: target.tpgTag,
+        lunIndex: lun.index,
+        backstoreName: lun.name,
+        backingPath: lun.backingPath,
+        persistedSize: facts.persistedSize,
+        actualSize: facts.actualSize,
+        containingMount: facts.containingMount,
+        expectedMount: facts.expectedMount,
+        zeroSized: facts.zeroSized,
+        wrongMount: facts.wrongMount,
+        quarantined: acted?.quarantined ?? false,
+        fileRemoved: acted?.fileRemoved ?? false,
+      })
+    }
+
+    // --- an ANAS target whose TPG is disabled (live-proof F12) --------------
+    // ANAS creates targets enabled; the only thing that turns one off is a
+    // deliberate act — most often the image-restore door, which leaves a target
+    // dark on purpose after a partial write and says so in a job that is
+    // ephemeral by design. A foreign target's enable flag is not ANAS's
+    // business (hands-off), and a target that is not live has nothing to serve
+    // with either way.
+    if (target.ownership === 'anas' && target.present && !target.enabled) {
+      const detail = opts.disabledDetail?.(target)
+      disabledTargets.push({
+        targetIqn: target.iqn,
+        tpgTag: target.tpgTag,
+        lunCount: target.lunCount,
+        ...(detail ? { detail } : {}),
       })
     }
 
@@ -190,10 +273,15 @@ export function computeIscsiHealth(
     ...iscsiAvailability(ctx),
     missingLuns,
     targetsServingNothing,
+    stubLuns,
+    disabledTargets,
     portalsWithoutInterface,
     foreignChanges,
-    // A hole in the live config makes every `saveconfig` destructive (GT-22).
-    degraded: missingLuns.length > 0,
+    // A hole in the live config makes every `saveconfig` destructive (GT-22) —
+    // and so does a stub, for the same reason with the sign flipped: the live
+    // tree is about to LOSE that LUN to the quarantine, and a save taken in
+    // between would write the loss into saveconfig.json permanently.
+    degraded: missingLuns.length > 0 || stubLuns.length > 0,
     interfacesUnknown: ctx.nodeAddresses === null,
     checkedAt: now.toISOString(),
   }

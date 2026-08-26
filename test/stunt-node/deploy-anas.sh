@@ -70,6 +70,24 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+# The iSCSI boot-ordering drop-in (stories iscsi.5 / iscsi.8, live-proof F14).
+#
+# MIRRORED from packaging/install.sh's install_iscsi_dropin, deliberately and
+# not extracted: install.sh is a self-contained transactional installer with its
+# own rollback, PREFIX handling and preflight, and this script is an rsync + a
+# handful of ssh calls. There is no shared shell library between them and
+# introducing one to share four lines would be the bigger change. The drop-in
+# FILE itself is the single source — both copy the same
+# packaging/systemd/rtslib-fb-targetctl.service.d/anas-ordering.conf, which is
+# pinned by a unit test — so the two paths cannot drift in content, only in
+# whether they run. Until F14, only this one did not, which meant every dev node
+# silently lost the boot AND shutdown ordering a live proof depends on.
+#
+# Installed unconditionally: a drop-in for a unit that is not installed yet is
+# inert, not an error. The daemon-reload below covers it.
+$SSH_CMD "install -d -m 0755 /etc/systemd/system/rtslib-fb-targetctl.service.d && install -m 0644 /opt/anas/packaging/systemd/rtslib-fb-targetctl.service.d/anas-ordering.conf /etc/systemd/system/rtslib-fb-targetctl.service.d/anas-ordering.conf"
+echo "  ✓ iSCSI ordering drop-in installed"
+
 $SSH_CMD "systemctl daemon-reload"
 $SSH_CMD "systemctl enable anasd anas"
 echo "✓ Systemd units installed"

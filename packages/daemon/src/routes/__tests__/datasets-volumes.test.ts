@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { CreateDatasetRequest as CreateDatasetRequestSchema, UpdateDatasetPropertiesRequest } from '@anas/shared'
-import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
+import { zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
 import { assertVolumeMutable } from '../datasets.js'
 
@@ -491,6 +491,70 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       assert.equal(res.statusCode, 202)
       await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.deepEqual(zfsCalls().find(a => a[0] === 'rollback'), ['rollback', `${VOL}@before-grow`])
+    })
+
+    /**
+     * Live-proof F15. ZFS refuses a non-recursive destroy of a volume that has
+     * snapshots, and the refusal used to reach the operator as the bare CLI
+     * sentence ("volume has children / use '-r' to destroy the following
+     * datasets: …"). Correct, safe, and no help: the standing "guide, don't just
+     * warn" ruling wants the counts, the names and the two ways forward, at the
+     * confirm door where the decision is actually made.
+     */
+    it('names the snapshots and BOTH ways forward, instead of the raw ZFS text', async () => {
+      server = startServer()
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      const wrapped = mock.exec.bind(mock)
+      const same = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i])
+      mock.exec = async (command: string, args: string[]) => {
+        // The name-only snapshot listing the destroy pre-flight uses.
+        if (command === '/usr/sbin/zfs' && same(args, zfsSnapshotListArgs(VOL))) {
+          return {
+            stdout: JSON.stringify({
+              output_version: { command: 'zfs list', vers_major: 0, vers_minor: 1 },
+              datasets: {
+                [`${VOL}@r1`]: { name: `${VOL}@r1`, type: 'SNAPSHOT', pool: POOL },
+                [`${VOL}@r2`]: { name: `${VOL}@r2`, type: 'SNAPSHOT', pool: POOL },
+              },
+            }),
+            stderr: '',
+            exitCode: 0,
+          }
+        }
+        // …and ZFS's real refusal, verbatim from the live proof.
+        if (command === '/usr/sbin/zfs' && same(args, ['destroy', VOL])) {
+          return {
+            stdout: '',
+            stderr: `cannot destroy '${VOL}': volume has children\nuse '-r' to destroy the following datasets:\n${VOL}@r1`,
+            exitCode: 1,
+          }
+        }
+        return wrapped(command, args)
+      }
+
+      const url = `/v1/pools/${POOL}/datasets/${VOL_PATH}`
+      const challenge = await server.inject({ method: 'DELETE', url, headers: IDENTITY_HEADERS })
+      assert.equal(challenge.statusCode, 409)
+      const body = challenge.json() as { error: { warnings?: string[] } }
+      const warnings = body.error.warnings ?? []
+      const guide = warnings.find(w => /destroy them first/i.test(w))
+      assert.ok(guide, `the confirm door must guide: ${warnings.join(' | ')}`)
+      assert.match(guide!, /Volume '.*vol1' has 2 snapshots/)
+      assert.match(guide!, /gtiscsi\/vol1@r1, gtiscsi\/vol1@r2/)
+      assert.match(guide!, /confirm again with Recursive/i)
+      // Never the flag name on its own.
+      assert.ok(!warnings.some(w => /use '-r'/.test(w)), warnings.join(' | '))
+
+      // And if they confirm without Recursive anyway, the JOB says the same
+      // thing rather than forwarding the CLI sentence.
+      const code = challenge.headers['x-anas-confirm-code'] as string
+      const res = await server.inject({ method: 'DELETE', url, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code } })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /has 2 snapshots/)
+      assert.match(job.error!.message, /Destroy them first/i)
+      assert.ok(!/use '-r'/.test(job.error!.message), job.error!.message)
     })
 
     it('destroys a volume through the ordinary confirm-gated destroy', async () => {

@@ -379,6 +379,9 @@ function twoHoleCtx(opts: { dropSerial?: boolean } = {}): IscsiReadContext {
     persisted,
     inputs: { pveStorages: new Map(), zfsMountpoints: [] },
     nodeAddresses: null,
+    backing: new Map(),
+    mounts: new Map(),
+    stubs: new Map(),
   } as IscsiReadContext
 }
 
@@ -393,6 +396,8 @@ function twoHoleHealth(present: [boolean, boolean]): IscsiHealth {
       { targetIqn: IQN, tpgTag: 1, lunIndex: 1, backstoreName: 'img1', plugin: 'fileio', backingPath: '/tank/images/img1.raw', backingExists: present[1] },
     ],
     targetsServingNothing: [{ targetIqn: IQN, tpgTag: 1, persistedLunCount: 2, enabled: true }],
+    stubLuns: [],
+    disabledTargets: [],
     portalsWithoutInterface: [],
     foreignChanges: [],
     degraded: true,

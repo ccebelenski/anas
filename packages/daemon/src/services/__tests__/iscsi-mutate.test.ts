@@ -86,6 +86,9 @@ function emptyCtx(overrides?: Partial<IscsiReadContext>): IscsiReadContext {
     persisted: { fabricModules: [], storageObjects: [], targets: [] },
     inputs: { pveStorages: new Map(), zfsMountpoints: [] },
     nodeAddresses: null,
+    backing: new Map(),
+    mounts: new Map(),
+    stubs: new Map(),
     ...overrides,
   } as IscsiReadContext
 }

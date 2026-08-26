@@ -39,6 +39,18 @@ const CHARSET_RE = /^[\w.-]+$/
 /** Whitespace splitter for the six fstab fields. */
 const FIELD_SPLIT = /\s+/
 
+/**
+ * The four mandatory fstab fields with their ORIGINAL separators, plus whatever
+ * follows (dump/pass, and any spacing a human chose).
+ *
+ * The tail is `(?:\s[\s\S]*)?` rather than `[\s\S]*` on purpose: a `\S+`
+ * field followed by "anything" can split the same text in many ways, and the
+ * regex engine will try them all on a long malformed line. Requiring the tail to
+ * start with whitespace makes the split unambiguous, because a non-space field
+ * can never absorb it.
+ */
+const FSTAB_FOUR_FIELDS = /^(\s*)(\S+)(\s+)(\S+)(\s+)(\S+)(\s+)(\S+)((?:\s[\s\S]*)?)$/
+
 /** Single whitespace char — the token boundary before an inline `#` comment. */
 const WS_CHAR = /\s/
 
@@ -142,6 +154,57 @@ export function replaceMount(text: string, mountpoint: string, entry: MountEntry
     }
   }
   return serializeFstabDoc(doc)
+}
+
+/**
+ * Add ONE option token to the line for `mountpoint`, in place, byte-surgically.
+ *
+ * Not `replaceMount`: that re-serializes the whole line from the parsed entry,
+ * which canonicalises spacing and drops the long tail of anything the structured
+ * tiers do not model. This one rewrites the OPTIONS FIELD of the raw line and
+ * nothing else — the spec, the mountpoint, the column alignment a human chose,
+ * the dump/pass columns, the inline comment and the `#ANAS ` marker all come out
+ * byte-identical (Principle 12: ANAS is a guest in this file).
+ *
+ * A no-op — byte-identical output — when the token is already there or the
+ * mountpoint has no line. That is what makes it safe to call on every LUN
+ * placement rather than only the first (story `iscsi.8`).
+ *
+ * Comparison is on the whole token, so `x-systemd.before=a.service` and
+ * `x-systemd.before=b.service` are different options and both may stand; fstab
+ * allows repeated `x-systemd.before=` and systemd honours each.
+ */
+export function addMountOption(text: string, mountpoint: string, token: string): string {
+  const doc = parseFstabDoc(text)
+  for (const line of doc) {
+    if (line.kind !== 'entry' || line.entry.mountpoint !== mountpoint)
+      continue
+
+    // Work on the bytes AFTER the disabled marker and BEFORE any inline comment,
+    // so neither is disturbed and neither can be mistaken for a field.
+    const marker = line.disabled && line.raw.startsWith(ANAS_MARKER) ? ANAS_MARKER : ''
+    const body = line.raw.slice(marker.length)
+    const hashIdx = inlineCommentIndex(body)
+    const fieldsPart = hashIdx === -1 ? body : body.slice(0, hashIdx)
+    const comment = hashIdx === -1 ? '' : body.slice(hashIdx)
+
+    // Leading whitespace, then four fields with their ORIGINAL separators. The
+    // fourth is the options column; everything after it is left untouched.
+    const m = fieldsPart.match(FSTAB_FOUR_FIELDS)
+    if (!m)
+      return text
+    const [, lead, spec, s1, mp, s2, fstype, s3, opts, rest] = m
+    if (opts.split(',').map(o => o.trim()).includes(token))
+      return text
+
+    const rewritten = `${lead}${spec}${s1}${mp}${s2}${fstype}${s3}${opts},${token}${rest}`
+    line.raw = marker + rewritten + comment
+    const reparsed = parseFstabDoc(line.raw)[0]
+    if (reparsed?.kind === 'entry')
+      line.entry = reparsed.entry
+    return serializeFstabDoc(doc)
+  }
+  return text
 }
 
 /** Remove ONLY the line for `mountpoint` (active or disabled). No-op if absent. */

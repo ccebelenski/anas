@@ -115,12 +115,20 @@ describe('iscsi.6 — the backing-file-removal seam (no such path exists)', () =
    *       → the LUN's OWN backing image, and only on an explicit, confirm-gated
    *         `?destroyBacking=true`. That is the deliberate verb this story's
    *         refusals point AT, not a path that could surprise a LUN.
+   *   iscsi-quarantine
+   *       → the 0-byte PLACEHOLDER `targetctl restore` created for itself, and
+   *         only when both stub signals agree, the LUN it belonged to has just
+   *         been unmapped by this same function, and a fresh `stat` inside the
+   *         iSCSI mutex still says 0 bytes (story `iscsi.8`). It cannot surprise
+   *         a LUN: it IS the LUN's teardown, and it never touches a file with
+   *         content.
    */
   const ALLOWED = new Set([
     'backup-units.ts',
     'replication-units.ts',
     'snapshot-schedule-units.ts',
     'iscsi-mutate.ts',
+    'iscsi-quarantine.ts',
   ])
 
   it('nothing else in services/ deletes a file', async () => {

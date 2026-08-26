@@ -52,7 +52,7 @@ const INITIATOR = 'iqn.1993-08.org.debian:01:ae3d2ec18ad'
 const GT_IQN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
 
 /** SYNTHETIC (not a capture): the smallest tree the mutation gates need. */
-function anasManifest(opts: { session?: boolean } = {}): string {
+function anasManifest(opts: { session?: boolean, fileLun?: string } = {}): string {
   const tpg = `iscsi/${ANAS_IQN}/tpgt_1`
   const acl = `${tpg}/acls/${INITIATOR}`
   const lines = [
@@ -72,6 +72,27 @@ function anasManifest(opts: { session?: boolean } = {}): string {
     'F core/iblock_0/vmdisk1/wwn/vpd_unit_serial = T10 VPD Unit Serial Number: 9bc6e907-6015-4267-be4f-5a0617cb3d71',
     'F core/iblock_0/vmdisk1/wwn/product_id = vmdisk1',
     'F core/iblock_0/vmdisk1/wwn/vendor_id = LIO-ORG',
+    // A FILE-backed LUN, for the resize gates that turn on the backing KIND
+    // (story `iscsi.8` / live-proof F13: a zvol grows live, a file is recreated).
+    ...(opts.fileLun
+      ? [
+          'D core/fileio_1',
+          'D core/fileio_1/imgdisk',
+          `F core/fileio_1/imgdisk/udev_path = ${opts.fileLun}`,
+          'F core/fileio_1/imgdisk/enable = 1',
+          `F core/fileio_1/imgdisk/info = Status: ACTIVATED  Max Queue Depth: 128  SectorSize: 512  HwMaxSectors: 16384\n        TCM FILEIO ID: 1        File: ${opts.fileLun}  Size: 1073741824  Mode: O_DSYNC Async: 0`,
+          'D core/fileio_1/imgdisk/attrib',
+          'F core/fileio_1/imgdisk/attrib/emulate_tpu = 1',
+          'F core/fileio_1/imgdisk/attrib/emulate_tpws = 1',
+          'F core/fileio_1/imgdisk/attrib/block_size = 512',
+          'F core/fileio_1/imgdisk/attrib/emulate_write_cache = 0',
+          'F core/fileio_1/imgdisk/attrib/max_unmap_lba_count = 262144',
+          'D core/fileio_1/imgdisk/wwn',
+          'F core/fileio_1/imgdisk/wwn/vpd_unit_serial = T10 VPD Unit Serial Number: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+          'F core/fileio_1/imgdisk/wwn/product_id = imgdisk',
+          'F core/fileio_1/imgdisk/wwn/vendor_id = LIO-ORG',
+        ]
+      : []),
     'D iscsi',
     `D iscsi/${ANAS_IQN}`,
     `D ${tpg}`,
@@ -86,6 +107,12 @@ function anasManifest(opts: { session?: boolean } = {}): string {
     `D ${tpg}/lun`,
     `D ${tpg}/lun/lun_0`,
     `L ${tpg}/lun/lun_0/6847ded961 -> ../../../../../../target/core/iblock_0/vmdisk1`,
+    ...(opts.fileLun
+      ? [
+          `D ${tpg}/lun/lun_1`,
+          `L ${tpg}/lun/lun_1/7947ded962 -> ../../../../../../target/core/fileio_1/imgdisk`,
+        ]
+      : []),
     `D ${tpg}/acls`,
     `D ${acl}`,
     `D ${acl}/auth`,
@@ -95,6 +122,7 @@ function anasManifest(opts: { session?: boolean } = {}): string {
     `F ${acl}/auth/password_mutual = `,
     `F ${acl}/auth/authenticate_target = 0`,
     `D ${acl}/lun_0`,
+    ...(opts.fileLun ? [`D ${acl}/lun_1`] : []),
     opts.session
       ? `F ${acl}/info = InitiatorName: ${INITIATOR}\\nInitiatorAlias: anas-pve\\nLIO Session ID: 1   ISID: 0x00 02 3d 00 00 02  TSIH: 1  SessionType: Normal\\nSession State: TARG_SESS_STATE_LOGGED_IN\\n---------------------[iSCSI Session Values]-----------------------\\n----------------------[iSCSI Connections]-------------------------\\nCID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN\\n   Address 192.168.200.60 TCP  StatSN: 0x6916c3e9`
       : `F ${acl}/info = No active iSCSI Session for Initiator Endpoint: ${INITIATOR}`,
@@ -109,7 +137,7 @@ function anasManifest(opts: { session?: boolean } = {}): string {
  * at a path that EXISTS, which is the only difference between "cannot repair
  * yet" and "repair now" (story `iscsi.5`).
  */
-function anasSaveconfig(extraLun = false, holeDev = '/dev/zvol/tank/gone'): string {
+function anasSaveconfig(extraLun = false, holeDev = '/dev/zvol/tank/gone', fileLun?: string): string {
   const storageObjects: unknown[] = [{
     name: 'vmdisk1',
     plugin: 'block',
@@ -121,6 +149,20 @@ function anasSaveconfig(extraLun = false, holeDev = '/dev/zvol/tank/gone'): stri
     alua_tpgs: [],
   }]
   const luns: unknown[] = [{ index: 0, storage_object: '/backstores/block/vmdisk1', alias: '6847ded961' }]
+  if (fileLun) {
+    storageObjects.push({
+      name: 'imgdisk',
+      plugin: 'fileio',
+      dev: fileLun,
+      size: 1073741824,
+      wwn: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      readonly: false,
+      write_back: false,
+      attributes: {},
+      alua_tpgs: [],
+    })
+    luns.push({ index: 1, storage_object: '/backstores/fileio/imgdisk', alias: '7947ded962' })
+  }
   if (extraLun) {
     // A LUN the persisted config has and the kernel does NOT: the GT-21 restore
     // hole, and the reason every mutation must refuse.
@@ -149,7 +191,12 @@ function anasSaveconfig(extraLun = false, holeDev = '/dev/zvol/tank/gone'): stri
         attributes: { authentication: 0, generate_node_acls: 0, demo_mode_discovery: 0 },
         parameters: {},
         luns,
-        node_acls: [{ node_wwn: INITIATOR, mapped_luns: [{ tpg_lun: 0, index: 0, alias: 'aaaaaaaaaa' }] }],
+        node_acls: [{
+          node_wwn: INITIATOR,
+          mapped_luns: fileLun
+            ? [{ tpg_lun: 0, index: 0, alias: 'aaaaaaaaaa' }, { tpg_lun: 1, index: 1, alias: 'bbbbbbbbbb' }]
+            : [{ tpg_lun: 0, index: 0, alias: 'aaaaaaaaaa' }],
+        }],
         portals: [{ ip_address: '192.168.200.50', port: 3260 }],
       }],
     }],
@@ -206,10 +253,10 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
   }
 
   /** The ANAS-owned tree every mutation test runs against. */
-  async function serveAnas(opts: { session?: boolean, hole?: boolean, holeDev?: string } = {}) {
+  async function serveAnas(opts: { session?: boolean, hole?: boolean, holeDev?: string, fileLun?: string } = {}) {
     await serve({
-      manifest: anasManifest({ session: opts.session ?? false }),
-      saveconfigText: anasSaveconfig(opts.hole ?? false, opts.holeDev),
+      manifest: anasManifest({ session: opts.session ?? false, ...(opts.fileLun ? { fileLun: opts.fileLun } : {}) }),
+      saveconfigText: anasSaveconfig(opts.hole ?? false, opts.holeDev, opts.fileLun),
     })
   }
 
@@ -615,14 +662,34 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
   // --- LUN resize ----------------------------------------------------------
 
   describe('PUT /v1/iscsi/targets/:iqn/luns/:n', () => {
-    it('refuses a resize under a LIVE session, with NO bypass (GT-42)', async () => {
+    // Live-proof F13: the two doors used to disagree about the SAME safe
+    // operation. `PUT /pools/:pool/datasets/:name {volsize}` accepted a grow of a
+    // held zvol (iscsi.3 allows it, and it is live end to end — measured), while
+    // this door refused every resize under a session. A user who met the iSCSI
+    // refusal first concluded it could not be done.
+    it('ALLOWS growing a zvol LUN under a live session — it is live, and the other door already allows it', async () => {
       await serveAnas({ session: true })
       const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 4294967296 })
+      assert.equal(res.statusCode, 202)
+    })
+
+    it('still refuses a FILE-backed resize under a live session — it is a recreate, not a grow', async () => {
+      await serveAnas({ session: true, fileLun: '/tank/images/imgdisk.raw' })
+      const res = await call('PUT', `${targetUrl()}/luns/1`, { size: 4294967296 })
       assert.equal(res.statusCode, 409)
       assert.equal(res.body.error!.reason, 'session-open')
+      assert.match(res.body.error!.message, /size is fixed at creation/)
       assert.match(res.body.error!.message, /no confirm bypass/)
       assert.ok(!res.headers['x-anas-confirm-code'], 'there is no way to confirm past this')
       assert.match(res.body.error!.message, new RegExp(INITIATOR.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    })
+
+    it('still refuses a WRITE-CACHE change under a live session (GT-42)', async () => {
+      await serveAnas({ session: true })
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { writeBack: true })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'session-open')
+      assert.match(res.body.error!.message, /write cache/i)
     })
 
     it('refuses a SHRINK, with NO bypass (GT-40)', async () => {

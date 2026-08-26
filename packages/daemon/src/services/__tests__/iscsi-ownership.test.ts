@@ -127,6 +127,9 @@ describe('classifyBacking — where a LUN\'s backing object actually lives', () 
       kind: 'zvol',
       pool: 'tank',
       dataset: 'tank/block/lun0',
+      // A device path has no mountpoint — only a FILE backing can sit on the
+      // wrong filesystem (story `iscsi.8`).
+      mountpoint: null,
       pveManaged: false,
       pveGuestVolume: false,
     })
@@ -153,6 +156,10 @@ describe('classifyBacking — where a LUN\'s backing object actually lives', () 
       kind: 'file',
       pool: 'tank',
       dataset: 'tank/images', // not `tank` — the nested dataset is more specific
+      // The dataset's mountpoint IS the expected filesystem for that file: a
+      // placeholder created while `tank/images` was unmounted would report
+      // `/tank` as its containing mount instead (story `iscsi.8`).
+      mountpoint: '/tank/images',
       pveManaged: false,
       pveGuestVolume: false,
     })

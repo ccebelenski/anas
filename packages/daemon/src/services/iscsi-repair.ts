@@ -74,8 +74,22 @@ export interface IscsiRepairItem {
   /** `block` | `fileio`. */
   plugin: string
   backingPath: string
-  /** Is the backing device present RIGHT NOW? Only `true` is repairable. */
+  /**
+   * Is the backing device present RIGHT NOW? Only `true` is repairable.
+   *
+   * A PLACEHOLDER does not count as present (story `iscsi.8`). `backingExists`
+   * on a stub LUN is already `false` — the read layer answers the question the
+   * flag is actually asking ("is the LUN's data here?"), not the one a bare
+   * `stat` answers — so this stays a single comparison and cannot drift from the
+   * detector.
+   */
   backingPresent: boolean
+  /**
+   * Was the absence a placeholder rather than a plain missing file? Only changes
+   * what the refusal SAYS: "still not on this node" is wrong and confusing when
+   * the operator can see a file sitting right there.
+   */
+  stubBacking: boolean
   /** The stored unit serial, replayed as `wwn=`. Null when the record has none. */
   serial: string | null
   /** fileio only: the persisted size, which `create` needs. */
@@ -135,6 +149,7 @@ export function planIscsiRepair(
       // is treated as absent: recreating over a device we cannot even stat is
       // how the hole was made.
       backingPresent: missing.backingExists === true,
+      stubBacking: ctx.stubs.has(backingPath),
       serial: store?.wwn ?? null,
       size: store?.size ?? null,
       writeBack: store?.writeBack ?? ISCSI_DEFAULT_WRITE_BACK,
@@ -155,6 +170,17 @@ function persistedAclsMapping(ctx: IscsiReadContext, missing: IscsiMissingLun): 
   return acls.map(a => a.initiatorIqn)
 }
 
+/**
+ * The extra sentence a BLOCKED hole gets when its path holds a placeholder
+ * rather than nothing at all (story `iscsi.8`). "Still not on this node" is
+ * confusing when the operator can see a file sitting right there.
+ */
+function stubClause(stubs: number): string {
+  return ` ${stubs === 1 ? 'One path holds' : `${stubs} paths hold`} a 0-byte placeholder the restore `
+    + `service created on the wrong filesystem: it is NOT the image, and repairing over it would `
+    + `serve an empty disk with the right serial (story iscsi.8).`
+}
+
 /** Nothing to repair — the live tree already matches the saved configuration. */
 export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
   if (plan.repairable.length + plan.blocked.length === 0) {
@@ -165,14 +191,15 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
   }
   if (plan.repairable.length === 0) {
     const named = plan.blocked
-      .map(b => `LUN ${b.lunIndex} of ${b.targetIqn} (backstore '${b.backstoreName}', ${b.backingPath})`)
+      .map(b => `LUN ${b.lunIndex} of ${b.targetIqn} (backstore '${b.backstoreName}', ${b.backingPath}${b.stubBacking ? ' — a placeholder, not the image' : ''})`)
       .join('; ')
+    const stubs = plan.blocked.filter(b => b.stubBacking).length
     return {
       reason: 'backing-absent',
       message: `None of the missing LUNs can be repaired yet — their backing objects are still not on `
         + `this node: ${named}. Bring the storage back first (import the pool, restore the image, mount `
         + `the filesystem) and run Repair again. Recreating a backstore over an absent device is what `
-        + `produced the hole.`,
+        + `produced the hole.${stubs > 0 ? stubClause(stubs) : ''}`,
     }
   }
   return null

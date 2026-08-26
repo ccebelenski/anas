@@ -5,6 +5,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
   addMount,
+  addMountOption,
   ANAS_MARKER,
   classifyOptions,
   disableMount,
@@ -249,6 +250,70 @@ describe('surgical edits touch only the targeted line', () => {
     assert.equal(serializeMountLine(entry), 'UUID=xyz /mnt/new ext4 nofail 0 2')
     const removed = removeMount(added, '/mnt/new')
     assert.equal(removed, before) // adding then removing is a no-op on the bytes
+  })
+})
+
+describe('addMountOption — one option, in place, byte-surgically (story iscsi.8)', () => {
+  const OPT = 'x-systemd.before=rtslib-fb-targetctl.service'
+
+  it('adds the token to the options column and touches NOTHING else', () => {
+    const before = loadFixture('fstab-handedited-sample')
+    const after = addMountOption(before, '/mnt/spare', OPT)
+
+    const beforeLines = before.split('\n')
+    const afterLines = after.split('\n')
+    assert.equal(afterLines.length, beforeLines.length)
+    for (let i = 0; i < beforeLines.length; i++) {
+      if (beforeLines[i].includes('/mnt/spare')) {
+        // The tab-separated hand alignment survives verbatim; only the fourth
+        // column grew. A `replaceMount` here would have reflowed the whole line.
+        assert.equal(afterLines[i], `UUID=1b3e6c9a-2f44-4d8e-91aa-77c0de3f1a2b\t/mnt/spare\txfs\tdefaults,nofail,noatime,${OPT}\t0\t2`)
+      }
+      else {
+        assert.equal(afterLines[i], beforeLines[i], `line ${i} must be untouched`)
+      }
+    }
+  })
+
+  it('is a byte-identical no-op the second time — safe on every LUN placement', () => {
+    const before = loadFixture('fstab-handedited-sample')
+    const once = addMountOption(before, '/mnt/spare', OPT)
+    assert.notEqual(once, before)
+    assert.equal(addMountOption(once, '/mnt/spare', OPT), once)
+  })
+
+  it('keeps an inline trailing comment where it was', () => {
+    const before = loadFixture('fstab-handedited-sample')
+    const after = addMountOption(before, '/mnt/media', OPT)
+    const line = after.split('\n').find(l => l.includes('/mnt/media'))!
+    assert.ok(line.includes(`retrans=3,_netdev,${OPT}`), line)
+    assert.ok(line.endsWith('# media library, read-mostly'), line)
+  })
+
+  it('does not disturb an unknown option a human put there', () => {
+    const before = loadFixture('fstab-handedited-sample')
+    const after = addMountOption(before, '/mnt/weird', OPT)
+    const line = after.split('\n').find(l => l.includes('/mnt/weird'))!
+    assert.ok(line.includes('x-anas-note=keep-this-unknown-option'), line)
+    assert.ok(line.includes('comment=cloudconfig'), line)
+    assert.ok(line.endsWith(`comment=cloudconfig,${OPT}   0 0`), line)
+  })
+
+  it('a mountpoint with no line is left alone, byte for byte', () => {
+    const before = loadFixture('fstab-handedited-sample')
+    assert.equal(addMountOption(before, '/mnt/nothing-here', OPT), before)
+  })
+
+  it('a DISABLED entry keeps its marker and still gains the option', () => {
+    const before = loadFixture('fstab-anas-managed')
+    const disabled = disableMount(before, '/mnt/anas-nfs')
+    const after = addMountOption(disabled, '/mnt/anas-nfs', OPT)
+    const line = after.split('\n').find(l => l.includes('/mnt/anas-nfs'))!
+    assert.ok(line.startsWith(ANAS_MARKER), line)
+    assert.ok(line.includes(OPT), line)
+    // …and enabling it afterwards still yields a parseable, option-carrying line.
+    const enabled = enableMount(after, '/mnt/anas-nfs')
+    assert.equal(getMount(enabled, '/mnt/anas-nfs')!.options.passthrough.includes(OPT), true)
   })
 })
 

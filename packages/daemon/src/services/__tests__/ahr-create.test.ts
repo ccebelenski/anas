@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
-import { createAhrPool } from '../ahr-create.js'
+import { AHR_ISCSI_ORDERING_OPTION, createAhrPool, ensureAhrTargetOrdering } from '../ahr-create.js'
 import { LVM_MIXED_BLOCK_ARGS } from '../ahr-exec.js'
 
 /**
@@ -172,7 +172,10 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     const fstab = await readFile(fstabPath, 'utf8')
     assert.ok(fstab.startsWith(FSTAB_SEED.trimEnd()))
     // fstab carries subvol=@data (§12) so the mountpoint mounts the data subvolume.
-    assert.ok(fstab.includes(`/dev/t2/t2-vol ${join(mountBase, 't2')} btrfs nofail,subvol=@data 0 0`))
+    // The line carries the LIO boot-ordering option from `iscsi.8`: an AHR
+    // pool's `nofail` mount has no static anchor a drop-in can name, and losing
+    // that race makes LIO create a 0-byte placeholder at an image LUN's path.
+    assert.ok(fstab.includes(`/dev/t2/t2-vol ${join(mountBase, 't2')} btrfs nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service 0 0`), fstab)
 
     // mdadm.conf gained the ARRAY pin + the monitor PROGRAM hook.
     const conf = await readFile(confPath, 'utf8')
@@ -545,5 +548,76 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
       const notify = executor.calls.filter(c => c.command === '/usr/bin/perl')
       assert.equal(notify.at(-1)!.args[2], 'warning')
     })
+  })
+})
+
+/**
+ * Story `iscsi.8` point 3: the boot-ordering option on an EXISTING pool's line,
+ * added the moment an image LUN is placed on it and never before.
+ *
+ * The migration is deliberately not a sweep: a pool that will never hold a LUN
+ * is left exactly as the operator (or an older ANAS) wrote it. ANAS is a guest
+ * in /etc/fstab.
+ */
+describe('ensureAhrTargetOrdering - the surgical add for a pool that predates iscsi.8', () => {
+  let dir: string
+  let fstabPath: string
+  let executor: MockExecutor
+
+  const OLD_LINE = '/dev/lpahr/lpahr-vol /mnt/anas-ahr/lpahr btrfs nofail,subvol=@data 0 0'
+  const SEED = [
+    '# static file system information',
+    'UUID=abc / ext4 errors=remount-ro 0 1',
+    OLD_LINE,
+    '/dev/other/other-vol /mnt/anas-ahr/other btrfs nofail,subvol=@data 0 0',
+    '',
+  ].join('\n')
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ahr-ordering-'))
+    fstabPath = join(dir, 'fstab')
+    await writeFile(fstabPath, SEED)
+    executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
+  })
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('adds the option to that pool line only, and reloads the generator', async () => {
+    const changed = await ensureAhrTargetOrdering(executor, fstabPath, { name: 'lpahr', mountpoint: '/mnt/anas-ahr/lpahr' })
+    assert.equal(changed, true)
+    const after = await readFile(fstabPath, 'utf8')
+    assert.ok(after.includes(`/mnt/anas-ahr/lpahr btrfs nofail,subvol=@data,${AHR_ISCSI_ORDERING_OPTION} 0 0`), after)
+    // The OTHER AHR pool has no LUN, so its line is byte-identical.
+    assert.ok(after.includes('/dev/other/other-vol /mnt/anas-ahr/other btrfs nofail,subvol=@data 0 0'), after)
+    assert.ok(after.includes('UUID=abc / ext4 errors=remount-ro 0 1'), after)
+    assert.ok(executor.calls.some(c => c.args.includes('daemon-reload')), 'the mount unit is regenerated')
+  })
+
+  it('is a byte-identical no-op on the second LUN', async () => {
+    await ensureAhrTargetOrdering(executor, fstabPath, { name: 'lpahr', mountpoint: '/mnt/anas-ahr/lpahr' })
+    const once = await readFile(fstabPath, 'utf8')
+    const changed = await ensureAhrTargetOrdering(executor, fstabPath, { name: 'lpahr', mountpoint: '/mnt/anas-ahr/lpahr' })
+    assert.equal(changed, false)
+    assert.equal(await readFile(fstabPath, 'utf8'), once)
+  })
+
+  it('finds the line by LV spec when the pool is mounted somewhere else', async () => {
+    const changed = await ensureAhrTargetOrdering(executor, fstabPath, { name: 'lpahr', mountpoint: '/somewhere/else' })
+    assert.equal(changed, true)
+    assert.ok((await readFile(fstabPath, 'utf8')).includes(AHR_ISCSI_ORDERING_OPTION))
+  })
+
+  it('a pool with no fstab line changes nothing and never throws', async () => {
+    const changed = await ensureAhrTargetOrdering(executor, fstabPath, { name: 'ghost', mountpoint: '/mnt/anas-ahr/ghost' })
+    assert.equal(changed, false)
+    assert.equal(await readFile(fstabPath, 'utf8'), SEED)
+  })
+
+  it('an unreadable fstab is not fatal - adding a LUN must not fail over ordering', async () => {
+    const changed = await ensureAhrTargetOrdering(executor, join(dir, 'no-such-file'), { name: 'lpahr', mountpoint: '/x' })
+    assert.equal(changed, false)
   })
 })
