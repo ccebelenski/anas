@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { hasControlChars, ISODateTime } from './common.js'
+import { hasControlChars, ISODateTime, SingleLine } from './common.js'
 
 /**
  * iSCSI — block storage (iscsi epic, story `iscsi.2`: schemas + the READ layer).
@@ -39,9 +39,16 @@ import { hasControlChars, ISODateTime } from './common.js'
  * stored by LIO) in lowercase, so the pattern is lowercase-only. The 223-byte
  * cap is RFC 3720 §3.2.6. No control characters: the name is written verbatim
  * into a configfs directory name and a `targetcli` argument.
+ *
+ * The naming authority of an `iqn.` name needs at least TWO labels, because
+ * that is what **rtslib itself** enforces before it will create the target:
+ * its wwn pattern is `iqn.<yyyy>-<mm>.<label>(.<label>)+`, so a
+ * single-label authority like `iqn.2026-08.anas:vmstore` is rejected by the
+ * layer underneath ANAS. Accepting it here would only move the failure from a
+ * clear 400 to an opaque `targetcli` exit 1 half-way through a create.
  */
 const ISCSI_NAME_RE
-  = /^(?:iqn\.\d{4}-\d{2}\.[a-z0-9-]+(?:\.[a-z0-9-]+)*(?::[a-z0-9._:-]+)?|eui\.[0-9a-f]{16}|naa\.[0-9a-f]{16}(?:[0-9a-f]{16})?)$/
+  = /^(?:iqn\.\d{4}-\d{2}\.[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::[a-z0-9._:-]+)?|eui\.[0-9a-f]{16}|naa\.[0-9a-f]{16}(?:[0-9a-f]{16})?)$/
 
 /** A single legal IQN naming-authority label (a DNS label, lowercased). */
 const IQN_LABEL_RE = /^[a-z0-9-]+$/
@@ -56,26 +63,40 @@ export const IscsiIqn = z
   .refine(s => !hasControlChars(s), 'Control characters are not allowed')
   .refine(
     s => ISCSI_NAME_RE.test(s),
-    'Must be an iSCSI name: iqn.YYYY-MM.<reversed domain>[:<unique>], eui.<16 hex>, or naa.<16|32 hex>',
+    'Must be an iSCSI name: iqn.YYYY-MM.<reversed domain, at least two labels>[:<unique>], eui.<16 hex>, or naa.<16|32 hex>',
   )
 
 /**
  * The naming-authority label ANAS appends to make an IQN self-identifying.
  *
  * There is no shadow state and no marker file: a target either LOOKS like one
- * ANAS generated or it does not. The convention is
+ * ANAS generated or it does not. The convention is one line —
  *
- *     iqn.<yyyy-mm>.<authority>:<name>
- *     authority = 'anas'                     (node has no domain)
- *               | '<reversed node domain>.anas'
+ *     authority = reverse('anas.' + <node name>)
+ *     iqn.<yyyy-mm>.<authority>:<target name>
  *
- * so `nas.example.com` yields `iqn.2026-08.com.example.nas.anas:vmstore` and a
- * domainless node yields `iqn.2026-08.anas:vmstore`. Recognition is
- * date-agnostic and domain-agnostic — it only asks whether the authority's last
- * label is `anas` — which matters because the node's domain and the creation
- * month are both things ANAS must not have to remember.
+ * — so the node `nas.example.com` yields
+ * `iqn.2026-08.com.example.nas.anas:vmstore` and the domainless node `nas`
+ * yields `iqn.2026-08.nas.anas:vmstore`. The node's SHORT name is a label like
+ * any other, not a missing domain: dropping it would leave the single-label
+ * authority `anas`, which **rtslib refuses to create** (its wwn pattern demands
+ * at least two labels), so the domainless case has to carry the hostname to be
+ * legal at all.
+ *
+ * Recognition is date-agnostic and node-agnostic — it only asks whether the
+ * authority's LAST label is `anas` — which matters because the node's name and
+ * the creation month are both things a stateless daemon must not have to
+ * remember. A node that is renamed keeps serving the targets it created.
  */
 export const ANAS_IQN_AUTHORITY_LABEL = 'anas'
+
+/**
+ * The label that stands in for a node whose name yielded nothing usable — an
+ * empty hostname, or one made entirely of characters an IQN label cannot carry.
+ * It exists so the authority always has the two labels rtslib requires; it is
+ * not expected to be reached on a real node.
+ */
+export const ANAS_IQN_FALLBACK_NODE_LABEL = 'node'
 
 /**
  * A user-facing target name — the `:<name>` half of an ANAS-generated IQN. Kept
@@ -93,21 +114,26 @@ export const IscsiTargetName = z
   )
 
 /**
- * The naming authority ANAS uses for a node: the node's DNS domain reversed
- * with `.anas` appended, or the bare label `anas` when the node has no domain.
- * Non-conforming domain labels are dropped rather than smuggled into an IQN.
+ * The naming authority ANAS uses for a node: the node's name reversed with
+ * `anas` appended.
+ *
+ * `nodeName` is the whole thing the node calls itself — `nas` or
+ * `nas.example.com`, whichever `hostname()` gives — not just a domain part.
+ * Non-conforming labels are dropped rather than smuggled into an IQN, and if
+ * that leaves nothing at all the fallback label keeps the authority legal (see
+ * {@link ANAS_IQN_FALLBACK_NODE_LABEL}).
  */
-export function anasIqnAuthority(domain?: string | null): string {
+export function anasIqnAuthority(nodeName?: string | null): string {
   // Built reversed as we go (`unshift`), which is the whole point of an IQN
   // naming authority: `nas.example.com` is written `com.example.nas`.
   const reversed: string[] = []
-  for (const raw of (domain ?? '').toLowerCase().split('.')) {
+  for (const raw of (nodeName ?? '').toLowerCase().split('.')) {
     const label = raw.trim()
     if (label.length > 0 && IQN_LABEL_RE.test(label))
       reversed.unshift(label)
   }
   if (reversed.length === 0)
-    return ANAS_IQN_AUTHORITY_LABEL
+    reversed.push(ANAS_IQN_FALLBACK_NODE_LABEL)
   reversed.push(ANAS_IQN_AUTHORITY_LABEL)
   return reversed.join('.')
 }
@@ -120,11 +146,11 @@ export function anasIqnAuthority(domain?: string | null): string {
  * one definition (there is no rename in LIO — GT-10 — so the IQN, once created,
  * is the target's identity for life).
  */
-export function anasIqn(name: string, opts?: { domain?: string | null, date?: Date }): string {
+export function anasIqn(name: string, opts?: { nodeName?: string | null, date?: Date }): string {
   const d = opts?.date ?? new Date()
   const yyyy = d.getUTCFullYear().toString().padStart(4, '0')
   const mm = (d.getUTCMonth() + 1).toString().padStart(2, '0')
-  return `iqn.${yyyy}-${mm}.${anasIqnAuthority(opts?.domain)}:${name}`
+  return `iqn.${yyyy}-${mm}.${anasIqnAuthority(opts?.nodeName)}:${name}`
 }
 
 /** Split an IQN into its `yyyy-mm`, authority and unique-string parts. */
@@ -147,16 +173,23 @@ function splitIqn(iqn: string): { date: string, authority: string, unique: strin
 
 /**
  * Does this IQN follow the ANAS naming convention? True when the name parses as
- * an `iqn.` name whose naming authority's LAST label is `anas` and which carries
- * a non-empty unique string. Half of the ownership derivation — the other half
- * is that every LUN's backing object sits on ANAS-managed storage.
+ * an `iqn.` name whose naming authority ends in the label `anas`, carries at
+ * least one label BEFORE it (the node's own name — and the minimum rtslib will
+ * create), and has a non-empty unique string. Half of the ownership derivation;
+ * the other half is that every LUN's backing object sits on ANAS-managed
+ * storage.
+ *
+ * Recognition deliberately ignores WHICH node label precedes `anas`: a node that
+ * has been renamed, or a pool imported from a sibling node, still shows its ANAS
+ * targets as ANAS targets. The alternative would be a stored node name, which is
+ * the shadow state Principle 11 forbids.
  */
 export function isAnasIqn(iqn: string): boolean {
   const parts = splitIqn(iqn)
   if (!parts || parts.unique.length === 0)
     return false
   const labels = parts.authority.split('.')
-  return labels.at(-1) === ANAS_IQN_AUTHORITY_LABEL
+  return labels.length >= 2 && labels.at(-1) === ANAS_IQN_AUTHORITY_LABEL
 }
 
 /** The user-facing target name inside an ANAS IQN, or null for a foreign one. */
@@ -585,3 +618,520 @@ export const IscsiHealth = IscsiAvailability.extend({
   checkedAt: ISODateTime,
 })
 export type IscsiHealth = z.infer<typeof IscsiHealth>
+
+// ===========================================================================
+// Mutations (story `iscsi.4`) — the iSCSI menu's write half
+// ===========================================================================
+//
+// Everything below is a REQUEST shape. Two rules run through all of them:
+//
+//  1. **No secret ever comes back.** A CHAP secret travels one way only. The
+//     read shapes above carry `chapCredentialsSet` / `mutualCredentialsSet`
+//     booleans and nothing else, and the daemon writes the secret straight into
+//     configfs — never onto `targetcli`'s argv, never into journald (GT-35).
+//  2. **value / null / omitted mean set / clear / keep** (the standing
+//     dialog↔daemon ruling), applied per field. A collection field
+//     (`portals`, `acls`) present at all is the COMPLETE desired set; absent
+//     keeps what is there. That is what lets an untouched edit send nothing.
+
+/** The 12–16 byte CHAP secret range initiators enforce and LIO does not. */
+export const ISCSI_CHAP_SECRET_MIN_BYTES = 12
+export const ISCSI_CHAP_SECRET_MAX_BYTES = 16
+
+function utf8Length(s: string): number {
+  return new TextEncoder().encode(s).length
+}
+
+/**
+ * A CHAP secret, 12–16 bytes.
+ *
+ * LIO validates the length **not at all** — 1, 7, 8, 12, 16 and 20-character
+ * secrets were all accepted and written to configfs verbatim (GT-34). The
+ * 12–16-byte rule is a CLIENT rule (Windows enforces it, and an initiator that
+ * refuses an 8-byte secret is indistinguishable from a wrong one at the target),
+ * so if ANAS wants it, ANAS has to be the one enforcing it. It does, here, at
+ * the boundary — once, for every caller.
+ *
+ * Measured in BYTES, not characters: the secret is written as UTF-8 into a
+ * configfs file, and 16 characters of non-ASCII would overrun an initiator's
+ * 16-byte field.
+ */
+export const IscsiChapSecret = z
+  .string()
+  .refine(s => !hasControlChars(s), 'Control characters are not allowed in a CHAP secret')
+  .refine(
+    s => utf8Length(s) >= ISCSI_CHAP_SECRET_MIN_BYTES && utf8Length(s) <= ISCSI_CHAP_SECRET_MAX_BYTES,
+    `A CHAP secret must be ${ISCSI_CHAP_SECRET_MIN_BYTES}–${ISCSI_CHAP_SECRET_MAX_BYTES} bytes (initiators enforce this range; the target does not)`,
+  )
+
+/**
+ * A CHAP username. NOT a secret — it crosses the wire in the clear during the
+ * CHAP exchange — but it is written into a configfs value file, so it is held
+ * to printable non-space ASCII.
+ */
+export const IscsiChapUserid = z
+  .string()
+  .min(1)
+  .max(255)
+  // Printable ASCII, space excluded: U+0021 '!' through U+007E '~'. Spelled with
+  // the escapes rather than the literal range so the bounds are unambiguous.
+  .regex(/^[\u0021-\u007E]+$/, 'A CHAP username must be printable ASCII with no spaces')
+
+/**
+ * How a target authenticates its initiators.
+ *
+ * - `none`        — ACLs only. An initiator not in the ACL list is refused at
+ *                   login (`generate_node_acls=0`, LIO's default and the only
+ *                   mode ANAS uses — GT-31).
+ * - `chap`        — one-way CHAP: the initiator proves itself to the target.
+ * - `mutual-chap` — both directions; LIO flips `authenticate_target` itself the
+ *                   moment a mutual secret is written (GT-32).
+ *
+ * Under explicit ACLs the credentials live on the ACL, not the TPG: setting
+ * `authentication=1` makes LIO ignore TPG-level userid/password entirely, and a
+ * login with no PER-ACL credentials is refused even when the TPG carries a valid
+ * pair (GT-32).
+ */
+export const IscsiAuthMode = z.enum(['none', 'chap', 'mutual-chap'])
+export type IscsiAuthMode = z.infer<typeof IscsiAuthMode>
+
+// ---------------------------------------------------------------------------
+// Portal addresses
+// ---------------------------------------------------------------------------
+
+/** A dotted-quad shape; the range check is done per octet below. */
+const IPV4_RE = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/
+
+/** A bracketed literal, `[…]` — how LIO STORES an IPv6 portal (GT-12/GT-13). */
+const BRACKET_RE = /^\[(.+)\]$/
+
+/** IPv6 link-local, `fe80::/10` — LIO refuses to create a portal on one (GT-25). */
+const IPV6_LINK_LOCAL_RE = /^fe[89ab][0-9a-f]{0,2}:/i
+
+/** IPv4 link-local, `169.254.0.0/16`. */
+const IPV4_LINK_LOCAL_RE = /^169\.254\./
+
+/** One IPv6 hextet. */
+const HEXTET_RE = /^[0-9a-f]{1,4}$/i
+
+/** The wildcard addresses a portal must never be bound to (the threat model). */
+const WILDCARD_ADDRESSES = new Set(['0.0.0.0', '::'])
+
+function isIpv4(s: string): boolean {
+  if (!IPV4_RE.test(s))
+    return false
+  return s.split('.').every((o) => {
+    const n = Number(o)
+    return Number.isInteger(n) && n >= 0 && n <= 255 && String(n) === o
+  })
+}
+
+/**
+ * A pragmatic IPv6 literal check: hex groups separated by colons, at most one
+ * `::` elision, an optional trailing dotted-quad, and no zone id (LIO has no
+ * scope-id support, which is exactly why link-local fails — GT-25).
+ */
+function isIpv6(s: string): boolean {
+  if (!s.includes(':') || s.includes('%'))
+    return false
+  const elisions = s.split('::').length - 1
+  if (elisions > 1)
+    return false
+  const [head, tail] = elisions === 1 ? s.split('::') : [s, '']
+  const split = (segment: string): string[] => (segment === '' ? [] : segment.split(':'))
+  const all = [...split(head), ...split(tail)]
+  if (all.includes(''))
+    return false
+  let groups = all.length
+  const last = all.at(-1)
+  if (last !== undefined && last.includes('.')) {
+    // A trailing dotted-quad occupies two hextets (`::ffff:192.0.2.1`).
+    if (!isIpv4(last))
+      return false
+    groups += 1
+    all.pop()
+  }
+  if (!all.every(p => HEXTET_RE.test(p)))
+    return false
+  return elisions === 1 ? groups <= 7 : groups === 8
+}
+
+/** Strip the brackets LIO stores an IPv6 portal with. Idempotent. */
+export function unbracketAddress(address: string): string {
+  const trimmed = address.trim()
+  return BRACKET_RE.exec(trimmed)?.[1] ?? trimmed
+}
+
+/** The family of an IP literal (bare or bracketed), or null when it is not one. */
+export function ipFamily(address: string): 'inet' | 'inet6' | null {
+  const bare = unbracketAddress(address)
+  if (isIpv4(bare))
+    return 'inet'
+  if (isIpv6(bare))
+    return 'inet6'
+  return null
+}
+
+/**
+ * A portal address: an IP LITERAL this node carries, never a hostname (LIO
+ * binds addresses).
+ *
+ * Three things are refused here rather than downstream:
+ *
+ *  - **A hostname.** `targetcli` would resolve it and bind whatever came back,
+ *    which is not a decision a storage target should make silently.
+ *  - **A wildcard** (`0.0.0.0`, `::`). This is the epic's threat model in one
+ *    line — a portal is bound to a CHOSEN address. It is also exactly what
+ *    `auto_add_default_portal` creates behind ANAS's back on target create
+ *    (GT-8), and which the create sequence deletes.
+ *  - **A link-local address.** LIO refuses it outright ("Could not create
+ *    NetworkPortal in configFS", exit 1) because it has no scope-id support
+ *    (GT-25), so refusing it here turns an opaque failure into a sentence.
+ *
+ * The value is NORMALISED to the bare form: LIO stores an IPv6 portal bracketed
+ * and an IPv4 one bare (GT-12), so brackets are stripped once, here.
+ */
+export const IscsiPortalAddress = z
+  .string()
+  .min(1)
+  .max(64)
+  .transform(s => unbracketAddress(s))
+  .refine(
+    s => !WILDCARD_ADDRESSES.has(s),
+    'A portal must be bound to a specific address, never the wildcard — pick one of this node\'s addresses',
+  )
+  .refine(
+    s => ipFamily(s) !== null,
+    'Must be an IPv4 or IPv6 address literal (a portal binds an address, not a hostname)',
+  )
+  .refine(
+    s => !IPV6_LINK_LOCAL_RE.test(s) && !IPV4_LINK_LOCAL_RE.test(s),
+    'A link-local address cannot carry an iSCSI portal (LIO has no scope-id support and refuses it)',
+  )
+
+/** The IANA iSCSI port; LIO defaults to it and so does ANAS. */
+export const ISCSI_DEFAULT_PORT = 3260
+
+/** One requested network portal. */
+export const IscsiPortalRequest = z.object({
+  address: IscsiPortalAddress,
+  port: z.number().int().min(1).max(65535).default(ISCSI_DEFAULT_PORT),
+})
+export type IscsiPortalRequest = z.infer<typeof IscsiPortalRequest>
+
+// ---------------------------------------------------------------------------
+// ACLs
+// ---------------------------------------------------------------------------
+
+/**
+ * One explicit initiator ACL, as requested.
+ *
+ * The four credential fields follow the standing per-field contract exactly:
+ * a **value** sets, **null** clears, and an **omitted** field keeps whatever is
+ * there. That is what makes a secret rotation optional on an edit — the dialog
+ * leaves the password box blank and simply does not send the key, the mounts
+ * precedent — while still allowing an explicit "take the CHAP credentials off
+ * this initiator" without deleting and recreating the ACL, which would drop its
+ * session instantly and silently (GT-36).
+ */
+export const IscsiAclRequest = z.object({
+  initiatorIqn: IscsiIqn,
+  chapUserid: IscsiChapUserid.nullable().optional(),
+  /** WRITE-ONLY. Never returned; written straight to configfs, never argv. */
+  chapSecret: IscsiChapSecret.nullable().optional(),
+  mutualUserid: IscsiChapUserid.nullable().optional(),
+  /** WRITE-ONLY. Never returned; written straight to configfs, never argv. */
+  mutualSecret: IscsiChapSecret.nullable().optional(),
+})
+export type IscsiAclRequest = z.infer<typeof IscsiAclRequest>
+
+/** What an ACL must carry to be able to log in under a given auth mode. */
+export interface IscsiAclCredentialState {
+  chapUserid?: string | null
+  chapSecret?: string | null
+  mutualUserid?: string | null
+  mutualSecret?: string | null
+}
+
+/**
+ * Does this ACL carry what `auth` needs to be usable?
+ *
+ * Shared by the create-time schema refinement (nothing is stored yet, so the
+ * request has to be complete) and by the daemon's edit path (where an omitted
+ * secret means the stored one still stands), so "CHAP is on but this initiator
+ * can never log in" is one rule, not two.
+ */
+export function aclSatisfiesAuth(acl: IscsiAclCredentialState, auth: IscsiAuthMode): boolean {
+  if (auth === 'none')
+    return true
+  const oneWay = !!acl.chapUserid && !!acl.chapSecret
+  if (auth === 'chap')
+    return oneWay
+  return oneWay && !!acl.mutualUserid && !!acl.mutualSecret
+}
+
+/** The sentence a caller gets when an ACL could not log in under `auth`. */
+export function aclAuthRequirement(auth: IscsiAuthMode): string {
+  return auth === 'mutual-chap'
+    ? 'mutual CHAP needs a username and a secret in BOTH directions on every initiator ACL'
+    : 'CHAP needs a username and a secret on every initiator ACL — under explicit ACLs LIO ignores TPG-level credentials entirely'
+}
+
+// ---------------------------------------------------------------------------
+// Targets
+// ---------------------------------------------------------------------------
+
+/**
+ * `POST /v1/iscsi/targets`.
+ *
+ * `name` is the user-facing half; the IQN is GENERATED from it by `anasIqn` and
+ * is immutable afterwards — LIO has no rename (GT-10), so a "rename" is a new
+ * target and the dialog says so.
+ */
+export const CreateIscsiTargetRequest = z
+  .object({
+    name: IscsiTargetName,
+    /** At least one — a target with no portal listens nowhere. */
+    portals: z.array(IscsiPortalRequest).min(1, 'A target needs at least one portal'),
+    auth: IscsiAuthMode.default('none'),
+    acls: z.array(IscsiAclRequest).default([]),
+  })
+  .superRefine((req, ctx) => {
+    const seen = new Set<string>()
+    for (const p of req.portals) {
+      const key = `${p.address.toLowerCase()}:${p.port}`
+      if (seen.has(key))
+        ctx.addIssue({ code: 'custom', path: ['portals'], message: `Portal ${p.address}:${p.port} is listed twice` })
+      seen.add(key)
+    }
+    const iqns = new Set<string>()
+    for (const a of req.acls) {
+      if (iqns.has(a.initiatorIqn))
+        ctx.addIssue({ code: 'custom', path: ['acls'], message: `Initiator ${a.initiatorIqn} is listed twice` })
+      iqns.add(a.initiatorIqn)
+      if (!aclSatisfiesAuth(a, req.auth)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['acls'],
+          message: `Initiator ${a.initiatorIqn} would never be able to log in: ${aclAuthRequirement(req.auth)}`,
+        })
+      }
+    }
+  })
+export type CreateIscsiTargetRequest = z.infer<typeof CreateIscsiTargetRequest>
+
+/**
+ * `PUT /v1/iscsi/targets/:iqn`.
+ *
+ * Every field is optional and OMISSION MEANS KEEP, so an untouched edit sends
+ * `{}` and rewrites nothing. A collection that IS present is the complete
+ * desired set — the daemon diffs it against the live one and issues only the
+ * creates and deletes that differ, because an ACL delete is not a metadata edit:
+ * it drops that initiator's session instantly and destroys its CHAP credentials
+ * (GT-36).
+ */
+export const UpdateIscsiTargetRequest = z
+  .object({
+    portals: z.array(IscsiPortalRequest).min(1, 'A target needs at least one portal').optional(),
+    acls: z.array(IscsiAclRequest).optional(),
+    auth: IscsiAuthMode.optional(),
+  })
+  .superRefine((req, ctx) => {
+    const seen = new Set<string>()
+    for (const p of req.portals ?? []) {
+      const key = `${p.address.toLowerCase()}:${p.port}`
+      if (seen.has(key))
+        ctx.addIssue({ code: 'custom', path: ['portals'], message: `Portal ${p.address}:${p.port} is listed twice` })
+      seen.add(key)
+    }
+    const iqns = new Set<string>()
+    for (const a of req.acls ?? []) {
+      if (iqns.has(a.initiatorIqn))
+        ctx.addIssue({ code: 'custom', path: ['acls'], message: `Initiator ${a.initiatorIqn} is listed twice` })
+      iqns.add(a.initiatorIqn)
+    }
+  })
+export type UpdateIscsiTargetRequest = z.infer<typeof UpdateIscsiTargetRequest>
+
+/**
+ * `POST /v1/iscsi/targets/:iqn/state` — the TPG `enable` flag.
+ *
+ * `disable` refuses NEW logins and makes discovery return nothing, but the
+ * portal socket stays open and an established session keeps running (GT-37); the
+ * UI says so rather than implying the target went away.
+ */
+export const IscsiTargetStateRequest = z.object({
+  action: z.enum(['enable', 'disable']),
+})
+export type IscsiTargetStateRequest = z.infer<typeof IscsiTargetStateRequest>
+
+// ---------------------------------------------------------------------------
+// LUNs
+// ---------------------------------------------------------------------------
+
+/** How many characters of a LUN name a standard INQUIRY actually shows (GT-15). */
+export const ISCSI_LUN_NAME_INQUIRY_CHARS = 16
+
+/**
+ * A LUN's name — and therefore the SCSI MODEL STRING every initiator sees.
+ *
+ * This is not an internal handle. With `emulate_model_alias=1` and targetcli's
+ * `export_backstore_name_as_model=true`, the backstore name is what INQUIRY
+ * reports as the product identification, what `lsblk MODEL` shows on the
+ * initiator, and part of the VPD 0x83 T10 designator `<name>:<serial>` (GT-15).
+ * Standard INQUIRY pads it to 16 characters, so only the first 16 are visible
+ * there — longer names are legal and useful in the ANAS UI, just truncated in
+ * that one field.
+ *
+ * It is also a configfs directory name, hence the conservative alphabet.
+ */
+export const IscsiLunName = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(
+    /^[a-z0-9][\w.-]*$/i,
+    'Must start with a letter or digit and contain only letters, digits, underscore, dot or hyphen',
+  )
+
+/**
+ * The logical block size an initiator sees. Settable ONLY before the backstore
+ * is mapped — on an activated one `set attribute block_size=` fails with
+ * `[Errno 22] Invalid argument` (GT-27) — so it is a create-time choice and
+ * read-only thereafter. Omitted keeps LIO's 512.
+ */
+export const IscsiBlockSize = z.union([
+  z.literal(512),
+  z.literal(1024),
+  z.literal(2048),
+  z.literal(4096),
+])
+export type IscsiBlockSize = z.infer<typeof IscsiBlockSize>
+
+/** The two backing kinds ANAS creates. `foreign` is a READ verdict, never a request. */
+export const IscsiLunCreateKind = z.enum(['zvol', 'file'])
+export type IscsiLunCreateKind = z.infer<typeof IscsiLunCreateKind>
+
+/**
+ * `POST /v1/iscsi/targets/:iqn/luns`.
+ *
+ * `backing` means one of two things, and the kind says which:
+ *
+ *  - `zvol` — an EXISTING ANAS-managed ZFS volume, named as a dataset
+ *    (`tank/vol1`) or as its stable device path (`/dev/zvol/tank/vol1`). A PVE
+ *    guest volume (`vm-101-disk-0`) and anything on a PVE-managed pool are never
+ *    eligible. `size` must be absent: a zvol already has one, and growing it is
+ *    the PUT.
+ *  - `file` — the ZFS dataset or AHR pool that will HOST a new sparse raw image
+ *    (`tank/images`, `ahrpool`, or an absolute directory). `size` is required
+ *    and then fixed: a fileio backstore's size is set at creation and cannot be
+ *    changed in place (GT-29), which is why the PUT recreates it.
+ */
+export const AddIscsiLunRequest = z
+  .object({
+    name: IscsiLunName,
+    kind: IscsiLunCreateKind,
+    backing: SingleLine.pipe(z.string().min(1).max(4096)),
+    /** `file` only: the image size in bytes. */
+    size: z.number().int().positive().optional(),
+    blockSize: IscsiBlockSize.optional(),
+  })
+  .superRefine((req, ctx) => {
+    if (req.kind === 'file' && req.size === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['size'],
+        message: 'An image-file LUN needs a size — a fileio backstore\'s size is fixed at creation and can only be changed by recreating it',
+      })
+    }
+    if (req.kind === 'zvol' && req.size !== undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['size'],
+        message: 'A zvol LUN takes its size from the volume — grow the volume instead',
+      })
+    }
+    if (req.backing.includes('..'))
+      ctx.addIssue({ code: 'custom', path: ['backing'], message: 'Path traversal is not allowed' })
+  })
+export type AddIscsiLunRequest = z.infer<typeof AddIscsiLunRequest>
+
+/**
+ * `PUT /v1/iscsi/targets/:iqn/luns/:n` — grow, or change the write cache.
+ *
+ * A SHRINK is refused: ZFS truncates a zvol silently even under a live session
+ * (GT-40), and a fileio recreate at a smaller size throws away whatever was past
+ * the new end. There is no safe way to take blocks away from a block device from
+ * the outside, so that is a Level 1 refusal with no confirm bypass.
+ */
+export const UpdateIscsiLunRequest = z
+  .object({
+    /** The new size in BYTES. Must be ≥ the current size. */
+    size: z.number().int().positive().optional(),
+    /**
+     * `emulate_write_cache`. LIO ships fileio with write-back ON — an unflushed
+     * write is lost on a crash (GT-26) — so ANAS creates every LUN with it OFF
+     * and only an explicit, warned choice turns it back on.
+     */
+    writeBack: z.boolean().optional(),
+  })
+  .refine(
+    req => req.size !== undefined || req.writeBack !== undefined,
+    'Nothing to change — send a size or a writeBack',
+  )
+export type UpdateIscsiLunRequest = z.infer<typeof UpdateIscsiLunRequest>
+
+/** Boolean-ish query flag (a query string carries `?flag=true`, not a boolean). */
+export const IscsiQueryFlag = z
+  .union([z.boolean(), z.enum(['true', '1', 'false', '0'])])
+  .transform(v => v === true || v === 'true' || v === '1')
+
+/**
+ * `DELETE /v1/iscsi/targets/:iqn/luns/:n`.
+ *
+ * Unmapping and deleting the backstore always happens. `destroyBacking` also
+ * destroys the object underneath — the zvol or the image file — and is
+ * confirm-gated, because that is the one irreversible half.
+ */
+export const DeleteIscsiLunQuery = z.object({
+  destroyBacking: IscsiQueryFlag.default(false),
+})
+export type DeleteIscsiLunQuery = z.infer<typeof DeleteIscsiLunQuery>
+
+// ---------------------------------------------------------------------------
+// The cross-feature seam (story `iscsi.6` consumes this)
+// ---------------------------------------------------------------------------
+
+/**
+ * One backing object a LUN currently holds — the answer to "is this zvol / image
+ * / dataset held by a LUN?" that Pools, Datasets, AHR and Mounts need before they
+ * destroy, rename, roll back or unmount anything.
+ *
+ * It is a shared shape rather than a daemon-private one because `iscsi.6` turns
+ * it into refusal text in several places, and a rendered sentence must not be
+ * written twice.
+ */
+export const IscsiClaim = z.object({
+  /** The stable backing path: `/dev/zvol/<pool>/<vol>` or the image file. */
+  backingPath: z.string(),
+  kind: IscsiLunKind,
+  /** The ZFS pool the object sits on, when it resolves onto one. */
+  pool: z.string().optional(),
+  /** The ZFS dataset (the zvol itself, or the image's dataset). */
+  dataset: z.string().optional(),
+  targetIqn: z.string(),
+  tpgTag: z.number().int().nonnegative(),
+  lunIndex: z.number().int().nonnegative(),
+  backstoreName: z.string(),
+  /** Initiator IQNs with a live session mapping this LUN. */
+  connectedInitiators: z.array(z.string()),
+  /** One sentence naming the holder, ready to append to a refusal. */
+  detail: z.string(),
+})
+export type IscsiClaim = z.infer<typeof IscsiClaim>
+
+/** `iscsiClaims()` — every backing object currently mapped into a LUN. */
+export const IscsiClaimList = IscsiAvailability.extend({
+  claims: z.array(IscsiClaim),
+})
+export type IscsiClaimList = z.infer<typeof IscsiClaimList>

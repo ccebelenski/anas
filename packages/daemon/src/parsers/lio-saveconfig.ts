@@ -57,6 +57,18 @@ const BRACKETED_RE = /^\[(.+)\]$/
 /** A backstore reference: `/backstores/<plugin>/<name>`. */
 const STORAGE_OBJECT_RE = /^\/backstores\/([^/]+)\/(.+)$/
 
+/**
+ * LIO's sentinel for a CHAP credential that is NOT set.
+ *
+ * The kernel's node-ACL auth store treats the literal string `NULL` as a clear
+ * (it drops the `NAF_*_IN_SET` flag), so that is what ANAS writes to remove a
+ * credential (`services/iscsi-mutate.ts`). rtslib normally converts it back to
+ * an empty string when it saves, but a config written while a credential was
+ * cleared can carry the sentinel through — and reporting `credentialsSet: true`
+ * for a credential that is not set would be a lie in the one place it matters.
+ */
+const LIO_AUTH_NULL = 'NULL'
+
 /** A persisted backstore (a `storage_objects[]` entry). */
 export interface SaveconfigStorageObject {
   /** Backstore name — also the SCSI model string initiators see (GT-15). */
@@ -198,7 +210,13 @@ function asBoolean(v: unknown): boolean | null {
  * this is the only thing the parser is allowed to learn from a `chap_password`.
  */
 function secretPresent(v: unknown): boolean {
-  return typeof v === 'string' && v.length > 0
+  return typeof v === 'string' && v.length > 0 && v !== LIO_AUTH_NULL
+}
+
+/** A CHAP username, with LIO's `NULL` sentinel read as "not set". */
+function authValue(v: unknown): string | null {
+  const s = asString(v)
+  return s === null || s === LIO_AUTH_NULL ? null : s
 }
 
 /** A `1`/`0` attribute read as a boolean; null when absent or non-numeric. */
@@ -289,10 +307,10 @@ function parseAcl(raw: unknown): SaveconfigAcl | null {
   }
   return {
     initiatorIqn,
-    chapUserid: asString(raw.chap_userid),
+    chapUserid: authValue(raw.chap_userid),
     // The secret itself stops here — only its presence travels on (GT-12/GT-35).
     chapCredentialsSet: secretPresent(raw.chap_password),
-    mutualUserid: asString(raw.chap_mutual_userid),
+    mutualUserid: authValue(raw.chap_mutual_userid),
     mutualCredentialsSet: secretPresent(raw.chap_mutual_password),
     mappedLuns: mappedLuns.sort((a, b) => a - b),
   }

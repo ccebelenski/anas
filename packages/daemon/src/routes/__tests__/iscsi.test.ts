@@ -129,7 +129,7 @@ describe('GET /v1/iscsi/* — the read layer against the real captures', () => {
 
   it('GET /v1/iscsi/targets/:iqn 404s for an unknown target', async () => {
     await serve({ manifest: 'configfs-live.manifest', saveconfig: 'saveconfig-final.json' })
-    const res = await get(server!, `/v1/iscsi/targets/${encodeURIComponent('iqn.2026-08.anas:nope')}`)
+    const res = await get(server!, `/v1/iscsi/targets/${encodeURIComponent('iqn.2026-08.host.anas:nope')}`)
     assert.equal(res.statusCode, 404)
     assert.equal(res.error!.code, 'NOT_FOUND')
   })
