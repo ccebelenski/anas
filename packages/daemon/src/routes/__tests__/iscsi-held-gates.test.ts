@@ -1,4 +1,4 @@
-import type { AhrPool, Dataset, IscsiTargetDetail, MountSummary, PoolSummary } from '@anas/shared'
+import type { AhrPool, Dataset, IscsiTargetDetail, Job, JobAccepted, MountSummary, PoolSummary } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { lunGrowGuidance } from '@anas/shared'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
@@ -177,6 +178,18 @@ describe('iscsi.6 — the rest of ANAS knows a LUN is there (route gates)', () =
     return calls.some(c => c.command === command && argPrefix.every((a, i) => c.args[i] === a))
   }
 
+  /** Poll a submitted job to its terminal state (the grow RESULT is the point). */
+  async function waitForJob(id: string): Promise<Job> {
+    for (let i = 0; i < 200; i++) {
+      const res = await server!.inject({ method: 'GET', url: `/v1/jobs/${id}`, headers: IDENTITY })
+      const { job } = res.json() as { job: Job }
+      if (job.status === 'completed' || job.status === 'failed')
+        return job
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    throw new Error(`Job ${id} did not finish`)
+  }
+
   /** Assert the shape every held-by-LUN refusal must have. */
   function assertHeldRefusal(res: { statusCode: number, headers: Record<string, unknown>, json: () => unknown }, lun: string): string {
     assert.equal(res.statusCode, 409)
@@ -296,6 +309,35 @@ describe('iscsi.6 — the rest of ANAS knows a LUN is there (route gates)', () =
       assert.match(body.error.message, /held by iSCSI LUN 0 'gtiscsi_vol1'/)
       assert.match(body.error.message, /no confirm bypass/)
       assert.equal(ran(ZFS, 'set'), false)
+    })
+
+    it('a volsize GROW of a served volume is allowed, and the guest guidance rides the job result — the same sentence the iSCSI door sends', async () => {
+      // iscsi.8: the grow is the supported live path — allowed, not refused.
+      // What the operator then has to do on the guest side is the daemon's job
+      // to say: lunGrowGuidance, the ONE sentence both doors share.
+      await serve()
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      const wrapped = mock.exec.bind(mock)
+      const same = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i])
+      mock.exec = async (command: string, args: string[]) => {
+        if (command === ZFS && same(args, ['set', 'volsize=4294967296', ZVOL]))
+          return { stdout: '', stderr: '', exitCode: 0 }
+        return wrapped(command, args)
+      }
+      const res = await server!.inject({
+        method: 'PUT',
+        url: `/v1/pools/${POOL}/datasets/vol1`,
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ properties: { volsize: 4294967296 } }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob((res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as { warnings?: string[] }
+      assert.ok(
+        result.warnings?.includes(lunGrowGuidance(4294967296)),
+        JSON.stringify(result.warnings),
+      )
     })
 
     it('DELETE a filesystem dataset holding a LUN\'s IMAGE FILE — refused before `zfs destroy`', async () => {

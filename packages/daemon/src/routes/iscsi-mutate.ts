@@ -14,6 +14,7 @@ import {
   emptyAclsSentence,
   IscsiIqn,
   IscsiTargetStateRequest,
+  lunGrowGuidance,
   UpdateIscsiLunRequest,
   UpdateIscsiTargetRequest,
 } from '@anas/shared'
@@ -714,17 +715,14 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       req.writeBack !== undefined ? { writeBack: req.writeBack } : {},
     )
     const warnings: string[] = []
-    // A grow that happens under a live session is safe and INVISIBLE until the
-    // initiator looks again — measured on the stunt node: the disk stayed at its
-    // old size until `iscsiadm -m node -R`, then reported the new one (F13).
-    // Saying so is the difference between "it did not work" and "rescan".
-    if (zvolGrow && lun.connectedInitiators.length > 0) {
-      warnings.push(
-        `${lun.connectedInitiators.length} initiator${lun.connectedInitiators.length === 1 ? ' is' : 's are'} logged in. `
-        + 'The volume grows live, but an initiator keeps showing the OLD size until it rescans '
-        + '(open-iscsi: `iscsiadm -m node -R`); the filesystem on top then has to be grown separately.',
-      )
-    }
+    // A zvol grow — with or without a session — is INVISIBLE to a running
+    // guest: the LUN and the initiators see the new size, but a RUNNING VM
+    // keeps the old one until QEMU reopens the disk (verified on a real node
+    // 2026-08-26). The sentence is the shared one — `lunGrowGuidance` —
+    // because the Datasets door's grow of the SAME volume carries it too:
+    // one definition, two doors.
+    if (zvolGrow && req.size !== undefined)
+      warnings.push(lunGrowGuidance(req.size))
     if (req.writeBack === true) {
       warnings.push(
         'Write-back caching is ON for this LUN: the target acknowledges a write before it reaches stable storage, '

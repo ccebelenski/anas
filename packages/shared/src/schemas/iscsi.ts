@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { hasControlChars, ISODateTime, SingleLine } from './common.js'
+import { fmtBytes, hasControlChars, ISODateTime, SingleLine } from './common.js'
 
 /**
  * iSCSI — block storage (iscsi epic, story `iscsi.2`: schemas + the READ layer).
@@ -1118,6 +1118,30 @@ export function aclAuthRequirement(auth: IscsiAuthMode): string {
 export function emptyAclsSentence(nodeInitiatorIqn: string | null): string {
   const tail = nodeInitiatorIqn ? ` (this node's own is ${nodeInitiatorIqn})` : ''
   return `A target needs at least one initiator ACL — discovery is closed to initiators not listed here (demo mode is off), so a target with no ACLs is invisible to everyone; add the initiator IQN of each host that should see it${tail}`
+}
+
+/**
+ * The sentence a GROWN LUN-backed volume earns — one definition, two doors.
+ *
+ * A ZFS volume that backs an iSCSI LUN can be grown from either door: the
+ * iSCSI screen's LUN resize (the zvol grows live, GT-28) and the Datasets
+ * screen's Resize Volume (`zfs set volsize=`, the iscsi.8-allowed path under a
+ * live session). Both doors hand the operator back a job that SUCCEEDED — and
+ * then nothing. The grow is real at the LUN and at the initiators, but a
+ * RUNNING VM still sees the old size: QEMU keeps the disk open at the size it
+ * first saw, a reboot INSIDE the guest does not reopen it, and Proxmox's own
+ * Resize button refuses to touch an iSCSI LUN at all. Verified on a real node
+ * 2026-08-26 — the guest-side steps (power-cycle or `block_resize`, then
+ * growpart + resize2fs in the guest) are the half the operator never finds on
+ * their own, so the sentence says them. Plain ASCII on purpose: it rides job
+ * results, logs and notifications, not just the UI.
+ */
+export function lunGrowGuidance(newSize: number): string {
+  return `The LUN and this node's initiators now see ${fmtBytes(newSize)}. `
+    + 'A RUNNING VM keeps the old size until QEMU reopens the disk: '
+    + 'power-cycle it (a reboot inside the guest is not enough) or run `block_resize` from `qm monitor`, '
+    + 'and the partition and filesystem inside the guest must then be grown there (e.g. growpart + resize2fs). '
+    + 'Proxmox\'s own Resize button cannot resize an iSCSI LUN.'
 }
 
 // ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ import type { ParsedAcl } from '../parsers/getfacl.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import type { Transport } from '../services/replication-transport.js'
-import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, PoolName, RenameSnapshotRequest, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
+import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, lunGrowGuidance, PoolName, RenameSnapshotRequest, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { parseExports } from '../parsers/exports.js'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
@@ -1015,6 +1015,10 @@ export async function datasetRoutes(
     // Story iscsi.3 — a volume and a filesystem accept DIFFERENT properties, and
     // ZFS reports the mismatch as an opaque failure part-way through the set.
     // Refuse the mismatch at the boundary instead, naming the property.
+    // Job-result warnings. The one a property edit can earn today is the LUN
+    // grow guidance (below) — a filesystem edit never does.
+    const warnings: string[] = []
+
     if (target.type === 'volume') {
       const notOnVolume = (['recordsize', 'quota', 'refquota', 'atime'] as const)
         .filter(k => props[k] !== undefined)
@@ -1025,17 +1029,25 @@ export async function datasetRoutes(
       // THE gate: grow yes, shrink never (assertVolumeMutable, the one seam).
       // Story iscsi.6: the holding LUN rides in too, so a refused shrink names
       // what is serving the volume as well as why the shrink itself is refused.
+      const held = await datasetHeldByLun(target, fullName)
       const refusal = assertVolumeMutable(
         fullName,
         'grow',
         target,
         { volsize: props.volsize },
-        target?.type === 'volume' ? await datasetHeldByLun(target, fullName) : null,
+        held,
       )
       if (refusal) {
         reply.code(409)
         return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
       }
+      // A grow of a LUN-backed volume succeeds — and then goes quiet. The
+      // shared sentence (lunGrowGuidance) rides the job result as a warning,
+      // exactly as the iSCSI door's own LUN resize carries it: one definition,
+      // two doors. Not held, or a property edit that is not a volsize grow →
+      // no warning.
+      if (held !== null && props.volsize !== undefined)
+        warnings.push(lunGrowGuidance(props.volsize))
     }
     else if (props.volsize !== undefined) {
       reply.code(400)
@@ -1057,7 +1069,7 @@ export async function datasetRoutes(
         const result = await executor.exec(ZFS, ['set', ...pairs, fullName])
         if (result.exitCode !== 0)
           throw new Error(result.stderr.trim() || `zfs set ${spec} exited with code ${result.exitCode}`)
-        return { dataset: fullName, applied: pairs }
+        return { dataset: fullName, applied: pairs, warnings }
       },
     )
 

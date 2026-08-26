@@ -2045,9 +2045,29 @@
             view: win,
             failTitle: 'Resize failed',
             successMsg: t('Volume resized') + ': ' + fullName + ' → ' + ANAS.formatBytes(next),
-            onComplete: function () {
+            onComplete: function (job) {
                 if (!win.destroyed && !win.destroying) {
                     win.close();
+                }
+                // A grow of a LUN-backed volume succeeds and then goes quiet —
+                // the daemon carries the guest-side steps (power-cycle, then
+                // growpart + resize2fs) as a warning on the job result.
+                // Surface it, never as a failure (the backup-run pattern).
+                var warnings = [];
+                try {
+                    var result = (job && job.result) || {};
+                    if (result.warnings && result.warnings.length) {
+                        warnings = result.warnings;
+                    }
+                } catch (e) {
+                    // best-effort summary
+                }
+                if (warnings.length) {
+                    try {
+                        Ext.Msg.alert(t('Volume resized with a warning'), ANAS.warningsHtml(warnings));
+                    } catch (eMsg) {
+                        ANAS.warn(warnings.join(' '));
+                    }
                 }
                 loadTree(tree, node);
             },

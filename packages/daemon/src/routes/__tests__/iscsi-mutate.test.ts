@@ -7,10 +7,10 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { anasIqn } from '@anas/shared'
+import { anasIqn, lunGrowGuidance } from '@anas/shared'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { createServer } from '../../server.js'
-import { TARGETCLI } from '../../services/iscsi-mutate.js'
+import { TARGETCLI, ZFS } from '../../services/iscsi-mutate.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/iscsi')
@@ -791,6 +791,49 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       await serveAnas()
       const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 4294967296 })
       assert.equal(res.statusCode, 202)
+    })
+
+    /** Let a resize job run to completion so its RESULT can be read. */
+    async function finishedResizeJob(opts: { session?: boolean } = {}) {
+      await serveAnas(opts)
+      const mock = mockOf()
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 4294967296 })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      return job.result as { warnings?: string[] }
+    }
+
+    it('a zvol grow carries the guest guidance as a warning — even when nobody is logged in', async () => {
+      const result = await finishedResizeJob()
+      assert.ok(result.warnings?.includes(lunGrowGuidance(4294967296)), JSON.stringify(result.warnings))
+      // Plain ASCII on purpose: it rides job results, logs and notifications.
+      assert.ok(!/[^\x20-\x7E]/.test(lunGrowGuidance(4294967296)))
+    })
+
+    it('under a live session it carries the SAME sentence — the old rescan warning is gone (one source)', async () => {
+      const result = await finishedResizeJob({ session: true })
+      assert.ok(result.warnings?.includes(lunGrowGuidance(4294967296)), JSON.stringify(result.warnings))
+      assert.ok(
+        !result.warnings?.some(w => /rescans|OLD size/.test(w)),
+        `the pre-guidance rescan sentence must not ride the result: ${JSON.stringify(result.warnings)}`,
+      )
+    })
+
+    it('a write-cache change carries no grow guidance — it is not a grow', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { writeBack: true })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as { warnings?: string[] }
+      assert.ok(!result.warnings?.includes(lunGrowGuidance(4294967296)), JSON.stringify(result.warnings))
+      // The write-back caveat still rides — only the grow sentence does not.
+      assert.ok(result.warnings?.some(w => /Write-back caching is ON/.test(w)), JSON.stringify(result.warnings))
     })
 
     it('400s an empty body — nothing to change is not a change', async () => {

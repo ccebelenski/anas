@@ -419,6 +419,16 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
       assert.deepEqual(args, ['set', `volsize=${4 * GiB}`, VOL])
     })
 
+    it('a grow of a volume no LUN holds carries no LUN guidance', async () => {
+      server = startServer()
+      const res = await put(VOL_PATH, { properties: { volsize: 4 * GiB } })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as { warnings?: string[] }
+      assert.deepEqual(result.warnings, [])
+    })
+
     it('refuses a shrink with a 409 that has NO confirm code', async () => {
       server = startServer()
       const res = await put(VOL_PATH, { properties: { volsize: GiB } })

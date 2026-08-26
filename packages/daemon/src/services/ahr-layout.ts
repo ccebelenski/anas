@@ -6,6 +6,7 @@ import type {
   ArrayLevel,
 } from '@anas/shared'
 import type { KernelInfo } from './kernel-version.js'
+import { fmtBytes } from '@anas/shared'
 import { MD_MIXED_LBS_MIN_KERNEL_TEXT } from './kernel-version.js'
 
 /**
@@ -181,20 +182,12 @@ function levelFor(tier: AhrType, members: number): ArrayLevel | null {
 }
 
 /**
- * The single canonical AHR size formatter, shared by every AHR confirm
- * dialog, warning, and notification.
- *
- * Convention: GiB below 1024 GiB, TiB at or above, at most two decimals with
- * trailing zeros dropped — "3.64 TiB pending", "2 GiB", never "3724 GiB" or
- * a noisy "2.00 GiB". Two decimals at TiB scale keeps ~10 GiB of resolution;
- * dropping trailing zeros keeps whole-disk sizes clean in operator strings.
+ * The canonical ANAS size formatter moved to `@anas/shared` (common.ts) so the
+ * shared guidance sentences and the daemon's own sentences render sizes the
+ * same way — one definition, not one per package. Re-exported so the existing
+ * AHR import sites keep working unchanged.
  */
-export function fmtBytes(bytes: number): string {
-  const gib = bytes / AHR_SIZE_GRANULARITY_BYTES
-  if (gib >= 1024)
-    return `${Math.round((gib / 1024) * 100) / 100} TiB`
-  return `${Math.round(gib * 100) / 100} GiB`
-}
+export { fmtBytes }
 
 interface RoundedDisk {
   id: string

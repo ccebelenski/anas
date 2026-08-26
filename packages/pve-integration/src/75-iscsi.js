@@ -2818,9 +2818,28 @@
             view: win,
             failTitle: 'Resize failed',
             successMsg: t('LUN resized') + ': ' + rec.get('name') + ' → ' + fmtBytes(next),
-            onComplete: function () {
+            onComplete: function (job) {
                 if (!win.destroyed && !win.destroying) {
                     win.close();
+                }
+                // The same guidance the Datasets door's grow of this volume
+                // carries — the daemon's one sentence, both doors. Surface it,
+                // never as a failure (the backup-run pattern).
+                var warnings = [];
+                try {
+                    var result = (job && job.result) || {};
+                    if (result.warnings && result.warnings.length) {
+                        warnings = result.warnings;
+                    }
+                } catch (e) {
+                    // best-effort summary
+                }
+                if (warnings.length) {
+                    try {
+                        Ext.Msg.alert(t('LUN resized with a warning'), ANAS.warningsHtml(warnings));
+                    } catch (eMsg) {
+                        ANAS.warn(warnings.join(' '));
+                    }
                 }
                 loadLuns(lunsWin, node, iqn);
                 loadTargets(view, node, true);

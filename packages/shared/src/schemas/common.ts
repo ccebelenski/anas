@@ -121,3 +121,22 @@ export const DiskId = z.string().min(1).regex(/^[\w.-]+$/, 'Invalid disk by-id i
  */
 export const NotifyMode = z.enum(['always', 'on-failure'])
 export type NotifyMode = z.infer<typeof NotifyMode>
+
+// --- Shared formatting ---
+
+/**
+ * The canonical ANAS size formatter, shared by every operator-facing size in a
+ * warning, guidance sentence, confirm dialog, or notification (AHR band math,
+ * iSCSI LUN guidance, …).
+ *
+ * Convention: GiB below 1024 GiB, TiB at or above, at most two decimals with
+ * trailing zeros dropped — "3.64 TiB pending", "2 GiB", never "3724 GiB" or
+ * a noisy "2.00 GiB". Two decimals at TiB scale keeps ~10 GiB of resolution;
+ * dropping trailing zeros keeps whole-disk sizes clean in operator strings.
+ */
+export function fmtBytes(bytes: number): string {
+  const gib = bytes / 1024 ** 3
+  if (gib >= 1024)
+    return `${Math.round((gib / 1024) * 100) / 100} TiB`
+  return `${Math.round(gib * 100) / 100} GiB`
+}
