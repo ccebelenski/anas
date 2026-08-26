@@ -2,11 +2,13 @@ import type { Disk, DiskHealthStatus, VdevRole, VdevState } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
+import type { IscsiPaths } from '../services/iscsi.js'
 import { parseByIdToKernel, parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { LSBLK_ARGS, parseLsblk } from '../parsers/lsblk.js'
 import { parseSmartctl } from '../parsers/smartctl.js'
 import { parseZpoolStatus } from '../parsers/zpool-status.js'
 import { readAhrPools } from '../services/ahr-topology.js'
+import { iscsiServedSerials, normalizeSerial } from '../services/iscsi-held.js'
 
 const BY_ID_PATH_RE = /^\/dev\/disk\/by-(?:id|partuuid)\/(.+)$/
 const KERNEL_PATH_RE = /^\/dev\/([a-z0-9]+)$/
@@ -132,8 +134,9 @@ export function computeHealth(
 export async function collectDisks(
   executor: CommandExecutor,
   diskIdentityCache: DiskIdentityCache,
+  iscsiPaths: IscsiPaths = {},
 ): Promise<Disk[]> {
-  const [lsblkResult, byIdResult, byPartuuidResult, statusResult, ahrPools] = await Promise.all([
+  const [lsblkResult, byIdResult, byPartuuidResult, statusResult, ahrPools, servedSerials] = await Promise.all([
     executor.exec('/usr/bin/lsblk', LSBLK_ARGS),
     executor.exec('/usr/bin/ls', ['-la', '/dev/disk/by-id/']),
     // Some pools reference vdev members by GPT partition GUID (`zpool status`
@@ -148,6 +151,10 @@ export async function collectDisks(
     // membership and disks fall through to their existing status — the disks
     // endpoint must never crash because AHR is unreadable.
     readAhrPools(executor).catch(() => []),
+    // The serials of the LUNs THIS node serves (story iscsi.6). Costs two stats
+    // on a node with no LIO (the read layer short-circuits before it touches
+    // ZFS, PVE or the network) and fail-opens to an empty set.
+    iscsiServedSerials(executor, iscsiPaths),
   ])
 
   const byIdMap = parseDiskByIdListing(byIdResult.stdout)
@@ -252,20 +259,49 @@ export async function collectDisks(
       smartHealthy,
       ...zfsContext,
       ...ahrContext,
+      ...handsOffContext(d, servedSerials),
       healthStatus: computeHealth(smartHealthy, info),
     }
   })
 }
 
+/**
+ * The hands-off tag for a disk this node is serving to ITSELF (story iscsi.6).
+ *
+ * `status` is left alone on purpose: the disk really IS a blank SCSI device, and
+ * lying about that in the inventory would be worse than the loop-back it
+ * prevents. The tag is the honest form — "ANAS knows something about this disk
+ * that the block layer does not" — and it is what the composer candidacy check
+ * and the Disks badge both read.
+ *
+ * Only a disk that arrived over the ISCSI TRANSPORT is ever considered. A local
+ * disk cannot be one of our LUNs, and a serial collision with a real SATA drive
+ * would otherwise be enough to hide it from the composer.
+ */
+export function handsOffContext(
+  disk: Pick<Disk, 'transport' | 'serial' | 'model'>,
+  servedSerials: Set<string>,
+): { handsOff?: Disk['handsOff'], handsOffReason?: string } {
+  if (disk.transport !== 'iscsi' || !disk.serial || servedSerials.size === 0)
+    return {}
+  if (!servedSerials.has(normalizeSerial(disk.serial)))
+    return {}
+  return {
+    handsOff: 'iscsi-served-here',
+    handsOffReason: `This disk is an iSCSI LUN served by THIS node${disk.model ? ` (backstore '${disk.model}')` : ''} — the node's own initiator is logged in to its own target. `
+      + `It is not remote storage: building a pool on it would stack storage on top of itself. Manage it from the iSCSI screen.`,
+  }
+}
+
 export async function diskRoutes(
   server: FastifyInstance,
-  opts: { executor: CommandExecutor, diskIdentityCache: DiskIdentityCache },
+  opts: { executor: CommandExecutor, diskIdentityCache: DiskIdentityCache, iscsiPaths?: IscsiPaths },
 ) {
-  const { executor, diskIdentityCache } = opts
+  const { executor, diskIdentityCache, iscsiPaths } = opts
 
   /** Fetch all disk data: lsblk, by-id mapping, and pool membership. */
   async function fetchDisks(): Promise<Disk[]> {
-    return collectDisks(executor, diskIdentityCache)
+    return collectDisks(executor, diskIdentityCache, iscsiPaths)
   }
 
   server.get('/disks', async (_request, _reply) => {

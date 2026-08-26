@@ -457,16 +457,27 @@ export function createServer(opts?: ServerOptions) {
   server.register(healthRoutes, { prefix: '/v1' })
   // Read-only filesystem browse (Epic 16.9) — backs the directory picker and
   // gentle path validation. No executor, no mutation; node fs only.
+  // iSCSI read-layer path overrides, declared ONCE and shared by every route
+  // that has to ask "is a LUN holding this?" (story iscsi.6) as well as by the
+  // iSCSI routes themselves. Defaults live in the service (the real host
+  // locations); one env points them all at a materialised capture so no test
+  // ever reads the kernel.
+  const iscsiPaths = {
+    configfsRoot: process.env.ANAS_ISCSI_CONFIGFS,
+    blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
+    saveconfigPath: process.env.ANAS_ISCSI_SAVECONFIG,
+    pveStorageCfg: process.env.ANAS_STORAGE_CFG,
+  }
   server.register(fsRoutes, { prefix: '/v1' })
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
   // fstabPath + pveStoragePath feed the story 3.27 mountpoint flow: fstab
   // collision checks and the story 3.25 PVE-managed hands-off guard. Both
   // default inside the route to the real host paths; the env overrides make the
   // guard and collisions testable (and keep mock reads off the host).
-  server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, pveStoragePath: process.env.ANAS_STORAGE_CFG })
+  server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, pveStoragePath: process.env.ANAS_STORAGE_CFG, iscsiPaths })
   // datasetRoutes also reads the share configs to report associated shares
   // (Epic 4.4) and warn on destroy — same paths the share routes edit.
-  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport })
+  server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport, iscsiPaths })
   server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath })
   server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
   server.register(shareIdentityRoutes, {
@@ -493,12 +504,7 @@ export function createServer(opts?: ServerOptions) {
     jobQueue,
     paths: backupReposPaths,
     systemdDir,
-    iscsiPaths: {
-      configfsRoot: process.env.ANAS_ISCSI_CONFIGFS,
-      blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
-      saveconfigPath: process.env.ANAS_ISCSI_SAVECONFIG,
-      pveStorageCfg: process.env.ANAS_STORAGE_CFG,
-    },
+    iscsiPaths,
   })
   // Uniform snapshot schedules (Epic 17.3/17.4) — units-as-store CRUD + status +
   // fire (take + prune). AHR targets mount @data on demand at subvolRuntimeDir.
@@ -509,33 +515,27 @@ export function createServer(opts?: ServerOptions) {
   server.register(scrubRoutes, { prefix: '/v1', executor, jobQueue })
   // Mounts (Epic 18) — external & local storage. fstab round-trip + findmnt
   // inventory + PVE-tagged hands-off + guarded status probe.
-  server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath })
+  server.register(mountsRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath: mountsStoragePath, mdadmConfPath, iscsiPaths })
   // iSCSI reads (iscsi epic, story iscsi.2) — LIO's persisted saveconfig.json
   // joined against live configfs. Read-only; every mutation is iscsi.4's. The
   // paths default inside the service to the real host locations and are
   // overridable so tests (and a dev box with no LIO) never read the kernel.
-  const iscsiPaths = {
-    configfsRoot: process.env.ANAS_ISCSI_CONFIGFS,
-    blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
-    saveconfigPath: process.env.ANAS_ISCSI_SAVECONFIG,
-    pveStorageCfg: process.env.ANAS_STORAGE_CFG,
-  }
   server.register(iscsiRoutes, { prefix: '/v1', executor, ...iscsiPaths })
   // iSCSI mutations (story iscsi.4) — targets, portals, ACL/CHAP and LUNs. Every
   // one is a job, every sequence runs under the one daemon-wide LIO mutex, and
   // each ends in `targetcli saveconfig` — never over a degraded restore (GT-22).
   server.register(iscsiMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, ...iscsiPaths })
   const diskIdentityCache = new DiskIdentityCache(executor)
-  server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
+  server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache, iscsiPaths })
   // AHR hybrid RAID (Epic 11 + AHR). The per-pool AhrExpansionIntent store
   // (§5.3 — the ONLY persisted expansion state) lives under /etc/anas/ahr;
   // dev mock keeps it in a throwaway temp dir so nothing touches the host.
   const ahrIntentDir = process.env.ANAS_AHR_INTENT_DIR
     ?? (opts?.mock ? join(tmpdir(), `anas-mock-ahr-intent-${process.pid}`) : '/etc/anas/ahr')
   // READ layer (list/detail/preview) — detail carries the live intent (§6.2).
-  server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache, intentDir: ahrIntentDir, jobQueue })
+  server.register(ahrRoutes, { prefix: '/v1', executor, diskIdentityCache, intentDir: ahrIntentDir, jobQueue, iscsiPaths })
   // AHR mutations: create/destroy/scrub (routes/ahr-mutate.ts).
-  server.register(ahrMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase: ahrMountBase })
+  server.register(ahrMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase: ahrMountBase, iscsiPaths })
   // AHR expansion engine (Epic 11.6, AHR-DESIGN §5) — plan/expand/resume/
   // abandon + guided replace.
   server.register(ahrExpansionRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, intentDir: ahrIntentDir })

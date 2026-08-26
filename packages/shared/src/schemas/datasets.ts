@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { AbsolutePath, DatasetPath, PoolName } from './common.js'
+import { IscsiHeldByLun } from './iscsi.js'
 
 // --- Enums ---
 
@@ -67,6 +68,14 @@ export const Dataset = z.object({
    * meaningful in the UI.
    */
   sparse: z.boolean().optional(),
+  /**
+   * An iSCSI LUN currently holds this dataset (story `iscsi.6`): the volume IS
+   * the LUN's backing device, or a LUN's image file lives under the
+   * filesystem's mountpoint, or a child zvol is served. Present only when
+   * something holds it — absent means nothing does, and an older daemon omits
+   * it entirely (version-skew ruling: no field ⇒ no gating).
+   */
+  heldByLun: IscsiHeldByLun.optional(),
 })
 export type Dataset = z.infer<typeof Dataset>
 

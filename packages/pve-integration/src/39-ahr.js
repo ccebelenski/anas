@@ -1233,15 +1233,54 @@
         });
     }
 
+    // ---- Story iscsi.6: "an iSCSI LUN lives on this pool" ------------------
+    //
+    // The daemon answers once, on the row; the toolbar reads the answer and
+    // borrows the daemon's own sentence for the tooltip, so the greyed button
+    // and the 409 it would have produced say the same thing. Fail-open at every
+    // step — an explanation must never be able to break a toolbar.
+
+    function ahrHeldByLun(rec) {
+        try {
+            var held = rec && rec.get ? rec.get('heldByLun') : null;
+            return (held && held.targetIqn) ? held : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function setLunTip(btn, held) {
+        try {
+            if (!btn || typeof btn.setTooltip !== 'function') {
+                return;
+            }
+            btn.setTooltip(held
+                ? (t('Disabled — this pool is ') + held.detail
+                    + t('. Delete the LUN from the iSCSI screen first.'))
+                : '');
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
     function updateButtons(grid) {
         var sel = grid.getSelection();
         var has = sel && sel.length > 0;
         var state = has ? sel[0].get('state') : '';
+        // Story iscsi.6: an iSCSI LUN's image file on this pool makes Destroy
+        // and Change mount hard 409s at the daemon (no confirm bypass) — a file
+        // on the btrfs volume IS the AHR block object, and an unmount pulls it
+        // out from under a live target with no error anywhere (GT-40/GT-41).
+        // Absent field ⇒ null ⇒ nothing gated (version skew).
+        var lunHeld = has ? ahrHeldByLun(sel[0]) : null;
+        var LUN_BLOCKED = { destroy: 1, changeMount: 1, unmount: 1 };
         var ids = ['details', 'replace', 'destroy', 'addSpare', 'changeMount'];
         for (var i = 0; i < ids.length; i++) {
             var btn = grid.down('#' + ids[i]);
             if (btn) {
-                btn.setDisabled(!has);
+                var lunBlock = !!(lunHeld && LUN_BLOCKED[ids[i]]);
+                btn.setDisabled(!has || lunBlock);
+                setLunTip(btn, lunBlock ? lunHeld : null);
             }
         }
         // 11.12: Snapshots needs the §12 @data/@snapshots layout — a flat pool
@@ -2427,6 +2466,10 @@
                 'capacity', 'arrays', 'disks', 'advisories', 'vg', 'lv',
                 // Live expansion intent (§6.2) — drives Resume/Abandon.
                 'expansion',
+                // Story iscsi.6: the iSCSI LUN whose image file lives on this
+                // pool. AUTO field — absent on old daemons leaves get()
+                // undefined and nothing is gated (version-skew ruling).
+                'heldByLun',
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],

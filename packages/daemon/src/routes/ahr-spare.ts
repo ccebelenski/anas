@@ -4,7 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
-import { AhrSpareRequest, DiskId, PoolName } from '@anas/shared'
+import { AhrSpareRequest, DiskId, isComposableDisk, PoolName } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
 import { projectExistingBands } from '../services/ahr-expand-exec.js'
 import { readIntent } from '../services/ahr-intent.js'
@@ -98,9 +98,11 @@ export async function ahrSpareRoutes(server: FastifyInstance, opts: AhrSpareRout
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `disk '${diskId}' not found in the inventory` } }
     }
-    if (disk.status !== 'available') {
+    if (!isComposableDisk(disk)) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `disk '${diskId}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})` } }
+      return { error: { code: 'VALIDATION_ERROR', message: disk.handsOff
+        ? `disk '${diskId}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`
+        : `disk '${diskId}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})` } }
     }
 
     // §11 full-coverage rule: usable (rounded) ≥ the pool's top array

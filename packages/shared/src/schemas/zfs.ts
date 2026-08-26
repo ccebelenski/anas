@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { AbsolutePath, DevicePath, ISODateTime, PoolName } from './common.js'
+import { IscsiHeldByLun } from './iscsi.js'
 
 // --- Enums ---
 
@@ -197,6 +198,14 @@ export const PoolSummary = z.object({
    *  Empty ⇒ not PVE-managed.
    */
   pveStorages: z.array(PveStorageRef).default([]),
+  /**
+   * An iSCSI LUN currently holds something on this pool (story `iscsi.6`) — a
+   * zvol served as a block backstore, or an image file on one of its datasets.
+   * Destroy and Export are refused while it does. Present only when something
+   * holds it; an older daemon omits it (version-skew ruling: no field ⇒ no
+   * gating).
+   */
+  heldByLun: IscsiHeldByLun.optional(),
 })
 export type PoolSummary = z.infer<typeof PoolSummary>
 

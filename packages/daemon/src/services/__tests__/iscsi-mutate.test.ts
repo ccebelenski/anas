@@ -877,7 +877,7 @@ describe('claimsFromTargets — the one cross-feature seam (iscsi.6)', () => {
     assert.equal(claims.length, 2)
     assert.equal(claims[0].backingPath, '/dev/zvol/tank/vol1')
     assert.equal(claims[0].dataset, 'tank/vol1')
-    assert.match(claims[0].detail, /held by LUN 0 of iSCSI target/)
+    assert.match(claims[0].detail, /held by iSCSI LUN 0 '.+' of target/)
     assert.match(claims[0].detail, /1 live session/)
     assert.ok(!/session/.test(claims[1].detail))
   })

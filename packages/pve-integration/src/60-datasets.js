@@ -277,6 +277,10 @@
             volsize: ds.volsize,
             volblocksize: ds.volblocksize,
             sparse: ds.sparse,
+            // Story iscsi.6: the iSCSI LUN holding this row — the zvol itself,
+            // an image file under a filesystem's mountpoint, or a child zvol.
+            // Absent ⇒ undefined ⇒ nothing is gated (version-skew ruling).
+            heldByLun: ds.heldByLun,
             // Total capacity of the owning pool (bytes) — feeds the "Space of
             // pool" gfx bar (Epic 15.4). Threaded from the GET /pools summary.
             poolSize: poolSize,
@@ -675,14 +679,21 @@
         // have a mountpoint path to share (DESIGN 5a/5d). zvols cannot: a zvol
         // is a block device, and block export is the iSCSI menu's job.
         setDisabled(tree, 'dsShare', !fs || pve);
-        setDisabled(tree, 'dsDestroy', !ds || pve);
+        // Story iscsi.6: an iSCSI LUN is serving this object — the daemon
+        // refuses Destroy and Rollback outright (hard 409, no confirm bypass),
+        // so the buttons say so instead of offering a click that cannot work.
+        // A GROW is deliberately still offered: it is the supported live resize.
+        var held = heldByLunOf(rec);
+        var snapHeld = snap ? heldByLunOf(parentOfSnapshot(tree, rec)) : null;
+        setDisabled(tree, 'dsDestroy', !ds || pve || !!held);
         // Grow — volumes only, and never on PVE's own zvols (3.25).
         setDisabled(tree, 'dsResize', !vol || pve);
         applyVolumeTips(tree, rec, vol, pve);
+        applyLunHeldTips(tree, held, snapHeld);
         // Snapshot actions: create/list act on a selected dataset or the pool
         // root; the rollback/rename/destroy trio act on a selected snapshot row.
         setDisabled(tree, 'snapCreate', !dsOrRoot || pve);
-        setDisabled(tree, 'snapRollback', !snap);
+        setDisabled(tree, 'snapRollback', !snap || !!snapHeld);
         setDisabled(tree, 'snapRename', !snap);
         setDisabled(tree, 'snapClone', !snap);
         setDisabled(tree, 'snapDestroy', !snap);
@@ -700,6 +711,49 @@
         dsShare: 'A volume is a block device with no path to share. Block export '
             + 'is the iSCSI menu, not a file share.',
     };
+
+    // ---- Story iscsi.6: "a LUN is holding this" ---------------------------
+    //
+    // The daemon answers the question once, on the row (`heldByLun`), and the
+    // toolbar reads the answer. It never asks per row and never re-derives the
+    // rule: the field, its `detail` sentence and the 409 body all come from the
+    // same `iscsiClaims()` read. ABSENT ⇒ nothing gated, which is what keeps
+    // this screen working unchanged against a pre-iscsi.6 daemon.
+
+    function heldByLunOf(rec) {
+        try {
+            var held = rec && rec.get ? rec.get('heldByLun') : null;
+            return (held && held.targetIqn) ? held : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // A snapshot row's subject is its PARENT dataset: rolling back rewrites the
+    // dataset, not the snapshot, so the LUN that matters is the one holding the
+    // parent.
+    function parentOfSnapshot(tree, rec) {
+        try {
+            return (rec && rec.parentNode) ? rec.parentNode : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function lunHeldTip(held, verb) {
+        return ANAS.t('Disabled — ') + verb + ANAS.t(' is refused while this object is ')
+            + held.detail + ANAS.t('. Delete the LUN from the iSCSI screen first, '
+                + 'or delete it with "destroy the backing object" ticked.');
+    }
+
+    function applyLunHeldTips(tree, held, snapHeld) {
+        try {
+            setTip(tree, 'dsDestroy', held ? lunHeldTip(held, ANAS.t('Destroy')) : '');
+            setTip(tree, 'snapRollback', snapHeld ? lunHeldTip(snapHeld, ANAS.t('Rollback')) : '');
+        } catch (e) {
+            // fail-open — a tooltip is an explanation, not a gate
+        }
+    }
 
     function setTip(tree, itemId, text) {
         try {
@@ -4126,6 +4180,10 @@
                 // vs first-class-root (ANAS). pveStorages kept for future detail.
                 { name: 'pveManaged', type: 'auto' },
                 { name: 'pveStorages', type: 'auto' },
+                // Story iscsi.6: the holding iSCSI LUN, when one is serving this
+                // object. 'auto' so an old daemon's ABSENCE stays undefined and
+                // gates nothing (version-skew ruling).
+                { name: 'heldByLun', type: 'auto' },
             ],
             root: { expanded: true, children: [] },
         });

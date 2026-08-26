@@ -517,6 +517,9 @@
             size: m.size,
             used: m.used,
             automount: !!m.automount,
+            // Story iscsi.6: the holding iSCSI LUN, carried through verbatim.
+            // Absent on an old daemon ⇒ undefined ⇒ nothing is gated.
+            heldByLun: m.heldByLun,
             raw: m,
         };
         // Materialise the ownership facet so the Managed-by column has a real
@@ -690,6 +693,39 @@
             btnSetTip(grid, 'mountToggle', t('Enable this mount first'));
             setDisabled(grid, 'mountEdit', true);
             btnSetTip(grid, 'mountEdit', t('Enable this mount first'));
+        }
+
+        // Story iscsi.6, LAST so it wins: an iSCSI LUN's image file under this
+        // mountpoint makes Unmount, Disable and Remove hard 409s at the daemon.
+        // `umount` does not reliably fail on an open fileio backing file — LIO
+        // holds the INODE — so the mount can go and leave the LUN serving a file
+        // no path reaches, with `fuser`/`lsof` showing nothing (GT-40/GT-41).
+        // A MOUNT (the same button when the row is unmounted) is never blocked:
+        // it puts the file back where the backstore expects it.
+        var held = has ? mountHeldByLun(rec) : null;
+        if (held) {
+            var lunTip = t('Disabled — a file under this mountpoint is ') + held.detail
+                + t('. Delete the LUN from the iSCSI screen first.');
+            var mounted = ('' + rec.get('state')).toLowerCase() !== 'unmounted';
+            if (mounted) {
+                setDisabled(grid, 'mountToggle', true);
+                btnSetTip(grid, 'mountToggle', lunTip);
+                setDisabled(grid, 'mountDisable', true);
+                btnSetTip(grid, 'mountDisable', lunTip);
+            }
+            setDisabled(grid, 'mountRemove', true);
+            btnSetTip(grid, 'mountRemove', lunTip);
+        }
+    }
+
+    // The holding iSCSI LUN for a mount row, or null (story iscsi.6). Absent
+    // field ⇒ null ⇒ no gating, exactly today's screen against an old daemon.
+    function mountHeldByLun(rec) {
+        try {
+            var held = rec && rec.get ? rec.get('heldByLun') : null;
+            return (held && held.targetIqn) ? held : null;
+        } catch (e) {
+            return null;
         }
     }
 
@@ -2558,6 +2594,10 @@
                 { name: 'used', type: 'auto' },
                 { name: 'automount', type: 'auto' },
                 { name: 'raw', type: 'auto' },
+                // Story iscsi.6: the iSCSI LUN whose image file sits under this
+                // mountpoint. AUTO field — absent on old daemons leaves get()
+                // undefined and nothing is gated (version-skew ruling).
+                { name: 'heldByLun', type: 'auto' },
             ],
             data: [],
             sorters: [{ property: 'mountpoint', direction: 'ASC' }],

@@ -47,8 +47,38 @@ interface LsblkOutput {
 export type ByIdMap = Map<string, string>
 
 /**
+ * Kernel zvol devices: `zd0`, `zd16`, `zd32` (story `iscsi.6`).
+ *
+ * lsblk reports a zvol with `type: "disk"` and no transport, so a blank one has
+ * always come back as a genuinely `available` candidate disk (GT-43) — offer it
+ * to the composer and it would build a ZFS pool inside a ZFS pool. A zvol is a
+ * ZFS OBJECT: it belongs to the Datasets screen, where `iscsi.3` made it
+ * first-class, and to the iSCSI screen, which exports it. It is not hardware and
+ * it is not inventory, exactly like the loop devices excluded beside it.
+ *
+ * Anchored on `zd` + digits rather than a `startsWith`, so a real disk that
+ * happens to be named `zdxx` by some future kernel is not swallowed. And note
+ * the number is NOT stable: the same zvol was `zd0` before a reboot and `zd16`
+ * after (GT-48), which is a second reason nothing may key off these names.
+ */
+const ZVOL_KERNEL_RE = /^zd\d+$/
+
+/**
+ * Is this lsblk node a physical disk ANAS should inventory?
+ *
+ * The one filter (`iscsi.6` seam): whole disks only, and never a virtual block
+ * device that merely presents as one — `zram`, `loop`, and now `zd*`.
+ */
+export function isInventoryDisk(dev: { type: string, name: string }): boolean {
+  return dev.type === 'disk'
+    && !dev.name.startsWith('zram')
+    && !dev.name.startsWith('loop')
+    && !ZVOL_KERNEL_RE.test(dev.name)
+}
+
+/**
  * Parse lsblk JSON output into Disk objects.
- * Filters to physical disks (type=disk), excluding CD-ROMs, zram, loop, etc.
+ * Filters to physical disks (type=disk), excluding CD-ROMs, zram, loop, zvols.
  * @param json raw lsblk JSON output (string or pre-parsed object)
  * @param byIdMap mapping of kernel names to by-id identifiers (from disk-by-id parser)
  * @param poolDisks map of KERNEL names to the ZFS pool they belong to
@@ -61,7 +91,7 @@ export function parseLsblk(
   const data: LsblkOutput = typeof json === 'string' ? JSON.parse(json) : json
 
   return data.blockdevices
-    .filter(dev => dev.type === 'disk' && !dev.name.startsWith('zram') && !dev.name.startsWith('loop'))
+    .filter(dev => isInventoryDisk(dev))
     .map((dev) => {
       const id = byIdMap.get(dev.name) ?? dev.serial ?? dev.name
       const partitions = parsePartitions(dev.children ?? [])

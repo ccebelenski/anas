@@ -282,7 +282,48 @@
 
     // Usage in ZFS terms: for a pool member, "pool / vdev / role"; otherwise the
     // plain usage status (available / system / Ceph OSD / other).
+    // Story iscsi.6 — the hands-off badge.
+    //
+    // A LUN this node serves to its own initiator arrives over the iSCSI
+    // transport looking like a pristine, blank SCSI disk: `status: available`,
+    // no partitions, no labels (GT-43). `status` is left telling that truth —
+    // the badge is what says the rest, and its tooltip carries the daemon's own
+    // sentence so the grid and the composer's refusal agree word for word.
+    function handsOffBadge(d) {
+        try {
+            if (!d || !d.handsOff) {
+                return '';
+            }
+            var tip = d.handsOffReason || t('Hands-off — ANAS is serving this disk itself');
+            var label = d.handsOff === 'iscsi-served-here' ? 'SERVED HERE' : 'HANDS-OFF';
+            var badge = '';
+            try {
+                if (ANAS.gfx && typeof ANAS.gfx.badge === 'function') {
+                    badge = ANAS.gfx.badge(label, { title: tip }) || '';
+                }
+            } catch (eB) {
+                badge = '';
+            }
+            if (!badge) {
+                badge = '<span class="anas-gfx-badge" title="' + enc(tip) + '">'
+                    + enc(label) + '</span>';
+            }
+            return ' <span class="anas-disk-handsoff-badge" title="' + enc(tip) + '">'
+                + badge + '</span>';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    // The usage cell = what the block layer says, plus the hands-off badge when
+    // ANAS knows something the block layer does not. The badge rides THIS cell
+    // because this is the cell that would otherwise read a bare, inviting
+    // "Available" on a disk nothing may be built on.
     function renderUsage(v, meta, rec) {
+        return renderUsageBase(v, meta, rec) + handsOffBadge(rec.data);
+    }
+
+    function renderUsageBase(v, meta, rec) {
         var d = rec.data;
         if (d.status === 'pool_member') {
             var parts = [];
@@ -578,6 +619,10 @@
                 'id', 'name', 'path', 'model', 'modelFamily', 'serial',
                 'transport', 'formFactor', 'status',
                 'poolName', 'vdevName', 'vdevRole', 'ahrArray', 'healthStatus',
+                // Story iscsi.6: a disk this node is serving to its OWN
+                // initiator. Auto fields — absent on old daemons leaves get()
+                // undefined and the badge simply does not appear (version skew).
+                'handsOff', 'handsOffReason',
                 { name: 'size', type: 'number' },
                 { name: 'rotational', type: 'boolean' },
                 { name: 'smartHealthy' },

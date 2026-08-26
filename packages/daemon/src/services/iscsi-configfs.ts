@@ -809,9 +809,17 @@ export function findLunHolder(state: LioLiveState, devPath: string): LunHolder |
   return null
 }
 
-/** Human sentence for a LUN holder — one phrasing, used wherever it surfaces. */
-export function describeLunHolder(holder: LunHolder): string {
-  return `held by LUN ${holder.lunIndex} of iSCSI target ${holder.targetIqn} (backstore '${holder.backstoreName}', ${holder.backingPath})`
+/**
+ * Human sentence for a LUN holder — ONE phrasing, used wherever it surfaces.
+ *
+ * Three places render it and they must not drift: the `busy-diagnosis` clause
+ * appended to a ZFS `dataset is busy` (story `iscsi.6`), an `IscsiClaim.detail`
+ * on `GET /v1/iscsi/claims`, and every held-by-LUN refusal body. The LUN's
+ * NAME is in it because that is the SCSI model string the operator sees on the
+ * initiator (GT-15) — "LUN 0" alone names nothing recognisable.
+ */
+export function describeLunHolder(holder: Pick<LunHolder, 'lunIndex' | 'backstoreName' | 'targetIqn' | 'backingPath'>): string {
+  return `held by iSCSI LUN ${holder.lunIndex} '${holder.backstoreName}' of target ${holder.targetIqn} (${holder.backingPath})`
 }
 
 /** The backstore name a configfs path belongs to (the last path component). */
