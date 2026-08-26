@@ -1,5 +1,5 @@
 import type { RetentionBucket, RetentionPlan, RetentionPolicy, ScheduledSnapshot } from '@anas/shared'
-import { parseScheduledName } from './snapshot-naming.js'
+import { isTransientBackupSnapshot, parseScheduledName } from './snapshot-naming.js'
 
 /**
  * The uniform retention engine (Epic 17) — pure computation, no I/O. Encodes
@@ -24,13 +24,22 @@ import { parseScheduledName } from './snapshot-naming.js'
  *      clock-skewed snapshot cannot claim the guarantee); if every eligible
  *      snapshot is future-dated, the newest overall is protected instead, so at
  *      least one snapshot always survives.
+ *
+ * ⚠ TRANSIENT BACKUP SNAPSHOTS ARE OUTSIDE RETENTION ENTIRELY (backup2.3). A
+ * snapshot-consistent backup run takes `anas-backup-<task>-<ts>`, backs up from
+ * it and destroys it in a `finally` — the run owns that lifetime end to end.
+ * They are dropped BEFORE anything else here, so they never occupy a bucket
+ * slot, never displace a real snapshot from a keep budget, never claim the
+ * always-keep-newest guarantee, and are never handed to `zfs destroy` by a
+ * prune. The predicate is the one shared with replication (snapshot-naming.ts).
  */
 export function planRetention(
   snapshots: ScheduledSnapshot[],
   policy: RetentionPolicy,
   now: Date = new Date(),
 ): RetentionPlan {
-  const anas = snapshots.filter(s => s.source === 'anas')
+  const durable = snapshots.filter(s => !isTransientBackupSnapshot(s.name))
+  const anas = durable.filter(s => s.source === 'anas')
   const skippedHeld = anas.filter(s => s.held === true)
   const eligible = anas.filter(s => s.held !== true)
 

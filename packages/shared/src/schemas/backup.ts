@@ -553,6 +553,133 @@ export function isPathWithin(parent: string, child: string): boolean {
   return child.startsWith(`${base}/`)
 }
 
+// ---- Snapshot consistency (story backup2.3) --------------------------------
+//
+// A multi-hour backup of a live tree captures no single instant: files written
+// while pbc walks land in the archive in whatever state they were in when it
+// reached them. Where the filesystem can give us a point-in-time view we take
+// one, back up from it, and destroy it; where it cannot, the backup is LIVE and
+// says so. The choice is DERIVED from the source's capability, never configured
+// — there is no override field in this cut, so nothing can claim a consistency
+// the filesystem does not provide.
+//
+// GROUND TRUTH (`docs/BACKUP-RESTORE-GROUND-TRUTH.md`):
+//   - GT-51: `.zfs/snapshot/<s>/` is reachable with the default
+//     `snapdir=hidden`. No property is ever changed for this.
+//   - GT-47/48/49/50: metadata-mode (and default-mode) change detection is
+//     INDIFFERENT to the root switching between the live path and the snapshot
+//     path — inodes are identical, `st_dev` is not part of the reference, and
+//     the first snapshot-mode run reuses 100%. There is no re-read.
+//   - GT-52/55: a btrfs read-only snapshot leaves every nested subvolume as an
+//     EMPTY PLACEHOLDER and `--all-file-systems` cannot rescue it. AHR therefore
+//     snapshots each nested subvolume and expands to one archive root per
+//     subvolume — a correctness requirement, not an optimisation.
+
+/**
+ * How faithfully a run captured a source. `snapshot` = backed up from a
+ * point-in-time snapshot the run took and then destroyed; `live` = backed up
+ * from the running filesystem, which is what every Epic 16 backup was.
+ */
+export const BackupConsistency = z.enum(['snapshot', 'live'])
+export type BackupConsistency = z.infer<typeof BackupConsistency>
+
+/** Which filesystem provides the snapshot for a `snapshot`-consistent source. */
+export const BackupSnapshotBackend = z.enum(['zfs', 'ahr'])
+export type BackupSnapshotBackend = z.infer<typeof BackupSnapshotBackend>
+
+/**
+ * The DERIVED consistency of one archive source, with the reason spelled out.
+ * Read-only and additive: the wizard renders it as a chip, the task detail
+ * repeats it, and nothing in any request body carries it — a source's capability
+ * is a fact about the system, not a setting.
+ */
+export const BackupArchiveConsistency = z.object({
+  /** `snapshot` when the source sits on a snapshottable filesystem, else `live`. */
+  consistency: BackupConsistency,
+  /** One plain sentence saying WHY — shown verbatim in the chip's tooltip. */
+  reason: z.string(),
+  /** Which backend will take the snapshot (absent for `live`). */
+  backend: BackupSnapshotBackend.optional(),
+  /** ZFS: the dataset that gets the recursive snapshot. AHR: the pool name. */
+  target: z.string().optional(),
+  /** Where that dataset / pool is mounted (the snapshot path derives from it). */
+  mountpoint: AbsolutePath.optional(),
+  /**
+   * The source path relative to `mountpoint` — `''` when the source IS the
+   * mountpoint, `photos/raw` when it is a plain subdirectory of the dataset.
+   * This is what makes `<mountpoint>/.zfs/snapshot/<s>/<relativePath>` the
+   * archive root for a subdirectory source.
+   */
+  relativePath: z.string().optional(),
+})
+export type BackupArchiveConsistency = z.infer<typeof BackupArchiveConsistency>
+
+/**
+ * One transient snapshot a run took, on the record. Destroyed in the run's
+ * `finally`; reported so the operator can see what existed while the run was in
+ * flight (and so a leaked one is nameable if a node died mid-run).
+ */
+export const BackupTransientSnapshot = z.object({
+  backend: BackupSnapshotBackend,
+  /** The label `anas-backup-<taskname>-<unix-seconds>` (+ a subvolume suffix on AHR). */
+  name: z.string(),
+  /** The dataset (ZFS) or pool (AHR) it was taken on. */
+  target: z.string(),
+  /** ZFS: `<dataset>@<name>`. AHR: `<pool>:@snapshots/<name>`. Never truncated. */
+  full: z.string(),
+  /** ZFS: taken with `-r`, so every child dataset carries the same label. */
+  recursive: z.boolean().optional(),
+})
+export type BackupTransientSnapshot = z.infer<typeof BackupTransientSnapshot>
+
+/**
+ * One archive root a snapshot-consistent run actually handed pbc. The
+ * configured archive expands into one of these per nested filesystem the scan
+ * reports as INCLUDED, plus the root itself.
+ *
+ * The ROOT entry's `name` is the configured archive name UNCHANGED — that,
+ * together with an unchanged `--backup-id`, is what preserves change-detection
+ * continuity across the live→snapshot switch (GT-47/48). Only children get a
+ * derived suffix.
+ */
+export const BackupExpandedArchive = z.object({
+  /** The PBS archive name (`<name>` for the root, `<name>__<child>` for a child). */
+  name: z.string(),
+  /** The configured archive this one was expanded FROM. */
+  from: z.string(),
+  /** The absolute path pbc was pointed at. */
+  root: z.string(),
+  /** `''` for the root archive; the nested filesystem's archive-relative path otherwise. */
+  relativePath: z.string(),
+  /** The excludes rebased onto THIS root. */
+  excludes: z.array(z.string()).default([]),
+})
+export type BackupExpandedArchive = z.infer<typeof BackupExpandedArchive>
+
+/**
+ * PBS archive names are restricted to `[A-Za-z0-9_-]`. A configured
+ * {@link BackupArchive} name is already narrower than that except for `.`, and a
+ * derived child name adds path separators — so every DERIVED name goes through
+ * here. The configured ROOT name never does: it must stay byte-identical for
+ * change-detection continuity.
+ */
+const ARCHIVE_NAME_ILLEGAL_RE = /[^\w-]/g
+/** Path separators in a derived suffix become `_`. */
+const PATH_SEPARATOR_RE = /\//g
+
+/**
+ * The deterministic child-archive name for a nested filesystem at
+ * `relativePath` under archive `name`: `<name>__<path with / → _>`, sanitised to
+ * PBS's charset. Deterministic on purpose — the same task always produces the
+ * same archive names, so the previous run's change-detection reference still
+ * matches. Collisions (two distinct paths sanitising to one name) are resolved
+ * by the caller, which knows the whole set.
+ */
+export function expandedArchiveName(name: string, relativePath: string): string {
+  const suffix = relativePath.replace(TRAILING_SLASHES_RE, '').replace(PATH_SEPARATOR_RE, '_')
+  return `${name}__${suffix}`.replace(ARCHIVE_NAME_ILLEGAL_RE, '_')
+}
+
 /**
  * One nested filesystem the detector found under a source, named as well as the
  * system allows. `included` answers the only question the screen asks: does the
@@ -594,6 +721,15 @@ export const BackupNestedScan = z.object({
   truncated: z.boolean(),
   /** Non-fatal problems (unreadable directory, walk timeout). Never secrets. */
   warnings: z.array(z.string()).default([]),
+  /**
+   * The DERIVED snapshot-consistency of this source (backup2.3) — READ-ONLY and
+   * additive. It rides the boundary scan rather than a second endpoint because
+   * the two answers come from the SAME facts: the mount table this scan already
+   * read, plus the AHR pool topology. Absent when the derivation could not run
+   * (an old daemon, or a scan that failed before it got there) — which the UI
+   * renders as "not known", never as "live".
+   */
+  consistency: BackupArchiveConsistency.optional(),
 })
 export type BackupNestedScan = z.infer<typeof BackupNestedScan>
 

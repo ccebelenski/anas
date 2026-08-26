@@ -655,19 +655,38 @@ describe('backup routes (Epic 16)', () => {
 
   it('an `all` archive reaches pbc as explicit --include-dev flags, never --all-file-systems', async () => {
     await createRepo()
+    // backup2.3 note: the source is deliberately `/srv` — a plain directory on
+    // the ext4 root, i.e. a LIVE archive. `--include-dev` is the contract for a
+    // live root; a SNAPSHOTTABLE root (ZFS/AHR) expands into one archive per
+    // nested filesystem instead, which the backup2.3 suite covers. Using a ZFS
+    // path here would be testing the wrong branch.
     await createTaskPayload({
       ...NESTED_TASK,
       name: 'pool-all',
       archives: [
-        { name: 'pool', path: '/mnttest', excludes: [], includeNested: 'all' },
+        { name: 'pool', path: '/srv', excludes: [], includeNested: 'all' },
         // A second archive in the SAME invocation that asked for nothing: the
         // whole reason `all` is resolved per archive instead of being a flag.
         { name: 'etc', path: '/etc', excludes: [] },
       ],
     })
-    mockNestedWalk(60)
-    mockNestedDescent(60)
     const mock = mockOf(server)
+    // /srv (on `/`, ext4) with a boundary and a nested-inside-nested boundary.
+    mock.addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/srv', 60),
+      result: { stdout: '2049\t/srv\n2049\t/srv/sub\n3000\t/srv/data\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/srv/data', 60, 11),
+      result: { stdout: '3000\t/srv/data\n3001\t/srv/data/deep\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/srv/data/deep', 60, 10),
+      result: { stdout: '3001\t/srv/data/deep\n', stderr: '', exitCode: 0 },
+    })
     // /etc has no boundary of its own in this tree.
     mock.addFixture({
       command: '/usr/bin/timeout',
@@ -694,12 +713,12 @@ describe('backup routes (Epic 16)', () => {
       if (a === '--include-dev')
         devs.push(pbc.args[i + 1])
     })
-    // Both boundaries under /mnttest, and NOTHING for the other archive.
-    assert.deepEqual(devs, ['/mnttest/data', '/mnttest/data/deep'])
+    // Both boundaries under /srv, and NOTHING for the other archive.
+    assert.deepEqual(devs, ['/srv/data', '/srv/data/deep'])
 
     // The run says on the record exactly which boundaries it crossed.
     const result = job.result as { includedNested?: Record<string, string[]>, warnings?: string[] }
-    assert.deepEqual(result.includedNested, { pool: ['/mnttest/data', '/mnttest/data/deep'] })
+    assert.deepEqual(result.includedNested, { pool: ['/srv/data', '/srv/data/deep'] })
     // Nothing was omitted, so no omission warning was raised.
     assert.ok(!(result.warnings ?? []).some(w => w.includes('empty directory')), JSON.stringify(result.warnings))
   })
@@ -736,6 +755,341 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(result.includedNested, undefined)
     const said = (result.warnings ?? []).some(w => w.includes('\'all\' could not be resolved'))
     assert.ok(said, JSON.stringify(result.warnings))
+  })
+
+  // ---- backup2.3: snapshot-consistent runs --------------------------------
+  //
+  // `/mnttest` is a ZFS dataset in the mock findmnt tree, with the child dataset
+  // `/mnttest/data` under it — so a run of a task rooted there is snapshot-mode,
+  // and the child expands into a second archive.
+
+  const ZFS_BIN = '/usr/sbin/zfs'
+
+  /**
+   * Every `zfs` verb succeeds; the sweep's snapshot list is `listStdout`
+   * (empty = nothing stale). The list is registered on its EXACT argv because
+   * the mock server carries its own command-only `/usr/sbin/zfs` fixture and a
+   * command-only match registered earlier would otherwise win.
+   */
+  function mockZfs(listStdout = ''): void {
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: ZFS_BIN,
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', 'mnttest'],
+      result: { stdout: listStdout, stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({ command: ZFS_BIN, result: { stdout: '', stderr: '', exitCode: 0 } })
+  }
+
+  /** The zfs argv of one verb, in call order. */
+  function zfsArgs(mock: MockExecutor, verb: string): string[][] {
+    return mock.calls.filter(c => c.command === ZFS_BIN && c.args[0] === verb).map(c => c.args)
+  }
+
+  /** The pbc argv of the run (the outer prlimit call). */
+  function pbcArgs(mock: MockExecutor): string[] {
+    const call = mock.calls.find(c => c.command === '/usr/bin/prlimit')
+    assert.ok(call, 'pbc ran')
+    return call.args
+  }
+
+  /** `<name>.pxar:<root>` tokens, in order. */
+  function archiveTokens(args: string[]): string[] {
+    return args.filter(a => a.includes('.pxar:'))
+  }
+
+  it('a ZFS source is backed up FROM a recursive transient snapshot, and the snapshot is destroyed', async () => {
+    await createRepo()
+    await createTaskPayload({ ...NESTED_TASK, name: 'snap-zfs' })
+    mockNestedWalk(60)
+    mockZfs()
+    const mock = mockOf(server)
+    mock.calls.length = 0
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/snap-zfs/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+
+    const snapshots = zfsArgs(mock, 'snapshot')
+    assert.equal(snapshots.length, 1, JSON.stringify(snapshots))
+    // ALWAYS -r: a child dataset is a separate filesystem and needs its own label.
+    assert.equal(snapshots[0][1], '-r')
+    assert.match(snapshots[0][2], /^mnttest@anas-backup-snap-zfs-\d+$/)
+    const label = snapshots[0][2].split('@')[1]
+
+    // Destroyed in the `finally`, recursively, matching how it was taken.
+    assert.deepEqual(zfsArgs(mock, 'destroy'), [['destroy', '-r', `mnttest@${label}`]])
+
+    // GT-51: reachable with the default `snapdir=hidden` — no property is set.
+    assert.equal(mock.calls.filter(c => c.command === ZFS_BIN && c.args[0] === 'set').length, 0)
+
+    const args = pbcArgs(mock)
+    assert.ok(archiveTokens(args).every(tok => tok.includes(`/.zfs/snapshot/${label}`)), args.join(' '))
+
+    const result = job.result as {
+      consistency?: { consistency: string, backend?: string, target?: string }[]
+      snapshots?: { full: string, recursive?: boolean }[]
+      expansion?: { name: string, root: string }[]
+    }
+    assert.equal(result.consistency?.[0].consistency, 'snapshot')
+    assert.equal(result.consistency?.[0].backend, 'zfs')
+    assert.equal(result.consistency?.[0].target, 'mnttest')
+    assert.deepEqual(result.snapshots?.map(s => s.full), [`mnttest@${label}`])
+    assert.equal(result.snapshots?.[0].recursive, true)
+    assert.equal(result.expansion?.[0].root, `/mnttest/.zfs/snapshot/${label}`)
+  })
+
+  it('the ROOT archive name and the --backup-id are IDENTICAL between live and snapshot mode', async () => {
+    // The change-detection identity (GT-47/48): a snapshot-mode run that renamed
+    // either would make the next run re-read the whole tree.
+    await createRepo()
+    const mock = mockOf(server)
+
+    // LIVE run: /etc is on the ext4 root in the mock tree.
+    await createTaskPayload({
+      ...NESTED_TASK,
+      name: 'ident-live',
+      archives: [{ name: 'data', path: '/etc', excludes: [] }],
+    })
+    mock.addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/etc', 60),
+      result: { stdout: '2049\t/etc\n', stderr: '', exitCode: 0 },
+    })
+    mock.calls.length = 0
+    let res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/ident-live/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
+    const liveArgs = pbcArgs(mock)
+
+    // SNAPSHOT run: the same archive NAME and the same backup-id, on ZFS.
+    await createTaskPayload({
+      ...NESTED_TASK,
+      name: 'ident-snap',
+      archives: [{ name: 'data', path: '/mnttest', excludes: [] }],
+    })
+    mockNestedWalk(60)
+    mockZfs()
+    mock.calls.length = 0
+    res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/ident-snap/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
+    const snapArgs = pbcArgs(mock)
+
+    const idOf = (a: string[]): string => a[a.indexOf('--backup-id') + 1]
+    assert.equal(idOf(snapArgs), idOf(liveArgs))
+    const nameOf = (a: string[]): string => archiveTokens(a)[0].split('.pxar:')[0]
+    assert.equal(nameOf(snapArgs), 'data')
+    assert.equal(nameOf(liveArgs), 'data')
+    // Only the ROOT moved; the name did not.
+    assert.ok(archiveTokens(liveArgs)[0].endsWith(':/etc'))
+    assert.match(archiveTokens(snapArgs)[0], /:\/mnttest\/\.zfs\/snapshot\//)
+  })
+
+  it('an included child dataset expands into its own archive: 1 nested filesystem -> 2 archive roots', async () => {
+    await createRepo()
+    await createTaskPayload({
+      ...NESTED_TASK,
+      name: 'snap-expand',
+      archives: [{ name: 'pool', path: '/mnttest', excludes: [], includeNested: ['/mnttest/data'] }],
+    })
+    mockNestedWalk(60)
+    mockZfs()
+    const mock = mockOf(server)
+    mock.calls.length = 0
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/snap-expand/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+
+    const args = pbcArgs(mock)
+    const label = zfsArgs(mock, 'snapshot')[0][2].split('@')[1]
+    assert.deepEqual(archiveTokens(args), [
+      `pool.pxar:/mnttest/.zfs/snapshot/${label}`,
+      `pool__data.pxar:/mnttest/data/.zfs/snapshot/${label}`,
+    ])
+    // `--include-dev` is meaningless under a snapshot root — the boundary is an
+    // empty directory there, so the child got its OWN archive instead.
+    assert.ok(!args.includes('--include-dev'), args.join(' '))
+    assert.ok(!args.includes('--all-file-systems'))
+
+    const result = job.result as { expansion?: { name: string, from: string, relativePath: string }[] }
+    assert.deepEqual(result.expansion?.map(e => [e.name, e.from, e.relativePath]), [
+      ['pool', 'pool', ''],
+      ['pool__data', 'pool', 'data'],
+    ])
+  })
+
+  it('a THREE-archive expansion emits one root per archive, deduped excludes, id unchanged', async () => {
+    await createRepo()
+    await createTaskPayload({
+      ...NESTED_TASK,
+      name: 'snap-three',
+      archives: [
+        // Snapshot-mode with one included child → two roots.
+        { name: 'pool', path: '/mnttest', excludes: ['/data/tmp', '*.swp'], includeNested: ['/mnttest/data'] },
+        // Live archive in the SAME invocation → one root, untouched.
+        { name: 'etc', path: '/etc', excludes: ['*.swp'] },
+      ],
+    })
+    mockNestedWalk(60)
+    mockZfs()
+    const mock = mockOf(server)
+    mock.addFixture({
+      command: '/usr/bin/timeout',
+      args: walkArgs('/etc', 60),
+      result: { stdout: '2049\t/etc\n', stderr: '', exitCode: 0 },
+    })
+    mock.calls.length = 0
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/snap-three/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+
+    const args = pbcArgs(mock)
+    const label = zfsArgs(mock, 'snapshot')[0][2].split('@')[1]
+    assert.deepEqual(archiveTokens(args), [
+      `pool.pxar:/mnttest/.zfs/snapshot/${label}`,
+      `pool__data.pxar:/mnttest/data/.zfs/snapshot/${label}`,
+      'etc.pxar:/etc',
+    ])
+    // The anchored exclude was REBASED onto the child root it targets; the
+    // unanchored one is depth-independent and emitted ONCE for the invocation.
+    const excludes: string[] = []
+    args.forEach((a, i) => {
+      if (a === '--exclude')
+        excludes.push(args[i + 1])
+    })
+    assert.deepEqual(excludes, ['*.swp', '/tmp'])
+    // The identity never moves.
+    assert.equal(args[args.indexOf('--backup-id') + 1], 'anas-pve')
+
+    const result = job.result as { consistency?: { consistency: string }[] }
+    assert.deepEqual(result.consistency?.map(c => c.consistency), ['snapshot', 'live'])
+  })
+
+  it('a stale sweep destroys THIS task\'s older transients and nobody else\'s', async () => {
+    await createRepo()
+    await createTaskPayload({ ...NESTED_TASK, name: 'snap-sweep' })
+    mockNestedWalk(60)
+    // A previous run of this task died before its `finally`; another task's run
+    // may be in flight right now; a schedule snapshot and a manual one are not
+    // ours at all.
+    mockZfs([
+      'mnttest@anas-backup-snap-sweep-1000000000',
+      'mnttest@anas-backup-snap-sweep-1000000000__photos',
+      'mnttest@anas-backup-other-task-1000000000',
+      'mnttest@anas-daily-2026-08-20T020000Z',
+      'mnttest@nightly',
+      '',
+    ].join('\n'))
+    const mock = mockOf(server)
+    mock.calls.length = 0
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/snap-sweep/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
+
+    const label = zfsArgs(mock, 'snapshot')[0][2].split('@')[1]
+    assert.deepEqual(zfsArgs(mock, 'destroy'), [
+      ['destroy', '-r', 'mnttest@anas-backup-snap-sweep-1000000000'],
+      ['destroy', '-r', 'mnttest@anas-backup-snap-sweep-1000000000__photos'],
+      // and this run's own, in the `finally`
+      ['destroy', '-r', `mnttest@${label}`],
+    ])
+  })
+
+  it('the run notification body carries the Consistency block and the archive roots', async () => {
+    await createRepo()
+    await createTaskPayload({
+      ...NESTED_TASK,
+      name: 'snap-notify',
+      notify: 'always',
+      archives: [{ name: 'pool', path: '/mnttest', excludes: [], includeNested: ['/mnttest/data'] }],
+    })
+    mockNestedWalk(60)
+    mockZfs()
+    const mock = mockOf(server)
+    mock.calls.length = 0
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/snap-notify/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    assert.equal((await waitForJob(server, await jobIdFrom(res))).status, 'completed')
+
+    const notify = mock.calls.find(c => c.command === '/usr/bin/pvesh' || c.args.some(a => a.includes('Consistency:')))
+    assert.ok(notify, `no notification carried the body: ${mock.calls.map(c => c.command).join(' ')}`)
+    const body = notify.args.find(a => a.includes('Consistency:')) as string
+    assert.match(body, /Consistency:\n {2}pool: snapshot mnttest@anas-backup-snap-notify-\d+/)
+    assert.match(body, /Archive roots:/)
+    assert.match(body, /pool__data\.pxar <- \/mnttest\/data\/\.zfs\/snapshot\//)
+    // The 16.12 ASCII rule still holds for the new block.
+    // eslint-disable-next-line no-control-regex
+    assert.ok(!/[^\x00-\x7F]/.test(body), body)
+  })
+
+  it('preview-nested returns the DERIVED consistency, read-only, on the same scan', async () => {
+    mockNestedWalk()
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/preview-nested',
+      headers: JSON_HEADERS,
+      payload: { path: '/mnttest', includeNested: 'none' },
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as {
+      data: { archives: { consistency?: { consistency: string, backend?: string, target?: string, reason: string } }[] }
+    }
+    const c = data.archives[0].consistency
+    assert.equal(c?.consistency, 'snapshot')
+    assert.equal(c?.backend, 'zfs')
+    assert.equal(c?.target, 'mnttest')
+    assert.match(c?.reason ?? '', /recursive snapshot/)
+  })
+
+  it('the task detail carries the consistency per archive too', async () => {
+    await createRepo()
+    await createTaskPayload({ ...NESTED_TASK, name: 'detail-consistency' })
+    mockNestedWalk()
+    const res = await server.inject({
+      method: 'GET',
+      url: '/v1/backup/tasks/detail-consistency',
+      headers: IDENTITY,
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: BackupTaskDetail }
+    assert.equal(data.nested?.[0].consistency?.consistency, 'snapshot')
+    assert.equal(data.nested?.[0].consistency?.target, 'mnttest')
   })
 
   it('prune-preview without any keep is a 400 (a keep-all prune is never run)', async () => {

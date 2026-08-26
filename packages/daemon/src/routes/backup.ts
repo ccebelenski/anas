@@ -27,6 +27,8 @@ import {
   UpsertBackupRepoRequest,
 } from '@anas/shared'
 import { readPbsStorages } from '../parsers/pve-storage.js'
+import { readAhrPools } from '../services/ahr-topology.js'
+import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyBackupRun } from '../services/backup-notify.js'
 import { pruneAfterBackup, pruneGroup, runPrune } from '../services/backup-prune.js'
 import {
@@ -115,6 +117,28 @@ function CONFLICT(version: number) {
 
 export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOptions) {
   const { executor, jobQueue, paths, systemdDir } = opts
+
+  /**
+   * Attach the DERIVED snapshot-consistency (backup2.3) to a set of boundary
+   * scans. It rides the SCAN rather than a second endpoint because both answers
+   * come from the same facts — the mount table the scan already needed, plus the
+   * AHR topology — and because the wizard asks the two questions at exactly the
+   * same moment (a row's path changed).
+   *
+   * READ-ONLY and additive: no request body carries `consistency` back, and
+   * nothing can set it. FAIL-OPEN — a derivation that throws leaves the key
+   * absent ("not known"), never a fabricated `live`.
+   */
+  async function withConsistency(scans: BackupNestedScan[]): Promise<BackupNestedScan[]> {
+    try {
+      const facts = await readConsistencyFacts(executor, readAhrPools)
+      return scans.map(scan => ({ ...scan, consistency: deriveConsistency(scan.path, facts) }))
+    }
+    catch (err) {
+      server.log.warn(`[backup] consistency derivation failed: ${err instanceof Error ? err.message : String(err)}`)
+      return scans
+    }
+  }
 
   // ==========================================================================
   //  Repositories
@@ -579,7 +603,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           includeNested: effectiveIncludeNested({ includeNested: req.includeNested ?? 'none' }),
         })]
 
-    const data: BackupNestedPreviewResponse = { archives }
+    // backup2.3 — the DERIVED consistency rides the SAME response rather than a
+    // second endpoint: both answers come from the one mount table this scan
+    // already needed, plus the AHR topology. Read-only and additive; nothing in
+    // any request body carries it back.
+    const data: BackupNestedPreviewResponse = { archives: await withConsistency(archives) }
     return { data }
   })
 
@@ -608,10 +636,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       // findmnt); no PBS contact, so the never-poll rule is untouched. Fail-open:
       // a scan that throws leaves the key ABSENT ("not known"), never an empty
       // array pretending nothing is nested.
-      scanArchives(executor, task.archives).catch((err: unknown) => {
-        server.log.warn(`[backup] nested scan for task ${name} failed: ${err instanceof Error ? err.message : String(err)}`)
-        return null
-      }),
+      scanArchives(executor, task.archives)
+        // backup2.3 — and, on the same scan, the DERIVED consistency of each
+        // source, so the detail can show `snapshot` / `live` with its reason.
+        .then(withConsistency)
+        .catch((err: unknown) => {
+          server.log.warn(`[backup] nested scan for task ${name} failed: ${err instanceof Error ? err.message : String(err)}`)
+          return null
+        }),
     ])
     const joinRepos = await reposForJoin(reg.repos)
     const detail: BackupTaskDetail = {

@@ -79,3 +79,88 @@ export function parseScheduledName(name: string): ParsedScheduledName | null {
 export function isScheduledName(name: string): boolean {
   return parseScheduledName(name) !== null
 }
+
+// ---------------------------------------------------------------------------
+//  Transient backup snapshots (story backup2.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * A snapshot-consistent backup run takes a TRANSIENT snapshot per snapshottable
+ * source, backs up from it, and destroys it in a `finally`. Its name is
+ * `anas-backup-<taskname>-<unix-seconds>` — a distinct prefix from the
+ * `anas-<bucket>-<utc>` schedule convention above, on purpose: these are not
+ * retention points, they are scaffolding that exists for the duration of one
+ * run.
+ *
+ * ⚠ THE WHOLE REASON THIS PREDICATE IS SHARED (backup2.3's flagged risk): two
+ * other subsystems walk the same snapshot lists and would otherwise reason about
+ * these as if they were durable —
+ *
+ *   - REPLICATION's newest-common-snapshot discovery. A transient that happened
+ *     to be the newest common snapshot would become an incremental base, and the
+ *     backup's `finally` destroy would then break the chain mid-flight. It also
+ *     must not inflate `snapshotsBehind` (a source snapshot that is deliberately
+ *     never replicated is not lag).
+ *   - SCHEDULES RETENTION's bucketing/pruning. A transient must never occupy a
+ *     bucket slot, never be counted, and never be handed to `zfs destroy` — the
+ *     backup run owns its lifecycle from creation to destruction.
+ *
+ * Both read the answer from HERE, so the two can never drift apart.
+ */
+const TRANSIENT_PREFIX = 'anas-backup-'
+
+/**
+ * `anas-backup-<taskname>-<unix-seconds>`, with an OPTIONAL `__<suffix>` that
+ * AHR's per-subvolume snapshots carry (a single btrfs ro snapshot drops nested
+ * subvolumes — GT-52 — so one run takes several, and every one of them has to
+ * be recognised by the stale sweep). The task name may itself contain dashes,
+ * so the seconds group anchors the split.
+ */
+const TRANSIENT_RE = /^anas-backup-([a-z0-9][a-z0-9-]*?)-(\d{1,19})(?:__(.*))?$/
+
+/**
+ * The transient snapshot name a run of `task` takes at `at`. Unix SECONDS, not
+ * an ISO stamp: it is a lifetime marker (older-than comparisons in the stale
+ * sweep), never a calendar bucket, and seconds keep the label short and legal on
+ * both backends.
+ */
+export function formatTransientBackupSnapshot(task: string, at: Date): string {
+  return `${TRANSIENT_PREFIX}${task}-${Math.floor(at.getTime() / 1000)}`
+}
+
+/** The decoded parts of a transient backup-snapshot name. */
+export interface ParsedTransientBackupSnapshot {
+  /** The backup task the snapshot was taken for. */
+  task: string
+  /** When it was taken (from the unix-seconds suffix). */
+  at: Date
+  /** AHR only: the `__`-suffixed nested subvolume this snapshot covers. */
+  subvolume?: string
+}
+
+/** Parse a transient backup-snapshot name, or null when it is not one. */
+export function parseTransientBackupSnapshot(name: string): ParsedTransientBackupSnapshot | null {
+  const m = TRANSIENT_RE.exec(name)
+  if (!m)
+    return null
+  const seconds = Number(m[2])
+  if (!Number.isFinite(seconds))
+    return null
+  return { task: m[1], at: new Date(seconds * 1000), ...(m[3] ? { subvolume: m[3] } : {}) }
+}
+
+/**
+ * Is `name` a transient backup snapshot? The ONE predicate replication and
+ * retention both consult (see the block comment above). Deliberately answers on
+ * the PREFIX shape alone — a name that starts `anas-backup-` but does not fully
+ * parse is still ours, and still must not be adopted as a replication base or
+ * pruned by a retention policy.
+ */
+export function isTransientBackupSnapshot(name: string): boolean {
+  return name.startsWith(TRANSIENT_PREFIX)
+}
+
+/** Is `name` a transient snapshot belonging to THIS task? (the stale sweep's scope) */
+export function isTransientBackupSnapshotOf(name: string, task: string): boolean {
+  return parseTransientBackupSnapshot(name)?.task === task
+}

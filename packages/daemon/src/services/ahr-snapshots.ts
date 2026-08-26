@@ -139,13 +139,17 @@ async function isStillMountpoint(executor: CommandExecutor, path: string): Promi
  * and nothing is removed. Concurrent ops on the same pool are serialized so
  * two jobs can never stack mounts on the one path.
  */
+export function topLevelMountPath(pool: AhrPool, opts?: AhrSnapshotOptions): string {
+  return join(runtimeBase(opts), `${pool.name}.toplevel`)
+}
+
 export async function withTopLevelMount<T>(
   executor: CommandExecutor,
   pool: AhrPool,
   fn: (topLevelPath: string) => Promise<T>,
   opts?: AhrSnapshotOptions,
 ): Promise<T> {
-  const mnt = join(runtimeBase(opts), `${pool.name}.toplevel`)
+  const mnt = topLevelMountPath(pool, opts)
   return serializeOnPath(mnt, async () => {
     await mkdir(mnt, { recursive: true })
     await run(executor, MOUNT, ['-t', 'btrfs', '-o', 'subvolid=5', lvDevice(pool), mnt])
@@ -283,22 +287,31 @@ async function withListPath<T>(
  * Take a READ-ONLY snapshot of `@data` into `@snapshots/<name>` (§12). Mounts
  * the top-level on demand, snapshots, and unmounts. `name` is charset-validated
  * by the route (and again here at the boundary).
+ *
+ * `opts.subvolume` snapshots a NESTED subvolume instead of `@data` itself — the
+ * `@data`-relative path, e.g. `photos/raw`. It exists because a btrfs read-only
+ * snapshot does NOT recurse into nested subvolumes: each one is left as an empty
+ * placeholder and `--all-file-systems` cannot rescue it (GT-52/55), so a
+ * snapshot-consistent backup (backup2.3) must take one snapshot PER subvolume it
+ * intends to back up. Same verb, same mount discipline, different source path.
  */
 export async function createAhrSnapshot(
   executor: CommandExecutor,
   pool: AhrPool,
   name: string,
   updateProgress: (message: string) => void,
-  opts?: AhrSnapshotOptions,
+  opts?: AhrSnapshotOptions & { subvolume?: string },
 ): Promise<{ pool: string, snapshot: string }> {
   const snapName = AhrSnapshotName.parse(name)
+  const subvolume = opts?.subvolume ? opts.subvolume.replace(LEADING_SLASH_RE, '') : ''
   return withTopLevelMount(executor, pool, async (top) => {
-    updateProgress(`Creating read-only snapshot @snapshots/${snapName}`)
+    const from = subvolume ? join(top, SUBVOL_DATA, subvolume) : join(top, SUBVOL_DATA)
+    updateProgress(`Creating read-only snapshot @snapshots/${snapName}${subvolume ? ` of ${SUBVOL_DATA}/${subvolume}` : ''}`)
     await run(executor, BTRFS, [
       'subvolume',
       'snapshot',
       '-r',
-      join(top, SUBVOL_DATA),
+      from,
       join(top, SUBVOL_SNAPSHOTS, snapName),
     ])
     return { pool: pool.name, snapshot: snapName }

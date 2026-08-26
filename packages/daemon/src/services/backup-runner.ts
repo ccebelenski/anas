@@ -1,12 +1,36 @@
-import type { BackupNestedScan, BackupPruneResult, BackupRepo, BackupRepoTestResult, BackupTask } from '@anas/shared'
+import type {
+  AhrPool,
+  BackupArchiveConsistency,
+  BackupExpandedArchive,
+  BackupNestedScan,
+  BackupPruneResult,
+  BackupRepo,
+  BackupRepoTestResult,
+  BackupTask,
+  BackupTransientSnapshot,
+} from '@anas/shared'
 import type { PeerCertificate } from 'node:tls'
 import type { CommandExecutor } from '../executor/types.js'
+import type { BackupSnapshotOptions, TakenSnapshot } from './backup-snapshots.js'
 import { lookup } from 'node:dns/promises'
 import { createConnection, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import { effectiveIncludeNested } from '@anas/shared'
+import { readAhrPools } from './ahr-topology.js'
+import { deriveConsistency, readConsistencyFacts } from './backup-consistency.js'
+import { planExpansion } from './backup-expansion.js'
 import { backupTargetLine } from './backup-notify.js'
+import {
+  destroyTransients,
+  plannedTopLevel,
+  sweepAhrTransients,
+  sweepZfsTransients,
+  takeAhrTransient,
+  takeZfsTransient,
+  withTopLevelMounts,
+} from './backup-snapshots.js'
 import { nestedRunWarnings, resolveNestedIncludes, scanArchives } from './nested-filesystems.js'
+import { formatTransientBackupSnapshot } from './snapshot-naming.js'
 
 /**
  * Backup RUNNER logic (Epic 16.7) — assembles the pbc environment + argv,
@@ -135,13 +159,31 @@ export function buildBackupArgs(
   task: BackupTask,
   namespace?: string,
   resolvedNested: Record<string, string[]> = {},
+  expansion?: BackupExpandedArchive[],
 ): string[] {
   const args: string[] = ['backup']
-  for (const a of task.archives)
+  // backup2.3 — when the run is snapshot-consistent, the archive list is the
+  // EXPANSION (one root per nested filesystem), not the stored archives. The
+  // root archive's NAME and the `--backup-id` below are unchanged either way:
+  // that pair is pbc's change-detection identity, and GT-47/48 proved a switch
+  // between the live root and the snapshot root costs nothing as long as it
+  // holds.
+  const roots: { name: string, path: string, excludes: string[] }[] = expansion?.length
+    ? expansion.map(e => ({ name: e.name, path: e.root, excludes: e.excludes }))
+    : task.archives.map(a => ({ name: a.name, path: a.path, excludes: a.excludes }))
+  for (const a of roots)
     args.push(`${a.name}.pxar:${a.path}`)
-  for (const a of task.archives) {
-    for (const pattern of a.excludes)
+  // `--exclude` is a per-INVOCATION flag (Epic 16's finding, unchanged here), so
+  // the union is emitted once, deduplicated — a pattern repeated across two
+  // expanded roots of the same archive is one flag, not two.
+  const excludes = new Set<string>()
+  for (const a of roots) {
+    for (const pattern of a.excludes) {
+      if (excludes.has(pattern))
+        continue
+      excludes.add(pattern)
       args.push('--exclude', pattern)
+    }
   }
   args.push('--backup-id', task.backupId)
   const ns = namespace ?? task.namespace
@@ -153,12 +195,22 @@ export function buildBackupArgs(
   const devs = new Set<string>()
   for (const a of task.archives) {
     const choice = effectiveIncludeNested(a)
-    // `all` is only ever as good as the scan that resolved it; with no resolution
-    // (a scan that failed, or a caller with nothing to hand over) the archive
-    // gets NO flag and the client default stands — never a guessed subset.
-    const paths = choice === 'all'
+    // On a SNAPSHOT-CONSISTENT run `resolvedNested` is the COMPLETE include-dev
+    // map: an archive that was expanded is absent from it and contributes no
+    // flag at all. That is not an optimisation — under a `.zfs/snapshot/<s>/`
+    // root the boundary is an EMPTY DIRECTORY on the snapshot's own device, so
+    // `--include-dev` there names nothing; the child came along as its own
+    // archive root instead (backup2.3).
+    //
+    // On a live run `all` is only ever as good as the scan that resolved it;
+    // with no resolution (a scan that failed, or a caller with nothing to hand
+    // over) the archive gets NO flag and the client default stands — never a
+    // guessed subset.
+    const paths = expansion?.length
       ? (resolvedNested[a.name] ?? [])
-      : (Array.isArray(choice) ? choice : [])
+      : (choice === 'all'
+          ? (resolvedNested[a.name] ?? [])
+          : (Array.isArray(choice) ? choice : []))
     for (const p of paths)
       devs.add(p)
   }
@@ -343,6 +395,13 @@ export interface BackupRunDeps {
   task: BackupTask
   repo: BackupRepo
   secret: string
+  /**
+   * backup2.3 test seam: the clock the transient snapshot's name and the stale
+   * sweep's cutoff are read from, and the AHR runtime dir. Absent = real time
+   * and the real `/run/anas-ahr`.
+   */
+  now?: Date
+  snapshotOptions?: BackupSnapshotOptions
 }
 
 export interface BackupRunResult {
@@ -374,6 +433,23 @@ export interface BackupRunResult {
    * about the config, so it is reported here rather than inferred from the task.
    */
   includedNested?: Record<string, string[]>
+  /**
+   * backup2.3 — the DERIVED consistency of each archive source, in task order.
+   * A fact about the system at run time, never a setting.
+   */
+  consistency?: BackupArchiveConsistency[]
+  /**
+   * The transient snapshots this run took. All of them were destroyed in the
+   * run's `finally` by the time this result exists — they are reported so the
+   * record says what the backup was actually read FROM.
+   */
+  snapshots?: BackupTransientSnapshot[]
+  /**
+   * The expansion: one entry per archive root pbc was handed. The root entry of
+   * each archive keeps the configured name (change-detection continuity); the
+   * children carry the derived `<name>__<child>` names.
+   */
+  expansion?: BackupExpandedArchive[]
 }
 
 /**
@@ -411,21 +487,128 @@ export async function runBackup(
   // Fail-open: the scan never fails a backup — it only ever adds warnings.
   const scanned = await scanArchives(executor, task.archives, { timeoutSeconds: NESTED_SCAN_RUN_TIMEOUT_S })
   const resolution = resolveNestedIncludes(task.archives, scanned)
-  const scans = resolution.scans
-  const warnings: string[] = [...nestedRunWarnings(scans), ...resolution.warnings]
+  const warnings: string[] = [...nestedRunWarnings(resolution.scans), ...resolution.warnings]
+
+  // backup2.3 — the DERIVED consistency of every source, from the mount table
+  // plus the live AHR topology. Read once for the whole task; both probes fail
+  // open to `live` with a stated reason, so a derivation that cannot see the
+  // system NEVER claims a snapshot it did not take.
+  const facts = await readConsistencyFacts(executor, readAhrPools)
+  const consistency = task.archives.map(a => deriveConsistency(a.path, facts))
+  // The scans carry it to the screens (one endpoint, not two — the two answers
+  // come from the same mount table).
+  const scans = resolution.scans.map((scan, i) => ({ ...scan, consistency: consistency[i] }))
+
+  const snapshotMode = consistency.some(c => c.consistency === 'snapshot')
+  for (let i = 0; i < task.archives.length; i++)
+    updateProgress(`archive '${task.archives[i].name}': ${consistency[i].consistency} - ${consistency[i].reason}`)
+
+  // `--include-dev` is meaningless under a snapshot root: the boundary directory
+  // is captured by the snapshot as an EMPTY DIRECTORY, so there is no foreign
+  // device there for pbc to be told about. Snapshot-mode archives therefore
+  // carry no include-dev at all — their included children become archive roots
+  // of their own (the expansion), and the ones that cannot be snapshotted are
+  // named in a warning by the planner. Live archives keep backup2.2 verbatim.
+  const liveIncludes: Record<string, string[]> = {}
+  for (let i = 0; i < task.archives.length; i++) {
+    if (consistency[i].consistency !== 'snapshot')
+      liveIncludes[task.archives[i].name] = resolution.byArchive[task.archives[i].name] ?? []
+  }
 
   // Effective namespace: the task's if set, else the repo's (zero re-entry for a
   // repo that already carries one, e.g. a PVE-defined storage). Mirrors the test
   // path, which probes repo.namespace.
-  const args = buildBackupArgs(task, effectiveNamespace(task, repo), resolution.byArchive)
+  const namespace = effectiveNamespace(task, repo)
 
   // Say on the record exactly which boundaries this run crossed — journald gets
   // it from the job progress, and it rides the 16.12 notification body.
-  const includedNested = includedNestedOf(resolution.byArchive)
+  const includedNested = includedNestedOf(liveIncludes)
   for (const [archive, paths] of Object.entries(includedNested))
     updateProgress(`archive '${archive}': crossing ${paths.length} filesystem boundary/boundaries - ${paths.join(' ')}`)
 
-  const r = await executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env })
+  const now = deps.now ?? new Date()
+  const snapshotOptions = deps.snapshotOptions
+  const taken: TakenSnapshot[] = []
+  let expansion: BackupExpandedArchive[] = []
+  // Definitely assigned by the time it is read: every branch below either sets
+  // it or throws (the `finally` re-raises after destroying the snapshots).
+  let r!: { exitCode: number, stderr: string }
+
+  const exec = async (args: string[]): Promise<{ exitCode: number, stderr: string }> =>
+    executor.exec(PRLIMIT, [`--nofile=${nofile}:${nofile}`, '--', PBC, ...args], { env })
+
+  if (!snapshotMode) {
+    r = await exec(buildBackupArgs(task, namespace, liveIncludes))
+  }
+  else {
+    // ---- Snapshot-consistent run ----------------------------------------
+    // Order matters and is load-bearing:
+    //   1. sweep this task's OWN stale transients (a previous run that died
+    //      before its `finally`) — never another task's, which may be running;
+    //   2. take the snapshots (all of them, before any top-level mount, because
+    //      `withTopLevelMount` serialises per pool and would deadlock on itself);
+    //   3. plan the expansion and build the argv from it;
+    //   4. hold every AHR pool's top-level mount open across the ONE pbc call;
+    //   5. destroy everything in a `finally`, mounts already released.
+    const zfsTargets = distinctZfsTargets(consistency)
+    const ahrTargets = distinctAhrTargets(consistency, facts.ahrPools)
+
+    for (const dataset of zfsTargets)
+      warnings.push(...await sweepZfsTransients(executor, dataset, task.name, now, updateProgress))
+    for (const pool of ahrTargets)
+      warnings.push(...await sweepAhrTransients(executor, pool, task.name, now, updateProgress, snapshotOptions))
+
+    const label = formatTransientBackupSnapshot(task.name, now)
+    try {
+      for (const dataset of zfsTargets) {
+        updateProgress(`snapshotting ${dataset}@${label} (recursive)`)
+        taken.push(await takeZfsTransient(executor, dataset, label))
+      }
+      for (const pool of ahrTargets) {
+        updateProgress(`snapshotting AHR pool '${pool.name}' as @snapshots/${label}`)
+        taken.push(await takeAhrTransient(executor, pool, label, undefined, updateProgress, snapshotOptions))
+      }
+
+      const plans = task.archives.map((archive, i) => planExpansion({
+        archive,
+        consistency: consistency[i],
+        scan: scans[i],
+        snapshot: label,
+        ...(consistency[i].backend === 'ahr' && consistency[i].target
+          ? { topLevel: plannedTopLevel(poolOf(consistency[i].target as string, ahrTargets) as AhrPool, snapshotOptions) }
+          : {}),
+      }))
+      for (const plan of plans)
+        warnings.push(...plan.warnings)
+      expansion = plans.flatMap(p => p.archives)
+
+      // GT-52/55: a single ro btrfs snapshot leaves every nested subvolume an
+      // EMPTY placeholder that no client flag can rescue — so each included one
+      // gets its own snapshot before the run reads anything.
+      for (let i = 0; i < plans.length; i++) {
+        const pool = poolOf(consistency[i].target ?? '', ahrTargets)
+        if (!pool)
+          continue
+        for (const sub of plans[i].ahrSubvolumeSnapshots) {
+          updateProgress(`snapshotting nested subvolume @data/${sub.subvolume} as @snapshots/${sub.label}`)
+          taken.push(await takeAhrTransient(executor, pool, sub.label, sub.subvolume, updateProgress, snapshotOptions))
+        }
+      }
+
+      const args = buildBackupArgs(task, namespace, liveIncludes, expansion)
+      for (const e of expansion)
+        updateProgress(`archive '${e.name}' <- ${e.root}`)
+
+      r = ahrTargets.length
+        ? await withTopLevelMounts(executor, ahrTargets, async () => exec(args), snapshotOptions)
+        : await exec(args)
+    }
+    finally {
+      // Success, failure or timeout alike. Destroy failures are warnings on an
+      // otherwise-good run; they never turn a completed backup into a failed job.
+      warnings.push(...await destroyTransients(executor, taken, updateProgress, snapshotOptions))
+    }
+  }
 
   const progress = parseBackupProgress(r.stderr)
   const summary = progressSummary(progress)
@@ -465,9 +648,59 @@ export async function runBackup(
     result.nested = scans
   if (Object.keys(includedNested).length)
     result.includedNested = includedNested
+  // backup2.3, on the record: what each source's consistency was DERIVED to be,
+  // which transient snapshots existed while the run read, and which archive
+  // roots pbc was actually handed.
+  if (consistency.length)
+    result.consistency = consistency
+  if (taken.length)
+    result.snapshots = taken.map(({ pool: _pool, ...rest }) => rest)
+  if (expansion.length)
+    result.expansion = expansion
   if (warnings.length)
     result.warnings = warnings
   return result
+}
+
+/**
+ * The distinct ZFS datasets one recursive snapshot each must cover. A dataset
+ * that is a DESCENDANT of another in the set is dropped: `zfs snapshot -r` on
+ * the ancestor already gave it the same label, and a second `-r` on the
+ * descendant would fail with "dataset already exists". Destroying the ancestor
+ * recursively takes the descendant's copy with it, so the lifecycle stays whole.
+ */
+export function distinctZfsTargets(consistency: BackupArchiveConsistency[]): string[] {
+  const names = new Set<string>()
+  for (const c of consistency) {
+    if (c.consistency === 'snapshot' && c.backend === 'zfs' && c.target)
+      names.add(c.target)
+  }
+  // Two steps on an array we own: `[...x].sort()` trips the lint rule that wants
+  // `toSorted()`, which this package's TS lib target does not have. Same pattern
+  // the include-dev ordering above already uses.
+  const all = [...names]
+  all.sort()
+  return all.filter(ds => !all.some(other => other !== ds && ds.startsWith(`${other}/`)))
+}
+
+/** The distinct AHR pools involved, resolved against the live topology. */
+export function distinctAhrTargets(consistency: BackupArchiveConsistency[], pools: AhrPool[]): AhrPool[] {
+  const names = new Set<string>()
+  for (const c of consistency) {
+    if (c.consistency === 'snapshot' && c.backend === 'ahr' && c.target)
+      names.add(c.target)
+  }
+  const ordered = [...names]
+  ordered.sort()
+  return ordered.flatMap((name) => {
+    const pool = pools.find(p => p.name === name)
+    return pool ? [pool] : []
+  })
+}
+
+/** One resolved AHR pool by name (undefined when the archive is not on AHR). */
+function poolOf(name: string, pools: AhrPool[]): AhrPool | undefined {
+  return name ? pools.find(p => p.name === name) : undefined
 }
 
 /** Drop the archives that cross nothing — an empty list is not a fact worth showing. */
