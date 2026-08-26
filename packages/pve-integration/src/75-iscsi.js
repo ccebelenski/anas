@@ -45,6 +45,16 @@
  *  - **"Not on this node right now" is not "somebody else's".** A LUN whose pool
  *    is exported reads `Unresolved`, not `Foreign`, and its target stays ANAS's —
  *    otherwise the hands-off badge would take away the very tools that fix it.
+ *  - **A backup image that is not EXACTLY the size of the LUN is destructive.**
+ *    Nothing below ANAS checks it: a larger image writes until the device is
+ *    full and leaves the LUN half-overwritten, a smaller one succeeds and leaves
+ *    stale bytes past its end. `Restore from backup…` shows both numbers and
+ *    keeps the button dead until they are equal (story backup2.7).
+ *  - **A restore takes the WHOLE TARGET offline, not one LUN.** LIO's enable
+ *    flag lives on the target portal group, so every other LUN on that target is
+ *    unreachable for the duration too. The confirm text says so — and if the
+ *    restore fails part-way the target stays disabled, because serving half an
+ *    image is worse than serving nothing.
  *
  * ---------------------------------------------------------------------------
  * DAEMON CONTRACT (docs/DESIGN.md "iSCSI — block storage")
@@ -67,6 +77,16 @@
  *        portalsWithoutInterface[], foreignChanges[], degraded, interfacesUnknown }
  *   POST /v1/iscsi/health/repair                                       → 202/409
  *
+ *   backup2.7 — the whole-image restore lives on the LUN toolbar, because the
+ *   LUN is the thing being restored:
+ *   GET  /v1/backup/repos                → the two repository tiers
+ *   GET  /v1/backup/repos/:name/groups?ns= → { groups: [ { group, snapshots: [
+ *        { snapshot, backupTime, files: [ { filename, size } ] } ] } ] }
+ *   POST /v1/backup/restore { kind:'image', repo, ns?, snapshot, archive,
+ *        lun:{targetIqn, index} }                                     → 202/409
+ *   The `snapshot` is ALWAYS the full `<type>/<id>/<RFC3339>`: a bare group path
+ *   is not an error to the backup client, it silently restores the latest.
+ *
  *   THE CLEAR CONTRACT: on an ACL, every credential field means set / clear /
  *   keep by value / null / OMITTED. A blank password box sends NO key, so the
  *   stored secret stands (the mounts precedent). An untouched target edit sends
@@ -80,9 +100,12 @@
  * 'anas-btn-iscsi-refresh' / '-create' / '-edit' / '-toggle' / '-delete' /
  * '-luns' / '-repair'; target dialog 'anas-win-iscsi-target' with submit
  * 'anas-btn-iscsi-target-submit'; LUNs window 'anas-win-iscsi-luns' with
- * 'anas-btn-lun-add' / 'anas-btn-lun-resize' / 'anas-btn-lun-delete'; Add LUN
- * dialog 'anas-win-iscsi-lun' with 'anas-btn-iscsi-lun-submit'; Resize dialog
- * 'anas-win-iscsi-lun-resize' with 'anas-btn-iscsi-lun-resize-submit'.
+ * 'anas-btn-lun-add' / 'anas-btn-lun-resize' / 'anas-btn-lun-restore' /
+ * 'anas-btn-lun-delete'; Add LUN dialog 'anas-win-iscsi-lun' with
+ * 'anas-btn-iscsi-lun-submit'; Resize dialog 'anas-win-iscsi-lun-resize' with
+ * 'anas-btn-iscsi-lun-resize-submit'; Restore dialog 'anas-win-lun-restore' with
+ * 'anas-fld-restore-repo' / '-ns' / '-group' / '-snapshot' / '-archive',
+ * 'anas-btn-restore-load' and 'anas-btn-lun-restore-submit'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  * Fail-open everywhere: a broken view renders an error panel, never breaks PVE.
@@ -1660,14 +1683,38 @@
         var unresolved = kind === 'unresolved';
         var kindOk = has && kind !== 'foreign' && !unresolved;
 
+        // A whole-image restore needs the same things a resize does — a backing
+        // object ANAS manages and one that is actually THERE — plus a known
+        // size, because the size EQUALITY is the only guard against a
+        // half-overwritten LUN (nothing below ANAS checks it, backup2.7).
+        var missing = has && rec.get('backingExists') === false;
+        var sizeKnown = has && Number(rec.get('size')) > 0;
+        var restorable = has && kindOk && !missing && sizeKnown;
+
         setDisabled(grid, 'lunAdd', foreign);
         setDisabled(grid, 'lunResize', foreign || !has || live || !kindOk);
+        setDisabled(grid, 'lunRestore', foreign || !has || live || !restorable);
         setDisabled(grid, 'lunDelete', foreign || !has || live);
 
         var foreignTip = t('This target is not managed by ANAS — hands-off');
         var liveTip = t('An initiator is logged in. Resizing or deleting a LUN under a live session is '
             + 'refused: LIO would do it anyway and leave a stale device on the other host with no '
             + 'kernel message. Log the initiator out first.');
+        var restoreLiveTip = t('An initiator is logged in. A whole-image restore overwrites the block '
+            + 'device under a mounted filesystem, and neither LIO nor the initiator would be told. '
+            + 'Log the initiator out first.');
+        btnSetTip(grid, 'lunRestore', foreign ? foreignTip
+            : (live
+                ? restoreLiveTip
+                : (missing
+                    ? t('The backing object is not on this node right now — bring the storage back, '
+                        + 'then Repair, before restoring onto it.')
+                    : (has && !kindOk
+                        ? t('The backing object is not storage ANAS manages')
+                        : (has && !sizeKnown
+                            ? t('This LUN\'s size is unknown, so ANAS cannot prove a backup image is exactly '
+                                + 'its size — and a mismatch is silently destructive.')
+                            : '')))));
         btnSetTip(grid, 'lunAdd', foreign ? foreignTip : '');
         btnSetTip(grid, 'lunResize', foreign ? foreignTip
             : (live
@@ -1934,6 +1981,17 @@
                                 handler: function (btn) {
                                     var w = btn.up('#lunsGrid').up();
                                     openResizeLunDialog(w, view, node, iqn, selectedLun(w));
+                                }
+                            },
+                            {
+                                text: t('Restore from backup…'),
+                                itemId: 'lunRestore',
+                                cls: 'anas-btn-lun-restore',
+                                iconCls: 'fa fa-undo',
+                                disabled: true,
+                                handler: function (btn) {
+                                    var w = btn.up('#lunsGrid').up();
+                                    openRestoreLunDialog(w, view, node, iqn, selectedLun(w));
                                 }
                             },
                             {
@@ -2554,6 +2612,561 @@
                 if (!win.destroyed && !win.destroying) {
                     win.close();
                 }
+                loadLuns(lunsWin, node, iqn);
+                loadTargets(view, node, true);
+            }
+        });
+    }
+
+    // ---- Restore a LUN from a PBS backup (story backup2.7) -----------------
+    //
+    // WHOLE-IMAGE, by nature: a block image has no "restore these files". The
+    // dialog's whole job is to let the operator name a point in time and then
+    // prove, before the button is live, that the image is EXACTLY the size of
+    // the LUN — because a mismatch is silently destructive below ANAS (a larger
+    // image writes until the device is full and leaves it half-overwritten; a
+    // smaller one succeeds and leaves stale bytes past its end).
+    //
+    // The reads are backup2.5's, in its two-call shape: `GET /v1/backup/repos/
+    // :name/groups?ns=` for the namespace's GROUPS, then the same endpoint with
+    // `?group=` for that group's POINTS IN TIME. Nothing that is not an `.img`
+    // archive is ever offered, and the filter keys on backup2.5's classified
+    // `kind`, never on the filename.
+
+    // Every stored file backup2.5 classified as a block image, keyed by the
+    // ARCHIVE ARGUMENT pbc takes (`vol.img.fidx` → `vol.img`).
+    //
+    // The match is on the KIND, never the name: a tree archive that happens to
+    // be called `something.img.pxar` is a pxar, and handing it to a block
+    // restore would earn a refusal at best and a wrong disk at worst.
+    function restoreArchivesOf(snapshot) {
+        var out = [];
+        var files = (snapshot && isArray(snapshot.files)) ? snapshot.files : [];
+        for (var i = 0; i < files.length; i++) {
+            if (files[i] && files[i].kind === 'img' && files[i].archive) {
+                out.push({
+                    archive: files[i].archive,
+                    size: (typeof files[i].size === 'number') ? files[i].size : null
+                });
+            }
+        }
+        return out;
+    }
+
+    // A GROUP's `files` are the classified filenames it holds (backup2.5), so a
+    // group with no image can be dropped before its snapshots are ever fetched.
+    function groupHasImage(group) {
+        var files = (group && isArray(group.files)) ? group.files : [];
+        for (var i = 0; i < files.length; i++) {
+            if (files[i] && files[i].kind === 'img') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // backup2.5's reads answer 200 with a VERDICT: a local fault is a 4xx, but a
+    // PBS-side one is a diagnosis the screen shows verbatim rather than a bare
+    // failure. Returns the detail to show, or '' when the read succeeded.
+    function readVerdictDetail(data) {
+        if (!data || !data.verdict || data.verdict === 'ok') {
+            return '';
+        }
+        return '' + (data.detail || data.verdict);
+    }
+
+    function comboStore(fields, rows) {
+        return Ext.create('Ext.data.Store', { fields: fields, data: rows || [] });
+    }
+
+    function setComboRows(win, sel, rows, selectFirst) {
+        var c;
+        try {
+            c = win.down(sel);
+        } catch (e) {
+            return;
+        }
+        if (!c) {
+            return;
+        }
+        c.getStore().loadData(rows || []);
+        if (selectFirst && rows && rows.length) {
+            c.setValue(rows[0][c.valueField || 'value']);
+        } else {
+            c.setValue(null);
+        }
+    }
+
+    function openRestoreLunDialog(lunsWin, view, node, iqn, rec) {
+        if (!rec) {
+            return;
+        }
+        var lunSize = Number(rec.get('size')) || 0;
+        if (!lunSize) {
+            ANAS.alertMsg('Cannot restore', t('This LUN\'s size is unknown, so ANAS cannot prove a backup image '
+                + 'is exactly its size. A size mismatch is silently destructive, so the restore is refused.'));
+            return;
+        }
+        var lunIndex = rec.get('index');
+        var backing = '' + (rec.get('backingPath') || '');
+
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-lun-restore',
+                title: t('Restore LUN from backup') + ': ' + rec.get('name'),
+                modal: true,
+                width: 720,
+                layout: 'fit',
+                anasSnapshots: [],
+                items: [{
+                    xtype: 'form',
+                    itemId: 'form',
+                    bodyPadding: 12,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 190 },
+                    items: [
+                        {
+                            xtype: 'displayfield',
+                            itemId: 'restoreTargetPath',
+                            fieldLabel: t('Restoring onto'),
+                            value: enc(backing) + ' (' + enc(t('LUN')) + ' ' + enc(lunIndex) + ')'
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'repo',
+                            cls: 'anas-fld-restore-repo',
+                            fieldLabel: t('Repository'),
+                            store: comboStore(['value', 'label', 'namespace'], []),
+                            valueField: 'value',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            emptyText: t('(loading…)')
+                        },
+                        {
+                            xtype: 'textfield',
+                            itemId: 'ns',
+                            cls: 'anas-fld-restore-ns',
+                            fieldLabel: t('Namespace'),
+                            emptyText: t('(the repository root)')
+                        },
+                        {
+                            xtype: 'button',
+                            itemId: 'loadGroups',
+                            cls: 'anas-btn-restore-load',
+                            text: t('List backups'),
+                            width: 140,
+                            margin: '0 0 8 0',
+                            handler: function (btn) {
+                                loadRestoreGroups(btn.up('window'), node, lunSize);
+                            }
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'group',
+                            cls: 'anas-fld-restore-group',
+                            fieldLabel: t('Backup group'),
+                            store: comboStore(['value', 'label'], []),
+                            valueField: 'value',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            emptyText: t('(list backups first)'),
+                            listeners: {
+                                change: function (c) {
+                                    loadRestoreSnapshots(c.up('window'), node, lunSize);
+                                }
+                            }
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'snapshot',
+                            cls: 'anas-fld-restore-snapshot',
+                            fieldLabel: t('Point in time'),
+                            store: comboStore(['value', 'label'], []),
+                            valueField: 'value',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            listeners: {
+                                change: function (c) {
+                                    onRestoreSnapshotChange(c.up('window'), lunSize);
+                                }
+                            }
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'archive',
+                            cls: 'anas-fld-restore-archive',
+                            fieldLabel: t('Image archive'),
+                            store: comboStore(['value', 'label', 'size'], []),
+                            valueField: 'value',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            emptyText: t('(no .img archive in this snapshot)'),
+                            listeners: {
+                                change: function (c) {
+                                    updateRestoreSizes(c.up('window'), lunSize);
+                                }
+                            }
+                        },
+                        {
+                            xtype: 'displayfield',
+                            itemId: 'lunSize',
+                            fieldLabel: t('LUN size'),
+                            value: enc(fmtBytes(lunSize)) + ' (' + enc('' + lunSize) + ' ' + enc(t('bytes')) + ')'
+                        },
+                        {
+                            xtype: 'displayfield',
+                            itemId: 'imageSize',
+                            cls: 'anas-fld-restore-image-size',
+                            fieldLabel: t('Image size'),
+                            value: '<span style="color:gray;">&mdash;</span>'
+                        },
+                        {
+                            xtype: 'component',
+                            itemId: 'sizeVerdict',
+                            cls: 'anas-restore-size-verdict',
+                            margin: '4 0 0 0',
+                            html: ''
+                        },
+                        {
+                            xtype: 'component',
+                            itemId: 'restoreNote',
+                            margin: '8 0 0 0',
+                            style: 'color:gray;font-size:11px;',
+                            html: enc(t('A block image is restored WHOLE — there is no "these files". '
+                                + 'The whole target goes offline for the duration (LIO\'s enable flag lives on '
+                                + 'the target portal group, not the LUN), every session drops and no initiator '
+                                + 'can log back in until it finishes. The image is streamed straight onto ')) + enc(backing)
+                                + enc(t('; the unit serial and the backstore attributes are untouched, so the '
+                                    + 'initiator sees the same disk with the backed-up contents.'))
+                        }
+                    ]
+                }],
+                buttons: [
+                    {
+                        text: t('Cancel'),
+                        handler: function () {
+                            win.close();
+                        }
+                    },
+                    {
+                        text: t('Restore'),
+                        itemId: 'restoreSubmit',
+                        cls: 'anas-btn-lun-restore-submit',
+                        disabled: true,
+                        handler: function () {
+                            try {
+                                submitRestoreLun(win, lunsWin, view, node, iqn, rec, lunSize);
+                            } catch (e) {
+                                ANAS.warn('restore LUN submit failed: ' + ANAS.errText(e));
+                            }
+                        }
+                    }
+                ]
+            });
+        } catch (e) {
+            ANAS.warn('restore LUN window failed: ' + ANAS.errText(e));
+            return;
+        }
+
+        win.show();
+        loadRestoreRepos(win, node);
+        return win;
+    }
+
+    // Both repository tiers, exactly as the backup wizard sees them: ANAS-
+    // registered AND PVE-discovered (`pve:<id>`). A repo with no stored
+    // credential is still listed — the daemon's refusal explains it better than
+    // a silently missing row would.
+    function loadRestoreRepos(win, node) {
+        ANAS.api.get(node, '/backup/repos').then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var list = (res && res.data && isArray(res.data.repos)) ? res.data.repos : [];
+            var rows = [];
+            for (var i = 0; i < list.length; i++) {
+                var r = list[i];
+                rows.push({
+                    value: r.name,
+                    label: r.name + ' — ' + (r.host || '') + ':' + (r.datastore || '')
+                        + (r.source === 'pve' ? ' (' + t('from Proxmox storage') + ')' : ''),
+                    namespace: r.namespace || ''
+                });
+            }
+            var combo = win.down('#repo');
+            combo.getStore().loadData(rows);
+            if (rows.length) {
+                combo.setValue(rows[0].value);
+                // Zero re-entry: a repository that already carries a namespace
+                // pre-fills it, the way the backup task path does.
+                if (rows[0].namespace) {
+                    win.down('#ns').setValue(rows[0].namespace);
+                }
+            }
+        }, function (err) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            ANAS.warn('restore: repositories load failed: ' + ANAS.errText(err));
+        });
+    }
+
+    // CALL 1 of 2: the namespace's groups. A group carries its classified
+    // filenames, so the ones that hold no image are dropped here — before a
+    // second call is ever made for their points in time.
+    function loadRestoreGroups(win, node, lunSize) {
+        var repo = textOf(win, '#repo');
+        if (!repo) {
+            ANAS.alertMsg('Pick a repository', t('Choose the repository holding the backup first.'));
+            return;
+        }
+        var ns = textOf(win, '#ns');
+        var path = '/backup/repos/' + encodeURIComponent(repo) + '/groups'
+            + (ns ? '?ns=' + encodeURIComponent(ns) : '');
+        win.anasSnapshots = [];
+        setComboRows(win, '#snapshot', [], false);
+        setComboRows(win, '#archive', [], false);
+        ANAS.api.get(node, path).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var data = (res && res.data) || {};
+            var detail = readVerdictDetail(data);
+            if (detail) {
+                setComboRows(win, '#group', [], false);
+                updateRestoreSizes(win, lunSize);
+                ANAS.alertMsg('Could not list backups', detail);
+                return;
+            }
+            var groups = isArray(data.groups) ? data.groups : [];
+            var rows = [];
+            for (var i = 0; i < groups.length; i++) {
+                // A pxar group cannot restore a block device, and offering it
+                // would only earn a refusal three clicks later.
+                if (!groupHasImage(groups[i])) {
+                    continue;
+                }
+                rows.push({
+                    value: groups[i].group,
+                    label: groups[i].group
+                        + (groups[i].lastBackupIso ? ' — ' + t('last') + ' ' + groups[i].lastBackupIso : '')
+                });
+            }
+            setComboRows(win, '#group', rows, rows.length === 1);
+            if (!rows.length) {
+                ANAS.alertMsg('No image backups', t('No backup group in this repository and namespace holds an '
+                    + '.img archive. A block image can only be restored from an image backup.'));
+            }
+            updateRestoreSizes(win, lunSize);
+        }, function (err) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            ANAS.alertMsg('Could not list backups', ANAS.errText(err));
+        });
+    }
+
+    // CALL 2 of 2: the chosen group's points in time. Same endpoint, `?group=`,
+    // and the snapshots come back in the SAME shape the task endpoint uses —
+    // one picker, one parser, two doors.
+    function loadRestoreSnapshots(win, node, lunSize) {
+        var repo = textOf(win, '#repo');
+        var group = textOf(win, '#group');
+        win.anasSnapshots = [];
+        setComboRows(win, '#snapshot', [], false);
+        setComboRows(win, '#archive', [], false);
+        if (!repo || !group) {
+            updateRestoreSizes(win, lunSize);
+            return;
+        }
+        var ns = textOf(win, '#ns');
+        var path = '/backup/repos/' + encodeURIComponent(repo) + '/groups?group=' + encodeURIComponent(group)
+            + (ns ? '&ns=' + encodeURIComponent(ns) : '');
+        ANAS.api.get(node, path).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var data = (res && res.data) || {};
+            var detail = readVerdictDetail(data);
+            if (detail) {
+                updateRestoreSizes(win, lunSize);
+                ANAS.alertMsg('Could not list points in time', detail);
+                return;
+            }
+            var snaps = isArray(data.snapshots) ? data.snapshots : [];
+            var keep = [];
+            var rows = [];
+            for (var i = 0; i < snaps.length; i++) {
+                if (!restoreArchivesOf(snaps[i]).length) {
+                    continue;
+                }
+                keep.push(snaps[i]);
+                // The FULL <type>/<id>/<RFC3339> id is the value, ALWAYS: a bare
+                // group path is not an error to the client, it silently restores
+                // the LATEST snapshot — a different operation from the one picked.
+                rows.push({
+                    value: snaps[i].snapshot,
+                    label: snaps[i].backupTimeIso || snaps[i].snapshot
+                });
+            }
+            win.anasSnapshots = keep;
+            setComboRows(win, '#snapshot', rows, rows.length > 0);
+            updateRestoreSizes(win, lunSize);
+        }, function (err) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            ANAS.alertMsg('Could not list points in time', ANAS.errText(err));
+        });
+    }
+
+    function selectedSnapshot(win) {
+        var path = textOf(win, '#snapshot');
+        var snaps = isArray(win.anasSnapshots) ? win.anasSnapshots : [];
+        for (var i = 0; i < snaps.length; i++) {
+            if (snaps[i].snapshot === path) {
+                return snaps[i];
+            }
+        }
+        return null;
+    }
+
+    function onRestoreSnapshotChange(win, lunSize) {
+        var snap = selectedSnapshot(win);
+        var archives = snap ? restoreArchivesOf(snap) : [];
+        var rows = [];
+        for (var i = 0; i < archives.length; i++) {
+            rows.push({
+                value: archives[i].archive,
+                label: archives[i].archive
+                    + (archives[i].size === null ? '' : ' — ' + fmtBytes(archives[i].size)),
+                size: archives[i].size
+            });
+        }
+        setComboRows(win, '#archive', rows, rows.length === 1);
+        updateRestoreSizes(win, lunSize);
+    }
+
+    function selectedArchiveSize(win) {
+        var snap = selectedSnapshot(win);
+        var name = textOf(win, '#archive');
+        var archives = snap ? restoreArchivesOf(snap) : [];
+        for (var i = 0; i < archives.length; i++) {
+            if (archives[i].archive === name) {
+                return archives[i].size;
+            }
+        }
+        return null;
+    }
+
+    // THE gate. The daemon refuses a mismatch too (safety lives in the API), but
+    // a red field and a dead button is the difference between a control that
+    // works and one that lets you press it and then explains why not.
+    function updateRestoreSizes(win, lunSize) {
+        var submit;
+        try {
+            submit = win.down('#restoreSubmit');
+        } catch (e) {
+            submit = null;
+        }
+        var verdict = win.down('#sizeVerdict');
+        var sizeField = win.down('#imageSize');
+        var size = selectedArchiveSize(win);
+        var chosen = textOf(win, '#snapshot') && textOf(win, '#archive');
+
+        if (sizeField) {
+            sizeField.setValue(size === null || size === undefined
+                ? '<span style="color:gray;">&mdash;</span>'
+                : enc(fmtBytes(size)) + ' (' + enc('' + size) + ' ' + enc(t('bytes')) + ')');
+        }
+
+        var ok = false;
+        var html = '';
+        if (!chosen) {
+            html = '';
+        } else if (size === null || size === undefined) {
+            html = '<span style="color:var(--anas-bad,#c0392b);">'
+                + enc(t('This archive\'s size is not in the snapshot manifest, so ANAS cannot prove it matches '
+                    + 'the LUN. The restore is refused: a mismatch is silently destructive.')) + '</span>';
+        } else if (size === lunSize) {
+            ok = true;
+            html = '<span style="color:var(--anas-good,#2e7d32);">'
+                + enc(t('The image is exactly the size of this LUN.')) + '</span>';
+        } else {
+            html = '<span style="color:var(--anas-bad,#c0392b);">'
+                + enc(size > lunSize
+                    ? t('The image is LARGER than this LUN. Restoring it would write until the device is full '
+                        + 'and leave it half-overwritten — the old contents gone, the new ones incomplete.')
+                    : t('The image is SMALLER than this LUN. Restoring it would succeed and leave stale bytes '
+                        + 'from the old contents past the end of the restored image.'))
+                + ' ' + enc(fmtBytes(size)) + ' ' + enc(t('vs')) + ' ' + enc(fmtBytes(lunSize)) + '.</span>';
+        }
+        if (verdict) {
+            verdict.update(html);
+        }
+        if (submit) {
+            submit.setDisabled(!ok);
+        }
+    }
+
+    function submitRestoreLun(win, lunsWin, view, node, iqn, rec, lunSize) {
+        var repo = textOf(win, '#repo');
+        var ns = textOf(win, '#ns');
+        var snapshot = textOf(win, '#snapshot');
+        var archive = textOf(win, '#archive');
+        var size = selectedArchiveSize(win);
+        if (!repo || !snapshot || !archive) {
+            ANAS.alertMsg('Incomplete', t('Choose a repository, a point in time and an image archive.'));
+            return;
+        }
+        // Belt and braces: the button is already dead on a mismatch, and the
+        // daemon refuses one too. Nothing may reach the wire on a mismatch.
+        if (size !== lunSize) {
+            ANAS.alertMsg('Size mismatch', t('The image and the LUN are not the same size, so the restore is '
+                + 'refused. Restore this image onto a target of exactly its own size.'));
+            return;
+        }
+
+        var body = { kind: 'image', repo: repo, snapshot: snapshot, archive: archive,
+            lun: { targetIqn: iqn, index: rec.get('index') } };
+        if (ns) {
+            body.ns = ns;
+        }
+
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/backup/restore',
+            body: body,
+            view: win,
+            confirmWindow: true,
+            confirmTitle: 'Restore LUN from backup',
+            confirmIntro: enc(t('Restoring')) + ' ' + enc(archive) + ' ' + enc(t('from')) + ' ' + enc(snapshot)
+                + ' ' + enc(t('onto')) + ' ' + enc(rec.get('backingPath') || '') + '.',
+            confirmButtonText: t('Restore'),
+            failTitle: 'Restore failed',
+            successMsg: t('LUN restored') + ': ' + rec.get('name'),
+            onSubmitted: function () {
+                // A whole image can take hours; the dialog has nothing left to
+                // do once the daemon has accepted the job.
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+            },
+            onComplete: function () {
+                loadLuns(lunsWin, node, iqn);
+                loadTargets(view, node, true);
+            },
+            onFailed: function () {
                 loadLuns(lunsWin, node, iqn);
                 loadTargets(view, node, true);
             }

@@ -1,4 +1,4 @@
-import type { CommandExecutor, ExecResult, PipelineResult } from '../../executor/types.js'
+import type { CommandExecutor, ExecResult, ExecStreamResult, PipelineResult } from '../../executor/types.js'
 import type { IscsiReadContext } from '../iscsi.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -41,6 +41,10 @@ function executorWithAddresses(addresses: string[] | null): CommandExecutor {
     },
     async pipeline(): Promise<PipelineResult> {
       return { leftExitCode: 1, rightExitCode: 1, leftStderr: '', rightStderr: '', stdout: '' }
+    },
+    // Interface parity (backup2.7 added the streaming exec); unused here.
+    async execToStream(): Promise<ExecStreamResult> {
+      return { stderr: '', exitCode: 1, bytesWritten: 0 }
     },
   }
 }
@@ -451,6 +455,9 @@ describe('the not-installed path is a first-class state, never an error', () => 
       },
       async pipeline(): Promise<PipelineResult> {
         return { leftExitCode: 1, rightExitCode: 1, leftStderr: '', rightStderr: '', stdout: '' }
+      },
+      async execToStream(): Promise<ExecStreamResult> {
+        return { stderr: '', exitCode: 1, bytesWritten: 0 }
       },
     }
     await readIscsiContext(spy, {

@@ -1,8 +1,9 @@
 import type {
-  BackupLunSource,
-  BackupLunSourceList,
   BackupBrowseResult,
   BackupGroupList,
+  BackupImageRestoreRequest,
+  BackupLunSource,
+  BackupLunSourceList,
   BackupNestedPreviewResponse,
   BackupNestedScan,
   BackupPrunePreviewResponse,
@@ -15,9 +16,10 @@ import type {
   BackupTaskEntry,
   BackupTaskView,
 } from '@anas/shared'
-import type { FastifyInstance, FastifyReply } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { ConfirmStore } from '../safety/confirm.js'
 import type { ConsistencyFacts } from '../services/backup-consistency.js'
 import type { BackupReposPaths } from '../services/backup-repos.js'
 import type { IscsiPaths } from '../services/iscsi.js'
@@ -29,15 +31,17 @@ import {
   BackupPrunePreviewRequest,
   BackupRepoRef,
   BackupRepoTestRequest,
+  BackupRestoreRequest,
   BackupRunRequest,
   BackupTaskRequest,
-  effectiveArchiveKind,
   composeGroupId,
+  effectiveArchiveKind,
   effectiveIncludeNested,
   hasRetentionKeeps,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
 import { readPbsStorages } from '../parsers/pve-storage.js'
+import { confirmGate } from '../safety/gate.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { browseArchiveLevel } from '../services/backup-catalog.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
@@ -58,6 +62,13 @@ import {
   writeBackupRepos,
   writeRepoSecret,
 } from '../services/backup-repos.js'
+import {
+  assertSizeMatch,
+  imageArchiveSize,
+  readTargetSize,
+  runImageRestore,
+  snapshotGroup,
+} from '../services/backup-restore.js'
 import {
   buildBackupEnv,
   buildProbeArgs,
@@ -84,6 +95,13 @@ import {
   validateSchedule,
   writeTaskUnits,
 } from '../services/backup-units.js'
+import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
+import {
+  assertInstalled,
+  assertSaveable,
+  readIscsiState,
+  withIscsiLock,
+} from '../services/iscsi-mutate.js'
 import { classifyBacking } from '../services/iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
 import { imageArchiveScan, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
@@ -117,6 +135,8 @@ import { requireIdentity } from './identity.js'
  *                                        snapshots) — the task-less door
  *   POST   /v1/backup/restore/browse   → one directory level of an archive,
  *                                        via catalog shell over a pipe (backup2.5)
+ *   POST   /v1/backup/restore         → whole-image LUN restore (backup2.7);
+ *                                        `kind: files` is backup2.6's and 400s
  *
  * Mutations are identity-gated jobs (202 → { job }); registry writes are
  * COMPARE-AND-SWAP. Status is LOCAL-ONLY — ANAS never contacts the PBS server
@@ -126,6 +146,12 @@ import { requireIdentity } from './identity.js'
 export interface BackupRouteOptions {
   executor: CommandExecutor
   jobQueue: JobQueue
+  /**
+   * backup2.7 — the whole-image LUN restore's 409 + X-Anas-Confirm-Code gate.
+   * Optional so an older wiring (and the pre-backup2.7 route tests) still
+   * registers; a restore without it refuses rather than skipping the gate.
+   */
+  confirmStore?: ConfirmStore
   /** Registry + creds paths (pmxcfs registry / 0600 secret files). */
   paths: BackupReposPaths
   /** systemd unit directory (the task store). Overridable for tests. */
@@ -146,7 +172,7 @@ function CONFLICT(version: number) {
 }
 
 export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOptions) {
-  const { executor, jobQueue, paths, systemdDir } = opts
+  const { executor, jobQueue, paths, systemdDir, confirmStore } = opts
   const iscsiPaths: IscsiPaths = opts.iscsiPaths ?? {}
 
   /**
@@ -1267,6 +1293,312 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     })
     return { data }
   })
+
+  // --- POST /backup/restore — the restore family ---------------------------
+  //
+  // ONE endpoint, one dispatch per restore KIND, because the two kinds are
+  // genuinely different operations: files are SELECTIVE (pick a subtree, merge
+  // or restore beside it), block images are WHOLE (the LUN is rewritten end to
+  // end and LIO stands down while it happens). Sharing a handler between them
+  // would mean a body where half the fields are inert on any given call.
+  //
+  // The files branch is `backup2.6`'s. It is refused here with a sentence
+  // rather than half-built; when it lands, `case 'files'` gains its one call and
+  // nothing else in this route moves.
+  server.post('/backup/restore', async (request, reply) => {
+    const parsed = BackupRestoreRequest.safeParse(request.body ?? {})
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid restore request: ${parsed.error.issues[0]?.message}` } }
+    }
+    const req = parsed.data
+
+    switch (req.kind) {
+      case 'image':
+        return restoreImage(request, reply, req)
+      case 'files':
+      default:
+        reply.code(400)
+        return {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'File restore is not yet available — this release restores whole block images only '
+              + '(a LUN\'s zvol or image file). Send kind: "image".',
+          },
+        }
+    }
+  })
+
+  // --- The WHOLE-IMAGE branch (story backup2.7) ----------------------------
+  //
+  // The pre-flight order below is the story's, and it is an order rather than a
+  // set: EVERY refusal happens before anything destructive is called, and the
+  // cheapest, most local checks come first so a node with no LIO never reaches
+  // the PBS server at all.
+  //
+  //   1. LIO installed, and the live tree is not a degraded restore
+  //   2. the target exists, is ANAS-owned, has that LUN
+  //   3. the LUN's backing is a zvol or an image file, and it is THERE
+  //   4. the snapshot exists and the archive is in it
+  //   5. the manifest's image size EQUALS the target's size           <- GT-42
+  //   6. no live session on the target                                <- entry gate
+  //   7. the confirm gate (409 + X-Anas-Confirm-Code)
+  //
+  // Only then is a job submitted, and only inside that job does anything change.
+  async function restoreImage(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    req: BackupImageRestoreRequest,
+  ) {
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!confirmStore) {
+      reply.code(503)
+      return {
+        error: {
+          code: 'UNAVAILABLE',
+          message: 'The confirmation store is not configured, so this data-destroying operation cannot be gated. '
+            + 'Restore is refused rather than run unguarded.',
+        },
+      }
+    }
+
+    // (1) LIO present, and not mid-degraded-restore. Same two refusals every
+    // iSCSI mutation takes, for the same reason: this operation ends in a
+    // `targetcli` enable, and enabling ends in `saveconfig` (GT-22).
+    const state = await readIscsiState(executor, iscsiPaths)
+    const notInstalled = assertInstalled(state.ctx)
+    if (notInstalled) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: notInstalled.reason, message: notInstalled.message } }
+    }
+    const degraded = assertSaveable(state.ctx, state.targets)
+    if (degraded) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: degraded.reason, message: degraded.message } }
+    }
+
+    // (2) The target and the LUN.
+    const target = state.targets.find(t => t.iqn === req.lun.targetIqn)
+    if (!target) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `iSCSI target '${req.lun.targetIqn}' not found` } }
+    }
+    if (target.ownership !== 'anas') {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'foreign-target',
+          message: `Target '${target.iqn}' is not managed by ANAS and is hands-off: ${target.ownershipDetail}`,
+        },
+      }
+    }
+    const lun = target.luns.find(l => l.index === req.lun.index)
+    if (!lun) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Target '${target.iqn}' has no LUN ${req.lun.index}` } }
+    }
+
+    // (3) The backing has to be a block object ANAS understands, and it has to
+    // be present. A `foreign` backing is somebody else's storage; `unresolved`
+    // is the boot-restore hole (iscsi.5) — writing an image at either would be
+    // writing at a path ANAS cannot vouch for.
+    if (lun.kind !== 'zvol' && lun.kind !== 'file') {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'backing-not-restorable',
+          message: `LUN ${lun.index} of ${target.iqn} is backed by '${lun.backingPath}', which ANAS reports as `
+            + `'${lun.kind}'. A whole-image restore writes directly at the backing object, so it is only offered `
+            + 'for a ZFS volume or an image file ANAS can resolve.',
+        },
+      }
+    }
+    if (lun.backingExists === false) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'backing-missing',
+          message: `The backing object '${lun.backingPath}' does not resolve on this node right now, so there is `
+            + 'nothing to restore onto. Bring the storage back (import the pool, restore the image file) and '
+            + 'repair the LUN from the iSCSI screen first.',
+        },
+      }
+    }
+
+    // (4) The snapshot, and the archive inside it — the FIRST PBS contact, and
+    // it is backup2.5's own read. Not a second parser: the restore resolves the
+    // manifest through exactly the call the picker used, so what is written back
+    // is what the operator was shown. Only the ONE group the snapshot names is
+    // listed (`snapshot list <group>`) — cheaper and more precise than listing
+    // the namespace and filtering.
+    //
+    // `readDepsFor` has already answered every LOCAL fault (unknown repository,
+    // no stored credential) with its own 4xx. A PBS-side outcome comes back as a
+    // VERDICT, which a picker renders as a message — but a restore cannot
+    // proceed on one, so here it becomes a refusal that quotes it.
+    const deps = await readDepsFor(req.repo, reply, req.ns?.trim() || undefined)
+    if (!deps)
+      return reply
+    const group = snapshotGroup(req.snapshot)
+    const listed = await listSnapshots(executor, deps, group)
+    if (!listed.ok) {
+      const notFound = listed.verdict === 'not-found'
+      reply.code(notFound ? 404 : 502)
+      return {
+        error: {
+          code: notFound ? 'NOT_FOUND' : 'UPSTREAM_ERROR',
+          reason: listed.verdict,
+          message: `Could not read '${group}' in repository '${req.repo}': ${listed.detail}`,
+        },
+      }
+    }
+    const entry = listed.data.find(s => s.snapshot === req.snapshot)
+    if (!entry) {
+      reply.code(404)
+      return {
+        error: {
+          code: 'NOT_FOUND',
+          message: `Snapshot '${req.snapshot}' is not in repository '${req.repo}'`
+            + `${deps.namespace ? ` namespace '${deps.namespace}'` : ''}.`,
+        },
+      }
+    }
+    const imageSize = imageArchiveSize(entry, req.archive)
+
+    // (5) THE size check. GT-42: nothing below ANAS does this, and the failure
+    // it prevents is silent and destructive in BOTH directions.
+    const targetSize = await readTargetSize(executor, lun)
+    if ('error' in targetSize) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'target-size-unknown',
+          message: `${targetSize.error}. A whole-image restore is refused when the target's exact size cannot `
+            + 'be read: the size equality is the only thing standing between this operation and a '
+            + 'half-overwritten LUN.',
+        },
+      }
+    }
+    const mismatch = assertSizeMatch(imageSize, targetSize.size, {
+      archive: req.archive,
+      targetPath: lun.backingPath,
+    })
+    if (mismatch) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'size-mismatch', message: mismatch } }
+    }
+
+    // (6) The entry gate: a live session is a hard 409 with no bypass. There is
+    // no confirmation that makes overwriting a block device an initiator has
+    // open and mounted safe from this side.
+    if (target.sessions.length > 0) {
+      const initiators = [...new Set(target.sessions.map(s => s.initiatorIqn))]
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'live-sessions',
+          message: `${initiators.length} initiator${initiators.length === 1 ? ' is' : 's are'} logged in to `
+            + `${target.iqn} right now: ${initiators.join(', ')}. Restoring an image over a LUN an initiator has `
+            + 'open would overwrite the device under a mounted filesystem, and neither LIO nor the initiator '
+            + 'would be told. Log the initiator(s) out first.',
+        },
+      }
+    }
+
+    // (7) The confirm gate. Everything above is a refusal; this is the one
+    // choice the operator is allowed to make, and the warnings say exactly what
+    // it costs.
+    const otherLuns = target.luns.filter(l => l.index !== lun.index).length
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'backup.restore.image',
+      params: { target: target.iqn, lun: lun.index },
+      message: `Restoring ${req.archive} from ${req.snapshot} over LUN ${lun.index} of ${target.iqn}`,
+      warnings: [
+        `This OVERWRITES ${lun.backingPath} completely — every byte currently on LUN ${lun.index} is replaced `
+        + `by the ${imageSize} bytes in the backup, and there is no undo.`,
+        `The WHOLE TARGET goes offline for the duration, not just this LUN: LIO's enable flag lives on the `
+        + `target portal group${otherLuns > 0 ? `, so its other ${otherLuns} LUN${otherLuns === 1 ? '' : 's'} are unreachable too` : ''}.`,
+        'Disabling refuses new logins and hides the target from discovery, so an initiator that auto-reconnects '
+        + '(open-iscsi, Windows) cannot come back mid-restore. It is re-enabled when the restore finishes.',
+        'If the restore fails part-way, the LUN holds a HALF-WRITTEN image and the target stays disabled until '
+        + 'you restore again or explicitly enable it.',
+      ],
+    })) {
+      return reply
+    }
+
+    // Disk space is NOT a consideration here, for either backing kind: the
+    // image is streamed in place over an object that is already exactly its
+    // size (that is what the equality check just proved), so nothing new is
+    // allocated. A sparse zvol or a sparse image file may of course consume
+    // more of its pool as the holes fill — that is a pool-capacity question,
+    // not a restore pre-flight one.
+    // The repo and its FRESH secret came back from `readDepsFor` above; nothing
+    // re-reads them, and neither ever leaves this scope.
+    const { repo, secret } = deps
+
+    // The journald audit params: what was restored, from where, onto which LUN.
+    // No secret and no repository credential ever rides here.
+    //
+    // The queue reads this object again when the job FINISHES, so the one fact
+    // that is not knowable at submit time — how many bytes actually reached the
+    // device — is filled in by the handler below and lands on the completion
+    // line. `imageBytes` is what the manifest promised; `bytesWritten` is what
+    // happened. A FAILED restore has no result to read it from — there the
+    // count rides the error message ("the image was partially written (N of M
+    // bytes reached …)"), which the audit line carries verbatim.
+    const auditParams: Record<string, unknown> = {
+      repo: repo.name,
+      ...(deps.namespace ? { namespace: deps.namespace } : {}),
+      snapshot: req.snapshot,
+      archive: req.archive,
+      target: target.iqn,
+      lun: lun.index,
+      backing: lun.backingPath,
+      imageBytes: imageSize as number,
+    }
+
+    const job = jobQueue.submit(
+      'backup.restore.image',
+      { ...identity, params: auditParams },
+      async updateProgress => withIscsiLock(async () => runImageRestore(
+        executor,
+        {
+          repo,
+          secret,
+          ...(deps.namespace ? { namespace: deps.namespace } : {}),
+          snapshot: req.snapshot,
+          archive: req.archive,
+          imageSize: imageSize as number,
+          target,
+          lun,
+          ...(req.rate ? { rate: req.rate } : {}),
+          env: buildBackupEnv(repo, secret),
+          readBack: async () => (await readIscsiState(executor, iscsiPaths)).targets,
+          mutate: {
+            executor,
+            configfsRoot: iscsiPaths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
+            progress: updateProgress,
+          },
+        },
+        updateProgress,
+      ).then((result) => {
+        auditParams.bytesWritten = result.bytesWritten
+        return result
+      })),
+    )
+
+    reply.code(202)
+    return { job }
+  }
 }
 
 /**

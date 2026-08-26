@@ -462,11 +462,24 @@ export function createServer(opts?: ServerOptions) {
   // iSCSI routes themselves. Defaults live in the service (the real host
   // locations); one env points them all at a materialised capture so no test
   // ever reads the kernel.
+  //
+  // `backingExists` is a TEST SEAM (story backup2.7): no test host has a
+  // `/dev/zvol/...` to stat, so without an override every LUN in every test
+  // reads `backingExists: false` and nothing that needs a PRESENT backing — the
+  // image restore above all — could be exercised through the routes at all.
+  // `ANAS_ISCSI_BACKING_PRESENT` is a colon-separated list of paths to report
+  // as present; anything else still gets the real `stat`.
+  const backingPresent = (process.env.ANAS_ISCSI_BACKING_PRESENT ?? '')
+    .split(':')
+    .filter(p => p.startsWith('/'))
   const iscsiPaths = {
     configfsRoot: process.env.ANAS_ISCSI_CONFIGFS,
     blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
     saveconfigPath: process.env.ANAS_ISCSI_SAVECONFIG,
     pveStorageCfg: process.env.ANAS_STORAGE_CFG,
+    ...(backingPresent.length > 0
+      ? { backingExists: async (path: string): Promise<boolean | null> => (backingPresent.includes(path) ? true : null) }
+      : {}),
   }
   server.register(fsRoutes, { prefix: '/v1' })
   server.register(jobRoutes, { prefix: '/v1', jobQueue })
@@ -502,6 +515,9 @@ export function createServer(opts?: ServerOptions) {
     prefix: '/v1',
     executor,
     jobQueue,
+    // backup2.7 — the whole-image LUN restore is a data-destroying op, so it
+    // rides the same 409 + X-Anas-Confirm-Code gate every other one does.
+    confirmStore,
     paths: backupReposPaths,
     systemdDir,
     iscsiPaths,

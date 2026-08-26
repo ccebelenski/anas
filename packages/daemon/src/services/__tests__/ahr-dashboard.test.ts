@@ -197,6 +197,10 @@ describe('collectAhrWarnings (fail-open source for GET /v1/status)', () => {
       pipeline: async () => {
         throw new Error('boom')
       },
+      // Interface parity (backup2.7 added the streaming exec); unused here.
+      execToStream: async () => {
+        throw new Error('boom')
+      },
     }
     assert.deepEqual(await collectAhrWarnings(throwing), [])
   })
@@ -439,6 +443,10 @@ describe('collectAhrPoolBriefs (fail-open source for GET /v1/status)', () => {
         throw new Error('boom')
       },
       pipeline: async () => {
+        throw new Error('boom')
+      },
+      // Interface parity (backup2.7 added the streaming exec); unused here.
+      execToStream: async () => {
         throw new Error('boom')
       },
     }

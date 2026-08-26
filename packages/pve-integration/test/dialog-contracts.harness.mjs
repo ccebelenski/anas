@@ -56,6 +56,15 @@
  *      And an `unresolved` LUN does NOT make its target hands-off: "not on this
  *      node right now" is not "somebody else's", and reading it that way would
  *      take away the very tools that fix it.
+ *   7. Whole-image LUN restore (story backup2.7): a backup image that is not
+ *      EXACTLY the size of the LUN is silently destructive below ANAS — larger
+ *      writes until the device is full and leaves the LUN half-overwritten,
+ *      smaller succeeds and leaves stale bytes past its end. So the dialog shows
+ *      both numbers, keeps Restore DEAD on a mismatch, and refuses again in the
+ *      submit handler; a pxar group is never offered at all; every point in time
+ *      travels as a FULL `<type>/<id>/<RFC3339>` (a bare group silently restores
+ *      the latest); and a live session or an absent backing greys the button
+ *      with the reason attached.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -371,6 +380,8 @@ function openWindow() {
 const warnings = []
 /** Every job the UI submitted: method, path and the exact body. */
 const jobs = []
+/** Every GET the UI issued, with its query — the read-contract record. */
+const apiGets = []
 
 function makeAnas(routes) {
   return {
@@ -405,8 +416,16 @@ function makeAnas(routes) {
     },
     api: {
       get(_node, path) {
+        // Recorded so a check can assert the exact QUERY a dialog sent — which
+        // is the whole contract for a two-call read like backup2.5's groups
+        // endpoint (`?ns=` for the groups, `?group=` for that group's points in
+        // time). A route value may be a FUNCTION of the full path for the same
+        // reason: one key, two answers.
+        apiGets.push(path)
         const key = `GET ${path.split('?')[0]}`
-        return key in routes ? Promise.resolve(routes[key]) : Promise.reject(new Error(`unexpected ${key}`))
+        if (!(key in routes)) { return Promise.reject(new Error(`unexpected ${key}`)) }
+        const value = routes[key]
+        return Promise.resolve(typeof value === 'function' ? value(path) : value)
       },
       post(_node, path, body) {
         const key = `POST ${path}`
@@ -2182,6 +2201,376 @@ async function iscsiUnresolvedLunChecks() {
   ok('unresolved: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+// ============================================================================
+//  7. Restore a LUN from a PBS backup — the size gate (story backup2.7)
+// ============================================================================
+//
+// The one thing this section exists to hold down: a backup image that is not
+// EXACTLY the size of the LUN is silently destructive below ANAS (a larger one
+// writes until the device is full and leaves the LUN half-overwritten, a
+// smaller one succeeds and leaves stale bytes past its end). The daemon refuses
+// a mismatch too — safety lives in the API — but a dialog that lets the button
+// be pressed and then explains why not is a dialog that failed.
+
+/** The repositories the restore dialog offers: both tiers, as the wizard sees them. */
+const RESTORE_REPOS = {
+  data: {
+    version: 3,
+    repos: [
+      { name: 'pbs-main', host: 'pbs.example', port: 8007, datastore: 'store', authType: 'token', namespace: 'anas', credentialsSet: true, source: 'anas' },
+      { name: 'pve:anastest', host: '10.0.0.9', port: 8007, datastore: 'anastest-store', authType: 'password', credentialsSet: true, source: 'pve' },
+    ],
+  },
+}
+
+const RESTORE_SNAP = 'host/gtimgboth/2026-08-25T19:28:38Z'
+const RESTORE_SNAP_OLD = 'host/gtimgboth/2026-08-24T19:28:38Z'
+
+/**
+ * backup2.5's groups endpoint answers in TWO shapes from one path, so the
+ * fixture is a function of the query — which is also how the two-call contract
+ * gets asserted at all.
+ *
+ * Without `?group=`: the namespace's GROUPS, each carrying its classified
+ * filenames. `host/etc-only` holds only a pxar and must never be offered — a
+ * tree cannot restore a block device.
+ *
+ * With `?group=`: that group's POINTS IN TIME, in the same `BackupSnapshot`
+ * shape the task endpoint uses. `gtimgboth` holds two images: one exactly the
+ * LUN's 2 GiB and one a mismatched 1 GiB.
+ */
+const RESTORE_GROUP_LIST = {
+  data: {
+    verdict: 'ok',
+    repository: 'pbs-main',
+    namespace: 'anas',
+    groups: [
+      {
+        group: 'host/gtimgboth',
+        backupType: 'host',
+        backupId: 'gtimgboth',
+        backupCount: 2,
+        lastBackup: 1787686118,
+        lastBackupIso: '2026-08-25T19:28:38Z',
+        files: [
+          { filename: 'vol.img.fidx', archive: 'vol.img', kind: 'img', size: 2 * GiB_ },
+          { filename: 'small.img.fidx', archive: 'small.img', kind: 'img', size: GiB_ },
+          { filename: 'index.json.blob', kind: 'other', size: 368 },
+        ],
+      },
+      {
+        group: 'host/etc-only',
+        backupType: 'host',
+        backupId: 'etc-only',
+        backupCount: 1,
+        lastBackupIso: '2026-08-25T02:00:00Z',
+        files: [
+          { filename: 'etc.pxar.didx', archive: 'etc.pxar', kind: 'pxar', size: 1234 },
+          { filename: 'catalog.pcat1.didx', kind: 'other', size: 99 },
+        ],
+      },
+    ],
+  },
+}
+
+const RESTORE_GROUP_SNAPSHOTS = {
+  data: {
+    verdict: 'ok',
+    repository: 'pbs-main',
+    namespace: 'anas',
+    group: 'host/gtimgboth',
+    groups: [],
+    snapshots: [
+      {
+        snapshot: RESTORE_SNAP,
+        backupType: 'host',
+        backupId: 'gtimgboth',
+        backupTime: 1787686118,
+        backupTimeIso: '2026-08-25T19:28:38Z',
+        files: [
+          { filename: 'vol.img.fidx', archive: 'vol.img', kind: 'img', size: 2 * GiB_ },
+          { filename: 'small.img.fidx', archive: 'small.img', kind: 'img', size: GiB_ },
+          { filename: 'index.json.blob', kind: 'other', size: 368 },
+        ],
+      },
+      {
+        snapshot: RESTORE_SNAP_OLD,
+        backupType: 'host',
+        backupId: 'gtimgboth',
+        backupTime: 1787599718,
+        backupTimeIso: '2026-08-24T19:28:38Z',
+        files: [
+          { filename: 'vol.img.fidx', archive: 'vol.img', kind: 'img', size: 2 * GiB_ },
+          // A tree archive whose NAME ends in `.img` — the KIND decides, so it
+          // must not reach the archive list.
+          { filename: 'weird.img.pxar.didx', archive: 'weird.img.pxar', kind: 'pxar', size: 77 },
+        ],
+      },
+    ],
+  },
+}
+
+const RESTORE_ROUTES = {
+  ...ISCSI_ROUTES,
+  'GET /backup/repos': RESTORE_REPOS,
+  'GET /backup/repos/pbs-main/groups': path => (
+    /[?&]group=/.test(path) ? RESTORE_GROUP_SNAPSHOTS : RESTORE_GROUP_LIST
+  ),
+}
+
+/** Open the LUNs window, select LUN 0 (the 2 GiB zvol), open Restore. */
+async function openRestoreDialog(routes = RESTORE_ROUTES) {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { view, grid } = await openIscsiView(routes)
+  const lunsWin = await openLuns(grid, routes)
+  const lunsGrid = lunsWin.down('#lunsGrid')
+  lunsGrid.selectRow(0)
+  const btn = lunsGrid.down('#lunRestore')
+  btn.handler(btn)
+  await settle()
+  return { view, grid, lunsWin, lunsGrid, dlg: openWindow() }
+}
+
+async function iscsiRestoreGatingChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { grid } = await openIscsiView(RESTORE_ROUTES)
+  const lunsWin = await openLuns(grid, RESTORE_ROUTES)
+  const lunsGrid = lunsWin.down('#lunsGrid')
+
+  let state = toolbar(lunsGrid, ['lunRestore'])
+  ok('restore: the button exists and needs a selection', state.lunRestore !== null
+    && state.lunRestore.disabled === true)
+
+  lunsGrid.selectRow(0)
+  state = toolbar(lunsGrid, ['lunRestore'])
+  ok('restore: a zvol LUN with a present backing and a known size is restorable',
+    state.lunRestore.disabled === false, state.lunRestore.tip)
+
+  ok('restore: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiRestoreSessionAndUnresolvedChecks() {
+  // A live session is the ENTRY GATE: overwriting a block device an initiator
+  // has open and mounted is not a thing a confirmation can make safe.
+  ajax.responses = { '/network': PVE_NETWORK }
+  const sessionRoutes = {
+    ...RESTORE_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: iscsiDetail({ session: true }) },
+  }
+  let { grid } = await openIscsiView(sessionRoutes)
+  let lunsWin = await openLuns(grid, sessionRoutes)
+  let lunsGrid = lunsWin.down('#lunsGrid')
+  lunsGrid.selectRow(0)
+  let state = toolbar(lunsGrid, ['lunRestore'])
+  ok('restore(session): DISABLED under a live session', state.lunRestore.disabled === true)
+  ok('restore(session): and says the write would land under a mounted filesystem',
+    /under a mounted filesystem/.test(state.lunRestore.tip), state.lunRestore.tip)
+
+  // A backing that is not on this node has nothing to restore ONTO.
+  created.windows.length = 0
+  const detail = iscsiDetail()
+  detail.luns[1] = { ...detail.luns[1], kind: 'unresolved', backingExists: false, present: false }
+  const unresolvedRoutes = {
+    ...RESTORE_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: detail },
+  }
+  ;({ grid } = await openIscsiView(unresolvedRoutes))
+  lunsWin = await openLuns(grid, unresolvedRoutes)
+  lunsGrid = lunsWin.down('#lunsGrid')
+  lunsGrid.selectRow(1)
+  state = toolbar(lunsGrid, ['lunRestore'])
+  ok('restore(unresolved): DISABLED — there is nothing on this node to write to',
+    state.lunRestore.disabled === true)
+  ok('restore(unresolved): and points at Repair',
+    /Repair/.test(state.lunRestore.tip), state.lunRestore.tip)
+
+  // A LUN whose size ANAS cannot read cannot be size-checked, so it cannot be
+  // restored: the equality IS the guard.
+  created.windows.length = 0
+  const noSize = iscsiDetail()
+  noSize.luns[0] = { ...noSize.luns[0], size: null }
+  const noSizeRoutes = {
+    ...RESTORE_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: noSize },
+  }
+  ;({ grid } = await openIscsiView(noSizeRoutes))
+  lunsWin = await openLuns(grid, noSizeRoutes)
+  lunsGrid = lunsWin.down('#lunsGrid')
+  lunsGrid.selectRow(0)
+  state = toolbar(lunsGrid, ['lunRestore'])
+  ok('restore(no size): DISABLED — without the LUN size there is no equality to check',
+    state.lunRestore.disabled === true)
+  ok('restore(no size): and says a mismatch is silently destructive',
+    /silently destructive/.test(state.lunRestore.tip), state.lunRestore.tip)
+
+  ok('restore gating: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiRestoreDialogChecks() {
+  const { dlg } = await openRestoreDialog()
+  ok('restore dialog: it opened', !!dlg && !!dlg.down('#repo'))
+  if (!dlg) { return }
+
+  // Both repository tiers are offered, and a PVE-discovered one is labelled.
+  const repos = dlg.down('#repo').getStore().getRange().map(r => r.get('value'))
+  eq('restore: both repository tiers are offered', repos, ['pbs-main', 'pve:anastest'])
+  ok('restore: a PVE-discovered repository says so',
+    /from Proxmox storage/.test(dlg.down('#repo').getStore().getAt(1).get('label')))
+  eq('restore: a repository that carries a namespace pre-fills it',
+    dlg.down('#ns').getValue(), 'anas')
+
+  // Nothing is chosen yet, so nothing can be restored.
+  ok('restore: the Restore button starts DEAD',
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit').disabled === true)
+
+  // --- CALL 1: the namespace's groups --------------------------------------
+  apiGets.length = 0
+  const load = dlg.down('#loadGroups')
+  load.handler(load)
+  await settle()
+
+  const groupCall = apiGets.find(u => u.includes('/groups'))
+  ok('restore: the group listing carries the namespace and NO group',
+    /[?&]ns=anas/.test(groupCall) && !/[?&]group=/.test(groupCall), groupCall)
+
+  // A pxar-only group is NEVER offered: a tree cannot restore a block device,
+  // and the filter reads backup2.5's classified `kind`, not the filename.
+  const groups = dlg.down('#group').getStore().getRange().map(r => r.get('value'))
+  eq('restore: only groups holding an .img archive are offered', groups, ['host/gtimgboth'])
+
+  // --- CALL 2: that group's points in time ---------------------------------
+  apiGets.length = 0
+  dlg.down('#group').setValue('host/gtimgboth')
+  await settle()
+
+  const snapCall = apiGets.find(u => u.includes('group='))
+  ok('restore: choosing a group asks the SAME endpoint for its points in time',
+    /\/backup\/repos\/pbs-main\/groups\?group=host%2Fgtimgboth/.test(snapCall), snapCall)
+  ok('restore: and carries the namespace with it', /[?&]ns=anas/.test(snapCall), snapCall)
+
+  const snaps = dlg.down('#snapshot').getStore().getRange().map(r => r.get('value'))
+  eq('restore: every point in time is a FULL <type>/<id>/<RFC3339> id',
+    snaps, [RESTORE_SNAP, RESTORE_SNAP_OLD])
+  for (const s of snaps) {
+    ok('restore: never a bare group path (which silently restores the latest)',
+      /^[a-z]+\/[^/]+\/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(s), s)
+  }
+
+  dlg.down('#snapshot').setValue(RESTORE_SNAP)
+  await settle()
+  const archives = dlg.down('#archive').getStore().getRange().map(r => r.get('value'))
+  eq('restore: the archive list is the .img files, named as pbc takes them',
+    archives, ['vol.img', 'small.img'])
+
+  // The KIND decides, never the filename: a pxar called `weird.img.pxar` is a
+  // tree and must not be offered to a block restore.
+  dlg.down('#snapshot').setValue(RESTORE_SNAP_OLD)
+  await settle()
+  eq('restore: a pxar whose NAME ends in .img is never offered as an image',
+    dlg.down('#archive').getStore().getRange().map(r => r.get('value')), ['vol.img'])
+
+  ok('restore dialog: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiRestoreVerdictChecks() {
+  // backup2.5's reads answer 200 with a VERDICT: a PBS-side problem is a
+  // DIAGNOSIS the screen shows verbatim, never a bare failure and never an
+  // empty combo that explains nothing.
+  const routes = {
+    ...RESTORE_ROUTES,
+    'GET /backup/repos/pbs-main/groups': {
+      data: {
+        verdict: 'unreachable',
+        detail: 'Could not reach the PBS server (the connection was refused).',
+        repository: 'pbs-main',
+        groups: [],
+      },
+    },
+  }
+  const { dlg } = await openRestoreDialog(routes)
+  if (!dlg) { return }
+  const load = dlg.down('#loadGroups')
+  load.handler(load)
+  await settle()
+  ok('verdict: the PBS-side detail is shown verbatim',
+    warnings.some(w => /connection was refused/.test(w)), warnings.join(' | '))
+  eq('verdict: and no group is offered', dlg.down('#group').getStore().getCount(), 0)
+  ok('verdict: Restore stays DEAD',
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit').disabled === true)
+  warnings.length = 0
+}
+
+async function iscsiRestoreSizeGateChecks() {
+  const { dlg, lunsWin } = await openRestoreDialog()
+  if (!dlg) { return }
+  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit')
+
+  const load = dlg.down('#loadGroups')
+  load.handler(load)
+  await settle()
+  dlg.down('#group').setValue('host/gtimgboth')
+  await settle()
+  dlg.down('#snapshot').setValue(RESTORE_SNAP)
+  await settle()
+
+  // --- MISMATCH: a 1 GiB image onto the 2 GiB LUN --------------------------
+  dlg.down('#archive').setValue('small.img')
+  await settle()
+  ok('size gate: a mismatch DISABLES Restore', submit.disabled === true)
+  ok('size gate: and says which way it is wrong',
+    /SMALLER/.test(dlg.down('#sizeVerdict').html), dlg.down('#sizeVerdict').html)
+  ok('size gate: and names the stale-tail consequence',
+    /stale bytes/.test(dlg.down('#sizeVerdict').html), dlg.down('#sizeVerdict').html)
+  ok('size gate: both numbers are on screen',
+    /1073741824 B/.test(dlg.down('#sizeVerdict').html)
+    && /2147483648 B/.test(dlg.down('#sizeVerdict').html),
+    dlg.down('#sizeVerdict').html)
+
+  // Pressing it anyway sends NOTHING (the button is dead, and the handler
+  // refuses independently — safety is not one check deep).
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('size gate: a mismatch sends NOTHING', jobs.length, 0)
+  ok('size gate: and says why', warnings.some(w => /Size mismatch/.test(w)), warnings.join(' | '))
+  warnings.length = 0
+
+  // --- MATCH: the 2 GiB image ---------------------------------------------
+  dlg.down('#archive').setValue('vol.img')
+  await settle()
+  ok('size gate: an exact match ENABLES Restore', submit.disabled === false)
+  ok('size gate: and says so',
+    /exactly the size of this LUN/.test(dlg.down('#sizeVerdict').html), dlg.down('#sizeVerdict').html)
+
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('restore: one request', jobs.length, 1)
+  eq('restore: it POSTs the image-kind restore', [jobs[0].method, jobs[0].path],
+    ['post', '/backup/restore'])
+  eq('restore: the body names the repo, namespace, FULL snapshot, .img archive and the LUN',
+    jobs[0].body, {
+      kind: 'image',
+      repo: 'pbs-main',
+      snapshot: RESTORE_SNAP,
+      archive: 'vol.img',
+      lun: { targetIqn: ISCSI_IQN, index: 0 },
+      ns: 'anas',
+    })
+  ok('restore: it goes through the danger idiom (409 + confirm code)',
+    jobs[0].confirmWindow === true)
+  ok('restore: the LUNs window is still there to refresh', !!lunsWin)
+
+  // A blank namespace sends NO key at all — the repository's own then stands.
+  jobs.length = 0
+  dlg.down('#ns').setValue('')
+  submit.handler(submit)
+  await settle()
+  ok('restore: a blank namespace sends no ns key', !('ns' in jobs[0].body), JSON.stringify(jobs[0].body))
+
+  ok('size gate: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 async function iscsiAddressFallbackChecks() {
   // PVE's network API is unreadable: the picker must degrade to a free-text
   // field rather than leaving the operator with no way to enter an address.
@@ -3107,6 +3496,12 @@ for (const check of [
   heldByLunMountChecks,
   iscsiBackingOwnerChecks,
   iscsiPortalWarningChecks,
+  // Story backup2.7 — the whole-image restore's size gate and its refusals.
+  iscsiRestoreGatingChecks,
+  iscsiRestoreSessionAndUnresolvedChecks,
+  iscsiRestoreDialogChecks,
+  iscsiRestoreVerdictChecks,
+  iscsiRestoreSizeGateChecks,
 ]) {
   warnings.length = 0
   // `created.windows` is module-global; a dialog a previous section left open

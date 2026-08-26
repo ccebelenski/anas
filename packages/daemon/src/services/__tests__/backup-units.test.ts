@@ -1,5 +1,5 @@
 import type { BackupTask } from '@anas/shared'
-import type { CommandExecutor, ExecResult, PipelineResult } from '../../executor/types.js'
+import type { CommandExecutor, ExecResult, ExecStreamResult, PipelineResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -650,6 +650,12 @@ class ScriptedExecutor implements CommandExecutor {
 
   async pipeline(): Promise<PipelineResult> {
     return { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: '' }
+  }
+
+  /** Interface parity only — nothing in the units path streams to a device. */
+  async execToStream(command: string, args: string[]): Promise<ExecStreamResult> {
+    this.calls.push({ command, args })
+    return { stderr: '', exitCode: 0, bytesWritten: 0 }
   }
 }
 

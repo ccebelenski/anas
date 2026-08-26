@@ -1502,3 +1502,139 @@ export const BackupBrowseResult = z.object({
   warnings: z.array(z.string()).default([]),
 })
 export type BackupBrowseResult = z.infer<typeof BackupBrowseResult>
+
+// ---- Restore: the WHOLE-IMAGE branch (story backup2.7) ---------------------
+//
+// Restore is two types BY NATURE — files are SELECTIVE, block images are WHOLE
+// — and this block is the whole half. The READ side (groups, points in time,
+// archive browse) is backup2.5's above: ONE picker, one parser, two doors, and
+// this block adds only what it takes to write an image BACK.
+//
+// GROUND TRUTH that shapes these types (`docs/BACKUP-RESTORE-GROUND-TRUTH.md`):
+//   - GT-39: `restore` REFUSES every existing target — a regular file, the
+//     `/dev/zvol/<pool>/<vol>` symlink and the resolved `/dev/zdNN` alike — and
+//     `--overwrite` does not help. So the target is NEVER an argv path: the
+//     archive is streamed to stdout (`-`) and ANAS opens the device/file itself.
+//   - GT-42: a size mismatch is UNGUARDED AND DESTRUCTIVE below ANAS. A larger
+//     image writes until `No space left on device` and leaves the target
+//     half-overwritten; a smaller one succeeds and leaves stale tail bytes. The
+//     equality pre-check is therefore ANAS's own, and it is a REFUSAL rather
+//     than a warning.
+//   - GT-57: a bare group path silently restores the LATEST snapshot, so
+//     `snapshot` here is always a FULL `<type>/<id>/<RFC3339 time>`.
+//   - GT-59: progress arrives on STDERR, CR-terminated, at a roughly DOUBLING
+//     interval — silence is not a stall.
+
+/**
+ * The `.img` suffix a whole-image archive name must carry. pbc rejects an
+ * unknown suffix outright (`failed to parse archive type for 'data.zzz'`,
+ * GT-56), so validating it here turns a 255 into a 400 with a sentence.
+ */
+export const IMG_ARCHIVE_SUFFIX = '.img'
+
+/** An archive name as pbc takes it on the restore command line. */
+export const BackupArchiveName = z
+  .string()
+  .min(1)
+  .max(160)
+  .regex(/^[\w.-]+$/, 'letters, digits, dots, underscores and dashes')
+export type BackupArchiveName = z.infer<typeof BackupArchiveName>
+
+/**
+ * A FULL snapshot path: `<type>/<id>/<RFC3339 time>`.
+ *
+ * The three-segment shape is enforced rather than assumed because a two-segment
+ * group path is NOT an error to pbc — it silently restores the latest snapshot
+ * (GT-57). "Restore the newest one" is a different operation from the one the
+ * operator picked in a dialog, and it must never happen by omission.
+ */
+export const BackupSnapshotPath = z
+  .string()
+  .min(1)
+  .max(256)
+  .regex(
+    /^[a-z]+\/[\w.:-]+\/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/,
+    'a full <type>/<id>/<RFC3339 time> path — a bare group silently restores the latest snapshot',
+  )
+export type BackupSnapshotPath = z.infer<typeof BackupSnapshotPath>
+
+/**
+ * `POST /v1/backup/restore` — the WHOLE-IMAGE branch (`kind: 'image'`).
+ *
+ * The destination is named as a LUN, not as a path: the whole point of the
+ * operation is that LIO stops serving the block object while it is rewritten,
+ * and a bare path could not express which target has to go offline.
+ */
+export const BackupImageRestoreRequest = z.object({
+  kind: z.literal('image'),
+  repo: BackupRepoRef,
+  /** Namespace; absent falls back to the repository's own. */
+  ns: z.string().max(256).optional(),
+  snapshot: BackupSnapshotPath,
+  /** The `.img` archive within that snapshot. */
+  archive: BackupArchiveName.refine(
+    n => n.endsWith(IMG_ARCHIVE_SUFFIX),
+    'a whole-image restore needs an .img archive',
+  ),
+  /** Which LUN to write back — the target it belongs to goes offline for the run. */
+  lun: BackupLunRef,
+  /**
+   * pbc's `--rate` (e.g. `50MB`), emitted ONLY when asked for. GT-62: it limits
+   * TRANSFERRED bytes, not logical ones, so a sparse image finishes far faster
+   * than the archive size suggests.
+   */
+  rate: z.string().max(32).optional(),
+})
+export type BackupImageRestoreRequest = z.infer<typeof BackupImageRestoreRequest>
+
+/**
+ * The FILE branch is `backup2.6`'s and is NOT built. It is in the union anyway,
+ * carrying nothing but its discriminator, so a client that sends it gets a 400
+ * saying "not yet available" instead of a schema error about an unknown `kind`
+ * — a half-built files restore would be far worse than an honest refusal.
+ */
+export const BackupFilesRestoreRequest = z.object({
+  kind: z.literal('files'),
+})
+export type BackupFilesRestoreRequest = z.infer<typeof BackupFilesRestoreRequest>
+
+export const BackupRestoreRequest = z.discriminatedUnion('kind', [
+  BackupImageRestoreRequest,
+  BackupFilesRestoreRequest,
+])
+export type BackupRestoreRequest = z.infer<typeof BackupRestoreRequest>
+
+/**
+ * The result of a whole-image restore job.
+ *
+ * `complete: false` is the state that matters most: a mid-stream failure leaves
+ * BYTES ON THE DEVICE with no marker of any kind (GT-60 shows pxar leaves none
+ * for a tree; a block device has even less to mark with), so the job says it in
+ * words and the target is deliberately LEFT DISABLED. Re-enabling it is an
+ * explicit `POST /v1/iscsi/targets/:iqn/state {action:'enable'}` — the
+ * operator's acknowledgement that a half-written LUN is not to be served.
+ */
+export const BackupImageRestoreResult = z.object({
+  snapshot: z.string(),
+  archive: z.string(),
+  targetIqn: z.string(),
+  lunIndex: z.number().int().nonnegative(),
+  /** The device or file the image was streamed into. */
+  targetPath: AbsolutePath,
+  /** The image's size from the manifest — equal to the target's, by pre-check. */
+  imageSize: z.number().int().nonnegative(),
+  /** Bytes ANAS's own write stream put on the target. */
+  bytesWritten: z.number().int().nonnegative(),
+  /** Did the whole image land? `false` ⇒ the target holds a half-written image. */
+  complete: z.boolean(),
+  /** The half-written state, spelled out. Present only when `complete` is false. */
+  partial: z.string().optional(),
+  /** Did ANAS disable the target's TPG, and did it get re-enabled? */
+  targetDisabled: z.boolean(),
+  targetReEnabled: z.boolean(),
+  /** pbc's own `restore complete (…)` line, when it printed one. */
+  duration: z.string().optional(),
+  /** Serial + attribute read-back, and anything else worth saying. */
+  warnings: z.array(z.string()).optional(),
+})
+export type BackupImageRestoreResult = z.infer<typeof BackupImageRestoreResult>

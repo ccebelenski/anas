@@ -85,6 +85,8 @@ describe('syncZfsImportUnit — best-effort enable/disable', () => {
         throw new Error('boom')
       },
       pipeline: async () => ({ leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: '' }),
+      // Interface parity (backup2.7 added the streaming exec); unused here.
+      execToStream: async () => ({ stderr: '', exitCode: 1, bytesWritten: 0 }),
     }
     const warning = await syncZfsImportUnit(throwing, 'tank', 'enable')
     assert.ok(typeof warning === 'string' && warning.includes('boom'))

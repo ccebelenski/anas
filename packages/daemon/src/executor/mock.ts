@@ -1,4 +1,12 @@
-import type { CommandExecutor, ExecOptions, ExecResult, PipelineResult } from './types.js'
+import type {
+  CommandExecutor,
+  ExecOptions,
+  ExecResult,
+  ExecStreamOptions,
+  ExecStreamResult,
+  ExecStreamTarget,
+  PipelineResult,
+} from './types.js'
 
 /** A canned response for a specific command + args pattern. */
 export interface MockFixture {
@@ -35,6 +43,23 @@ export interface MockPipelineCall {
   args2: string[]
 }
 
+/** A canned response for a streaming exec (story backup2.7). */
+export interface MockStreamFixture {
+  command: string
+  /** Args pattern to match. If omitted, matches any args for this command. */
+  args?: string[]
+  result: ExecStreamResult
+  /** Simulate a process that could not start / a target that could not open. */
+  throws?: Error
+}
+
+/** A recorded streaming invocation — argv PLUS where the bytes were headed. */
+export interface MockStreamCall {
+  command: string
+  args: string[]
+  target: ExecStreamTarget
+}
+
 /**
  * Mock executor — returns fixture data for development and testing.
  *
@@ -44,12 +69,16 @@ export interface MockPipelineCall {
 export class MockExecutor implements CommandExecutor {
   private fixtures: MockFixture[] = []
   private pipelineFixtures: MockPipelineFixture[] = []
+  private streamFixtures: MockStreamFixture[] = []
 
   /** Every exec() call made, in order — tests assert the exact argv here. */
   readonly calls: { command: string, args: string[] }[] = []
 
   /** Every pipeline() call made, in order — tests assert the exact argv here. */
   readonly pipelineCalls: MockPipelineCall[] = []
+
+  /** Every execToStream() call, in order — argv AND the target descriptor. */
+  readonly streamCalls: MockStreamCall[] = []
 
   /** Register a fixture. More specific matches (with args) take priority. */
   addFixture(fixture: MockFixture): this {
@@ -63,12 +92,20 @@ export class MockExecutor implements CommandExecutor {
     return this
   }
 
+  /** Register a streaming fixture. Unmatched streams answer "not found" (127). */
+  addStreamFixture(fixture: MockStreamFixture): this {
+    this.streamFixtures.push(fixture)
+    return this
+  }
+
   /** Clear all fixtures (including pipeline fixtures and recorded calls). */
   clearFixtures(): void {
     this.fixtures = []
     this.pipelineFixtures = []
+    this.streamFixtures = []
     this.calls.length = 0
     this.pipelineCalls.length = 0
+    this.streamCalls.length = 0
   }
 
   async exec(command: string, args: string[], _opts?: ExecOptions): Promise<ExecResult> {
@@ -123,5 +160,45 @@ export class MockExecutor implements CommandExecutor {
 
     // Default: both sides succeed (like the command-only exec fallbacks).
     return { leftExitCode: 0, rightExitCode: 0, leftStderr: '', rightStderr: '', stdout: '' }
+  }
+
+  /**
+   * Streaming exec (story backup2.7). NOTHING is written anywhere — the mock
+   * records the argv AND the target descriptor so a test can assert the exact
+   * path and open flags a real restore would have used, which is the whole
+   * safety property: `O_WRONLY` on a device (never `O_TRUNC`) and `'w'` on an
+   * image file (same inode, rewritten in place).
+   *
+   * The call also lands in `calls` so a test can assert the ORDER of the whole
+   * sequence — disable, restore, enable — in one list.
+   */
+  async execToStream(
+    command: string,
+    args: string[],
+    target: ExecStreamTarget,
+    opts?: ExecStreamOptions,
+  ): Promise<ExecStreamResult> {
+    this.calls.push({ command, args })
+    this.streamCalls.push({ command, args, target })
+
+    const match = this.streamFixtures.find(
+      f => f.command === command
+        && (f.args === undefined
+          || (f.args.length === args.length && f.args.every((a, i) => a === args[i]))),
+    )
+    if (!match) {
+      return {
+        stderr: `mock: command not found: ${command}`,
+        exitCode: 127,
+        bytesWritten: 0,
+      }
+    }
+    if (match.throws)
+      throw match.throws
+    // Replay the stderr through the progress sink the same way a live child
+    // would — the parser under test then sees exactly the real bytes.
+    if (match.result.stderr && opts?.onStderr)
+      opts.onStderr(match.result.stderr)
+    return match.result
   }
 }

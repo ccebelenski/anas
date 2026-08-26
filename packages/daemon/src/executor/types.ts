@@ -25,6 +25,49 @@ export interface PipelineResult {
   stdout: string
 }
 
+/**
+ * Where a streaming exec sends the child's STDOUT (story backup2.7).
+ *
+ * The whole reason this exists is GT-39: `proxmox-backup-client restore` REFUSES
+ * every existing target — a regular file, the `/dev/zvol/<pool>/<vol>` symlink
+ * and the resolved `/dev/zdNN` alike — and `--overwrite` does not help. The one
+ * working path to an existing block object is `restore … -` with the caller
+ * owning the destination file descriptor (GT-40), which is exactly what this is.
+ */
+export interface ExecStreamTarget {
+  /** Absolute path the child's stdout is written into. */
+  path: string
+  /**
+   * open(2) flags for that path, as `fs.createWriteStream` takes them.
+   *
+   * A BLOCK DEVICE gets the numeric `O_WRONLY` — never `'w'`, whose `O_CREAT |
+   * O_TRUNC` says something meaningless about a device node and would be a lie
+   * about intent. A regular image FILE gets `'w'`, which rewrites it in place:
+   * the inode is kept (open+truncate, not unlink+create) so the LIO fileio
+   * backstore keeps pointing at the same object and never has to be recreated.
+   */
+  flags: string | number
+}
+
+/** Result of a streaming exec: the usual, plus what actually reached the target. */
+export interface ExecStreamResult {
+  stderr: string
+  exitCode: number
+  /** Bytes the write stream put on the target — the partial-write evidence. */
+  bytesWritten: number
+}
+
+/** Optional options for a streaming exec. */
+export interface ExecStreamOptions extends ExecOptions {
+  /**
+   * Called with each chunk of the child's STDERR as it arrives. pbc emits its
+   * restore progress there, CR-terminated, at a roughly doubling interval
+   * (GT-59), so a job that wants live progress has to read it as it comes
+   * rather than waiting for the process to exit.
+   */
+  onStderr?: (chunk: string) => void
+}
+
 /** Optional execution options. */
 export interface ExecOptions {
   /**
@@ -76,4 +119,29 @@ export interface CommandExecutor {
    * @param args2 - Consumer arguments as an array
    */
   pipeline: (cmd1: string, args1: string[], cmd2: string, args2: string[]) => Promise<PipelineResult>
+
+  /**
+   * Execute a command with its STDOUT streamed straight into a file or device
+   * ANAS opens itself (story backup2.7).
+   *
+   * NO SHELL and NO redirect string — the child is spawned directly (argv
+   * array) and its stdout is piped into an `fs.createWriteStream` on `target`.
+   * That is the difference between this and {@link exec}: `exec` buffers stdout
+   * in memory, which is impossible for a multi-gigabyte block image, and it has
+   * nowhere to put it anyway.
+   *
+   * The stream is FSYNCED before the promise resolves: a restore that returned
+   * with data still in the page cache would call a LUN restored while a power
+   * loss could still lose the tail of it.
+   *
+   * Resolves with the exit code, the buffered stderr, and the byte count the
+   * stream actually wrote (the evidence for a partial write); rejects only if
+   * the process fails to start or the target cannot be opened.
+   */
+  execToStream: (
+    command: string,
+    args: string[],
+    target: ExecStreamTarget,
+    opts?: ExecStreamOptions,
+  ) => Promise<ExecStreamResult>
 }

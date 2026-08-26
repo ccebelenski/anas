@@ -8,7 +8,7 @@
  */
 
 import type { IscsiHealth } from '@anas/shared'
-import type { CommandExecutor, ExecResult, PipelineResult } from '../../executor/types.js'
+import type { CommandExecutor, ExecResult, ExecStreamResult, PipelineResult } from '../../executor/types.js'
 import type { IscsiPaths } from '../iscsi.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
@@ -56,6 +56,10 @@ function executor(addresses: string[] | null = ['192.168.200.50']): CommandExecu
     },
     async pipeline(): Promise<PipelineResult> {
       return { leftExitCode: 1, rightExitCode: 1, leftStderr: '', rightStderr: '', stdout: '' }
+    },
+    // Interface parity (backup2.7 added the streaming exec); unused here.
+    async execToStream(): Promise<ExecStreamResult> {
+      return { stderr: '', exitCode: 1, bytesWritten: 0 }
     },
   }
 }
@@ -261,6 +265,9 @@ describe('collectIscsiWarnings — fail-open, against the real captures', () => 
         throw new Error('boom')
       },
       async pipeline(): Promise<PipelineResult> {
+        throw new Error('boom')
+      },
+      async execToStream(): Promise<ExecStreamResult> {
         throw new Error('boom')
       },
     }

@@ -55,6 +55,17 @@ export interface IscsiPaths {
   saveconfigPath?: string
   /** PVE's storage.cfg; defaults to `/etc/pve/storage.cfg`. */
   pveStorageCfg?: string
+  /**
+   * Does a backing path resolve on this node right now? Defaults to a real
+   * `stat` (ENOENT/ENOTDIR ⇒ `false`, anything else ⇒ `null` = not known).
+   *
+   * A TEST SEAM, the same shape `backup-zvol.ts` already uses for the snapshot
+   * device node: no test host has a `/dev/zvol/...` to stat, so without this
+   * every LUN in every test reads `backingExists: false` and nothing that
+   * depends on a present backing (backup2.7's restore, above all) could ever be
+   * exercised through the routes.
+   */
+  backingExists?: (path: string) => Promise<boolean | null>
 }
 
 /** Everything one iSCSI read needs, gathered once and shared by all four routes. */
@@ -69,6 +80,12 @@ export interface IscsiReadContext {
    * `carriedByInterface` is nullable (GT-24 says LIO will never tell us).
    */
   nodeAddresses: Set<string> | null
+  /**
+   * The backing-existence probe {@link buildIscsiTargets} uses, carried on the
+   * context so it reaches the builder (which takes no paths). Absent = the real
+   * `stat`. See {@link IscsiPaths.backingExists}.
+   */
+  backingExists?: (path: string) => Promise<boolean | null>
 }
 
 /**
@@ -149,7 +166,7 @@ export async function readNodeAddresses(executor: CommandExecutor): Promise<Set<
 }
 
 /** Does a backing path resolve right now? Null when the check itself failed. */
-async function backingExists(path: string): Promise<boolean | null> {
+async function statBackingExists(path: string): Promise<boolean | null> {
   if (!path.startsWith('/'))
     return null
   try {
@@ -186,6 +203,7 @@ export async function readIscsiContext(
     persisted,
     inputs: { pveStorages: new Map(), zfsMountpoints: [] },
     nodeAddresses: null,
+    ...(paths.backingExists ? { backingExists: paths.backingExists } : {}),
   }
 
   const hasTargets = live.targets.length > 0 || (persisted?.targets.length ?? 0) > 0
@@ -221,7 +239,13 @@ export async function readIscsiContext(
     }
   }
 
-  return { live, persisted, inputs, nodeAddresses }
+  return {
+    live,
+    persisted,
+    inputs,
+    nodeAddresses,
+    ...(paths.backingExists ? { backingExists: paths.backingExists } : {}),
+  }
 }
 
 /** Every distinct backing path either source knows about. */
@@ -415,7 +439,7 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
       // when it is actually THERE. When it is not, it is `unresolved` — the
       // boot-restore hole — and that must not cost the target its ownership
       // (story `iscsi.5`, live-proof F2).
-      const exists = backingPath ? await backingExists(backingPath) : null
+      const exists = backingPath ? await (ctx.backingExists ?? statBackingExists)(backingPath) : null
       const classification = classifyBacking(backingPath, ctx.inputs, exists)
 
       const lun: IscsiLun = {
