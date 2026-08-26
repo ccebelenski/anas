@@ -1200,8 +1200,8 @@ export type BackupTaskDetail = z.infer<typeof BackupTaskDetail>
  *   `other` — the snapshot's bookkeeping: `catalog.pcat1.didx`,
  *             `index.json.blob`. Never a restore target the picker offers.
  */
-export const BackupArchiveKind = z.enum(['pxar', 'img', 'other'])
-export type BackupArchiveKind = z.infer<typeof BackupArchiveKind>
+export const BackupSnapshotFileKind = z.enum(['pxar', 'img', 'other'])
+export type BackupSnapshotFileKind = z.infer<typeof BackupSnapshotFileKind>
 
 /**
  * The suffixes pbc strips to get from a STORED filename to the ARCHIVE NAME it
@@ -1221,7 +1221,7 @@ const PXAR_EXTENSIONS = ['.pxar', '.mpxar', '.ppxar'] as const
  */
 export function classifyArchiveFile(
   filename: string,
-): { kind: BackupArchiveKind, archive?: string } {
+): { kind: BackupSnapshotFileKind, archive?: string } {
   let base = filename
   for (const suffix of INDEX_SUFFIXES) {
     if (base.endsWith(suffix)) {
@@ -1239,7 +1239,7 @@ export function classifyArchiveFile(
 }
 
 /** Is this archive kind something the archive picker can browse into? */
-export function isBrowsableArchive(kind: BackupArchiveKind): boolean {
+export function isBrowsableArchive(kind: BackupSnapshotFileKind): boolean {
   return kind === 'pxar'
 }
 
@@ -1289,7 +1289,7 @@ export const BackupSnapshotFile = z.object({
    */
   archive: z.string().optional(),
   /** Derived from the suffix — what this file IS for restore purposes. */
-  kind: BackupArchiveKind,
+  kind: BackupSnapshotFileKind,
   /**
    * GT-4: the LOGICAL archive size, and the restore space estimate — no
    * download needed. An `.img` reports the full device size.
@@ -1491,7 +1491,7 @@ export const BackupBrowseResult = z.object({
   snapshot: z.string(),
   archive: z.string(),
   /** What kind of archive this is — an `img` is a single whole-image unit. */
-  archiveKind: BackupArchiveKind,
+  archiveKind: BackupSnapshotFileKind,
   /** The directory that was listed (normalized). */
   path: z.string(),
   /** Directories first, then everything else; each group name-sorted. */

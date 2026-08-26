@@ -65,6 +65,7 @@ export {
   BackupArchive,
   BackupArchiveConsistency,
   BackupArchiveKind,
+  BackupSnapshotFileKind,
   BackupAuthType,
   BackupBrowseEntry,
   BackupBrowseEntryType,
