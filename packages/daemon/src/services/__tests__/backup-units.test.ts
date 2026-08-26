@@ -750,6 +750,48 @@ describe('backup Run-Now supervision (Fix 1 — through the unit)', () => {
     assert.equal((await superviseRun(plain, 'nightly-etc', FAST)).includedNested, undefined)
   })
 
+  it('consistency, snapshots and expansion survive the supervised Run-Now (backup2.3, live-proof wave 2)', async () => {
+    // DESIGN.md: "The run result carries consistency[], snapshots[],
+    // expansion[]". The direct unit path emitted all three; the supervised
+    // Run-Now dropped them, so a UI Run-Now on the stunt node's AHR task could
+    // not tell a snapshot run from a live one, nor name the transients it took.
+    const result = {
+      status: 'success',
+      archives: [],
+      consistency: [{ consistency: 'snapshot', reason: 'on AHR pool', backend: 'ahr', target: 'lpahr', mountpoint: '/mnt/anas-ahr/lpahr', relativePath: '' }],
+      snapshots: [{ backend: 'ahr', name: 'anas-backup-lp-ahr-1', target: 'lpahr', full: 'lpahr:@snapshots/anas-backup-lp-ahr-1' }],
+      expansion: [{ name: 'ahrdata__photos', from: 'ahrdata', root: '/run/anas-ahr/lpahr.toplevel/@snapshots/anas-backup-lp-ahr-1__photos', relativePath: 'photos', excludes: [] }],
+    }
+    const journal = [
+      `2026-08-26T14:50:15+0000 anas-pve anas-backup-lp-ahr[999]: ${JSON.stringify({ task: 'lp-ahr', result })}`,
+      '2026-08-26T14:50:15+0000 anas-pve systemd[1]: anas-backup-lp-ahr.service: Deactivated successfully.',
+    ].join('\n')
+    const exec = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        { ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0', InvocationID: 'NEW' },
+      ],
+      journal,
+    })
+    const res = await superviseRun(exec, 'lp-ahr', FAST)
+    assert.equal(res.status, 'success')
+    assert.deepEqual(res.consistency, result.consistency)
+    assert.deepEqual(res.snapshots, result.snapshots)
+    assert.deepEqual(res.expansion, result.expansion)
+    // A live run takes no snapshot and expands nothing: those fields stay ABSENT.
+    const plain = new ScriptedExecutor({
+      shows: [
+        { ActiveState: 'inactive', Result: 'success', InvocationID: 'OLD' },
+        { ActiveState: 'inactive', Result: 'success', ExecMainStatus: '0', InvocationID: 'NEW' },
+      ],
+      journal: OK_JOURNAL,
+    })
+    const bare = await superviseRun(plain, 'lp-ahr', FAST)
+    assert.equal(bare.consistency, undefined)
+    assert.equal(bare.snapshots, undefined)
+    assert.equal(bare.expansion, undefined)
+  })
+
   it('failureDetailFromJournal returns pbc\'s verbatim Error line', () => {
     assert.equal(failureDetailFromJournal(FAILED_JOURNAL), 'Error: permission check failed.')
   })

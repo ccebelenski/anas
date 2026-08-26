@@ -1,4 +1,4 @@
-import type { BackupPruneResult, BackupRunResult, BackupTask, DashboardWarning } from '@anas/shared'
+import type { BackupArchiveConsistency, BackupExpandedArchive, BackupPruneResult, BackupRunResult, BackupTask, BackupTransientSnapshot, DashboardWarning } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { BackupTrigger, CadenceGateDecision } from './backup-cadence.js'
 import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
@@ -604,6 +604,17 @@ export interface SuperviseRunResult {
    * the direct (unit) path and dropped by the supervised one.
    */
   includedNested?: Record<string, string[]>
+  /**
+   * backup2.3's three facts — what each source's consistency was DERIVED to be,
+   * which transient snapshots existed while the run read, and which archive
+   * roots the client was actually handed. DESIGN.md promises the run result
+   * carries all three; live-proof wave 2 found the supervised Run-Now path
+   * dropping them (the same omission wave 1 caught for `includedNested`), so a
+   * UI Run-Now could not tell a snapshot run from a live one.
+   */
+  consistency?: BackupArchiveConsistency[]
+  snapshots?: BackupTransientSnapshot[]
+  expansion?: BackupExpandedArchive[]
 }
 
 /** The shape the backup-task helper prints as JSON (its `job.result`). */
@@ -616,6 +627,9 @@ interface HelperResult {
   prune?: BackupPruneResult
   warnings?: string[]
   includedNested?: Record<string, string[]>
+  consistency?: BackupArchiveConsistency[]
+  snapshots?: BackupTransientSnapshot[]
+  expansion?: BackupExpandedArchive[]
 }
 
 /** Is a `systemctl show` snapshot in a still-running state? */
@@ -759,6 +773,14 @@ async function classifyTerminalRun(
   // a Run-Now must not report only half the boundary story.
   if (helper?.includedNested && Object.keys(helper.includedNested).length)
     result.includedNested = helper.includedNested
+  // backup2.3: consistency / transient snapshots / expansion travel the same
+  // way. An absent field stays ABSENT — never an empty array.
+  if (helper?.consistency?.length)
+    result.consistency = helper.consistency
+  if (helper?.snapshots?.length)
+    result.snapshots = helper.snapshots
+  if (helper?.expansion?.length)
+    result.expansion = helper.expansion
   if (helper?.reason)
     result.reason = helper.reason
   else if (status === 'skipped')
