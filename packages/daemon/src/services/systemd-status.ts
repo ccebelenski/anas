@@ -11,10 +11,14 @@
 /**
  * A run's outcome, mapped from a oneshot service's systemd state.
  *
- * `disabled` is not an outcome the unit reported — it is the honest answer when
- * systemd is holding NO answer at all. See {@link hasRetainedRunHistory}.
+ * `disabled` and `never-run` are not outcomes the unit reported — they are the
+ * honest answers when systemd is holding NO run to date: the former because a
+ * disabled unit's history is garbage-collected, the latter because an enabled
+ * unit that has never fired has none to begin with. See
+ * {@link hasRetainedRunHistory}.
  */
-export type SystemdRunResult = 'success' | 'failure' | 'running' | 'unknown' | 'disabled'
+export type SystemdRunResult
+  = 'success' | 'failure' | 'running' | 'unknown' | 'disabled' | 'never-run'
 
 /**
  * The one-line caveat a DISABLED task's detail carries, so a reader who sees
@@ -99,9 +103,20 @@ export interface RunResultContext {
  * outcome, so when the caller says the task is disabled AND systemd retains no
  * history, the answer is `disabled` — there is no run to report.
  *
+ * **The enabled twin.** An ENABLED unit is referenced by its timer, so systemd
+ * keeps it loaded and its timestamps are not garbage-collected — which is why
+ * empty exit/inactive timestamps on a loaded unit can mean exactly one thing:
+ * it has NEVER run. The same default-valued `Result=success` then reads as a
+ * successful run that never happened, so when the caller says the task is
+ * enabled AND systemd retains no history, the answer is `never-run`. The gate
+ * on `ActiveState` being present keeps the two honest absences distinct: an
+ * EMPTY props map means systemd answered nothing at all and stays fail-open
+ * `unknown` (never-run would fabricate an absence we did not verify).
+ *
  * A disabled unit that is running RIGHT NOW (Run Now goes through the unit) or
- * that still has its timestamps is reported truthfully; the caveat is only for
- * the state where systemd genuinely knows nothing.
+ * that still has its timestamps is reported truthfully; an enabled unit that
+ * has run (timestamps retained) likewise keeps its real result. The caveats
+ * are only for the states where systemd genuinely holds no run to date.
  */
 export function deriveRunResult(
   props: Record<string, string>,
@@ -114,6 +129,8 @@ export function deriveRunResult(
     return 'failure'
   if (ctx.enabled === false && !hasRetainedRunHistory(props))
     return 'disabled'
+  if (ctx.enabled === true && active !== undefined && active !== '' && !hasRetainedRunHistory(props))
+    return 'never-run'
   const result = props.Result
   if (result === 'success')
     return 'success'

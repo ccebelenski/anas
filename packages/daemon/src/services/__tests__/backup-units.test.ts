@@ -400,7 +400,9 @@ describe('backup units — LOCAL-ONLY status derivation', () => {
   const pastUsec = String((Date.now() - 3_600_000) * 1000)
 
   it('status: success result, future next run → not overdue', async () => {
-    const st = await deriveTaskStatus(statusMock({ result: 'success', nextTs: futureUsec }), makeTask())
+    // A real successful run retains its exit timestamp — an enabled unit with
+    // EMPTY ones has never fired and reads `never-run` (the F9 twin below).
+    const st = await deriveTaskStatus(statusMock({ result: 'success', exitTs: 'Sun 2026-07-19 02:00:12 UTC', nextTs: futureUsec }), makeTask())
     assert.equal(st.lastRunResult, 'success')
     assert.equal(st.overdue, false)
     assert.notEqual(st.nextRunAt, null)
@@ -455,10 +457,26 @@ describe('backup units — a DISABLED task has no run history to report (F9)', (
     assert.equal(deriveRunResult({ ...COLLECTED, Result: '' }, { enabled: false }), 'disabled')
   })
 
-  it('an ENABLED task is untouched — the unit is referenced, so it keeps its history', () => {
-    assert.equal(deriveRunResult(COLLECTED, { enabled: true }), 'success')
-    // …and so is a caller that does not say (an old call site).
+  it('an ENABLED task with no retained history reads `never-run`, never a fabricated success (the F9 twin)', () => {
+    // The unit IS referenced by its timer, so systemd keeps it loaded: its
+    // timestamps are not garbage-collected, and EMPTY ones can only mean it
+    // has never fired — the default-valued `Result=success` is a successful
+    // run that never happened.
+    assert.equal(deriveRunResult(COLLECTED, { enabled: true }), 'never-run')
+    // …and so does the same shape with an empty Result.
+    assert.equal(deriveRunResult({ ...COLLECTED, Result: '' }, { enabled: true }), 'never-run')
+    // A caller that does not say (an old call site) stays fail-open — the
+    // `ActiveState` gate keeps an UNVERIFIED absence out of the answer.
     assert.equal(deriveRunResult(COLLECTED), 'success')
+  })
+
+  it('an ENABLED task that HAS run keeps its real result — its history is retained', () => {
+    const loaded = { ...COLLECTED, ExecMainExitTimestamp: 'Sun 2026-07-19 02:00:12 UTC' }
+    assert.equal(deriveRunResult(loaded, { enabled: true }), 'success')
+    assert.equal(
+      deriveRunResult({ ...loaded, ActiveState: 'failed', Result: 'exit-code' }, { enabled: true }),
+      'failure',
+    )
   })
 
   it('a disabled task that is RUNNING right now says so — Run Now goes through the unit', () => {
@@ -614,7 +632,7 @@ describe('backup cadence — overdue measured against the cadence, not the timer
     mock.addFixture({
       command: SYSTEMCTL,
       args: ['show', serviceUnitName('nightly-etc'), '-p', 'ActiveState,Result,ExecMainStatus,ExecMainExitTimestamp,InactiveEnterTimestamp'],
-      result: { stdout: `ActiveState=inactive\nResult=success\nExecMainStatus=${BACKUP_SKIP_EXIT_CODE}\nExecMainExitTimestamp=\nInactiveEnterTimestamp=\n`, stderr: '', exitCode: 0 },
+      result: { stdout: `ActiveState=inactive\nResult=success\nExecMainStatus=${BACKUP_SKIP_EXIT_CODE}\nExecMainExitTimestamp=Sun 2026-07-19 02:00:12 UTC\nInactiveEnterTimestamp=\n`, stderr: '', exitCode: 0 },
     })
     mock.addFixture({
       command: SYSTEMCTL,

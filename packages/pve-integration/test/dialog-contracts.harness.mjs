@@ -716,6 +716,17 @@ async function backupChecks() {
     /disabled/.test(disabledCell) && !/success/.test(disabledCell), disabledCell)
   ok('backup: and it explains that systemd keeps no history for one',
     /run history|does not keep the run history/i.test(disabledCell), disabledCell)
+  // The enabled twin of F9: the timer keeps the unit loaded, so empty run
+  // timestamps mean an ENABLED task has never fired — the default-valued
+  // Result=success must not read as a successful run that never happened.
+  const neverRunRec = {
+    get: (k) => ({ lastRunResult: 'never-run', lastRunAt: null, overdue: false }[k]),
+  }
+  const neverRunCell = lastRunCol.renderer('never-run', {}, neverRunRec)
+  ok('backup: a never-run task reads "never run", never a fabricated success',
+    /never run/.test(neverRunCell) && !/success/.test(neverRunCell), neverRunCell)
+  ok('backup: and it says so in plain words',
+    /has not run yet/.test(neverRunCell), neverRunCell)
   const successCell = lastRunCol.renderer('success', {}, {
     get: (k) => ({ lastRunResult: 'success', lastRunAt: null, overdue: false }[k]),
   })

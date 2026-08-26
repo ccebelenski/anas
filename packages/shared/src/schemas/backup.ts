@@ -1138,8 +1138,15 @@ export type BackupRunRequest = z.infer<typeof BackupRunRequest>
  * Reporting that as a success is a fabricated outcome. The member is ADDITIVE:
  * the field stays required and every previously valid value still parses
  * (live-proof F9).
+ *
+ * `never-run` is the ENABLED twin: an enabled unit IS referenced by its timer,
+ * so systemd keeps it loaded and its empty timestamps can only mean it has
+ * never fired — yet the same default-valued `Result=success` still reads as a
+ * successful run that never happened. Also ADDITIVE (version skew: an older
+ * daemon that predates it never sends the value).
  */
-export const BackupRunResult = z.enum(['success', 'failure', 'running', 'skipped', 'unknown', 'disabled'])
+export const BackupRunResult
+  = z.enum(['success', 'failure', 'running', 'skipped', 'unknown', 'disabled', 'never-run'])
 export type BackupRunResult = z.infer<typeof BackupRunResult>
 
 /** A task grid entry: the task + its LOCAL-ONLY runtime status. */

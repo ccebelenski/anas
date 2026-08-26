@@ -41,9 +41,13 @@
  *                GENERATED `schedule` from it and the cadence is authoritative;
  *                absent ⇒ `schedule` is a hand-written expression, which is what
  *                every pre-16.10 task carries) }
- *     lastRunResult ('success'|'failure'|'running'|'skipped'|'unknown' — 'skipped'
- *     is a biweekly off-week fire: it ran and deliberately did nothing, which is
- *     neither a success nor a failure), lastRunAt (ISO),
+ *     lastRunResult ('success'|'failure'|'running'|'skipped'|'unknown'|'disabled'
+ *     |'never-run' — 'skipped' is a biweekly off-week fire: it ran and
+ *     deliberately did nothing, which is neither a success nor a failure;
+ *     'disabled' and 'never-run' are the ABSENCE of a result, not an outcome:
+ *     a disabled unit's history is garbage-collected by systemd (F9), and an
+ *     enabled unit with empty run timestamps has simply never fired),
+ *     lastRunAt (ISO),
  *     nextRunAt (ISO), overdue (bool — a silently-overdue task counts as failed,
  *     the replication policy).
  *
@@ -774,6 +778,12 @@
 
     var DISABLED_RESULT_TIP = 'Disabled — systemd does not keep the run history of a task whose timer is off, so there is no last result to show. The recent journald output on the detail is the only record left.';
 
+    // The one sentence a `never-run` result carries, wherever it is rendered
+    // (grid pill and task detail). The enabled twin of the F9 hole: an enabled
+    // unit is kept loaded by its timer, so empty run timestamps mean it has
+    // never fired — the default-valued Result=success was a fabricated success.
+    var NEVER_RUN_TIP = 'this task has not run yet';
+
     // A muted, outlined pill — for a state that is an ABSENCE of a result
     // rather than an outcome, so it must not wear an outcome's solid colour.
     function softPill(label, color, title) {
@@ -811,6 +821,12 @@
             // grid used to read `success / never` regardless of what actually
             // happened — a fabricated outcome. Say there is none.
             pill = softPill(t('disabled'), 'var(--anas-muted,gray)', t(DISABLED_RESULT_TIP));
+        } else if (result === 'never-run') {
+            // The enabled twin of F9: an enabled task IS referenced by its
+            // timer, so systemd keeps its unit loaded — empty run timestamps
+            // can only mean it has never fired, and the default-valued
+            // Result=success was a fabricated success. Say so.
+            pill = softPill(t('never run'), 'var(--anas-muted,gray)', t(NEVER_RUN_TIP));
         } else if (overdue) {
             pill = pillHtml(t('overdue'), 'var(--anas-danger,#c23b2c)',
                 t('Past its schedule without a successful run — treated as failed.'));
@@ -1625,19 +1641,24 @@
         return html + '</div>';
     }
 
-    // The last-run row. It exists for ONE case (live-proof F9): a DISABLED task
-    // whose run history systemd has garbage-collected has no result at all, and
-    // the detail must say that in words rather than leave the grid's pill to
-    // carry it alone. Nothing is shown for any other status — the grid already
-    // has it, and a second copy would be clutter.
+    // The last-run row. It exists for the cases with NO result to show: a
+    // DISABLED task whose run history systemd has garbage-collected (live-proof
+    // F9), and an ENABLED task that has never run (its enabled twin). The
+    // detail must say that in words rather than leave the grid's pill to carry
+    // it alone. Nothing is shown for any other status — the grid already has
+    // it, and a second copy would be clutter.
     function lastRunRow(d) {
-        if (('' + (d.lastRunResult || '')) !== 'disabled') {
-            return '';
-        }
-        var note = d.statusNote || DISABLED_HISTORY_SENTENCE;
+        var result = '' + (d.lastRunResult || '');
+        if (result === 'disabled') {
+            var note = d.statusNote || DISABLED_HISTORY_SENTENCE;
         return kv(t('Last run'),
             softPill(t('disabled'), 'var(--anas-muted,gray)', t(DISABLED_RESULT_TIP))
             + ' <span style="color:var(--anas-muted,gray);">' + enc('\u2014 ' + note) + '</span>');
+        }
+        if (result === 'never-run') {
+            return kv(t('Last run'), softPill(t('never run'), 'var(--anas-muted,gray)', t(NEVER_RUN_TIP)));
+        }
+        return '';
     }
 
     function recentRunsBlock(d) {

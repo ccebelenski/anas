@@ -237,8 +237,10 @@ describe('backup routes (Epic 16)', () => {
     const entries = (list.json() as { data: BackupTaskEntry[] }).data
     assert.equal(entries.find(e => e.task.name === 'nightly-etc')?.lastRunResult, 'disabled')
 
-    // An ENABLED task with the very same systemd answer is untouched: its unit
-    // is referenced by its timer, so the history is really there.
+    // An ENABLED task with the very same systemd answer is the never-run twin:
+    // its unit IS kept loaded by its timer, so empty timestamps can only mean
+    // it has never fired — the default-valued `Result=success` is a run that
+    // never happened.
     const on = await server.inject({
       method: 'PUT',
       url: '/v1/backup/tasks/nightly-etc',
@@ -248,7 +250,8 @@ describe('backup routes (Epic 16)', () => {
     assert.equal((await waitForJob(server, await jobIdFrom(on))).status, 'completed')
     const again = await server.inject({ method: 'GET', url: '/v1/backup/tasks/nightly-etc', headers: IDENTITY })
     const back = (again.json() as { data: BackupTaskDetail }).data
-    assert.equal(back.lastRunResult, 'success')
+    assert.equal(back.lastRunResult, 'never-run')
+    assert.equal(back.lastRunAt, null)
     assert.equal(back.statusNote, undefined)
   })
 
