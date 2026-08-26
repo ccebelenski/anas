@@ -2,14 +2,19 @@ import type { IscsiClaimList, Job } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { anasIqn } from '@anas/shared'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
+import { mockFixtures } from '../../fixtures/loader.js'
+import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
+import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
+import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { createServer } from '../../server.js'
+import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { TARGETCLI } from '../../services/iscsi-mutate.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -217,6 +222,13 @@ interface Res {
   body: { data?: unknown, job?: { id: string }, error?: { code: string, reason?: string, message: string, warnings?: string[] } }
 }
 
+/** A node of the `lsblk -J` tree, as far as a mountpoint walk needs. */
+interface LsblkNode {
+  type?: string
+  mountpoint?: string
+  children?: LsblkNode[]
+}
+
 describe('the iSCSI mutation routes — every gate before the job', () => {
   let dir: string
   let server: ReturnType<typeof createServer> | undefined
@@ -227,6 +239,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
     storage: process.env.ANAS_STORAGE_CFG,
     nodename: process.env.ANAS_NODENAME,
     initiator: process.env.ANAS_ISCSI_INITIATOR_NAME,
+    fstab: process.env.ANAS_FSTAB_PATH,
   }
 
   async function serve(opts: { manifest?: string, saveconfigText?: string, saveconfigFixture?: string } = {}) {
@@ -318,6 +331,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       ['ANAS_STORAGE_CFG', savedEnv.storage],
       ['ANAS_NODENAME', savedEnv.nodename],
       ['ANAS_ISCSI_INITIATOR_NAME', savedEnv.initiator],
+      ['ANAS_FSTAB_PATH', savedEnv.fstab],
     ] as const) {
       if (saved === undefined)
         delete process.env[key]
@@ -742,6 +756,112 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
         backing: 'tank/vol2',
       })
       assert.equal(res.statusCode, 202)
+    })
+
+    it('accepts an AHR pool NAME as a file backing — the image lands under the pool\'s mountpoint', async () => {
+      // The pool's "mountpoint" is a real temp directory: the job's
+      // createSparseImage is real file I/O, and the point of the test is that
+      // the NAME resolved onto it. fstab is pointed at a temp file so the
+      // boot-ordering step (iscsi.8) the same job runs never touches the host's.
+      const mountDir = join(dir, 'ahr0')
+      await mkdir(mountDir, { recursive: true })
+      process.env.ANAS_FSTAB_PATH = join(dir, 'fstab')
+      await writeFile(join(dir, 'fstab'), '')
+      await serveAnas()
+      const mock = mockOf()
+      // The MockExecutor is first-match, and serveAnas() already registered the
+      // fixture pool MOUNTED at /mnt/anas-ahr/ahr0 — both as the findmnt entry
+      // and as the LVM nodes' mountpoints, the two sources the topology reader
+      // consults for a pool's mount. Those would shadow everything added here
+      // and the image would land under /mnt/anas-ahr/ahr0, not the temp dir
+      // this test points the name at. Clear the defaults and re-register the
+      // AHR reads with BOTH sources agreeing on the temp mountpoint.
+      mock.clearFixtures()
+      const lsblk = JSON.parse(mockFixtures.ahrLsblk().stdout) as { blockdevices: LsblkNode[] }
+      const pointMounts = (nodes: LsblkNode[]): void => {
+        for (const n of nodes) {
+          if (n.type === 'lvm')
+            n.mountpoint = mountDir
+          if (n.children)
+            pointMounts(n.children)
+        }
+      }
+      pointMounts(lsblk.blockdevices)
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+      mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: { stdout: JSON.stringify(lsblk), stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+      mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+      mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+      mock.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: mockFixtures.ahrPvs() })
+      mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: {
+        stdout: JSON.stringify({ filesystems: [{ target: mountDir, source: '/dev/mapper/ahr0-ahr0--vol', fstype: 'btrfs', options: 'rw,relatime,subvolid=5,subvol=/' }] }),
+        stderr: '',
+        exitCode: 0,
+      } })
+
+      const res = await call('POST', `${targetUrl()}/luns`, {
+        name: 'ahrimg',
+        kind: 'file',
+        backing: 'ahr0',
+        size: 1024 * 1024,
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed')
+
+      // The image exists under the pool's MOUNTPOINT — the name resolved there.
+      const img = await stat(join(mountDir, 'ahrimg.raw'))
+      assert.equal(img.size, 1024 * 1024)
+      // …and the backstore LIO was told about points at that same path.
+      const create = mock.calls.find(c => c.command === TARGETCLI
+        && c.args.includes('/backstores/fileio')
+        && c.args.join(' ').includes('name=ahrimg'))
+      assert.ok(create, 'the fileio backstore create was issued')
+      assert.ok(create!.args.join(' ').includes(`file_or_dev=${join(mountDir, 'ahrimg.raw')}`))
+    })
+
+    it('refuses an UNMOUNTED AHR pool name before the job — naming it, saying to mount it', async () => {
+      process.env.ANAS_FSTAB_PATH = join(dir, 'fstab')
+      await writeFile(join(dir, 'fstab'), '')
+      await serveAnas()
+      const mock = mockOf()
+      // First-match again: without the clear the server-registered findmnt
+      // still shows the pool mounted and the refusal below never fires. Both
+      // sources the reader consults for a mount must agree on "none" — the
+      // findmnt list is empty AND no lsblk LVM node carries a mountpoint.
+      mock.clearFixtures()
+      mock.addFixture({ command: '/usr/bin/cat', args: MDSTAT_CAT_ARGS, result: mockFixtures.ahrMdstat() })
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md127'), result: mockFixtures.ahrMdadmExportR1() })
+      mock.addFixture({ command: '/usr/sbin/mdadm', args: mdadmDetailExportArgs('/dev/md126'), result: mockFixtures.ahrMdadmExportR2() })
+      const lsblk = JSON.parse(mockFixtures.ahrLsblk().stdout) as { blockdevices: LsblkNode[] }
+      const clearMounts = (nodes: LsblkNode[]): void => {
+        for (const n of nodes) {
+          if (n.type === 'lvm')
+            n.mountpoint = undefined
+          if (n.children)
+            clearMounts(n.children)
+        }
+      }
+      clearMounts(lsblk.blockdevices)
+      mock.addFixture({ command: '/usr/bin/lsblk', args: AHR_LSBLK_ARGS, result: { stdout: JSON.stringify(lsblk), stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: mockFixtures.diskByIdListing() })
+      mock.addFixture({ command: '/usr/sbin/vgs', args: VGS_ARGS, result: mockFixtures.ahrVgs() })
+      mock.addFixture({ command: '/usr/sbin/lvs', args: LVS_ARGS, result: mockFixtures.ahrLvs() })
+      mock.addFixture({ command: '/usr/sbin/pvs', args: PVS_ARGS, result: mockFixtures.ahrPvs() })
+      mock.addFixture({ command: '/usr/bin/findmnt', args: AHR_FINDMNT_ARGS, result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+
+      const res = await call('POST', `${targetUrl()}/luns`, {
+        name: 'ahrimg',
+        kind: 'file',
+        backing: 'ahr0',
+        size: 1024 * 1024,
+      })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'ahr-pool-unmounted')
+      assert.match(res.body.error!.message, /'ahr0' is an AHR pool, but it is not mounted — mount it first, then place the image/)
     })
   })
 

@@ -2528,15 +2528,19 @@
                     }
                 });
             }
-            // AHR pools are a second, independent source for the image-file list.
-            ANAS.api.get(node, '/ahr/pools').then(function (ares) {
+            // AHR pools are a second, independent source for the image-file list
+            // (GET /ahr — the same read the AHR menu makes; the daemon has no
+            // /ahr/pools). Only MOUNTED pools are offered: the image directory
+            // IS the mountpoint, and an unmounted pool has no directory to hold
+            // one in (the daemon refuses the name with its own guiding 400).
+            ANAS.api.get(node, '/ahr').then(function (ares) {
                 if (win.destroyed || win.destroying) {
                     return;
                 }
                 var apools = (ares && ares.data) || [];
                 for (var k = 0; k < apools.length; k++) {
                     var a = apools[k] || {};
-                    if (a.name) {
+                    if (a.name && a.mounted) {
                         dirs.push({ name: a.name, label: a.name + ' (' + t('AHR pool') + ')' });
                     }
                 }
