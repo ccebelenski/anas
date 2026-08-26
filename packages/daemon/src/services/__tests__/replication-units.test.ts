@@ -302,9 +302,23 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
       const mock = statusMock({ result: 'success', exitStamp: '' })
       const st = await deriveTaskStatus(mock, makeTask({ enabled: false }))
       assert.equal(st.lastRunResult, 'disabled')
-      // ZFS is still the authority for what actually replicated — untouched.
+      // The ENABLED twin of the same shape: the timer keeps the unit loaded,
+      // so empty timestamps mean it has never fired — the default-valued
+      // `Result=success` is a run that never happened. (ZFS is still the
+      // authority for what actually replicated — untouched by either.)
       const enabled = await deriveTaskStatus(statusMock({ result: 'success', exitStamp: '' }), makeTask())
-      assert.equal(enabled.lastRunResult, 'success')
+      assert.equal(enabled.lastRunResult, 'never-run')
+    })
+
+    it('an ENABLED task that HAS run keeps its real result — its history is retained', async () => {
+      const mock = statusMock({
+        source: [{ name: 's1', txg: 100 }],
+        target: [{ name: 's1', txg: 100 }],
+        result: 'success',
+      })
+      const st = await deriveTaskStatus(mock, makeTask())
+      assert.equal(st.lastRunResult, 'success')
+      assert.equal(st.snapshotsBehind, 0)
     })
 
     it('behind: target has the older snapshot only → 1 behind', async () => {

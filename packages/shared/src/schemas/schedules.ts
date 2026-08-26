@@ -195,8 +195,14 @@ export type RetentionPlan = z.infer<typeof RetentionPlan>
  * history of a disabled unit nothing references, so `systemctl show` answers
  * from defaults and a real outcome cannot be read at all (live-proof F9).
  * Additive — the field stays required and every earlier value still parses.
+ *
+ * `never-run` is the ENABLED twin: an enabled unit is kept loaded by its
+ * timer, so empty run timestamps mean it has never fired, while the
+ * default-valued `Result=success` would still read as a fabricated success.
+ * Additive, like `disabled`.
  */
-export const ScheduleRunResult = z.enum(['success', 'failure', 'running', 'unknown', 'disabled'])
+export const ScheduleRunResult
+  = z.enum(['success', 'failure', 'running', 'unknown', 'disabled', 'never-run'])
 export type ScheduleRunResult = z.infer<typeof ScheduleRunResult>
 
 /**

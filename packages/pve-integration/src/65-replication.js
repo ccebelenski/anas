@@ -275,6 +275,12 @@
     // and snapshot grids; one hole, one explanation (F9).
     var DISABLED_RESULT_TIP = 'Disabled — systemd does not keep the run history of a task whose timer is off, so there is no last result to show. The recent journald output on the detail is the only record left.';
 
+    // The one sentence a `never-run` result carries — the enabled twin of the
+    // F9 hole: an enabled unit is kept loaded by its timer, so empty run
+    // timestamps mean it has never fired. Same words as the backup and
+    // snapshot grids.
+    var NEVER_RUN_TIP = 'this task has not run yet';
+
     // Last run: a result pill + the relative time of the last replicated snapshot.
     function renderLastRun(v, meta, rec) {
         var result = '' + (rec.get('lastRunResult') || 'unknown');
@@ -298,6 +304,15 @@
                 + ' style="display:inline-block;padding:0 8px;border-radius:9px;font-size:0.85em;'
                 + 'color:var(--anas-muted,gray);border:1px solid var(--anas-muted,gray);">'
                 + enc(t('disabled')) + '</span>';
+        } else if (result === 'never-run') {
+            // The enabled twin of F9 — an enabled unit is kept loaded by its
+            // timer, so empty run timestamps mean it has never fired and
+            // `Result=success` is only a property default. ZFS still answers
+            // what actually replicated, beside this.
+            pill = '<span title="' + enc(t(NEVER_RUN_TIP)) + '"'
+                + ' style="display:inline-block;padding:0 8px;border-radius:9px;font-size:0.85em;'
+                + 'color:var(--anas-muted,gray);border:1px solid var(--anas-muted,gray);">'
+                + enc(t('never run')) + '</span>';
         } else {
             pill = pillHtml(t('unknown'), 'var(--anas-muted,gray)', '');
         }

@@ -236,6 +236,12 @@
     // Same words as the backup grid — one hole, one explanation (F9).
     var DISABLED_RESULT_TIP = 'Disabled — systemd does not keep the run history of a task whose timer is off, so there is no last result to show. The recent journald output on the detail is the only record left.';
 
+    // The one sentence a `never-run` result carries — the enabled twin of the
+    // F9 hole: an enabled unit is kept loaded by its timer, so empty run
+    // timestamps mean it has never fired (the default-valued Result=success
+    // was a fabricated success). Same words as the backup grid.
+    var NEVER_RUN_TIP = 'this task has not run yet';
+
     // Last run: a result pill (success / failure / running / unknown) + relative
     // time. A `failure` here is exactly the dashboard's 17.7 warning surfaced inline.
     function renderLastRun(v, meta, rec) {
@@ -255,8 +261,14 @@
         } else if (result === 'disabled') {
             // Live-proof F9 — the same hole as the backup grid, and the same
             // answer: a disabled unit's history is garbage-collected, so there
-            // is no result to report, and "never run" would be a guess.
+            // is no result to report (its timer being OFF is what sets it apart
+            // from the enabled never-run state below).
             pill = softPill(t('disabled'), 'var(--anas-muted,gray)', t(DISABLED_RESULT_TIP));
+        } else if (result === 'never-run') {
+            // The enabled twin of F9: an enabled unit is kept loaded by its
+            // timer, so empty run timestamps mean it has never fired — the
+            // default-valued Result=success was a fabricated success.
+            pill = softPill(t('never run'), 'var(--anas-muted,gray)', t(NEVER_RUN_TIP));
         } else {
             pill = softPill(t('never run'), 'var(--anas-muted,gray)', t('no run recorded yet'));
         }
@@ -1276,6 +1288,9 @@
             pill = pillHtml(t('running'), 'var(--anas-accent,#3468c0)', '');
         } else if (result === 'disabled') {
             pill = softPill(t('disabled'), 'var(--anas-muted,gray)', t(DISABLED_RESULT_TIP));
+        } else if (result === 'never-run') {
+            // The enabled twin of F9 — no run to date, timer on (see the grid).
+            pill = softPill(t('never run'), 'var(--anas-muted,gray)', t(NEVER_RUN_TIP));
         } else {
             pill = softPill(t('never run'), 'var(--anas-muted,gray)', '');
         }

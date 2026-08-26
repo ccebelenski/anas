@@ -201,8 +201,12 @@ export const ReplicationTaskStatus = z.object({
    * systemd: last trigger result. `disabled` is the ABSENCE of a result —
    * systemd garbage-collects the run history of a disabled unit nothing
    * references, so no real outcome can be read (live-proof F9). Additive.
+   * `never-run` is the ENABLED twin: an enabled unit is kept loaded by its
+   * timer, so empty run timestamps mean it has never fired — the
+   * default-valued `Result=success` would read as a fabricated success.
+   * Additive, like `disabled`.
    */
-  lastRunResult: z.enum(['success', 'failure', 'running', 'unknown', 'disabled']),
+  lastRunResult: z.enum(['success', 'failure', 'running', 'unknown', 'disabled', 'never-run']),
   /** systemd timer: next scheduled trigger. */
   nextRunAt: ISODateTime.nullable(),
 })

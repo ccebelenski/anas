@@ -187,9 +187,18 @@ describe('snapshot schedule units — status derivation + dashboard warnings', (
     )
     assert.equal(st.lastRunResult, 'disabled')
     assert.equal(st.lastRunAt, null)
-    // The same shape while ENABLED is untouched — the unit is referenced there.
+    // The same shape while ENABLED is the never-run twin: the timer keeps the
+    // unit loaded, so empty timestamps mean it has never fired — the
+    // default-valued `Result=success` is a run that never happened.
     const on = await deriveScheduleStatus(statusMock({ result: 'success', exitTs: '' }), makeSchedule({ enabled: true }))
-    assert.equal(on.lastRunResult, 'success')
+    assert.equal(on.lastRunResult, 'never-run')
+    assert.equal(on.lastRunAt, null)
+  })
+
+  it('an ENABLED schedule that HAS run keeps its real result — its history is retained', async () => {
+    const st = await deriveScheduleStatus(statusMock({ result: 'success', exitTs: 'Sun 2026-07-26 00:00:00 UTC' }), makeSchedule({ enabled: true }))
+    assert.equal(st.lastRunResult, 'success')
+    assert.equal(st.lastRunAt, '2026-07-26T00:00:00.000Z')
   })
 
   it('the schedule DETAIL states why there is no result, and shows no exit code (F9)', async () => {
