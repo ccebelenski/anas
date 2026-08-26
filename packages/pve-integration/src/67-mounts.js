@@ -1946,15 +1946,13 @@
                     emptyText: 'smbuser',
                     // This dialog lives in the PVE origin: a user/password pair is
                     // exactly the shape a password manager autofills (issue #23).
-                    inputAttrTpl: 'autocomplete="off"',
+                    inputAttrTpl: ANAS.noAutofill.user.inputAttrTpl,
                 },
                 {
                     xtype: 'textfield', itemId: 'credPass', fieldLabel: t('Password'),
                     inputType: 'password',
                     emptyText: isEdit ? t('(unchanged)') : '',
-                    // 'new-password' is the hint browsers honour on password inputs;
-                    // bare 'off' is routinely ignored there.
-                    inputAttrTpl: 'autocomplete="new-password"',
+                    inputAttrTpl: ANAS.noAutofill.secret.inputAttrTpl,
                     listeners: {
                         afterrender: function (f) {
                             // Second layer: on edit, only a secret the operator

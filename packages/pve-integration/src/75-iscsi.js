@@ -740,6 +740,7 @@
                     itemId: 'aclUserid',
                     cls: 'anas-fld-acl-userid',
                     fieldLabel: t('CHAP username'),
+                    inputAttrTpl: ANAS.noAutofill.user.inputAttrTpl,
                     value: acl.chapUserid || ''
                 },
                 {
@@ -747,6 +748,7 @@
                     itemId: 'aclSecret',
                     cls: 'anas-fld-acl-secret',
                     inputType: 'password',
+                    inputAttrTpl: ANAS.noAutofill.secret.inputAttrTpl,
                     fieldLabel: acl.chapCredentialsSet
                         ? t('CHAP secret (stored — leave blank to keep)')
                         : t('CHAP secret'),
@@ -757,6 +759,7 @@
                     itemId: 'aclMutualUserid',
                     cls: 'anas-fld-acl-mutual-userid',
                     fieldLabel: t('Mutual CHAP username'),
+                    inputAttrTpl: ANAS.noAutofill.user.inputAttrTpl,
                     value: acl.mutualUserid || ''
                 },
                 {
@@ -764,6 +767,7 @@
                     itemId: 'aclMutualSecret',
                     cls: 'anas-fld-acl-mutual-secret',
                     inputType: 'password',
+                    inputAttrTpl: ANAS.noAutofill.secret.inputAttrTpl,
                     fieldLabel: acl.mutualCredentialsSet
                         ? t('Mutual CHAP secret (stored — leave blank to keep)')
                         : t('Mutual CHAP secret'),

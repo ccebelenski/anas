@@ -26,6 +26,16 @@
         ANAS.views = {};
     }
 
+    // Credential fields opt out of password-manager autofill (issue #23: a
+    // username/secret pair in a dialog is exactly the shape managers fill in).
+    // Spread into every credential field config: 'user' for the name side,
+    // 'secret' for the password side ('new-password' is the one hint browsers
+    // reliably honour on password inputs; bare 'off' is routinely ignored).
+    ANAS.noAutofill = {
+        user: { inputAttrTpl: 'autocomplete="off"' },
+        secret: { inputAttrTpl: 'autocomplete="new-password"' },
+    };
+
     // ---- Fail-open helpers -------------------------------------------------
 
     ANAS.warn = function (msg) {

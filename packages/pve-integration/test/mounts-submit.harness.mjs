@@ -217,6 +217,14 @@ function makeStore() {
 
 const captured = { jobs: [], posts: [] }
 
+/** The real autofill opt-out from 00-core.js — the credential tier reads it
+ * while building its fields, so the fake must mirror it. */
+const noAutofill = (() => {
+  const sandbox = { window: {} }
+  vm.runInNewContext(readFileSync(join(SRC, '00-core.js'), 'utf8'), sandbox, { filename: '00-core.js' })
+  return sandbox.window.ANAS.noAutofill
+})()
+
 function loadUi() {
   const doc = {
     cookie: '',
@@ -227,6 +235,7 @@ function loadUi() {
   const win = { document: doc }
   win.ANAS = {
     views: {},
+    noAutofill,
     t: s => s,
     enc: s => String(s === null || s === undefined ? '' : s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
