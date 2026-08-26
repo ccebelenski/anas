@@ -323,6 +323,57 @@ async function runShell(
 }
 
 /**
+ * `stat` a BATCH of archive paths in ONE catalog-shell session (story
+ * backup2.6's restore pre-flight).
+ *
+ * One session answers three questions a file restore must settle before it
+ * runs, and it answers them from the catalog rather than from a guess:
+ *
+ *   1. which selections are DIRECTORIES — an in-place restore of a tree is the
+ *      only thing the confirm gate applies to;
+ *   2. which selections are HARDLINKS and what their group's primary is —
+ *      GT-25: a hardlink's second name restored alone fails the WHOLE job;
+ *   3. how big a file selection is — the space check's exact figure, where the
+ *      manifest's `files[].size` is only the whole archive's upper bound.
+ *
+ * Batching is free: 500 `stat`s in a single session measured 0.083 s (GT-8h).
+ *
+ * A path the archive does not hold produces an `Error: no such file or
+ * directory: "…"` line on STDERR and NO block, while the shell keeps going and
+ * still exits 0 (GT-8e) — so a missing selection is detected by its ABSENCE
+ * from the returned map, never by an exit code. `missing` names them.
+ */
+export async function statArchivePaths(
+  executor: CommandExecutor,
+  deps: BrowseArchiveDeps,
+  paths: string[],
+): Promise<
+  | { ok: true, stats: Map<string, CatalogStat>, missing: string[] }
+  | { ok: false, verdict: BackupBrowseResult['verdict'], detail: string }
+> {
+  if (paths.length === 0)
+    return { ok: true, stats: new Map(), missing: [] }
+
+  let script: string
+  try {
+    script = buildStatScript(paths)
+  }
+  catch (err) {
+    return { ok: false, verdict: 'error', detail: err instanceof Error ? err.message : String(err) }
+  }
+
+  const out = await runShell(executor, deps, script)
+  if (!out.ok)
+    return out
+
+  const stats = new Map<string, CatalogStat>()
+  for (const block of parseStatBlocks(out.stdout.split('\n')))
+    stats.set(block.path, block)
+  const missing = paths.filter(p => !stats.has(p))
+  return { ok: true, stats, missing }
+}
+
+/**
  * Browse ONE directory level of ONE archive.
  *
  * An `img` archive short-circuits with NO PBS contact at all: browsing a block

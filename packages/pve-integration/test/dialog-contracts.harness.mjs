@@ -30,6 +30,9 @@
  *      the PATH: retype the path and the record is not sent.
  *   4. Import Pool sends the GUID it displays — duplicate-name imports are the
  *      whole reason the scan reports a GUID.
+ *   5c/5d. backup2.6: the RESTORE doors — the request body in every mode, the
+ *      confirm-code prediction for an in-place TREE only, a hardlink group as
+ *      ONE unit, `img` archives excluded, and both doors on the Backup screen.
  *   5. backup2.5: the shared path picker — lazy tree loads, breadcrumbs,
  *      type-ahead, multi-select set semantics, hardlink groups as ONE unit, and
  *      the archive backend carrying its snapshot context. Plus the one that
@@ -3460,6 +3463,365 @@ async function iscsiPortalWarningChecks() {
   ok('portal: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+
+// ============================================================================
+//  5c. backup2.6 — the RESTORE doors: what each mode SENDS
+//
+//  What this guards:
+//    · the request body in EVERY mode — side-by-side (the default), in place,
+//      the task door and the task-less repository door
+//    · omission is meaningful: an un-ticked ignore flag, an empty namespace and
+//      an empty rate are ABSENT, never `false`/`''`
+//    · the confirm-code dance is predicted for an in-place TREE and ONLY for
+//      that — a single explicitly picked file in place is not gated
+//    · a hardlink group travels as ONE unit (GT-25), through the real picker
+//    · `img` archives are NOT offered by the file-restore door
+//    · both doors exist and open the same dialog
+// ============================================================================
+
+/** The archive tree the RESTORE picker walks — the same shape the daemon returns. */
+const FILE_RESTORE_SNAPSHOTS = {
+  data: {
+    verdict: 'ok',
+    repository: 'pbs-main',
+    namespace: 'anas/pictures',
+    group: 'host/pictures',
+    snapshots: [{
+      snapshot: 'host/pictures/2026-08-25T19:16:45Z',
+      backupType: 'host',
+      backupId: 'pictures',
+      backupTime: 1787685405,
+      backupTimeIso: '2026-08-25T19:16:45Z',
+      size: 3309,
+      files: [
+        { filename: 'data.pxar.didx', archive: 'data.pxar', kind: 'pxar', size: 2607 },
+        // A block image in the SAME snapshot: the file door must not offer it.
+        { filename: 'lun.img.fidx', archive: 'lun.img', kind: 'img', size: 536870912 },
+        { filename: 'catalog.pcat1.didx', kind: 'other', size: 327 },
+      ],
+    }],
+  },
+}
+
+const FILE_RESTORE_ROUTES = {
+  ...PICKER_ROUTES,
+  'GET /backup/tasks/nightly-pictures': {
+    data: {
+      task: TASK,
+      unit: '',
+      timer: '',
+      recentRuns: [],
+    },
+  },
+  'GET /backup/tasks/nightly-pictures/snapshots': FILE_RESTORE_SNAPSHOTS,
+  'GET /backup/repos/pbs-main/groups': {
+    data: {
+      verdict: 'ok',
+      repository: 'pbs-main',
+      groups: [{
+        group: 'host/pictures',
+        backupType: 'host',
+        backupId: 'pictures',
+        backupCount: 3,
+        lastBackup: 1787685405,
+        lastBackupIso: '2026-08-25T19:16:45Z',
+        files: [{ filename: 'data.pxar.didx', archive: 'data.pxar', kind: 'pxar' }],
+      }],
+    },
+  },
+  'POST /backup/restore': { job: { id: 'restore-1' } },
+}
+
+/** Open the restore dialog through the TOOLBAR door and return it. */
+function openFileRestoreDialog(ANAS, opts) {
+  created.windows.length = 0
+  ANAS.backupRestore.open('harness', opts || {})
+  return openWindow()
+}
+
+/**
+ * The picker sandbox plus the restore-only routes (the task detail, the
+ * snapshot listings, the restore door itself).
+ */
+function loadRestoreSources() {
+  const ANAS = loadPickerSources(['12-picker.js', '68-backup.js'])
+  ANAS.api.post = (_node, path, body) => {
+    const key = `POST ${path}`
+    if (!(key in FILE_RESTORE_ROUTES)) { return Promise.reject(new Error(`unexpected ${key}`)) }
+    const route = FILE_RESTORE_ROUTES[key]
+    return Promise.resolve(typeof route === 'function' ? route(body) : route)
+  }
+  const baseGet = ANAS.api.get
+  ANAS.api.get = (node, path) => {
+    const key = `GET ${path.split('?')[0]}`
+    if (key in FILE_RESTORE_ROUTES && FILE_RESTORE_ROUTES[key]) { return Promise.resolve(FILE_RESTORE_ROUTES[key]) }
+    return baseGet(node, path)
+  }
+  return ANAS
+}
+
+async function restoreChecks() {
+  const ANAS = loadRestoreSources()
+  const R = ANAS.backupRestore
+
+  // --- pure helpers --------------------------------------------------------
+
+  eq('file restore: the side-by-side name is <home>.anas-restore-<time>, colon-free',
+    R.sideBySideName('/mnt/pictures', 'host/pictures/2026-08-25T19:16:45Z'),
+    '/mnt/pictures.anas-restore-2026-08-25T19-16-45Z')
+  eq('file restore: a trailing slash on the home does not double up',
+    R.sideBySideName('/mnt/pictures/', 'host/pictures/2026-08-25T19:16:45Z'),
+    '/mnt/pictures.anas-restore-2026-08-25T19-16-45Z')
+  eq('file restore: no name without a full snapshot id (a bare group means LATEST)',
+    R.sideBySideName('/mnt/pictures', 'host/pictures'), '')
+  eq('file restore: no name beside the filesystem root',
+    R.sideBySideName('/', 'host/pictures/2026-08-25T19:16:45Z'), '')
+
+  const ARCHIVES = FILE_RESTORE_SNAPSHOTS.data.snapshots[0].files
+    .filter(f => f.archive)
+    .map(f => ({ archive: f.archive, kind: f.kind, size: f.size }))
+  eq('file restore: an `img` archive is NOT offered by the file door',
+    R.restorableArchives(ARCHIVES).map(a => a.archive), ['data.pxar'])
+  eq('file restore: the estimate is the archive`s logical size', R.archiveBytes(ARCHIVES, 'data.pxar'), 2607)
+
+  const FILE_ROW = { path: '/alpha.txt', type: 'file' }
+  const DIR_ROW = { path: '/docs', type: 'dir' }
+  ok('file restore: in place + a directory predicts the confirm dance',
+    R.needsConfirm('inPlace', [FILE_ROW, DIR_ROW]) === true)
+  ok('file restore: in place + only files does NOT — the checkbox is the consent',
+    R.needsConfirm('inPlace', [FILE_ROW]) === false)
+  ok('file restore: side-by-side is never gated, even for a whole tree',
+    R.needsConfirm('sideBySide', [DIR_ROW]) === false)
+  ok('file restore: a typed selection with no row is not gated either',
+    R.needsConfirm('inPlace', []) === false)
+
+  // --- the body, mode by mode ----------------------------------------------
+
+  const CTX = {
+    repo: 'pbs-main',
+    ns: 'anas/pictures',
+    task: 'nightly-pictures',
+    snapshot: 'host/pictures/2026-08-25T19:16:45Z',
+    archive: 'data.pxar',
+    selections: ['/alpha.txt'],
+    mode: 'sideBySide',
+    home: '/mnt/pictures',
+  }
+  eq('file restore: the side-by-side body (the default) is exactly this', R.restoreBody(CTX), {
+    kind: 'files',
+    repo: 'pbs-main',
+    snapshot: 'host/pictures/2026-08-25T19:16:45Z',
+    archive: 'data.pxar',
+    selections: ['/alpha.txt'],
+    target: { mode: 'sideBySide', path: '/mnt/pictures' },
+    options: {},
+    ns: 'anas/pictures',
+    task: 'nightly-pictures',
+  })
+  eq('file restore: the in-place body differs ONLY in the mode',
+    R.restoreBody({ ...CTX, mode: 'inPlace' }).target, { mode: 'inPlace', path: '/mnt/pictures' })
+  eq('file restore: the task-less door sends no task key',
+    Object.prototype.hasOwnProperty.call(R.restoreBody({ ...CTX, task: '' }), 'task'), false)
+  eq('file restore: an empty namespace is ABSENT, never an empty string',
+    Object.prototype.hasOwnProperty.call(R.restoreBody({ ...CTX, ns: '' }), 'ns'), false)
+  eq('file restore: an empty rate is absent; a set one rides',
+    Object.prototype.hasOwnProperty.call(R.restoreBody({ ...CTX, rate: '' }), 'rate'), false)
+  eq('file restore: a set rate rides verbatim', R.restoreBody({ ...CTX, rate: ' 50MB ' }).rate, '50MB')
+  eq('file restore: an UN-TICKED ignore flag is absent, not false',
+    R.restoreBody({ ...CTX, ignoreAcls: false }).options, {})
+  eq('file restore: every ticked ignore flag rides', R.restoreBody({
+    ...CTX,
+    ignoreOwnership: true,
+    ignoreAcls: true,
+    ignoreXattrs: true,
+    ignorePermissions: true,
+  }).options, {
+    ignoreOwnership: true,
+    ignoreAcls: true,
+    ignoreXattrs: true,
+    ignorePermissions: true,
+  })
+
+  // --- the dialog, end to end ----------------------------------------------
+
+  jobs.length = 0
+  const dlg = openFileRestoreDialog(ANAS, {
+    task: 'nightly-pictures',
+    repo: 'pbs-main',
+    ns: 'anas/pictures',
+    homeByArchive: { data: '/mnt/pictures' },
+  })
+  ok('file restore: the task door opened the restore dialog', dlg && dlg.cls === 'anas-win-backup-restore')
+
+  // Point in time → the picker, then Select.
+  const snapBtn = dlg.down('#restoreSnapPick')
+  ok('file restore: the dialog has a point-in-time button', !!snapBtn)
+  snapBtn.handler(snapBtn)
+  await settle()
+  const snapWin = openWindow()
+  ok('file restore: it opened the SHARED snapshot picker', snapWin && snapWin.cls === 'anas-win-snapshot-picker')
+  snapWin.down('#snapGrid').selectRow(0)
+  const snapSelect = snapWin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelect.handler(snapSelect)
+  await settle()
+  eq('file restore: the composed snapshot id is carried WHOLE (never a bare group)',
+    dlg.down('#restoreSnapshot').getValue(), 'host/pictures/2026-08-25T19:16:45Z')
+  eq('file restore: the archive combo took the pxar archive and dropped the image',
+    dlg.down('#restoreArchive').getValue(), 'data.pxar')
+  eq('file restore: choosing the archive followed it to ITS live home',
+    dlg.down('#restoreHome').getValue(), '/mnt/pictures')
+
+  // Files → the archive-backed multi-select picker. Pick the HARDLINK only.
+  const filesBtn = dlg.down('#restoreFilesPick')
+  filesBtn.handler(filesBtn)
+  await settle()
+  const filePicker = openWindow()
+  ok('file restore: it opened the shared path picker on the ARCHIVE backend',
+    filePicker && filePicker.cls === 'anas-win-path-picker')
+  const tree = filePicker.down('#pickerTree')
+  const rootKids = filePicker.down('#pickerTree').getStore().getRootNode().childNodes
+  const hardB = rootKids.find(n => n.get('name') === 'hard-b.txt')
+  ok('file restore: the archive level listed the hardlink', !!hardB)
+  tree.fireEvent('selectionchange', tree.getSelectionModel(), [hardB])
+  const fileSelect = filePicker.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  fileSelect.handler(fileSelect)
+  await settle()
+
+  // Submit.
+  const submit = dlg.down('#restoreSubmit')
+  submit.handler(submit)
+  await settle()
+
+  ok('file restore: the dialog submitted exactly one request', jobs.length === 1, `${jobs.length}`)
+  const sent = jobs[0] || {}
+  eq('file restore: it is a POST to the ONE restore door', `${sent.method} ${sent.path}`, 'post /backup/restore')
+  ok('file restore: it goes through confirmAndRun so a 409 can be answered',
+    Object.prototype.hasOwnProperty.call(sent, 'confirmWindow'))
+  eq('file restore: the hardlink group travelled as ONE unit (GT-25)',
+    sent.body && sent.body.selections, ['/hard-b.txt', '/hard-a.txt'])
+  eq('file restore: the body carries the task door`s full context', sent.body, {
+    kind: 'files',
+    repo: 'pbs-main',
+    snapshot: 'host/pictures/2026-08-25T19:16:45Z',
+    archive: 'data.pxar',
+    selections: ['/hard-b.txt', '/hard-a.txt'],
+    target: { mode: 'sideBySide', path: '/mnt/pictures' },
+    options: {},
+    ns: 'anas/pictures',
+    task: 'nightly-pictures',
+  })
+
+  // The same dialog, in place, with a DIRECTORY picked.
+  jobs.length = 0
+  const dlg2 = openFileRestoreDialog(ANAS, {
+    task: 'nightly-pictures',
+    repo: 'pbs-main',
+    ns: 'anas/pictures',
+    homeByArchive: { data: '/mnt/pictures' },
+  })
+  const snapBtn2 = dlg2.down('#restoreSnapPick')
+  snapBtn2.handler(snapBtn2)
+  await settle()
+  const snapWin2 = openWindow()
+  snapWin2.down('#snapGrid').selectRow(0)
+  const snapSelect2 = snapWin2.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelect2.handler(snapSelect2)
+  await settle()
+  dlg2.down('#restoreInPlace').setValue(true)
+  const filesBtn2 = dlg2.down('#restoreFilesPick')
+  filesBtn2.handler(filesBtn2)
+  await settle()
+  const filePicker2 = openWindow()
+  const tree2 = filePicker2.down('#pickerTree')
+  const docs = tree2.getStore().getRootNode().childNodes.find(n => n.get('name') === 'docs')
+  ok('file restore: the archive level listed the directory', !!docs)
+  tree2.fireEvent('selectionchange', tree2.getSelectionModel(), [docs])
+  const fileSelect2 = filePicker2.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  fileSelect2.handler(fileSelect2)
+  await settle()
+  const submit2 = dlg2.down('#restoreSubmit')
+  submit2.handler(submit2)
+  await settle()
+
+  eq('file restore: the in-place tree body carries mode inPlace', jobs.length && jobs[0].body.target, {
+    mode: 'inPlace',
+    path: '/mnt/pictures',
+  })
+  eq('file restore: …and the directory selection', jobs.length && jobs[0].body.selections, ['/docs'])
+
+  // Nothing may be sent without a selection.
+  jobs.length = 0
+  const dlg3 = openFileRestoreDialog(ANAS, { task: 'nightly-pictures', repo: 'pbs-main' })
+  const submit3 = dlg3.down('#restoreSubmit')
+  submit3.handler(submit3)
+  await settle()
+  ok('file restore: an empty dialog sends NOTHING', jobs.length === 0, `${jobs.length}`)
+
+  ok('file restore: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  5d. backup2.6 — both restore doors exist on the Backup screen
+// ============================================================================
+
+async function restoreDoorChecks() {
+  const ANAS = loadRestoreSources()
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+
+  // Door 1: the toolbar, always available — the point of the task-less door is
+  // that there may be no task to select.
+  const toolbarDoor = grid.down('#backupRestoreRepo')
+  ok('file restore: the Backup toolbar has "Restore from repository…"', !!toolbarDoor)
+  ok('file restore: the task-less door needs no selection', toolbarDoor && !toolbarDoor.disabled)
+  created.windows.length = 0
+  toolbarDoor.handler(toolbarDoor)
+  await settle()
+  const repoDlg = openWindow()
+  ok('file restore: the toolbar door opens the restore dialog',
+    repoDlg && repoDlg.cls === 'anas-win-backup-restore')
+  ok('file restore: the repository door asks for the repository, namespace and group',
+    repoDlg && !!repoDlg.down('#restoreRepo') && !!repoDlg.down('#restoreNs') && !!repoDlg.down('#restoreGroup'))
+  // The group is a real choice, not a name to remember: the door exists because
+  // the task that would have known it is gone.
+  ok('file restore: the group combo was filled from the repository`s groups',
+    repoDlg && repoDlg.down('#restoreGroup').getStore().getCount() > 0,
+    `${repoDlg && repoDlg.down('#restoreGroup').getStore().getCount()}`)
+  // …and with no group named, the point-in-time picker does not open on nothing.
+  created.windows.length = 0
+  repoDlg.down('#restoreGroup').setValue('')
+  const emptySnap = repoDlg.down('#restoreSnapPick')
+  emptySnap.handler(emptySnap)
+  await settle()
+  ok('file restore: no group means no empty point-in-time picker', created.windows.length === 0)
+
+  // Door 2: the task detail window.
+  grid.selectRow(0)
+  created.windows.length = 0
+  const detailsBtn = grid.down('#backupDetails')
+  detailsBtn.handler(detailsBtn)
+  await settle()
+  const detail = openWindow()
+  ok('file restore: the task detail window opened', detail && detail.cls === 'anas-win-backup-detail')
+  const detailDoor = detail && detail.buttonCmps.find(b => b.itemId === 'backupDetailRestore')
+  ok('file restore: the task detail has a Restore… button', !!detailDoor)
+  ok('file restore: it went live once the detail loaded', detailDoor && detailDoor.disabled === false)
+  created.windows.length = 0
+  detailDoor.handler(detailDoor)
+  await settle()
+  const taskDlg = openWindow()
+  ok('file restore: the task door opens the same dialog',
+    taskDlg && taskDlg.cls === 'anas-win-backup-restore')
+  ok('file restore: the task door does NOT ask for a group — the task knows it',
+    taskDlg && !taskDlg.down('#restoreGroup'))
+  eq('file restore: the task door carries the task`s repository',
+    taskDlg && taskDlg.down('#restoreRepo').getValue(), 'pbs-main')
+
+  ok('file restore: nothing warned in the doors', warnings.length === 0, warnings.join(' | '))
+}
+
 // ============================================================================
 
 await backupChecks()
@@ -3513,6 +3875,12 @@ warnings.length = 0
 await pickerChecks()
 warnings.length = 0
 await pickedPathChecks()
+warnings.length = 0
+created.windows.length = 0
+await restoreChecks()
+warnings.length = 0
+created.windows.length = 0
+await restoreDoorChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

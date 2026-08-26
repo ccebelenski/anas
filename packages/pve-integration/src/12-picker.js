@@ -650,12 +650,47 @@
         var value = currentValue(win, cfg);
         if (cfg.onSelect) {
             try {
-                cfg.onSelect(value);
+                // The ROWS ride along as a second argument. A caller that only
+                // wants paths ignores it (every pre-backup2.6 caller does), but
+                // a restore has to know whether a pick was a DIRECTORY: an
+                // in-place restore of a tree is confirm-gated and a single file
+                // is not, and that is decided from the type, never from the
+                // shape of the path.
+                cfg.onSelect(value, currentRows(win, cfg));
             } catch (e) {
                 warn('picker select failed: ' + errText(e));
             }
         }
         win.close();
+    }
+
+    /**
+     * The rows behind the value: the checked ones in multi-select, the single
+     * highlighted one otherwise. Empty when the answer was typed rather than
+     * picked — a typed path has no type, and pretending otherwise would be a
+     * guess.
+     */
+    function currentRows(win, cfg) {
+        var all = win._picked || [];
+        var usable = [];
+        for (var i = 0; i < all.length; i++) {
+            if (all[i].selectable !== false) {
+                usable.push(all[i]);
+            }
+        }
+        if (!cfg.multiSelect) {
+            // Single-select hands back the FIELD, so a row only counts when it
+            // is the row the field is showing.
+            var typed = normalizePath(trim(fieldValue(win)) || (win._dir || '/'));
+            var hit = [];
+            for (var j = 0; j < usable.length; j++) {
+                if (normalizePath(usable[j].path || '') === typed) {
+                    hit.push(usable[j]);
+                }
+            }
+            return hit;
+        }
+        return usable;
     }
 
     function openPathPicker(cfg) {

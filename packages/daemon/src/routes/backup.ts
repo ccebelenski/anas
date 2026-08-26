@@ -1,5 +1,6 @@
 import type {
   BackupBrowseResult,
+  BackupFilesRestoreRequest,
   BackupGroupList,
   BackupImageRestoreRequest,
   BackupLunSource,
@@ -34,13 +35,16 @@ import {
   BackupRestoreRequest,
   BackupRunRequest,
   BackupTaskRequest,
+  classifyArchiveFile,
   composeGroupId,
   effectiveArchiveKind,
   effectiveIncludeNested,
+  groupOfSnapshotId,
   hasRetentionKeeps,
+  sideBySideRestorePath,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
-import { readPbsStorages } from '../parsers/pve-storage.js'
+import { readPbsStorages, readPveMountPaths } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { browseArchiveLevel } from '../services/backup-catalog.js'
@@ -62,6 +66,17 @@ import {
   writeBackupRepos,
   writeRepoSecret,
 } from '../services/backup-repos.js'
+import {
+  availableBytes,
+  bareArchiveName,
+  estimateSpace,
+  parentDirectory,
+  pathExists,
+  pveTerritoryReason,
+  readSelectionFacts,
+  runFileRestore,
+  writeTestDirectory,
+} from '../services/backup-restore-files.js'
 import {
   assertSizeMatch,
   imageArchiveSize,
@@ -96,6 +111,7 @@ import {
   writeTaskUnits,
 } from '../services/backup-units.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
+import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import {
   assertInstalled,
   assertSaveable,
@@ -133,6 +149,9 @@ import { requireIdentity } from './identity.js'
  *   GET    /v1/backup/tasks/:name/snapshots → the task group's points in time
  *   GET    /v1/backup/repos/:name/groups → groups (and, with ?group=, their
  *                                        snapshots) — the task-less door
+ *   POST   /v1/backup/restore          → the ONE restore door: `kind: files`
+ *                                        (backup2.6, selective) and
+ *                                        `kind: image` (backup2.7, whole)
  *   POST   /v1/backup/restore/browse   → one directory level of an archive,
  *                                        via catalog shell over a pipe (backup2.5)
  *   POST   /v1/backup/restore         → whole-image LUN restore (backup2.7);
@@ -164,6 +183,9 @@ export interface BackupRouteOptions {
    */
   iscsiPaths?: IscsiPaths
 }
+
+/** Trailing slashes on a restore target (the root survives as `/`). */
+const RESTORE_TRAILING_SLASHES_RE = /\/+$/
 
 function CONFLICT(version: number) {
   return {
@@ -1302,14 +1324,20 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   // end and LIO stands down while it happens). Sharing a handler between them
   // would mean a body where half the fields are inert on any given call.
   //
-  // The files branch is `backup2.6`'s. It is refused here with a sentence
-  // rather than half-built; when it lands, `case 'files'` gains its one call and
-  // nothing else in this route moves.
+  // Each branch is one call into its own service, and the `switch` is the whole
+  // join: `backup2.7` built the image half, `backup2.6` the file half, and
+  // neither knows anything about the other.
   server.post('/backup/restore', async (request, reply) => {
     const parsed = BackupRestoreRequest.safeParse(request.body ?? {})
     if (!parsed.success) {
+      // Name the FIELD, not just the shape. A restore body is long enough that
+      // "expected array, received undefined" identifies nothing on its own, and
+      // the two kinds have different fields — so which one is wrong is exactly
+      // the thing the caller needs told (backup2.6 merge fix-up).
+      const issue = parsed.error.issues[0]
+      const where = issue?.path.length ? `${issue.path.join('.')}: ` : ''
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid restore request: ${parsed.error.issues[0]?.message}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid restore request: ${where}${issue?.message}` } }
     }
     const req = parsed.data
 
@@ -1318,14 +1346,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         return restoreImage(request, reply, req)
       case 'files':
       default:
-        reply.code(400)
-        return {
-          error: {
-            code: 'VALIDATION_ERROR',
-            message: 'File restore is not yet available — this release restores whole block images only '
-              + '(a LUN\'s zvol or image file). Send kind: "image".',
-          },
-        }
+        return restoreFiles(request, reply, req)
     }
   })
 
@@ -1596,6 +1617,281 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       })),
     )
 
+    reply.code(202)
+    return { job }
+  }
+  // --- The SELECTIVE FILE branch (story backup2.6) -------------------------
+  //
+  // The pre-flight order below is an order, not a set: every refusal happens
+  // before the client is called at all, and the cheapest, most local checks
+  // come first. Each one exists because the client fails LATE, DESTRUCTIVELY
+  // or SILENTLY without it:
+  //
+  //   1. whose storage is this?  PVE territory, and a live LUN's backing
+  //   2. a side-by-side directory is NEW — never reuse a half-finished one
+  //   3. what IS the selection?  hardlink groups completed, trees identified,
+  //      file sizes read — ONE catalog-shell session                 <- GT-25/24
+  //   4. can we write there?     a read-only target fails at the FIRST file
+  //                                                                  <- GT-56 F8
+  //   5. does it fit?            ENOSPC leaves a half-written tree
+  //   6. the confirm gate, for an IN-PLACE restore of a TREE and nothing else
+  //
+  // Only then is a job submitted, and only inside that job does anything change.
+  async function restoreFiles(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    req: BackupFilesRestoreRequest,
+  ): Promise<unknown> {
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!confirmStore) {
+      reply.code(503)
+      return {
+        error: {
+          code: 'UNAVAILABLE',
+          message: 'The confirmation store is not configured, so an in-place restore cannot be gated. '
+            + 'Restore is refused rather than run unguarded.',
+        },
+      }
+    }
+
+    // A block image has no inside to select from — `catalog shell` answers
+    // `Can only mount pxar archives.` — so it is refused here by NAME, before
+    // any contact, and pointed at its own door.
+    const { kind: archiveKind } = classifyArchiveFile(req.archive)
+    if (archiveKind !== 'pxar') {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: `'${req.archive}' is not a file archive - a block image is restored whole, from the LUN it backs, `
+            + 'not by picking files out of it.',
+        },
+      }
+    }
+
+    const deps = await readDepsFor(req.repo, reply, req.ns?.trim() || undefined)
+    if (!deps)
+      return
+
+    // --- Where does it land? -------------------------------------------------
+    // The HOME is the archive's live directory: the caller's `path` when it
+    // sent one, else the task archive of this name. An expanded archive
+    // (backup2.3's `<name>__<child>`) matches no stored archive on purpose —
+    // its name flattened a path and cannot be inverted — so the caller names
+    // the directory and ANAS guesses nothing. Nothing here creates a dataset.
+    let home = req.target.path
+    if (!home && req.task) {
+      const task = await readTask(systemdDir, req.task)
+      home = task?.archives.find(a => a.name === bareArchiveName(req.archive))?.path
+    }
+    if (!home) {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: `Name the directory to restore ${req.target.mode === 'inPlace' ? 'into' : 'beside'} `
+            + `(target.path): archive '${req.archive}' does not match an archive of a task on this node.`,
+        },
+      }
+    }
+
+    const target = req.target.mode === 'inPlace'
+      ? home.replace(RESTORE_TRAILING_SLASHES_RE, '') || '/'
+      : sideBySideRestorePath(home, req.snapshot)
+    if (!target) {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: `A side-by-side restore needs a directory to sit beside; '${home}' has none.`,
+        },
+      }
+    }
+
+    // --- Pre-flight 1: whose storage is this? --------------------------------
+    // Two hard refusals with no override.
+    //
+    // PVE's territory is read-only and hands-off, always.
+    const pveMountPaths = await readPveMountPaths(paths.pveStorageCfg).catch(() => new Map<string, string>())
+    const pveReason = pveTerritoryReason(target, [...pveMountPaths.keys()])
+    if (pveReason) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: pveReason } }
+    }
+    // And a live iSCSI LUN's backing object is a block device somebody else has
+    // open. `heldByLun` is the ONE question iscsi.6 established for exactly this
+    // — it catches the backing path itself AND any directory that CONTAINS one,
+    // which is the real hazard here: a file-backed LUN is an ordinary file, so
+    // an in-place `--overwrite` restore into its directory would rewrite it
+    // silently while initiators are mid-write. Fail-open: no LIO, nothing held.
+    const held = await heldByLun(
+      createIscsiClaimCache(executor, iscsiPaths),
+      { path: target },
+    )
+    if (held) {
+      const refusal = heldByLunRefusal(`'${target}'`, 'Restoring files into', held)
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
+    }
+
+    // --- Pre-flight 2: a side-by-side directory is NEW, always ---------------
+    // Never reuse: a second restore of the same point in time into a
+    // half-finished first one would merge two attempts with no way to tell
+    // them apart — including a partial one this daemon labelled itself.
+    if (req.target.mode === 'sideBySide') {
+      const exists = await pathExists(executor, target)
+      if (exists === true) {
+        reply.code(409)
+        return {
+          error: {
+            code: 'CONFLICT',
+            message: `'${target}' already exists. A side-by-side restore always creates a new directory - `
+              + 'move or remove that one first (if it holds a .anas-restore-partial marker, it is an '
+              + 'unfinished restore of this same point in time).',
+          },
+        }
+      }
+    }
+
+    // --- Pre-flight 3: what IS the selection? --------------------------------
+    // One catalog-shell session: hardlink groups completed (a partly-named
+    // group fails the whole job), directories identified (the gate's only
+    // trigger), file sizes read (the exact space figure).
+    const browseDeps = { ...deps, snapshot: req.snapshot, archive: req.archive, path: '/' }
+    const facts = await readSelectionFacts(executor, browseDeps, req.selections)
+    if (facts.unknown.length) {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: `This snapshot's '${req.archive}' does not hold ${facts.unknown.join(', ')} - `
+            + 'the client would report success and restore nothing for those, so the restore is refused instead.',
+        },
+      }
+    }
+
+    // --- Pre-flight 4: can we write there at all? ----------------------------
+    // A read-only or dead target does not fail at the start: the client enters
+    // the directory happily and dies at the FIRST FILE. For a side-by-side
+    // restore the directory does not exist yet, so the test goes where it will
+    // be created.
+    const writeDir = req.target.mode === 'inPlace' ? target : parentDirectory(target)
+    const writable = await writeTestDirectory(executor, writeDir)
+    if (!writable.ok) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: writable.detail } }
+    }
+
+    // --- Pre-flight 5: does it fit? ------------------------------------------
+    // The exact sum of the picked files when every selection is a file, else
+    // the manifest's logical archive size (GT-4) — an upper bound, and the
+    // refusal says which figure it used.
+    const warnings = [...facts.warnings]
+    let archiveBytes: number | null = null
+    const group = groupOfSnapshotId(req.snapshot)
+    if (facts.exactBytes === null && group) {
+      const listing = await listSnapshots(executor, deps, group)
+      if (listing.ok) {
+        const snap = listing.data.find(s => s.snapshot === req.snapshot)
+        const file = snap?.files.find(f => f.archive === req.archive)
+        archiveBytes = typeof file?.size === 'number' ? file.size : null
+      }
+      if (archiveBytes === null)
+        warnings.push('The archive size could not be read, so the restore ran without a space check.')
+    }
+    const available = await availableBytes(executor, writeDir)
+    const space = estimateSpace(
+      facts.exactBytes ?? archiveBytes,
+      facts.exactBytes !== null,
+      available,
+      writeDir,
+    )
+    if (space.refuse) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Not enough free space for this restore. ${space.detail}` } }
+    }
+
+    // --- Pre-flight 6: the confirm gate, and ONLY here -----------------------
+    // An in-place restore of a TREE is the one shape that can rewrite an
+    // unbounded amount of live data, so it is the one shape that asks. A single
+    // explicitly picked file restored in place is NOT gated: the operator
+    // pointed at that file and ticked the in-place box, and that IS the
+    // consent. Side-by-side is never gated at all — it writes only into a
+    // directory that did not exist a moment ago.
+    if (req.target.mode === 'inPlace' && facts.hasDirectory) {
+      if (!confirmGate(confirmStore, request, reply, {
+        operation: 'backup.restore.files',
+        params: { target, snapshot: req.snapshot, archive: req.archive, mode: 'inPlace' },
+        message: `Restore a directory from ${req.snapshot} INTO '${target}', over the live data`,
+        warnings: [
+          `Files in the snapshot will replace the ones in '${target}' that have the same names.`,
+          'This is a MERGE, never a sync: anything under the target that is not in the archive is left exactly as it is.',
+          'A directory selection restores the whole tree below it.',
+        ],
+      })) {
+        return reply
+      }
+    }
+
+    const job = jobQueue.submit(
+      'backup.restore.files',
+      {
+        ...identity,
+        params: {
+          ...(req.task ? { task: req.task } : {}),
+          repo: deps.repo.name,
+          ...(deps.namespace ? { namespace: deps.namespace } : {}),
+          snapshot: req.snapshot,
+          archive: req.archive,
+          selections: facts.selections.length,
+          target,
+          mode: req.target.mode,
+        },
+      },
+      async (updateProgress) => {
+        const result = await runFileRestore(
+          executor,
+          {
+            ...deps,
+            snapshot: req.snapshot,
+            archive: req.archive,
+            target,
+            mode: req.target.mode,
+            selections: facts.selections,
+            addedForHardlinks: facts.addedForHardlinks,
+            options: req.options,
+            ...(req.rate ? { rate: req.rate } : {}),
+            warnings,
+          },
+          updateProgress,
+        )
+        // The audit record the job queue writes names the operation and its
+        // params; the BYTES are only known when the client has finished, so
+        // they get their own journald line at that moment. journald is
+        // forensics — the authoritative answer is the filesystem itself.
+        server.log.info(
+          {
+            event: 'backup.restore.files',
+            user: identity.user,
+            snapshot: req.snapshot,
+            archive: req.archive,
+            selections: facts.selections.length,
+            target,
+            mode: req.target.mode,
+            status: result.status,
+            bytes: result.bytes ?? 0,
+            restored: result.restored.length,
+            missing: result.missing.length,
+          },
+          `audit: restored ${result.restored.length}/${result.selections.length} selection(s) of `
+          + `${req.archive} from ${req.snapshot} into ${target} (${req.target.mode}, ${result.bytes ?? 0} bytes)`,
+        )
+        return result
+      },
+    )
     reply.code(202)
     return { job }
   }

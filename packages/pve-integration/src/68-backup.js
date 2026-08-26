@@ -1767,10 +1767,22 @@
             if (body.destroyed || body.destroying) {
                 return;
             }
+            // The Restore door lives on this window and needs the same facts
+            // the body just rendered: which repository, which namespace, and
+            // where each archive's live home is.
+            win._detail = (res && res.data) || null;
             try {
                 body.update(taskDetailHtml(res && res.data));
             } catch (e) {
                 ANAS.warn('backup detail render failed: ' + ANAS.errText(e));
+            }
+            try {
+                var restoreBtn = win.down('#backupDetailRestore');
+                if (restoreBtn) {
+                    restoreBtn.setDisabled(!win._detail);
+                }
+            } catch (e2) {
+                // non-fatal
             }
         }, function (err) {
             if (body.destroyed || body.destroying) {
@@ -1808,6 +1820,19 @@
                     html: '',
                 }],
                 buttons: [
+                    {
+                        // The TASK-BOUND restore door (backup2.6). It opens on
+                        // this task's own repository, namespace and group, so
+                        // the operator picks a point in time and some files and
+                        // nothing else. Disabled until the detail has loaded —
+                        // the archive homes come from it.
+                        text: t('Restore…'),
+                        itemId: 'backupDetailRestore',
+                        cls: 'anas-btn-backup-detail-restore',
+                        iconCls: 'fa fa-undo',
+                        disabled: true,
+                        handler: function () { openRestoreFromDetail(win, node, name); },
+                    },
                     {
                         text: t('Reload'),
                         cls: 'anas-btn-backup-detail-reload',
@@ -4363,6 +4388,18 @@
                     openReposManager(node);
                 },
             },
+            {
+                // The TASK-LESS restore door (backup2.6): for archives whose
+                // task was renamed or deleted. It needs no selection, because
+                // the point is that there may be no task to select.
+                text: t('Restore from repository…'),
+                itemId: 'backupRestoreRepo',
+                cls: 'anas-btn-backup-restore-repo',
+                iconCls: 'fa fa-undo',
+                handler: function () {
+                    openRestoreWizard(node, {});
+                },
+            },
             '-',
             {
                 text: t('Run Now'),
@@ -4542,6 +4579,781 @@
             },
         };
     }
+
+
+    // ======================================================================
+    //  Restore (story backup2.6) — 'anas-win-backup-restore'
+    //
+    //  TWO DOORS, one dialog:
+    //    * the task detail's "Restore…" — the task supplies the repository,
+    //      the namespace, the group and the archive's live home, so the
+    //      operator picks a point in time and some files and nothing else;
+    //    * the toolbar's "Restore from repository…" — for archives whose task
+    //      was renamed or deleted. Repository → namespace → group → point in
+    //      time, and the target directory has to be named because nothing on
+    //      this node remembers where the archive came from.
+    //
+    //  What the dialog does NOT do is decide anything about safety. The daemon
+    //  owns every refusal and the confirm gate; this screen's job is to say,
+    //  before the button is pressed, exactly what is about to happen — which
+    //  directory, merge or new, and what the ownership toggles really cost.
+    //
+    //  `img` archives are not offered here at all. A block image is restored
+    //  WHOLE, from the LUN it backs; picking files out of one is not a thing,
+    //  and the archive combo simply does not list it.
+    // ======================================================================
+
+    /** The `<type>/<id>/<RFC3339>` snapshot id, split — display only. */
+    var SNAPSHOT_ID_RE = /^([^/]+)\/([^/]+)\/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$/;
+
+    /**
+     * The side-by-side directory the daemon will create:
+     * `<home>.anas-restore-<snapshot time>`, colons turned to dashes because a
+     * colon cannot be represented over SMB and this directory very often lands
+     * inside a share.
+     *
+     * DISPLAY ONLY. The daemon computes the real one from the same rule and its
+     * answer is what lands on disk; this is here so the screen can show the name
+     * before the operator commits, never to decide it.
+     */
+    function sideBySideName(home, snapshot) {
+        var m = SNAPSHOT_ID_RE.exec(trim(snapshot));
+        if (!m) {
+            return '';
+        }
+        var base = trim(home).replace(/\/+$/, '');
+        if (!base || base === '/') {
+            return '';
+        }
+        return base + '.anas-restore-' + m[3].replace(/:/g, '-');
+    }
+
+    /**
+     * The archives of one snapshot row that a FILE restore may offer.
+     *
+     * `img` is excluded by nature, not by policy: a block image has no inside
+     * to pick from. Its door is the LUN's own.
+     */
+    function restorableArchives(rows) {
+        var list = isArray(rows) ? rows : [];
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            var a = list[i] || {};
+            if (a.kind === 'pxar' && a.archive) {
+                out.push(a);
+            }
+        }
+        return out;
+    }
+
+    /** The logical size of one archive in a snapshot row — the space estimate. */
+    function archiveBytes(rows, archive) {
+        var list = isArray(rows) ? rows : [];
+        for (var i = 0; i < list.length; i++) {
+            if ((list[i] || {}).archive === archive && typeof list[i].size === 'number') {
+                return list[i].size;
+            }
+        }
+        return undefined;
+    }
+
+    /** Does this selection hold a DIRECTORY? (the picker knows; a path does not) */
+    function hasDirectorySelection(rows) {
+        var list = isArray(rows) ? rows : [];
+        for (var i = 0; i < list.length; i++) {
+            if ((list[i] || {}).type === 'dir') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Will the daemon ask for a confirm code?
+     *
+     * Only an IN-PLACE restore whose selection holds a directory. A single
+     * explicitly picked file restored in place is not gated — the operator
+     * pointed at that file and ticked the box, and that IS the consent. The
+     * daemon decides; this only lets the dialog say so in advance.
+     */
+    function needsConfirm(mode, rows) {
+        return mode === 'inPlace' && hasDirectorySelection(rows);
+    }
+
+    /**
+     * The POST body, built from one plain context object so the contract can be
+     * asserted without an ExtJS window.
+     *
+     * Omission is meaningful: `ns`, `task`, `rate` and every un-ticked ignore
+     * flag are simply absent. A restore is one-shot, not stored config, so
+     * `false` and absent mean the same thing and the shorter body is the honest
+     * one.
+     */
+    function restoreBody(ctx) {
+        var c = ctx || {};
+        var body = {
+            kind: 'files',
+            repo: c.repo,
+            snapshot: c.snapshot,
+            archive: c.archive,
+            selections: isArray(c.selections) ? c.selections : [],
+            target: { mode: c.mode === 'inPlace' ? 'inPlace' : 'sideBySide' },
+            options: {},
+        };
+        if (trim(c.ns)) {
+            body.ns = trim(c.ns);
+        }
+        if (trim(c.task)) {
+            body.task = trim(c.task);
+        }
+        if (trim(c.home)) {
+            body.target.path = trim(c.home);
+        }
+        var flags = ['ignoreOwnership', 'ignoreAcls', 'ignoreXattrs', 'ignorePermissions'];
+        for (var i = 0; i < flags.length; i++) {
+            if (c[flags[i]] === true) {
+                body.options[flags[i]] = true;
+            }
+        }
+        if (trim(c.rate)) {
+            body.rate = trim(c.rate);
+        }
+        return body;
+    }
+
+    /** The dialog's live context — every field read by itemId, never mirrored. */
+    function restoreContext(win) {
+        return {
+            repo: trim(valOf(win, '#restoreRepo')),
+            ns: trim(valOf(win, '#restoreNs')),
+            task: win._task || '',
+            snapshot: trim(valOf(win, '#restoreSnapshot')),
+            archive: trim(valOf(win, '#restoreArchive')),
+            selections: isArray(win._selections) ? win._selections : [],
+            mode: valOf(win, '#restoreInPlace') === true ? 'inPlace' : 'sideBySide',
+            home: trim(valOf(win, '#restoreHome')),
+            ignoreOwnership: valOf(win, '#restoreIgnoreOwnership') === true,
+            ignoreAcls: valOf(win, '#restoreIgnoreAcls') === true,
+            ignoreXattrs: valOf(win, '#restoreIgnoreXattrs') === true,
+            ignorePermissions: valOf(win, '#restoreIgnorePermissions') === true,
+            rate: trim(valOf(win, '#restoreRate')),
+        };
+    }
+
+    function restoreNote(win, itemId, html) {
+        try {
+            var c = win.down('#' + itemId);
+            if (c) {
+                c.update(html || '');
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    function mutedSpan(text) {
+        return '<span style="color:var(--anas-muted,gray);font-size:0.9em;">' + enc(text) + '</span>';
+    }
+
+    /** Repaint the target line, the estimate and the selection summary. */
+    function refreshRestore(win) {
+        var ctx = restoreContext(win);
+        var rows = isArray(win._selectionRows) ? win._selectionRows : [];
+
+        var selectionHtml;
+        if (!ctx.selections.length) {
+            selectionHtml = mutedSpan(t('Nothing picked yet.'));
+        } else {
+            var names = [];
+            for (var i = 0; i < ctx.selections.length && i < 12; i++) {
+                names.push(enc(ctx.selections[i]));
+            }
+            selectionHtml = '<span style="font-family:monospace;font-size:0.9em;">' + names.join('<br>') + '</span>';
+            if (ctx.selections.length > names.length) {
+                selectionHtml += '<br>' + mutedSpan(t('and') + ' ' + (ctx.selections.length - names.length) + ' ' + t('more'));
+            }
+        }
+        restoreNote(win, 'restoreSelectionList', selectionHtml);
+
+        var targetHtml;
+        if (ctx.mode === 'inPlace') {
+            targetHtml = '<span style="font-family:monospace;">' + enc(ctx.home || '?') + '</span><br>'
+                + '<span style="color:var(--anas-warn,#b06a12);font-size:0.9em;">'
+                + enc(t('Restored files replace the ones with the same names. This is a MERGE, never a sync: '
+                    + 'anything under the target that is not in the backup is left exactly as it is.'))
+                + '</span>';
+            if (needsConfirm(ctx.mode, rows)) {
+                targetHtml += '<br>' + '<span style="color:var(--anas-warn,#b06a12);font-size:0.9em;">'
+                    + enc(t('The selection includes a directory, so ANAS will ask you to confirm before it runs.'))
+                    + '</span>';
+            }
+        } else {
+            var name = sideBySideName(ctx.home, ctx.snapshot);
+            targetHtml = name
+                ? '<span style="font-family:monospace;">' + enc(name) + '</span><br>'
+                    + mutedSpan(t('A NEW directory beside the source. Nothing already on disk is touched.'))
+                : mutedSpan(t('Pick a point in time and a source directory to see the target.'));
+        }
+        restoreNote(win, 'restoreTargetNote', targetHtml);
+
+        var bytes = archiveBytes(win._archives, ctx.archive);
+        restoreNote(win, 'restoreEstimate', bytes === undefined
+            ? mutedSpan(t('unknown until a point in time and an archive are picked'))
+            : enc(ANAS.formatBytes ? ANAS.formatBytes(bytes) : ('' + bytes))
+                + ' ' + mutedSpan(t('— the whole archive; a partial selection needs less')));
+    }
+
+    /** Fill the archive combo from the chosen snapshot, `img` excluded. */
+    function setRestoreArchives(win, archives) {
+        win._archives = restorableArchives(archives);
+        var combo = win.down('#restoreArchive');
+        if (!combo) {
+            return;
+        }
+        var data = [];
+        for (var i = 0; i < win._archives.length; i++) {
+            data.push({ archive: win._archives[i].archive, label: win._archives[i].archive });
+        }
+        try {
+            combo.getStore().loadData(data);
+        } catch (e) {
+            // non-fatal
+        }
+        try {
+            combo.setValue(data.length ? data[0].archive : '');
+        } catch (e2) {
+            // non-fatal
+        }
+        var skipped = (isArray(archives) ? archives.length : 0) - win._archives.length;
+        restoreNote(win, 'restoreArchiveNote', skipped > 0
+            ? mutedSpan(t('Block images are not listed here — an image is restored whole, from its LUN.'))
+            : '');
+    }
+
+    /**
+     * Follow the chosen archive to ITS live home, when the task door knows one.
+     * The field stays editable — a typed path is always first-class — but the
+     * dialog never leaves a stale home pointing at a different archive.
+     */
+    function applyArchiveHome(win) {
+        var map = win._homeByArchive || {};
+        var home = map[bareArchive(trim(valOf(win, '#restoreArchive')))];
+        if (!home) {
+            return;
+        }
+        try {
+            var f = win.down('#restoreHome');
+            if (f) {
+                f.setValue(home);
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    /** Open the point-in-time picker for whichever door this dialog is. */
+    function pickRestoreSnapshot(win, node) {
+        if (!ANAS.snapshotPicker) {
+            ANAS.warn('snapshot picker unavailable');
+            return;
+        }
+        var ctx = restoreContext(win);
+        var cfg = {
+            node: node,
+            onSelect: function (picked) {
+                try {
+                    var f = win.down('#restoreSnapshot');
+                    if (f) {
+                        f.setValue(picked.snapshot);
+                    }
+                } catch (e) {
+                    // non-fatal
+                }
+                win._selections = [];
+                win._selectionRows = [];
+                setRestoreArchives(win, picked.archives);
+                refreshRestore(win);
+            },
+        };
+        if (win._task) {
+            cfg.task = win._task;
+        } else {
+            var group = trim(valOf(win, '#restoreGroup'));
+            if (!ctx.repo || !group) {
+                // Without a group there is nothing to list: the repository door
+                // exists because no task remembers the name, so say which two
+                // things are still missing rather than opening an empty picker.
+                restoreNote(win, 'restoreArchiveNote',
+                    '<span style="color:var(--anas-warn,#b06a12);">'
+                    + enc(t('Choose a repository and a backup group first.')) + '</span>');
+                return;
+            }
+            cfg.repo = ctx.repo;
+            if (ctx.ns) {
+                cfg.ns = ctx.ns;
+            }
+            cfg.group = group;
+        }
+        ANAS.snapshotPicker(cfg);
+    }
+
+    /** Open the archive-backed multi-select picker for the chosen archive. */
+    function pickRestoreFiles(win, node) {
+        if (!ANAS.pathPicker) {
+            ANAS.warn('path picker unavailable');
+            return;
+        }
+        var ctx = restoreContext(win);
+        if (!ctx.snapshot || !ctx.archive) {
+            restoreNote(win, 'restoreSelectionList',
+                '<span style="color:var(--anas-warn,#b06a12);">'
+                + enc(t('Pick a point in time and an archive first.')) + '</span>');
+            return;
+        }
+        ANAS.pathPicker({
+            node: node,
+            backend: 'archive',
+            mode: 'any',
+            multiSelect: true,
+            value: '/',
+            title: t('Choose what to restore'),
+            archive: {
+                repo: ctx.repo,
+                ns: ctx.ns,
+                snapshot: ctx.snapshot,
+                archive: ctx.archive,
+            },
+            onSelect: function (paths, rows) {
+                win._selections = isArray(paths) ? paths : [];
+                win._selectionRows = isArray(rows) ? rows : [];
+                refreshRestore(win);
+            },
+        });
+    }
+
+    /** Submit. The daemon owns every refusal; this only sends the body. */
+    function submitRestore(win, node) {
+        var ctx = restoreContext(win);
+        if (!ctx.snapshot || !ctx.archive || !ctx.selections.length) {
+            restoreNote(win, 'restoreSelectionList',
+                '<span style="color:var(--anas-danger,#c23b2c);">'
+                + enc(t('Pick a point in time, an archive and at least one entry.')) + '</span>');
+            return;
+        }
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/backup/restore',
+            body: restoreBody(ctx),
+            view: win,
+            maxMs: 3600000,
+            confirmTitle: t('Restore over live data'),
+            confirmIntro: t('This restore writes into a directory that already holds data:'),
+            confirmButtonText: t('Restore'),
+            failTitle: t('Restore failed'),
+            successMsg: t('Restore finished'),
+            onSubmitted: function () {
+                try {
+                    win.close();
+                } catch (e) {
+                    // non-fatal
+                }
+            },
+            onComplete: function (job) {
+                var r = job && job.result;
+                if (!r) {
+                    return;
+                }
+                var missing = isArray(r.missing) ? r.missing.length : 0;
+                var restored = isArray(r.restored) ? r.restored.length : 0;
+                var msg = t('Restored') + ' ' + restored + '/' + (restored + missing)
+                    + ' ' + t('selected entries into') + ' ' + (r.target || '');
+                if (missing) {
+                    msg += ' — ' + t('not restored') + ': ' + (r.missing || []).join(', ');
+                }
+                try {
+                    ANAS.alertMsg(t('Restore'), msg);
+                } catch (e) {
+                    ANAS.toast(msg);
+                }
+            },
+        });
+    }
+
+    /**
+     * The restore dialog. `opts.task` names the task door (repository,
+     * namespace, group and the archive's home come from it); its absence is the
+     * repository door, where the operator names all four.
+     */
+    function openRestoreWizard(node, opts) {
+        var o = opts || {};
+        var win;
+        var archiveStore;
+        try {
+            archiveStore = Ext.create('Ext.data.Store', {
+                fields: ['archive', 'label'],
+                data: [],
+            });
+        } catch (eStore) {
+            ANAS.warn('restore dialog store failed: ' + ANAS.errText(eStore));
+            return null;
+        }
+
+        var items = [];
+        if (o.task) {
+            items.push({
+                xtype: 'component',
+                padding: '0 0 8 0',
+                html: mutedSpan(t('Restoring from the backup task') + ' ') + '<b>' + enc(o.task) + '</b>',
+            });
+            // Hidden-but-real fields: the repository and namespace ARE part of
+            // the request, so they are carried as fields read by itemId like
+            // every other value — never as a mirrored hidden copy of something
+            // else on screen.
+            items.push({ xtype: 'textfield', itemId: 'restoreRepo', hidden: true, value: o.repo || '' });
+            items.push({ xtype: 'textfield', itemId: 'restoreNs', hidden: true, value: o.ns || '' });
+        } else {
+            items.push({
+                xtype: 'combobox',
+                itemId: 'restoreRepo',
+                cls: 'anas-fld-restore-repo',
+                fieldLabel: t('Repository'),
+                store: Ext.create('Ext.data.Store', { fields: ['name', 'label'], data: [] }),
+                displayField: 'label',
+                valueField: 'name',
+                queryMode: 'local',
+                editable: true,
+                value: o.repo || '',
+                listeners: { change: function () { loadRestoreGroups(win, node); } },
+            });
+            items.push({
+                xtype: 'textfield',
+                itemId: 'restoreNs',
+                cls: 'anas-fld-restore-ns',
+                fieldLabel: t('Namespace'),
+                emptyText: t('the repository’s own'),
+                value: o.ns || '',
+                listeners: { change: function () { loadRestoreGroups(win, node); } },
+            });
+            items.push({
+                // A combo, not a plain field: the groups in a namespace are one
+                // read away and nobody remembers a backup-id. Typing still
+                // works — this door exists precisely because the task that
+                // would have known the name is gone.
+                xtype: 'combobox',
+                itemId: 'restoreGroup',
+                cls: 'anas-fld-restore-group',
+                fieldLabel: t('Backup group'),
+                emptyText: 'host/<backup-id>',
+                store: Ext.create('Ext.data.Store', { fields: ['group', 'label'], data: [] }),
+                displayField: 'label',
+                valueField: 'group',
+                queryMode: 'local',
+                editable: true,
+                value: o.group || '',
+            });
+        }
+
+        items.push({
+            xtype: 'fieldcontainer',
+            layout: 'hbox',
+            items: [
+                {
+                    xtype: 'textfield',
+                    itemId: 'restoreSnapshot',
+                    cls: 'anas-fld-restore-snapshot',
+                    fieldLabel: t('Point in time'),
+                    labelWidth: 130,
+                    flex: 1,
+                    // The full composed id is the value and is never truncated:
+                    // a bare group path would silently restore the LATEST.
+                    emptyText: 'host/<id>/<RFC3339>',
+                },
+                {
+                    xtype: 'button',
+                    itemId: 'restoreSnapPick',
+                    cls: 'anas-btn-restore-snap',
+                    text: t('Choose…'),
+                    margin: '0 0 0 6',
+                    handler: function () { pickRestoreSnapshot(win, node); },
+                },
+            ],
+        });
+        items.push({
+            xtype: 'combobox',
+            itemId: 'restoreArchive',
+            cls: 'anas-fld-restore-archive',
+            fieldLabel: t('Archive'),
+            store: archiveStore,
+            displayField: 'label',
+            valueField: 'archive',
+            queryMode: 'local',
+            editable: false,
+            listeners: {
+                change: function () {
+                    applyArchiveHome(win);
+                    refreshRestore(win);
+                },
+            },
+        });
+        items.push({ xtype: 'component', itemId: 'restoreArchiveNote', padding: '0 0 6 130', html: '' });
+
+        items.push({
+            xtype: 'fieldcontainer',
+            fieldLabel: t('Restore'),
+            labelWidth: 130,
+            layout: 'hbox',
+            items: [
+                {
+                    xtype: 'component',
+                    itemId: 'restoreSelectionList',
+                    flex: 1,
+                    html: mutedSpan(t('Nothing picked yet.')),
+                },
+                {
+                    xtype: 'button',
+                    itemId: 'restoreFilesPick',
+                    cls: 'anas-btn-restore-files',
+                    text: t('Choose files…'),
+                    margin: '0 0 0 6',
+                    handler: function () { pickRestoreFiles(win, node); },
+                },
+            ],
+        });
+
+        items.push({
+            xtype: 'textfield',
+            itemId: 'restoreHome',
+            cls: 'anas-fld-restore-home',
+            fieldLabel: t('Source directory'),
+            emptyText: '/srv/data',
+            value: o.home || '',
+            listeners: { change: function () { refreshRestore(win); } },
+        });
+        items.push({
+            xtype: 'checkbox',
+            itemId: 'restoreInPlace',
+            cls: 'anas-chk-restore-inplace',
+            fieldLabel: t('Restore in place'),
+            boxLabel: t('write into the source directory itself (a merge, never a sync)'),
+            checked: false,
+            listeners: { change: function () { refreshRestore(win); } },
+        });
+        items.push({
+            xtype: 'fieldcontainer',
+            fieldLabel: t('Target'),
+            labelWidth: 130,
+            items: [{ xtype: 'component', itemId: 'restoreTargetNote', html: '' }],
+        });
+
+        items.push({
+            xtype: 'fieldset',
+            title: t('Ownership, ACLs and permissions'),
+            collapsible: true,
+            collapsed: true,
+            padding: '6 10 8',
+            defaults: { anchor: '100%' },
+            items: [
+                {
+                    xtype: 'checkbox',
+                    itemId: 'restoreIgnoreOwnership',
+                    cls: 'anas-chk-restore-ignore-ownership',
+                    fieldLabel: t('Ignore ownership'),
+                    boxLabel: t('everything lands owned by root; an existing file keeps its current owner'),
+                },
+                {
+                    xtype: 'checkbox',
+                    itemId: 'restoreIgnoreAcls',
+                    cls: 'anas-chk-restore-ignore-acls',
+                    fieldLabel: t('Ignore ACLs'),
+                    boxLabel: t('named ACL entries are dropped; the file mode is still applied'),
+                },
+                {
+                    xtype: 'checkbox',
+                    itemId: 'restoreIgnoreXattrs',
+                    cls: 'anas-chk-restore-ignore-xattrs',
+                    fieldLabel: t('Ignore xattrs'),
+                    boxLabel: t('extended attributes are dropped; POSIX ACLs are not affected'),
+                },
+                {
+                    xtype: 'checkbox',
+                    itemId: 'restoreIgnorePermissions',
+                    cls: 'anas-chk-restore-ignore-permissions',
+                    fieldLabel: t('Ignore permissions'),
+                    // The honest consequence, measured: not "keeps the umask".
+                    boxLabel: t('newly created files land as 0600 — not their archived mode, and not your umask'),
+                },
+            ],
+        });
+
+        items.push({
+            xtype: 'fieldcontainer',
+            fieldLabel: t('Estimated size'),
+            labelWidth: 130,
+            items: [{ xtype: 'component', itemId: 'restoreEstimate', html: '' }],
+        });
+        items.push({
+            xtype: 'textfield',
+            itemId: 'restoreRate',
+            cls: 'anas-fld-restore-rate',
+            fieldLabel: t('Rate limit'),
+            emptyText: t('unlimited (e.g. 50MB)'),
+        });
+
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-backup-restore',
+                title: t('Restore Files'),
+                modal: true,
+                width: 660,
+                autoScroll: true,
+                bodyPadding: 12,
+                layout: 'anchor',
+                defaults: { anchor: '100%', labelWidth: 130 },
+                items: items,
+                buttons: [
+                    { text: t('Cancel'), handler: function () { win.close(); } },
+                    {
+                        text: t('Restore…'),
+                        itemId: 'restoreSubmit',
+                        cls: 'anas-btn-restore-submit',
+                        handler: function () { submitRestore(win, node); },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('restore dialog failed: ' + ANAS.errText(e));
+            return null;
+        }
+
+        win._task = o.task || '';
+        win._homeByArchive = o.homeByArchive || {};
+        win._selections = [];
+        win._selectionRows = [];
+        win._archives = [];
+        win.show();
+        if (!o.task) {
+            loadRestoreRepos(win, node);
+        }
+        refreshRestore(win);
+        return win;
+    }
+
+
+    /**
+     * The task-bound restore door: open the wizard on THIS task's repository,
+     * namespace and group, with every archive's live home to hand.
+     *
+     * `img` archives contribute nothing here — a block image is restored whole
+     * from its LUN, and its home would be a device, not a directory.
+     */
+    function openRestoreFromDetail(win, node, name) {
+        var detail = win._detail || {};
+        var task = detail.task || detail || {};
+        var homeByArchive = {};
+        var list = archivesOf(task);
+        for (var i = 0; i < list.length; i++) {
+            var a = list[i] || {};
+            if (a.name && a.path && archiveKindOf(a) !== 'img') {
+                homeByArchive[bareArchive(a.name)] = a.path;
+            }
+        }
+        openRestoreWizard(node, {
+            task: name,
+            repo: repoNameOf(task),
+            ns: first(task.namespace) || '',
+            homeByArchive: homeByArchive,
+        });
+    }
+
+    /**
+     * Fill the group combo from the chosen repository + namespace. One read,
+     * on a change the operator made — never a poll.
+     */
+    function loadRestoreGroups(win, node) {
+        var repo = trim(valOf(win, '#restoreRepo'));
+        var combo = win.down('#restoreGroup');
+        if (!repo || !combo) {
+            return;
+        }
+        var ns = trim(valOf(win, '#restoreNs'));
+        var url = '/backup/repos/' + encodeURIComponent(repo) + '/groups'
+            + (ns ? ('?ns=' + encodeURIComponent(ns)) : '');
+        return ANAS.api.get(node, url).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var d = (res && res.data) || {};
+            if (d.verdict && d.verdict !== 'ok') {
+                restoreNote(win, 'restoreArchiveNote',
+                    '<span style="color:var(--anas-warn,#b06a12);">'
+                    + enc(d.detail || t('The backup server could not be read.')) + '</span>');
+                return;
+            }
+            var groups = isArray(d.groups) ? d.groups : [];
+            var data = [];
+            for (var i = 0; i < groups.length; i++) {
+                var g = groups[i] || {};
+                if (!g.group) {
+                    continue;
+                }
+                data.push({
+                    group: g.group,
+                    label: g.group + (g.lastBackupIso ? ('  —  ' + t('last') + ' ' + g.lastBackupIso) : ''),
+                });
+            }
+            try {
+                combo.getStore().loadData(data);
+            } catch (e) {
+                // non-fatal
+            }
+        }, function (err) {
+            ANAS.warn('restore group list failed: ' + ANAS.errText(err));
+        });
+    }
+
+    /**
+     * Fill the repository combo for the task-less door.
+     *
+     * Through `loadRepoOptions` — the ONE repository-list builder in this file,
+     * PVE badge and all. A second loop here would drift from the wizard's list
+     * the first time the badge rule changed.
+     */
+    function loadRestoreRepos(win, node) {
+        return loadRepoOptions(node).then(function (opts) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            try {
+                var combo = win.down('#restoreRepo');
+                combo.getStore().loadData(opts);
+                // Default to the first repository when nothing is chosen yet —
+                // most nodes have one, and an empty combo cannot list groups.
+                // It stays a choice: changing it reloads the groups.
+                if (!trim(combo.getValue()) && opts.length) {
+                    combo.setValue(opts[0].name);
+                }
+            } catch (e) {
+                ANAS.warn('restore repo combo failed: ' + ANAS.errText(e));
+            }
+            loadRestoreGroups(win, node);
+        }, function (err) {
+            ANAS.warn('restore repo list failed: ' + ANAS.errText(err));
+        });
+    }
+
+    // The pure parts, exported so the dialog-contract harness can drive them
+    // without an ExtJS window — the same seam the picker uses.
+    ANAS.backupRestore = {
+        restoreBody: restoreBody,
+        restoreContext: restoreContext,
+        restorableArchives: restorableArchives,
+        archiveBytes: archiveBytes,
+        hasDirectorySelection: hasDirectorySelection,
+        needsConfirm: needsConfirm,
+        sideBySideName: sideBySideName,
+        open: openRestoreWizard,
+    };
 
     // ---- View registration -------------------------------------------------
 

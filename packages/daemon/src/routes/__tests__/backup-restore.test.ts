@@ -349,12 +349,17 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.equal(res.statusCode, 401)
     })
 
-    it('kind: files is REFUSED with "not yet available", never half-built', async () => {
+    // backup2.6 merge fix-up: the file branch is BUILT now, so `kind: 'files'`
+    // is no longer refused — it is dispatched. What still matters here is that
+    // the switch keeps the two kinds apart: a files body is judged by the FILE
+    // schema (it needs `selections`), never by the image one, and it never
+    // reaches anything the image restore does.
+    it('kind: files dispatches to the file branch, judged by the FILE schema', async () => {
       await serveAnas()
       const res = await restore({ kind: 'files', repo: 'pbs-main', snapshot: SNAP, archive: 'data.pxar' })
       assert.equal(res.statusCode, 400)
-      assert.match(res.body.error!.message, /not yet available/)
-      assert.match(res.body.error!.message, /whole block images only/)
+      assert.match(res.body.error!.message, /selections/)
+      assert.ok(!/\.img/.test(res.body.error!.message), 'not judged by the image schema')
       assertNothingDestructive()
     })
 

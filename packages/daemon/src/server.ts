@@ -515,8 +515,9 @@ export function createServer(opts?: ServerOptions) {
     prefix: '/v1',
     executor,
     jobQueue,
-    // backup2.7 — the whole-image LUN restore is a data-destroying op, so it
-    // rides the same 409 + X-Anas-Confirm-Code gate every other one does.
+    // backup2.6/2.7 — a whole-image LUN restore and an in-place file restore
+    // over live data both ride the same 409 + X-Anas-Confirm-Code gate every
+    // other data-destroying op does.
     confirmStore,
     paths: backupReposPaths,
     systemdDir,

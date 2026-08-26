@@ -1558,6 +1558,211 @@ export const BackupSnapshotPath = z
   )
 export type BackupSnapshotPath = z.infer<typeof BackupSnapshotPath>
 
+// ---- Restore: the SELECTIVE FILE branch (story backup2.6) ------------------
+//
+// The other half of the pair above: files are SELECTIVE, block images are
+// WHOLE. Both branches share the discriminated `BackupRestoreRequest`, the
+// snapshot path (`BackupSnapshotPath`, whose three-segment shape is enforced
+// for the same GT-57 reason) and the read side backup2.5 built — and share
+// nothing else, because there is nothing else in common between writing a tree
+// of files and writing a block device.
+//
+// Ground truth: `docs/BACKUP-RESTORE-GROUND-TRUTH.md` §2 (flags), §3 (patterns)
+// and §9 (failures / progress / interruption).
+
+/**
+ * Where a file restore lands.
+ *
+ *   `sideBySide` — a NEW directory beside the archive's live home, named
+ *                  `<home>.anas-restore-<snapshot time>`. Needs NO flags and
+ *                  the directory need not exist (GT-15). The DEFAULT, because
+ *                  it cannot touch a single live byte.
+ *   `inPlace`    — the live home itself, with `--allow-existing-dirs
+ *                  --overwrite` (GT-11: the minimal pair — `--overwrite` alone
+ *                  dies on the first existing DIRECTORY). It is a MERGE, never
+ *                  a sync (GT-12): files not in the archive SURVIVE.
+ */
+export const BackupRestoreTargetMode = z.enum(['sideBySide', 'inPlace'])
+export type BackupRestoreTargetMode = z.infer<typeof BackupRestoreTargetMode>
+
+/**
+ * PBS prints a snapshot time as `2026-08-25T19:16:45Z`. A colon is legal on
+ * every filesystem ANAS manages but cannot be represented over SMB — and the
+ * side-by-side directory very often lands inside a share — so the colons become
+ * dashes in the directory name. That is the only edit.
+ */
+const SNAPSHOT_TIME_COLON_RE = /:/g
+
+/** Trailing slashes on a path (the root survives as `/`). */
+const RESTORE_TRAILING_SLASHES_RE = /\/+$/
+/** Leading slashes on an archive-relative path. */
+const RESTORE_LEADING_SLASHES_RE = /^\/+/
+/** The whole-second UTC RFC3339 form PBS renders a `backup-time` as. */
+const SNAPSHOT_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/
+
+/**
+ * The three-part snapshot id `<type>/<id>/<RFC3339>`, split.
+ *
+ * Returns null when the id does not carry all three parts — which is the whole
+ * point of the check: GT-57 measured a BARE GROUP path (`host/gtrestore`)
+ * restoring the LATEST snapshot at exit 0. That is not an error, it is a
+ * DIFFERENT restore, so ANAS refuses the truncated form at the schema rather
+ * than discovering afterwards that it restored a point in time nobody picked.
+ */
+export function parseSnapshotId(
+  snapshot: string,
+): { backupType: string, backupId: string, time: string } | null {
+  const parts = snapshot.split('/')
+  if (parts.length !== 3)
+    return null
+  const [backupType, backupId, time] = parts
+  if (!backupType || !backupId || !time)
+    return null
+  if (!SNAPSHOT_TIME_RE.test(time))
+    return null
+  return { backupType, backupId, time }
+}
+
+/** True when `snapshot` carries a full timestamp (not a bare group path). */
+export function snapshotIdHasTimestamp(snapshot: string): boolean {
+  return parseSnapshotId(snapshot) !== null
+}
+
+/** The group path `<type>/<id>` of a composed snapshot id, or null. */
+export function groupOfSnapshotId(snapshot: string): string | null {
+  const parsed = parseSnapshotId(snapshot)
+  return parsed ? composeGroupId(parsed.backupType, parsed.backupId) : null
+}
+
+/**
+ * The side-by-side directory for one archive home and one snapshot:
+ * `<home>.anas-restore-<snapshot time>`.
+ *
+ * Deterministic (the same snapshot always names the same directory) and
+ * DISTINCTIVE (nothing else on the system writes `.anas-restore-`), so an
+ * operator can tell at a glance what the directory beside their data is. It
+ * must NOT already exist — a second restore of the same point in time into a
+ * half-finished first one would merge two attempts with no way to tell them
+ * apart, so the daemon refuses rather than reusing.
+ *
+ * Null when the snapshot id is not a full three-part id, or when the home is
+ * the filesystem root (there is nothing to sit beside).
+ */
+export function sideBySideRestorePath(home: string, snapshot: string): string | null {
+  const parsed = parseSnapshotId(snapshot)
+  if (!parsed)
+    return null
+  const base = home === '/' ? '/' : home.replace(RESTORE_TRAILING_SLASHES_RE, '')
+  if (base === '/' || !base.startsWith('/'))
+    return null
+  return `${base}.anas-restore-${parsed.time.replace(SNAPSHOT_TIME_COLON_RE, '-')}`
+}
+
+/**
+ * The characters `--pattern` treats as glob syntax, escaped with a backslash.
+ *
+ * GT-22 is the rule and `[` is the trap, not `*`: `bracket[1].txt` unescaped is
+ * a CHARACTER CLASS, so the pattern means `bracket1.txt` and restores NOTHING
+ * at exit 0. A backslash escape was verified against the real archive for `*`,
+ * `[` and `]`. A SPACE needs nothing — the pattern is one argv element, never a
+ * shell word. The backslash itself is in the class so it is escaped in the same
+ * single pass (no double-escaping).
+ */
+const PATTERN_ESCAPE_RE = /[\\*?[\]]/g
+
+/**
+ * The `--pattern` argument for ONE archive-relative selection.
+ *
+ * `/`-ANCHORED: GT-18 proved an unanchored pattern is a PATH SUFFIX match at
+ * any depth — a bare `alpha.txt` restored three files at three depths. A
+ * selection is one exact entry, so it is anchored, always.
+ *
+ * Returns null for the archive ROOT: `--pattern /` is rejected by pbc's own
+ * parameter schema (`value does not match the regex pattern`, exit 255), and it
+ * would mean "everything" anyway — which is a restore with NO pattern at all.
+ */
+export function restorePatternFor(archivePath: string): string | null {
+  const rel = archivePath
+    .replace(RESTORE_TRAILING_SLASHES_RE, '')
+    .replace(RESTORE_LEADING_SLASHES_RE, '')
+  if (!rel)
+    return null
+  return `/${rel.replace(PATTERN_ESCAPE_RE, m => `\\${m}`)}`
+}
+
+/**
+ * The `--pattern` list for a whole selection, in selection order and
+ * deduplicated (GT-23: the flag may be repeated).
+ *
+ * An EMPTY list is not "restore nothing" — it is "restore everything", because
+ * a selection that named the archive root cannot be expressed as a pattern and
+ * a pattern-less restore is exactly what it means. Callers must not read an
+ * empty result as a no-op.
+ */
+export function restorePatternsFor(selections: string[]): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const selection of selections) {
+    const pattern = restorePatternFor(selection)
+    // The archive root swallows every other pattern: everything is included.
+    if (pattern === null)
+      return []
+    if (seen.has(pattern))
+      continue
+    seen.add(pattern)
+    out.push(pattern)
+  }
+  return out
+}
+
+/**
+ * Ownership / ACL / xattr / permission handling, surfaced HONESTLY — GT-14
+ * measured each one and `--ignore-permissions` is the surprising one: newly
+ * created files land **0600**, not the archived mode and not the umask.
+ *
+ * Absent = the flag is not emitted (pbc's own default: restore what was
+ * archived). There is no tri-state here — a restore is a one-shot operation,
+ * not a stored config, so `false` and absent mean the same thing.
+ */
+export const BackupRestoreOptions = z.object({
+  /** `--ignore-ownership`: everything is owned by root (no chown). */
+  ignoreOwnership: z.boolean().optional(),
+  /** `--ignore-acls`: named ACL entries are dropped; the mode is still set. */
+  ignoreAcls: z.boolean().optional(),
+  /** `--ignore-xattrs`: user xattrs are dropped; POSIX ACLs still apply. */
+  ignoreXattrs: z.boolean().optional(),
+  /** `--ignore-permissions`: newly created files land 0600 (GT-14). */
+  ignorePermissions: z.boolean().optional(),
+})
+export type BackupRestoreOptions = z.infer<typeof BackupRestoreOptions>
+
+/**
+ * A `--rate` value: bytes/s with an optional unit, exactly as pbc's own help
+ * documents it (`B, KB (base 10), MB, GB, …, KiB (base 2), MiB, GiB, …`).
+ *
+ * GT-62: it limits TRANSFERRED bytes, not logical bytes — a sparse image
+ * finishes far faster than its size suggests.
+ */
+export const BackupRateLimit = z
+  .string()
+  .regex(/^\d+(?:\.\d+)?(?:[KMGT]?i?B)?$/, 'a byte rate with an optional unit (e.g. 10MB, 50MiB)')
+export type BackupRateLimit = z.infer<typeof BackupRateLimit>
+
+/** Where the restore lands. `path` names the archive's live HOME, not the new directory. */
+export const BackupRestoreTarget = z.object({
+  mode: BackupRestoreTargetMode.default('sideBySide'),
+  /**
+   * The archive's live home. Optional when the request names a `task` whose
+   * archive of this name knows its own path; REQUIRED otherwise (the task-less
+   * door, and an expanded archive whose name no longer matches any archive).
+   *
+   * In `sideBySide` this is the directory the new one is created BESIDE — the
+   * restore never writes into it.
+   */
+  path: AbsolutePath.optional(),
+})
+export type BackupRestoreTarget = z.infer<typeof BackupRestoreTarget>
+
 /**
  * `POST /v1/backup/restore` — the WHOLE-IMAGE branch (`kind: 'image'`).
  *
@@ -1587,14 +1792,44 @@ export const BackupImageRestoreRequest = z.object({
 })
 export type BackupImageRestoreRequest = z.infer<typeof BackupImageRestoreRequest>
 
+/** Ceiling on one restore's selection count — a bounded argv and one bounded stat pass. */
+export const MAX_RESTORE_SELECTIONS = 256
+
 /**
- * The FILE branch is `backup2.6`'s and is NOT built. It is in the union anyway,
- * carrying nothing but its discriminator, so a client that sends it gets a 400
- * saying "not yet available" instead of a schema error about an unknown `kind`
- * — a half-built files restore would be far worse than an honest refusal.
+ * `POST /v1/backup/restore` with `kind: 'files'` — restore selected entries of
+ * ONE pxar archive.
+ *
+ * A DIRECTORY selection restores recursively (GT-20). A hardlink's second name
+ * picked ALONE fails the whole job (GT-25), so the daemon completes the group
+ * before it runs. A pattern that matches nothing is a SILENT SUCCESS (GT-24),
+ * so the daemon verifies what landed instead of trusting exit 0.
  */
 export const BackupFilesRestoreRequest = z.object({
   kind: z.literal('files'),
+  /** Repository reference (a registered name or `pve:<storage-id>`). */
+  repo: BackupRepoRef,
+  /** Namespace; absent = the repository's own. */
+  ns: z.string().optional(),
+  /**
+   * The task this restore came from, when there is one. It supplies the
+   * archive's live home so `target.path` can be omitted — nothing else. An
+   * unknown task is not an error: the caller simply has to name the path.
+   */
+  task: BackupName.optional(),
+  /** The FULL `<type>/<id>/<RFC3339>` id — a bare group means "latest" (GT-57). */
+  snapshot: BackupSnapshotPath,
+  /** The archive argument WITH its type suffix (`data.pxar`) — GT-16. */
+  archive: BackupArchiveName,
+  /**
+   * Archive-relative paths, at least one. `/` (the archive root) means the
+   * whole tree. Hardlink groups arrive as all their names; the daemon completes
+   * a partly-named group itself.
+   */
+  selections: z.array(ArchivePath).min(1).max(MAX_RESTORE_SELECTIONS),
+  target: BackupRestoreTarget.default({ mode: 'sideBySide' }),
+  options: BackupRestoreOptions.default({}),
+  /** Optional transfer-rate limit (`--rate`). */
+  rate: BackupRateLimit.optional(),
 })
 export type BackupFilesRestoreRequest = z.infer<typeof BackupFilesRestoreRequest>
 
@@ -1638,3 +1873,68 @@ export const BackupImageRestoreResult = z.object({
   warnings: z.array(z.string()).optional(),
 })
 export type BackupImageRestoreResult = z.infer<typeof BackupImageRestoreResult>
+/**
+ * How a finished file restore turned out.
+ *
+ *   `completed`               — every selected path is present under the target.
+ *   `completed-with-warnings` — the client exited 0 but something is missing
+ *                               (GT-24's silent no-match, or GT-21's empty
+ *                               directory, which `--pattern` cannot restore).
+ *   `partial`                 — the client did NOT finish. A side-by-side
+ *                               directory is labelled by ANAS, because the
+ *                               client leaves no marker at all (GT-60).
+ */
+export const BackupRestoreStatus = z.enum(['completed', 'completed-with-warnings', 'partial'])
+export type BackupRestoreStatus = z.infer<typeof BackupRestoreStatus>
+
+/** One parsed `progress N% (…)` line (GT-59). The raw line rides along. */
+export const BackupRestoreProgress = z.object({
+  /** The line exactly as pbc wrote it, minus the trailing `\r` and padding. */
+  line: z.string(),
+  percent: z.number().int().min(0).max(100).optional(),
+  /** `12.409 MiB` / `250.001 MiB` — kept as the client rendered them. */
+  done: z.string().optional(),
+  total: z.string().optional(),
+  elapsed: z.string().optional(),
+  rate: z.string().optional(),
+})
+export type BackupRestoreProgress = z.infer<typeof BackupRestoreProgress>
+
+/** The result of one file restore job. */
+export const BackupFilesRestoreResult = z.object({
+  kind: z.literal('files'),
+  status: BackupRestoreStatus,
+  repository: z.string(),
+  namespace: z.string().optional(),
+  snapshot: z.string(),
+  archive: z.string(),
+  mode: BackupRestoreTargetMode,
+  /** The directory that was WRITTEN (the new one, or the live home in place). */
+  target: z.string(),
+  /**
+   * True for `inPlace`: a merge, never a sync. Files under the target that are
+   * not in the archive SURVIVE (GT-12) — stated on the record so nobody reads a
+   * completed in-place restore as "the target now matches the snapshot".
+   */
+  merge: z.boolean(),
+  /** The selection actually restored, hardlink completion included. */
+  selections: z.array(z.string()),
+  /** Paths the daemon ADDED because a hardlink group was only partly named. */
+  addedForHardlinks: z.array(z.string()).default([]),
+  /** The `--pattern` arguments sent, verbatim. Empty = the whole archive. */
+  patterns: z.array(z.string()),
+  /** Selected paths verified present under the target afterwards. */
+  restored: z.array(z.string()),
+  /** Selected paths that are NOT there — the client's silent no-match, named. */
+  missing: z.array(z.string()),
+  /** Every `progress …` line pbc emitted, parsed (GT-59: widening intervals). */
+  progress: z.array(BackupRestoreProgress).default([]),
+  /** The `restore complete (… processed in …)` line, verbatim, when seen. */
+  completeLine: z.string().optional(),
+  /** Bytes processed, parsed from the complete line (else the last progress line). */
+  bytes: z.number().nonnegative().optional(),
+  /** The `.anas-restore-partial` marker this job wrote, when it wrote one. */
+  partialMarker: z.string().optional(),
+  warnings: z.array(z.string()).default([]),
+})
+export type BackupFilesRestoreResult = z.infer<typeof BackupFilesRestoreResult>
