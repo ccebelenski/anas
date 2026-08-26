@@ -29,11 +29,24 @@
     // Credential fields opt out of password-manager autofill (issue #23: a
     // username/secret pair in a dialog is exactly the shape managers fill in).
     // Spread into every credential field config: 'user' for the name side,
-    // 'secret' for the password side ('new-password' is the one hint browsers
-    // reliably honour on password inputs; bare 'off' is routinely ignored).
+    // 'secret' for the password side. Each attribute earns its place:
+    //
+    // - autocomplete: 'new-password' is the one hint browsers reliably honour
+    //   on password inputs (bare 'off' is advisory on a text input next to a
+    //   password input and routinely ignored).
+    // - data-1p-ignore / data-lpignore / data-bwignore: the per-vendor
+    //   skip-flags — 1Password, LastPass, Bitwarden. Managers ignore
+    //   autocomplete entirely; they key on the label/name and honour only
+    //   their own attribute.
+    // - readonly (user side only) + onfocus: managers skip readonly inputs,
+    //   and onfocus drops the attribute the moment the operator engages the
+    //   field. readonly blocks user TYPING only — ExtJS setValue() writes the
+    //   DOM value directly, so a dialog that pre-fills the saved username on
+    //   edit (e.g. the CIFS credential tier, the CHAP userid fields) still
+    //   displays it untouched.
     ANAS.noAutofill = {
-        user: { inputAttrTpl: 'autocomplete="off"' },
-        secret: { inputAttrTpl: 'autocomplete="new-password"' },
+        user: { inputAttrTpl: 'autocomplete="off" data-1p-ignore data-lpignore="true" data-bwignore="true" readonly onfocus="this.removeAttribute(\'readonly\')"' },
+        secret: { inputAttrTpl: 'autocomplete="new-password" data-1p-ignore data-lpignore="true" data-bwignore="true"' },
     };
 
     // ---- Fail-open helpers -------------------------------------------------
