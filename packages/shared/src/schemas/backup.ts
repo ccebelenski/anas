@@ -553,6 +553,62 @@ export function isPathWithin(parent: string, child: string): boolean {
   return child.startsWith(`${base}/`)
 }
 
+// ---- Archive kind (story backup2.4) ----------------------------------------
+//
+// pbc takes an archive spec of the form `<name>.<type>:<source>`, and the type
+// decides what the client does with the source:
+//
+//   `pxar` — a FILE ARCHIVE of a directory tree (Epic 16's only kind). Walks
+//            one filesystem, honours `--exclude`, `--include-dev` and
+//            `--change-detection-mode`.
+//   `img`  — a fixed-chunk BLOCK IMAGE of a device or a regular file. 4 MiB
+//            chunks, no catalog, no FUSE mount, and:
+//              * a REGULAR FILE is a first-class source — no loop device is
+//                needed at all (GT-34);
+//              * `--change-detection-mode` is a COMPLETE NO-OP (GT-37) and
+//                every run reads the whole image, even when it uploads 0 B
+//                (GT-36);
+//              * `--exclude` / `--include-dev` mean nothing on a block device,
+//                which is why both are REFUSED on an `img` archive below
+//                rather than silently ignored.
+
+export const BackupArchiveKind = z.enum(['pxar', 'img'])
+export type BackupArchiveKind = z.infer<typeof BackupArchiveKind>
+
+/**
+ * The ONE place "absent means pxar" is expressed — the {@link BackupArchive}
+ * `kind` field is OPTIONAL rather than `.default()`ed so a task written before
+ * this story rewrites its unit BYTE-IDENTICALLY on an untouched edit (the
+ * dialog ↔ daemon contract). Every reader — the runner's argv, the consistency
+ * derivation, the wizard, the notification body — asks here.
+ */
+export function effectiveArchiveKind(
+  archive?: { kind?: BackupArchiveKind | null } | null,
+): BackupArchiveKind {
+  return archive?.kind === 'img' ? 'img' : 'pxar'
+}
+
+/** The pbc archive-spec type token for a kind: `pxar` or `img`. */
+export function archiveSpecType(kind: BackupArchiveKind): string {
+  return kind === 'img' ? 'img' : 'pxar'
+}
+
+/**
+ * WHICH iSCSI LUN an `img` archive's source was picked as. It is a RECORD, not
+ * an address: the archive's `path` is still the one and only source pbc is
+ * pointed at, and a LUN that is later deleted or re-pointed does not change what
+ * gets backed up. It exists so the UI can show "this is LUN 0 of <target>" and
+ * so backup2.7's restore knows which LUN to disable before writing an image back
+ * (a LUN whose backing this archive is).
+ */
+export const BackupLunRef = z.object({
+  /** The target's IQN — never truncated, never a display name. */
+  targetIqn: z.string().min(1).max(223),
+  /** The LUN number within the target's TPG. */
+  index: z.number().int().nonnegative(),
+})
+export type BackupLunRef = z.infer<typeof BackupLunRef>
+
 // ---- Snapshot consistency (story backup2.3) --------------------------------
 //
 // A multi-hour backup of a live tree captures no single instant: files written
@@ -592,6 +648,10 @@ export type BackupSnapshotBackend = z.infer<typeof BackupSnapshotBackend>
  * Read-only and additive: the wizard renders it as a chip, the task detail
  * repeats it, and nothing in any request body carries it — a source's capability
  * is a fact about the system, not a setting.
+ *
+ * backup2.4 adds ONE optional field, {@link BackupArchiveConsistency.zvolDevice}
+ * — an `img` archive whose source is a zvol has no mountpoint and no tree, so
+ * its snapshot is reached as a DEVICE NODE rather than a `.zfs/snapshot` path.
  */
 export const BackupArchiveConsistency = z.object({
   /** `snapshot` when the source sits on a snapshottable filesystem, else `live`. */
@@ -611,6 +671,15 @@ export const BackupArchiveConsistency = z.object({
    * archive root for a subdirectory source.
    */
   relativePath: z.string().optional(),
+  /**
+   * backup2.4 — the source is a ZVOL BLOCK DEVICE (`/dev/zvol/<pool>/<vol>`),
+   * not a tree. A zvol has no mountpoint and no `.zfs/snapshot` directory, so
+   * the run reaches its snapshot as the DEVICE NODE `<zvolDevice>@<snapshot>`,
+   * published by `zfs set snapdev=visible` for the duration of the run and
+   * restored with `zfs inherit snapdev` afterwards (GT-44/GT-46). Present ONLY
+   * for a zvol source; `mountpoint` and `relativePath` are absent then.
+   */
+  zvolDevice: AbsolutePath.optional(),
 })
 export type BackupArchiveConsistency = z.infer<typeof BackupArchiveConsistency>
 
@@ -653,6 +722,13 @@ export const BackupExpandedArchive = z.object({
   relativePath: z.string(),
   /** The excludes rebased onto THIS root. */
   excludes: z.array(z.string()).default([]),
+  /**
+   * backup2.4 — which pbc archive TYPE this root becomes (`<name>.pxar:<root>`
+   * or `<name>.img:<root>`). Absent = `pxar`, so every pre-backup2.4 result
+   * reads exactly as it did. An `img` archive never expands: a block device has
+   * no nested filesystems, so it is always exactly one root.
+   */
+  kind: BackupArchiveKind.optional(),
 })
 export type BackupExpandedArchive = z.infer<typeof BackupExpandedArchive>
 
@@ -742,11 +818,18 @@ export type BackupNestedScan = z.infer<typeof BackupNestedScan>
 export const BackupNestedPreviewRequest = z.object({
   path: AbsolutePath.optional(),
   includeNested: BackupIncludeNested.optional(),
+  /**
+   * backup2.4 — an `img` source is a block device or an image FILE, so there is
+   * no tree to walk: the daemon skips the boundary scan for it and answers with
+   * the derived consistency alone. Absent = `pxar`.
+   */
+  kind: BackupArchiveKind.optional(),
   archives: z
     .array(z.object({
       name: z.string().optional(),
       path: AbsolutePath,
       includeNested: BackupIncludeNested.optional(),
+      kind: BackupArchiveKind.optional(),
     }))
     .max(64)
     .optional(),
@@ -759,16 +842,85 @@ export const BackupNestedPreviewResponse = z.object({
 })
 export type BackupNestedPreviewResponse = z.infer<typeof BackupNestedPreviewResponse>
 
+// ---- LUN sources (story backup2.4) -----------------------------------------
+//
+// `GET /v1/backup/lun-sources` — the wizard's picker for an `img` archive.
+// READ-ONLY, LOCAL-ONLY (the iSCSI read layer plus the same mount table the
+// consistency derivation already needs; no PBS contact, no `targetcli`), and a
+// CONVENIENCE: a free-typed device or file path stays first-class, exactly as
+// the directory picker never replaced typing a path.
+//
+// The list is deliberately narrower than `GET /v1/iscsi/targets`:
+//   - a LUN whose backing ANAS cannot resolve onto storage it knows (`foreign`,
+//     and — once `iscsi.5` lands — `unresolved`) is not offered: ANAS cannot say
+//     what backs it, so it cannot say what backing it up would capture;
+//   - a PVE-owned volume (a guest disk, or a zvol on a PVE-managed pool) is
+//     never offered at all — PVE territory is read-only and hands-off, and PVE
+//     backs its own guests up.
+
+/** The backing kind of an offerable LUN — `foreign` is filtered out upstream. */
+export const BackupLunSourceKind = z.enum(['zvol', 'file'])
+export type BackupLunSourceKind = z.infer<typeof BackupLunSourceKind>
+
+/** One backup-eligible LUN, with everything the picker shows. */
+export const BackupLunSource = z.object({
+  /** The serving target's IQN — never truncated. */
+  targetIqn: z.string(),
+  /** The LUN number within the target's TPG. */
+  index: z.number().int().nonnegative(),
+  /** The backstore name — which IS the SCSI model string initiators see. */
+  name: z.string(),
+  kind: BackupLunSourceKind,
+  /** The stable backing path — `/dev/zvol/<pool>/<vol>` or the image file. */
+  path: AbsolutePath,
+  /** SCSI unit serial; null when it could not be read. */
+  serial: z.string().nullable(),
+  /** Size in bytes; null when it could not be determined. */
+  size: z.number().int().nonnegative().nullable(),
+  /**
+   * Does the backing path resolve on this node right now? `false` is a real
+   * answer and a real problem — a `zfs rename` under a live LUN succeeds
+   * silently and leaves the backstore pointing at nothing (GT-40) — so the row
+   * is still LISTED and says so, rather than vanishing from the picker with no
+   * explanation. `null` means the check itself could not answer.
+   */
+  backingExists: z.boolean().nullable(),
+  /**
+   * The DERIVED consistency of backing THIS path up, from the same derivation
+   * the wizard's preview uses — so the picker can say `snapshot` or `live`
+   * BEFORE a path is chosen. Absent when the derivation could not run.
+   */
+  consistency: BackupArchiveConsistency.optional(),
+})
+export type BackupLunSource = z.infer<typeof BackupLunSource>
+
+/**
+ * `GET /v1/backup/lun-sources`. `installed: false` (no LIO stack on this node)
+ * is a first-class 200 with an empty list, never an error — most nodes serve no
+ * block storage and the wizard must keep working there.
+ */
+export const BackupLunSourceList = z.object({
+  installed: z.boolean(),
+  /** One sentence when `installed` is false; absent otherwise. */
+  reason: z.string().optional(),
+  luns: z.array(BackupLunSource),
+})
+export type BackupLunSourceList = z.infer<typeof BackupLunSourceList>
+
 // ---- Tasks -----------------------------------------------------------------
 
 /**
- * One archive within a task: a named pxar archive of a path, with per-archive
+ * One archive within a task: a named archive of a path, with per-archive
  * exclude patterns (passed to pbc as `--exclude`). The name is the bare archive
- * name (no `.pxar` suffix); paths are absolute.
+ * name (no `.pxar` / `.img` suffix); paths are absolute.
+ *
+ * `kind` (backup2.4) decides what the path MEANS: a `pxar` archive's path is a
+ * directory tree, an `img` archive's path is a block device or a regular image
+ * file. Absent = `pxar`, which is what every pre-backup2.4 archive is.
  */
 export const BackupArchive = z
   .object({
-    /** Bare archive name — pbc stores it as `<name>.pxar` (or mpxar/ppxar). */
+    /** Bare archive name — pbc stores it as `<name>.pxar` (mpxar/ppxar) or `<name>.img`. */
     name: z
       .string()
       .min(1)
@@ -782,8 +934,47 @@ export const BackupArchive = z
      * {@link effectiveIncludeNested}, never by truthiness.
      */
     includeNested: BackupIncludeNested.optional(),
+    /**
+     * `pxar` (a tree) or `img` (a block device / raw image file) — backup2.4.
+     * ABSENT = `pxar`; read it through {@link effectiveArchiveKind}.
+     */
+    kind: BackupArchiveKind.optional(),
+    /**
+     * OPTIONAL record that this `img` source was picked as an iSCSI LUN
+     * (backup2.4). Display + restore truth; the `path` is still the source.
+     */
+    lun: BackupLunRef.optional(),
   })
   .superRefine((a, ctx) => {
+    const kind = effectiveArchiveKind(a)
+    if (kind === 'img') {
+      // A block image has no directory entries to exclude and no filesystem
+      // boundaries to cross. pbc would IGNORE both flags on an `.img` archive
+      // (and `--exclude` is per-invocation, so a pattern stored here would
+      // silently reach every SIBLING pxar archive of the same task) — so they
+      // are refused, loudly, rather than accepted and dropped.
+      if (a.excludes.length) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `archive '${a.name}' is a block image: exclude patterns do not apply to an image and would be applied to the other archives of this task instead`,
+          path: ['excludes'],
+        })
+      }
+      if (effectiveIncludeNested(a) !== 'none') {
+        ctx.addIssue({
+          code: 'custom',
+          message: `archive '${a.name}' is a block image: it has no nested filesystems, so 'include nested filesystems' does not apply`,
+          path: ['includeNested'],
+        })
+      }
+    }
+    else if (a.lun) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `archive '${a.name}' records an iSCSI LUN but is a file archive - a LUN is a block image (kind 'img')`,
+        path: ['lun'],
+      })
+    }
     if (!Array.isArray(a.includeNested))
       return
     for (const p of a.includeNested) {
@@ -881,6 +1072,15 @@ export const BackupTaskRequest = z.preprocess((raw) => {
           || (Array.isArray(chosen) && chosen.length === 0)) {
           delete arch.includeNested
         }
+        // backup2.4 — the same rule for `kind`: `pxar` and `null` both mean what
+        // an ABSENT field already means, so they normalize to absent and a
+        // pre-backup2.4 archive rewrites byte-for-byte. `lun` is a record about
+        // an IMAGE source: on a file archive it is meaningless, and a null one
+        // is a clear.
+        if (arch.kind === 'pxar' || arch.kind === null || arch.kind === undefined)
+          delete arch.kind
+        if (arch.lun === null || arch.lun === undefined || arch.kind !== 'img')
+          delete arch.lun
         return arch
       })
     }

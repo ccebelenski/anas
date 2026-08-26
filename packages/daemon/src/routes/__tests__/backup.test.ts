@@ -1092,6 +1092,142 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(data.nested?.[0].consistency?.target, 'mnttest')
   })
 
+  // ---- backup2.4: img archives -------------------------------------------
+  //
+  // `/mnttest` is the ZFS dataset `mnttest` in the mock findmnt tree, so
+  // `/dev/zvol/mnttest/vol1` is a volume on a pool ANAS manages and
+  // `/mnttest/images/lun.raw` is an image file on that dataset.
+
+  const IMG_TASK = {
+    name: 'nightly-lun',
+    repository: 'pbs-main',
+    backupId: 'anas-pve',
+    archives: [{ name: 'lun0', path: '/dev/zvol/mnttest/vol1', excludes: [], kind: 'img' }],
+    changeDetectionMode: 'default',
+    schedule: '*-*-* 02:00:00',
+    enabled: true,
+  }
+
+  it('preview-nested answers an img source WITHOUT walking anything', async () => {
+    const mock = mockOf(server)
+    mock.calls.length = 0
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/preview-nested',
+      headers: JSON_HEADERS,
+      payload: { path: '/dev/zvol/mnttest/vol1', kind: 'img' },
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as {
+      data: { archives: { nested: unknown[], includeNested: string, consistency?: { consistency: string, zvolDevice?: string, target?: string } }[] }
+    }
+    const scan = data.archives[0]
+    assert.deepEqual(scan.nested, [])
+    assert.equal(scan.includeNested, 'none')
+    // A block image has no tree — the `find` walk never runs for it.
+    assert.equal(mock.calls.some(c => c.command === '/usr/bin/timeout'), false)
+    // And it still gets its derived consistency: the snapshot DEVICE.
+    assert.equal(scan.consistency?.consistency, 'snapshot')
+    assert.equal(scan.consistency?.target, 'mnttest/vol1')
+    assert.equal(scan.consistency?.zvolDevice, '/dev/zvol/mnttest/vol1')
+  })
+
+  it('preview-nested answers an img archive list the same way', async () => {
+    mockNestedWalk()
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/preview-nested',
+      headers: JSON_HEADERS,
+      payload: {
+        archives: [
+          { name: 'pool', path: '/mnttest' },
+          { name: 'lun0', path: '/mnttest/images/lun.raw', kind: 'img' },
+        ],
+      },
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as {
+      data: { archives: { path: string, nested: unknown[], consistency?: { consistency: string, relativePath?: string } }[] }
+    }
+    assert.equal(data.archives.length, 2)
+    // The pxar row was walked; the image row was not, and reports no boundaries.
+    assert.ok((data.archives[0].nested as unknown[]).length > 0)
+    assert.deepEqual(data.archives[1].nested, [])
+    // An image FILE follows the directory rules: its dataset's snapshot, with
+    // the file's own relative path under the snapshot root.
+    assert.equal(data.archives[1].consistency?.consistency, 'snapshot')
+    assert.equal(data.archives[1].consistency?.relativePath, 'images/lun.raw')
+  })
+
+  it('the task detail carries kind and consistency for an img archive', async () => {
+    await createRepo()
+    await createTaskPayload(IMG_TASK)
+    const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks/nightly-lun', headers: IDENTITY })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: BackupTaskDetail }
+    assert.equal(data.task.archives[0].kind, 'img')
+    assert.equal(data.nested?.[0].consistency?.consistency, 'snapshot')
+    assert.equal(data.nested?.[0].consistency?.zvolDevice, '/dev/zvol/mnttest/vol1')
+    assert.deepEqual(data.nested?.[0].nested, [])
+  })
+
+  it('a create with excludes on an img archive is a 400, not a silent drop', async () => {
+    await createRepo()
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks',
+      headers: JSON_HEADERS,
+      payload: { ...IMG_TASK, name: 'bad-img', archives: [{ name: 'lun0', path: '/dev/zvol/mnttest/vol1', excludes: ['*.tmp'], kind: 'img' }] },
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match((res.json() as { error: { message: string } }).error.message, /exclude patterns do not apply to an image/)
+  })
+
+  it('a direct run of an img task publishes snapdev, reads the snapshot device, and inherits back', async () => {
+    await createRepo()
+    await createTaskPayload(IMG_TASK)
+    const mock = mockOf(server)
+    // The sweep list for the VOLUME, and the snapdev property read.
+    mock.addFixture({
+      command: ZFS_BIN,
+      args: ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', 'mnttest/vol1'],
+      result: { stdout: '', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: ZFS_BIN,
+      args: ['get', '-Hp', '-o', 'name,value,source', 'snapdev', 'mnttest/vol1'],
+      result: { stdout: 'mnttest/vol1\thidden\tdefault\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({ command: ZFS_BIN, result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/udevadm', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.calls.length = 0
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/nightly-lun/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    // The snapdev node poll is a real (bounded) ~2 s wait, so this job needs a
+    // longer leash than the default one-second one.
+    const job = await waitForJob(server, await jobIdFrom(res), 500, 10)
+    // The device node does not exist on a test host, so the run fails at the
+    // publish step — which is exactly the branch that must still put the
+    // property back. The failure names the node, not something unrelated.
+    assert.equal(job.status, 'failed')
+    assert.match(job.error?.message ?? '', /never appeared/)
+    const verbs = [...zfsArgs(mock, 'set'), ...zfsArgs(mock, 'inherit')]
+    assert.deepEqual(verbs, [
+      ['set', 'snapdev=visible', 'mnttest/vol1'],
+      ['inherit', 'snapdev', 'mnttest/vol1'],
+    ])
+    // And the transient snapshot the run took is destroyed all the same.
+    assert.ok(
+      zfsArgs(mock, 'destroy').some(a => a[2]?.startsWith('mnttest/vol1@anas-backup-nightly-lun-')),
+      JSON.stringify(zfsArgs(mock, 'destroy')),
+    )
+  })
+
   it('prune-preview without any keep is a 400 (a keep-all prune is never run)', async () => {
     await createRepo()
     await createTask()

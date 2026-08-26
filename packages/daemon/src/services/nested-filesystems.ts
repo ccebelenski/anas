@@ -1,7 +1,7 @@
-import type { BackupIncludeNested, BackupNestedEntry, BackupNestedKind, BackupNestedScan } from '@anas/shared'
+import type { BackupArchiveKind, BackupIncludeNested, BackupNestedEntry, BackupNestedKind, BackupNestedScan } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
-import { effectiveIncludeNested, isPathWithin, nestedIncluded } from '@anas/shared'
+import { effectiveArchiveKind, effectiveIncludeNested, isPathWithin, nestedIncluded } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 
 /**
@@ -460,11 +460,21 @@ async function nameHit(
  */
 export async function scanArchives(
   executor: CommandExecutor,
-  archives: { name?: string, path: string, includeNested?: BackupIncludeNested }[],
+  archives: { name?: string, path: string, includeNested?: BackupIncludeNested, kind?: BackupArchiveKind }[],
   opts: Omit<NestedScanOptions, 'archive' | 'includeNested'> = {},
 ): Promise<BackupNestedScan[]> {
   const out: BackupNestedScan[] = []
   for (const a of archives) {
+    if (effectiveArchiveKind(a) === 'img') {
+      // backup2.4 — a BLOCK IMAGE has no directory tree, so there is nothing to
+      // walk and nothing that could be "stored as an empty directory". The walk
+      // is skipped entirely rather than run and discarded: the source may be a
+      // device node (nonsense to descend) or an image file on a remote mount
+      // (the one thing the boundary pass must never touch). The empty entry
+      // keeps the scans index-aligned with the task's archives.
+      out.push(imageArchiveScan(a.name, a.path))
+      continue
+    }
     out.push(await scanNestedFilesystems(executor, a.path, {
       ...opts,
       ...(a.name ? { archive: a.name } : {}),
@@ -472,6 +482,19 @@ export async function scanArchives(
     }))
   }
   return out
+}
+
+/** The boundary-scan answer for an `img` source: there are no boundaries. */
+export function imageArchiveScan(archive: string | undefined, path: string): BackupNestedScan {
+  return {
+    ...(archive ? { archive } : {}),
+    path: normalizePath(path),
+    exists: true,
+    includeNested: 'none',
+    nested: [],
+    truncated: false,
+    warnings: [],
+  }
 }
 
 /** What an archive's `includeNested` resolves to for THIS run. */

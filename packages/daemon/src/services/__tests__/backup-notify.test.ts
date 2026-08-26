@@ -286,3 +286,95 @@ describe('backup notifications — emission (16.12)', () => {
     }))
   })
 })
+
+/**
+ * backup2.4 — an image archive in the body. The operator reading this mail must
+ * be able to tell that an image was backed up, from what, and that it was read
+ * whole — without opening the UI.
+ */
+describe('backup notifications — image archives (backup2.4)', () => {
+  const imgTask = makeTask({
+    name: 'nightly-luns',
+    archives: [{ name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img' }],
+  })
+  const IMG_STATS = [
+    'lun0.img: had to backup 0 B of 512 MiB (compressed 0 B) in 0.56 s (average 0 B/s)',
+    'lun0.img: backup was done incrementally, reused 512 MiB (100.0%)',
+  ]
+
+  it('the .img stats lines appear exactly like a pxar archive\'s', () => {
+    const body = buildBackupNotifyBody({
+      task: imgTask,
+      repo: REPO,
+      result: { status: 'success', archives: IMG_STATS },
+    })
+    assert.ok(body.includes('Archives:'), body)
+    for (const line of IMG_STATS)
+      assert.ok(body.includes(`  ${line}`), body)
+  })
+
+  it('the image SOURCE is named — in snapshot mode that is the snapshot device', () => {
+    const body = buildBackupNotifyBody({
+      task: imgTask,
+      repo: REPO,
+      result: {
+        status: 'success',
+        archives: IMG_STATS,
+        images: [{ archive: 'lun0', source: '/dev/zvol/tank/vol1@anas-backup-nightly-luns-1787686116' }],
+      },
+    })
+    assert.ok(body.includes('Image sources:'), body)
+    assert.ok(body.includes('  lun0.img <- /dev/zvol/tank/vol1@anas-backup-nightly-luns-1787686116'), body)
+  })
+
+  it('an expanded IMG root is spelled `.img`, never `.pxar`', () => {
+    const body = buildBackupNotifyBody({
+      task: makeTask({
+        name: 'mixed',
+        archives: [
+          { name: 'media', path: '/tank/media', excludes: [] },
+          { name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img' },
+        ],
+      }),
+      repo: REPO,
+      result: {
+        status: 'success',
+        archives: IMG_STATS,
+        consistency: [
+          { consistency: 'snapshot', reason: 'r', backend: 'zfs', target: 'tank/media' },
+          { consistency: 'snapshot', reason: 'r', backend: 'zfs', target: 'tank/vol1', zvolDevice: '/dev/zvol/tank/vol1' },
+        ],
+        expansion: [
+          { name: 'media', from: 'media', root: '/tank/media/.zfs/snapshot/s', relativePath: '', excludes: [] },
+          { name: 'media__photos', from: 'media', root: '/tank/media/photos/.zfs/snapshot/s', relativePath: 'photos', excludes: [] },
+          { name: 'lun0', from: 'lun0', root: '/dev/zvol/tank/vol1@s', relativePath: '', excludes: [], kind: 'img' },
+        ],
+      },
+    })
+    assert.ok(body.includes('  lun0.img <- /dev/zvol/tank/vol1@s'), body)
+    assert.ok(body.includes('  media.pxar <- /tank/media/.zfs/snapshot/s'), body)
+  })
+
+  it('a task with no image archives says nothing about images (version skew)', () => {
+    const body = buildBackupNotifyBody({
+      task: makeTask(),
+      repo: REPO,
+      result: { status: 'success', archives: [ARCHIVE_LINE] },
+    })
+    assert.equal(body.includes('Image sources:'), false, body)
+  })
+
+  it('the image lines are plain ASCII, like every other line of the body', () => {
+    const body = buildBackupNotifyBody({
+      task: imgTask,
+      repo: REPO,
+      result: {
+        status: 'success',
+        archives: IMG_STATS,
+        images: [{ archive: 'lun0', source: '/dev/zvol/tank/vol1@s' }],
+      },
+    })
+    // eslint-disable-next-line no-control-regex
+    assert.doesNotMatch(body, /[^\x00-\x7F]/, body)
+  })
+})

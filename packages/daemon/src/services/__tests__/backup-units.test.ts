@@ -75,6 +75,18 @@ describe('backup units — the systemd units ARE the store (Epic 16.3, NOTES §7
         { name: 'etc', path: '/etc', excludes: [], includeNested: ['/etc/pve'] },
         { name: 'srv', path: '/srv', excludes: [] },
       ] }),
+      // Block images (backup2.4) ride the same JSON, with and without the LUN
+      // record, and mixed with a file archive in one task.
+      makeTask({ name: 'img-zvol', archives: [
+        { name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img' },
+      ] }),
+      makeTask({ name: 'img-lun', archives: [
+        { name: 'lun0', path: '/tank/images/lun.raw', excludes: [], kind: 'img', lun: { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 } },
+      ] }),
+      makeTask({ name: 'mixed', archives: [
+        { name: 'etc', path: '/etc', excludes: ['*.tmp'] },
+        { name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img' },
+      ] }),
     ]) {
       assert.deepEqual(parseServiceUnit(renderServiceUnit(task)), task)
     }
@@ -122,6 +134,94 @@ describe('backup units — the systemd units ARE the store (Epic 16.3, NOTES §7
       archives: [{ name: 'etc', path: '/etc', excludes: [], includeNested: ['/etc/pve'] }],
     })
     assert.deepEqual(kept.archives[0].includeNested, ['/etc/pve'])
+  })
+
+  it('an archive with NO kind round-trips with no such key (backup2.4)', () => {
+    // The untouched-edit rule again: a task written before backup2.4 must
+    // rewrite byte-for-byte. ABSENT means `pxar`, and absent is what stays.
+    const unit = renderServiceUnit(makeTask())
+    assert.ok(!unit.includes('"kind"'), unit)
+    assert.ok(!unit.includes('"lun"'), unit)
+    assert.equal(parseServiceUnit(unit)!.archives[0].kind, undefined)
+  })
+
+  it('an untouched edit of a pre-backup2.4 unit rewrites it BYTE-IDENTICALLY', () => {
+    const legacy = renderServiceUnit(makeTask({
+      name: 'legacy-kindless',
+      archives: [
+        { name: 'etc', path: '/etc', excludes: [] },
+        { name: 'srv', path: '/srv', excludes: ['*.tmp'], includeNested: 'all' },
+      ],
+    }))
+    const parsed = parseServiceUnit(legacy)
+    assert.ok(parsed)
+    const resaved = BackupTaskRequest.parse(JSON.parse(JSON.stringify(parsed)))
+    assert.equal(renderServiceUnit(resaved), legacy)
+  })
+
+  it('an untouched edit of an IMG unit is byte-identical too, LUN record and all', () => {
+    const stored = renderServiceUnit(makeTask({
+      name: 'img-untouched',
+      archives: [
+        { name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', lun: { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 } },
+      ],
+    }))
+    const parsed = parseServiceUnit(stored)
+    assert.ok(parsed)
+    const resaved = BackupTaskRequest.parse(JSON.parse(JSON.stringify(parsed)))
+    assert.equal(renderServiceUnit(resaved), stored)
+  })
+
+  it('an explicit `pxar` / null kind normalizes to ABSENT, and drops a stray lun', () => {
+    for (const value of ['pxar', null] as unknown[]) {
+      const task = BackupTaskRequest.parse({
+        ...makeTask(),
+        archives: [{ name: 'etc', path: '/etc', excludes: [], kind: value }],
+      })
+      assert.equal(task.archives[0].kind, undefined, JSON.stringify(value))
+      assert.ok(!renderServiceUnit(task).includes('"kind"'))
+    }
+    // A LUN record on a FILE archive is meaningless — it never reaches the unit.
+    const dropped = BackupTaskRequest.parse({
+      ...makeTask(),
+      archives: [{ name: 'etc', path: '/etc', excludes: [], lun: { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 } }],
+    })
+    assert.equal(dropped.archives[0].lun, undefined)
+    // A real choice survives the same normalizer untouched.
+    const kept = BackupTaskRequest.parse({
+      ...makeTask(),
+      archives: [{ name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img' }],
+    })
+    assert.equal(kept.archives[0].kind, 'img')
+  })
+
+  it('excludes and includeNested are REFUSED on an img archive (backup2.4)', () => {
+    const withExcludes = BackupTaskRequest.safeParse({
+      ...makeTask(),
+      archives: [{ name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: ['*.tmp'], kind: 'img' }],
+    })
+    assert.equal(withExcludes.success, false)
+    assert.match(withExcludes.error!.issues[0]!.message, /exclude patterns do not apply to an image/)
+
+    for (const choice of ['all', ['/dev/zvol/tank/vol1/x']] as unknown[]) {
+      const withNested = BackupTaskRequest.safeParse({
+        ...makeTask(),
+        archives: [{ name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', includeNested: choice }],
+      })
+      assert.equal(withNested.success, false, JSON.stringify(choice))
+      assert.match(
+        withNested.error!.issues.map(i => i.message).join(' | '),
+        /has no nested filesystems/,
+      )
+    }
+
+    // An explicit `none` is NOT a refusal — it means exactly what absent means,
+    // so the normalizer drops it and the archive is valid.
+    const none = BackupTaskRequest.safeParse({
+      ...makeTask(),
+      archives: [{ name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', includeNested: 'none' }],
+    })
+    assert.equal(none.success, true)
   })
 
   it('an includeNested path OUTSIDE its archive is refused (--include-dev would be a lie)', () => {

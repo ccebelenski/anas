@@ -167,6 +167,43 @@ export function anasTargetName(iqn: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Zvol device paths — one definition, several readers
+// ---------------------------------------------------------------------------
+
+/**
+ * `/dev/zvol/` — the STABLE zvol path prefix. A zvol's `/dev/zdN` kernel name
+ * moves across a reboot (GT-48), so this is the only spelling ANAS stores,
+ * matches or hands to another program. Defined here because three unrelated
+ * readers need it: iSCSI ownership (`classifyBacking`), the backup consistency
+ * derivation (an `img` archive whose source is a zvol, backup2.4), and the
+ * snapshot-device path the backup runner publishes with `snapdev`.
+ */
+export const ZVOL_PATH_PREFIX = '/dev/zvol/'
+
+/** Trailing slashes, stripped before a zvol path is turned into a dataset. */
+const ZVOL_TRAILING_SLASH_RE = /\/+$/
+
+/**
+ * The ZFS dataset behind a `/dev/zvol/<pool>/<vol>` path, or null when the path
+ * is not a zvol path at all. Pure string arithmetic — the path is never stat'ed
+ * (the hang rule), and a bare `/dev/zvol/<pool>` with no volume is not a volume.
+ */
+export function zvolDatasetFromPath(path: string): string | null {
+  if (!path.startsWith(ZVOL_PATH_PREFIX))
+    return null
+  const dataset = path.slice(ZVOL_PATH_PREFIX.length).replace(ZVOL_TRAILING_SLASH_RE, '')
+  // `<pool>` alone is a directory of volumes, not a volume.
+  if (!dataset || !dataset.includes('/'))
+    return null
+  return dataset
+}
+
+/** The stable device path of a zvol dataset (`tank/vol1` → `/dev/zvol/tank/vol1`). */
+export function zvolDevicePath(dataset: string): string {
+  return `${ZVOL_PATH_PREFIX}${dataset}`
+}
+
+// ---------------------------------------------------------------------------
 // Ownership — derived, never stored (Principle 11; the 3.25 PVE-tagging pattern)
 // ---------------------------------------------------------------------------
 

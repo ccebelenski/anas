@@ -10,7 +10,7 @@ import type {
 import type { CommandExecutor } from '../executor/types.js'
 import type { PveNotifySeverity } from './pve-notify.js'
 import type { NotifyOutcome } from './unattended-notify.js'
-import { BACKUP_SKIPPED_OFF_WEEK } from '@anas/shared'
+import { archiveSpecType, BACKUP_SKIPPED_OFF_WEEK } from '@anas/shared'
 import { pruneSummaryLine } from './backup-prune.js'
 import { ANAS_BACKUP_NOTIFY_TEMPLATE, pveNotify } from './pve-notify.js'
 import { formatElapsed, notifySeverity, shouldNotify } from './unattended-notify.js'
@@ -74,6 +74,12 @@ export interface BackupNotifyResult {
   snapshots?: BackupTransientSnapshot[]
   /** One entry per archive root pbc was actually handed (the expansion). */
   expansion?: BackupExpandedArchive[]
+  /**
+   * backup2.4 — the `.img` archives the run uploaded and the device or file each
+   * was read from (`Upload image '<source>' … as <name>.img.fidx`). Absent on a
+   * task with no image archives, and on a daemon that predates the field.
+   */
+  images?: { archive: string, source: string }[]
 }
 
 export interface BackupNotifyContext {
@@ -245,7 +251,19 @@ export function buildBackupNotifyBody(ctx: BackupNotifyContext): string {
     lines.push('')
     lines.push('Archive roots:')
     for (const e of result.expansion)
-      lines.push(`  ${e.name}.pxar <- ${e.root}`)
+      lines.push(`  ${e.name}.${archiveSpecType(e.kind ?? 'pxar')} <- ${e.root}`)
+  }
+
+  // backup2.4 — the image archives and what each was actually READ FROM. In
+  // snapshot mode that is the snapshot's own device node, which is the one line
+  // that proves the run did not read the live volume. It is listed even when the
+  // expansion block above is absent (an image never expands, so a single-image
+  // task would otherwise say nothing about its source at all).
+  if (result?.images?.length) {
+    lines.push('')
+    lines.push('Image sources:')
+    for (const img of result.images)
+      lines.push(`  ${img.archive}.img <- ${img.source}`)
   }
 
   if (result?.prune) {

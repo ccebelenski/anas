@@ -1,4 +1,6 @@
 import type {
+  BackupLunSource,
+  BackupLunSourceList,
   BackupNestedPreviewResponse,
   BackupNestedScan,
   BackupPrunePreviewResponse,
@@ -13,7 +15,9 @@ import type {
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { ConsistencyFacts } from '../services/backup-consistency.js'
 import type { BackupReposPaths } from '../services/backup-repos.js'
+import type { IscsiPaths } from '../services/iscsi.js'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
   BackupName,
@@ -22,6 +26,7 @@ import {
   BackupRepoTestRequest,
   BackupRunRequest,
   BackupTaskRequest,
+  effectiveArchiveKind,
   effectiveIncludeNested,
   hasRetentionKeeps,
   UpsertBackupRepoRequest,
@@ -71,7 +76,9 @@ import {
   validateSchedule,
   writeTaskUnits,
 } from '../services/backup-units.js'
-import { scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
+import { classifyBacking } from '../services/iscsi-ownership.js'
+import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
+import { imageArchiveScan, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -94,6 +101,9 @@ import { requireIdentity } from './identity.js'
  *   POST   /v1/backup/tasks/:name/prune-preview → retention dry-run (16.11)
  *   POST   /v1/backup/tasks/preview-nested → nested-filesystem scan (backup2.2;
  *                                        LOCAL-ONLY: no PBS contact at all)
+ *   GET    /v1/backup/lun-sources     → backup-eligible iSCSI LUNs, with their
+ *                                        derived consistency (backup2.4; the
+ *                                        `img` archive's picker, LOCAL-ONLY)
  *
  * Mutations are identity-gated jobs (202 → { job }); registry writes are
  * COMPARE-AND-SWAP. Status is LOCAL-ONLY — ANAS never contacts the PBS server
@@ -107,6 +117,13 @@ export interface BackupRouteOptions {
   paths: BackupReposPaths
   /** systemd unit directory (the task store). Overridable for tests. */
   systemdDir: string
+  /**
+   * backup2.4 — the iSCSI read layer's paths, for the LUN-source picker. All
+   * overridable for tests; absent means the real configfs / saveconfig /
+   * storage.cfg locations, and a node with no LIO stack answers
+   * `installed: false` with an empty list.
+   */
+  iscsiPaths?: IscsiPaths
 }
 
 function CONFLICT(version: number) {
@@ -117,6 +134,7 @@ function CONFLICT(version: number) {
 
 export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOptions) {
   const { executor, jobQueue, paths, systemdDir } = opts
+  const iscsiPaths: IscsiPaths = opts.iscsiPaths ?? {}
 
   /**
    * Attach the DERIVED snapshot-consistency (backup2.3) to a set of boundary
@@ -131,7 +149,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
    */
   async function withConsistency(scans: BackupNestedScan[]): Promise<BackupNestedScan[]> {
     try {
-      const facts = await readConsistencyFacts(executor, readAhrPools)
+      const facts = await readConsistencyFacts(executor, readAhrPools, { pveStorageCfg: paths.pveStorageCfg })
       return scans.map(scan => ({ ...scan, consistency: deriveConsistency(scan.path, facts) }))
     }
     catch (err) {
@@ -593,21 +611,102 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'VALIDATION_ERROR', message: 'Send a path, or the archives to scan' } }
     }
 
+    // backup2.4 — an `img` source is a device or an image file: `scanArchives`
+    // skips the walk for it entirely and answers "no boundaries", so the row
+    // still gets its derived consistency without anything being stat'ed.
     const archives: BackupNestedScan[] = req.archives?.length
       ? await scanArchives(executor, req.archives.map(a => ({
           ...(a.name ? { name: a.name } : {}),
           path: a.path,
           includeNested: effectiveIncludeNested(a),
+          ...(effectiveArchiveKind(a) === 'img' ? { kind: 'img' as const } : {}),
         })))
-      : [await scanNestedFilesystems(executor, req.path as string, {
-          includeNested: effectiveIncludeNested({ includeNested: req.includeNested ?? 'none' }),
-        })]
+      : effectiveArchiveKind(req) === 'img'
+        ? [imageArchiveScan(undefined, req.path as string)]
+        : [await scanNestedFilesystems(executor, req.path as string, {
+            includeNested: effectiveIncludeNested({ includeNested: req.includeNested ?? 'none' }),
+          })]
 
     // backup2.3 — the DERIVED consistency rides the SAME response rather than a
     // second endpoint: both answers come from the one mount table this scan
     // already needed, plus the AHR topology. Read-only and additive; nothing in
     // any request body carries it back.
     const data: BackupNestedPreviewResponse = { archives: await withConsistency(archives) }
+    return { data }
+  })
+
+  // --- GET /backup/lun-sources — the img archive's LUN picker ---------------
+  // READ-ONLY and LOCAL-ONLY (the iSCSI read layer plus the same mount table the
+  // consistency derivation already needs). NO PBS contact and NO `targetcli`:
+  // this is the directory picker's block-storage sibling, a convenience over a
+  // path field where free typing stays first-class.
+  //
+  // Registered BEFORE `/backup/tasks/:name` for the same reason `preview-nested`
+  // is — it is a literal segment under the same prefix family and must never be
+  // read as a task name.
+  //
+  // WHAT IS LEFT OUT, and why:
+  //   - a LUN whose backing does not resolve onto storage ANAS knows (`foreign`)
+  //     — ANAS cannot say what backs it, so it cannot say what backing it up
+  //     would capture, and offering it in a picker would imply it can;
+  //   - a PVE-owned volume: a guest disk (`vm-N-disk-M`) or a zvol on a
+  //     PVE-managed pool. PVE territory is read-only and hands-off (3.25), and
+  //     PVE backs its own guests up;
+  //
+  // A LUN whose backing path does not resolve right now is NOT hidden: a `zfs
+  // rename` under a live LUN leaves exactly that (GT-40), and a row that
+  // silently disappears explains nothing. It is listed with
+  // `backingExists: false` and the screen says so.
+  server.get('/backup/lun-sources', async (request, reply) => {
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const ctx = await readIscsiContext(executor, iscsiPaths)
+    const availability = iscsiAvailability(ctx)
+    if (!availability.installed) {
+      const empty: BackupLunSourceList = {
+        installed: false,
+        ...(availability.reason ? { reason: availability.reason } : {}),
+        luns: [],
+      }
+      return { data: empty }
+    }
+
+    const targets = await buildIscsiTargets(ctx)
+    // One fact read for every LUN's consistency — the same derivation the
+    // wizard's preview uses, so the picker and the row agree by construction.
+    let facts: ConsistencyFacts | null = null
+    try {
+      facts = await readConsistencyFacts(executor, readAhrPools, { pveStorageCfg: paths.pveStorageCfg })
+    }
+    catch (err) {
+      server.log.warn(`[backup] LUN-source consistency derivation failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+
+    const luns: BackupLunSource[] = []
+    for (const target of targets) {
+      for (const lun of target.luns) {
+        if (lun.kind === 'foreign' || !lun.backingPath.startsWith('/'))
+          continue
+        const classification = classifyBacking(lun.backingPath, ctx.inputs)
+        if (classification.pveManaged || classification.pveGuestVolume)
+          continue
+        luns.push({
+          targetIqn: target.iqn,
+          index: lun.index,
+          name: lun.name,
+          kind: lun.kind,
+          path: lun.backingPath,
+          serial: lun.serial,
+          size: lun.size,
+          backingExists: lun.backingExists,
+          ...(facts ? { consistency: deriveConsistency(lun.backingPath, facts) } : {}),
+        })
+      }
+    }
+
+    const data: BackupLunSourceList = { installed: true, luns }
     return { data }
   })
 
@@ -851,7 +950,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
               ? `No PBS credential file for '${task.repository}' (${paths.pvePrivStorageDir}/${pveStorageId(task.repository)}.pw is missing) — set it in Datacenter → Storage`
               : `No secret stored for repository '${repo.name}' — set its credentials first`)
           }
-          const result = await runBackup(executor, { task, repo, secret }, updateProgress)
+          const result = await runBackup(
+            executor,
+            // The consistency derivation reads the SAME storage.cfg the rest of
+            // the backup routes do (the zvol branch's PVE hands-off guard).
+            { task, repo, secret, consistencyOptions: { pveStorageCfg: paths.pveStorageCfg } },
+            updateProgress,
+          )
           // Retention (16.11): prune ONLY after a run that actually backed up. A
           // 'skipped' run (the benign too-soon collision — and any future cadence
           // skip) never prunes, and a FAILED run threw long before this line. A
