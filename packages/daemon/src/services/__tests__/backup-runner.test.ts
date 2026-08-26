@@ -333,6 +333,47 @@ describe('backup runner — STDERR progress parsing (NOTES §3, SURPRISE C)', ()
     assert.match(lines[0], /\/etc\/late/)
     assert.match(lines[0], /empty directory/)
   })
+
+  it('in SNAPSHOT mode the boundary is matched on the relative path (live-proof wave 2)', () => {
+    // The client reads the transient snapshot, so its absolute path can never
+    // equal the walk's live one. Live-proven on the stunt node: an AHR source
+    // with includeNested `all`, whose nested subvolume was EXPANDED into
+    // `ahrdata__photos` and fully backed up, still warned "stored as an empty
+    // directory" on every run — pinning the run at completed-with-warnings and
+    // the notification at `warning` forever.
+    const root = '/run/anas-ahr/lpahr.toplevel/@snapshots/anas-backup-lp-ahr-1787755676'
+    const lines = skippedWarnings(
+      [{ archive: 'ahrdata', root, relativePath: 'photos', path: `${root}/photos` }],
+      [{
+        archive: 'ahrdata',
+        path: '/mnt/anas-ahr/lpahr',
+        exists: true,
+        includeNested: 'all' as const,
+        truncated: false,
+        warnings: [],
+        nested: [{ path: '/mnt/anas-ahr/lpahr/photos', relativePath: 'photos', kind: 'subvolume' as const, included: true }],
+      }],
+    )
+    assert.deepEqual(lines, [])
+  })
+
+  it('a boundary the walk never named still warns in snapshot mode', () => {
+    const root = '/gtbackup/cdm/.zfs/snapshot/anas-backup-t-1/tree'
+    const lines = skippedWarnings(
+      [{ archive: 'cdm', root, relativePath: 'appeared-late', path: `${root}/appeared-late` }],
+      [{
+        archive: 'cdm',
+        path: '/gtbackup/cdm/tree',
+        exists: true,
+        includeNested: 'all' as const,
+        truncated: false,
+        warnings: [],
+        nested: [{ path: '/gtbackup/cdm/tree/photos', relativePath: 'photos', kind: 'subvolume' as const, included: true }],
+      }],
+    )
+    assert.equal(lines.length, 1)
+    assert.match(lines[0], /appeared-late/)
+  })
 })
 
 describe('backup runner — result classification (NOTES §6, SURPRISE A/B)', () => {

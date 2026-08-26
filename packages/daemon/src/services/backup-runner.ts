@@ -801,9 +801,26 @@ function includedNestedOf(byArchive: Record<string, string[]>): Record<string, s
 
 /**
  * Turn the client's own `skipping mount point:` lines into warnings, DROPPING
- * every one our detection already named (same absolute path). A skip line the
- * walk missed is the interesting one — it means reality moved between the scan
- * and the run, or the walk was truncated.
+ * every one our detection already named. A skip line the walk missed is the
+ * interesting one — it means reality moved between the scan and the run, or the
+ * walk was truncated.
+ *
+ * Matched on the ARCHIVE-RELATIVE path as well as the absolute one, because in
+ * snapshot mode (backup2.3) the two absolute paths are never equal: the walk
+ * names the live boundary (`/mnt/anas-ahr/lpahr/photos`) while the client is
+ * reading the transient snapshot and prints
+ * `/run/anas-ahr/<pool>.toplevel/@snapshots/anas-backup-…/photos` — and on ZFS,
+ * `<mountpoint>/.zfs/snapshot/<s>/…`. Live-proof wave 2 caught the consequence:
+ * an AHR source with `includeNested: all`, whose nested subvolume was EXPANDED
+ * into its own archive and fully backed up, still reported "it was stored as an
+ * empty directory" on every run — so the run was permanently
+ * completed-with-warnings and the 16.12 notification permanently `warning`,
+ * which is exactly what choosing `all` is supposed to stop. The relative path is
+ * the same string on both sides because expansion preserves the tree.
+ *
+ * Suppressing here loses nothing: ANAS's own detection is the authoritative
+ * warning (an uncovered nested filesystem gets its own "is NOT included" line
+ * from `nestedRunWarnings`, and the whole scan rides in `result.nested`).
  */
 export function skippedWarnings(
   skipped: SkippedMountPoint[],
@@ -811,13 +828,15 @@ export function skippedWarnings(
 ): string[] {
   const known = new Set<string>()
   for (const scan of scans) {
-    for (const n of scan.nested)
+    for (const n of scan.nested) {
       known.add(n.path)
+      known.add(n.relativePath)
+    }
   }
   const out: string[] = []
   const seen = new Set<string>()
   for (const s of skipped) {
-    if (known.has(s.path) || seen.has(s.path))
+    if (known.has(s.path) || known.has(s.relativePath) || seen.has(s.path))
       continue
     seen.add(s.path)
     const who = s.archive ? `archive '${s.archive}'` : 'the backup'
