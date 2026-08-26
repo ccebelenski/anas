@@ -5,6 +5,7 @@ import type {
   Disk,
   DiskHealthCounts,
   DiskTelemetry,
+  IscsiTargetDetail,
   JobBrief,
   NetTelemetry,
   PoolStatusBrief,
@@ -93,6 +94,22 @@ export async function dashboardRoutes(
   // sources so the Pools section and the warning cards agree.
   const ahrCreateStatus = (pool: AhrPool): AhrPool => withAhrCreateStatus(pool, jobQueue)
 
+  /**
+   * Why an ANAS target is disabled, when a retained job still says (live-proof
+   * F12). The image-restore door is the only thing in ANAS that leaves a target
+   * disabled on purpose: after a mid-stream failure the half-written LUN stays
+   * offline and re-enabling is the operator's acknowledgement. That decision is
+   * recorded in exactly one place — the failed job's error text — and jobs are
+   * ephemeral by design, so this is best-effort by construction: no job, no
+   * detail, and the card still says the target is dark.
+   */
+  function iscsiDisabledDetail(target: IscsiTargetDetail): string | undefined {
+    const job = jobQueue.findByOperation('backup.restore.image', target.iqn, 'target')
+    if (job?.status !== 'failed' || !job.error?.message)
+      return undefined
+    return `A whole-image restore onto it failed and left it disabled: ${job.error.message}`
+  }
+
   // --- GET /v1/status ------------------------------------------------------
   server.get('/status', async () => {
     // Each block is independently fail-open so one failing source (e.g. no ZFS)
@@ -121,7 +138,13 @@ export async function dashboardRoutes(
       // LUN, a target serving nothing or a portal on a dead address is ever
       // surfaced. Healthy adds nothing; a node without LIO costs two stats and
       // adds nothing; errors fail-open to [].
-      collectIscsiWarnings(executor, iscsiPaths ?? {}),
+      // Story `iscsi.8` widens it twice: a fileio LUN found to be serving a
+      // PLACEHOLDER is quarantined here (this read is one of the two moments
+      // ANAS looks at the tree at all), and a disabled ANAS target gets a card
+      // that names WHY when a retained job still knows — the image restore that
+      // left it dark says so in its own failure text, and nothing else on the
+      // system remembers (no shadow state).
+      collectIscsiWarnings(executor, iscsiPaths ?? {}, { disabledDetail: iscsiDisabledDetail }),
     ])
 
     const summary: StatusSummary = {

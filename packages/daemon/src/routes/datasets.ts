@@ -132,6 +132,48 @@ function buildSetPairs(p: UpdateDatasetPropertiesRequest['properties']): string[
 /** Mutations that a LUN's claim on a volume must be able to veto (iscsi.6). */
 export type VolumeOp = 'grow' | 'rollback' | 'rename' | 'destroy'
 
+/**
+ * `zfs destroy`'s "it has children" refusal, in its two shapes.
+ *
+ * A FILESYSTEM with children says `filesystem has children`; a VOLUME with
+ * snapshots says `volume has children`. Both then print `use '-r' to destroy the
+ * following datasets:` and list them.
+ */
+const ZFS_HAS_CHILDREN_RE = /\bhas children\b/i
+
+/**
+ * The one sentence that stands in for that CLI text (live-proof F15).
+ *
+ * It is used in BOTH places on purpose: as a confirm-door warning before the
+ * operator commits, and as the job's error if they commit anyway. One string, so
+ * the advice cannot say two different things — and it names the counts, the
+ * snapshots themselves, and the two ways forward, because "guide, don't just
+ * warn" is a standing ruling and `use '-r'` is a flag name, not guidance.
+ *
+ * The snapshot list is capped: a dataset with a snapshot schedule can have
+ * hundreds, and a refusal that scrolls is a refusal nobody reads.
+ */
+function destroyNeedsRecursive(
+  fullName: string,
+  type: string,
+  children: string[],
+  snapshots: string[],
+): string {
+  const noun = type === 'volume' ? 'Volume' : 'Dataset'
+  const parts: string[] = []
+  if (snapshots.length > 0) {
+    const shown = snapshots.slice(0, 5).join(', ')
+    parts.push(`${snapshots.length} snapshot${snapshots.length === 1 ? '' : 's'} (${shown}${snapshots.length > 5 ? `, and ${snapshots.length - 5} more` : ''})`)
+  }
+  if (children.length > 0) {
+    const shown = children.slice(0, 5).join(', ')
+    parts.push(`${children.length} child dataset${children.length === 1 ? '' : 's'} (${shown}${children.length > 5 ? `, and ${children.length - 5} more` : ''})`)
+  }
+  return `${noun} '${fullName}' has ${parts.join(' and ')} — ZFS will not destroy it while they exist. `
+    + `Destroy ${snapshots.length > 0 && children.length === 0 ? 'them' : 'those'} first, or confirm again with `
+    + `Recursive to destroy ${fullName} and everything under it in one go. A recursive destroy is irreversible.`
+}
+
 /** A refusal from {@link assertVolumeMutable} — 409, Level 1, no confirm code. */
 export interface VolumeRefusal {
   reason: string
@@ -1467,8 +1509,15 @@ export async function datasetRoutes(
       warnings.push(`${snapshots.length} snapshot(s) of '${fullName}' will also be destroyed.`)
     if (shares.length > 0)
       warnings.push(`${shares.length} share(s) serve this dataset (${shares.map(s => `'${s.protocol}:${s.name}'`).join(', ')}) and will stop working.`)
-    if (!recursive && (children.length > 0 || snapshots.length > 0))
-      warnings.push(`This dataset has children or snapshots; destroy will fail unless recursive is requested.`)
+    // Live-proof F15: without this, confirming a non-recursive destroy of a
+    // volume that has snapshots produced a FAILED job carrying nothing but the
+    // raw `zfs` text ("volume has children / use '-r' to destroy the following
+    // datasets: …"). Correct, safe, and no help at all — "guide, don't just
+    // warn" wants the two ways forward named where the operator is standing,
+    // which is the confirm door.
+    if (!recursive && (children.length > 0 || snapshots.length > 0)) {
+      warnings.push(destroyNeedsRecursive(fullName, targetDataset.type, children.map(c => c.name), snapshots))
+    }
 
     // The confirmation protects "destroy this dataset" — `recursive` is NOT part
     // of the signature. The flag is chosen after the challenge is issued (like
@@ -1497,6 +1546,18 @@ export async function datasetRoutes(
           // Story iscsi.6: name the dataset explicitly so the LIO branch can
           // look up `/dev/zvol/<dataset>` even when ZFS's message quotes a
           // MOUNTPOINT (a busy filesystem) rather than the dataset itself.
+          // ZFS's own refusal for "it has children" is a bare CLI sentence and
+          // is the one failure this route can predict exactly, so it is
+          // translated rather than forwarded (F15). Everything else keeps the
+          // busy-diagnosis path, which names holding processes and LUNs.
+          if (!recursive && ZFS_HAS_CHILDREN_RE.test(base)) {
+            throw new Error(destroyNeedsRecursive(
+              fullName,
+              targetDataset.type,
+              children.map(c => c.name),
+              snapshots,
+            ))
+          }
           throw new Error(await enrichBusyError(executor, base, undefined, {
             ...configfsOptionsFrom(iscsiPaths),
             dataset: fullName,

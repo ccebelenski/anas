@@ -5,7 +5,7 @@ import type { AhrBandSlice } from './ahr-geometry.js'
 import type { AhrLayoutDisk } from './ahr-layout.js'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import { addMount, hasMount, parseFstab, removeMount } from '../parsers/fstab.js'
+import { addMount, addMountOption, hasMount, parseFstab, removeMount } from '../parsers/fstab.js'
 import { mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { ROLLED_BACK_MARKER } from './ahr-create-status.js'
 import { destroyAhrPool } from './ahr-destroy.js'
@@ -114,6 +114,28 @@ export async function clearGhostMdSignatures(
 }
 
 /**
+ * The ONE fstab option that keeps an AHR pool ahead of the LIO restore service
+ * (story `iscsi.8`, promoted from the standing `iscsi.5` candidate).
+ *
+ * `rtslib-fb-targetctl.service` gets an ordering drop-in from `install.sh` that
+ * names every ZFS anchor there is — and there is no equivalent for AHR. An AHR
+ * pool comes up as md assembly (udev) → LVM activation (udev) → an ordinary
+ * fstab mount, with no ANAS unit anywhere in that path, and the generated mount
+ * unit is named after the pool's mountpoint, so no static `After=` in a drop-in
+ * can name it. Worse, ANAS writes AHR entries with `nofail` (a pool must never
+ * hold the host's boot hostage), and systemd deliberately does NOT order a
+ * `nofail` mount before `local-fs.target` — so even the weak anchor the drop-in
+ * has does not cover it.
+ *
+ * `x-systemd.before=` on the fstab line is the mechanism that does: the fstab
+ * generator turns it into a `Before=` on THAT mount unit, which is the only
+ * place the pool's identity exists. It was a candidate until live-proof F2
+ * showed what losing the race actually costs — not a missing LUN, which is
+ * visible, but a LUN serving zeros, which is not.
+ */
+export const AHR_ISCSI_ORDERING_OPTION = 'x-systemd.before=rtslib-fb-targetctl.service'
+
+/**
  * The canonical fstab entry for a pool: LV device, btrfs, nofail. When
  * `subvolLayout` is true (every pool created since §12) the entry carries
  * `subvol=@data` so the mountpoint mounts the data subvolume, not the
@@ -121,6 +143,13 @@ export async function clearGhostMdSignatures(
  * pre-§12 flat pool has no `@data` subvolume, so its entry omits the option;
  * `changeAhrMountpoint` MUST pass the pool's real layout so a mountpoint move
  * never rewrites a flat pool's line to reference a subvolume it lacks.
+ *
+ * Every pool created from now on also carries
+ * {@link AHR_ISCSI_ORDERING_OPTION}, whether or not it will ever hold a LUN. It
+ * costs a boot-time ordering edge on a service that is usually not installed
+ * (systemd ignores a `Before=` on a unit that does not exist), and it is the
+ * difference between a pool that is mounted when LIO restores and one that
+ * silently is not.
  */
 function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean): MountEntry {
   return {
@@ -141,11 +170,60 @@ function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean):
         noexec: false,
         netdev: false,
       },
-      passthrough: subvolLayout ? `subvol=${SUBVOL_DATA}` : '',
+      passthrough: subvolLayout
+        ? `subvol=${SUBVOL_DATA},${AHR_ISCSI_ORDERING_OPTION}`
+        : AHR_ISCSI_ORDERING_OPTION,
     },
     dump: 0,
     pass: 0,
   }
+}
+
+/**
+ * Add {@link AHR_ISCSI_ORDERING_OPTION} to an EXISTING pool's fstab line, once,
+ * surgically (story `iscsi.8`).
+ *
+ * Called at the moment an image LUN is placed on an AHR pool — the moment the
+ * ordering starts to matter and not before. Pools that will never hold a LUN are
+ * left exactly as they are: ANAS is a guest in `/etc/fstab`, and a mass
+ * migration that edited every AHR line on upgrade would be an owner's move.
+ *
+ * The line is found by MOUNTPOINT or by LV spec, the same pair
+ * `changeAhrMountpoint` uses, so an unmounted or hand-edited pool is still
+ * matched. `addMountOption` rewrites the options column and nothing else, and is
+ * a byte-identical no-op when the option is already there — so this is safe on
+ * the second, third and hundredth LUN.
+ *
+ * Returns whether the file changed. Never throws: a pool with no fstab line
+ * (someone mounts it by hand) simply gets nothing, and adding a LUN must not
+ * fail over a boot-ordering nicety.
+ */
+export async function ensureAhrTargetOrdering(
+  executor: CommandExecutor,
+  fstabPath: string,
+  pool: { name: string, mountpoint: string },
+): Promise<boolean> {
+  let changed = false
+  try {
+    await editConfig(fstabPath, (current) => {
+      const lvPath = ahrLvPath(pool.name)
+      const existing = parseFstab(current).find(e => e.mountpoint === pool.mountpoint || e.spec === lvPath)
+      if (!existing)
+        return current
+      const next = addMountOption(current, existing.mountpoint, AHR_ISCSI_ORDERING_OPTION)
+      changed = next !== current
+      return next
+    })
+    // The fstab generator owns the mount unit; a reload is how a changed line
+    // becomes a changed unit without a reboot. Only on a real change, and never
+    // fatal — the ordering it establishes is for the NEXT boot anyway.
+    if (changed)
+      await executor.exec(SYSTEMCTL, ['daemon-reload'])
+  }
+  catch {
+    return false
+  }
+  return changed
 }
 
 /** One disk as the create planned it — the rollback's list of what to scrub. */

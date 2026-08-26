@@ -33,6 +33,8 @@ function health(overrides: Partial<IscsiHealth> = {}): IscsiHealth {
     saveconfigPresent: true,
     missingLuns: [],
     targetsServingNothing: [],
+    stubLuns: [],
+    disabledTargets: [],
     portalsWithoutInterface: [],
     foreignChanges: [],
     degraded: false,
@@ -182,6 +184,105 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
     assert.match(degraded[0].message, /mutations are refused until this is repaired/)
     // It is node-level, so it carries no target ref to deep-link to.
     assert.equal(degraded[0].ref, undefined)
+  })
+
+  it('a placeholder LUN is the CRITICAL card, and names both signals plus what ANAS did', () => {
+    const w = buildIscsiWarnings(health({
+      stubLuns: [{
+        targetIqn: IQN,
+        tpgTag: 1,
+        lunIndex: 3,
+        backstoreName: 'lpahrlun',
+        backingPath: '/mnt/anas-ahr/lpahr/lpahrlun.raw',
+        persistedSize: 536870912,
+        actualSize: 0,
+        containingMount: '/',
+        expectedMount: '/mnt/anas-ahr/lpahr',
+        zeroSized: true,
+        wrongMount: true,
+        quarantined: true,
+        fileRemoved: true,
+      }],
+      degraded: true,
+    }))
+    const card = w.find(c => /placeholder created by/.test(c.message))!
+    assert.ok(card, w.map(c => c.message).join(' | '))
+    assert.equal(card.level, 'critical')
+    assert.equal(card.category, 'iscsi')
+    assert.equal(card.ref, IQN)
+    // The LUN, the target and the path are all named in full (ids never truncated).
+    assert.match(card.message, /LUN 3 'lpahrlun'/)
+    assert.match(card.message, /\/mnt\/anas-ahr\/lpahr\/lpahrlun\.raw/)
+    // Both measurements, so the operator can check the claim.
+    assert.match(card.message, /0 bytes where the saved configuration says 536870912/)
+    assert.match(card.message, /on \/ instead of \/mnt\/anas-ahr\/lpahr/)
+    // What it cost, and the way out.
+    assert.match(card.message, /empty disk of the right size with the right serial/)
+    assert.match(card.message, /ANAS has taken it offline/)
+    assert.match(card.message, /mount the filesystem and use Repair/i)
+  })
+
+  it('a placeholder ANAS could NOT unmap says so, instead of implying it is handled', () => {
+    const w = buildIscsiWarnings(health({
+      stubLuns: [{
+        targetIqn: IQN,
+        tpgTag: 1,
+        lunIndex: 3,
+        backstoreName: 'lpahrlun',
+        backingPath: '/mnt/anas-ahr/lpahr/lpahrlun.raw',
+        persistedSize: 536870912,
+        actualSize: 0,
+        containingMount: '/',
+        expectedMount: '/mnt/anas-ahr/lpahr',
+        zeroSized: true,
+        wrongMount: false,
+        quarantined: false,
+        fileRemoved: false,
+      }],
+      degraded: true,
+    }))
+    const card = w.find(c => /placeholder created by/.test(c.message))!
+    assert.match(card.message, /could NOT take it offline - it is still being served|could NOT take it offline — it is still being served/)
+    // Only the signal that actually fired is quoted.
+    assert.ok(!/instead of/.test(card.message), card.message)
+  })
+
+  it('a hole whose path still holds a placeholder says THAT, not "still missing"', () => {
+    const w = buildIscsiWarnings(health({
+      missingLuns: [{
+        targetIqn: IQN,
+        tpgTag: 1,
+        lunIndex: 3,
+        backstoreName: 'lpahrlun',
+        plugin: 'fileio',
+        backingPath: '/mnt/anas-ahr/lpahr/lpahrlun.raw',
+        backingExists: false,
+        stubBacking: true,
+      }],
+      degraded: true,
+    }))
+    const card = w.find(c => /did not restore/.test(c.message))!
+    assert.match(card.message, /holds a PLACEHOLDER the restore service created/)
+    assert.match(card.message, /Mount the filesystem that should hold the image/)
+    assert.ok(!/still missing/.test(card.message), card.message)
+  })
+
+  it('a DISABLED ANAS target is a warning card that names the reason when there is one', () => {
+    const plain = buildIscsiWarnings(health({
+      disabledTargets: [{ targetIqn: IQN, tpgTag: 1, lunCount: 4 }],
+    }))
+    assert.equal(plain.length, 1)
+    assert.equal(plain[0].level, 'warning')
+    assert.equal(plain[0].category, 'iscsi')
+    assert.equal(plain[0].ref, IQN)
+    assert.match(plain[0].message, /is disabled/)
+    assert.match(plain[0].message, /4 LUNs are unreachable/)
+    assert.match(plain[0].message, /Enable it from the iSCSI menu/)
+
+    const withReason = buildIscsiWarnings(health({
+      disabledTargets: [{ targetIqn: IQN, tpgTag: 1, lunCount: 1, detail: 'A whole-image restore onto it failed and left it disabled: the image was partially written' }],
+    }))
+    assert.match(withReason[0].message, /partially written/)
   })
 
   it('foreignChanges are NOT cards — they are informational, not failures', () => {

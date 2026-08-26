@@ -71,6 +71,15 @@ export interface BackingClassification {
   pool: string | null
   /** The ZFS dataset (the zvol itself, or the file's dataset). */
   dataset: string | null
+  /**
+   * The MOUNTPOINT of the dataset / AHR pool the path resolves onto — the
+   * filesystem the file is supposed to be on (story `iscsi.8`). Null for a zvol
+   * (a device path has no mountpoint) and for anything unmatched. It is the
+   * `expectedMount` half of the stub verdict: compared against the mount that
+   * actually contains the file, it catches a placeholder sitting on the PARENT
+   * filesystem of a dataset that did not mount.
+   */
+  mountpoint: string | null
   /** True when that pool/dataset is referenced by a PVE storage (3.25). */
   pveManaged: boolean
   /** True when the object is named like a PVE guest volume. */
@@ -168,6 +177,7 @@ export function classifyBacking(
     kind: backingExists === false ? 'unresolved' : 'foreign',
     pool: null,
     dataset: null,
+    mountpoint: null,
     pveManaged: false,
     pveGuestVolume: false,
   }
@@ -186,6 +196,7 @@ export function classifyBacking(
       kind: 'zvol',
       pool,
       dataset,
+      mountpoint: null,
       pveManaged: (inputs.pveStorages.get(pool)?.length ?? 0) > 0,
       pveGuestVolume: PVE_GUEST_VOLUME_RE.test(lastComponent(dataset)),
     }
@@ -203,6 +214,7 @@ export function classifyBacking(
       kind: 'file',
       pool: mp.pool,
       dataset: mp.dataset,
+      mountpoint: mp.mountpoint,
       pveManaged: (inputs.pveStorages.get(mp.pool)?.length ?? 0) > 0,
       pveGuestVolume: false,
     }
@@ -220,7 +232,7 @@ export function classifyBacking(
       }
     }
     if (best)
-      return { kind: 'file', pool: best.pool, dataset: null, pveManaged: false, pveGuestVolume: false }
+      return { kind: 'file', pool: best.pool, dataset: null, mountpoint: best.mountpoint, pveManaged: false, pveGuestVolume: false }
   }
 
   return unmatched

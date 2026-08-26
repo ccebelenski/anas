@@ -84,9 +84,11 @@ export class JobQueue {
   }
 
   /**
-   * The most recently submitted job for `operation` that named `target` as its
-   * `params.name` — the in-process correlation from a job back to the resource
-   * it acts on.
+   * The most recently submitted job for `operation` that named `target` under
+   * `paramKey` (`params.name` by default) — the in-process correlation from a
+   * job back to the resource it acts on. The key is a parameter because not
+   * every family calls its subject `name`: an image restore names its LUN's
+   * target as `params.target` (story `iscsi.8`, live-proof F12).
    *
    * Submitter params are deliberately NOT on the wire `Job` shape, so this is
    * the only way a read path can ask "is a create running for THIS pool?".
@@ -95,12 +97,12 @@ export class JobQueue {
    * are the daemon's one legitimate piece of runtime state — no shadow state is
    * introduced, and after a restart the answer honestly reverts to "unknown".
    */
-  findByOperation(operation: string, target: string): Job | undefined {
+  findByOperation(operation: string, target: string, paramKey: string = 'name'): Job | undefined {
     let latest: Job | undefined
     // Map iteration is insertion order, so a later job with an equal timestamp
     // still wins.
     for (const record of this.jobs.values()) {
-      if (record.job.operation !== operation || record.submitter.params?.name !== target)
+      if (record.job.operation !== operation || record.submitter.params?.[paramKey] !== target)
         continue
       if (!latest || record.job.createdAt >= latest.createdAt)
         latest = record.job

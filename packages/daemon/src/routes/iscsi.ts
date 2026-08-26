@@ -3,7 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { IscsiIqn } from '@anas/shared'
-import { computeIscsiHealth } from '../services/iscsi-health.js'
+import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
 import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, readIscsiContext, toTargetSummary } from '../services/iscsi.js'
 import { readPveFirewallAdvisory } from '../services/pve-firewall.js'
 
@@ -60,10 +60,14 @@ export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptio
   })
 
   // --- GET /iscsi/health ---------------------------------------------------
+  // The one read that is allowed to CHANGE something (story `iscsi.8`): a fileio
+  // LUN found to be serving a placeholder is unmapped before the answer is sent,
+  // because the alternative is reporting the problem while the empty disk stays
+  // on the network. Everything else here is still strictly read-only, and a node
+  // with no stub takes no lock and does no extra work.
   server.get('/iscsi/health', async () => {
-    const ctx = await readIscsiContext(executor, paths)
-    const targets = await buildIscsiTargets(ctx)
-    const result: IscsiHealth = computeIscsiHealth(ctx, targets)
+    const { health } = await readIscsiHealthWithQuarantine(executor, paths)
+    const result: IscsiHealth = health
     return { data: result }
   })
 

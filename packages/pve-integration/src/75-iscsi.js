@@ -1691,8 +1691,16 @@
         var sizeKnown = has && Number(rec.get('size')) > 0;
         var restorable = has && kindOk && !missing && sizeKnown;
 
+        // A ZVOL grows live under a session — the volume resizes, the initiator
+        // rescans and sees the new size (story iscsi.3, live-proof F13). The
+        // Datasets door has always allowed it on the same held volume; this one
+        // used to refuse, and two doors disagreeing about one safe operation
+        // reads as "it cannot be done". A FILE-backed LUN is still refused: its
+        // size is fixed at creation, so a resize is a backstore recreate under
+        // the initiator's feet.
+        var zvol = kind === 'zvol';
         setDisabled(grid, 'lunAdd', foreign);
-        setDisabled(grid, 'lunResize', foreign || !has || live || !kindOk);
+        setDisabled(grid, 'lunResize', foreign || !has || (live && !zvol) || !kindOk);
         setDisabled(grid, 'lunRestore', foreign || !has || live || !restorable);
         setDisabled(grid, 'lunDelete', foreign || !has || live);
 
@@ -1716,9 +1724,12 @@
                                 + 'its size — and a mismatch is silently destructive.')
                             : '')))));
         btnSetTip(grid, 'lunAdd', foreign ? foreignTip : '');
+        var resizeLiveTip = t('An initiator is logged in. A file-backed LUN\'s size is fixed at creation, so '
+            + 'resizing it deletes and recreates the backstore under the initiator\'s feet, with no kernel '
+            + 'message either side. Log the initiator out first. (A zvol-backed LUN grows live.)');
         btnSetTip(grid, 'lunResize', foreign ? foreignTip
-            : (live
-                ? liveTip
+            : (live && !zvol
+                ? resizeLiveTip
                 : (unresolved
                     ? t('The backing object is not on this node right now — bring the storage back, '
                         + 'then Repair, before resizing.')
@@ -2484,6 +2495,7 @@
             return;
         }
         var isFile = rec.get('kind') === 'file';
+        var liveNow = (rec.get('connectedInitiators') || []).length;
         var split = splitSize(current);
         var win;
         try {
@@ -2546,7 +2558,13 @@
                                     + 'replay it would see a different disk.')
                                 : t('A ZFS volume grows live: nothing on the iSCSI side changes and the initiator '
                                     + 'sees the new size after a rescan. Shrinking is refused — ZFS truncates '
-                                    + 'silently, even under a live session.'))
+                                    + 'silently, even under a live session.')
+                                + (liveNow
+                                    ? ' ' + t('' + liveNow + (liveNow === 1 ? ' initiator is' : ' initiators are')
+                                        + ' logged in now: the grow is allowed and safe, but each one keeps showing '
+                                        + 'the OLD size until it rescans (open-iscsi: iscsiadm -m node -R), and the '
+                                        + 'filesystem on top has to be grown separately.')
+                                    : ''))
                         }
                     ]
                 }],

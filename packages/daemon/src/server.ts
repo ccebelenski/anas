@@ -541,7 +541,7 @@ export function createServer(opts?: ServerOptions) {
   // iSCSI mutations (story iscsi.4) — targets, portals, ACL/CHAP and LUNs. Every
   // one is a job, every sequence runs under the one daemon-wide LIO mutex, and
   // each ends in `targetcli saveconfig` — never over a degraded restore (GT-22).
-  server.register(iscsiMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, ...iscsiPaths })
+  server.register(iscsiMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, ...iscsiPaths })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache, iscsiPaths })
   // AHR hybrid RAID (Epic 11 + AHR). The per-pool AhrExpansionIntent store
@@ -578,6 +578,11 @@ export function createServer(opts?: ServerOptions) {
   // re-attach an interrupted expansion after a restart (issue #1).
   server.decorate('diskIdentityCache', diskIdentityCache)
   server.decorate('ahrIntentDir', ahrIntentDir)
+  // Exposed for the iSCSI stub quarantine at daemon start (index.ts): the same
+  // injectable paths every iSCSI route uses, so the boot pass reads the fixture
+  // tree under test and the real one in production — never a mix (story
+  // `iscsi.8`).
+  server.decorate('iscsiPaths', iscsiPaths)
 
   return server
 }

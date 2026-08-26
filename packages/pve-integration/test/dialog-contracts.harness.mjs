@@ -1450,7 +1450,7 @@ function iscsiDetail(opts = {}) {
     ...ISCSI_TARGETS.targets[0],
     security: { authentication: true, generateNodeAcls: false, demoModeDiscovery: false },
     sessions: opts.session
-      ? [{ initiatorIqn: ISCSI_INITIATOR, initiatorAlias: 'anas-pve', targetIqn: ISCSI_IQN, tpgTag: 1, sessionId: 1, state: 'TARG_SESS_STATE_LOGGED_IN', connections: [{ cid: 0, address: '192.168.200.60', state: 'TARG_CONN_STATE_LOGGED_IN' }], mappedLuns: [0] }]
+      ? [{ initiatorIqn: ISCSI_INITIATOR, initiatorAlias: 'anas-pve', targetIqn: ISCSI_IQN, tpgTag: 1, sessionId: 1, state: 'TARG_SESS_STATE_LOGGED_IN', connections: [{ cid: 0, address: '192.168.200.60', state: 'TARG_CONN_STATE_LOGGED_IN' }], mappedLuns: [opts.sessionLun ?? 0] }]
       : [],
     acls: [{
       initiatorIqn: ISCSI_INITIATOR,
@@ -1471,7 +1471,7 @@ function iscsiDetail(opts = {}) {
         size: 2 * GiB_,
         serial: '9bc6e907-6015-4267-be4f-5a0617cb3d71',
         attributes: { emulateTpu: true, emulateTpws: true, blockSize: 512, writeBack: false, maxUnmapLbaCount: 524288 },
-        connectedInitiators: opts.session ? [ISCSI_INITIATOR] : [],
+        connectedInitiators: opts.session && (opts.sessionLun ?? 0) === 0 ? [ISCSI_INITIATOR] : [],
         present: true,
         backingExists: true,
         pool: 'tank',
@@ -1486,7 +1486,7 @@ function iscsiDetail(opts = {}) {
         size: GiB_,
         serial: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
         attributes: { emulateTpu: true, emulateTpws: true, blockSize: 512, writeBack: false, maxUnmapLbaCount: 262144 },
-        connectedInitiators: [],
+        connectedInitiators: opts.session && opts.sessionLun === 1 ? [ISCSI_INITIATOR] : [],
         present: true,
         backingExists: true,
         pool: 'tank',
@@ -2071,18 +2071,57 @@ async function iscsiSessionGatingChecks() {
   const lunsWin = await openLuns(grid, routes)
   const lunsGrid = lunsWin.down('#lunsGrid')
 
-  lunsGrid.selectRow(0) // the LUN with a live session
+  // LUN 0 is the ZVOL, and it is the one with the session.
+  lunsGrid.selectRow(0)
   let state = toolbar(lunsGrid, ['lunAdd', 'lunResize', 'lunDelete'])
-  ok('session: Resize is DISABLED under a live session', state.lunResize.disabled === true)
+  // Live-proof F13: the two doors used to disagree about the same safe
+  // operation — Datasets accepted a grow of the held zvol, this one refused
+  // every resize. A zvol grow is live end to end (measured: the initiator kept
+  // showing the old size until `iscsiadm -R`, then the new one), so it is
+  // allowed here too. A FILE-backed LUN's resize is a backstore recreate and
+  // stays refused.
+  ok('session: growing a ZVOL LUN is allowed under a live session', state.lunResize.disabled === false)
   ok('session: Delete is DISABLED under a live session', state.lunDelete.disabled === true)
-  ok('session: the reason says LIO would not have refused',
-    /stale device/.test(state.lunResize.tip), state.lunResize.tip)
+  ok('session: the delete reason says LIO would not have refused',
+    /stale device/.test(state.lunDelete.tip), state.lunDelete.tip)
   ok('session: Add LUN is still allowed', state.lunAdd.disabled === false)
 
-  lunsGrid.selectRow(1) // the LUN with nobody logged in
+  // …and the dialog tells the operator the one thing that is not obvious.
+  let btn = lunsGrid.down('#lunResize')
+  btn.handler(btn)
+  await settle()
+  let resizeWin = openWindow()
+  let note = String(resizeWin.down('#resizeNote').html)
+  ok('session: the resize dialog says the initiator must RESCAN to see it',
+    /iscsiadm -m node -R/.test(note), note)
+  ok('session: …and that the filesystem on top is a separate job',
+    /grown separately/.test(note), note)
+  resizeWin.close()
+  await settle()
+
+  lunsGrid.selectRow(1) // the FILE LUN, nobody logged in
   state = toolbar(lunsGrid, ['lunResize', 'lunDelete'])
   ok('session: a LUN with no session is still resizable', state.lunResize.disabled === false)
   ok('session: …and deletable', state.lunDelete.disabled === false)
+
+  // The other half of F13: move the session onto the FILE LUN. Its size is fixed
+  // at creation, so a resize deletes and recreates the backstore under the
+  // initiator — refused, with the reason stated.
+  const fileRoutes = {
+    ...ISCSI_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: iscsiDetail({ session: true, sessionLun: 1 }) },
+  }
+  const fileView = await openIscsiView(fileRoutes)
+  const fileLuns = (await openLuns(fileView.grid, fileRoutes)).down('#lunsGrid')
+  fileLuns.selectRow(1)
+  state = toolbar(fileLuns, ['lunResize', 'lunDelete'])
+  ok('session: a FILE LUN is NOT resizable under a live session', state.lunResize.disabled === true)
+  ok('session: …and the tip says why it is different from a zvol',
+    /fixed at creation/.test(state.lunResize.tip) && /zvol-backed LUN grows live/.test(state.lunResize.tip),
+    state.lunResize.tip)
+  fileLuns.selectRow(0)
+  state = toolbar(fileLuns, ['lunResize'])
+  ok('session: the zvol sibling of a busy file LUN is unaffected', state.lunResize.disabled === false)
 
   // The live session is SHOWN, with its address — and never the misleading
   // `(NOT AUTHENTICATED)` label targetcli prints for one-way CHAP.

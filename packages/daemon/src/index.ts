@@ -1,9 +1,11 @@
 import type { CommandExecutor } from './executor/types.js'
 import type { JobQueue } from './jobs/queue.js'
 import type { DiskIdentityCache } from './services/disk-identity-cache.js'
+import type { IscsiPaths } from './services/iscsi.js'
 import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
+import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
 // no-env manual launch must NOT land the trust-boundary socket in world-writable
@@ -54,7 +56,7 @@ async function main() {
     // re-attach observation of kernel-owned reshapes. Non-blocking; failures are
     // logged, never fatal. Skipped in mock mode — there is no real md state.
     if (!MOCK) {
-      const decorated = server as unknown as { executor: CommandExecutor, jobQueue: JobQueue, diskIdentityCache: DiskIdentityCache, ahrIntentDir: string }
+      const decorated = server as unknown as { executor: CommandExecutor, jobQueue: JobQueue, diskIdentityCache: DiskIdentityCache, ahrIntentDir: string, iscsiPaths: IscsiPaths }
       void ahrBootScan(decorated.executor, {
         intentDir: decorated.ahrIntentDir,
         jobQueue: decorated.jobQueue,
@@ -64,6 +66,23 @@ async function main() {
           server.log.info(`ahr boot scan: recovered=[${report.recovered.join(',')}] reattached=[${report.reattached.join(',')}] haltedIntents=[${report.haltedIntents.join(',')}] observedReshapes=[${report.observedReshapes.join(',')}]`)
       }).catch((err) => {
         server.log.warn(`ahr boot scan failed: ${err instanceof Error ? err.message : String(err)}`)
+      })
+
+      // iSCSI stub quarantine (story `iscsi.8`, live-proof F2): `targetctl
+      // restore` CREATES a missing fileio backing file at its recorded size
+      // whenever the mountpoint directory exists, so a filesystem that failed to
+      // mount — or is still mounting — leaves a LUN activated, the right size,
+      // the right serial, and full of zeros. It runs long before anasd and
+      // reports success. The first useful thing anasd can do about iSCSI is take
+      // that empty disk off the network; the saved record is left alone so
+      // Repair puts the LUN back once the filesystem is there. Non-blocking,
+      // fail-open, and skipped in mock mode (no real LIO tree).
+      void iscsiStubBootScan(decorated.executor, {
+        ...decorated.iscsiPaths,
+        log: (line: string) => server.log.warn(line),
+      }).then((outcomes) => {
+        if (outcomes.length > 0)
+          server.log.warn(`iscsi stub quarantine: ${outcomes.length} placeholder LUN(s) taken offline — repair them from the iSCSI menu once the filesystem is mounted`)
       })
     }
   }

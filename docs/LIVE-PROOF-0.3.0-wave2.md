@@ -1130,3 +1130,259 @@ Timezone back to `Etc/UTC`. `node.startup=automatic` on the `lp2` node record.
 > then `systemctl stop rtslib-fb-targetctl && umount /mnt/anas-ahr/lpahr && rm -f
 > /mnt/anas-ahr/lpahr/lpahrlun.raw && mount /mnt/anas-ahr/lpahr && systemctl start
 > rtslib-fb-targetctl`. Done once already: the node is healthy as described above.
+
+---
+
+## iscsi.8 live proof
+
+Stunt node `anas-pve` (192.168.200.50), snapshots `pre-iscsi8` (before anything) and
+`post-iscsi8` (after everything below). Dev build of `iscsi.8` deployed with
+`test/stunt-node/deploy-anas.sh`.
+
+| # | Leg | Verdict |
+|---|---|---|
+| 0 | F2 reproduced ON THE OLD BUILD by a real power cycle | **PASS** (the bug is real, and unprompted) |
+| 1 | Daemon-start quarantine of the placeholder the boot left behind | **PASS** |
+| 2 | Unmount the AHR pool → restart the restore service → card, LUN-level unmap, initiator sees no LUN 3 → mount → Repair | **PASS** |
+| 3 | ZFS child dataset variant (both signals) — placeholder DELETED | **PASS** |
+| 4 | AHR fstab ordering: added on LUN placement, idempotent, and a normal boot orders by dependency | **PASS** |
+| 5 | F12 — a disabled ANAS target gets a card | **PASS** |
+| 6 | F13 — a zvol grow under a live session, through BOTH doors | **PASS** |
+| 7 | F15 — the volume-destroy guidance | **PASS** |
+| — | F14 — `deploy-anas.sh` installs the ordering drop-in | **PASS** |
+
+### 0. The old build, and a power cycle that was not staged
+
+`snapshot.sh pre-iscsi8` stops the VM, and `add-disk.sh` attaches the three AHR disks with
+`--live` only — so the very first boot of this session was the F2 scenario, with the code that
+does not handle it:
+
+```
+$ cat /proc/mdstat                     unused devices: <none>
+$ ls -la /mnt/anas-ahr/lpahr/
+-rw------- 1 root root 0 Aug 26 16:33 lpahrlun.raw        ← LIO created it at boot
+$ cat …/core/fileio_0/lpahrlun/info
+Status: ACTIVATED …  File: /mnt/anas-ahr/lpahr/lpahrlun.raw  Size: 536870912
+$ GET /v1/iscsi/health   →  degraded false, missingLuns []
+$ GET /v1/iscsi/targets  →  iqn.2026-08.anas-pve.anas:lp2  foreign  backing-not-anas-storage
+```
+
+A whole storage pool absent, an empty 512 MiB disk on the network, a healthy verdict, and the
+ANAS target declared hands-off. Every symptom of F2, measured again before a line of the fix
+ran.
+
+### 1. The daemon-start quarantine
+
+`deploy-anas.sh` (which now installs the drop-in — F14) restarted `anasd` into exactly that
+state. The boot scan found it without being asked:
+
+```
+anasd[1928]: iscsi.quarantine target=iqn.2026-08.anas-pve.anas:lp2 lun=3 backstore=lpahrlun
+             path=/mnt/anas-ahr/lpahr/lpahrlun.raw persistedSize=536870912 actualSize=0
+             containingMount=/ expectedMount=unknown zeroSized=true wrongMount=false
+             result=unmapped fileRemoved=false
+anasd[1928]: iscsi stub quarantine: 1 placeholder LUN(s) taken offline …
+```
+
+and the node's answers changed to match the truth:
+
+```
+$ ls …/tpgt_1/lun/                     lun_0  lun_1  lun_2          ← LUN 3 unmapped, siblings intact
+$ ls …/core/                           fileio_1 fileio_3 fileio_4   ← the stub backstore is gone
+$ GET /v1/iscsi/health
+    missingLuns [ lun 3, lpahrlun, backingExists FALSE ],  degraded TRUE,  stubLuns []
+$ GET /v1/iscsi/targets   →  …:lp2  anas  backing-unresolved  ← ownership BACK
+```
+
+`expectedMount=unknown` is the honest limit of the AHR-detached case: with no md array there is
+no pool, so nothing on the system can say where the file was supposed to live. Only the
+size signal fires, so the 0-byte file is **kept** — one signal unmaps the LUN, two are needed
+before ANAS deletes anything. The `missingLuns` card says so rather than claiming the path is
+empty:
+
+> LUN 3 'lpahrlun' … did not restore … That path holds a PLACEHOLDER the restore service
+> created — a file of the right name that is not the image, which is why ANAS took the LUN
+> offline. Mount the filesystem that should hold the image, then use Repair …
+
+### 2. Unmount + restart, the F2 recipe verbatim
+
+`systemctl stop rtslib-fb-targetctl` → `umount /mnt/anas-ahr/lpahr` → `systemctl start`. The
+restore reused the leftover 0-byte file and reported `Result=success`, `ExecMainStatus=0`. The
+FIRST `/v1/status` read after that is the discovering pass, and it says what happened:
+
+```
+CRITICAL  LUN 3 'lpahrlun' of target iqn.2026-08.anas-pve.anas:lp2 is a placeholder created by
+          the restore service — its filesystem was not mounted, so /mnt/anas-ahr/lpahr/
+          lpahrlun.raw holds no data (it is 0 bytes where the saved configuration says
+          536870912). An initiator reading it sees an empty disk of the right size with the
+          right serial. ANAS has taken it offline; mount the filesystem and use Repair …
+```
+
+The unmap is LUN-level, and rtslib removes the dependent MappedLUNs with it — both ACLs kept
+exactly their other three:
+
+```
+$ ls …/tpgt_1/lun/                              lun_0 lun_1 lun_2
+$ ls …/acls/iqn.1993-08.org.debian:01:ae3d…/    lun_0 lun_1 lun_2
+$ ls …/acls/iqn.1993-08.org.debian:01:dead…/    lun_0 lun_1 lun_2
+$ initiator, fresh login:   sdb lpzvol 2G   sdc lpsmall 256M   sdd lpfile 2G
+                            ← three disks, and NO 512 MiB lpahrlun
+```
+
+Then `mount /mnt/anas-ahr/lpahr` + `POST /v1/iscsi/health/repair`:
+
+```
+completed  repaired[ lun 3, lpahrlun, serialReplayed true ]  stillMissing []  saved true
+$ initiator after -R:   sdh 512M lpahrlun  8157f977-6f7e-4f38-a92d-15a91e891520
+$ sha256sum /dev/sdh                          8264508bd3c58006…
+$ sha256sum …/lpahrlun.raw                    8264508bd3c58006…   ← byte-identical
+```
+
+Same serial, same bytes, through the initiator.
+
+### 3. The ZFS child-dataset variant — where both signals fire
+
+`zfs unmount gtbackup/img2` with LUN 2 (`lpsmall`) backed by `/gtbackup/img2/lpsmall.raw`. The
+restore created the placeholder on the PARENT dataset, which is the case a size check alone
+would still catch but a size check alone could not safely clean up:
+
+```
+$ findmnt -T /gtbackup/img2/lpsmall.raw -o TARGET,SOURCE    /gtbackup  gtbackup
+$ GET /v1/iscsi/health  →  stubLuns[0]
+    persistedSize 268435456   actualSize 0
+    containingMount /gtbackup   expectedMount /gtbackup/img2
+    zeroSized true   wrongMount true   quarantined true   fileRemoved TRUE
+$ ls -la /gtbackup/img2/                       (empty)
+anasd: iscsi.quarantine … zeroSized=true wrongMount=true result=unmapped fileRemoved=true
+```
+
+`zfs mount gtbackup/img2` + Repair put LUN 2 back with `serialReplayed true`.
+
+### 4. The AHR fstab ordering
+
+`POST …/luns {kind: file, backing: lpahr}` — the moment an image LUN lands on the pool:
+
+```
+before   /dev/lpahr/lpahr-vol /mnt/anas-ahr/lpahr btrfs nofail,subvol=@data 0 0
+after    /dev/lpahr/lpahr-vol /mnt/anas-ahr/lpahr btrfs nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service 0 0
+second LUN on the same pool  →  `diff` says IDENTICAL
+$ systemctl show 'mnt-anas\x2dahr-lpahr.mount' -p Before   Before=rtslib-fb-targetctl.service
+```
+
+A normal reboot then orders by DEPENDENCY rather than by luck (the 1.2 s margin GT-47 measured
+was coincidence; this is not):
+
+```
+16:43:33.533949  Mounted mnt-anas\x2dahr-lpahr.mount - /mnt/anas-ahr/lpahr.
+16:43:34.585985  Starting rtslib-fb-targetctl.service - Restore LIO kernel target configuration...
+16:43:34.877906  Finished rtslib-fb-targetctl.service …
+$ GET /v1/iscsi/health   →  degraded false, missing 0, stubs 0
+```
+
+The `post-iscsi8` snapshot then power-cycled the node one more time, and the ordering earned
+its keep on a boot nobody staged — the AHR disks were re-attached while the guest was still
+coming up, and the restore waited for the mount instead of racing it:
+
+```
+16:49:09.206347  Mounted mnt-anas\x2dahr-lpahr.mount - /mnt/anas-ahr/lpahr.
+16:49:09.207452  Starting rtslib-fb-targetctl.service …          ← 1 ms later, BY DEPENDENCY
+16:49:09.402851  Finished rtslib-fb-targetctl.service …
+$ GET /v1/iscsi/health   →  degraded false, missing [], stubs 0
+$ ls …/tpgt_1/lun/       →  lun_0 lun_1 lun_2 lun_3
+$ dd if=/dev/sdg bs=1M count=4 | sha256sum          5d7934bcabafceb6…
+$ dd if=…/lpahrlun.raw bs=1M count=4 | sha256sum    5d7934bcabafceb6…
+```
+
+No placeholder, no quarantine, no repair — the failure mode simply did not happen. That is the
+point of design point 3: detection and quarantine are the safety net, the fstab ordering is
+what keeps the node off it.
+
+### 5. F12 — a target that is serving nothing
+
+```
+POST …/state {disable}  →  GET /v1/status
+WARNING  iSCSI target iqn.2026-08.anas-pve.anas:lp2 is disabled — it is serving nothing, and
+         its 6 LUNs are unreachable (LIO's enable flag is per target, not per LUN). Enable it
+         from the iSCSI menu when you are ready.
+POST …/state {enable}   →  no iscsi cards
+```
+
+The partial-image-restore reason rides on the retained job when there is one; there was no
+failed restore in this session, so the card correctly carried no invented explanation.
+
+### 6. F13 — one answer from both doors
+
+```
+iSCSI door,   1 session open,  PUT …/luns/0 {size: 3 GiB}      → 202, completed
+    warning: "1 initiator is logged in. The volume grows live, but an initiator keeps showing
+              the OLD size until it rescans (open-iscsi: `iscsiadm -m node -R`) …"
+    initiator before -R:  sde 2G      after -R:  sde 3G        ← measured, again
+Datasets door, same session, PUT …/datasets/sparse1 {volsize: 4 GiB}  → 202, completed
+```
+
+And the two things that are NOT a live grow are still refused, with reasons that differ:
+
+```
+PUT …/luns/1 {size} (file kind, session)  → 409 session-open, no confirm code
+    "A file-backed LUN is resized by recreating its backstore (its size is fixed at creation),
+     so it is refused under a live session …"
+PUT …/luns/0 {size: 1 MiB}                → 409 shrink   (a shrink is refused AS a shrink,
+                                             session or not — "log the initiator out" would
+                                             have been misleading advice)
+```
+
+### 7. F15 — the destroy that ZFS refuses
+
+On a fresh `gtbackup/i8vol` with two snapshots:
+
+```
+DELETE …/datasets/i8vol            → 409 CONFIRMATION_REQUIRED, warnings[] includes
+  "Volume 'gtbackup/i8vol' has 2 snapshots (gtbackup/i8vol@r1, gtbackup/i8vol@r2) — ZFS will
+   not destroy it while they exist. Destroy them first, or confirm again with Recursive to
+   destroy gtbackup/i8vol and everything under it in one go. A recursive destroy is
+   irreversible."
+DELETE …/datasets/i8vol (confirmed, not recursive)  → job FAILED with the SAME sentence
+```
+
+No `use '-r'`, no `volume has children`, in either place.
+
+### GT amendments (`docs/ISCSI-GROUND-TRUTH.md`)
+
+14. **`luns delete lun<n>` removes that LUN's MappedLUNs from every ACL.** rtslib does the
+    dependent delete, so a LUN-level unmap needs exactly the two commands `deleteIscsiLun`
+    already runs — no ACL cleanup pass, and no leftover `mapped_lun<n>` directories. Verified
+    on two ACLs with three sibling LUNs each.
+15. **A by-hand `mount` of an fstab entry creates a mount unit systemd may collect.** Stopping
+    `rtslib-fb-targetctl` (which the ordering drop-in orders after `local-fs.target`) took a
+    hand-mounted AHR pool down with it, producing a THIRD unprompted F2 reproduction inside
+    this proof. Not a product bug — a `nofail` mount started outside a boot transaction has
+    nothing wanting it — but it is a trap for anyone testing by hand: mount with
+    `systemctl start <unit>.mount`, or expect the mount to disappear under an unrelated stop.
+16. **The stub verdict's mount signal is unavailable when the whole pool is gone.** With no md
+    array there is no AHR topology, so `expectedMount` is unknown and only the size signal
+    fires — which unmaps the LUN but deliberately leaves the 0-byte file. Mounting the pool
+    then shadows it (`Directory … to mount over is not empty, mounting anyway`), which is
+    harmless but leaves litter until someone unmounts. The ZFS-dataset case has both signals
+    and cleans up after itself.
+
+### Node state left behind (delta from the wave-2 section above)
+
+- **`gtbackup/sparse1` is now 4 GiB** (was 2 GiB) — grown twice by the F13 legs, through both
+  doors. A zvol cannot shrink back, and LUN 0 reports 4294967296.
+- **The AHR pool's fstab line carries `x-systemd.before=rtslib-fb-targetctl.service`**, added
+  by the LUN-placement path and left in place (the pool holds LUN 3).
+- The stale 0-byte `lpahrlun.raw` placeholder under the mountpoint was removed by hand at the
+  end; `/mnt/anas-ahr/lpahr/` holds the real 512 MiB image (`8264508bd3c58006…`), `photos` and
+  `top`.
+- Temporary objects removed again: LUNs 4/5 (`i8order`, `i8order2`) with their images, the
+  volume `gtbackup/i8vol` and its two snapshots.
+- `GET /v1/iscsi/health`: `degraded false`, nothing missing, no stubs, no disabled targets.
+  Target `…:lp2` is `anas`, enabled, 4 LUNs with their original serials
+  (`3183e69f…`, `2e69b404…`, `33907512…`, `8157f977…`). `saveconfig.json` sha256
+  `4e92833d…`. The only dashboard warnings are the pre-existing `share`/`mount` ones from
+  earlier sessions (`/testpool/*`, `/mnt/anas-ahr/stage`, `/mnt/anas-cifs-smoke`).
+- **The `add-disk.sh` caveat still applies**: after any full stop, re-run
+  `./test/stunt-node/add-disk.sh 1 && … 2 && … 3`. What has changed is what happens if you
+  forget — ANAS now takes the placeholder LUN offline by itself and tells you, instead of
+  serving an empty disk. The recovery is `add-disk.sh` ×3, `mount /mnt/anas-ahr/lpahr`, then
+  Repair from the iSCSI menu.

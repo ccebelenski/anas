@@ -29,19 +29,28 @@ import type {
   IscsiTargetDetail,
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { FindmntNode } from '../parsers/findmnt.js'
 import type { LioSaveconfig, SaveconfigStorageObject } from '../parsers/lio-saveconfig.js'
+import type { ZfsMountpoint } from '../parsers/pve-storage.js'
 import type { ConfigfsAcl, ConfigfsBackstore, ConfigfsPortal, LioLiveState } from './iscsi-configfs.js'
 import type { OwnershipInputs, OwnershipLun } from './iscsi-ownership.js'
+import type { StubVerdict } from './iscsi-stub.js'
 import { stat } from 'node:fs/promises'
 import { anasTargetName } from '@anas/shared'
 import { LIO_SAVECONFIG_PATH, readLioSaveconfig, storageObjectsByName } from '../parsers/lio-saveconfig.js'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { readAhrPools } from './ahr-topology.js'
+import { filesystemOf } from './backup-consistency.js'
 import { CONFIGFS_TARGET_ROOT, normalizePlugin, readConfigfs } from './iscsi-configfs.js'
 import { classifyBacking, deriveOwnership } from './iscsi-ownership.js'
+import { fileStubVerdict } from './iscsi-stub.js'
+import { mountIndex } from './nested-filesystems.js'
 
 /** `/usr/bin/ip` — the REAL binary on Debian/PVE (`/usr/sbin/ip` is a symlink). */
 const IP = '/usr/bin/ip'
+
+/** `findmnt --json` — the mount table that can never hang (it reads mountinfo). */
+const FINDMNT = '/usr/bin/findmnt'
 
 export { normalizePlugin }
 
@@ -66,6 +75,32 @@ export interface IscsiPaths {
    * exercised through the routes.
    */
   backingExists?: (path: string) => Promise<boolean | null>
+  /**
+   * A fileio backing's `st_size` in bytes, or null when it could not be read.
+   * Defaults to a real `stat`. The SECOND half of the stub verdict's first
+   * signal (story `iscsi.8`) and a test seam for exactly the same reason
+   * `backingExists` is one: a fixture's `/gtiscsi/images/lun2.raw` does not
+   * exist on any test host, so without it no test could ever exercise a
+   * placeholder — which is the whole finding.
+   */
+  backingSize?: (path: string) => Promise<number | null>
+  /**
+   * The kernel mount table, as `findmnt --json` prints it. Defaults to running
+   * `findmnt`, and ONLY when a fileio LUN is backed by a real path (Principle 7:
+   * a node with no image LUNs pays nothing). Injectable so the stub tests can
+   * put a filesystem boundary exactly where the finding puts one.
+   */
+  findmnt?: () => Promise<string | null>
+  /**
+   * The ZFS dataset → mountpoint list. Defaults to `zfs list -H -o
+   * name,mountpoint`.
+   *
+   * A seam for the same reason `findmnt` is one: a test host has no ZFS, and
+   * "which dataset is this image SUPPOSED to be on" is half of the stub verdict
+   * (story `iscsi.8`). Without it the expected mount is always unknown and the
+   * mount-mismatch signal can never be exercised end to end.
+   */
+  zfsMountpoints?: () => Promise<ZfsMountpoint[]>
 }
 
 /** Everything one iSCSI read needs, gathered once and shared by all four routes. */
@@ -81,11 +116,50 @@ export interface IscsiReadContext {
    */
   nodeAddresses: Set<string> | null
   /**
-   * The backing-existence probe {@link buildIscsiTargets} uses, carried on the
-   * context so it reaches the builder (which takes no paths). Absent = the real
-   * `stat`. See {@link IscsiPaths.backingExists}.
+   * Every backing path either source names, probed ONCE during the gather:
+   * does it resolve, and (for a file) how big is it? The builder reads this map
+   * instead of doing I/O of its own, so a LUN that appears in both the live tree
+   * and the saved config costs one `stat`, not two.
    */
-  backingExists?: (path: string) => Promise<boolean | null>
+  backing: Map<string, IscsiBackingProbe>
+  /**
+   * The kernel mount table by mountpoint, EMPTY when it was not read (no image
+   * LUN on this node) or `findmnt` failed. Empty is deliberately indistinguishable
+   * from "no boundaries known": the stub verdict withholds its mount signal
+   * rather than inventing one (fail-open).
+   */
+  mounts: Map<string, FindmntNode>
+  /**
+   * The stub verdict per backing path, FILLED BY {@link buildIscsiTargets}.
+   *
+   * It lives on the context rather than in the return value because the verdict
+   * is computed on the way in (it decides the LUN's kind) and needed again on
+   * the way out (it is what `stubLuns[]` reports), and computing it twice from
+   * two copies of the same arithmetic is exactly the drift the single-source
+   * rule forbids. Empty until a build has run; a path with no entry was never a
+   * candidate.
+   */
+  stubs: Map<string, IscsiLunStubFacts>
+}
+
+/** A stub verdict with the facts it was reached from — the `stubLuns[]` row. */
+export interface IscsiLunStubFacts extends StubVerdict {
+  /** The size the saved configuration records (0 when it records none). */
+  persistedSize: number
+  /** The file's real `st_size`; null when unread. */
+  actualSize: number | null
+  /** The mount that actually contains the file. */
+  containingMount: string | null
+  /** The mountpoint of the dataset / AHR pool the path belongs to. */
+  expectedMount: string | null
+}
+
+/** What one `stat` of a backing path told us. */
+export interface IscsiBackingProbe {
+  /** Does the path resolve right now? Null when the check itself failed. */
+  exists: boolean | null
+  /** `st_size` for a regular file; null for a device, or when unread. */
+  size: number | null
 }
 
 /**
@@ -165,20 +239,71 @@ export async function readNodeAddresses(executor: CommandExecutor): Promise<Set<
   }
 }
 
-/** Does a backing path resolve right now? Null when the check itself failed. */
-async function statBackingExists(path: string): Promise<boolean | null> {
+/**
+ * One `stat` of a backing path: does it resolve, and how big is it?
+ *
+ * The size half is what makes a PLACEHOLDER visible (story `iscsi.8`): a fileio
+ * backing LIO created for itself at boot is 0 bytes while the saved config says
+ * otherwise, and `st_size` is the only thing on the system that says so — the
+ * LUN, the serial and configfs's own `Size:` all read exactly as they should.
+ * `st_size` (not `st_blocks`) is the right measure: ANAS creates image files
+ * with `ftruncate`, so a real image is full-length and completely sparse.
+ */
+async function statBacking(path: string): Promise<IscsiBackingProbe> {
   if (!path.startsWith('/'))
-    return null
+    return { exists: null, size: null }
   try {
-    await stat(path)
-    return true
+    const st = await stat(path)
+    return { exists: true, size: st.isFile() ? st.size : null }
   }
   catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException).code
     // ENOENT / ENOTDIR are a real answer: the backing object is gone (a `zfs
     // rename` under a live LUN leaves exactly this, GT-40). Anything else
     // (EACCES, EIO) is "we do not know", not "missing".
-    return code === 'ENOENT' || code === 'ENOTDIR' ? false : null
+    return { exists: code === 'ENOENT' || code === 'ENOTDIR' ? false : null, size: null }
+  }
+}
+
+/**
+ * Probe every backing path once, honouring the two seams.
+ *
+ * The seams override INDEPENDENTLY: `backingExists` answers existence and
+ * `backingSize` answers size, so a test can say "this path is there" without
+ * also having to invent a size, and the production default (`ANAS_ISCSI_*`
+ * unset) is one real `stat` per path.
+ */
+async function probeBackings(paths: string[], seams: IscsiPaths): Promise<Map<string, IscsiBackingProbe>> {
+  const out = new Map<string, IscsiBackingProbe>()
+  for (const path of paths) {
+    const real = seams.backingExists && seams.backingSize
+      ? { exists: null, size: null }
+      : await statBacking(path)
+    const probe: IscsiBackingProbe = {
+      exists: seams.backingExists ? await seams.backingExists(path) : real.exists,
+      size: seams.backingSize ? await seams.backingSize(path) : real.size,
+    }
+    out.set(path, probe)
+  }
+  return out
+}
+
+/**
+ * The kernel mount table, FAIL-OPEN to an empty map.
+ *
+ * `findmnt --json` reads `/proc/self/mountinfo`, so it can never hang — the same
+ * property Epic 18 and `backup-consistency.ts` rely on. An empty map withholds
+ * the stub verdict's mount signal instead of asserting one.
+ */
+async function readMountTable(executor: CommandExecutor, seams: IscsiPaths): Promise<Map<string, FindmntNode>> {
+  try {
+    const json = seams.findmnt
+      ? await seams.findmnt()
+      : await executor.exec(FINDMNT, ['--json']).then(r => (r.exitCode === 0 ? r.stdout : null))
+    return json ? mountIndex(json) : new Map<string, FindmntNode>()
+  }
+  catch {
+    return new Map<string, FindmntNode>()
   }
 }
 
@@ -203,7 +328,9 @@ export async function readIscsiContext(
     persisted,
     inputs: { pveStorages: new Map(), zfsMountpoints: [] },
     nodeAddresses: null,
-    ...(paths.backingExists ? { backingExists: paths.backingExists } : {}),
+    backing: new Map(),
+    mounts: new Map(),
+    stubs: new Map(),
   }
 
   const hasTargets = live.targets.length > 0 || (persisted?.targets.length ?? 0) > 0
@@ -211,17 +338,18 @@ export async function readIscsiContext(
     return empty
 
   const [zfsMountpoints, nodeAddresses] = await Promise.all([
-    readZfsMountpoints(),
+    paths.zfsMountpoints ? paths.zfsMountpoints() : readZfsMountpoints(),
     readNodeAddresses(executor),
   ])
   const pveStorages = await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints)
 
   const inputs: OwnershipInputs = { pveStorages, zfsMountpoints }
+  const backingPaths = collectBackingPaths(live, persisted)
 
   // AHR topology is the expensive read (mdstat + LVM + btrfs), so it happens
   // only when a LUN is backed by a FILE that resolved onto no ZFS dataset — the
   // only case where an AHR pool could be the answer.
-  const needsAhr = collectBackingPaths(live, persisted).some((p) => {
+  const needsAhr = backingPaths.some((p) => {
     if (p.startsWith('/dev/'))
       return false
     return classifyBacking(p, inputs).kind === 'foreign'
@@ -239,12 +367,24 @@ export async function readIscsiContext(
     }
   }
 
+  // The mount table is read only when a LUN is backed by a real PATH — the only
+  // kind that can be a placeholder (story `iscsi.8`). A node serving nothing but
+  // zvols pays nothing for it (Principle 7).
+  const hasFileBacking = backingPaths.some(p => p.startsWith('/') && !p.startsWith('/dev/'))
+
+  const [backing, mounts] = await Promise.all([
+    probeBackings(backingPaths, paths),
+    hasFileBacking ? readMountTable(executor, paths) : Promise.resolve(new Map<string, FindmntNode>()),
+  ])
+
   return {
     live,
     persisted,
     inputs,
     nodeAddresses,
-    ...(paths.backingExists ? { backingExists: paths.backingExists } : {}),
+    backing,
+    mounts,
+    stubs: new Map(),
   }
 }
 
@@ -439,8 +579,36 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
       // when it is actually THERE. When it is not, it is `unresolved` — the
       // boot-restore hole — and that must not cost the target its ownership
       // (story `iscsi.5`, live-proof F2).
-      const exists = backingPath ? await (ctx.backingExists ?? statBackingExists)(backingPath) : null
+      const probe = (backingPath ? ctx.backing.get(backingPath) : undefined) ?? { exists: null, size: null }
+      const exists = probe.exists
       const classification = classifyBacking(backingPath, ctx.inputs, exists)
+
+      // Is what LIO is serving the LUN's data, or a placeholder the restore
+      // service created for itself (story `iscsi.8`, live-proof F2)? The verdict
+      // is computed HERE, on the way in, because it changes the LUN's kind: a
+      // stub RESOLVES — the file is right there — so without this it classifies
+      // `foreign` and takes its target's ownership with it, which is precisely
+      // backwards. A placeholder is an ABSENCE dressed up as a file, so it gets
+      // the absence's answer: `unresolved`, ownership untouched, repairable.
+      const persistedSize = persistedBackstore?.size ?? liveBackstore?.size ?? null
+      const containingMount = backingPath ? filesystemOf(backingPath, ctx.mounts)?.target ?? null : null
+      const stub: IscsiLunStubFacts = {
+        ...fileStubVerdict({
+          backingPath,
+          plugin,
+          persistedSize,
+          exists: probe.exists,
+          actualSize: probe.size,
+          expectedMount: classification.mountpoint,
+          containingMount,
+        }),
+        persistedSize: persistedSize ?? 0,
+        actualSize: probe.size,
+        containingMount,
+        expectedMount: classification.mountpoint,
+      }
+      if (stub.stub && backingPath)
+        ctx.stubs.set(backingPath, stub)
 
       const lun: IscsiLun = {
         index,
@@ -448,8 +616,9 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
         // A backing that positively resolves onto storage ANAS does not manage
         // is `foreign`; one that resolves onto nothing at all is `unresolved`; a
         // zvol/file whose path has merely gone stale keeps its kind and reports
-        // `backingExists: false` instead (GT-40).
-        kind: classification.kind,
+        // `backingExists: false` instead (GT-40). A STUB is `unresolved` too:
+        // the bytes the LUN is supposed to serve are not on this node.
+        kind: stub.stub ? 'unresolved' : classification.kind,
         plugin,
         backingPath,
         size: liveBackstore?.size ?? persistedBackstore?.size ?? null,
@@ -466,7 +635,13 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
           .filter(s => s.mappedLuns.includes(index))
           .map(s => s.initiatorIqn),
         present: liveLun !== undefined && liveBackstore !== undefined,
-        backingExists: exists,
+        // A stub reports its BACKING as absent, and it is not a lie: the file is
+        // there, but the LUN's data is not, and every consumer of this flag —
+        // Repair's "is it back yet", the image-restore door, the grid's tooltips
+        // — is asking about the data. Answering "present" because a 0-byte
+        // placeholder can be `stat`ed is how F2 let Repair re-create a LUN over
+        // the placeholder.
+        backingExists: stub.stub ? false : exists,
       }
       if (classification.pool)
         lun.pool = classification.pool
@@ -476,6 +651,11 @@ export async function buildIscsiTargets(ctx: IscsiReadContext): Promise<IscsiTar
     }
 
     // --- ownership ---------------------------------------------------------
+    // A stub LUN is handed to ownership as an ABSENCE (`backingExists: false`),
+    // not as the resolvable file it physically is. That is the whole ownership
+    // half of live-proof F2: the placeholder is real enough to `stat`, so the
+    // honest-looking answer ("it resolves, and not onto ANAS storage") declares
+    // ANAS's own target hands-off at the exact moment it needs managing.
     const ownershipLuns: OwnershipLun[] = luns.map(l => ({
       name: l.name,
       backingPath: l.backingPath,

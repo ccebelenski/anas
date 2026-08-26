@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
-import type { IscsiBackstoreAttributes, IscsiMutateOptions, IscsiRefusal } from '../services/iscsi-mutate.js'
+import type { IscsiBackstoreAttributes, IscsiMutateOptions, IscsiRefusal, ResolvedAhrPool } from '../services/iscsi-mutate.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import {
   aclAuthRequirement,
@@ -17,8 +17,8 @@ import {
   UpdateIscsiTargetRequest,
 } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
+import { ensureAhrTargetOrdering } from '../services/ahr-create.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
-import { computeIscsiHealth } from '../services/iscsi-health.js'
 import {
   addIscsiLun,
   assertInstalled,
@@ -44,6 +44,7 @@ import {
   withIscsiLock,
   zvolDataset,
 } from '../services/iscsi-mutate.js'
+import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
 import { assertRepairable, planIscsiRepair, repairIscsiHoles } from '../services/iscsi-repair.js'
 import { iscsiAvailability } from '../services/iscsi.js'
 import { requireIdentity } from './identity.js'
@@ -92,6 +93,13 @@ export interface IscsiMutateRouteOptions extends IscsiPaths {
   executor: CommandExecutor
   jobQueue: JobQueue
   confirmStore: ConfirmStore
+  /**
+   * `/etc/fstab` — written surgically, and for exactly one reason: an image LUN
+   * placed on an AHR pool adds `x-systemd.before=rtslib-fb-targetctl.service` to
+   * that pool's line so the pool is mounted before LIO restores (story
+   * `iscsi.8`). Defaults to the real file; the tests point it at a temp copy.
+   */
+  fstabPath?: string
 }
 
 /**
@@ -110,7 +118,7 @@ function sendRefusal(reply: FastifyReply, refusal: IscsiRefusal): FastifyReply {
 }
 
 export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMutateRouteOptions) {
-  const { executor, jobQueue, confirmStore, ...paths } = opts
+  const { executor, jobQueue, confirmStore, fstabPath = '/etc/fstab', ...paths } = opts
   const configfsRoot = paths.configfsRoot ?? CONFIGFS_TARGET_ROOT
 
   /** The mutation context every sequence gets: executor, configfs root, progress. */
@@ -501,6 +509,8 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     let plugin: 'block' | 'fileio'
     let dataset: string | undefined
     let size: number | null = null
+    /** Set when the image lands on an AHR pool — the boot-ordering half. */
+    let ahrPool: ResolvedAhrPool | undefined
     if (req.kind === 'zvol') {
       const resolved = resolveZvolBacking(req.backing, state.ctx)
       if ('refusal' in resolved)
@@ -528,6 +538,7 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       plugin = 'fileio'
       dataset = dir.ok.dataset
       size = req.size ?? null
+      ahrPool = dir.ok.ahr
     }
 
     const serial = newSerial()
@@ -538,6 +549,17 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         if (req.kind === 'file' && size !== null) {
           updateProgress(`Creating sparse image ${backingPath}`)
           await createSparseImage(backingPath, size)
+        }
+        // The moment an image LUN lands on an AHR pool, that pool's boot
+        // ordering starts to matter: a `nofail` fstab mount has no static anchor
+        // any drop-in can name, so without this the pool can lose the race to
+        // `rtslib-fb-targetctl` and LIO CREATES a 0-byte placeholder at the
+        // image's path — an empty disk with the right serial (live-proof F2).
+        // Surgical, byte-identical when already present, never fatal.
+        if (ahrPool) {
+          const added = await ensureAhrTargetOrdering(executor, fstabPath, ahrPool)
+          if (added)
+            updateProgress(`Ordered the mount of AHR pool '${ahrPool.name}' before the iSCSI restore service`)
         }
         const result = await addIscsiLun(
           mutateOptions(updateProgress),
@@ -587,24 +609,10 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (!lun)
       return reply
 
-    // GT-42: LIO offers NO protection here. A live session is refused outright
-    // in this cut — no confirm bypass. Growing a zvol under a session is in fact
-    // safe (GT-28), but a fileio resize deletes and recreates the backstore
-    // under the initiator's feet, and one rule that is true beats two that need
-    // explaining.
-    if (lun.connectedInitiators.length > 0) {
-      reply.code(409)
-      return {
-        error: {
-          code: 'CONFLICT',
-          reason: 'session-open',
-          message: `LUN ${index} of '${iqn}' has ${lun.connectedInitiators.length} live session${lun.connectedInitiators.length === 1 ? '' : 's'} `
-            + `(${lun.connectedInitiators.join(', ')}). Resizing a LUN under a live session is refused outright — log the initiator out first. `
-            + `This refusal has no confirm bypass.`,
-        },
-      }
-    }
-
+    // The size checks come FIRST so a shrink is refused as a SHRINK even when a
+    // session is also open: "this would destroy data past the new end" is the
+    // fact the operator needs, and "log the initiator out" would be misleading
+    // advice — logging out would not make the shrink safe.
     if (req.size !== undefined) {
       if (lun.size !== null && req.size < lun.size) {
         reply.code(409)
@@ -630,12 +638,67 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       }
     }
 
+    // GT-42: LIO offers NO protection here, so every session gate is ANAS's own.
+    //
+    // ONE exception, and it is not a softening: **growing a zvol is live**
+    // (GT-28). Nothing is unmapped, no backstore is recreated, the LUN keeps its
+    // identity and the initiator picks the new size up on its next rescan. That
+    // is exactly what `iscsi.3` already allows through the Datasets door on the
+    // same held zvol — and live-proof F13 caught the two doors disagreeing about
+    // the same safe operation, which is worse than either rule alone: a user who
+    // meets this refusal first concludes it cannot be done.
+    //
+    // A FILE resize stays refused, because it is a different operation wearing
+    // the same name: the size of a fileio backing is fixed at creation (GT-29),
+    // so ANAS unmaps the LUN, deletes the backstore, grows the file and recreates
+    // it — under a mounted filesystem, with no kernel message either side.
+    // A write-cache change also stays refused: it is a live attribute write on a
+    // backstore an initiator has open.
+    const zvolGrow = lun.kind === 'zvol'
+      && req.size !== undefined
+      && req.writeBack === undefined
+      && (lun.size === null || req.size > lun.size)
+    if (lun.connectedInitiators.length > 0 && !zvolGrow) {
+      // The zvol clause is part of the sentence rather than appended to it: a
+      // refusal that ends in "…and by the way this is allowed" reads as an
+      // afterthought, and it is the half the operator most needs.
+      const zvolNote = lun.kind === 'zvol'
+        ? ' (GROWING a zvol-backed LUN is allowed under a live session: it is live end to end and the initiator rescans.)'
+        : ''
+      const why = req.writeBack !== undefined
+        ? `Changing the write cache under a live session is refused`
+        : lun.kind === 'zvol'
+          ? `Resizing a LUN under a live session is refused`
+          : `A file-backed LUN is resized by recreating its backstore (its size is fixed at creation), so it is refused under a live session`
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'session-open',
+          message: `LUN ${index} of '${iqn}' has ${lun.connectedInitiators.length} live session${lun.connectedInitiators.length === 1 ? '' : 's'} `
+            + `(${lun.connectedInitiators.join(', ')}). ${why} — LIO would do it anyway and leave a stale device on the `
+            + `other host with no kernel message. Log the initiator out first. This refusal has no confirm bypass.${zvolNote}`,
+        },
+      }
+    }
+
     const attributes: IscsiBackstoreAttributes = replayAttributes(
       lun,
       lun.plugin,
       req.writeBack !== undefined ? { writeBack: req.writeBack } : {},
     )
     const warnings: string[] = []
+    // A grow that happens under a live session is safe and INVISIBLE until the
+    // initiator looks again — measured on the stunt node: the disk stayed at its
+    // old size until `iscsiadm -m node -R`, then reported the new one (F13).
+    // Saying so is the difference between "it did not work" and "rescan".
+    if (zvolGrow && lun.connectedInitiators.length > 0) {
+      warnings.push(
+        `${lun.connectedInitiators.length} initiator${lun.connectedInitiators.length === 1 ? ' is' : 's are'} logged in. `
+        + 'The volume grows live, but an initiator keeps showing the OLD size until it rescans '
+        + '(open-iscsi: `iscsiadm -m node -R`); the filesystem on top then has to be grown separately.',
+      )
+    }
     if (req.writeBack === true) {
       warnings.push(
         'Write-back caching is ON for this LUN: the target acknowledges a write before it reaches stable storage, '
@@ -789,13 +852,16 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (!identity)
       return
 
-    const state = await readIscsiState(executor, paths)
+    // Story `iscsi.8`: this read quarantines too. A LUN serving a PLACEHOLDER is
+    // not yet a hole — it is a live LUN with an empty file behind it — so the
+    // tear-down has to happen before the plan is built, or Repair would answer
+    // "nothing to repair" about the very thing it exists to fix.
+    const state = await readIscsiHealthWithQuarantine(executor, paths)
     const notInstalled = assertInstalled(state.ctx)
     if (notInstalled)
       return sendRefusal(reply, notInstalled)
 
-    const health = computeIscsiHealth(state.ctx, state.targets)
-    const plan = planIscsiRepair(state.ctx, health, state.targets)
+    const plan = planIscsiRepair(state.ctx, state.health, state.targets)
     const refusal = assertRepairable(plan)
     if (refusal)
       return sendRefusal(reply, refusal)
