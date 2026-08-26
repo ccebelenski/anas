@@ -446,4 +446,77 @@
             ANAS.warn('changeMountpointFlow failed: ' + ANAS.errText(e));
         }
     };
+
+    // ---- Shared edit guard (save gate) -------------------------------------
+    //
+    // An edit dialog NEVER substitutes stored identity: when a stored pool or
+    // target location is missing from freshly-loaded inventory (a pool
+    // exported, a remote de-registered, an endpoint that answered with an
+    // empty list), falling back to the first row silently rewrites where the
+    // task reads from or writes to. So the stored value stays on screen marked
+    // "(unavailable)" and Save is BLOCKED with a named reason until the
+    // operator decides — and the daemon refuses an unflagged retarget
+    // regardless. One rule, shared by the replication task dialog
+    // (65-replication.js, #39) and the snapshot schedule dialog
+    // (69-snapshots.js, #40).
+    //
+    // State lives on the window: win._saveBlocks = { key: reason }. reason()
+    // reports the first live block (or '' when the gate is open); refresh()
+    // mirrors it onto the #submit button and the #guardNote component (noteCfg
+    // is that component's config); block/unblock update the map and re-run
+    // refresh().
+    ANAS.editGuard = {
+        reason: function (win) {
+            var blocks = win._saveBlocks || {};
+            var keys = Object.keys(blocks);
+            for (var i = 0; i < keys.length; i++) {
+                if (blocks[keys[i]]) {
+                    return blocks[keys[i]];
+                }
+            }
+            return '';
+        },
+        // Disable Save and show WHY, in the dialog, in the operator's words.
+        refresh: function (win) {
+            var reason = ANAS.editGuard.reason(win);
+            try {
+                var btn = win.down('#submit');
+                if (btn) {
+                    btn.setDisabled(!!reason);
+                }
+                var note = win.down('#guardNote');
+                if (note) {
+                    note.setHidden(!reason);
+                    note.setHtml(reason
+                        ? '<div style="color:var(--anas-danger,#c23b2c);font-size:12px;">' + ANAS.enc(reason) + '</div>'
+                        : '');
+                }
+            } catch (e) {
+                // Cosmetic only — the dialog's submit handler re-checks the
+                // gate before it sends.
+            }
+        },
+        block: function (win, key, reason) {
+            win._saveBlocks = win._saveBlocks || {};
+            win._saveBlocks[key] = reason;
+            ANAS.editGuard.refresh(win);
+        },
+        unblock: function (win, key) {
+            if (win._saveBlocks) {
+                delete win._saveBlocks[key];
+            }
+            ANAS.editGuard.refresh(win);
+        },
+        // The note the gate writes into, placed at the top of a dialog's form.
+        noteCfg: function () {
+            return {
+                xtype: 'component',
+                itemId: 'guardNote',
+                cls: 'anas-edit-guard',
+                hidden: true,
+                margin: '0 0 8 0',
+                html: '',
+            };
+        },
+    };
 })();

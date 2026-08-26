@@ -546,60 +546,10 @@
     // named reason. The daemon backs this up: a PUT may not change a schedule's
     // target at all (retarget = delete + create).
     //
-    // NOTE: 65-replication.js carries these same edit-guard helpers for the
-    // task dialog (#39) — deliberately identical, since the rule is one rule.
-    // Their natural home is a shared ANAS.* helper in 10-api.js.
+    // The gate machinery itself is the shared ANAS.editGuard in 10-api.js —
+    // the replication task dialog (65-replication.js, #39) runs the same one.
 
     var UNAVAILABLE = t('(unavailable)');
-
-    function saveBlockReason(win) {
-        var blocks = win._saveBlocks || {};
-        var keys = Object.keys(blocks);
-        for (var i = 0; i < keys.length; i++) {
-            if (blocks[keys[i]]) {
-                return blocks[keys[i]];
-            }
-        }
-        return '';
-    }
-
-    // Disable Save and show WHY, in the dialog, in the operator's words.
-    function refreshSaveGate(win) {
-        var reason = saveBlockReason(win);
-        try {
-            var btn = win.down('#submit');
-            if (btn) {
-                btn.setDisabled(!!reason);
-            }
-            var note = win.down('#guardNote');
-            if (note) {
-                note.setHidden(!reason);
-                note.setHtml(reason
-                    ? '<div style="color:var(--anas-danger,#c23b2c);font-size:12px;">' + enc(reason) + '</div>'
-                    : '');
-            }
-        } catch (e) {
-            // Cosmetic only — submitSchedule re-checks the gate before it sends.
-        }
-    }
-
-    function blockSave(win, key, reason) {
-        win._saveBlocks = win._saveBlocks || {};
-        win._saveBlocks[key] = reason;
-        refreshSaveGate(win);
-    }
-
-    // The note the gate writes into, placed at the top of the dialog's form.
-    function guardNoteCfg() {
-        return {
-            xtype: 'component',
-            itemId: 'guardNote',
-            cls: 'anas-edit-guard',
-            hidden: true,
-            margin: '0 0 8 0',
-            html: ''
-        };
-    }
 
     function valOf(win, sel) {
         try {
@@ -791,7 +741,7 @@
                     scrollable: true,
                     defaults: { anchor: '100%', labelWidth: 150 },
                     items: [
-                        guardNoteCfg(),
+                        ANAS.editGuard.noteCfg(),
                         {
                             xtype: 'textfield',
                             itemId: 'name',
@@ -1041,19 +991,19 @@
         // Inventory that came back without the schedule's own target blocks Save
         // by name (#40) — the stored target stays on screen either way.
         if (kindMissing) {
-            blockSave(win, 'targetKind', t('This schedule targets')
+            ANAS.editGuard.block(win, 'targetKind', t('This schedule targets')
                 + ' ' + (kindMissing === 'ahr' ? t('an AHR pool') : t('a ZFS dataset'))
                 + ', ' + t('but no such filesystem was listed just now (the inventory may '
                     + 'have failed to load). Saving is blocked so the schedule cannot be '
                     + 'moved to a different filesystem — reload the view, or cancel.'));
         }
         if (zfsMissing) {
-            blockSave(win, 'zfsPool', t('ZFS pool') + ' "' + zfsMissing + '" '
+            ANAS.editGuard.block(win, 'zfsPool', t('ZFS pool') + ' "' + zfsMissing + '" '
                 + t('was not listed just now. Saving is blocked so this schedule cannot '
                     + 'be moved to another pool — reload the view, or cancel.'));
         }
         if (ahrMissing) {
-            blockSave(win, 'ahrPool', t('AHR pool') + ' "' + ahrMissing + '" '
+            ANAS.editGuard.block(win, 'ahrPool', t('AHR pool') + ' "' + ahrMissing + '" '
                 + t('was not listed just now. Saving is blocked so this schedule cannot '
                     + 'be moved to another pool — reload the view, or cancel.'));
         }
@@ -1080,7 +1030,7 @@
         }
         // The edit guard has the last word: a blocked dialog sends NOTHING, even
         // if the disabled button was somehow reached (#40).
-        var blocked = saveBlockReason(win);
+        var blocked = ANAS.editGuard.reason(win);
         if (blocked) {
             ANAS.alertMsg('Cannot save', blocked);
             return;

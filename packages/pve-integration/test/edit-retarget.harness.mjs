@@ -221,7 +221,25 @@ function loadUi() {
     removeEventListener() {},
   }
   const win = { document: doc, Ext }
-  win.ANAS = {
+  const sandbox = {
+    window: win,
+    document: doc,
+    Ext,
+    console,
+    Promise,
+    Date,
+    setTimeout,
+    clearTimeout,
+    setInterval: () => 1,
+    clearInterval: () => {},
+  }
+  // 10-api.js first, exactly as the real page loads it: the dialogs' save gate
+  // is the shared ANAS.editGuard it defines, and this harness wants to prove the
+  // REAL helper, not a re-stub of it. It also installs the fetch-based
+  // ANAS.api / runJob / pollJob / casWrite — the stub fields below are applied
+  // OVER those afterwards, so the recording doubles win, as before.
+  vm.runInNewContext(readFileSync(join(SRC, '10-api.js'), 'utf8'), sandbox, { filename: '10-api.js' })
+  Object.assign(win.ANAS, {
     views: {},
     t: s => s,
     enc: s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;'),
@@ -252,19 +270,7 @@ function loadUi() {
     casWrite(opts) {
       state.requests.push({ method: opts.method, path: opts.path, body: opts.body })
     },
-  }
-  const sandbox = {
-    window: win,
-    document: doc,
-    Ext,
-    console,
-    Promise,
-    Date,
-    setTimeout,
-    clearTimeout,
-    setInterval: () => 1,
-    clearInterval: () => {},
-  }
+  })
   vm.runInNewContext(readFileSync(join(SRC, '65-replication.js'), 'utf8'), sandbox, { filename: '65-replication.js' })
   vm.runInNewContext(readFileSync(join(SRC, '69-snapshots.js'), 'utf8'), sandbox, { filename: '69-snapshots.js' })
   return win.ANAS

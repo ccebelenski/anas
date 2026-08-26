@@ -567,67 +567,10 @@
     // "(unavailable)" and Save is BLOCKED with a named reason until the operator
     // decides — and the daemon refuses an unflagged retarget regardless.
     //
-    // NOTE: 69-snapshots.js carries these same edit-guard helpers for the
-    // schedule dialog (#40) — deliberately identical, since the rule is one
-    // rule. Their natural home is a shared ANAS.* helper in 10-api.js.
+    // The gate machinery itself is the shared ANAS.editGuard in 10-api.js —
+    // the snapshot schedule dialog (69-snapshots.js, #40) runs the same one.
 
     var UNAVAILABLE = t('(unavailable)');
-
-    function saveBlockReason(win) {
-        var blocks = win._saveBlocks || {};
-        var keys = Object.keys(blocks);
-        for (var i = 0; i < keys.length; i++) {
-            if (blocks[keys[i]]) {
-                return blocks[keys[i]];
-            }
-        }
-        return '';
-    }
-
-    // Disable Save and show WHY, in the dialog, in the operator's words.
-    function refreshSaveGate(win) {
-        var reason = saveBlockReason(win);
-        try {
-            var btn = win.down('#submit');
-            if (btn) {
-                btn.setDisabled(!!reason);
-            }
-            var note = win.down('#guardNote');
-            if (note) {
-                note.setHidden(!reason);
-                note.setHtml(reason
-                    ? '<div style="color:var(--anas-danger,#c23b2c);font-size:12px;">' + enc(reason) + '</div>'
-                    : '');
-            }
-        } catch (e) {
-            // Cosmetic only — submitTask re-checks the gate before it sends.
-        }
-    }
-
-    function blockSave(win, key, reason) {
-        win._saveBlocks = win._saveBlocks || {};
-        win._saveBlocks[key] = reason;
-        refreshSaveGate(win);
-    }
-
-    function unblockSave(win, key) {
-        if (win._saveBlocks) {
-            delete win._saveBlocks[key];
-        }
-        refreshSaveGate(win);
-    }
-
-    // The note the gate writes into, placed at the top of a dialog's form.
-    function guardNoteCfg() {
-        return {
-            xtype: 'component',
-            itemId: 'guardNote',
-            cls: 'anas-edit-guard',
-            hidden: true,
-            margin: '0 0 8 0',
-            html: '',
-        };
-    }
 
     // ======================================================================
     //  Stage-3 shared helpers — target locations + CAS registry writes
@@ -753,7 +696,7 @@
         }
         setEmpty(combo, t('(loading pools…)'));
         // Hold Save while the list is in flight — the combo is empty right now.
-        blockSave(win, 'targetPool', t('Loading target pools…'));
+        ANAS.editGuard.block(win, 'targetPool', t('Loading target pools…'));
         return loadLocationPools(node, loc).then(function (r) {
             if (win.destroyed || win.destroying) {
                 return;
@@ -784,16 +727,16 @@
                     combo.setValue(missing || preselect || r.names[0] || '');
                 }
                 if (missing && !r.freeText) {
-                    blockSave(win, 'targetPool', t('Target pool') + ' "' + missing + '" '
+                    ANAS.editGuard.block(win, 'targetPool', t('Target pool') + ' "' + missing + '" '
                         + t('is not in this location\'s pool list any more. Saving now would '
                             + 'replicate somewhere else — pick a target deliberately, or cancel.'));
                 } else {
-                    unblockSave(win, 'targetPool');
+                    ANAS.editGuard.unblock(win, 'targetPool');
                 }
             } catch (e) {
                 ANAS.warn('replication pool combo repopulate failed: ' + ANAS.errText(e));
                 // The combo is in an unknown state — keep Save shut, and say so.
-                blockSave(win, 'targetPool', t('The target pool list could not be built')
+                ANAS.editGuard.block(win, 'targetPool', t('The target pool list could not be built')
                     + ': ' + ANAS.errText(e));
             }
         });
@@ -813,7 +756,7 @@
         if (!combo) {
             return;
         }
-        blockSave(win, 'location', t('Loading target locations…'));
+        ANAS.editGuard.block(win, 'location', t('Loading target locations…'));
         var apply = function () {
             applyLocationToPoolCombo(win, node, selectedLocation(win));
             if (opts.onAfterApply) {
@@ -857,16 +800,16 @@
                     // (the change handler above only re-applies on user action).
                 }
                 if (lost) {
-                    blockSave(win, 'location', t('Target location') + ' "' + lost + '" '
+                    ANAS.editGuard.block(win, 'location', t('Target location') + ' "' + lost + '" '
                         + t('is not registered on this node any more. Saving now would '
                             + 'replicate somewhere else — re-register it, pick another '
                             + 'location deliberately, or cancel.'));
                 } else {
-                    unblockSave(win, 'location');
+                    ANAS.editGuard.unblock(win, 'location');
                 }
             } catch (e) {
                 ANAS.warn('replication location load failed: ' + ANAS.errText(e));
-                unblockSave(win, 'location');
+                ANAS.editGuard.unblock(win, 'location');
             }
         });
     }
@@ -1734,7 +1677,7 @@
                     border: false,
                     defaults: { anchor: '100%', labelWidth: 150 },
                     items: [
-                        guardNoteCfg(),
+                        ANAS.editGuard.noteCfg(),
                         {
                             xtype: 'textfield',
                             itemId: 'name',
@@ -1897,13 +1840,13 @@
         win.show();
         // A stored pool the inventory no longer lists blocks Save by name (#39).
         if (srcSeed.missing) {
-            blockSave(win, 'sourcePool', t('Source pool') + ' "' + srcSeed.missing + '" '
+            ANAS.editGuard.block(win, 'sourcePool', t('Source pool') + ' "' + srcSeed.missing + '" '
                 + t('is not in this node\'s pool list any more (exported, or the pool '
                     + 'list failed to load). Saving now would replicate a different '
                     + 'dataset — fix the pool, or cancel.'));
         }
         if (tgtSeed.missing) {
-            blockSave(win, 'targetPool', t('Target pool') + ' "' + tgtSeed.missing + '" '
+            ANAS.editGuard.block(win, 'targetPool', t('Target pool') + ' "' + tgtSeed.missing + '" '
                 + t('is not in this node\'s pool list any more. Saving now would '
                     + 'replicate somewhere else — pick a target deliberately, or cancel.'));
         }
@@ -1953,7 +1896,7 @@
         }
         // The edit guard has the last word: a blocked dialog sends NOTHING, even
         // if the disabled button was somehow reached (#39).
-        var blocked = saveBlockReason(win);
+        var blocked = ANAS.editGuard.reason(win);
         if (blocked) {
             ANAS.alertMsg('Cannot save', blocked);
             return;
