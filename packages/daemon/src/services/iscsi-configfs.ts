@@ -577,8 +577,16 @@ async function readBackstores(root: string, blockRoot: string): Promise<Configfs
   return out
 }
 
-/** Read the mapped LUN indexes of an ACL (its `lun_<n>` subdirectories). */
-async function readMappedLuns(aclDir: string): Promise<number[]> {
+/**
+ * Read the mapped LUN indexes of an ACL (its `lun_<n>` subdirectories).
+ *
+ * Exported because it is also the only honest answer to "is this LUN already
+ * mapped into this ACL?" at the moment of a grant: targetcli's
+ * `auto_add_mapped_luns` preference (GT-7, default true) maps a brand-new TPG
+ * LUN into every existing ACL by itself, so a set read BEFORE the mutation is
+ * stale by the time the grant runs.
+ */
+export async function readMappedLuns(aclDir: string): Promise<number[]> {
   const out: number[] = []
   for (const entry of await listDir(aclDir)) {
     const m = LUN_DIR_RE.exec(entry)

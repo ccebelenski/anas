@@ -228,6 +228,33 @@ describe('repairIscsiHoles — the exact replay argv', () => {
     }
   })
 
+  it('does not re-grant a mapped LUN targetcli already auto-added (live-proof wave 2)', async () => {
+    // GT-7: `auto_add_mapped_luns` is true by default, so the `/luns create`
+    // above has already put the LUN back into every ACL. A blind
+    // `acls/<iqn> create n n` then fails with `This MappedLUN already exists in
+    // configFS` and takes the whole repair down — live-proven on the stunt node,
+    // where Repair after a pool re-import failed exactly this way. The shared
+    // grant helper reads the ACL's live mapped set first.
+    const s = await holeState()
+    try {
+      const root = join(s.dir, 'target')
+      for (const initiator of ['iqn.2026-08.dev.anas.gtiscsi:allowed2', 'iqn.1993-08.org.debian:01:ae3d2ec18ad'])
+        await mkdir(join(root, 'iscsi', IQN, 'tpgt_1', 'acls', initiator, 'lun_0'), { recursive: true })
+      const mock = okExecutor()
+      const plan = planIscsiRepair(s.ctx, withBackingPresent(s.health), s.targets)
+      const result = await repairIscsiHoles({ executor: mock, configfsRoot: root }, plan)
+
+      const calls = targetcliCalls(mock)
+      assert.equal(calls.filter(c => c.includes('/acls/')).length, 0, 'no mapped-LUN create was issued')
+      assert.equal(calls.at(-1), 'saveconfig')
+      assert.equal(result.saved, true)
+      assert.deepEqual(result.stillMissing, [])
+    }
+    finally {
+      await rm(s.dir, { recursive: true, force: true })
+    }
+  })
+
   it('NEVER runs saveconfig while a hole is left (GT-22)', async () => {
     // Two holes, one device back. The repaired LUN goes in; the save does not
     // happen, because saving now would write the OTHER hole into

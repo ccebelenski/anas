@@ -548,6 +548,64 @@ describe('addIscsiLun — wwn at create, attributes before the map, then the gra
     assert.ok(!calls.includes(`/iscsi/${IQN}/tpg1/acls/iqn.1993-08.org.debian:01:already create 0 0`))
   })
 
+  it('a LUN targetcli already auto-mapped into an ACL is not granted twice (live-proof wave 2)', async () => {
+    // GT-7: targetcli's `auto_add_mapped_luns` preference is TRUE by default, so
+    // `/…/luns create` maps the brand-new LUN into every existing ACL by itself.
+    // The ACL snapshot addIscsiLun is handed was taken BEFORE that, so it says
+    // "not mapped" — and the explicit grant then dies with `This MappedLUN
+    // already exists in configFS`, failing a job whose work was complete and
+    // leaving the live tree unsaved. Live-proven on the stunt node: adding the
+    // first LUN to a target with two ACLs failed exactly this way.
+    const root = await mkdtemp(join(tmpdir(), 'anas-iscsi-configfs-'))
+    try {
+      await mkdir(join(root, 'iscsi', IQN, 'tpgt_1', 'acls', INITIATOR, 'lun_0'), { recursive: true })
+      const mock = okExecutor()
+      await addIscsiLun(
+        { executor: mock, configfsRoot: root },
+        target({
+          acls: [
+            // Stale: configfs already has lun_0 under this ACL.
+            { initiatorIqn: INITIATOR, chapUserid: null, chapCredentialsSet: false, mutualUserid: null, mutualCredentialsSet: false, mappedLuns: [] },
+          ],
+        }),
+        { name: 'vmdisk1', kind: 'zvol', backing: 'tank/vol1' },
+        { path: '/dev/zvol/tank/vol1', plugin: 'block' },
+        null,
+        newSerial(),
+      )
+      const calls = targetcliCalls(mock)
+      assert.ok(!calls.includes(`/iscsi/${IQN}/tpg1/acls/${INITIATOR} create 0 0`), 'no duplicate mapped-LUN create')
+      assert.equal(calls.at(-1), 'saveconfig', 'and the add still reaches saveconfig')
+    }
+    finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('an ACL configfs does NOT yet map still gets the explicit grant (live-proof wave 2)', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anas-iscsi-configfs-'))
+    try {
+      await mkdir(join(root, 'iscsi', IQN, 'tpgt_1', 'acls', INITIATOR), { recursive: true })
+      const mock = okExecutor()
+      await addIscsiLun(
+        { executor: mock, configfsRoot: root },
+        target({
+          acls: [
+            { initiatorIqn: INITIATOR, chapUserid: null, chapCredentialsSet: false, mutualUserid: null, mutualCredentialsSet: false, mappedLuns: [] },
+          ],
+        }),
+        { name: 'vmdisk1', kind: 'zvol', backing: 'tank/vol1' },
+        { path: '/dev/zvol/tank/vol1', plugin: 'block' },
+        null,
+        newSerial(),
+      )
+      assert.ok(targetcliCalls(mock).includes(`/iscsi/${IQN}/tpg1/acls/${INITIATOR} create 0 0`))
+    }
+    finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('takes the lowest free LUN index', () => {
     assert.equal(nextLunIndex(target()), 0)
     assert.equal(nextLunIndex(target({ luns: [{ index: 0 }, { index: 2 }] as never })), 1)

@@ -56,6 +56,7 @@ import { storageObjectsByName } from '../parsers/lio-saveconfig.js'
 import {
   attributeTokens,
   backstorePath,
+  grantLunsToAcl,
   ISCSI_DEFAULT_WRITE_BACK,
   replayAttributes,
   runTargetcli,
@@ -259,15 +260,13 @@ export async function repairIscsiHoles(
       `lun=${item.lunIndex}`,
     ])
 
-    for (const initiator of item.aclInitiators) {
-      opts.progress?.(`Granting LUN ${item.lunIndex} to ${initiator}`)
-      await runTargetcli(executor, [
-        `${tpgPath(item.targetIqn, item.tpgTag)}/acls/${initiator}`,
-        'create',
-        String(item.lunIndex),
-        String(item.lunIndex),
-      ])
-    }
+    // The ONE grant helper (single-source rule): it reads the ACL's live mapped
+    // set from configfs first, because targetcli's `auto_add_mapped_luns`
+    // preference (GT-7) has already re-mapped the LUN we just recreated into
+    // every ACL — a blind `create n n` here dies with `This MappedLUN already
+    // exists in configFS` and fails the whole repair.
+    for (const initiator of item.aclInitiators)
+      await grantLunsToAcl(opts, item.targetIqn, item.tpgTag, initiator, [item.lunIndex])
 
     repaired.push(outcome(item))
   }

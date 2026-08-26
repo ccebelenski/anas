@@ -52,7 +52,7 @@ import { hostname } from 'node:os'
 import { join } from 'node:path'
 import { anasIqn, IscsiIqn } from '@anas/shared'
 import { readAhrPools } from './ahr-topology.js'
-import { CONFIGFS_TARGET_ROOT, describeLunHolder } from './iscsi-configfs.js'
+import { CONFIGFS_TARGET_ROOT, describeLunHolder, readMappedLuns } from './iscsi-configfs.js'
 import { computeIscsiHealth } from './iscsi-health.js'
 import { classifyBacking } from './iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from './iscsi.js'
@@ -280,7 +280,26 @@ export function aclAuthPath(
   }
   if (!(ACL_AUTH_FILES as readonly string[]).includes(file))
     throw new Error(`Refusing to write configfs auth file '${file}'`)
-  return join(root, 'iscsi', targetIqn, `tpgt_${tag}`, 'acls', initiatorIqn, 'auth', file)
+  return join(aclDirPath(root, targetIqn, tag, initiatorIqn), 'auth', file)
+}
+
+/**
+ * The configfs directory of one initiator ACL.
+ *
+ * Same validation as `aclAuthPath` — both IQNs are checked before either one is
+ * pasted into a filesystem path.
+ */
+export function aclDirPath(
+  root: string,
+  targetIqn: string,
+  tag: number,
+  initiatorIqn: string,
+): string {
+  for (const iqn of [targetIqn, initiatorIqn]) {
+    if (!IscsiIqn.safeParse(iqn).success)
+      throw new Error(`Refusing to build a configfs path from '${iqn}': not an iSCSI name`)
+  }
+  return join(root, 'iscsi', targetIqn, `tpgt_${tag}`, 'acls', initiatorIqn)
 }
 
 /**
@@ -677,7 +696,7 @@ export async function updateIscsiTarget(
  * an initiator that sees `LUN 3` and an operator reading `LUN 3` in the UI must
  * be talking about the same disk.
  */
-async function grantLunsToAcl(
+export async function grantLunsToAcl(
   opts: IscsiMutateOptions,
   iqn: string,
   tag: number,
@@ -686,6 +705,15 @@ async function grantLunsToAcl(
   alreadyMapped: number[] = [],
 ): Promise<number> {
   const have = new Set(alreadyMapped)
+  // The caller's set came from a snapshot taken BEFORE this mutation, and
+  // targetcli's `auto_add_mapped_luns` preference (GT-7, default true) maps a
+  // freshly created TPG LUN into every existing ACL on its own — so the stale
+  // set says "not mapped" for a LUN that already is, and `acls/<iqn> create n n`
+  // then dies with `This MappedLUN already exists in configFS`, failing a job
+  // whose work is in fact complete. Read the live set at the point of use.
+  const root = opts.configfsRoot ?? CONFIGFS_TARGET_ROOT
+  for (const index of await readMappedLuns(aclDirPath(root, iqn, tag, initiatorIqn)))
+    have.add(index)
   let granted = 0
   for (const index of lunIndexes) {
     if (have.has(index))
