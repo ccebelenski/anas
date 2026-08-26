@@ -687,7 +687,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const luns: BackupLunSource[] = []
     for (const target of targets) {
       for (const lun of target.luns) {
-        if (lun.kind === 'foreign' || !lun.backingPath.startsWith('/'))
+        // `foreign` = positively not ANAS storage; `unresolved` (iscsi.5) = resolves onto
+        // no known storage NOW — either way ANAS cannot say what a backup would capture.
+        if (lun.kind === 'foreign' || lun.kind === 'unresolved' || !lun.backingPath.startsWith('/'))
           continue
         const classification = classifyBacking(lun.backingPath, ctx.inputs)
         if (classification.pveManaged || classification.pveGuestVolume)

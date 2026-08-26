@@ -145,8 +145,9 @@ describe('GET /v1/backup/lun-sources — the img archive picker (backup2.4)', ()
     await serve({ manifest: 'configfs-live.manifest', saveconfig: 'saveconfig-final.json' })
     const res = await lunSources()
     // LUN 1 is a fileio backstore on `/gtiscsi/images/lun2.raw`, which resolves
-    // onto no dataset and no AHR pool here — ANAS cannot say what backs it, so
-    // it cannot say what backing it up would capture.
+    // onto no dataset and no AHR pool here (`unresolved` since iscsi.5; `foreign`
+    // before) — ANAS cannot say what backs it, so it cannot say what backing it
+    // up would capture.
     assert.equal(res.data!.luns.some(l => l.path.endsWith('lun2.raw')), false, JSON.stringify(res.data!.luns))
   })
 
