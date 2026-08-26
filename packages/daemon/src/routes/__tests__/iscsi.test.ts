@@ -41,6 +41,7 @@ describe('GET /v1/iscsi/* — the read layer against the real captures', () => {
     block: process.env.ANAS_ISCSI_SYS_BLOCK,
     saveconfig: process.env.ANAS_ISCSI_SAVECONFIG,
     storage: process.env.ANAS_STORAGE_CFG,
+    initiator: process.env.ANAS_ISCSI_INITIATOR_NAME,
   }
 
   async function serve(opts: { manifest?: string, saveconfig?: string } = {}) {
@@ -57,6 +58,9 @@ describe('GET /v1/iscsi/* — the read layer against the real captures', () => {
       : join(dir, 'absent-saveconfig.json')
     process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
     process.env.ANAS_ISCSI_SYS_BLOCK = join(dir, 'block')
+    // Absent by default: a test host has no open-iscsi state, and the read
+    // must fail-open to null on its own.
+    process.env.ANAS_ISCSI_INITIATOR_NAME = join(dir, 'absent-initiatorname.iscsi')
     server = createServer({ mock: true, logger: false })
     await server.ready()
   }
@@ -77,6 +81,7 @@ describe('GET /v1/iscsi/* — the read layer against the real captures', () => {
       ['ANAS_ISCSI_SYS_BLOCK', savedEnv.block],
       ['ANAS_ISCSI_SAVECONFIG', savedEnv.saveconfig],
       ['ANAS_STORAGE_CFG', savedEnv.storage],
+      ['ANAS_ISCSI_INITIATOR_NAME', savedEnv.initiator],
     ] as const) {
       if (saved === undefined)
         delete process.env[key]
@@ -100,6 +105,20 @@ describe('GET /v1/iscsi/* — the read layer against the real captures', () => {
     assert.equal(t.ownershipReason, 'iqn-not-anas')
     // The summary is a grid row: no detail arrays ride along.
     assert.equal('luns' in t, false)
+    // The node's own initiator IQN fails open to null (no open-iscsi state in
+    // a test) — the field is present, the value is "none".
+    assert.equal(res.data!.nodeInitiatorIqn, null)
+  })
+
+  it('GET /v1/iscsi/targets carries the node\'s own initiator IQN from the real file shape', async () => {
+    await serve({ manifest: 'configfs-live.manifest', saveconfig: 'saveconfig-final.json' })
+    // The route resolved the seam's path at registration; the FILE is read at
+    // request time, so writing it now is enough.
+    await writeFile(join(dir, 'absent-initiatorname.iscsi'), '# This file was created by openscsd.\nInitiatorName=iqn.1993-08.org.debian:01:1dd0a338f783\n')
+    const res = await get<IscsiTargetList>(server!, '/v1/iscsi/targets')
+    assert.equal(res.statusCode, 200)
+    assert.equal(IscsiTargetListSchema.safeParse(res.data).success, true)
+    assert.equal(res.data!.nodeInitiatorIqn, 'iqn.1993-08.org.debian:01:1dd0a338f783')
   })
 
   it('GET /v1/iscsi/targets/:iqn returns the detail for a URL-encoded IQN', async () => {

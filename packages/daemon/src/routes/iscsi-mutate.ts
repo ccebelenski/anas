@@ -11,11 +11,13 @@ import {
   AddIscsiLunRequest,
   CreateIscsiTargetRequest,
   DeleteIscsiLunQuery,
+  emptyAclsSentence,
   IscsiIqn,
   IscsiTargetStateRequest,
   UpdateIscsiLunRequest,
   UpdateIscsiTargetRequest,
 } from '@anas/shared'
+import { readNodeInitiatorName } from '../parsers/iscsi-initiator.js'
 import { confirmGate } from '../safety/gate.js'
 import { ensureAhrTargetOrdering } from '../services/ahr-create.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
@@ -241,6 +243,21 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       }
     }
 
+    // A target with ZERO ACLs is invisible to every initiator: ANAS creates
+    // every target with demo_mode_discovery=0 and generate_node_acls=0, so
+    // discovery answers nothing for one nobody is listed on — the operator
+    // would get "No portals found" and nothing on the node to say why.
+    // Refuse with the sentence rather than create the mystery.
+    if (req.acls.length === 0) {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: emptyAclsSentence(await readNodeInitiatorName(paths.initiatorNamePath)),
+        },
+      }
+    }
+
     // A portal on an address no interface carries binds happily, shows [OK] and
     // never logs a word (GT-24), so the warning has to come from ANAS or from
     // nowhere. It is a warning, not a refusal: an address that is about to exist
@@ -329,7 +346,16 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       }
     }
 
-    const warnings = req.portals ? portalAddressWarnings(state.ctx.nodeAddresses, req.portals) : []
+    let warnings = req.portals ? portalAddressWarnings(state.ctx.nodeAddresses, req.portals) : []
+
+    // Removing the LAST initiator ACL is the operator's call — they may be
+    // mid-reconfigure — so the edit is NOT refused. But the same sentence a
+    // create would be refused with rides the job result as a warning: the
+    // target is now invisible to every initiator, and nothing else on the node
+    // will ever say so.
+    if (req.acls !== undefined && req.acls.length === 0 && target.acls.length > 0) {
+      warnings = [...warnings, emptyAclsSentence(await readNodeInitiatorName(paths.initiatorNamePath))]
+    }
 
     const job = jobQueue.submit(
       'iscsi.target.update',

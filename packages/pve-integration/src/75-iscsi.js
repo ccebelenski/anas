@@ -23,6 +23,14 @@
  *    session keeps running. The button says so.
  *  - **Removing an initiator ACL drops its session instantly** and destroys its
  *    CHAP credentials. That is a confirm-gated change, not a metadata edit.
+ *  - **A target with no initiator ACLs is invisible to EVERYONE.** ANAS closes
+ *    discovery (demo mode is never enabled), so a target nobody is listed on
+ *    does not appear in `iscsiadm -m discovery` or in PVE's storage scan — and
+ *    nothing on the node says why. A create with an empty list is refused with
+ *    that sentence (Save stays dead until an initiator is listed); "Add this
+ *    node" inserts this node's own IQN, the one an operator is most likely to
+ *    mean; an edit that removes the LAST ACL is allowed — mid-reconfigure — and
+ *    the same sentence rides the job result as a warning.
  *  - **An image-file LUN cannot be resized in place.** Its size is fixed at
  *    creation, so a grow deletes and recreates the backstore, replaying the SAME
  *    unit serial and the SAME attributes and re-mapping at the same index. The
@@ -60,7 +68,7 @@
  * DAEMON CONTRACT (docs/DESIGN.md "iSCSI — block storage")
  *
  *   GET  /v1/iscsi/targets  → { data: { installed, configfsPresent,
- *        saveconfigPresent, reason?, targets: [ { iqn, name, ownership,
+ *        saveconfigPresent, reason?, nodeInitiatorIqn?, targets: [ { iqn, name, ownership,
  *        ownershipReason, ownershipDetail, tpgTag, enabled, portals[], lunCount,
  *        aclCount, sessionCount, security{authentication, generateNodeAcls,
  *        demoModeDiscovery}, present, persisted, missingLunCount,
@@ -99,7 +107,11 @@
  * Test hooks: view 'anas-view anas-view-iscsi'; grid 'anas-grid-iscsi'; toolbar
  * 'anas-btn-iscsi-refresh' / '-create' / '-edit' / '-toggle' / '-delete' /
  * '-luns' / '-repair'; target dialog 'anas-win-iscsi-target' with submit
- * 'anas-btn-iscsi-target-submit'; LUNs window 'anas-win-iscsi-luns' with
+ * 'anas-btn-iscsi-target-submit' (itemId 'submit', gated by the shared
+ * ANAS.editGuard of 10-api.js whose note is '#guardNote'); its ACL editor is
+ * '#aclsContainer' with '#aclAdd', '#aclAddNode' (inserts this node's own IQN,
+ * disabled with a tooltip when the daemon reports none or predates the field),
+ * per-row '#aclIqn' / '#aclRemove', and the empty-list note '#aclEmptyNote'; LUNs window 'anas-win-iscsi-luns' with
  * 'anas-btn-lun-add' / 'anas-btn-lun-resize' / 'anas-btn-lun-restore' /
  * 'anas-btn-lun-delete'; Add LUN dialog 'anas-win-iscsi-lun' with
  * 'anas-btn-iscsi-lun-submit'; Resize dialog 'anas-win-iscsi-lun-resize' with
@@ -537,6 +549,13 @@
                 ANAS.warn('iscsi grid load failed: ' + ANAS.errText(e2));
             }
             applyEnvelope(view, env);
+            // This node's own initiator IQN for the target dialog's "Add this
+            // node" button. `undefined` (an older daemon that does not send the
+            // field) and `null` (open-iscsi not installed, file unreadable) are
+            // kept distinct: both leave the button dead, and the button's
+            // tooltip says which (version-skew ruling: absent field ⇒ today's
+            // dialog, no error).
+            grid.anasNodeInitiator = env.nodeInitiatorIqn === undefined ? undefined : (env.nodeInitiatorIqn || null);
             if (priorIqn) {
                 try {
                     var idx = grid.getStore().findExact('iqn', priorIqn);
@@ -733,7 +752,22 @@
                     cls: 'anas-fld-acl-iqn',
                     fieldLabel: t('Initiator IQN'),
                     emptyText: 'iqn.1993-08.org.debian:01:0123456789ab',
-                    value: acl.initiatorIqn || ''
+                    value: acl.initiatorIqn || '',
+                    listeners: {
+                        // The create save-gate counts rows with an IQN, so it
+                        // must re-evaluate as they gain and lose one.
+                        change: function () {
+                            try {
+                                var form = this.up('#form');
+                                var w = form && form.up ? form.up() : null;
+                                if (w) {
+                                    refreshAclsGate(w);
+                                }
+                            } catch (e) {
+                                // non-fatal
+                            }
+                        }
+                    }
                 },
                 {
                     xtype: 'textfield',
@@ -786,6 +820,11 @@
                             var cont = row && row.up('#aclsContainer');
                             if (cont && row) {
                                 cont.remove(row);
+                            }
+                            var form = row ? row.up('#form') : null;
+                            var w = form && form.up ? form.up() : null;
+                            if (w) {
+                                refreshAclsGate(w);
                             }
                         } catch (e) {
                             ANAS.warn('acl row remove failed: ' + ANAS.errText(e));
@@ -875,6 +914,13 @@
     function openTargetDialog(view, node, detail) {
         var isEdit = !!detail;
         var win;
+        // This node's own initiator IQN, cached on the grid by the last list
+        // read. `undefined` (an older daemon that does not send the field) and
+        // `null` (open-iscsi not installed, file unreadable) both leave the
+        // button dead — with a tooltip saying which.
+        var grid0 = gridOf(view);
+        var nodeIqnRaw = grid0 ? grid0.anasNodeInitiator : undefined;
+        var nodeIqn = nodeIqnRaw || null;
         var storedAcls = (detail && isArray(detail.acls)) ? detail.acls : [];
         var storedPortals = (detail && isArray(detail.portals)) ? detail.portals : [];
         var storedAuth = detail
@@ -916,6 +962,10 @@
                     scrollable: true,
                     defaults: { anchor: '100%', labelWidth: 180 },
                     items: [
+                        // The shared save gate's note (10-api.js): a create
+                        // with zero ACLs blocks Save here, in the operator's
+                        // words.
+                        ANAS.editGuard.noteCfg(),
                         // --- identity -----------------------------------------
                         (isEdit
                             ? {
@@ -1069,12 +1119,62 @@
                                     margin: '4 0 0 0',
                                     handler: function (btn) {
                                         try {
-                                            var cont = btn.up('#form').down('#aclsContainer');
+                                            var form = btn.up('#form');
+                                            var cont = form.down('#aclsContainer');
                                             cont.add(aclRow({}, cont.items.getCount()));
+                                            var w = form.up ? form.up() : null;
+                                            if (w) {
+                                                refreshAclsGate(w);
+                                            }
                                         } catch (e) {
                                             ANAS.warn('acl add failed: ' + ANAS.errText(e));
                                         }
                                     }
+                                },
+                                {
+                                    // This node is an ordinary initiator, and its
+                                    // own IQN is the one an operator is most
+                                    // likely to mean. Dead (not hidden — a greyed
+                                    // control that explains itself reads as a
+                                    // rule) when the daemon reports no value or
+                                    // predates the field; the tooltip says which.
+                                    xtype: 'button',
+                                    itemId: 'aclAddNode',
+                                    cls: 'anas-btn-acl-add-node',
+                                    text: t('Add this node'),
+                                    iconCls: 'fa fa-server',
+                                    margin: '4 0 0 0',
+                                    disabled: !nodeIqn,
+                                    tooltip: nodeIqn
+                                        ? ''
+                                        : (nodeIqnRaw === undefined
+                                            ? t('This daemon does not report this node\'s own initiator IQN (it predates the field) — use Add initiator and type it in')
+                                            : t('This node\'s own initiator IQN could not be read (/etc/iscsi/initiatorname.iscsi is missing or unreadable) — use Add initiator and type it in')),
+                                    handler: function (btn) {
+                                        try {
+                                            var form = btn.up('#form');
+                                            var cont = form.down('#aclsContainer');
+                                            cont.add(aclRow({ initiatorIqn: nodeIqn }, cont.items.getCount()));
+                                            var w = form.up ? form.up() : null;
+                                            if (w) {
+                                                refreshAclsGate(w);
+                                            }
+                                        } catch (e) {
+                                            ANAS.warn('acl add-node failed: ' + ANAS.errText(e));
+                                        }
+                                    }
+                                },
+                                {
+                                    // Shown whenever the list is empty (create OR
+                                    // an edit of a target that already has none):
+                                    // the same sentence the daemon says.
+                                    xtype: 'component',
+                                    itemId: 'aclEmptyNote',
+                                    cls: 'anas-iscsi-acl-empty-note',
+                                    hidden: aclItems.length > 0,
+                                    margin: '4 0 0 0',
+                                    style: 'color:var(--anas-warn,#b06a12);font-size:11px;',
+                                    html: ''
                                 },
                                 {
                                     xtype: 'component',
@@ -1098,6 +1198,10 @@
                     {
                         text: isEdit ? t('Save') : t('Create'),
                         cls: 'anas-btn-iscsi-target-submit',
+                        // itemId 'submit': the shared ANAS.editGuard (10-api.js)
+                        // mirrors its block state onto this button and the
+                        // #guardNote above it.
+                        itemId: 'submit',
                         handler: function () {
                             try {
                                 submitTarget(win, view, node, detail);
@@ -1124,6 +1228,12 @@
                 applyAddressStore(win, rows[k]);
             }
         });
+
+        // The "Add this node" value and the ACL editor's starting state (a
+        // create opens empty, so the gate and the note start in their empty
+        // state; an edit opens on whatever is stored).
+        win.anasNodeInitiator = nodeIqn;
+        refreshAclsGate(win);
 
         win.show();
         return win;
@@ -1330,6 +1440,73 @@
         return null;
     }
 
+    // The sentence the daemon says when a target has no initiator ACLs — the
+    // UI carries the same words in two places (the static note under the ACL
+    // editor and the shared save gate) because "guide, don't just warn":
+    // discovery is closed to anyone not listed, so an unlisted target is
+    // invisible to everyone, including this node itself.
+    function emptyAclsNote(nodeIqn) {
+        var s = t('A target needs at least one initiator ACL — discovery is closed to initiators not listed here (demo mode is off), ')
+            + t('so a target with no ACLs is invisible to everyone; add the initiator IQN of each host that should see it');
+        if (nodeIqn) {
+            s += t(' (this node\'s own is ') + enc(nodeIqn) + t(')');
+        }
+        return s;
+    }
+
+    // The static note under the ACL editor: the same sentence, shown whenever
+    // the list is empty — on a create AND on an edit of a target that already
+    // has no ACLs (a state worth saying out loud in its own right).
+    function updateAclsNote(win, n) {
+        try {
+            var note = win.down('#aclEmptyNote');
+            if (!note) {
+                return;
+            }
+            note.setHidden(n > 0);
+            note.setHtml(n > 0 ? '' : '<span style="color:var(--anas-warn,#b06a12);font-size:11px;">'
+                + enc(emptyAclsNote(win.anasNodeInitiator || null)) + '</span>');
+        } catch (e) {
+            // non-fatal — a note must never break the dialog
+        }
+    }
+
+    /**
+     * The ONE evaluator for the ACL editor's state: how many rows carry an
+     * IQN, the static note's visibility, and — on a CREATE only — the shared
+     * save gate (ANAS.editGuard in 10-api.js). The gate is create-only: an edit
+     * may legitimately end up with zero ACLs (the operator is mid-reconfigure)
+     * and the daemon carries the sentence as a warning on the job result
+     * instead of refusing.
+     */
+    function refreshAclsGate(win) {
+        if (!win || win.destroyed || !ANAS.editGuard) {
+            return;
+        }
+        var rows = rowsOf(win, 'aclsContainer');
+        var n = 0;
+        for (var i = 0; i < rows.length; i++) {
+            try {
+                var f = rows[i].down('#aclIqn');
+                if (f && ('' + (f.getValue() || '')).trim()) {
+                    n++;
+                }
+            } catch (e) {
+                // non-fatal
+            }
+        }
+        updateAclsNote(win, n);
+        if (win.anasEdit) {
+            ANAS.editGuard.unblock(win, 'acls');
+            return;
+        }
+        if (n === 0) {
+            ANAS.editGuard.block(win, 'acls', emptyAclsNote(win.anasNodeInitiator || null));
+        } else {
+            ANAS.editGuard.unblock(win, 'acls');
+        }
+    }
+
     function submitTarget(win, view, node, detail) {
         var isEdit = !!detail;
         var portals = readPortals(win);
@@ -1339,6 +1516,17 @@
         }
         var mode = authModeOf(win);
         var acls = readAcls(win);
+        // A create with no initiator listed is refused by the daemon with the
+        // discovery sentence; the dialog says it up front and keeps the button
+        // dead until an ACL exists. The handler re-checks because the button's
+        // disabled state is cosmetic, not contractual.
+        if (!isEdit) {
+            if (acls.length === 0) {
+                ANAS.editGuard.block(win, 'acls', emptyAclsNote(win.anasNodeInitiator || null));
+                return;
+            }
+            ANAS.editGuard.unblock(win, 'acls');
+        }
         var problem = validateAcls(acls);
         if (problem) {
             ANAS.alertMsg('Invalid input', problem);

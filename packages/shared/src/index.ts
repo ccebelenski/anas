@@ -261,6 +261,7 @@ export {
   anasTargetName,
   CreateIscsiTargetRequest,
   DeleteIscsiLunQuery,
+  emptyAclsSentence,
   ipFamily,
   isAnasIqn,
   ISCSI_BACKSTORE_PLUGINS,

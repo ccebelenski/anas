@@ -65,6 +65,13 @@ export interface IscsiPaths {
   /** PVE's storage.cfg; defaults to `/etc/pve/storage.cfg`. */
   pveStorageCfg?: string
   /**
+   * The node's own initiator identity file; defaults to
+   * `/etc/iscsi/initiatorname.iscsi`. A seam for the same reason the others
+   * are: a test host has no open-iscsi state to read, and the read must
+   * fail-open to `null` on a node where open-iscsi is not installed at all.
+   */
+  initiatorNamePath?: string
+  /**
    * Does a backing path resolve on this node right now? Defaults to a real
    * `stat` (ENOENT/ENOTDIR ⇒ `false`, anything else ⇒ `null` = not known).
    *

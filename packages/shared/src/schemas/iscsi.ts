@@ -610,6 +610,17 @@ export type IscsiAvailability = z.infer<typeof IscsiAvailability>
 /** `GET /v1/iscsi/targets`. */
 export const IscsiTargetList = IscsiAvailability.extend({
   targets: z.array(IscsiTargetSummary),
+  /**
+   * The node's OWN initiator IQN, from `/etc/iscsi/initiatorname.iscsi`.
+   *
+   * The "Add this node" door in the create/edit dialog fills an ACL row with
+   * it: the node is an ordinary initiator, and its own IQN is the one an
+   * operator is most likely to mean. `null` when the file is absent,
+   * unreadable or holds no legal name — open-iscsi may simply not be installed.
+   * Optional and ADDITIVE (version-skew ruling): an older daemon omits it and
+   * the UI hides the button and renders today's screen.
+   */
+  nodeInitiatorIqn: z.string().nullable().optional(),
 })
 export type IscsiTargetList = z.infer<typeof IscsiTargetList>
 
@@ -1089,6 +1100,24 @@ export function aclAuthRequirement(auth: IscsiAuthMode): string {
   return auth === 'mutual-chap'
     ? 'mutual CHAP needs a username and a secret in BOTH directions on every initiator ACL'
     : 'CHAP needs a username and a secret on every initiator ACL — under explicit ACLs LIO ignores TPG-level credentials entirely'
+}
+
+/**
+ * The sentence an EMPTY initiator ACL list earns — one definition, two doors.
+ *
+ * ANAS creates every target with `demo_mode_discovery=0` and
+ * `generate_node_acls=0`, so discovery answers nothing for a target nobody is
+ * listed on: `iscsiadm -m discovery` says "No portals found" and the PVE
+ * Add-Storage scan finds nothing, with nothing on the node to explain why. The
+ * create route REFUSES an empty list with this sentence (a guiding 400), and an
+ * edit that removes the LAST ACL carries it as a WARNING on the job result
+ * (the operator may be mid-reconfigure, so the door stays open). `guide, don't
+ * just warn` — the refusal says what to do next, and `nodeInitiatorIqn` is the
+ * most likely answer.
+ */
+export function emptyAclsSentence(nodeInitiatorIqn: string | null): string {
+  const tail = nodeInitiatorIqn ? ` (this node's own is ${nodeInitiatorIqn})` : ''
+  return `A target needs at least one initiator ACL — discovery is closed to initiators not listed here (demo mode is off), so a target with no ACLs is invisible to everyone; add the initiator IQN of each host that should see it${tail}`
 }
 
 // ---------------------------------------------------------------------------

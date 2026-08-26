@@ -1,4 +1,5 @@
-import type { IscsiClaimList } from '@anas/shared'
+import type { IscsiClaimList, Job } from '@anas/shared'
+import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -9,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 import { anasIqn } from '@anas/shared'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { createServer } from '../../server.js'
+import { TARGETCLI } from '../../services/iscsi-mutate.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/iscsi')
@@ -224,6 +226,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
     saveconfig: process.env.ANAS_ISCSI_SAVECONFIG,
     storage: process.env.ANAS_STORAGE_CFG,
     nodename: process.env.ANAS_NODENAME,
+    initiator: process.env.ANAS_ISCSI_INITIATOR_NAME,
   }
 
   async function serve(opts: { manifest?: string, saveconfigText?: string, saveconfigFixture?: string } = {}) {
@@ -248,8 +251,27 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
     }
     process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
     process.env.ANAS_ISCSI_SYS_BLOCK = join(dir, 'block')
+    // Absent by default: a test host has no open-iscsi state, and the read
+    // must fail-open to null on its own. The FILE is read at request time, so
+    // a test that wants a value writes this exact path before the call.
+    process.env.ANAS_ISCSI_INITIATOR_NAME = join(dir, 'absent-initiatorname.iscsi')
     server = createServer({ mock: true, logger: false })
     await server.ready()
+  }
+
+  function mockOf(): MockExecutor {
+    return (server as unknown as { executor: MockExecutor }).executor
+  }
+
+  async function waitForJob(id: string): Promise<Job> {
+    for (let i = 0; i < 200; i++) {
+      const res = await call('GET', `/v1/jobs/${id}`)
+      const { job } = res.body as unknown as { job: Job }
+      if (job.status === 'completed' || job.status === 'failed')
+        return job
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    throw new Error(`Job ${id} did not finish`)
   }
 
   /** The ANAS-owned tree every mutation test runs against. */
@@ -295,6 +317,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       ['ANAS_ISCSI_SAVECONFIG', savedEnv.saveconfig],
       ['ANAS_STORAGE_CFG', savedEnv.storage],
       ['ANAS_NODENAME', savedEnv.nodename],
+      ['ANAS_ISCSI_INITIATOR_NAME', savedEnv.initiator],
     ] as const) {
       if (saved === undefined)
         delete process.env[key]
@@ -398,6 +421,9 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       const res = await call('POST', '/v1/iscsi/targets', {
         name: 'other',
         portals: [{ address: '192.168.200.50' }],
+        // A target with no ACLs is refused — discovery is closed, so the
+        // list is never optional at create.
+        acls: [{ initiatorIqn: INITIATOR }],
       })
       assert.equal(res.statusCode, 202)
       assert.ok(res.body.job)
@@ -458,6 +484,37 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.match(res.body.error!.message, /12–16 bytes/)
     })
 
+    it('refuses an EMPTY initiator ACL list — a target nobody is listed on is invisible to everyone', async () => {
+      await serveAnas()
+      // The file is read at request time, so writing the seam's path now is
+      // enough: the refusal then names this node's own IQN.
+      await writeFile(join(dir, 'absent-initiatorname.iscsi'), 'InitiatorName=iqn.1993-08.org.debian:01:1dd0a338f783\n')
+      const res = await call('POST', '/v1/iscsi/targets', {
+        name: 'other',
+        portals: [{ address: '192.168.200.50' }],
+        acls: [],
+      })
+      assert.equal(res.statusCode, 400)
+      assert.equal(res.body.error!.code, 'VALIDATION_ERROR')
+      assert.match(res.body.error!.message, /needs at least one initiator ACL/)
+      assert.match(res.body.error!.message, /invisible to everyone/)
+      assert.match(res.body.error!.message, /iqn\.1993-08\.org\.debian:01:1dd0a338f783/)
+      assert.ok(!res.headers['x-anas-confirm-code'], 'a guiding 400, not a confirm gate')
+    })
+
+    it('the same refusal without the parenthetical when the node\'s own IQN is unknown', async () => {
+      await serveAnas()
+      // No file: open-iscsi may simply not be installed. The sentence still
+      // says what to do — it just cannot name a value it does not have.
+      const res = await call('POST', '/v1/iscsi/targets', {
+        name: 'other',
+        portals: [{ address: '192.168.200.50' }],
+      })
+      assert.equal(res.statusCode, 400)
+      assert.match(res.body.error!.message, /needs at least one initiator ACL/)
+      assert.ok(!/this node/.test(res.body.error!.message), res.body.error!.message)
+    })
+
     it('401s without identity headers — anasd never acts for nobody', async () => {
       await serveAnas()
       const res = await server!.inject({
@@ -500,6 +557,35 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       await serveAnas()
       const res = await call('PUT', targetUrl(), { acls: [] })
       assert.equal(res.statusCode, 202)
+    })
+
+    it('removing the LAST ACL is accepted — the discovery sentence rides the job result as a warning', async () => {
+      await serveAnas()
+      // The generic targetcli success lets the sequence (acls delete +
+      // saveconfig) complete so the job RESULT — not the 202 — can be read.
+      const mock = mockOf()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const res = await call('PUT', targetUrl(), { acls: [] })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as { warnings?: string[] }
+      assert.ok(
+        result.warnings?.some(w => /needs at least one initiator ACL/.test(w) && /invisible to everyone/.test(w)),
+        JSON.stringify(result.warnings),
+      )
+    })
+
+    it('an edit that KEEPS its ACLs adds no such warning', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const res = await call('PUT', targetUrl(), { acls: [{ initiatorIqn: INITIATOR }] })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as { warnings?: string[] }
+      assert.ok(!result.warnings?.some(w => /needs at least one initiator ACL/.test(w)), JSON.stringify(result.warnings))
     })
 
     it('400s turning CHAP on when a stored ACL has no credentials', async () => {

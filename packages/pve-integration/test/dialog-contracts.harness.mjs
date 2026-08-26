@@ -414,6 +414,41 @@ function makeAnas(routes) {
     warn(m) { warnings.push(m) },
     errText: e => String((e && e.message) || e),
     toast() {},
+    // The real save gate from 10-api.js — the iSCSI target dialog blocks Save
+    // on it (a create with zero ACLs), so the stub mirrors its state machine:
+    // state on the window, reason() the first live block, refresh() mirrored
+    // onto the #submit button and the #guardNote component.
+    editGuard: {
+      reason(win) {
+        const blocks = win._saveBlocks || {}
+        for (const k of Object.keys(blocks)) { if (blocks[k]) { return blocks[k] } }
+        return ''
+      },
+      refresh(win) {
+        const reason = this.reason(win)
+        const btn = win.down('#submit')
+        if (btn) { btn.setDisabled(!!reason) }
+        const note = win.down('#guardNote')
+        if (note) {
+          note.setHidden(!reason)
+          note.setHtml(reason
+            ? `<div style="color:var(--anas-danger,#c23b2c);font-size:12px;">${reason}</div>`
+            : '')
+        }
+      },
+      block(win, key, reason) {
+        win._saveBlocks = win._saveBlocks || {}
+        win._saveBlocks[key] = reason
+        this.refresh(win)
+      },
+      unblock(win, key) {
+        if (win._saveBlocks) { delete win._saveBlocks[key] }
+        this.refresh(win)
+      },
+      noteCfg() {
+        return { xtype: 'component', itemId: 'guardNote', cls: 'anas-edit-guard', hidden: true, margin: '0 0 8 0', html: '' }
+      },
+    },
     alertMsg(title, msg) { warnings.push(`alert: ${title}: ${msg}`) },
     errorPanel: msg => ({ xtype: 'component', html: msg }),
     // The real 00-core.js helper (this stub stands in for it) — every tbar is
@@ -1422,12 +1457,16 @@ async function datasetsChecks() {
 const ISCSI_IQN = 'iqn.2026-08.nas.anas:vmstore'
 const ISCSI_FOREIGN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
 const ISCSI_INITIATOR = 'iqn.1993-08.org.debian:01:ae3d2ec18ad'
+// The node's OWN initiator IQN, as `/etc/iscsi/initiatorname.iscsi` carries it —
+// the value "Add this node" inserts.
+const ISCSI_NODE_IQN = 'iqn.1993-08.org.debian:01:1dd0a338f783'
 const ISCSI_SECRET = 'correcthorseba' // 14 bytes — inside the 12–16 range
 
 const ISCSI_TARGETS = {
   installed: true,
   configfsPresent: true,
   saveconfigPresent: true,
+  nodeInitiatorIqn: ISCSI_NODE_IQN,
   targets: [
     {
       iqn: ISCSI_IQN,
@@ -1713,16 +1752,48 @@ async function iscsiCreateChecks() {
   // The PVE-CHAP note is hidden until auth is not none, then it appears.
   ok('create: the PVE no-CHAP-field note starts hidden', dlg.down('#pveChapNote').hidden === true)
 
+  // --- zero ACLs: the create is GATED, and "Add this node" is the door out ---
+  //
+  // ANAS closes discovery (demo mode is never enabled), so a target nobody is
+  // listed on never appears in any scan. The dialog says that out loud, keeps
+  // Save dead until an initiator is listed, and offers the one initiator an
+  // operator is most likely to mean: this node itself.
+
+  const nodeBtn = dlg.down('#aclAddNode')
+  ok('create: "Add this node" is live when the daemon reports the node\'s own IQN',
+    !!nodeBtn && nodeBtn.disabled === false, nodeBtn && `${nodeBtn.disabled}`)
+
   dlg.down('#name').setValue('vmstore2')
   dlg.down('#portalAddress').setValue('192.168.200.50')
   let submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-target-submit')
   submit.handler(submit)
   await settle()
 
+  eq('create: a target with zero ACLs is BLOCKED — no job', jobs.length, 0)
+  ok('create: Save is dead', submit.disabled === true)
+  ok('create: and the gate says WHY, in the dialog, in the operator\'s words',
+    /needs at least one initiator ACL/.test(dlg.down('#guardNote').html),
+    dlg.down('#guardNote').html)
+  ok('create: the static note under the ACL editor is shown while the list is empty',
+    dlg.down('#aclEmptyNote').hidden === false
+    && /invisible to everyone/.test(dlg.down('#aclEmptyNote').html),
+    dlg.down('#aclEmptyNote').html)
+
+  nodeBtn.handler(nodeBtn)
+  await settle()
+  const nodeRow = dlg.down('#aclsContainer').items.getAt(0)
+  eq('create: "Add this node" inserts the node\'s own IQN as an ACL row',
+    nodeRow.down('#aclIqn').getValue(), ISCSI_NODE_IQN)
+  ok('create: …and unblocks Save', submit.disabled === false)
+  ok('create: the empty-ACL note goes away once a row carries an IQN',
+    dlg.down('#aclEmptyNote').hidden === true)
+  submit.handler(submit)
+  await settle()
+
   eq('create: one job', jobs.length, 1)
   eq('create: it POSTs to the collection', [jobs[0].method, jobs[0].path], ['post', '/iscsi/targets'])
-  eq('create: the body carries the name, the portal and an explicit auth',
-    jobs[0].body, { name: 'vmstore2', portals: [{ address: '192.168.200.50', port: 3260 }], auth: 'none', acls: [] })
+  eq('create: the body carries the name, the portal and the node\'s own ACL',
+    jobs[0].body, { name: 'vmstore2', portals: [{ address: '192.168.200.50', port: 3260 }], auth: 'none', acls: [{ initiatorIqn: ISCSI_NODE_IQN }] })
 
   // --- with CHAP ---
   jobs.length = 0
@@ -1790,6 +1861,43 @@ async function iscsiCreateChecks() {
   eq('create: a target with no portal sends nothing', jobs.length, 0)
   ok('create: and says a portal is needed', warnings.some(w => /portal/.test(w)), warnings.join(' | '))
   warnings.length = 0
+}
+
+async function iscsiNodeIqnAbsentChecks() {
+  // Version skew: a daemon that predates the field omits it entirely. The
+  // ruling is "absent ⇒ today's screen, no error": the button is DEAD (and
+  // says so), nothing else is gated, and a hand-typed initiator still gets a
+  // target created.
+  ajax.responses = { '/network': PVE_NETWORK }
+  const old = { ...ISCSI_TARGETS }
+  delete old.nodeInitiatorIqn
+  const { grid } = await openIscsiView({ ...ISCSI_ROUTES, 'GET /iscsi/targets': { data: old } })
+
+  jobs.length = 0
+  grid.down('#iscsiCreate').handler(grid.down('#iscsiCreate'))
+  await settle()
+  const dlg = openWindow()
+  ok('skew: the dialog opens — an absent field is not an error', !!dlg && !!dlg.down('#name'))
+  if (!dlg) { return }
+  const nodeBtn = dlg.down('#aclAddNode')
+  ok('skew: "Add this node" is DEAD when the daemon predates the field',
+    !!nodeBtn && nodeBtn.disabled === true, nodeBtn && `${nodeBtn.disabled}`)
+  ok('skew: and its tooltip says the daemon does not report it',
+    /predates the field/.test(nodeBtn.tooltip || ''), nodeBtn.tooltip)
+
+  dlg.down('#name').setValue('vmstore9')
+  dlg.down('#portalAddress').setValue('192.168.200.50')
+  dlg.down('#aclAdd').handler(dlg.down('#aclAdd'))
+  await settle()
+  dlg.down('#aclsContainer').items.getAt(0).down('#aclIqn').setValue(ISCSI_INITIATOR)
+  await settle()
+  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-target-submit')
+  ok('skew: a typed initiator unblocks Save', submit.disabled === false)
+  submit.handler(submit)
+  await settle()
+  eq('skew: and the create goes through', jobs.length, 1)
+  eq('skew: the body carries the typed initiator', jobs[0].body.acls, [{ initiatorIqn: ISCSI_INITIATOR }])
+  ok('skew: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 async function iscsiEditChecks() {
@@ -2673,6 +2781,11 @@ async function iscsiAddressFallbackChecks() {
   jobs.length = 0
   dlg.down('#name').setValue('vmstore9')
   picker.setValue('10.1.2.3')
+  // A zero-ACL create is now gated; list this node itself so the check can get
+  // on with testing the address, not the gate.
+  const nodeBtn = dlg.down('#aclAddNode')
+  nodeBtn.handler(nodeBtn)
+  await settle()
   const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-target-submit')
   submit.handler(submit)
   await settle()
@@ -3949,6 +4062,7 @@ for (const check of [
   iscsiGridChecks,
   iscsiNotInstalledChecks,
   iscsiCreateChecks,
+  iscsiNodeIqnAbsentChecks,
   iscsiEditChecks,
   iscsiLunChecks,
   iscsiResizeAndDeleteChecks,

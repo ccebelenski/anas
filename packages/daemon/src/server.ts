@@ -477,6 +477,10 @@ export function createServer(opts?: ServerOptions) {
     blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
     saveconfigPath: process.env.ANAS_ISCSI_SAVECONFIG,
     pveStorageCfg: process.env.ANAS_STORAGE_CFG,
+    // The node's own initiator IQN (the "Add this node" door). A test host has
+    // no open-iscsi state to read; the default fail-opens to null on its own,
+    // and the env points the read at a temp file when a test wants a value.
+    initiatorNamePath: process.env.ANAS_ISCSI_INITIATOR_NAME,
     ...(backingPresent.length > 0
       ? { backingExists: async (path: string): Promise<boolean | null> => (backingPresent.includes(path) ? true : null) }
       : {}),

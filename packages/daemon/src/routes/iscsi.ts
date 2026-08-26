@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { IscsiIqn } from '@anas/shared'
+import { readNodeInitiatorName } from '../parsers/iscsi-initiator.js'
 import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
 import { buildIscsiTargets, collectIscsiSessions, iscsiAvailability, readIscsiContext, toTargetSummary } from '../services/iscsi.js'
 import { readPveFirewallAdvisory } from '../services/pve-firewall.js'
@@ -40,9 +41,16 @@ export async function iscsiRoutes(server: FastifyInstance, opts: IscsiRouteOptio
   server.get('/iscsi/targets', async () => {
     const ctx = await readIscsiContext(executor, paths)
     const targets = await buildIscsiTargets(ctx)
+    // The node's own initiator IQN rides the LIST envelope (not the detail):
+    // it is a property of the node, not of any target, and the create dialog —
+    // the one that needs it — reads the list. Deliberately NOT folded into
+    // readIscsiContext, which bails out early on a node with no targets: a
+    // fresh install with zero targets is exactly when the field is needed.
+    const nodeInitiatorIqn = await readNodeInitiatorName(paths.initiatorNamePath)
     const result: IscsiTargetList = {
       ...iscsiAvailability(ctx),
       targets: targets.map(toTargetSummary),
+      nodeInitiatorIqn,
     }
     return { data: result }
   })
