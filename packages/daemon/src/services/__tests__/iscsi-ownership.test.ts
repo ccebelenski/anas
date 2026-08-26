@@ -34,8 +34,8 @@ function inputs(overrides: Partial<OwnershipInputs> = {}): OwnershipInputs {
 }
 
 describe('the ANAS IQN naming convention (defined once, in @anas/shared)', () => {
-  it('generates a conforming IQN from a node domain', () => {
-    const iqn = anasIqn('vmstore', { domain: 'nas.example.com', date: new Date(Date.UTC(2026, 7, 25)) })
+  it('generates a conforming IQN from a fully-qualified node name', () => {
+    const iqn = anasIqn('vmstore', { nodeName: 'nas.example.com', date: new Date(Date.UTC(2026, 7, 25)) })
     assert.equal(iqn, 'iqn.2026-08.com.example.nas.anas:vmstore')
     assert.equal(isAnasIqn(iqn), true)
     assert.equal(anasTargetName(iqn), 'vmstore')
@@ -43,23 +43,38 @@ describe('the ANAS IQN naming convention (defined once, in @anas/shared)', () =>
     assert.equal(IscsiIqn.safeParse(iqn).success, true)
   })
 
-  it('falls back to the bare `anas` authority on a domainless node', () => {
-    assert.equal(anasIqnAuthority(undefined), 'anas')
-    assert.equal(anasIqnAuthority(''), 'anas')
-    const iqn = anasIqn('vmstore', { date: new Date(Date.UTC(2026, 0, 1)) })
-    assert.equal(iqn, 'iqn.2026-01.anas:vmstore')
+  it('a domainless node keeps its hostname as the leading label', () => {
+    // The short hostname is a label like any other, NOT a missing domain:
+    // dropping it would leave the single-label authority `anas`, which rtslib
+    // refuses to create. So a domainless node's IQN carries its own name.
+    assert.equal(anasIqnAuthority('nas'), 'nas.anas')
+    const iqn = anasIqn('vmstore', { nodeName: 'nas', date: new Date(Date.UTC(2026, 0, 1)) })
+    assert.equal(iqn, 'iqn.2026-01.nas.anas:vmstore')
     assert.equal(isAnasIqn(iqn), true)
+    assert.equal(IscsiIqn.safeParse(iqn).success, true)
   })
 
-  it('drops domain labels that are not legal IQN labels', () => {
+  it('a node name that yields no usable label still produces a legal authority', () => {
+    // Never expected on a real node, but the authority must never come out with
+    // a single label — that is the one shape rtslib will not create.
+    assert.equal(anasIqnAuthority(undefined), 'node.anas')
+    assert.equal(anasIqnAuthority(''), 'node.anas')
+    assert.equal(anasIqnAuthority('_'), 'node.anas')
+    const iqn = anasIqn('vmstore', { nodeName: '', date: new Date(Date.UTC(2026, 0, 1)) })
+    assert.equal(IscsiIqn.safeParse(iqn).success, true)
+  })
+
+  it('drops node-name labels that are not legal IQN labels', () => {
     assert.equal(anasIqnAuthority('Nas.Example.COM'), 'com.example.nas.anas')
     assert.equal(anasIqnAuthority('nas..example.com'), 'com.example.nas.anas')
     assert.equal(anasIqnAuthority('nas.exa_mple.com'), 'com.nas.anas')
   })
 
-  it('recognition is date- and domain-agnostic', () => {
+  it('recognition is date- and node-agnostic', () => {
     assert.equal(isAnasIqn('iqn.1999-12.org.example.host.anas:x'), true)
-    assert.equal(isAnasIqn('iqn.2030-06.anas:x'), true)
+    // A renamed node still recognises the targets it created: only the LAST
+    // authority label is asked about, never which node label precedes it.
+    assert.equal(isAnasIqn('iqn.2030-06.othernode.anas:x'), true)
   })
 
   it('rejects everything that is not an ANAS target', () => {
@@ -70,7 +85,10 @@ describe('the ANAS IQN naming convention (defined once, in @anas/shared)', () =>
     // targetcli's own generated form (it embeds the hostname — GT-10).
     assert.equal(isAnasIqn('iqn.2003-01.org.linux-iscsi.anas-pve.x8664:sn.0123456789ab'), false)
     // No unique string at all.
-    assert.equal(isAnasIqn('iqn.2026-08.anas'), false)
+    assert.equal(isAnasIqn('iqn.2026-08.host.anas'), false)
+    // A single-label authority: `anas` alone is not a name rtslib would create.
+    assert.equal(isAnasIqn('iqn.2030-06.anas:x'), false)
+    assert.equal(IscsiIqn.safeParse('iqn.2030-06.anas:x').success, false)
     // Not an IQN.
     assert.equal(isAnasIqn('eui.0123456789abcdef'), false)
     assert.equal(anasTargetName('iqn.2026-08.dev.anas.gtiscsi:target1'), null)
@@ -89,10 +107,15 @@ describe('the ANAS IQN naming convention (defined once, in @anas/shared)', () =>
     for (const bad of [
       '',
       'not-an-iqn',
-      'iqn.26-08.anas:x', // two-digit year
-      'iqn.2026-08.ANAS:x', // uppercase
-      'iqn.2026-08.anas:x\ny', // control character
-      `iqn.2026-08.anas:${'x'.repeat(300)}`, // over the 223-byte cap
+      'iqn.26-08.host.anas:x', // two-digit year
+      'iqn.2026-08.HOST.ANAS:x', // uppercase
+      'iqn.2026-08.host.anas:x\ny', // control character
+      `iqn.2026-08.host.anas:${'x'.repeat(300)}`, // over the 223-byte cap
+      // A single-label naming authority: rtslib's own wwn pattern requires at
+      // least two, so accepting it here would only turn a clean 400 into an
+      // opaque targetcli exit 1 half-way through a create.
+      'iqn.2026-08.anas:vmstore',
+      'iqn.2026-08.example:vmstore',
     ])
       assert.equal(IscsiIqn.safeParse(bad).success, false, JSON.stringify(bad))
   })
@@ -160,7 +183,7 @@ describe('classifyBacking — where a LUN\'s backing object actually lives', () 
 })
 
 describe('deriveOwnership — both halves are required, and the reason is shown', () => {
-  const anas = anasIqn('vmstore', { domain: 'nas.example.com', date: new Date(Date.UTC(2026, 7, 25)) })
+  const anas = anasIqn('vmstore', { nodeName: 'nas.example.com', date: new Date(Date.UTC(2026, 7, 25)) })
 
   it('anas: an ANAS IQN with every LUN on ANAS-managed storage', () => {
     const tag = deriveOwnership(anas, [

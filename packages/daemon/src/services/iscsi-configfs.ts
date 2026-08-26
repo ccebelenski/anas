@@ -60,6 +60,23 @@ const SYSFS_SECTOR_BYTES = 512
 /** The prefix `wwn/vpd_unit_serial` reads back with (GT-13). */
 export const UNIT_SERIAL_PREFIX = 'T10 VPD Unit Serial Number: '
 
+/**
+ * LIO's sentinel for a CHAP credential that is NOT set.
+ *
+ * The kernel's node-ACL auth store reads the literal string `NULL` as a clear —
+ * it drops the corresponding `NAF_*_IN_SET` flag — while a zero-length write
+ * would store an EMPTY credential and mark it as set. That is why removing a
+ * credential means writing `NULL` (`services/iscsi-mutate.ts`), and why a
+ * credential file reading back `NULL` here must be reported as unset rather than
+ * as a four-character secret.
+ */
+export const LIO_AUTH_NULL = 'NULL'
+
+/** Is this configfs auth value "not set" — empty, or LIO's `NULL` sentinel? */
+export function authUnset(value: string): boolean {
+  return value === '' || value === LIO_AUTH_NULL
+}
+
 /** A bracketed IPv6 np directory: `[fd00:6774:0:1::1]:3260` (GT-13). */
 const NP_IPV6_RE = /^\[(.+)\]:(\d+)$/
 
@@ -592,10 +609,10 @@ async function readAcl(aclsDir: string, initiatorIqn: string): Promise<ConfigfsA
 
   return {
     initiatorIqn,
-    chapUserid: chapUserid === '' ? null : chapUserid,
-    chapCredentialsSet: password !== '',
-    mutualUserid: mutualUserid === '' ? null : mutualUserid,
-    mutualCredentialsSet: passwordMutual !== '',
+    chapUserid: authUnset(chapUserid) ? null : chapUserid,
+    chapCredentialsSet: !authUnset(password),
+    mutualUserid: authUnset(mutualUserid) ? null : mutualUserid,
+    mutualCredentialsSet: !authUnset(passwordMutual),
     authenticateTarget,
     mappedLuns,
     session: infoRaw !== null ? parseAclInfo(infoRaw, initiatorIqn) : null,

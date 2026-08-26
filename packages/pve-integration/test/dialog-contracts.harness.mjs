@@ -32,6 +32,13 @@
  *      ones, that Resize Volume grows only — an untouched edit sends nothing, a
  *      shrink sends nothing — and the toolbar gating matrix for a volume row,
  *      including the tooltip reason on each disabled control.
+ *   5. iSCSI (story iscsi.4): a CHAP secret is WRITE-ONLY, so a blank box means
+ *      KEEP and never "clear" — a dialog that got that backwards would strip
+ *      every stored secret on the next unrelated save. Also: an untouched target
+ *      edit sends an EMPTY body, the Add LUN pickers never offer PVE territory,
+ *      a resize grows only, destroying a LUN's backing object is a separate
+ *      ticked choice that becomes a query flag, and a foreign target or a live
+ *      session greys the right controls with the reason attached.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -223,6 +230,7 @@ function makeComponent(cfg, parent) {
   }
 
   c.getStore = () => c.store
+  c.setStore = function (st) { c.store = st; return c }
   c.getSelection = () => c._selection.slice()
   // Tree panels delegate the root to their store (the ES5 sources call both).
   c.getRootNode = () => (c.store && c.store.getRootNode ? c.store.getRootNode() : null)
@@ -288,7 +296,23 @@ const Ext = {
     confirm(_title, _msg, fn) { if (fn) { fn('yes') } },
     alert() {},
   },
+  // PVE's own /nodes/<node>/network, which the portal picker reads (the same
+  // endpoint the SMB "how to connect" strings use). `ajax.responses` lets a
+  // check choose success-with-addresses or outright failure.
+  Ajax: {
+    request(cfg) {
+      const hit = Object.keys(ajax.responses).find(k => String(cfg.url).includes(k))
+      if (hit === undefined) { if (cfg.failure) { cfg.failure({}) } return }
+      const body = ajax.responses[hit]
+      if (body === null) { if (cfg.failure) { cfg.failure({}) } return }
+      if (cfg.success) { cfg.success({ responseText: JSON.stringify(body) }) }
+    },
+  },
+  decode: t => JSON.parse(t),
 }
+
+/** What Ext.Ajax hands back, keyed by a substring of the URL. */
+const ajax = { responses: {} }
 
 /** The most recently opened, still-open window. */
 function openWindow() {
@@ -347,12 +371,35 @@ function makeAnas(routes) {
         if (!(key in routes)) { return Promise.reject(new Error(`unexpected ${key}`)) }
         return Promise.resolve(typeof routes[key] === 'function' ? routes[key](body) : routes[key])
       },
+      put(_node, path, body) {
+        const key = `PUT ${path}`
+        if (!(key in routes)) { return Promise.reject(new Error(`unexpected ${key}`)) }
+        return Promise.resolve(typeof routes[key] === 'function' ? routes[key](body) : routes[key])
+      },
+      del(_node, path) {
+        const key = `DELETE ${path}`
+        if (!(key in routes)) { return Promise.reject(new Error(`unexpected ${key}`)) }
+        return Promise.resolve(routes[key])
+      },
     },
     runJob(cfg) {
       jobs.push({ method: cfg.method, path: cfg.path, body: cfg.body })
       if (cfg.onComplete) { cfg.onComplete({}) }
     },
-    confirmAndRun(cfg) { if (cfg && cfg.run) { cfg.run() } },
+    // A confirm-gated mutation. The real one only shows its window after the
+    // daemon answers 409 with a code; here the SHAPE is what matters, so the
+    // request is recorded along with the widget hooks a destructive dialog adds.
+    confirmAndRun(cfg) {
+      jobs.push({
+        method: cfg.method,
+        path: cfg.path,
+        body: cfg.body,
+        confirmWindow: !!cfg.confirmWindow,
+        extraItems: cfg.extraItems,
+        mapConfirm: cfg.mapConfirm,
+      })
+      if (cfg.onComplete) { cfg.onComplete({}) }
+    },
     casWrite(cfg) { jobs.push({ method: 'cas', path: cfg && cfg.path, body: cfg && cfg.body }) },
   }
 }
@@ -1021,6 +1068,727 @@ async function datasetsChecks() {
   ok('datasets: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+
+// ============================================================================
+//  5. iSCSI: targets, ACLs/CHAP and LUNs — what each dialog SENDS (story iscsi.4)
+// ============================================================================
+//
+// The three things this section exists to hold down:
+//
+//   * a CHAP secret is WRITE-ONLY, so the box always opens empty — which makes
+//     "blank" mean KEEP, not clear. A dialog that sent `chapSecret: null` for an
+//     untouched box would silently strip every stored secret on the next save.
+//   * an untouched target edit must send an EMPTY body, and a resize that
+//     changes nothing must send no request at all.
+//   * destroying the backing object is a SEPARATE, ticked choice that becomes a
+//     query flag — not something a Delete button does on its own.
+
+const ISCSI_IQN = 'iqn.2026-08.nas.anas:vmstore'
+const ISCSI_FOREIGN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
+const ISCSI_INITIATOR = 'iqn.1993-08.org.debian:01:ae3d2ec18ad'
+const ISCSI_SECRET = 'correcthorseba' // 14 bytes — inside the 12–16 range
+
+const ISCSI_TARGETS = {
+  installed: true,
+  configfsPresent: true,
+  saveconfigPresent: true,
+  targets: [
+    {
+      iqn: ISCSI_IQN,
+      name: 'vmstore',
+      ownership: 'anas',
+      ownershipReason: 'anas-managed',
+      ownershipDetail: 'IQN follows the ANAS naming convention and all 2 LUNs are backed by ANAS-managed storage',
+      tpgTag: 1,
+      enabled: true,
+      portals: [{ address: '192.168.200.50', port: 3260, family: 'inet', carriedByInterface: true }],
+      lunCount: 2,
+      aclCount: 1,
+      sessionCount: 0,
+      security: { authentication: false, generateNodeAcls: false, demoModeDiscovery: false },
+      present: true,
+      persisted: true,
+      missingLunCount: 0,
+      portalsWithoutInterfaceCount: 0,
+    },
+    {
+      iqn: ISCSI_FOREIGN,
+      name: null,
+      ownership: 'foreign',
+      ownershipReason: 'iqn-not-anas',
+      ownershipDetail: `IQN '${ISCSI_FOREIGN}' was not generated by ANAS (an ANAS target's naming authority ends in '.anas')`,
+      tpgTag: 1,
+      enabled: true,
+      portals: [{ address: '10.9.9.9', port: 3260, family: 'inet', carriedByInterface: false }],
+      lunCount: 1,
+      aclCount: 0,
+      sessionCount: 1,
+      security: { authentication: true, generateNodeAcls: false, demoModeDiscovery: true },
+      present: true,
+      persisted: true,
+      missingLunCount: 0,
+      portalsWithoutInterfaceCount: 1,
+    },
+  ],
+}
+
+const GiB_ = 1024 * 1024 * 1024
+
+/** The ANAS target in full: two LUNs, one ACL with a STORED CHAP secret. */
+function iscsiDetail(opts = {}) {
+  return {
+    ...ISCSI_TARGETS.targets[0],
+    security: { authentication: true, generateNodeAcls: false, demoModeDiscovery: false },
+    sessions: opts.session
+      ? [{ initiatorIqn: ISCSI_INITIATOR, initiatorAlias: 'anas-pve', targetIqn: ISCSI_IQN, tpgTag: 1, sessionId: 1, state: 'TARG_SESS_STATE_LOGGED_IN', connections: [{ cid: 0, address: '192.168.200.60', state: 'TARG_CONN_STATE_LOGGED_IN' }], mappedLuns: [0] }]
+      : [],
+    acls: [{
+      initiatorIqn: ISCSI_INITIATOR,
+      chapUserid: 'alice',
+      chapCredentialsSet: true,
+      mutualUserid: null,
+      mutualCredentialsSet: false,
+      authenticateTarget: false,
+      mappedLuns: [0, 1],
+    }],
+    luns: [
+      {
+        index: 0,
+        name: 'vmdisk1',
+        kind: 'zvol',
+        plugin: 'block',
+        backingPath: '/dev/zvol/tank/vol1',
+        size: 2 * GiB_,
+        serial: '9bc6e907-6015-4267-be4f-5a0617cb3d71',
+        attributes: { emulateTpu: true, emulateTpws: true, blockSize: 512, writeBack: false, maxUnmapLbaCount: 524288 },
+        connectedInitiators: opts.session ? [ISCSI_INITIATOR] : [],
+        present: true,
+        backingExists: true,
+        pool: 'tank',
+        dataset: 'tank/vol1',
+      },
+      {
+        index: 1,
+        name: 'vmdisk2',
+        kind: 'file',
+        plugin: 'fileio',
+        backingPath: '/tank/images/vmdisk2.raw',
+        size: GiB_,
+        serial: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        attributes: { emulateTpu: true, emulateTpws: true, blockSize: 512, writeBack: false, maxUnmapLbaCount: 262144 },
+        connectedInitiators: [],
+        present: true,
+        backingExists: true,
+        pool: 'tank',
+        dataset: 'tank/images',
+      },
+    ],
+  }
+}
+
+/** The pools/datasets the Add LUN pickers read. */
+const ISCSI_POOL_ROUTES = {
+  'GET /pools': { data: [
+    { name: 'tank', size: 8 * GiB_, pveStorages: [] },
+    // PVE territory: never a candidate, and never even enumerated.
+    { name: 'pvepool', size: 8 * GiB_, pveStorages: [{ id: 'local-zfs', type: 'zfspool' }] },
+  ] },
+  'GET /pools/tank/datasets': { data: [
+    { name: 'tank', type: 'filesystem', mountpoint: '/tank' },
+    { name: 'tank/images', type: 'filesystem', mountpoint: '/tank/images' },
+    { name: 'tank/vol1', type: 'volume', volsize: 2 * GiB_ },
+    { name: 'tank/vol2', type: 'volume', volsize: 4 * GiB_ },
+    // A PVE guest disk that happens to sit on an ANAS pool: still never a
+    // candidate — the same three prefixes the daemon refuses.
+    { name: 'tank/vm-101-disk-0', type: 'volume', volsize: GiB_ },
+  ] },
+  'GET /ahr/pools': { data: [{ name: 'ahrpool', mountpoint: '/ahrpool' }] },
+}
+
+const ISCSI_ROUTES = {
+  'GET /iscsi/targets': { data: ISCSI_TARGETS },
+  [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: iscsiDetail() },
+  [`GET /iscsi/targets/${encodeURIComponent(ISCSI_FOREIGN)}`]: { data: { ...ISCSI_TARGETS.targets[1], luns: [], acls: [], sessions: [] } },
+  ...ISCSI_POOL_ROUTES,
+}
+
+/** The node's real addresses, as PVE's own /nodes/<node>/network reports them. */
+const PVE_NETWORK = {
+  data: [
+    { iface: 'lo', address: '127.0.0.1', active: 1 },
+    { iface: 'vmbr0', address: '192.168.200.50', active: 1 },
+    { iface: 'vmbr1', address: '10.0.0.5', active: 0 },
+  ],
+}
+
+/** Open the view and wait for its first load. */
+async function openIscsiView(routes) {
+  const ANAS = loadSource('75-iscsi.js', routes)
+  const view = makeComponent(ANAS.views.iscsi.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  return { ANAS, view, grid: view.down('#iscsiGrid') }
+}
+
+/** Row index of a target by IQN. */
+function iscsiRowOf(grid, iqn) {
+  return grid.getStore().findExact('iqn', iqn)
+}
+
+function toolbar(grid, ids) {
+  const out = {}
+  for (const id of ids) {
+    const btn = grid.down(`#${id}`)
+    out[id] = btn ? { disabled: !!btn.disabled, tip: btn.tooltip || '', text: btn.text } : null
+  }
+  return out
+}
+
+async function iscsiGridChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { view, grid } = await openIscsiView(ISCSI_ROUTES)
+
+  ok('iscsi: the grid loaded both targets', grid && grid.getStore().getCount() === 2)
+  ok('iscsi: the view registered under its own menu key', !!view.down('#iscsiGrid'))
+
+  const GATED = ['iscsiCreate', 'iscsiEdit', 'iscsiToggle', 'iscsiDelete', 'iscsiLuns']
+
+  // Nothing selected: only Create is live.
+  let state = toolbar(grid, GATED)
+  ok('gating(none): Create is enabled', state.iscsiCreate.disabled === false)
+  ok('gating(none): Edit is disabled', state.iscsiEdit.disabled === true)
+  ok('gating(none): LUNs… is disabled', state.iscsiLuns.disabled === true)
+
+  // An ANAS target: everything is live and the toggle reads Disable.
+  grid.selectRow(iscsiRowOf(grid, ISCSI_IQN))
+  state = toolbar(grid, GATED)
+  ok('gating(anas): Edit enabled', state.iscsiEdit.disabled === false)
+  ok('gating(anas): Delete enabled', state.iscsiDelete.disabled === false)
+  ok('gating(anas): LUNs… enabled', state.iscsiLuns.disabled === false)
+  ok('gating(anas): an enabled target offers Disable', state.iscsiToggle.text === 'Disable')
+  ok('gating(anas): no hands-off excuse on an ANAS row', state.iscsiEdit.tip === '', state.iscsiEdit.tip)
+
+  // A FOREIGN target: hands-off, and every disabled control explains itself.
+  grid.selectRow(iscsiRowOf(grid, ISCSI_FOREIGN))
+  state = toolbar(grid, GATED)
+  ok('gating(foreign): Edit DISABLED', state.iscsiEdit.disabled === true)
+  ok('gating(foreign): Enable/Disable DISABLED', state.iscsiToggle.disabled === true)
+  ok('gating(foreign): Delete DISABLED', state.iscsiDelete.disabled === true)
+  ok('gating(foreign): reading its LUNs is still allowed', state.iscsiLuns.disabled === false)
+  ok('gating(foreign): the tooltip carries the DERIVATION, not just a refusal',
+    /not generated by ANAS/.test(state.iscsiEdit.tip), state.iscsiEdit.tip)
+
+  // A double-click on a foreign row must not open the edit dialog either.
+  const before = created.windows.length
+  grid.fireEvent('itemdblclick', grid, grid.getStore().getAt(iscsiRowOf(grid, ISCSI_FOREIGN)))
+  await settle()
+  eq('gating(foreign): a double-click opens nothing', created.windows.length, before)
+
+  ok('iscsi: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiNotInstalledChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const reason = 'The LIO iSCSI target stack is not present on this node (no configfs target tree and no saved configuration) — install targetcli-fb to serve block storage'
+  const { view, grid } = await openIscsiView({
+    'GET /iscsi/targets': {
+      data: {
+        installed: false,
+        configfsPresent: false,
+        saveconfigPresent: false,
+        reason,
+        targets: [],
+      },
+    },
+  })
+
+  const banner = view.down('#iscsiEnvelope')
+  ok('not-installed: the panel renders the envelope\'s OWN reason', banner && banner.hidden === false
+    && String(banner.html).includes('install targetcli-fb'), banner && banner.html)
+  const state = toolbar(grid, ['iscsiCreate', 'iscsiEdit', 'iscsiToggle', 'iscsiDelete', 'iscsiLuns'])
+  ok('not-installed: even Create is disabled', state.iscsiCreate.disabled === true)
+  ok('not-installed: Create says what is missing', /targetcli-fb/.test(state.iscsiCreate.tip), state.iscsiCreate.tip)
+  ok('not-installed: the rest of the toolbar is disabled too',
+    state.iscsiEdit.disabled === true && state.iscsiLuns.disabled === true)
+  ok('not-installed: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiCreateChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { view, grid } = await openIscsiView(ISCSI_ROUTES)
+
+  jobs.length = 0
+  const btn = grid.down('#iscsiCreate')
+  btn.handler(btn)
+  await settle()
+  let dlg = openWindow()
+  ok('create: the dialog opened', !!dlg && !!dlg.down('#name'))
+  if (!dlg) { return }
+
+  // The portal picker is filled from PVE's OWN network API — the addresses this
+  // node actually carries, because LIO will bind one it does not and say nothing.
+  const picker = dlg.down('#portalAddress')
+  const addrs = picker.getStore().getRange().map(r => r.get('address'))
+  ok('create: the portal picker offers this node\'s ACTIVE addresses',
+    addrs.includes('192.168.200.50') && addrs.includes('127.0.0.1'), JSON.stringify(addrs))
+  ok('create: an inactive interface is not offered', !addrs.includes('10.0.0.5'), JSON.stringify(addrs))
+  ok('create: the picker stays editable — an address about to exist is legitimate',
+    picker.editable === true)
+
+  // The PVE-CHAP note is hidden until auth is not none, then it appears.
+  ok('create: the PVE no-CHAP-field note starts hidden', dlg.down('#pveChapNote').hidden === true)
+
+  dlg.down('#name').setValue('vmstore2')
+  dlg.down('#portalAddress').setValue('192.168.200.50')
+  let submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-target-submit')
+  submit.handler(submit)
+  await settle()
+
+  eq('create: one job', jobs.length, 1)
+  eq('create: it POSTs to the collection', [jobs[0].method, jobs[0].path], ['post', '/iscsi/targets'])
+  eq('create: the body carries the name, the portal and an explicit auth',
+    jobs[0].body, { name: 'vmstore2', portals: [{ address: '192.168.200.50', port: 3260 }], auth: 'none', acls: [] })
+
+  // --- with CHAP ---
+  jobs.length = 0
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#name').setValue('vmstore3')
+  dlg.down('#portalAddress').setValue('192.168.200.50')
+  dlg.down('#authGroup').setValue({ authMode: 'chap' })
+  await settle()
+  ok('create: choosing CHAP reveals the PVE no-CHAP-field note',
+    dlg.down('#pveChapNote').hidden === false)
+  ok('create: the note names the PVE plugin limitation exactly',
+    /iscsi: storage plugin has no CHAP field/.test(dlg.down('#pveChapNote').html),
+    dlg.down('#pveChapNote').html)
+  ok('create: the 12–16 byte rule is stated, since LIO does not enforce it',
+    /12–16 bytes/.test(dlg.down('#chapLengthNote').html), dlg.down('#chapLengthNote').html)
+
+  const addAcl = dlg.down('#aclAdd')
+  addAcl.handler(addAcl)
+  await settle()
+  let row = dlg.down('#aclsContainer').items.getAt(0)
+  row.down('#aclIqn').setValue(ISCSI_INITIATOR)
+  row.down('#aclUserid').setValue('alice')
+  row.down('#aclSecret').setValue(ISCSI_SECRET)
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-target-submit')
+  submit.handler(submit)
+  await settle()
+  eq('create(chap): the ACL carries the username and the secret',
+    jobs[0].body.acls, [{ initiatorIqn: ISCSI_INITIATOR, chapUserid: 'alice', chapSecret: ISCSI_SECRET }])
+  eq('create(chap): the auth mode travels', jobs[0].body.auth, 'chap')
+
+  // --- a too-short secret never reaches the daemon ---
+  jobs.length = 0
+  warnings.length = 0
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#name').setValue('vmstore4')
+  dlg.down('#portalAddress').setValue('192.168.200.50')
+  dlg.down('#authGroup').setValue({ authMode: 'chap' })
+  const addAcl2 = dlg.down('#aclAdd')
+  addAcl2.handler(addAcl2)
+  await settle()
+  row = dlg.down('#aclsContainer').items.getAt(0)
+  row.down('#aclIqn').setValue(ISCSI_INITIATOR)
+  row.down('#aclUserid').setValue('alice')
+  row.down('#aclSecret').setValue('short')
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-target-submit')
+  submit.handler(submit)
+  await settle()
+  eq('create: a too-short CHAP secret sends NOTHING', jobs.length, 0)
+  ok('create: and it says why', warnings.some(w => /12–16/.test(w)), warnings.join(' | '))
+  warnings.length = 0
+
+  // --- a portal-less target is refused client-side too ---
+  jobs.length = 0
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#name').setValue('vmstore5')
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-target-submit')
+  submit.handler(submit)
+  await settle()
+  eq('create: a target with no portal sends nothing', jobs.length, 0)
+  ok('create: and says a portal is needed', warnings.some(w => /portal/.test(w)), warnings.join(' | '))
+  warnings.length = 0
+}
+
+async function iscsiEditChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { view, grid } = await openIscsiView(ISCSI_ROUTES)
+  grid.selectRow(iscsiRowOf(grid, ISCSI_IQN))
+
+  const openEdit = async () => {
+    const btn = grid.down('#iscsiEdit')
+    btn.handler(btn)
+    await settle()
+    return openWindow()
+  }
+  const save = async (dlg) => {
+    jobs.length = 0
+    const b = dlg.buttonCmps.find(x => x.cls === 'anas-btn-iscsi-target-submit')
+    b.handler(b)
+    await settle()
+    return jobs.length ? jobs[0] : null
+  }
+
+  // The dialog opens on the DETAIL read, never on the grid row's summary.
+  let dlg = await openEdit()
+  ok('edit: the dialog opened on the stored entry', !!dlg && !!dlg.down('#iqn'))
+  eq('edit: the IQN is shown read-only — there is no rename in LIO',
+    dlg.down('#iqn').value.includes(ISCSI_IQN), true)
+  eq('edit: the stored auth mode pre-fills', dlg.down('#authGroup').getValue(), { authMode: 'chap' })
+  const aclRow = dlg.down('#aclsContainer').items.getAt(0)
+  eq('edit: the stored initiator pre-fills', aclRow.down('#aclIqn').getValue(), ISCSI_INITIATOR)
+  eq('edit: the stored CHAP username pre-fills', aclRow.down('#aclUserid').getValue(), 'alice')
+  eq('edit: the secret box is EMPTY — a secret is never returned', aclRow.down('#aclSecret').getValue(), '')
+  ok('edit: and the label says one is stored', /stored/.test(aclRow.down('#aclSecret').fieldLabel),
+    aclRow.down('#aclSecret').fieldLabel)
+  eq('edit: the stored portal pre-fills', dlg.down('#portalAddress').getValue(), '192.168.200.50')
+
+  // (i) An UNTOUCHED edit sends NOTHING.
+  let job = await save(dlg)
+  eq('edit: an untouched edit sends NOTHING', job, null)
+
+  // (ii) Changing only the auth mode sends only `auth`.
+  dlg = await openEdit()
+  dlg.down('#authGroup').setValue({ authMode: 'none' })
+  await settle()
+  job = await save(dlg)
+  eq('edit(auth): it is a PUT at the target', [job.method, job.path],
+    ['put', `/iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`])
+  eq('edit(auth): the body carries auth and nothing else', job.body, { auth: 'none' })
+
+  // (iii) A blank secret box KEEPS the stored secret — it does not clear it.
+  dlg = await openEdit()
+  dlg.down('#portalPort').setValue(3261)
+  await settle()
+  job = await save(dlg)
+  eq('edit(portal): the portal set travels complete', job.body.portals,
+    [{ address: '192.168.200.50', port: 3261 }])
+  ok('edit(portal): an untouched ACL sends no acls key at all',
+    !('acls' in job.body), JSON.stringify(job.body))
+
+  // (iv) A TYPED secret rotates it.
+  dlg = await openEdit()
+  dlg.down('#aclsContainer').items.getAt(0).down('#aclSecret').setValue('newsecret1234')
+  await settle()
+  job = await save(dlg)
+  eq('edit(rotate): the new secret travels', job.body.acls,
+    [{ initiatorIqn: ISCSI_INITIATOR, chapSecret: 'newsecret1234' }])
+
+  // (v) Clearing the CHAP USERNAME clears the credential pair.
+  dlg = await openEdit()
+  dlg.down('#aclsContainer').items.getAt(0).down('#aclUserid').setValue('')
+  await settle()
+  job = await save(dlg)
+  eq('edit(clear): a blanked username sends null, and takes the secret with it',
+    job.body.acls, [{ initiatorIqn: ISCSI_INITIATOR, chapUserid: null, chapSecret: null }])
+
+  // (vi) Removing an initiator sends the SHORTER complete list.
+  dlg = await openEdit()
+  const remove = dlg.down('#aclsContainer').items.getAt(0).down('#aclRemove')
+  remove.handler(remove)
+  await settle()
+  job = await save(dlg)
+  eq('edit(remove): the ACL list travels complete and shorter', job.body.acls, [])
+
+  ok('edit: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/** Open the LUNs window on the ANAS target. */
+async function openLuns(grid, routes) {
+  grid.selectRow(iscsiRowOf(grid, ISCSI_IQN))
+  const btn = grid.down('#iscsiLuns')
+  btn.handler(btn)
+  await settle()
+  return openWindow()
+}
+
+async function iscsiLunChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { view, grid } = await openIscsiView(ISCSI_ROUTES)
+  const lunsWin = await openLuns(grid, ISCSI_ROUTES)
+  ok('luns: the window opened', !!lunsWin && !!lunsWin.down('#lunsGrid'))
+  if (!lunsWin) { return }
+  const lunsGrid = lunsWin.down('#lunsGrid')
+  eq('luns: both LUNs loaded', lunsGrid.getStore().getCount(), 2)
+
+  const LUN_BTNS = ['lunAdd', 'lunResize', 'lunDelete']
+  let state = toolbar(lunsGrid, LUN_BTNS)
+  ok('luns: Add is enabled on an ANAS target', state.lunAdd.disabled === false)
+  ok('luns: Resize needs a selection', state.lunResize.disabled === true)
+
+  lunsGrid.selectRow(0)
+  state = toolbar(lunsGrid, LUN_BTNS)
+  ok('luns(selected): Resize enabled', state.lunResize.disabled === false)
+  ok('luns(selected): Delete enabled', state.lunDelete.disabled === false)
+
+  // --- Add LUN: the zvol branch --------------------------------------------
+  jobs.length = 0
+  let btn = lunsGrid.down('#lunAdd')
+  btn.handler(btn)
+  await settle()
+  let dlg = openWindow()
+  ok('addlun: the dialog opened', !!dlg && !!dlg.down('#lunName'))
+  if (!dlg) { return }
+  eq('addlun: it defaults to a zvol', dlg.down('#kindGroup').getValue(), { lunKind: 'zvol' })
+  ok('addlun: the image fields start hidden AND disabled', dlg.down('#size').hidden === true
+    && dlg.down('#size').disabled === true)
+  ok('addlun: the zvol picker is visible', dlg.down('#zvolPicker').hidden === false)
+
+  const zvols = dlg.down('#zvolPicker').getStore().getRange().map(r => r.get('name'))
+  ok('addlun: the picker offers ANAS-managed volumes', zvols.includes('tank/vol1') && zvols.includes('tank/vol2'),
+    JSON.stringify(zvols))
+  ok('addlun: a PVE guest disk is NEVER a candidate', !zvols.includes('tank/vm-101-disk-0'), JSON.stringify(zvols))
+  ok('addlun: a PVE-managed pool is not even enumerated',
+    !zvols.some(z => z.startsWith('pvepool')), JSON.stringify(zvols))
+  ok('addlun: filesystems are not offered as zvols', !zvols.includes('tank/images'), JSON.stringify(zvols))
+
+  const dirs = dlg.down('#filePicker').getStore().getRange().map(r => r.get('name'))
+  ok('addlun: the image-file picker offers datasets AND the AHR pool',
+    dirs.includes('tank/images') && dirs.includes('ahrpool'), JSON.stringify(dirs))
+  ok('addlun: it does not offer a zvol as a place to put a file',
+    !dirs.includes('tank/vol1'), JSON.stringify(dirs))
+
+  ok('addlun: the attribute summary states what ANAS sets',
+    /Thin reclaim on/.test(dlg.down('#lunAttrSummary').html)
+    && /Write-through/.test(dlg.down('#lunAttrSummary').html),
+    dlg.down('#lunAttrSummary').html)
+  ok('addlun: and that the serial survives a recreate',
+    /unit serial that survives every recreate/.test(dlg.down('#lunAttrSummary').html),
+    dlg.down('#lunAttrSummary').html)
+
+  dlg.down('#lunName').setValue('vmdisk3')
+  dlg.down('#zvolPicker').setValue('tank/vol2')
+  let submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-lun-submit')
+  submit.handler(submit)
+  await settle()
+  eq('addlun(zvol): one job', jobs.length, 1)
+  eq('addlun(zvol): it POSTs to the target\'s LUN collection', jobs[0].path,
+    `/iscsi/targets/${encodeURIComponent(ISCSI_IQN)}/luns`)
+  eq('addlun(zvol): the body names the volume and carries NO size and NO block size',
+    jobs[0].body, { name: 'vmdisk3', kind: 'zvol', backing: 'tank/vol2' })
+
+  // --- Add LUN: the file branch --------------------------------------------
+  jobs.length = 0
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#kindGroup').setValue({ lunKind: 'file' })
+  await settle()
+  ok('addlun(file): the image fields appear', dlg.down('#size').hidden === false
+    && dlg.down('#filePicker').hidden === false)
+  ok('addlun(file): the zvol picker goes away AND is disabled, so a stale value cannot be read back',
+    dlg.down('#zvolPicker').hidden === true && dlg.down('#zvolPicker').disabled === true)
+  ok('addlun(file): the honest reclaim caveat appears for an image file',
+    /rejected by LIO for this backend/.test(dlg.down('#lunAttrSummary').html),
+    dlg.down('#lunAttrSummary').html)
+  ok('addlun(file): and that its size is fixed at creation',
+    /fixed at creation/.test(dlg.down('#lunAttrSummary').html), dlg.down('#lunAttrSummary').html)
+
+  dlg.down('#lunName').setValue('vmdisk4')
+  dlg.down('#filePicker').setValue('tank/images')
+  dlg.down('#size').setValue(4)
+  dlg.down('#unit').setValue(GiB_)
+  dlg.down('#blockSize').setValue(4096)
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-lun-submit')
+  submit.handler(submit)
+  await settle()
+  eq('addlun(file): the body carries the host, the size in BYTES and the block size',
+    jobs[0].body, { name: 'vmdisk4', kind: 'file', backing: 'tank/images', size: 4 * GiB_, blockSize: 4096 })
+
+  // A blank block size sends NO key — LIO then applies its own 512.
+  jobs.length = 0
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#lunName').setValue('vmdisk5')
+  dlg.down('#zvolPicker').setValue('tank/vol2')
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-lun-submit')
+  submit.handler(submit)
+  await settle()
+  ok('addlun: a default block size sends no blockSize at all',
+    !('blockSize' in jobs[0].body), JSON.stringify(jobs[0].body))
+
+  ok('addlun: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiResizeAndDeleteChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { grid } = await openIscsiView(ISCSI_ROUTES)
+  const lunsWin = await openLuns(grid, ISCSI_ROUTES)
+  const lunsGrid = lunsWin.down('#lunsGrid')
+
+  // --- Resize the ZVOL LUN (index 0, 2 GiB) --------------------------------
+  lunsGrid.selectRow(0)
+  jobs.length = 0
+  let btn = lunsGrid.down('#lunResize')
+  btn.handler(btn)
+  await settle()
+  let dlg = openWindow()
+  ok('resize: the window opened', !!dlg && !!dlg.down('#size'))
+  eq('resize: it pre-fills the CURRENT size in the largest exact unit',
+    [dlg.down('#size').getValue(), dlg.down('#unit').getValue()], [2, GiB_])
+  ok('resize: the serial is shown — it is the identity the initiator keys on',
+    String(dlg.down('#currentSerial').value).includes('9bc6e907'), dlg.down('#currentSerial').value)
+  ok('resize(zvol): the note says a volume grows LIVE',
+    /grows live/.test(dlg.down('#resizeNote').html), dlg.down('#resizeNote').html)
+
+  let submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-lun-resize-submit')
+  submit.handler(submit)
+  await settle()
+  eq('resize: an untouched edit sends NOTHING', jobs.length, 0)
+  ok('resize: and closes', dlg.destroyed === true)
+
+  // A shrink is refused before it can reach the daemon.
+  jobs.length = 0
+  warnings.length = 0
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#size').setValue(1)
+  submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-lun-resize-submit')
+  submit.handler(submit)
+  await settle()
+  eq('resize: a shrink sends NOTHING', jobs.length, 0)
+  ok('resize: a shrink says why', warnings.some(w => /can only grow/.test(w)), warnings.join(' | '))
+  ok('resize: a shrink leaves the window open to fix', dlg.destroyed === false)
+  warnings.length = 0
+
+  // A grow is a PUT of the size alone.
+  dlg.down('#size').setValue(8)
+  submit.handler(submit)
+  await settle()
+  eq('resize: one job', jobs.length, 1)
+  eq('resize: it PUTs at the LUN index', [jobs[0].method, jobs[0].path],
+    ['put', `/iscsi/targets/${encodeURIComponent(ISCSI_IQN)}/luns/0`])
+  eq('resize: it sends the size and nothing else', jobs[0].body, { size: 8 * GiB_ })
+
+  // --- The FILE LUN says its resize is a recreate ---------------------------
+  lunsGrid.selectRow(1)
+  btn = lunsGrid.down('#lunResize')
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  ok('resize(file): the note says the backstore is RECREATED with the same identity',
+    /same unit serial/i.test(dlg.down('#resizeNote').html) && /same attributes/i.test(dlg.down('#resizeNote').html),
+    dlg.down('#resizeNote').html)
+  ok('resize(file): and that this is because the size is fixed at creation',
+    /fixed at creation/.test(dlg.down('#resizeNote').html), dlg.down('#resizeNote').html)
+  dlg.close()
+
+  // --- Delete a LUN ---------------------------------------------------------
+  lunsGrid.selectRow(0)
+  jobs.length = 0
+  const del = lunsGrid.down('#lunDelete')
+  del.handler(del)
+  await settle()
+  eq('deletelun: one request', jobs.length, 1)
+  eq('deletelun: it DELETEs the LUN with NO destroy flag by default',
+    [jobs[0].method, jobs[0].path],
+    ['del', `/iscsi/targets/${encodeURIComponent(ISCSI_IQN)}/luns/0`])
+  ok('deletelun: it is confirm-gated with a widget window', jobs[0].confirmWindow === true)
+
+  // The destructive half is a SEPARATE ticked choice that becomes a query flag.
+  const extra = makeComponent({ xtype: 'window', items: jobs[0].extraItems }, null)
+  const box = extra.down('#destroyBacking')
+  ok('deletelun: the destroy-backing checkbox exists and starts UNticked',
+    !!box && box.getValue() === false)
+  ok('deletelun: it names the object it would destroy',
+    /\/dev\/zvol\/tank\/vol1/.test(box.boxLabel), box.boxLabel)
+  ok('deletelun: and warns a zvol takes its snapshots with it',
+    /snapshots/.test(box.boxLabel), box.boxLabel)
+  eq('deletelun: unticked adds no query at all', jobs[0].mapConfirm(extra), {})
+  box.setValue(true)
+  eq('deletelun: ticked becomes ?destroyBacking=true',
+    jobs[0].mapConfirm(extra), { pathSuffix: '?destroyBacking=true' })
+
+  ok('resize/delete: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiSessionGatingChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  // The same target, but with an initiator logged in on LUN 0.
+  const routes = {
+    ...ISCSI_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: iscsiDetail({ session: true }) },
+  }
+  const { grid } = await openIscsiView(routes)
+  const lunsWin = await openLuns(grid, routes)
+  const lunsGrid = lunsWin.down('#lunsGrid')
+
+  lunsGrid.selectRow(0) // the LUN with a live session
+  let state = toolbar(lunsGrid, ['lunAdd', 'lunResize', 'lunDelete'])
+  ok('session: Resize is DISABLED under a live session', state.lunResize.disabled === true)
+  ok('session: Delete is DISABLED under a live session', state.lunDelete.disabled === true)
+  ok('session: the reason says LIO would not have refused',
+    /stale device/.test(state.lunResize.tip), state.lunResize.tip)
+  ok('session: Add LUN is still allowed', state.lunAdd.disabled === false)
+
+  lunsGrid.selectRow(1) // the LUN with nobody logged in
+  state = toolbar(lunsGrid, ['lunResize', 'lunDelete'])
+  ok('session: a LUN with no session is still resizable', state.lunResize.disabled === false)
+  ok('session: …and deletable', state.lunDelete.disabled === false)
+
+  // The live session is SHOWN, with its address — and never the misleading
+  // `(NOT AUTHENTICATED)` label targetcli prints for one-way CHAP.
+  const panel = lunsWin.down('#lunSessions')
+  ok('session: the detail lists the logged-in initiator',
+    String(panel.html).includes(ISCSI_INITIATOR), panel.html)
+  ok('session: with the address it connected from',
+    String(panel.html).includes('192.168.200.60'), panel.html)
+  ok('session: and never the misleading NOT AUTHENTICATED label',
+    !/NOT AUTHENTICATED/.test(String(panel.html)), panel.html)
+
+  ok('session: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiForeignLunChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { grid } = await openIscsiView(ISCSI_ROUTES)
+  grid.selectRow(iscsiRowOf(grid, ISCSI_FOREIGN))
+  const btn = grid.down('#iscsiLuns')
+  btn.handler(btn)
+  await settle()
+  const win = openWindow()
+  const lunsGrid = win.down('#lunsGrid')
+  const state = toolbar(lunsGrid, ['lunAdd', 'lunResize', 'lunDelete'])
+  ok('foreign luns: Add LUN is DISABLED on a foreign target', state.lunAdd.disabled === true)
+  ok('foreign luns: Resize is DISABLED', state.lunResize.disabled === true)
+  ok('foreign luns: Delete is DISABLED', state.lunDelete.disabled === true)
+  ok('foreign luns: the reason is hands-off, not a generic refusal',
+    /not managed by ANAS/.test(state.lunAdd.tip), state.lunAdd.tip)
+  ok('foreign luns: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiAddressFallbackChecks() {
+  // PVE's network API is unreadable: the picker must degrade to a free-text
+  // field rather than leaving the operator with no way to enter an address.
+  ajax.responses = {}
+  const { grid } = await openIscsiView(ISCSI_ROUTES)
+  const btn = grid.down('#iscsiCreate')
+  btn.handler(btn)
+  await settle()
+  const dlg = openWindow()
+  const picker = dlg.down('#portalAddress')
+  ok('addresses: a failed network read still leaves an editable field',
+    !!picker && picker.editable === true)
+  jobs.length = 0
+  dlg.down('#name').setValue('vmstore9')
+  picker.setValue('10.1.2.3')
+  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-target-submit')
+  submit.handler(submit)
+  await settle()
+  eq('addresses: a hand-typed address still submits',
+    jobs[0].body.portals, [{ address: '10.1.2.3', port: 3260 }])
+  ok('addresses: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 // ============================================================================
 
 await backupChecks()
@@ -1032,6 +1800,23 @@ warnings.length = 0
 await poolImportChecks()
 warnings.length = 0
 await datasetsChecks()
+for (const check of [
+  iscsiGridChecks,
+  iscsiNotInstalledChecks,
+  iscsiCreateChecks,
+  iscsiEditChecks,
+  iscsiLunChecks,
+  iscsiResizeAndDeleteChecks,
+  iscsiSessionGatingChecks,
+  iscsiForeignLunChecks,
+  iscsiAddressFallbackChecks,
+]) {
+  warnings.length = 0
+  // `created.windows` is module-global; a dialog a previous section left open
+  // would otherwise be what `openWindow()` hands back here.
+  created.windows.length = 0
+  await check()
+}
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

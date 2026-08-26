@@ -26,6 +26,7 @@ import { datasetRoutes } from './routes/datasets.js'
 import { diskRoutes } from './routes/disks.js'
 import { fsRoutes } from './routes/fs.js'
 import { healthRoutes } from './routes/health.js'
+import { iscsiMutationRoutes } from './routes/iscsi-mutate.js'
 import { iscsiRoutes } from './routes/iscsi.js'
 import { jobRoutes } from './routes/jobs.js'
 import { mountsRoutes } from './routes/mounts.js'
@@ -498,14 +499,17 @@ export function createServer(opts?: ServerOptions) {
   // joined against live configfs. Read-only; every mutation is iscsi.4's. The
   // paths default inside the service to the real host locations and are
   // overridable so tests (and a dev box with no LIO) never read the kernel.
-  server.register(iscsiRoutes, {
-    prefix: '/v1',
-    executor,
+  const iscsiPaths = {
     configfsRoot: process.env.ANAS_ISCSI_CONFIGFS,
     blockRoot: process.env.ANAS_ISCSI_SYS_BLOCK,
     saveconfigPath: process.env.ANAS_ISCSI_SAVECONFIG,
     pveStorageCfg: process.env.ANAS_STORAGE_CFG,
-  })
+  }
+  server.register(iscsiRoutes, { prefix: '/v1', executor, ...iscsiPaths })
+  // iSCSI mutations (story iscsi.4) — targets, portals, ACL/CHAP and LUNs. Every
+  // one is a job, every sequence runs under the one daemon-wide LIO mutex, and
+  // each ends in `targetcli saveconfig` — never over a degraded restore (GT-22).
+  server.register(iscsiMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, ...iscsiPaths })
   const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache })
   // AHR hybrid RAID (Epic 11 + AHR). The per-pool AhrExpansionIntent store
