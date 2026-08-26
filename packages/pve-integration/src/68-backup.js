@@ -132,8 +132,9 @@
  * 'anas-fld-backup-keepyearly', preview 'anas-btn-backup-retention-preview'
  * rendering into 'anas-backup-retention-preview');
  * notification mode combo 'anas-fld-backup-notify';
- * directory picker 'anas-win-fs-picker' (grid 'anas-grid-fs-picker', path field
- * 'anas-fld-fs-path', select 'anas-btn-fs-select'); repos manager
+ * directory picker: the SHARED widget from 12-picker.js —
+ * 'anas-win-path-picker' (tree 'anas-tree-path-picker', path field
+ * 'anas-fld-picker-path', select 'anas-btn-picker-select'); repos manager
  * 'anas-win-backup-repos' (grid 'anas-grid-backup-repos'); repo edit
  * 'anas-win-backup-repo-edit' (test area 'anas-backup-repo-test', save
  * 'anas-btn-backup-repo-save').
@@ -975,227 +976,32 @@
     }
 
     // ======================================================================
-    //  Directory picker — 'anas-win-fs-picker' (driven by GET /v1/fs/browse)
+    //  Directory picker — the SHARED widget (12-picker.js)
     //
-    //  A small, plain listbox-style navigator (no tree widget): the current
-    //  path (editable + Go), an Up button, a list of child dirs (double-click
-    //  descends), and Select to return the current path. Fail-open: an
-    //  unreadable / non-directory path silently falls back to '/'. Free-form
-    //  typing in the wizard field is untouched — this only fills it.
+    //  The flat listbox this used to be is gone: story backup2.5 replaced it
+    //  with PVE's expanding-tree idiom (breadcrumb, type-ahead, keyboard nav),
+    //  and the same widget serves the restore flow against a PBS archive. This
+    //  view keeps ONE responsibility — say which field the chosen path lands in.
+    //
+    //  Free-form typing in the wizard field is untouched and remains
+    //  authoritative: the picker only fills the field in.
     // ======================================================================
 
-    // Join a directory and a child name into an absolute path.
-    function joinDir(base, name) {
-        var b = trim(base) || '/';
-        if (b.charAt(b.length - 1) === '/') {
-            return b + name;
-        }
-        return b + '/' + name;
-    }
-
-    // Parent of an absolute path ('/' is its own parent).
-    function parentDir(p) {
-        var s = trim(p);
-        if (!s || s === '/') {
-            return '/';
-        }
-        // Drop a trailing slash, then the last segment.
-        s = s.replace(/\/+$/, '');
-        var idx = s.lastIndexOf('/');
-        if (idx <= 0) {
-            return '/';
-        }
-        return s.substring(0, idx);
-    }
-
-    function setPickerNote(win, msg, warn) {
-        var c = win.down('#pickerNote');
-        if (!c) {
-            return;
-        }
-        var color = warn ? 'var(--anas-warn,#b06a12)' : 'var(--anas-muted,gray)';
-        try {
-            c.update(msg
-                ? '<span style="color:' + color + ';font-size:12px;">' + enc(msg) + '</span>'
-                : '');
-        } catch (e) {
-            // non-fatal
-        }
-    }
-
-    // Browse to a path: list its child dirs, or fall back to '/' when it is not
-    // a readable directory (fail-open, one retry against root).
-    function pickerBrowse(win, node, path) {
-        if (!win || win.destroyed || win.destroying) {
-            return;
-        }
-        var grid = win.down('#pickerGrid');
-        if (grid) {
-            try { grid.setLoading(true); } catch (e) { /* non-fatal */ }
-        }
-        ANAS.api.get(node, '/fs/browse?path=' + encodeURIComponent(path)).then(function (res) {
-            if (win.destroyed || win.destroying) {
-                return;
-            }
-            if (grid) {
-                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
-            }
-            var d = (res && res.data) || {};
-            if (d.type !== 'dir') {
-                // Not a directory (missing / file / other) — fall back to root
-                // once so the picker always lands somewhere navigable.
-                if (path !== '/') {
-                    pickerBrowse(win, node, '/');
-                    return;
-                }
-                setPickerNote(win, t('Not a directory.'), true);
-                return;
-            }
-            win._path = d.path || path;
-            var pf = win.down('#pickerPath');
-            if (pf) {
-                try { pf.setValue(win._path); } catch (e) { /* non-fatal */ }
-            }
-            var rows = [];
-            var dirs = isArray(d.dirs) ? d.dirs : [];
-            for (var i = 0; i < dirs.length; i++) {
-                rows.push({ name: '' + dirs[i] });
-            }
-            try {
-                grid.getStore().loadData(rows);
-            } catch (e2) {
-                // non-fatal
-            }
-            // Silent truncation is banned — say so plainly when the flag is set.
-            setPickerNote(win, d.truncated ? t('list truncated') : '', !!d.truncated);
-        }, function (err) {
-            if (win.destroyed || win.destroying) {
-                return;
-            }
-            if (grid) {
-                try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
-            }
-            // A browse error is fail-open: retry root once, else note it.
-            if (path !== '/') {
-                pickerBrowse(win, node, '/');
-                return;
-            }
-            setPickerNote(win, t('Could not read directory') + ': ' + ANAS.errText(err), true);
-        });
-    }
-
     function openDirPicker(node, startPath, onSelect) {
-        var start = trim(startPath) || '/';
-        var win;
-        try {
-            win = Ext.create('Ext.window.Window', {
-                cls: 'anas-win-fs-picker',
-                title: t('Choose a directory'),
-                modal: true,
-                width: 520,
-                height: 460,
-                resizable: true,
-                layout: { type: 'vbox', align: 'stretch' },
-                items: [
-                    {
-                        xtype: 'fieldcontainer',
-                        layout: 'hbox',
-                        padding: '8 8 4 8',
-                        items: [
-                            {
-                                xtype: 'textfield',
-                                itemId: 'pickerPath',
-                                cls: 'anas-fld-fs-path',
-                                flex: 1,
-                                selectOnFocus: true,
-                                value: start,
-                                listeners: {
-                                    specialkey: function (f, e) {
-                                        if (e.getKey() === e.ENTER) {
-                                            pickerBrowse(win, node, trim(f.getValue()) || '/');
-                                        }
-                                    },
-                                },
-                            },
-                            {
-                                xtype: 'button',
-                                text: t('Go'),
-                                cls: 'anas-btn-fs-go',
-                                margin: '0 0 0 6',
-                                handler: function () {
-                                    pickerBrowse(win, node, trim(valOf(win, '#pickerPath')) || '/');
-                                },
-                            },
-                            {
-                                xtype: 'button',
-                                text: t('Up'),
-                                cls: 'anas-btn-fs-up',
-                                iconCls: 'fa fa-level-up',
-                                margin: '0 0 0 6',
-                                handler: function () {
-                                    pickerBrowse(win, node, parentDir(win._path || valOf(win, '#pickerPath') || '/'));
-                                },
-                            },
-                        ],
-                    },
-                    {
-                        xtype: 'component',
-                        itemId: 'pickerNote',
-                        padding: '0 10',
-                        html: '',
-                    },
-                    {
-                        xtype: 'gridpanel',
-                        itemId: 'pickerGrid',
-                        cls: 'anas-grid-fs-picker',
-                        flex: 1,
-                        border: false,
-                        hideHeaders: true,
-                        store: Ext.create('Ext.data.Store', { fields: ['name'], data: [] }),
-                        emptyText: t('No subdirectories'),
-                        columns: [
-                            {
-                                text: t('Directory'),
-                                dataIndex: 'name',
-                                flex: 1,
-                                sortable: false,
-                                menuDisabled: true,
-                                renderer: function (v) {
-                                    return '<i class="fa fa-folder" style="margin-right:6px;'
-                                        + 'color:var(--anas-accent,#3468c0);"></i>' + enc(v);
-                                },
-                            },
-                        ],
-                        listeners: {
-                            itemdblclick: function (g, rec) {
-                                pickerBrowse(win, node, joinDir(win._path || '/', rec.get('name')));
-                            },
-                        },
-                    },
-                ],
-                buttons: [
-                    { text: t('Cancel'), handler: function () { win.close(); } },
-                    {
-                        text: t('Select'),
-                        cls: 'anas-btn-fs-select',
-                        handler: function () {
-                            var p = win._path || trim(valOf(win, '#pickerPath')) || '/';
-                            if (onSelect) {
-                                try { onSelect(p); } catch (e) { ANAS.warn('picker select failed: ' + ANAS.errText(e)); }
-                            }
-                            win.close();
-                        },
-                    },
-                ],
-            });
-        } catch (e) {
-            ANAS.warn('directory picker window failed: ' + ANAS.errText(e));
+        if (!ANAS.pathPicker) {
+            // Fail-open: an older bundle without the picker must not break the
+            // wizard — the path field still takes a typed path.
+            ANAS.warn('path picker unavailable; type the path instead');
             return;
         }
-        win.show();
-        // Start at the field's current value if it resolves to a dir, else '/'
-        // (pickerBrowse handles the fallback).
-        pickerBrowse(win, node, start);
+        ANAS.pathPicker({
+            node: node,
+            backend: 'live',
+            mode: 'dir',
+            value: trim(startPath) || '/',
+            title: t('Choose a directory'),
+            onSelect: onSelect,
+        });
     }
 
     // ---- LUN picker (backup2.4) --------------------------------------------

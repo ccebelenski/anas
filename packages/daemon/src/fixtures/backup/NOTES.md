@@ -82,6 +82,18 @@ btrfs-progs 6.14). Nothing on the node was created, modified or destroyed.
 | `findmnt-nested.json` | The node's whole `findmnt --json` tree, verbatim — the naming input for the walk above. Contains the zfs parent + child (`/gtbackup`, `/gtbackup/cdm`), PVE's `/etc/pve` fuse mount, an `autofs` placeholder, and the pseudo-filesystems the parser filters. |
 | `btrfs-nested-subvol.txt` | *(backup2.1 capture, reused here)* The **`skipping mount point: "photos"`** line the parser keys on — real bytes, on stderr, quoted, archive-root-relative — plus `btrfs subvolume show` in both its forms (a real subvolume, and `ERROR: Not a Btrfs subvolume` for the empty placeholder a ro snapshot leaves). |
 
+### Archive-browse index (story backup2.5, captured 2026-08-26)
+
+Read-only probes against the same disposable PBS (client/server 4.2.5-1), driving
+`catalog shell` over a pipe exactly as the daemon does. Nothing on the node was
+created, modified or destroyed. `backup2.1` established that `catalog shell` is a
+scriptable non-FUSE browser; this capture establishes **what it actually hands a
+directory picker**, which turned out to be less than the story assumed.
+
+| File | What it is |
+|------|------------|
+| `catalog-shell-browse.txt` | **The picker's whole contract, in ten sections.** (1) `ls` prints **BARE NAMES on stdout** — no type, no size, no trailing marker of any kind (`cat -A` proof); the `Starting interactive shell` banner is the only thing on stderr for a clean run. (2) `ls` of a **FILE echoes the file itself**, so a level must stat what it was pointed at or it shows a directory containing itself. (3) `stat` is therefore the ONLY type source, and its four-line block distinguishes `directory` / `file` / `symlink` — with a **HARDLINK rendered as a symlink** carrying the give-away mode `(0/L---------)`, an epoch mtime, and the group's PRIMARY name as its target. (4) **Argument quoting**: an unquoted space SPLITS the argument (`Error: got additional arguments`); double quotes, single quotes and unquoted `\\` escaping all work; a backslash **inside** double quotes is LITERAL, so quoting cannot escape the quote character — which is why the driver backslash-escapes unquoted. `*` and `[` are never globbed. (5) A per-command error goes to **stderr with the shell still at exit 0** and the session continuing — so failures are read off stderr, never off the exit code; a `;` is parsed as more arguments, never a separator. (6) The **real exit codes** when the shell cannot start (all 255, no pipe in the way): missing archive, missing snapshot, missing type suffix, an `.img` (`Can only mount pxar archives.`), a closed port (`client error (Connect)` + the 4.2.5 `Caused by:` cause), a no-permission token (`no permissions on …` — **different wording** from `snapshot list`'s `permission check failed - missing Datastore.Audit\|Datastore.Backup`), and a nonexistent namespace (`ENOENT`, unlike an EMPTY one which is `[]` at exit 0). (7) `catalog shell` browses `.pxar`, `.mpxar` **and** `.ppxar`. (8) **Cost**: a whole session is one process and one catalog fetch — 0.028 s on a small archive, 0.063 s on a 250 MiB one, and 0.083 s for `ls` + **500 `stat`s in one session**. (9) The composed `<type>/<id>/<RFC3339>` id ANAS builds **round-trips** back through `snapshot files`. (10) `list` — the group listing, whose `files` are bare STRINGS (GT-3). |
+
 ---
 
 ## 1. The env-var contract (both auth styles)

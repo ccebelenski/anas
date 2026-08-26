@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { AbsolutePath, ISODateTime, NotifyMode } from './common.js'
+import { AbsolutePath, hasControlChars, ISODateTime, NotifyMode } from './common.js'
 
 /**
  * PBS file backup (Epic 16) — back up host FILE data (shares, datasets, any
@@ -1178,3 +1178,327 @@ export const BackupTaskDetail = z.object({
   nested: z.array(BackupNestedScan).optional(),
 })
 export type BackupTaskDetail = z.infer<typeof BackupTaskDetail>
+
+// ---- Restore reads: snapshots, groups, archive browse (story backup2.5) -----
+//
+// The three USER-INITIATED read contacts phase 2 adds to the sanctioned list
+// (EPICS "Backup via PBS"): listing a group's points in time, listing a
+// repository's groups (the task-less entry point), and browsing ONE directory
+// level of an archive. Never polled, never background — a person clicked
+// something. Ground truth: docs/BACKUP-RESTORE-GROUND-TRUTH.md §1 (GT-1..GT-8)
+// plus the backup2.5 capture in fixtures/backup/catalog-shell-browse.txt.
+
+/**
+ * How a PBS-stored file behaves for restore, derived from its filename suffix
+ * (GT-16: the archive argument must carry its type suffix).
+ *
+ *   `pxar`  — a file archive: `<n>.pxar.didx`, `<n>.mpxar.didx`, `<n>.ppxar.didx`.
+ *             All three are browsable with `catalog shell` (real capture).
+ *   `img`   — a fixed-chunk block image: `<n>.img.fidx`. NOT browsable
+ *             (`Error: Can only mount pxar archives.`, exit 255) and restored
+ *             whole, by nature.
+ *   `other` — the snapshot's bookkeeping: `catalog.pcat1.didx`,
+ *             `index.json.blob`. Never a restore target the picker offers.
+ */
+export const BackupArchiveKind = z.enum(['pxar', 'img', 'other'])
+export type BackupArchiveKind = z.infer<typeof BackupArchiveKind>
+
+/**
+ * The suffixes pbc strips to get from a STORED filename to the ARCHIVE NAME it
+ * accepts as an argument (`data.pxar.didx` → `data.pxar`).
+ */
+const INDEX_SUFFIXES = ['.didx', '.fidx', '.blob'] as const
+/** Archive extensions that `catalog shell` will browse (all three proven). */
+const PXAR_EXTENSIONS = ['.pxar', '.mpxar', '.ppxar'] as const
+
+/**
+ * Classify ONE `snapshot list` file entry by its filename.
+ *
+ * Returns the kind and, for a real archive, the `archive` argument to pass to
+ * `catalog shell` / `restore` — the stored name minus its index suffix. A
+ * bookkeeping file (`index.json.blob`, `catalog.pcat1.didx`) is `other` and
+ * carries no archive name, so nothing can offer it as a restore source.
+ */
+export function classifyArchiveFile(
+  filename: string,
+): { kind: BackupArchiveKind, archive?: string } {
+  let base = filename
+  for (const suffix of INDEX_SUFFIXES) {
+    if (base.endsWith(suffix)) {
+      base = base.slice(0, -suffix.length)
+      break
+    }
+  }
+  if (base.endsWith('.img'))
+    return { kind: 'img', archive: base }
+  for (const ext of PXAR_EXTENSIONS) {
+    if (base.endsWith(ext))
+      return { kind: 'pxar', archive: base }
+  }
+  return { kind: 'other' }
+}
+
+/** Is this archive kind something the archive picker can browse into? */
+export function isBrowsableArchive(kind: BackupArchiveKind): boolean {
+  return kind === 'pxar'
+}
+
+/**
+ * The composed snapshot id `<backup-type>/<backup-id>/<RFC3339 backup-time>`.
+ *
+ * GT-1: `snapshot list --output-format json` does NOT return this — the client
+ * hands back the three parts separately and the CALLER composes the id. GT-57:
+ * a group path with no timestamp silently restores the LATEST snapshot, so
+ * every call ANAS makes carries the full three-part id.
+ */
+export function composeSnapshotId(
+  backupType: string,
+  backupId: string,
+  backupTimeUnixSeconds: number,
+): string {
+  return `${backupType}/${backupId}/${snapshotTimeIso(backupTimeUnixSeconds)}`
+}
+
+/** The `.mmmZ` tail `toISOString()` adds; PBS renders whole seconds. */
+const ISO_MILLIS_RE = /\.\d{3}Z$/
+
+/**
+ * PBS's own rendering of a `backup-time`: UTC RFC3339, second resolution, `Z`
+ * zone (`2026-08-25T19:16:45Z`) — verified by round-tripping a composed id back
+ * through `snapshot files` against a real server.
+ */
+export function snapshotTimeIso(backupTimeUnixSeconds: number): string {
+  return new Date(backupTimeUnixSeconds * 1000).toISOString().replace(ISO_MILLIS_RE, 'Z')
+}
+
+/** The group path `<backup-type>/<backup-id>` (the `snapshot list` argument). */
+export function composeGroupId(backupType: string, backupId: string): string {
+  return `${backupType}/${backupId}`
+}
+
+/**
+ * One file of a snapshot, as `snapshot list` reports it (GT-3: OBJECTS here,
+ * bare STRINGS in the group `list` — two shapes for the same word).
+ */
+export const BackupSnapshotFile = z.object({
+  /** The stored name, verbatim (`data.pxar.didx`). Never truncated. */
+  filename: z.string(),
+  /**
+   * The argument `catalog shell` / `restore` take (`data.pxar`) — absent for a
+   * bookkeeping file, which is never a restore source.
+   */
+  archive: z.string().optional(),
+  /** Derived from the suffix — what this file IS for restore purposes. */
+  kind: BackupArchiveKind,
+  /**
+   * GT-4: the LOGICAL archive size, and the restore space estimate — no
+   * download needed. An `.img` reports the full device size.
+   */
+  size: z.number().int().nonnegative().optional(),
+  /** `crypt-mode` verbatim (`none`, `sign-only`, `encrypt`). */
+  cryptMode: z.string().optional(),
+})
+export type BackupSnapshotFile = z.infer<typeof BackupSnapshotFile>
+
+/** One point in time in a backup group. */
+export const BackupSnapshot = z.object({
+  /** The composed `<type>/<id>/<RFC3339>` id ANAS builds (GT-1). */
+  snapshot: z.string(),
+  backupType: z.string(),
+  backupId: z.string(),
+  /** `backup-time` verbatim — UNIX SECONDS (same unit as prune). */
+  backupTime: z.number().int(),
+  /** The RFC3339 rendering used inside `snapshot` — the picker's label. */
+  backupTimeIso: ISODateTime,
+  files: z.array(BackupSnapshotFile),
+  /** The snapshot's total stored size, when the server reported one. */
+  size: z.number().int().nonnegative().optional(),
+  /** The owning auth-id (a group has ONE owner; a different auth-id is refused). */
+  owner: z.string().optional(),
+  /** PBS's protected flag — a protected snapshot is never pruned. */
+  protected: z.boolean().optional(),
+})
+export type BackupSnapshot = z.infer<typeof BackupSnapshot>
+
+/**
+ * The outcome of one user-initiated PBS read. `ok` carries data; every other
+ * value carries a `detail` the UI shows verbatim. Modelled on the prune verdict
+ * (16.11) and the repo Test (16.6): DIAGNOSE, never a bare failure.
+ *
+ * GT-56 forces the honesty of `not-found`: a missing snapshot, a missing group
+ * and a missing namespace produce the SAME string, so the message names all
+ * three rather than guessing which one is wrong.
+ */
+export const BackupReadVerdict = z.enum([
+  'ok',
+  'not-found',
+  'permission',
+  'unreachable',
+  'error',
+])
+export type BackupReadVerdict = z.infer<typeof BackupReadVerdict>
+
+/** Points in time for one group (`GET /v1/backup/tasks/:name/snapshots`). */
+export const BackupSnapshotList = z.object({
+  verdict: BackupReadVerdict,
+  /** Present for every non-ok verdict — the client-safe explanation. */
+  detail: z.string().optional(),
+  /** The repository reference the listing ran against. */
+  repository: z.string(),
+  /** The effective namespace (absent = the datastore root). */
+  namespace: z.string().optional(),
+  /** The group path `<type>/<id>` that was listed. */
+  group: z.string(),
+  /** NEWEST FIRST — GT-2: the client's array is NOT sorted, the picker must be. */
+  snapshots: z.array(BackupSnapshot),
+})
+export type BackupSnapshotList = z.infer<typeof BackupSnapshotList>
+
+/** One backup group as the group `list` reports it (GT-3: `files` are STRINGS). */
+export const BackupGroup = z.object({
+  /** The composed group path `<type>/<id>`. */
+  group: z.string(),
+  backupType: z.string(),
+  backupId: z.string(),
+  /** How many snapshots the group holds. */
+  backupCount: z.number().int().nonnegative().optional(),
+  /** `last-backup` verbatim — UNIX SECONDS. */
+  lastBackup: z.number().int().optional(),
+  /** RFC3339 rendering of `lastBackup` (absent when the server sent none). */
+  lastBackupIso: ISODateTime.optional(),
+  owner: z.string().optional(),
+  /** The stored filenames, classified — which archives this group holds. */
+  files: z.array(BackupSnapshotFile),
+})
+export type BackupGroup = z.infer<typeof BackupGroup>
+
+/**
+ * `GET /v1/backup/repos/:name/groups?ns=[&group=]` — the TASK-LESS entry point
+ * for archives whose task was renamed or deleted.
+ *
+ * Without `group` it lists the namespace's groups. With `group` it returns THAT
+ * group's snapshots in exactly the {@link BackupSnapshot} shape the task
+ * endpoint uses — one picker, one parser, two doors.
+ */
+export const BackupGroupList = z.object({
+  verdict: BackupReadVerdict,
+  detail: z.string().optional(),
+  repository: z.string(),
+  namespace: z.string().optional(),
+  /** Newest-last-backup first. Empty when a single group was requested. */
+  groups: z.array(BackupGroup),
+  /** Echoed when `?group=` was passed. */
+  group: z.string().optional(),
+  /** Present (newest first) only for the `?group=` form. */
+  snapshots: z.array(BackupSnapshot).optional(),
+})
+export type BackupGroupList = z.infer<typeof BackupGroupList>
+
+// ---- Archive browse (`catalog shell` over a pipe) --------------------------
+
+/**
+ * A path INSIDE a pxar archive. Absolute (the archive root is `/`), no `..`,
+ * and — load-bearing — no control characters: the browse driver feeds paths to
+ * `catalog shell` as lines on stdin, so a newline in a path would be a second
+ * command. pxar itself permits a newline in a filename; such an entry cannot be
+ * represented by the shell's line-based `ls` either, so it is refused here
+ * rather than silently mis-parsed downstream.
+ */
+export const ArchivePath = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(p => p.startsWith('/'), 'must be an absolute archive path (the archive root is /)')
+  .refine(p => !p.split('/').includes('..'), 'must not contain ".."')
+  .refine(p => !hasControlChars(p), 'must not contain control characters')
+export type ArchivePath = z.infer<typeof ArchivePath>
+
+/**
+ * What one entry in an archive directory IS.
+ *
+ * `hardlink` is its own type on purpose (the catalog's `h` entries): `stat`
+ * renders a hardlink as a symlink pointing at the group's PRIMARY name, with
+ * the give-away mode `(0/L---------)`. GT-25: picking a hardlink's second name
+ * ALONE fails the whole restore, so a hardlink and its target are ONE selection
+ * unit, never two.
+ *
+ * `image` is the single pseudo-entry an `.img` archive yields — browsing a
+ * block image is meaningless, so the browse short-circuits and says so instead
+ * of asking pbc a question it answers with an error.
+ */
+export const BackupBrowseEntryType = z.enum([
+  'dir',
+  'file',
+  'symlink',
+  'hardlink',
+  'image',
+  'other',
+])
+export type BackupBrowseEntryType = z.infer<typeof BackupBrowseEntryType>
+
+/** One entry of one directory level inside an archive. */
+export const BackupBrowseEntry = z.object({
+  /** The bare entry name as `ls` printed it. Never truncated, never escaped. */
+  name: z.string(),
+  /** The full archive path `<dir>/<name>` — what a selection carries. */
+  path: z.string(),
+  type: BackupBrowseEntryType,
+  /** Size in bytes when `stat` reported one (0 for dirs and links). */
+  size: z.number().int().nonnegative().optional(),
+  /**
+   * The modification time EXACTLY as pbc rendered it (`2026-08-25 19:16:23`).
+   * Deliberately not converted: the client prints it with NO timezone, so any
+   * ISO conversion here would be an invented offset.
+   */
+  modified: z.string().optional(),
+  /** Octal permission bits as pbc printed them (`644`, `755`). Display only. */
+  mode: z.string().optional(),
+  /**
+   * For a symlink, its target verbatim. For a HARDLINK, the group's primary
+   * name — the path that must be restored together with this one.
+   */
+  target: z.string().optional(),
+})
+export type BackupBrowseEntry = z.infer<typeof BackupBrowseEntry>
+
+/**
+ * `POST /v1/backup/restore/browse` — ONE directory level of one archive.
+ *
+ * Deliberately a POST of a compound key, not a GET: repo + namespace +
+ * snapshot + archive + path do not belong in a query string. It is still a
+ * READ (200, never a job) — nothing on the node or the server changes.
+ */
+export const BackupBrowseRequest = z.object({
+  /** Repository reference (a registered name or `pve:<storage-id>`). */
+  repo: BackupRepoRef,
+  /** Namespace; absent = the repo's own, else the datastore root. */
+  ns: z.string().optional(),
+  /** The FULL `<type>/<id>/<RFC3339>` id — never a bare group path (GT-57). */
+  snapshot: z.string().min(1),
+  /** The archive argument WITH its type suffix (`data.pxar`) — GT-16. */
+  archive: z.string().min(1),
+  /** The directory to list; defaults to the archive root. */
+  path: ArchivePath.default('/'),
+})
+export type BackupBrowseRequest = z.infer<typeof BackupBrowseRequest>
+
+/** One directory level of an archive, or the verdict explaining why not. */
+export const BackupBrowseResult = z.object({
+  verdict: BackupReadVerdict,
+  detail: z.string().optional(),
+  repository: z.string(),
+  namespace: z.string().optional(),
+  snapshot: z.string(),
+  archive: z.string(),
+  /** What kind of archive this is — an `img` is a single whole-image unit. */
+  archiveKind: BackupArchiveKind,
+  /** The directory that was listed (normalized). */
+  path: z.string(),
+  /** Directories first, then everything else; each group name-sorted. */
+  entries: z.array(BackupBrowseEntry),
+  /** True when the level was capped — silent truncation is banned. */
+  truncated: z.boolean().optional(),
+  /** Non-fatal problems (an entry that could not be stat'ed). Never secrets. */
+  warnings: z.array(z.string()).default([]),
+})
+export type BackupBrowseResult = z.infer<typeof BackupBrowseResult>

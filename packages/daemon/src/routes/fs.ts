@@ -15,7 +15,7 @@ const MAX_DIRS = 500
 
 export async function fsRoutes(server: FastifyInstance) {
   server.get<{
-    Querystring: { path?: string }
+    Querystring: { path?: string, files?: string }
   }>('/fs/browse', async (request, reply) => {
     const parsed = AbsolutePath.safeParse(request.query.path)
     if (!parsed.success) {
@@ -57,12 +57,20 @@ export async function fsRoutes(server: FastifyInstance) {
 
     const result: FsBrowseResult = { path, exists: true, type, dirs: [] }
 
+    // Child FILES are listed only when the caller opts in (`?files=1`, story
+    // backup2.5 — the picker also single-selects a file). Absent otherwise, so
+    // "not requested" is never mistaken for "none there", and every pre-flag
+    // caller gets byte-identical responses.
+    const wantFiles = request.query.files === '1' || request.query.files === 'true'
+
     if (isDir) {
       try {
         const entries = await readdir(path, { withFileTypes: true })
         const names: string[] = []
+        const fileNames: string[] = []
         for (const ent of entries) {
           let childIsDir = ent.isDirectory()
+          let childIsFile = ent.isFile()
           // A symlink child may point at a directory — follow it (best-effort)
           // so the picker can descend into symlinked directories. Fail-open:
           // an unreadable / dangling symlink is simply skipped.
@@ -70,13 +78,18 @@ export async function fsRoutes(server: FastifyInstance) {
             try {
               const cst = await stat(join(path, ent.name))
               childIsDir = cst.isDirectory()
+              childIsFile = cst.isFile()
             }
             catch {
               childIsDir = false
+              childIsFile = false
             }
           }
           if (childIsDir) {
             names.push(ent.name)
+          }
+          else if (wantFiles && childIsFile) {
+            fileNames.push(ent.name)
           }
         }
         names.sort()
@@ -87,11 +100,24 @@ export async function fsRoutes(server: FastifyInstance) {
         else {
           result.dirs = names
         }
+        if (wantFiles) {
+          fileNames.sort()
+          if (fileNames.length > MAX_DIRS) {
+            result.files = fileNames.slice(0, MAX_DIRS)
+            result.truncated = true
+          }
+          else {
+            result.files = fileNames
+          }
+        }
       }
       catch {
         // Unreadable directory (permission) — fail-open to an empty listing;
         // the path still exists and is a dir, the picker just shows no children.
         result.dirs = []
+        if (wantFiles) {
+          result.files = []
+        }
       }
     }
 

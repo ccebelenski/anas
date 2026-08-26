@@ -133,6 +133,74 @@ Commands: `cd`, `ls`, `pwd`, `stat`, `find <pattern>`, `select`/`deselect`/
 (`cdm.mpxar` and `cdm.pxar` are both accepted). On an `.img`:
 `Error: Can only mount pxar archives.` **exit 255**.
 
+### Addendum — what `catalog shell` gives a PICKER (story backup2.5, 2026-08-26)
+
+> GT-8 established that the browser exists and is scriptable. Building the picker
+> needed the shape of its answers, which `backup2.1` had not captured. These
+> facts come from `fixtures/backup/catalog-shell-browse.txt` — read-only probes
+> against the same disposable PBS (client/server 4.2.5-1), same namespace.
+
+**GT-8a — `ls` prints BARE NAMES and NOTHING ELSE.** One plain name per line on
+**stdout**, no type marker, no size, no trailing `/` on a directory (`cat -A`
+proof in the fixture). The `Starting interactive shell` banner is the only thing
+on **stderr** for a clean run. A picker therefore cannot get types from `ls`.
+
+**GT-8b — `ls` of a FILE echoes the file's own name** (exit 0, no error). Without
+a second question, a level would show a directory that contains itself.
+
+**GT-8c — `stat` is the only type source, and it is a fixed four-line block:**
+
+```
+  File: /link-to-alpha -> "alpha.txt"
+  Size: 0             Type: symlink
+Access: (777/lrwxrwxrwx  )  Uid: 0     Gid: 0
+Modify: 2026-08-25 19:16:23
+```
+
+Types seen: `directory`, `file`, `symlink`. **A HARDLINK is rendered as a
+`symlink`** pointing at the group's PRIMARY name — told apart only by its mode,
+`Access: (0/L---------  )`, with an epoch `Modify`. That `L` is pxar's own
+format-mode letter for a hardlink and is the discriminator. `Modify` carries **no
+timezone**, so any ISO conversion would be an invented offset.
+
+**GT-8d — argument quoting. Backslash-escaping UNQUOTED is the only complete
+form.** An unquoted space splits the argument
+(`Error: got additional arguments: ["space.txt"]`). Double quotes, single quotes
+and `\\ ` all resolve correctly — but **a backslash inside double quotes is
+LITERAL** (`"/with\\ space.txt"` looked for `with\\ space.txt`), so a quoted
+argument cannot escape the quote character itself. `*` and `[` are never globbed.
+Verified against the real archive: `ls /mix\\ \\[a\\]\\ \\*\\ b.txt` →
+`mix [a] * b.txt`.
+
+**GT-8e — a per-command error is on STDERR and the shell stays at exit 0**, and
+keeps going: `ls /nosuchdir` prints `Error: no such file or directory: "nosuchdir"`
+and the next `ls` still answers. A non-zero exit means the shell never STARTED.
+One command per line — a `;` is parsed as more arguments, never a separator.
+
+**GT-8f — the start-up failures all exit 255** (GT-6/GT-56 confirmed without a
+pipe swallowing the code): missing archive (`archive not found in manifest`),
+missing snapshot / group / namespace (one identical string), missing type suffix
+(`failed to parse archive type for 'data'`), an `.img`
+(`Can only mount pxar archives.`), a closed port (`client error (Connect)` plus
+the 4.2.5 `Caused by:` cause), and a no-permission token —
+`Error: no permissions on /datastore/<store>/<ns>`, **different wording** from
+`snapshot list`'s `permission check failed - missing Datastore.Audit|Datastore.Backup`.
+A **nonexistent namespace** is `Error: ENOENT`, exit 255 — unlike an EMPTY one,
+which is `[]` at exit 0 (GT-5).
+
+**GT-8g — `.ppxar` browses too.** `catalog shell` accepts `.pxar`, `.mpxar` AND
+the metadata-mode payload `.ppxar`, all returning the same tree.
+
+**GT-8h — a session is cheap: one process, one catalog fetch.** `ls` + `exit`
+measured **0.028 s** on a 2.5 KiB archive and **0.063 s** on a 250 MiB one; `ls`
+plus **500 `stat`s in a single session** took **0.083 s** and produced 2 500
+stdout lines. Batching a level's stats into one invocation costs nothing.
+
+**GT-8i — the composed id round-trips.** `host/gtbig/2026-08-25T19:22:02Z`, built
+by ANAS from the three parts GT-1 returns, was accepted verbatim by
+`snapshot files` — confirming PBS renders `backup-time` as UTC RFC3339 with
+second resolution and a `Z` zone.
+
 ---
 
 ## 2. Restore into an existing tree

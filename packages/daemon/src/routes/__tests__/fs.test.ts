@@ -18,6 +18,19 @@ async function browse(
   return { statusCode: res.statusCode, ...body }
 }
 
+/** The same browse, opting IN to the file listing (story backup2.5). */
+async function browseWithFiles(
+  server: ReturnType<typeof createServer>,
+  path: string,
+): Promise<{ statusCode: number, data?: FsBrowseResult }> {
+  const res = await server.inject({
+    method: 'GET',
+    url: `/v1/fs/browse?path=${encodeURIComponent(path)}&files=1`,
+  })
+  const body = res.json() as { data?: FsBrowseResult }
+  return { statusCode: res.statusCode, ...body }
+}
+
 describe('fs browse route (Epic 16.9)', () => {
   let server: ReturnType<typeof createServer> | undefined
   let dir: string
@@ -138,5 +151,54 @@ describe('fs browse route (Epic 16.9)', () => {
     finally {
       await chmod(locked, 0o755)
     }
+  })
+
+  // --- `?files=1` — the picker's file-select mode (story backup2.5) ---------
+
+  it('lists child FILES only when asked, sorted, and never mixed into dirs', async () => {
+    await mkdir(join(dir, 'sub'))
+    await writeFile(join(dir, 'zeta.img'), 'x')
+    await writeFile(join(dir, 'alpha.raw'), 'x')
+
+    const withFiles = await browseWithFiles(server!, dir)
+    assert.equal(withFiles.statusCode, 200)
+    assert.deepEqual(withFiles.data!.dirs, ['sub'])
+    assert.deepEqual(withFiles.data!.files, ['alpha.raw', 'zeta.img'])
+  })
+
+  it('ABSENT, not [], when files were not requested — "not asked" is not "none"', async () => {
+    await mkdir(join(dir, 'sub'))
+    await writeFile(join(dir, 'a.img'), 'x')
+    const plain = await browse(server!, dir)
+    assert.equal(plain.statusCode, 200)
+    assert.equal('files' in plain.data!, false)
+    assert.deepEqual(plain.data!.dirs, ['sub'])
+  })
+
+  it('an empty directory asked for files answers with an empty list', async () => {
+    const res = await browseWithFiles(server!, dir)
+    assert.deepEqual(res.data!.dirs, [])
+    assert.deepEqual(res.data!.files, [])
+  })
+
+  it('a symlink to a FILE is listed as a file; a symlink to a dir stays a dir', async () => {
+    await writeFile(join(dir, 'real.img'), 'x')
+    await mkdir(join(dir, 'realdir'))
+    await symlink(join(dir, 'real.img'), join(dir, 'linkfile'))
+    await symlink(join(dir, 'realdir'), join(dir, 'linkdir'))
+    const res = await browseWithFiles(server!, dir)
+    assert.deepEqual(res.data!.dirs, ['linkdir', 'realdir'])
+    assert.deepEqual(res.data!.files, ['linkfile', 'real.img'])
+  })
+
+  it('caps the file listing too, and says so', async () => {
+    const mk: Promise<void>[] = []
+    for (let i = 0; i < 501; i++) {
+      mk.push(writeFile(join(dir, `f${String(i).padStart(4, '0')}.bin`), 'x'))
+    }
+    await Promise.all(mk)
+    const res = await browseWithFiles(server!, dir)
+    assert.equal(res.data!.truncated, true)
+    assert.equal(res.data!.files!.length, 500)
   })
 })
