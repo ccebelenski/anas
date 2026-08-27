@@ -593,6 +593,78 @@ export function archiveSpecType(kind: BackupArchiveKind): string {
   return kind === 'img' ? 'img' : 'pxar'
 }
 
+// ---- Task kind (story backup2.9) -------------------------------------------
+//
+// A backup task is FILES (directory trees) or BLOCK (one iSCSI LUN as a whole
+// image) — not a bag of archives with a mixed agenda. The field is OPTIONAL on
+// the task, by the same ruling as the archive's `kind` (backup2.4): a unit
+// written before this story stores nothing, and its kind is DERIVED from the
+// archives — which is what keeps every existing unit byte-identical on an
+// untouched edit, and makes an old UI + new daemon (or the reverse) a
+// derivation, not a failure.
+
+export const BackupTaskKind = z.enum(['files', 'block'])
+export type BackupTaskKind = z.infer<typeof BackupTaskKind>
+
+/** The one answer to "what IS this task" — the stored value or the derived shape. */
+export interface EffectiveTaskKind {
+  kind: BackupTaskKind
+  /**
+   * The legacy shape this story formalises: the task reads as `files` yet
+   * still carries image archive(s) — written before block tasks existed, when
+   * an `img` archive rode in a task alongside its files. The UI notes it and
+   * points at one block task per LUN; the stored data is untouched.
+   */
+  legacyImgArchives: boolean
+}
+
+/**
+ * The ONE place "what kind of task is this" is expressed — the read model, the
+ * wizard, the grid and the LUN door all ask here rather than re-deriving.
+ *
+ *   - stored `block` / `files` is the answer (the wizard writes it the moment
+ *     an operator chooses, so stored and derived can never diverge silently);
+ *   - absent ⇒ derived: EXACTLY ONE archive, and it is an image, is a block
+ *     task — the shape backup2.4 let the wizard build by hand;
+ *   - everything else is a files task; a DERIVED files task that still carries
+ *     image archive(s) is the legacy shape (`legacyImgArchives`), and the UI's
+ *     note says what to do about it (one block task per LUN).
+ */
+export function effectiveTaskKind(
+  task?: {
+    kind?: BackupTaskKind | null
+    archives?: ReadonlyArray<{ kind?: BackupArchiveKind | null } | null> | null
+  } | null,
+): EffectiveTaskKind {
+  const archives = (task?.archives ?? []).filter((a): a is { kind?: BackupArchiveKind | null } => !!a)
+  const imgCount = archives.filter(a => effectiveArchiveKind(a) === 'img').length
+  if (task?.kind === 'block' || task?.kind === 'files')
+    return { kind: task.kind, legacyImgArchives: false }
+  if (archives.length === 1 && imgCount === 1)
+    return { kind: 'block', legacyImgArchives: false }
+  return { kind: 'files', legacyImgArchives: imgCount > 0 }
+}
+
+/**
+ * The FIXED archive name of a block task (backup2.9): the whole image IS the
+ * archive, and the name says exactly that — `disk`. It never varies, because
+ * the archive name is pbc's change-detection KEY: a name that could drift would
+ * be a re-read waiting to happen on a multi-terabyte LUN.
+ */
+export const BLOCK_ARCHIVE_NAME = 'disk'
+
+/**
+ * A block task's backup-id: `lun-<SCSI unit serial>` (backup2.9). The PBS
+ * GROUP is the LUN's durable identity — the human LUN name is display-only and
+ * can change, but the serial (a VPD fact) survives a rename, a re-point and a
+ * re-install, so the LUN's backups stay one group across all of them. The
+ * wizard derives the id from the pick; the daemon verifies it against the
+ * read layer's own serial and refuses a mismatch (a guiding 400).
+ */
+export function lunBackupId(serial: string): string {
+  return `lun-${serial}`
+}
+
 /**
  * WHICH iSCSI LUN an `img` archive's source was picked as. It is a RECORD, not
  * an address: the archive's `path` is still the one and only source pbc is
@@ -742,6 +814,8 @@ export type BackupExpandedArchive = z.infer<typeof BackupExpandedArchive>
 const ARCHIVE_NAME_ILLEGAL_RE = /[^\w-]/g
 /** Path separators in a derived suffix become `_`. */
 const PATH_SEPARATOR_RE = /\//g
+/** The characters an archive name can never carry (a derived name keeps dots). */
+const DERIVED_ARCHIVE_NAME_ILLEGAL_RE = /[^\w.-]/g
 
 /**
  * The deterministic child-archive name for a nested filesystem at
@@ -754,6 +828,31 @@ const PATH_SEPARATOR_RE = /\//g
 export function expandedArchiveName(name: string, relativePath: string): string {
   const suffix = relativePath.replace(TRAILING_SLASHES_RE, '').replace(PATH_SEPARATOR_RE, '_')
   return `${name}__${suffix}`.replace(ARCHIVE_NAME_ILLEGAL_RE, '_')
+}
+
+/**
+ * The archive name a files row gets when it is CREATED (backup2.9): the source
+ * path's LAST SEGMENT, sanitised to the archive-name charset. The wizard shows
+ * it, not an empty box to fill — and it is read-only, because the archive name
+ * is pbc's change-detection KEY: a name that could later be re-derived (a path
+ * rename changing the last segment) would silently turn the next run into a
+ * full re-read of the whole tree. It is derived ONCE, at row creation, against
+ * the names the task already carries (`taken`, auto-suffixed `-2`, `-3`, … on a
+ * collision); a STORED name is never re-derived, on any edit.
+ */
+export function deriveArchiveName(path: string, taken: readonly string[] = []): string {
+  const segments = path.replace(TRAILING_SLASHES_RE, '').split('/').filter(Boolean)
+  // The same "replace what the charset cannot say" convention as
+  // `expandedArchiveName` — but the archive charset keeps dots, so only true
+  // illegal characters become `_`.
+  let base = (segments.at(-1) ?? '').replace(DERIVED_ARCHIVE_NAME_ILLEGAL_RE, '_')
+  if (!base)
+    base = 'root' // the path was `/` — take the filesystem's own name
+  let name = base
+  let n = 2
+  while (taken.includes(name))
+    name = `${base}-${n++}`
+  return name.length > 128 ? name.slice(0, 128) : name
 }
 
 /**
@@ -1009,6 +1108,16 @@ export const BackupTask = z.object({
   backupId: z.string().min(1),
   /** 1..N archives (the operator's multi-archive shape). */
   archives: z.array(BackupArchive).min(1),
+  /**
+   * FILES or BLOCK (backup2.9) — the task's kind, chosen FIRST. OPTIONAL by the
+   * same ruling as the archive's `kind`: a unit written before this story
+   * stores nothing and {@link effectiveTaskKind} derives the answer (exactly
+   * one image archive is a block task), so no existing unit is rewritten until
+   * it is edited. The wizard stores `block` on a block task and stores NOTHING
+   * on a files task — absent IS the files default, and a value nobody chose is
+   * never written.
+   */
+  kind: BackupTaskKind.optional(),
   changeDetectionMode: ChangeDetectionMode.default('default'),
   /**
    * OPTIONAL retention (16.11): after a SUCCESSFUL run the job prunes the task's
@@ -1062,6 +1171,12 @@ export const BackupTaskRequest = z.preprocess((raw) => {
     const o = { ...(raw as Record<string, unknown>) }
     if (o.changeDetectionMode === undefined && o.mode !== undefined)
       o.changeDetectionMode = o.mode
+    // backup2.9 — `null` kind is a clear (absent = derived), exactly as the
+    // archive's `kind` normalises; `files` is KEPT — unlike `pxar`, it is not
+    // redundant with absent: a stored `files` on a mixed task is what makes it
+    // NOT the legacy shape.
+    if (o.kind === null || o.kind === undefined)
+      delete o.kind
     if (Array.isArray(o.archives)) {
       o.archives = o.archives.map((a) => {
         if (!a || typeof a !== 'object')
@@ -1100,13 +1215,73 @@ export const BackupTaskRequest = z.preprocess((raw) => {
     return o
   }
   return raw
-}, BackupTask)
+}, BackupTask.superRefine((task, ctx) => {
+  // backup2.9 — a BLOCK task is one LUN, spelled out at the TASK level. The
+  // per-archive refusions already fired above (excludes and includeNested are
+  // refused on an `img` archive); this is the shape the task itself must have.
+  if (task.kind !== 'block')
+    return
+  if (task.archives.length !== 1) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['archives'],
+      message: `a block task backs up EXACTLY one LUN — one image archive per task (${task.archives.length} archives were sent; create one block task per LUN)`,
+    })
+    return
+  }
+  const archive = task.archives[0]
+  if (effectiveArchiveKind(archive) !== 'img') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['archives', 0, 'kind'],
+      message: `a block task's one archive must be a block image (kind 'img') — it names a LUN, not a directory`,
+    })
+    return
+  }
+  if (archive.name !== BLOCK_ARCHIVE_NAME) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['archives', 0, 'name'],
+      message: `a block task's archive is named '${BLOCK_ARCHIVE_NAME}' — the whole image is the archive, and the name is the change-detection key`,
+    })
+  }
+  if (!archive.lun) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['archives', 0, 'lun'],
+      message: `a block task's archive must record the iSCSI LUN it backs up (target + LUN number)`,
+    })
+  }
+  if (task.changeDetectionMode !== 'default') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['changeDetectionMode'],
+      message: `the change-detection mode does not apply to a block image (every run reads the whole image) — a block task cannot set it`,
+    })
+  }
+}))
 export type BackupTaskRequest = z.infer<typeof BackupTaskRequest>
 
-/** The task shape returned to clients — enriched with the repo's datastore. */
+/**
+ * The task shape returned to clients — enriched with the repo's datastore and,
+ * since backup2.9, the legacy-shape flag. The `kind` key stays the STORED value
+ * (absent on a unit written before this story) — exactly the archive's `kind`
+ * ruling, and exactly what the edit dialog needs: a STORED `block` is sent back
+ * on save, a derived one is not, which is what keeps a pre-backup2.9 task's
+ * hand-chosen id and PBS group (the daemon's serial guard fires only on a task
+ * that claims to be block). The EFFECTIVE answer the grid and the LUN door ask
+ * for is a DERIVATION the client performs through {@link effectiveTaskKind} —
+ * the same helper the daemon reads it with, so both sides cannot disagree.
+ */
 export const BackupTaskView = BackupTask.extend({
   /** Joined from the repository so the UI need not (never truncated). */
   datastore: z.string().optional(),
+  /**
+   * backup2.9 — the legacy shape: a derived `files` that still carries image
+   * archive(s) (written before block tasks existed). The wizard's note points
+   * at one block task per LUN; the stored data is untouched.
+   */
+  legacyImgArchives: z.boolean().optional(),
 })
 export type BackupTaskView = z.infer<typeof BackupTaskView>
 
@@ -1157,6 +1332,15 @@ export const BackupTaskEntry = z.object({
   nextRunAt: ISODateTime.nullable(),
   /** Enabled task past its schedule without a successful run (counts as failed). */
   overdue: z.boolean(),
+  /**
+   * backup2.9 — for a BLOCK task: the LUN's human NAME, resolved LIVE from the
+   * iSCSI read layer. The stored task carries only the `{ targetIqn, index }`
+   * record and the serial-derived backup-id; the name is display-only and can
+   * change, so it is never stored — read where it lives. `null` = the LUN no
+   * longer resolves right now (fail-open: the list must never die on the read
+   * layer). Absent for files tasks and on older daemons.
+   */
+  lunName: z.string().nullable().optional(),
 })
 export type BackupTaskEntry = z.infer<typeof BackupTaskEntry>
 

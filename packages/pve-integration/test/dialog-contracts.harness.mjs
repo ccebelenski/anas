@@ -75,11 +75,24 @@
  *      kind-`img` archive on the LUN's backing path) and their last-run
  *      result; "Back up…" runs/edits the covering task through the Backup
  *      menu's OWN doors (asserted on the job and dialog produced, not a copy),
- *      or opens the new-task wizard pre-filled with the LUN's archive — whose
- *      body is deep-equal to a manual LUN pick in that same wizard; the tasks
+ *      or opens the new-task wizard with the block panel already chosen and
+ *      the LUN pre-selected (backup2.9 — the kind choice is skipped; 7c),
+ *      whose body is deep-equal to a manual block pick in that same wizard; the tasks
  *      read failing shows no badge and gates nothing (fail-open, silent), and
  *      a foreign target or an absent backing disables the door with the
  *      reason.
+ *   7c. backup2.9: a task is FILES or BLOCK, chosen FIRST — the block panel is
+ *      the LUN picker and nothing else (no path, excludes, nested or
+ *      change-detection controls), a new block task's id is `lun-<serial>`
+ *      read-only and its archive name the fixed `disk`, and the door's
+ *      pre-fill is deep-equal to a manual block pick in the same wizard. File
+ *      archive names derive from the path's last segment at row creation
+ *      (pinned against the shared deriveArchiveName) and are read-only; STORED
+ *      names are never re-derived. A pre-backup2.9 single-image task derives
+ *      as block but its save carries NO `kind` key — its stored id and group
+ *      ride through verbatim. The grid grows a Kind column + the LUN's live
+ *      name (null = "no longer resolvable"), and the LUN door's badge matches
+ *      a task by the serial in its backup-id.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -89,7 +102,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { BackupTask, cadenceToOnCalendar } from '@anas/shared'
+import { BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, deriveArchiveName, lunBackupId } from '@anas/shared'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, '..', 'src')
@@ -334,6 +347,10 @@ function makeComponent(cfg, parent) {
   c.setVisible = function (v) { c.hidden = !v; return c }
   c.isVisible = () => !c.hidden
   c.setDisabled = function (v) { c.disabled = !!v; return c }
+  // The block panel (backup2.9) locks the backup-id field once a pick with a
+  // readable serial derives it — readOnly, not disabled: the value is still
+  // read (and asserted), the operator just cannot type over it.
+  c.setReadOnly = function (v) { c.readOnly = !!v; return c }
   c.setText = function (v) { c.text = v; return c }
   c.setIconCls = function (v) { c.iconCls = v; return c }
   c.update = function (h) { c.html = h; return c }
@@ -732,13 +749,63 @@ function nestedPreviewRoute(body) {
   }
 }
 
+/**
+ * backup2.9 — the one block-task shape the wizard writes: the stored kind,
+ * the fixed archive name, the LUN record, and the id DERIVED from the LUN's
+ * serial (pinned through the shared helper, not a re-typed literal).
+ */
+const BLOCK_TASK = {
+  name: 'lun-disk',
+  repository: 'pbs-main',
+  backupId: lunBackupId(LUN_SOURCES[0].serial),
+  kind: 'block',
+  archives: [{
+    name: BLOCK_ARCHIVE_NAME,
+    path: LUN_SOURCES[0].path,
+    excludes: [],
+    kind: 'img',
+    lun: { targetIqn: LUN_SOURCES[0].targetIqn, index: LUN_SOURCES[0].index },
+  }],
+  changeDetectionMode: 'default',
+  schedule: 'daily',
+  enabled: true,
+}
+
+/**
+ * backup2.9 — the operator's first LUN backup (2026-08-26): one img archive
+ * with its record, NO stored kind, a hand-chosen id. It derives as a block
+ * task, but an untouched edit must send NO `kind` key and keep the stored id
+ * and group verbatim — the daemon's serial guard would refuse the claim.
+ */
+const LEGACY_LUN_TASK = {
+  name: 'legacy-lun',
+  repository: 'pbs-main',
+  backupId: 'vmstore',
+  archives: [{
+    name: 'lun0',
+    path: LUN_SOURCES[0].path,
+    excludes: [],
+    kind: 'img',
+    lun: { targetIqn: LUN_SOURCES[0].targetIqn, index: LUN_SOURCES[0].index },
+  }],
+  schedule: 'daily',
+  enabled: true,
+}
+
 const BACKUP_ROUTES = {
   'GET /backup/repos': { data: { version: 1, repos: [{ name: 'pbs-main', datastore: 'store1', source: 'anas' }] } },
-  'GET /backup/tasks': { data: [{ task: TASK, lastRunResult: 'success', enabled: true }] },
+  'GET /backup/tasks': {
+    data: [
+      { task: TASK, lastRunResult: 'success', enabled: true },
+      { task: BLOCK_TASK, lastRunResult: 'success', lastRunAt: '2026-08-27T02:00:00Z', nextRunAt: null, overdue: false, lunName: LUN_SOURCES[0].name },
+      { task: LEGACY_LUN_TASK, lastRunResult: 'failure', lastRunAt: '2026-08-26T02:00:00Z', nextRunAt: null, overdue: false, lunName: LUN_SOURCES[0].name },
+    ],
+  },
   'GET /mounts': { data: [] },
   'GET /pools': { data: [] },
   'POST /backup/tasks/preview-nested': nestedPreviewRoute,
   'GET /backup/lun-sources': { data: { installed: true, luns: LUN_SOURCES } },
+  'GET /fs/browse': path => ({ data: { exists: true, path } }),
 }
 
 /**
@@ -778,10 +845,34 @@ async function backupChecks() {
   await settle()
 
   const grid = view.down('#backupGrid')
-  ok('backup: the grid loaded the task', grid && grid.getStore().getCount() === 1)
+  ok('backup: the grid loaded all three tasks', grid && grid.getStore().getCount() === 3)
   const rec = grid.selectRow(0)
   ok('backup: the row carries the raw task', rec && rec.get('raw') && rec.get('raw').name === TASK.name)
   ok('backup: selecting a row enables Edit', grid.down('#backupEdit').disabled === false)
+
+  // --- 0c. backup2.9 — the grid's Kind column + the LUN's live name ---------
+  const kindCol = (grid.columns || []).find(c => c.dataIndex === 'kind')
+  const lunCol = (grid.columns || []).find(c => c.dataIndex === 'lunName')
+  ok('backup: the grid has a Kind column', !!kindCol)
+  ok('backup: the grid has a LUN column', !!lunCol)
+  if (kindCol && lunCol) {
+    const rowFiles = grid.getStore().getAt(0) // TASK: derived files, mixed legacy
+    const rowBlock = grid.getStore().getAt(1) // BLOCK_TASK: stored block
+    const rowLegacy = grid.getStore().getAt(2) // LEGACY_LUN_TASK: derived block
+    eq('backup: a pre-backup2.9 mixed task reads as files', rowFiles.get('kind'), 'files')
+    eq('backup: a stored-block task reads as block', rowBlock.get('kind'), 'block')
+    eq('backup: a pre-backup2.9 single-image task DERIVES as block', rowLegacy.get('kind'), 'block')
+    ok('backup: the files row renders no LUN (a dash, not a state)',
+      /&mdash;|&mdash|—/.test(lunCol.renderer(rowFiles.get('lunName'), {}, rowFiles)),
+      lunCol.renderer(rowFiles.get('lunName'), {}, rowFiles))
+    ok('backup: the block row shows the LUN\'s LIVE name',
+      lunCol.renderer(rowBlock.get('lunName'), {}, rowBlock).includes(LUN_SOURCES[0].name),
+      lunCol.renderer(rowBlock.get('lunName'), {}, rowBlock))
+    ok('backup: a block task whose LUN no longer resolves says so',
+      /no longer resolvable/i.test(lunCol.renderer(null, {}, { get: k => (k === 'kind' ? 'block' : null) })))
+    ok('backup: a files task never shows the "unresolvable" state',
+      !/no longer resolvable/i.test(lunCol.renderer(undefined, {}, { get: k => (k === 'kind' ? 'files' : undefined) })))
+  }
 
   // --- 0b. A DISABLED task has no run result to show (live-proof F9) --------
   // systemd unloads a disabled unit nothing references and answers from
@@ -828,6 +919,15 @@ async function backupChecks() {
   eq('backup: Save is a PUT of the whole task', jobs.length && jobs[0].method, 'put')
   eq('backup: Save targets the task', jobs.length && jobs[0].path, `/backup/tasks/${TASK.name}`)
   if (jobs.length) { sweepFields('edit→save', jobs[0].body, TASK) }
+  // backup2.9 — the kind rule the whole story hinges on: TASK predates the
+  // field (and its derived kind is `files` anyway), so an untouched edit sends
+  // NO `kind` key at all — the unit rewrites byte-for-byte. (sweepFields cannot
+  // see a key present-with-undefined: JSON.stringify drops it, so the `in` test
+  // is what actually guards it.)
+  if (jobs.length) {
+    ok('backup: an untouched pre-backup2.9 edit sends NO `kind` key',
+      !('kind' in jobs[0].body), JSON.stringify(jobs[0].body))
+  }
 
   // --- 2. Enable / disable ---
   jobs.length = 0
@@ -1188,6 +1288,260 @@ async function lunPickerChecks() {
   eq('picker: the archive is still a block image', body.archives[3].kind, 'img')
 
   ok('picker: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  1f. backup2.9 — a task is FILES or BLOCK, chosen first
+// ============================================================================
+//
+// The contract this section pins:
+//  - a new task starts at the kind choice (files is the default), and choosing
+//    block turns the dialog into the LUN panel — the picker and nothing else;
+//  - a block task's identity IS the LUN's serial: `lun-<serial>`, derived from
+//    the pick and read-only (pinned to the shared lunBackupId), and its single
+//    archive is `disk` at the LUN's path (pinned to the shared
+//    BLOCK_ARCHIVE_NAME);
+//  - file archive names derive from the path's last segment at creation (pinned
+//    to the shared deriveArchiveName) — shown, not editable — and are NEVER
+//    re-derived on an edit: the name is the change-detection key;
+//  - the edit dialog keeps the kind as STORED: a pre-backup2.9 single-image
+//    task edits as block but sends NO `kind` back (the daemon's serial guard
+//    must never fire on its hand-chosen id); a stored block task sends
+//    `kind: 'block'` verbatim and keeps its stored archive name.
+
+async function backupTaskKindChecks() {
+  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+
+  // --- 1. New task: the kind is chosen first, and block is a different shape ---
+  created.windows.length = 0
+  ANAS.backup.openNewTask(view, 'harness', null)
+  await settle()
+  let wiz = openWindow()
+  ok('kind: the plain door opens the NEW-task wizard',
+    !!wiz && /New Backup Task/.test(wiz.title || ''), wiz && wiz.title)
+  const kindGroup = wiz && wiz.down('#kindGroup')
+  ok('kind: a new task shows the kind choice', !!kindGroup && kindGroup.hidden === false)
+  eq('kind: …and it opens on files', kindGroup && kindGroup.getValue(), { taskKind: 'files' })
+  ok('kind: the files panel (the archive list) is the shape it opens on',
+    !!wiz && wiz.down('#filesPanel').hidden === false)
+  ok('kind: the block panel waits until it is chosen',
+    !!wiz && wiz.down('#blockPanel').hidden === true)
+
+  kindGroup.setValue('block')
+  await settle()
+  ok('kind: choosing block hides the archive list', wiz.down('#filesPanel').hidden === true)
+  ok('kind: …and the change-detection fieldset (a no-op for images)',
+    wiz.down('#modePanel').hidden === true)
+  ok('kind: …and shows the block panel', wiz.down('#blockPanel').hidden === false)
+  ok('kind: with no pick yet, the panel says so — not a blank',
+    /No LUN chosen\./.test(wiz.down('#blockLunOut').html || ''))
+  ok('kind: the id field is not locked without a pick',
+    wiz.down('#backupId').readOnly === false)
+
+  // The picker is the panel's one input.
+  findCmp(wiz, 'anas-btn-backup-block-lun').handler()
+  await settle()
+  const picker = openWindow()
+  ok('kind: the block panel opens the same LUN picker the rows use',
+    !!picker && /iSCSI LUN/.test(picker.title || ''), picker && picker.title)
+  picker.down('#lunGrid').selectRow(0)
+  picker.buttonCmps.find(b => b.cls === 'anas-btn-backup-lun-select').handler()
+  await settle()
+
+  const outHtml = wiz.down('#blockLunOut').html || ''
+  ok("kind: the pick's facts are on screen (name, full IQN, LUN number, path)",
+    outHtml.includes(LUN_SOURCES[0].name)
+    && outHtml.includes(LUN_SOURCES[0].targetIqn)
+    && outHtml.includes('LUN 0')
+    && outHtml.includes(LUN_SOURCES[0].path), outHtml)
+  ok('kind: the snapshot consistency chip comes with the pick',
+    /snapshot/.test(outHtml), outHtml)
+  eq('kind: the backup-id is DERIVED from the serial (shared lunBackupId)',
+    wiz.down('#backupId').getValue(), lunBackupId(LUN_SOURCES[0].serial))
+  ok('kind: …and the field locks — the group IS the LUN',
+    wiz.down('#backupId').readOnly === true)
+  eq('kind: the archive name is the fixed block name (shared BLOCK_ARCHIVE_NAME)',
+    wiz.down('#blockArchiveName').getValue(), BLOCK_ARCHIVE_NAME)
+  ok('kind: the archive name is shown, not editable',
+    wiz.down('#blockArchiveName').readOnly === true)
+
+  jobs.length = 0
+  wiz.down('#name').setValue('lun-disk')
+  wiz.down('#schedule').setValue('daily')
+  wiz.down('#taskSubmitBtn').handler(wiz.down('#taskSubmitBtn'))
+  await settle()
+  ok('kind: a block create POSTs one task', jobs.length === 1
+    && jobs[0].method === 'post' && jobs[0].path === '/backup/tasks',
+    JSON.stringify(jobs[0] && [jobs[0].method, jobs[0].path]))
+  if (jobs.length) {
+    const body = jobs[0].body
+    eq('kind: …claiming to be block', body.kind, 'block')
+    eq('kind: …with the id derived from the pick', body.backupId, lunBackupId(LUN_SOURCES[0].serial))
+    eq("kind: …with the single img archive at the LUN's path", body.archives, [{
+      name: BLOCK_ARCHIVE_NAME,
+      path: LUN_SOURCES[0].path,
+      excludes: [],
+      kind: 'img',
+      lun: { targetIqn: LUN_SOURCES[0].targetIqn, index: LUN_SOURCES[0].index },
+    }])
+    eq('kind: …with no change detection (a block task stores the default)',
+      [body.changeDetectionMode, body.mode], ['default', 'default'])
+  }
+
+  // --- 2. Files names: derived from the path at creation, shown not editable ---
+  created.windows.length = 0
+  ANAS.backup.openNewTask(view, 'harness', null)
+  await settle()
+  wiz = openWindow()
+  let rows = archiveRows(wiz)
+  eq('kind: the files wizard opens on the suggested etc row', rows.length, 1)
+  ok('kind: the archive name is shown, not typed', rows[0].down('#archName').readOnly === true)
+
+  // The suggested row came in NAMED: re-typing its path does not re-name it.
+  rows[0].down('#archPath').setValue('/var/log')
+  await settle()
+  eq('kind: a named row keeps its name when its path moves',
+    rows[0].down('#archName').getValue(), 'etc')
+
+  const add = findCmp(wiz, 'anas-btn-backup-arch-add')
+  add.handler(add)
+  await settle()
+  rows = archiveRows(wiz)
+  let r = rows[1]
+  r.down('#archPath').setValue('/mnt/pictures/raw')
+  await settle()
+  eq("kind: an unnamed row takes the path's last segment (shared deriveArchiveName)",
+    r.down('#archName').getValue(), deriveArchiveName('/mnt/pictures/raw', ['etc']))
+  r.down('#archPath').setValue('/etc')
+  await settle()
+  eq('kind: a taken name is auto-suffixed', r.down('#archName').getValue(), 'etc-2')
+
+  add.handler(add)
+  await settle()
+  rows = archiveRows(wiz)
+  r = rows[2]
+  r.down('#archPath').setValue('/mnt/my-dir!')
+  await settle()
+  eq('kind: non-archive characters are sanitised', r.down('#archName').getValue(), 'my-dir_')
+
+  add.handler(add)
+  await settle()
+  rows = archiveRows(wiz)
+  r = rows[3]
+  r.down('#archKind').setValue('img')
+  await settle()
+  r.down('#archPath').setValue('/tank/images/lun2.raw')
+  await settle()
+  eq('kind: an image row derives the same way (the name, not the kind, is the key)',
+    r.down('#archName').getValue(), 'lun2.raw')
+
+  // --- 3. An edit never re-derives a stored name (it is the detection key) ---
+  grid.selectRow(0)
+  let editDlg = await openEdit(grid)
+  const erows = archiveRows(editDlg)
+  erows[0].down('#archPath').setValue('/mnt/elsewhere')
+  await settle()
+  eq('kind: a stored archive name survives its path moving',
+    erows[0].down('#archName').getValue(), 'pictures')
+
+  // The same dialog: TASK carries one pre-block image archive — the note
+  // names it and points at the shape it should become.
+  const note = editDlg.down('#filesLegacyNote')
+  ok('kind: a files task with image archive(s) shows the legacy note',
+    !!note && /image archive/i.test(note.html || ''), note && note.html)
+  ok('kind: …pointing at one block task per LUN',
+    !!note && /block task/.test(note.html || ''), note && note.html)
+  editDlg.close()
+  await settle()
+
+  // --- 4. A stored block task: edits as block, the id editable, name stored ---
+  grid.selectRow(1)
+  editDlg = await openEdit(grid)
+  ok('kind: a stored-block task edits as block',
+    /Edit Backup Task/.test(editDlg.title || '') && editDlg.down('#blockPanel').hidden === false)
+  ok('kind: …with no kind choice (the task is what it is)',
+    editDlg.down('#kindGroup').hidden === true)
+  eq('kind: the block archive name stays the stored one',
+    editDlg.down('#blockArchiveName').getValue(), BLOCK_ARCHIVE_NAME)
+  eq('kind: the stored id is shown', editDlg.down('#backupId').getValue(), BLOCK_TASK.backupId)
+  ok("kind: …and editable on an edit (the daemon's guard says what it may become)",
+    editDlg.down('#backupId').readOnly === false)
+  await settle()
+  ok('kind: the stored pick re-resolves against the LUN list (live name on screen)',
+    (editDlg.down('#blockLunOut').html || '').includes(LUN_SOURCES[0].name),
+    editDlg.down('#blockLunOut').html)
+
+  jobs.length = 0
+  editDlg.down('#taskSubmitBtn').handler(editDlg.down('#taskSubmitBtn'))
+  await settle()
+  ok('kind: an untouched stored-block edit PUTs the whole task', jobs.length === 1
+    && jobs[0].method === 'put' && jobs[0].path === '/backup/tasks/lun-disk',
+    JSON.stringify(jobs[0] && [jobs[0].method, jobs[0].path]))
+  if (jobs.length) {
+    const body = jobs[0].body
+    eq('kind: …sending its stored kind back verbatim', body.kind, 'block')
+    eq('kind: …with the stored archive unchanged', body.archives, BLOCK_TASK.archives)
+    eq('kind: …with the stored id', body.backupId, BLOCK_TASK.backupId)
+  }
+
+  // A re-pick is a different source: the record and the path follow the pick,
+  // the stored name stays.
+  editDlg.down('#blockLunChoose').handler()
+  await settle()
+  const picker2 = openWindow()
+  picker2.down('#lunGrid').selectRow(1)
+  picker2.buttonCmps.find(b => b.cls === 'anas-btn-backup-lun-select').handler()
+  await settle()
+  jobs.length = 0
+  editDlg.down('#taskSubmitBtn').handler(editDlg.down('#taskSubmitBtn'))
+  await settle()
+  if (jobs.length) {
+    const body = jobs[0].body
+    eq('kind: a re-pick re-points the archive at the new LUN', body.archives, [{
+      name: BLOCK_ARCHIVE_NAME,
+      path: LUN_SOURCES[1].path,
+      excludes: [],
+      kind: 'img',
+      lun: { targetIqn: LUN_SOURCES[1].targetIqn, index: LUN_SOURCES[1].index },
+    }])
+    eq('kind: …and the stored id rides back as-is (the daemon says what it may become)',
+      body.backupId, BLOCK_TASK.backupId)
+  }
+  editDlg.close()
+  await settle()
+
+  // --- 5. A pre-backup2.9 LUN task: edits as block, sends NO kind -----------
+  grid.selectRow(2)
+  editDlg = await openEdit(grid)
+  ok('kind: a pre-backup2.9 single-image task edits as block',
+    /Edit Backup Task/.test(editDlg.title || '') && editDlg.down('#blockPanel').hidden === false)
+  ok('kind: …with no kind choice', editDlg.down('#kindGroup').hidden === true)
+  eq('kind: the archive name is the stored one — NOT the fixed block name',
+    editDlg.down('#blockArchiveName').getValue(), 'lun0')
+  eq('kind: the hand-chosen id is shown', editDlg.down('#backupId').getValue(), 'vmstore')
+  await settle()
+  ok('kind: its stored pick re-resolves too',
+    (editDlg.down('#blockLunOut').html || '').includes(LUN_SOURCES[0].name),
+    editDlg.down('#blockLunOut').html)
+
+  jobs.length = 0
+  editDlg.down('#taskSubmitBtn').handler(editDlg.down('#taskSubmitBtn'))
+  await settle()
+  if (jobs.length) {
+    const body = jobs[0].body
+    ok('kind: an untouched legacy LUN edit sends NO `kind` key — its id and group survive',
+      !('kind' in body), JSON.stringify(body))
+    eq('kind: …with the hand-chosen id verbatim', body.backupId, 'vmstore')
+    eq('kind: …with the stored archive verbatim', body.archives, LEGACY_LUN_TASK.archives)
+  }
+  editDlg.close()
+  await settle()
+
+  ok('kind: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 // ============================================================================
@@ -2968,12 +3322,32 @@ const LUN_BACKUP_TASKS = {
       nextRunAt: null,
       overdue: false,
     },
+    {
+      // backup2.9 — covers LUN 2 ONLY by the serial in its backup-id: it has
+      // no `lun` record, and its path is not the LUN's backing path (the
+      // backing moved under the LUN — the GT-40 shape the serial exists for).
+      // The only possible match is `lun-<this LUN's unit serial>`, the group
+      // the wizard derives for every new block task.
+      task: {
+        name: 'vol2-block',
+        repository: 'pbs-main',
+        backupId: 'lun-12121212-3434-5656-7878-9a9a9a9a9a9a',
+        kind: 'block',
+        archives: [{ name: 'disk', path: '/dev/zvol/elsewhere/vol2', excludes: [], kind: 'img' }],
+        schedule: 'daily',
+        enabled: true,
+      },
+      lastRunResult: 'success',
+      lastRunAt: '2026-08-27T04:00:00Z',
+      nextRunAt: null,
+      overdue: false,
+    },
   ],
 }
 
-/** The section's target: the usual two LUNs plus a THIRD, uncovered one whose
- * name is free text — a SCSI model string — the archive-name rule must
- * sanitise. */
+/** The section's target: the usual two LUNs, a THIRD covered ONLY by the
+ * serial in a backup-id (backup2.9), and a FOURTH, uncovered one — the wizard
+ * door's target (the door is for exactly these). */
 function lunsDetail(opts = {}) {
   const base = iscsiDetail(opts)
   base.luns.push({
@@ -2991,30 +3365,95 @@ function lunsDetail(opts = {}) {
     pool: 'tank',
     dataset: 'tank/vol2',
   })
+  base.luns.push({
+    index: 3,
+    name: 'vmdisk 4',
+    kind: 'zvol',
+    plugin: 'block',
+    backingPath: '/dev/zvol/tank/vol3',
+    size: 2 * GiB_,
+    serial: '34343434-5656-7878-9a9a-1b1b1b1b1b1b',
+    attributes: { emulateTpu: true, emulateTpws: true, blockSize: 512, writeBack: false, maxUnmapLbaCount: 524288 },
+    connectedInitiators: [],
+    present: true,
+    backingExists: true,
+    pool: 'tank',
+    dataset: 'tank/vol3',
+  })
+  base.lunCount = base.luns.length
   return base
 }
 
-/** The wizard's LUN picker, in this section's sandbox: the uncovered LUN. */
+/** The wizard's LUN picker, in this section's sandbox: every backup-eligible
+ * LUN of the ANAS target — the door's re-resolution (and the fail-open
+ * re-resolution) needs its pre-selected LUN in the list, as it always is on
+ * the node. */
 const LUN_BACKUP_SOURCES = {
   data: {
     installed: true,
-    luns: [{
-      targetIqn: ISCSI_IQN,
-      index: 2,
-      name: 'vmdisk 3',
-      kind: 'zvol',
-      path: '/dev/zvol/tank/vol2',
-      serial: '12121212-3434-5656-7878-9a9a9a9a9a9a',
-      size: 4 * GiB_,
-      backingExists: true,
-      consistency: {
-        consistency: 'snapshot',
-        reason: '/dev/zvol/tank/vol2 is the ZFS volume tank/vol2; the run snapshots the volume and reads the snapshot device',
-        backend: 'zfs',
-        target: 'tank/vol2',
-        zvolDevice: '/dev/zvol/tank/vol2',
+    luns: [
+      {
+        targetIqn: ISCSI_IQN,
+        index: 0,
+        name: 'vmdisk1',
+        kind: 'zvol',
+        path: '/dev/zvol/tank/vol1',
+        serial: '9bc6e907-6015-4267-be4f-5a0617cb3d71',
+        size: 2 * GiB_,
+        backingExists: true,
+        consistency: {
+          consistency: 'snapshot',
+          reason: '/dev/zvol/tank/vol1 is the ZFS volume tank/vol1; the run snapshots the volume and reads the snapshot device',
+          backend: 'zfs',
+          target: 'tank/vol1',
+          zvolDevice: '/dev/zvol/tank/vol1',
+        },
       },
-    }],
+      {
+        targetIqn: ISCSI_IQN,
+        index: 1,
+        name: 'vmdisk2',
+        kind: 'file',
+        path: '/tank/images/vmdisk2.raw',
+        serial: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        size: GiB_,
+        backingExists: true,
+      },
+      {
+        targetIqn: ISCSI_IQN,
+        index: 2,
+        name: 'vmdisk 3',
+        kind: 'zvol',
+        path: '/dev/zvol/tank/vol2',
+        serial: '12121212-3434-5656-7878-9a9a9a9a9a9a',
+        size: 4 * GiB_,
+        backingExists: true,
+        consistency: {
+          consistency: 'snapshot',
+          reason: '/dev/zvol/tank/vol2 is the ZFS volume tank/vol2; the run snapshots the volume and reads the snapshot device',
+          backend: 'zfs',
+          target: 'tank/vol2',
+          zvolDevice: '/dev/zvol/tank/vol2',
+        },
+      },
+      {
+        targetIqn: ISCSI_IQN,
+        index: 3,
+        name: 'vmdisk 4',
+        kind: 'zvol',
+        path: '/dev/zvol/tank/vol3',
+        serial: '34343434-5656-7878-9a9a-1b1b1b1b1b1b',
+        size: 2 * GiB_,
+        backingExists: true,
+        consistency: {
+          consistency: 'snapshot',
+          reason: '/dev/zvol/tank/vol3 is the ZFS volume tank/vol3; the run snapshots the volume and reads the snapshot device',
+          backend: 'zfs',
+          target: 'tank/vol3',
+          zvolDevice: '/dev/zvol/tank/vol3',
+        },
+      },
+    ],
   },
 }
 
@@ -3037,11 +3476,22 @@ async function openLunBackupView(routes) {
   return { ANAS, view, grid: view.down('#iscsiGrid') }
 }
 
+/**
+ * Select the picker row for a LUN NUMBER. The list holds every eligible LUN,
+ * so the row position is not the LUN number — the number is the address.
+ */
+function lunPickerSelect(picker, idx) {
+  const grid = picker.down('#lunGrid')
+  const pos = grid.getStore().getRange().findIndex(r => r.get('index') === idx)
+  if (pos >= 0) { grid.selectRow(pos) }
+  return pos
+}
+
 async function lunBackupBadgeChecks() {
   ajax.responses = { '/network': PVE_NETWORK }
   const { grid } = await openLunBackupView(LUN_BACKUP_ROUTES)
   const lunsWin = await openLuns(grid, LUN_BACKUP_ROUTES)
-  ok('lunbackup: the window opened with three LUNs', !!lunsWin && lunsWin.down('#lunsGrid').getStore().getCount() === 3)
+  ok('lunbackup: the window opened with four LUNs', !!lunsWin && lunsWin.down('#lunsGrid').getStore().getCount() === 4)
   if (!lunsWin) { return }
   const lunsGrid = lunsWin.down('#lunsGrid')
   await settle()
@@ -3051,6 +3501,7 @@ async function lunBackupBadgeChecks() {
   const r0 = lunsGrid.getStore().getAt(0)
   const r1 = lunsGrid.getStore().getAt(1)
   const r2 = lunsGrid.getStore().getAt(2)
+  const r3 = lunsGrid.getStore().getAt(3)
 
   eq('lunbackup: LUN 0 is covered by the task whose archive records it',
     r0.get('backupBy'),
@@ -3061,22 +3512,30 @@ async function lunBackupBadgeChecks() {
       { name: 'vmstore-luns', lastRunResult: 'success', lastRunAt: '2026-08-27T02:00:00Z' },
       { name: 'repointed', lastRunResult: 'failure', lastRunAt: '2026-08-26T03:00:00Z' },
     ])
+  eq('lunbackup: LUN 2 is covered ONLY by the serial in the task\'s backup-id (no record, no path match)',
+    r2.get('backupBy'),
+    [{ name: 'vol2-block', lastRunResult: 'success', lastRunAt: '2026-08-27T04:00:00Z' }])
   eq('lunbackup: an uncovered LUN is an EMPTY list — "known and none", not unknown',
-    r2.get('backupBy'), [])
+    r3.get('backupBy'), [])
 
   const cell0 = byCol.renderer(r0.get('backupBy'), {}, r0)
   ok('lunbackup: the covered cell names the task and its last result',
     /vmstore-luns/.test(cell0) && /success/.test(cell0), cell0)
   ok('lunbackup: a pxar-only task never badges a LUN', !/pictures/.test(cell0), cell0)
+  ok('lunbackup: a serial on ANOTHER LUN never matches (the id is the LUN\'s own)',
+    !/vol2-block/.test(cell0), cell0)
   const cell1 = byCol.renderer(r1.get('backupBy'), {}, r1)
   ok('lunbackup: both covering tasks are named, each with its OWN result',
     /vmstore-luns/.test(cell1) && /repointed/.test(cell1) && /failure/.test(cell1), cell1)
   ok('lunbackup: a record on another target never matches on index alone',
     !/other-lun/.test(cell1), cell1)
+  const cell2 = byCol.renderer(r2.get('backupBy'), {}, r2)
+  ok('lunbackup: the serial-matched cell names the task and its last result',
+    /vol2-block/.test(cell2) && /success/.test(cell2), cell2)
   ok('lunbackup: an uncovered LUN reads "not backed up"',
-    /not backed up/.test(byCol.renderer(r2.get('backupBy'), {}, r2)))
+    /not backed up/.test(byCol.renderer(r3.get('backupBy'), {}, r3)))
   ok('lunbackup: a failed read renders NOTHING — unknown is not "not backed up"',
-    byCol.renderer(undefined, {}, r2) === '' && byCol.renderer(null, {}, r2) === '')
+    byCol.renderer(undefined, {}, r3) === '' && byCol.renderer(null, {}, r3) === '')
 
   ok('lunbackup: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
@@ -3126,16 +3585,18 @@ async function lunBackupMenuChecks() {
     items.map(i => i.text),
     ['Run task vmstore-luns now', 'Edit task vmstore-luns…', 'Run task repointed now', 'Edit task repointed…'])
 
-  // --- LUN 2: uncovered — the wizard door, and body identity ---------------
-  lunsGrid.selectRow(2)
+  // --- LUN 3: uncovered — the wizard door, and body identity ---------------
+  lunsGrid.selectRow(3)
   ok('lunbackup: live on an uncovered LUN — the door is for exactly these',
     btn.disabled === false)
   items = (btn.menu && btn.menu.items) || []
   eq('lunbackup: an uncovered LUN offers the wizard door',
     items.map(i => i.text), ['Create backup task…'])
 
-  // Flow A — a MANUAL LUN pick in the plain New Task wizard: add a row, set
-  // the kind, pick the LUN through the wizard's own picker, type the name.
+  const LUN3 = { serial: '34343434-5656-7878-9a9a-1b1b1b1b1b1b', path: '/dev/zvol/tank/vol3' }
+
+  // Flow A — a MANUAL block pick in the plain New Task wizard: the kind is
+  // chosen, then the LUN through the block panel's own picker.
   created.windows.length = 0
   jobs.length = 0
   ANAS.backup.openNewTask(view, 'harness', null)
@@ -3143,70 +3604,77 @@ async function lunBackupMenuChecks() {
   let wiz = openWindow()
   ok('lunbackup: the plain door opens the NEW-task wizard',
     !!wiz && /New Backup Task/.test(wiz.title || ''), wiz && wiz.title)
-  let rows = archiveRows(wiz)
-  eq('lunbackup: the plain door opens on the suggested etc row', rows.length, 1)
-  findCmp(wiz, 'anas-btn-backup-arch-add').handler()
+  wiz.down('#kindGroup').setValue('block')
   await settle()
-  rows = archiveRows(wiz)
-  eq('lunbackup: "Add archive" grew the row list', rows.length, 2)
-  const mrow = rows[1]
-  mrow.down('#archKind').setValue('img')
-  await settle()
-  findCmp(mrow, 'anas-btn-backup-arch-lun').handler()
+  ok('lunbackup: the plain door SHOWS the kind choice (skipping it is the door\'s)',
+    wiz.down('#kindGroup').hidden === false && wiz.down('#blockPanel').hidden === false)
+  findCmp(wiz, 'anas-btn-backup-block-lun').handler()
   await settle()
   const picker = openWindow()
   ok('lunbackup: the manual door is the wizard\'s own LUN picker',
     !!picker && /iSCSI LUN/.test(picker.title || ''), picker && picker.title)
-  picker.down('#lunGrid').selectRow(0)
+  eq('lunbackup: the picker listed every eligible LUN of the target',
+    picker.down('#lunGrid').getStore().getCount(), 4)
+  eq('lunbackup: …and the door\'s LUN is selectable', lunPickerSelect(picker, 3), 3)
   picker.buttonCmps.find(b => b.cls === 'anas-btn-backup-lun-select').handler()
   await settle()
-  eq('lunbackup: the pick fills the path', mrow.down('#archPath').getValue(), '/dev/zvol/tank/vol2')
-  eq('lunbackup: …and records the LUN at that path',
-    [mrow.anasLun, mrow.anasLunPath],
-    [{ targetIqn: ISCSI_IQN, index: 2 }, '/dev/zvol/tank/vol2'])
-  mrow.down('#archName').setValue('vmdisk-3')
-  wiz.down('#name').setValue('lun2-manual')
+  eq('lunbackup: the pick derives the backup-id from the serial (shared lunBackupId)',
+    wiz.down('#backupId').getValue(), lunBackupId(LUN3.serial))
+  ok('lunbackup: …and locks it (the group IS the LUN)', wiz.down('#backupId').readOnly === true)
+  wiz.down('#name').setValue('lun3-manual')
   wiz.down('#schedule').setValue('daily')
   wiz.down('#taskSubmitBtn').handler(wiz.down('#taskSubmitBtn'))
   await settle()
-  eq('lunbackup: the manual wizard POSTs its archives',
+  eq('lunbackup: the manual wizard POSTs its block task',
     jobs.length === 1 ? [jobs[0].method, jobs[0].path] : null, ['post', '/backup/tasks'])
-  const manualArchive = jobs.length
-    ? jobs[0].body.archives.find(a => a.path === '/dev/zvol/tank/vol2')
-    : null
-  ok('lunbackup: the manual pick sent its archive', !!manualArchive, JSON.stringify(jobs[0] && jobs[0].body))
+  const manualBody = jobs.length ? jobs[0].body : null
+  eq('lunbackup: the manual block pick carries the single disk archive',
+    manualBody && manualBody.archives, [{
+      name: BLOCK_ARCHIVE_NAME,
+      path: LUN3.path,
+      excludes: [],
+      kind: 'img',
+      lun: { targetIqn: ISCSI_IQN, index: 3 },
+    }])
 
-  // Flow B — the LUN toolbar's door: the SAME wizard, pre-filled.
+  // Flow B — the LUN toolbar's door: the SAME wizard, the choice skipped and
+  // the LUN pre-selected.
   created.windows.length = 0
   jobs.length = 0
-  lunsGrid.selectRow(2) // the menu is rebuilt on selection
+  lunsGrid.selectRow(3) // the menu is rebuilt on selection
   items = (btn.menu && btn.menu.items) || []
   items[0].handler()
   await settle()
   wiz = openWindow()
   ok('lunbackup: the door opens the NEW-task wizard',
     !!wiz && /New Backup Task/.test(wiz.title || ''), wiz && wiz.title)
-  rows = archiveRows(wiz)
-  eq('lunbackup: pre-filled with exactly ONE archive row', rows.length, 1)
-  const row = rows[0]
-  eq('lunbackup: Kind = Block image', row.down('#archKind').getValue(), 'img')
-  eq('lunbackup: the path is the LUN\'s backing path', row.down('#archPath').getValue(), '/dev/zvol/tank/vol2')
-  eq('lunbackup: the name is the LUN name, sanitised to the wizard\'s rule',
-    row.down('#archName').getValue(), 'vmdisk-3')
-  eq('lunbackup: the LUN record rides with the path, as a manual pick records it',
-    [row.anasLun, row.anasLunPath],
-    [{ targetIqn: ISCSI_IQN, index: 2 }, '/dev/zvol/tank/vol2'])
-  wiz.down('#name').setValue('lun2-prefilled')
+  ok('lunbackup: the door SKIPS the kind choice (the toolbar already said block)',
+    wiz.down('#kindGroup').hidden === true)
+  ok('lunbackup: …and opens on the block panel, the files panel off',
+    wiz.down('#blockPanel').hidden === false && wiz.down('#filesPanel').hidden === true)
+  const doorHtml = wiz.down('#blockLunOut').html || ''
+  ok('lunbackup: the LUN is pre-selected, re-resolved against the node\'s list',
+    doorHtml.includes('vmdisk 4') && doorHtml.includes(ISCSI_IQN)
+    && doorHtml.includes('LUN 3') && doorHtml.includes(LUN3.path), doorHtml)
+  eq('lunbackup: …and the id derives from its serial (shared lunBackupId)',
+    [wiz.down('#backupId').getValue(), wiz.down('#backupId').readOnly],
+    [lunBackupId(LUN3.serial), true])
+  eq('lunbackup: the archive name is the fixed block name (shared BLOCK_ARCHIVE_NAME)',
+    wiz.down('#blockArchiveName').getValue(), BLOCK_ARCHIVE_NAME)
+  wiz.down('#name').setValue('lun3-prefilled')
   wiz.down('#schedule').setValue('daily')
   wiz.down('#taskSubmitBtn').handler(wiz.down('#taskSubmitBtn'))
   await settle()
-  eq('lunbackup: the pre-filled wizard POSTs exactly its one archive',
-    jobs.length === 1 ? jobs[0].body.archives.length : null, 1)
+  ok('lunbackup: the pre-filled wizard POSTs one task', jobs.length === 1
+    && jobs[0].method === 'post' && jobs[0].path === '/backup/tasks',
+    JSON.stringify(jobs[0] && [jobs[0].method, jobs[0].path]))
 
   // The point of the door: the pre-filled body is BYTE-IDENTICAL to the
-  // manual pick's — same code path, one archive.
-  eq('lunbackup: the pre-filled archive body is deep-equal to the manual LUN pick',
-    jobs.length ? jobs[0].body.archives[0] : null, manualArchive)
+  // manual block pick's — same code path, one archive. Only the name the
+  // harness types differs.
+  eq('lunbackup: the pre-filled body is deep-equal to the manual block pick',
+    jobs.length ? jobs[0].body : null,
+    manualBody ? { ...manualBody, name: 'lun3-prefilled' } : null)
 
   ok('lunbackup: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
@@ -3236,11 +3704,13 @@ async function lunBackupFailOpenChecks() {
   items[0].handler()
   await settle()
   const wiz = openWindow()
-  const rows = wiz ? archiveRows(wiz) : []
-  ok('lunbackup(fail-open): the wizard opens on the LUN\'s archive',
-    !!wiz && rows.length === 1 && rows[0].down('#archPath').getValue() === '/dev/zvol/tank/vol1')
-  eq('lunbackup(fail-open): …with the LUN\'s record',
-    rows.length ? rows[0].anasLun : null, { targetIqn: ISCSI_IQN, index: 0 })
+  ok('lunbackup(fail-open): the wizard opens on the BLOCK panel — the door is unchanged',
+    !!wiz && wiz.down('#blockPanel').hidden === false && wiz.down('#kindGroup').hidden === true)
+  const foHtml = wiz && (wiz.down('#blockLunOut').html || '')
+  ok('lunbackup(fail-open): …with the LUN re-resolved from its record (live name on screen)',
+    !!wiz && foHtml.includes(ISCSI_IQN) && foHtml.includes('vmdisk1') && foHtml.includes('LUN 0'), foHtml)
+  eq('lunbackup(fail-open): …and the id derives from its serial (shared lunBackupId)',
+    wiz && wiz.down('#backupId').getValue(), lunBackupId('9bc6e907-6015-4267-be4f-5a0617cb3d71'))
 
   ok('lunbackup(fail-open): nothing warned — fail-open is silent',
     warnings.length === 0, warnings.join(' | '))
@@ -4609,6 +5079,8 @@ warnings.length = 0
 await imageKindChecks()
 warnings.length = 0
 await lunPickerChecks()
+warnings.length = 0
+await backupTaskKindChecks()
 warnings.length = 0
 await poolImportChecks()
 warnings.length = 0

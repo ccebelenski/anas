@@ -21,10 +21,29 @@
  * dash, never an error.
  *
  *   GET /v1/backup/tasks → { data: TaskEntry[] }, each:
- *     { task, lastRunResult, lastRunAt, nextRunAt, overdue }
+ *     { task, lastRunResult, lastRunAt, nextRunAt, overdue,
+ *       lunName? (backup2.9 — BLOCK tasks only: the LUN's name READ LIVE from
+ *         the iSCSI read layer; the unit stores the record + the serial, never
+ *         the display name. null = the read layer cannot resolve it right now
+ *         — a state to SHOW, not a dash. Absent for files tasks and on older
+ *         daemons) }
  *     task = { name, repository (repo NAME; alias `repo`), datastore? (else joined
  *              from the repos list), namespace?, backupId (alias `backup-id`/
- *              `backupID`), archives:[{name, path, excludes:[],
+ *              `backupID`),
+ *              kind? (backup2.9 — 'files'|'block', the STORED value; ABSENT on
+ *              a unit written before this story, exactly as the archive's kind.
+ *              The EFFECTIVE kind is derived: exactly one img archive is a
+ *              block task, everything else is files — and a derived files task
+ *              that still carries image archive(s) is the legacy shape the
+ *              wizard's note points at. A send may carry `kind: 'block'` ONLY
+ *              for a task whose unit stored it: that is what keeps a
+ *              pre-backup2.9 LUN task's hand-chosen id and PBS group, which
+ *              the daemon's serial guard would otherwise refuse),
+ *              archives:[{name, path, excludes:[],
+                kind? ('pxar'|'img' — backup2.4; ABSENT means 'pxar'),
+                lun? ({ targetIqn, index } — backup2.4 — the LUN an img source
+                  was picked as; display + restore truth, the path is still
+                  the source),
                 includeNested? ('none'|'all'|[absolute paths] — backup2.2;
                   ABSENT means 'none', the client's own behaviour, and the
                   dialog NEVER writes a default on an untouched save)}],
@@ -84,10 +103,16 @@
  *   PUT  /v1/backup/tasks/:name      body TaskWrite (edit/toggle) → 202 { job }
  *   DELETE /v1/backup/tasks/:name    (units removed; PBS data untouched) → 202/409
  *   POST /v1/backup/tasks/:name/run  (Run Now; job carries progress) → 202 { job }
- *     TaskWrite = { name, repository, namespace?, backupId, archives, mode
- *       (=changeDetectionMode), retention?, notify, enabled, and EITHER `cadence`
- *       (structured — the daemon derives the OnCalendar; this view never
- *       generates one) OR `schedule` (the raw expression, for the Custom kind)}.
+ *     TaskWrite = { name, repository, namespace?, backupId,
+ *       kind? (backup2.9 — 'block' for a NEW block task, or for an edit of a
+ *         task whose UNIT STORED it; never 'files' — absent IS the files
+ *         default, so a files task stays byte-identical on every save, and a
+ *         pre-backup2.9 LUN task keeps its id + group), archives,
+ *       mode (=changeDetectionMode — a block task sends 'default': the control
+ *         does not exist for one), retention?, notify, enabled, and EITHER
+ *       `cadence` (structured — the daemon derives the OnCalendar; this view
+ *       never generates one) OR `schedule` (the raw expression, for the
+ *       Custom kind)}.
  *     The finished job's `result` may carry `prune` ({group, namespace?, dryRun,
  *       kept, removed, protectedCount, snapshots[]}) and `warnings[]` — a prune
  *       that failed AFTER a successful backup is a WARNING on a COMPLETED job,
@@ -121,14 +146,19 @@
  * 'anas-btn-backup-refresh' / '-new' / '-repos' / '-run' / '-edit' / '-toggle' /
  * '-delete' / '-details'; detail window 'anas-win-backup-detail' (body
  * 'anas-backup-detail', reload 'anas-btn-backup-detail-reload'); task window
- * 'anas-win-backup-task' (submit 'anas-btn-backup-task-submit', archives
- * 'anas-backup-archives', per-row path browse 'anas-btn-backup-arch-browse',
- * per-row nested choice 'anas-fld-backup-arch-nested' with its path list
+ * 'anas-win-backup-task' (submit 'anas-btn-backup-task-submit', task-kind
+ * choice 'anas-fld-backup-kind' — backup2.9, hidden on edit and on a
+ * door-pre-filled block wizard; files panel 'anas-backup-files' (archives
+ * 'anas-backup-archives', legacy note 'anas-backup-legacy-note', per-row path
+ * browse 'anas-btn-backup-arch-browse', per-row nested choice
+ * 'anas-fld-backup-arch-nested' with its path list
  * 'anas-fld-backup-arch-nested-paths' and inline alert
- * 'anas-backup-arch-nested-alert',
- * per-row kind 'anas-fld-backup-arch-kind' with its name suffix
- * 'anas-backup-arch-suffix', LUN button 'anas-btn-backup-arch-lun' and image
- * note 'anas-backup-arch-image-note'; LUN picker 'anas-win-backup-lun-picker'
+ * 'anas-backup-arch-nested-alert', per-row kind 'anas-fld-backup-arch-kind'
+ * with its name suffix 'anas-backup-arch-suffix', LUN button
+ * 'anas-btn-backup-arch-lun' and image note 'anas-backup-arch-image-note');
+ * block panel 'anas-backup-block' (backup2.9 — LUN facts
+ * 'anas-backup-block-lun', choose button 'anas-btn-backup-block-lun', archive
+ * name 'anas-fld-backup-block-name'); LUN picker 'anas-win-backup-lun-picker'
  * (grid 'anas-grid-backup-lun-picker', select 'anas-btn-backup-lun-select');
  * schedule fieldset 'anas-backup-schedule' with 'anas-fld-backup-cadence' /
  * '-day' / '-single-day' / '-parity' / '-time' / '-schedule');
@@ -361,6 +391,82 @@
     /** `<target> LUN <n>` — the LUN identity, spelled out, never truncated. */
     function lunLabel(lun) {
         return lun ? (lun.targetIqn + '  ' + t('LUN') + ' ' + lun.index) : '';
+    }
+
+    // ---- Task kind (backup2.9) ---------------------------------------------
+    //
+    // A task is FILES (directory trees) or BLOCK (one iSCSI LUN as a whole
+    // image) — not a bag of archives with a mixed agenda. The stored kind is
+    // ABSENT on a unit written before this story, and the effective answer is
+    // derived exactly as the shared schema derives it (the harness pins the
+    // two): exactly one image archive is a block task, everything else is
+    // files — and a derived files task that still carries image archive(s) is
+    // the legacy shape the wizard's note points at (one block task per LUN).
+    //
+    // Stored vs derived is what the edit dialog turns on: a STORED `block` is
+    // sent back on save, a derived one is not — which keeps a pre-backup2.9
+    // task's hand-chosen id and PBS group, the daemon's serial guard refusing
+    // exactly the send a derived task must not make.
+
+    /** The fixed archive name of a block task (mirrors the shared constant): the whole image IS the archive. */
+    var BLOCK_ARCHIVE_NAME = 'disk';
+
+    /** The backup-id a new block task gets: `lun-<SCSI unit serial>` (mirrors the shared helper). */
+    function lunBackupId(serial) {
+        return 'lun-' + serial;
+    }
+
+    /**
+     * The archive name a row gets when it is CREATED (mirrors the shared
+     * deriveArchiveName): the source path's last segment, sanitised to the
+     * archive-name charset, auto-suffixed `-2`, `-3`, … against the names the
+     * task already carries. A STORED name is never re-derived — the name is
+     * pbc's change-detection key, and re-deriving it (a path rename changing
+     * the last segment) would silently turn the next run into a full re-read.
+     */
+    function deriveArchiveName(path, taken) {
+        var p = ('' + (path == null ? '' : path)).replace(/\/+$/, '');
+        var segments = p.split('/');
+        var last = '';
+        for (var i = 0; i < segments.length; i++) {
+            if (segments[i]) {
+                last = segments[i];
+            }
+        }
+        var base = last.replace(/[^\w.-]/g, '_');
+        if (!base) {
+            base = 'root'; // the path was `/` — take the filesystem's own name
+        }
+        var name = base;
+        var n = 2;
+        taken = taken || [];
+        while (taken.indexOf(name) >= 0) {
+            name = base + '-' + (n++);
+        }
+        return name.length > 128 ? name.substring(0, 128) : name;
+    }
+
+    /**
+     * The one answer to "what IS this task" (mirrors the shared
+     * effectiveTaskKind): the stored kind, or derived when the unit predates
+     * the field.
+     */
+    function taskKindOf(task) {
+        task = task || {};
+        var archives = archivesOf(task);
+        var imgCount = 0;
+        for (var i = 0; i < archives.length; i++) {
+            if (archiveKindOf(archives[i]) === 'img') {
+                imgCount++;
+            }
+        }
+        if (task.kind === 'block' || task.kind === 'files') {
+            return { kind: task.kind, legacyImgArchives: false };
+        }
+        if (archives.length === 1 && imgCount === 1) {
+            return { kind: 'block', legacyImgArchives: false };
+        }
+        return { kind: 'files', legacyImgArchives: imgCount > 0 };
     }
 
     // ---- Nested filesystems (backup2.2) ------------------------------------
@@ -669,6 +775,16 @@
             datastore: datastoreOf(task),
             namespace: first(task.namespace) || '',
             backupId: backupIdOf(task),
+            // backup2.9 — the EFFECTIVE kind (derived when the unit predates
+            // the field) and the LUN's live name for a block task. `lunName`
+            // stays `undefined` for files tasks (the daemon omits the key) so
+            // the renderer can tell "no LUN column for this shape" from a
+            // block task whose LUN no longer resolves (`null`). `storedKind`
+            // keeps the STORED value off by itself — the save must send that,
+            // never the derived answer.
+            kind: taskKindOf(task).kind,
+            storedKind: (task.kind === 'block' || task.kind === 'files') ? task.kind : undefined,
+            lunName: ('lunName' in entry) ? entry.lunName : undefined,
             archiveCount: archives.length,
             mode: modeOf(task),
             schedule: task.schedule,
@@ -695,6 +811,12 @@
             repository: rec.get('repository'),
             namespace: rec.get('namespace'),
             backupId: rec.get('backupId'),
+            // backup2.9 — the STORED kind only (`rec.get('kind')` is the
+            // effective answer: a derived-block task must not start claiming
+            // block on a save).
+            kind: (rec.get('storedKind') === 'block' || rec.get('storedKind') === 'files')
+                ? rec.get('storedKind')
+                : undefined,
             archives: [],
             changeDetectionMode: rec.get('mode'),
             schedule: rec.get('schedule'),
@@ -739,6 +861,34 @@
         }
         return '<span title="' + enc('host/' + id) + '" style="font-family:monospace;font-size:0.92em;">'
             + enc(id) + '</span>';
+    }
+
+    // backup2.9 — the effective kind. Block is the exceptional shape (the one
+    // with a LUN column beside it), so it wears the accent; files reads muted.
+    function renderKind(v) {
+        if (v === 'block') {
+            return pillHtml(t('block'), 'var(--anas-accent,#3468c0)',
+                t('a whole iSCSI LUN as one block image — one LUN per task'));
+        }
+        return '<span style="color:var(--anas-muted,gray);">' + enc(t('files')) + '</span>';
+    }
+
+    // backup2.9 — the LUN a block task backs up, by its LIVE name (it is
+    // display-only and never stored — read where it lives). Files tasks get a
+    // dash; a block task whose LUN no longer resolves says so, amber — a
+    // resolved-null is a state, not an absence of data.
+    function renderLunName(v, meta, rec) {
+        if (!rec || !rec.get || rec.get('kind') !== 'block') {
+            return '<span style="color:gray;">&mdash;</span>';
+        }
+        if (v === null) {
+            return '<span style="color:var(--anas-warn,#c9820b);">'
+                + enc(t('no longer resolvable')) + '</span>';
+        }
+        return '<span style="font-family:monospace;" title="'
+            + enc(t('The LUN this block task backs up — the name is read live and can change; '
+                + 'the backups are keyed to the LUN, not the name')) + '">'
+            + enc(v) + '</span>';
     }
 
     // Archive count → a labelled number (numbers get labeled context).
@@ -1203,10 +1353,16 @@
     function selectLun(win, rec, onSelect) {
         if (onSelect) {
             try {
+                // The path + record are what a row-level pick records; the
+                // serial, name and derived consistency ride along for the
+                // block panel (backup2.9) — the row caller ignores the extras.
                 onSelect({
                     targetIqn: '' + rec.get('targetIqn'),
                     index: rec.get('index'),
                     path: '' + rec.get('path'),
+                    serial: (rec.get('serial') == null) ? null : ('' + rec.get('serial')),
+                    name: '' + (rec.get('name') || ''),
+                    consistency: rec.get('consistency') || null,
                 });
             } catch (e) {
                 ANAS.warn('LUN select failed: ' + ANAS.errText(e));
@@ -1260,6 +1416,262 @@
                     + enc(t('Could not list iSCSI LUNs') + ': ' + ANAS.errText(err)) + '</div>');
             }
         );
+    }
+
+    // ---- Block panel (backup2.9) -------------------------------------------
+    //
+    // A block task's whole shape: one LUN, picked through the same LUN picker
+    // the archive rows use. The panel holds the pick's facts (name, target,
+    // index, path, the derived consistency chip) and drives the two derived
+    // identities — the fixed archive name and the `lun-<serial>` backup-id.
+    // A stored pick (an edit, or a door's pre-fill) is RE-RESOLVED against the
+    // node's LUN list: the name is display-only and read where it lives, and a
+    // LUN that is gone is a state the panel shows, not a silent pre-fill.
+
+    /**
+     * Set the block panel's LUN. `fromPicker` marks a just-made pick — its
+     * facts (incl. serial, name, consistency) are current, render straight
+     * away. Otherwise the facts are re-resolved against `GET /backup/lun-sources`
+     * (fail-open: an unanswered list keeps what is known, no chip).
+     */
+    function setBlockLun(win, lun, fromPicker) {
+        try {
+            if (!win || win.destroyed || win.destroying) {
+                return;
+            }
+            win.anasBlockLun = {
+                targetIqn: '' + (lun && lun.targetIqn ? lun.targetIqn : ''),
+                index: lun && lun.index !== undefined && lun.index !== null ? lun.index : 0,
+                path: '' + (lun && lun.path ? lun.path : ''),
+                serial: (lun && lun.serial == null) ? null : ('' + lun.serial),
+                name: '' + (lun && lun.name ? lun.name : ''),
+            };
+            win.anasBlockConsistency = (lun && lun.consistency) ? lun.consistency : null;
+            win.anasBlockStale = false;
+            if (fromPicker) {
+                renderBlockLun(win);
+                syncBlockIdValue(win);
+                syncTaskKind(win);
+                return;
+            }
+            loadBlockLunSources(win);
+        } catch (e) {
+            ANAS.warn('block LUN set failed: ' + ANAS.errText(e));
+        }
+    }
+
+    /** Re-resolve the current pick against the node's LUN list (see above). */
+    function loadBlockLunSources(win) {
+        var node = win.anasNode;
+        ANAS.api.get(node, '/backup/lun-sources').then(
+            function (res) {
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                var d = (res && res.data) || {};
+                var luns = isArray(d.luns) ? d.luns : [];
+                var seed = win.anasBlockLun;
+                var match = null;
+                var i;
+                // The record is the truth; the path is the fallback (an edit
+                // whose archive lost its record still names its source).
+                if (seed && seed.targetIqn) {
+                    for (i = 0; i < luns.length; i++) {
+                        var l = luns[i] || {};
+                        if (l.targetIqn === seed.targetIqn && Number(l.index) === Number(seed.index)) {
+                            match = l;
+                            break;
+                        }
+                    }
+                }
+                if (!match && seed && seed.path) {
+                    for (i = 0; i < luns.length; i++) {
+                        if ((luns[i] || {}).path === seed.path) {
+                            match = luns[i];
+                            break;
+                        }
+                    }
+                }
+                if (match) {
+                    win.anasBlockLun = {
+                        targetIqn: '' + match.targetIqn,
+                        index: match.index,
+                        path: '' + match.path,
+                        serial: (match.serial == null) ? null : ('' + match.serial),
+                        name: '' + (match.name || ''),
+                    };
+                    win.anasBlockConsistency = match.consistency || null;
+                    win.anasBlockStale = false;
+                } else if (seed && seed.path) {
+                    // The list answered and does not hold the LUN: shown, amber.
+                    win.anasBlockStale = true;
+                }
+                renderBlockLun(win);
+                syncBlockIdValue(win);
+                syncTaskKind(win);
+            },
+            function () {
+                // Fail-open: the list could not answer — keep the known facts,
+                // no chip, and no stale claim (we cannot say either way).
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                win.anasBlockStale = false;
+                renderBlockLun(win);
+                syncBlockIdValue(win);
+                syncTaskKind(win);
+            }
+        );
+    }
+
+    /** The picked LUN's facts on screen — or the "(no LUN chosen)" state. */
+    function renderBlockLun(win) {
+        try {
+            if (!win || win.destroyed || win.destroying) {
+                return;
+            }
+            var out = win.down('#blockLunOut');
+            if (!out) {
+                return;
+            }
+            var lun = win.anasBlockLun;
+            if (!lun || !lun.path) {
+                out.update('<div style="font-size:11px;color:var(--anas-muted,gray);">'
+                    + enc(t('No LUN chosen.')) + '</div>');
+                return;
+            }
+            var html = '<div style="font-size:12px;">'
+                + '<i class="fa fa-hdd-o" style="margin-right:5px;color:var(--anas-muted,gray);"></i>'
+                + enc(lun.name || t('unnamed LUN'))
+                + ' <span style="color:var(--anas-muted,gray);">—</span> '
+                + '<span style="font-family:monospace;" title="' + enc(t('Target IQN — never truncated')) + '">'
+                + enc(lun.targetIqn) + '</span>'
+                + ' <span style="color:var(--anas-muted,gray);">' + enc(t('LUN') + ' ' + lun.index) + '</span>';
+            var chip = lunConsistencyChip({ consistency: win.anasBlockConsistency });
+            if (chip) {
+                html += ' ' + chip;
+            }
+            html += '</div>';
+            html += '<div style="font-size:11px;color:var(--anas-muted,gray);margin-top:2px;">'
+                + '<span style="font-family:monospace;">' + enc(lun.path) + '</span>'
+                + (lun.serial
+                    ? ' <span title="' + enc(t('SCSI unit serial — the backup-id derives from it')) + '"></span>'
+                    : ' <span style="color:var(--anas-warn,#c9820b);">('
+                        + enc(t('serial not readable')) + ')</span>')
+                + '</div>';
+            if (win.anasBlockStale === true) {
+                html += '<div style="font-size:11px;color:var(--anas-warn,#c9820b);margin-top:2px;">'
+                    + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
+                    + enc(t('This LUN is not in the node\'s LUN list right now — saving will be '
+                        + 'refused until it resolves.'))
+                    + '</div>';
+            }
+            out.update(html);
+        } catch (e) {
+            ANAS.warn('block LUN render failed: ' + ANAS.errText(e));
+        }
+    }
+
+    /**
+     * The block task's backup-id: on a NEW task with a readable serial it
+     * DERIVES from the pick and goes read-only (the group IS the LUN). A
+     * serial the read layer cannot read leaves the field open — the daemon
+     * cannot verify an id it cannot read either, and a dead field would be the
+     * only way to create the task. An EDIT shows the stored id, always
+     * editable — the daemon's serial guard says what a stored-block id may
+     * become (a guiding 400 names the required id).
+     */
+    function syncBlockIdValue(win) {
+        try {
+            var f = win && win.down ? win.down('#backupId') : null;
+            if (!f) {
+                return;
+            }
+            var lun = win.anasBlockLun;
+            if (win.anasBlockNewId && lun && lun.serial) {
+                f.setValue(lunBackupId(lun.serial));
+            }
+        } catch (e) {
+            // the field stays as it was
+        }
+    }
+
+    /**
+     * The shape switch: which panel is on, and whether the id field is locked
+     * (new block task + a readable serial). The change-detection fieldset is
+     * part of the files shape — a block image has no mode to set.
+     */
+    function syncTaskKind(win) {
+        try {
+            if (!win || win.destroyed || win.destroying) {
+                return;
+            }
+            var kind = win.anasTaskKind === 'block' ? 'block' : 'files';
+            var files = win.down('#filesPanel');
+            var block = win.down('#blockPanel');
+            var modePanel = win.down('#modePanel');
+            var group = win.down('#kindGroup');
+            if (files) {
+                files.setVisible(kind === 'files');
+            }
+            if (block) {
+                block.setVisible(kind === 'block');
+            }
+            if (modePanel) {
+                modePanel.setVisible(kind === 'files');
+            }
+            if (group) {
+                group.setVisible(win.anasKindChoosable === true);
+            }
+            // A switch to the block shape must show its LUN state (fresh or
+            // "(no LUN chosen)"), not a blank panel.
+            if (kind === 'block') {
+                renderBlockLun(win);
+            }
+            var f = win.down('#backupId');
+            if (f && typeof f.setReadOnly === 'function') {
+                f.setReadOnly(kind === 'block' && win.anasBlockNewId === true
+                    && !!win.anasBlockLun && !!win.anasBlockLun.serial);
+            }
+        } catch (e) {
+            // non-fatal: the panels stay as they are
+        }
+    }
+
+    /**
+     * The one archive a block task sends. A NEW task is the fixed shape: the
+     * whole image under the fixed name, with the record of the LUN it was
+     * picked as. An EDIT keeps its STORED name verbatim (existing archives are
+     * never re-derived) and re-points only when a different LUN was picked —
+     * a re-pick is a different source, and the record follows the path.
+     */
+    function readBlockArchive(win) {
+        var lun = win.anasBlockLun;
+        if (!lun || !lun.path) {
+            return null;
+        }
+        if (!win.anasBlockStored) {
+            return {
+                name: BLOCK_ARCHIVE_NAME,
+                path: lun.path,
+                excludes: [],
+                kind: 'img',
+                lun: { targetIqn: lun.targetIqn, index: lun.index },
+            };
+        }
+        var stored = win.anasBlockStored;
+        var same = !!stored.lun
+            && stored.lun.targetIqn === lun.targetIqn
+            && Number(stored.lun.index) === Number(lun.index);
+        return {
+            name: stored.name || BLOCK_ARCHIVE_NAME,
+            path: same ? stored.path : lun.path,
+            excludes: [],
+            kind: 'img',
+            lun: same && stored.lun
+                ? { targetIqn: stored.lun.targetIqn, index: stored.lun.index }
+                : { targetIqn: lun.targetIqn, index: lun.index },
+        };
     }
 
     // CAS-aware repo writes go through the shared ANAS.casWrite (10-api.js) —
@@ -1371,10 +1783,14 @@
         runTaskByName(view, node, name);
     };
     ANAS.backup.openEditTask = function (view, node, task) {
-        openTaskDialog(view, node, task);
+        openTaskDialog(view, node, task, null, null);
     };
-    ANAS.backup.openNewTask = function (view, node, seedArchives) {
-        openTaskDialog(view, node, null, seedArchives);
+    // `preset` (backup2.9) is `{ kind: 'block', lun: { targetIqn, index, path,
+    // serial?, name? } }`: the LUN toolbar's door opens the wizard with the
+    // block panel ALREADY CHOSEN (the kind choice is skipped) and its LUN
+    // pre-selected. `seedArchives` stays for a plain files seed.
+    ANAS.backup.openNewTask = function (view, node, seedArchives, preset) {
+        openTaskDialog(view, node, null, seedArchives, preset);
     };
 
     // ---- Toolbar state -----------------------------------------------------
@@ -1797,11 +2213,24 @@
         var repoText = enc(repoName) + (ds ? (':' + enc(ds)) : '') + (ns ? (' / ' + enc(ns)) : '');
         var mode = modeOf(task);
         var modeLabel = mode === 'metadata' ? t('Metadata') : t('Default (data/block)');
+        // backup2.9 — the effective kind, with the legacy shape named when a
+        // derived files task still carries image archive(s).
+        var effKind = taskKindOf(task);
+        var kindLabel = effKind.kind === 'block'
+            ? '<span style="color:var(--anas-accent,#3468c0);">'
+                + enc(t('block — one iSCSI LUN')) + '</span>'
+            : enc(t('files'));
+        if (effKind.legacyImgArchives) {
+            kindLabel += ' <span style="color:var(--anas-warn,#c9820b);font-size:0.9em;">'
+                + enc(t('— still carries image archive(s) from before block tasks existed'))
+                + '</span>';
+        }
 
         var rows = ''
             + kv(t('Task'), mono(task.name))
             + kv(t('Repository'), '<span style="font-family:monospace;font-size:0.92em;">' + repoText + '</span>')
             + kv(t('Backup ID'), mono('host/' + backupIdOf(task)))
+            + kv(t('Kind'), kindLabel)
             + kv(t('Change detection'), enc(modeLabel))
             + kv(t('Retention'), retentionRowHtml(task))
             + kv(t('Notifications'), notifyRowHtml(task))
@@ -1949,13 +2378,22 @@
                         layout: 'hbox',
                         items: [
                             {
+                                // backup2.9 — SHOWN, not editable: the archive
+                                // name is pbc's change-detection key. A row
+                                // with a stored name keeps it verbatim (a
+                                // re-derivation would silently turn the next
+                                // run into a full re-read); a row created now
+                                // gets its name from the path's last segment —
+                                // derived against the names the task already
+                                // carries, never re-derived once stored.
                                 xtype: 'textfield',
                                 itemId: 'archName',
                                 cls: 'anas-fld-backup-arch-name',
                                 fieldLabel: t('Archive name'),
                                 labelWidth: 120,
                                 flex: 1,
-                                emptyText: 'etc',
+                                readOnly: true,
+                                emptyText: t('derived from the path'),
                                 value: bareArchive(data.name || ''),
                             },
                             {
@@ -2042,9 +2480,12 @@
                                     // scan is a real tree walk on the node.
                                     // The kind sync rides along so a LUN identity
                                     // stops being shown the moment the path stops
-                                    // being the one it was picked at.
+                                    // being the one it was picked at. A NEW row's
+                                    // derived name follows the path too (backup2.9);
+                                    // stored rows are never touched.
                                     change: function () {
                                         syncArchiveKind(fs);
+                                        syncArchiveName(fs);
                                         scheduleNestedScan(fs, node);
                                     },
                                 },
@@ -2180,8 +2621,13 @@
             // was recorded at — see readArchives.
             fs.anasLun = lunRefOf(data);
             fs.anasLunPath = fs.anasLun ? ('' + (data.path == null ? '' : data.path)) : '';
+            // backup2.9 — a row the seed had no name for is a NEW row: its
+            // name is the live derivation from the path. A seeded name is
+            // STORED and never re-derived.
+            fs.anasNameNew = !bareArchive(data.name || '');
             syncArchiveKind(fs);
             syncArchiveNested(fs);
+            syncArchiveName(fs);
             scanArchiveNested(fs, node);
         }
         return fs;
@@ -2234,6 +2680,48 @@
             }
         } catch (e) {
             ANAS.warn('archive kind sync failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // backup2.9 — keep a NEW row's name tracking its path: the last segment,
+    // sanitised, auto-suffixed against the SIBLINGS' current names (the names
+    // the task already carries, in the order the rows stand). Stored rows are
+    // never touched — their name is part of what change-detection keys on, and
+    // a re-derivation here would be the 10 TB question made invisible.
+    function syncArchiveName(fs) {
+        try {
+            if (!fs || !fs.anasNameNew || fs.destroyed || fs.destroying) {
+                return;
+            }
+            var nameF = fs.down('#archName');
+            var pathF = fs.down('#archPath');
+            if (!nameF || !pathF) {
+                return;
+            }
+            var path = trim(pathF.getValue());
+            if (!path) {
+                nameF.setValue('');
+                return;
+            }
+            var taken = [];
+            var cont = fs.up ? fs.up('#archivesContainer') : null;
+            if (cont && cont.items) {
+                cont.items.each(function (other) {
+                    if (other === fs || !other || other.destroyed) {
+                        return;
+                    }
+                    var n = other.down ? other.down('#archName') : null;
+                    if (n) {
+                        var v = bareArchive(n.getValue());
+                        if (v) {
+                            taken.push(v);
+                        }
+                    }
+                });
+            }
+            nameF.setValue(deriveArchiveName(path, taken));
+        } catch (e) {
+            ANAS.warn('archive name sync failed: ' + ANAS.errText(e));
         }
     }
 
@@ -2875,7 +3363,7 @@
      * `archivesOf` an edit round-trip does, so a pre-filled row is the same
      * row a manual pick in the wizard builds.
      */
-    function openTaskDialog(view, node, existing, seedArchives) {
+    function openTaskDialog(view, node, existing, seedArchives, preset) {
         var isEdit = !!existing;
         var task = existing || {};
         var seed = (!isEdit && isArray(seedArchives) && seedArchives.length)
@@ -2886,11 +3374,11 @@
                 ANAS.toast(t('Register a PBS repository first (Repositories…).'));
                 return;
             }
-            buildTaskWindow(view, node, isEdit, task, repoOpts, seed);
+            buildTaskWindow(view, node, isEdit, task, repoOpts, seed, preset);
         });
     }
 
-    function buildTaskWindow(view, node, isEdit, task, repoOpts, seedArchives) {
+    function buildTaskWindow(view, node, isEdit, task, repoOpts, seedArchives, preset) {
         var repoStore = Ext.create('Ext.data.Store', {
             fields: ['name', 'label'], data: repoOpts,
         });
@@ -2904,6 +3392,30 @@
         // No cadence = a raw-OnCalendar task (everything created before 16.10):
         // it opens on Custom with its expression prefilled and round-trips as-is.
         var cadence = cadenceOf(task);
+
+        // backup2.9 — the task's kind, chosen FIRST. Edit: the task is what it
+        // IS (the effective kind — a pre-backup2.9 single-image task is a block
+        // task). New: the operator's choice, or the door's pre-fill, which
+        // SKIPS the choice entirely (the LUN toolbar already said block).
+        var effKind = taskKindOf(task).kind;
+        var presetBlock = !isEdit && preset && preset.kind === 'block';
+        var initialKind = isEdit ? effKind : (presetBlock ? 'block' : 'files');
+        var kindChoosable = !isEdit && !presetBlock;
+        // The block task's STORED archive (edit only): the name is never
+        // re-derived and the path/record ride back verbatim until a different
+        // LUN is picked.
+        var blockStored = null;
+        if (isEdit && effKind === 'block') {
+            var blockArchs = archivesOf(task);
+            if (blockArchs.length) {
+                var b0 = blockArchs[0];
+                blockStored = {
+                    name: bareArchive(b0.name || ''),
+                    path: b0.path,
+                    lun: lunRefOf(b0),
+                };
+            }
+        }
 
         var win;
         try {
@@ -2935,6 +3447,39 @@
                             regex: NAME_RE,
                             maxLength: 64,
                             regexText: t('Lowercase letters, digits and hyphens; must start with a letter or digit.'),
+                        },
+                        {
+                            // backup2.9 — chosen FIRST: a task is files or block,
+                            // and the two panels below are different shapes, not
+                            // variations. Hidden on edit (the task is what it is)
+                            // and on a door-pre-filled block wizard (the LUN
+                            // toolbar already said block — the choice is skipped).
+                            xtype: 'radiogroup',
+                            itemId: 'kindGroup',
+                            cls: 'anas-fld-backup-kind',
+                            fieldLabel: t('Kind'),
+                            columns: 2,
+                            hidden: !kindChoosable,
+                            items: [
+                                {
+                                    boxLabel: t('Files — directory trees'),
+                                    name: 'taskKind', inputValue: 'files',
+                                    checked: initialKind === 'files',
+                                },
+                                {
+                                    boxLabel: t('Block — one iSCSI LUN'),
+                                    name: 'taskKind', inputValue: 'block',
+                                    checked: initialKind === 'block',
+                                },
+                            ],
+                            listeners: {
+                                change: function () {
+                                    var g = win.down('#kindGroup');
+                                    var v = g && g.getValue ? g.getValue() : null;
+                                    win.anasTaskKind = (v && v.taskKind) || 'files';
+                                    syncTaskKind(win);
+                                },
+                            },
                         },
                         {
                             xtype: 'combobox',
@@ -2974,10 +3519,15 @@
                                 + 'hostname; give it a logical name (pictures, storage…) to disambiguate.')),
                         },
                         {
+                            // backup2.9 — the FILES panel: today's archive list.
+                            // (The class keeps its backup2.4 name; `filesPanel`
+                            // is the shape switch the kind choice drives.)
                             xtype: 'fieldset',
                             title: t('Archives'),
-                            cls: 'anas-backup-archives',
+                            itemId: 'filesPanel',
+                            cls: 'anas-backup-files anas-backup-archives',
                             collapsible: false,
+                            hidden: initialKind !== 'files',
                             items: [
                                 {
                                     xtype: 'container',
@@ -2998,12 +3548,81 @@
                                         }
                                     },
                                 },
+                                {
+                                    // The legacy shape, named: a derived files
+                                    // task that still carries image archive(s).
+                                    // The data is untouched — the note points at
+                                    // the shape it should become.
+                                    xtype: 'component',
+                                    itemId: 'filesLegacyNote',
+                                    cls: 'anas-backup-legacy-note',
+                                    margin: '4 0 0 0',
+                                    html: '',
+                                },
+                            ],
+                        },
+                        {
+                            // backup2.9 — the BLOCK panel: the LUN picker and
+                            // nothing else. No path field (the pick IS the path
+                            // + the lun record), no excludes, no nested option,
+                            // no change detection (a no-op for images — the
+                            // fieldset below does not exist for this shape).
+                            xtype: 'fieldset',
+                            title: t('LUN'),
+                            itemId: 'blockPanel',
+                            cls: 'anas-backup-block',
+                            collapsible: false,
+                            hidden: initialKind !== 'block',
+                            items: [
+                                {
+                                    xtype: 'component',
+                                    itemId: 'blockLunOut',
+                                    cls: 'anas-backup-block-lun',
+                                    html: '',
+                                },
+                                {
+                                    xtype: 'button',
+                                    itemId: 'blockLunChoose',
+                                    cls: 'anas-btn-backup-block-lun',
+                                    text: t('Choose LUN…'),
+                                    iconCls: 'fa fa-hdd-o',
+                                    margin: '4 0 0 0',
+                                    handler: function () {
+                                        openLunPicker(node, function (chosen) {
+                                            setBlockLun(win, chosen, true);
+                                        });
+                                    },
+                                },
+                                {
+                                    // The block task's archive name: the whole
+                                    // image IS the archive. New tasks get the
+                                    // fixed name; an edit keeps whatever its
+                                    // unit stores (never re-derived).
+                                    xtype: 'textfield',
+                                    itemId: 'blockArchiveName',
+                                    cls: 'anas-fld-backup-block-name',
+                                    fieldLabel: t('Archive name'),
+                                    readOnly: true,
+                                    value: (isEdit && blockStored && blockStored.name)
+                                        ? blockStored.name
+                                        : BLOCK_ARCHIVE_NAME,
+                                },
+                                {
+                                    xtype: 'component',
+                                    style: 'color:var(--anas-muted,gray);font-size:11px;margin-top:2px;',
+                                    html: enc(t('One LUN per block task. The backup-id derives from the '
+                                        + 'LUN\'s unit serial — the PBS group is the LUN itself, and it '
+                                        + 'survives a rename or a re-point of the backing.')),
+                                },
                             ],
                         },
                         {
                             xtype: 'fieldset',
                             title: t('Change detection'),
+                            itemId: 'modePanel',
+                            cls: 'anas-backup-mode',
                             collapsible: false,
+                            hidden: initialKind !== 'files',
                             defaults: { anchor: '100%' },
                             items: [
                                 {
@@ -3161,12 +3780,21 @@
         }
         syncRetentionControls(win);
 
-        // Seed the archive rows. Edit → the task's archives; new → a second
-        // door's pre-filled archive (the iSCSI LUN toolbar's LUN), else the
-        // suggested etc.pxar:/etc default (the operator's own habit;
-        // removable = dismissible).
+        // backup2.9 — the kind state the panels and the save read. `win` must
+        // exist before any of the syncs below (they look fields up off it).
+        win.anasNode = node;
+        win.anasTaskKind = initialKind;
+        win.anasKindChoosable = kindChoosable;
+        win.anasBlockNewId = !isEdit; // new: the id derives from the pick
+        win.anasBlockStored = blockStored;
+
+        // Seed the ARCHIVE rows — files panel only; a block wizard has no rows
+        // (its one archive is the LUN pick). Edit → the task's archives; new →
+        // a second door's pre-filled archive, else the suggested
+        // etc.pxar:/etc default (the operator's own habit; removable =
+        // dismissible).
         var cont = win.down('#archivesContainer');
-        if (cont) {
+        if (cont && initialKind === 'files') {
             var seed = archivesOf(task);
             if (!seed.length && !isEdit) {
                 seed = (seedArchives && seedArchives.length)
@@ -3180,6 +3808,45 @@
                 addArchiveRow(win, cont, pathStore, seed[i], node);
             }
         }
+
+        // The legacy note: a derived files task that still carries image
+        // archive(s) says what to do about it — one block task per LUN.
+        var legacyEff = taskKindOf(task);
+        var legacyNote = win.down('#filesLegacyNote');
+        if (legacyNote && isEdit && legacyEff.legacyImgArchives) {
+            var imgCount = 0;
+            var legacyArchs = archivesOf(task);
+            for (var li = 0; li < legacyArchs.length; li++) {
+                if (archiveKindOf(legacyArchs[li]) === 'img') {
+                    imgCount++;
+                }
+            }
+            legacyNote.update('<div style="font-size:11px;color:var(--anas-warn,#c9820b);">'
+                + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
+                + enc(imgCount + ' ' + t('image archive') + (imgCount === 1 ? '' : t('s'))
+                    + t(' in this task were written before block tasks existed. A LUN belongs in its own '
+                        + 'block task (one LUN per task) — create one, and remove the image row from here '
+                        + 'when its snapshots are safe.'))
+                + '</div>');
+        }
+
+        // The block panel's LUN: an edit re-resolves its stored record (or
+        // path) against the node's LUN list — the live name, the serial and
+        // the consistency chip come from where they live; a door's pre-fill
+        // re-resolves the same way (the pick is fresh, the chip is not).
+        if (initialKind === 'block') {
+            if (isEdit && blockStored) {
+                setBlockLun(win, {
+                    targetIqn: blockStored.lun ? blockStored.lun.targetIqn : '',
+                    index: blockStored.lun ? blockStored.lun.index : 0,
+                    path: blockStored.path,
+                }, false);
+            } else if (presetBlock && preset.lun) {
+                setBlockLun(win, preset.lun, false);
+            }
+            renderBlockLun(win);
+        }
+        syncTaskKind(win);
     }
 
     // `task` is the task being edited (empty on create): the source for every
@@ -3225,26 +3892,49 @@
                 return; // readCadence already said what is wrong
             }
         }
-        var archives = readArchives(win);
-        if (!archives.length) {
-            ANAS.alertMsg('Invalid input', t('Add at least one archive (a name and a path).'));
-            return;
-        }
-        for (var i = 0; i < archives.length; i++) {
-            if (!archives[i].name || !archives[i].path) {
-                ANAS.alertMsg('Invalid input', t('Every archive needs both a name and a path.'));
+        // backup2.9 — the shape decides what the body carries. A block task is
+        // one LUN pick (one image archive, the fixed name on a new task, the
+        // serial-derived id on a new task) and no mode; a files task is today's
+        // archive list and nothing that does not exist for one.
+        var taskKind = win.anasTaskKind === 'block' ? 'block' : 'files';
+        var archives;
+        if (taskKind === 'block') {
+            var blockArch = readBlockArchive(win);
+            archives = blockArch ? [blockArch] : [];
+            if (!archives.length) {
+                ANAS.alertMsg('Invalid input', t('Choose a LUN for the block task.'));
                 return;
             }
-        }
-        var mode = 'default';
-        try {
-            var mg = win.down('#modeGroup');
-            var mv = mg && mg.getValue();
-            if (mv && mv.mode) {
-                mode = mv.mode;
+        } else {
+            archives = readArchives(win);
+            if (!archives.length) {
+                ANAS.alertMsg('Invalid input', t('Add at least one archive (a path).'));
+                return;
             }
-        } catch (eMode) {
-            // default stands
+            for (var i = 0; i < archives.length; i++) {
+                if (!archives[i].name || !archives[i].path) {
+                    ANAS.alertMsg('Invalid input', t('Every archive needs both a name and a path.'));
+                    return;
+                }
+            }
+        }
+        var mode;
+        if (taskKind === 'block') {
+            // No change detection on a block image (a complete no-op): a NEW
+            // task stores the default, an EDIT keeps whatever its unit stores
+            // — the daemon's block guard applies only to a stored-block task.
+            mode = isEdit ? modeOf(task) : 'default';
+        } else {
+            mode = 'default';
+            try {
+                var mg = win.down('#modeGroup');
+                var mv = mg && mg.getValue();
+                if (mv && mv.mode) {
+                    mode = mv.mode;
+                }
+            } catch (eMode) {
+                // default stands
+            }
         }
         var namespace = trim(valOf(win, '#namespace'));
 
@@ -3264,6 +3954,17 @@
             body.cadence = cadence;
         } else {
             body.schedule = schedule;
+        }
+        // backup2.9 — the stored kind rides back VERBATIM. A wizard files task
+        // stores nothing (absent IS the files default) and a pre-backup2.9 LUN
+        // task stores nothing either — and NOT sending `kind` is exactly what
+        // keeps that task's hand-chosen id and PBS group: the daemon's serial
+        // guard fires only on a task that claims to be block. A new block
+        // task (or a stored-block edit) is the only send that carries it.
+        if (isEdit && (task.kind === 'block' || task.kind === 'files')) {
+            body.kind = task.kind;
+        } else if (!isEdit && taskKind === 'block') {
+            body.kind = 'block';
         }
         if (namespace) {
             body.namespace = namespace;
@@ -3514,6 +4215,11 @@
             mode: modeOf(raw),
             changeDetectionMode: modeOf(raw),
             schedule: raw.schedule || rec.get('schedule'),
+            // backup2.9 — the stored kind rides the whole-task PUT verbatim,
+            // for the same reason the dialog sends it: a derived-block task
+            // must not start claiming `block` on a toggle (its id and group
+            // would stop being its own).
+            kind: (raw.kind === 'block' || raw.kind === 'files') ? raw.kind : undefined,
             // A toggle rewrites the whole task — carry the notification mode
             // through it, exactly like the retention policy below.
             notify: notifyOf(raw),
@@ -4456,6 +5162,9 @@
         var store = Ext.create('Ext.data.Store', {
             fields: [
                 'name', 'repository', 'datastore', 'namespace', 'backupId',
+                { name: 'kind', type: 'auto' },
+                { name: 'storedKind', type: 'auto' },
+                { name: 'lunName', type: 'auto' },
                 'schedule', 'mode', 'notify', 'lastRunResult', 'lastRunAt', 'nextRunAt',
                 { name: 'archiveCount', type: 'auto' },
                 { name: 'cadence', type: 'auto' },
@@ -4596,6 +5305,19 @@
                         {
                             text: t('Backup ID'), dataIndex: 'backupId', width: 130,
                             renderer: renderBackupId,
+                        },
+                        {
+                            // backup2.9 — files or block (the effective kind:
+                            // a pre-backup2.9 single-image task reads block).
+                            text: t('Kind'), dataIndex: 'kind', width: 90,
+                            align: 'center', renderer: renderKind,
+                        },
+                        {
+                            // backup2.9 — the LUN's LIVE name for block tasks
+                            // (null = no longer resolvable); a dash for files.
+                            text: t('LUN'), dataIndex: 'lunName', width: 150,
+                            sortable: false, menuDisabled: true,
+                            renderer: renderLunName,
                         },
                         {
                             text: t('Archives'), dataIndex: 'archiveCount', width: 100,

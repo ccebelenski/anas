@@ -88,9 +88,90 @@ describe('backup units — the systemd units ARE the store (Epic 16.3, NOTES §7
         { name: 'etc', path: '/etc', excludes: ['*.tmp'] },
         { name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img' },
       ] }),
+      // Task kind (backup2.9): a block task stores `kind` + the fixed archive
+      // name + the serial-derived id; a files task stores nothing at all
+      // (absent derives as `files`).
+      makeTask({ name: 'block-one', kind: 'block', backupId: 'lun-9bc6e907-6015-4267-be4f-5a0617cb3d71', archives: [
+        { name: 'disk', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', lun: { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 } },
+      ] }),
+      makeTask({ name: 'files-explicit', kind: 'files' }),
     ]) {
       assert.deepEqual(parseServiceUnit(renderServiceUnit(task)), task)
     }
+  })
+
+  it('a task-level kind round-trips additively, and ABSENT stays absent (backup2.9)', () => {
+    // The untouched-edit rule, one more time: a unit written before this story
+    // has no task `kind`, and an untouched edit must not invent one.
+    const files = makeTask()
+    const filesBack = parseServiceUnit(renderServiceUnit(files))
+    assert.ok(filesBack)
+    assert.equal(filesBack.kind, undefined)
+    const block = makeTask({
+      name: 'block-roundtrip',
+      kind: 'block',
+      backupId: 'lun-9bc6e907-6015-4267-be4f-5a0617cb3d71',
+      archives: [
+        { name: 'disk', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', lun: { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 } },
+      ],
+    })
+    const blockBack = parseServiceUnit(renderServiceUnit(block))
+    assert.ok(blockBack)
+    assert.equal(blockBack.kind, 'block')
+    assert.match(renderServiceUnit(block), /"kind":"block"/)
+  })
+
+  it('an untouched edit of a pre-backup2.9 unit (no task kind) rewrites it BYTE-IDENTICALLY', () => {
+    // The legacy shape includes a single-image task — a block task by today's
+    // derivation, written before the field existed. No unit is rewritten until
+    // it is edited, and an untouched edit never rewrites anything.
+    const legacy = renderServiceUnit(makeTask({
+      name: 'legacy-block',
+      archives: [
+        { name: 'lun0', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', lun: { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 } },
+      ],
+    }))
+    assert.ok(!legacy.includes('"kind":"block"'))
+    const parsed = parseServiceUnit(legacy)
+    assert.ok(parsed)
+    assert.equal(parsed.kind, undefined)
+    const resaved = BackupTaskRequest.parse(JSON.parse(JSON.stringify(parsed)))
+    assert.equal(renderServiceUnit(resaved), legacy)
+  })
+
+  it('a BLOCK unit round-trips byte-identically, stored archive name verbatim', () => {
+    // On an edit the stored archive names are KEPT, never re-derived: the
+    // name is the change-detection key, and a re-derivation would silently
+    // turn the next run into a full re-read of the whole image. The stored
+    // shape is what the WRITE path produced — normalized through the request
+    // schema, so `kind` sits in schema key order (after `archives`), not in
+    // whatever order a test object happens to be written in.
+    const stored = renderServiceUnit(BackupTaskRequest.parse(JSON.parse(JSON.stringify(makeTask({
+      name: 'block-untouched',
+      kind: 'block',
+      backupId: 'lun-9bc6e907-6015-4267-be4f-5a0617cb3d71',
+      archives: [
+        { name: 'disk', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', lun: { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 } },
+      ],
+    })))))
+    const parsed = parseServiceUnit(stored)
+    assert.ok(parsed)
+    assert.equal(parsed.kind, 'block')
+    const resaved = BackupTaskRequest.parse(JSON.parse(JSON.stringify(parsed)))
+    assert.equal(renderServiceUnit(resaved), stored)
+    assert.equal(resaved.archives[0].name, 'disk')
+  })
+
+  it('a null task kind normalizes to absent; an explicit `files` is kept (backup2.9)', () => {
+    // `null` is a clear (absent = derived); `files` is KEPT — unlike `pxar` it
+    // is not redundant with absent (a stored `files` on a mixed task is what
+    // keeps it from reading as the legacy shape).
+    const nulled = BackupTaskRequest.parse({ ...makeTask(), kind: null })
+    assert.equal(nulled.kind, undefined)
+    assert.ok(!renderServiceUnit(nulled).includes('"kind"'))
+    const files = BackupTaskRequest.parse({ ...makeTask(), kind: 'files' })
+    assert.equal(files.kind, 'files')
+    assert.match(renderServiceUnit(files), /"kind":"files"/)
   })
 
   it('an archive with NO includeNested round-trips with no such key (backup2.2)', () => {

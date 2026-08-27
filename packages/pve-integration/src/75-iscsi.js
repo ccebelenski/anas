@@ -105,16 +105,20 @@
  *
  *   The LUN toolbar is BACKUP-AWARE on backup2.4's archive record:
  *   GET  /v1/backup/tasks          → { data: [ { task{ archives[{ name, path,
- *        kind?, lun? }] }, lastRunResult, lastRunAt } ] } — read ONCE when the
- *   window opens (coverage is config, not volatile state; the session poll
- *   re-applies the badges from the cached answer). A task COVERS a LUN when an
- *   archive records its lun { targetIqn, index } — or, for a task written
- *   before backup2.4, when it is kind 'img' of the LUN's backing path.
+ *        kind?, lun? }], backupId }, lastRunResult, lastRunAt } ] } — read
+ *   ONCE when the window opens (coverage is config, not volatile state; the
+ *   session poll re-applies the badges from the cached answer). A task COVERS
+ *   a LUN when an archive records its lun { targetIqn, index } — or, for a
+ *   task written before backup2.4, when it is kind 'img' of the LUN's backing
+ *   path — or (backup2.9) when its backup-id IS the LUN's identity:
+ *   `lun-<this LUN's unit serial>`, the group the wizard derives for every new
+ *   block task, durable across a rename or a re-point.
  *   FAIL-OPEN: a failed read shows no badge and gates nothing. The doors are
  *   the Backup menu's own (ANAS.backup.runTaskNow / .openEditTask /
  *   .openNewTask in 68-backup.js); "Create backup task…" opens the new-task
- *   wizard pre-filled with the LUN's archive record — the same row the wizard
- *   builds for a manual LUN pick, so the body is byte-identical.
+ *   wizard with the BLOCK panel already chosen and this LUN pre-selected
+ *   (backup2.9 — the kind choice is skipped) — the same body a manual block
+ *   pick in that same wizard sends.
  *
  *   THE CLEAR CONTRACT: on an ACL, every credential field means set / clear /
  *   keep by value / null / OMITTED. A blank password box sends NO key, so the
@@ -1870,7 +1874,11 @@
     //
     //   an archive records THIS LUN's lun { targetIqn, index } — the truth; or
     //   (a task written before backup2.4, which carries no record) an archive
-    //   that is kind 'img' of the LUN's backing PATH.
+    //   that is kind 'img' of the LUN's backing PATH; or
+    //   (backup2.9) the task's backup-id IS the LUN's identity — `lun-<this
+    //   LUN's unit serial>`: the group the wizard derives for every new block
+    //   task, durable across a rename or a re-point, readable out of the task
+    //   list without resolving the LUN at all.
     //
     // Read ONCE per window: coverage is config, not volatile state, and the
     // session poll re-applies the badges from the cached answer instead of
@@ -1884,9 +1892,11 @@
      * The tasks covering one LUN. `entries` are the `GET /backup/tasks`
      * records ({ task, lastRunResult, lastRunAt, … }); the result carries each
      * covering task's last-run result for the badge. A task counts once no
-     * matter how many of its archives match.
+     * matter how many of its archives match. `serial` is the LUN's unit
+     * serial (backup2.9) — the backup-id match needs it, and a null/unknown
+     * serial simply makes that match impossible (never a guess).
      */
-    function coveringTasks(entries, iqn, index, backingPath) {
+    function coveringTasks(entries, iqn, index, backingPath, serial) {
         var out = [];
         if (!isArray(entries)) {
             return out;
@@ -1913,6 +1923,9 @@
                     break;
                 }
             }
+            if (!covers && serial && task.backupId === 'lun-' + serial) {
+                covers = true;
+            }
             if (covers) {
                 out.push({
                     name: task.name,
@@ -1936,23 +1949,6 @@
             }
         }
         return null;
-    }
-
-    /**
-     * The archive name the wizard pre-fills from a LUN name, sanitised to the
-     * wizard's own rule: the daemon takes 1..128 of letters, digits, dots,
-     * underscores and dashes with no `.pxar`/`.img` suffix — and a SCSI model
-     * string is free text, so every other character becomes a dash.
-     */
-    function lunArchiveName(name, index) {
-        var s = ('' + (name == null ? '' : name))
-            .replace(/[^A-Za-z0-9._-]/g, '-')
-            .replace(/\.(?:pxar|img)$/i, '')
-            .replace(/^-+|-+$/g, '');
-        if (!s) {
-            s = 'lun' + (Number(index) >= 0 ? index : '');
-        }
-        return s.length > 128 ? s.substring(0, 128) : s;
     }
 
     function backupResultText(result) {
@@ -2020,7 +2016,7 @@
         var iqn = win.anasIqn;
         try {
             grid.getStore().each(function (rec) {
-                rec.set('backupBy', coveringTasks(entries, iqn, rec.get('index'), rec.get('backingPath')));
+                rec.set('backupBy', coveringTasks(entries, iqn, rec.get('index'), rec.get('backingPath'), rec.get('serial')));
             });
         } catch (e) {
             // non-fatal
@@ -2035,7 +2031,7 @@
         var rec = selectedLun(win);
         var entries = win.anasBackupTasks;
         var covering = (rec && isArray(entries))
-            ? coveringTasks(entries, win.anasIqn, rec.get('index'), rec.get('backingPath'))
+            ? coveringTasks(entries, win.anasIqn, rec.get('index'), rec.get('backingPath'), rec.get('serial'))
             : null;
         // `[]` is the "known and none" answer — it must take the wizard door,
         // and an empty array is truthy in JS, so length decides, not the list.
@@ -2075,12 +2071,12 @@
         }];
     }
 
-    // The "Create backup task…" door: the Backup menu's new-task wizard,
-    // pre-filled with ONE archive — the LUN's block image, named from the LUN,
-    // carrying the lun record a manual LUN pick records. It reaches the wizard
-    // through the same seed an edit passes through `archivesOf`, so the row is
-    // the one `addArchiveRow` builds for a manual pick, and the body the
-    // wizard sends is byte-identical.
+    // The "Create backup task…" door (backup2.9): the Backup menu's new-task
+    // wizard with the BLOCK panel already chosen — the kind choice is skipped
+    // (the LUN toolbar already said block) — and its LUN pre-selected: the
+    // record, the backing path and the unit serial this row carries. The body
+    // the wizard sends is the same one a manual block pick in that same
+    // wizard sends: one `disk` image archive, the `lun-<serial>` id.
     function openBackupTaskForLun(win, view, node, iqn, rec) {
         if (!rec || !ANAS.backup || !ANAS.backup.openNewTask) {
             return;
@@ -2093,13 +2089,16 @@
             || rec.get('backingExists') === false || !rec.get('backingPath')) {
             return;
         }
-        ANAS.backup.openNewTask(view, node, [{
-            name: lunArchiveName(rec.get('name'), rec.get('index')),
-            path: '' + rec.get('backingPath'),
-            excludes: [],
-            kind: 'img',
-            lun: { targetIqn: iqn, index: rec.get('index') }
-        }]);
+        ANAS.backup.openNewTask(view, node, null, {
+            kind: 'block',
+            lun: {
+                targetIqn: iqn,
+                index: rec.get('index'),
+                path: '' + rec.get('backingPath'),
+                serial: (rec.get('serial') == null) ? null : ('' + rec.get('serial')),
+                name: '' + (rec.get('name') || ''),
+            },
+        });
     }
 
     // The attribute summary an operator can act on, in words rather than flags.

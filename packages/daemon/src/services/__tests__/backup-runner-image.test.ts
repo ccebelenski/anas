@@ -163,6 +163,19 @@ describe('img archives — the pbc argv (backup2.4)', () => {
     assert.ok(!args.some(a => a.startsWith('--change-detection-mode')), args.join(' '))
   })
 
+  it('a BLOCK task (the task-level kind) never gets --change-detection-mode, whatever its mode (backup2.9)', () => {
+    // The story's block shape — kind on the task, one img archive named
+    // `disk` with its LUN record — is the unit the wizard writes. The no-flag
+    // rule holds for it by the kind, not just by the archive list.
+    const args = buildBackupArgs(task({
+      kind: 'block',
+      changeDetectionMode: 'metadata',
+      archives: [{ name: 'disk', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', lun: { targetIqn: 'iqn.2026-08.anas:vmstore', index: 0 } }],
+    }))
+    assert.ok(!args.some(a => a.startsWith('--change-detection-mode')), args.join(' '))
+    assert.ok(args.includes('disk.img:/dev/zvol/tank/vol1'), args.join(' '))
+  })
+
   it('a MIXED task still emits it once — its pxar archives honour it', () => {
     const args = buildBackupArgs(task({
       changeDetectionMode: 'metadata',

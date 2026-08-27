@@ -39,8 +39,10 @@ import {
   composeGroupId,
   effectiveArchiveKind,
   effectiveIncludeNested,
+  effectiveTaskKind,
   groupOfSnapshotId,
   hasRetentionKeeps,
+  lunBackupId,
   sideBySideRestorePath,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
@@ -596,10 +598,47 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     return repos.find(r => r.name === task.repository)?.datastore
   }
 
-  /** A task enriched with its repo datastore (response shape). */
+  /**
+   * A task enriched for the response: its repo's datastore, and — backup2.9 —
+   * the legacy-shape flag. The `kind` key stays the STORED value (absent on a
+   * unit that predates the field): the effective answer is a DERIVATION the
+   * client performs through the shared effectiveTaskKind — which is what lets
+   * the edit dialog tell a stored `block` (send it back) from a derived one
+   * (send nothing, keep the pre-backup2.9 id and group).
+   */
   function toTaskView(task: BackupTask, repos: BackupRepo[]): BackupTaskView {
+    const eff = effectiveTaskKind(task)
+    const view: BackupTaskView = { ...task, legacyImgArchives: eff.legacyImgArchives }
     const datastore = datastoreOf(task, repos)
-    return datastore ? { ...task, datastore } : { ...task }
+    if (datastore)
+      view.datastore = datastore
+    return view
+  }
+
+  /**
+   * Resolve a stored `{ targetIqn, index }` LUN record to what the iSCSI read
+   * layer says about it RIGHT NOW — the human name and the serial (backup2.9).
+   * The answer the read layer gives, or `null` when it cannot answer (the LUN
+   * is gone, or the read layer is unavailable): FAIL-OPEN, because a task list
+   * must never die on the read layer, and "not resolvable" is a state the UI
+   * shows, not an error it raises.
+   */
+  async function resolveLunRef(
+    ref: { targetIqn: string, index: number },
+  ): Promise<{ name: string | null, serial: string | null } | null> {
+    try {
+      const ctx = await readIscsiContext(executor, iscsiPaths)
+      const targets = await buildIscsiTargets(ctx)
+      const target = targets.find(t => t.iqn === ref.targetIqn)
+      const lun = target?.luns.find(l => l.index === ref.index)
+      if (!target || !lun)
+        return null
+      return { name: lun.name ? lun.name : null, serial: lun.serial ?? null }
+    }
+    catch (err) {
+      server.log.warn(`[backup] LUN resolution for ${ref.targetIqn} LUN ${ref.index} failed: ${err instanceof Error ? err.message : String(err)}`)
+      return null
+    }
   }
 
   /**
@@ -627,6 +666,51 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       reply.send({ error: { code: 'VALIDATION_ERROR', message: `Repository '${task.repository}' is not registered` } })
       return false
     }
+    // backup2.9 — a block task's group IS the LUN's durable identity: its
+    // backupId must be `lun-<serial>` with the serial as the READ LAYER reads
+    // it (a VPD fact that survives a rename, a re-point and a re-install). The
+    // wizard derives the id from the pick, so this fires only for a client that
+    // sends a different id for a LUN this node can see.
+    if (task.kind === 'block') {
+      // A record-less block task is refused by the shared schema already; the
+      // branch stays as defence in depth (and so TS knows `lun` is a record
+      // before it is used).
+      const lun = task.archives[0]?.lun
+      if (!lun) {
+        reply.code(400)
+        reply.send({
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: `A block task's archive must record the iSCSI LUN it backs up (target + LUN number).`,
+          },
+        })
+        return false
+      }
+      const resolved = await resolveLunRef(lun)
+      if (!resolved) {
+        reply.code(400)
+        reply.send({
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: `The block task's LUN ${lun.targetIqn} LUN ${lun.index} is not served by this node's iSCSI targets — pick a LUN from the backup wizard's LUN picker, which lists what this node actually serves.`,
+          },
+        })
+        return false
+      }
+      if (resolved.serial && task.backupId !== lunBackupId(resolved.serial)) {
+        reply.code(400)
+        reply.send({
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: `A block task's backup ID is the LUN's serial: this LUN's is '${lunBackupId(resolved.serial)}'. '${task.backupId}' does not match, and the LUN's backups must stay one PBS group across renames and re-points.`,
+          },
+        })
+        return false
+      }
+      // A serial the read layer cannot read right now cannot be verified — the
+      // pick the wizard made is the only claim, and it is accepted (the same
+      // fail-open the list's `lunName: null` is).
+    }
     return true
   }
 
@@ -638,13 +722,29 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const data = await Promise.all(
       tasks.map(async (task): Promise<BackupTaskEntry> => {
         const st = await deriveTaskStatus(executor, task)
-        return {
+        const entry: BackupTaskEntry = {
           task: toTaskView(task, joinRepos),
           lastRunResult: st.lastRunResult,
           lastRunAt: st.lastRunAt,
           nextRunAt: st.nextRunAt,
           overdue: st.overdue,
         }
+        // backup2.9 — a block task's LUN NAME is read live: the unit stores the
+        // record and the serial-derived id, never the display name (it can
+        // change, and a stored copy would lie the moment it does). Fail-open
+        // null: a LUN the read layer cannot resolve right now is shown as such,
+        // and a broken read layer must not kill the task list.
+        if (effectiveTaskKind(task).kind === 'block') {
+          const lun = task.archives[0]?.lun
+          if (lun) {
+            const resolved = await resolveLunRef(lun)
+            entry.lunName = resolved?.name ?? null
+          }
+          else {
+            entry.lunName = null
+          }
+        }
+        return entry
       }),
     )
     return { data }
