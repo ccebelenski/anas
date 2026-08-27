@@ -3,7 +3,8 @@
  *
  * A native ExtJS grid over the node's iSCSI targets plus a toolbar (Create,
  * Edit, Enable/Disable, Delete, LUNs…, Repair) and a LUNs detail window that is
- * DISPLAY plus its own LUN toolbar (Add LUN, Resize, Delete). One menu per
+ * DISPLAY plus its own LUN toolbar (Add LUN, Resize, Back up…, Restore from
+ * backup…, Delete). One menu per
  * feature; no row-icon action columns.
  *
  * `Repair` (story iscsi.5) is the node-level door out of a boot-restore hole.
@@ -102,6 +103,19 @@
  *   The `snapshot` is ALWAYS the full `<type>/<id>/<RFC3339>`: a bare group path
  *   is not an error to the backup client, it silently restores the latest.
  *
+ *   The LUN toolbar is BACKUP-AWARE on backup2.4's archive record:
+ *   GET  /v1/backup/tasks          → { data: [ { task{ archives[{ name, path,
+ *        kind?, lun? }] }, lastRunResult, lastRunAt } ] } — read ONCE when the
+ *   window opens (coverage is config, not volatile state; the session poll
+ *   re-applies the badges from the cached answer). A task COVERS a LUN when an
+ *   archive records its lun { targetIqn, index } — or, for a task written
+ *   before backup2.4, when it is kind 'img' of the LUN's backing path.
+ *   FAIL-OPEN: a failed read shows no badge and gates nothing. The doors are
+ *   the Backup menu's own (ANAS.backup.runTaskNow / .openEditTask /
+ *   .openNewTask in 68-backup.js); "Create backup task…" opens the new-task
+ *   wizard pre-filled with the LUN's archive record — the same row the wizard
+ *   builds for a manual LUN pick, so the body is byte-identical.
+ *
  *   THE CLEAR CONTRACT: on an ACL, every credential field means set / clear /
  *   keep by value / null / OMITTED. A blank password box sends NO key, so the
  *   stored secret stands (the mounts precedent). An untouched target edit sends
@@ -119,9 +133,11 @@
  * '#aclsContainer' with '#aclAdd', '#aclAddNode' (inserts this node's own IQN,
  * disabled with a tooltip when the daemon reports none or predates the field),
  * per-row '#aclIqn' / '#aclRemove', and the empty-list note '#aclEmptyNote'; LUNs window 'anas-win-iscsi-luns' with
- * 'anas-btn-lun-add' / 'anas-btn-lun-resize' / 'anas-btn-lun-restore' /
+ * 'anas-btn-lun-add' / 'anas-btn-lun-resize' / 'anas-btn-lun-backup' /
+ * 'anas-btn-lun-restore' /
  * 'anas-btn-lun-delete'; Add LUN dialog 'anas-win-iscsi-lun' with
- * 'anas-btn-iscsi-lun-submit'; Resize dialog 'anas-win-iscsi-lun-resize' with
+ * the growth note '#lunKindNote' and 'anas-btn-iscsi-lun-submit'; Resize dialog
+ * 'anas-win-iscsi-lun-resize' with
  * 'anas-btn-iscsi-lun-resize-submit'; Restore dialog 'anas-win-lun-restore' with
  * 'anas-fld-restore-repo' / '-ns' / '-group' / '-snapshot' / '-archive',
  * 'anas-btn-restore-load' and 'anas-btn-lun-restore-submit'.
@@ -1845,6 +1861,247 @@
             + enc(list.length + ' ' + (list.length === 1 ? t('initiator') : t('initiators'))) + '</span>';
     }
 
+    // ---- Backup coverage (the LUN toolbar's only read of the backup side) ---
+    //
+    // backup2.4 made every block-image archive record the LUN it was picked
+    // at (kind 'img' + lun { targetIqn, index }); the LUN toolbar reads the
+    // task list once when its window opens and asks which tasks cover each
+    // LUN:
+    //
+    //   an archive records THIS LUN's lun { targetIqn, index } — the truth; or
+    //   (a task written before backup2.4, which carries no record) an archive
+    //   that is kind 'img' of the LUN's backing PATH.
+    //
+    // Read ONCE per window: coverage is config, not volatile state, and the
+    // session poll re-applies the badges from the cached answer instead of
+    // re-reading the list every tick. FAIL-OPEN (the version-skew ruling): a
+    // failed or absent read shows no badge and gates nothing — and "unknown"
+    // and "not backed up" are different states, which the row field keeps
+    // different: absent means the read did not answer, an empty list means it
+    // answered and no task covers the LUN.
+
+    /**
+     * The tasks covering one LUN. `entries` are the `GET /backup/tasks`
+     * records ({ task, lastRunResult, lastRunAt, … }); the result carries each
+     * covering task's last-run result for the badge. A task counts once no
+     * matter how many of its archives match.
+     */
+    function coveringTasks(entries, iqn, index, backingPath) {
+        var out = [];
+        if (!isArray(entries)) {
+            return out;
+        }
+        for (var i = 0; i < entries.length; i++) {
+            var e = entries[i] || {};
+            var task = e.task || {};
+            if (!task.name) {
+                continue;
+            }
+            var archives = isArray(task.archives) ? task.archives : [];
+            var covers = false;
+            for (var a = 0; a < archives.length; a++) {
+                var arch = archives[a] || {};
+                var lun = arch.lun;
+                if (lun && lun.targetIqn === iqn && Number(lun.index) === Number(index)) {
+                    covers = true;
+                    break;
+                }
+                // Absent `kind` means pxar (read it the way the wizard does),
+                // so this is the block-image test, not a truthiness guess.
+                if (arch.kind === 'img' && arch.path === backingPath) {
+                    covers = true;
+                    break;
+                }
+            }
+            if (covers) {
+                out.push({
+                    name: task.name,
+                    lastRunResult: e.lastRunResult || 'unknown',
+                    lastRunAt: e.lastRunAt
+                });
+            }
+        }
+        return out;
+    }
+
+    /** The stored task object behind a list entry — what Edit pre-fills from. */
+    function backupTaskByName(entries, name) {
+        if (!isArray(entries)) {
+            return null;
+        }
+        for (var i = 0; i < entries.length; i++) {
+            var e = entries[i] || {};
+            if (e.task && e.task.name === name) {
+                return e.task;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The archive name the wizard pre-fills from a LUN name, sanitised to the
+     * wizard's own rule: the daemon takes 1..128 of letters, digits, dots,
+     * underscores and dashes with no `.pxar`/`.img` suffix — and a SCSI model
+     * string is free text, so every other character becomes a dash.
+     */
+    function lunArchiveName(name, index) {
+        var s = ('' + (name == null ? '' : name))
+            .replace(/[^A-Za-z0-9._-]/g, '-')
+            .replace(/\.(?:pxar|img)$/i, '')
+            .replace(/^-+|-+$/g, '');
+        if (!s) {
+            s = 'lun' + (Number(index) >= 0 ? index : '');
+        }
+        return s.length > 128 ? s.substring(0, 128) : s;
+    }
+
+    function backupResultText(result) {
+        switch (result) {
+            case 'success': return t('success');
+            case 'failure': return t('failure');
+            case 'running': return t('running');
+            case 'skipped': return t('skipped');
+            case 'disabled': return t('disabled');
+            case 'never-run': return t('never run');
+            default: return t('unknown');
+        }
+    }
+
+    // Which tasks cover the LUN and how their last runs ended — or the muted
+    // "not backed up" when the read answered and none does. Empty (nothing) is
+    // the not-answered state: a failed read is not "not backed up".
+    function renderBackupBy(v) {
+        if (v === undefined || v === null) {
+            return '';
+        }
+        if (!isArray(v) || !v.length) {
+            return '<span class="anas-lun-not-backup" style="color:gray;">'
+                + enc(t('not backed up')) + '</span>';
+        }
+        var bits = [];
+        for (var i = 0; i < v.length; i++) {
+            var e = v[i] || {};
+            bits.push('<span class="anas-lun-backup" title="'
+                + enc(t('Backed up by task ') + e.name)
+                + '">' + enc(e.name)
+                + (e.lastRunResult
+                    ? ' <span style="color:gray;">(' + enc(backupResultText(e.lastRunResult)) + ')</span>'
+                    : '')
+                + '</span>');
+        }
+        return bits.join(' ');
+    }
+
+    function loadBackupCoverage(win, node) {
+        ANAS.api.get(node, '/backup/tasks').then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var data = res && res.data;
+            win.anasBackupTasks = isArray(data) ? data : null;
+            applyBackupBadges(win);
+        }, function () {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            win.anasBackupTasks = null; // no badge, nothing gated — fail-open
+        });
+    }
+
+    function applyBackupBadges(win) {
+        var grid = lunsGridOf(win);
+        if (!grid || grid.destroyed || grid.destroying) {
+            return;
+        }
+        var entries = win.anasBackupTasks;
+        if (!isArray(entries)) {
+            return; // the read has not answered (or failed) — say nothing
+        }
+        var iqn = win.anasIqn;
+        try {
+            grid.getStore().each(function (rec) {
+                rec.set('backupBy', coveringTasks(entries, iqn, rec.get('index'), rec.get('backingPath')));
+            });
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // The "Back up…" button's menu, rebuilt on every selection: the covering
+    // tasks' Run/Edit — the Backup menu's own doors, nothing re-implemented
+    // here — or the wizard door when nothing covers the LUN (and when the read
+    // failed: fail-open).
+    function lunBackupMenuItems(win) {
+        var rec = selectedLun(win);
+        var entries = win.anasBackupTasks;
+        var covering = (rec && isArray(entries))
+            ? coveringTasks(entries, win.anasIqn, rec.get('index'), rec.get('backingPath'))
+            : null;
+        // `[]` is the "known and none" answer — it must take the wizard door,
+        // and an empty array is truthy in JS, so length decides, not the list.
+        if (covering && covering.length) {
+            var items = [];
+            for (var i = 0; i < covering.length; i++) {
+                (function (entry) {
+                    items.push({
+                        text: t('Run task ') + entry.name + t(' now'),
+                        cls: 'anas-lun-backup-run',
+                        handler: function () {
+                            if (ANAS.backup && ANAS.backup.runTaskNow) {
+                                ANAS.backup.runTaskNow(win.anasNode, entry.name, win);
+                            }
+                        }
+                    });
+                    items.push({
+                        text: t('Edit task ') + entry.name + t('…'),
+                        cls: 'anas-lun-backup-edit',
+                        handler: function () {
+                            var task = backupTaskByName(entries, entry.name);
+                            if (ANAS.backup && ANAS.backup.openEditTask && task) {
+                                ANAS.backup.openEditTask(win.anasView, win.anasNode, task);
+                            }
+                        }
+                    });
+                })(covering[i]);
+            }
+            return items;
+        }
+        return [{
+            text: t('Create backup task…'),
+            cls: 'anas-lun-backup-create',
+            handler: function () {
+                openBackupTaskForLun(win, win.anasView, win.anasNode, win.anasIqn, rec);
+            }
+        }];
+    }
+
+    // The "Create backup task…" door: the Backup menu's new-task wizard,
+    // pre-filled with ONE archive — the LUN's block image, named from the LUN,
+    // carrying the lun record a manual LUN pick records. It reaches the wizard
+    // through the same seed an edit passes through `archivesOf`, so the row is
+    // the one `addArchiveRow` builds for a manual pick, and the body the
+    // wizard sends is byte-identical.
+    function openBackupTaskForLun(win, view, node, iqn, rec) {
+        if (!rec || !ANAS.backup || !ANAS.backup.openNewTask) {
+            return;
+        }
+        // Double guard — the button is already dead in these states: a foreign
+        // or unresolved backing is something ANAS cannot say a backup would
+        // capture, and an absent backing has nothing to read.
+        var kind = rec.get('kind');
+        if (kind === 'foreign' || kind === 'unresolved'
+            || rec.get('backingExists') === false || !rec.get('backingPath')) {
+            return;
+        }
+        ANAS.backup.openNewTask(view, node, [{
+            name: lunArchiveName(rec.get('name'), rec.get('index')),
+            path: '' + rec.get('backingPath'),
+            excludes: [],
+            kind: 'img',
+            lun: { targetIqn: iqn, index: rec.get('index') }
+        }]);
+    }
+
     // The attribute summary an operator can act on, in words rather than flags.
     function lunAttributesHtml(attrs) {
         attrs = attrs || {};
@@ -1962,6 +2219,36 @@
                         + 'then Repair, before resizing.')
                     : (has && !kindOk ? t('The backing object is not storage ANAS manages') : ''))));
         btnSetTip(grid, 'lunDelete', foreign ? foreignTip : (live ? liveTip : ''));
+
+        // Back up… — a door into the backup side, so it needs what a restore
+        // needs minus the size (nothing is written onto it): a backing ANAS
+        // manages and one that is on this node right now. The coverage answer
+        // does NOT gate it — fail-open: a failed read still leaves the wizard
+        // door open, because a LUN nobody backs up is exactly the one that
+        // needs it.
+        var backupable = has && kind !== 'foreign' && kind !== 'unresolved'
+            && rec.get('backingExists') !== false && !!rec.get('backingPath');
+        setDisabled(grid, 'lunBackup', !has || foreign || !backupable);
+        btnSetTip(grid, 'lunBackup', foreign ? foreignTip
+            : (!has ? ''
+                : (kind === 'foreign'
+                    ? t('The backing object is not storage ANAS manages')
+                    : ((kind === 'unresolved' || rec.get('backingExists') === false)
+                        ? t('The backing object is not on this node right now — bring the storage '
+                            + 'back, then Repair, before it can be backed up.')
+                        : (!rec.get('backingPath')
+                            ? t('The backing path could not be read, so nothing can be backed up from it.')
+                            : '')))));
+        // The menu follows the selection: the covering tasks' Run/Edit (the
+        // Backup menu's own doors), or the wizard door.
+        try {
+            var backupBtn = grid.down('#lunBackup');
+            if (backupBtn && typeof backupBtn.setMenu === 'function') {
+                backupBtn.setMenu({ items: lunBackupMenuItems(win) });
+            }
+        } catch (eMenu) {
+            // non-fatal
+        }
     }
 
     function loadLuns(win, node, iqn, quiet) {
@@ -2011,6 +2298,9 @@
             renderSessionPanel(win, detail);
             renderFirewallAdvisory(win, detail);
             updateLunButtons(win);
+            // The poll re-loaded the rows; re-apply the badges from the cached
+            // coverage answer (no second read of the task list per tick).
+            applyBackupBadges(win);
         }, function (err) {
             if (grid.destroyed || grid.destroying) {
                 return;
@@ -2157,6 +2447,7 @@
                 { name: 'connectedInitiators', type: 'auto' },
                 { name: 'present', type: 'auto' },
                 { name: 'backingExists', type: 'auto' },
+                { name: 'backupBy', type: 'auto' },
                 'pool', 'dataset',
                 { name: 'raw', type: 'auto' }
             ],
@@ -2174,6 +2465,8 @@
                 height: 560,
                 layout: { type: 'vbox', align: 'stretch' },
                 anasIqn: iqn,
+                anasView: view,
+                anasNode: node,
                 items: [
                     {
                         xtype: 'gridpanel',
@@ -2189,6 +2482,7 @@
                             { text: t('Name (SCSI model)'), dataIndex: 'name', flex: 1, minWidth: 150 },
                             { text: t('Kind'), dataIndex: 'kind', width: 130, align: 'center', renderer: renderLunKind },
                             { text: t('Backing'), dataIndex: 'backingPath', flex: 2, minWidth: 220, sortable: false, renderer: renderBacking },
+                            { text: t('Backed up by'), dataIndex: 'backupBy', width: 170, sortable: false, menuDisabled: true, renderer: renderBackupBy },
                             {
                                 text: t('Size'), dataIndex: 'size', width: 110, align: 'right',
                                 renderer: function (v) {
@@ -2219,6 +2513,25 @@
                                 handler: function (btn) {
                                     var w = btn.up('#lunsGrid').up();
                                     openResizeLunDialog(w, view, node, iqn, selectedLun(w));
+                                }
+                            },
+                            {
+                                text: t('Back up…'),
+                                itemId: 'lunBackup',
+                                cls: 'anas-btn-lun-backup',
+                                iconCls: 'fa fa-cloud-upload',
+                                disabled: true,
+                                menu: { items: [] },
+                                handler: function (btn) {
+                                    try {
+                                        // The whole button opens the menu; the
+                                        // arrow does it natively.
+                                        if (typeof btn.showMenu === 'function') {
+                                            btn.showMenu();
+                                        }
+                                    } catch (e) {
+                                        // non-fatal
+                                    }
                                 }
                             },
                             {
@@ -2313,6 +2626,7 @@
 
         win.show();
         loadLuns(win, node, iqn);
+        loadBackupCoverage(win, node);
         startSessionPoll(win, node, iqn);
         return win;
     }
@@ -2372,6 +2686,24 @@
                                     }
                                 }
                             }
+                        },
+                        {
+                            // The one choice that is expensive to get wrong,
+                            // said BEFORE the LUN exists: a zvol grow is live
+                            // even under a connected initiator, an image-file
+                            // grow is a backstore recreate LIO refuses while an
+                            // initiator is logged in.
+                            xtype: 'component',
+                            itemId: 'lunKindNote',
+                            cls: 'anas-fld-lun-kind-note',
+                            margin: '0 0 8 0',
+                            style: 'color:gray;font-size:11px;',
+                            html: enc(t('Volumes (zvol) grow live, even while an initiator is connected. '
+                                + 'Image files have a fixed size in LIO - growing one recreates its '
+                                + 'backstore, which is refused while any initiator is logged in to the '
+                                + 'target (with Proxmox storage that means disabling the storage first). '
+                                + 'Choose a volume for anything you expect to grow; an image file for AHR '
+                                + 'pools or for things sized once.'))
                         },
                         {
                             xtype: 'combobox',

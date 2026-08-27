@@ -70,6 +70,16 @@
  *      travels as a FULL `<type>/<id>/<RFC3339>` (a bare group silently restores
  *      the latest); and a live session or an absent backing greys the button
  *      with the reason attached.
+ *   7b. The LUN toolbar is backup-aware: each LUN is badged with the backup
+ *      task(s) that cover it (an archive's `lun` record, or a pre-backup2.4
+ *      kind-`img` archive on the LUN's backing path) and their last-run
+ *      result; "Back up…" runs/edits the covering task through the Backup
+ *      menu's OWN doors (asserted on the job and dialog produced, not a copy),
+ *      or opens the new-task wizard pre-filled with the LUN's archive — whose
+ *      body is deep-equal to a manual LUN pick in that same wizard; the tasks
+ *      read failing shows no badge and gates nothing (fail-open, silent), and
+ *      a foreign target or an absent backing disables the door with the
+ *      reason.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -288,6 +298,9 @@ function makeComponent(cfg, parent) {
   // reason through it rather than assigning `.tooltip`, so the stub must model
   // it or their tooltips would be untestable.
   c.setTooltip = function (v) { c.tooltip = v || '' }
+  // ExtJS's own menu-button setter — the LUN toolbar's "Back up…" rebuilds its
+  // menu on every selection, so the stub must hold what setMenu hands it.
+  c.setMenu = function (m) { c.menu = m; return c }
   c.selectNode = function (node) {
     c._selection = node ? [node] : []
     c.fireEvent('selectionchange', {}, c._selection)
@@ -377,6 +390,18 @@ const ajax = { responses: {} }
 function openWindow() {
   for (let i = created.windows.length - 1; i >= 0; i--) {
     if (!created.windows[i].destroyed) { return created.windows[i] }
+  }
+  return null
+}
+
+/** Find a component by its `cls` where no itemId reaches (the wizard's
+ * "Add archive" and per-row "LUN…" buttons carry only a class). */
+function findCmp(cmp, cls) {
+  if (!cmp || cmp.destroyed) { return null }
+  if (cmp.cls === cls) { return cmp }
+  for (const kid of cmp.childCmps()) {
+    const hit = findCmp(kid, cls)
+    if (hit) { return hit }
   }
   return null
 }
@@ -2849,6 +2874,453 @@ async function iscsiRestoreSizeGateChecks() {
   ok('size gate: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+// ============================================================================
+//  5b. The LUN toolbar is backup-aware — "Backed up by" + "Back up…"
+//
+//  The LUN row offered a restore with no door to the backup. Now the LUNs
+//  window reads the task list ONCE (GET /backup/tasks — the list carries the
+//  full task with its archives plus lastRunResult/lastRunAt, so no second
+//  daemon endpoint exists or is needed):
+//    · each LUN is badged with the covering task(s) and their last-run
+//      result — coverage = an archive records the LUN's
+//      lun { targetIqn, index }, or (a pre-backup2.4 task) is kind 'img' of
+//      the LUN's backing path — or reads "not backed up";
+//    · "Back up…" offers the covering task's Run / Edit — the Backup menu's
+//      OWN doors (ANAS.backup.* in 68-backup.js), asserted on the job and
+//      dialog they produce, never a copy — or opens the new-task wizard
+//      pre-filled with the LUN's archive, whose body must be BYTE-IDENTICAL
+//      to a manual LUN pick in that same wizard;
+//    · fail-open: the tasks read failing shows no badge and gates nothing —
+//      the wizard door still works, and unknown is not "not backed up".
+//
+//  Both sources load into ONE sandbox (as on the real page) so the LUN
+//  toolbar's doors reach the real ANAS.backup surface.
+// ============================================================================
+
+/** The task list this section's node carries. */
+const LUN_BACKUP_TASKS = {
+  data: [
+    {
+      // Covers LUN 0 through the lun record (backup2.4) and LUN 1 through the
+      // PATH fallback (a pre-backup2.4 img archive, no record at all).
+      task: {
+        name: 'vmstore-luns',
+        repository: 'pbs-main',
+        backupId: 'vmstore',
+        archives: [
+          { name: 'vol1', path: '/dev/zvol/tank/vol1', excludes: [], kind: 'img', lun: { targetIqn: ISCSI_IQN, index: 0 } },
+          { name: 'vmdisk2', path: '/tank/images/vmdisk2.raw', excludes: [], kind: 'img' },
+          { name: 'etc', path: '/etc', excludes: [] },
+        ],
+        schedule: 'daily',
+        enabled: true,
+      },
+      lastRunResult: 'success',
+      lastRunAt: '2026-08-27T02:00:00Z',
+      nextRunAt: null,
+      overdue: false,
+    },
+    {
+      // A pxar-only task: covers nothing and must badge no LUN.
+      task: {
+        name: 'pictures',
+        repository: 'pbs-main',
+        backupId: 'pictures',
+        archives: [{ name: 'pictures', path: '/mnt/pictures', excludes: [] }],
+        schedule: 'daily',
+        enabled: true,
+      },
+      lastRunResult: 'failure',
+      lastRunAt: '2026-08-26T02:00:00Z',
+      nextRunAt: null,
+      overdue: false,
+    },
+    {
+      // A record on ANOTHER target: the record is { targetIqn, index }, so the
+      // index alone must never match.
+      task: {
+        name: 'other-lun',
+        repository: 'pbs-main',
+        backupId: 'other',
+        archives: [{ name: 'x', path: '/dev/zvol/other/x', excludes: [], kind: 'img', lun: { targetIqn: ISCSI_FOREIGN, index: 0 } }],
+        schedule: 'daily',
+        enabled: true,
+      },
+      lastRunResult: 'success',
+      lastRunAt: '2026-08-27T03:00:00Z',
+      nextRunAt: null,
+      overdue: false,
+    },
+    {
+      // A second cover for LUN 1, through its record — the "several tasks"
+      // case on the menu. Its path does NOT match the LUN (the record is the
+      // truth); its last run failed, so the two badges show two results.
+      task: {
+        name: 'repointed',
+        repository: 'pbs-main',
+        backupId: 'other',
+        archives: [{ name: 'vmdisk2-moved', path: '/tank/moved/vmdisk2.raw', excludes: [], kind: 'img', lun: { targetIqn: ISCSI_IQN, index: 1 } }],
+        schedule: 'daily',
+        enabled: true,
+      },
+      lastRunResult: 'failure',
+      lastRunAt: '2026-08-26T03:00:00Z',
+      nextRunAt: null,
+      overdue: false,
+    },
+  ],
+}
+
+/** The section's target: the usual two LUNs plus a THIRD, uncovered one whose
+ * name is free text — a SCSI model string — the archive-name rule must
+ * sanitise. */
+function lunsDetail(opts = {}) {
+  const base = iscsiDetail(opts)
+  base.luns.push({
+    index: 2,
+    name: 'vmdisk 3',
+    kind: 'zvol',
+    plugin: 'block',
+    backingPath: '/dev/zvol/tank/vol2',
+    size: 4 * GiB_,
+    serial: '12121212-3434-5656-7878-9a9a9a9a9a9a',
+    attributes: { emulateTpu: true, emulateTpws: true, blockSize: 512, writeBack: false, maxUnmapLbaCount: 262144 },
+    connectedInitiators: [],
+    present: true,
+    backingExists: true,
+    pool: 'tank',
+    dataset: 'tank/vol2',
+  })
+  return base
+}
+
+/** The wizard's LUN picker, in this section's sandbox: the uncovered LUN. */
+const LUN_BACKUP_SOURCES = {
+  data: {
+    installed: true,
+    luns: [{
+      targetIqn: ISCSI_IQN,
+      index: 2,
+      name: 'vmdisk 3',
+      kind: 'zvol',
+      path: '/dev/zvol/tank/vol2',
+      serial: '12121212-3434-5656-7878-9a9a9a9a9a9a',
+      size: 4 * GiB_,
+      backingExists: true,
+      consistency: {
+        consistency: 'snapshot',
+        reason: '/dev/zvol/tank/vol2 is the ZFS volume tank/vol2; the run snapshots the volume and reads the snapshot device',
+        backend: 'zfs',
+        target: 'tank/vol2',
+        zvolDevice: '/dev/zvol/tank/vol2',
+      },
+    }],
+  },
+}
+
+const LUN_BACKUP_ROUTES = {
+  ...ISCSI_ROUTES,
+  [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: lunsDetail() },
+  'GET /backup/tasks': LUN_BACKUP_TASKS,
+  'GET /backup/repos': { data: { version: 1, repos: [{ name: 'pbs-main', datastore: 'store1', source: 'anas' }] } },
+  'GET /backup/lun-sources': LUN_BACKUP_SOURCES,
+  'POST /backup/tasks/preview-nested': nestedPreviewRoute,
+  'GET /fs/browse': path => ({ data: { exists: true, path: path } }),
+}
+
+/** Both sources into one sandbox, then the iSCSI view — as on the real page. */
+async function openLunBackupView(routes) {
+  const ANAS = loadSources(['68-backup.js', '75-iscsi.js'], routes)
+  const view = makeComponent(ANAS.views.iscsi.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  return { ANAS, view, grid: view.down('#iscsiGrid') }
+}
+
+async function lunBackupBadgeChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { grid } = await openLunBackupView(LUN_BACKUP_ROUTES)
+  const lunsWin = await openLuns(grid, LUN_BACKUP_ROUTES)
+  ok('lunbackup: the window opened with three LUNs', !!lunsWin && lunsWin.down('#lunsGrid').getStore().getCount() === 3)
+  if (!lunsWin) { return }
+  const lunsGrid = lunsWin.down('#lunsGrid')
+  await settle()
+
+  const byCol = (lunsGrid.columns || []).find(c => c.dataIndex === 'backupBy')
+  ok('lunbackup: the grid has a "Backed up by" column', !!byCol)
+  const r0 = lunsGrid.getStore().getAt(0)
+  const r1 = lunsGrid.getStore().getAt(1)
+  const r2 = lunsGrid.getStore().getAt(2)
+
+  eq('lunbackup: LUN 0 is covered by the task whose archive records it',
+    r0.get('backupBy'),
+    [{ name: 'vmstore-luns', lastRunResult: 'success', lastRunAt: '2026-08-27T02:00:00Z' }])
+  eq('lunbackup: LUN 1 is covered by TWO tasks — a record and the path fallback',
+    r1.get('backupBy'),
+    [
+      { name: 'vmstore-luns', lastRunResult: 'success', lastRunAt: '2026-08-27T02:00:00Z' },
+      { name: 'repointed', lastRunResult: 'failure', lastRunAt: '2026-08-26T03:00:00Z' },
+    ])
+  eq('lunbackup: an uncovered LUN is an EMPTY list — "known and none", not unknown',
+    r2.get('backupBy'), [])
+
+  const cell0 = byCol.renderer(r0.get('backupBy'), {}, r0)
+  ok('lunbackup: the covered cell names the task and its last result',
+    /vmstore-luns/.test(cell0) && /success/.test(cell0), cell0)
+  ok('lunbackup: a pxar-only task never badges a LUN', !/pictures/.test(cell0), cell0)
+  const cell1 = byCol.renderer(r1.get('backupBy'), {}, r1)
+  ok('lunbackup: both covering tasks are named, each with its OWN result',
+    /vmstore-luns/.test(cell1) && /repointed/.test(cell1) && /failure/.test(cell1), cell1)
+  ok('lunbackup: a record on another target never matches on index alone',
+    !/other-lun/.test(cell1), cell1)
+  ok('lunbackup: an uncovered LUN reads "not backed up"',
+    /not backed up/.test(byCol.renderer(r2.get('backupBy'), {}, r2)))
+  ok('lunbackup: a failed read renders NOTHING — unknown is not "not backed up"',
+    byCol.renderer(undefined, {}, r2) === '' && byCol.renderer(null, {}, r2) === '')
+
+  ok('lunbackup: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function lunBackupMenuChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { ANAS, view, grid } = await openLunBackupView(LUN_BACKUP_ROUTES)
+  const lunsWin = await openLuns(grid, LUN_BACKUP_ROUTES)
+  const lunsGrid = lunsWin.down('#lunsGrid')
+  await settle()
+  const btn = lunsGrid.down('#lunBackup')
+  ok('lunbackup: the button exists and needs a selection', !!btn && btn.disabled === true)
+  if (!lunsWin) { return }
+
+  // --- LUN 0: covered by exactly one task — Run + Edit for THAT task ------
+  lunsGrid.selectRow(0)
+  ok('lunbackup: live on a covered LUN', btn.disabled === false)
+  let items = (btn.menu && btn.menu.items) || []
+  eq('lunbackup: a covered LUN offers exactly Run/Edit for its task',
+    items.map(i => i.text), ['Run task vmstore-luns now', 'Edit task vmstore-luns…'])
+
+  // Run — the Backup menu's OWN run path, asserted on the job it files.
+  jobs.length = 0
+  items[0].handler()
+  await settle()
+  eq('lunbackup: Run files the task\'s own /run job — the existing run path',
+    jobs.length === 1 ? [jobs[0].method, jobs[0].path, jobs[0].body] : null,
+    ['post', '/backup/tasks/vmstore-luns/run', {}])
+
+  // Edit — the Backup menu's OWN edit dialog, prefilled from the entry.
+  created.windows.length = 0
+  items[1].handler()
+  await settle()
+  const editDlg = openWindow()
+  ok('lunbackup: Edit opens the EXISTING edit dialog',
+    !!editDlg && /Edit Backup Task/.test(editDlg.title || ''), editDlg && editDlg.title)
+  eq('lunbackup: …on the covering task, prefilled from its entry',
+    editDlg && editDlg.down('#name') ? editDlg.down('#name').getValue() : null, 'vmstore-luns')
+  ok('lunbackup: the task\'s archives prefill as rows',
+    !!editDlg && archiveRows(editDlg).length === 3,
+    editDlg && `${archiveRows(editDlg).length}`)
+
+  // --- LUN 1: covered by two tasks — the same two actions, per task -------
+  lunsGrid.selectRow(1)
+  items = (btn.menu && btn.menu.items) || []
+  eq('lunbackup: several covering tasks get the same two actions each',
+    items.map(i => i.text),
+    ['Run task vmstore-luns now', 'Edit task vmstore-luns…', 'Run task repointed now', 'Edit task repointed…'])
+
+  // --- LUN 2: uncovered — the wizard door, and body identity ---------------
+  lunsGrid.selectRow(2)
+  ok('lunbackup: live on an uncovered LUN — the door is for exactly these',
+    btn.disabled === false)
+  items = (btn.menu && btn.menu.items) || []
+  eq('lunbackup: an uncovered LUN offers the wizard door',
+    items.map(i => i.text), ['Create backup task…'])
+
+  // Flow A — a MANUAL LUN pick in the plain New Task wizard: add a row, set
+  // the kind, pick the LUN through the wizard's own picker, type the name.
+  created.windows.length = 0
+  jobs.length = 0
+  ANAS.backup.openNewTask(view, 'harness', null)
+  await settle()
+  let wiz = openWindow()
+  ok('lunbackup: the plain door opens the NEW-task wizard',
+    !!wiz && /New Backup Task/.test(wiz.title || ''), wiz && wiz.title)
+  let rows = archiveRows(wiz)
+  eq('lunbackup: the plain door opens on the suggested etc row', rows.length, 1)
+  findCmp(wiz, 'anas-btn-backup-arch-add').handler()
+  await settle()
+  rows = archiveRows(wiz)
+  eq('lunbackup: "Add archive" grew the row list', rows.length, 2)
+  const mrow = rows[1]
+  mrow.down('#archKind').setValue('img')
+  await settle()
+  findCmp(mrow, 'anas-btn-backup-arch-lun').handler()
+  await settle()
+  const picker = openWindow()
+  ok('lunbackup: the manual door is the wizard\'s own LUN picker',
+    !!picker && /iSCSI LUN/.test(picker.title || ''), picker && picker.title)
+  picker.down('#lunGrid').selectRow(0)
+  picker.buttonCmps.find(b => b.cls === 'anas-btn-backup-lun-select').handler()
+  await settle()
+  eq('lunbackup: the pick fills the path', mrow.down('#archPath').getValue(), '/dev/zvol/tank/vol2')
+  eq('lunbackup: …and records the LUN at that path',
+    [mrow.anasLun, mrow.anasLunPath],
+    [{ targetIqn: ISCSI_IQN, index: 2 }, '/dev/zvol/tank/vol2'])
+  mrow.down('#archName').setValue('vmdisk-3')
+  wiz.down('#name').setValue('lun2-manual')
+  wiz.down('#schedule').setValue('daily')
+  wiz.down('#taskSubmitBtn').handler(wiz.down('#taskSubmitBtn'))
+  await settle()
+  eq('lunbackup: the manual wizard POSTs its archives',
+    jobs.length === 1 ? [jobs[0].method, jobs[0].path] : null, ['post', '/backup/tasks'])
+  const manualArchive = jobs.length
+    ? jobs[0].body.archives.find(a => a.path === '/dev/zvol/tank/vol2')
+    : null
+  ok('lunbackup: the manual pick sent its archive', !!manualArchive, JSON.stringify(jobs[0] && jobs[0].body))
+
+  // Flow B — the LUN toolbar's door: the SAME wizard, pre-filled.
+  created.windows.length = 0
+  jobs.length = 0
+  lunsGrid.selectRow(2) // the menu is rebuilt on selection
+  items = (btn.menu && btn.menu.items) || []
+  items[0].handler()
+  await settle()
+  wiz = openWindow()
+  ok('lunbackup: the door opens the NEW-task wizard',
+    !!wiz && /New Backup Task/.test(wiz.title || ''), wiz && wiz.title)
+  rows = archiveRows(wiz)
+  eq('lunbackup: pre-filled with exactly ONE archive row', rows.length, 1)
+  const row = rows[0]
+  eq('lunbackup: Kind = Block image', row.down('#archKind').getValue(), 'img')
+  eq('lunbackup: the path is the LUN\'s backing path', row.down('#archPath').getValue(), '/dev/zvol/tank/vol2')
+  eq('lunbackup: the name is the LUN name, sanitised to the wizard\'s rule',
+    row.down('#archName').getValue(), 'vmdisk-3')
+  eq('lunbackup: the LUN record rides with the path, as a manual pick records it',
+    [row.anasLun, row.anasLunPath],
+    [{ targetIqn: ISCSI_IQN, index: 2 }, '/dev/zvol/tank/vol2'])
+  wiz.down('#name').setValue('lun2-prefilled')
+  wiz.down('#schedule').setValue('daily')
+  wiz.down('#taskSubmitBtn').handler(wiz.down('#taskSubmitBtn'))
+  await settle()
+  eq('lunbackup: the pre-filled wizard POSTs exactly its one archive',
+    jobs.length === 1 ? jobs[0].body.archives.length : null, 1)
+
+  // The point of the door: the pre-filled body is BYTE-IDENTICAL to the
+  // manual pick's — same code path, one archive.
+  eq('lunbackup: the pre-filled archive body is deep-equal to the manual LUN pick',
+    jobs.length ? jobs[0].body.archives[0] : null, manualArchive)
+
+  ok('lunbackup: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function lunBackupFailOpenChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  // The tasks read FAILS: no badge, nothing gated, the door still works — and
+  // the failure is silent (a badge is display, not safety).
+  const routes = { ...LUN_BACKUP_ROUTES }
+  delete routes['GET /backup/tasks']
+  const { grid } = await openLunBackupView(routes)
+  const lunsWin = await openLuns(grid, routes)
+  const lunsGrid = lunsWin.down('#lunsGrid')
+  await settle()
+
+  ok('lunbackup(fail-open): a failed read leaves no badge',
+    lunsGrid.getStore().getAt(0).get('backupBy') === undefined)
+  const btn = lunsGrid.down('#lunBackup')
+  lunsGrid.selectRow(0)
+  ok('lunbackup(fail-open): the button is still LIVE — coverage does not gate it',
+    btn.disabled === false)
+  const items = (btn.menu && btn.menu.items) || []
+  eq('lunbackup(fail-open): unknown coverage still offers the wizard door',
+    items.map(i => i.text), ['Create backup task…'])
+  created.windows.length = 0
+  jobs.length = 0
+  items[0].handler()
+  await settle()
+  const wiz = openWindow()
+  const rows = wiz ? archiveRows(wiz) : []
+  ok('lunbackup(fail-open): the wizard opens on the LUN\'s archive',
+    !!wiz && rows.length === 1 && rows[0].down('#archPath').getValue() === '/dev/zvol/tank/vol1')
+  eq('lunbackup(fail-open): …with the LUN\'s record',
+    rows.length ? rows[0].anasLun : null, { targetIqn: ISCSI_IQN, index: 0 })
+
+  ok('lunbackup(fail-open): nothing warned — fail-open is silent',
+    warnings.length === 0, warnings.join(' | '))
+}
+
+async function lunBackupGatingChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  // A FOREIGN target: hands-off — the backup door is no exception.
+  const foreignRoutes = {
+    ...LUN_BACKUP_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_FOREIGN)}`]: {
+      data: {
+        ...ISCSI_TARGETS.targets[1],
+        luns: [{
+          index: 0, name: 'xvol', kind: 'foreign', plugin: 'fileio',
+          backingPath: '/unknown/x', size: GiB_, serial: 'ffffffff-0000-0000-0000-000000000000',
+          attributes: {}, connectedInitiators: [], present: true, backingExists: true,
+        }],
+        acls: [], sessions: [],
+      },
+    },
+  }
+  const { grid } = await openLunBackupView(foreignRoutes)
+  grid.selectRow(iscsiRowOf(grid, ISCSI_FOREIGN))
+  grid.down('#iscsiLuns').handler(grid.down('#iscsiLuns'))
+  await settle()
+  const fWin = openWindow()
+  const fGrid = fWin.down('#lunsGrid')
+  await settle()
+  fGrid.selectRow(0)
+  const fBtn = fGrid.down('#lunBackup')
+  ok('lunbackup(foreign): DISABLED on a foreign target', fBtn.disabled === true)
+  ok('lunbackup(foreign): and says the target is hands-off',
+    /not managed by ANAS/.test(fBtn.tooltip || ''), fBtn.tooltip)
+
+  // An ABSENT backing: there is nothing on this node to read.
+  const missing = lunsDetail()
+  missing.luns[2] = { ...missing.luns[2], backingExists: false }
+  const missingRoutes = {
+    ...LUN_BACKUP_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: missing },
+  }
+  const { grid: g2 } = await openLunBackupView(missingRoutes)
+  const mWin = await openLuns(g2, missingRoutes)
+  const mGrid = mWin.down('#lunsGrid')
+  await settle()
+  mGrid.selectRow(2)
+  const mBtn = mGrid.down('#lunBackup')
+  ok('lunbackup(absent): DISABLED when the backing is not on this node',
+    mBtn.disabled === true)
+  ok('lunbackup(absent): and points at Repair, the way the restore door does',
+    /Repair/.test(mBtn.tooltip || ''), mBtn.tooltip)
+
+  ok('lunbackup gating: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function addLunGrowthNoteChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { grid } = await openLunBackupView(LUN_BACKUP_ROUTES)
+  const lunsWin = await openLuns(grid, LUN_BACKUP_ROUTES)
+  const lunsGrid = lunsWin.down('#lunsGrid')
+  lunsGrid.down('#lunAdd').handler(lunsGrid.down('#lunAdd'))
+  await settle()
+  const dlg = openWindow()
+  const note = dlg && dlg.down('#lunKindNote')
+  ok('addlun: the growth note sits under the Kind choice', !!note)
+  const html = note ? note.html : ''
+  ok('addlun: it says a volume grows live, even under a connected initiator',
+    /Volumes \(zvol\) grow live, even while an initiator is connected/.test(html), html)
+  ok('addlun: …and that an image-file grow is a refused backstore recreate',
+    /recreates its backstore, which is refused while any initiator is logged in to the target/
+      .test(html), html)
+  ok('addlun: …and names the Proxmox consequence',
+    /with Proxmox storage that means disabling the storage first/.test(html), html)
+  ok('addlun: it gives the rule of thumb',
+    /Choose a volume for anything you expect to grow; an image file for AHR pools or for things sized once/
+      .test(html), html)
+  ok('addlun: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 async function iscsiAddressFallbackChecks() {
   // PVE's network API is unreadable: the picker must degrade to a free-text
   // field rather than leaving the operator with no way to enter an address.
@@ -4170,6 +4642,14 @@ for (const check of [
   iscsiRestoreDialogChecks,
   iscsiRestoreVerdictChecks,
   iscsiRestoreSizeGateChecks,
+  // The LUN toolbar is backup-aware: the "Backed up by" badge, the Back up…
+  // doors into the Backup menu's own run/edit/wizard, the body identity, the
+  // fail-open, the gating — and the Add LUN growth note.
+  lunBackupBadgeChecks,
+  lunBackupMenuChecks,
+  lunBackupFailOpenChecks,
+  lunBackupGatingChecks,
+  addLunGrowthNoteChecks,
 ]) {
   warnings.length = 0
   // `created.windows` is module-global; a dialog a previous section left open

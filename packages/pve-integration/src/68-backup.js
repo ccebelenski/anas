@@ -1361,6 +1361,21 @@
 
     ANAS.backup = ANAS.backup || {};
     ANAS.backup.reload = loadTasks;
+    // The second doors (a door opens the EXISTING dialog, never a second
+    // implementation): the iSCSI LUN toolbar (75-iscsi.js) reaches in here.
+    // runTaskNow is the Backup menu's Run Now on a task name; openEditTask is
+    // its Edit — the task object is exactly what the menu's grid record
+    // carries as `raw`; openNewTask is its New Task with pre-filled archive
+    // rows.
+    ANAS.backup.runTaskNow = function (node, name, view) {
+        runTaskByName(view, node, name);
+    };
+    ANAS.backup.openEditTask = function (view, node, task) {
+        openTaskDialog(view, node, task);
+    };
+    ANAS.backup.openNewTask = function (view, node, seedArchives) {
+        openTaskDialog(view, node, null, seedArchives);
+    };
 
     // ---- Toolbar state -----------------------------------------------------
 
@@ -2852,19 +2867,30 @@
         );
     }
 
-    function openTaskDialog(view, node, existing) {
+    /**
+     * `existing` = the task being edited (null on create). `seedArchives` =
+     * the archive rows a NEW task opens with when a second door pre-fills
+     * them — the iSCSI LUN toolbar hands the LUN's block-image archive — in
+     * place of the suggested etc default. The seed passes through the SAME
+     * `archivesOf` an edit round-trip does, so a pre-filled row is the same
+     * row a manual pick in the wizard builds.
+     */
+    function openTaskDialog(view, node, existing, seedArchives) {
         var isEdit = !!existing;
         var task = existing || {};
+        var seed = (!isEdit && isArray(seedArchives) && seedArchives.length)
+            ? archivesOf({ archives: seedArchives })
+            : null;
         loadRepoOptions(node).then(function (repoOpts) {
             if (!isEdit && !repoOpts.length) {
                 ANAS.toast(t('Register a PBS repository first (Repositories…).'));
                 return;
             }
-            buildTaskWindow(view, node, isEdit, task, repoOpts);
+            buildTaskWindow(view, node, isEdit, task, repoOpts, seed);
         });
     }
 
-    function buildTaskWindow(view, node, isEdit, task, repoOpts) {
+    function buildTaskWindow(view, node, isEdit, task, repoOpts, seedArchives) {
         var repoStore = Ext.create('Ext.data.Store', {
             fields: ['name', 'label'], data: repoOpts,
         });
@@ -3135,13 +3161,17 @@
         }
         syncRetentionControls(win);
 
-        // Seed the archive rows. Edit → the task's archives; new → the suggested
-        // etc.pxar:/etc default (the operator's own habit; removable = dismissible).
+        // Seed the archive rows. Edit → the task's archives; new → a second
+        // door's pre-filled archive (the iSCSI LUN toolbar's LUN), else the
+        // suggested etc.pxar:/etc default (the operator's own habit;
+        // removable = dismissible).
         var cont = win.down('#archivesContainer');
         if (cont) {
             var seed = archivesOf(task);
             if (!seed.length && !isEdit) {
-                seed = [{ name: 'etc', path: '/etc', excludes: [] }];
+                seed = (seedArchives && seedArchives.length)
+                    ? seedArchives
+                    : [{ name: 'etc', path: '/etc', excludes: [] }];
             }
             if (!seed.length) {
                 seed = [{ name: '', path: '', excludes: [] }];
@@ -3412,7 +3442,19 @@
         if (!rec) {
             return;
         }
-        var name = rec.get('name');
+        runTaskByName(view, node, rec.get('name'));
+    }
+
+    // The ONE run path: POST the task's /run, let the task's own systemd unit
+    // do the work, and supervise through the job (one code path, one history).
+    // The Backup menu hands a grid record; the iSCSI LUN toolbar (75-iscsi.js)
+    // reaches in through ANAS.backup.runTaskNow with just a name — both land
+    // here, so a run started from the LUNs window lands in the task's history
+    // like any other.
+    function runTaskByName(view, node, name) {
+        if (!name) {
+            return;
+        }
         var grid = gridOf(view);
         ANAS.runJob({
             node: node,
