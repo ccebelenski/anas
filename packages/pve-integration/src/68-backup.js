@@ -5518,13 +5518,14 @@
      */
     function restoreBody(ctx) {
         var c = ctx || {};
+        var mode = c.mode === 'newLocation' ? 'newLocation' : (c.mode === 'inPlace' ? 'inPlace' : 'sideBySide');
         var body = {
             kind: 'files',
             repo: c.repo,
             snapshot: c.snapshot,
             archive: c.archive,
             selections: isArray(c.selections) ? c.selections : [],
-            target: { mode: c.mode === 'inPlace' ? 'inPlace' : 'sideBySide' },
+            target: { mode: mode },
             options: {},
         };
         if (trim(c.ns)) {
@@ -5533,8 +5534,12 @@
         if (trim(c.task)) {
             body.task = trim(c.task);
         }
-        if (trim(c.home)) {
-            body.target.path = trim(c.home);
+        // In `sideBySide`/`inPlace` the path names the archive's live HOME. In
+        // `newLocation` (backup2.10) it IS the new directory the restore
+        // creates — always carried, so the daemon never has to guess.
+        var path = mode === 'newLocation' ? trim(c.newPath) : trim(c.home);
+        if (path) {
+            body.target.path = path;
         }
         var flags = ['ignoreOwnership', 'ignoreAcls', 'ignoreXattrs', 'ignorePermissions'];
         for (var i = 0; i < flags.length; i++) {
@@ -5548,6 +5553,24 @@
         return body;
     }
 
+    /**
+     * The target choice from the THREE radios — side-by-side (the default),
+     * in place, or a NEW location (backup2.10). Reads the radio group by
+     * itemId, never a mirrored flag.
+     */
+    function restoreTargetMode(win) {
+        try {
+            var g = win.down('#restoreTargetKind');
+            var v = g && g.getValue();
+            if (v && (v.restoreTarget === 'inPlace' || v.restoreTarget === 'newLocation')) {
+                return v.restoreTarget;
+            }
+        } catch (e) {
+            // fall through to the default
+        }
+        return 'sideBySide';
+    }
+
     /** The dialog's live context — every field read by itemId, never mirrored. */
     function restoreContext(win) {
         return {
@@ -5557,8 +5580,9 @@
             snapshot: trim(valOf(win, '#restoreSnapshot')),
             archive: trim(valOf(win, '#restoreArchive')),
             selections: isArray(win._selections) ? win._selections : [],
-            mode: valOf(win, '#restoreInPlace') === true ? 'inPlace' : 'sideBySide',
+            mode: restoreTargetMode(win),
             home: trim(valOf(win, '#restoreHome')),
+            newPath: trim(valOf(win, '#restoreNewLocation')),
             ignoreOwnership: valOf(win, '#restoreIgnoreOwnership') === true,
             ignoreAcls: valOf(win, '#restoreIgnoreAcls') === true,
             ignoreXattrs: valOf(win, '#restoreIgnoreXattrs') === true,
@@ -5614,6 +5638,13 @@
                     + enc(t('The selection includes a directory, so ANAS will ask you to confirm before it runs.'))
                     + '</span>';
             }
+        } else if (ctx.mode === 'newLocation') {
+            var loc = trim(ctx.newPath);
+            targetHtml = loc
+                ? '<span style="font-family:monospace;">' + enc(loc) + '</span><br>'
+                    + mutedSpan(t('A NEW directory of your choosing, created by this restore (parents included). '
+                        + 'Nothing already on disk is touched.'))
+                : mutedSpan(t('Name the NEW directory the restore creates.'));
         } else {
             var name = sideBySideName(ctx.home, ctx.snapshot);
             targetHtml = name
@@ -5622,6 +5653,17 @@
                 : mutedSpan(t('Pick a point in time and a source directory to see the target.'));
         }
         restoreNote(win, 'restoreTargetNote', targetHtml);
+
+        // The new-directory field and its note belong ONLY to the newLocation choice.
+        var nlocWrap = win.down('#restoreNewLocationWrap');
+        if (nlocWrap) {
+            nlocWrap.setHidden(ctx.mode !== 'newLocation');
+            nlocWrap.setDisabled(ctx.mode !== 'newLocation');
+        }
+        var nlocNote = win.down('#restoreNewLocationNote');
+        if (nlocNote) {
+            nlocNote.setHidden(ctx.mode !== 'newLocation');
+        }
 
         var bytes = archiveBytes(win._archives, ctx.archive);
         restoreNote(win, 'restoreEstimate', bytes === undefined
@@ -5758,6 +5800,43 @@
         });
     }
 
+    /**
+     * The newLocation door's directory browser (backup2.10): the SHARED path
+     * picker on the LIVE backend, choosing a directory. The typed/struck answer
+     * is the path of the NEW directory the restore will create — the picker
+     * happily names a directory that does not exist yet; that is the point.
+     */
+    function pickNewRestoreLocation(win, node) {
+        if (!ANAS.pathPicker) {
+            ANAS.warn('path picker unavailable');
+            return;
+        }
+        ANAS.pathPicker({
+            node: node,
+            backend: 'live',
+            mode: 'dir',
+            title: t('Choose the new directory'),
+            onSelect: function (paths) {
+                // A SINGLE-select picker hands back the path STRING (the field is
+                // authoritative); a multi-select one hands back an array. Both
+                // arrive here, and both are the directory the restore creates.
+                var picked = isArray(paths) ? paths[0] : paths;
+                if (!picked) {
+                    return;
+                }
+                try {
+                    var f = win.down('#restoreNewLocation');
+                    if (f) {
+                        f.setValue(picked);
+                    }
+                } catch (e) {
+                    // non-fatal
+                }
+                refreshRestore(win);
+            },
+        });
+    }
+
     /** Submit. The daemon owns every refusal; this only sends the body. */
     function submitRestore(win, node) {
         var ctx = restoreContext(win);
@@ -5765,6 +5844,15 @@
             restoreNote(win, 'restoreSelectionList',
                 '<span style="color:var(--anas-danger,#c23b2c);">'
                 + enc(t('Pick a point in time, an archive and at least one entry.')) + '</span>');
+            return;
+        }
+        // A newLocation restore is refused by the daemon without the directory it
+        // creates — say it before the button is pressed, in the target line.
+        if (ctx.mode === 'newLocation' && !ctx.newPath) {
+            restoreNote(win, 'restoreTargetNote',
+                '<span style="color:var(--anas-danger,#c23b2c);">'
+                + enc(t('Name the NEW directory this restore creates. It must not exist yet — the restore '
+                    + 'creates it and its parents; an existing directory is refused, never merged.')) + '</span>');
             return;
         }
         ANAS.confirmAndRun({
@@ -5957,14 +6045,65 @@
             value: o.home || '',
             listeners: { change: function () { refreshRestore(win); } },
         });
+        // backup2.10 — the THREE-way destination choice. Side-by-side is the
+        // default and stays untouched; in place keeps its merge/gate semantics;
+        // a NEW location names a directory the restore creates.
         items.push({
-            xtype: 'checkbox',
-            itemId: 'restoreInPlace',
-            cls: 'anas-chk-restore-inplace',
-            fieldLabel: t('Restore in place'),
-            boxLabel: t('write into the source directory itself (a merge, never a sync)'),
-            checked: false,
-            listeners: { change: function () { refreshRestore(win); } },
+            xtype: 'radiogroup',
+            itemId: 'restoreTargetKind',
+            cls: 'anas-fld-restore-target-kind',
+            fieldLabel: t('Restore to'),
+            labelWidth: 130,
+            columns: 1,
+            vertical: true,
+            items: [
+                { boxLabel: t('Original place (side-by-side)'), name: 'restoreTarget', inputValue: 'sideBySide', checked: true },
+                { boxLabel: t('Original place, in place (merge)'), name: 'restoreTarget', inputValue: 'inPlace' },
+                { boxLabel: t('New location…'), name: 'restoreTarget', inputValue: 'newLocation' },
+            ],
+            listeners: {
+                change: function (grp) {
+                    try {
+                        refreshRestore(grp.up('window'));
+                    } catch (e) {
+                        // non-fatal
+                    }
+                }
+            }
+        });
+        items.push({
+            xtype: 'fieldcontainer',
+            itemId: 'restoreNewLocationWrap',
+            fieldLabel: t('New directory'),
+            labelWidth: 130,
+            hidden: true,
+            disabled: true,
+            layout: 'hbox',
+            items: [
+                {
+                    xtype: 'textfield',
+                    itemId: 'restoreNewLocation',
+                    cls: 'anas-fld-restore-new-location',
+                    flex: 1,
+                    emptyText: t('/srv/restores/pictures-2026-08-25'),
+                    listeners: { change: function () { refreshRestore(win); } },
+                },
+                {
+                    xtype: 'button',
+                    itemId: 'restoreNewLocationBrowse',
+                    cls: 'anas-btn-restore-new-location-browse',
+                    text: t('Browse…'),
+                    margin: '0 0 0 6',
+                    handler: function () { pickNewRestoreLocation(win, node); },
+                },
+            ],
+        });
+        items.push({
+            xtype: 'component',
+            itemId: 'restoreNewLocationNote',
+            padding: '2 0 0 130',
+            html: mutedSpan(t('A NEW directory — it must NOT exist yet. The restore creates it, parents '
+                + 'included; an existing directory is refused, never merged into.')),
         });
         items.push({
             xtype: 'fieldcontainer',

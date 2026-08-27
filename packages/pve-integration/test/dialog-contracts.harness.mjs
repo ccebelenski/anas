@@ -2978,14 +2978,14 @@ const RESTORE_ROUTES = {
 /** Open the LUNs window, select LUN 0 (the 2 GiB zvol), open Restore. */
 async function openRestoreDialog(routes = RESTORE_ROUTES) {
   ajax.responses = { '/network': PVE_NETWORK }
-  const { view, grid } = await openIscsiView(routes)
+  const { ANAS, view, grid } = await openIscsiView(routes)
   const lunsWin = await openLuns(grid, routes)
   const lunsGrid = lunsWin.down('#lunsGrid')
   lunsGrid.selectRow(0)
   const btn = lunsGrid.down('#lunRestore')
   btn.handler(btn)
   await settle()
-  return { view, grid, lunsWin, lunsGrid, dlg: openWindow() }
+  return { ANAS, view, grid, lunsWin, lunsGrid, dlg: openWindow() }
 }
 
 async function iscsiRestoreGatingChecks() {
@@ -3214,6 +3214,10 @@ async function iscsiRestoreSizeGateChecks() {
       lun: { targetIqn: ISCSI_IQN, index: 0 },
       ns: 'anas',
     })
+  // backup2.10 — the in-place door is byte-identical to backup2.7's: no NEW
+  // `target` key appears just because the dialog now has a second door.
+  ok('restore: the in-place body carries NO `target` key (byte-identical to backup2.7)',
+    jobs.length && !('target' in jobs[0].body), JSON.stringify(jobs[0].body))
   ok('restore: it goes through the danger idiom (409 + confirm code)',
     jobs[0].confirmWindow === true)
   ok('restore: the LUNs window is still there to refresh', !!lunsWin)
@@ -3226,6 +3230,287 @@ async function iscsiRestoreSizeGateChecks() {
   ok('restore: a blank namespace sends no ns key', !('ns' in jobs[0].body), JSON.stringify(jobs[0].body))
 
   ok('size gate: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  7b. backup2.10 — restore the image AS A NEW LUN
+// ============================================================================
+//
+// The second door on the same dialog: instead of writing the image over the
+// source LUN, create a fresh backing at the image's OWN size on a target of the
+// operator's choosing, map it with a NEW serial, stream the image in — the
+// source LUN never goes offline. What this guards:
+//   · the in-place bodies above still carry NO `target` key (byte-identical);
+//   · the new-LUN form reuses the add-LUN door's kinds — a POOL for the zvol
+//     (the volume is created at the image's size, named after the LUN), a
+//     dataset OR an AHR pool for the image — and its `backing` is written
+//     exactly in the shared schema's discriminated shape;
+//   · the equality gate is a KNOWN-size gate for a new LUN: a 1 GiB image on a
+//     2 GiB LUN is fine, because the backing is created at the image's size;
+//   · name / target / backing validation blocks Save with the reason;
+//   · a daemon refusal surfaces VERBATIM in the dialog's own verdict line, and
+//     the finished identity lands in the result panel.
+
+async function iscsiRestoreNewLunChecks() {
+  const { dlg } = await openRestoreDialog()
+  if (!dlg) { return }
+  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit')
+
+  // --- the destination radios, and what each carries ----------------------
+  eq('restore(newLun): the dialog opens on "This LUN (in place)"',
+    dlg.down('#restoreDest').getValue(), { restoreDest: 'inPlace' })
+  ok('restore(newLun): the new-LUN form is hidden until its radio is chosen',
+    dlg.down('#newLunFields').hidden === true)
+  ok('restore(newLun): a hidden form is disabled too — a stale value cannot be read back',
+    dlg.down('#newLunFields').disabled === true)
+  ok('restore(newLun): the in-place restore-target line is visible by default',
+    dlg.down('#restoreTargetPath').hidden === false)
+
+  // --- the reads: the same two-call shape both doors use ------------------
+  dlg.down('#loadGroups').handler(dlg.down('#loadGroups'))
+  await settle()
+  dlg.down('#group').setValue('host/gtimgboth')
+  await settle()
+  dlg.down('#snapshot').setValue(RESTORE_SNAP)
+  await settle()
+  dlg.down('#archive').setValue('vol.img')
+  await settle()
+
+  dlg.down('#restoreDest').setValue('newLun')
+  await settle()
+  ok('restore(newLun): choosing the radio reveals the new-LUN form',
+    dlg.down('#newLunFields').hidden === false)
+  ok('restore(newLun): …and hides the in-place restore-target line',
+    dlg.down('#restoreTargetPath').hidden === true)
+  ok('restore(newLun): the source LUN is named as staying untouched',
+    (dlg.down('#newLunSource').getValue() || '').includes('vmdisk1'),
+    dlg.down('#newLunSource').getValue())
+  ok('restore(newLun): the note says the source stays online, no offline window, a FRESH serial',
+    /stays online/.test(dlg.down('#restoreNote').html || '')
+    && /no initiator/.test(dlg.down('#restoreNote').html || '')
+    && /FRESH/.test(dlg.down('#restoreNote').html || ''),
+    dlg.down('#restoreNote').html)
+
+  // The target combo offers ANAS-owned targets only; the current one is default.
+  const targets = dlg.down('#newLunTarget').getStore().getRange().map(r => r.get('value'))
+  eq('restore(newLun): only ANAS-owned targets are offered, never a foreign one',
+    targets, [ISCSI_IQN])
+  eq('restore(newLun): the current target pre-fills', dlg.down('#newLunTarget').getValue(), ISCSI_IQN)
+
+  // The backing lists reuse the add-LUN door's reads: pools for the zvol, and
+  // the dataset/AHR list for the image — with the source flag that keeps the
+  // `dataset` vs `ahrPool` phrase honest.
+  const pools = dlg.down('#newLunPool').getStore().getRange().map(r => r.get('name'))
+  ok('restore(newLun): the zvol picker offers ANAS-managed pools', pools.includes('tank'), JSON.stringify(pools))
+  ok('restore(newLun): a PVE-managed pool is never a candidate', !pools.includes('pvepool'))
+  const dirs = dlg.down('#filePicker').getStore().getRange()
+  ok('restore(newLun): the image picker marks a dataset row with its source',
+    !!dirs.find(r => r.get('name') === 'tank/images' && r.get('source') === 'dataset'))
+  ok('restore(newLun): the image picker marks an AHR pool row with its source',
+    !!dirs.find(r => r.get('name') === 'ahrpool' && r.get('source') === 'ahr'))
+
+  // --- validation blocks Save, with the reason ----------------------------
+  const blocked = async () => {
+    jobs.length = 0
+    submit.handler(submit)
+    await settle()
+    return jobs.length === 0
+  }
+
+  dlg.down('#newLunName').setValue('')
+  await settle()
+  ok('restore(newLun): a missing name blocks Save', await blocked())
+  ok('restore(newLun): the reason names the missing name',
+    /Enter a LUN name/.test(dlg.down('#newLunVerdict').html), dlg.down('#newLunVerdict').html)
+
+  dlg.down('#newLunName').setValue('vmdisk1')
+  await settle()
+  ok('restore(newLun): a taken name blocks Save', await blocked())
+  ok('restore(newLun): the reason is the daemon\'s own — a name is a node-global SCSI model string',
+    /already exists on this node/.test(dlg.down('#newLunVerdict').html), dlg.down('#newLunVerdict').html)
+
+  dlg.down('#newLunName').setValue('vmdisk-new')
+  dlg.down('#newLunTarget').setValue('')
+  await settle()
+  ok('restore(newLun): a missing target blocks Save', await blocked())
+  ok('restore(newLun): the reason names the missing target',
+    /ANAS-managed target/.test(dlg.down('#newLunVerdict').html), dlg.down('#newLunVerdict').html)
+  dlg.down('#newLunTarget').setValue(ISCSI_IQN)
+  await settle()
+
+  dlg.down('#newLunPool').setValue('')
+  await settle()
+  ok('restore(newLun): a missing pool blocks Save', await blocked())
+  ok('restore(newLun): the reason names the pool',
+    /ZFS pool/.test(dlg.down('#newLunVerdict').html), dlg.down('#newLunVerdict').html)
+  dlg.down('#newLunPool').setValue('tank')
+  await settle()
+
+  // --- the newLun body, in the shared schema's exact shape ----------------
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('restore(newLun): one request', jobs.length, 1)
+  eq('restore(newLun): the zvol body is target={mode,targetIqn,name,backing:{kind:zvol,pool}}',
+    jobs.length && jobs[0].body, {
+      kind: 'image',
+      repo: 'pbs-main',
+      snapshot: RESTORE_SNAP,
+      archive: 'vol.img',
+      target: {
+        mode: 'newLun',
+        targetIqn: ISCSI_IQN,
+        name: 'vmdisk-new',
+        backing: { kind: 'zvol', pool: 'tank' },
+      },
+      ns: 'anas',
+    })
+  ok('restore(newLun): a newLun body never sends the in-place `lun` key',
+    jobs.length && !('lun' in jobs[0].body), JSON.stringify(jobs[0].body))
+  ok('restore(newLun): it goes through the danger idiom too (the daemon confirm-gates a create)',
+    jobs.length && jobs[0].confirmWindow === true)
+
+  // File backing on a dataset.
+  dlg.down('#newLunName').setValue('disk-new-img')
+  dlg.down('#newLunKind').setValue({ lunKind: 'file' })
+  await settle()
+  ok('restore(newLun): the file kind swaps the pool picker for the dataset/AHR picker',
+    dlg.down('#newLunPool').hidden === true && dlg.down('#filePicker').hidden === false,
+    `${dlg.down('#newLunPool').hidden}/${dlg.down('#filePicker').hidden}`)
+  dlg.down('#filePicker').setValue('tank/images')
+  await settle()
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('restore(newLun): a file-on-dataset backing is {kind:file, dataset}',
+    jobs.length && jobs[0].body.target && jobs[0].body.target.backing,
+    { kind: 'file', dataset: 'tank/images' })
+
+  // File backing on an AHR pool.
+  dlg.down('#filePicker').setValue('ahrpool')
+  await settle()
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('restore(newLun): a file-on-AHR backing is {kind:file, ahrPool}',
+    jobs.length && jobs[0].body.target && jobs[0].body.target.backing,
+    { kind: 'file', ahrPool: 'ahrpool' })
+
+  // --- a new LUN needs NO size equality — only a KNOWN size ----------------
+  // The 1 GiB image is a MISMATCH for the 2 GiB LUN in place (the size gate
+  // above). As a new LUN the backing is CREATED at 1 GiB, so it is legal.
+  dlg.down('#archive').setValue('small.img')
+  await settle()
+  ok('restore(newLun): the verdict speaks of the image size, never "SMALLER"',
+    /at exactly the image/.test(dlg.down('#newLunVerdict').html), dlg.down('#newLunVerdict').html)
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('restore(newLun): a 1 GiB image on a 2 GiB LUN is a WHOLE legal new-LUN body',
+    jobs.length && jobs[0].body, {
+      kind: 'image',
+      repo: 'pbs-main',
+      snapshot: RESTORE_SNAP,
+      archive: 'small.img',
+      target: {
+        mode: 'newLun',
+        targetIqn: ISCSI_IQN,
+        name: 'disk-new-img',
+        backing: { kind: 'file', ahrPool: 'ahrpool' },
+      },
+      ns: 'anas',
+    })
+
+  // A blank namespace still sends no ns key in the newLun body.
+  dlg.down('#ns').setValue('')
+  await settle()
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  ok('restore(newLun): a blank namespace sends no ns key in a newLun body',
+    jobs.length && !('ns' in jobs[0].body), JSON.stringify(jobs[0].body))
+
+  ok('restore(newLun): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  7c. backup2.10 — a daemon refusal surfaces VERBATIM, and the result panel
+// ============================================================================
+//
+// The dialog's local checks catch what they can see; the daemon owns the rest
+// (a name taken on ANOTHER target, a backing that resolves to nobody's storage,
+// an unknown image size, …). Its refusal must appear on the SAME verdict line,
+// in its own words — and the finished newLun restore lands the new LUN's
+// identity (index, name, serial, backing path) in the result panel.
+
+async function iscsiRestoreRefusalAndResultChecks() {
+  const { ANAS, dlg } = await openRestoreDialog()
+  if (!dlg) { return }
+  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit')
+
+  dlg.down('#loadGroups').handler(dlg.down('#loadGroups'))
+  await settle()
+  dlg.down('#group').setValue('host/gtimgboth')
+  await settle()
+  dlg.down('#snapshot').setValue(RESTORE_SNAP)
+  await settle()
+  dlg.down('#archive').setValue('vol.img')
+  await settle()
+  dlg.down('#restoreDest').setValue('newLun')
+  await settle()
+  dlg.down('#newLunName').setValue('vmdisk-new')
+  dlg.down('#newLunTarget').setValue(ISCSI_IQN)
+  dlg.down('#newLunPool').setValue('tank')
+  await settle()
+
+  // --- the daemon refuses (409, no confirm code) --------------------------
+  const refusal = "A LUN named 'vmdisk-new' already exists on this node. The name is the SCSI model string initiators see, so it has to be unique."
+  const recordOnly = cfg => {
+    jobs.push({ method: cfg.method, path: cfg.path, body: cfg.body })
+    if (cfg.onFailed) { cfg.onFailed({ error: { message: refusal } }) }
+  }
+  ANAS.confirmAndRun = recordOnly
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('restore(refuse): the request still reached the daemon',
+    jobs.length && [jobs[0].method, jobs[0].path], ['post', '/backup/restore'])
+  ok('restore(refuse): the daemon\'s refusal is on screen VERBATIM, in the dialog\'s own line',
+    (dlg.down('#newLunVerdict').html || '').includes(refusal), dlg.down('#newLunVerdict').html)
+  ok('restore(refuse): the dialog is still open to fix the form', dlg.destroyed !== true)
+
+  // --- the restore completes: the new LUN's identity lands in the result panel
+  const completed = cfg => {
+    jobs.push({ method: cfg.method, path: cfg.path, body: cfg.body })
+    if (cfg.onComplete) {
+      cfg.onComplete({
+        result: {
+          newLun: {
+            targetIqn: ISCSI_IQN,
+            index: 2,
+            name: 'vmdisk-new',
+            serial: '11111111-2222-3333-4444-555555555555',
+            backingPath: '/dev/zvol/tank/vmdisk-new',
+          },
+        },
+      })
+    }
+  }
+  ANAS.confirmAndRun = completed
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('restore(result): the resubmitted request is the same shape',
+    jobs.length && jobs[0].body.target && jobs[0].body.target.name, 'vmdisk-new')
+  const panel = dlg.down('#restoreResult').html || ''
+  ok('restore(result): the result panel names the NEW LUN and its LUN number',
+    /vmdisk-new/.test(panel) && /LUN 2/.test(panel), panel)
+  ok('restore(result): the result panel shows the target', /iqn\.2026-08\.nas\.anas:vmstore/.test(panel), panel)
+  ok('restore(result): the result panel shows the FRESH serial', /11111111-2222-3333-4444-555555555555/.test(panel), panel)
+  ok('restore(result): the result panel shows the backing created, and that the source was untouched',
+    /\/dev\/zvol\/tank\/vmdisk-new/.test(panel) && /never touched/.test(panel), panel)
+
+  ok('restore(result): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 // ============================================================================
@@ -4838,6 +5123,10 @@ async function restoreChecks() {
     R.needsConfirm('inPlace', [FILE_ROW]) === false)
   ok('file restore: side-by-side is never gated, even for a whole tree',
     R.needsConfirm('sideBySide', [DIR_ROW]) === false)
+  // backup2.10 — a NEW location is even less dangerous than side-by-side: it
+  // writes only into a directory the restore itself creates, so it is never gated.
+  ok('file restore: a new location is never gated, even for a whole tree',
+    R.needsConfirm('newLocation', [DIR_ROW]) === false)
   ok('file restore: a typed selection with no row is not gated either',
     R.needsConfirm('inPlace', []) === false)
 
@@ -4866,6 +5155,20 @@ async function restoreChecks() {
   })
   eq('file restore: the in-place body differs ONLY in the mode',
     R.restoreBody({ ...CTX, mode: 'inPlace' }).target, { mode: 'inPlace', path: '/mnt/pictures' })
+  // backup2.10 — the third door. newLocation carries the chosen path (trimmed)
+  // as the target, and its home is IGNORED (the daemon creates the new dir from
+  // `target.path`, never from the archive's live home).
+  eq('file restore: the newLocation body carries the chosen NEW directory',
+    R.restoreBody({ ...CTX, mode: 'newLocation', newPath: ' /srv/restores/pictures ' }).target,
+    { mode: 'newLocation', path: '/srv/restores/pictures' })
+  eq('file restore: sideBySide/inPlace bodies ignore the newLocation path field',
+    R.restoreBody({ ...CTX, home: '/mnt/pictures', newPath: '/srv/restores/pictures' }).target,
+    { mode: 'sideBySide', path: '/mnt/pictures' })
+  // Every key OUTSIDE `target` is byte-identical to the side-by-side body —
+  // the new door changes exactly one thing.
+  eq('file restore: every other key of a newLocation body is byte-identical to today',
+    (() => { const a = R.restoreBody({ ...CTX, mode: 'newLocation', newPath: '/srv/restores/pictures' }); delete a.target; return a })(),
+    (() => { const a = R.restoreBody(CTX); delete a.target; return a })())
   eq('file restore: the task-less door sends no task key',
     Object.prototype.hasOwnProperty.call(R.restoreBody({ ...CTX, task: '' }), 'task'), false)
   eq('file restore: an empty namespace is ABSENT, never an empty string',
@@ -4973,7 +5276,7 @@ async function restoreChecks() {
   const snapSelect2 = snapWin2.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
   snapSelect2.handler(snapSelect2)
   await settle()
-  dlg2.down('#restoreInPlace').setValue(true)
+  dlg2.down('#restoreTargetKind').setValue('inPlace')
   const filesBtn2 = dlg2.down('#restoreFilesPick')
   filesBtn2.handler(filesBtn2)
   await settle()
@@ -4994,6 +5297,85 @@ async function restoreChecks() {
     path: '/mnt/pictures',
   })
   eq('file restore: …and the directory selection', jobs.length && jobs[0].body.selections, ['/docs'])
+
+  // --- backup2.10: the NEW LOCATION door, end to end ------------------------
+  jobs.length = 0
+  const dlgN = openFileRestoreDialog(ANAS, {
+    task: 'nightly-pictures',
+    repo: 'pbs-main',
+    ns: 'anas/pictures',
+    homeByArchive: { data: '/mnt/pictures' },
+  })
+  // Point in time → picker → Select; files → archive picker → alpha.txt.
+  const snapBtnN = dlgN.down('#restoreSnapPick')
+  snapBtnN.handler(snapBtnN)
+  await settle()
+  const snapWinN = openWindow()
+  snapWinN.down('#snapGrid').selectRow(0)
+  const snapSelectN = snapWinN.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelectN.handler(snapSelectN)
+  await settle()
+  const filesBtnN = dlgN.down('#restoreFilesPick')
+  filesBtnN.handler(filesBtnN)
+  await settle()
+  const fpN = openWindow()
+  const alphaN = fpN.down('#pickerTree').getStore().getRootNode().childNodes.find(n => n.get('name') === 'alpha.txt')
+  fpN.down('#pickerTree').fireEvent('selectionchange', fpN.down('#pickerTree').getSelectionModel(), [alphaN])
+  const fselectN = fpN.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  fselectN.handler(fselectN)
+  await settle()
+
+  // The third radio reveals the directory field; the first two do not carry it.
+  ok('file restore: the new-directory field is hidden until "New location…" is chosen',
+    dlgN.down('#restoreNewLocationWrap').hidden === true)
+  ok('file restore: the new-directory note says it must NOT exist yet',
+    /must NOT exist/.test(dlgN.down('#restoreNewLocationNote').html || ''),
+    dlgN.down('#restoreNewLocationNote').html)
+  dlgN.down('#restoreTargetKind').setValue('newLocation')
+  await settle()
+  ok('file restore: choosing "New location…" reveals the directory field',
+    dlgN.down('#restoreNewLocationWrap').hidden === false)
+
+  // The Browse button opens the SHARED path picker on the LIVE backend, for a
+  // DIRECTORY; typing a new name is the whole point (the tree shows its parent).
+  created.windows.length = 0
+  dlgN.down('#restoreNewLocationBrowse').handler()
+  await settle()
+  const newPicker = openWindow()
+  ok('file restore: the Browse button opened the SHARED picker on the LIVE backend',
+    newPicker && newPicker.cls === 'anas-win-path-picker'
+    && newPicker._backend && newPicker._backend.key === 'live',
+    newPicker && newPicker.cls)
+  newPicker.down('#pickerPath').setValue('/mnt/pictures/restore-new')
+  await settle()
+  const pickSelectN = newPicker.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  pickSelectN.handler(pickSelectN)
+  await settle()
+  eq('file restore: the picked new directory landed in the field',
+    dlgN.down('#restoreNewLocation').getValue(), '/mnt/pictures/restore-new')
+  ok('file restore: the target line names the NEW directory and that it is created',
+    (dlgN.down('#restoreTargetNote').html || '').includes('/mnt/pictures/restore-new')
+    && /NEW directory/.test(dlgN.down('#restoreTargetNote').html || ''),
+    dlgN.down('#restoreTargetNote').html)
+
+  const submitN = dlgN.down('#restoreSubmit')
+  submitN.handler(submitN)
+  await settle()
+  ok('file restore: the newLocation dialog submitted exactly one request', jobs.length === 1, `${jobs.length}`)
+  eq('file restore: the newLocation body carries exactly the new target',
+    jobs.length && jobs[0].body, {
+      kind: 'files',
+      repo: 'pbs-main',
+      snapshot: 'host/pictures/2026-08-25T19:16:45Z',
+      archive: 'data.pxar',
+      selections: ['/alpha.txt'],
+      target: { mode: 'newLocation', path: '/mnt/pictures/restore-new' },
+      options: {},
+      ns: 'anas/pictures',
+      task: 'nightly-pictures',
+    })
+  ok('file restore: a newLocation restore is NEVER confirm-gated',
+    jobs.length && jobs[0].confirmWindow === false, JSON.stringify(jobs[0] && jobs[0].confirmWindow))
 
   // Nothing may be sent without a selection.
   jobs.length = 0
@@ -5114,6 +5496,10 @@ for (const check of [
   iscsiRestoreDialogChecks,
   iscsiRestoreVerdictChecks,
   iscsiRestoreSizeGateChecks,
+  // Story backup2.10 — restore the image AS A NEW LUN (target/newLun), and
+  // the daemon refusal + the finished identity on the result panel.
+  iscsiRestoreNewLunChecks,
+  iscsiRestoreRefusalAndResultChecks,
   // The LUN toolbar is backup-aware: the "Backed up by" badge, the Back up…
   // doors into the Backup menu's own run/edit/wizard, the body identity, the
   // fail-open, the gating — and the Add LUN growth note.

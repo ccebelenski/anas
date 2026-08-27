@@ -2871,6 +2871,33 @@
      * tree applies. The dataset/AHR list is the same read, filesystems only, plus
      * the AHR pools (a file on the btrfs volume is AHR's only block object).
      */
+    // The image-file picker must know WHICH phrase the daemon wants in the new
+    // LUN's backing (backup2.10): an image on `tank/images` is a `dataset`, one
+    // on AHR storage is an `ahrPool` — exactly one of the two, and guessing
+    // wrong would hand the daemon a name it resolves to nobody's storage.
+    function applyBackingStores(win, zvols, dirs, pools) {
+        var apply = function (sel, data, extraFields) {
+            try {
+                var f = win.down(sel);
+                if (!f) {
+                    return; // a dialog that does not have the field is unaffected
+                }
+                f.setStore(Ext.create('Ext.data.Store', {
+                    fields: ['name', 'label'].concat(extraFields || []),
+                    data: data || []
+                }));
+            } catch (e) {
+                // non-fatal — the field stays free-text
+            }
+        };
+        apply('#zvolPicker', zvols);
+        apply('#filePicker', dirs, ['source']);
+        // The new-LUN restore door backs a zvol with a POOL (the volume is
+        // created at the image's size, named after the LUN) — a different pick
+        // than the add-LUN dialog's existing-volume list, so it is its own list.
+        apply('#newLunPool', pools);
+    }
+
     function loadBackingChoices(node, win) {
         ANAS.api.get(node, '/pools').then(function (res) {
             if (win.destroyed || win.destroying) {
@@ -2880,17 +2907,19 @@
             var pending = 0;
             var zvols = [];
             var dirs = [];
+            var anasPools = [];
             var i;
             for (i = 0; i < pools.length; i++) {
                 var p = pools[i] || {};
                 if (isArray(p.pveStorages) && p.pveStorages.length) {
                     continue; // PVE territory — hands-off
                 }
+                anasPools.push({ name: p.name, label: p.name });
                 pending++;
                 collectFromPool(node, win, p.name, zvols, dirs, function () {
                     pending--;
                     if (pending <= 0) {
-                        applyBackingStores(win, zvols, dirs);
+                        applyBackingStores(win, zvols, dirs, anasPools);
                     }
                 });
             }
@@ -2907,19 +2936,19 @@
                 for (var k = 0; k < apools.length; k++) {
                     var a = apools[k] || {};
                     if (a.name && a.mounted) {
-                        dirs.push({ name: a.name, label: a.name + ' (' + t('AHR pool') + ')' });
+                        dirs.push({ name: a.name, label: a.name + ' (' + t('AHR pool') + ')', source: 'ahr' });
                     }
                 }
                 if (pending <= 0) {
-                    applyBackingStores(win, zvols, dirs);
+                    applyBackingStores(win, zvols, dirs, anasPools);
                 }
             }, function () {
                 if (pending <= 0) {
-                    applyBackingStores(win, zvols, dirs);
+                    applyBackingStores(win, zvols, dirs, anasPools);
                 }
             });
             if (!pools.length) {
-                applyBackingStores(win, zvols, dirs);
+                applyBackingStores(win, zvols, dirs, anasPools);
             }
         }, function (err) {
             ANAS.warn('iscsi backing choices failed: ' + ANAS.errText(err));
@@ -2952,29 +2981,13 @@
                         label: d.name + (d.volsize ? ' (' + fmtBytes(d.volsize) + ')' : '')
                     });
                 } else if (d.mountpoint && d.mountpoint !== 'none' && d.mountpoint !== '-') {
-                    dirs.push({ name: d.name, label: d.name + ' → ' + d.mountpoint });
+                    dirs.push({ name: d.name, label: d.name + ' → ' + d.mountpoint, source: 'dataset' });
                 }
             }
             done();
         }, function () {
             done();
         });
-    }
-
-    function applyBackingStores(win, zvols, dirs) {
-        try {
-            if (win.destroyed || win.destroying) {
-                return;
-            }
-            win.down('#zvolPicker').setStore(Ext.create('Ext.data.Store', {
-                fields: ['name', 'label'], data: zvols
-            }));
-            win.down('#filePicker').setStore(Ext.create('Ext.data.Store', {
-                fields: ['name', 'label'], data: dirs
-            }));
-        } catch (e) {
-            // non-fatal — both fields stay free-text
-        }
     }
 
     function submitAddLun(win, lunsWin, view, node, iqn) {
@@ -3332,6 +3345,141 @@
                             value: enc(backing) + ' (' + enc(t('LUN')) + ' ' + enc(lunIndex) + ')'
                         },
                         {
+                            // backup2.10 — the TWO doors. In place is today's
+                            // restore (the whole target offline, the image must
+                            // be EXACTLY this LUN's size). A NEW LUN creates the
+                            // backing at the image's own size on a target of the
+                            // operator's choosing, and the source LUN is never
+                            // touched — no offline window, a FRESH serial.
+                            xtype: 'radiogroup',
+                            itemId: 'restoreDest',
+                            cls: 'anas-fld-restore-dest',
+                            fieldLabel: t('Restore to'),
+                            columns: 1,
+                            vertical: true,
+                            items: [
+                                { boxLabel: t('This LUN (in place)'), name: 'restoreDest', inputValue: 'inPlace', checked: true },
+                                { boxLabel: t('A new LUN…'), name: 'restoreDest', inputValue: 'newLun' }
+                            ],
+                            listeners: {
+                                change: function (grp) {
+                                    applyRestoreDest(grp.up('window'));
+                                }
+                            }
+                        },
+                        {
+                            xtype: 'fieldset',
+                            itemId: 'newLunFields',
+                            cls: 'anas-fld-restore-newlun',
+                            title: t('New LUN'),
+                            hidden: true,
+                            disabled: true,
+                            defaults: { anchor: '100%' },
+                            items: [
+                                {
+                                    xtype: 'displayfield',
+                                    itemId: 'newLunSource',
+                                    fieldLabel: t('Source stays'),
+                                    value: enc(rec.get('name')) + ' — ' + enc(backing) + ' (' + enc(t('LUN')) + ' ' + enc(lunIndex) + ')'
+                                },
+                                {
+                                    xtype: 'combobox',
+                                    itemId: 'newLunTarget',
+                                    cls: 'anas-fld-restore-newlun-target',
+                                    fieldLabel: t('On target'),
+                                    store: comboStore(['value', 'label'], []),
+                                    valueField: 'value',
+                                    displayField: 'label',
+                                    queryMode: 'local',
+                                    editable: false,
+                                    forceSelection: true,
+                                    emptyText: t('(loading…)'),
+                                    listeners: {
+                                        change: function (c) { updateNewLunVerdict(c.up('window'), selectedArchiveSize(c.up('window'))); }
+                                    }
+                                },
+                                {
+                                    xtype: 'textfield',
+                                    itemId: 'newLunName',
+                                    cls: 'anas-fld-restore-newlun-name',
+                                    fieldLabel: t('LUN name'),
+                                    allowBlank: false,
+                                    emptyText: 'vmdisk1',
+                                    listeners: {
+                                        change: function (c) { updateNewLunVerdict(c.up('window'), selectedArchiveSize(c.up('window'))); }
+                                    }
+                                },
+                                {
+                                    // The backing kinds a restore CREATES — the
+                                    // same two as the add-LUN door, but a restore
+                                    // never maps an EXISTING object: the zvol is
+                                    // a new volume ON a pool, the image is a new
+                                    // file on a dataset or AHR pool.
+                                    xtype: 'radiogroup',
+                                    itemId: 'newLunKind',
+                                    cls: 'anas-fld-restore-newlun-kind',
+                                    fieldLabel: t('Backed by'),
+                                    columns: 1,
+                                    vertical: true,
+                                    items: [
+                                        { boxLabel: t('A new ZFS volume (zvol) on a ZFS pool'), name: 'lunKind', inputValue: 'zvol', checked: true },
+                                        { boxLabel: t('A new raw image file on a dataset or AHR pool'), name: 'lunKind', inputValue: 'file' }
+                                    ],
+                                    listeners: {
+                                        change: function (grp) {
+                                            applyNewLunKind(grp.up('window'));
+                                            updateNewLunVerdict(grp.up('window'), selectedArchiveSize(grp.up('window')));
+                                        }
+                                    }
+                                },
+                                {
+                                    xtype: 'combobox',
+                                    itemId: 'newLunPool',
+                                    cls: 'anas-fld-restore-newlun-pool',
+                                    fieldLabel: t('ZFS pool'),
+                                    queryMode: 'local',
+                                    editable: false,
+                                    forceSelection: true,
+                                    displayField: 'label',
+                                    valueField: 'name',
+                                    store: comboStore(['name', 'label'], []),
+                                    emptyText: t('(the ZFS pool the volume is created on)'),
+                                    listeners: {
+                                        change: function (c) { updateNewLunVerdict(c.up('window'), selectedArchiveSize(c.up('window'))); }
+                                    }
+                                },
+                                {
+                                    // The SAME dataset/AHR picker the add-LUN
+                                    // door uses (shared loadBackingChoices); the
+                                    // source flag on each row keeps the backing
+                                    // phrase (`dataset` vs `ahrPool`) honest.
+                                    xtype: 'combobox',
+                                    itemId: 'filePicker',
+                                    cls: 'anas-fld-lun-dataset',
+                                    fieldLabel: t('Dataset or AHR pool'),
+                                    hidden: true,
+                                    disabled: true,
+                                    queryMode: 'local',
+                                    displayField: 'label',
+                                    valueField: 'name',
+                                    store: comboStore(['name', 'label', 'source'], []),
+                                    emptyText: t('pool/dataset'),
+                                    listeners: {
+                                        change: function (c) { updateNewLunVerdict(c.up('window'), selectedArchiveSize(c.up('window'))); }
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            xtype: 'component',
+                            itemId: 'newLunVerdict',
+                            cls: 'anas-restore-newlun-verdict',
+                            hidden: true,
+                            disabled: true,
+                            margin: '2 0 0 0',
+                            html: ''
+                        },
+                        {
                             xtype: 'combobox',
                             itemId: 'repo',
                             cls: 'anas-fld-restore-repo',
@@ -3446,6 +3594,17 @@
                                 + 'can log back in until it finishes. The image is streamed straight onto ')) + enc(backing)
                                 + enc(t('; the unit serial and the backstore attributes are untouched, so the '
                                     + 'initiator sees the same disk with the backed-up contents.'))
+                        },
+                        {
+                            // backup2.10 — the RESULT PANEL. A newLun restore
+                            // keeps the dialog open while the job runs, and this
+                            // is where the new LUN's identity lands (or the
+                            // daemon's refusal, verbatim).
+                            xtype: 'component',
+                            itemId: 'restoreResult',
+                            cls: 'anas-restore-result',
+                            margin: '8 0 0 0',
+                            html: ''
                         }
                     ]
                 }],
@@ -3476,8 +3635,15 @@
             return;
         }
 
+        // The context the destination form and the gate need, held on the
+        // window so every change listener reaches it without re-deriving.
+        win._restore = { lunsWin: lunsWin, view: view, node: node, iqn: iqn, rec: rec,
+            lunSize: lunSize, lunIndex: lunIndex, backingPath: backing };
+
         win.show();
         loadRestoreRepos(win, node);
+        loadRestoreTargetChoices(win, node, iqn);
+        loadBackingChoices(node, win);
         return win;
     }
 
@@ -3667,27 +3833,189 @@
         return null;
     }
 
-    // THE gate. The daemon refuses a mismatch too (safety lives in the API), but
+    // THE destination-mode choice from the two radios.
+    function restoreDestMode(win) {
+        try {
+            var g = win.down('#restoreDest');
+            var v = g && g.getValue();
+            return (v && v.restoreDest === 'newLun') ? 'newLun' : 'inPlace';
+        } catch (e) {
+            return 'inPlace';
+        }
+    }
+
+    // The new-LUN backing kind from its radio: `zvol` (a new volume ON a pool)
+    // or `file` (a new image on a dataset or AHR pool). Defaults to zvol.
+    function newLunBackingKind(win) {
+        try {
+            var g = win.down('#newLunKind');
+            var v = g && g.getValue();
+            return (v && v.lunKind === 'file') ? 'file' : 'zvol';
+        } catch (e) {
+            return 'zvol';
+        }
+    }
+
+    // Show only the fields the chosen new-LUN backing uses, and DISABLE the
+    // hidden one so a stale value cannot be read back on submit — the add-LUN
+    // door's own rule.
+    function applyNewLunKind(win) {
+        var file = newLunBackingKind(win) === 'file';
+        var set = function (sel, visible) {
+            var f = win.down(sel);
+            if (!f) {
+                return;
+            }
+            f.setHidden(!visible);
+            f.setDisabled(!visible);
+        };
+        set('#newLunPool', !file);
+        set('#filePicker', file);
+    }
+
+    // Where the picked image file will live, read off the row the picker
+    // loaded: `dataset` for a ZFS dataset's mountpoint, `ahr` for an AHR pool.
+    function filePickerSource(win, where) {
+        try {
+            var combo = win.down('#filePicker');
+            var store = combo && combo.getStore();
+            var rec = store && store.findRecord ? store.findRecord('name', where) : null;
+            return rec ? (rec.get('source') || 'dataset') : 'dataset';
+        } catch (e) {
+            return 'dataset';
+        }
+    }
+
+    // A name already claimed by a LUN on THIS target — the node-global check the
+    // daemon runs lives on every target, and this catches the one we can see.
+    function lunNameTakenOn(win, name) {
+        try {
+            var r = win._restore || {};
+            var grid = r.lunsWin && r.lunsWin.down('#lunsGrid');
+            var store = grid && grid.getStore();
+            if (!store) {
+                return false;
+            }
+            for (var i = 0; i < store.getCount(); i++) {
+                if (store.getAt(i).get('name') === name) {
+                    return true;
+                }
+            }
+        } catch (e) {
+            // fail-open: the daemon's own refusal is the authority
+        }
+        return false;
+    }
+
+    // The local validation for the new-LUN form, cheapest checks first — the
+    // same order the daemon refuses in. Returns { ok:true }, or { ok:false,
+    // reason } (a hard red line) / { ok:false, prompt } (pick X first).
+    function validateNewLun(win, size) {
+        if (!textOf(win, '#snapshot') || !textOf(win, '#archive')) {
+            return { ok: false, prompt: t('Pick a point in time and an image archive first.') };
+        }
+        if (size === null || size === undefined) {
+            return { ok: false, reason: t('The size of this archive is not in the snapshot manifest, so ANAS '
+                + 'cannot create the new backing at the image\'s exact size. The restore is refused without '
+                + 'that proof: a backing of the wrong size would be a LUN whose end does not match the image it holds.') };
+        }
+        if (!textOf(win, '#newLunTarget')) {
+            return { ok: false, reason: t('Pick the ANAS-managed target the new LUN appears on.') };
+        }
+        var name = textOf(win, '#newLunName');
+        if (!name) {
+            return { ok: false, reason: t('Enter a LUN name.') };
+        }
+        if (lunNameTakenOn(win, name)) {
+            return { ok: false, reason: t('A LUN named') + ' \'' + name + '\' ' + t('already exists on this node. '
+                + 'The name is the SCSI model string initiators see, so it has to be unique.') };
+        }
+        if (newLunBackingKind(win) === 'zvol') {
+            if (!textOf(win, '#newLunPool')) {
+                return { ok: false, reason: t('Pick the ZFS pool the new volume is created on.') };
+            }
+        } else if (!textOf(win, '#filePicker')) {
+            return { ok: false, reason: t('Pick the dataset or AHR pool the image will live on.') };
+        }
+        return { ok: true };
+    }
+
+    // The `target` object for a newLun restore, in the SHARED schema's exact
+    // shape — `backing` is one of `{kind:'zvol', pool}`, `{kind:'file',
+    // dataset}` or `{kind:'file', ahrPool}`.
+    function buildNewLunTarget(win) {
+        var target = {
+            mode: 'newLun',
+            targetIqn: textOf(win, '#newLunTarget'),
+            name: textOf(win, '#newLunName'),
+        };
+        if (newLunBackingKind(win) === 'zvol') {
+            target.backing = { kind: 'zvol', pool: textOf(win, '#newLunPool') };
+        } else {
+            var where = textOf(win, '#filePicker');
+            var source = filePickerSource(win, where);
+            target.backing = source === 'ahr'
+                ? { kind: 'file', ahrPool: where }
+                : { kind: 'file', dataset: where };
+        }
+        return target;
+    }
+
+    // Which panels the operator sees, per destination. A stale value in a hidden
+    // field must never reach the wire, so every hidden field is disabled too.
+    function setDestFieldVisibility(win, isNewLun) {
+        var set = function (sel, visible) {
+            var f = win.down(sel);
+            if (!f) {
+                return;
+            }
+            f.setHidden(!visible);
+            f.setDisabled(!visible);
+        };
+        set('#restoreTargetPath', !isNewLun);
+        set('#newLunFields', isNewLun);
+        set('#newLunVerdict', isNewLun);
+        set('#sizeVerdict', !isNewLun);
+    }
+
+    // The GATE. The daemon refuses a mismatch too (safety lives in the API), but
     // a red field and a dead button is the difference between a control that
     // works and one that lets you press it and then explains why not.
+    //
+    // Two doors (backup2.10):
+    //   * in place — the image must be EXACTLY this LUN's size; a mismatch is
+    //     silently destructive below ANAS.
+    //   * a new LUN — the backing is CREATED at the image's size, so there is no
+    //     equality to prove; only that the size is KNOWN plus a form ANAS's own
+    //     add-LUN door would accept (target, name, backing).
     function updateRestoreSizes(win, lunSize) {
+        var size = selectedArchiveSize(win);
+        var sizeField = win.down('#imageSize');
+        if (sizeField) {
+            sizeField.setValue(size === null || size === undefined
+                ? '<span style="color:gray;">&mdash;</span>'
+                : enc(fmtBytes(size)) + ' (' + enc('' + size) + ' ' + enc(t('bytes')) + ')');
+        }
+        var isNewLun = restoreDestMode(win) === 'newLun';
+        setDestFieldVisibility(win, isNewLun);
+        var ok = isNewLun
+            ? updateNewLunVerdict(win, size)
+            : applyInPlaceVerdict(win, lunSize, size);
         var submit;
         try {
             submit = win.down('#restoreSubmit');
         } catch (e) {
             submit = null;
         }
-        var verdict = win.down('#sizeVerdict');
-        var sizeField = win.down('#imageSize');
-        var size = selectedArchiveSize(win);
-        var chosen = textOf(win, '#snapshot') && textOf(win, '#archive');
-
-        if (sizeField) {
-            sizeField.setValue(size === null || size === undefined
-                ? '<span style="color:gray;">&mdash;</span>'
-                : enc(fmtBytes(size)) + ' (' + enc('' + size) + ' ' + enc(t('bytes')) + ')');
+        if (submit) {
+            submit.setDisabled(!ok);
         }
+    }
 
+    /** The in-place verdict — TODAY's gate, byte-for-byte the same wording. */
+    function applyInPlaceVerdict(win, lunSize, size) {
+        var verdict = win.down('#sizeVerdict');
+        var chosen = textOf(win, '#snapshot') && textOf(win, '#archive');
         var ok = false;
         var html = '';
         if (!chosen) {
@@ -3712,9 +4040,121 @@
         if (verdict) {
             verdict.update(html);
         }
-        if (submit) {
-            submit.setDisabled(!ok);
+        return ok;
+    }
+
+    /** The new-LUN verdict: the form's validity, and the button's gate. */
+    function updateNewLunVerdict(win, size) {
+        var verdict = win.down('#newLunVerdict');
+        var val = validateNewLun(win, size);
+        var ok = false;
+        var html;
+        if (val.ok) {
+            ok = true;
+            html = '<span style="color:var(--anas-good,#2e7d32);">'
+                + enc(t('Restored as a NEW LUN: the backing is created at exactly the image\'s size ('))
+                + enc(fmtBytes(size)) + '). ' + enc(t('The source LUN is untouched and stays online.')) + '</span>';
+        } else if (val.prompt) {
+            html = '<span style="color:gray;font-size:0.9em;">' + enc(val.prompt) + '</span>';
+        } else {
+            html = '<span style="color:var(--anas-bad,#c0392b);">' + enc(val.reason) + '</span>';
         }
+        if (verdict) {
+            verdict.update(html);
+        }
+        return ok;
+    }
+
+    /** Called when the destination radio changes: note, panels, then the gate. */
+    function applyRestoreDest(win) {
+        var r = win._restore || {};
+        var isNewLun = restoreDestMode(win) === 'newLun';
+        setDestFieldVisibility(win, isNewLun);
+        // The backing kinds toggle their own panel too.
+        applyNewLunKind(win);
+        setRestoreNote(win, isNewLun, r.backingPath || '');
+        updateRestoreSizes(win, r.lunSize || 0);
+    }
+
+    // The safety property CHANGES with the destination, so the note is rebuilt:
+    // in place, the target's TPG goes offline for the run; a new LUN never
+    // touches anything that is serving.
+    function setRestoreNote(win, isNewLun, backing) {
+        var note = win.down('#restoreNote');
+        if (!note || win.destroyed || win.destroying) {
+            return;
+        }
+        if (!isNewLun) {
+            note.update(enc(t('A block image is restored WHOLE — there is no "these files". '
+                + 'The whole target goes offline for the duration (LIO\'s enable flag lives on '
+                + 'the target portal group, not the LUN), every session drops and no initiator '
+                + 'can log back in until it finishes. The image is streamed straight onto ')) + enc(backing)
+                + enc(t('; the unit serial and the backstore attributes are untouched, so the '
+                    + 'initiator sees the same disk with the backed-up contents.')));
+        } else {
+            note.update(enc(t('Restored as a NEW LUN: a fresh backing is created at exactly the image\'s '
+                + 'size, the image is streamed into it, and the new LUN is mapped on the chosen target. '
+                + 'The source LUN is never touched — it stays online, keeps its serial, and no initiator '
+                + 'has to log out. The new LUN gets a FRESH unit serial: a restored copy is a NEW disk.')));
+        }
+    }
+
+    /**
+     * The RESULT PANEL (backup2.10): where the finished new-LUN identity lands.
+     * `job.result.newLun` is { targetIqn, index, name, serial, backingPath } —
+     * the fresh-serial proof and the backing this run created.
+     */
+    function showNewLunResult(win, job) {
+        var panel = win.down('#restoreResult');
+        if (!panel) {
+            return;
+        }
+        var nl = job && job.result && job.result.newLun;
+        if (!nl) {
+            panel.update('<span style="color:gray;font-size:0.9em;">'
+                + enc(t('The new LUN restore finished.')) + '</span>');
+            return;
+        }
+        panel.update('<span style="color:var(--anas-good,#2e7d32);">'
+            + enc(t('Restore complete — NEW LUN created')) + '</span>'
+            + '<div style="font-family:monospace;margin:4px 0;">'
+            + enc(nl.name) + ' — ' + enc(t('LUN')) + ' ' + enc(nl.index) + ' ' + enc(t('on'))
+            + ' ' + enc(nl.targetIqn)
+            + '<br>' + enc(t('serial')) + ' ' + enc(nl.serial)
+            + '<br>' + enc(t('backed by')) + ' ' + enc(nl.backingPath)
+            + '</div>'
+            + '<span style="color:gray;font-size:0.9em;">'
+            + enc(t('The source LUN was never touched.')) + '</span>');
+    }
+
+    // The ANAS-owned targets for the new-LUN door, fresh from the read the view
+    // itself makes. A FOREIGN target is hands-off and is never offered; the
+    // daemon's refusal would say the same, but a door that does not open beats a
+    // refusal that has to be answered.
+    function loadRestoreTargetChoices(win, node, iqn) {
+        ANAS.api.get(node, '/iscsi/targets').then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var targets = (res && res.data && isArray(res.data.targets)) ? res.data.targets : [];
+            var rows = [];
+            for (var i = 0; i < targets.length; i++) {
+                var t = targets[i] || {};
+                if (t.ownership !== 'anas') {
+                    continue;
+                }
+                rows.push({ value: t.iqn, label: (t.name ? t.name + ' — ' : '') + t.iqn });
+            }
+            var combo = win.down('#newLunTarget');
+            if (!combo) {
+                return;
+            }
+            combo.getStore().loadData(rows);
+            combo.setValue(rows.length ? iqn : '');
+        }, function () {
+            // fail-open: the combo stays empty and the gate names the missing
+            // choic; the operator can retype nothing — a target must be chosen.
+        });
     }
 
     function submitRestoreLun(win, lunsWin, view, node, iqn, rec, lunSize) {
@@ -3727,19 +4167,52 @@
             ANAS.alertMsg('Incomplete', t('Choose a repository, a point in time and an image archive.'));
             return;
         }
-        // Belt and braces: the button is already dead on a mismatch, and the
-        // daemon refuses one too. Nothing may reach the wire on a mismatch.
-        if (size !== lunSize) {
-            ANAS.alertMsg('Size mismatch', t('The image and the LUN are not the same size, so the restore is '
-                + 'refused. Restore this image onto a target of exactly its own size.'));
-            return;
+        var isNewLun = restoreDestMode(win) === 'newLun';
+        if (isNewLun) {
+            // Belt and braces: the button is already dead on an invalid form,
+            // and the daemon refuses one too. Nothing may reach the wire.
+            var newLun = validateNewLun(win, size);
+            if (!newLun.ok) {
+                var nv = win.down('#newLunVerdict');
+                if (nv) {
+                    nv.update('<span style="color:var(--anas-bad,#c0392b);">' + enc(newLun.reason || newLun.prompt) + '</span>');
+                }
+                return;
+            }
+        } else {
+            // Belt and braces: the button is already dead on a mismatch, and the
+            // daemon refuses one too. Nothing may reach the wire on a mismatch.
+            if (size !== lunSize) {
+                ANAS.alertMsg('Size mismatch', t('The image and the LUN are not the same size, so the restore is '
+                    + 'refused. Restore this image onto a target of exactly its own size.'));
+                return;
+            }
         }
 
-        var body = { kind: 'image', repo: repo, snapshot: snapshot, archive: archive,
-            lun: { targetIqn: iqn, index: rec.get('index') } };
+        var body = { kind: 'image', repo: repo, snapshot: snapshot, archive: archive };
+        if (isNewLun) {
+            body.target = buildNewLunTarget(win);
+        } else {
+            body.lun = { targetIqn: iqn, index: rec.get('index') };
+        }
         if (ns) {
             body.ns = ns;
         }
+
+        // The confirm text says what each door IS: for in place, the image
+        // lands on the named device (and the whole target goes offline); for a
+        // new LUN, the source stays untouched and online, there is no offline
+        // window, and the new LUN carries a FRESH serial.
+        var confirmTitle = isNewLun ? 'Restore as new LUN' : 'Restore LUN from backup';
+        var confirmIntro = isNewLun
+            ? enc(t('Restoring')) + ' ' + enc(archive) + ' ' + enc(t('from')) + ' ' + enc(snapshot)
+                + ' ' + enc(t('as a NEW LUN')) + ' "' + enc(body.target.name) + '" ' + enc(t('on'))
+                + ' ' + enc(body.target.targetIqn) + '. '
+                + enc(t('The source LUN is untouched and stays online — there is no offline window and no '
+                    + 'initiator has to log out. The new LUN gets a FRESH unit serial: a restored copy is '
+                    + 'a NEW disk.'))
+            : enc(t('Restoring')) + ' ' + enc(archive) + ' ' + enc(t('from')) + ' ' + enc(snapshot)
+                + ' ' + enc(t('onto')) + ' ' + enc(rec.get('backingPath') || '') + '.';
 
         ANAS.confirmAndRun({
             node: node,
@@ -3748,24 +4221,51 @@
             body: body,
             view: win,
             confirmWindow: true,
-            confirmTitle: 'Restore LUN from backup',
-            confirmIntro: enc(t('Restoring')) + ' ' + enc(archive) + ' ' + enc(t('from')) + ' ' + enc(snapshot)
-                + ' ' + enc(t('onto')) + ' ' + enc(rec.get('backingPath') || '') + '.',
+            confirmTitle: confirmTitle,
+            confirmIntro: confirmIntro,
             confirmButtonText: t('Restore'),
-            failTitle: 'Restore failed',
-            successMsg: t('LUN restored') + ': ' + rec.get('name'),
+            failTitle: isNewLun ? 'Restore as new LUN failed' : 'Restore failed',
+            successMsg: isNewLun
+                ? t('Restored as a new LUN') + ': ' + archive
+                : t('LUN restored') + ': ' + rec.get('name'),
             onSubmitted: function () {
-                // A whole image can take hours; the dialog has nothing left to
-                // do once the daemon has accepted the job.
+                // A whole image can take hours; for an in-place restore the dialog
+                // has nothing left to do once the daemon has accepted the job. A
+                // NEW LUN restore keeps the dialog open so the completed identity
+                // lands in the result panel below.
+                if (isNewLun) {
+                    var note = win.down('#restoreNote');
+                    if (note) {
+                        note.update(enc(t('Restore accepted — a new LUN is being created. '
+                            + 'Its identity appears here when it finishes.')));
+                    }
+                    return;
+                }
                 if (!win.destroyed && !win.destroying) {
                     win.close();
                 }
             },
-            onComplete: function () {
+            onComplete: function (job) {
+                if (isNewLun) {
+                    showNewLunResult(win, job);
+                }
                 loadLuns(lunsWin, node, iqn);
                 loadTargets(view, node, true);
             },
-            onFailed: function () {
+            onFailed: function (job) {
+                // A refusal (name taken elsewhere, a foreign target, a backing
+                // ANAS does not own, an unknown size) is the daemon's words put
+                // on screen VERBATIM — the same line its 409 would carry — so
+                // the operator can fix the form instead of hunting the alert.
+                if (isNewLun) {
+                    var msg = (job && job.error && job.error.message);
+                    if (msg) {
+                        var vr = win.down('#newLunVerdict');
+                        if (vr) {
+                            vr.update('<span style="color:var(--anas-bad,#c0392b);">' + enc(msg) + '</span>');
+                        }
+                    }
+                }
                 loadLuns(lunsWin, node, iqn);
                 loadTargets(view, node, true);
             }
