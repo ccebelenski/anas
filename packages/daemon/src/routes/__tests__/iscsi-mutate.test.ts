@@ -33,7 +33,9 @@ const fixturesDir = join(__dirname, '../../fixtures/iscsi')
  *   - a foreign target           → 409 hands-off, with the ownership reason
  *   - a live session on a LUN    → 409 with NO confirm bypass (GT-42)
  *   - a shrink                   → 409 with NO confirm bypass (GT-40)
- *   - a target delete            → 409 + X-Anas-Confirm-Code, listing initiators
+ *   - a target delete with sessions → 409 `live-sessions`, NO confirm bypass,
+ *                                     nothing runs (GT-42)
+ *   - a target delete with LUNs     → 409 `target-has-luns`, NO confirm bypass
  *   - destroyBacking             → 409 + confirm code
  *   - a duplicate LUN name       → 409 (the name is the SCSI model string)
  *   - a zvol already exported    → 409 (two LUNs onto one device)
@@ -210,6 +212,64 @@ function anasSaveconfig(extraLun = false, holeDev = '/dev/zvol/tank/gone', fileL
   })
 }
 
+/**
+ * SYNTHETIC: the same ANAS target with NO backstores and NO LUNs — the only
+ * state a target delete may run on.
+ */
+function emptyAnasManifest(): string {
+  const tpg = `iscsi/${ANAS_IQN}/tpgt_1`
+  const acl = `${tpg}/acls/${INITIATOR}`
+  const lines = [
+    'D core',
+    'D iscsi',
+    `D iscsi/${ANAS_IQN}`,
+    `D ${tpg}`,
+    `F ${tpg}/enable = 1`,
+    `D ${tpg}/attrib`,
+    `F ${tpg}/attrib/authentication = 0`,
+    `F ${tpg}/attrib/generate_node_acls = 0`,
+    `F ${tpg}/attrib/demo_mode_discovery = 0`,
+    `F ${tpg}/dynamic_sessions = `,
+    `D ${tpg}/np`,
+    `D ${tpg}/np/192.168.200.50:3260`,
+    `D ${tpg}/acls`,
+    `D ${acl}`,
+    `D ${acl}/auth`,
+    `F ${acl}/auth/userid = `,
+    `F ${acl}/auth/password = `,
+    `F ${acl}/auth/userid_mutual = `,
+    `F ${acl}/auth/password_mutual = `,
+    `F ${acl}/auth/authenticate_target = 0`,
+    `F ${acl}/info = No active iSCSI Session for Initiator Endpoint: ${INITIATOR}`,
+  ]
+  return `${lines.join('\n')}\n`
+}
+
+/** SYNTHETIC: the persisted half of the empty target. */
+function emptyAnasSaveconfig(): string {
+  return JSON.stringify({
+    fabric_modules: [],
+    storage_objects: [],
+    targets: [{
+      wwn: ANAS_IQN,
+      fabric: 'iscsi',
+      parameters: {},
+      tpgs: [{
+        tag: 1,
+        enable: true,
+        attributes: { authentication: 0, generate_node_acls: 0, demo_mode_discovery: 0 },
+        parameters: {},
+        luns: [],
+        node_acls: [{
+          node_wwn: INITIATOR,
+          mapped_luns: [],
+        }],
+        portals: [{ ip_address: '192.168.200.50', port: 3260 }],
+      }],
+    }],
+  })
+}
+
 const IDENTITY = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
@@ -293,6 +353,11 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       manifest: anasManifest({ session: opts.session ?? false, ...(opts.fileLun ? { fileLun: opts.fileLun } : {}) }),
       saveconfigText: anasSaveconfig(opts.hole ?? false, opts.holeDev, opts.fileLun),
     })
+  }
+
+  /** The ANAS-owned EMPTY target — the only state a target delete may run on. */
+  async function serveEmpty() {
+    await serve({ manifest: emptyAnasManifest(), saveconfigText: emptyAnasSaveconfig() })
   }
 
   async function call(
@@ -645,34 +710,66 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
 
   // --- target delete -------------------------------------------------------
 
-  describe('DELETE /v1/iscsi/targets/:iqn', () => {
-    it('is always confirm-gated, and lists the initiators it would drop', async () => {
+  describe('DELETE /v1/iscsi/targets/:iqn — an empty, session-free target is the only deletable one', () => {
+    it('refuses a target with a LIVE session — names the initiators, no bypass, nothing runs', async () => {
       await serveAnas({ session: true })
+      const mock = mockOf()
       const res = await call('DELETE', targetUrl())
       assert.equal(res.statusCode, 409)
-      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
-      assert.ok(res.headers['x-anas-confirm-code'])
-      assert.ok(res.body.error!.warnings!.some(w => w.includes(INITIATOR)))
-      // The consequence is stated: the session drops, the device goes stale.
-      assert.ok(res.body.error!.warnings!.some(w => /drops its session/.test(w)))
-      // …and so is what is NOT destroyed.
-      assert.ok(res.body.error!.warnings!.some(w => /data is NOT destroyed/.test(w)))
+      assert.equal(res.body.error!.reason, 'live-sessions')
+      // No confirm code: there is no confirm path left to send one through.
+      assert.ok(!res.headers['x-anas-confirm-code'])
+      assert.match(res.body.error!.message, new RegExp(INITIATOR.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+      assert.match(res.body.error!.message, /Log the initiators out first/)
+      // Nothing ran: the read layer never calls targetcli, so any targetcli
+      // call at all would be the delete sequence — and it must not be there.
+      assert.equal(
+        mock.calls.filter(c => c.command === TARGETCLI).length,
+        0,
+        JSON.stringify(mock.calls.map(c => [c.command, c.args])),
+      )
     })
 
-    it('is confirm-gated even with no sessions — the IQN goes with it', async () => {
+    it('does not honour a confirm code — the gate is gone entirely', async () => {
+      await serveAnas({ session: true })
+      const res = await call('DELETE', targetUrl(), undefined, { 'x-anas-confirm': 'a-code-from-nowhere' })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'live-sessions')
+      assert.ok(!res.headers['x-anas-confirm-code'])
+    })
+
+    it('refuses a target that still has LUNs — names them and says delete them first', async () => {
       await serveAnas()
+      const mock = mockOf()
       const res = await call('DELETE', targetUrl())
       assert.equal(res.statusCode, 409)
-      assert.ok(res.headers['x-anas-confirm-code'])
-      assert.ok(res.body.error!.warnings!.some(w => /repointed/.test(w)))
+      assert.equal(res.body.error!.reason, 'target-has-luns')
+      assert.ok(!res.headers['x-anas-confirm-code'])
+      assert.match(res.body.error!.message, /vmdisk1/)
+      assert.match(res.body.error!.message, /Delete the LUNs first/)
+      assert.match(res.body.error!.message, /destroyBacking/)
+      assert.equal(mock.calls.filter(c => c.command === TARGETCLI).length, 0)
     })
 
-    it('goes through with the code', async () => {
-      await serveAnas()
-      const first = await call('DELETE', targetUrl())
-      const code = first.headers['x-anas-confirm-code'] as string
-      const second = await call('DELETE', targetUrl(), undefined, { 'x-anas-confirm': code })
-      assert.equal(second.statusCode, 202)
+    it('deletes an EMPTY, session-free target — no confirm at all, exact argv', async () => {
+      await serveEmpty()
+      const mock = mockOf()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const res = await call('DELETE', targetUrl())
+      assert.equal(res.statusCode, 202)
+      assert.ok(!res.headers['x-anas-confirm-code'], 'an empty target is not data-destroying — no confirm gate')
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.deepEqual(job.result, { iqn: ANAS_IQN })
+      // The whole sequence, nothing more: delete the target, save. An empty
+      // target has no backstores of its own, so there is no cleanup to assert.
+      assert.deepEqual(
+        mock.calls.filter(c => c.command === TARGETCLI).map(c => c.args),
+        [
+          ['/iscsi', 'delete', ANAS_IQN],
+          ['saveconfig'],
+        ],
+      )
     })
   })
 

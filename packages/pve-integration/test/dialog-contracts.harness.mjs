@@ -50,8 +50,10 @@
  *      every stored secret on the next unrelated save. Also: an untouched target
  *      edit sends an EMPTY body, the Add LUN pickers never offer PVE territory,
  *      a resize grows only, destroying a LUN's backing object is a separate
- *      ticked choice that becomes a query flag, and a foreign target or a live
- *      session greys the right controls with the reason attached.
+ *      ticked choice that becomes a query flag, and a foreign target, a live
+ *      session, or a non-empty target greys the right controls with the reason
+ *      attached — a target is deletable ONLY empty and quiet, and that delete
+ *      is a plain confirm, never a confirm-code flow.
  *   6. iSCSI boot lifecycle (story iscsi.5): the Repair button is live ONLY when
  *      a restore hole's backing object is BACK, and says what is still missing
  *      otherwise — a boot restore with a missing device exits 0 and systemd
@@ -350,7 +352,7 @@ const Ext = {
   String: { htmlEncode: s => String(s == null ? '' : s) },
   Date: { format: d => String(d) },
   Msg: {
-    confirm(_title, _msg, fn) { if (fn) { fn('yes') } },
+    confirm(title, msg, fn) { confirms.push({ title, msg }); if (fn) { fn('yes') } },
     alert() {},
   },
   // PVE's own /nodes/<node>/network, which the portal picker reads (the same
@@ -386,6 +388,10 @@ function openWindow() {
 const warnings = []
 /** Every job the UI submitted: method, path and the exact body. */
 const jobs = []
+/** Every plain Ext.Msg.confirm the UI asked (title + message) — the confirmAndRun
+ * flow is recorded on the JOB instead (confirmWindow/extraItems), so a check can
+ * tell a plain confirm from a confirm-code flow. */
+const confirms = []
 /** Every GET the UI issued, with its query — the read-contract record. */
 const apiGets = []
 
@@ -1670,11 +1676,15 @@ async function iscsiGridChecks() {
   ok('gating(none): Edit is disabled', state.iscsiEdit.disabled === true)
   ok('gating(none): LUNs… is disabled', state.iscsiLuns.disabled === true)
 
-  // An ANAS target: everything is live and the toggle reads Disable.
+  // An ANAS target: everything is live and the toggle reads Disable — except
+  // Delete, which is dead while the row still carries LUNs: a target is only
+  // deletable empty, and the tooltip says what to clear first.
   grid.selectRow(iscsiRowOf(grid, ISCSI_IQN))
   state = toolbar(grid, GATED)
   ok('gating(anas): Edit enabled', state.iscsiEdit.disabled === false)
-  ok('gating(anas): Delete enabled', state.iscsiDelete.disabled === false)
+  ok('gating(anas): Delete DISABLED while the target still has LUNs', state.iscsiDelete.disabled === true)
+  ok('gating(anas): and the tooltip says to delete the LUNs first',
+    /Delete its 2 LUNs first/.test(state.iscsiDelete.tip), state.iscsiDelete.tip)
   ok('gating(anas): LUNs… enabled', state.iscsiLuns.disabled === false)
   ok('gating(anas): an enabled target offers Disable', state.iscsiToggle.text === 'Disable')
   ok('gating(anas): no hands-off excuse on an ANAS row', state.iscsiEdit.tip === '', state.iscsiEdit.tip)
@@ -2273,6 +2283,72 @@ async function iscsiSessionGatingChecks() {
   ok('session: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+// ---------------------------------------------------------------------------
+//  The target-delete gate: only an EMPTY, session-free target is deletable
+// ---------------------------------------------------------------------------
+//
+// The daemon refuses a target delete with live sessions (they drop, and the
+// devices go stale with no kernel message — no confirm bypass) and with any
+// LUN (delete the LUNs first, where destroyBacking is the per-LUN choice). So
+// the button is dead with the reason while either is true; what remains is not
+// data-destroying, so it is a PLAIN confirm, never a confirm-code flow.
+
+async function iscsiTargetDeleteChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  // One target in each state the gate knows: live sessions, and — the only
+  // deletable one — empty and quiet.
+  const EMPTY_IQN = 'iqn.2026-08.nas.anas:empty'
+  const targets = {
+    ...ISCSI_TARGETS,
+    targets: [
+      { ...ISCSI_TARGETS.targets[0], lunCount: 0, sessionCount: 2 },
+      {
+        ...ISCSI_TARGETS.targets[0],
+        iqn: EMPTY_IQN,
+        name: 'empty',
+        lunCount: 0,
+        sessionCount: 0,
+        ownershipDetail: 'IQN follows the ANAS naming convention; the target has no LUNs',
+      },
+    ],
+  }
+  const { grid } = await openIscsiView({ ...ISCSI_ROUTES, 'GET /iscsi/targets': { data: targets } })
+
+  // Live sessions: dead, and the tooltip counts them and says the way out.
+  grid.selectRow(0)
+  let state = toolbar(grid, ['iscsiDelete'])
+  ok('delgate(sessions): Delete is DISABLED while initiators are connected',
+    state.iscsiDelete.disabled === true)
+  ok('delgate(sessions): the tooltip counts them and says to log them out',
+    /2 initiators connected — log them out first/.test(state.iscsiDelete.tip),
+    state.iscsiDelete.tip)
+
+  // The empty, quiet one: live, with nothing to clear first.
+  grid.selectRow(iscsiRowOf(grid, EMPTY_IQN))
+  state = toolbar(grid, ['iscsiDelete'])
+  ok('delgate(empty): Delete is ENABLED on an empty, session-free target',
+    state.iscsiDelete.disabled === false)
+  ok('delgate(empty): and it says nothing — there is nothing to clear first',
+    state.iscsiDelete.tip === '', state.iscsiDelete.tip)
+
+  // Pressing it: a PLAIN confirm (the harness answers yes), then a plain
+  // DELETE. Not confirmAndRun — so no confirm-code flow and no widget window.
+  jobs.length = 0
+  confirms.length = 0
+  grid.down('#iscsiDelete').handler(grid.down('#iscsiDelete'))
+  await settle()
+  eq('delgate: one request', jobs.length, 1)
+  eq('delgate: it DELETEs the target', [jobs[0].method, jobs[0].path],
+    ['del', '/iscsi/targets/' + encodeURIComponent(EMPTY_IQN)])
+  ok('delgate: it is NOT a confirm-code flow — no confirm window, no widgets',
+    !jobs[0].confirmWindow && !jobs[0].extraItems)
+  ok('delgate: and the confirm was the plain one, naming the empty target',
+    confirms.length === 1 && /Delete empty target/.test(confirms[0].msg) && confirms[0].msg.includes('empty'),
+    JSON.stringify(confirms))
+
+  ok('delgate: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 async function iscsiForeignLunChecks() {
   ajax.responses = { '/network': PVE_NETWORK }
   const { grid } = await openIscsiView(ISCSI_ROUTES)
@@ -2372,11 +2448,15 @@ async function iscsiUnresolvedLunChecks() {
     [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: detail },
   })
 
-  // The target is still ANAS's: every verb stays available.
+  // The target is still ANAS's: the verbs stay available — Delete still needs
+  // the LUNs gone first (this row carries two), but it is NOT hands-off.
   grid.selectRow(iscsiRowOf(grid, ISCSI_IQN))
   const targetState = toolbar(grid, ['iscsiEdit', 'iscsiDelete', 'iscsiLuns'])
   ok('unresolved: an unresolved LUN does NOT make its target hands-off',
-    targetState.iscsiEdit.disabled === false && targetState.iscsiDelete.disabled === false)
+    targetState.iscsiEdit.disabled === false)
+  ok('unresolved: …but Delete still says the LUNs must go first',
+    targetState.iscsiDelete.disabled === true && /Delete its 2 LUNs first/.test(targetState.iscsiDelete.tip),
+    targetState.iscsiDelete.tip)
 
   const btn = grid.down('#iscsiLuns')
   btn.handler(btn)
@@ -4070,6 +4150,7 @@ for (const check of [
   iscsiLunChecks,
   iscsiResizeAndDeleteChecks,
   iscsiSessionGatingChecks,
+  iscsiTargetDeleteChecks,
   iscsiForeignLunChecks,
   iscsiAddressFallbackChecks,
   iscsiRepairChecks,

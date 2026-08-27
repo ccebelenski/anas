@@ -23,6 +23,13 @@
  *    session keeps running. The button says so.
  *  - **Removing an initiator ACL drops its session instantly** and destroys its
  *    CHAP credentials. That is a confirm-gated change, not a metadata edit.
+ *  - **A target is deletable only when it is empty.** A live session → the
+ *    delete is refused (no confirm bypass): the sessions drop and the devices
+ *    go stale with no kernel message. Any LUN → the delete is refused (no
+ *    confirm bypass): the LUNs go through their own door, where destroyBacking
+ *    is the per-LUN choice about the data. The Delete button is dead with the
+ *    reason while either is true; what is left — deleting an empty target — is
+ *    not data-destroying, so it is a plain confirm, never a confirm code.
  *  - **A target with no initiator ACLs is invisible to EVERYONE.** ANAS closes
  *    discovery (demo mode is never enabled), so a target nobody is listed on
  *    does not appear in `iscsiadm -m discovery` or in PVE's storage scan — and
@@ -642,18 +649,33 @@
         var foreign = has && rec.get('ownership') !== 'anas';
         var mutable = has && !foreign;
 
+        // A target is deletable only when it is EMPTY and QUIET: the daemon
+        // refuses a delete with live sessions (they drop, and the devices go
+        // stale with no kernel message) and with any LUN (delete the LUNs
+        // first, where destroyBacking is the per-LUN choice), both with no
+        // confirm bypass — so the button says which to clear first instead of
+        // promising a delete it would get refused for.
+        var sess = has ? (Number(rec.get('sessionCount')) || 0) : 0;
+        var luns = has ? (Number(rec.get('lunCount')) || 0) : 0;
+        var deleteWhy = sess > 0
+            ? (sess + (sess === 1 ? ' initiator connected' : ' initiators connected')
+                + t(' — log them out first'))
+            : (luns > 0
+                ? t('Delete its ') + luns + (luns === 1 ? t(' LUN') : t(' LUNs')) + t(' first')
+                : '');
+
         setDisabled(grid, 'iscsiEdit', !mutable);
         setDisabled(grid, 'iscsiToggle', !mutable);
-        setDisabled(grid, 'iscsiDelete', !mutable);
+        setDisabled(grid, 'iscsiDelete', !mutable || deleteWhy !== '');
         // Looking at a foreign target's LUNs is READ — always allowed.
         setDisabled(grid, 'iscsiLuns', !has);
 
-        var tip = foreign
+        var foreignTip = foreign
             ? (t('View only — ') + ('' + (rec.get('ownershipDetail') || t('this target is not managed by ANAS'))))
             : '';
-        btnSetTip(grid, 'iscsiEdit', tip);
-        btnSetTip(grid, 'iscsiToggle', tip);
-        btnSetTip(grid, 'iscsiDelete', tip);
+        btnSetTip(grid, 'iscsiEdit', foreignTip);
+        btnSetTip(grid, 'iscsiToggle', foreignTip);
+        btnSetTip(grid, 'iscsiDelete', foreign ? foreignTip : deleteWhy);
         btnSetTip(grid, 'iscsiLuns', foreign ? t('Read-only: this target is not managed by ANAS') : '');
 
         try {
@@ -1678,21 +1700,34 @@
         if (!rec) {
             return;
         }
-        ANAS.confirmAndRun({
-            node: node,
-            method: 'del',
-            path: '/iscsi/targets/' + encIqn(rec.get('iqn')),
-            view: view,
-            confirmTitle: 'Delete iSCSI target',
-            confirmIntro: t('Deleting') + ' <b>' + enc(rec.get('name') || rec.get('iqn')) + '</b>:',
-            confirmButtonText: t('Delete'),
-            confirmWindow: true,
-            failTitle: 'Delete failed',
-            successMsg: t('iSCSI target deleted') + ': ' + (rec.get('name') || rec.get('iqn')),
-            onComplete: function () {
-                loadTargets(view, node);
-            }
-        });
+        // Only an EMPTY, session-free target can reach here: the button is dead
+        // with a reason while the row shows sessions or LUNs, and the daemon
+        // refuses the same two states again — with no confirm bypass. So the
+        // plain confirm below is the whole ceremony: deleting an empty target
+        // destroys no data (the backing zvols/images went with the LUN deletes,
+        // where the operator chose per LUN), which is exactly what a confirm
+        // code is NOT for.
+        var msg = enc(t('Delete empty target') + ' "' + (rec.get('name') || rec.get('iqn')) + '"? ')
+            + enc(t('The IQN goes with it — any initiator configured against it must be repointed.'));
+        try {
+            Ext.Msg.confirm(t('Delete iSCSI target'), msg, function (btn) {
+                if (btn === 'yes') {
+                    ANAS.runJob({
+                        node: node,
+                        method: 'del',
+                        path: '/iscsi/targets/' + encIqn(rec.get('iqn')),
+                        view: view,
+                        failTitle: 'Delete failed',
+                        successMsg: t('iSCSI target deleted') + ': ' + (rec.get('name') || rec.get('iqn')),
+                        onComplete: function () {
+                            loadTargets(view, node);
+                        }
+                    });
+                }
+            });
+        } catch (e) {
+            ANAS.warn('iscsi target delete confirm failed: ' + ANAS.errText(e));
+        }
     }
 
     // ---- LUNs window (display + its own toolbar) ---------------------------

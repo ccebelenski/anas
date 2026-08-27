@@ -774,48 +774,28 @@ export async function setIscsiTargetState(
 }
 
 /**
- * Delete a target and the backstores only it referenced.
+ * Delete an EMPTY target.
  *
- * The BACKING objects — the zvol, the image file — are never touched here; that
- * is what `?destroyBacking=true` on a LUN delete is for. The LIO backstores are,
- * because an orphaned backstore keeps holding its zvol open with nothing in the
- * UI to explain it: `zfs destroy` would fail `dataset is busy` while `fuser`,
- * `lsof` and `holders/` all report nothing (GT-40/GT-41). A backstore still
- * mapped into ANOTHER target is left alone.
+ * Only a target with zero LUNs and no live sessions reaches this — the route
+ * refuses anything else, because both cases need the operator to do a DIFFERENT
+ * operation first: log the initiators out, or delete the LUNs through their own
+ * door, where `?destroyBacking=true` is the per-LUN choice about the data.
+ *
+ * There is no backstore cleanup in here on purpose: a zero-LUN target has no
+ * backstores of its own. Backstore names are a node-global namespace, a LUN
+ * delete removes its backstore, and a backstore still mapped into ANOTHER
+ * target was never this target's to remove. The BACKING objects — the zvols,
+ * the image files — are never touched by any target delete.
  */
 export async function deleteIscsiTarget(
   opts: IscsiMutateOptions,
   target: IscsiTargetDetail,
-  allTargets: IscsiTargetDetail[],
-): Promise<{ iqn: string, backstoresDeleted: string[], backingKept: string[] }> {
-  const { executor } = opts
-
-  const sharedNames = new Set<string>()
-  for (const other of allTargets) {
-    if (other.iqn === target.iqn)
-      continue
-    for (const lun of other.luns)
-      sharedNames.add(lun.name)
-  }
-
+): Promise<{ iqn: string }> {
   report(opts, `Deleting iSCSI target ${target.iqn}`)
-  await runTargetcli(executor, ['/iscsi', 'delete', target.iqn])
-
-  const backstoresDeleted: string[] = []
-  const backingKept: string[] = []
-  for (const lun of target.luns) {
-    if (!lun.name || sharedNames.has(lun.name))
-      continue
-    report(opts, `Deleting backstore ${lun.name}`)
-    await runTargetcli(executor, [`/backstores/${lun.plugin}`, 'delete', lun.name])
-    backstoresDeleted.push(lun.name)
-    if (lun.backingPath)
-      backingKept.push(lun.backingPath)
-  }
-
+  await runTargetcli(opts.executor, ['/iscsi', 'delete', target.iqn])
   report(opts, 'Saving the LIO configuration')
-  await saveIscsiConfig(executor)
-  return { iqn: target.iqn, backstoresDeleted, backingKept }
+  await saveIscsiConfig(opts.executor)
+  return { iqn: target.iqn }
 }
 
 // ---------------------------------------------------------------------------

@@ -58,7 +58,7 @@ import { requireIdentity } from './identity.js'
  *   POST   /v1/iscsi/targets                      create a target
  *   PUT    /v1/iscsi/targets/:iqn                 portals / ACLs / auth / secrets
  *   POST   /v1/iscsi/targets/:iqn/state           enable | disable
- *   DELETE /v1/iscsi/targets/:iqn                 delete (sessions → 409 + confirm)
+ *   DELETE /v1/iscsi/targets/:iqn                 delete an EMPTY target (sessions → 409, LUNs → 409, both without bypass)
  *   POST   /v1/iscsi/targets/:iqn/luns            add a LUN (zvol | file)
  *   PUT    /v1/iscsi/targets/:iqn/luns/:n         grow / write-cache
  *   DELETE /v1/iscsi/targets/:iqn/luns/:n         unmap + delete backstore
@@ -83,14 +83,18 @@ import { requireIdentity } from './identity.js'
  *  - **A live session**, on the operations where one makes the result silently
  *    wrong. LIO offers no protection at all here: a LUN delete or backstore
  *    delete with a live session returns exit 0, leaves a stale device on the
- *    initiator and produces no kernel message until the next rescan (GT-42).
- *    Every session gate is ANAS's own.
+ *    initiator and produces no kernel message until the next rescan, and a
+ *    target delete drops every session the same way (GT-42). Every session gate
+ *    is ANAS's own.
  *
- * The gates differ in altitude on purpose. Deleting a TARGET is confirm-gated —
- * the operator may well mean it, and the consequence (every session drops) is
- * describable. Resizing or deleting a LUN with a live session is a hard 409 with
- * no bypass: the initiator has the device open and its filesystem mounted, and
- * there is no confirmation that makes that safe from this side.
+ * The gates differ in altitude on purpose. Deleting a TARGET is REFUSED while
+ * it has a live session (the sessions drop and the devices go stale with no
+ * kernel message — no confirmation makes that safe) or a single LUN (delete the
+ * LUNs first, where `destroyBacking` is the per-LUN choice about the data). Only
+ * an empty, session-free target is deleted — and that is not data-destroying, so
+ * the route carries no confirm gate at all. Resizing or deleting a LUN with a
+ * live session is likewise a hard 409 with no bypass: the initiator has the
+ * device open and its filesystem mounted.
  */
 export interface IscsiMutateRouteOptions extends IscsiPaths {
   executor: CommandExecutor
@@ -450,38 +454,47 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     if (rejectForeign(target, reply))
       return reply
 
-    const initiators = target.sessions.map(s => s.initiatorIqn)
-    const warnings: string[] = []
-    if (initiators.length > 0) {
-      warnings.push(
-        ...initiators.map(i => `${i} is logged in now — deleting the target drops its session immediately and its device on that host goes stale with no kernel message`),
-      )
+    // A target with live sessions is REFUSED, not confirmed: deleting it drops
+    // every session and leaves a stale device on each host with no kernel
+    // message (GT-42) — there is no confirmation that makes that safe. Logging
+    // the initiators out first is the only way out, so the refusal says it.
+    if (target.sessions.length > 0) {
+      const initiators = target.sessions.map(s => s.initiatorIqn)
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'live-sessions',
+          message: `Target '${iqn}' has ${initiators.length} live session${initiators.length === 1 ? '' : 's'} `
+            + `(${initiators.join(', ')}). Deleting it drops ${initiators.length === 1 ? 'it' : 'them'} and leaves a stale device `
+            + `on each host with no kernel message. Log the initiators out first. This refusal has no confirm bypass.`,
+        },
+      }
     }
-    if (target.luns.length > 0) {
-      warnings.push(
-        `${target.luns.length} LUN${target.luns.length === 1 ? '' : 's'} will be unmapped and their backstores deleted. The data is NOT destroyed — `
-        + `the volumes and image files stay: ${target.luns.map(l => l.backingPath).filter(Boolean).join(', ')}`,
-      )
-    }
-    warnings.push(`The IQN ${iqn} goes with it — an initiator configured against it must be repointed, and there is no way to recreate a target under the same IQN with the same LUN identities except by adding the same LUNs back`)
 
-    if (!confirmGate(confirmStore, request, reply, {
-      operation: 'iscsi.target.delete',
-      params: { target: iqn },
-      message: initiators.length > 0
-        ? `Target '${iqn}' has ${initiators.length} live session${initiators.length === 1 ? '' : 's'}; deleting it drops ${initiators.length === 1 ? 'it' : 'them'}`
-        : `Deleting target '${iqn}' unmaps its LUNs and removes the target`,
-      warnings,
-    })) {
-      return reply
+    // A target with LUNs is refused too: the LUNs are deleted through their own
+    // door, where the operator chooses per LUN whether the backing zvol/image is
+    // destroyed. Only what is left after — an empty, session-free target — is
+    // safe to delete, and that is not data-destroying, so it is not
+    // confirm-gated either.
+    if (target.luns.length > 0) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'target-has-luns',
+          message: `Target '${iqn}' still has ${target.luns.length} LUN${target.luns.length === 1 ? '' : 's'} `
+            + `(${target.luns.map(l => l.name).join(', ')}). Delete the LUNs first `
+            + `(their backing zvols/images are kept unless you choose destroyBacking on each). This refusal has no confirm bypass.`,
+        },
+      }
     }
 
     const job = jobQueue.submit(
       'iscsi.target.delete',
-      { ...identity, params: { target: iqn, sessions: initiators.length } },
+      { ...identity, params: { target: iqn } },
       async updateProgress => withIscsiLock(async () => {
-        const result = await deleteIscsiTarget(mutateOptions(updateProgress), target, state.targets)
-        return { ...result, droppedSessions: initiators }
+        return deleteIscsiTarget(mutateOptions(updateProgress), target)
       }),
     )
 

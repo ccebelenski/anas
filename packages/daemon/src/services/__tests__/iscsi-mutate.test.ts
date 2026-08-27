@@ -821,30 +821,20 @@ describe('zvol grow, LUN delete, target state and target delete', () => {
     }
   })
 
-  it('deleting a target removes it and the backstores ONLY it referenced', async () => {
+  it('deleting a target removes the target and saves — an EMPTY target has no backstores to clean up', async () => {
+    // The route only calls this for a target with zero LUNs and no live
+    // sessions (it refuses both), so the sequence is exactly the delete and
+    // the save. A zero-LUN target has no backstores of its own: backstore
+    // names are node-global, a LUN delete removes its backstore, and a
+    // backstore shared with another target was never this target's to remove.
     const mock = okExecutor()
-    const victim = target({
-      luns: [
-        { index: 0, name: 'mine', plugin: 'block', backingPath: '/dev/zvol/tank/a' },
-        { index: 1, name: 'shared', plugin: 'fileio', backingPath: '/tank/images/shared.raw' },
-      ] as never,
-    })
-    const other = target({
-      iqn: 'iqn.2026-08.nas.anas:other',
-      luns: [{ index: 0, name: 'shared', plugin: 'fileio', backingPath: '/tank/images/shared.raw' }] as never,
-    })
-    const result = await deleteIscsiTarget({ executor: mock }, victim, [victim, other])
+    const result = await deleteIscsiTarget({ executor: mock }, target())
 
     assert.deepEqual(targetcliCalls(mock), [
       `/iscsi delete ${IQN}`,
-      // An orphaned backstore would keep holding its zvol open with nothing in
-      // the UI to explain the later `dataset is busy` (GT-40/GT-41).
-      '/backstores/block delete mine',
       'saveconfig',
     ])
-    assert.deepEqual(result.backstoresDeleted, ['mine'])
-    // The DATA is untouched either way — that is what destroyBacking is for.
-    assert.deepEqual(result.backingKept, ['/dev/zvol/tank/a'])
+    assert.deepEqual(result, { iqn: IQN })
   })
 })
 
