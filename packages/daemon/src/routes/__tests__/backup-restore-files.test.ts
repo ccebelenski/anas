@@ -677,6 +677,122 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.deepEqual(result.missing, ['/alpha.txt'])
   })
 
+  // --- New location (backup2.10) --------------------------------------------
+
+  describe('newLocation — the path IS the new directory the restore creates', () => {
+    const NEWLOC = '/gtbackup/elsewhere'
+
+    function newLocationBody(over: Record<string, unknown> = {}): Record<string, unknown> {
+      return body({ task: undefined, target: { mode: 'newLocation', path: NEWLOC }, ...over })
+    }
+
+    it('a newLocation door without its path is refused at the boundary', async () => {
+      const res = await post(body({ task: undefined, target: { mode: 'newLocation' } }))
+      assert.equal(res.statusCode, 400)
+      assert.match((res.json() as { error: { message: string } }).error.message, /target\.path/)
+      assert.equal(restoreRan(), false)
+    })
+
+    it('an existing path is refused — newLocation always creates, never merges', async () => {
+      const mock = mockOf(server)
+      mock.addFixture({
+        command: TIMEOUT,
+        args: shellArgs(),
+        result: { stdout: statBlock('/alpha.txt', 23, 'file', '644', '-rw-r--r--'), stderr: '', exitCode: 0 },
+      })
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+        result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
+      })
+      const res = await post(newLocationBody())
+      assert.equal(res.statusCode, 409)
+      const message = (res.json() as { error: { message: string } }).error.message
+      assert.match(message, /already exists/)
+      assert.match(message, /newLocation/)
+      assert.equal(restoreRan(), false)
+    })
+
+    it('creates the new directory and restores into it — no overwrite flags, no gate', async () => {
+      const mock = mockOf(server)
+      mock.addFixture({
+        command: TIMEOUT,
+        args: shellArgs(),
+        result: { stdout: statBlock('/alpha.txt', 23, 'file', '644', '-rw-r--r--'), stderr: 'Starting interactive shell\n', exitCode: 0 },
+      })
+      // The new directory must NOT exist — parents are created by the client (GT-15).
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+        result: { stdout: '', stderr: 'No such file or directory\n', exitCode: 1 },
+      })
+      // Verification: the picked file is there after the restore.
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['30', '/usr/bin/find', '-P', `${NEWLOC}/alpha.txt`, '-maxdepth', '0', '-printf', '%p\n'],
+        result: { stdout: `${NEWLOC}/alpha.txt\n`, stderr: '', exitCode: 0 },
+      })
+      mock.addFixture({
+        command: PBC,
+        args: ['restore', SNAP, 'data.pxar', NEWLOC, '--ns', 'gtrestore', '--pattern', '/alpha.txt'],
+        result: { stdout: '', stderr: 'restore complete (2.546 KiB processed in <0.1s, average 777.059 KiB/s)    \r', exitCode: 0 },
+      })
+
+      const res = await post(newLocationBody())
+      assert.equal(res.statusCode, 202, 'a new directory is never confirm-gated')
+      const job = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as BackupFilesRestoreResult
+      assert.equal(result.mode, 'newLocation')
+      assert.equal(result.target, NEWLOC, 'the operator\'s path IS the target, no derivation')
+      assert.equal(result.merge, false)
+      assert.equal(result.status, 'completed')
+      assert.deepEqual(result.patterns, ['/alpha.txt'])
+      assert.deepEqual(result.missing, [])
+
+      const call = mock.calls.find(c => c.command === PBC && c.args[0] === 'restore')!
+      assert.deepEqual(call.args, ['restore', SNAP, 'data.pxar', NEWLOC, '--ns', 'gtrestore', '--pattern', '/alpha.txt'])
+      // No overwrite flags for a new directory (GT-15), and no secret on argv.
+      assert.ok(!call.args.includes('--overwrite'))
+      assert.ok(!call.args.includes('--allow-existing-dirs'))
+      assert.ok(!mock.calls.some(c => c.args.some(a => a.includes('token-secret-value'))))
+    })
+
+    it('refuses a path in PVE territory, and nothing ran', async () => {
+      const res = await post(newLocationBody({ target: { mode: 'newLocation', path: '/mnt/pve/backups' } }))
+      assert.equal(res.statusCode, 409)
+      assert.match((res.json() as { error: { message: string } }).error.message, /belongs to Proxmox/)
+      assert.equal(restoreRan(), false)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    })
+
+    it('refuses when the selection does not fit the new location\'s filesystem, naming BOTH numbers', async () => {
+      const mock = mockOf(server)
+      mock.addFixture({
+        command: TIMEOUT,
+        args: shellArgs(),
+        result: { stdout: statBlock('/alpha.txt', 5_000_000, 'file', '644', '-rw-r--r--'), stderr: '', exitCode: 0 },
+      })
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+        result: { stdout: '', stderr: 'No such file', exitCode: 1 },
+      })
+      // The check lands on the parent — the directory the new one will be created in.
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['10', '/usr/bin/stat', '-f', '-c', '%S %a', '/gtbackup'],
+        result: { stdout: '4096 10\n', stderr: '', exitCode: 0 },
+      })
+      const res = await post(newLocationBody())
+      assert.equal(res.statusCode, 409)
+      const message = (res.json() as { error: { message: string } }).error.message
+      assert.match(message, /5000000 bytes/)
+      assert.match(message, /40960 bytes free/)
+      assert.equal(restoreRan(), false)
+    })
+  })
+
   // --- Failure --------------------------------------------------------------
 
   it('a failed restore fails the JOB and labels the side-by-side directory', async () => {

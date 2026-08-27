@@ -54,8 +54,12 @@ const WHITESPACE_RE = /\s+/
  * guaranteed that `volsize` is present and that no filesystem-only property
  * (mountpoint / recordsize / quota) came along for the ride, because ZFS does
  * not have those properties on a zvol at all.
+ *
+ * Exported rather than route-private because the new-LUN image restore
+ * (story backup2.10) creates its zvol backing through the SAME `zfs create`
+ * argv — one builder for the volume-create arguments, not two copies.
  */
-function buildCreateArgs(fullName: string, req: CreateDatasetRequest): string[] {
+export function buildCreateArgs(fullName: string, req: CreateDatasetRequest): string[] {
   const args = ['create']
   const isVolume = req.type === 'volume'
   // Sparse (thin) FIRST: `-s` is what omits the refreservation, and the absence

@@ -16,6 +16,7 @@ import type {
   BackupTaskDetail,
   BackupTaskEntry,
   BackupTaskView,
+  IscsiTargetDetail,
 } from '@anas/shared'
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
@@ -23,7 +24,8 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { ConsistencyFacts } from '../services/backup-consistency.js'
 import type { BackupReposPaths } from '../services/backup-repos.js'
-import type { IscsiPaths } from '../services/iscsi.js'
+import type { ResolvedBacking } from '../services/iscsi-mutate.js'
+import type { IscsiPaths, IscsiReadContext } from '../services/iscsi.js'
 import {
   BACKUP_SKIPPED_OFF_WEEK,
   BackupBrowseRequest,
@@ -84,6 +86,7 @@ import {
   imageArchiveSize,
   readTargetSize,
   runImageRestore,
+  runNewLunImageRestore,
   snapshotGroup,
 } from '../services/backup-restore.js'
 import {
@@ -118,7 +121,10 @@ import { createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/
 import {
   assertInstalled,
   assertSaveable,
+  imageFilePath,
   readIscsiState,
+  resolveFileBackingDir,
+  resolveZvolBacking,
   withIscsiLock,
 } from '../services/iscsi-mutate.js'
 import { classifyBacking } from '../services/iscsi-ownership.js'
@@ -185,6 +191,11 @@ export interface BackupRouteOptions {
    * `installed: false` with an empty list.
    */
   iscsiPaths?: IscsiPaths
+  /**
+   * backup2.10 — the fstab a file-backed new LUN on an AHR pool gets its boot
+   * ordering from (story iscsi.8), same option the add-LUN route takes.
+   */
+  fstabPath?: string
 }
 
 /** Trailing slashes on a restore target (the root survives as `/`). */
@@ -196,8 +207,19 @@ function CONFLICT(version: number) {
   }
 }
 
+/**
+ * The 409 a side-by-side restore earns when its own deterministic directory
+ * already exists — a second restore of the same point in time must never be
+ * merged into the first, including a partial one this daemon labelled itself.
+ */
+function sideBySideExistsMessage(target: string): string {
+  return `'${target}' already exists. A side-by-side restore always creates a new directory - `
+    + 'move or remove that one first (if it holds a .anas-restore-partial marker, it is an '
+    + 'unfinished restore of this same point in time).'
+}
+
 export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOptions) {
-  const { executor, jobQueue, paths, systemdDir, confirmStore } = opts
+  const { executor, jobQueue, paths, systemdDir, confirmStore, fstabPath = '/etc/fstab' } = opts
   const iscsiPaths: IscsiPaths = opts.iscsiPaths ?? {}
 
   /**
@@ -1516,11 +1538,32 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'CONFLICT', reason: degraded.reason, message: degraded.message } }
     }
 
+    // backup2.10: the second door. A `newLun` target restores the image AS A
+    // NEW LUN and the source is never touched, so it pre-flights a different
+    // set of facts (there is no source LUN to check) and runs a different job.
+    // `confirmStore` arrives already narrowed — the 503 guard above ran first.
+    if (req.target?.mode === 'newLun')
+      return restoreNewLunImage(request, reply, req, state, confirmStore)
+
+    // In-place: the shared schema made `lun` required when there is no newLun
+    // target, so this is a type-level backstop, not an expected path.
+    const lunRef = req.lun
+    if (!lunRef) {
+      reply.code(400)
+      return {
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: 'An in-place image restore names the LUN it writes back (lun); '
+            + 'to restore as a NEW LUN send target with mode=newLun.',
+        },
+      }
+    }
+
     // (2) The target and the LUN.
-    const target = state.targets.find(t => t.iqn === req.lun.targetIqn)
+    const target = state.targets.find(t => t.iqn === lunRef.targetIqn)
     if (!target) {
       reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `iSCSI target '${req.lun.targetIqn}' not found` } }
+      return { error: { code: 'NOT_FOUND', message: `iSCSI target '${lunRef.targetIqn}' not found` } }
     }
     if (target.ownership !== 'anas') {
       reply.code(409)
@@ -1532,10 +1575,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         },
       }
     }
-    const lun = target.luns.find(l => l.index === req.lun.index)
+    const lun = target.luns.find(l => l.index === lunRef.index)
     if (!lun) {
       reply.code(404)
-      return { error: { code: 'NOT_FOUND', message: `Target '${target.iqn}' has no LUN ${req.lun.index}` } }
+      return { error: { code: 'NOT_FOUND', message: `Target '${target.iqn}' has no LUN ${lunRef.index}` } }
     }
 
     // (3) The backing has to be a block object ANAS understands, and it has to
@@ -1735,6 +1778,224 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     reply.code(202)
     return { job }
   }
+
+  // --- The restore-as-a-NEW-LUN branch (story backup2.10) ------------------
+  //
+  // Its own pre-flight, because it checks different facts: there is NO source
+  // LUN to look up, NO size equality to prove (the new backing is created at
+  // exactly the image's size, so a mismatch is impossible by construction),
+  // NO live-session gate (nothing existing goes offline) and NO TPG disable.
+  // What it does check, in order — every refusal before anything destructive:
+  //
+  //   1. LIO installed, not degraded                          (shared, above)
+  //   2. the target exists and is ANAS-owned
+  //   3. the name is free — the backstore name is NODE-GLOBAL (GT-15)
+  //   4. the backing storage resolves onto ANAS-managed storage
+  //   5. the snapshot exists and the manifest knows the image's size
+  //   6. the confirm gate (409 + X-Anas-Confirm-Code)
+  //
+  // Only then is a job submitted, and only inside that job does anything change.
+  async function restoreNewLunImage(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    req: BackupImageRestoreRequest,
+    state: { ctx: IscsiReadContext, targets: IscsiTargetDetail[] },
+    confirmStore: ConfirmStore,
+  ) {
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    const newLun = req.target
+    if (!newLun || newLun.mode !== 'newLun')
+      return reply
+
+    // (2) The destination target — a LUN is added to it, so it must be ANAS's.
+    const target = state.targets.find(t => t.iqn === newLun.targetIqn)
+    if (!target) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `iSCSI target '${newLun.targetIqn}' not found` } }
+    }
+    if (target.ownership !== 'anas') {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'foreign-target',
+          message: `Target '${target.iqn}' is not managed by ANAS and is hands-off: ${target.ownershipDetail}`,
+        },
+      }
+    }
+
+    // (3) The name. The backstore name is a NODE-GLOBAL namespace in LIO, not
+    // per-target, and it is the SCSI model string every initiator sees (GT-15)
+    // — the same reason the add-LUN door checks it node-wide, so the same
+    // refusal wording rides here.
+    const nameTaken = state.targets.some(t => t.luns.some(l => l.name === newLun.name))
+    if (nameTaken) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'name-taken',
+          message: `A LUN named '${newLun.name}' already exists on this node. The name is the SCSI model string `
+            + 'initiators see, so it has to be unique.',
+        },
+      }
+    }
+
+    // (4) The backing storage — resolved exactly the way the add-LUN door
+    // resolves it, because a restore's new backing is one of its two kinds:
+    // a zvol is the pool's volume named after the LUN, a file is the image
+    // `<dir>/<name>.raw` on a dataset or an AHR pool. Everything not
+    // ANAS-managed is refused by the same helper, with its own wording.
+    let backing: ResolvedBacking
+    let ahr: { name: string, mountpoint: string } | undefined
+    if (newLun.backing.kind === 'zvol') {
+      const dataset = `${newLun.backing.pool}/${newLun.name}`
+      const resolved = resolveZvolBacking(dataset, state.ctx)
+      if ('refusal' in resolved) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', reason: resolved.refusal.reason, message: resolved.refusal.message } }
+      }
+      backing = resolved.ok
+    }
+    else {
+      const dir = await resolveFileBackingDir(
+        executor,
+        newLun.backing.dataset ?? newLun.backing.ahrPool ?? '',
+        state.ctx,
+      )
+      if ('refusal' in dir) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', reason: dir.refusal.reason, message: dir.refusal.message } }
+      }
+      backing = {
+        path: imageFilePath(dir.ok.dir, newLun.name),
+        plugin: 'fileio',
+        ...(dir.ok.dataset ? { dataset: dir.ok.dataset } : {}),
+      }
+      ahr = dir.ok.ahr
+    }
+
+    // (5) The snapshot, and the manifest's size of the image inside it — the
+    // FIRST PBS contact, through the same read as the picker (backup2.5). The
+    // size is not an equality to prove here: the new backing is CREATED at
+    // exactly that size. What it must be is KNOWN — a restore without the
+    // manifest's number would be a LUN whose end nobody checked.
+    const deps = await readDepsFor(req.repo, reply, req.ns?.trim() || undefined)
+    if (!deps)
+      return reply
+    const group = snapshotGroup(req.snapshot)
+    const listed = await listSnapshots(executor, deps, group)
+    if (!listed.ok) {
+      const notFound = listed.verdict === 'not-found'
+      reply.code(notFound ? 404 : 502)
+      return {
+        error: {
+          code: notFound ? 'NOT_FOUND' : 'UPSTREAM_ERROR',
+          reason: listed.verdict,
+          message: `Could not read '${group}' in repository '${req.repo}': ${listed.detail}`,
+        },
+      }
+    }
+    const entry = listed.data.find(s => s.snapshot === req.snapshot)
+    if (!entry) {
+      reply.code(404)
+      return {
+        error: {
+          code: 'NOT_FOUND',
+          message: `Snapshot '${req.snapshot}' is not in repository '${req.repo}'`
+            + `${deps.namespace ? ` namespace '${deps.namespace}'` : ''}.`,
+        },
+      }
+    }
+    const imageSize = imageArchiveSize(entry, req.archive)
+    if (imageSize === null) {
+      reply.code(409)
+      return {
+        error: {
+          code: 'CONFLICT',
+          reason: 'image-size-unknown',
+          message: `The size of archive '${req.archive}' is not in the snapshot manifest, so ANAS cannot `
+            + `create the new backing at the image's exact size. A whole-image restore is refused without `
+            + 'that proof: a backing of the wrong size would be a LUN whose end does not match the image it holds.',
+        },
+      }
+    }
+
+    // (6) The confirm gate. The warnings say exactly what this is and is not:
+    // a NEW disk, nothing existing touched, the source stays where it is.
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'backup.restore.image',
+      params: { target: target.iqn, lun: newLun.name, mode: 'newLun' },
+      message: `Restoring ${req.archive} from ${req.snapshot} as a NEW LUN '${newLun.name}' on ${target.iqn}`,
+      warnings: [
+        `This creates a NEW LUN '${newLun.name}' backed by ${backing.path} at exactly the image's size `
+        + `(${imageSize} bytes), mapped at the next free index on ${target.iqn}. Nothing that exists is touched.`,
+        'The new LUN gets a FRESH unit serial: a restored copy is a NEW disk, so an initiator that identified '
+        + 'the original by its serial will see a different disk.',
+        'The source LUN — the LUN this image was backed up from — is not touched: it stays online, keeps its '
+        + 'serial, and no initiator has to log out.',
+        'If the restore fails part-way, ANAS removes the new LUN, its backstore and its backing — nothing of '
+        + 'the failed attempt is left behind, and the half-written state is never persisted.',
+      ],
+    })) {
+      return reply
+    }
+
+    const { repo, secret } = deps
+
+    // The journald audit params — the queue's completion line carries them, with
+    // `bytesWritten` filled in when the job finishes, exactly as the in-place
+    // restore does. No secret and no repository credential ever ride here.
+    const auditParams: Record<string, unknown> = {
+      repo: repo.name,
+      ...(deps.namespace ? { namespace: deps.namespace } : {}),
+      snapshot: req.snapshot,
+      archive: req.archive,
+      target: target.iqn,
+      lun: newLun.name,
+      backing: backing.path,
+      imageBytes: imageSize,
+      mode: 'newLun',
+    }
+
+    const job = jobQueue.submit(
+      'backup.restore.image',
+      { ...identity, params: auditParams },
+      async updateProgress => withIscsiLock(async () => runNewLunImageRestore(
+        executor,
+        {
+          repo,
+          secret,
+          ...(deps.namespace ? { namespace: deps.namespace } : {}),
+          snapshot: req.snapshot,
+          archive: req.archive,
+          imageSize,
+          target,
+          name: newLun.name,
+          backing,
+          ...(ahr ? { ahr: { fstabPath, pool: ahr } } : {}),
+          ...(req.rate ? { rate: req.rate } : {}),
+          env: buildBackupEnv(repo, secret),
+          mutate: {
+            executor,
+            configfsRoot: iscsiPaths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
+            progress: updateProgress,
+          },
+        },
+        updateProgress,
+      ).then((result) => {
+        auditParams.bytesWritten = result.bytesWritten
+        return result
+      })),
+    )
+
+    reply.code(202)
+    return { job }
+  }
+
   // --- The SELECTIVE FILE branch (story backup2.6) -------------------------
   //
   // The pre-flight order below is an order, not a set: every refusal happens
@@ -1797,8 +2058,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // (backup2.3's `<name>__<child>`) matches no stored archive on purpose —
     // its name flattened a path and cannot be inverted — so the caller names
     // the directory and ANAS guesses nothing. Nothing here creates a dataset.
+    //
+    // `newLocation` (backup2.10) is the exception to "home": its `path` IS the
+    // new directory, not the archive's live home — the schema made it required
+    // for that mode, so the task lookup below never runs for it.
+    const isNewLocation = req.target.mode === 'newLocation'
     let home = req.target.path
-    if (!home && req.task) {
+    if (!home && !isNewLocation && req.task) {
       const task = await readTask(systemdDir, req.task)
       home = task?.archives.find(a => a.name === bareArchiveName(req.archive))?.path
     }
@@ -1815,7 +2081,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
     const target = req.target.mode === 'inPlace'
       ? home.replace(RESTORE_TRAILING_SLASHES_RE, '') || '/'
-      : sideBySideRestorePath(home, req.snapshot)
+      : isNewLocation
+        ? home.replace(RESTORE_TRAILING_SLASHES_RE, '') || '/'
+        : sideBySideRestorePath(home, req.snapshot)
     if (!target) {
       reply.code(400)
       return {
@@ -1852,22 +2120,21 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
     }
 
-    // --- Pre-flight 2: a side-by-side directory is NEW, always ---------------
+    // --- Pre-flight 2: a new directory is NEW, always -----------------------
     // Never reuse: a second restore of the same point in time into a
     // half-finished first one would merge two attempts with no way to tell
     // them apart — including a partial one this daemon labelled itself.
-    if (req.target.mode === 'sideBySide') {
+    // `newLocation` (backup2.10) is the same shape with an operator-chosen
+    // path: the restore creates it, parents included (GT-15), and refuses to
+    // merge into a directory the operator already has.
+    if (req.target.mode === 'sideBySide' || isNewLocation) {
       const exists = await pathExists(executor, target)
       if (exists === true) {
+        const message = isNewLocation
+          ? `'${target}' already exists. A newLocation restore always creates a new directory - choose a different path, or remove that directory first.`
+          : sideBySideExistsMessage(target)
         reply.code(409)
-        return {
-          error: {
-            code: 'CONFLICT',
-            message: `'${target}' already exists. A side-by-side restore always creates a new directory - `
-              + 'move or remove that one first (if it holds a .anas-restore-partial marker, it is an '
-              + 'unfinished restore of this same point in time).',
-          },
-        }
+        return { error: { code: 'CONFLICT', message } }
       }
     }
 
@@ -1890,9 +2157,9 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
 
     // --- Pre-flight 4: can we write there at all? ----------------------------
     // A read-only or dead target does not fail at the start: the client enters
-    // the directory happily and dies at the FIRST FILE. For a side-by-side
-    // restore the directory does not exist yet, so the test goes where it will
-    // be created.
+    // the directory happily and dies at the FIRST FILE. For a restore into a
+    // NEW directory (side-by-side or newLocation) the directory does not exist
+    // yet, so the test goes where it will be created.
     const writeDir = req.target.mode === 'inPlace' ? target : parentDirectory(target)
     const writable = await writeTestDirectory(executor, writeDir)
     if (!writable.ok) {

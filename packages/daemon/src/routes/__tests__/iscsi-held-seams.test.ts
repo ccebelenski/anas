@@ -122,6 +122,15 @@ describe('iscsi.6 — the backing-file-removal seam (no such path exists)', () =
    *         iSCSI mutex still says 0 bytes (story `iscsi.8`). It cannot surprise
    *         a LUN: it IS the LUN's teardown, and it never touches a file with
    *         content.
+   *   backup-restore
+   *       → the NEW LUN's OWN backing image, and only as the last step of the
+   *         cleanup a FAILED new-LUN restore (story `backup2.10`) performs on
+   *         what THIS run created seconds earlier. `createSparseImage` opens
+   *         with `wx` (it refuses an existing path), so the file cannot be
+   *         anyone else's, and the function has unmapped the LUN and deleted
+   *         the backstore it belonged to before it unlinks. Teardown of a LUN
+   *         the operation created itself — the same category as iscsi-mutate's
+   *         `?destroyBacking`, not a path that could surprise a LUN.
    */
   const ALLOWED = new Set([
     'backup-units.ts',
@@ -129,6 +138,7 @@ describe('iscsi.6 — the backing-file-removal seam (no such path exists)', () =
     'snapshot-schedule-units.ts',
     'iscsi-mutate.ts',
     'iscsi-quarantine.ts',
+    'backup-restore.ts',
   ])
 
   it('nothing else in services/ deletes a file', async () => {

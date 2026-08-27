@@ -1,6 +1,7 @@
 import type { Job } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
+import { constants } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -678,6 +679,246 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       // And no secret, anywhere.
       assert.equal(JSON.stringify(job).includes('super-secret'), false)
       assert.equal(JSON.stringify(params).includes('super-secret'), false)
+    })
+  })
+
+  // --- backup2.10: the same image restored AS A NEW LUN ---------------------
+  //
+  // `target: { mode: 'newLun' }` is the second door of this route: the image
+  // lands on a FRESH backing with a FRESH serial, mapped at the next free
+  // index — the source LUN is never touched, so it has none of in-place's
+  // gates (no live-session gate, no offline window). It has its own: the
+  // destination target's ownership, the node-global name, the backing's
+  // storage, the manifest's size, and a confirm gate whose warnings say what
+  // this is NOT (not an overwrite). The sequence itself is asserted as a call
+  // log in `services/__tests__/backup-restore-elsewhere.test.ts`.
+
+  describe('backup2.10 — the image restored as a NEW LUN (target.mode: newLun)', () => {
+    const NEWVOL_PATH = '/dev/zvol/tank/newvol'
+
+    function newLunBody(over: Record<string, unknown> = {}) {
+      return body({
+        lun: undefined,
+        target: {
+          mode: 'newLun',
+          targetIqn: ANAS_IQN,
+          name: 'newvol',
+          backing: { kind: 'zvol', pool: 'tank' },
+        },
+        ...over,
+      })
+    }
+
+    function targetWith(over: Record<string, unknown>) {
+      return { target: { mode: 'newLun', targetIqn: ANAS_IQN, name: 'newvol', backing: { kind: 'zvol', pool: 'tank' }, ...over } }
+    }
+
+    describe('the preflights — in order, and nothing destructive before each one', () => {
+      it('no LIO stack → the same guiding 409, nothing touched', async () => {
+        await serve()
+        const res = await restore(newLunBody())
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.body.error!.reason, 'lio-not-installed')
+        assert.match(res.body.error!.message, /targetcli-fb python3-rtslib-fb/)
+        assertNothingDestructive()
+      })
+
+      it('a degraded restore is refused for a NEW LUN too — a save would persist the hole (GT-22)', async () => {
+        await serveAnas({ hole: true })
+        const res = await restore(newLunBody())
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.body.error!.reason, 'degraded-restore')
+        assert.match(res.body.error!.message, /ghost/)
+        assertNothingDestructive()
+      })
+
+      it('an unknown destination target is a 404', async () => {
+        await serveAnas()
+        const res = await restore(newLunBody(targetWith({ targetIqn: 'iqn.2026-08.nas.anas:nope' })))
+        assert.equal(res.statusCode, 404)
+        assert.match(res.body.error!.message, /not found/)
+        assertNothingDestructive()
+      })
+
+      it('a destination target ANAS does not manage is hands-off', async () => {
+        const foreign = 'iqn.2026-08.dev.example.gt:target1'
+        await serve({
+          manifest: anasManifest().replace(new RegExp(ANAS_IQN, 'g'), foreign),
+          saveconfigText: anasSaveconfig().replace(new RegExp(ANAS_IQN, 'g'), foreign),
+        })
+        const res = await restore(newLunBody(targetWith({ targetIqn: foreign })))
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.body.error!.reason, 'foreign-target')
+        assertNothingDestructive()
+      })
+
+      it('a taken name is refused node-wide — it is the SCSI model string (GT-15)', async () => {
+        await serveAnas()
+        const res = await restore(newLunBody(targetWith({ name: 'vmdisk1' })))
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.body.error!.reason, 'name-taken')
+        assert.match(res.body.error!.message, /SCSI model string/)
+        assertNothingDestructive()
+      })
+
+      it('a PVE guest volume is never ANAS\'s to create, even for a restore', async () => {
+        await serveAnas()
+        const res = await restore(newLunBody(targetWith({ name: 'vm-101-disk-0' })))
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.body.error!.reason, 'pve-guest-volume')
+        assert.match(res.body.error!.message, /PVE's territory/)
+        assertNothingDestructive()
+      })
+
+      it('a file backing on storage ANAS does not manage is refused by name', async () => {
+        await serveAnas()
+        const res = await restore(newLunBody(targetWith({ backing: { kind: 'file', dataset: 'nosuchdataset' } })))
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.body.error!.reason, 'backing-not-found')
+        assert.match(res.body.error!.message, /neither a mounted ZFS dataset nor an AHR pool/)
+        assertNothingDestructive()
+      })
+
+      it('a manifest without the image\'s size refuses — a backing of the wrong size is worse than none', async () => {
+        await serveAnas()
+        const res = await restore(newLunBody({ archive: 'nosuch.img' }))
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.body.error!.reason, 'image-size-unknown')
+        assert.match(res.body.error!.message, /not in the snapshot manifest/)
+        assertNothingDestructive()
+      })
+    })
+
+    it('the confirm gate says what this is and is not — a NEW disk, nothing touched', async () => {
+      await serveAnas()
+      const res = await restore(newLunBody())
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      assert.ok(res.headers['x-anas-confirm-code'], 'expected a confirm code')
+      const warnings = (res.body.error!.warnings ?? []).join(' | ')
+      assert.match(warnings, /NEW LUN 'newvol' backed by \/dev\/zvol\/tank\/newvol at exactly the image's size \(536870912 bytes\)/)
+      assert.match(warnings, /FRESH unit serial/)
+      assert.match(warnings, /source LUN .* is not touched/)
+      assert.match(warnings, /removes the new LUN, its backstore and its backing/)
+      assertNothingDestructive()
+    })
+
+    it('the confirmed call runs the whole sequence: fresh backing at the manifest size, FRESH serial, source untouched, saveconfig LAST', async () => {
+      await serveAnas()
+      // The read-back at the end of the job reads the NEW volume's size.
+      mockOf().addFixture({
+        command: ZFS,
+        args: volsizeArgs('tank/newvol'),
+        result: { stdout: `${IMAGE_SIZE}\n`, stderr: '', exitCode: 0 },
+      })
+
+      const first = await restore(newLunBody())
+      const res = await restore(newLunBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as {
+        complete: boolean
+        bytesWritten: number
+        imageSize: number
+        lunIndex: number
+        targetPath: string
+        targetDisabled: boolean
+        targetReEnabled: boolean
+        newLun?: { targetIqn: string, index: number, name: string, serial: string, backingPath: string }
+        warnings?: string[]
+      }
+      assert.equal(result.complete, true)
+      assert.equal(result.bytesWritten, IMAGE_SIZE)
+      assert.equal(result.imageSize, IMAGE_SIZE)
+      assert.equal(result.targetPath, NEWVOL_PATH)
+      assert.equal(result.lunIndex, 1, 'mapped at the NEXT free index — the source holds 0')
+      assert.equal(result.targetDisabled, false, 'the source LUN never goes offline')
+      assert.equal(result.targetReEnabled, false)
+      assert.equal(result.warnings, undefined, JSON.stringify(result.warnings))
+
+      // The serial is FRESH — generated for this disk, never the source's.
+      const serial = result.newLun?.serial ?? ''
+      assert.match(serial, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+      assert.notEqual(serial, '9bc6e907-6015-4267-be4f-5a0617cb3d71', 'never the source LUN\'s serial')
+      assert.deepEqual(result.newLun, { targetIqn: ANAS_IQN, index: 1, name: 'newvol', serial, backingPath: NEWVOL_PATH })
+
+      const mock = mockOf()
+      // The stream went to the NEW backing, write-only — pbc never saw a path.
+      assert.equal(mock.streamCalls.length, 1)
+      assert.deepEqual(mock.streamCalls[0].target, { path: NEWVOL_PATH, flags: constants.O_WRONLY })
+      assert.deepEqual(mock.streamCalls[0].args, ['restore', SNAP, 'vol.img', '-', '--ns', 'gtrestore'])
+
+      // The sequence, in order: volume created at the manifest size FIRST,
+      // backstore with the fresh wwn, ALL attributes before the map, the map
+      // at index 1, the grant, the stream, the read-back, saveconfig LAST.
+      const seq = mock.calls
+        .map(c => `${c.command} ${c.args.join(' ')}`)
+        .filter(a => a.startsWith(TARGETCLI)
+          || a.includes(' restore ')
+          || a === `${ZFS} create -s -V ${IMAGE_SIZE} tank/newvol`
+          || a === `${ZFS} get -Hp -o value volsize tank/newvol`)
+      assert.deepEqual(seq, [
+        `${ZFS} create -s -V ${IMAGE_SIZE} tank/newvol`,
+        `${TARGETCLI} /backstores/block create name=newvol dev=${NEWVOL_PATH} wwn=${serial}`,
+        `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpu=1`,
+        `${TARGETCLI} /backstores/block/newvol set attribute emulate_tpws=1`,
+        `${TARGETCLI} /backstores/block/newvol set attribute max_unmap_lba_count=524288`,
+        `${TARGETCLI} /backstores/block/newvol set attribute emulate_write_cache=0`,
+        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns create storage_object=/backstores/block/newvol lun=1`,
+        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/acls/${INITIATOR} create 1 1`,
+        `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
+        `${ZFS} get -Hp -o value volsize tank/newvol`,
+        `${TARGETCLI} saveconfig`,
+      ], seq.join(' | '))
+
+      // The source LUN never went offline and was never written to.
+      assert.deepEqual(
+        mock.calls.filter(c => c.command === TARGETCLI && (c.args.includes('disable') || c.args.includes('enable'))),
+        [],
+      )
+      assert.ok(!mock.calls.some(c => c.args.join(' ').includes(ZVOL_PATH)), JSON.stringify(mock.calls))
+    })
+
+    it('a mid-stream failure removes the new LUN, its backstore and its backing — and never saves', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.clearFixtures()
+      mock.addFixture({ command: PBC, result: { stdout: SNAPSHOT_LIST_JSON, stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addStreamFixture({
+        command: PBC,
+        result: { stderr: 'Error: No space left on device (os error 28)\n', exitCode: 255, bytesWritten: 268435456 },
+      })
+
+      // The confirm gate still comes first — the failure is the job's, not the gate's.
+      const first = await restore(newLunBody())
+      assert.equal(first.statusCode, 409)
+      assert.equal(first.body.error!.code, 'CONFIRMATION_REQUIRED')
+      const res = await restore(newLunBody(), { 'x-anas-confirm': String(first.headers['x-anas-confirm-code']) })
+      assert.equal(res.statusCode, 202)
+
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed')
+      assert.match(job.error!.message, /the image was partially written \(268435456 of 536870912 bytes reached the new backing \/dev\/zvol\/tank\/newvol\)/)
+      assert.match(job.error!.message, /ANAS has removed LUN 1, backstore 'newvol', volume tank\/newvol/)
+      assert.match(job.error!.message, /nothing of the failed restore remains/)
+
+      // The undo runs in the reverse of the order the objects were made, and
+      // nothing is persisted or taken offline along the way.
+      const seq = mock.calls.map(c => `${c.command} ${c.args.join(' ')}`)
+      const restoreIdx = seq.indexOf(`${PBC} restore ${SNAP} vol.img - --ns gtrestore`)
+      assert.deepEqual(seq.slice(restoreIdx + 1), [
+        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1/luns delete lun1`,
+        `${TARGETCLI} /backstores/block/newvol delete`,
+        `${ZFS} destroy tank/newvol`,
+      ], seq.join(' | '))
+      assert.ok(!seq.some(a => a.includes('saveconfig')), 'a failed restore must not save the LIO configuration')
+      assert.deepEqual(
+        mock.calls.filter(c => c.command === TARGETCLI && (c.args.includes('disable') || c.args.includes('enable'))),
+        [],
+      )
     })
   })
 })

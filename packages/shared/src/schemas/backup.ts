@@ -1,5 +1,6 @@
 import { z } from 'zod'
-import { AbsolutePath, hasControlChars, ISODateTime, NotifyMode } from './common.js'
+import { AbsolutePath, DatasetPath, hasControlChars, ISODateTime, NotifyMode, PoolName } from './common.js'
+import { IscsiIqn, IscsiLunName } from './iscsi.js'
 
 /**
  * PBS file backup (Epic 16) — back up host FILE data (shares, datasets, any
@@ -1788,16 +1789,22 @@ export type BackupSnapshotPath = z.infer<typeof BackupSnapshotPath>
 /**
  * Where a file restore lands.
  *
- *   `sideBySide` — a NEW directory beside the archive's live home, named
- *                  `<home>.anas-restore-<snapshot time>`. Needs NO flags and
- *                  the directory need not exist (GT-15). The DEFAULT, because
- *                  it cannot touch a single live byte.
- *   `inPlace`    — the live home itself, with `--allow-existing-dirs
- *                  --overwrite` (GT-11: the minimal pair — `--overwrite` alone
- *                  dies on the first existing DIRECTORY). It is a MERGE, never
- *                  a sync (GT-12): files not in the archive SURVIVE.
+ *   `sideBySide`  — a NEW directory beside the archive's live home, named
+ *                   `<home>.anas-restore-<snapshot time>`. Needs NO flags and
+ *                   the directory need not exist (GT-15). The DEFAULT, because
+ *                   it cannot touch a single live byte.
+ *   `inPlace`     — the live home itself, with `--allow-existing-dirs
+ *                   --overwrite` (GT-11: the minimal pair — `--overwrite`
+ *                   alone dies on the first existing DIRECTORY). It is a
+ *                   MERGE, never a sync (GT-12): files not in the archive
+ *                   SURVIVE.
+ *   `newLocation` — a NEW directory of the operator's choosing
+ *                   (`target.path`), which must NOT exist yet (story
+ *                   backup2.10). Restored with no overwrite flags — like
+ *                   `sideBySide`, it lands in a directory the restore owns,
+ *                   and the restore never writes into anything live.
  */
-export const BackupRestoreTargetMode = z.enum(['sideBySide', 'inPlace'])
+export const BackupRestoreTargetMode = z.enum(['sideBySide', 'inPlace', 'newLocation'])
 export type BackupRestoreTargetMode = z.infer<typeof BackupRestoreTargetMode>
 
 /**
@@ -1963,20 +1970,100 @@ export const BackupRateLimit = z
   .regex(/^\d+(?:\.\d+)?(?:[KMGT]?i?B)?$/, 'a byte rate with an optional unit (e.g. 10MB, 50MiB)')
 export type BackupRateLimit = z.infer<typeof BackupRateLimit>
 
-/** Where the restore lands. `path` names the archive's live HOME, not the new directory. */
-export const BackupRestoreTarget = z.object({
-  mode: BackupRestoreTargetMode.default('sideBySide'),
-  /**
-   * The archive's live home. Optional when the request names a `task` whose
-   * archive of this name knows its own path; REQUIRED otherwise (the task-less
-   * door, and an expanded archive whose name no longer matches any archive).
-   *
-   * In `sideBySide` this is the directory the new one is created BESIDE — the
-   * restore never writes into it.
-   */
-  path: AbsolutePath.optional(),
-})
+/**
+ * Where a file restore lands. `path` names the archive's live HOME in
+ * `sideBySide`/`inPlace` — but in `newLocation` it IS the new directory
+ * (story backup2.10), which must not exist yet and is created by the restore.
+ */
+export const BackupRestoreTarget = z
+  .object({
+    mode: BackupRestoreTargetMode.default('sideBySide'),
+    /**
+     * In `sideBySide`/`inPlace` the archive's live home. Optional when the
+     * request names a `task` whose archive of this name knows its own path;
+     * REQUIRED otherwise (the task-less door, and an expanded archive whose
+     * name no longer matches any archive).
+     *
+     * In `sideBySide` this is the directory the new one is created BESIDE — the
+     * restore never writes into it.
+     *
+     * In `newLocation` REQUIRED: the new directory the restore creates (parents
+     * included). It must not exist — the daemon refuses a restore that would
+     * merge into a directory the operator already has.
+     */
+    path: AbsolutePath.optional(),
+  })
+  .superRefine((target, ctx) => {
+    if (target.mode === 'newLocation' && target.path === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['path'],
+        message: 'a newLocation restore needs the new directory it creates (target.path)',
+      })
+    }
+  })
 export type BackupRestoreTarget = z.infer<typeof BackupRestoreTarget>
+
+/**
+ * The backing object a whole-image restore creates when it lands as a NEW LUN
+ * (story backup2.10) — the same two kinds the add-LUN door offers (iscsi),
+ * minus the "map an EXISTING object" shapes, because a restore's backing is
+ * always created fresh at exactly the image's manifest size:
+ *
+ *   `zvol`  — a new sparse ZFS volume `<pool>/<name>` (the LUN's name IS the
+ *             volume name), created with `zfs create -s -V <size>`.
+ *   `file`  — a new sparse image `<dir>/<name>.raw` on a ZFS dataset or an
+ *             AHR pool's filesystem (exactly ONE of the two), created by
+ *             `createSparseImage` at that size.
+ */
+export const BackupNewLunBacking = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('zvol'),
+    /** The ANAS-managed ZFS pool the new volume goes on. */
+    pool: PoolName,
+  }),
+  z
+    .object({
+      kind: z.literal('file'),
+      /** The ANAS-managed ZFS dataset whose mountpoint hosts the image. */
+      dataset: DatasetPath.optional(),
+      /** The AHR pool whose filesystem hosts the image. */
+      ahrPool: PoolName.optional(),
+    })
+    .superRefine((backing, ctx) => {
+      if (backing.dataset === undefined && backing.ahrPool === undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'a file-backed new LUN names where the image goes: a ZFS dataset or an AHR pool',
+        })
+      }
+      if (backing.dataset !== undefined && backing.ahrPool !== undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          message: 'a file-backed new LUN takes a ZFS dataset OR an AHR pool, not both',
+        })
+      }
+    }),
+])
+export type BackupNewLunBacking = z.infer<typeof BackupNewLunBacking>
+
+/**
+ * Restore the image as a NEW LUN instead of over the source (story backup2.10):
+ * the new backing is created at exactly the image's manifest size, the image is
+ * streamed into it, and it is mapped on `targetIqn` under a FRESH serial — the
+ * source LUN is never touched, goes offline nowhere, and a copy is a new disk
+ * (a copied serial would be a second disk with the source's identity).
+ */
+export const BackupImageRestoreNewLunTarget = z.object({
+  mode: z.literal('newLun'),
+  /** The ANAS-owned target the new LUN appears on. */
+  targetIqn: IscsiIqn,
+  /** The new LUN's name — the backstore name and the SCSI model string. */
+  name: IscsiLunName,
+  /** Where the new backing is created. */
+  backing: BackupNewLunBacking,
+})
+export type BackupImageRestoreNewLunTarget = z.infer<typeof BackupImageRestoreNewLunTarget>
 
 /**
  * `POST /v1/backup/restore` — the WHOLE-IMAGE branch (`kind: 'image'`).
@@ -1984,27 +2071,59 @@ export type BackupRestoreTarget = z.infer<typeof BackupRestoreTarget>
  * The destination is named as a LUN, not as a path: the whole point of the
  * operation is that LIO stops serving the block object while it is rewritten,
  * and a bare path could not express which target has to go offline.
+ *
+ * Story backup2.10 adds the second door — `target` with `mode: 'newLun'`
+ * restores the image AS A NEW LUN (fresh backing at the image's manifest size,
+ * a fresh serial, mapped on an existing ANAS-owned target) and the source LUN
+ * is not touched at all; then `lun` — the in-place destination — is the one
+ * that is optional, and the two doors are mutually exclusive.
  */
-export const BackupImageRestoreRequest = z.object({
-  kind: z.literal('image'),
-  repo: BackupRepoRef,
-  /** Namespace; absent falls back to the repository's own. */
-  ns: z.string().max(256).optional(),
-  snapshot: BackupSnapshotPath,
-  /** The `.img` archive within that snapshot. */
-  archive: BackupArchiveName.refine(
-    n => n.endsWith(IMG_ARCHIVE_SUFFIX),
-    'a whole-image restore needs an .img archive',
-  ),
-  /** Which LUN to write back — the target it belongs to goes offline for the run. */
-  lun: BackupLunRef,
-  /**
-   * pbc's `--rate` (e.g. `50MB`), emitted ONLY when asked for. GT-62: it limits
-   * TRANSFERRED bytes, not logical ones, so a sparse image finishes far faster
-   * than the archive size suggests.
-   */
-  rate: z.string().max(32).optional(),
-})
+export const BackupImageRestoreRequest = z
+  .object({
+    kind: z.literal('image'),
+    repo: BackupRepoRef,
+    /** Namespace; absent falls back to the repository's own. */
+    ns: z.string().max(256).optional(),
+    snapshot: BackupSnapshotPath,
+    /** The `.img` archive within that snapshot. */
+    archive: BackupArchiveName.refine(
+      n => n.endsWith(IMG_ARCHIVE_SUFFIX),
+      'a whole-image restore needs an .img archive',
+    ),
+    /**
+     * Which LUN to write back — the target it belongs to goes offline for the
+     * run. REQUIRED unless `target.mode` is `newLun` (restore as a new LUN
+     * instead; the source is never touched).
+     */
+    lun: BackupLunRef.optional(),
+    /** Restore as a NEW LUN instead of onto the source (story backup2.10). */
+    target: BackupImageRestoreNewLunTarget.optional(),
+    /**
+     * pbc's `--rate` (e.g. `50MB`), emitted ONLY when asked for. GT-62: it limits
+     * TRANSFERRED bytes, not logical ones, so a sparse image finishes far faster
+     * than the archive size suggests.
+     */
+    rate: z.string().max(32).optional(),
+  })
+  .superRefine((request, ctx) => {
+    if (request.target?.mode === 'newLun') {
+      if (request.lun !== undefined) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['lun'],
+          message: 'an image restore names ONE destination: the LUN it rewrites (lun) or the new LUN it creates (target) — not both',
+        })
+      }
+      return
+    }
+    if (request.lun === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['lun'],
+        message: 'an in-place image restore needs the LUN it writes back (lun); to restore as a NEW LUN send target with mode=newLun',
+      })
+    }
+  })
 export type BackupImageRestoreRequest = z.infer<typeof BackupImageRestoreRequest>
 
 /** Ceiling on one restore's selection count — a bounded argv and one bounded stat pass. */
@@ -2086,6 +2205,23 @@ export const BackupImageRestoreResult = z.object({
   duration: z.string().optional(),
   /** Serial + attribute read-back, and anything else worth saying. */
   warnings: z.array(z.string()).optional(),
+  /**
+   * Present ONLY for a `newLun` restore (story backup2.10) — the new LUN this
+   * run created. When it is present, `targetIqn`/`lunIndex`/`targetPath` above
+   * name the NEW object, `targetDisabled`/`targetReEnabled` are both false
+   * (nothing went offline), and the source LUN was never touched. A `newLun`
+   * run that fails cleans up what it created and fails as a job — it never
+   * returns a result with `complete: false`.
+   */
+  newLun: z.object({
+    targetIqn: z.string(),
+    index: z.number().int().nonnegative(),
+    name: z.string(),
+    /** The FRESH unit serial — never the source LUN's (a copy is a new disk). */
+    serial: z.string(),
+    /** The backing this run created: the zvol device path or the image file. */
+    backingPath: AbsolutePath,
+  }).optional(),
 })
 export type BackupImageRestoreResult = z.infer<typeof BackupImageRestoreResult>
 /**

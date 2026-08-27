@@ -410,8 +410,10 @@ export interface RestoreArgvSpec {
  * ships the directory flag, because GT-26 proved a file in a SUBDIRECTORY needs
  * it too — the flag is about entering the parent, not about the file.
  *
- * SIDE-BY-SIDE emits no overwrite flags at all: the directory is new, so there
- * is nothing to overwrite and nothing to allow (GT-15).
+ * SIDE-BY-SIDE and NEW-LOCATION (backup2.10) emit no overwrite flags at all:
+ * the directory is new in both — one named by ANAS beside the live home, one
+ * named by the operator — so there is nothing to overwrite and nothing to
+ * allow (GT-15).
  */
 export function buildRestoreArgs(spec: RestoreArgvSpec): string[] {
   const args = ['restore', spec.snapshot, spec.archive, spec.target]
@@ -672,11 +674,12 @@ export interface FileRestoreDeps extends BackupReadDeps {
  * selections are not there. A non-empty `missing` list makes the job complete
  * WITH WARNINGS rather than plainly — the operator asked for those paths.
  *
- * On failure the side-by-side directory is labelled `partial` (or removed when
- * it is empty) and the error is re-thrown so the job fails truthfully. An
- * in-place failure writes nothing at all into the operator's live tree; it says
- * how far the client got and names the one forensic hint the client leaves —
- * an in-flight file that is short AND mode `0600` (GT-60).
+ * On failure the NEW directory (side-by-side or newLocation, backup2.10 — both
+ * are ANAS's to label or remove) is labelled `partial` (or removed when it is
+ * empty) and the error is re-thrown so the job fails truthfully. An in-place
+ * failure writes nothing at all into the operator's live tree; it says how far
+ * the client got and names the one forensic hint the client leaves — an
+ * in-flight file that is short AND mode `0600` (GT-60).
  */
 export async function runFileRestore(
   executor: CommandExecutor,
@@ -690,7 +693,7 @@ export async function runFileRestore(
   updateProgress(
     `restoring ${deps.archive} from ${deps.snapshot} into ${deps.target} `
     + `(${patterns.length ? `${patterns.length} selection(s)` : 'the whole archive'}, `
-    + `${merge ? 'in place - a MERGE, never a sync' : 'a new directory beside the source'})`,
+    + `${merge ? 'in place - a MERGE, never a sync' : deps.mode === 'newLocation' ? 'a new directory at the chosen path' : 'a new directory beside the source'})`,
   )
   updateProgress('pbc reports restore progress at widening intervals (about 6s, 16s, 36s, 79s) - silence is not a stall')
 
@@ -751,7 +754,7 @@ export async function runFileRestore(
     ].join('\n')
 
     let suffix = ''
-    if (deps.mode === 'sideBySide') {
+    if (deps.mode === 'sideBySide' || deps.mode === 'newLocation') {
       const hasEntries = await directoryHasEntries(executor, deps.target)
       if (hasEntries === false) {
         // Nothing landed at all — leave no litter beside the operator's data.

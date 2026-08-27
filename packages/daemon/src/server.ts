@@ -526,6 +526,9 @@ export function createServer(opts?: ServerOptions) {
     paths: backupReposPaths,
     systemdDir,
     iscsiPaths,
+    // backup2.10 — a file-backed new LUN on an AHR pool takes its boot ordering
+    // from the SAME fstab (and mock override) the iSCSI add-LUN route uses.
+    fstabPath,
   })
   // Uniform snapshot schedules (Epic 17.3/17.4) — units-as-store CRUD + status +
   // fire (take + prune). AHR targets mount @data on demand at subvolRuntimeDir.

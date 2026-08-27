@@ -2,15 +2,18 @@ import type {
   BackupImageRestoreResult,
   BackupRepo,
   BackupSnapshot,
+  CreateDatasetRequest,
   IscsiLun,
   IscsiTargetDetail,
 } from '@anas/shared'
 import type { CommandExecutor, ExecStreamTarget } from '../executor/types.js'
-import type { IscsiMutateOptions } from './iscsi-mutate.js'
+import type { IscsiMutateOptions, ResolvedBacking } from './iscsi-mutate.js'
 import { constants } from 'node:fs'
-import { stat } from 'node:fs/promises'
+import { stat, unlink } from 'node:fs/promises'
+import { buildCreateArgs } from '../routes/datasets.js'
+import { ensureAhrTargetOrdering } from './ahr-create.js'
 import { PBC } from './backup-runner.js'
-import { setIscsiTargetState, ZFS, zvolDataset } from './iscsi-mutate.js'
+import { backstorePath, createAndMapLun, createSparseImage, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, ZFS, zvolDataset } from './iscsi-mutate.js'
 
 /**
  * WHOLE-IMAGE RESTORE of an iSCSI LUN (story backup2.7).
@@ -62,6 +65,9 @@ import { setIscsiTargetState, ZFS, zvolDataset } from './iscsi-mutate.js'
 
 /** Splits a pbc stream into lines: its progress lines are CR-terminated (GT-59). */
 const LINE_SPLIT_RE = /[\r\n]+/
+
+/** targetcli's answer to a `delete` of a backstore that does not exist. */
+const NO_SUCH_OBJECT_RE = /no such object/i
 
 /** `zfs get -Hp -o value volsize <dataset>` — the zvol target's exact size. */
 export function volsizeArgs(dataset: string): string[] {
@@ -624,4 +630,304 @@ export async function runImageRestore(
   if (warnings.length)
     result.warnings = warnings
   return result
+}
+
+// ---------------------------------------------------------------------------
+// Restore as a NEW LUN (story backup2.10)
+// ---------------------------------------------------------------------------
+
+export interface NewLunRestoreDeps {
+  repo: BackupRepo
+  secret: string
+  /** The effective namespace (the request's, else the repo's own). */
+  namespace?: string
+  snapshot: string
+  archive: string
+  /** The manifest's image size — the new backing is created at EXACTLY this. */
+  imageSize: number
+  /** The destination target — ANAS-owned, the route's pre-flight proved it. */
+  target: IscsiTargetDetail
+  /** The new LUN's name — the backstore name and the SCSI model string. */
+  name: string
+  /**
+   * The resolved backing — its pool/dataset was already refused if it is not
+   * ANAS-managed. The path does NOT exist yet; this run creates it.
+   */
+  backing: ResolvedBacking
+  /**
+   * Present when a file backing lands on an AHR pool — the fstab file and the
+   * pool whose mount must win the boot race against LIO (story iscsi.8).
+   */
+  ahr?: { fstabPath: string, pool: { name: string, mountpoint: string } }
+  /** pbc `--rate`, only when the caller asked for one. */
+  rate?: string
+  /** The pbc environment builder's output (secrets are env-only, never argv). */
+  env: Record<string, string>
+  /** The mutate context the targetcli steps run in. */
+  mutate: IscsiMutateOptions
+}
+
+/**
+ * The `zfs create` argv for the new LUN's zvol backing — the SAME builder the
+ * dataset door uses (one copy of the volume-create arguments, not two):
+ * a sparse volume of exactly the image's size.
+ */
+export function newLunZvolCreateArgs(dataset: string, size: number): string[] {
+  return buildCreateArgs(dataset, {
+    path: dataset,
+    type: 'volume',
+    sparse: true,
+    volsize: size,
+  } satisfies CreateDatasetRequest)
+}
+
+/**
+ * Run one whole-image restore that lands as a NEW LUN (story backup2.10).
+ *
+ * THE SEQUENCE, and why it is this order:
+ *
+ *   1. **Create the backing at exactly the manifest size** — `zfs create -s -V`
+ *      for a zvol, a sparse image for fileio. This is the GT-42 guard in its
+ *      other direction: instead of proving the target already matches the
+ *      image, the target is MADE to match the image, so a mismatch is
+ *      impossible by construction.
+ *   2. **Backstore, attributes, map, grants** — the ONE shared
+ *      {@link createAndMapLun} step the add-LUN door uses, with a FRESH serial:
+ *      a copy is a new disk, and the source keeps its own identity (GT-14/15/16).
+ *   3. **Stream the image in** — the same `restore <snap> <archive> -` argv as
+ *      the in-place restore; the fsync is inside the executor.
+ *   4. **Read the size back** — the new object must hold exactly the image.
+ *   5. **Save the LIO configuration ONLY NOW** — when the LUN is fully
+ *      populated. A failed run must never persist a half-created LUN.
+ *
+ * The source LUN is never touched: no TPG disable, no session gate, no
+ * read-back of it. And because everything this run creates is seconds old and
+ * ANAS's, a mid-stream failure UNDOES IT — unmap, delete the backstore, destroy
+ * the backing — and says so, instead of saving a half-done state or leaving a
+ * half-filled LUN that looks healthy in the grid.
+ */
+export async function runNewLunImageRestore(
+  executor: CommandExecutor,
+  deps: NewLunRestoreDeps,
+  updateProgress: (message: string) => void,
+): Promise<BackupImageRestoreResult> {
+  const { target, backing } = deps
+  const kind: 'zvol' | 'file' = backing.plugin === 'block' ? 'zvol' : 'file'
+  const streamTarget = restoreStreamTarget(backing.path, kind)
+  const warnings: string[] = []
+
+  let bytesWritten = 0
+  let duration: string | undefined
+  let index = 0
+  let serial = ''
+  // What this run has created so far — the cleanup's work list.
+  const state = { backingCreated: false, backstoreTouched: false, mapped: false }
+
+  try {
+    // ---- 1. The backing at exactly the manifest's size ---------------------
+    if (kind === 'zvol') {
+      const dataset = backing.dataset ?? zvolDataset(backing.path)
+      updateProgress(`creating volume ${dataset} at exactly the image's size (${deps.imageSize} bytes)`)
+      const r = await executor.exec(ZFS, newLunZvolCreateArgs(dataset, deps.imageSize))
+      if (r.exitCode !== 0) {
+        throw new Error(
+          `could not create the new volume ${dataset} at the image's size: `
+          + `${r.stderr.trim() || `zfs create exited with code ${r.exitCode}`}`,
+        )
+      }
+    }
+    else {
+      updateProgress(`creating sparse image ${backing.path} at exactly the image's size (${deps.imageSize} bytes)`)
+      await createSparseImage(backing.path, deps.imageSize)
+    }
+    state.backingCreated = true
+
+    // The moment the image lands on an AHR pool, that pool's boot ordering
+    // starts to matter — the same fstab line the add-LUN door adds, for the
+    // same reason: without it LIO can create a 0-byte placeholder at the
+    // image's path (live-proof F2).
+    if (deps.ahr) {
+      const added = await ensureAhrTargetOrdering(executor, deps.ahr.fstabPath, deps.ahr.pool)
+      if (added)
+        updateProgress(`Ordered the mount of AHR pool '${deps.ahr.pool.name}' before the iSCSI restore service`)
+    }
+
+    // ---- 2. The backstore: a FRESH serial — a copy is a new disk ----------
+    serial = newSerial()
+    updateProgress(
+      `creating backstore ${deps.name} with a fresh unit serial `
+      + '(a copy is a NEW disk — the source LUN keeps its own)',
+    )
+    const mapped = await createAndMapLun(
+      deps.mutate,
+      target,
+      deps.name,
+      backing,
+      kind === 'file' ? deps.imageSize : null,
+      serial,
+    )
+    index = mapped.index
+    state.backstoreTouched = true
+    state.mapped = true
+
+    // ---- 3. The image -------------------------------------------------------
+    const args = imageRestoreArgs(deps.snapshot, deps.archive, deps.namespace, deps.rate)
+    updateProgress(
+      `restoring ${deps.archive} from ${deps.snapshot} into the new backing ${backing.path} `
+      + `(${deps.imageSize} bytes, streamed to stdout - the client refuses to write an existing target)`,
+    )
+    let lastPercent = -1
+    const r = await executor.execToStream(PBC, args, streamTarget, {
+      env: deps.env,
+      onStderr: (chunk) => {
+        // GT-59: forward every progress line verbatim, as the in-place run does.
+        const p = parseRestoreProgress(chunk)
+        if (p.percent !== null && p.percent !== lastPercent) {
+          lastPercent = p.percent
+          updateProgress(`restore ${p.lastLine ?? `progress ${p.percent}%`}`)
+        }
+      },
+    })
+    const progress = parseRestoreProgress(r.stderr)
+    const written = imageBytesWritten(r.bytesWritten, progress, deps.imageSize, r.exitCode)
+    bytesWritten = written.bytes
+    if (progress.complete)
+      duration = progress.complete
+
+    if (r.exitCode !== 0) {
+      const detail = explainRestoreFailure(r.stderr)
+      if (bytesWritten > 0) {
+        throw new Error(
+          `the image was partially written (${written.estimated ? 'at least ' : ''}${bytesWritten} `
+          + `of ${deps.imageSize} bytes reached the new backing ${backing.path}). ${detail}`,
+        )
+      }
+      throw new Error(`${detail} Nothing was written to the new backing ${backing.path}.`)
+    }
+
+    // ---- 4. Read-back: the new object must hold exactly the image ----------
+    updateProgress('verifying the new backing holds exactly the image')
+    const size = await readTargetSize(executor, { kind, backingPath: backing.path, dataset: backing.dataset })
+    if ('error' in size)
+      warnings.push(`could not re-read the size of ${backing.path}: ${size.error}`)
+    else if (size.size !== deps.imageSize)
+      warnings.push(`${backing.path} is ${size.size} bytes after the restore, not the image's ${deps.imageSize}`)
+
+    // ---- 5. Only NOW is the LUN persisted -----------------------------------
+    updateProgress('Saving the LIO configuration')
+    try {
+      await saveIscsiConfig(executor)
+    }
+    catch (err) {
+      throw new Error(
+        `the image was written in full and LUN ${index} ('${deps.name}') is live on ${target.iqn}, `
+        + `but persisting the LIO configuration failed `
+        + `(${err instanceof Error ? err.message : String(err)}) — the LUN will be gone after a `
+        + 'reboot until the configuration is saved from the iSCSI screen.',
+      )
+    }
+  }
+  catch (err) {
+    const base = err instanceof Error ? err.message : String(err)
+    const cleanup = await removeNewLun(executor, deps, index, state)
+    if (cleanup)
+      throw new Error(`${base} ${cleanup}`)
+    throw err
+  }
+
+  const result: BackupImageRestoreResult = {
+    snapshot: deps.snapshot,
+    archive: deps.archive,
+    targetIqn: target.iqn,
+    lunIndex: index,
+    targetPath: backing.path,
+    imageSize: deps.imageSize,
+    bytesWritten,
+    complete: true,
+    targetDisabled: false,
+    targetReEnabled: false,
+    newLun: { targetIqn: target.iqn, index, name: deps.name, serial, backingPath: backing.path },
+  }
+  if (duration)
+    result.duration = duration
+  if (warnings.length)
+    result.warnings = warnings
+  return result
+}
+
+/**
+ * Remove what a failed new-LUN restore created, in the REVERSE of the order it
+ * created them, WITHOUT saving the configuration: a half-created LUN must not
+ * survive as if it were healthy, and a save would persist exactly that.
+ *
+ * Each step is best-effort — the point is to leave NOTHING behind, and a step
+ * that cannot be undone says so in the result rather than hiding it. Returns
+ * the sentence the failed job carries, or '' when nothing was created yet.
+ */
+async function removeNewLun(
+  executor: CommandExecutor,
+  deps: NewLunRestoreDeps,
+  index: number,
+  state: { backingCreated: boolean, backstoreTouched: boolean, mapped: boolean },
+): Promise<string> {
+  if (!state.backingCreated && !state.backstoreTouched)
+    return ''
+
+  const { target, backing } = deps
+  const removed: string[] = []
+  const left: string[] = []
+
+  if (state.mapped) {
+    try {
+      await runTargetcli(executor, [`${tpgPath(target.iqn, target.tpgTag)}/luns`, 'delete', `lun${index}`])
+      removed.push(`LUN ${index}`)
+    }
+    catch (err) {
+      left.push(`LUN ${index} on ${target.iqn} could not be unmapped (${err instanceof Error ? err.message : String(err)})`)
+    }
+  }
+
+  if (state.backstoreTouched) {
+    try {
+      await runTargetcli(executor, [backstorePath(backing.plugin, deps.name), 'delete'])
+      removed.push(`backstore '${deps.name}'`)
+    }
+    catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      // createAndMapLun may have died before the backstore existed — a delete
+      // that finds nothing has left nothing behind.
+      if (!NO_SUCH_OBJECT_RE.test(msg))
+        left.push(`backstore '${deps.name}' could not be deleted (${msg})`)
+    }
+  }
+
+  if (state.backingCreated) {
+    try {
+      if (backing.plugin === 'block') {
+        const dataset = backing.dataset ?? zvolDataset(backing.path)
+        const r = await executor.exec(ZFS, ['destroy', dataset])
+        if (r.exitCode !== 0) {
+          throw new Error(r.stderr.trim() || `zfs destroy ${dataset} exited with code ${r.exitCode}`)
+        }
+        removed.push(`volume ${dataset}`)
+      }
+      else {
+        await unlink(backing.path)
+        removed.push(`image ${backing.path}`)
+      }
+    }
+    catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      const what = backing.plugin === 'block'
+        ? `volume ${backing.dataset ?? zvolDataset(backing.path)}`
+        : `image ${backing.path}`
+      left.push(`${what} could not be destroyed (${msg})`)
+    }
+  }
+
+  const tail = left.length
+    ? ` But this was left behind and needs your hand: ${left.join('; ')}`
+    : ''
+  return `The LUN and its backing were created for this restore seconds ago and are ANAS's to clean up: `
+    + `${removed.length ? `ANAS has removed ${removed.join(', ')}, so nothing of the failed restore remains` : 'nothing of it remains'}${tail}.`
 }
