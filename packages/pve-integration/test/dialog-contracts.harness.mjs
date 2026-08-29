@@ -772,6 +772,51 @@ const BLOCK_TASK = {
 }
 
 /**
+ * A block task whose `lun` record points at a LIVE LUN on the iscsi screen
+ * (`iqn.2026-08.nas.anas:vmstore` LUN 0) — the "This LUN" resolution keys on the
+ * real identity, not the backup-side LUN_SOURCES iqn, so the restore door gets
+ * the in-place destination. Driven directly with a prefill (not the grid).
+ */
+const LIVE_BLOCK_TASK = {
+  name: 'live-lun',
+  repository: 'pbs-main',
+  backupId: lunBackupId(LUN_SOURCES[0].serial),
+  kind: 'block',
+  archives: [{
+    name: BLOCK_ARCHIVE_NAME,
+    path: '/dev/zvol/tank/vol1',
+    excludes: [],
+    kind: 'img',
+    lun: { targetIqn: 'iqn.2026-08.nas.anas:vmstore', index: 0 },
+  }],
+  changeDetectionMode: 'default',
+  schedule: 'daily',
+  enabled: true,
+}
+
+/**
+ * backup2.9 — a block task whose `lun` record maps to a LUN this node does NOT
+ * serve (the LUN is gone, or was never here). The unified dialog then offers
+ * ONLY "A new LUN…" — "This LUN" exists only when the source maps to a live LUN.
+ */
+const STRAY_LUN_TASK = {
+  name: 'stray-lun',
+  repository: 'pbs-main',
+  backupId: 'stray',
+  kind: 'block',
+  archives: [{
+    name: BLOCK_ARCHIVE_NAME,
+    path: '/dev/zvol/tank/volX',
+    excludes: [],
+    kind: 'img',
+    lun: { targetIqn: LUN_SOURCES[0].targetIqn, index: 9 },
+  }],
+  changeDetectionMode: 'default',
+  schedule: 'daily',
+  enabled: true,
+}
+
+/**
  * backup2.9 — the operator's first LUN backup (2026-08-26): one img archive
  * with its record, NO stored kind, a hand-chosen id. It derives as a block
  * task, but an untouched edit must send NO `kind` key and keep the stored id
@@ -2883,6 +2928,13 @@ const RESTORE_REPOS = {
 const RESTORE_SNAP = 'host/gtimgboth/2026-08-25T19:28:38Z'
 const RESTORE_SNAP_OLD = 'host/gtimgboth/2026-08-24T19:28:38Z'
 
+// backup2.9 — a block task's backup-id derives from the LUN's unit serial, so
+// its PBS group IS this LUN's durable identity. The LUN door resolves THIS
+// group when it exists, else falls back to the repository's `.img` groups.
+const LUN_SERIAL = LUN_SOURCES[0].serial
+const LUN_GROUP = `host/lun-${LUN_SERIAL}`
+const LUN_SNAP = `${LUN_GROUP}/2026-08-25T19:28:38Z`
+
 /**
  * backup2.5's groups endpoint answers in TWO shapes from one path, so the
  * fixture is a function of the query — which is also how the two-call contract
@@ -2902,6 +2954,18 @@ const RESTORE_GROUP_LIST = {
     repository: 'pbs-main',
     namespace: 'anas',
     groups: [
+      {
+        group: LUN_GROUP,
+        backupType: 'host',
+        backupId: `lun-${LUN_SERIAL}`,
+        backupCount: 2,
+        lastBackup: 1787686118,
+        lastBackupIso: '2026-08-25T19:28:38Z',
+        files: [
+          { filename: 'disk.img.fidx', archive: 'disk.img', kind: 'img', size: 2 * GiB_ },
+          { filename: 'index.json.blob', kind: 'other', size: 368 },
+        ],
+      },
       {
         group: 'host/gtimgboth',
         backupType: 'host',
@@ -2967,18 +3031,61 @@ const RESTORE_GROUP_SNAPSHOTS = {
   },
 }
 
+/**
+ * The LUN's own group's points in time — the size gate's playground: one image
+ * EXACTLY this LUN's 2 GiB (`disk.img`, the block task's fixed archive name)
+ * and one mismatched 1 GiB.
+ */
+const LUN_GROUP_SNAPSHOTS = {
+  data: {
+    verdict: 'ok',
+    repository: 'pbs-main',
+    namespace: 'anas',
+    group: LUN_GROUP,
+    groups: [],
+    snapshots: [
+      {
+        snapshot: LUN_SNAP,
+        backupType: 'host',
+        backupId: `lun-${LUN_SERIAL}`,
+        backupTime: 1787686118,
+        backupTimeIso: '2026-08-25T19:28:38Z',
+        files: [
+          { filename: 'disk.img.fidx', archive: 'disk.img', kind: 'img', size: 2 * GiB_ },
+          { filename: 'small.img.fidx', archive: 'small.img', kind: 'img', size: GiB_ },
+          { filename: 'index.json.blob', kind: 'other', size: 368 },
+        ],
+      },
+    ],
+  },
+}
+
 const RESTORE_ROUTES = {
   ...ISCSI_ROUTES,
   'GET /backup/repos': RESTORE_REPOS,
-  'GET /backup/repos/pbs-main/groups': path => (
-    /[?&]group=/.test(path) ? RESTORE_GROUP_SNAPSHOTS : RESTORE_GROUP_LIST
-  ),
+  'GET /backup/repos/pbs-main/groups': path => {
+    // The group travels URL-encoded (`host%2Flun-<serial>`), so match the
+    // serial, not the slash.
+    if (`/lun-${LUN_SERIAL}` && /[?&]group=/.test(path) && decodeURIComponent(path).includes(LUN_GROUP)) {
+      return LUN_GROUP_SNAPSHOTS
+    }
+    return /[?&]group=/.test(path) ? RESTORE_GROUP_SNAPSHOTS : RESTORE_GROUP_LIST
+  },
 }
 
-/** Open the LUNs window, select LUN 0 (the 2 GiB zvol), open Restore. */
+/**
+ * Open the LUNs window, select LUN 0 (the 2 GiB zvol), and open Restore — which
+ * is now the UNIFIED restore dialog (68-backup.js's), reached through the LUN
+ * toolbar door's `{lun}` prefill. Both sources load into one sandbox exactly as
+ * the real page loads them.
+ */
 async function openRestoreDialog(routes = RESTORE_ROUTES) {
   ajax.responses = { '/network': PVE_NETWORK }
-  const { ANAS, view, grid } = await openIscsiView(routes)
+  const ANAS = loadSources(['12-picker.js', '68-backup.js', '75-iscsi.js'], routes)
+  const view = makeComponent(ANAS.views.iscsi.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#iscsiGrid')
   const lunsWin = await openLuns(grid, routes)
   const lunsGrid = lunsWin.down('#lunsGrid')
   lunsGrid.selectRow(0)
@@ -3064,75 +3171,95 @@ async function iscsiRestoreSessionAndUnresolvedChecks() {
 }
 
 async function iscsiRestoreDialogChecks() {
+  // The LUN door now opens the UNIFIED restore dialog (backup2.6/2.7/2.10): the
+  // source collapses to one read-only summary line, and the dialog starts AT
+  // the point in time — the LUN selection already said everything else.
   const { dlg } = await openRestoreDialog()
-  ok('restore dialog: it opened', !!dlg && !!dlg.down('#repo'))
+  ok('restore dialog: it opened as the unified restore dialog',
+    dlg && dlg.cls === 'anas-win-backup-restore')
   if (!dlg) { return }
 
-  // Both repository tiers are offered, and a PVE-discovered one is labelled.
-  const repos = dlg.down('#repo').getStore().getRange().map(r => r.get('value'))
+  // --- the LUN door's summary line, and what it collapses -------------------
+  const summary = dlg.down('#restoreSourceSummary')
+  ok('restore: the LUN door shows the read-only summary line',
+    summary && (summary.html || '').includes('From LUN'), summary && summary.html)
+  ok('restore: it names the LUN itself', /vmdisk1/.test(summary.html || ''), summary && summary.html)
+  ok('restore: it names the LUN\'s group (host/lun-<serial>)',
+    new RegExp(LUN_GROUP).test(summary.html || ''), summary && summary.html)
+  ok('restore: it names the repository the group was found in',
+    /pbs-main/.test(summary.html || ''), summary && summary.html)
+
+  // The same fields live behind the summary, but collapsed (hidden AND
+  // disabled — a stale source value can never be read back before it is
+  // chosen), and the point-in-time is the first interactive field.
+  eq('restore: the repository field is collapsed on the LUN door',
+    dlg.down('#restoreRepo').disabled, true)
+  eq('restore: the namespace field is collapsed too', dlg.down('#restoreNs').disabled, true)
+  eq('restore: the group field is collapsed too', dlg.down('#restoreGroup').disabled, true)
+  ok('restore: point-in-time is the first interactive field',
+    dlg.down('#restoreSnapshot').disabled === false && dlg.down('#restoreSnapPick').disabled === false)
+  ok('restore: a "change source…" link expands the fields',
+    !!dlg.down('#restoreChangeSource'))
+  created.windows.length = 0
+  dlg.down('#restoreChangeSource').handler(dlg.down('#restoreChangeSource'))
+  await settle()
+  eq('restore: change source expands the source part',
+    dlg.down('#restoreRepo').disabled, false)
+  ok('restore: the summary line hides once expanded',
+    dlg.down('#restoreSourceSummary').hidden === true)
+
+  // Both repository tiers are still offered (the collapsed repo combo holds
+  // exactly what the task-less door offers).
+  const repos = dlg.down('#restoreRepo').getStore().getRange().map(r => r.get('name'))
   eq('restore: both repository tiers are offered', repos, ['pbs-main', 'pve:anastest'])
   ok('restore: a PVE-discovered repository says so',
-    /from Proxmox storage/.test(dlg.down('#repo').getStore().getAt(1).get('label')))
+    /PVE/.test(dlg.down('#restoreRepo').getStore().getAt(1).get('label'))
+    || /from Proxmox/.test(dlg.down('#restoreRepo').getStore().getAt(1).get('label')),
+    dlg.down('#restoreRepo').getStore().getAt(1).get('label'))
   eq('restore: a repository that carries a namespace pre-fills it',
-    dlg.down('#ns').getValue(), 'anas')
+    dlg.down('#restoreNs').getValue(), 'anas')
 
-  // Nothing is chosen yet, so nothing can be restored.
-  ok('restore: the Restore button starts DEAD',
-    dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit').disabled === true)
+  // --- the group resolved, then point in time, then the single `disk` archive
+  const groups = dlg.down('#restoreGroup').getStore().getRange().map(r => r.get('group'))
+  ok('restore: the LUN\'s own group was pre-selected (lun-<serial> exists)',
+    groups.includes(LUN_GROUP) && dlg.down('#restoreGroup').getValue() === LUN_GROUP, JSON.stringify(groups))
 
-  // --- CALL 1: the namespace's groups --------------------------------------
-  apiGets.length = 0
-  const load = dlg.down('#loadGroups')
-  load.handler(load)
+  const snapBtn = dlg.down('#restoreSnapPick')
+  snapBtn.handler(snapBtn)
   await settle()
-
-  const groupCall = apiGets.find(u => u.includes('/groups'))
-  ok('restore: the group listing carries the namespace and NO group',
-    /[?&]ns=anas/.test(groupCall) && !/[?&]group=/.test(groupCall), groupCall)
-
-  // A pxar-only group is NEVER offered: a tree cannot restore a block device,
-  // and the filter reads backup2.5's classified `kind`, not the filename.
-  const groups = dlg.down('#group').getStore().getRange().map(r => r.get('value'))
-  eq('restore: only groups holding an .img archive are offered', groups, ['host/gtimgboth'])
-
-  // --- CALL 2: that group's points in time ---------------------------------
-  apiGets.length = 0
-  dlg.down('#group').setValue('host/gtimgboth')
+  const snapWin = openWindow()
+  ok('restore: point-in-time opened the SHARED snapshot picker',
+    snapWin && snapWin.cls === 'anas-win-snapshot-picker')
+  ok('restore: it lists the LUN\'s own group, never an empty picker',
+    snapWin && snapWin.down('#snapGrid').getStore().getCount() >= 1)
+  snapWin.down('#snapGrid').selectRow(0)
+  const snapSelect = snapWin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelect.handler(snapSelect)
   await settle()
-
-  const snapCall = apiGets.find(u => u.includes('group='))
-  ok('restore: choosing a group asks the SAME endpoint for its points in time',
-    /\/backup\/repos\/pbs-main\/groups\?group=host%2Fgtimgboth/.test(snapCall), snapCall)
-  ok('restore: and carries the namespace with it', /[?&]ns=anas/.test(snapCall), snapCall)
-
-  const snaps = dlg.down('#snapshot').getStore().getRange().map(r => r.get('value'))
   eq('restore: every point in time is a FULL <type>/<id>/<RFC3339> id',
-    snaps, [RESTORE_SNAP, RESTORE_SNAP_OLD])
-  for (const s of snaps) {
-    ok('restore: never a bare group path (which silently restores the latest)',
-      /^[a-z]+\/[^/]+\/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(s), s)
-  }
+    dlg.down('#restoreSnapshot').getValue(), LUN_SNAP)
 
-  dlg.down('#snapshot').setValue(RESTORE_SNAP)
+  // Two images in the LUN group's snapshot → the archive is a real choice; the
+  // image half appears once an image archive is picked.
+  eq('restore: the archive combo carries the group\'s image archives',
+    dlg.down('#restoreArchive').getStore().getRange().map(r => r.get('archive')),
+    ['disk.img', 'small.img'])
+  ok('restore: the what/where part stays hidden until the archive is picked',
+    dlg.down('#restoreFilesWrap').hidden === true && dlg.down('#restoreImageWrap').hidden === true,
+    `${dlg.down('#restoreFilesWrap').hidden}/${dlg.down('#restoreImageWrap').hidden}`)
+  dlg.down('#restoreArchive').setValue('disk.img')
   await settle()
-  const archives = dlg.down('#archive').getStore().getRange().map(r => r.get('value'))
-  eq('restore: the archive list is the .img files, named as pbc takes them',
-    archives, ['vol.img', 'small.img'])
-
-  // The KIND decides, never the filename: a pxar called `weird.img.pxar` is a
-  // tree and must not be offered to a block restore.
-  dlg.down('#snapshot').setValue(RESTORE_SNAP_OLD)
-  await settle()
-  eq('restore: a pxar whose NAME ends in .img is never offered as an image',
-    dlg.down('#archive').getStore().getRange().map(r => r.get('value')), ['vol.img'])
+  ok('restore: choosing the image archive reveals the image half',
+    dlg.down('#restoreImageWrap').hidden === false, `${dlg.down('#restoreImageWrap').hidden}`)
+  ok('restore: the files half stays hidden for a whole-image restore',
+    dlg.down('#restoreFilesWrap').hidden === true)
 
   ok('restore dialog: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 async function iscsiRestoreVerdictChecks() {
   // backup2.5's reads answer 200 with a VERDICT: a PBS-side problem is a
-  // DIAGNOSIS the screen shows verbatim, never a bare failure and never an
-  // empty combo that explains nothing.
+  // DIAGNOSIS the screen shows verbatim, never a bare failure.
   const routes = {
     ...RESTORE_ROUTES,
     'GET /backup/repos/pbs-main/groups': {
@@ -3146,32 +3273,33 @@ async function iscsiRestoreVerdictChecks() {
   }
   const { dlg } = await openRestoreDialog(routes)
   if (!dlg) { return }
-  const load = dlg.down('#loadGroups')
-  load.handler(load)
-  await settle()
   ok('verdict: the PBS-side detail is shown verbatim',
-    warnings.some(w => /connection was refused/.test(w)), warnings.join(' | '))
-  eq('verdict: and no group is offered', dlg.down('#group').getStore().getCount(), 0)
-  ok('verdict: Restore stays DEAD',
-    dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit').disabled === true)
-  warnings.length = 0
+    (dlg.down('#restoreArchiveNote').html || '').includes('connection was refused'),
+    dlg.down('#restoreArchiveNote').html)
+  eq('verdict: and no group is offered', dlg.down('#restoreGroup').getStore().getCount(), 0)
 }
 
 async function iscsiRestoreSizeGateChecks() {
-  const { dlg, lunsWin } = await openRestoreDialog()
+  const { dlg } = await openRestoreDialog()
   if (!dlg) { return }
-  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit')
+  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-restore-submit')
 
-  const load = dlg.down('#loadGroups')
-  load.handler(load)
+  // Point in time -> the picker -> the LUN's own group's snapshot.
+  const snapBtn = dlg.down('#restoreSnapPick')
+  snapBtn.handler(snapBtn)
   await settle()
-  dlg.down('#group').setValue('host/gtimgboth')
+  const snapWin = openWindow()
+  snapWin.down('#snapGrid').selectRow(0)
+  const snapSelect = snapWin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelect.handler(snapSelect)
   await settle()
-  dlg.down('#snapshot').setValue(RESTORE_SNAP)
-  await settle()
+
+  // Two images in the LUN group's snapshot: a 2 GiB match and a 1 GiB mismatch.
+  const archives = dlg.down('#restoreArchive').getStore().getRange().map(r => r.get('archive'))
+  eq('size gate: the archive combo carries both images (no auto-preference)', archives, ['disk.img', 'small.img'])
 
   // --- MISMATCH: a 1 GiB image onto the 2 GiB LUN --------------------------
-  dlg.down('#archive').setValue('small.img')
+  dlg.down('#restoreArchive').setValue('small.img')
   await settle()
   ok('size gate: a mismatch DISABLES Restore', submit.disabled === true)
   ok('size gate: and says which way it is wrong',
@@ -3193,7 +3321,7 @@ async function iscsiRestoreSizeGateChecks() {
   warnings.length = 0
 
   // --- MATCH: the 2 GiB image ---------------------------------------------
-  dlg.down('#archive').setValue('vol.img')
+  dlg.down('#restoreArchive').setValue('disk.img')
   await settle()
   ok('size gate: an exact match ENABLES Restore', submit.disabled === false)
   ok('size gate: and says so',
@@ -3209,8 +3337,8 @@ async function iscsiRestoreSizeGateChecks() {
     jobs[0].body, {
       kind: 'image',
       repo: 'pbs-main',
-      snapshot: RESTORE_SNAP,
-      archive: 'vol.img',
+      snapshot: LUN_SNAP,
+      archive: 'disk.img',
       lun: { targetIqn: ISCSI_IQN, index: 0 },
       ns: 'anas',
     })
@@ -3220,11 +3348,10 @@ async function iscsiRestoreSizeGateChecks() {
     jobs.length && !('target' in jobs[0].body), JSON.stringify(jobs[0].body))
   ok('restore: it goes through the danger idiom (409 + confirm code)',
     jobs[0].confirmWindow === true)
-  ok('restore: the LUNs window is still there to refresh', !!lunsWin)
 
   // A blank namespace sends NO key at all — the repository's own then stands.
   jobs.length = 0
-  dlg.down('#ns').setValue('')
+  dlg.down('#restoreNs').setValue('')
   submit.handler(submit)
   await settle()
   ok('restore: a blank namespace sends no ns key', !('ns' in jobs[0].body), JSON.stringify(jobs[0].body))
@@ -3233,49 +3360,36 @@ async function iscsiRestoreSizeGateChecks() {
 }
 
 // ============================================================================
-//  7b. backup2.10 — restore the image AS A NEW LUN
+//  7b. backup2.10 — restore the image AS A NEW LUN, through the same dialog
 // ============================================================================
-//
-// The second door on the same dialog: instead of writing the image over the
-// source LUN, create a fresh backing at the image's OWN size on a target of the
-// operator's choosing, map it with a NEW serial, stream the image in — the
-// source LUN never goes offline. What this guards:
-//   · the in-place bodies above still carry NO `target` key (byte-identical);
-//   · the new-LUN form reuses the add-LUN door's kinds — a POOL for the zvol
-//     (the volume is created at the image's size, named after the LUN), a
-//     dataset OR an AHR pool for the image — and its `backing` is written
-//     exactly in the shared schema's discriminated shape;
-//   · the equality gate is a KNOWN-size gate for a new LUN: a 1 GiB image on a
-//     2 GiB LUN is fine, because the backing is created at the image's size;
-//   · name / target / backing validation blocks Save with the reason;
-//   · a daemon refusal surfaces VERBATIM in the dialog's own verdict line, and
-//     the finished identity lands in the result panel.
 
 async function iscsiRestoreNewLunChecks() {
   const { dlg } = await openRestoreDialog()
   if (!dlg) { return }
-  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit')
+  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-restore-submit')
+
+  // Point in time -> picker -> the LUN's group, then the matching image archive
+  // (two archives: a choice, not an auto-pick — the block task would have one).
+  const snapBtn = dlg.down('#restoreSnapPick')
+  snapBtn.handler(snapBtn)
+  await settle()
+  const snapWin = openWindow()
+  snapWin.down('#snapGrid').selectRow(0)
+  const snapSelect = snapWin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelect.handler(snapSelect)
+  await settle()
+  dlg.down('#restoreArchive').setValue('disk.img')
+  await settle()
 
   // --- the destination radios, and what each carries ----------------------
-  eq('restore(newLun): the dialog opens on "This LUN (in place)"',
+  eq('restore(newLun): the dialog defaults to "This LUN (in place)"',
     dlg.down('#restoreDest').getValue(), { restoreDest: 'inPlace' })
   ok('restore(newLun): the new-LUN form is hidden until its radio is chosen',
     dlg.down('#newLunFields').hidden === true)
   ok('restore(newLun): a hidden form is disabled too — a stale value cannot be read back',
     dlg.down('#newLunFields').disabled === true)
-  ok('restore(newLun): the in-place restore-target line is visible by default',
-    dlg.down('#restoreTargetPath').hidden === false)
 
-  // --- the reads: the same two-call shape both doors use ------------------
-  dlg.down('#loadGroups').handler(dlg.down('#loadGroups'))
-  await settle()
-  dlg.down('#group').setValue('host/gtimgboth')
-  await settle()
-  dlg.down('#snapshot').setValue(RESTORE_SNAP)
-  await settle()
-  dlg.down('#archive').setValue('vol.img')
-  await settle()
-
+  // --- the new-LUN door -----------------------------------------------------
   dlg.down('#restoreDest').setValue('newLun')
   await settle()
   ok('restore(newLun): choosing the radio reveals the new-LUN form',
@@ -3355,8 +3469,8 @@ async function iscsiRestoreNewLunChecks() {
     jobs.length && jobs[0].body, {
       kind: 'image',
       repo: 'pbs-main',
-      snapshot: RESTORE_SNAP,
-      archive: 'vol.img',
+      snapshot: LUN_SNAP,
+      archive: 'disk.img',
       target: {
         mode: 'newLun',
         targetIqn: ISCSI_IQN,
@@ -3399,7 +3513,7 @@ async function iscsiRestoreNewLunChecks() {
   // --- a new LUN needs NO size equality — only a KNOWN size ----------------
   // The 1 GiB image is a MISMATCH for the 2 GiB LUN in place (the size gate
   // above). As a new LUN the backing is CREATED at 1 GiB, so it is legal.
-  dlg.down('#archive').setValue('small.img')
+  dlg.down('#restoreArchive').setValue('small.img')
   await settle()
   ok('restore(newLun): the verdict speaks of the image size, never "SMALLER"',
     /at exactly the image/.test(dlg.down('#newLunVerdict').html), dlg.down('#newLunVerdict').html)
@@ -3410,7 +3524,7 @@ async function iscsiRestoreNewLunChecks() {
     jobs.length && jobs[0].body, {
       kind: 'image',
       repo: 'pbs-main',
-      snapshot: RESTORE_SNAP,
+      snapshot: LUN_SNAP,
       archive: 'small.img',
       target: {
         mode: 'newLun',
@@ -3422,7 +3536,7 @@ async function iscsiRestoreNewLunChecks() {
     })
 
   // A blank namespace still sends no ns key in the newLun body.
-  dlg.down('#ns').setValue('')
+  dlg.down('#restoreNs').setValue('')
   await settle()
   jobs.length = 0
   submit.handler(submit)
@@ -3436,25 +3550,21 @@ async function iscsiRestoreNewLunChecks() {
 // ============================================================================
 //  7c. backup2.10 — a daemon refusal surfaces VERBATIM, and the result panel
 // ============================================================================
-//
-// The dialog's local checks catch what they can see; the daemon owns the rest
-// (a name taken on ANOTHER target, a backing that resolves to nobody's storage,
-// an unknown image size, …). Its refusal must appear on the SAME verdict line,
-// in its own words — and the finished newLun restore lands the new LUN's
-// identity (index, name, serial, backing path) in the result panel.
 
 async function iscsiRestoreRefusalAndResultChecks() {
   const { ANAS, dlg } = await openRestoreDialog()
   if (!dlg) { return }
-  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-lun-restore-submit')
+  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-restore-submit')
 
-  dlg.down('#loadGroups').handler(dlg.down('#loadGroups'))
+  const snapBtn = dlg.down('#restoreSnapPick')
+  snapBtn.handler(snapBtn)
   await settle()
-  dlg.down('#group').setValue('host/gtimgboth')
+  const snapWin = openWindow()
+  snapWin.down('#snapGrid').selectRow(0)
+  const snapSelect = snapWin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelect.handler(snapSelect)
   await settle()
-  dlg.down('#snapshot').setValue(RESTORE_SNAP)
-  await settle()
-  dlg.down('#archive').setValue('vol.img')
+  dlg.down('#restoreArchive').setValue('disk.img')
   await settle()
   dlg.down('#restoreDest').setValue('newLun')
   await settle()
@@ -3512,8 +3622,6 @@ async function iscsiRestoreRefusalAndResultChecks() {
 
   ok('restore(result): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
-
-// ============================================================================
 //  5b. The LUN toolbar is backup-aware — "Backed up by" + "Back up…"
 //
 //  The LUN row offered a restore with no door to the backup. Now the LUNs
@@ -5060,33 +5168,112 @@ const FILE_RESTORE_ROUTES = {
       }],
     },
   },
+  // A block task's group holds exactly ONE restorable archive (`disk.img`) so
+  // the unified dialog auto-selects it — the whole-image half then appears.
+  'GET /backup/tasks/lun-disk/snapshots': {
+    data: {
+      verdict: 'ok',
+      repository: 'pbs-main',
+      namespace: 'anas',
+      group: LUN_GROUP,
+      snapshots: [{
+        snapshot: `${LUN_GROUP}/2026-08-25T19:16:45Z`,
+        backupType: 'host',
+        backupId: `lun-${LUN_SERIAL}`,
+        backupTime: 1787685405,
+        backupTimeIso: '2026-08-25T19:16:45Z',
+        files: [{ filename: 'disk.img.fidx', archive: 'disk.img', kind: 'img', size: 2 * GiB_ }],
+      }],
+    },
+  },
+  // The block task whose `lun` record maps to a LIVE LUN (LUN 0 of this IQN).
+  'GET /backup/tasks/live-lun/snapshots': {
+    data: {
+      verdict: 'ok',
+      repository: 'pbs-main',
+      namespace: 'anas',
+      group: LUN_GROUP,
+      snapshots: [{
+        snapshot: `${LUN_GROUP}/2026-08-25T19:16:45Z`,
+        backupType: 'host',
+        backupId: `lun-${LUN_SERIAL}`,
+        backupTime: 1787685405,
+        backupTimeIso: '2026-08-25T19:16:45Z',
+        files: [{ filename: 'disk.img.fidx', archive: 'disk.img', kind: 'img', size: 2 * GiB_ }],
+      }],
+    },
+  },
+  // The stray block task (its `lun` record maps to no LUN on this node).
+  'GET /backup/tasks/stray-lun/snapshots': {
+    data: {
+      verdict: 'ok',
+      repository: 'pbs-main',
+      group: 'host/stray',
+      snapshots: [{
+        snapshot: 'host/stray/2026-08-25T19:16:45Z',
+        backupType: 'host',
+        backupId: 'stray',
+        backupTime: 1787685405,
+        backupTimeIso: '2026-08-25T19:16:45Z',
+        files: [{ filename: 'disk.img.fidx', archive: 'disk.img', kind: 'img', size: 2 * GiB_ }],
+      }],
+    },
+  },
   'POST /backup/restore': { job: { id: 'restore-1' } },
 }
 
-/** Open the restore dialog through the TOOLBAR door and return it. */
+/** Open the restore dialog through the ONE dialog's task door and return it. */
 function openFileRestoreDialog(ANAS, opts) {
   created.windows.length = 0
-  ANAS.backupRestore.open('harness', opts || {})
+  const o = opts || {}
+  ANAS.backup.openRestoreDialog('harness', 'harness', {
+    task: o.task,
+    repo: o.repo,
+    ns: o.ns,
+    homeByArchive: o.homeByArchive,
+  })
   return openWindow()
+}
+
+/** Pick the point in time through the dialog's shared picker. */
+async function pickFileSnapshot(dlg) {
+  const snapBtn = dlg.down('#restoreSnapPick')
+  snapBtn.handler(snapBtn)
+  await settle()
+  const snapWin = openWindow()
+  if (!snapWin || snapWin.destroyed) { return null }
+  snapWin.down('#snapGrid').selectRow(0)
+  const snapSelect = snapWin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelect.handler(snapSelect)
+  await settle()
+  return snapWin
 }
 
 /**
  * The picker sandbox plus the restore-only routes (the task detail, the
- * snapshot listings, the restore door itself).
+ * snapshot listings, the restore door itself) AND the iSCSI reads the image
+ * half needs (the LUN inventory, the new-LUN target + backing pickers).
  */
 function loadRestoreSources() {
-  const ANAS = loadPickerSources(['12-picker.js', '68-backup.js'])
-  ANAS.api.post = (_node, path, body) => {
-    const key = `POST ${path}`
-    if (!(key in FILE_RESTORE_ROUTES)) { return Promise.reject(new Error(`unexpected ${key}`)) }
-    const route = FILE_RESTORE_ROUTES[key]
-    return Promise.resolve(typeof route === 'function' ? route(body) : route)
-  }
+  const ANAS = loadPickerSources(['12-picker.js', '68-backup.js', '75-iscsi.js'])
+  const ROUTES = { ...FILE_RESTORE_ROUTES, ...ISCSI_ROUTES }
   const baseGet = ANAS.api.get
   ANAS.api.get = (node, path) => {
-    const key = `GET ${path.split('?')[0]}`
-    if (key in FILE_RESTORE_ROUTES && FILE_RESTORE_ROUTES[key]) { return Promise.resolve(FILE_RESTORE_ROUTES[key]) }
-    return baseGet(node, path)
+    const [base, query] = path.split('?')
+    if (base === '/fs/browse') {
+      const params = new URLSearchParams(query || '')
+      return Promise.resolve(liveRoute(params.get('path') || '/', params.get('files') === '1'))
+    }
+    const key = `GET ${base}`
+    if (!(key in ROUTES)) { return Promise.reject(new Error(`unexpected GET ${key}`)) }
+    const value = ROUTES[key]
+    return Promise.resolve(typeof value === 'function' ? value(path) : value)
+  }
+  ANAS.api.post = (_node, path, body) => {
+    const key = `POST ${path}`
+    if (!(key in ROUTES)) { return Promise.reject(new Error(`unexpected ${key}`)) }
+    const route = ROUTES[key]
+    return Promise.resolve(typeof route === 'function' ? route(body) : route)
   }
   return ANAS
 }
@@ -5111,9 +5298,14 @@ async function restoreChecks() {
   const ARCHIVES = FILE_RESTORE_SNAPSHOTS.data.snapshots[0].files
     .filter(f => f.archive)
     .map(f => ({ archive: f.archive, kind: f.kind, size: f.size }))
-  eq('file restore: an `img` archive is NOT offered by the file door',
+  eq('file restore: the files half offers ONLY the pxar archives',
     R.restorableArchives(ARCHIVES).map(a => a.archive), ['data.pxar'])
+  eq('file restore: the image half offers ONLY the img archives',
+    R.imageArchivesOf(ARCHIVES).map(a => a.archive), ['lun.img'])
   eq('file restore: the estimate is the archive`s logical size', R.archiveBytes(ARCHIVES, 'data.pxar'), 2607)
+  eq('file restore: a lun-<serial> group id yields its serial',
+    R.lunSerialOfGroup(`host/lun-${LUN_SERIAL}`), LUN_SERIAL)
+  eq('file restore: a non-LUN group id yields no serial', R.lunSerialOfGroup('host/pictures'), '')
 
   const FILE_ROW = { path: '/alpha.txt', type: 'file' }
   const DIR_ROW = { path: '/docs', type: 'dir' }
@@ -5130,7 +5322,7 @@ async function restoreChecks() {
   ok('file restore: a typed selection with no row is not gated either',
     R.needsConfirm('inPlace', []) === false)
 
-  // --- the body, mode by mode ----------------------------------------------
+  // --- the files body, mode by mode ----------------------------------------
 
   const CTX = {
     repo: 'pbs-main',
@@ -5191,7 +5383,52 @@ async function restoreChecks() {
     ignorePermissions: true,
   })
 
-  // --- the dialog, end to end ----------------------------------------------
+  // --- the image body, mode by mode (backup2.7/2.10 shapes, byte-identical) --
+
+  const IMG = {
+    repo: 'pbs-main',
+    ns: 'anas',
+    snapshot: LUN_SNAP,
+    archive: 'disk.img',
+  }
+  eq('image restore: the in-place body is exactly {kind,repo,ns,snapshot,archive,lun}',
+    R.imageRestoreBody({ ...IMG, dest: 'inPlace', lun: { targetIqn: ISCSI_IQN, index: 0 } }), {
+      kind: 'image',
+      repo: 'pbs-main',
+      snapshot: LUN_SNAP,
+      archive: 'disk.img',
+      lun: { targetIqn: ISCSI_IQN, index: 0 },
+      ns: 'anas',
+    })
+  eq('image restore: a blank ns sends no ns key',
+    Object.prototype.hasOwnProperty.call(
+      R.imageRestoreBody({ ...IMG, ns: '', dest: 'inPlace', lun: { targetIqn: ISCSI_IQN, index: 0 } }), 'ns'), false)
+  ok('image restore: the in-place body NEVER carries a target key',
+    !('target' in R.imageRestoreBody({ ...IMG, dest: 'inPlace', lun: { targetIqn: ISCSI_IQN, index: 0 } })))
+  eq('image restore: the newLun body is the shared schema\'s exact shape',
+    R.imageRestoreBody({ ...IMG, dest: 'newLun', newLunTargetIqn: ISCSI_IQN, newLunName: 'vmdisk-new', newLunKind: 'zvol', newLunPool: 'tank' }), {
+      kind: 'image',
+      repo: 'pbs-main',
+      snapshot: LUN_SNAP,
+      archive: 'disk.img',
+      target: {
+        mode: 'newLun',
+        targetIqn: ISCSI_IQN,
+        name: 'vmdisk-new',
+        backing: { kind: 'zvol', pool: 'tank' },
+      },
+      ns: 'anas',
+    })
+  ok('image restore: a newLun body NEVER carries the in-place lun key',
+    !('lun' in R.imageRestoreBody({ ...IMG, dest: 'newLun', newLunTargetIqn: ISCSI_IQN, newLunName: 'n', newLunKind: 'zvol', newLunPool: 'tank' })))
+  eq('image restore: a file-on-dataset backing is {kind:file, dataset}',
+    R.imageRestoreBody({ ...IMG, dest: 'newLun', newLunTargetIqn: ISCSI_IQN, newLunName: 'n', newLunKind: 'file', filePath: 'tank/images' }).target.backing,
+    { kind: 'file', dataset: 'tank/images' })
+  eq('image restore: a file-on-AHR backing is {kind:file, ahrPool}',
+    R.imageRestoreBody({ ...IMG, dest: 'newLun', newLunTargetIqn: ISCSI_IQN, newLunName: 'n', newLunKind: 'file', filePath: 'ahrpool', fileSource: 'ahr' }).target.backing,
+    { kind: 'file', ahrPool: 'ahrpool' })
+
+  // --- the files task door, end to end --------------------------------------
 
   jobs.length = 0
   const dlg = openFileRestoreDialog(ANAS, {
@@ -5200,24 +5437,41 @@ async function restoreChecks() {
     ns: 'anas/pictures',
     homeByArchive: { data: '/mnt/pictures' },
   })
-  ok('file restore: the task door opened the restore dialog', dlg && dlg.cls === 'anas-win-backup-restore')
+  ok('file restore: the task door opened the unified restore dialog', dlg && dlg.cls === 'anas-win-backup-restore')
+  // The bare-name prefill fetches the task (repo/ns/group/homes come from it),
+  // which settles after the window opens.
+  await settle()
 
-  // Point in time → the picker, then Select.
-  const snapBtn = dlg.down('#restoreSnapPick')
-  ok('file restore: the dialog has a point-in-time button', !!snapBtn)
-  snapBtn.handler(snapBtn)
-  await settle()
-  const snapWin = openWindow()
-  ok('file restore: it opened the SHARED snapshot picker', snapWin && snapWin.cls === 'anas-win-snapshot-picker')
-  snapWin.down('#snapGrid').selectRow(0)
-  const snapSelect = snapWin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
-  snapSelect.handler(snapSelect)
-  await settle()
+  // The task door collapses the source part to the summary line (the task
+  // already names repo, namespace and group) and starts AT the point in time.
+  const summary = dlg.down('#restoreSourceSummary')
+  ok('file restore: the task door shows the read-only summary line',
+    summary && (summary.html || '').includes('From task'), summary && summary.html)
+  ok('file restore: it names the task, the repository, namespace and group',
+    /nightly-pictures/.test(summary.html || '') && /pbs-main/.test(summary.html || '')
+    && /anas\/pictures/.test(summary.html || '') && /host\/pictures/.test(summary.html || ''),
+    summary && summary.html)
+  eq('file restore: the source fields are collapsed (disabled)',
+    dlg.down('#restoreRepo').disabled && dlg.down('#restoreNs').disabled && dlg.down('#restoreGroup').disabled, true)
+  ok('file restore: point-in-time is the first interactive field',
+    dlg.down('#restoreSnapshot').disabled === false && dlg.down('#restoreSnapPick').disabled === false)
+
+  // Point in time → the picker, then Select. The archive combo then holds BOTH
+  // kinds — no auto-preference when there is a real choice.
+  const snapWin1 = await pickFileSnapshot(dlg)
+  ok('file restore: it opened the SHARED snapshot picker', snapWin1 && snapWin1.cls === 'anas-win-snapshot-picker')
   eq('file restore: the composed snapshot id is carried WHOLE (never a bare group)',
     dlg.down('#restoreSnapshot').getValue(), 'host/pictures/2026-08-25T19:16:45Z')
-  eq('file restore: the archive combo took the pxar archive and dropped the image',
-    dlg.down('#restoreArchive').getValue(), 'data.pxar')
-  eq('file restore: choosing the archive followed it to ITS live home',
+  const comboKinds = dlg.down('#restoreArchive').getStore().getRange().map(r => r.get('archive'))
+  eq('file restore: the archive combo lists both kinds, pre-selecting nothing',
+    comboKinds, ['data.pxar', 'lun.img'])
+  eq('file restore: the what/where part stays hidden until an archive is picked',
+    dlg.down('#restoreFilesWrap').hidden && dlg.down('#restoreImageWrap').hidden, true)
+  dlg.down('#restoreArchive').setValue('data.pxar')
+  await settle()
+  eq('file restore: choosing the pxar archive reveals the files half',
+    dlg.down('#restoreFilesWrap').hidden, false)
+  eq('file restore: …and follows the archive to ITS live home',
     dlg.down('#restoreHome').getValue(), '/mnt/pictures')
 
   // Files → the archive-backed multi-select picker. Pick the HARDLINK only.
@@ -5268,13 +5522,8 @@ async function restoreChecks() {
     ns: 'anas/pictures',
     homeByArchive: { data: '/mnt/pictures' },
   })
-  const snapBtn2 = dlg2.down('#restoreSnapPick')
-  snapBtn2.handler(snapBtn2)
-  await settle()
-  const snapWin2 = openWindow()
-  snapWin2.down('#snapGrid').selectRow(0)
-  const snapSelect2 = snapWin2.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
-  snapSelect2.handler(snapSelect2)
+  await pickFileSnapshot(dlg2)
+  dlg2.down('#restoreArchive').setValue('data.pxar')
   await settle()
   dlg2.down('#restoreTargetKind').setValue('inPlace')
   const filesBtn2 = dlg2.down('#restoreFilesPick')
@@ -5306,14 +5555,9 @@ async function restoreChecks() {
     ns: 'anas/pictures',
     homeByArchive: { data: '/mnt/pictures' },
   })
-  // Point in time → picker → Select; files → archive picker → alpha.txt.
-  const snapBtnN = dlgN.down('#restoreSnapPick')
-  snapBtnN.handler(snapBtnN)
-  await settle()
-  const snapWinN = openWindow()
-  snapWinN.down('#snapGrid').selectRow(0)
-  const snapSelectN = snapWinN.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
-  snapSelectN.handler(snapSelectN)
+  // Point in time → picker → Select; pick the pxar archive; files → alpha.txt.
+  await pickFileSnapshot(dlgN)
+  dlgN.down('#restoreArchive').setValue('data.pxar')
   await settle()
   const filesBtnN = dlgN.down('#restoreFilesPick')
   filesBtnN.handler(filesBtnN)
@@ -5389,7 +5633,8 @@ async function restoreChecks() {
 }
 
 // ============================================================================
-//  5d. backup2.6 — both restore doors exist on the Backup screen
+//  5d. backup2.6/2.9 — every restore door on the Backup screen opens the ONE
+//      dialog, and the archive kind picks the half (files or LUN)
 // ============================================================================
 
 async function restoreDoorChecks() {
@@ -5400,7 +5645,7 @@ async function restoreDoorChecks() {
   const grid = view.down('#backupGrid')
 
   // Door 1: the toolbar, always available — the point of the task-less door is
-  // that there may be no task to select.
+  // that there may be no task to select, and it shows the FULL source part.
   const toolbarDoor = grid.down('#backupRestoreRepo')
   ok('file restore: the Backup toolbar has "Restore from repository…"', !!toolbarDoor)
   ok('file restore: the task-less door needs no selection', toolbarDoor && !toolbarDoor.disabled)
@@ -5408,10 +5653,13 @@ async function restoreDoorChecks() {
   toolbarDoor.handler(toolbarDoor)
   await settle()
   const repoDlg = openWindow()
-  ok('file restore: the toolbar door opens the restore dialog',
+  ok('file restore: the toolbar door opens the unified restore dialog',
     repoDlg && repoDlg.cls === 'anas-win-backup-restore')
   ok('file restore: the repository door asks for the repository, namespace and group',
-    repoDlg && !!repoDlg.down('#restoreRepo') && !!repoDlg.down('#restoreNs') && !!repoDlg.down('#restoreGroup'))
+    repoDlg && repoDlg.down('#restoreRepo').disabled === false
+    && repoDlg.down('#restoreNs').disabled === false && repoDlg.down('#restoreGroup').disabled === false)
+  ok('file restore: the task-less door has NO summary line (the source is the full part)',
+    repoDlg && !repoDlg.down('#restoreSourceSummary'))
   // The group is a real choice, not a name to remember: the door exists because
   // the task that would have known it is gone.
   ok('file restore: the group combo was filled from the repository`s groups',
@@ -5425,7 +5673,182 @@ async function restoreDoorChecks() {
   await settle()
   ok('file restore: no group means no empty point-in-time picker', created.windows.length === 0)
 
-  // Door 2: the task detail window.
+  // Door 2: the NEW grid "Restore…" button beside Run Now — selection-dependent,
+  // and allowed for a DISABLED task (a disabled task keeps its restore path).
+  const gridRestore = grid.down('#backupRestore')
+  ok('file restore: the grid has a selection-dependent Restore… button', !!gridRestore)
+  ok('file restore: it starts DISABLED with nothing selected', gridRestore.disabled === true)
+  grid.selectRow(0)
+  ok('file restore: it goes live once a task is selected', gridRestore.disabled === false)
+  // A disabled task keeps its restore path — only Run Now/Edit/Delete are taken.
+  grid.getStore().getAt(2).set('enabled', false)
+  grid.selectRow(2)
+  ok('file restore: it stays live for a DISABLED task', gridRestore.disabled === false)
+  created.windows.length = 0
+  gridRestore.handler(gridRestore)
+  await settle()
+  const gridDlg = openWindow()
+  ok('file restore: the grid Restore… opens the unified dialog',
+    gridDlg && gridDlg.cls === 'anas-win-backup-restore')
+  const gridSummary = gridDlg && gridDlg.down('#restoreSourceSummary')
+  ok('file restore: the grid door collapses the source to the summary line',
+    gridSummary && (gridSummary.html || '').includes('From task'), gridSummary && gridSummary.html)
+
+  // The BLOCK task door: one fixed `disk` image archive → the image half. When
+  // the archive's `lun` record maps to a LIVE LUN on this node, This LUN is the
+  // destination and the body is the in-place shape.
+  created.windows.length = 0
+  ANAS.backup.openRestoreDialog('harness', 'harness', { task: LIVE_BLOCK_TASK })
+  await settle()
+  const blockDlg = openWindow()
+  ok('block restore: the block task door opened the unified dialog',
+    blockDlg && blockDlg.cls === 'anas-win-backup-restore')
+  const blockSummary = blockDlg && blockDlg.down('#restoreSourceSummary')
+  ok('block restore: the summary names the task and its lun-<serial> group',
+    /live-lun/.test(blockSummary.html || '') && new RegExp(LUN_GROUP).test(blockSummary.html || ''),
+    blockSummary && blockSummary.html)
+  ok('block restore: point-in-time is the first interactive field',
+    blockDlg.down('#restoreSnapshot').disabled === false && blockDlg.down('#restoreRepo').disabled === true)
+  const blockSnap = await pickFileSnapshot(blockDlg)
+  ok('block restore: the shared picker listed the block group', !!blockSnap)
+  // A block group holds exactly ONE restorable archive — it is pre-selected.
+  eq('block restore: the single `disk.img` archive is pre-selected',
+    blockDlg.down('#restoreArchive').getValue(), 'disk.img')
+  ok('block restore: the image half appeared', blockDlg.down('#restoreImageWrap').hidden === false)
+  ok('block restore: files half stays hidden', blockDlg.down('#restoreFilesWrap').hidden === true)
+  ok('block restore: This LUN is available and defaulted (the lun record maps a live LUN)',
+    blockDlg.down('#restoreDest').getValue(), { restoreDest: 'inPlace' })
+  jobs.length = 0
+  const blockSubmit = blockDlg.down('#restoreSubmit')
+  blockSubmit.handler(blockSubmit)
+  await settle()
+  eq('block restore: the LUN body names the task group and the fixed disk archive',
+    jobs.length && jobs[0].body, {
+      kind: 'image',
+      repo: 'pbs-main',
+      snapshot: `${LUN_GROUP}/2026-08-25T19:16:45Z`,
+      archive: 'disk.img',
+      lun: { targetIqn: ISCSI_IQN, index: 0 },
+    })
+  ok('block restore: the in-place body carries NO target key',
+    jobs.length && jobs[0].body && !('target' in jobs[0].body), JSON.stringify((jobs[0] || {}).body))
+
+  // The block task whose LUN record maps to NOTHING: only a new LUN is offered,
+  // and the confirm-gated in-place destination is simply not there.
+  created.windows.length = 0
+  ANAS.backup.openRestoreDialog('harness', 'harness', { task: STRAY_LUN_TASK })
+  await settle()
+  const strayDlg = openWindow()
+  await pickFileSnapshot(strayDlg)
+  eq('block restore(stray): the single disk.img archive is pre-selected',
+    strayDlg.down('#restoreArchive').getValue(), 'disk.img')
+  ok('block restore(stray): This LUN is DISABLED — nothing on this node maps to it',
+    strayDlg.down('#restoreDest').getValue(), { restoreDest: 'newLun' })
+  const strayInPlace = strayDlg.down('#restoreDest').childCmps().find(k => k.inputValue === 'inPlace')
+  ok('block restore(stray): the in-place radio is disabled', strayInPlace.disabled === true)
+  // A new-LUN restore is the only destination, and it is a whole legal body.
+  strayDlg.down('#newLunName').setValue('stray-new')
+  strayDlg.down('#newLunPool').setValue('tank')
+  await settle()
+  jobs.length = 0
+  const straySubmit = strayDlg.down('#restoreSubmit')
+  straySubmit.handler(straySubmit)
+  await settle()
+  eq('block restore(stray): only a new-LUN body leaves the dialog',
+    jobs.length && jobs[0].body, {
+      kind: 'image',
+      repo: 'pbs-main',
+      snapshot: 'host/stray/2026-08-25T19:16:45Z',
+      archive: 'disk.img',
+      target: {
+        mode: 'newLun',
+        targetIqn: ISCSI_IQN,
+        name: 'stray-new',
+        backing: { kind: 'zvol', pool: 'tank' },
+      },
+    })
+  ok('block restore(stray): a new-LUN body never carries the in-place lun key',
+    jobs.length && jobs[0].body && !('lun' in jobs[0].body), JSON.stringify((jobs[0] || {}).body))
+
+  // --- switching archive kind swaps the half AND clears the other's state ----
+  // Same dialog, one mixed snapshot: pick a FILE, then switch to the image —
+  // the file selections must fall, not ride along; switch back and the image
+  // destination must re-default, not leak a `target`.
+  const ANAS2 = loadRestoreSources()
+  created.windows.length = 0
+  const switchDlg = openFileRestoreDialog(ANAS2, {
+    task: 'nightly-pictures',
+    repo: 'pbs-main',
+    ns: 'anas/pictures',
+    homeByArchive: { data: '/mnt/pictures' },
+  })
+  await pickFileSnapshot(switchDlg)
+  switchDlg.down('#restoreArchive').setValue('data.pxar')
+  await settle()
+  const switchFilesBtn = switchDlg.down('#restoreFilesPick')
+  switchFilesBtn.handler(switchFilesBtn)
+  await settle()
+  const switchPicker = openWindow()
+  const alphaS = switchPicker.down('#pickerTree').getStore().getRootNode().childNodes.find(n => n.get('name') === 'alpha.txt')
+  switchPicker.down('#pickerTree').fireEvent('selectionchange', switchPicker.down('#pickerTree').getSelectionModel(), [alphaS])
+  const switchSel = switchPicker.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  switchSel.handler(switchSel)
+  await settle()
+  switchDlg.down('#restoreTargetKind').setValue('inPlace')
+  await settle()
+  ok('kind switch: a file selection is present in the files half',
+    (switchDlg.down('#restoreSelectionList').html || '').includes('alpha.txt'),
+    switchDlg.down('#restoreSelectionList').html)
+
+  // → the img archive. The files state drops; this task is files-only, so only
+  // the new-LUN destination exists for the image.
+  switchDlg.down('#restoreArchive').setValue('lun.img')
+  await settle()
+  ok('kind switch: the image half replaced the files half',
+    switchDlg.down('#restoreImageWrap').hidden === false && switchDlg.down('#restoreFilesWrap').hidden === true)
+  ok('kind switch: the file selections were dropped, never carried over',
+    (switchDlg.down('#restoreSelectionList').html || '').includes('Nothing picked yet.'),
+    switchDlg.down('#restoreSelectionList').html)
+  eq('kind switch: a files-only task has no This LUN — only the new-LUN destination',
+    switchDlg.down('#restoreDest').getValue(), { restoreDest: 'newLun' })
+
+  // → back to the pxar archive. The image state drops; the files half re-appears
+  // with the target re-defaulted (no stale target.mode).
+  switchDlg.down('#restoreArchive').setValue('data.pxar')
+  await settle()
+  eq('kind switch: the files half returns side-by-side, not the stale in-place choice',
+    switchDlg.down('#restoreTargetKind').getValue(), { restoreTarget: 'sideBySide' })
+  ok('kind switch: an image-mode new-LUN verdict left no stale text',
+    !(switchDlg.down('#newLunVerdict').html || '').length, switchDlg.down('#newLunVerdict').html)
+  // No stale `selections` may ride a files body after the round trip — pick the
+  // same entry fresh and the body is byte-clean.
+  const switchFilesBtn2 = switchDlg.down('#restoreFilesPick')
+  switchFilesBtn2.handler(switchFilesBtn2)
+  await settle()
+  const switchPicker2 = openWindow()
+  const alphaS2 = switchPicker2.down('#pickerTree').getStore().getRootNode().childNodes.find(n => n.get('name') === 'alpha.txt')
+  switchPicker2.down('#pickerTree').fireEvent('selectionchange', switchPicker2.down('#pickerTree').getSelectionModel(), [alphaS2])
+  const switchSel2 = switchPicker2.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  switchSel2.handler(switchSel2)
+  await settle()
+  jobs.length = 0
+  const switchSubmit = switchDlg.down('#restoreSubmit')
+  switchSubmit.handler(switchSubmit)
+  await settle()
+  ok('kind switch: the round-tripped files body is byte-clean',
+    jobs.length && jobs[0].body, {
+      kind: 'files',
+      repo: 'pbs-main',
+      snapshot: 'host/pictures/2026-08-25T19:16:45Z',
+      archive: 'data.pxar',
+      selections: ['/alpha.txt'],
+      target: { mode: 'sideBySide', path: '/mnt/pictures' },
+      options: {},
+      ns: 'anas/pictures',
+      task: 'nightly-pictures',
+    })
+
+  // Door 3: the task detail window — the same collapsed task door.
   grid.selectRow(0)
   created.windows.length = 0
   const detailsBtn = grid.down('#backupDetails')
@@ -5442,16 +5865,14 @@ async function restoreDoorChecks() {
   const taskDlg = openWindow()
   ok('file restore: the task door opens the same dialog',
     taskDlg && taskDlg.cls === 'anas-win-backup-restore')
-  ok('file restore: the task door does NOT ask for a group — the task knows it',
-    taskDlg && !taskDlg.down('#restoreGroup'))
+  ok('file restore: the task door collapses the source (fields behind a summary)',
+    taskDlg && taskDlg.down('#restoreSourceSummary').hidden === false
+    && taskDlg.down('#restoreRepo').disabled === true)
   eq('file restore: the task door carries the task`s repository',
     taskDlg && taskDlg.down('#restoreRepo').getValue(), 'pbs-main')
 
   ok('file restore: nothing warned in the doors', warnings.length === 0, warnings.join(' | '))
 }
-
-// ============================================================================
-
 await backupChecks()
 warnings.length = 0
 await nestedChecks()

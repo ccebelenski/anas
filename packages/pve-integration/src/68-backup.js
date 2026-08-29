@@ -1099,7 +1099,10 @@
                 if (('' + (r.source || 'anas')).toLowerCase() === 'pve') {
                     label += '  — ' + t('PVE');
                 }
-                opts.push({ name: r.name, label: label });
+                // The repository's own namespace rides along (additive — a store
+                // that does not declare it simply drops it): the restore dialog
+                // pre-fills the namespace field from it for zero re-entry.
+                opts.push({ name: r.name, label: label, namespace: r.namespace || '' });
             }
             return opts;
         });
@@ -1810,6 +1813,9 @@
         var rec = selectedTask(grid);
         var has = !!rec;
         setDisabled(grid, 'backupRun', !has);
+        // A restore is allowed for a DISABLED task too — disabling the backups
+        // must not take the restore path away with it.
+        setDisabled(grid, 'backupRestore', !has);
         setDisabled(grid, 'backupDetails', !has);
         setDisabled(grid, 'backupEdit', !has);
         setDisabled(grid, 'backupToggle', !has);
@@ -5205,16 +5211,38 @@
             {
                 // The TASK-LESS restore door (backup2.6): for archives whose
                 // task was renamed or deleted. It needs no selection, because
-                // the point is that there may be no task to select.
+                // the point is that there may be no task to select, and it shows
+                // the FULL editable source part.
                 text: t('Restore from repository…'),
                 itemId: 'backupRestoreRepo',
                 cls: 'anas-btn-backup-restore-repo',
                 iconCls: 'fa fa-undo',
-                handler: function () {
-                    openRestoreWizard(node, {});
+                handler: function (btn) {
+                    openRestoreDialog(btn.up('#backupView'), node, {});
                 },
             },
             '-',
+            {
+                // The SELECTION-DEPENDENT door (operator finding 2026-08-28): a
+                // selected TASK already knows repository, namespace, group and
+                // the archive homes, so the dialog asks only the point in time
+                // — and what is true of the task is true whether it is enabled
+                // or disabled (a disabled task still needs its restore path).
+                text: t('Restore…'),
+                itemId: 'backupRestore',
+                cls: 'anas-btn-backup-restore',
+                iconCls: 'fa fa-undo',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#backupView');
+                    var rec = selectedTask(gridOf(view));
+                    if (rec) {
+                        openRestoreDialog(view, node, {
+                            task: rec.get('raw') || taskFromRecord(rec),
+                        });
+                    }
+                },
+            },
             {
                 text: t('Run Now'),
                 itemId: 'backupRun',
@@ -5409,25 +5437,47 @@
 
 
     // ======================================================================
-    //  Restore (story backup2.6) — 'anas-win-backup-restore'
+    //  Restore (stories backup2.6, 2.7, 2.10) — 'anas-win-backup-restore'
     //
-    //  TWO DOORS, one dialog:
-    //    * the task detail's "Restore…" — the task supplies the repository,
-    //      the namespace, the group and the archive's live home, so the
-    //      operator picks a point in time and some files and nothing else;
-    //    * the toolbar's "Restore from repository…" — for archives whose task
-    //      was renamed or deleted. Repository → namespace → group → point in
-    //      time, and the target directory has to be named because nothing on
-    //      this node remembers where the archive came from.
+    //  ONE dialog behind FOUR doors (the second-door ruling: every door opens
+    //  this same window with a prefill, never a second implementation):
+    //    * "Restore from repository…" on the Backup toolbar — the task-less
+    //      door for archives whose task was renamed or deleted. It shows the
+    //      FULL editable source part: repository → namespace → group → point
+    //      in time → archive.
+    //    * the task detail's "Restore…" and the grid's "Restore…" (beside Run
+    //      Now) — the task door. `{task}` supplies repository, namespace,
+    //      group and the archive live-homes, so the source part collapses to
+    //      a read-only summary line and the dialog starts AT the point in
+    //      time (the only real choice left).
+    //    * the LUN toolbar's "Restore from backup…" — `{lun}`. Same collapse:
+    //      "From LUN <name> — group lun-<serial> in <repo>", destination
+    //      defaulting to This LUN.
+    //
+    //  The source part is asked ONLY when it is not already known. On a
+    //  pre-filled door it is one summary line; a small "change source…" link
+    //  expands the editable fields for the rare case (collapsed by default).
+    //
+    //  The what/where part FOLLOWS the picked archive's kind:
+    //    * `pxar` → the file restore half (backup2.6/2.10): selections, the
+    //      three destinations (side-by-side / in-place merge, gated for trees
+    //      / a new location), ownership toggles, estimate, rate.
+    //    * `img` → the image restore half (backup2.7/2.10): This LUN (a block
+    //      image is restored WHOLE, exactly its size) or A new LUN… (fresh
+    //      backing at the image's size on ANAS's imagined target combo).
+    //      This-LUN is available ONLY when the archive's task `lun` record or
+    //      the group's `lun-<serial>` id maps to a LIVE LUN on this node —
+    //      the LUN list is read once — and the size-equality gate is
+    //      unchanged.
+    //
+    //  The bodies are EXACTLY the two pre-existing shapes — the daemon and
+    //  its schemas are untouched. Switching archive kind swaps the half AND
+    //  clears the other half's state, so no stale `selections` can ride an
+    //  image body and no stale `target.mode` a files body.
     //
     //  What the dialog does NOT do is decide anything about safety. The daemon
     //  owns every refusal and the confirm gate; this screen's job is to say,
-    //  before the button is pressed, exactly what is about to happen — which
-    //  directory, merge or new, and what the ownership toggles really cost.
-    //
-    //  `img` archives are not offered here at all. A block image is restored
-    //  WHOLE, from the LUN it backs; picking files out of one is not a thing,
-    //  and the archive combo simply does not list it.
+    //  before the button is pressed, exactly what is about to happen.
     // ======================================================================
 
     /** The `<type>/<id>/<RFC3339>` snapshot id, split — display only. */
@@ -5456,21 +5506,42 @@
     }
 
     /**
-     * The archives of one snapshot row that a FILE restore may offer.
-     *
-     * `img` is excluded by nature, not by policy: a block image has no inside
-     * to pick from. Its door is the LUN's own.
+     * The archives of one snapshot row that a FILE restore may offer — the
+     * `pxar` half of a snapshot's archives (the `img` ones have no inside to
+     * pick from). The unified dialog lists BOTH kinds and switches its
+     * what/where part on whichever archive is picked; these two pure helpers
+     * are the one place the split lives.
      */
     function restorableArchives(rows) {
+        return archivesOfKind(rows, 'pxar');
+    }
+
+    /** The `img` half — a whole-image restore's candidates in a snapshot. */
+    function imageArchivesOf(rows) {
+        return archivesOfKind(rows, 'img');
+    }
+
+    function archivesOfKind(rows, kind) {
         var list = isArray(rows) ? rows : [];
         var out = [];
         for (var i = 0; i < list.length; i++) {
             var a = list[i] || {};
-            if (a.kind === 'pxar' && a.archive) {
+            if (a.kind === kind && a.archive) {
                 out.push(a);
             }
         }
         return out;
+    }
+
+    /**
+     * The serial a group's identity carries when it IS a LUN's group: a block
+     * task's backup-id is `lun-<unit serial>` (backup2.9), so the PBS group
+     * `<type>/lun-<serial>` is the LUN's durable identity and survives a rename
+     * or a resize. Returns the serial, or '' when the group is not a LUN's.
+     */
+    function lunSerialOfGroup(group) {
+        var m = /^[^/]+\/lun-(.+)$/.exec('' + (group == null ? '' : group));
+        return m ? m[1] : '';
     }
 
     /** The logical size of one archive in a snapshot row — the space estimate. */
@@ -5551,6 +5622,66 @@
             body.rate = trim(c.rate);
         }
         return body;
+    }
+
+    /**
+     * The POST body of the IMAGE half (backup2.7/2.10), built from one plain
+     * context object so the contract can be asserted without an ExtJS window.
+     *
+     * Exactly today's two shapes: an in-place restore names the LUN to write
+     * back (`lun: {targetIqn, index}`) and NO `target`; a new-LUN restore names
+     * `target: {mode:'newLun', targetIqn, name, backing}` and NO `lun`. Omission
+     * is meaningful: `ns` and `rate` are absent unless set. The daemon's schema
+     * refuses both at once, and nothing here can produce both.
+     */
+    function imageRestoreBody(ctx) {
+        var c = ctx || {};
+        var body = {
+            kind: 'image',
+            repo: trim(c.repo),
+            snapshot: c.snapshot,
+            archive: c.archive,
+        };
+        if (c.dest === 'newLun') {
+            var target = {
+                mode: 'newLun',
+                targetIqn: trim(c.newLunTargetIqn),
+                name: trim(c.newLunName),
+            };
+            if (c.newLunKind === 'zvol') {
+                target.backing = { kind: 'zvol', pool: trim(c.newLunPool) };
+            } else {
+                target.backing = c.fileSource === 'ahr'
+                    ? { kind: 'file', ahrPool: trim(c.filePath) }
+                    : { kind: 'file', dataset: trim(c.filePath) };
+            }
+            body.target = target;
+        } else if (c.lun) {
+            body.lun = { targetIqn: c.lun.targetIqn, index: c.lun.index };
+        }
+        // `ns` stays LAST, exactly where backup2.7's dialog put it — the bodies
+        // are byte-identical to the pre-unification shapes, key order included.
+        if (trim(c.ns)) {
+            body.ns = trim(c.ns);
+        }
+        if (trim(c.rate)) {
+            body.rate = trim(c.rate);
+        }
+        return body;
+    }
+
+    /** Trimmed field value — the 68-backup sibling of 75-iscsi's textOf. */
+    function textOf(win, sel) {
+        var v = valOf(win, sel);
+        return ('' + (v === undefined || v === null ? '' : v)).trim();
+    }
+
+    function fmtBytes(v) {
+        try {
+            return ANAS.formatBytes ? ANAS.formatBytes(v) : ('' + v);
+        } catch (e) {
+            return '' + v;
+        }
     }
 
     /**
@@ -5672,31 +5803,139 @@
                 + ' ' + mutedSpan(t('— the whole archive; a partial selection needs less')));
     }
 
-    /** Fill the archive combo from the chosen snapshot, `img` excluded. */
+    /**
+     * Fill the archive combo from the chosen snapshot with BOTH kinds. The
+     * what/where part follows whichever archive is picked — pxar → the files
+     * half, img → the LUN half — so nothing is filtered here except the
+     * bookkeeping files (kind `other`), which are never a restore source.
+     *
+     * An archive is PRE-SELECTED only when the snapshot holds exactly ONE
+     * restorable archive (a block task's whole image is the fixed `disk`); with
+     * a real choice the combo is left empty and the part stays hidden until the
+     * operator picks.
+     */
     function setRestoreArchives(win, archives) {
-        win._archives = restorableArchives(archives);
+        win._archives = isArray(archives) ? archives.slice() : [];
         var combo = win.down('#restoreArchive');
         if (!combo) {
             return;
         }
         var data = [];
         for (var i = 0; i < win._archives.length; i++) {
-            data.push({ archive: win._archives[i].archive, label: win._archives[i].archive });
+            var a = win._archives[i] || {};
+            data.push({
+                archive: a.archive,
+                label: a.archive + (a.kind === 'img' ? '  (' + t('image') + ')' : ''),
+            });
         }
         try {
             combo.getStore().loadData(data);
         } catch (e) {
             // non-fatal
         }
-        try {
-            combo.setValue(data.length ? data[0].archive : '');
-        } catch (e2) {
-            // non-fatal
+        if (data.length === 1) {
+            try {
+                combo.setValue(data[0].archive);
+            } catch (e2) {
+                // non-fatal
+            }
+        } else if (data.length) {
+            try {
+                combo.setValue('');
+            } catch (e3) {
+                // non-fatal
+            }
+            restoreNote(win, 'restoreArchiveNote',
+                '<span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+                + enc(t('This snapshot has') + ' ' + data.length + ' '
+                    + t('archives — pick one; the restore follows its kind.')) + '</span>');
+        } else {
+            restoreNote(win, 'restoreArchiveNote', mutedSpan(
+                t('This snapshot holds no restorable archive.')));
         }
-        var skipped = (isArray(archives) ? archives.length : 0) - win._archives.length;
-        restoreNote(win, 'restoreArchiveNote', skipped > 0
-            ? mutedSpan(t('Block images are not listed here — an image is restored whole, from its LUN.'))
-            : '');
+    }
+
+    /** The KIND of the archive the combo currently names, or '' when none. */
+    function currentArchiveKind(win) {
+        var archive = trim(valOf(win, '#restoreArchive'));
+        if (!archive) {
+            return '';
+        }
+        for (var i = 0; i < win._archives.length; i++) {
+            if (win._archives[i].archive === archive) {
+                return win._archives[i].kind === 'img' ? 'img' : 'pxar';
+            }
+        }
+        return '';
+    }
+
+    /**
+     * The archive choice drives the what/where part. Switching kind ALSO clears
+     * the other half's state — no stale `selections` may ride an image body, no
+     * stale target choice a files body — and the destination re-defaults to
+     * This LUN / side-by-side every time the part appears.
+     */
+    function restoreArchiveChanged(win, node) {
+        var kind = currentArchiveKind(win);
+        var previous = win._archiveKind || '';
+        win._archiveKind = kind;
+        if (kind === 'img') {
+            // Entering the image half from a DIFFERENT kind (or from nothing):
+            // the files state is dropped and the destination re-asks *This LUN*
+            // (resolveAndRefreshImage flips it to a new LUN when nothing maps).
+            // Moving between two `img` archives stays put — a second image is
+            // the same half, and resetting would clear the operator's choices.
+            if (previous !== 'img') {
+                win._selections = [];
+                win._selectionRows = [];
+                var filesTarget = win.down('#restoreTargetKind');
+                if (filesTarget) {
+                    try { filesTarget.setValue({ restoreTarget: 'sideBySide' }); } catch (eT) { /* non-fatal */ }
+                }
+                var destG = win.down('#restoreDest');
+                if (destG) {
+                    try { destG.setValue({ restoreDest: 'inPlace' }); } catch (eD) { /* non-fatal */ }
+                }
+                ensureLunInventory(win, node);
+                // The task-less door has no pre-filled LUN/task, so the target
+                // combo has not been filled yet — the image half needs it.
+                loadRestoreTargetChoices(win, node,
+                    win._prefillLun ? (win._prefillLun.targetIqn || '') : '');
+            }
+            resolveAndRefreshImage(win);
+        } else if (kind === 'pxar') {
+            // Entering the files half from a DIFFERENT kind: image state is
+            // dropped on the floor (the destination re-defaults and the new-LUN
+            // form clears, so neither can leak a stale value into a files body).
+            if (previous !== 'pxar') {
+                var dest = win.down('#restoreDest');
+                if (dest) {
+                    try { dest.setValue({ restoreDest: 'inPlace' }); } catch (eD) { /* non-fatal */ }
+                }
+                clearNewLunFields(win);
+            }
+            applyArchiveHome(win);
+            refreshRestore(win);
+            // Files restores validate on submit — the button is always live.
+            updateSubmitGate(win, true);
+        }
+        setRestorePartVisibility(win);
+    }
+
+    /** Show only the what/where half the picked archive's kind needs. */
+    function setRestorePartVisibility(win) {
+        var files = win._archiveKind === 'pxar';
+        var image = win._archiveKind === 'img';
+        var set = function (sel, visible) {
+            var f = win.down(sel);
+            if (!f) {
+                return;
+            }
+            f.setHidden(!visible);
+            f.setDisabled(!visible);
+        };
+        set('#restoreFilesWrap', files);
+        set('#restoreImageWrap', image);
     }
 
     /**
@@ -5720,7 +5959,12 @@
         }
     }
 
-    /** Open the point-in-time picker for whichever door this dialog is. */
+    /**
+     * Open the point-in-time picker. A task door that is still COLLAPSED lists
+     * the task's OWN group (`/backup/tasks/<name>/snapshots`); once the source
+     * has been expanded — or on the task-less / LUN doors — it lists the group
+     * the source fields name (`/backup/repos/<repo>/groups?group=`).
+     */
     function pickRestoreSnapshot(win, node) {
         if (!ANAS.snapshotPicker) {
             ANAS.warn('snapshot picker unavailable');
@@ -5740,16 +5984,25 @@
                 }
                 win._selections = [];
                 win._selectionRows = [];
+                // The listing named the group it read — that is what a LUN's
+                // `lun-<serial>` identity and the summary line are keyed on.
+                if (picked.group) {
+                    win._group = picked.group;
+                    win._groupKnown = true;
+                }
                 setRestoreArchives(win, picked.archives);
-                refreshRestore(win);
+                updateRestoreSummary(win);
+                // A picked point in time REPLACES any earlier one — including
+                // its archives and the part state they chose.
+                restoreArchiveChanged(win, node);
             },
         };
-        if (win._task) {
+        if (win._task && !win._sourceExpanded) {
             cfg.task = win._task;
         } else {
             var group = trim(valOf(win, '#restoreGroup'));
             if (!ctx.repo || !group) {
-                // Without a group there is nothing to list: the repository door
+                // Without a group there is nothing to list: the task-less door
                 // exists because no task remembers the name, so say which two
                 // things are still missing rather than opening an empty picker.
                 restoreNote(win, 'restoreArchiveNote',
@@ -5837,8 +6090,17 @@
         });
     }
 
-    /** Submit. The daemon owns every refusal; this only sends the body. */
+    /** Submit — route by the picked archive's kind, one dialog, two halves. */
     function submitRestore(win, node) {
+        if (currentArchiveKind(win) === 'img') {
+            submitRestoreImage(win, node);
+            return;
+        }
+        submitRestoreFiles(win, node);
+    }
+
+    /** Submit the FILES half. The daemon owns every refusal; this only sends. */
+    function submitRestoreFiles(win, node) {
         var ctx = restoreContext(win);
         if (!ctx.snapshot || !ctx.archive || !ctx.selections.length) {
             restoreNote(win, 'restoreSelectionList',
@@ -5895,13 +6157,662 @@
         });
     }
 
+    // ---- The image half (backup2.7 / backup2.10) ---------------------------
+    //
+    // A whole image is restored WHOLE. The destination choice is This LUN — the
+    // block object the source maps to, which must be exactly the image's size —
+    // or A new LUN… (backup2.10), where a fresh backing is created AT the
+    // image's size and the source LUN is never touched. The live-LUN inventory
+    // is read ONCE (per ANAS-owned target's detail the ~first time the img half
+    // shows), and "This LUN" is offered only when the picked source maps to a
+    // LUN in that inventory through one of the three anchors: the door's own
+    // prefill, the task archive's `lun` record, or the group's `lun-<serial>`.
+
+    /** The live LUN inventory, read once. Not collected until the img half needs it. */
+    function ensureLunInventory(win, node) {
+        return loadLunInventory(win, node);
+    }
+
+    function loadLunInventory(win, node) {
+        if (win._lunInventoryPromise) {
+            return win._lunInventoryPromise;
+        }
+        win._lunInventoryPromise = ANAS.api.get(node, '/iscsi/targets').then(function (res) {
+            var targets = (res && res.data && isArray(res.data.targets)) ? res.data.targets : [];
+            var reads = [];
+            for (var i = 0; i < targets.length; i++) {
+                var t = targets[i] || {};
+                if (t.ownership === 'anas' && t.iqn) {
+                    reads.push(loadLunTargetDetail(win, node, t.iqn));
+                }
+            }
+            return Promise.all(reads);
+        }).then(function (lists) {
+            var out = [];
+            for (var j = 0; j < lists.length; j++) {
+                out = out.concat(isArray(lists[j]) ? lists[j] : []);
+            }
+            win._lunInventory = out;
+            win._lunReceived = true;
+            win._lunInventoryPromise = null;
+            // The list just landed — a This LUN the earlier rendering could not
+            // resolve may be there now, so the whole half re-evaluates.
+            resolveAndRefreshImage(win);
+            return out;
+        }, function () {
+            win._lunInventoryPromise = null;
+            win._lunReceived = true;
+            resolveAndRefreshImage(win);
+            return [];
+        });
+    }
+
+    function loadLunTargetDetail(win, node, iqn) {
+        return ANAS.api.get(node, '/iscsi/targets/' + encodeURIComponent(iqn)).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return [];
+            }
+            var d = (res && res.data) || {};
+            var luns = isArray(d.luns) ? d.luns : [];
+            var out = [];
+            for (var i = 0; i < luns.length; i++) {
+                var l = luns[i] || {};
+                out.push({
+                    targetIqn: iqn,
+                    index: l.index,
+                    name: l.name,
+                    kind: l.kind,
+                    size: l.size,
+                    serial: l.serial,
+                    backingPath: l.backingPath,
+                    backingExists: l.backingExists,
+                    connectedInitiators: isArray(l.connectedInitiators) ? l.connectedInitiators : [],
+                });
+            }
+            return out;
+        }, function () {
+            return [];
+        });
+    }
+
     /**
-     * The restore dialog. `opts.task` names the task door (repository,
-     * namespace, group and the archive's home come from it); its absence is the
-     * repository door, where the operator names all four.
+     * "This LUN" is never invented: it has to RESOLVE from the picked source to
+     * a LUN the node is serving right now, through three anchors —
+     *   1. the LUN door's own prefill (the LUN the operator selected in the
+     *      iSCSI screen),
+     *   2. the block task's archive `lun` record,
+     *   3. the group's `lun-<serial>` identity (a serial survives a rename).
+     * `live` requires a backing ANAS can see AND a known size — without the
+     * size there is no equality to prove, and an absent backing has nothing to
+     * write onto. Returns the record, or null.
      */
-    function openRestoreWizard(node, opts) {
-        var o = opts || {};
+    function resolveThisLun(win) {
+        var inv = isArray(win._lunInventory) ? win._lunInventory : [];
+        var p = win._prefill && win._prefill.lun;
+        var cand = null;
+        if (p) {
+            cand = p;
+        } else if (win._taskLun) {
+            cand = win._taskLun;
+        } else if (win._group) {
+            var serial = lunSerialOfGroup(win._group);
+            if (serial) {
+                for (var i = 0; i < inv.length; i++) {
+                    if (inv[i] && inv[i].serial === serial) {
+                        return liveLunMatch(inv[i]) ? inv[i] : null;
+                    }
+                }
+                return null;
+            }
+        }
+        if (!cand) {
+            return null;
+        }
+        for (var j = 0; j < inv.length; j++) {
+            var l = inv[j] || {};
+            if (l.targetIqn === cand.targetIqn && l.index === cand.index) {
+                return liveLunMatch(l) ? l : null;
+            }
+        }
+        return null;
+    }
+
+    /** A serving LUN with a backing present and a size to prove equality on. */
+    function liveLunMatch(l) {
+        return l.backingExists !== false && Number(l.size) > 0;
+    }
+
+    /** The size of the picked `.img` archive — the image's manifest size. */
+    function selectedImageSize(win) {
+        var archive = trim(valOf(win, '#restoreArchive'));
+        for (var i = 0; i < win._archives.length; i++) {
+            var a = win._archives[i] || {};
+            if (a.archive === archive && a.kind === 'img') {
+                return typeof a.size === 'number' ? a.size : null;
+            }
+        }
+        return null;
+    }
+
+    /** The destination choice from the two radios: `inPlace` | `newLun`. */
+    function restoreDestMode(win) {
+        try {
+            var g = win.down('#restoreDest');
+            var v = g && g.getValue();
+            return (v && v.restoreDest === 'newLun') ? 'newLun' : 'inPlace';
+        } catch (e) {
+            return 'inPlace';
+        }
+    }
+
+    /** The new-LUN backing kind from its radio: `zvol` | `file`. */
+    function newLunBackingKind(win) {
+        try {
+            var g = win.down('#newLunKind');
+            var v = g && g.getValue();
+            return (v && v.lunKind === 'file') ? 'file' : 'zvol';
+        } catch (e) {
+            return 'zvol';
+        }
+    }
+
+    /** Show only the fields the chosen new-LUN backing uses, and DISABLE the
+     * hidden one so a stale value cannot be read back on submit. */
+    function applyNewLunKind(win) {
+        var file = newLunBackingKind(win) === 'file';
+        var set = function (sel, visible) {
+            var f = win.down(sel);
+            if (!f) {
+                return;
+            }
+            f.setHidden(!visible);
+            f.setDisabled(!visible);
+        };
+        set('#newLunPool', !file);
+        set('#filePicker', file);
+    }
+
+    /** Where the picked image file will live — `dataset` or `ahr` (the source flag). */
+    function filePickerSource(win, where) {
+        try {
+            var combo = win.down('#filePicker');
+            var store = combo && combo.getStore();
+            var rec = store && store.findRecord ? store.findRecord('name', where) : null;
+            return rec ? (rec.get('source') || 'dataset') : 'dataset';
+        } catch (e) {
+            return 'dataset';
+        }
+    }
+
+    /** A name already claimed by a LUN on this node — the node-global check. */
+    function lunNameTakenOn(win, name) {
+        var inv = isArray(win._lunInventory) ? win._lunInventory : [];
+        for (var i = 0; i < inv.length; i++) {
+            if (inv[i] && inv[i].name === name) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The local validation for the new-LUN form, cheapest checks first. */
+    function validateNewLun(win, size) {
+        if (!textOf(win, '#restoreSnapshot') || !textOf(win, '#restoreArchive')) {
+            return { ok: false, prompt: t('Pick a point in time and an image archive first.') };
+        }
+        if (size === null || size === undefined) {
+            return { ok: false, reason: t('The size of this archive is not in the snapshot manifest, so ANAS '
+                + 'cannot create the new backing at the image\'s exact size. The restore is refused without '
+                + 'that proof: a backing of the wrong size would be a LUN whose end does not match the image it holds.') };
+        }
+        if (!textOf(win, '#newLunTarget')) {
+            return { ok: false, reason: t('Pick the ANAS-managed target the new LUN appears on.') };
+        }
+        var name = textOf(win, '#newLunName');
+        if (!name) {
+            return { ok: false, reason: t('Enter a LUN name.') };
+        }
+        if (lunNameTakenOn(win, name)) {
+            return { ok: false, reason: t('A LUN named') + ' \'' + name + '\' ' + t('already exists on this node. '
+                + 'The name is the SCSI model string initiators see, so it has to be unique.') };
+        }
+        if (newLunBackingKind(win) === 'zvol') {
+            if (!textOf(win, '#newLunPool')) {
+                return { ok: false, reason: t('Pick the ZFS pool the new volume is created on.') };
+            }
+        } else if (!textOf(win, '#filePicker')) {
+            return { ok: false, reason: t('Pick the dataset or AHR pool the image will live on.') };
+        }
+        return { ok: true };
+    }
+
+    /** The `target` object for a newLun restore, schema-exact. */
+    function buildNewLunTarget(win) {
+        var target = {
+            mode: 'newLun',
+            targetIqn: textOf(win, '#newLunTarget'),
+            name: textOf(win, '#newLunName'),
+        };
+        if (newLunBackingKind(win) === 'zvol') {
+            target.backing = { kind: 'zvol', pool: textOf(win, '#newLunPool') };
+        } else {
+            var where = textOf(win, '#filePicker');
+            var source = filePickerSource(win, where);
+            target.backing = source === 'ahr'
+                ? { kind: 'file', ahrPool: where }
+                : { kind: 'file', dataset: where };
+        }
+        return target;
+    }
+
+    /** Which panels the operator sees, per destination. Hidden = disabled. */
+    function setDestFieldVisibility(win, isNewLun) {
+        var set = function (sel, visible) {
+            var f = win.down(sel);
+            if (!f) {
+                return;
+            }
+            f.setHidden(!visible);
+            f.setDisabled(!visible);
+        };
+        set('#restoreTargetPath', !isNewLun);
+        set('#lunSizeWrap', !isNewLun);
+        set('#sizeVerdictWrap', !isNewLun);
+        set('#newLunFields', isNewLun);
+        set('#newLunVerdictWrap', isNewLun);
+    }
+
+    /** The in-place verdict — TODAY's gate, byte-for-byte the same wording. */
+    function applyInPlaceVerdict(win, lunSize, size) {
+        var verdict = win.down('#sizeVerdict');
+        var chosen = textOf(win, '#restoreSnapshot') && textOf(win, '#restoreArchive');
+        var ok = false;
+        var html = '';
+        if (!chosen) {
+            html = '';
+        } else if (size === null || size === undefined) {
+            html = '<span style="color:var(--anas-bad,#c0392b);">'
+                + enc(t('This archive\'s size is not in the snapshot manifest, so ANAS cannot prove it matches '
+                    + 'the LUN. The restore is refused: a mismatch is silently destructive.')) + '</span>';
+        } else if (size === lunSize) {
+            ok = true;
+            html = '<span style="color:var(--anas-good,#2e7d32);">'
+                + enc(t('The image is exactly the size of this LUN.')) + '</span>';
+        } else {
+            html = '<span style="color:var(--anas-bad,#c0392b);">'
+                + enc(size > lunSize
+                    ? t('The image is LARGER than this LUN. Restoring it would write until the device is full '
+                        + 'and leave it half-overwritten — the old contents gone, the new ones incomplete.')
+                    : t('The image is SMALLER than this LUN. Restoring it would succeed and leave stale bytes '
+                        + 'from the old contents past the end of the restored image.'))
+                + ' ' + enc(fmtBytes(size)) + ' ' + enc(t('vs')) + ' ' + enc(fmtBytes(lunSize)) + '.</span>';
+        }
+        if (verdict) {
+            verdict.update(html);
+        }
+        return ok;
+    }
+
+    /** The new-LUN verdict: the form's validity, and the button's gate. */
+    function updateNewLunVerdict(win, size) {
+        var verdict = win.down('#newLunVerdict');
+        var val = validateNewLun(win, size);
+        var ok = false;
+        var html;
+        if (val.ok) {
+            ok = true;
+            html = '<span style="color:var(--anas-good,#2e7d32);">'
+                + enc(t('Restored as a NEW LUN: the backing is created at exactly the image\'s size ('))
+                + enc(fmtBytes(size)) + '). ' + enc(t('The source LUN is untouched and stays online.')) + '</span>';
+        } else if (val.prompt) {
+            html = '<span style="color:gray;font-size:0.9em;">' + enc(val.prompt) + '</span>';
+        } else {
+            html = '<span style="color:var(--anas-bad,#c0392b);">' + enc(val.reason) + '</span>';
+        }
+        if (verdict) {
+            verdict.update(html);
+        }
+        return ok;
+    }
+
+    /** The size gate, per destination: in-place EQUALITY, newLun KNOWN-only. */
+    function updateRestoreSizes(win) {
+        var size = selectedImageSize(win);
+        var sizeField = win.down('#imageSize');
+        if (sizeField) {
+            sizeField.setValue(size === null || size === undefined
+                ? '<span style="color:gray;">&mdash;</span>'
+                : enc(fmtBytes(size)) + ' (' + enc('' + size) + ' ' + enc(t('bytes')) + ')');
+        }
+        var isNewLun = restoreDestMode(win) === 'newLun';
+        setDestFieldVisibility(win, isNewLun);
+        if (!win._lunReceived) {
+            return;
+        }
+        var rl = resolveThisLun(win);
+        var ok = isNewLun ? updateNewLunVerdict(win, size) : applyInPlaceVerdict(win, rl ? rl.size : 0, size);
+        updateSubmitGate(win, ok);
+    }
+
+    /**
+     * The image half painted in full: which destination is even possible, which
+     * panels are visible, which verdict speaks. Call it whenever the source
+     * (group), the archive, or the LUN list changes.
+     */
+    function resolveAndRefreshImage(win) {
+        var rl = resolveThisLun(win);
+        var dest = win.down('#restoreDest');
+        if (dest) {
+            var inPlaceRadio = null;
+            try {
+                var kids = dest.childCmps ? dest.childCmps() : [];
+                for (var i = 0; i < kids.length; i++) {
+                    if (kids[i].inputValue === 'inPlace') {
+                        inPlaceRadio = kids[i];
+                    }
+                }
+            } catch (e) {
+                inPlaceRadio = null;
+            }
+            if (inPlaceRadio) {
+                inPlaceRadio.setDisabled(!rl);
+            }
+            if (restoreDestMode(win) === 'inPlace' && !rl) {
+                // No LUN on this node backs the chosen source — the ONLY
+                // destination is a new LUN. Re-default rather than leave a
+                // dead radio checked so nothing reads a phantom `lun`.
+                try { dest.setValue({ restoreDest: 'newLun' }); } catch (e2) { /* non-fatal */ }
+            }
+        }
+        var path = win.down('#restoreTargetPath');
+        if (path) {
+            path.setValue(rl
+                ? enc(rl.backingPath || '') + ' (' + enc(t('LUN')) + ' ' + enc(rl.index) + ')'
+                : '');
+        }
+        var s = win.down('#newLunSource');
+        if (s) {
+            s.setValue(sourceLunPhrase(win, rl));
+        }
+        var ls = win.down('#lunSize');
+        if (ls) {
+            ls.setValue(rl
+                ? enc(fmtBytes(rl.size)) + ' (' + enc('' + rl.size) + ' ' + enc(t('bytes')) + ')'
+                : '<span style="color:gray;">&mdash;</span>');
+        }
+        setDestFieldVisibility(win, restoreDestMode(win) === 'newLun');
+        applyNewLunKind(win);
+        setRestoreNote(win, restoreDestMode(win) === 'newLun', rl ? rl.backingPath : '');
+        // `updateRestoreSizes` computes the verdict AND the button's gate; a
+        // second no-arg call here would disable it again (undefined ≠ true).
+        updateRestoreSizes(win);
+    }
+
+    /** The "Source stays" phrase over the new-LUN form's source panel. */
+    function sourceLunPhrase(win, rl) {
+        var p = win._prefill && win._prefill.lun;
+        if (rl) {
+            return enc(rl.name || rl.index) + ' — ' + enc(rl.backingPath || '') + ' (' + enc(t('LUN')) + ' ' + enc(rl.index) + ')';
+        }
+        if (p && p.name) {
+            return enc(p.name) + ' (' + enc(t('LUN')) + ' ' + enc(p.index) + ') — ' + enc(t('not on this node anymore'));
+        }
+        return enc(t('The source LUN is never touched.'));
+    }
+
+    /** Drop the new-LUN form's answers — a stale value must not ride a body. */
+    function clearNewLunFields(win) {
+        var set = function (sel, value) {
+            var f = win.down(sel);
+            if (!f) {
+                return;
+            }
+            try {
+                f.setValue(value);
+            } catch (e) {
+                // non-fatal
+            }
+        };
+        set('#newLunTarget', '');
+        set('#newLunName', '');
+        set('#newLunPool', '');
+        set('#filePicker', '');
+        set('#imageSize', '<span style="color:gray;">&mdash;</span>');
+        var verdict = win.down('#sizeVerdict');
+        if (verdict) {
+            verdict.update('');
+        }
+        var nv = win.down('#newLunVerdict');
+        if (nv) {
+            nv.update('');
+        }
+    }
+
+    /** The safety property CHANGES with the destination; the note rebuilds. */
+    function setRestoreNote(win, isNewLun, backing) {
+        var note = win.down('#restoreNote');
+        if (!note) {
+            return;
+        }
+        if (!isNewLun) {
+            note.update(enc(t('A block image is restored WHOLE — there is no "these files". '
+                + 'The whole target goes offline for the duration (LIO\'s enable flag lives on '
+                + 'the target portal group, not the LUN), every session drops and no initiator '
+                + 'can log back in until it finishes. The image is streamed straight onto ')) + enc(backing)
+                + enc(t('; the unit serial and the backstore attributes are untouched, so the '
+                    + 'initiator sees the same disk with the backed-up contents.')));
+        } else {
+            note.update(enc(t('Restored as a NEW LUN: a fresh backing is created at exactly the image\'s '
+                + 'size, the image is streamed into it, and the new LUN is mapped on the chosen target. '
+                + 'The source LUN is never touched — it stays online, keeps its serial, and no initiator '
+                + 'has to log out. The new LUN gets a FRESH unit serial: a restored copy is a NEW disk.')));
+        }
+    }
+
+    /** The result panel: a finished new-LUN restore lands its identity here. */
+    function showNewLunResult(win, job) {
+        var panel = win.down('#restoreResult');
+        if (!panel) {
+            return;
+        }
+        var nl = job && job.result && job.result.newLun;
+        if (!nl) {
+            panel.update('<span style="color:gray;font-size:0.9em;">'
+                + enc(t('The new LUN restore finished.')) + '</span>');
+            return;
+        }
+        panel.update('<span style="color:var(--anas-good,#2e7d32);">'
+            + enc(t('Restore complete — NEW LUN created')) + '</span>'
+            + '<div style="font-family:monospace;margin:4px 0;">'
+            + enc(nl.name) + ' — ' + enc(t('LUN')) + ' ' + enc(nl.index) + ' ' + enc(t('on'))
+            + ' ' + enc(nl.targetIqn)
+            + '<br>' + enc(t('serial')) + ' ' + enc(nl.serial)
+            + '<br>' + enc(t('backed by')) + ' ' + enc(nl.backingPath)
+            + '</div>'
+            + '<span style="color:gray;font-size:0.9em;">'
+            + enc(t('The source LUN was never touched.')) + '</span>');
+    }
+
+    /** The ANAS-owned targets for the new-LUN door, from the list read once. */
+    function loadRestoreTargetChoices(win, node, preferIqn) {
+        ANAS.api.get(node, '/iscsi/targets').then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var targets = (res && res.data && isArray(res.data.targets)) ? res.data.targets : [];
+            var rows = [];
+            for (var i = 0; i < targets.length; i++) {
+                var t = targets[i] || {};
+                if (t.ownership !== 'anas') {
+                    continue;
+                }
+                rows.push({ value: t.iqn, label: (t.name ? t.name + ' — ' : '') + t.iqn });
+            }
+            var combo = win.down('#newLunTarget');
+            if (!combo) {
+                return;
+            }
+            combo.getStore().loadData(rows);
+            var pick = preferIqn || (rows.length ? rows[0].value : '');
+            try {
+                combo.setValue(pick || '');
+            } catch (e) {
+                // non-fatal
+            }
+            if (win._archiveKind === 'img') {
+                updateRestoreSizes(win);
+            }
+        }, function () {
+            // fail-open: the combo stays empty and the gate names the missing choice
+        });
+    }
+
+    /**
+     * The button's gate — the ONLY part the image half hard-gates. A size
+     * mismatch is silently destructive over a live block object, so Restore is
+     * simply dead until this half says yes (the daemon refuses too). The files
+     * half stays enabled: it owns the 409-confirm dance and validates on submit.
+     */
+    function updateSubmitGate(win, imageOk) {
+        var submit;
+        try {
+            submit = win.down('#restoreSubmit');
+        } catch (e) {
+            return;
+        }
+        if (!submit) {
+            return;
+        }
+        if (currentArchiveKind(win) !== 'img') {
+            submit.setDisabled(false);
+            return;
+        }
+        submit.setDisabled(imageOk !== true);
+    }
+
+    /** Submit the IMAGE half. Same door, same shape as today. */
+    function submitRestoreImage(win, node) {
+        var rl = resolveThisLun(win);
+        var snapshot = textOf(win, '#restoreSnapshot');
+        var archive = textOf(win, '#restoreArchive');
+        if (!snapshot || !archive) {
+            ANAS.alertMsg('Incomplete', t('Choose a point in time and an image archive.'));
+            return;
+        }
+        var size = selectedImageSize(win);
+        var dest = restoreDestMode(win);
+        if (dest === 'newLun') {
+            var newLun = validateNewLun(win, size);
+            if (!newLun.ok) {
+                var nv = win.down('#newLunVerdict');
+                if (nv) {
+                    nv.update('<span style="color:var(--anas-bad,#c0392b);">' + enc(newLun.reason || newLun.prompt) + '</span>');
+                }
+                return;
+            }
+        } else {
+            if (!rl) {
+                ANAS.alertMsg('No destination', t('This image maps to no LUN on this node. Restore it as a NEW LUN.'));
+                return;
+            }
+            if (size !== rl.size) {
+                ANAS.alertMsg('Size mismatch', t('The image and the LUN are not the same size, so the restore is '
+                    + 'refused. Restore this image onto a target of exactly its own size.'));
+                return;
+            }
+        }
+
+        var ctx = {
+            repo: textOf(win, '#restoreRepo'),
+            ns: textOf(win, '#restoreNs'),
+            snapshot: snapshot,
+            archive: archive,
+            dest: dest,
+            lun: (dest === 'inPlace' && rl) ? { targetIqn: rl.targetIqn, index: rl.index } : null,
+            newLunTargetIqn: textOf(win, '#newLunTarget'),
+            newLunName: textOf(win, '#newLunName'),
+            newLunKind: newLunBackingKind(win),
+            newLunPool: textOf(win, '#newLunPool'),
+            filePath: textOf(win, '#filePicker'),
+            fileSource: filePickerSource(win, textOf(win, '#filePicker')),
+        };
+        var body = imageRestoreBody(ctx);
+        var sourceName = win._sourceName || '';
+        var backing = rl ? rl.backingPath : '';
+
+        var confirmTitle = dest === 'newLun' ? 'Restore as new LUN' : 'Restore LUN from backup';
+        var confirmIntro = dest === 'newLun'
+            ? enc(t('Restoring')) + ' ' + enc(archive) + ' ' + enc(t('from')) + ' ' + enc(snapshot)
+                + ' ' + enc(t('as a NEW LUN')) + ' "' + enc(body.target.name) + '" ' + enc(t('on'))
+                + ' ' + enc(body.target.targetIqn) + '. '
+                + enc(t('The source LUN is untouched and stays online — there is no offline window and no '
+                    + 'initiator has to log out. The new LUN gets a FRESH unit serial: a restored copy is '
+                    + 'a NEW disk.'))
+            : enc(t('Restoring')) + ' ' + enc(archive) + ' ' + enc(t('from')) + ' ' + enc(snapshot)
+                + ' ' + enc(t('onto')) + ' ' + enc(backing || sourceName) + '.';
+
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'post',
+            path: '/backup/restore',
+            body: body,
+            view: win,
+            confirmWindow: true,
+            confirmTitle: confirmTitle,
+            confirmIntro: confirmIntro,
+            confirmButtonText: t('Restore'),
+            failTitle: dest === 'newLun' ? 'Restore as new LUN failed' : 'Restore failed',
+            successMsg: dest === 'newLun'
+                ? t('Restored as a new LUN') + ': ' + archive
+                : t('LUN restored') + ': ' + (sourceName || archive),
+            onSubmitted: function () {
+                if (dest === 'newLun') {
+                    var note = win.down('#restoreNote');
+                    if (note) {
+                        note.update(enc(t('Restore accepted — a new LUN is being created. '
+                            + 'Its identity appears here when it finishes.')));
+                    }
+                    return;
+                }
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+            },
+            onComplete: function (job) {
+                if (dest === 'newLun') {
+                    showNewLunResult(win, job);
+                }
+                if (win._onDone) {
+                    win._onDone(job);
+                }
+            },
+            onFailed: function (job) {
+                if (dest === 'newLun') {
+                    var msg = (job && job.error && job.error.message);
+                    if (msg) {
+                        var vr = win.down('#newLunVerdict');
+                        if (vr) {
+                            vr.update('<span style="color:var(--anas-bad,#c0392b);">' + enc(msg) + '</span>');
+                        }
+                    }
+                }
+                if (win._onDone) {
+                    win._onDone(job);
+                }
+            }
+        });
+    }
+
+    /**
+     * The restore dialog — ONE dialog for every door. `prefill` is
+     *   {}                      the task-less repository door (full source part),
+     *   { task }                the task door — name or the task object,
+     *   { lun: {targetIqn,index,serial,name}, … }  the LUN door.
+     * When task or lun is present the source part collapses to a summary line and
+     * the dialog starts AT the point in time.
+     */
+    function openRestoreDialog(view, node, prefill) {
+        var o = prefill || {};
         var win;
         var archiveStore;
         try {
@@ -5914,61 +6825,141 @@
             return null;
         }
 
+        // ---- the door's prefill, normalised ---------------------------------
+        var taskObj = (o.task && typeof o.task === 'object') ? o.task : null;
+        var taskName = taskObj ? ('' + (taskObj.name || '')) : ('' + (o.task || '')).trim();
+        var lunPre = o.lun || null;
+        var sourceCollapsed = !!(taskName || lunPre);
+        var repo = trim(o.repo) || (taskObj ? repoNameOf(taskObj) : '');
+        var ns = '' + (first(trim(o.ns), taskObj && taskObj.namespace) || '');
+        var sourceGroup = trim(o.group) || (taskObj && backupIdOf(taskObj) ? 'host/' + backupIdOf(taskObj) : '');
+        var homeByArchive = (o.homeByArchive && Object.keys(o.homeByArchive).length)
+            ? o.homeByArchive
+            : null; // derived from the task object when a real one is known
+
+        // ---- the what/where part's anchor points ----------------------------
+        var taskLun = null;
+        var taskLunSerial = '';
+        if (taskObj) {
+            var archList = archivesOf(taskObj);
+            for (var ai = 0; ai < archList.length; ai++) {
+                var r0 = archList[ai] || {};
+                if (archiveKindOf(r0) === 'img') {
+                    taskLun = lunRefOf(r0) || taskLun;
+                }
+            }
+            var bid = backupIdOf(taskObj);
+            var mB = /^lun-(.+)$/.exec(bid);
+            if (mB) {
+                taskLunSerial = mB[1];
+            }
+        }
+
         var items = [];
-        if (o.task) {
+
+        // ---- the source part ------------------------------------------------
+
+        // On a pre-filled door ONE read-only summary line replaces the fields;
+        // a "change source…" link expands them (collapsed by default).
+        if (sourceCollapsed) {
             items.push({
                 xtype: 'component',
+                itemId: 'restoreSourceSummary',
+                cls: 'anas-restore-source-summary',
                 padding: '0 0 8 0',
-                html: mutedSpan(t('Restoring from the backup task') + ' ') + '<b>' + enc(o.task) + '</b>',
-            });
-            // Hidden-but-real fields: the repository and namespace ARE part of
-            // the request, so they are carried as fields read by itemId like
-            // every other value — never as a mirrored hidden copy of something
-            // else on screen.
-            items.push({ xtype: 'textfield', itemId: 'restoreRepo', hidden: true, value: o.repo || '' });
-            items.push({ xtype: 'textfield', itemId: 'restoreNs', hidden: true, value: o.ns || '' });
-        } else {
-            items.push({
-                xtype: 'combobox',
-                itemId: 'restoreRepo',
-                cls: 'anas-fld-restore-repo',
-                fieldLabel: t('Repository'),
-                store: Ext.create('Ext.data.Store', { fields: ['name', 'label'], data: [] }),
-                displayField: 'label',
-                valueField: 'name',
-                queryMode: 'local',
-                editable: true,
-                value: o.repo || '',
-                listeners: { change: function () { loadRestoreGroups(win, node); } },
+                html: '',
             });
             items.push({
-                xtype: 'textfield',
-                itemId: 'restoreNs',
-                cls: 'anas-fld-restore-ns',
-                fieldLabel: t('Namespace'),
-                emptyText: t('the repository’s own'),
-                value: o.ns || '',
-                listeners: { change: function () { loadRestoreGroups(win, node); } },
-            });
-            items.push({
-                // A combo, not a plain field: the groups in a namespace are one
-                // read away and nobody remembers a backup-id. Typing still
-                // works — this door exists precisely because the task that
-                // would have known the name is gone.
-                xtype: 'combobox',
-                itemId: 'restoreGroup',
-                cls: 'anas-fld-restore-group',
-                fieldLabel: t('Backup group'),
-                emptyText: 'host/<backup-id>',
-                store: Ext.create('Ext.data.Store', { fields: ['group', 'label'], data: [] }),
-                displayField: 'label',
-                valueField: 'group',
-                queryMode: 'local',
-                editable: true,
-                value: o.group || '',
+                xtype: 'button',
+                itemId: 'restoreChangeSource',
+                cls: 'anas-btn-restore-change-source',
+                text: t('Change source…'),
+                scale: 'small',
+                margin: '0 0 6 0',
+                handler: function () {
+                    win._sourceExpanded = true;
+                    applyRestoreSourceVisibility(win);
+                    loadRestoreGroups(win, node);
+                },
             });
         }
 
+        // The fields themselves: hidden + disabled on a collapsed pre-filled
+        // door, the whole editable source part on the task-less door.
+        items.push({
+            xtype: 'fieldset',
+            itemId: 'restoreSourceFields',
+            cls: 'anas-restore-source-fields',
+            title: t('Source'),
+            defaults: { anchor: '100%' },
+            items: [
+                {
+                    xtype: 'combobox',
+                    itemId: 'restoreRepo',
+                    cls: 'anas-fld-restore-repo',
+                    fieldLabel: t('Repository'),
+                    store: Ext.create('Ext.data.Store', { fields: ['name', 'label', 'namespace'], data: [] }),
+                    displayField: 'label',
+                    valueField: 'name',
+                    queryMode: 'local',
+                    editable: true,
+                    value: repo,
+                    listeners: {
+                        change: function () {
+                            win._group = '';
+                            win._groupKnown = false;
+                            loadRestoreGroups(win, node);
+                            updateRestoreSummary(win);
+                            if (win._archiveKind === 'img') { resolveAndRefreshImage(win); }
+                        },
+                    },
+                },
+                {
+                    xtype: 'textfield',
+                    itemId: 'restoreNs',
+                    cls: 'anas-fld-restore-ns',
+                    fieldLabel: t('Namespace'),
+                    emptyText: t('the repository\u2019s own'),
+                    value: ns,
+                    listeners: {
+                        change: function () {
+                            win._group = '';
+                            win._groupKnown = false;
+                            loadRestoreGroups(win, node);
+                            updateRestoreSummary(win);
+                            if (win._archiveKind === 'img') { resolveAndRefreshImage(win); }
+                        },
+                    },
+                },
+                {
+                    // A combo, not a plain field: the groups in a namespace are
+                    // one read away and nobody remembers a backup-id. Typing
+                    // still works — the repository door exists precisely because
+                    // the task that would have known the name is gone.
+                    xtype: 'combobox',
+                    itemId: 'restoreGroup',
+                    cls: 'anas-fld-restore-group',
+                    fieldLabel: t('Backup group'),
+                    emptyText: 'host/<backup-id>',
+                    store: Ext.create('Ext.data.Store', { fields: ['group', 'label'], data: [] }),
+                    displayField: 'label',
+                    valueField: 'group',
+                    queryMode: 'local',
+                    editable: true,
+                    value: sourceGroup,
+                    listeners: {
+                        change: function () {
+                            win._group = trim(valOf(win, '#restoreGroup'));
+                            win._groupKnown = !!win._group;
+                            updateRestoreSummary(win);
+                            if (win._archiveKind === 'img') { resolveAndRefreshImage(win); }
+                        },
+                    },
+                },
+            ],
+        });
+
+        // ---- point in time, then the archive (which kind picks the part) ----
         items.push({
             xtype: 'fieldcontainer',
             layout: 'hbox',
@@ -6005,173 +6996,370 @@
             queryMode: 'local',
             editable: false,
             listeners: {
-                change: function () {
-                    applyArchiveHome(win);
-                    refreshRestore(win);
-                },
+                change: function () { restoreArchiveChanged(win, node); },
             },
         });
         items.push({ xtype: 'component', itemId: 'restoreArchiveNote', padding: '0 0 6 130', html: '' });
 
+        // ---- what/where: the FILES half (archive kind pxar) -----------------
         items.push({
             xtype: 'fieldcontainer',
-            fieldLabel: t('Restore'),
-            labelWidth: 130,
-            layout: 'hbox',
-            items: [
-                {
-                    xtype: 'component',
-                    itemId: 'restoreSelectionList',
-                    flex: 1,
-                    html: mutedSpan(t('Nothing picked yet.')),
-                },
-                {
-                    xtype: 'button',
-                    itemId: 'restoreFilesPick',
-                    cls: 'anas-btn-restore-files',
-                    text: t('Choose files…'),
-                    margin: '0 0 0 6',
-                    handler: function () { pickRestoreFiles(win, node); },
-                },
-            ],
-        });
-
-        items.push({
-            xtype: 'textfield',
-            itemId: 'restoreHome',
-            cls: 'anas-fld-restore-home',
-            fieldLabel: t('Source directory'),
-            emptyText: '/srv/data',
-            value: o.home || '',
-            listeners: { change: function () { refreshRestore(win); } },
-        });
-        // backup2.10 — the THREE-way destination choice. Side-by-side is the
-        // default and stays untouched; in place keeps its merge/gate semantics;
-        // a NEW location names a directory the restore creates.
-        items.push({
-            xtype: 'radiogroup',
-            itemId: 'restoreTargetKind',
-            cls: 'anas-fld-restore-target-kind',
-            fieldLabel: t('Restore to'),
-            labelWidth: 130,
-            columns: 1,
-            vertical: true,
-            items: [
-                { boxLabel: t('Original place (side-by-side)'), name: 'restoreTarget', inputValue: 'sideBySide', checked: true },
-                { boxLabel: t('Original place, in place (merge)'), name: 'restoreTarget', inputValue: 'inPlace' },
-                { boxLabel: t('New location…'), name: 'restoreTarget', inputValue: 'newLocation' },
-            ],
-            listeners: {
-                change: function (grp) {
-                    try {
-                        refreshRestore(grp.up('window'));
-                    } catch (e) {
-                        // non-fatal
-                    }
-                }
-            }
-        });
-        items.push({
-            xtype: 'fieldcontainer',
-            itemId: 'restoreNewLocationWrap',
-            fieldLabel: t('New directory'),
+            itemId: 'restoreFilesWrap',
+            cls: 'anas-restore-files-part',
+            fieldLabel: t('Restore files'),
             labelWidth: 130,
             hidden: true,
             disabled: true,
-            layout: 'hbox',
+            layout: 'anchor',
+            defaults: { anchor: '100%', labelWidth: 130 },
             items: [
+                {
+                    xtype: 'fieldcontainer',
+                    fieldLabel: t('Restore'),
+                    labelWidth: 130,
+                    layout: 'hbox',
+                    items: [
+                        {
+                            xtype: 'component',
+                            itemId: 'restoreSelectionList',
+                            flex: 1,
+                            html: mutedSpan(t('Nothing picked yet.')),
+                        },
+                        {
+                            xtype: 'button',
+                            itemId: 'restoreFilesPick',
+                            cls: 'anas-btn-restore-files',
+                            text: t('Choose files…'),
+                            margin: '0 0 0 6',
+                            handler: function () { pickRestoreFiles(win, node); },
+                        },
+                    ],
+                },
                 {
                     xtype: 'textfield',
-                    itemId: 'restoreNewLocation',
-                    cls: 'anas-fld-restore-new-location',
-                    flex: 1,
-                    emptyText: t('/srv/restores/pictures-2026-08-25'),
+                    itemId: 'restoreHome',
+                    cls: 'anas-fld-restore-home',
+                    fieldLabel: t('Source directory'),
+                    emptyText: '/srv/data',
+                    value: '',
                     listeners: { change: function () { refreshRestore(win); } },
                 },
+                // backup2.10 — the THREE-way destination choice. Side-by-side is
+                // the default and stays untouched; in place keeps its merge/gate
+                // semantics; a NEW location names a directory the restore creates.
                 {
-                    xtype: 'button',
-                    itemId: 'restoreNewLocationBrowse',
-                    cls: 'anas-btn-restore-new-location-browse',
-                    text: t('Browse…'),
-                    margin: '0 0 0 6',
-                    handler: function () { pickNewRestoreLocation(win, node); },
+                    xtype: 'radiogroup',
+                    itemId: 'restoreTargetKind',
+                    cls: 'anas-fld-restore-target-kind',
+                    fieldLabel: t('Restore to'),
+                    labelWidth: 130,
+                    columns: 1,
+                    vertical: true,
+                    items: [
+                        { boxLabel: t('Original place (side-by-side)'), name: 'restoreTarget', inputValue: 'sideBySide', checked: true },
+                        { boxLabel: t('Original place, in place (merge)'), name: 'restoreTarget', inputValue: 'inPlace' },
+                        { boxLabel: t('New location\u2026'), name: 'restoreTarget', inputValue: 'newLocation' },
+                    ],
+                    listeners: {
+                        change: function (grp) {
+                            try {
+                                refreshRestore(grp.up('window'));
+                            } catch (e) {
+                                // non-fatal
+                            }
+                        }
+                    }
+                },
+                {
+                    xtype: 'fieldcontainer',
+                    itemId: 'restoreNewLocationWrap',
+                    fieldLabel: t('New directory'),
+                    labelWidth: 130,
+                    hidden: true,
+                    disabled: true,
+                    layout: 'hbox',
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            itemId: 'restoreNewLocation',
+                            cls: 'anas-fld-restore-new-location',
+                            flex: 1,
+                            emptyText: t('/srv/restores/pictures-2026-08-25'),
+                            listeners: { change: function () { refreshRestore(win); } },
+                        },
+                        {
+                            xtype: 'button',
+                            itemId: 'restoreNewLocationBrowse',
+                            cls: 'anas-btn-restore-new-location-browse',
+                            text: t('Browse\u2026'),
+                            margin: '0 0 0 6',
+                            handler: function () { pickNewRestoreLocation(win, node); },
+                        },
+                    ],
+                },
+                {
+                    xtype: 'component',
+                    itemId: 'restoreNewLocationNote',
+                    padding: '2 0 0 130',
+                    html: mutedSpan(t('A NEW directory \u2014 it must NOT exist yet. The restore creates it, parents '
+                        + 'included; an existing directory is refused, never merged into.')),
+                },
+                {
+                    xtype: 'fieldcontainer',
+                    fieldLabel: t('Target'),
+                    labelWidth: 130,
+                    items: [{ xtype: 'component', itemId: 'restoreTargetNote', html: '' }],
+                },
+                {
+                    xtype: 'fieldset',
+                    title: t('Ownership, ACLs and permissions'),
+                    collapsible: true,
+                    collapsed: true,
+                    padding: '6 10 8',
+                    defaults: { anchor: '100%' },
+                    items: [
+                        {
+                            xtype: 'checkbox',
+                            itemId: 'restoreIgnoreOwnership',
+                            cls: 'anas-chk-restore-ignore-ownership',
+                            fieldLabel: t('Ignore ownership'),
+                            boxLabel: t('everything lands owned by root; an existing file keeps its current owner'),
+                        },
+                        {
+                            xtype: 'checkbox',
+                            itemId: 'restoreIgnoreAcls',
+                            cls: 'anas-chk-restore-ignore-acls',
+                            fieldLabel: t('Ignore ACLs'),
+                            boxLabel: t('named ACL entries are dropped; the file mode is still applied'),
+                        },
+                        {
+                            xtype: 'checkbox',
+                            itemId: 'restoreIgnoreXattrs',
+                            cls: 'anas-chk-restore-ignore-xattrs',
+                            fieldLabel: t('Ignore xattrs'),
+                            boxLabel: t('extended attributes are dropped; POSIX ACLs are not affected'),
+                        },
+                        {
+                            xtype: 'checkbox',
+                            itemId: 'restoreIgnorePermissions',
+                            cls: 'anas-chk-restore-ignore-permissions',
+                            fieldLabel: t('Ignore permissions'),
+                            boxLabel: t('newly created files land as 0600 \u2014 not their archived mode, and not your umask'),
+                        },
+                    ],
+                },
+                {
+                    xtype: 'fieldcontainer',
+                    fieldLabel: t('Estimated size'),
+                    labelWidth: 130,
+                    items: [{ xtype: 'component', itemId: 'restoreEstimate', html: '' }],
+                },
+                {
+                    xtype: 'textfield',
+                    itemId: 'restoreRate',
+                    cls: 'anas-fld-restore-rate',
+                    fieldLabel: t('Rate limit'),
+                    emptyText: t('unlimited (e.g. 50MB)'),
                 },
             ],
         });
-        items.push({
-            xtype: 'component',
-            itemId: 'restoreNewLocationNote',
-            padding: '2 0 0 130',
-            html: mutedSpan(t('A NEW directory — it must NOT exist yet. The restore creates it, parents '
-                + 'included; an existing directory is refused, never merged into.')),
-        });
+
+        // ---- what/where: the IMAGE half (archive kind img) ------------------
         items.push({
             xtype: 'fieldcontainer',
-            fieldLabel: t('Target'),
+            itemId: 'restoreImageWrap',
+            cls: 'anas-restore-image-part',
+            fieldLabel: t('Restore image'),
             labelWidth: 130,
-            items: [{ xtype: 'component', itemId: 'restoreTargetNote', html: '' }],
-        });
-
-        items.push({
-            xtype: 'fieldset',
-            title: t('Ownership, ACLs and permissions'),
-            collapsible: true,
-            collapsed: true,
-            padding: '6 10 8',
-            defaults: { anchor: '100%' },
+            hidden: true,
+            disabled: true,
+            layout: 'anchor',
+            defaults: { anchor: '100%', labelWidth: 190 },
             items: [
                 {
-                    xtype: 'checkbox',
-                    itemId: 'restoreIgnoreOwnership',
-                    cls: 'anas-chk-restore-ignore-ownership',
-                    fieldLabel: t('Ignore ownership'),
-                    boxLabel: t('everything lands owned by root; an existing file keeps its current owner'),
+                    // backup2.10 — the TWO doors. In place is the whole-image
+                    // restore (the target's TPG goes offline for the run, the
+                    // image must be EXACTLY this LUN's size). A NEW LUN creates
+                    // the backing at the image's own size on a target of the
+                    // operator's choosing; the source LUN is never touched.
+                    xtype: 'radiogroup',
+                    itemId: 'restoreDest',
+                    cls: 'anas-fld-restore-dest',
+                    fieldLabel: t('Restore to'),
+                    columns: 1,
+                    vertical: true,
+                    items: [
+                        { boxLabel: t('This LUN (in place)'), name: 'restoreDest', inputValue: 'inPlace', checked: true },
+                        { boxLabel: t('A new LUN\u2026'), name: 'restoreDest', inputValue: 'newLun' }
+                    ],
+                    listeners: {
+                        change: function (grp) {
+                            var w2 = grp.up('window');
+                            setDestFieldVisibility(w2, restoreDestMode(w2) === 'newLun');
+                            applyNewLunKind(w2);
+                            setRestoreNote(w2, restoreDestMode(w2) === 'newLun',
+                                resolveThisLun(w2) ? resolveThisLun(w2).backingPath : '');
+                            updateRestoreSizes(w2);
+                        }
+                    }
                 },
                 {
-                    xtype: 'checkbox',
-                    itemId: 'restoreIgnoreAcls',
-                    cls: 'anas-chk-restore-ignore-acls',
-                    fieldLabel: t('Ignore ACLs'),
-                    boxLabel: t('named ACL entries are dropped; the file mode is still applied'),
+                    xtype: 'displayfield',
+                    itemId: 'restoreTargetPath',
+                    cls: 'anas-restore-target-path',
+                    fieldLabel: t('Restoring onto'),
+                    value: ''
                 },
                 {
-                    xtype: 'checkbox',
-                    itemId: 'restoreIgnoreXattrs',
-                    cls: 'anas-chk-restore-ignore-xattrs',
-                    fieldLabel: t('Ignore xattrs'),
-                    boxLabel: t('extended attributes are dropped; POSIX ACLs are not affected'),
+                    xtype: 'fieldset',
+                    itemId: 'newLunFields',
+                    cls: 'anas-fld-restore-newlun',
+                    title: t('New LUN'),
+                    hidden: true,
+                    disabled: true,
+                    defaults: { anchor: '100%' },
+                    items: [
+                        {
+                            xtype: 'displayfield',
+                            itemId: 'newLunSource',
+                            fieldLabel: t('Source stays'),
+                            value: ''
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'newLunTarget',
+                            cls: 'anas-fld-restore-newlun-target',
+                            fieldLabel: t('On target'),
+                            store: Ext.create('Ext.data.Store', { fields: ['value', 'label'], data: [] }),
+                            valueField: 'value',
+                            displayField: 'label',
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            emptyText: t('(loading\u2026)'),
+                            listeners: {
+                                change: function (c) { updateRestoreSizes(c.up('window')); }
+                            }
+                        },
+                        {
+                            xtype: 'textfield',
+                            itemId: 'newLunName',
+                            cls: 'anas-fld-restore-newlun-name',
+                            fieldLabel: t('LUN name'),
+                            allowBlank: false,
+                            emptyText: 'vmdisk1',
+                            listeners: {
+                                change: function (c) { updateRestoreSizes(c.up('window')); }
+                            }
+                        },
+                        {
+                            xtype: 'radiogroup',
+                            itemId: 'newLunKind',
+                            cls: 'anas-fld-restore-newlun-kind',
+                            fieldLabel: t('Backed by'),
+                            columns: 1,
+                            vertical: true,
+                            items: [
+                                { boxLabel: t('A new ZFS volume (zvol) on a ZFS pool'), name: 'lunKind', inputValue: 'zvol', checked: true },
+                                { boxLabel: t('A new raw image file on a dataset or AHR pool'), name: 'lunKind', inputValue: 'file' }
+                            ],
+                            listeners: {
+                                change: function (grp) {
+                                    var w2 = grp.up('window');
+                                    applyNewLunKind(w2);
+                                    updateRestoreSizes(w2);
+                                }
+                            }
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'newLunPool',
+                            cls: 'anas-fld-restore-newlun-pool',
+                            fieldLabel: t('ZFS pool'),
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            displayField: 'label',
+                            valueField: 'name',
+                            store: Ext.create('Ext.data.Store', { fields: ['name', 'label'], data: [] }),
+                            emptyText: t('(the ZFS pool the volume is created on)'),
+                            listeners: {
+                                change: function (c) { updateRestoreSizes(c.up('window')); }
+                            }
+                        },
+                        {
+                            // The SAME dataset/AHR picker the add-LUN door uses;
+                            // a row's `source` flag keeps the backing phrase
+                            // (`dataset` vs `ahrPool`) honest.
+                            xtype: 'combobox',
+                            itemId: 'filePicker',
+                            cls: 'anas-fld-lun-dataset',
+                            fieldLabel: t('Dataset or AHR pool'),
+                            hidden: true,
+                            disabled: true,
+                            queryMode: 'local',
+                            displayField: 'label',
+                            valueField: 'name',
+                            store: Ext.create('Ext.data.Store', { fields: ['name', 'label', 'source'], data: [] }),
+                            emptyText: t('pool/dataset'),
+                            listeners: {
+                                change: function (c) { updateRestoreSizes(c.up('window')); }
+                            }
+                        }
+                    ]
                 },
                 {
-                    xtype: 'checkbox',
-                    itemId: 'restoreIgnorePermissions',
-                    cls: 'anas-chk-restore-ignore-permissions',
-                    fieldLabel: t('Ignore permissions'),
-                    // The honest consequence, measured: not "keeps the umask".
-                    boxLabel: t('newly created files land as 0600 — not their archived mode, and not your umask'),
+                    xtype: 'fieldcontainer',
+                    itemId: 'newLunVerdictWrap',
+                    hidden: true,
+                    disabled: true,
+                    fieldLabel: '',
+                    items: [{ xtype: 'component', itemId: 'newLunVerdict', cls: 'anas-restore-newlun-verdict', html: '' }],
                 },
+                {
+                    xtype: 'fieldcontainer',
+                    itemId: 'lunSizeWrap',
+                    fieldLabel: t('LUN size'),
+                    items: [{ xtype: 'displayfield', itemId: 'lunSize', cls: 'anas-fld-restore-lun-size', value: '' }],
+                },
+                {
+                    xtype: 'displayfield',
+                    itemId: 'imageSize',
+                    cls: 'anas-fld-restore-image-size',
+                    fieldLabel: t('Image size'),
+                    value: '<span style="color:gray;">&mdash;</span>'
+                },
+                {
+                    xtype: 'fieldcontainer',
+                    itemId: 'sizeVerdictWrap',
+                    fieldLabel: '',
+                    items: [{ xtype: 'component', itemId: 'sizeVerdict', cls: 'anas-restore-size-verdict', html: '' }],
+                },
+                {
+                    xtype: 'component',
+                    itemId: 'restoreNote',
+                    margin: '4 0 0 0',
+                    style: 'color:gray;font-size:11px;',
+                    html: ''
+                },
+                {
+                    // backup2.10 — the RESULT PANEL: a newLun restore keeps the
+                    // dialog open and lands the new LUN's identity here.
+                    xtype: 'component',
+                    itemId: 'restoreResult',
+                    cls: 'anas-restore-result',
+                    margin: '8 0 0 0',
+                    html: ''
+                }
             ],
-        });
-
-        items.push({
-            xtype: 'fieldcontainer',
-            fieldLabel: t('Estimated size'),
-            labelWidth: 130,
-            items: [{ xtype: 'component', itemId: 'restoreEstimate', html: '' }],
-        });
-        items.push({
-            xtype: 'textfield',
-            itemId: 'restoreRate',
-            cls: 'anas-fld-restore-rate',
-            fieldLabel: t('Rate limit'),
-            emptyText: t('unlimited (e.g. 50MB)'),
         });
 
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-backup-restore',
-                title: t('Restore Files'),
+                title: t('Restore'),
                 modal: true,
-                width: 660,
+                width: 720,
                 autoScroll: true,
                 bodyPadding: 12,
                 layout: 'anchor',
@@ -6180,7 +7368,7 @@
                 buttons: [
                     { text: t('Cancel'), handler: function () { win.close(); } },
                     {
-                        text: t('Restore…'),
+                        text: t('Restore\u2026'),
                         itemId: 'restoreSubmit',
                         cls: 'anas-btn-restore-submit',
                         handler: function () { submitRestore(win, node); },
@@ -6192,27 +7380,66 @@
             return null;
         }
 
-        win._task = o.task || '';
-        win._homeByArchive = o.homeByArchive || {};
+        win._task = taskName;
+        win._taskObj = taskObj;
+        win._repo = repo;
+        win._ns = ns;
+        win._homeByArchive = homeByArchive || {};
         win._selections = [];
         win._selectionRows = [];
         win._archives = [];
-        win.show();
-        if (!o.task) {
+        win._group = sourceGroup;
+        win._groupKnown = !!(sourceGroup || o.group);
+        win._sourceCollapsed = sourceCollapsed;
+        win._sourceExpanded = false;
+        win._prefill = o;
+        win._prefillLun = lunPre;
+        win._view = view;
+        win._node = node;
+        win._onDone = (typeof o.onDone === 'function') ? o.onDone : null;
+        win._taskLun = taskLun;
+        win._taskLunSerial = taskLunSerial;
+        win._sourceName = lunPre && lunPre.name
+            ? ('' + lunPre.name)
+            : (taskObj ? ('' + (taskObj.name || '')) : '');
+        win._lunInventory = [];
+        win._lunReceived = false;
+        win._archiveKind = '';
+
+        if (taskObj) {
+            buildTaskDerived(win, taskObj);
+        } else if (taskName) {
+            fetchRestoreTask(win, node, taskName);
+        }
+        if (lunPre) {
+            loadRestoreRepos(win, node);
+        } else if (!sourceCollapsed) {
             loadRestoreRepos(win, node);
         }
+        if (lunPre || taskLun || taskLunSerial) {
+            ensureLunInventory(win, node);
+            // The new-LUN destination can appear on ANY door that may reach the
+            // image half, so the ANAS-owned target combo is filled up front
+            // (defaulting to the LUN door's own target when there is one).
+            loadRestoreTargetChoices(win, node, lunPre ? lunPre.targetIqn : '');
+        }
+
+        win.show();
+        applyRestoreSourceVisibility(win);
+        setRestorePartVisibility(win);
+        if (lunPre) {
+            if (ANAS.iscsi && ANAS.iscsi.loadBackingChoices) {
+                ANAS.iscsi.loadBackingChoices(node, win);
+            }
+            resolveAndRefreshImage(win);
+        }
         refreshRestore(win);
+        updateRestoreSummary(win);
+        updateSubmitGate(win);
         return win;
     }
 
-
-    /**
-     * The task-bound restore door: open the wizard on THIS task's repository,
-     * namespace and group, with every archive's live home to hand.
-     *
-     * `img` archives contribute nothing here — a block image is restored whole
-     * from its LUN, and its home would be a device, not a directory.
-     */
+    /** The task-bound restore door's prefill, fed through the ONE dialog. */
     function openRestoreFromDetail(win, node, name) {
         var detail = win._detail || {};
         var task = detail.task || detail || {};
@@ -6224,17 +7451,128 @@
                 homeByArchive[bareArchive(a.name)] = a.path;
             }
         }
-        openRestoreWizard(node, {
-            task: name,
-            repo: repoNameOf(task),
-            ns: first(task.namespace) || '',
+        openRestoreDialog(win, node, {
+            task: task,
             homeByArchive: homeByArchive,
         });
     }
 
+    /** Derive the collapsed-task-door context from the task object. */
+    function buildTaskDerived(win, task) {
+        if (!task) {
+            return;
+        }
+        var list = archivesOf(task);
+        if (!Object.keys(win._homeByArchive).length) {
+            var homes = {};
+            for (var i = 0; i < list.length; i++) {
+                var a = list[i] || {};
+                if (a.name && a.path && archiveKindOf(a) !== 'img') {
+                    homes[bareArchive(a.name)] = a.path;
+                }
+            }
+            win._homeByArchive = homes;
+        }
+        if (!win._groupKnown) {
+            var bid = backupIdOf(task);
+            if (bid) {
+                win._group = 'host/' + bid;
+            }
+        }
+    }
+
+    /** A bare task NAME needs its object: repo/ns/group/homes all come from it. */
+    function fetchRestoreTask(win, node, name) {
+        ANAS.api.get(node, '/backup/tasks/' + encodeURIComponent(name)).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var d = (res && res.data) || {};
+            var task = d.task || d || {};
+            win._taskObj = task;
+            buildTaskDerived(win, task);
+            if (!trim(valOf(win, '#restoreRepo'))) {
+                try { win.down('#restoreRepo').setValue(repoNameOf(task)); } catch (e) { /* non-fatal */ }
+            }
+            if (!trim(valOf(win, '#restoreNs'))) {
+                try { win.down('#restoreNs').setValue(first(task.namespace) || ''); } catch (e2) { /* non-fatal */ }
+            }
+            try { win.down('#restoreGroup').setValue(win._group); } catch (e3) { /* non-fatal */ }
+            updateRestoreSummary(win);
+            refreshRestore(win);
+        }, function (err) {
+            ANAS.warn('restore task load failed: ' + ANAS.errText(err));
+            updateRestoreSummary(win);
+        });
+    }
+
+    /** Show the source as fields (task-less, or expanded) or as the summary. */
+    function applyRestoreSourceVisibility(win) {
+        var visible = !win._sourceCollapsed || win._sourceExpanded === true;
+        var set = function (sel) {
+            var f = win.down(sel);
+            if (!f) {
+                return;
+            }
+            f.setHidden(!visible);
+            f.setDisabled(!visible);
+        };
+        set('#restoreRepo');
+        set('#restoreNs');
+        set('#restoreGroup');
+        var wrap = win.down('#restoreSourceFields');
+        if (wrap) {
+            wrap.setHidden(!visible);
+        }
+        var sum = win.down('#restoreSourceSummary');
+        if (sum) {
+            // The summary shows while the door is collapsed; "change source…"
+            // hides it as it expands the editable fields.
+            sum.setHidden(!!(win._sourceCollapsed && win._sourceExpanded === true));
+        }
+    }
+
+    /** The one read-only source line of a pre-filled door. */
+    function updateRestoreSummary(win) {
+        var sum = win.down('#restoreSourceSummary');
+        if (!sum) {
+            return;
+        }
+        var p = win._prefill;
+        var html;
+        if (p && p.lun) {
+            var name = p.lun.name || '';
+            var grp = win._group || (p.lun.serial ? 'lun-' + p.lun.serial : '');
+            var repo1 = trim(valOf(win, '#restoreRepo')) || '';
+            html = enc(t('From LUN')) + ' <b>' + enc(name) + '</b> \u2014 '
+                + enc(t('group')) + ' <b>' + enc(grp) + '</b> '
+                + enc(t('in')) + ' <b>' + enc(repo1) + '</b>';
+        } else {
+            var parts = [];
+            var r = trim(valOf(win, '#restoreRepo')) || '';
+            var n = trim(valOf(win, '#restoreNs')) || '';
+            var g = win._group || '';
+            if (r) { parts.push('<b>' + enc(r) + '</b>'); }
+            if (n) { parts.push('<b>' + enc(n) + '</b>'); }
+            if (g) { parts.push('<b>' + enc(g) + '</b>'); }
+            html = enc(t('From task')) + ' <b>' + enc(win._task) + '</b>'
+                + (parts.length ? (' \u2014 ' + parts.join(' / ')) : '');
+        }
+        sum.update(html);
+    }
+
+
+
     /**
      * Fill the group combo from the chosen repository + namespace. One read,
      * on a change the operator made — never a poll.
+     *
+     * On the LUN door, the group is not a free choice either: a block task's
+     * backup-id is `lun-<unit serial>`, so its group (`host/lun-<serial>`, say)
+     * IS this LUN's backup. When that group exists it is pre-selected; only
+     * when it does not (the LUN was never backed up, or was backed up before
+     * its backup-id derived from the serial) are the repository's other groups
+     * offered.
      */
     function loadRestoreGroups(win, node) {
         var repo = trim(valOf(win, '#restoreRepo'));
@@ -6257,6 +7595,10 @@
                 return;
             }
             var groups = isArray(d.groups) ? d.groups : [];
+            var autoId = (win._prefillLun && win._prefillLun.serial)
+                ? ('lun-' + win._prefillLun.serial)
+                : '';
+            var found = '';
             var data = [];
             for (var i = 0; i < groups.length; i++) {
                 var g = groups[i] || {};
@@ -6267,11 +7609,37 @@
                     group: g.group,
                     label: g.group + (g.lastBackupIso ? ('  —  ' + t('last') + ' ' + g.lastBackupIso) : ''),
                 });
+                // The PBS group reports its backup-id as the id segment; a block
+                // LUN's group is `<backup-type>/lun-<serial>`.
+                if (autoId && g.backupId === autoId) {
+                    found = g.group;
+                }
             }
             try {
                 combo.getStore().loadData(data);
             } catch (e) {
                 // non-fatal
+            }
+            if (found && !win._groupKnown) {
+                try {
+                    combo.setValue(found);
+                } catch (e2) {
+                    // non-fatal
+                }
+                win._group = found;
+                win._groupKnown = true;
+                updateRestoreSummary(win);
+                if (win._archiveKind === 'img') {
+                    resolveAndRefreshImage(win);
+                }
+            } else if (!win._groupKnown) {
+                win._group = '';
+            }
+            if (autoId && !found) {
+                restoreNote(win, 'restoreArchiveNote',
+                    '<span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+                    + enc(t('No group named') + ' ' + autoId + ' — '
+                        + t('the repository’s other groups are offered instead.')) + '</span>');
             }
         }, function (err) {
             ANAS.warn('restore group list failed: ' + ANAS.errText(err));
@@ -6296,8 +7664,31 @@
                 // Default to the first repository when nothing is chosen yet —
                 // most nodes have one, and an empty combo cannot list groups.
                 // It stays a choice: changing it reloads the groups.
-                if (!trim(combo.getValue()) && opts.length) {
-                    combo.setValue(opts[0].name);
+                // Zero re-entry: a repository that records its own namespace
+                // pre-fills it (the way the task path does).
+                if (opts.length) {
+                    if (!trim(combo.getValue())) {
+                        combo.setValue(opts[0].name);
+                    }
+                    var chosen = null;
+                    try {
+                        var rec0 = combo.getStore() && combo.getStore().findRecord
+                            ? combo.getStore().findRecord('name', combo.getValue())
+                            : null;
+                        chosen = rec0 ? rec0.get('namespace') : '';
+                    } catch (e) {
+                        chosen = null;
+                    }
+                    if (chosen === undefined || chosen === null) {
+                        chosen = '';
+                    }
+                    if (!trim(valOf(win, '#restoreNs'))) {
+                        try {
+                            win.down('#restoreNs').setValue('' + chosen);
+                        } catch (e2) {
+                            // non-fatal
+                        }
+                    }
                 }
             } catch (e) {
                 ANAS.warn('restore repo combo failed: ' + ANAS.errText(e));
@@ -6312,13 +7703,22 @@
     // without an ExtJS window — the same seam the picker uses.
     ANAS.backupRestore = {
         restoreBody: restoreBody,
+        imageRestoreBody: imageRestoreBody,
         restoreContext: restoreContext,
         restorableArchives: restorableArchives,
+        imageArchivesOf: imageArchivesOf,
+        lunSerialOfGroup: lunSerialOfGroup,
         archiveBytes: archiveBytes,
         hasDirectorySelection: hasDirectorySelection,
         needsConfirm: needsConfirm,
         sideBySideName: sideBySideName,
-        open: openRestoreWizard,
+        open: openRestoreDialog,
+    };
+
+    // The second doors reach in here: the iSCSI LUN toolbar (75-iscsi.js) opens
+    // the SAME restore dialog with a `{lun}` prefill — never a second dialog.
+    ANAS.backup.openRestoreDialog = function (view, node, prefill) {
+        return openRestoreDialog(view, node, prefill);
     };
 
     // ---- View registration -------------------------------------------------

@@ -1163,6 +1163,7 @@
                                         snapshot: rec.get('snapshot'),
                                         backupTimeIso: rec.get('backupTimeIso'),
                                         archives: rec.get('archives') || [],
+                                        group: win._group || '',
                                     });
                                 } catch (e2) {
                                     warn('snapshot select failed: ' + errText(e2));
@@ -1220,6 +1221,11 @@
                 return;
             }
             var rows = snapshotRows(d);
+            // The listing names the GROUP it read (`<type>/<id>` on the repository
+            // form) — carried so a caller that needs the identity for the RESTORE
+            // body (e.g. the `lun-<serial>` mapping the unified dialog keys on)
+            // does not have to re-derive it or re-read it.
+            win._group = '' + (d.group || '');
             try {
                 grid.getStore().loadData(rows);
             } catch (e3) {
