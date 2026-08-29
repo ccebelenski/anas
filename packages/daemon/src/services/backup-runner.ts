@@ -31,7 +31,7 @@ import {
   withTopLevelMounts,
 } from './backup-snapshots.js'
 import { withZvolSnapshotDevices } from './backup-zvol.js'
-import { nestedRunWarnings, resolveNestedIncludes, scanArchives } from './nested-filesystems.js'
+import { nestedRunNotices, nestedRunWarnings, resolveNestedIncludes, scanArchives } from './nested-filesystems.js'
 import { formatTransientBackupSnapshot } from './snapshot-naming.js'
 
 /**
@@ -488,11 +488,21 @@ export interface BackupRunResult {
   prune?: BackupPruneResult
   /**
    * Completed-with-warning detail — a prune that failed AFTER a successful
-   * backup never fails the job (the data is safe); it rides here instead, as do
-   * this story's nested-filesystem omissions (backup2.2). They flow verbatim
-   * into the 16.12 notification body and the task detail.
+   * backup never fails the job (the data is safe); it rides here, as do the
+   * boundary-scan uncertainties (an incomplete scan: the list of nested
+   * filesystems may be a floor). They flow verbatim into the 16.12
+   * notification body and the task detail. The "stored as an empty directory"
+   * lines are NOT here — they are notices ({@link notices}), because an
+   * uncovered nested filesystem is the consequence of a deliberate choice,
+   * not a surprise.
    */
   warnings?: string[]
+  /**
+   * Informational lines about the run — nested filesystems stored as empty
+   * directories because the task's includeNested does not cover them. They
+   * never change the run's status or the notification level.
+   */
+  notices?: string[]
   /** The run-time boundary scan, per archive (backup2.2). */
   nested?: BackupNestedScan[]
   /**
@@ -555,7 +565,15 @@ export async function runBackup(
   // Fail-open: the scan never fails a backup — it only ever adds warnings.
   const scanned = await scanArchives(executor, task.archives, { timeoutSeconds: NESTED_SCAN_RUN_TIMEOUT_S })
   const resolution = resolveNestedIncludes(task.archives, scanned)
+  // Warnings = real uncertainty only: an incomplete boundary scan (the list of
+  // nested filesystems may be a floor), a resolution that could not honour
+  // `all`. The "stored as an empty directory" lines are NOTICES, not warnings:
+  // an uncovered nested filesystem is the consequence of a deliberate
+  // includeNested choice, and it must not hold the run at
+  // `completed with warnings` or the notification at `warning` (operator
+  // ruling 2026-08-28, revising backup2.2's warning for it).
   const warnings: string[] = [...nestedRunWarnings(resolution.scans), ...resolution.warnings]
+  const notices: string[] = [...nestedRunNotices(resolution.scans)]
 
   // backup2.3 — the DERIVED consistency of every source, from the mount table
   // plus the live AHR topology. Read once for the whole task; both probes fail
@@ -724,9 +742,11 @@ export async function runBackup(
 
   // The SECONDARY signal: whatever the client itself reported skipping and our
   // own walk did not already name. Deduplicated by absolute path so one
-  // omission is one warning, never two (backup2.2).
-  for (const line of skippedWarnings(progress.skipped, scans))
-    warnings.push(line)
+  // omission is one notice, never two (backup2.2). INFORMATIONAL — a client
+  // skip of a mount the task does not include is the same deliberate choice the
+  // primary signal names, not a surprise.
+  for (const line of skippedNotices(progress.skipped, scans))
+    notices.push(line)
   if (scans.length)
     result.nested = scans
   if (Object.keys(includedNested).length)
@@ -742,6 +762,8 @@ export async function runBackup(
     result.expansion = expansion
   if (warnings.length)
     result.warnings = warnings
+  if (notices.length)
+    result.notices = notices
   return result
 }
 
@@ -800,10 +822,15 @@ function includedNestedOf(byArchive: Record<string, string[]>): Record<string, s
 }
 
 /**
- * Turn the client's own `skipping mount point:` lines into warnings, DROPPING
+ * Turn the client's own `skipping mount point:` lines into NOTICES, DROPPING
  * every one our detection already named. A skip line the walk missed is the
  * interesting one — it means reality moved between the scan and the run, or the
  * walk was truncated.
+ *
+ * These are notices, not warnings: a client skip of a mount the task does not
+ * include is the same deliberate choice the primary signal names (an uncovered
+ * nested filesystem is the consequence of the includeNested choice, not a
+ * surprise), and it must not hold the run at `completed with warnings`.
  *
  * Matched on the ARCHIVE-RELATIVE path as well as the absolute one, because in
  * snapshot mode (backup2.3) the two absolute paths are never equal: the walk
@@ -819,10 +846,10 @@ function includedNestedOf(byArchive: Record<string, string[]>): Record<string, s
  * the same string on both sides because expansion preserves the tree.
  *
  * Suppressing here loses nothing: ANAS's own detection is the authoritative
- * warning (an uncovered nested filesystem gets its own "is NOT included" line
- * from `nestedRunWarnings`, and the whole scan rides in `result.nested`).
+ * notice (an uncovered nested filesystem gets its own "is NOT included" line
+ * from `nestedRunNotices`, and the whole scan rides in `result.nested`).
  */
-export function skippedWarnings(
+export function skippedNotices(
   skipped: SkippedMountPoint[],
   scans: BackupNestedScan[],
 ): string[] {

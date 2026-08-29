@@ -14,7 +14,7 @@ import {
   normalizeFingerprint,
   parseBackupProgress,
   progressSummary,
-  skippedWarnings,
+  skippedNotices,
 } from '../backup-runner.js'
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/backup')
@@ -317,10 +317,10 @@ describe('backup runner — STDERR progress parsing (NOTES §3, SURPRISE C)', ()
     const skipped = [
       { archive: 'etc', root: '/etc', relativePath: 'pve', path: '/etc/pve' },
       { archive: 'etc', root: '/etc', relativePath: 'late', path: '/etc/late' },
-      // A duplicate of the first — one omission is one warning.
+      // A duplicate of the first — one omission is one notice.
       { archive: 'etc', root: '/etc', relativePath: 'pve', path: '/etc/pve' },
     ]
-    const lines = skippedWarnings(skipped, [{
+    const lines = skippedNotices(skipped, [{
       archive: 'etc',
       path: '/etc',
       exists: true,
@@ -338,11 +338,12 @@ describe('backup runner — STDERR progress parsing (NOTES §3, SURPRISE C)', ()
     // The client reads the transient snapshot, so its absolute path can never
     // equal the walk's live one. Live-proven on the stunt node: an AHR source
     // with includeNested `all`, whose nested subvolume was EXPANDED into
-    // `ahrdata__photos` and fully backed up, still warned "stored as an empty
-    // directory" on every run — pinning the run at completed-with-warnings and
-    // the notification at `warning` forever.
+    // `ahrdata__photos` and fully backed up, still reported "stored as an empty
+    // directory" on every run — the run sat at completed-with-warnings and the
+    // notification at `warning` forever, until the 2026-08-28 ruling made it a
+    // notice.
     const root = '/run/anas-ahr/lpahr.toplevel/@snapshots/anas-backup-lp-ahr-1787755676'
-    const lines = skippedWarnings(
+    const lines = skippedNotices(
       [{ archive: 'ahrdata', root, relativePath: 'photos', path: `${root}/photos` }],
       [{
         archive: 'ahrdata',
@@ -357,9 +358,9 @@ describe('backup runner — STDERR progress parsing (NOTES §3, SURPRISE C)', ()
     assert.deepEqual(lines, [])
   })
 
-  it('a boundary the walk never named still warns in snapshot mode', () => {
+  it('a boundary the walk never named still notices in snapshot mode', () => {
     const root = '/gtbackup/cdm/.zfs/snapshot/anas-backup-t-1/tree'
-    const lines = skippedWarnings(
+    const lines = skippedNotices(
       [{ archive: 'cdm', root, relativePath: 'appeared-late', path: `${root}/appeared-late` }],
       [{
         archive: 'cdm',

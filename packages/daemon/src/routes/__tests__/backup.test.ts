@@ -572,7 +572,9 @@ describe('backup routes (Epic 16)', () => {
   }
 
   it('preview-nested scans a bare path and never contacts PBS (backup2.2)', async () => {
-    mockNestedWalk()
+    // The interactive scan runs under the budget that fits under the gateway's
+    // 15 s forward — the walk argv carries 10, not the run-start 20/60.
+    mockNestedWalk(10)
     const mock = mockOf(server)
     mock.calls.length = 0
     const res = await server.inject({
@@ -596,14 +598,15 @@ describe('backup routes (Epic 16)', () => {
     }])
     // The one PBS-contact rule: this endpoint never calls the client at all.
     assert.ok(!mock.calls.some(c => c.command === PBC_CMD || c.command === '/usr/bin/prlimit'))
-    // And the walk really is the bounded, symlink-free, directory-only form.
+    // And the walk really is the bounded, symlink-free, directory-only form —
+    // under the INTERACTIVE budget (10 s), which the forward can carry.
     const walk = mock.calls.find(c => c.command === '/usr/bin/timeout' && c.args.includes('-xdev'))
-    assert.deepEqual(walk?.args, walkArgs('/mnttest'))
+    assert.deepEqual(walk?.args, walkArgs('/mnttest', 10))
   })
 
   it('preview-nested reports coverage per archive, against each own choice', async () => {
-    mockNestedWalk()
-    mockNestedDescent()
+    mockNestedWalk(10)
+    mockNestedDescent(10)
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/preview-nested',
@@ -632,34 +635,46 @@ describe('backup routes (Epic 16)', () => {
     assert.match((res.json() as { error: { message: string } }).error.message, /Send a path/)
   })
 
-  it('the task detail reports what is nested under each source and whether it is covered', async () => {
+  it('the task detail is instant — the boundary scan is no longer part of it', async () => {
     await createRepo()
     await createTaskPayload(NESTED_TASK)
     mockNestedWalk()
+    const mock = mockOf(server)
+    mock.calls.length = 0
     const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks/pool-task', headers: IDENTITY })
     assert.equal(res.statusCode, 200)
     const { data } = res.json() as { data: BackupTaskDetail }
-    assert.ok(data.nested, 'the detail carries the boundary scan')
-    assert.equal(data.nested!.length, 1)
-    assert.equal(data.nested![0].archive, 'pool')
-    assert.equal(data.nested![0].nested[0].path, '/mnttest/data')
-    assert.equal(data.nested![0].nested[0].kind, 'dataset')
-    assert.equal(data.nested![0].nested[0].included, false)
+    // The detail no longer carries the boundary scan: an ABSENT key is
+    // "not known" to the UI, which loads it progressively through
+    // preview-nested (where the 10 s budget fits under the 15 s forward).
+    assert.equal(data.nested, undefined)
+    // And the detail never walks anything — the walk used to hang the screen
+    // for a source rooted on a remote mount.
+    assert.ok(!mock.calls.some(c => c.command === '/usr/bin/timeout' && c.args.includes('-xdev')))
   })
 
-  it('a task that CHOOSES a nested path stores it and reports it covered', async () => {
+  it('a task that CHOOSES a nested path stores it, and the boundary scan reports it covered', async () => {
     await createRepo()
     await createTaskPayload({
       ...NESTED_TASK,
       name: 'pool-chosen',
       archives: [{ name: 'pool', path: '/mnttest', excludes: [], includeNested: ['/mnttest/data'] }],
     })
-    mockNestedWalk()
+    mockNestedWalk(10)
     const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks/pool-chosen', headers: IDENTITY })
     const { data } = res.json() as { data: BackupTaskDetail }
     assert.deepEqual(data.task.archives[0].includeNested, ['/mnttest/data'])
     assert.ok(data.unit.includes('includeNested'))
-    assert.equal(data.nested![0].nested[0].included, true)
+    // Coverage now rides the progressive scan the detail window loads.
+    const preview = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/preview-nested',
+      headers: JSON_HEADERS,
+      payload: { archives: [{ name: 'pool', path: '/mnttest', includeNested: ['/mnttest/data'] }] },
+    })
+    assert.equal(preview.statusCode, 200)
+    const { data: pdata } = preview.json() as { data: { archives: Array<{ nested: Array<{ included: boolean }> }> } }
+    assert.equal(pdata.archives[0].nested[0].included, true)
   })
 
   it('a task with NO nested choice stores no such key (the untouched-edit rule)', async () => {
@@ -683,7 +698,7 @@ describe('backup routes (Epic 16)', () => {
     assert.match((res.json() as { error: { message: string } }).error.message, /not under the archive path/)
   })
 
-  it('a run WARNS about every nested filesystem its choice omits (never silent)', async () => {
+  it('a run NOTES every nested filesystem its choice omits (never silent, but not a warning)', async () => {
     await createRepo()
     await createTaskPayload(NESTED_TASK)
     // The run path gives the walk a longer budget than the wizard's.
@@ -697,10 +712,37 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(res.statusCode, 202)
     const job = await waitForJob(server, await jobIdFrom(res))
     assert.equal(job.status, 'completed')
-    const result = job.result as { warnings?: string[], nested?: unknown[] }
-    const omitted = result.warnings?.some(w => w.includes('/mnttest/data') && w.includes('empty directory'))
-    assert.ok(omitted, JSON.stringify(result.warnings))
+    const result = job.result as { warnings?: string[], notices?: string[], nested?: unknown[] }
+    // The omission is recorded — but as a notice: a deliberate choice is
+    // information, and it must not hold the run at completed-with-warnings.
+    const omitted = result.notices?.some(w => w.includes('/mnttest/data') && w.includes('empty directory'))
+    assert.ok(omitted, JSON.stringify(result.notices))
+    assert.ok(!result.warnings?.some(w => w.includes('/mnttest/data')), 'not a warning')
     assert.equal(result.nested?.length, 1)
+  })
+
+  it('the detail carries the last run`s NOTES — the run`s toast points here for them', async () => {
+    await createRepo()
+    await createTaskPayload({ ...NESTED_TASK, name: 'pool-noticed' })
+    mockNestedWalk(60)
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/pool-noticed/run',
+      headers: JSON_HEADERS,
+      payload: { direct: true },
+    })
+    const job = await waitForJob(server, await jobIdFrom(res))
+    assert.equal(job.status, 'completed')
+    const result = job.result as { notices?: string[] }
+    assert.ok(result.notices?.length, `the fixture run must carry a notice: ${JSON.stringify(job.result)}`)
+    // The same lines the toast summarized are findable on the DETAIL window —
+    // the notes-only toast points the operator there, so the pointer must land
+    // on something. Read back from the in-process run job, so they vanish
+    // honestly after a daemon restart.
+    const detail = await server.inject({ method: 'GET', url: '/v1/backup/tasks/pool-noticed', headers: IDENTITY })
+    assert.equal(detail.statusCode, 200)
+    const { data } = detail.json() as { data: BackupTaskDetail }
+    assert.deepEqual(data.lastRunNotices, result.notices)
   })
 
   it('an `all` archive reaches pbc as explicit --include-dev flags, never --all-file-systems', async () => {
@@ -1109,7 +1151,7 @@ describe('backup routes (Epic 16)', () => {
   })
 
   it('preview-nested returns the DERIVED consistency, read-only, on the same scan', async () => {
-    mockNestedWalk()
+    mockNestedWalk(10)
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/preview-nested',
@@ -1127,10 +1169,10 @@ describe('backup routes (Epic 16)', () => {
     assert.match(c?.reason ?? '', /recursive snapshot/)
   })
 
-  it('the task detail carries the consistency per archive too', async () => {
+  it('the task detail is instant — the consistency per archive rides preview-nested now', async () => {
     await createRepo()
     await createTaskPayload({ ...NESTED_TASK, name: 'detail-consistency' })
-    mockNestedWalk()
+    mockNestedWalk(10)
     const res = await server.inject({
       method: 'GET',
       url: '/v1/backup/tasks/detail-consistency',
@@ -1138,8 +1180,18 @@ describe('backup routes (Epic 16)', () => {
     })
     assert.equal(res.statusCode, 200)
     const { data } = res.json() as { data: BackupTaskDetail }
-    assert.equal(data.nested?.[0].consistency?.consistency, 'snapshot')
-    assert.equal(data.nested?.[0].consistency?.target, 'mnttest')
+    assert.equal(data.nested, undefined)
+    // The same facts the detail used to carry now ride the progressive scan
+    // the detail window loads (backup2.3's "one endpoint serves both").
+    const preview = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/preview-nested',
+      headers: JSON_HEADERS,
+      payload: { archives: [{ name: 'pool', path: '/mnttest' }] },
+    })
+    const { data: pdata } = preview.json() as { data: { archives: Array<{ consistency?: { consistency: string, target?: string } }> } }
+    assert.equal(pdata.archives[0].consistency?.consistency, 'snapshot')
+    assert.equal(pdata.archives[0].consistency?.target, 'mnttest')
   })
 
   // ---- backup2.4: img archives -------------------------------------------
@@ -1183,7 +1235,7 @@ describe('backup routes (Epic 16)', () => {
   })
 
   it('preview-nested answers an img archive list the same way', async () => {
-    mockNestedWalk()
+    mockNestedWalk(10)
     const res = await server.inject({
       method: 'POST',
       url: '/v1/backup/tasks/preview-nested',
@@ -1209,16 +1261,24 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(data.archives[1].consistency?.relativePath, 'images/lun.raw')
   })
 
-  it('the task detail carries kind and consistency for an img archive', async () => {
+  it('the detail keeps the img kind; its consistency rides preview-nested', async () => {
     await createRepo()
     await createTaskPayload(IMG_TASK)
     const res = await server.inject({ method: 'GET', url: '/v1/backup/tasks/nightly-lun', headers: IDENTITY })
     assert.equal(res.statusCode, 200)
     const { data } = res.json() as { data: BackupTaskDetail }
     assert.equal(data.task.archives[0].kind, 'img')
-    assert.equal(data.nested?.[0].consistency?.consistency, 'snapshot')
-    assert.equal(data.nested?.[0].consistency?.zvolDevice, '/dev/zvol/mnttest/vol1')
-    assert.deepEqual(data.nested?.[0].nested, [])
+    assert.equal(data.nested, undefined)
+    const preview = await server.inject({
+      method: 'POST',
+      url: '/v1/backup/tasks/preview-nested',
+      headers: JSON_HEADERS,
+      payload: { archives: [{ name: 'lun0', path: '/dev/zvol/mnttest/vol1', kind: 'img' }] },
+    })
+    const { data: pdata } = preview.json() as { data: { archives: Array<{ consistency?: { consistency: string, zvolDevice?: string }, nested: unknown[] }> } }
+    assert.equal(pdata.archives[0].consistency?.consistency, 'snapshot')
+    assert.equal(pdata.archives[0].consistency?.zvolDevice, '/dev/zvol/mnttest/vol1')
+    assert.deepEqual(pdata.archives[0].nested, [])
   })
 
   it('a create with excludes on an img archive is a 400, not a silent drop', async () => {

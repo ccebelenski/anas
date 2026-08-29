@@ -133,6 +133,26 @@ describe('backup notifications — the body (16.12)', () => {
     assert.ok(body.includes('Backup succeeded, but the retention prune did not run: ENOENT'))
   })
 
+  it('a run whose ONLY finding is an uncovered nested filesystem is a success whose body carries the note', () => {
+    // The operator ruling (2026-08-28): an uncovered nested filesystem is the
+    // consequence of a deliberate includeNested choice — information, not a
+    // warning. It must not hold the run at completed-with-warnings or the
+    // notification at `warning`, but the body must still say it.
+    const notice = 'archive \'etc\': nested filesystem /etc/pve (pmxcfs) is NOT included - it is backed up as an empty directory'
+    const ctx = {
+      task: makeTask(),
+      repo: REPO,
+      result: { status: 'success', archives: [ARCHIVE_LINE], notices: [notice] },
+    }
+    assert.equal(backupNotifyOutcome(ctx), 'success')
+    const body = buildBackupNotifyBody(ctx)
+    assert.match(body, /Result:\s+success/)
+    assert.match(body, /Notes:/)
+    assert.ok(body.includes(notice), 'the notice line rides the body')
+    assert.ok(!body.includes('Warnings:'), 'no warnings block')
+    assert.match(backupNotifyTitle(ctx.task, 'success'), /succeeded/)
+  })
+
   it('the body names the filesystem boundaries the run actually crossed (backup2.2)', () => {
     // What `all` RESOLVED to is a per-run fact, so the mail states it rather
     // than leaving the reader to infer it from the task config.

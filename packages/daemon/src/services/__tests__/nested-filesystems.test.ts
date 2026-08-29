@@ -11,6 +11,7 @@ import {
   isZfsSnapshotMount,
   kindOfMount,
   mountIndex,
+  nestedRunNotices,
   nestedRunWarnings,
   normalizePath,
   parseSubvolumeShow,
@@ -552,36 +553,43 @@ describe('nested filesystems — resolving `all` into explicit --include-dev pat
   })
 })
 
-describe('nested filesystems — run warnings', () => {
-  it('one ASCII warning per EXCLUDED boundary, none for an included one', () => {
-    const lines = nestedRunWarnings([
+describe('nested filesystems — run warnings and notices', () => {
+  it('an EXCLUDED boundary is a notice (information), never a warning', () => {
+    const scans = [
       {
         archive: 'etc',
         path: '/etc',
         exists: true,
-        includeNested: 'none',
+        includeNested: 'none' as const,
         truncated: false,
         warnings: [],
         nested: [
-          { path: '/etc/pve', relativePath: 'pve', kind: 'pmxcfs', included: false },
-          { path: '/etc/other', relativePath: 'other', kind: 'local', included: true },
+          { path: '/etc/pve', relativePath: 'pve', kind: 'pmxcfs' as const, included: false },
+          { path: '/etc/other', relativePath: 'other', kind: 'local' as const, included: true },
         ],
       },
-    ])
-    assert.equal(lines.length, 1)
-    assert.match(lines[0], /archive 'etc'/)
-    assert.match(lines[0], /\/etc\/pve \(pmxcfs\)/)
-    assert.match(lines[0], /empty directory/)
+    ]
+    const notices = nestedRunNotices(scans)
+    assert.equal(notices.length, 1)
+    assert.match(notices[0], /archive 'etc'/)
+    assert.match(notices[0], /\/etc\/pve \(pmxcfs\)/)
+    assert.match(notices[0], /empty directory/)
     // The notification body is plain ASCII (16.12's rule).
-    assert.ok(/^[\x20-\x7E]*$/.test(lines[0]), lines[0])
+    assert.ok(/^[\x20-\x7E]*$/.test(notices[0]), notices[0])
+    // A deliberate choice is information: the same scan yields NO warning.
+    assert.deepEqual(nestedRunWarnings(scans), [])
   })
 
-  it('a truncated scan adds its own honest line', () => {
+  it('a truncated scan is still a warning — an incomplete list is real uncertainty', () => {
     const lines = nestedRunWarnings([
       { archive: 'big', path: '/big', exists: true, includeNested: 'none', truncated: true, warnings: [], nested: [] },
     ])
     assert.equal(lines.length, 1)
     assert.match(lines[0], /incomplete/)
+    // …and it is NOT also a notice.
+    assert.deepEqual(nestedRunNotices([
+      { archive: 'big', path: '/big', exists: true, includeNested: 'none', truncated: true, warnings: [], nested: [] },
+    ]), [])
   })
 })
 
@@ -759,5 +767,53 @@ describe('nested filesystems — a DEAD remote mount does not cost the whole sca
     const scan = await scanNestedFilesystems(ex, '/gtbackup')
     assert.equal(scan.truncated, false)
     assert.equal(walkCalls(ex).length, 1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  A source ROOTED on a remote mount (the archive path IS the remote mount, or
+//  a subpath of it) is never walked at all: the walk is a local `st_dev` walk,
+//  and such a source would run entirely over the network until the wall-clock
+//  cap — which is what took the task-detail endpoint past the gateway's forward
+//  timeout. The mount table already names the root; the consistency derivation
+//  reads it as remote from the same table. The scan ends there.
+// ---------------------------------------------------------------------------
+describe('nested filesystems — a REMOTE-ROOTED source is never walked', () => {
+  const STAT = 'stat'
+  const REMOTE_ROOTED = JSON.stringify({
+    filesystems: [
+      { target: '/mnt/nas/share', source: 'nas:/share', fstype: 'cifs', options: 'rw' },
+    ],
+  })
+
+  it('a findmnt table where the root ITSELF is a cifs mount: only findmnt runs', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: FINDMNT, args: ['--json'], result: ok(REMOTE_ROOTED) })
+    const scan = await scanNestedFilesystems(ex, '/mnt/nas/share')
+
+    assert.deepEqual(scan.nested, [])
+    assert.equal(scan.truncated, false)
+    assert.deepEqual(scan.warnings, [])
+    // findmnt ONLY — no `find`, no `stat`, nothing under the remote root touched.
+    assert.equal(ex.calls.length, 1)
+    assert.equal(ex.calls[0].command, FINDMNT)
+    assert.ok(!ex.calls.some(c => c.command === FIND))
+    assert.ok(!ex.calls.some(c => c.command === TIMEOUT || c.command.endsWith('/stat') || c.command === STAT))
+  })
+
+  it('a source that is a SUBPATH of a remote mount short-circuits the same way', async () => {
+    const ex = new MockExecutor()
+    ex.addFixture({ command: FINDMNT, args: ['--json'], result: ok(REMOTE_ROOTED) })
+    const scan = await scanNestedFilesystems(ex, '/mnt/nas/share/photos')
+    assert.deepEqual(scan.nested, [])
+    assert.equal(scan.truncated, false)
+    assert.equal(ex.calls.length, 1, 'the walk never runs')
+  })
+
+  it('a source on a LOCAL mount still walks — the short-circuit is remote-only', async () => {
+    const ex = makeExecutor(ok('46\t/gtbackup\n49\t/gtbackup/cdm\n'))
+    const scan = await scanNestedFilesystems(ex, '/gtbackup')
+    assert.equal(scan.nested.length, 1, 'the real node capture still walks')
+    assert.ok(walkCalls(ex).length >= 1)
   })
 })

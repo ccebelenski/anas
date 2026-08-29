@@ -383,7 +383,7 @@ const Ext = {
   Date: { format: d => String(d) },
   Msg: {
     confirm(title, msg, fn) { confirms.push({ title, msg }); if (fn) { fn('yes') } },
-    alert() {},
+    alert(title, msg) { alerts.push({ title, msg }) },
   },
   // PVE's own /nodes/<node>/network, which the portal picker reads (the same
   // endpoint the SMB "how to connect" strings use). `ajax.responses` lets a
@@ -436,6 +436,11 @@ const jobs = []
 const confirms = []
 /** Every GET the UI issued, with its query — the read-contract record. */
 const apiGets = []
+/** Every toast the UI raised (message) — the run-completion channel. */
+const toasts = []
+/** Every Ext.Msg.alert the UI opened (title + message) — a MODAL. A check
+ * asserting "no modal" counts these; a confirmAndRun confirm is NOT one. */
+const alerts = []
 
 /** The real autofill opt-out from 00-core.js — every credential dialog
  * references it while building its fields, so the fake must mirror it. */
@@ -461,7 +466,7 @@ function makeAnas(routes) {
     enc: s => String(s == null ? '' : s),
     warn(m) { warnings.push(m) },
     errText: e => String((e && e.message) || e),
-    toast() {},
+    toast(m) { toasts.push(m) },
     // The real save gate from 10-api.js — the iSCSI target dialog blocks Save
     // on it (a create with zero ACLs), so the stub mirrors its state machine:
     // state on the window, reason() the first live block, refresh() mirrored
@@ -502,7 +507,14 @@ function makeAnas(routes) {
     // The real 00-core.js helper (this stub stands in for it) — every tbar is
     // a toolbar config object, and build() materialises its items.
     tbar: items => ({ xtype: 'toolbar', items }),
-    warningsHtml: () => '',
+    // The real 00-core.js helper: a `<ul><li>` per line. Rendered for real
+    // here (not '') so a check can assert WHICH lines ride an alert or a
+    // detail block — a stub that swallows the list would prove nothing about
+    // the content.
+    warningsHtml(lines) {
+      const list = Array.isArray(lines) ? lines : [lines]
+      return '<ul>' + list.map(l => `<li>${String(l == null ? '' : l)}</li>`).join('') + '</ul>'
+    },
     renderState: s => String(s),
     notifyMode: {
       of(value, dflt) {
@@ -545,7 +557,10 @@ function makeAnas(routes) {
       },
     },
     runJob(cfg) {
-      jobs.push({ method: cfg.method, path: cfg.path, body: cfg.body })
+      // The handler is kept on the record: a check can complete the job with a
+      // RESULT of its own choosing (the auto-call below simulates the default
+      // "finished, nothing to report").
+      jobs.push({ method: cfg.method, path: cfg.path, body: cfg.body, onComplete: cfg.onComplete })
       if (cfg.onComplete) { cfg.onComplete({}) }
     },
     // A confirm-gated mutation. The real one only shows its window after the
@@ -663,6 +678,9 @@ const NESTED_BY_PATH = {
   '/srv': [{ path: '/srv/nfs', relativePath: 'nfs', kind: 'nfs', fstype: 'nfs4' }],
 }
 
+/** The daemon's own run-NOTICE line (backup2 fix-ups) — the product-level shape. */
+const RUN_NOTICE = "archive 'etc': nested filesystem /etc/pve (pmxcfs) is NOT included - it is backed up as an empty directory"
+
 /**
  * backup2.3 — the DERIVED consistency the daemon attaches to the SAME scan.
  * READ-ONLY: it appears in the response, never in a request body. `/mnt/pictures`
@@ -725,28 +743,63 @@ const LUN_SOURCES = [
   },
 ]
 
-/** Every preview-nested body the dialog sent (the endpoint must be user-driven). */
+/**
+ * Every preview-nested body sent (the endpoint must be user-driven). Two
+ * shapes are user-driven: the wizard's boundary check (the `path:` form), and
+ * the Details window OPENING — the operator's action — which loads the task's
+ * boundary scan progressively (the `archives:` form, one entry per archive).
+ */
 const nestedPreviews = []
 
-function nestedPreviewRoute(body) {
-  nestedPreviews.push(body)
-  const choice = (body && body.includeNested) || 'none'
-  const found = NESTED_BY_PATH[body && body.path] || []
-  const covers = p => choice === 'all' || (Array.isArray(choice) && choice.indexOf(p) >= 0)
-  const consistency = CONSISTENCY_BY_PATH[body && body.path]
-  return {
-    data: {
-      archives: [{
-        path: body && body.path,
+/**
+ * The preview-nested answer for a body — the wizard's single-path form, or the
+ * Details window's per-archive form (one scan per requested archive,
+ * index-aligned, an `img` answered "no boundaries" exactly like the daemon's
+ * `scanArchives`). Both forms answer `exists: true` here: this is a route
+ * mock of the success path, not a missing-path fixture.
+ */
+function nestedPreviewResponse(body) {
+  const scan = (path, choice, kind) => {
+    const consistency = CONSISTENCY_BY_PATH[path]
+    if (kind === 'img') {
+      // The daemon skips the walk entirely for an img source.
+      return {
+        path,
         exists: true,
-        includeNested: choice,
-        nested: found.map(n => ({ ...n, included: covers(n.path) })),
+        includeNested: 'none',
+        nested: [],
         truncated: false,
         warnings: [],
         ...(consistency ? { consistency } : {}),
-      }],
+      }
+    }
+    const found = NESTED_BY_PATH[path] || []
+    const covers = p => choice === 'all' || (Array.isArray(choice) && choice.indexOf(p) >= 0)
+    return {
+      path,
+      exists: true,
+      includeNested: choice,
+      nested: found.map(n => ({ ...n, included: covers(n.path) })),
+      truncated: false,
+      warnings: [],
+      ...(consistency ? { consistency } : {}),
+    }
+  }
+  const archives = (body && body.archives) || []
+  return {
+    data: {
+      archives: archives.length
+        ? archives.map(a => (a.name
+          ? { archive: a.name, ...scan(a.path, a.includeNested || 'none', a.kind) }
+          : scan(a.path, a.includeNested || 'none', a.kind)))
+        : [scan(body && body.path, (body && body.includeNested) || 'none', body && body.kind)],
     },
   }
+}
+
+function nestedPreviewRoute(body) {
+  nestedPreviews.push(body)
+  return nestedPreviewResponse(body)
 }
 
 /**
@@ -5144,14 +5197,20 @@ const FILE_RESTORE_SNAPSHOTS = {
 
 const FILE_RESTORE_ROUTES = {
   ...PICKER_ROUTES,
-  'GET /backup/tasks/nightly-pictures': {
+  // A FUNCTION route: the detail window stores `res.data` on itself and the
+  // progressive scan later writes `nested` onto it — a shared constant object
+  // would leak that state into every later detail GET in the harness.
+  'GET /backup/tasks/nightly-pictures': () => ({
     data: {
       task: TASK,
       unit: '',
       timer: '',
       recentRuns: [],
+      // The last run carried a notice (backup2 fix-ups): the run's toast
+      // pointed at THIS window for it, so the detail must show it.
+      lastRunNotices: [RUN_NOTICE],
     },
-  },
+  }),
   'GET /backup/tasks/nightly-pictures/snapshots': FILE_RESTORE_SNAPSHOTS,
   'GET /backup/repos/pbs-main/groups': {
     data: {
@@ -5873,6 +5932,147 @@ async function restoreDoorChecks() {
 
   ok('file restore: nothing warned in the doors', warnings.length === 0, warnings.join(' | '))
 }
+// ============================================================================
+//  5e. backup2 fix-ups — the Details window loads the boundary scan
+//      progressively (the detail GET is instant; preview-nested follows)
+// ============================================================================
+
+async function detailNestedScanChecks() {
+  const ANAS = loadRestoreSources()
+  // The preview-nested answer is DEFERRED: the window must paint its spinner
+  // before the scan lands, so the check resolves (and later rejects) it by
+  // hand. Everything else the detail flow asks for keeps the usual routes.
+  let previewDeferred = null
+  const basePost = ANAS.api.post
+  ANAS.api.post = (node, path, body) => (path === '/backup/tasks/preview-nested'
+    ? (nestedPreviews.push(body), new Promise((resolve, reject) => { previewDeferred = { resolve, reject } }))
+    : basePost(node, path, body))
+
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+
+  grid.selectRow(0)
+  created.windows.length = 0
+  grid.down('#backupDetails').handler(grid.down('#backupDetails'))
+  await settle()
+  const detail = openWindow()
+  ok('detail scan: the detail window opened', detail && detail.cls === 'anas-win-backup-detail')
+  const body = detail && detail.down('#detailBody')
+
+  // (a) The detail GET already rendered — WITHOUT the scan: the files rows show
+  // their spinner, the rest of the detail is fully there.
+  const html = body && body.html
+  ok('detail scan: spinner while the scan is in flight',
+    !!html && html.includes('Scanning for nested filesystems'), html && html.slice(0, 300))
+  ok('detail scan: the spinner is the icon, not text alone', !!html && html.includes('fa-spin'))
+  ok('detail scan: the rest of the detail rendered without the scan',
+    !!html && html.includes('nightly-pictures') && html.includes('pbs-main'))
+
+  // The request IS the task's own archives, index-aligned, only defined keys
+  // (the `srv` archive never chose includeNested — the key must stay absent).
+  const sent = nestedPreviews[nestedPreviews.length - 1]
+  ok('detail scan: the preview request is the task`s archives',
+    !!sent && Array.isArray(sent.archives) && sent.archives.length === 4 && sent.path === undefined,
+    JSON.stringify(sent))
+  ok('detail scan: only the keys the schema accepts ride the request',
+    !!sent && sent.archives[0].name === 'pictures' && sent.archives[0].path === '/mnt/pictures'
+    && sent.archives[0].includeNested === 'all'
+    && sent.archives[2].path === '/srv' && sent.archives[2].includeNested === undefined
+    && sent.archives[3].kind === 'img' && sent.archives[3].includeNested === undefined,
+    JSON.stringify(sent && sent.archives))
+
+  // (b) The scan lands: the nested lines render from it, the spinner is gone.
+  previewDeferred.resolve(nestedPreviewResponse(sent))
+  await settle()
+  const html2 = body && body.html
+  ok('detail scan: the scan`s boundaries render once it lands',
+    !!html2 && html2.includes('/mnt/pictures/raw') && html2.includes('/etc/pve') && html2.includes('/srv/nfs'))
+  ok('detail scan: the spinner is gone after the scan lands', !!html2 && !html2.includes('Scanning for nested filesystems'))
+  ok('detail scan: included vs empty-directory is stated per boundary',
+    !!html2 && html2.includes('included') && html2.includes('stored as an empty directory'))
+  ok('detail scan: the derived consistency rides the same scan', !!html2 && html2.includes('snapshot'))
+  // The last run's notice is findable HERE — the run's notes-only toast points
+  // the operator to this window, so the pointer must land on something.
+  ok('detail scan: the last run`s notes render muted on the detail',
+    !!html2 && html2.includes('Notes: <ul>') && html2.includes(RUN_NOTICE))
+
+  // (c) A preview that REFUSES (second window, second request): the rows say
+  // "unavailable" and the rest of the detail stays exactly as it is.
+  grid.selectRow(0)
+  created.windows.length = 0
+  grid.down('#backupDetails').handler(grid.down('#backupDetails'))
+  await settle()
+  const detail2 = openWindow()
+  const body2 = detail2 && detail2.down('#detailBody')
+  const sent2 = nestedPreviews[nestedPreviews.length - 1]
+  ok('detail scan: a second open requests the scan again', !!sent2 && Array.isArray(sent2.archives))
+  previewDeferred.reject(new Error('the scan could not run'))
+  await settle()
+  const html3 = body2 && body2.html
+  ok('detail scan: a failed scan says unavailable on the archive rows',
+    !!html3 && html3.includes('Nested-filesystem scan unavailable') && html3.includes('the scan could not run'))
+  ok('detail scan: the rest of the detail survives a failed scan',
+    !!html3 && html3.includes('nightly-pictures') && html3.includes('pbs-main'))
+  ok('detail scan: the spinner is gone after a failure too', !!html3 && !html3.includes('Scanning for nested filesystems'))
+  ok('detail scan: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  5f. backup2 fix-ups — the run's completion: notices are INFORMATION,
+//      never a second modal
+// ============================================================================
+
+async function runNotesChecks() {
+  const ANAS = loadRestoreSources()
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+
+  // (a) Warnings + notes: ONE alert, the notes riding inside it (muted, headed
+  // "Notes") — a second modal for information is wrong.
+  ANAS.backup.runTaskNow('harness', 'nightly-pictures', view)
+  const run1 = jobs[jobs.length - 1]
+  ok('run notes: the run posts the task`s own /run',
+    !!run1 && run1.path === '/backup/tasks/nightly-pictures/run', run1 && run1.path)
+  toasts.length = 0
+  alerts.length = 0
+  run1.onComplete({ result: { warnings: ['the retention prune did not run: ENOENT'], notices: [RUN_NOTICE] } })
+  await settle()
+  ok('run notes: warnings + notes is ONE alert', alerts.length === 1, `${alerts.length}`)
+  ok('run notes: the alert keeps the warning title',
+    alerts[0] && alerts[0].title === 'Backup finished with a warning', alerts[0] && alerts[0].title)
+  ok('run notes: the warning line still rides it',
+    alerts[0] && alerts[0].msg.includes('the retention prune did not run: ENOENT'))
+  ok('run notes: the notes ride INSIDE it, headed Notes',
+    alerts[0] && alerts[0].msg.includes('Notes') && alerts[0].msg.includes(RUN_NOTICE),
+    alerts[0] && alerts[0].msg)
+
+  // (b) Notes WITHOUT warnings: no modal at all — the toast counts them and
+  // points at the task's Details (where they render).
+  ANAS.backup.runTaskNow('harness', 'nightly-pictures', view)
+  const run2 = jobs[jobs.length - 1]
+  toasts.length = 0
+  alerts.length = 0
+  run2.onComplete({ result: { notices: [RUN_NOTICE, 'archive \'srv\': nested filesystem /srv/nfs (nfs) is NOT included - it is backed up as an empty directory'] } })
+  await settle()
+  ok('run notes: notes without warnings open NO modal', alerts.length === 0, `${alerts.length}`)
+  ok('run notes: the toast counts the notes and points at the detail',
+    toasts.length === 1 && toasts[0].includes('2 notes, see the task'), toasts.join(' | '))
+
+  // (c) One note reads singular.
+  ANAS.backup.runTaskNow('harness', 'nightly-pictures', view)
+  const run3 = jobs[jobs.length - 1]
+  toasts.length = 0
+  alerts.length = 0
+  run3.onComplete({ result: { notices: [RUN_NOTICE] } })
+  await settle()
+  ok('run notes: a single note reads singular',
+    toasts.length === 1 && toasts[0].includes('1 note, see the task'), toasts.join(' | '))
+  ok('run notes: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
@@ -5946,6 +6146,11 @@ await restoreChecks()
 warnings.length = 0
 created.windows.length = 0
 await restoreDoorChecks()
+warnings.length = 0
+created.windows.length = 0
+await detailNestedScanChecks()
+warnings.length = 0
+await runNotesChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

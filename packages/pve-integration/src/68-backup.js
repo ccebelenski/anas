@@ -1882,8 +1882,17 @@
         return null;
     }
 
-    /** The per-archive nested summary line for the detail window (backup2.2). */
-    function nestedDetailHtml(archive, scan) {
+    /**
+     * The per-archive nested summary line for the detail window (backup2.2).
+     *
+     * `pending` / `errText` (backup2 fix-ups): the detail no longer carries the
+     * boundary scan — the window loads it progressively through
+     * preview-nested. While that request is in flight the row shows a spinner
+     * (muted), and if it fails a muted "unavailable" line with the error — the
+     * rest of the detail is never touched by either state. Image archives never
+     * pass these (an image has no boundaries; imageDetailHtml is unchanged).
+     */
+    function nestedDetailHtml(archive, scan, pending, errText) {
         var choice = nestedChoiceOf(archive);
         var label = choice === 'all'
             ? t('nested filesystems: all')
@@ -1903,6 +1912,21 @@
                 + '</div>';
         }
         out += '<div style="color:var(--anas-muted,gray);margin-top:2px;">' + enc(label) + '</div>';
+        // The progressive scan's two in-between states — in place of the nested
+        // list, muted: a spinner while preview-nested is in flight, and the
+        // honest error if it does not come back. The label above (the task's
+        // own choice) stays, because it is a fact about the task, not the scan.
+        if (pending) {
+            if (errText) {
+                out += '<div style="color:var(--anas-muted,gray);margin-top:3px;">'
+                    + enc(t('Nested-filesystem scan unavailable') + ': ' + errText) + '</div>';
+            } else {
+                out += '<div style="color:var(--anas-muted,gray);margin-top:3px;">'
+                    + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
+                    + enc(t('Scanning for nested filesystems…')) + '</div>';
+            }
+            return out;
+        }
         if (!scan) {
             return out;
         }
@@ -1961,7 +1985,13 @@
         return out;
     }
 
-    function archivesBlock(task, scans) {
+    /**
+     * The archives block's content — the title plus the per-archive table. ONE
+     * renderer for the block at every stage of the progressive scan (spinner,
+     * filled, failed), so the window re-rendering it alone cannot drift from
+     * the first paint. `pending`/`errText` reach the files-kind rows only.
+     */
+    function archivesInnerHtml(task, scans, pending, errText) {
         var archives = archivesOf(task);
         if (!archives.length) {
             return '<div style="margin-top:10px;color:var(--anas-muted,gray);font-size:0.9em;">'
@@ -1985,11 +2015,23 @@
                 + '<td style="padding:3px 0;">' + mono(a.path) + excl
                 + (img
                     ? imageDetailHtml(a, nestedScanFor(scans, a))
-                    : nestedDetailHtml(a, nestedScanFor(scans, a)))
+                    : nestedDetailHtml(a, nestedScanFor(scans, a), pending, errText))
                 + '</td></tr>';
         }
         html += '</table></div>';
         return html;
+    }
+
+    /**
+     * The archives block in the detail window, inside its STABLE wrapper. The
+     * detail GET is instant (no scan in it), so the window re-renders this
+     * block alone when the progressive preview-nested scan lands or fails —
+     * the wrapper id is the handle that keeps the rest of the detail (units,
+     * journald) untouched.
+     */
+    function archivesBlock(task, scans, pending, errText) {
+        return '<div id="anas-backup-detail-archives">'
+            + archivesInnerHtml(task, scans, pending, errText) + '</div>';
     }
 
     // ---- Last run: snapshots + expansion (backup2.3) -----------------------
@@ -2207,7 +2249,7 @@
             + enc(t('— delivered by the Proxmox notification system (type anas-backup)')) + '</span>';
     }
 
-    function taskDetailHtml(d) {
+    function taskDetailHtml(d, pending, errText) {
         if (!d) {
             return '<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
                 + enc(t('No detail returned for this task.')) + '</div>';
@@ -2248,7 +2290,18 @@
 
         var html = '<div style="padding:10px 14px;">'
             + '<table style="border-collapse:collapse;width:100%;">' + rows + '</table>';
-        html += archivesBlock(task, d.nested);
+        // The last run's NOTES (backup2 fix-ups): the run's completion toast
+        // points the operator here when it did not open a modal (notes without
+        // warnings), so they must be findable on this window. Muted — they are
+        // information about a deliberate choice, never a warning.
+        var runNotices = isArray(d.lastRunNotices) ? d.lastRunNotices : [];
+        if (runNotices.length) {
+            html += '<div style="margin-top:8px;color:var(--anas-muted,gray);">'
+                + enc(t('Notes')) + ': ' + ANAS.warningsHtml(runNotices) + '</div>';
+        }
+        // `pending`/`errText` are the progressive scan's states (the detail GET
+        // itself no longer carries the boundary scan — see loadDetailInto).
+        html += archivesBlock(task, d.nested, pending, errText);
         // The unit + timer, verbatim — config-is-the-API transparency (Principle 13).
         html += unitBlock(t('systemd service unit (as written)'), first(d.unit, d.serviceUnit));
         html += unitBlock(t('systemd timer (as written)'), first(d.timer, d.timerUnit));
@@ -2259,8 +2312,123 @@
         return html;
     }
 
-    // Fetch GET /backup/tasks/:name and render it into the detail window's body.
-    // Called on open and by the window's Reload button — no polling.
+    // Does this detail still need its boundary scan loaded? The detail GET no
+    // longer carries it (it is instant by design), so the answer is: the task
+    // has at least one FILES archive (an image has no boundaries — it never
+    // shows the spinner), and the detail did not already arrive with scans (an
+    // older daemon that predates the split still serves them in the detail —
+    // render those, do not re-fetch).
+    function detailNeedsNestedScan(detail) {
+        if (!detail) {
+            return false;
+        }
+        if (isArray(detail.nested)) {
+            return false;
+        }
+        var archives = archivesOf(detail.task || detail);
+        for (var i = 0; i < archives.length; i++) {
+            if (archiveKindOf(archives[i]) !== 'img') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Re-render ONLY the archives block of an open detail window, from the
+    // window's stored detail. `errText` set = the scan failed (the muted
+    // "unavailable" line replaces the spinners); absent = the scan landed
+    // (win._detail.nested holds it). The stable wrapper keeps the rest of the
+    // detail — units, journald, the PBS link — untouched; where the wrapper
+    // cannot be reached the whole body is re-rendered from the same stored
+    // detail (one renderer, no drift).
+    function redrawDetailArchives(win, body, errText) {
+        var detail = win && win._detail;
+        if (!detail || !body || body.destroyed || body.destroying) {
+            return;
+        }
+        var task = detail.task || detail;
+        // The scan has LANDED either way (its data is on the stored detail when
+        // it succeeded): the only "pending" here is the failed one, where the
+        // muted error line takes the spinners' place.
+        var failed = errText !== undefined && errText !== null;
+        var el = body.getEl && body.getEl();
+        var dom = el && el.dom;
+        if (dom && dom.querySelector) {
+            var wrap = dom.querySelector('#anas-backup-detail-archives');
+            if (wrap) {
+                wrap.innerHTML = archivesInnerHtml(task, detail.nested, failed, errText);
+                return;
+            }
+        }
+        try {
+            body.update(taskDetailHtml(detail, failed, errText));
+        } catch (e) {
+            ANAS.warn('backup detail archives re-render failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // STAGE 2 of the detail: the boundary scan the window loads progressively
+    // through preview-nested, on the SAME node. The detail GET is instant on
+    // purpose — a scan in it is what hung a source rooted on a remote mount
+    // until the gateway's 15 s forward tore the request down; the scan's own
+    // 10 s budget (daemon-side) fits under that forward. The request body is
+    // the task's archives, only the keys the endpoint's schema accepts. Every
+    // callback is guarded exactly like loadDetailInto's: a closed window must
+    // not be written to. The endpoint is archive-shaped (the task's own
+    // archives are the request body), so the task name plays no part in it.
+    function loadDetailNested(win, node) {
+        var detail = win && win._detail;
+        if (!detail || !detailNeedsNestedScan(detail)) {
+            return;
+        }
+        var body = win.down('#detailBody');
+        if (!body) {
+            return;
+        }
+        var task = detail.task || detail;
+        var archives = archivesOf(task);
+        var reqArchives = [];
+        for (var i = 0; i < archives.length; i++) {
+            var a = archives[i] || {};
+            var entry = {};
+            if (a.name) {
+                entry.name = a.name;
+            }
+            entry.path = a.path;
+            if (a.includeNested !== undefined && a.includeNested !== null) {
+                entry.includeNested = a.includeNested;
+            }
+            if (a.kind) {
+                entry.kind = a.kind;
+            }
+            reqArchives.push(entry);
+        }
+        ANAS.api.post(node, '/backup/tasks/preview-nested', { archives: reqArchives }).then(function (res) {
+            if (!win || win.destroyed || win.destroying) {
+                return;
+            }
+            var scans = res && res.data && isArray(res.data.archives) ? res.data.archives : null;
+            if (!scans) {
+                return;
+            }
+            // The scan lands on the stored detail — the Restore door and any
+            // later reload read it from there — and only the block re-renders.
+            win._detail.nested = scans;
+            redrawDetailArchives(win, body);
+        }, function (err) {
+            if (!win || win.destroyed || win.destroying) {
+                return;
+            }
+            // The scan is unavailable: say so on the archive rows (muted) and
+            // leave the rest of the detail exactly as it is.
+            redrawDetailArchives(win, body, ANAS.errText(err));
+        });
+    }
+
+    // Fetch GET /backup/tasks/:name and render it into the detail window's
+    // body (STAGE 1 — instant: the boundary scan is not part of it). STAGE 2
+    // (the scan itself) follows through preview-nested. Called on open and by
+    // the window's Reload button — which repeats BOTH stages. No polling.
     function loadDetailInto(win, node, name) {
         if (!win || win.destroyed || win.destroying) {
             return;
@@ -2281,7 +2449,9 @@
             // where each archive's live home is.
             win._detail = (res && res.data) || null;
             try {
-                body.update(taskDetailHtml(res && res.data));
+                // While stage 2 is about to start, the files rows show their
+                // spinner instead of a nested list.
+                body.update(taskDetailHtml(res && res.data, detailNeedsNestedScan(res && res.data)));
             } catch (e) {
                 ANAS.warn('backup detail render failed: ' + ANAS.errText(e));
             }
@@ -2293,6 +2463,7 @@
             } catch (e2) {
                 // non-fatal
             }
+            loadDetailNested(win, node);
         }, function (err) {
             if (body.destroyed || body.destroying) {
                 return;
@@ -4177,6 +4348,7 @@
                 // on a COMPLETED job — surface it, never as a failure.
                 var msg = t('Backup finished') + ': ' + name;
                 var warnings = [];
+                var notices = [];
                 try {
                     var result = (job && job.result) || {};
                     if (result.prune) {
@@ -4187,13 +4359,35 @@
                     if (isArray(result.warnings)) {
                         warnings = result.warnings;
                     }
+                    // backup2 fix-ups — nested filesystems the task's choice does
+                    // not cover are NOTES, not warnings: they never change the
+                    // run's status (the 2026-08-28 ruling: it is information).
+                    if (isArray(result.notices)) {
+                        notices = result.notices;
+                    }
                 } catch (e) {
                     // best-effort summary
+                }
+                // Notes WITHOUT warnings: no modal at all — a second popup for
+                // information is wrong. The toast says where they can be read.
+                if (notices.length && !warnings.length) {
+                    msg += ' — ' + notices.length + ' '
+                        + (notices.length === 1 ? t('note') : t('notes'))
+                        + ', ' + t('see the task\'s Details');
                 }
                 ANAS.toast(msg);
                 if (warnings.length) {
                     try {
-                        Ext.Msg.alert(t('Backup finished with a warning'), ANAS.warningsHtml(warnings));
+                        var alertBody = ANAS.warningsHtml(warnings);
+                        // The notes ride the ONE warning alert as a muted
+                        // section — still shown, never a second modal.
+                        if (notices.length) {
+                            alertBody += '<div style="color:var(--anas-muted,gray);margin-top:8px;">'
+                                + enc(t('Notes')) + '</div>'
+                                + '<div style="color:var(--anas-muted,gray);">'
+                                + ANAS.warningsHtml(notices) + '</div>';
+                        }
+                        Ext.Msg.alert(t('Backup finished with a warning'), alertBody);
                     } catch (eMsg) {
                         ANAS.warn(warnings.join(' '));
                     }

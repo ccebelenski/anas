@@ -147,6 +147,7 @@ export function createServer(opts: ServerOptions = {}) {
       pvePort: config.pvePort,
       clusterCa: config.clusterCa,
       membersPath: config.membersPath,
+      ...(config.forwardTimeoutMs !== undefined ? { timeoutMs: config.forwardTimeoutMs } : {}),
     })
   })
 

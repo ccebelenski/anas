@@ -25,6 +25,9 @@ writeFileSync(MEMBERS_PATH, JSON.stringify({
   nodelist: {
     '127.0.0.1': { id: 2, online: 1, ip: '127.0.0.1' },
     'peer1': { id: 3, online: 1, ip: '127.0.0.1' },
+    // A "member" that resolves to a reserved, non-routable address (TEST-NET-1):
+    // the TCP connect can never complete — the firewalled/black-holed peer.
+    'blackhole': { id: 4, online: 1, ip: '192.0.2.1' },
   },
 }))
 
@@ -589,6 +592,67 @@ describe('cross-node forwarding over :8006/anas (real TLS, cluster CA)', () => {
 
     await server.close()
     await new Promise<void>(resolve => peer.close(() => resolve()))
+  })
+
+  it('a peer that CONNECTS but never answers yields 504 GATEWAY_TIMEOUT — "timed out", not "unreachable"', async () => {
+    // The peer terminates TLS and accepts the request, then stays silent: the
+    // forward's socket is open, so this is a SLOW/HUNG operation on a reachable
+    // node — NOT a connection failure. It must read that way, or the operator
+    // chases a dead node that is fine. A short forwardTimeoutMs keeps the test
+    // off the real 15 s wait; the PATH is what is under test.
+    const peer = createHttpsServer({ cert, key }, (_req, _res) => {
+      // Deliberately no response: hold the connection open and answer nothing.
+    })
+    await new Promise<void>(resolve => peer.listen(0, '127.0.0.1', resolve))
+    const peerPort = (peer.address() as AddressInfo).port
+
+    const server = createServer({
+      config: baseConfig({ clusterCa: certPath, pvePort: peerPort, forwardTimeoutMs: 250 }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/nodes/peer1/v1/pools',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+
+    assert.equal(res.statusCode, 504)
+    const body = res.json()
+    assert.equal(body.error.code, 'GATEWAY_TIMEOUT')
+    // The wording says timed-out and names the reachable node; it must NOT read
+    // as a dead node.
+    assert.match(body.error.message, /timed out/i)
+    assert.match(body.error.message, /reachable/i)
+    assert.ok(!/unreachable/i.test(body.error.message), body.error.message)
+
+    await server.close()
+    await new Promise<void>(resolve => peer.close(() => resolve()))
+  })
+
+  it('a peer that never even CONNECTS stays 502 NODE_UNREACHABLE — a connect timeout is not "reachable"', async () => {
+    // The firewalled/black-holed peer: the SYN is dropped, so the forward's
+    // timeout fires while the connection is STILL PENDING. The 504 wording
+    // ("the node is reachable") would be a lie here — no connection was ever
+    // made — so this keeps the 502. 192.0.2.1 (TEST-NET-1) is reserved and
+    // non-routable: the connect simply hangs until the (short) forward timeout.
+    const server = createServer({
+      config: baseConfig({ clusterCa: certPath, pvePort: 8006, forwardTimeoutMs: 300 }),
+      authProvider: new AcceptAuthProvider(),
+      logger: false,
+    })
+    const res = await server.inject({
+      method: 'GET',
+      url: '/api/nodes/blackhole/v1/pools',
+      headers: { cookie: 'PVEAuthCookie=x' },
+    })
+
+    assert.equal(res.statusCode, 502)
+    const body = res.json()
+    assert.equal(body.error.code, 'NODE_UNREACHABLE')
+    assert.match(body.error.message, /unreachable/i)
+
+    await server.close()
   })
 })
 

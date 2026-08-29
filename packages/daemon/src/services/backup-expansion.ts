@@ -28,8 +28,9 @@ import { isUnwalkableKind, normalizePath, relativeTo } from './nested-filesystem
  * So one configured archive becomes N+1 archives at run time: the root, plus one
  * per nested filesystem the backup2.2 scan reports as INCLUDED. `includeNested`
  * still decides WHICH children are included — `none` yields the root archive
- * alone (with backup2.2's existing "stored as an empty directory" warnings),
- * `all` / a path list yields the expansion.
+ * alone (with backup2.2's "stored as an empty directory" notices — information,
+ * not warnings, since the choice was deliberate), `all` / a path list yields
+ * the expansion.
  *
  * TWO INVARIANTS THAT ARE NOT NEGOTIABLE:
  *

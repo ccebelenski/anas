@@ -80,6 +80,19 @@ const TIMEOUT = '/usr/bin/timeout'
 export const DEFAULT_NESTED_MAX_DEPTH = 12
 /** Default wall-clock budget (seconds) for the walk, enforced by `timeout`. */
 export const DEFAULT_NESTED_TIMEOUT_S = 20
+/**
+ * The wall-clock budget for the INTERACTIVE boundary scan — the one the task
+ * detail window (and the wizard) ride through the gateway's cross-node forward.
+ *
+ * It MUST fit under the gateway's `FORWARD_TIMEOUT_MS` (15 s), because the
+ * detail request forwards to the owning node and a forward that exceeds 15 s
+ * is torn down with a 504 before the daemon's own answer ever lands. 10 s
+ * leaves headroom for TLS + the forward hop + the daemon's own startup, so a
+ * scan that would run long reports `truncated` inside the budget instead of the
+ * request dying as a false "node unreachable". The run-start scan keeps its
+ * own, larger, {@link DEFAULT_NESTED_TIMEOUT_S} budget — it is not a forward.
+ */
+export const NESTED_SCAN_PREVIEW_TIMEOUT_S = 10
 /** `timeout` exits 124 when it had to kill the child. */
 const TIMEOUT_EXIT = 124
 /** One `find -printf '%D\t%p\n'` row. */
@@ -285,7 +298,9 @@ export function parseSubvolumeShow(stdout: string): { name?: string, id?: number
  *
  * Order of operations, and why:
  *   1. `findmnt --json` — the mount table. It reads `/proc/self/mountinfo`, so
- *      it is the ONE probe that can never hang (Epic 18's rule).
+ *      it is the ONE probe that can never hang (Epic 18's rule). If the source
+ *      ROOT ITSELF sits on a remote mount, that row IS the answer and the scan
+ *      ends there (a walk of a remote-rooted source would run over the network).
  *   2. Build the prune list from it: remote mounts and armed automounts are
  *      recorded from the table and never touched by the walk.
  *   3. `timeout N find -P … -xdev -type d -printf '%D\t%p\n'` — the bounded
@@ -333,6 +348,19 @@ export async function scanNestedFilesystems(
   catch (err) {
     warnings.push(`could not read the mount table: ${errText(err)} — nested filesystems are named as 'unknown'`)
   }
+
+  // 1b. A source ROOTED on a remote mount is the whole answer: findmnt already
+  // names the root itself, and there is nothing under it to walk. The walk is a
+  // LOCAL `st_dev` walk — a source whose root is a CIFS/NFS mount (the archive
+  // path IS the remote mount, or a subpath of it) would run entirely over the
+  // network until the wall-clock cap. The consistency derivation already reads
+  // such a source as `live`/remote from this SAME mount table (backup-consistency
+  // reads the fstype, never the walk), so the scan owes the screens nothing here:
+  // return immediately — no walk, no probe, no stat, nothing under the remote
+  // root is ever touched.
+  const rootMount = mounts.get(nearestMountTarget(root, mounts))
+  if (rootMount && isProbeableKind(kindOfMount(rootMount)))
+    return finish(scan)
 
   // 2. Mounts the walk must never touch: remote filesystems (a dead server hangs
   // `stat` forever) and armed automounts (walking one triggers the mount). They
@@ -703,12 +731,23 @@ export function resolveNestedIncludes(
 }
 
 /**
- * The authoritative run warnings: one line per nested filesystem the archive's
- * choice will NOT cover. This is the primary signal (the client's own
- * `skipping mount point:` parse is the secondary one) — plain ASCII, because it
- * rides the 16.12 notification body verbatim.
+ * The run NOTICES: one line per nested filesystem the archive's choice does
+ * NOT cover — a nested filesystem stored as an empty directory.
+ *
+ * INFORMATION, not a warning (operator ruling 2026-08-28, revising the
+ * backup2.2 one): the choice was made in the wizard with this exact screen in
+ * front of the operator — a filesystem stored empty is the CONSEQUENCE of a
+ * deliberate choice, not a surprise. Riding it in `warnings` made every such
+ * run `completed with warnings` and held the 16.12 notification at `warning`
+ * forever. These lines still ride the record and the notification body (as
+ * notes), so the omission is never silent; they just stop changing the status
+ * or the level.
+ *
+ * This is the primary signal (the client's own `skipping mount point:` parse
+ * is the secondary one) — plain ASCII, because it rides the 16.12 notification
+ * body verbatim.
  */
-export function nestedRunWarnings(scans: BackupNestedScan[]): string[] {
+export function nestedRunNotices(scans: BackupNestedScan[]): string[] {
   const out: string[] = []
   for (const scan of scans) {
     for (const n of scan.nested) {
@@ -717,6 +756,19 @@ export function nestedRunWarnings(scans: BackupNestedScan[]): string[] {
       const who = scan.archive ? `archive '${scan.archive}'` : scan.path
       out.push(`${who}: nested filesystem ${n.path} (${n.kind}) is NOT included - it is backed up as an empty directory`)
     }
+  }
+  return out
+}
+
+/**
+ * The run warnings from the boundary scans: ONLY an incomplete scan. A scan
+ * that did not finish is a REAL uncertainty — the list of nested filesystems
+ * may be a floor — and it stays a warning. The "stored as an empty directory"
+ * lines are notices, not warnings (see {@link nestedRunNotices}).
+ */
+export function nestedRunWarnings(scans: BackupNestedScan[]): string[] {
+  const out: string[] = []
+  for (const scan of scans) {
     if (scan.truncated) {
       const who = scan.archive ? `archive '${scan.archive}'` : scan.path
       out.push(`${who}: the filesystem-boundary scan of ${scan.path} was incomplete - there may be more nested filesystems than listed`)

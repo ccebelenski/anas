@@ -129,7 +129,7 @@ import {
 } from '../services/iscsi-mutate.js'
 import { classifyBacking } from '../services/iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
-import { imageArchiveScan, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
+import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -798,17 +798,24 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // backup2.4 — an `img` source is a device or an image file: `scanArchives`
     // skips the walk for it entirely and answers "no boundaries", so the row
     // still gets its derived consistency without anything being stat'ed.
+    //
+    // This is the INTERACTIVE scan: it rides the gateway's 15 s cross-node
+    // forward, so it runs under the budget that fits under it
+    // (NESTED_SCAN_PREVIEW_TIMEOUT_S). The run-start scan keeps its own, larger
+    // budget — a backup is not a forward.
+    const previewBudget = { timeoutSeconds: NESTED_SCAN_PREVIEW_TIMEOUT_S }
     const archives: BackupNestedScan[] = req.archives?.length
       ? await scanArchives(executor, req.archives.map(a => ({
           ...(a.name ? { name: a.name } : {}),
           path: a.path,
           includeNested: effectiveIncludeNested(a),
           ...(effectiveArchiveKind(a) === 'img' ? { kind: 'img' as const } : {}),
-        })))
+        })), previewBudget)
       : effectiveArchiveKind(req) === 'img'
         ? [imageArchiveScan(undefined, req.path as string)]
         : [await scanNestedFilesystems(executor, req.path as string, {
             includeNested: effectiveIncludeNested({ includeNested: req.includeNested ?? 'none' }),
+            ...previewBudget,
           })]
 
     // backup2.3 — the DERIVED consistency rides the SAME response rather than a
@@ -921,26 +928,34 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'NOT_FOUND', message: `Backup task '${name}' not found` } }
     }
 
-    const [reg, st, units, journal, nested] = await Promise.all([
+    // backup2.2 — the boundary scan is no longer part of the detail. It is a
+    // local `st_dev` walk, and for a source ROOTED on a remote mount it ran
+    // over the network until its wall-clock cap — past the gateway's 15 s
+    // forward timeout, so a slow (but reachable) node read as "unreachable" and
+    // the detail hung for twenty seconds on a screen the operator opened for
+    // the task, not for a scan. The detail is instant now; the UI loads the
+    // boundary scan progressively through POST /backup/tasks/preview-nested,
+    // which rides that same forward and runs under the budget that fits under
+    // it (NESTED_SCAN_PREVIEW_TIMEOUT_S). An ABSENT `nested` key still means
+    // "not known" to the UI, so the schema's optional field is untouched.
+    const [reg, st, units, journal] = await Promise.all([
       readBackupRepos(paths),
       deriveTaskStatus(executor, task),
       readUnitTexts(systemdDir, name),
       readRecentJournal(executor, name),
-      // backup2.2 — what is nested under each source RIGHT NOW, and whether the
-      // task's current includeNested covers it. LOCAL-ONLY (an st_dev walk plus
-      // findmnt); no PBS contact, so the never-poll rule is untouched. Fail-open:
-      // a scan that throws leaves the key ABSENT ("not known"), never an empty
-      // array pretending nothing is nested.
-      scanArchives(executor, task.archives)
-        // backup2.3 — and, on the same scan, the DERIVED consistency of each
-        // source, so the detail can show `snapshot` / `live` with its reason.
-        .then(withConsistency)
-        .catch((err: unknown) => {
-          server.log.warn(`[backup] nested scan for task ${name} failed: ${err instanceof Error ? err.message : String(err)}`)
-          return null
-        }),
     ])
     const joinRepos = await reposForJoin(reg.repos)
+    // The last run's NOTES (backup2 fix-ups): the run's completion toast points
+    // the operator to THIS window for them. Run jobs are in-process state —
+    // after a daemon restart the last run's result is honestly unknown, and the
+    // key stays absent rather than claiming "none".
+    const lastRunJob = jobQueue.findByOperation('backup.task.run', name, 'task')
+    const lastRunResult = lastRunJob?.status === 'completed'
+      ? (lastRunJob.result as { notices?: unknown } | null)
+      : undefined
+    const lastRunNotices = Array.isArray(lastRunResult?.notices)
+      ? lastRunResult.notices.filter((n): n is string => typeof n === 'string')
+      : undefined
     const detail: BackupTaskDetail = {
       task: toTaskView(task, joinRepos),
       lastRunResult: st.lastRunResult,
@@ -950,11 +965,11 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       unit: units.unit,
       timer: units.timer,
       ...(journal ? { journal } : {}),
-      ...(nested ? { nested } : {}),
       // F9 — when there is no result to show, say WHY on the one screen that has
       // room for the sentence. The journald tail is the only history a disabled
       // task has left, and it is already labelled recent-only.
       ...(st.lastRunResult === 'disabled' ? { statusNote: DISABLED_HISTORY_NOTE } : {}),
+      ...(lastRunNotices?.length ? { lastRunNotices } : {}),
     }
     return { data: detail }
   })

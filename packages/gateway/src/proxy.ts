@@ -207,8 +207,17 @@ function loadClusterCa(request: FastifyRequest, caPath: string): string | Buffer
  * The user's PVEAuthCookie rides along so the remote gateway verifies the ticket
  * against the replicated cluster authkey exactly as for a direct request. The
  * TLS hop is verified against the cluster CA (fail-closed if it is unreadable).
- * Connection failure → 502 NODE_UNREACHABLE. A peer whose `:8006` answers but
- * lacks the `/anas` hook (ANAS not installed) → 502 ANAS_NOT_INSTALLED.
+ * Connection failure → 502 NODE_UNREACHABLE — including a connect that never
+ * COMPLETES (a firewalled/black-holed peer whose SYN is dropped): Node's
+ * request `timeout` also fires while the connect is still pending, and there
+ * "the node is reachable" would itself be the lie, so that timeout stays a
+ * plain error and takes the 502 path. A peer that CONNECTED (TCP+TLS) but does
+ * not answer within the forward timeout → 504 GATEWAY_TIMEOUT — a distinct
+ * wording, because "unreachable" for a request that was slow or hung is a lie:
+ * the node was reachable, the operation was not (a pre-fix boundary scan of a
+ * remote-rooted source took exactly this path and read as a dead node). A peer
+ * whose `:8006` answers but lacks the `/anas` hook (ANAS not installed) →
+ * 502 ANAS_NOT_INSTALLED.
  */
 /**
  * Resolve a cluster node name to its IP via PVE's membership file
@@ -235,8 +244,11 @@ export function resolveNodeAddress(node: string, membersPath: string): string | 
 export async function forwardToNode(
   request: FastifyRequest,
   reply: FastifyReply,
-  opts: { node: string, pvePort: number, clusterCa: string, membersPath: string },
+  opts: { node: string, pvePort: number, clusterCa: string, membersPath: string, timeoutMs?: number },
 ): Promise<void> {
+  // Overridable for tests (a real forward timeout is a 15 s wait); production
+  // always runs at FORWARD_TIMEOUT_MS.
+  const timeoutMs = opts.timeoutMs ?? FORWARD_TIMEOUT_MS
   const ca = loadClusterCa(request, opts.clusterCa)
   if (ca === undefined) {
     // Fail CLOSED: without the cluster CA we cannot verify the peer's TLS
@@ -301,8 +313,8 @@ export async function forwardToNode(
           headers,
           agent: new HttpsAgent({ ca }),
           // A down-but-not-refused peer (firewall drop, partition) must not hang
-          // the browser request — time out and surface NODE_UNREACHABLE instead.
-          timeout: FORWARD_TIMEOUT_MS,
+          // the browser request — time out and surface it instead.
+          timeout: timeoutMs,
         },
         (res) => {
           const chunks: Buffer[] = []
@@ -315,7 +327,34 @@ export async function forwardToNode(
         },
       )
       req.on('error', reject)
-      req.on('timeout', () => req.destroy(new Error(`connection to ${opts.node} timed out after ${FORWARD_TIMEOUT_MS}ms`)))
+      // Whether the socket ever actually CONNECTED. Node's request `timeout`
+      // fires on socket inactivity — INCLUDING while the TCP/TLS connect is
+      // still pending (a firewalled/black-holed peer never answers the SYN), so
+      // "the node is reachable" may only be claimed when a connection was made.
+      let connected = false
+      req.on('socket', (s) => {
+        s.once('connect', () => {
+          connected = true
+        })
+        s.once('secureConnect', () => {
+          connected = true
+        })
+      })
+      // Mark the timeout at its SOURCE so the catch can tell "the peer
+      // CONNECTED and then never answered within the budget" (GATEWAY_TIMEOUT)
+      // apart from a connection that was never established at all
+      // (NODE_UNREACHABLE). A hung peer is REACHABLE — the operation is what is
+      // slow; a connect that times out is not.
+      req.on('timeout', () => {
+        const err = new Error(connected
+          ? `connection to ${opts.node} timed out after ${timeoutMs}ms`
+          : `connection attempt to ${opts.node} timed out after ${timeoutMs}ms`)
+        if (connected) {
+          const marked = err as NodeJS.ErrnoException
+          marked.code = 'ANAS_FORWARD_TIMEOUT'
+        }
+        req.destroy(err)
+      })
       if (body)
         req.write(body)
       req.end()
@@ -338,6 +377,21 @@ export async function forwardToNode(
     await reply.code(result.status).send(result.body)
   }
   catch (err) {
+    // The forward TIMED OUT on a connection that HAD BEEN ESTABLISHED (the
+    // marker is only stamped when the socket connected): the peer is reachable
+    // — the operation is what did not answer in time. A distinct 504 and
+    // wording, because the 502 "unreachable" below is a lie for this. A timeout
+    // that happened BEFORE any connect (a black-holed peer) has no marker and
+    // lands on the 502 below, where it belongs.
+    if ((err as NodeJS.ErrnoException)?.code === 'ANAS_FORWARD_TIMEOUT') {
+      await reply.code(504).send({
+        error: {
+          code: 'GATEWAY_TIMEOUT',
+          message: `Node '${opts.node}' did not answer within ${Math.round(timeoutMs / 1000)} s: the request timed out. The node is reachable; that operation is slow or hung.`,
+        },
+      })
+      return
+    }
     await reply.code(502).send({
       error: {
         code: 'NODE_UNREACHABLE',

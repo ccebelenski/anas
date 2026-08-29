@@ -1382,6 +1382,15 @@ export const BackupTaskDetail = z.object({
    * not be run at all — a missing key is "not known", never "none found".
    */
   nested: z.array(BackupNestedScan).optional(),
+  /**
+   * The NOTICES of the task's last run (backup2 fix-ups): nested filesystems
+   * the task's `includeNested` does not cover, stored as empty directories.
+   * Informational — they never changed that run's status — but the run's
+   * completion toast points the operator to THIS window for them, so they ride
+   * the detail. Run jobs are in-process state: absent after a daemon restart,
+   * or when the last run had none (a missing key is "not known", like `nested`).
+   */
+  lastRunNotices: z.array(z.string()).optional(),
 })
 export type BackupTaskDetail = z.infer<typeof BackupTaskDetail>
 

@@ -40,6 +40,13 @@ export interface GatewayConfig {
    * forwarding resolves the peer's IP here rather than trusting DNS.
    */
   membersPath: string
+  /**
+   * Cross-node forward timeout (ms). Production always runs at the proxy's
+   * 15 s default; the override exists so the timeout PATH itself is testable
+   * without a 15 s wait (a peer that never answers must yield the 504, not a
+   * hang).
+   */
+  forwardTimeoutMs?: number
 }
 
 export function loadConfig(

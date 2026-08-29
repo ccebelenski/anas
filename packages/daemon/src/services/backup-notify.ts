@@ -58,6 +58,13 @@ export interface BackupNotifyResult {
   prune?: BackupPruneResult
   warnings?: string[]
   /**
+   * Informational lines about the run — nested filesystems stored as empty
+   * directories because the task's includeNested does not cover them. They
+   * ride the body (as notes) on a success AND a warning outcome alike, and
+   * never change the outcome or the severity. Absent on an old daemon.
+   */
+  notices?: string[]
+  /**
    * Archive name → the filesystem boundaries the run crossed (`--include-dev`).
    * What an `all` choice RESOLVED to is a per-run fact, so the body states it
    * rather than leaving the reader to infer it from the task config (backup2.2).
@@ -101,6 +108,11 @@ export interface BackupNotifyContext {
  * is the one case that stays silent in BOTH modes; the benign too-soon
  * collision, by contrast, is a run that really executed and reported nothing
  * wrong, so it reads as a success whose body says nothing needed backing up.
+ *
+ * The level is derived from `warnings` ONLY. `notices` — nested filesystems
+ * stored empty by a deliberate includeNested choice — never promote a run to
+ * `warning` (operator ruling 2026-08-28): a run whose only finding is an
+ * uncovered nested filesystem is a `success` whose body carries the note.
  */
 export function backupNotifyOutcome(ctx: BackupNotifyContext): BackupNotifyOutcome {
   if (ctx.error !== undefined)
@@ -290,6 +302,16 @@ export function buildBackupNotifyBody(ctx: BackupNotifyContext): string {
     lines.push('Warnings:')
     for (const w of result.warnings)
       lines.push(`  ${w}`)
+  }
+
+  // Notes: informational, same formatting as the warnings block. Shown on a
+  // success AND a warning outcome alike — a run whose ONLY finding is an
+  // uncovered nested filesystem is a success whose body still says so.
+  if (result?.notices?.length) {
+    lines.push('')
+    lines.push('Notes:')
+    for (const n of result.notices)
+      lines.push(`  ${n}`)
   }
 
   if (ctx.error !== undefined) {
