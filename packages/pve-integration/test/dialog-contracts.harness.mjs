@@ -207,9 +207,26 @@ function makeComponent(cfg, parent) {
   // `list` is a plain array (items/buttons) or a toolbar config object —
   // ANAS.tbar wraps every tbar in { xtype:'toolbar', items:[…] }, so the
   // stub materialises the object's items, flattening as it always did.
+  //
+  // ExtJS container `items` is an Ext.util.ItemCollection KEYED BY
+  // getItemId() (itemId || id): adding a component whose key already exists
+  // silently REMOVES the earlier entry from the collection first (the first
+  // stays rendered in the DOM). A row factory emitting the same itemId is
+  // therefore "N rows visible, 1 row in the collection" — exactly the fleet
+  // bug this harness exists to catch, so the stub models it.
+  const keyOf = cmp => cmp.itemId || cmp.id
+  const keyedPush = (arr, kc) => {
+    const key = keyOf(kc)
+    if (key !== undefined && key !== null) {
+      const dup = arr.findIndex(x => keyOf(x) === key)
+      if (dup >= 0) { arr.splice(dup, 1)[0].parent = null }
+    }
+    arr.push(kc)
+    return kc
+  }
   const build = list => (Array.isArray(list) ? list : (list && list.items) || [])
     .filter(x => x && typeof x === 'object')
-    .map((k) => { const kc = makeComponent(k, c); kids.push(kc); return kc })
+    .map((k) => { const kc = makeComponent(k, c); keyedPush(kids, kc); return kc })
 
   const own = build(cfg && cfg.items)
   c.buttonCmps = build(cfg && cfg.buttons)
@@ -231,9 +248,9 @@ function makeComponent(cfg, parent) {
     const list = Array.isArray(what) ? what : [what]
     let last = null
     for (const one of list) {
-      const kc = makeComponent(one, c)
-      items.push(kc)
-      last = kc
+      // keyedPush, not items.push: a duplicate key REPLACES the earlier
+      // entry (ExtJS ItemCollection semantics), it does not append.
+      last = keyedPush(items, makeComponent(one, c))
     }
     return Array.isArray(what) ? items.slice(-list.length) : last
   }
@@ -245,6 +262,15 @@ function makeComponent(cfg, parent) {
   c.removeAll = function () { items.length = 0 }
 
   function matches(cmp, sel) {
+    // '#id', an xtype, or an ExtJS ComponentQuery attribute selector
+    // '[attr]' / '[attr=value]' matched against any component property
+    // (row markers like anasRowKind are config properties, not xtypes).
+    const attr = sel.match(/^\[([A-Za-z_$][\w$]*)(?:=(.+))?\]$/)
+    if (attr) {
+      const v = cmp[attr[1]]
+      if (attr[2] === undefined) { return v !== undefined && v !== null }
+      return String(v) === attr[2]
+    }
     return sel.charAt(0) === '#' ? cmp.itemId === sel.slice(1) : cmp.xtype === sel
   }
   c.down = function (sel) {
@@ -267,6 +293,15 @@ function makeComponent(cfg, parent) {
   // --- field value semantics, per xtype ---
   const isCheckbox = CHECKBOXES.indexOf(c.xtype) >= 0
   const isRadioGroup = c.xtype === 'radiogroup'
+  // The DOM box — what the operator sees in the input — versus the field's
+  // committed value. setValue commits both (a programmatic set); a paste
+  // writes the box ONLY, and the commit happens on blur. That is the split a
+  // real browser holds while a field's input is uncommitted, and the
+  // target-dialog contract (a visible row's box contents reach the POST body)
+  // is asserted against it. Checkbox/radio/number fields commit on the spot
+  // and keep the old single-value behaviour.
+  const isTextish = !isCheckbox && !isRadioGroup && c.xtype !== 'numberfield'
+  c._domValue = isTextish ? ((c.value === undefined || c.value === null) ? '' : c.value) : undefined
   c.getValue = function () {
     if (isCheckbox) { return !!c.checked }
     if (isRadioGroup) {
@@ -286,9 +321,25 @@ function makeComponent(cfg, parent) {
       const want = v && typeof v === 'object' ? v[Object.keys(v)[0]] : v
       for (const kid of c.childCmps()) { kid.checked = kid.inputValue === want }
     }
-    else { c.value = v }
+    else {
+      c.value = v
+      if (isTextish) { c._domValue = (v === undefined || v === null) ? '' : v }
+    }
     c.fireEvent('change', c, v)
     return c
+  }
+  /** Simulate an operator PASTE: the text lands in the box, uncommitted. */
+  c.pasteInto = function (v) { c._domValue = v; return c }
+  /** The blur that commits the box into the field's value (ExtJS syncs it). */
+  c.blur = function () {
+    if (isTextish && c._domValue !== undefined && c._domValue !== c.value) {
+      c.setValue(c._domValue)
+    }
+    return c
+  }
+  /** The box contents, committed or not — ExtJS's getRawValue. */
+  c.getRawValue = function () {
+    return c._domValue === undefined ? c.getValue() : c._domValue
   }
 
   c.on = function (ev, fn) { (c._on[ev] = c._on[ev] || []).push(fn) }
@@ -2471,6 +2522,173 @@ async function iscsiEditChecks() {
   eq('edit(remove): the ACL list travels complete and shorter', job.body.acls, [])
 
   ok('edit: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// Bug report (live, 2026-08-28): a target dialog with TWO visible initiator
+// rows — "Add this node" plus a row with a pasted Windows IQN — submitted
+// only ONE ACL: the LAST-added one. Root cause: every row was created with
+// the SAME itemId, and an ExtJS container's `items` is keyed by itemId, so
+// the second add silently REPLACED the first entry in the collection while
+// the first stayed rendered in the DOM. The daemon audit (acls:
+// req.acls.length) proved the body itself carried one. The contract these
+// orders must honour: every visible row reaches the body — in either
+// add-order, set OR pasted (committed or uncommitted), on a create AND on an
+// edit, for initiator AND portal rows alike.
+async function iscsiRowSurvivalChecks() {
+  const WINDOWS_IQN = 'iqn.1991-05.com.microsoft:winserv2025'
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { view, grid } = await openIscsiView(ISCSI_ROUTES)
+  const submit = (dlg) => dlg.buttonCmps.find(b => b.cls === 'anas-btn-iscsi-target-submit')
+  // The operator always types into the row they JUST added — the last entry
+  // of the collection (a pre-fix dialog had evicted the earlier row from it).
+  const lastRow = (dlg, id) => dlg.down(id).items.getRange().slice(-1)[0]
+
+  // (a) Add this node, THEN Add initiator + set the Windows IQN, then Create.
+  jobs.length = 0
+  grid.down('#iscsiCreate').handler(grid.down('#iscsiCreate'))
+  await settle()
+  let dlg = openWindow()
+  ok('acl-survival: the create dialog opened', !!dlg && !!dlg.down('#name'))
+  if (!dlg) { return }
+  dlg.down('#name').setValue('winsrv')
+  dlg.down('#portalAddress').setValue('192.168.200.50')
+  dlg.down('#aclAddNode').handler(dlg.down('#aclAddNode'))
+  await settle()
+  dlg.down('#aclAdd').handler(dlg.down('#aclAdd'))
+  await settle()
+  eq('acl-survival(a): both rows are in the container',
+    dlg.down('#aclsContainer').items.getCount(), 2)
+  lastRow(dlg, '#aclsContainer').down('#aclIqn').setValue(WINDOWS_IQN)
+  await settle()
+  submit(dlg).handler(submit(dlg))
+  await settle()
+  eq('acl-survival(a): one job', jobs.length, 1)
+  eq('acl-survival(a): it POSTs to the collection', [jobs[0].method, jobs[0].path],
+    ['post', '/iscsi/targets'])
+  eq('acl-survival(a): BOTH IQNs reach the body', jobs[0].body.acls,
+    [{ initiatorIqn: ISCSI_NODE_IQN }, { initiatorIqn: WINDOWS_IQN }])
+
+  // The two operator-requested hints, muted, in the initiator section.
+  const sectionNotes = dlg.down('#aclsContainer').up().items.getRange()
+    .map(c => c.html || '').join('\n')
+  ok('acl-survival: the discovery hint renders in the initiator section',
+    /Initiators must be listed here before they can discover this target/.test(sectionNotes), sectionNotes)
+  ok('acl-survival: the all-LUNs-visible hint renders in the initiator section',
+    /Every initiator listed sees all of this target's LUNs/.test(sectionNotes), sectionNotes)
+
+  // (b) Add initiator + set the Windows IQN, THEN Add this node, then Create.
+  jobs.length = 0
+  grid.down('#iscsiCreate').handler(grid.down('#iscsiCreate'))
+  await settle()
+  dlg = openWindow()
+  dlg.down('#name').setValue('winsrv2')
+  dlg.down('#portalAddress').setValue('192.168.200.50')
+  dlg.down('#aclAdd').handler(dlg.down('#aclAdd'))
+  await settle()
+  // The IQN goes into this row NOW, before the second add — a pre-fix dialog
+  // would evict it from the collection afterwards, but the box keeps the text.
+  lastRow(dlg, '#aclsContainer').down('#aclIqn').setValue(WINDOWS_IQN)
+  await settle()
+  dlg.down('#aclAddNode').handler(dlg.down('#aclAddNode'))
+  await settle()
+  eq('acl-survival(b): both rows are in the container',
+    dlg.down('#aclsContainer').items.getCount(), 2)
+  submit(dlg).handler(submit(dlg))
+  await settle()
+  eq('acl-survival(b): one job', jobs.length, 1)
+  eq('acl-survival(b): BOTH IQNs reach the body, order kept', jobs[0].body.acls,
+    [{ initiatorIqn: WINDOWS_IQN }, { initiatorIqn: ISCSI_NODE_IQN }])
+
+  // (c) The paste: the Windows IQN lands in the box via pasteInto (the DOM
+  // input), NOT setValue — straight to Create with the value still
+  // UNCOMMITTED: the box is what the operator sees, so the box is what gets
+  // sent.
+  jobs.length = 0
+  grid.down('#iscsiCreate').handler(grid.down('#iscsiCreate'))
+  await settle()
+  dlg = openWindow()
+  dlg.down('#name').setValue('winsrv3')
+  dlg.down('#portalAddress').setValue('192.168.200.50')
+  dlg.down('#aclAddNode').handler(dlg.down('#aclAddNode'))
+  await settle()
+  dlg.down('#aclAdd').handler(dlg.down('#aclAdd'))
+  await settle()
+  lastRow(dlg, '#aclsContainer').down('#aclIqn').pasteInto(WINDOWS_IQN)
+  submit(dlg).handler(submit(dlg))
+  await settle()
+  eq('acl-survival(c): an UNCOMMITTED paste still submits', jobs.length, 1)
+  // (Pre-fix this order can also gate out entirely: the evicted-collection
+  // dialog reads zero ACL rows, so the create save-gate blocks the button.)
+  if (jobs.length) {
+    eq('acl-survival(c): BOTH IQNs reach the body', jobs[0].body.acls,
+      [{ initiatorIqn: ISCSI_NODE_IQN }, { initiatorIqn: WINDOWS_IQN }])
+  }
+
+  // (c2) the same paste with the blur that commits it before Create.
+  jobs.length = 0
+  grid.down('#iscsiCreate').handler(grid.down('#iscsiCreate'))
+  await settle()
+  dlg = openWindow()
+  dlg.down('#name').setValue('winsrv4')
+  dlg.down('#portalAddress').setValue('192.168.200.50')
+  dlg.down('#aclAddNode').handler(dlg.down('#aclAddNode'))
+  await settle()
+  dlg.down('#aclAdd').handler(dlg.down('#aclAdd'))
+  await settle()
+  const pasted = lastRow(dlg, '#aclsContainer').down('#aclIqn')
+  pasted.pasteInto(WINDOWS_IQN)
+  pasted.blur()
+  await settle()
+  submit(dlg).handler(submit(dlg))
+  await settle()
+  eq('acl-survival(c2): a committed paste still submits', jobs.length, 1)
+  eq('acl-survival(c2): BOTH IQNs reach the body', jobs[0].body.acls,
+    [{ initiatorIqn: ISCSI_NODE_IQN }, { initiatorIqn: WINDOWS_IQN }])
+
+  // (d) EDIT: the dialog opens on the stored ACL; Add initiator with the
+  // Windows IQN; Save → the PUT body carries the COMPLETE list, both ACLs —
+  // and the stored row's blank secret box still means "keep", not "clear".
+  grid.selectRow(iscsiRowOf(grid, ISCSI_IQN))
+  jobs.length = 0
+  grid.down('#iscsiEdit').handler(grid.down('#iscsiEdit'))
+  await settle()
+  dlg = openWindow()
+  eq('acl-survival(d): the edit opened on the one stored row',
+    dlg.down('#aclsContainer').items.getCount(), 1)
+  dlg.down('#aclAdd').handler(dlg.down('#aclAdd'))
+  await settle()
+  lastRow(dlg, '#aclsContainer').down('#aclIqn').setValue(WINDOWS_IQN)
+  await settle()
+  submit(dlg).handler(submit(dlg))
+  await settle()
+  eq('acl-survival(d): one job', jobs.length, 1)
+  eq('acl-survival(d): it PUTs at the target', [jobs[0].method, jobs[0].path],
+    ['put', `/iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`])
+  eq('acl-survival(d): the PUT body carries BOTH ACLs, stored one untouched',
+    jobs[0].body.acls,
+    [{ initiatorIqn: ISCSI_INITIATOR }, { initiatorIqn: WINDOWS_IQN }])
+
+  // (e) PORTALS, the same class of bug: two portal rows (Add portal twice),
+  // two addresses — both must reach the POST body's portals array.
+  jobs.length = 0
+  grid.down('#iscsiCreate').handler(grid.down('#iscsiCreate'))
+  await settle()
+  dlg = openWindow()
+  dlg.down('#name').setValue('winsrv5')
+  dlg.down('#portalAddress').setValue('192.168.200.50')
+  dlg.down('#aclAddNode').handler(dlg.down('#aclAddNode'))
+  await settle()
+  dlg.down('#portalAdd').handler(dlg.down('#portalAdd'))
+  await settle()
+  lastRow(dlg, '#portalsContainer').down('#portalAddress').setValue('127.0.0.1')
+  await settle()
+  submit(dlg).handler(submit(dlg))
+  await settle()
+  eq('portal-survival(e): one job', jobs.length, 1)
+  eq('portal-survival(e): BOTH portals reach the body', jobs[0].body.portals,
+    [{ address: '192.168.200.50', port: 3260 }, { address: '127.0.0.1', port: 3260 }])
+
+  ok('row-survival: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 /** Open the LUNs window on the ANAS target. */
@@ -6094,6 +6312,7 @@ for (const check of [
   iscsiCreateChecks,
   iscsiNodeIqnAbsentChecks,
   iscsiEditChecks,
+  iscsiRowSurvivalChecks,
   iscsiLunChecks,
   iscsiResizeAndDeleteChecks,
   iscsiSessionGatingChecks,

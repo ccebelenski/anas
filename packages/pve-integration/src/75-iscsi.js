@@ -218,6 +218,29 @@
         return ('' + (v === undefined || v === null ? '' : v)).trim();
     }
 
+    // The change-independent read for a text field: what is IN THE BOX, not
+    // whatever the field's committed value happens to hold. A paste writes the
+    // box; whether the field's value pipeline has caught up is the field's
+    // business, and a submit must not depend on it — the operator sees the box,
+    // and the box is what gets sent. getRawValue() is the box in ExtJS;
+    // getValue() is the fallback (for a plain textfield it is the same live
+    // DOM read, so this is behaviour-neutral where the field is in sync and
+    // box-faithful where it is not).
+    function boxText(field) {
+        try {
+            if (field && typeof field.getRawValue === 'function') {
+                return '' + (field.getRawValue() || '');
+            }
+        } catch (e) {
+            // fall through to the committed value
+        }
+        try {
+            return field ? ('' + (field.getValue() || '')) : '';
+        } catch (e) {
+            return '';
+        }
+    }
+
     // UTF-8 byte length — the CHAP range the daemon enforces is in BYTES, and a
     // 16-character non-ASCII secret is longer than an initiator's 16-byte field.
     function byteLength(s) {
@@ -774,16 +797,28 @@
 
     // ---- Create / Edit Target dialog ---------------------------------------
 
+    // Row ids come from a monotonically increasing counter, NOT the row's
+    // position: ExtJS container `items` is an ItemCollection keyed by itemId,
+    // so a second row reusing a key silently REPLACES the first entry in the
+    // collection while the first stays rendered in the DOM — the dialog shows
+    // two rows and submits one (the fleet bug of 2026-08-28). A removed row
+    // must not free its id for reuse either, which is why it is a counter and
+    // not the (reusable) index.
+    var aclRowSeq = 0;
+    var portalRowSeq = 0;
+
     // The ACL editor is a small list of rows; each row carries an initiator IQN
     // and its four credential fields, plus the "credentials set" state the read
     // layer reports (a secret is never returned, so the box is always empty and
     // the LABEL is what tells the operator one is stored).
     function aclRow(acl, index) {
         acl = acl || {};
+        aclRowSeq += 1;
         return {
             xtype: 'fieldset',
-            itemId: 'aclRow',
+            itemId: 'aclRow-' + aclRowSeq,
             cls: 'anas-iscsi-acl-row',
+            anasRowKind: 'acl',
             title: t('Initiator') + ' ' + (index + 1),
             collapsible: false,
             margin: '0 0 6 0',
@@ -862,7 +897,10 @@
                     margin: '4 0 0 0',
                     handler: function (btn) {
                         try {
-                            var row = btn.up('#aclRow');
+                            // By the ROW MARKER, not an itemId: the ids are
+                            // unique per row and must never be what a handler
+                            // resolves by (first match would be the first row).
+                            var row = btn.up('[anasRowKind=acl]');
                             var cont = row && row.up('#aclsContainer');
                             if (cont && row) {
                                 cont.remove(row);
@@ -883,10 +921,12 @@
 
     function portalRow(portal) {
         portal = portal || {};
+        portalRowSeq += 1;
         return {
             xtype: 'fieldcontainer',
-            itemId: 'portalRow',
+            itemId: 'portalRow-' + portalRowSeq,
             cls: 'anas-iscsi-portal-row',
+            anasRowKind: 'portal',
             layout: 'hbox',
             margin: '0 0 4 0',
             items: [
@@ -927,7 +967,7 @@
                     margin: '0 0 0 8',
                     handler: function (btn) {
                         try {
-                            var row = btn.up('#portalRow');
+                            var row = btn.up('[anasRowKind=portal]');
                             var cont = row && row.up('#portalsContainer');
                             if (cont && row) {
                                 cont.remove(row);
@@ -941,10 +981,27 @@
         };
     }
 
-    function rowsOf(win, containerId) {
+    /**
+     * The rows of one container: its items filtered by the row marker
+     * (anasRowKind). The read is by marker, never by itemId — row ids are
+     * unique per row and must stay unresolvable by name (the first-match
+     * hazard), and a stray non-row component in the container can never be
+     * read as a row.
+     */
+    function rowsOf(win, containerId, kind) {
         try {
             var cont = win.down('#' + containerId);
-            return cont ? cont.items.getRange() : [];
+            if (!cont) {
+                return [];
+            }
+            var all = cont.items.getRange();
+            var out = [];
+            for (var i = 0; i < all.length; i++) {
+                if (all[i].anasRowKind === kind) {
+                    out.push(all[i]);
+                }
+            }
+            return out;
         } catch (e) {
             return [];
         }
@@ -1211,6 +1268,24 @@
                                     }
                                 },
                                 {
+                                    // The two sentences the operator asked to be
+                                    // said near the buttons: the list is the door
+                                    // (discovery is closed to everyone else), and
+                                    // the key is not per-LUN (a listed initiator
+                                    // sees the whole target, not a subset).
+                                    xtype: 'component',
+                                    margin: '4 0 0 0',
+                                    style: 'color:gray;font-size:11px;',
+                                    html: enc(t('Initiators must be listed here before they can discover this target — '
+                                        + 'discovery is closed to unknown initiators.'))
+                                },
+                                {
+                                    xtype: 'component',
+                                    margin: '0 0 0 0',
+                                    style: 'color:gray;font-size:11px;',
+                                    html: enc(t('Every initiator listed sees all of this target\'s LUNs.'))
+                                },
+                                {
                                     // Shown whenever the list is empty (create OR
                                     // an edit of a target that already has none):
                                     // the same sentence the daemon says.
@@ -1269,7 +1344,7 @@
                 return;
             }
             win.anasAddresses = addresses;
-            var rows = rowsOf(win, 'portalsContainer');
+            var rows = rowsOf(win, 'portalsContainer', 'portal');
             for (var k = 0; k < rows.length; k++) {
                 applyAddressStore(win, rows[k]);
             }
@@ -1400,7 +1475,7 @@
 
     /** Read the portal rows into the request array. */
     function readPortals(win) {
-        var rows = rowsOf(win, 'portalsContainer');
+        var rows = rowsOf(win, 'portalsContainer', 'portal');
         var out = [];
         for (var i = 0; i < rows.length; i++) {
             var address = ('' + (rows[i].down('#portalAddress').getValue() || '')).trim();
@@ -1422,11 +1497,14 @@
      * an ACL that HAD a value sends null, which clears it.
      */
     function readAcls(win) {
-        var rows = rowsOf(win, 'aclsContainer');
+        var rows = rowsOf(win, 'aclsContainer', 'acl');
         var out = [];
         for (var i = 0; i < rows.length; i++) {
             var row = rows[i];
-            var iqn = ('' + (row.down('#aclIqn').getValue() || '')).trim();
+            // boxText, not getValue: the row is visible in the dialog, and what
+            // is in its boxes is what gets sent — the submit must not depend on
+            // the field's committed state having caught up with the paste.
+            var iqn = boxText(row.down('#aclIqn')).trim();
             if (!iqn) {
                 continue;
             }
@@ -1434,21 +1512,21 @@
             var acl = { initiatorIqn: iqn };
 
             applyClearContract(acl, 'chapUserid',
-                ('' + (row.down('#aclUserid').getValue() || '')).trim(), stored.chapUserid || '');
+                boxText(row.down('#aclUserid')).trim(), stored.chapUserid || '');
             applyClearContract(acl, 'mutualUserid',
-                ('' + (row.down('#aclMutualUserid').getValue() || '')).trim(), stored.mutualUserid || '');
+                boxText(row.down('#aclMutualUserid')).trim(), stored.mutualUserid || '');
 
             // A secret is WRITE-ONLY, so the box is always empty when the dialog
             // opens. Blank therefore cannot mean "clear" — it means "keep", the
             // mounts precedent. Clearing a stored secret is done by clearing its
             // USERNAME, which the daemon reads as "this ACL has no CHAP".
-            var secret = '' + (row.down('#aclSecret').getValue() || '');
+            var secret = boxText(row.down('#aclSecret'));
             if (secret) {
                 acl.chapSecret = secret;
             } else if (stored.chapCredentialsSet && !acl.chapUserid && acl.chapUserid !== undefined) {
                 acl.chapSecret = null;
             }
-            var mutual = '' + (row.down('#aclMutualSecret').getValue() || '');
+            var mutual = boxText(row.down('#aclMutualSecret'));
             if (mutual) {
                 acl.mutualSecret = mutual;
             } else if (stored.mutualCredentialsSet && !acl.mutualUserid && acl.mutualUserid !== undefined) {
@@ -1529,12 +1607,15 @@
         if (!win || win.destroyed || !ANAS.editGuard) {
             return;
         }
-        var rows = rowsOf(win, 'aclsContainer');
+        var rows = rowsOf(win, 'aclsContainer', 'acl');
         var n = 0;
         for (var i = 0; i < rows.length; i++) {
             try {
+                // boxText: the gate must count what is in the box, by the same
+                // change-independent read the submit uses — or the button could
+                // say "ready" for a row the submit would drop (or vice versa).
                 var f = rows[i].down('#aclIqn');
-                if (f && ('' + (f.getValue() || '')).trim()) {
+                if (f && boxText(f).trim()) {
                     n++;
                 }
             } catch (e) {
