@@ -3381,12 +3381,44 @@ async function iscsiRestoreGatingChecks() {
   ok('restore: a zvol LUN with a present backing and a known size is restorable',
     state.lunRestore.disabled === false, state.lunRestore.tip)
 
+  // A FOREIGN target keeps its hands off, selection and all — the `foreign`
+  // clause is the door's only live case.
+  created.windows.length = 0
+  const foreignRoutes = {
+    ...RESTORE_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_FOREIGN)}`]: {
+      data: {
+        ...ISCSI_TARGETS.targets[1],
+        luns: [{
+          index: 0, name: 'xvol', kind: 'foreign', plugin: 'fileio',
+          backingPath: '/unknown/x', size: GiB_, serial: 'ffffffff-0000-0000-0000-000000000000',
+          attributes: {}, connectedInitiators: [], present: true, backingExists: true,
+        }],
+        acls: [], sessions: [],
+      },
+    },
+  }
+  const { grid: fGrid } = await openIscsiView(foreignRoutes)
+  fGrid.selectRow(iscsiRowOf(fGrid, ISCSI_FOREIGN))
+  fGrid.down('#iscsiLuns').handler(fGrid.down('#iscsiLuns'))
+  await settle()
+  const fWin = openWindow()
+  const fLuns = fWin.down('#lunsGrid')
+  fLuns.selectRow(0)
+  state = toolbar(fLuns, ['lunRestore'])
+  ok('restore(foreign): DISABLED on a foreign target, selection and all — hands-off',
+    state.lunRestore.disabled === true)
+  ok('restore(foreign): and says the target is not managed by ANAS',
+    /not managed by ANAS/.test(state.lunRestore.tip), state.lunRestore.tip)
+
   ok('restore: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 async function iscsiRestoreSessionAndUnresolvedChecks() {
-  // A live session is the ENTRY GATE: overwriting a block device an initiator
-  // has open and mounted is not a thing a confirmation can make safe.
+  // backup2.10 fix-up 2026-08-29: the session is NO LONGER the entry gate —
+  // a new-LUN restore touches nothing live, so the door stays open and the
+  // in-place refusal (with its reason) travels into the dialog's prefill
+  // (lunInPlace). Only the destructive destination is refused.
   ajax.responses = { '/network': PVE_NETWORK }
   const sessionRoutes = {
     ...RESTORE_ROUTES,
@@ -3397,11 +3429,13 @@ async function iscsiRestoreSessionAndUnresolvedChecks() {
   let lunsGrid = lunsWin.down('#lunsGrid')
   lunsGrid.selectRow(0)
   let state = toolbar(lunsGrid, ['lunRestore'])
-  ok('restore(session): DISABLED under a live session', state.lunRestore.disabled === true)
-  ok('restore(session): and says the write would land under a mounted filesystem',
-    /under a mounted filesystem/.test(state.lunRestore.tip), state.lunRestore.tip)
+  ok('restore(session): the door STAYS OPEN under a live session — a new-LUN restore touches nothing live',
+    state.lunRestore.disabled === false, state.lunRestore.tip)
+  ok('restore(session): the in-place refusal travels into the dialog, so the toolbar tip is empty',
+    state.lunRestore.tip === '')
 
-  // A backing that is not on this node has nothing to restore ONTO.
+  // A backing that is not on this node: nothing to restore ONTO in place —
+  // but a new LUN needs none of it.
   created.windows.length = 0
   const detail = iscsiDetail()
   detail.luns[1] = { ...detail.luns[1], kind: 'unresolved', backingExists: false, present: false }
@@ -3414,13 +3448,11 @@ async function iscsiRestoreSessionAndUnresolvedChecks() {
   lunsGrid = lunsWin.down('#lunsGrid')
   lunsGrid.selectRow(1)
   state = toolbar(lunsGrid, ['lunRestore'])
-  ok('restore(unresolved): DISABLED — there is nothing on this node to write to',
-    state.lunRestore.disabled === true)
-  ok('restore(unresolved): and points at Repair',
-    /Repair/.test(state.lunRestore.tip), state.lunRestore.tip)
+  ok('restore(unresolved): the door stays open — a new-LUN restore does not need the missing backing',
+    state.lunRestore.disabled === false, state.lunRestore.tip)
 
-  // A LUN whose size ANAS cannot read cannot be size-checked, so it cannot be
-  // restored: the equality IS the guard.
+  // A LUN whose size ANAS cannot read cannot be size-checked in place: the
+  // equality IS the guard — but again, only for the in-place destination.
   created.windows.length = 0
   const noSize = iscsiDetail()
   noSize.luns[0] = { ...noSize.luns[0], size: null }
@@ -3433,12 +3465,281 @@ async function iscsiRestoreSessionAndUnresolvedChecks() {
   lunsGrid = lunsWin.down('#lunsGrid')
   lunsGrid.selectRow(0)
   state = toolbar(lunsGrid, ['lunRestore'])
-  ok('restore(no size): DISABLED — without the LUN size there is no equality to check',
-    state.lunRestore.disabled === true)
-  ok('restore(no size): and says a mismatch is silently destructive',
-    /silently destructive/.test(state.lunRestore.tip), state.lunRestore.tip)
+  ok('restore(no size): the door stays open — only the size equality is in question, and that is in place',
+    state.lunRestore.disabled === false, state.lunRestore.tip)
 
   ok('restore gating: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function iscsiRestoreLiveSessionDialogChecks() {
+  // backup2.10 fix-up 2026-08-29 — the dialog half of the ruling: the door
+  // opened on a LUN under a live session defaults to a new LUN, disables
+  // "This LUN (in place)" through the stray-mapping machinery, carries the
+  // door's own reason, and the new-LUN body is the shared schema's shape.
+  const sessionRoutes = {
+    ...RESTORE_ROUTES,
+    [`GET /iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`]: { data: iscsiDetail({ session: true }) },
+  }
+  const { dlg } = await openRestoreDialog(sessionRoutes)
+  if (!dlg) { return }
+  const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-restore-submit')
+
+  const snapBtn = dlg.down('#restoreSnapPick')
+  snapBtn.handler(snapBtn)
+  await settle()
+  const snapWin = openWindow()
+  snapWin.down('#snapGrid').selectRow(0)
+  const snapSelect = snapWin.buttonCmps.find(b => b.cls === 'anas-btn-snap-select')
+  snapSelect.handler(snapSelect)
+  await settle()
+  dlg.down('#restoreArchive').setValue('disk.img')
+  await settle()
+
+  eq('restore(live session): the destination defaults to "A new LUN…"',
+    dlg.down('#restoreDest').getValue(), { restoreDest: 'newLun' })
+  const inPlace = dlg.down('#restoreDest').childCmps().find(k => k.inputValue === 'inPlace')
+  ok('restore(live session): "This LUN (in place)" is DISABLED', inPlace.disabled === true)
+  ok('restore(live session): the door\'s reason speaks under the radio',
+    /under a mounted filesystem/.test(dlg.down('#restoreInPlaceNote').html || ''),
+    dlg.down('#restoreInPlaceNote').html)
+
+  // The new-LUN path is whole legal under the session — the source LUN is
+  // never touched, so nothing has to log out.
+  dlg.down('#newLunName').setValue('vmdisk-live')
+  dlg.down('#newLunPool').setValue('tank')
+  await settle()
+  eq('restore(live session): the target combo still pre-fills the LUN\'s own target',
+    dlg.down('#newLunTarget').getValue(), ISCSI_IQN)
+  ok('restore(live session): the new-LUN verdict is legal — Restore is live',
+    submit.disabled === false, dlg.down('#newLunVerdict').html)
+
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('restore(live session): the submitted body is the newLun shape',
+    jobs.length && jobs[0].body, {
+      kind: 'image',
+      repo: 'pbs-main',
+      snapshot: LUN_SNAP,
+      archive: 'disk.img',
+      target: {
+        mode: 'newLun',
+        targetIqn: ISCSI_IQN,
+        name: 'vmdisk-live',
+        backing: { kind: 'zvol', pool: 'tank' },
+      },
+      ns: 'anas',
+    })
+  ok('restore(live session): a newLun body never carries the in-place lun key',
+    jobs.length && !('lun' in jobs[0].body), JSON.stringify((jobs[0] || {}).body))
+
+  ok('restore(live session): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function restoreDoorsLiveSessionChecks() {
+  // backup2.10 fix-up 2026-08-29, part two — the verdict is ONE helper
+  // (`ANAS.iscsi.lunInPlace`) the DIALOG applies to the LUN it resolves, so
+  // EVERY door says the refusal before the daemon's 409 does: the task grid,
+  // task Details, and the repository door alike — not just the LUN toolbar.
+  // One live session on the LUN the block task maps to, for every door.
+  const ANAS = loadRestoreSources()
+  const liveIqnPath = `/iscsi/targets/${encodeURIComponent(ISCSI_IQN)}`
+  const groupsPath = '/backup/repos/pbs-main/groups'
+  const baseGet = ANAS.api.get
+  ANAS.api.get = (node, path) => {
+    const [base, query] = String(path).split('?')
+    if (base === '/backup/tasks') {
+      // The live-LUN block task is a grid row for THIS check only — the shared
+      // fixture's three-task grid is asserted elsewhere.
+      return Promise.resolve({
+        data: BACKUP_ROUTES['GET /backup/tasks'].data.concat([
+          { task: LIVE_BLOCK_TASK, lastRunResult: 'success', enabled: true },
+        ]),
+      })
+    }
+    if (base === '/backup/tasks/live-lun') {
+      // A FUNCTION route: the detail window stores `res.data` on itself.
+      return Promise.resolve({
+        data: { task: LIVE_BLOCK_TASK, unit: '', timer: '', recentRuns: [], lastRunNotices: [] },
+      })
+    }
+    if (base === liveIqnPath) {
+      return Promise.resolve({ data: iscsiDetail({ session: true }) })
+    }
+    if (base === groupsPath) {
+      // The repository's group list carries the LUN's own group; the group's
+      // snapshot listing is the LUN group's (disk.img, exactly the LUN's size).
+      if (query && decodeURIComponent(query).includes(`group=${LUN_GROUP}`)) {
+        return Promise.resolve(LUN_GROUP_SNAPSHOTS)
+      }
+      return Promise.resolve({
+        data: {
+          verdict: 'ok',
+          repository: 'pbs-main',
+          groups: [
+            {
+              group: 'host/pictures',
+              backupType: 'host',
+              backupId: 'pictures',
+              backupCount: 3,
+              lastBackup: 1787685405,
+              lastBackupIso: '2026-08-25T19:16:45Z',
+              files: [{ filename: 'data.pxar.didx', archive: 'data.pxar', kind: 'pxar' }],
+            },
+            {
+              group: LUN_GROUP,
+              backupType: 'host',
+              backupId: `lun-${LUN_SERIAL}`,
+              backupCount: 1,
+              lastBackup: 1787685405,
+              lastBackupIso: '2026-08-25T19:16:45Z',
+              files: [{ filename: 'disk.img.fidx', archive: 'disk.img', kind: 'img' }],
+            },
+          ],
+        },
+      })
+    }
+    return baseGet(node, path)
+  }
+
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  const liveRow = grid.getStore().findExact('name', 'live-lun')
+  ok('doors(live session): the grid carries the live-LUN block task', liveRow >= 0, `${liveRow}`)
+  if (liveRow < 0) { return }
+
+  const liveDestAsserts = (dlg, label) => {
+    eq(`doors(live session, ${label}): the destination defaults to "A new LUN…"`,
+      dlg.down('#restoreDest').getValue(), { restoreDest: 'newLun' })
+    const inPlace = dlg.down('#restoreDest').childCmps().find(k => k.inputValue === 'inPlace')
+    ok(`doors(live session, ${label}): "This LUN (in place)" is DISABLED`, inPlace.disabled === true)
+    ok(`doors(live session, ${label}): the live reason speaks under the radio`,
+      /under a mounted filesystem/.test(dlg.down('#restoreInPlaceNote').html || ''),
+      dlg.down('#restoreInPlaceNote').html)
+  }
+  const submitNewLun = async (dlg, label, name) => {
+    dlg.down('#newLunName').setValue(name)
+    dlg.down('#newLunPool').setValue('tank')
+    await settle()
+    eq(`doors(live session, ${label}): the target combo pre-fills the ANAS-owned target`,
+      dlg.down('#newLunTarget').getValue(), ISCSI_IQN)
+    jobs.length = 0
+    dlg.down('#restoreSubmit').handler(dlg.down('#restoreSubmit'))
+    await settle()
+    return jobs[0] || null
+  }
+  const newLunBody = (snapshot, name, ns) => {
+    const body = {
+      kind: 'image',
+      repo: 'pbs-main',
+      snapshot,
+      archive: 'disk.img',
+      target: { mode: 'newLun', targetIqn: ISCSI_IQN, name, backing: { kind: 'zvol', pool: 'tank' } },
+    }
+    if (ns) { body.ns = ns }
+    return body
+  }
+
+  // --- Door 1: the task grid's selection-dependent Restore… ----------------
+  grid.selectRow(liveRow)
+  ok('doors(live session, grid): Restore… is live for the selected block task',
+    grid.down('#backupRestore').disabled === false)
+  created.windows.length = 0
+  grid.down('#backupRestore').handler(grid.down('#backupRestore'))
+  await settle()
+  const gridDlg = openWindow()
+  ok('doors(live session, grid): the grid door opened the unified dialog',
+    gridDlg && gridDlg.cls === 'anas-win-backup-restore')
+  if (!gridDlg) { return }
+  await pickFileSnapshot(gridDlg)
+  eq('doors(live session, grid): the single disk.img archive is pre-selected',
+    gridDlg.down('#restoreArchive').getValue(), 'disk.img')
+  liveDestAsserts(gridDlg, 'grid')
+  const gridJob = await submitNewLun(gridDlg, 'grid', 'grid-live-new')
+  eq('doors(live session, grid): the submitted body is the newLun shape',
+    gridJob && gridJob.body,
+    newLunBody(`${LUN_GROUP}/2026-08-25T19:16:45Z`, 'grid-live-new'))
+  ok('doors(live session, grid): a newLun body never carries the in-place lun key',
+    !!gridJob && !('lun' in gridJob.body), JSON.stringify((gridJob || {}).body))
+
+  // --- Door 2: the task Details window's Restore… ---------------------------
+  created.windows.length = 0
+  grid.selectRow(liveRow)
+  grid.down('#backupDetails').handler(grid.down('#backupDetails'))
+  await settle()
+  const detailWin = openWindow()
+  ok('doors(live session, detail): the Details window opened',
+    detailWin && detailWin.cls === 'anas-win-backup-detail')
+  if (!detailWin) { return }
+  const detailRestore = detailWin.down('#backupDetailRestore')
+  ok('doors(live session, detail): Restore… is live once the detail loaded',
+    detailRestore.disabled === false)
+  created.windows.length = 0
+  detailRestore.handler(detailRestore)
+  await settle()
+  const detailDlg = openWindow()
+  ok('doors(live session, detail): the Details door opened the unified dialog',
+    detailDlg && detailDlg.cls === 'anas-win-backup-restore')
+  if (!detailDlg) { return }
+  await pickFileSnapshot(detailDlg)
+  liveDestAsserts(detailDlg, 'detail')
+  const detailJob = await submitNewLun(detailDlg, 'detail', 'detail-live-new')
+  eq('doors(live session, detail): the submitted body is the newLun shape',
+    detailJob && detailJob.body,
+    newLunBody(`${LUN_GROUP}/2026-08-25T19:16:45Z`, 'detail-live-new'))
+  ok('doors(live session, detail): a newLun body never carries the in-place lun key',
+    !!detailJob && !('lun' in detailJob.body), JSON.stringify((detailJob || {}).body))
+
+  // --- Door 3: Restore from repository… (task-less) --------------------------
+  created.windows.length = 0
+  ANAS.backup.openRestoreDialog('harness', 'harness', {})
+  await settle()
+  const repoDlg = openWindow()
+  ok('doors(live session, repo): the repository door opened the unified dialog',
+    repoDlg && repoDlg.cls === 'anas-win-backup-restore')
+  if (!repoDlg) { return }
+  repoDlg.down('#restoreRepo').setValue('pbs-main')
+  await settle()
+  const repoGroups = repoDlg.down('#restoreGroup').getStore().getRange().map(r => r.get('group'))
+  ok('doors(live session, repo): the repository group list carries the LUN\'s own group',
+    repoGroups.includes(LUN_GROUP), JSON.stringify(repoGroups))
+  repoDlg.down('#restoreGroup').setValue(LUN_GROUP)
+  await settle()
+  await pickFileSnapshot(repoDlg)
+  eq('doors(live session, repo): the LUN group lists its image archives',
+    repoDlg.down('#restoreArchive').getStore().getRange().map(r => r.get('archive')),
+    ['disk.img', 'small.img'])
+  repoDlg.down('#restoreArchive').setValue('disk.img')
+  await settle()
+  liveDestAsserts(repoDlg, 'repo')
+  const repoJob = await submitNewLun(repoDlg, 'repo', 'repo-live-new')
+  eq('doors(live session, repo): the submitted body is the newLun shape',
+    repoJob && repoJob.body, newLunBody(LUN_SNAP, 'repo-live-new'))
+  ok('doors(live session, repo): a newLun body never carries the in-place lun key',
+    !!repoJob && !('lun' in repoJob.body), JSON.stringify((repoJob || {}).body))
+
+  // --- The contrast: the SAME task door, the SAME LUN, NO live session ------
+  // "This LUN" is offered and selected, exactly as before the fix-up.
+  const ANAS2 = loadRestoreSources()
+  created.windows.length = 0
+  ANAS2.backup.openRestoreDialog('harness', 'harness', { task: LIVE_BLOCK_TASK })
+  await settle()
+  const quietDlg = openWindow()
+  ok('doors(no session): the task door opened the unified dialog',
+    quietDlg && quietDlg.cls === 'anas-win-backup-restore')
+  if (!quietDlg) { return }
+  await pickFileSnapshot(quietDlg)
+  eq('doors(no session): "This LUN (in place)" is selected by default',
+    quietDlg.down('#restoreDest').getValue(), { restoreDest: 'inPlace' })
+  const quietInPlace = quietDlg.down('#restoreDest').childCmps().find(k => k.inputValue === 'inPlace')
+  ok('doors(no session): the in-place radio is ENABLED', quietInPlace.disabled === false)
+  ok('doors(no session): the refusal note is empty',
+    !(quietDlg.down('#restoreInPlaceNote').html || '').length,
+    quietDlg.down('#restoreInPlaceNote').html)
+
+  ok('doors(live session): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 async function iscsiRestoreDialogChecks() {
@@ -3655,6 +3956,16 @@ async function iscsiRestoreNewLunChecks() {
   // --- the destination radios, and what each carries ----------------------
   eq('restore(newLun): the dialog defaults to "This LUN (in place)"',
     dlg.down('#restoreDest').getValue(), { restoreDest: 'inPlace' })
+  {
+    // No session → no refusal: the in-place radio is live and carries no
+    // reason line (the fix-up's default case).
+    const inPlace = dlg.down('#restoreDest').childCmps().find(k => k.inputValue === 'inPlace')
+    ok('restore(newLun): with no session the in-place radio is ENABLED',
+      inPlace.disabled === false)
+    ok('restore(newLun): …and the refusal note is empty',
+      !(dlg.down('#restoreInPlaceNote').html || '').length,
+      dlg.down('#restoreInPlaceNote').html)
+  }
   ok('restore(newLun): the new-LUN form is hidden until its radio is chosen',
     dlg.down('#newLunFields').hidden === true)
   ok('restore(newLun): a hidden form is disabled too — a stale value cannot be read back',
@@ -6333,6 +6644,12 @@ for (const check of [
   // Story backup2.7 — the whole-image restore's size gate and its refusals.
   iscsiRestoreGatingChecks,
   iscsiRestoreSessionAndUnresolvedChecks,
+  // backup2.10 fix-up 2026-08-29 — the door stays open under a live session;
+  // only the in-place destination is refused, with the door's own reason.
+  iscsiRestoreLiveSessionDialogChecks,
+  // …and the verdict is ONE helper the dialog applies to the LUN it resolves —
+  // every door (task grid, task Details, repository) says it alike.
+  restoreDoorsLiveSessionChecks,
   iscsiRestoreDialogChecks,
   iscsiRestoreVerdictChecks,
   iscsiRestoreSizeGateChecks,

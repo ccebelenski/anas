@@ -6476,6 +6476,39 @@
         return l.backingExists !== false && Number(l.size) > 0;
     }
 
+    /**
+     * The in-place verdict, ONE computation for every door (backup2.10
+     * fix-up 2026-08-29): the DIALOG applies the shared
+     * `ANAS.iscsi.lunInPlace` helper to the LUN it resolves — the toolbar's,
+     * the task grid's, the task-Details' and the repository door's alike — so
+     * every door says the refusal before the daemon's 409 does. Fails CLOSED:
+     * a helper the bundle does not carry (load order, a stale page) disables
+     * in place with a generic refusal rather than offering it unverified.
+     * `null` when the LUN resolves and the verdict allows it (a LUN that does
+     * not resolve at all has its own machinery below).
+     */
+    function inPlaceRefused(win) {
+        var rl = resolveThisLun(win);
+        if (!rl) {
+            return null;
+        }
+        if (!ANAS.iscsi || typeof ANAS.iscsi.lunInPlace !== 'function') {
+            return {
+                allowed: false,
+                reason: t('The in-place destination cannot be verified right now — restore it as a NEW '
+                    + 'LUN, which touches nothing that is live.')
+            };
+        }
+        var v = ANAS.iscsi.lunInPlace(rl);
+        if (v && v.allowed === false) {
+            return {
+                allowed: false,
+                reason: '' + (v.reason || t('This LUN cannot take an in-place restore right now.'))
+            };
+        }
+        return null;
+    }
+
     /** The size of the picked `.img` archive — the image's manifest size. */
     function selectedImageSize(win) {
         var archive = trim(valOf(win, '#restoreArchive'));
@@ -6695,6 +6728,13 @@
      */
     function resolveAndRefreshImage(win) {
         var rl = resolveThisLun(win);
+        // The shared verdict (ANAS.iscsi.lunInPlace — one helper, every door)
+        // adds its refusal to the SAME condition: the in-place destination is
+        // dead when nothing maps — OR when the LUN it resolves cannot take the
+        // overwrite (a live session, an unmanaged backing, an unknown size,
+        // or a verdict the bundle could not compute).
+        var refused = inPlaceRefused(win);
+        var inPlaceDead = !rl || !!refused;
         var dest = win.down('#restoreDest');
         if (dest) {
             var inPlaceRadio = null;
@@ -6709,14 +6749,19 @@
                 inPlaceRadio = null;
             }
             if (inPlaceRadio) {
-                inPlaceRadio.setDisabled(!rl);
+                inPlaceRadio.setDisabled(inPlaceDead);
             }
-            if (restoreDestMode(win) === 'inPlace' && !rl) {
-                // No LUN on this node backs the chosen source — the ONLY
-                // destination is a new LUN. Re-default rather than leave a
-                // dead radio checked so nothing reads a phantom `lun`.
+            if (restoreDestMode(win) === 'inPlace' && inPlaceDead) {
+                // No LUN on this node backs the chosen source — OR the shared
+                // verdict refuses in place: the ONLY destination is a new
+                // LUN. Re-default rather than leave a dead radio checked so
+                // nothing reads a phantom `lun`.
                 try { dest.setValue({ restoreDest: 'newLun' }); } catch (e2) { /* non-fatal */ }
             }
+        }
+        var ipNote = win.down('#restoreInPlaceNote');
+        if (ipNote) {
+            ipNote.update(refused ? enc(refused.reason) : '');
         }
         var path = win.down('#restoreTargetPath');
         if (path) {
@@ -6905,6 +6950,13 @@
                 return;
             }
         } else {
+            if (inPlaceRefused(win)) {
+                // The shared verdict, re-checked where the button is dead:
+                // the radio cannot be selected, but safety is not one check deep.
+                ANAS.alertMsg('No destination', t('This LUN cannot take an in-place restore right now. '
+                    + 'Restore it as a NEW LUN.'));
+                return;
+            }
             if (!rl) {
                 ANAS.alertMsg('No destination', t('This image maps to no LUN on this node. Restore it as a NEW LUN.'));
                 return;
@@ -7001,7 +7053,9 @@
      * The restore dialog — ONE dialog for every door. `prefill` is
      *   {}                      the task-less repository door (full source part),
      *   { task }                the task door — name or the task object,
-     *   { lun: {targetIqn,index,serial,name}, … }  the LUN door.
+     *   { lun: {targetIqn,index,serial,name}, … }  the LUN door — identity only;
+     *     the dialog applies the shared in-place verdict (ANAS.iscsi.lunInPlace)
+     *     to the LUN it resolves, for every door alike.
      * When task or lun is present the source part collapses to a summary line and
      * the dialog starts AT the point in time.
      */
@@ -7396,6 +7450,19 @@
                             updateRestoreSizes(w2);
                         }
                     }
+                },
+                {
+                    // The in-place refusal, when the dialog's shared verdict
+                    // (ANAS.iscsi.lunInPlace — one helper, every door) says the
+                    // LUN cannot take the overwrite: the radio is disabled
+                    // through the SAME stray-mapping machinery and this muted
+                    // line carries the reason. Empty unless refused.
+                    xtype: 'component',
+                    itemId: 'restoreInPlaceNote',
+                    cls: 'anas-restore-inplace-note',
+                    padding: '2 0 0 190',
+                    style: 'color:gray;font-size:11px;',
+                    html: ''
                 },
                 {
                     xtype: 'displayfield',

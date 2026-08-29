@@ -653,6 +653,10 @@
     // SAME backing pickers the add-LUN door uses — a pool for a zvol, a dataset
     // or AHR pool for an image. One implementation, two doors.
     ANAS.iscsi.loadBackingChoices = loadBackingChoices;
+    // THE in-place restore verdict (backup2.10 fix-up 2026-08-29): the dialog
+    // applies it to the LUN it resolves, for EVERY door — the toolbar keeps
+    // using this same function on its grid record. One source of truth.
+    ANAS.iscsi.lunInPlace = lunInPlace;
 
     // ---- Toolbar state -----------------------------------------------------
 
@@ -2235,6 +2239,62 @@
         return (sel && sel.length) ? sel[0] : null;
     }
 
+    /**
+     * THE in-place restore verdict — one computation for EVERY door
+     * (backup2.10 fix-up 2026-08-29). The toolbar applies it to its grid
+     * record; the unified restore dialog (68-backup.js) applies it to the LUN
+     * record IT resolves from its own targets read, for whichever door opened
+     * it (toolbar, task grid, task Details, repository) — so every door says
+     * the refusal before the daemon's 409 does. Record-shape agnostic: an Ext
+     * record (`.get`) or a plain API LUN object, normalised once.
+     *
+     * The toolbar itself gates only `has && !foreign` — a NEW-LUN restore
+     * touches nothing that is live or absent or unmanaged, so the door stays
+     * open under a session (the zvol-resize ruling: two doors disagreeing
+     * about a safe operation reads as "it cannot be done"). Only the in-place
+     * destination carries the preconditions the whole-image overwrite needs
+     * (backup2.7): no session on the LUN, a backing ANAS manages and that is
+     * actually there, and a size to prove equality on — the equality IS the
+     * guard (nothing below ANAS checks it).
+     */
+    function lunInPlace(lun) {
+        if (!lun) {
+            return { allowed: false, reason: '' };
+        }
+        var get = typeof lun.get === 'function'
+            ? function (k) { return lun.get(k); }
+            : function (k) { return lun[k]; };
+        var kind = '' + (get('kind') || '');
+        var kindOk = kind !== 'foreign' && kind !== 'unresolved';
+        var live = (get('connectedInitiators') || []).length > 0;
+        if (live) {
+            return {
+                allowed: false,
+                reason: t('An initiator is logged in. A whole-image restore overwrites the block '
+                    + 'device under a mounted filesystem, and neither LIO nor the initiator would be told. '
+                    + 'Log the initiator out first.')
+            };
+        }
+        if (get('backingExists') === false) {
+            return {
+                allowed: false,
+                reason: t('The backing object is not on this node right now — bring the storage back, '
+                    + 'then Repair, before restoring onto it.')
+            };
+        }
+        if (!kindOk) {
+            return { allowed: false, reason: t('The backing object is not storage ANAS manages') };
+        }
+        if (!(Number(get('size')) > 0)) {
+            return {
+                allowed: false,
+                reason: t('This LUN\'s size is unknown, so ANAS cannot prove a backup image is exactly '
+                    + 'its size — and a mismatch is silently destructive.')
+            };
+        }
+        return { allowed: true, reason: '' };
+    }
+
     function updateLunButtons(win) {
         var grid = lunsGridOf(win);
         if (!grid) {
@@ -2251,14 +2311,6 @@
         var unresolved = kind === 'unresolved';
         var kindOk = has && kind !== 'foreign' && !unresolved;
 
-        // A whole-image restore needs the same things a resize does — a backing
-        // object ANAS manages and one that is actually THERE — plus a known
-        // size, because the size EQUALITY is the only guard against a
-        // half-overwritten LUN (nothing below ANAS checks it, backup2.7).
-        var missing = has && rec.get('backingExists') === false;
-        var sizeKnown = has && Number(rec.get('size')) > 0;
-        var restorable = has && kindOk && !missing && sizeKnown;
-
         // A ZVOL grows live under a session — the volume resizes, the initiator
         // rescans and sees the new size (story iscsi.3, live-proof F13). The
         // Datasets door has always allowed it on the same held volume; this one
@@ -2269,28 +2321,19 @@
         var zvol = kind === 'zvol';
         setDisabled(grid, 'lunAdd', foreign);
         setDisabled(grid, 'lunResize', foreign || !has || (live && !zvol) || !kindOk);
-        setDisabled(grid, 'lunRestore', foreign || !has || live || !restorable);
+        // The DOOR is not the gate (backup2.10 fix-up 2026-08-29): a new-LUN
+        // restore touches nothing live, absent, or unmanaged, so it stays open
+        // under a session — the DIALOG applies the shared `lunInPlace` verdict
+        // to the LUN it resolves and refuses THAT destination with the reason,
+        // for every door alike. A foreign target stays hands-off.
+        setDisabled(grid, 'lunRestore', foreign || !has);
         setDisabled(grid, 'lunDelete', foreign || !has || live);
 
         var foreignTip = t('This target is not managed by ANAS — hands-off');
         var liveTip = t('An initiator is logged in. Resizing or deleting a LUN under a live session is '
             + 'refused: LIO would do it anyway and leave a stale device on the other host with no '
             + 'kernel message. Log the initiator out first.');
-        var restoreLiveTip = t('An initiator is logged in. A whole-image restore overwrites the block '
-            + 'device under a mounted filesystem, and neither LIO nor the initiator would be told. '
-            + 'Log the initiator out first.');
-        btnSetTip(grid, 'lunRestore', foreign ? foreignTip
-            : (live
-                ? restoreLiveTip
-                : (missing
-                    ? t('The backing object is not on this node right now — bring the storage back, '
-                        + 'then Repair, before restoring onto it.')
-                    : (has && !kindOk
-                        ? t('The backing object is not storage ANAS manages')
-                        : (has && !sizeKnown
-                            ? t('This LUN\'s size is unknown, so ANAS cannot prove a backup image is exactly '
-                                + 'its size — and a mismatch is silently destructive.')
-                            : '')))));
+        btnSetTip(grid, 'lunRestore', foreign ? foreignTip : '');
         btnSetTip(grid, 'lunAdd', foreign ? foreignTip : '');
         var resizeLiveTip = t('An initiator is logged in. A file-backed LUN\'s size is fixed at creation, so '
             + 'resizing it deletes and recreates the backstore under the initiator\'s feet, with no kernel '
@@ -2620,11 +2663,13 @@
                             },
                             {
                                 // The LUN door into the ONE restore dialog
-                                // (backup2.7): pre-filled with this LUN, source
-                                // collapsed to a summary line, destination
-                                // defaulting to This LUN. The second-door ruling
-                                // — the dialog asks only what the selection does
-                                // not already know.
+                                // (backup2.7): pre-filled with this LUN's identity,
+                                // source collapsed to a summary line, destination
+                                // defaulting to This LUN — or to a new LUN when the
+                                // dialog's shared in-place verdict (lunInPlace)
+                                // refuses (a live session). The second-door ruling —
+                                // the dialog asks only what the selection does not
+                                // already know.
                                 text: t('Restore from backup…'),
                                 itemId: 'lunRestore',
                                 cls: 'anas-btn-lun-restore',
@@ -2636,6 +2681,10 @@
                                     if (!rec || !ANAS.backup || !ANAS.backup.openRestoreDialog) {
                                         return;
                                     }
+                                    // The prefill carries the LUN's IDENTITY only. The
+                                    // in-place verdict is computed by the DIALOG —
+                                    // `ANAS.iscsi.lunInPlace` on the LUN it resolves,
+                                    // for every door alike — one source of truth.
                                     ANAS.backup.openRestoreDialog(view, node, {
                                         lun: {
                                             targetIqn: iqn,
