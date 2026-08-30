@@ -23,7 +23,8 @@ const PBC = '/usr/bin/proxmox-backup-client'
 const TIMEOUT = '/usr/bin/timeout'
 const SNAP = 'host/gtrestore/2026-08-25T19:16:45Z'
 const HOME = '/gtbackup/data'
-const SIDE = '/gtbackup/data.anas-restore-2026-08-25T19-16-45Z'
+/** The default body's destination: an operator-named directory that does not exist yet. */
+const NEWLOC = '/gtbackup/elsewhere'
 
 const IDENTITY = {
   'x-anas-user': 'root@pam',
@@ -92,7 +93,12 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     enabled: true,
   }
 
-  /** The default body: the task door, side-by-side, one picked file. */
+  /**
+   * The default body: the task door, one picked file, and the operator's
+   * named destination (newLocation) — the default since the beside-the-original
+   * mode was dropped (ruling 2026-08-29). The path names a directory that does
+   * not exist yet, so the restore creates it with no merge flags.
+   */
   function body(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     return {
       kind: 'files',
@@ -101,14 +107,15 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       snapshot: SNAP,
       archive: 'data.pxar',
       selections: ['/alpha.txt'],
+      target: { mode: 'newLocation', path: NEWLOC },
       ...overrides,
     }
   }
 
-  /** Register the pre-flight answers a HAPPY side-by-side restore needs. */
+  /** Register the pre-flight answers a HAPPY newLocation (new directory) restore needs. */
   function seedHappyPath(opts: { target?: string, selections?: string[], stats?: string, found?: string[] } = {}): void {
     const mock = mockOf(server)
-    const target = opts.target ?? SIDE
+    const target = opts.target ?? NEWLOC
     const selections = opts.selections ?? ['/alpha.txt']
     mock.addFixture({
       command: TIMEOUT,
@@ -119,7 +126,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
         exitCode: 0,
       },
     })
-    // The side-by-side directory must NOT exist.
+    // The newLocation directory must NOT exist yet (the restore creates it).
     mock.addFixture({
       command: TIMEOUT,
       args: ['10', '/usr/bin/stat', '-c', '%F', target],
@@ -238,9 +245,9 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.equal(res.statusCode, 404)
   })
 
-  // --- Side-by-side, the default -------------------------------------------
+  // --- newLocation, the default --------------------------------------------
 
-  it('derives the side-by-side directory from the task`s archive path, and restores', async () => {
+  it('the default body restores into the operator`s named directory, created by the restore', async () => {
     seedHappyPath()
     const res = await post(body())
     assert.equal(res.statusCode, 202)
@@ -249,8 +256,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     const result = job.result as BackupFilesRestoreResult
     assert.equal(result.kind, 'files')
     assert.equal(result.status, 'completed')
-    assert.equal(result.target, SIDE)
-    assert.equal(result.mode, 'sideBySide')
+    assert.equal(result.target, NEWLOC)
+    assert.equal(result.mode, 'newLocation')
     assert.equal(result.merge, false)
     assert.deepEqual(result.patterns, ['/alpha.txt'])
     assert.deepEqual(result.restored, ['/alpha.txt'])
@@ -261,7 +268,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       'restore',
       SNAP,
       'data.pxar',
-      SIDE,
+      NEWLOC,
       '--ns',
       'gtrestore',
       '--pattern',
@@ -273,10 +280,10 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.ok(!call.args.some(a => a.includes('token-secret-value')))
   })
 
-  it('refuses to REUSE an existing side-by-side directory', async () => {
-    // A second restore of the same point in time into a half-finished first one
-    // would merge two attempts with no way to tell them apart — including a
-    // partial one this daemon labelled itself.
+  it('an EXISTING newLocation directory earns a 409 confirm code — not a plain refusal', async () => {
+    // Ruling 2026-08-29: restoring into a directory the operator already has
+    // is legitimate — it overwrites live data, so it earns the same gate as an
+    // in-place restore (the confirmed leg is in the newLocation describe below).
     const mock = mockOf(server)
     mock.addFixture({
       command: TIMEOUT,
@@ -285,33 +292,38 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', SIDE],
+      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
       result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
     })
     const res = await post(body())
     assert.equal(res.statusCode, 409)
-    assert.match((res.json() as { error: { message: string } }).error.message, /already exists/)
+    const err = (res.json() as { error: { code: string, message: string, warnings: string[] } }).error
+    assert.equal(err.code, 'CONFIRMATION_REQUIRED')
+    assert.match(err.message, /already exists: restoring into it overwrites files with the same names and keeps everything else/)
+    assert.ok(err.warnings.some(w => /already exists/.test(w)), 'the confirm dialog renders the warnings, not the message')
+    assert.ok(res.headers['x-anas-confirm-code'], 'a confirm code is issued')
     assert.equal(restoreRan(), false)
   })
 
-  it('the task-less door needs a target path, and works with one', async () => {
-    const without = await post(body({ task: undefined }))
+  it('a newLocation door without its path is refused at the boundary, and works with one', async () => {
+    const without = await post(body({ task: undefined, target: { mode: 'newLocation' } }))
     assert.equal(without.statusCode, 400)
     assert.match((without.json() as { error: { message: string } }).error.message, /target\.path/)
     assert.equal(restoreRan(), false)
 
     seedHappyPath()
-    const withPath = await post(body({ task: undefined, target: { mode: 'sideBySide', path: HOME } }))
+    const withPath = await post(body({ task: undefined }))
     assert.equal(withPath.statusCode, 202)
     const job = await waitForJob(server, (withPath.json() as { job: { id: string } }).job.id)
     assert.equal(job.status, 'completed')
-    assert.equal((job.result as BackupFilesRestoreResult).target, SIDE)
+    assert.equal((job.result as BackupFilesRestoreResult).target, NEWLOC)
   })
 
   it('an EXPANDED archive name matches no task archive and asks for the path', async () => {
     // backup2.3's `<name>__<child>` flattened a path with `/` → `_`, which
-    // cannot be inverted — so nothing is guessed and no dataset is created.
-    const res = await post(body({ archive: 'data__photos.pxar' }))
+    // cannot be inverted — so an inPlace restore (which needs the task's home)
+    // is refused rather than guessed, and no dataset is created.
+    const res = await post(body({ archive: 'data__photos.pxar', target: { mode: 'inPlace' } }))
     assert.equal(res.statusCode, 400)
     assert.match((res.json() as { error: { message: string } }).error.message, /does not match an archive/)
   })
@@ -430,7 +442,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     assert.equal(job.status, 'completed')
   })
 
-  it('a side-by-side restore of a TREE is NEVER gated', async () => {
+  it('a newLocation restore of a TREE into a directory that does not exist is NEVER gated', async () => {
     const mock = mockOf(server)
     mock.addFixture({
       command: TIMEOUT,
@@ -439,7 +451,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', SIDE],
+      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
       result: { stdout: '', stderr: 'No such file', exitCode: 1 },
     })
     mock.addFixture({
@@ -454,12 +466,12 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['30', '/usr/bin/find', '-P', `${SIDE}/docs`, '-maxdepth', '0', '-printf', '%p\n'],
-      result: { stdout: `${SIDE}/docs\n`, stderr: '', exitCode: 0 },
+      args: ['30', '/usr/bin/find', '-P', `${NEWLOC}/docs`, '-maxdepth', '0', '-printf', '%p\n'],
+      result: { stdout: `${NEWLOC}/docs\n`, stderr: '', exitCode: 0 },
     })
     mock.addFixture({
       command: PBC,
-      args: ['restore', SNAP, 'data.pxar', SIDE, '--ns', 'gtrestore', '--pattern', '/docs'],
+      args: ['restore', SNAP, 'data.pxar', NEWLOC, '--ns', 'gtrestore', '--pattern', '/docs'],
       result: { stdout: '', stderr: 'restore complete (2.546 KiB processed in <0.1s, average 1 MiB/s)\r', exitCode: 0 },
     })
     const res = await post(body({ selections: ['/docs'] }))
@@ -516,7 +528,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', SIDE],
+      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
       result: { stdout: '', stderr: 'No such file', exitCode: 1 },
     })
     const res = await post(body({ selections: ['/nope.txt'] }))
@@ -534,7 +546,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', SIDE],
+      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
       result: { stdout: '', stderr: 'No such file', exitCode: 1 },
     })
     mock.addFixture({
@@ -557,7 +569,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', SIDE],
+      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
       result: { stdout: '', stderr: 'No such file', exitCode: 1 },
     })
     mock.addFixture({
@@ -588,7 +600,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', SIDE],
+      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
       result: { stdout: '', stderr: 'No such file', exitCode: 1 },
     })
     mock.addFixture({
@@ -603,8 +615,8 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['30', '/usr/bin/find', '-P', `${SIDE}/hard-b.txt`, `${SIDE}/hard-a.txt`, '-maxdepth', '0', '-printf', '%p\n'],
-      result: { stdout: `${SIDE}/hard-b.txt\n${SIDE}/hard-a.txt\n`, stderr: '', exitCode: 0 },
+      args: ['30', '/usr/bin/find', '-P', `${NEWLOC}/hard-b.txt`, `${NEWLOC}/hard-a.txt`, '-maxdepth', '0', '-printf', '%p\n'],
+      result: { stdout: `${NEWLOC}/hard-b.txt\n${NEWLOC}/hard-a.txt\n`, stderr: '', exitCode: 0 },
     })
     mock.addFixture({
       command: PBC,
@@ -612,7 +624,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
         'restore',
         SNAP,
         'data.pxar',
-        SIDE,
+        NEWLOC,
         '--ns',
         'gtrestore',
         '--pattern',
@@ -650,7 +662,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', SIDE],
+      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
       result: { stdout: '', stderr: 'No such file', exitCode: 1 },
     })
     mock.addFixture({
@@ -660,12 +672,12 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['30', '/usr/bin/find', '-P', `${SIDE}/alpha.txt`, '-maxdepth', '0', '-printf', '%p\n'],
+      args: ['30', '/usr/bin/find', '-P', `${NEWLOC}/alpha.txt`, '-maxdepth', '0', '-printf', '%p\n'],
       result: { stdout: '', stderr: 'find: no such file\n', exitCode: 1 },
     })
     mock.addFixture({
       command: PBC,
-      args: ['restore', SNAP, 'data.pxar', SIDE, '--ns', 'gtrestore', '--pattern', '/alpha.txt'],
+      args: ['restore', SNAP, 'data.pxar', NEWLOC, '--ns', 'gtrestore', '--pattern', '/alpha.txt'],
       result: { stdout: '', stderr: 'restore complete (2.546 KiB processed in <0.1s, average 2.886 MiB/s)\r', exitCode: 0 },
     })
     const res = await post(body())
@@ -679,21 +691,66 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
 
   // --- New location (backup2.10) --------------------------------------------
 
-  describe('newLocation — the path IS the new directory the restore creates', () => {
-    const NEWLOC = '/gtbackup/elsewhere'
-
+  describe('newLocation — the path IS the directory the restore writes into', () => {
     function newLocationBody(over: Record<string, unknown> = {}): Record<string, unknown> {
       return body({ task: undefined, target: { mode: 'newLocation', path: NEWLOC }, ...over })
     }
 
-    it('a newLocation door without its path is refused at the boundary', async () => {
-      const res = await post(body({ task: undefined, target: { mode: 'newLocation' } }))
-      assert.equal(res.statusCode, 400)
-      assert.match((res.json() as { error: { message: string } }).error.message, /target\.path/)
-      assert.equal(restoreRan(), false)
+    it('an EXISTING directory: 409 + confirm code, and a CONFIRM runs the in-place merge', async () => {
+      const mock = mockOf(server)
+      mock.addFixture({
+        command: TIMEOUT,
+        args: shellArgs(),
+        result: { stdout: statBlock('/alpha.txt', 23, 'file', '644', '-rw-r--r--'), stderr: '', exitCode: 0 },
+      })
+      // The directory EXISTS — this is what makes the first post a gate.
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
+        result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
+      })
+      // Confirmed leg: the write test and the space check land on the directory
+      // ITSELF (it exists now, unlike the created-new case), the selection is
+      // verified under it, and the client gets the MERGE pair (GT-11).
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['10', '/usr/bin/stat', '-f', '-c', '%S %a', NEWLOC],
+        result: { stdout: '4096 1000000\n', stderr: '', exitCode: 0 },
+      })
+      mock.addFixture({
+        command: TIMEOUT,
+        args: ['30', '/usr/bin/find', '-P', `${NEWLOC}/alpha.txt`, '-maxdepth', '0', '-printf', '%p\n'],
+        result: { stdout: `${NEWLOC}/alpha.txt\n`, stderr: '', exitCode: 0 },
+      })
+      mock.addFixture({
+        command: PBC,
+        args: ['restore', SNAP, 'data.pxar', NEWLOC, '--ns', 'gtrestore', '--pattern', '/alpha.txt', '--allow-existing-dirs', '--overwrite'],
+        result: { stdout: '', stderr: 'restore complete (2.546 KiB processed in <0.1s, average 777.059 KiB/s)    \r', exitCode: 0 },
+      })
+
+      const payload = newLocationBody()
+      const first = await post(payload)
+      assert.equal(first.statusCode, 409)
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code, 'a confirm code is issued')
+      const err = (first.json() as { error: { code: string, message: string } }).error
+      assert.equal(err.code, 'CONFIRMATION_REQUIRED')
+      assert.match(err.message, /already exists: restoring into it overwrites files with the same names and keeps everything else/)
+      assert.equal(restoreRan(), false, 'the gate refused BEFORE the client ran')
+
+      const second = await post(payload, { 'x-anas-confirm': code })
+      assert.equal(second.statusCode, 202)
+      const job = await waitForJob(server, (second.json() as { job: { id: string } }).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as BackupFilesRestoreResult
+      assert.equal(result.mode, 'newLocation')
+      assert.equal(result.merge, true, 'the record says it MERGED into a pre-existing directory')
+      const call = mock.calls.find(c => c.command === PBC && c.args[0] === 'restore')!
+      assert.ok(call.args.includes('--allow-existing-dirs'))
+      assert.ok(call.args.includes('--overwrite'))
     })
 
-    it('an existing path is refused — newLocation always creates, never merges', async () => {
+    it('an existing path that is NOT a directory is a plain 400 — no gate, nothing ran', async () => {
       const mock = mockOf(server)
       mock.addFixture({
         command: TIMEOUT,
@@ -703,13 +760,14 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
       mock.addFixture({
         command: TIMEOUT,
         args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
-        result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
+        result: { stdout: 'regular file\n', stderr: '', exitCode: 0 },
       })
       const res = await post(newLocationBody())
-      assert.equal(res.statusCode, 409)
-      const message = (res.json() as { error: { message: string } }).error.message
-      assert.match(message, /already exists/)
-      assert.match(message, /newLocation/)
+      assert.equal(res.statusCode, 400)
+      const err = (res.json() as { error: { code: string, message: string } }).error
+      assert.equal(err.code, 'VALIDATION_ERROR')
+      assert.match(err.message, /already exists and is not a directory/)
+      assert.equal(res.headers['x-anas-confirm-code'], undefined)
       assert.equal(restoreRan(), false)
     })
 
@@ -795,7 +853,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
 
   // --- Failure --------------------------------------------------------------
 
-  it('a failed restore fails the JOB and labels the side-by-side directory', async () => {
+  it('a failed restore fails the JOB and removes the EMPTY newLocation directory it created', async () => {
     const mock = mockOf(server)
     mock.addFixture({
       command: TIMEOUT,
@@ -804,7 +862,7 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['10', '/usr/bin/stat', '-c', '%F', SIDE],
+      args: ['10', '/usr/bin/stat', '-c', '%F', NEWLOC],
       result: { stdout: '', stderr: 'No such file', exitCode: 1 },
     })
     mock.addFixture({
@@ -814,12 +872,12 @@ describe('POST /v1/backup/restore — kind: files (story backup2.6)', () => {
     })
     mock.addFixture({
       command: TIMEOUT,
-      args: ['30', '/usr/bin/find', '-P', SIDE, '-mindepth', '1', '-maxdepth', '1', '-printf', '.'],
+      args: ['30', '/usr/bin/find', '-P', NEWLOC, '-mindepth', '1', '-maxdepth', '1', '-printf', '.'],
       result: { stdout: '', stderr: '', exitCode: 0 },
     })
     mock.addFixture({
       command: PBC,
-      args: ['restore', SNAP, 'data.pxar', SIDE, '--ns', 'gtrestore', '--pattern', '/alpha.txt'],
+      args: ['restore', SNAP, 'data.pxar', NEWLOC, '--ns', 'gtrestore', '--pattern', '/alpha.txt'],
       result: { stdout: '', stderr: 'Error: client error (Connect)\n\nCaused by:\n    error connecting to https://localhost:8007/ - tcp connect error: Connection refused (os error 111)\n', exitCode: 255 },
     })
     const res = await post(body())

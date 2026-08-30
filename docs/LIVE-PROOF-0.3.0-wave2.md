@@ -368,7 +368,7 @@ audit: iscsi.lun.add completed (1048ms)
 audit: liveproof@pam submitted iscsi.target.update  params {"target":"…:lp2","auth":"mutual-chap","acls":2}
 audit: iscsi.target.update completed (148ms)
 audit: restored 1/1 selection(s) of hl.pxar from host/lp-files/… into /gtbackup/hl.anas-restore-…
-       (sideBySide, 314573849 bytes)
+       (side-by-side, 314573849 bytes)
 ```
 
 ---

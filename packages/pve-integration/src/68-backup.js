@@ -5654,8 +5654,10 @@
     //
     //  The what/where part FOLLOWS the picked archive's kind:
     //    * `pxar` → the file restore half (backup2.6/2.10): selections, the
-    //      three destinations (side-by-side / in-place merge, gated for trees
-    //      / a new location), ownership toggles, estimate, rate.
+    //      two destinations (into the original — a merge, gated for trees /
+    //      somewhere else — a directory the operator names; created if new,
+    //      or merged into, after the daemon's confirm, if it exists),
+    //      ownership toggles, estimate, rate.
     //    * `img` → the image restore half (backup2.7/2.10): This LUN (a block
     //      image is restored WHOLE, exactly its size) or A new LUN… (fresh
     //      backing at the image's size on ANAS's imagined target combo).
@@ -5673,31 +5675,6 @@
     //  owns every refusal and the confirm gate; this screen's job is to say,
     //  before the button is pressed, exactly what is about to happen.
     // ======================================================================
-
-    /** The `<type>/<id>/<RFC3339>` snapshot id, split — display only. */
-    var SNAPSHOT_ID_RE = /^([^/]+)\/([^/]+)\/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$/;
-
-    /**
-     * The side-by-side directory the daemon will create:
-     * `<home>.anas-restore-<snapshot time>`, colons turned to dashes because a
-     * colon cannot be represented over SMB and this directory very often lands
-     * inside a share.
-     *
-     * DISPLAY ONLY. The daemon computes the real one from the same rule and its
-     * answer is what lands on disk; this is here so the screen can show the name
-     * before the operator commits, never to decide it.
-     */
-    function sideBySideName(home, snapshot) {
-        var m = SNAPSHOT_ID_RE.exec(trim(snapshot));
-        if (!m) {
-            return '';
-        }
-        var base = trim(home).replace(/\/+$/, '');
-        if (!base || base === '/') {
-            return '';
-        }
-        return base + '.anas-restore-' + m[3].replace(/:/g, '-');
-    }
 
     /**
      * The archives of one snapshot row that a FILE restore may offer — the
@@ -5765,7 +5742,12 @@
      *
      * Only an IN-PLACE restore whose selection holds a directory. A single
      * explicitly picked file restored in place is not gated — the operator
-     * pointed at that file and ticked the box, and that IS the consent. The
+     * pointed at that file and ticked the box, and that IS the consent.
+     *
+     * A `newLocation` restore whose chosen directory ALREADY EXISTS is also
+     * gated by the daemon (its 409 + confirm code) — but the dialog cannot
+     * know from here whether the path exists, so this helper does not
+     * predict it; the confirm flow handles either gate the same way. The
      * daemon decides; this only lets the dialog say so in advance.
      */
     function needsConfirm(mode, rows) {
@@ -5783,7 +5765,7 @@
      */
     function restoreBody(ctx) {
         var c = ctx || {};
-        var mode = c.mode === 'newLocation' ? 'newLocation' : (c.mode === 'inPlace' ? 'inPlace' : 'sideBySide');
+        var mode = c.mode === 'inPlace' ? 'inPlace' : 'newLocation';
         var body = {
             kind: 'files',
             repo: c.repo,
@@ -5799,9 +5781,11 @@
         if (trim(c.task)) {
             body.task = trim(c.task);
         }
-        // In `sideBySide`/`inPlace` the path names the archive's live HOME. In
-        // `newLocation` (backup2.10) it IS the new directory the restore
-        // creates — always carried, so the daemon never has to guess.
+        // In `inPlace` the path names the archive's live HOME. In
+        // `newLocation` (backup2.10) it IS the destination directory —
+        // created if it does not exist, merged into (after the daemon's
+        // confirm) if it does — always carried, so the daemon never has
+        // to guess.
         var path = mode === 'newLocation' ? trim(c.newPath) : trim(c.home);
         if (path) {
             body.target.path = path;
@@ -5879,9 +5863,9 @@
     }
 
     /**
-     * The target choice from the THREE radios — side-by-side (the default),
-     * in place, or a NEW location (backup2.10). Reads the radio group by
-     * itemId, never a mirrored flag.
+     * The target choice from the TWO radios — somewhere else (the default),
+     * or into the original (backup2.10, ruling 2026-08-29). Reads the radio
+     * group by itemId, never a mirrored flag.
      */
     function restoreTargetMode(win) {
         try {
@@ -5893,7 +5877,7 @@
         } catch (e) {
             // fall through to the default
         }
-        return 'sideBySide';
+        return 'newLocation';
     }
 
     /** The dialog's live context — every field read by itemId, never mirrored. */
@@ -5963,19 +5947,14 @@
                     + enc(t('The selection includes a directory, so ANAS will ask you to confirm before it runs.'))
                     + '</span>';
             }
-        } else if (ctx.mode === 'newLocation') {
+        } else {
             var loc = trim(ctx.newPath);
             targetHtml = loc
                 ? '<span style="font-family:monospace;">' + enc(loc) + '</span><br>'
-                    + mutedSpan(t('A NEW directory of your choosing, created by this restore (parents included). '
-                        + 'Nothing already on disk is touched.'))
-                : mutedSpan(t('Name the NEW directory the restore creates.'));
-        } else {
-            var name = sideBySideName(ctx.home, ctx.snapshot);
-            targetHtml = name
-                ? '<span style="font-family:monospace;">' + enc(name) + '</span><br>'
-                    + mutedSpan(t('A NEW directory beside the source. Nothing already on disk is touched.'))
-                : mutedSpan(t('Pick a point in time and a source directory to see the target.'));
+                    + mutedSpan(t('Created by this restore if it does not exist. If it already exists, ANAS will '
+                        + 'ask you to confirm and then merge into it: files with the same names are replaced, '
+                        + 'everything else is kept.'))
+                : mutedSpan(t('Name the directory the restore writes into.'));
         }
         restoreNote(win, 'restoreTargetNote', targetHtml);
 
@@ -6067,7 +6046,7 @@
      * The archive choice drives the what/where part. Switching kind ALSO clears
      * the other half's state — no stale `selections` may ride an image body, no
      * stale target choice a files body — and the destination re-defaults to
-     * This LUN / side-by-side every time the part appears.
+     * This LUN / somewhere else every time the part appears.
      */
     function restoreArchiveChanged(win, node) {
         var kind = currentArchiveKind(win);
@@ -6084,7 +6063,7 @@
                 win._selectionRows = [];
                 var filesTarget = win.down('#restoreTargetKind');
                 if (filesTarget) {
-                    try { filesTarget.setValue({ restoreTarget: 'sideBySide' }); } catch (eT) { /* non-fatal */ }
+                    try { filesTarget.setValue({ restoreTarget: 'newLocation' }); } catch (eT) { /* non-fatal */ }
                 }
                 var destG = win.down('#restoreDest');
                 if (destG) {
@@ -6110,7 +6089,8 @@
             }
             applyArchiveHome(win);
             refreshRestore(win);
-            // Files restores validate on submit — the button is always live.
+            // Files restores validate on submit; the one dead-button case is a
+            // `newLocation` restore without its directory (the gate checks it).
             updateSubmitGate(win, true);
         }
         setRestorePartVisibility(win);
@@ -6302,13 +6282,15 @@
                 + enc(t('Pick a point in time, an archive and at least one entry.')) + '</span>');
             return;
         }
-        // A newLocation restore is refused by the daemon without the directory it
-        // creates — say it before the button is pressed, in the target line.
+        // A newLocation restore is refused by the daemon without its
+        // directory — say it before the button is pressed, in the target line
+        // (the button is already dead in this shape; this is the same rule
+        // said where the operator is looking).
         if (ctx.mode === 'newLocation' && !ctx.newPath) {
             restoreNote(win, 'restoreTargetNote',
                 '<span style="color:var(--anas-danger,#c23b2c);">'
-                + enc(t('Name the NEW directory this restore creates. It must not exist yet — the restore '
-                    + 'creates it and its parents; an existing directory is refused, never merged.')) + '</span>');
+                + enc(t('Name the directory this restore writes into. It is created if it does not '
+                    + 'exist; if it already exists, ANAS will ask you to confirm and merge into it.')) + '</span>');
             return;
         }
         ANAS.confirmAndRun({
@@ -6923,7 +6905,12 @@
             return;
         }
         if (currentArchiveKind(win) !== 'img') {
-            submit.setDisabled(false);
+            // The files half gates EXACTLY one thing: a `newLocation` restore
+            // without its directory. The daemon may still ask its own
+            // confirms (in-place tree, an existing chosen directory) — those
+            // are the 409 dance, not a dead button.
+            var ctx = restoreContext(win);
+            submit.setDisabled(ctx.mode === 'newLocation' && !ctx.newPath);
             return;
         }
         submit.setDisabled(imageOk !== true);
@@ -7292,9 +7279,13 @@
                     value: '',
                     listeners: { change: function () { refreshRestore(win); } },
                 },
-                // backup2.10 — the THREE-way destination choice. Side-by-side is
-                // the default and stays untouched; in place keeps its merge/gate
-                // semantics; a NEW location names a directory the restore creates.
+                // backup2.10 — the TWO-way destination choice (ruling
+                // 2026-08-29: the beside-the-original mode is dropped — no
+                // established backup tool has one). Into the original keeps
+                // its merge/gate semantics; somewhere else names a directory
+                // that is created if new, or merged into after the daemon's
+                // confirm if it exists. Somewhere-else is the default and its
+                // path is REQUIRED — Restore stays dead until it is typed.
                 {
                     xtype: 'radiogroup',
                     itemId: 'restoreTargetKind',
@@ -7304,14 +7295,15 @@
                     columns: 1,
                     vertical: true,
                     items: [
-                        { boxLabel: t('Original place (side-by-side)'), name: 'restoreTarget', inputValue: 'sideBySide', checked: true },
-                        { boxLabel: t('Original place, in place (merge)'), name: 'restoreTarget', inputValue: 'inPlace' },
-                        { boxLabel: t('New location\u2026'), name: 'restoreTarget', inputValue: 'newLocation' },
+                        { boxLabel: t('Into the original \u2014 overwrite matching files, keep the rest'), name: 'restoreTarget', inputValue: 'inPlace' },
+                        { boxLabel: t('Somewhere else\u2026'), name: 'restoreTarget', inputValue: 'newLocation', checked: true },
                     ],
                     listeners: {
                         change: function (grp) {
                             try {
-                                refreshRestore(grp.up('window'));
+                                var win = grp.up('window');
+                                refreshRestore(win);
+                                updateSubmitGate(win);
                             } catch (e) {
                                 // non-fatal
                             }
@@ -7321,7 +7313,7 @@
                 {
                     xtype: 'fieldcontainer',
                     itemId: 'restoreNewLocationWrap',
-                    fieldLabel: t('New directory'),
+                    fieldLabel: t('Destination directory'),
                     labelWidth: 130,
                     hidden: true,
                     disabled: true,
@@ -7333,7 +7325,12 @@
                             cls: 'anas-fld-restore-new-location',
                             flex: 1,
                             emptyText: t('/srv/restores/pictures-2026-08-25'),
-                            listeners: { change: function () { refreshRestore(win); } },
+                            listeners: {
+                                change: function () {
+                                    refreshRestore(win);
+                                    updateSubmitGate(win);
+                                }
+                            },
                         },
                         {
                             xtype: 'button',
@@ -7349,8 +7346,9 @@
                     xtype: 'component',
                     itemId: 'restoreNewLocationNote',
                     padding: '2 0 0 130',
-                    html: mutedSpan(t('A NEW directory \u2014 it must NOT exist yet. The restore creates it, parents '
-                        + 'included; an existing directory is refused, never merged into.')),
+                    html: mutedSpan(t('Created by this restore if it does not exist. If it already exists, ANAS '
+                        + 'will ask you to confirm and then merge into it: files with the same names are '
+                        + 'replaced, everything else is kept.')),
                 },
                 {
                     xtype: 'fieldcontainer',
@@ -7972,7 +7970,6 @@
         archiveBytes: archiveBytes,
         hasDirectorySelection: hasDirectorySelection,
         needsConfirm: needsConfirm,
-        sideBySideName: sideBySideName,
         open: openRestoreDialog,
     };
 

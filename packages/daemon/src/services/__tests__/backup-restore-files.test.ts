@@ -12,7 +12,6 @@ import {
   parseSnapshotId,
   restorePatternFor,
   restorePatternsFor,
-  sideBySideRestorePath,
 } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import {
@@ -32,7 +31,7 @@ import {
   parseRestoreProgress,
   PARTIAL_MARKER_NAME,
   partialMarkerReason,
-  pathExists,
+  pathKind,
   progressSummaryLine,
   pveTerritoryReason,
   readSelectionFacts,
@@ -72,6 +71,11 @@ const REPO = {
 }
 const SNAP = 'host/gtrestore/2026-08-25T19:16:45Z'
 
+/**
+ * The run deps. The default is a `newLocation` restore that CREATES its own
+ * directory (merge: false) — the one shape that owns its target; an in-place
+ * or a confirmed merge passes `merge: true`.
+ */
 function deps(overrides: Record<string, unknown> = {}) {
   return {
     repo: REPO,
@@ -79,8 +83,9 @@ function deps(overrides: Record<string, unknown> = {}) {
     namespace: 'gtrestore',
     snapshot: SNAP,
     archive: 'data.pxar',
-    target: '/gtbackup/data.anas-restore-2026-08-25T19-16-45Z',
-    mode: 'sideBySide' as const,
+    target: '/gtbackup/data-restore-2026-08-25',
+    mode: 'newLocation' as const,
+    merge: false,
     selections: ['/alpha.txt'],
     options: {},
     ...overrides,
@@ -143,16 +148,40 @@ describe('backup2.6 — a snapshot id without a timestamp is refused', () => {
       selections: ['/alpha.txt'],
     })
     assert.equal(bad.success, false)
-    const good = BackupFilesRestoreRequest.safeParse({
+    // With the beside-the-original mode dropped there is no destination the
+    // daemon may name on the operator's behalf — a restore without one is
+    // refused at the boundary, never guessed.
+    const noDestination = BackupFilesRestoreRequest.safeParse({
       kind: 'files',
       repo: 'pbs-main',
       snapshot: SNAP,
       archive: 'data.pxar',
       selections: ['/alpha.txt'],
     })
+    assert.equal(noDestination.success, false)
+    assert.match(JSON.stringify(noDestination.error), /target/)
+    const newLocationNoPath = BackupFilesRestoreRequest.safeParse({
+      kind: 'files',
+      repo: 'pbs-main',
+      snapshot: SNAP,
+      archive: 'data.pxar',
+      selections: ['/alpha.txt'],
+      target: { mode: 'newLocation' },
+    })
+    assert.equal(newLocationNoPath.success, false)
+    assert.match(JSON.stringify(newLocationNoPath.error), /the directory it writes into/)
+    const good = BackupFilesRestoreRequest.safeParse({
+      kind: 'files',
+      repo: 'pbs-main',
+      snapshot: SNAP,
+      archive: 'data.pxar',
+      selections: ['/alpha.txt'],
+      target: { mode: 'inPlace' },
+    })
     assert.equal(good.success, true)
-    // Defaults: side-by-side, no ignore flags.
-    assert.equal(good.data?.target.mode, 'sideBySide')
+    // Defaults: in-place target without a path (the task supplies the home),
+    // no ignore flags.
+    assert.equal(good.data?.target.mode, 'inPlace')
     assert.deepEqual(good.data?.options, {})
   })
 
@@ -179,7 +208,7 @@ describe('backup2.6 — a snapshot id without a timestamp is refused', () => {
   })
 
   it('both target modes parse, and a bad one does not', () => {
-    for (const mode of ['sideBySide', 'inPlace']) {
+    for (const mode of ['inPlace', 'newLocation']) {
       const r = BackupFilesRestoreRequest.safeParse({
         kind: 'files',
         repo: 'pbs-main',
@@ -264,54 +293,28 @@ describe('backup2.6 — restorePatternFor against the ground-truth names', () =>
 })
 
 // ============================================================================
-//  3. The side-by-side directory name
-// ============================================================================
-
-describe('backup2.6 — the side-by-side directory', () => {
-  it('is <home>.anas-restore-<snapshot time>, colon-free for SMB', () => {
-    assert.equal(
-      sideBySideRestorePath('/gtbackup/data', SNAP),
-      '/gtbackup/data.anas-restore-2026-08-25T19-16-45Z',
-    )
-    assert.equal(
-      sideBySideRestorePath('/gtbackup/data/', SNAP),
-      '/gtbackup/data.anas-restore-2026-08-25T19-16-45Z',
-    )
-  })
-
-  it('is deterministic — the same snapshot always names the same directory', () => {
-    assert.equal(sideBySideRestorePath('/srv/x', SNAP), sideBySideRestorePath('/srv/x', SNAP))
-  })
-
-  it('refuses the filesystem root and a snapshot id with no timestamp', () => {
-    assert.equal(sideBySideRestorePath('/', SNAP), null)
-    assert.equal(sideBySideRestorePath('/gtbackup/data', 'host/gtrestore'), null)
-  })
-})
-
-// ============================================================================
-//  4. argv per mode — the flags exactly as the matrix measured them
+//  3. argv per merge state — the flags exactly as the matrix measured them
 // ============================================================================
 
 describe('backup2.6 — buildRestoreArgs', () => {
-  it('side-by-side emits NO overwrite flags at all (GT-15)', () => {
+  it('a brand-new newLocation directory emits NO overwrite flags at all (GT-15)', () => {
     // Captured: restoring into a NEW directory needs no flags and the directory
     // need not exist; deep missing parents are created.
     assert.deepEqual(
       buildRestoreArgs({
         snapshot: SNAP,
         archive: 'data.pxar',
-        target: '/gtbackup/data.anas-restore-2026-08-25T19-16-45Z',
+        target: '/gtbackup/data-restore-2026-08-25',
         namespace: 'gtrestore',
         patterns: ['/alpha.txt'],
-        mode: 'sideBySide',
+        merge: false,
         options: {},
       }),
       [
         'restore',
         SNAP,
         'data.pxar',
-        '/gtbackup/data.anas-restore-2026-08-25T19-16-45Z',
+        '/gtbackup/data-restore-2026-08-25',
         '--ns',
         'gtrestore',
         '--pattern',
@@ -329,7 +332,7 @@ describe('backup2.6 — buildRestoreArgs', () => {
       archive: 'data.pxar',
       target: '/gtbackup/data',
       patterns: ['/docs'],
-      mode: 'inPlace',
+      merge: true,
       options: {},
     })
     assert.deepEqual(args, [
@@ -345,6 +348,26 @@ describe('backup2.6 — buildRestoreArgs', () => {
     assert.ok(!args.includes('--overwrite-files'), '--overwrite covers files/symlinks/hardlinks')
   })
 
+  it('a CONFIRMED newLocation merge emits the SAME pair as in-place (GT-11)', () => {
+    // The merge decision rides on whether the target ALREADY EXISTED, not on
+    // the mode's name: a newLocation whose chosen directory passed the
+    // confirm gate restores with the in-place flags, no more, no less.
+    const args = buildRestoreArgs({
+      snapshot: SNAP,
+      archive: 'data.pxar',
+      target: '/gtbackup/data',
+      patterns: ['/docs'],
+      merge: true,
+      options: {},
+    })
+    assert.deepEqual(args.slice(args.indexOf('--pattern')), [
+      '--pattern',
+      '/docs',
+      '--allow-existing-dirs',
+      '--overwrite',
+    ])
+  })
+
   it('a single picked FILE in place still ships --allow-existing-dirs (GT-26)', () => {
     // Captured: `--pattern /docs/readme.md --overwrite` → 255 "failed to get
     // parent directory file descriptor: EEXIST"; with the dir flag → exit 0.
@@ -353,7 +376,7 @@ describe('backup2.6 — buildRestoreArgs', () => {
       archive: 'data.pxar',
       target: '/gtbackup/data',
       patterns: ['/docs/readme.md'],
-      mode: 'inPlace',
+      merge: true,
       options: {},
     })
     assert.ok(args.includes('--allow-existing-dirs'))
@@ -365,7 +388,7 @@ describe('backup2.6 — buildRestoreArgs', () => {
       archive: 'data.pxar',
       target: '/t',
       patterns: ['/alpha.txt', '/docs/readme.md'],
-      mode: 'sideBySide',
+      merge: false,
       options: {},
     })
     assert.deepEqual(
@@ -380,7 +403,7 @@ describe('backup2.6 — buildRestoreArgs', () => {
       archive: 'data.pxar',
       target: '/t',
       patterns: [],
-      mode: 'sideBySide',
+      merge: false,
       options: {},
     })
     assert.deepEqual(args, ['restore', SNAP, 'data.pxar', '/t'])
@@ -392,7 +415,7 @@ describe('backup2.6 — buildRestoreArgs', () => {
       archive: 'data.pxar',
       target: '/t',
       patterns: [],
-      mode: 'sideBySide',
+      merge: false,
       options: { ignoreOwnership: true, ignoreAcls: true, ignoreXattrs: true, ignorePermissions: true },
       rate: '3MB',
     })
@@ -414,7 +437,7 @@ describe('backup2.6 — buildRestoreArgs', () => {
       archive: 'data.pxar',
       target: '/t',
       patterns: [],
-      mode: 'sideBySide',
+      merge: false,
       options: { ignoreOwnership: false },
     })
     assert.ok(!none.some(a => a.startsWith('--ignore')))
@@ -866,16 +889,21 @@ describe('backup2.6 — local pre-flight probes', () => {
     assert.equal(await availableBytes(mock, '/t'), null)
   })
 
-  it('pathExists answers from a bounded stat, and null on a timeout', async () => {
-    const yes = new MockExecutor()
-    yes.addFixture({ command: TIMEOUT, result: { stdout: 'directory\n', stderr: '', exitCode: 0 } })
-    assert.equal(await pathExists(yes, '/t'), true)
+  it('pathKind answers the KIND from a bounded stat, and null when it cannot answer', async () => {
+    // null covers BOTH "does not exist" and "the probe could not finish" —
+    // the route treats both the same (fall through to the write test).
+    const dir = new MockExecutor()
+    dir.addFixture({ command: TIMEOUT, result: { stdout: 'directory\n', stderr: '', exitCode: 0 } })
+    assert.equal(await pathKind(dir, '/t'), 'directory')
+    const file = new MockExecutor()
+    file.addFixture({ command: TIMEOUT, result: { stdout: 'regular file\n', stderr: '', exitCode: 0 } })
+    assert.equal(await pathKind(file, '/t'), 'regular file')
     const no = new MockExecutor()
     no.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: 'No such file', exitCode: 1 } })
-    assert.equal(await pathExists(no, '/t'), false)
+    assert.equal(await pathKind(no, '/t'), null)
     const dead = new MockExecutor()
     dead.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: '', exitCode: 124 } })
-    assert.equal(await pathExists(dead, '/t'), null)
+    assert.equal(await pathKind(dead, '/t'), null)
   })
 
   it('verification is a BOUNDED probe of the exact paths — it never walks the tree', async () => {
@@ -957,7 +985,7 @@ describe('backup2.6 — runFileRestore', () => {
   it('sends the argv, parses progress, and verifies what landed', async () => {
     const mock = restoreMock(
       { stderr: 'restore complete (2.546 KiB processed in <0.1s, average 777 KiB/s)    \r', exitCode: 0 },
-      [{ stdout: '/gtbackup/data.anas-restore-2026-08-25T19-16-45Z/alpha.txt\n', exitCode: 0 }],
+      [{ stdout: '/gtbackup/data-restore-2026-08-25/alpha.txt\n', exitCode: 0 }],
     )
     const progress: string[] = []
     const result = await runFileRestore(mock, deps(), m => progress.push(m))
@@ -972,7 +1000,7 @@ describe('backup2.6 — runFileRestore', () => {
       'restore',
       SNAP,
       'data.pxar',
-      '/gtbackup/data.anas-restore-2026-08-25T19-16-45Z',
+      '/gtbackup/data-restore-2026-08-25',
       '--ns',
       'gtrestore',
       '--pattern',
@@ -1003,7 +1031,7 @@ describe('backup2.6 — runFileRestore', () => {
     )
     const result = await runFileRestore(
       mock,
-      deps({ mode: 'inPlace', target: '/gtbackup/data', selections: ['/docs'] }),
+      deps({ mode: 'inPlace', merge: true, target: '/gtbackup/data', selections: ['/docs'] }),
       () => {},
     )
     assert.equal(result.merge, true)
@@ -1012,7 +1040,7 @@ describe('backup2.6 — runFileRestore', () => {
     assert.ok(call.args.includes('--allow-existing-dirs') && call.args.includes('--overwrite'))
   })
 
-  it('a failed side-by-side restore that WROTE something is LABELLED partial (GT-60)', async () => {
+  it('a failed newLocation restore that CREATED its directory and WROTE something is LABELLED partial (GT-60)', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'anas-restore-partial-'))
     try {
       const mock = restoreMock(
@@ -1070,7 +1098,9 @@ describe('backup2.6 — runFileRestore', () => {
     }
   })
 
-  it('a failed side-by-side restore that wrote NOTHING removes the empty directory', async () => {
+  it('a failed newLocation restore whose created directory is EMPTY removes it', async () => {
+    // The cleanup rule: only a directory THIS restore created is ever
+    // removed or labelled — a merged-into directory is never touched.
     const mock = restoreMock(
       { stderr: 'Error: snapshot host/gtrestore/2020-01-01T00:00:00Z does not exist.\n', exitCode: 255 },
       [
@@ -1089,12 +1119,31 @@ describe('backup2.6 — runFileRestore', () => {
     assert.deepEqual(rmCall.args, ['10', '/usr/bin/rm', '-d', '-f', deps().target])
   })
 
+  it('a failed CONFIRMED newLocation merge touches NOTHING — no marker, no removal (GT-60)', async () => {
+    // Same rule as in-place: the directory pre-existed, so the tree belongs
+    // to the operator. The error says the directory is now a mixture.
+    const mock = restoreMock(
+      { stderr: 'progress 40% (101.305 MiB of 250.001 MiB in 36.1s, 2.868 MiB/s)\r', exitCode: 137 },
+    )
+    await assert.rejects(
+      () => runFileRestore(mock, deps({ mode: 'newLocation', merge: true, target: '/gtbackup/data' }), () => {}),
+      (err: Error) => {
+        assert.match(err.message, /was restored INTO/)
+        assert.match(err.message, /mixture of its previous contents/)
+        assert.match(err.message, /short AND mode 0600/)
+        return true
+      },
+    )
+    assert.ok(!mock.calls.some(c => c.args.some(a => a.includes(PARTIAL_MARKER_NAME))))
+    assert.ok(!mock.calls.some(c => c.args.includes('/usr/bin/rm')))
+  })
+
   it('an IN-PLACE failure writes no marker at all, and names the 0600 hint (GT-60)', async () => {
     const mock = restoreMock(
       { stderr: 'progress 40% (101.305 MiB of 250.001 MiB in 36.1s, 2.868 MiB/s)\r', exitCode: 137 },
     )
     await assert.rejects(
-      () => runFileRestore(mock, deps({ mode: 'inPlace', target: '/gtbackup/data' }), () => {}),
+      () => runFileRestore(mock, deps({ mode: 'inPlace', merge: true, target: '/gtbackup/data' }), () => {}),
       (err: Error) => {
         assert.match(err.message, /interrupted/)
         assert.match(err.message, /mixture of its previous contents/)

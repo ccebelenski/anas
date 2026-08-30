@@ -5689,8 +5689,9 @@ async function iscsiPortalWarningChecks() {
 //  5c. backup2.6 — the RESTORE doors: what each mode SENDS
 //
 //  What this guards:
-//    · the request body in EVERY mode — side-by-side (the default), in place,
-//      the task door and the task-less repository door
+//    · the request body in EVERY mode — into the original (merge) and
+//      somewhere else (the default, path required), through the task door
+//      and the task-less repository door
 //    · omission is meaningful: an un-ticked ignore flag, an empty namespace and
 //      an empty rate are ABSENT, never `false`/`''`
 //    · the confirm-code dance is predicted for an in-place TREE and ONLY for
@@ -5872,17 +5873,6 @@ async function restoreChecks() {
 
   // --- pure helpers --------------------------------------------------------
 
-  eq('file restore: the side-by-side name is <home>.anas-restore-<time>, colon-free',
-    R.sideBySideName('/mnt/pictures', 'host/pictures/2026-08-25T19:16:45Z'),
-    '/mnt/pictures.anas-restore-2026-08-25T19-16-45Z')
-  eq('file restore: a trailing slash on the home does not double up',
-    R.sideBySideName('/mnt/pictures/', 'host/pictures/2026-08-25T19:16:45Z'),
-    '/mnt/pictures.anas-restore-2026-08-25T19-16-45Z')
-  eq('file restore: no name without a full snapshot id (a bare group means LATEST)',
-    R.sideBySideName('/mnt/pictures', 'host/pictures'), '')
-  eq('file restore: no name beside the filesystem root',
-    R.sideBySideName('/', 'host/pictures/2026-08-25T19:16:45Z'), '')
-
   const ARCHIVES = FILE_RESTORE_SNAPSHOTS.data.snapshots[0].files
     .filter(f => f.archive)
     .map(f => ({ archive: f.archive, kind: f.kind, size: f.size }))
@@ -5901,11 +5891,11 @@ async function restoreChecks() {
     R.needsConfirm('inPlace', [FILE_ROW, DIR_ROW]) === true)
   ok('file restore: in place + only files does NOT — the checkbox is the consent',
     R.needsConfirm('inPlace', [FILE_ROW]) === false)
-  ok('file restore: side-by-side is never gated, even for a whole tree',
-    R.needsConfirm('sideBySide', [DIR_ROW]) === false)
-  // backup2.10 — a NEW location is even less dangerous than side-by-side: it
-  // writes only into a directory the restore itself creates, so it is never gated.
-  ok('file restore: a new location is never gated, even for a whole tree',
+  // A newLocation restore whose chosen directory ALREADY EXISTS is also gated
+  // by the daemon (its own 409 + confirm code) — but the dialog cannot see
+  // whether the path exists, so this helper does not predict it; the confirm
+  // flow answers either gate the same way.
+  ok('file restore: a new location is never PREDICTED gated (the daemon decides)',
     R.needsConfirm('newLocation', [DIR_ROW]) === false)
   ok('file restore: a typed selection with no row is not gated either',
     R.needsConfirm('inPlace', []) === false)
@@ -5919,36 +5909,33 @@ async function restoreChecks() {
     snapshot: 'host/pictures/2026-08-25T19:16:45Z',
     archive: 'data.pxar',
     selections: ['/alpha.txt'],
-    mode: 'sideBySide',
     home: '/mnt/pictures',
   }
-  eq('file restore: the side-by-side body (the default) is exactly this', R.restoreBody(CTX), {
-    kind: 'files',
-    repo: 'pbs-main',
-    snapshot: 'host/pictures/2026-08-25T19:16:45Z',
-    archive: 'data.pxar',
-    selections: ['/alpha.txt'],
-    target: { mode: 'sideBySide', path: '/mnt/pictures' },
-    options: {},
-    ns: 'anas/pictures',
-    task: 'nightly-pictures',
-  })
-  eq('file restore: the in-place body differs ONLY in the mode',
-    R.restoreBody({ ...CTX, mode: 'inPlace' }).target, { mode: 'inPlace', path: '/mnt/pictures' })
-  // backup2.10 — the third door. newLocation carries the chosen path (trimmed)
-  // as the target, and its home is IGNORED (the daemon creates the new dir from
-  // `target.path`, never from the archive's live home).
-  eq('file restore: the newLocation body carries the chosen NEW directory',
+  eq('file restore: the inPlace body (into the original) is exactly this',
+    R.restoreBody({ ...CTX, mode: 'inPlace' }), {
+      kind: 'files',
+      repo: 'pbs-main',
+      snapshot: 'host/pictures/2026-08-25T19:16:45Z',
+      archive: 'data.pxar',
+      selections: ['/alpha.txt'],
+      target: { mode: 'inPlace', path: '/mnt/pictures' },
+      options: {},
+      ns: 'anas/pictures',
+      task: 'nightly-pictures',
+    })
+  // Somewhere else (the default radio, ruling 2026-08-29): carries the chosen
+  // directory (trimmed) as the target; the archive's live home is IGNORED.
+  eq('file restore: the newLocation body carries the chosen directory',
     R.restoreBody({ ...CTX, mode: 'newLocation', newPath: ' /srv/restores/pictures ' }).target,
     { mode: 'newLocation', path: '/srv/restores/pictures' })
-  eq('file restore: sideBySide/inPlace bodies ignore the newLocation path field',
-    R.restoreBody({ ...CTX, home: '/mnt/pictures', newPath: '/srv/restores/pictures' }).target,
-    { mode: 'sideBySide', path: '/mnt/pictures' })
-  // Every key OUTSIDE `target` is byte-identical to the side-by-side body —
-  // the new door changes exactly one thing.
-  eq('file restore: every other key of a newLocation body is byte-identical to today',
+  eq('file restore: an inPlace body ignores the newLocation path field',
+    R.restoreBody({ ...CTX, mode: 'inPlace', newPath: '/srv/restores/pictures' }).target,
+    { mode: 'inPlace', path: '/mnt/pictures' })
+  // Every key OUTSIDE `target` is byte-identical between the two modes —
+  // the destination is the only thing that differs.
+  eq('file restore: every other key of a newLocation body is byte-identical to inPlace',
     (() => { const a = R.restoreBody({ ...CTX, mode: 'newLocation', newPath: '/srv/restores/pictures' }); delete a.target; return a })(),
-    (() => { const a = R.restoreBody(CTX); delete a.target; return a })())
+    (() => { const a = R.restoreBody({ ...CTX, mode: 'inPlace' }); delete a.target; return a })())
   eq('file restore: the task-less door sends no task key',
     Object.prototype.hasOwnProperty.call(R.restoreBody({ ...CTX, task: '' }), 'task'), false)
   eq('file restore: an empty namespace is ABSENT, never an empty string',
@@ -6078,6 +6065,24 @@ async function restoreChecks() {
   fileSelect.handler(fileSelect)
   await settle()
 
+  // The destination choice (ruling 2026-08-29): EXACTLY two radios,
+  // "Somewhere else…" is the default, and Restore stays dead until the
+  // directory is named (early validation — the daemon is still the authority).
+  const targetGroup = dlg.down('#restoreTargetKind')
+  const destRadios = targetGroup.childCmps()
+  eq('file restore: EXACTLY two destination radios', destRadios.length, 2)
+  eq('file restore: …with the two labels the ruling names, in order',
+    destRadios.map(r => r.boxLabel),
+    ['Into the original — overwrite matching files, keep the rest', 'Somewhere else…'])
+  eq('file restore: "Somewhere else…" is the default destination',
+    targetGroup.getValue(), { restoreTarget: 'newLocation' })
+  eq('file restore: Restore is DEAD until the directory is named',
+    dlg.down('#restoreSubmit').disabled, true)
+  dlg.down('#restoreNewLocation').setValue('/mnt/pictures/restore-new')
+  await settle()
+  eq('file restore: naming the directory takes Restore live',
+    dlg.down('#restoreSubmit').disabled, false)
+
   // Submit.
   const submit = dlg.down('#restoreSubmit')
   submit.handler(submit)
@@ -6096,7 +6101,7 @@ async function restoreChecks() {
     snapshot: 'host/pictures/2026-08-25T19:16:45Z',
     archive: 'data.pxar',
     selections: ['/hard-b.txt', '/hard-a.txt'],
-    target: { mode: 'sideBySide', path: '/mnt/pictures' },
+    target: { mode: 'newLocation', path: '/mnt/pictures/restore-new' },
     options: {},
     ns: 'anas/pictures',
     task: 'nightly-pictures',
@@ -6157,15 +6162,20 @@ async function restoreChecks() {
   fselectN.handler(fselectN)
   await settle()
 
-  // The third radio reveals the directory field; the first two do not carry it.
-  ok('file restore: the new-directory field is hidden until "New location…" is chosen',
-    dlgN.down('#restoreNewLocationWrap').hidden === true)
-  ok('file restore: the new-directory note says it must NOT exist yet',
-    /must NOT exist/.test(dlgN.down('#restoreNewLocationNote').html || ''),
+  // "Somewhere else…" is the DEFAULT radio, so the directory field is up front.
+  ok('file restore: the directory field is visible BY DEFAULT (somewhere-else is the default)',
+    dlgN.down('#restoreNewLocationWrap').hidden === false)
+  ok('file restore: the note says created-if-missing, confirm-then-merge-if-exists',
+    /Created by this restore if it does not exist/.test(dlgN.down('#restoreNewLocationNote').html || '')
+    && /ask you to confirm and then merge/.test(dlgN.down('#restoreNewLocationNote').html || ''),
     dlgN.down('#restoreNewLocationNote').html)
+  dlgN.down('#restoreTargetKind').setValue('inPlace')
+  await settle()
+  ok('file restore: choosing "Into the original" hides the directory field',
+    dlgN.down('#restoreNewLocationWrap').hidden === true)
   dlgN.down('#restoreTargetKind').setValue('newLocation')
   await settle()
-  ok('file restore: choosing "New location…" reveals the directory field',
+  ok('file restore: …and choosing "Somewhere else…" reveals it again',
     dlgN.down('#restoreNewLocationWrap').hidden === false)
 
   // The Browse button opens the SHARED path picker on the LIVE backend, for a
@@ -6185,9 +6195,9 @@ async function restoreChecks() {
   await settle()
   eq('file restore: the picked new directory landed in the field',
     dlgN.down('#restoreNewLocation').getValue(), '/mnt/pictures/restore-new')
-  ok('file restore: the target line names the NEW directory and that it is created',
+  ok('file restore: the target line names the directory and what happens to it',
     (dlgN.down('#restoreTargetNote').html || '').includes('/mnt/pictures/restore-new')
-    && /NEW directory/.test(dlgN.down('#restoreTargetNote').html || ''),
+    && /Created by this restore if it does not exist/.test(dlgN.down('#restoreTargetNote').html || ''),
     dlgN.down('#restoreTargetNote').html)
 
   const submitN = dlgN.down('#restoreSubmit')
@@ -6206,8 +6216,103 @@ async function restoreChecks() {
       ns: 'anas/pictures',
       task: 'nightly-pictures',
     })
-  ok('file restore: a newLocation restore is NEVER confirm-gated',
-    jobs.length && jobs[0].confirmWindow === false, JSON.stringify(jobs[0] && jobs[0].confirmWindow))
+  ok('file restore: the files half always rides confirmAndRun (the daemon may still gate an existing directory)',
+    Object.prototype.hasOwnProperty.call(jobs[0], 'confirmWindow') && jobs[0].confirmWindow === false,
+    JSON.stringify(jobs[0] && jobs[0].confirmWindow))
+
+  // --- the 409 dance: an EXISTING chosen directory (ruling 2026-08-29) ------
+  // The transport below is a double that answers the daemon's gate; the control
+  // flow mirrors 10-api.js (post → 409 + confirm code → the daemon's message in
+  // a Confirm → resend with the code). What is asserted is what 68-backup.js
+  // puts on the wire and what the operator is shown.
+  {
+    const ANASg = loadRestoreSources()
+    const EXISTS = '/gtbackup/exists'
+    const SENTENCE = `'${EXISTS}' already exists: restoring into it overwrites files with the same names and keeps everything else. Confirm to proceed.`
+    const attempts = []
+    const wireErr = () => {
+      const e = new Error(SENTENCE)
+      e.status = 409
+      e.confirmCode = 'GT-CONFIRM-1'
+      e.body = { error: { code: 'CONFIRMATION_REQUIRED', message: SENTENCE, warnings: [SENTENCE] } }
+      return e
+    }
+    // Everything EXCEPT the restore door rides the sandbox's own routes
+    // (the picker's archive browse is a POST too).
+    const realPost = ANASg.api.post
+    ANASg.api.post = (node, path, body, opts) => {
+      if (path !== '/backup/restore') { return realPost(node, path, body, opts) }
+      attempts.push({ path, body, confirmCode: opts && opts.confirmCode })
+      return (opts && opts.confirmCode)
+        ? Promise.resolve({ job: { id: 'restore-1' } })
+        : Promise.reject(wireErr())
+    }
+    ANASg.runJob = (cfg) => ANASg.api.post(cfg.node, cfg.path, cfg.body, cfg.confirmCode ? { confirmCode: cfg.confirmCode } : undefined)
+      .then((res) => {
+        if (cfg.onSubmitted) { cfg.onSubmitted(res.job) }
+        if (cfg.onComplete) { cfg.onComplete({ job: res.job, status: 'completed' }) }
+      })
+      .catch((err) => {
+        if (err && err.status === 409 && err.confirmCode && cfg.onConfirm) { cfg.onConfirm(err); return }
+        if (cfg.onFailed) { cfg.onFailed(null) }
+      })
+    ANASg.confirmAndRun = (opts) => {
+      const base = { ...opts }
+      base.onConfirm = (err) => {
+        // The plain presentation renders intro + the daemon's warnings —
+        // exactly the real confirmAndRun's message (10-api.js).
+        const warnings = (err.body && err.body.error && err.body.error.warnings) || []
+        const intro = opts.confirmIntro || 'Confirm:'
+        Ext.Msg.confirm(opts.confirmTitle || 'Confirm', intro + ANASg.warningsHtml(warnings), (btn) => {
+          if (btn === 'yes') {
+            ANASg.runJob({ ...opts, confirmCode: err.confirmCode })
+          }
+        })
+      }
+      ANASg.runJob(base)
+    }
+
+    const confirmsBefore = confirms.length
+    const dlgG = openFileRestoreDialog(ANASg, {
+      task: 'nightly-pictures',
+      repo: 'pbs-main',
+      ns: 'anas/pictures',
+      homeByArchive: { data: '/mnt/pictures' },
+    })
+    await pickFileSnapshot(dlgG)
+    dlgG.down('#restoreArchive').setValue('data.pxar')
+    await settle()
+    const filesBtnG = dlgG.down('#restoreFilesPick')
+    filesBtnG.handler(filesBtnG)
+    await settle()
+    const fpG = openWindow()
+    const alphaG = fpG.down('#pickerTree').getStore().getRootNode().childNodes.find(n => n.get('name') === 'alpha.txt')
+    fpG.down('#pickerTree').fireEvent('selectionchange', fpG.down('#pickerTree').getSelectionModel(), [alphaG])
+    const fselG = fpG.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+    fselG.handler(fselG)
+    await settle()
+    dlgG.down('#restoreNewLocation').setValue(EXISTS)
+    await settle()
+    const submitG = dlgG.down('#restoreSubmit')
+    submitG.handler(submitG)
+    await settle()
+
+    eq('confirm dance: exactly two attempts — refused, then confirmed', attempts.length, 2)
+    eq('confirm dance: the first attempt carries NO confirm code',
+      attempts[0] && attempts[0].confirmCode, undefined)
+    eq('confirm dance: the first attempt asks for the existing directory',
+      attempts[0] && attempts[0].body.target, { mode: 'newLocation', path: EXISTS })
+    eq('confirm dance: the resend carries the daemon`s confirm code',
+      attempts[1] && attempts[1].confirmCode, 'GT-CONFIRM-1')
+    eq('confirm dance: the resend is the SAME body', attempts[1] && attempts[1].body,
+      attempts[0] && attempts[0].body)
+    ok('confirm dance: the operator saw the daemon`s own sentence in a Confirm',
+      confirms.length === confirmsBefore + 1
+      && confirms[confirmsBefore].msg.includes('overwrites files with the same names and keeps everything else'),
+      confirms[confirmsBefore] && confirms[confirmsBefore].msg)
+    ok('confirm dance: no sideBySide anywhere on the wire',
+      !/sideBySide/.test(JSON.stringify(attempts)))
+  }
 
   // Nothing may be sent without a selection.
   jobs.length = 0
@@ -6404,12 +6509,12 @@ async function restoreDoorChecks() {
   // with the target re-defaulted (no stale target.mode).
   switchDlg.down('#restoreArchive').setValue('data.pxar')
   await settle()
-  eq('kind switch: the files half returns side-by-side, not the stale in-place choice',
-    switchDlg.down('#restoreTargetKind').getValue(), { restoreTarget: 'sideBySide' })
+  eq('kind switch: the files half returns somewhere-else, not the stale in-place choice',
+    switchDlg.down('#restoreTargetKind').getValue(), { restoreTarget: 'newLocation' })
   ok('kind switch: an image-mode new-LUN verdict left no stale text',
     !(switchDlg.down('#newLunVerdict').html || '').length, switchDlg.down('#newLunVerdict').html)
   // No stale `selections` may ride a files body after the round trip — pick the
-  // same entry fresh and the body is byte-clean.
+  // same entry fresh, name the (now default) destination, and the body is byte-clean.
   const switchFilesBtn2 = switchDlg.down('#restoreFilesPick')
   switchFilesBtn2.handler(switchFilesBtn2)
   await settle()
@@ -6418,6 +6523,8 @@ async function restoreDoorChecks() {
   switchPicker2.down('#pickerTree').fireEvent('selectionchange', switchPicker2.down('#pickerTree').getSelectionModel(), [alphaS2])
   const switchSel2 = switchPicker2.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
   switchSel2.handler(switchSel2)
+  await settle()
+  switchDlg.down('#restoreNewLocation').setValue('/mnt/pictures/restore-roundtrip')
   await settle()
   jobs.length = 0
   const switchSubmit = switchDlg.down('#restoreSubmit')
@@ -6430,7 +6537,7 @@ async function restoreDoorChecks() {
       snapshot: 'host/pictures/2026-08-25T19:16:45Z',
       archive: 'data.pxar',
       selections: ['/alpha.txt'],
-      target: { mode: 'sideBySide', path: '/mnt/pictures' },
+      target: { mode: 'newLocation', path: '/mnt/pictures/restore-roundtrip' },
       options: {},
       ns: 'anas/pictures',
       task: 'nightly-pictures',

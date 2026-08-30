@@ -1796,33 +1796,28 @@ export type BackupSnapshotPath = z.infer<typeof BackupSnapshotPath>
 // and §9 (failures / progress / interruption).
 
 /**
- * Where a file restore lands.
+ * Where a file restore lands — the two destinations every established backup
+ * tool offers: the original location, or a location the operator chooses
+ * (operator ruling 2026-08-29: a "beside the original under a fixed name" mode
+ * was dropped entirely — none of the tools operators already know has it, so
+ * ANAS does not either).
  *
- *   `sideBySide`  — a NEW directory beside the archive's live home, named
- *                   `<home>.anas-restore-<snapshot time>`. Needs NO flags and
- *                   the directory need not exist (GT-15). The DEFAULT, because
- *                   it cannot touch a single live byte.
- *   `inPlace`     — the live home itself, with `--allow-existing-dirs
- *                   --overwrite` (GT-11: the minimal pair — `--overwrite`
- *                   alone dies on the first existing DIRECTORY). It is a
- *                   MERGE, never a sync (GT-12): files not in the archive
- *                   SURVIVE.
- *   `newLocation` — a NEW directory of the operator's choosing
- *                   (`target.path`), which must NOT exist yet (story
- *                   backup2.10). Restored with no overwrite flags — like
- *                   `sideBySide`, it lands in a directory the restore owns,
- *                   and the restore never writes into anything live.
+ *   `inPlace`     — INTO the original: the live home itself, with
+ *                   `--allow-existing-dirs --overwrite` (GT-11: the minimal
+ *                   pair — `--overwrite` alone dies on the first existing
+ *                   DIRECTORY). It is a MERGE, never a sync (GT-12): files
+ *                   not in the archive SURVIVE.
+ *   `newLocation` — SOMEWHERE ELSE: a directory of the operator's choosing
+ *                   (`target.path`), REQUIRED. When it does NOT exist the
+ *                   restore creates it with no overwrite flags (GT-15). When
+ *                   it EXISTS the daemon confirm-gates it (409 +
+ *                   X-Anas-Confirm-Code, Principle 14) and, on confirm, runs
+ *                   with the SAME merge flags as `inPlace`: files with the
+ *                   same names are replaced, everything else is kept. An
+ *                   existing path that is not a directory is refused (400).
  */
-export const BackupRestoreTargetMode = z.enum(['sideBySide', 'inPlace', 'newLocation'])
+export const BackupRestoreTargetMode = z.enum(['inPlace', 'newLocation'])
 export type BackupRestoreTargetMode = z.infer<typeof BackupRestoreTargetMode>
-
-/**
- * PBS prints a snapshot time as `2026-08-25T19:16:45Z`. A colon is legal on
- * every filesystem ANAS manages but cannot be represented over SMB — and the
- * side-by-side directory very often lands inside a share — so the colons become
- * dashes in the directory name. That is the only edit.
- */
-const SNAPSHOT_TIME_COLON_RE = /:/g
 
 /** Trailing slashes on a path (the root survives as `/`). */
 const RESTORE_TRAILING_SLASHES_RE = /\/+$/
@@ -1863,30 +1858,6 @@ export function snapshotIdHasTimestamp(snapshot: string): boolean {
 export function groupOfSnapshotId(snapshot: string): string | null {
   const parsed = parseSnapshotId(snapshot)
   return parsed ? composeGroupId(parsed.backupType, parsed.backupId) : null
-}
-
-/**
- * The side-by-side directory for one archive home and one snapshot:
- * `<home>.anas-restore-<snapshot time>`.
- *
- * Deterministic (the same snapshot always names the same directory) and
- * DISTINCTIVE (nothing else on the system writes `.anas-restore-`), so an
- * operator can tell at a glance what the directory beside their data is. It
- * must NOT already exist — a second restore of the same point in time into a
- * half-finished first one would merge two attempts with no way to tell them
- * apart, so the daemon refuses rather than reusing.
- *
- * Null when the snapshot id is not a full three-part id, or when the home is
- * the filesystem root (there is nothing to sit beside).
- */
-export function sideBySideRestorePath(home: string, snapshot: string): string | null {
-  const parsed = parseSnapshotId(snapshot)
-  if (!parsed)
-    return null
-  const base = home === '/' ? '/' : home.replace(RESTORE_TRAILING_SLASHES_RE, '')
-  if (base === '/' || !base.startsWith('/'))
-    return null
-  return `${base}.anas-restore-${parsed.time.replace(SNAPSHOT_TIME_COLON_RE, '-')}`
 }
 
 /**
@@ -1981,24 +1952,25 @@ export type BackupRateLimit = z.infer<typeof BackupRateLimit>
 
 /**
  * Where a file restore lands. `path` names the archive's live HOME in
- * `sideBySide`/`inPlace` — but in `newLocation` it IS the new directory
- * (story backup2.10), which must not exist yet and is created by the restore.
+ * `inPlace` — in `newLocation` (story backup2.10) it IS the destination
+ * directory: created by the restore when it does not exist, and a
+ * confirm-gated MERGE into the existing directory when it does.
  */
 export const BackupRestoreTarget = z
   .object({
-    mode: BackupRestoreTargetMode.default('sideBySide'),
+    mode: BackupRestoreTargetMode.default('newLocation'),
     /**
-     * In `sideBySide`/`inPlace` the archive's live home. Optional when the
-     * request names a `task` whose archive of this name knows its own path;
-     * REQUIRED otherwise (the task-less door, and an expanded archive whose
-     * name no longer matches any archive).
+     * In `inPlace` the archive's live home. Optional when the request names a
+     * `task` whose archive of this name knows its own path; REQUIRED otherwise
+     * (the task-less door, and an expanded archive whose name no longer
+     * matches any archive).
      *
-     * In `sideBySide` this is the directory the new one is created BESIDE — the
-     * restore never writes into it.
-     *
-     * In `newLocation` REQUIRED: the new directory the restore creates (parents
-     * included). It must not exist — the daemon refuses a restore that would
-     * merge into a directory the operator already has.
+     * In `newLocation` REQUIRED: the directory the restore writes into. When it
+     * does not exist, the restore creates it (parents included, GT-15) with no
+     * overwrite flags; when it exists, the daemon confirm-gates the MERGE into
+     * it (409 + X-Anas-Confirm-Code) and runs with the in-place flags on
+     * confirm — never a silent merge, and an existing non-directory is a plain
+     * refusal.
      */
     path: AbsolutePath.optional(),
   })
@@ -2007,7 +1979,7 @@ export const BackupRestoreTarget = z
       ctx.addIssue({
         code: 'custom',
         path: ['path'],
-        message: 'a newLocation restore needs the new directory it creates (target.path)',
+        message: 'a newLocation restore needs the directory it writes into (target.path)',
       })
     }
   })
@@ -2169,7 +2141,15 @@ export const BackupFilesRestoreRequest = z.object({
    * a partly-named group itself.
    */
   selections: z.array(ArchivePath).min(1).max(MAX_RESTORE_SELECTIONS),
-  target: BackupRestoreTarget.default({ mode: 'sideBySide' }),
+  /**
+   * The destination, named by the operator (ruling 2026-08-29: with the
+   * beside-the-original mode dropped there is no destination the daemon may
+   * name on the operator's behalf). `inPlace` without a path defers to the
+   * task's own archive home (the route resolves it); `newLocation` always
+   * carries its directory. A restore without a destination is refused at the
+   * boundary, never guessed.
+   */
+  target: BackupRestoreTarget,
   options: BackupRestoreOptions.default({}),
   /** Optional transfer-rate limit (`--rate`). */
   rate: BackupRateLimit.optional(),
@@ -2240,9 +2220,12 @@ export type BackupImageRestoreResult = z.infer<typeof BackupImageRestoreResult>
  *   `completed-with-warnings` — the client exited 0 but something is missing
  *                               (GT-24's silent no-match, or GT-21's empty
  *                               directory, which `--pattern` cannot restore).
- *   `partial`                 — the client did NOT finish. A side-by-side
- *                               directory is labelled by ANAS, because the
- *                               client leaves no marker at all (GT-60).
+ *   `partial`                 — the client did NOT finish. A newLocation
+ *                               directory the restore CREATED is labelled by
+ *                               ANAS, because the client leaves no marker at
+ *                               all (GT-60); a directory the restore MERGED
+ *                               into (inPlace, or a confirmed existing
+ *                               newLocation) is never labelled or removed.
  */
 export const BackupRestoreStatus = z.enum(['completed', 'completed-with-warnings', 'partial'])
 export type BackupRestoreStatus = z.infer<typeof BackupRestoreStatus>
@@ -2269,12 +2252,18 @@ export const BackupFilesRestoreResult = z.object({
   snapshot: z.string(),
   archive: z.string(),
   mode: BackupRestoreTargetMode,
-  /** The directory that was WRITTEN (the new one, or the live home in place). */
+  /**
+   * The directory that was WRITTEN: the archive's live home in `inPlace`, the
+   * operator's chosen directory in `newLocation` (created, or pre-existing).
+   */
   target: z.string(),
   /**
-   * True for `inPlace`: a merge, never a sync. Files under the target that are
-   * not in the archive SURVIVE (GT-12) — stated on the record so nobody reads a
-   * completed in-place restore as "the target now matches the snapshot".
+   * True whenever the restore ran with the MERGE flags — `inPlace` always,
+   * and a `newLocation` restore whose chosen directory already existed (the
+   * confirm gate's "yes"). Files under the target that are not in the archive
+   * SURVIVE (GT-12) — stated on the record so nobody reads a completed merge
+   * as "the target now matches the snapshot". False when the restore created
+   * its own new directory.
    */
   merge: z.boolean(),
   /** The selection actually restored, hardlink completion included. */

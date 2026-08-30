@@ -62,13 +62,16 @@ export const SPACE_PROBE_TIMEOUT_S = 10
 export const VERIFY_TIMEOUT_S = 30
 
 /**
- * The marker ANAS writes inside a side-by-side directory it could not finish.
+ * The marker ANAS writes inside a newLocation directory it could not finish —
+ * a directory THIS restore created.
  *
  * OUR artefact, inside OUR directory — not shadow state about the system. It
  * exists because the client leaves nothing at all behind (GT-60) and a tree
  * that looks complete but is not is the one outcome a restore must never
- * produce silently. An IN-PLACE restore never gets one: writing a file into the
- * operator's live data to describe our own failure is not ours to do.
+ * produce silently. A restore that MERGED into a directory that already
+ * existed (inPlace, or a newLocation confirmed through the gate) never gets
+ * one: writing a file into the operator's data to describe our own failure is
+ * not ours to do (Principle 12).
  */
 export const PARTIAL_MARKER_NAME = '.anas-restore-partial'
 
@@ -396,7 +399,13 @@ export interface RestoreArgvSpec {
   namespace?: string
   /** One entry per selection, `/`-anchored and escaped. Empty = the whole archive. */
   patterns: string[]
-  mode: BackupRestoreTargetMode
+  /**
+   * Whether the target ALREADY EXISTED when the pre-flight looked: `inPlace`
+   * always, and a `newLocation` only after its confirm gate (operator ruling
+   * 2026-08-29). The merge flag pair rides on this, not on the mode's name —
+   * a newLocation into a fresh directory is a `newLocation` with no flags.
+   */
+  merge: boolean
   options: BackupRestoreOptions
   rate?: string
 }
@@ -404,16 +413,16 @@ export interface RestoreArgvSpec {
 /**
  * The `restore` argv. No secrets — those ride the environment only.
  *
- * The IN-PLACE flag pair is `--allow-existing-dirs --overwrite` and nothing
- * else (GT-11: that is the minimal pair, and `--overwrite` does NOT imply
- * `--allow-existing-dirs`). A single explicitly picked file in place still
- * ships the directory flag, because GT-26 proved a file in a SUBDIRECTORY needs
- * it too — the flag is about entering the parent, not about the file.
+ * The MERGE flag pair is `--allow-existing-dirs --overwrite` and nothing else
+ * (GT-11: that is the minimal pair, and `--overwrite` does NOT imply
+ * `--allow-existing-dirs`). It is emitted when the target already exists — an
+ * in-place restore, or a newLocation restore the operator confirmed into an
+ * existing directory — and a single explicitly picked file in a merge still
+ * ships the directory flag, because GT-26 proved a file in a SUBDIRECTORY
+ * needs it too — the flag is about entering the parent, not about the file.
  *
- * SIDE-BY-SIDE and NEW-LOCATION (backup2.10) emit no overwrite flags at all:
- * the directory is new in both — one named by ANAS beside the live home, one
- * named by the operator — so there is nothing to overwrite and nothing to
- * allow (GT-15).
+ * A restore into a directory it creates emits no overwrite flags at all:
+ * there is nothing to overwrite and nothing to allow (GT-15).
  */
 export function buildRestoreArgs(spec: RestoreArgvSpec): string[] {
   const args = ['restore', spec.snapshot, spec.archive, spec.target]
@@ -421,7 +430,7 @@ export function buildRestoreArgs(spec: RestoreArgvSpec): string[] {
     args.push('--ns', spec.namespace)
   for (const pattern of spec.patterns)
     args.push('--pattern', pattern)
-  if (spec.mode === 'inPlace')
+  if (spec.merge)
     args.push('--allow-existing-dirs', '--overwrite')
   if (spec.options.ignoreOwnership)
     args.push('--ignore-ownership')
@@ -584,7 +593,7 @@ export async function verifyRestored(
 }
 
 /**
- * Write the `.anas-restore-partial` marker into a side-by-side directory the
+ * Write the `.anas-restore-partial` marker into a newLocation directory the
  * restore could not finish, or say why it did not.
  *
  * Best effort by contract: a marker that cannot be written must never replace
@@ -634,7 +643,10 @@ export async function directoryHasEntries(
   return r.stdout.length > 0
 }
 
-/** Remove an EMPTY side-by-side directory (never a recursive delete). */
+/**
+ * Remove an EMPTY newLocation directory the restore created (never a
+ * recursive delete — and only ever a directory the restore itself owns).
+ */
 export async function removeEmptyDirectory(
   executor: CommandExecutor,
   directory: string,
@@ -656,6 +668,13 @@ export interface FileRestoreDeps extends BackupReadDeps {
   /** The directory pbc writes into (already resolved and pre-flighted). */
   target: string
   mode: BackupRestoreTargetMode
+  /**
+   * Ran with the MERGE flags: `inPlace` always; `newLocation` only when its
+   * chosen directory already existed and passed the confirm gate. This — not
+   * the mode — decides the argv (buildRestoreArgs) and what a failure may
+   * clean up below.
+   */
+  merge: boolean
   /** The selection AFTER hardlink completion. */
   selections: string[]
   /** Paths the pre-flight added to complete a hardlink group. */
@@ -674,12 +693,18 @@ export interface FileRestoreDeps extends BackupReadDeps {
  * selections are not there. A non-empty `missing` list makes the job complete
  * WITH WARNINGS rather than plainly — the operator asked for those paths.
  *
- * On failure the NEW directory (side-by-side or newLocation, backup2.10 — both
- * are ANAS's to label or remove) is labelled `partial` (or removed when it is
- * empty) and the error is re-thrown so the job fails truthfully. An in-place
- * failure writes nothing at all into the operator's live tree; it says how far
- * the client got and names the one forensic hint the client leaves — an
- * in-flight file that is short AND mode `0600` (GT-60).
+ * On failure the rule is WHOSE the directory is:
+ *
+ *   - a `newLocation` restore that CREATED its target — the directory is
+ *     ANAS's: it is labelled `partial` (or removed when it is empty) and the
+ *     error is re-thrown so the job fails truthfully;
+ *   - a MERGE into a directory that already existed (an in-place restore, or a
+ *     newLocation confirmed through the gate) — the tree belongs to the
+ *     operator. NOTHING is removed and no marker is written: writing a file
+ *     into the operator's data to describe our own failure is not ours to do.
+ *     The error says how far the client got and names the one forensic hint
+ *     the client leaves — an in-flight file that is short AND mode `0600`
+ *     (GT-60).
  */
 export async function runFileRestore(
   executor: CommandExecutor,
@@ -688,12 +713,16 @@ export async function runFileRestore(
 ): Promise<BackupFilesRestoreResult> {
   const patterns = restorePatternsFor(deps.selections)
   const warnings = [...(deps.warnings ?? [])]
-  const merge = deps.mode === 'inPlace'
+  const merge = deps.merge
 
   updateProgress(
     `restoring ${deps.archive} from ${deps.snapshot} into ${deps.target} `
     + `(${patterns.length ? `${patterns.length} selection(s)` : 'the whole archive'}, `
-    + `${merge ? 'in place - a MERGE, never a sync' : deps.mode === 'newLocation' ? 'a new directory at the chosen path' : 'a new directory beside the source'})`,
+    + `${deps.mode === 'inPlace'
+      ? 'in place - a MERGE, never a sync'
+      : merge
+        ? `into an EXISTING directory - a MERGE, never a sync`
+        : 'a new directory at the chosen path, created by this restore'})`,
   )
   updateProgress('pbc reports restore progress at widening intervals (about 6s, 16s, 36s, 79s) - silence is not a stall')
 
@@ -703,7 +732,7 @@ export async function runFileRestore(
     target: deps.target,
     ...(deps.namespace ? { namespace: deps.namespace } : {}),
     patterns,
-    mode: deps.mode,
+    merge,
     options: deps.options,
     ...(deps.rate ? { rate: deps.rate } : {}),
   })
@@ -754,10 +783,21 @@ export async function runFileRestore(
     ].join('\n')
 
     let suffix = ''
-    if (deps.mode === 'sideBySide' || deps.mode === 'newLocation') {
+    if (merge) {
+      // The restore wrote INTO a directory that already existed — the live
+      // home in place, or a newLocation the operator confirmed. That tree is
+      // the operator's: nothing is removed, and no marker is written into it.
+      suffix = ` '${deps.target}' was restored INTO and is now a mixture of its previous contents and `
+        + 'a partial restore. The client leaves no marker; an in-flight file is short AND mode 0600.'
+    }
+    else {
+      // The only mode left that creates its own directory: a newLocation into
+      // a path that did not exist. ANAS owns that directory, so it is labelled
+      // (or removed when empty) — NEVER a pre-existing directory, which the
+      // `merge` branch above takes care of without touching it.
       const hasEntries = await directoryHasEntries(executor, deps.target)
       if (hasEntries === false) {
-        // Nothing landed at all — leave no litter beside the operator's data.
+        // Nothing landed at all — leave no litter.
         await removeEmptyDirectory(executor, deps.target)
         suffix = ` The empty restore directory '${deps.target}' was removed.`
       }
@@ -767,10 +807,6 @@ export async function runFileRestore(
           ? ` '${deps.target}' holds a PARTIAL tree and is labelled '${PARTIAL_MARKER_NAME}'.`
           : ` '${deps.target}' holds a PARTIAL tree (the partial marker could not be written).`
       }
-    }
-    else {
-      suffix = ` '${deps.target}' was restored INTO and is now a mixture of its previous contents and `
-        + 'a partial restore. The client leaves no marker; an in-flight file is short AND mode 0600.'
     }
     throw new Error(`${detail}${suffix} Last progress: ${progressSummaryLine(parsed)}`)
   }
@@ -786,8 +822,11 @@ export async function runFileRestore(
   }
   if (merge) {
     warnings.push(
-      'An in-place restore is a MERGE, never a sync: files under the target that are not in the archive '
-      + 'were left exactly as they were.',
+      deps.mode === 'inPlace'
+        ? 'An in-place restore is a MERGE, never a sync: files under the target that are not in the archive '
+        + 'were left exactly as they were.'
+        : `The chosen directory '${deps.target}' already existed, so this restore MERGED into it: files with `
+          + 'the same names were replaced, and everything else under it was left exactly as it was.',
     )
   }
 
@@ -1022,14 +1061,20 @@ export function estimateSpace(
 }
 
 /**
- * Does this path exist? A bounded `stat` through the executor — never a bare
- * `fs.stat`, because the path may sit on a remote mount that never answers.
- * Null when the probe itself could not say (a timeout).
+ * What a path IS — the `stat -c %F` answer (`directory`, `regular file`, …) —
+ * or null when the path does not exist, or the probe itself could not say
+ * (a timeout: a dead mount must not wedge a request).
+ *
+ * A bounded `stat` through the executor — never a bare `fs.stat`, because the
+ * path may sit on a remote mount that never answers. A restore pre-flight
+ * reads the KIND, not just existence: an existing DIRECTORY is a confirm gate,
+ * an existing FILE is a refusal, and a null answer falls through to the write
+ * test, which re-asks the filesystem for real.
  */
-export async function pathExists(
+export async function pathKind(
   executor: CommandExecutor,
   path: string,
-): Promise<boolean | null> {
+): Promise<string | null> {
   let r
   try {
     r = await executor.exec(TIMEOUT, [String(SPACE_PROBE_TIMEOUT_S), STAT, '-c', '%F', path])
@@ -1037,9 +1082,9 @@ export async function pathExists(
   catch {
     return null
   }
-  if (r.exitCode === TIMEOUT_EXIT)
+  if (r.exitCode !== 0)
     return null
-  return r.exitCode === 0
+  return r.stdout.trim() || null
 }
 
 /** The parent directory of an absolute path (`/` is its own parent). */

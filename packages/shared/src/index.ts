@@ -160,7 +160,6 @@ export {
   PVE_REPO_PREFIX,
   restorePatternFor,
   restorePatternsFor,
-  sideBySideRestorePath,
   snapshotTimeIso,
   UpsertBackupRepoRequest,
 } from './schemas/backup.js'

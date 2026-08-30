@@ -45,7 +45,6 @@ import {
   groupOfSnapshotId,
   hasRetentionKeeps,
   lunBackupId,
-  sideBySideRestorePath,
   UpsertBackupRepoRequest,
 } from '@anas/shared'
 import { readPbsStorages, readPveMountPaths } from '../parsers/pve-storage.js'
@@ -75,7 +74,7 @@ import {
   bareArchiveName,
   estimateSpace,
   parentDirectory,
-  pathExists,
+  pathKind,
   pveTerritoryReason,
   readSelectionFacts,
   runFileRestore,
@@ -205,17 +204,6 @@ function CONFLICT(version: number) {
   return {
     error: { code: 'CONFLICT', message: `backup repositories registry changed (version ${version}) — reload and retry` },
   }
-}
-
-/**
- * The 409 a side-by-side restore earns when its own deterministic directory
- * already exists — a second restore of the same point in time must never be
- * merged into the first, including a partial one this daemon labelled itself.
- */
-function sideBySideExistsMessage(target: string): string {
-  return `'${target}' already exists. A side-by-side restore always creates a new directory - `
-    + 'move or remove that one first (if it holds a .anas-restore-partial marker, it is an '
-    + 'unfinished restore of this same point in time).'
 }
 
 export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOptions) {
@@ -2019,7 +2007,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   // or SILENTLY without it:
   //
   //   1. whose storage is this?  PVE territory, and a live LUN's backing
-  //   2. a side-by-side directory is NEW — never reuse a half-finished one
+  //   2. a newLocation directory is NEW — unless the operator confirmed
+  //      MERGING into one that exists (409 + confirm code, like in-place)
   //   3. what IS the selection?  hardlink groups completed, trees identified,
   //      file sizes read — ONE catalog-shell session                 <- GT-25/24
   //   4. can we write there?     a read-only target fails at the FIRST file
@@ -2075,8 +2064,8 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // the directory and ANAS guesses nothing. Nothing here creates a dataset.
     //
     // `newLocation` (backup2.10) is the exception to "home": its `path` IS the
-    // new directory, not the archive's live home — the schema made it required
-    // for that mode, so the task lookup below never runs for it.
+    // destination directory, not the archive's live home — the schema made it
+    // required for that mode, so the task lookup below never runs for it.
     const isNewLocation = req.target.mode === 'newLocation'
     let home = req.target.path
     if (!home && !isNewLocation && req.task) {
@@ -2088,26 +2077,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return {
         error: {
           code: 'VALIDATION_ERROR',
-          message: `Name the directory to restore ${req.target.mode === 'inPlace' ? 'into' : 'beside'} `
-            + `(target.path): archive '${req.archive}' does not match an archive of a task on this node.`,
+          message: `Name the directory to restore into (target.path): archive '${req.archive}' does not match an archive of a task on this node.`,
         },
       }
     }
 
-    const target = req.target.mode === 'inPlace'
-      ? home.replace(RESTORE_TRAILING_SLASHES_RE, '') || '/'
-      : isNewLocation
-        ? home.replace(RESTORE_TRAILING_SLASHES_RE, '') || '/'
-        : sideBySideRestorePath(home, req.snapshot)
-    if (!target) {
-      reply.code(400)
-      return {
-        error: {
-          code: 'VALIDATION_ERROR',
-          message: `A side-by-side restore needs a directory to sit beside; '${home}' has none.`,
-        },
-      }
-    }
+    const target = home.replace(RESTORE_TRAILING_SLASHES_RE, '') || '/'
 
     // --- Pre-flight 1: whose storage is this? --------------------------------
     // Two hard refusals with no override.
@@ -2135,21 +2110,43 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
     }
 
-    // --- Pre-flight 2: a new directory is NEW, always -----------------------
-    // Never reuse: a second restore of the same point in time into a
-    // half-finished first one would merge two attempts with no way to tell
-    // them apart — including a partial one this daemon labelled itself.
-    // `newLocation` (backup2.10) is the same shape with an operator-chosen
-    // path: the restore creates it, parents included (GT-15), and refuses to
-    // merge into a directory the operator already has.
-    if (req.target.mode === 'sideBySide' || isNewLocation) {
-      const exists = await pathExists(executor, target)
-      if (exists === true) {
-        const message = isNewLocation
-          ? `'${target}' already exists. A newLocation restore always creates a new directory - choose a different path, or remove that directory first.`
-          : sideBySideExistsMessage(target)
-        reply.code(409)
-        return { error: { code: 'CONFLICT', message } }
+    // --- Pre-flight 2: a newLocation into a directory that EXISTS -------------
+    // is the operator's choice, not a refusal — but it is overwriting live
+    // data with the same shape as in-place, so it earns the same 409 +
+    // X-Anas-Confirm-Code gate (ruling 2026-08-29: no "refuse, pick another
+    // path" here; a merge into a known directory is legitimate). A path that
+    // exists and is NOT a directory is a plain refusal — there is nothing to
+    // merge into it. `pathKind` answers `null` both for a missing path and for
+    // a probe that could not finish (timeout): both fall through to the write
+    // test below, which asks again. `inPlace` is never probed this way — its
+    // target is the live home, and the hasDirectory gate in pre-flight 6 is
+    // its ask.
+    let mergeIntoExisting = false
+    if (isNewLocation) {
+      const kind = await pathKind(executor, target)
+      if (kind === 'directory') {
+        mergeIntoExisting = true
+        // The plain confirm dialog renders the warnings, not the error
+        // message — so the one sentence rides in BOTH, said identically,
+        // nothing invented for either.
+        const message = `'${target}' already exists: restoring into it overwrites files with the same names and keeps everything else. Confirm to proceed.`
+        if (!confirmGate(confirmStore, request, reply, {
+          operation: 'backup.restore.files',
+          params: { target, snapshot: req.snapshot, archive: req.archive, mode: 'newLocation' },
+          message,
+          warnings: [message],
+        })) {
+          return reply
+        }
+      }
+      else if (kind !== null) {
+        reply.code(400)
+        return {
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: `'${target}' already exists and is not a directory - a restore needs a directory. Remove it or choose another path.`,
+          },
+        }
       }
     }
 
@@ -2173,9 +2170,12 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // --- Pre-flight 4: can we write there at all? ----------------------------
     // A read-only or dead target does not fail at the start: the client enters
     // the directory happily and dies at the FIRST FILE. For a restore into a
-    // NEW directory (side-by-side or newLocation) the directory does not exist
-    // yet, so the test goes where it will be created.
-    const writeDir = req.target.mode === 'inPlace' ? target : parentDirectory(target)
+    // newLocation directory that does NOT exist yet the directory is created
+    // by the client, so the test goes where it will be created; a confirmed
+    // merge into an existing directory tests the directory itself.
+    const writeDir = req.target.mode === 'inPlace' || mergeIntoExisting
+      ? target
+      : parentDirectory(target)
     const writable = await writeTestDirectory(executor, writeDir)
     if (!writable.ok) {
       reply.code(409)
@@ -2216,8 +2216,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // unbounded amount of live data, so it is the one shape that asks. A single
     // explicitly picked file restored in place is NOT gated: the operator
     // pointed at that file and ticked the in-place box, and that IS the
-    // consent. Side-by-side is never gated at all — it writes only into a
-    // directory that did not exist a moment ago.
+    // consent. A newLocation restore into a directory the restore will CREATE
+    // is never gated here — it writes only into a directory that did not exist
+    // a moment ago; its existing-directory gate is pre-flight 2, where the
+    // path was already known to exist.
     if (req.target.mode === 'inPlace' && facts.hasDirectory) {
       if (!confirmGate(confirmStore, request, reply, {
         operation: 'backup.restore.files',
@@ -2246,6 +2248,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           selections: facts.selections.length,
           target,
           mode: req.target.mode,
+          merge: req.target.mode === 'inPlace' || mergeIntoExisting,
         },
       },
       async (updateProgress) => {
@@ -2257,6 +2260,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             archive: req.archive,
             target,
             mode: req.target.mode,
+            merge: req.target.mode === 'inPlace' || mergeIntoExisting,
             selections: facts.selections,
             addedForHardlinks: facts.addedForHardlinks,
             options: req.options,
@@ -2278,13 +2282,15 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
             selections: facts.selections.length,
             target,
             mode: req.target.mode,
+            merge: req.target.mode === 'inPlace' || mergeIntoExisting,
             status: result.status,
             bytes: result.bytes ?? 0,
             restored: result.restored.length,
             missing: result.missing.length,
           },
           `audit: restored ${result.restored.length}/${result.selections.length} selection(s) of `
-          + `${req.archive} from ${req.snapshot} into ${target} (${req.target.mode}, ${result.bytes ?? 0} bytes)`,
+          + `${req.archive} from ${req.snapshot} into ${target} `
+          + `(${req.target.mode}${req.target.mode === 'inPlace' || mergeIntoExisting ? ', merge' : ''}, ${result.bytes ?? 0} bytes)`,
         )
         return result
       },

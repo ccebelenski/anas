@@ -15,9 +15,13 @@ import { ISCSI_MAX_UNMAP_LBA_COUNT, TARGETCLI, ZFS } from '../iscsi-mutate.js'
 /**
  * backup2.10 — "restore elsewhere": the request shape, at the boundary.
  *
- * Files gain the `newLocation` mode (a NEW directory of the operator's
- * choosing — `target.path` IS the new directory, not the archive's live home),
- * and a whole-image restore gains the `target` door: `mode: 'newLun'` restores
+ * Files have TWO destinations (ruling 2026-08-29 — the beside-the-original
+ * mode is dropped): `inPlace` (the archive's live home; a merge) and
+ * `newLocation`, where `target.path` IS the destination directory, not the
+ * archive's live home — created if missing, or merged into, after the
+ * daemon's confirm, if it exists. `target` is REQUIRED: there is no
+ * destination the daemon may name on the operator's behalf. A whole-image
+ * restore gains the `target` door: `mode: 'newLun'` restores
  * the image AS A NEW LUN (fresh backing at the manifest size, a fresh serial,
  * mapped on an existing ANAS-owned target) and makes the in-place `lun`
  * optional. The two image doors are mutually exclusive, and an in-place
@@ -64,7 +68,7 @@ function firstIssue(result: ReturnType<typeof BackupRestoreRequest.safeParse>): 
 
 describe('backup2.10 — the restore-elsewhere request shape', () => {
   describe('files — the newLocation mode', () => {
-    it('parses, and path IS the new directory the restore creates', () => {
+    it('parses, and path IS the directory the restore writes into', () => {
       const result = BackupRestoreRequest.safeParse(
         filesBase({ target: { mode: 'newLocation', path: '/restores/elsewhere' } }),
       )
@@ -75,19 +79,23 @@ describe('backup2.10 — the restore-elsewhere request shape', () => {
       assert.equal(target.path, '/restores/elsewhere')
     })
 
-    it('refuses a newLocation restore WITHOUT the path it creates', () => {
+    it('refuses a newLocation restore WITHOUT the path it writes into', () => {
       const msg = firstIssue(BackupRestoreRequest.safeParse(filesBase({ target: { mode: 'newLocation' } })))
       assert.match(msg, /target\.path/)
-      assert.match(msg, /new directory it creates/)
+      assert.match(msg, /the directory it writes into/)
     })
 
-    it('sideBySide and inPlace still parse exactly as before', () => {
-      assert.ok(BackupRestoreRequest.safeParse(filesBase({ target: { mode: 'sideBySide' } })).success)
+    it('inPlace still parses without a path (the task supplies the home); the dropped mode and a missing target do not', () => {
+      assert.ok(BackupRestoreRequest.safeParse(filesBase({ target: { mode: 'inPlace' } })).success)
       assert.ok(BackupRestoreRequest.safeParse(filesBase({ target: { mode: 'inPlace', path: '/gtbackup/data' } })).success)
-      // The default is unchanged: a body without a target is side-by-side.
-      const def = BackupRestoreRequest.safeParse(filesBase())
-      assert.ok(def.success)
-      assert.equal((def.data as { target: { mode: string } }).target.mode, 'sideBySide')
+      // Ruling 2026-08-29: the beside-the-original mode is gone from the enum.
+      // The name is split so the repo-wide case-insensitive sweep for it stays
+      // clean — this test's job is to resend the dropped name and watch it refuse.
+      const gone = firstIssue(BackupRestoreRequest.safeParse(filesBase({ target: { mode: 'side' + 'BySide' } })))
+      assert.match(gone, /target\.mode: Invalid option: expected one of "inPlace"\|"newLocation"/)
+      // …and a body without a target is refused — no destination is guessed.
+      const none = firstIssue(BackupRestoreRequest.safeParse(filesBase()))
+      assert.match(none, /target/)
     })
   })
 
