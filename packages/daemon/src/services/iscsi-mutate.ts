@@ -172,8 +172,17 @@ export function withIscsiLock<T>(fn: () => Promise<T>): Promise<T> {
  * is forbidden: the secret shows up in `ps` for every local user (GT-35). The
  * check is structural rather than a comment, so a future edit that reaches for
  * the convenient call fails loudly here instead of leaking quietly.
+ *
+ * The match is NOT anchored to the start of the token (D7). `targetcli` joins
+ * its argv with spaces and re-parses the result as one configshell command line,
+ * so `['/x/acls/y', 'set auth password=X']` is a perfectly working call — and a
+ * `^`-anchored test walks straight past it, into `ps` and into
+ * {@link TargetcliError}'s `args.join`. A separator (start of token, whitespace
+ * or a comma) before the parameter name is what makes the token a parameter,
+ * and nothing ANAS legitimately passes (`wwn=`, `size=`, `write_back=`,
+ * `emulate_write_cache=`, `file_or_dev=`, `storage_object=`) can match it.
  */
-const SECRET_ARG_RE = /^(?:password|password_mutual|mutual_password)=/i
+const SECRET_ARG_RE = /(?:^|[\s,])(password|password_mutual|mutual_password)=/i
 
 /** Thrown when a targetcli invocation would carry a secret on argv. */
 export class SecretOnArgvError extends Error {
@@ -186,11 +195,17 @@ export class SecretOnArgvError extends Error {
   }
 }
 
-/** Throw if any argv token would leak a secret. Exported so tests assert it. */
+/**
+ * Throw if any argv token would leak a secret. Exported so tests assert it.
+ *
+ * The error names the matched PARAMETER, never the token: a joined token
+ * carries the secret itself, and the refusal must not become the leak.
+ */
 export function assertNoSecretArgs(args: string[]): void {
   for (const a of args) {
-    if (SECRET_ARG_RE.test(a))
-      throw new SecretOnArgvError(a)
+    const m = SECRET_ARG_RE.exec(a)
+    if (m)
+      throw new SecretOnArgvError(m[1] ?? a)
   }
 }
 
@@ -857,6 +872,21 @@ export function resolveZvolBacking(
       refusal: {
         reason: 'not-a-zvol',
         message: `'${backing}' does not name a ZFS volume — a zvol LUN is backed by /dev/zvol/<pool>/<volume>`,
+      },
+    }
+  }
+  // M4: a single-label dataset is a POOL, not a volume. `classifyBacking` still
+  // calls `/dev/zvol/<pool>` a zvol on purpose — it has to keep classifying the
+  // degenerate form when it DERIVES OWNERSHIP for a LUN somebody else already
+  // created (the comment there says so) — but accepting one HERE means a 202
+  // followed by an opaque `targetcli` failure inside the job, because there is
+  // no such device node. A new backing is refused at the door instead.
+  if (!c.dataset || !c.dataset.includes('/')) {
+    return {
+      refusal: {
+        reason: 'not-a-volume',
+        message: `'${backing}' names a pool, not a volume — name a volume as <pool>/<volume> `
+          + `(a pool itself has no /dev/zvol device to export)`,
       },
     }
   }

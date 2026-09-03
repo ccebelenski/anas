@@ -267,6 +267,85 @@ describe('buildIscsiWarnings — one card shape per finding', () => {
     assert.ok(!/still missing/.test(card.message), card.message)
   })
 
+  // C4: the quarantine pass that REMOVED the placeholder leaves a hole whose
+  // path is empty because ANAS emptied it. "Bring the storage back (restore the
+  // image)" is then an instruction to undo a deletion that destroyed nothing —
+  // the image is still on the filesystem that never mounted.
+  it('a hole ANAS made by REMOVING the placeholder says so, and points at mount + Repair', () => {
+    const w = buildIscsiWarnings(health({
+      missingLuns: [{
+        targetIqn: IQN,
+        tpgTag: 1,
+        lunIndex: 3,
+        backstoreName: 'lpahrlun',
+        plugin: 'fileio',
+        backingPath: '/mnt/anas-ahr/lpahr/lpahrlun.raw',
+        // The file is gone because the quarantine unlinked it: nothing is at
+        // that path, and it is not a stub any more.
+        backingExists: false,
+      }],
+      stubLuns: [{
+        targetIqn: IQN,
+        tpgTag: 1,
+        lunIndex: 3,
+        backstoreName: 'lpahrlun',
+        backingPath: '/mnt/anas-ahr/lpahr/lpahrlun.raw',
+        persistedSize: 536870912,
+        actualSize: 0,
+        containingMount: '/',
+        expectedMount: '/mnt/anas-ahr/lpahr',
+        zeroSized: true,
+        wrongMount: true,
+        quarantined: true,
+        fileRemoved: true,
+      }],
+      degraded: true,
+    }))
+    const card = w.find(c => /did not restore/.test(c.message))!
+    assert.match(card.message, /ANAS REMOVED the placeholder/)
+    assert.match(card.message, /nothing of yours was deleted/)
+    assert.match(card.message, /Mount the filesystem that should hold the image/)
+    assert.match(card.message, /use Repair on the iSCSI menu/)
+    assert.ok(!/still missing/.test(card.message), card.message)
+    assert.ok(!/restore the image\) first/.test(card.message), card.message)
+  })
+
+  it('a quarantine that could NOT remove the file leaves the hole card alone', () => {
+    // Only the LUN was unmapped (one signal), so the placeholder is still at
+    // that path and `stubBacking` says so — the pre-existing card is right.
+    const w = buildIscsiWarnings(health({
+      missingLuns: [{
+        targetIqn: IQN,
+        tpgTag: 1,
+        lunIndex: 3,
+        backstoreName: 'lpahrlun',
+        plugin: 'fileio',
+        backingPath: '/mnt/anas-ahr/lpahr/lpahrlun.raw',
+        backingExists: false,
+        stubBacking: true,
+      }],
+      stubLuns: [{
+        targetIqn: IQN,
+        tpgTag: 1,
+        lunIndex: 3,
+        backstoreName: 'lpahrlun',
+        backingPath: '/mnt/anas-ahr/lpahr/lpahrlun.raw',
+        persistedSize: 536870912,
+        actualSize: 0,
+        containingMount: '/mnt/anas-ahr/lpahr',
+        expectedMount: '/mnt/anas-ahr/lpahr',
+        zeroSized: true,
+        wrongMount: false,
+        quarantined: true,
+        fileRemoved: false,
+      }],
+      degraded: true,
+    }))
+    const card = w.find(c => /did not restore/.test(c.message))!
+    assert.match(card.message, /holds a PLACEHOLDER the restore service created/)
+    assert.ok(!/ANAS REMOVED the placeholder/.test(card.message), card.message)
+  })
+
   it('a DISABLED ANAS target is a warning card that names the reason when there is one', () => {
     const plain = buildIscsiWarnings(health({
       disabledTargets: [{ targetIqn: IQN, tpgTag: 1, lunCount: 4 }],

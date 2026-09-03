@@ -19,6 +19,7 @@ import {
   UpdateIscsiTargetRequest,
 } from '@anas/shared'
 import { readNodeInitiatorName } from '../parsers/iscsi-initiator.js'
+import { parseSnapshotNames, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { confirmGate } from '../safety/gate.js'
 import { ensureAhrTargetOrdering } from '../services/ahr-create.js'
 import { CONFIGFS_TARGET_ROOT } from '../services/iscsi-configfs.js'
@@ -45,6 +46,7 @@ import {
   setLunWriteBack,
   updateIscsiTarget,
   withIscsiLock,
+  ZFS,
   zvolDataset,
 } from '../services/iscsi-mutate.js'
 import { readIscsiHealthWithQuarantine } from '../services/iscsi-quarantine.js'
@@ -157,6 +159,30 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       return null
     }
     return state
+  }
+
+  /**
+   * A zvol's OWN snapshots, by name (story `iscsi.4`, M5).
+   *
+   * The same `zfs list` argument builder and the same parser the Datasets door
+   * uses for its destroy warnings — direct children only, never `-r` (the
+   * parser file's note explains why), because the question here is exactly the
+   * one `zfs destroy <vol>` asks: does this volume itself still have snapshots?
+   *
+   * Fail-open to `[]`: a `zfs list` that cannot run must not block a LUN delete
+   * that keeps the backing — the destroy itself still refuses, which is the
+   * pre-existing behaviour and no worse than it was.
+   */
+  async function zvolSnapshots(dataset: string): Promise<string[]> {
+    const r = await executor.exec(ZFS, zfsSnapshotListArgs(dataset))
+    if (r.exitCode !== 0 || !r.stdout.trim())
+      return []
+    try {
+      return parseSnapshotNames(r.stdout)
+    }
+    catch {
+      return []
+    }
   }
 
   /** Parse + validate the `:iqn` path parameter. */
@@ -865,6 +891,33 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       }
     }
 
+    // M5: the job destroys a zvol with a PLAIN `zfs destroy` — never `-r`,
+    // because sweeping somebody's snapshots away as a side effect of deleting a
+    // LUN is not a decision this door gets to make. `zfs destroy` refuses a
+    // volume that has any, and it refuses it INSIDE the job — after the LUN is
+    // unmapped and its backstore deleted, before `saveconfig`, which is config
+    // drift with an opaque error attached. So the snapshots are checked here,
+    // before the confirm gate, and the refusal names them.
+    if (destroyBacking && lun.kind === 'zvol') {
+      const dataset = lun.dataset ?? zvolDataset(lun.backingPath)
+      const snapshots = await zvolSnapshots(dataset)
+      if (snapshots.length > 0) {
+        const shown = snapshots.slice(0, 10).join(', ')
+        const more = snapshots.length > 10 ? `, and ${snapshots.length - 10} more` : ''
+        reply.code(409)
+        return {
+          error: {
+            code: 'CONFLICT',
+            reason: 'zvol-has-snapshots',
+            message: `The volume ${dataset} has ${snapshots.length} snapshot${snapshots.length === 1 ? '' : 's'} `
+              + `(${shown}${more}). Destroying the backing destroys the VOLUME only — ANAS never sweeps snapshots away as a `
+              + `side effect, and 'zfs destroy' refuses a volume that still has any. Remove them on the Datasets screen first, `
+              + `or delete the LUN without "Also destroy" and keep the volume. This refusal has no confirm bypass.`,
+          },
+        }
+      }
+    }
+
     // The confirmation protects "delete this LUN" — `destroyBacking` is NOT
     // part of the signature. The flag is chosen AFTER the challenge is issued
     // (the UI's checkbox is ticked on the resend, exactly like `recursive` on
@@ -879,8 +932,12 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       warnings: [
         `The unit serial ${lun.serial ?? '(unknown)'} goes with it — any PVE volid or initiator configuration built on it breaks`,
         `The backing object ${lun.backingPath} is kept unless you tick "Also destroy" (re-send with ?destroyBacking=true)`,
+        // M5: the volume, and ONLY the volume. The job runs a plain
+        // `zfs destroy`, so a volume that still has snapshots is refused above
+        // rather than swept — the warning must promise exactly that.
         lun.kind === 'zvol'
-          ? `If the backing is destroyed: the volume ${lun.dataset ?? zvolDataset(lun.backingPath)} and every snapshot under it will be destroyed`
+          ? `If the backing is destroyed: the volume ${lun.dataset ?? zvolDataset(lun.backingPath)} will be destroyed. `
+          + `Its snapshots are NOT destroyed with it — a volume that still has any is refused, so remove them on the Datasets screen first.`
           : `If the backing is destroyed: the image file ${lun.backingPath} will be removed`,
       ],
     })) {

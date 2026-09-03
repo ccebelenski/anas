@@ -13,6 +13,7 @@ import { mockFixtures } from '../../fixtures/loader.js'
 import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
+import { zfsSnapshotListArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { TARGETCLI, ZFS } from '../../services/iscsi-mutate.js'
@@ -268,6 +269,28 @@ function emptyAnasSaveconfig(): string {
       }],
     }],
   })
+}
+
+/**
+ * SYNTHETIC `zfs list -j -t snapshot` output for one dataset (M5).
+ *
+ * The shape is the captured fixture's, trimmed to what `parseSnapshotNames`
+ * reads: the envelope, and one `datasets` entry per snapshot.
+ */
+function snapshotListJson(dataset: string, names: string[]): string {
+  const datasets: Record<string, unknown> = {}
+  for (const n of names) {
+    datasets[`${dataset}@${n}`] = {
+      name: `${dataset}@${n}`,
+      type: 'SNAPSHOT',
+      pool: dataset.split('/')[0],
+      createtxg: '100',
+      dataset,
+      snapshot_name: n,
+      properties: {},
+    }
+  }
+  return JSON.stringify({ output_version: { command: 'zfs list', vers_major: 0, vers_minor: 1 }, datasets })
 }
 
 const IDENTITY = {
@@ -855,6 +878,34 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.equal(res.statusCode, 202)
     })
 
+    // M4: a POOL is not a volume. `/dev/zvol/tank` is not a device node, so the
+    // old code answered 202 and the job died inside `targetcli` with an opaque
+    // message. The refusal has to happen at the door, and say what to type.
+    it('refuses a POOL name as a zvol backing — no job, and it names the <pool>/<volume> form', async () => {
+      await serveAnas()
+      const res = await call('POST', `${targetUrl()}/luns`, {
+        name: 'pooldisk',
+        kind: 'zvol',
+        backing: 'tank',
+      })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'not-a-volume')
+      assert.match(res.body.error!.message, /<pool>\/<volume>/)
+      assert.ok(!res.body.job, 'nothing may be queued for a backing that cannot exist')
+      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0, JSON.stringify(mockOf().calls))
+    })
+
+    it('refuses the spelled-out /dev/zvol/<pool> form too — same door, same answer', async () => {
+      await serveAnas()
+      const res = await call('POST', `${targetUrl()}/luns`, {
+        name: 'pooldisk',
+        kind: 'zvol',
+        backing: '/dev/zvol/tank',
+      })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'not-a-volume')
+    })
+
     it('accepts an AHR pool NAME as a file backing — the image lands under the pool\'s mountpoint', async () => {
       // The pool's "mountpoint" is a real temp directory: the job's
       // createSparseImage is real file I/O, and the point of the test is that
@@ -1193,6 +1244,68 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.equal((job.result as { backingDestroyed?: string | null }).backingDestroyed, 'tank/vol1')
       assert.ok(mockOf().calls.some(c => c.command === ZFS && c.args[0] === 'destroy' && c.args[1] === 'tank/vol1'), JSON.stringify(mockOf().calls))
+    })
+
+    // M5: the job runs a PLAIN `zfs destroy` (no `-r`), which refuses a volume
+    // that still has snapshots — and it refuses AFTER the LUN is unmapped and
+    // its backstore deleted, before `saveconfig`: config drift with an opaque
+    // error attached. The snapshots are checked at the door instead.
+    it('refuses ?destroyBacking=true on a zvol that has snapshots, NAMING them, before the confirm gate', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.addFixture({
+        command: ZFS,
+        args: zfsSnapshotListArgs('tank/vol1'),
+        result: { stdout: snapshotListJson('tank/vol1', ['daily-2026-09-01', 'daily-2026-09-02']), stderr: '', exitCode: 0 },
+      })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const res = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`)
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'zvol-has-snapshots')
+      assert.match(res.body.error!.message, /tank\/vol1@daily-2026-09-01/)
+      assert.match(res.body.error!.message, /tank\/vol1@daily-2026-09-02/)
+      assert.match(res.body.error!.message, /Datasets screen/)
+      // Not a confirm challenge, and not a job: nothing may be unmapped for a
+      // destroy that cannot finish.
+      assert.notEqual(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      assert.ok(!res.headers['x-anas-confirm-code'], 'there is no way to confirm past this')
+      assert.ok(!res.body.job)
+      assert.equal(mock.calls.filter(c => c.command === TARGETCLI).length, 0, JSON.stringify(mock.calls))
+      assert.ok(!mock.calls.some(c => c.command === ZFS && c.args[0] === 'destroy'), JSON.stringify(mock.calls))
+    })
+
+    it('the confirm warning promises the VOLUME only — never "every snapshot under it"', async () => {
+      await serveAnas()
+      const res = await call('DELETE', `${targetUrl()}/luns/0`)
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      const warnings = res.body.error!.warnings!
+      assert.ok(
+        !warnings.some(w => /every snapshot under it will be destroyed/.test(w)),
+        `the job runs a plain zfs destroy — the warning must not promise a recursive one: ${JSON.stringify(warnings)}`,
+      )
+      assert.ok(
+        warnings.some(w => /snapshots are NOT destroyed with it/.test(w)),
+        JSON.stringify(warnings),
+      )
+    })
+
+    it('a snapshot-free zvol still destroys — the pre-check is a gate, not a wall', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.addFixture({ command: ZFS, args: zfsSnapshotListArgs('tank/vol1'), result: { stdout: snapshotListJson('tank/vol1', []), stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const first = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`)
+      assert.equal(first.body.error!.code, 'CONFIRMATION_REQUIRED')
+      const code = first.headers['x-anas-confirm-code'] as string
+      const second = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`, undefined, { 'x-anas-confirm': code })
+      assert.equal(second.statusCode, 202)
+      const job = await waitForJob(second.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      // Still a PLAIN destroy: the fix is a pre-check, NOT a silent `-r`.
+      const destroy = mock.calls.find(c => c.command === ZFS && c.args[0] === 'destroy')
+      assert.deepEqual(destroy?.args, ['destroy', 'tank/vol1'])
     })
 
     it('a wrong code 409s again — a fresh challenge, and nothing has run', async () => {

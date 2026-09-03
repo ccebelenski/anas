@@ -307,6 +307,43 @@ describe('repairIscsiHoles — the exact replay argv', () => {
     assert.equal(result.repaired[0].serialReplayed, false)
   })
 
+  // C3: `size=${item.size ?? 0}` did not refuse — `targetcli` CREATES a 0-byte
+  // file at the image's path and serves it with the right serial, which is the
+  // placeholder story `iscsi.8` exists to take away, made this time by ANAS.
+  it('a fileio record with NO persisted size is BLOCKED, never created at size=0 (C3)', async () => {
+    const ctx = twoHoleCtx({ dropSize: true })
+    // The fileio backing is BACK — the only thing standing in the way is the
+    // record itself, which is the whole point of the case.
+    const plan = planIscsiRepair(ctx, twoHoleHealth([false, true]), [])
+    assert.equal(plan.repairable.length, 0)
+    const sizeless = plan.blocked.find(b => b.backstoreName === 'img1')
+    assert.ok(sizeless, JSON.stringify(plan.blocked))
+    assert.equal(sizeless.backingPresent, true, 'the backing is present — the RECORD is what blocks it')
+    assert.equal(sizeless.size, null)
+    assert.match(sizeless.blockedReason ?? '', /no size/)
+
+    const mock = okExecutor()
+    const result = await repairIscsiHoles({ executor: mock }, plan)
+    assert.deepEqual(result.repaired, [])
+    assert.equal(result.saved, false)
+    assert.equal(targetcliCalls(mock).length, 0, JSON.stringify(targetcliCalls(mock)))
+    assert.ok(!targetcliCalls(mock).some(c => /size=0/.test(c)), 'no 0-byte placeholder may be created')
+  })
+
+  it('the 409 for a size-less record NAMES the missing size, not "import the pool"', () => {
+    const ctx = twoHoleCtx({ dropSize: true })
+    const both = twoHoleHealth([true, true])
+    // ONLY the fileio hole: the other one is repairable and would carry the
+    // ordinary absent-backing sentence.
+    const plan = planIscsiRepair(ctx, { ...both, missingLuns: [both.missingLuns[1]] }, [])
+    const refusal = assertRepairable(plan)
+    assert.ok(refusal)
+    assert.equal(refusal.reason, 'record-incomplete')
+    assert.match(refusal.message, /no size/)
+    assert.match(refusal.message, /img1/)
+    assert.doesNotMatch(refusal.message, /import the pool/)
+  })
+
   it('never issues `targetctl restore` or a service restart', async () => {
     // rtslib's restore takes clear_existing=True and wipes the whole live tree,
     // dropping every healthy LUN's sessions. Repair is surgical, by design.
@@ -368,10 +405,13 @@ const TWO_HOLE_SAVECONFIG = {
   }],
 }
 
-function twoHoleCtx(opts: { dropSerial?: boolean } = {}): IscsiReadContext {
+function twoHoleCtx(opts: { dropSerial?: boolean, dropSize?: boolean } = {}): IscsiReadContext {
   const raw = JSON.parse(JSON.stringify(TWO_HOLE_SAVECONFIG))
   if (opts.dropSerial)
     delete raw.storage_objects[0].wwn
+  // A fileio record whose `size` the saved configuration does not carry (C3).
+  if (opts.dropSize)
+    delete raw.storage_objects[1].size
   const persisted: LioSaveconfig = parseLioSaveconfig(JSON.stringify(raw))
   return {
     // Live: the target is up, but neither backstore nor LUN restored.

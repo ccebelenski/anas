@@ -94,6 +94,15 @@ export interface IscsiRepairItem {
   serial: string | null
   /** fileio only: the persisted size, which `create` needs. */
   size: number | null
+  /**
+   * Why this hole is BLOCKED for a reason other than an absent backing (C3).
+   *
+   * Absence is the ordinary case and needs no sentence — `assertRepairable`
+   * already tells that story. This carries the other kind: a persisted record
+   * the replay cannot be built from, which must be named rather than papered
+   * over with a default.
+   */
+  blockedReason?: string
   /** The persisted write-cache posture, replayed on the fileio create line. */
   writeBack: boolean
   /** The attribute set to replay after create, before the map. */
@@ -156,7 +165,17 @@ export function planIscsiRepair(
       attributes: replayAttributes({ attributes }, plugin),
       aclInitiators: persistedAclsMapping(ctx, missing),
     }
-    ;(item.backingPresent ? repairable : blocked).push(item)
+    // C3: a fileio create line needs a size, and the persisted record is the
+    // only place an honest one can come from. A record without one used to be
+    // repaired with `size=0`, which does not fail — `targetcli` CREATES a
+    // 0-byte file at the path and serves it: the very placeholder story
+    // `iscsi.8` exists to take away, made this time by ANAS itself. So the hole
+    // is BLOCKED and says what is missing.
+    if (item.plugin === 'fileio' && item.size === null) {
+      item.blockedReason = `the saved configuration records no size for fileio backstore '${item.backstoreName}' `
+        + `(${item.backingPath}) — recreating it without one would serve a 0-byte disk with the right serial`
+    }
+    ;(item.backingPresent && item.blockedReason === undefined ? repairable : blocked).push(item)
   }
 
   return { repairable, blocked }
@@ -190,16 +209,33 @@ export function assertRepairable(plan: IscsiRepairPlan): IscsiRefusal | null {
     }
   }
   if (plan.repairable.length === 0) {
-    const named = plan.blocked
+    // Two kinds of blocked hole, and they need different sentences: a backing
+    // that is not on the node yet (bring it back), and a persisted record the
+    // replay cannot be built from (C3 — nothing the operator does to the
+    // storage will help, so "import the pool" would be a wrong instruction).
+    const absent = plan.blocked.filter(b => b.blockedReason === undefined)
+    const incomplete = plan.blocked.filter(b => b.blockedReason !== undefined)
+    const incompleteClause = incomplete.length === 0
+      ? ''
+      : ` ${incomplete.length === 1 ? 'One hole' : `${incomplete.length} holes`} cannot be repaired from the saved `
+        + `configuration at all: ${incomplete.map(b => `LUN ${b.lunIndex} of ${b.targetIqn} — ${b.blockedReason}`).join('; ')}.`
+    if (absent.length === 0) {
+      return {
+        reason: 'record-incomplete',
+        message: `None of the missing LUNs can be repaired — the saved configuration does not describe `
+          + `${incomplete.length === 1 ? 'it' : 'them'} completely.${incompleteClause}`,
+      }
+    }
+    const named = absent
       .map(b => `LUN ${b.lunIndex} of ${b.targetIqn} (backstore '${b.backstoreName}', ${b.backingPath}${b.stubBacking ? ' — a placeholder, not the image' : ''})`)
       .join('; ')
-    const stubs = plan.blocked.filter(b => b.stubBacking).length
+    const stubs = absent.filter(b => b.stubBacking).length
     return {
       reason: 'backing-absent',
       message: `None of the missing LUNs can be repaired yet — their backing objects are still not on `
         + `this node: ${named}. Bring the storage back first (import the pool, restore the image, mount `
         + `the filesystem) and run Repair again. Recreating a backstore over an absent device is what `
-        + `produced the hole.${stubs > 0 ? stubClause(stubs) : ''}`,
+        + `produced the hole.${stubs > 0 ? stubClause(stubs) : ''}${incompleteClause}`,
     }
   }
   return null
@@ -247,12 +283,22 @@ export async function repairIscsiHoles(
 
     opts.progress?.(`Recreating ${item.plugin} backstore ${item.backstoreName} from the saved configuration`)
     if (item.plugin === 'fileio') {
+      // C3: never `size=0`. `planIscsiRepair` blocks a size-less fileio record
+      // before it can reach here, so this is the belt to that braces — a plan
+      // built by hand must fail loudly rather than have targetcli create a
+      // 0-byte file at the image's path and serve it with the right serial.
+      if (item.size === null) {
+        throw new Error(
+          `Cannot repair LUN ${item.lunIndex} of ${item.targetIqn}: the saved configuration records no size `
+          + `for fileio backstore '${item.backstoreName}' (${item.backingPath})`,
+        )
+      }
       const args = [
         '/backstores/fileio',
         'create',
         `name=${item.backstoreName}`,
         `file_or_dev=${item.backingPath}`,
-        `size=${item.size ?? 0}`,
+        `size=${item.size}`,
         `write_back=${item.writeBack}`,
       ]
       // A record with no stored serial is the one case where identity cannot be

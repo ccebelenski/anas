@@ -159,6 +159,36 @@ describe('runTargetcli — one command per invocation, real exit code (GT-5)', (
     assert.doesNotThrow(() => assertNoSecretArgs(['userid=alice']))
   })
 
+  // D7: `targetcli` joins its argv with spaces and re-parses the result as ONE
+  // configshell command line, so a JOINED token is a working call — and a
+  // `^`-anchored test walked straight past it, into `ps` and into
+  // TargetcliError's `args.join`.
+  it('catches a JOINED token — the form targetcli actually re-parses (D7)', () => {
+    for (const token of [
+      `set auth password=${SECRET}`,
+      `set auth password_mutual=${MUTUAL}`,
+      `set auth userid=alice password=${SECRET}`,
+      `set auth userid=alice,password=${SECRET}`,
+    ]) {
+      assert.throws(() => assertNoSecretArgs(['/iscsi/x/tpg1/acls/y', token]), SecretOnArgvError, token)
+    }
+    // The refusal must not become the leak: it names the PARAMETER, never the
+    // token it found it in.
+    assert.throws(
+      () => assertNoSecretArgs([`set auth password=${SECRET}`]),
+      (err: unknown) => {
+        assert.ok(err instanceof SecretOnArgvError)
+        assert.ok(!(err as Error).message.includes(SECRET), (err as Error).message)
+        assert.match((err as Error).message, /'password='/)
+        return true
+      },
+    )
+    // Still no false positive on the parameters ANAS legitimately passes.
+    for (const ok of ['wwn=abc', 'size=1073741824', 'write_back=false', 'emulate_write_cache=1', 'file_or_dev=/srv/x.img', 'storage_object=/backstores/fileio/x', 'set auth userid=alice']) {
+      assert.doesNotThrow(() => assertNoSecretArgs([ok]), ok)
+    }
+  })
+
   it('the refusal reaches the executor boundary, not just the helper', async () => {
     const mock = okExecutor()
     await assert.rejects(
@@ -874,6 +904,26 @@ describe('resolveZvolBacking — PVE territory is never a candidate', () => {
     const r = resolveZvolBacking('/dev/sdb', emptyCtx())
     assert.ok('refusal' in r)
     assert.equal(r.refusal.reason, 'not-a-zvol')
+  })
+
+  // M4: `classifyBacking` still calls `/dev/zvol/tank` a zvol — it must, to keep
+  // DERIVING OWNERSHIP for a pre-existing LUN somebody else created in that
+  // degenerate form. Accepting one as a NEW backing is a different thing: there
+  // is no such device node, so it is a 202 followed by an opaque targetcli
+  // failure inside the job.
+  it('refuses a POOL — a single-label dataset names no volume', () => {
+    for (const backing of ['tank', '/dev/zvol/tank', '/dev/zvol/tank/']) {
+      const r = resolveZvolBacking(backing, emptyCtx())
+      assert.ok('refusal' in r, `${backing} must be refused`)
+      assert.equal(r.refusal.reason, 'not-a-volume')
+      assert.match(r.refusal.message, /<pool>\/<volume>/)
+    }
+  })
+
+  it('a nested volume is still a volume — the refusal is about the POOL form only', () => {
+    const r = resolveZvolBacking('tank/vms/vol1', emptyCtx())
+    assert.ok('ok' in r)
+    assert.equal(r.ok.dataset, 'tank/vms/vol1')
   })
 
   it('the two path helpers round-trip', () => {

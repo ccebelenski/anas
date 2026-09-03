@@ -101,6 +101,17 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     })
   }
 
+  // C4: the holes ANAS made itself by REMOVING a placeholder in this very pass.
+  // The fact is already on the health object — `stubLuns` carries the acted
+  // stubs with `fileRemoved` (the quarantine carries them onto the after-read
+  // precisely so the card can still say what happened) — so no new thread is
+  // needed, only the honesty to read it. Nothing is remembered across reads: on
+  // a LATER read the stub is gone from the diff, and the hole is an ordinary
+  // absent backing, which is exactly what it then is.
+  const placeholderRemoved = new Set(
+    health.stubLuns.filter(s => s.fileRemoved).map(s => `${s.targetIqn}#${s.lunIndex}`),
+  )
+
   for (const lun of health.missingLuns) {
     // A hole ANAS made itself, by taking a placeholder off the network, must
     // keep saying so: "that path is still missing" is confusing when there is
@@ -108,13 +119,23 @@ export function buildIscsiWarnings(health: IscsiHealth): DashboardWarning[] {
     const placeholderClause = ' That path holds a PLACEHOLDER the restore service created — a file of the right name '
       + 'that is not the image, which is why ANAS took the LUN offline. Mount the filesystem that should hold the '
       + 'image, then use Repair on the iSCSI menu to put the LUN back with its own serial.'
+    // ANAS deleted the file at that path itself, so "bring the storage back
+    // (restore the image)" would be an instruction to undo a deletion that
+    // destroyed nothing: the file was a 0-byte placeholder on the wrong
+    // filesystem, never the image. The image is wherever it always was — on the
+    // filesystem that did not mount.
+    const removedClause = ' That path is empty because ANAS REMOVED the placeholder it found there — it was 0 bytes and '
+      + 'on the wrong filesystem, so nothing of yours was deleted. Mount the filesystem that should hold the image, then '
+      + 'use Repair on the iSCSI menu to put the LUN back with its own serial.'
     const backNow = lun.stubBacking
       ? placeholderClause
-      : lun.backingExists === true
-        ? ' That path is available again — use Repair on the iSCSI menu to put the LUN back.'
-        : lun.backingExists === false
-          ? ' That path is still missing — bring the storage back (import the pool, restore the image) first.'
-          : ''
+      : placeholderRemoved.has(`${lun.targetIqn}#${lun.lunIndex}`)
+        ? removedClause
+        : lun.backingExists === true
+          ? ' That path is available again — use Repair on the iSCSI menu to put the LUN back.'
+          : lun.backingExists === false
+            ? ' That path is still missing — bring the storage back (import the pool, restore the image) first.'
+            : ''
     warnings.push({
       level: 'warning',
       category: 'iscsi',
