@@ -622,6 +622,11 @@ function makeAnas(routes) {
         method: cfg.method,
         path: cfg.path,
         body: cfg.body,
+        // The poll view is recorded so a check can assert a dialog that closes
+        // itself on acceptance hands the poll a LONG-LIVED component, never the
+        // dialog being closed (issue #48 — a dead view silences the failure
+        // alert and every grid refresh).
+        view: cfg.view,
         confirmWindow: !!cfg.confirmWindow,
         extraItems: cfg.extraItems,
         mapConfirm: cfg.mapConfirm,
@@ -3641,6 +3646,20 @@ async function restoreDoorsLiveSessionChecks() {
     if (ns) { body.ns = ns }
     return body
   }
+  // #49: the new-LUN backing pickers start EMPTY and are filled only by
+  // ANAS.iscsi.loadBackingChoices — which used to run on the LUN door alone,
+  // leaving these stores empty on every other door (where #newLunPool is
+  // non-editable, so the new-LUN destination could never be submitted). The
+  // stores must be filled on every door that reaches the image half.
+  const backingAsserts = async (dlg, label) => {
+    await settle()
+    const pools = dlg.down('#newLunPool').getStore().getRange().map(r => r.get('name'))
+    ok(`doors(live session, ${label}): the new-LUN pool picker is FILLED on this door too`,
+      pools.includes('tank') && !pools.includes('pvepool'), JSON.stringify(pools))
+    const dirs = dlg.down('#filePicker').getStore().getRange().map(r => `${r.get('name')}@${r.get('source') || ''}`)
+    ok(`doors(live session, ${label}): the image picker is FILLED on this door too`,
+      dirs.includes('tank/images@dataset') && dirs.includes('ahrpool@ahr'), JSON.stringify(dirs))
+  }
 
   // --- Door 1: the task grid's selection-dependent Restore… ----------------
   grid.selectRow(liveRow)
@@ -3657,6 +3676,7 @@ async function restoreDoorsLiveSessionChecks() {
   eq('doors(live session, grid): the single disk.img archive is pre-selected',
     gridDlg.down('#restoreArchive').getValue(), 'disk.img')
   liveDestAsserts(gridDlg, 'grid')
+  await backingAsserts(gridDlg, 'grid')
   const gridJob = await submitNewLun(gridDlg, 'grid', 'grid-live-new')
   eq('doors(live session, grid): the submitted body is the newLun shape',
     gridJob && gridJob.body,
@@ -3685,6 +3705,7 @@ async function restoreDoorsLiveSessionChecks() {
   if (!detailDlg) { return }
   await pickFileSnapshot(detailDlg)
   liveDestAsserts(detailDlg, 'detail')
+  await backingAsserts(detailDlg, 'detail')
   const detailJob = await submitNewLun(detailDlg, 'detail', 'detail-live-new')
   eq('doors(live session, detail): the submitted body is the newLun shape',
     detailJob && detailJob.body,
@@ -3713,6 +3734,7 @@ async function restoreDoorsLiveSessionChecks() {
     ['disk.img', 'small.img'])
   repoDlg.down('#restoreArchive').setValue('disk.img')
   await settle()
+  await backingAsserts(repoDlg, 'repo')
   liveDestAsserts(repoDlg, 'repo')
   const repoJob = await submitNewLun(repoDlg, 'repo', 'repo-live-new')
   eq('doors(live session, repo): the submitted body is the newLun shape',
@@ -3852,7 +3874,7 @@ async function iscsiRestoreVerdictChecks() {
 }
 
 async function iscsiRestoreSizeGateChecks() {
-  const { dlg } = await openRestoreDialog()
+  const { view, dlg } = await openRestoreDialog()
   if (!dlg) { return }
   const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-restore-submit')
 
@@ -3905,6 +3927,12 @@ async function iscsiRestoreSizeGateChecks() {
   eq('restore: one request', jobs.length, 1)
   eq('restore: it POSTs the image-kind restore', [jobs[0].method, jobs[0].path],
     ['post', '/backup/restore'])
+  // #48: the in-place half closes the dialog on acceptance, so the poll view
+  // must be the LONG-LIVED view the dialog was opened from — keyed to the
+  // dialog, ANAS.pollJob dies the moment onSubmitted closes it and the
+  // failure alert + the LUNs-window refresh never fire.
+  ok('restore(in place): the poll view is the LUNs view, never the dialog being closed',
+    jobs[0].view === view && view !== dlg, `view === dlg: ${jobs[0].view === dlg}`)
   eq('restore: the body names the repo, namespace, FULL snapshot, .img archive and the LUN',
     jobs[0].body, {
       kind: 'image',
@@ -3936,7 +3964,7 @@ async function iscsiRestoreSizeGateChecks() {
 // ============================================================================
 
 async function iscsiRestoreNewLunChecks() {
-  const { dlg } = await openRestoreDialog()
+  const { view, dlg } = await openRestoreDialog()
   if (!dlg) { return }
   const submit = dlg.buttonCmps.find(b => b.cls === 'anas-btn-restore-submit')
 
@@ -4047,6 +4075,11 @@ async function iscsiRestoreNewLunChecks() {
   submit.handler(submit)
   await settle()
   eq('restore(newLun): one request', jobs.length, 1)
+  // #48: the newLun half KEEPS the dialog open, but its poll view is the same
+  // long-lived reference — and the operator may still close the dialog while
+  // the job runs (the result panel guards on that).
+  ok('restore(newLun): the poll view is the LUNs view, never the dialog itself',
+    jobs[0].view === view && view !== dlg, `view === dlg: ${jobs[0].view === dlg}`)
   eq('restore(newLun): the zvol body is target={mode,targetIqn,name,backing:{kind:zvol,pool}}',
     jobs.length && jobs[0].body, {
       kind: 'image',
@@ -6091,6 +6124,12 @@ async function restoreChecks() {
   ok('file restore: the dialog submitted exactly one request', jobs.length === 1, `${jobs.length}`)
   const sent = jobs[0] || {}
   eq('file restore: it is a POST to the ONE restore door', `${sent.method} ${sent.path}`, 'post /backup/restore')
+  // #48: onSubmitted closes the dialog the moment the daemon accepts, so the
+  // poll view must be the long-lived component the dialog was opened from —
+  // keyed to the dialog, the failure alert and the completion summary die
+  // with it.
+  ok('file restore: the poll view outlives the dialog — never the dialog being closed',
+    sent.view !== undefined && sent.view !== dlg, `view === dlg: ${sent.view === dlg}`)
   ok('file restore: it goes through confirmAndRun so a 409 can be answered',
     Object.prototype.hasOwnProperty.call(sent, 'confirmWindow'))
   eq('file restore: the hardlink group travelled as ONE unit (GT-25)',

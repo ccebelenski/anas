@@ -9,6 +9,8 @@ Finding ids (U/K/D/R/M/C/B prefixes) are stable and referenced from the GitHub i
 
 ## Wave 1 — announcement blockers (HIGH) — fix before announcing 0.3.0
 
+**Status: COMPLETE 2026-09-03** — #50 `71ea926`, #47 `f9093c0`, #48+#49 in the K1/K2 commit; every fix landed with tests demonstrated to fail on the old code.
+
 | id | issue | where | defect | fix |
 |----|-------|-------|--------|-----|
 | U1 | [#47](https://github.com/ccebelenski/anas/issues/47) | routes/iscsi-mutate.ts:834 + 75-iscsi.js:3408 | LUN delete confirm-gated only when `destroyBacking` set → one-click delete, checkbox unreachable | gate every LUN delete on `{target, lun}` (flag NOT in the code signature — the datasets.ts:1538 rule); warnings into the gate |

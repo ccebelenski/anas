@@ -2477,7 +2477,7 @@
     // Open the on-demand Details window (modal:false, sized like the repos
     // manager). Snapshot semantics: it fetches once on open; the Reload button
     // is the refresh.
-    function openTaskDetailWindow(node, name) {
+    function openTaskDetailWindow(node, name, view) {
         if (!name) {
             return;
         }
@@ -2526,6 +2526,10 @@
             ANAS.warn('backup detail window failed: ' + ANAS.errText(e));
             return;
         }
+        // The view behind the grid that opened this window. The Restore door
+        // hands it to the restore dialog as the poll view — a dialog opened
+        // from THIS window must outlive the detail window being closed.
+        win._view = view;
         win.show();
         loadDetailInto(win, node, name);
     }
@@ -5455,9 +5459,10 @@
                 iconCls: 'fa fa-info-circle',
                 disabled: true,
                 handler: function (btn) {
-                    var rec = selectedTask(gridOf(btn.up('#backupView')));
+                    var view = btn.up('#backupView');
+                    var rec = selectedTask(gridOf(view));
                     if (rec) {
-                        openTaskDetailWindow(node, rec.get('name'));
+                        openTaskDetailWindow(node, rec.get('name'), view);
                     }
                 },
             },
@@ -6074,6 +6079,9 @@
                 // combo has not been filled yet — the image half needs it.
                 loadRestoreTargetChoices(win, node,
                     win._prefillLun ? (win._prefillLun.targetIqn || '') : '');
+                // …and the backing pickers ride the same entry (once per
+                // dialog — the doors that filled them up front set the flag).
+                loadRestoreBackingChoices(win, node);
             }
             resolveAndRefreshImage(win);
         } else if (kind === 'pxar') {
@@ -6298,7 +6306,11 @@
             method: 'post',
             path: '/backup/restore',
             body: restoreBody(ctx),
-            view: win,
+            // The poll view is the LONG-LIVED component the dialog was opened
+            // from, never the dialog itself: onSubmitted closes `win`, and
+            // ANAS.pollJob stops the moment its view is destroyed — a dead
+            // view would silence the failure alert and the completion summary.
+            view: win._view || win,
             maxMs: 3600000,
             confirmTitle: t('Restore over live data'),
             confirmIntro: t('This restore writes into a directory that already holds data:'),
@@ -6889,6 +6901,23 @@
     }
 
     /**
+     * The new-LUN backing pickers (#newLunPool / #filePicker) start EMPTY and
+     * are filled only by ANAS.iscsi.loadBackingChoices (75-iscsi.js). The
+     * new-LUN destination can appear on ANY door that reaches the image half,
+     * so the read runs wherever loadRestoreTargetChoices does — the LUN door's
+     * own up-front call included — guarded to run once per dialog.
+     */
+    function loadRestoreBackingChoices(win, node) {
+        if (win._backingLoaded) {
+            return;
+        }
+        win._backingLoaded = true;
+        if (ANAS.iscsi && ANAS.iscsi.loadBackingChoices) {
+            ANAS.iscsi.loadBackingChoices(node, win);
+        }
+    }
+
+    /**
      * The button's gate — the ONLY part the image half hard-gates. A size
      * mismatch is silently destructive over a live block object, so Restore is
      * simply dead until this half says yes (the daemon refuses too). The files
@@ -6989,7 +7018,13 @@
             method: 'post',
             path: '/backup/restore',
             body: body,
-            view: win,
+            // The poll view is the LONG-LIVED component the dialog was opened
+            // from (the same reference win._onDone belongs to) — the in-place
+            // half closes `win` on acceptance, and a dead view would silence
+            // the failure alert and the grids' refresh. The newLun half keeps
+            // the dialog open, so its own result panel still reads `win` —
+            // guarded, because the operator may close it while the job runs.
+            view: win._view || win,
             confirmWindow: true,
             confirmTitle: confirmTitle,
             confirmIntro: confirmIntro,
@@ -7012,7 +7047,7 @@
                 }
             },
             onComplete: function (job) {
-                if (dest === 'newLun') {
+                if (dest === 'newLun' && !win.destroyed && !win.destroying) {
                     showNewLunResult(win, job);
                 }
                 if (win._onDone) {
@@ -7020,7 +7055,7 @@
                 }
             },
             onFailed: function (job) {
-                if (dest === 'newLun') {
+                if (dest === 'newLun' && !win.destroyed && !win.destroying) {
                     var msg = (job && job.error && job.error.message);
                     if (msg) {
                         var vr = win.down('#newLunVerdict');
@@ -7679,17 +7714,17 @@
             ensureLunInventory(win, node);
             // The new-LUN destination can appear on ANY door that may reach the
             // image half, so the ANAS-owned target combo is filled up front
-            // (defaulting to the LUN door's own target when there is one).
+            // (defaulting to the LUN door's own target when there is one) —
+            // and the backing pickers load right beside it, once per dialog
+            // (the repository door loads them at image-half entry instead).
             loadRestoreTargetChoices(win, node, lunPre ? lunPre.targetIqn : '');
+            loadRestoreBackingChoices(win, node);
         }
 
         win.show();
         applyRestoreSourceVisibility(win);
         setRestorePartVisibility(win);
         if (lunPre) {
-            if (ANAS.iscsi && ANAS.iscsi.loadBackingChoices) {
-                ANAS.iscsi.loadBackingChoices(node, win);
-            }
             resolveAndRefreshImage(win);
         }
         refreshRestore(win);
@@ -7710,7 +7745,9 @@
                 homeByArchive[bareArchive(a.name)] = a.path;
             }
         }
-        openRestoreDialog(win, node, {
+        // The poll view is the backup grid behind this detail window when it is
+        // known — the dialog must keep polling after this window closes.
+        openRestoreDialog(win._view || win, node, {
             task: task,
             homeByArchive: homeByArchive,
         });
