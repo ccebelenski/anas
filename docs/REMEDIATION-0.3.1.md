@@ -58,6 +58,9 @@ value vs exact bytes.
 - **C2:** `GET /iscsi/health` runs the quarantine (deliberate, story iscsi.8) outside the job
   model with no session check. Decide and write down: does a stub with a LIVE session still get
   yanked (serving zeros vs kicking the initiator)? Foreign skip is C1/#54 regardless.
+- **New-LUN restore holds the iSCSI mutex across the whole image stream** (routes/backup.ts newLun job wrap —
+  pre-existing, surfaced while fixing #52): every iSCSI mutation on the node queues behind an hours-long
+  restore. Same fix shape as #52 (lock only the targetcli sections). Promote to a wave when convenient.
 - **Crash-window record for new-LUN restore:** a daemon crash (not a job failure) mid-stream
   leaves a healthy-looking, unpersisted LUN holding half an image; the in-place path's record is
   the disabled target, the new-LUN path has no equivalent. Decide whether a marker is wanted.

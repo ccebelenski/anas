@@ -12,6 +12,7 @@ import { lunGrowGuidance } from '@anas/shared'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
+import { AHR_FINDMNT_ARGS } from '../../services/ahr-topology.js'
 
 /**
  * The rest of ANAS knows a LUN is there — story `iscsi.6`, the ROUTE gates.
@@ -50,6 +51,7 @@ import { createServer } from '../../server.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ISCSI_FIXTURES = join(__dirname, '../../fixtures/iscsi')
 const ZFS_FIXTURES = join(__dirname, '../../fixtures/zfs')
+const AHR_FIXTURES = join(__dirname, '../../fixtures/ahr')
 
 const POOL = 'gtiscsi'
 const ZVOL = 'gtiscsi/vol1'
@@ -59,16 +61,33 @@ const GT_TARGET = 'iqn.2026-08.dev.anas.gtiscsi:target1'
 const AHR_POOL = 'ahr0'
 const AHR_MOUNT = '/mnt/anas-ahr/ahr0'
 
+const ZPOOL = '/usr/sbin/zpool'
+const ZFS = '/usr/sbin/zfs'
+const UMOUNT = '/usr/bin/umount'
+const MV = '/usr/bin/mv'
+const BTRFS = '/usr/bin/btrfs'
+const FINDMNT = '/usr/bin/findmnt'
+
+
+/**
+ * The dev mock's `ahr0` is mounted FLAT (`subvol=/`), which the snapshot
+ * routes refuse before any held-by-LUN question. This re-points the SAME
+ * mount at the §12 subvolume layout — findmnt appends the mounted subvolume
+ * to a btrfs source (`…[/@data]`), which the topology reader strips.
+ */
+const AHR_FINDMNT_SUBVOL_LAYOUT = JSON.stringify({ filesystems: [{
+  target: AHR_MOUNT,
+  source: '/dev/mapper/ahr0-ahr0--vol[/@data]',
+  fstype: 'btrfs',
+  options: 'rw,relatime,space_cache=v2,subvol=/@data',
+}] })
+
 const IDENTITY = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
   'x-anas-request-id': randomUUID(),
 }
 const JSON_HEADERS = { ...IDENTITY, 'content-type': 'application/json' }
-
-const ZPOOL = '/usr/sbin/zpool'
-const ZFS = '/usr/sbin/zfs'
-const UMOUNT = '/usr/bin/umount'
 
 /** The pool a LUN sits on, and a second one nothing serves (the control). */
 const UNSERVED_POOL = 'sparepool'
@@ -466,6 +485,44 @@ describe('iscsi.6 — the rest of ANAS knows a LUN is there (route gates)', () =
       })
       assertHeldRefusal(res, 'gtiscsi_lun2')
       assert.equal(ran(UMOUNT), false)
+    })
+
+    it('ROLLBACK of a snapshot on a served pool — refused, and nothing is unmounted or renamed (issue #51)', async () => {
+      // The rollback route's own guards must pass FIRST so the held refusal is
+      // the one that fires: the pool needs the §12 subvolume layout (the mount
+      // seam above) and a snapshot to roll back to (the shipped layout capture,
+      // which lists @snapshots/before-upgrade). Both are fixture seams — the
+      // LIO half is unchanged: the same ONTO_AHR rewrite the destroy/mountpoint
+      // refusals prove, since the subject (pool name + mountpoint) is identical.
+      await serve(ONTO_AHR)
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      const wrapped = mock.exec.bind(mock)
+      const same = (a: string[], b: string[]) => a.length === b.length && a.every((x, i) => x === b[i])
+      mock.exec = async (command: string, args: string[]) => {
+        if (command === FINDMNT && same(args, AHR_FINDMNT_ARGS))
+          return { stdout: AHR_FINDMNT_SUBVOL_LAYOUT, stderr: '', exitCode: 0 }
+        if (command === BTRFS && same(args, ['subvolume', 'list', AHR_MOUNT]))
+          return { stdout: fixtureText(AHR_FIXTURES, 'btrfs-subvol-list-layout.txt'), stderr: '', exitCode: 0 }
+        if (command === BTRFS && same(args, ['subvolume', 'list', '-s', AHR_MOUNT]))
+          return { stdout: fixtureText(AHR_FIXTURES, 'btrfs-subvol-list-s.txt'), stderr: '', exitCode: 0 }
+        if (command === BTRFS && same(args, ['subvolume', 'list', '-r', AHR_MOUNT]))
+          return { stdout: fixtureText(AHR_FIXTURES, 'btrfs-subvol-list-r.txt'), stderr: '', exitCode: 0 }
+        return wrapped(command, args)
+      }
+
+      const res = await server!.inject({
+        method: 'POST',
+        url: `/v1/ahr/${AHR_POOL}/snapshots/before-upgrade/rollback`,
+        headers: JSON_HEADERS,
+        payload: '{}',
+      })
+      assertHeldRefusal(res, 'gtiscsi_lun2')
+      // The swap's two destructive steps — unmount the pool, rename `@data` to
+      // its pre-rollback preserve — never run. (The unmounted-pool case is the
+      // hole: the rename SUCCEEDS under LIO's open fd and the live `@data`
+      // diverges silently.)
+      assert.equal(ran(UMOUNT), false)
+      assert.equal(ran(MV), false)
     })
 
     it('GET /v1/ahr stamps heldByLun on the pool the image lives on', async () => {

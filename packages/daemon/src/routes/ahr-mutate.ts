@@ -5,6 +5,7 @@ import type { ConfirmStore } from '../safety/confirm.js'
 import type { AhrLayoutDisk } from '../services/ahr-layout.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
+import type { IscsiHeldByLun } from '@anas/shared'
 import { AhrCreateRequest, AhrMountpointRequest, isComposableDisk, PoolName } from '@anas/shared'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
@@ -25,6 +26,41 @@ const FINDMNT = '/usr/bin/findmnt'
 const VGS = '/usr/sbin/vgs'
 
 const TRAILING_SLASHES_RE = /\/+$/
+
+/**
+ * Is an iSCSI LUN's image file living on this AHR pool (story iscsi.6)?
+ *
+ * A file on the btrfs volume IS the AHR block object — AHR's only backing kind
+ * — so it is matched two ways: by the pool NAME (`classifyBacking` resolves an
+ * AHR-hosted file onto its pool) and by the MOUNTPOINT (which still answers
+ * when the pool could not be classified). `rm` of a backing file succeeds
+ * silently and LIO keeps serving the unlinked inode (GT-40), so an unmount, a
+ * destroy — or a rollback swapping `@data` out from under the file (issue #51)
+ * — is data loss with no error anywhere.
+ *
+ * Module-scope (not a route closure) so routes/ahr-snapshots.ts's rollback
+ * route runs the SAME check from the SAME helper — one source, one phrasing.
+ */
+export async function ahrPoolHeldByLun(
+  executor: CommandExecutor,
+  iscsiPaths: IscsiPaths,
+  pool: { name: string, mountpoint: string, mounted: boolean },
+) {
+  const subject: { pool: string, path?: string } = { pool: pool.name }
+  if (pool.mounted && pool.mountpoint.startsWith('/'))
+    subject.path = pool.mountpoint
+  return heldByLun(createIscsiClaimCache(executor, iscsiPaths), subject)
+}
+
+/**
+ * The hard-409 body for a held pool — ONE shape (`CONFLICT` /
+ * `reason: 'held-by-lun'`, no confirm bypass in the text) for every caller.
+ * `heldByLunRefusal` writes the message; this shapes the response.
+ */
+export function ahrHeldByLunConflict(what: string, action: string, held: IscsiHeldByLun) {
+  const refusal = heldByLunRefusal(what, action, held)
+  return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
+}
 
 export interface AhrMutationRouteOptions {
   executor: CommandExecutor
@@ -67,23 +103,6 @@ export interface AhrMutationRouteOptions {
 export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutationRouteOptions) {
   const { executor, jobQueue, confirmStore, diskIdentityCache, fstabPath, mdadmConfPath, mountBase, kernelRelease } = opts
   const iscsiPaths = opts.iscsiPaths ?? {}
-
-  /**
-   * Is an iSCSI LUN's image file living on this AHR pool (story iscsi.6)?
-   *
-   * A file on the btrfs volume IS the AHR block object — AHR's only backing kind
-   * — so it is matched two ways: by the pool NAME (`classifyBacking` resolves an
-   * AHR-hosted file onto its pool) and by the MOUNTPOINT (which still answers
-   * when the pool could not be classified). `rm` of a backing file succeeds
-   * silently and LIO keeps serving the unlinked inode (GT-40), so an unmount or
-   * a destroy under a LUN is data loss with no error anywhere.
-   */
-  async function ahrPoolHeldByLun(pool: { name: string, mountpoint: string, mounted: boolean }) {
-    const subject: { pool: string, path?: string } = { pool: pool.name }
-    if (pool.mounted && pool.mountpoint.startsWith('/'))
-      subject.path = pool.mountpoint
-    return heldByLun(createIscsiClaimCache(executor, iscsiPaths), subject)
-  }
 
   /** Parse + validate a pool-name param, or 400 and return null. */
   function parsePoolName(raw: string, reply: FastifyReply): string | null {
@@ -273,11 +292,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // Story iscsi.6: moving the mountpoint UNMOUNTS the filesystem, which pulls
     // the image file out from under a live LIO backstore. A hard 409 with no
     // confirm bypass — "unsafe now", before anything is touched.
-    const moveHeld = await ahrPoolHeldByLun(pool)
+    const moveHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
     if (moveHeld) {
-      const refusal = heldByLunRefusal(`the mountpoint of AHR pool '${name}'`, 'Changing', moveHeld)
       reply.code(409)
-      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
+      return ahrHeldByLunConflict(`the mountpoint of AHR pool '${name}'`, 'Changing', moveHeld)
     }
 
     if (!confirmGate(confirmStore, request, reply, {
@@ -327,11 +345,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // NOW — every array, partition and byte goes, including the file LIO is
     // serving, and nothing in ZFS/btrfs/md is going to refuse it. Hard 409, no
     // confirm bypass, before the confirm code is minted.
-    const destroyHeld = await ahrPoolHeldByLun(pool)
+    const destroyHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
     if (destroyHeld) {
-      const refusal = heldByLunRefusal(`AHR pool '${name}'`, 'Destroying', destroyHeld)
       reply.code(409)
-      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
+      return ahrHeldByLunConflict(`AHR pool '${name}'`, 'Destroying', destroyHeld)
     }
 
     // Consumers under the mountpoint (submounts — shares/backups serving from

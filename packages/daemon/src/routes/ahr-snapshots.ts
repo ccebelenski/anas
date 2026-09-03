@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
+import type { IscsiPaths } from '../services/iscsi.js'
 import { AhrCreateSnapshotRequest, AhrSnapshotName, PoolName } from '@anas/shared'
 import { confirmGate } from '../safety/gate.js'
 import { readIntent } from '../services/ahr-intent.js'
@@ -14,6 +15,7 @@ import {
   rollbackAhrSnapshot,
 } from '../services/ahr-snapshots.js'
 import { readAhrPools } from '../services/ahr-topology.js'
+import { ahrHeldByLunConflict, ahrPoolHeldByLun } from './ahr-mutate.js'
 import { requireIdentity } from './identity.js'
 
 export interface AhrSnapshotRouteOptions {
@@ -24,6 +26,8 @@ export interface AhrSnapshotRouteOptions {
   intentDir: string
   /** On-demand top-level mount base override (tests point at a temp dir). */
   subvolRuntimeDir?: string
+  /** iSCSI read-layer path overrides (story iscsi.6) — the rollback refusal. */
+  iscsiPaths?: IscsiPaths
 }
 
 /**
@@ -37,12 +41,24 @@ export interface AhrSnapshotRouteOptions {
  * Snapshots require the §12 subvolume layout (`subvolLayout: true`); a flat
  * pre-§12 pool is refused with the "snapshots unavailable, no migration"
  * advisory. Every mutation also refuses while an expansion intent exists or
- * the pool is failed/read-only — consistent with the other AHR verbs. All
+ * the pool is failed/read-only — consistent with the other AHR verbs. Rollback
+ * additionally refuses while an iSCSI LUN's image file lives on the pool (story
+ * iscsi.6, issue #51) — the same hard 409 destroy/mountpoint use. All
  * mutations are jobs (202); delete/rollback are confirm-gated (Principle 14).
  */
 export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapshotRouteOptions) {
   const { executor, jobQueue, confirmStore, intentDir, subvolRuntimeDir } = opts
   const svc = { runtimeDir: subvolRuntimeDir }
+
+  /**
+   * The iSCSI read-layer paths for the rollback refusal: the explicit test
+   * seam wins, else the env-derived object server.ts decorates onto the app —
+   * the SAME object every other route was handed, never a second env→paths
+   * mapping here. Read lazily (decoration lands before ready()); a bare app
+   * without it falls back to the library defaults, exactly like `{}` would.
+   */
+  const iscsiPaths = (): IscsiPaths =>
+    opts.iscsiPaths ?? (server as unknown as { iscsiPaths?: IscsiPaths }).iscsiPaths ?? {}
 
   async function loadPool(rawName: string, reply: FastifyReply): Promise<AhrPool | null> {
     const parsed = PoolName.safeParse(rawName)
@@ -210,6 +226,19 @@ export async function ahrSnapshotRoutes(server: FastifyInstance, opts: AhrSnapsh
     if (!(await listAhrSnapshots(executor, pool, svc)).some(s => s.name === snap)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Snapshot '${snap}' not found in pool '${pool.name}'` } }
+    }
+
+    // Story iscsi.6 (issue #51): a LUN's image file on this pool makes the
+    // rollback unsafe NOW — the swap unmounts the pool and RENAMES `@data` —
+    // LIO's open inode — out from under a live fileio backstore. A mounted pool
+    // dies mid-job on EBUSY; an UNMOUNTED one diverges silently, LIO still
+    // serving the preserved subvolume while the live `@data` goes stale. The
+    // same hard 409 the destroy/mountpoint routes use — no confirm bypass,
+    // before the confirm code is minted.
+    const rollbackHeld = await ahrPoolHeldByLun(executor, iscsiPaths(), pool)
+    if (rollbackHeld) {
+      reply.code(409)
+      return ahrHeldByLunConflict(`AHR pool '${pool.name}'`, 'Rolling back', rollbackHeld)
     }
 
     if (!confirmGate(confirmStore, request, reply, {
