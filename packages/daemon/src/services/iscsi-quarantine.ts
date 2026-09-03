@@ -40,6 +40,17 @@
  *      mounted again. A save here would erase the LUN from the saved config and
  *      turn a recoverable accident into a permanent loss (GT-22).
  *
+ * ## Whose stub it is
+ *
+ * The quarantine is a mutation, so it wears the same gate every other mutating
+ * path has (story `iscsi.5`): a stub whose target is **foreign** — by IQN
+ * shape, or because a sibling LUN's backing positively resolves onto non-ANAS
+ * storage — is REPORTED (the stub verdict itself is ownership-blind) but never
+ * acted on. Somebody else's LUN is not unmapped and nobody's file is unlinked,
+ * however placeholder-shaped it looks. The skip is told in journald
+ * (`result=skipped`) and recorded nowhere else: an `outcomes` entry would read
+ * as "ANAS took it offline", which the boot scan counts and says.
+ *
  * ## Why it runs where it runs
  *
  * At daemon start, and on every `/v1/iscsi/health` read and every dashboard
@@ -96,6 +107,20 @@ function auditLine(stub: IscsiStubLun, result: { quarantined: boolean, fileRemov
     + `zeroSized=${stub.zeroSized} wrongMount=${stub.wrongMount} `
     + `result=${result.quarantined ? 'unmapped' : 'failed'} fileRemoved=${result.fileRemoved}`
     + `${result.error ? ` detail=${result.error}` : ''}`
+}
+
+/**
+ * The audit line for a stub ANAS saw but must not touch: its target is foreign
+ * (story `iscsi.5`), so hands-off applies to the quarantine like to every other
+ * mutation. Same key=value table as {@link auditLine}, with `result=skipped` —
+ * deliberately not `failed`, which would claim a tear-down was attempted — and
+ * the ownership derivation that decided it, so the line explains WHY it was
+ * left alone and not just that it was.
+ */
+function skipLine(stub: IscsiStubLun, target: IscsiTargetDetail): string {
+  return `iscsi.quarantine target=${stub.targetIqn} lun=${stub.lunIndex} backstore=${stub.backstoreName} `
+    + `path=${stub.backingPath} result=skipped `
+    + `detail=foreign target — hands-off (${target.ownershipReason}: ${target.ownershipDetail})`
 }
 
 /**
@@ -183,6 +208,17 @@ export async function readIscsiHealthWithQuarantine(
       const target = fresh.targets.find(t => t.iqn === stub.targetIqn)
       if (!target)
         continue
+      // Hands-off (story `iscsi.5`): the quarantine is a mutation, and this is
+      // the gate every other mutating path already has. A foreign target's
+      // stub is still REPORTED — it stays in the health diff with
+      // `quarantined: false`, exactly the card a pure read gives — but ANAS
+      // must not unmap somebody else's LUN or unlink their file, however
+      // placeholder-shaped it looks. Deliberately no outcome: `outcomes` reads
+      // as "ANAS took it offline", and the boot scan counts and says that.
+      if (target.ownership !== 'anas') {
+        log(skipLine(stub, target))
+        continue
+      }
       const result = await quarantineOne(executor, stub, { tpgTag: target.tpgTag })
       log(auditLine(stub, result))
       acted.set(stub.backingPath, { quarantined: result.quarantined, fileRemoved: result.fileRemoved })
@@ -210,7 +246,10 @@ export async function readIscsiHealthWithQuarantine(
   const stubLuns = [
     // A stub the tear-down could not remove is still live and still reported by
     // the fresh diff — with its `quarantined: false` from `acted`, so the card
-    // says ANAS tried and failed rather than implying it is handled.
+    // says ANAS tried and failed rather than implying it is handled. (A stub
+    // never in `acted` at all — a foreign target's, skipped before acting —
+    // carries the same `false`, but there it is the pure read's meaning:
+    // nothing was attempted, which is exactly right for hands-off.)
     ...after.health.stubLuns,
     ...actedStubs.filter(s => !carried.has(s.backingPath)),
   ]

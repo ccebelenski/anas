@@ -399,17 +399,21 @@ describe('quarantine — unmap that LUN, delete the stub backstore, never saveco
    * `stat` answers and the mount table all arrive the way production supplies
    * them.
    */
-  async function paths(s: Scenario & { bytes?: number }) {
+  async function paths(s: Scenario & { bytes?: number, iqn?: string }) {
     const root = join(dir, 'target')
     const image = join(dir, 'gtbackup', 'img2', 'lpsmall.raw')
-    await materializeConfigfsManifest(manifest(image), root)
+    // A different IQN rewrites BOTH halves of the fixture: the live tree and the
+    // persisted record must agree on whose target it is, or the read layer sees
+    // a diff that has nothing to do with the case under test.
+    const iqn = s.iqn ?? IQN
+    await materializeConfigfsManifest(manifest(image).replaceAll(IQN, iqn), root)
     await mkdir(join(dir, 'gtbackup', 'img2'), { recursive: true })
     // A REAL file on a real filesystem: the `stat` and the `unlink` are the
     // production ones, so "only a 0-byte file is ever removed" is proven rather
     // than asserted against a mock.
     await writeFile(image, Buffer.alloc(s.bytes ?? 0))
     const savePath = join(dir, 'saveconfig.json')
-    await writeFile(savePath, saveconfig(image))
+    await writeFile(savePath, saveconfig(image).replaceAll(IQN, iqn))
     return {
       image,
       paths: {
@@ -511,6 +515,47 @@ describe('quarantine — unmap that LUN, delete the stub backstore, never saveco
     assert.equal(health.stubLuns.length, 1)
     assert.equal(health.stubLuns[0].quarantined, false)
     assert.equal(health.degraded, true)
+  })
+
+  it('leaves a FOREIGN target\'s stub alone — reported, never acted on (issue #54)', async () => {
+    const calls: string[][] = []
+    const logged: string[] = []
+    // Foreign by IQN shape: the same placeholder tree the pass above tears
+    // down, under an IQN ANAS did not generate.
+    const foreignIqn = 'iqn.2026-08.dev.example:other'
+    const { image, paths: p } = await paths({
+      probe: { exists: true, size: 0 },
+      childMounted: false,
+      iqn: foreignIqn,
+    })
+    const { outcomes, health } = await readIscsiHealthWithQuarantine(
+      recorder(calls),
+      { ...p, log: (l: string) => logged.push(l) },
+    )
+
+    // The hands-off gate: no targetcli call at all, and the file stays — both
+    // stub signals agree here, so on an ANAS target this same pass unmaps,
+    // deletes the backstore AND unlinks the placeholder.
+    assert.deepEqual(calls, [], 'somebody else\'s LUN is not unmapped from a READ')
+    assert.equal(existsSync(image), true, 'nobody\'s file is unlinked either')
+
+    // Still REPORTED — the stub verdict is ownership-blind — with the pure
+    // diff's card: `quarantined: false` means nothing was attempted, not that
+    // ANAS tried and failed. And no outcome: an outcome reads as "ANAS took it
+    // offline", which the boot scan counts and says.
+    assert.deepEqual(outcomes, [])
+    assert.equal(health.degraded, true)
+    assert.equal(health.stubLuns.length, 1)
+    assert.equal(health.stubLuns[0].targetIqn, foreignIqn)
+    assert.equal(health.stubLuns[0].quarantined, false)
+    assert.equal(health.stubLuns[0].fileRemoved, false)
+
+    // The skip is told in journald, with the ownership derivation that decided
+    // it — `result=skipped`, never `failed`, which would claim an attempt.
+    assert.equal(logged.length, 1)
+    assert.match(logged[0], /^iscsi\.quarantine /)
+    assert.match(logged[0], /result=skipped/)
+    assert.match(logged[0], /iqn-not-anas/)
   })
 
   it('a node with no LIO tree quarantines nothing and does not throw', async () => {
