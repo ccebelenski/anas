@@ -1,4 +1,5 @@
-import type { BackupRepo, BackupSnapshot, IscsiLun, IscsiTargetDetail } from '@anas/shared'
+import type { BackupRepo, BackupSnapshot, IscsiLun, IscsiSession, IscsiTargetDetail } from '@anas/shared'
+import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { constants, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -13,6 +14,8 @@ import {
   imageArchiveSize,
   imageBytesWritten,
   imageRestoreArgs,
+  liveSessionsAtRunRefusal,
+  liveSessionsRefusal,
   parseRestoreProgress,
   readBackWarnings,
   readTargetSize,
@@ -22,6 +25,7 @@ import {
   volsizeArgs,
 } from '../backup-restore.js'
 import { buildBackupEnv, PBC } from '../backup-runner.js'
+import { withIscsiLock } from '../iscsi-mutate.js'
 
 /**
  * backup2.7 — the whole-image LUN restore, at the service level.
@@ -159,8 +163,26 @@ function deps(mock: MockExecutor, lun: IscsiLun, tgt: IscsiTargetDetail, over: R
     lun,
     env: buildBackupEnv(REPO, 'super-secret'),
     readBack: async () => [tgt],
+    // The run-time session re-read (R1 / issue #52). The default is the healthy
+    // case — nobody logged back in while the job waited in the queue — so every
+    // test that is about something else keeps reading as it did.
+    readSessions: async () => [],
     mutate: { executor: mock },
     ...over,
+  }
+}
+
+/** A live session on the target, in the shape LIO's `acls/<iqn>/info` yields. */
+function session(initiatorIqn = 'iqn.1993-08.org.debian:01:ae3d2ec18ad'): IscsiSession {
+  return {
+    initiatorIqn,
+    initiatorAlias: 'anas-pve',
+    targetIqn: IQN,
+    tpgTag: 1,
+    sessionId: 1,
+    state: 'TARG_SESS_STATE_LOGGED_IN',
+    connections: [{ cid: 0, address: '192.168.200.60', state: 'TARG_CONN_STATE_LOGGED_IN' }],
+    mappedLuns: [0],
   }
 }
 
@@ -549,6 +571,176 @@ describe('runImageRestore — the happy sequence, as an exact call log', () => {
     assert.equal(mock.calls.some(c => c.args.includes('enable')), false)
     assert.equal(result.targetDisabled, false)
     assert.equal(result.targetReEnabled, false)
+  })
+})
+
+describe('runImageRestore — the run-time session re-check (R1, issue #52)', () => {
+  /**
+   * The gap this closes: the route's entry gate reads the sessions when the
+   * REQUEST arrives, and the job it submits can sit in the queue for hours
+   * behind other work (four run at a time). open-iscsi and Windows reconnect on
+   * their own, so by the time the job runs, "no sessions" is a fact about the
+   * past. Without a re-read the designed "gate, then disable" pair degrades to
+   * "disable only" and the image is written under a live initiator.
+   */
+  it('a session that came back while the job waited fails it — nothing disabled, nothing written', async () => {
+    const mock = successMock()
+    const lun = zvolLun()
+    const tgt = target([lun])
+    await assert.rejects(
+      // The target the job carries is the one the REQUEST saw: no sessions on
+      // it. The re-read is what knows better.
+      runImageRestore(mock, deps(mock, lun, tgt, { readSessions: async () => [session()] }), noop),
+      (err: Error) => {
+        assert.match(err.message, /1 initiator is logged in to/)
+        assert.match(err.message, /iqn\.1993-08\.org\.debian:01:ae3d2ec18ad/)
+        assert.match(err.message, /Log the initiator\(s\) out first/)
+        // The one fact only the job can report.
+        assert.match(err.message, /appeared AFTER the restore was accepted/)
+        return true
+      },
+    )
+    // NOTHING ran: no disable, no saveconfig, no stream. The target is exactly
+    // as the job found it, which is what makes this refusal safe to retry.
+    assert.deepEqual(mock.calls, [])
+    assert.deepEqual(mock.streamCalls, [])
+  })
+
+  it('the re-check is asked for THIS target, and BEFORE anything is disabled', async () => {
+    const mock = successMock()
+    const lun = zvolLun()
+    const tgt = target([lun])
+    const asked: string[] = []
+    let callsWhenAsked: number | null = null
+    await runImageRestore(mock, deps(mock, lun, tgt, {
+      readSessions: async (iqn: string) => {
+        asked.push(iqn)
+        callsWhenAsked = mock.calls.length
+        return []
+      },
+    }), noop)
+    assert.deepEqual(asked, [IQN])
+    // Zero commands had run when the question was asked — the answer decides
+    // whether the disable happens at all, so it cannot come after it.
+    assert.equal(callsWhenAsked, 0)
+    // And with no session, the sequence is the one it always was.
+    assert.deepEqual(mock.calls.map(c => `${c.command} ${c.args.join(' ')}`), [
+      `${TARGETCLI} /iscsi/${IQN}/tpg1 disable`,
+      `${TARGETCLI} saveconfig`,
+      `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
+      `${TARGETCLI} /iscsi/${IQN}/tpg1 enable`,
+      `${TARGETCLI} saveconfig`,
+    ])
+  })
+
+  it('says it in the SAME words the request-time 409 uses — one sentence, two doors', () => {
+    const one = liveSessionsRefusal(IQN, [session()])
+    assert.match(one, /^1 initiator is logged in to /)
+    assert.match(one, /under a mounted filesystem/)
+    // The in-job refusal is that sentence plus the fact that is only true there.
+    assert.ok(liveSessionsAtRunRefusal(IQN, [session()]).startsWith(one))
+    assert.match(liveSessionsAtRunRefusal(IQN, [session()]), /Nothing was disabled and nothing was written/)
+  })
+
+  it('counts INITIATORS, not sessions — two connections from one host are one name', () => {
+    const two = liveSessionsRefusal(IQN, [session(), session()])
+    assert.match(two, /^1 initiator is logged in to /)
+    const both = liveSessionsRefusal(IQN, [session(), session('iqn.1991-05.com.microsoft:win')])
+    assert.match(both, /^2 initiators are logged in to /)
+    assert.match(both, /iqn\.1991-05\.com\.microsoft:win/)
+  })
+})
+
+describe('runImageRestore — where the iSCSI lock is held, and where it is not', () => {
+  /** Resolves 'waited' if `p` has not settled within a few event-loop turns. */
+  async function raceAgainstTime(p: Promise<unknown>, ms = 50): Promise<string> {
+    let timer: NodeJS.Timeout | undefined
+    const verdict = await Promise.race([
+      p.then(() => 'ran'),
+      new Promise<string>((r) => {
+        timer = setTimeout(r, ms, 'waited')
+      }),
+    ])
+    if (timer)
+      clearTimeout(timer)
+    return verdict
+  }
+
+  it('the re-check and the disable are ONE locked section — a concurrent mutation waits', async () => {
+    const mock = successMock()
+    const lun = zvolLun()
+    const tgt = target([lun])
+    let entered!: () => void
+    const inCheck = new Promise<void>((r) => {
+      entered = r
+    })
+    let release!: () => void
+    const held = new Promise<void>((r) => {
+      release = r
+    })
+
+    const run = runImageRestore(mock, deps(mock, lun, tgt, {
+      readSessions: async () => {
+        entered()
+        await held
+        return []
+      },
+    }), noop)
+    // A restore that never asks fails HERE rather than hanging the suite.
+    assert.equal(await raceAgainstTime(inCheck, 200), 'ran', 'the job must re-read the sessions')
+
+    // Any other iSCSI mutation queued now must wait: reading the sessions and
+    // acting on the answer is one decision, and a targetcli run in between
+    // would make the answer stale before the disable lands.
+    let ran = false
+    const other = withIscsiLock(async () => {
+      ran = true
+    })
+    assert.equal(await raceAgainstTime(other), 'waited')
+    assert.equal(ran, false)
+
+    release()
+    await run
+    await other
+    assert.equal(ran, true)
+  })
+
+  it('the image STREAM does not hold the lock — an hours-long restore blocks no mutation', async () => {
+    const mock = successMock()
+    const lun = zvolLun()
+    const tgt = target([lun])
+    let streaming!: () => void
+    const hasStarted = new Promise<void>((r) => {
+      streaming = r
+    })
+    let release!: () => void
+    const finish = new Promise<void>((r) => {
+      release = r
+    })
+
+    // The mock has no notion of a slow child, so the stream is gated here: the
+    // restore is parked mid-image, exactly where a real one spends its hours.
+    const gated: CommandExecutor = {
+      exec: (c, a, o) => mock.exec(c, a, o),
+      pipeline: (c1, a1, c2, a2) => mock.pipeline(c1, a1, c2, a2),
+      execToStream: async (c, a, t, o) => {
+        streaming()
+        await finish
+        return mock.execToStream(c, a, t, o)
+      },
+    }
+
+    const run = runImageRestore(gated, deps(mock, lun, tgt), noop)
+    await hasStarted
+    // The disable has landed and the lock is free again.
+    assert.ok(mock.calls.some(c => c.args.includes('disable')), JSON.stringify(mock.calls))
+    const other = withIscsiLock(async () => 'mutated')
+    assert.equal(await raceAgainstTime(other), 'ran')
+
+    release()
+    await run
+    // And the re-enable still ran, after the stream, under the lock again.
+    assert.ok(mock.calls.some(c => c.args.includes('enable')))
   })
 })
 

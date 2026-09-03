@@ -83,6 +83,7 @@ import {
 import {
   assertSizeMatch,
   imageArchiveSize,
+  liveSessionsRefusal,
   readTargetSize,
   runImageRestore,
   runNewLunImageRestore,
@@ -1680,17 +1681,19 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     // (6) The entry gate: a live session is a hard 409 with no bypass. There is
     // no confirmation that makes overwriting a block device an initiator has
     // open and mounted safe from this side.
+    //
+    // This is the FIRST of two askings. The state above was read when the
+    // request arrived; the job it submits may not run for hours (the queue runs
+    // four at a time and a restore can queue behind long backups), so
+    // `runImageRestore` asks again under the iSCSI lock immediately before it
+    // disables anything — with the same sentence, from the same helper.
     if (target.sessions.length > 0) {
-      const initiators = [...new Set(target.sessions.map(s => s.initiatorIqn))]
       reply.code(409)
       return {
         error: {
           code: 'CONFLICT',
           reason: 'live-sessions',
-          message: `${initiators.length} initiator${initiators.length === 1 ? ' is' : 's are'} logged in to `
-            + `${target.iqn} right now: ${initiators.join(', ')}. Restoring an image over a LUN an initiator has `
-            + 'open would overwrite the device under a mounted filesystem, and neither LIO nor the initiator '
-            + 'would be told. Log the initiator(s) out first.',
+          message: liveSessionsRefusal(target.iqn, target.sessions),
         },
       }
     }
@@ -1751,7 +1754,13 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const job = jobQueue.submit(
       'backup.restore.image',
       { ...identity, params: auditParams },
-      async updateProgress => withIscsiLock(async () => runImageRestore(
+      // NO `withIscsiLock` here: `runImageRestore` OWNS the lock for this
+      // operation and takes it twice — once for the session re-check plus the
+      // disable, once for the re-enable — leaving it released across the image
+      // stream, which can run for hours. Wrapping the call would both hold the
+      // node's only iSCSI mutex for that whole time and deadlock against the
+      // service's own acquisition (the mutex is a plain chain, not reentrant).
+      async updateProgress => runImageRestore(
         executor,
         {
           repo,
@@ -1765,6 +1774,15 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           ...(req.rate ? { rate: req.rate } : {}),
           env: buildBackupEnv(repo, secret),
           readBack: async () => (await readIscsiState(executor, iscsiPaths)).targets,
+          // The run-time answer to the question the entry gate asked at the
+          // request. A target that has VANISHED in the meantime reports no
+          // sessions — the disable that follows is what discovers that, and it
+          // fails loudly with targetcli's own words rather than this read
+          // inventing a second story about it.
+          readSessions: async (iqn) => {
+            const now = await readIscsiState(executor, iscsiPaths)
+            return now.targets.find(t => t.iqn === iqn)?.sessions ?? []
+          },
           mutate: {
             executor,
             configfsRoot: iscsiPaths.configfsRoot ?? CONFIGFS_TARGET_ROOT,
@@ -1775,7 +1793,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       ).then((result) => {
         auditParams.bytesWritten = result.bytesWritten
         return result
-      })),
+      }),
     )
 
     reply.code(202)

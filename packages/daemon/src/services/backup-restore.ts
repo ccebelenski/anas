@@ -4,6 +4,7 @@ import type {
   BackupSnapshot,
   CreateDatasetRequest,
   IscsiLun,
+  IscsiSession,
   IscsiTargetDetail,
 } from '@anas/shared'
 import type { CommandExecutor, ExecStreamTarget } from '../executor/types.js'
@@ -13,7 +14,7 @@ import { stat, unlink } from 'node:fs/promises'
 import { buildCreateArgs } from '../routes/datasets.js'
 import { ensureAhrTargetOrdering } from './ahr-create.js'
 import { PBC } from './backup-runner.js'
-import { backstorePath, createAndMapLun, createSparseImage, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, ZFS, zvolDataset } from './iscsi-mutate.js'
+import { backstorePath, createAndMapLun, createSparseImage, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
 
 /**
  * WHOLE-IMAGE RESTORE of an iSCSI LUN (story backup2.7).
@@ -437,6 +438,47 @@ function changedAttributes(
 }
 
 // ---------------------------------------------------------------------------
+// The live-session refusal — ONE sentence, said at BOTH doors
+// ---------------------------------------------------------------------------
+
+/**
+ * The refusal a live session earns an in-place image restore.
+ *
+ * It lives here, not in the route, because it is said TWICE and the two sayings
+ * must be the same words: once at the request (the entry gate, a 409 with no
+ * confirm bypass) and once inside the job, immediately before the TPG is
+ * disabled. An operator who hits the second one has already been told the first
+ * one's story by the UI, so a differently-worded second refusal would read as a
+ * different problem.
+ */
+export function liveSessionsRefusal(iqn: string, sessions: { initiatorIqn: string }[]): string {
+  const initiators = [...new Set(sessions.map(s => s.initiatorIqn))]
+  return `${initiators.length} initiator${initiators.length === 1 ? ' is' : 's are'} logged in to `
+    + `${iqn} right now: ${initiators.join(', ')}. Restoring an image over a LUN an initiator has `
+    + 'open would overwrite the device under a mounted filesystem, and neither LIO nor the initiator '
+    + 'would be told. Log the initiator(s) out first.'
+}
+
+/**
+ * The same refusal, from INSIDE the job, plus the one fact that is only true
+ * there: the session was not present when the restore was accepted.
+ *
+ * A queued restore can sit behind hours of backups (the queue runs four jobs at
+ * a time), and open-iscsi and Windows RECONNECT on their own — so the entry
+ * gate's verdict is a fact about the past by the time the job runs. Without
+ * this re-read the designed "gate, then disable" pair degrades to "disable
+ * only": the session comes back during the wait and the image is written under
+ * it. What LIO does to an ESTABLISHED session when its TPG is disabled is not
+ * ground-truthed (GT-37 measured new logins), so nothing here assumes either
+ * way — the restore simply does not start.
+ */
+export function liveSessionsAtRunRefusal(iqn: string, sessions: { initiatorIqn: string }[]): string {
+  return `${liveSessionsRefusal(iqn, sessions)} This session appeared AFTER the restore was accepted — `
+    + 'the check at the request passed and this one did not, so the job refused rather than write under it. '
+    + 'Nothing was disabled and nothing was written; the target is exactly as it was.'
+}
+
+// ---------------------------------------------------------------------------
 // The run
 // ---------------------------------------------------------------------------
 
@@ -457,6 +499,13 @@ export interface ImageRestoreDeps {
   env: Record<string, string>
   /** Re-read the LIO state for the post-write assertions. */
   readBack: () => Promise<IscsiTargetDetail[]>
+  /**
+   * Re-read the target's LIVE sessions, NOW — the smallest possible reader,
+   * because the only thing the job needs from LIO before it disables anything
+   * is whether an initiator is logged in at this instant. Required, never
+   * optional: a caller that forgot it would silently lose the gate.
+   */
+  readSessions: (iqn: string) => Promise<IscsiSession[]>
   /** The mutate context the enable/disable pair runs in. */
   mutate: IscsiMutateOptions
 }
@@ -466,14 +515,18 @@ export interface ImageRestoreDeps {
  *
  * THE SEQUENCE, and why it is this order:
  *
- *   1. **Disable the target's TPG.** Not "check for sessions and hope" — the
- *      entry gate already refused a live session, but open-iscsi and Windows
- *      RECONNECT, so a target left enabled can acquire a session between the
- *      pre-flight and the first byte. Disabling refuses new logins and hides
- *      the target from discovery (GT-37, iSCSI ground truth). It is the whole
- *      TARGET that goes down, not one LUN: LIO's enable flag lives on the TPG,
- *      and every other LUN on that target is unreachable for the duration. The
- *      confirm text says so in those words.
+ *   1. **Re-read the sessions, THEN disable the target's TPG — under the iSCSI
+ *      lock, as one step.** The entry gate refused a live session at the
+ *      REQUEST; this job may have waited hours in the queue behind other work,
+ *      and open-iscsi and Windows RECONNECT, so that verdict is about the past.
+ *      The re-read is the same question asked at the moment it matters, and it
+ *      shares the lock with the disable so no other iSCSI mutation can slip
+ *      between the two. A session here is a hard failure with NOTHING done:
+ *      the target is left exactly as found. Disabling then refuses new logins
+ *      and hides the target from discovery (GT-37, iSCSI ground truth). It is
+ *      the whole TARGET that goes down, not one LUN: LIO's enable flag lives on
+ *      the TPG, and every other LUN on that target is unreachable for the
+ *      duration. The confirm text says so in those words.
  *   2. **Stream the image in.** `restore <snap> <archive> -` with stdout piped
  *      into a descriptor ANAS opened on the device/file. pbc never sees the
  *      target path, which is the only way past GT-39.
@@ -481,13 +534,24 @@ export interface ImageRestoreDeps {
  *      medium, not in the page cache.
  *   4. **Read back** serial + attributes + backing path and prove they are
  *      unchanged.
- *   5. **Re-enable in a `finally`** — EXCEPT after a partial write, which is
- *      the one case where staying offline is the correct outcome and an
- *      explicit `POST /iscsi/targets/:iqn/state {enable}` is the operator's
- *      acknowledgement.
+ *   5. **Re-enable in a `finally`, under the lock again** — EXCEPT after a
+ *      partial write, which is the one case where staying offline is the
+ *      correct outcome and an explicit `POST /iscsi/targets/:iqn/state {enable}`
+ *      is the operator's acknowledgement.
  *
  * Only what ANAS disabled is re-enabled: a target that was already disabled
  * when the restore started is left exactly as found (guest philosophy).
+ *
+ * WHERE THE LOCK IS, AND WHY IT IS NOT AROUND THE WHOLE THING: the daemon-wide
+ * `withIscsiLock` mutex exists so two `targetcli` runs never touch the tree at
+ * once, and this function is its OWNER for a restore — it takes it twice, for
+ * the two short targetcli sections, and holds it for neither the image stream
+ * nor the read-back. An image restore runs for HOURS; a lock held across it
+ * would block every iSCSI mutation on the node for the whole restore, which is
+ * a far bigger outage than the one it would prevent. The stream itself needs no
+ * mutual exclusion: it writes the LUN's backing object, not the LIO tree. The
+ * mutex is NOT reentrant (a plain promise chain), so callers must not wrap this
+ * call in another `withIscsiLock` — that deadlocks.
  */
 export async function runImageRestore(
   executor: CommandExecutor,
@@ -505,17 +569,29 @@ export async function runImageRestore(
   let bytesWritten = 0
   let duration: string | undefined
 
-  if (target.enabled) {
-    updateProgress(
-      `disabling iSCSI target ${target.iqn} for the duration of the restore `
-      + `(the whole target goes offline, not just LUN ${lun.index})`,
-    )
-    await setIscsiTargetState(deps.mutate, target, 'disable')
-    disabledByUs = true
-  }
-  else {
-    updateProgress(`iSCSI target ${target.iqn} is already disabled - left as found`)
-  }
+  // ---- 1. Re-check + disable: ONE locked section --------------------------
+  // Under the lock so nothing else can mutate the LIO tree between the answer
+  // and the act on it. The refusal is thrown from INSIDE the lock, before the
+  // `try`, so a job that stops here has disabled nothing and has no `finally`
+  // to unwind — the target is bit-for-bit as the job found it.
+  await withIscsiLock(async () => {
+    updateProgress(`re-reading the live sessions on ${target.iqn} - the request-time check is not the run-time one`)
+    const sessions = await deps.readSessions(target.iqn)
+    if (sessions.length > 0)
+      throw new Error(liveSessionsAtRunRefusal(target.iqn, sessions))
+
+    if (target.enabled) {
+      updateProgress(
+        `disabling iSCSI target ${target.iqn} for the duration of the restore `
+        + `(the whole target goes offline, not just LUN ${lun.index})`,
+      )
+      await setIscsiTargetState(deps.mutate, target, 'disable')
+      disabledByUs = true
+    }
+    else {
+      updateProgress(`iSCSI target ${target.iqn} is already disabled - left as found`)
+    }
+  })
 
   try {
     const args = imageRestoreArgs(deps.snapshot, deps.archive, deps.namespace, deps.rate)
@@ -598,7 +674,11 @@ export async function runImageRestore(
     if (disabledByUs && !partial) {
       try {
         updateProgress(`re-enabling iSCSI target ${target.iqn}`)
-        await setIscsiTargetState(deps.mutate, target, 'enable')
+        // The lock again, for the same reason it was taken to disable: this is
+        // a targetcli run plus a `saveconfig`, and it must not interleave with
+        // another mutation. It is a SECOND acquisition, not a nested one — the
+        // stream ran with the lock released.
+        await withIscsiLock(async () => setIscsiTargetState(deps.mutate, target, 'enable'))
         reEnabled = true
       }
       catch (err) {

@@ -11,6 +11,7 @@ import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js
 import { createServer } from '../../server.js'
 import { volsizeArgs } from '../../services/backup-restore.js'
 import { PBC } from '../../services/backup-runner.js'
+import { withIscsiLock } from '../../services/iscsi-mutate.js'
 
 /**
  * backup2.7 — `POST /v1/backup/restore` (kind `image`): EVERY GATE BEFORE THE JOB.
@@ -69,6 +70,22 @@ const IDENTITY = {
   'x-anas-request-id': '11111111-2222-4333-8444-555555555555',
 }
 
+/**
+ * The `acls/<iqn>/info` block LIO writes while an initiator is LOGGED IN.
+ *
+ * One copy, used twice: the manifest embeds it (escaped) for a target that is
+ * busy from the start, and the TOCTOU test writes it into the live tree to make
+ * an initiator reconnect while a restore job is queued.
+ */
+const SESSION_INFO = `InitiatorName: ${INITIATOR}
+InitiatorAlias: anas-pve
+LIO Session ID: 1   ISID: 0x00 02 3d 00 00 02  TSIH: 1  SessionType: Normal
+Session State: TARG_SESS_STATE_LOGGED_IN
+---------------------[iSCSI Session Values]-----------------------
+----------------------[iSCSI Connections]-------------------------
+CID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN
+   Address 192.168.200.60 TCP  StatSN: 0x6916c3e9`
+
 /** SYNTHETIC configfs: one ANAS target, one zvol LUN, one ACL. */
 function anasManifest(opts: { session?: boolean } = {}): string {
   const tpg = `iscsi/${ANAS_IQN}/tpgt_1`
@@ -114,7 +131,9 @@ function anasManifest(opts: { session?: boolean } = {}): string {
     `F ${acl}/auth/authenticate_target = 0`,
     `D ${acl}/lun_0`,
     opts.session
-      ? `F ${acl}/info = InitiatorName: ${INITIATOR}\\nInitiatorAlias: anas-pve\\nLIO Session ID: 1   ISID: 0x00 02 3d 00 00 02  TSIH: 1  SessionType: Normal\\nSession State: TARG_SESS_STATE_LOGGED_IN\\n---------------------[iSCSI Session Values]-----------------------\\n----------------------[iSCSI Connections]-------------------------\\nCID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN\\n   Address 192.168.200.60 TCP  StatSN: 0x6916c3e9`
+      // The manifest escapes newlines as `\n`, so the one copy of the block is
+      // re-escaped here rather than written out a second time.
+      ? `F ${acl}/info = ${SESSION_INFO.replace(/\n/g, '\\n')}`
       : `F ${acl}/info = No active iSCSI Session for Initiator Endpoint: ${INITIATOR}`,
   ].join('\n')}\n`
 }
@@ -532,6 +551,101 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       assert.match(res.body.error!.message, /under a mounted filesystem/)
       assert.ok(!res.headers['x-anas-confirm-code'], 'a live session has no confirm bypass')
       assertNothingDestructive()
+    })
+  })
+
+  // --- (7b) the SAME question, asked again when the job runs (R1, #52) -----
+  //
+  // The gate above is a fact about the moment the request arrived. A restore is
+  // a job, and a job waits: the queue runs four at a time and this one can sit
+  // behind hours of backups. open-iscsi and Windows reconnect on their own, so
+  // an initiator can be back before the first byte — which used to mean the
+  // designed "gate, then disable" pair degraded to "disable only".
+
+  describe('a session that comes back while the job is QUEUED stops the job', () => {
+    /** The initiator logs back in: LIO's live `info` block replaces the idle one. */
+    async function loginInitiator(): Promise<void> {
+      await writeFile(
+        join(dir, 'target', 'iscsi', ANAS_IQN, 'tpgt_1', 'acls', INITIATOR, 'info'),
+        `${SESSION_INFO}\n`,
+      )
+    }
+
+    it('fails the job with the live-session wording — nothing disabled, nothing written', async () => {
+      await serveAnas()
+      const first = await restore()
+      const code = String(first.headers['x-anas-confirm-code'])
+
+      // Park the daemon-wide iSCSI mutex. The job takes it for the session
+      // re-check plus the disable, so holding it here holds the job open in
+      // EXACTLY the window the defect lived in — no sleeps, no races.
+      let release!: () => void
+      let locked!: () => void
+      const isLocked = new Promise<void>((r) => {
+        locked = r
+      })
+      const held = withIscsiLock(() => new Promise<void>((r) => {
+        release = r
+        locked()
+      }))
+      await isLocked
+
+      const res = await restore(body(), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+
+      // ... and now the initiator is back, after the entry gate said it was not.
+      await loginInitiator()
+      release()
+      await held
+
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'failed', JSON.stringify(job.result))
+      assert.match(job.error!.message, new RegExp(INITIATOR.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+      assert.match(job.error!.message, /is logged in to/)
+      assert.match(job.error!.message, /under a mounted filesystem/)
+      assert.match(job.error!.message, /appeared AFTER the restore was accepted/)
+      // The whole point: the target was left EXACTLY as the job found it. No
+      // disable, no saveconfig, and not one byte of the image streamed.
+      assertNothingDestructive()
+    })
+
+    it('no session when the job runs — the restore proceeds exactly as before', async () => {
+      // The same lock-parked shape as above with the login left out, so the
+      // only difference between passing and failing this pair is the session.
+      await serveAnas()
+      const first = await restore()
+      const code = String(first.headers['x-anas-confirm-code'])
+
+      let release!: () => void
+      let locked!: () => void
+      const isLocked = new Promise<void>((r) => {
+        locked = r
+      })
+      const held = withIscsiLock(() => new Promise<void>((r) => {
+        release = r
+        locked()
+      }))
+      await isLocked
+
+      const res = await restore(body(), { 'x-anas-confirm': code })
+      assert.equal(res.statusCode, 202)
+      release()
+      await held
+
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const mock = mockOf()
+      assert.equal(mock.streamCalls.length, 1)
+      const seq = mock.calls
+        .map(c => `${c.command} ${c.args.join(' ')}`)
+        .filter(a => a.startsWith(TARGETCLI) || a.includes(' restore '))
+      assert.deepEqual(seq, [
+        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1 disable`,
+        `${TARGETCLI} saveconfig`,
+        `${PBC} restore ${SNAP} vol.img - --ns gtrestore`,
+        `${TARGETCLI} /iscsi/${ANAS_IQN}/tpg1 enable`,
+        `${TARGETCLI} saveconfig`,
+      ])
     })
   })
 
