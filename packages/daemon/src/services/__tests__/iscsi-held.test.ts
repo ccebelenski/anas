@@ -1,4 +1,5 @@
 import type { IscsiClaim } from '@anas/shared'
+import type { ZfsMountpoint } from '../../parsers/pve-storage.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -339,6 +340,74 @@ describe('heldByLun — against the REAL configfs capture (iscsi.1)', () => {
     const first = createIscsiClaimCache(exec, paths())
     const second = createIscsiClaimCache(exec, paths())
     assert.notEqual(await first.claims(), await second.claims())
+  })
+})
+
+describe('createIscsiClaimCache — the failure bit is kept, not discarded (D3)', () => {
+  let dir: string
+  let configfsRoot: string
+  const exec = new MockExecutor()
+
+  /**
+   * The read layer fail-opens component by component (an unreadable configfs
+   * and a malformed saveconfig both come back as healthy empties), so the
+   * cache's catch exists for "a throw anywhere" in the read. The
+   * `zfsMountpoints` SEAM is the injection point for exactly that: rejecting it
+   * makes the read reject the way a genuinely broken read does.
+   */
+  const BROKEN_READ = async () => {
+    throw new Error('zfs list exploded')
+  }
+
+  function paths(zfsMountpoints?: () => Promise<ZfsMountpoint[]>) {
+    return {
+      configfsRoot,
+      saveconfigPath: join(dir, 'absent-saveconfig.json'),
+      pveStorageCfg: join(dir, 'absent-storage.cfg'),
+      blockRoot: join(dir, 'absent-block'),
+      ...(zfsMountpoints ? { zfsMountpoints } : {}),
+    }
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-held-failed-'))
+    configfsRoot = join(dir, 'target')
+    await materializeConfigfsManifest(
+      readFileSync(join(ISCSI_FIXTURES, 'configfs-live.manifest'), 'utf-8'),
+      configfsRoot,
+    )
+  })
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('a healthy read keeps both halves: the claims AND failed=false', async () => {
+    const cache = createIscsiClaimCache(exec, paths(async () => []))
+    assert.ok((await cache.claims()).length > 0)
+    assert.equal(await cache.readFailed(), false)
+  })
+
+  it('a read failure keeps the FAIL-OPEN [] but reports failed=true', async () => {
+    const cache = createIscsiClaimCache(exec, paths(BROKEN_READ))
+    assert.deepEqual(await cache.claims(), [])
+    assert.equal(await cache.readFailed(), true)
+  })
+
+  it('the verdict is memoised WITH the claims — one read, one verdict', async () => {
+    const cache = createIscsiClaimCache(exec, paths(BROKEN_READ))
+    await cache.claims()
+    assert.equal(await cache.readFailed(), true)
+    assert.equal(await cache.readFailed(), true)
+  })
+
+  it('a node with NO LIO is not a failure — installed:false is a healthy answer', async () => {
+    const cache = createIscsiClaimCache(exec, {
+      ...paths(),
+      configfsRoot: join(dir, 'no-such-configfs'),
+    })
+    assert.deepEqual(await cache.claims(), [])
+    assert.equal(await cache.readFailed(), false)
   })
 })
 

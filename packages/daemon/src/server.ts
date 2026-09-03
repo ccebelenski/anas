@@ -491,7 +491,11 @@ export function createServer(opts?: ServerOptions) {
   // collision checks and the story 3.25 PVE-managed hands-off guard. Both
   // default inside the route to the real host paths; the env overrides make the
   // guard and collisions testable (and keep mock reads off the host).
-  server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, pveStoragePath: process.env.ANAS_STORAGE_CFG, iscsiPaths })
+  // ONE DiskIdentityCache for every consumer of the disk inventory: the Disks
+  // screen and the pool composability pre-flight (D4) must read the same
+  // identities, not re-derive them per route.
+  const diskIdentityCache = new DiskIdentityCache(executor)
+  server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, pveStoragePath: process.env.ANAS_STORAGE_CFG, iscsiPaths, diskIdentityCache })
   // datasetRoutes also reads the share configs to report associated shares
   // (Epic 4.4) and warn on destroy — same paths the share routes edit.
   server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport, iscsiPaths })
@@ -549,7 +553,6 @@ export function createServer(opts?: ServerOptions) {
   // one is a job, every sequence runs under the one daemon-wide LIO mutex, and
   // each ends in `targetcli saveconfig` — never over a degraded restore (GT-22).
   server.register(iscsiMutationRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, ...iscsiPaths })
-  const diskIdentityCache = new DiskIdentityCache(executor)
   server.register(diskRoutes, { prefix: '/v1', executor, diskIdentityCache, iscsiPaths })
   // AHR hybrid RAID (Epic 11 + AHR). The per-pool AhrExpansionIntent store
   // (§5.3 — the ONLY persisted expansion state) lives under /etc/anas/ahr;

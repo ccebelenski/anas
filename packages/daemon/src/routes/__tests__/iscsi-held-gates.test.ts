@@ -1,5 +1,7 @@
 import type { AhrPool, Dataset, IscsiTargetDetail, Job, JobAccepted, MountSummary, PoolSummary } from '@anas/shared'
-import type { MockExecutor } from '../../executor/mock.js'
+import type { FastifyInstance } from 'fastify'
+import type { ZfsMountpoint } from '../../parsers/pve-storage.js'
+import type { Transport } from '../../services/replication-transport.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -8,11 +10,17 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import Fastify from 'fastify'
 import { lunGrowGuidance } from '@anas/shared'
+import { MockExecutor } from '../../executor/mock.js'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
+import { JobQueue } from '../../jobs/queue.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
+import { ConfirmStore } from '../../safety/confirm.js'
 import { createServer } from '../../server.js'
 import { AHR_FINDMNT_ARGS } from '../../services/ahr-topology.js'
+import { datasetRoutes } from '../datasets.js'
+import { poolRoutes } from '../pools.js'
 
 /**
  * The rest of ANAS knows a LUN is there — story `iscsi.6`, the ROUTE gates.
@@ -603,5 +611,140 @@ describe('iscsi.6 — the rest of ANAS knows a LUN is there (route gates)', () =
       for (const d of (res.json() as { data: Dataset[] }).data)
         assert.equal('heldByLun' in d, false, d.name)
     })
+  })
+})
+
+/**
+ * The DISCLOSURE half of fail-open (D3). The fail-open posture above stands —
+ * a broken claims read must never block a destroy — but it must not be
+ * fail-SILENT either: the cache now keeps the failure bit, and the confirm
+ * doors that are about to hand the operator a code say "ANAS could not check".
+ *
+ * These tests build the minimal app (not `createServer`) because the failure
+ * has to be injected through the `zfsMountpoints` TEST SEAM: the read layer
+ * fail-opens component by component, so the catch is reachable only by making
+ * the read throw — which is precisely the "genuinely broken read" this warns
+ * about. The LIO tree itself is the same real capture.
+ */
+describe('the disclosure — a failed claims read is named at the confirm doors (D3)', () => {
+  let dir: string
+  let app: FastifyInstance | undefined
+
+  const BROKEN_READ = async (): Promise<ZfsMountpoint[]> => {
+    throw new Error('zfs list exploded')
+  }
+  const HEALTHY_READ = async (): Promise<ZfsMountpoint[]> => []
+
+  /** The datasetRoutes transport is never driven by these tests. */
+  function stubTransport(): Transport {
+    return {
+      resolveLocation: async () => ({ ok: false, error: 'not driven by this test' }),
+      listPeers: async () => [],
+      sshExec: async () => ({ stdout: '', stderr: '', exitCode: 1 }),
+      buildSshArgv: () => [],
+      remotePoolNames: async () => [],
+      remotePoolExists: async () => false,
+      remoteDatasetExists: async () => false,
+      remoteSnapshotNames: async () => [],
+      remoteHold: async () => ({ stdout: '', stderr: '', exitCode: 1 }),
+      remoteRelease: async () => ({ stdout: '', stderr: '', exitCode: 1 }),
+      remoteHeldTags: async () => [],
+    }
+  }
+
+  /**
+   * The real LIO capture behind both doors; `zfsMountpoints` decides whether
+   * the claims read SUCCEEDS (healthy) or THROWS (the broken read).
+   */
+  async function buildDoors(zfsMountpoints: () => Promise<ZfsMountpoint[]>): Promise<FastifyInstance> {
+    const root = join(dir, 'target')
+    await materializeConfigfsManifest(fixtureText(ISCSI_FIXTURES, 'configfs-live.manifest'), root)
+    const executor = new MockExecutor()
+    executor.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: ZPOOL_LIST, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: ZFS, args: zfsListArgs(POOL), result: { stdout: fixtureText(ZFS_FIXTURES, 'zfs-list-volumes.json'), stderr: '', exitCode: 0 } })
+    const iscsiPaths = {
+      configfsRoot: root,
+      saveconfigPath: join(dir, 'absent-saveconfig.json'),
+      pveStorageCfg: join(dir, 'absent-storage.cfg'),
+      blockRoot: join(dir, 'absent-block'),
+      zfsMountpoints,
+    }
+    const built = Fastify({ logger: false })
+    const jobQueue = new JobQueue()
+    await built.register(poolRoutes, {
+      prefix: '/v1', executor, jobQueue, confirmStore: new ConfirmStore(),
+      fstabPath: join(dir, 'fstab'), pveStoragePath: join(dir, 'no-storage.cfg'), iscsiPaths,
+    })
+    await built.register(datasetRoutes, {
+      prefix: '/v1', executor, jobQueue, confirmStore: new ConfirmStore(),
+      transport: stubTransport(), iscsiPaths,
+    })
+    await built.ready()
+    return built
+  }
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-held-disclose-'))
+    await writeFile(join(dir, 'fstab'), '# empty\n')
+  })
+
+  afterEach(async () => {
+    await app?.close()
+    app = undefined
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('pool destroy mints the confirm gate WITH the could-not-check warning', async () => {
+    app = await buildDoors(BROKEN_READ)
+    const res = await app.inject({ method: 'DELETE', url: `/v1/pools/${POOL}`, headers: IDENTITY })
+    assert.equal(res.statusCode, 409)
+    const body = res.json() as { error: { code: string, warnings: string[] } }
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED', JSON.stringify(body))
+    assert.ok(res.headers['x-anas-confirm-code'], 'a normal confirm challenge, not a refusal')
+    const line = body.error.warnings.find(w => w.includes('could not check whether an iSCSI LUN'))
+    assert.match(line ?? '', /served from this pool/)
+    assert.match(line ?? '', /LIO configuration was unreadable/)
+    assert.match(line ?? '', /verify by hand/)
+  })
+
+  it('dataset destroy mints the confirm gate WITH the could-not-check warning', async () => {
+    app = await buildDoors(BROKEN_READ)
+    const res = await app.inject({ method: 'DELETE', url: `/v1/pools/${POOL}/datasets/vol1`, headers: IDENTITY })
+    assert.equal(res.statusCode, 409)
+    const body = res.json() as { error: { code: string, warnings: string[] } }
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED', JSON.stringify(body))
+    assert.ok(res.headers['x-anas-confirm-code'])
+    const line = body.error.warnings.find(w => w.includes('could not check whether an iSCSI LUN'))
+    assert.match(line ?? '', /served from this dataset/)
+  })
+
+  it('pool export mints the confirm gate WITH the could-not-check warning', async () => {
+    app = await buildDoors(BROKEN_READ)
+    const res = await app.inject({
+      method: 'POST', url: `/v1/pools/${UNSERVED_POOL}/export`,
+      headers: JSON_HEADERS, payload: '{}',
+    })
+    assert.equal(res.statusCode, 409)
+    const body = res.json() as { error: { code: string, warnings: string[] } }
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED', JSON.stringify(body))
+    assert.ok(res.headers['x-anas-confirm-code'])
+    const line = body.error.warnings.find(w => w.includes('could not check whether an iSCSI LUN'))
+    assert.match(line ?? '', /served from this pool/)
+  })
+
+  it('a healthy read discloses NOTHING — the warning rides the failure, not the LIO', async () => {
+    app = await buildDoors(HEALTHY_READ)
+    const res = await app.inject({ method: 'DELETE', url: `/v1/pools/${UNSERVED_POOL}`, headers: IDENTITY })
+    assert.equal(res.statusCode, 409)
+    const body = res.json() as { error: { code: string, warnings: string[] } }
+    assert.equal(body.error.code, 'CONFIRMATION_REQUIRED')
+    assert.ok(res.headers['x-anas-confirm-code'])
+    // LIO is present, readable, serving `gtiscsi` — and `sparepool` hears
+    // nothing about it, because nothing failed.
+    assert.equal(
+      body.error.warnings.some(w => w.includes('could not check whether an iSCSI LUN')),
+      false,
+      JSON.stringify(body.error.warnings),
+    )
   })
 })

@@ -45,11 +45,12 @@ export async function ahrPoolHeldByLun(
   executor: CommandExecutor,
   iscsiPaths: IscsiPaths,
   pool: { name: string, mountpoint: string, mounted: boolean },
+  cache = createIscsiClaimCache(executor, iscsiPaths),
 ) {
   const subject: { pool: string, path?: string } = { pool: pool.name }
   if (pool.mounted && pool.mountpoint.startsWith('/'))
     subject.path = pool.mountpoint
-  return heldByLun(createIscsiClaimCache(executor, iscsiPaths), subject)
+  return heldByLun(cache, subject)
 }
 
 /**
@@ -345,7 +346,10 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
     // NOW — every array, partition and byte goes, including the file LIO is
     // serving, and nothing in ZFS/btrfs/md is going to refuse it. Hard 409, no
     // confirm bypass, before the confirm code is minted.
-    const destroyHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool)
+    // The cache is created HERE so the same read's failure bit can be
+    // disclosed at the confirm door below (D3).
+    const claimsCache = createIscsiClaimCache(executor, iscsiPaths)
+    const destroyHeld = await ahrPoolHeldByLun(executor, iscsiPaths, pool, claimsCache)
     if (destroyHeld) {
       reply.code(409)
       return ahrHeldByLunConflict(`AHR pool '${name}'`, 'Destroying', destroyHeld)
@@ -363,6 +367,13 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
         if (m.target.startsWith(`${pool.mountpoint}/`))
           warnings.push(`'${m.target}' (${m.fstype}) is mounted beneath the pool and will lose its filesystem`)
       }
+    }
+
+    // Fail-open is not fail-silent (D3): a broken claims read looks exactly
+    // like a pool holding no LUNs, and the destroy takes the image file with
+    // it. Disclose; the hard 409 above is unchanged.
+    if (await claimsCache.readFailed()) {
+      warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
     }
 
     if (!confirmGate(confirmStore, request, reply, {

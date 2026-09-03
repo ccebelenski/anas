@@ -1,11 +1,11 @@
-import type { ExpansionTarget, PoolDetail, PoolExpansionReport, PoolSummary, VdevSpec } from '@anas/shared'
+import type { Disk, ExpansionTarget, PoolDetail, PoolExpansionReport, PoolSummary, VdevSpec } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { IscsiPaths } from '../services/iscsi.js'
-import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, PoolMountpointRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
+import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, isComposableDisk, PoolMountpointRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
@@ -17,11 +17,12 @@ import { parseZpoolUpgrade } from '../parsers/zpool-upgrade.js'
 import { confirmGate } from '../safety/gate.js'
 import { isRootPool } from '../safety/root-pool.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
+import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
-import { resolveLeafKernel } from './disks.js'
+import { collectDisks, resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
 
 const ZFS = '/usr/sbin/zfs'
@@ -466,12 +467,21 @@ export async function poolRoutes(
      * Destroy/Export reads configfs. Defaults to the real host locations.
      */
     iscsiPaths?: IscsiPaths
+    /**
+     * The disk inventory's identity cache, shared with the Disks screen. The
+     * disk-composability pre-flight (the AHR composer's twin) reads the
+     * inventory through it; when the wiring does not hand one over, a local
+     * instance is built — identity is immutable per disk, so a second cache
+     * only re-reads what it has not seen, never diverges.
+     */
+    diskIdentityCache?: DiskIdentityCache
   },
 ) {
   const { executor, jobQueue, confirmStore } = opts
   const fstabPath = opts.fstabPath ?? '/etc/fstab'
   const pveCfgPath = opts.pveStoragePath ?? PVE_STORAGE_CFG
   const iscsiPaths = opts.iscsiPaths ?? {}
+  const diskIdentityCache = opts.diskIdentityCache ?? new DiskIdentityCache(executor)
 
   /**
    * Is an iSCSI LUN holding anything on this pool (story iscsi.6)?
@@ -480,8 +490,61 @@ export async function poolRoutes(
    * datasets — both resolve onto the pool root in the claim, so ONE question
    * covers both backing kinds.
    */
-  async function poolHeldByLun(poolName: string) {
-    return heldByLun(createIscsiClaimCache(executor, iscsiPaths), { pool: poolName })
+  async function poolHeldByLun(poolName: string, cache = createIscsiClaimCache(executor, iscsiPaths)) {
+    return heldByLun(cache, { pool: poolName })
+  }
+
+  /**
+   * The disk-composability pre-flight (the AHR composer's twin, same message
+   * shape): resolve every requested disk against the live inventory and name
+   * any that ANAS knows must not be composed into a pool.
+   *
+   * Why ZFS needs what AHR always had: `handsOff: 'iscsi-served-here'` marks the
+   * GT-43 loop-back disk — the node's own LUN coming back over its own
+   * initiator — and `status` marks everything else that is not genuinely blank.
+   * `zpool` itself cannot see either; handed such a disk it would happily build
+   * storage on top of itself. One refusal per disk, joined `; `-style.
+   *
+   * A disk that does NOT resolve in the inventory is deliberately passed
+   * through: the current behavior — zpool's own error surfacing from the job —
+   * stays, and inventing a second refusal for it is out of scope here.
+   */
+  async function composableDiskProblems(ids: string[]): Promise<string[]> {
+    // FAIL-OPEN, like every read this route makes: an inventory that cannot be
+    // read yields no refusal — zpool's own error stays the answer — exactly as
+    // the held-by-LUN gate treats an unreadable configfs. Never a 500.
+    let inventory: Disk[]
+    try {
+      inventory = await collectDisks(executor, diskIdentityCache, iscsiPaths)
+    }
+    catch (err: unknown) {
+      console.warn('anasd: could not read the disk inventory for the composability pre-flight:', err)
+      return []
+    }
+    const problems: string[] = []
+    for (const id of ids) {
+      const disk = inventory.find(d => d.id === id)
+      if (!disk)
+        continue
+      if (!isComposableDisk(disk)) {
+        problems.push(disk.handsOff
+          ? `disk '${id}' is hands-off: ${disk.handsOffReason ?? disk.handsOff}`
+          : `disk '${id}' is not available (status: ${disk.status}${disk.poolName ? `, pool '${disk.poolName}'` : ''})`)
+      }
+    }
+    return problems
+  }
+
+  /** Every disk id a create request names, across all six vdev classes. */
+  function createRequestDiskIds(req: CreatePoolRequest): string[] {
+    return [
+      ...req.dataVdevs.flatMap(v => v.disks),
+      ...(req.logVdevs ?? []).flatMap(v => v.disks),
+      ...(req.specialVdevs ?? []).flatMap(v => v.disks),
+      ...(req.dedupVdevs ?? []).flatMap(v => v.disks),
+      ...(req.cacheDisks ?? []),
+      ...(req.spareDisks ?? []),
+    ]
   }
 
   /** Stamp `heldByLun` onto every pool a LUN holds — one read for the grid. */
@@ -1071,6 +1134,18 @@ export async function poolRoutes(
       req.mountpoint = mp
     }
 
+    // SAFETY (the AHR composer's twin, D4): every requested disk must be
+    // composable. The GT-43 loop-back LUN is blank SCSI as far as the kernel
+    // and zpool can see — only the inventory's hands-off tag knows — and a
+    // non-available disk would be clobbered by the create. Refused BEFORE the
+    // job, naming the disk and the reason; an id the inventory does not know
+    // keeps zpool's own error as the answer.
+    const diskProblems = await composableDiskProblems(createRequestDiskIds(req))
+    if (diskProblems.length > 0) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${diskProblems.join('; ')}` } }
+    }
+
     const args = buildCreateArgs(req)
 
     const job = jobQueue.submit(
@@ -1217,6 +1292,16 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
+    // SAFETY (D4 — the create path's inventory pre-flight, shared): a hands-off
+    // (loop-back LUN) or non-available disk must not be composed in, whatever
+    // the role. Refused before the job; unresolvable ids keep zpool's error.
+    const candidateIds = role === 'cache' || role === 'spare' ? (disks ?? []) : vdev!.disks
+    const diskProblems = await composableDiskProblems(candidateIds)
+    if (diskProblems.length > 0) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${diskProblems.join('; ')}` } }
+    }
+
     // Build the argv by role. The schema guarantees cache/spare carry `disks`
     // and data/log/special/dedup carry `vdev`.
     let args: string[]
@@ -1327,6 +1412,19 @@ export async function poolRoutes(
     if (!(await poolExists(poolName))) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    // SAFETY (D4 — the create path's inventory pre-flight, shared): the NEW
+    // disk must be composable — a loop-back LUN or a non-available disk must
+    // not become a mirror leg, a replacement or a raidz-expansion column. The
+    // EXISTING leaf is deliberately not checked: it is already a pool member,
+    // so the inventory (honestly) reports it as anything but available, and
+    // that must never refuse a legitimate attach or replace. Refused before
+    // the job; an unresolvable id keeps zpool's error.
+    const diskProblems = await composableDiskProblems([newDiskId])
+    if (diskProblems.length > 0) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Ineligible disk selection: ${diskProblems.join('; ')}` } }
     }
 
     const newPath = byIdPath(newDiskId)
@@ -1473,7 +1571,10 @@ export async function poolRoutes(
     // but only with `pool or dataset is busy` and only for the FILE kind that
     // holds a mount; naming the LUN up front is the difference between "try
     // again" and "here is what to do". Fail-open: no LIO ⇒ nothing held.
-    const exportHeld = await poolHeldByLun(poolName)
+    // The claims read is shared by the refusal above and the disclosure below —
+    // one read per request (Principle 11), one verdict.
+    const claimsCache = createIscsiClaimCache(executor, iscsiPaths)
+    const exportHeld = await poolHeldByLun(poolName, claimsCache)
     if (exportHeld) {
       const refusal = heldByLunRefusal(`pool '${poolName}'`, 'Exporting', exportHeld)
       reply.code(409)
@@ -1485,6 +1586,13 @@ export async function poolRoutes(
     const warnings = [
       `Exporting '${poolName}' makes the pool and all its datasets unavailable until it is re-imported.`,
     ]
+
+    // Fail-open is not fail-silent (D3): when the claims read broke, the empty
+    // answer it fail-opened to is indistinguishable from "no LIO" — say so
+    // before the operator confirms. The hard-409 refusal above is unchanged.
+    if (await claimsCache.readFailed()) {
+      warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
+    }
 
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'zpool.export',
@@ -1553,7 +1661,10 @@ export async function poolRoutes(
     // Unlike export, `zpool destroy` is NOT reliably refused by ZFS for a zvol
     // backstore — and a destroy that gets through takes the data with it. Hard
     // 409, no confirm bypass, before the confirm gate is even minted.
-    const destroyHeld = await poolHeldByLun(poolName)
+    // The claims read is shared by the refusal and the disclosure below — one
+    // read per request (Principle 11), one verdict.
+    const claimsCache = createIscsiClaimCache(executor, iscsiPaths)
+    const destroyHeld = await poolHeldByLun(poolName, claimsCache)
     if (destroyHeld) {
       const refusal = heldByLunRefusal(`pool '${poolName}'`, 'Destroying', destroyHeld)
       reply.code(409)
@@ -1566,6 +1677,13 @@ export async function poolRoutes(
     ]
     if (cleanup)
       warnings.push(`The pool's disks will be wiped clean (existing ZFS labels removed).`)
+
+    // Fail-open is not fail-silent (D3): a broken claims read fail-opens to
+    // "nothing held", which a node genuinely serving a LUN would look exactly
+    // like at this door. Disclose it; the hard-409 refusal above is unchanged.
+    if (await claimsCache.readFailed()) {
+      warnings.push('ANAS could not check whether an iSCSI LUN is served from this pool — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
+    }
 
     // The confirmation protects "destroy this pool" — `cleanup` is NOT part of
     // the signature. The checkbox is chosen after the challenge is issued, so

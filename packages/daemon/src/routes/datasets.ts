@@ -502,11 +502,15 @@ export async function datasetRoutes(
    * One `iscsiClaims()` read per call — the verbs here are single-row, so there
    * is nothing to amortise and nothing that outlives the request (Principle 11).
    */
-  async function datasetHeldByLun(row: Dataset | null, fullName: string): Promise<IscsiHeldByLun | null> {
+  async function datasetHeldByLun(
+    row: Dataset | null,
+    fullName: string,
+    cache = createIscsiClaimCache(executor, iscsiPaths),
+  ): Promise<IscsiHeldByLun | null> {
     const subject: { dataset: string, path?: string } = { dataset: fullName }
     if (row?.mountpoint && row.mountpoint.startsWith('/'))
       subject.path = row.mountpoint
-    return heldByLun(createIscsiClaimCache(executor, iscsiPaths), subject)
+    return heldByLun(cache, subject)
   }
 
   /**
@@ -1489,8 +1493,11 @@ export async function datasetRoutes(
     // bare `dataset is busy` that names nothing, and a `-r` destroy whose CHILD
     // is the claimed one is worse: the parent's other children are destroyed
     // first, then it stops. Refusing up front is the only non-destructive
-    // answer. Fail-open — an unreadable LIO tree holds nothing.
-    const heldForDestroy = await datasetHeldByLun(targetDataset, fullName)
+    // answer. Fail-open — an unreadable LIO tree holds nothing. The cache is
+    // created HERE (not inside the helper) so the same read's failure bit can
+    // be disclosed at the confirm door below.
+    const claimsCache = createIscsiClaimCache(executor, iscsiPaths)
+    const heldForDestroy = await datasetHeldByLun(targetDataset, fullName, claimsCache)
     // A volume routes through the ONE gate (story iscsi.3); a filesystem gets
     // the same refusal built from the same helper, so the two never drift.
     const volumeRefusal = assertVolumeMutable(fullName, 'destroy', targetDataset, undefined, heldForDestroy)
@@ -1533,6 +1540,14 @@ export async function datasetRoutes(
     // which is the confirm door.
     if (!recursive && (children.length > 0 || snapshots.length > 0)) {
       warnings.push(destroyNeedsRecursive(fullName, targetDataset.type, children.map(c => c.name), snapshots))
+    }
+
+    // Fail-open is not fail-silent (D3): a broken claims read fail-opens to
+    // "nothing held", which a dataset genuinely serving a LUN would look exactly
+    // like at this door — `zfs destroy` succeeds silently under a live session
+    // (GT-40). Disclose it; the hard-409 refusals above are unchanged.
+    if (await claimsCache.readFailed()) {
+      warnings.push('ANAS could not check whether an iSCSI LUN is served from this dataset — the LIO configuration was unreadable. If this node serves iSCSI, verify by hand before confirming.')
     }
 
     // The confirmation protects "destroy this dataset" — `recursive` is NOT part

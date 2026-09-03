@@ -22,10 +22,14 @@
  *     and answers for every row; the next request reads again. There is no
  *     shadow state and no TTL cache to go stale (Principle 11) — a LUN added a
  *     second ago must be visible to the very next refusal.
- *  3. **Fail-open.** No LIO on the node, an unreadable configfs, a throw
- *     anywhere: nothing is held, and the verb proceeds exactly as it did before
- *     this story. A read failure must never be the reason a pool cannot be
- *     destroyed — the same posture `busy-diagnosis.ts` has taken since 3.29.
+ *  3. **Fail-open, but DISCLOSED.** No LIO on the node, an unreadable configfs,
+ *     a throw anywhere: nothing is held, and the verb proceeds exactly as it
+ *     did before this story. A read failure must never be the reason a pool
+ *     cannot be destroyed — the same posture `busy-diagnosis.ts` has taken
+ *     since 3.29. Fail-open is not fail-silent, though: the cache keeps the
+ *     failure bit ({@link IscsiClaimCache.readFailed}) so a confirm door that
+ *     is about to hand the operator a code can say "ANAS could not check"
+ *     instead of letting a broken read impersonate a node with no LIO.
  */
 
 import type { IscsiClaim, IscsiHeldByLun } from '@anas/shared'
@@ -62,6 +66,14 @@ export interface HeldByLunSubject {
 export interface IscsiClaimCache {
   /** Every backing object a LUN currently holds. Never throws; `[]` on failure. */
   claims: () => Promise<IscsiClaim[]>
+  /**
+   * Did the ONE read behind {@link claims} FAIL (an unreadable configfs, a
+   * throw anywhere in the read layer)? Resolves after the same memoised read
+   * `claims()` runs, so a caller may ask it in either order and pays at most
+   * one read. False for a node with no LIO — that is `installed: false`, a
+   * first-class healthy answer, not a failure.
+   */
+  readFailed: () => Promise<boolean>
 }
 
 /**
@@ -112,19 +124,28 @@ export function createIscsiClaimCache(
   executor: CommandExecutor,
   paths: IscsiPaths = {},
 ): IscsiClaimCache {
-  let pending: Promise<IscsiClaim[]> | null = null
+  // The read is memoised WHOLE — claims AND the failure bit together — so both
+  // accessors see one read and one verdict (a failed read can never heal into
+  // a healthy one halfway through a request).
+  let pending: Promise<{ claims: IscsiClaim[], failed: boolean }> | null = null
+  const read = () => {
+    pending ??= iscsiClaims(executor, paths)
+      .then(r => ({ claims: r.claims, failed: false }))
+      .catch((err: unknown) => {
+        // FAIL-OPEN. A node with no LIO reports `installed: false` and an
+        // empty list without throwing; this catches the genuinely broken
+        // cases (an unreadable configfs, a malformed saveconfig).
+        console.warn('anasd: could not read iSCSI claims for the held-by-LUN check:', err)
+        return { claims: [], failed: true }
+      })
+    return pending
+  }
   return {
     claims() {
-      pending ??= iscsiClaims(executor, paths)
-        .then(r => r.claims)
-        .catch((err: unknown) => {
-          // FAIL-OPEN. A node with no LIO reports `installed: false` and an
-          // empty list without throwing; this catches the genuinely broken
-          // cases (an unreadable configfs, a malformed saveconfig).
-          console.warn('anasd: could not read iSCSI claims for the held-by-LUN check:', err)
-          return []
-        })
-      return pending
+      return read().then(r => r.claims)
+    },
+    async readFailed() {
+      return (await read()).failed
     },
   }
 }

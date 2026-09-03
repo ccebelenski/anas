@@ -14,8 +14,12 @@ const IDENTITY_HEADERS = {
 }
 
 const BY_ID = '/dev/disk/by-id/'
-const DISK_A = 'ata-WDC_WD2003FZEX-00SRLA0_WD-45678901'
-const DISK_B = 'ata-WDC_WD2003FZEX-00SRLA0_WD-56789012'
+// Deliberately NOT resolvable in the mock disk inventory (the WD-45678901 /
+// 56789012 fixtures are testpool members there): the composability pre-flight
+// refuses an inventory-known non-available disk before the job, and these tests
+// assert argv construction, not that refusal (see pools-composable).
+const DISK_A = 'ata-WDC_WD2003FZEX-00SRLA0_WD-99999991'
+const DISK_B = 'ata-WDC_WD2003FZEX-00SRLA0_WD-99999992'
 
 /** Poll a job until it reaches a terminal state. */
 async function waitForJob(server: ReturnType<typeof createServer>, id: string): Promise<Job> {
