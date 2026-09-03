@@ -1086,28 +1086,64 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.match(res.body.error!.message, /LIO would delete it anyway/)
     })
 
-    it('deletes without confirmation when the backing object is kept', async () => {
+    // U1 (#47): the confirmation protects "delete this LUN" — EVERY delete is
+    // gated, not just the one that also destroys the backing.
+    it('confirm-gates EVERY delete — even with the backing kept, nothing runs yet', async () => {
       await serveAnas()
       const res = await call('DELETE', `${targetUrl()}/luns/0`)
-      assert.equal(res.statusCode, 202)
-    })
-
-    it('confirm-gates ?destroyBacking=true, naming the volume and the serial', async () => {
-      await serveAnas()
-      const res = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`)
       assert.equal(res.statusCode, 409)
       assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
       assert.ok(res.headers['x-anas-confirm-code'])
-      assert.ok(res.body.error!.warnings!.some(w => /tank\/vol1/.test(w)))
-      assert.ok(res.body.error!.warnings!.some(w => /9bc6e907-6015-4267-be4f-5a0617cb3d71/.test(w)))
+      // The warnings describe BOTH outcomes: the flag is chosen on the resend,
+      // so the challenge has to disclose what each choice does.
+      assert.ok(res.body.error!.warnings!.some(w => /9bc6e907-6015-4267-be4f-5a0617cb3d71/.test(w)), JSON.stringify(res.body.error!.warnings))
+      assert.ok(res.body.error!.warnings!.some(w => /kept/.test(w) && /tank\/vol1/.test(w)), JSON.stringify(res.body.error!.warnings))
+      assert.ok(res.body.error!.warnings!.some(w => /If the backing is destroyed/.test(w)), JSON.stringify(res.body.error!.warnings))
+      // No job submitted, and no targetcli reached the executor.
+      assert.ok(!res.body.job)
+      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0, JSON.stringify(mockOf().calls))
     })
 
-    it('goes through with the code', async () => {
+    it('goes through with the code and keeps the backing', async () => {
       await serveAnas()
-      const first = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`)
+      mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const first = await call('DELETE', `${targetUrl()}/luns/0`)
+      const code = first.headers['x-anas-confirm-code'] as string
+      // No ?destroyBacking on the resend: the code minted for {target, lun}
+      // must verify WITHOUT the flag being part of anything.
+      const second = await call('DELETE', `${targetUrl()}/luns/0`, undefined, { 'x-anas-confirm': code })
+      assert.equal(second.statusCode, 202)
+      const job = await waitForJob(second.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.equal((job.result as { backingDestroyed?: string | null }).backingDestroyed, null)
+      assert.ok(!mockOf().calls.some(c => c.command === ZFS), 'no zfs destroy when the backing is kept')
+    })
+
+    it('the code minted for {target, lun} verifies WITH ?destroyBacking=true — the flag is not in the signature', async () => {
+      await serveAnas()
+      mockOf().addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mockOf().addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const first = await call('DELETE', `${targetUrl()}/luns/0`)
       const code = first.headers['x-anas-confirm-code'] as string
       const second = await call('DELETE', `${targetUrl()}/luns/0?destroyBacking=true`, undefined, { 'x-anas-confirm': code })
       assert.equal(second.statusCode, 202)
+      const job = await waitForJob(second.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.equal((job.result as { backingDestroyed?: string | null }).backingDestroyed, 'tank/vol1')
+      assert.ok(mockOf().calls.some(c => c.command === ZFS && c.args[0] === 'destroy' && c.args[1] === 'tank/vol1'), JSON.stringify(mockOf().calls))
+    })
+
+    it('a wrong code 409s again — a fresh challenge, and nothing has run', async () => {
+      await serveAnas()
+      const first = await call('DELETE', `${targetUrl()}/luns/0`)
+      assert.equal(first.statusCode, 409)
+      const second = await call('DELETE', `${targetUrl()}/luns/0`, undefined, { 'x-anas-confirm': 'not-a-code' })
+      assert.equal(second.statusCode, 409)
+      assert.equal(second.body.error!.code, 'CONFIRMATION_REQUIRED')
+      assert.ok(second.headers['x-anas-confirm-code'])
+      assert.notEqual(second.headers['x-anas-confirm-code'], 'not-a-code')
+      assert.ok(!second.body.job)
+      assert.equal(mockOf().calls.filter(c => c.command === TARGETCLI).length, 0, JSON.stringify(mockOf().calls))
     })
   })
 

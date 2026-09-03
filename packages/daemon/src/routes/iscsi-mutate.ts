@@ -831,20 +831,26 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       }
     }
 
-    if (destroyBacking) {
-      if (!confirmGate(confirmStore, request, reply, {
-        operation: 'iscsi.lun.delete',
-        params: { target: iqn, lun: index, destroyBacking: true },
-        message: `Deleting LUN ${index} and destroying ${lun.backingPath} erases its data permanently`,
-        warnings: [
-          lun.kind === 'zvol'
-            ? `The volume ${lun.dataset ?? zvolDataset(lun.backingPath)} and every snapshot under it will be destroyed`
-            : `The image file ${lun.backingPath} will be removed`,
-          `The unit serial ${lun.serial ?? '(unknown)'} goes with it — any PVE volid or initiator configuration built on it breaks`,
-        ],
-      })) {
-        return reply
-      }
+    // The confirmation protects "delete this LUN" — `destroyBacking` is NOT
+    // part of the signature. The flag is chosen AFTER the challenge is issued
+    // (the UI's checkbox is ticked on the resend, exactly like `recursive` on
+    // the dataset destroy), so binding it here would make the confirmed request
+    // mismatch the minted code and 409 again. The warnings therefore describe
+    // BOTH outcomes: the backing is kept unless the box is ticked, and what
+    // ticking it destroys.
+    if (!confirmGate(confirmStore, request, reply, {
+      operation: 'iscsi.lun.delete',
+      params: { target: iqn, lun: index },
+      message: `Deleting LUN ${index} of '${iqn}' is irreversible — the unit serial goes with it; the backing object is kept unless the resend sets destroyBacking`,
+      warnings: [
+        `The unit serial ${lun.serial ?? '(unknown)'} goes with it — any PVE volid or initiator configuration built on it breaks`,
+        `The backing object ${lun.backingPath} is kept unless you tick "Also destroy" (re-send with ?destroyBacking=true)`,
+        lun.kind === 'zvol'
+          ? `If the backing is destroyed: the volume ${lun.dataset ?? zvolDataset(lun.backingPath)} and every snapshot under it will be destroyed`
+          : `If the backing is destroyed: the image file ${lun.backingPath} will be removed`,
+      ],
+    })) {
+      return reply
     }
 
     const job = jobQueue.submit(
