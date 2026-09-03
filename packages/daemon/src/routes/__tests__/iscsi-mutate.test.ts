@@ -995,6 +995,68 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.match(res.body.error!.message, /write cache/i)
     })
 
+    /**
+     * The same ANAS target, but the zvol's sysfs size file is gone — the exact
+     * shape of M2 (#53): `lun.size` reads back null, and no gate below may take
+     * that as "therefore a grow".
+     */
+    async function serveAnasUnreadableSize(opts: { session?: boolean } = {}) {
+      await serveAnas(opts)
+      await rm(join(dir, 'block', 'zd16', 'size'))
+    }
+
+    it('refuses ANY size change when the current size could not be read — it cannot be proven a grow (M2 #53)', async () => {
+      await serveAnasUnreadableSize()
+      const mock = mockOf()
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 1048576 })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'size-unknown')
+      assert.match(res.body.error!.message, /cannot prove/)
+      assert.match(res.body.error!.message, /no confirm bypass/)
+      assert.ok(!res.headers['x-anas-confirm-code'], 'there is no way to confirm past this')
+      // The old code took the null size as a grow and ran a direction-blind
+      // `zfs set volsize=` — a silent truncation. Nothing may have run.
+      assert.equal(
+        mock.calls.filter(c => c.command === TARGETCLI || c.command === ZFS).length,
+        0,
+        JSON.stringify(mock.calls.map(c => [c.command, c.args])),
+      )
+    })
+
+    it('refuses a size change on an unreadable-size LUN even UNDER a live session — the zvol exemption cannot vouch for it (M2 #53)', async () => {
+      await serveAnasUnreadableSize({ session: true })
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 4294967296 })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.reason, 'size-unknown')
+      assert.ok(!res.headers['x-anas-confirm-code'])
+    })
+
+    it('a combined {size, writeBack} on a zvol runs BOTH the grow and the cache change (M1)', async () => {
+      await serveAnas()
+      const mock = mockOf()
+      mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 4294967296, writeBack: true })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(res.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      // The grow ran…
+      assert.ok(
+        mock.calls.some(c => c.command === ZFS && c.args.join(' ').includes('volsize=4294967296')),
+        JSON.stringify(mock.calls.map(c => [c.command, c.args])),
+      )
+      // …AND the emulate_write_cache change the audit params and the ON warning
+      // both claim — the old code ran the grow only.
+      assert.ok(
+        mock.calls.some(c => c.command === TARGETCLI && c.args.includes('emulate_write_cache=1')),
+        JSON.stringify(mock.calls.map(c => [c.command, c.args])),
+      )
+      const result = job.result as { warnings?: string[] }
+      assert.ok(result.warnings?.some(w => /Write-back caching is ON/.test(w)), JSON.stringify(result.warnings))
+      // A combined request is still a grow, so it carries the guest guidance too.
+      assert.ok(result.warnings?.includes(lunGrowGuidance(4294967296)), JSON.stringify(result.warnings))
+    })
+
     it('refuses a SHRINK, with NO bypass (GT-40)', async () => {
       await serveAnas()
       const res = await call('PUT', `${targetUrl()}/luns/0`, { size: 1048576 })

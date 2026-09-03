@@ -654,7 +654,24 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     // fact the operator needs, and "log the initiator out" would be misleading
     // advice — logging out would not make the shrink safe.
     if (req.size !== undefined) {
-      if (lun.size !== null && req.size < lun.size) {
+      // M2 (#53): an unreadable current size used to fall through every gate
+      // below as "this is a grow" — and both resize helpers are direction-blind
+      // (`zfs set volsize=`, a bare truncate), so a smaller request was a silent
+      // truncation even under a live session. If the current size cannot be
+      // read, no direction can be proven, so no size change is accepted.
+      if (lun.size === null) {
+        reply.code(409)
+        return {
+          error: {
+            code: 'CONFLICT',
+            reason: 'size-unknown',
+            message: `LUN ${index}'s current size could not be read, so ANAS cannot prove a change to ${req.size} bytes `
+              + `is a GROW rather than a SHRINK — and the resize is applied unchecked. Re-read the target's size `
+              + `(refresh the iSCSI view) and retry once it reads back. This refusal has no confirm bypass.`,
+          },
+        }
+      }
+      if (req.size < lun.size) {
         reply.code(409)
         return {
           error: {
@@ -694,10 +711,13 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     // it — under a mounted filesystem, with no kernel message either side.
     // A write-cache change also stays refused: it is a live attribute write on a
     // backstore an initiator has open.
-    const zvolGrow = lun.kind === 'zvol'
+    // A zvol size change that is provably a grow. The `lun.size === null` arm is
+    // unreachable since M2 (#53) — a null size is 409'd above for any size
+    // change — but the type cannot narrow that far, so the arm stays.
+    const zvolSizeGrow = lun.kind === 'zvol'
       && req.size !== undefined
-      && req.writeBack === undefined
       && (lun.size === null || req.size > lun.size)
+    const zvolGrow = zvolSizeGrow && req.writeBack === undefined
     if (lun.connectedInitiators.length > 0 && !zvolGrow) {
       // The zvol clause is part of the sentence rather than appended to it: a
       // refusal that ends in "…and by the way this is allowed" reads as an
@@ -734,7 +754,11 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
     // 2026-08-26). The sentence is the shared one — `lunGrowGuidance` —
     // because the Datasets door's grow of the SAME volume carries it too:
     // one definition, two doors.
-    if (zvolGrow && req.size !== undefined)
+    // M1: the combined {size, writeBack} request IS a grow too, so it carries
+    // the same guidance the grow-only request does — the session gate above
+    // still refuses it under a session (the cache half is a live attribute
+    // write), but session-free it must not lose the sentence.
+    if (zvolSizeGrow && req.size !== undefined)
       warnings.push(lunGrowGuidance(req.size))
     if (req.writeBack === true) {
       warnings.push(
@@ -748,10 +772,20 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       'iscsi.lun.update',
       { ...identity, params: { target: iqn, lun: index, ...(req.size !== undefined ? { size: req.size } : {}), ...(req.writeBack !== undefined ? { writeBack: req.writeBack } : {}) } },
       async updateProgress => withIscsiLock(async () => {
+        // The `lun.size === null` arm is unreachable for a size change since M2
+        // (#53) — it is 409'd before the job is ever submitted — but the type
+        // cannot narrow across this closure, so the arm stays.
         if (req.size !== undefined && (lun.size === null || req.size > lun.size)) {
           if (lun.kind === 'zvol') {
             // A zvol grow is live end to end — no LIO action at all (GT-28).
             await growZvolLun(mutateOptions(updateProgress), lun.dataset ?? zvolDataset(lun.backingPath), req.size)
+            // M1: a combined {size, writeBack} must do BOTH. The fileio branch
+            // carries writeBack inside the replay (the create's `write_back=`
+            // plus its attribute token), but growZvolLun is a bare
+            // `zfs set volsize=` — without this the audit params and the ON
+            // warning claim a change the job never made.
+            if (req.writeBack !== undefined)
+              await setLunWriteBack(mutateOptions(updateProgress), lun.plugin, lun.name, req.writeBack)
           }
           else {
             // fileio: the size is fixed at creation, so this is the replay path
