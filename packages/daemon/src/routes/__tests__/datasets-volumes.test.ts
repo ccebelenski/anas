@@ -469,6 +469,103 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
   })
 
   // ==========================================================================
+  // The never-shrink gate must compare EXACT bytes — issue #50 (D1)
+  //
+  // `zfs list` WITHOUT `-p` prints three significant digits, so a 1240 GiB
+  // zvol reads back as `1.21T` → 1,330,409,069,609 B: ~983 MiB below its true
+  // 1,331,439,861,760 B. Every requested volsize inside that window looked
+  // like a GROW to `assertVolumeMutable`, and `zfs set volsize=` truncates a
+  // possibly-live volume in silence. The gate itself was always right — what
+  // was wrong was the number it was handed.
+  //
+  // So this server answers the dataset list with whichever form the daemon's
+  // OWN argv asked for: display when `-p` is absent, exact when it is present.
+  // That makes these assertions a statement about the command we issue rather
+  // than about a fixture hand-picked to prove a point — drop `-p` from
+  // `zfsListArgs` and the 409 below turns straight back into a 202.
+  // ==========================================================================
+  describe('the shrink gate reads exact bytes, not a rounded display size (#50)', () => {
+    /** The volume's true size — 1240 GiB, issue #50's own example. */
+    const TRUE_SIZE = 1331439861760
+    /** What `1.21T`, the display form of that size, reconstructs as. */
+    const ROUNDED_SIZE = 1330409069609
+    /** A real shrink that HIDES inside the rounding window. */
+    const SNEAKY_SHRINK = 1331000000000
+
+    /**
+     * The real capture with vol1 resized to the issue's number, rendered in
+     * whichever form the caller asked for. Derived here and named as derived;
+     * the checked-in captures stay verbatim (fixtures/zfs/NOTES.md).
+     */
+    function listBody(exact: boolean): string {
+      const raw = JSON.parse(fixtureText('zfs-list-volumes.json'))
+      const props = raw.datasets[VOL].properties
+      props.volsize.value = exact ? String(TRUE_SIZE) : '1.21T'
+      props.refreservation.value = exact ? String(TRUE_SIZE) : '1.21T'
+      props.volblocksize.value = exact ? '16384' : '16K'
+      return JSON.stringify(raw)
+    }
+
+    function startWindowServer(): ReturnType<typeof createServer> {
+      server = createServer({ mock: true, logger: false })
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      calls = []
+      mock.exec = async (command: string, args: string[]) => {
+        calls.push({ command, args })
+        if (command === '/usr/sbin/zpool' && args.length === 2 && args[0] === 'list' && args[1] === '-j')
+          return { stdout: ZPOOL_LIST, stderr: '', exitCode: 0 }
+        if (command === '/usr/sbin/zfs' && args[0] === 'list' && args.includes('filesystem,volume') && args.at(-1) === POOL)
+          return { stdout: listBody(args.includes('-p')), stderr: '', exitCode: 0 }
+        return orig(command, args)
+      }
+      return server
+    }
+
+    async function put(body: unknown) {
+      return server!.inject({ method: 'PUT', url: `/v1/pools/${POOL}/datasets/${VOL_PATH}`, headers: IDENTITY_HEADERS, payload: body as object })
+    }
+
+    it('asks ZFS for exact bytes in the first place', () => {
+      const args = zfsListArgs(POOL)
+      assert.ok(args.includes('-p'), `the dataset list must carry -p: ${args.join(' ')}`)
+    })
+
+    it('the rounding window is real, and the shrink sits inside it', () => {
+      assert.ok(SNEAKY_SHRINK < TRUE_SIZE, 'the request IS a shrink')
+      assert.ok(SNEAKY_SHRINK > ROUNDED_SIZE, 'and the display form would have called it a grow')
+      assert.ok(TRUE_SIZE - ROUNDED_SIZE > 900 * MiB)
+    })
+
+    it('lists the volume at its exact size, not its display size', async () => {
+      server = startWindowServer()
+      const res = await server.inject({ method: 'GET', url: `/v1/pools/${POOL}/datasets` })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: Dataset[] }
+      assert.equal(data.find(d => d.name === VOL)!.volsize, TRUE_SIZE)
+    })
+
+    it('REFUSES a shrink that hides inside the rounding window', async () => {
+      server = startWindowServer()
+      const res = await put({ properties: { volsize: SNEAKY_SHRINK } })
+      assert.equal(res.statusCode, 409, 'a shrink inside the rounding window must not pass as a grow')
+      const body = res.json() as { error: { reason: string, message: string } }
+      assert.equal(body.error.reason, 'shrink')
+      // The refusal quotes the volume's REAL size, so the operator can see it.
+      assert.match(body.error.message, new RegExp(String(TRUE_SIZE)))
+      assert.equal(zfsCalls().some(a => a[0] === 'set'), false, 'nothing may reach `zfs set volsize=`')
+    })
+
+    it('still lets a genuine grow through', async () => {
+      server = startWindowServer()
+      const res = await put({ properties: { volsize: TRUE_SIZE + GiB } })
+      assert.equal(res.statusCode, 202)
+      await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', `volsize=${TRUE_SIZE + GiB}`, VOL])
+    })
+  })
+
+  // ==========================================================================
   // The verbs a volume shares with every other dataset
   // ==========================================================================
   describe('the existing verbs keep working on a volume', () => {

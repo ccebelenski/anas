@@ -35,6 +35,31 @@ describe('parseHumanSize', () => {
     assert.equal(parseHumanSize('-'), 0)
     assert.equal(parseHumanSize(''), 0)
   })
+
+  // Issue #50: `zfsListArgs` asks for `-p`, whose values carry NO unit. A bare
+  // integer used to fall off the regex and parse as 0 — which is how a real
+  // shrink reached `zfs set volsize=` looking like a grow.
+  it('parses the exact (-p) form: a unit-less byte count', () => {
+    assert.equal(parseHumanSize('1331439861760'), 1331439861760)
+    assert.equal(parseHumanSize('16384'), 16384)
+    assert.equal(parseHumanSize('0'), 0)
+  })
+
+  it('keeps the display form meaning exactly what it did', () => {
+    // The two forms of the SAME size, and the gap that made #50 a safety bug.
+    assert.equal(parseHumanSize('1.21T'), 1330409069609)
+    assert.ok(1331439861760 - parseHumanSize('1.21T') > 900 * 1024 * 1024)
+  })
+
+  it('accepts a JSON number as well as a string', () => {
+    assert.equal(parseHumanSize(1331439861760), 1331439861760)
+  })
+
+  it('still returns 0 for values that are not sizes', () => {
+    assert.equal(parseHumanSize('none'), 0)
+    assert.equal(parseHumanSize('on'), 0)
+    assert.equal(parseHumanSize('12X'), 0)
+  })
 })
 
 describe('parseIntOrZero', () => {
@@ -77,6 +102,14 @@ describe('parseDedupRatio', () => {
   it('returns 1.0 for dash or empty', () => {
     assert.equal(parseDedupRatio('-'), 1.0)
     assert.equal(parseDedupRatio(''), 1.0)
+  })
+
+  // Whether libzfs keeps the trailing `x` under `-p` is unverified on a real
+  // node (see the #50 live-capture checklist). Read both, so the answer either
+  // way is a ratio and never a silent 1.00 default.
+  it('reads a ratio with or without the trailing x', () => {
+    assert.equal(parseDedupRatio('1.42'), 1.42)
+    assert.equal(parseDedupRatio('1.42x'), 1.42)
   })
 })
 

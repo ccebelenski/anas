@@ -42,6 +42,40 @@ creating one, so the thin case is exercised by mutating this real capture's
 `refreservation` to `none` inside `zfs-list.test.ts` — done in the test, and named
 there, rather than checked in as a fixture that looks captured but is not.
 
+## The `-p` flag and these captures (issue #50, 2026-09-03)
+
+`zfsListArgs` now issues `zfs list -j **-p** -r -o …`. Without `-p` every number
+in the JSON is the DISPLAY form — three significant digits — and the volume
+never-shrink gate was comparing a requested exact byte count against it, so a
+real shrink inside the rounding window read as a grow (`1.21T` → 1,330,409,069,609
+against a true 1,331,439,861,760: ~983 MiB light).
+
+**Both `zfs list` files here therefore predate the command we now issue.** They
+are deliberately kept **verbatim** rather than mechanically rewritten:
+
+- `zfs-list-volumes.json` is a real capture. Its exact byte counts are NOT
+  recoverable from the rounded strings it holds (`2.03G` is anything in
+  [2.025 G, 2.035 G)), so "converting" it would mean inventing digits and
+  checking them in under a heading that says *real capture*. That is exactly the
+  thing ground-truth-first forbids.
+- `zfs-list.json` is synthetic and mixed-purpose: the same file feeds the `-p`
+  dataset list AND the snapshot parsers, whose commands stay in display form
+  (`creation` under `-p` is an epoch integer `parseZfsDate` does not read).
+  Rewriting it would make one of its two jobs wrong.
+
+Instead, `parseHumanSize` reads **both** forms (it has to: `zfs get -j all` and
+the snapshot listings are still display-form on purpose), the `-p` rows are
+DERIVED inside the tests and named as derived — the same rule the thin-volume
+case above already follows — and these two files now serve as the display-form
+tolerance cases.
+
+**Owed:** a fresh `zfs list -j -p -r -o <ZFS_LIST_PROPS> -t filesystem,volume
+<pool>` capture from a real node, to be checked in beside the existing one
+(suggested name `zfs-list-volumes-p.json`) and to settle two things nothing here
+can attest to: whether libzfs emits `-p` values as JSON strings or numbers (the
+parser accepts both), and whether `compressratio` keeps its trailing `x` under
+`-p` (`parseDedupRatio` accepts both).
+
 ## Pre-existing fixtures — synthetic
 
 Every other file here (`zfs-list.json`, `zfs-get-*.json`, `zpool-*.json`,

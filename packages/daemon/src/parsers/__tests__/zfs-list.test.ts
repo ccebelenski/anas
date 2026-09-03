@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList } from '../zfs-list.js'
+import { parseHumanSize } from '../utils.js'
+import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs } from '../zfs-list.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/zfs')
@@ -221,6 +222,102 @@ describe('volumes — real capture', () => {
     assert.equal(vol.volsize, undefined)
     assert.equal(vol.volblocksize, undefined)
     assert.equal(vol.sparse, undefined)
+  })
+})
+
+// ============================================================================
+// The EXACT (`-p`) form — issue #50
+//
+// `zfsListArgs` asks for `-p`, so what `parseZfsList` is handed on a real node
+// is a unit-less byte count, not the three-significant-digit display form. The
+// two checked-in `zfs list` files predate that flag and are kept VERBATIM
+// rather than rewritten into a form no host ever printed (fixtures/zfs/
+// NOTES.md) — so the `-p` rows below are DERIVED here and named as derived,
+// the same rule the thin-volume case above already follows. A fresh `-p`
+// capture is owed; see NOTES.md.
+//
+// The numbers are issue #50's own: a 1240 GiB zvol whose display form is
+// `1.21T`. The gap between the two IS the defect.
+// ============================================================================
+
+/** The volume's true size, as `-p` prints it. */
+const EXACT_VOLSIZE = 1331439861760
+/** What its display form, `1.21T`, reconstructs as — ~983 MiB light. */
+const ROUNDED_VOLSIZE = 1330409069609
+
+/** The real capture's rows rewritten into the exact form `-p` emits. */
+function exactFormList() {
+  const raw = loadFixture(REAL_LIST)
+  const props = raw.datasets['gtiscsi/vol1'].properties
+  props.volsize.value = String(EXACT_VOLSIZE)
+  props.volblocksize.value = '16384'
+  props.refreservation.value = '1331453296640'
+  props.used.value = '1331453296640'
+  props.referenced.value = '61952'
+  props.available.value = '3404062720'
+  // `none` is a display-form spelling: under `-p` an unset quota prints `0`.
+  raw.datasets.gtiscsi.properties.quota.value = '0'
+  return raw
+}
+
+describe('volumes — the exact (-p) form (#50)', () => {
+  it('asks ZFS for exact bytes: `-p` is part of the issued command', () => {
+    const args = zfsListArgs('tank')
+    assert.ok(args.includes('-p'), `zfs list must carry -p: ${args.join(' ')}`)
+    assert.deepEqual(args.slice(0, 3), ['list', '-j', '-p'])
+  })
+
+  it('reads a unit-less byte count straight through into volsize', () => {
+    const vol = parseZfsList(exactFormList()).find(d => d.name === 'gtiscsi/vol1')!
+    assert.equal(vol.volsize, EXACT_VOLSIZE)
+    assert.equal(vol.volblocksize, 16 * 1024)
+  })
+
+  it('documents the rounding window the display form opened', () => {
+    // This is why the gate may only ever see the exact form: every requested
+    // volsize between these two numbers looked like a GROW.
+    assert.equal(parseHumanSize('1.21T'), ROUNDED_VOLSIZE)
+    assert.ok(EXACT_VOLSIZE - ROUNDED_VOLSIZE > 900 * 1024 * 1024)
+  })
+
+  it('reads the other exact sizes too (used / referenced / available / quota)', () => {
+    const rows = parseZfsList(exactFormList())
+    const vol = rows.find(d => d.name === 'gtiscsi/vol1')!
+    assert.equal(vol.used, 1331453296640)
+    assert.equal(vol.referenced, 61952)
+    assert.equal(vol.available, 3404062720)
+    assert.equal(rows.find(d => d.name === 'gtiscsi')!.quota, 0)
+  })
+
+  it('derives sparse from the exact refreservation, both ways', () => {
+    const thick = parseZfsList(exactFormList()).find(d => d.name === 'gtiscsi/vol1')!
+    assert.equal(thick.sparse, false, 'a big refreservation is a THICK volume')
+    const raw = exactFormList()
+    // `zfs create -s` omits the refreservation; `-p` prints that as `0`.
+    raw.datasets['gtiscsi/vol1'].properties.refreservation.value = '0'
+    const thin = parseZfsList(raw).find(d => d.name === 'gtiscsi/vol1')!
+    assert.equal(thin.sparse, true)
+  })
+
+  it('reads ZFS\'s default volblocksize out of the exact form as well', () => {
+    assert.equal(parseVolblocksizeDefault(exactFormList()), 16 * 1024)
+  })
+
+  it('tolerates a JSON NUMBER value, not just a numeric string', () => {
+    // libzfs prints strings today. If it ever stopped, a safety gate's size
+    // must not become a parse failure (or a thrown TypeError).
+    const raw = exactFormList()
+    raw.datasets['gtiscsi/vol1'].properties.volsize.value = EXACT_VOLSIZE
+    const vol = parseZfsList(raw).find(d => d.name === 'gtiscsi/vol1')!
+    assert.equal(vol.volsize, EXACT_VOLSIZE)
+  })
+
+  it('still reads the display form — `zfs get all` and the snapshot lists keep it', () => {
+    // One tolerant parser rather than two that drift: the untouched capture,
+    // in the form the pre-`-p` command printed, parses exactly as before.
+    const vol = parseZfsList(loadFixture(REAL_LIST)).find(d => d.name === 'gtiscsi/vol1')!
+    assert.equal(vol.volsize, 2 * GiB)
+    assert.equal(vol.sparse, false)
   })
 })
 
