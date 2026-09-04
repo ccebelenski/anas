@@ -636,7 +636,7 @@ describe('mount routes (Epic 18)', () => {
     })
   })
 
-  describe('remote-only guard (local storage is ZFS territory)', () => {
+  describe('remote-only guard (not an ANAS-managed filesystem)', () => {
     it('rejects state/PUT/DELETE on a local fstab entry with 400', async () => {
       await writeFile(fstabPath, `${FSTAB_FIXTURE}UUID=abcd-1234 /data ext4 defaults,nofail 0 2\n`)
       const calls = [
@@ -647,7 +647,7 @@ describe('mount routes (Epic 18)', () => {
       for (const call of calls) {
         const res = await server!.inject({ method: call.method, url: call.url, headers: IDENTITY_HEADERS, payload: call.payload })
         assert.equal(res.statusCode, 400, `${call.method} ${call.url}`)
-        assert.match((res.json() as { error: { message: string } }).error.message, /remote shares only/)
+        assert.match((res.json() as { error: { message: string } }).error.message, /not an ANAS-managed filesystem/)
       }
     })
 
@@ -738,7 +738,7 @@ describe('mount routes — AHR pool persistence is hands-off', () => {
     const res = await server!.inject({ method: 'DELETE', url: `/v1/mounts/${enc('/mnt/foo')}`, headers: IDENTITY_HEADERS })
     assert.equal(res.statusCode, 400)
     // Rejected as a LOCAL fs, NOT as AHR — proof the look-alike was not seized.
-    assert.match((res.json() as { error: { message: string } }).error.message, /remote shares only/)
+    assert.match((res.json() as { error: { message: string } }).error.message, /not an ANAS-managed filesystem/)
   })
 })
 

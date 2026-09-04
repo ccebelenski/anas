@@ -143,6 +143,10 @@ export function classifyKind(fstype: string, source: string): MountKind {
     return 'zfs'
   if (fstype === 'autofs')
     return 'autofs'
+  // A CephFS mon-list source (`a,b,c:/`) matches the NFS `host:/path` shape,
+  // so fstype must win over the source fallthrough.
+  if (fstype === 'ceph' || fstype === 'fuse.ceph-fuse' || fstype === 'fuse.ceph')
+    return 'ceph'
   // A bind mount reports the underlying fstype but a device-path source that is
   // itself a directory; findmnt can't always tell, so this stays best-effort.
   if (source.startsWith('/dev/') || source.startsWith('UUID=') || source.startsWith('PARTUUID=') || source.startsWith('LABEL='))

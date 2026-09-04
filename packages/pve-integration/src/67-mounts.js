@@ -652,7 +652,7 @@
         var tip = pve ? t('Disabled — PVE manages this mount')
             : (ahr ? t('View only — this is an ANAS Hybrid RAID pool; manage it from the Hybrid RAID view')
                 : (has && !isRemoteRec(rec)
-                    ? t('View only — ANAS manages remote shares; local storage is ZFS territory')
+                    ? t('View only — not an ANAS-managed filesystem')
                     : ''));
         btnSetTip(grid, 'mountToggle', tip);
         btnSetTip(grid, 'mountEdit', tip);

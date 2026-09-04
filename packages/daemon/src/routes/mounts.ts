@@ -639,7 +639,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     }
     if (kind !== undefined && !isRemoteKind(kind)) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mountpoint}' is a local filesystem — ANAS manages remote shares only (local storage is ZFS territory)` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Mount '${mountpoint}' is not an ANAS-managed filesystem — ANAS manages remote (NFS/CIFS) shares only` } }
     }
     return undefined
   }

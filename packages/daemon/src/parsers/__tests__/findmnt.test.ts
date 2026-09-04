@@ -39,6 +39,10 @@ describe('classifyKind', () => {
     assert.equal(classifyKind('nfs4', '127.0.0.1:/srv/nfs/export1'), 'nfs')
     assert.equal(classifyKind('zfs', 'mnttest'), 'zfs')
     assert.equal(classifyKind('autofs', 'systemd-1'), 'autofs')
+    // A kernel CephFS mon-list source matches the NFS `host:/path` shape —
+    // fstype must win, so the row never mis-reports as nfs.
+    assert.equal(classifyKind('ceph', '10.0.0.101,10.0.0.102,10.0.0.105:/'), 'ceph')
+    assert.equal(classifyKind('fuse.ceph-fuse', 'ceph-fuse'), 'ceph')
     assert.equal(classifyKind('ext4', '/dev/sda1'), 'local')
     assert.equal(classifyKind('vfat', '/dev/sda15'), 'local')
     assert.equal(classifyKind('ext4', 'UUID=abc'), 'local')

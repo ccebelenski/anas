@@ -112,8 +112,12 @@ export type MountSec = z.infer<typeof MountSec>
 
 // ---- Enums -------------------------------------------------------------------
 
-/** Kind of a mount, disambiguated from findmnt `source`/`fstype`. */
-export const MountKind = z.enum(['nfs', 'cifs', 'local', 'zfs', 'bind', 'autofs', 'other'])
+/**
+ * Kind of a mount, disambiguated from findmnt `source`/`fstype`. `ceph` is a
+ * CephFS mount — read-only kind (observed, never ANAS-mutable; creation stays
+ * nfs|cifs).
+ */
+export const MountKind = z.enum(['nfs', 'cifs', 'local', 'zfs', 'bind', 'autofs', 'ceph', 'other'])
 export type MountKind = z.infer<typeof MountKind>
 
 /**
