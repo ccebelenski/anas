@@ -6,6 +6,7 @@ import type { TargetNamesResolver } from '../services/replication-units.js'
 import { ReplicationTask, ReplicationTaskName } from '@anas/shared'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
+import { guardReplicationTarget } from '../services/replication-target.js'
 import {
   collectTaskStatuses,
   readTask,
@@ -44,11 +45,13 @@ export interface ReplicationTaskRouteOptions {
   /** systemd unit directory (the task store). Overridable for tests. */
   systemdDir: string
   /**
-   * Stage-3 SSH transport — lets task STATUS read a non-local target's
-   *  snapshots so lag/last-replicated are real for remote tasks. Optional:
-   *  without it, remote-task lag honestly shows unknown.
+   * Stage-3 SSH transport. It lets task STATUS read a non-local target's
+   * snapshots (so lag/last-replicated are real for remote tasks) AND it is how
+   * a task's target is validated where it actually lives — a peer's pool is not
+   * in this node's `zpool list` (issue #46). Required: without it a non-local
+   * task could only be judged against the wrong machine.
    */
-  transport?: Transport
+  transport: Transport
 }
 
 export async function replicationTaskRoutes(
@@ -62,20 +65,18 @@ export async function replicationTaskRoutes(
    * Any transport/resolution failure → null (unknown), never a false
    * "everything is behind".
    */
-  const remoteTargetNames: TargetNamesResolver | undefined = transport
-    ? async (task, targetFull) => {
-      try {
-        const res = await transport.resolveLocation(task.target.location!)
-        if (!res.ok)
-          return null
-        const names = await transport.remoteSnapshotNames(res.resolved, targetFull)
-        return new Set(names)
-      }
-      catch {
+  const remoteTargetNames: TargetNamesResolver = async (task, targetFull) => {
+    try {
+      const res = await transport.resolveLocation(task.target.location!)
+      if (!res.ok)
         return null
-      }
+      const names = await transport.remoteSnapshotNames(res.resolved, targetFull)
+      return new Set(names)
     }
-    : undefined
+    catch {
+      return null
+    }
+  }
 
   /**
    * Does the named pool exist? (source of truth is `zpool list`). Same probe
@@ -103,11 +104,19 @@ export async function replicationTaskRoutes(
   }
 
   /**
-   * The shared create/update guards (reused from the stage-1 replicate handler):
-   * the schedule must be valid systemd calendar syntax, the SOURCE pool must
-   * exist, the target pool must exist and NOT be PVE-managed, and a task may not
-   * replicate a dataset onto itself. Sends the appropriate 4xx and returns false
-   * on the first failure.
+   * The create/update guards: the schedule must be valid systemd calendar
+   * syntax, the SOURCE pool must exist HERE, and the target must pass the
+   * location-aware target guards. Sends the appropriate 4xx and returns false on
+   * the first failure.
+   *
+   * ⚠ The target guards are NOT re-derived here (issue #46). They used to be a
+   * stage-1 copy that asked `zpool list` — this node's pools — about EVERY
+   * target, so a task replicating to a peer or a registered remote was rejected
+   * with "Target pool 'x' does not exist" whenever that pool's name did not also
+   * exist locally, and could be rejected as PVE-managed or as replicating "onto
+   * itself" on the strength of a same-named LOCAL dataset. One-shot replicate
+   * and recurring task now call the SAME guard, which resolves the location
+   * first and asks the machine the target actually lives on.
    */
   async function guardTask(task: ReplicationTask, reply: FastifyReply): Promise<boolean> {
     const schedule = await validateSchedule(executor, task.schedule)
@@ -117,28 +126,22 @@ export async function replicationTaskRoutes(
       return false
     }
     // The SOURCE is always local (a task reads from this node and sends outward),
-    // so `zpool list` is authoritative for it exactly as it is for a local
-    // target. It was never checked: a task could be written pointing at a pool
-    // that does not exist, and only fail at 03:00 in a timer run.
+    // so `zpool list` is authoritative for it. It was never checked: a task could
+    // be written pointing at a pool that does not exist, and only fail at 03:00
+    // in a timer run.
     if (!(await poolExists(task.source.pool))) {
       reply.code(400)
       reply.send({ error: { code: 'VALIDATION_ERROR', message: `Source pool '${task.source.pool}' does not exist` } })
       return false
     }
-    if (!(await poolExists(task.target.pool))) {
-      reply.code(400)
-      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Target pool '${task.target.pool}' does not exist` } })
-      return false
-    }
-    if (await isPveManagedPool(task.target.pool)) {
-      reply.code(400)
-      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Target pool '${task.target.pool}' is PVE-managed — ANAS does not create datasets there` } })
-      return false
-    }
     const { sourceFull, targetFull } = resolveTaskDatasets(task)
-    if (sourceFull === targetFull) {
+    const guard = await guardReplicationTarget(
+      { transport, poolExists, isPveManagedPool },
+      { target: task.target, sourceFull, targetFull },
+    )
+    if (!guard.ok) {
       reply.code(400)
-      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Cannot replicate '${sourceFull}' onto itself — choose a different target` } })
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: guard.message } })
       return false
     }
     return true

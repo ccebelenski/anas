@@ -1,11 +1,13 @@
-import type { ReplicatePlan, ReplicationTarget, Snapshot } from '@anas/shared'
+import type { ReplicatePlan, Snapshot } from '@anas/shared'
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ReplicationNotifyContext } from '../services/replication-notify.js'
-import type { ResolvedLocation, Transport } from '../services/replication-transport.js'
+import type { TargetPlacement } from '../services/replication-target.js'
+import type { Transport } from '../services/replication-transport.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
 import { notifyReplicationRun } from '../services/replication-notify.js'
+import { guardReplicationTarget } from '../services/replication-target.js'
 import { isTransientBackupSnapshot } from '../services/snapshot-naming.js'
 import { createZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
@@ -166,45 +168,23 @@ async function heldTags(executor: CommandExecutor, snapFull: string): Promise<st
   return r.stdout.split('\n').filter(Boolean).map(l => l.split('\t')[1]).filter(Boolean)
 }
 
-/** Resolved target location: local, or a resolved peer/remote (isRemote true). */
-type TargetLocation
-  = | { isRemote: false }
-    | { isRemote: true, resolved: ResolvedLocation }
-    | { error: string }
-
 export function createReplicationHandlers(deps: ReplicationDeps) {
   const { executor, jobQueue, resolveDatasetName, poolExists, datasetExists, listSnapshotsDetail, transport } = deps
 
   /**
-   * Resolve where the target pool lives. `local` (absent location) → { isRemote:
-   * false }. A peer/remote is looked up (members / registry); an unresolvable one
-   * is a 400-worthy { error }.
+   * The target-side guards — location resolution, pool existence WHERE THE
+   * TARGET LIVES, the PVE-managed exclusion and the onto-itself check — all live
+   * in services/replication-target.ts, shared verbatim with the recurring-task
+   * routes (issue #46).
    */
-  async function resolveTargetLocation(target: ReplicationTarget): Promise<TargetLocation> {
-    const kind = target.location?.kind ?? 'local'
-    if (kind === 'local')
-      return { isRemote: false }
-    const res = await transport.resolveLocation(target.location!)
-    if (!res.ok)
-      return { error: res.error }
-    return { isRemote: true, resolved: res.resolved }
-  }
-
-  /** Does the target pool exist — locally (`zpool list`) or on the peer/remote (`ssh zpool list`)? */
-  async function targetPoolExists(loc: TargetLocation, pool: string): Promise<boolean> {
-    if ('error' in loc)
-      return false
-    return loc.isRemote ? transport.remotePoolExists(loc.resolved, pool) : poolExists(pool)
-  }
+  const guardDeps = { transport, poolExists, isPveManagedPool: deps.isPveManagedPool }
 
   /**
    * The target dataset's snapshots (as minimal Snapshot records — only
    * snapshotName is read downstream), or null when the target dataset is absent.
    * Remote targets go over ssh; the zfs -H list yields names only.
    */
-  async function targetSnapshots(loc: TargetLocation, targetPool: string, targetFull: string): Promise<Snapshot[] | null> {
-    if ('error' in loc)
-      return null
+  async function targetSnapshots(loc: TargetPlacement, targetPool: string, targetFull: string): Promise<Snapshot[] | null> {
     if (loc.isRemote) {
       if (!(await transport.remoteDatasetExists(loc.resolved, targetFull)))
         return null
@@ -233,37 +213,15 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       return { error: { code: 'NOT_FOUND', message: `Dataset '${source}' not found` } }
     }
 
-    // Stage 3: resolve where the target lives (local / peer / remote).
-    const loc = await resolveTargetLocation(target)
-    if ('error' in loc) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: loc.error } }
-    }
-
-    // The target POOL must exist — we replicate into an existing pool, never
-    // create one. Locally via `zpool list`; on a peer/remote via `ssh zpool list`.
-    if (!(await targetPoolExists(loc, target.pool))) {
-      const where = loc.isRemote ? ` on ${target.location?.kind} '${target.location?.name}'` : ''
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' does not exist${where}` } }
-    }
-    // Story 3.25: never create datasets on a PVE-managed pool. This guard applies
-    // ONLY to LOCAL targets — we cannot and must not read a remote's storage.cfg,
-    // so a peer/remote pool is never subject to the PVE-managed exclusion.
-    if (!loc.isRemote && (await deps.isPveManagedPool(target.pool))) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' is PVE-managed — ANAS does not create datasets there` } }
-    }
-
+    // Stage 3: resolve where the target lives (local / peer / remote) and run
+    // every target-side guard in THAT context.
     const targetFull = resolveTarget(source, poolName, target)
-
-    // Replicating a dataset onto itself is meaningless — give the honest answer.
-    // Only meaningful for LOCAL targets: a peer/remote dataset of the same name
-    // lives on a different machine and is never the source.
-    if (!loc.isRemote && targetFull === source) {
+    const guard = await guardReplicationTarget(guardDeps, { target, sourceFull: source, targetFull })
+    if (!guard.ok) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Cannot replicate '${source}' onto itself — choose a different target dataset` } }
+      return { error: { code: 'VALIDATION_ERROR', message: guard.message } }
     }
+    const loc = guard.placement
 
     // Pick the snapshot to send: explicit (must exist) or the newest source snapshot.
     const sourceSnaps = await listSnapshotsDetail(source)
@@ -323,32 +281,15 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       return { error: { code: 'NOT_FOUND', message: `Dataset '${source}' not found` } }
     }
 
-    // Stage 3: resolve where the target lives (local / peer / remote).
-    const loc = await resolveTargetLocation(target)
-    if ('error' in loc) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: loc.error } }
-    }
-
-    if (!(await targetPoolExists(loc, target.pool))) {
-      const where = loc.isRemote ? ` on ${target.location?.kind} '${target.location?.name}'` : ''
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' does not exist${where}` } }
-    }
-    // Story 3.25: never create datasets on a PVE-managed pool — LOCAL targets
-    // only (we cannot and must not read a remote's storage.cfg).
-    if (!loc.isRemote && (await deps.isPveManagedPool(target.pool))) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Target pool '${target.pool}' is PVE-managed — ANAS does not create datasets there` } }
-    }
-
+    // Stage 3: resolve where the target lives (local / peer / remote) and run
+    // every target-side guard in THAT context.
     const targetFull = resolveTarget(source, poolName, target)
-
-    // Replicating a dataset onto itself is meaningless — LOCAL targets only.
-    if (!loc.isRemote && targetFull === source) {
+    const guard = await guardReplicationTarget(guardDeps, { target, sourceFull: source, targetFull })
+    if (!guard.ok) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Cannot replicate '${source}' onto itself — choose a different target dataset` } }
+      return { error: { code: 'VALIDATION_ERROR', message: guard.message } }
     }
+    const loc = guard.placement
 
     // 9.4 notification context. Built BEFORE the job so a run that dies early
     // still names source → target (and the peer/remote it was going to); the
