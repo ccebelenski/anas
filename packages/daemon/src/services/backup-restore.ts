@@ -820,6 +820,37 @@ export function newLunZvolCreateArgs(dataset: string, size: number): string[] {
  * ANAS's, a mid-stream failure UNDOES IT — unmap, delete the backstore, destroy
  * the backing — and says so, instead of saving a half-done state or leaving a
  * half-filled LUN that looks healthy in the grid.
+ *
+ * WHERE THE LOCK IS, AND WHY IT IS NOT AROUND THE WHOLE THING (the #52 shape,
+ * applied to this door too): the daemon-wide `withIscsiLock` mutex exists so two
+ * `targetcli` runs never touch the LIO tree at once, and this function OWNS it
+ * for a new-LUN restore — it takes it for the two SHORT targetcli sections
+ * (create+map the LUN, and the final `saveconfig`) and for the cleanup's undo,
+ * and holds it for NEITHER the image stream nor the size read-back. A new-LUN
+ * restore streams for HOURS; a lock held across it would block every iSCSI
+ * mutation on the node for the whole restore. The stream needs no mutual
+ * exclusion — it writes the new backing OBJECT (the zvol/image), not the tree.
+ * The mutex is NOT reentrant (a plain promise chain), so the route must NOT wrap
+ * this call in another `withIscsiLock` — that would both reintroduce the
+ * hours-long block and deadlock against these acquisitions.
+ *
+ * THE CRASH WINDOW, AND WHY THERE IS NO MARKER (ruling, 0.3.1): `saveconfig` is
+ * the LAST step, so a daemon CRASH mid-stream (not a job failure — that path
+ * unwinds cleanly above) leaves the new LUN LIVE in configfs but ABSENT from
+ * `saveconfig.json`. On a host REBOOT — the LIO persistence boundary — boot
+ * restores from `saveconfig.json`, which never held the LUN, so it is simply
+ * gone; only an inert orphaned backing object remains on disk, served to no one,
+ * and it is NOT a stub (a stub is a PERSISTED LUN whose backing went missing,
+ * the opposite case). On a daemon-only restart (host up) the LUN lingers live at
+ * exactly the manifest size — the size-based stub detector cannot see it because
+ * the size is correct, only the CONTENTS are half — BUT the existing
+ * persisted⟷live health diff already names it: `lun-not-persisted`, "live but
+ * not in the saved configuration — it will not come back after a reboot". A
+ * completed restore saves the config (persisted); a crashed one does not, so
+ * that flag distinguishes them with no shadow state. This is the general LIO
+ * live-then-save model (the add-LUN door has the same window, only milliseconds
+ * wide), and the stateless principle wins: adding a persistent "restore in
+ * flight" marker would be shadow state the health diff already makes unnecessary.
  */
 export async function runNewLunImageRestore(
   executor: CommandExecutor,
@@ -873,14 +904,18 @@ export async function runNewLunImageRestore(
       `creating backstore ${deps.name} with a fresh unit serial `
       + '(a copy is a NEW disk — the source LUN keeps its own)',
     )
-    const mapped = await createAndMapLun(
+    // Under the lock: createAndMapLun is a run of targetcli commands against the
+    // LIO tree (backstore create, attributes, map, ACL grants), so it must not
+    // interleave with another node mutation. The lock is taken HERE and released
+    // the moment the LUN is mapped — NOT held across the hours-long stream below.
+    const mapped = await withIscsiLock(async () => createAndMapLun(
       deps.mutate,
       target,
       deps.name,
       backing,
       kind === 'file' ? deps.imageSize : null,
       serial,
-    )
+    ))
     index = mapped.index
     state.backstoreTouched = true
     state.mapped = true
@@ -931,7 +966,10 @@ export async function runNewLunImageRestore(
     // ---- 5. Only NOW is the LUN persisted -----------------------------------
     updateProgress('Saving the LIO configuration')
     try {
-      await saveIscsiConfig(executor)
+      // The lock again, a SECOND short acquisition — saveconfig walks the whole
+      // tree and must not run alongside another targetcli. The stream between
+      // the map and this save ran with the lock released.
+      await withIscsiLock(async () => saveIscsiConfig(executor))
     }
     catch (err) {
       throw new Error(
@@ -994,7 +1032,9 @@ async function removeNewLun(
 
   if (state.mapped) {
     try {
-      await runTargetcli(executor, [`${tpgPath(target.iqn, target.tpgTag)}/luns`, 'delete', `lun${index}`])
+      // The cleanup runs after the stream, so the lock is free — each targetcli
+      // undo re-takes it, the same short-section discipline as the create path.
+      await withIscsiLock(async () => runTargetcli(executor, [`${tpgPath(target.iqn, target.tpgTag)}/luns`, 'delete', `lun${index}`]))
       removed.push(`LUN ${index}`)
     }
     catch (err) {
@@ -1004,7 +1044,7 @@ async function removeNewLun(
 
   if (state.backstoreTouched) {
     try {
-      await runTargetcli(executor, [backstorePath(backing.plugin, deps.name), 'delete'])
+      await withIscsiLock(async () => runTargetcli(executor, [backstorePath(backing.plugin, deps.name), 'delete']))
       removed.push(`backstore '${deps.name}'`)
     }
     catch (err) {

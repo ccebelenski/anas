@@ -81,10 +81,35 @@ value vs exact bytes.
   yanked (serving zeros vs kicking the initiator)? Foreign skip is C1/#54 regardless.
 - **New-LUN restore holds the iSCSI mutex across the whole image stream** (routes/backup.ts newLun job wrap —
   pre-existing, surfaced while fixing #52): every iSCSI mutation on the node queues behind an hours-long
-  restore. Same fix shape as #52 (lock only the targetcli sections). Promote to a wave when convenient.
+  restore. **RESOLVED (code):** the whole-job `withIscsiLock` wrap is gone from the route;
+  `runNewLunImageRestore` now OWNS the lock and takes it only for its short targetcli sections
+  (create+map the LUN, the final `saveconfig`, and each cleanup undo), releasing it across the
+  multi-hour `execToStream` and the size read-back — the exact shape #52 applied to the in-place door.
+  The stream writes the new backing OBJECT, not the LIO tree, so it needs no mutual exclusion; the mutex
+  is a plain chain (not reentrant), which is why ownership had to move into the service. Lock-structure
+  tests in `backup-restore-elsewhere.test.ts` prove a concurrent mutation WAITS during create+map and
+  during saveconfig, and RUNS during the stream (the two "under the lock" tests fail on the old
+  whole-job-wrap code).
 - **Crash-window record for new-LUN restore:** a daemon crash (not a job failure) mid-stream
   leaves a healthy-looking, unpersisted LUN holding half an image; the in-place path's record is
-  the disabled target, the new-LUN path has no equivalent. Decide whether a marker is wanted.
+  the disabled target, the new-LUN path has no equivalent. **RESOLVED (a) — documentation only, NO
+  new state.** Trace: `saveconfig` is the LAST step, so a crash mid-stream leaves the new LUN LIVE in
+  configfs but absent from `saveconfig.json`. On a host REBOOT (the LIO persistence boundary) boot
+  restores from `saveconfig.json`, which never held the LUN → it is simply GONE, leaving only an inert
+  orphaned backing object on disk (served to no one). It is NOT a stub — a stub is a *persisted* LUN
+  whose backing went missing (iscsi.5/iscsi.8), the opposite case — and the size-based stub detector
+  cannot see it anyway: the backing is created at exactly the manifest size, so the size is correct and
+  only the CONTENTS are half. On a daemon-only restart (host up) the LUN lingers live and correct-sized,
+  but the pre-existing persisted⟷live health diff (`GET /iscsi/health`, iscsi.2) ALREADY names it:
+  `lun-not-persisted` — "live but not in the saved configuration — it will not come back after a reboot".
+  A completed restore saves the config (persisted); a crashed one does not, so that flag is the honest
+  equivalent of the in-place path's disabled-target record, derived from live state with zero shadow
+  state. This is just the general LIO live-then-save model (the ordinary add-LUN door has the same
+  window, only milliseconds wide), so the stateless principle wins — no marker. A structural alternative
+  that would close even the daemon-restart window (map the LUN only AFTER the stream completes, so a
+  crash leaves only an inert orphaned backing) is recorded but NOT adopted: it trades away the current
+  order's fail-fast property (prove LIO will accept the LUN before spending hours streaming) and is a
+  larger redesign. The finding lives in a `runNewLunImageRestore` doc comment.
 - **Pre-existing, explicitly out of 0.3.1 unless promoted:** B2 backupId has no cross-task
   uniqueness (two tasks can share a PBS group and prune each other); B3 BackupRepo doesn't tie
   authType to username/tokenId (empty auth-id repo string). Both predate 0.3.0.

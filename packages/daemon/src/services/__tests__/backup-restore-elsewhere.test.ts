@@ -1,4 +1,5 @@
 import type { BackupRepo, IscsiLun, IscsiTargetDetail } from '@anas/shared'
+import type { CommandExecutor } from '../../executor/types.js'
 import type { NewLunRestoreDeps } from '../backup-restore.js'
 import assert from 'node:assert/strict'
 import { constants } from 'node:fs'
@@ -10,7 +11,7 @@ import { BackupRestoreRequest } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { newLunZvolCreateArgs, runNewLunImageRestore, volsizeArgs } from '../backup-restore.js'
 import { buildBackupEnv, PBC } from '../backup-runner.js'
-import { ISCSI_MAX_UNMAP_LBA_COUNT, TARGETCLI, ZFS } from '../iscsi-mutate.js'
+import { ISCSI_MAX_UNMAP_LBA_COUNT, TARGETCLI, withIscsiLock, ZFS } from '../iscsi-mutate.js'
 
 /**
  * backup2.10 — "restore elsewhere": the request shape, at the boundary.
@@ -539,6 +540,154 @@ describe('runNewLunImageRestore — a failure undoes what it made, and never sav
       )
       assert.ok(!mock.calls.some(c => c.args.includes('saveconfig')))
       assertSourceUntouched(mock)
+    })
+  })
+})
+
+describe('runNewLunImageRestore — where the iSCSI lock is held, and where it is not (the #52 shape for the new-LUN door)', () => {
+  /** Resolves 'waited' if `p` has not settled within a few event-loop turns. */
+  async function raceAgainstTime(p: Promise<unknown>, ms = 50): Promise<string> {
+    let timer: NodeJS.Timeout | undefined
+    const verdict = await Promise.race([
+      p.then(() => 'ran'),
+      new Promise<string>((r) => {
+        timer = setTimeout(r, ms, 'waited')
+      }),
+    ])
+    if (timer)
+      clearTimeout(timer)
+    return verdict
+  }
+
+  /**
+   * Wrap a base executor, PAUSING the first call whose (command, args) satisfy
+   * `match` until `held` resolves; `entered` fires the instant that call begins.
+   * Everything else passes straight through to the base mock's fixtures.
+   */
+  function gatedOn(
+    base: MockExecutor,
+    which: 'exec' | 'stream',
+    match: (command: string, args: string[]) => boolean,
+    entered: () => void,
+    held: Promise<void>,
+  ): CommandExecutor {
+    let gated = false
+    const gate = async (kind: 'exec' | 'stream', command: string, args: string[]): Promise<void> => {
+      if (!gated && kind === which && match(command, args)) {
+        gated = true
+        entered()
+        await held
+      }
+    }
+    return {
+      exec: async (c, a, o) => {
+        await gate('exec', c, a)
+        return base.exec(c, a, o)
+      },
+      pipeline: (c1, a1, c2, a2) => base.pipeline(c1, a1, c2, a2),
+      execToStream: async (c, a, t, o) => {
+        await gate('stream', c, a)
+        return base.execToStream(c, a, t, o)
+      },
+    }
+  }
+
+  const isBackstoreCreate = (c: string, a: string[]): boolean =>
+    c === TARGETCLI && a.includes('create') && a.join(' ').includes('wwn=')
+  const isSaveconfig = (c: string, a: string[]): boolean =>
+    c === TARGETCLI && a.includes('saveconfig')
+
+  it('the backstore CREATE + MAP runs UNDER the lock — a concurrent mutation waits (FAILS on the whole-job-wrap code)', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      const base = successMock('tank/newvol')
+      let entered!: () => void
+      const inCreate = new Promise<void>((r) => {
+        entered = r
+      })
+      let release!: () => void
+      const held = new Promise<void>((r) => {
+        release = r
+      })
+      const gated = gatedOn(base, 'exec', isBackstoreCreate, () => entered(), held)
+
+      const run = runNewLunImageRestore(gated, deps(base, configfsRoot, { mutate: { executor: gated, configfsRoot } }), noop)
+      // If the create step never runs, fail here instead of hanging the suite.
+      assert.equal(await raceAgainstTime(inCreate, 200), 'ran', 'the run must reach the backstore create')
+
+      // The service now sits INSIDE `withIscsiLock(createAndMapLun)`. Any other
+      // iSCSI mutation queued now MUST wait — on the old shape the service held
+      // no lock of its own and this ran immediately.
+      let ran = false
+      const other = withIscsiLock(async () => {
+        ran = true
+      })
+      assert.equal(await raceAgainstTime(other), 'waited')
+      assert.equal(ran, false)
+
+      release()
+      await run
+      await other
+      assert.equal(ran, true)
+    })
+  })
+
+  it('the SAVECONFIG step runs UNDER the lock too — a concurrent mutation waits', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      const base = successMock('tank/newvol')
+      let entered!: () => void
+      const inSave = new Promise<void>((r) => {
+        entered = r
+      })
+      let release!: () => void
+      const held = new Promise<void>((r) => {
+        release = r
+      })
+      const gated = gatedOn(base, 'exec', isSaveconfig, () => entered(), held)
+
+      const run = runNewLunImageRestore(gated, deps(base, configfsRoot, { mutate: { executor: gated, configfsRoot } }), noop)
+      assert.equal(await raceAgainstTime(inSave, 200), 'ran', 'the run must reach saveconfig')
+
+      let ran = false
+      const other = withIscsiLock(async () => {
+        ran = true
+      })
+      assert.equal(await raceAgainstTime(other), 'waited')
+      assert.equal(ran, false)
+
+      release()
+      await run
+      await other
+      assert.equal(ran, true)
+    })
+  })
+
+  it('the image STREAM does NOT hold the lock — an hours-long restore blocks no mutation', async () => {
+    await withConfigfsRoot(async (configfsRoot) => {
+      const base = successMock('tank/newvol')
+      let streaming!: () => void
+      const hasStarted = new Promise<void>((r) => {
+        streaming = r
+      })
+      let release!: () => void
+      const finish = new Promise<void>((r) => {
+        release = r
+      })
+      // Park the run mid-image, exactly where a real one spends its hours.
+      const gated = gatedOn(base, 'stream', () => true, () => streaming(), finish)
+
+      const run = runNewLunImageRestore(gated, deps(base, configfsRoot, { mutate: { executor: gated, configfsRoot } }), noop)
+      await hasStarted
+
+      // The create+map lock section is already done and released: the backstore
+      // was created and mapped before the stream began, and the lock is free.
+      assert.ok(base.calls.some(c => c.args.includes('create') && c.args.join(' ').includes('wwn=')), 'the backstore was created before the stream')
+      const other = withIscsiLock(async () => 'mutated')
+      assert.equal(await raceAgainstTime(other), 'ran')
+
+      release()
+      await run
+      // saveconfig still ran, after the stream, under the lock again.
+      assert.ok(base.calls.some(c => c.args.includes('saveconfig')))
     })
   })
 })

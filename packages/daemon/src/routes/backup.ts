@@ -125,7 +125,6 @@ import {
   readIscsiState,
   resolveFileBackingDir,
   resolveZvolBacking,
-  withIscsiLock,
 } from '../services/iscsi-mutate.js'
 import { classifyBacking } from '../services/iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
@@ -1985,7 +1984,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const job = jobQueue.submit(
       'backup.restore.image',
       { ...identity, params: auditParams },
-      async updateProgress => withIscsiLock(async () => runNewLunImageRestore(
+      // NO `withIscsiLock` here: `runNewLunImageRestore` OWNS the lock for this
+      // operation and takes it only for its short targetcli sections (create+map
+      // the LUN, the final saveconfig, and any cleanup undo), leaving it released
+      // across the image stream, which can run for hours. Wrapping the call would
+      // both hold the node's only iSCSI mutex for that whole time and deadlock
+      // against the service's own acquisitions (the mutex is a plain chain, not
+      // reentrant) — the same fix #52 applied to the in-place door.
+      async updateProgress => runNewLunImageRestore(
         executor,
         {
           repo,
@@ -2010,7 +2016,7 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
       ).then((result) => {
         auditParams.bytesWritten = result.bytesWritten
         return result
-      })),
+      }),
     )
 
     reply.code(202)
