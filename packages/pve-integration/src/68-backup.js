@@ -876,12 +876,14 @@
     // backup2.9 — the LUN a block task backs up, by its LIVE name (it is
     // display-only and never stored — read where it lives). Files tasks get a
     // dash; a block task whose LUN no longer resolves says so, amber — a
-    // resolved-null is a state, not an absence of data.
+    // resolved-null is a state, not an absence of data. An OLDER daemon omits
+    // the field entirely (absent, not null) — both are the same unresolved
+    // state; neither may render the literal string "undefined".
     function renderLunName(v, meta, rec) {
         if (!rec || !rec.get || rec.get('kind') !== 'block') {
             return '<span style="color:gray;">&mdash;</span>';
         }
-        if (v === null) {
+        if (v == null) {
             return '<span style="color:var(--anas-warn,#c9820b);">'
                 + enc(t('no longer resolvable')) + '</span>';
         }
@@ -1263,6 +1265,9 @@
                                 width: 60,
                                 sortable: false,
                                 menuDisabled: true,
+                                // Raw store values never reach innerHTML (the
+                                // same rule the Backup grid's Name column runs).
+                                renderer: Ext.String.htmlEncode,
                             },
                             {
                                 text: t('Name'),
@@ -1270,6 +1275,7 @@
                                 flex: 1,
                                 sortable: false,
                                 menuDisabled: true,
+                                renderer: Ext.String.htmlEncode,
                             },
                             {
                                 text: t('Backing'),
@@ -1785,15 +1791,18 @@
     ANAS.backup.runTaskNow = function (node, name, view) {
         runTaskByName(view, node, name);
     };
-    ANAS.backup.openEditTask = function (view, node, task) {
-        openTaskDialog(view, node, task, null, null);
+    ANAS.backup.openEditTask = function (view, node, task, onDone) {
+        openTaskDialog(view, node, task, null, null, onDone);
     };
     // `preset` (backup2.9) is `{ kind: 'block', lun: { targetIqn, index, path,
     // serial?, name? } }`: the LUN toolbar's door opens the wizard with the
     // block panel ALREADY CHOSEN (the kind choice is skipped) and its LUN
-    // pre-selected. `seedArchives` stays for a plain files seed.
-    ANAS.backup.openNewTask = function (view, node, seedArchives, preset) {
-        openTaskDialog(view, node, null, seedArchives, preset);
+    // pre-selected. `seedArchives` stays for a plain files seed. `onDone`
+    // (both doors) fires once after the task save completes successfully —
+    // the iSCSI LUNs window re-reads its backup coverage through it, so its
+    // badges are not one task behind the wizard's own Create/Edit doors.
+    ANAS.backup.openNewTask = function (view, node, seedArchives, preset, onDone) {
+        openTaskDialog(view, node, null, seedArchives, preset, onDone);
     };
 
     // ---- Toolbar state -----------------------------------------------------
@@ -3059,10 +3068,20 @@
     // Ask the daemon what is nested under this row's path. USER-INITIATED (a row
     // opened or edited), one-shot, non-mutating and entirely local — the
     // save-time verify pattern, with no PBS contact at all.
+    //
+    // Two in-flight scans on the SAME row can resolve out of order (a slow
+    // first walk answering after a fast second one): the last to RESOLVE would
+    // paint #archNestedAlert for a path the row no longer holds. Every request
+    // stamps the row's monotonic sequence and drops its own resolution when the
+    // row has moved on — the stale verdict never paints.
     function scanArchiveNested(fs, node) {
         if (!fs || fs.destroyed || fs.destroying) {
             return;
         }
+        var seq = (fs.anasScanSeq = (fs.anasScanSeq || 0) + 1);
+        var stale = function () {
+            return fs.destroyed || fs.destroying || fs.anasScanSeq !== seq;
+        };
         var pathF = fs.down('#archPath');
         var path = trim(pathF ? pathF.getValue() : '');
         if (!path || path.charAt(0) !== '/') {
@@ -3082,7 +3101,7 @@
             + enc(img ? t('checking this image source…') : t('checking for nested filesystems…')) + '</div>');
         ANAS.api.post(node, '/backup/tasks/preview-nested', body).then(
             function (res) {
-                if (fs.destroyed || fs.destroying) {
+                if (stale()) {
                     return;
                 }
                 var d = (res && res.data) || {};
@@ -3090,7 +3109,7 @@
                 nestedAlertOut(fs, nestedAlertHtml(scans[0]));
             },
             function (err) {
-                if (fs.destroyed || fs.destroying) {
+                if (stale()) {
                     return;
                 }
                 // Fail-open and HONEST: an unavailable scan says so, it never
@@ -3544,7 +3563,7 @@
      * `archivesOf` an edit round-trip does, so a pre-filled row is the same
      * row a manual pick in the wizard builds.
      */
-    function openTaskDialog(view, node, existing, seedArchives, preset) {
+    function openTaskDialog(view, node, existing, seedArchives, preset, onDone) {
         var isEdit = !!existing;
         var task = existing || {};
         var seed = (!isEdit && isArray(seedArchives) && seedArchives.length)
@@ -3555,11 +3574,11 @@
                 ANAS.toast(t('Register a PBS repository first (Repositories…).'));
                 return;
             }
-            buildTaskWindow(view, node, isEdit, task, repoOpts, seed, preset);
+            buildTaskWindow(view, node, isEdit, task, repoOpts, seed, preset, onDone);
         });
     }
 
-    function buildTaskWindow(view, node, isEdit, task, repoOpts, seedArchives, preset) {
+    function buildTaskWindow(view, node, isEdit, task, repoOpts, seedArchives, preset, onDone) {
         var repoStore = Ext.create('Ext.data.Store', {
             fields: ['name', 'label'], data: repoOpts,
         });
@@ -3926,7 +3945,7 @@
                         cls: 'anas-btn-backup-task-submit',
                         handler: function () {
                             try {
-                                submitTask(win, view, node, isEdit, task);
+                                submitTask(win, view, node, isEdit, task, onDone);
                             } catch (e) {
                                 ANAS.warn('backup task submit failed: ' + ANAS.errText(e));
                             }
@@ -4032,7 +4051,7 @@
 
     // `task` is the task being edited (empty on create): the source for every
     // field the dialog does NOT show but a PUT would otherwise drop.
-    function submitTask(win, view, node, isEdit, task) {
+    function submitTask(win, view, node, isEdit, task, onDone) {
         var form = win.down('#form');
         var basicForm = form && form.getForm();
         if (basicForm && basicForm.isValid && !basicForm.isValid()) {
@@ -4178,6 +4197,17 @@
                         win.close();
                     }
                     loadTasks(view, node);
+                    // The door's completion callback (the iSCSI LUNs window
+                    // re-reads its backup coverage). Called once, only after
+                    // a successful save; the door's own screens must never be
+                    // taken down by it.
+                    if (onDone) {
+                        try {
+                            onDone();
+                        } catch (eDone) {
+                            ANAS.warn('backup task onDone failed: ' + ANAS.errText(eDone));
+                        }
+                    }
                 },
             });
         };
@@ -6558,7 +6588,10 @@
         try {
             var combo = win.down('#filePicker');
             var store = combo && combo.getStore();
-            var rec = store && store.findRecord ? store.findRecord('name', where) : null;
+            // exactMatch — the in-repo form: ExtJS's default is a
+            // case-insensitive PREFIX match, so a store holding 'ahrpool' and
+            // 'ahrpool-snap' would hand back the wrong row's source flag.
+            var rec = store && store.findRecord ? store.findRecord('name', where, 0, false, true, true) : null;
             return rec ? (rec.get('source') || 'dataset') : 'dataset';
         } catch (e) {
             return 'dataset';
@@ -6842,16 +6875,27 @@
         }
     }
 
-    /** The result panel: a finished new-LUN restore lands its identity here. */
+    /** The result panel: a finished new-LUN restore lands its identity here.
+     * A poll budget that runs out hands back a STILL-RUNNING job — that must
+     * never read as "finished": the daemon task owns the truth until it says
+     * completed, and the new LUN may not exist yet. */
     function showNewLunResult(win, job) {
         var panel = win.down('#restoreResult');
         if (!panel) {
             return;
         }
         var nl = job && job.result && job.result.newLun;
+        if (job && job.status !== 'completed') {
+            panel.update('<span style="color:var(--anas-warn,#c9820b);">'
+                + enc(t('The restore is still running — the daemon task is the truth. Watch the task; '
+                    + 'the new LUN’s identity appears here if this dialog is still open when it finishes.'))
+                + '</span>');
+            return;
+        }
         if (!nl) {
             panel.update('<span style="color:gray;font-size:0.9em;">'
-                + enc(t('The new LUN restore finished.')) + '</span>');
+                + enc(t('The restore job completed, but no new-LUN record came back with it — '
+                    + 'check the task log for the LUN’s identity.')) + '</span>');
             return;
         }
         panel.update('<span style="color:var(--anas-good,#2e7d32);">'
@@ -7025,6 +7069,10 @@
             // the dialog open, so its own result panel still reads `win` —
             // guarded, because the operator may close it while the job runs.
             view: win._view || win,
+            // A whole-image restore re-reads every byte of the source and can
+            // run for hours — the 15 s poll default would fire onComplete on
+            // a still-running job. Same budget as the files half.
+            maxMs: 3600000,
             confirmWindow: true,
             confirmTitle: confirmTitle,
             confirmIntro: confirmIntro,
@@ -7968,8 +8016,12 @@
                     }
                     var chosen = null;
                     try {
+                        // exactMatch — the in-repo form: ExtJS's default is a
+                        // case-insensitive PREFIX match, so 'pbs' would
+                        // resolve to 'pbs-offsite' (whichever sorts first)
+                        // and prefill the WRONG repo's namespace.
                         var rec0 = combo.getStore() && combo.getStore().findRecord
-                            ? combo.getStore().findRecord('name', combo.getValue())
+                            ? combo.getStore().findRecord('name', combo.getValue(), 0, false, true, true)
                             : null;
                         chosen = rec0 ? rec0.get('namespace') : '';
                     } catch (e) {

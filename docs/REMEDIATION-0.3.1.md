@@ -26,6 +26,8 @@ value vs exact bytes.
 
 ## Wave 2 — data-safety MEDIUMs (daemon)
 
+**Status: COMPLETE 2026-09-03** — #52 `42ec599`, #53+M1 `75a4a9d`, #51 `4ac5c46`, #54 `fa6863e`, D3+D4 `94663f7`. Open: M3 only (awaits its GT probe).
+
 | id | issue | where | defect | fix |
 |----|-------|-------|--------|-----|
 | D2 | [#51](https://github.com/ccebelenski/anas/issues/51) | routes/ahr-snapshots.ts:198 | AHR rollback has no held-by-LUN pre-flight (ZFS twin has one); unmounted pool → `mv @data` under LIO's open fd, silent divergence | same `ahrPoolHeldByLun` refusal as ahr-mutate.ts, before the confirm gate |
@@ -39,6 +41,8 @@ value vs exact bytes.
 
 ## Wave 3 — UI correctness and staleness (MEDIUM)
 
+**Status: COMPLETE 2026-09-03** — U2 spans `eddc555` (75-iscsi half) + the K3-K7/U2 commit; K3/K4/K5 in that same commit.
+
 | id | where | defect | fix |
 |----|-------|--------|-----|
 | U2 | 75-iscsi.js:2080/2795 | LUNs-window backup coverage read once; task doors have no completion callback → stale "not backed up", invites duplicate task | `onDone` on openNewTask/openEditTask → re-read coverage |
@@ -47,6 +51,8 @@ value vs exact bytes.
 | K5 | 68-backup.js:3037 | nested-scan responses race; stale path's boundary verdict can drive `includeNested` | request-generation stamp, drop stale resolutions |
 
 ## Wave 4 — LOW sweep (one story, grouped by area)
+
+**Status: COMPLETE 2026-09-03** — iSCSI daemon `48ce526`; backup/executor `e181010`; UI `eddc555` + the K3-K7/U2 commit. Also fixed outside the plan: issue #46 `15e708f`.
 
 - **iSCSI daemon:** M4 bare `/dev/zvol/<pool>` accepted as backing (ownership.ts:191 fallback) → refuse at route; M5 destroy warning promises snapshots ("-r") but command is a plain `zfs destroy` that fails AFTER unmap, before saveconfig → pre-check snapshots in the route + align text; C3 repair `size ?? 0` for a size-less fileio record → refuse the item; C4 post-quarantine missingLuns card says "restore the image" ANAS itself deleted → thread `fileRemoved` into the wording.
 - **Backup daemon:** R2 newLocation write-test probes the immediate parent (client creates the chain) → probe nearest existing ancestor; R3 `.anas-restore-partial` never removed on a successful retry into the same dir; R4 image `rate` unvalidated (reuse `BackupRateLimit`); R5 wrong-password → "Datastore.Audit" wording (reuse backup-runner.ts:892's auth/privs split — single source of truth); B1 same-second restart hits "dataset already exists" → destroy-and-retake own label.

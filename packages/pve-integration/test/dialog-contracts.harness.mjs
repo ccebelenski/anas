@@ -183,7 +183,21 @@ function makeStore(cfg) {
     getAt: i => rows[i],
     each(fn) { rows.slice().forEach(fn) },
     findExact(field, value) { return rows.findIndex(r => r.get(field) === value) },
-    findRecord(field, value) { return rows.find(r => r.get(field) === value) || null },
+    // ExtJS's REAL findRecord: without the trailing args it is a
+    // case-INSENSITIVE ANCHORED-PREFIX match (exactMatch=true lifts both).
+    // Modeling the exact-match-only form would let a prefix collision
+    // ('pbs' resolving to 'pbs-offsite', 'tank' to 'tank2') pass here and
+    // misfire in the field — so the stub keeps Ext's semantics.
+    findRecord(field, value, startIndex, anyMatch, caseSensitive, exactMatch) {
+      const from = startIndex || 0
+      const v = String(value === undefined || value === null ? '' : value)
+      const rx = exactMatch ? null : new RegExp((anyMatch ? '' : '^')
+        + v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), caseSensitive ? '' : 'i')
+      const eq = r => (exactMatch
+        ? (caseSensitive ? r.get(field) === value : String(r.get(field)) === v)
+        : rx.test(String(r.get(field))))
+      return rows.slice(from).find(eq) || null
+    },
     add(r) { rows.push(r.get ? r : makeRecord(r)) },
     removeAll() { rows.length = 0 },
   }
@@ -430,7 +444,16 @@ const Ext = {
     if (cls === 'Ext.window.Window') { created.windows.push(cmp) }
     return cmp
   },
-  String: { htmlEncode: s => String(s == null ? '' : s) },
+  // Ext.String.htmlEncode encodes — the identity stub would let a "renderer
+  // present" check pass while raw markup still reached innerHTML.
+  String: {
+    htmlEncode: s => String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;'),
+  },
   Date: { format: d => String(d) },
   Msg: {
     confirm(title, msg, fn) { confirms.push({ title, msg }); if (fn) { fn('yes') } },
@@ -627,6 +650,9 @@ function makeAnas(routes) {
         // dialog being closed (issue #48 — a dead view silences the failure
         // alert and every grid refresh).
         view: cfg.view,
+        // …and the poll budget: a long job left on the 15 s default fires
+        // onComplete on a STILL-RUNNING job (the image restore's "finished").
+        maxMs: cfg.maxMs,
         confirmWindow: !!cfg.confirmWindow,
         extraItems: cfg.extraItems,
         mapConfirm: cfg.mapConfirm,
@@ -1024,6 +1050,10 @@ async function backupChecks() {
       lunCol.renderer(rowBlock.get('lunName'), {}, rowBlock))
     ok('backup: a block task whose LUN no longer resolves says so',
       /no longer resolvable/i.test(lunCol.renderer(null, {}, { get: k => (k === 'kind' ? 'block' : null) })))
+    ok('backup: an ABSENT LUN name (older daemon) is the same unresolved state, never "undefined"',
+      /no longer resolvable/i.test(lunCol.renderer(undefined, {}, { get: k => (k === 'kind' ? 'block' : undefined) }))
+        && !/undefined/.test(lunCol.renderer(undefined, {}, { get: k => (k === 'kind' ? 'block' : undefined) })),
+      lunCol.renderer(undefined, {}, { get: k => (k === 'kind' ? 'block' : undefined) }))
     ok('backup: a files task never shows the "unresolvable" state',
       !/no longer resolvable/i.test(lunCol.renderer(undefined, {}, { get: k => (k === 'kind' ? 'files' : undefined) })))
   }
@@ -1425,6 +1455,19 @@ async function lunPickerChecks() {
   ok('picker: the serial is on screen', (lunGrid.columns || []).some(col => col.dataIndex === 'serial'))
   ok('picker: the derived consistency is on screen',
     (lunGrid.columns || []).some(col => col.dataIndex === 'consistency'))
+  // Raw store values never reach innerHTML: the LUN number and Name columns
+  // encode like every other column here (a store value with markup in it is
+  // attacker-shaped, but the rule costs nothing).
+  {
+    const idxCol = (lunGrid.columns || []).find(c => c.dataIndex === 'index')
+    const nameCol = (lunGrid.columns || []).find(c => c.dataIndex === 'name')
+    ok('picker: the LUN and Name columns encode, never pass raw markup',
+      !!idxCol && typeof idxCol.renderer === 'function'
+        && idxCol.renderer('<b>2</b>') === '&lt;b&gt;2&lt;/b&gt;'
+        && !!nameCol && typeof nameCol.renderer === 'function'
+        && nameCol.renderer('<b>x</b>') === '&lt;b&gt;x&lt;/b&gt;',
+      `index=${idxCol && idxCol.renderer} name=${nameCol && nameCol.renderer}`)
+  }
 
   // Pick the FILE-backed LUN: a different path AND a different LUN number, so
   // neither can round-trip by accident.
@@ -4124,6 +4167,28 @@ async function iscsiRestoreNewLunChecks() {
   eq('restore(newLun): a file-on-AHR backing is {kind:file, ahrPool}',
     jobs.length && jobs[0].body.target && jobs[0].body.target.backing,
     { kind: 'file', ahrPool: 'ahrpool' })
+  // A whole-image restore runs for hours: the poll budget must be the long
+  // one — the 15 s default fires onComplete on a STILL-RUNNING job, and the
+  // result panel would say "finished" before the LUN exists.
+  ok('restore(newLun): the image half polls for an hour, not the 15 s default',
+    jobs.length && jobs[0].maxMs === 3600000, jobs.length && jobs[0].maxMs)
+
+  // The exact-match rule: 'ahrpool' must resolve to the 'ahrpool' ROW, not to
+  // whichever earlier row its name prefixes — ExtJS's default findRecord is a
+  // case-insensitive PREFIX match, and the wrong row's source flag picks the
+  // wrong backing key on submit.
+  dlg.down('#filePicker').getStore().loadData([
+    { name: 'ahrpool-snap', source: 'dataset' },
+    { name: 'ahrpool', source: 'ahr' },
+  ])
+  dlg.down('#filePicker').setValue('ahrpool')
+  await settle()
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('restore(newLun): an exact name wins over a prefix sibling (the source flag)',
+    jobs.length && jobs[0].body.target && jobs[0].body.target.backing,
+    { kind: 'file', ahrPool: 'ahrpool' })
 
   // --- a new LUN needs NO size equality — only a KNOWN size ----------------
   // The 1 GiB image is a MISMATCH for the 2 GiB LUN in place (the size gate
@@ -4204,11 +4269,44 @@ async function iscsiRestoreRefusalAndResultChecks() {
     (dlg.down('#newLunVerdict').html || '').includes(refusal), dlg.down('#newLunVerdict').html)
   ok('restore(refuse): the dialog is still open to fix the form', dlg.destroyed !== true)
 
+  // --- the poll budget expires with the job still going: the panel must say
+  // STILL RUNNING — "finished" with no identity is exactly the old lie.
+  const stillRunning = cfg => {
+    jobs.push({ method: cfg.method, path: cfg.path })
+    if (cfg.onSubmitted) { cfg.onSubmitted({}) }
+    if (cfg.onComplete) { cfg.onComplete({ status: 'running', result: {} }) }
+  }
+  ANAS.confirmAndRun = stillRunning
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  ok('restore(result): an expired poll budget reads STILL RUNNING, never "finished"',
+    /still running/i.test(dlg.down('#restoreResult').html || '')
+      && !/finished/i.test(dlg.down('#restoreResult').html || ''),
+    dlg.down('#restoreResult').html)
+
+  // --- the job completes WITHOUT a newLun record: an honest absence, not a
+  // generic "finished" that reads as if the LUN landed.
+  const completedNoRecord = cfg => {
+    jobs.push({ method: cfg.method, path: cfg.path })
+    if (cfg.onComplete) { cfg.onComplete({ status: 'completed', result: {} }) }
+  }
+  ANAS.confirmAndRun = completedNoRecord
+  jobs.length = 0
+  submit.handler(submit)
+  await settle()
+  ok('restore(result): completed without a newLun record says the record is missing',
+    /no new-LUN record/i.test(dlg.down('#restoreResult').html || ''),
+    dlg.down('#restoreResult').html)
+
   // --- the restore completes: the new LUN's identity lands in the result panel
   const completed = cfg => {
     jobs.push({ method: cfg.method, path: cfg.path, body: cfg.body })
     if (cfg.onComplete) {
       cfg.onComplete({
+        // pollJob always hands the job back WITH its status — the result
+        // panel reads it to tell a finished job from an expired poll budget.
+        status: 'completed',
         result: {
           newLun: {
             targetIqn: ISCSI_IQN,
@@ -6748,6 +6846,125 @@ async function runNotesChecks() {
   ok('run notes: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+// ============================================================================
+//  0d. Remediation 0.3.1 (Waves 3+4) — the 68-backup regression sweep:
+//      the nested-scan race (K5), the repo-door namespace prefill (K4), and
+//      the task doors' onDone contract (U2, 68-half).
+// ============================================================================
+
+/**
+ * K5 — two in-flight nested scans on ONE row can resolve out of order; the
+ * last to RESOLVE must never paint #archNestedAlert for a path the row no
+ * longer holds. The first scan's answer is PARKED here and released only
+ * after the second has painted — the stale verdict must be dropped.
+ */
+async function nestedScanRaceCheck() {
+  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const parked = []
+  const basePost = ANAS.api.post
+  ANAS.api.post = (node, path, body) => (path === '/backup/tasks/preview-nested' && body && body.path === '/etc'
+    ? (nestedPreviews.push(body), new Promise(resolve => { parked.push({ body, resolve }) }))
+    : basePost(node, path, body))
+
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  grid.selectRow(0)
+
+  nestedPreviews.length = 0
+  const dlg = await openEdit(grid)
+  const rows = archiveRows(dlg)
+  eq('scan race: the row holds /etc before the retype', rows[1].down('#archPath').getValue(), '/etc')
+  ok('scan race: the open scan for /etc is parked', parked.length === 1, `${parked.length}`)
+
+  // Retype the SAME row onto /srv: that scan resolves and paints. Only then
+  // does the parked /etc answer land — out of order, exactly the field race.
+  rows[1].down('#archPath').setValue('/srv')
+  await settle()
+  const alert = rows[1].down('#archNestedAlert')
+  ok('scan race: the fresh /srv scan painted', /\/srv\/nfs/.test(alert.html || ''), alert && alert.html)
+
+  for (const p of parked) { p.resolve(nestedPreviewResponse({ path: '/etc', includeNested: 'none' })) }
+  await settle()
+  ok('scan race: the stale /etc verdict is DROPPED — /srv still owns the alert',
+    /\/srv\/nfs/.test(alert.html || '') && !/\/etc\/pve/.test(alert.html || ''),
+    alert && alert.html)
+}
+
+/**
+ * K4 — the repository door's namespace prefill must resolve the chosen repo
+ * EXACTLY: ExtJS's default findRecord is a case-insensitive PREFIX match, so
+ * 'pbs' resolved to 'pbs-offsite' (whichever sorts first) and prefilled the
+ * WRONG repo's namespace — which then fails the namespace verify, or backs the
+ * wrong groups list.
+ */
+async function restoreRepoNamespacePrefillCheck() {
+  const routes = {
+    ...ISCSI_ROUTES,
+    'GET /backup/repos': {
+      data: {
+        version: 3,
+        repos: [
+          { name: 'pbs-offsite', host: 'pbs.example', port: 8007, datastore: 'off', authType: 'token', namespace: 'off-ns', credentialsSet: true, source: 'anas' },
+          { name: 'pbs', host: 'pbs.example', port: 8007, datastore: 'main', authType: 'token', namespace: 'main-ns', credentialsSet: true, source: 'anas' },
+        ],
+      },
+    },
+    'GET /backup/repos/pbs/groups': { data: { verdict: 'ok', repository: 'pbs', groups: [] } },
+    'GET /backup/repos/pbs-offsite/groups': { data: { verdict: 'ok', repository: 'pbs-offsite', groups: [] } },
+  }
+  const ANAS = loadSource('68-backup.js', routes)
+  const view = makeComponent({ xtype: 'panel' }, null)
+  ANAS.backupRestore.open(view, 'harness', { repo: 'pbs' })
+  await settle()
+  const dlg = openWindow()
+  ok('ns prefill: the repository door opened with the prefill', !!dlg
+    && dlg.cls === 'anas-win-backup-restore'
+    && dlg.down('#restoreRepo').getValue() === 'pbs', dlg && dlg.down('#restoreRepo').getValue())
+  eq('ns prefill: "pbs" resolves to the pbs ROW — its own namespace prefills',
+    dlg && dlg.down('#restoreNs').getValue(), 'main-ns')
+}
+
+/**
+ * U2 (68-half) — the wizard doors take a trailing onDone, fired ONCE after a
+ * successful save (the iSCSI LUNs window re-reads its backup coverage with
+ * it), and every existing caller keeps working without one.
+ */
+async function taskDoorOnDoneCheck() {
+  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+
+  // Edit door: the stored task round-trips untouched — Save → onDone, once.
+  let done = 0
+  ANAS.backup.openEditTask(view, 'harness', TASK, () => { done++ })
+  await settle()
+  const editDlg = openWindow()
+  ok('onDone: the edit door opened the task wizard', !!editDlg && !!editDlg.down('#taskSubmitBtn'))
+  if (editDlg) {
+    editDlg.down('#taskSubmitBtn').handler(editDlg.down('#taskSubmitBtn'))
+    await settle()
+    eq('onDone: the edit door fires onDone exactly once after the save', done, 1)
+  }
+
+  // New door: same contract, a seeded archive so the form validates.
+  done = 0
+  ANAS.backup.openNewTask(view, 'harness', [{ name: 'etc', path: '/etc' }], null, () => { done++ })
+  await settle()
+  const newDlg = openWindow()
+  ok('onDone: the new door opened the task wizard', !!newDlg && !!newDlg.down('#taskSubmitBtn'))
+  if (newDlg) {
+    newDlg.down('#name').setValue('on-done-task')
+    newDlg.down('#schedule').setValue('daily')
+    newDlg.down('#taskSubmitBtn').handler(newDlg.down('#taskSubmitBtn'))
+    await settle()
+    eq('onDone: the new door fires onDone exactly once after the save', done, 1)
+  }
+}
+
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
@@ -6833,6 +7050,15 @@ created.windows.length = 0
 await detailNestedScanChecks()
 warnings.length = 0
 await runNotesChecks()
+warnings.length = 0
+created.windows.length = 0
+await nestedScanRaceCheck()
+warnings.length = 0
+created.windows.length = 0
+await restoreRepoNamespacePrefillCheck()
+warnings.length = 0
+created.windows.length = 0
+await taskDoorOnDoneCheck()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)
