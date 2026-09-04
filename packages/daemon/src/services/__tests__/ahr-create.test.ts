@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
-import { AHR_ISCSI_ORDERING_OPTION, createAhrPool, ensureAhrTargetOrdering } from '../ahr-create.js'
+import { AHR_ISCSI_DEVICE_TIMEOUT_OPTION, AHR_ISCSI_ORDERING_OPTION, createAhrPool, ensureAhrTargetOrdering } from '../ahr-create.js'
 import { LVM_MIXED_BLOCK_ARGS } from '../ahr-exec.js'
 
 /**
@@ -175,7 +175,9 @@ describe('createAhrPool (Epic 11 + AHR)', () => {
     // The line carries the LIO boot-ordering option from `iscsi.8`: an AHR
     // pool's `nofail` mount has no static anchor a drop-in can name, and losing
     // that race makes LIO create a 0-byte placeholder at an image LUN's path.
-    assert.ok(fstab.includes(`/dev/t2/t2-vol ${join(mountBase, 't2')} btrfs nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service 0 0`), fstab)
+    // It also carries the O3 device-timeout so a pool that never assembles gives
+    // up its `.device` job instead of holding the boot for the 90 s default.
+    assert.ok(fstab.includes(`/dev/t2/t2-vol ${join(mountBase, 't2')} btrfs nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s 0 0`), fstab)
 
     // mdadm.conf gained the ARRAY pin + the monitor PROGRAM hook.
     const conf = await readFile(confPath, 'utf8')
@@ -589,11 +591,31 @@ describe('ensureAhrTargetOrdering - the surgical add for a pool that predates is
     const changed = await ensureAhrTargetOrdering(executor, fstabPath, { name: 'lpahr', mountpoint: '/mnt/anas-ahr/lpahr' })
     assert.equal(changed, true)
     const after = await readFile(fstabPath, 'utf8')
-    assert.ok(after.includes(`/mnt/anas-ahr/lpahr btrfs nofail,subvol=@data,${AHR_ISCSI_ORDERING_OPTION} 0 0`), after)
+    assert.ok(after.includes(`/mnt/anas-ahr/lpahr btrfs nofail,subvol=@data,${AHR_ISCSI_ORDERING_OPTION},${AHR_ISCSI_DEVICE_TIMEOUT_OPTION} 0 0`), after)
     // The OTHER AHR pool has no LUN, so its line is byte-identical.
     assert.ok(after.includes('/dev/other/other-vol /mnt/anas-ahr/other btrfs nofail,subvol=@data 0 0'), after)
     assert.ok(after.includes('UUID=abc / ext4 errors=remount-ro 0 1'), after)
     assert.ok(executor.calls.some(c => c.args.includes('daemon-reload')), 'the mount unit is regenerated')
+  })
+
+  // Live-proof O3: a pool whose device never appears held rtslib-fb-targetctl and
+  // multi-user.target for the 90 s DefaultTimeoutStartSec. The `.device` job is
+  // what waits, so the bound rides on the SAME line as the ordering edge — and it
+  // is added surgically, next to `before=`, with the rest of the line untouched.
+  it('carries the O3 device-timeout alongside the ordering edge, surgically', async () => {
+    await ensureAhrTargetOrdering(executor, fstabPath, { name: 'lpahr', mountpoint: '/mnt/anas-ahr/lpahr' })
+    const after = await readFile(fstabPath, 'utf8')
+    const line = after.split('\n').find(l => l.includes('/mnt/anas-ahr/lpahr'))
+    assert.ok(line, 'the pool line is present')
+    assert.ok(line.includes(AHR_ISCSI_DEVICE_TIMEOUT_OPTION), `device-timeout is on the line: ${line}`)
+    assert.equal(AHR_ISCSI_DEVICE_TIMEOUT_OPTION, 'x-systemd.device-timeout=45s')
+    // Surgical: the pre-existing options and the LV spec/columns are preserved,
+    // the two ANAS tokens are appended in create-time order, and nothing else on
+    // the line moved.
+    assert.equal(
+      line,
+      `${OLD_LINE.replace('nofail,subvol=@data', `nofail,subvol=@data,${AHR_ISCSI_ORDERING_OPTION},${AHR_ISCSI_DEVICE_TIMEOUT_OPTION}`)}`,
+    )
   })
 
   it('is a byte-identical no-op on the second LUN', async () => {

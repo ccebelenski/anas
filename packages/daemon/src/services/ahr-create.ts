@@ -132,8 +132,40 @@ export async function clearGhostMdSignatures(
  * place the pool's identity exists. It was a candidate until live-proof F2
  * showed what losing the race actually costs — not a missing LUN, which is
  * visible, but a LUN serving zeros, which is not.
+ *
+ * The flip side of that ordering edge is what live-proof O3 measured: if the
+ * pool's LV device NEVER appears (its disks were pulled), the `nofail` mount
+ * does not fail the boot, but its `.device` job runs the full
+ * `DefaultTimeoutStartSec` (~90 s) before giving up — and because
+ * `rtslib-fb-targetctl.service` (and `multi-user.target`) are ordered behind
+ * the mount, every iSCSI LUN on the node comes back ~90 s late for a reason
+ * nothing announces. {@link AHR_ISCSI_DEVICE_TIMEOUT_OPTION} bounds that wait.
  */
 export const AHR_ISCSI_ORDERING_OPTION = 'x-systemd.before=rtslib-fb-targetctl.service'
+
+/**
+ * The bound on how long the AHR mount waits for its BACKING DEVICE at boot
+ * (live-proof O3). The 90 s stall O3 measured is not the mount's own timeout —
+ * it is the `.device` job the mount waits on, so `x-systemd.device-timeout=` is
+ * the knob that bounds it (`x-systemd.mount-timeout` would not: the mount never
+ * gets far enough to time out, it is blocked waiting for a device that will
+ * never come). The fstab generator turns this option into
+ * `JobTimeoutSec=`/`TimeoutStartSec=` on the generated `.device` unit, so a
+ * permanently-absent pool gives up here instead of at the 90 s default and
+ * releases `rtslib-fb-targetctl.service` (and `multi-user.target`) that much
+ * sooner.
+ *
+ * The value is a floor over realistic PRESENT-device readiness, not an
+ * aggressively short one: AHR pools are typically spinning disks, and staggered
+ * spin-up + md assembly + LVM activation can take tens of seconds on a cold
+ * boot even when every disk is there. Abandoning a slow-but-present pool would
+ * be the WORSE bug — LIO would restore before the mount is up and place the
+ * 0-byte placeholder {@link AHR_ISCSI_ORDERING_OPTION} exists to prevent. 45 s
+ * halves the absent-device stall while staying comfortably above any legitimate
+ * present-device readiness, so the success path is unchanged; only a device
+ * that is genuinely never coming gives up sooner.
+ */
+export const AHR_ISCSI_DEVICE_TIMEOUT_OPTION = 'x-systemd.device-timeout=45s'
 
 /**
  * The canonical fstab entry for a pool: LV device, btrfs, nofail. When
@@ -144,12 +176,14 @@ export const AHR_ISCSI_ORDERING_OPTION = 'x-systemd.before=rtslib-fb-targetctl.s
  * `changeAhrMountpoint` MUST pass the pool's real layout so a mountpoint move
  * never rewrites a flat pool's line to reference a subvolume it lacks.
  *
- * Every pool created from now on also carries
- * {@link AHR_ISCSI_ORDERING_OPTION}, whether or not it will ever hold a LUN. It
- * costs a boot-time ordering edge on a service that is usually not installed
- * (systemd ignores a `Before=` on a unit that does not exist), and it is the
- * difference between a pool that is mounted when LIO restores and one that
- * silently is not.
+ * Every pool created from now on also carries {@link AHR_ISCSI_ORDERING_OPTION}
+ * and {@link AHR_ISCSI_DEVICE_TIMEOUT_OPTION}, whether or not it will ever hold
+ * a LUN. Together they cost a boot-time ordering edge on a service that is
+ * usually not installed (systemd ignores a `Before=` on a unit that does not
+ * exist) plus a bound on how long an absent device holds the boot (O3); they
+ * are the difference between a pool that is mounted when LIO restores and one
+ * that silently is not, without letting a pool that will never assemble stall
+ * the boot for the full 90 s default.
  */
 function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean): MountEntry {
   return {
@@ -171,8 +205,8 @@ function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean):
         netdev: false,
       },
       passthrough: subvolLayout
-        ? `subvol=${SUBVOL_DATA},${AHR_ISCSI_ORDERING_OPTION}`
-        : AHR_ISCSI_ORDERING_OPTION,
+        ? `subvol=${SUBVOL_DATA},${AHR_ISCSI_ORDERING_OPTION},${AHR_ISCSI_DEVICE_TIMEOUT_OPTION}`
+        : `${AHR_ISCSI_ORDERING_OPTION},${AHR_ISCSI_DEVICE_TIMEOUT_OPTION}`,
     },
     dump: 0,
     pass: 0,
@@ -180,8 +214,9 @@ function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean):
 }
 
 /**
- * Add {@link AHR_ISCSI_ORDERING_OPTION} to an EXISTING pool's fstab line, once,
- * surgically (story `iscsi.8`).
+ * Add {@link AHR_ISCSI_ORDERING_OPTION} and
+ * {@link AHR_ISCSI_DEVICE_TIMEOUT_OPTION} to an EXISTING pool's fstab line,
+ * once, surgically (story `iscsi.8`; device-timeout from live-proof O3).
  *
  * Called at the moment an image LUN is placed on an AHR pool — the moment the
  * ordering starts to matter and not before. Pools that will never hold a LUN are
@@ -190,9 +225,10 @@ function ahrFstabEntry(name: string, mountpoint: string, subvolLayout: boolean):
  *
  * The line is found by MOUNTPOINT or by LV spec, the same pair
  * `changeAhrMountpoint` uses, so an unmounted or hand-edited pool is still
- * matched. `addMountOption` rewrites the options column and nothing else, and is
- * a byte-identical no-op when the option is already there — so this is safe on
- * the second, third and hundredth LUN.
+ * matched. `addMountOption` rewrites the options column and nothing else, one
+ * token at a time, and is a byte-identical no-op when a token is already there —
+ * so this is safe on the second, third and hundredth LUN, and a pool that
+ * predates the device-timeout gains it the next time a LUN lands on it.
  *
  * Returns whether the file changed. Never throws: a pool with no fstab line
  * (someone mounts it by hand) simply gets nothing, and adding a LUN must not
@@ -210,7 +246,11 @@ export async function ensureAhrTargetOrdering(
       const existing = parseFstab(current).find(e => e.mountpoint === pool.mountpoint || e.spec === lvPath)
       if (!existing)
         return current
-      const next = addMountOption(current, existing.mountpoint, AHR_ISCSI_ORDERING_OPTION)
+      // Two tokens, each added idempotently: the ordering edge (iscsi.8) and the
+      // bound on how long an absent device holds the boot (O3). Order matches the
+      // create-time entry — `before=` then `device-timeout=`.
+      const withOrdering = addMountOption(current, existing.mountpoint, AHR_ISCSI_ORDERING_OPTION)
+      const next = addMountOption(withOrdering, existing.mountpoint, AHR_ISCSI_DEVICE_TIMEOUT_OPTION)
       changed = next !== current
       return next
     })
