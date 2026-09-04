@@ -565,6 +565,10 @@
         if (!grid || grid.destroyed || grid.destroying) {
             return;
         }
+        // The view just (re)read the live config — any address cached for this
+        // node may predate a portal/VIP created since, so the next dialog opens
+        // on a fresh read instead (remediation U5).
+        invalidateNodeAddresses(node);
         if (!quiet) {
             try {
                 grid.setLoading(true);
@@ -747,9 +751,21 @@
     // already publishes them at /nodes/<node>/network on the same origin and the
     // same session, which is exactly where the SMB Details "how to connect"
     // strings get theirs — so this reads the same endpoint rather than adding a
-    // second one. Cached per node; any failure degrades to a free-text field.
+    // second one. Cached per node, successes only: a failure is never cached
+    // (one API blip must not silence the picker for the whole session), and the
+    // entry is dropped on every iSCSI view reload (loadTargets) so a dialog
+    // opened after a VIP is created reads the addresses that exist NOW, not the
+    // ones that existed at page load (remediation U5).
 
     var netCache = {};
+
+    function invalidateNodeAddresses(node) {
+        try {
+            delete netCache[node];
+        } catch (e) {
+            // non-fatal
+        }
+    }
 
     function summarizeAddresses(list) {
         var out = [];
@@ -790,7 +806,8 @@
                     cb(info);
                 },
                 failure: function () {
-                    netCache[node] = [];
+                    // NOT cached: a failed read degrades this one dialog to a
+                    // free-text field, and the next dialog tries again.
                     cb([]);
                 }
             });
@@ -1739,18 +1756,20 @@
     }
 
     function portalsChanged(next, stored) {
-        var have = isArray(stored) ? stored : [];
-        if (next.length !== have.length) {
+        // Compare as SORTED key sequences, element-wise — multiplicity counts.
+        // A set-compare (has-any-key) would call [A,B] → [A,A] unchanged and the
+        // dialog would close with the duplicate-portal edit silently dropped;
+        // sending the body is what lets the daemon's own duplicate refusal reach
+        // the operator (remediation U8).
+        var key = function (p) { return ('' + p.address).toLowerCase() + ':' + p.port; };
+        var a = (isArray(next) ? next : []).map(key).sort();
+        var b = (isArray(stored) ? stored : []).map(key).sort();
+        var i;
+        if (a.length !== b.length) {
             return true;
         }
-        var key = function (p) { return ('' + p.address).toLowerCase() + ':' + p.port; };
-        var seen = {};
-        var i;
-        for (i = 0; i < have.length; i++) {
-            seen[key(have[i])] = 1;
-        }
-        for (i = 0; i < next.length; i++) {
-            if (!seen[key(next[i])]) {
+        for (i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) {
                 return true;
             }
         }
@@ -1874,7 +1893,11 @@
             return '<span style="color:gray;" title="'
                 + enc(t('The unit serial could not be read')) + '">&mdash;</span>';
         }
-        return '<span title="' + enc(t('SCSI unit serial — initiators and PVE volids identify this LUN by it'))
+        // The value itself leads the title — a squeezed column clips the cell,
+        // and the never-truncate-ids rule means the tooltip must carry what the
+        // cell would have shown, not only a description of it (remediation U7).
+        return '<span title="' + enc(s + ' — '
+            + t('SCSI unit serial — initiators and PVE volids identify this LUN by it'))
             + '" style="font-family:monospace;font-size:0.88em;">' + enc(s) + '</span>';
     }
 
@@ -2085,12 +2108,31 @@
             var data = res && res.data;
             win.anasBackupTasks = isArray(data) ? data : null;
             applyBackupBadges(win);
+            // The coverage answer is the menu's other input — a fresh answer
+            // (e.g. after a task was just saved through the wizard) rebuilds
+            // the menu that was built on the stale one (U2 + U4).
+            rebuildLunBackupMenu(win);
         }, function () {
             if (win.destroyed || win.destroying) {
                 return;
             }
             win.anasBackupTasks = null; // no badge, nothing gated — fail-open
+            rebuildLunBackupMenu(win);
         });
+    }
+
+    // U2: the onDone handed to the backup wizard's task doors. The wizard is
+    // 68-backup.js's own; older builds ignore the trailing callback entirely,
+    // in which case coverage simply stays as stale as it was before this
+    // existed (fail-open). Newer builds fire it after a successful save — the
+    // LUNs window re-reads coverage so "not backed up" cannot outlive the task
+    // that just started covering it.
+    function afterBackupTaskSaved(win) {
+        return function () {
+            if (win && !win.destroyed && !win.destroying && win.anasNode) {
+                loadBackupCoverage(win, win.anasNode);
+            }
+        };
     }
 
     function applyBackupBadges(win) {
@@ -2143,7 +2185,11 @@
                         handler: function () {
                             var task = backupTaskByName(entries, entry.name);
                             if (ANAS.backup && ANAS.backup.openEditTask && task) {
-                                ANAS.backup.openEditTask(win.anasView, win.anasNode, task);
+                                // U2: trailing onDone (contract added in
+                                // 68-backup.js) — a saved edit re-reads coverage.
+                                // An older wizard ignores it and nothing breaks.
+                                ANAS.backup.openEditTask(win.anasView, win.anasNode, task,
+                                    afterBackupTaskSaved(win));
                             }
                         }
                     });
@@ -2155,9 +2201,44 @@
             text: t('Create backup task…'),
             cls: 'anas-lun-backup-create',
             handler: function () {
-                openBackupTaskForLun(win, win.anasView, win.anasNode, win.anasIqn, rec);
+                // Resolved at CLICK time, not at menu-build time: the menu is
+                // no longer rebuilt on every poll tick (remediation U4), so a
+                // captured record could be a store-detached leftover of an
+                // earlier loadData while another row is selected now.
+                openBackupTaskForLun(win, win.anasView, win.anasNode, win.anasIqn, selectedLun(win));
             }
         }];
+    }
+
+    // (Re)build the "Back up…" button's menu. Deliberately NOT on the 5 s
+    // session poll: `setMenu` destroys the current menu, and a poll-tick
+    // rebuild would demolish an OPEN menu under the cursor. It runs when the
+    // menu's two inputs change — the selection (selectionchange) and the
+    // coverage answer (every loadBackupCoverage, including the U2 re-read) —
+    // and skips the rebuild while the menu is visible, so even a coverage
+    // read landing mid-open cannot close it; a menu shown across a coverage
+    // change is one close/reopen cycle stale, nothing worse.
+    function rebuildLunBackupMenu(win) {
+        try {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var grid = lunsGridOf(win);
+            if (!grid || grid.destroyed || grid.destroying) {
+                return;
+            }
+            var backupBtn = grid.down('#lunBackup');
+            if (!backupBtn || typeof backupBtn.setMenu !== 'function') {
+                return;
+            }
+            var menu = typeof backupBtn.getMenu === 'function' ? backupBtn.getMenu() : null;
+            if (menu && typeof menu.isVisible === 'function' && menu.isVisible()) {
+                return;
+            }
+            backupBtn.setMenu({ items: lunBackupMenuItems(win) });
+        } catch (eMenu) {
+            // non-fatal
+        }
     }
 
     // The "Create backup task…" door (backup2.9): the Backup menu's new-task
@@ -2187,7 +2268,7 @@
                 serial: (rec.get('serial') == null) ? null : ('' + rec.get('serial')),
                 name: '' + (rec.get('name') || ''),
             },
-        });
+        }, afterBackupTaskSaved(win));
     }
 
     // The attribute summary an operator can act on, in words rather than flags.
@@ -2366,16 +2447,10 @@
                         : (!rec.get('backingPath')
                             ? t('The backing path could not be read, so nothing can be backed up from it.')
                             : '')))));
-        // The menu follows the selection: the covering tasks' Run/Edit (the
-        // Backup menu's own doors), or the wizard door.
-        try {
-            var backupBtn = grid.down('#lunBackup');
-            if (backupBtn && typeof backupBtn.setMenu === 'function') {
-                backupBtn.setMenu({ items: lunBackupMenuItems(win) });
-            }
-        } catch (eMenu) {
-            // non-fatal
-        }
+        // The menu is rebuilt where its inputs change — selectionchange and
+        // loadBackupCoverage (rebuildLunBackupMenu) — never here:
+        // updateLunButtons runs on every 5 s poll tick, and a setMenu here
+        // would destroy an OPEN "Back up…" menu under the cursor (U4).
     }
 
     function loadLuns(win, node, iqn, quiet) {
@@ -2727,6 +2802,9 @@
                             selectionchange: function (selModel, selected) {
                                 var w = this.up();
                                 updateLunButtons(w);
+                                // The menu's other input is the selection: rebuild
+                                // here, never on the poll tick (U4).
+                                rebuildLunBackupMenu(w);
                                 try {
                                     var rec2 = (selected && selected.length) ? selected[0] : null;
                                     var attrs = w.down('#lunAttributes');

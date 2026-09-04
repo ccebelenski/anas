@@ -432,6 +432,15 @@
         }
     }
 
+    // Clear the shared tree loading mask; every loadLevel exit path needs it.
+    function clearPickerLoading(win) {
+        try {
+            win.down('#pickerTree').setLoading(false);
+        } catch (e) {
+            // tree not available (window closing)
+        }
+    }
+
     // Append one level's rows under a tree node, replacing whatever was there.
     function fillNode(node, rows) {
         try {
@@ -463,24 +472,26 @@
      * Load one level into a tree node. Every failure is reported in the note
      * line and leaves the node collapsed — a picker that says why beats a picker
      * that silently shows nothing.
+     *
+     * Each load stamps the window's monotonic navigation counter (win._nav, U6);
+     * a response that lands after a NEWER load started is dropped — filling a
+     * slow directory in would show rows the breadcrumb no longer names.
      */
     function loadLevel(win, node) {
         var backend = win._backend;
         var path = node.get('path') || '/';
+        var stamp = (win._nav = (win._nav || 0) + 1);
         try {
             win.down('#pickerTree').setLoading(true);
         } catch (e) {
             // non-fatal
         }
         return backend.load(path).then(function (level) {
-            if (win.destroyed || win.destroying) {
+            if (win.destroyed || win.destroying || stamp !== win._nav) {
+                clearPickerLoading(win);
                 return;
             }
-            try {
-                win.down('#pickerTree').setLoading(false);
-            } catch (e2) {
-                // non-fatal
-            }
+            clearPickerLoading(win);
             fillNode(node, level.rows);
             var notes = [];
             if (level.truncated) {
@@ -491,14 +502,11 @@
             }
             setNote(win, notes.join(' — '), !!level.truncated);
         }, function (err) {
-            if (win.destroyed || win.destroying) {
+            if (win.destroyed || win.destroying || stamp !== win._nav) {
+                clearPickerLoading(win);
                 return;
             }
-            try {
-                win.down('#pickerTree').setLoading(false);
-            } catch (e3) {
-                // non-fatal
-            }
+            clearPickerLoading(win);
             node.set('loaded', false);
             setNote(win, t('Could not read') + ' ' + path + ': ' + errText(err), true);
         });

@@ -252,35 +252,52 @@
         return idx >= 0 ? name.substring(idx + 1) : name;
     }
 
+    // The ONE list of dataset fields that land on a tree node — everything a
+    // row renderer or the toolbar can gate on. nodeFromDataset builds fresh
+    // nodes from it and applyDatasetData refreshes existing rows with it, so a
+    // field added here reaches BOTH paths or neither: no third field can be
+    // merged onto a child row and dropped from the pool root again (that is
+    // exactly how heldByLun went missing on the root and lost its Rollback
+    // gate — remediation U3).
+    var DATASET_NODE_FIELDS = [
+        'type',
+        'used',
+        'available',
+        'referenced',
+        'mountpoint',
+        'compression',
+        'compressratio',
+        'quota',
+        // Epic 4.4 / 15.4: protocols sharing this dataset (['smb'|'nfs'])
+        // and its snapshot count, from the enriched flat feed. Optional —
+        // absent on older daemons, in which case the badges/chip degrade.
+        'sharedOver',
+        'snapshotCount',
+        // Story iscsi.3: zvol facts. Present only on `type === 'volume'`
+        // rows and only from a daemon that knows about them — the renderers
+        // and the toolbar all treat `undefined` as "unknown", never as 0.
+        'volsize',
+        'volblocksize',
+        'sparse',
+        // Story iscsi.6: the iSCSI LUN holding this row — the zvol itself,
+        // an image file under a filesystem's mountpoint, or a child zvol.
+        // Absent ⇒ undefined ⇒ nothing is gated (version-skew ruling).
+        'heldByLun',
+    ];
+
+    function applyDatasetFields(node, ds) {
+        for (var i = 0; i < DATASET_NODE_FIELDS.length; i++) {
+            var f = DATASET_NODE_FIELDS[i];
+            node[f] = ds[f];
+        }
+    }
+
     function nodeFromDataset(ds, kind, poolSize, pveManaged) {
-        return {
+        var node = {
             name: lastSegment(ds.name),
             fullName: ds.name,
             pool: ds.pool,
             kind: kind,
-            type: ds.type,
-            used: ds.used,
-            available: ds.available,
-            referenced: ds.referenced,
-            mountpoint: ds.mountpoint,
-            compression: ds.compression,
-            compressratio: ds.compressratio,
-            quota: ds.quota,
-            // Epic 4.4 / 15.4: protocols sharing this dataset (['smb'|'nfs'])
-            // and its snapshot count, from the enriched flat feed. Optional —
-            // absent on older daemons, in which case the badges/chip degrade.
-            sharedOver: ds.sharedOver,
-            snapshotCount: ds.snapshotCount,
-            // Story iscsi.3: zvol facts. Present only on `type === 'volume'`
-            // rows and only from a daemon that knows about them — the renderers
-            // and the toolbar all treat `undefined` as "unknown", never as 0.
-            volsize: ds.volsize,
-            volblocksize: ds.volblocksize,
-            sparse: ds.sparse,
-            // Story iscsi.6: the iSCSI LUN holding this row — the zvol itself,
-            // an image file under a filesystem's mountpoint, or a child zvol.
-            // Absent ⇒ undefined ⇒ nothing is gated (version-skew ruling).
-            heldByLun: ds.heldByLun,
             // Total capacity of the owning pool (bytes) — feeds the "Space of
             // pool" gfx bar (Epic 15.4). Threaded from the GET /pools summary.
             poolSize: poolSize,
@@ -294,22 +311,12 @@
             leaf: true,
             children: [],
         };
+        applyDatasetFields(node, ds);
+        return node;
     }
 
     function applyDatasetData(node, ds) {
-        node.type = ds.type;
-        node.used = ds.used;
-        node.available = ds.available;
-        node.referenced = ds.referenced;
-        node.mountpoint = ds.mountpoint;
-        node.compression = ds.compression;
-        node.compressratio = ds.compressratio;
-        node.quota = ds.quota;
-        node.sharedOver = ds.sharedOver;
-        node.snapshotCount = ds.snapshotCount;
-        node.volsize = ds.volsize;
-        node.volblocksize = ds.volblocksize;
-        node.sparse = ds.sparse;
+        applyDatasetFields(node, ds);
     }
 
     // Ensure an intermediate parent node exists for parentName (defensive — in
