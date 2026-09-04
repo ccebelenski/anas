@@ -4,7 +4,9 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { MockExecutor } from '../mock.js'
 import { ProdExecutor } from '../prod.js'
+import type { ExecStreamOptions } from '../types.js'
 
 /**
  * `ProdExecutor.execToStream` — REAL processes, real file descriptors.
@@ -147,5 +149,74 @@ describe('ProdExecutor.execToStream (real processes, real fds)', () => {
       exec.execToStream('/no/such/binary/xyz', [], { path: join(dir, 'out.raw'), flags: 'w' }),
       (err: NodeJS.ErrnoException) => err.code === 'ENOENT',
     )
+  })
+
+  it('carries the SIGNAL NAME of a killed child through (D5)', async () => {
+    // A signal death has no exit code, so the plain 1 it is reported as says
+    // nothing about HOW the child ended. `kill -9 $$` is the honest stand-in
+    // for a killed pbc: progress on stderr, no error, SIGKILL.
+    const exec = new ProdExecutor()
+    const r = await exec.execToStream(SH, ['-c', 'kill -9 $$'], { path: join(dir, 'out.raw'), flags: 'w' })
+    assert.equal(r.exitCode, 1)
+    assert.equal(r.signal, 'SIGKILL')
+    assert.equal(r.bytesWritten, 0)
+  })
+})
+
+describe('MockExecutor.execToStream (fixture resolution mirrors exec)', () => {
+  it('a command-only fixture registered FIRST does not shadow a later specific one', async () => {
+    // exec() resolves fixtures in two passes — exact command+args first, then
+    // the command-only fallback. execToStream matched in registration order,
+    // so a catch-all registered early silently won over a specific fixture
+    // registered after it and the test exercised the wrong result. Same
+    // two-pass rule now applies here (D8, REMEDIATION-0.3.1).
+    const exec = new MockExecutor()
+    exec.addStreamFixture({
+      command: '/usr/bin/dd',
+      result: { stderr: 'catch-all', exitCode: 0, bytesWritten: 0 },
+    })
+    exec.addStreamFixture({
+      command: '/usr/bin/dd',
+      args: ['if=image.raw', 'of=/dev/vg0/lun0'],
+      result: { stderr: 'specific', exitCode: 0, bytesWritten: 42 },
+    })
+
+    const r = await exec.execToStream(
+      '/usr/bin/dd',
+      ['if=image.raw', 'of=/dev/vg0/lun0'],
+      { path: '/tmp/unused', flags: 'w' },
+    )
+    assert.equal(r.stderr, 'specific')
+    assert.equal(r.bytesWritten, 42)
+  })
+
+  it('a fixture replaying a KILLED child carries the signal name through (D5)', async () => {
+    const exec = new MockExecutor()
+    exec.addStreamFixture({
+      command: '/usr/bin/pbc',
+      result: { stderr: 'progress 22% (55.0 MiB of 250.0 MiB in 16s)\r', exitCode: 1, bytesWritten: 1000, signal: 'SIGKILL' },
+    })
+    const r = await exec.execToStream('/usr/bin/pbc', [], { path: '/tmp/unused', flags: 'w' })
+    assert.equal(r.signal, 'SIGKILL')
+  })
+
+  it('stdin is NOT a stream option — a secret-via-stdin caller cannot compile (D6)', async () => {
+    // `execToStream` starts the child with `stdio: ['ignore', …]`: nothing can
+    // be fed to its stdin, so advertising the inherited option was a lie a
+    // future secret-via-stdin caller would have hit silently. The option is
+    // omitted from ExecStreamOptions, and the `@ts-expect-error` below is the
+    // compile-time proof — on the OLD interface (stdin still inherited) this
+    // file does not compile, because the expectation is then unused.
+    const exec = new MockExecutor()
+    exec.addStreamFixture({
+      command: '/usr/bin/dd',
+      result: { stderr: '', exitCode: 0, bytesWritten: 0 },
+    })
+    const opts: ExecStreamOptions = {
+      // @ts-expect-error stdin is deliberately omitted from ExecStreamOptions (D6)
+      stdin: 'a-secret-that-must-not-be-silently-ignored',
+    }
+    const r = await exec.execToStream('/usr/bin/dd', [], { path: '/tmp/unused', flags: 'w' }, opts)
+    assert.equal(r.exitCode, 0)
   })
 })

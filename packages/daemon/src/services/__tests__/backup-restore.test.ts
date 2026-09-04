@@ -378,6 +378,32 @@ describe('explainRestoreFailure — the real taxonomy (GT-56)', () => {
       /dropped part-way through the image/,
     )
   })
+
+  it('a KILLED client says HOW it ended, never a progress line (D5)', () => {
+    // Live-proof F16 for the image door: a killed pbc leaves only progress on
+    // stderr, and a progress line is not a reason. The executor's signal name
+    // is the only honest record of what happened.
+    const stderr = 'progress 22% (55.001 MiB of 250.001 MiB in 16.1s, 3.097 MiB/s)    \r'
+    const said = explainRestoreFailure(stderr, 'SIGKILL')
+    assert.match(said, /killed by SIGKILL/)
+    assert.ok(!said.includes('progress 22%'), 'the progress line must not be quoted as the reason')
+  })
+
+  it('a client that said something real before dying keeps its words (D5)', () => {
+    const stderr = 'progress 22% (55.001 MiB of 250.001 MiB in 16.1s, 3.097 MiB/s)    \rError: archive not found in manifest'
+    assert.match(explainRestoreFailure(stderr, 'SIGKILL'), /holds no archive by that name/)
+  })
+
+  it('the auth-vs-privileges split is the ONE classifier\'s (R5)', () => {
+    // A bare `permission check failed` is a REJECTED credential — an
+    // authentication failure, not a Datastore.Audit problem.
+    const bare = explainRestoreFailure('Error: permission check failed.')
+    assert.match(bare, /authentication failure/)
+    assert.ok(!/not allowed to read this datastore/.test(bare))
+    // The `- missing` suffix keeps the privileges wording.
+    const privs = explainRestoreFailure('Error: permission check failed - missing Datastore.Audit|Datastore.Backup on /datastore/anastest-store/gtrestore')
+    assert.match(privs, /not allowed to read this datastore/)
+  })
 })
 
 // ============================================================================

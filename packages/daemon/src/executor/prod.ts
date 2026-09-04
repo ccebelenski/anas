@@ -234,7 +234,7 @@ export class ProdExecutor implements CommandExecutor {
       let stderr = ''
       let settled = false
 
-      const settle = (exitCode: number): void => {
+      const settle = (exitCode: number, signal?: string): void => {
         if (settled)
           return
         settled = true
@@ -247,7 +247,7 @@ export class ProdExecutor implements CommandExecutor {
             reject(err)
             return
           }
-          resolve({ stderr, exitCode, bytesWritten })
+          resolve({ stderr, exitCode, bytesWritten, ...(signal ? { signal } : {}) })
         })
       }
 
@@ -265,10 +265,12 @@ export class ProdExecutor implements CommandExecutor {
         reject(err)
       })
 
-      child.on('close', (code) => {
+      child.on('close', (code, signal) => {
         // A signal kill leaves no numeric code; report it as a failure rather
-        // than inventing a zero.
-        settle(code === null ? 1 : code)
+        // than inventing a zero — and carry the signal NAME through (D5): it is
+        // the only record of how the process ended, and a killed image restore
+        // must say "killed by SIGKILL", not quote a progress line as its reason.
+        settle(code === null ? 1 : code, signal ?? undefined)
       })
     })
   }

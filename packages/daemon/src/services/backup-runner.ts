@@ -875,6 +875,32 @@ export function skippedNotices(
 // --- Test-endpoint verdict (the pbc probe stage) ----------------------------
 
 /**
+ * The ONE auth-vs-privileges split for pbc's `permission check failed` family
+ * (R5, single source of truth).
+ *
+ * PBS says BOTH with the same opening words and only the suffix separates them:
+ *
+ *   - `permission check failed - missing Datastore.Audit|…` — the credential
+ *     AUTHENTICATED but lacks privileges. A permissions problem;
+ *   - bare `permission check failed` — the credential was REJECTED (a wrong
+ *     password looks exactly like this). An authentication problem.
+ *
+ * The `- missing` suffix must be tested first (a bare regex matches both).
+ * Every door that renders this family — the repo test verdict below, the
+ * restore-read classifier, the image-restore explainer — takes its answer from
+ * here, so the wording can never drift back apart.
+ */
+export type PermissionFailureKind = 'missing-privileges' | 'authentication'
+
+export function classifyPermissionFailure(stderr: string): PermissionFailureKind | null {
+  if (PERM_MISSING_RE.test(stderr))
+    return 'missing-privileges'
+  if (PERM_FAILED_RE.test(stderr))
+    return 'authentication'
+  return null
+}
+
+/**
  * Map the pbc probe result (AFTER the daemon's own dns/tcp/tls stages pass) to a
  * test verdict. Order matters: the token no-ACL `- missing` suffix must be
  * checked before the generic `permission check failed`. There is no separate
@@ -889,9 +915,12 @@ export function classifyTestVerdict(exitCode: number, stderr: string): BackupRep
     return { stage: 'datastore', detail: firstErrorLine(s) }
   if (NAMESPACE_RE.test(s))
     return { stage: 'namespace', detail: firstErrorLine(s) }
-  if (PERM_MISSING_RE.test(s))
+  // The auth-vs-privileges split lives in ONE classifier (R5) — shared with the
+  // restore-read and image-restore doors.
+  const perm = classifyPermissionFailure(s)
+  if (perm === 'missing-privileges')
     return { stage: 'auth', detail: 'Authenticated, but the token is missing the required Datastore privileges.' }
-  if (PERM_FAILED_RE.test(s))
+  if (perm === 'authentication')
     return { stage: 'auth', detail: 'Authentication failed — check the password.' }
   if (AUTH_FAILED_RE.test(s))
     return { stage: 'auth', detail: 'Authentication failed — check the token id/secret (a revoked token looks the same).' }

@@ -13,7 +13,7 @@ import { constants } from 'node:fs'
 import { stat, unlink } from 'node:fs/promises'
 import { buildCreateArgs } from '../routes/datasets.js'
 import { ensureAhrTargetOrdering } from './ahr-create.js'
-import { PBC } from './backup-runner.js'
+import { classifyPermissionFailure, PBC } from './backup-runner.js'
 import { backstorePath, createAndMapLun, createSparseImage, newSerial, runTargetcli, saveIscsiConfig, setIscsiTargetState, tpgPath, withIscsiLock, ZFS, zvolDataset } from './iscsi-mutate.js'
 
 /**
@@ -263,14 +263,41 @@ export function firstRestoreError(stderr: string): string {
 }
 
 /**
+ * Does the image restore's stderr hold anything usable as a REASON? Progress
+ * alone is silence (live-proof F16): a killed pbc's last words are
+ * `progress 22% (…)`, and quoting that as the failure reads as though the
+ * progress WAS the reason.
+ */
+export function hasImageRestoreErrorText(stderr: string): boolean {
+  for (const raw of stderr.split(LINE_SPLIT_RE)) {
+    const line = raw.replace(TRAILING_WS_RE, '').trim()
+    if (!line)
+      continue
+    if (PROGRESS_RE.test(line) || COMPLETE_RE.test(line))
+      continue
+    return true
+  }
+  return false
+}
+
+/**
  * Turn a failed restore into a sentence that says what to do next.
  *
  * Three of these collapse on the client side and the message says so rather
  * than pretending to a precision pbc does not have: a missing SNAPSHOT, a
  * missing GROUP and a missing NAMESPACE all produce the identical
  * `snapshot …/… does not exist.` string (GT-56).
+ *
+ * `signal` is the executor's record of a signal death (D5): when the client was
+ * killed and left nothing but progress behind, the reason is HOW it ended —
+ * `the client was killed by SIGKILL` — never the progress line, which is not a
+ * reason. A client that said something real before dying keeps its words.
  */
-export function explainRestoreFailure(stderr: string): string {
+export function explainRestoreFailure(stderr: string, signal?: string): string {
+  if (signal && !hasImageRestoreErrorText(stderr)) {
+    return `The image restore was interrupted - the client was killed by ${signal} `
+      + 'and reported no error of its own; what reached the target is whatever its last progress line claimed.'
+  }
   const line = firstRestoreError(stderr)
   if (NO_SNAPSHOT_RE.test(stderr)) {
     return `${line} The client reports a missing snapshot, a missing group and a missing NAMESPACE `
@@ -280,6 +307,14 @@ export function explainRestoreFailure(stderr: string): string {
     return `${line} That snapshot exists but holds no archive by that name.`
   if (BAD_SUFFIX_RE.test(stderr))
     return `${line} A whole-image restore needs the '<name>.img' archive name, not the stored '.img.fidx' file name.`
+  // The auth-vs-privileges split is the ONE classifier's (R5): a bare
+  // `permission check failed` is a REJECTED credential, not a permissions
+  // problem, and must not read as the Datastore.Audit wording.
+  const perm = classifyPermissionFailure(stderr)
+  if (perm === 'missing-privileges')
+    return `${line} The repository's credential authenticated but is not allowed to read this datastore/namespace.`
+  if (perm === 'authentication')
+    return `${line} PBS rejected the credential - this is an authentication failure, not a permissions problem (check the password, or the token id and secret).`
   if (NO_PERM_RE.test(stderr))
     return `${line} The repository's credential authenticated but is not allowed to read this datastore/namespace.`
   if (CERT_RE.test(stderr))
@@ -621,7 +656,7 @@ export async function runImageRestore(
       duration = progress.complete
 
     if (r.exitCode !== 0) {
-      const detail = explainRestoreFailure(r.stderr)
+      const detail = explainRestoreFailure(r.stderr, r.signal)
       if (bytesWritten > 0) {
         // The half-written state, stated in the words the story asks for. The
         // device has no marker of its own; this sentence IS the record.
@@ -875,7 +910,7 @@ export async function runNewLunImageRestore(
       duration = progress.complete
 
     if (r.exitCode !== 0) {
-      const detail = explainRestoreFailure(r.stderr)
+      const detail = explainRestoreFailure(r.stderr, r.signal)
       if (bytesWritten > 0) {
         throw new Error(
           `the image was partially written (${written.estimated ? 'at least ' : ''}${bytesWritten} `

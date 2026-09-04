@@ -12,7 +12,7 @@ import {
   composeSnapshotId,
   snapshotTimeIso,
 } from '@anas/shared'
-import { buildBackupEnv, firstErrorLine, PBC } from './backup-runner.js'
+import { buildBackupEnv, classifyPermissionFailure, firstErrorLine, PBC } from './backup-runner.js'
 
 /**
  * Backup RESTORE READS (story backup2.5) — the point-in-time and group listings
@@ -88,11 +88,33 @@ export function classifyBackupReadVerdict(
       detail: 'The Proxmox Backup Server did not answer in time - the request was cancelled.',
     }
   }
-  if (PERM_NONE_RE.test(stderr) || PERM_CHECK_RE.test(stderr)) {
+  if (PERM_NONE_RE.test(stderr)) {
     return {
       verdict: 'permission',
       detail: `The credential lacks read access to this datastore/namespace - PBS wants `
         + `Datastore.Audit or Datastore.Backup (${firstErrorLine(stderr)}).`,
+    }
+  }
+  // The auth-vs-privileges split is the ONE classifier's (R5): the `- missing`
+  // suffix means an authenticated-but-unauthorized credential (a permissions
+  // problem); the BARE `permission check failed` means the credential was
+  // REJECTED — a wrong password — and must not read as the Datastore.Audit
+  // wording. There is no auth verdict in the read set, so a rejected
+  // credential folds into `error` with the credential wording, the same fold
+  // the repo test makes into its `auth` stage.
+  const perm = classifyPermissionFailure(stderr)
+  if (perm === 'missing-privileges') {
+    return {
+      verdict: 'permission',
+      detail: `The credential lacks read access to this datastore/namespace - PBS wants `
+        + `Datastore.Audit or Datastore.Backup (${firstErrorLine(stderr)}).`,
+    }
+  }
+  if (perm === 'authentication') {
+    return {
+      verdict: 'error',
+      detail: `PBS rejected the credential before any listing - this is an authentication failure, not a `
+        + `permissions problem (check the password, or the token id and secret). (${firstErrorLine(stderr)})`,
     }
   }
   if (CONNECT_RE.test(stderr)) {

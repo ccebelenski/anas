@@ -48,6 +48,10 @@ export interface MockStreamFixture {
   command: string
   /** Args pattern to match. If omitted, matches any args for this command. */
   args?: string[]
+  /**
+   * The result, verbatim — including `signal` (D5): a fixture replaying a
+   * killed child carries the signal NAME the real executor would report.
+   */
   result: ExecStreamResult
   /** Simulate a process that could not start / a target that could not open. */
   throws?: Error
@@ -181,10 +185,18 @@ export class MockExecutor implements CommandExecutor {
     this.calls.push({ command, args })
     this.streamCalls.push({ command, args, target })
 
-    const match = this.streamFixtures.find(
-      f => f.command === command
-        && (f.args === undefined
-          || (f.args.length === args.length && f.args.every((a, i) => a === args[i]))),
+    // Try exact match (command + args) first, then command-only match —
+    // mirroring exec() so a catch-all fixture registered early cannot shadow a
+    // specific one registered later.
+    const exactMatch = this.streamFixtures.find(
+      f =>
+        f.command === command
+        && f.args !== undefined
+        && f.args.length === args.length
+        && f.args.every((a, i) => a === args[i]),
+    )
+    const match = exactMatch ?? this.streamFixtures.find(
+      f => f.command === command && f.args === undefined,
     )
     if (!match) {
       return {

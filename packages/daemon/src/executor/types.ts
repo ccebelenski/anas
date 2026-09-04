@@ -65,10 +65,26 @@ export interface ExecStreamResult {
   exitCode: number
   /** Bytes the write stream put on the target — the partial-write evidence. */
   bytesWritten: number
+  /**
+   * The POSIX signal name that killed the child (`SIGKILL`), when one did —
+   * the same field {@link ExecResult} carries, for the same reason: a signal
+   * death has NO exit code, so this is the only honest record of how the
+   * process ended, and a killed image restore must say so instead of quoting
+   * its last progress line as the reason (live-proof F16, D5).
+   */
+  signal?: string
 }
 
-/** Optional options for a streaming exec. */
-export interface ExecStreamOptions extends ExecOptions {
+/**
+ * Optional options for a streaming exec.
+ *
+ * `stdin` is deliberately OMITTED from the inherited {@link ExecOptions}:
+ * `execToStream` starts the child with `stdio: ['ignore', …]` and nothing can
+ * be fed to it, so advertising the option was a lie a future secret-via-stdin
+ * caller would have hit the hard way — compiled, shipped, silently ignored.
+ * Omitting it makes that caller a compile error (D6).
+ */
+export interface ExecStreamOptions extends Omit<ExecOptions, 'stdin'> {
   /**
    * Called with each chunk of the child's STDERR as it arrives. pbc emits its
    * restore progress there, CR-terminated, at a roughly doubling interval

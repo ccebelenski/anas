@@ -100,6 +100,23 @@ describe('backup2.10 — the restore-elsewhere request shape', () => {
   })
 
   describe('image — the newLun door', () => {
+    it('an unparseable rate is refused at the boundary — the SAME schema as the files door (R4)', () => {
+      // The image door's `rate` used to be `z.string().max(32)`: any text up to
+      // 32 chars parsed, then rode onto pbc's `--rate` argv. It is the files
+      // door's BackupRateLimit now, so garbage is a 400 at the boundary.
+      const bad = firstIssue(BackupRestoreRequest.safeParse(imageBase({
+        target: { mode: 'newLun', targetIqn: IQN, name: 'newvol', backing: { kind: 'zvol', pool: 'tank' } },
+        rate: 'as fast as possible',
+      })))
+      assert.match(bad, /rate: /)
+      assert.match(bad, /byte rate/)
+      const good = BackupRestoreRequest.safeParse(imageBase({
+        target: { mode: 'newLun', targetIqn: IQN, name: 'newvol', backing: { kind: 'zvol', pool: 'tank' } },
+        rate: '50MiB',
+      }))
+      assert.ok(good.success, good.success ? '' : good.error.message)
+    })
+
     it('parses with a zvol backing and no in-place LUN', () => {
       const result = BackupRestoreRequest.safeParse(imageBase({
         target: { mode: 'newLun', targetIqn: IQN, name: 'newvol', backing: { kind: 'zvol', pool: 'tank' } },

@@ -52,21 +52,63 @@ function noop(): void {}
 // ---------------------------------------------------------------------------
 
 /**
+ * The exists-family both backends collide with (GT-probed on ZFS:
+ * `cannot create snapshot 'ds@name': dataset already exists`; btrfs prints the
+ * destination path with `File exists`).
+ */
+const ALREADY_EXISTS_RE = /already exists|file exists/i
+
+/**
+ * Is this take failure the same-second-restart collision (B1)?
+ *
+ * A run restarted within the same wall-clock second as a crashed one generates
+ * the IDENTICAL label: the stale sweep cannot take the leftover (its cutoff is
+ * strictly `<`) and the take cannot create it — the whole job then fails on an
+ * opaque "already exists". The leftover is THIS run's own transient by
+ * construction (it carries this run's label), so the guard is deliberately
+ * narrow: the error must be the exists family, the label must PARSE as a
+ * transient name (we never destroy-and-retake a label we cannot prove ours),
+ * and — on ZFS, where the error text is proven to name the snapshot — it must
+ * name exactly this `dataset@label`. Anything else fails as before.
+ */
+function ownLabelCollision(err: unknown, label: string, named?: string): boolean {
+  const text = err instanceof Error ? err.message : String(err)
+  if (!ALREADY_EXISTS_RE.test(text))
+    return false
+  if (parseTransientBackupSnapshot(label) === null)
+    return false
+  return named === undefined || text.includes(named)
+}
+
+/**
  * Take the ZFS transient snapshot for one source — always `-r`. The label is
  * the run's, shared by every dataset in the subtree, which is exactly what makes
  * `<child mountpoint>/.zfs/snapshot/<label>` predictable for the expansion.
+ *
+ * On an exists collision with THIS run's own label the leftover is destroyed
+ * and the take retried ONCE (B1); a retake that also fails throws its own
+ * error, honestly.
  */
 export async function takeZfsTransient(
   executor: CommandExecutor,
   dataset: string,
   label: string,
 ): Promise<TakenSnapshot> {
-  await createZfsSnapshot(executor, { dataset, name: label, recursive: true })
+  const full = zfsSnapshotFullName(dataset, label)
+  try {
+    await createZfsSnapshot(executor, { dataset, name: label, recursive: true })
+  }
+  catch (err) {
+    if (!ownLabelCollision(err, label, full))
+      throw err
+    await destroyZfsSnapshot(executor, { dataset, name: label, recursive: true })
+    await createZfsSnapshot(executor, { dataset, name: label, recursive: true })
+  }
   return {
     backend: 'zfs',
     name: label,
     target: dataset,
-    full: zfsSnapshotFullName(dataset, label),
+    full,
     recursive: true,
   }
 }
@@ -74,6 +116,10 @@ export async function takeZfsTransient(
 /**
  * Take one AHR read-only snapshot. `subvolume` is the `@data`-relative path when
  * this snapshot covers a NESTED subvolume rather than `@data` itself.
+ *
+ * Same-second-restart collision handling as the ZFS take (B1): this run's own
+ * leftover label is deleted and the take retried once, honestly failing if the
+ * retake fails too.
  */
 export async function takeAhrTransient(
   executor: CommandExecutor,
@@ -83,10 +129,19 @@ export async function takeAhrTransient(
   updateProgress: (message: string) => void = noop,
   opts?: BackupSnapshotOptions,
 ): Promise<TakenSnapshot> {
-  await createAhrSnapshot(executor, pool, label, updateProgress, {
+  const take = (): Promise<unknown> => createAhrSnapshot(executor, pool, label, updateProgress, {
     ...opts,
     ...(subvolume ? { subvolume } : {}),
   })
+  try {
+    await take()
+  }
+  catch (err) {
+    if (!ownLabelCollision(err, label))
+      throw err
+    await deleteAhrSnapshot(executor, pool, label, updateProgress, opts)
+    await take()
+  }
   return {
     backend: 'ahr',
     name: label,

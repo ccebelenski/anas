@@ -163,6 +163,61 @@ describe('transient snapshot lifecycle (backup2.3)', () => {
     assert.equal(taken.backend, 'zfs')
   })
 
+  // ---- the same-second-restart collision (B1) ----------------------------
+
+  function collisionMock(retakeSucceeds = true): MockExecutor {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: ZFS,
+      args: ['snapshot', '-r', `tank/media@${LABEL}`],
+      results: [
+        // First take: a crashed run of THIS task died in the same wall-clock
+        // second, so the label is already there. (The proven zfs wording.)
+        { stdout: '', stderr: `cannot create snapshot 'tank/media@${LABEL}': dataset already exists\n`, exitCode: 1 },
+        retakeSucceeds
+          ? { stdout: '', stderr: '', exitCode: 0 }
+          : { stdout: '', stderr: 'cannot destroy: dataset is busy\n', exitCode: 1 },
+      ],
+    })
+    mock.addFixture({
+      command: ZFS,
+      args: ['destroy', '-r', `tank/media@${LABEL}`],
+      result: { stdout: '', stderr: '', exitCode: 0 },
+    })
+    return mock
+  }
+
+  it('a same-second restart DESTROYS its own leftover label and retakes once (B1)', async () => {
+    const mock = collisionMock()
+    const taken = await takeZfsTransient(mock, 'tank/media', LABEL)
+    assert.equal(taken.full, `tank/media@${LABEL}`)
+    assert.deepEqual(mock.calls.map(c => c.args), [
+      ['snapshot', '-r', `tank/media@${LABEL}`],
+      ['destroy', '-r', `tank/media@${LABEL}`],
+      ['snapshot', '-r', `tank/media@${LABEL}`],
+    ])
+  })
+
+  it('a retake that also fails is an HONEST failure, not a swallowed one (B1)', async () => {
+    const mock = collisionMock(false)
+    await assert.rejects(
+      () => takeZfsTransient(mock, 'tank/media', LABEL),
+      /dataset is busy/,
+    )
+  })
+
+  it('an exists collision on a label that is NOT this run\'s transient is never retaken (B1)', async () => {
+    // The guard: a label that does not parse as a transient name is never
+    // destroyed by the take path — the error propagates as before.
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: ZFS,
+      result: { stdout: '', stderr: `cannot create snapshot 'tank/media@nightly': dataset already exists\n`, exitCode: 1 },
+    })
+    await assert.rejects(() => takeZfsTransient(mock, 'tank/media', 'nightly'), /dataset already exists/)
+    assert.ok(!mock.calls.some(c => c.args[0] === 'destroy'))
+  })
+
   it('destroy is recursive too, and runs in REVERSE order', async () => {
     const mock = new MockExecutor()
     mock.addFixture({ command: ZFS, result: { stdout: '', stderr: '', exitCode: 0 } })
@@ -318,6 +373,35 @@ describe('AHR transient snapshots (backup2.3, GT-52)', () => {
       assert.deepEqual(mock.calls.filter(c => c.command === UMOUNT).map(c => c.args), [['--', top]])
       assert.equal(taken.backend, 'ahr')
       assert.equal(taken.full, `ahr1:@snapshots/${LABEL}`)
+    })
+  })
+
+  it('an AHR take destroys its own leftover @snapshots label and retakes once (B1)', async () => {
+    // Same-second restart, AHR flavour: the crashed run left @snapshots/<label>
+    // and this run's sweep cannot take it (strict `<` cutoff), so the take
+    // deletes its OWN label and retries once.
+    await withTempRuntime(async (runtimeDir) => {
+      const mock = new MockExecutor()
+      const top = join(runtimeDir, 'ahr1.toplevel')
+      mock.addFixture({ command: MOUNT, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: UMOUNT, result: { stdout: '', stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: FINDMNT, result: { stdout: '', stderr: '', exitCode: 1 } })
+      // BTRFS call order: create (collision), delete, retake.
+      mock.addFixture({
+        command: BTRFS,
+        results: [
+          { stdout: '', stderr: `ERROR: create subvolume: '${join(top, '@snapshots', LABEL)}': File exists\n`, exitCode: 1 },
+          { stdout: '', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: '', exitCode: 0 },
+        ],
+      })
+      const taken = await takeAhrTransient(mock, pool('ahr1'), LABEL, undefined, () => {}, { runtimeDir })
+      assert.equal(taken.full, `ahr1:@snapshots/${LABEL}`)
+      assert.deepEqual(mock.calls.filter(c => c.command === BTRFS).map(c => c.args), [
+        ['subvolume', 'snapshot', '-r', join(top, '@data'), join(top, '@snapshots', LABEL)],
+        ['subvolume', 'delete', join(top, '@snapshots', LABEL)],
+        ['subvolume', 'snapshot', '-r', join(top, '@data'), join(top, '@snapshots', LABEL)],
+      ])
     })
   })
 

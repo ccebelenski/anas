@@ -248,6 +248,23 @@ describe('backup restore reads — failure taxonomy (verbatim stderr)', () => {
     }
   })
 
+  it('a BARE `permission check failed` — a wrong password — reads as a CREDENTIAL problem (R5)', () => {
+    // Without the `- missing` suffix PBS is saying the credential was REJECTED,
+    // not that it lacks privileges. The old wording ("lacks read access - PBS
+    // wants Datastore.Audit or Datastore.Backup") sent an operator with a bad
+    // password to fix their token's role.
+    const v = classifyBackupReadVerdict(255, 'Error: permission check failed\n')
+    assert.equal(v.verdict, 'error')
+    assert.ok(/authentication failure/.test(v.detail), v.detail)
+    assert.ok(!/Datastore\.Audit/.test(v.detail), 'the privileges wording must not appear for a rejected credential')
+  })
+
+  it('the missing-privileges suffix keeps its `permission` verdict and Datastore.Audit wording (R5)', () => {
+    const v = classifyBackupReadVerdict(255, 'Error: permission check failed - missing Datastore.Audit|Datastore.Backup on /datastore/anastest-store/gtrestore')
+    assert.equal(v.verdict, 'permission')
+    assert.ok(v.detail.includes('Datastore.Audit'))
+  })
+
   it('a wrong archive name and a missing type suffix are told apart', () => {
     assert.ok(browse.includes('Error: archive not found in manifest'))
     assert.ok(browse.includes('Error: failed to parse archive type for \'data\''))

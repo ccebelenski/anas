@@ -465,6 +465,58 @@ export type WriteTestOutcome
   = | { ok: true }
     | { ok: false, detail: string }
 
+/** What a bounded `stat` said about one path's existence. */
+type PathPresence = 'present' | 'absent' | 'unknown'
+
+/**
+ * Does this path exist? A bounded `stat` through the executor, read as
+ * three-valued on purpose: `absent` (the command answered and the path is not
+ * there) is the only answer that sends the nearest-existing walk UP. `unknown`
+ * — a timeout on a dead remote mount, or a probe that could not run at all —
+ * must NOT: walking past a mountpoint would test a different filesystem and
+ * green-light a restore onto a mount that never answers.
+ */
+async function pathPresence(executor: CommandExecutor, path: string): Promise<PathPresence> {
+  let r
+  try {
+    r = await executor.exec(TIMEOUT, [String(SPACE_PROBE_TIMEOUT_S), STAT, '-c', '%F', path])
+  }
+  catch {
+    return 'unknown'
+  }
+  if (r.exitCode === TIMEOUT_EXIT)
+    return 'unknown'
+  if (r.exitCode !== 0)
+    return 'absent'
+  return 'present'
+}
+
+/**
+ * The nearest EXISTING directory at or above `path` — the directory a write
+ * test must probe when the target does not exist yet (GT-15: pbc creates the
+ * WHOLE missing chain with mkdir -p semantics, so what matters is that the
+ * nearest ancestor that does exist accepts a write).
+ *
+ * The walk uses {@link parentDirectory} and stops at `/`; it also stops at the
+ * first path that answers at all (even as a file — the write test then fails
+ * honestly on it) or that the probe could not read (a dead mount stays where
+ * it is, refusing as before).
+ */
+export async function nearestExistingDirectory(
+  executor: CommandExecutor,
+  path: string,
+): Promise<string> {
+  let probe = path.replace(TRAILING_SLASHES_RE, '') || '/'
+  for (;;) {
+    if (await pathPresence(executor, probe) !== 'absent')
+      return probe
+    const parent = parentDirectory(probe)
+    if (parent === probe)
+      return probe
+    probe = parent
+  }
+}
+
 /**
  * Prove the target directory is WRITABLE before anything is restored.
  *
@@ -474,6 +526,12 @@ export type WriteTestOutcome
  * has to be a real write rather than a permission check: as root, a `0555`
  * directory is writable, so only writing tells the truth.
  *
+ * The test probes the nearest EXISTING ancestor ({@link nearestExistingDirectory}):
+ * a newLocation restore into a directory whose parent chain is not built yet
+ * used to fail here with `touch`'s ENOENT and read as "not writable", when pbc
+ * would happily have created the whole chain (GT-15). The messages keep naming
+ * the operator's path, whatever was probed.
+ *
  * Both halves are `timeout`-wrapped: the directory may be on a dead remote
  * mount, and the daemon never touches a mountpoint synchronously.
  */
@@ -482,7 +540,8 @@ export async function writeTestDirectory(
   directory: string,
   probeName = `.anas-restore-write-test-${process.pid}`,
 ): Promise<WriteTestOutcome> {
-  const probe = targetPathFor(directory, probeName)
+  const probeDir = await nearestExistingDirectory(executor, directory)
+  const probe = targetPathFor(probeDir, probeName)
   let r
   try {
     r = await executor.exec(TIMEOUT, [String(WRITE_TEST_TIMEOUT_S), TOUCH, probe])
@@ -828,6 +887,22 @@ export async function runFileRestore(
         : `The chosen directory '${deps.target}' already existed, so this restore MERGED into it: files with `
           + 'the same names were replaced, and everything else under it was left exactly as it was.',
     )
+  }
+
+  // A retry that COMPLETES removes the marker a failed run left behind: a
+  // `.anas-restore-partial` sitting in a directory whose restore just finished
+  // is a lie about the tree below it. Only ANAS's own marker at ANAS's own
+  // name is ever removed — the exact path this module writes, nothing else.
+  const markerPath = targetPathFor(deps.target, PARTIAL_MARKER_NAME)
+  if (await pathKind(executor, markerPath) !== null) {
+    const removed = await executor
+      .exec(TIMEOUT, [String(WRITE_TEST_TIMEOUT_S), RM, '-f', markerPath])
+      .then(r => r.exitCode === 0)
+      .catch(() => false)
+    if (removed)
+      updateProgress(`removed the '${PARTIAL_MARKER_NAME}' left by a failed earlier restore into '${deps.target}'`)
+    else
+      warnings.push(`'${markerPath}' is the partial marker of a failed earlier restore and could not be removed.`)
   }
 
   const status = verified.missing.length > 0 ? 'completed-with-warnings' : 'completed'

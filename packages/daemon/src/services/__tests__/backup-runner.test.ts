@@ -420,7 +420,12 @@ describe('backup runner — test verdicts from the REAL failure taxonomy fixture
   })
 
   it('wrong password → auth', () => {
-    assert.equal(classifyTestVerdict(byNum(4).exit, byNum(4).stderr).stage, 'auth')
+    const v = classifyTestVerdict(byNum(4).exit, byNum(4).stderr)
+    assert.equal(v.stage, 'auth')
+    // R5: the wrong-password case says CHECK THE PASSWORD — it must not borrow
+    // the missing-privileges detail its sibling below earns.
+    assert.match(v.detail ?? '', /check the password/)
+    assert.doesNotMatch(v.detail ?? '', /missing the required Datastore privileges/)
   })
 
   it('bad token secret + revoked token → auth (indistinguishable)', () => {

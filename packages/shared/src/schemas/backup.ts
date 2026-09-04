@@ -2082,9 +2082,10 @@ export const BackupImageRestoreRequest = z
     /**
      * pbc's `--rate` (e.g. `50MB`), emitted ONLY when asked for. GT-62: it limits
      * TRANSFERRED bytes, not logical ones, so a sparse image finishes far faster
-     * than the archive size suggests.
+     * than the archive size suggests. The SAME schema as the files door's rate
+     * (R4) — one byte-rate shape, validated at the boundary like its twin.
      */
-    rate: z.string().max(32).optional(),
+    rate: BackupRateLimit.optional(),
   })
   .superRefine((request, ctx) => {
     if (request.target?.mode === 'newLun') {

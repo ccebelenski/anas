@@ -848,29 +848,103 @@ describe('backup2.6 — estimateSpace', () => {
 describe('backup2.6 — local pre-flight probes', () => {
   it('the write test WRITES (root ignores directory permissions — GT-56 F8b)', async () => {
     const mock = new MockExecutor()
+    // The target answers its existence probe (R2's walk), then the write lands.
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-c', '%F', '/gtbackup/data'],
+      result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
+    })
     mock.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: '', exitCode: 0 } })
     const out = await writeTestDirectory(mock, '/gtbackup/data', '.probe')
     assert.equal(out.ok, true)
-    const touch = mock.calls[0]!
+    const touch = mock.calls.find(c => c.args[1] === '/usr/bin/touch')!
     assert.deepEqual(touch.args, ['10', '/usr/bin/touch', '/gtbackup/data/.probe'])
     // …and it cleans up after itself.
-    assert.deepEqual(mock.calls[1]!.args, ['10', '/usr/bin/rm', '-f', '/gtbackup/data/.probe'])
+    assert.deepEqual(mock.calls.find(c => c.args[1] === '/usr/bin/rm')!.args, ['10', '/usr/bin/rm', '-f', '/gtbackup/data/.probe'])
+  })
+
+  it('a newLocation whose parent chain is NOT built yet probes the nearest EXISTING ancestor (GT-15)', async () => {
+    // pbc creates the whole missing chain (GT-15), so the probe directory is
+    // the nearest ancestor that EXISTS — not the missing parent, whose ENOENT
+    // used to read as "not writable" and 409 a restore that would have worked.
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-c', '%F', '/gtbackup/deep/newdir'],
+      result: { stdout: '', stderr: 'No such file or directory\n', exitCode: 1 },
+    })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-c', '%F', '/gtbackup/deep'],
+      result: { stdout: '', stderr: 'No such file or directory\n', exitCode: 1 },
+    })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-c', '%F', '/gtbackup'],
+      result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/touch', `/gtbackup/.anas-restore-write-test-${process.pid}`],
+      result: { stdout: '', stderr: '', exitCode: 0 },
+    })
+    const out = await writeTestDirectory(mock, '/gtbackup/deep/newdir')
+    assert.equal(out.ok, true)
+    const touch = mock.calls.find(c => c.args[1] === '/usr/bin/touch')!
+    assert.equal(touch.args[2], `/gtbackup/.anas-restore-write-test-${process.pid}`)
+  })
+
+  it('the ancestor walk STOPS at a mountpoint a dead mount cannot answer about', async () => {
+    // `unknown` (the timeout guard's 124) never sends the walk up: probing a
+    // different filesystem would green-light a restore onto a mount that
+    // never answers.
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-c', '%F', '/mnt/pbs/deep/newdir'],
+      result: { stdout: '', stderr: '', exitCode: 124 },
+    })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/touch', `/mnt/pbs/deep/newdir/.anas-restore-write-test-${process.pid}`],
+      result: { stdout: '', stderr: '', exitCode: 124 },
+    })
+    const out = await writeTestDirectory(mock, '/mnt/pbs/deep/newdir')
+    assert.equal(out.ok, false)
+    assert.match(out.ok === false ? out.detail : '', /not responding/)
+    assert.ok(!mock.calls.some(c => c.args[1] === '/usr/bin/stat' && c.args[2] === '/mnt'))
   })
 
   it('a read-only target is refused BEFORE the client runs (GT-56 F8)', async () => {
     const mock = new MockExecutor()
     mock.addFixture({
       command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-c', '%F', '/x'],
+      result: { stdout: 'directory\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/touch', '/x/.p'],
       result: { stdout: '', stderr: 'touch: cannot touch \'/x/.p\': Read-only file system\n', exitCode: 1 },
     })
     const out = await writeTestDirectory(mock, '/x', '.p')
     assert.equal(out.ok, false)
     assert.match(out.ok === false ? out.detail : '', /Read-only file system/)
+    assert.match(out.ok === false ? out.detail : '', /^'\/x' is not writable/)
   })
 
   it('a target that never answers is refused, not waited on', async () => {
     const mock = new MockExecutor()
-    mock.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: '', exitCode: 124 } })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/stat', '-c', '%F', '/dead'],
+      result: { stdout: '', stderr: '', exitCode: 124 },
+    })
+    mock.addFixture({
+      command: TIMEOUT,
+      args: ['10', '/usr/bin/touch', '/dead/.p'],
+      result: { stdout: '', stderr: '', exitCode: 124 },
+    })
     const out = await writeTestDirectory(mock, '/dead', '.p')
     assert.equal(out.ok, false)
     assert.match(out.ok === false ? out.detail : '', /not responding/)
@@ -1009,6 +1083,61 @@ describe('backup2.6 — runFileRestore', () => {
     // The secret is NEVER on argv.
     assert.ok(!call.args.some(a => a.includes('token-secret-value')))
     assert.ok(progress.some(p => /silence is not a stall/.test(p)))
+  })
+
+  it('a COMPLETED retry removes the partial marker a failed earlier run left behind (R3)', async () => {
+    // A newLocation restore fails part-way (marker written), the operator runs
+    // it again into the same path — the directory now exists, so this retry is
+    // a MERGE — and it completes. The `.anas-restore-partial` from the failed
+    // run must not sit there calling the finished tree partial.
+    const mock = restoreMock(
+      { stderr: 'restore complete (2.546 KiB processed in <0.1s, average 2.886 MiB/s)\r', exitCode: 0 },
+      [
+        { stdout: '/gtbackup/data-restore-2026-08-25/alpha.txt\n', exitCode: 0 }, // find verify
+        { stdout: 'regular file\n', exitCode: 0 }, // stat: the marker IS there
+        { stdout: '', exitCode: 0 }, // rm -f the marker
+      ],
+    )
+    const result = await runFileRestore(
+      mock,
+      deps({ mode: 'newLocation', merge: true, target: '/gtbackup/data-restore-2026-08-25' }),
+      () => {},
+    )
+    assert.equal(result.status, 'completed')
+    const markerRm = mock.calls.find(c => c.args[1] === '/usr/bin/rm' && c.args[2] === '-f')
+    assert.ok(markerRm, 'no rm -f of the leftover marker happened')
+    assert.deepEqual(markerRm.args, [
+      '10',
+      '/usr/bin/rm',
+      '-f',
+      targetPathFor('/gtbackup/data-restore-2026-08-25', PARTIAL_MARKER_NAME),
+    ])
+  })
+
+  it('a completed restore into a directory WITHOUT the marker removes nothing (R3)', async () => {
+    const mock = restoreMock(
+      { stderr: 'restore complete (2.546 KiB processed in <0.1s, average 2.886 MiB/s)\r', exitCode: 0 },
+      [
+        { stdout: '/gtbackup/data-restore-2026-08-25/alpha.txt\n', exitCode: 0 }, // find verify
+        { stdout: '', stderr: 'No such file\n', exitCode: 1 }, // stat: no marker
+      ],
+    )
+    await runFileRestore(mock, deps(), () => {})
+    assert.ok(!mock.calls.some(c => c.args[1] === '/usr/bin/rm' && c.args[2] === '-f'))
+  })
+
+  it('a leftover marker that cannot be removed is a WARNING, never a failed restore (R3)', async () => {
+    const mock = restoreMock(
+      { stderr: 'restore complete (2.546 KiB processed in <0.1s, average 2.886 MiB/s)\r', exitCode: 0 },
+      [
+        { stdout: '/gtbackup/data-restore-2026-08-25/alpha.txt\n', exitCode: 0 }, // find verify
+        { stdout: 'regular file\n', exitCode: 0 }, // stat: the marker IS there
+        { stdout: '', stderr: 'rm: permission denied\n', exitCode: 1 }, // rm fails
+      ],
+    )
+    const result = await runFileRestore(mock, deps(), () => {})
+    assert.equal(result.status, 'completed')
+    assert.ok(result.warnings.some(w => w.includes(PARTIAL_MARKER_NAME) && w.includes('could not be removed')))
   })
 
   it('a SILENT no-match completes WITH WARNINGS, naming what is not there (GT-24)', async () => {
