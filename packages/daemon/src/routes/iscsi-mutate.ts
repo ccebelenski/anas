@@ -359,6 +359,14 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       }
     }
 
+    // Two things in one edit can touch a LIVE session — dropping an ACL and
+    // removing a portal — and each needs the SAME confirm challenge (same
+    // operation, same `{target}` signature). So their sentences and warnings are
+    // gathered and issued through ONE gate: an edit that both removes an ACL and
+    // removes a portal must not make the operator answer two challenges in a row.
+    const gateMessages: string[] = []
+    const gateWarnings: string[] = []
+
     // Removing an ACL is not a metadata edit: it drops that initiator's session
     // instantly and destroys its CHAP credentials (GT-36). Say so, and gate it.
     const removedWithSessions = req.acls === undefined
@@ -367,11 +375,52 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
           .filter(s => !req.acls?.some(a => a.initiatorIqn === s.initiatorIqn))
           .map(s => s.initiatorIqn)
     if (removedWithSessions.length > 0) {
+      gateMessages.push(`Removing ${removedWithSessions.length} initiator ACL${removedWithSessions.length === 1 ? '' : 's'} will drop ${removedWithSessions.length === 1 ? 'its' : 'their'} live session immediately`)
+      gateWarnings.push(...removedWithSessions.map(i => `${i} is logged in now — its session drops the moment the ACL is removed, and its device on that host goes stale with no kernel message`))
+    }
+
+    // M3: removing a portal an initiator's session came in through does NOT drop
+    // the session. LIO tears down only the listening socket — the accepted TCP
+    // connection, the mapped LUN and I/O all keep running with no kernel message
+    // on either side (live-proof LP6). What breaks is the NEXT reconnect: a login
+    // or discovery through that address fails (iscsiadm error 8) while the
+    // initiator's own node record still points at it. So this is a confirm with
+    // warnings, not a refusal — the operator may proceed, but the affected
+    // initiators are named and told exactly what happens. The removed set is the
+    // SAME diff the service applies: a live portal (address case-insensitive,
+    // port exact) that the desired set no longer contains.
+    const removedPortals = req.portals === undefined
+      ? []
+      : target.portals.filter(p => !req.portals?.some(w =>
+          w.address.toLowerCase() === p.address.toLowerCase() && w.port === p.port))
+    const portalSessionWarnings: string[] = []
+    for (const p of removedPortals) {
+      // `IscsiSession.connections[].address` is the only fidelity LIO reports for
+      // an established connection — an address, no port — so a session is matched
+      // to a removed portal by address. A session that came in on a DIFFERENT
+      // address is untouched: that initiator can still re-login through its own
+      // surviving portal (LP6), so it earns no warning.
+      for (const s of target.sessions) {
+        if (s.connections.some(c => c.address.toLowerCase() === p.address.toLowerCase())) {
+          portalSessionWarnings.push(
+            `${s.initiatorIqn} has a live connection on ${p.address}:${p.port} — its current session keeps running, `
+            + `but once that portal is removed it cannot re-login or discover through ${p.address}:${p.port} `
+            + `(iscsiadm error 8) until its own node record is pointed at a surviving portal`,
+          )
+        }
+      }
+    }
+    if (portalSessionWarnings.length > 0) {
+      gateMessages.push('Removing a portal a live connection came in on will not drop that session, but its next reconnect through that address will fail until the initiator\'s node record is updated')
+      gateWarnings.push(...portalSessionWarnings)
+    }
+
+    if (gateWarnings.length > 0) {
       if (!confirmGate(confirmStore, request, reply, {
         operation: 'iscsi.target.update',
         params: { target: iqn },
-        message: `Removing ${removedWithSessions.length} initiator ACL${removedWithSessions.length === 1 ? '' : 's'} will drop ${removedWithSessions.length === 1 ? 'its' : 'their'} live session immediately`,
-        warnings: removedWithSessions.map(i => `${i} is logged in now — its session drops the moment the ACL is removed, and its device on that host goes stale with no kernel message`),
+        message: gateMessages.join('; '),
+        warnings: gateWarnings,
       })) {
         return reply
       }

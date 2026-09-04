@@ -62,9 +62,18 @@ const INITIATOR = 'iqn.1993-08.org.debian:01:ae3d2ec18ad'
 const GT_IQN = 'iqn.2026-08.dev.anas.gtiscsi:target1'
 
 /** SYNTHETIC (not a capture): the smallest tree the mutation gates need. */
-function anasManifest(opts: { session?: boolean, fileLun?: string } = {}): string {
+function anasManifest(opts: {
+  session?: boolean
+  fileLun?: string
+  /** The TPG's portals; defaults to the single 192.168.200.50:3260 the other tests expect. */
+  portals?: { address: string, port: number }[]
+  /** The address the live session's connection came in on (M3/LP6). */
+  sessionAddress?: string
+} = {}): string {
   const tpg = `iscsi/${ANAS_IQN}/tpgt_1`
   const acl = `${tpg}/acls/${INITIATOR}`
+  const portals = opts.portals ?? [{ address: '192.168.200.50', port: 3260 }]
+  const sessionAddress = opts.sessionAddress ?? '192.168.200.60'
   const lines = [
     'D core',
     'D core/iblock_0',
@@ -113,7 +122,7 @@ function anasManifest(opts: { session?: boolean, fileLun?: string } = {}): strin
     `F ${tpg}/attrib/demo_mode_discovery = 0`,
     `F ${tpg}/dynamic_sessions = `,
     `D ${tpg}/np`,
-    `D ${tpg}/np/192.168.200.50:3260`,
+    ...portals.map(p => `D ${tpg}/np/${p.address}:${p.port}`),
     `D ${tpg}/lun`,
     `D ${tpg}/lun/lun_0`,
     `L ${tpg}/lun/lun_0/6847ded961 -> ../../../../../../target/core/iblock_0/vmdisk1`,
@@ -134,7 +143,7 @@ function anasManifest(opts: { session?: boolean, fileLun?: string } = {}): strin
     `D ${acl}/lun_0`,
     ...(opts.fileLun ? [`D ${acl}/lun_1`] : []),
     opts.session
-      ? `F ${acl}/info = InitiatorName: ${INITIATOR}\\nInitiatorAlias: anas-pve\\nLIO Session ID: 1   ISID: 0x00 02 3d 00 00 02  TSIH: 1  SessionType: Normal\\nSession State: TARG_SESS_STATE_LOGGED_IN\\n---------------------[iSCSI Session Values]-----------------------\\n----------------------[iSCSI Connections]-------------------------\\nCID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN\\n   Address 192.168.200.60 TCP  StatSN: 0x6916c3e9`
+      ? `F ${acl}/info = InitiatorName: ${INITIATOR}\\nInitiatorAlias: anas-pve\\nLIO Session ID: 1   ISID: 0x00 02 3d 00 00 02  TSIH: 1  SessionType: Normal\\nSession State: TARG_SESS_STATE_LOGGED_IN\\n---------------------[iSCSI Session Values]-----------------------\\n----------------------[iSCSI Connections]-------------------------\\nCID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN\\n   Address ${sessionAddress} TCP  StatSN: 0x6916c3e9`
       : `F ${acl}/info = No active iSCSI Session for Initiator Endpoint: ${INITIATOR}`,
   ]
   return `${lines.join('\n')}\n`
@@ -705,6 +714,92 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       const res = await call('PUT', targetUrl(), { portals: [] })
       assert.equal(res.statusCode, 400)
       assert.match(res.body.error!.message, /at least one portal/)
+    })
+
+    // --- M3 / LP6: portal removal under a live session -----------------------
+    //
+    // A two-portal target, A=192.168.200.50 and B=192.168.200.51, with a live
+    // session whose connection came in on one of them. Removing the portal the
+    // session came in on is a CONFIRM-with-warnings (LP6): the session survives
+    // — LIO drops only the listener — but the initiator's next reconnect through
+    // that address fails (iscsiadm error 8). It is NOT a refusal.
+    const PORTAL_A = { address: '192.168.200.50', port: 3260 }
+    const PORTAL_B = { address: '192.168.200.51', port: 3260 }
+    async function serveTwoPortals(sessionAddress: string) {
+      await serve({
+        manifest: anasManifest({ session: true, portals: [PORTAL_A, PORTAL_B], sessionAddress }),
+        saveconfigText: anasSaveconfig(),
+      })
+    }
+
+    it('confirm-gates removing a portal a live session came in through (M3, LP6)', async () => {
+      await serveTwoPortals(PORTAL_A.address)
+      const res = await call('PUT', targetUrl(), { portals: [PORTAL_B] })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      assert.ok(res.headers['x-anas-confirm-code'], 'a portal removal under a live connection CAN be confirmed')
+      const warnings = res.body.error!.warnings!
+      // The initiator is named, the removed address:port is named, and the truth
+      // from LP6 is stated: session keeps running, reconnect fails with error 8.
+      assert.ok(warnings.some(w => w.includes(INITIATOR)), JSON.stringify(warnings))
+      assert.ok(warnings.some(w => /192\.168\.200\.50:3260/.test(w)), JSON.stringify(warnings))
+      assert.ok(warnings.some(w => /keeps running/.test(w) && /error 8/.test(w)), JSON.stringify(warnings))
+      // No overclaim about dropped I/O — the wording never says the session dies.
+      assert.ok(!warnings.some(w => /drops the/.test(w) || /disconnect/.test(w)), JSON.stringify(warnings))
+    })
+
+    it('the confirm code applies the portal removal', async () => {
+      await serveTwoPortals(PORTAL_A.address)
+      const mock = mockOf()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const first = await call('PUT', targetUrl(), { portals: [PORTAL_B] })
+      const code = first.headers['x-anas-confirm-code'] as string
+      const second = await call('PUT', targetUrl(), { portals: [PORTAL_B] }, { 'x-anas-confirm': code })
+      assert.equal(second.statusCode, 202)
+      const job = await waitForJob(second.body.job!.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const result = job.result as { portalsRemoved?: number }
+      assert.equal(result.portalsRemoved, 1)
+    })
+
+    it('removing a portal that carries NO live connection needs no confirmation', async () => {
+      // The session came in on B; A is removed. That initiator can still re-login
+      // through its own surviving portal, so there is nothing to warn about.
+      await serveTwoPortals(PORTAL_B.address)
+      const mock = mockOf()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const res = await call('PUT', targetUrl(), { portals: [PORTAL_B] })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      assert.ok(!res.headers['x-anas-confirm-code'], 'no session on the removed address — no new gate')
+    })
+
+    it('adding a portal, or an untouched-portal edit, raises no portal gate', async () => {
+      await serveTwoPortals(PORTAL_A.address)
+      const mock = mockOf()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      // Keep both and add a third — nothing is removed, so nothing to confirm.
+      const res = await call('PUT', targetUrl(), {
+        portals: [PORTAL_A, PORTAL_B, { address: '192.168.200.52', port: 3260 }],
+      })
+      assert.equal(res.statusCode, 202, JSON.stringify(res.body))
+      assert.ok(!res.headers['x-anas-confirm-code'])
+    })
+
+    it('a combined ACL-and-portal removal is ONE challenge carrying BOTH warnings (M3)', async () => {
+      await serveTwoPortals(PORTAL_A.address)
+      const res = await call('PUT', targetUrl(), { acls: [], portals: [PORTAL_B] })
+      assert.equal(res.statusCode, 409)
+      assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
+      const warnings = res.body.error!.warnings!
+      // Both surface in the one challenge, not two sequential ones.
+      assert.ok(warnings.some(w => /session drops the moment the ACL is removed/.test(w)), `ACL warning: ${JSON.stringify(warnings)}`)
+      assert.ok(warnings.some(w => /error 8/.test(w)), `portal warning: ${JSON.stringify(warnings)}`)
+      // The single minted code applies the whole edit — one challenge, not two.
+      const code = res.headers['x-anas-confirm-code'] as string
+      const mock = mockOf()
+      mock.addFixture({ command: TARGETCLI, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const second = await call('PUT', targetUrl(), { acls: [], portals: [PORTAL_B] }, { 'x-anas-confirm': code })
+      assert.equal(second.statusCode, 202, JSON.stringify(second.body))
     })
   })
 
