@@ -847,13 +847,18 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
       'iscsi.lun.update',
       { ...identity, params: { target: iqn, lun: index, ...(req.size !== undefined ? { size: req.size } : {}), ...(req.writeBack !== undefined ? { writeBack: req.writeBack } : {}) } },
       async updateProgress => withIscsiLock(async () => {
+        // O1: a zvol grow rounds the requested size up to a volblocksize
+        // multiple (the create door does the same silently). The applied size
+        // may therefore exceed `req.size`, so the result reports what actually
+        // landed on the volume rather than what was asked for.
+        let appliedSize = req.size
         // The `lun.size === null` arm is unreachable for a size change since M2
         // (#53) — it is 409'd before the job is ever submitted — but the type
         // cannot narrow across this closure, so the arm stays.
         if (req.size !== undefined && (lun.size === null || req.size > lun.size)) {
           if (lun.kind === 'zvol') {
             // A zvol grow is live end to end — no LIO action at all (GT-28).
-            await growZvolLun(mutateOptions(updateProgress), lun.dataset ?? zvolDataset(lun.backingPath), req.size)
+            appliedSize = await growZvolLun(mutateOptions(updateProgress), lun.dataset ?? zvolDataset(lun.backingPath), req.size)
             // M1: a combined {size, writeBack} must do BOTH. The fileio branch
             // carries writeBack inside the replay (the create's `write_back=`
             // plus its attribute token), but growZvolLun is a bare
@@ -883,7 +888,7 @@ export async function iscsiMutationRoutes(server: FastifyInstance, opts: IscsiMu
         return {
           target: iqn,
           lun: index,
-          ...(req.size !== undefined ? { size: req.size } : {}),
+          ...(req.size !== undefined ? { size: appliedSize } : {}),
           serial: lun.serial,
           recreated: lun.kind === 'file' && req.size !== undefined,
           warnings,

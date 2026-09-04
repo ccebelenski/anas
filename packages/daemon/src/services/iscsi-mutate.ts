@@ -427,14 +427,23 @@ export function assertSaveable(ctx: IscsiReadContext, targets: IscsiTargetDetail
   // told about by anything else: the LUN is live and looks perfect (story
   // `iscsi.8`). The quarantine turns it into an ordinary hole within one health
   // read, so this branch is what a mutation attempted in that window gets.
-  if (health.stubLuns.length > 0) {
-    const stubs = health.stubLuns
+  //
+  // Only ANAS-OWNED stubs reach here (F1): `degraded` no longer counts a foreign
+  // stub, so a node whose only placeholder is on a hands-off target is saveable
+  // and this whole guard returned null above. The filter is belt-and-braces and,
+  // more importantly, keeps the refusal text HONEST — every LUN it names is one
+  // ANAS really does take offline itself, so "ANAS takes such a LUN offline …"
+  // is true for each. (A foreign stub would make that promise a lie: after #54
+  // ANAS never touches it, which is precisely why it no longer degrades.)
+  const ownedStubs = health.stubLuns.filter(s => s.ownership === 'anas')
+  if (ownedStubs.length > 0) {
+    const stubs = ownedStubs
       .map(l => `LUN ${l.lunIndex} of ${l.targetIqn} (backstore '${l.backstoreName}', ${l.backingPath})`)
       .join('; ')
     return {
       reason: 'stub-backing',
-      message: `The live iSCSI configuration is serving ${health.stubLuns.length} `
-        + `LUN${health.stubLuns.length === 1 ? '' : 's'} over a PLACEHOLDER file the restore service created `
+      message: `The live iSCSI configuration is serving ${ownedStubs.length} `
+        + `LUN${ownedStubs.length === 1 ? '' : 's'} over a PLACEHOLDER file the restore service created `
         + `because the filesystem was not mounted: ${stubs}. ANAS takes such a LUN offline and leaves the saved `
         + `record intact so Repair can put it back, and refuses every other mutation meanwhile — a `
         + `'targetcli saveconfig' now would write the loss into /etc/rtslib-fb-target/saveconfig.json `
@@ -924,6 +933,50 @@ export function resolveZvolBacking(
  * AHR's only kind. An AHR pool that is not mounted has no directory yet — it
  * is refused by name, saying what to do about it.
  */
+/**
+ * Is a ZFS dataset currently mounted? `zfs get -Hp -o value mounted <dataset>`
+ * answers `yes` / `no` / `-` (the last for a volume, which has no mount). Null
+ * is "could not tell" — fail-open, so an unreadable answer never blocks a create
+ * and the quarantine stays the safety net.
+ */
+async function zfsDatasetMounted(executor: CommandExecutor, dataset: string): Promise<boolean | null> {
+  const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'mounted', dataset])
+  if (r.exitCode !== 0)
+    return null
+  const v = r.stdout.trim()
+  if (v === 'yes')
+    return true
+  if (v === 'no')
+    return false
+  return null
+}
+
+/**
+ * O2: the add-LUN door's refusal for a file backing whose ZFS dataset is not
+ * mounted. Returns the refusal when it is provably unmounted, or null to
+ * proceed (mounted, or the mount state could not be read — fail-open). The
+ * message names the mountpoint that would be written to by the parent.
+ */
+async function refuseIfDatasetUnmounted(
+  executor: CommandExecutor,
+  backing: string,
+  dataset: string,
+  mountpoint?: string,
+): Promise<{ refusal: BackingRefusal } | null> {
+  const mounted = await zfsDatasetMounted(executor, dataset)
+  if (mounted !== false)
+    return null
+  const where = mountpoint ? ` at '${mountpoint}'` : ''
+  return {
+    refusal: {
+      reason: 'backing-unmounted',
+      message: `Dataset '${dataset}' is not mounted${where} — an image LUN created on '${backing}' now would be `
+        + `written into the PARENT filesystem's directory, not onto this dataset, and served as an empty disk after `
+        + `the next reboot. Mount the dataset first, then place the image.`,
+    },
+  }
+}
+
 export async function resolveFileBackingDir(
   executor: CommandExecutor,
   backing: string,
@@ -950,6 +1003,15 @@ export async function resolveFileBackingDir(
         },
       }
     }
+    // O2: a path that resolves onto a ZFS dataset that is NOT mounted would have
+    // its image written into the PARENT filesystem's directory instead — the
+    // exact accident the stub quarantine catches after the fact. Refuse it at
+    // the door, where the facts are, rather than serving a placeholder later.
+    if (c.dataset) {
+      const unmounted = await refuseIfDatasetUnmounted(executor, backing, c.dataset)
+      if (unmounted)
+        return unmounted
+    }
     const ok: ResolvedFileDir = { dir: backing }
     if (c.dataset)
       ok.dataset = c.dataset
@@ -969,6 +1031,15 @@ export async function resolveFileBackingDir(
         },
       }
     }
+    // O2 (live-proof): the dataset's CONFIGURED mountpoint is not proof it is
+    // mounted. `zfs list` reports the mountpoint whether or not the dataset is
+    // live; when it is not, that directory belongs to the parent dataset, and
+    // an image created there is written to the parent — not this dataset — which
+    // is how a file LUN landed on the wrong filesystem and became a stub. Refuse
+    // at the door, naming the mountpoint that is not mounted.
+    const unmounted = await refuseIfDatasetUnmounted(executor, backing, mp.dataset, mp.mountpoint)
+    if (unmounted)
+      return unmounted
     return { ok: { dir: mp.mountpoint, dataset: mp.dataset, pool: mp.pool } }
   }
 
@@ -1255,21 +1326,52 @@ export function replayAttributes(
 }
 
 /**
+ * A dataset's `volblocksize`, in bytes, or null when it could not be read.
+ *
+ * `zfs get -Hp -o value volblocksize <dataset>` gives the raw byte count (the
+ * `-p` half of #50's lesson: never a human-rounded string). Fail-open: an
+ * unreadable value returns null and the caller applies the size as asked — the
+ * same behaviour as before this helper existed.
+ */
+async function readVolblocksize(executor: CommandExecutor, dataset: string): Promise<number | null> {
+  const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'volblocksize', dataset])
+  if (r.exitCode !== 0)
+    return null
+  const n = Number.parseInt(r.stdout.trim(), 10)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
+/**
  * Grow a zvol-backed LUN: `zfs set volsize=`, and nothing on the LIO side.
  *
  * A zvol grow is live end to end — `targetcli ls` and configfs report the new
  * size immediately and the initiator picks it up on a rescan (GT-28). There is
  * no backstore to touch, so the serial and the attributes are never at risk.
+ *
+ * O1 (0.3.1, LP2): the size is rounded UP to a multiple of the volume's
+ * `volblocksize` first, matching what the CREATE door does silently — `zfs
+ * create -V` rounds an unaligned volsize up, but `zfs set volsize=` refuses one
+ * with a raw "must be a multiple of volume block size" error, which used to
+ * surface out of a 202 as a failed job. Rounding here makes the grow door behave
+ * like the create door. Returns the size actually applied (the rounded value)
+ * so the caller's job result and read model agree with the filesystem.
  */
 export async function growZvolLun(
   opts: IscsiMutateOptions,
   dataset: string,
   size: number,
-): Promise<void> {
-  report(opts, `Growing volume ${dataset} to ${size} bytes`)
-  const r = await opts.executor.exec(ZFS, ['set', `volsize=${size}`, dataset])
+): Promise<number> {
+  const bs = await readVolblocksize(opts.executor, dataset)
+  let applied = size
+  if (bs !== null && size % bs !== 0) {
+    applied = Math.ceil(size / bs) * bs
+    report(opts, `Rounded volsize up to ${applied} bytes — a multiple of the ${bs}-byte volume block size (as 'zfs create' would)`)
+  }
+  report(opts, `Growing volume ${dataset} to ${applied} bytes`)
+  const r = await opts.executor.exec(ZFS, ['set', `volsize=${applied}`, dataset])
   if (r.exitCode !== 0)
-    throw new Error(r.stderr.trim() || `zfs set volsize=${size} ${dataset} exited with code ${r.exitCode}`)
+    throw new Error(r.stderr.trim() || `zfs set volsize=${applied} ${dataset} exited with code ${r.exitCode}`)
+  return applied
 }
 
 /**

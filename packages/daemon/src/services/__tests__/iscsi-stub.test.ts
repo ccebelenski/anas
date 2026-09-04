@@ -29,6 +29,7 @@ import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js
 import { parseLioSaveconfig } from '../../parsers/lio-saveconfig.js'
 import { readConfigfs } from '../iscsi-configfs.js'
 import { computeIscsiHealth } from '../iscsi-health.js'
+import { assertSaveable } from '../iscsi-mutate.js'
 import { readIscsiHealthWithQuarantine } from '../iscsi-quarantine.js'
 import { planIscsiRepair } from '../iscsi-repair.js'
 import { fileStubVerdict } from '../iscsi-stub.js'
@@ -310,6 +311,69 @@ describe('the read layer — a stub is `unresolved`, and never costs the target 
   })
 })
 
+describe('F1 — only an ANAS-owned stub degrades the node and gates ANAS mutations', () => {
+  it('an ANAS-owned stub degrades and 409s every mutation (assertSaveable → stub-backing)', async () => {
+    const ctx = await context({ probe: { exists: true, size: 0 }, childMounted: false })
+    const targets = await buildIscsiTargets(ctx)
+    assert.equal(targets[0].ownership, 'anas')
+
+    const health = computeIscsiHealth(ctx, targets)
+    assert.equal(health.stubLuns.length, 1)
+    assert.equal(health.stubLuns[0].ownership, 'anas')
+    assert.equal(health.degraded, true)
+
+    const refusal = assertSaveable(ctx, targets)
+    assert.ok(refusal, 'an ANAS stub still refuses saves — the quarantine really does take it offline')
+    assert.equal(refusal!.reason, 'stub-backing')
+    assert.match(refusal!.message, /PLACEHOLDER/)
+    assert.match(refusal!.message, /ANAS takes such a LUN offline/)
+  })
+
+  it('a FOREIGN stub is reported but does NOT degrade the node, and mutations flow', async () => {
+    const ctx = await context({ probe: { exists: true, size: 0 }, childMounted: false })
+    // Rename the target to a non-ANAS naming authority in BOTH halves, so the
+    // read layer sees one foreign target rather than a live/persisted diff.
+    const foreign = 'iqn.2026-08.dev.example:other'
+    ctx.live.targets[0].iqn = foreign
+    ctx.persisted!.targets[0].iqn = foreign
+    const targets = await buildIscsiTargets(ctx)
+    assert.equal(targets[0].ownership, 'foreign')
+
+    const health = computeIscsiHealth(ctx, targets)
+    // The stub is still REPORTED — the verdict is ownership-blind (issue #54) …
+    assert.equal(health.stubLuns.length, 1)
+    assert.equal(health.stubLuns[0].ownership, 'foreign')
+    // … but the node is NOT degraded (F1): ANAS never clears a foreign stub, so
+    // gating every ANAS-owned mutation on it only strands the operator.
+    assert.equal(health.degraded, false)
+    // And so the node-wide save gate lets ANAS mutations through — this is the
+    // whole point of F1. Before the fix this returned a `stub-backing` refusal.
+    assert.equal(assertSaveable(ctx, targets), null)
+  })
+
+  it('an ANAS stub AND a foreign stub together: only the ANAS one is named in the refusal', async () => {
+    // Two targets, each with a placeholder LUN. The gate must refuse (the ANAS
+    // stub degrades) but its message must name ONLY the ANAS LUN — promising to
+    // take the foreign one offline would be the dishonesty F1 removed.
+    const ctx = await context({ probe: { exists: true, size: 0 }, childMounted: false })
+    const foreign = 'iqn.2026-08.dev.example:other'
+    // Clone the single fixture target into a second, foreign one that shares the
+    // same placeholder backing (the stub verdict keys on the path, not the IQN).
+    ctx.live.targets.push({ ...ctx.live.targets[0], iqn: foreign })
+    ctx.persisted!.targets.push({ ...ctx.persisted!.targets[0], iqn: foreign })
+    const targets = await buildIscsiTargets(ctx)
+    const byOwner = Object.fromEntries(targets.map(t => [t.ownership, t.iqn]))
+    assert.equal(byOwner.anas, IQN)
+    assert.equal(byOwner.foreign, foreign)
+
+    const refusal = assertSaveable(ctx, targets)
+    assert.ok(refusal)
+    assert.equal(refusal!.reason, 'stub-backing')
+    assert.match(refusal!.message, new RegExp(IQN))
+    assert.ok(!refusal!.message.includes(foreign), refusal!.message)
+  })
+})
+
 describe('a DISABLED ANAS target is serving nothing, and says so (live-proof F12)', () => {
   it('reports the target, its LUN count, and the reason when a job still has one', async () => {
     const ctx = await context({ probe: { exists: true, size: IMAGE_SIZE }, childMounted: true })
@@ -544,9 +608,13 @@ describe('quarantine — unmap that LUN, delete the stub backstore, never saveco
     // ANAS tried and failed. And no outcome: an outcome reads as "ANAS took it
     // offline", which the boot scan counts and says.
     assert.deepEqual(outcomes, [])
-    assert.equal(health.degraded, true)
+    // F1: a FOREIGN stub does NOT degrade the node. ANAS will never clear it
+    // (issue #54), so making it refuse every ANAS-owned mutation node-wide only
+    // strands the operator (Repair answers nothing-to-repair). The card stays.
+    assert.equal(health.degraded, false)
     assert.equal(health.stubLuns.length, 1)
     assert.equal(health.stubLuns[0].targetIqn, foreignIqn)
+    assert.equal(health.stubLuns[0].ownership, 'foreign')
     assert.equal(health.stubLuns[0].quarantined, false)
     assert.equal(health.stubLuns[0].fileRemoved, false)
 

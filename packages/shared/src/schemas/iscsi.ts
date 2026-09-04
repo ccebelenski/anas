@@ -746,6 +746,14 @@ export const IscsiStubLun = z.object({
   zeroSized: z.boolean(),
   /** Signal 2: the containing mount is not the expected one. */
   wrongMount: z.boolean(),
+  /**
+   * Whose target the stub is on (F1). The stub verdict itself is ownership-blind
+   * — a placeholder is reported wherever it is served — but only an ANAS-owned
+   * stub raises `degraded` and gates ANAS mutations, because the quarantine acts
+   * ONLY on ANAS-owned stubs (issue #54): a foreign stub ANAS will never touch,
+   * so making it refuse every other mutation node-wide accomplishes nothing.
+   */
+  ownership: IscsiOwnership,
   /** Did ANAS take this LUN offline in this pass? */
   quarantined: z.boolean(),
   /** Was the 0-byte placeholder file removed? Only ever when BOTH signals agree. */

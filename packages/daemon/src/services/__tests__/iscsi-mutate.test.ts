@@ -771,19 +771,56 @@ describe('the image file itself', () => {
 })
 
 describe('zvol grow, LUN delete, target state and target delete', () => {
-  it('a zvol grow is a plain `zfs set volsize=` and NOTHING on the LIO side (GT-28)', async () => {
+  it('a zvol grow reads the volblocksize, then a plain `zfs set volsize=` and NOTHING on the LIO side (GT-28)', async () => {
     const mock = new MockExecutor()
+    // An already-aligned size against a 16K volblocksize: no rounding, and the
+    // applied size is what was asked for.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'], result: { stdout: '16384\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })
-    await growZvolLun({ executor: mock }, 'tank/vol1', 2147483648)
+    const applied = await growZvolLun({ executor: mock }, 'tank/vol1', 2147483648)
+    assert.equal(applied, 2147483648)
     assert.deepEqual(mock.calls, [
+      { command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'] },
       { command: '/usr/sbin/zfs', args: ['set', 'volsize=2147483648', 'tank/vol1'] },
     ])
   })
 
+  it('O1: an unaligned grow is rounded UP to a volblocksize multiple, as the create door does', async () => {
+    const mock = new MockExecutor()
+    // The live-proof numbers (LP2): 16K volblocksize, 1_300_000_000 requested →
+    // 1_300_004_864 applied. Before O1 this reached `zfs set volsize=` unaligned
+    // and failed the JOB with a raw ZFS error out of a 202.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'], result: { stdout: '16384\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const applied = await growZvolLun({ executor: mock }, 'tank/vol1', 1300000000)
+    assert.equal(applied, 1300004864)
+    // The value that reaches ZFS is the rounded one, so ZFS never sees an
+    // unaligned volsize and never errors.
+    assert.deepEqual(mock.calls.find(c => c.args[0] === 'set'), {
+      command: '/usr/sbin/zfs',
+      args: ['set', 'volsize=1300004864', 'tank/vol1'],
+    })
+  })
+
+  it('an unreadable volblocksize falls open — the size is applied as asked (fail-open)', async () => {
+    const mock = new MockExecutor()
+    // `zfs get` fails: no rounding is attempted, the request goes through as-is,
+    // exactly as before O1 existed.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'], result: { stdout: '', stderr: 'no dataset', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+    const applied = await growZvolLun({ executor: mock }, 'tank/vol1', 1300000000)
+    assert.equal(applied, 1300000000)
+    assert.deepEqual(mock.calls.find(c => c.args[0] === 'set'), {
+      command: '/usr/sbin/zfs',
+      args: ['set', 'volsize=1300000000', 'tank/vol1'],
+    })
+  })
+
   it('a zvol grow that ZFS refuses surfaces what ZFS said', async () => {
     const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'volblocksize', 'tank/vol1'], result: { stdout: '16384\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zfs', result: { stdout: '', stderr: 'cannot set property for \'tank/vol1\': out of space\n', exitCode: 1 } })
-    await assert.rejects(() => growZvolLun({ executor: mock }, 'tank/vol1', 1), /out of space/)
+    await assert.rejects(() => growZvolLun({ executor: mock }, 'tank/vol1', 16384), /out of space/)
   })
 
   it('enable / disable is one targetcli command plus the save', async () => {
@@ -994,8 +1031,11 @@ describe('resolveFileBackingDir — an AHR pool name is a backing, like a datase
     assert.match(r.refusal.message, /'ahr0' is an AHR pool, but it is not mounted — mount it first, then place the image/)
   })
 
-  it('still resolves a ZFS dataset name to its mountpoint — without ever reading the AHR topology', async () => {
+  it('still resolves a MOUNTED ZFS dataset name to its mountpoint — without ever reading the AHR topology', async () => {
     const mock = ahrExecutor('/mnt/anas-ahr/ahr0')
+    // O2: the dataset-name branch now confirms the dataset is actually mounted
+    // before handing back its mountpoint. A mounted dataset resolves as before.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'tank/images'], result: { stdout: 'yes\n', stderr: '', exitCode: 0 } })
     const ctx = emptyCtx({
       inputs: {
         pveStorages: new Map(),
@@ -1008,7 +1048,64 @@ describe('resolveFileBackingDir — an AHR pool name is a backing, like a datase
     assert.equal(r.ok.dataset, 'tank/images')
     assert.equal(r.ok.pool, 'tank')
     assert.equal(r.ok.ahr, undefined)
-    assert.equal(mock.calls.length, 0)
+    // The ONLY command run is the mounted check — no AHR topology (mdadm, lvs, …).
+    assert.deepEqual(mock.calls, [
+      { command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'tank/images'] },
+    ])
+  })
+
+  it('O2: refuses a ZFS dataset name that is NOT mounted, naming the mountpoint the parent would swallow', async () => {
+    // The live-proof case: a file LUN was created onto a configured-but-unmounted
+    // dataset, so the image landed in the PARENT filesystem's directory and was
+    // served as an empty disk after the next reboot (the quarantine caught it
+    // only afterwards). The create door has the facts — refuse here.
+    const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'gtbackup/lp35b'], result: { stdout: 'no\n', stderr: '', exitCode: 0 } })
+    const ctx = emptyCtx({
+      inputs: {
+        pveStorages: new Map(),
+        zfsMountpoints: [{ dataset: 'gtbackup/lp35b', mountpoint: '/gtbackup/lp35b', pool: 'gtbackup' }],
+      },
+    } as never)
+    const r = await resolveFileBackingDir(mock, 'gtbackup/lp35b', ctx)
+    assert.ok('refusal' in r)
+    assert.equal(r.refusal.reason, 'backing-unmounted')
+    assert.match(r.refusal.message, /not mounted at '\/gtbackup\/lp35b'/)
+    assert.match(r.refusal.message, /PARENT filesystem/)
+    assert.match(r.refusal.message, /Mount the dataset first/)
+  })
+
+  it('O2: an absolute path onto an unmounted ZFS dataset is refused too', async () => {
+    // Same hazard through the absolute-path form: the path resolves onto a
+    // dataset that is not mounted, so the write would land on the parent.
+    const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'tank/images'], result: { stdout: 'no\n', stderr: '', exitCode: 0 } })
+    const ctx = emptyCtx({
+      inputs: {
+        pveStorages: new Map(),
+        zfsMountpoints: [{ dataset: 'tank/images', mountpoint: '/tank/images', pool: 'tank' }],
+      },
+    } as never)
+    const r = await resolveFileBackingDir(mock, '/tank/images', ctx)
+    assert.ok('refusal' in r)
+    assert.equal(r.refusal.reason, 'backing-unmounted')
+    assert.match(r.refusal.message, /Dataset 'tank\/images' is not mounted/)
+  })
+
+  it('O2 fail-open: an unreadable mounted state lets the create proceed (the quarantine stays the net)', async () => {
+    // `zfs get mounted` fails: no refusal is invented, the door resolves, and the
+    // stub quarantine remains the safety net — the pre-O2 behaviour.
+    const mock = new MockExecutor()
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'mounted', 'tank/images'], result: { stdout: '', stderr: 'no dataset', exitCode: 1 } })
+    const ctx = emptyCtx({
+      inputs: {
+        pveStorages: new Map(),
+        zfsMountpoints: [{ dataset: 'tank/images', mountpoint: '/tank/images', pool: 'tank' }],
+      },
+    } as never)
+    const r = await resolveFileBackingDir(mock, 'tank/images', ctx)
+    assert.ok('ok' in r)
+    assert.equal(r.ok.dir, '/tank/images')
   })
 
   it('still refuses a name that is neither a dataset nor a pool, with the existing message', async () => {

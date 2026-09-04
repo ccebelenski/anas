@@ -219,6 +219,18 @@ export async function readIscsiHealthWithQuarantine(
         log(skipLine(stub, target))
         continue
       }
+      // RULING C2 (0.3.1 remediation, LP5): a stub on an ANAS-owned target is
+      // torn down EVEN WHEN it has a live session. The quarantine does not check
+      // for sessions and must not start: a stub serves a 0-byte placeholder
+      // (zeros/garbage), so leaving it mapped serves CORRUPTION to whatever is
+      // reading it, and unmapping it — which kicks that session — is the safer
+      // outcome. There is no ambiguity to protect against: the two-signal verdict
+      // (zeroSized / wrongMount) proves the file behind the LUN is not the data,
+      // whether or not an initiator is attached, so a session is never evidence
+      // that ANAS would be tearing down someone's live disk. The card and the
+      // dashboard warning say so honestly — that the LUN was serving an empty
+      // placeholder, not your data, and ANAS took it offline (see the stub card
+      // in iscsi-warnings.ts). Foreign stubs are the one exception, gated above.
       const result = await quarantineOne(executor, stub, { tpgTag: target.tpgTag })
       log(auditLine(stub, result))
       acted.set(stub.backingPath, { quarantined: result.quarantined, fileRemoved: result.fileRemoved })
@@ -256,7 +268,14 @@ export async function readIscsiHealthWithQuarantine(
   return {
     ctx: after.ctx,
     targets: after.targets,
-    health: { ...after.health, stubLuns, degraded: after.health.degraded || stubLuns.length > 0 },
+    // Degraded only when an ANAS-OWNED stub is in the carried set (F1). A
+    // successfully-torn-down ANAS stub is already an ordinary `missingLuns` hole
+    // in `after.health` (so `after.health.degraded` is true); one the tear-down
+    // could not remove stays in `after.health.stubLuns` as ANAS-owned; a FOREIGN
+    // stub, reported here but never acted on, must not put the node into the
+    // refuse-all state — ANAS will never clear it (issue #54), so gating on it
+    // only strands the operator.
+    health: { ...after.health, stubLuns, degraded: after.health.degraded || stubLuns.some(s => s.ownership === 'anas') },
     outcomes,
   }
 }

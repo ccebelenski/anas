@@ -61,24 +61,46 @@ value vs exact bytes.
 
 ## Post-live-proof findings (2026-09-04 round, docs/LIVE-PROOF-0.3.1.md — all 7 items PASS)
 
-- **F1 MEDIUM → feeds the C2 ruling:** a FOREIGN target's stub sets `degraded: true` and 409s every
-  ANAS iSCSI mutation node-wide (`stub-backing`), while #54 correctly guarantees ANAS never clears
-  it; the refusal text promises an offline-taking that never happens and Repair answers
-  nothing-to-repair. Only hand targetcli escapes. The C2 ruling must now also decide: does a
-  foreign stub degrade the node at all, or only report?
-- **O1 LOW:** unaligned volsize grow fails as a job with raw ZFS text out of a 202; the create door
-  rounds silently — parallel construction wants rounding or a 400 at the door.
-- **O2 LOW:** file-kind LUN create accepted a configured-but-UNMOUNTED dataset backing (image
-  written to the parent; quarantine caught it later). The create door has the mount facts — refuse
-  there (same family as the backup source-guard idea).
+- **F1 MEDIUM — RESOLVED (code):** a FOREIGN target's stub used to set `degraded: true` and 409
+  every ANAS iSCSI mutation node-wide (`stub-backing`), while #54 correctly guarantees ANAS never
+  clears it; the refusal text promised an offline-taking that never happens and Repair answered
+  nothing-to-repair, so only hand-targetcli escaped. **Fix:** `degraded` (in `iscsi-health.ts` and
+  the quarantine's post-tear-down recompute) now counts only ANAS-OWNED stubs plus missing LUNs, so
+  a node whose only placeholder is on a hands-off target is saveable and `assertSaveable` returns
+  null — mutations flow. The stub is still REPORTED as a health card and dashboard warning
+  (unchanged). `IscsiStubLun` gained an `ownership` field to carry the verdict, and
+  `assertSaveable`'s `stub-backing` refusal now filters to ANAS-owned stubs, keeping its "ANAS takes
+  such a LUN offline …" promise honest (every LUN it names is one ANAS really does take offline).
+  Tests fail on the old code.
+- **O1 LOW — RESOLVED (code):** an unaligned volsize grow failed as a job with raw ZFS text out of a
+  202 while the create door rounds silently. **Fix:** `growZvolLun` reads the volume's
+  `volblocksize` (`zfs get -Hp`) and rounds the requested size UP to a multiple before `zfs set
+  volsize=`, exactly as `zfs create -V` does — and returns the applied size so the job result and
+  read model agree with the filesystem. Fail-open: an unreadable volblocksize applies the size as
+  asked (the pre-fix behaviour). Tests fail on the old code.
+- **O2 LOW — RESOLVED (code):** a file-kind LUN create accepted a configured-but-UNMOUNTED dataset
+  backing (image written to the parent; quarantine caught it later). **Fix:** `resolveFileBackingDir`
+  now checks `zfs get -Hp -o value mounted <dataset>` at the add-LUN door — for both the dataset-name
+  and the absolute-path forms — and refuses (`backing-unmounted`) when the dataset is provably not
+  mounted, naming the mountpoint the parent would swallow. Fail-open on an unreadable mount state
+  (quarantine stays the net). Tests fail on the old code.
 - **O3 LOW (boot):** an AHR fstab entry whose device never appears delays rtslib-fb-targetctl (and
   multi-user.target) ~90 s via the x-systemd.before ordering; nofail prevents failure, not the wait.
 
 ## Rulings needed (not code yet)
 
-- **C2:** `GET /iscsi/health` runs the quarantine (deliberate, story iscsi.8) outside the job
-  model with no session check. Decide and write down: does a stub with a LIVE session still get
-  yanked (serving zeros vs kicking the initiator)? Foreign skip is C1/#54 regardless.
+- **C2 — RULED + IMPLEMENTED (code):** `GET /iscsi/health` runs the quarantine (deliberate, story
+  iscsi.8) outside the job model with no session check. **Ruling: a stub on an ANAS-OWNED target is
+  torn down EVEN WHEN it has a live session.** A stub serves a 0-byte placeholder (zeros/garbage),
+  so leaving it mapped serves CORRUPTION to whatever is reading it; unmapping it — which kicks that
+  session — is the safer outcome. There is no ambiguity to protect against: the two-signal verdict
+  (`zeroSized` / `wrongMount`) proves the file behind the LUN is not the data whether or not an
+  initiator is attached, so a session is never evidence ANAS would be tearing down a live *data*
+  disk. The quarantine already did this (it never checked sessions); the ruling is recorded as a
+  comment where it decides to act (`iscsi-quarantine.ts`), and the health card / dashboard warning
+  already say so honestly ("this LUN was serving an empty placeholder, not your data; ANAS took it
+  offline"). Foreign skip is C1/#54 regardless. This also settles the F1 half: a foreign stub does
+  NOT degrade the node — see F1 below.
 - **New-LUN restore holds the iSCSI mutex across the whole image stream** (routes/backup.ts newLun job wrap —
   pre-existing, surfaced while fixing #52): every iSCSI mutation on the node queues behind an hours-long
   restore. **RESOLVED (code):** the whole-job `withIscsiLock` wrap is gone from the route;

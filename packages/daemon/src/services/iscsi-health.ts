@@ -148,6 +148,7 @@ export function computeIscsiHealth(
         expectedMount: facts.expectedMount,
         zeroSized: facts.zeroSized,
         wrongMount: facts.wrongMount,
+        ownership: target.ownership,
         quarantined: acted?.quarantined ?? false,
         fileRemoved: acted?.fileRemoved ?? false,
       })
@@ -278,10 +279,16 @@ export function computeIscsiHealth(
     portalsWithoutInterface,
     foreignChanges,
     // A hole in the live config makes every `saveconfig` destructive (GT-22) —
-    // and so does a stub, for the same reason with the sign flipped: the live
-    // tree is about to LOSE that LUN to the quarantine, and a save taken in
-    // between would write the loss into saveconfig.json permanently.
-    degraded: missingLuns.length > 0 || stubLuns.length > 0,
+    // and so does an ANAS-OWNED stub, for the same reason with the sign flipped:
+    // the live tree is about to LOSE that LUN to the quarantine, and a save
+    // taken in between would write the loss into saveconfig.json permanently.
+    // A FOREIGN stub does NOT degrade the node (F1): the quarantine never acts
+    // on it (issue #54), so it can never be about to lose a LUN to a save ANAS
+    // takes — and blocking every ANAS-owned mutation node-wide while a foreign
+    // placeholder ANAS will never touch sits there accomplishes nothing but a
+    // dead end (Repair answers nothing-to-repair; only hand-targetcli escapes).
+    // The stub is still REPORTED as a health card either way.
+    degraded: missingLuns.length > 0 || stubLuns.some(s => s.ownership === 'anas'),
     interfacesUnknown: ctx.nodeAddresses === null,
     checkedAt: now.toISOString(),
   }

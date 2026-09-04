@@ -277,7 +277,7 @@ describe('POST /v1/ahr — create success path (controlled inventory)', () => {
     // …carrying the `iscsi.8` boot-ordering option: a `nofail` AHR mount is
     // otherwise unordered against the LIO restore service, and losing that race
     // makes LIO serve a 0-byte placeholder for any image LUN on the pool.
-    assert.ok(fstab.includes(`/dev/tpool/tpool-vol ${join(dir, 'mnt', 'tpool')} btrfs nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service 0 0`), fstab)
+    assert.ok(fstab.includes(`/dev/tpool/tpool-vol ${join(dir, 'mnt', 'tpool')} btrfs nofail,subvol=@data,x-systemd.before=rtslib-fb-targetctl.service,x-systemd.device-timeout=45s 0 0`), fstab)
     const conf = await readFile(join(dir, 'mdadm.conf'), 'utf8')
     assert.ok(conf.includes('/dev/md/tpool-r1') && conf.includes(UUID_R1))
   })
