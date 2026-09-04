@@ -1007,7 +1007,6 @@ export async function datasetRoutes(
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid property update: ${bodyParsed.error.issues[0]?.message}` } }
     }
     const props = bodyParsed.data.properties
-    const pairs = buildSetPairs(props)
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -1034,6 +1033,21 @@ export async function datasetRoutes(
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: `'${fullName}' is a volume; ${notOnVolume.join(', ')} ${notOnVolume.length > 1 ? 'are filesystem properties' : 'is a filesystem property'} and ZFS does not carry ${notOnVolume.length > 1 ? 'them' : 'it'} on a volume` } }
       }
+      // O1 follow-up (0.3.1): round a volsize grow UP to a multiple of the
+      // volume's `volblocksize` BEFORE the gate and the `zfs set`, exactly as
+      // growZvolLun does on the iSCSI door and as `zfs create -V` does silently.
+      // Without it an unaligned volsize makes `zfs set volsize=` fail with a raw
+      // "must be a multiple of volume block size" out of a 202. The block size
+      // rides in on the dataset row (ZFS_LIST_PROPS reads volblocksize, exact
+      // after #50) — no extra `zfs get`. Fail-open: an absent/unreadable
+      // volblocksize applies the size as asked, the pre-fix behaviour. Rounding
+      // happens first so the shrink gate below compares the rounded value against
+      // current.volsize, the applied pairs carry it, and the job reports it; an
+      // already-aligned request is unchanged (round-up of a multiple is itself).
+      const bs = target.volblocksize
+      if (props.volsize !== undefined && bs !== undefined && bs > 0 && props.volsize % bs !== 0)
+        props.volsize = Math.ceil(props.volsize / bs) * bs
+
       // THE gate: grow yes, shrink never (assertVolumeMutable, the one seam).
       // Story iscsi.6: the holding LUN rides in too, so a refused shrink names
       // what is serving the volume as well as why the shrink itself is refused.
@@ -1061,6 +1075,10 @@ export async function datasetRoutes(
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `'${fullName}' is a filesystem; volsize applies only to a volume` } }
     }
+
+    // Built AFTER the volume branch so a rounded `props.volsize` (O1) is the one
+    // that reaches `zfs set` and the applied/params reports.
+    const pairs = buildSetPairs(props)
 
     const job = jobQueue.submit(
       'zfs.set',

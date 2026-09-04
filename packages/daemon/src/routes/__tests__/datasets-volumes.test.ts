@@ -469,6 +469,108 @@ describe('datasets — ZFS volumes (story iscsi.3)', () => {
   })
 
   // ==========================================================================
+  // A grow rounds the requested volsize UP to a volblocksize multiple (O1
+  // follow-up, 0.3.1). `zfs create -V` rounds an unaligned size up silently;
+  // `zfs set volsize=` instead REFUSES it with a raw "must be a multiple of
+  // volume block size" that surfaced out of a 202 as a failed job. The grow
+  // door (like the iSCSI grow door, growZvolLun) now rounds first, using the
+  // volblocksize ALREADY on the dataset row (ZFS_LIST_PROPS reads it, exact
+  // after #50) — no extra `zfs get`. Fail-open: an unreadable volblocksize
+  // applies the size as asked, the pre-fix behaviour.
+  // ==========================================================================
+  describe('a grow rounds volsize up to a volblocksize multiple (O1)', () => {
+    /** 16 KiB — the captured vol1's real volblocksize. */
+    const BS = 16384
+    /** A small current size so an unaligned request is unambiguously a GROW. */
+    const CURRENT = 64 * MiB
+
+    /**
+     * The real capture with vol1's current size pinned small and its
+     * volblocksize optionally stripped (to exercise the fail-open path). The
+     * checked-in capture stays verbatim (fixtures/zfs/NOTES.md); this is derived
+     * and named as derived, the same shape the #50 block uses.
+     */
+    function listBody(withBlocksize: boolean): string {
+      const raw = JSON.parse(fixtureText('zfs-list-volumes.json'))
+      const props = raw.datasets[VOL].properties
+      props.volsize.value = String(CURRENT)
+      props.refreservation.value = String(CURRENT)
+      if (withBlocksize)
+        props.volblocksize.value = String(BS)
+      else
+        delete props.volblocksize
+      return JSON.stringify(raw)
+    }
+
+    function startRoundServer(withBlocksize: boolean): ReturnType<typeof createServer> {
+      server = createServer({ mock: true, logger: false })
+      const mock = (server as unknown as { executor: MockExecutor }).executor
+      const orig = mock.exec.bind(mock)
+      calls = []
+      mock.exec = async (command: string, args: string[]) => {
+        calls.push({ command, args })
+        if (command === '/usr/sbin/zpool' && args.length === 2 && args[0] === 'list' && args[1] === '-j')
+          return { stdout: ZPOOL_LIST, stderr: '', exitCode: 0 }
+        if (command === '/usr/sbin/zfs' && args[0] === 'list' && args.includes('filesystem,volume') && args.at(-1) === POOL)
+          return { stdout: listBody(withBlocksize), stderr: '', exitCode: 0 }
+        return orig(command, args)
+      }
+      return server
+    }
+
+    async function put(body: unknown) {
+      return server!.inject({ method: 'PUT', url: `/v1/pools/${POOL}/datasets/${VOL_PATH}`, headers: IDENTITY_HEADERS, payload: body as object })
+    }
+
+    /** issue #50's own worked example: 1.3 GB, unaligned to a 16 KiB block. */
+    const REQUESTED = 1_300_000_000
+    /** 1,300,004,864 — the next 16 KiB multiple at or above the request. */
+    const APPLIED = Math.ceil(REQUESTED / BS) * BS
+
+    it('the request really is unaligned and a grow (so the assertion proves something)', () => {
+      assert.notEqual(REQUESTED % BS, 0)
+      assert.ok(REQUESTED > CURRENT)
+      assert.equal(APPLIED, 1_300_004_864)
+      assert.ok(APPLIED > REQUESTED && APPLIED - REQUESTED < BS)
+    })
+
+    it('rounds an unaligned grow UP to the next multiple in the `zfs set` argv', async () => {
+      server = startRoundServer(true)
+      const res = await put({ properties: { volsize: REQUESTED } })
+      assert.equal(res.statusCode, 202)
+      await waitForJob(server, (res.json() as JobAccepted).job.id)
+      // The raw request never reaches ZFS — only the rounded multiple does.
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', `volsize=${APPLIED}`, VOL])
+    })
+
+    it('reports the applied (rounded) size on the job result, so read model and filesystem agree', async () => {
+      server = startRoundServer(true)
+      const res = await put({ properties: { volsize: REQUESTED } })
+      const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.deepEqual((job.result as { applied: string[] }).applied, [`volsize=${APPLIED}`])
+    })
+
+    it('leaves an already-aligned grow byte-identical (round-up of a multiple is itself)', async () => {
+      server = startRoundServer(true)
+      const ALIGNED = 512 * MiB // a 16 KiB multiple and a grow over CURRENT
+      assert.equal(ALIGNED % BS, 0)
+      const res = await put({ properties: { volsize: ALIGNED } })
+      assert.equal(res.statusCode, 202)
+      await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', `volsize=${ALIGNED}`, VOL])
+    })
+
+    it('fails open — an unreadable volblocksize applies the size exactly as asked', async () => {
+      server = startRoundServer(false)
+      const res = await put({ properties: { volsize: REQUESTED } })
+      assert.equal(res.statusCode, 202)
+      await waitForJob(server, (res.json() as JobAccepted).job.id)
+      assert.deepEqual(zfsCalls().find(a => a[0] === 'set'), ['set', `volsize=${REQUESTED}`, VOL])
+    })
+  })
+
+  // ==========================================================================
   // The never-shrink gate must compare EXACT bytes — issue #50 (D1)
   //
   // `zfs list` WITHOUT `-p` prints three significant digits, so a 1240 GiB
