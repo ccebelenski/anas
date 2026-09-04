@@ -37,7 +37,7 @@ value vs exact bytes.
 | M1 | — | routes/iscsi-mutate.ts:751 | `{size, writeBack}` on a zvol drops the writeBack while audit + warning claim it applied | run `setLunWriteBack` after the grow, or refuse the combination |
 | D3 | — | services/iscsi-held.ts:118 | claims cache drops `installed`; failed read indistinguishable from "no LIO"; confirm doors can't disclose | keep `installed`/`readFailed`; append one warning line at destroy/export doors |
 | D4 | — | routes/pools.ts | `handsOff: 'iscsi-served-here'` consumed by AHR only; ZFS create/add-vdev/attach never read the inventory (pre-existing absence, widened here) | resolve ids via collectDisks, refuse `!isComposableDisk` with the AHR message shape |
-| M3 | — | services/iscsi-mutate.ts:656 | portal removal under live sessions has no gate (ACL removal is confirm-gated) | FIRST: ground-truth what LIO does to an established session on np delete (GT-37 covers new logins only); then refuse/confirm/warn accordingly |
+| M3 | — | services/iscsi-mutate.ts:656 | portal removal under live sessions has no gate (ACL removal is confirm-gated) | **GT ANSWERED (LIVE-PROOF-0.3.1 LP6):** the established session SURVIVES np delete (listener only; I/O continues, no kernel messages either side) but re-login/discovery through that address dies (error 8). Ruling follows the ACL pattern: CONFIRM-with-warnings naming the initiators whose session came in through the removed portal (the fact is in GET /iscsi/sessions), never a hard refusal. |
 
 ## Wave 3 — UI correctness and staleness (MEDIUM)
 
@@ -58,6 +58,21 @@ value vs exact bytes.
 - **Backup daemon:** R2 newLocation write-test probes the immediate parent (client creates the chain) → probe nearest existing ancestor; R3 `.anas-restore-partial` never removed on a successful retry into the same dir; R4 image `rate` unvalidated (reuse `BackupRateLimit`); R5 wrong-password → "Datastore.Audit" wording (reuse backup-runner.ts:892's auth/privs split — single source of truth); B1 same-second restart hits "dataset already exists" → destroy-and-retake own label.
 - **Executor:** D5 `ExecStreamResult` lacks `signal` (killed image restore reports a progress line as the reason); D6 `ExecStreamOptions` advertises `stdin` that execToStream ignores → honour or Omit<>; D7 `SECRET_ARG_RE` ^-anchor misses a joined token → word-boundary match; D8 mock stream fixtures first-registered-wins vs exec's exact-first.
 - **UI:** U3 pool-root row drops `heldByLun` (share one field list); U4 "Back up…" menu rebuilt every 5 s poll; U5 `netCache` never invalidated (and caches failures); U6 picker load has no generation guard; U7 Serial column tooltip lacks the value (never-truncate rule); U8 `portalsChanged` set-compare swallows a duplicate-portal edit; K6 literal "undefined" LUN name from older daemons (`v == null`); K7 LUN-picker columns get `htmlEncode` renderers.
+
+## Post-live-proof findings (2026-09-04 round, docs/LIVE-PROOF-0.3.1.md — all 7 items PASS)
+
+- **F1 MEDIUM → feeds the C2 ruling:** a FOREIGN target's stub sets `degraded: true` and 409s every
+  ANAS iSCSI mutation node-wide (`stub-backing`), while #54 correctly guarantees ANAS never clears
+  it; the refusal text promises an offline-taking that never happens and Repair answers
+  nothing-to-repair. Only hand targetcli escapes. The C2 ruling must now also decide: does a
+  foreign stub degrade the node at all, or only report?
+- **O1 LOW:** unaligned volsize grow fails as a job with raw ZFS text out of a 202; the create door
+  rounds silently — parallel construction wants rounding or a 400 at the door.
+- **O2 LOW:** file-kind LUN create accepted a configured-but-UNMOUNTED dataset backing (image
+  written to the parent; quarantine caught it later). The create door has the mount facts — refuse
+  there (same family as the backup source-guard idea).
+- **O3 LOW (boot):** an AHR fstab entry whose device never appears delays rtslib-fb-targetctl (and
+  multi-user.target) ~90 s via the x-systemd.before ordering; nofail prevents failure, not the wait.
 
 ## Rulings needed (not code yet)
 
