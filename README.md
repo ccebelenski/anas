@@ -94,10 +94,10 @@ every node.
   attributes survive every recreate, since that's how initiators (and PVE's own
   volids) recognise a disk. New targets start locked down: demo mode off,
   dynamic ACLs off, discovery closed to initiators not on the list. At boot the
-  target comes up after ZFS volumes and AHR pools, and a file-backed LUN whose
-  filesystem didn't mount is quarantined instead of being served as a blank
-  disk. You can't destroy a LUN's zvol, export its pool, or unmount its
-  filesystem out from under it; the refusal names the LUN and who's connected.
+  target comes up after ZFS volumes and AHR pools; a file-backed LUN whose
+  filesystem didn't mount is quarantined and not served. Destroying a LUN's
+  zvol, exporting its pool, or unmounting its filesystem is refused while the
+  LUN exists, and the refusal names the LUN and the connected initiators.
 - **Share users** — Samba user management for share access, over `getent`
   identities and nologin accounts. No role or permission system — PVE owns
   identity.
@@ -111,8 +111,8 @@ every node.
   about. File sources on ZFS and AHR are backed up **from a snapshot**, so a
   multi-hour run captures one instant; sources that can't be snapshotted (remote
   mounts, for instance) are backed up live and labeled as such. Nested
-  filesystems under a source are detected and you choose whether to include
-  them. Nothing is skipped silently.
+  filesystems under a source are detected and listed, and you choose which
+  ones to include.
 - **Restore** — selective file restore with a picker that browses the live tree
   and the archive catalog side by side, restoring **into the original**
   (matching files overwritten, the rest kept) or **somewhere else**. Whole-image
@@ -136,8 +136,8 @@ every node.
 - **Dashboard** — pool health, capacity, disk health, shares, running jobs and
   warnings, plus live telemetry: ARC, network throughput, and per-pool/per-disk
   I/O with latency for ZFS and AHR alike (the AHR strip breaks down to per-band
-  and per-member throughput/IOPS/latency). When everything is healthy and idle,
-  it stays quiet.
+  and per-member throughput/IOPS/latency). The jobs strip and warning cards
+  appear only when something is running or wrong.
 - **Jobs** — every change is a queued job you can watch through to its result,
   including the multi-hour ones.
 - **Notifications** — unattended runs (backup, snapshot schedules, replication)
@@ -153,9 +153,9 @@ every node.
   adds panels to the UI that is already there.
 - **Not a NAS operating system or appliance.** There's no second machine to
   boot, patch, or pass an HBA through to.
-- **Not a VM or container manager.** That's Proxmox's job.
-- **Not a Ceph manager.** `pveceph` owns Ceph. You can share a mounted CephFS
-  path like any other path, and that's as far as it goes.
+- **Not a VM or container manager.** Proxmox does that.
+- **Not a Ceph manager.** `pveceph` owns Ceph. A mounted CephFS path can be
+  shared like any other path; ANAS does nothing else with Ceph.
 - **Not an identity system.** PVE owns the login, and there are no roles or
   permissions. The only accounts ANAS manages are Samba users for share access.
 - **Not a scheduler, notifier, or monitoring stack.** systemd timers run the
@@ -185,7 +185,7 @@ ANAS treats your system as the source of truth and itself as a **guest**:
   to journald with the requesting user's identity.
 - **Dangerous operations are gated.** Destructive actions require an explicit
   confirmation code round-trip. An operation that would break something in use
-  is refused, with the reason and a suggested next step, rather than attempted.
+  is refused, and the refusal says why and what to do instead.
 
 ## Requirements
 
