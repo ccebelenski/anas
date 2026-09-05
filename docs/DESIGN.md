@@ -2,9 +2,9 @@
 
 ## Overview
 
-ANAS is a lightweight storage management GUI for Proxmox (and potentially other Linux platforms). It provides a modern web interface for managing ZFS pools/datasets, SMB shares, NFS exports, and share security — the storage management features that Proxmox's native UI doesn't cover well.
+ANAS is the storage layer Proxmox VE doesn't have. Proxmox manages the storage its guests consume; ANAS manages the storage a node *serves* — ZFS and ANAS Hybrid RAID pools, datasets and zvols, SMB shares, NFS exports, an iSCSI target, snapshots and schedules, replication, backup to Proxmox Backup Server with restore, client-side mounts, and disk health. It targets Proxmox VE (and potentially other Linux platforms).
 
-Think TrueNAS, but purpose-built to complement Proxmox rather than replace it.
+It runs on the PVE node itself, presented as native ExtJS panels injected into the PVE web UI — the same model Proxmox uses for Ceph. There is no separate appliance, no separate web app, and no second login: PVE owns the session. ANAS complements Proxmox rather than replacing it, and stays a guest on the system it manages — PVE keeps identity, notifications, certificates, scheduling and its own storage territory.
 
 ## V1 Scope
 

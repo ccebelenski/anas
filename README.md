@@ -1,15 +1,21 @@
 # ANAS — A NAS
 
-**TrueNAS-style storage management for Proxmox VE, inside the Proxmox web UI.**
+**The storage layer Proxmox VE doesn't have, inside the Proxmox web UI.**
 
-ANAS adds the storage management layer that Proxmox's native UI doesn't cover:
-ZFS pools, datasets, snapshots and replication, SMB/NFS shares, share security,
-file backup to PBS, and **Hybrid RAID pools that mix drive sizes and grow one
-disk at a time** — presented as native panels injected into the PVE web UI
-itself (the same model Proxmox uses for Ceph). There is no separate web app to
-visit and no separate login: you use your existing PVE session.
+Proxmox VE manages VMs and containers and the storage they consume. It doesn't
+do much for the storage you serve to everything else: file shares, block
+targets, and the pools and disks behind them. ANAS fills that gap, on the PVE
+node itself: ZFS pools, **Hybrid RAID pools that mix drive sizes and grow one
+disk at a time**, datasets and zvols, SMB and NFS shares, an iSCSI target,
+snapshots and scrubs on a schedule, replication with `zfs send/recv`, file and
+block backup to Proxmox Backup Server (and restore), client-side NFS/CIFS
+mounts, and disk health.
 
-Think TrueNAS, but purpose-built to **complement** Proxmox rather than replace it.
+The UI is a set of native ExtJS panels added to the Proxmox web UI, the same way
+Proxmox does Ceph. You don't deploy an appliance or pass an HBA through to a NAS
+VM, and there's no second web app or second login. You're already logged into
+PVE, and since PVE tickets are valid cluster-wide, the same browser tab works on
+every node.
 
 > **Status: pre-1.0.** Actively developed and dogfooded on a production PVE
 > cluster, but interfaces and behavior may change without notice. Use at your
@@ -36,49 +42,124 @@ Think TrueNAS, but purpose-built to **complement** Proxmox rather than replace i
 
 ## Features
 
-- **Dashboard** — pool health, capacity, fleet disk health, shares, running
-  jobs, warnings, and live telemetry (ARC, network throughput, per-pool/disk
-  I/O with latency for both ZFS and AHR pools — the AHR strip breaks down to
-  per-band and per-member throughput/IOPS/latency)
+### Pools
+
 - **ZFS pools** — create/import/export/destroy, scrub, topology view with
-  per-bay disk health, device errors, properties; a drag-to-build vdev
-  composer with a live capacity/redundancy preview and a rules-based pool
-  advisor
+  per-bay disk health, device errors and properties. A drag-to-build vdev
+  composer shows capacity and redundancy as you go, and a rules-based advisor
+  warns about layouts with no redundancy or wasted space before you build them.
+  Special/dedup vdevs and RAIDZ expansion are supported; PVE-owned pools are
+  tagged and left alone.
 - **Hybrid RAID (AHR)** — Synology-SHR-style pools from **mismatched disk
   sizes**, using every drive's full height (a 12 TB next to 8 TBs contributes
-  all 12, not 8): disks are sliced into size-matched bands, each band is its
-  own md RAID5/6 array, LVM concatenates them under one btrfs filesystem
-  (checksums + scrub; redundancy always lives in md, never btrfs-RAID).
-  **Grow-as-you-buy online expansion** — add or live-replace one disk at a
-  time while the pool stays mounted; a live layout preview shows exactly what
-  each disk combination yields (and names any capacity that stays locked
-  until a matching disk arrives) before you commit. Expansion is a resumable
-  multi-layer job: power loss mid-reshape is survivable, interrupted runs
-  resume or abandon cleanly, and md events land in PVE's own notification
-  system. **Hot spares** — full-coverage spares sliced into every band so md
-  owns automatic failover; expansion auto-extends spare coverage to new bands.
-  **btrfs snapshots** — new pools get an `@data`/`@snapshots` subvolume layout;
-  list/create/delete and roll back, with rollback preserving the replaced state
-  (destroying nothing)
-- **Datasets** — create/manage, quotas, compression, permissions/ACLs, a
-  layered access editor
-- **Snapshots** — create, rollback (gated), clone, destroy
-- **Replication** — `zfs send/recv` tasks on systemd timers: local pool→pool
-  and remote over SSH (PVE cluster peers auto-discovered; external hosts —
-  including TrueNAS — need only sshd + ZFS, nothing installed)
+  all 12, not 8): disks are sliced into size-matched bands, each band is its own
+  md RAID5/6 array, LVM concatenates the bands, and one btrfs filesystem sits on
+  top (checksums + scrub; redundancy always lives in md, never btrfs-RAID).
+  **Grow as you buy** — add or live-replace one disk at a time while the pool
+  stays mounted, with a layout preview that names what each combination yields
+  and what stays locked until a matching disk arrives. Expansion is a resumable
+  multi-layer job; power loss mid-reshape is survivable. **Hot spares** are
+  full-coverage — sliced into every band so md owns failover.
+
+### Data
+
+- **Datasets** — tree view, quotas, compression/dedup/sync/trim, and a
+  POSIX-ACL permissions editor with a layered access view.
+- **ZFS volumes (zvols)** — listed with size, `volblocksize` and usage; create,
+  grow while in use (the initiator rescans and sees the new size), snapshot and
+  destroy. PVE guest volumes stay read-only.
+- **Snapshots** — create, rename, rollback (gated), clone, destroy on ZFS; the
+  same verbs on AHR over btrfs `@data`/`@snapshots` subvolumes, where rollback
+  preserves the replaced state rather than destroying it.
+- **Schedules** — uniform snapshot and scrub schedules across ZFS and AHR, on
+  systemd timers, with keep-N-per-period retention that never prunes a held
+  snapshot. Scrubs start and stop from the UI and report progress and a
+  last-scrub verdict.
+- **Replication** — `zfs send/recv` tasks on systemd timers: local pool→pool and
+  remote over SSH. PVE cluster peers are auto-discovered; external hosts —
+  including TrueNAS — need only sshd and ZFS, nothing installed. Host keys are
+  pinned and shown; when a remote is rebuilt you re-trust it from the UI.
+
+### Serving
+
 - **SMB shares** — full share lifecycle over a round-trip `smb.conf` editor
-  that preserves your comments and formatting; connection details view
-- **NFS exports** — same treatment for `/etc/exports`
-- **Share users/groups** — Samba user management for share access (no
-  role/permission system — PVE owns identity)
+  that preserves your comments and formatting; per-share access control (valid
+  users, browseable, read-only, allowed/denied hosts) and a connection-details
+  view.
+- **NFS exports** — the same treatment for `/etc/exports`.
+- **iSCSI target** — manages LIO (targetcli) natively: targets with a stable
+  ANAS-generated IQN, portals, initiator ACLs with one-way or mutual CHAP
+  (secrets go to configfs, never onto a command line), and LUNs backed by a
+  **zvol** or by a **raw image file** on a dataset or AHR pool. LUN serials and
+  attributes survive every recreate, since that's how initiators (and PVE's own
+  volids) recognise a disk. New targets start locked down: demo mode off,
+  dynamic ACLs off, discovery closed to initiators not on the list. At boot the
+  target comes up after ZFS volumes and AHR pools, and a file-backed LUN whose
+  filesystem didn't mount is quarantined instead of being served as a blank
+  disk. You can't destroy a LUN's zvol, export its pool, or unmount its
+  filesystem out from under it; the refusal names the LUN and who's connected.
+- **Share users** — Samba user management for share access, over `getent`
+  identities and nologin accounts. No role or permission system — PVE owns
+  identity.
+
+### Protecting
+
+- **Backup to PBS** — a task is **files** (shares, datasets, any mounted path)
+  or **block** (one LUN per task, as a fixed-chunk `.img` archive), stored on a
+  Proxmox Backup Server via `proxmox-backup-client` with dedup, encryption,
+  retention and pruning. Repositories include the PBS storages PVE already knows
+  about. File sources on ZFS and AHR are backed up **from a snapshot**, so a
+  multi-hour run captures one instant; sources that can't be snapshotted (remote
+  mounts, for instance) are backed up live and labeled as such. Nested
+  filesystems under a source are detected and you choose whether to include
+  them. Nothing is skipped silently.
+- **Restore** — selective file restore with a picker that browses the live tree
+  and the archive catalog side by side, restoring **into the original**
+  (matching files overwritten, the rest kept) or **somewhere else**. Whole-image
+  LUN restore goes onto the original LUN, or onto a **new LUN** with a fresh
+  serial on any target, leaving the source untouched. There's one Restore
+  dialog, reachable from the LUN toolbar, the task grid or the repository, and
+  it only asks for what it can't work out from where you opened it.
+- **Disk health** — SMART and ZFS fused into a single per-disk status, with
+  pool and vdev membership.
+
+### Consuming
+
 - **Mounts** — client-side NFS/CIFS mounts with surgical fstab persistence
-  (credentials in root-only files, never on a command line), a common option
-  set across both protocols and human-readable file/dir permission modes;
-  local and PVE-owned mounts inventoried read-only
-- **File backup (PBS)** — back up shares, datasets, or any mounted path to a
-  Proxmox Backup Server with `proxmox-backup-client` (dedup, encryption,
-  retention), ZFS-snapshot-consistent where the source supports it
-- **Disk health** — SMART + ZFS fused per-disk status
+  (credentials in root-only files, never on a command line), a common option set
+  across both protocols, human-readable file/dir permission modes, and on-demand
+  (automount) mounting. Local, ZFS-, AHR- and PVE-owned mounts are inventoried
+  read-only and labeled with what manages them.
+
+### Operating
+
+- **Dashboard** — pool health, capacity, disk health, shares, running jobs and
+  warnings, plus live telemetry: ARC, network throughput, and per-pool/per-disk
+  I/O with latency for ZFS and AHR alike (the AHR strip breaks down to per-band
+  and per-member throughput/IOPS/latency). When everything is healthy and idle,
+  it stays quiet.
+- **Jobs** — every change is a queued job you can watch through to its result,
+  including the multi-hour ones.
+- **Notifications** — unattended runs (backup, snapshot schedules, replication)
+  report through **PVE's own notification system**, per task: always, or on
+  failure only.
+- **Cluster** — cross-node traffic goes through each node's `:8006`: no extra
+  port, no extra certificate. A version-skew banner names the versions when a
+  newer UI meets an older daemon.
+
+## What ANAS is not
+
+- **Not a Proxmox replacement or fork.** It installs onto a stock PVE node and
+  adds panels to the UI that is already there.
+- **Not a NAS operating system or appliance.** There's no second machine to
+  boot, patch, or pass an HBA through to.
+- **Not a VM or container manager.** That's Proxmox's job.
+- **Not a Ceph manager.** `pveceph` owns Ceph. You can share a mounted CephFS
+  path like any other path, and that's as far as it goes.
+- **Not an identity system.** PVE owns the login, and there are no roles or
+  permissions. The only accounts ANAS manages are Samba users for share access.
+- **Not a scheduler, notifier, or monitoring stack.** systemd timers run the
+  schedules and PVE's notification system delivers the messages.
 
 ## How it's built (the guest philosophy)
 
@@ -91,16 +172,20 @@ ANAS treats your system as the source of truth and itself as a **guest**:
   ordering, and hand-edits preserved byte-for-byte outside the touched lines.
   Never overwritten, never "owned".
 - **Leverage, don't rebuild.** PVE's certificates, auth tickets, journald,
-  systemd timers, and cluster filesystem are used as-is. ANAS builds no
-  scheduler, no notification system, no user database.
+  systemd timers, notification system, and cluster filesystem are used as-is.
+  ANAS builds no scheduler, no notifier, no user database.
+- **PVE territory is read-only.** Pools, datasets, volumes and mounts that
+  Proxmox manages are inventoried, labeled, and left alone; `storage.cfg` is
+  parsed, never written.
 - **Two processes, one boundary.** An API gateway (`anas`, plain HTTP on the
-  loopback interface) fronts a system daemon (`anasd`, REST over a Unix socket).
-  The gateway is reached through PVE's own `:8006` front door under `/anas`
-  (a fail-open reverse-proxy hook in pveproxy) — no separate origin, no extra
-  certificate. All mutations are queued jobs; every operation is audited to
-  journald with the requesting user's identity.
+  loopback interface) fronts a system daemon (`anasd`, REST over a Unix
+  socket). The gateway is reached through PVE's own `:8006` front door under
+  `/anas` (a fail-open reverse-proxy hook in pveproxy) — no separate origin, no
+  extra certificate. All mutations are queued jobs; every operation is audited
+  to journald with the requesting user's identity.
 - **Dangerous operations are gated.** Destructive actions require an explicit
-  confirmation code round-trip — no accidental pool destroys.
+  confirmation code round-trip. An operation that would break something in use
+  is refused, with the reason and a suggested next step, rather than attempted.
 
 ## Requirements
 
@@ -126,12 +211,12 @@ sudo ./install.sh              # add --install-deps on a fresh node
 ```
 
 The installer preflights the node without touching it, then performs a
-transactional install (backup → install → health check → PVE UI integration)
-that rolls itself back completely on any failure. Re-running it is the upgrade
-path. ANAS is served through pveproxy on `:8006` under `/anas`, so there is no
-separate origin and **no extra certificate to accept** — if the Proxmox web UI
-loads, ANAS does. See [`packaging/README.md`](packaging/README.md) for flags
-and uninstall.
+transactional install (dependencies → backup → install → health check → PVE UI
+integration) that rolls itself back completely on any failure. Re-running it is
+the upgrade path. ANAS is served through pveproxy on `:8006` under `/anas`, so
+there is no separate origin and **no extra certificate to accept** — if the
+Proxmox web UI loads, ANAS does. See [`packaging/README.md`](packaging/README.md)
+for flags and uninstall.
 
 ### Gateway port
 
