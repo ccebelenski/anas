@@ -10,8 +10,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import Fastify from 'fastify'
 import { lunGrowGuidance } from '@anas/shared'
+import Fastify from 'fastify'
 import { MockExecutor } from '../../executor/mock.js'
 import { materializeConfigfsManifest } from '../../fixtures/configfs-manifest.js'
 import { JobQueue } from '../../jobs/queue.js'
@@ -75,7 +75,6 @@ const UMOUNT = '/usr/bin/umount'
 const MV = '/usr/bin/mv'
 const BTRFS = '/usr/bin/btrfs'
 const FINDMNT = '/usr/bin/findmnt'
-
 
 /**
  * The dev mock's `ahr0` is mounted FLAT (`subvol=/`), which the snapshot
@@ -672,12 +671,21 @@ describe('the disclosure — a failed claims read is named at the confirm doors 
     const built = Fastify({ logger: false })
     const jobQueue = new JobQueue()
     await built.register(poolRoutes, {
-      prefix: '/v1', executor, jobQueue, confirmStore: new ConfirmStore(),
-      fstabPath: join(dir, 'fstab'), pveStoragePath: join(dir, 'no-storage.cfg'), iscsiPaths,
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      fstabPath: join(dir, 'fstab'),
+      pveStoragePath: join(dir, 'no-storage.cfg'),
+      iscsiPaths,
     })
     await built.register(datasetRoutes, {
-      prefix: '/v1', executor, jobQueue, confirmStore: new ConfirmStore(),
-      transport: stubTransport(), iscsiPaths,
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      confirmStore: new ConfirmStore(),
+      transport: stubTransport(),
+      iscsiPaths,
     })
     await built.ready()
     return built
@@ -721,8 +729,10 @@ describe('the disclosure — a failed claims read is named at the confirm doors 
   it('pool export mints the confirm gate WITH the could-not-check warning', async () => {
     app = await buildDoors(BROKEN_READ)
     const res = await app.inject({
-      method: 'POST', url: `/v1/pools/${UNSERVED_POOL}/export`,
-      headers: JSON_HEADERS, payload: '{}',
+      method: 'POST',
+      url: `/v1/pools/${UNSERVED_POOL}/export`,
+      headers: JSON_HEADERS,
+      payload: '{}',
     })
     assert.equal(res.statusCode, 409)
     const body = res.json() as { error: { code: string, warnings: string[] } }

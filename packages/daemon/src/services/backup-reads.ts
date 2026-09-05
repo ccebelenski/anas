@@ -48,8 +48,6 @@ const ARCHIVE_MISSING_RE = /archive not found in manifest/i
 const ARCHIVE_TYPE_RE = /failed to parse archive type/i
 /** `Error: Can only mount pxar archives.` (an `.img` handed to catalog shell). */
 const NOT_PXAR_RE = /can only mount pxar archives/i
-/** The listing paths: `permission check failed - missing Datastore.Audit|…`. */
-const PERM_CHECK_RE = /permission check failed/i
 /** The catalog-shell path has its OWN wording: `no permissions on /datastore/…`. */
 const PERM_NONE_RE = /no permissions on/i
 /** `Error: client error (Connect)` — the transport never came up. */

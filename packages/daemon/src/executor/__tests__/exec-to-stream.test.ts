@@ -1,3 +1,4 @@
+import type { ExecStreamOptions } from '../types.js'
 import assert from 'node:assert/strict'
 import { constants } from 'node:fs'
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
@@ -6,7 +7,6 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../mock.js'
 import { ProdExecutor } from '../prod.js'
-import type { ExecStreamOptions } from '../types.js'
 
 /**
  * `ProdExecutor.execToStream` — REAL processes, real file descriptors.
