@@ -122,7 +122,7 @@ test.describe('Per-dataset ownership stamps (list)', () => {
     try {
       const res = await ctx.get(`${V1}/pools/${PVE_POOL}/datasets`)
       expect(res.status()).toBe(200)
-      const rows: Array<{ name: string, pve?: { kind: string, storage?: string, reason: string } }>
+      const rows: Array<{ name: string, pve?: { kind: string, storage?: string, reason: string, childrenManageable?: boolean } }>
         = (await res.json()).data
       const byName = new Map(rows.map(r => [r.name, r]))
 
@@ -131,6 +131,8 @@ test.describe('Per-dataset ownership stamps (list)', () => {
       expect(root?.pve).toEqual({
         kind: 'storage-root',
         storage: PVE_POOL,
+        // A storage root may hold ANAS siblings — the daemon says so itself (review fix 3).
+        childrenManageable: true,
         reason: expect.stringContaining(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}`),
       })
 
@@ -139,6 +141,7 @@ test.describe('Per-dataset ownership stamps (list)', () => {
         const row = byName.get(`${PVE_POOL}/${vol}`)
         expect(row?.pve, vol).toEqual({
           kind: 'guest-volume',
+          childrenManageable: false,
           storage: PVE_POOL,
           reason: expect.stringContaining(`PVE storage '${PVE_POOL}' owns ${PVE_POOL}/${vol} as a guest volume`),
         })
@@ -148,6 +151,7 @@ test.describe('Per-dataset ownership stamps (list)', () => {
       const dump = byName.get(`${PVE_POOL}/dump`)
       expect(dump?.pve).toEqual({
         kind: 'dir-storage',
+        childrenManageable: false,
         storage: 'pvfixdump',
         reason: expect.stringContaining(`PVE storage 'pvfixdump' owns ${PVE_POOL}/dump as directory storage`),
       })
@@ -166,25 +170,29 @@ test.describe('Per-dataset ownership stamps (list)', () => {
     try {
       const res = await ctx.get(`${V1}/pools/${SYS_POOL}/datasets`)
       expect(res.status()).toBe(200)
-      const rows: Array<{ name: string, pve?: { kind: string, storage?: string, reason: string } }>
+      const rows: Array<{ name: string, pve?: { kind: string, storage?: string, reason: string, childrenManageable?: boolean } }>
         = (await res.json()).data
       const byName = new Map(rows.map(r => [r.name, r]))
 
       const bootfs = `${SYS_POOL}/ROOT/pve-1`
-      expect(byName.get(SYS_POOL)?.pve).toMatchObject({ kind: 'system' })
-      expect(byName.get(`${SYS_POOL}/ROOT`)?.pve).toMatchObject({ kind: 'system' })
-      expect(byName.get(bootfs)?.pve).toMatchObject({ kind: 'system' })
+      // The system pool's ROOT may hold ANAS siblings (rpool/media on a default install);
+      // the boot tree may not — the daemon states both (review fix 3).
+      expect(byName.get(SYS_POOL)?.pve).toMatchObject({ kind: 'system', childrenManageable: true })
+      expect(byName.get(`${SYS_POOL}/ROOT`)?.pve).toMatchObject({ kind: 'system', childrenManageable: false })
+      expect(byName.get(bootfs)?.pve).toMatchObject({ kind: 'system', childrenManageable: false })
       expect(byName.get(bootfs)?.pve?.reason).toContain(`${bootfs} is the boot filesystem of pool ${SYS_POOL}`)
 
       const dataRoot = byName.get(`${SYS_POOL}/data`)
       expect(dataRoot?.pve).toEqual({
         kind: 'storage-root',
         storage: 'sysfix-data',
+        childrenManageable: true,
         reason: expect.stringContaining(`PVE storage 'sysfix-data' owns ${SYS_POOL}/data`),
       })
 
       expect(byName.get(`${SYS_POOL}/data/vm-200-disk-0`)?.pve).toEqual({
         kind: 'guest-volume',
+        childrenManageable: false,
         storage: 'sysfix-data',
         reason: expect.stringContaining(`PVE storage 'sysfix-data' owns ${SYS_POOL}/data/vm-200-disk-0 as a guest volume`),
       })
