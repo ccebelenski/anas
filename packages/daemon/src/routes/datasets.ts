@@ -1810,6 +1810,15 @@ export async function datasetRoutes(
       return { error: { code: 'NOT_FOUND', message: `Snapshot '${from}' not found` } }
     }
 
+    // PVE footprint (story pvepool.1): an OWNED dataset is view-only — its
+    // snapshots are PVE's to manage, like its create (the same guard above).
+    // Refused with the predicate's reason.
+    const owned = (await pveFootprint()).ownershipOf(fullName)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
+    }
+
     const job = jobQueue.submit(
       'zfs.rename',
       { ...identity, params: { from, to } },
@@ -1845,6 +1854,15 @@ export async function datasetRoutes(
     if (!existing.some(s => s.name === snapName)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` } }
+    }
+
+    // PVE footprint (story pvepool.1): an OWNED dataset is view-only — a
+    // guest volume's snapshots are PVE's to destroy, and a storage root's are
+    // taken and kept by PVE itself. Refused with the predicate's reason.
+    const owned = (await pveFootprint()).ownershipOf(fullName)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
     }
 
     // Plain 202 — destroying a snapshot removes a recovery point, not live data,
@@ -1888,6 +1906,16 @@ export async function datasetRoutes(
     if (!target) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` } }
+    }
+
+    // PVE footprint (story pvepool.1): an OWNED dataset is view-only — a
+    // rollback rewrites PVE's data in place, the most damaging of the snapshot
+    // verbs here. Refused BEFORE the confirm gate is even minted, with the
+    // predicate's reason.
+    const owned = (await pveFootprint()).ownershipOf(fullName)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
     }
 
     // Snapshots newer than the target block a plain rollback; ZFS needs `-r`
@@ -1982,6 +2010,17 @@ export async function datasetRoutes(
       return { error: { code: 'NOT_FOUND', message: `Snapshot '${snapName}' not found` } }
     }
 
+    // PVE footprint (story pvepool.1), loaded once for BOTH ends of the clone.
+    const pve = await pveFootprint()
+
+    // Source end: an OWNED dataset is view-only — a clone out of PVE's
+    // snapshot tree is PVE's to make. Refused with the predicate's reason.
+    const sourceOwned = pve.ownershipOf(fullName)
+    if (sourceOwned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: sourceOwned.reason } }
+    }
+
     // 409 if the target dataset already exists — clone creates a NEW dataset.
     const targetPool = target.split('/')[0]
     const targetDatasets = await listDatasets(targetPool)
@@ -1994,7 +2033,6 @@ export async function datasetRoutes(
     // dataset create wearing another hat: the naming guard first, then
     // ownership of the target itself (a storage root, a dir-storage tree, the
     // boot tree — a guest-named target is already caught by the guard above).
-    const pve = await pveFootprint()
     const claim = pve.claimedByPve(target)
     if (claim) {
       reply.code(400)

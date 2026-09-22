@@ -8,6 +8,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
 
 const IDENTITY_HEADERS = {
@@ -647,5 +648,120 @@ describe('PVE footprint ownership (pvepool.1)', () => {
     })
     assert.equal(res.statusCode, 400)
     assert.match(res.json().error.message, /guest volume/)
+  })
+
+  // Snapshot verbs under an OWNED dataset. The default mock knows no snapshots
+  // under the guest volume, so each case below registers the one it needs.
+  const GUEST_SNAP = JSON.stringify({
+    datasets: {
+      'testpool/vm-100-disk-0@vm-snap': {
+        name: 'testpool/vm-100-disk-0@vm-snap',
+        type: 'SNAPSHOT',
+        pool: 'testpool',
+        properties: {},
+      },
+    },
+  })
+
+  function guestVolumeWithSnapshot(): void {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.addFixture({ command: '/usr/sbin/zfs', args: zfsSnapshotDetailArgs('testpool/vm-100-disk-0'), result: { stdout: GUEST_SNAP, stderr: '', exitCode: 0 } })
+  }
+
+  it('renaming a snapshot of an OWNED dataset is refused with the ownership reason', async () => {
+    guestVolumeWithSnapshot()
+    const res = await server!.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/datasets/vm-100-disk-0/snapshots/vm-snap',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ newName: 'renamed' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /guest volume/)
+  })
+
+  it('rolling back an OWNED dataset is refused before the confirm gate (400, not 409)', async () => {
+    guestVolumeWithSnapshot()
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/vm-100-disk-0/snapshots/vm-snap/rollback',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /guest volume/)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+  })
+
+  it('destroying a snapshot of an OWNED dataset is refused with the ownership reason', async () => {
+    guestVolumeWithSnapshot()
+    const res = await server!.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool/datasets/vm-100-disk-0/snapshots/vm-snap',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /guest volume/)
+  })
+
+  it('cloning OUT of an OWNED dataset is refused with the ownership reason', async () => {
+    guestVolumeWithSnapshot()
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/vm-100-disk-0/snapshots/vm-snap/clone',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ target: 'testpool/restored' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /guest volume/)
+  })
+
+  it('the same snapshot verbs on the sibling pass the guard — rename', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/datasets/media/snapshots/snap1',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ newName: 'renamed' }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+    assert.equal((job.result as { to: string }).to, 'testpool/media@renamed')
+  })
+
+  it('the same snapshot verbs on the sibling pass the guard — rollback (challenge, then 202)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const first = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/media/snapshots/snap1/rollback',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(first.statusCode, 409)
+    assert.equal(first.json().error.code, 'CONFIRMATION_REQUIRED')
+    const code = first.headers['x-anas-confirm-code'] as string
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/media/snapshots/snap1/rollback',
+      headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code },
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+  })
+
+  it('the same snapshot verbs on the sibling pass the guard — destroy (plain 202)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool/datasets/media/snapshots/snap1',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 202)
+    assert.equal(res.headers['x-anas-confirm-code'], undefined)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed')
+    assert.equal((job.result as { destroyed: string }).destroyed, 'testpool/media@snap1')
   })
 })
