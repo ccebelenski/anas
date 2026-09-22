@@ -1,5 +1,7 @@
 import type { ReplicationTarget } from '@anas/shared'
+import type { PveFootprint } from './pve-footprint.js'
 import type { ResolvedLocation, Transport } from './replication-transport.js'
+import { pveNamingGuardMessage } from './pve-footprint.js'
 
 /**
  * WHERE a replication target lives, and whether it may be written to.
@@ -18,10 +20,11 @@ import type { ResolvedLocation, Transport } from './replication-transport.js'
  *    must be registered) — an unresolvable one is the caller's 400;
  *  - the target POOL must exist where the target actually lives: locally via
  *    `zpool list`, on a peer/remote via `ssh zpool list`;
- *  - the story 3.25 PVE-managed exclusion and the replicate-onto-itself check
- *    are LOCAL-ONLY facts: we neither can nor should read a remote's
- *    storage.cfg, and a peer's `backup/media` is a different machine's dataset,
- *    never the source we are reading from.
+ *  - the PVE footprint exclusion (pvepool.1 — the TARGET DATASET is judged, not
+ *    the pool) and the replicate-onto-itself check are LOCAL-ONLY facts: we
+ *    neither can nor should read a remote's storage.cfg, and a peer's
+ *    `backup/media` is a different machine's dataset, never the source we are
+ *    reading from.
  */
 
 /** A target that lives on this node, or on a resolved peer/remote. */
@@ -69,11 +72,11 @@ export interface TargetGuardDeps {
   /** Does this pool exist on THIS node (`zpool list`)? */
   poolExists: (pool: string) => Promise<boolean>
   /**
-   * Story 3.25 boundary guard: is this LOCAL pool PVE-managed (referenced by
-   *  /etc/pve/storage.cfg)? Fail-open (non-PVE host / unreadable config →
-   *  false). Only ever asked about a local pool.
+   * PVE footprint ownership (story pvepool.1): the ONE service that answers
+   * "is this dataset PVE's?", loaded fresh per guard run. Only consulted for a
+   * LOCAL target — a remote's storage.cfg is neither readable nor ours to read.
    */
-  isPveManagedPool: (pool: string) => Promise<boolean>
+  pveFootprint: () => Promise<PveFootprint>
 }
 
 export interface TargetGuardInput {
@@ -110,10 +113,22 @@ export async function guardReplicationTarget(
     return { ok: false, message: `Target pool '${target.pool}' does not exist${where}` }
   }
 
-  // Story 3.25: never create datasets on a PVE-managed pool. LOCAL targets only
-  // — a remote's storage.cfg is neither readable nor ours to read.
-  if (!placement.isRemote && (await deps.isPveManagedPool(target.pool)))
-    return { ok: false, message: `Target pool '${target.pool}' is PVE-managed — ANAS does not create datasets there` }
+  // PVE footprint ownership (story pvepool.1): never write into PVE's
+  // territory — but ONLY the dataset itself is judged, not the pool. A target
+  // dataset PVE owns (a storage root, a guest volume, a dir-storage tree, the
+  // boot tree) is refused with the predicate's reason; a target whose NAME
+  // PVE would inventory as a guest disk on its next scan trips the naming
+  // guard. A sibling dataset on a PVE pool is a legitimate target. LOCAL
+  // targets only — a remote's storage.cfg is neither readable nor ours to read.
+  if (!placement.isRemote) {
+    const pve = await deps.pveFootprint()
+    const owned = pve.ownershipOf(targetFull)
+    if (owned)
+      return { ok: false, message: `Replication target '${targetFull}' is PVE-owned — ${owned.reason}` }
+    const claim = pve.claimedByPve(targetFull)
+    if (claim)
+      return { ok: false, message: pveNamingGuardMessage(claim.storage, targetFull) }
+  }
 
   // Replicating a dataset onto itself is meaningless — again LOCAL only: the
   // same name on a peer is a different machine's dataset.

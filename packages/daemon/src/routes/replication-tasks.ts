@@ -4,8 +4,8 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { Transport } from '../services/replication-transport.js'
 import type { TargetNamesResolver } from '../services/replication-units.js'
 import { ReplicationTask, ReplicationTaskName } from '@anas/shared'
-import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
+import { loadPveFootprint } from '../services/pve-footprint.js'
 import { guardReplicationTarget } from '../services/replication-target.js'
 import {
   collectTaskStatuses,
@@ -89,19 +89,11 @@ export async function replicationTaskRoutes(
   }
 
   /**
-   * Story 3.25 boundary guard: is the pool PVE-managed (referenced by
-   *  storage.cfg)? Fail-open (non-PVE host / unreadable config → false), exactly
-   *  as the stage-1 replicate guard.
+   * Story pvepool.1: the ONE footprint service answers "does PVE own this
+   * dataset?" for the target guard — the target DATASET is judged, not the
+   * pool (the old pool-level `isPveManagedPool` probe is gone).
    */
-  async function isPveManagedPool(poolName: string): Promise<boolean> {
-    try {
-      const refs = await readPveStorages(PVE_STORAGE_CFG, await readZfsMountpoints())
-      return (refs.get(poolName) ?? []).length > 0
-    }
-    catch {
-      return false
-    }
-  }
+  const pveFootprint = () => loadPveFootprint(executor)
 
   /**
    * The create/update guards: the schedule must be valid systemd calendar
@@ -136,7 +128,7 @@ export async function replicationTaskRoutes(
     }
     const { sourceFull, targetFull } = resolveTaskDatasets(task)
     const guard = await guardReplicationTarget(
-      { transport, poolExists, isPveManagedPool },
+      { transport, poolExists, pveFootprint },
       { target: task.target, sourceFull, targetFull },
     )
     if (!guard.ok) {

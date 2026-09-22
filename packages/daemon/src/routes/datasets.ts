@@ -5,11 +5,11 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedAcl } from '../parsers/getfacl.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { IscsiPaths } from '../services/iscsi.js'
+import type { PveFootprint } from '../services/pve-footprint.js'
 import type { Transport } from '../services/replication-transport.js'
 import { CloneSnapshotRequest, CreateDatasetRequest as CreateDatasetRequestSchema, CreateSnapshotRequest, DatasetPath, lunGrowGuidance, PoolName, RenameSnapshotRequest, SetAccessRequest, SetPermissionsRequest, SnapshotName, UpdateDatasetPropertiesRequest as UpdateDatasetPropertiesRequestSchema } from '@anas/shared'
 import { parseExports } from '../parsers/exports.js'
 import { levelToAclPerms, levelToOctalDigit, modeDigitToLevel, parseGetfacl, permsToLevel } from '../parsers/getfacl.js'
-import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseSmbConf } from '../parsers/smb-conf.js'
 import { parseDatasetGet, parseSnapshotList, parseSnapshotNames, parseVolblocksizeDefault, parseZfsList, zfsListArgs, zfsSnapshotDetailArgs, zfsSnapshotListArgs } from '../parsers/zfs-list.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
@@ -17,6 +17,7 @@ import { confirmGate } from '../safety/gate.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { loadPveFootprint, pveNamingGuardMessage } from '../services/pve-footprint.js'
 import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 import { createReplicationHandlers } from './replication.js'
@@ -423,17 +424,9 @@ export async function datasetRoutes(
     poolExists,
     datasetExists,
     listSnapshotsDetail,
-    // Story 3.25 boundary guard: same storage.cfg detection GET /pools uses.
-    // Fail-open (non-PVE host / unreadable config → not PVE-managed).
-    isPveManagedPool: async (pool: string) => {
-      try {
-        const refs = await readPveStorages(PVE_STORAGE_CFG, await readZfsMountpoints())
-        return (refs.get(pool) ?? []).length > 0
-      }
-      catch {
-        return false
-      }
-    },
+    // PVE footprint ownership (story pvepool.1): the ONE service that answers
+    // "is this dataset PVE's?" — the target guard asks it per request.
+    pveFootprint: () => loadPveFootprint(executor),
     transport,
   })
 
@@ -442,6 +435,29 @@ export async function datasetRoutes(
     const r = await executor.exec('/usr/sbin/zpool', ['list', '-j'])
     const pools = r.exitCode === 0 && r.stdout.trim() ? parseZpoolList(r.stdout) : []
     return pools.some(p => p.name === poolName)
+  }
+
+  /**
+   * The PVE footprint, loaded ONCE per request (story pvepool.1). The ONE
+   * answerer for "does PVE own this dataset?" — every guard and every stamp in
+   * this file asks it; there is no local copy of the old pool-level rule.
+   */
+  function pveFootprint() {
+    return loadPveFootprint(executor)
+  }
+
+  /**
+   * Stamp the per-node `pve` verdict onto every OWNED row (story pvepool.1).
+   * Additive and optional (version-skew ruling): a row outside PVE's footprint
+   * carries no field, so "absent" means manageable — an older UI ignores the
+   * field entirely and keeps today's whole-pool rule.
+   */
+  function stampPveOwnership(pve: PveFootprint, rows: Dataset[]): void {
+    for (const d of rows) {
+      const owned = pve.ownershipOf(d.name)
+      if (owned)
+        d.pve = owned
+    }
   }
 
   /**
@@ -791,6 +807,16 @@ export async function datasetRoutes(
     // cache) — never a request per row.
     await annotateHeldByLun(datasets)
 
+    // Story pvepool.1: per-node PVE ownership, decided by the one predicate —
+    // owned rows carry `pve`, everything else (the siblings this story exists
+    // to unlock) carries nothing. Fail-open like the enrichment above.
+    try {
+      stampPveOwnership(await pveFootprint(), datasets)
+    }
+    catch {
+      // fail-open — omit the field rather than fail the list
+    }
+
     // Story iscsi.3: `defaults` carries the ZFS-owned volblocksize the Create
     // dialog quotes. Optional and additive — an older UI ignores it, and a newer
     // UI against an older daemon simply gets nothing and says "ZFS default"
@@ -856,6 +882,17 @@ export async function datasetRoutes(
       associatedShares: associated,
     }
 
+    // Story pvepool.1: the same per-node verdict the tree stamps, so Detail
+    // agrees with the list by construction. Additive; absent when not owned.
+    try {
+      const owned = (await pveFootprint()).ownershipOf(fullName)
+      if (owned)
+        detail.pve = owned
+    }
+    catch {
+      // fail-open — omit the field rather than fail the detail
+    }
+
     return { data: detail }
   })
 
@@ -890,6 +927,25 @@ export async function datasetRoutes(
     if (existing.some(d => d.name === fullName)) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `Dataset '${fullName}' already exists` } }
+    }
+
+    // PVE footprint guards (story pvepool.1). The NAMING GUARD first: a
+    // guest-named direct child of a storage path would be inventoried by PVE
+    // as a guest disk on its next scan. Then ownership: creating a dataset
+    // INSIDE PVE's footprint (a storage root itself, a guest volume, a
+    // dir-storage tree, the boot tree) is refused with the predicate's reason.
+    // A plain child of a storage root (`tank/media` under bare-pool storage
+    // `tank`) is owned by neither rule — that is the whole point of the story.
+    const pve = await pveFootprint()
+    const claim = pve.claimedByPve(fullName)
+    if (claim) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: pveNamingGuardMessage(claim.storage, fullName) } }
+    }
+    const owned = pve.ownershipOf(fullName)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
     }
 
     const args = buildCreateArgs(fullName, req)
@@ -1017,6 +1073,15 @@ export async function datasetRoutes(
     if (!target) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
+
+    // PVE footprint (story pvepool.1): an OWNED dataset is view-only for
+    // properties — any kind (storage root, guest volume, dir-storage tree,
+    // boot tree), refused with the predicate's reason naming storage + dataset.
+    const owned = (await pveFootprint()).ownershipOf(fullName)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
     }
 
     // Story iscsi.3 — a volume and a filesystem accept DIFFERENT properties, and
@@ -1504,6 +1569,15 @@ export async function datasetRoutes(
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
     }
 
+    // PVE footprint (story pvepool.1): an OWNED dataset is never ANAS's to
+    // destroy — any kind, refused up front with the predicate's reason, before
+    // the confirm gate is even minted.
+    const pveOwned = (await pveFootprint()).ownershipOf(fullName)
+    if (pveOwned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: pveOwned.reason } }
+    }
+
     // Story iscsi.6: BEFORE the confirm gate and before any `zfs destroy`, ask
     // configfs whether a LUN is serving this dataset — the volume itself, a
     // child zvol a `-r` destroy would sweep, or an image file inside a
@@ -1904,6 +1978,22 @@ export async function datasetRoutes(
     if (targetDatasets.some(d => d.name === target)) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `Dataset '${target}' already exists` } }
+    }
+
+    // PVE footprint guards (story pvepool.1) on the NEW name — clone is a
+    // dataset create wearing another hat: the naming guard first, then
+    // ownership of the target itself (a storage root, a dir-storage tree, the
+    // boot tree — a guest-named target is already caught by the guard above).
+    const pve = await pveFootprint()
+    const claim = pve.claimedByPve(target)
+    if (claim) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: pveNamingGuardMessage(claim.storage, target) } }
+    }
+    const owned = pve.ownershipOf(target)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
     }
 
     // Plain 202 — creating a new dataset from a snapshot is not destructive, so

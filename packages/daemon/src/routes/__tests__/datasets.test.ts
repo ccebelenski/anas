@@ -4,9 +4,10 @@ import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, it } from 'node:test'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
 
 const IDENTITY_HEADERS = {
@@ -541,5 +542,110 @@ describe('datasets routes', () => {
       assert.equal(res.statusCode, 400)
       assert.equal(res.json().error.code, 'VALIDATION_ERROR')
     })
+  })
+})
+
+// --- PVE footprint ownership (story pvepool.1) ---------------------------
+// The fixture set: a BARE zfspool storage on `testpool` (the pool root is the
+// storage root), so `testpool` itself and `testpool/vm-100-disk-0` are owned
+// (storage-root / guest-volume) and `testpool/media` is the sibling this story
+// exists to unlock.
+describe('PVE footprint ownership (pvepool.1)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let prevCfg: string | undefined
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ds-pve-'))
+    prevCfg = process.env.ANAS_STORAGE_CFG
+    await writeFile(join(dir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n\n', 'utf8')
+    process.env.ANAS_STORAGE_CFG = join(dir, 'storage.cfg')
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    await rm(dir, { recursive: true, force: true })
+    if (prevCfg === undefined)
+      delete process.env.ANAS_STORAGE_CFG
+    else
+      process.env.ANAS_STORAGE_CFG = prevCfg
+  })
+
+  it('GET list stamps `pve` on OWNED rows only — the sibling carries no field', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets' })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: Dataset[] }
+    const byName = new Map(data.map(d => [d.name, d]))
+    assert.equal(byName.get('testpool')?.pve?.kind, 'storage-root')
+    assert.match(byName.get('testpool')?.pve?.reason ?? '', /local-zfs/)
+    assert.match(byName.get('testpool')?.pve?.reason ?? '', /testpool/)
+    assert.equal(byName.get('testpool/vm-100-disk-0')?.pve?.kind, 'guest-volume')
+    // The sibling this story exists to unlock: NO field means manageable.
+    assert.equal(byName.get('testpool/media')?.pve, undefined)
+  })
+
+  it('the naming guard refuses a guest-named child of the storage root (400, backstop)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: 'vm-101-disk-1' }),
+    })
+    assert.equal(res.statusCode, 400)
+    // The sentence names the storage AND the dataset.
+    assert.match(res.json().error.message, /local-zfs/)
+    assert.match(res.json().error.message, /testpool\/vm-101-disk-1/)
+    assert.match(res.json().error.message, /guest disk/)
+  })
+
+  it('a plain child of the storage root IS created — the whole point of the story', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: 'media2' }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+  })
+
+  it('creating INSIDE a guest volume is refused with the ownership reason', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: 'vm-100-disk-0/inner' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /owns testpool\/vm-100-disk-0\/inner/)
+  })
+
+  it('properties on an OWNED dataset are refused with the ownership reason', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/datasets/vm-100-disk-0',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ properties: { compression: 'lz4' } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /guest volume/)
+  })
+
+  it('destroying an OWNED dataset is refused before the confirm gate', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool/datasets/vm-100-disk-0',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /guest volume/)
   })
 })

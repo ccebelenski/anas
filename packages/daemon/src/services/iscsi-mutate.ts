@@ -54,7 +54,7 @@ import { anasIqn, IscsiIqn } from '@anas/shared'
 import { readAhrPools } from './ahr-topology.js'
 import { CONFIGFS_TARGET_ROOT, describeLunHolder, readMappedLuns } from './iscsi-configfs.js'
 import { computeIscsiHealth } from './iscsi-health.js'
-import { classifyBacking } from './iscsi-ownership.js'
+import { classifyBacking, ownershipFromInputs } from './iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from './iscsi.js'
 
 /** `/usr/bin/targetcli` — the real binary on Debian/PVE. */
@@ -865,10 +865,12 @@ export function zvolDataset(devPath: string): string {
  * is not an ANAS-managed volume.
  *
  * `classifyBacking` is `iscsi.2`'s, reused rather than reimplemented: a PVE
- * guest volume (`vm-101-disk-0`, `base-…`, `subvol-…`), a zvol on a PVE-managed
- * pool and anything that resolves onto storage ANAS does not manage are all
- * already decidable from `storage.cfg` plus the ZFS mountpoint list, and the
- * ownership badge in the grid comes from the same call.
+ * guest volume (`vm-101-disk-0`, `base-…`, `subvol-…`, `basevol-…`), a backing
+ * DATASET inside PVE's footprint in any other way (storage root, dir-storage
+ * tree, boot tree — pvepool.1) and anything that resolves onto storage ANAS
+ * does not manage are all already decidable from `storage.cfg` plus the ZFS
+ * mountpoint list, and the ownership badge in the grid comes from the same
+ * call. A zvol on a sibling dataset of a PVE pool is ordinary ANAS storage.
  */
 export function resolveZvolBacking(
   backing: string,
@@ -907,12 +909,11 @@ export function resolveZvolBacking(
       },
     }
   }
-  if (c.pveManaged) {
-    const names = (c.pool ? ctx.inputs.pveStorages.get(c.pool) ?? [] : []).map(r => r.storage).join(', ')
+  if (c.pveOwned) {
     return {
       refusal: {
-        reason: 'pve-managed-pool',
-        message: `'${c.dataset ?? backing}' is on pool '${c.pool}', which PVE manages${names ? ` (${names})` : ''} — hands-off`,
+        reason: 'pve-owned-backing',
+        message: `'${c.dataset ?? backing}' is inside PVE's footprint — ${c.pveOwnership?.reason} — hands-off`,
       },
     }
   }
@@ -995,11 +996,11 @@ export async function resolveFileBackingDir(
         },
       }
     }
-    if (c.pveManaged) {
+    if (c.pveOwned) {
       return {
         refusal: {
-          reason: 'pve-managed-pool',
-          message: `'${backing}' is on pool '${c.pool}', which PVE manages — hands-off`,
+          reason: 'pve-owned-backing',
+          message: `'${backing}' is inside PVE's footprint — ${c.pveOwnership?.reason} — hands-off`,
         },
       }
     }
@@ -1023,11 +1024,14 @@ export async function resolveFileBackingDir(
   // A ZFS dataset name: its mountpoint is the directory.
   const mp = ctx.inputs.zfsMountpoints.find(m => m.dataset === backing)
   if (mp) {
-    if ((ctx.inputs.pveStorages.get(mp.pool)?.length ?? 0) > 0) {
+    // pvepool.1: the DATASET is judged, not the pool — a sibling of a PVE
+    // storage root is a legitimate image home.
+    const owned = ownershipFromInputs(ctx.inputs, backing)
+    if (owned) {
       return {
         refusal: {
-          reason: 'pve-managed-pool',
-          message: `Dataset '${backing}' is on pool '${mp.pool}', which PVE manages — hands-off`,
+          reason: 'pve-owned-backing',
+          message: `Dataset '${backing}' is inside PVE's footprint — ${owned.reason} — hands-off`,
         },
       }
     }

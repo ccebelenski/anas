@@ -2,6 +2,7 @@ import type { ReplicatePlan, Snapshot } from '@anas/shared'
 import type { FastifyReply, FastifyRequest } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { PveFootprint } from '../services/pve-footprint.js'
 import type { ReplicationNotifyContext } from '../services/replication-notify.js'
 import type { TargetPlacement } from '../services/replication-target.js'
 import type { Transport } from '../services/replication-transport.js'
@@ -54,12 +55,11 @@ export interface ReplicationDeps {
   /** A dataset's snapshots, newest-first (empty when it has none). */
   listSnapshotsDetail: (fullName: string) => Promise<Snapshot[]>
   /**
-   * Story 3.25 boundary guard: is the pool PVE-managed (referenced by
-   *  /etc/pve/storage.cfg)? Replicating INTO PVE territory would create a
-   *  dataset there, which ANAS never does. Fail-open: detection failure /
-   *  non-PVE host → false.
+   * PVE footprint ownership (story pvepool.1): the ONE service that answers
+   * "is this dataset PVE's?" — the target guard asks it per request, judging
+   * the target DATASET rather than the pool.
    */
-  isPveManagedPool: (poolName: string) => Promise<boolean>
+  pveFootprint: () => Promise<PveFootprint>
   /** Stage-3 remote/peer SSH transport (location resolution + remote zfs ops). */
   transport: Transport
 }
@@ -173,11 +173,11 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
 
   /**
    * The target-side guards — location resolution, pool existence WHERE THE
-   * TARGET LIVES, the PVE-managed exclusion and the onto-itself check — all live
-   * in services/replication-target.ts, shared verbatim with the recurring-task
-   * routes (issue #46).
+   * TARGET LIVES, the PVE-footprint exclusion (pvepool.1) and the onto-itself
+   * check — all live in services/replication-target.ts, shared verbatim with
+   * the recurring-task routes (issue #46).
    */
-  const guardDeps = { transport, poolExists, isPveManagedPool: deps.isPveManagedPool }
+  const guardDeps = { transport, poolExists, pveFootprint: deps.pveFootprint }
 
   /**
    * The target dataset's snapshots (as minimal Snapshot records — only

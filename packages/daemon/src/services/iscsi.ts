@@ -45,6 +45,7 @@ import { CONFIGFS_TARGET_ROOT, normalizePlugin, readConfigfs } from './iscsi-con
 import { classifyBacking, deriveOwnership } from './iscsi-ownership.js'
 import { fileStubVerdict } from './iscsi-stub.js'
 import { mountIndex } from './nested-filesystems.js'
+import { readSystemPoolFacts } from './pve-footprint.js'
 
 /** `/usr/bin/ip` — the REAL binary on Debian/PVE (`/usr/sbin/ip` is a symlink). */
 const IP = '/usr/bin/ip'
@@ -349,8 +350,11 @@ export async function readIscsiContext(
     readNodeAddresses(executor),
   ])
   const pveStorages = await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints)
+  // Boot facts for the system rule of the footprint predicate — fail-open to []
+  // when the probe fails (pvepool.1).
+  const systemFacts = await readSystemPoolFacts(executor)
 
-  const inputs: OwnershipInputs = { pveStorages, zfsMountpoints }
+  const inputs: OwnershipInputs = { pveStorages, zfsMountpoints, systemFacts }
   const backingPaths = collectBackingPaths(live, persisted)
 
   // AHR topology is the expensive read (mdstat + LVM + btrfs), so it happens

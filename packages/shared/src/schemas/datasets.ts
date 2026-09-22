@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import { AbsolutePath, DatasetPath, PoolName } from './common.js'
 import { IscsiHeldByLun } from './iscsi.js'
+import { PveOwnership } from './zfs.js'
 
 // --- Enums ---
 
@@ -76,6 +77,13 @@ export const Dataset = z.object({
    * it entirely (version-skew ruling: no field ⇒ no gating).
    */
   heldByLun: IscsiHeldByLun.optional(),
+  /**
+   * PVE's ownership claim on THIS dataset (story pvepool.1), from the shared
+   * footprint predicate — absent when the dataset is outside PVE's footprint
+   * and ANAS may manage it. Additive and optional (version-skew ruling): an
+   * older daemon omits it entirely, and the UI keeps its whole-pool rule.
+   */
+  pve: PveOwnership.optional(),
 })
 export type Dataset = z.infer<typeof Dataset>
 

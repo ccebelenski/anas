@@ -916,25 +916,47 @@ describe('resolveZvolBacking — PVE territory is never a candidate', () => {
     }
   })
 
-  it('refuses a PVE guest volume by name, whatever pool it is on', () => {
-    for (const name of ['vm-101-disk-0', 'base-9000-disk-0', 'subvol-120-disk-0']) {
-      const r = resolveZvolBacking(`tank/${name}`, emptyCtx())
-      assert.ok('refusal' in r, name)
-      assert.equal(r.refusal.reason, 'pve-guest-volume')
-    }
-  })
-
-  it('refuses a zvol on a PVE-managed pool, naming the storage', () => {
+  it('refuses a PVE guest volume under a PVE storage root (pvepool.1)', () => {
     const ctx = emptyCtx({
       inputs: {
-        pveStorages: new Map([['rpool', [{ storage: 'local-zfs', type: 'zfspool', pool: 'rpool' }]]]),
+        pveStorages: new Map([['rpool', [{ storage: 'local-zfs', type: 'zfspool', dataset: 'rpool/data', content: [] }]]]),
         zfsMountpoints: [],
       },
     } as never)
-    const r = resolveZvolBacking('rpool/data/vol1', ctx)
+    for (const name of ['vm-101-disk-0', 'base-9000-disk-0', 'subvol-120-disk-0', 'subvol-100-foo']) {
+      const r = resolveZvolBacking(`rpool/data/${name}`, ctx)
+      assert.ok('refusal' in r, name)
+      assert.equal(r.refusal.reason, 'pve-guest-volume')
+      assert.match(r.refusal.message, new RegExp(name.replace(/-/g, '\\-')))
+    }
+  })
+
+  it('ACCEPTS a guest-LOOKING zvol on a pool PVE has no storage for (pvepool.1)', () => {
+    // PVE inventories the children of a storage's configured path only — a
+    // vm-named zvol anywhere else is invisible to it and ANAS's to export.
+    for (const name of ['vm-101-disk-0', 'subvol-100-foo']) {
+      const r = resolveZvolBacking(`tank/${name}`, emptyCtx())
+      assert.ok('ok' in r, name)
+      assert.equal(r.ok.dataset, `tank/${name}`)
+    }
+  })
+
+  it('refuses a backing dataset INSIDE PVE\'s footprint, with the ownership reason (pvepool.1)', () => {
+    const ctx = emptyCtx({
+      inputs: {
+        pveStorages: new Map([['rpool', [{ storage: 'local-zfs', type: 'zfspool', dataset: 'rpool/data', content: [] }]]]),
+        zfsMountpoints: [],
+      },
+    } as never)
+    // The nested storage root itself is refused…
+    const r = resolveZvolBacking('rpool/data', ctx)
     assert.ok('refusal' in r)
-    assert.equal(r.refusal.reason, 'pve-managed-pool')
+    assert.equal(r.refusal.reason, 'pve-owned-backing')
     assert.match(r.refusal.message, /local-zfs/)
+    assert.match(r.refusal.message, /rpool\/data as a storage root/)
+    // …while a SIBLING dataset of the storage root is a legitimate LUN home.
+    const sibling = resolveZvolBacking('rpool/media/lun0', ctx)
+    assert.ok('ok' in sibling)
   })
 
   it('refuses anything that is not a zvol path at all', () => {

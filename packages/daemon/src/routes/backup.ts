@@ -881,7 +881,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
         if (lun.kind === 'foreign' || lun.kind === 'unresolved' || !lun.backingPath.startsWith('/'))
           continue
         const classification = classifyBacking(lun.backingPath, ctx.inputs)
-        if (classification.pveManaged || classification.pveGuestVolume)
+        // pvepool.1: hide only a LUN whose backing DATASET is inside PVE's
+        // footprint (any kind) — a LUN backed by a sibling dataset of a PVE
+        // pool is a legitimate source and stays listed.
+        if (classification.pveOwned)
           continue
         luns.push({
           targetIqn: target.iqn,

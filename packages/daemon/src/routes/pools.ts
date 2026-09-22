@@ -9,7 +9,7 @@ import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest
 import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
-import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
+import { PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
 import { parseZpoolFeature, parseZpoolGet } from '../parsers/zpool-get.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { parsePoolBusyState, parseZpoolStatus, parseZpoolStatusPool } from '../parsers/zpool-status.js'
@@ -20,6 +20,7 @@ import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
+import { loadPveFootprint, systemPoolRefusal } from '../services/pve-footprint.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
 import { collectDisks, resolveLeafKernel } from './disks.js'
@@ -561,10 +562,22 @@ export async function poolRoutes(
     }
   }
 
-  /** The PVE storages that reference a pool (story 3.25) — empty ⇒ ANAS-managed. */
-  async function poolPveStorages(poolName: string): Promise<{ storage: string }[]> {
-    const storages = await readPveStorages(pveCfgPath, await readZfsMountpoints())
-    return storages.get(poolName) ?? []
+  /**
+   * The PVE footprint, loaded once per request (story pvepool.1). The ONE
+   * answerer for "does PVE own this pool/dataset?" — it replaces the old
+   * pool-level `poolPveStorages` helper and carries the system-pool boot facts
+   * the hard refusals below need.
+   */
+  function pveFootprint() {
+    return loadPveFootprint(executor, { pveStorageCfg: pveCfgPath })
+  }
+
+  /** The hard no-bypass 409 when the pool holds this node's boot filesystem. */
+  async function systemPoolBlock(poolName: string) {
+    const pve = await pveFootprint()
+    if (!pve.isSystemPool(poolName))
+      return null
+    return systemPoolRefusal(poolName, pve.systemPoolFacts(poolName))
   }
 
   /** Every leaf disk of a pool resolved for disk cleanup (labelclear + zap). */
@@ -579,7 +592,7 @@ export async function poolRoutes(
   }
 
   server.get('/pools', async (_request, _reply) => {
-    const [listResult, statusResult, byIdResult, lsblkDiscardResult, upgradeResult, pveStorages, poolMounts] = await Promise.all([
+    const [listResult, statusResult, byIdResult, lsblkDiscardResult, upgradeResult, pve, poolMounts] = await Promise.all([
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
       executor.exec('/usr/sbin/zpool', ['status', '-jv']),
       // by-id → kernel map, to canonicalize pool leaves for the discard probe.
@@ -591,9 +604,9 @@ export async function poolRoutes(
       executor.exec('/usr/sbin/zpool', ['upgrade']),
       // Read-only PVE storage detection (Epic 3.25). Fail-open: off-PVE hosts
       // and parse errors yield an empty map, so this never breaks GET /pools.
-      // Passing the ZFS mountpoint map also catches `dir` storages backed by a
-      // ZFS dataset (backup/iso), not just `zfspool` entries.
-      readPveStorages(pveCfgPath, await readZfsMountpoints()),
+      // The footprint service reads storage.cfg WITH the ZFS mountpoint map
+      // (dir storages resolve) and the boot facts (system pools).
+      pveFootprint(),
       // The pool ROOT dataset's mountpoint + mounted flag (story 3.27 — the
       // grid's Mount column). Fail-open: an old/absent zfs leaves the field off.
       readPoolMountpoints(executor),
@@ -660,7 +673,7 @@ export async function poolRoutes(
         ...(status?.health && { health: status.health }),
         // Pool root mountpoint (story 3.27) — the Mount column. Absent ⇒ omitted.
         ...(mount && { mountpoint: mount.mountpoint, mounted: mount.mounted }),
-        pveStorages: pveStorages.get(pool.name) ?? [],
+        pveStorages: pve.storagesByPool.get(pool.name) ?? [],
       }
     })
 
@@ -676,12 +689,14 @@ export async function poolRoutes(
   server.get<{ Params: { name: string } }>('/pools/:name', async (request, reply) => {
     const poolName = request.params.name
 
-    const [statusResult, listResult, getResult, pveStorages, poolMounts] = await Promise.all([
+    const [statusResult, listResult, getResult, pve, poolMounts] = await Promise.all([
       executor.exec('/usr/sbin/zpool', ['status', '-jv']),
       executor.exec('/usr/sbin/zpool', ['list', '-j']),
       executor.exec('/usr/sbin/zpool', ['get', 'all', '-j']),
       // Read-only PVE storage detection (Epic 3.25) — fail-open (see GET /pools).
-      readPveStorages(pveCfgPath),
+      // The footprint service always passes the ZFS mountpoint map, so a `dir`
+      // storage backed by a dataset resolves here too (pvepool.1).
+      pveFootprint(),
       // Pool root mountpoint + mounted flag (story 3.27) — fail-open.
       readPoolMountpoints(executor),
     ])
@@ -733,7 +748,7 @@ export async function poolRoutes(
         mountpoint: poolMounts.get(poolName)!.mountpoint,
         mounted: poolMounts.get(poolName)!.mounted,
       }),
-      pveStorages: pveStorages.get(poolName) ?? [],
+      pveStorages: pve.storagesByPool.get(poolName) ?? [],
     }
 
     return { data: detail }
@@ -981,10 +996,20 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
+    // SYSTEM-POOL GUARD (story pvepool.1): the pool holds this node's boot
+    // filesystem — a hard 409 with NO confirm bypass, before anything else is
+    // negotiated. Level-1, like the root-pool destroy block.
+    const pve = await pveFootprint()
+    if (pve.isSystemPool(poolName)) {
+      const refusal = systemPoolRefusal(poolName, pve.systemPoolFacts(poolName))
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
+    }
+
     // SCOPE GUARD (story 3.25): PVE owns this pool's storage — ANAS keeps its
     // hands off the mountpoint. A hard 400, never a confirm (mirrors the grid's
     // disabled Change mount action for PVE-managed pools).
-    const pveStorages = await poolPveStorages(poolName)
+    const pveStorages = pve.storagesByPool.get(poolName) ?? []
     if (pveStorages.length > 0) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Pool '${poolName}' is managed by PVE (${pveStorages.map(s => s.storage).join(', ')}) — ANAS keeps its mountpoint hands-off (story 3.25)` } }
@@ -1565,6 +1590,15 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
+    // SYSTEM-POOL GUARD (story pvepool.1): the pool holds this node's boot
+    // filesystem — a hard 409 with NO confirm bypass. Exporting the boot pool
+    // takes the running node's root away; there is nothing to negotiate.
+    const systemBlock = await systemPoolBlock(poolName)
+    if (systemBlock) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: systemBlock.reason, message: systemBlock.message } }
+    }
+
     // Story iscsi.6: a LUN on this pool makes the export unsafe NOW, so it is a
     // hard 409 with no confirm bypass — BEFORE the confirm gate and before
     // `zpool export`. ZFS does refuse an export whose dataset is open (GT-40),
@@ -1655,6 +1689,16 @@ export async function poolRoutes(
     if (!pools.some(p => p.name === poolName)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    // SYSTEM-POOL GUARD (story pvepool.1): the pool holds this node's boot
+    // filesystem — a hard 409 with NO confirm bypass, same Level-1 altitude as
+    // the root-pool block above (which guards the well-known names; this one
+    // reads the boot facts, so it also covers a non-default boot pool name).
+    const systemBlock = await systemPoolBlock(poolName)
+    if (systemBlock) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: systemBlock.reason, message: systemBlock.message } }
     }
 
     // Story iscsi.6: refuse a destroy while a LUN serves anything on the pool.

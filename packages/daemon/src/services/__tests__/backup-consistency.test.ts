@@ -1,4 +1,4 @@
-import type { AhrPool } from '@anas/shared'
+import type { AhrPool, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { ConsistencyFacts } from '../backup-consistency.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
@@ -28,6 +28,8 @@ const TABLE = JSON.stringify({
     children: [
       { target: '/tank', source: 'tank', fstype: 'zfs', options: 'rw,xattr' },
       { target: '/tank/media', source: 'tank/media', fstype: 'zfs', options: 'rw,xattr' },
+      // A `dir` storage's dataset (pvepool.1) — PVE's backup/ISO file tree.
+      { target: '/tank/dump', source: 'tank/dump', fstype: 'zfs', options: 'rw,xattr' },
       // A `.zfs/snapshot` automount — its SOURCE carries the `@`.
       {
         target: '/tank/media/.zfs/snapshot/s1',
@@ -57,9 +59,25 @@ const FACTS: ConsistencyFacts = {
     pool('ahr1', '/mnt/ahr1', true),
     pool('ahrflat', '/mnt/ahrflat', false),
   ],
-  // backup2.4 — the zvol branch's PVE-territory guard. `pvepool` is a pool PVE
-  // manages (a `zfspool` storage in storage.cfg); `tank` is ANAS's.
-  pvePools: new Set(['pvepool']),
+  // pvepool.1 — the PVE footprint refs the predicate judges each source's own
+  // dataset by. `pvepool` carries a BARE zfspool storage (the pool root is the
+  // storage root) and a NESTED one (`pvepool/data`); `tank/dump` is a `dir`
+  // storage's tree. `tank` itself has no zfspool ref of its own here.
+  pveStorages: new Map<string, PveStorageRef[]>([
+    ['pvepool', [
+      { storage: 'pvestore', type: 'zfspool', content: ['images', 'rootdir'] },
+      { storage: 'local-zfs', type: 'zfspool', dataset: 'pvepool/data', content: ['images', 'rootdir'] },
+    ]],
+    ['tank', [
+      { storage: 'vzdumps', type: 'dir', dataset: 'tank/dump', content: ['backup'] },
+    ]],
+  ]),
+}
+
+/** The same facts, with `tank` carrying this node's boot filesystem. */
+const SYSFACTS: ConsistencyFacts = {
+  ...FACTS,
+  systemFacts: [{ pool: 'tank', bootfs: 'tank/ROOT/pve-1', rootDataset: 'tank/ROOT/pve-1' }] as SystemPoolFacts[],
 }
 
 describe('backup consistency derivation (backup2.3)', () => {
@@ -148,7 +166,7 @@ describe('backup consistency derivation (backup2.3)', () => {
   })
 
   it('an unreadable mount table derives LIVE and says the derivation could not see the system', () => {
-    const c = deriveConsistency('/tank/media', { mounts: new Map(), ahrPools: [], pvePools: new Set() })
+    const c = deriveConsistency('/tank/media', { mounts: new Map(), ahrPools: [], pveStorages: new Map() })
     assert.equal(c.consistency, 'live')
     assert.match(c.reason, /mount table could not be read/)
   })
@@ -161,12 +179,16 @@ describe('backup consistency derivation (backup2.3)', () => {
   it('reads its facts once and never stats a path (the hang trap)', async () => {
     const mock = new MockExecutor()
     mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: TABLE, stderr: '', exitCode: 0 } })
+    // The boot probe (pvepool.1) fails open on these fixtures — no system facts.
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '', stderr: '', exitCode: 1 } })
     const facts = await readConsistencyFacts(mock, async () => FACTS.ahrPools, { pveStorageCfg: '/nonexistent/storage.cfg' })
     assert.ok(facts.mounts.size > 0)
-    // storage.cfg is a FILE read (fail-open), so the executor still sees exactly
-    // one command and no path is ever stat'ed.
-    assert.deepEqual(mock.calls, [{ command: FINDMNT, args: ['--json'] }])
-    assert.equal(facts.pvePools.size, 0)
+    // storage.cfg is a FILE read (fail-open), so no path is ever stat'ed; the
+    // only executor calls are the mount table and the two boot probes.
+    assert.equal(mock.calls.filter(c => c.command === FINDMNT && c.args.includes('--json')).length, 1)
+    assert.deepEqual(facts.pveStorages.size, 0)
+    assert.deepEqual(facts.systemFacts, [])
   })
 
   it('both probes fail OPEN — a throwing AHR read never fails the derivation', async () => {
@@ -189,7 +211,7 @@ describe('backup consistency derivation (backup2.3)', () => {
       async () => FACTS.ahrPools,
     )
     assert.deepEqual(out.map(c => c.consistency), ['snapshot', 'live', 'snapshot'])
-    assert.equal(mock.calls.filter(c => c.command === FINDMNT).length, 1)
+    assert.equal(mock.calls.filter(c => c.command === FINDMNT && c.args.includes('--json')).length, 1)
   })
 })
 
@@ -222,17 +244,69 @@ describe('backup consistency derivation — block sources (backup2.4)', () => {
     assert.equal(c.zvolDevice, '/dev/zvol/tank/luns/vm1')
   })
 
-  it('a zvol on a PVE-managed pool is LIVE and hands-off (3.25)', () => {
+  it('a zvol DIRECTLY under a PVE storage root but not guest-named is SNAPSHOTTED (pvepool.1)', () => {
+    // Ownership is per dataset: `pvepool/somevol` is a child of the storage
+    // root, invisible to PVE — the old whole-pool rule would have refused it.
     const c = deriveConsistency('/dev/zvol/pvepool/somevol', FACTS)
-    assert.equal(c.consistency, 'live')
-    assert.equal(c.zvolDevice, undefined)
-    assert.match(c.reason, /PVE manages/)
+    assert.equal(c.consistency, 'snapshot')
+    assert.equal(c.target, 'pvepool/somevol')
   })
 
-  it('a PVE GUEST volume is LIVE whatever pool it is on', () => {
-    const c = deriveConsistency('/dev/zvol/tank/vm-101-disk-0', FACTS)
+  it('a zvol that IS a nested PVE storage root is LIVE and hands-off (pvepool.1)', () => {
+    // `/dev/zvol/pvepool` (single label) is a pool, not a volume, and answers
+    // on the /dev branch — but `pvepool/data` is a real volume naming the
+    // storage root of `local-zfs`.
+    const c = deriveConsistency('/dev/zvol/pvepool/data', FACTS)
+    assert.equal(c.consistency, 'live')
+    assert.equal(c.zvolDevice, undefined)
+    // The sentence names the storage AND the dataset — never "this pool".
+    assert.match(c.reason, /PVE storage 'local-zfs' owns pvepool\/data as a storage root/)
+  })
+
+  it('a zvol under a NESTED PVE storage root keeps its sibling allowed, its guests refused', () => {
+    // Sibling of the storage root: ordinary ANAS storage.
+    const sib = deriveConsistency('/dev/zvol/pvepool/media/vol0', FACTS)
+    assert.equal(sib.consistency, 'snapshot')
+    // Guest volume under the nested root: hands-off.
+    const guest = deriveConsistency('/dev/zvol/pvepool/data/vm-100-disk-0', FACTS)
+    assert.equal(guest.consistency, 'live')
+    assert.match(guest.reason, /PVE guest volume/)
+    // A guest-LOOKING name on the sibling is still snapshotted — PVE would
+    // never list it.
+    const lookalike = deriveConsistency('/dev/zvol/pvepool/media/vm-100-disk-0', FACTS)
+    assert.equal(lookalike.consistency, 'snapshot')
+  })
+
+  it('a PVE GUEST volume under a storage root is LIVE with the guest sentence', () => {
+    const c = deriveConsistency('/dev/zvol/pvepool/vm-101-disk-0', FACTS)
     assert.equal(c.consistency, 'live')
     assert.match(c.reason, /PVE guest volume/)
+  })
+
+  it('a file inside a `dir` storage tree is LIVE with the ownership reason (pvepool.1)', () => {
+    const c = deriveConsistency('/tank/dump/iso/debian.iso', FACTS)
+    assert.equal(c.consistency, 'live')
+    assert.match(c.reason, /PVE storage 'vzdumps' owns tank\/dump as directory storage/)
+  })
+
+  it('a source whose HOSTING dataset is a dir-storage tree is LIVE, its sibling is not', () => {
+    const owned = deriveConsistency('/tank/dump', FACTS)
+    assert.equal(owned.consistency, 'live')
+    assert.match(owned.reason, /directory storage/)
+    const sibling = deriveConsistency('/tank/media', FACTS)
+    assert.equal(sibling.consistency, 'snapshot')
+  })
+
+  it('the boot tree is LIVE even though the pool also holds ordinary datasets', () => {
+    // The zvol form: everything under tank/ROOT is system-owned.
+    const zvol = deriveConsistency('/dev/zvol/tank/ROOT/pve-1', SYSFACTS)
+    assert.equal(zvol.consistency, 'live')
+    assert.match(zvol.reason, /boot filesystem of pool tank/)
+    // The filesystem form: the boot dataset itself.
+    const fs = deriveConsistency('/', SYSFACTS)
+    assert.equal(fs.consistency, 'live')
+    // A sibling of the boot tree on the SAME pool is still snapshotted.
+    assert.equal(deriveConsistency('/tank/media', SYSFACTS).consistency, 'snapshot')
   })
 
   it('a plain block device is LIVE, and says the image is crash-consistent', () => {

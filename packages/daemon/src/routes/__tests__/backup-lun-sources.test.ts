@@ -51,7 +51,7 @@ const IDENTITY = {
 /** `gtiscsi` declared as a PVE `zfspool` storage — the hands-off case. */
 const PVE_STORAGE_CFG = [
   'zfspool: local-zfs',
-  '\tpool gtiscsi',
+  '\tpool gtiscsi/vol1',
   '\tcontent images,rootdir',
   '',
 ].join('\n')
@@ -215,7 +215,10 @@ describe('GET /v1/backup/lun-sources — the img archive picker (backup2.4)', ()
     assert.equal(res.data!.luns[0].targetIqn, GT_IQN)
   })
 
-  it('a zvol on a PVE-managed pool is NEVER offered (PVE territory is hands-off)', async () => {
+  it('a LUN whose backing dataset IS a PVE storage root is NEVER offered (pvepool.1)', async () => {
+    // The fixture's zvol IS the configured `pool` path of `local-zfs`. The old
+    // whole-pool rule hid any zvol on `gtiscsi`; the footprint rule hides only
+    // the owned dataset itself.
     await serve({
       manifest: 'configfs-live.manifest',
       saveconfig: 'saveconfig-final.json',

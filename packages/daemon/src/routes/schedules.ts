@@ -3,9 +3,9 @@ import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import { ScheduleId, SnapshotSchedule } from '@anas/shared'
-import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { readAhrPools } from '../services/ahr-topology.js'
+import { loadPveFootprint } from '../services/pve-footprint.js'
 import { notifyScheduleRun } from '../services/snapshot-notify.js'
 import {
   collectScheduleStatuses,
@@ -66,18 +66,16 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
   }
 
   /**
-   * Story 3.25 boundary guard: is the pool PVE-managed (referenced by
-   * storage.cfg)? Fail-open (non-PVE host / unreadable config → false), exactly
-   * as the replication task guard.
+   * Story pvepool.1 boundary guard: refuse only a schedule whose TARGET dataset
+   * PVE owns — a storage root, a guest volume, a dir-storage tree or the boot
+   * tree (the ownership reason names the storage AND the dataset). A sibling
+   * dataset on a PVE pool is a legitimate schedule target; the pool itself is
+   * never the question (the old pool-level `isPveManagedPool` probe is gone).
+   * Fail-open (non-PVE host / unreadable config → no ownership), exactly as the
+   * replication target guard.
    */
-  async function isPveManagedPool(poolName: string): Promise<boolean> {
-    try {
-      const refs = await readPveStorages(PVE_STORAGE_CFG, await readZfsMountpoints())
-      return (refs.get(poolName) ?? []).length > 0
-    }
-    catch {
-      return false
-    }
+  async function pveFootprint() {
+    return loadPveFootprint(executor)
   }
 
   /** Resolve an AHR target's pool from live topology, or null. */
@@ -87,7 +85,8 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
 
   /**
    * Validate that a schedule's target exists and is ANAS-manageable (SCHEDULES-
-   * DESIGN: ANAS-managed pools/datasets only; PVE-managed pools stay hands-off).
+   * DESIGN: ANAS-managed pools/datasets only; PVE-OWNED DATASETS stay hands-off —
+   * pvepool.1).
    * Sends the appropriate 4xx and returns false on the first failure.
    */
   async function guardTarget(target: SnapshotTarget, reply: FastifyReply): Promise<boolean> {
@@ -97,8 +96,12 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `Pool '${pool}' does not exist` } })
         return false
       }
-      if (await isPveManagedPool(pool)) {
-        reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `Pool '${pool}' is PVE-managed — ANAS does not schedule snapshots there` } })
+      // A storage root IS owned (kind 'storage-root'), so this one check covers
+      // both: an owned target of any kind, and the recursive schedule on a
+      // storage root that sweeps guest zvols.
+      const owned = (await pveFootprint()).ownershipOf(target.dataset)
+      if (owned) {
+        reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `Cannot schedule snapshots of '${target.dataset}' — ${owned.reason}` } })
         return false
       }
       if (!(await zfsDatasetExists(target.dataset))) {

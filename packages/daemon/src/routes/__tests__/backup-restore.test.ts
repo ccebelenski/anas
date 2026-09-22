@@ -218,6 +218,7 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
     snapshots?: string
     snapshotExit?: number
     snapshotStderr?: string
+    storageCfg?: string
   } = {}) {
     if (opts.manifest) {
       const root = join(dir, 'target')
@@ -236,7 +237,14 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
       setEnv('ANAS_ISCSI_SAVECONFIG', join(dir, 'absent-saveconfig.json'))
     }
     setEnv('ANAS_ISCSI_SYS_BLOCK', join(dir, 'block'))
-    setEnv('ANAS_STORAGE_CFG', join(dir, 'absent-storage.cfg'))
+    if (opts.storageCfg !== undefined) {
+      const p = join(dir, 'storage.cfg')
+      await writeFile(p, opts.storageCfg)
+      setEnv('ANAS_STORAGE_CFG', p)
+    }
+    else {
+      setEnv('ANAS_STORAGE_CFG', join(dir, 'absent-storage.cfg'))
+    }
     setEnv('ANAS_ISCSI_BACKING_PRESENT', opts.present === false ? '' : ZVOL_PATH)
 
     server = createServer({ mock: true, logger: false })
@@ -875,12 +883,26 @@ describe('POST /v1/backup/restore — the whole-image LUN restore (backup2.7)', 
         assertNothingDestructive()
       })
 
-      it('a PVE guest volume is never ANAS\'s to create, even for a restore', async () => {
-        await serveAnas()
+      it('a PVE guest volume is never ANAS\'s to create, even for a restore (pvepool.1)', async () => {
+        // The naming rule is scoped to PVE's storage: with `tank` as the
+        // configured pool of a zfspool storage, a zvol named like a guest disk
+        // is exactly what PVE would inventory on its next scan.
+        await serveAnas({ storageCfg: 'zfspool: local-zfs\n\tpool tank\n\tcontent images,rootdir\n' })
         const res = await restore(newLunBody(targetWith({ name: 'vm-101-disk-0' })))
         assert.equal(res.statusCode, 409)
         assert.equal(res.body.error!.reason, 'pve-guest-volume')
-        assert.match(res.body.error!.message, /PVE's territory/)
+        assert.match(res.body.error!.message, /guest volume/)
+        assertNothingDestructive()
+      })
+
+      it('a guest-LOOKING LUN name on a pool PVE has no storage for is allowed (pvepool.1)', async () => {
+        // Without a storage.cfg naming the pool, PVE would never list
+        // `tank/vm-101-disk-0` — the name alone proves nothing.
+        await serveAnas()
+        const res = await restore(newLunBody(targetWith({ name: 'vm-101-disk-0' })))
+        // It reaches the CONFIRM gate — every preflight passed.
+        assert.equal(res.statusCode, 409)
+        assert.equal(res.body.error!.code, 'CONFIRMATION_REQUIRED')
         assertNothingDestructive()
       })
 

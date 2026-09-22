@@ -2,7 +2,7 @@ import type { Job, SnapshotScheduleStatus } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -396,5 +396,70 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     assert.equal(done.status, 'failed')
     assert.match(done.error?.message ?? '', /dataset is busy/)
     assert.equal(notifications(mock).length, 1)
+  })
+  // --- PVE footprint ownership (story pvepool.1) ---------------------------
+  describe('schedule targets and the PVE footprint (pvepool.1)', () => {
+    it('a sibling dataset of a PVE pool IS schedulable — the pool itself is never the question', async () => {
+      const cfgdir = await mkdtemp(join(tmpdir(), 'anas-sched-pve-'))
+      const prevCfg = process.env.ANAS_STORAGE_CFG
+      await writeFile(join(cfgdir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n\n', 'utf8')
+      process.env.ANAS_STORAGE_CFG = join(cfgdir, 'storage.cfg')
+      try {
+        const res = await create()
+        assert.equal(res.statusCode, 202)
+        const done = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+      }
+      finally {
+        await rm(cfgdir, { recursive: true, force: true })
+        if (prevCfg === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prevCfg
+      }
+    })
+
+    it('a schedule ON the storage root is refused — the recursive sweep would hit guest zvols', async () => {
+      const cfgdir = await mkdtemp(join(tmpdir(), 'anas-sched-pve-'))
+      const prevCfg = process.env.ANAS_STORAGE_CFG
+      await writeFile(join(cfgdir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n\n', 'utf8')
+      process.env.ANAS_STORAGE_CFG = join(cfgdir, 'storage.cfg')
+      try {
+        // The sentence names the storage AND the dataset — never "this pool".
+        const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool' } })
+        assert.equal(res.statusCode, 400)
+        const msg = (res.json() as { error: { message: string } }).error.message
+        assert.match(msg, /local-zfs/)
+        assert.match(msg, /testpool as a storage root/)
+      }
+      finally {
+        await rm(cfgdir, { recursive: true, force: true })
+        if (prevCfg === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prevCfg
+      }
+    })
+
+    it('a schedule ON a guest volume is refused with the ownership reason', async () => {
+      const cfgdir = await mkdtemp(join(tmpdir(), 'anas-sched-pve-'))
+      const prevCfg = process.env.ANAS_STORAGE_CFG
+      await writeFile(join(cfgdir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n\n', 'utf8')
+      process.env.ANAS_STORAGE_CFG = join(cfgdir, 'storage.cfg')
+      try {
+        const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/vm-100-disk-0' } })
+        assert.equal(res.statusCode, 400)
+        const msg = (res.json() as { error: { message: string } }).error.message
+        assert.match(msg, /guest volume/)
+        assert.match(msg, /testpool\/vm-100-disk-0/)
+      }
+      finally {
+        await rm(cfgdir, { recursive: true, force: true })
+        if (prevCfg === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prevCfg
+      }
+    })
   })
 })

@@ -334,7 +334,7 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
     fstab: process.env.ANAS_FSTAB_PATH,
   }
 
-  async function serve(opts: { manifest?: string, saveconfigText?: string, saveconfigFixture?: string } = {}) {
+  async function serve(opts: { manifest?: string, saveconfigText?: string, saveconfigFixture?: string, storageCfg?: string } = {}) {
     if (opts.manifest) {
       const root = join(dir, 'target')
       await materializeConfigfsManifest(opts.manifest, root)
@@ -354,7 +354,14 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
     else {
       process.env.ANAS_ISCSI_SAVECONFIG = join(dir, 'absent-saveconfig.json')
     }
-    process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
+    if (opts.storageCfg !== undefined) {
+      const p = join(dir, 'storage.cfg')
+      await writeFile(p, opts.storageCfg)
+      process.env.ANAS_STORAGE_CFG = p
+    }
+    else {
+      process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
+    }
     process.env.ANAS_ISCSI_SYS_BLOCK = join(dir, 'block')
     // Absent by default: a test host has no open-iscsi state, and the read
     // must fail-open to null on its own. The FILE is read at request time, so
@@ -380,10 +387,11 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
   }
 
   /** The ANAS-owned tree every mutation test runs against. */
-  async function serveAnas(opts: { session?: boolean, hole?: boolean, holeDev?: string, fileLun?: string } = {}) {
+  async function serveAnas(opts: { session?: boolean, hole?: boolean, holeDev?: string, fileLun?: string, storageCfg?: string } = {}) {
     await serve({
       manifest: anasManifest({ session: opts.session ?? false, ...(opts.fileLun ? { fileLun: opts.fileLun } : {}) }),
       saveconfigText: anasSaveconfig(opts.hole ?? false, opts.holeDev, opts.fileLun),
+      ...(opts.storageCfg !== undefined ? { storageCfg: opts.storageCfg } : {}),
     })
   }
 
@@ -918,8 +926,10 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       assert.match(res.body.error!.message, /two initiators to write to it at once/)
     })
 
-    it('refuses a PVE guest volume', async () => {
-      await serveAnas()
+    it('refuses a PVE guest volume (pvepool.1)', async () => {
+      // The naming rule is scoped to PVE's storage: `tank` as the configured
+      // pool of a zfspool storage makes `tank/vm-101-disk-0` a guest disk.
+      await serveAnas({ storageCfg: 'zfspool: local-zfs\n\tpool tank\n\tcontent images,rootdir\n' })
       const res = await call('POST', `${targetUrl()}/luns`, {
         name: 'guestdisk',
         kind: 'zvol',
@@ -927,6 +937,35 @@ describe('the iSCSI mutation routes — every gate before the job', () => {
       })
       assert.equal(res.statusCode, 409)
       assert.equal(res.body.error!.reason, 'pve-guest-volume')
+    })
+
+    it('ACCEPTS a guest-LOOKING zvol on a pool PVE has no storage for (pvepool.1)', async () => {
+      await serveAnas()
+      const res = await call('POST', `${targetUrl()}/luns`, {
+        name: 'guestdisk',
+        kind: 'zvol',
+        backing: 'tank/vm-101-disk-0',
+      })
+      // It reaches the job queue — every preflight passed.
+      assert.equal(res.statusCode, 202)
+    })
+
+    it('refuses a backing dataset inside PVE\'s footprint and ALLOWS its sibling (pvepool.1)', async () => {
+      await serveAnas({ storageCfg: 'zfspool: local-zfs\n\tpool tank/media\n\tcontent images,rootdir\n' })
+      const owned = await call('POST', `${targetUrl()}/luns`, {
+        name: 'rootlun',
+        kind: 'zvol',
+        backing: 'tank/media',
+      })
+      assert.equal(owned.statusCode, 409)
+      assert.equal(owned.body.error!.reason, 'pve-owned-backing')
+      assert.match(owned.body.error!.message, /tank\/media as a storage root/)
+      const sibling = await call('POST', `${targetUrl()}/luns`, {
+        name: 'siblun',
+        kind: 'zvol',
+        backing: 'tank/other/lun0',
+      })
+      assert.equal(sibling.statusCode, 202)
     })
 
     it('400s a file LUN with no size — a fileio size is fixed at creation', async () => {

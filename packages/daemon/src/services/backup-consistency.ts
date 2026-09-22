@@ -1,10 +1,10 @@
-import type { AhrPool, BackupArchiveConsistency } from '@anas/shared'
+import type { AhrPool, BackupArchiveConsistency, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
-import { isPathWithin, zvolDatasetFromPath, zvolDevicePath } from '@anas/shared'
-import { PVE_STORAGE_CFG, readPveStorages } from '../parsers/pve-storage.js'
-import { PVE_GUEST_VOLUME_RE } from './iscsi-ownership.js'
+import { isPathWithin, pveOwnership, zvolDatasetFromPath, zvolDevicePath } from '@anas/shared'
+import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { mountIndex, normalizePath, relativeTo } from './nested-filesystems.js'
+import { readSystemPoolFacts } from './pve-footprint.js'
 
 /**
  * DERIVED per-source snapshot consistency (story backup2.3).
@@ -85,13 +85,22 @@ export interface ConsistencyFacts {
   /** Live AHR topology (empty when it could not be read). */
   ahrPools: AhrPool[]
   /**
-   * ZFS pool roots PVE manages, from `storage.cfg` (backup2.4). Only the zvol
-   * branch needs them: PVE territory is read-only and hands-off, so ANAS never
-   * takes a transient snapshot of a zvol PVE owns. Empty when the file could not
-   * be read — which derives to `snapshot` for a non-guest-named volume, the same
-   * posture `/v1/pools` already takes when storage.cfg is unreadable.
+   * PVE footprint refs per pool root, from `storage.cfg` WITH the ZFS
+   * mountpoint map (pvepool.1 — a `dir` storage's path resolves onto its
+   * dataset). The ONE shared predicate `pveOwnership()` judges each source's
+   * own dataset: PVE-owned (a storage root, a guest volume, a dir-storage tree,
+   * the boot tree) means hands-off — no transient snapshot — while a sibling
+   * dataset on a PVE pool is snapshotted like any other. Empty when the file
+   * could not be read — which derives to `snapshot` for an unowned source, the
+   * same posture `/v1/pools` already takes when storage.cfg is unreadable.
    */
-  pvePools: Set<string>
+  pveStorages: Map<string, PveStorageRef[]>
+  /**
+   * Boot facts per imported pool, for the system rule of the footprint
+   * predicate. Optional: omitted facts fail open (the system rule is
+   * undetectable), exactly like an unreadable storage.cfg.
+   */
+  systemFacts?: SystemPoolFacts[]
 }
 
 /**
@@ -121,17 +130,19 @@ export async function readConsistencyFacts(
   catch {
     ahrPools = []
   }
-  // One file read, no `zfs list`: the zvol branch only needs the zfspool
-  // storages, which `readPveStorages` resolves without mountpoints. Fail-open
-  // (the parser already is): an unreadable storage.cfg yields an empty map.
-  let pvePools = new Set<string>()
+  // Per-source ownership needs the refs RESOLVED — a `dir` storage only maps
+  // onto its dataset with the mountpoint list — so this is one file read plus
+  // one `zfs list`, and the boot facts for the system rule. Fail-open (the
+  // parsers already are): an unreadable source yields an empty map/list.
+  let pveStorages = new Map<string, PveStorageRef[]>()
   try {
-    pvePools = new Set((await readPveStorages(opts.pveStorageCfg ?? PVE_STORAGE_CFG)).keys())
+    pveStorages = await readPveStorages(opts.pveStorageCfg ?? PVE_STORAGE_CFG, await readZfsMountpoints())
   }
   catch {
-    pvePools = new Set()
+    pveStorages = new Map()
   }
-  return { mounts, ahrPools, pvePools }
+  const systemFacts = await readSystemPoolFacts(executor)
+  return { mounts, ahrPools, pveStorages, systemFacts }
 }
 
 /**
@@ -181,17 +192,22 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
   const zvol = zvolDatasetFromPath(source)
   if (zvol) {
     const pool = zvol.split('/')[0]
-    const volume = zvol.split('/').at(-1) ?? zvol
-    if (PVE_GUEST_VOLUME_RE.test(volume)) {
+    // pvepool.1: the VOLUME's own dataset is judged, not the pool — the ONE
+    // shared predicate. A guest volume is its own case (its snapshots are PVE's
+    // to take); any other owned kind (storage root, dir-storage tree, boot
+    // tree) is equally hands-off, with the ownership reason as the sentence.
+    // A volume on a sibling dataset of a PVE pool is snapshotted normally.
+    const owned = pveOwnership(facts.pveStorages.get(pool) ?? [], zvol, facts.systemFacts?.find(f => f.pool === pool))
+    if (owned?.kind === 'guest-volume') {
       return {
         consistency: 'live',
         reason: `${source} is a PVE guest volume - PVE owns its guests' disks and their snapshots, so ANAS takes none and the image is read live (crash-consistent)`,
       }
     }
-    if (facts.pvePools.has(pool)) {
+    if (owned) {
       return {
         consistency: 'live',
-        reason: `${source} is on pool '${pool}', which PVE manages - PVE territory is hands-off, so ANAS takes no snapshot and the image is read live (crash-consistent)`,
+        reason: `${source} is inside PVE's footprint - ${owned.reason} - so the run takes no snapshot and the image is read live (crash-consistent)`,
       }
     }
     return {
@@ -229,6 +245,17 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
       return {
         consistency: 'live',
         reason: `${source} is already inside a ZFS snapshot (${node.source}) - it is read-only and unchanging, so nothing is snapshotted for it`,
+      }
+    }
+    // pvepool.1: an OWNED hosting dataset is not snapshotted — a storage-root
+    // snapshot would sweep PVE's guest zvols, a dir-storage tree or a guest
+    // subvol is PVE's own territory. A sibling dataset of a PVE pool is
+    // snapshotted like any other.
+    const owned = pveOwnership(facts.pveStorages.get(node.source.split('/')[0]) ?? [], node.source, facts.systemFacts?.find(f => f.pool === node.source.split('/')[0]))
+    if (owned) {
+      return {
+        consistency: 'live',
+        reason: `${source} is inside PVE's footprint - ${owned.reason} - so the run takes no snapshot and reads the live tree`,
       }
     }
     return {

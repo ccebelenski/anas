@@ -10,11 +10,13 @@
  *      recognises — LIO has no rename, so an IQN is identity for life, GT-10);
  *   2. every LUN's backing object resolves onto storage ANAS manages.
  *
- * Rule 2 is the 3.25 PVE-tagging pattern applied to block objects. `storage.cfg`
- * is parsed (never written) to learn which ZFS pools PVE owns; a LUN backed by a
- * zvol on one of those pools, or by anything named like a PVE guest volume
- * (`vm-101-disk-0`), makes its target foreign and hands-off. PVE's guest disks
- * are never ANAS's candidates.
+ * Rule 2 is the pvepool.1 footprint pattern applied to block objects. The ONE
+ * shared predicate `pveOwnership()` (`@anas/shared`) decides — per DATASET, not
+ * per pool — whether a LUN's backing dataset is inside PVE's footprint: a
+ * storage root, a guest volume (`vm-101-disk-0`, `subvol-100-foo`, `basevol-*`),
+ * a `dir` storage's tree, or the system/boot tree. An owned backing makes its
+ * target foreign and hands-off. PVE's guest disks are never ANAS's candidates;
+ * a sibling dataset on a PVE pool is ordinary ANAS storage.
  *
  * A LUN whose backing path does NOT resolve is a third thing, and it is
  * deliberately not "foreign": `zfs rename` under a live LUN succeeds silently and
@@ -43,18 +45,9 @@
  * doing, for `backingExists`).
  */
 
-import type { IscsiLunKind, IscsiOwnershipTag, PveStorageRef } from '@anas/shared'
+import type { IscsiLunKind, IscsiOwnershipTag, PveOwnership, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
-import { isAnasIqn, ZVOL_PATH_PREFIX, zvolDatasetFromPath } from '@anas/shared'
-
-/**
- * PVE's guest-volume naming on a `zfspool` storage: `vm-<vmid>-disk-<n>` for a
- * VM disk, `base-<vmid>-disk-<n>` for a template's base volume, `subvol-<vmid>-
- * disk-<n>` for a container's subvolume. A backing object with one of these
- * names belongs to a guest, whatever pool it is on, and is never an ANAS
- * candidate.
- */
-export const PVE_GUEST_VOLUME_RE = /^(?:vm|base|subvol)-\d+-disk-\d+$/
+import { isAnasIqn, pveOwnership, ZVOL_PATH_PREFIX, zvolDatasetFromPath } from '@anas/shared'
 
 /** Trailing slashes, stripped before any path comparison. */
 const TRAILING_SLASH_RE = /\/+$/
@@ -80,9 +73,11 @@ export interface BackingClassification {
    * filesystem of a dataset that did not mount.
    */
   mountpoint: string | null
-  /** True when that pool/dataset is referenced by a PVE storage (3.25). */
-  pveManaged: boolean
-  /** True when the object is named like a PVE guest volume. */
+  /** True when the backing DATASET is inside PVE's footprint (any kind, pvepool.1). */
+  pveOwned: boolean
+  /** The full ownership verdict behind `pveOwned` — null when not owned. */
+  pveOwnership: PveOwnership | null
+  /** True when the backing dataset is owned as a PVE guest volume. */
   pveGuestVolume: boolean
 }
 
@@ -94,6 +89,14 @@ export interface OwnershipInputs {
   zfsMountpoints: ZfsMountpoint[]
   /** AHR pool mountpoints (`name -> mountpoint`); an AHR pool's only block kind is a file. */
   ahrMountpoints?: Map<string, string>
+  /**
+   * Boot facts per imported pool (`readSystemPoolFacts()`), for the
+   * system/boot-tree rule of the footprint predicate. Optional: a context that
+   * does not already hold them (some create paths, tests) omits them and the
+   * system rule is simply undetectable there — fail-open, like an unreadable
+   * storage.cfg.
+   */
+  systemFacts?: SystemPoolFacts[]
 }
 
 function stripTrailingSlash(path: string): string {
@@ -112,11 +115,22 @@ function poolRoot(dataset: string): string {
   return dataset.split('/')[0]
 }
 
-/** The last name component of a dataset (`tank/vm-101-disk-0` → `vm-101-disk-0`). */
-function lastComponent(dataset: string): string {
-  const parts = dataset.split('/')
-  return parts.at(-1) ?? dataset
+/**
+ * The ONE predicate, asked through {@link OwnershipInputs}: does PVE own this
+ * dataset? Feed it the pool's storage refs and — when the context holds them —
+ * that pool's boot facts. Omitted system facts fail open (the system rule is
+ * undetectable), exactly like an unreadable storage.cfg. Exported for callers
+ * that already HOLD an {@link OwnershipInputs} (the iSCSI mutate paths) — one
+ * predicate assembly, never two.
+ */
+export function ownershipFromInputs(inputs: OwnershipInputs, dataset: string): PveOwnership | null {
+  const pool = poolRoot(dataset)
+  const system = inputs.systemFacts?.find(f => f.pool === pool)
+  return pveOwnership(inputs.pveStorages.get(pool) ?? [], dataset, system)
 }
+
+/** Ask {@link ownershipFromInputs} from inside this module. */
+const ownershipOf = ownershipFromInputs
 
 /**
  * Resolve an absolute path onto the ZFS dataset that hosts it. When datasets
@@ -178,7 +192,8 @@ export function classifyBacking(
     pool: null,
     dataset: null,
     mountpoint: null,
-    pveManaged: false,
+    pveOwned: false,
+    pveOwnership: null,
     pveGuestVolume: false,
   }
   if (!devPath.startsWith('/'))
@@ -192,13 +207,15 @@ export function classifyBacking(
     ?? (devPath.startsWith(ZVOL_PATH_PREFIX) ? stripTrailingSlash(devPath.slice(ZVOL_PATH_PREFIX.length)) : '')
   if (dataset) {
     const pool = poolRoot(dataset)
+    const owned = ownershipOf(inputs, dataset)
     return {
       kind: 'zvol',
       pool,
       dataset,
       mountpoint: null,
-      pveManaged: (inputs.pveStorages.get(pool)?.length ?? 0) > 0,
-      pveGuestVolume: PVE_GUEST_VOLUME_RE.test(lastComponent(dataset)),
+      pveOwned: owned !== null,
+      pveOwnership: owned,
+      pveGuestVolume: owned?.kind === 'guest-volume',
     }
   }
 
@@ -209,13 +226,29 @@ export function classifyBacking(
     return unmatched
 
   const mp = matchMountpoint(devPath, inputs.zfsMountpoints)
-  if (mp) {
+  if (mp && mp.dataset) {
+    const owned = ownershipOf(inputs, mp.dataset)
     return {
       kind: 'file',
       pool: mp.pool,
       dataset: mp.dataset,
       mountpoint: mp.mountpoint,
-      pveManaged: (inputs.pveStorages.get(mp.pool)?.length ?? 0) > 0,
+      pveOwned: owned !== null,
+      pveOwnership: owned,
+      // A file cannot be a guest VOLUME (PVE inventories zvols/subvols, never
+      // plain files) — but a dir storage's tree is owned as `dir-storage`, and
+      // `pveOwned` already reflects that.
+      pveGuestVolume: false,
+    }
+  }
+  if (mp) {
+    return {
+      kind: 'file',
+      pool: mp.pool,
+      dataset: null,
+      mountpoint: mp.mountpoint,
+      pveOwned: false,
+      pveOwnership: null,
       pveGuestVolume: false,
     }
   }
@@ -232,7 +265,7 @@ export function classifyBacking(
       }
     }
     if (best)
-      return { kind: 'file', pool: best.pool, dataset: null, mountpoint: best.mountpoint, pveManaged: false, pveGuestVolume: false }
+      return { kind: 'file', pool: best.pool, dataset: null, mountpoint: best.mountpoint, pveOwned: false, pveOwnership: null, pveGuestVolume: false }
   }
 
   return unmatched
@@ -260,8 +293,9 @@ export interface OwnershipLun {
  * target ANAS did create stays ANAS's unless some LUN's backing POSITIVELY
  * resolves onto storage that is somebody else's (story `iscsi.5`).
  *
- * That leaves exactly three ways to lose a target — a PVE guest volume, a
- * PVE-managed pool, or a resolvable backing on unmanaged storage — and each one
+ * That leaves exactly two ways to lose a target — a backing dataset inside
+ * PVE's footprint (guest volume, storage root, dir-storage tree, boot tree,
+ * pvepool.1) or a resolvable backing on unmanaged storage — and each one
  * carries its reason, so the UI explains its hands-off badge instead of merely
  * wearing one.
  *
@@ -308,13 +342,14 @@ export function deriveOwnership(
         detail: `LUN '${lun.name}' is backed by the PVE guest volume ${c.dataset ?? lun.backingPath}`,
       }
     }
-    if (c.pveManaged) {
-      const refs = c.pool ? inputs.pveStorages.get(c.pool) ?? [] : []
-      const names = refs.map(r => r.storage).join(', ')
+    // Any OTHER owned kind — storage root, dir-storage tree, system/boot tree —
+    // is equally hands-off, and the ownership reason names the storage AND the
+    // dataset (pvepool.1: never "this pool").
+    if (c.pveOwnership) {
       return {
         ownership: 'foreign',
         reason: 'backing-pve-storage',
-        detail: `LUN '${lun.name}' is backed by ${lun.backingPath} on pool '${c.pool}', which PVE manages${names ? ` (${names})` : ''}`,
+        detail: `LUN '${lun.name}' is backed by ${lun.backingPath} — ${c.pveOwnership.reason}`,
       }
     }
     if (c.kind === 'foreign') {
