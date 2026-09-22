@@ -2,6 +2,17 @@
 
 export const VERSION = '0.3.3'
 
+// PVE footprint ownership (story pvepool.1 — GitHub #61): the shared pure
+// predicate every consumer asks, plus PVE's own guest-volume regex
+// (ZFSPoolPlugin.pm) and the storage-path helper.
+export {
+  isPveGuestName,
+  PVE_GUEST_VOLUME_RE,
+  pveOwnership,
+  pveStoragePath,
+  wouldBeClaimedByPve,
+} from './pve-footprint.js'
+
 // Access / permissions schemas (layered editor — Epic 4.7.2)
 export {
   AccessEntry,
@@ -505,11 +516,14 @@ export {
   PoolProperties,
   PoolState,
   PoolSummary,
+  PveOwnership,
+  PveOwnershipKind,
   PveStorageRef,
   ScanFunction,
   ScanState,
   ScanStatus,
   ScrubRequest,
+  SystemPoolFacts,
   TrimPoolRequest,
   UpdatePoolPropertiesRequest,
   Vdev,

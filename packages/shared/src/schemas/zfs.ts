@@ -149,6 +149,40 @@ export const PveStorageRef = z.object({
 })
 export type PveStorageRef = z.infer<typeof PveStorageRef>
 
+/** What kind of PVE footprint claim covers a dataset (story pvepool.1). */
+export const PveOwnershipKind = z.enum(['storage-root', 'guest-volume', 'dir-storage', 'system'])
+export type PveOwnershipKind = z.infer<typeof PveOwnershipKind>
+
+/**
+ * PVE's ownership claim on ONE dataset — the verdict of the shared pure
+ * predicate `pveOwnership()` (DESIGN.md "PVE footprint ownership", from
+ * ZFSPoolPlugin.pm). A dataset with NO verdict is outside PVE's footprint and
+ * ANAS may manage it. Pool-level PVE refusals are separate and unchanged.
+ */
+export const PveOwnership = z.object({
+  kind: PveOwnershipKind,
+  /** PVE storage id, e.g. 'local-zfs'; absent for kind 'system'. */
+  storage: z.string().optional(),
+  /** One sentence naming the storage (or pool) and the dataset. */
+  reason: z.string(),
+})
+export type PveOwnership = z.infer<typeof PveOwnership>
+
+/**
+ * Boot facts for a pool something boots from — the bootfs dataset (`zpool get
+ * bootfs`, when set) and the dataset mounted at / (when it is on this pool),
+ * read once per request. When present for a pool, the boot tree is
+ * system-owned and hands-off regardless of storage.cfg.
+ */
+export const SystemPoolFacts = z.object({
+  pool: z.string(),
+  /** Dataset from `zpool get bootfs` when set. */
+  bootfs: z.string().optional(),
+  /** Dataset mounted at / when it is on this pool. */
+  rootDataset: z.string().optional(),
+})
+export type SystemPoolFacts = z.infer<typeof SystemPoolFacts>
+
 /** Pool summary for list views (GET /v1/pools) */
 export const PoolSummary = z.object({
   name: PoolName,
