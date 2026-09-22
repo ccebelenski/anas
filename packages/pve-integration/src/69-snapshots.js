@@ -515,10 +515,13 @@
                     } catch (eRow) {
                         // A throw in the helper would REJECT this promise
                         // silently (no catch further down the chain). Degrade
-                        // the one row to the whole-pool rule — the tightening
-                        // answer (skew direction) — and keep looping.
-                        owned = !perNode
-                            && ANAS.pve.storagesOf(poolSummary).length > 0;
+                        // the one row toward the TIGHTENING answer and keep
+                        // looping: the whole-pool rule when the payload
+                        // predates the per-node stamps, OWNED (the row is
+                        // omitted) when it carries them — a row whose verdict
+                        // cannot be read must never be offered.
+                        owned = perNode
+                            || ANAS.pve.storagesOf(poolSummary).length > 0;
                     }
                     if (owned) {
                         if (ds.name === pool) {

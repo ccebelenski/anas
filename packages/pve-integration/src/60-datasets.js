@@ -386,10 +386,12 @@
     }
 
     // The selected row's ownership verdict (or null). Fail-open ⇒ null: a row
-    // that cannot be read is treated as ANAS-manageable.
+    // that cannot be read is treated as ANAS-manageable. The guarded field
+    // read is ANAS.pve.fieldOf (10-api.js) — the ONE accessor for both record
+    // and plain-node callers.
     function recPveOwnership(rec) {
         try {
-            var o = rec && rec.get ? rec.get('pveOwnership') : null;
+            var o = ANAS.pve.fieldOf(rec, 'pveOwnership');
             return (o && typeof o === 'object') ? o : null;
         } catch (e) {
             return null;
@@ -421,7 +423,7 @@
         if (!own) {
             return true;
         }
-        if (rec.get('pvePerNode') === false) {
+        if (ANAS.pve.fieldOf(rec, 'pvePerNode') === false) {
             return false;
         }
         if (typeof own.childrenManageable === 'boolean') {

@@ -1986,6 +1986,44 @@ const PVE2_SKEW_ROUTES = {
   },
 }
 
+// pvepool.2 review — mid-skew in the OTHER direction: the payload carries the
+// per-node `pve` field, but the verdicts predate `childrenManageable`. The
+// gate then falls back to the row's kind: only a storage root may take
+// children.
+const PVE2_MIDSKEW_ROUTES = {
+  ...PVE2_ROUTES,
+  'GET /pools/pvepool/datasets': {
+    data: PVE2_DATASETS.map(({ pve, ...rest }) => {
+      if (!pve) { return rest }
+      const { childrenManageable, ...verdict } = pve
+      return { ...rest, pve: verdict }
+    }),
+    defaults: { volblocksize: 16384 },
+  },
+}
+
+// pvepool.2 review — the dialog's PARENT gate: the pool root is owned by a
+// PVE storage whose `childrenManageable` is FALSE (a directory storage rooted
+// at the pool), so creating under it is refused by the dialog itself while an
+// ANAS pool re-enables Create when the combo changes.
+const PVE2_DIRSTOR_ROUTES = {
+  ...PVE2_ROUTES,
+  'GET /pools/pvepool/datasets': {
+    data: PVE2_DATASETS.map((row) => (row.name === 'pvepool'
+      ? {
+        ...row,
+        pve: {
+          kind: 'dir-storage',
+          storage: 'local-zfs',
+          reason: "PVE storage 'local-zfs' manages pvepool as directory storage",
+          childrenManageable: false,
+        },
+      }
+      : row)),
+    defaults: { volblocksize: 16384 },
+  },
+}
+
 /** The tree-reload counter: loadTree always re-reads GET /pools first. */
 const poolsGets = () => apiGets.filter(p => p === '/pools').length
 
@@ -2373,6 +2411,131 @@ async function pveSkewChecks() {
     /older daemon/.test(state.dsDestroy.tip), state.dsDestroy.tip)
 
   ok('skew(datasets): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/** pvepool.2 review: mid-skew — the daemon stamps `pve` but the verdicts
+ * predate `childrenManageable`. Create then falls back to the row's kind and
+ * is allowed ONLY on a storage root. */
+async function pveMidSkewChecks() {
+  const { tree } = await openDatasetTree(PVE2_MIDSKEW_ROUTES)
+  const root = findNode(tree, 'pvepool')
+  const guest = findNode(tree, 'pvepool/vm-100-disk-0')
+  ok('midskew: the rows loaded', !!root && !!guest)
+  if (!root || !guest) { return }
+
+  ok('midskew: the root verdict is stamped', !!root.get('pveOwnership'))
+  eq('midskew: the verdict carries NO childrenManageable',
+    typeof root.get('pveOwnership').childrenManageable, 'undefined')
+
+  tree.selectNode(root)
+  let state = toolbarState(tree, ['dsCreate'])
+  ok('midskew(root): Create ENABLED (a storage root may take children)',
+    state.dsCreate.disabled === false)
+
+  tree.selectNode(guest)
+  state = toolbarState(tree, ['dsCreate'])
+  ok('midskew(guest): Create DISABLED (no childrenManageable ⇒ hands-off)',
+    state.dsCreate.disabled === true)
+
+  ok('midskew(datasets): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/** pvepool.2 review: the dialog's PARENT gate — a parent whose
+ * `childrenManageable` is false holds the Create button, and switching the
+ * pool combo to an ANAS pool re-runs the gate and re-enables it. */
+async function pveDialogParentGateChecks() {
+  const { tree } = await openDatasetTree(PVE2_DIRSTOR_ROUTES)
+  const sibling = findNode(tree, 'pvepool/media')
+  ok('parent-gate: the unowned sibling loaded', !!sibling)
+  if (!sibling) { return }
+
+  tree.selectNode(sibling)
+  const btn = tree.down('#dsCreate')
+  ok('parent-gate: Create is enabled on the unowned sibling', btn.disabled === false)
+  btn.handler(btn)
+  await settle()
+  const dlg = openWindow()
+  ok('parent-gate: the dialog opened', !!dlg && !!dlg.down('#pool'))
+  if (!dlg) { return }
+
+  // The sibling selection pre-seeds `media/` — the typed path's parent is the
+  // pool root, whose verdict says childrenManageable: false.
+  const submit = dlg.down('#dsCreateSubmit')
+  ok('parent-gate: Create DISABLED on open (parent is PVE directory storage)',
+    submit.disabled === true)
+  ok('parent-gate: the guard names the owner',
+    dlg.down('#anasDsNameGuard').hidden === false
+      && /directory storage/.test(dlg.down('#anasDsNameGuard').html),
+    dlg.down('#anasDsNameGuard').html)
+
+  // Changing the pool re-runs the gate: an ANAS pool re-enables Create.
+  dlg.down('#pool').setValue('tank')
+  await settle()
+  ok('parent-gate: Create ENABLED again on the ANAS pool', submit.disabled === false)
+  ok('parent-gate: and the guard note goes away',
+    dlg.down('#anasDsNameGuard').hidden === true)
+
+  // …and back: the gate re-holds Create.
+  dlg.down('#pool').setValue('pvepool')
+  await settle()
+  ok('parent-gate: Create DISABLED again on the PVE pool', submit.disabled === true)
+
+  ok('parent-gate: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/** pvepool.2 review: expansion and selection survive the shared reload — the
+ * loadTree path every create/failure handler takes must not collapse the
+ * operator's view. */
+async function pveReloadRestoreChecks() {
+  const { tree } = await openDatasetTree(PVE2_ROUTES)
+  const media = findNode(tree, 'pvepool/media')
+  const guest = findNode(tree, 'pvepool/vm-100-disk-0')
+  ok('reload-restore: the rows loaded', !!media && !!guest)
+  if (!media || !guest) { return }
+
+  media.expand()
+  guest.expand()
+  tree.selectNode(media)
+
+  // The destroy path — confirmAndRun records the job, the stub auto-completes
+  // it (onComplete → loadTree), and the failure branch is fired explicitly
+  // (onFailed → loadTree). Both reloads must restore what the operator had
+  // open.
+  jobs.length = 0
+  apiGets.length = 0
+  const btn = tree.down('#dsDestroy')
+  btn.handler(btn)
+  await settle()
+  eq('reload-restore: one destroy job', jobs.length, 1)
+  ok('reload-restore: the tree reloaded on SUCCESS', poolsGets() > 0)
+
+  const mediaAfter = findNode(tree, 'pvepool/media')
+  const guestAfter = findNode(tree, 'pvepool/vm-100-disk-0')
+  ok('reload-restore: media is expanded again after the SUCCESS reload',
+    !!mediaAfter && mediaAfter.isExpanded() === true)
+  ok('reload-restore: the guest row is expanded again too',
+    !!guestAfter && guestAfter.isExpanded() === true)
+  eq('reload-restore: the selection is restored',
+    tree.getSelection().map(n => n.get('fullName')), ['pvepool/media'])
+
+  apiGets.length = 0
+  if (typeof jobs[0].onFailed === 'function') {
+    jobs[0].onFailed({ error: { message: 'zfs destroy failed: dataset is busy' } })
+    await settle()
+    ok('reload-restore: the tree reloaded on FAILURE too', poolsGets() > 0)
+    const mediaFailed = findNode(tree, 'pvepool/media')
+    const guestFailed = findNode(tree, 'pvepool/vm-100-disk-0')
+    ok('reload-restore: media is expanded after the FAILURE reload',
+      !!mediaFailed && mediaFailed.isExpanded() === true)
+    ok('reload-restore: the guest row is still expanded',
+      !!guestFailed && guestFailed.isExpanded() === true)
+    eq('reload-restore: the selection survives the failure reload',
+      tree.getSelection().map(n => n.get('fullName')), ['pvepool/media'])
+  } else {
+    ok('reload-restore: onFailed reaches the poll', false, 'no onFailed recorded')
+  }
+
+  ok('reload-restore: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 
@@ -9242,6 +9405,14 @@ warnings.length = 0
 await pveOwnershipChecks()
 warnings.length = 0
 await pveSkewChecks()
+warnings.length = 0
+// pvepool.2 review — mid-skew Create gate, the dialog's parent gate, and
+// expansion/selection surviving the shared reload.
+await pveMidSkewChecks()
+warnings.length = 0
+await pveDialogParentGateChecks()
+warnings.length = 0
+await pveReloadRestoreChecks()
 warnings.length = 0
 for (const check of [
   iscsiGridChecks,

@@ -641,6 +641,11 @@
             return !!ANAS.pve.ownership(node, pool, perNodeAvailable);
         },
 
+        // fieldOf(rec, name) → the field off an ExtJS record (.get) or a plain
+        // node (.name), never throwing — pveField above, the ONE guarded
+        // accessor, exported so the screens stop re-deriving it per file.
+        fieldOf: pveField,
+
         // storagesOf(pool) → the pool's PVE storages as a plain array (never
         // null; non-array / malformed ⇒ []). The ONE copy — 30-pools and
         // 60-datasets each used to carry their own (pveStoragesOf /
