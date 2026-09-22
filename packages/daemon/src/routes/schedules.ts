@@ -5,7 +5,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import { ScheduleId, SnapshotSchedule } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { readAhrPools } from '../services/ahr-topology.js'
-import { loadPveFootprint } from '../services/pve-footprint.js'
+import { loadPveFootprint, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { notifyScheduleRun } from '../services/snapshot-notify.js'
 import {
   collectScheduleStatuses,
@@ -66,6 +66,20 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
   }
 
   /**
+   * The dataset and everything beneath it (`zfs list -r -H -o name`) — the
+   * candidate list for the recursive-schedule descendant guard (pvepool.1
+   * review fix 2). Empty when the read fails: the existence check below has
+   * already refused a vanished target, and a failed probe must never read as
+   * "no descendants" for a target that exists.
+   */
+  async function descendantDatasetNames(dataset: string): Promise<string[]> {
+    const r = await executor.exec(ZFS, ['list', '-H', '-o', 'name', '-r', dataset])
+    if (r.exitCode !== 0)
+      return []
+    return r.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+  }
+
+  /**
    * Story pvepool.1 boundary guard: refuse only a schedule whose TARGET dataset
    * PVE owns — a storage root, a guest volume, a dir-storage tree or the boot
    * tree (the ownership reason names the storage AND the dataset). A sibling
@@ -86,10 +100,13 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
   /**
    * Validate that a schedule's target exists and is ANAS-manageable (SCHEDULES-
    * DESIGN: ANAS-managed pools/datasets only; PVE-OWNED DATASETS stay hands-off —
-   * pvepool.1).
+   * pvepool.1). `recursive` schedules are additionally refused when any STRICT
+   * descendant of the target is PVE-owned (pvepool.1 review fix 2): a recursive
+   * schedule sweeps the subtree, and a storage registered on a nested path
+   * leaves the tree above it unowned.
    * Sends the appropriate 4xx and returns false on the first failure.
    */
-  async function guardTarget(target: SnapshotTarget, reply: FastifyReply): Promise<boolean> {
+  async function guardTarget(target: SnapshotTarget, recursive: boolean, reply: FastifyReply): Promise<boolean> {
     if (target.kind === 'zfs') {
       const pool = target.dataset.split('/')[0]
       if (!(await zpoolExists(pool))) {
@@ -99,7 +116,8 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       // A storage root IS owned (kind 'storage-root'), so this one check covers
       // both: an owned target of any kind, and the recursive schedule on a
       // storage root that sweeps guest zvols.
-      const owned = (await pveFootprint()).ownershipOf(target.dataset)
+      const pve = await pveFootprint()
+      const owned = pve.ownershipOf(target.dataset)
       if (owned) {
         reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `Cannot schedule snapshots of '${target.dataset}' — ${owned.reason}` } })
         return false
@@ -107,6 +125,13 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       if (!(await zfsDatasetExists(target.dataset))) {
         reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `Dataset '${target.dataset}' does not exist` } })
         return false
+      }
+      if (recursive) {
+        const descendant = pve.ownedDescendant(await descendantDatasetNames(target.dataset), target.dataset)
+        if (descendant) {
+          reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: pveRecursiveRefusalMessage('Snapshot schedule', target.dataset, descendant) } })
+          return false
+        }
       }
       return true
     }
@@ -174,7 +199,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `Snapshot schedule '${schedule.id}' already exists` } }
     }
-    if (!(await guardTarget(schedule.target, reply)))
+    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply)))
       return reply
 
     const job = jobQueue.submit(
@@ -257,7 +282,7 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         },
       }
     }
-    if (!(await guardTarget(schedule.target, reply)))
+    if (!(await guardTarget(schedule.target, schedule.recursive === true, reply)))
       return reply
 
     const job = jobQueue.submit(

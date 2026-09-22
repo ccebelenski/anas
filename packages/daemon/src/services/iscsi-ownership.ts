@@ -85,8 +85,13 @@ export interface BackingClassification {
 
 /** The system facts ownership is derived from; both are already read elsewhere. */
 export interface OwnershipInputs {
-  /** `poolRoot -> PveStorageRef[]`, from `readPveStorages()`. */
-  pveStorages: Map<string, PveStorageRef[]>
+  /**
+   * `poolRoot -> PveStorageRef[]`, from `readPveStorages()`. `null` means that
+   * read FAILED — UNREADABLE, not "no storages" (pvepool.1 review fix 1) — and
+   * {@link ownershipWithFallback} then treats EVERY dataset as PVE's until the
+   * config can be read. Missing facts may only tighten the gate, never loosen it.
+   */
+  pveStorages: Map<string, PveStorageRef[]> | null
   /** ZFS mountpoints, from `readZfsMountpoints()` — resolves a file onto a dataset. */
   zfsMountpoints: ZfsMountpoint[]
   /** AHR pool mountpoints (`name -> mountpoint`); an AHR pool's only block kind is a file. */
@@ -127,7 +132,12 @@ function poolRoot(dataset: string): string {
  * mutate paths) — one predicate assembly, never two.
  */
 export function ownershipFromInputs(inputs: OwnershipInputs, dataset: string): PveOwnership | null {
-  return ownershipWithFallback(inputs.pveStorages, inputs.systemFacts ?? null, dataset)
+  return ownershipWithFallback(
+    inputs.pveStorages ?? new Map(),
+    inputs.systemFacts ?? null,
+    dataset,
+    inputs.pveStorages === null,
+  )
 }
 
 /** Ask {@link ownershipFromInputs} from inside this module. */

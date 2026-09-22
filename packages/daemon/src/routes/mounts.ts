@@ -189,7 +189,16 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Mountpoint '${req.mountpoint}' belongs to a PVE storage (hands-off)` } }
     }
-    if ((await readZfsMountpoints()).some(m => m.mountpoint === req.mountpoint)) {
+    // pvepool.1 review fix 1: the mountpoint list is three-valued now — absent
+    // `zfs` ([]) fails open, an UNREADABLE answer (null) tightens: this check
+    // keeps a mount from shadowing a ZFS dataset's mountpoint, and "could not
+    // check" never gets to read as "nothing there".
+    const zfsMountpoints = await readZfsMountpoints()
+    if (zfsMountpoints === null) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `ANAS could not verify whether '${req.mountpoint}' is a ZFS dataset mountpoint (zfs list failed) — the mount is refused until the ZFS answer is readable` } }
+    }
+    if (zfsMountpoints.some(m => m.mountpoint === req.mountpoint)) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: `Mountpoint '${req.mountpoint}' is a ZFS dataset mountpoint` } }
     }

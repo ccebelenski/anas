@@ -1,10 +1,10 @@
 import type { AhrPool, BackupArchiveConsistency, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
-import { isPathWithin, zvolDatasetFromPath, zvolDevicePath } from '@anas/shared'
+import { isPathWithin, pveStoragePath, zvolDatasetFromPath, zvolDevicePath } from '@anas/shared'
 import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { mountIndex, normalizePath, relativeTo } from './nested-filesystems.js'
-import { ownershipWithFallback, readSystemPoolFacts } from './pve-footprint.js'
+import { ownedDescendantIn, ownershipWithFallback, readSystemPoolFacts } from './pve-footprint.js'
 
 /**
  * DERIVED per-source snapshot consistency (story backup2.3).
@@ -91,11 +91,16 @@ export interface ConsistencyFacts {
    * each source's own dataset: PVE-owned (a storage root, a guest volume, a
    * dir-storage tree, the boot tree) means hands-off — no transient snapshot —
    * while a sibling dataset on a PVE pool is snapshotted like any other.
-   * Empty when the file could not be read — which derives to `snapshot` for an
-   * unowned source, the same posture `/v1/pools` already takes when
-   * storage.cfg is unreadable.
+   * Empty when the file could not be read — see {@link storagesUnavailable},
+   * which is what the derivation then consults: unreadable tightens to
+   * hands-off, it never reads as "no PVE storages" (pvepool.1 review fix 1).
    */
   pveStorages: Map<string, PveStorageRef[]>
+  /**
+   * True when the storage.cfg read FAILED (UNREADABLE, not absent). While
+   * true, every dataset is judged PVE-owned and every source derives `live`.
+   */
+  storagesUnavailable: boolean
   /**
    * Boot facts per imported pool, for the system rule of the footprint
    * predicate. `null` (or omitted) means UNREADABLE — not "no system pool" —
@@ -135,20 +140,19 @@ export async function readConsistencyFacts(
   }
   // Per-source ownership needs the refs RESOLVED — a `dir` storage only maps
   // onto its dataset with the mountpoint list — so this is one file read plus
-  // one `zfs list`, and the boot facts for the system rule. Fail-open (the
-  // parsers already are): an unreadable source yields an empty map/list.
-  let pveStorages = new Map<string, PveStorageRef[]>()
-  try {
-    pveStorages = await readPveStorages(opts.pveStorageCfg ?? PVE_STORAGE_CFG, await readZfsMountpoints())
-  }
-  catch {
-    pveStorages = new Map()
-  }
+  // one `zfs list`, and the boot facts for the system rule. The readers are
+  // three-valued (pvepool.1 review fix 1): absent fails open, UNREADABLE comes
+  // back as null and the derivation tightens to hands-off via
+  // {@link ConsistencyFacts.storagesUnavailable}. A failed `zfs list` only
+  // disables `dir` resolution — the parser's secondary signal.
+  const mountpoints = await readZfsMountpoints()
+  const storages = await readPveStorages(opts.pveStorageCfg ?? PVE_STORAGE_CFG, mountpoints)
+  const pveStorages = storages ?? new Map<string, PveStorageRef[]>()
   // Unreadable boot facts stay `null` here — NOT `[]`: the derivation tightens
   // toward hands-off through the whole-pool fallback, exactly like the
   // footprint service does.
   const systemFacts = await readSystemPoolFacts(executor)
-  return { mounts, ahrPools, pveStorages, systemFacts }
+  return { mounts, ahrPools, pveStorages, storagesUnavailable: storages === null, systemFacts }
 }
 
 /**
@@ -179,6 +183,13 @@ export function filesystemOf(path: string, mounts: Map<string, FindmntNode>): Fi
 export function deriveConsistency(path: string, facts: ConsistencyFacts): BackupArchiveConsistency {
   const source = normalizePath(path)
 
+  // The ONE ownership answer, assembled once from the facts (the same
+  // composition {@link loadPveFootprint} performs) — every judgement below,
+  // including the descendant scan, asks through here and never re-states the
+  // rule.
+  const ownershipOf = (dataset: string) =>
+    ownershipWithFallback(facts.pveStorages, facts.systemFacts ?? null, dataset, facts.storagesUnavailable)
+
   // A source that is ALREADY inside somebody's `.zfs/snapshot/<s>` tree is a
   // frozen, read-only view: there is nothing to make consistent, and snapshotting
   // its dataset would point the archive at a `.zfs/snapshot/<new>/.zfs/…` path
@@ -202,7 +213,8 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     // to take); any other owned kind (storage root, dir-storage tree, boot
     // tree) is equally hands-off, with the ownership reason as the sentence.
     // A volume on a sibling dataset of a PVE pool is snapshotted normally.
-    const owned = ownershipWithFallback(facts.pveStorages, facts.systemFacts ?? null, zvol)
+    // (No descendant scan: a zvol is a leaf — it cannot have child datasets.)
+    const owned = ownershipOf(zvol)
     if (owned?.kind === 'guest-volume') {
       return {
         consistency: 'live',
@@ -256,11 +268,34 @@ export function deriveConsistency(path: string, facts: ConsistencyFacts): Backup
     // snapshot would sweep PVE's guest zvols, a dir-storage tree or a guest
     // subvol is PVE's own territory. A sibling dataset of a PVE pool is
     // snapshotted like any other.
-    const owned = ownershipWithFallback(facts.pveStorages, facts.systemFacts ?? null, node.source)
+    const owned = ownershipOf(node.source)
     if (owned) {
       return {
         consistency: 'live',
         reason: `${source} is inside PVE's footprint - ${owned.reason} - so the run takes no snapshot and reads the live tree`,
+      }
+    }
+    // pvepool.1 review fix 2: the run snapshots RECURSIVELY, so an UNOWNED
+    // hosting dataset with an OWNED DESCENDANT (a storage registered on a
+    // nested path, e.g. `tank/x/data` under `tank/x`) is equally hands-off —
+    // `zfs snapshot -r` would sweep PVE's storage root and its guest disks.
+    // The descendant candidates are the pool's ref paths, already in the
+    // facts — no extra I/O — and the scan is the ONE helper
+    // {@link ownedDescendantIn}.
+    const descendant = ownedDescendantIn(
+      (facts.pveStorages.get(node.source.split('/')[0]) ?? []).flatMap((r) => {
+        // A bare-pool `zfspool` ref resolves to the pool root itself; a ref
+        // with no footprint contributes no candidate.
+        const p = pveStoragePath(r, node.source.split('/')[0])
+        return p ? [p] : []
+      }),
+      node.source,
+      ownershipOf,
+    )
+    if (descendant) {
+      return {
+        consistency: 'live',
+        reason: `${source} is on the ZFS dataset ${node.source}, which has PVE-owned ${descendant.name} beneath it - a recursive snapshot would include it (${descendant.ownership.reason}) - so the run takes no snapshot and reads the live tree`,
       }
     }
     return {

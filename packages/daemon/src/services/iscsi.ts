@@ -345,10 +345,14 @@ export async function readIscsiContext(
   if (!hasTargets)
     return empty
 
-  const [zfsMountpoints, nodeAddresses] = await Promise.all([
+  const [readMountpoints, nodeAddresses] = await Promise.all([
     paths.zfsMountpoints ? paths.zfsMountpoints() : readZfsMountpoints(),
     readNodeAddresses(executor),
   ])
+  // A null mountpoint read (zfs list failed) only disables file→dataset
+  // resolution — the parser's secondary signal — never the storage.cfg
+  // verdict itself, which rides in `pveStorages` (null = UNREADABLE).
+  const zfsMountpoints = readMountpoints ?? []
   const pveStorages = await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints)
   // Boot facts for the system rule of the footprint predicate — null when the
   // probe fails (UNREADABLE), so the ownership answer tightens toward

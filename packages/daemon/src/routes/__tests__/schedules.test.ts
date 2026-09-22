@@ -464,5 +464,75 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
           process.env.ANAS_STORAGE_CFG = prevCfg
       }
     })
+
+    // pvepool.1 review fix 2: a RECURSIVE schedule over an unowned parent with
+    // an OWNED DESCENDANT (the storage registered on the nested path
+    // `testpool/x/data`) is refused with the descendant named.
+    it('a RECURSIVE schedule over an unowned parent with an owned descendant is refused', async () => {
+      const cfgdir = await mkdtemp(join(tmpdir(), 'anas-sched-pve-'))
+      const prevCfg = process.env.ANAS_STORAGE_CFG
+      await writeFile(join(cfgdir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool/x/data\n\tcontent images,rootdir\n\n', 'utf8')
+      process.env.ANAS_STORAGE_CFG = join(cfgdir, 'storage.cfg')
+      // The subtree `zfs list -r` answers for the descendant scan.
+      mockOf(server).addFixture({
+        command: ZFS,
+        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/data/vm-100-disk-0\ntestpool/x/media\n', stderr: '', exitCode: 0 },
+      })
+      try {
+        const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/x' }, recursive: true })
+        assert.equal(res.statusCode, 400)
+        const msg = (res.json() as { error: { message: string } }).error.message
+        assert.match(msg, /Snapshot schedule of 'testpool\/x' would include testpool\/x\/data/)
+        assert.match(msg, /local-zfs/)
+      }
+      finally {
+        await rm(cfgdir, { recursive: true, force: true })
+        if (prevCfg === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prevCfg
+      }
+    })
+
+    it('a NON-recursive schedule over the same unowned parent is schedulable', async () => {
+      const cfgdir = await mkdtemp(join(tmpdir(), 'anas-sched-pve-'))
+      const prevCfg = process.env.ANAS_STORAGE_CFG
+      await writeFile(join(cfgdir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool/x/data\n\tcontent images,rootdir\n\n', 'utf8')
+      process.env.ANAS_STORAGE_CFG = join(cfgdir, 'storage.cfg')
+      try {
+        const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/x' } })
+        assert.equal(res.statusCode, 202)
+        const done = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+      }
+      finally {
+        await rm(cfgdir, { recursive: true, force: true })
+        if (prevCfg === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prevCfg
+      }
+    })
+
+    it('a recursive schedule on the SIBLING passes the guard', async () => {
+      const cfgdir = await mkdtemp(join(tmpdir(), 'anas-sched-pve-'))
+      const prevCfg = process.env.ANAS_STORAGE_CFG
+      await writeFile(join(cfgdir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool/x/data\n\tcontent images,rootdir\n\n', 'utf8')
+      process.env.ANAS_STORAGE_CFG = join(cfgdir, 'storage.cfg')
+      try {
+        const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/x/media' }, recursive: true })
+        assert.equal(res.statusCode, 202)
+        const done = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+      }
+      finally {
+        await rm(cfgdir, { recursive: true, force: true })
+        if (prevCfg === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prevCfg
+      }
+    })
   })
 })

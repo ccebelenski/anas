@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { parsePbsStorages, parsePveStorageCfg, parseZfsMountpoints, readPbsStorages, readPveStorages } from '../pve-storage.js'
+import { parsePbsStorages, parsePveStorageCfg, parseZfsMountpoints, readPbsStorages, readPveStorages, readZfsMountpoints } from '../pve-storage.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/pve')
@@ -245,11 +245,34 @@ describe('readPbsStorages (fail-open)', () => {
 describe('readPveStorages (fail-open)', () => {
   it('reads and parses a real storage.cfg fixture', async () => {
     const map = await readPveStorages(join(fixturesDir, 'storage.cfg'))
+    assert.ok(map)
     assert.deepEqual([...map.keys()], ['datapool'])
   })
 
   it('returns an empty map when the file is missing (non-PVE host)', async () => {
     const map = await readPveStorages(join(fixturesDir, 'does-not-exist.cfg'))
+    assert.ok(map)
     assert.equal(map.size, 0)
+  })
+
+  // pvepool.1 review fix 1: ENOENT (absent = not a PVE host) stays fail-open;
+  // ANY OTHER read failure is UNREADABLE — null, never an empty map that would
+  // read as "no PVE storages" and loosen the hands-off gate.
+  it('returns null (unreadable) when the read fails with anything but ENOENT', async () => {
+    // A DIRECTORY: readFile rejects with EISDIR, not ENOENT.
+    assert.equal(await readPveStorages(fixturesDir), null)
+  })
+})
+
+describe('readZfsMountpoints (ENOENT vs unreadable)', () => {
+  // pvepool.1 review fix 1: the same three-valued posture as the storage.cfg
+  // read — a missing `zfs` binary is a genuine "no ZFS here" (fail-open, []),
+  // a command that RAN and failed is UNREADABLE (null).
+  it('returns [] when the zfs binary is missing (ENOENT)', async () => {
+    assert.deepEqual(await readZfsMountpoints('/nonexistent/anas-no-zfs-here'), [])
+  })
+
+  it('returns null (unreadable) when the command fails with anything but ENOENT', async () => {
+    assert.equal(await readZfsMountpoints('/bin/false'), null)
   })
 })

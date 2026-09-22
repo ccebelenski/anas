@@ -17,7 +17,7 @@ import { confirmGate } from '../safety/gate.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
-import { loadPveFootprint, pveNamingGuardMessage } from '../services/pve-footprint.js'
+import { loadPveFootprint, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 import { createReplicationHandlers } from './replication.js'
@@ -1571,11 +1571,23 @@ export async function datasetRoutes(
 
     // PVE footprint (story pvepool.1): an OWNED dataset is never ANAS's to
     // destroy — any kind, refused up front with the predicate's reason, before
-    // the confirm gate is even minted.
-    const pveOwned = (await pveFootprint()).ownershipOf(fullName)
+    // the confirm gate is even minted. A RECURSIVE destroy also sweeps the
+    // subtree, and a storage registered on a NESTED path (e.g. `tank/x/data`)
+    // leaves the tree above it unowned — review fix 2 refuses when any
+    // strict descendant is PVE-owned, so `?recursive=true` can never take
+    // PVE's storage root and its guest disks with it.
+    const pve = await pveFootprint()
+    const pveOwned = pve.ownershipOf(fullName)
     if (pveOwned) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: pveOwned.reason } }
+    }
+    if (recursive) {
+      const descendant = pve.ownedDescendant(datasets, fullName)
+      if (descendant) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: pveRecursiveRefusalMessage('Destroy', fullName, descendant) } }
+      }
     }
 
     // Story iscsi.6: BEFORE the confirm gate and before any `zfs destroy`, ask
@@ -1742,7 +1754,8 @@ export async function datasetRoutes(
     if (!identity)
       return
 
-    if (!(await datasetExists(poolName, fullName))) {
+    const datasets = await listDatasets(poolName)
+    if (!datasets.some(d => d.name === fullName)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
     }
@@ -1750,11 +1763,22 @@ export async function datasetRoutes(
     // PVE footprint (story pvepool.1): an OWNED dataset is view-only for
     // snapshots — any kind. A storage-root snapshot sweeps PVE's guest zvols
     // (3.26's reasoning, now per-dataset), and a guest volume's snapshots are
-    // PVE's to take. Refused with the predicate's reason.
-    const owned = (await pveFootprint()).ownershipOf(fullName)
+    // PVE's to take. Refused with the predicate's reason. A RECURSIVE snapshot
+    // also sweeps the subtree, so an unowned dataset with an OWNED DESCENDANT
+    // (a storage registered on a nested path) is equally hands-off — review
+    // fix 2 refuses with the descendant named.
+    const pve = await pveFootprint()
+    const owned = pve.ownershipOf(fullName)
     if (owned) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
+    }
+    if (recursive) {
+      const descendant = pve.ownedDescendant(datasets, fullName)
+      if (descendant) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: pveRecursiveRefusalMessage('Recursive snapshot', fullName, descendant) } }
+      }
     }
 
     // 409 if the snapshot already exists — the system is the source of truth.

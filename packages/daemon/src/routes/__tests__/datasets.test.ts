@@ -8,7 +8,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
+import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
 
 const IDENTITY_HEADERS = {
@@ -763,5 +763,182 @@ describe('PVE footprint ownership (pvepool.1)', () => {
     const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed')
     assert.equal((job.result as { destroyed: string }).destroyed, 'testpool/media@snap1')
+  })
+})
+
+// --- pvepool.1 review fix 2: recursive verbs vs a NESTED PVE storage -------
+
+/** One `zfs list -j` dataset row — minimal, but everything parseZfsList reads. */
+function datasetRow(name: string, type: 'FILESYSTEM' | 'VOLUME'): [string, unknown] {
+  return [name, {
+    name,
+    type,
+    pool: 'testpool',
+    properties: {
+      used: { value: '1M', source: { type: 'NONE', data: '-' } },
+      available: { value: '1G', source: { type: 'NONE', data: '-' } },
+      referenced: { value: '1M', source: { type: 'NONE', data: '-' } },
+      mountpoint: { value: `/${name}`, source: { type: 'DEFAULT', data: '-' } },
+      type: { value: type.toLowerCase(), source: { type: 'NONE', data: '-' } },
+    },
+  }]
+}
+
+// The nested-storage shape: the zfspool storage is registered on
+// `testpool/x/data`, so `testpool/x` itself is NOT owned — but a recursive
+// verb on it would sweep the storage root and its guest disk.
+const NESTED_LIST = JSON.stringify({
+  output_version: { command: 'zfs list', vers_major: 0, vers_minor: 1 },
+  datasets: Object.fromEntries([
+    datasetRow('testpool', 'FILESYSTEM'),
+    datasetRow('testpool/x', 'FILESYSTEM'),
+    datasetRow('testpool/x/data', 'FILESYSTEM'),
+    datasetRow('testpool/x/data/vm-100-disk-0', 'VOLUME'),
+    datasetRow('testpool/x/media', 'FILESYSTEM'),
+  ]),
+})
+
+describe('recursive verbs over a NESTED PVE storage (review fix 2)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let prevCfg: string | undefined
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ds-nested-'))
+    prevCfg = process.env.ANAS_STORAGE_CFG
+    await writeFile(join(dir, 'storage.cfg'), 'zfspool: local-zfs\n\tpool testpool/x/data\n\tcontent images,rootdir\n\n', 'utf8')
+    process.env.ANAS_STORAGE_CFG = join(dir, 'storage.cfg')
+    server = createServer({ mock: true, logger: false })
+    // Answer ONLY the pool dataset list with the nested fixture — the
+    // first-registered exact fixture (the default zfsList) would otherwise win.
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const listArgs = zfsListArgs('testpool').join(' ')
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/sbin/zfs' && args.join(' ') === listArgs)
+        return { stdout: NESTED_LIST, stderr: '', exitCode: 0 }
+      return orig(command, args)
+    }
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    await rm(dir, { recursive: true, force: true })
+    if (prevCfg === undefined)
+      delete process.env.ANAS_STORAGE_CFG
+    else
+      process.env.ANAS_STORAGE_CFG = prevCfg
+  })
+
+  it('non-recursive destroy of the unowned parent behaves as before (confirm gate, not the ownership refusal)', async () => {
+    const res = await server!.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool/datasets/x',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+  })
+
+  it('recursive destroy of the unowned parent is refused, naming the owned descendant', async () => {
+    const res = await server!.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool/datasets/x?recursive=true',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 400)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'VALIDATION_ERROR')
+    assert.match(error.message, /Destroy of 'testpool\/x' would include testpool\/x\/data/)
+    assert.match(error.message, /local-zfs/)
+  })
+
+  it('recursive destroy of the sibling passes the guard (confirm gate)', async () => {
+    const res = await server!.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool/datasets/x/media?recursive=true',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 409)
+    assert.equal(res.json().error.code, 'CONFIRMATION_REQUIRED')
+  })
+
+  it('a recursive snapshot of the unowned parent is refused, naming the owned descendant', async () => {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/x/snapshots',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'snap1', recursive: true }),
+    })
+    assert.equal(res.statusCode, 400)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'VALIDATION_ERROR')
+    assert.match(error.message, /Recursive snapshot of 'testpool\/x' would include testpool\/x\/data/)
+  })
+
+  it('a recursive snapshot of the sibling passes the guard (202)', async () => {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/x/media/snapshots',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'snap1', recursive: true }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+  })
+})
+
+// --- pvepool.1 review fix 1: unreadable storage.cfg fails CLOSED ------------
+
+describe('unreadable storage.cfg fails closed (review fix 1)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let prevCfg: string | undefined
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ds-eisdir-'))
+    prevCfg = process.env.ANAS_STORAGE_CFG
+    // The env override points at a DIRECTORY: readFile rejects with EISDIR —
+    // any non-ENOENT failure stands in for pmxcfs (/etc/pve) being down.
+    process.env.ANAS_STORAGE_CFG = dir
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    await rm(dir, { recursive: true, force: true })
+    if (prevCfg === undefined)
+      delete process.env.ANAS_STORAGE_CFG
+    else
+      process.env.ANAS_STORAGE_CFG = prevCfg
+  })
+
+  it('a dataset create is refused with the unreadable reason (400 VALIDATION_ERROR)', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: 'media2' }),
+    })
+    assert.equal(res.statusCode, 400)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'VALIDATION_ERROR')
+    assert.match(error.message, /PVE storage configuration is unreadable/)
+    assert.match(error.message, /pool 'testpool' is treated as PVE's until it can be read/)
+  })
+
+  it('the tree stamps `pve` on EVERY node with the unreadable reason — reads work, mutations refuse', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets' })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: Dataset[] }
+    assert.ok(data.length > 0)
+    for (const d of data) {
+      assert.equal(d.pve?.kind, 'system', d.name)
+      assert.match(d.pve?.reason ?? '', /unreadable/)
+    }
   })
 })

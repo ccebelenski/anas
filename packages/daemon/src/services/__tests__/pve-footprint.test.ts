@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { parsePveStorageCfg } from '../../parsers/pve-storage.js'
-import { buildSystemPoolFacts, loadPveFootprint, ownershipFromFootprintData, parseBootfsGet, parseRootMount, readSystemPoolFacts } from '../pve-footprint.js'
+import { buildSystemPoolFacts, loadPveFootprint, ownedDescendantIn, ownershipFromFootprintData, parseBootfsGet, parseRootMount, pveRecursiveRefusalMessage, readSystemPoolFacts } from '../pve-footprint.js'
 
 /**
  * Story pvepool.1 — the system-pool half of the footprint service. The boot
@@ -181,5 +181,131 @@ describe('loadPveFootprint — unreadable boot facts fall back to the whole-pool
     // The sibling outside the boot tree stays manageable — the relaxation.
     assert.equal(fp.ownershipOf('tank/media'), null)
     assert.equal(fp.isSystemPool('tank'), true)
+  })
+})
+
+// --- pvepool.1 review fix 1: storage.cfg UNREADABLE fails closed ------------
+
+describe('loadPveFootprint — unreadable storage.cfg tightens EVERY pool (review fix 1)', () => {
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-pve-unreadable-'))
+    // `dir` itself is the cfg path: readFile rejects with EISDIR — any
+    // non-ENOENT failure stands in for pmxcfs being down.
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  function mockWithReadableBootFacts(): MockExecutor {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zpool',
+      args: ['get', '-H', '-o', 'name,value', 'bootfs'],
+      result: { stdout: 'tank\t-\nother\t-\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['-n', '-o', 'SOURCE,FSTYPE', '/'],
+      result: { stdout: '', stderr: '', exitCode: 1 },
+    })
+    return mock
+  }
+
+  it('a dataset on a pool with NO storage ref is owned with the unreadable reason', async () => {
+    const fp = await loadPveFootprint(mockWithReadableBootFacts(), { pveStorageCfg: dir })
+    assert.equal(fp.storagesUnavailable, true)
+    const owned = fp.ownershipOf('tank/media')
+    assert.equal(owned?.kind, 'system')
+    assert.equal(
+      owned?.reason,
+      `PVE storage configuration is unreadable (/etc/pve/storage.cfg) — pool 'tank' is treated as PVE's until it can be read`,
+    )
+  })
+
+  it('every pool is a system pool and the naming guard judges nothing', async () => {
+    const fp = await loadPveFootprint(mockWithReadableBootFacts(), { pveStorageCfg: dir })
+    assert.equal(fp.isSystemPool('tank'), true)
+    assert.equal(fp.isSystemPool('other'), true)
+    assert.equal(fp.claimedByPve('tank/vm-100-disk-0'), null)
+  })
+
+  it('an ABSENT storage.cfg (ENOENT) stays fail-open — unchanged behaviour', async () => {
+    const fp = await loadPveFootprint(mockWithReadableBootFacts(), { pveStorageCfg: join(dir, 'absent.cfg') })
+    assert.equal(fp.storagesUnavailable, false)
+    assert.equal(fp.ownershipOf('tank/media'), null)
+    assert.equal(fp.isSystemPool('tank'), false)
+    assert.equal(fp.claimedByPve('tank/vm-100-disk-0'), null)
+  })
+})
+
+// --- pvepool.1 review fix 2: the recursive-verb descendant guard ------------
+
+describe('ownedDescendant — the first strict descendant PVE owns (review fix 2)', () => {
+  // The nested-storage shape: the storage root is `tank/x/data`, so the tree
+  // ABOVE it (`tank/x`) is unowned — yet a recursive verb on `tank/x` sweeps
+  // the storage root and its guest disk.
+  const CFG = 'zfspool: local-zfs\n\tpool tank/x/data\n\tcontent images,rootdir\n\n'
+  const NAMES = ['tank', 'tank/x', 'tank/x/data', 'tank/x/data/vm-100-disk-0', 'tank/x/media']
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-pve-descendant-'))
+    await writeFile(join(dir, 'storage.cfg'), CFG, 'utf8')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function footprint() {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zpool',
+      args: ['get', '-H', '-o', 'name,value', 'bootfs'],
+      result: { stdout: 'tank\t-\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['-n', '-o', 'SOURCE,FSTYPE', '/'],
+      result: { stdout: '', stderr: '', exitCode: 1 },
+    })
+    return loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+  }
+
+  it('the parent above a nested storage root is NOT owned, but its descendant scan hits the root', async () => {
+    const fp = await footprint()
+    assert.equal(fp.ownershipOf('tank/x'), null)
+    const hit = fp.ownedDescendant(NAMES, 'tank/x')
+    assert.equal(hit?.name, 'tank/x/data')
+    assert.equal(hit?.ownership.kind, 'storage-root')
+    assert.match(hit?.ownership.reason ?? '', /local-zfs/)
+  })
+
+  it('a sibling with no owned descendants scans clean; the pool root hits the same root', async () => {
+    const fp = await footprint()
+    assert.equal(fp.ownedDescendant(NAMES, 'tank/x/media'), null)
+    assert.equal(fp.ownedDescendant(NAMES, 'tank')?.name, 'tank/x/data')
+  })
+
+  it('the strictness is on path SEGMENTS — `tank/x-other` is not a descendant of `tank/x`', async () => {
+    const fp = await footprint()
+    assert.equal(fp.ownedDescendant(['tank/x-other'], 'tank/x'), null)
+  })
+
+  it('the pure core answers the same for a plain string list and Dataset rows', async () => {
+    const fp = await footprint()
+    const asRows = NAMES.map(name => ({ name }))
+    assert.equal(ownedDescendantIn(asRows, 'tank/x', fp.ownershipOf)?.name, 'tank/x/data')
+    assert.equal(ownedDescendantIn(NAMES, 'tank/x', fp.ownershipOf)?.name, 'tank/x/data')
+  })
+
+  it('the refusal sentence names the verb, the swept descendant and the reason', async () => {
+    const fp = await footprint()
+    const hit = fp.ownedDescendant(NAMES, 'tank/x')!
+    assert.equal(
+      pveRecursiveRefusalMessage('Destroy', 'tank/x', hit),
+      `Destroy of 'tank/x' would include tank/x/data — PVE storage 'local-zfs' owns tank/x/data as a storage root`,
+    )
   })
 })

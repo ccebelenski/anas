@@ -21,9 +21,11 @@
  *
  * A stanza header (`<type>: <id>`) sits at column 0; its keys are indented.
  *
- * This parser is FAIL-OPEN by contract: a missing file (non-PVE / dev host) or
- * any parse error yields an empty map and must NEVER throw — GET /pools depends
- * on it and must succeed on hosts with no PVE.
+ * ENOENT (a missing file — a non-PVE / dev host) is FAIL-OPEN: an empty map,
+ * never a throw, so GET /pools keeps working on hosts with no PVE. ANY OTHER
+ * read failure returns `null` (see {@link readPveStorages}) — unreadable is a
+ * DIFFERENT answer from absent, and a missing fact may only TIGHTEN a
+ * hands-off gate, never loosen one (pvepool.1 review fix 1).
  */
 
 import type { PveStorageRef } from '@anas/shared'
@@ -233,30 +235,45 @@ export function parsePveStorageCfg(
 }
 
 /**
- * Read and parse the PVE storage config, FAIL-OPEN. A missing file (non-PVE or
- * dev host) or any read/parse error resolves to an empty map — never throws, so
- * GET /pools keeps working everywhere. Path is overridable for tests.
+ * Read and parse the PVE storage config. The ABSENT file (ENOENT — a non-PVE
+ * or dev host) is FAIL-OPEN: an empty map, no warning, exactly the posture
+ * GET /pools has always had off-PVE. ANY OTHER read failure (EACCES, EIO,
+ * ENOTCONN — pmxcfs down, a hung cluster fs) returns `null`: UNREADABLE, which
+ * is a different answer from absent, and which the ownership service treats as
+ * "every pool may be PVE's until this can be read" (pvepool.1 review fix 1 —
+ * an unreadable config must never read as "no PVE storages", or every guest
+ * dataset turns manageable). A READ file that parses to nothing still yields a
+ * (possibly empty) map — the parser is total. Path is overridable for tests.
  *
  * Pass `mountpoints` (from {@link readZfsMountpoints}) to ALSO resolve `dir`
- * storages that live on a ZFS dataset (secondary signal). Omit it for the
- * original zfspool-only behavior — nothing extra is read or computed.
+ * storages that live on a ZFS dataset (secondary signal). `null` (that read
+ * failed) resolves dir stanzas the same way as omitting it — they are skipped.
+ * Omit it for the original zfspool-only behavior.
  */
+let storagesReadWarned = false
+
 export async function readPveStorages(
   path: string = PVE_STORAGE_CFG,
-  mountpoints?: ZfsMountpoint[],
-): Promise<Map<string, PveStorageRef[]>> {
+  mountpoints?: ZfsMountpoint[] | null,
+): Promise<Map<string, PveStorageRef[]> | null> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
   }
   catch (err: unknown) {
-    // ENOENT is expected off-PVE and not worth a warning; anything else is.
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
-      console.warn(`anasd: could not read ${path} for PVE storage detection:`, err)
-    return new Map()
+    // ENOENT is expected off-PVE and not worth a warning; anything else means
+    // the answer is UNKNOWN, not "no storages" — say so once per process, not
+    // once per request (journald must not flood on a dead pmxcfs).
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return new Map()
+    if (!storagesReadWarned) {
+      storagesReadWarned = true
+      console.warn(`anasd: could not read ${path} for PVE storage detection — treated as UNREADABLE (ownership gates tighten) until it can be read:`, err)
+    }
+    return null
   }
   try {
-    return parsePveStorageCfg(text, mountpoints)
+    return parsePveStorageCfg(text, mountpoints ?? undefined)
   }
   catch (err: unknown) {
     console.warn(`anasd: could not parse ${path} for PVE storage detection:`, err)
@@ -291,19 +308,33 @@ export function parseZfsMountpoints(text: string): ZfsMountpoint[] {
 }
 
 /**
- * List ZFS dataset mountpoints via `zfs list`, FAIL-OPEN. Used to resolve PVE
- * `dir` storages onto their pool. Any failure (no ZFS, command error) resolves
- * to an empty array — dir detection is a secondary signal and must never break
- * GET /pools. Uses execFile (args array, no shell).
+ * List ZFS dataset mountpoints via `zfs list`. Used to resolve PVE `dir`
+ * storages onto their pool. A missing `zfs` binary (ENOENT — a non-ZFS host)
+ * is FAIL-OPEN: an empty array, no warning. ANY OTHER failure (nonzero exit,
+ * spawn trouble) returns `null` — UNREADABLE, the same three-valued posture as
+ * {@link readPveStorages}: callers tighten whatever gate the mountpoints feed
+ * instead of reading "no ZFS datasets" (pvepool.1 review fix 1). Uses execFile
+ * (args array, no shell).
  */
-export async function readZfsMountpoints(): Promise<ZfsMountpoint[]> {
+let mountpointsReadWarned = false
+
+/**
+ * The `zfs` command is overridable for tests (a fixture script standing in for
+ * the binary proves the ENOENT-vs-other split without requiring ZFS).
+ */
+export async function readZfsMountpoints(zfs = 'zfs'): Promise<ZfsMountpoint[] | null> {
   try {
-    const { stdout } = await execFileAsync('zfs', ['list', '-H', '-o', 'name,mountpoint'])
+    const { stdout } = await execFileAsync(zfs, ['list', '-H', '-o', 'name,mountpoint'])
     return parseZfsMountpoints(stdout)
   }
   catch (err: unknown) {
-    console.warn('anasd: could not list ZFS mountpoints for PVE dir detection:', err)
-    return []
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return []
+    if (!mountpointsReadWarned) {
+      mountpointsReadWarned = true
+      console.warn('anasd: could not list ZFS mountpoints for PVE dir detection — treated as UNREADABLE, not empty:', err)
+    }
+    return null
   }
 }
 

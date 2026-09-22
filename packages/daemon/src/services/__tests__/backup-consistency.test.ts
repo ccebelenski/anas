@@ -59,6 +59,7 @@ const FACTS: ConsistencyFacts = {
     pool('ahr1', '/mnt/ahr1', true),
     pool('ahrflat', '/mnt/ahrflat', false),
   ],
+  storagesUnavailable: false,
   // pvepool.1 — the PVE footprint refs the predicate judges each source's own
   // dataset by. `pvepool` carries a BARE zfspool storage (the pool root is the
   // storage root) and a NESTED one (`pvepool/data`); `tank/dump` is a `dir`
@@ -107,7 +108,29 @@ describe('backup consistency derivation (backup2.3)', () => {
 
   it('the LONGEST matching mount wins — a child dataset is not attributed to its parent', () => {
     assert.equal(deriveConsistency('/tank/media', FACTS).target, 'tank/media')
-    assert.equal(deriveConsistency('/tank/other', FACTS).target, 'tank')
+    assert.equal(filesystemOf('/tank/other', FACTS.mounts)?.source, 'tank')
+  })
+
+  // pvepool.1 review fix 2: the run snapshots RECURSIVELY, so a source on
+  // `tank` itself — which has the PVE-owned dir-storage tree `tank/dump`
+  // beneath it — is downgraded to live with the descendant named, exactly like
+  // an owned source.
+  it('a source on a dataset with a PVE-OWNED DESCENDANT is live, naming the descendant', () => {
+    const c = deriveConsistency('/tank/other', FACTS)
+    assert.equal(c.consistency, 'live')
+    assert.match(c.reason, /tank\/dump/)
+    assert.match(c.reason, /recursive snapshot would include/)
+  })
+
+  // pvepool.1 review fix 1: UNREADABLE storage.cfg tightens every answer —
+  // every source, file or zvol, derives live with the unreadable reason.
+  it('an UNREADABLE storage.cfg makes every source live (hands-off, never "no PVE")', () => {
+    const file = deriveConsistency('/tank/media/photos/raw', { ...FACTS, storagesUnavailable: true })
+    assert.equal(file.consistency, 'live')
+    assert.match(file.reason, /PVE storage configuration is unreadable/)
+    const zvol = deriveConsistency('/dev/zvol/tank/media', { ...FACTS, storagesUnavailable: true })
+    assert.equal(zvol.consistency, 'live')
+    assert.match(zvol.reason, /PVE storage configuration is unreadable/)
   })
 
   it('a path already INSIDE a .zfs snapshot is live, and says so', () => {
@@ -169,7 +192,7 @@ describe('backup consistency derivation (backup2.3)', () => {
   })
 
   it('an unreadable mount table derives LIVE and says the derivation could not see the system', () => {
-    const c = deriveConsistency('/tank/media', { mounts: new Map(), ahrPools: [], pveStorages: new Map() })
+    const c = deriveConsistency('/tank/media', { mounts: new Map(), ahrPools: [], pveStorages: new Map(), storagesUnavailable: false })
     assert.equal(c.consistency, 'live')
     assert.match(c.reason, /mount table could not be read/)
   })

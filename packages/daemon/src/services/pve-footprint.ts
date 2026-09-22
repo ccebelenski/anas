@@ -23,11 +23,15 @@ import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers
  * replication, iSCSI, backup) loads ONE footprint per request and asks it —
  * there is no second copy of the pool-level "is this PVE's?" helper anywhere
  * in the daemon (the four `isPveManagedPool` copies this replaces were the
- * single-source-of-truth lesson repeating itself). The storage.cfg read fails
- * OPEN: an unreadable file yields no storages, the same posture GET /pools has
- * always had off-PVE. The boot probe may only TIGHTEN: when it fails, the
- * facts are UNREADABLE (not "no system pool"), and a pool that hosts a zfspool
- * storage falls back to the pre-pvepool.1 whole-pool rule — PVE's whole pool,
+ * single-source-of-truth lesson repeating itself). BOTH reads are three-valued
+ * in the same direction (pvepool.1 review fix 1): ENOENT — the file absent, a
+ * non-PVE host — fails OPEN with no storages, exactly the posture GET /pools
+ * has always had off-PVE; ANY OTHER failure is UNREADABLE (`null`) and the
+ * footprint tightens — every dataset on every pool is treated as PVE's until
+ * the config can be read, because "unreadable" must never read as "no PVE
+ * here". The boot probe already had that shape: when it fails, the facts are
+ * UNREADABLE (not "no system pool"), and a pool that hosts a zfspool storage
+ * falls back to the pre-pvepool.1 whole-pool rule — PVE's whole pool,
  * hands-off — instead of answering manageable.
  */
 
@@ -155,8 +159,20 @@ export function ownershipWithFallback(
   storagesByPool: Map<string, PveStorageRef[]>,
   systemFacts: SystemPoolFacts[] | null,
   dataset: string,
+  storagesUnavailable = false,
 ): PveOwnership | null {
   const poolRoot = dataset.split('/')[0]
+  // UNREADABLE storage.cfg (pvepool.1 review fix 1): nothing can be judged, so
+  // EVERY dataset on EVERY pool is treated as PVE's — kind 'system', the
+  // existing "hands-off, no storage id" kind — until the config can be read.
+  // Reads keep working; mutations refuse. Missing facts may only tighten the
+  // gate, never loosen it.
+  if (storagesUnavailable) {
+    return {
+      kind: 'system',
+      reason: `PVE storage configuration is unreadable (/etc/pve/storage.cfg) — pool '${poolRoot}' is treated as PVE's until it can be read`,
+    }
+  }
   const refs = storagesByPool.get(poolRoot) ?? []
   if (systemFacts !== null)
     return pveOwnership(refs, dataset, systemFacts.find(f => f.pool === poolRoot))
@@ -170,6 +186,53 @@ export function ownershipWithFallback(
     }
   }
   return null
+}
+
+/**
+ * The FIRST strict descendant of `dataset` in `candidates` whose ownership is
+ * non-null — the recursive-verb guard (pvepool.1 review fix 2). A recursive
+ * verb (`zfs destroy -r`, a recursive snapshot) sweeps the whole subtree, and
+ * a storage registered on a NESTED path leaves the tree above it unowned; this
+ * is what stops `DELETE …/datasets/x?recursive=true` from taking PVE's storage
+ * root `x/data` and every guest disk under it.
+ *
+ * Pure over the candidates the caller already holds — the route's fetched
+ * dataset list, or a footprint consumer's ref paths — and it judges each one
+ * through the ONE ownership answer passed as `ownershipOf`, so the decision
+ * itself is never re-stated here. No extra I/O.
+ *
+ * Exported for consumers that hold facts rather than a {@link PveFootprint}
+ * (the backup consistency derivation); routes ask {@link PveFootprint.ownedDescendant}.
+ */
+export function ownedDescendantIn(
+  candidates: string[] | { name: string }[],
+  dataset: string,
+  ownershipOf: (dataset: string) => PveOwnership | null,
+): { name: string, ownership: PveOwnership } | null {
+  const prefix = `${dataset}/`
+  for (const c of candidates) {
+    const name = typeof c === 'string' ? c : c.name
+    if (!name.startsWith(prefix))
+      continue
+    const ownership = ownershipOf(name)
+    if (ownership)
+      return { name, ownership }
+  }
+  return null
+}
+
+/**
+ * The recursive-verb refusal sentence, stated ONCE (pvepool.1 review fix 2).
+ * `<verb>` is the human verb phrase ("Destroy", "Recursive snapshot",
+ * "Snapshot schedule"); the shape matches the single-dataset refusal — names
+ * the swept descendant AND quotes the ownership reason.
+ */
+export function pveRecursiveRefusalMessage(
+  verb: string,
+  dataset: string,
+  hit: { name: string, ownership: PveOwnership },
+): string {
+  return `${verb} of '${dataset}' would include ${hit.name} — ${hit.ownership.reason}`
 }
 
 /**
@@ -187,7 +250,7 @@ export function ownershipFromFootprintData(
 
 /** What one request's worth of PVE-footprint reads can answer. */
 export interface PveFootprint {
-  /** `poolRoot -> PveStorageRef[]` from storage.cfg (dir refs resolved). */
+  /** `poolRoot -> PveStorageRef[]` from storage.cfg (dir refs resolved; EMPTY while unavailable). */
   storagesByPool: Map<string, PveStorageRef[]>
   /** Boot facts per imported pool (empty when the probe failed). */
   systemFacts: SystemPoolFacts[]
@@ -199,20 +262,41 @@ export interface PveFootprint {
    */
   systemFactsUnavailable: boolean
   /**
+   * True when storage.cfg could NOT be read (pvepool.1 review fix 1) —
+   * UNREADABLE, as opposed to absent on a non-PVE host. While this is true,
+   * EVERY dataset on EVERY pool is answered PVE-owned ({@link ownershipOf})
+   * and {@link isSystemPool} is true for every pool, until the config can be
+   * read. Missing facts may only tighten the gate, never loosen it.
+   */
+  storagesUnavailable: boolean
+  /**
    * PVE's ownership claim on one full dataset name, or null when it is
    * outside PVE's footprint and ANAS may manage it. Pool-level PVE refusals
    * are separate and unchanged.
    */
   ownershipOf: (dataset: string) => PveOwnership | null
   /**
+   * The first strict descendant of `dataset` in `candidates` that PVE owns
+   * (pvepool.1 review fix 2) — the recursive-verb guard. `candidates` is the
+   * dataset list the caller already fetched (routes pass their `Dataset[]`
+   * rows); pure over it, no extra I/O. Null when no descendant is owned.
+   */
+  ownedDescendant: (
+    candidates: string[] | { name: string }[],
+    dataset: string,
+  ) => { name: string, ownership: PveOwnership } | null
+  /**
    * The naming guard for dataset create/rename/clone: non-null when PVE would
-   * inventory the dataset as a guest disk on its next scan.
+   * inventory the dataset as a guest disk on its next scan. Null while the
+   * storages are UNREADABLE — nothing can be judged, and the ownership
+   * refusal already blocks creation.
    */
   claimedByPve: (dataset: string) => { storage: string } | null
   /**
    * Does this pool hold this node's boot filesystem (bootfs set or hosting /) —
    * or is it a zfspool pool whose boot facts are UNREADABLE (the whole-pool
-   * fallback answers true for it too)?
+   * fallback answers true for it too)? While the STORAGES are unreadable it is
+   * true for every pool: pool-level destructive verbs refuse hard.
    */
   isSystemPool: (pool: string) => boolean
   /** The pool's boot facts when it is a system pool, else null. */
@@ -229,12 +313,18 @@ export async function loadPveFootprint(
   executor: CommandExecutor,
   opts: { pveStorageCfg?: string } = {},
 ): Promise<PveFootprint> {
-  const [storagesByPool, readFacts] = await Promise.all([
+  const [readStorages, readFacts] = await Promise.all([
     // Explicit override, then the daemon-wide env override, then the real path
-    // — the same resolution server.ts hands the route-level consumers.
+    // — the same resolution server.ts hands the route-level consumers. A null
+    // mountpoint read (zfs list failed) only disables `dir` resolution — the
+    // parser's secondary signal — never the storage.cfg verdict itself.
     readPveStorages(opts.pveStorageCfg ?? process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG, await readZfsMountpoints()),
     readSystemPoolFacts(executor),
   ])
+  // UNREADABLE ≠ empty (pvepool.1 review fix 1): null storages tighten every
+  // answer below until the config can be read again.
+  const storagesUnavailable = readStorages === null
+  const storagesByPool = readStorages ?? new Map<string, PveStorageRef[]>()
   const systemFactsUnavailable = readFacts === null
   const systemFacts = readFacts ?? []
 
@@ -247,13 +337,22 @@ export async function loadPveFootprint(
   const hasZfspoolRef = (pool: string): boolean =>
     (storagesByPool.get(pool) ?? []).some(ref => ref.type === 'zfspool')
 
+  const ownershipOf = (dataset: string): PveOwnership | null =>
+    ownershipWithFallback(storagesByPool, readFacts, dataset, storagesUnavailable)
+
   return {
     storagesByPool,
     systemFacts,
     systemFactsUnavailable,
-    ownershipOf: (dataset: string) => ownershipWithFallback(storagesByPool, readFacts, dataset),
-    claimedByPve: (dataset: string) => wouldBeClaimedByPve(storagesByPool.get(dataset.split('/')[0]) ?? [], dataset),
+    storagesUnavailable,
+    ownershipOf,
+    ownedDescendant: (candidates, dataset) => ownedDescendantIn(candidates, dataset, ownershipOf),
+    claimedByPve: (dataset: string) => storagesUnavailable
+      ? null // nothing can be judged; the ownership refusal already blocks creation
+      : wouldBeClaimedByPve(storagesByPool.get(dataset.split('/')[0]) ?? [], dataset),
     isSystemPool: (pool: string) => {
+      if (storagesUnavailable)
+        return true
       const f = factsFor(pool)
       if (f !== null && (f.bootfs !== undefined || f.rootDataset !== undefined))
         return true
