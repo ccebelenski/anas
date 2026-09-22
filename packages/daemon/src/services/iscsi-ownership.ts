@@ -11,8 +11,9 @@
  *   2. every LUN's backing object resolves onto storage ANAS manages.
  *
  * Rule 2 is the pvepool.1 footprint pattern applied to block objects. The ONE
- * shared predicate `pveOwnership()` (`@anas/shared`) decides — per DATASET, not
- * per pool — whether a LUN's backing dataset is inside PVE's footprint: a
+ * shared ownership answer, asked through {@link ownershipWithFallback} (which
+ * wraps the `@anas/shared` predicate), decides — per DATASET, not per pool —
+ * whether a LUN's backing dataset is inside PVE's footprint: a
  * storage root, a guest volume (`vm-101-disk-0`, `subvol-100-foo`, `basevol-*`),
  * a `dir` storage's tree, or the system/boot tree. An owned backing makes its
  * target foreign and hands-off. PVE's guest disks are never ANAS's candidates;
@@ -47,7 +48,8 @@
 
 import type { IscsiLunKind, IscsiOwnershipTag, PveOwnership, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
-import { isAnasIqn, pveOwnership, ZVOL_PATH_PREFIX, zvolDatasetFromPath } from '@anas/shared'
+import { isAnasIqn, ZVOL_PATH_PREFIX, zvolDatasetFromPath } from '@anas/shared'
+import { ownershipWithFallback } from './pve-footprint.js'
 
 /** Trailing slashes, stripped before any path comparison. */
 const TRAILING_SLASH_RE = /\/+$/
@@ -91,12 +93,13 @@ export interface OwnershipInputs {
   ahrMountpoints?: Map<string, string>
   /**
    * Boot facts per imported pool (`readSystemPoolFacts()`), for the
-   * system/boot-tree rule of the footprint predicate. Optional: a context that
-   * does not already hold them (some create paths, tests) omits them and the
-   * system rule is simply undetectable there — fail-open, like an unreadable
-   * storage.cfg.
+   * system/boot-tree rule of the footprint predicate. `null` (or omitted — a
+   * context that never read them, e.g. a create path) means UNREADABLE, and
+   * the whole-pool fallback of {@link ownershipWithFallback} tightens toward
+   * hands-off on any pool that hosts a zfspool storage. Missing facts may
+   * only tighten the gate, never loosen it.
    */
-  systemFacts?: SystemPoolFacts[]
+  systemFacts?: SystemPoolFacts[] | null
 }
 
 function stripTrailingSlash(path: string): string {
@@ -117,16 +120,14 @@ function poolRoot(dataset: string): string {
 
 /**
  * The ONE predicate, asked through {@link OwnershipInputs}: does PVE own this
- * dataset? Feed it the pool's storage refs and — when the context holds them —
- * that pool's boot facts. Omitted system facts fail open (the system rule is
- * undetectable), exactly like an unreadable storage.cfg. Exported for callers
- * that already HOLD an {@link OwnershipInputs} (the iSCSI mutate paths) — one
- * predicate assembly, never two.
+ * dataset? Feed it the pool's storage refs and that pool's boot facts. Facts
+ * that are `null` or omitted are UNREADABLE and take the whole-pool fallback
+ * — {@link ownershipWithFallback} is the single statement of the rule.
+ * Exported for callers that already HOLD an {@link OwnershipInputs} (the iSCSI
+ * mutate paths) — one predicate assembly, never two.
  */
 export function ownershipFromInputs(inputs: OwnershipInputs, dataset: string): PveOwnership | null {
-  const pool = poolRoot(dataset)
-  const system = inputs.systemFacts?.find(f => f.pool === pool)
-  return pveOwnership(inputs.pveStorages.get(pool) ?? [], dataset, system)
+  return ownershipWithFallback(inputs.pveStorages, inputs.systemFacts ?? null, dataset)
 }
 
 /** Ask {@link ownershipFromInputs} from inside this module. */

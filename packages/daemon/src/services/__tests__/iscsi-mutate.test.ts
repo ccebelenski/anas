@@ -921,6 +921,8 @@ describe('resolveZvolBacking — PVE territory is never a candidate', () => {
       inputs: {
         pveStorages: new Map([['rpool', [{ storage: 'local-zfs', type: 'zfspool', dataset: 'rpool/data', content: [] }]]]),
         zfsMountpoints: [],
+        // READABLE facts, no boot pool — the question is the per-dataset one.
+        systemFacts: [],
       },
     } as never)
     for (const name of ['vm-101-disk-0', 'base-9000-disk-0', 'subvol-120-disk-0', 'subvol-100-foo']) {
@@ -946,6 +948,8 @@ describe('resolveZvolBacking — PVE territory is never a candidate', () => {
       inputs: {
         pveStorages: new Map([['rpool', [{ storage: 'local-zfs', type: 'zfspool', dataset: 'rpool/data', content: [] }]]]),
         zfsMountpoints: [],
+        // READABLE facts, no boot pool — the question is the per-dataset one.
+        systemFacts: [],
       },
     } as never)
     // The nested storage root itself is refused…
@@ -954,9 +958,22 @@ describe('resolveZvolBacking — PVE territory is never a candidate', () => {
     assert.equal(r.refusal.reason, 'pve-owned-backing')
     assert.match(r.refusal.message, /local-zfs/)
     assert.match(r.refusal.message, /rpool\/data as a storage root/)
-    // …while a SIBLING dataset of the storage root is a legitimate LUN home.
+    // …while a SIBLING dataset of the storage root is a legitimate LUN home —
+    // the per-dataset relaxation, which holds only when the boot facts are
+    // READABLE (an unreadable probe tightens the whole pool via the fallback).
     const sibling = resolveZvolBacking('rpool/media/lun0', ctx)
     assert.ok('ok' in sibling)
+    const unreadable = emptyCtx({
+      inputs: {
+        pveStorages: new Map([['rpool', [{ storage: 'local-zfs', type: 'zfspool', dataset: 'rpool/data', content: [] }]]]),
+        zfsMountpoints: [],
+        systemFacts: null,
+      },
+    } as never)
+    const fallback = resolveZvolBacking('rpool/media/lun0', unreadable)
+    assert.ok('refusal' in fallback)
+    assert.equal(fallback.refusal.reason, 'pve-owned-backing')
+    assert.match(fallback.refusal.message, /boot facts unavailable/)
   })
 
   it('refuses anything that is not a zvol path at all', () => {

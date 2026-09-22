@@ -72,6 +72,9 @@ const FACTS: ConsistencyFacts = {
       { storage: 'vzdumps', type: 'dir', dataset: 'tank/dump', content: ['backup'] },
     ]],
   ]),
+  // A READABLE boot probe with no system pool — these facts ask the
+  // per-dataset rules, not the unreadable-facts whole-pool fallback.
+  systemFacts: [] as SystemPoolFacts[],
 }
 
 /** The same facts, with `tank` carrying this node's boot filesystem. */
@@ -281,6 +284,18 @@ describe('backup consistency derivation — block sources (backup2.4)', () => {
     const c = deriveConsistency('/dev/zvol/pvepool/vm-101-disk-0', FACTS)
     assert.equal(c.consistency, 'live')
     assert.match(c.reason, /PVE guest volume/)
+  })
+
+  it('UNREADABLE boot facts (null) tighten to the whole-pool rule on a zfspool pool (pvepool.1)', () => {
+    // `pvepool` hosts zfspool storages and the probe failed: the per-dataset
+    // "snapshottable" answer is overridden by the pre-pvepool.1 whole-pool
+    // rule — hands-off. Missing facts may only tighten, never loosen.
+    const c = deriveConsistency('/dev/zvol/pvepool/media/vol0', { ...FACTS, systemFacts: null })
+    assert.equal(c.consistency, 'live')
+    assert.match(c.reason, /boot facts unavailable/)
+    assert.match(c.reason, /pvepool/)
+    // Facts present (even "no system pool") — the sibling is snapshotted.
+    assert.equal(deriveConsistency('/dev/zvol/pvepool/media/vol0', FACTS).consistency, 'snapshot')
   })
 
   it('a file inside a `dir` storage tree is LIVE with the ownership reason (pvepool.1)', () => {

@@ -139,20 +139,50 @@ export async function readSystemPoolFacts(exec: CommandExecutor): Promise<System
 }
 
 /**
- * The pure half of {@link PveFootprint.ownershipOf}, exported so a caller that
- * already HOLDS the two maps (the iSCSI read context builds them once per
- * read) can ask the same question without a second service load — one
- * predicate assembly, never two.
+ * The ONE ownership answer with the unreadable-facts fallback — every
+ * consumer (the footprint service, the iSCSI read context, the backup
+ * consistency derivation) asks through here, so the fallback is stated in
+ * exactly one place (pvepool.1).
+ *
+ * `systemFacts` of `null` means the boot probe FAILED — UNREADABLE, not "no
+ * system pool". The per-dataset rules are still asked first; the fallback
+ * only answers what they call manageable, and only on a pool that hosts a
+ * zfspool storage — the pre-pvepool.1 whole-pool rule, hands-off. Missing
+ * facts may only TIGHTEN the gate, never loosen it. A non-null array (even
+ * `[]`) is a READABLE answer and takes the per-dataset rules alone. Pure.
+ */
+export function ownershipWithFallback(
+  storagesByPool: Map<string, PveStorageRef[]>,
+  systemFacts: SystemPoolFacts[] | null,
+  dataset: string,
+): PveOwnership | null {
+  const poolRoot = dataset.split('/')[0]
+  const refs = storagesByPool.get(poolRoot) ?? []
+  if (systemFacts !== null)
+    return pveOwnership(refs, dataset, systemFacts.find(f => f.pool === poolRoot))
+  const owned = pveOwnership(refs, dataset)
+  if (owned !== null)
+    return owned
+  if (refs.some(ref => ref.type === 'zfspool')) {
+    return {
+      kind: 'system',
+      reason: `boot facts unavailable (zpool get bootfs failed) — pool '${poolRoot}' is treated as PVE's whole pool until the daemon can read them`,
+    }
+  }
+  return null
+}
+
+/**
+ * The pure half of {@link PveFootprint.ownershipOf} with READABLE facts —
+ * the facts the caller already holds, never null, so it is the fallback-free
+ * half of {@link ownershipWithFallback}.
  */
 export function ownershipFromFootprintData(
   storagesByPool: Map<string, PveStorageRef[]>,
   systemFacts: SystemPoolFacts[],
   dataset: string,
 ): PveOwnership | null {
-  const poolRoot = dataset.split('/')[0]
-  const refs = storagesByPool.get(poolRoot) ?? []
-  const system = systemFacts.find(f => f.pool === poolRoot)
-  return pveOwnership(refs, dataset, system)
+  return ownershipWithFallback(storagesByPool, systemFacts, dataset)
 }
 
 /** What one request's worth of PVE-footprint reads can answer. */
@@ -221,22 +251,7 @@ export async function loadPveFootprint(
     storagesByPool,
     systemFacts,
     systemFactsUnavailable,
-    ownershipOf: (dataset: string) => {
-      const owned = ownershipFromFootprintData(storagesByPool, systemFacts, dataset)
-      if (owned !== null)
-        return owned
-      // Facts UNREADABLE, not "no system pool": what the per-dataset rules
-      // call manageable on a pool PVE inventories is answered with the
-      // whole-pool rule — hands-off.
-      const poolRoot = dataset.split('/')[0]
-      if (systemFactsUnavailable && hasZfspoolRef(poolRoot)) {
-        return {
-          kind: 'system',
-          reason: `boot facts unavailable (zpool get bootfs failed) — pool '${poolRoot}' is treated as PVE's whole pool until the daemon can read them`,
-        }
-      }
-      return null
-    },
+    ownershipOf: (dataset: string) => ownershipWithFallback(storagesByPool, readFacts, dataset),
     claimedByPve: (dataset: string) => wouldBeClaimedByPve(storagesByPool.get(dataset.split('/')[0]) ?? [], dataset),
     isSystemPool: (pool: string) => {
       const f = factsFor(pool)

@@ -29,6 +29,9 @@ function inputs(overrides: Partial<OwnershipInputs> = {}): OwnershipInputs {
   return {
     pveStorages: parsePveStorageCfg(STORAGE_CFG, MOUNTPOINTS) as Map<string, PveStorageRef[]>,
     zfsMountpoints: MOUNTPOINTS,
+    // A READABLE answer (the probe succeeded, no pool boots) — these fixtures
+    // ask the per-dataset rules, not the unreadable-facts fallback.
+    systemFacts: [],
     ...overrides,
   }
 }
@@ -489,11 +492,32 @@ describe('classifyBacking over the pvepool.1 fixture set', () => {
     assert.equal(classifyBacking('/rpool/media/lun.raw', fx()).pveOwned, false)
   })
 
-  it('ALLOWED: a system-pool sibling whose pool has NO boot facts (fail-open omission)', () => {
-    // A caller that does not hold system facts simply cannot see the system
-    // rule — the sibling case still answers correctly, nothing throws.
-    const c = classifyBacking('/dev/zvol/rpool/ROOT', fx({ systemFacts: undefined }))
-    assert.equal(c.pveOwned, false)
+  it('UNREADABLE boot facts (null or omitted) fall back to the whole-pool rule (pvepool.1)', () => {
+    // `null` is the probe failing and `undefined` is the caller never having
+    // read them — both are UNREADABLE. `rpool` hosts the zfspool storage
+    // `local-zfs`, so its whole pool is answered hands-off, even the boot
+    // tree the per-dataset rules could no longer name.
+    for (const facts of [null, undefined] as const) {
+      const c = classifyBacking('/dev/zvol/rpool/ROOT', fx({ systemFacts: facts }))
+      assert.equal(c.pveOwned, true, `facts=${String(facts)}`)
+      assert.equal(c.pveOwnership?.kind, 'system', `facts=${String(facts)}`)
+      assert.match(c.pveOwnership?.reason ?? '', /boot facts unavailable/, `facts=${String(facts)}`)
+    }
+    // …while a READABLE answer — even "no system pool" — leaves the pool's
+    // siblings alone (an empty array is readable, not unreadable).
+    assert.equal(classifyBacking('/dev/zvol/rpool/media', fx({ systemFacts: [] })).pveOwned, false)
+  })
+
+  it('a SIBLING on a zfspool pool is hands-off when the boot facts are unreadable, allowed when they are', () => {
+    // The per-dataset rules call `tank/media` manageable (the story's
+    // relaxation); the fallback may only TIGHTEN, when the facts went dark.
+    const owned = classifyBacking('/dev/zvol/tank/media', fx({ systemFacts: null }))
+    assert.equal(owned.pveOwned, true)
+    assert.equal(owned.pveOwnership?.kind, 'system')
+    assert.match(owned.pveOwnership?.reason ?? '', /boot facts unavailable[\s\S]*whole pool/)
+    // Facts present — any readable answer — the sibling is ANAS's again.
+    assert.equal(classifyBacking('/dev/zvol/tank/media', fx()).pveOwned, false)
+    assert.equal(classifyBacking('/dev/zvol/tank/media', fx({ systemFacts: [] })).pveOwned, false)
   })
 
   it('deriveOwnership sentences over the fixture set: storage and dataset are always named', () => {
