@@ -150,7 +150,7 @@ export const PveStorageRef = z.object({
 export type PveStorageRef = z.infer<typeof PveStorageRef>
 
 /** What kind of PVE footprint claim covers a dataset (story pvepool.1). */
-export const PveOwnershipKind = z.enum(['storage-root', 'guest-volume', 'dir-storage', 'system'])
+export const PveOwnershipKind = z.enum(['storage-root', 'guest-volume', 'dir-storage', 'system', 'config-unreadable'])
 export type PveOwnershipKind = z.infer<typeof PveOwnershipKind>
 
 /**
@@ -165,6 +165,15 @@ export const PveOwnership = z.object({
   storage: z.string().optional(),
   /** One sentence naming the storage (or pool) and the dataset. */
   reason: z.string(),
+  /**
+   * Whether ANAS may still create/manage DIRECT children of this owned dataset
+   * (pvepool.1 review fix 3) — true when a non-guest-named child would sit
+   * OUTSIDE PVE's footprint, so only the dataset itself is hands-off. Absent
+   * (or false) when the children are PVE's too. Stamped by the daemon's
+   * footprint service on OWNED answers only; an older daemon omits it
+   * (version-skew ruling: no field ⇒ no gating).
+   */
+  childrenManageable: z.boolean().optional(),
 })
 export type PveOwnership = z.infer<typeof PveOwnership>
 
@@ -240,6 +249,14 @@ export const PoolSummary = z.object({
    * gating).
    */
   heldByLun: IscsiHeldByLun.optional(),
+  /**
+   * PVE's ownership claim on this pool's ROOT dataset (pvepool.1 review fix 3)
+   * — the same verdict the datasets tree stamps, so a system pool, a bare-path
+   * storage root, a dir storage on the root, and the config-unreadable state
+   * are all visible in the grid. Absent when the pool root is outside PVE's
+   * footprint (an ANAS pool). Additive and optional (version-skew ruling).
+   */
+  pve: PveOwnership.optional(),
 })
 export type PoolSummary = z.infer<typeof PoolSummary>
 
@@ -293,6 +310,12 @@ export const PoolDetail = z.object({
    *  Empty ⇒ not PVE-managed.
    */
   pveStorages: z.array(PveStorageRef).default([]),
+  /**
+   * PVE's ownership claim on this pool's ROOT dataset (pvepool.1 review fix 3)
+   * — the same per-node verdict the list view carries; see {@link PoolSummary}
+   * `pve`. Absent when the pool root is outside PVE's footprint.
+   */
+  pve: PveOwnership.optional(),
 })
 export type PoolDetail = z.infer<typeof PoolDetail>
 

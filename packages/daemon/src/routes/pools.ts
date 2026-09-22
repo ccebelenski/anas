@@ -661,6 +661,12 @@ export async function poolRoutes(
       const status = statusByName.get(pool.name)
       const scanning = status?.scan?.state === 'SCANNING'
       const mount = poolMounts.get(pool.name)
+      // Pool-root PVE ownership (pvepool.1 review fix 3): the SAME per-request
+      // footprint as pveStorages asks about the pool's ROOT dataset, so a
+      // system pool, a bare-path storage root, a dir storage on the root, and
+      // the config-unreadable state are all visible in the grid. An ANAS pool
+      // root is outside the footprint and carries no `pve` at all.
+      const pveOwned = pve.ownershipOf(pool.name)
       return {
         ...pool,
         state: status?.state ?? pool.state,
@@ -674,6 +680,7 @@ export async function poolRoutes(
         // Pool root mountpoint (story 3.27) — the Mount column. Absent ⇒ omitted.
         ...(mount && { mountpoint: mount.mountpoint, mounted: mount.mounted }),
         pveStorages: pve.storagesByPool.get(pool.name) ?? [],
+        ...(pveOwned && { pve: pveOwned }),
       }
     })
 
@@ -727,6 +734,11 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
+    // Pool-root PVE ownership (pvepool.1 review fix 3) — the same per-request
+    // footprint asks about the pool's ROOT dataset, so the detail view carries
+    // the same verdict the list does. Absent for an ANAS pool.
+    const pveOwned = pve.ownershipOf(poolName)
+
     const detail: PoolDetail = {
       name: poolName,
       state: status.state,
@@ -749,6 +761,7 @@ export async function poolRoutes(
         mounted: poolMounts.get(poolName)!.mounted,
       }),
       pveStorages: pve.storagesByPool.get(poolName) ?? [],
+      ...(pveOwned && { pve: pveOwned }),
     }
 
     return { data: detail }

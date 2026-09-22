@@ -165,13 +165,13 @@ export function ownershipWithFallback(
 ): PveOwnership | null {
   const poolRoot = dataset.split('/')[0]
   // UNREADABLE storage.cfg (pvepool.1 review fix 1): nothing can be judged, so
-  // EVERY dataset on EVERY pool is treated as PVE's — kind 'system', the
-  // existing "hands-off, no storage id" kind — until the config can be read.
-  // Reads keep working; mutations refuse. Missing facts may only tighten the
-  // gate, never loosen it.
+  // EVERY dataset on EVERY pool is treated as PVE's — kind 'config-unreadable'
+  // (review fix 3: its own kind, distinct from the boot-tree 'system' claim the
+  // UI can explain) — until the config can be read. Reads keep working;
+  // mutations refuse. Missing facts may only tighten the gate, never loosen it.
   if (storagesUnavailable) {
     return {
-      kind: 'system',
+      kind: 'config-unreadable',
       reason: `PVE storage configuration is unreadable (/etc/pve/storage.cfg) — pool '${poolRoot}' is treated as PVE's until it can be read`,
     }
   }
@@ -278,8 +278,10 @@ export interface PveFootprint {
   storagesUnavailable: boolean
   /**
    * PVE's ownership claim on one full dataset name, or null when it is
-   * outside PVE's footprint and ANAS may manage it. Pool-level PVE refusals
-   * are separate and unchanged.
+   * outside PVE's footprint and ANAS may manage it. A non-null answer carries
+   * `childrenManageable` — whether ANAS may still manage DIRECT children of
+   * the owned dataset (pvepool.1 review fix 3; the pool payloads stamp the
+   * same verdict). Pool-level PVE refusals are separate and unchanged.
    */
   ownershipOf: (dataset: string) => PveOwnership | null
   /**
@@ -355,8 +357,24 @@ export async function loadPveFootprint(
   const hasZfspoolRef = (pool: string): boolean =>
     (storagesByPool.get(pool) ?? []).some(ref => ref.type === 'zfspool')
 
-  const ownershipOf = (dataset: string): PveOwnership | null =>
+  // The ONE per-dataset answer, with the childrenManageable probe stamped here
+  // (pvepool.1 review fix 3) — part of what ownershipOf returns, so every
+  // consumer (datasets tree/detail, pool list/detail) carries the same field
+  // and no route re-derives it. The probe asks the RAW predicate about a
+  // would-be DIRECT child with a name PVE never inventories (`anas-probe` does
+  // not match the guest-volume regex); if that child would be unowned, only
+  // THIS dataset is hands-off and its children remain manageable. The probe
+  // goes through the raw closure — the stamped wrapper recursing into itself
+  // would never terminate.
+  const rawOwnershipOf = (dataset: string): PveOwnership | null =>
     ownershipWithFallback(storagesByPool, readFacts, dataset, storagesUnavailable)
+  const CHILDREN_PROBE_BASENAME = 'anas-probe'
+  const ownershipOf = (dataset: string): PveOwnership | null => {
+    const owned = rawOwnershipOf(dataset)
+    if (owned === null)
+      return null
+    return { ...owned, childrenManageable: rawOwnershipOf(`${dataset}/${CHILDREN_PROBE_BASENAME}`) === null }
+  }
 
   return {
     storagesByPool,

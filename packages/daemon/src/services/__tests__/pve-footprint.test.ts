@@ -217,11 +217,13 @@ describe('loadPveFootprint — unreadable storage.cfg tightens EVERY pool (revie
     const fp = await loadPveFootprint(mockWithReadableBootFacts(), { pveStorageCfg: dir })
     assert.equal(fp.storagesUnavailable, true)
     const owned = fp.ownershipOf('tank/media')
-    assert.equal(owned?.kind, 'system')
+    assert.equal(owned?.kind, 'config-unreadable')
     assert.equal(
       owned?.reason,
       `PVE storage configuration is unreadable (/etc/pve/storage.cfg) — pool 'tank' is treated as PVE's until it can be read`,
     )
+    // Nothing can be judged, so no owned node's children are manageable either.
+    assert.equal(owned?.childrenManageable, false)
   })
 
   it('every pool is a system pool and the naming guard judges nothing', async () => {
@@ -237,6 +239,108 @@ describe('loadPveFootprint — unreadable storage.cfg tightens EVERY pool (revie
     assert.equal(fp.ownershipOf('tank/media'), null)
     assert.equal(fp.isSystemPool('tank'), false)
     assert.equal(fp.claimedByPve('tank/vm-100-disk-0'), null)
+  })
+})
+
+// --- pvepool.1 review fix 3: childrenManageable stamped on OWNED answers ----
+
+describe('ownershipOf childrenManageable — the probe table over the pvepool fixture (review fix 3)', () => {
+  // The full story shape: a NESTED storage root (`rpool/data`), a dir storage
+  // resolved onto `rpool/media/dirstore`, and the system/boot tree
+  // (`rpool/ROOT/pve-1`). The probe is a non-guest child: `childrenManageable`
+  // is true exactly when `<dataset>/anas-probe` would sit OUTSIDE the
+  // footprint.
+  const CFG = 'zfspool: local-zfs\n\tpool rpool/data\n\tcontent images,rootdir\n\n'
+    + 'dir: local-dir\n\tpath /rpool/media/dirstore\n\tcontent backup\n\n'
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-pve-children-'))
+    await writeFile(join(dir, 'storage.cfg'), CFG, 'utf8')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  async function footprint() {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: {
+        stdout: 'rpool\t/rpool\nrpool/data\t/rpool/data\nrpool/media\t/rpool/media\nrpool/media/dirstore\t/rpool/media/dirstore\n',
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    mock.addFixture({
+      command: '/usr/sbin/zpool',
+      args: ['get', '-H', '-o', 'name,value', 'bootfs'],
+      result: { stdout: 'rpool\trpool/ROOT/pve-1\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['-n', '-o', 'SOURCE,FSTYPE', '/'],
+      result: { stdout: '', stderr: '', exitCode: 1 },
+    })
+    return loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+  }
+
+  it('the table: storage root and system pool root true; ROOT, guest, dir and unreadable false', async () => {
+    const fp = await footprint()
+
+    // Storage root: a plain child of it is NOT PVE's (the story's whole point).
+    const root = fp.ownershipOf('rpool/data')
+    assert.equal(root?.kind, 'storage-root')
+    assert.equal(root?.childrenManageable, true)
+
+    // System POOL ROOT: the boot tree lives under rpool/ROOT, a sibling of any
+    // non-guest child ANAS would create.
+    const pool = fp.ownershipOf('rpool')
+    assert.equal(pool?.kind, 'system')
+    assert.equal(pool?.childrenManageable, true)
+
+    // The boot-tree interior: everything under rpool/ROOT is PVE's.
+    assert.equal(fp.ownershipOf('rpool/ROOT')?.childrenManageable, false)
+    assert.equal(fp.ownershipOf('rpool/ROOT/pve-1')?.childrenManageable, false)
+
+    // Guest volume: children inherit the guest claim through the subtree rule.
+    const guest = fp.ownershipOf('rpool/data/vm-100-disk-0')
+    assert.equal(guest?.kind, 'guest-volume')
+    assert.equal(guest?.childrenManageable, false)
+
+    // Dir storage: the whole tree under its path is PVE's.
+    const dirOwned = fp.ownershipOf('rpool/media/dirstore')
+    assert.equal(dirOwned?.kind, 'dir-storage')
+    assert.equal(dirOwned?.childrenManageable, false)
+
+    // UNOWNED nodes carry no verdict at all — no field, no probe answer.
+    assert.equal(fp.ownershipOf('rpool/media'), null)
+  })
+
+  it('a config-unreadable footprint answers false — nothing can be judged', async () => {
+    // The cfg PATH is the temp directory itself: readFile rejects EISDIR —
+    // the same stand-in for pmxcfs being down the fix-1 tests use.
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: '', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/sbin/zpool',
+      args: ['get', '-H', '-o', 'name,value', 'bootfs'],
+      result: { stdout: 'rpool\t-\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['-n', '-o', 'SOURCE,FSTYPE', '/'],
+      result: { stdout: '', stderr: '', exitCode: 1 },
+    })
+    const fp = await loadPveFootprint(mock, { pveStorageCfg: dir })
+    const owned = fp.ownershipOf('rpool/media')
+    assert.equal(owned?.kind, 'config-unreadable')
+    assert.equal(owned?.childrenManageable, false)
   })
 })
 

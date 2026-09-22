@@ -587,6 +587,22 @@ describe('PVE footprint ownership (pvepool.1)', () => {
     assert.equal(byName.get('testpool/media')?.pve, undefined)
   })
 
+  // pvepool.1 review fix 3: OWNED rows also carry `childrenManageable` —
+  // whether ANAS may still create/manage DIRECT children of the owned dataset.
+  it('OWNED rows carry childrenManageable — true on the storage root, false inside a guest volume', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({ method: 'GET', url: '/v1/pools/testpool/datasets' })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: Dataset[] }
+    const byName = new Map(data.map(d => [d.name, d]))
+    // Bare-pool storage root: a non-guest child of it sits OUTSIDE the footprint.
+    assert.equal(byName.get('testpool')?.pve?.childrenManageable, true)
+    // A guest volume's children are guest volumes too (subtree inheritance).
+    assert.equal(byName.get('testpool/vm-100-disk-0')?.pve?.childrenManageable, false)
+    // The UNOWNED sibling carries no `pve` — and so no childrenManageable.
+    assert.equal(byName.get('testpool/media')?.pve?.childrenManageable, undefined)
+  })
+
   it('the naming guard refuses a guest-named child of the storage root (400, backstop)', async () => {
     server = createServer({ mock: true, logger: false })
     const res = await server.inject({
@@ -1025,8 +1041,10 @@ describe('unreadable storage.cfg fails closed (review fix 1)', () => {
     const { data } = res.json() as { data: Dataset[] }
     assert.ok(data.length > 0)
     for (const d of data) {
-      assert.equal(d.pve?.kind, 'system', d.name)
+      assert.equal(d.pve?.kind, 'config-unreadable', d.name)
       assert.match(d.pve?.reason ?? '', /unreadable/)
+      // Nothing can be judged, so no node's children are manageable either.
+      assert.equal(d.pve?.childrenManageable, false, d.name)
     }
   })
 })
