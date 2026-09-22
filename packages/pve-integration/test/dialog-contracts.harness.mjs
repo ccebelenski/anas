@@ -45,6 +45,19 @@
  *      ones, that Resize Volume grows only — an untouched edit sends nothing, a
  *      shrink sends nothing — and the toolbar gating matrix for a volume row,
  *      including the tooltip reason on each disabled control.
+ *   4-pve. pvepool.2 (U1): the Datasets screen on PER-DATASET PVE ownership.
+ *      The sources load WITH the real 10-api.js, so the ONE shared helper
+ *      (ANAS.pve) decides every verdict. Toolbar per node kind — storage root:
+ *      Create enabled, the rest view-only; guest volume: Detail only; an
+ *      unowned sibling: everything, with no ownership excuse left on a button.
+ *      The create dialog offers the PVE pool, shows the INFORMATIONAL note
+ *      (I/O shared; PVE's free-space figure shrinks), and the live name guard
+ *      holds Create for a `vm-<vmid>-*` name while a deeper one passes (PVE
+ *      lists `-d1` only). The tree reloads after a job on SUCCESS and on
+ *      FAILURE (runJob and confirmAndRun both), and a successful create leaves
+ *      the NEW node selected. The skew side: a payload with no per-node `pve`
+ *      key against a pool PVE names keeps the whole-pool rule — every row
+ *      gates, Create included (skew tightens, never loosens).
  *   5. iSCSI (story iscsi.4): a CHAP secret is WRITE-ONLY, so a blank box means
  *      KEEP and never "clear" — a dialog that got that backwards would strip
  *      every stored secret on the next unrelated save. Also: an untouched target
@@ -153,6 +166,12 @@ function makeNode(cfg, parent) {
       child.parentNode = node
       node.childNodes.push(child)
       return child
+    },
+    // ExtJS walks every descendant (findDatasetNode uses it to locate the
+    // node a finished create selects).
+    cascadeBy(fn) {
+      fn(node)
+      for (const kid of node.childNodes) { kid.cascadeBy(fn) }
     },
     removeAll() { node.childNodes.length = 0 },
     expand() { data.expanded = true },
@@ -693,8 +712,15 @@ function makeAnas(routes) {
     runJob(cfg) {
       // The handler is kept on the record: a check can complete the job with a
       // RESULT of its own choosing (the auto-call below simulates the default
-      // "finished, nothing to report").
-      jobs.push({ method: cfg.method, path: cfg.path, body: cfg.body, onComplete: cfg.onComplete })
+      // "finished, nothing to report") — or FAIL it via onFailed, which is what
+      // the pvepool.2 reload-on-failure contract is asserted against.
+      jobs.push({
+        method: cfg.method,
+        path: cfg.path,
+        body: cfg.body,
+        onComplete: cfg.onComplete,
+        onFailed: cfg.onFailed,
+      })
       if (cfg.onComplete) { cfg.onComplete({}) }
     },
     // A confirm-gated mutation. The real one only shows its window after the
@@ -716,6 +742,8 @@ function makeAnas(routes) {
         confirmWindow: !!cfg.confirmWindow,
         extraItems: cfg.extraItems,
         mapConfirm: cfg.mapConfirm,
+        onComplete: cfg.onComplete,
+        onFailed: cfg.onFailed,
       })
       if (cfg.onComplete) { cfg.onComplete({}) }
     },
@@ -762,8 +790,21 @@ function loadSources(files, routes) {
     setTimeout: (fn) => { fn(); return 1 },
     clearTimeout: () => {},
   }
+  // 10-api.js defines the REAL shared helpers (ANAS.pve — pvepool.2 U0/U1 —
+  // and editGuard), which the sandbox keeps; but it also replaces the stub's
+  // job plumbing with real polling. Put the recording stubs back so the
+  // job/read contracts stay assertable. A sandbox that never loads 10-api.js
+  // gets its own functions reassigned — a no-op.
+  const stubFns = {
+    api: win.ANAS.api,
+    runJob: win.ANAS.runJob,
+    pollJob: win.ANAS.pollJob,
+    confirmAndRun: win.ANAS.confirmAndRun,
+    casWrite: win.ANAS.casWrite,
+  }
   for (const file of files)
     vm.runInNewContext(readFileSync(join(SRC, file), 'utf8'), sandbox, { filename: file })
+  for (const k of Object.keys(stubFns)) { win.ANAS[k] = stubFns[k] }
   return win.ANAS
 }
 
@@ -1856,11 +1897,14 @@ async function poolImportChecks() {
 const GiB = 1024 * 1024 * 1024
 
 // One ANAS-managed pool with a filesystem and a real-shaped zvol, and one
-// PVE-managed pool whose zvol must stay hands-off (story 3.25 — the SAME
-// pool-level tag as its datasets, not a second check).
+// pool PVE names with a storage. The PVE datasets below carry NO per-node
+// `pve` field — the pre-pvepool.1 daemon shape — so the existing gating
+// checks on them double as the version-skew proof: pool `pveStorages[]`
+// non-empty + no per-node field ⇒ the whole-pool rule (skew tightens, never
+// loosens). The per-node cases live in pveOwnershipChecks (PVE2_ROUTES).
 const DS_POOLS = [
   { name: 'tank', size: 8 * GiB, pveStorages: [] },
-  { name: 'pvepool', size: 8 * GiB, pveStorages: [{ id: 'local-zfs', type: 'zfspool' }] },
+  { name: 'pvepool', size: 8 * GiB, pveStorages: [{ storage: 'local-zfs', type: 'zfspool', content: ['images', 'rootdir'] }] },
 ]
 
 const TANK_DATASETS = [
@@ -1895,6 +1939,54 @@ function findNode(tree, fullName) {
   return walk(tree.getRootNode())
 }
 
+// ============================================================================
+//  4-pve. pvepool.2 (U1): per-dataset PVE ownership on the Datasets screen —
+//  toolbar per node kind, badges, the create dialog's PVE contract, and the
+//  reload-on-success-and-failure timeliness rule.
+// ============================================================================
+
+// A NEW-daemon payload: owned rows carry the per-node `pve` verdict
+// (PveOwnership), the sibling `pvepool/media` carries none. The storage is a
+// BARE pool ref (no dataset) so the storage root IS the pool root.
+const PVE2_DATASETS = [
+  {
+    name: 'pvepool', pool: 'pvepool', type: 'filesystem', used: 1, available: 1, referenced: 1,
+    mountpoint: '/pvepool', compression: 'on', compressratio: 1, quota: 0,
+    pve: { kind: 'storage-root', storage: 'local-zfs', reason: "PVE storage 'local-zfs' owns pvepool as a storage root" },
+  },
+  {
+    name: 'pvepool/media', pool: 'pvepool', type: 'filesystem', used: 1, available: 1, referenced: 1,
+    mountpoint: '/pvepool/media', compression: 'on', compressratio: 1, quota: 0,
+  },
+  {
+    name: 'pvepool/vm-100-disk-0', pool: 'pvepool', type: 'volume', used: GiB, available: 1, referenced: 1,
+    mountpoint: null, compression: 'on', compressratio: 1, quota: 0,
+    volsize: GiB, volblocksize: 8192, sparse: true,
+    pve: { kind: 'guest-volume', storage: 'local-zfs', reason: "PVE storage 'local-zfs' owns pvepool/vm-100-disk-0 as a guest volume" },
+  },
+]
+
+const PVE2_ROUTES = {
+  'GET /pools': { data: DS_POOLS },
+  'GET /pools/tank/datasets': { data: TANK_DATASETS, defaults: { volblocksize: 16384 } },
+  'GET /pools/pvepool/datasets': { data: PVE2_DATASETS, defaults: { volblocksize: 16384 } },
+  // The sibling's lazy snapshot rows (the refresh after a snapshot job).
+  'GET /pools/pvepool/datasets/media/snapshots': { data: [] },
+}
+
+// The SAME pool, an OLD daemon: the per-node field stripped entirely ⇒ the
+// whole-pool fallback — everything on pvepool gates, even the sibling.
+const PVE2_SKEW_ROUTES = {
+  ...PVE2_ROUTES,
+  'GET /pools/pvepool/datasets': {
+    data: PVE2_DATASETS.map(({ pve, ...rest }) => rest),
+    defaults: { volblocksize: 16384 },
+  },
+}
+
+/** The tree-reload counter: loadTree always re-reads GET /pools first. */
+const poolsGets = () => apiGets.filter(p => p === '/pools').length
+
 /** The toolbar's disabled/tooltip state, keyed by itemId. */
 function toolbarState(tree, ids) {
   const out = {}
@@ -1906,7 +1998,9 @@ function toolbarState(tree, ids) {
 }
 
 async function datasetsChecks() {
-  const ANAS = loadSource('60-datasets.js', DATASET_ROUTES)
+  // 10-api.js first: the real bundle order, so the Datasets screen decides
+  // ownership with the ONE shared helper (ANAS.pve) — not a mirror.
+  const ANAS = loadSource(['10-api.js', '60-datasets.js'], DATASET_ROUTES)
   const view = makeComponent(ANAS.views.datasets.factory('harness'), null)
   const tree = view.down('#dsTree')
   ok('datasets: the tree panel exists', !!tree)
@@ -2079,6 +2173,204 @@ async function datasetsChecks() {
     jobs[0].body, { properties: { volsize: 8 * GiB } })
 
   ok('datasets: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/** pvepool.2 (U1): per-node ownership on a NEW-daemon payload. Toolbar per
+ * kind, the create dialog's PVE contract (picker, note, live name guard), and
+ * the tree reloading on success AND failure with the new node selected. */
+async function pveOwnershipChecks() {
+  const GATED = ['dsCreate', 'dsEdit', 'dsPerms', 'dsShare', 'dsResize', 'dsDestroy', 'dsDetail', 'snapCreate']
+  const { tree } = await openDatasetTree(PVE2_ROUTES)
+
+  const root = findNode(tree, 'pvepool')
+  let sibling = findNode(tree, 'pvepool/media')
+  const guest = findNode(tree, 'pvepool/vm-100-disk-0')
+  ok('pve(datasets): the storage root loaded', !!root)
+  ok('pve(datasets): the unowned sibling loaded', !!sibling)
+  ok('pve(datasets): the guest volume loaded', !!guest)
+  if (!root || !sibling || !guest) { return }
+
+  // The verdicts ride the node, per kind.
+  eq('pve(datasets): the pool root is a storage root',
+    root.get('pveOwnership') && root.get('pveOwnership').kind, 'storage-root')
+  eq('pve(datasets): the guest volume is a guest volume',
+    guest.get('pveOwnership') && guest.get('pveOwnership').kind, 'guest-volume')
+  eq('pve(datasets): the sibling carries NO verdict', sibling.get('pveOwnership'), null)
+
+  // --- Toolbar per kind: storage root = Create enabled, the rest view-only.
+  tree.selectNode(root)
+  let state = toolbarState(tree, GATED)
+  ok('pve(root): Create Dataset ENABLED', state.dsCreate.disabled === false)
+  for (const id of ['dsEdit', 'dsPerms', 'dsShare', 'dsResize', 'dsDestroy', 'snapCreate']) {
+    ok(`pve(root): ${id} DISABLED (view-only)`, state[id] && state[id].disabled === true)
+  }
+  ok('pve(root): Detail still enabled', state.dsDetail.disabled === false)
+  // A disabled control explains itself with the ownership reason — it names
+  // the storage AND the dataset, never "this pool".
+  ok('pve(root): Destroy names the storage and the dataset',
+    /local-zfs/.test(state.dsDestroy.tip) && /pvepool/.test(state.dsDestroy.tip),
+    state.dsDestroy.tip)
+
+  // --- Guest volume: Detail only.
+  tree.selectNode(guest)
+  state = toolbarState(tree, GATED)
+  ok('pve(guest): Detail enabled', state.dsDetail.disabled === false)
+  for (const id of ['dsCreate', 'dsEdit', 'dsPerms', 'dsShare', 'dsResize', 'dsDestroy', 'snapCreate']) {
+    ok(`pve(guest): ${id} DISABLED`, state[id] && state[id].disabled === true)
+  }
+
+  // --- Sibling: everything enabled, no ownership excuse left behind.
+  tree.selectNode(sibling)
+  state = toolbarState(tree, GATED)
+  for (const id of ['dsCreate', 'dsEdit', 'dsPerms', 'dsShare', 'dsDestroy', 'dsDetail', 'snapCreate']) {
+    ok(`pve(sibling): ${id} ENABLED`, state[id] && state[id].disabled === false)
+  }
+  ok('pve(sibling): no ownership reason on Destroy', state.dsDestroy.tip === '', state.dsDestroy.tip)
+
+  // --- Create dialog on the storage root: the PVE pool is offered, the
+  // informational note shows, and the live name guard holds Create.
+  tree.selectNode(root)
+  let btn = tree.down('#dsCreate')
+  btn.handler(btn)
+  await settle()
+  let dlg = openWindow()
+  ok('pve(create): the dialog opens on a storage root', !!dlg && !!dlg.down('#dsType'))
+  if (!dlg) { return }
+  ok('pve(create): the PVE pool is in the picker',
+    !!dlg.down('#pool').getStore().findRecord('name', 'pvepool'))
+  ok('pve(create): the informational note shows for the PVE pool',
+    dlg.down('#anasPvePoolNote').hidden === false
+      && /local-zfs/.test(dlg.down('#anasPvePoolNote').html),
+    dlg.down('#anasPvePoolNote').html)
+  ok('pve(create): the note is about I/O and free space, not a refusal',
+    /share its I\/O/.test(dlg.down('#anasPvePoolNote').html)
+      && /shrinks by what ANAS uses/.test(dlg.down('#anasPvePoolNote').html),
+    dlg.down('#anasPvePoolNote').html)
+
+  // The live name guard: a guest-shaped name marks the field and holds Create.
+  dlg.down('#path').setValue('vm-100-disk-0')
+  await settle()
+  const submit = dlg.down('#dsCreateSubmit')
+  ok('pve(create): Create is DISABLED for vm-100-disk-0', submit.disabled === true)
+  ok('pve(create): the guard sentence names the dataset',
+    dlg.down('#anasDsNameGuard').hidden === false
+      && /PVE would inventory 'vm-100-disk-0' as a guest disk/.test(dlg.down('#anasDsNameGuard').html),
+    dlg.down('#anasDsNameGuard').html)
+  ok('pve(create): the guard tells the operator what to avoid',
+    /vm-\/base-\/subvol-\/basevol-/.test(dlg.down('#anasDsNameGuard').html),
+    dlg.down('#anasDsNameGuard').html)
+
+  // One level DEEPER the name is invisible to PVE (`zfs list -d1`) — no guard.
+  dlg.down('#path').setValue('media/vm-100-disk-0')
+  await settle()
+  ok('pve(create): a deeper vm- name does not trip the guard', submit.disabled === false)
+  ok('pve(create): and the guard note goes away', dlg.down('#anasDsNameGuard').hidden === true)
+
+  // An ordinary name is unguarded; Create re-enables and submits.
+  dlg.down('#path').setValue('media')
+  await settle()
+  ok('pve(create): Create is ENABLED for media', submit.disabled === false)
+  jobs.length = 0
+  apiGets.length = 0
+  submit.handler(submit)
+  await settle()
+  eq('pve(create): one job', jobs.length, 1)
+  eq('pve(create): it posts the new dataset', jobs[0].path, '/pools/pvepool/datasets')
+  eq('pve(create): the body is the path alone', jobs[0].body, { path: 'media' })
+  ok('pve(create): the tree reloaded on SUCCESS', poolsGets() > 0)
+  eq('pve(create): the NEW node is selected after the reload',
+    tree.getSelection().map(n => n.get('fullName')), ['pvepool/media'])
+
+  // --- Reload on FAILURE: the stub auto-completed the job above; the destroy
+  // confirmAndRun is failed explicitly (the poll's failed branch calls
+  // onFailed). The tree must reload even then (the 0.3.3 lesson).
+  jobs.length = 0
+  apiGets.length = 0
+  btn = tree.down('#dsDestroy')
+  btn.handler(btn)
+  await settle()
+  eq('pve(failure): one destroy job', jobs.length, 1)
+  eq('pve(failure): it targets the selected dataset', jobs[0].path, '/pools/pvepool/datasets/media')
+  ok('pve(failure): the tree reloaded on SUCCESS first', poolsGets() > 0)
+  apiGets.length = 0
+  if (typeof jobs[0].onFailed === 'function') {
+    jobs[0].onFailed({ error: { message: 'zfs destroy failed: dataset is busy' } })
+    await settle()
+    ok('pve(failure): the tree reloaded on FAILURE too', poolsGets() > 0)
+  } else {
+    ok('pve(failure): onFailed reaches the poll', false, 'no onFailed recorded')
+  }
+
+  // A runJob (non-confirm) mutation reloads on failure the same way: a
+  // snapshot create on the unowned sibling. Re-find it — the reloads above
+  // rebuilt the tree, so the old node object is stale.
+  jobs.length = 0
+  apiGets.length = 0
+  sibling = findNode(tree, 'pvepool/media')
+  tree.selectNode(sibling)
+  // Expanded, so the post-job refresh reloads the inline rows (in a real tree
+  // the expand itself lazy-loads; the stub does not fire itemexpand).
+  sibling.expand()
+  btn = tree.down('#snapCreate')
+  btn.handler(btn)
+  await settle()
+  dlg = openWindow()
+  ok('pve(failure): the snapshot dialog opens on the sibling', !!dlg && !!dlg.down('#snapName'))
+  if (dlg) {
+    dlg.down('#snapName').setValue('nightly')
+    const snapGets = () => apiGets.filter(p => p.endsWith('/datasets/media/snapshots')).length
+    const before = snapGets()
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-snap-create-submit').handler(dlg)
+    await settle()
+    eq('pve(failure): one snapshot job', jobs.length, 1)
+    ok('pve(failure): the snapshot rows refreshed on SUCCESS', snapGets() > before)
+    const afterSuccess = snapGets()
+    if (typeof jobs[0].onFailed === 'function') {
+      jobs[0].onFailed({ error: { message: 'zfs snapshot failed' } })
+      await settle()
+      ok('pve(failure): the snapshot rows refreshed on FAILURE too', snapGets() > afterSuccess)
+    } else {
+      ok('pve(failure): onFailed reaches the poll', false, 'no onFailed recorded')
+    }
+  }
+
+  ok('pve(datasets): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/** pvepool.2 (U1): the version-skew fallback — a payload with NO per-node
+ * `pve` key against a pool PVE names keeps TODAY'S whole-pool rule, and that
+ * rule gates Create too (skew tightens, never loosens). */
+async function pveSkewChecks() {
+  const { tree } = await openDatasetTree(PVE2_SKEW_ROUTES)
+  const root = findNode(tree, 'pvepool')
+  const sibling = findNode(tree, 'pvepool/media')
+  const guest = findNode(tree, 'pvepool/vm-100-disk-0')
+  ok('skew(datasets): the rows loaded', !!root && !!sibling && !!guest)
+  if (!root || !sibling || !guest) { return }
+
+  // The whole-pool fallback verdict rides EVERY row of the pool.
+  eq('skew: the root verdict is the fallback storage-root',
+    root.get('pveOwnership') && root.get('pveOwnership').kind, 'storage-root')
+  eq('skew: the payload signal is off', root.get('pvePerNode'), false)
+  ok('skew: the sibling is owned too', !!sibling.get('pveOwnership'))
+  ok('skew: the guest volume is owned', !!guest.get('pveOwnership'))
+  ok('skew: the fallback reason names pool + the skew',
+    /older daemon/.test(sibling.get('pveOwnership').reason),
+    sibling.get('pveOwnership').reason)
+
+  tree.selectNode(root)
+  let state = toolbarState(tree, ['dsCreate', 'dsDestroy', 'dsEdit'])
+  ok('skew(root): Create DISABLED (the whole-pool rule gates it too)',
+    state.dsCreate.disabled === true)
+  ok('skew(root): Destroy DISABLED', state.dsDestroy.disabled === true)
+  tree.selectNode(sibling)
+  state = toolbarState(tree, ['dsCreate', 'dsDestroy'])
+  ok('skew(sibling): Create DISABLED', state.dsCreate.disabled === true)
+  ok('skew(sibling): Destroy DISABLED', state.dsDestroy.disabled === true)
+  ok('skew(sibling): the reason is the whole-pool fallback',
+    /older daemon/.test(state.dsDestroy.tip), state.dsDestroy.tip)
+
+  ok('skew(datasets): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 
@@ -5628,7 +5920,7 @@ function snapshotRecord(parent, name) {
 }
 
 async function openDatasetTree(routes) {
-  const ANAS = loadSource('60-datasets.js', routes)
+  const ANAS = loadSource(['10-api.js', '60-datasets.js'], routes)
   const view = makeComponent(ANAS.views.datasets.factory('harness'), null)
   const tree = view.down('#dsTree')
   tree.fireEvent('afterrender', tree)
@@ -8928,6 +9220,13 @@ warnings.length = 0
 await poolImportChecks()
 warnings.length = 0
 await datasetsChecks()
+warnings.length = 0
+// pvepool.2 (U1) — per-dataset ownership on the Datasets screen, both sides
+// of the version skew.
+await pveOwnershipChecks()
+warnings.length = 0
+await pveSkewChecks()
+warnings.length = 0
 for (const check of [
   iscsiGridChecks,
   iscsiNotInstalledChecks,
