@@ -1747,6 +1747,16 @@ export async function datasetRoutes(
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
     }
 
+    // PVE footprint (story pvepool.1): an OWNED dataset is view-only for
+    // snapshots — any kind. A storage-root snapshot sweeps PVE's guest zvols
+    // (3.26's reasoning, now per-dataset), and a guest volume's snapshots are
+    // PVE's to take. Refused with the predicate's reason.
+    const owned = (await pveFootprint()).ownershipOf(fullName)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
+    }
+
     // 409 if the snapshot already exists — the system is the source of truth.
     const existing = await listSnapshotsDetail(fullName)
     if (existing.some(s => s.name === snapName)) {
