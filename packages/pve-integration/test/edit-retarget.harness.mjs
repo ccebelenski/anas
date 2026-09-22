@@ -724,6 +724,102 @@ async function openRemotes() {
   eq('and the edited field applied', edited.body.remote.user, 'backup')
 }
 
+// =============================================================================
+//  pvepool.2 (U2) — the pickers list PVE pools and omit what PVE owns
+// =============================================================================
+//
+// The pool pickers offer EVERY pool now — PVE's included. The dataset pickers
+// omit what PVE OWNS (any kind, the real ANAS.pve helper from 10-api.js —
+// this harness loads it) and keep the siblings. Against an older daemon (no
+// per-node `pve` field in the payload) a pool PVE names keeps the whole-pool
+// rule: every one of its datasets is omitted.
+
+const PVE_POOL = { name: 'rpool', size: 8 * 1024 * 1024 * 1024, pveStorages: [{ storage: 'local-zfs', type: 'zfspool' }] }
+const OWNER = (kind, ds) => ({ kind, storage: 'local-zfs', reason: `PVE storage local-zfs owns ${ds}` })
+// The live contract (pvepool.1): owned rows carry `pve`, siblings carry nothing.
+// A bare-pool storage — the pool root itself is owned.
+const PVE_DS = { data: [
+  { name: 'rpool', pve: OWNER('storage-root', 'rpool') },
+  { name: 'rpool/vm-100-disk-0', pve: OWNER('guest-volume', 'rpool/vm-100-disk-0') },
+  { name: 'rpool/media' },
+] }
+// The SAME pool on an older daemon: no row carries a `pve` field.
+const PVE_DS_SKEW = { data: [
+  { name: 'rpool' },
+  { name: 'rpool/vm-100-disk-0' },
+  { name: 'rpool/media' },
+] }
+
+// --- 16. Replication: the PVE pool appears, owned rows omitted, sibling kept ---
+{
+  reset()
+  state.get = baseGets({
+    '/pools': { data: [{ name: 'tank' }, PVE_POOL] },
+    '/pools/rpool/datasets': PVE_DS,
+  })
+  const win = await openTask(null)
+  ok('pve2(repl): the PVE pool appears in the source pool picker',
+    win.down('#sourcePool').getStore().rows().some(r => r.name === 'rpool'),
+    JSON.stringify(win.down('#sourcePool').getStore().rows()))
+  ok('pve2(repl): …and in the target pool picker',
+    win.down('#targetPool').getStore().rows().some(r => r.name === 'rpool'))
+
+  win.down('#sourcePool').setValue('rpool')
+  await settle()
+  eq('pve2(repl): owned root + guest volume omitted, the sibling is listed',
+    JSON.stringify(win.down('#sourceDataset').getStore().rows().map(r => r.rel)), JSON.stringify(['media']))
+}
+
+// --- 17. Replication, skew: no per-node field ⇒ the whole-pool rule ----------
+{
+  reset()
+  state.get = baseGets({
+    '/pools': { data: [{ name: 'tank' }, PVE_POOL] },
+    '/pools/rpool/datasets': PVE_DS_SKEW,
+  })
+  const win = await openTask(null)
+  win.down('#sourcePool').setValue('rpool')
+  await settle()
+  eq('pve2(repl skew): EVERY dataset of the PVE pool is omitted',
+    win.down('#sourceDataset').getStore().rows().length, 0)
+  win.down('#sourcePool').setValue('tank')
+  await settle()
+  eq('pve2(repl skew): the ANAS pool\'s datasets are untouched',
+    JSON.stringify(win.down('#sourceDataset').getStore().rows().map(r => r.rel)), JSON.stringify(['', 'media']))
+}
+
+// --- 18. Schedule: the PVE pool appears, owned rows omitted, sibling kept ----
+{
+  reset()
+  state.get = schedGets({
+    '/pools': { data: [{ name: 'tank' }, PVE_POOL] },
+    '/pools/rpool/datasets': PVE_DS,
+  })
+  const win = await openSchedule(null)
+  ok('pve2(sched): the PVE pool appears in the ZFS pool picker',
+    win.down('#zfsPool').getStore().rows().some(r => r.name === 'rpool'),
+    JSON.stringify(win.down('#zfsPool').getStore().rows()))
+
+  win.down('#zfsPool').setValue('rpool')
+  await settle()
+  eq('pve2(sched): owned root + guest volume omitted, the sibling is listed',
+    JSON.stringify(win.down('#zfsDataset').getStore().rows().map(r => r.rel)), JSON.stringify(['media']))
+}
+
+// --- 19. Schedule, skew: no per-node field ⇒ the whole-pool rule -------------
+{
+  reset()
+  state.get = schedGets({
+    '/pools': { data: [{ name: 'tank' }, PVE_POOL] },
+    '/pools/rpool/datasets': PVE_DS_SKEW,
+  })
+  const win = await openSchedule(null)
+  win.down('#zfsPool').setValue('rpool')
+  await settle()
+  eq('pve2(sched skew): EVERY dataset of the PVE pool is omitted',
+    win.down('#zfsDataset').getStore().rows().length, 0)
+}
+
 // ---- Report -----------------------------------------------------------------
 
 ok('no view warned unexpectedly', state.warnings.length === 0, state.warnings.join(' | '))

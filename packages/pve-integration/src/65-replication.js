@@ -487,30 +487,19 @@
         }
     }
 
-    // ---- ANAS pool + dataset pickers (exclude PVE-managed pools) ------------
+    // ---- Pool + dataset pickers (pvepool.2: PVE pools in, owned datasets out)
+    //
+    // The pool picker lists EVERY pool — PVE's included. The dataset options
+    // omit what PVE owns (any kind, per the shared ANAS.pve helper in
+    // 10-api.js — the ONE predicate); the daemon's named refusal is the
+    // backstop. Against an older daemon (no per-node field in the payload) a
+    // pool PVE names keeps the whole-pool rule: every one of its datasets is
+    // omitted — skew tightens, never loosens.
 
-    // A pool is PVE-managed iff its summary carries a non-empty pveStorages[].
-    // Fail-open: missing/malformed ⇒ ANAS-managed.
-    function isPveManaged(pool) {
-        try {
-            var ps = pool && pool.pveStorages;
-            return !!(ps && ps.length);
-        } catch (e) {
-            return false;
-        }
-    }
-
-    // Resolve to an array of ANAS-managed pool names; never rejects.
-    function loadAnasPools(node) {
+    // Resolve to the pool summaries (every pool, PVE's included); never rejects.
+    function loadPools(node) {
         return ANAS.api.get(node, '/pools').then(function (res) {
-            var pools = (res && res.data) || [];
-            var names = [];
-            for (var i = 0; i < pools.length; i++) {
-                if (!isPveManaged(pools[i])) {
-                    names.push(pools[i].name);
-                }
-            }
-            return names;
+            return (res && res.data) || [];
         }, function (err) {
             ANAS.warn('replication pools load failed: ' + ANAS.errText(err));
             return [];
@@ -518,18 +507,39 @@
     }
 
     // Resolve to a list of { rel, label } dataset options for a pool: the pool
-    // root '(pool root)' first, then each dataset's relative path. Never rejects.
-    function loadDatasetOptions(node, pool) {
-        var opts = [{ rel: '', label: t('(pool root)') }];
+    // root '(pool root)' first, then each ANAS-managed dataset's relative path —
+    // owned rows (any kind) are omitted, siblings stay. `poolSummary` carries
+    // the pool's pveStorages for the skew fallback. Never rejects.
+    function loadDatasetOptions(node, pool, poolSummary) {
+        var rootOpt = [{ rel: '', label: t('(pool root)') }];
         if (!pool) {
-            return Promise.resolve(opts);
+            return Promise.resolve(rootOpt);
         }
         return ANAS.api.get(node, '/pools/' + encodeURIComponent(pool) + '/datasets').then(
             function (res) {
                 var list = (res && res.data) || [];
+                // Did the daemon stamp per-node ownership on any row of this
+                // payload? (Unowned rows carry no `pve` key — that is the
+                // contract ANAS.pve.ownership is called with.)
+                var perNode = false;
+                for (var k = 0; k < list.length; k++) {
+                    var row = list[k];
+                    if (row && row.pve && typeof row.pve === 'object') {
+                        perNode = true;
+                        break;
+                    }
+                }
+                var opts = [];
+                var rootOwned = false;
                 var rels = [];
                 for (var i = 0; i < list.length; i++) {
                     var ds = list[i] || {};
+                    if (ANAS.pve.isOwned(ds, poolSummary, perNode)) {
+                        if (ds.name === pool) {
+                            rootOwned = true; // the root row is PVE's
+                        }
+                        continue; // owned — PVE inventories it, the picker omits it
+                    }
                     if (ds.name === pool) {
                         continue; // the pool root is already the first option
                     }
@@ -537,6 +547,9 @@
                     if (rel) {
                         rels.push(rel);
                     }
+                }
+                if (!rootOwned) {
+                    opts = rootOpt;
                 }
                 rels.sort();
                 for (var j = 0; j < rels.length; j++) {
@@ -546,7 +559,7 @@
             },
             function (err) {
                 ANAS.warn('replication datasets load failed for ' + pool + ': ' + ANAS.errText(err));
-                return opts;
+                return rootOpt;
             }
         );
     }
@@ -656,7 +669,11 @@
     //   → { names:[...], freeText:bool }
     function loadLocationPools(node, loc) {
         if (!loc || loc.kind === 'local' || !loc.name) {
-            return loadAnasPools(node).then(function (names) {
+            return loadPools(node).then(function (pools) {
+                var names = [];
+                for (var i = 0; i < pools.length; i++) {
+                    names.push(pools[i].name);
+                }
                 return { names: names, freeText: false };
             });
         }
@@ -1636,22 +1653,26 @@
         var src = task.source || {};
         var tgt = task.target || {};
 
-        loadAnasPools(node).then(function (names) {
+        loadPools(node).then(function (pools) {
             if (grid.destroyed || grid.destroying) {
                 return;
+            }
+            var names = [];
+            for (var i = 0; i < pools.length; i++) {
+                names.push(pools[i].name);
             }
             // Nothing to point a NEW task at. An EDIT still opens: the task
             // already has its endpoints, and the dialog's job is then to say the
             // pool list is missing — not to disappear (mirrors 69-snapshots.js).
             if (!names.length && !isEdit) {
-                ANAS.toast(t('No ANAS-managed pool is available for replication.'));
+                ANAS.toast(t('No pool is available for replication.'));
                 return;
             }
-            buildTaskWindow(node, grid, isEdit, task, src, tgt, names);
+            buildTaskWindow(node, grid, isEdit, task, src, tgt, names, pools);
         });
     }
 
-    function buildTaskWindow(node, grid, isEdit, task, src, tgt, names) {
+    function buildTaskWindow(node, grid, isEdit, task, src, tgt, names, pools) {
         var srcPoolStore = poolComboStore(names);
         var tgtPoolStore = poolComboStore(names);
         var srcDsStore = Ext.create('Ext.data.Store', { fields: ['rel', 'label'], data: [] });
@@ -1824,9 +1845,18 @@
             return;
         }
 
-        // Reload the source-dataset combo whenever the source pool changes.
+        // Reload the source-dataset combo whenever the source pool changes. The
+        // pool's summary rides along: the skew fallback reads its pveStorages
+        // from there (an older daemon stamps no per-node field).
         var loadSrcDatasets = function (pool, preselectRel) {
-            loadDatasetOptions(node, pool).then(function (opts) {
+            var summary = null;
+            for (var i = 0; i < pools.length; i++) {
+                if (pools[i].name === pool) {
+                    summary = pools[i];
+                    break;
+                }
+            }
+            loadDatasetOptions(node, pool, summary).then(function (opts) {
                 if (win.destroyed || win.destroying) {
                     return;
                 }
@@ -2300,16 +2330,20 @@
     }
 
     function openReplicateOnce(node, grid) {
-        loadAnasPools(node).then(function (names) {
+        loadPools(node).then(function (pools) {
+            var names = [];
+            for (var i = 0; i < pools.length; i++) {
+                names.push(pools[i].name);
+            }
             if (!names.length) {
-                ANAS.toast(t('No ANAS-managed pool is available for replication.'));
+                ANAS.toast(t('No pool is available for replication.'));
                 return;
             }
-            buildOnceWindow(node, grid, names);
+            buildOnceWindow(node, grid, names, pools);
         });
     }
 
-    function buildOnceWindow(node, grid, names) {
+    function buildOnceWindow(node, grid, names, pools) {
         var srcPoolStore = poolComboStore(names);
         var tgtPoolStore = poolComboStore(names);
         var srcDsStore = Ext.create('Ext.data.Store', { fields: ['rel', 'label'], data: [] });
@@ -2462,7 +2496,14 @@
         var replan = function () { fetchPlan(win, node); };
 
         var loadSrc = function (pool) {
-            loadDatasetOptions(node, pool).then(function (opts) {
+            var summary = null;
+            for (var i = 0; i < pools.length; i++) {
+                if (pools[i].name === pool) {
+                    summary = pools[i];
+                    break;
+                }
+            }
+            loadDatasetOptions(node, pool, summary).then(function (opts) {
                 if (win.destroyed || win.destroying) {
                     return;
                 }

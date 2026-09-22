@@ -435,30 +435,19 @@
         }
     }
 
-    // ---- Target pickers (ANAS-managed only; exclude PVE-managed pools) ------
+    // ---- Target pickers (pvepool.2: PVE pools in, owned datasets out) -------
+    //
+    // The ZFS pool picker lists EVERY pool — PVE's included. The dataset
+    // options omit what PVE owns (any kind, per the shared ANAS.pve helper in
+    // 10-api.js — the ONE predicate); the daemon's named refusal is the
+    // backstop. Against an older daemon (no per-node field in the payload) a
+    // pool PVE names keeps the whole-pool rule: every one of its datasets is
+    // omitted — skew tightens, never loosens.
 
-    // A ZFS pool is PVE-managed iff its summary carries a non-empty pveStorages[].
-    // Fail-open: missing/malformed ⇒ ANAS-managed.
-    function isPveManaged(pool) {
-        try {
-            var ps = pool && pool.pveStorages;
-            return !!(ps && ps.length);
-        } catch (e) {
-            return false;
-        }
-    }
-
-    // ANAS-managed ZFS pool names; never rejects.
+    // Every ZFS pool summary (PVE's included); never rejects.
     function loadZfsPools(node) {
         return ANAS.api.get(node, '/pools').then(function (res) {
-            var pools = (res && res.data) || [];
-            var names = [];
-            for (var i = 0; i < pools.length; i++) {
-                if (!isPveManaged(pools[i])) {
-                    names.push(pools[i].name);
-                }
-            }
-            return names;
+            return (res && res.data) || [];
         }, function (err) {
             ANAS.warn('schedules ZFS pools load failed: ' + ANAS.errText(err));
             return [];
@@ -493,18 +482,39 @@
     }
 
     // Dataset options for a ZFS pool: the pool root '(pool root)' first, then each
-    // dataset's relative path. `rel` '' is the pool root. Never rejects.
-    function loadDatasetOptions(node, pool) {
-        var opts = [{ rel: '', label: t('(pool root)') }];
+    // ANAS-managed dataset's relative path — owned rows (any kind, ANAS.pve) are
+    // omitted, siblings stay. `rel` '' is the pool root. `poolSummary` carries
+    // the pool's pveStorages for the skew fallback. Never rejects.
+    function loadDatasetOptions(node, pool, poolSummary) {
+        var rootOpt = [{ rel: '', label: t('(pool root)') }];
         if (!pool) {
-            return Promise.resolve(opts);
+            return Promise.resolve(rootOpt);
         }
         return ANAS.api.get(node, '/pools/' + encodeURIComponent(pool) + '/datasets').then(
             function (res) {
                 var list = (res && res.data) || [];
+                // Did the daemon stamp per-node ownership on any row of this
+                // payload? (Unowned rows carry no `pve` key — that is the
+                // contract ANAS.pve.ownership is called with.)
+                var perNode = false;
+                for (var k = 0; k < list.length; k++) {
+                    var row = list[k];
+                    if (row && row.pve && typeof row.pve === 'object') {
+                        perNode = true;
+                        break;
+                    }
+                }
+                var opts = [];
+                var rootOwned = false;
                 var rels = [];
                 for (var i = 0; i < list.length; i++) {
                     var ds = list[i] || {};
+                    if (ANAS.pve.isOwned(ds, poolSummary, perNode)) {
+                        if (ds.name === pool) {
+                            rootOwned = true; // the root row is PVE's
+                        }
+                        continue; // owned — PVE inventories it, the picker omits it
+                    }
                     if (ds.name === pool) {
                         continue;
                     }
@@ -512,6 +522,9 @@
                     if (rel) {
                         rels.push(rel);
                     }
+                }
+                if (!rootOwned) {
+                    opts = rootOpt;
                 }
                 rels.sort();
                 for (var j = 0; j < rels.length; j++) {
@@ -521,7 +534,7 @@
             },
             function (err) {
                 ANAS.warn('schedules datasets load failed for ' + pool + ': ' + ANAS.errText(err));
-                return opts;
+                return rootOpt;
             }
         );
     }
@@ -666,20 +679,26 @@
             if (grid.destroyed || grid.destroying) {
                 return;
             }
-            var zfsPools = r[0] || [];
+            // Summaries — the dataset options' skew fallback reads pveStorages
+            // off the picked pool's summary; the picker stores want names.
+            var zfsSummaries = r[0] || [];
+            var zfsPools = [];
+            for (var i = 0; i < zfsSummaries.length; i++) {
+                zfsPools.push(zfsSummaries[i].name);
+            }
             var ahrPools = r[1] || [];
             // Nothing to point a NEW schedule at. An EDIT still opens: the
             // schedule already has a target, and the dialog's job is then to say
             // that the inventory is missing — not to disappear.
             if (!zfsPools.length && !ahrPools.length && !existing) {
-                ANAS.toast(t('No ANAS-managed ZFS dataset or AHR pool is available to schedule.'));
+                ANAS.toast(t('No ZFS pool or AHR pool is available to schedule.'));
                 return;
             }
-            buildScheduleWindow(node, grid, existing || null, zfsPools, ahrPools);
+            buildScheduleWindow(node, grid, existing || null, zfsPools, ahrPools, zfsSummaries);
         });
     }
 
-    function buildScheduleWindow(node, grid, existing, zfsPools, ahrPools) {
+    function buildScheduleWindow(node, grid, existing, zfsPools, ahrPools, zfsSummaries) {
         var isEdit = !!existing;
         var sched = existing || {};
         var target = sched.target || {};
@@ -942,9 +961,18 @@
             setVis('#ahrPool', !zfs);
         };
 
-        // Reload the ZFS dataset combo when the ZFS pool changes.
+        // Reload the ZFS dataset combo when the ZFS pool changes. The pool's
+        // summary rides along: the skew fallback reads its pveStorages from
+        // there (an older daemon stamps no per-node field).
         var loadZfsDatasets = function (pool, preselectRel) {
-            loadDatasetOptions(node, pool).then(function (opts) {
+            var summary = null;
+            for (var i = 0; i < zfsSummaries.length; i++) {
+                if (zfsSummaries[i].name === pool) {
+                    summary = zfsSummaries[i];
+                    break;
+                }
+            }
+            loadDatasetOptions(node, pool, summary).then(function (opts) {
                 if (win.destroyed || win.destroying) {
                     return;
                 }

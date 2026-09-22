@@ -3110,11 +3110,13 @@
     /**
      * Fill the two backing pickers.
      *
-     * zvols come from `/v1/pools/:name/datasets` filtered to `type: volume` and
-     * to volumes ANAS manages — PVE's own pools and its `vm-*`/`base-*`/`subvol-*`
-     * guest volumes are never candidates, the same hands-off rule the Datasets
-     * tree applies. The dataset/AHR list is the same read, filesystems only, plus
-     * the AHR pools (a file on the btrfs volume is AHR's only block object).
+     * zvols come from `/v1/pools/:name/datasets` filtered to `type: volume` —
+     * PVE pools are candidates too (pvepool.2), but the rows PVE OWNS (any
+     * kind, per the shared ANAS.pve helper in 10-api.js — the ONE predicate;
+     * the daemon stamps `pve` on the owned ones) are never candidates, and its
+     * named refusal is the backstop. The dataset/AHR list is the same read,
+     * filesystems only, plus the AHR pools (a file on the btrfs volume is
+     * AHR's only block object).
      */
     // The image-file picker must know WHICH phrase the daemon wants in the new
     // LUN's backing (backup2.10): an image on `tank/images` is a `dataset`, one
@@ -3156,12 +3158,12 @@
             var i;
             for (i = 0; i < pools.length; i++) {
                 var p = pools[i] || {};
-                if (isArray(p.pveStorages) && p.pveStorages.length) {
-                    continue; // PVE territory — hands-off
-                }
+                // pvepool.2: PVE pools are candidates too — collectFromPool
+                // keeps out only the rows PVE owns (the shared ANAS.pve
+                // predicate), and the daemon's named refusal is the backstop.
                 anasPools.push({ name: p.name, label: p.name });
                 pending++;
-                collectFromPool(node, win, p.name, zvols, dirs, function () {
+                collectFromPool(node, win, p, zvols, dirs, function () {
                     pending--;
                     if (pending <= 0) {
                         applyBackingStores(win, zvols, dirs, anasPools);
@@ -3200,27 +3202,38 @@
         });
     }
 
-    // PVE's guest-volume naming, the same three prefixes the daemon refuses.
-    var PVE_GUEST_RE = /^(?:vm|base|subvol)-\d+-disk-\d+$/;
-
+    // The dataset read behind both pickers, one pool at a time. `pool` is the
+    // pool SUMMARY (its pveStorages feed the skew fallback when the daemon
+    // stamped no per-node field). Rows PVE owns — any kind, the shared
+    // ANAS.pve predicate — never reach a picker; siblings do.
     function collectFromPool(node, win, pool, zvols, dirs, done) {
-        if (!pool) {
+        if (!pool || !pool.name) {
             done();
             return;
         }
-        ANAS.api.get(node, '/pools/' + encodeURIComponent(pool) + '/datasets').then(function (res) {
+        ANAS.api.get(node, '/pools/' + encodeURIComponent(pool.name) + '/datasets').then(function (res) {
             if (win.destroyed || win.destroying) {
                 done();
                 return;
             }
             var list = (res && res.data) || [];
+            // Did the daemon stamp per-node ownership on any row of this
+            // payload? (Unowned rows carry no `pve` key — that is the
+            // contract ANAS.pve.ownership is called with.)
+            var perNode = false;
+            for (var k = 0; k < list.length; k++) {
+                var row = list[k];
+                if (row && row.pve && typeof row.pve === 'object') {
+                    perNode = true;
+                    break;
+                }
+            }
             for (var i = 0; i < list.length; i++) {
                 var d = list[i] || {};
-                var leaf = ('' + (d.name || '')).split('/').pop();
+                if (ANAS.pve.isOwned(d, pool, perNode)) {
+                    continue; // owned by PVE — never a candidate
+                }
                 if (d.type === 'volume') {
-                    if (PVE_GUEST_RE.test(leaf)) {
-                        continue; // a PVE guest disk is never a candidate
-                    }
                     zvols.push({
                         name: d.name,
                         label: d.name + (d.volsize ? ' (' + fmtBytes(d.volsize) + ')' : '')

@@ -48,7 +48,9 @@
  *   5. iSCSI (story iscsi.4): a CHAP secret is WRITE-ONLY, so a blank box means
  *      KEEP and never "clear" — a dialog that got that backwards would strip
  *      every stored secret on the next unrelated save. Also: an untouched target
- *      edit sends an EMPTY body, the Add LUN pickers never offer PVE territory,
+ *      edit sends an EMPTY body, the Add LUN pickers omit what PVE OWNS
+ *      (pvepool.2 — the pool itself is a candidate, owned rows are not, and
+ *      an older daemon keeps the whole-pool rule),
  *      a resize grows only, destroying a LUN's backing object is a separate
  *      ticked choice that becomes a query flag, and a foreign target, a live
  *      session, or a non-empty target greys the right controls with the reason
@@ -552,10 +554,40 @@ const noAutofill = (() => {
   return sandbox.window.ANAS.noAutofill
 })()
 
+/**
+ * The REAL ANAS.pve from 10-api.js (pvepool.2) — loaded into a throwaway
+ * sandbox exactly as the page loads 10-api.js, so the backing pickers run
+ * against the one shared predicate, not a re-stub of it. (The recording stub
+ * below cannot take 10-api.js wholesale: its fetch-based api/runJob would
+ * shadow the ajax recorder.)
+ */
+function loadPveHelper() {
+  const win = {}
+  win.ANAS = {
+    t: s => s,
+    enc: s => String(s == null ? '' : s),
+    warn() {},
+    errText: e => String((e && e.message) || e),
+  }
+  const sandbox = {
+    window: win,
+    console,
+    Promise,
+    setTimeout: fn => { fn(); return 1 },
+    clearTimeout: () => {},
+  }
+  vm.runInNewContext(readFileSync(join(SRC, '10-api.js'), 'utf8'), sandbox, { filename: '10-api.js' })
+  return win.ANAS.pve
+}
+
+const ANAS_PVE = loadPveHelper()
+
 function makeAnas(routes) {
   return {
     views: {},
     noAutofill,
+    // pvepool.2: the shared ownership helper the pickers consult per row.
+    pve: ANAS_PVE,
     pools: { registerAction(a) { this._actions = (this._actions || []).concat([a]) }, reload() {} },
     datasets: {},
     // The Datasets view degrades gracefully without the gfx layer (every call
@@ -2175,17 +2207,30 @@ function iscsiDetail(opts = {}) {
 const ISCSI_POOL_ROUTES = {
   'GET /pools': { data: [
     { name: 'tank', size: 8 * GiB_, pveStorages: [] },
-    // PVE territory: never a candidate, and never even enumerated.
-    { name: 'pvepool', size: 8 * GiB_, pveStorages: [{ id: 'local-zfs', type: 'zfspool' }] },
+    // pvepool.2: a PVE pool is a candidate too — the pickers omit only the
+    // datasets PVE OWNS (the rows the daemon stamps `pve`), never the pool.
+    { name: 'pvepool', size: 8 * GiB_, pveStorages: [{ storage: 'local-zfs', type: 'zfspool' }] },
   ] },
   'GET /pools/tank/datasets': { data: [
     { name: 'tank', type: 'filesystem', mountpoint: '/tank' },
     { name: 'tank/images', type: 'filesystem', mountpoint: '/tank/images' },
     { name: 'tank/vol1', type: 'volume', volsize: 2 * GiB_ },
     { name: 'tank/vol2', type: 'volume', volsize: 4 * GiB_ },
-    // A PVE guest disk that happens to sit on an ANAS pool: still never a
-    // candidate — the same three prefixes the daemon refuses.
+    // A guest-NAMED disk sitting on an ANAS pool: ownership is
+    // FOOTPRINT-based (pvepool.1) — PVE does not name tank, so the daemon
+    // stamps no `pve` and the row is a candidate. Name-based exclusion is gone.
     { name: 'tank/vm-101-disk-0', type: 'volume', volsize: GiB_ },
+  ] },
+  // pvepool.1's live contract: the daemon stamps `pve` on the owned rows and
+  // nothing on the siblings. A bare-pool storage — the pool root itself is
+  // owned, the guest volume is owned, the rest of the pool is ANAS's.
+  'GET /pools/pvepool/datasets': { data: [
+    { name: 'pvepool', type: 'filesystem', mountpoint: '/pvepool',
+      pve: { kind: 'storage-root', storage: 'local-zfs', reason: 'PVE storage local-zfs owns pvepool as a storage root' } },
+    { name: 'pvepool/vm-100-disk-0', type: 'volume', volsize: GiB_,
+      pve: { kind: 'guest-volume', storage: 'local-zfs', reason: 'PVE storage local-zfs owns pvepool/vm-100-disk-0 as a guest volume' } },
+    { name: 'pvepool/vol-sibling', type: 'volume', volsize: GiB_ },
+    { name: 'pvepool/media', type: 'filesystem', mountpoint: '/pvepool/media' },
   ] },
   // The picker reads the same GET /ahr the AHR menu makes (the daemon has no
   // /ahr/pools) and offers only MOUNTED pools — the image directory IS the
@@ -2811,14 +2856,22 @@ async function iscsiLunChecks() {
   const zvols = dlg.down('#zvolPicker').getStore().getRange().map(r => r.get('name'))
   ok('addlun: the picker offers ANAS-managed volumes', zvols.includes('tank/vol1') && zvols.includes('tank/vol2'),
     JSON.stringify(zvols))
-  ok('addlun: a PVE guest disk is NEVER a candidate', !zvols.includes('tank/vm-101-disk-0'), JSON.stringify(zvols))
-  ok('addlun: a PVE-managed pool is not even enumerated',
-    !zvols.some(z => z.startsWith('pvepool')), JSON.stringify(zvols))
+  // pvepool.2: ownership is the footprint, not the name — PVE does not name
+  // `tank`, so its guest-shaped row is ANAS's and stays a candidate.
+  ok('addlun: a guest-NAMED disk on an ANAS pool is a candidate', zvols.includes('tank/vm-101-disk-0'), JSON.stringify(zvols))
+  // …while on PVE's own pool the pool itself is enumerated, its OWNED volumes
+  // (storage root, guest volume) are omitted, and the sibling stays.
+  ok('addlun: the PVE pool is enumerated, owned rows omitted, sibling kept',
+    zvols.includes('pvepool/vol-sibling')
+    && !zvols.includes('pvepool/vm-100-disk-0')
+    && !zvols.includes('pvepool'), JSON.stringify(zvols))
   ok('addlun: filesystems are not offered as zvols', !zvols.includes('tank/images'), JSON.stringify(zvols))
 
   const dirs = dlg.down('#filePicker').getStore().getRange().map(r => r.get('name'))
   ok('addlun: the image-file picker offers datasets AND the AHR pool',
     dirs.includes('tank/images') && dirs.includes('ahrpool'), JSON.stringify(dirs))
+  ok('addlun: the PVE pool\'s sibling filesystem is a place for an image', dirs.includes('pvepool/media'), JSON.stringify(dirs))
+  ok('addlun: the owned PVE storage root is not', !dirs.includes('pvepool'), JSON.stringify(dirs))
   ok('addlun: it does not offer a zvol as a place to put a file',
     !dirs.includes('tank/vol1'), JSON.stringify(dirs))
 
@@ -2883,6 +2936,51 @@ async function iscsiLunChecks() {
     !('blockSize' in jobs[0].body), JSON.stringify(jobs[0].body))
 
   ok('addlun: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  iSCSI — pvepool.2: the version-skew fallback on the backing pickers
+// ============================================================================
+//
+// An older daemon stamps no per-node `pve` field on its dataset rows (and the
+// pool's pveStorages says PVE names this pool). The shared predicate then
+// keeps the whole-pool rule: EVERY dataset of the pool is omitted — skew may
+// only ever tighten, never loosen. The ANAS pool's rows are untouched.
+
+const ISCSI_SKEW_ROUTES = {
+  ...ISCSI_ROUTES,
+  'GET /pools/pvepool/datasets': { data: [
+    { name: 'pvepool', type: 'filesystem', mountpoint: '/pvepool' },
+    { name: 'pvepool/vm-100-disk-0', type: 'volume', volsize: GiB_ },
+    { name: 'pvepool/vol-sibling', type: 'volume', volsize: GiB_ },
+    { name: 'pvepool/media', type: 'filesystem', mountpoint: '/pvepool/media' },
+  ] },
+}
+
+async function iscsiPveSkewChecks() {
+  ajax.responses = { '/network': PVE_NETWORK }
+  const { grid } = await openIscsiView(ISCSI_SKEW_ROUTES)
+  const lunsWin = await openLuns(grid, ISCSI_SKEW_ROUTES)
+  ok('pve-skew: the LUNs window opened', !!lunsWin && !!lunsWin.down('#lunsGrid'))
+  if (!lunsWin) { return }
+  const lunsGrid = lunsWin.down('#lunsGrid')
+  lunsGrid.down('#lunAdd').handler(lunsGrid.down('#lunAdd'))
+  await settle()
+  const dlg = openWindow()
+  ok('pve-skew: the add-LUN dialog opened', !!dlg && !!dlg.down('#zvolPicker'))
+  if (!dlg) { return }
+
+  const zvols = dlg.down('#zvolPicker').getStore().getRange().map(r => r.get('name'))
+  ok('pve-skew: the ANAS pool\'s rows are offered', zvols.includes('tank/vol1') && zvols.includes('tank/vol2'), JSON.stringify(zvols))
+  ok('pve-skew: EVERY dataset of the PVE pool is omitted (the whole-pool rule)',
+    !zvols.some(z => z === 'pvepool' || z.startsWith('pvepool/')), JSON.stringify(zvols))
+
+  const dirs = dlg.down('#filePicker').getStore().getRange().map(r => r.get('name'))
+  ok('pve-skew: the PVE pool\'s filesystems are omitted from the image list too',
+    !dirs.some(d => d === 'pvepool' || d.startsWith('pvepool/')), JSON.stringify(dirs))
+  ok('pve-skew: the ANAS pool\'s image directories are offered', dirs.includes('tank/images'), JSON.stringify(dirs))
+
+  ok('pve-skew: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 async function iscsiResizeAndDeleteChecks() {
@@ -3726,7 +3824,7 @@ async function restoreDoorsLiveSessionChecks() {
     await settle()
     const pools = dlg.down('#newLunPool').getStore().getRange().map(r => r.get('name'))
     ok(`doors(live session, ${label}): the new-LUN pool picker is FILLED on this door too`,
-      pools.includes('tank') && !pools.includes('pvepool'), JSON.stringify(pools))
+      pools.includes('tank') && pools.includes('pvepool'), JSON.stringify(pools))
     const dirs = dlg.down('#filePicker').getStore().getRange().map(r => `${r.get('name')}@${r.get('source') || ''}`)
     ok(`doors(live session, ${label}): the image picker is FILLED on this door too`,
       dirs.includes('tank/images@dataset') && dirs.includes('ahrpool@ahr'), JSON.stringify(dirs))
@@ -4096,8 +4194,10 @@ async function iscsiRestoreNewLunChecks() {
   // the dataset/AHR list for the image — with the source flag that keeps the
   // `dataset` vs `ahrPool` phrase honest.
   const pools = dlg.down('#newLunPool').getStore().getRange().map(r => r.get('name'))
-  ok('restore(newLun): the zvol picker offers ANAS-managed pools', pools.includes('tank'), JSON.stringify(pools))
-  ok('restore(newLun): a PVE-managed pool is never a candidate', !pools.includes('pvepool'))
+  // pvepool.2: every pool is a candidate — including PVE's. A zvol the daemon
+  // creates there gets the LUN's name; the naming guard is the backstop.
+  ok('restore(newLun): the zvol picker offers every pool, PVE\'s included',
+    pools.includes('tank') && pools.includes('pvepool'), JSON.stringify(pools))
   const dirs = dlg.down('#filePicker').getStore().getRange()
   ok('restore(newLun): the image picker marks a dataset row with its source',
     !!dirs.find(r => r.get('name') === 'tank/images' && r.get('source') === 'dataset'))
@@ -8836,6 +8936,9 @@ for (const check of [
   iscsiEditChecks,
   iscsiRowSurvivalChecks,
   iscsiLunChecks,
+  // pvepool.2 — the backing pickers' version-skew fallback (old daemon: no
+  // per-node `pve` field ⇒ the whole-pool rule stands).
+  iscsiPveSkewChecks,
   iscsiResizeAndDeleteChecks,
   iscsiSessionGatingChecks,
   iscsiTargetDeleteChecks,
