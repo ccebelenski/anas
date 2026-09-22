@@ -17,5 +17,11 @@ export const NODE_NAME = process.env.ANAS_STUNT_NODE ?? 'anas-pve'
 /** Proxmox VE web UI / API — the PVEAuthCookie origin. */
 export const PVE_URL = `https://${HOST}:8006`
 
-/** The ANAS gateway (HTTPS, story 10.4). */
-export const GATEWAY_URL = `https://${HOST}:3000`
+/**
+ * The ANAS gateway, reached through pveproxy (story 12.2). The gateway binds
+ * the loopback interface plain HTTP — `:3000` is not reachable from outside the
+ * node — so every external address is the PVE origin's `/anas` forward, which
+ * the AnasProxy hook strips and proxies to the loopback listener. Same origin
+ * as the PVE UI, same PVEAuthCookie (the auth the pvepool spec uses).
+ */
+export const GATEWAY_URL = `${PVE_URL}/anas`
