@@ -497,11 +497,18 @@
     }
 
     function isPveManaged(rec) {
+        // pvepool.2 (U0): the ONE client-side ownership helper (ANAS.pve) is
+        // the source of truth. A POOL row carries no per-node `pve` field, so
+        // perNodeAvailable is false and the whole-pool rule applies: non-empty
+        // pveStorages ⇒ PVE's (skew direction: this only tightens the gate).
         try {
-            return pveStoragesOf(rec).length > 0;
+            if (ANAS.pve && typeof ANAS.pve.isOwned === 'function') {
+                return ANAS.pve.isOwned(rec, rec, false);
+            }
         } catch (e) {
-            return false;
+            // helper unavailable or a malformed row — degrade to the pre-U0 rule
         }
+        return pveStoragesOf(rec).length > 0;
     }
 
     // Tooltip like "PVE storage: datapool (images, rootdir)". Joins multiple
@@ -532,7 +539,11 @@
             if (!storages.length) {
                 return name;
             }
-            var tip = pveTooltip(storages);
+            // pvepool.2: the pool stays hands-off as a whole (ruled), but the
+            // datasets OUTSIDE PVE's footprint are manageable — point the
+            // operator at the Datasets screen where per-dataset ownership shows.
+            var tip = pveTooltip(storages) + ' '
+                + ANAS.t('Datasets outside PVE\'s footprint are manageable in Datasets.');
             var badge = '';
             try {
                 var gfx = ANAS.gfx;

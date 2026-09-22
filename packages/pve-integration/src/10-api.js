@@ -519,4 +519,178 @@
             };
         },
     };
+
+    // ---- Shared PVE-footprint ownership helper (pvepool.2, U0) ------------
+    //
+    // The ONE client-side ownership helper. The daemon stamps each dataset
+    // node with a per-node `pve` verdict (PveOwnership: { kind, storage?,
+    // reason }); a dataset with NO verdict is outside PVE's footprint and ANAS
+    // may manage it. Six UI files used to each carry their own `isPveManaged`
+    // copy — they all delegate to this (DESIGN.md "PVE footprint ownership").
+    //
+    // Version skew (fail-safe direction — DESIGN §2 ruling): an OLD daemon
+    // omits the per-node `pve` field entirely. A new UI that sees
+    // `pveStorages[]` non-empty on the pool AND no per-node field keeps
+    // TODAY'S whole-pool rule (the pool is PVE's). Skew may only ever TIGHTEN
+    // a hands-off gate, never loosen it. `perNodeAvailable` tells the helper
+    // which side of the skew we are on:
+    //   true  — the payload came from a daemon that stamps `pve`; a missing
+    //           `node.pve` then means NOT owned.
+    //   false — old daemon (no per-node field); fall back to the whole-pool
+    //           rule via `pool.pveStorages`.
+    // The CALLER decides perNodeAvailable. The simplest reliable signal for a
+    // dataset tree is whether the daemon returned the `pve` key on ANY node of
+    // that payload (owned or not). A pool ROW (the Pools grid) carries no
+    // per-node field by construction, so it is always passed `false` and rides
+    // the whole-pool rule.
+
+    // Read a field off an ExtJS record (.get) or a plain tree node, never
+    // throwing — pool rows are records, dataset tree nodes are plain objects.
+    function pveField(rec, name) {
+        try {
+            if (rec && typeof rec.get === 'function') {
+                return rec.get(name);
+            }
+        } catch (e) {
+            // getter threw — fall through to a property read
+        }
+        return rec ? rec[name] : undefined;
+    }
+
+    // The pool's PVE storages as a plain array (never null). Mirrors
+    // 30-pools.js's pveStoragesOf: non-array / malformed ⇒ [].
+    function pveStoragesList(pool) {
+        try {
+            var v = pveField(pool, 'pveStorages');
+            if (v && Object.prototype.toString.call(v) === '[object Array]' && v.length) {
+                return v;
+            }
+        } catch (e) {
+            // malformed field — ANAS-managed (fail-open, never block)
+        }
+        return [];
+    }
+
+    // The per-kind badge label drawn beside a dataset name (the Datasets
+    // tree). Raw (un-encoded) — the badge renderer encodes it. `<id>` is the
+    // owning storage id; `system` carries no storage id.
+    function pveKindLabel(o) {
+        var s = (o && o.storage) ? o.storage : '';
+        switch (o && o.kind) {
+            case 'storage-root':
+                return ANAS.t('PVE storage root') + ': ' + s;
+            case 'guest-volume':
+                return ANAS.t('PVE guest volume') + ' (' + s + ')';
+            case 'dir-storage':
+                return ANAS.t('PVE storage') + ' (' + s + ')';
+            case 'system':
+                return ANAS.t('System pool') + ': ' + ANAS.t('boot filesystem');
+            default:
+                return ANAS.t('PVE');
+        }
+    }
+
+    ANAS.pve = {
+        // The guest-volume name contract, verbatim from ZFSPoolPlugin.pm
+        // `zfs_parse_zvol_list` (PVE 9.2.20). The ONE permitted duplicate —
+        // the browser bundle cannot import @anas/shared; the source of truth
+        // is packages/shared/src/pve-footprint.ts (PVE_GUEST_VOLUME_RE).
+        GUEST_NAME_RE: /^(vm|base|subvol|basevol)-\d+-\S+$/,
+
+        // ownership(node, pool, perNodeAvailable) → the PveOwnership object for
+        // `node`, or null when ANAS may manage it.
+        //   node   — the dataset record/row (may carry pve: { kind, storage?,
+        //     reason } stamped by the daemon; kinds: 'storage-root' |
+        //     'guest-volume' | 'dir-storage' | 'system').
+        //   pool   — the pool record/summary (carries pveStorages: [PveStorageRef]).
+        //   perNodeAvailable — see the section note above.
+        ownership: function (node, pool, perNodeAvailable) {
+            var pve = pveField(node, 'pve');
+            if (pve && typeof pve === 'object') {
+                return pve;
+            }
+            if (!perNodeAvailable) {
+                // Old daemon — no per-node field. Whole-pool rule: a pool PVE
+                // names is PVE's (tightens the gate, never loosens it).
+                var storages = pveStoragesList(pool);
+                if (storages.length) {
+                    var first = storages[0] || {};
+                    var id = first.storage || first.dataset || '';
+                    var poolName = pveField(pool, 'name') || '';
+                    return {
+                        kind: 'storage-root',
+                        storage: id,
+                        reason: "PVE storage '" + id + "' manages pool '" + poolName
+                            + "' (older daemon — per-dataset ownership unavailable)",
+                    };
+                }
+            }
+            // perNodeAvailable=true with no `pve`, or an empty pveStorages:
+            // outside PVE's footprint — ANAS may manage it.
+            return null;
+        },
+
+        // isOwned(node, pool, perNodeAvailable) → boolean convenience.
+        isOwned: function (node, pool, perNodeAvailable) {
+            return !!ANAS.pve.ownership(node, pool, perNodeAvailable);
+        },
+
+        // badge(ownership) → { html, tip } for a dataset's PVE badge. `html`
+        // is the INNER badge (gfx.badge when the gfx layer is up, a plain
+        // .anas-gfx-badge span otherwise) so the look matches 30-pools.js's
+        // existing PVE tag exactly; `tip` = ownership.reason (the tooltip).
+        // The caller wraps `html` in its own outer span (e.g. .anas-ds-pve-
+        // badge / .anas-pool-pve-badge) so each screen keeps its hook class.
+        badge: function (ownership) {
+            if (!ownership || typeof ownership !== 'object') {
+                return { html: '', tip: '' };
+            }
+            var tip = ownership.reason || '';
+            var label = pveKindLabel(ownership);
+            var html = '';
+            try {
+                var gfx = ANAS.gfx;
+                if (gfx && typeof gfx.badge === 'function') {
+                    html = gfx.badge(label, { title: tip }) || '';
+                }
+            } catch (e) {
+                // gfx unavailable — fall back to a plain badge (never break the row)
+                html = '';
+            }
+            if (!html) {
+                html = '<span class="anas-gfx-badge" title="' + ANAS.enc(tip)
+                    + '">' + ANAS.enc(label) + '</span>';
+            }
+            return { html: html, tip: tip };
+        },
+
+        // wouldBeClaimed(parentName, baseName, pool) → { storage } or null: the
+        // naming guard, client side. Non-null when PVE would inventory a new
+        // dataset on its next `zfs list -d1` — its parent (parentName) IS a
+        // zfspool storage's configured path (storage.dataset, falling back to
+        // the pool name) AND baseName matches the guest-volume regex. Only the
+        // zfspool DIRECT-child shape counts: a dir storage inventories plain
+        // files, and deeper nesting is never listed. Mirrors the daemon's
+        // wouldBeClaimedByPve (packages/shared/src/pve-footprint.ts).
+        wouldBeClaimed: function (parentName, baseName, pool) {
+            parentName = '' + (parentName || '');
+            baseName = '' + (baseName || '');
+            if (!baseName || !ANAS.pve.GUEST_NAME_RE.test(baseName)) {
+                return null;
+            }
+            var storages = pveStoragesList(pool);
+            var poolName = '' + (pveField(pool, 'name') || '');
+            for (var i = 0; i < storages.length; i++) {
+                var s = storages[i] || {};
+                if (s.type !== 'zfspool') {
+                    continue;
+                }
+                var path = s.dataset || poolName;
+                if (path && path === parentName) {
+                    return { storage: s.storage };
+                }
+            }
+            return null;
+        },
+    };
 })();
