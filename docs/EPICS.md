@@ -69,6 +69,7 @@ One line each. These are decisions, not history; the rationale is in `EPICS-HIST
 - **Dialog ↔ daemon contract:** for every option, value / `null` / omitted mean set / clear / keep; an untouched edit rewrites byte-identically (pre-fill reflects the entry exactly, never field defaults); fields are read by itemId, no hiddenfield mirroring. *(#34, #43, #26)*
 - **Structured output only** (`-j`, `--output-format json`); never parse human tables when a structured form exists. *(Principle 13)*
 - **Ids are never truncated; numbers carry labeled context.** *(11.18, 15.6)*
+- **Design pass = mechanism AND workflow, equal weight (operator ruling 2026-09-21).** A §3 slate entry is authorized SCOPE, not a dispatchable story. Each item first gets a design pass in its design doc, and from that pass the concrete numbered stories are cut — those are the dispatch unit. The pass answers, beside the commands / ground truth / failure model: **where it lives** (the one menu or panel and the entry action); **the happy path as the user sees it**, screen by screen, every number labeled, every state derived from the system; **timeliness** — what the user sees during a job, what refreshes when it completes or fails, and how stale a screen may be before that is a defect (0.3.3: delete grids that did not reload on failure were a workflow bug on a correct fix); **failure as the user meets it** — which refusal appears where, what the guiding text says, and the recovery verb offered on the same screen; **proof** — a Playwright spec per workflow beside the live proof of the mutation steps. Correctness and robustness are the pillars; the workflow is the only place a user ever meets them.
 
 ### ZFS — pools, datasets, snapshots *(Epics 3/4/5)*
 - Shares are storage-agnostic: **a path is a path** (smb.conf / exports edited directly, never `sharesmb`/`sharenfs`); only filesystem datasets are shareable. *(DESIGN §5a)*
@@ -131,6 +132,8 @@ One line each. These are decisions, not history; the rationale is in `EPICS-HIST
 ## 3. Active — 0.4.0
 
 > Shipped 0.3.x stories (backup2, iscsi, selfheal, identity) moved to `docs/EPICS-HISTORY.md` §"0.3.x shipped" on 2026-09-21; their rulings that outlived them are in §2.
+>
+> **Entries below are authorized scope, not dispatch-ready.** Each gets a design pass (mechanism + workflow, §2 rule) in its design doc, then concrete numbered stories cut from that pass; the stories are what gets dispatched. Design passes run in dispatch order and each item's stories are written right after its pass.
 
 ### 0.4.0 — accepted 2026-09-14 (operator: "a full and solid release"); groomed 2026-09-21
 
