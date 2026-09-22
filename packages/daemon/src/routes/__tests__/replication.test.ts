@@ -2,6 +2,9 @@ import type { Job, JobAccepted, ReplicatePlan } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
@@ -490,6 +493,130 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
     assert.equal(job.status, 'failed')
     assert.match(job.error!.message, /diverged/)
     assert.equal(notifications(mock).length, 1)
+  })
+
+  // --- pvepool.1 review fixes: snapshotFirst + the run-time re-check ------
+  //
+  // `snapshotFirst: true` takes a NEW snapshot on the SOURCE before sending —
+  // a mutation, so an OWNED source refuses 400 with the ownership reason.
+  // Without the flag the run sends PVE's own EXISTING snapshots — a read —
+  // and stays allowed. This endpoint IS the recurring task's run: its timer
+  // runner (replicate-task.js) POSTs here with the unit's --snapshot-first
+  // flag, so the guard re-asks ownership with the storage.cfg of THAT run —
+  // a source PVE claimed after the task was written fails the later run.
+
+  // A storage registered on the NESTED path testpool/share1 — the shape that
+  // leaves everything above it unowned while owning the named dataset as a
+  // storage root. It owns this file's fixture source outright.
+  const CLAIM = 'zfspool: local-zfs\n\tpool testpool/share1\n\tcontent images,rootdir\n\n'
+
+  /**
+   * Point ANAS_STORAGE_CFG at a temp file holding `text` (or at an ABSENT
+   * path when null — the fail-open posture). Returns the cfg path and a
+   * restore thunk; the caller can REWRITE the file mid-test to model PVE
+   * claiming a pool after the fact.
+   */
+  async function storageCfg(text: string | null): Promise<{ cfg: string, restore: () => Promise<void> }> {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-repl-pve-'))
+    const prev = process.env.ANAS_STORAGE_CFG
+    const cfg = join(dir, 'storage.cfg')
+    if (text === null)
+      process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
+    else
+      await writeFile(cfg, text, 'utf8')
+    process.env.ANAS_STORAGE_CFG = text === null ? join(dir, 'absent-storage.cfg') : cfg
+    return {
+      cfg,
+      restore: async () => {
+        if (prev === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prev
+        await rm(dir, { recursive: true, force: true })
+      },
+    }
+  }
+
+  it('snapshot-first onto an OWNED source is refused 400 with the ownership reason', async () => {
+    server = createServer({ mock: true, logger: false })
+    armSuccessfulRun()
+    const { restore } = await storageCfg(CLAIM)
+    try {
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/datasets/share1/replicate',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ target: { pool: 'testpool2' }, snapshotFirst: true }),
+      })
+      assert.equal(res.statusCode, 400)
+      assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+      assert.match(res.json().error.message, /snapshot-first replication would snapshot/i)
+      assert.match(res.json().error.message, /local-zfs/)
+      assert.match(res.json().error.message, /testpool\/share1/)
+      assert.match(res.json().error.message, /storage root/)
+    }
+    finally {
+      await restore()
+    }
+  })
+
+  it('the SAME owned source WITHOUT snapshotFirst is a read of existing snapshots — allowed', async () => {
+    server = createServer({ mock: true, logger: false })
+    armSuccessfulRun()
+    const { restore } = await storageCfg(CLAIM)
+    try {
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/datasets/share1/replicate',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ target: { pool: 'testpool2' } }),
+      })
+      // No snapshotFirst → nothing is created on the source → the send of
+      // PVE's existing snapshots is a read and passes the guard (202 job).
+      assert.equal(res.statusCode, 202)
+    }
+    finally {
+      await restore()
+    }
+  })
+
+  it('a source PVE claimed AFTER a run fails the NEXT run (the timer re-check)', async () => {
+    server = createServer({ mock: true, logger: false })
+    armSuccessfulRun()
+    // The task's world at creation/first-run time: storage.cfg does not claim
+    // testpool (absent on this node — fail-open, the pvepool.1 posture). The
+    // run is ACCEPTED (the guard let it through; the job itself cannot finish
+    // in mock — the just-taken snapshot is not in the static fixture list —
+    // but that is downstream of the boundary under test here).
+    const { cfg, restore } = await storageCfg(null)
+    try {
+      const first = await server.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/datasets/share1/replicate',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ target: { pool: 'testpool2' }, snapshotFirst: true }),
+      })
+      assert.equal(first.statusCode, 202)
+
+      // PVE claims testpool/share1 (the storage in CLAIM) — the fixture
+      // storage.cfg is written AFTER the first run. The timer's next run
+      // POSTs the same endpoint (replicate-task.js), and the guard must
+      // refuse the mutation with the reason, not send.
+      await writeFile(cfg, CLAIM, 'utf8')
+      process.env.ANAS_STORAGE_CFG = cfg
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/pools/testpool/datasets/share1/replicate',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ target: { pool: 'testpool2' }, snapshotFirst: true }),
+      })
+      assert.equal(res.statusCode, 400)
+      assert.match(res.json().error.message, /local-zfs/)
+      assert.match(res.json().error.message, /testpool\/share1/)
+    }
+    finally {
+      await restore()
+    }
   })
 
   // --- replicate: unauthenticated ----------------------------------------

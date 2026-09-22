@@ -128,7 +128,14 @@ async function run(mock: MockExecutor, over: Partial<BackupTask> = {}) {
 }
 
 function zfsArgs(mock: MockExecutor): string[][] {
-  return mock.calls.filter(c => c.command === ZFS).map(c => c.args)
+  // The PVE footprint's mountpoint inventory read (`zfs list -H -o
+  // name,mountpoint`, pvepool.1 review fixes) rides through the executor since
+  // readConsistencyFacts asks loadPveFootprint — it is inventory, not part of
+  // the run's own argv, so it is filtered out of every sequence assertion.
+  return mock.calls
+    .filter(c => c.command === ZFS)
+    .map(c => c.args)
+    .filter(a => !(a[0] === 'list' && a[1] === '-H' && a[2] === '-o' && a[3] === 'name,mountpoint'))
 }
 
 function pbcArgs(mock: MockExecutor): string[] {

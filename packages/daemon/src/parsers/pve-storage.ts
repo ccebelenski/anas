@@ -29,6 +29,7 @@
  */
 
 import type { PveStorageRef } from '@anas/shared'
+import type { CommandExecutor } from '../executor/types.js'
 import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
@@ -37,6 +38,9 @@ const execFileAsync = promisify(execFile)
 
 /** Default location of the PVE storage config on a Proxmox host. */
 export const PVE_STORAGE_CFG = '/etc/pve/storage.cfg'
+
+/** The zfs binary the executor-routed mountpoint read runs ({@link readZfsMountpoints}). */
+const ZFS_BIN = '/usr/sbin/zfs'
 
 /**
  * A ZFS dataset's mountpoint, as needed to resolve a PVE `dir` storage back to
@@ -99,13 +103,21 @@ function isUnder(path: string, mp: string): boolean {
 }
 
 /**
- * Resolve a `dir` storage's absolute `path` onto a ZFS dataset. A path is on
- * ZFS iff it sits at or under a dataset's mountpoint; when several datasets
- * nest (e.g. `/tank` and `/tank/backups`), the LONGEST matching mountpoint —
- * the most specific dataset — wins. Returns the winning mountpoint entry, or
- * `null` when the path is on no ZFS dataset (e.g. `/var/lib/vz`).
+ * The ONE longest-prefix path → dataset resolver: resolve an absolute path
+ * onto the ZFS dataset that hosts it. A path is on ZFS iff it sits at or under
+ * a dataset's mountpoint; when several datasets nest (e.g. `/tank` and
+ * `/tank/backups`), the LONGEST matching mountpoint — the most specific
+ * dataset — wins. Returns the winning mountpoint entry, or `null` when the
+ * path is on no ZFS dataset (e.g. `/var/lib/vz`).
+ *
+ * Three consumers ask it (pvepool.1 review fixes): `parsePveStorageCfg`
+ * resolves a `dir` storage's path, {@link readZfsMountpoints}' callers resolve
+ * an iSCSI file backing, and the footprint service's `datasetOfPath` resolves
+ * a share path — there is no second copy of this loop anywhere (the
+ * single-source-of-truth rule; iscsi-ownership's private copy was folded into
+ * this one).
  */
-function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): ZfsMountpoint | null {
+export function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): ZfsMountpoint | null {
   const target = stripTrailingSlash(path)
   let best: ZfsMountpoint | null = null
   let bestLen = -1
@@ -309,22 +321,42 @@ export function parseZfsMountpoints(text: string): ZfsMountpoint[] {
 
 /**
  * List ZFS dataset mountpoints via `zfs list`. Used to resolve PVE `dir`
- * storages onto their pool. A missing `zfs` binary (ENOENT — a non-ZFS host)
- * is FAIL-OPEN: an empty array, no warning. ANY OTHER failure (nonzero exit,
- * spawn trouble) returns `null` — UNREADABLE, the same three-valued posture as
- * {@link readPveStorages}: callers tighten whatever gate the mountpoints feed
- * instead of reading "no ZFS datasets" (pvepool.1 review fix 1). Uses execFile
- * (args array, no shell).
+ * storages onto their pool (and, via the footprint service's `datasetOfPath`,
+ * a share path onto its dataset). A missing `zfs` binary (ENOENT — a non-ZFS
+ * host) is FAIL-OPEN: an empty array, no warning. ANY OTHER failure (nonzero
+ * exit, spawn trouble) returns `null` — UNREADABLE, the same three-valued
+ * posture as {@link readPveStorages}: callers tighten whatever gate the
+ * mountpoints feed instead of reading "no ZFS datasets" (pvepool.1 review fix
+ * 1). Uses execFile (args array, no shell).
+ *
+ * When an {@link CommandExecutor} is supplied the read goes THROUGH it — the
+ * footprint service always passes its executor, so the read is mock-driven in
+ * tests and captured by the real daemon's argv discipline; without one the
+ * read runs directly (the pre-existing callers: mounts.ts, iscsi.ts).
  */
 let mountpointsReadWarned = false
 
 /**
  * The `zfs` command is overridable for tests (a fixture script standing in for
- * the binary proves the ENOENT-vs-other split without requiring ZFS).
+ * the binary proves the ENOENT-vs-other split without requiring ZFS); a
+ * {@link CommandExecutor} routes the read through it instead (see above).
  */
-export async function readZfsMountpoints(zfs = 'zfs'): Promise<ZfsMountpoint[] | null> {
+export async function readZfsMountpoints(zfsOrExec: string | CommandExecutor = 'zfs'): Promise<ZfsMountpoint[] | null> {
+  const exec = typeof zfsOrExec === 'object' ? zfsOrExec : undefined
+  const zfs = typeof zfsOrExec === 'string' ? zfsOrExec : 'zfs'
   try {
-    const { stdout } = await execFileAsync(zfs, ['list', '-H', '-o', 'name,mountpoint'])
+    let stdout: string
+    if (exec) {
+      // A non-zero exit is UNREADABLE (never "no datasets") — the direct
+      // execFileAsync below rejects on one, so the executor path must too.
+      const r = await exec.exec(ZFS_BIN, ['list', '-H', '-o', 'name,mountpoint'])
+      if (r.exitCode !== 0)
+        throw new Error(`zfs list exited ${r.exitCode}: ${r.stderr.trim()}`)
+      stdout = r.stdout
+    }
+    else {
+      stdout = (await execFileAsync(zfs, ['list', '-H', '-o', 'name,mountpoint'])).stdout
+    }
     return parseZfsMountpoints(stdout)
   }
   catch (err: unknown) {

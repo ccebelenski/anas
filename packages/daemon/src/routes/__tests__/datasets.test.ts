@@ -650,6 +650,76 @@ describe('PVE footprint ownership (pvepool.1)', () => {
     assert.match(res.json().error.message, /guest volume/)
   })
 
+  // pvepool.1 review fixes: chown/chmod -R and setfacl -R are exactly as much
+  // PVE's territory as a destroy — an OWNED dataset is view-only for the
+  // permissions and access writers too. Asked BEFORE the dataset read (an
+  // owned VOLUME would otherwise come back 409 "no mountpoint" / 404 "not a
+  // mounted filesystem", not the ownership reason).
+  it('setPermissions on an OWNED dataset is refused with the ownership reason', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/datasets/vm-100-disk-0/permissions',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ mode: '750' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    // The sentence names the storage AND the dataset.
+    assert.match(res.json().error.message, /local-zfs/)
+    assert.match(res.json().error.message, /testpool\/vm-100-disk-0/)
+    assert.match(res.json().error.message, /guest volume/)
+  })
+
+  it('setPermissions on the sibling proceeds past the guard', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/datasets/media/permissions',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ mode: '750' }),
+    })
+    // Past the ownership guard: the mountpoint read resolves and the job is
+    // accepted (the dev-mock chown/chmod succeed, so it completes).
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+  })
+
+  it('setAccess on an OWNED dataset is refused with the ownership reason', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/datasets/vm-100-disk-0/access',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ entries: [{ kind: 'owner', level: 'read-write' }] }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /local-zfs/)
+    assert.match(res.json().error.message, /testpool\/vm-100-disk-0/)
+    assert.match(res.json().error.message, /guest volume/)
+  })
+
+  it('setAccess on the sibling proceeds past the guard', async () => {
+    server = createServer({ mock: true, logger: false })
+    const res = await server.inject({
+      method: 'PUT',
+      url: '/v1/pools/testpool/datasets/media/access',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({
+        entries: [
+          { kind: 'owner', level: 'read-write' },
+          { kind: 'owning-group', level: 'read' },
+          { kind: 'everyone', level: 'none' },
+        ],
+      }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+  })
+
   // Snapshot verbs under an OWNED dataset. The default mock knows no snapshots
   // under the guest volume, so each case below registers the one it needs.
   const GUEST_SNAP = JSON.stringify({
@@ -668,6 +738,24 @@ describe('PVE footprint ownership (pvepool.1)', () => {
     const mock = (server as unknown as { executor: MockExecutor }).executor
     mock.addFixture({ command: '/usr/sbin/zfs', args: zfsSnapshotDetailArgs('testpool/vm-100-disk-0'), result: { stdout: GUEST_SNAP, stderr: '', exitCode: 0 } })
   }
+
+  // pvepool.1 review fixes (the missing unit test): snapshot CREATE is a
+  // mutation like every other verb — an OWNED dataset refuses with the reason,
+  // before the 409 already-exists check has anything to say about it.
+  it('creating a snapshot on an OWNED dataset is refused with the ownership reason', async () => {
+    guestVolumeWithSnapshot()
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/vm-100-disk-0/snapshots',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'pre-upgrade' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /local-zfs/)
+    assert.match(res.json().error.message, /testpool\/vm-100-disk-0/)
+    assert.match(res.json().error.message, /guest volume/)
+  })
 
   it('renaming a snapshot of an OWNED dataset is refused with the ownership reason', async () => {
     guestVolumeWithSnapshot()

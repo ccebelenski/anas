@@ -1196,6 +1196,17 @@ export async function datasetRoutes(
     if (!identity)
       return
 
+    // pvepool.1 review fixes: an OWNED dataset is view-only — chown/chmod -R
+    // must never touch PVE's territory. Asked BEFORE the dataset read so an
+    // owned VOLUME is refused 400 with the reason (the read would 409 it as
+    // "no mountpoint") and before any command runs. The reason names the
+    // storage AND the dataset.
+    const owned = (await pveFootprint()).ownershipOf(fullName)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
+    }
+
     // Resolve the mountpoint from the dataset — permissions apply to the path.
     const r = await executor.exec(ZFS, ['get', '-j', 'all', fullName])
     if (r.exitCode !== 0 || !r.stdout.trim()) {
@@ -1325,10 +1336,33 @@ export async function datasetRoutes(
     if (!identity)
       return
 
+    // pvepool.1 review fixes: an OWNED dataset is view-only — setfacl/chmod on
+    // its mountpoint (let alone -R) is PVE's territory to change. Asked BEFORE
+    // the target resolution so an owned VOLUME is refused 400 with the reason
+    // (the resolution would 404 it as "not a mounted filesystem") and before
+    // any command runs. The plain path parse is repeated from
+    // resolveAccessTarget; the 400 it can send is identical.
+    let fullName = poolName
+    if (path) {
+      const pathParsed = DatasetPath.safeParse(path)
+      if (!pathParsed.success) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid dataset path: ${pathParsed.error.issues[0]?.message}` } }
+      }
+      fullName = `${poolName}/${pathParsed.data}`
+    }
+    const owned = (await pveFootprint()).ownershipOf(fullName)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
+    }
+
     const target = await resolveAccessTarget(poolName, path, reply)
     if (!target)
       return reply
-    const { fullName, mountpoint } = target
+    // `fullName` is the one this function computed above — resolveAccessTarget
+    // re-parses the same path to the same name; only its mountpoint is new.
+    const { mountpoint } = target
 
     const perm = await statMountpoint(mountpoint)
     if (!perm) {

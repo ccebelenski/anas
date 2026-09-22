@@ -291,6 +291,104 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     assert.equal(res.statusCode, 404)
   })
 
+  // --- pvepool.1 review fixes: the RUN-TIME re-check -----------------------
+  //
+  // The create guard asks storage.cfg once, at create/update. Ownership is
+  // LIVE — PVE can claim a dataset afterwards — and the timer's runner
+  // (snapshot-task.js) POSTs /run, so the run job re-asks: a target PVE
+  // claimed after the schedule was written FAILS the run with the reason
+  // (the job error, and 9.4's notification error), never a silent skip.
+  const CLAIM = 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n\n'
+  const CLAIM_NESTED = 'zfspool: local-zfs\n\tpool testpool/x/data\n\tcontent images,rootdir\n\n'
+
+  /** Point ANAS_STORAGE_CFG at `text` (or an ABSENT path when null); restore thunk. */
+  async function storageCfg(text: string | null): Promise<{ cfg: string, restore: () => Promise<void> }> {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-sched-pve-'))
+    const prev = process.env.ANAS_STORAGE_CFG
+    const cfg = join(dir, 'storage.cfg')
+    process.env.ANAS_STORAGE_CFG = text === null ? join(dir, 'absent-storage.cfg') : cfg
+    if (text !== null)
+      await writeFile(cfg, text, 'utf8')
+    return {
+      cfg,
+      restore: async () => {
+        if (prev === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prev
+        await rm(dir, { recursive: true, force: true })
+      },
+    }
+  }
+
+  it('a run re-asks ownership: a target PVE claimed AFTER creation fails the run with the reason', async () => {
+    const { cfg, restore } = await storageCfg(null)
+    try {
+      // Created while storage.cfg does not claim testpool (fail-open).
+      const created = await create({
+        ...SCHEDULE,
+        id: 'nightly-vm',
+        target: { kind: 'zfs', dataset: 'testpool/vm-100-disk-0' },
+      })
+      assert.equal(created.statusCode, 202)
+
+      // PVE claims testpool — the fixture storage.cfg is written AFTER the
+      // schedule exists. The timer's next fire (or a Run Now) must refuse.
+      await writeFile(cfg, CLAIM, 'utf8')
+      process.env.ANAS_STORAGE_CFG = cfg
+      const run = await server.inject({ method: 'POST', url: '/v1/schedules/nightly-vm/run', headers: JSON_HEADERS, payload: '{}' })
+      assert.equal(run.statusCode, 202)
+      const done = await waitForJob(server, run.json().job.id)
+      assert.equal(done.status, 'failed')
+      // The refusal names the storage AND the dataset — and it is a REFUSAL,
+      // not a take that happened to fail: no snapshot command was issued.
+      assert.match(done.error!.message, /local-zfs/)
+      assert.match(done.error!.message, /testpool\/vm-100-disk-0/)
+      assert.equal(mockOf(server).calls.some(c => c.args[0] === 'snapshot'), false)
+    }
+    finally {
+      await restore()
+    }
+  })
+
+  it('a RECURSIVE run re-asks descendants: a child claimed after creation fails the run', async () => {
+    const { cfg, restore } = await storageCfg(null)
+    try {
+      // Recursive over testpool/x, created while nothing is claimed; the
+      // create-side descendant read (`zfs list -r`) falls through to the
+      // command-only zfs success → empty → nothing owned → allowed.
+      const created = await create({
+        ...SCHEDULE,
+        id: 'nightly-x',
+        target: { kind: 'zfs', dataset: 'testpool/x' },
+        recursive: true,
+      })
+      assert.equal(created.statusCode, 202)
+
+      // A storage is registered on the NESTED path testpool/x/data — its
+      // subtree is PVE's, the schedule's target above it is not.
+      await writeFile(cfg, CLAIM_NESTED, 'utf8')
+      process.env.ANAS_STORAGE_CFG = cfg
+      const mock = mockOf(server)
+      mock.addFixture({
+        command: ZFS,
+        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        result: { stdout: 'testpool/x\ntestpool/x/data\ntestpool/x/data/vm-100-disk-0\n', stderr: '', exitCode: 0 },
+      })
+
+      const run = await server.inject({ method: 'POST', url: '/v1/schedules/nightly-x/run', headers: JSON_HEADERS, payload: '{}' })
+      assert.equal(run.statusCode, 202)
+      const done = await waitForJob(server, run.json().job.id)
+      assert.equal(done.status, 'failed')
+      assert.match(done.error!.message, /local-zfs/)
+      assert.match(done.error!.message, /testpool\/x\/data/)
+      assert.equal(mock.calls.some(c => c.args[0] === 'snapshot'), false)
+    }
+    finally {
+      await restore()
+    }
+  })
+
   // ==========================================================================
   //  Run notifications (story 9.4) — the per-schedule mode, one emission point
   // ==========================================================================

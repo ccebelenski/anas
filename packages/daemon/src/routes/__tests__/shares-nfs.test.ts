@@ -1,4 +1,5 @@
 import type { Job, JobAccepted, NfsExport } from '@anas/shared'
+import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -248,5 +249,89 @@ describe('nfs export routes', () => {
       })
       assert.equal(res.statusCode, 404)
     })
+  })
+})
+
+// --- pvepool.1 review fixes: the share-path backstop -----------------------
+//
+// The SAME longest-prefix resolution + ownership ask the SMB create makes:
+// an export whose path resolves onto a PVE-OWNED dataset refuses 400 with
+// the ownership reason. A path on the sibling dataset's mountpoint, or on
+// no ZFS dataset at all, is unaffected. The PUT cannot move the path (it is
+// the URL identity), so create is the one door.
+describe('NFS export path vs the PVE footprint (pvepool.1 review fixes)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let prevCfg: string | undefined
+
+  const CLAIM = 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n\n'
+  const MOUNTPOINTS = 'testpool\t/testpool\ntestpool/media\t/testpool/media\n'
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-nfs-pve-'))
+    prevCfg = process.env.ANAS_STORAGE_CFG
+    const cfg = join(dir, 'storage.cfg')
+    await writeFile(cfg, CLAIM, 'utf8')
+    process.env.ANAS_STORAGE_CFG = cfg
+    await writeFile(join(dir, 'exports'), FIXTURE, 'utf8')
+    process.env.ANAS_EXPORTS_PATH = join(dir, 'exports')
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: MOUNTPOINTS, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '/dev/sda1\text4\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/exportfs', result: { stdout: '', stderr: '', exitCode: 0 } })
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    if (prevCfg === undefined)
+      delete process.env.ANAS_STORAGE_CFG
+    else
+      process.env.ANAS_STORAGE_CFG = prevCfg
+    delete process.env.ANAS_EXPORTS_PATH
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('an export on an OWNED mountpoint is refused 400 with the ownership reason', async () => {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/shares/nfs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: '/testpool', clients: [{ spec: '192.168.1.0/24', options: ['rw', 'sync'] }] }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /'\/testpool'/)
+    assert.match(res.json().error.message, /'testpool'/)
+    assert.match(res.json().error.message, /local-zfs/)
+    assert.match(res.json().error.message, /storage root/)
+    // Nothing was appended to /etc/exports.
+    assert.ok(!(await readFile(join(dir, 'exports'), 'utf8')).includes('/testpool '))
+  })
+
+  it('an export on the SIBLING dataset\'s mountpoint passes the backstop', async () => {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/shares/nfs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: '/testpool/media', clients: [{ spec: '*', options: ['ro', 'sync'] }] }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+  })
+
+  it('an export on a NON-ZFS path is untouched by the backstop', async () => {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/shares/nfs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: '/srv/elsewhere', clients: [{ spec: '*', options: ['ro', 'sync'] }] }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
   })
 })

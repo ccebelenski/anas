@@ -2,9 +2,8 @@ import type { AhrPool, BackupArchiveConsistency, PveStorageRef, SystemPoolFacts 
 import type { CommandExecutor } from '../executor/types.js'
 import type { FindmntNode } from '../parsers/findmnt.js'
 import { isPathWithin, pveStoragePath, zvolDatasetFromPath, zvolDevicePath } from '@anas/shared'
-import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { mountIndex, normalizePath, relativeTo } from './nested-filesystems.js'
-import { ownedDescendantIn, ownershipWithFallback, readSystemPoolFacts } from './pve-footprint.js'
+import { loadPveFootprint, ownedDescendantIn, ownershipWithFallback } from './pve-footprint.js'
 
 /**
  * DERIVED per-source snapshot consistency (story backup2.3).
@@ -138,21 +137,20 @@ export async function readConsistencyFacts(
   catch {
     ahrPools = []
   }
-  // Per-source ownership needs the refs RESOLVED — a `dir` storage only maps
-  // onto its dataset with the mountpoint list — so this is one file read plus
-  // one `zfs list`, and the boot facts for the system rule. The readers are
-  // three-valued (pvepool.1 review fix 1): absent fails open, UNREADABLE comes
-  // back as null and the derivation tightens to hands-off via
-  // {@link ConsistencyFacts.storagesUnavailable}. A failed `zfs list` only
-  // disables `dir` resolution — the parser's secondary signal.
-  const mountpoints = await readZfsMountpoints()
-  const storages = await readPveStorages(opts.pveStorageCfg ?? PVE_STORAGE_CFG, mountpoints)
-  const pveStorages = storages ?? new Map<string, PveStorageRef[]>()
+  // Per-source ownership is the ONE footprint service's answer (pvepool.1
+  // review fixes): it assembles storage.cfg + the ZFS mountpoint list (with the
+  // ANAS_STORAGE_CFG env override this route honours everywhere else) + the
+  // boot facts, so the derivation judges sources exactly as the routes do —
+  // no second loader that could drift. Its three-valued posture carries over:
+  // absent storage.cfg fails open (empty refs), UNREADABLE comes back as
+  // `storagesUnavailable` and the derivation tightens to hands-off; a failed
+  // `zfs list` only disables `dir` resolution — the parser's secondary signal.
+  const pve = await loadPveFootprint(executor, { pveStorageCfg: opts.pveStorageCfg })
   // Unreadable boot facts stay `null` here — NOT `[]`: the derivation tightens
   // toward hands-off through the whole-pool fallback, exactly like the
   // footprint service does.
-  const systemFacts = await readSystemPoolFacts(executor)
-  return { mounts, ahrPools, pveStorages, storagesUnavailable: storages === null, systemFacts }
+  const systemFacts = pve.systemFactsUnavailable ? null : pve.systemFacts
+  return { mounts, ahrPools, pveStorages: pve.storagesByPool, storagesUnavailable: pve.storagesUnavailable, systemFacts }
 }
 
 /**

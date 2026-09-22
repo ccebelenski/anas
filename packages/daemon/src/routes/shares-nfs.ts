@@ -6,6 +6,7 @@ import { AbsolutePath, CreateNfsExportRequest, UpdateNfsExportRequest } from '@a
 import { addExport, hasExport, parseExports, removeExport, replaceExport } from '../parsers/exports.js'
 import { confirmGate } from '../safety/gate.js'
 import { editConfig, readConfig } from '../services/config-writer.js'
+import { loadPveFootprint } from '../services/pve-footprint.js'
 import { requireIdentity } from './identity.js'
 import { pathExists } from './shares-smb.js'
 
@@ -74,6 +75,21 @@ export async function nfsExportRoutes(
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
+
+    // Share-path backstop (pvepool.1 review fixes): a path that resolves onto
+    // a PVE-OWNED dataset is refused 400 with the ownership reason — the same
+    // longest-prefix resolution + ownership ask the SMB create makes (that
+    // module's refuseOwnedSharePath sentence). A path on a sibling dataset's
+    // mountpoint, or a non-ZFS path, resolves to nothing owned and passes.
+    // The PUT below cannot move the path (it is the URL identity, only the
+    // client list is replaced), so create is the one door to guard.
+    const pve = await loadPveFootprint(executor)
+    const exportDataset = pve.datasetOfPath(exp.path)
+    const owned = exportDataset ? pve.ownershipOf(exportDataset) : null
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Export path '${exp.path}' is on '${exportDataset}', which is PVE-owned — ${owned.reason}` } }
+    }
 
     // 409 if the path is already exported — the file is the source of truth.
     if (hasExport(await readConfig(exportsPath), exp.path)) {

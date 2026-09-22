@@ -1,4 +1,5 @@
 import type { Job, JobAccepted, SmbGlobalConfig, SmbShare, SmbShareDetail } from '@anas/shared'
+import type { MockExecutor } from '../../executor/mock.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -468,5 +469,125 @@ describe('SMB share routes', () => {
       const res = await s.inject({ method: 'DELETE', url: '/v1/shares/smb/nope', headers: IDENTITY_HEADERS })
       assert.equal(res.statusCode, 404)
     })
+  })
+})
+
+// --- pvepool.1 review fixes: the share-path backstop -----------------------
+//
+// A share's `path` resolves onto the ZFS dataset whose mountpoint hosts it
+// (longest prefix), and an OWNED dataset is no share target: the create (and
+// an edit that MOVES the path) refuse 400 with the ownership reason. A path
+// on the sibling dataset's mountpoint, or on no ZFS dataset at all, passes.
+describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string | undefined
+  let prevCfg: string | undefined
+
+  const CLAIM = 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n\n'
+  // testpool is the storage ROOT (mountpoint /testpool, owned) and
+  // testpool/media the sibling this story exists to unlock (/testpool/media).
+  const MOUNTPOINTS = 'testpool\t/testpool\ntestpool/media\t/testpool/media\n'
+
+  function startServer(conf = SAMPLE_CONF): ReturnType<typeof createServer> {
+    dir = mkdtempSync(join(tmpdir(), 'anas-smb-pve-'))
+    prevCfg = process.env.ANAS_STORAGE_CFG
+    const cfg = join(dir, 'storage.cfg')
+    writeFileSync(cfg, CLAIM, 'utf8')
+    process.env.ANAS_STORAGE_CFG = cfg
+    const confPath = join(dir, 'smb.conf')
+    writeFileSync(confPath, conf, 'utf8')
+    server = createServer({ mock: true, logger: false, smbConfPath: confPath })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    // The footprint's reads: the mountpoint table (datasetOfPath's input),
+    // the boot probe (readable, no bootfs — the system rule stays inactive),
+    // and systemctl for the smbd reload the accepted creates end with.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: MOUNTPOINTS, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '/dev/sda1\text4\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    return server
+  }
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    if (prevCfg === undefined)
+      delete process.env.ANAS_STORAGE_CFG
+    else
+      process.env.ANAS_STORAGE_CFG = prevCfg
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true })
+      dir = undefined
+    }
+  })
+
+  it('a share on an OWNED mountpoint is refused 400 with the ownership reason', async () => {
+    const s = startServer()
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'pve-root', path: '/testpool' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    // The sentence names the resolved dataset AND the owning storage.
+    assert.match(res.json().error.message, /'\/testpool'/)
+    assert.match(res.json().error.message, /'testpool'/)
+    assert.match(res.json().error.message, /local-zfs/)
+    assert.match(res.json().error.message, /storage root/)
+    // Nothing was written to smb.conf.
+    assert.ok(!readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[pve-root]'))
+  })
+
+  it('a share on the SIBLING dataset\'s mountpoint passes the backstop', async () => {
+    const s = startServer()
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'media2', path: '/testpool/media' }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[media2]'))
+  })
+
+  it('a share on a NON-ZFS path is untouched by the backstop', async () => {
+    const s = startServer()
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'scratch', path: '/srv/other' }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+  })
+
+  it('an edit that MOVES the path onto an owned mountpoint is refused; one that keeps it is not', async () => {
+    const s = startServer()
+    // The move.
+    const moved = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: '/testpool' }),
+    })
+    assert.equal(moved.statusCode, 400)
+    assert.match(moved.json().error.message, /storage root/)
+    // The untouched edit — no `path` in the body — never asks the footprint
+    // for a move and succeeds.
+    const kept = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ comment: 'still the media library' }),
+    })
+    assert.equal(kept.statusCode, 202)
+    const job = await waitForJob(s, (kept.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
   })
 })

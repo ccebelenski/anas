@@ -1,5 +1,5 @@
 import type { SmbConnection, SmbShareDetail } from '@anas/shared'
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
@@ -9,6 +9,7 @@ import { addShare, getShare, hasShare, parseSmbConf, removeShare, updateGlobal, 
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
 import { confirmGate } from '../safety/gate.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
+import { loadPveFootprint } from '../services/pve-footprint.js'
 import { requireIdentity } from './identity.js'
 
 const SMBSTATUS = '/usr/bin/smbstatus'
@@ -115,6 +116,29 @@ export async function smbShareRoutes(
     if (err instanceof ConfigConflictError)
       return new Error(`smb.conf changed on disk during the operation — retry against the current state`)
     return err instanceof Error ? err : new Error(String(err))
+  }
+
+  /**
+   * The share-path backstop (pvepool.1 review fixes): refuse a share whose
+   * `path` resolves onto a PVE-OWNED dataset. The ONE footprint service
+   * resolves the path by longest mountpoint prefix ({@link datasetOfPath}) and
+   * asks the ONE ownership answer — a storage root, a guest volume, a
+   * dir-storage tree or the boot tree is refused 400 with the reason, which
+   * names the storage AND the dataset. A path on a SIBLING dataset's
+   * mountpoint (or a subdirectory of one) is ordinary ANAS storage, and a
+   * non-ZFS path resolves to no dataset at all and passes untouched.
+   */
+  async function refuseOwnedSharePath(path: string, reply: FastifyReply): Promise<boolean> {
+    const pve = await loadPveFootprint(executor)
+    const dataset = pve.datasetOfPath(path)
+    if (!dataset)
+      return false
+    const owned = pve.ownershipOf(dataset)
+    if (!owned)
+      return false
+    reply.code(400)
+    reply.send({ error: { code: 'VALIDATION_ERROR', message: `Share path '${path}' is on '${dataset}', which is PVE-owned — ${owned.reason}` } })
+    return true
   }
 
   // --- GET /shares/smb — ALL shares (incl. admin-created, Principle 11) -----
@@ -239,6 +263,9 @@ export async function smbShareRoutes(
     if (!identity)
       return
 
+    if (await refuseOwnedSharePath(req.path, reply))
+      return reply
+
     // 409 if the share already exists — the config file is the source of truth.
     const text = await readSmbConf()
     if (hasShare(text, req.name)) {
@@ -290,6 +317,12 @@ export async function smbShareRoutes(
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `SMB share '${name}' not found` } }
     }
+
+    // The edit CAN move the path (UpdateSmbShareRequest carries an optional
+    // one) — the same backstop as create applies when it does (pvepool.1
+    // review fixes). An edit that leaves the path alone is untouched.
+    if (req.path !== undefined && await refuseOwnedSharePath(req.path, reply))
+      return reply
 
     const job = jobQueue.submit(
       'smb.config.set',

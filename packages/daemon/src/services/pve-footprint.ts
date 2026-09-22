@@ -1,7 +1,8 @@
 import type { PveOwnership, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { ZfsMountpoint } from '../parsers/pve-storage.js'
 import { pveOwnership, wouldBeClaimedByPve } from '@anas/shared'
-import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
+import { matchMountpoint, PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
 
 /**
  * PVE footprint ownership — the ONE daemon service that answers "does PVE own
@@ -14,7 +15,8 @@ import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers
  *
  *   1. `readPveStorages()` — /etc/pve/storage.cfg parsed into
  *      `poolRoot -> PveStorageRef[]`, ALWAYS with the ZFS mountpoint list so a
- *      `dir` storage's `path` resolves onto its dataset;
+ *      `dir` storage's `path` resolves onto its dataset (the same list backs
+ *      `datasetOfPath`, the share-path backstop's resolver);
  *   2. `readSystemPoolFacts()` — `zpool get -H -o name,value bootfs` per
  *      imported pool plus the dataset `findmnt` reports mounted at `/`, the
  *      boot tree the relaxation would otherwise expose.
@@ -252,6 +254,11 @@ export function ownershipFromFootprintData(
 export interface PveFootprint {
   /** `poolRoot -> PveStorageRef[]` from storage.cfg (dir refs resolved; EMPTY while unavailable). */
   storagesByPool: Map<string, PveStorageRef[]>
+  /**
+   * ZFS dataset mountpoints (empty when the read failed or found nothing) —
+   * the table {@link PveFootprint.datasetOfPath} resolves a path against.
+   */
+  zfsMountpoints: ZfsMountpoint[]
   /** Boot facts per imported pool (empty when the probe failed). */
   systemFacts: SystemPoolFacts[]
   /**
@@ -293,6 +300,14 @@ export interface PveFootprint {
    */
   claimedByPve: (dataset: string) => { storage: string } | null
   /**
+   * The ONE longest-prefix path → dataset resolver (pvepool.1 review fixes):
+   * the ZFS dataset whose mountpoint hosts `path`, or null when the path is on
+   * no ZFS dataset (a non-ZFS path — nothing here is PVE's to refuse) or the
+   * mountpoint read was unavailable. Share create/edit ask it, then
+   * {@link PveFootprint.ownershipOf} on the answer — the share-path backstop.
+   */
+  datasetOfPath: (path: string) => string | null
+  /**
    * Does this pool hold this node's boot filesystem (bootfs set or hosting /) —
    * or is it a zfspool pool whose boot facts are UNREADABLE (the whole-pool
    * fallback answers true for it too)? While the STORAGES are unreadable it is
@@ -313,12 +328,15 @@ export async function loadPveFootprint(
   executor: CommandExecutor,
   opts: { pveStorageCfg?: string } = {},
 ): Promise<PveFootprint> {
+  // The mountpoint read goes THROUGH the executor (mock-driven in tests) and
+  // feeds BOTH consumers: the `dir`-storage resolution and datasetOfPath. A
+  // null read (zfs list failed) only disables those — the parser's secondary
+  // signal — never the storage.cfg verdict itself.
+  const zfsMountpoints = await readZfsMountpoints(executor)
   const [readStorages, readFacts] = await Promise.all([
     // Explicit override, then the daemon-wide env override, then the real path
-    // — the same resolution server.ts hands the route-level consumers. A null
-    // mountpoint read (zfs list failed) only disables `dir` resolution — the
-    // parser's secondary signal — never the storage.cfg verdict itself.
-    readPveStorages(opts.pveStorageCfg ?? process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG, await readZfsMountpoints()),
+    // — the same resolution server.ts hands the route-level consumers.
+    readPveStorages(opts.pveStorageCfg ?? process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG, zfsMountpoints),
     readSystemPoolFacts(executor),
   ])
   // UNREADABLE ≠ empty (pvepool.1 review fix 1): null storages tighten every
@@ -342,11 +360,19 @@ export async function loadPveFootprint(
 
   return {
     storagesByPool,
+    zfsMountpoints: zfsMountpoints ?? [],
     systemFacts,
     systemFactsUnavailable,
     storagesUnavailable,
     ownershipOf,
     ownedDescendant: (candidates, dataset) => ownedDescendantIn(candidates, dataset, ownershipOf),
+    // The ONE path → dataset resolver (pvepool.1 review fixes): longest-prefix
+    // over the mountpoint table, one exported matcher shared with the parser.
+    // Null opens the share-path gate ONLY for a path on no known ZFS dataset —
+    // when the mountpoint read itself failed the answer is equally null, and
+    // the shares routes' sentence never fires; storage.cfg's own unreadable
+    // verdict still tightens ownershipOf for every path that DOES resolve.
+    datasetOfPath: (path: string) => matchMountpoint(path, zfsMountpoints ?? [])?.dataset ?? null,
     claimedByPve: (dataset: string) => storagesUnavailable
       ? null // nothing can be judged; the ownership refusal already blocks creation
       : wouldBeClaimedByPve(storagesByPool.get(dataset.split('/')[0]) ?? [], dataset),

@@ -281,6 +281,23 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
       return { error: { code: 'NOT_FOUND', message: `Dataset '${source}' not found` } }
     }
 
+    // pvepool.1 review fixes: `snapshotFirst` creates a NEW snapshot on the
+    // SOURCE before sending — a mutation, so an OWNED source refuses (400, the
+    // ownership reason). Sending PVE's own EXISTING snapshots (no
+    // snapshotFirst) is a read and stays allowed. This is ALSO the run-time
+    // re-check for a recurring task: the timer's runner (replicate-task.js)
+    // POSTs this same endpoint, so the guard re-asks on every run with the
+    // storage.cfg of THAT moment — a source PVE claimed after the task was
+    // written fails the timer run with the reason. The target side is
+    // re-asked on every run by guardReplicationTarget below.
+    if (snapshotFirst) {
+      const owned = (await deps.pveFootprint()).ownershipOf(source)
+      if (owned) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Snapshot-first replication would snapshot '${source}' — ${owned.reason}` } }
+      }
+    }
+
     // Stage 3: resolve where the target lives (local / peer / remote) and run
     // every target-side guard in THAT context.
     const targetFull = resolveTarget(source, poolName, target)

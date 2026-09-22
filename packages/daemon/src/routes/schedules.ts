@@ -162,6 +162,27 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
     schedule: SnapshotScheduleT,
     updateProgress: (message: string) => void,
   ): Promise<{ schedule: string, taken: string, pruned: string[], skippedHeld: string[] }> {
+    // pvepool.1 review fixes — the RUN-TIME re-check. Ownership was asked when
+    // the schedule was created/updated, but storage.cfg is LIVE: PVE can claim
+    // a dataset after the schedule exists. The timer's runner
+    // (snapshot-task.js) and a manual Run Now both converge on THIS job, so
+    // the re-check lives here, not in a route: an owned target — or, for a
+    // recursive schedule, an owned descendant — FAILS the run with the reason
+    // (the job error, and the 9.4 notification's), never a silent skip.
+    // Reads/footprint may fail closed (unreadable storage.cfg = everything
+    // owned) exactly like the create guard. An AHR target is not PVE-footprint
+    // territory.
+    if (schedule.target.kind === 'zfs') {
+      const pve = await pveFootprint()
+      const owned = pve.ownershipOf(schedule.target.dataset)
+      if (owned)
+        throw new Error(`Snapshot run refused: '${schedule.target.dataset}' is PVE-owned — ${owned.reason}`)
+      if (schedule.recursive === true) {
+        const descendant = pve.ownedDescendant(await descendantDatasetNames(schedule.target.dataset), schedule.target.dataset)
+        if (descendant)
+          throw new Error(pveRecursiveRefusalMessage('Snapshot run', schedule.target.dataset, descendant))
+      }
+    }
     const svcOpts = schedule.target.kind === 'ahr'
       ? { pool: (await resolveAhrPool(schedule.target.pool)) ?? undefined, runtimeDir: subvolRuntimeDir, updateProgress }
       : { recursive: schedule.recursive, updateProgress, runtimeDir: subvolRuntimeDir }

@@ -49,6 +49,7 @@
 import type { IscsiLunKind, IscsiOwnershipTag, PveOwnership, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
 import { isAnasIqn, ZVOL_PATH_PREFIX, zvolDatasetFromPath } from '@anas/shared'
+import { matchMountpoint } from '../parsers/pve-storage.js'
 import { ownershipWithFallback } from './pve-footprint.js'
 
 /** Trailing slashes, stripped before any path comparison. */
@@ -143,26 +144,9 @@ export function ownershipFromInputs(inputs: OwnershipInputs, dataset: string): P
 /** Ask {@link ownershipFromInputs} from inside this module. */
 const ownershipOf = ownershipFromInputs
 
-/**
- * Resolve an absolute path onto the ZFS dataset that hosts it. When datasets
- * nest, the LONGEST matching mountpoint wins — the same most-specific rule
- * `pve-storage.ts` uses for a PVE `dir` storage.
- */
-function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): ZfsMountpoint | null {
-  const target = stripTrailingSlash(path)
-  let best: ZfsMountpoint | null = null
-  let bestLen = -1
-  for (const mp of mountpoints) {
-    if (!mp.mountpoint)
-      continue
-    const canonical = stripTrailingSlash(mp.mountpoint)
-    if (isUnder(target, canonical) && canonical.length > bestLen) {
-      best = mp
-      bestLen = canonical.length
-    }
-  }
-  return best
-}
+// matchMountpoint is IMPORTED (parsers/pve-storage.ts) — the ONE longest-prefix
+// path → dataset resolver, shared with the dir-storage parser and the footprint
+// service's datasetOfPath; this file used to carry a private copy.
 
 /**
  * Classify a LUN's backing path.
