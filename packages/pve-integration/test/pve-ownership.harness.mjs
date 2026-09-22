@@ -80,10 +80,13 @@ const SKEW_REASON = id =>
 
 const POOL_NE = { name: 'rpool', pveStorages: [NESTED] }
 const KINDS = {
-  'storage-root': { kind: 'storage-root', storage: 'local-zfs', reason: 'PVE storage \'local-zfs\' owns rpool/data as a storage root' },
-  'guest-volume': { kind: 'guest-volume', storage: 'local-zfs', reason: 'PVE storage \'local-zfs\' owns rpool/data/vm-100-disk-0 as a guest volume' },
-  'dir-storage': { kind: 'dir-storage', storage: 'local', reason: 'PVE storage \'local\' owns tank/iso as directory storage' },
-  'system': { kind: 'system', reason: 'rpool/ROOT/pve-1 is the boot filesystem of pool rpool' },
+  'storage-root': { kind: 'storage-root', storage: 'local-zfs', reason: 'PVE storage \'local-zfs\' owns rpool/data as a storage root', childrenManageable: true },
+  'guest-volume': { kind: 'guest-volume', storage: 'local-zfs', reason: 'PVE storage \'local-zfs\' owns rpool/data/vm-100-disk-0 as a guest volume', childrenManageable: false },
+  'dir-storage': { kind: 'dir-storage', storage: 'local', reason: 'PVE storage \'local\' owns tank/iso as directory storage', childrenManageable: false },
+  'system': { kind: 'system', reason: 'rpool/ROOT/pve-1 is the boot filesystem of pool rpool', childrenManageable: false },
+  // storage.cfg unreadable — every dataset on every pool is stamped with it;
+  // the reason names storage.cfg. No storage id (the config could not be read).
+  'config-unreadable': { kind: 'config-unreadable', reason: "could not read /etc/pve/storage.cfg — treating every dataset as PVE territory", childrenManageable: false },
 }
 
 for (const [kind, verdict] of Object.entries(KINDS)) {
@@ -135,22 +138,26 @@ ok('per-node verdict beats the pool field (owned + perNode false)',
 
 // No gfx in this sandbox → the plain .anas-gfx-badge span fallback, carrying
 // the kind label and the reason as its title.
-function badgeCheck(kind, o) {
+function badgeCheck(kind, o, label) {
   const b = ANAS.pve.badge(o)
-  const label =
-    kind === 'storage-root' ? 'PVE storage root: local-zfs'
-      : kind === 'guest-volume' ? 'PVE guest volume (local-zfs)'
-        : kind === 'dir-storage' ? 'PVE storage (local-zfs)'
-          : 'System pool: boot filesystem'
   ok(`badge(${kind}): label present`, b.html.includes(label), b.html)
   ok(`badge(${kind}): uses the shared badge class`, b.html.includes('anas-gfx-badge'), b.html)
   eq(`badge(${kind}): tip is the reason`, b.tip, o.reason)
   return b
 }
-badgeCheck('storage-root', { kind: 'storage-root', storage: 'local-zfs', reason: 'R-root' })
-badgeCheck('guest-volume', { kind: 'guest-volume', storage: 'local-zfs', reason: 'R-guest' })
-badgeCheck('dir-storage', { kind: 'dir-storage', storage: 'local-zfs', reason: 'R-dir' })
-badgeCheck('system', { kind: 'system', reason: 'R-sys' })
+badgeCheck('storage-root', { kind: 'storage-root', storage: 'local-zfs', reason: 'R-root' }, 'PVE storage root: local-zfs')
+badgeCheck('guest-volume', { kind: 'guest-volume', storage: 'local-zfs', reason: 'R-guest' }, 'PVE guest volume (local-zfs)')
+badgeCheck('dir-storage', { kind: 'dir-storage', storage: 'local-zfs', reason: 'R-dir' }, 'PVE storage (local-zfs)')
+badgeCheck('system', { kind: 'system', reason: 'R-sys' }, 'System pool: boot filesystem')
+// pvepool.2 review: storage.cfg unreadable — hands-off, named in the label.
+badgeCheck('config-unreadable',
+  { kind: 'config-unreadable', reason: 'could not read /etc/pve/storage.cfg' },
+  'PVE config unreadable — hands-off')
+// Forward compatibility: a kind this UI has never seen still reads as
+// hands-off — never a crash, never a row that looks manageable.
+badgeCheck('unknown', { kind: 'paravirtual-2077', storage: 'who-knows', reason: 'R-future' }, 'PVE — hands-off')
+// `system` keeps its label even with a storage id present.
+badgeCheck('system+storage', { kind: 'system', storage: 'local-zfs', reason: 'R-sys2' }, 'System pool: boot filesystem')
 
 // The title carries the reason, HTML-escaped (the reason has apostrophes, not
 // angle brackets — but a `<` in a reason must be escaped so it cannot inject).
@@ -240,6 +247,21 @@ ok('record: no pve + perNode true ⇒ not owned',
 // wouldBeClaimed reads the pool via .get too.
 eq('record: wouldBeClaimed reads a record pool',
   ANAS.pve.wouldBeClaimed('rpool/data', 'vm-100-disk-0', pveRec), { storage: 'local-zfs' })
+
+// ---- 6. storagesOf — the ONE copy of the pveStorages shape rule -------------
+//
+// 30-pools (pveStoragesOf) and 60-datasets (poolPveStorages) each used to
+// carry this rule; the dedupe lives here. It must read records AND raw
+// objects the same way, and answer [] for every malformed shape.
+
+eq('storagesOf: a record pool returns its storages', ANAS.pve.storagesOf(pveRec), [NESTED])
+eq('storagesOf: a raw pool returns its storages', ANAS.pve.storagesOf(POOL_NE), [NESTED])
+eq('storagesOf: an ANAS pool is []', ANAS.pve.storagesOf(nasRec), [])
+eq('storagesOf: absent field is []', ANAS.pve.storagesOf({ name: 'tank' }), [])
+eq('storagesOf: null is []', ANAS.pve.storagesOf(null), [])
+eq('storagesOf: undefined is []', ANAS.pve.storagesOf(undefined), [])
+eq('storagesOf: a non-array is []', ANAS.pve.storagesOf({ name: 'tank', pveStorages: 'local-zfs' }), [])
+eq('storagesOf: an empty array is []', ANAS.pve.storagesOf({ name: 'tank', pveStorages: [] }), [])
 
 // ---- Report -----------------------------------------------------------------
 

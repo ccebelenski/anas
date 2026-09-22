@@ -534,7 +534,18 @@
                 var rels = [];
                 for (var i = 0; i < list.length; i++) {
                     var ds = list[i] || {};
-                    if (ANAS.pve.isOwned(ds, poolSummary, perNode)) {
+                    var owned;
+                    try {
+                        owned = ANAS.pve.isOwned(ds, poolSummary, perNode);
+                    } catch (eRow) {
+                        // A throw in the helper would REJECT this promise
+                        // silently (no catch further down the chain). Degrade
+                        // the one row to the whole-pool rule — the tightening
+                        // answer (skew direction) — and keep looping.
+                        owned = !perNode
+                            && ANAS.pve.storagesOf(poolSummary).length > 0;
+                    }
+                    if (owned) {
                         if (ds.name === pool) {
                             rootOwned = true; // the root row is PVE's
                         }
@@ -559,7 +570,18 @@
             },
             function (err) {
                 ANAS.warn('replication datasets load failed for ' + pool + ': ' + ANAS.errText(err));
-                return rootOpt;
+                // A PVE pool offers NOTHING on failure: its root is owned
+                // (a `pve` verdict on the summary, or pveStorages on any
+                // daemon), so surfacing "(pool root)" would hand the operator
+                // a target the daemon refuses. Tighten on failure, never loosen.
+                var rootOwned = false;
+                try {
+                    rootOwned = ANAS.pve.isOwned(poolSummary, poolSummary, false);
+                } catch (eFail) {
+                    // a malformed summary cannot be classified — the old
+                    // behaviour (offer the root) stands; the daemon refuses
+                }
+                return rootOwned ? [] : rootOpt;
             }
         );
     }

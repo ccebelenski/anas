@@ -557,8 +557,8 @@
         return rec ? rec[name] : undefined;
     }
 
-    // The pool's PVE storages as a plain array (never null). Mirrors
-    // 30-pools.js's pveStoragesOf: non-array / malformed ⇒ [].
+    // The pool's PVE storages as a plain array (never null). Non-array /
+    // malformed ⇒ []. Exported as ANAS.pve.storagesOf — the ONE copy.
     function pveStoragesList(pool) {
         try {
             var v = pveField(pool, 'pveStorages');
@@ -573,7 +573,9 @@
 
     // The per-kind badge label drawn beside a dataset name (the Datasets
     // tree). Raw (un-encoded) — the badge renderer encodes it. `<id>` is the
-    // owning storage id; `system` carries no storage id.
+    // owning storage id; `system` carries no storage id. Unknown kinds (a
+    // daemon newer than this UI) still read as hands-off — forward
+    // compatibility, never a crash and never a row that looks manageable.
     function pveKindLabel(o) {
         var s = (o && o.storage) ? o.storage : '';
         switch (o && o.kind) {
@@ -585,8 +587,12 @@
                 return ANAS.t('PVE storage') + ' (' + s + ')';
             case 'system':
                 return ANAS.t('System pool') + ': ' + ANAS.t('boot filesystem');
+            case 'config-unreadable':
+                // storage.cfg could not be read — the daemon stamps EVERY
+                // dataset on EVERY pool with it; the reason names storage.cfg.
+                return ANAS.t('PVE config unreadable — hands-off');
             default:
-                return ANAS.t('PVE');
+                return ANAS.t('PVE — hands-off');
         }
     }
 
@@ -633,6 +639,15 @@
         // isOwned(node, pool, perNodeAvailable) → boolean convenience.
         isOwned: function (node, pool, perNodeAvailable) {
             return !!ANAS.pve.ownership(node, pool, perNodeAvailable);
+        },
+
+        // storagesOf(pool) → the pool's PVE storages as a plain array (never
+        // null; non-array / malformed ⇒ []). The ONE copy — 30-pools and
+        // 60-datasets each used to carry their own (pveStoragesOf /
+        // poolPveStorages), and identical field-shape rules in two places
+        // drift.
+        storagesOf: function (pool) {
+            return pveStoragesList(pool);
         },
 
         // badge(ownership) → { html, tip } for a dataset's PVE badge. `html`

@@ -3158,10 +3158,16 @@
             var i;
             for (i = 0; i < pools.length; i++) {
                 var p = pools[i] || {};
-                // pvepool.2: PVE pools are candidates too — collectFromPool
-                // keeps out only the rows PVE owns (the shared ANAS.pve
-                // predicate), and the daemon's named refusal is the backstop.
-                anasPools.push({ name: p.name, label: p.name });
+                // pvepool.2: PVE pools are candidates for the ZVOL and image
+                // pickers — collectFromPool keeps out only the rows PVE owns
+                // (the shared ANAS.pve predicate), and the daemon's named
+                // refusal is the backstop. The NEW-LUN pool picker is a
+                // different door: it creates a volume at the pool ROOT, so the
+                // pool is a candidate only when that root may take a child
+                // (newLunPoolAllowed).
+                if (newLunPoolAllowed(p)) {
+                    anasPools.push({ name: p.name, label: p.name });
+                }
                 pending++;
                 collectFromPool(node, win, p, zvols, dirs, function () {
                     pending--;
@@ -3202,6 +3208,25 @@
         });
     }
 
+    // The new-LUN restore door creates its volume at the pool ROOT — the pool
+    // is a candidate only when that root may take a child: unowned, or the
+    // root's own `childrenManageable` answer (the daemon's `pve` verdict,
+    // stamped on the pool summary; the root row carries the same one). The
+    // fallback, for a verdict that predates the field: unowned or a storage
+    // root. Under skew — no `pve` anywhere, pveStorages non-empty — the
+    // whole-pool rule withholds the pool: skew may only ever tighten, never
+    // loosen.
+    function newLunPoolAllowed(pool) {
+        var pve = pool && pool.pve;
+        if (pve && typeof pve === 'object') {
+            if (typeof pve.childrenManageable === 'boolean') {
+                return pve.childrenManageable === true;
+            }
+            return pve.kind === 'storage-root';
+        }
+        return ANAS.pve.storagesOf(pool).length === 0;
+    }
+
     // The dataset read behind both pickers, one pool at a time. `pool` is the
     // pool SUMMARY (its pveStorages feed the skew fallback when the daemon
     // stamped no per-node field). Rows PVE owns — any kind, the shared
@@ -3230,7 +3255,17 @@
             }
             for (var i = 0; i < list.length; i++) {
                 var d = list[i] || {};
-                if (ANAS.pve.isOwned(d, pool, perNode)) {
+                var owned;
+                try {
+                    owned = ANAS.pve.isOwned(d, pool, perNode);
+                } catch (eRow) {
+                    // A throw in the helper would REJECT this promise silently
+                    // (no catch further down the chain). Degrade the one row to
+                    // the whole-pool rule — the tightening answer (skew
+                    // direction) — and keep looping.
+                    owned = !perNode && ANAS.pve.storagesOf(pool).length > 0;
+                }
+                if (owned) {
                     continue; // owned by PVE — never a candidate
                 }
                 if (d.type === 'volume') {

@@ -370,33 +370,17 @@
     // ONE client-side helper (ANAS.pve.ownership, 10-api.js) decides from the
     // daemon's `pve` field. `perNodeAvailable` is "this payload carries the `pve`
     // key on any node": when it is false (an old daemon), the helper falls back
-    // to the whole-pool rule — skew may only tighten, never loosen.
-    //
-    // Fail-safe when the helper itself is absent (cannot happen in the bundle —
-    // 10-api.js concatenates first — but a harness or partial load must not
-    // throw): keep the pre-U1 whole-pool rule, which only ever gates MORE.
+    // to the whole-pool rule ITSELF (the same sentence, the same fields) —
+    // skew may only tighten, never loosen. No local copy of that rule: the
+    // helper is the single source of truth.
     function ownershipOf(node, poolRec, perNodeAvailable) {
         try {
             if (ANAS.pve && typeof ANAS.pve.ownership === 'function') {
                 return ANAS.pve.ownership(node, poolRec, perNodeAvailable);
             }
         } catch (e) {
-            // helper threw on a malformed row — fall through to the old rule
-        }
-        try {
-            var ps = poolRec && poolRec.pveStorages;
-            if (ps && ps.length) {
-                var first = ps[0] || {};
-                var id = first.storage || first.dataset || '';
-                return {
-                    kind: 'storage-root',
-                    storage: id,
-                    reason: "PVE storage '" + id + "' manages pool '"
-                        + ((poolRec && poolRec.name) || '') + "'",
-                };
-            }
-        } catch (e2) {
-            // malformed pool record — ANAS-managed (fail-open, never block)
+            // helper threw on a malformed row — the row is treated as
+            // ANAS-manageable (fail-open); the daemon's refusal is the backstop
         }
         return null;
     }
@@ -410,6 +394,40 @@
         } catch (e) {
             return null;
         }
+    }
+
+    // pvepool.2 review: MAY a child be created on `rec`? The gate is keyed on
+    // the TARGET PARENT's verdict, not the selected row's kind — the daemon
+    // answers the question itself with `childrenManageable` on the `pve`
+    // field (it is the same object pveOwnership returns when the daemon
+    // stamped it).
+    //   unowned row                       → true
+    //   owned, childrenManageable === true → true (a storage root, a system
+    //                                           pool root)
+    //   owned, childrenManageable === false→ false (guest volumes, dir
+    //                                           storage, ROOT subtrees,
+    //                                           config-unreadable)
+    //   owned, childrenManageable ABSENT   → the daemon stamps `pve` but
+    //   (mid-skew, predates the field)      predates the answer: only a
+    //                                        storage root may take children.
+    //   owned with pvePerNode === false     → the whole-pool SKEW rule — the
+    //                                        verdict is the client's fallback,
+    //                                        and every row of the pool gates.
+    function createChildAllowed(rec) {
+        if (!rec) {
+            return true;
+        }
+        var own = recPveOwnership(rec);
+        if (!own) {
+            return true;
+        }
+        if (rec.get('pvePerNode') === false) {
+            return false;
+        }
+        if (typeof own.childrenManageable === 'boolean') {
+            return own.childrenManageable === true;
+        }
+        return own.kind === 'storage-root';
     }
 
     function buildPoolNode(pool, datasets) {
@@ -496,8 +514,14 @@
             node.expanded = false;
             // Force the expander even when the dataset has no child datasets:
             // ExtJS would otherwise hide it for a loaded, childless, non-leaf
-            // node, leaving no way to trigger the lazy snapshot load.
-            node.expandable = true;
+            // node, leaving no way to trigger the lazy snapshot load. Owned
+            // rows are the exception (pvepool.2 review): they never lazy-load
+            // snapshots (itemexpand skips them), so a childless owned row gets
+            // no dead expander — one WITH child datasets still expands to show
+            // them (the children ride the payload, not the snapshot load).
+            if (!node.pveOwnership) {
+                node.expandable = true;
+            }
             if (!node.children) {
                 node.children = [];
             }
@@ -562,20 +586,6 @@
         }
     }
 
-    // The pool's PVE storages as a plain array (never null). Same shape rule as
-    // 10-api.js's pveStoragesList / 30-pools.js's pveStoragesOf.
-    function poolPveStorages(poolRec) {
-        try {
-            var v = poolRec && poolRec.pveStorages;
-            if (v && Object.prototype.toString.call(v) === '[object Array]' && v.length) {
-                return v;
-            }
-        } catch (e) {
-            // malformed field — treat as none
-        }
-        return [];
-    }
-
     function loadTree(tree, node) {
         if (!tree || tree.destroyed || tree.destroying) {
             return;
@@ -636,6 +646,39 @@
                 } catch (eVbd) {
                     // non-fatal — the dialog degrades to "(ZFS default)"
                 }
+                // pvepool.2 review: a reload must not collapse the operator's
+                // view. Capture the expanded rows + the selected row BEFORE
+                // the atomic rebuild; restore them after (both success and
+                // failure reloads end here — every job site reloads both ways).
+                var expandedNames = [];
+                var selectedName = null;
+                try {
+                    var prevRoot = tree.getRootNode();
+                    if (prevRoot && typeof prevRoot.cascadeBy === 'function') {
+                        prevRoot.cascadeBy(function (n) {
+                            var fn = null;
+                            var exp = false;
+                            try {
+                                fn = n.get('fullName') || n.get('name');
+                                exp = (typeof n.isExpanded === 'function')
+                                    ? n.isExpanded() : !!n.expanded;
+                            } catch (eCap) {
+                                // an unreadable node is skipped
+                                fn = null;
+                            }
+                            if (fn && exp) {
+                                expandedNames.push(fn);
+                            }
+                        });
+                    }
+                    var prevSel = selectedRecord(tree);
+                    if (prevSel) {
+                        selectedName = prevSel.get('fullName') || prevSel.get('name');
+                    }
+                } catch (eCapAll) {
+                    expandedNames = [];
+                    selectedName = null;
+                }
                 try {
                     // Replace the whole root atomically. Incrementally mutating
                     // an already-rendered root (removeAll + appendChild) can leave
@@ -648,30 +691,64 @@
                 } catch (e2) {
                     ANAS.warn('dataset tree build failed: ' + ANAS.errText(e2));
                 }
-                // pvepool.2 (U1): a create job names the dataset it just made
-                // (tree.anasSelectOnLoad) — once the rebuilt tree is in, the NEW
-                // node is selected so the next click acts on what was built.
-                // Cleared on use, so Reload and other loads never hijack the
-                // selection.
+                // Restore what the operator had open. A create job names the
+                // dataset it just made (tree.anasSelectOnLoad) — once the
+                // rebuilt tree is in, the NEW node is selected so the next
+                // click acts on what was built (pvepool.2, U1), its ancestors
+                // expanded so it is visible. Cleared on use, so Reload and
+                // other loads never hijack the selection. Any other reload
+                // restores the PREVIOUS selection when its node survived.
                 try {
                     var want = tree.anasSelectOnLoad;
                     if (want) {
                         tree.anasSelectOnLoad = null;
-                        // want is always '<pool>/<path>' — the full ZFS name of
-                        // the dataset the create job just made.
-                        var newNode = findDatasetNode(
-                            tree, want.substring(0, want.indexOf('/')), want);
-                        if (newNode) {
-                            if (typeof tree.setSelection === 'function') {
-                                tree.setSelection(newNode);
-                            } else if (tree.getSelectionModel
-                                && typeof tree.getSelectionModel().select === 'function') {
-                                tree.getSelectionModel().select(newNode);
+                    }
+                    var byFull = {};
+                    var newRoot = tree.getRootNode();
+                    if (newRoot && typeof newRoot.cascadeBy === 'function') {
+                        newRoot.cascadeBy(function (n) {
+                            try {
+                                var fn = n.get('fullName');
+                                if (fn) {
+                                    byFull[fn] = n;
+                                }
+                            } catch (eMap) {
+                                // skip an unreadable node
+                            }
+                        });
+                    }
+                    var toExpand = expandedNames;
+                    if (want) {
+                        // the new node's ancestors — a selected row must be
+                        // visible, so its chain expands too
+                        var segs = want.split('/');
+                        var acc = '';
+                        for (var a = 0; a < segs.length - 1; a++) {
+                            acc = acc ? acc + '/' + segs[a] : segs[a];
+                            toExpand = toExpand.concat([acc]);
+                        }
+                    }
+                    for (var eRe = 0; eRe < toExpand.length; eRe++) {
+                        var en = byFull[toExpand[eRe]];
+                        if (en && typeof en.expand === 'function') {
+                            try {
+                                en.expand();
+                            } catch (eExp) {
+                                // one unexpandable row never blocks the rest
                             }
                         }
                     }
+                    var pick = want ? byFull[want] : (selectedName ? byFull[selectedName] : null);
+                    if (pick) {
+                        if (typeof tree.setSelection === 'function') {
+                            tree.setSelection(pick);
+                        } else if (tree.getSelectionModel
+                            && typeof tree.getSelectionModel().select === 'function') {
+                            tree.getSelectionModel().select(pick);
+                        }
+                    }
                 } catch (eSel) {
-                    // selection is a convenience — never break the reload
+                    // expansion + selection are a convenience — never break the reload
                 }
                 updateButtons(tree);
                 try {
@@ -794,8 +871,11 @@
         // reason travels with the button as its tooltip, so a disabled control
         // still explains itself (never a dead grey button with no story).
         var vol = isVolume(rec);
-        var pveRoot = pve && own.kind === 'storage-root' && rec.get('pvePerNode') !== false;
-        setDisabled(tree, 'dsCreate', pve && !pveRoot);
+        // pvepool.2 review: Create is keyed on the target PARENT's own answer
+        // (childrenManageable on the daemon's `pve` verdict), not on the row's
+        // kind — a system pool root takes children, a guest volume does not,
+        // and the whole-pool skew rule gates every row of the pool.
+        setDisabled(tree, 'dsCreate', !createChildAllowed(rec));
         setDisabled(tree, 'dsDetail', !dsOrRoot);
         setDisabled(tree, 'dsEdit', !dsOrRoot || pve || vol);
         setDisabled(tree, 'dsPerms', !fs || pve);
@@ -885,21 +965,28 @@
     }
 
     // All the "why is this greyed" reasons for the current selection, in one
-    // place so they can never disagree about precedence. Owned rows (pvepool.2,
-    // U1) carry the ownership reason — the same sentence the daemon refuses
-    // with, naming the storage and the dataset. It overrides the volume excuse
-    // (a PVE guest volume is hands-off first, "it's a zvol" second) and yields
-    // to the LUN-held reason on Destroy (that one carries instructions for
-    // undoing the hold). Clearing on every call keeps a reason from lingering
-    // when the selection moves to a row with a different story.
+    // place so they can never disagree about precedence. Owned rows (pvepool.2)
+    // carry the ownership reason — the same sentence the daemon refuses with,
+    // naming the storage and the dataset — on EVERY action the ownership
+    // disables (Edit / Permissions / Share / Resize / Destroy / Create /
+    // Create Snapshot): a greyed control with no tooltip reads as a bug. The
+    // reason overrides the volume excuse (a PVE guest volume is hands-off
+    // first, "it's a zvol" second) and yields to the LUN-held reason on
+    // Destroy (that one carries instructions for undoing the hold). Clearing
+    // on every call keeps a reason from lingering when the selection moves to
+    // a row with a different story.
     function applySelectionTips(tree, rec, own, vol, held, snapHeld) {
         try {
             var reason = (own && own.reason) || '';
             for (var id in VOLUME_TIPS) {
                 if (Object.prototype.hasOwnProperty.call(VOLUME_TIPS, id)) {
-                    setTip(tree, id, (!own && vol) ? t(VOLUME_TIPS[id]) : '');
+                    setTip(tree, id, own ? reason : (vol ? t(VOLUME_TIPS[id]) : ''));
                 }
             }
+            // Create is disabled only by ownership, and only on a parent that
+            // may not take children — an owned row where Create is ON (a
+            // children-manageable root) gets no excuse on an enabled button.
+            setTip(tree, 'dsCreate', own && !createChildAllowed(rec) ? reason : '');
             // Resize is the volume-only action: on any other row, say so.
             setTip(tree, 'dsResize',
                 reason || (vol
@@ -1087,15 +1174,13 @@
     // ---- Create Dataset (story 4.5) ----------------------------------------
 
     function openCreate(node, tree, rec) {
-        // pvepool.2 (U1): create is refused on an OWNED row — EXCEPT a real
-        // daemon-stamped storage root, whose children outside PVE's footprint
-        // are ANAS's to make (the live name guard below keeps PVE's
-        // guest-volume namespace clean). The whole-pool SKEW fallback also
-        // reads 'storage-root', but with pvePerNode false it gates Create
-        // like every other row. Soft gate — the affordance stays visible,
-        // the mutation is refused.
+        // pvepool.2 review: create is refused on a row that may NOT take
+        // children — the gate is the target parent's own `childrenManageable`
+        // answer (createChildAllowed), not the row's kind. Soft gate — the
+        // affordance stays visible, the mutation is refused, the toast names
+        // the owner.
         var own = recPveOwnership(rec);
-        if (own && (own.kind !== 'storage-root' || rec.get('pvePerNode') === false)) {
+        if (own && !createChildAllowed(rec)) {
             ANAS.toast(own.reason);
             return;
         }
@@ -1177,9 +1262,11 @@
                         {
                             // pvepool.2 (U1): INFORMATIONAL, not a warning —
                             // creating on a PVE pool is supported. Shown when
-                            // the picked pool carries PVE storages (blue, the
-                            // anasSparseNote idiom), naming the storage(s) whose
-                            // free-space figure ANAS's usage eats into.
+                            // the picked pool carries PVE storages. Blue with
+                            // an info icon — a note the operator reads, not
+                            // the grey anasSparseNote idiom (a volume-sizing
+                            // caveat); names the storage(s) whose free-space
+                            // figure ANAS's usage eats into.
                             xtype: 'component',
                             itemId: 'anasPvePoolNote',
                             cls: 'anas-fld-pve-pool-note',
@@ -1495,7 +1582,7 @@
                 return;
             }
             var poolRec = poolSummaryOf(tree, win.down('#pool').getValue());
-            var storages = poolPveStorages(poolRec);
+            var storages = ANAS.pve.storagesOf(poolRec);
             if (!storages.length) {
                 note.setHidden(true);
                 return;
@@ -1518,8 +1605,44 @@
         }
     }
 
-    // Run the naming guard over the current input: mark the field, show the
-    // sentence, and hold the Create button while the name would be claimed.
+    // pvepool.2 review: the dialog's PARENT gate. Resolve the node the new
+    // dataset would be created ON (the picked pool + the typed path's parent,
+    // via the same findDatasetNode the post-create selection uses) and answer
+    // the same question the toolbar does: may that parent take children?
+    // Returns { reason } when the answer is no, null when it is yes — or when
+    // the path is not yet a valid shape / the parent is not in the tree
+    // (fail-open: the daemon's refusal is the backstop). Under the whole-pool
+    // skew rule every parent on a PVE pool is gated, so the pool is refused
+    // as a target for any path.
+    function createParentGate(win, tree) {
+        try {
+            var info = createNameInfo(win);
+            if (!info) {
+                return null;
+            }
+            var poolName = win.down('#pool').getValue();
+            var parent = findDatasetNode(tree, poolName, info.parentFull);
+            if (!parent) {
+                return null;
+            }
+            if (createChildAllowed(parent)) {
+                return null;
+            }
+            var own = recPveOwnership(parent);
+            return {
+                reason: (own && own.reason)
+                    || t('This dataset is PVE-managed — its children cannot be created here.'),
+            };
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Run the PVE guards over the current input: the naming guard (the typed
+    // name) marks the field and shows the sentence; the parent gate (the
+    // picked parent's verdict) shows the ownership reason. Either one holds
+    // the Create button; only the naming guard marks the field invalid (the
+    // name is what is wrong there — the parent gate is structural).
     function syncCreateNameGuard(win, tree) {
         try {
             var field = win.down('#path');
@@ -1553,6 +1676,17 @@
                 }
             } catch (eClear) {
                 // nothing to clear
+            }
+            var gate = createParentGate(win, tree);
+            if (gate && gate.reason) {
+                if (guard) {
+                    guard.setHtml(enc(gate.reason));
+                    guard.setHidden(false);
+                }
+                if (submit) {
+                    submit.setDisabled(true);
+                }
+                return;
             }
             if (guard) {
                 guard.setHidden(true);

@@ -1947,12 +1947,14 @@ function findNode(tree, fullName) {
 
 // A NEW-daemon payload: owned rows carry the per-node `pve` verdict
 // (PveOwnership), the sibling `pvepool/media` carries none. The storage is a
-// BARE pool ref (no dataset) so the storage root IS the pool root.
+// BARE pool ref (no dataset) so the storage root IS the pool root. The
+// verdicts carry `childrenManageable` — the daemon's own answer to "may a
+// child be created here" (true for the storage root, false for the guest).
 const PVE2_DATASETS = [
   {
     name: 'pvepool', pool: 'pvepool', type: 'filesystem', used: 1, available: 1, referenced: 1,
     mountpoint: '/pvepool', compression: 'on', compressratio: 1, quota: 0,
-    pve: { kind: 'storage-root', storage: 'local-zfs', reason: "PVE storage 'local-zfs' owns pvepool as a storage root" },
+    pve: { kind: 'storage-root', storage: 'local-zfs', reason: "PVE storage 'local-zfs' owns pvepool as a storage root", childrenManageable: true },
   },
   {
     name: 'pvepool/media', pool: 'pvepool', type: 'filesystem', used: 1, available: 1, referenced: 1,
@@ -1962,7 +1964,7 @@ const PVE2_DATASETS = [
     name: 'pvepool/vm-100-disk-0', pool: 'pvepool', type: 'volume', used: GiB, available: 1, referenced: 1,
     mountpoint: null, compression: 'on', compressratio: 1, quota: 0,
     volsize: GiB, volblocksize: 8192, sparse: true,
-    pve: { kind: 'guest-volume', storage: 'local-zfs', reason: "PVE storage 'local-zfs' owns pvepool/vm-100-disk-0 as a guest volume" },
+    pve: { kind: 'guest-volume', storage: 'local-zfs', reason: "PVE storage 'local-zfs' owns pvepool/vm-100-disk-0 as a guest volume", childrenManageable: false },
   },
 ]
 
@@ -2501,7 +2503,14 @@ const ISCSI_POOL_ROUTES = {
     { name: 'tank', size: 8 * GiB_, pveStorages: [] },
     // pvepool.2: a PVE pool is a candidate too — the pickers omit only the
     // datasets PVE OWNS (the rows the daemon stamps `pve`), never the pool.
-    { name: 'pvepool', size: 8 * GiB_, pveStorages: [{ storage: 'local-zfs', type: 'zfspool' }] },
+    // pvepool.2 review: a new daemon stamps the pool ROOT's verdict on the
+    // summary (`pve`) — the new-LUN picker reads its childrenManageable from
+    // there (true for a storage root: a new zvol at the root is ANAS's to
+    // make, the naming guard keeps PVE's namespace clean).
+    {
+      name: 'pvepool', size: 8 * GiB_, pveStorages: [{ storage: 'local-zfs', type: 'zfspool' }],
+      pve: { kind: 'storage-root', storage: 'local-zfs', childrenManageable: true, reason: 'PVE storage local-zfs owns pvepool as a storage root' },
+    },
   ] },
   'GET /pools/tank/datasets': { data: [
     { name: 'tank', type: 'filesystem', mountpoint: '/tank' },
@@ -3241,6 +3250,13 @@ async function iscsiLunChecks() {
 
 const ISCSI_SKEW_ROUTES = {
   ...ISCSI_ROUTES,
+  // Old daemon: no per-node `pve` on the dataset rows AND no `pve` on the
+  // pool summary — only pveStorages. The whole-pool rule stands everywhere,
+  // the new-LUN picker included (skew tightens, never loosens).
+  'GET /pools': { data: [
+    { name: 'tank', size: 8 * GiB_, pveStorages: [] },
+    { name: 'pvepool', size: 8 * GiB_, pveStorages: [{ storage: 'local-zfs', type: 'zfspool' }] },
+  ] },
   'GET /pools/pvepool/datasets': { data: [
     { name: 'pvepool', type: 'filesystem', mountpoint: '/pvepool' },
     { name: 'pvepool/vm-100-disk-0', type: 'volume', volsize: GiB_ },

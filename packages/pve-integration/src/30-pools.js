@@ -483,32 +483,28 @@
         }
     }
 
-    // The pool's PVE storages as a plain array (never null). Accepts an ExtJS
-    // record or a raw object. Non-array / malformed ⇒ [] (ANAS-managed).
-    function pveStoragesOf(rec) {
-        try {
-            var v = (rec && typeof rec.get === 'function')
-                ? rec.get('pveStorages')
-                : (rec && rec.pveStorages);
-            return (isArray(v) && v.length) ? v : [];
-        } catch (e) {
-            return [];
-        }
-    }
-
+    // A pool is PVE-managed iff its ROOT is owned: a `pve` verdict on the
+    // summary (new daemons stamp the root's ownership — storage root, system
+    // pool, config unreadable, dir storage on the root) OR a non-empty
+    // `pveStorages` (any daemon). The ONE helper (ANAS.pve) answers both: with
+    // perNodeAvailable false it reads the row's `pve` first, then the
+    // whole-pool rule.
     function isPveManaged(rec) {
-        // pvepool.2 (U0): the ONE client-side ownership helper (ANAS.pve) is
-        // the source of truth. A POOL row carries no per-node `pve` field, so
-        // perNodeAvailable is false and the whole-pool rule applies: non-empty
-        // pveStorages ⇒ PVE's (skew direction: this only tightens the gate).
         try {
             if (ANAS.pve && typeof ANAS.pve.isOwned === 'function') {
                 return ANAS.pve.isOwned(rec, rec, false);
             }
         } catch (e) {
-            // helper unavailable or a malformed row — degrade to the pre-U0 rule
+            // helper unavailable or a malformed row — degrade to the raw rule
         }
-        return pveStoragesOf(rec).length > 0;
+        var pve = (rec && typeof rec.get === 'function')
+            ? rec.get('pve') : (rec && rec.pve);
+        if (pve && typeof pve === 'object') {
+            return true;
+        }
+        var ps = (rec && typeof rec.get === 'function')
+            ? rec.get('pveStorages') : (rec && rec.pveStorages);
+        return !!(isArray(ps) && ps.length);
     }
 
     // Tooltip like "PVE storage: datapool (images, rootdir)". Joins multiple
@@ -528,38 +524,57 @@
         }
     }
 
-    // Name column: the pool name, plus a standout "PVE" badge for PVE-managed
-    // pools (test hook: anas-pool-pve-badge; tooltip names storages + content).
-    // ANAS-managed pools show the plain name. Fully fail-open — any throw or a
-    // missing gfx foundation degrades to just the encoded name.
+    // Name column: the pool name, plus a standout badge for a pool whose ROOT
+    // is owned (test hook: anas-pool-pve-badge). A new daemon stamps the root's
+    // verdict on the summary (`pve`) — the badge is the shared kind badge
+    // (ANAS.pve.badge), so system pools, config-unreadable pools and a dir
+    // storage on the pool root are visible here, not just "PVE". An older
+    // daemon sends no `pve`: the badge is the storages' "PVE" tag. Either way
+    // the tooltip says datasets outside PVE's footprint are manageable —
+    // except config-unreadable, which names no footprint at all. ANAS-managed
+    // pools show the plain name. Fully fail-open — any throw or a missing gfx
+    // foundation degrades to just the encoded name.
     function renderPoolName(value, meta, record) {
         var name = encHtml(value);
         try {
-            var storages = pveStoragesOf(record);
+            var manageable = ' '
+                + ANAS.t('Datasets outside PVE\'s footprint are manageable in Datasets.');
+            var rootPve = null;
+            try {
+                rootPve = (record && typeof record.get === 'function')
+                    ? record.get('pve') : (record && record.pve);
+            } catch (ePve) {
+                rootPve = null;
+            }
+            if (rootPve && typeof rootPve === 'object'
+                && ANAS.pve && typeof ANAS.pve.badge === 'function') {
+                var b = ANAS.pve.badge(rootPve);
+                var tip = b.tip + (rootPve.kind === 'config-unreadable' ? '' : manageable);
+                return name + ' <span class="anas-pool-pve-badge" title="'
+                    + encHtml(tip) + '">' + b.html + '</span>';
+            }
+            var storages = (ANAS.pve && typeof ANAS.pve.storagesOf === 'function')
+                ? ANAS.pve.storagesOf(record) : [];
             if (!storages.length) {
                 return name;
             }
-            // pvepool.2: the pool stays hands-off as a whole (ruled), but the
-            // datasets OUTSIDE PVE's footprint are manageable — point the
-            // operator at the Datasets screen where per-dataset ownership shows.
-            var tip = pveTooltip(storages) + ' '
-                + ANAS.t('Datasets outside PVE\'s footprint are manageable in Datasets.');
+            var tip2 = pveTooltip(storages) + manageable;
             var badge = '';
             try {
                 var gfx = ANAS.gfx;
                 if (gfx && typeof gfx.badge === 'function') {
-                    badge = gfx.badge('PVE', { title: tip }) || '';
+                    badge = gfx.badge('PVE', { title: tip2 }) || '';
                 }
             } catch (eB) {
                 badge = '';
             }
             if (!badge) {
                 // gfx unavailable — a plain inline tag still conveys PVE + tip.
-                badge = '<span class="anas-gfx-badge" title="' + encHtml(tip)
+                badge = '<span class="anas-gfx-badge" title="' + encHtml(tip2)
                     + '">PVE</span>';
             }
             return name + ' <span class="anas-pool-pve-badge" title="'
-                + encHtml(tip) + '">' + badge + '</span>';
+                + encHtml(tip2) + '">' + badge + '</span>';
         } catch (e) {
             return name;
         }
@@ -911,6 +926,11 @@
                 // story 3.25: PVE-managed classification. Auto field keeps the
                 // array verbatim; empty/absent ⇒ ANAS-managed (see isPveManaged).
                 'pveStorages',
+                // pvepool.2 review: the pool ROOT's ownership verdict, stamped
+                // by a new daemon (PveOwnership, incl. childrenManageable).
+                // Auto field — absent on older daemons leaves get() undefined
+                // and the pveStorages rule stands (version skew).
+                { name: 'pve', type: 'auto' },
                 // story iscsi.6: the holding iSCSI LUN, when one is serving
                 // something on this pool. AUTO field — absent on old daemons
                 // leaves get() undefined and nothing is gated (version skew).
