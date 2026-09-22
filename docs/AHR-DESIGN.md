@@ -498,3 +498,64 @@ unmounted after each op — nothing new stays mounted):
 - **Follow-ups inked, not built here:** Epic 16 snapshot-consistent backup for
   AHR sources (snapshot → back up `@snapshots/<x>` → delete, exactly the ZFS
   treatment); Epic 17 scheduled snapshots + scrubs gain AHR targets.
+
+## 13. Read cache — lvmcache writethrough (designed 2026-09-21, GitHub #63)
+
+**Shape.** The pool VG already carries the concatenation layer, so the cache sits
+where LVM expects it: one GPT slice per cache disk (by-id convention as for band
+slices) → `pvcreate` → `vgextend <pool>` → `lvcreate -n <pool>-cache` (linear
+across all cache slices — a writethrough cache is never the only copy, so it
+needs no redundancy) → `lvconvert --type cache --cachevol <pool>-cache
+--cachemode writethrough <pool>/<pool>-vol`. Policy `smq` (kernel default;
+sequential I/O bypasses). The pool LV keeps its name and mapper path, so
+mounts, shares, LUNs and the fstab line are untouched. Detach = `lvconvert
+--uncache` (drops the cache volume) → `vgreduce` → `pvremove` → wipe the slice.
+**Writeback and `--type writecache` are not exposed** (EPICS §2 ruling).
+
+**Steps** join the §5.1 executor as detect-then-delta kinds: `cache-attach`
+(partition → pv-create → vg-extend → lv-create → lv-convert) and `cache-detach`
+(uncache → vg-reduce → pv-remove → wipe). Attach/detach are jobs on an existing
+pool; the create composer does not offer a cache.
+
+**Ground truth (2026-09-21, stunt node, lvm2 2.03.31-2+pmx1, loop devices):**
+- `lvextend` on the cached origin succeeds while mounted (`vol_corig` grows,
+  the cache LV reports the new size) and `btrfs filesystem resize max` follows —
+  the §5.1 expansion pipeline needs no split/reattach around a cache.
+- `lvs --reportformat json` exposes `cache_mode`, `cache_policy`,
+  `cache_total_blocks`, `cache_used_blocks`, `cache_read_hits/misses`,
+  `cache_write_hits/misses`, `cache_dirty_blocks`; hidden sub-LVs appear as
+  `[<pool>-vol_corig]` / `[<cache>_cvol]` under `lvs -a`. Structured — no parsing.
+- **Cache PV missing at activation: refused** (`Refusing activation of partial
+  LV`) in normal AND `--activationmode degraded`; `partial` fails on the missing
+  cache metadata. Recovery = `lvconvert --uncache <pool>/<pool>-vol` (works with
+  the device absent, no `--force`) → `vgreduce --removemissing <pool>` →
+  `vgchange -ay` → data reads back intact. Dirty blocks are zero by construction
+  in writethrough, so this is safe to run unattended.
+
+**Boot rung (ahr-boot-scan):** cache PV missing → run the recovery above → pool
+mounts uncached → notification + dashboard `ahr` warning "cache device missing,
+pool running uncached". Parallel to an md array assembled degraded-but-running.
+
+**Topology:** a PV in the pool VG that is not an md array is classified `cache`
+(today every PV is expected to be `/dev/md/<pool>-r<band>`); the cache disk is
+in-use with role `cache` and excluded by `isComposableDisk()` from composer,
+spare and expand candidates; destroy adds the cache slice to the wipe list.
+Verify the 11.15 telemetry sampler's dm-name resolution once the pool LV is a
+`cache` target (dm-0 is then the cache device, the origin is a hidden LV).
+
+**Pool detail `cache` block:** devices (by-id), size, mode (always
+writethrough), hits/misses, used/total blocks, dirty blocks (should read 0 —
+non-zero is a bug), and SSD wear where the drive reports it: NVMe
+`percentage_used` from smartctl JSON is standard; SATA wear attributes are
+vendor-specific — shown only when the attribute is present, never inferred
+(firmware permutation bar). Advisory states two facts once: hotspot cache
+(repeated random reads benefit, sequential I/O bypasses), and the SSD is a
+consumable (cached blocks are rewritten as the working set rotates).
+
+**Open before dispatch:** (a) the cache SSD failing while the pool is LIVE —
+dm-cache does not bypass a failing cache device; expect I/O errors on the pool
+until uncached; ground-truth with dm-flakey/dm-error and decide whether the
+daemon uncaches on detection or surfaces a one-click repair; (b) whether a
+cache slice must be published/verified like a band slice (issue #12 pattern —
+the cache disk is otherwise idle, so `BLKRRPART` should succeed, verify).
+
