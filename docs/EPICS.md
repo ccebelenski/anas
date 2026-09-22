@@ -87,6 +87,7 @@ One line each. These are decisions, not history; the rationale is in `EPICS-HIST
 - Destination `readonly=on` by default; `recv -F` behind the confirm gate; a FULL send is announced with its size; **`zfs hold` on the incremental base**; the newest common snapshot IS the durable record. `zfs allow` delegation is a noted follow-on, not faked.
 
 ### Shares & identities *(Epics 6/7/8)*
+- **A share on a PVE directory-storage path (e.g. `/var/lib/vz`) is allowed — caveat emptor** (ruled 2026-09-22). Shares are a path (§5a); the user typed it, ANAS never places anything there by default, and mounts/restore keep refusing storage.cfg paths. Shares on a PVE-OWNED ZFS dataset (storage root, guest volume, dir storage on a dataset) ARE refused — that is the footprint rule, not this one.
 - Surgical config editing with comments/order preserved and byte-identical round-trips; `reload smbd` / `exportfs -ra` are side effects of mutations, never separate calls; an SMB interface-binding change is confirm-gated when clients are connected.
 - Identities resolve via **`getent`/nsswitch, never `/etc/passwd`** (the Epic 14 seam). ANAS-created users are nologin share users (`useradd -M -s nologin`), never PVE users; `user.cfg` is never written. **User delete is OUT** — disable is the primitive (UID recycling / orphaned ACLs); unresolved owners are flagged, not hidden.
 
