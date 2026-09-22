@@ -661,6 +661,8 @@ Users/groups are read **only** via `getent`/nsswitch (source-agnostic — local,
 - reads: `/etc/rtslib-fb-target/saveconfig.json`, configfs (`acls/<iqn>/info` for sessions, `CLAIMED`/`udev_path` for the busy diagnosis)
 - `systemctl restart rtslib-fb-targetctl` never issued by ANAS (a restore over a degraded state persists the hole); enable/disable via `targetcli`
 
+**AHR-backed LUN images stay copy-on-write (ruled 2026-09-11).** `createSparseImage` is open+truncate and stays so — no `chattr +C`, no `nodatacow`, no per-LUN toggle. The btrfs data checksum is the whole reason an AHR image is a better block object than a raw LV: it keeps the image inside scrub attribution and self-heal, and snapshots (every backup run, every schedule) defeat NOCOW anyway (first write after a snapshot is CoW-once, so the file fragments regardless while losing its checksums). Guidance is placement, not a flag — the add-LUN dialog's AHR branch says so: random-write block workloads belong on a zvol; an image on spinning AHR expects fragmentation, and a later defragment unshares snapshot extents.
+
 ### Backup restore operations (proxmox-backup-client — backup2 epic)
 
 - nested-filesystem detection (backup2.2): `timeout <s> find -P <path> -xdev -maxdepth N -type d -printf '%D\t%p\n'` (our own machine format — no structured tool walks `st_dev`), `findmnt --json`, `btrfs subvolume show <path>`; the backup call gains `--include-dev <path>` per included boundary — **`includeNested: all` is resolved at run time into per-archive `--include-dev` paths; `--all-file-systems` is never emitted** (it is per-invocation and would spill onto sibling archives)
