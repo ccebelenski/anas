@@ -66,6 +66,9 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
     const mock = mockOf(server)
     mock.clearFixtures()
     mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: { stdout: zpoolListJson(['testpool']), stderr: '', exitCode: 0 } })
+    // The boot probe (pvepool.1) is readable on the node this file models —
+    // testpool has no bootfs, so the system rule stays inactive.
+    mock.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
     // systemctl (daemon-reload/enable/disable/show) + zfs (list/snapshot/destroy):
     // command-only success. zfs list -t snapshot returns empty → prune no-ops.
     mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })

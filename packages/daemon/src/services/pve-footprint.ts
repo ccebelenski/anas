@@ -23,10 +23,12 @@ import { PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers
  * replication, iSCSI, backup) loads ONE footprint per request and asks it —
  * there is no second copy of the pool-level "is this PVE's?" helper anywhere
  * in the daemon (the four `isPveManagedPool` copies this replaces were the
- * single-source-of-truth lesson repeating itself). Both reads FAIL OPEN: an
- * unreadable storage.cfg yields no storages and a failed boot probe yields no
- * system facts, which derives to "outside PVE's footprint" — the same posture
- * GET /pools has always had off-PVE.
+ * single-source-of-truth lesson repeating itself). The storage.cfg read fails
+ * OPEN: an unreadable file yields no storages, the same posture GET /pools has
+ * always had off-PVE. The boot probe may only TIGHTEN: when it fails, the
+ * facts are UNREADABLE (not "no system pool"), and a pool that hosts a zfspool
+ * storage falls back to the pre-pvepool.1 whole-pool rule — PVE's whole pool,
+ * hands-off — instead of answering manageable.
  */
 
 const ZPOOL = '/usr/sbin/zpool'
@@ -102,16 +104,18 @@ export function buildSystemPoolFacts(
 }
 
 /**
- * Read the boot facts for every imported pool, FAIL-OPEN: on any error the
- * answer is `[]` (no pool is system-owned — the per-dataset relaxation then
- * applies unchecked) and the failure is logged ONCE per process, not once per
- * request — a system pool whose facts went dark must not flood journald, and
- * the destroy route's `isRootPool` name/proc-mounts block is still there
- * behind it for the common shapes.
+ * Read the boot facts for every imported pool. On any error the answer is
+ * `null` — NOT `[]`: `[]` means "read them, no system pool" while `null` means
+ * UNREADABLE, and the caller tightens toward hands-off accordingly (see
+ * {@link loadPveFootprint}) — a missing fact may never loosen the gate. The
+ * failure is logged ONCE per process, not once per request — a system pool
+ * whose facts went dark must not flood journald, and the destroy route's
+ * `isRootPool` name/proc-mounts block is still there behind it for the common
+ * shapes.
  */
 let systemFactsWarned = false
 
-export async function readSystemPoolFacts(exec: CommandExecutor): Promise<SystemPoolFacts[]> {
+export async function readSystemPoolFacts(exec: CommandExecutor): Promise<SystemPoolFacts[] | null> {
   try {
     const [bootfsResult, findmntResult] = await Promise.all([
       exec.exec(ZPOOL, ['get', '-H', '-o', 'name,value', 'bootfs']),
@@ -128,9 +132,9 @@ export async function readSystemPoolFacts(exec: CommandExecutor): Promise<System
     if (!systemFactsWarned) {
       systemFactsWarned = true
       console.warn('anasd: could not read system-pool boot facts (zpool get bootfs / findmnt /); '
-        + 'system-pool protection is inactive this process lifetime:', err)
+        + 'pools hosting a zfspool storage are treated as PVE whole pools this process lifetime:', err)
     }
-    return []
+    return null
   }
 }
 
@@ -155,8 +159,15 @@ export function ownershipFromFootprintData(
 export interface PveFootprint {
   /** `poolRoot -> PveStorageRef[]` from storage.cfg (dir refs resolved). */
   storagesByPool: Map<string, PveStorageRef[]>
-  /** Boot facts per imported pool (empty when the probe failed — fail-open). */
+  /** Boot facts per imported pool (empty when the probe failed). */
   systemFacts: SystemPoolFacts[]
+  /**
+   * True when the boot probe FAILED — the facts are UNREADABLE, as opposed to
+   * read and finding no system pool. Missing facts may only tighten: while
+   * this is true, a pool that hosts a zfspool storage is answered by the
+   * pre-pvepool.1 whole-pool rule instead of the per-dataset footprint.
+   */
+  systemFactsUnavailable: boolean
   /**
    * PVE's ownership claim on one full dataset name, or null when it is
    * outside PVE's footprint and ANAS may manage it. Pool-level PVE refusals
@@ -168,7 +179,11 @@ export interface PveFootprint {
    * inventory the dataset as a guest disk on its next scan.
    */
   claimedByPve: (dataset: string) => { storage: string } | null
-  /** Does this pool hold this node's boot filesystem (bootfs set or hosting /)? */
+  /**
+   * Does this pool hold this node's boot filesystem (bootfs set or hosting /) —
+   * or is it a zfspool pool whose boot facts are UNREADABLE (the whole-pool
+   * fallback answers true for it too)?
+   */
   isSystemPool: (pool: string) => boolean
   /** The pool's boot facts when it is a system pool, else null. */
   systemPoolFacts: (pool: string) => SystemPoolFacts | null
@@ -184,24 +199,50 @@ export async function loadPveFootprint(
   executor: CommandExecutor,
   opts: { pveStorageCfg?: string } = {},
 ): Promise<PveFootprint> {
-  const [storagesByPool, systemFacts] = await Promise.all([
+  const [storagesByPool, readFacts] = await Promise.all([
     // Explicit override, then the daemon-wide env override, then the real path
     // — the same resolution server.ts hands the route-level consumers.
     readPveStorages(opts.pveStorageCfg ?? process.env.ANAS_STORAGE_CFG ?? PVE_STORAGE_CFG, await readZfsMountpoints()),
     readSystemPoolFacts(executor),
   ])
+  const systemFactsUnavailable = readFacts === null
+  const systemFacts = readFacts ?? []
 
   const factsFor = (pool: string): SystemPoolFacts | null =>
     systemFacts.find(f => f.pool === pool) ?? null
 
+  // The pre-pvepool.1 whole-pool rule: a pool that hosts ANY zfspool storage
+  // is PVE's whole pool. Used ONLY as the fallback for unreadable boot facts
+  // — missing facts may tighten a hands-off gate, never loosen one.
+  const hasZfspoolRef = (pool: string): boolean =>
+    (storagesByPool.get(pool) ?? []).some(ref => ref.type === 'zfspool')
+
   return {
     storagesByPool,
     systemFacts,
-    ownershipOf: (dataset: string) => ownershipFromFootprintData(storagesByPool, systemFacts, dataset),
+    systemFactsUnavailable,
+    ownershipOf: (dataset: string) => {
+      const owned = ownershipFromFootprintData(storagesByPool, systemFacts, dataset)
+      if (owned !== null)
+        return owned
+      // Facts UNREADABLE, not "no system pool": what the per-dataset rules
+      // call manageable on a pool PVE inventories is answered with the
+      // whole-pool rule — hands-off.
+      const poolRoot = dataset.split('/')[0]
+      if (systemFactsUnavailable && hasZfspoolRef(poolRoot)) {
+        return {
+          kind: 'system',
+          reason: `boot facts unavailable (zpool get bootfs failed) — pool '${poolRoot}' is treated as PVE's whole pool until the daemon can read them`,
+        }
+      }
+      return null
+    },
     claimedByPve: (dataset: string) => wouldBeClaimedByPve(storagesByPool.get(dataset.split('/')[0]) ?? [], dataset),
     isSystemPool: (pool: string) => {
       const f = factsFor(pool)
-      return f !== null && (f.bootfs !== undefined || f.rootDataset !== undefined)
+      if (f !== null && (f.bootfs !== undefined || f.rootDataset !== undefined))
+        return true
+      return systemFactsUnavailable && hasZfspoolRef(pool)
     },
     systemPoolFacts: factsFor,
   }
@@ -224,7 +265,16 @@ export function pveNamingGuardMessage(storage: string, name: string): string {
  * mount. Stated once; pools.ts quotes it at all three doors.
  */
 export function systemPoolRefusal(pool: string, facts: SystemPoolFacts | null): { reason: 'system-pool', message: string } {
-  const boot = facts?.bootfs ?? facts?.rootDataset ?? pool
+  if (facts === null) {
+    // Reachable since the unreadable-facts fallback: the pool hosts a PVE
+    // zfspool storage but the boot facts could not be read — refuse on that,
+    // without claiming a boot filesystem no one could verify.
+    return {
+      reason: 'system-pool',
+      message: `Pool '${pool}' is treated as a system pool (boot facts unreadable; it hosts a PVE zfspool storage) — ANAS never destroys, exports or remounts a system pool`,
+    }
+  }
+  const boot = facts.bootfs ?? facts.rootDataset ?? pool
   return {
     reason: 'system-pool',
     message: `Pool '${pool}' holds this node's boot filesystem (${boot}) — ANAS never destroys, exports or remounts a system pool`,

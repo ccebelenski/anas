@@ -352,7 +352,7 @@ export async function readIscsiContext(
   const pveStorages = await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints)
   // Boot facts for the system rule of the footprint predicate — fail-open to []
   // when the probe fails (pvepool.1).
-  const systemFacts = await readSystemPoolFacts(executor)
+  const systemFacts = (await readSystemPoolFacts(executor)) ?? []
 
   const inputs: OwnershipInputs = { pveStorages, zfsMountpoints, systemFacts }
   const backingPaths = collectBackingPaths(live, persisted)

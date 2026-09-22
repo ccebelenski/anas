@@ -141,7 +141,9 @@ export async function readConsistencyFacts(
   catch {
     pveStorages = new Map()
   }
-  const systemFacts = await readSystemPoolFacts(executor)
+  // Unreadable boot facts (null) keep this path's fail-open posture — the
+  // per-source derivation has no whole-pool fallback.
+  const systemFacts = (await readSystemPoolFacts(executor)) ?? []
   return { mounts, ahrPools, pveStorages, systemFacts }
 }
 
