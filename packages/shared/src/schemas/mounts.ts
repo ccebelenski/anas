@@ -146,6 +146,15 @@ export const MountTestVerdict = z.enum([
   'auth-failed',
   'not-found',
   'protocol-mismatch',
+  /**
+   * The server or share is MALFORMED (additive, 0.4.x bug fix): the kernel
+   * refused the devname before any connection was tried (`mount error(22)` /
+   * EINVAL, "CIFS: VFS: Malformed UNC in devname" — e.g. an empty share).
+   * It is a typing problem, not a network problem: an older daemon never
+   * sends it, so the UI renders an unknown verdict without claiming
+   * "no route".
+   */
+  'invalid',
 ])
 export type MountTestVerdict = z.infer<typeof MountTestVerdict>
 

@@ -2,6 +2,14 @@
 
 export const VERSION = '0.3.3'
 
+// Mount target normalisation (Epic 18): the pure server/share normaliser the
+// daemon (buildSpec, create/test routes) and the UI port both build from,
+// plus its result type.
+export {
+  normalizeMountTarget,
+} from './mount-target.js'
+export type { MountTarget } from './mount-target.js'
+
 // PVE footprint ownership (story pvepool.1 — GitHub #61): the shared pure
 // predicate every consumer asks, plus PVE's own guest-volume regex
 // (ZFSPoolPlugin.pm) and the storage-path helper.

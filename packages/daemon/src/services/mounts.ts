@@ -21,7 +21,7 @@ import { chmod, mkdir, mkdtemp, readFile, rename, rm, rmdir, writeFile } from 'n
 import { createConnection } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { MountCifsSec, MountNfsSec } from '@anas/shared'
+import { MountCifsSec, MountNfsSec, normalizeMountTarget } from '@anas/shared'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
 import { getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
@@ -52,6 +52,8 @@ const STALE_RE = /stale file handle/i
 const WHITESPACE_RE = /\s+/
 /** `mount error(N)` errno extractor (mount.cifs). */
 const MOUNT_ERRNO_RE = /mount error\((\d+)\)/
+/** Kernel "malformed UNC" marker (a malformed server/share devname). */
+const MALFORMED_UNC_RE = /malformed unc/i
 /** Leading slashes on a mountpoint (creds-filename derivation). */
 const LEADING_SLASHES_RE = /^\/+/
 /** Path separators (creds-filename derivation). */
@@ -445,10 +447,20 @@ export function mapNfsFailure(stderr: string): MountTestVerdict {
   return 'unreachable'
 }
 
-/** Map `mount.cifs` `mount error(N)` errno (all failures exit 32) to a verdict. */
+/**
+ * Map `mount.cifs` `mount error(N)` errno (all failures exit 32) to a verdict.
+ *
+ * `mount error(22)` (EINVAL) is the kernel's "CIFS: VFS: Malformed UNC in
+ * devname" — a bad SERVER or SHARE string, decided before any connection was
+ * attempted. It must come back `invalid`, never `unreachable`: the old table
+ * folded it into the default case, so an empty share read as "no route to the
+ * server" and sent the operator hunting the network for a typo.
+ */
 export function mapCifsFailure(stderr: string): MountTestVerdict {
   const m = MOUNT_ERRNO_RE.exec(stderr)
   const errno = m ? Number.parseInt(m[1], 10) : Number.NaN
+  if (errno === 22 || MALFORMED_UNC_RE.test(stderr))
+    return 'invalid' // EINVAL — malformed UNC (empty share, stray slashes, …)
   switch (errno) {
     case 13: return 'auth-failed' // cannot distinguish bad user from bad password
     case 2: return 'not-found'
@@ -486,11 +498,19 @@ export function fstypeForType(type: MountType): string {
   return type === 'nfs' ? 'nfs4' : 'cifs'
 }
 
-/** Build the fs_spec for a create/test request. */
+/**
+ * Build the fs_spec for a create/test request — ALWAYS from the normalised
+ * target (the shared `normalizeMountTarget`), so whatever the operator typed
+ * (`//10.0.0.212`, `10.0.0.212/`, `/pictures`, `smb://host/share`) lands in
+ * fstab as the canonical `//host/share` / `host:/export`. The routes refuse a
+ * target with `problems` (an empty CIFS share) BEFORE this is reached; a
+ * problem-free target normalises to exactly the parts the spec is built from.
+ */
 export function buildSpec(type: MountType, req: { server?: string, remotePath?: string }): string {
+  const { server, remotePath } = normalizeMountTarget(type, req)
   if (type === 'nfs')
-    return `${req.server ?? ''}:${req.remotePath ?? '/'}`
-  return `//${req.server ?? ''}/${req.remotePath ?? ''}`
+    return `${server}:${remotePath}`
+  return `//${server}/${remotePath}`
 }
 
 /** Leading path separators on a CIFS spec (`//` or `\\`, mixed). */
@@ -502,8 +522,9 @@ const CIFS_SEP_RE = /[/\\]+/
  * Reverse of `buildSpec` (single source of truth for the spec<->parts mapping):
  * split an fstab fs_spec / findmnt source back into `{ server, remotePath }` so
  * the edit dialog can round-trip an existing entry. The exact inverse of the
- * write-side device builder; `parseSpec(kind, buildSpec(type, { server, remotePath }))`
- * recovers the original parts across cifs / nfs / ipv6.
+ * write-side device builder: `parseSpec(kind, buildSpec(type, { server, remotePath }))`
+ * recovers the parts for any input — for a dirty one the NORMALISED parts
+ * (buildSpec normalises first), for a clean one the original parts.
  *
  * NOTE: the UI's `fstabDevice` (67-mounts.js) is a client-side PREVIEW mirror of
  * `buildSpec` — the daemon owns the authoritative mapping in both directions;
@@ -895,24 +916,44 @@ export async function removeEmptyMountpointDir(
 // ============================================================================
 
 /**
+ * The network stages of the preflight test, as a seam (see `MountTestStages`):
+ * a test host has no share server on 2049/445, so without an override the
+ * mount stage — and its verdict mapping — can never be reached from a test.
+ */
+export interface MountTestStages {
+  /** DNS resolvable? Defaults to the real `node:dns` lookup. */
+  resolves?: (host: string) => Promise<boolean>
+  /** TCP connect within 3s? Defaults to the real `node:net` connect. */
+  tcpReachable?: (host: string, port: number) => Promise<boolean>
+}
+
+/**
  * Diagnose a remote mount before commit: DNS → TCP(2049/445) → short-lived
  * `timeout`-guarded probe mount into a private temp dir → a distinct verdict
  * (NOTES §6). Never blocks longer than the guards; never leaves a probe mounted;
  * the secret goes via a temp 0600 creds file, never argv.
+ *
+ * The target is normalised BEFORE the first stage (the shared normaliser): a
+ * dirty typed host (`//10.0.0.212`) is resolved and probed as the clean one,
+ * so a failure detail quotes what the spec actually carries. Targets with
+ * `problems` (an empty CIFS share) are refused by the routes as a 400 with the
+ * guiding sentence — they never reach a stage here.
  */
 export async function runMountTest(
   executor: CommandExecutor,
   req: MountTestRequest,
+  stages: MountTestStages = {},
 ): Promise<MountTestResult> {
   const port = req.type === 'nfs' ? PORT_NFS : PORT_CIFS
+  const { server } = normalizeMountTarget(req.type, req)
 
-  const dnsResolved = await resolves(req.server)
+  const dnsResolved = await (stages.resolves ?? resolves)(server)
   if (!dnsResolved)
-    return { verdict: 'unreachable', stage: 'dns', dnsResolved: false, portReachable: false, detail: `Could not resolve host '${req.server}'` }
+    return { verdict: 'unreachable', stage: 'dns', dnsResolved: false, portReachable: false, detail: `Could not resolve host '${server}'` }
 
-  const portReachable = await tcpReachable(req.server, port)
+  const portReachable = await (stages.tcpReachable ?? tcpReachable)(server, port)
   if (!portReachable)
-    return { verdict: 'unreachable', stage: 'tcp', dnsResolved: true, portReachable: false, detail: `No answer on ${req.server}:${port}` }
+    return { verdict: 'unreachable', stage: 'tcp', dnsResolved: true, portReachable: false, detail: `No answer on ${server}:${port}` }
 
   const { verdict, detail } = await probeMountAttempt(executor, req)
   // `stderr` stays daemon-side: the wire result carries the curated detail only.
@@ -994,10 +1035,20 @@ async function probeMountSpec(executor: CommandExecutor, probe: ProbeMountSpec):
   }
 }
 
-/** The CIFS probe's `-o` list: the version, plus the creds file when there is one. */
+/**
+ * The CIFS probe's `-o` list: the version, and either the creds file (an auth
+ * probe) or `guest` (a no-credentials probe). Without one of the two,
+ * `mount.cifs` PROMPTS for a password on stdin ("Password for root@//host/
+ * share:") — a probe with no terminal then hangs until the timeout and reports
+ * "unreachable" for what is really "no credentials supplied". `guest` makes
+ * the request anonymous instead: an auth-requiring share answers EACCES, which
+ * maps to the `auth-failed` verdict with its advice.
+ */
 function cifsProbeOptions(probe: ProbeMountSpec): string {
   const opts = `vers=${probe.vers ?? '3.1.1'}`
-  return probe.credentialsFile ? `${opts},credentials=${probe.credentialsFile}` : opts
+  if (probe.credentialsFile)
+    return `${opts},credentials=${probe.credentialsFile}`
+  return `${opts},guest`
 }
 
 /**
@@ -1025,6 +1076,8 @@ async function probeMountAttempt(executor: CommandExecutor, req: MountTestReques
 function verdictDetail(type: 'nfs' | 'cifs', verdict: MountTestVerdict, stderr: string): string {
   if (type === 'cifs' && verdict === 'auth-failed')
     return `Authentication failed — ${CIFS_AUTH_ADVICE}.`
+  if (verdict === 'invalid')
+    return 'The server or share is malformed — server is a host or address, share is the share\'s name.'
   return stderr || verdict
 }
 

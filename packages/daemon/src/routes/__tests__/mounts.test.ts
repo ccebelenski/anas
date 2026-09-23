@@ -1,5 +1,6 @@
 import type { Job, MountDetail, MountSummary } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
+import type { MountTestStages } from '../../services/mounts.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -179,6 +180,48 @@ describe('mount routes (Epic 18)', () => {
     it('requires credentials for CIFS', async () => {
       const res = await server!.inject({ method: 'POST', url: '/v1/mounts', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1', remotePath: 'share', mountpoint: join(dir, 'c') }) })
       assert.equal(res.statusCode, 400)
+    })
+
+    it('normalises the typed target: //host + /share land in fstab as //host/share', async () => {
+      const mountpoint = join(dir, 'normmnt')
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({
+          type: 'cifs',
+          server: '//127.0.0.1',
+          remotePath: '/pictures',
+          mountpoint,
+          persistent: true,
+          credentials: { username: 'smbuser', password: 's3cret' },
+        }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(mountpoint))!
+      // The canonical spec — never the typed `//127.0.0.1` + `/pictures` join.
+      assert.ok(line.startsWith('//127.0.0.1/pictures'), line)
+    })
+
+    it('refuses an empty CIFS share with the guiding 400, before any job', async () => {
+      const res = await server!.inject({
+        method: 'POST',
+        url: '/v1/mounts',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({
+          type: 'cifs',
+          server: '127.0.0.1/',
+          remotePath: '',
+          mountpoint: join(dir, 'noshare'),
+          credentials: { username: 'smbuser', password: 's3cret' },
+        }),
+      })
+      assert.equal(res.statusCode, 400)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'VALIDATION_ERROR')
+      assert.match(error.message, /share name is required/)
     })
   })
 
@@ -666,6 +709,32 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(data.stage, 'dns')
       assert.equal(data.dnsResolved, false)
     })
+
+    it('a dirty typed host is normalised BEFORE the DNS stage (the detail quotes the clean host)', async () => {
+      // The reproduced failure said "Could not resolve host '//10.0.0.212'".
+      const res = await server!.inject({ method: 'POST', url: '/v1/mounts/test', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ type: 'cifs', server: '//no-such-host.invalid', remotePath: 'share' }) })
+      assert.equal(res.statusCode, 200)
+      const { data } = res.json() as { data: { verdict: string, stage: string, detail?: string } }
+      assert.equal(data.verdict, 'unreachable')
+      assert.equal(data.stage, 'dns')
+      assert.equal(data.detail, `Could not resolve host 'no-such-host.invalid'`)
+    })
+
+    it('refuses an empty CIFS share with the guiding 400, before any stage runs', async () => {
+      const res = await server!.inject({ method: 'POST', url: '/v1/mounts/test', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1/', remotePath: '' }) })
+      assert.equal(res.statusCode, 400)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'VALIDATION_ERROR')
+      assert.match(error.message, /share name is required/)
+    })
+
+    it('refuses an unusable server (only slashes) with the guiding 400', async () => {
+      const res = await server!.inject({ method: 'POST', url: '/v1/mounts/test', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ type: 'cifs', server: '///', remotePath: 'share' }) })
+      assert.equal(res.statusCode, 400)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'VALIDATION_ERROR')
+      assert.match(error.message, /server is required/)
+    })
   })
 })
 
@@ -784,11 +853,13 @@ interface EditHarness {
 /**
  * A mounts app over a private executor. `mountTables` is the SEQUENCE of
  * `findmnt --json` answers (the last repeats) — that is how a test scripts the
- * kernel mount table under the job.
+ * kernel mount table under the job. `mountTestStages` is the /test network
+ * seam (DNS/TCP overrides) — a test host has no share server on 2049/445.
  */
 async function createEditServer(
   fstab: (credsDir: string) => string,
   mountTables: string[],
+  mountTestStages?: MountTestStages,
 ): Promise<EditHarness> {
   const dir = await mkdtemp(join(tmpdir(), 'anas-mount-edit-'))
   const fstabPath = join(dir, 'fstab')
@@ -812,6 +883,7 @@ async function createEditServer(
     fstabPath,
     credsDir,
     storagePath: join(dir, 'no-storage.cfg'),
+    ...(mountTestStages !== undefined ? { mountTestStages } : {}),
   })
   return { app, executor, dir, fstabPath, credsDir }
 }
@@ -820,6 +892,89 @@ async function createEditServer(
 function called(executor: MockExecutor, command: string, args: string[]): boolean {
   return executor.calls.some(c => c.command === command && c.args.length === args.length && c.args.every((a, i) => a === args[i]))
 }
+
+// ============================================================================
+// POST /v1/mounts/test — the MOUNT stage (the TEST SEAM: a test host has no
+// share server on 445, so DNS/TCP are overridden; the mount-stage verdict
+// mapping is what the reproduced bug misreported — EINVAL as "unreachable")
+// ============================================================================
+
+describe('mount routes — POST /v1/mounts/test reaches the mount stage (seam)', () => {
+  let h: EditHarness | undefined
+
+  beforeEach(async () => {
+    h = await createEditServer(() => '', [findmntJson([])], {
+      resolves: async () => true,
+      tcpReachable: async () => true,
+    })
+  })
+
+  afterEach(async () => {
+    await h?.app.close()
+    await rm(h!.dir, { recursive: true, force: true })
+    h = undefined
+  })
+
+  it('EINVAL / "Malformed UNC" comes back `invalid` — never `unreachable`', async () => {
+    h!.executor.addFixture({ command: TIMEOUT, result: {
+      stdout: '',
+      stderr: 'mount error(22): Invalid argument\nRefer to the mount.cifs(8) manual page (mount.cifs -h)\n',
+      exitCode: 32,
+    } })
+    const res = await h!.app.inject({
+      method: 'POST',
+      url: '/v1/mounts/test',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ type: 'cifs', server: '//127.0.0.1', remotePath: '/pictures' }),
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: { verdict: string, stage: string, detail?: string } }
+    assert.equal(data.verdict, 'invalid')
+    assert.equal(data.stage, 'mount')
+    assert.match(data.detail ?? '', /server or share is malformed/)
+  })
+
+  it('a no-credentials CIFS probe passes `guest` (never prompts) and the NORMALISED spec', async () => {
+    h!.executor.addFixture({ command: TIMEOUT, result: {
+      stdout: '',
+      stderr: 'mount error(22): Invalid argument\n',
+      exitCode: 32,
+    } })
+    const res = await h!.app.inject({
+      method: 'POST',
+      url: '/v1/mounts/test',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ type: 'cifs', server: '  127.0.0.1/  ', remotePath: 'pictures/' }),
+    })
+    assert.equal(res.statusCode, 200)
+    const probe = h!.executor.calls.find(c => c.command === TIMEOUT)!
+    // argv: timeout 15 /usr/bin/mount -t cifs -o <opts> <spec> <probeDir>
+    assert.equal(probe.args[4], '-o')
+    assert.equal(probe.args[5], 'vers=3.1.1,guest')
+    assert.equal(probe.args[6], '//127.0.0.1/pictures')
+  })
+
+  it('a credentials probe still authenticates from a temp file; rejection is auth-failed with its advice', async () => {
+    h!.executor.addFixture({ command: TIMEOUT, result: {
+      stdout: '',
+      stderr: 'mount error(13): Permission denied\nRefer to the mount.cifs(8) manual page (mount.cifs -h)\n',
+      exitCode: 32,
+    } })
+    const res = await h!.app.inject({
+      method: 'POST',
+      url: '/v1/mounts/test',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1', remotePath: 'pictures', credentials: { username: 'u', password: 'p' } }),
+    })
+    assert.equal(res.statusCode, 200)
+    const { data } = res.json() as { data: { verdict: string, detail?: string } }
+    assert.equal(data.verdict, 'auth-failed')
+    assert.match(data.detail ?? '', /username or password/)
+    const probe = h!.executor.calls.find(c => c.command === TIMEOUT)!
+    assert.match(probe.args[5], /^vers=3\.1\.1,credentials=\/.+probe\.cred$/)
+    assert.ok(!probe.args[5].includes('guest'))
+  })
+})
 
 describe('PUT /v1/mounts — credentials are proven before anything is committed (issue #24)', () => {
   let h: EditHarness | undefined
