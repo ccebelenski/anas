@@ -7,7 +7,9 @@
  * lines. rclone writes exactly one space each side of `=`; values are VERBATIM
  * to end of line and may themselves contain `=`, spaces, `;`, `#` or JSON (a
  * `{"access_token":"x"}` token value) — a `;`/`#` INSIDE a value is never a
- * comment.
+ * comment. The file is read as bytes, and a CRLF-edited file is handled: a
+ * key line's VALUE drops the trailing `\r` of a CRLF line (the raw line keeps
+ * it), and NEW lines the writer emits take the file's own line ending.
  *
  * ── Round-trip fidelity (Principle 12: we are a guest, never reformat) ──
  * Like `smb-conf.ts`, the file is held as its ORIGINAL array of lines and
@@ -24,8 +26,18 @@
 
 /** A `[section]` header (whole trimmed line) — the remote name inside. */
 const SECTION_HEADER_RE = /^\[(.+)\]\s*$/
-/** Trailing newlines at the end of a file (normalised away on append). */
-const TRAILING_NEWLINES_RE = /\n+$/
+/** Trailing line endings at the end of a file (normalised away on append). */
+const TRAILING_NEWLINES_RE = /(?:\r\n|\n)+$/
+
+/**
+ * The file's own line ending: CRLF when the FIRST line ends in `\r` (i.e. the
+ * first newline is `\r\n`), else LF. New lines the writer emits (key lines,
+ * the blank separator) take this spelling so an update to a CRLF-edited file
+ * stays CRLF-only.
+ */
+function lineEnding(text: string): string {
+  return (text.split('\n', 1)[0] ?? '').endsWith('\r') ? '\r\n' : '\n'
+}
 
 // ============================================================================
 // Low-level line model — the round-trip substrate.
@@ -69,7 +81,9 @@ function sectionHeader(line: string): string | null {
  * The key is trimmed on both sides (a hand-indented stanza still reads); the
  * value is everything after the FIRST `=` with ONE leading space stripped if
  * present, otherwise VERBATIM to end of line — `endpoint = https://x y=z ;q`
- * keeps its spaces, `=` and `;`.
+ * keeps its spaces, `=` and `;`. In a CRLF file the split leaves a trailing
+ * `\r` on every line; the VALUE drops exactly one (the raw LINE keeps it —
+ * the round-trip stays byte-identical).
  */
 function parseKeyLine(line: string): { key: string, value: string } | null {
   const trimmed = line.trim()
@@ -84,6 +98,8 @@ function parseKeyLine(line: string): { key: string, value: string } | null {
   let value = line.slice(eq + 1)
   if (value.startsWith(' '))
     value = value.slice(1)
+  if (value.endsWith('\r'))
+    value = value.slice(0, -1)
   return { key, value }
 }
 
@@ -160,7 +176,8 @@ export interface RcloneConfSection {
 /**
  * The named sections of the document with their key values (preamble
  * skipped). Values follow the `parseKeyLine` contract: verbatim to end of
- * line, one leading space after `=` stripped.
+ * line, one leading space after `=` stripped, one trailing `\r` dropped (the
+ * CRLF line ending).
  */
 export function listSections(doc: RcloneConfDoc): RcloneConfSection[] {
   const out: RcloneConfSection[] = []
@@ -203,12 +220,20 @@ export function listSections(doc: RcloneConfDoc): RcloneConfSection[] {
  * rewritten section is compact, the way rclone writes it.
  *
  * When the section is ABSENT it is appended at the end in rclone's own
- * format — `[name]` + the key lines, each newline-terminated — separated from
- * what precedes it by exactly one blank line, and the file is made to end
- * with a newline.
+ * format — `[name]` + the key lines, each line-ending-terminated — separated
+ * from what precedes it by exactly one blank line, and the file is made to
+ * end with a line ending.
+ *
+ * Every NEW line takes the file's OWN line ending (`lineEnding`): an upsert
+ * into a CRLF-edited file emits CRLF lines only.
  */
 export function upsertSection(text: string, name: string, values: Record<string, string>): string {
-  const keyLines = Object.entries(values).map(([k, v]) => `${k} = ${v}`)
+  const eol = lineEnding(text)
+  // The line-ending residue a new line carries inside the split `lines`
+  // array (the array is joined with `\n`, so CRLF lines end in a bare `\r`).
+  const cr = eol === '\r\n' ? '\r' : ''
+  const bareKeyLines = Object.entries(values).map(([k, v]) => `${k} = ${v}`)
+  let keyLines = bareKeyLines.map(l => `${l}${cr}`)
   const doc = parseRcloneConf(text)
   const span = findSection(doc, name)
 
@@ -216,11 +241,12 @@ export function upsertSection(text: string, name: string, values: Record<string,
     // Strip any trailing newlines, then add exactly one terminator + one
     // blank line of separation, so the result has exactly one blank line
     // between the old content and the new section whatever the file ended
-    // with. The block itself is newline-terminated (the file ends with a
-    // newline).
+    // with. The block itself is line-ending-terminated (the file ends with
+    // a line ending). The key lines here are BARE — the `eol` join supplies
+    // the line endings, the array model does not double them.
     const prefix = text.replace(TRAILING_NEWLINES_RE, '')
-    const separator = prefix === '' ? '' : '\n\n'
-    return `${prefix}${separator}[${name}]\n${keyLines.join('\n')}\n`
+    const separator = prefix === '' ? '' : eol + eol
+    return `${prefix}${separator}[${name}]${eol}${bareKeyLines.join(eol)}${eol}`
   }
 
   const body = doc.lines.slice(span.start + 1, span.end)
@@ -232,10 +258,16 @@ export function upsertSection(text: string, name: string, values: Record<string,
   // INSIDE the last span's body, and the splice would drop it. When the
   // original file ended with a newline, the rewritten section must too.
   const trailingNewline = span.end === doc.lines.length && doc.lines[span.end - 1] === ''
+  // A section at the end of a file that does NOT end with a line ending:
+  // the last NEW line must not carry one either (it would add the ending
+  // the file never had). (`-0 === 0`, so the strip is skipped for LF files
+  // — `slice(0, -0)` is the empty string.)
+  if (cr !== '' && !trailingNewline && span.end === doc.lines.length && keyLines.length > 0)
+    keyLines = [...keyLines.slice(0, -1), keyLines.at(-1)!.slice(0, -1)]
 
   const sectionLines: string[] = [doc.lines[span.headerIndex!], ...preserved, ...keyLines]
   if (hadBlank && followed)
-    sectionLines.push('') // keep the blank separator before the next section
+    sectionLines.push(cr) // keep the blank separator before the next section
   if (trailingNewline)
     sectionLines.push('')
 

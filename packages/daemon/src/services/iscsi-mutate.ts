@@ -56,6 +56,9 @@ import { CONFIGFS_TARGET_ROOT, describeLunHolder, readMappedLuns } from './iscsi
 import { computeIscsiHealth } from './iscsi-health.js'
 import { classifyBacking, ownershipFromInputs } from './iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from './iscsi.js'
+import { assertNoSecretArgs as assertSecretArgShape, SecretOnArgvError } from './secret-argv.js'
+
+export { SecretOnArgvError }
 
 /** `/usr/bin/targetcli` — the real binary on Debian/PVE. */
 export const TARGETCLI = '/usr/bin/targetcli'
@@ -184,29 +187,17 @@ export function withIscsiLock<T>(fn: () => Promise<T>): Promise<T> {
  */
 const SECRET_ARG_RE = /(?:^|[\s,])(password|password_mutual|mutual_password)=/i
 
-/** Thrown when a targetcli invocation would carry a secret on argv. */
-export class SecretOnArgvError extends Error {
-  constructor(token: string) {
-    super(
-      `Refusing to run targetcli with '${token.split('=')[0]}=' on the command line — `
-      + 'CHAP secrets are written straight to configfs (docs/ISCSI-GROUND-TRUTH.md GT-35)',
-    )
-    this.name = 'SecretOnArgvError'
-  }
-}
-
 /**
- * Throw if any argv token would leak a secret. Exported so tests assert it.
+ * Throw if any targetcli argv token would leak a CHAP secret.
  *
- * The error names the matched PARAMETER, never the token: a joined token
- * carries the secret itself, and the refusal must not become the leak.
+ * The check and the one argv-secret error live in `secret-argv.ts` (shared
+ * with the rclone.conf writer, story rclone.1); this module keeps its own
+ * regex constant and passes it in. The error names the matched PARAMETER,
+ * never the token: a joined token carries the secret itself, and the refusal
+ * must not become the leak.
  */
 export function assertNoSecretArgs(args: string[]): void {
-  for (const a of args) {
-    const m = SECRET_ARG_RE.exec(a)
-    if (m)
-      throw new SecretOnArgvError(m[1] ?? a)
-  }
+  assertSecretArgShape(args, SECRET_ARG_RE)
 }
 
 /** A targetcli invocation that exited non-zero. */

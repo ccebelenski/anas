@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { constants as fsConstants } from 'node:fs'
 import { access, copyFile, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
+import { withFileLock } from './file-lock.js'
 
 /**
  * Concurrency-safe, non-destructive editor for system config files
@@ -24,17 +25,6 @@ export class ConfigConflictError extends Error {
     super(`Config file '${path}' changed on disk during the operation — retry against the current state`)
     this.name = 'ConfigConflictError'
   }
-}
-
-/** Per-path promise chain — serializes writes to the same file within anasd. */
-const locks = new Map<string, Promise<unknown>>()
-
-function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-  const prev = locks.get(path) ?? Promise.resolve()
-  // Chain regardless of prior success/failure so one failed write doesn't wedge the lock.
-  const next = prev.catch(() => {}).then(fn)
-  locks.set(path, next.catch(() => {}))
-  return next
 }
 
 function sha256(text: string): string {

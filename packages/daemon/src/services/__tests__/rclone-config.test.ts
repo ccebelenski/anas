@@ -1,4 +1,5 @@
 import type { CloudProvider, CloudProviderOption } from '@anas/shared'
+import type { CommandExecutor } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -7,7 +8,6 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
 import {
-  assertNoSecretOnArgv,
   ConfigEncryptedError,
   defaultRcloneConfigPaths,
   isSecretKey,
@@ -22,10 +22,11 @@ import {
   RemoteExistsError,
   RemoteNotFoundError,
   removeRemote,
-  SecretOnArgvError,
   trimProviders,
+  writeConfigFileAtomic,
   writeRemote,
 } from '../rclone-config.js'
+import { assertNoSecretValues, SecretOnArgvError } from '../secret-argv.js'
 
 // The REAL 1.60.1 provider capture (packages/daemon/src/fixtures) — trimmed
 // through the function under test, so every assertion below runs on the
@@ -86,6 +87,23 @@ describe('rclone-config: trimProviders on the 1.60.1 fixture (rclone.1)', () => 
   it('trims to the 8 captured backends with the shared shape', () => {
     assert.equal(providers.length, 8)
     assert.deepEqual(providers.map(p => p.name).sort(), ['alias', 'b2', 'crypt', 'drive', 'local', 's3', 'sftp', 'webdav'])
+  })
+
+  it('every captured backend keeps exactly its fixture option count (Hide=0 only)', () => {
+    // The expected counts are the fixture's own, per backend — a drift in
+    // the trim (a dropped or duplicated option) fails here.
+    const expectedCounts: Record<string, number> = {
+      alias: 1,
+      b2: 15,
+      crypt: 8,
+      drive: 36,
+      local: 14,
+      s3: 80,
+      sftp: 28,
+      webdav: 8,
+    }
+    for (const [name, count] of Object.entries(expectedCounts))
+      assert.equal(provider(name).options.length, count, `option count for '${name}'`)
   })
 
   it('b2: account / key (secret, required) / hard_delete; hidden options dropped', () => {
@@ -164,12 +182,12 @@ describe('rclone-config: argv guard + base args (rclone.1)', () => {
     assert.deepEqual(rcloneBaseArgs('/etc/anas/rclone.conf'), ['--config', '/etc/anas/rclone.conf', '--ask-password=false'])
   })
 
-  it('assertNoSecretOnArgv refuses an argv carrying a secret, without naming it', () => {
-    assert.doesNotThrow(() => assertNoSecretOnArgv(['config', 'dump'], ['hunter2secret']))
-    assert.throws(() => assertNoSecretOnArgv(['--pass=hunter2secret'], ['hunter2secret']), SecretOnArgvError)
-    assert.throws(() => assertNoSecretOnArgv(['hunter2secret'], ['hunter2secret']), SecretOnArgvError)
+  it('assertNoSecretValues refuses an argv carrying a secret, without naming it', () => {
+    assert.doesNotThrow(() => assertNoSecretValues(['config', 'dump'], ['hunter2secret']))
+    assert.throws(() => assertNoSecretValues(['--pass=hunter2secret'], ['hunter2secret']), SecretOnArgvError)
+    assert.throws(() => assertNoSecretValues(['hunter2secret'], ['hunter2secret']), SecretOnArgvError)
     try {
-      assertNoSecretOnArgv(['x=hunter2secret'], ['hunter2secret'])
+      assertNoSecretValues(['x=hunter2secret'], ['hunter2secret'])
       assert.fail('expected a throw')
     }
     catch (err) {
@@ -177,7 +195,19 @@ describe('rclone-config: argv guard + base args (rclone.1)', () => {
       assert.ok(!String(err.message).includes('hunter2secret'), 'the error must not echo the secret')
     }
     // empty secret values cannot match anything
-    assert.doesNotThrow(() => assertNoSecretOnArgv(['anything'], ['', '']))
+    assert.doesNotThrow(() => assertNoSecretValues(['anything'], ['', '']))
+  })
+
+  it('the guard skips the base args (ANAS constants) and checks only the dynamic tail (regression)', () => {
+    // The false positive the flake was: `--ask-password=false` contains the
+    // value `false`, and a config path may contain the value `h`. Neither is
+    // the dynamic tail, so neither may trip the guard.
+    const base = rcloneBaseArgs('/tmp/h-false/rclone.conf')
+    assert.doesNotThrow(() => assertNoSecretValues([...base, 'config', 'dump'], ['h', 'false'], base.length))
+    assert.doesNotThrow(() => assertNoSecretValues([...base, 'obscure', '-'], ['hunter2secret'], base.length))
+    // …but a plain secret smuggled into the DYNAMIC tail is still refused.
+    assert.throws(() => assertNoSecretValues([...base, 'config', 'dump', 'x=hunter2secret'], ['hunter2secret'], base.length), SecretOnArgvError)
+    assert.throws(() => assertNoSecretValues([...base, 'hunter2secret'], ['hunter2secret'], base.length), SecretOnArgvError)
   })
 
   it('the config path is env-overridable', () => {
@@ -233,12 +263,37 @@ describe('rclone-config: readConfig (rclone.1)', () => {
     await rm(dir, { recursive: true, force: true })
   })
 
-  it('an absent file reads as empty: no remotes, not encrypted', async () => {
+  it('an absent file reads as empty: no remotes, not encrypted, not present', async () => {
     mock.addFixture({ command: RCLONE, args: [...rcloneBaseArgs(paths.configFile), 'config', 'dump'], result: dumpResult({}) })
     const read = await readConfig(paths, mock)
     assert.equal(read.text, '')
     assert.equal(read.encrypted, false)
     assert.deepEqual(read.remotes, [])
+    assert.equal(read.existedBefore, false)
+  })
+
+  it('an existing EMPTY file reads as empty text with existedBefore true', async () => {
+    await writeFile(paths.configFile, '', 'utf-8')
+    mock.addFixture({ command: RCLONE, args: [...rcloneBaseArgs(paths.configFile), 'config', 'dump'], result: dumpResult({}) })
+    const read = await readConfig(paths, mock)
+    assert.equal(read.text, '')
+    assert.equal(read.existedBefore, true)
+  })
+
+  it('non-JSON dump output throws stating the fact only — no dump bytes in the message', async () => {
+    // The dump output can carry a plain name-rule secret (an s3
+    // secret_access_key) — the error must not become the leak.
+    mock.addFixture({
+      command: RCLONE,
+      args: [...rcloneBaseArgs(paths.configFile), 'config', 'dump'],
+      result: { stdout: 'secret_access_key = PLAIN\n', stderr: '', exitCode: 0 },
+    })
+    await assert.rejects(readConfig(paths, mock), (err: unknown) => {
+      assert.ok(err instanceof Error)
+      assert.match(err.message, /not JSON/)
+      assert.ok(!err.message.includes('PLAIN'), `the error leaked dump bytes: ${err.message}`)
+      return true
+    })
   })
 
   it('a real-shaped dump: non-secret options back, secrets named never valued, sorted by name', async () => {
@@ -392,7 +447,7 @@ describe('rclone-config: writeRemote (rclone.1)', () => {
   it('update: untouched keys stay verbatim, \'\' removes a non-secret key, \'\' on a secret is ignored, type change refused', async () => {
     const seed = '[homelab]\ntype = sftp\nhost = 127.0.0.1\nuser = root\npass = OBSCURED-orig\nport = 2222\n'
     await mkdir(dirname(cfg), { recursive: true })
-    await writeFile(cfg, seed, 'utf-8')
+    await writeFile(cfg, seed, { encoding: 'utf-8', mode: 0o644 })
     mock.addFixture({
       command: RCLONE,
       args: [...base(), 'config', 'dump'],
@@ -406,6 +461,8 @@ describe('rclone-config: writeRemote (rclone.1)', () => {
 
     const text = await readFile(cfg, 'utf-8')
     assert.equal(text, '[homelab]\ntype = sftp\nhost = 10.0.0.9\nuser = root\npass = OBSCURED-orig\n')
+    // the update path (re)writes 0600 — a pre-existing 0644 file is not left loose
+    assert.equal((await stat(cfg)).mode & 0o777, 0o600)
     assert.deepEqual(result, { name: 'homelab', type: 'sftp', options: { host: '10.0.0.9', user: 'root' }, secretsSet: ['pass'] })
     // no password value was re-sent, so no obscure call
     assert.ok(!mock.calls.some(c => c.args.includes('obscure')))
@@ -495,6 +552,151 @@ describe('rclone-config: writeRemote (rclone.1)', () => {
       ConfigEncryptedError,
     )
     await assert.rejects(stat(cfg), (err: NodeJS.ErrnoException) => err.code === 'ENOENT')
+  })
+
+  it('secret-SHAPED plain values (host "h", hard_delete "false") do not trip the guard (regression)', async () => {
+    // The flake: the guard set was EVERY option value and the check covered
+    // the base args too — so a `host` of `h` matched a config path that
+    // contains `h`, and a `false` value matched `--ask-password=false`. A
+    // config path containing BOTH, and two writes whose values are `h` and
+    // `false`, must succeed.
+    const cfg2 = join(dir, 'h', 'h-false.conf')
+    const paths2 = { configFile: cfg2 }
+    const base2 = () => rcloneBaseArgs(cfg2)
+    mock.addFixture({
+      command: RCLONE,
+      args: [...base2(), 'config', 'dump'],
+      results: [
+        dumpResult({}),
+        dumpResult({ one: { type: 'sftp', host: 'h' } }),
+        dumpResult({ one: { type: 'sftp', host: 'h' } }),
+        dumpResult({ one: { type: 'sftp', host: 'h' }, two: { type: 'b2', account: 'acct', key: 'plainkey', hard_delete: 'false' } }),
+      ],
+    })
+
+    const ra = await writeRemote(paths2, mock, { name: 'one', type: 'sftp', options: { host: 'h' } }, { providers, mode: 'create' })
+    const rb = await writeRemote(paths2, mock, { name: 'two', type: 'b2', options: { account: 'acct', key: 'plainkey', hard_delete: 'false' } }, { providers, mode: 'create' })
+    assert.deepEqual(ra.options, { host: 'h' })
+    assert.deepEqual(rb, { name: 'two', type: 'b2', options: { account: 'acct', hard_delete: 'false' }, secretsSet: ['key'] })
+    assert.equal(await readFile(cfg2, 'utf-8'), '[one]\ntype = sftp\nhost = h\n\n[two]\ntype = b2\naccount = acct\nkey = plainkey\nhard_delete = false\n')
+  })
+
+  it('a CRLF-edited config passes the gate and stays CRLF-only after the update', async () => {
+    const seed = '[homelab]\r\ntype = sftp\r\nhost = 127.0.0.1\r\nuser = root\r\n'
+    await mkdir(dirname(cfg), { recursive: true })
+    await writeFile(cfg, seed, 'utf-8')
+    mock.addFixture({
+      command: RCLONE,
+      args: [...base(), 'config', 'dump'],
+      results: [
+        dumpResult({ homelab: { type: 'sftp', host: '127.0.0.1', user: 'root' } }),
+        dumpResult({ homelab: { type: 'sftp', host: '10.0.0.9', user: 'root' } }),
+      ],
+    })
+    await writeRemote(paths, mock, { name: 'homelab', type: 'sftp', options: { host: '10.0.0.9' } }, { providers, mode: 'update' })
+    const text = await readFile(cfg, 'utf-8')
+    assert.equal(text, '[homelab]\r\ntype = sftp\r\nhost = 10.0.0.9\r\nuser = root\r\n')
+  })
+
+  it('a gate failure on an existing EMPTY file restores it empty, not deleted', async () => {
+    await mkdir(dirname(cfg), { recursive: true })
+    await writeFile(cfg, '', 'utf-8')
+    mock.addFixture({
+      command: RCLONE,
+      args: [...base(), 'config', 'dump'],
+      results: [dumpResult({}), { stdout: '', stderr: 'config file corrupt: cannot parse\n', exitCode: 1 }],
+    })
+    await assert.rejects(
+      writeRemote(paths, mock, { name: 'homelab', type: 'sftp', options: { host: '127.0.0.1' } }, { providers, mode: 'create' }),
+      RcloneConfigGateError,
+    )
+    // the file EXISTED (empty) before the write — it comes back empty
+    assert.equal(await readFile(cfg, 'utf-8'), '')
+  })
+
+  it('a failed rename leaves no .tmp behind (the target path is a directory)', async () => {
+    await mkdir(dirname(cfg), { recursive: true })
+    await mkdir(cfg)
+    await assert.rejects(
+      writeConfigFileAtomic(paths, '[x]\ntype = sftp\n'),
+      (err: NodeJS.ErrnoException) => {
+        assert.equal(err.code, 'EISDIR')
+        return true
+      },
+    )
+    await assert.rejects(stat(join(dirname(cfg), 'rclone.conf.tmp')), (err: NodeJS.ErrnoException) => err.code === 'ENOENT')
+  })
+
+  it('a failed ROLLBACK still yields the gate error, stating the restore failed', async () => {
+    const seed = '[homelab]\ntype = sftp\nhost = 127.0.0.1\n'
+    await mkdir(dirname(cfg), { recursive: true })
+    await writeFile(cfg, seed, 'utf-8')
+    mock.addFixture({
+      command: RCLONE,
+      args: [...base(), 'config', 'dump'],
+      results: [
+        dumpResult({ homelab: { type: 'sftp', host: '127.0.0.1' } }),
+        { stdout: '', stderr: 'config file corrupt: cannot parse\n', exitCode: 1 },
+      ],
+    })
+    // The fs goes hostile on the GATE call (the 2nd dump): the config file
+    // becomes a directory, so the rollback's rename must fail. Nothing in
+    // the real sequence would do that — the mocked rclone call is the only
+    // place to stage it.
+    let dumps = 0
+    const executor: CommandExecutor = {
+      async exec(command, args, opts) {
+        const result = await mock.exec(command, args, opts)
+        if (args.at(-2) === 'config' && args.at(-1) === 'dump') {
+          dumps++
+          if (dumps === 2) {
+            await rm(cfg, { force: true })
+            await mkdir(cfg)
+          }
+        }
+        return result
+      },
+      pipeline: (c1, a1, c2, a2) => mock.pipeline(c1, a1, c2, a2),
+      execToStream: (c, a, t, o) => mock.execToStream(c, a, t, o),
+    }
+    await assert.rejects(
+      writeRemote(paths, executor, { name: 'homelab', type: 'sftp', options: { host: '10.0.0.9' } }, { providers, mode: 'update' }),
+      (err: unknown) => {
+        assert.ok(err instanceof RcloneConfigGateError, `expected RcloneConfigGateError, got ${String(err)}`)
+        assert.match(err.message, /config file corrupt/) // the gate reason survives
+        assert.match(err.message, /rollback/) // and the failed restore is stated
+        assert.ok(!err.message.includes('hunter2secret'), 'no secret in the refusal')
+        return true
+      },
+    )
+  })
+
+  it('two concurrent writes on the same file serialise through the lock — no lost update', async () => {
+    // Without the lock both writes would read the same pre-state and the
+    // second rename would clobber the first section. The canned dumps play
+    // the serialised order: A reads empty, A gates, B reads A's section,
+    // B gates on both.
+    mock.addFixture({
+      command: RCLONE,
+      args: [...base(), 'config', 'dump'],
+      results: [
+        dumpResult({}),
+        dumpResult({ a: { type: 'sftp', host: '10.0.0.1' } }),
+        dumpResult({ a: { type: 'sftp', host: '10.0.0.1' } }),
+        dumpResult({ a: { type: 'sftp', host: '10.0.0.1' }, b: { type: 'sftp', host: '10.0.0.2' } }),
+      ],
+    })
+    const [ra, rb] = await Promise.all([
+      writeRemote(paths, mock, { name: 'a', type: 'sftp', options: { host: '10.0.0.1' } }, { providers, mode: 'create' }),
+      writeRemote(paths, mock, { name: 'b', type: 'sftp', options: { host: '10.0.0.2' } }, { providers, mode: 'create' }),
+    ])
+    assert.deepEqual(ra, { name: 'a', type: 'sftp', options: { host: '10.0.0.1' }, secretsSet: [] })
+    assert.deepEqual(rb, { name: 'b', type: 'sftp', options: { host: '10.0.0.2' }, secretsSet: [] })
+    const text = await readFile(cfg, 'utf-8')
+    assert.ok(text.includes('[a]\n'), `missing section a in: ${text}`)
+    assert.ok(text.includes('[b]\n'), `missing section b in: ${text}`)
+    assert.ok(text.includes('host = 10.0.0.1'))
+    assert.ok(text.includes('host = 10.0.0.2'))
   })
 })
 

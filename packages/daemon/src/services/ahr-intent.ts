@@ -2,6 +2,7 @@ import type { AhrExpansionState } from '@anas/shared'
 import { mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { AhrExpansionIntent, PoolName } from '@anas/shared'
+import { withFileLock } from './file-lock.js'
 
 /**
  * AhrExpansionIntent persistence (Epic 11.6, docs/AHR-DESIGN.md §5.3) — the
@@ -44,15 +45,6 @@ export class AhrIntentConflictError extends Error {
 /** Intent file path for a pool. The name is schema-validated before joining. */
 function intentFile(dir: string, pool: string): string {
   return join(dir, `${PoolName.parse(pool)}.json`)
-}
-
-/** Per-path promise chain — serializes writes to the same file in-process. */
-const locks = new Map<string, Promise<unknown>>()
-function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-  const prev = locks.get(path) ?? Promise.resolve()
-  const next = prev.catch(() => {}).then(fn)
-  locks.set(path, next.catch(() => {}))
-  return next
 }
 
 /**

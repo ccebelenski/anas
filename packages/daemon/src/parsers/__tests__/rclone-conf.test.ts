@@ -163,6 +163,48 @@ describe('rclone.conf upsertSection (rclone.1)', () => {
     const next = upsertSection(text, 'media', { x: '2' })
     assert.equal(next, '[  media  ]\nx = 2\n')
   })
+
+  it('a value with =, spaces and ; round-trips through upsertSection + listSections unchanged', () => {
+    const value = 'https://x y=z ;q'
+    const next = upsertSection('[a]\nk = old\n', 'a', { k: value })
+    const [section] = listSections(parseRcloneConf(next))
+    assert.equal(section!.values.k, value)
+  })
+})
+
+describe('rclone.conf CRLF (rclone.1)', () => {
+  // A CRLF-edited file: the same shapes the gnarly LF fixture exercises.
+  const CRLF_FIXTURE = '# a full-line comment\r\n\r\n[media]\r\ntype = webdav\r\nendpoint = https://x y=z ;q\r\n\r\n[sftp1]\r\ntype = sftp\r\nhost = 127.0.0.1\r\n'
+
+  it('parse + serialize is byte-identical for a CRLF file', () => {
+    assert.equal(serializeRcloneConf(parseRcloneConf(CRLF_FIXTURE)), CRLF_FIXTURE)
+  })
+
+  it('listSections values carry no \\r', () => {
+    const sections = listSections(parseRcloneConf(CRLF_FIXTURE))
+    assert.deepEqual(sections.map(s => s.name), ['media', 'sftp1'])
+    assert.equal(sections[0]!.values.type, 'webdav')
+    // spaces, `=` and `;` inside the value survive verbatim, minus the line ending
+    assert.equal(sections[0]!.values.endpoint, 'https://x y=z ;q')
+    assert.equal(sections[1]!.values.host, '127.0.0.1')
+  })
+
+  it('an upsert into a CRLF file emits CRLF lines only', () => {
+    const next = upsertSection('[a]\r\nx = 1\r\n\r\n[b]\r\ny = 2\r\n', 'b', { y: '3' })
+    assert.equal(next, '[a]\r\nx = 1\r\n\r\n[b]\r\ny = 3\r\n')
+  })
+
+  it('an appended section into a CRLF file takes the CRLF separator and terminator', () => {
+    assert.equal(upsertSection('[a]\r\nx = 1\r\n', 'c', { z: 'w' }), '[a]\r\nx = 1\r\n\r\n[c]\r\nz = w\r\n')
+  })
+
+  it('a CRLF file without a final line ending does not gain one', () => {
+    assert.equal(upsertSection('[a]\r\nx = 1\r\n[b]\r\ny = 2', 'b', { y: '3' }), '[a]\r\nx = 1\r\n[b]\r\ny = 3')
+  })
+
+  it('an LF file stays LF-only after an upsert', () => {
+    assert.equal(upsertSection('[a]\nx = 1\n', 'b', { y: '2' }), '[a]\nx = 1\n\n[b]\ny = 2\n')
+  })
 })
 
 describe('rclone.conf removeSection (rclone.1)', () => {

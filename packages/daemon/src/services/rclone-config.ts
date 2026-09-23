@@ -18,8 +18,8 @@
  * `rclone obscure -` over STDIN before they touch the file; secrets only by
  * the name rule (s3 `secret_access_key`, b2 `key`) are stored PLAIN — rclone
  * would not reveal an obscured value there. A secret value never enters an
- * argv (guarded by `assertNoSecretOnArgv`, the iscsi-mutate backstop), and a
- * secret value is never returned (responses carry `secretsSet` only).
+ * argv (guarded by the shared `secret-argv.ts` backstop, the iSCSI ruling),
+ * and a secret value is never returned (responses carry `secretsSet` only).
  *
  * A password-PROTECTED (encrypted) config file is reported as a fact
  * (`encrypted: true`) and refuses every mutation (`ConfigEncryptedError` →
@@ -35,6 +35,7 @@ import { CloudProvider as CloudProviderSchema } from '@anas/shared'
 import { z } from 'zod'
 import { listSections, parseRcloneConf, removeSection, upsertSection } from '../parsers/rclone-conf.js'
 import { withFileLock } from './file-lock.js'
+import { assertNoSecretValues } from './secret-argv.js'
 
 // ── The binary, the file, the argv every invocation starts with ────────────
 
@@ -64,32 +65,6 @@ export interface RcloneConfigPaths {
 /** Default paths (env-overridable, else the system location). */
 export function defaultRcloneConfigPaths(): RcloneConfigPaths {
   return { configFile: defaultRcloneConfigFile() }
-}
-
-// ── The argv-secret guard ──────────────────────────────────────────────────
-
-/** Thrown when an rclone invocation would carry a secret value on argv. */
-export class SecretOnArgvError extends Error {
-  constructor() {
-    super('refusing to run rclone with a secret value on the command line — secrets ride stdin (rclone obscure -) only')
-    this.name = 'SecretOnArgvError'
-  }
-}
-
-/**
- * Throw if any argv token CONTAINS a non-empty secret value. Called before
- * every exec in this module that runs while secret values are in scope. The
- * error names nothing of the argv: a matching token carries the secret
- * itself, and the refusal must not become the leak.
- */
-export function assertNoSecretOnArgv(args: string[], secrets: string[]): void {
-  const nonEmpty = secrets.filter(s => s !== '')
-  if (nonEmpty.length === 0)
-    return
-  for (const a of args) {
-    if (nonEmpty.some(s => a.includes(s)))
-      throw new SecretOnArgvError()
-  }
 }
 
 // ── The secret-key rule ────────────────────────────────────────────────────
@@ -239,6 +214,12 @@ export interface RcloneConfigRead {
   encrypted: boolean
   /** The remotes, secrets stripped, sorted by name (empty when encrypted). */
   remotes: CloudRemote[]
+  /**
+   * The file existed on disk before this read. `text === ''` is NOT enough to
+   * tell absent from an existing EMPTY file — the gate's rollback must restore
+   * an existing empty file as empty, not delete it.
+   */
+  existedBefore: boolean
 }
 
 /**
@@ -251,8 +232,9 @@ export interface RcloneConfigRead {
  *    → `{ encrypted: true, remotes: [] }` — a password-protected file,
  *  - any other non-zero → an Error carrying rclone's last output line.
  *
- * `secrets` are values already in scope at the caller (e.g. an in-flight
- * write's plain-text options) — the argv guard runs for them too.
+ * `secrets` are the plain SECRET values in scope at the caller (an in-flight
+ * write's secret options) — the argv guard runs for them too, on the dynamic
+ * tail only (the base args are ANAS constants, `secret-argv.ts`).
  */
 export async function readConfig(
   paths: RcloneConfigPaths,
@@ -261,16 +243,19 @@ export async function readConfig(
   secrets: string[] = [],
 ): Promise<RcloneConfigRead> {
   let text = ''
+  let existedBefore = false
   try {
     text = await readFile(paths.configFile, 'utf-8')
+    existedBefore = true
   }
   catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
       throw err
   }
 
-  const args = [...rcloneBaseArgs(paths.configFile), 'config', 'dump']
-  assertNoSecretOnArgv(args, secrets)
+  const base = rcloneBaseArgs(paths.configFile)
+  const args = [...base, 'config', 'dump']
+  assertNoSecretValues(args, secrets, base.length)
   const result = await executor.exec(RCLONE, args)
 
   if (result.exitCode === 0) {
@@ -279,13 +264,15 @@ export async function readConfig(
       dump = JSON.parse(result.stdout)
     }
     catch {
-      throw new Error(`rclone config dump returned invalid JSON: ${lastOutputLine(result) || 'empty output'}`)
+      // The dump output is not echoed: it can carry a plain name-rule secret
+      // (an s3 secret_access_key), and the error must not become the leak.
+      throw new Error('rclone config dump returned output that is not JSON')
     }
-    return { text, encrypted: false, remotes: dumpToRemotes(dump, providers) }
+    return { text, encrypted: false, remotes: dumpToRemotes(dump, providers), existedBefore }
   }
 
   if (ENCRYPTED_CONFIG_RE.test(`${result.stderr}\n${result.stdout}`))
-    return { text, encrypted: true, remotes: [] }
+    return { text, encrypted: true, remotes: [], existedBefore }
   throw new Error(`rclone config dump failed: ${lastOutputLine(result) || `exit ${result.exitCode}`}`)
 }
 
@@ -365,8 +352,9 @@ export async function obscure(
   value: string,
   configFile: string = defaultRcloneConfigFile(),
 ): Promise<string> {
-  const args = [...rcloneBaseArgs(configFile), 'obscure', '-']
-  assertNoSecretOnArgv(args, [value])
+  const base = rcloneBaseArgs(configFile)
+  const args = [...base, 'obscure', '-']
+  assertNoSecretValues(args, [value], base.length)
   const result = await executor.exec(RCLONE, args, { stdin: value })
   if (result.exitCode !== 0)
     throw new Error(`rclone obscure failed: ${lastOutputLine(result) || `exit ${result.exitCode}`}`)
@@ -377,20 +365,40 @@ export async function obscure(
  * Write the config file atomically: write `<file>.tmp` with mode 0600, then
  * `rename` over the file (the rename is the atomic swap). The parent
  * directory is created 0700 when missing (an existing one is never chmodded
- * — we are a guest).
+ * — we are a guest). A FAILED rename must not leave the `.tmp` behind — the
+ * tmp is removed in a `finally` (`force` ignores the post-rename ENOENT).
+ *
+ * Test seam: the rename-failure path (a target that is a directory) is not
+ * reachable through the public API — `readConfig` would refuse to read the
+ * directory first — so the helper is exported for that one test.
  */
-async function writeConfigFileAtomic(paths: RcloneConfigPaths, text: string): Promise<void> {
+export async function writeConfigFileAtomic(paths: RcloneConfigPaths, text: string): Promise<void> {
   const dir = dirname(paths.configFile)
   await mkdir(dir, { recursive: true, mode: 0o700 })
   const tmp = join(dir, `${basename(paths.configFile)}.tmp`)
   await writeFile(tmp, text, { encoding: 'utf-8', mode: 0o600 })
-  await rename(tmp, paths.configFile)
-  await chmod(paths.configFile, 0o600).catch(() => {})
+  try {
+    await rename(tmp, paths.configFile)
+    await chmod(paths.configFile, 0o600).catch(() => {})
+  }
+  finally {
+    // The tmp must not outlive the write; a cleanup failure must not mask
+    // the write's own error.
+    await rm(tmp, { force: true }).catch(() => {})
+  }
 }
 
-/** The byte-identical rollback: the PREVIOUS text back, or the file removed when it was absent. */
-async function restoreConfigFile(paths: RcloneConfigPaths, previousText: string): Promise<void> {
-  if (previousText === '') {
+/**
+ * The byte-identical rollback: the PREVIOUS text back, or the file removed
+ * when it was ABSENT (`existedBefore === false`). An existing EMPTY file
+ * (`existedBefore === true`, text `''`) comes back empty — not deleted.
+ */
+async function restoreConfigFile(
+  paths: RcloneConfigPaths,
+  previousText: string,
+  existedBefore: boolean,
+): Promise<void> {
+  if (!existedBefore) {
     await rm(paths.configFile, { force: true })
     return
   }
@@ -413,8 +421,9 @@ async function configDumpGate(
   expected: Record<string, string>,
   secrets: string[],
 ): Promise<string | null> {
-  const args = [...rcloneBaseArgs(paths.configFile), 'config', 'dump']
-  assertNoSecretOnArgv(args, secrets)
+  const base = rcloneBaseArgs(paths.configFile)
+  const args = [...base, 'config', 'dump']
+  assertNoSecretValues(args, secrets, base.length)
   const result = await executor.exec(RCLONE, args)
   if (result.exitCode !== 0)
     return lastOutputLine(result) || `exit ${result.exitCode}`
@@ -464,8 +473,9 @@ function existingSectionRaw(text: string, name: string): Map<string, string> {
  *    per-file lock.
  *  - GATE: `config dump` must exit 0 and list the section with the same
  *    non-secret values — else the PREVIOUS bytes go back byte-identically
- *    (absent-before ⇒ the file is removed) and `RcloneConfigGateError`
- *    carries rclone's last output line.
+ *    (absent-before ⇒ the file is removed; an existing empty file comes
+ *    back empty) and `RcloneConfigGateError` carries rclone's last output
+ *    line — with the rollback failure stated when the restore itself fails.
  *
  * Returns the remote with secrets stripped.
  */
@@ -476,9 +486,20 @@ export async function writeRemote(
   opts: { providers: CloudProvider[], mode: 'create' | 'update' },
 ): Promise<CloudRemote> {
   return withFileLock(paths.configFile, async () => {
-    const plainSecrets = Object.values(input.options)
+    // The argv-guard set is the SECRET values of this write ONLY (the
+    // name rule with the provider's option, `isSecretKey`) — every option
+    // value is not a secret: a `host` of `h` or a `hard_delete` of `false`
+    // must not trip on the static base args, where the config path may
+    // contain `h` and `--ask-password=false` contains `false`. The OBSCLUDED
+    // outputs are not secrets either — they are rclone's own encoding, and
+    // the guard only ever sees these plain values in scope. (On `update`,
+    // `input.type` is the type: it must equal the existing one or the call
+    // throws before anything else runs.)
+    const secretValues = Object.entries(input.options)
+      .filter(([key]) => isSecretKey(key, providerOption(opts.providers, input.type, key)))
+      .map(([, value]) => value)
 
-    const current = await readConfig(paths, executor, opts.providers, plainSecrets)
+    const current = await readConfig(paths, executor, opts.providers, secretValues)
     if (current.encrypted)
       throw new ConfigEncryptedError(paths.configFile)
     const existing = current.remotes.find(r => r.name === input.name)
@@ -576,9 +597,17 @@ export async function writeRemote(
       else
         expected[e.key] = e.value
     }
-    const gateError = await configDumpGate(paths, executor, input.name, expected, plainSecrets)
+    const gateError = await configDumpGate(paths, executor, input.name, expected, secretValues)
     if (gateError !== null) {
-      await restoreConfigFile(paths, current.text)
+      // The PREVIOUS bytes go back. A FAILED RESTORE must not replace the
+      // gate error — the operator needs the gate reason, with the restore
+      // failure stated (an fs error: paths and errnos, no secrets).
+      try {
+        await restoreConfigFile(paths, current.text, current.existedBefore)
+      }
+      catch {
+        throw new RcloneConfigGateError(`${gateError} — and the rollback of the previous bytes also failed, so the config file may still hold the failed write`)
+      }
       throw new RcloneConfigGateError(gateError)
     }
 
@@ -614,8 +643,9 @@ export async function removeRemote(
     await writeConfigFileAtomic(paths, newText)
 
     // The gate: the dump must parse AND the remote must be gone.
-    const args = [...rcloneBaseArgs(paths.configFile), 'config', 'dump']
-    assertNoSecretOnArgv(args, [])
+    const base = rcloneBaseArgs(paths.configFile)
+    const args = [...base, 'config', 'dump']
+    assertNoSecretValues(args, [], base.length)
     const gate = await executor.exec(RCLONE, args)
     let gateError: string
     if (gate.exitCode !== 0) {
@@ -631,7 +661,14 @@ export async function removeRemote(
       }
     }
     if (gateError !== '') {
-      await restoreConfigFile(paths, current.text)
+      // A failed RESTORE must not replace the gate error (same contract as
+      // writeRemote): the gate reason stays, the restore failure is stated.
+      try {
+        await restoreConfigFile(paths, current.text, current.existedBefore)
+      }
+      catch {
+        throw new RcloneConfigGateError(`${gateError} — and the rollback of the previous bytes also failed, so the config file may still hold the failed write`)
+      }
       throw new RcloneConfigGateError(gateError)
     }
   })

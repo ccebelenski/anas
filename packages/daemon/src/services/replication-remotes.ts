@@ -6,6 +6,7 @@ import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { ReplicationRemote as ReplicationRemoteSchema } from '@anas/shared'
 import { z } from 'zod'
+import { withFileLock } from './file-lock.js'
 
 /**
  * Stage-3 remotes registry (Epic 5.5.2) — the COROSYNC STORE.
@@ -129,15 +130,6 @@ export async function readRemotes(paths: RemotesPaths): Promise<RemotesFile> {
     updatedAt: envelope.data.updatedAt,
     remotes,
   }
-}
-
-/** Per-path promise chain — serializes CAS writes to the same file in-process. */
-const locks = new Map<string, Promise<unknown>>()
-function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-  const prev = locks.get(path) ?? Promise.resolve()
-  const next = prev.catch(() => {}).then(fn)
-  locks.set(path, next.catch(() => {}))
-  return next
 }
 
 /** Test seam: run something between acquiring the lock and the CAS re-read. */
