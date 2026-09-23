@@ -1,9 +1,9 @@
 {
   "name": "anas",
   "type": "module",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "private": true,
-  "description": "A NAS — Storage management GUI for Proxmox",
+  "description": "A NAS \u2014 Storage management GUI for Proxmox",
   "license": "AGPL-3.0-or-later",
   "workspaces": [
     "packages/*"
@@ -24,13 +24,14 @@
     "typecheck:daemon": "cd packages/daemon && npx tsc --noEmit",
     "typecheck:gateway": "cd packages/gateway && npx tsc --noEmit",
     "test": "npm run test:unit",
-    "test:unit": "npm run test:unit:daemon && npm run test:unit:gateway && npm run test:unit:ui",
+    "test:unit": "npm run test:unit:shared && npm run test:unit:daemon && npm run test:unit:gateway && npm run test:unit:ui",
     "test:unit:daemon": "cd packages/daemon && npm test",
     "test:unit:gateway": "cd packages/gateway && npm test",
     "test:unit:ui": "node packages/pve-integration/test/dialog-contracts.harness.mjs && node packages/pve-integration/test/mounts-submit.harness.mjs && node packages/pve-integration/test/edit-retarget.harness.mjs",
     "test:integration": "npx playwright test --project=integration",
     "test:stunt-deploy": "./test/stunt-node/deploy-anas.sh",
-    "test:stunt-run": "./test/stunt-node/run-tests.sh"
+    "test:stunt-run": "./test/stunt-node/run-tests.sh",
+    "test:unit:shared": "cd packages/shared && npm test"
   },
   "devDependencies": {
     "@antfu/eslint-config": "^7.7.2",

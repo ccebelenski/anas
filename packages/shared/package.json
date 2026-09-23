@@ -1,7 +1,7 @@
 {
   "name": "@anas/shared",
   "type": "module",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "private": true,
   "license": "AGPL-3.0-or-later",
   "exports": {
@@ -13,9 +13,14 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "tsx --test \"src/**/__tests__/*.test.ts\""
   },
   "dependencies": {
     "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "tsx": "^4.19.0"
   }
 }

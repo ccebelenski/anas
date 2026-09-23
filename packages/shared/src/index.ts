@@ -1,6 +1,6 @@
 // @anas/shared — shared types, schemas, and validators
 
-export const VERSION = '0.3.3'
+export const VERSION = '0.3.4'
 
 // Mount target normalisation (Epic 18): the pure server/share normaliser the
 // daemon (buildSpec, create/test routes) and the UI port both build from,
