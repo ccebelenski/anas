@@ -3,13 +3,18 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
   addShare,
+  composeVfsObjects,
+  customVfsRefusal,
   getShare,
+  hasCustomVfsObjects,
   hasShare,
   normalizeKey,
   parseDoc,
+  parseShadowFormatBucket,
   parseSmbConf,
   removeShare,
   serializeDoc,
+  shadowFormatFor,
   updateGlobal,
   updateShare,
 } from '../smb-conf.js'
@@ -729,5 +734,275 @@ describe('class guard — an untouched save is byte-identical', () => {
       })
     }
     assert.equal(text, FIXTURE)
+  })
+})
+
+// ============================================================================
+// Self-service features (smbsvc.1–3): the `vfs objects` composer, the managed
+// feature keys, the recycle purge marker, and custom-line detection. DESIGN
+// "Self-service on SMB shares" — one composer for all three features, the
+// stanza is the only store.
+// ============================================================================
+
+/** A plain two-share config nothing in these tests touches but [media]. */
+const SS_BASE = [
+  '[global]',
+  '\tworkgroup = WORKGROUP',
+  '',
+  '[media]',
+  '\tpath = /tank/media',
+  '\tread only = no',
+  '',
+  '[archive]',
+  '\tpath = /tank/archive',
+  '\tread only = yes',
+  '',
+].join('\n')
+
+const PV_ZFS = { bucket: 'hourly', snapdir: '.zfs/snapshot', snapdirseverywhere: true }
+const PV_AHR = { bucket: 'daily', snapdir: '/mnt/anas-ahr-snapshots/tank', snapdirseverywhere: false }
+
+function stanzaOf(text: string, name: string): string {
+  const start = text.indexOf(`[${name}]`)
+  const rest = text.slice(start)
+  const nextSection = rest.slice(1).search(/\n\[/)
+  return nextSection === -1 ? rest : rest.slice(0, nextSection + 1)
+}
+
+describe('vfs objects composer (smbsvc.1–3)', () => {
+  // Every subset of the three features → the ground-truthed module order
+  // (catia/fruit/streams_xattr ride together; shadow_copy2 then recycle).
+  const CASES: { label: string, pv: boolean, rc: boolean, tm: boolean, want: string | null }[] = [
+    { label: 'no feature on', pv: false, rc: false, tm: false, want: null },
+    { label: 'timeMachine only', pv: false, rc: false, tm: true, want: 'catia fruit streams_xattr' },
+    { label: 'previousVersions only', pv: true, rc: false, tm: false, want: 'shadow_copy2' },
+    { label: 'recycle only', pv: false, rc: true, tm: false, want: 'recycle' },
+    { label: 'previousVersions + recycle', pv: true, rc: true, tm: false, want: 'shadow_copy2 recycle' },
+    { label: 'timeMachine + previousVersions', pv: true, rc: false, tm: true, want: 'catia fruit streams_xattr shadow_copy2' },
+    { label: 'timeMachine + recycle', pv: false, rc: true, tm: true, want: 'catia fruit streams_xattr recycle' },
+    { label: 'all three', pv: true, rc: true, tm: true, want: 'catia fruit streams_xattr shadow_copy2 recycle' },
+  ]
+
+  for (const c of CASES) {
+    it(`${c.label} → ${c.want ?? '(line removed)'}`, () => {
+      assert.equal(composeVfsObjects({ previousVersions: c.pv, recycle: c.rc, timeMachine: c.tm }), c.want)
+    })
+  }
+})
+
+describe('shadow:format ↔ bucket (smbsvc.1)', () => {
+  it('round-trips every retention bucket', () => {
+    for (const bucket of ['frequently', 'hourly', 'daily', 'weekly', 'monthly', 'yearly'])
+      assert.equal(parseShadowFormatBucket(shadowFormatFor(bucket)), bucket)
+  })
+
+  it('rejects foreign formats and unknown buckets', () => {
+    assert.equal(parseShadowFormatBucket('%Y-%m-%d'), null)
+    assert.equal(parseShadowFormatBucket('anas-hourly-20260922T000000Z'), null)
+    assert.equal(parseShadowFormatBucket('anas-minutely-%Y-%m-%dT%H%M%SZ'), null)
+    assert.equal(parseShadowFormatBucket('anas-hourly-%Y-%m-%dT%H%M%SZ extra'), null)
+  })
+})
+
+describe('managed self-service keys (smbsvc.1)', () => {
+  it('enabling Previous Versions on a ZFS share writes the composer line + full key set', () => {
+    const next = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS })
+    const stanza = stanzaOf(next, 'media')
+    assert.match(stanza, /\tvfs objects = shadow_copy2\n/)
+    assert.match(stanza, /\tshadow:format = anas-hourly-%Y-%m-%dT%H%M%SZ\n/)
+    assert.match(stanza, /\tshadow:snapdir = \.zfs\/snapshot\n/)
+    assert.match(stanza, /\tshadow:snapdirseverywhere = yes\n/)
+    assert.match(stanza, /\tshadow:localtime = no\n/)
+    assert.match(stanza, /\tshadow:sort = desc\n/)
+    // The read model derives the feature FROM the stanza.
+    const share = getShare(next, 'media')!
+    assert.deepEqual(share.previousVersions, { bucket: 'hourly' })
+    assert.deepEqual(share.vfsObjects, ['shadow_copy2'])
+    assert.equal(hasCustomVfsObjects(share), false)
+    // Every other byte (the [archive] stanza included) is untouched.
+    assert.ok(next.endsWith(SS_BASE.slice(SS_BASE.indexOf('[archive]'))))
+  })
+
+  it('the AHR shape writes the absolute snapdir and NO snapdirseverywhere = yes', () => {
+    const next = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_AHR })
+    const stanza = stanzaOf(next, 'media')
+    assert.match(stanza, /\tshadow:snapdir = \/mnt\/anas-ahr-snapshots\/tank\n/)
+    assert.match(stanza, /\tshadow:snapdirseverywhere = no\n/)
+    assert.deepEqual(getShare(next, 'media')!.previousVersions, { bucket: 'daily' })
+  })
+
+  it('re-enabling with the same values is byte-identical (no-op save)', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS })
+    const again = updateShare(enabled, 'media', {}, { previousVersions: PV_ZFS })
+    assert.equal(again, enabled)
+  })
+
+  it('a full-field save on an enabled share leaves the file byte-identical', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS, recycle: { purgeDays: 30 } })
+    const share = getShare(enabled, 'media')!
+    const next = updateShare(enabled, 'media', {
+      path: share.path,
+      comment: share.comment ?? '',
+      browseable: share.browseable,
+      readOnly: share.readOnly,
+      guestOk: share.guestOk,
+      validUsers: share.validUsers,
+      hostsAllow: share.hostsAllow,
+      hostsDeny: share.hostsDeny,
+    })
+    assert.equal(next, enabled)
+  })
+
+  it('stacking: enabling recycle on a previousVersions share composes BOTH modules in order', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS })
+    const both = updateShare(enabled, 'media', {}, { recycle: { purgeDays: 14 } })
+    const stanza = stanzaOf(both, 'media')
+    assert.match(stanza, /\tvfs objects = shadow_copy2 recycle\n/)
+    // The shadow keys survive untouched.
+    assert.match(stanza, /\tshadow:format = anas-hourly-%Y-%m-%dT%H%M%SZ\n/)
+    assert.deepEqual(getShare(both, 'media')!.vfsObjects, ['shadow_copy2', 'recycle'])
+  })
+
+  it('disabling the last feature removes the composed line and the feature keys', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS })
+    const off = updateShare(enabled, 'media', {}, { previousVersions: null })
+    const stanza = stanzaOf(off, 'media')
+    assert.ok(!stanza.includes('vfs objects'), 'the composed line is gone')
+    assert.ok(!stanza.includes('shadow:'), 'the shadow keys are gone')
+    assert.equal(getShare(off, 'media')!.previousVersions, undefined)
+    // The untouched parts of the stanza stay put.
+    assert.match(stanza, /\tpath = \/tank\/media\n/)
+    assert.match(stanza, /\tread only = no\n/)
+  })
+
+  it('a CLEAR against a feature that never read as on leaves a foreign stanza untouched', () => {
+    // A hand-made stanza: the module is there, the format is NOT ANAS's — the
+    // feature does not read as on, so a disable request must not strip keys
+    // ANAS never wrote (guest philosophy, Principle 12).
+    const foreign = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = shadow_copy2\n\tshadow:format = %Y%m%d\n')
+    const next = updateShare(foreign, 'media', {}, { previousVersions: null })
+    assert.equal(next, foreign)
+    assert.equal(hasCustomVfsObjects(getShare(next, 'media')!), true)
+  })
+
+  it('enabling on a custom line throws the refusal sentence', () => {
+    const foreign = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = vfs_fruit_extras\n')
+    assert.throws(() => updateShare(foreign, 'media', {}, { previousVersions: PV_ZFS }), (err: Error) => {
+      return err.message === customVfsRefusal('media')
+    })
+    assert.equal(customVfsRefusal('media'), 'share \'media\' has a custom vfs objects line — remove it before enabling self-service features')
+  })
+
+  it('addShare writes the full self-service stanza at create time', () => {
+    const text = addShare('', {
+      name: 'photos',
+      path: '/tank/photos',
+      browseable: true,
+      readOnly: false,
+      guestOk: false,
+      validUsers: [],
+      hostsAllow: [],
+      hostsDeny: [],
+    }, { previousVersions: PV_ZFS })
+    assert.equal(text, [
+      '[photos]',
+      '\tpath = /tank/photos',
+      '\tbrowseable = yes',
+      '\tread only = no',
+      '\tguest ok = no',
+      '\tvfs objects = shadow_copy2',
+      '\tshadow:format = anas-hourly-%Y-%m-%dT%H%M%SZ',
+      '\tshadow:snapdir = .zfs/snapshot',
+      '\tshadow:snapdirseverywhere = yes',
+      '\tshadow:localtime = no',
+      '\tshadow:sort = desc',
+      '',
+    ].join('\n'))
+  })
+})
+
+describe('the recycle purge marker (smbsvc.2 keys, smbsvc.1 contract)', () => {
+  it('enabling recycle writes the marker with the purge age; never is `never`', () => {
+    const withDays = updateShare(SS_BASE, 'media', {}, { recycle: { purgeDays: 14 } })
+    assert.match(stanzaOf(withDays, 'media'), /^\t# anas:recycle-purge-days = 14$/m)
+    const never = updateShare(SS_BASE, 'media', {}, { recycle: { purgeDays: null } })
+    assert.match(stanzaOf(never, 'media'), /^\t# anas:recycle-purge-days = never$/m)
+    assert.deepEqual(getShare(never, 'media')!.recycle, { purgeDays: null })
+    assert.deepEqual(getShare(withDays, 'media')!.recycle, { purgeDays: 14 })
+  })
+
+  it('an existing marker is preserved verbatim on an unrelated edit', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { recycle: { purgeDays: 30 } })
+    const edited = updateShare(enabled, 'media', { comment: 'new comment' })
+    assert.ok(edited.includes('\tcomment = new comment\n'))
+    assert.ok(edited.includes('\t# anas:recycle-purge-days = 30\n'), 'marker line untouched, indent kept')
+    assert.equal(edited.split('anas:recycle-purge-days').length, 2)
+  })
+
+  it('the marker is rewritten ONLY when the value changes', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { recycle: { purgeDays: 30 } })
+    const same = updateShare(enabled, 'media', {}, { recycle: { purgeDays: 30 } })
+    assert.equal(same, enabled, 'same age → byte-identical')
+    const changed = updateShare(enabled, 'media', {}, { recycle: { purgeDays: 90 } })
+    assert.match(stanzaOf(changed, 'media'), /^\t# anas:recycle-purge-days = 90$/m)
+    assert.ok(!changed.includes('= 30'), 'the old age is gone')
+  })
+
+  it('turning recycle off removes the marker; the feature keys go with it', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { recycle: { purgeDays: 30 } })
+    const off = updateShare(enabled, 'media', {}, { recycle: null })
+    const stanza = stanzaOf(off, 'media')
+    assert.ok(!stanza.includes('recycle:'), 'the recycle keys are gone')
+    assert.ok(!stanza.includes('anas:recycle-purge-days'), 'the marker is gone')
+    assert.ok(!stanza.includes('vfs objects'), 'the composed line is gone (last feature off)')
+    assert.equal(getShare(off, 'media')!.recycle, undefined)
+  })
+
+  it('a marker outside the policy values reads as custom, never as a purge age', () => {
+    const foreign = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = recycle\n\trecycle:repository = #recycle\n\trecycle:keeptree = yes\n\trecycle:versions = yes\n\trecycle:touch = yes\n\t# anas:recycle-purge-days = 45\n')
+    const share = getShare(foreign, 'media')!
+    assert.equal(share.recycle, undefined)
+    assert.equal(hasCustomVfsObjects(share), true)
+  })
+})
+
+describe('hasCustomVfsObjects (smbsvc.1)', () => {
+  it('a share with no vfs objects line is never custom', () => {
+    assert.equal(hasCustomVfsObjects(getShare(SS_BASE, 'media')!), false)
+  })
+
+  it('a fully composer-written stanza is not custom', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS, recycle: { purgeDays: 7 }, timeMachine: { maxSize: 500_000_000_000 } })
+    const share = getShare(enabled, 'media')!
+    assert.deepEqual(share.vfsObjects, ['catia', 'fruit', 'streams_xattr', 'shadow_copy2', 'recycle'])
+    assert.deepEqual(share.timeMachine, { maxSize: 500_000_000_000 })
+    assert.equal(hasCustomVfsObjects(share), false)
+  })
+
+  it('a foreign module makes the line custom', () => {
+    const foreign = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = shadow_copy2 audit_pvfs\n\tshadow:format = %Y%m%d\n')
+    assert.equal(hasCustomVfsObjects(getShare(foreign, 'media')!), true)
+  })
+
+  it('the right modules with an INCOMPLETE key set reads custom', () => {
+    // shadow_copy2 without the managed companions: ANAS did not write this.
+    const partial = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = shadow_copy2\n\tshadow:format = anas-daily-%Y-%m-%dT%H%M%SZ\n')
+    assert.equal(hasCustomVfsObjects(getShare(partial, 'media')!), true)
+  })
+
+  it('the right modules with ANAS keys but a foreign spelling order reads custom', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS, recycle: { purgeDays: 7 } })
+    const reordered = enabled.replace('vfs objects = shadow_copy2 recycle', 'vfs objects = recycle shadow_copy2')
+    assert.equal(hasCustomVfsObjects(getShare(reordered, 'media')!), true)
+  })
+
+  it('recycle keys with no marker reads custom (the runner would never purge it)', () => {
+    const noMarker = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = recycle\n\trecycle:repository = #recycle\n\trecycle:keeptree = yes\n\trecycle:versions = yes\n\trecycle:touch = yes\n')
+    assert.equal(hasCustomVfsObjects(getShare(noMarker, 'media')!), true)
+  })
+
+  it('fruit keys without the size cap reads custom', () => {
+    const noCap = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = catia fruit streams_xattr\n\tfruit:time machine = yes\n')
+    assert.equal(hasCustomVfsObjects(getShare(noCap, 'media')!), true)
   })
 })

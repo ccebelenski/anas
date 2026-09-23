@@ -695,3 +695,378 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
     assert.ok(readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[dump-share]'))
   })
 })
+
+// ============================================================================
+// Self-service on SMB shares — slice 1 (smbsvc.1): Previous Versions enable /
+// disable round-trips on a mock ZFS share and a mock AHR share, the refusals,
+// and the testparm-gated byte-identical rollback.
+// ============================================================================
+
+const TESTPARM = '/usr/bin/testparm'
+const MOUNT_BIN = '/usr/bin/mount'
+
+/**
+ * The dev-mock pre-registers ground-truth AHR fixtures for pool `ahr0` (flat
+ * layout, mountpoint `/mnt/anas-ahr/ahr0`) and they win first-match, so a
+ * second pool's fixtures would never match. Instead of re-registering, wrap
+ * `exec` and override ONLY the mount-table read that decides `subvolLayout` —
+ * every other AHR read falls through to the dev fixtures (pool `ahr0`).
+ */
+function wrapAhrFindmnt(mock: MockExecutor, opts: { subvol?: string } = {}): void {
+  const subvol = opts.subvol ?? 'subvolid=256,subvol=/@data'
+  const orig = mock.exec.bind(mock)
+  mock.exec = async (command: string, args: string[]) => {
+    if (command === '/usr/bin/findmnt' && args[0] === '--json' && args[1] === '--real') {
+      return { stdout: JSON.stringify({ filesystems: [{
+        target: '/',
+        source: '/dev/sda1',
+        fstype: 'ext4',
+        options: 'rw,relatime,errors=remount-ro',
+      }, {
+        target: '/mnt/anas-ahr/ahr0',
+        source: '/dev/mapper/ahr0-ahr0--vol',
+        fstype: 'btrfs',
+        options: `rw,relatime,space_cache=v2,${subvol}`,
+      }] }), stderr: '', exitCode: 0 }
+    }
+    return orig(command, args)
+  }
+}
+
+describe('SMB self-service (smbsvc.1 slice 1)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string | undefined
+  let confPath: string | undefined
+  let fstabPath: string | undefined
+  let schedDir: string | undefined
+  let savedEnv: { systemd?: string, fstab?: string } = {}
+
+  const ZFS_SHARE_CONF = [
+    '[global]',
+    '\tworkgroup = WORKGROUP',
+    '',
+    '[media]',
+    '\tpath = /testpool/media',
+    '\tread only = no',
+    '',
+  ].join('\n')
+
+  const AHR_SHARE_CONF = [
+    '[global]',
+    '\tworkgroup = WORKGROUP',
+    '',
+    '[media]',
+    '\tpath = /mnt/anas-ahr/ahr0/media',
+    '\tread only = no',
+    '',
+  ].join('\n')
+
+  /**
+   * A server with the footprint reads fixture-registered. `zfsTable` decides
+   * whether the share's path resolves onto a ZFS dataset (empty = fall
+   * through to AHR, where `wrapAhrFindmnt` steers the pool's layout).
+   */
+  function startSelfService(
+    conf: string,
+    opts: { zfsTable?: string, ahr?: { subvol?: string }, systemdUnits?: { id: string, cadence: string, dataset: string }[] } = {},
+  ): ReturnType<typeof createServer> {
+    dir = mkdtempSync(join(tmpdir(), 'anas-smb-selfsvc-'))
+    fstabPath = join(dir, 'fstab')
+    writeFileSync(fstabPath, '# test fstab\n', 'utf8')
+    schedDir = join(dir, 'units')
+    mkdirSync(schedDir)
+    for (const u of opts.systemdUnits ?? []) {
+      writeFileSync(join(schedDir, `anas-snap-${u.id}.service`), [
+        '[Unit]',
+        `# X-ANAS-Schedule=${JSON.stringify({
+          id: u.id,
+          name: u.id,
+          target: { kind: 'zfs', dataset: u.dataset },
+          cadence: u.cadence,
+          retention: { daily: 7 },
+          enabled: true,
+        })}`,
+        '',
+        '[Service]',
+        'Type=oneshot',
+        '',
+      ].join('\n'), 'utf8')
+    }
+    savedEnv = { systemd: process.env.ANAS_SYSTEMD_DIR, fstab: process.env.ANAS_FSTAB_PATH }
+    process.env.ANAS_SYSTEMD_DIR = schedDir
+    process.env.ANAS_FSTAB_PATH = fstabPath
+    confPath = join(dir, 'smb.conf')
+    writeFileSync(confPath, conf, 'utf8')
+    server = createServer({ mock: true, logger: false, smbConfPath: confPath })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    // The footprint reads (datasetOfPath): mountpoint table + boot probe.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: opts.zfsTable ?? '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '/dev/sda1\text4\n', stderr: '', exitCode: 0 } })
+    // testparm gate + reload.
+    mock.addFixture({ command: TESTPARM, result: { stdout: 'Loaded services file OK.', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    // The AHR `@snapshots` mount probe (not mounted yet → mount runs) + mount.
+    mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'TARGET', '/mnt/anas-ahr-snapshots/ahr0'], result: { stdout: '', stderr: '', exitCode: 1 } })
+    mock.addFixture({ command: MOUNT_BIN, result: { stdout: '', stderr: '', exitCode: 0 } })
+    if (opts.ahr)
+      wrapAhrFindmnt(mock, opts.ahr)
+    return server
+  }
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    if (savedEnv.systemd === undefined)
+      delete process.env.ANAS_SYSTEMD_DIR
+    else
+      process.env.ANAS_SYSTEMD_DIR = savedEnv.systemd
+    if (savedEnv.fstab === undefined)
+      delete process.env.ANAS_FSTAB_PATH
+    else
+      process.env.ANAS_FSTAB_PATH = savedEnv.fstab
+    savedEnv = {}
+    if (dir) {
+      rmSync(dir, { recursive: true, force: true })
+      dir = undefined
+      confPath = undefined
+      fstabPath = undefined
+      schedDir = undefined
+    }
+  })
+
+  // --- ZFS share -----------------------------------------------------------
+  it('enable on a ZFS share writes the composed stanza; the detail derives the bucket', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n' })
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ previousVersions: { enabled: true } }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+    const written = readFileSync(confPath!, 'utf8')
+    const stanza = written.slice(written.indexOf('[media]'))
+    assert.ok(stanza.includes('\tvfs objects = shadow_copy2\n'), written)
+    assert.ok(stanza.includes('\tshadow:format = anas-daily-%Y-%m-%dT%H%M%SZ\n'), written)
+    assert.ok(stanza.includes('\tshadow:snapdir = .zfs/snapshot\n'), written)
+    assert.ok(stanza.includes('\tshadow:snapdirseverywhere = yes\n'), written)
+    assert.ok(stanza.includes('\tshadow:localtime = no\n'), written)
+    assert.ok(stanza.includes('\tshadow:sort = desc\n'), written)
+    // No schedule exists → `daily` is the honest fallback, never a refusal.
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    assert.deepEqual((detail.json() as { data: SmbShare }).data.previousVersions, { bucket: 'daily' })
+  })
+
+  it('the bucket is the FINEST enabled schedule on the dataset, read from the unit store', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF, {
+      zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n',
+      systemdUnits: [
+        { id: 'nightly', cadence: 'daily', dataset: 'testpool/media' },
+        { id: 'hourly', cadence: 'hourly', dataset: 'testpool/media' },
+        { id: 'other', cadence: 'frequently', dataset: 'testpool/other' },
+      ],
+    })
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ previousVersions: { enabled: true } }),
+    })
+    assert.equal(res.statusCode, 202)
+    await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.ok(readFileSync(confPath!, 'utf8').includes('\tshadow:format = anas-hourly-%Y-%m-%dT%H%M%SZ\n'))
+  })
+
+  it('re-enabling with the same request leaves smb.conf byte-identical (testparm-gated no-op)', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n' })
+    const payload = JSON.stringify({ previousVersions: { enabled: true } })
+    const first = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload })
+    await waitForJob(s, (first.json() as JobAccepted).job.id)
+    const afterFirst = readFileSync(confPath!, 'utf8')
+    const second = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload })
+    await waitForJob(s, (second.json() as JobAccepted).job.id)
+    assert.equal(readFileSync(confPath!, 'utf8'), afterFirst)
+  })
+
+  it('disable removes the shadow keys and the composed line; the read model follows', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n' })
+    const enable = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ previousVersions: { enabled: true } }) })
+    await waitForJob(s, (enable.json() as JobAccepted).job.id)
+    const disable = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ previousVersions: null }) })
+    assert.equal(disable.statusCode, 202)
+    await waitForJob(s, (disable.json() as JobAccepted).job.id)
+    const written = readFileSync(confPath!, 'utf8')
+    assert.equal(written, ZFS_SHARE_CONF, 'disable restores the original bytes exactly')
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    assert.equal((detail.json() as { data: SmbShare }).data.previousVersions, undefined)
+  })
+
+  // --- AHR share -----------------------------------------------------------
+  it('enable on an AHR share writes the absolute snapdir and the ONE @snapshots fstab mount', async () => {
+    const s = startSelfService(AHR_SHARE_CONF, { ahr: {} })
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ previousVersions: { enabled: true } }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+    const written = readFileSync(confPath!, 'utf8')
+    const stanza = written.slice(written.indexOf('[media]'))
+    assert.ok(stanza.includes('\tvfs objects = shadow_copy2\n'), written)
+    assert.ok(stanza.includes('\tshadow:snapdir = /mnt/anas-ahr-snapshots/ahr0\n'), written)
+    assert.ok(stanza.includes('\tshadow:snapdirseverywhere = no\n'), written)
+    // The ONE fstab line, read-only, nofail, subvol=@snapshots — and the mount NOW.
+    const fstab = readFileSync(fstabPath!, 'utf8')
+    assert.equal(fstab.split('\n').filter(l => l.includes('/mnt/anas-ahr-snapshots/ahr0')).length, 1, fstab)
+    assert.match(fstab, /^\/dev\/ahr0\/ahr0-vol\s+\/mnt\/anas-ahr-snapshots\/ahr0\s+btrfs\s+ro,nofail,subvol=@snapshots\s+0 0$/m)
+    assert.ok((s as unknown as { executor: MockExecutor }).executor.calls
+      .some(c => c.command === MOUNT_BIN && c.args[0] === '/mnt/anas-ahr-snapshots/ahr0'))
+  })
+
+  it('a second enable on the same AHR pool writes NO second fstab line and does not mount again', async () => {
+    const s = startSelfService(AHR_SHARE_CONF, { ahr: {} })
+    const payload = JSON.stringify({ previousVersions: { enabled: true } })
+    for (let i = 0; i < 2; i++) {
+      const res = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    }
+    const fstab = readFileSync(fstabPath!, 'utf8')
+    assert.equal(fstab.split('\n').filter(l => l.includes('/mnt/anas-ahr-snapshots/ahr0')).length, 1, fstab)
+    const mock = (s as unknown as { executor: MockExecutor }).executor
+    // The probe fixture answers "not mounted" (exit 1) — matched twice max.
+    const mountCalls = mock.calls.filter(c => c.command === MOUNT_BIN && c.args[0] === '/mnt/anas-ahr-snapshots/ahr0')
+    assert.ok(mountCalls.length >= 1, 'the first enable mounts the snapshots subvolume')
+    assert.ok(mountCalls.length <= 2, 'no mount storm on repeat enables')
+  })
+
+  it(`enable on a FLAT-layout AHR pool is refused: "pool 'ahr0' predates the snapshot layout…"`, async () => {
+    const s = startSelfService(AHR_SHARE_CONF, { ahr: { subvol: 'subvolid=5,subvol=/' } })
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ previousVersions: { enabled: true } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /pool 'ahr0' predates the snapshot layout — Previous Versions needs @snapshots/)
+    assert.ok(!readFileSync(confPath!, 'utf8').includes('shadow:'), 'nothing was written')
+  })
+
+  // --- Refusals ------------------------------------------------------------
+  it(`enable on a share with a custom vfs objects line is refused with the share named`, async () => {
+    const custom = ZFS_SHARE_CONF.replace('\tread only = no\n', '\tread only = no\n\tvfs objects = vfs_fruit_extras\n')
+    const s = startSelfService(custom, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n' })
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ previousVersions: { enabled: true } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /share 'media' has a custom vfs objects line — remove it before enabling self-service features/)
+    // The list/detail still flags the share as custom for the dialog to grey.
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    const share = (detail.json() as { data: SmbShare }).data
+    assert.deepEqual(share.vfsObjects, ['vfs_fruit_extras'])
+    // Clearing on a custom share is NOT refused — and changes nothing.
+    const clear = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ previousVersions: null }) })
+    assert.equal(clear.statusCode, 202)
+    await waitForJob(s, (clear.json() as JobAccepted).job.id)
+    assert.equal(readFileSync(confPath!, 'utf8'), custom)
+  })
+
+  it(`enable on a path that is neither ZFS nor AHR is refused: "…no snapshots to expose"`, async () => {
+    const scratch = ZFS_SHARE_CONF.replace('/testpool/media', '/srv/scratch')
+    const s = startSelfService(scratch)
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ previousVersions: { enabled: true } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /'\/srv\/scratch' is not on a ZFS dataset or an AHR pool — there are no snapshots to expose/)
+  })
+
+  it('a create that enables Previous Versions writes the stanza (and AHR mounts nothing until enable)', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n' })
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'photos', path: '/testpool/media', previousVersions: { enabled: true } }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const written = readFileSync(confPath!, 'utf8')
+    assert.ok(written.includes('[photos]'))
+    assert.ok(written.includes('\tvfs objects = shadow_copy2\n'))
+    assert.ok(written.includes('\tshadow:format = anas-daily-%Y-%m-%dT%H%M%SZ\n'))
+  })
+
+  it('a create enabling Previous Versions on a non-snapshot path is refused 400', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'scratch', path: '/srv/scratch', previousVersions: { enabled: true } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /no snapshots to expose/)
+    assert.ok(!readFileSync(confPath!, 'utf8').includes('[scratch]'))
+  })
+
+  it('a request that SETS recycle or timeMachine is refused (slice 1 ships Previous Versions only)', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n' })
+    for (const feature of [{ recycle: { purgeDays: 30 } }, { timeMachine: { maxSize: 1_000_000 } }]) {
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/media',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify(feature),
+      })
+      assert.equal(res.statusCode, 400)
+      assert.match(res.json().error.message, /not available in this version/)
+      assert.ok(!readFileSync(confPath!, 'utf8').includes('recycle:'))
+      assert.ok(!readFileSync(confPath!, 'utf8').includes('fruit:'))
+    }
+  })
+
+  it('a failing testparm rolls the write back byte-identically and fails the job with the sentence', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n' })
+    const mock = (s as unknown as { executor: MockExecutor }).executor
+    // The gate runs BEFORE the candidate /usr/bin/testparm fixture: register a
+    // failure for the candidate temp file specifically.
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) => {
+      if (command === TESTPARM && args[0] === '-s' && args[1]?.endsWith('.anas-testparm.tmp'))
+        return { stdout: '', stderr: 'Unknown parameter encountered: "vfs objects"', exitCode: 1 }
+      return orig(command, args)
+    }
+    const before = readFileSync(confPath!, 'utf8')
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ previousVersions: { enabled: true } }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.match((job.error as { message: string }).message, /smb.conf failed testparm validation — the change was not applied/)
+    assert.equal(readFileSync(confPath!, 'utf8'), before, 'the file stands byte-identical')
+  })
+})

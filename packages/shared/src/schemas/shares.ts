@@ -14,6 +14,58 @@ export const SmbConnection = z.object({
 })
 export type SmbConnection = z.infer<typeof SmbConnection>
 
+// ---------------------------------------------------------------------------
+// Self-service features on SMB shares (smbsvc.1–3, DESIGN "Self-service on
+// SMB shares"). Each feature is pure surgical smb.conf wiring of a Samba VFS
+// module set; the `vfs objects` line is COMPOSED from the enabled set, and
+// every feature key is a managed parameter. All three schemas are cut once
+// here — smbsvc.2 (recycle) and smbsvc.3 (Time Machine) reuse them.
+// ---------------------------------------------------------------------------
+
+/**
+ * Which snapshot schedule bucket a share's Previous Versions exposes. The
+ * daemon picks it (the finest cadence scheduled on the share's backing
+ * dataset/pool, `daily` when none) and the stanza is the store: the value is
+ * parsed back from `shadow:format = anas-<bucket>-…` on every read — never
+ * kept anywhere else (Principle 11).
+ */
+export const PreviousVersionsState = z.object({ bucket: z.string().min(1) })
+export type PreviousVersionsState = z.infer<typeof PreviousVersionsState>
+
+/** Purge age for the recycle bin, in days; `null` = never purge. */
+export const RecyclePurgeDays = z.union([
+  z.literal(7),
+  z.literal(14),
+  z.literal(30),
+  z.literal(90),
+  z.null(),
+])
+export type RecyclePurgeDays = z.infer<typeof RecyclePurgeDays>
+
+export const RecycleState = z.object({ purgeDays: RecyclePurgeDays })
+export type RecycleState = z.infer<typeof RecycleState>
+
+/** Time Machine size cap in bytes (the `fruit:time machine max size` value). */
+export const TimeMachineState = z.object({ maxSize: z.number().int().positive() })
+export type TimeMachineState = z.infer<typeof TimeMachineState>
+
+/**
+ * The self-service feature set a request SETS. Each field is three-valued per
+ * the §2 dialog↔daemon contract: value = set, `null` = clear, omitted = keep.
+ * `previousVersions.enabled=false` is the explicit "turn it off" that the
+ * boolean needs (there is no value to hold).
+ */
+export const PreviousVersionsRequest = z.object({ enabled: z.boolean() }).nullable()
+export type PreviousVersionsRequest = z.infer<typeof PreviousVersionsRequest>
+
+/** Request shape for the recycle bin: a value sets it (purge age, `null` inside = never). */
+export const RecycleRequest = z.object({ purgeDays: RecyclePurgeDays }).nullable()
+export type RecycleRequest = z.infer<typeof RecycleRequest>
+
+/** Request shape for the Time Machine target (cap in bytes). */
+export const TimeMachineRequest = TimeMachineState.nullable()
+export type TimeMachineRequest = z.infer<typeof TimeMachineRequest>
+
 /**
  * An SMB share (a `[name]` stanza in smb.conf). ANAS lists ALL shares,
  * whether it or an admin created them (Principle 11).
@@ -48,6 +100,21 @@ export const SmbShare = z.object({
    * unknown (old daemon, or the stat failed, e.g. EACCES — never a false stale).
    */
   pathExists: z.boolean().optional(),
+  /**
+   * The share's `vfs objects` module list, parsed from the stanza — absent
+   * when the stanza carries no such line. Read-only information (what the
+   * config says), and the input {@link hasCustomVfsObjects} answers from.
+   */
+  vfsObjects: z.array(z.string()).optional(),
+  /**
+   * Previous Versions (smbsvc.1), derived FROM the stanza (`shadow:format`).
+   * Present iff the feature is on. Absent = off / not configured here.
+   */
+  previousVersions: PreviousVersionsState.optional(),
+  /** Recycle bin (smbsvc.2), derived from the stanza + its purge marker. */
+  recycle: RecycleState.optional(),
+  /** Time Machine target (smbsvc.3, beta), derived from the fruit keys. */
+  timeMachine: TimeMachineState.optional(),
 })
 export type SmbShare = z.infer<typeof SmbShare>
 
@@ -85,6 +152,14 @@ export const CreateSmbShareRequest = z.object({
   validUsers: z.array(SingleLine).optional(),
   hostsAllow: z.array(SingleLine).optional(),
   hostsDeny: z.array(SingleLine).optional(),
+  /**
+   * Self-service features (smbsvc.1–3): value = set, `null` = clear, omitted
+   * = keep (the §2 dialog↔daemon contract). Enabling is refused on a share
+   * with a custom `vfs objects` line and on a path with nothing to expose.
+   */
+  previousVersions: PreviousVersionsRequest.optional(),
+  recycle: RecycleRequest.optional(),
+  timeMachine: TimeMachineRequest.optional(),
 })
 export type CreateSmbShareRequest = z.infer<typeof CreateSmbShareRequest>
 

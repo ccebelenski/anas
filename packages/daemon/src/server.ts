@@ -348,6 +348,8 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/bin/smbstatus', args: ['-S'], result: { stdout: '', stderr: '', exitCode: 0 } })
     // systemctl reload smbd — config-change side effect.
     mock.addFixture({ command: '/usr/bin/systemctl', args: ['reload', 'smbd'], result: { stdout: '', stderr: '', exitCode: 0 } })
+    // testparm — the smb.conf write gate (smbsvc.1); dev candidates validate OK.
+    mock.addFixture({ command: '/usr/bin/testparm', result: { stdout: 'Loaded services file OK.', stderr: '', exitCode: 0 } })
 
     // --- Epic 2: Dashboard -----------------------------------------------
     // Service-active probes for the share status panel (GET /v1/status).
@@ -512,7 +514,7 @@ export function createServer(opts?: ServerOptions) {
   // datasetRoutes also reads the share configs to report associated shares
   // (Epic 4.4) and warn on destroy — same paths the share routes edit.
   server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport, iscsiPaths })
-  server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath })
+  server.register(smbShareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, fstabPath, systemdDir })
   server.register(nfsExportRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, exportsPath })
   server.register(shareIdentityRoutes, {
     prefix: '/v1',

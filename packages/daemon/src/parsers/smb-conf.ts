@@ -20,7 +20,8 @@
  * edits; they never touch lines outside the section (and key) being changed.
  */
 
-import type { CreateSmbShareRequest, SmbGlobalConfig, SmbShare, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
+import type { CreateSmbShareRequest, RecyclePurgeDays, SmbGlobalConfig, SmbShare, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
+import { RetentionBucket } from '@anas/shared'
 
 /** `[section]` header (whole trimmed line). */
 const SECTION_HEADER_RE = /^\[(.+)\]\s*$/
@@ -285,6 +286,25 @@ const PARAM = {
   serverString: { canonical: 'server string', norms: ['serverstring'] },
   interfaces: { canonical: 'interfaces', norms: ['interfaces'] },
   bindInterfacesOnly: { canonical: 'bind interfaces only', norms: ['bindinterfacesonly'], unset: 'no' },
+  // ── Self-service features (smbsvc.1–3). The `vfs objects` line is COMPOSED
+  // from the enabled feature set (composeVfsObjects below) — never hand-merged.
+  // Keys are case- and space-insensitive like every parameter ("fruit:time
+  // machine" ≡ "fruit:timemachine"), so the norms fold the spaces out.
+  // Deliberately NO `unset` defaults: enabling writes the complete key set
+  // even where a value equals Samba's default (the stanza is the proof of
+  // ownership, and "relying on the default" would leave a half-written shape).
+  vfsObjects: { canonical: 'vfs objects', norms: ['vfsobjects'] },
+  shadowSnapdir: { canonical: 'shadow:snapdir', norms: ['shadow:snapdir'] },
+  shadowSnapdirseverywhere: { canonical: 'shadow:snapdirseverywhere', norms: ['shadow:snapdirseverywhere'] },
+  shadowLocaltime: { canonical: 'shadow:localtime', norms: ['shadow:localtime'] },
+  shadowSort: { canonical: 'shadow:sort', norms: ['shadow:sort'] },
+  shadowFormat: { canonical: 'shadow:format', norms: ['shadow:format'] },
+  recycleRepository: { canonical: 'recycle:repository', norms: ['recycle:repository'] },
+  recycleKeeptree: { canonical: 'recycle:keeptree', norms: ['recycle:keeptree'] },
+  recycleVersions: { canonical: 'recycle:versions', norms: ['recycle:versions'] },
+  recycleTouch: { canonical: 'recycle:touch', norms: ['recycle:touch'] },
+  fruitTimeMachine: { canonical: 'fruit:time machine', norms: ['fruit:timemachine'] },
+  fruitTimeMachineMaxSize: { canonical: 'fruit:time machine max size', norms: ['fruit:timemachinemaxsize'] },
 } as const satisfies Record<string, SmbParam>
 
 /** One definition of a parameter, flagged when it uses an inverted spelling. */
@@ -330,18 +350,223 @@ function paramBool(defs: KeyDef[], param: SmbParam): boolean {
 }
 
 // ============================================================================
+// Self-service features (smbsvc.1–3) — the `vfs objects` COMPOSER + managed
+// feature keys + the recycle purge marker. DESIGN "Self-service on SMB shares".
+// ============================================================================
+
+/** `recycle:repository` — the bin name users know, visible at the share root. */
+export const RECYCLE_REPOSITORY = '#recycle'
+
+/**
+ * The `# anas:recycle-purge-days = <n>` marker (the fstab `#ANAS` pattern): the
+ * purge age lives IN the stanza — the config file stays the one store (P.11).
+ */
+const PURGE_MARKER_RE = /^#\s*anas:recycle-purge-days\s*=(.*)$/
+const SHADOW_FORMAT_RE = /^anas-([a-z]+)-%Y-%m-%dT%H%M%SZ$/
+const DIGITS_RE = /^\d+$/
+
+/**
+ * The enabled-features → `vfs objects` module list. ONE composer for all
+ * three features (smbsvc.2/.3 reuse it); the order is ground-truthed on
+ * Samba 4.22 (catia/fruit/streams_xattr ride together for Time Machine).
+ * `null` = no feature on → the line is REMOVED, never left empty.
+ */
+export function composeVfsObjects(features: {
+  previousVersions?: boolean
+  recycle?: boolean
+  timeMachine?: boolean
+}): string | null {
+  const modules: string[] = []
+  if (features.timeMachine)
+    modules.push('catia', 'fruit', 'streams_xattr')
+  if (features.previousVersions)
+    modules.push('shadow_copy2')
+  if (features.recycle)
+    modules.push('recycle')
+  return modules.length > 0 ? modules.join(' ') : null
+}
+
+/** `shadow:format` for a schedule bucket: `anas-<bucket>-%Y-%m-%dT%H%M%SZ`. */
+export function shadowFormatFor(bucket: string): string {
+  return `anas-${bucket}-%Y-%m-%dT%H%M%SZ`
+}
+
+/**
+ * The ANAS-written `shadow:format` → its schedule bucket, or null when the
+ * value is not one of ours (a custom format means the line is not ANAS's).
+ * The bucket must be a real retention bucket — `shadow:snapprefix` is broken
+ * on Samba 4.22, so a share exposes exactly ONE bucket through this format.
+ */
+export function parseShadowFormatBucket(value: string): string | null {
+  const m = SHADOW_FORMAT_RE.exec(value.trim())
+  if (!m)
+    return null
+  return (RetentionBucket.options as readonly string[]).includes(m[1]) ? m[1] : null
+}
+
+/** Marker text for a purge age (`null` inside = never purge). */
+function purgeMarkerValue(purgeDays: RecyclePurgeDays): string {
+  return purgeDays === null ? 'never' : String(purgeDays)
+}
+
+/**
+ * A marker value → its purge age; `undefined` when it is not a policy value
+ * (`null` = `never`; a number = days).
+ */
+function parseMarkerDays(raw: string): RecyclePurgeDays | undefined {
+  const v = raw.trim().toLowerCase()
+  if (v === 'never')
+    return null
+  if (!DIGITS_RE.test(v))
+    return undefined
+  const n = Number(v)
+  return (n === 7 || n === 14 || n === 30 || n === 90) ? (n as RecyclePurgeDays) : undefined
+}
+
+/** The verbatim marker line (rewritten whole — never reformatted) for a value. */
+function purgeMarkerLine(indent: string, value: string): string {
+  return `${indent}# anas:recycle-purge-days = ${value}`
+}
+
+/**
+ * Find the recycle purge marker inside a section. Returns the raw value text
+ * (e.g. `30` or `never`) and its line index, or null when the section has no
+ * marker. The marker is a COMMENT line, so it is invisible to `sectionDefs`
+ * and handled by its own scan.
+ */
+function findPurgeMarker(doc: SmbConfDoc, span: SectionSpan): { value: string, line: number } | null {
+  for (let i = span.start; i < span.end; i++) {
+    if (i === span.headerIndex)
+      continue
+    const m = PURGE_MARKER_RE.exec(content(doc.lines[i]).trim())
+    if (m)
+      return { value: m[1].trim(), line: i }
+  }
+  return null
+}
+
+/**
+ * Set or remove the purge marker in one section, splicing `doc.lines`. The
+ * existing line is preserved VERBATIM and rewritten only when the value
+ * changes (the line's own indent kept); `wanted === null` removes it. A new
+ * marker is inserted after the section's last content line at `indent` — the
+ * same anchor applyEditsToSection uses for new keys. Recomputes the section
+ * overlay first — earlier inserts/ removals shifted the spans.
+ */
+function applyPurgeMarkerEdit(doc: SmbConfDoc, sectionName: string, wanted: string | null, indent: string): void {
+  reindexSections(doc)
+  const span = findSection(doc, sectionName)
+  if (!span)
+    return
+  const existing = findPurgeMarker(doc, span)
+  if (wanted === null) {
+    if (existing)
+      doc.lines.splice(existing.line, 1)
+    return
+  }
+  if (existing) {
+    if (existing.value !== wanted) {
+      const m = LEADING_WS_RE.exec(content(doc.lines[existing.line]))
+      doc.lines[existing.line] = purgeMarkerLine(m?.[0] ?? indent, wanted)
+    }
+    return
+  }
+  // Insert after the section's last content line, before trailing blanks —
+  // the same anchor applyEditsToSection uses for new keys.
+  const fresh = findSection(doc, sectionName)
+  if (!fresh)
+    return
+  let insertAt = fresh.headerIndex !== null ? fresh.headerIndex + 1 : fresh.start
+  for (let i = fresh.start; i < fresh.end; i++) {
+    if (i === fresh.headerIndex)
+      continue
+    if (content(doc.lines[i]).trim() !== '')
+      insertAt = i + 1
+  }
+  doc.lines.splice(insertAt, 0, purgeMarkerLine(indent, wanted))
+}
+
+/**
+ * Is a feature's managed-key set COMPLETE — i.e. written the way the composer
+ * writes it? A stanza carrying the module but a foreign/absent key set is a
+ * hand-made line: the feature does not read as on, and the share reads custom.
+ */
+function previousVersionsKeysComplete(defs: KeyDef[]): boolean {
+  return parseShadowFormatBucket(paramValue(defs, PARAM.shadowFormat) ?? '') !== null
+    && paramValue(defs, PARAM.shadowSnapdir) !== undefined
+    && paramValue(defs, PARAM.shadowLocaltime) !== undefined
+    && paramValue(defs, PARAM.shadowSort) !== undefined
+}
+
+function recycleKeysComplete(defs: KeyDef[], marker: string | null): boolean {
+  return paramValue(defs, PARAM.recycleRepository) === RECYCLE_REPOSITORY
+    && paramValue(defs, PARAM.recycleKeeptree) !== undefined
+    && paramValue(defs, PARAM.recycleVersions) !== undefined
+    && paramValue(defs, PARAM.recycleTouch) !== undefined
+    && marker !== null
+    && parseMarkerDays(marker) !== undefined
+}
+
+function timeMachineKeysComplete(defs: KeyDef[]): boolean {
+  const maxSize = paramValue(defs, PARAM.fruitTimeMachineMaxSize)
+  return parseBool(paramValue(defs, PARAM.fruitTimeMachine), false)
+    && maxSize !== undefined && DIGITS_RE.test(maxSize) && Number(maxSize) > 0
+}
+
+// ============================================================================
 // Typed read-models (SmbShare / SmbGlobalConfig) built from a section's defs.
 // ============================================================================
+
+/**
+ * Is this stanza's `vfs objects` line ANAS-composed? A line is CUSTOM — and
+ * no self-service feature may be enabled on the share — when it carries any
+ * module outside the composer's set, or a module set that does not exactly
+ * match the composer's output for the features that read as on (a feature
+ * reads as on only with its COMPLETE managed-key set above). A share with no
+ * `vfs objects` line is never custom. Pure over the read-model.
+ */
+export function hasCustomVfsObjects(share: SmbShare): boolean {
+  if (!share.vfsObjects || share.vfsObjects.length === 0)
+    return false
+  const composed = composeVfsObjects({
+    previousVersions: share.previousVersions !== undefined,
+    recycle: share.recycle !== undefined,
+    timeMachine: share.timeMachine !== undefined,
+  })
+  if (composed === null)
+    return true
+  return share.vfsObjects.join(' ') !== composed
+}
+
+/**
+ * The custom-`vfs objects` refusal sentence, stated ONCE — the route's 400
+ * fast path and the parser's in-job guard both quote it.
+ */
+export function customVfsRefusal(share: string): string {
+  return `share '${share}' has a custom vfs objects line — remove it before enabling self-service features`
+}
 
 /**
  * Build an SmbShare from a section's definitions, or null if it has no path —
  * such sections (e.g. `[homes]`, `[printers]`) are not path-based file shares
  * ANAS manages, and would not satisfy the schema's AbsolutePath.
+ *
+ * `marker` is the section's recycle purge marker value (null when absent).
+ * The self-service feature states are DERIVED from the stanza — the module
+ * list plus each feature's complete managed-key set — so list/detail read
+ * them straight from the config with no shadow copy (Principle 11).
  */
-function toSmbShare(name: string, defs: KeyDef[]): SmbShare | null {
+function toSmbShare(name: string, defs: KeyDef[], marker: string | null): SmbShare | null {
   const path = paramValue(defs, PARAM.path)
   if (!path)
     return null
+
+  const vfsModules = parseList(paramValue(defs, PARAM.vfsObjects))
+  const previousVersionsOn = vfsModules.includes('shadow_copy2') && previousVersionsKeysComplete(defs)
+  const recycleOn = vfsModules.includes('recycle') && recycleKeysComplete(defs, marker)
+  const timeMachineOn = vfsModules.includes('fruit') && vfsModules.includes('catia') && timeMachineKeysComplete(defs)
+  const maxSizeRaw = paramValue(defs, PARAM.fruitTimeMachineMaxSize)
+  const bucket = parseShadowFormatBucket(paramValue(defs, PARAM.shadowFormat) ?? '')
 
   return {
     name,
@@ -353,6 +578,10 @@ function toSmbShare(name: string, defs: KeyDef[]): SmbShare | null {
     validUsers: parseList(paramValue(defs, PARAM.validUsers)),
     hostsAllow: parseList(paramValue(defs, PARAM.hostsAllow)),
     hostsDeny: parseList(paramValue(defs, PARAM.hostsDeny)),
+    ...(vfsModules.length > 0 ? { vfsObjects: vfsModules } : {}),
+    ...(previousVersionsOn && bucket ? { previousVersions: { bucket } } : {}),
+    ...(recycleOn && marker !== null ? { recycle: { purgeDays: parseMarkerDays(marker) as RecyclePurgeDays } } : {}),
+    ...(timeMachineOn && maxSizeRaw !== undefined ? { timeMachine: { maxSize: Number(maxSizeRaw) } } : {}),
   }
 }
 
@@ -386,7 +615,7 @@ export function parseSmbConf(text: string): SmbConfView {
       global = toGlobalConfig(defs)
       continue
     }
-    const share = toSmbShare(span.name as string, defs)
+    const share = toSmbShare(span.name as string, defs, findPurgeMarker(doc, span)?.value ?? null)
     if (share)
       shares.push(share)
   }
@@ -400,7 +629,7 @@ export function getShare(text: string, name: string): SmbShare | null {
   const span = findSection(doc, name)
   if (!span || span.key === 'global')
     return null
-  return toSmbShare(span.name as string, sectionDefs(doc, span))
+  return toSmbShare(span.name as string, sectionDefs(doc, span), findPurgeMarker(doc, span)?.value ?? null)
 }
 
 /** Does a share section by this name exist? (case-insensitive). */
@@ -554,6 +783,134 @@ function applyEditsToSection(doc: SmbConfDoc, sectionName: string, edits: KeyEdi
   }
 }
 
+/**
+ * The RESOLVED self-service edits for one share: the desired state of each
+ * feature per the §2 dialog↔daemon contract (value = set, `null` = clear,
+ * omitted = keep), with the values the ROUTE resolved from the system — the
+ * schedule bucket and the ZFS-vs-AHR snapdir shape are system facts, not
+ * parser inputs. The parser composes the `vfs objects` line from the FINAL
+ * feature set (current stanza state overridden by these) and writes the
+ * managed keys around it.
+ */
+export interface SelfServiceKeys {
+  previousVersions?: { bucket: string, snapdir: string, snapdirseverywhere: boolean } | null
+  recycle?: { purgeDays: RecyclePurgeDays } | null
+  timeMachine?: { maxSize: number } | null
+}
+
+/**
+ * The self-service key/marker edits for one share stanza. Throws when a
+ * feature is being ENABLED on a share whose `vfs objects` line is custom
+ * (the route's 400 fast path re-checks the same rule in the job). The marker
+ * edit is returned separately — it is a COMMENT line, invisible to the
+ * `KeyEdit` machinery, and applied after the key edits splice the lines.
+ */
+function selfServiceEdits(doc: SmbConfDoc, sectionName: string, keys: SelfServiceKeys): {
+  edits: KeyEdit[]
+  /** Marker value to write/rewrite; null = leave alone (unless markerRemove). */
+  markerWanted: string | null
+  /** Remove the marker (recycle turned off while it read as on). */
+  markerRemove: boolean
+} {
+  const span = findSection(doc, sectionName)
+  const defs = span ? sectionDefs(doc, span) : []
+  const marker = span ? findPurgeMarker(doc, span)?.value ?? null : null
+  const current = toSmbShare(sectionName, defs, marker)
+
+  // Enabling on a custom line would silently adopt (and later rewrite) a
+  // stanza ANAS did not compose — refused in the route as a 400; here the same
+  // rule fails the job (the state may have changed between the two reads).
+  const enabling = Object.values(keys).some(v => v !== undefined && v !== null)
+  if (enabling && current && hasCustomVfsObjects(current))
+    throw new Error(customVfsRefusal(sectionName))
+
+  const final = {
+    previousVersions: current?.previousVersions !== undefined,
+    recycle: current?.recycle !== undefined,
+    timeMachine: current?.timeMachine !== undefined,
+  }
+  const edits: KeyEdit[] = []
+  // Only REMOVE a feature's keys when the feature currently reads as ON: a
+  // clear request against a hand-made stanza must not strip a foreign key set.
+  const removeKeys = (params: SmbParam[]): void =>
+    params.forEach(p => edits.push({ param: p, kind: 'text', value: null }))
+  // The composed line is ANAS's only when a feature turned ON here or a
+  // formerly-on feature turned OFF here. A request that only clears a feature
+  // which never read as on leaves the line — and the stanza — alone.
+  let lineTouched = false
+
+  const pv = keys.previousVersions
+  if (pv === null) {
+    if (final.previousVersions) {
+      removeKeys([PARAM.shadowSnapdir, PARAM.shadowSnapdirseverywhere, PARAM.shadowLocaltime, PARAM.shadowSort, PARAM.shadowFormat])
+      lineTouched = true
+    }
+    final.previousVersions = false
+  }
+  else if (pv !== undefined) {
+    final.previousVersions = true
+    lineTouched = true
+    edits.push({ param: PARAM.shadowFormat, kind: 'text', value: shadowFormatFor(pv.bucket) })
+    edits.push({ param: PARAM.shadowSnapdir, kind: 'text', value: pv.snapdir })
+    edits.push({ param: PARAM.shadowSnapdirseverywhere, kind: 'bool', value: boolStr(pv.snapdirseverywhere) })
+    edits.push({ param: PARAM.shadowLocaltime, kind: 'bool', value: 'no' })
+    edits.push({ param: PARAM.shadowSort, kind: 'text', value: 'desc' })
+  }
+
+  const rc = keys.recycle
+  if (rc === null) {
+    if (final.recycle) {
+      removeKeys([PARAM.recycleRepository, PARAM.recycleKeeptree, PARAM.recycleVersions, PARAM.recycleTouch])
+      lineTouched = true
+    }
+    final.recycle = false
+  }
+  else if (rc !== undefined) {
+    final.recycle = true
+    lineTouched = true
+    edits.push({ param: PARAM.recycleRepository, kind: 'text', value: RECYCLE_REPOSITORY })
+    edits.push({ param: PARAM.recycleKeeptree, kind: 'bool', value: 'yes' })
+    edits.push({ param: PARAM.recycleVersions, kind: 'bool', value: 'yes' })
+    edits.push({ param: PARAM.recycleTouch, kind: 'bool', value: 'yes' })
+  }
+
+  const tm = keys.timeMachine
+  if (tm === null) {
+    if (final.timeMachine) {
+      removeKeys([PARAM.fruitTimeMachine, PARAM.fruitTimeMachineMaxSize])
+      lineTouched = true
+    }
+    final.timeMachine = false
+  }
+  else if (tm !== undefined) {
+    final.timeMachine = true
+    lineTouched = true
+    edits.push({ param: PARAM.fruitTimeMachine, kind: 'bool', value: 'yes' })
+    edits.push({ param: PARAM.fruitTimeMachineMaxSize, kind: 'text', value: String(tm.maxSize) })
+  }
+
+  // The composed line: written (in canonical order) whenever any feature ends
+  // up on, REMOVED when the last feature turns off. `kind: 'text'` on purpose —
+  // the composer's order is canonical, so a reordered-but-equal set is
+  // rewritten rather than left as a near-miss.
+  if (lineTouched)
+    edits.push({ param: PARAM.vfsObjects, kind: 'text', value: composeVfsObjects(final) })
+
+  // The recycle marker follows the recycle feature: set/rewritten on enable or
+  // purge-age change, removed when the feature turns off. `rc === null` with
+  // recycle already off must NOT strip a foreign marker — hence the `current`
+  // guard mirrors the key removals above.
+  let markerWanted: string | null = null
+  let markerRemove = false
+  if (rc === null && current?.recycle !== undefined) {
+    markerRemove = true
+  }
+  else if (rc !== undefined && rc !== null) {
+    markerWanted = purgeMarkerValue(rc.purgeDays)
+  }
+  return { edits, markerWanted, markerRemove }
+}
+
 /** Build the ordered key edits for the mutable SMB share fields present in `req`. */
 function shareEdits(req: UpdateSmbShareRequest | CreateSmbShareRequest): KeyEdit[] {
   const edits: KeyEdit[] = []
@@ -581,8 +938,12 @@ function shareEdits(req: UpdateSmbShareRequest | CreateSmbShareRequest): KeyEdit
   return edits
 }
 
-/** Render a brand-new share stanza (no surrounding blank lines). */
-function renderStanza(req: CreateSmbShareRequest, indent: string): string {
+/**
+ * Render a brand-new share stanza (no surrounding blank lines). `selfService`
+ * carries the RESOLVED features to enable at create time (value = set; a
+ * `null`/omitted feature is simply not written).
+ */
+function renderStanza(req: CreateSmbShareRequest, indent: string, selfService?: SelfServiceKeys): string {
   const lines = [`[${req.name}]`]
   const add = (param: SmbParam, value: string) => lines.push(`${indent}${param.canonical} = ${value}`)
 
@@ -601,6 +962,37 @@ function renderStanza(req: CreateSmbShareRequest, indent: string): string {
   if (req.hostsDeny && req.hostsDeny.length)
     add(PARAM.hostsDeny, req.hostsDeny.join(' '))
 
+  if (selfService) {
+    const pv = selfService.previousVersions ?? undefined
+    const rc = selfService.recycle ?? undefined
+    const tm = selfService.timeMachine ?? undefined
+    const composed = composeVfsObjects({
+      previousVersions: pv != null,
+      recycle: rc != null,
+      timeMachine: tm != null,
+    })
+    if (composed !== null)
+      add(PARAM.vfsObjects, composed)
+    if (pv != null) {
+      add(PARAM.shadowFormat, shadowFormatFor(pv.bucket))
+      add(PARAM.shadowSnapdir, pv.snapdir)
+      add(PARAM.shadowSnapdirseverywhere, boolStr(pv.snapdirseverywhere))
+      add(PARAM.shadowLocaltime, 'no')
+      add(PARAM.shadowSort, 'desc')
+    }
+    if (rc != null) {
+      add(PARAM.recycleRepository, RECYCLE_REPOSITORY)
+      add(PARAM.recycleKeeptree, 'yes')
+      add(PARAM.recycleVersions, 'yes')
+      add(PARAM.recycleTouch, 'yes')
+      lines.push(purgeMarkerLine(indent, purgeMarkerValue(rc.purgeDays)))
+    }
+    if (tm != null) {
+      add(PARAM.fruitTimeMachine, 'yes')
+      add(PARAM.fruitTimeMachineMaxSize, String(tm.maxSize))
+    }
+  }
+
   return lines.join('\n')
 }
 
@@ -609,8 +1001,8 @@ function renderStanza(req: CreateSmbShareRequest, indent: string): string {
  * is preserved verbatim; a blank separator line precedes the stanza. Assumes the
  * caller has already checked the share does not exist (409 otherwise).
  */
-export function addShare(text: string, req: CreateSmbShareRequest): string {
-  const stanza = renderStanza(req, '\t')
+export function addShare(text: string, req: CreateSmbShareRequest, selfService?: SelfServiceKeys): string {
+  const stanza = renderStanza(req, '\t', selfService)
   if (text === '')
     return `${stanza}\n`
 
@@ -623,14 +1015,28 @@ export function addShare(text: string, req: CreateSmbShareRequest): string {
 /**
  * Update only the changed keys of an existing share, leaving every other line
  * (and every other section) byte-identical. Returns the text unchanged if the
- * share is absent.
+ * share is absent. `selfService` (smbsvc.1–3) carries the RESOLVED feature
+ * states: set / clear / keep per feature, with the route-resolved bucket and
+ * snapdir shape.
  */
-export function updateShare(text: string, name: string, req: UpdateSmbShareRequest): string {
+export function updateShare(text: string, name: string, req: UpdateSmbShareRequest, selfService?: SelfServiceKeys): string {
   const doc = parseDoc(text)
   const span = findSection(doc, name)
   if (!span || span.key === 'global')
     return text
-  applyEditsToSection(doc, name, shareEdits(req), sectionIndent(doc, span))
+  const indent = sectionIndent(doc, span)
+  const edits = shareEdits(req)
+  if (selfService) {
+    const ss = selfServiceEdits(doc, name, selfService)
+    edits.push(...ss.edits)
+    applyEditsToSection(doc, name, edits, indent)
+    if (ss.markerRemove)
+      applyPurgeMarkerEdit(doc, name, null, indent)
+    else if (ss.markerWanted !== null)
+      applyPurgeMarkerEdit(doc, name, ss.markerWanted, indent)
+    return serializeDoc(doc)
+  }
+  applyEditsToSection(doc, name, edits, indent)
   return serializeDoc(doc)
 }
 

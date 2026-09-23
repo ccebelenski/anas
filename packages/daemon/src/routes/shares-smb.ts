@@ -2,18 +2,22 @@ import type { SmbConnection, SmbShareDetail } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
+import type { SelfServiceKeys } from '../parsers/smb-conf.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import { statSync } from 'node:fs'
+import { rm, writeFile } from 'node:fs/promises'
 import { CreateSmbShareRequest, ShareName, UpdateSmbGlobalConfigRequest, UpdateSmbShareRequest } from '@anas/shared'
-import { addShare, getShare, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
+import { addShare, customVfsRefusal, getShare, hasCustomVfsObjects, hasShare, parseSmbConf, removeShare, updateGlobal, updateShare } from '../parsers/smb-conf.js'
 import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
 import { confirmGate } from '../safety/gate.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
+import { enablingSelfService, ensureAhrSnapshotsMount, resolveSelfService, touchesSelfService } from '../services/share-selfservice.js'
 import { requireIdentity } from './identity.js'
 
 const SMBSTATUS = '/usr/bin/smbstatus'
 const SYSTEMCTL = '/usr/bin/systemctl'
+const TESTPARM = '/usr/bin/testparm'
 
 /**
  * Read-time staleness check for a share's backing path (Principle 7 — the
@@ -43,17 +47,53 @@ export interface SmbShareRouteOptions {
   confirmStore: ConfirmStore
   /** Absolute path to smb.conf (config IS the API — Principle 13). */
   smbConfPath: string
+  /** /etc/fstab — the AHR `@snapshots` mounts Previous Versions writes (smbsvc.1). */
+  fstabPath: string
+  /** systemd unit dir — the snapshot schedule store the bucket is picked from. */
+  systemdDir: string
 }
 
 export async function smbShareRoutes(
   server: FastifyInstance,
   opts: SmbShareRouteOptions,
 ) {
-  const { executor, jobQueue, confirmStore, smbConfPath } = opts
+  const { executor, jobQueue, confirmStore, smbConfPath, fstabPath, systemdDir } = opts
 
   /** Read smb.conf fresh every time — the file is the source of truth (P.11). */
   async function readSmbConf(): Promise<string> {
     return readConfig(smbConfPath)
+  }
+
+  /**
+   * The testparm gate (smbsvc.1): every smb.conf write this route makes is
+   * validated with `testparm -s` BEFORE the file is touched — the candidate
+   * text is parsed from a temp copy, and a failure throws inside
+   * `editConfig`'s transform, so nothing is ever written and the previous
+   * bytes stand (byte-identical rollback by construction, not by restore).
+   * Runs inside the per-file lock.
+   */
+  async function testparmGate(candidate: string): Promise<void> {
+    const tmp = `${smbConfPath}.anas-testparm.tmp`
+    await writeFile(tmp, candidate, 'utf8')
+    try {
+      const r = await executor.exec(TESTPARM, ['-s', tmp])
+      if (r.exitCode !== 0) {
+        throw new Error(`smb.conf failed testparm validation — the change was not applied: `
+          + `${r.stderr.trim() || `testparm exited with code ${r.exitCode}`}`)
+      }
+    }
+    finally {
+      await rm(tmp, { force: true })
+    }
+  }
+
+  /** Edit smb.conf under the lock, testparm-validating the candidate first. */
+  async function editSmbConf(transform: (current: string) => string): Promise<void> {
+    await editConfig(smbConfPath, async (current) => {
+      const next = transform(current)
+      await testparmGate(next)
+      return next
+    })
   }
 
   /**
@@ -116,6 +156,64 @@ export async function smbShareRoutes(
     if (err instanceof ConfigConflictError)
       return new Error(`smb.conf changed on disk during the operation — retry against the current state`)
     return err instanceof Error ? err : new Error(String(err))
+  }
+
+  /**
+   * The self-service fast path (smbsvc.1): refuse 400 with the sentence when
+   * the request cannot be honoured against the CURRENT state — a custom
+   * `vfs objects` line on the share being enabled onto, a path that is
+   * neither ZFS nor AHR, a flat-layout AHR pool. The JOB re-resolves (the
+   * same fast-path + in-job re-check pattern the ownership guards use), so
+   * this is the zero-cost UI-explained refusal, not the only gate.
+   */
+  async function refuseSelfService(
+    name: string,
+    path: string,
+    req: CreateSmbShareRequest | UpdateSmbShareRequest,
+    reply: FastifyReply,
+  ): Promise<boolean> {
+    if (!touchesSelfService(req))
+      return false
+    if (enablingSelfService(req)) {
+      const share = getShare(await readSmbConf(), name)
+      if (share && hasCustomVfsObjects(share)) {
+        reply.code(400)
+        reply.send({ error: { code: 'VALIDATION_ERROR', message: customVfsRefusal(name) } })
+        return true
+      }
+    }
+    try {
+      await resolveSelfService(executor, path, req, { systemdDir })
+      return false
+    }
+    catch (err) {
+      reply.code(400)
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: err instanceof Error ? err.message : String(err) } })
+      return true
+    }
+  }
+
+  /**
+   * Run the self-service side of a share mutation inside the job: resolve
+   * against fresh state (a refusal here FAILS the job with the same
+   * sentence), ensure the AHR `@snapshots` mount BEFORE the stanza lands
+   * (a mount failure must not leave a stanza pointing at nothing), and edit
+   * smb.conf through the composer with the resolved keys.
+   */
+  async function applySelfServiceAndEdit(
+    name: string,
+    path: string,
+    req: CreateSmbShareRequest | UpdateSmbShareRequest,
+    edit: (current: string, keys: SelfServiceKeys | undefined) => string,
+  ): Promise<void> {
+    if (!touchesSelfService(req)) {
+      await editSmbConf(current => edit(current, undefined))
+      return
+    }
+    const resolution = await resolveSelfService(executor, path, req, { systemdDir })
+    if (resolution?.ahrPool)
+      await ensureAhrSnapshotsMount(executor, fstabPath, resolution.ahrPool)
+    await editSmbConf(current => edit(current, resolution?.keys))
   }
 
   /**
@@ -216,7 +314,7 @@ export async function smbShareRoutes(
       { ...identity, params: { section: 'global', config: req } },
       async () => {
         try {
-          await editConfig(smbConfPath, current => updateGlobal(current, req))
+          await editSmbConf(current => updateGlobal(current, req))
         }
         catch (err) {
           throw asJobError(err)
@@ -270,6 +368,11 @@ export async function smbShareRoutes(
     if (await refuseOwnedSharePath(req.path, reply))
       return reply
 
+    // The self-service fast path (smbsvc.1): 400 with the sentence when the
+    // features cannot be enabled on this path/state.
+    if (await refuseSelfService(req.name, req.path, req, reply))
+      return reply
+
     // 409 if the share already exists — the config file is the source of truth.
     const text = await readSmbConf()
     if (hasShare(text, req.name)) {
@@ -282,7 +385,12 @@ export async function smbShareRoutes(
       { ...identity, params: { share: req.name, path: req.path } },
       async () => {
         try {
-          await editConfig(smbConfPath, current => addShare(current, req))
+          await applySelfServiceAndEdit(
+            req.name,
+            req.path,
+            req,
+            (current, keys) => addShare(current, req, keys),
+          )
         }
         catch (err) {
           throw asJobError(err)
@@ -328,12 +436,24 @@ export async function smbShareRoutes(
     if (req.path !== undefined && await refuseOwnedSharePath(req.path, reply))
       return reply
 
+    // The self-service fast path (smbsvc.1) judges the EFFECTIVE path — the
+    // moved one when the edit carries it, the stanza's own path otherwise.
+    const currentShare = getShare(text, name)
+    if (currentShare && await refuseSelfService(name, req.path ?? currentShare.path, req, reply))
+      return reply
+
     const job = jobQueue.submit(
       'smb.config.set',
       { ...identity, params: { share: name, config: req } },
       async () => {
         try {
-          await editConfig(smbConfPath, current => updateShare(current, name, req))
+          await applySelfServiceAndEdit(
+            name,
+            // The effective path AGAIN, resolved in the job from fresh state.
+            req.path ?? getShare(await readSmbConf(), name)?.path ?? '',
+            req,
+            (current, keys) => updateShare(current, name, req, keys),
+          )
         }
         catch (err) {
           throw asJobError(err)
@@ -389,7 +509,7 @@ export async function smbShareRoutes(
       { ...identity, params: { share: name } },
       async () => {
         try {
-          await editConfig(smbConfPath, current => removeShare(current, name))
+          await editSmbConf(current => removeShare(current, name))
         }
         catch (err) {
           throw asJobError(err)
