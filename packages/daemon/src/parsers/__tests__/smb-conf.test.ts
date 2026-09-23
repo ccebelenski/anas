@@ -12,6 +12,7 @@ import {
   parseDoc,
   parseShadowFormatBucket,
   parseSmbConf,
+  recyclePurgeTargets,
   removeShare,
   serializeDoc,
   shadowFormatFor,
@@ -1004,5 +1005,61 @@ describe('hasCustomVfsObjects (smbsvc.1)', () => {
   it('fruit keys without the size cap reads custom', () => {
     const noCap = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = catia fruit streams_xattr\n\tfruit:time machine = yes\n')
     assert.equal(hasCustomVfsObjects(getShare(noCap, 'media')!), true)
+  })
+})
+
+// ============================================================================
+// recyclePurgeTargets (smbsvc.2) — what the `anas-recycle` runner sees. The
+// SAME parser answers the runner and the read-model, so they can never
+// disagree about which stanza purges and at what age.
+// ============================================================================
+
+describe('recyclePurgeTargets — the purge runner\'s view of smb.conf', () => {
+  it('a stanza with a repository and a numeric marker is a target, with its path and age', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { recycle: { purgeDays: 30 } })
+    assert.deepEqual(recyclePurgeTargets(enabled), [
+      { share: 'media', path: '/tank/media', repository: '#recycle', days: 30 },
+    ])
+  })
+
+  it('`never` and a marker-less (or foreign-marker) stanza are targets with days: null', () => {
+    const never = updateShare(SS_BASE, 'media', {}, { recycle: { purgeDays: null } })
+    assert.deepEqual(recyclePurgeTargets(never), [
+      { share: 'media', path: '/tank/media', repository: '#recycle', days: null },
+    ])
+    const bare = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = recycle\n\trecycle:repository = #recycle\n')
+    assert.deepEqual(recyclePurgeTargets(bare), [
+      { share: 'media', path: '/tank/media', repository: '#recycle', days: null },
+    ])
+  })
+
+  it('a stanza without recycle:repository is not a target at all', () => {
+    assert.deepEqual(recyclePurgeTargets(SS_BASE), [])
+  })
+
+  it('a pathless stanza is still listed (with path: null) — the runner skips it, audibly', () => {
+    const pathless = SS_BASE.replace('\t\tpath = /tank/media\n', '\t\t')
+      .replace('\tpath = /tank/media\n', '')
+      .replace('[media]\n', '[media]\n\tvfs objects = recycle\n\trecycle:repository = #recycle\n\trecycle:keeptree = yes\n\trecycle:versions = yes\n\trecycle:touch = yes\n\t# anas:recycle-purge-days = 30\n')
+    assert.deepEqual(recyclePurgeTargets(pathless), [
+      { share: 'media', path: null, repository: '#recycle', days: 30 },
+    ])
+  })
+
+  it('[global] and non-share noise never surface, and a custom repository value is honoured as written', () => {
+    const conf = [
+      '[global]',
+      '\trecycle:repository = #global-noise',
+      '\t# anas:recycle-purge-days = 30',
+      '',
+      '[odd]',
+      '\tpath = /tank/odd',
+      '\trecycle:repository = .回收站',
+      '\t# anas:recycle-purge-days = 90',
+      '',
+    ].join('\n')
+    assert.deepEqual(recyclePurgeTargets(conf), [
+      { share: 'odd', path: '/tank/odd', repository: '.回收站', days: 90 },
+    ])
   })
 })

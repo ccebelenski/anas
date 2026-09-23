@@ -1030,20 +1030,136 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     assert.ok(!readFileSync(confPath!, 'utf8').includes('[scratch]'))
   })
 
-  it('a request that SETS recycle or timeMachine is refused (slice 1 ships Previous Versions only)', async () => {
+  it('a request that SETS timeMachine is still refused (smbsvc.3 wires the beta; slice 2 shipped recycle)', async () => {
     const s = startSelfService(ZFS_SHARE_CONF, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n' })
-    for (const feature of [{ recycle: { purgeDays: 30 } }, { timeMachine: { maxSize: 1_000_000 } }]) {
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ timeMachine: { maxSize: 1_000_000 } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /not available in this version/)
+    assert.ok(!readFileSync(confPath!, 'utf8').includes('fruit:'))
+  })
+
+  // --- Recycle bin (smbsvc.2) -----------------------------------------------
+  it('enable writes the recycle keys, the marker, and the composed module; the detail derives purgeDays', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ recycle: { purgeDays: 30 } }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+    const written = readFileSync(confPath!, 'utf8')
+    const stanza = written.slice(written.indexOf('[media]'))
+    assert.ok(stanza.includes('\tvfs objects = recycle\n'), written)
+    assert.ok(stanza.includes('\trecycle:repository = #recycle\n'), written)
+    assert.ok(stanza.includes('\trecycle:keeptree = yes\n'), written)
+    assert.ok(stanza.includes('\trecycle:versions = yes\n'), written)
+    assert.ok(stanza.includes('\trecycle:touch = yes\n'), written)
+    assert.ok(stanza.includes('\t# anas:recycle-purge-days = 30\n'), written)
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    assert.deepEqual((detail.json() as { data: SmbShare }).data.recycle, { purgeDays: 30 })
+  })
+
+  it('every purge age round-trips: 7 / 14 / 90 and `null` (never) land in the marker and the read model', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    for (const purgeDays of [7, 14, 90, null] as const) {
       const res = await s.inject({
         method: 'PUT',
         url: '/v1/shares/smb/media',
         headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
-        payload: JSON.stringify(feature),
+        payload: JSON.stringify({ recycle: { purgeDays } }),
       })
-      assert.equal(res.statusCode, 400)
-      assert.match(res.json().error.message, /not available in this version/)
-      assert.ok(!readFileSync(confPath!, 'utf8').includes('recycle:'))
-      assert.ok(!readFileSync(confPath!, 'utf8').includes('fruit:'))
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const stanza = readFileSync(confPath!, 'utf8').slice(readFileSync(confPath!, 'utf8').indexOf('[media]'))
+      assert.ok(stanza.includes(`\t# anas:recycle-purge-days = ${purgeDays === null ? 'never' : purgeDays}\n`), `marker for ${purgeDays}: ${stanza}`)
+      const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+      assert.deepEqual((detail.json() as { data: SmbShare }).data.recycle, { purgeDays })
     }
+  })
+
+  it('a purge-age change rewrites ONLY the marker line — every other byte stands', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    const first = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ recycle: { purgeDays: 30 } }),
+    })
+    await waitForJob(s, (first.json() as JobAccepted).job.id)
+    const before = readFileSync(confPath!, 'utf8')
+    const second = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ recycle: { purgeDays: 90 } }),
+    })
+    await waitForJob(s, (second.json() as JobAccepted).job.id)
+    const after = readFileSync(confPath!, 'utf8')
+    assert.equal(after.replace('anas:recycle-purge-days = 90', 'anas:recycle-purge-days = 30'), before)
+  })
+
+  it('re-enabling with the same purge age is a byte-identical no-op', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    const payload = JSON.stringify({ recycle: { purgeDays: 14 } })
+    const first = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload })
+    await waitForJob(s, (first.json() as JobAccepted).job.id)
+    const afterFirst = readFileSync(confPath!, 'utf8')
+    const second = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload })
+    await waitForJob(s, (second.json() as JobAccepted).job.id)
+    assert.equal(readFileSync(confPath!, 'utf8'), afterFirst)
+  })
+
+  it('disable removes the recycle keys and the marker, byte-identically; #recycle is a filesystem fact ANAS never touches', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    const enable = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ recycle: { purgeDays: 30 } }) })
+    await waitForJob(s, (enable.json() as JobAccepted).job.id)
+    const disable = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ recycle: null }) })
+    assert.equal(disable.statusCode, 202)
+    await waitForJob(s, (disable.json() as JobAccepted).job.id)
+    assert.equal(readFileSync(confPath!, 'utf8'), ZFS_SHARE_CONF, 'disable restores the original bytes exactly')
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    assert.equal((detail.json() as { data: SmbShare }).data.recycle, undefined)
+  })
+
+  it(`recycle enable on a share with a custom vfs objects line is refused 400 with the share named`, async () => {
+    const custom = ZFS_SHARE_CONF.replace('\tread only = no\n', '\tread only = no\n\tvfs objects = vfs_fruit_extras\n')
+    const s = startSelfService(custom)
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ recycle: { purgeDays: 30 } }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /share 'media' has a custom vfs objects line — remove it before enabling self-service features/)
+    assert.ok(!readFileSync(confPath!, 'utf8').includes('recycle:'), 'nothing was written')
+  })
+
+  it('a create with recycle enabled writes the full stanza (module, keys, marker) in one go', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'photos', path: '/srv/photos', recycle: { purgeDays: 14 } }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const written = readFileSync(confPath!, 'utf8')
+    assert.ok(written.includes('[photos]'))
+    assert.ok(written.includes('\tvfs objects = recycle\n'), written)
+    assert.ok(written.includes('\t# anas:recycle-purge-days = 14\n'), written)
   })
 
   it('a failing testparm rolls the write back byte-identically and fails the job with the sentence', async () => {

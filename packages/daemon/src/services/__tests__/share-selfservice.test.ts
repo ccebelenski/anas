@@ -231,16 +231,31 @@ describe('resolveSelfService — keys, shapes, refusals (smbsvc.1)', () => {
     )
   })
 
-  it('refuses a request that SETS recycle or timeMachine (slice 1 ships Previous Versions only)', async () => {
+  it('still refuses a request that SETS timeMachine (slice 2 ships recycle; smbsvc.3 wires the beta)', async () => {
     const mock = new MockExecutor()
-    await assert.rejects(
-      resolveSelfService(mock, '/x', { recycle: { purgeDays: 30 } }, { systemdDir: '/tmp' }),
-      (err: Error) => /recycle bin is not available/.test(err.message),
-    )
     await assert.rejects(
       resolveSelfService(mock, '/x', { timeMachine: { maxSize: 1000 } }, { systemdDir: '/tmp' }),
       (err: Error) => /Time Machine target is not available/.test(err.message),
     )
+  })
+
+  it('resolves a SET recycle with no system reads at all — the bin lives on the share\'s own filesystem', async () => {
+    const mock = new MockExecutor()
+    for (const purgeDays of [7, 14, 30, 90, null] as const) {
+      const resolved = await resolveSelfService(mock, '/srv/plain-disk/media', { recycle: { purgeDays } }, { systemdDir: '/tmp' })
+      assert.deepEqual(resolved?.keys, { recycle: { purgeDays } }, `purgeDays ${purgeDays}`)
+      assert.equal(resolved?.ahrPool, undefined)
+    }
+    // The decision needs no executor traffic: not even one command was run.
+    assert.equal(mock.calls.length, 0)
+  })
+
+  it('recycle rides alongside a Previous Versions enable (both keys resolved together)', async () => {
+    const mock = new MockExecutor()
+    addZfsFootprintFixtures(mock, 'testpool\t/testpool\ntestpool/media\t/testpool/media\n')
+    const resolved = await resolveSelfService(mock, '/testpool/media', { previousVersions: { enabled: true }, recycle: { purgeDays: 30 } }, { systemdDir: '/nonexistent-units' })
+    assert.equal(resolved?.keys.recycle?.purgeDays, 30)
+    assert.equal(resolved?.keys.previousVersions?.bucket, 'daily')
   })
 
   it('clearing stays a permitted no-op shape (previousVersions/recycle/timeMachine = null)', async () => {

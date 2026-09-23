@@ -13,6 +13,7 @@ node with a careful, transactional installer.
 | `uninstall.sh` | Clean, idempotent removal (shipped in the tarball). |
 | `systemd/anasd.service`, `systemd/anas.service` | The two systemd units. |
 | `systemd/rtslib-fb-targetctl.service.d/anas-ordering.conf` | Boot-ordering drop-in for LIO's restore service (story `iscsi.5`) — installed to `/etc/systemd/system/`, never an edit of the vendor unit. Orders the iSCSI restore after `zfs-volumes.target` / `zfs-volume-wait.service` (and `local-fs.target` for AHR), so a LUN's backing device exists before the restore looks for it; `After=` is also stop-before, which gives the shutdown half for free. |
+| `systemd/anas-recycle.timer`, `systemd/anas-recycle.service` | The recycle-bin daily purge timer pair (story `smbsvc.2`) — ONE static pair for all shares: the runner (`app/packages/daemon/dist/recycle-purge.js`) reads each share's purge age from its `# anas:recycle-purge-days` marker in smb.conf. install.sh enables the timer; uninstall.sh removes the pair and never touches any `#recycle` contents. |
 
 ## Versioning (story 10.10)
 

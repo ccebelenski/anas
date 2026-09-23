@@ -638,6 +638,59 @@ export function hasShare(text: string, name: string): boolean {
   return span !== null && span.key !== 'global'
 }
 
+/**
+ * One stanza the recycle purge runner acts on (smbsvc.2): any share section
+ * carrying a `recycle:repository` (that IS the bin — the runner needs nothing
+ * else from the stanza) plus whatever purge policy its marker states.
+ */
+export interface RecyclePurgeTarget {
+  /** Section (share) name. */
+  share: string
+  /**
+   * The stanza's `path`, or null when it sets none — the runner skips such a
+   * stanza (it cannot locate the bin) without error.
+   */
+  path: string | null
+  /** The stanza's `recycle:repository` value (present by construction). */
+  repository: string
+  /**
+   * The purge age in days, or null when the marker is absent, `never`, or not
+   * a policy value — the runner skips those and never deletes anything.
+   */
+  days: number | null
+}
+
+/**
+ * Every recycle-purge candidate in an smb.conf, for the `anas-recycle` runner.
+ * The SAME parser that reads and writes the config answers the runner — one
+ * copy of the marker/repository semantics, never a second hand-rolled scan of
+ * smb.conf (single-source-of-truth rule). `[global]` and pathless sections are
+ * skipped like any non-share stanza.
+ */
+export function recyclePurgeTargets(text: string): RecyclePurgeTarget[] {
+  const doc = parseDoc(text)
+  const targets: RecyclePurgeTarget[] = []
+  for (const span of doc.sections) {
+    if (span.key === null || span.key === 'global')
+      continue
+    const defs = sectionDefs(doc, span)
+    const repository = paramValue(defs, PARAM.recycleRepository)
+    if (!repository)
+      continue
+    const marker = findPurgeMarker(doc, span)?.value ?? null
+    targets.push({
+      share: span.name as string,
+      path: paramValue(defs, PARAM.path) ?? null,
+      repository,
+      // `never` and a non-policy marker both read as "no purge age" — the same
+      // parseMarkerDays the read-model uses, so the runner and ANAS can never
+      // disagree about which stanza purges.
+      days: marker !== null ? parseMarkerDays(marker) ?? null : null,
+    })
+  }
+  return targets
+}
+
 // ============================================================================
 // Surgical editors — each returns new text, changing ONLY the target section
 // (and, within it, only the target keys). All other bytes pass through verbatim.

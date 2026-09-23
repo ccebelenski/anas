@@ -109,6 +109,10 @@ printf '%s\n' "${VERSION}" > "${APP}/VERSION"
 mkdir -p "${REL_ROOT}/systemd"
 cp "${SCRIPT_DIR}/systemd/anasd.service" "${REL_ROOT}/systemd/anasd.service"
 cp "${SCRIPT_DIR}/systemd/anas.service"  "${REL_ROOT}/systemd/anas.service"
+# The recycle-bin purge timer + service (smbsvc.2) — ONE static pair for every
+# share; install.sh enables the timer, uninstall.sh removes the pair.
+cp "${SCRIPT_DIR}/systemd/anas-recycle.timer"   "${REL_ROOT}/systemd/anas-recycle.timer"
+cp "${SCRIPT_DIR}/systemd/anas-recycle.service" "${REL_ROOT}/systemd/anas-recycle.service"
 # The iSCSI boot-ordering drop-in (story iscsi.5) — a drop-in beside
 # rtslib-fb-targetctl.service, never an edit of that vendor unit. install.sh's
 # preflight requires it, so a release without it fails before touching the node.

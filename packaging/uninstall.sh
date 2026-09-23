@@ -82,6 +82,25 @@ remove_schedule_units() {
   fi
 }
 
+# Remove the recycle-bin age-based cleanup timer + service (smbsvc.2). ONE
+# static pair (enabled by install.sh) — the runner reads each share's deletion
+# age from its smb.conf marker, so there are no per-share units to sweep.
+#
+# Deliberately NOT touched, ever: the `#recycle` directories themselves, and
+# the `recycle:*` keys / markers in smb.conf. A checkbox never deletes data —
+# the bins are real files a user may still want, and an uninstall that emptied
+# them would be an owner's move, not a guest's. Shares keep their (now
+# unswept) bins; if smbd is still serving them, the module keeps working.
+remove_recycle_units() {
+  if [ ! -f "${SYSTEMD_DIR}/anas-recycle.timer" ] && [ ! -f "${SYSTEMD_DIR}/anas-recycle.service" ]; then
+    return 0
+  fi
+  systemctl disable --now anas-recycle.timer >/dev/null 2>&1 || true
+  rm -f "${SYSTEMD_DIR}/anas-recycle.timer" "${SYSTEMD_DIR}/anas-recycle.service"
+  rm -f "${TIMERS_STAMP_DIR}/stamp-anas-recycle.timer"
+  info "removed 1 ANAS schedule unit pair (anas-recycle.*); every #recycle directory and its contents are left in place"
+}
+
 usage() {
   cat <<EOF
 ANAS uninstaller
@@ -147,6 +166,10 @@ fi
 # distro default when the scrub timer was one of them.
 # See the function above (review F2/F8).
 remove_schedule_units
+
+# 3a'. Remove the recycle-bin cleanup timer + service (smbsvc.2) — never any
+# `#recycle` contents (see remove_recycle_units above).
+remove_recycle_units
 
 # 3b. Remove the iSCSI boot-ordering drop-in install.sh added beside
 # rtslib-fb-targetctl.service. This is the ONLY iSCSI thing an uninstall touches.

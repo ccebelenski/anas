@@ -73,6 +73,16 @@ NOTIFY_TEMPLATES=(
 ISCSI_DROPIN_DIR="rtslib-fb-targetctl.service.d"
 ISCSI_DROPIN_FILE="anas-ordering.conf"
 
+# The recycle-bin purge timer + service (smbsvc.2). ONE static pair for ALL
+# shares: the runner (app/packages/daemon/dist/recycle-purge.js) reads each
+# stanza's purge age from its `# anas:recycle-purge-days` marker in smb.conf,
+# so nothing is created or removed per share — the timer is enabled once here
+# and disabled once by uninstall.sh. A share without the feature is invisible
+# to it, and uninstall never touches any `#recycle` directory (a checkbox
+# never deletes data).
+RECYCLE_TIMER="anas-recycle.timer"
+RECYCLE_SERVICE="anas-recycle.service"
+
 log()  { printf '==> %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf 'WARN: %s\n' "$*" >&2; }
@@ -309,6 +319,10 @@ phase0_preflight() {
     || FATAL+=("release incomplete: anas-md-event.sh not found next to install.sh")
   [ -f "${UNIT_SRC}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}" ] \
     || FATAL+=("release incomplete: systemd/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE} not found next to install.sh")
+  [ -f "${UNIT_SRC}/${RECYCLE_TIMER}" ] && [ -f "${UNIT_SRC}/${RECYCLE_SERVICE}" ] \
+    || FATAL+=("release incomplete: systemd/${RECYCLE_TIMER} / ${RECYCLE_SERVICE} not found next to install.sh")
+  [ -f "${APP_SRC}/packages/daemon/dist/recycle-purge.js" ] \
+    || FATAL+=("release incomplete: app/packages/daemon/dist/recycle-purge.js not found (recycle purge runner)")
   for tpl in "${NOTIFY_TEMPLATES[@]}"; do
     [ -f "${SCRIPT_DIR}/templates/${tpl}" ] \
       || FATAL+=("release incomplete: templates/${tpl} not found next to install.sh")
@@ -598,6 +612,8 @@ rollback() {
     info "removing systemd units"
     systemctl disable --now anasd anas >/dev/null 2>&1 || true
     rm -f "${SYSTEMD_DIR}/anasd.service" "${SYSTEMD_DIR}/anas.service"
+    systemctl disable --now anas-recycle.timer >/dev/null 2>&1 || true
+    rm -f "${SYSTEMD_DIR}/${RECYCLE_TIMER}" "${SYSTEMD_DIR}/${RECYCLE_SERVICE}"
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 
@@ -641,11 +657,17 @@ rollback() {
 
 # Copy the unit files into place, substituting PREFIX for the default /opt/anas
 # ExecStart path so a custom --prefix works. daemon-reload is the caller's job.
+# The recycle purge pair (smbsvc.2) rides the same substitution — its .service
+# ExecStart points at the runner under PREFIX.
 install_units() {
   local u
   for u in anasd anas; do
     sed "s#/opt/anas#${PREFIX}#g" "${UNIT_SRC}/${u}.service" > "${SYSTEMD_DIR}/${u}.service"
     chmod 0644 "${SYSTEMD_DIR}/${u}.service"
+  done
+  for u in "${RECYCLE_SERVICE}" "${RECYCLE_TIMER}"; do
+    sed "s#/opt/anas#${PREFIX}#g" "${UNIT_SRC}/${u}" > "${SYSTEMD_DIR}/${u}"
+    chmod 0644 "${SYSTEMD_DIR}/${u}"
   done
   install_iscsi_dropin
 }
@@ -753,13 +775,17 @@ phase1_install() {
 
   # 3. Install units, enable, (re)start. install_units also lays down the iSCSI
   # boot-ordering drop-in (iscsi.5) — a drop-in beside the vendor unit, never an
-  # edit of it — and the daemon-reload below is what makes it take effect.
+  # edit of it — and the recycle purge timer pair (smbsvc.2), enabled once here
+  # for ALL shares: the purge age lives in each stanza's marker, so there is
+  # nothing per-share to create or remove, ever.
   info "installing systemd units"
   install_units
   info "installed iSCSI ordering drop-in -> ${SYSTEMD_DIR}/${ISCSI_DROPIN_DIR}/${ISCSI_DROPIN_FILE}"
   systemctl daemon-reload
   UNITS_INSTALLED=1
   systemctl enable anasd anas >/dev/null 2>&1
+  systemctl enable --now anas-recycle.timer >/dev/null 2>&1
+  info "recycle purge timer enabled (anas-recycle.timer, daily)"
   info "starting services"
   systemctl restart anasd anas
   SERVICES_STARTED=1

@@ -132,17 +132,32 @@ export function enablingSelfService(req: SelfServiceRequest): boolean {
 }
 
 /**
+ * The recycle bin's slice of the resolved keys: a value sets the feature with
+ * its purge age (`null` inside = never), a `null` request clears it, an
+ * omitted field keeps whatever the stanza says. Recycle needs NO system
+ * resolution — no bucket to pick, no snapshots to find, no mount to ensure:
+ * the bin lives on the share's own filesystem (DESIGN smbsvc.2), so it works
+ * on any path a share may sit on, ZFS, AHR or plain disk.
+ */
+function recycleKeysFrom(req: SelfServiceRequest): SelfServiceKeys {
+  if (req.recycle === null)
+    return { recycle: null }
+  if (req.recycle !== undefined)
+    return { recycle: { purgeDays: req.recycle.purgeDays } }
+  return {}
+}
+
+/**
  * Resolve the request's feature fields into {@link SelfServiceKeys} — the
  * route calls this as its 400 fast path (throwing the refusal sentence) and
  * AGAIN inside the job, so the decision is made against fresh state where it
  * matters (the same fast-path + in-job re-check pattern the ownership guards
  * use). `undefined` when the request touches no feature (a plain field edit).
  *
- * Slice 1 ships Previous Versions only: a request that SETS recycle or
- * timeMachine is refused — the composer and managed keys exist, but the
- * purge runner (smbsvc.2) and the beta wiring (smbsvc.3) do not, and writing
- * the keys alone would ship a bin nobody prunes. Clearing either stays a
- * permitted no-op.
+ * Slice 2 ships the recycle bin alongside Previous Versions; a request that
+ * SETS timeMachine is still refused — the composer and managed keys exist,
+ * but the beta wiring (smbsvc.3) does not. Clearing it stays a permitted
+ * no-op.
  */
 export async function resolveSelfService(
   executor: CommandExecutor,
@@ -153,19 +168,19 @@ export async function resolveSelfService(
   if (!touchesSelfService(req))
     return undefined
 
-  if (req.recycle !== undefined && req.recycle !== null)
-    throw new Error('The recycle bin is not available in this version of ANAS — enable it once the recycle story ships')
   if (req.timeMachine !== undefined && req.timeMachine !== null)
     throw new Error('The Time Machine target is not available in this version of ANAS — enable it once the Time Machine story ships')
 
-  const clears: SelfServiceKeys = {
-    ...(req.recycle !== undefined ? { recycle: null } : {}),
+  const resolved: SelfServiceKeys = {
+    ...recycleKeysFrom(req),
+    // Clearing Time Machine stays a permitted no-op (the composer removes
+    // nothing it did not write) — only SETTING it is refused above.
     ...(req.timeMachine !== undefined ? { timeMachine: null } : {}),
   }
 
   const pv = req.previousVersions
   if (pv === undefined || pv === null || !pv.enabled)
-    return { keys: { ...(pv !== undefined ? { previousVersions: null as SelfServiceKeys['previousVersions'] } : {}), ...clears } }
+    return { keys: { ...(pv !== undefined ? { previousVersions: null as SelfServiceKeys['previousVersions'] } : {}), ...resolved } }
 
   // Enabling: the path must sit on a snapshot-bearing stack.
   const target = await resolveSelfServiceTarget(executor, path)
@@ -181,8 +196,8 @@ export async function resolveSelfService(
   const schedules = await readAllSchedules(opts.systemdDir)
   const bucket = pickBucket(schedules, target)
   const keys: SelfServiceKeys = target.kind === 'zfs'
-    ? { previousVersions: { bucket, snapdir: '.zfs/snapshot', snapdirseverywhere: true }, ...clears }
-    : { previousVersions: { bucket, snapdir: ahrSnapshotsMountpoint(target.pool), snapdirseverywhere: false }, ...clears }
+    ? { previousVersions: { bucket, snapdir: '.zfs/snapshot', snapdirseverywhere: true }, ...resolved }
+    : { previousVersions: { bucket, snapdir: ahrSnapshotsMountpoint(target.pool), snapdirseverywhere: false }, ...resolved }
   return target.kind === 'ahr' ? { keys, ahrPool: target.pool } : { keys }
 }
 

@@ -1,0 +1,6 @@
+[Unit]
+Description=ANAS recycle bin purge (vfs_recycle, age-based)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/recycle-purge.js
