@@ -120,24 +120,26 @@ export async function smbShareRoutes(
 
   /**
    * The share-path backstop (pvepool.1 review fixes): refuse a share whose
-   * `path` resolves onto a PVE-OWNED dataset. The ONE footprint service
-   * resolves the path by longest mountpoint prefix ({@link datasetOfPath}) and
-   * asks the ONE ownership answer — a storage root, a guest volume, a
-   * dir-storage tree or the boot tree is refused 400 with the reason, which
-   * names the storage AND the dataset. A path on a SIBLING dataset's
-   * mountpoint (or a subdirectory of one) is ordinary ANAS storage, and a
-   * non-ZFS path resolves to no dataset at all and passes untouched.
+   * `path` is PVE's. The ONE footprint service answers {@link sharePathClaim}:
+   * the path resolves onto an OWNED dataset (a storage root, a guest volume,
+   * a dir-storage tree or the boot tree — refused 400 with the reason, which
+   * names the storage AND the dataset), or it sits under a `dir` storage's
+   * CONFIGURED path whose dataset could not be resolved (a `legacy`/`none`
+   * dataset with no live mount — refused against the path itself, the same
+   * rule mounts and restore use; pvepool.1 review fix 5). A path on a SIBLING
+   * dataset's mountpoint (or a subdirectory of one) is ordinary ANAS storage
+   * and passes untouched.
    */
   async function refuseOwnedSharePath(path: string, reply: FastifyReply): Promise<boolean> {
     const pve = await loadPveFootprint(executor)
-    const dataset = pve.datasetOfPath(path)
-    if (!dataset)
-      return false
-    const owned = pve.ownershipOf(dataset)
-    if (!owned)
+    const claim = pve.sharePathClaim(path)
+    if (!claim)
       return false
     reply.code(400)
-    reply.send({ error: { code: 'VALIDATION_ERROR', message: `Share path '${path}' is on '${dataset}', which is PVE-owned — ${owned.reason}` } })
+    if (claim.kind === 'dataset')
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Share path '${path}' is on '${claim.dataset}', which is PVE-owned — ${claim.ownership.reason}` } })
+    else
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Share path '${path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — shares cannot serve PVE territory` } })
     return true
   }
 

@@ -353,7 +353,9 @@ export async function readIscsiContext(
   // resolution — the parser's secondary signal — never the storage.cfg
   // verdict itself, which rides in `pveStorages` (null = UNREADABLE).
   const zfsMountpoints = readMountpoints ?? []
-  const pveStorages = await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints)
+  // The ownership predicate only needs the pool-keyed refs; the unresolvable
+  // dir storages (pvepool.1 review fix 5) are the share-path backstop's.
+  const pveStorages = (await readPveStorages(paths.pveStorageCfg ?? PVE_STORAGE_CFG, zfsMountpoints))?.byPool ?? null
   // Boot facts for the system rule of the footprint predicate — null when the
   // probe fails (UNREADABLE), so the ownership answer tightens toward
   // hands-off via the whole-pool fallback (pvepool.1).

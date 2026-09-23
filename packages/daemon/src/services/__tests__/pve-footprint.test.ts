@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { MockExecutor } from '../../executor/mock.js'
 import { parsePveStorageCfg } from '../../parsers/pve-storage.js'
-import { buildSystemPoolFacts, loadPveFootprint, ownedDescendantIn, ownershipFromFootprintData, parseBootfsGet, parseRootMount, pveRecursiveRefusalMessage, readSystemPoolFacts } from '../pve-footprint.js'
+import { buildSystemPoolFacts, loadPveFootprint, ownedDescendantIn, ownershipFromFootprintData, parseBootfsGet, parseRootMount, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage, readSystemPoolFacts, systemPoolRefusal } from '../pve-footprint.js'
 
 /**
  * Story pvepool.1 — the system-pool half of the footprint service. The boot
@@ -85,7 +85,7 @@ describe('ownershipFromFootprintData — the service-level assembly over the fix
     { mountpoint: '/rpool/data', dataset: 'rpool/data', pool: 'rpool' },
     { mountpoint: '/rpool/media', dataset: 'rpool/media', pool: 'rpool' },
   ]
-  const storages = parsePveStorageCfg(CFG, MPS)
+  const storages = parsePveStorageCfg(CFG, MPS).byPool
   const system: SystemPoolFacts[] = [{ pool: 'rpool', bootfs: 'rpool/ROOT/pve-1' }]
 
   it('the boot dataset and its ancestors are system-owned', () => {
@@ -411,5 +411,147 @@ describe('ownedDescendant — the first strict descendant PVE owns (review fix 2
       pveRecursiveRefusalMessage('Destroy', 'tank/x', hit),
       `Destroy of 'tank/x' would include tank/x/data — PVE storage 'local-zfs' owns tank/x/data as a storage root`,
     )
+  })
+
+  it('a FAILED descendant probe is its own refusal sentence (review fix 4)', () => {
+    assert.equal(
+      pveDescendantsUnlistedMessage('destroy', 'tank/x'),
+      `Could not list descendants of 'tank/x' — refusing the recursive destroy`,
+    )
+  })
+})
+
+// --- pvepool.1 review fix 4: the system-pool refusal names the CAUSE --------
+
+describe('systemPoolRefusal — the sentence matches the cause that fired (review fix 4)', () => {
+  it('unreadable storage configuration: says the CONFIG is unreadable — not a zfspool claim', () => {
+    // The old sentence claimed "it hosts a PVE zfspool storage" even when the
+    // config itself was the unreadable fact — with it gone, no one could have
+    // verified the claim. The sentence must say what was actually true.
+    const r = systemPoolRefusal('tank', null, { storagesUnavailable: true })
+    assert.equal(r.reason, 'system-pool')
+    assert.equal(r.message, 'PVE storage configuration is unreadable (/etc/pve/storage.cfg) — pool \'tank\' is treated as a system pool until it can be read — ANAS never destroys, exports or remounts a system pool')
+    // The config cause WINS even when the boot facts happened to be readable —
+    // the pool's system-ness is being refused on the config, not the boot tree.
+    const withFacts = systemPoolRefusal('tank', { pool: 'tank', bootfs: 'tank/ROOT/pve-1' }, { storagesUnavailable: true })
+    assert.equal(withFacts.message, r.message)
+  })
+
+  it('unreadable boot facts (a zfspool pool): the whole-pool fallback sentence', () => {
+    const r = systemPoolRefusal('tank', null)
+    assert.equal(r.message, 'Pool \'tank\' is treated as a system pool (boot facts unreadable; it hosts a PVE zfspool storage) — ANAS never destroys, exports or remounts a system pool')
+  })
+
+  it('a readable boot tree: names the boot filesystem', () => {
+    const r = systemPoolRefusal('rpool', { pool: 'rpool', bootfs: 'rpool/ROOT/pve-1', rootDataset: 'rpool/ROOT/pve-1' })
+    assert.equal(r.message, 'Pool \'rpool\' holds this node\'s boot filesystem (rpool/ROOT/pve-1) — ANAS never destroys, exports or remounts a system pool')
+  })
+})
+
+// --- pvepool.1 review fix 5: the share-path backstop over unresolvable dirs -
+
+describe('sharePathClaim — dataset claims first, then the unresolvable-dir path rule (review fix 5)', () => {
+  // A `dir` storage on a `legacy` dataset — the finding's shape: its `zfs list`
+  // mountpoint is a marker, so only findmnt (or nothing) says where it sits.
+  const CFG = 'dir: dump\n\tpath /srv/dump\n\tcontent backup,iso\n\n'
+  let dir: string
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-pve-sharepath-'))
+    await writeFile(join(dir, 'storage.cfg'), CFG, 'utf8')
+  })
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  function bootFactsMock(): MockExecutor {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/usr/sbin/zpool',
+      args: ['get', '-H', '-o', 'name,value', 'bootfs'],
+      result: { stdout: 'tank\t-\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['-n', '-o', 'SOURCE,FSTYPE', '/'],
+      result: { stdout: '', stderr: '', exitCode: 1 },
+    })
+    return mock
+  }
+
+  it('a mounted legacy dataset: the path resolves onto the DATASET, and the dir storage owns it', async () => {
+    const mock = bootFactsMock()
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: 'tank/dump\tlegacy\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['--json'],
+      result: {
+        stdout: '{"filesystems":[{"target":"/srv/dump","source":"tank/dump","fstype":"zfs","options":"rw"}]}',
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+    assert.deepEqual(fp.unresolvedDirPaths, []) // the dir resolved — it is a ref now
+
+    // The path sits ON the dataset (via findmnt) and the dataset is PVE's dir
+    // storage — a dataset claim quoting the ownership reason.
+    const claim = fp.sharePathClaim('/srv/dump')!
+    assert.equal(claim.kind, 'dataset')
+    if (claim.kind !== 'dataset')
+      throw new Error('unreachable')
+    assert.equal(claim.dataset, 'tank/dump')
+    assert.equal(claim.ownership.kind, 'dir-storage')
+    assert.match(claim.ownership.reason, /dump/)
+
+    // A subpath of the storage path is the same claim (the mount hosts it).
+    assert.equal(fp.sharePathClaim('/srv/dump/some/file')!.kind, 'dataset')
+    // A path on no PVE dataset and no PVE dir path opens the gate.
+    assert.equal(fp.sharePathClaim('/data/plain'), null)
+  })
+
+  it('an unmounted legacy dataset: the dir path is unresolvable and the path rule refuses directly', async () => {
+    const mock = bootFactsMock()
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: 'tank/dump\tlegacy\n', stderr: '', exitCode: 0 },
+    })
+    // No `findmnt --json` fixture → exit 127 → no live target known.
+    const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+    // The dir storage could not resolve onto a dataset — it keeps its path.
+    assert.deepEqual(fp.unresolvedDirPaths, [{ storage: 'dump', path: '/srv/dump' }])
+
+    // The backstop's path rule: a share at or under the configured path is
+    // refused against the storage — the same isPathWithin rule mounts use.
+    const claim = fp.sharePathClaim('/srv/dump')!
+    assert.deepEqual(claim, { kind: 'dir-path', storage: 'dump', path: '/srv/dump' })
+    assert.deepEqual(fp.sharePathClaim('/srv/dump/sub'), claim)
+    // A SIBLING path that merely shares the prefix is outside (segments, not
+    // strings) — the rule is isPathWithin, not startsWith.
+    assert.equal(fp.sharePathClaim('/srv/dump-other'), null)
+    assert.equal(fp.sharePathClaim('/srv'), null)
+  })
+
+  it('a non-ZFS dir path (e.g. /var/lib/vz) also tightens the share gate via its path', async () => {
+    // The finding's tightening rule: EVERY dir storage whose path fails to
+    // resolve keeps its path as a backstop claim — including plain-ext4
+    // /var/lib/vz — because "no dataset resolved" is a missing fact, and a
+    // missing fact may only tighten.
+    await writeFile(join(dir, 'storage.cfg'), 'dir: local\n\tpath /var/lib/vz\n\tcontent backup\n\n', 'utf8')
+    const mock = bootFactsMock()
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: '', stderr: '', exitCode: 0 },
+    })
+    const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+    assert.deepEqual(fp.unresolvedDirPaths, [{ storage: 'local', path: '/var/lib/vz' }])
+    assert.deepEqual(fp.sharePathClaim('/var/lib/vz'), { kind: 'dir-path', storage: 'local', path: '/var/lib/vz' })
+    assert.equal(fp.sharePathClaim('/var/lib/vz/template-101')!.kind, 'dir-path')
   })
 })

@@ -282,16 +282,23 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     }
 
     // pvepool.1 review fixes: `snapshotFirst` creates a NEW snapshot on the
-    // SOURCE before sending — a mutation, so an OWNED source refuses (400, the
-    // ownership reason). Sending PVE's own EXISTING snapshots (no
-    // snapshotFirst) is a read and stays allowed. This is ALSO the run-time
-    // re-check for a recurring task: the timer's runner (replicate-task.js)
-    // POSTs this same endpoint, so the guard re-asks on every run with the
-    // storage.cfg of THAT moment — a source PVE claimed after the task was
-    // written fails the timer run with the reason. The target side is
+    // SOURCE before sending — a mutation, so an OWNED source refuses. The 400
+    // here is the FAST PATH only (dialog feedback before a job exists); the
+    // gate is the IN-JOB re-check immediately before `zfs snapshot` (the
+    // fireSchedule pattern — review fix 4): the snapshot is taken in the job,
+    // so the source is judged in the job, on a FRESH footprint with the
+    // storage.cfg of THAT moment — a source PVE claimed after the request
+    // fails the job with the reason (the 9.4 notification carries it), never
+    // a snapshot. This is ALSO the run-time re-check for a recurring task:
+    // the timer's runner (replicate-task.js) POSTs this same endpoint, so the
+    // guard re-asks on every run. Sending PVE's own EXISTING snapshots (no
+    // snapshotFirst) is a read and stays allowed. The target side is
     // re-asked on every run by guardReplicationTarget below.
-    if (snapshotFirst) {
-      const owned = (await deps.pveFootprint()).ownershipOf(source)
+    // ONE footprint load per request (review fix 4): this load feeds the 400
+    // AND is passed to the guard, instead of the guard loading its own.
+    const pve = snapshotFirst ? await deps.pveFootprint() : undefined
+    if (pve) {
+      const owned = pve.ownershipOf(source)
       if (owned) {
         reply.code(400)
         return { error: { code: 'VALIDATION_ERROR', message: `Snapshot-first replication would snapshot '${source}' — ${owned.reason}` } }
@@ -301,7 +308,10 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
     // Stage 3: resolve where the target lives (local / peer / remote) and run
     // every target-side guard in THAT context.
     const targetFull = resolveTarget(source, poolName, target)
-    const guard = await guardReplicationTarget(guardDeps, { target, sourceFull: source, targetFull })
+    const guard = await guardReplicationTarget(
+      pve ? { ...guardDeps, pveFootprintPreloaded: pve } : guardDeps,
+      { target, sourceFull: source, targetFull },
+    )
     if (!guard.ok) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: guard.message } }
@@ -335,6 +345,16 @@ export function createReplicationHandlers(deps: ReplicationDeps) {
           // 1) Optional snapshot-first — create a fresh, sortable snapshot to send up to.
           let snapName = snapshot
           if (snapshotFirst) {
+            // pvepool.1 review fix 4: the ownership gate moves WITH the
+            // mutation. The snapshot is taken HERE, so the source is judged
+            // HERE, on a FRESH footprint — storage.cfg is live and PVE can
+            // claim the source between the request and now. An owned source
+            // FAILS the job with the reason (the 9.4 notification carries
+            // it); the request-level 400 is the fast path only, exactly the
+            // fireSchedule pattern.
+            const owned = (await deps.pveFootprint()).ownershipOf(source)
+            if (owned)
+              throw new Error(`Snapshot-first replication refused: '${source}' is PVE-owned — ${owned.reason}`)
             const name = defaultSnapName()
             updateProgress(`zfs snapshot ${source}@${name}`)
             // The ONE zfs-snapshot verb (backup2.3's extraction) — same argv,

@@ -5,7 +5,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import { ScheduleId, SnapshotSchedule } from '@anas/shared'
 import { parseZpoolList } from '../parsers/zpool-list.js'
 import { readAhrPools } from '../services/ahr-topology.js'
-import { loadPveFootprint, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
+import { loadPveFootprint, pveDescendantsUnlistedMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { notifyScheduleRun } from '../services/snapshot-notify.js'
 import {
   collectScheduleStatuses,
@@ -68,14 +68,16 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
   /**
    * The dataset and everything beneath it (`zfs list -r -H -o name`) — the
    * candidate list for the recursive-schedule descendant guard (pvepool.1
-   * review fix 2). Empty when the read fails: the existence check below has
-   * already refused a vanished target, and a failed probe must never read as
-   * "no descendants" for a target that exists.
+   * review fix 2). `null` when the probe FAILED (pvepool.1 review fix 4): a
+   * failed probe must never read as "no descendants" — the guard refuses the
+   * recursive verb with {@link pveDescendantsUnlistedMessage} instead of
+   * letting a sweep it cannot see through. A successful read with no rows is
+   * a genuine "no descendants" (`[]`).
    */
-  async function descendantDatasetNames(dataset: string): Promise<string[]> {
+  async function descendantDatasetNames(dataset: string): Promise<string[] | null> {
     const r = await executor.exec(ZFS, ['list', '-H', '-o', 'name', '-r', dataset])
     if (r.exitCode !== 0)
-      return []
+      return null
     return r.stdout.split('\n').map(l => l.trim()).filter(Boolean)
   }
 
@@ -127,7 +129,14 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
         return false
       }
       if (recursive) {
-        const descendant = pve.ownedDescendant(await descendantDatasetNames(target.dataset), target.dataset)
+        // pvepool.1 review fix 4: a failed probe is not "no descendants" —
+        // the recursive verb is refused until the subtree can be listed.
+        const descendants = await descendantDatasetNames(target.dataset)
+        if (descendants === null) {
+          reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: pveDescendantsUnlistedMessage('snapshot schedule', target.dataset) } })
+          return false
+        }
+        const descendant = pve.ownedDescendant(descendants, target.dataset)
         if (descendant) {
           reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: pveRecursiveRefusalMessage('Snapshot schedule', target.dataset, descendant) } })
           return false
@@ -178,7 +187,12 @@ export async function scheduleRoutes(server: FastifyInstance, opts: ScheduleRout
       if (owned)
         throw new Error(`Snapshot run refused: '${schedule.target.dataset}' is PVE-owned — ${owned.reason}`)
       if (schedule.recursive === true) {
-        const descendant = pve.ownedDescendant(await descendantDatasetNames(schedule.target.dataset), schedule.target.dataset)
+        // pvepool.1 review fix 4: a failed probe fails the run with the
+        // refusal — never a sweep the daemon could not see.
+        const descendants = await descendantDatasetNames(schedule.target.dataset)
+        if (descendants === null)
+          throw new Error(pveDescendantsUnlistedMessage('snapshot run', schedule.target.dataset))
+        const descendant = pve.ownedDescendant(descendants, schedule.target.dataset)
         if (descendant)
           throw new Error(pveRecursiveRefusalMessage('Snapshot run', schedule.target.dataset, descendant))
       }

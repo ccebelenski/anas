@@ -17,7 +17,7 @@ import { confirmGate } from '../safety/gate.js'
 import { enrichBusyError } from '../services/busy-diagnosis.js'
 import { readConfig } from '../services/config-writer.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
-import { loadPveFootprint, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
+import { loadPveFootprint, pveDescendantsUnlistedMessage, pveNamingGuardMessage, pveRecursiveRefusalMessage } from '../services/pve-footprint.js'
 import { createZfsSnapshot, destroyZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 import { createReplicationHandlers } from './replication.js'
@@ -481,6 +481,22 @@ export async function datasetRoutes(
   /** The pool's flat dataset list (filesystems + volumes). */
   async function listDatasets(poolName: string): Promise<Dataset[]> {
     return (await listDatasetsAndDefaults(poolName)).datasets
+  }
+
+  /**
+   * The pool's flat dataset list, or `null` when the probe itself FAILED —
+   * a non-zero `zfs list`, or a read that exited 0 with nothing to say
+   * (pvepool.1 review fix 4). The recursive-verb guards need the distinction
+   * from a list that was read: a failed probe may never read as "no
+   * descendants" for a target that exists, so they refuse with
+   * {@link pveDescendantsUnlistedMessage} instead. Display and 404 paths keep
+   * the fail-open {@link listDatasets}.
+   */
+  async function listDatasetsOrNull(poolName: string): Promise<Dataset[] | null> {
+    const r = await executor.exec(ZFS, zfsListArgs(poolName))
+    if (r.exitCode !== 0 || !r.stdout.trim())
+      return null
+    return parseZfsList(r.stdout)
   }
 
   /** Snapshot names below a dataset (for destroy warnings). */
@@ -1596,7 +1612,18 @@ export async function datasetRoutes(
     if (!identity)
       return
 
-    const datasets = await listDatasets(poolName)
+    const datasets = await listDatasetsOrNull(poolName)
+    if (datasets === null) {
+      // pvepool.1 review fix 4: the pool list FAILED. A recursive destroy
+      // would sweep a subtree the daemon cannot see — refused, not 404'd into
+      // a guess; a non-recursive destroy keeps its vanished-target 404.
+      if (recursive) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: pveDescendantsUnlistedMessage('destroy', fullName) } }
+      }
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
     const targetDataset = datasets.find(d => d.name === fullName)
     if (!targetDataset) {
       reply.code(404)
@@ -1788,7 +1815,18 @@ export async function datasetRoutes(
     if (!identity)
       return
 
-    const datasets = await listDatasets(poolName)
+    const datasets = await listDatasetsOrNull(poolName)
+    if (datasets === null) {
+      // pvepool.1 review fix 4: the pool list FAILED. A recursive snapshot
+      // would sweep a subtree the daemon cannot see — refused, not 404'd into
+      // a guess; a non-recursive snapshot keeps its vanished-target 404.
+      if (recursive === true) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: pveDescendantsUnlistedMessage('snapshot', fullName) } }
+      }
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }
+    }
     if (!datasets.some(d => d.name === fullName)) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Dataset '${fullName}' not found` } }

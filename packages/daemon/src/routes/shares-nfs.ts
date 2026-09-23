@@ -76,19 +76,20 @@ export async function nfsExportRoutes(
     if (!identity)
       return
 
-    // Share-path backstop (pvepool.1 review fixes): a path that resolves onto
-    // a PVE-OWNED dataset is refused 400 with the ownership reason — the same
-    // longest-prefix resolution + ownership ask the SMB create makes (that
-    // module's refuseOwnedSharePath sentence). A path on a sibling dataset's
-    // mountpoint, or a non-ZFS path, resolves to nothing owned and passes.
-    // The PUT below cannot move the path (it is the URL identity, only the
-    // client list is replaced), so create is the one door to guard.
+    // Share-path backstop (pvepool.1 review fixes): a path that is PVE's is
+    // refused 400 — the SAME sharePathClaim answer the SMB create refuses
+    // through: an export onto an OWNED dataset's mountpoint, or under a `dir`
+    // storage's configured path whose dataset could not be resolved (review
+    // fix 5). A path on a sibling dataset's mountpoint, or on no PVE claim at
+    // all, passes. The PUT below cannot move the path (it is the URL identity,
+    // only the client list is replaced), so create is the one door to guard.
     const pve = await loadPveFootprint(executor)
-    const exportDataset = pve.datasetOfPath(exp.path)
-    const owned = exportDataset ? pve.ownershipOf(exportDataset) : null
-    if (owned) {
+    const claim = pve.sharePathClaim(exp.path)
+    if (claim) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Export path '${exp.path}' is on '${exportDataset}', which is PVE-owned — ${owned.reason}` } }
+      if (claim.kind === 'dataset')
+        return { error: { code: 'VALIDATION_ERROR', message: `Export path '${exp.path}' is on '${claim.dataset}', which is PVE-owned — ${claim.ownership.reason}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Export path '${exp.path}' is inside '${claim.path}', a path PVE storage '${claim.storage}' claims — exports cannot serve PVE territory` } }
     }
 
     // 409 if the path is already exported — the file is the source of truth.

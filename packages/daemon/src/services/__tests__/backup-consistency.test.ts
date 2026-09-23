@@ -211,8 +211,10 @@ describe('backup consistency derivation (backup2.3)', () => {
     const facts = await readConsistencyFacts(mock, async () => FACTS.ahrPools, { pveStorageCfg: '/nonexistent/storage.cfg' })
     assert.ok(facts.mounts.size > 0)
     // storage.cfg is a FILE read (fail-open), so no path is ever stat'ed; the
-    // only executor calls are the mount table and the two boot probes.
-    assert.equal(mock.calls.filter(c => c.command === FINDMNT && c.args.includes('--json')).length, 1)
+    // executor calls are the mount table, the footprint's own mountpoint read
+    // (pvepool.1 review fix 5: it resolves legacy/none targets from its own
+    // `findmnt --json`, one per footprint load), and the boot probes.
+    assert.equal(mock.calls.filter(c => c.command === FINDMNT && c.args.includes('--json')).length, 2)
     assert.deepEqual(facts.pveStorages.size, 0)
     assert.deepEqual(facts.systemFacts, [])
   })
@@ -237,7 +239,9 @@ describe('backup consistency derivation (backup2.3)', () => {
       async () => FACTS.ahrPools,
     )
     assert.deepEqual(out.map(c => c.consistency), ['snapshot', 'live', 'snapshot'])
-    assert.equal(mock.calls.filter(c => c.command === FINDMNT && c.args.includes('--json')).length, 1)
+    // One mount table + the footprint's own mountpoint read (review fix 5) —
+    // the derivation itself never re-reads per source.
+    assert.equal(mock.calls.filter(c => c.command === FINDMNT && c.args.includes('--json')).length, 2)
   })
 })
 

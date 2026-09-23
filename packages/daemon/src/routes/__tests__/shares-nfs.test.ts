@@ -334,4 +334,35 @@ describe('NFS export path vs the PVE footprint (pvepool.1 review fixes)', () => 
     const job = await waitForJob(server!, (res.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
   })
+
+  it('an export on a dir storage whose dataset could not resolve is refused against the dir path (review fix 5)', async () => {
+    // A `dir` storage on a `legacy` dataset with no live mount: its path
+    // resolves onto no dataset, so the backstop's path rule refuses the
+    // export against the storage's CONFIGURED path — the SAME claim the SMB
+    // create refuses through (one sharePathClaim answerer for both).
+    await writeFile(join(dir, 'storage.cfg'), 'dir: dump\n\tpath /srv/dump\n\tcontent backup,iso\n', 'utf8')
+    const mock = (server! as unknown as { executor: MockExecutor }).executor
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/sbin/zfs' && args.join(' ') === 'list -H -o name,mountpoint')
+        return { stdout: 'tank/dump\tlegacy\n', stderr: '', exitCode: 0 }
+      if (command === '/usr/bin/findmnt' && args.join(' ') === '--json')
+        return { stdout: JSON.stringify({ filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }] }), stderr: '', exitCode: 0 }
+      return orig(command, args)
+    }
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/shares/nfs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ path: '/srv/dump', clients: [{ spec: '*', options: ['ro', 'sync'] }] }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    // The path-rule sentence names the storage and its configured path.
+    assert.match(res.json().error.message, /'\/srv\/dump'/)
+    assert.match(res.json().error.message, /PVE storage 'dump' claims/)
+    assert.match(res.json().error.message, /exports cannot serve PVE territory/)
+    // Nothing was appended to /etc/exports.
+    assert.ok(!(await readFile(join(dir, 'exports'), 'utf8')).includes('/srv/dump '))
+  })
 })

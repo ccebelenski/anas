@@ -77,6 +77,13 @@ export interface TargetGuardDeps {
    * LOCAL target — a remote's storage.cfg is neither readable nor ours to read.
    */
   pveFootprint: () => Promise<PveFootprint>
+  /**
+   * A footprint the caller ALREADY loaded (pvepool.1 review fix 4) — consulted
+   * in place of `pveFootprint()` so one request loads the footprint exactly
+   * once: the snapshotFirst run shares its source check's load with this
+   * guard. Absent → the loader is used as before (plan, recurring tasks).
+   */
+  pveFootprintPreloaded?: PveFootprint
 }
 
 export interface TargetGuardInput {
@@ -121,7 +128,10 @@ export async function guardReplicationTarget(
   // guard. A sibling dataset on a PVE pool is a legitimate target. LOCAL
   // targets only — a remote's storage.cfg is neither readable nor ours to read.
   if (!placement.isRemote) {
-    const pve = await deps.pveFootprint()
+    // pvepool.1 review fix 4: a caller that already loaded the footprint for
+    // its own pre-job check passes it in — one load per request, not one per
+    // guard.
+    const pve = deps.pveFootprintPreloaded ?? await deps.pveFootprint()
     const owned = pve.ownershipOf(targetFull)
     if (owned)
       return { ok: false, message: `Replication target '${targetFull}' is PVE-owned — ${owned.reason}` }

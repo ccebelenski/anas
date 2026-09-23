@@ -577,7 +577,10 @@ export async function poolRoutes(
     const pve = await pveFootprint()
     if (!pve.isSystemPool(poolName))
       return null
-    return systemPoolRefusal(poolName, pve.systemPoolFacts(poolName))
+    // The sentence names the CAUSE that made isSystemPool fire (pvepool.1
+    // review fix 4) — an unreadable storage.cfg answers "system pool" for
+    // every pool and must be said as such, not as a boot-facts failure.
+    return systemPoolRefusal(poolName, pve.systemPoolFacts(poolName), { storagesUnavailable: pve.storagesUnavailable })
   }
 
   /** Every leaf disk of a pool resolved for disk cleanup (labelclear + zap). */
@@ -1014,7 +1017,7 @@ export async function poolRoutes(
     // negotiated. Level-1, like the root-pool destroy block.
     const pve = await pveFootprint()
     if (pve.isSystemPool(poolName)) {
-      const refusal = systemPoolRefusal(poolName, pve.systemPoolFacts(poolName))
+      const refusal = systemPoolRefusal(poolName, pve.systemPoolFacts(poolName), { storagesUnavailable: pve.storagesUnavailable })
       reply.code(409)
       return { error: { code: 'CONFLICT', reason: refusal.reason, message: refusal.message } }
     }

@@ -1,13 +1,19 @@
-import type { Job, JobAccepted, ReplicatePlan } from '@anas/shared'
-import type { MockExecutor } from '../../executor/mock.js'
+import type { Job, JobAccepted, ReplicatePlan, Snapshot } from '@anas/shared'
+import type { FastifyReply, FastifyRequest } from 'fastify'
+import type { PveFootprint } from '../../services/pve-footprint.js'
+import type { Transport } from '../../services/replication-transport.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { MockExecutor } from '../../executor/mock.js'
+import { JobQueue } from '../../jobs/queue.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from '../../parsers/zfs-list.js'
 import { createServer } from '../../server.js'
+import { loadPveFootprint } from '../../services/pve-footprint.js'
+import { createReplicationHandlers } from '../replication.js'
 
 const ZFS = '/usr/sbin/zfs'
 const ZPOOL = '/usr/sbin/zpool'
@@ -629,5 +635,130 @@ describe('replication routes (Epic 5.5.1 — local zfs send | zfs recv)', () => 
       payload: JSON.stringify({ target: { pool: 'testpool2' } }),
     })
     assert.equal(res.statusCode, 401)
+  })
+})
+
+// --- pvepool.1 review fixes 1 + 4: the gate is IN THE JOB -------------------
+//
+// The request-level 400 is the fast path (dialog feedback before a job
+// exists). The snapshot is taken IN THE JOB, so the ownership gate is IN
+// THE JOB: the handler re-asks with a FRESH footprint immediately before
+// `zfs snapshot` (the fireSchedule pattern). A source PVE claims between the
+// request and the snapshot step fails the JOB — the 9.4 failure notification
+// carries the reason — and no `zfs snapshot` is ever issued. The REQUEST
+// itself loads the footprint exactly ONCE: the pre-job check and the target
+// guard share the same load (fix 4); the job's load is the deliberate fresh
+// one.
+//
+// The seam is unit-level: a route test cannot deterministically place a
+// storage.cfg change between the pre-job and the in-job loads (the queue runs
+// the handler to its first await during the request), but a gated footprint
+// loader can — hold it between the two loads and the load count at that
+// moment is exactly what the request path asked for.
+
+describe('snapshotFirst ownership — the in-job re-check (review fixes 1 + 4)', () => {
+  const PERL = '/usr/bin/perl'
+
+  /** A real footprint from a temp storage.cfg (null = an ABSENT path, fail-open). */
+  async function footprintFor(cfgText: string | null): Promise<PveFootprint> {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-repl-injob-'))
+    const cfg = join(dir, 'storage.cfg')
+    if (cfgText !== null)
+      await writeFile(cfg, cfgText, 'utf8')
+    try {
+      return await loadPveFootprint(new MockExecutor(), {
+        pveStorageCfg: cfgText === null ? join(dir, 'absent.cfg') : cfg,
+      })
+    }
+    finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+
+  async function jobWhen(queue: JobQueue, id: string): Promise<Job> {
+    for (let i = 0; i < 100; i++) {
+      const job = queue.get(id)
+      if (job && (job.status === 'completed' || job.status === 'failed'))
+        return job
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    throw new Error(`Job ${id} did not finish`)
+  }
+
+  it('an owned-at-snapshot-time source fails the job with the reason; no snapshot is taken', async () => {
+    const unowned = await footprintFor(null)
+    const owned = await footprintFor('zfspool: local-zfs\n\tpool testpool/share1\n\tcontent images,rootdir\n\n')
+    assert.equal(owned.ownershipOf('testpool/share1')?.kind, 'storage-root')
+
+    let loads = 0
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const pveFootprint = async (): Promise<PveFootprint> => {
+      loads++
+      if (loads > 1)
+        await gate // hold the JOB on its fresh load until the request is done
+      return loads === 1 ? unowned : owned
+    }
+
+    const mock = new MockExecutor()
+    mock.addFixture({ command: PERL, result: { stdout: '', stderr: '', exitCode: 0 } })
+    const queue = new JobQueue()
+    const handlers = createReplicationHandlers({
+      executor: mock,
+      jobQueue: queue,
+      resolveDatasetName: () => 'testpool/share1',
+      poolExists: async () => true,
+      datasetExists: async () => true,
+      listSnapshotsDetail: async () => [{ snapshotName: 'repl-base' } as Snapshot],
+      pveFootprint,
+      transport: {} as Transport, // a local target never touches the transport
+    })
+
+    let replyCode = 0
+    const request = {
+      headers: {
+        'x-anas-user': 'root@pam',
+        'x-anas-user-uid': '0',
+        'x-anas-request-id': randomUUID(),
+      },
+      body: { target: { pool: 'testpool2' }, snapshotFirst: true },
+    } as unknown as FastifyRequest
+    const reply = {
+      code(c: number) {
+        replyCode = c
+        return this
+      },
+      send() {
+        return this
+      },
+    } as unknown as FastifyReply
+
+    const returned = await handlers.runReplication('testpool', 'share1', request, reply)
+    assert.equal(replyCode, 202) // accepted — the pre-job footprint did not own the source
+    const ref = (returned as { job: { id: string } }).job
+
+    // The request path loaded the footprint EXACTLY ONCE — the pre-job check
+    // and the target guard shared it (fix 4). The second load is the job's
+    // fresh in-job load, suspended on the gate; had the guard loaded its own,
+    // the count would be three.
+    assert.equal(loads, 2)
+
+    // PVE claims the source NOW — between the request and the snapshot step.
+    release()
+    const job = await jobWhen(queue, ref.id)
+    assert.equal(job.status, 'failed')
+    assert.match(job.error!.message, /is PVE-owned/)
+    assert.match(job.error!.message, /local-zfs/)
+    // The gate fired BEFORE the snapshot — nothing was taken on the source.
+    assert.ok(!mock.calls.some(c => c.command === '/usr/sbin/zfs' && c.args[0] === 'snapshot'))
+    // ...and the 9.4 failure notification carries the reason.
+    const sent = mock.calls
+      .filter(c => c.command === PERL)
+      .map(c => ({ severity: c.args[2], body: c.args[4] }))
+    assert.equal(sent.length, 1)
+    assert.equal(sent[0].severity, 'error')
+    assert.match(sent[0].body, /is PVE-owned/)
   })
 })

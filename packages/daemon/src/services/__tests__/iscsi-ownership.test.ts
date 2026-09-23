@@ -1,4 +1,4 @@
-import type { PveStorageRef, SystemPoolFacts } from '@anas/shared'
+import type { SystemPoolFacts } from '@anas/shared'
 import type { ZfsMountpoint } from '../../parsers/pve-storage.js'
 import type { OwnershipInputs } from '../iscsi-ownership.js'
 import assert from 'node:assert/strict'
@@ -27,7 +27,7 @@ const MOUNTPOINTS: ZfsMountpoint[] = [
 
 function inputs(overrides: Partial<OwnershipInputs> = {}): OwnershipInputs {
   return {
-    pveStorages: parsePveStorageCfg(STORAGE_CFG, MOUNTPOINTS) as Map<string, PveStorageRef[]>,
+    pveStorages: parsePveStorageCfg(STORAGE_CFG, MOUNTPOINTS).byPool,
     zfsMountpoints: MOUNTPOINTS,
     // A READABLE answer (the probe succeeded, no pool boots) — these fixtures
     // ask the per-dataset rules, not the unreadable-facts fallback.
@@ -422,7 +422,7 @@ describe('classifyBacking over the pvepool.1 fixture set', () => {
   const SYSTEM: SystemPoolFacts[] = [{ pool: 'rpool', bootfs: 'rpool/ROOT/pve-1', rootDataset: 'rpool/ROOT/pve-1' }]
 
   const fx = (overrides: Partial<OwnershipInputs> = {}): OwnershipInputs => ({
-    pveStorages: parsePveStorageCfg(CFG, MPS) as Map<string, PveStorageRef[]>,
+    pveStorages: parsePveStorageCfg(CFG, MPS).byPool,
     zfsMountpoints: MPS,
     systemFacts: SYSTEM,
     ...overrides,

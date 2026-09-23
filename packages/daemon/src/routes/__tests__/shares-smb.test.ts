@@ -590,4 +590,83 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
     const job = await waitForJob(s, (kept.json() as JobAccepted).job.id)
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
   })
+
+  // pvepool.1 review fix 5: a `dir` storage on a `legacy` dataset — its `zfs
+  // list` mountpoint is a marker, not a path. Mounted, the path resolves onto
+  // the DATASET (findmnt says where) and the dir storage owns it; unmounted,
+  // the dir keeps its CONFIGURED path and the backstop refuses against that
+  // path directly. Either way a share on it is refused — never through.
+  const LEGACY_DIR_CFG = 'dir: dump\n\tpath /srv/dump\n\tcontent backup,iso\n'
+
+  /**
+   * A server whose storage.cfg is the legacy dir storage, whose `zfs list`
+   * says `tank/dump legacy`, and whose `findmnt --json` answers `findmntJson`
+   * (the server's default fixture is overridden by wrap, not re-registered).
+   */
+  function legacyServer(findmntJson: string): ReturnType<typeof createServer> {
+    dir = mkdtempSync(join(tmpdir(), 'anas-smb-pve-'))
+    prevCfg = process.env.ANAS_STORAGE_CFG
+    const cfg = join(dir, 'storage.cfg')
+    writeFileSync(cfg, LEGACY_DIR_CFG, 'utf8')
+    process.env.ANAS_STORAGE_CFG = cfg
+    const confPath = join(dir, 'smb.conf')
+    writeFileSync(confPath, SAMPLE_CONF, 'utf8')
+    const s = createServer({ mock: true, logger: false, smbConfPath: confPath })
+    const mock = (s as unknown as { executor: MockExecutor }).executor
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank/dump\tlegacy\n', stderr: '', exitCode: 0 } })
+    const orig = mock.exec.bind(mock)
+    mock.exec = async (command: string, args: string[]) => {
+      if (command === '/usr/bin/findmnt' && args.join(' ') === '--json')
+        return { stdout: findmntJson, stderr: '', exitCode: 0 }
+      return orig(command, args)
+    }
+    return s
+  }
+
+  it('a share on a MOUNTED legacy dataset is refused with the dir-storage claim (review fix 5)', async () => {
+    // findmnt knows where the `legacy` dataset actually sits: /srv/dump.
+    const s = legacyServer(JSON.stringify({
+      filesystems: [
+        { target: '/srv/dump', source: 'tank/dump', fstype: 'zfs', options: 'rw' },
+        { target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' },
+      ],
+    }))
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'dump-share', path: '/srv/dump' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    // The path resolved onto the DATASET (via findmnt) and the dataset is the
+    // dir storage — the dataset claim quotes the ownership reason.
+    assert.match(res.json().error.message, /'\/srv\/dump'/)
+    assert.match(res.json().error.message, /'tank\/dump'/)
+    assert.match(res.json().error.message, /directory storage/)
+    // Nothing was written to smb.conf.
+    assert.ok(!readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[dump-share]'))
+  })
+
+  it('a share on an UNMOUNTED legacy dataset is refused against the dir path itself (review fix 5)', async () => {
+    // No live mount anywhere: the dataset row stays in the table with no
+    // target, the dir storage cannot resolve, and its CONFIGURED path is the
+    // backstop's fact — the same path rule mounts and restore use.
+    const s = legacyServer(JSON.stringify({
+      filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }],
+    }))
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'dump-share', path: '/srv/dump' }),
+    })
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    // The path-rule sentence names the storage and its configured path.
+    assert.match(res.json().error.message, /'\/srv\/dump'/)
+    assert.match(res.json().error.message, /PVE storage 'dump' claims/)
+    assert.match(res.json().error.message, /shares cannot serve PVE territory/)
+    assert.ok(!readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[dump-share]'))
+  })
 })

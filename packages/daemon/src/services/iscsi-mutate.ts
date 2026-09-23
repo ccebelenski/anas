@@ -1021,8 +1021,11 @@ export async function resolveFileBackingDir(
     return { ok }
   }
 
-  // A ZFS dataset name: its mountpoint is the directory.
-  const mp = ctx.inputs.zfsMountpoints.find(m => m.dataset === backing)
+  // A ZFS dataset name: its mountpoint is the directory. An EMPTY mountpoint
+  // is a `legacy`/`none` dataset findmnt does not report mounted (pvepool.1
+  // review fix 5 kept such rows in the table) — it names no directory, so it
+  // is no row at all here and the AHR/not-found fallthrough below applies.
+  const mp = ctx.inputs.zfsMountpoints.find(m => m.dataset === backing && m.mountpoint !== '')
   if (mp) {
     // pvepool.1: the DATASET is judged, not the pool — a sibling of a PVE
     // storage root is a legitimate image home.

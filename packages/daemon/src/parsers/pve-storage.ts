@@ -30,9 +30,11 @@
 
 import type { PveStorageRef } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { FindmntNode } from './findmnt.js'
 import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
+import { parseFindmnt } from './findmnt.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -42,6 +44,9 @@ export const PVE_STORAGE_CFG = '/etc/pve/storage.cfg'
 /** The zfs binary the executor-routed mountpoint read runs ({@link readZfsMountpoints}). */
 const ZFS_BIN = '/usr/sbin/zfs'
 
+/** The findmnt binary the mountpoint read runs for `legacy`/`none` targets. */
+const FINDMNT_BIN = '/usr/bin/findmnt'
+
 /**
  * A ZFS dataset's mountpoint, as needed to resolve a PVE `dir` storage back to
  * its pool. `pool` is the pool ROOT that owns `dataset` (e.g. dataset
@@ -49,7 +54,14 @@ const ZFS_BIN = '/usr/sbin/zfs'
  * {@link readPveStorages}; produced by {@link readZfsMountpoints}.
  */
 export interface ZfsMountpoint {
-  /** Absolute mountpoint, e.g. `/tank/backups`. */
+  /**
+   * Absolute mountpoint, e.g. `/tank/backups` — or the target findmnt reports
+   * for a `legacy`/`none` dataset that IS mounted (its `zfs list` mountpoint
+   * is a marker, not a path). `''` when the dataset's mountpoint is
+   * `legacy`/`none` and no live mount is known: the row stays in the table
+   * (the dataset remains visible to the parse) but can never win a
+   * {@link matchMountpoint} (pvepool.1 review fix 5).
+   */
   mountpoint: string
   /** Full ZFS dataset name, e.g. `tank/backups`. */
   dataset: string
@@ -134,7 +146,22 @@ export function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): Zfs
 }
 
 /**
- * Parse the text of a storage.cfg into a map `poolRoot -> PveStorageRef[]`.
+ * What one read of a storage.cfg answers (pvepool.1 review fix 5): the
+ * pool-keyed refs PLUS the `dir` storages whose configured `path` resolved onto
+ * no ZFS dataset. The unresolved dirs keep their configured `path` (they have
+ * no dataset to key by) — the share-path backstop matches a share against those
+ * paths directly, the same path rule mounts and restore use, so a `legacy`
+ * dataset with no live mount still tightens instead of opening.
+ */
+export interface PveStorageParse {
+  /** `poolRoot -> PveStorageRef[]` (resolved refs only). */
+  byPool: Map<string, PveStorageRef[]>
+  /** `dir` storages whose path resolved onto no dataset (see above). */
+  unresolvedDirs: { storage: string, path: string }[]
+}
+
+/**
+ * Parse the text of a storage.cfg into a {@link PveStorageParse}.
  *
  * `zfspool` stanzas are the PRIMARY signal: they carry the `pool <name>` line
  * that ties a storage to a ZFS pool. For each we read `pool <name>` and
@@ -142,11 +169,14 @@ export function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): Zfs
  *
  * `dir` stanzas are a SECONDARY signal (backup/iso/template storage). A dir has
  * `path <abspath>` + `content <csv>`; it is PVE-managed-on-ZFS iff its `path`
- * resolves onto a ZFS dataset's mountpoint. Resolution needs the mountpoint→pool
- * map, so it only happens when `mountpoints` is supplied — WITHOUT it, dir
- * stanzas are ignored (the original zfspool-only behavior, unchanged). When a
- * dir path matches, the ref is `{ type:'dir', dataset:<matched dataset> }` and
- * is keyed by that dataset's pool root.
+ * resolves onto a ZFS dataset's mountpoint. Resolution needs the mountpoint
+ * table, so it only happens when `mountpoints` is supplied — WITHOUT it, dir
+ * stanzas are ignored (the original zfspool-only behavior, unchanged) and
+ * `unresolvedDirs` stays empty. When a dir path matches, the ref is
+ * `{ type:'dir', dataset:<matched dataset> }` keyed by that dataset's pool
+ * root; when it matches NOTHING (a `legacy`/`none` dataset with no live mount,
+ * or a path on a non-ZFS filesystem — e.g. `/var/lib/vz`), the dir lands in
+ * `unresolvedDirs` with its configured `path` (pvepool.1 review fix 5).
  *
  * Edge cases:
  *  - Commented-out lines (leading `#`, after trimming) are skipped, so a
@@ -154,8 +184,7 @@ export function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): Zfs
  *  - `pool <name>` may be a dataset path (`tank/data`); we key by its root but
  *    keep the full path in `dataset`.
  *  - A `zfspool` stanza with no `pool` line is skipped (nothing to attach to).
- *  - A `dir` stanza with no `path` line, or whose path is on no ZFS dataset
- *    (e.g. `/var/lib/vz`), is skipped.
+ *  - A `dir` stanza with no `path` line is skipped.
  *  - Nested datasets: the LONGEST matching mountpoint (most specific dataset)
  *    wins, so a dir under `/tank/backups` attaches to `tank/backups`, not `tank`.
  *  - Missing `content` yields an empty content array (still a valid ref).
@@ -163,8 +192,9 @@ export function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): Zfs
 export function parsePveStorageCfg(
   text: string,
   mountpoints?: ZfsMountpoint[],
-): Map<string, PveStorageRef[]> {
+): PveStorageParse {
   const byPool = new Map<string, PveStorageRef[]>()
+  const unresolvedDirs: { storage: string, path: string }[] = []
 
   const pushRef = (root: string, ref: PveStorageRef) => {
     const list = byPool.get(root)
@@ -190,8 +220,11 @@ export function parsePveStorageCfg(
       })
     }
     // dir: resolve the path onto a ZFS dataset (secondary signal). Only when a
-    // mountpoint map is supplied; otherwise dir stanzas are ignored.
-    else if (current.type === 'dir' && current.path && mountpoints && mountpoints.length > 0) {
+    // mountpoint table is supplied (even an empty one — then nothing resolves);
+    // without one, dir stanzas are ignored (the zfspool-only mode). A path that
+    // matches no dataset keeps its configured path in `unresolvedDirs` instead
+    // of vanishing — the share-path backstop needs it (pvepool.1 review fix 5).
+    else if (current.type === 'dir' && current.path && mountpoints) {
       const match = matchMountpoint(current.path, mountpoints)
       if (match) {
         pushRef(poolRoot(match.pool), {
@@ -200,6 +233,9 @@ export function parsePveStorageCfg(
           dataset: match.dataset,
           content: splitContent(current.content),
         })
+      }
+      else {
+        unresolvedDirs.push({ storage: current.id, path: current.path })
       }
     }
     current = null
@@ -243,31 +279,33 @@ export function parsePveStorageCfg(
   }
   flush() // final stanza (no trailing blank line)
 
-  return byPool
+  return { byPool, unresolvedDirs }
 }
 
 /**
  * Read and parse the PVE storage config. The ABSENT file (ENOENT — a non-PVE
- * or dev host) is FAIL-OPEN: an empty map, no warning, exactly the posture
- * GET /pools has always had off-PVE. ANY OTHER read failure (EACCES, EIO,
- * ENOTCONN — pmxcfs down, a hung cluster fs) returns `null`: UNREADABLE, which
- * is a different answer from absent, and which the ownership service treats as
- * "every pool may be PVE's until this can be read" (pvepool.1 review fix 1 —
- * an unreadable config must never read as "no PVE storages", or every guest
- * dataset turns manageable). A READ file that parses to nothing still yields a
- * (possibly empty) map — the parser is total. Path is overridable for tests.
+ * or dev host) is FAIL-OPEN: an empty parse (no refs, no unresolved dirs), no
+ * warning, exactly the posture GET /pools has always had off-PVE. ANY OTHER
+ * read failure (EACCES, EIO, ENOTCONN — pmxcfs down, a hung cluster fs)
+ * returns `null`: UNREADABLE, which is a different answer from absent, and
+ * which the ownership service treats as "every pool may be PVE's until this
+ * can be read" (pvepool.1 review fix 1 — an unreadable config must never read
+ * as "no PVE storages", or every guest dataset turns manageable). A READ file
+ * that parses to nothing still yields an (empty) parse — the parser is total.
+ * Path is overridable for tests.
  *
  * Pass `mountpoints` (from {@link readZfsMountpoints}) to ALSO resolve `dir`
- * storages that live on a ZFS dataset (secondary signal). `null` (that read
- * failed) resolves dir stanzas the same way as omitting it — they are skipped.
- * Omit it for the original zfspool-only behavior.
+ * storages that live on a ZFS dataset (secondary signal) and to report the
+ * ones that do not resolve ({@link PveStorageParse.unresolvedDirs}). `null`
+ * (that read failed) resolves dir stanzas the same way as omitting it — they
+ * are skipped. Omit it for the original zfspool-only behavior.
  */
 let storagesReadWarned = false
 
 export async function readPveStorages(
   path: string = PVE_STORAGE_CFG,
   mountpoints?: ZfsMountpoint[] | null,
-): Promise<Map<string, PveStorageRef[]> | null> {
+): Promise<PveStorageParse | null> {
   let text: string
   try {
     text = await readFile(path, 'utf8')
@@ -277,7 +315,7 @@ export async function readPveStorages(
     // the answer is UNKNOWN, not "no storages" — say so once per process, not
     // once per request (journald must not flood on a dead pmxcfs).
     if ((err as NodeJS.ErrnoException).code === 'ENOENT')
-      return new Map()
+      return { byPool: new Map(), unresolvedDirs: [] }
     if (!storagesReadWarned) {
       storagesReadWarned = true
       console.warn(`anasd: could not read ${path} for PVE storage detection — treated as UNREADABLE (ownership gates tighten) until it can be read:`, err)
@@ -289,19 +327,40 @@ export async function readPveStorages(
   }
   catch (err: unknown) {
     console.warn(`anasd: could not parse ${path} for PVE storage detection:`, err)
-    return new Map()
+    return { byPool: new Map(), unresolvedDirs: [] }
   }
 }
 
 /**
- * Parse `zfs list -H -o name,mountpoint` output into a mountpoint→pool map.
- *
- * `-H` gives tab-separated, header-less rows: `<dataset>\t<mountpoint>`. Rows
- * whose mountpoint is not a real path (`-` for volumes, `none`, `legacy`, or
- * empty) are dropped — they cannot host a `dir` storage. Pure and total: any
- * malformed row is skipped, never throws.
+ * The datasets findmnt reports as zfs MOUNTS, keyed by dataset (the mount's
+ * `source`) — the target each one is actually mounted at. A `legacy`/`none`
+ * dataset's `zfs list` mountpoint is a marker, not a path; when such a dataset
+ * IS mounted (fstab, a manual mount), findmnt knows where (pvepool.1 review
+ * fix 5). Non-zfs mounts are not datasets this table tracks. Pure and total:
+ * first target wins per dataset, malformed rows yield nothing.
  */
-export function parseZfsMountpoints(text: string): ZfsMountpoint[] {
+export function zfsMountTargets(nodes: FindmntNode[]): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const n of nodes) {
+    if (n.fstype === 'zfs' && n.source && n.target && !out.has(n.source))
+      out.set(n.source, n.target)
+  }
+  return out
+}
+
+/**
+ * Parse `zfs list -H -o name,mountpoint` output into the dataset→mountpoint
+ * table.
+ *
+ * `-H` gives tab-separated, header-less rows: `<dataset>\t<mountpoint>`. Volumes
+ * (`-`) and malformed rows are dropped — a block device cannot host a `dir`
+ * storage. A `none`/`legacy` mountpoint is NOT dropped (pvepool.1 review fix
+ * 5): the dataset stays in the table so a `dir` storage on it is visible, with
+ * its mountpoint taken from `mountedTargets` (findmnt — see
+ * {@link zfsMountTargets}) when the dataset is live, else `''` (kept but never
+ * matchable). Pure and total: any malformed row is skipped, never throws.
+ */
+export function parseZfsMountpoints(text: string, mountedTargets: Map<string, string> = new Map()): ZfsMountpoint[] {
   const out: ZfsMountpoint[] = []
   for (const rawLine of text.split('\n')) {
     const line = rawLine.replace(TRAILING_CR_RE, '')
@@ -312,22 +371,30 @@ export function parseZfsMountpoints(text: string): ZfsMountpoint[] {
       continue
     const dataset = line.slice(0, tab).trim()
     const mountpoint = line.slice(tab + 1).trim()
-    if (!dataset || !mountpoint || mountpoint === '-' || mountpoint === 'none' || mountpoint === 'legacy')
+    if (!dataset || mountpoint === '-' || mountpoint === '')
       continue
-    out.push({ mountpoint, dataset, pool: poolRoot(dataset) })
+    const resolved = mountpoint === 'none' || mountpoint === 'legacy'
+      ? (mountedTargets.get(dataset) ?? '')
+      : mountpoint
+    out.push({ mountpoint: resolved, dataset, pool: poolRoot(dataset) })
   }
   return out
 }
 
 /**
- * List ZFS dataset mountpoints via `zfs list`. Used to resolve PVE `dir`
- * storages onto their pool (and, via the footprint service's `datasetOfPath`,
- * a share path onto its dataset). A missing `zfs` binary (ENOENT — a non-ZFS
- * host) is FAIL-OPEN: an empty array, no warning. ANY OTHER failure (nonzero
- * exit, spawn trouble) returns `null` — UNREADABLE, the same three-valued
- * posture as {@link readPveStorages}: callers tighten whatever gate the
- * mountpoints feed instead of reading "no ZFS datasets" (pvepool.1 review fix
- * 1). Uses execFile (args array, no shell).
+ * List ZFS dataset mountpoints via `zfs list`, resolving the targets of
+ * `legacy`/`none` datasets from `findmnt` (pvepool.1 review fix 5 — their
+ * `zfs list` mountpoint is a marker, and a live fstab mount is the only
+ * evidence of where they actually sit). Used to resolve PVE `dir` storages
+ * onto their pool (and, via the footprint service's `datasetOfPath`, a share
+ * path onto its dataset). A missing `zfs` binary (ENOENT — a non-ZFS host) is
+ * FAIL-OPEN: an empty array, no warning. ANY OTHER failure (nonzero exit,
+ * spawn trouble) returns `null` — UNREADABLE, the same three-valued posture
+ * as {@link readPveStorages}: callers tighten whatever gate the mountpoints
+ * feed instead of reading "no ZFS datasets" (pvepool.1 review fix 1). A
+ * findmnt failure only degrades the legacy/none resolution (those rows stay
+ * unresolvable, `''`), never the table itself. Uses execFile (args array, no
+ * shell).
  *
  * When an {@link CommandExecutor} is supplied the read goes THROUGH it — the
  * footprint service always passes its executor, so the read is mock-driven in
@@ -346,18 +413,35 @@ export async function readZfsMountpoints(zfsOrExec: string | CommandExecutor = '
   const zfs = typeof zfsOrExec === 'string' ? zfsOrExec : 'zfs'
   try {
     let stdout: string
+    let mountedTargets = new Map<string, string>()
     if (exec) {
       // A non-zero exit is UNREADABLE (never "no datasets") — the direct
       // execFileAsync below rejects on one, so the executor path must too.
-      const r = await exec.exec(ZFS_BIN, ['list', '-H', '-o', 'name,mountpoint'])
-      if (r.exitCode !== 0)
-        throw new Error(`zfs list exited ${r.exitCode}: ${r.stderr.trim()}`)
-      stdout = r.stdout
+      const [zfsResult, findmntResult] = await Promise.all([
+        exec.exec(ZFS_BIN, ['list', '-H', '-o', 'name,mountpoint']),
+        exec.exec(FINDMNT_BIN, ['--json']),
+      ])
+      if (zfsResult.exitCode !== 0)
+        throw new Error(`zfs list exited ${zfsResult.exitCode}: ${zfsResult.stderr.trim()}`)
+      stdout = zfsResult.stdout
+      if (findmntResult.exitCode === 0)
+        mountedTargets = zfsMountTargets(parseFindmnt(findmntResult.stdout))
     }
     else {
-      stdout = (await execFileAsync(zfs, ['list', '-H', '-o', 'name,mountpoint'])).stdout
+      // allSettled: the zfs side's rejection (ENOENT / nonzero) is the
+      // three-valued signal; a findmnt hiccup only loses the legacy/none
+      // resolution, never the table.
+      const [zfsResult, findmntResult] = await Promise.allSettled([
+        execFileAsync(zfs, ['list', '-H', '-o', 'name,mountpoint']),
+        execFileAsync(FINDMNT_BIN, ['--json']),
+      ])
+      if (zfsResult.status === 'rejected')
+        throw zfsResult.reason
+      stdout = zfsResult.value.stdout
+      if (findmntResult.status === 'fulfilled')
+        mountedTargets = zfsMountTargets(parseFindmnt(findmntResult.value.stdout))
     }
-    return parseZfsMountpoints(stdout)
+    return parseZfsMountpoints(stdout, mountedTargets)
   }
   catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT')

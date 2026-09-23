@@ -632,5 +632,92 @@ describe('snapshot schedule routes (Epic 17.3/17.4)', () => {
           process.env.ANAS_STORAGE_CFG = prevCfg
       }
     })
+
+    // pvepool.1 review fix 4: a descendant probe that FAILED is not "no
+    // descendants" — a failed `zfs list -r` may never open the gate. The
+    // recursive verb is refused (create: 400, run: failed job) until the
+    // subtree can be listed; the non-recursive path never probes and is
+    // untouched.
+    it('a recursive CREATE is refused when the descendant probe fails', async () => {
+      // Fail-open storage (an absent path): the target is unowned, so the
+      // probe is the only question left — and its failure still refuses.
+      const prevCfg = process.env.ANAS_STORAGE_CFG
+      process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
+      mockOf(server).addFixture({
+        command: ZFS,
+        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        result: { stdout: '', stderr: 'zfs list: cannot open pool', exitCode: 1 },
+      })
+      try {
+        const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/x' }, recursive: true })
+        assert.equal(res.statusCode, 400)
+        const msg = (res.json() as { error: { message: string } }).error.message
+        assert.match(msg, /Could not list descendants of 'testpool\/x'/)
+        assert.match(msg, /refusing the recursive snapshot schedule/)
+      }
+      finally {
+        if (prevCfg === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prevCfg
+      }
+    })
+
+    it('a recursive RUN fails when the probe fails — and takes no snapshot', async () => {
+      const prevCfg = process.env.ANAS_STORAGE_CFG
+      process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
+      // The probe answers for the CREATE guard, then fails for the RUN's
+      // re-check — the sequence models the subtree going dark in between.
+      mockOf(server).addFixture({
+        command: ZFS,
+        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        results: [
+          { stdout: 'testpool/x\ntestpool/x/media\n', stderr: '', exitCode: 0 },
+          { stdout: '', stderr: 'zfs list: cannot open pool', exitCode: 1 },
+        ],
+      })
+      try {
+        const created = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/x' }, recursive: true })
+        assert.equal(created.statusCode, 202)
+        await waitForJob(server, (created.json() as { job: { id: string } }).job.id)
+
+        const run = await server.inject({ method: 'POST', url: '/v1/schedules/nightly-media/run', headers: JSON_HEADERS, payload: '{}' })
+        assert.equal(run.statusCode, 202)
+        const done = await waitForJob(server, (run.json() as { job: { id: string } }).job.id)
+        assert.equal(done.status, 'failed')
+        assert.match(done.error!.message, /Could not list descendants of 'testpool\/x'/)
+        assert.match(done.error!.message, /refusing the recursive snapshot run/)
+        // The refusal fired before the take — no snapshot command was issued.
+        assert.ok(!mockOf(server).calls.some(c => c.command === ZFS && c.args[0] === 'snapshot'))
+      }
+      finally {
+        if (prevCfg === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prevCfg
+      }
+    })
+
+    it('a NON-recursive create never probes — a failing probe is irrelevant to it', async () => {
+      const prevCfg = process.env.ANAS_STORAGE_CFG
+      process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
+      mockOf(server).addFixture({
+        command: ZFS,
+        args: ['list', '-H', '-o', 'name', '-r', 'testpool/x'],
+        result: { stdout: '', stderr: 'probe broken', exitCode: 1 },
+      })
+      try {
+        const res = await create({ ...SCHEDULE, target: { kind: 'zfs', dataset: 'testpool/x' } })
+        assert.equal(res.statusCode, 202)
+        const done = await waitForJob(server, (res.json() as { job: { id: string } }).job.id)
+        assert.equal(done.status, 'completed', JSON.stringify(done.error))
+      }
+      finally {
+        if (prevCfg === undefined)
+          delete process.env.ANAS_STORAGE_CFG
+        else
+          process.env.ANAS_STORAGE_CFG = prevCfg
+      }
+    })
   })
 })

@@ -994,6 +994,89 @@ describe('recursive verbs over a NESTED PVE storage (review fix 2)', () => {
   })
 })
 
+// --- pvepool.1 review fix 4: a FAILED pool list probe refuses the recursive
+// verb instead of reading as "no descendants" --------------------------------
+
+describe('recursive verbs with a FAILED pool list probe (review fix 4)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string
+  let prevCfg: string | undefined
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-ds-failprobe-'))
+    prevCfg = process.env.ANAS_STORAGE_CFG
+    // storage.cfg ABSENT (fail-open): the probe failure is the only question —
+    // no ownership verdict is even reachable behind it.
+    process.env.ANAS_STORAGE_CFG = join(dir, 'absent-storage.cfg')
+    server = createServer({ mock: true, logger: false })
+    // The pool list RAN and failed: a recursive verb must refuse with the
+    // unlisted-descendants sentence, not 404 into a guess.
+    recordCalls(server, (command, args) => {
+      if (command === '/usr/sbin/zfs' && args.join(' ') === zfsListArgs('testpool').join(' '))
+        return { stdout: '', stderr: 'zfs list: cannot open pool: No such pool', exitCode: 1 }
+      return undefined
+    })
+  })
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    await rm(dir, { recursive: true, force: true })
+    if (prevCfg === undefined)
+      delete process.env.ANAS_STORAGE_CFG
+    else
+      process.env.ANAS_STORAGE_CFG = prevCfg
+  })
+
+  it('a recursive destroy is refused with the unlisted-descendants sentence', async () => {
+    const res = await server!.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool/datasets/x?recursive=true',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 400)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'VALIDATION_ERROR')
+    assert.match(error.message, /Could not list descendants of 'testpool\/x'/)
+    assert.match(error.message, /refusing the recursive destroy/)
+  })
+
+  it('a NON-recursive destroy keeps its vanished-target 404 (unchanged behaviour)', async () => {
+    const res = await server!.inject({
+      method: 'DELETE',
+      url: '/v1/pools/testpool/datasets/x',
+      headers: IDENTITY_HEADERS,
+    })
+    assert.equal(res.statusCode, 404)
+    assert.equal(res.json().error.code, 'NOT_FOUND')
+  })
+
+  it('a recursive snapshot is refused with the unlisted-descendants sentence', async () => {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/x/snapshots',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'snap1', recursive: true }),
+    })
+    assert.equal(res.statusCode, 400)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'VALIDATION_ERROR')
+    assert.match(error.message, /Could not list descendants of 'testpool\/x'/)
+    assert.match(error.message, /refusing the recursive snapshot/)
+  })
+
+  it('a NON-recursive snapshot keeps its vanished-target 404 (unchanged behaviour)', async () => {
+    const res = await server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/datasets/x/snapshots',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'snap1' }),
+    })
+    assert.equal(res.statusCode, 404)
+    assert.equal(res.json().error.code, 'NOT_FOUND')
+  })
+})
+
 // --- pvepool.1 review fix 1: unreadable storage.cfg fails CLOSED ------------
 
 describe('unreadable storage.cfg fails closed (review fix 1)', () => {
