@@ -118,9 +118,21 @@ export const SmbShare = z.object({
 })
 export type SmbShare = z.infer<typeof SmbShare>
 
+/**
+ * The free space of the storage a share path resolves onto — a READ-TIME
+ * observation (never stored state), carried on the DETAIL only, to suggest the
+ * Time Machine cap (smbsvc.3): the dialog prefills half of it. Resolved from
+ * the ZFS dataset's `available` or the AHR pool's free bytes; omitted when the
+ * path sits on neither.
+ */
+export const ShareCapacity = z.object({ availableBytes: z.number().int().nonnegative() })
+export type ShareCapacity = z.infer<typeof ShareCapacity>
+
 /** SMB share detail = the share plus its live connections. */
 export const SmbShareDetail = SmbShare.extend({
   connections: z.array(SmbConnection),
+  /** Free space under the share path, when it resolves onto ZFS or AHR. */
+  capacity: ShareCapacity.optional(),
 })
 export type SmbShareDetail = z.infer<typeof SmbShareDetail>
 

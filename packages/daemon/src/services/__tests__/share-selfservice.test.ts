@@ -8,12 +8,14 @@ import { MockExecutor } from '../../executor/mock.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
+import { readAhrPools } from '../ahr-topology.js'
 import {
   ahrSnapshotsMountpoint,
   ensureAhrSnapshotsMount,
   pickBucket,
   resolveSelfService,
   resolveSelfServiceTarget,
+  shareAvailableBytes,
   touchesSelfService,
 } from '../share-selfservice.js'
 
@@ -231,12 +233,21 @@ describe('resolveSelfService — keys, shapes, refusals (smbsvc.1)', () => {
     )
   })
 
-  it('still refuses a request that SETS timeMachine (slice 2 ships recycle; smbsvc.3 wires the beta)', async () => {
+  it('resolves a SET timeMachine with no system reads — the fruit cap is the quota on BOTH stacks (smbsvc.3)', async () => {
     const mock = new MockExecutor()
-    await assert.rejects(
-      resolveSelfService(mock, '/x', { timeMachine: { maxSize: 1000 } }, { systemdDir: '/tmp' }),
-      (err: Error) => /Time Machine target is not available/.test(err.message),
-    )
+    const resolved = await resolveSelfService(mock, '/srv/plain-disk/tm', { timeMachine: { maxSize: 536_870_912_000 } }, { systemdDir: '/tmp' })
+    assert.deepEqual(resolved?.keys, { timeMachine: { maxSize: 536_870_912_000 } })
+    assert.equal(resolved?.ahrPool, undefined)
+    // Like recycle, the decision needs no executor traffic — no bucket, no mount.
+    assert.equal(mock.calls.length, 0)
+  })
+
+  it('timeMachine rides alongside a Previous Versions enable (both keys resolved together)', async () => {
+    const mock = new MockExecutor()
+    addZfsFootprintFixtures(mock, 'testpool\t/testpool\ntestpool/media\t/testpool/media\n')
+    const resolved = await resolveSelfService(mock, '/testpool/media', { previousVersions: { enabled: true }, timeMachine: { maxSize: 536_870_912_000 } }, { systemdDir: '/nonexistent-units' })
+    assert.equal(resolved?.keys.previousVersions?.bucket, 'daily')
+    assert.deepEqual(resolved?.keys.timeMachine, { maxSize: 536_870_912_000 })
   })
 
   it('resolves a SET recycle with no system reads at all — the bin lives on the share\'s own filesystem', async () => {
@@ -264,6 +275,40 @@ describe('resolveSelfService — keys, shapes, refusals (smbsvc.1)', () => {
     assert.deepEqual(pv?.keys, { previousVersions: null })
     const clearAll = await resolveSelfService(mock, '/x', { previousVersions: { enabled: false }, recycle: null, timeMachine: null }, { systemdDir: '/tmp' })
     assert.deepEqual(clearAll?.keys, { previousVersions: null, recycle: null, timeMachine: null })
+  })
+})
+
+describe('shareAvailableBytes — the cap suggestion\'s input (smbsvc.3)', () => {
+  it('the ZFS dataset\'s `available`, read with -Hp', async () => {
+    const mock = new MockExecutor()
+    addZfsFootprintFixtures(mock, 'testpool\t/testpool\ntestpool/media\t/testpool/media\n')
+    mock.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'available', 'testpool/media'], result: { stdout: '1099511627776\n', stderr: '', exitCode: 0 } })
+    assert.equal(await shareAvailableBytes(mock, '/testpool/media/sub'), 1_099_511_627_776)
+  })
+
+  it('the AHR pool\'s free bytes, from the SAME pool read everything else uses', async () => {
+    const mock = new MockExecutor()
+    addZfsFootprintFixtures(mock, '') // no ZFS datasets
+    addAhrPoolFixtures(mock)
+    const pools = await readAhrPools(mock)
+    const pool = pools.find(p => p.name === 'tank')!
+    assert.equal(await shareAvailableBytes(mock, '/mnt/anas-ahr/tank/media'), pool.capacity.freeBytes)
+  })
+
+  it('FAIL-OPEN undefined: a plain dir, a failed read, an unparseable value', async () => {
+    const mock = new MockExecutor()
+    addZfsFootprintFixtures(mock, '')
+    assert.equal(await shareAvailableBytes(mock, '/srv/scratch'), undefined, 'neither stack → undefined')
+
+    const failRead = new MockExecutor()
+    addZfsFootprintFixtures(failRead, 'testpool\t/testpool\ntestpool/media\t/testpool/media\n')
+    failRead.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'available', 'testpool/media'], result: { stdout: '', stderr: 'dataset gone', exitCode: 1 } })
+    assert.equal(await shareAvailableBytes(failRead, '/testpool/media'), undefined, 'failed read → undefined')
+
+    const garbage = new MockExecutor()
+    addZfsFootprintFixtures(garbage, 'testpool\t/testpool\ntestpool/media\t/testpool/media\n')
+    garbage.addFixture({ command: ZFS, args: ['get', '-Hp', '-o', 'value', 'available', 'testpool/media'], result: { stdout: 'not-a-number\n', stderr: '', exitCode: 0 } })
+    assert.equal(await shareAvailableBytes(garbage, '/testpool/media'), undefined, 'unparseable → undefined')
   })
 })
 

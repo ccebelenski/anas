@@ -5,11 +5,13 @@ import {
   addShare,
   composeVfsObjects,
   customVfsRefusal,
+  formatMaxSize,
   getShare,
   hasCustomVfsObjects,
   hasShare,
   normalizeKey,
   parseDoc,
+  parseMaxSize,
   parseShadowFormatBucket,
   parseSmbConf,
   recyclePurgeTargets,
@@ -973,10 +975,10 @@ describe('hasCustomVfsObjects (smbsvc.1)', () => {
   })
 
   it('a fully composer-written stanza is not custom', () => {
-    const enabled = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS, recycle: { purgeDays: 7 }, timeMachine: { maxSize: 500_000_000_000 } })
+    const enabled = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS, recycle: { purgeDays: 7 }, timeMachine: { maxSize: 536_870_912_000 } })
     const share = getShare(enabled, 'media')!
     assert.deepEqual(share.vfsObjects, ['catia', 'fruit', 'streams_xattr', 'shadow_copy2', 'recycle'])
-    assert.deepEqual(share.timeMachine, { maxSize: 500_000_000_000 })
+    assert.deepEqual(share.timeMachine, { maxSize: 536_870_912_000 })
     assert.equal(hasCustomVfsObjects(share), false)
   })
 
@@ -1005,6 +1007,124 @@ describe('hasCustomVfsObjects (smbsvc.1)', () => {
   it('fruit keys without the size cap reads custom', () => {
     const noCap = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = catia fruit streams_xattr\n\tfruit:time machine = yes\n')
     assert.equal(hasCustomVfsObjects(getShare(noCap, 'media')!), true)
+  })
+
+  it('fruit keys with a ZERO cap reads custom — 0 means unlimited, never a cap', () => {
+    const zero = SS_BASE.replace('\tpath = /tank/media\n', '\tpath = /tank/media\n\tvfs objects = catia fruit streams_xattr\n\tfruit:time machine = yes\n\tfruit:time machine max size = 0\n')
+    const share = getShare(zero, 'media')!
+    assert.equal(share.timeMachine, undefined)
+    assert.equal(hasCustomVfsObjects(share), true)
+  })
+})
+
+// ============================================================================
+// Time Machine cap (smbsvc.3): the byte cap's unit form in the stanza — the
+// LARGEST unit that divides it exactly, else MiB floored — and the parse-back
+// to bytes. `fruit:time machine max size` carries Samba's binary suffixes;
+// a value of 0 means unlimited, so zero is never written or read.
+// ============================================================================
+
+describe('fruit max-size unit choice + round-trip (smbsvc.3)', () => {
+  const GIB = 1024 ** 3
+  const MIB = 1024 ** 2
+
+  it('the largest exact unit wins: TiB, then GiB, then MiB', () => {
+    assert.equal(formatMaxSize(2 * 1024 ** 4), '2T')
+    assert.equal(formatMaxSize(500 * GIB), '500G')
+    assert.equal(formatMaxSize(250 * MIB), '250M')
+  })
+
+  it('a byte count no unit divides exactly writes MiB floored — never below 1M', () => {
+    assert.equal(formatMaxSize(500_000_000), '476M') // 476.8 MiB → down
+    assert.equal(formatMaxSize(500_000), '1M') // < 1 MiB: 0 would lift the cap
+  })
+
+  it('round-trips through the stanza value', () => {
+    for (const bytes of [1024 ** 4, 500 * GIB, 250 * MIB, 1 * MIB]) {
+      assert.equal(parseMaxSize(formatMaxSize(bytes)), bytes)
+    }
+    // The inexact shapes parse back to what the stanza actually says.
+    assert.equal(parseMaxSize(formatMaxSize(500_000_000)), 476 * MIB)
+    assert.equal(parseMaxSize('1048576'), 1048576, 'a bare byte count (hand-written stanza) reads as bytes')
+    assert.equal(parseMaxSize('500g'), 500 * GIB, 'Samba accepts the lowercase suffix')
+  })
+
+  it('rejects non-caps and garbage', () => {
+    assert.equal(parseMaxSize('0'), null, '0 = unlimited in Samba, never a cap')
+    assert.equal(parseMaxSize(''), null)
+    assert.equal(parseMaxSize('abc'), null)
+    assert.equal(parseMaxSize('-5'), null)
+    assert.equal(parseMaxSize('10X'), null)
+    assert.equal(parseMaxSize('10 G'), null)
+  })
+
+  it('enabling Time Machine writes the fruit keys with the unit cap; the read model parses back to bytes', () => {
+    const next = updateShare(SS_BASE, 'media', {}, { timeMachine: { maxSize: 536_870_912_000 } })
+    const stanza = stanzaOf(next, 'media')
+    assert.match(stanza, /\tvfs objects = catia fruit streams_xattr\n/)
+    assert.match(stanza, /\tfruit:time machine = yes\n/)
+    assert.match(stanza, /\tfruit:time machine max size = 500G\n/)
+    assert.deepEqual(getShare(next, 'media')!.timeMachine, { maxSize: 536_870_912_000 })
+    assert.equal(hasCustomVfsObjects(getShare(next, 'media')!), false)
+    assert.ok(next.endsWith(SS_BASE.slice(SS_BASE.indexOf('[archive]'))))
+  })
+
+  it('re-enabling with the same cap is byte-identical (the unit form compares equal)', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { timeMachine: { maxSize: 536_870_912_000 } })
+    const again = updateShare(enabled, 'media', {}, { timeMachine: { maxSize: 536_870_912_000 } })
+    assert.equal(again, enabled)
+  })
+
+  it('a cap change rewrites ONLY the max-size value', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { timeMachine: { maxSize: 536_870_912_000 } })
+    const changed = updateShare(enabled, 'media', {}, { timeMachine: { maxSize: 250 * MIB } })
+    const stanza = stanzaOf(changed, 'media')
+    assert.match(stanza, /\tfruit:time machine max size = 250M\n/)
+    assert.ok(!changed.includes('500G'), 'the old cap is gone')
+    assert.equal(changed.replace('= 250M', '= 500G'), enabled, 'every other byte stands')
+  })
+
+  it('stacking onto previousVersions + recycle composes all five modules in order', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { previousVersions: PV_ZFS, recycle: { purgeDays: 30 } })
+    const all = updateShare(enabled, 'media', {}, { timeMachine: { maxSize: 536_870_912_000 } })
+    const stanza = stanzaOf(all, 'media')
+    assert.match(stanza, /\tvfs objects = catia fruit streams_xattr shadow_copy2 recycle\n/)
+    assert.match(stanza, /\tshadow:format = anas-hourly-%Y-%m-%dT%H%M%SZ\n/, 'the shadow keys survive')
+    assert.match(stanza, /\trecycle:repository = #recycle\n/, 'the recycle keys survive')
+    assert.deepEqual(getShare(all, 'media')!.timeMachine, { maxSize: 536_870_912_000 })
+  })
+
+  it('disabling removes the fruit keys and the composed line', () => {
+    const enabled = updateShare(SS_BASE, 'media', {}, { timeMachine: { maxSize: 536_870_912_000 } })
+    const off = updateShare(enabled, 'media', {}, { timeMachine: null })
+    const stanza = stanzaOf(off, 'media')
+    assert.ok(!stanza.includes('fruit:'), 'the fruit keys are gone')
+    assert.ok(!stanza.includes('vfs objects'), 'the composed line is gone (last feature off)')
+    assert.equal(getShare(off, 'media')!.timeMachine, undefined)
+  })
+
+  it('addShare writes the Time Machine stanza at create time', () => {
+    const text = addShare('', {
+      name: 'timemachine',
+      path: '/tank/tm',
+      browseable: true,
+      readOnly: false,
+      guestOk: false,
+      validUsers: [],
+      hostsAllow: [],
+      hostsDeny: [],
+    }, { timeMachine: { maxSize: 536_870_912_000 } })
+    assert.equal(text, [
+      '[timemachine]',
+      '\tpath = /tank/tm',
+      '\tbrowseable = yes',
+      '\tread only = no',
+      '\tguest ok = no',
+      '\tvfs objects = catia fruit streams_xattr',
+      '\tfruit:time machine = yes',
+      '\tfruit:time machine max size = 500G',
+      '',
+    ].join('\n'))
   })
 })
 

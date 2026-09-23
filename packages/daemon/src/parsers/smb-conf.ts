@@ -364,6 +364,8 @@ export const RECYCLE_REPOSITORY = '#recycle'
 const PURGE_MARKER_RE = /^#\s*anas:recycle-purge-days\s*=(.*)$/
 const SHADOW_FORMAT_RE = /^anas-([a-z]+)-%Y-%m-%dT%H%M%SZ$/
 const DIGITS_RE = /^\d+$/
+/** `fruit:time machine max size`: `<n>[M|G|T]` (Samba's size suffixes; bare = bytes). */
+const MAX_SIZE_RE = /^(\d+)([MGT])?$/i
 
 /**
  * The enabled-features → `vfs objects` module list. ONE composer for all
@@ -389,6 +391,51 @@ export function composeVfsObjects(features: {
 /** `shadow:format` for a schedule bucket: `anas-<bucket>-%Y-%m-%dT%H%M%SZ`. */
 export function shadowFormatFor(bucket: string): string {
   return `anas-${bucket}-%Y-%m-%dT%H%M%SZ`
+}
+
+// ── `fruit:time machine max size` (smbsvc.3) ──
+// Samba reads the value as a byte count with a size suffix; its units are
+// binary (M = MiB, G = GiB, T = TiB), and a value of 0 means UNLIMITED —
+// which is exactly what the cap exists to prevent, so neither direction ever
+// produces a zero.
+
+const MIB = 1024 ** 2
+const GIB = 1024 ** 3
+const TIB = 1024 ** 4
+
+/**
+ * A byte cap → the stanza value: the LARGEST unit that divides it exactly,
+ * else MiB rounded down. A positive cap that rounds below one MiB writes
+ * `1M` rather than `0M` — `0M` would lift the cap (Samba reads 0 as
+ * unlimited), the one direction rounding must never drift into.
+ */
+export function formatMaxSize(bytes: number): string {
+  if (bytes % TIB === 0)
+    return `${bytes / TIB}T`
+  if (bytes % GIB === 0)
+    return `${bytes / GIB}G`
+  if (bytes % MIB === 0)
+    return `${bytes / MIB}M`
+  return `${Math.max(1, Math.floor(bytes / MIB))}M`
+}
+
+/**
+ * A stanza's max-size value → bytes, or null when it is not a positive cap
+ * (`0` = unlimited is NOT a cap; garbage is a hand-written line).
+ */
+export function parseMaxSize(raw: string): number | null {
+  const m = MAX_SIZE_RE.exec(raw.trim())
+  if (!m)
+    return null
+  const n = Number(m[1])
+  if (n <= 0)
+    return null
+  switch ((m[2] ?? '').toUpperCase()) {
+    case 'T': return n * TIB
+    case 'G': return n * GIB
+    case 'M': return n * MIB
+    default: return n // a bare byte count (e.g. a hand-written stanza)
+  }
 }
 
 /**
@@ -510,7 +557,7 @@ function recycleKeysComplete(defs: KeyDef[], marker: string | null): boolean {
 function timeMachineKeysComplete(defs: KeyDef[]): boolean {
   const maxSize = paramValue(defs, PARAM.fruitTimeMachineMaxSize)
   return parseBool(paramValue(defs, PARAM.fruitTimeMachine), false)
-    && maxSize !== undefined && DIGITS_RE.test(maxSize) && Number(maxSize) > 0
+    && maxSize !== undefined && parseMaxSize(maxSize) !== null
 }
 
 // ============================================================================
@@ -565,7 +612,7 @@ function toSmbShare(name: string, defs: KeyDef[], marker: string | null): SmbSha
   const previousVersionsOn = vfsModules.includes('shadow_copy2') && previousVersionsKeysComplete(defs)
   const recycleOn = vfsModules.includes('recycle') && recycleKeysComplete(defs, marker)
   const timeMachineOn = vfsModules.includes('fruit') && vfsModules.includes('catia') && timeMachineKeysComplete(defs)
-  const maxSizeRaw = paramValue(defs, PARAM.fruitTimeMachineMaxSize)
+  const maxSizeBytes = parseMaxSize(paramValue(defs, PARAM.fruitTimeMachineMaxSize) ?? '')
   const bucket = parseShadowFormatBucket(paramValue(defs, PARAM.shadowFormat) ?? '')
 
   return {
@@ -581,7 +628,7 @@ function toSmbShare(name: string, defs: KeyDef[], marker: string | null): SmbSha
     ...(vfsModules.length > 0 ? { vfsObjects: vfsModules } : {}),
     ...(previousVersionsOn && bucket ? { previousVersions: { bucket } } : {}),
     ...(recycleOn && marker !== null ? { recycle: { purgeDays: parseMarkerDays(marker) as RecyclePurgeDays } } : {}),
-    ...(timeMachineOn && maxSizeRaw !== undefined ? { timeMachine: { maxSize: Number(maxSizeRaw) } } : {}),
+    ...(timeMachineOn && maxSizeBytes !== null ? { timeMachine: { maxSize: maxSizeBytes } } : {}),
   }
 }
 
@@ -939,7 +986,7 @@ function selfServiceEdits(doc: SmbConfDoc, sectionName: string, keys: SelfServic
     final.timeMachine = true
     lineTouched = true
     edits.push({ param: PARAM.fruitTimeMachine, kind: 'bool', value: 'yes' })
-    edits.push({ param: PARAM.fruitTimeMachineMaxSize, kind: 'text', value: String(tm.maxSize) })
+    edits.push({ param: PARAM.fruitTimeMachineMaxSize, kind: 'text', value: formatMaxSize(tm.maxSize) })
   }
 
   // The composed line: written (in canonical order) whenever any feature ends
@@ -1042,7 +1089,7 @@ function renderStanza(req: CreateSmbShareRequest, indent: string, selfService?: 
     }
     if (tm != null) {
       add(PARAM.fruitTimeMachine, 'yes')
-      add(PARAM.fruitTimeMachineMaxSize, String(tm.maxSize))
+      add(PARAM.fruitTimeMachineMaxSize, formatMaxSize(tm.maxSize))
     }
   }
 

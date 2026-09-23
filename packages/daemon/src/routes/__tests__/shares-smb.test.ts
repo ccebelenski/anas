@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { createServer } from '../../server.js'
+import { readAhrPools } from '../../services/ahr-topology.js'
 
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
@@ -768,7 +769,7 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
    */
   function startSelfService(
     conf: string,
-    opts: { zfsTable?: string, ahr?: { subvol?: string }, systemdUnits?: { id: string, cadence: string, dataset: string }[] } = {},
+    opts: { zfsTable?: string, ahr?: { subvol?: string }, systemdUnits?: { id: string, cadence: string, dataset: string }[], availableBytes?: number } = {},
   ): ReturnType<typeof createServer> {
     dir = mkdtempSync(join(tmpdir(), 'anas-smb-selfsvc-'))
     fstabPath = join(dir, 'fstab')
@@ -801,6 +802,8 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     const mock = (server as unknown as { executor: MockExecutor }).executor
     // The footprint reads (datasetOfPath): mountpoint table + boot probe.
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: opts.zfsTable ?? '', stderr: '', exitCode: 0 } })
+    // The dataset's free space (smbsvc.3): the capacity read the detail serves.
+    mock.addFixture({ command: '/usr/sbin/zfs', args: ['get', '-Hp', '-o', 'value', 'available', 'testpool/media'], result: { stdout: `${opts.availableBytes ?? 1_099_511_627_776}\n`, stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/findmnt', args: ['--json'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '/dev/sda1\text4\n', stderr: '', exitCode: 0 } })
@@ -1030,17 +1033,130 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     assert.ok(!readFileSync(confPath!, 'utf8').includes('[scratch]'))
   })
 
-  it('a request that SETS timeMachine is still refused (smbsvc.3 wires the beta; slice 2 shipped recycle)', async () => {
-    const s = startSelfService(ZFS_SHARE_CONF, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n' })
+  // --- Time Machine target (smbsvc.3, BETA) -----------------------------------
+  it('enable writes the fruit keys with the unit cap and the composed modules; the detail derives the cap', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
     const res = await s.inject({
       method: 'PUT',
       url: '/v1/shares/smb/media',
       headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
-      payload: JSON.stringify({ timeMachine: { maxSize: 1_000_000 } }),
+      payload: JSON.stringify({ timeMachine: { maxSize: 536_870_912_000 } }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+
+    const written = readFileSync(confPath!, 'utf8')
+    const stanza = written.slice(written.indexOf('[media]'))
+    assert.ok(stanza.includes('\tvfs objects = catia fruit streams_xattr\n'), written)
+    assert.ok(stanza.includes('\tfruit:time machine = yes\n'), written)
+    assert.ok(stanza.includes('\tfruit:time machine max size = 500G\n'), written)
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    assert.deepEqual((detail.json() as { data: SmbShare }).data.timeMachine, { maxSize: 536_870_912_000 })
+  })
+
+  it('cap units round-trip: the parse-back reads the stanza form to bytes', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    for (const [bytes, want] of [[5 * 1024 ** 3, '5G'], [250 * 1024 ** 2, '250M'], [2 * 1024 ** 4, '2T']] as const) {
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/media',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify({ timeMachine: { maxSize: bytes } }),
+      })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.ok(readFileSync(confPath!, 'utf8').includes(`fruit:time machine max size = ${want}\n`), `stanza for ${bytes}`)
+      const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+      assert.deepEqual((detail.json() as { data: SmbShare }).data.timeMachine, { maxSize: bytes })
+    }
+  })
+
+  it('a cap that is missing, zero or negative is refused 400 by the schema (the cap is REQUIRED)', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    for (const payload of [{ timeMachine: {} }, { timeMachine: { maxSize: 0 } }, { timeMachine: { maxSize: -5 } }, { timeMachine: { maxSize: 1.5 } }]) {
+      const res = await s.inject({
+        method: 'PUT',
+        url: '/v1/shares/smb/media',
+        headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+        payload: JSON.stringify(payload),
+      })
+      assert.equal(res.statusCode, 400, JSON.stringify(payload))
+      assert.equal((res.json() as { error: { code: string } }).error.code, 'VALIDATION_ERROR')
+    }
+    assert.ok(!readFileSync(confPath!, 'utf8').includes('fruit:'), 'nothing was written')
+  })
+
+  it('clear removes the fruit keys and the composed line byte-identically', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    const enable = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ timeMachine: { maxSize: 536_870_912_000 } }) })
+    await waitForJob(s, (enable.json() as JobAccepted).job.id)
+    const disable = await s.inject({ method: 'PUT', url: '/v1/shares/smb/media', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ timeMachine: null }) })
+    assert.equal(disable.statusCode, 202)
+    await waitForJob(s, (disable.json() as JobAccepted).job.id)
+    assert.equal(readFileSync(confPath!, 'utf8'), ZFS_SHARE_CONF, 'disable restores the original bytes exactly')
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    assert.equal((detail.json() as { data: SmbShare }).data.timeMachine, undefined)
+  })
+
+  it(`a create with the Time Machine target writes the full stanza in one go`, async () => {
+    const s = startSelfService(ZFS_SHARE_CONF)
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'timemachine', path: '/srv/tm', timeMachine: { maxSize: 536_870_912_000 } }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    const written = readFileSync(confPath!, 'utf8')
+    assert.ok(written.includes('[timemachine]'))
+    assert.ok(written.includes('\tvfs objects = catia fruit streams_xattr\n'), written)
+    assert.ok(written.includes('\tfruit:time machine max size = 500G\n'), written)
+  })
+
+  it(`Time Machine enable on a share with a custom vfs objects line is refused 400 with the share named`, async () => {
+    const custom = ZFS_SHARE_CONF.replace('\tread only = no\n', '\tread only = no\n\tvfs objects = vfs_fruit_extras\n')
+    const s = startSelfService(custom)
+    const res = await s.inject({
+      method: 'PUT',
+      url: '/v1/shares/smb/media',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ timeMachine: { maxSize: 536_870_912_000 } }),
     })
     assert.equal(res.statusCode, 400)
-    assert.match(res.json().error.message, /not available in this version/)
-    assert.ok(!readFileSync(confPath!, 'utf8').includes('fruit:'))
+    assert.match(res.json().error.message, /share 'media' has a custom vfs objects line — remove it before enabling self-service features/)
+    assert.ok(!readFileSync(confPath!, 'utf8').includes('fruit:'), 'nothing was written')
+  })
+
+  // --- Capacity on the detail (smbsvc.3: the cap suggestion's input) ---------
+  it('the ZFS detail carries the dataset available as capacity.availableBytes', async () => {
+    const s = startSelfService(ZFS_SHARE_CONF, { zfsTable: 'testpool\t/testpool\ntestpool/media\t/testpool/media\n', availableBytes: 1_099_511_627_776 })
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    assert.equal(detail.statusCode, 200)
+    const data = (detail.json() as { data: SmbShareDetail }).data
+    assert.deepEqual(data.capacity, { availableBytes: 1_099_511_627_776 })
+  })
+
+  it('the AHR detail carries the pool freeBytes as capacity.availableBytes', async () => {
+    const s = startSelfService(AHR_SHARE_CONF, { ahr: {} })
+    const mock = (s as unknown as { executor: MockExecutor }).executor
+    const pools = await readAhrPools(mock)
+    const pool = pools.find(p => p.name === 'ahr0')!
+    assert.ok(pool.capacity.freeBytes > 0, 'the fixture pool has free bytes')
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    const data = (detail.json() as { data: SmbShareDetail }).data
+    assert.deepEqual(data.capacity, { availableBytes: pool.capacity.freeBytes })
+  })
+
+  it('a plain-directory share carries NO capacity (neither ZFS nor AHR underneath)', async () => {
+    const scratch = ZFS_SHARE_CONF.replace('/testpool/media', '/srv/scratch')
+    const s = startSelfService(scratch)
+    const detail = await s.inject({ method: 'GET', url: '/v1/shares/smb/media' })
+    const data = (detail.json() as { data: SmbShareDetail }).data
+    assert.equal(data.capacity, undefined)
   })
 
   // --- Recycle bin (smbsvc.2) -----------------------------------------------

@@ -12,7 +12,7 @@ import { parseSmbStatusJson, parseSmbStatusText } from '../parsers/smbstatus.js'
 import { confirmGate } from '../safety/gate.js'
 import { ConfigConflictError, editConfig, readConfig } from '../services/config-writer.js'
 import { loadPveFootprint } from '../services/pve-footprint.js'
-import { enablingSelfService, ensureAhrSnapshotsMount, resolveSelfService, touchesSelfService } from '../services/share-selfservice.js'
+import { enablingSelfService, ensureAhrSnapshotsMount, resolveSelfService, shareAvailableBytes, touchesSelfService } from '../services/share-selfservice.js'
 import { requireIdentity } from './identity.js'
 
 const SMBSTATUS = '/usr/bin/smbstatus'
@@ -349,6 +349,12 @@ export async function smbShareRoutes(
       pathExists: pathExists(share.path),
       connections: await connectionsFor(share.name),
     }
+    // The storage's free space (smbsvc.3, additive, fail-open): the input for
+    // the Time Machine cap suggestion — present when the path resolves onto a
+    // ZFS dataset or an AHR pool, absent otherwise.
+    const availableBytes = await shareAvailableBytes(executor, share.path)
+    if (availableBytes !== undefined)
+      detail.capacity = { availableBytes }
     return { data: detail }
   })
 

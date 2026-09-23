@@ -52,6 +52,15 @@ const execFileAsync = promisify(execFile)
  *      reads back through @GMT, re-enable/second-share reuse the mount,
  *      disable keeps the mount (by design), and DESTROY takes the mount AND
  *      its fstab line with the pool
+ *   6. the Time Machine target (smbsvc.3, BETA) addendum: enabling with a
+ *      500 GiB cap on pvshare writes the composed `vfs objects = catia fruit
+ *      streams_xattr` line and the fruit keys — and NOTHING else (the
+ *      enforced durable-handles / posix-locking / kernel-oplocks settings are
+ *      vfs_fruit's own connect-time consequences, which GT 2026-09-23 showed
+ *      testparm cannot display: `--parameter-name` answers the unchanged
+ *      default identically for [global] and the TM share). `testparm -s` ON
+ *      THE NODE shows the share with the fruit keys as written.
+ *      Client-side proof = community (no current macOS on the bench).
  *
  * Every test leaves the node as found: the shares, schedules, and share users
  * this file creates are removed through their own API doors (best-effort
@@ -588,6 +597,67 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
       catch { /* best-effort */ }
       await ctx.dispose()
       await sshExec('rm -f /var/tmp/ahr-v1.txt /var/tmp/ahr-v2.txt /var/tmp/ahr-old.txt').catch(() => {})
+    }
+  })
+
+  test('6 — Time Machine target (smbsvc.3, beta): enable with a 500 GiB cap — the fruit keys land and ANAS writes nothing besides', async ({ playwright, pveTicket }) => {
+    const ctx = await authedContext(playwright, pveTicket)
+    try {
+      // The share may already exist (test 1 made it plain; a grep'd solo run
+      // starts without it) — either way it stands plain here.
+      const create = await ctx.post(`${V1}/shares/smb`, { data: { name: SHARE, path: SHARE_PATH } })
+      expect([202, 409]).toContain(create.status())
+      if (create.status() === 202)
+        await awaitJob(ctx, (await create.json()).job.id)
+
+      // The detail carries the storage's free space (the cap suggestion's
+      // input): pvshare is a ZFS dataset, so capacity is present.
+      const plain = await ctx.get(`${V1}/shares/smb/${SHARE}`)
+      expect((await plain.json()).data.capacity?.availableBytes ?? 0).toBeGreaterThan(0)
+
+      // Enable with a 500 GiB cap → the composed fruit line + keys.
+      await runJob(ctx, 'put', `${V1}/shares/smb/${SHARE}`, { timeMachine: { maxSize: 536870912000 } })
+      const detail = await ctx.get(`${V1}/shares/smb/${SHARE}`)
+      expect((await detail.json()).data.timeMachine).toEqual({ maxSize: 536870912000 })
+      const stanza = await shareStanza(SHARE)
+      expect(stanza).toContain('vfs objects = catia fruit streams_xattr')
+      expect(stanza).toContain('fruit:time machine = yes')
+      expect(stanza).toContain('fruit:time machine max size = 500G')
+      // ANAS writes NOTHING beyond the composed line and the two fruit keys:
+      // durable handles / kernel oplocks / kernel share modes / posix locking
+      // are vfs_fruit's own connect-time consequences of fruit:time machine.
+      expect(stanza).not.toContain('durable handles')
+      expect(stanza).not.toContain('posix locking')
+      expect(stanza).not.toContain('kernel oplocks')
+      // The node's independent testparm read. GROUND TRUTH 2026-09-23 (Samba
+      // 4.22.11): testparm echoes the `fruit:*` params AS WRITTEN (they are
+      // VFS options, not loadparm booleans — no `Yes`/`No` normalisation), and
+      // fruit's enforced settings are NOT visible to it at all — a
+      // `--parameter-name` query answers the unchanged default identically for
+      // [global] and the TM share, because the enforcement happens when smbd
+      // serves the share, not in the config. The runtime behaviour is Samba's
+      // documented one; with no macOS on the bench the client side stays
+      // community-verified (the beta's standing disclosure).
+      const tp = await sshExec('testparm -s 2>/dev/null')
+      const lines = tp.split('\n')
+      const start = lines.findIndex(l => l.trim() === `[${SHARE}]`)
+      expect(start).toBeGreaterThanOrEqual(0)
+      const rest = lines.slice(start + 1)
+      const end = rest.findIndex(l => l.trim().startsWith('['))
+      const section = (end === -1 ? rest : rest.slice(0, end)).join('\n')
+      expect(section).toContain('vfs objects = catia fruit streams_xattr')
+      expect(section).toContain('fruit:time machine = yes')
+      expect(section).toContain('fruit:time machine max size = 500G')
+
+      // Disable → the stanza goes clean again (the fruit keys are ANAS's to
+      // remove, the enforced settings were never written).
+      await runJob(ctx, 'put', `${V1}/shares/smb/${SHARE}`, { timeMachine: null })
+      const after = await ctx.get(`${V1}/shares/smb/${SHARE}`)
+      expect((await after.json()).data.timeMachine).toBeUndefined()
+      expect(await shareStanza(SHARE)).not.toContain('fruit:')
+    }
+    finally {
+      await ctx.dispose()
     }
   })
 })

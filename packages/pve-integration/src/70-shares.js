@@ -22,8 +22,10 @@
  *
  * The SMB dialog's "Self-service" fieldset (DESIGN "Self-service on SMB
  * shares", smbsvc.1–3) carries one row per per-share feature the user
- * toggles for their own clients — Previous Versions (smbsvc.1) and the
- * Recycle bin (smbsvc.2) for now; Time Machine joins in smbsvc.3. Each row is a
+ * toggles for their own clients — Previous Versions (smbsvc.1), the
+ * Recycle bin (smbsvc.2) and the Time Machine target (smbsvc.3, BETA: the
+ * server side is configured per Samba's documentation; the client side is
+ * community-verified). Each row is a
  * checkbox + a read-only sentence the dialog fills; a share whose `vfs
  * objects` line is hand-made (ANAS.smb.hasCustomVfsObjects, the daemon's
  * own refusal rule) greys its row with the reason instead of sending a
@@ -60,7 +62,9 @@
  * Self-service fieldset (smbsvc.1/.2) 'anas-fld-smb-self-service' /
  * 'anas-fld-smb-previous-versions' / 'anas-fld-smb-previous-versions-note' /
  * 'anas-fld-smb-recycle' / 'anas-fld-smb-recycle-purge' /
- * 'anas-fld-smb-recycle-note';
+ * 'anas-fld-smb-recycle-note' / 'anas-fld-smb-time-machine' /
+ * 'anas-fld-smb-time-machine-size' / 'anas-fld-smb-time-machine-unit' /
+ * 'anas-fld-smb-time-machine-note';
  * details window
  * 'anas-fld-details-addr' / 'anas-fld-connect' / 'anas-btn-copy'.
  *
@@ -487,6 +491,52 @@
         + 'keeping their path. Files deleted from #recycle are gone for real; deleting '
         + 'the folder empties the bin. Turning this off leaves #recycle in place.';
 
+    // The Time Machine row's sentence (smbsvc.3, BETA), shown while the box is
+    // ticked — the dedicated-share warning (the cap counts only sparsebundle
+    // contents), the ZFS-quota hint, the no-avahi selection sentence, and the
+    // beta disclosure (release notes carry the same wording and ask for
+    // reports).
+    var SMB_TM_NOTE = 'Dedicate this share to Time Machine — the cap counts only '
+        + 'sparsebundle contents. On ZFS a dataset quota is the hard limit '
+        + '(Datasets). Select it on the Mac by mounting the share in Finder or '
+        + 'with tmutil setdestination. Beta: the server side is configured per '
+        + "Samba's documentation; the client side is community-verified — please "
+        + 'report.';
+
+    // Binary size units — Samba's fruit max-size suffixes are MiB/GiB/TiB, so
+    // the dialog's unit combo and its conversions are binary too.
+    var MIB = 1024 * 1024;
+    var GIB = 1024 * 1024 * 1024;
+    var TIB = 1024 * 1024 * 1024 * 1024;
+
+    // A byte cap → the field's { size, unit } split: the largest unit that
+    // divides it exactly (T, then G, then M), else whole MiB floored — the
+    // round-trip the edit dialog needs when the feature is already on.
+    function smbTmSplit(bytes) {
+        if (bytes % TIB === 0) { return { size: bytes / TIB, unit: 'T' }; }
+        if (bytes % GIB === 0) { return { size: bytes / GIB, unit: 'G' }; }
+        if (bytes % MIB === 0) { return { size: bytes / MIB, unit: 'M' }; }
+        return { size: Math.floor(bytes / MIB), unit: 'M' };
+    }
+
+    // The cap suggestion (smbsvc.3): HALF the storage's available bytes,
+    // floored to whole GiB — the design's suggested value, applied only when
+    // the box is ticked and the field is still empty.
+    function smbTmSuggestedSize(capacity) {
+        var avail = capacity && capacity.availableBytes;
+        if (!avail || avail <= 0) { return null; }
+        return Math.floor(avail / 2 / GIB);
+    }
+
+    // A stored cap as the detail sentence reads it: "500 GiB" / "2000 MiB" —
+    // the largest unit that divides it exactly, MiB as the smallest step
+    // (ANAS never writes below one).
+    function smbTmCapText(bytes) {
+        var split = smbTmSplit(bytes);
+        var unit = { M: t('MiB'), G: t('GiB'), T: t('TiB') }[split.unit];
+        return split.size + ' ' + unit;
+    }
+
     // The sentence beside a TICKED box: the bucket the share exposes when the
     // detail already carries one (an edit), the empty-until-a-schedule-runs
     // note for a fresh enable.
@@ -519,9 +569,10 @@
         note.setHidden(false);
     }
 
-    // The Self-service fieldset (smbsvc.1/.2): BOTH rows share the same
+    // The Self-service fieldset (smbsvc.1–3): ALL rows share the same
     // custom-`vfs objects` rule and sentence — one greyed state, one helper,
-    // no copy. The purge combo is live exactly while its box is ticked.
+    // no copy. The purge combo and the Time Machine cap field are live
+    // exactly while their boxes are ticked.
     function syncSmbSelfServiceNotes(win, share, greyed) {
         syncSmbRowNote(win, '#previousVersionsNote', '#previousVersions',
             smbPvNoteText(share), greyed);
@@ -530,6 +581,17 @@
         var purgeCombo = win.down('#recyclePurge');
         if (purgeCombo) {
             purgeCombo.setDisabled(greyed || !(recycleBox && recycleBox.getValue()));
+        }
+        var tmBox = win.down('#timeMachine');
+        syncSmbRowNote(win, '#timeMachineNote', '#timeMachine', t(SMB_TM_NOTE), greyed);
+        var tmSize = win.down('#timeMachineSize');
+        var tmUnit = win.down('#timeMachineUnit');
+        var tmLive = !greyed && !!(tmBox && tmBox.getValue());
+        if (tmSize) {
+            tmSize.setDisabled(!tmLive);
+        }
+        if (tmUnit) {
+            tmUnit.setDisabled(!tmLive);
         }
     }
 
@@ -565,6 +627,16 @@
         if (isEdit && existing && existing.recycle) {
             recyclePurgeInitial = existing.recycle.purgeDays == null
                 ? 'never' : String(existing.recycle.purgeDays);
+        }
+        // The stored Time Machine cap on an edit, split for the size field +
+        // unit combo (smbsvc.3); empty on a create — the tick fills the
+        // suggestion (half the storage's available space) when it can.
+        var tmInitialSize = '';
+        var tmInitialUnit = 'G';
+        if (isEdit && existing && existing.timeMachine) {
+            var tmSplit = smbTmSplit(existing.timeMachine.maxSize);
+            tmInitialSize = String(tmSplit.size);
+            tmInitialUnit = tmSplit.unit;
         }
         var userGroupStore = Ext.create('Ext.data.Store', {
             fields: ['name'],
@@ -669,9 +741,10 @@
                             value: isEdit ? (existing.hostsDeny || []).join(', ') : '',
                         },
                         {
-                            // Self-service (smbsvc.1/.2): per-share features
-                            // the user's own clients use. Time Machine joins
-                            // as a further row in smbsvc.3.
+                            // Self-service (smbsvc.1–3): per-share features
+                            // the user's own clients use — Previous Versions,
+                            // the Recycle bin and the Time Machine target
+                            // (beta).
                             xtype: 'fieldset',
                             itemId: 'selfService',
                             cls: 'anas-fld-smb-self-service',
@@ -741,6 +814,77 @@
                                     hidden: true,
                                     html: '',
                                 },
+                                {
+                                    // Time Machine target (smbsvc.3, BETA):
+                                    // vfs_fruit on the share, the size cap
+                                    // its only knob. Beta is IN the label —
+                                    // the dialog row, the detail line and the
+                                    // release notes all say so.
+                                    xtype: 'checkboxfield',
+                                    itemId: 'timeMachine',
+                                    cls: 'anas-fld-smb-time-machine',
+                                    fieldLabel: t('Time Machine target (beta)'),
+                                    boxLabel: t('Let a Mac back up to this share'),
+                                    checked: isEdit && !!existing.timeMachine,
+                                    disabled: selfServiceGreyed,
+                                },
+                                {
+                                    // The required cap, in a size + unit
+                                    // field (G the default). Ticked with an
+                                    // empty field, it prefills with HALF the
+                                    // storage's available space (the share's
+                                    // detail carries it) floored to whole GiB.
+                                    xtype: 'fieldcontainer',
+                                    fieldLabel: t('Size cap'),
+                                    labelWidth: 160,
+                                    layout: { type: 'hbox' },
+                                    defaults: { anchor: '100%' },
+                                    items: [
+                                        {
+                                            xtype: 'numberfield',
+                                            itemId: 'timeMachineSize',
+                                            cls: 'anas-fld-smb-time-machine-size',
+                                            flex: 1,
+                                            minValue: 1,
+                                            allowDecimals: false,
+                                            allowBlank: true,
+                                            value: tmInitialSize,
+                                            disabled: !tmInitialSize,
+                                        },
+                                        {
+                                            xtype: 'combobox',
+                                            itemId: 'timeMachineUnit',
+                                            cls: 'anas-fld-smb-time-machine-unit',
+                                            width: 80,
+                                            margin: '0 0 0 6',
+                                            store: {
+                                                fields: ['val', 'label'],
+                                                data: [
+                                                    { val: 'M', label: t('MiB') },
+                                                    { val: 'G', label: t('GiB') },
+                                                    { val: 'T', label: t('TiB') },
+                                                ],
+                                            },
+                                            displayField: 'label',
+                                            valueField: 'val',
+                                            queryMode: 'local',
+                                            editable: false,
+                                            forceSelection: true,
+                                            value: tmInitialUnit,
+                                            disabled: !tmInitialSize,
+                                        },
+                                    ],
+                                },
+                                {
+                                    // The sentence under the row — shown
+                                    // while the box is ticked; filled by
+                                    // syncSmbSelfServiceNotes below.
+                                    xtype: 'component',
+                                    itemId: 'timeMachineNote',
+                                    cls: 'anas-fld-smb-time-machine-note',
+                                    hidden: true,
+                                    html: '',
+                                },
                             ],
                         },
                     ],
@@ -779,6 +923,26 @@
         var recycleBox = win.down('#recycle');
         if (recycleBox) {
             recycleBox.on('change', function () {
+                syncSmbSelfServiceNotes(win, existing, selfServiceGreyed);
+            });
+        }
+        var tmBox = win.down('#timeMachine');
+        if (tmBox) {
+            tmBox.on('change', function () {
+                // The cap suggestion (smbsvc.3): ticked with an empty field,
+                // prefill HALF the storage's available space floored to whole
+                // GiB (the share's detail carries it — an edit; a create has
+                // no capacity to read and stays empty). An already-filled
+                // field is never overwritten.
+                if (tmBox.getValue()) {
+                    var tmSize = win.down('#timeMachineSize');
+                    if (tmSize && (tmSize.getValue() === null || tmSize.getValue() === '')) {
+                        var suggested = smbTmSuggestedSize(existing && existing.capacity);
+                        if (suggested !== null && suggested > 0) {
+                            tmSize.setValue(suggested);
+                        }
+                    }
+                }
                 syncSmbSelfServiceNotes(win, existing, selfServiceGreyed);
             });
         }
@@ -850,6 +1014,34 @@
             body.recycle = recycleNowOn ? { purgeDays: purgeDays } : null;
         } else if (recycleNowOn && purgeDays !== existing.recycle.purgeDays) {
             body.recycle = { purgeDays: purgeDays };
+        }
+
+        // Self-service Time Machine target (smbsvc.3, BETA) — the same §2
+        // three-valued contract: a tick sends { maxSize: bytes } (the cap is
+        // REQUIRED), a cap change on an already-on share sends the new cap,
+        // an untick sends `null`, and an untouched edit sends no key at all.
+        // A ticked box with an empty or non-positive cap is refused HERE,
+        // before anything is sent.
+        var tmBox = win.down('#timeMachine');
+        var tmWasOn = !!(isEdit && existing && existing.timeMachine != null);
+        var tmNowOn = tmBox ? !!tmBox.getValue() : tmWasOn;
+        if (tmNowOn) {
+            var tmSizeField = win.down('#timeMachineSize');
+            var tmUnit = win.down('#timeMachineUnit');
+            var tmVal = tmSizeField ? tmSizeField.getValue() : null;
+            var tmMult = { M: MIB, G: GIB, T: TIB }[(tmUnit && tmUnit.getValue()) || 'G'] || GIB;
+            var tmBytes = (typeof tmVal === 'number' && isFinite(tmVal) && tmVal > 0)
+                ? Math.floor(tmVal) * tmMult
+                : null;
+            if (tmBytes === null) {
+                ANAS.alertMsg('Invalid input', t('Enter a size cap for the Time Machine target.'));
+                return;
+            }
+            if (tmNowOn !== tmWasOn || tmBytes !== existing.timeMachine.maxSize) {
+                body.timeMachine = { maxSize: tmBytes };
+            }
+        } else if (tmNowOn !== tmWasOn) {
+            body.timeMachine = null;
         }
 
         var method;
@@ -1290,7 +1482,20 @@
             loadShares(grid, node);
         };
         if (rec.get('protocol') === 'smb') {
-            openSmbShareWindow(node, rec.get('raw'), null, reload);
+            // The edit dialog opens on the share's DETAIL (smbsvc.3): the
+            // detail carries `capacity` — the storage's free space the Time
+            // Machine cap suggestion prefills from — which the list rows do
+            // not. Fail-open: a failed detail read opens the dialog on the
+            // row (the tick then starts with an empty cap field).
+            var raw = rec.get('raw');
+            var detailCall = raw && raw.name && ANAS.api.get
+                ? ANAS.api.get(node, '/shares/smb/' + encodeURIComponent(raw.name))
+                : Promise.reject(new Error('no share name'));
+            detailCall.then(function (res) {
+                openSmbShareWindow(node, (res && res.data) || raw, null, reload);
+            }, function () {
+                openSmbShareWindow(node, raw, null, reload);
+            });
         } else {
             openNfsExportWindow(node, rec.get('raw'), null, reload);
         }
@@ -1363,6 +1568,14 @@
                     ? t('on') + ' — ' + (rc.purgeDays == null
                         ? t('never purged')
                         : t('purge after') + ' ' + rc.purgeDays + ' ' + t('days'))
+                    : t('off')));
+            // Time Machine target (smbsvc.3, BETA): the effective cap, parsed
+            // back from the stanza's fruit keys — or off. Beta is in the
+            // label, matching the dialog row.
+            var tm = raw.timeMachine;
+            lines.push('<b>' + t('Time Machine target (beta)') + ':</b> '
+                + (tm
+                    ? t('on') + ' — ' + t('cap') + ' ' + smbTmCapText(tm.maxSize)
                     : t('off')));
         } else {
             lines.push('<b>' + t('NFS export') + ':</b> ' + enc(raw.path));

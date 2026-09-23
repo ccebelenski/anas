@@ -36,6 +36,7 @@ import { readAllSchedules } from './snapshot-schedule-units.js'
 
 const FINDMNT = '/usr/bin/findmnt'
 const MOUNT = '/usr/bin/mount'
+const ZFS = '/usr/sbin/zfs'
 
 /**
  * Base for the per-pool read-only `@snapshots` mounts (a SIBLING of the pool
@@ -78,6 +79,35 @@ export async function resolveSelfServiceTarget(executor: CommandExecutor, path: 
       best = { pool: pool.name, mountpoint: pool.mountpoint }
   }
   return best ? { kind: 'ahr', pool: best.pool } : null
+}
+
+/**
+ * The free space of the storage `path` sits on, in bytes — the input for the
+ * Time Machine cap suggestion (smbsvc.3): the ZFS dataset's `available`, or
+ * the AHR pool's free bytes (reusing the SAME target resolver and pool read
+ * everything else here uses — no second resolver). FAIL-OPEN `undefined`: an
+ * unresolvable path, a failed read or an unparseable value is a missing
+ * suggestion, never a detail-view failure.
+ */
+export async function shareAvailableBytes(executor: CommandExecutor, path: string): Promise<number | undefined> {
+  try {
+    const target = await resolveSelfServiceTarget(executor, path)
+    if (!target)
+      return undefined
+    if (target.kind === 'zfs') {
+      const r = await executor.exec(ZFS, ['get', '-Hp', '-o', 'value', 'available', target.dataset])
+      if (r.exitCode !== 0)
+        return undefined
+      const n = Number(r.stdout.trim())
+      return Number.isInteger(n) && n >= 0 ? n : undefined
+    }
+    const pools = await readAhrPools(executor)
+    const pool = pools.find(p => p.name === target.pool)
+    return pool ? pool.capacity.freeBytes : undefined
+  }
+  catch {
+    return undefined
+  }
 }
 
 /** Does a schedule target exactly this dataset/pool? */
@@ -154,10 +184,11 @@ function recycleKeysFrom(req: SelfServiceRequest): SelfServiceKeys {
  * matters (the same fast-path + in-job re-check pattern the ownership guards
  * use). `undefined` when the request touches no feature (a plain field edit).
  *
- * Slice 2 ships the recycle bin alongside Previous Versions; a request that
- * SETS timeMachine is still refused — the composer and managed keys exist,
- * but the beta wiring (smbsvc.3) does not. Clearing it stays a permitted
- * no-op.
+ * Time Machine (smbsvc.3, BETA) needs NO system resolution — unlike Previous
+ * Versions there is nothing to pick or mount: the fruit cap is the quota on
+ * BOTH stacks (on AHR the only one), and the feature works on any path a
+ * share may sit on. The cap arrives validated (integer > 0, the shared
+ * schema); a `null` request clears it.
  */
 export async function resolveSelfService(
   executor: CommandExecutor,
@@ -168,14 +199,11 @@ export async function resolveSelfService(
   if (!touchesSelfService(req))
     return undefined
 
-  if (req.timeMachine !== undefined && req.timeMachine !== null)
-    throw new Error('The Time Machine target is not available in this version of ANAS — enable it once the Time Machine story ships')
-
   const resolved: SelfServiceKeys = {
     ...recycleKeysFrom(req),
-    // Clearing Time Machine stays a permitted no-op (the composer removes
-    // nothing it did not write) — only SETTING it is refused above.
-    ...(req.timeMachine !== undefined ? { timeMachine: null } : {}),
+    ...(req.timeMachine !== undefined
+      ? { timeMachine: req.timeMachine === null ? null : { maxSize: req.timeMachine.maxSize } }
+      : {}),
   }
 
   const pv = req.previousVersions

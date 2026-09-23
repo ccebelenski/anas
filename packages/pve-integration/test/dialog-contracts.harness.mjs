@@ -9587,13 +9587,17 @@ const SMB_SHARE = {
   hostsDeny: [],
 }
 
-function smbSelfServiceRoutes(shares) {
+function smbSelfServiceRoutes(shares, detail) {
+  // The EDIT dialog opens on the share's DETAIL (smbsvc.3: it carries
+  // `capacity`, the cap-suggestion input) — defaulting to the first share row
+  // so the dialog's initial state matches what the row would show.
+  const det = detail || { ...(shares[0] || SMB_SHARE), connections: [] }
   return {
     'GET /shares/smb': { data: shares },
     'GET /shares/nfs': { data: [] },
     'GET /identity/users': { data: [] },
     'GET /identity/groups': { data: [] },
-    'GET /shares/smb/media': { data: { ...SMB_SHARE, connections: [] } },
+    'GET /shares/smb/media': { data: det },
   }
 }
 
@@ -9945,6 +9949,168 @@ async function smbSelfServiceChecks() {
   summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
   ok('smb-recycle(detail): an off share reads "off"',
     /Recycle bin:<\/b> off/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  // --- (g) Time Machine target (smbsvc.3, BETA): the row, the required cap
+  // (empty refused before anything is sent), the capacity prefill, the §2
+  // set/keep contract, the shared greyed state, and the detail sentence.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  dlg = openWindow()
+  let tm = dlg && dlg.down('#timeMachine')
+  let tmSize = dlg && dlg.down('#timeMachineSize')
+  let tmUnit = dlg && dlg.down('#timeMachineUnit')
+  ok('smb-tm: the create dialog has the Time Machine (beta) row',
+    !!tm && !!tmSize && !!tmUnit && tm.checked === false && tm.disabled === false
+      && tmSize.disabled === true && tmUnit.disabled === true
+      && tmUnit.getValue() === 'G',
+    JSON.stringify({ tm: !!tm, size: !!tmSize, unit: tmUnit && tmUnit.getValue() }))
+  ok('smb-tm: an unticked box shows no note', !!dlg && dlg.down('#timeMachineNote').hidden === true)
+  if (dlg && tm) {
+    tm.setValue(true)
+    ok('smb-tm: ticking shows the note (dedicated share, tmutil, beta) and enables the cap field',
+      dlg.down('#timeMachineNote').hidden === false
+        && /Dedicate this share to Time Machine/.test(dlg.down('#timeMachineNote').html)
+        && /tmutil setdestination/.test(dlg.down('#timeMachineNote').html)
+        && /community-verified/.test(dlg.down('#timeMachineNote').html)
+        && tmSize.disabled === false && tmUnit.disabled === false,
+      dlg.down('#timeMachineNote').html)
+    // A create has no capacity to read — the suggestion cannot fill the field,
+    // and the REQUIRED cap is refused before anything is sent.
+    dlg.down('#name').setValue('videos')
+    dlg.down('#path').setValue('/tank/videos')
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    ok('smb-tm: an empty cap is refused with an alert and NO job',
+      warnings.length === 1 && /size cap/.test(warnings[0]) && jobs.length === 0,
+      JSON.stringify({ warnings: warnings.slice(), jobs: jobs.length }))
+    warnings.length = 0
+    tmSize.setValue(500)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-tm: a ticked create sends timeMachine { maxSize: 500 GiB }',
+      jobs[0] && jobs[0].body && jobs[0].body.timeMachine, { maxSize: 536870912000 })
+  }
+  created.windows.length = 0
+
+  // EDIT on a share with the feature already on: the box opens ticked with the
+  // stored cap split into the field (500 + G), an untouched save sends NO
+  // timeMachine key and the byte-identical body, a cap change sends the new
+  // cap, an untick sends null.
+  const tmOn = { ...SMB_SHARE, vfsObjects: ['catia', 'fruit', 'streams_xattr'], timeMachine: { maxSize: 536870912000 } }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([tmOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  tm = dlg && dlg.down('#timeMachine')
+  tmSize = dlg && dlg.down('#timeMachineSize')
+  tmUnit = dlg && dlg.down('#timeMachineUnit')
+  ok('smb-tm: an on share opens the edit box TICKED with the cap field live',
+    !!tm && tm.checked === true && tm.disabled === false
+      && !!tmSize && tmSize.disabled === false
+      && !!tmUnit && tmUnit.disabled === false)
+  ok('smb-tm: the cap field reads the stored 500 GiB', !!tmSize && tmSize.getValue() === 500 && tmUnit.getValue() === 'G',
+    JSON.stringify({ size: tmSize && tmSize.getValue(), unit: tmUnit && tmUnit.getValue() }))
+  ok('smb-tm: the note is up on a ticked edit', !!dlg && dlg.down('#timeMachineNote').hidden === false)
+  if (dlg && tm) {
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    ok('smb-tm: an untouched edit sends NO timeMachine key',
+      !!jobs[0] && !('timeMachine' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
+
+    // Cap change on an already-on share → the new cap.
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#timeMachineSize').setValue(250)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-tm: changing the cap sends timeMachine { maxSize: 250 GiB }',
+      jobs[0] && jobs[0].body && jobs[0].body.timeMachine, { maxSize: 268435456000 })
+
+    // Untick → the explicit off.
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#timeMachine').setValue(false)
+    ok('smb-tm: unticking hides the note and disables the cap field',
+      dlg.down('#timeMachineNote').hidden === true
+        && dlg.down('#timeMachineSize').disabled === true)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-tm: unticking sends timeMachine null',
+      jobs[0] && jobs[0].body && jobs[0].body.timeMachine, null)
+  }
+  created.windows.length = 0
+
+  // The capacity prefill (smbsvc.3): an EDIT whose detail carries capacity —
+  // ticking an empty cap field prefills HALF the available bytes floored to
+  // whole GiB; a filled field is never overwritten.
+  const capDetail = { ...SMB_SHARE, connections: [], capacity: { availableBytes: 2 * 1024 ** 4 } }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE], capDetail)))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  tm = dlg && dlg.down('#timeMachine')
+  tmSize = dlg && dlg.down('#timeMachineSize')
+  ok('smb-tm: an edit with capacity opens the cap field EMPTY', !!tmSize && !tmSize.getValue())
+  if (dlg && tm) {
+    tm.setValue(true)
+    ok('smb-tm: ticking prefills HALF the available space in GiB',
+      tmSize.getValue() === 1024 && dlg.down('#timeMachineUnit').getValue() === 'G',
+      JSON.stringify({ size: tmSize.getValue(), unit: dlg.down('#timeMachineUnit').getValue() }))
+    tmSize.setValue('') // the suggestion never overwrites a filled field
+    tm.setValue(false)
+    tm.setValue(true)
+    ok('smb-tm: the suggestion refills a re-ticked empty field',
+      tmSize.getValue() === 1024)
+  }
+  created.windows.length = 0
+
+  // The greyed state: the SAME custom-`vfs objects` rule as the other rows.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([rcCustom])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  tm = dlg && dlg.down('#timeMachine')
+  ok('smb-tm: a custom vfs objects line DISABLES the row',
+    !!tm && tm.disabled === true && dlg.down('#timeMachineSize').disabled === true)
+  ok('smb-tm: the greyed row carries the SAME refusal sentence',
+    !!dlg && dlg.down('#timeMachineNote').hidden === false
+      && /custom vfs objects line/.test(dlg.down('#timeMachineNote').html),
+    dlg && dlg.down('#timeMachineNote').html)
+  created.windows.length = 0
+
+  // The detail window: "Time Machine target (beta): on — cap 500 GiB" / off.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([tmOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-tm(detail): an on share reads "on — cap 500 GiB"',
+    /Time Machine target \(beta\):<\/b> on — cap 500 GiB/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-tm(detail): an off share reads "off"',
+    /Time Machine target \(beta\):<\/b> off/.test(summary || ''), summary)
   created.windows.length = 0
 
   ok('smb-self: nothing warned', warnings.length === 0, warnings.join(' | '))
