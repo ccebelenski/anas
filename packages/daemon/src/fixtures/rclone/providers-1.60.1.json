@@ -1,0 +1,6365 @@
+{
+ "providers": [
+  {
+   "Aliases": null,
+   "CommandHelp": null,
+   "Description": "Alias for an existing remote",
+   "Hide": false,
+   "MetadataInfo": null,
+   "Name": "alias",
+   "Options": [
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Remote or path to alias.\n\nCan be \"myremote:path/to/dir\", \"myremote:bucket\", \"myremote:\" or \"/local/path\".",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "remote",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": true,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    }
+   ],
+   "Prefix": "alias"
+  },
+  {
+   "Aliases": null,
+   "CommandHelp": [
+    {
+     "Long": "This encodes the filenames given as arguments returning a list of\nstrings of the encoded results.\n\nUsage Example:\n\n    rclone backend encode crypt: file1 [file2...]\n    rclone rc backend/command command=encode fs=crypt: file1 [file2...]\n",
+     "Name": "encode",
+     "Opts": null,
+     "Short": "Encode the given filename(s)"
+    },
+    {
+     "Long": "This decodes the filenames given as arguments returning a list of\nstrings of the decoded results. It will return an error if any of the\ninputs are invalid.\n\nUsage Example:\n\n    rclone backend decode crypt: encryptedfile1 [encryptedfile2...]\n    rclone rc backend/command command=decode fs=crypt: encryptedfile1 [encryptedfile2...]\n",
+     "Name": "decode",
+     "Opts": null,
+     "Short": "Decode the given filename(s)"
+    }
+   ],
+   "Description": "Encrypt/Decrypt a remote",
+   "Hide": false,
+   "MetadataInfo": {
+    "Help": "Any metadata supported by the underlying remote is read and written.",
+    "System": null
+   },
+   "Name": "crypt",
+   "Options": [
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Remote to encrypt/decrypt.\n\nNormally should contain a ':' and a path, e.g. \"myremote:path/to/dir\",\n\"myremote:bucket\" or maybe \"myremote:\" (not recommended).",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "remote",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": true,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "standard",
+     "DefaultStr": "standard",
+     "Examples": [
+      {
+       "Help": "Encrypt the filenames.\nSee the docs for the details.",
+       "Provider": "",
+       "Value": "standard"
+      },
+      {
+       "Help": "Very simple filename obfuscation.",
+       "Provider": "",
+       "Value": "obfuscate"
+      },
+      {
+       "Help": "Don't encrypt the file names.\nAdds a \".bin\" extension only.",
+       "Provider": "",
+       "Value": "off"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "How to encrypt the filenames.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "filename_encryption",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": "standard"
+    },
+    {
+     "Advanced": false,
+     "Default": true,
+     "DefaultStr": "true",
+     "Examples": [
+      {
+       "Help": "Encrypt directory names.",
+       "Provider": "",
+       "Value": "true"
+      },
+      {
+       "Help": "Don't encrypt directory names, leave them intact.",
+       "Provider": "",
+       "Value": "false"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Option to either encrypt directory names or leave them intact.\n\nNB If filename_encryption is \"off\" then this option will do nothing.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "directory_name_encryption",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "true"
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Password or pass phrase for encryption.",
+     "Hide": 0,
+     "IsPassword": true,
+     "Name": "password",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": true,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Password or pass phrase for salt.\n\nOptional but recommended.\nShould be different to the previous password.",
+     "Hide": 0,
+     "IsPassword": true,
+     "Name": "password2",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Allow server-side operations (e.g. copy) to work across different crypt configs.\n\nNormally this option is not what you want, but if you have two crypts\npointing to the same backend you can use it.\n\nThis can be used, for example, to change file name encryption type\nwithout re-uploading all the data. Just make two crypt backends\npointing to two different directories with the single changed\nparameter and use rclone move to move the files between the crypt\nremotes.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "server_side_across_configs",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "For all files listed show how the names encrypt.\n\nIf this flag is set then for each file that the remote is asked to\nlist, it will log (at level INFO) a line stating the decrypted file\nname and the encrypted file name.\n\nThis is so you can work out which encrypted names are which decrypted\nnames just in case you need to do something with the encrypted file\nnames, or for debugging purposes.",
+     "Hide": 2,
+     "IsPassword": false,
+     "Name": "show_mapping",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Examples": [
+      {
+       "Help": "Don't encrypt file data, leave it unencrypted.",
+       "Provider": "",
+       "Value": "true"
+      },
+      {
+       "Help": "Encrypt file data.",
+       "Provider": "",
+       "Value": "false"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Option to either encrypt file data or leave it unencrypted.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "no_data_encryption",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": "base32",
+     "DefaultStr": "base32",
+     "Examples": [
+      {
+       "Help": "Encode using base32. Suitable for all remote.",
+       "Provider": "",
+       "Value": "base32"
+      },
+      {
+       "Help": "Encode using base64. Suitable for case sensitive remote.",
+       "Provider": "",
+       "Value": "base64"
+      },
+      {
+       "Help": "Encode using base32768. Suitable if your remote counts UTF-16 or\nUnicode codepoint instead of UTF-8 byte length. (Eg. Onedrive)",
+       "Provider": "",
+       "Value": "base32768"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "How to encode the encrypted filename to text string.\n\nThis option could help with shortening the encrypted filename. The \nsuitable option would depend on the way your remote count the filename\nlength and if it's case sensitive.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "filename_encoding",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": "base32"
+    }
+   ],
+   "Prefix": "crypt"
+  },
+  {
+   "Aliases": null,
+   "CommandHelp": [
+    {
+     "Long": "This is a test command which has some options\nyou can try to change the output.",
+     "Name": "noop",
+     "Opts": {
+      "echo": "echo the input arguments",
+      "error": "return an error based on option value"
+     },
+     "Short": "A null operation for testing backend commands"
+    }
+   ],
+   "Description": "Local Disk",
+   "Hide": false,
+   "MetadataInfo": {
+    "Help": "Depending on which OS is in use the local backend may return only some\nof the system metadata. Setting system metadata is supported on all\nOSes but setting user metadata is only supported on linux, freebsd,\nnetbsd, macOS and Solaris. It is **not** supported on Windows yet\n([see pkg/attrs#47](https://github.com/pkg/xattr/issues/47)).\n\nUser metadata is stored as extended attributes (which may not be\nsupported by all file systems) under the \"user.*\" prefix.\n",
+    "System": {
+     "atime": {
+      "Example": "2006-01-02T15:04:05.999999999Z07:00",
+      "Help": "Time of last access",
+      "ReadOnly": false,
+      "Type": "RFC 3339"
+     },
+     "btime": {
+      "Example": "2006-01-02T15:04:05.999999999Z07:00",
+      "Help": "Time of file birth (creation)",
+      "ReadOnly": false,
+      "Type": "RFC 3339"
+     },
+     "gid": {
+      "Example": "500",
+      "Help": "Group ID of owner",
+      "ReadOnly": false,
+      "Type": "decimal number"
+     },
+     "mode": {
+      "Example": "0100664",
+      "Help": "File type and mode",
+      "ReadOnly": false,
+      "Type": "octal, unix style"
+     },
+     "mtime": {
+      "Example": "2006-01-02T15:04:05.999999999Z07:00",
+      "Help": "Time of last modification",
+      "ReadOnly": false,
+      "Type": "RFC 3339"
+     },
+     "rdev": {
+      "Example": "1abc",
+      "Help": "Device ID (if special file)",
+      "ReadOnly": false,
+      "Type": "hexadecimal"
+     },
+     "uid": {
+      "Example": "500",
+      "Help": "User ID of owner",
+      "ReadOnly": false,
+      "Type": "decimal number"
+     }
+    }
+   },
+   "Name": "local",
+   "Options": [
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Examples": [
+      {
+       "Help": "Disables long file names.",
+       "Provider": "",
+       "Value": "true"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Disable UNC (long path names) conversion on Windows.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "nounc",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Follow symlinks and copy the pointed to item.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "copy_links",
+     "NoPrefix": true,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "L",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Translate symlinks to/from regular files with a '.rclonelink' extension.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "links",
+     "NoPrefix": true,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "l",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Don't warn about skipped symlinks.\n\nThis flag disables warning messages on skipped symlinks or junction\npoints, as you explicitly acknowledge that they should be skipped.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "skip_links",
+     "NoPrefix": true,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Assume the Stat size of links is zero (and read them instead) (deprecated).\n\nRclone used to use the Stat size of links as the link size, but this fails in quite a few places:\n\n- Windows\n- On some virtual filesystems (such ash LucidLink)\n- Android\n\nSo rclone now always reads the link.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "zero_size_links",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Apply unicode NFC normalization to paths and filenames.\n\nThis flag can be used to normalize file names into unicode NFC form\nthat are read from the local filesystem.\n\nRclone does not normally touch the encoding of file names it reads from\nthe file system.\n\nThis can be useful when using macOS as it normally provides decomposed (NFD)\nunicode which in some language (eg Korean) doesn't display properly on\nsome OSes.\n\nNote that rclone compares filenames with unicode normalization in the sync\nroutine so this flag shouldn't normally be used.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "unicode_normalization",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Don't check to see if the files change during upload.\n\nNormally rclone checks the size and modification time of files as they\nare being uploaded and aborts with a message which starts \"can't copy\n- source file is being updated\" if the file changes during upload.\n\nHowever on some file systems this modification time check may fail (e.g.\n[Glusterfs #2206](https://github.com/rclone/rclone/issues/2206)) so this\ncheck can be disabled with this flag.\n\nIf this flag is set, rclone will use its best efforts to transfer a\nfile which is being updated. If the file is only having things\nappended to it (e.g. a log) then rclone will transfer the log file with\nthe size it had the first time rclone saw it.\n\nIf the file is being modified throughout (not just appended to) then\nthe transfer may fail with a hash check failure.\n\nIn detail, once the file has had stat() called on it for the first\ntime we:\n\n- Only transfer the size that stat gave\n- Only checksum the size that stat gave\n- Don't update the stat info for the file\n\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "no_check_updated",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Don't cross filesystem boundaries (unix/macOS only).",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "one_file_system",
+     "NoPrefix": true,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "x",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Force the filesystem to report itself as case sensitive.\n\nNormally the local backend declares itself as case insensitive on\nWindows/macOS and case sensitive for everything else.  Use this flag\nto override the default choice.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "case_sensitive",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Force the filesystem to report itself as case insensitive.\n\nNormally the local backend declares itself as case insensitive on\nWindows/macOS and case sensitive for everything else.  Use this flag\nto override the default choice.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "case_insensitive",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Disable preallocation of disk space for transferred files.\n\nPreallocation of disk space helps prevent filesystem fragmentation.\nHowever, some virtual filesystem layers (such as Google Drive File\nStream) may incorrectly set the actual file size equal to the\npreallocated space, causing checksum and file size checks to fail.\nUse this flag to disable preallocation.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "no_preallocate",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Disable sparse files for multi-thread downloads.\n\nOn Windows platforms rclone will make sparse files when doing\nmulti-thread downloads. This avoids long pauses on large files where\nthe OS zeros the file. However sparse files may be undesirable as they\ncause disk fragmentation and can be slow to work with.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "no_sparse",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Disable setting modtime.\n\nNormally rclone updates modification time of files after they are done\nuploading. This can cause permissions issues on Linux platforms when \nthe user rclone is running as does not own the file uploaded, such as\nwhen copying to a CIFS mount owned by another user. If this option is \nenabled, rclone will no longer update the modtime after copying a file.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "no_set_modtime",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": 33554434,
+     "DefaultStr": "Slash,Dot",
+     "Exclusive": false,
+     "Help": "The encoding for the backend.\n\nSee the [encoding section in the overview](/overview/#encoding) for more info.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "encoding",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "MultiEncoder",
+     "Value": null,
+     "ValueStr": "Slash,Dot"
+    }
+   ],
+   "Prefix": "local"
+  },
+  {
+   "Aliases": null,
+   "CommandHelp": null,
+   "Description": "Backblaze B2",
+   "Hide": false,
+   "MetadataInfo": null,
+   "Name": "b2",
+   "Options": [
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Account ID or Application Key ID.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "account",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": true,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Application Key.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "key",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": true,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Endpoint for the service.\n\nLeave blank normally.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "A flag string for X-Bz-Test-Mode header for debugging.\n\nThis is for debugging purposes only. Setting it to one of the strings\nbelow will cause b2 to return specific errors:\n\n  * \"fail_some_uploads\"\n  * \"expire_some_account_authorization_tokens\"\n  * \"force_cap_exceeded\"\n\nThese will be set in the \"X-Bz-Test-Mode\" header which is documented\nin the [b2 integrations checklist](https://www.backblaze.com/b2/docs/integration_checklist.html).",
+     "Hide": 2,
+     "IsPassword": false,
+     "Name": "test_mode",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Include old versions in directory listings.\n\nNote that when using this no file write operations are permitted,\nso you can't upload files or delete them.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "versions",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": {},
+     "DefaultStr": "off",
+     "Exclusive": false,
+     "Help": "Show file versions as they were at the specified time.\n\nNote that when using this no file write operations are permitted,\nso you can't upload files or delete them.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "version_at",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Time",
+     "Value": null,
+     "ValueStr": "off"
+    },
+    {
+     "Advanced": false,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Permanently delete files on remote removal, otherwise hide files.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "hard_delete",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": 209715200,
+     "DefaultStr": "200Mi",
+     "Exclusive": false,
+     "Help": "Cutoff for switching to chunked upload.\n\nFiles above this size will be uploaded in chunks of \"--b2-chunk-size\".\n\nThis value should be set no larger than 4.657 GiB (== 5 GB).",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "upload_cutoff",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "200Mi"
+    },
+    {
+     "Advanced": true,
+     "Default": 4294967296,
+     "DefaultStr": "4Gi",
+     "Exclusive": false,
+     "Help": "Cutoff for switching to multipart copy.\n\nAny files larger than this that need to be server-side copied will be\ncopied in chunks of this size.\n\nThe minimum is 0 and the maximum is 4.6 GiB.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "copy_cutoff",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "4Gi"
+    },
+    {
+     "Advanced": true,
+     "Default": 100663296,
+     "DefaultStr": "96Mi",
+     "Exclusive": false,
+     "Help": "Upload chunk size.\n\nWhen uploading large files, chunk the file into this size.\n\nMust fit in memory. These chunks are buffered in memory and there\nmight a maximum of \"--transfers\" chunks in progress at once.\n\n5,000,000 Bytes is the minimum size.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "chunk_size",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "96Mi"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Disable checksums for large (> upload cutoff) files.\n\nNormally rclone will calculate the SHA1 checksum of the input before\nuploading it so it can add it to metadata on the object. This is great\nfor data integrity checking but can cause long delays for large files\nto start uploading.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "disable_checksum",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Custom endpoint for downloads.\n\nThis is usually set to a Cloudflare CDN URL as Backblaze offers\nfree egress for data downloaded through the Cloudflare network.\nRclone works with private buckets by sending an \"Authorization\" header.\nIf the custom endpoint rewrites the requests for authentication,\ne.g., in Cloudflare Workers, this header needs to be handled properly.\nLeave blank if you want to use the endpoint provided by Backblaze.\n\nThe URL provided here SHOULD have the protocol and SHOULD NOT have\na trailing slash or specify the /file/bucket subpath as rclone will\nrequest files with \"{download_url}/file/{bucket_name}/{path}\".\n\nExample:\n> https://mysubdomain.mydomain.tld\n(No trailing \"/\", \"file\" or \"bucket\")",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "download_url",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": 604800000000000,
+     "DefaultStr": "1w",
+     "Exclusive": false,
+     "Help": "Time before the authorization token will expire in s or suffix ms|s|m|h|d.\n\nThe duration before the download authorization token will expire.\nThe minimum value is 1 second. The maximum value is one week.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "download_auth_duration",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Duration",
+     "Value": null,
+     "ValueStr": "1w"
+    },
+    {
+     "Advanced": true,
+     "Default": 60000000000,
+     "DefaultStr": "1m0s",
+     "Exclusive": false,
+     "Help": "How often internal memory buffer pools will be flushed.\nUploads which requires additional buffers (f.e multipart) will use memory pool for allocations.\nThis option controls how often unused buffers will be removed from the pool.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "memory_pool_flush_time",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Duration",
+     "Value": null,
+     "ValueStr": "1m0s"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Whether to use mmap buffers in internal memory pool.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "memory_pool_use_mmap",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": 50438146,
+     "DefaultStr": "Slash,BackSlash,Del,Ctl,InvalidUtf8,Dot",
+     "Exclusive": false,
+     "Help": "The encoding for the backend.\n\nSee the [encoding section in the overview](/overview/#encoding) for more info.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "encoding",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "MultiEncoder",
+     "Value": null,
+     "ValueStr": "Slash,BackSlash,Del,Ctl,InvalidUtf8,Dot"
+    }
+   ],
+   "Prefix": "b2"
+  },
+  {
+   "Aliases": null,
+   "CommandHelp": null,
+   "Description": "SSH/SFTP",
+   "Hide": false,
+   "MetadataInfo": null,
+   "Name": "sftp",
+   "Options": [
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "SSH host to connect to.\n\nE.g. \"example.com\".",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "host",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": true,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "root",
+     "DefaultStr": "root",
+     "Exclusive": false,
+     "Help": "SSH username.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "user",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": "root"
+    },
+    {
+     "Advanced": false,
+     "Default": 22,
+     "DefaultStr": "22",
+     "Exclusive": false,
+     "Help": "SSH port number.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "port",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "int",
+     "Value": null,
+     "ValueStr": "22"
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "SSH password, leave blank to use ssh-agent.",
+     "Hide": 0,
+     "IsPassword": true,
+     "Name": "pass",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Raw PEM-encoded private key.\n\nIf specified, will override key_file parameter.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "key_pem",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Path to PEM-encoded private key file.\n\nLeave blank or set key-use-agent to use ssh-agent.\n\nLeading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "key_file",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "The passphrase to decrypt the PEM-encoded private key file.\n\nOnly PEM encrypted key files (old OpenSSH format) are supported. Encrypted keys\nin the new OpenSSH format can't be used.",
+     "Hide": 0,
+     "IsPassword": true,
+     "Name": "key_file_pass",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Optional path to public key file.\n\nSet this if you have a signed certificate you want to use for authentication.\n\nLeading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "pubkey_file",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Use OpenSSH's known_hosts file.",
+       "Provider": "",
+       "Value": "~/.ssh/known_hosts"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Optional path to known_hosts file.\n\nSet this value to enable server host key validation.\n\nLeading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "known_hosts_file",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "When set forces the usage of the ssh-agent.\n\nWhen key-file is also set, the \".pub\" file of the specified key-file is read and only the associated key is\nrequested from the ssh-agent. This allows to avoid `Too many authentication failures for *username*` errors\nwhen the ssh-agent contains many keys.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "key_use_agent",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": false,
+     "Default": false,
+     "DefaultStr": "false",
+     "Examples": [
+      {
+       "Help": "Use default Cipher list.",
+       "Provider": "",
+       "Value": "false"
+      },
+      {
+       "Help": "Enables the use of the aes128-cbc cipher and diffie-hellman-group-exchange-sha256, diffie-hellman-group-exchange-sha1 key exchange.",
+       "Provider": "",
+       "Value": "true"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Enable the use of insecure ciphers and key exchange methods.\n\nThis enables the use of the following insecure ciphers and key exchange methods:\n\n- aes128-cbc\n- aes192-cbc\n- aes256-cbc\n- 3des-cbc\n- diffie-hellman-group-exchange-sha256\n- diffie-hellman-group-exchange-sha1\n\nThose algorithms are insecure and may allow plaintext data to be recovered by an attacker.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "use_insecure_cipher",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": false,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Disable the execution of SSH commands to determine if remote file hashing is available.\n\nLeave blank or set to false to enable hashing (recommended), set to true to disable hashing.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "disable_hashcheck",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Allow asking for SFTP password when needed.\n\nIf this is set and no password is supplied then rclone will:\n- ask for a password\n- not contact the ssh agent\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "ask_password",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Override path used by SSH shell commands.\n\nThis allows checksum calculation when SFTP and SSH paths are\ndifferent. This issue affects among others Synology NAS boxes.\n\nE.g. if shared folders can be found in directories representing volumes:\n\n    rclone sync /home/local/directory remote:/directory --sftp-path-override /volume2/directory\n\nE.g. if home directory can be found in a shared folder called \"home\":\n\n    rclone sync /home/local/directory remote:/home/directory --sftp-path-override /volume1/homes/USER/directory",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "path_override",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": true,
+     "DefaultStr": "true",
+     "Exclusive": false,
+     "Help": "Set the modified time on the remote if set.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "set_modtime",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "true"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "No shell access",
+       "Provider": "",
+       "Value": "none"
+      },
+      {
+       "Help": "Unix shell",
+       "Provider": "",
+       "Value": "unix"
+      },
+      {
+       "Help": "PowerShell",
+       "Provider": "",
+       "Value": "powershell"
+      },
+      {
+       "Help": "Windows Command Prompt",
+       "Provider": "",
+       "Value": "cmd"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "The type of SSH shell on remote server, if any.\n\nLeave blank for autodetect.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "shell_type",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "The command used to read md5 hashes.\n\nLeave blank for autodetect.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "md5sum_command",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "The command used to read sha1 hashes.\n\nLeave blank for autodetect.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "sha1sum_command",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Set to skip any symlinks and any other non regular files.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "skip_links",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": "sftp",
+     "DefaultStr": "sftp",
+     "Exclusive": false,
+     "Help": "Specifies the SSH2 subsystem on the remote host.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "subsystem",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": "sftp"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Specifies the path or command to run a sftp server on the remote host.\n\nThe subsystem option is ignored when server_command is defined.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "server_command",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If set use fstat instead of stat.\n\nSome servers limit the amount of open files and calling Stat after opening\nthe file will throw an error from the server. Setting this flag will call\nFstat instead of Stat which is called on an already open file handle.\n\nIt has been found that this helps with IBM Sterling SFTP servers which have\n\"extractability\" level set to 1 which means only 1 file can be opened at\nany given time.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "use_fstat",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If set don't use concurrent reads.\n\nNormally concurrent reads are safe to use and not using them will\ndegrade performance, so this option is disabled by default.\n\nSome servers limit the amount number of times a file can be\ndownloaded. Using concurrent reads can trigger this limit, so if you\nhave a server which returns\n\n    Failed to copy: file does not exist\n\nThen you may need to enable this flag.\n\nIf concurrent reads are disabled, the use_fstat option is ignored.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "disable_concurrent_reads",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If set don't use concurrent writes.\n\nNormally rclone uses concurrent writes to upload files. This improves\nthe performance greatly, especially for distant servers.\n\nThis option disables concurrent writes should that be necessary.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "disable_concurrent_writes",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": 60000000000,
+     "DefaultStr": "1m0s",
+     "Exclusive": false,
+     "Help": "Max time before closing idle connections.\n\nIf no connections have been returned to the connection pool in the time\ngiven, rclone will empty the connection pool.\n\nSet to 0 to keep connections indefinitely.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "idle_timeout",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Duration",
+     "Value": null,
+     "ValueStr": "1m0s"
+    },
+    {
+     "Advanced": true,
+     "Default": 32768,
+     "DefaultStr": "32Ki",
+     "Exclusive": false,
+     "Help": "Upload and download chunk size.\n\nThis controls the maximum size of payload in SFTP protocol packets.\nThe RFC limits this to 32768 bytes (32k), which is the default. However,\na lot of servers support larger sizes, typically limited to a maximum\ntotal package size of 256k, and setting it larger will increase transfer\nspeed dramatically on high latency links. This includes OpenSSH, and,\nfor example, using the value of 255k works well, leaving plenty of room\nfor overhead while still being within a total packet size of 256k.\n\nMake sure to test thoroughly before using a value higher than 32k,\nand only use it if you always connect to the same server or after\nsufficiently broad testing. If you get errors such as\n\"failed to send packet payload: EOF\", lots of \"connection lost\",\nor \"corrupted on transfer\", when copying a larger file, try lowering\nthe value. The server run by [rclone serve sftp](/commands/rclone_serve_sftp)\nsends packets with standard 32k maximum payload so you must not\nset a different chunk_size when downloading files, but it accepts\npackets up to the 256k total size, so for uploads the chunk_size\ncan be set as for the OpenSSH example above.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "chunk_size",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "32Ki"
+    },
+    {
+     "Advanced": true,
+     "Default": 64,
+     "DefaultStr": "64",
+     "Exclusive": false,
+     "Help": "The maximum number of outstanding requests for one file\n\nThis controls the maximum number of outstanding requests for one file.\nIncreasing it will increase throughput on high latency links at the\ncost of using more memory.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "concurrency",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "int",
+     "Value": null,
+     "ValueStr": "64"
+    },
+    {
+     "Advanced": true,
+     "Default": [],
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Environment variables to pass to sftp and commands\n\nSet environment variables in the form:\n\n    VAR=value\n\nto be passed to the sftp client and to any commands run (eg md5sum).\n\nPass multiple variables space separated, eg\n\n    VAR1=value VAR2=value\n\nand pass variables with spaces in in quotes, eg\n\n    \"VAR3=value with space\" \"VAR4=value with space\" VAR5=nospacehere\n\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "set_env",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SpaceSepList",
+     "Value": null,
+     "ValueStr": ""
+    }
+   ],
+   "Prefix": "sftp"
+  },
+  {
+   "Aliases": null,
+   "CommandHelp": null,
+   "Description": "WebDAV",
+   "Hide": false,
+   "MetadataInfo": null,
+   "Name": "webdav",
+   "Options": [
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "URL of http host to connect to.\n\nE.g. https://example.com.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "url",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": true,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Nextcloud",
+       "Provider": "",
+       "Value": "nextcloud"
+      },
+      {
+       "Help": "Owncloud",
+       "Provider": "",
+       "Value": "owncloud"
+      },
+      {
+       "Help": "Sharepoint Online, authenticated by Microsoft account",
+       "Provider": "",
+       "Value": "sharepoint"
+      },
+      {
+       "Help": "Sharepoint with NTLM authentication, usually self-hosted or on-premises",
+       "Provider": "",
+       "Value": "sharepoint-ntlm"
+      },
+      {
+       "Help": "Other site/service or software",
+       "Provider": "",
+       "Value": "other"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Name of the WebDAV site/service/software you are using.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "vendor",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "User name.\n\nIn case NTLM authentication is used, the username should be in the format 'Domain\\User'.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "user",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Password.",
+     "Hide": 0,
+     "IsPassword": true,
+     "Name": "pass",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Bearer token instead of user/pass (e.g. a Macaroon).",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "bearer_token",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Command to run to get a bearer token.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "bearer_token_command",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "The encoding for the backend.\n\nSee the [encoding section in the overview](/overview/#encoding) for more info.\n\nDefault encoding is Slash,LtGt,DoubleQuote,Colon,Question,Asterisk,Pipe,Hash,Percent,BackSlash,Del,Ctl,LeftSpace,LeftTilde,RightSpace,RightPeriod,InvalidUtf8 for sharepoint-ntlm or identity otherwise.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "encoding",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": [],
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Set HTTP headers for all transactions.\n\nUse this to set additional HTTP headers for all transactions\n\nThe input format is comma separated list of key,value pairs.  Standard\n[CSV encoding](https://godoc.org/encoding/csv) may be used.\n\nFor example, to set a Cookie use 'Cookie,name=value', or '\"Cookie\",\"name=value\"'.\n\nYou can set multiple headers, e.g. '\"Cookie\",\"name=value\",\"Authorization\",\"xxx\"'.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "headers",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "CommaSepList",
+     "Value": null,
+     "ValueStr": ""
+    }
+   ],
+   "Prefix": "webdav"
+  },
+  {
+   "Aliases": null,
+   "CommandHelp": [
+    {
+     "Long": "This command can be used to restore one or more objects from GLACIER\nto normal storage.\n\nUsage Examples:\n\n    rclone backend restore s3:bucket/path/to/object [-o priority=PRIORITY] [-o lifetime=DAYS]\n    rclone backend restore s3:bucket/path/to/directory [-o priority=PRIORITY] [-o lifetime=DAYS]\n    rclone backend restore s3:bucket [-o priority=PRIORITY] [-o lifetime=DAYS]\n\nThis flag also obeys the filters. Test first with -i/--interactive or --dry-run flags\n\n    rclone -i backend restore --include \"*.txt\" s3:bucket/path -o priority=Standard\n\nAll the objects shown will be marked for restore, then\n\n    rclone backend restore --include \"*.txt\" s3:bucket/path -o priority=Standard\n\nIt returns a list of status dictionaries with Remote and Status\nkeys. The Status will be OK if it was successful or an error message\nif not.\n\n    [\n        {\n            \"Status\": \"OK\",\n            \"Path\": \"test.txt\"\n        },\n        {\n            \"Status\": \"OK\",\n            \"Path\": \"test/file4.txt\"\n        }\n    ]\n\n",
+     "Name": "restore",
+     "Opts": {
+      "description": "The optional description for the job.",
+      "lifetime": "Lifetime of the active copy in days",
+      "priority": "Priority of restore: Standard|Expedited|Bulk"
+     },
+     "Short": "Restore objects from GLACIER to normal storage"
+    },
+    {
+     "Long": "This command lists the unfinished multipart uploads in JSON format.\n\n    rclone backend list-multipart s3:bucket/path/to/object\n\nIt returns a dictionary of buckets with values as lists of unfinished\nmultipart uploads.\n\nYou can call it with no bucket in which case it lists all bucket, with\na bucket or with a bucket and path.\n\n    {\n      \"rclone\": [\n        {\n          \"Initiated\": \"2020-06-26T14:20:36Z\",\n          \"Initiator\": {\n            \"DisplayName\": \"XXX\",\n            \"ID\": \"arn:aws:iam::XXX:user/XXX\"\n          },\n          \"Key\": \"KEY\",\n          \"Owner\": {\n            \"DisplayName\": null,\n            \"ID\": \"XXX\"\n          },\n          \"StorageClass\": \"STANDARD\",\n          \"UploadId\": \"XXX\"\n        }\n      ],\n      \"rclone-1000files\": [],\n      \"rclone-dst\": []\n    }\n\n",
+     "Name": "list-multipart-uploads",
+     "Opts": null,
+     "Short": "List the unfinished multipart uploads"
+    },
+    {
+     "Long": "This command removes unfinished multipart uploads of age greater than\nmax-age which defaults to 24 hours.\n\nNote that you can use -i/--dry-run with this command to see what it\nwould do.\n\n    rclone backend cleanup s3:bucket/path/to/object\n    rclone backend cleanup -o max-age=7w s3:bucket/path/to/object\n\nDurations are parsed as per the rest of rclone, 2h, 7d, 7w etc.\n",
+     "Name": "cleanup",
+     "Opts": {
+      "max-age": "Max age of upload to delete"
+     },
+     "Short": "Remove unfinished multipart uploads."
+    },
+    {
+     "Long": "This command removes any old hidden versions of files\non a versions enabled bucket.\n\nNote that you can use -i/--dry-run with this command to see what it\nwould do.\n\n    rclone backend cleanup-hidden s3:bucket/path/to/dir\n",
+     "Name": "cleanup-hidden",
+     "Opts": null,
+     "Short": "Remove old versions of files."
+    },
+    {
+     "Long": "This command sets versioning support if a parameter is\npassed and then returns the current versioning status for the bucket\nsupplied.\n\n    rclone backend versioning s3:bucket # read status only\n    rclone backend versioning s3:bucket Enabled\n    rclone backend versioning s3:bucket Suspended\n\nIt may return \"Enabled\", \"Suspended\" or \"Unversioned\". Note that once versioning\nhas been enabled the status can't be set back to \"Unversioned\".\n",
+     "Name": "versioning",
+     "Opts": null,
+     "Short": "Set/get versioning support for a bucket."
+    }
+   ],
+   "Description": "Amazon S3 Compliant Storage Providers including AWS, Alibaba, Ceph, China Mobile, Cloudflare, ArvanCloud, Digital Ocean, Dreamhost, Huawei OBS, IBM COS, IDrive e2, IONOS Cloud, Lyve Cloud, Minio, Netease, RackCorp, Scaleway, SeaweedFS, StackPath, Storj, Tencent COS, Qiniu and Wasabi",
+   "Hide": false,
+   "MetadataInfo": {
+    "Help": "User metadata is stored as x-amz-meta- keys. S3 metadata keys are case insensitive and are always returned in lower case.",
+    "System": {
+     "btime": {
+      "Example": "2006-01-02T15:04:05.999999999Z07:00",
+      "Help": "Time of file birth (creation) read from Last-Modified header",
+      "ReadOnly": true,
+      "Type": "RFC 3339"
+     },
+     "cache-control": {
+      "Example": "no-cache",
+      "Help": "Cache-Control header",
+      "ReadOnly": false,
+      "Type": "string"
+     },
+     "content-disposition": {
+      "Example": "inline",
+      "Help": "Content-Disposition header",
+      "ReadOnly": false,
+      "Type": "string"
+     },
+     "content-encoding": {
+      "Example": "gzip",
+      "Help": "Content-Encoding header",
+      "ReadOnly": false,
+      "Type": "string"
+     },
+     "content-language": {
+      "Example": "en-US",
+      "Help": "Content-Language header",
+      "ReadOnly": false,
+      "Type": "string"
+     },
+     "content-type": {
+      "Example": "text/plain",
+      "Help": "Content-Type header",
+      "ReadOnly": false,
+      "Type": "string"
+     },
+     "mtime": {
+      "Example": "2006-01-02T15:04:05.999999999Z07:00",
+      "Help": "Time of last modification, read from rclone metadata",
+      "ReadOnly": false,
+      "Type": "RFC 3339"
+     },
+     "tier": {
+      "Example": "GLACIER",
+      "Help": "Tier of the object",
+      "ReadOnly": true,
+      "Type": "string"
+     }
+    }
+   },
+   "Name": "s3",
+   "Options": [
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Amazon Web Services (AWS) S3",
+       "Provider": "",
+       "Value": "AWS"
+      },
+      {
+       "Help": "Alibaba Cloud Object Storage System (OSS) formerly Aliyun",
+       "Provider": "",
+       "Value": "Alibaba"
+      },
+      {
+       "Help": "Ceph Object Storage",
+       "Provider": "",
+       "Value": "Ceph"
+      },
+      {
+       "Help": "China Mobile Ecloud Elastic Object Storage (EOS)",
+       "Provider": "",
+       "Value": "ChinaMobile"
+      },
+      {
+       "Help": "Cloudflare R2 Storage",
+       "Provider": "",
+       "Value": "Cloudflare"
+      },
+      {
+       "Help": "Arvan Cloud Object Storage (AOS)",
+       "Provider": "",
+       "Value": "ArvanCloud"
+      },
+      {
+       "Help": "Digital Ocean Spaces",
+       "Provider": "",
+       "Value": "DigitalOcean"
+      },
+      {
+       "Help": "Dreamhost DreamObjects",
+       "Provider": "",
+       "Value": "Dreamhost"
+      },
+      {
+       "Help": "Huawei Object Storage Service",
+       "Provider": "",
+       "Value": "HuaweiOBS"
+      },
+      {
+       "Help": "IBM COS S3",
+       "Provider": "",
+       "Value": "IBMCOS"
+      },
+      {
+       "Help": "IDrive e2",
+       "Provider": "",
+       "Value": "IDrive"
+      },
+      {
+       "Help": "IONOS Cloud",
+       "Provider": "",
+       "Value": "IONOS"
+      },
+      {
+       "Help": "Seagate Lyve Cloud",
+       "Provider": "",
+       "Value": "LyveCloud"
+      },
+      {
+       "Help": "Minio Object Storage",
+       "Provider": "",
+       "Value": "Minio"
+      },
+      {
+       "Help": "Netease Object Storage (NOS)",
+       "Provider": "",
+       "Value": "Netease"
+      },
+      {
+       "Help": "RackCorp Object Storage",
+       "Provider": "",
+       "Value": "RackCorp"
+      },
+      {
+       "Help": "Scaleway Object Storage",
+       "Provider": "",
+       "Value": "Scaleway"
+      },
+      {
+       "Help": "SeaweedFS S3",
+       "Provider": "",
+       "Value": "SeaweedFS"
+      },
+      {
+       "Help": "StackPath Object Storage",
+       "Provider": "",
+       "Value": "StackPath"
+      },
+      {
+       "Help": "Storj (S3 Compatible Gateway)",
+       "Provider": "",
+       "Value": "Storj"
+      },
+      {
+       "Help": "Tencent Cloud Object Storage (COS)",
+       "Provider": "",
+       "Value": "TencentCOS"
+      },
+      {
+       "Help": "Wasabi Object Storage",
+       "Provider": "",
+       "Value": "Wasabi"
+      },
+      {
+       "Help": "Qiniu Object Storage (Kodo)",
+       "Provider": "",
+       "Value": "Qiniu"
+      },
+      {
+       "Help": "Any other S3 compatible provider",
+       "Provider": "",
+       "Value": "Other"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Choose your S3 provider.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "provider",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": false,
+     "DefaultStr": "false",
+     "Examples": [
+      {
+       "Help": "Enter AWS credentials in the next step.",
+       "Provider": "",
+       "Value": "false"
+      },
+      {
+       "Help": "Get AWS credentials from the environment (env vars or IAM).",
+       "Provider": "",
+       "Value": "true"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Get AWS credentials from runtime (environment variables or EC2/ECS meta data if no env vars).\n\nOnly applies if access_key_id and secret_access_key is blank.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "env_auth",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "AWS Access Key ID.\n\nLeave blank for anonymous access or runtime credentials.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "access_key_id",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "AWS Secret Access Key (password).\n\nLeave blank for anonymous access or runtime credentials.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "secret_access_key",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "The default endpoint - a good choice if you are unsure.\nUS Region, Northern Virginia, or Pacific Northwest.\nLeave location constraint empty.",
+       "Provider": "",
+       "Value": "us-east-1"
+      },
+      {
+       "Help": "US East (Ohio) Region.\nNeeds location constraint us-east-2.",
+       "Provider": "",
+       "Value": "us-east-2"
+      },
+      {
+       "Help": "US West (Northern California) Region.\nNeeds location constraint us-west-1.",
+       "Provider": "",
+       "Value": "us-west-1"
+      },
+      {
+       "Help": "US West (Oregon) Region.\nNeeds location constraint us-west-2.",
+       "Provider": "",
+       "Value": "us-west-2"
+      },
+      {
+       "Help": "Canada (Central) Region.\nNeeds location constraint ca-central-1.",
+       "Provider": "",
+       "Value": "ca-central-1"
+      },
+      {
+       "Help": "EU (Ireland) Region.\nNeeds location constraint EU or eu-west-1.",
+       "Provider": "",
+       "Value": "eu-west-1"
+      },
+      {
+       "Help": "EU (London) Region.\nNeeds location constraint eu-west-2.",
+       "Provider": "",
+       "Value": "eu-west-2"
+      },
+      {
+       "Help": "EU (Paris) Region.\nNeeds location constraint eu-west-3.",
+       "Provider": "",
+       "Value": "eu-west-3"
+      },
+      {
+       "Help": "EU (Stockholm) Region.\nNeeds location constraint eu-north-1.",
+       "Provider": "",
+       "Value": "eu-north-1"
+      },
+      {
+       "Help": "EU (Milan) Region.\nNeeds location constraint eu-south-1.",
+       "Provider": "",
+       "Value": "eu-south-1"
+      },
+      {
+       "Help": "EU (Frankfurt) Region.\nNeeds location constraint eu-central-1.",
+       "Provider": "",
+       "Value": "eu-central-1"
+      },
+      {
+       "Help": "Asia Pacific (Singapore) Region.\nNeeds location constraint ap-southeast-1.",
+       "Provider": "",
+       "Value": "ap-southeast-1"
+      },
+      {
+       "Help": "Asia Pacific (Sydney) Region.\nNeeds location constraint ap-southeast-2.",
+       "Provider": "",
+       "Value": "ap-southeast-2"
+      },
+      {
+       "Help": "Asia Pacific (Tokyo) Region.\nNeeds location constraint ap-northeast-1.",
+       "Provider": "",
+       "Value": "ap-northeast-1"
+      },
+      {
+       "Help": "Asia Pacific (Seoul).\nNeeds location constraint ap-northeast-2.",
+       "Provider": "",
+       "Value": "ap-northeast-2"
+      },
+      {
+       "Help": "Asia Pacific (Osaka-Local).\nNeeds location constraint ap-northeast-3.",
+       "Provider": "",
+       "Value": "ap-northeast-3"
+      },
+      {
+       "Help": "Asia Pacific (Mumbai).\nNeeds location constraint ap-south-1.",
+       "Provider": "",
+       "Value": "ap-south-1"
+      },
+      {
+       "Help": "Asia Pacific (Hong Kong) Region.\nNeeds location constraint ap-east-1.",
+       "Provider": "",
+       "Value": "ap-east-1"
+      },
+      {
+       "Help": "South America (Sao Paulo) Region.\nNeeds location constraint sa-east-1.",
+       "Provider": "",
+       "Value": "sa-east-1"
+      },
+      {
+       "Help": "Middle East (Bahrain) Region.\nNeeds location constraint me-south-1.",
+       "Provider": "",
+       "Value": "me-south-1"
+      },
+      {
+       "Help": "Africa (Cape Town) Region.\nNeeds location constraint af-south-1.",
+       "Provider": "",
+       "Value": "af-south-1"
+      },
+      {
+       "Help": "China (Beijing) Region.\nNeeds location constraint cn-north-1.",
+       "Provider": "",
+       "Value": "cn-north-1"
+      },
+      {
+       "Help": "China (Ningxia) Region.\nNeeds location constraint cn-northwest-1.",
+       "Provider": "",
+       "Value": "cn-northwest-1"
+      },
+      {
+       "Help": "AWS GovCloud (US-East) Region.\nNeeds location constraint us-gov-east-1.",
+       "Provider": "",
+       "Value": "us-gov-east-1"
+      },
+      {
+       "Help": "AWS GovCloud (US) Region.\nNeeds location constraint us-gov-west-1.",
+       "Provider": "",
+       "Value": "us-gov-west-1"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Region to connect to.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "region",
+     "NoPrefix": false,
+     "Provider": "AWS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Global CDN (All locations) Region",
+       "Provider": "",
+       "Value": "global"
+      },
+      {
+       "Help": "Australia (All states)",
+       "Provider": "",
+       "Value": "au"
+      },
+      {
+       "Help": "NSW (Australia) Region",
+       "Provider": "",
+       "Value": "au-nsw"
+      },
+      {
+       "Help": "QLD (Australia) Region",
+       "Provider": "",
+       "Value": "au-qld"
+      },
+      {
+       "Help": "VIC (Australia) Region",
+       "Provider": "",
+       "Value": "au-vic"
+      },
+      {
+       "Help": "Perth (Australia) Region",
+       "Provider": "",
+       "Value": "au-wa"
+      },
+      {
+       "Help": "Manila (Philippines) Region",
+       "Provider": "",
+       "Value": "ph"
+      },
+      {
+       "Help": "Bangkok (Thailand) Region",
+       "Provider": "",
+       "Value": "th"
+      },
+      {
+       "Help": "HK (Hong Kong) Region",
+       "Provider": "",
+       "Value": "hk"
+      },
+      {
+       "Help": "Ulaanbaatar (Mongolia) Region",
+       "Provider": "",
+       "Value": "mn"
+      },
+      {
+       "Help": "Bishkek (Kyrgyzstan) Region",
+       "Provider": "",
+       "Value": "kg"
+      },
+      {
+       "Help": "Jakarta (Indonesia) Region",
+       "Provider": "",
+       "Value": "id"
+      },
+      {
+       "Help": "Tokyo (Japan) Region",
+       "Provider": "",
+       "Value": "jp"
+      },
+      {
+       "Help": "SG (Singapore) Region",
+       "Provider": "",
+       "Value": "sg"
+      },
+      {
+       "Help": "Frankfurt (Germany) Region",
+       "Provider": "",
+       "Value": "de"
+      },
+      {
+       "Help": "USA (AnyCast) Region",
+       "Provider": "",
+       "Value": "us"
+      },
+      {
+       "Help": "New York (USA) Region",
+       "Provider": "",
+       "Value": "us-east-1"
+      },
+      {
+       "Help": "Freemont (USA) Region",
+       "Provider": "",
+       "Value": "us-west-1"
+      },
+      {
+       "Help": "Auckland (New Zealand) Region",
+       "Provider": "",
+       "Value": "nz"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "region - the location where your bucket will be created and your data stored.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "region",
+     "NoPrefix": false,
+     "Provider": "RackCorp",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Amsterdam, The Netherlands",
+       "Provider": "",
+       "Value": "nl-ams"
+      },
+      {
+       "Help": "Paris, France",
+       "Provider": "",
+       "Value": "fr-par"
+      },
+      {
+       "Help": "Warsaw, Poland",
+       "Provider": "",
+       "Value": "pl-waw"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Region to connect to.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "region",
+     "NoPrefix": false,
+     "Provider": "Scaleway",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "AF-Johannesburg",
+       "Provider": "",
+       "Value": "af-south-1"
+      },
+      {
+       "Help": "AP-Bangkok",
+       "Provider": "",
+       "Value": "ap-southeast-2"
+      },
+      {
+       "Help": "AP-Singapore",
+       "Provider": "",
+       "Value": "ap-southeast-3"
+      },
+      {
+       "Help": "CN East-Shanghai1",
+       "Provider": "",
+       "Value": "cn-east-3"
+      },
+      {
+       "Help": "CN East-Shanghai2",
+       "Provider": "",
+       "Value": "cn-east-2"
+      },
+      {
+       "Help": "CN North-Beijing1",
+       "Provider": "",
+       "Value": "cn-north-1"
+      },
+      {
+       "Help": "CN North-Beijing4",
+       "Provider": "",
+       "Value": "cn-north-4"
+      },
+      {
+       "Help": "CN South-Guangzhou",
+       "Provider": "",
+       "Value": "cn-south-1"
+      },
+      {
+       "Help": "CN-Hong Kong",
+       "Provider": "",
+       "Value": "ap-southeast-1"
+      },
+      {
+       "Help": "LA-Buenos Aires1",
+       "Provider": "",
+       "Value": "sa-argentina-1"
+      },
+      {
+       "Help": "LA-Lima1",
+       "Provider": "",
+       "Value": "sa-peru-1"
+      },
+      {
+       "Help": "LA-Mexico City1",
+       "Provider": "",
+       "Value": "na-mexico-1"
+      },
+      {
+       "Help": "LA-Santiago2",
+       "Provider": "",
+       "Value": "sa-chile-1"
+      },
+      {
+       "Help": "LA-Sao Paulo1",
+       "Provider": "",
+       "Value": "sa-brazil-1"
+      },
+      {
+       "Help": "RU-Moscow2",
+       "Provider": "",
+       "Value": "ru-northwest-2"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Region to connect to. - the location where your bucket will be created and your data stored. Need bo be same with your endpoint.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "region",
+     "NoPrefix": false,
+     "Provider": "HuaweiOBS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "R2 buckets are automatically distributed across Cloudflare's data centers for low latency.",
+       "Provider": "",
+       "Value": "auto"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Region to connect to.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "region",
+     "NoPrefix": false,
+     "Provider": "Cloudflare",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "The default endpoint - a good choice if you are unsure.\nEast China Region 1.\nNeeds location constraint cn-east-1.",
+       "Provider": "",
+       "Value": "cn-east-1"
+      },
+      {
+       "Help": "East China Region 2.\nNeeds location constraint cn-east-2.",
+       "Provider": "",
+       "Value": "cn-east-2"
+      },
+      {
+       "Help": "North China Region 1.\nNeeds location constraint cn-north-1.",
+       "Provider": "",
+       "Value": "cn-north-1"
+      },
+      {
+       "Help": "South China Region 1.\nNeeds location constraint cn-south-1.",
+       "Provider": "",
+       "Value": "cn-south-1"
+      },
+      {
+       "Help": "North America Region.\nNeeds location constraint us-north-1.",
+       "Provider": "",
+       "Value": "us-north-1"
+      },
+      {
+       "Help": "Southeast Asia Region 1.\nNeeds location constraint ap-southeast-1.",
+       "Provider": "",
+       "Value": "ap-southeast-1"
+      },
+      {
+       "Help": "Northeast Asia Region 1.\nNeeds location constraint ap-northeast-1.",
+       "Provider": "",
+       "Value": "ap-northeast-1"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Region to connect to.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "region",
+     "NoPrefix": false,
+     "Provider": "Qiniu",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Frankfurt, Germany",
+       "Provider": "",
+       "Value": "de"
+      },
+      {
+       "Help": "Berlin, Germany",
+       "Provider": "",
+       "Value": "eu-central-2"
+      },
+      {
+       "Help": "Logrono, Spain",
+       "Provider": "",
+       "Value": "eu-south-2"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Region where your bucket will be created and your data stored.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "region",
+     "NoPrefix": false,
+     "Provider": "IONOS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Use this if unsure.\nWill use v4 signatures and an empty region.",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "Use this only if v4 signatures don't work.\nE.g. pre Jewel/v10 CEPH.",
+       "Provider": "",
+       "Value": "other-v2-signature"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Region to connect to.\n\nLeave blank if you are using an S3 clone and you don't have a region.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "region",
+     "NoPrefix": false,
+     "Provider": "!AWS,Alibaba,ChinaMobile,Cloudflare,IONOS,ArvanCloud,Qiniu,RackCorp,Scaleway,Storj,TencentCOS,HuaweiOBS,IDrive",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Endpoint for S3 API.\n\nLeave blank if using AWS to use the default endpoint for the region.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "AWS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "The default endpoint - a good choice if you are unsure.\nEast China (Suzhou)",
+       "Provider": "",
+       "Value": "eos-wuxi-1.cmecloud.cn"
+      },
+      {
+       "Help": "East China (Jinan)",
+       "Provider": "",
+       "Value": "eos-jinan-1.cmecloud.cn"
+      },
+      {
+       "Help": "East China (Hangzhou)",
+       "Provider": "",
+       "Value": "eos-ningbo-1.cmecloud.cn"
+      },
+      {
+       "Help": "East China (Shanghai-1)",
+       "Provider": "",
+       "Value": "eos-shanghai-1.cmecloud.cn"
+      },
+      {
+       "Help": "Central China (Zhengzhou)",
+       "Provider": "",
+       "Value": "eos-zhengzhou-1.cmecloud.cn"
+      },
+      {
+       "Help": "Central China (Changsha-1)",
+       "Provider": "",
+       "Value": "eos-hunan-1.cmecloud.cn"
+      },
+      {
+       "Help": "Central China (Changsha-2)",
+       "Provider": "",
+       "Value": "eos-zhuzhou-1.cmecloud.cn"
+      },
+      {
+       "Help": "South China (Guangzhou-2)",
+       "Provider": "",
+       "Value": "eos-guangzhou-1.cmecloud.cn"
+      },
+      {
+       "Help": "South China (Guangzhou-3)",
+       "Provider": "",
+       "Value": "eos-dongguan-1.cmecloud.cn"
+      },
+      {
+       "Help": "North China (Beijing-1)",
+       "Provider": "",
+       "Value": "eos-beijing-1.cmecloud.cn"
+      },
+      {
+       "Help": "North China (Beijing-2)",
+       "Provider": "",
+       "Value": "eos-beijing-2.cmecloud.cn"
+      },
+      {
+       "Help": "North China (Beijing-3)",
+       "Provider": "",
+       "Value": "eos-beijing-4.cmecloud.cn"
+      },
+      {
+       "Help": "North China (Huhehaote)",
+       "Provider": "",
+       "Value": "eos-huhehaote-1.cmecloud.cn"
+      },
+      {
+       "Help": "Southwest China (Chengdu)",
+       "Provider": "",
+       "Value": "eos-chengdu-1.cmecloud.cn"
+      },
+      {
+       "Help": "Southwest China (Chongqing)",
+       "Provider": "",
+       "Value": "eos-chongqing-1.cmecloud.cn"
+      },
+      {
+       "Help": "Southwest China (Guiyang)",
+       "Provider": "",
+       "Value": "eos-guiyang-1.cmecloud.cn"
+      },
+      {
+       "Help": "Nouthwest China (Xian)",
+       "Provider": "",
+       "Value": "eos-xian-1.cmecloud.cn"
+      },
+      {
+       "Help": "Yunnan China (Kunming)",
+       "Provider": "",
+       "Value": "eos-yunnan.cmecloud.cn"
+      },
+      {
+       "Help": "Yunnan China (Kunming-2)",
+       "Provider": "",
+       "Value": "eos-yunnan-2.cmecloud.cn"
+      },
+      {
+       "Help": "Tianjin China (Tianjin)",
+       "Provider": "",
+       "Value": "eos-tianjin-1.cmecloud.cn"
+      },
+      {
+       "Help": "Jilin China (Changchun)",
+       "Provider": "",
+       "Value": "eos-jilin-1.cmecloud.cn"
+      },
+      {
+       "Help": "Hubei China (Xiangyan)",
+       "Provider": "",
+       "Value": "eos-hubei-1.cmecloud.cn"
+      },
+      {
+       "Help": "Jiangxi China (Nanchang)",
+       "Provider": "",
+       "Value": "eos-jiangxi-1.cmecloud.cn"
+      },
+      {
+       "Help": "Gansu China (Lanzhou)",
+       "Provider": "",
+       "Value": "eos-gansu-1.cmecloud.cn"
+      },
+      {
+       "Help": "Shanxi China (Taiyuan)",
+       "Provider": "",
+       "Value": "eos-shanxi-1.cmecloud.cn"
+      },
+      {
+       "Help": "Liaoning China (Shenyang)",
+       "Provider": "",
+       "Value": "eos-liaoning-1.cmecloud.cn"
+      },
+      {
+       "Help": "Hebei China (Shijiazhuang)",
+       "Provider": "",
+       "Value": "eos-hebei-1.cmecloud.cn"
+      },
+      {
+       "Help": "Fujian China (Xiamen)",
+       "Provider": "",
+       "Value": "eos-fujian-1.cmecloud.cn"
+      },
+      {
+       "Help": "Guangxi China (Nanning)",
+       "Provider": "",
+       "Value": "eos-guangxi-1.cmecloud.cn"
+      },
+      {
+       "Help": "Anhui China (Huainan)",
+       "Provider": "",
+       "Value": "eos-anhui-1.cmecloud.cn"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for China Mobile Ecloud Elastic Object Storage (EOS) API.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "ChinaMobile",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "The default endpoint - a good choice if you are unsure.\nTehran Iran (Asiatech)",
+       "Provider": "",
+       "Value": "s3.ir-thr-at1.arvanstorage.com"
+      },
+      {
+       "Help": "Tabriz Iran (Shahriar)",
+       "Provider": "",
+       "Value": "s3.ir-tbz-sh1.arvanstorage.com"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for Arvan Cloud Object Storage (AOS) API.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "ArvanCloud",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "US Cross Region Endpoint",
+       "Provider": "",
+       "Value": "s3.us.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Cross Region Dallas Endpoint",
+       "Provider": "",
+       "Value": "s3.dal.us.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Cross Region Washington DC Endpoint",
+       "Provider": "",
+       "Value": "s3.wdc.us.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Cross Region San Jose Endpoint",
+       "Provider": "",
+       "Value": "s3.sjc.us.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Cross Region Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.us.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Cross Region Dallas Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.dal.us.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Cross Region Washington DC Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.wdc.us.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Cross Region San Jose Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.sjc.us.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Region East Endpoint",
+       "Provider": "",
+       "Value": "s3.us-east.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Region East Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.us-east.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Region South Endpoint",
+       "Provider": "",
+       "Value": "s3.us-south.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "US Region South Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.us-south.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Cross Region Endpoint",
+       "Provider": "",
+       "Value": "s3.eu.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Cross Region Frankfurt Endpoint",
+       "Provider": "",
+       "Value": "s3.fra.eu.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Cross Region Milan Endpoint",
+       "Provider": "",
+       "Value": "s3.mil.eu.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Cross Region Amsterdam Endpoint",
+       "Provider": "",
+       "Value": "s3.ams.eu.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Cross Region Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.eu.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Cross Region Frankfurt Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.fra.eu.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Cross Region Milan Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.mil.eu.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Cross Region Amsterdam Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.ams.eu.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Great Britain Endpoint",
+       "Provider": "",
+       "Value": "s3.eu-gb.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Great Britain Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.eu-gb.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Region DE Endpoint",
+       "Provider": "",
+       "Value": "s3.eu-de.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "EU Region DE Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.eu-de.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Cross Regional Endpoint",
+       "Provider": "",
+       "Value": "s3.ap.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Cross Regional Tokyo Endpoint",
+       "Provider": "",
+       "Value": "s3.tok.ap.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Cross Regional HongKong Endpoint",
+       "Provider": "",
+       "Value": "s3.hkg.ap.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Cross Regional Seoul Endpoint",
+       "Provider": "",
+       "Value": "s3.seo.ap.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Cross Regional Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.ap.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Cross Regional Tokyo Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.tok.ap.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Cross Regional HongKong Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.hkg.ap.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Cross Regional Seoul Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.seo.ap.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Region Japan Endpoint",
+       "Provider": "",
+       "Value": "s3.jp-tok.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Region Japan Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.jp-tok.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Region Australia Endpoint",
+       "Provider": "",
+       "Value": "s3.au-syd.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "APAC Region Australia Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.au-syd.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Amsterdam Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.ams03.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Amsterdam Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.ams03.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Chennai Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.che01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Chennai Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.che01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Melbourne Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.mel01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Melbourne Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.mel01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Oslo Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.osl01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Oslo Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.osl01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Toronto Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.tor01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Toronto Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.tor01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Seoul Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.seo01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Seoul Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.seo01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Montreal Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.mon01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Montreal Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.mon01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Mexico Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.mex01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Mexico Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.mex01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "San Jose Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.sjc04.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "San Jose Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.sjc04.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Milan Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.mil01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Milan Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.mil01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Hong Kong Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.hkg02.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Hong Kong Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.hkg02.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Paris Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.par01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Paris Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.par01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Singapore Single Site Endpoint",
+       "Provider": "",
+       "Value": "s3.sng01.cloud-object-storage.appdomain.cloud"
+      },
+      {
+       "Help": "Singapore Single Site Private Endpoint",
+       "Provider": "",
+       "Value": "s3.private.sng01.cloud-object-storage.appdomain.cloud"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for IBM COS S3 API.\n\nSpecify if using an IBM COS On Premise.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "IBMCOS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Frankfurt, Germany",
+       "Provider": "",
+       "Value": "s3-eu-central-1.ionoscloud.com"
+      },
+      {
+       "Help": "Berlin, Germany",
+       "Provider": "",
+       "Value": "s3-eu-central-2.ionoscloud.com"
+      },
+      {
+       "Help": "Logrono, Spain",
+       "Provider": "",
+       "Value": "s3-eu-south-2.ionoscloud.com"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for IONOS S3 Object Storage.\n\nSpecify the endpoint from the same region.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "IONOS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Global Accelerate",
+       "Provider": "",
+       "Value": "oss-accelerate.aliyuncs.com"
+      },
+      {
+       "Help": "Global Accelerate (outside mainland China)",
+       "Provider": "",
+       "Value": "oss-accelerate-overseas.aliyuncs.com"
+      },
+      {
+       "Help": "East China 1 (Hangzhou)",
+       "Provider": "",
+       "Value": "oss-cn-hangzhou.aliyuncs.com"
+      },
+      {
+       "Help": "East China 2 (Shanghai)",
+       "Provider": "",
+       "Value": "oss-cn-shanghai.aliyuncs.com"
+      },
+      {
+       "Help": "North China 1 (Qingdao)",
+       "Provider": "",
+       "Value": "oss-cn-qingdao.aliyuncs.com"
+      },
+      {
+       "Help": "North China 2 (Beijing)",
+       "Provider": "",
+       "Value": "oss-cn-beijing.aliyuncs.com"
+      },
+      {
+       "Help": "North China 3 (Zhangjiakou)",
+       "Provider": "",
+       "Value": "oss-cn-zhangjiakou.aliyuncs.com"
+      },
+      {
+       "Help": "North China 5 (Hohhot)",
+       "Provider": "",
+       "Value": "oss-cn-huhehaote.aliyuncs.com"
+      },
+      {
+       "Help": "North China 6 (Ulanqab)",
+       "Provider": "",
+       "Value": "oss-cn-wulanchabu.aliyuncs.com"
+      },
+      {
+       "Help": "South China 1 (Shenzhen)",
+       "Provider": "",
+       "Value": "oss-cn-shenzhen.aliyuncs.com"
+      },
+      {
+       "Help": "South China 2 (Heyuan)",
+       "Provider": "",
+       "Value": "oss-cn-heyuan.aliyuncs.com"
+      },
+      {
+       "Help": "South China 3 (Guangzhou)",
+       "Provider": "",
+       "Value": "oss-cn-guangzhou.aliyuncs.com"
+      },
+      {
+       "Help": "West China 1 (Chengdu)",
+       "Provider": "",
+       "Value": "oss-cn-chengdu.aliyuncs.com"
+      },
+      {
+       "Help": "Hong Kong (Hong Kong)",
+       "Provider": "",
+       "Value": "oss-cn-hongkong.aliyuncs.com"
+      },
+      {
+       "Help": "US West 1 (Silicon Valley)",
+       "Provider": "",
+       "Value": "oss-us-west-1.aliyuncs.com"
+      },
+      {
+       "Help": "US East 1 (Virginia)",
+       "Provider": "",
+       "Value": "oss-us-east-1.aliyuncs.com"
+      },
+      {
+       "Help": "Southeast Asia Southeast 1 (Singapore)",
+       "Provider": "",
+       "Value": "oss-ap-southeast-1.aliyuncs.com"
+      },
+      {
+       "Help": "Asia Pacific Southeast 2 (Sydney)",
+       "Provider": "",
+       "Value": "oss-ap-southeast-2.aliyuncs.com"
+      },
+      {
+       "Help": "Southeast Asia Southeast 3 (Kuala Lumpur)",
+       "Provider": "",
+       "Value": "oss-ap-southeast-3.aliyuncs.com"
+      },
+      {
+       "Help": "Asia Pacific Southeast 5 (Jakarta)",
+       "Provider": "",
+       "Value": "oss-ap-southeast-5.aliyuncs.com"
+      },
+      {
+       "Help": "Asia Pacific Northeast 1 (Japan)",
+       "Provider": "",
+       "Value": "oss-ap-northeast-1.aliyuncs.com"
+      },
+      {
+       "Help": "Asia Pacific South 1 (Mumbai)",
+       "Provider": "",
+       "Value": "oss-ap-south-1.aliyuncs.com"
+      },
+      {
+       "Help": "Central Europe 1 (Frankfurt)",
+       "Provider": "",
+       "Value": "oss-eu-central-1.aliyuncs.com"
+      },
+      {
+       "Help": "West Europe (London)",
+       "Provider": "",
+       "Value": "oss-eu-west-1.aliyuncs.com"
+      },
+      {
+       "Help": "Middle East 1 (Dubai)",
+       "Provider": "",
+       "Value": "oss-me-east-1.aliyuncs.com"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for OSS API.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "Alibaba",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "AF-Johannesburg",
+       "Provider": "",
+       "Value": "obs.af-south-1.myhuaweicloud.com"
+      },
+      {
+       "Help": "AP-Bangkok",
+       "Provider": "",
+       "Value": "obs.ap-southeast-2.myhuaweicloud.com"
+      },
+      {
+       "Help": "AP-Singapore",
+       "Provider": "",
+       "Value": "obs.ap-southeast-3.myhuaweicloud.com"
+      },
+      {
+       "Help": "CN East-Shanghai1",
+       "Provider": "",
+       "Value": "obs.cn-east-3.myhuaweicloud.com"
+      },
+      {
+       "Help": "CN East-Shanghai2",
+       "Provider": "",
+       "Value": "obs.cn-east-2.myhuaweicloud.com"
+      },
+      {
+       "Help": "CN North-Beijing1",
+       "Provider": "",
+       "Value": "obs.cn-north-1.myhuaweicloud.com"
+      },
+      {
+       "Help": "CN North-Beijing4",
+       "Provider": "",
+       "Value": "obs.cn-north-4.myhuaweicloud.com"
+      },
+      {
+       "Help": "CN South-Guangzhou",
+       "Provider": "",
+       "Value": "obs.cn-south-1.myhuaweicloud.com"
+      },
+      {
+       "Help": "CN-Hong Kong",
+       "Provider": "",
+       "Value": "obs.ap-southeast-1.myhuaweicloud.com"
+      },
+      {
+       "Help": "LA-Buenos Aires1",
+       "Provider": "",
+       "Value": "obs.sa-argentina-1.myhuaweicloud.com"
+      },
+      {
+       "Help": "LA-Lima1",
+       "Provider": "",
+       "Value": "obs.sa-peru-1.myhuaweicloud.com"
+      },
+      {
+       "Help": "LA-Mexico City1",
+       "Provider": "",
+       "Value": "obs.na-mexico-1.myhuaweicloud.com"
+      },
+      {
+       "Help": "LA-Santiago2",
+       "Provider": "",
+       "Value": "obs.sa-chile-1.myhuaweicloud.com"
+      },
+      {
+       "Help": "LA-Sao Paulo1",
+       "Provider": "",
+       "Value": "obs.sa-brazil-1.myhuaweicloud.com"
+      },
+      {
+       "Help": "RU-Moscow2",
+       "Provider": "",
+       "Value": "obs.ru-northwest-2.myhuaweicloud.com"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for OBS API.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "HuaweiOBS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Amsterdam Endpoint",
+       "Provider": "",
+       "Value": "s3.nl-ams.scw.cloud"
+      },
+      {
+       "Help": "Paris Endpoint",
+       "Provider": "",
+       "Value": "s3.fr-par.scw.cloud"
+      },
+      {
+       "Help": "Warsaw Endpoint",
+       "Provider": "",
+       "Value": "s3.pl-waw.scw.cloud"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for Scaleway Object Storage.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "Scaleway",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "US East Endpoint",
+       "Provider": "",
+       "Value": "s3.us-east-2.stackpathstorage.com"
+      },
+      {
+       "Help": "US West Endpoint",
+       "Provider": "",
+       "Value": "s3.us-west-1.stackpathstorage.com"
+      },
+      {
+       "Help": "EU Endpoint",
+       "Provider": "",
+       "Value": "s3.eu-central-1.stackpathstorage.com"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for StackPath Object Storage.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "StackPath",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "EU1 Shared Gateway",
+       "Provider": "",
+       "Value": "gateway.eu1.storjshare.io"
+      },
+      {
+       "Help": "US1 Shared Gateway",
+       "Provider": "",
+       "Value": "gateway.us1.storjshare.io"
+      },
+      {
+       "Help": "Asia-Pacific Shared Gateway",
+       "Provider": "",
+       "Value": "gateway.ap1.storjshare.io"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint of the Shared Gateway.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "Storj",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Beijing Region",
+       "Provider": "",
+       "Value": "cos.ap-beijing.myqcloud.com"
+      },
+      {
+       "Help": "Nanjing Region",
+       "Provider": "",
+       "Value": "cos.ap-nanjing.myqcloud.com"
+      },
+      {
+       "Help": "Shanghai Region",
+       "Provider": "",
+       "Value": "cos.ap-shanghai.myqcloud.com"
+      },
+      {
+       "Help": "Guangzhou Region",
+       "Provider": "",
+       "Value": "cos.ap-guangzhou.myqcloud.com"
+      },
+      {
+       "Help": "Nanjing Region",
+       "Provider": "",
+       "Value": "cos.ap-nanjing.myqcloud.com"
+      },
+      {
+       "Help": "Chengdu Region",
+       "Provider": "",
+       "Value": "cos.ap-chengdu.myqcloud.com"
+      },
+      {
+       "Help": "Chongqing Region",
+       "Provider": "",
+       "Value": "cos.ap-chongqing.myqcloud.com"
+      },
+      {
+       "Help": "Hong Kong (China) Region",
+       "Provider": "",
+       "Value": "cos.ap-hongkong.myqcloud.com"
+      },
+      {
+       "Help": "Singapore Region",
+       "Provider": "",
+       "Value": "cos.ap-singapore.myqcloud.com"
+      },
+      {
+       "Help": "Mumbai Region",
+       "Provider": "",
+       "Value": "cos.ap-mumbai.myqcloud.com"
+      },
+      {
+       "Help": "Seoul Region",
+       "Provider": "",
+       "Value": "cos.ap-seoul.myqcloud.com"
+      },
+      {
+       "Help": "Bangkok Region",
+       "Provider": "",
+       "Value": "cos.ap-bangkok.myqcloud.com"
+      },
+      {
+       "Help": "Tokyo Region",
+       "Provider": "",
+       "Value": "cos.ap-tokyo.myqcloud.com"
+      },
+      {
+       "Help": "Silicon Valley Region",
+       "Provider": "",
+       "Value": "cos.na-siliconvalley.myqcloud.com"
+      },
+      {
+       "Help": "Virginia Region",
+       "Provider": "",
+       "Value": "cos.na-ashburn.myqcloud.com"
+      },
+      {
+       "Help": "Toronto Region",
+       "Provider": "",
+       "Value": "cos.na-toronto.myqcloud.com"
+      },
+      {
+       "Help": "Frankfurt Region",
+       "Provider": "",
+       "Value": "cos.eu-frankfurt.myqcloud.com"
+      },
+      {
+       "Help": "Moscow Region",
+       "Provider": "",
+       "Value": "cos.eu-moscow.myqcloud.com"
+      },
+      {
+       "Help": "Use Tencent COS Accelerate Endpoint",
+       "Provider": "",
+       "Value": "cos.accelerate.myqcloud.com"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for Tencent COS API.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "TencentCOS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Global (AnyCast) Endpoint",
+       "Provider": "",
+       "Value": "s3.rackcorp.com"
+      },
+      {
+       "Help": "Australia (Anycast) Endpoint",
+       "Provider": "",
+       "Value": "au.s3.rackcorp.com"
+      },
+      {
+       "Help": "Sydney (Australia) Endpoint",
+       "Provider": "",
+       "Value": "au-nsw.s3.rackcorp.com"
+      },
+      {
+       "Help": "Brisbane (Australia) Endpoint",
+       "Provider": "",
+       "Value": "au-qld.s3.rackcorp.com"
+      },
+      {
+       "Help": "Melbourne (Australia) Endpoint",
+       "Provider": "",
+       "Value": "au-vic.s3.rackcorp.com"
+      },
+      {
+       "Help": "Perth (Australia) Endpoint",
+       "Provider": "",
+       "Value": "au-wa.s3.rackcorp.com"
+      },
+      {
+       "Help": "Manila (Philippines) Endpoint",
+       "Provider": "",
+       "Value": "ph.s3.rackcorp.com"
+      },
+      {
+       "Help": "Bangkok (Thailand) Endpoint",
+       "Provider": "",
+       "Value": "th.s3.rackcorp.com"
+      },
+      {
+       "Help": "HK (Hong Kong) Endpoint",
+       "Provider": "",
+       "Value": "hk.s3.rackcorp.com"
+      },
+      {
+       "Help": "Ulaanbaatar (Mongolia) Endpoint",
+       "Provider": "",
+       "Value": "mn.s3.rackcorp.com"
+      },
+      {
+       "Help": "Bishkek (Kyrgyzstan) Endpoint",
+       "Provider": "",
+       "Value": "kg.s3.rackcorp.com"
+      },
+      {
+       "Help": "Jakarta (Indonesia) Endpoint",
+       "Provider": "",
+       "Value": "id.s3.rackcorp.com"
+      },
+      {
+       "Help": "Tokyo (Japan) Endpoint",
+       "Provider": "",
+       "Value": "jp.s3.rackcorp.com"
+      },
+      {
+       "Help": "SG (Singapore) Endpoint",
+       "Provider": "",
+       "Value": "sg.s3.rackcorp.com"
+      },
+      {
+       "Help": "Frankfurt (Germany) Endpoint",
+       "Provider": "",
+       "Value": "de.s3.rackcorp.com"
+      },
+      {
+       "Help": "USA (AnyCast) Endpoint",
+       "Provider": "",
+       "Value": "us.s3.rackcorp.com"
+      },
+      {
+       "Help": "New York (USA) Endpoint",
+       "Provider": "",
+       "Value": "us-east-1.s3.rackcorp.com"
+      },
+      {
+       "Help": "Freemont (USA) Endpoint",
+       "Provider": "",
+       "Value": "us-west-1.s3.rackcorp.com"
+      },
+      {
+       "Help": "Auckland (New Zealand) Endpoint",
+       "Provider": "",
+       "Value": "nz.s3.rackcorp.com"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for RackCorp Object Storage.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "RackCorp",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "East China Endpoint 1",
+       "Provider": "",
+       "Value": "s3-cn-east-1.qiniucs.com"
+      },
+      {
+       "Help": "East China Endpoint 2",
+       "Provider": "",
+       "Value": "s3-cn-east-2.qiniucs.com"
+      },
+      {
+       "Help": "North China Endpoint 1",
+       "Provider": "",
+       "Value": "s3-cn-north-1.qiniucs.com"
+      },
+      {
+       "Help": "South China Endpoint 1",
+       "Provider": "",
+       "Value": "s3-cn-south-1.qiniucs.com"
+      },
+      {
+       "Help": "North America Endpoint 1",
+       "Provider": "",
+       "Value": "s3-us-north-1.qiniucs.com"
+      },
+      {
+       "Help": "Southeast Asia Endpoint 1",
+       "Provider": "",
+       "Value": "s3-ap-southeast-1.qiniucs.com"
+      },
+      {
+       "Help": "Northeast Asia Endpoint 1",
+       "Provider": "",
+       "Value": "s3-ap-northeast-1.qiniucs.com"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for Qiniu Object Storage.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "Qiniu",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Dream Objects endpoint",
+       "Provider": "Dreamhost",
+       "Value": "objects-us-east-1.dream.io"
+      },
+      {
+       "Help": "Digital Ocean Spaces New York 3",
+       "Provider": "DigitalOcean",
+       "Value": "nyc3.digitaloceanspaces.com"
+      },
+      {
+       "Help": "Digital Ocean Spaces Amsterdam 3",
+       "Provider": "DigitalOcean",
+       "Value": "ams3.digitaloceanspaces.com"
+      },
+      {
+       "Help": "Digital Ocean Spaces Singapore 1",
+       "Provider": "DigitalOcean",
+       "Value": "sgp1.digitaloceanspaces.com"
+      },
+      {
+       "Help": "SeaweedFS S3 localhost",
+       "Provider": "SeaweedFS",
+       "Value": "localhost:8333"
+      },
+      {
+       "Help": "Seagate Lyve Cloud US East 1 (Virginia)",
+       "Provider": "LyveCloud",
+       "Value": "s3.us-east-1.lyvecloud.seagate.com"
+      },
+      {
+       "Help": "Seagate Lyve Cloud US West 1 (California)",
+       "Provider": "LyveCloud",
+       "Value": "s3.us-west-1.lyvecloud.seagate.com"
+      },
+      {
+       "Help": "Seagate Lyve Cloud AP Southeast 1 (Singapore)",
+       "Provider": "LyveCloud",
+       "Value": "s3.ap-southeast-1.lyvecloud.seagate.com"
+      },
+      {
+       "Help": "Wasabi US East 1 (N. Virginia)",
+       "Provider": "Wasabi",
+       "Value": "s3.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi US East 2 (N. Virginia)",
+       "Provider": "Wasabi",
+       "Value": "s3.us-east-2.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi US Central 1 (Texas)",
+       "Provider": "Wasabi",
+       "Value": "s3.us-central-1.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi US West 1 (Oregon)",
+       "Provider": "Wasabi",
+       "Value": "s3.us-west-1.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi CA Central 1 (Toronto)",
+       "Provider": "Wasabi",
+       "Value": "s3.ca-central-1.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi EU Central 1 (Amsterdam)",
+       "Provider": "Wasabi",
+       "Value": "s3.eu-central-1.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi EU Central 2 (Frankfurt)",
+       "Provider": "Wasabi",
+       "Value": "s3.eu-central-2.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi EU West 1 (London)",
+       "Provider": "Wasabi",
+       "Value": "s3.eu-west-1.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi EU West 2 (Paris)",
+       "Provider": "Wasabi",
+       "Value": "s3.eu-west-2.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi AP Northeast 1 (Tokyo) endpoint",
+       "Provider": "Wasabi",
+       "Value": "s3.ap-northeast-1.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi AP Northeast 2 (Osaka) endpoint",
+       "Provider": "Wasabi",
+       "Value": "s3.ap-northeast-2.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi AP Southeast 1 (Singapore)",
+       "Provider": "Wasabi",
+       "Value": "s3.ap-southeast-1.wasabisys.com"
+      },
+      {
+       "Help": "Wasabi AP Southeast 2 (Sydney)",
+       "Provider": "Wasabi",
+       "Value": "s3.ap-southeast-2.wasabisys.com"
+      },
+      {
+       "Help": "ArvanCloud Tehran Iran (Asiatech) endpoint",
+       "Provider": "ArvanCloud",
+       "Value": "s3.ir-thr-at1.arvanstorage.com"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Endpoint for S3 API.\n\nRequired when using an S3 clone.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "endpoint",
+     "NoPrefix": false,
+     "Provider": "!AWS,IBMCOS,IDrive,IONOS,TencentCOS,HuaweiOBS,Alibaba,ChinaMobile,ArvanCloud,Scaleway,StackPath,Storj,RackCorp,Qiniu",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Empty for US Region, Northern Virginia, or Pacific Northwest",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "US East (Ohio) Region",
+       "Provider": "",
+       "Value": "us-east-2"
+      },
+      {
+       "Help": "US West (Northern California) Region",
+       "Provider": "",
+       "Value": "us-west-1"
+      },
+      {
+       "Help": "US West (Oregon) Region",
+       "Provider": "",
+       "Value": "us-west-2"
+      },
+      {
+       "Help": "Canada (Central) Region",
+       "Provider": "",
+       "Value": "ca-central-1"
+      },
+      {
+       "Help": "EU (Ireland) Region",
+       "Provider": "",
+       "Value": "eu-west-1"
+      },
+      {
+       "Help": "EU (London) Region",
+       "Provider": "",
+       "Value": "eu-west-2"
+      },
+      {
+       "Help": "EU (Paris) Region",
+       "Provider": "",
+       "Value": "eu-west-3"
+      },
+      {
+       "Help": "EU (Stockholm) Region",
+       "Provider": "",
+       "Value": "eu-north-1"
+      },
+      {
+       "Help": "EU (Milan) Region",
+       "Provider": "",
+       "Value": "eu-south-1"
+      },
+      {
+       "Help": "EU Region",
+       "Provider": "",
+       "Value": "EU"
+      },
+      {
+       "Help": "Asia Pacific (Singapore) Region",
+       "Provider": "",
+       "Value": "ap-southeast-1"
+      },
+      {
+       "Help": "Asia Pacific (Sydney) Region",
+       "Provider": "",
+       "Value": "ap-southeast-2"
+      },
+      {
+       "Help": "Asia Pacific (Tokyo) Region",
+       "Provider": "",
+       "Value": "ap-northeast-1"
+      },
+      {
+       "Help": "Asia Pacific (Seoul) Region",
+       "Provider": "",
+       "Value": "ap-northeast-2"
+      },
+      {
+       "Help": "Asia Pacific (Osaka-Local) Region",
+       "Provider": "",
+       "Value": "ap-northeast-3"
+      },
+      {
+       "Help": "Asia Pacific (Mumbai) Region",
+       "Provider": "",
+       "Value": "ap-south-1"
+      },
+      {
+       "Help": "Asia Pacific (Hong Kong) Region",
+       "Provider": "",
+       "Value": "ap-east-1"
+      },
+      {
+       "Help": "South America (Sao Paulo) Region",
+       "Provider": "",
+       "Value": "sa-east-1"
+      },
+      {
+       "Help": "Middle East (Bahrain) Region",
+       "Provider": "",
+       "Value": "me-south-1"
+      },
+      {
+       "Help": "Africa (Cape Town) Region",
+       "Provider": "",
+       "Value": "af-south-1"
+      },
+      {
+       "Help": "China (Beijing) Region",
+       "Provider": "",
+       "Value": "cn-north-1"
+      },
+      {
+       "Help": "China (Ningxia) Region",
+       "Provider": "",
+       "Value": "cn-northwest-1"
+      },
+      {
+       "Help": "AWS GovCloud (US-East) Region",
+       "Provider": "",
+       "Value": "us-gov-east-1"
+      },
+      {
+       "Help": "AWS GovCloud (US) Region",
+       "Provider": "",
+       "Value": "us-gov-west-1"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Location constraint - must be set to match the Region.\n\nUsed when creating buckets only.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "location_constraint",
+     "NoPrefix": false,
+     "Provider": "AWS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "East China (Suzhou)",
+       "Provider": "",
+       "Value": "wuxi1"
+      },
+      {
+       "Help": "East China (Jinan)",
+       "Provider": "",
+       "Value": "jinan1"
+      },
+      {
+       "Help": "East China (Hangzhou)",
+       "Provider": "",
+       "Value": "ningbo1"
+      },
+      {
+       "Help": "East China (Shanghai-1)",
+       "Provider": "",
+       "Value": "shanghai1"
+      },
+      {
+       "Help": "Central China (Zhengzhou)",
+       "Provider": "",
+       "Value": "zhengzhou1"
+      },
+      {
+       "Help": "Central China (Changsha-1)",
+       "Provider": "",
+       "Value": "hunan1"
+      },
+      {
+       "Help": "Central China (Changsha-2)",
+       "Provider": "",
+       "Value": "zhuzhou1"
+      },
+      {
+       "Help": "South China (Guangzhou-2)",
+       "Provider": "",
+       "Value": "guangzhou1"
+      },
+      {
+       "Help": "South China (Guangzhou-3)",
+       "Provider": "",
+       "Value": "dongguan1"
+      },
+      {
+       "Help": "North China (Beijing-1)",
+       "Provider": "",
+       "Value": "beijing1"
+      },
+      {
+       "Help": "North China (Beijing-2)",
+       "Provider": "",
+       "Value": "beijing2"
+      },
+      {
+       "Help": "North China (Beijing-3)",
+       "Provider": "",
+       "Value": "beijing4"
+      },
+      {
+       "Help": "North China (Huhehaote)",
+       "Provider": "",
+       "Value": "huhehaote1"
+      },
+      {
+       "Help": "Southwest China (Chengdu)",
+       "Provider": "",
+       "Value": "chengdu1"
+      },
+      {
+       "Help": "Southwest China (Chongqing)",
+       "Provider": "",
+       "Value": "chongqing1"
+      },
+      {
+       "Help": "Southwest China (Guiyang)",
+       "Provider": "",
+       "Value": "guiyang1"
+      },
+      {
+       "Help": "Nouthwest China (Xian)",
+       "Provider": "",
+       "Value": "xian1"
+      },
+      {
+       "Help": "Yunnan China (Kunming)",
+       "Provider": "",
+       "Value": "yunnan"
+      },
+      {
+       "Help": "Yunnan China (Kunming-2)",
+       "Provider": "",
+       "Value": "yunnan2"
+      },
+      {
+       "Help": "Tianjin China (Tianjin)",
+       "Provider": "",
+       "Value": "tianjin1"
+      },
+      {
+       "Help": "Jilin China (Changchun)",
+       "Provider": "",
+       "Value": "jilin1"
+      },
+      {
+       "Help": "Hubei China (Xiangyan)",
+       "Provider": "",
+       "Value": "hubei1"
+      },
+      {
+       "Help": "Jiangxi China (Nanchang)",
+       "Provider": "",
+       "Value": "jiangxi1"
+      },
+      {
+       "Help": "Gansu China (Lanzhou)",
+       "Provider": "",
+       "Value": "gansu1"
+      },
+      {
+       "Help": "Shanxi China (Taiyuan)",
+       "Provider": "",
+       "Value": "shanxi1"
+      },
+      {
+       "Help": "Liaoning China (Shenyang)",
+       "Provider": "",
+       "Value": "liaoning1"
+      },
+      {
+       "Help": "Hebei China (Shijiazhuang)",
+       "Provider": "",
+       "Value": "hebei1"
+      },
+      {
+       "Help": "Fujian China (Xiamen)",
+       "Provider": "",
+       "Value": "fujian1"
+      },
+      {
+       "Help": "Guangxi China (Nanning)",
+       "Provider": "",
+       "Value": "guangxi1"
+      },
+      {
+       "Help": "Anhui China (Huainan)",
+       "Provider": "",
+       "Value": "anhui1"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Location constraint - must match endpoint.\n\nUsed when creating buckets only.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "location_constraint",
+     "NoPrefix": false,
+     "Provider": "ChinaMobile",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Tehran Iran (Asiatech)",
+       "Provider": "",
+       "Value": "ir-thr-at1"
+      },
+      {
+       "Help": "Tabriz Iran (Shahriar)",
+       "Provider": "",
+       "Value": "ir-tbz-sh1"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Location constraint - must match endpoint.\n\nUsed when creating buckets only.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "location_constraint",
+     "NoPrefix": false,
+     "Provider": "ArvanCloud",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "US Cross Region Standard",
+       "Provider": "",
+       "Value": "us-standard"
+      },
+      {
+       "Help": "US Cross Region Vault",
+       "Provider": "",
+       "Value": "us-vault"
+      },
+      {
+       "Help": "US Cross Region Cold",
+       "Provider": "",
+       "Value": "us-cold"
+      },
+      {
+       "Help": "US Cross Region Flex",
+       "Provider": "",
+       "Value": "us-flex"
+      },
+      {
+       "Help": "US East Region Standard",
+       "Provider": "",
+       "Value": "us-east-standard"
+      },
+      {
+       "Help": "US East Region Vault",
+       "Provider": "",
+       "Value": "us-east-vault"
+      },
+      {
+       "Help": "US East Region Cold",
+       "Provider": "",
+       "Value": "us-east-cold"
+      },
+      {
+       "Help": "US East Region Flex",
+       "Provider": "",
+       "Value": "us-east-flex"
+      },
+      {
+       "Help": "US South Region Standard",
+       "Provider": "",
+       "Value": "us-south-standard"
+      },
+      {
+       "Help": "US South Region Vault",
+       "Provider": "",
+       "Value": "us-south-vault"
+      },
+      {
+       "Help": "US South Region Cold",
+       "Provider": "",
+       "Value": "us-south-cold"
+      },
+      {
+       "Help": "US South Region Flex",
+       "Provider": "",
+       "Value": "us-south-flex"
+      },
+      {
+       "Help": "EU Cross Region Standard",
+       "Provider": "",
+       "Value": "eu-standard"
+      },
+      {
+       "Help": "EU Cross Region Vault",
+       "Provider": "",
+       "Value": "eu-vault"
+      },
+      {
+       "Help": "EU Cross Region Cold",
+       "Provider": "",
+       "Value": "eu-cold"
+      },
+      {
+       "Help": "EU Cross Region Flex",
+       "Provider": "",
+       "Value": "eu-flex"
+      },
+      {
+       "Help": "Great Britain Standard",
+       "Provider": "",
+       "Value": "eu-gb-standard"
+      },
+      {
+       "Help": "Great Britain Vault",
+       "Provider": "",
+       "Value": "eu-gb-vault"
+      },
+      {
+       "Help": "Great Britain Cold",
+       "Provider": "",
+       "Value": "eu-gb-cold"
+      },
+      {
+       "Help": "Great Britain Flex",
+       "Provider": "",
+       "Value": "eu-gb-flex"
+      },
+      {
+       "Help": "APAC Standard",
+       "Provider": "",
+       "Value": "ap-standard"
+      },
+      {
+       "Help": "APAC Vault",
+       "Provider": "",
+       "Value": "ap-vault"
+      },
+      {
+       "Help": "APAC Cold",
+       "Provider": "",
+       "Value": "ap-cold"
+      },
+      {
+       "Help": "APAC Flex",
+       "Provider": "",
+       "Value": "ap-flex"
+      },
+      {
+       "Help": "Melbourne Standard",
+       "Provider": "",
+       "Value": "mel01-standard"
+      },
+      {
+       "Help": "Melbourne Vault",
+       "Provider": "",
+       "Value": "mel01-vault"
+      },
+      {
+       "Help": "Melbourne Cold",
+       "Provider": "",
+       "Value": "mel01-cold"
+      },
+      {
+       "Help": "Melbourne Flex",
+       "Provider": "",
+       "Value": "mel01-flex"
+      },
+      {
+       "Help": "Toronto Standard",
+       "Provider": "",
+       "Value": "tor01-standard"
+      },
+      {
+       "Help": "Toronto Vault",
+       "Provider": "",
+       "Value": "tor01-vault"
+      },
+      {
+       "Help": "Toronto Cold",
+       "Provider": "",
+       "Value": "tor01-cold"
+      },
+      {
+       "Help": "Toronto Flex",
+       "Provider": "",
+       "Value": "tor01-flex"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Location constraint - must match endpoint when using IBM Cloud Public.\n\nFor on-prem COS, do not make a selection from this list, hit enter.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "location_constraint",
+     "NoPrefix": false,
+     "Provider": "IBMCOS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Global CDN Region",
+       "Provider": "",
+       "Value": "global"
+      },
+      {
+       "Help": "Australia (All locations)",
+       "Provider": "",
+       "Value": "au"
+      },
+      {
+       "Help": "NSW (Australia) Region",
+       "Provider": "",
+       "Value": "au-nsw"
+      },
+      {
+       "Help": "QLD (Australia) Region",
+       "Provider": "",
+       "Value": "au-qld"
+      },
+      {
+       "Help": "VIC (Australia) Region",
+       "Provider": "",
+       "Value": "au-vic"
+      },
+      {
+       "Help": "Perth (Australia) Region",
+       "Provider": "",
+       "Value": "au-wa"
+      },
+      {
+       "Help": "Manila (Philippines) Region",
+       "Provider": "",
+       "Value": "ph"
+      },
+      {
+       "Help": "Bangkok (Thailand) Region",
+       "Provider": "",
+       "Value": "th"
+      },
+      {
+       "Help": "HK (Hong Kong) Region",
+       "Provider": "",
+       "Value": "hk"
+      },
+      {
+       "Help": "Ulaanbaatar (Mongolia) Region",
+       "Provider": "",
+       "Value": "mn"
+      },
+      {
+       "Help": "Bishkek (Kyrgyzstan) Region",
+       "Provider": "",
+       "Value": "kg"
+      },
+      {
+       "Help": "Jakarta (Indonesia) Region",
+       "Provider": "",
+       "Value": "id"
+      },
+      {
+       "Help": "Tokyo (Japan) Region",
+       "Provider": "",
+       "Value": "jp"
+      },
+      {
+       "Help": "SG (Singapore) Region",
+       "Provider": "",
+       "Value": "sg"
+      },
+      {
+       "Help": "Frankfurt (Germany) Region",
+       "Provider": "",
+       "Value": "de"
+      },
+      {
+       "Help": "USA (AnyCast) Region",
+       "Provider": "",
+       "Value": "us"
+      },
+      {
+       "Help": "New York (USA) Region",
+       "Provider": "",
+       "Value": "us-east-1"
+      },
+      {
+       "Help": "Freemont (USA) Region",
+       "Provider": "",
+       "Value": "us-west-1"
+      },
+      {
+       "Help": "Auckland (New Zealand) Region",
+       "Provider": "",
+       "Value": "nz"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Location constraint - the location where your bucket will be located and your data stored.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "location_constraint",
+     "NoPrefix": false,
+     "Provider": "RackCorp",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "East China Region 1",
+       "Provider": "",
+       "Value": "cn-east-1"
+      },
+      {
+       "Help": "East China Region 2",
+       "Provider": "",
+       "Value": "cn-east-2"
+      },
+      {
+       "Help": "North China Region 1",
+       "Provider": "",
+       "Value": "cn-north-1"
+      },
+      {
+       "Help": "South China Region 1",
+       "Provider": "",
+       "Value": "cn-south-1"
+      },
+      {
+       "Help": "North America Region 1",
+       "Provider": "",
+       "Value": "us-north-1"
+      },
+      {
+       "Help": "Southeast Asia Region 1",
+       "Provider": "",
+       "Value": "ap-southeast-1"
+      },
+      {
+       "Help": "Northeast Asia Region 1",
+       "Provider": "",
+       "Value": "ap-northeast-1"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Location constraint - must be set to match the Region.\n\nUsed when creating buckets only.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "location_constraint",
+     "NoPrefix": false,
+     "Provider": "Qiniu",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Location constraint - must be set to match the Region.\n\nLeave blank if not sure. Used when creating buckets only.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "location_constraint",
+     "NoPrefix": false,
+     "Provider": "!AWS,Alibaba,HuaweiOBS,ChinaMobile,Cloudflare,IBMCOS,IDrive,IONOS,ArvanCloud,Qiniu,RackCorp,Scaleway,StackPath,Storj,TencentCOS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Owner gets Full_CONTROL.\nNo one else has access rights (default).",
+       "Provider": "TencentCOS",
+       "Value": "default"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nNo one else has access rights (default).",
+       "Provider": "!IBMCOS,TencentCOS",
+       "Value": "private"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nThe AllUsers group gets READ access.",
+       "Provider": "!IBMCOS",
+       "Value": "public-read"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nThe AllUsers group gets READ and WRITE access.\nGranting this on a bucket is generally not recommended.",
+       "Provider": "!IBMCOS",
+       "Value": "public-read-write"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nThe AuthenticatedUsers group gets READ access.",
+       "Provider": "!IBMCOS",
+       "Value": "authenticated-read"
+      },
+      {
+       "Help": "Object owner gets FULL_CONTROL.\nBucket owner gets READ access.\nIf you specify this canned ACL when creating a bucket, Amazon S3 ignores it.",
+       "Provider": "!IBMCOS,ChinaMobile",
+       "Value": "bucket-owner-read"
+      },
+      {
+       "Help": "Both the object owner and the bucket owner get FULL_CONTROL over the object.\nIf you specify this canned ACL when creating a bucket, Amazon S3 ignores it.",
+       "Provider": "!IBMCOS,ChinaMobile",
+       "Value": "bucket-owner-full-control"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nNo one else has access rights (default).\nThis acl is available on IBM Cloud (Infra), IBM Cloud (Storage), On-Premise COS.",
+       "Provider": "IBMCOS",
+       "Value": "private"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nThe AllUsers group gets READ access.\nThis acl is available on IBM Cloud (Infra), IBM Cloud (Storage), On-Premise IBM COS.",
+       "Provider": "IBMCOS",
+       "Value": "public-read"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nThe AllUsers group gets READ and WRITE access.\nThis acl is available on IBM Cloud (Infra), On-Premise IBM COS.",
+       "Provider": "IBMCOS",
+       "Value": "public-read-write"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nThe AuthenticatedUsers group gets READ access.\nNot supported on Buckets.\nThis acl is available on IBM Cloud (Infra) and On-Premise IBM COS.",
+       "Provider": "IBMCOS",
+       "Value": "authenticated-read"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Canned ACL used when creating buckets and storing or copying objects.\n\nThis ACL is used for creating objects and if bucket_acl isn't set, for creating buckets too.\n\nFor more info visit https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#canned-acl\n\nNote that this ACL is applied when server-side copying objects as S3\ndoesn't copy the ACL from the source but rather writes a fresh one.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "acl",
+     "NoPrefix": false,
+     "Provider": "!Storj,Cloudflare",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Owner gets FULL_CONTROL.\nNo one else has access rights (default).",
+       "Provider": "",
+       "Value": "private"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nThe AllUsers group gets READ access.",
+       "Provider": "",
+       "Value": "public-read"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nThe AllUsers group gets READ and WRITE access.\nGranting this on a bucket is generally not recommended.",
+       "Provider": "",
+       "Value": "public-read-write"
+      },
+      {
+       "Help": "Owner gets FULL_CONTROL.\nThe AuthenticatedUsers group gets READ access.",
+       "Provider": "",
+       "Value": "authenticated-read"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Canned ACL used when creating buckets.\n\nFor more info visit https://docs.aws.amazon.com/AmazonS3/latest/dev/acl-overview.html#canned-acl\n\nNote that this ACL is applied when only when creating buckets.  If it\nisn't set then \"acl\" is used instead.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "bucket_acl",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Enables requester pays option when interacting with S3 bucket.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "requester_pays",
+     "NoPrefix": false,
+     "Provider": "AWS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "None",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "AES256",
+       "Provider": "",
+       "Value": "AES256"
+      },
+      {
+       "Help": "aws:kms",
+       "Provider": "!ChinaMobile",
+       "Value": "aws:kms"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "The server-side encryption algorithm used when storing this object in S3.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "server_side_encryption",
+     "NoPrefix": false,
+     "Provider": "AWS,Ceph,ChinaMobile,Minio",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "None",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "AES256",
+       "Provider": "",
+       "Value": "AES256"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "If using SSE-C, the server-side encryption algorithm used when storing this object in S3.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "sse_customer_algorithm",
+     "NoPrefix": false,
+     "Provider": "AWS,Ceph,ChinaMobile,Minio",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "None",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "arn:aws:kms:*",
+       "Provider": "",
+       "Value": "arn:aws:kms:us-east-1:*"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "If using KMS ID you must provide the ARN of Key.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "sse_kms_key_id",
+     "NoPrefix": false,
+     "Provider": "AWS,Ceph,Minio",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "None",
+       "Provider": "",
+       "Value": ""
+      }
+     ],
+     "Exclusive": false,
+     "Help": "To use SSE-C you may provide the secret encryption key used to encrypt/decrypt your data.\n\nAlternatively you can provide --sse-customer-key-base64.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "sse_customer_key",
+     "NoPrefix": false,
+     "Provider": "AWS,Ceph,ChinaMobile,Minio",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "None",
+       "Provider": "",
+       "Value": ""
+      }
+     ],
+     "Exclusive": false,
+     "Help": "If using SSE-C you must provide the secret encryption key encoded in base64 format to encrypt/decrypt your data.\n\nAlternatively you can provide --sse-customer-key.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "sse_customer_key_base64",
+     "NoPrefix": false,
+     "Provider": "AWS,Ceph,ChinaMobile,Minio",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "None",
+       "Provider": "",
+       "Value": ""
+      }
+     ],
+     "Exclusive": false,
+     "Help": "If using SSE-C you may provide the secret encryption key MD5 checksum (optional).\n\nIf you leave it blank, this is calculated automatically from the sse_customer_key provided.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "sse_customer_key_md5",
+     "NoPrefix": false,
+     "Provider": "AWS,Ceph,ChinaMobile,Minio",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Default",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "Standard storage class",
+       "Provider": "",
+       "Value": "STANDARD"
+      },
+      {
+       "Help": "Reduced redundancy storage class",
+       "Provider": "",
+       "Value": "REDUCED_REDUNDANCY"
+      },
+      {
+       "Help": "Standard Infrequent Access storage class",
+       "Provider": "",
+       "Value": "STANDARD_IA"
+      },
+      {
+       "Help": "One Zone Infrequent Access storage class",
+       "Provider": "",
+       "Value": "ONEZONE_IA"
+      },
+      {
+       "Help": "Glacier storage class",
+       "Provider": "",
+       "Value": "GLACIER"
+      },
+      {
+       "Help": "Glacier Deep Archive storage class",
+       "Provider": "",
+       "Value": "DEEP_ARCHIVE"
+      },
+      {
+       "Help": "Intelligent-Tiering storage class",
+       "Provider": "",
+       "Value": "INTELLIGENT_TIERING"
+      },
+      {
+       "Help": "Glacier Instant Retrieval storage class",
+       "Provider": "",
+       "Value": "GLACIER_IR"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "The storage class to use when storing new objects in S3.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "storage_class",
+     "NoPrefix": false,
+     "Provider": "AWS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Default",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "Standard storage class",
+       "Provider": "",
+       "Value": "STANDARD"
+      },
+      {
+       "Help": "Archive storage mode",
+       "Provider": "",
+       "Value": "GLACIER"
+      },
+      {
+       "Help": "Infrequent access storage mode",
+       "Provider": "",
+       "Value": "STANDARD_IA"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "The storage class to use when storing new objects in OSS.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "storage_class",
+     "NoPrefix": false,
+     "Provider": "Alibaba",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Default",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "Standard storage class",
+       "Provider": "",
+       "Value": "STANDARD"
+      },
+      {
+       "Help": "Archive storage mode",
+       "Provider": "",
+       "Value": "GLACIER"
+      },
+      {
+       "Help": "Infrequent access storage mode",
+       "Provider": "",
+       "Value": "STANDARD_IA"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "The storage class to use when storing new objects in ChinaMobile.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "storage_class",
+     "NoPrefix": false,
+     "Provider": "ChinaMobile",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Standard storage class",
+       "Provider": "",
+       "Value": "STANDARD"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "The storage class to use when storing new objects in ArvanCloud.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "storage_class",
+     "NoPrefix": false,
+     "Provider": "ArvanCloud",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Default",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "Standard storage class",
+       "Provider": "",
+       "Value": "STANDARD"
+      },
+      {
+       "Help": "Archive storage mode",
+       "Provider": "",
+       "Value": "ARCHIVE"
+      },
+      {
+       "Help": "Infrequent access storage mode",
+       "Provider": "",
+       "Value": "STANDARD_IA"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "The storage class to use when storing new objects in Tencent COS.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "storage_class",
+     "NoPrefix": false,
+     "Provider": "TencentCOS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Default.",
+       "Provider": "",
+       "Value": ""
+      },
+      {
+       "Help": "The Standard class for any upload.\nSuitable for on-demand content like streaming or CDN.",
+       "Provider": "",
+       "Value": "STANDARD"
+      },
+      {
+       "Help": "Archived storage.\nPrices are lower, but it needs to be restored first to be accessed.",
+       "Provider": "",
+       "Value": "GLACIER"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "The storage class to use when storing new objects in S3.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "storage_class",
+     "NoPrefix": false,
+     "Provider": "Scaleway",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Standard storage class",
+       "Provider": "",
+       "Value": "STANDARD"
+      },
+      {
+       "Help": "Infrequent access storage mode",
+       "Provider": "",
+       "Value": "LINE"
+      },
+      {
+       "Help": "Archive storage mode",
+       "Provider": "",
+       "Value": "GLACIER"
+      },
+      {
+       "Help": "Deep archive storage mode",
+       "Provider": "",
+       "Value": "DEEP_ARCHIVE"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "The storage class to use when storing new objects in Qiniu.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "storage_class",
+     "NoPrefix": false,
+     "Provider": "Qiniu",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": 209715200,
+     "DefaultStr": "200Mi",
+     "Exclusive": false,
+     "Help": "Cutoff for switching to chunked upload.\n\nAny files larger than this will be uploaded in chunks of chunk_size.\nThe minimum is 0 and the maximum is 5 GiB.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "upload_cutoff",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "200Mi"
+    },
+    {
+     "Advanced": true,
+     "Default": 5242880,
+     "DefaultStr": "5Mi",
+     "Exclusive": false,
+     "Help": "Chunk size to use for uploading.\n\nWhen uploading files larger than upload_cutoff or files with unknown\nsize (e.g. from \"rclone rcat\" or uploaded with \"rclone mount\" or google\nphotos or google docs) they will be uploaded as multipart uploads\nusing this chunk size.\n\nNote that \"--s3-upload-concurrency\" chunks of this size are buffered\nin memory per transfer.\n\nIf you are transferring large files over high-speed links and you have\nenough memory, then increasing this will speed up the transfers.\n\nRclone will automatically increase the chunk size when uploading a\nlarge file of known size to stay below the 10,000 chunks limit.\n\nFiles of unknown size are uploaded with the configured\nchunk_size. Since the default chunk size is 5 MiB and there can be at\nmost 10,000 chunks, this means that by default the maximum size of\na file you can stream upload is 48 GiB.  If you wish to stream upload\nlarger files then you will need to increase chunk_size.\n\nIncreasing the chunk size decreases the accuracy of the progress\nstatistics displayed with \"-P\" flag. Rclone treats chunk as sent when\nit's buffered by the AWS SDK, when in fact it may still be uploading.\nA bigger chunk size means a bigger AWS SDK buffer and progress\nreporting more deviating from the truth.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "chunk_size",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "5Mi"
+    },
+    {
+     "Advanced": true,
+     "Default": 10000,
+     "DefaultStr": "10000",
+     "Exclusive": false,
+     "Help": "Maximum number of parts in a multipart upload.\n\nThis option defines the maximum number of multipart chunks to use\nwhen doing a multipart upload.\n\nThis can be useful if a service does not support the AWS S3\nspecification of 10,000 chunks.\n\nRclone will automatically increase the chunk size when uploading a\nlarge file of a known size to stay below this number of chunks limit.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "max_upload_parts",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "int",
+     "Value": null,
+     "ValueStr": "10000"
+    },
+    {
+     "Advanced": true,
+     "Default": 4999610368,
+     "DefaultStr": "4.656Gi",
+     "Exclusive": false,
+     "Help": "Cutoff for switching to multipart copy.\n\nAny files larger than this that need to be server-side copied will be\ncopied in chunks of this size.\n\nThe minimum is 0 and the maximum is 5 GiB.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "copy_cutoff",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "4.656Gi"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Don't store MD5 checksum with object metadata.\n\nNormally rclone will calculate the MD5 checksum of the input before\nuploading it so it can add it to metadata on the object. This is great\nfor data integrity checking but can cause long delays for large files\nto start uploading.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "disable_checksum",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Path to the shared credentials file.\n\nIf env_auth = true then rclone can use a shared credentials file.\n\nIf this variable is empty rclone will look for the\n\"AWS_SHARED_CREDENTIALS_FILE\" env variable. If the env value is empty\nit will default to the current user's home directory.\n\n    Linux/OSX: \"$HOME/.aws/credentials\"\n    Windows:   \"%USERPROFILE%\\.aws\\credentials\"\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "shared_credentials_file",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Profile to use in the shared credentials file.\n\nIf env_auth = true then rclone can use a shared credentials file. This\nvariable controls which profile is used in that file.\n\nIf empty it will default to the environment variable \"AWS_PROFILE\" or\n\"default\" if that environment variable is also not set.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "profile",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "An AWS session token.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "session_token",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": 4,
+     "DefaultStr": "4",
+     "Exclusive": false,
+     "Help": "Concurrency for multipart uploads.\n\nThis is the number of chunks of the same file that are uploaded\nconcurrently.\n\nIf you are uploading small numbers of large files over high-speed links\nand these uploads do not fully utilize your bandwidth, then increasing\nthis may help to speed up the transfers.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "upload_concurrency",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "int",
+     "Value": null,
+     "ValueStr": "4"
+    },
+    {
+     "Advanced": true,
+     "Default": true,
+     "DefaultStr": "true",
+     "Exclusive": false,
+     "Help": "If true use path style access if false use virtual hosted style.\n\nIf this is true (the default) then rclone will use path style access,\nif false then rclone will use virtual path style. See [the AWS S3\ndocs](https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingBucket.html#access-bucket-intro)\nfor more info.\n\nSome providers (e.g. AWS, Aliyun OSS, Netease COS, or Tencent COS) require this set to\nfalse - rclone will do this automatically based on the provider\nsetting.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "force_path_style",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "true"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If true use v2 authentication.\n\nIf this is false (the default) then rclone will use v4 authentication.\nIf it is set then rclone will use v2 authentication.\n\nUse this only if v4 signatures don't work, e.g. pre Jewel/v10 CEPH.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "v2_auth",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If true use the AWS S3 accelerated endpoint.\n\nSee: [AWS S3 Transfer acceleration](https://docs.aws.amazon.com/AmazonS3/latest/dev/transfer-acceleration-examples.html)",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "use_accelerate_endpoint",
+     "NoPrefix": false,
+     "Provider": "AWS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If true avoid calling abort upload on a failure, leaving all successfully uploaded parts on S3 for manual recovery.\n\nIt should be set to true for resuming uploads across different sessions.\n\nWARNING: Storing parts of an incomplete multipart upload counts towards space usage on S3 and will add additional costs if not cleaned up.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "leave_parts_on_error",
+     "NoPrefix": false,
+     "Provider": "AWS",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": 1000,
+     "DefaultStr": "1000",
+     "Exclusive": false,
+     "Help": "Size of listing chunk (response list for each ListObject S3 request).\n\nThis option is also known as \"MaxKeys\", \"max-items\", or \"page-size\" from the AWS S3 specification.\nMost services truncate the response list to 1000 objects even if requested more than that.\nIn AWS S3 this is a global maximum and cannot be changed, see [AWS S3](https://docs.aws.amazon.com/cli/latest/reference/s3/ls.html).\nIn Ceph, this can be increased with the \"rgw list buckets max chunk\" option.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "list_chunk",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "int",
+     "Value": null,
+     "ValueStr": "1000"
+    },
+    {
+     "Advanced": true,
+     "Default": 0,
+     "DefaultStr": "0",
+     "Exclusive": false,
+     "Help": "Version of ListObjects to use: 1,2 or 0 for auto.\n\nWhen S3 originally launched it only provided the ListObjects call to\nenumerate objects in a bucket.\n\nHowever in May 2016 the ListObjectsV2 call was introduced. This is\nmuch higher performance and should be used if at all possible.\n\nIf set to the default, 0, rclone will guess according to the provider\nset which list objects method to call. If it guesses wrong, then it\nmay be set manually here.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "list_version",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "int",
+     "Value": null,
+     "ValueStr": "0"
+    },
+    {
+     "Advanced": true,
+     "Default": {
+      "Valid": false,
+      "Value": false
+     },
+     "DefaultStr": "unset",
+     "Exclusive": false,
+     "Help": "Whether to url encode listings: true/false/unset\n\nSome providers support URL encoding listings and where this is\navailable this is more reliable when using control characters in file\nnames. If this is set to unset (the default) then rclone will choose\naccording to the provider setting what to apply, but you can override\nrclone's choice here.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "list_url_encode",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Tristate",
+     "Value": null,
+     "ValueStr": "unset"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If set, don't attempt to check the bucket exists or create it.\n\nThis can be useful when trying to minimise the number of transactions\nrclone does if you know the bucket exists already.\n\nIt can also be needed if the user you are using does not have bucket\ncreation permissions. Before v1.52.0 this would have passed silently\ndue to a bug.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "no_check_bucket",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If set, don't HEAD uploaded objects to check integrity.\n\nThis can be useful when trying to minimise the number of transactions\nrclone does.\n\nSetting it means that if rclone receives a 200 OK message after\nuploading an object with PUT then it will assume that it got uploaded\nproperly.\n\nIn particular it will assume:\n\n- the metadata, including modtime, storage class and content type was as uploaded\n- the size was as uploaded\n\nIt reads the following items from the response for a single part PUT:\n\n- the MD5SUM\n- The uploaded date\n\nFor multipart uploads these items aren't read.\n\nIf an source object of unknown length is uploaded then rclone **will** do a\nHEAD request.\n\nSetting this flag increases the chance for undetected upload failures,\nin particular an incorrect size, so it isn't recommended for normal\noperation. In practice the chance of an undetected upload failure is\nvery small even with this flag.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "no_head",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If set, do not do HEAD before GET when getting objects.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "no_head_object",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": 50331650,
+     "DefaultStr": "Slash,InvalidUtf8,Dot",
+     "Exclusive": false,
+     "Help": "The encoding for the backend.\n\nSee the [encoding section in the overview](/overview/#encoding) for more info.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "encoding",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "MultiEncoder",
+     "Value": null,
+     "ValueStr": "Slash,InvalidUtf8,Dot"
+    },
+    {
+     "Advanced": true,
+     "Default": 60000000000,
+     "DefaultStr": "1m0s",
+     "Exclusive": false,
+     "Help": "How often internal memory buffer pools will be flushed.\n\nUploads which requires additional buffers (f.e multipart) will use memory pool for allocations.\nThis option controls how often unused buffers will be removed from the pool.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "memory_pool_flush_time",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Duration",
+     "Value": null,
+     "ValueStr": "1m0s"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Whether to use mmap buffers in internal memory pool.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "memory_pool_use_mmap",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Disable usage of http2 for S3 backends.\n\nThere is currently an unsolved issue with the s3 (specifically minio) backend\nand HTTP/2.  HTTP/2 is enabled by default for the s3 backend but can be\ndisabled here.  When the issue is solved this flag will be removed.\n\nSee: https://github.com/rclone/rclone/issues/4673, https://github.com/rclone/rclone/issues/3631\n\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "disable_http2",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Custom endpoint for downloads.\nThis is usually set to a CloudFront CDN URL as AWS S3 offers\ncheaper egress for data downloaded through the CloudFront network.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "download_url",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": {
+      "Valid": false,
+      "Value": false
+     },
+     "DefaultStr": "unset",
+     "Exclusive": false,
+     "Help": "Whether to use ETag in multipart uploads for verification\n\nThis should be true, false or left unset to use the default for the provider.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "use_multipart_etag",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Tristate",
+     "Value": null,
+     "ValueStr": "unset"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Whether to use a presigned request or PutObject for single part uploads\n\nIf this is false rclone will use PutObject from the AWS SDK to upload\nan object.\n\nVersions of rclone < 1.59 use presigned requests to upload a single\npart object and setting this flag to true will re-enable that\nfunctionality. This shouldn't be necessary except in exceptional\ncircumstances or for testing.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "use_presigned_request",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Include old versions in directory listings.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "versions",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": {},
+     "DefaultStr": "off",
+     "Exclusive": false,
+     "Help": "Show file versions as they were at the specified time.\n\nThe parameter should be a date, \"2006-01-02\", datetime \"2006-01-02\n15:04:05\" or a duration for that long ago, eg \"100d\" or \"1h\".\n\nNote that when using this no file write operations are permitted,\nso you can't upload files or delete them.\n\nSee [the time option docs](/docs/#time-option) for valid formats.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "version_at",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Time",
+     "Value": null,
+     "ValueStr": "off"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If set this will decompress gzip encoded objects.\n\nIt is possible to upload objects to S3 with \"Content-Encoding: gzip\"\nset. Normally rclone will download these files as compressed objects.\n\nIf this flag is set then rclone will decompress these files with\n\"Content-Encoding: gzip\" as they are received. This means that rclone\ncan't check the size and hash but the file contents will be decompressed.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "decompress",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": {
+      "Valid": false,
+      "Value": false
+     },
+     "DefaultStr": "unset",
+     "Exclusive": false,
+     "Help": "Set this if the backend might gzip objects.\n\nNormally providers will not alter objects when they are downloaded. If\nan object was not uploaded with `Content-Encoding: gzip` then it won't\nbe set on download.\n\nHowever some providers may gzip objects even if they weren't uploaded\nwith `Content-Encoding: gzip` (eg Cloudflare).\n\nA symptom of this would be receiving errors like\n\n    ERROR corrupted on transfer: sizes differ NNN vs MMM\n\nIf you set this flag and rclone downloads an object with\nContent-Encoding: gzip set and chunked transfer encoding, then rclone\nwill decompress the object on the fly.\n\nIf this is set to unset (the default) then rclone will choose\naccording to the provider setting what to apply, but you can override\nrclone's choice here.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "might_gzip",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Tristate",
+     "Value": null,
+     "ValueStr": "unset"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Suppress setting and reading of system metadata",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "no_system_metadata",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    }
+   ],
+   "Prefix": "s3"
+  },
+  {
+   "Aliases": null,
+   "CommandHelp": [
+    {
+     "Long": "This is a get command which will be used to fetch the various drive config parameters\n\nUsage Examples:\n\n    rclone backend get drive: [-o service_account_file] [-o chunk_size]\n    rclone rc backend/command command=get fs=drive: [-o service_account_file] [-o chunk_size]\n",
+     "Name": "get",
+     "Opts": {
+      "chunk_size": "show the current upload chunk size",
+      "service_account_file": "show the current service account file"
+     },
+     "Short": "Get command for fetching the drive config parameters"
+    },
+    {
+     "Long": "This is a set command which will be used to update the various drive config parameters\n\nUsage Examples:\n\n    rclone backend set drive: [-o service_account_file=sa.json] [-o chunk_size=67108864]\n    rclone rc backend/command command=set fs=drive: [-o service_account_file=sa.json] [-o chunk_size=67108864]\n",
+     "Name": "set",
+     "Opts": {
+      "chunk_size": "update the current upload chunk size",
+      "service_account_file": "update the current service account file"
+     },
+     "Short": "Set command for updating the drive config parameters"
+    },
+    {
+     "Long": "This command creates shortcuts from files or directories.\n\nUsage:\n\n    rclone backend shortcut drive: source_item destination_shortcut\n    rclone backend shortcut drive: source_item -o target=drive2: destination_shortcut\n\nIn the first example this creates a shortcut from the \"source_item\"\nwhich can be a file or a directory to the \"destination_shortcut\". The\n\"source_item\" and the \"destination_shortcut\" should be relative paths\nfrom \"drive:\"\n\nIn the second example this creates a shortcut from the \"source_item\"\nrelative to \"drive:\" to the \"destination_shortcut\" relative to\n\"drive2:\". This may fail with a permission error if the user\nauthenticated with \"drive2:\" can't read files from \"drive:\".\n",
+     "Name": "shortcut",
+     "Opts": {
+      "target": "optional target remote for the shortcut destination"
+     },
+     "Short": "Create shortcuts from files or directories"
+    },
+    {
+     "Long": "This command lists the Shared Drives (Team Drives) available to this\naccount.\n\nUsage:\n\n    rclone backend [-o config] drives drive:\n\nThis will return a JSON list of objects like this\n\n    [\n        {\n            \"id\": \"0ABCDEF-01234567890\",\n            \"kind\": \"drive#teamDrive\",\n            \"name\": \"My Drive\"\n        },\n        {\n            \"id\": \"0ABCDEFabcdefghijkl\",\n            \"kind\": \"drive#teamDrive\",\n            \"name\": \"Test Drive\"\n        }\n    ]\n\nWith the -o config parameter it will output the list in a format\nsuitable for adding to a config file to make aliases for all the\ndrives found and a combined drive.\n\n    [My Drive]\n    type = alias\n    remote = drive,team_drive=0ABCDEF-01234567890,root_folder_id=:\n\n    [Test Drive]\n    type = alias\n    remote = drive,team_drive=0ABCDEFabcdefghijkl,root_folder_id=:\n\n    [AllDrives]\n    type = combine\n    upstreams = \"My Drive=My Drive:\" \"Test Drive=Test Drive:\"\n\nAdding this to the rclone config file will cause those team drives to\nbe accessible with the aliases shown. Any illegal characters will be\nsubstituted with \"_\" and duplicate names will have numbers suffixed.\nIt will also add a remote called AllDrives which shows all the shared\ndrives combined into one directory tree.\n",
+     "Name": "drives",
+     "Opts": null,
+     "Short": "List the Shared Drives available to this account"
+    },
+    {
+     "Long": "This command untrashes all the files and directories in the directory\npassed in recursively.\n\nUsage:\n\nThis takes an optional directory to trash which make this easier to\nuse via the API.\n\n    rclone backend untrash drive:directory\n    rclone backend -i untrash drive:directory subdir\n\nUse the -i flag to see what would be restored before restoring it.\n\nResult:\n\n    {\n        \"Untrashed\": 17,\n        \"Errors\": 0\n    }\n",
+     "Name": "untrash",
+     "Opts": null,
+     "Short": "Untrash files and directories"
+    },
+    {
+     "Long": "This command copies files by ID\n\nUsage:\n\n    rclone backend copyid drive: ID path\n    rclone backend copyid drive: ID1 path1 ID2 path2\n\nIt copies the drive file with ID given to the path (an rclone path which\nwill be passed internally to rclone copyto). The ID and path pairs can be\nrepeated.\n\nThe path should end with a / to indicate copy the file as named to\nthis directory. If it doesn't end with a / then the last path\ncomponent will be used as the file name.\n\nIf the destination is a drive backend then server-side copying will be\nattempted if possible.\n\nUse the -i flag to see what would be copied before copying.\n",
+     "Name": "copyid",
+     "Opts": null,
+     "Short": "Copy files by ID"
+    },
+    {
+     "Long": "",
+     "Name": "exportformats",
+     "Opts": null,
+     "Short": "Dump the export formats for debug purposes"
+    },
+    {
+     "Long": "",
+     "Name": "importformats",
+     "Opts": null,
+     "Short": "Dump the import formats for debug purposes"
+    }
+   ],
+   "Description": "Google Drive",
+   "Hide": false,
+   "MetadataInfo": null,
+   "Name": "drive",
+   "Options": [
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Google Application Client Id\nSetting your own is recommended.\nSee https://rclone.org/drive/#making-your-own-client-id for how to create your own.\nIf you leave this blank, it will use an internal key which is low performance.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "client_id",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "OAuth Client Secret.\n\nLeave blank normally.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "client_secret",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "OAuth Access Token as a JSON blob.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "token",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Auth server URL.\n\nLeave blank to use the provider defaults.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "auth_url",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Token server url.\n\nLeave blank to use the provider defaults.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "token_url",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Examples": [
+      {
+       "Help": "Full access all files, excluding Application Data Folder.",
+       "Provider": "",
+       "Value": "drive"
+      },
+      {
+       "Help": "Read-only access to file metadata and file contents.",
+       "Provider": "",
+       "Value": "drive.readonly"
+      },
+      {
+       "Help": "Access to files created by rclone only.\nThese are visible in the drive website.\nFile authorization is revoked when the user deauthorizes the app.",
+       "Provider": "",
+       "Value": "drive.file"
+      },
+      {
+       "Help": "Allows read and write access to the Application Data folder.\nThis is not visible in the drive website.",
+       "Provider": "",
+       "Value": "drive.appfolder"
+      },
+      {
+       "Help": "Allows read-only access to file metadata but\ndoes not allow any access to read or download file content.",
+       "Provider": "",
+       "Value": "drive.metadata.readonly"
+      }
+     ],
+     "Exclusive": false,
+     "Help": "Scope that rclone should use when requesting access from drive.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "scope",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "ID of the root folder.\nLeave blank normally.\n\nFill in to access \"Computers\" folders (see docs), or for rclone to use\na non root folder as its starting point.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "root_folder_id",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Service Account Credentials JSON file path.\n\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.\n\nLeading `~` will be expanded in the file name as will environment variables such as `${RCLONE_CONFIG_DIR}`.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "service_account_file",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Service Account Credentials JSON blob.\n\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
+     "Hide": 2,
+     "IsPassword": false,
+     "Name": "service_account_credentials",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "ID of the Shared Drive (Team Drive).",
+     "Hide": 2,
+     "IsPassword": false,
+     "Name": "team_drive",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Only consider files owned by the authenticated user.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "auth_owner_only",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": true,
+     "DefaultStr": "true",
+     "Exclusive": false,
+     "Help": "Send files to the trash instead of deleting permanently.\n\nDefaults to true, namely sending files to the trash.\nUse `--drive-use-trash=false` to delete files permanently instead.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "use_trash",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "true"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Server side copy contents of shortcuts instead of the shortcut.\n\nWhen doing server side copies, normally rclone will copy shortcuts as\nshortcuts.\n\nIf this flag is used then rclone will copy the contents of shortcuts\nrather than shortcuts themselves when doing server side copies.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "copy_shortcut_content",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Skip google documents in all listings.\n\nIf given, gdocs practically become invisible to rclone.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "skip_gdocs",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Skip MD5 checksum on Google photos and videos only.\n\nUse this if you get checksum errors when transferring Google photos or\nvideos.\n\nSetting this flag will cause Google photos and videos to return a\nblank MD5 checksum.\n\nGoogle photos are identified by being in the \"photos\" space.\n\nCorrupted checksums are caused by Google modifying the image/video but\nnot updating the checksum.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "skip_checksum_gphotos",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Only show files that are shared with me.\n\nInstructs rclone to operate on your \"Shared with me\" folder (where\nGoogle Drive lets you access the files and folders others have shared\nwith you).\n\nThis works both with the \"list\" (lsd, lsl, etc.) and the \"copy\"\ncommands (copy, sync, etc.), and with all other commands too.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "shared_with_me",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Only show files that are in the trash.\n\nThis will show trashed files in their original directory structure.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "trashed_only",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Only show files that are starred.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "starred_only",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Deprecated: See export_formats.",
+     "Hide": 2,
+     "IsPassword": false,
+     "Name": "formats",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": "docx,xlsx,pptx,svg",
+     "DefaultStr": "docx,xlsx,pptx,svg",
+     "Exclusive": false,
+     "Help": "Comma separated list of preferred formats for downloading Google docs.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "export_formats",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": "docx,xlsx,pptx,svg"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Comma separated list of preferred formats for uploading Google docs.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "import_formats",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Allow the filetype to change when uploading Google docs.\n\nE.g. file.doc to file.docx. This will confuse sync and reupload every time.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "allow_import_name_change",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Use file created date instead of modified date.\n\nUseful when downloading data and you want the creation date used in\nplace of the last modified date.\n\n**WARNING**: This flag may have some unexpected consequences.\n\nWhen uploading to your drive all files will be overwritten unless they\nhaven't been modified since their creation. And the inverse will occur\nwhile downloading.  This side effect can be avoided by using the\n\"--checksum\" flag.\n\nThis feature was implemented to retain photos capture date as recorded\nby google photos. You will first need to check the \"Create a Google\nPhotos folder\" option in your google drive settings. You can then copy\nor move the photos locally and use the date the image was taken\n(created) set as the modification date.",
+     "Hide": 2,
+     "IsPassword": false,
+     "Name": "use_created_date",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Use date file was shared instead of modified date.\n\nNote that, as with \"--drive-use-created-date\", this flag may have\nunexpected consequences when uploading/downloading files.\n\nIf both this flag and \"--drive-use-created-date\" are set, the created\ndate is used.",
+     "Hide": 2,
+     "IsPassword": false,
+     "Name": "use_shared_date",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": 1000,
+     "DefaultStr": "1000",
+     "Exclusive": false,
+     "Help": "Size of listing chunk 100-1000, 0 to disable.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "list_chunk",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "int",
+     "Value": null,
+     "ValueStr": "1000"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Impersonate this user when using a service account.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "impersonate",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": false,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Deprecated: No longer needed.",
+     "Hide": 3,
+     "IsPassword": false,
+     "Name": "alternate_export",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": 8388608,
+     "DefaultStr": "8Mi",
+     "Exclusive": false,
+     "Help": "Cutoff for switching to chunked upload.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "upload_cutoff",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "8Mi"
+    },
+    {
+     "Advanced": true,
+     "Default": 8388608,
+     "DefaultStr": "8Mi",
+     "Exclusive": false,
+     "Help": "Upload chunk size.\n\nMust a power of 2 >= 256k.\n\nMaking this larger will improve performance, but note that each chunk\nis buffered in memory one per transfer.\n\nReducing this will reduce memory usage but decrease performance.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "chunk_size",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "8Mi"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Set to allow files which return cannotDownloadAbusiveFile to be downloaded.\n\nIf downloading a file returns the error \"This file has been identified\nas malware or spam and cannot be downloaded\" with the error code\n\"cannotDownloadAbusiveFile\" then supply this flag to rclone to\nindicate you acknowledge the risks of downloading the file and rclone\nwill download it anyway.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "acknowledge_abuse",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Keep new head revision of each file forever.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "keep_revision_forever",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Show sizes as storage quota usage, not actual size.\n\nShow the size of a file as the storage quota used. This is the\ncurrent version plus any older versions that have been set to keep\nforever.\n\n**WARNING**: This flag may have some unexpected consequences.\n\nIt is not recommended to set this flag in your config - the\nrecommended usage is using the flag form --drive-size-as-quota when\ndoing rclone ls/lsl/lsf/lsjson/etc only.\n\nIf you do use this flag for syncing (not recommended) then you will\nneed to use --ignore size also.",
+     "Hide": 2,
+     "IsPassword": false,
+     "Name": "size_as_quota",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": -1,
+     "DefaultStr": "off",
+     "Exclusive": false,
+     "Help": "If Object's are greater, use drive v2 API to download.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "v2_download_min_size",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "SizeSuffix",
+     "Value": null,
+     "ValueStr": "off"
+    },
+    {
+     "Advanced": true,
+     "Default": 100000000,
+     "DefaultStr": "100ms",
+     "Exclusive": false,
+     "Help": "Minimum time to sleep between API calls.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "pacer_min_sleep",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "Duration",
+     "Value": null,
+     "ValueStr": "100ms"
+    },
+    {
+     "Advanced": true,
+     "Default": 100,
+     "DefaultStr": "100",
+     "Exclusive": false,
+     "Help": "Number of API calls to allow without sleeping.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "pacer_burst",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "int",
+     "Value": null,
+     "ValueStr": "100"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Allow server-side operations (e.g. copy) to work across different drive configs.\n\nThis can be useful if you wish to do a server-side copy between two\ndifferent Google drives.  Note that this isn't enabled by default\nbecause it isn't easy to tell if it will work between any two\nconfigurations.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "server_side_across_configs",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": true,
+     "DefaultStr": "true",
+     "Exclusive": false,
+     "Help": "Disable drive using http2.\n\nThere is currently an unsolved issue with the google drive backend and\nHTTP/2.  HTTP/2 is therefore disabled by default for the drive backend\nbut can be re-enabled here.  When the issue is solved this flag will\nbe removed.\n\nSee: https://github.com/rclone/rclone/issues/3631\n\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "disable_http2",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "true"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Make upload limit errors be fatal.\n\nAt the time of writing it is only possible to upload 750 GiB of data to\nGoogle Drive a day (this is an undocumented limit). When this limit is\nreached Google Drive produces a slightly different error message. When\nthis flag is set it causes these errors to be fatal.  These will stop\nthe in-progress sync.\n\nNote that this detection is relying on error message strings which\nGoogle don't document so it may break in the future.\n\nSee: https://github.com/rclone/rclone/issues/3857\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "stop_on_upload_limit",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "Make download limit errors be fatal.\n\nAt the time of writing it is only possible to download 10 TiB of data from\nGoogle Drive a day (this is an undocumented limit). When this limit is\nreached Google Drive produces a slightly different error message. When\nthis flag is set it causes these errors to be fatal.  These will stop\nthe in-progress sync.\n\nNote that this detection is relying on error message strings which\nGoogle don't document so it may break in the future.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "stop_on_download_limit",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If set skip shortcut files.\n\nNormally rclone dereferences shortcut files making them appear as if\nthey are the original file (see [the shortcuts section](#shortcuts)).\nIf this flag is set then rclone will ignore shortcut files completely.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "skip_shortcuts",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": false,
+     "DefaultStr": "false",
+     "Exclusive": false,
+     "Help": "If set skip dangling shortcut files.\n\nIf this is set then rclone will not show any dangling shortcuts in listings.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "skip_dangling_shortcuts",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "bool",
+     "Value": null,
+     "ValueStr": "false"
+    },
+    {
+     "Advanced": true,
+     "Default": "",
+     "DefaultStr": "",
+     "Exclusive": false,
+     "Help": "Resource key for accessing a link-shared file.\n\nIf you need to access files shared with a link like this\n\n    https://drive.google.com/drive/folders/XXX?resourcekey=YYY&usp=sharing\n\nThen you will need to use the first part \"XXX\" as the \"root_folder_id\"\nand the second part \"YYY\" as the \"resource_key\" otherwise you will get\n404 not found errors when trying to access the directory.\n\nSee: https://developers.google.com/drive/api/guides/resource-keys\n\nThis resource key requirement only applies to a subset of old files.\n\nNote also that opening the folder once in the web interface (with the\nuser you've authenticated rclone with) seems to be enough so that the\nresource key is no needed.\n",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "resource_key",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "string",
+     "Value": null,
+     "ValueStr": ""
+    },
+    {
+     "Advanced": true,
+     "Default": 16777216,
+     "DefaultStr": "InvalidUtf8",
+     "Exclusive": false,
+     "Help": "The encoding for the backend.\n\nSee the [encoding section in the overview](/overview/#encoding) for more info.",
+     "Hide": 0,
+     "IsPassword": false,
+     "Name": "encoding",
+     "NoPrefix": false,
+     "Provider": "",
+     "Required": false,
+     "ShortOpt": "",
+     "Type": "MultiEncoder",
+     "Value": null,
+     "ValueStr": "InvalidUtf8"
+    }
+   ],
+   "Prefix": "drive"
+  }
+ ]
+}
