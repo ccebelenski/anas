@@ -5,6 +5,7 @@ import { hostname } from 'node:os'
 import { dirname, join } from 'node:path'
 import { BackupRepoRegistry as BackupRepoRegistrySchema, PVE_REPO_PREFIX } from '@anas/shared'
 import { PVE_PRIV_STORAGE_DIR, PVE_STORAGE_CFG } from '../parsers/pve-storage.js'
+import { withFileLock } from './file-lock.js'
 
 /**
  * PBS repositories registry (Epic 16.2) — the COROSYNC STORE, reusing the
@@ -97,15 +98,6 @@ export async function readBackupRepos(paths: BackupReposPaths): Promise<BackupRe
   if (!parsed.success)
     throw new Error(`backup repositories registry is invalid: ${parsed.error.issues[0]?.message}`)
   return parsed.data
-}
-
-/** Per-path promise chain — serializes CAS writes to the same file in-process. */
-const locks = new Map<string, Promise<unknown>>()
-function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
-  const prev = locks.get(path) ?? Promise.resolve()
-  const next = prev.catch(() => {}).then(fn)
-  locks.set(path, next.catch(() => {}))
-  return next
 }
 
 /** Test seam: run something between acquiring the lock and the CAS re-read. */

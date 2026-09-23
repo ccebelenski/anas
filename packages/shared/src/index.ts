@@ -10,7 +10,6 @@ export {
 } from './mount-target.js'
 export type { MountTarget } from './mount-target.js'
 
-
 // PVE footprint ownership (story pvepool.1 — GitHub #61): the shared pure
 // predicate every consumer asks, plus PVE's own guest-volume regex
 // (ZFSPoolPlugin.pm) and the storage-path helper.
@@ -189,6 +188,21 @@ export {
   snapshotTimeIso,
   UpsertBackupRepoRequest,
 } from './schemas/backup.js'
+
+// Cloud sync schemas (rclone.1)
+export {
+  CloudProvider,
+  CloudProviderExample,
+  CloudProviderOption,
+  CloudRcloneInfo,
+  CloudRemote,
+  CloudRemoteName,
+  CloudRemotesResponse,
+  CloudRemoteTestResult,
+  CloudRemoteTestVerdict,
+  CloudRemoteUpdate,
+  CloudRemoteWrite,
+} from './schemas/cloud.js'
 
 // Common validators
 export {
