@@ -108,6 +108,14 @@
  *      ride through verbatim. The grid grows a Kind column + the LUN's live
  *      name (null = "no longer resolvable"), and the LUN door's badge matches
  *      a task by the serial in its backup-id.
+ *   8. SMB Self-service (smbsvc.1): the Previous Versions row obeys the §2
+ *      three-valued contract — a ticked create/edit sends `{ enabled: true }`,
+ *      unticking sends `{ enabled: false }`, and an untouched edit sends NO
+ *      `previousVersions` key (a byte-identical body). A share with a
+ *      hand-made `vfs objects` line opens the box DISABLED with the refusal
+ *      sentence (ANAS.smb — the daemon's own rule; an ANAS-composed line does
+ *      not grey); the detail window reads "on — <bucket> schedule" / "off";
+ *      and the shares grid reloads after the save job on SUCCESS and FAILURE.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -1888,7 +1896,6 @@ async function poolImportChecks() {
   ok('import: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
-
 // ============================================================================
 //  4. Datasets: filesystem vs volume — what each one sends, and what a volume
 //     row does to the toolbar (story iscsi.3)
@@ -2537,7 +2544,6 @@ async function pveReloadRestoreChecks() {
 
   ok('reload-restore: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
-
 
 // ============================================================================
 //  5. iSCSI: targets, ACLs/CHAP and LUNs — what each dialog SENDS (story iscsi.4)
@@ -6414,7 +6420,6 @@ async function iscsiPortalWarningChecks() {
   ok('portal: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
-
 // ============================================================================
 //  5c. backup2.6 — the RESTORE doors: what each mode SENDS
 //
@@ -9554,6 +9559,245 @@ await disksStaleHealthChecks()
 warnings.length = 0
 created.windows.length = 0
 await shareUsersChecks()
+
+// ============================================================================
+//  SMB Self-service (smbsvc.1) — the Previous Versions row: what the dialog
+//  SENDS (the §2 set / keep contract), the greyed custom-`vfs objects` state,
+//  the detail sentence, and reload on success AND failure
+// ============================================================================
+
+const SMB_SHARE = {
+  name: 'media',
+  path: '/tank/media',
+  comment: null,
+  browseable: true,
+  readOnly: false,
+  guestOk: false,
+  validUsers: [],
+  hostsAllow: [],
+  hostsDeny: [],
+}
+
+function smbSelfServiceRoutes(shares) {
+  return {
+    'GET /shares/smb': { data: shares },
+    'GET /shares/nfs': { data: [] },
+    'GET /identity/users': { data: [] },
+    'GET /identity/groups': { data: [] },
+    'GET /shares/smb/media': { data: { ...SMB_SHARE, connections: [] } },
+  }
+}
+
+async function openSharesView(routes) {
+  // Real bundle order: 10-api.js carries ANAS.smb (the custom-vfs rule the
+  // dialog's greyed state decides from), 70-shares.js the view.
+  const ANAS = loadSource(['10-api.js', '70-shares.js'], routes)
+  const view = makeComponent(ANAS.views.shares.factory('harness'), null)
+  const grid = view.down('#sharesGrid')
+  grid.fireEvent('afterrender', grid)
+  await settle()
+  return { ANAS, view, grid }
+}
+
+const smbSharesGets = () => apiGets.filter(p => p === '/shares/smb').length
+
+/** Click a Shares toolbar button by cls — the handlers read btn.up('grid'). */
+function clickTbar(grid, cls) {
+  const b = findCmp(grid, cls)
+  b.handler(b)
+  return b
+}
+
+async function smbSelfServiceChecks() {
+  // --- (a) CREATE: the fieldset frame, the fresh-enable note, and that a
+  // ticked box sends { enabled: true } while an unticked one sends nothing.
+  let { grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE]))
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  let dlg = openWindow()
+  ok('smb-self: the create dialog has the Self-service fieldset', !!dlg && !!dlg.down('#selfService'))
+  let pv = dlg && dlg.down('#previousVersions')
+  ok('smb-self: the Previous Versions box starts unticked and live',
+    !!pv && pv.checked === false && pv.disabled === false)
+  ok('smb-self: an unticked box shows no note',
+    !!dlg && dlg.down('#previousVersionsNote').hidden === true)
+  if (dlg && pv) {
+    pv.setValue(true)
+    const note = dlg.down('#previousVersionsNote')
+    ok('smb-self: a fresh enable names the empty-until-a-schedule note',
+      note.hidden === false && /finest snapshot schedule/.test(note.html)
+        && /Snapshots menu/.test(note.html), note.html)
+    dlg.down('#name').setValue('videos')
+    dlg.down('#path').setValue('/tank/videos')
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-self: a ticked create sends previousVersions { enabled: true }',
+      jobs[0] && jobs[0].body && jobs[0].body.previousVersions, { enabled: true })
+  }
+  created.windows.length = 0
+
+  // …and an unticked create sends NO previousVersions key (omitted = keep).
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  dlg = openWindow()
+  if (dlg) {
+    dlg.down('#name').setValue('videos')
+    dlg.down('#path').setValue('/tank/videos')
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    ok('smb-self: an unticked create omits previousVersions',
+      !!jobs[0] && !('previousVersions' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
+  }
+  created.windows.length = 0
+
+  // --- (b) EDIT, feature already on: the box starts ticked with the bucket
+  // sentence; an untouched save sends NO previousVersions key and the SAME
+  // body it always did (the byte-identical no-op); unticking sends
+  // { enabled: false }.
+  const pvOn = { ...SMB_SHARE, previousVersions: { bucket: 'hourly' } }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([pvOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  pv = dlg && dlg.down('#previousVersions')
+  ok('smb-self: an on share opens the edit box TICKED', !!pv && pv.checked === true)
+  ok('smb-self: the ticked edit names the bucket schedule',
+    !!dlg && dlg.down('#previousVersionsNote').hidden === false
+      && /exposes the hourly schedule's snapshots/.test(dlg.down('#previousVersionsNote').html),
+    dlg && dlg.down('#previousVersionsNote').html)
+  if (dlg && pv) {
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-self: an untouched edit PUTs the body it always did (no previousVersions key)', jobs[0] && jobs[0].body, {
+      path: '/tank/media',
+      comment: '',
+      browseable: true,
+      readOnly: false,
+      guestOk: false,
+      validUsers: [],
+      hostsAllow: [],
+      hostsDeny: [],
+    })
+
+    // Untick → the explicit off.
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#previousVersions').setValue(false)
+    ok('smb-self: unticking clears the note', dlg.down('#previousVersionsNote').hidden === true)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-self: unticking sends previousVersions { enabled: false }',
+      jobs[0] && jobs[0].body && jobs[0].body.previousVersions, { enabled: false })
+  }
+  created.windows.length = 0
+
+  // --- (c) The greyed state: a hand-made `vfs objects` line disables the row
+  // with the reason; an ANAS-composed line (the feature itself on) does NOT.
+  const custom = { ...SMB_SHARE, name: 'media', vfsObjects: ['media_audit'] }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([custom])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  pv = dlg && dlg.down('#previousVersions')
+  ok('smb-self: a custom vfs objects line DISABLES the Previous Versions box', !!pv && pv.disabled === true)
+  ok('smb-self: the greyed row carries the refusal sentence',
+    !!dlg && dlg.down('#previousVersionsNote').hidden === false
+      && /custom vfs objects line/.test(dlg.down('#previousVersionsNote').html),
+    dlg && dlg.down('#previousVersionsNote').html)
+  created.windows.length = 0
+
+  const anasLine = {
+    ...SMB_SHARE,
+    vfsObjects: ['shadow_copy2'],
+    previousVersions: { bucket: 'daily' },
+  }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([anasLine])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  pv = dlg && dlg.down('#previousVersions')
+  ok('smb-self: an ANAS-composed vfs line does NOT grey the box', !!pv && pv.disabled === false)
+  created.windows.length = 0
+
+  // --- (d) The detail window: "Previous Versions: on — <bucket> schedule" / off.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([pvOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  let dwin = openWindow()
+  let summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-self(detail): an on share reads "on — <bucket> schedule"',
+    /Previous Versions:<\/b> on — hourly schedule/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-self(detail): an off share reads "off"',
+    /Previous Versions:<\/b> off/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  // --- (e) Timeliness: the shares grid reloads after the job completes —
+  // and after it FAILS (the daemon's refusal sentence rides the failure
+  // alert; the reload is the dialog's own duty).
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  jobs.length = 0
+  apiGets.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+  await settle()
+  ok('smb-self: the grid reloaded on SUCCESS', smbSharesGets() > 0, JSON.stringify(apiGets))
+  if (typeof jobs[0].onFailed === 'function') {
+    const afterSuccess = smbSharesGets()
+    apiGets.length = 0
+    jobs[0].onFailed({ error: { message: 'share \'media\' has a custom vfs objects line — remove it before enabling self-service features' } })
+    await settle()
+    ok('smb-self: the grid reloaded on FAILURE too', smbSharesGets() > 0, JSON.stringify(apiGets))
+  } else {
+    ok('smb-self: onFailed reaches the poll', false, 'no onFailed recorded')
+  }
+  created.windows.length = 0
+
+  // …and the REMOVE flow (confirmAndRun) obeys the same rule.
+  jobs.length = 0
+  apiGets.length = 0
+  clickTbar(grid, 'anas-btn-share-remove')
+  await settle()
+  ok('smb-self(remove): the grid reloaded on SUCCESS', smbSharesGets() > 0, JSON.stringify(apiGets))
+  if (typeof jobs[0].onFailed === 'function') {
+    apiGets.length = 0
+    jobs[0].onFailed({ error: { message: 'smbshare removal failed' } })
+    await settle()
+    ok('smb-self(remove): the grid reloaded on FAILURE too', smbSharesGets() > 0, JSON.stringify(apiGets))
+  } else {
+    ok('smb-self(remove): onFailed reaches the poll', false, 'no onFailed recorded')
+  }
+  created.windows.length = 0
+
+  ok('smb-self: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// Story smbsvc.1 — the SMB dialog's Self-service fieldset (Previous Versions):
+// set/keep on the wire, the custom-vfs greyed state, the detail sentence, and
+// reload on success AND failure.
+warnings.length = 0
+created.windows.length = 0
+await smbSelfServiceChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

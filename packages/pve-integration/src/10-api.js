@@ -713,4 +713,45 @@
             return null;
         },
     };
+
+    // ---- Shared SMB self-service rule (smbsvc.1) ---------------------------
+    //
+    // The browser bundle cannot import @anas/shared, so the custom-`vfs objects`
+    // rule the daemon refuses on (packages/daemon/src/parsers/smb-conf.ts,
+    // `hasCustomVfsObjects` + `composeVfsObjects`) is duplicated here — the same
+    // ONE-permitted-duplicate situation as `GUEST_NAME_RE` above. It is pure over
+    // the SmbShare read-model (the module list plus the feature states derived
+    // from the stanza), so the dialog's greyed row and the daemon's 400 can
+    // never disagree about WHICH shares carry a hand-made line.
+
+    ANAS.smb = {
+        // The `vfs objects` module list the composer writes for a feature set —
+        // the ground-truthed order on Samba 4.22, mirrored from the daemon.
+        // `null` = no feature on → the line is removed, never left empty.
+        composeVfsObjects: function (features) {
+            var modules = [];
+            if (features.timeMachine) { modules.push('catia', 'fruit', 'streams_xattr'); }
+            if (features.previousVersions) { modules.push('shadow_copy2'); }
+            if (features.recycle) { modules.push('recycle'); }
+            return modules.length > 0 ? modules.join(' ') : null;
+        },
+
+        // Is this share's `vfs objects` line CUSTOM — i.e. not composed the way
+        // ANAS writes it, so no self-service feature may be enabled on the
+        // share? A share with no such line is never custom. A line that is
+        // exactly the composer's output for the features that read as on is
+        // ANAS's (enabling another feature onto it is fine).
+        hasCustomVfsObjects: function (share) {
+            share = share || {};
+            var vfs = share.vfsObjects;
+            if (!vfs || !vfs.length) { return false; }
+            var composed = ANAS.smb.composeVfsObjects({
+                previousVersions: share.previousVersions != null,
+                recycle: share.recycle != null,
+                timeMachine: share.timeMachine != null,
+            });
+            if (composed === null) { return true; }
+            return vfs.join(' ') !== composed;
+        },
+    };
 })();

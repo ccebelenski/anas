@@ -20,6 +20,15 @@
  * SMB Settings surfaces the 5c network-binding levers: interfaces +
  * bind interfaces only, alongside workgroup / server string.
  *
+ * The SMB dialog's "Self-service" fieldset (DESIGN "Self-service on SMB
+ * shares", smbsvc.1–3) carries one row per per-share feature the user
+ * toggles for their own clients — Previous Versions (smbsvc.1) for now;
+ * Recycle and Time Machine join the fieldset in smbsvc.2/.3. Each row is a
+ * checkbox + a read-only sentence the dialog fills; a share whose `vfs
+ * objects` line is hand-made (ANAS.smb.hasCustomVfsObjects, the daemon's
+ * own refusal rule) greys its row with the reason instead of sending a
+ * mutation the daemon would refuse 400.
+ *
  * ANAS.shares.openSmbCreate / openNfsCreate are exported so 60-datasets.js can
  * offer a contextual "Share…" action pre-filled from a filesystem dataset's
  * mountpoint (this file loads after 60 in lexical concat order; the datasets
@@ -47,7 +56,10 @@
  * field hooks 'anas-fld-smb-name' / 'anas-fld-smb-path' / 'anas-fld-valid-users'
  * / 'anas-fld-hosts-allow' / 'anas-fld-hosts-deny' / 'anas-fld-nfs-path' /
  * 'anas-fld-client-spec' / 'anas-fld-client-options' / 'anas-fld-workgroup' /
- * 'anas-fld-server-string' / 'anas-fld-interfaces'; details window
+ * 'anas-fld-server-string' / 'anas-fld-interfaces'; the SMB dialog's
+ * Self-service fieldset (smbsvc.1) 'anas-fld-smb-self-service' /
+ * 'anas-fld-smb-previous-versions' / 'anas-fld-smb-previous-versions-note';
+ * details window
  * 'anas-fld-details-addr' / 'anas-fld-connect' / 'anas-btn-copy'.
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
@@ -449,11 +461,64 @@
         });
     }
 
+    // ---- SMB self-service: Previous Versions (smbsvc.1) -------------------
+    //
+    // DESIGN "Self-service on SMB shares" — the row's read-only sentence. The
+    // daemon picks the schedule bucket (the finest schedule on the share's
+    // dataset, `daily` when none) and the stanza is the store, so the dialog
+    // only ever DISPLAYS it: the share's detail carries the bucket when the
+    // feature reads as on, and a fresh enable names the note instead. The
+    // other refusal states (a flat-layout AHR pool, a path on neither ZFS nor
+    // AHR) are not decidable from the share read-model — the row stays live
+    // there and the daemon's 400 sentence reaches the operator in the job
+    // alert (the existing reload-as-side-effect path).
+
+    var SMB_PV_GREY_REASON = 'this share has a custom vfs objects line — '
+        + 'remove it first';
+
+    // The sentence beside a TICKED box: the bucket the share exposes when the
+    // detail already carries one (an edit), the empty-until-a-schedule-runs
+    // note for a fresh enable.
+    function smbPvNoteText(share) {
+        var bucket = share && share.previousVersions && share.previousVersions.bucket;
+        if (bucket) {
+            return t('exposes the') + ' ' + bucket + ' ' + t("schedule's snapshots");
+        }
+        return t("Previous Versions will expose this share's finest snapshot "
+            + 'schedule; it stays empty until a schedule on this dataset runs (Snapshots menu)');
+    }
+
+    // The row's read-only sentence: the reason when greyed (stands in every
+    // box state — the row is hands-off until the line is removed), the note
+    // when ticked, nothing when unticked.
+    function syncSmbPvNote(win, share, greyed) {
+        var note = win.down('#previousVersionsNote');
+        var box = win.down('#previousVersions');
+        if (!note || !box) {
+            return;
+        }
+        var text = greyed ? t(SMB_PV_GREY_REASON)
+            : (box.getValue() ? smbPvNoteText(share) : '');
+        if (!text) {
+            note.setHtml('');
+            note.setHidden(true);
+            return;
+        }
+        note.setHtml('<div style="color:#888;font-size:11px;">' + enc(text) + '</div>');
+        note.setHidden(false);
+    }
+
     // ---- SMB share create / edit ------------------------------------------
 
     function openSmbShareWindow(node, existing, preset, onDone) {
         var isEdit = !!existing;
         preset = preset || {};
+        // The greyed-with-reason state (smbsvc.1): a share whose `vfs objects`
+        // line is hand-made cannot enable a self-service feature — the SAME
+        // rule the daemon refuses on (ANAS.smb, 10-api.js), so the dialog
+        // never offers a toggle the daemon would 400. Static for the dialog's
+        // life: the stanza's line does not change while it is open.
+        var pvGreyed = !!(isEdit && existing && ANAS.smb.hasCustomVfsObjects(existing));
         var userGroupStore = Ext.create('Ext.data.Store', {
             fields: ['name'],
             data: [],
@@ -556,6 +621,36 @@
                             fieldLabel: t('Hosts deny'),
                             value: isEdit ? (existing.hostsDeny || []).join(', ') : '',
                         },
+                        {
+                            // Self-service (smbsvc.1): per-share features the
+                            // user's own clients use. Recycle and Time Machine
+                            // join as further rows in smbsvc.2/.3.
+                            xtype: 'fieldset',
+                            itemId: 'selfService',
+                            cls: 'anas-fld-smb-self-service',
+                            title: t('Self-service'),
+                            defaults: { anchor: '100%', labelWidth: 160 },
+                            items: [
+                                {
+                                    xtype: 'checkboxfield',
+                                    itemId: 'previousVersions',
+                                    cls: 'anas-fld-smb-previous-versions',
+                                    fieldLabel: t('Previous Versions'),
+                                    boxLabel: t('Let users restore old files from the snapshot schedule'),
+                                    checked: isEdit && !!existing.previousVersions,
+                                    disabled: pvGreyed,
+                                },
+                                {
+                                    // The read-only sentence beside the box —
+                                    // filled by syncSmbPvNote below.
+                                    xtype: 'component',
+                                    itemId: 'previousVersionsNote',
+                                    cls: 'anas-fld-smb-previous-versions-note',
+                                    hidden: true,
+                                    html: '',
+                                },
+                            ],
+                        },
                     ],
                 }],
                 buttons: [
@@ -583,6 +678,15 @@
             return;
         }
         win.show();
+        var pvBox = win.down('#previousVersions');
+        if (pvBox) {
+            pvBox.on('change', function () {
+                syncSmbPvNote(win, existing, pvGreyed);
+            });
+        }
+        // The initial sentence: the greyed reason, the bucket note for a
+        // ticked edit, nothing for an unticked one.
+        syncSmbPvNote(win, existing, pvGreyed);
         loadShareIdentity(node, userGroupStore);
     }
 
@@ -619,6 +723,19 @@
             hostsDeny: hostsDeny,
         };
 
+        // Self-service Previous Versions (smbsvc.1) — the §2 three-valued
+        // contract: value = set, omitted = keep. The checkbox IS the feature
+        // state (no separate clear gesture), so send `{ enabled: … }` ONLY
+        // when the operator changed it and an untouched edit stays
+        // byte-identical. A greyed box is disabled and cannot change, so it
+        // never sends a mutation the daemon would refuse 400.
+        var pvBox = win.down('#previousVersions');
+        var pvWasOn = !!(isEdit && existing && existing.previousVersions);
+        var pvNowOn = pvBox ? !!pvBox.getValue() : pvWasOn;
+        if (pvNowOn !== pvWasOn) {
+            body.previousVersions = { enabled: pvNowOn };
+        }
+
         var method;
         var url;
         var label;
@@ -645,6 +762,14 @@
                 if (!win.destroyed && !win.destroying) {
                     win.close();
                 }
+                if (onDone) {
+                    onDone();
+                }
+            },
+            // Timeliness (smbsvc.1): the grid reflects the share's real state
+            // even when the job fails — the daemon's refusal sentence itself
+            // rides the failure alert above. The dialog stays open for a retry.
+            onFailed: function () {
                 if (onDone) {
                     onDone();
                 }
@@ -1026,6 +1151,9 @@
             successMsg: t('Removed') + ' ' + label,
             maxMs: 30000,
             onComplete: function () { loadShares(grid, node); },
+            // The same timeliness rule as the save dialog (smbsvc.1): the
+            // grid reflects reality even when the removal fails.
+            onFailed: function () { loadShares(grid, node); },
             confirmWindow: true,
             confirmTitle: proto === 'smb' ? 'Remove SMB share' : 'Remove NFS export',
             confirmWidth: 480,
@@ -1103,6 +1231,14 @@
             if (ha.length) {
                 lines.push('<b>' + t('Hosts allow') + ':</b> ' + enc(ha.join(', ')));
             }
+            // Self-service state (smbsvc.1): which snapshot schedule bucket
+            // the share exposes — the daemon's pick, parsed back from the
+            // stanza — or off.
+            var pv = raw.previousVersions;
+            lines.push('<b>' + t('Previous Versions') + ':</b> '
+                + (pv && pv.bucket
+                    ? t('on') + ' — ' + enc(pv.bucket) + ' ' + t('schedule')
+                    : t('off')));
         } else {
             lines.push('<b>' + t('NFS export') + ':</b> ' + enc(raw.path));
             var clients = raw.clients || [];
