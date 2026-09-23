@@ -116,6 +116,15 @@
  *      sentence (ANAS.smb — the daemon's own rule; an ANAS-composed line does
  *      not grey); the detail window reads "on — <bucket> schedule" / "off";
  *      and the shares grid reloads after the save job on SUCCESS and FAILURE.
+ *   9. SMB Recycle bin (smbsvc.2): the Recycle bin row obeys the same §2
+ *      contract with the purge combo as its value — a ticked create sends
+ *      `{ purgeDays: 30 }` (the combo default), a purge-age change sends the
+ *      new value (`never` = `purgeDays: null`), unticking sends `null`, and
+ *      an untouched edit sends NO `recycle` key (a byte-identical body).
+ *      The combo is live exactly while the box is ticked; a custom
+ *      `vfs objects` line greys BOTH rows with the SAME refusal sentence;
+ *      the detail window reads "on — purge after 30 days" / "on — never
+ *      purged" / "off".
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -9787,6 +9796,155 @@ async function smbSelfServiceChecks() {
   } else {
     ok('smb-self(remove): onFailed reaches the poll', false, 'no onFailed recorded')
   }
+  created.windows.length = 0
+
+  // --- (f) Recycle bin (smbsvc.2): the row, the §2 set/keep contract on
+  // purge age, the shared greyed state, and the detail sentences.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  dlg = openWindow()
+  let rc = dlg && dlg.down('#recycle')
+  let rcPurge = dlg && dlg.down('#recyclePurge')
+  ok('smb-recycle: the create dialog has the Recycle bin row',
+    !!rc && !!rcPurge && rc.checked === false && rc.disabled === false
+      && rcPurge.disabled === true, JSON.stringify({ rc: !!rc, purge: !!rcPurge }))
+  ok('smb-recycle: the purge combo defaults to 30 days',
+    !!rcPurge && rcPurge.getValue() === '30', rcPurge && rcPurge.getValue())
+  if (dlg && rc) {
+    rc.setValue(true)
+    ok('smb-recycle: ticking enables the purge combo and shows the #recycle note',
+      rcPurge.disabled === false && dlg.down('#recycleNote').hidden === false
+        && /#recycle folder/.test(dlg.down('#recycleNote').html)
+        && /Turning this off leaves #recycle in place/.test(dlg.down('#recycleNote').html),
+      dlg.down('#recycleNote').html)
+    dlg.down('#name').setValue('videos')
+    dlg.down('#path').setValue('/tank/videos')
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-recycle: a ticked create sends recycle { purgeDays: 30 }',
+      jobs[0] && jobs[0].body && jobs[0].body.recycle, { purgeDays: 30 })
+  }
+  created.windows.length = 0
+
+  // EDIT on a share with the feature already on (the ANAS-composed line):
+  // the box opens ticked with the stored age, an untouched save sends NO
+  // recycle key and the byte-identical body, an age change sends the new
+  // age, an untick sends null.
+  const rcOn = { ...SMB_SHARE, vfsObjects: ['recycle'], recycle: { purgeDays: 30 } }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([rcOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  rc = dlg && dlg.down('#recycle')
+  rcPurge = dlg && dlg.down('#recyclePurge')
+  ok('smb-recycle: an on share opens the edit box TICKED with the combo live',
+    !!rc && rc.checked === true && rc.disabled === false
+      && !!rcPurge && rcPurge.disabled === false)
+  ok('smb-recycle: the purge combo reads the stored 30 days',
+    !!rcPurge && rcPurge.getValue() === '30', rcPurge && rcPurge.getValue())
+  if (dlg && rc) {
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    ok('smb-recycle: an untouched edit sends NO recycle key',
+      !!jobs[0] && !('recycle' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
+    eq('smb-recycle: an untouched edit PUTs the body it always did', jobs[0] && jobs[0].body, {
+      path: '/tank/media',
+      comment: '',
+      browseable: true,
+      readOnly: false,
+      guestOk: false,
+      validUsers: [],
+      hostsAllow: [],
+      hostsDeny: [],
+    })
+
+    // Purge-age change on an already-on share → the new age (`never` = null).
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#recyclePurge').setValue('never')
+    ok('smb-recycle: choosing never keeps the note up',
+      dlg.down('#recycleNote').hidden === false)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-recycle: changing the purge age to never sends recycle { purgeDays: null }',
+      jobs[0] && jobs[0].body && jobs[0].body.recycle, { purgeDays: null })
+
+    // Untick → the explicit off.
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#recycle').setValue(false)
+    ok('smb-recycle: unticking hides the note and disables the combo',
+      dlg.down('#recycleNote').hidden === true
+        && dlg.down('#recyclePurge').disabled === true)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-recycle: unticking sends recycle null',
+      jobs[0] && jobs[0].body && jobs[0].body.recycle, null)
+  }
+  created.windows.length = 0
+
+  // The greyed state: a hand-made `vfs objects` line disables BOTH rows,
+  // each carrying the SAME refusal sentence.
+  const rcCustom = { ...SMB_SHARE, vfsObjects: ['media_audit'] }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([rcCustom])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  rc = dlg && dlg.down('#recycle')
+  ok('smb-recycle: a custom vfs objects line DISABLES the Recycle bin row',
+    !!rc && rc.disabled === true && dlg.down('#recyclePurge').disabled === true)
+  ok('smb-recycle: the greyed row carries the SAME refusal sentence as Previous Versions',
+    !!dlg && dlg.down('#recycleNote').hidden === false
+      && /custom vfs objects line/.test(dlg.down('#recycleNote').html)
+      && /custom vfs objects line/.test(dlg.down('#previousVersionsNote').html),
+    dlg && dlg.down('#recycleNote').html)
+  created.windows.length = 0
+
+  // The detail window: "Recycle bin: on — purge after 30 days" /
+  // "on — never purged" / "off".
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([
+    { ...SMB_SHARE, recycle: { purgeDays: 30 } },
+  ])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-recycle(detail): an on share reads "on — purge after 30 days"',
+    /Recycle bin:<\/b> on — purge after 30 days/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([
+    { ...SMB_SHARE, recycle: { purgeDays: null } },
+  ])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-recycle(detail): a never-purged share reads "on — never purged"',
+    /Recycle bin:<\/b> on — never purged/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-recycle(detail): an off share reads "off"',
+    /Recycle bin:<\/b> off/.test(summary || ''), summary)
   created.windows.length = 0
 
   ok('smb-self: nothing warned', warnings.length === 0, warnings.join(' | '))

@@ -22,8 +22,8 @@
  *
  * The SMB dialog's "Self-service" fieldset (DESIGN "Self-service on SMB
  * shares", smbsvc.1–3) carries one row per per-share feature the user
- * toggles for their own clients — Previous Versions (smbsvc.1) for now;
- * Recycle and Time Machine join the fieldset in smbsvc.2/.3. Each row is a
+ * toggles for their own clients — Previous Versions (smbsvc.1) and the
+ * Recycle bin (smbsvc.2) for now; Time Machine joins in smbsvc.3. Each row is a
  * checkbox + a read-only sentence the dialog fills; a share whose `vfs
  * objects` line is hand-made (ANAS.smb.hasCustomVfsObjects, the daemon's
  * own refusal rule) greys its row with the reason instead of sending a
@@ -57,8 +57,10 @@
  * / 'anas-fld-hosts-allow' / 'anas-fld-hosts-deny' / 'anas-fld-nfs-path' /
  * 'anas-fld-client-spec' / 'anas-fld-client-options' / 'anas-fld-workgroup' /
  * 'anas-fld-server-string' / 'anas-fld-interfaces'; the SMB dialog's
- * Self-service fieldset (smbsvc.1) 'anas-fld-smb-self-service' /
- * 'anas-fld-smb-previous-versions' / 'anas-fld-smb-previous-versions-note';
+ * Self-service fieldset (smbsvc.1/.2) 'anas-fld-smb-self-service' /
+ * 'anas-fld-smb-previous-versions' / 'anas-fld-smb-previous-versions-note' /
+ * 'anas-fld-smb-recycle' / 'anas-fld-smb-recycle-purge' /
+ * 'anas-fld-smb-recycle-note';
  * details window
  * 'anas-fld-details-addr' / 'anas-fld-connect' / 'anas-btn-copy'.
  *
@@ -473,8 +475,17 @@
     // there and the daemon's 400 sentence reaches the operator in the job
     // alert (the existing reload-as-side-effect path).
 
-    var SMB_PV_GREY_REASON = 'this share has a custom vfs objects line — '
+    var SMB_SELF_SERVICE_GREY_REASON = 'this share has a custom vfs objects line — '
         + 'remove it first';
+
+    // The recycle row's sentence (smbsvc.2), shown while the box is ticked —
+    // the same note treatment as Previous Versions. It carries the ground
+    // truth (GT 2026-09-22): deleting inside #recycle is a real delete (the
+    // module never nests a bin), and turning the feature off never deletes
+    // data — the existing bin just stays.
+    var SMB_RECYCLE_NOTE = 'Deleted files move to a #recycle folder at the share root, '
+        + 'keeping their path. Files deleted from #recycle are gone for real; deleting '
+        + 'the folder empties the bin. Turning this off leaves #recycle in place.';
 
     // The sentence beside a TICKED box: the bucket the share exposes when the
     // detail already carries one (an edit), the empty-until-a-schedule-runs
@@ -488,17 +499,17 @@
             + 'schedule; it stays empty until a schedule on this dataset runs (Snapshots menu)');
     }
 
-    // The row's read-only sentence: the reason when greyed (stands in every
-    // box state — the row is hands-off until the line is removed), the note
+    // One row's note: the reason when greyed (stands in every box state —
+    // the row is hands-off until the line is removed), the row's sentence
     // when ticked, nothing when unticked.
-    function syncSmbPvNote(win, share, greyed) {
-        var note = win.down('#previousVersionsNote');
-        var box = win.down('#previousVersions');
+    function syncSmbRowNote(win, noteId, boxId, tickedText, greyed) {
+        var note = win.down(noteId);
+        var box = win.down(boxId);
         if (!note || !box) {
             return;
         }
-        var text = greyed ? t(SMB_PV_GREY_REASON)
-            : (box.getValue() ? smbPvNoteText(share) : '');
+        var text = greyed ? t(SMB_SELF_SERVICE_GREY_REASON)
+            : (box.getValue() ? tickedText : '');
         if (!text) {
             note.setHtml('');
             note.setHidden(true);
@@ -508,17 +519,53 @@
         note.setHidden(false);
     }
 
+    // The Self-service fieldset (smbsvc.1/.2): BOTH rows share the same
+    // custom-`vfs objects` rule and sentence — one greyed state, one helper,
+    // no copy. The purge combo is live exactly while its box is ticked.
+    function syncSmbSelfServiceNotes(win, share, greyed) {
+        syncSmbRowNote(win, '#previousVersionsNote', '#previousVersions',
+            smbPvNoteText(share), greyed);
+        var recycleBox = win.down('#recycle');
+        syncSmbRowNote(win, '#recycleNote', '#recycle', t(SMB_RECYCLE_NOTE), greyed);
+        var purgeCombo = win.down('#recyclePurge');
+        if (purgeCombo) {
+            purgeCombo.setDisabled(greyed || !(recycleBox && recycleBox.getValue()));
+        }
+    }
+
+    // The purge combo's value as the wire shape: the `never` entry maps to
+    // `null`, the days entries to their number.
+    function smbPurgeDaysValue(win) {
+        var combo = win.down('#recyclePurge');
+        var v = combo ? combo.getValue() : null;
+        if (v === 'never') {
+            return null;
+        }
+        var days = parseInt(v, 10);
+        return isNaN(days) ? 30 : days;
+    }
+
     // ---- SMB share create / edit ------------------------------------------
 
     function openSmbShareWindow(node, existing, preset, onDone) {
         var isEdit = !!existing;
         preset = preset || {};
-        // The greyed-with-reason state (smbsvc.1): a share whose `vfs objects`
-        // line is hand-made cannot enable a self-service feature — the SAME
-        // rule the daemon refuses on (ANAS.smb, 10-api.js), so the dialog
-        // never offers a toggle the daemon would 400. Static for the dialog's
-        // life: the stanza's line does not change while it is open.
-        var pvGreyed = !!(isEdit && existing && ANAS.smb.hasCustomVfsObjects(existing));
+        // The greyed-with-reason state (smbsvc.1, shared with the recycle row
+        // in smbsvc.2): a share whose `vfs objects` line is hand-made cannot
+        // enable a self-service feature — the SAME rule the daemon refuses on
+        // (ANAS.smb, 10-api.js), so the dialog never offers a toggle the
+        // daemon would 400. Static for the dialog's life: the stanza's line
+        // does not change while it is open.
+        var selfServiceGreyed = !!(isEdit && existing
+            && ANAS.smb.hasCustomVfsObjects(existing));
+        // The stored purge age on an edit (`never` when the marker is absent
+        // or says so), 30 days otherwise — the combo's default and what a
+        // fresh enable sends.
+        var recyclePurgeInitial = '30';
+        if (isEdit && existing && existing.recycle) {
+            recyclePurgeInitial = existing.recycle.purgeDays == null
+                ? 'never' : String(existing.recycle.purgeDays);
+        }
         var userGroupStore = Ext.create('Ext.data.Store', {
             fields: ['name'],
             data: [],
@@ -622,9 +669,9 @@
                             value: isEdit ? (existing.hostsDeny || []).join(', ') : '',
                         },
                         {
-                            // Self-service (smbsvc.1): per-share features the
-                            // user's own clients use. Recycle and Time Machine
-                            // join as further rows in smbsvc.2/.3.
+                            // Self-service (smbsvc.1/.2): per-share features
+                            // the user's own clients use. Time Machine joins
+                            // as a further row in smbsvc.3.
                             xtype: 'fieldset',
                             itemId: 'selfService',
                             cls: 'anas-fld-smb-self-service',
@@ -638,14 +685,59 @@
                                     fieldLabel: t('Previous Versions'),
                                     boxLabel: t('Let users restore old files from the snapshot schedule'),
                                     checked: isEdit && !!existing.previousVersions,
-                                    disabled: pvGreyed,
+                                    disabled: selfServiceGreyed,
                                 },
                                 {
                                     // The read-only sentence beside the box —
-                                    // filled by syncSmbPvNote below.
+                                    // filled by syncSmbSelfServiceNotes below.
                                     xtype: 'component',
                                     itemId: 'previousVersionsNote',
                                     cls: 'anas-fld-smb-previous-versions-note',
+                                    hidden: true,
+                                    html: '',
+                                },
+                                {
+                                    // Recycle bin (smbsvc.2): vfs_recycle on
+                                    // the share, purge age its only knob.
+                                    xtype: 'checkboxfield',
+                                    itemId: 'recycle',
+                                    cls: 'anas-fld-smb-recycle',
+                                    fieldLabel: t('Recycle bin'),
+                                    boxLabel: t('Let users recover deleted files'),
+                                    checked: isEdit && !!existing.recycle,
+                                    disabled: selfServiceGreyed,
+                                },
+                                {
+                                    xtype: 'combobox',
+                                    itemId: 'recyclePurge',
+                                    cls: 'anas-fld-smb-recycle-purge',
+                                    fieldLabel: t('Purge deleted files after'),
+                                    store: {
+                                        fields: ['val', 'label'],
+                                        data: [
+                                            { val: '7', label: t('7 days') },
+                                            { val: '14', label: t('14 days') },
+                                            { val: '30', label: t('30 days') },
+                                            { val: '90', label: t('90 days') },
+                                            { val: 'never', label: t('never') },
+                                        ],
+                                    },
+                                    displayField: 'label',
+                                    valueField: 'val',
+                                    queryMode: 'local',
+                                    editable: false,
+                                    forceSelection: true,
+                                    value: recyclePurgeInitial,
+                                    // Live exactly while the box is ticked;
+                                    // synced by syncSmbSelfServiceNotes below.
+                                    disabled: true,
+                                },
+                                {
+                                    // The sentence under the row — filled by
+                                    // syncSmbSelfServiceNotes below.
+                                    xtype: 'component',
+                                    itemId: 'recycleNote',
+                                    cls: 'anas-fld-smb-recycle-note',
                                     hidden: true,
                                     html: '',
                                 },
@@ -681,12 +773,20 @@
         var pvBox = win.down('#previousVersions');
         if (pvBox) {
             pvBox.on('change', function () {
-                syncSmbPvNote(win, existing, pvGreyed);
+                syncSmbSelfServiceNotes(win, existing, selfServiceGreyed);
             });
         }
-        // The initial sentence: the greyed reason, the bucket note for a
-        // ticked edit, nothing for an unticked one.
-        syncSmbPvNote(win, existing, pvGreyed);
+        var recycleBox = win.down('#recycle');
+        if (recycleBox) {
+            recycleBox.on('change', function () {
+                syncSmbSelfServiceNotes(win, existing, selfServiceGreyed);
+            });
+        }
+        // The initial sentences: the greyed reason on both rows, the bucket
+        // note for a ticked Previous Versions edit, the #recycle note for a
+        // ticked recycle edit, nothing for unticked ones — and the purge
+        // combo enabled exactly while its box is ticked.
+        syncSmbSelfServiceNotes(win, existing, selfServiceGreyed);
         loadShareIdentity(node, userGroupStore);
     }
 
@@ -734,6 +834,22 @@
         var pvNowOn = pvBox ? !!pvBox.getValue() : pvWasOn;
         if (pvNowOn !== pvWasOn) {
             body.previousVersions = { enabled: pvNowOn };
+        }
+
+        // Self-service Recycle bin (smbsvc.2) — the same §2 three-valued
+        // contract: a tick sends { purgeDays: … } (`never` = `null` inside),
+        // a purge-age change on an already-on share sends the new age, an
+        // untick sends `null`, and an untouched edit sends no key at all.
+        // The combo is disabled while the box is unticked, so it cannot send
+        // an age for a feature that is off.
+        var recycleBox = win.down('#recycle');
+        var recycleWasOn = !!(isEdit && existing && existing.recycle != null);
+        var recycleNowOn = recycleBox ? !!recycleBox.getValue() : recycleWasOn;
+        var purgeDays = smbPurgeDaysValue(win);
+        if (recycleNowOn !== recycleWasOn) {
+            body.recycle = recycleNowOn ? { purgeDays: purgeDays } : null;
+        } else if (recycleNowOn && purgeDays !== existing.recycle.purgeDays) {
+            body.recycle = { purgeDays: purgeDays };
         }
 
         var method;
@@ -1238,6 +1354,15 @@
             lines.push('<b>' + t('Previous Versions') + ':</b> '
                 + (pv && pv.bucket
                     ? t('on') + ' — ' + enc(pv.bucket) + ' ' + t('schedule')
+                    : t('off')));
+            // Recycle bin (smbsvc.2): the effective purge age, parsed back
+            // from the stanza + its marker — or off.
+            var rc = raw.recycle;
+            lines.push('<b>' + t('Recycle bin') + ':</b> '
+                + (rc
+                    ? t('on') + ' — ' + (rc.purgeDays == null
+                        ? t('never purged')
+                        : t('purge after') + ' ' + rc.purgeDays + ' ' + t('days'))
                     : t('off')));
         } else {
             lines.push('<b>' + t('NFS export') + ':</b> ' + enc(raw.path));
