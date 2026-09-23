@@ -385,6 +385,12 @@ export function classifyOptions(
         credentialsFile = value
         continue
       }
+      // `guest` is STRUCTURAL, like `credentials=`: the serializer re-derives
+      // it from the ABSENCE of a credentials file (cifsAuthToken), so a
+      // credential-less line round-trips exactly one `guest` — consumed here,
+      // never parked in passthrough (where it would come back a second time).
+      if (key === 'guest')
+        continue
       // SECURITY (BUG-1): inline `username=`/`password=` are credential tokens,
       // NOT passthrough — lifting them into the structured `inlineCredentials`
       // channel keeps the plaintext password out of `passthrough` (which is
@@ -618,6 +624,21 @@ function applyCifsToken(cifs: MountCifsOptions, key: string, value: string, pass
   return false
 }
 
+/**
+ * The auth token a CIFS entry carries in its option list: its credentials
+ * FILE when there is one, `guest` when there is not. Stated ONCE and taken by
+ * every writer of a CIFS option list — the fstab serializer (below), the
+ * daemon's immediate non-fstab mount (routes/mounts.js), and the preflight
+ * probe (services/mounts.js) — so the three can never drift apart. Without
+ * one of the two, `mount.cifs` PROMPTS for a password on stdin ("Password for
+ * root@//host/share:"); a boot mount (or a `mountNow` with no terminal) then
+ * hangs until `nofail` hides it. `guest` makes the request anonymous instead:
+ * an auth-requiring share answers EACCES, which is honest.
+ */
+export function cifsAuthToken(credentialsFile: string | undefined): string {
+  return credentialsFile ? `credentials=${credentialsFile}` : 'guest'
+}
+
 /** Build the canonical, ordered option-token list for a serialized entry. */
 function buildOptionTokens(entry: MountEntry): string[] {
   const t: string[] = []
@@ -661,8 +682,7 @@ function buildOptionTokens(entry: MountEntry): string[] {
     const cifs = entry.options.cifs
     if (cifs?.vers !== undefined)
       t.push(`vers=${cifs.vers}`)
-    if (entry.credentialsFile !== undefined)
-      t.push(`credentials=${entry.credentialsFile}`)
+    t.push(cifsAuthToken(entry.credentialsFile))
     if (cifs?.domain !== undefined)
       t.push(`domain=${cifs.domain}`)
     if (cifs?.uid !== undefined)
