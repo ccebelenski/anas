@@ -8,7 +8,7 @@ import type { MountTestStages } from '../services/mounts.js'
 import { mkdir, readdir } from 'node:fs/promises'
 import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
 import { classifyKind } from '../parsers/findmnt.js'
-import { addMount, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
+import { addMount, cifsAuthToken, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
 import { confirmGate } from '../safety/gate.js'
 import { diagnoseBusyPath, enrichBusyError, formatHolders } from '../services/busy-diagnosis.js'
@@ -39,6 +39,7 @@ import {
   runMountTest,
   writeCredentialsFile,
 } from '../services/mounts.js'
+import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
 
 const SYSTEMCTL = '/usr/bin/systemctl'
@@ -170,7 +171,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const parsed = CreateMountRequest.safeParse(request.body ?? {})
     if (!parsed.success) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid create mount request: ${parsed.error.issues[0]?.message}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid create mount request: ${zodIssue(parsed.error)}` } }
     }
     const req = parsed.data
 
@@ -188,11 +189,6 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: target.problems.join('; ') } }
     }
-    if (req.type === 'cifs' && !req.credentials) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: 'CIFS mounts require credentials (username/password)' } }
-    }
-
     // Mountpoint safety: never PVE territory; never an existing ZFS dataset.
     if (mountpointReservedByPve(req.mountpoint)) {
       reply.code(400)
@@ -282,7 +278,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const parsed = UpdateMountRequest.safeParse(request.body ?? {})
     if (!parsed.success) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid update mount request: ${parsed.error.issues[0]?.message}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid update mount request: ${zodIssue(parsed.error)}` } }
     }
     const body = parsed.data
 
@@ -375,7 +371,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const parsed = MountStateRequest.safeParse(request.body ?? {})
     if (!parsed.success) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid mount state request: ${parsed.error.issues[0]?.message}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid mount state request: ${zodIssue(parsed.error)}` } }
     }
     const { action } = parsed.data
 
@@ -509,7 +505,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const query = DeleteMountQuery.safeParse(request.query ?? {})
     if (!query.success) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid delete mount query: ${query.error.issues[0]?.message}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid delete mount query: ${zodIssue(query.error)}` } }
     }
     const { removeMountpointDir } = query.data
 
@@ -597,7 +593,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const parsed = MountTestRequest.safeParse(request.body ?? {})
     if (!parsed.success) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Invalid mount test request: ${parsed.error.issues[0]?.message}` } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid mount test request: ${zodIssue(parsed.error)}` } }
     }
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -714,7 +710,7 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const parsed = AbsolutePath.safeParse(raw)
     if (!parsed.success) {
       reply.code(400)
-      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid mountpoint: ${parsed.error.issues[0]?.message}` } })
+      reply.send({ error: { code: 'VALIDATION_ERROR', message: `Invalid mountpoint: ${zodIssue(parsed.error)}` } })
       return null
     }
     return parsed.data
@@ -828,8 +824,10 @@ function serializeInlineOptions(entry: MountEntry): string {
     const cf = entry.options.cifs
     if (cf?.vers)
       t.push(`vers=${cf.vers}`)
-    if (entry.credentialsFile)
-      t.push(`credentials=${entry.credentialsFile}`)
+    // The SAME auth token the fstab line and the preflight probe carry
+    // (parsers/fstab.js): a credential-less CIFS mounts `guest`, never a
+    // prompt.
+    t.push(cifsAuthToken(entry.credentialsFile))
     if (cf?.domain)
       t.push(`domain=${cf.domain}`)
     if (cf?.uid !== undefined)

@@ -23,7 +23,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { MountCifsSec, MountNfsSec, normalizeMountTarget } from '@anas/shared'
 import { classifyKind, isIgnoredMount, optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
-import { getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
+import { cifsAuthToken, getMount, inlineCommentIndex, parseFstab } from '../parsers/fstab.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName } from '../parsers/mdadm-detail.js'
 import { readPveMountPaths } from '../parsers/pve-storage.js'
@@ -1036,8 +1036,9 @@ async function probeMountSpec(executor: CommandExecutor, probe: ProbeMountSpec):
 }
 
 /**
- * The CIFS probe's `-o` list: the version, and either the creds file (an auth
- * probe) or `guest` (a no-credentials probe). Without one of the two,
+ * The CIFS probe's `-o` list: the version plus the SAME auth token the write
+ * path carries (`cifsAuthToken`, parsers/fstab.js) — the creds file for an
+ * auth probe, `guest` for a no-credentials probe. Without one of the two,
  * `mount.cifs` PROMPTS for a password on stdin ("Password for root@//host/
  * share:") — a probe with no terminal then hangs until the timeout and reports
  * "unreachable" for what is really "no credentials supplied". `guest` makes
@@ -1045,10 +1046,7 @@ async function probeMountSpec(executor: CommandExecutor, probe: ProbeMountSpec):
  * maps to the `auth-failed` verdict with its advice.
  */
 function cifsProbeOptions(probe: ProbeMountSpec): string {
-  const opts = `vers=${probe.vers ?? '3.1.1'}`
-  if (probe.credentialsFile)
-    return `${opts},credentials=${probe.credentialsFile}`
-  return `${opts},guest`
+  return `vers=${probe.vers ?? '3.1.1'},${cifsAuthToken(probe.credentialsFile)}`
 }
 
 /**
@@ -1282,8 +1280,11 @@ export function fstabLineFor(fstabText: string, mountpoint: string): string | un
 
 /**
  * Build the structured fstab entry ANAS will write for a create request, with
- * server-side defaults applied. For CIFS, `credentialsFile` points at the
- * per-mount creds path (the secret itself lives only in that 0600 file).
+ * server-side defaults applied. A CIFS WITH credentials gets its
+ * `credentialsFile` pointing at the per-mount creds path (the secret itself
+ * lives only in that 0600 file); a credential-less CIFS carries NO
+ * credentialsFile, so the serializer writes `guest` (cifsAuthToken) and the
+ * mount never prompts.
  */
 export function entryFromRequest(
   req: CreateMountRequest,
@@ -1298,7 +1299,7 @@ export function entryFromRequest(
     dump: 0,
     pass: 0,
   }
-  if (req.type === 'cifs')
+  if (req.type === 'cifs' && req.credentials)
     entry.credentialsFile = credsFilePath(credsDir, req.mountpoint)
   return { entry, warnings }
 }

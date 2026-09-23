@@ -86,6 +86,14 @@ describe('classifyOptions — CIFS credentials + tiers', () => {
     assert.equal(options.passthrough, '')
     assert.equal(inlineCredentials, undefined) // secure entry — no inline creds
   })
+
+  it('consumes `guest` structurally — a credential-less line round-trips exactly one', () => {
+    const { options, credentialsFile } = classifyOptions('cifs', 'guest,x-anas-note=keepme'.split(','))
+    assert.equal(credentialsFile, undefined)
+    assert.equal(options.passthrough, 'x-anas-note=keepme') // guest is NOT parked in passthrough
+    const line = serializeMountLine({ spec: '//nas/share', mountpoint: '/mnt/g', fstype: 'cifs', options, dump: 0, pass: 0 })
+    assert.equal(line, '//nas/share /mnt/g cifs guest,x-anas-note=keepme 0 0')
+  })
 })
 
 describe('classifyOptions — inline plaintext CIFS credentials (BUG-1 security)', () => {

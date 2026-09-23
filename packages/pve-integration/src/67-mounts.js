@@ -58,6 +58,10 @@
  *         forcegid, noserverino, nobrl, sec, iocharset },     (CIFS tier)
  *       extraOptions (free-text passthrough),
  *       credentials:{ username, password, domain } }         (CIFS; write-only)
+ *     CIFS credentials are OPTIONAL: both fields blank sends no credentials
+ *     block (a GUEST mount — the daemon writes `guest`); exactly one filled is
+ *     refused by the dialog (a half-typed pair the schema would reject); a
+ *     stored set on an edit is kept unless a new password is typed.
  *     nofail is FORCED by the daemon (default mode) — the UI shows it locked-on
  *     and does NOT send it as a choice.
  *     THE CLEAR CONTRACT (#34): every value-bearing option travels on EVERY
@@ -1389,8 +1393,15 @@
                 opts.push('nobrl');
             }
             // Credentials live in a root-only file — never inline. Shown in the
-            // preview as the reference the daemon will write.
-            opts.push('credentials=/etc/anas/creds/<mount>.cred');
+            // preview as the reference the daemon will write. An edit that
+            // already carries a credentials set keeps it (a blank password on
+            // save means "unchanged"); a fresh entry with a full pair gets the
+            // file; everything else is a GUEST mount — no creds file, the
+            // `guest` token, exactly as the daemon writes it.
+            var pu = ('' + (valOf(win, '#credUser') || '')).trim();
+            var pp = valOf(win, '#credPass');
+            var hasCreds = (win._stored && win._stored.credsSet) || (pu && pp);
+            opts.push(hasCreds ? 'credentials=/etc/anas/creds/<mount>.cred' : 'guest');
         }
         var extra = ('' + (valOf(win, '#extraOptions') || '')).trim();
         if (extra) {
@@ -2411,7 +2422,14 @@
             // schema carries no server/remotePath). Both fields are read-only
             // here, and Test connection probes these values, never a typed one
             // the save would drop on the floor (issue #38).
-            win._stored = { server: d.server, remotePath: d.remotePath };
+            win._stored = {
+                server: d.server,
+                remotePath: d.remotePath,
+                // Does the entry already carry a credentials set? The preview
+                // shows the creds-file reference only when it does (a blank
+                // password on save keeps the set) — never for a guest entry.
+                credsSet: !!(d.credentials && d.credentials.set),
+            };
             setFld(win, '#server', d.server);
             setFld(win, '#remotePath', d.remotePath);
 
@@ -2615,13 +2633,21 @@
             // typed/pasted secret counts as a rotation on edit (issue #23).
             var passTyped = !!(passFld && passFld._userTyped);
             if (!isEdit) {
-                // Create: credentials are required (the daemon enforces it). Send
-                // whatever was typed; the schema requires username + password.
-                var creds = {};
-                if (user) { creds.username = user; }
-                if (pass) { creds.password = pass; }
-                if (dom) { creds.domain = dom; }
-                body.credentials = creds;
+                // Create: credentials are OPTIONAL — a server may allow guest
+                // access. Both BLANK sends no credentials block at all (the
+                // daemon writes `guest`); exactly ONE filled is a half-typed
+                // pair the schema would refuse, so it is caught here, before
+                // the job, with the guidance the daemon cannot give (it sees
+                // only what was sent).
+                if (!!user !== !!pass) {
+                    ANAS.alertMsg('Invalid input', t('Enter both the SMB username and password, or leave both blank for guest access.'));
+                    return;
+                }
+                if (user && pass) {
+                    var creds = { username: user, password: pass };
+                    if (dom) { creds.domain = dom; }
+                    body.credentials = creds;
+                }
             } else if (pass && passTyped) {
                 // Edit: only ROTATE when a new password is entered. Username and
                 // password travel together (the creds file needs both, and the

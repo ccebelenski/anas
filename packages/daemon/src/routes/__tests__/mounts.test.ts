@@ -177,9 +177,26 @@ describe('mount routes (Epic 18)', () => {
       assert.equal(res.statusCode, 400)
     })
 
-    it('requires credentials for CIFS', async () => {
-      const res = await server!.inject({ method: 'POST', url: '/v1/mounts', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1', remotePath: 'share', mountpoint: join(dir, 'c') }) })
+    it('a credential-less CIFS create is a GUEST mount: `guest` in fstab, no credentials reference, no creds file', async () => {
+      const mountpoint = join(dir, 'guestmnt')
+      const res = await server!.inject({ method: 'POST', url: '/v1/mounts', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1', remotePath: 'share', mountpoint, persistent: true }) })
+      assert.equal(res.statusCode, 202)
+      const job = await waitForJob(server!, res.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(mountpoint))!
+      const tokens = line.trim().split(/\s+/)[3].split(',')
+      assert.ok(tokens.includes('guest'), line)
+      assert.ok(!tokens.some(tk => tk.startsWith('credentials=')), line)
+      // No creds file was written for a guest mount.
+      assert.deepEqual(await readdir(join(dir, 'creds')).catch(() => []), [])
+    })
+
+    it('a half-filled credentials block is refused with the FIELD named', async () => {
+      const res = await server!.inject({ method: 'POST', url: '/v1/mounts', headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' }, payload: JSON.stringify({ type: 'cifs', server: '127.0.0.1', remotePath: 'share', mountpoint: join(dir, 'halfcreds'), credentials: { username: 'u' } }) })
       assert.equal(res.statusCode, 400)
+      const { error } = res.json() as { error: { code: string, message: string } }
+      assert.equal(error.code, 'VALIDATION_ERROR')
+      assert.match(error.message, /^Invalid create mount request: credentials\.password — /)
     })
 
     it('normalises the typed target: //host + /share land in fstab as //host/share', async () => {
@@ -203,6 +220,10 @@ describe('mount routes (Epic 18)', () => {
       const line = (await readFile(fstabPath, 'utf8')).split('\n').find(l => l.includes(mountpoint))!
       // The canonical spec — never the typed `//127.0.0.1` + `/pictures` join.
       assert.ok(line.startsWith('//127.0.0.1/pictures'), line)
+      // A credentials mount references its creds file and carries NO guest token.
+      const tokens = line.trim().split(/\s+/)[3].split(',')
+      assert.ok(tokens.some(tk => tk.startsWith('credentials=')), line)
+      assert.ok(!tokens.includes('guest'), line)
     })
 
     it('refuses an empty CIFS share with the guiding 400, before any job', async () => {

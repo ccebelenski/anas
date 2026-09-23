@@ -222,7 +222,7 @@ function makeStore() {
 
 // ---- The ANAS stub ----------------------------------------------------------
 
-const captured = { jobs: [], posts: [] }
+const captured = { jobs: [], posts: [], alerts: [] }
 
 // Queued responses for POST /mounts/test (shifted one per test post; the
 // default — an `ok` verdict — applies when the queue is empty).
@@ -257,7 +257,9 @@ function loadUi() {
     errorPanel: m => ({ html: m }),
     tbar: items => ({ xtype: 'toolbar', items }), // real 00-core.js helper
     warningsHtml: w => String(w),
-    alertMsg(title, msg) { failures.push(`unexpected alert: ${title} — ${msg}`) },
+    // Recorded, not failed, HERE: the negative tests consume the alert they
+    // expect. Anything still in captured.alerts at the report is unexpected.
+    alertMsg(title, msg) { captured.alerts.push({ title, msg }) },
     fmtMode: () => ({ valid: true, symbolic: 'rw-r--r--', gloss: '' }),
     api: {
       get(_node, path) {
@@ -438,6 +440,7 @@ check(created && created.body.type === 'nfs', 'the create dialog defaults to NFS
 check(ao.vers === '4.2', `a create still writes the version the dialog SHOWS (got ${JSON.stringify(ao.vers)})`)
 check(ao.hard === true, 'a create still writes the hard mount it shows')
 check(created && created.body.persistent === true, 'persistence is create-time and sent')
+check(created && created.body.credentials === undefined, 'NFS create sends no credentials block (the CIFS rule does not reach it)')
 
 // ---- 5. CREATE: typed target normalises; Test gates + renders verdicts ------
 //
@@ -498,7 +501,59 @@ check(normJob && normJob.body.server === 'nas.example.com', `the save body carri
 check(normJob && normJob.body.remotePath === 'media/sub', `the save body carries the normalised share (got ${normJob && normJob.body.remotePath})`)
 check(normJob && normJob.body.type === 'cifs', 'the save body keeps the chosen protocol')
 
+// ---- 6. CREATE: CIFS credentials — guest / half-filled / complete -----------
+//
+// A server may allow guest access: both credential fields BLANK sends NO
+// credentials block at all (the daemon writes `guest`); exactly ONE filled is
+// refused with guidance BEFORE any job; both filled sends the complete pair.
+
+const cifsAdd = await openDialog('Add Remote Share…')
+cifsAdd.down('#type').setValue('cifs')
+cifsAdd.down('#server').setValue('nas.example.com')
+cifsAdd.down('#remotePath').setValue('public')
+cifsAdd.down('#mountpoint').setValue('/mnt/guest-share')
+
+// Both blank → POST without a credentials block (guest).
+const guestJob = submit(cifsAdd)
+check(guestJob && guestJob.method === 'post', 'a blank-credentials CIFS create still POSTs')
+check(guestJob && guestJob.body.type === 'cifs', 'the guest create keeps the chosen protocol')
+check(guestJob && guestJob.body.credentials === undefined, `both blank sends NO credentials block (got ${JSON.stringify(guestJob && guestJob.body.credentials)})`)
+
+// Username only → refused with the guidance, and NO job.
+cifsAdd.down('#credUser').setValue('smbuser')
+const halfJob = submit(cifsAdd)
+check(halfJob === undefined, 'a username-only CIFS create sends NO job')
+const halfAlert = captured.alerts.shift()
+check(
+  halfAlert && halfAlert.title === 'Invalid input' && halfAlert.msg === 'Enter both the SMB username and password, or leave both blank for guest access.',
+  `half-filled credentials are refused with the guidance (got ${JSON.stringify(halfAlert)})`,
+)
+
+// Password only → the same refusal (the rule is symmetric).
+cifsAdd.down('#credUser').setValue('')
+cifsAdd.down('#credPass').setValue('s3cret')
+const halfJob2 = submit(cifsAdd)
+check(halfJob2 === undefined, 'a password-only CIFS create sends NO job')
+const halfAlert2 = captured.alerts.shift()
+check(
+  halfAlert2 && halfAlert2.msg === 'Enter both the SMB username and password, or leave both blank for guest access.',
+  `a password-only half-fill is refused too (got ${JSON.stringify(halfAlert2)})`,
+)
+
+// Both filled → the complete pair travels.
+cifsAdd.down('#credUser').setValue('smbuser')
+cifsAdd.down('#credDomain').setValue('WORKGROUP')
+const fullJob = submit(cifsAdd)
+check(fullJob && fullJob.method === 'post', 'a filled-credentials CIFS create POSTs')
+check(fullJob && fullJob.body.credentials && fullJob.body.credentials.username === 'smbuser', `the username travels (got ${JSON.stringify(fullJob && fullJob.body.credentials)})`)
+check(fullJob && fullJob.body.credentials && fullJob.body.credentials.password === 's3cret', 'the password travels')
+check(fullJob && fullJob.body.credentials && fullJob.body.credentials.domain === 'WORKGROUP', 'the domain rides along')
+
 // ---- Report -----------------------------------------------------------------
+
+for (const a of captured.alerts) {
+  failures.push(`unexpected alert: ${a.title} — ${a.msg}`)
+}
 
 if (failures.length) {
   console.error(`mounts-submit harness: ${failures.length} failure(s)`)
