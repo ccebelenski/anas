@@ -449,6 +449,9 @@ describe('systemPoolRefusal — the sentence matches the cause that fired (revie
 })
 
 // --- pvepool.1 review fix 5: the share-path backstop over unresolvable dirs -
+// (narrowed by the 2026-09-22 caveat-emptor ruling, EPICS §2: only dir paths
+// on a ZFS filesystem stay claims — a readable findmnt table that answers
+// ext4 DROPS the dir; an unavailable table keeps the tightening)
 
 describe('sharePathClaim — dataset claims first, then the unresolvable-dir path rule (review fix 5)', () => {
   // A `dir` storage on a `legacy` dataset — the finding's shape: its `zfs list`
@@ -521,7 +524,9 @@ describe('sharePathClaim — dataset claims first, then the unresolvable-dir pat
       args: ['list', '-H', '-o', 'name,mountpoint'],
       result: { stdout: 'tank/dump\tlegacy\n', stderr: '', exitCode: 0 },
     })
-    // No `findmnt --json` fixture → exit 127 → no live target known.
+    // No `findmnt --json` fixture → exit 127 → the mount table is
+    // UNAVAILABLE: whether /srv/dump sits on ZFS is UNKNOWN, and missing
+    // facts may only tighten — the dir path stays a claim.
     const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
     // The dir storage could not resolve onto a dataset — it keeps its path.
     assert.deepEqual(fp.unresolvedDirPaths, [{ storage: 'dump', path: '/srv/dump' }])
@@ -537,11 +542,10 @@ describe('sharePathClaim — dataset claims first, then the unresolvable-dir pat
     assert.equal(fp.sharePathClaim('/srv'), null)
   })
 
-  it('a non-ZFS dir path (e.g. /var/lib/vz) also tightens the share gate via its path', async () => {
-    // The finding's tightening rule: EVERY dir storage whose path fails to
-    // resolve keeps its path as a backstop claim — including plain-ext4
-    // /var/lib/vz — because "no dataset resolved" is a missing fact, and a
-    // missing fact may only tighten.
+  it('a non-ZFS dir path with an UNAVAILABLE mount table still tightens (missing facts tighten)', async () => {
+    // The tightening survives the caveat-emptor ruling only as far as the
+    // facts reach: with no readable findmnt table, whether /var/lib/vz sits
+    // on ZFS is UNKNOWN — the dir path stays a claim.
     await writeFile(join(dir, 'storage.cfg'), 'dir: local\n\tpath /var/lib/vz\n\tcontent backup\n\n', 'utf8')
     const mock = bootFactsMock()
     mock.addFixture({
@@ -553,5 +557,69 @@ describe('sharePathClaim — dataset claims first, then the unresolvable-dir pat
     assert.deepEqual(fp.unresolvedDirPaths, [{ storage: 'local', path: '/var/lib/vz' }])
     assert.deepEqual(fp.sharePathClaim('/var/lib/vz'), { kind: 'dir-path', storage: 'local', path: '/var/lib/vz' })
     assert.equal(fp.sharePathClaim('/var/lib/vz/template-101')!.kind, 'dir-path')
+  })
+
+  it('a non-ZFS dir path on a READABLE ext4 mount table is dropped — share allowed (caveat emptor)', async () => {
+    // The ruling (EPICS §2, 2026-09-22): the path rule claims only what a ZFS
+    // filesystem serves. findmnt READS (exit 0) and its longest-prefix mount
+    // for /var/lib/vz is `/` on ext4 — a READ answer, not a missing fact —
+    // so the dir is dropped and the share gate opens.
+    await writeFile(join(dir, 'storage.cfg'), 'dir: local\n\tpath /var/lib/vz\n\tcontent backup\n\n', 'utf8')
+    const mock = bootFactsMock()
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: '', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['--json'],
+      result: {
+        stdout: '{"filesystems":[{"target":"/","source":"/dev/sda1","fstype":"ext4","options":"rw"}]}',
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+    assert.deepEqual(fp.unresolvedDirPaths, [])
+    assert.equal(fp.sharePathClaim('/var/lib/vz'), null)
+    assert.equal(fp.sharePathClaim('/var/lib/vz/dump'), null)
+    assert.equal(fp.sharePathClaim('/var/lib/vz/template/iso'), null)
+  })
+
+  it('a dir under a ZFS mount whose dataset zfs list did not name STAYS claimed', async () => {
+    // The other ZFS-backed shape the ruling keeps: findmnt READS and reports
+    // a zfs mount at /srv/other (dataset tank/elsewhere), but `zfs list` did
+    // not name that dataset — the parser cannot resolve a dataset for the
+    // dir storage under it, yet the path IS on ZFS. It stays a claim, while
+    // the ext4 dir beside it is dropped in the same footprint.
+    await writeFile(
+      join(dir, 'storage.cfg'),
+      'dir: dump\n\tpath /srv/dump\n\tcontent backup,iso\n\n'
+      + 'dir: zstore\n\tpath /srv/other/sub\n\tcontent backup\n\n',
+      'utf8',
+    )
+    const mock = bootFactsMock()
+    mock.addFixture({
+      command: '/usr/sbin/zfs',
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: 'tank/dump\tlegacy\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: '/usr/bin/findmnt',
+      args: ['--json'],
+      result: {
+        stdout: '{"filesystems":[{"target":"/","source":"/dev/sda1","fstype":"ext4","options":"rw"},'
+          + '{"target":"/srv/other","source":"tank/elsewhere","fstype":"zfs","options":"rw"}]}',
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    const fp = await loadPveFootprint(mock, { pveStorageCfg: join(dir, 'storage.cfg') })
+    // Only the ZFS-backed dir survives the filter.
+    assert.deepEqual(fp.unresolvedDirPaths, [{ storage: 'zstore', path: '/srv/other/sub' }])
+    assert.equal(fp.sharePathClaim('/srv/dump'), null)
+    const claim = fp.sharePathClaim('/srv/other/sub/x')!
+    assert.deepEqual(claim, { kind: 'dir-path', storage: 'zstore', path: '/srv/other/sub' })
   })
 })

@@ -115,6 +115,44 @@ function isUnder(path: string, mp: string): boolean {
 }
 
 /**
+ * Is `path` hosted by a ZFS filesystem, per the findmnt mount table? The
+ * LONGEST-PREFIX mount containing the path decides — the filesystem actually
+ * serving the path (a nested non-ZFS mount shadows the ZFS mount above it).
+ *
+ * Returns `null` when the table is unavailable — UNKNOWN, and the caller
+ * tightens whatever gate this feeds (missing facts may only tighten). A
+ * READABLE table that answers ext4 (e.g. `/` over `/var/lib/vz`) is a READ
+ * answer — the path is on no ZFS filesystem, and the 2026-09-22 caveat-emptor
+ * ruling (EPICS §2) allows a share there. Stacked mounts at one target (an
+ * autofs placeholder and the real fs) count as ZFS-backed when ANY of the
+ * longest-prefix mounts is zfs. Pure and total.
+ */
+export function pathOnZfsFilesystem(path: string, nodes: FindmntNode[] | null): boolean | null {
+  if (nodes === null)
+    return null
+  const target = stripTrailingSlash(path)
+  let bestLen = -1
+  let zfs = false
+  for (const n of nodes) {
+    if (!n.target)
+      continue
+    const t = stripTrailingSlash(n.target)
+    if (!isUnder(target, t))
+      continue
+    if (t.length > bestLen) {
+      bestLen = t.length
+      zfs = n.fstype === 'zfs'
+    }
+    else if (t.length === bestLen && n.fstype === 'zfs') {
+      zfs = true
+    }
+  }
+  // A readable table that names no containing mount (unreachable on a real
+  // host — findmnt always lists `/`) answers "no ZFS filesystem here".
+  return bestLen < 0 ? false : zfs
+}
+
+/**
  * The ONE longest-prefix path → dataset resolver: resolve an absolute path
  * onto the ZFS dataset that hosts it. A path is on ZFS iff it sits at or under
  * a dataset's mountpoint; when several datasets nest (e.g. `/tank` and
@@ -151,7 +189,10 @@ export function matchMountpoint(path: string, mountpoints: ZfsMountpoint[]): Zfs
  * no ZFS dataset. The unresolved dirs keep their configured `path` (they have
  * no dataset to key by) — the share-path backstop matches a share against those
  * paths directly, the same path rule mounts and restore use, so a `legacy`
- * dataset with no live mount still tightens instead of opening.
+ * dataset with no live mount still tightens instead of opening. The parser is
+ * TOTAL — every unresolvable dir lands here; the footprint service filters the
+ * list down to the ZFS-BACKED ones for its share gate (a non-ZFS path such as
+ * `/var/lib/vz` is allowed, caveat emptor — EPICS §2, ruled 2026-09-22).
  */
 export interface PveStorageParse {
   /** `poolRoot -> PveStorageRef[]` (resolved refs only). */
@@ -403,17 +444,34 @@ export function parseZfsMountpoints(text: string, mountedTargets: Map<string, st
  */
 let mountpointsReadWarned = false
 
+/** What one full mountpoint read answers (pvepool.1 caveat-emptor ruling). */
+export interface ZfsMountpointsRead {
+  /** The dataset→mountpoint table (`zfs list` + findmnt-resolved legacy/none rows). */
+  mountpoints: ZfsMountpoint[]
+  /**
+   * The findmnt mount table — ALL filesystems, not just the zfs ones — when
+   * that read succeeded, else `null`. The footprint service asks
+   * {@link pathOnZfsFilesystem} over it to tell a `dir` storage's unresolved
+   * path on a ZFS filesystem (claimed) from one on ext4 (allowed, caveat
+   * emptor). `null` is UNKNOWN: callers tighten, never loosen.
+   */
+  findmntNodes: FindmntNode[] | null
+}
+
 /**
- * The `zfs` command is overridable for tests (a fixture script standing in for
- * the binary proves the ENOENT-vs-other split without requiring ZFS); a
- * {@link CommandExecutor} routes the read through it instead (see above).
+ * The FULL read behind {@link readZfsMountpoints}: the same mountpoint table
+ * PLUS the findmnt table and its availability, which the share-path backstop's
+ * ZFS-backed test needs ({@link pathOnZfsFilesystem}). Same three-valued
+ * posture: `null` when the `zfs list` side fails, a findmnt failure only
+ * degrades legacy/none resolution and reports `findmntNodes: null`.
  */
-export async function readZfsMountpoints(zfsOrExec: string | CommandExecutor = 'zfs'): Promise<ZfsMountpoint[] | null> {
+export async function readZfsMountpointsFull(zfsOrExec: string | CommandExecutor = 'zfs'): Promise<ZfsMountpointsRead | null> {
   const exec = typeof zfsOrExec === 'object' ? zfsOrExec : undefined
   const zfs = typeof zfsOrExec === 'string' ? zfsOrExec : 'zfs'
   try {
     let stdout: string
     let mountedTargets = new Map<string, string>()
+    let findmntNodes: FindmntNode[] | null = null
     if (exec) {
       // A non-zero exit is UNREADABLE (never "no datasets") — the direct
       // execFileAsync below rejects on one, so the executor path must too.
@@ -425,7 +483,7 @@ export async function readZfsMountpoints(zfsOrExec: string | CommandExecutor = '
         throw new Error(`zfs list exited ${zfsResult.exitCode}: ${zfsResult.stderr.trim()}`)
       stdout = zfsResult.stdout
       if (findmntResult.exitCode === 0)
-        mountedTargets = zfsMountTargets(parseFindmnt(findmntResult.stdout))
+        findmntNodes = parseFindmnt(findmntResult.stdout)
     }
     else {
       // allSettled: the zfs side's rejection (ENOENT / nonzero) is the
@@ -439,19 +497,30 @@ export async function readZfsMountpoints(zfsOrExec: string | CommandExecutor = '
         throw zfsResult.reason
       stdout = zfsResult.value.stdout
       if (findmntResult.status === 'fulfilled')
-        mountedTargets = zfsMountTargets(parseFindmnt(findmntResult.value.stdout))
+        findmntNodes = parseFindmnt(findmntResult.value.stdout)
     }
-    return parseZfsMountpoints(stdout, mountedTargets)
+    if (findmntNodes !== null)
+      mountedTargets = zfsMountTargets(findmntNodes)
+    return { mountpoints: parseZfsMountpoints(stdout, mountedTargets), findmntNodes }
   }
   catch (err: unknown) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT')
-      return []
+      return { mountpoints: [], findmntNodes: null }
     if (!mountpointsReadWarned) {
       mountpointsReadWarned = true
       console.warn('anasd: could not list ZFS mountpoints for PVE dir detection — treated as UNREADABLE, not empty:', err)
     }
     return null
   }
+}
+
+/**
+ * The ZFS dataset mountpoint table only — the shape the pre-existing callers
+ * (mounts, iSCSI) consume. The footprint service asks {@link readZfsMountpointsFull}
+ * instead, for the findmnt table beside it. See there for the semantics.
+ */
+export async function readZfsMountpoints(zfsOrExec: string | CommandExecutor = 'zfs'): Promise<ZfsMountpoint[] | null> {
+  return (await readZfsMountpointsFull(zfsOrExec))?.mountpoints ?? null
 }
 
 /**

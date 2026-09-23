@@ -79,10 +79,12 @@ export async function nfsExportRoutes(
     // Share-path backstop (pvepool.1 review fixes): a path that is PVE's is
     // refused 400 — the SAME sharePathClaim answer the SMB create refuses
     // through: an export onto an OWNED dataset's mountpoint, or under a `dir`
-    // storage's configured path whose dataset could not be resolved (review
-    // fix 5). A path on a sibling dataset's mountpoint, or on no PVE claim at
-    // all, passes. The PUT below cannot move the path (it is the URL identity,
-    // only the client list is replaced), so create is the one door to guard.
+    // storage's configured path on a ZFS filesystem whose dataset could not be
+    // resolved (review fix 5; a non-ZFS dir path such as /var/lib/vz is
+    // allowed — caveat emptor, EPICS §2, ruled 2026-09-22). A path on a
+    // sibling dataset's mountpoint, or on no PVE claim at all, passes. The PUT
+    // below cannot move the path (it is the URL identity, only the client list
+    // is replaced), so create is the one door to guard.
     const pve = await loadPveFootprint(executor)
     const claim = pve.sharePathClaim(exp.path)
     if (claim) {

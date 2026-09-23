@@ -591,19 +591,24 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
     assert.equal(job.status, 'completed', JSON.stringify(job.error))
   })
 
-  // pvepool.1 review fix 5: a `dir` storage on a `legacy` dataset — its `zfs
-  // list` mountpoint is a marker, not a path. Mounted, the path resolves onto
-  // the DATASET (findmnt says where) and the dir storage owns it; unmounted,
-  // the dir keeps its CONFIGURED path and the backstop refuses against that
-  // path directly. Either way a share on it is refused — never through.
+  // pvepool.1 review fix 5, narrowed by the 2026-09-22 caveat-emptor ruling
+  // (EPICS §2): a `dir` storage on a `legacy` dataset — its `zfs list`
+  // mountpoint is a marker, not a path. Mounted, the path resolves onto the
+  // DATASET (findmnt says where) and the dir storage owns it. Unmounted, the
+  // dir keeps its CONFIGURED path and the backstop refuses against that path
+  // — but ONLY while the path is (or may be) on ZFS: a readable findmnt table
+  // that answers ext4 DROPS the dir and the share is allowed; an UNAVAILABLE
+  // table keeps the tightening.
   const LEGACY_DIR_CFG = 'dir: dump\n\tpath /srv/dump\n\tcontent backup,iso\n'
 
   /**
    * A server whose storage.cfg is the legacy dir storage, whose `zfs list`
    * says `tank/dump legacy`, and whose `findmnt --json` answers `findmntJson`
-   * (the server's default fixture is overridden by wrap, not re-registered).
+   * with `findmntExit` (the server's default fixture is overridden by wrap,
+   * not re-registered). The systemctl fixture backs the reload an ACCEPTED
+   * create ends with.
    */
-  function legacyServer(findmntJson: string): ReturnType<typeof createServer> {
+  function legacyServer(findmntJson: string, findmntExit = 0): ReturnType<typeof createServer> {
     dir = mkdtempSync(join(tmpdir(), 'anas-smb-pve-'))
     prevCfg = process.env.ANAS_STORAGE_CFG
     const cfg = join(dir, 'storage.cfg')
@@ -614,10 +619,11 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
     const s = createServer({ mock: true, logger: false, smbConfPath: confPath })
     const mock = (s as unknown as { executor: MockExecutor }).executor
     mock.addFixture({ command: '/usr/sbin/zfs', args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: 'tank/dump\tlegacy\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
     const orig = mock.exec.bind(mock)
     mock.exec = async (command: string, args: string[]) => {
       if (command === '/usr/bin/findmnt' && args.join(' ') === '--json')
-        return { stdout: findmntJson, stderr: '', exitCode: 0 }
+        return { stdout: findmntJson, stderr: '', exitCode: findmntExit }
       return orig(command, args)
     }
     return s
@@ -648,13 +654,12 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
     assert.ok(!readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[dump-share]'))
   })
 
-  it('a share on an UNMOUNTED legacy dataset is refused against the dir path itself (review fix 5)', async () => {
-    // No live mount anywhere: the dataset row stays in the table with no
-    // target, the dir storage cannot resolve, and its CONFIGURED path is the
-    // backstop's fact — the same path rule mounts and restore use.
-    const s = legacyServer(JSON.stringify({
-      filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }],
-    }))
+  it('a share on an UNMOUNTED legacy dataset with an UNAVAILABLE mount table is refused against the dir path', async () => {
+    // findmnt --json FAILS to read: whether /srv/dump sits on ZFS is UNKNOWN,
+    // and missing facts may only tighten — the dir keeps its CONFIGURED path
+    // and the backstop refuses against it (the same path rule mounts and
+    // restore use).
+    const s = legacyServer('', 1)
     const res = await s.inject({
       method: 'POST',
       url: '/v1/shares/smb',
@@ -668,5 +673,25 @@ describe('SMB share path vs the PVE footprint (pvepool.1 review fixes)', () => {
     assert.match(res.json().error.message, /PVE storage 'dump' claims/)
     assert.match(res.json().error.message, /shares cannot serve PVE territory/)
     assert.ok(!readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[dump-share]'))
+  })
+
+  it('a share on a dir-storage path findmnt READS as ext4 is ALLOWED (caveat-emptor ruling)', async () => {
+    // The ruling (EPICS §2, 2026-09-22): the path rule claims only what a ZFS
+    // filesystem serves. The legacy dataset is NOT mounted (no zfs mount in
+    // the readable table), so /srv/dump is ext4 territory — a share there is
+    // the operator's call.
+    const s = legacyServer(JSON.stringify({
+      filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }],
+    }))
+    const res = await s.inject({
+      method: 'POST',
+      url: '/v1/shares/smb',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ name: 'dump-share', path: '/srv/dump/sub' }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(s, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.ok(readFileSync(join(dir!, 'smb.conf'), 'utf8').includes('[dump-share]'))
   })
 })

@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
-import { parsePbsStorages, parsePveStorageCfg, parseZfsMountpoints, readPbsStorages, readPveStorages, readZfsMountpoints, zfsMountTargets } from '../pve-storage.js'
+import { parsePbsStorages, parsePveStorageCfg, parseZfsMountpoints, pathOnZfsFilesystem, readPbsStorages, readPveStorages, readZfsMountpoints, readZfsMountpointsFull, zfsMountTargets } from '../pve-storage.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/pve')
@@ -119,8 +119,9 @@ describe('parsePveStorageCfg — dir on ZFS (secondary signal)', () => {
   })
 
   it('records a dir path that is on no ZFS dataset (e.g. /var/lib/vz) as an unresolved dir', () => {
-    // pvepool.1 review fix 5: it does not VANISH — the share-path backstop
-    // matches a share against the configured path directly.
+    // pvepool.1 review fix 5: it does not VANISH — the parser is total over
+    // unresolved dirs; the footprint service filters them down to the
+    // ZFS-backed ones for its share gate (caveat-emptor ruling, EPICS §2).
     const text = 'dir: local\n\tpath /var/lib/vz\n\tcontent backup,iso\n'
     const parse = parsePveStorageCfg(text, mountpoints)
     assert.equal(parse.byPool.size, 0)
@@ -411,5 +412,94 @@ describe('readZfsMountpoints (executor path, pvepool.1 review fix 5)', () => {
     })
     mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: '{"filesystems":[]}', stderr: '', exitCode: 0 } })
     assert.equal(await readZfsMountpoints(mock), null)
+  })
+})
+
+describe('readZfsMountpointsFull — the findmnt table beside the mountpoints (caveat-emptor ruling)', () => {
+  const ZFS = '/usr/sbin/zfs'
+  const FINDMNT = '/usr/bin/findmnt'
+
+  it('carries the parsed findmnt nodes (ALL filesystems) when that read succeeded', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: ZFS,
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: 'tank\t/tank\n', stderr: '', exitCode: 0 },
+    })
+    mock.addFixture({
+      command: FINDMNT,
+      args: ['--json'],
+      result: {
+        stdout: '{"filesystems":[{"target":"/","source":"/dev/sda1","fstype":"ext4","options":"rw"},{"target":"/tank","source":"tank","fstype":"zfs","options":"rw"}]}',
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    const out = await readZfsMountpointsFull(mock)
+    assert.equal(out?.findmntNodes?.length, 2)
+    assert.deepEqual(out?.mountpoints, [{ mountpoint: '/tank', dataset: 'tank', pool: 'tank' }])
+  })
+
+  it('findmntNodes is null when findmnt failed — UNKNOWN, the caller tightens', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: ZFS,
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: 'tank\t/tank\n', stderr: '', exitCode: 0 },
+    })
+    // No findmnt fixture → exit 127. The table itself survives.
+    const out = await readZfsMountpointsFull(mock)
+    assert.equal(out?.findmntNodes, null)
+    assert.deepEqual(out?.mountpoints, [{ mountpoint: '/tank', dataset: 'tank', pool: 'tank' }])
+  })
+
+  it('the whole read is null when zfs list RAN and failed', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: ZFS,
+      args: ['list', '-H', '-o', 'name,mountpoint'],
+      result: { stdout: '', stderr: 'no permission', exitCode: 1 },
+    })
+    assert.equal(await readZfsMountpointsFull(mock), null)
+  })
+})
+
+describe('pathOnZfsFilesystem — the longest-prefix findmnt mount decides (caveat-emptor ruling)', () => {
+  const TABLE = [
+    { target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' },
+    { target: '/srv', source: 'tank/srv', fstype: 'zfs', options: 'rw' },
+    { target: '/srv/media', source: '/dev/sdb1', fstype: 'ext4', options: 'rw' },
+  ]
+
+  it('a null table is UNKNOWN — null (the caller tightens)', () => {
+    assert.equal(pathOnZfsFilesystem('/var/lib/vz', null), null)
+  })
+
+  it('the longest-prefix mount is ext4: NOT ZFS-backed (/var/lib/vz on the root)', () => {
+    assert.equal(pathOnZfsFilesystem('/var/lib/vz', TABLE), false)
+  })
+
+  it('the longest-prefix mount is zfs: ZFS-backed', () => {
+    assert.equal(pathOnZfsFilesystem('/srv/dump', TABLE), true)
+    // The mount itself and a deep subpath alike.
+    assert.equal(pathOnZfsFilesystem('/srv', TABLE), true)
+    assert.equal(pathOnZfsFilesystem('/srv/a/b/c', TABLE), true)
+  })
+
+  it('a nested non-ZFS mount SHADOWS the zfs mount above it', () => {
+    // /srv/media is ext4 territory — the zfs mount at /srv does not serve it.
+    assert.equal(pathOnZfsFilesystem('/srv/media/imports', TABLE), false)
+  })
+
+  it('stacked mounts at one target count as ZFS-backed when ANY of them is zfs', () => {
+    const stacked = [
+      { target: '/mnt/x', source: 'systemd-1', fstype: 'autofs', options: 'rw' },
+      { target: '/mnt/x', source: 'tank/x', fstype: 'zfs', options: 'rw' },
+    ]
+    assert.equal(pathOnZfsFilesystem('/mnt/x/store', stacked), true)
+  })
+
+  it('a trailing slash on either side changes nothing', () => {
+    assert.equal(pathOnZfsFilesystem('/srv/dump/', [{ target: '/srv/dump/', source: 'tank/dump', fstype: 'zfs', options: 'rw' }]), true)
   })
 })

@@ -2,7 +2,7 @@ import type { PveOwnership, PveStorageRef, SystemPoolFacts } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { ZfsMountpoint } from '../parsers/pve-storage.js'
 import { isPathWithin, pveOwnership, wouldBeClaimedByPve } from '@anas/shared'
-import { matchMountpoint, PVE_STORAGE_CFG, readPveStorages, readZfsMountpoints } from '../parsers/pve-storage.js'
+import { matchMountpoint, pathOnZfsFilesystem, PVE_STORAGE_CFG, readPveStorages, readZfsMountpointsFull } from '../parsers/pve-storage.js'
 
 /**
  * PVE footprint ownership — the ONE daemon service that answers "does PVE own
@@ -267,10 +267,15 @@ export function ownershipFromFootprintData(
  * share-path backstop's answer, asked ONCE per candidate path:
  *  - `dataset` — the path sits at/under a dataset's mountpoint AND that
  *    dataset is owned; the refusal quotes the ownership reason;
- *  - `dir-path` — the path resolves onto no dataset (a `legacy`/`none`
- *    dataset with no live mount, or a non-ZFS path), but a `dir` storage's
- *    CONFIGURED path hosts it (review fix 5) — the same path rule mounts and
- *    restore use; the refusal names the storage and its path.
+ *  - `dir-path` — the path resolves onto no dataset but IS on a ZFS
+ *    filesystem: a `dir` storage's CONFIGURED path hosts it (review fix 5)
+ *    while the dataset it lives on could not be resolved to a name (a
+ *    `legacy`/`none` dataset with no live mount, or a ZFS mount findmnt
+ *    reports whose dataset `zfs list` did not name) — the same path rule
+ *    mounts and restore use; the refusal names the storage and its path.
+ *    A dir-storage path on a NON-ZFS filesystem (e.g. `/var/lib/vz` on the
+ *    ext4 root) is NOT a claim — the caveat-emptor ruling (EPICS §2, ruled
+ *    2026-09-22) allows a share there.
  * `null` is the only answer that opens the share gate.
  */
 export type SharePathClaim
@@ -282,12 +287,19 @@ export interface PveFootprint {
   /** `poolRoot -> PveStorageRef[]` from storage.cfg (dir refs resolved; EMPTY while unavailable). */
   storagesByPool: Map<string, PveStorageRef[]>
   /**
-   * `dir` storages whose configured `path` resolved onto no ZFS dataset
-   * (pvepool.1 review fix 5) — a `legacy`/`none` dataset with no live mount,
-   * or a path on a non-ZFS filesystem. The share-path backstop's fallback
+   * `dir` storages whose configured `path` resolved onto no ZFS dataset AND
+   * sits on a ZFS filesystem (pvepool.1 review fix 5 + the 2026-09-22
+   * caveat-emptor ruling, EPICS §2) — a `legacy`/`none` dataset with no live
+   * mount, or a path under a ZFS mount findmnt reports whose dataset `zfs
+   * list` did not name. The share-path backstop's fallback
    * ({@link PveFootprint.sharePathClaim}): a share on one of these paths is
-   * refused against the path itself. EMPTY while the storages are
-   * unavailable or no mountpoint table was supplied (the zfspool-only mode).
+   * refused against the path itself. A dir-storage path on a NON-ZFS
+   * filesystem (readable findmnt table, longest-prefix mount ext4 — e.g.
+   * `/var/lib/vz`) is dropped: a share there is allowed, caveat emptor. When
+   * the findmnt table itself is unavailable the answer is UNKNOWN and the
+   * tightening STAYS — missing facts may only tighten. EMPTY while the
+   * storages are unavailable or no mountpoint table was supplied (the
+   * zfspool-only mode).
    */
   unresolvedDirPaths: { storage: string, path: string }[]
   /**
@@ -378,8 +390,11 @@ export async function loadPveFootprint(
   // The mountpoint read goes THROUGH the executor (mock-driven in tests) and
   // feeds BOTH consumers: the `dir`-storage resolution and datasetOfPath. A
   // null read (zfs list failed) only disables those — the parser's secondary
-  // signal — never the storage.cfg verdict itself.
-  const zfsMountpoints = await readZfsMountpoints(executor)
+  // signal — never the storage.cfg verdict itself. The full read also carries
+  // the findmnt table the share-path backstop's ZFS-backed test needs.
+  const mountRead = await readZfsMountpointsFull(executor)
+  const zfsMountpoints = mountRead?.mountpoints ?? null
+  const findmntNodes = mountRead?.findmntNodes ?? null
   const [readStorages, readFacts] = await Promise.all([
     // Explicit override, then the daemon-wide env override, then the real path
     // — the same resolution server.ts hands the route-level consumers.
@@ -390,9 +405,16 @@ export async function loadPveFootprint(
   // answer below until the config can be read again.
   const storagesUnavailable = readStorages === null
   const storagesByPool = readStorages?.byPool ?? new Map<string, PveStorageRef[]>()
-  // pvepool.1 review fix 5: dir storages whose path resolved onto no dataset —
-  // the share-path backstop's path rule (see PveFootprint.unresolvedDirPaths).
-  const unresolvedDirPaths = readStorages?.unresolvedDirs ?? []
+  // pvepool.1 review fix 5, narrowed by the 2026-09-22 caveat-emptor ruling
+  // (EPICS §2): dir storages whose path resolved onto no dataset AND sits on a
+  // ZFS filesystem — the share-path backstop's path rule (see
+  // PveFootprint.unresolvedDirPaths). A readable findmnt table whose
+  // longest-prefix mount for the path is NOT zfs (ext4's `/` over
+  // `/var/lib/vz`) is a READ answer that DROPS the dir — a share there is
+  // allowed. A null table is UNKNOWN: the tightening stays (missing facts may
+  // only tighten, never loosen).
+  const unresolvedDirPaths = (readStorages?.unresolvedDirs ?? [])
+    .filter(d => pathOnZfsFilesystem(d.path, findmntNodes) !== false)
   const systemFactsUnavailable = readFacts === null
   const systemFacts = readFacts ?? []
 
@@ -442,8 +464,9 @@ export async function loadPveFootprint(
     datasetOfPath: (path: string) => matchMountpoint(path, zfsMountpoints ?? [])?.dataset ?? null,
     // The share-path backstop (pvepool.1 review fixes): the dataset answer
     // first, then — only for a path on no known dataset — the unresolvable-dir
-    // path rule. Missing facts may only tighten: an unresolvable dir storage
-    // never reads as "not PVE's" (review fix 5).
+    // path rule. `unresolvedDirPaths` is already the ZFS-BACKED subset (the
+    // caveat-emptor ruling dropped the non-ZFS paths at load time; a null
+    // findmnt table kept them all), so missing facts here may only tighten.
     sharePathClaim: (path: string): SharePathClaim | null => {
       const dataset = matchMountpoint(path, zfsMountpoints ?? [])?.dataset
       if (dataset) {

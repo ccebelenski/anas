@@ -124,11 +124,13 @@ export async function smbShareRoutes(
    * the path resolves onto an OWNED dataset (a storage root, a guest volume,
    * a dir-storage tree or the boot tree — refused 400 with the reason, which
    * names the storage AND the dataset), or it sits under a `dir` storage's
-   * CONFIGURED path whose dataset could not be resolved (a `legacy`/`none`
-   * dataset with no live mount — refused against the path itself, the same
-   * rule mounts and restore use; pvepool.1 review fix 5). A path on a SIBLING
-   * dataset's mountpoint (or a subdirectory of one) is ordinary ANAS storage
-   * and passes untouched.
+   * CONFIGURED path on a ZFS filesystem whose dataset could not be resolved (a
+   * `legacy`/`none` dataset with no live mount — refused against the path
+   * itself, the same rule mounts and restore use; pvepool.1 review fix 5). A
+   * dir-storage path on a NON-ZFS filesystem (e.g. `/var/lib/vz` on the ext4
+   * root) is allowed — caveat emptor (EPICS §2, ruled 2026-09-22). A path on a
+   * SIBLING dataset's mountpoint (or a subdirectory of one) is ordinary ANAS
+   * storage and passes untouched.
    */
   async function refuseOwnedSharePath(path: string, reply: FastifyReply): Promise<boolean> {
     const pve = await loadPveFootprint(executor)
