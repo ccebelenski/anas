@@ -1,4 +1,4 @@
-import type { MountEntry, MountSummary } from '@anas/shared'
+import type { MountEntry, MountSummary, MountType } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
@@ -26,6 +26,7 @@ import {
   probeInventoryHealth,
   redactFstabLine,
   removeEmptyMountpointDir,
+  runMountTest,
   writeCredentialsFile,
 } from '../mounts.js'
 
@@ -157,6 +158,26 @@ describe('parseSpec — reverse of buildSpec (server/share from an fstab spec)',
       assert.deepEqual(parseSpec(type, spec), { server, remotePath }, `round-trip ${type} ${spec}`)
     }
   })
+})
+
+describe('buildSpec — builds from the NORMALISED target (the typed form never reaches fstab)', () => {
+  const cases: Array<[MountType, { server: string, remotePath: string }, string]> = [
+    ['cifs', { server: '10.0.0.212', remotePath: 'pictures' }, '//10.0.0.212/pictures'],
+    ['cifs', { server: '//10.0.0.212', remotePath: '/pictures' }, '//10.0.0.212/pictures'],
+    ['cifs', { server: '10.0.0.212/', remotePath: 'pictures' }, '//10.0.0.212/pictures'],
+    // A pasted URL: the server is the host; the share stays as typed.
+    ['cifs', { server: 'smb://host/share', remotePath: 'typed' }, '//host/typed'],
+    ['nfs', { server: '10.0.0.9', remotePath: '/srv/export1' }, '10.0.0.9:/srv/export1'],
+    // Trailing lone `:` with a blank export = the export root.
+    ['nfs', { server: '10.0.0.9:', remotePath: '' }, '10.0.0.9:/'],
+    // `host:/export` pasted into one field.
+    ['nfs', { server: '10.0.0.9:/srv/export1', remotePath: '' }, '10.0.0.9:/srv/export1'],
+  ]
+  for (const [type, req, want] of cases) {
+    it(`${type} ${JSON.stringify(req)} → ${want}`, () => {
+      assert.equal(buildSpec(type, req), want)
+    })
+  }
 })
 
 describe('ahrPinnedSpecs — AHR pool LV specs from the ANAS-managed mdadm.conf', () => {
@@ -381,12 +402,71 @@ describe('mapCifsFailure — every captured mount.cifs errno', () => {
     ['mount error(13): Permission denied', 'auth-failed'],
     ['mount error(2): No such file or directory', 'not-found'],
     ['mount error(95): Operation not supported', 'protocol-mismatch'],
+    // The reproduced bug: an empty share built `//host/` → the kernel's
+    // Malformed UNC / EINVAL. That is `invalid`, never `unreachable`.
+    ['mount error(22): Invalid argument', 'invalid'],
+    ['CIFS: VFS: Malformed UNC in devname', 'invalid'],
+    ['mount error(22): Invalid argument\nRefer to the mount.cifs(8) manual page (mount.cifs -h)', 'invalid'],
   ]
   for (const [stderr, verdict] of cases) {
     it(`${verdict}: ${stderr.slice(0, 30)}…`, () => {
       assert.equal(mapCifsFailure(stderr), verdict)
     })
   }
+})
+
+// --- The preflight probe's stages (TEST SEAM: DNS/TCP overridden) ------------
+//
+// A test host has no share server on 2049/445, so the mount stage — and its
+// verdict mapping, the part the reproduced bug got wrong — is only reachable
+// with the stages overridden.
+
+describe('runMountTest — probe stages (TEST SEAM)', () => {
+  const TIMEOUT = '/usr/bin/timeout'
+  const STAGES = { resolves: async () => true, tcpReachable: async () => true }
+  const INVALID_STDERR = 'mount error(22): Invalid argument\nRefer to the mount.cifs(8) manual page (mount.cifs -h)\n'
+
+  it('resolves the NORMALISED host — the dirty typed form never reaches DNS', async () => {
+    const exec = new MockExecutor()
+    const seen: string[] = []
+    const result = await runMountTest(exec, { type: 'cifs', server: '  //nas.example.com  ', remotePath: 'media' }, {
+      resolves: async (host) => {
+        seen.push(host)
+        return false
+      },
+      tcpReachable: async () => true,
+    })
+    assert.deepEqual(seen, ['nas.example.com'])
+    assert.equal(result.verdict, 'unreachable')
+    assert.equal(result.stage, 'dns')
+    // The detail quotes the CLEAN host — the old behaviour said `'//nas…'`.
+    assert.equal(result.detail, `Could not resolve host 'nas.example.com'`)
+  })
+
+  it('a no-credentials CIFS probe passes `guest` (never prompts) and the normalised spec; EINVAL → invalid', async () => {
+    const exec = new MockExecutor()
+    exec.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: INVALID_STDERR, exitCode: 32 } })
+    const result = await runMountTest(exec, { type: 'cifs', server: '//10.0.0.212', remotePath: '/pictures' }, STAGES)
+    assert.equal(result.verdict, 'invalid')
+    assert.equal(result.stage, 'mount')
+    assert.match(result.detail ?? '', /server or share is malformed/)
+    // argv: timeout 15 /usr/bin/mount -t cifs -o <opts> <spec> <probeDir>
+    const probe = exec.calls.find(c => c.command === TIMEOUT)!
+    assert.equal(probe.args[4], '-o')
+    assert.equal(probe.args[5], 'vers=3.1.1,guest')
+    assert.equal(probe.args[6], '//10.0.0.212/pictures')
+  })
+
+  it('a credentials probe authenticates from a temp file (no guest); EACCES → auth-failed with its advice', async () => {
+    const exec = new MockExecutor()
+    exec.addFixture({ command: TIMEOUT, result: { stdout: '', stderr: 'mount error(13): Permission denied\n', exitCode: 32 } })
+    const result = await runMountTest(exec, { type: 'cifs', server: 'nas', remotePath: 'media', credentials: { username: 'u', password: 'p' } }, STAGES)
+    assert.equal(result.verdict, 'auth-failed')
+    assert.match(result.detail ?? '', /username or password/)
+    const probe = exec.calls.find(c => c.command === TIMEOUT)!
+    assert.match(probe.args[5], /^vers=3\.1\.1,credentials=\/.+probe\.cred$/)
+    assert.ok(!probe.args[5].includes('guest'))
+  })
 })
 
 // --- Server-side option defaults (18.5) --------------------------------------

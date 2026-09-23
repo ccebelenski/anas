@@ -2,6 +2,14 @@
 
 export const VERSION = '0.3.3'
 
+// Mount target normalisation (Epic 18): the pure server/share normaliser the
+// daemon (buildSpec, create/test routes) and the UI port both build from,
+// plus its result type.
+export {
+  normalizeMountTarget,
+} from './mount-target.js'
+export type { MountTarget } from './mount-target.js'
+
 // Access / permissions schemas (layered editor — Epic 4.7.2)
 export {
   AccessEntry,

@@ -20,7 +20,12 @@
  *       onto an entry that never had it;
  *   #38 — Server and Export path/Share name are read-only on an edit, and Test
  *       connection probes the STORED spec, never an edited value the save would
- *       drop.
+ *       drop;
+ *   (2026-09-22 bug) — the typed Server/Share normalise on blur (the browser
+ *       port of packages/shared/src/mount-target.ts), the Test button arms
+ *       only once the target is testable (server; share for CIFS), the new
+ *       `invalid` verdict renders, and an UNKNOWN verdict never claims
+ *       "no route to the server".
  *
  *   node packages/pve-integration/test/mounts-submit.harness.mjs
  *
@@ -126,10 +131,12 @@ function makeCmp(cfg, win) {
     fieldLabel: cfg.fieldLabel,
     html: cfg.html || '',
     _value: initialValue(cfg),
-    _handlers: [],
+    _handlers: {},
     up: () => win,
     down: () => null,
-    on(evt, fn) { if (evt === 'change') { this._handlers.push(fn) } },
+    on(evt, fn) { (this._handlers[evt] = this._handlers[evt] || []).push(fn) },
+    /** Fire a component event (the dialog wires change AND blur). */
+    fire(evt) { for (const fn of (this._handlers[evt] || []).slice()) { fn(this, this.getValue()) } },
     update(html) { this.html = html },
     setHidden(v) { this.hidden = !!v },
     setDisabled(v) { this.disabled = !!v },
@@ -148,7 +155,7 @@ function makeCmp(cfg, win) {
       if (this.xtype === 'checkboxfield') { this._value = !!v }
       else if (this.xtype === 'radiogroup') { this._value = v || {} }
       else { this._value = v }
-      for (const fn of this._handlers.slice()) { fn(this, this.getValue()) }
+      this.fire('change')
       return this
     },
   }
@@ -217,6 +224,10 @@ function makeStore() {
 
 const captured = { jobs: [], posts: [] }
 
+// Queued responses for POST /mounts/test (shifted one per test post; the
+// default — an `ok` verdict — applies when the queue is empty).
+const testResponses = []
+
 /** The real autofill opt-out from 00-core.js — the credential tier reads it
  * while building its fields, so the fake must mirror it. */
 const noAutofill = (() => {
@@ -258,6 +269,9 @@ function loadUi() {
       },
       post(_node, path, body) {
         captured.posts.push({ path, body })
+        if (path === '/mounts/test' && testResponses.length > 0) {
+          return Promise.resolve(testResponses.shift())
+        }
         return Promise.resolve({ data: { verdict: 'ok' } })
       },
     },
@@ -424,6 +438,65 @@ check(created && created.body.type === 'nfs', 'the create dialog defaults to NFS
 check(ao.vers === '4.2', `a create still writes the version the dialog SHOWS (got ${JSON.stringify(ao.vers)})`)
 check(ao.hard === true, 'a create still writes the hard mount it shows')
 check(created && created.body.persistent === true, 'persistence is create-time and sent')
+
+// ---- 5. CREATE: typed target normalises; Test gates + renders verdicts ------
+//
+// The Server/Share fields apply the shared normaliser on blur (the ES5 port of
+// packages/shared/src/mount-target.ts), the Test button arms only once the
+// target is testable, the new `invalid` verdict renders with its detail, and
+// an UNKNOWN verdict says "Test failed: <detail>" — never "no route".
+
+const add2 = await openDialog('Add Remote Share…')
+const tbtn = add2.byCls('anas-btn-mount-testconn')
+check(!!tbtn, 'the Test connection button exists on a create')
+check(tbtn.disabled === true, 'the Test button starts disabled (nothing typed)')
+
+// CIFS with the reproduced shapes: a UNC-marked server, an outer-slashed share.
+add2.down('#type').setValue('cifs')
+add2.down('#server').setValue('//10.0.0.212')
+check(tbtn.disabled === true, 'Test stays disabled: a CIFS test needs a share too')
+add2.down('#remotePath').setValue('/pictures')
+check(tbtn.disabled === false, 'Test arms once server AND share are filled (CIFS)')
+
+// BLUR normalises the typed values in place — the fields show what the daemon
+// would write, and the test body follows them.
+add2.down('#server').fire('blur')
+add2.down('#remotePath').fire('blur')
+check(add2.down('#server').getValue() === '10.0.0.212', `blur normalises the server (got ${add2.down('#server').getValue()})`)
+check(add2.down('#remotePath').getValue() === 'pictures', `blur normalises the share (got ${add2.down('#remotePath').getValue()})`)
+
+captured.posts.length = 0
+tbtn.handler()
+await flush()
+const npost = captured.posts.find(p => p.path === '/mounts/test')
+check(!!npost, 'Test posts /mounts/test')
+check(npost && npost.body.server === '10.0.0.212', `the test body carries the normalised server (got ${npost && npost.body.server})`)
+check(npost && npost.body.remotePath === 'pictures', `the test body carries the normalised share (got ${npost && npost.body.remotePath})`)
+
+// The new `invalid` verdict renders with its guiding detail.
+testResponses.push({ data: { verdict: 'invalid', stage: 'mount', detail: "The server or share is malformed — server is a host or address, share is the share's name." } })
+tbtn.handler()
+await flush()
+let verdictArea = add2.down('#testResult')
+check(verdictArea && verdictArea.html.indexOf('Malformed') !== -1, 'the invalid verdict renders its label')
+check(verdictArea && verdictArea.html.indexOf('server or share is malformed') !== -1, 'the invalid verdict renders the daemon detail')
+
+// An UNKNOWN verdict says "Test failed: <detail>" — never "no route".
+testResponses.push({ data: { verdict: 'brand-new-verdict', stage: 'mount', detail: 'some odd failure' } })
+tbtn.handler()
+await flush()
+verdictArea = add2.down('#testResult')
+check(verdictArea && verdictArea.html.indexOf('Test failed: some odd failure') !== -1, `an unknown verdict renders "Test failed: <detail>" (got ${verdictArea && verdictArea.html})`)
+check(verdictArea && verdictArea.html.indexOf('no route') === -1, 'an unknown verdict never claims "no route"')
+
+// The SUBMIT body normalises too — raw values never reach the daemon.
+add2.down('#server').setValue('  //nas.example.com  ')
+add2.down('#remotePath').setValue('media\\sub')
+add2.down('#mountpoint').setValue('/mnt/norm-sub')
+const normJob = submit(add2)
+check(normJob && normJob.body.server === 'nas.example.com', `the save body carries the normalised server (got ${normJob && normJob.body.server})`)
+check(normJob && normJob.body.remotePath === 'media/sub', `the save body carries the normalised share (got ${normJob && normJob.body.remotePath})`)
+check(normJob && normJob.body.type === 'cifs', 'the save body keeps the chosen protocol')
 
 // ---- Report -----------------------------------------------------------------
 

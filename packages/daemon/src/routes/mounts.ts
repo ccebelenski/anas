@@ -4,8 +4,9 @@ import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { IscsiPaths } from '../services/iscsi.js'
+import type { MountTestStages } from '../services/mounts.js'
 import { mkdir, readdir } from 'node:fs/promises'
-import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, UpdateMountRequest } from '@anas/shared'
+import { AbsolutePath, CreateMountRequest, DeleteMountQuery, MountCifsSec, MountNfsSec, MountStateRequest, MountTestRequest, normalizeMountTarget, UpdateMountRequest } from '@anas/shared'
 import { classifyKind } from '../parsers/findmnt.js'
 import { addMount, disableMount, enableMount, getMount, hasMount, removeMount, replaceMount } from '../parsers/fstab.js'
 import { readPveMountPaths, readZfsMountpoints } from '../parsers/pve-storage.js'
@@ -72,6 +73,13 @@ export interface MountsRouteOptions {
    * default; overridable so a test never reads the kernel.
    */
   iscsiPaths?: IscsiPaths
+  /**
+   * TEST SEAM for POST /mounts/test's network stages (DNS + TCP to 2049/445):
+   * a test host has no share server on those ports, so the mount stage — and
+   * its verdict mapping — was unreachable from a route test. Production never
+   * sets it; the real checks are the default.
+   */
+  mountTestStages?: MountTestStages
 }
 
 /**
@@ -83,7 +91,7 @@ export interface MountsRouteOptions {
  * (guarded `stat -f` in a child process).
  */
 export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOptions) {
-  const { executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath, mdadmConfPath } = opts
+  const { executor, jobQueue, confirmStore, fstabPath, credsDir, storagePath, mdadmConfPath, mountTestStages } = opts
   const iscsiPaths = opts.iscsiPaths ?? {}
 
   /**
@@ -170,10 +178,15 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     if (!identity)
       return
 
-    // Remote shares only (see rejectIfNotRemote): a mount needs its server.
-    if (!req.server) {
+    // Remote shares only (see rejectIfNotRemote): a mount needs its server —
+    // and the typed target is normalised at the boundary (the UI applies the
+    // same normaliser): an empty server or an empty CIFS share comes back as
+    // a guiding 400, never as a job that fails inside the kernel with a
+    // malformed UNC (`//host/` → "CIFS: VFS: Malformed UNC in devname").
+    const target = normalizeMountTarget(req.type, req)
+    if (target.problems.length > 0) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `A ${req.type} mount requires 'server' (and 'remotePath')` } }
+      return { error: { code: 'VALIDATION_ERROR', message: target.problems.join('; ') } }
     }
     if (req.type === 'cifs' && !req.credentials) {
       reply.code(400)
@@ -580,7 +593,16 @@ export async function mountsRoutes(server: FastifyInstance, opts: MountsRouteOpt
     const identity = requireIdentity(request, reply)
     if (!identity)
       return
-    const result = await runMountTest(executor, parsed.data)
+    // The typed target is normalised BEFORE any DNS/port/mount stage: an empty
+    // server or CIFS share is a guiding 400 — it used to sail through to the
+    // probe, fail the kernel's UNC parse (`mount error(22)`), and come back
+    // "unreachable — no route to the server".
+    const target = normalizeMountTarget(parsed.data.type, parsed.data)
+    if (target.problems.length > 0) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: target.problems.join('; ') } }
+    }
+    const result = await runMountTest(executor, parsed.data, mountTestStages)
     return { data: result }
   })
 

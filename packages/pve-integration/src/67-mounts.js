@@ -43,9 +43,10 @@
  *     idleTimeout (number)            plus the Mount fields above.
  *
  *   POST /v1/mounts/test → { data: { verdict, detail } }
- *     verdict ('ok'|'unreachable'|'auth-failed'|'not-found'|'protocol-mismatch';
- *     `stage` accepted as an alias)   body: { type, server, remotePath,
- *     credentials?, options? }
+ *     verdict ('ok'|'unreachable'|'auth-failed'|'not-found'|'protocol-mismatch'|
+ *     'invalid'; `stage` accepted as an alias; an empty server or CIFS share is
+ *     refused up front — 400 + a guiding sentence, never a probe)   body:
+ *     { type, server, remotePath, credentials?, options? }
  *
  *   POST /v1/mounts → 202 { job }   body (create):
  *     { type:'nfs'|'cifs', server, remotePath, mountpoint, persistent,
@@ -1398,16 +1399,100 @@
         return opts;
     }
 
-    function fstabDevice(type, server, remotePath) {
-        var srv = ('' + (server || '')).trim();
-        var path = ('' + (remotePath || '')).trim();
+    // ---- server/share normalisation ----------------------------------------
+    //
+    // ONE shared implementation lives in packages/shared/src/mount-target.ts
+    // (normalizeMountTarget) — the daemon normalises the SAME fields at the
+    // boundary, so the typed value, this preview, the test body, and the
+    // fstab line all agree. The browser cannot import the shared package;
+    // this port is the ONE permitted duplicate — keep both in lockstep.
+    //
+    // It turns what the operator typed into what the daemon will write: a
+    // bare host and a clean share/export path, so `//10.0.0.212` and
+    // `/pictures` preview as `//10.0.0.212/pictures`, never `//10.0.0.212//
+    // pictures` (which the kernel answers "Malformed UNC in devname").
+    var MNT_SCHEME_RE = /^(?:smb|cifs|nfs):\/\//i;
+    var MNT_LEAD_RE = /^[/\\]+/;
+    var MNT_TRAIL_RE = /[\/\\]+$/;
+    var MNT_SEG_RE = /[\/\\]/;
+
+    function normalizeMountServer(type, raw) {
+        var s = ('' + (raw || '')).trim().replace(MNT_SCHEME_RE, '').replace(MNT_LEAD_RE, '').replace(MNT_TRAIL_RE, '');
         if (type === 'nfs') {
-            var p = path ? (path.charAt(0) === '/' ? path : '/' + path) : '';
-            return srv + ':' + p;
+            // `host:/export` — the server ends at the colon before the export
+            // path (an unbracketed IPv6's colons never precede a `/`).
+            if (s.charAt(s.length - 1) === ':') {
+                return { server: s.slice(0, -1), export: '' };
+            }
+            var idx = s.indexOf(':/');
+            if (idx !== -1) {
+                return { server: s.slice(0, idx), export: s.slice(idx + 1) };
+            }
+            return { server: s, export: '' };
+        }
+        // cifs: the server is the host ONLY — a pasted URL/UNC keeps everything
+        // before the first separator (the share stays as typed, never moved).
+        var i = s.search(MNT_SEG_RE);
+        if (i !== -1) {
+            s = s.slice(0, i);
+        }
+        return { server: s, export: '' };
+    }
+
+    function normalizeMountTarget(type, server, remotePath) {
+        var n = normalizeMountServer(type, server);
+        var path = ('' + (remotePath || '')).trim();
+        if (type === 'cifs') {
+            // A share is a path on the server: backslashes are separators, the
+            // outer slashes are noise — an inner prefix path is kept.
+            path = path.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+        } else {
+            // A pasted `host:/export` fills a BLANK export field only — a typed
+            // path always wins. Exactly one leading `/`; blank = the root.
+            if (!path && n.export) {
+                path = n.export;
+            }
+            path = path === '' ? '/' : ('/' + path.replace(/^\/+/, ''));
+        }
+        var problems = [];
+        if (!n.server) {
+            problems.push('server is required');
+        }
+        if (type === 'cifs' && !path) {
+            problems.push('share name is required (the name of the share on the server, e.g. `pictures`)');
+        }
+        return { server: n.server, remotePath: path, problems: problems };
+    }
+
+    function fstabDevice(type, server, remotePath) {
+        var n = normalizeMountTarget(type, server, remotePath);
+        if (type === 'nfs') {
+            return n.server + ':' + n.remotePath;
         }
         // cifs
-        var share = path.replace(/^[\/\\]+/, '');
-        return '//' + srv + '/' + share;
+        return '//' + n.server + '/' + n.remotePath;
+    }
+
+    // Re-run the shared normaliser on the two typed fields and write the
+    // canonical values back IN PLACE — only when they actually changed, so
+    // caret position and the undo history are not churned on every blur.
+    // Wired to BLUR; the daemon re-normalises at the boundary regardless,
+    // this only keeps what the user sees agreeing with what gets sent.
+    function normalizeFields(win) {
+        try {
+            var type = valOf(win, '#type') || 'nfs';
+            var n = normalizeMountTarget(type, valOf(win, '#server'), valOf(win, '#remotePath'));
+            var sv = win.down('#server');
+            var rp = win.down('#remotePath');
+            if (sv && ('' + (valOf(win, '#server') || '')) !== n.server) {
+                sv.setValue(n.server);
+            }
+            if (rp && ('' + (valOf(win, '#remotePath') || '')) !== n.remotePath) {
+                rp.setValue(n.remotePath);
+            }
+        } catch (e) {
+            ANAS.warn('mount field normalise failed: ' + ANAS.errText(e));
+        }
     }
 
     function updatePreview(win) {
@@ -1449,10 +1534,11 @@
                 remotePath: ('' + (stored.remotePath || '')).trim(),
             };
         }
-        return {
-            server: ('' + (valOf(win, '#server') || '')).trim(),
-            remotePath: ('' + (valOf(win, '#remotePath') || '')).trim(),
-        };
+        // Typed values (a create): normalised the same way the daemon does, so
+        // the probe targets the spec the write path would actually write.
+        var type = valOf(win, '#type') || 'nfs';
+        var n = normalizeMountTarget(type, valOf(win, '#server'), valOf(win, '#remotePath'));
+        return { server: n.server, remotePath: n.remotePath };
     }
 
     function testBody(win) {
@@ -1490,6 +1576,8 @@
             msg: 'Not found — the export or share does not exist on the server.' },
         'protocol-mismatch': { level: 'warn',
             msg: 'Protocol mismatch — the server does not offer the requested version.' },
+        invalid: { level: 'bad',
+            msg: 'Malformed — check the server and share fields.' },
     };
 
     function renderTestVerdict(win, data) {
@@ -1498,9 +1586,14 @@
             return;
         }
         data = data || {};
-        var verdict = ('' + first(data.verdict, data.stage, 'unreachable')).toLowerCase();
-        var spec = VERDICT_SPEC[verdict] || { level: 'warn', msg: verdict };
-        win._tested = (verdict === 'ok');
+        var raw = first(data.verdict, data.stage);
+        var spec = raw ? VERDICT_SPEC[String(raw).toLowerCase()] : null;
+        if (!spec) {
+            // An unknown (or absent) verdict says what it says — it must never
+            // claim "no route to the server" about a failure we do not know.
+            spec = { level: 'bad', msg: 'Test failed' + (data.detail ? ': ' + data.detail : '') };
+        }
+        win._tested = (data.verdict === 'ok');
         var color = spec.level === 'bad' ? 'var(--anas-danger,#c23b2c)'
             : spec.level === 'warn' ? 'var(--anas-warn,#b06a12)' : 'var(--anas-ok,#1f9c56)';
         var text = t(spec.msg) + (data.detail ? (' — ' + data.detail) : '');
@@ -1518,11 +1611,15 @@
     }
 
     function runTest(win, node) {
+        var type = valOf(win, '#type') || 'nfs';
         var spec = testSpec(win);
         var server = spec.server;
         var remotePath = spec.remotePath;
-        if (!server || !remotePath) {
-            ANAS.alertMsg('Invalid input', t('Enter a server and a share/export path to test.'));
+        // An NFS test needs only the host (the export defaults to the root);
+        // CIFS needs the share too — the daemon refuses an empty one with the
+        // guiding sentence, and the button is disabled until both are filled.
+        if (!server || (type === 'cifs' && !remotePath)) {
+            ANAS.alertMsg('Invalid input', t('Enter a server and, for CIFS, a share name to test.'));
             return;
         }
         var area = win.down('#testResult');
@@ -1541,7 +1638,9 @@
                 return;
             }
             ANAS.warn('mount test failed: ' + ANAS.errText(err));
-            renderTestVerdict(win, { verdict: 'unreachable', detail: ANAS.errText(err) });
+            // No verdict: this is a failure of the TEST ITSELF (the request did
+            // not round-trip) — render it as such, never as "unreachable".
+            renderTestVerdict(win, { detail: ANAS.errText(err) });
         });
     }
 
@@ -2088,11 +2187,17 @@
                         },
                         {
                             xtype: 'button',
+                            itemId: 'testBtn',
                             cls: 'anas-btn-mount-testconn',
                             text: t('Test connection'),
                             iconCls: 'fa fa-plug',
                             width: 160,
                             margin: '2 0 6 154',
+                            // Disabled until the target is testable (server, and
+                            // the share for CIFS) — see refreshTest. An empty
+                            // CIFS share used to run a probe that the kernel
+                            // refused as a malformed UNC.
+                            disabled: true,
                             handler: function () { runTest(win, node); },
                         },
                         {
@@ -2179,9 +2284,23 @@
             var btn = win.down('#saveBtn');
             if (btn) { btn.setDisabled(!ok); }
         };
+        // The Test button arms once the target is TESTABLE: a server always,
+        // and the share for CIFS (an NFS test is fine at the export root).
+        var refreshTest = function () {
+            try {
+                var type = valOf(win, '#type') || 'nfs';
+                var ok = !!('' + (valOf(win, '#server') || '')).trim()
+                    && (type !== 'cifs' || !!('' + (valOf(win, '#remotePath') || '')).trim());
+                var btn = win.down('#testBtn');
+                if (btn) { btn.setDisabled(!ok); }
+            } catch (e) {
+                ANAS.warn('mount test-button gate failed: ' + ANAS.errText(e));
+            }
+        };
         var onChange = function () {
             updatePreview(win);
             refreshSave();
+            refreshTest();
         };
 
         try {
@@ -2198,10 +2317,19 @@
             win.down('#remotePath').on('change', function () { maybeSuggest(); onChange(); });
             win.down('#mountpoint').on('change', onChange);
             win.down('#mountpoint').on('dirtychange', function (f) { f._userTyped = true; });
-            // Blanket: any field change refreshes the preview.
+            // The server + share fields normalise on BLUR (the shared
+            // normaliser, ported): `//10.0.0.212` becomes `10.0.0.212`,
+            // `/pictures` becomes `pictures` — the daemon re-normalises at the
+            // boundary; this keeps the typed value, the preview, and the test
+            // body in agreement while the user types.
+            var onFieldBlur = function () { normalizeFields(win); };
+            win.down('#server').on('blur', onFieldBlur);
+            win.down('#remotePath').on('blur', onFieldBlur);
+            // Blanket: any field change refreshes the preview and re-gates the
+            // Test button (a protocol toggle changes whether a share is needed).
             var fields = win.down('#form').query('field');
             for (var i = 0; i < fields.length; i++) {
-                fields[i].on('change', function () { updatePreview(win); });
+                fields[i].on('change', function () { updatePreview(win); refreshTest(); });
             }
         } catch (eWire) {
             ANAS.warn('mount wizard wiring failed: ' + ANAS.errText(eWire));
@@ -2439,11 +2567,16 @@
             return;
         }
         var type = valOf(win, '#type') || 'nfs';
-        var server = ('' + (valOf(win, '#server') || '')).trim();
-        var remotePath = ('' + (valOf(win, '#remotePath') || '')).trim();
+        // The SAME shared normaliser the daemon runs at the boundary (ported):
+        // the body carries the canonical host + share/export, never the raw
+        // typed text (`//host`, `/share`). NFS normalises a blank export to
+        // the root, so only the server can be empty there.
+        var norm = normalizeMountTarget(type, valOf(win, '#server'), valOf(win, '#remotePath'));
+        var server = norm.server;
+        var remotePath = norm.remotePath;
         var mountpoint = ('' + (valOf(win, '#mountpoint') || '')).trim();
-        if (!server || !remotePath) {
-            ANAS.alertMsg('Invalid input', t('Enter a server and a share/export path.'));
+        if (!server || (type === 'cifs' && !remotePath)) {
+            ANAS.alertMsg('Invalid input', t('Enter a server and, for CIFS, a share name.'));
             return;
         }
         if (!MP_RE.test(mountpoint)) {
