@@ -807,8 +807,9 @@ describe('SMB self-service (smbsvc.1 slice 1)', () => {
     // testparm gate + reload.
     mock.addFixture({ command: TESTPARM, result: { stdout: 'Loaded services file OK.', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
-    // The AHR `@snapshots` mount probe (not mounted yet → mount runs) + mount.
+    // The AHR `@snapshots` mount probe (not mounted yet → dir + mount run).
     mock.addFixture({ command: '/usr/bin/findmnt', args: ['-n', '-o', 'TARGET', '/mnt/anas-ahr-snapshots/ahr0'], result: { stdout: '', stderr: '', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/bin/mkdir', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: MOUNT_BIN, result: { stdout: '', stderr: '', exitCode: 0 } })
     if (opts.ahr)
       wrapAhrFindmnt(mock, opts.ahr)

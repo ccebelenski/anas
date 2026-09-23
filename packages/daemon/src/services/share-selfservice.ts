@@ -216,12 +216,22 @@ function ahrSnapshotsFstabEntry(poolName: string): MountEntry {
   }
 }
 
+const MKDIR = '/usr/bin/mkdir'
+
 /**
  * Ensure the pool's ONE read-only `@snapshots` fstab mount exists and is
  * mounted — idempotent (a second enable on the same pool rewrites nothing:
  * `hasMount` answers, and an already-mounted point is not mounted again).
  * The mount STAYS when the feature is later turned off: it is read-only,
  * harmless, and enable/disable must not count mounts (DESIGN ruling).
+ *
+ * The mountpoint directory is created before mounting: `mount` does not
+ * create it, the snapshots base is a SIBLING of the pool mount base (nothing
+ * else makes it), and a mount that silently failed would leave the feature
+ * enabled against a snapdir that does not exist — so a failed mount fails the
+ * job with mount's own stderr instead of completing (live-proof finding,
+ * 2026-09-23: the unit mock answered exit 0 where the real node said
+ * "mount point does not exist").
  */
 export async function ensureAhrSnapshotsMount(
   executor: CommandExecutor,
@@ -235,6 +245,12 @@ export async function ensureAhrSnapshotsMount(
     return addMount(current, ahrSnapshotsFstabEntry(poolName))
   })
   const probe = await executor.exec(FINDMNT, ['-n', '-o', 'TARGET', mountpoint])
-  if (probe.exitCode !== 0)
-    await executor.exec(MOUNT, [mountpoint])
+  if (probe.exitCode !== 0) {
+    await executor.exec(MKDIR, ['-p', mountpoint])
+    const mounted = await executor.exec(MOUNT, [mountpoint])
+    if (mounted.exitCode !== 0) {
+      throw new Error(`the Previous Versions snapshots mount at '${mountpoint}' failed to mount: `
+        + `${mounted.stderr.trim() || `mount exited ${mounted.exitCode}`}`)
+    }
+  }
 }

@@ -43,11 +43,20 @@ const execFileAsync = promisify(execFile)
  *      a plain directory under /var/tmp ("not on a ZFS dataset or an AHR
  *      pool"), and enabling on a share carrying a hand-written
  *      `vfs objects = acl_xattr` line ("custom vfs objects line")
- *   5. the AHR half is SKIPPED — see the reason in the test body
+ *   5. the AHR half on REAL disks (`smbsvc-fixture.sh ahr-up` — loop devices
+ *      have no /dev/disk/by-id entry and the daemon addresses AHR create disks
+ *      exclusively by by-id): pool `ahrpv` created through POST /v1/ahr
+ *      (confirm flow), share + Previous Versions → absolute
+ *      `shadow:snapdir` into the ONE read-only `@snapshots` fstab mount,
+ *      smbclient puts a file, POST /v1/ahr/ahrpv/snapshots, the old content
+ *      reads back through @GMT, re-enable/second-share reuse the mount,
+ *      disable keeps the mount (by design), and DESTROY takes the mount AND
+ *      its fstab line with the pool
  *
- * Every test leaves the node as found: the share, schedules, and share user
+ * Every test leaves the node as found: the shares, schedules, and share users
  * this file creates are removed through their own API doors (best-effort
- * safety nets behind them), and the fixture is torn down (down) in afterAll.
+ * safety nets behind them), and the fixtures are torn down (down + ahr-down)
+ * in afterAll.
  */
 
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
@@ -70,6 +79,28 @@ const DAILY_GMT = '@GMT-2026.09.20-10.00.00'
 const REFUSAL_DIR = '/var/tmp/smbsvc-refusal'
 const REFUSAL_SHARE = 'pvrefusal'
 const CUSTOM_SHARE = 'pvcustom'
+
+// ---- The AHR half (test 5) — real disks, the pool made through the API ------
+
+const AHR_POOL = 'ahrpv'
+const AHR_MOUNT = `/mnt/anas-ahr/${AHR_POOL}`
+const AHR_SNAP_MOUNT = `/mnt/anas-ahr-snapshots/${AHR_POOL}`
+const AHR_SHARE = 'ahrpv'
+const AHR_SHARE2 = 'ahrpv-two'
+const AHR_SHARE_FILE = 'docs.txt'
+const AHR_USER = 'smbsvc_ahr'
+const AHR_PW = 'anas-ahr-proof'
+// No schedule targets an AHR pool in this file → the design's fallback bucket.
+const AHR_SNAP_FORMAT = 'anas-daily-%Y-%m-%dT%H%M%SZ'
+const AHR_SNAPSHOT = 'anas-daily-2026-09-22T100000Z'
+// vfs_shadow_copy2 renders the ANAS format as a @GMT path with dots/colons.
+const AHR_GMT = '@GMT-2026.09.22-10.00.00'
+const AHR_V1 = 'ahr pv report v1'
+const AHR_V2 = 'ahr pv report v2'
+// The fixture's two AHR disks (smbsvc-fixture.sh ahr-up): hot slots 7+8 —
+// 1–6 belong to other specs. Serial → by-id prefix.
+const AHR_HOT_SERIALS = ['ANAS_HOT7', 'ANAS_HOT8']
+const AHR_BY_ID = AHR_HOT_SERIALS.map(s => `scsi-0QEMU_QEMU_HARDDISK_${s}`)
 
 /** The plain-share stanza, captured on the node before the feature goes on. */
 let stanzaBeforeEnable = ''
@@ -111,6 +142,7 @@ async function runJob(
   url: string,
   data?: unknown,
   headers?: Record<string, string>,
+  timeout = 90_000,
 ): Promise<void> {
   const res = await ctx[verb](url, {
     ...(data !== undefined ? { data } : {}),
@@ -118,7 +150,7 @@ async function runJob(
   })
   expect(res.status(), await res.text()).toBe(202)
   const { id } = (await res.json()).job
-  const job = await awaitJob(ctx, id)
+  const job = await awaitJob(ctx, id, timeout)
   expect(job.status, job.error).toBe('completed')
 }
 
@@ -154,11 +186,27 @@ async function shareStanza(name: string): Promise<string> {
   return sshExec(`echo ${b64} | base64 -d | python3`)
 }
 
-/** smbclient ON THE NODE, authenticated as the share user. */
-async function smbClient(commands: string): Promise<string> {
+/** smbclient ON THE NODE, authenticated as a share user. */
+async function smbClientAs(share: string, user: string, pw: string, commands: string): Promise<string> {
   return sshExec(
-    `smbclient //localhost/${SHARE} -U ${SHARE_USER}%${SHARE_PW} -c '${commands}'`,
+    `smbclient //localhost/${share} -U ${user}%${pw} -c '${commands}'`,
   )
+}
+
+/** smbclient ON THE NODE, authenticated as the ZFS fixture's share user. */
+function smbClient(commands: string): Promise<string> {
+  return smbClientAs(SHARE, SHARE_USER, SHARE_PW, commands)
+}
+
+/** The /etc/fstab lines containing `needle`, as they stand on the node. */
+async function fstabLinesMatching(needle: string): Promise<string[]> {
+  const out = await sshExec(`grep -F '${needle}' /etc/fstab || true`)
+  return out === '' ? [] : out.split('\n')
+}
+
+/** A file's presence on the node — `test -e` that never throws. */
+async function fileExists(path: string): Promise<boolean> {
+  return (await sshExec(`test -e '${path}' && echo yes || echo no`)) === 'yes'
 }
 
 /** Absolute path of the fixture script, relative to this spec file. */
@@ -202,14 +250,16 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
         }
         catch { /* best-effort */ }
       }
-      try {
-        const challenge = await ctx.delete(`${V1}/identity/users/${SHARE_USER}`)
-        const code = challenge.headers()['x-anas-confirm-code']
-        if (challenge.status() === 409 && code)
-          await runJob(ctx, 'delete', `${V1}/identity/users/${SHARE_USER}`, undefined, { 'x-anas-confirm': code })
+      for (const user of [SHARE_USER, AHR_USER]) {
+        try {
+          const challenge = await ctx.delete(`${V1}/identity/users/${user}`)
+          const code = challenge.headers()['x-anas-confirm-code']
+          if (challenge.status() === 409 && code)
+            await runJob(ctx, 'delete', `${V1}/identity/users/${user}`, undefined, { 'x-anas-confirm': code })
+        }
+        catch { /* best-effort */ }
       }
-      catch { /* best-effort */ }
-      for (const name of [SHARE, REFUSAL_SHARE, CUSTOM_SHARE]) {
+      for (const name of [SHARE, REFUSAL_SHARE, CUSTOM_SHARE, AHR_SHARE, AHR_SHARE2]) {
         try {
           await removeShareViaApi(ctx, name)
         }
@@ -221,8 +271,12 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     finally {
       await ctx.dispose()
       await removeShareUser(SHARE_USER).catch(() => {})
+      await removeShareUser(AHR_USER).catch(() => {})
       await sshExec(`rm -rf ${REFUSAL_DIR}`).catch(() => {})
       await execFileAsync(FIXTURE_SH, ['down']).catch(() => {})
+      // The AHR half's disks and any pool remnants — idempotent, silent when
+      // test 5 never ran (or destroyed everything through the API itself).
+      await execFileAsync(FIXTURE_SH, ['ahr-down']).catch(() => {})
     }
   })
 
@@ -381,7 +435,159 @@ test.describe('Previous Versions on SMB shares (smbsvc.1)', () => {
     }
   })
 
-  test('5 — AHR half: Previous Versions through an AHR @snapshots mount', async () => {
-    test.skip(true, 'No loop-device AHR pool can be created through the daemon\'s own API: loop devices have no /dev/disk/by-id entry and the daemon addresses AHR create disks exclusively by by-id (shared DiskId). The fixture therefore builds no AHR pool; proving the AHR half (fstab @snapshots mount + absolute shadow:snapdir) needs a real-disk AHR pool.')
+  test('5 — AHR half: real-disk pool, the @snapshots mount, smbclient through the snapshot, and destroy takes the mount with the pool', async ({ playwright, pveTicket }) => {
+    // A real-disk AHR pool (loop devices have no /dev/disk/by-id entry, and the
+    // daemon addresses AHR create disks exclusively by by-id — shared DiskId):
+    // `smbsvc-fixture.sh ahr-up` attaches the two hot disks the fixture owns
+    // (indices 7+8, serials ANAS_HOT7/8 — 1–6 belong to other tests), and the
+    // POOL is created here through the daemon's own API, never by hand.
+    test.setTimeout(600_000)
+
+    if (!(await fileExists(`/dev/disk/by-id/${AHR_BY_ID[0]}`)) || !(await fileExists(`/dev/disk/by-id/${AHR_BY_ID[1]}`)))
+      await execFileAsync(FIXTURE_SH, ['ahr-up'])
+    expect(await fileExists(`/dev/disk/by-id/${AHR_BY_ID[0]}`), `${AHR_BY_ID[0]} present`).toBe(true)
+    expect(await fileExists(`/dev/disk/by-id/${AHR_BY_ID[1]}`), `${AHR_BY_ID[1]} present`).toBe(true)
+
+    const ctx = await authedContext(playwright, pveTicket)
+    try {
+      // The two hot disks must be live inventory and 'available' — the create
+      // route resolves every id against /v1/disks and refuses anything else.
+      const disks = (await (await ctx.get(`${V1}/disks`)).json()).data as { id: string, status: string }[]
+      const selected = AHR_HOT_SERIALS.map((serial) => {
+        const disk = disks.find(d => d.id.includes(serial))
+        expect(disk, `disk ${serial} in /v1/disks and available`).toBeTruthy()
+        expect(disk!.status).toBe('available')
+        return disk!.id
+      })
+
+      // 1. Create the pool through the API (confirm flow — the disks are
+      // wiped), AHR-1 on two disks = a RAID1 band; wait out the create job.
+      const createChallenge = await ctx.post(`${V1}/ahr`, {
+        data: { name: AHR_POOL, tier: 'ahr1', disks: selected },
+      })
+      expect(createChallenge.status()).toBe(409)
+      const createCode = createChallenge.headers()['x-anas-confirm-code']
+      expect(createCode).toBeTruthy()
+      await runJob(ctx, 'post', `${V1}/ahr`, { name: AHR_POOL, tier: 'ahr1', disks: selected }, { 'x-anas-confirm': createCode }, 300_000)
+
+      const poolRes = await ctx.get(`${V1}/ahr/${AHR_POOL}`)
+      expect(poolRes.status()).toBe(200)
+      const pool = (await poolRes.json()).data
+      expect(pool.mountpoint).toBe(AHR_MOUNT)
+      expect(pool.subvolLayout).toBe(true) // §12 layout — snapshots exist at all
+
+      // A share user of its own, a share on the pool mountpoint, Previous
+      // Versions on. No schedule targets an AHR pool here → the design's
+      // fallback bucket: daily.
+      await runJob(ctx, 'post', `${V1}/identity/users`, { name: AHR_USER, smbPassword: AHR_PW })
+      await runJob(ctx, 'post', `${V1}/shares/smb`, { name: AHR_SHARE, path: AHR_MOUNT })
+      // The pool directory is root-owned 755 (create leaves it that way); the
+      // share user needs write to plant the proof file. The product path for
+      // this is the Permissions editor; the proof just opens the directory.
+      await sshExec(`chmod 777 ${AHR_MOUNT}`)
+      await runJob(ctx, 'put', `${V1}/shares/smb/${AHR_SHARE}`, { previousVersions: { enabled: true } })
+      const detail = await ctx.get(`${V1}/shares/smb/${AHR_SHARE}`)
+      expect((await detail.json()).data.previousVersions).toEqual({ bucket: 'daily' })
+
+      // 2. The stanza carries the AHR shape: absolute snapdir INTO the
+      // snapshots mount, snapdirseverywhere OFF (the mount is the snapshot
+      // home, there is nothing beneath the share to walk into).
+      const stanza = await shareStanza(AHR_SHARE)
+      expect(stanza).toContain('vfs objects = shadow_copy2')
+      expect(stanza).toContain(`shadow:format = ${AHR_SNAP_FORMAT}`)
+      expect(stanza).toContain(`shadow:snapdir = ${AHR_SNAP_MOUNT}`)
+      expect(stanza).toContain('shadow:snapdirseverywhere = no')
+      expect(stanza).toContain('shadow:localtime = no')
+
+      // EXACTLY ONE fstab line for the mount, read-only, subvol=@snapshots —
+      // and it is actually mounted, read-only, right now.
+      const snapLines = await fstabLinesMatching(AHR_SNAP_MOUNT)
+      expect(snapLines).toHaveLength(1)
+      expect(snapLines[0]).toContain('subvol=@snapshots')
+      expect(snapLines[0]).toContain(' ro,')
+      const findmntSnap = await sshExec(`findmnt -n -o TARGET,OPTIONS ${AHR_SNAP_MOUNT}`)
+      expect(findmntSnap).toContain(AHR_SNAP_MOUNT)
+      expect(findmntSnap).toContain('ro')
+
+      // 3. A file through smbclient, a snapshot through the daemon's own API,
+      // the file changed — the FIRST content reads back through @GMT.
+      await sshExec(`printf '${AHR_V1}\\n' > /var/tmp/ahr-v1.txt && chmod 644 /var/tmp/ahr-v1.txt`)
+      await sshExec(`printf '${AHR_V2}\\n' > /var/tmp/ahr-v2.txt && chmod 644 /var/tmp/ahr-v2.txt`)
+      await smbClientAs(AHR_SHARE, AHR_USER, AHR_PW, `put /var/tmp/ahr-v1.txt ${AHR_SHARE_FILE}`)
+      await runJob(ctx, 'post', `${V1}/ahr/${AHR_POOL}/snapshots`, { name: AHR_SNAPSHOT })
+      await smbClientAs(AHR_SHARE, AHR_USER, AHR_PW, `put /var/tmp/ahr-v2.txt ${AHR_SHARE_FILE}`)
+
+      // The snapshot is visible through the read-only mount (that mount IS the
+      // snapshot home the share's snapdir points into).
+      expect(await fileExists(`${AHR_SNAP_MOUNT}/${AHR_SNAPSHOT}/${AHR_SHARE_FILE}`)).toBe(true)
+
+      const info = await smbClientAs(AHR_SHARE, AHR_USER, AHR_PW, `allinfo ${AHR_SHARE_FILE}`)
+      const gmt = info.split('\n').map(l => l.trim()).filter(l => l.startsWith('@GMT-'))
+      expect(gmt).toEqual([AHR_GMT])
+      const oldTmp = '/var/tmp/ahr-old.txt'
+      await smbClientAs(AHR_SHARE, AHR_USER, AHR_PW, `get ${AHR_GMT}/${AHR_SHARE_FILE} ${oldTmp}`)
+      expect(await sshExec(`cat ${oldTmp} && rm -f ${oldTmp}`)).toBe(AHR_V1)
+
+      // 4. Enable a second time: idempotent — still ONE fstab line.
+      await runJob(ctx, 'put', `${V1}/shares/smb/${AHR_SHARE}`, { previousVersions: { enabled: true } })
+      expect(await fstabLinesMatching(AHR_SNAP_MOUNT)).toHaveLength(1)
+
+      // A second share on the SAME pool reuses the mount: still one line, same
+      // absolute snapdir in its own stanza.
+      await runJob(ctx, 'post', `${V1}/shares/smb`, { name: AHR_SHARE2, path: AHR_MOUNT })
+      await runJob(ctx, 'put', `${V1}/shares/smb/${AHR_SHARE2}`, { previousVersions: { enabled: true } })
+      expect(await fstabLinesMatching(AHR_SNAP_MOUNT)).toHaveLength(1)
+      expect(await shareStanza(AHR_SHARE2)).toContain(`shadow:snapdir = ${AHR_SNAP_MOUNT}`)
+
+      // Disable: the stanza goes clean and the detail forgets the feature —
+      // but the mount and its fstab line REMAIN (the design's no-counting rule:
+      // the line stays across enable/disable, only destroy ends it).
+      await runJob(ctx, 'put', `${V1}/shares/smb/${AHR_SHARE}`, { previousVersions: { enabled: false } })
+      const afterDisable = await ctx.get(`${V1}/shares/smb/${AHR_SHARE}`)
+      expect((await afterDisable.json()).data.previousVersions).toBeUndefined()
+      const cleanStanza = await shareStanza(AHR_SHARE)
+      expect(cleanStanza).not.toContain('vfs objects')
+      expect(cleanStanza).not.toContain('shadow:')
+      expect(await fstabLinesMatching(AHR_SNAP_MOUNT)).toHaveLength(1)
+      expect(await sshExec(`findmnt -n -o TARGET ${AHR_SNAP_MOUNT}`)).toContain(AHR_SNAP_MOUNT)
+
+      // 5. Destroy the pool through the API (confirm flow). This is where the
+      // @snapshots mount must go WITH the pool: a still-mounted one holds the
+      // LV open (lvremove fails the job) and its fstab line would dangle across
+      // a pool that no longer exists.
+      const destroyChallenge = await ctx.delete(`${V1}/ahr/${AHR_POOL}`)
+      expect(destroyChallenge.status()).toBe(409)
+      const destroyCode = destroyChallenge.headers()['x-anas-confirm-code']
+      expect(destroyCode).toBeTruthy()
+      await runJob(ctx, 'delete', `${V1}/ahr/${AHR_POOL}`, undefined, { 'x-anas-confirm': destroyCode }, 300_000)
+
+      expect((await ctx.get(`${V1}/ahr/${AHR_POOL}`)).status()).toBe(404)
+      // No dangling fstab line for the snapshots mount — and none for the pool.
+      expect(await fstabLinesMatching(AHR_SNAP_MOUNT)).toEqual([])
+      expect(await fstabLinesMatching(`${AHR_MOUNT} `)).toEqual([])
+      // The mount itself is gone (destroy unmounted it before tearing the LV).
+      expect(await sshExec(`findmnt -n -o TARGET ${AHR_SNAP_MOUNT} 2>/dev/null || true`)).toBe('')
+    }
+    finally {
+      // Best-effort cleanup through the API doors (a crashed run leaves the
+      // rest to ahr-down in afterAll: stanzas, mounts, fstab, LVM/md, disks).
+      for (const name of [AHR_SHARE, AHR_SHARE2]) {
+        try {
+          await removeShareViaApi(ctx, name)
+        }
+        catch {
+          await removeSmbShare(name).catch(() => {})
+        }
+      }
+      try {
+        const userChallenge = await ctx.delete(`${V1}/identity/users/${AHR_USER}`)
+        const userCode = userChallenge.headers()['x-anas-confirm-code']
+        if (userChallenge.status() === 409 && userCode)
+          await runJob(ctx, 'delete', `${V1}/identity/users/${AHR_USER}`, undefined, { 'x-anas-confirm': userCode })
+      }
+      catch { /* best-effort */ }
+      await ctx.dispose()
+      await sshExec('rm -f /var/tmp/ahr-v1.txt /var/tmp/ahr-v2.txt /var/tmp/ahr-old.txt').catch(() => {})
+    }
   })
 })

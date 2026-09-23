@@ -14,12 +14,14 @@ import { DEFAULT_MDADM_CONF, unpinArrays } from './ahr-mdadm-conf.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS, indexLsblk } from './ahr-topology.js'
 import { editConfig, readConfig } from './config-writer.js'
+import { ahrSnapshotsMountpoint } from './share-selfservice.js'
 
 /**
  * AHR pool destruction (Epic 11 + AHR, docs/AHR-DESIGN.md §4) — the DESTROY
  * mutation behind DELETE /v1/ahr/:name. Tears the stack down top-down:
  *
- *   umount → fstab line removed (surgical) → lvremove/vgremove/pvremove
+ *   umount (pool mountpoint AND the Previous Versions @snapshots mount)
+ *     → fstab lines removed (surgical) → lvremove/vgremove/pvremove
  *     → mdadm --stop per array → --zero-superblock per member partition
  *     → sgdisk --zap-all per member DISK → partlabel sweep for members no
  *       array still claims (issue #16) → unpin mdadm.conf ARRAY lines
@@ -192,15 +194,35 @@ export async function destroyAhrPool(
     await run(executor, UMOUNT, [mountpoint], { busyPath: mountpoint })
   }
 
-  // --- fstab: drop the pool's line (found by mountpoint OR by LV spec, so a
-  // half-destroyed, already-unmounted pool still gets its line removed) -------
+  // The Previous Versions @snapshots mount (smbsvc.1) is a SIBLING of the pool
+  // mount base — never under the pool mountpoint — and the design keeps it
+  // across enable/disable on purpose. Destroy is not disable: with the LV gone
+  // the mount has no filesystem left to show, a still-mounted one holds the LV
+  // open (the lvremove below would fail on it), and its fstab line would dangle
+  // across a pool that no longer exists. This is the one place the "the mount
+  // stays" ruling ends. Unmounted but fstab-claimed is still torn down — the
+  // mount is found live (like everything else here), never inferred from fstab.
+  const snapMount = ahrSnapshotsMountpoint(name)
+  if (mounts.some(m => m.target === snapMount)) {
+    updateProgress(`Unmounting ${snapMount} (Previous Versions @snapshots mount)`)
+    await run(executor, UMOUNT, [snapMount], { busyPath: snapMount })
+  }
+
+  // --- fstab: drop the pool's lines (found by mountpoint OR by LV spec, so a
+  // half-destroyed, already-unmounted pool still gets its line removed). The LV
+  // spec matches BOTH the pool's own line and the @snapshots line — every
+  // match goes; a destroyed pool leaves no line behind. ------------------------
   const fstabText = await readConfig(opts.fstabPath)
-  const fstabEntry = parseFstab(fstabText).find(
-    e => e.mountpoint === mountpoint || e.spec === ahrLvPath(name),
+  const fstabMountpoints = new Set(
+    parseFstab(fstabText)
+      .filter(e => e.mountpoint === mountpoint || e.mountpoint === snapMount || e.spec === ahrLvPath(name))
+      .map(e => e.mountpoint),
   )
-  if (fstabEntry) {
-    updateProgress('Removing /etc/fstab entry')
-    await editConfig(opts.fstabPath, current => removeMount(current, fstabEntry.mountpoint))
+  for (const mp of fstabMountpoints) {
+    updateProgress(`Removing /etc/fstab entry for ${mp}`)
+    await editConfig(opts.fstabPath, current => removeMount(current, mp))
+  }
+  if (fstabMountpoints.size > 0) {
     await run(executor, SYSTEMCTL, ['daemon-reload'])
   }
 

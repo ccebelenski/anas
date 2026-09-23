@@ -265,17 +265,37 @@ describe('ensureAhrSnapshotsMount — ONE fstab line, mounted once (smbsvc.1)', 
     await rm(dir, { recursive: true, force: true })
   })
 
-  it('writes the read-only @snapshots line and mounts it now', async () => {
+  it('writes the read-only @snapshots line, makes the mountpoint dir, and mounts it now', async () => {
     const mock = new MockExecutor()
     mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'TARGET', ahrSnapshotsMountpoint('tank')], result: { stdout: '', stderr: '', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/bin/mkdir', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/mount', result: { stdout: '', stderr: '', exitCode: 0 } })
     await ensureAhrSnapshotsMount(mock, fstabPath, 'tank')
     const fstab = await readFile(fstabPath, 'utf8')
     const line = fstab.split('\n').find(l => l.includes('anas-ahr-snapshots/tank'))
     assert.ok(line, 'the @snapshots mount line exists')
     assert.match(line!, /^\/dev\/tank\/tank-vol\s+\/mnt\/anas-ahr-snapshots\/tank\s+btrfs\s+ro,nofail,subvol=@snapshots\s+0 0$/)
-    // The mount happened NOW, via the fstab entry.
+    // The mountpoint directory was made (mount does not create it — the live
+    // proof caught the silent failure this was) and the mount happened NOW,
+    // via the fstab entry.
+    assert.deepEqual(mock.calls.find(c => c.command === '/usr/bin/mkdir'), { command: '/usr/bin/mkdir', args: ['-p', ahrSnapshotsMountpoint('tank')] })
     const mountCall = mock.calls.find(c => c.command === '/usr/bin/mount')
     assert.deepEqual(mountCall, { command: '/usr/bin/mount', args: [ahrSnapshotsMountpoint('tank')] })
+  })
+
+  it('a FAILED mount fails loudly with the sentence (never a completed job over a missing mount)', async () => {
+    // The live-proof finding: `mount` says "mount point does not exist" and the
+    // old code completed the job anyway — the feature enabled against a snapdir
+    // that was never mounted. The mount's stderr must surface.
+    const mock = new MockExecutor()
+    mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'TARGET', ahrSnapshotsMountpoint('tank')], result: { stdout: '', stderr: '', exitCode: 1 } })
+    mock.addFixture({ command: '/usr/bin/mkdir', result: { stdout: '', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/mount', result: { stdout: '', stderr: 'mount point does not exist', exitCode: 2 } })
+    await assert.rejects(
+      ensureAhrSnapshotsMount(mock, fstabPath, 'tank'),
+      (err: Error) => err.message.includes(`'${ahrSnapshotsMountpoint('tank')}' failed to mount`)
+        && err.message.includes('mount point does not exist'),
+    )
   })
 
   it('a second ensure rewrites nothing and does not mount again (idempotent)', async () => {

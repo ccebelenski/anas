@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
 usage() {
-  echo "Usage: remove-disk.sh [--nvme] <1|2|3>"
+  echo "Usage: remove-disk.sh [--nvme] <n>"
+  echo "  <n>     Disk index (1,2,… — must match the add-disk.sh index; 0 is the cdrom, never valid)"
   echo "  --nvme  Detach NVMe device (default: SCSI)"
   exit 1
 }
@@ -16,7 +17,7 @@ DISK_NUM=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --nvme) BUS="nvme"; shift ;;
-    [1-3])  DISK_NUM="$1"; shift ;;
+    [1-9]|[1-9][0-9]) DISK_NUM="$1"; shift ;;
     *)      usage ;;
   esac
 done

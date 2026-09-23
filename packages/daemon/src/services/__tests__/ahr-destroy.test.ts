@@ -25,6 +25,8 @@ const GONE = 'ata-ANAS_GONE_3G'
 const UUID_T2 = '11111111:22222222:33333333:44444444'
 const UUID_FOREIGN = '99999999:99999999:99999999:99999999'
 const MOUNTPOINT = '/mnt/test-ahr/t2'
+/** The Previous Versions @snapshots mount (smbsvc.1) — sibling of the pool mount base. */
+const SNAP_MOUNT = '/mnt/anas-ahr-snapshots/t2'
 
 const FSTAB_SEED = [
   '# static file system information',
@@ -279,6 +281,98 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     const fstab = await readFile(fstabPath, 'utf8')
     assert.ok(!fstab.includes('/dev/t2/t2-vol'))
     assert.ok(!executor.calls.some(c => c.command === '/usr/bin/umount'))
+  })
+
+  /**
+   * smbsvc.1: enabling Previous Versions on an AHR share adds ONE read-only
+   * `@snapshots` fstab line at /mnt/anas-ahr-snapshots/<pool> — SAME LV spec as
+   * the pool's own line — and the design keeps that mount across enable/disable
+   * on purpose. Destroy must take it with the pool: a still-mounted one holds
+   * the LV open (lvremove would fail the job), and a surviving line would dangle
+   * across a pool that no longer exists. The one place the "the mount stays"
+   * ruling ends.
+   */
+  it('a Previous Versions @snapshots mount is unmounted and its fstab line goes with the pool', async () => {
+    await writeFile(fstabPath, [
+      '# static file system information',
+      'UUID=abc / ext4 errors=remount-ro 0 1',
+      `/dev/t2/t2-vol ${MOUNTPOINT} btrfs nofail 0 0`,
+      `/dev/t2/t2-vol ${SNAP_MOUNT} btrfs ro,nofail,subvol=@snapshots 0 0`,
+      '',
+    ].join('\n'))
+    await writeFile(confPath, '')
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_EMPTY, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: {
+      stdout: JSON.stringify({ filesystems: [
+        { target: MOUNTPOINT, source: '/dev/mapper/t2-t2--vol', fstype: 'btrfs', options: 'rw,subvol=/@data' },
+        { target: SNAP_MOUNT, source: '/dev/mapper/t2-t2--vol', fstype: 'btrfs', options: 'ro,subvol=/@snapshots' },
+      ] }),
+      stderr: '',
+      exitCode: 0,
+    } })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 1 } })
+    executor.addFixture({ command: '/usr/sbin/sgdisk', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/umount', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    const result = await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.deepEqual(result, { destroyed: 't2' })
+
+    // BOTH mounts go — pool mountpoint first, then the @snapshots sibling —
+    // before the LVM teardown reads the LV.
+    assert.deepEqual(
+      executor.calls.filter(c => c.command === '/usr/bin/umount').map(c => c.args[0]),
+      [MOUNTPOINT, SNAP_MOUNT],
+    )
+    assert.ok(progress.some(m => m.includes(SNAP_MOUNT) && m.includes('@snapshots')))
+    // Both fstab lines (same spec, two mountpoints) are gone; the rest survives.
+    const fstab = await readFile(fstabPath, 'utf8')
+    assert.ok(!fstab.includes('/dev/t2/t2-vol'))
+    assert.ok(fstab.includes('UUID=abc / ext4'))
+  })
+
+  it('an unmounted pool with a still-mounted @snapshots mount: only the @snapshots unmount runs, its line still removed', async () => {
+    // Topology reports the LV device path as "mountpoint" when the pool is not
+    // mounted — but the @snapshots mount is independent of that state (it stays
+    // across disable). Destroy must still unmount it and take both lines.
+    await writeFile(fstabPath, [
+      'UUID=abc / ext4 errors=remount-ro 0 1',
+      `/dev/t2/t2-vol ${SNAP_MOUNT} btrfs ro,nofail,subvol=@snapshots 0 0`,
+      '',
+    ].join('\n'))
+    await writeFile(confPath, '')
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_EMPTY, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: {
+      stdout: JSON.stringify({ filesystems: [
+        { target: SNAP_MOUNT, source: '/dev/mapper/t2-t2--vol', fstype: 'btrfs', options: 'ro,subvol=/@snapshots' },
+      ] }),
+      stderr: '',
+      exitCode: 0,
+    } })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 1 } })
+    executor.addFixture({ command: '/usr/sbin/sgdisk', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/systemctl', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/umount', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    await destroyAhrPool(executor, pool('/dev/t2/t2-vol'), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+
+    // The pool mountpoint is not mounted (nothing to unmount there) — but the
+    // @snapshots mount is, and holding the LV open would fail the lvremove.
+    assert.deepEqual(
+      executor.calls.filter(c => c.command === '/usr/bin/umount').map(c => c.args[0]),
+      [SNAP_MOUNT],
+    )
+    const fstab = await readFile(fstabPath, 'utf8')
+    assert.ok(!fstab.includes('/dev/t2/t2-vol'))
+    assert.ok(fstab.includes('UUID=abc / ext4'))
   })
 
   /**
