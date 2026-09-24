@@ -215,3 +215,311 @@ index.html.tpl handling). The `fields` param carries matcher-filterable metadata
 - ~~**Production data-offset value (GT-5)**~~: **CLOSED 2026-07-24** — calibrated
   (see GT-5 above); pin is 256 MiB for members ≥ 128 GiB, 4 MiB below.
 - **mdadm.conf ARRAY pinning vs tolerate-both (GT-3)**: decide at build.
+
+## 18. Read cache — live cache failure and slice publishing (2026-09-24)
+
+> Captured on the stunt node (PVE 9.2.20, kernel 7.0.14-17-pve, lvm2
+> 2.03.31-2+pmx1, ANAS 0.3.5 build installed). Answers the two "Open before
+> dispatch" items of AHR-DESIGN §13 (read cache — lvmcache writethrough,
+> GitHub #63) ahead of the ahrcache.1 dispatch. Real virtual disks, not loop
+> devices. No product code was changed; this is measurement only.
+
+**The bed.** AHR-1 pool `gtcache` on two 1 GiB disks (`ANAS_HOT7`/`ANAS_HOT8`),
+created through the daemon's own API (`POST /v1/ahr`, confirm-code flow, job to
+completion — never by hand), `@data`/`@snapshots` layout, mounted at
+`/mnt/anas-ahr/gtcache`. Loaded with 256 × 1 MiB random files plus a sha256
+manifest. Cache SSD stand-in = one 512 MiB GPT slice on a third 2 GiB disk
+(`ANAS_HOT9`), attached by hand exactly as §13 specifies:
+
+```
+# sgdisk -n 1:1M:+512M -t 1:8E00 -c 1:gtcache-cache1 \
+      /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9
+# wipefs -a  /dev/disk/by-id/…ANAS_HOT9-part1
+# pvcreate   /dev/disk/by-id/…ANAS_HOT9-part1
+# vgextend gtcache /dev/disk/by-id/…ANAS_HOT9-part1
+# lvcreate -n gtcache-cache -l 100%PVS gtcache /dev/disk/by-id/…ANAS_HOT9-part1
+# lvconvert -y --type cache --cachevol gtcache-cache --cachemode writethrough \
+      gtcache/gtcache-vol
+  Logical volume gtcache/gtcache-vol is now cached.
+```
+
+**GT-18 — Cache attach AND detach are live operations on a mounted pool.**
+`lvconvert --type cache` ran with the pool mounted and in use; the filesystem
+never blinked, and `/dev/mapper/gtcache-gtcache--vol` kept both its name and
+its dm number (252:0 → `dm-0`) across attach, failure and detach. Mounts,
+shares, LUNs and the fstab line are genuinely untouched, as §13 assumes. Two
+mechanical notes for the step: `lvconvert` needs `-y` to run non-interactively,
+and `pvcreate` **refuses** non-interactively when the slice carries a stale
+foreign signature — on a recycled disk it printed
+
+```
+WARNING: zfs_member signature detected on …ANAS_HOT9-part1 at offset 16384. Wipe it? [y/n]: [n]
+  Aborted wiping of zfs_member.
+  1 existing signature left on the device.
+```
+
+and then `vgextend` failed with `Physical Volume "…" not found in Volume Group
+"gtcache"`. The `cache-attach` step must `wipefs -a` the slice before
+`pvcreate`, the same way `ahr-create` wipes a member disk.
+
+After warming (eight full read passes over the 256 MiB set, page cache dropped
+each pass) the cache was live and hot: `cache_used_blocks` 3870/8000 (64 KiB
+blocks ≈ 241 MiB), `cache_read_hits` climbing ~3 900 per pass,
+`cache_dirty_blocks` 0 — zero by construction in writethrough, as designed.
+
+### (a) The cache device failing under a LIVE pool
+
+Cache slice made to fail by detaching its virtual disk live (`remove-disk.sh 9`)
+while a direct-I/O reader loop ran against the pool.
+
+```
+2026-09-24T19:32:00 pass=14 file=f15.bin rc=0 | 1048576 bytes … 132 MB/s
+2026-09-24T19:32:01 pass=15 file=f16.bin rc=1 | dd: error reading '…/f16.bin': Input/output error
+2026-09-24T19:32:02 pass=16 file=f17.bin rc=1 | dd: error reading '…/f17.bin': Input/output error
+…
+```
+
+**GT-19 — dm-cache does NOT bypass a dead cache device: reads fail fast with
+EIO, they do not hang, and they do not fall through to the origin.** The
+failure was immediate (same second as the detach) and total — files that had
+never been promoted failed identically to cached ones, and a raw read of the LV
+itself failed:
+
+```
+# dd if=/dev/mapper/gtcache-gtcache--vol of=/dev/null bs=4k count=1 iflag=direct
+dd: error reading '/dev/mapper/gtcache-gtcache--vol': Input/output error
+```
+
+The detection signal is clean and structured enough to poll:
+
+```
+# dmsetup status
+gtcache-gtcache--vol: 0 2080768 cache Error
+# pvs
+  WARNING: Couldn't find device with uuid 18IiiM-….
+  WARNING: VG gtcache is missing PV 18IiiM-… (last written to /dev/sdd1).
+  PV         VG      Fmt  Attr PSize    PFree
+  /dev/md127 gtcache lvm2 a--  1016.00m    0
+  [unknown]  gtcache lvm2 a-m   508.00m    0
+```
+
+`dmsetup status` reports the cache target as the single token `Error`; `lvs`,
+`pvs` and `vgs` mark the partial VG (`Cwi-aoC-p-`, `wz-pn-`, PV attr `a-m`) and
+name the missing PV UUID on stderr. **The cache counters in `lvs` go stale
+rather than absent** — they keep reporting the last values read before the
+metadata died (3881 used blocks, 25 632 hits), so the pool-detail `cache` block
+must not present them as live once the target reads `Error`.
+
+**btrfs behaviour splits by workload, and this is the part that decides the
+recovery rung.** Under a pure *read* load the filesystem stayed **rw** and just
+counted errors — `btrfs device stats` read_io_errs climbing, `BTRFS error
+(device dm-0): bdev … errs: wr 0, rd 28, flush 0, corrupt 0, gen 0`. The first
+*write* took it down:
+
+```
+[360961.968586] device-mapper: cache: 252:0: aborting current metadata transaction
+[360961.988273] device-mapper: cache: 252:0: failed to abort metadata transaction
+[360976.264789] BTRFS info (device dm-0 state E): forced readonly
+[360976.264791] BTRFS warning (device dm-0 state E): Skipping commit of aborted transaction.
+[360976.264793] BTRFS error (device dm-0 state EA): Transaction aborted (error -5)
+```
+
+**GT-20 — `lvconvert --uncache` is the whole recovery, it works with the device
+absent and the pool mounted, and it takes under a third of a second.** No
+`--force`, no unmount, no prior `vgreduce`:
+
+```
+# lvconvert --uncache gtcache/gtcache-vol
+  WARNING: VG gtcache is missing PV yqLyG2-… (last written to /dev/sdd1).
+  WARNING: Skipping flush for failed cache gtcache/gtcache-vol.
+  Logical volume "gtcache-cache" successfully removed.
+  Logical volume gtcache/gtcache-vol is not cached and gtcache/gtcache-cache is removed.
+real  0m0.224s          (0m0.289s on the first run; 0m0.247s on a healthy detach)
+```
+
+The "Skipping flush" warning is the writethrough guarantee doing its job — there
+is nothing to flush. **Service resumes in the same second, with no unmount at
+all** — the reader loop recovered on the pass immediately after the uncache
+completed:
+
+```
+2026-09-24T19:33:21 pass=94 file=f95.bin rc=1 | dd: error reading …: Input/output error
+2026-09-24T19:33:22 pass=95 file=f96.bin rc=0 | 16+0 records in
+2026-09-24T19:33:23 pass=96 file=f97.bin rc=0 | 16+0 records in
+```
+
+`dmsetup status` becomes `gtcache-gtcache--vol: 0 2080768 linear`, the LV keeps
+its name and mapper path, and `vgreduce --removemissing gtcache` (0.07 s) then
+drops the ghost PV and writes out a consistent VG. **All 256 files verified
+against the sha256 manifest, byte-identical, after every cycle** — cache loss,
+uncache, `vgreduce`, and again after a clean detach.
+
+**The one thing `--uncache` cannot undo is the btrfs forced-readonly flag.**
+When a write had already aborted the transaction, the pool came back
+read-only-but-readable, and a remount was refused:
+
+```
+# mount -o remount,rw /mnt/anas-ahr/gtcache
+mount: /mnt/anas-ahr/gtcache: mount point not mounted or bad option.
+[361032.761003] BTRFS error (device dm-0 state EMA): remounting read-write after error is not allowed
+```
+
+`umount` + `mount` restored rw cleanly and reset `btrfs device stats` to zero.
+
+**Conclusion (a):** the daemon should uncache automatically on detection —
+`--uncache` is fast, needs no force, needs no unmount, has nothing to flush in
+writethrough, and restores read service instantly, so leaving the pool in
+all-I/O-fails while a human finds a button is strictly worse. Restoring *write*
+service is the part that cannot be automatic in the same breath: if the pool
+took a write during the failure window it is btrfs-forced-readonly and needs
+umount+mount, which is a remount of a live share — that is the piece that
+belongs behind an operator action, with the notification saying so.
+
+### (b) Slice publishing
+
+**GT-21 — A cache slice on an idle disk publishes immediately; the issue-#12
+retry dance is not needed, but `udevadm settle` still is.** On a freshly wiped,
+unheld disk, `sgdisk` succeeded silently and the kernel node appeared at once
+(`dmesg`: ` sdd: sdd1`), while the by-id symlink and `PARTLABEL` needed the
+settle — the same shape as the CREATE path:
+
+```
+# sgdisk -n 1:1M:+512M -t 1:8E00 -c 1:gtcache-cache1 /dev/disk/by-id/…ANAS_HOT9
+Creating new GPT entries in memory.
+The operation has completed successfully.
+# lsblk                    ← immediately, no settle, no partx
+NAME    SIZE TYPE PARTLABEL
+sdd       2G disk
+└─sdd1  512M part                       ← kernel node present, udev not done yet
+# udevadm settle
+# lsblk; ls /dev/disk/by-id/…HOT9*
+└─sdd1  512M part gtcache-cache1
+…ANAS_HOT9-part1 -> ../../sdd1
+```
+
+The negative confirms the mechanism is holders, not luck. Partitioning the same
+disk once its slice 1 was an in-use cache PV:
+
+```
+# sgdisk -n 2:514M:+512M -t 2:8E00 -c 2:gtcache-cache2 /dev/disk/by-id/…ANAS_HOT9
+Warning: The kernel is still using the old partition table.
+The new table will be used at the next reboot or after you
+run partprobe(8) or kpartx(8)
+The operation has completed successfully.          ← exit 0, and the node never appears
+# blockdev --rereadpt /dev/sdd
+blockdev: ioctl error on BLKRRPART: Device or resource busy
+# partx -a /dev/sdd
+partx: /dev/sdd: error adding partition 1          ← expected, part 1 already known
+# ls /dev/disk/by-id/ | grep HOT9
+…ANAS_HOT9
+…ANAS_HOT9-part1
+…ANAS_HOT9-part2                                   ← partx published part 2
+```
+
+`sgdisk` exits **0** while silently not publishing — the exact trap issue #12
+documented — and `udevadm settle` does not help, because no event was
+generated. Also noted: **`partprobe` is not installed on PVE 9**
+(`bash: partprobe: command not found`), so the warning text names a tool the
+node does not have; `partx -a` is the remedy that is actually present.
+
+**GT-22 — `pvremove` + `wipefs` are not enough to hand the cache disk back.**
+With the slice wiped but still in the GPT, `GET /v1/disks` reports the disk
+`other` (a partition with no filesystem is still a partition):
+
+```
+scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9 status= other parts= [('sdd1', None)]
+```
+
+After the slice is deleted from the table (`sgdisk -d 1`, or `--zap-all`), the
+same call reports:
+
+```
+scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9 status= available parts= []
+```
+
+The `cache-detach` step therefore ends at *remove the partition*, not at
+*wipe it* — otherwise the SSD never becomes selectable again.
+
+**Conclusion (b):** a cache slice needs no `partx` treatment — the cache disk is
+idle by definition at attach time, so `sgdisk` + `udevadm settle` (the create
+path's pair) is correct and sufficient; a second slice on an already-attached
+cache disk would need the expansion path's partx-then-verify, which is one more
+reason to keep one slice per cache disk. Detach must delete the slice.
+
+### What today's daemon sees (pre-ahrcache.1 baseline)
+
+**GT-23 — With the cache dead and the pool unable to serve a single byte, ANAS
+reports the pool `healthy`.** Captured live, while every read was returning
+EIO:
+
+```
+GET /v1/ahr/gtcache  → state: healthy | mounted: True | advisories: []
+                        arrays: [(1, 'clean')]
+GET /v1/status       → ahrPools: [{"name":"gtcache","state":"healthy","mounted":true,…}]
+                        warnings: (nothing about gtcache)
+```
+
+Nothing in the product mentions the cache at all — not its absence, not its
+presence. (To its credit the daemon does not *break*: the LVM stderr warnings on
+a partial VG parse through without a 500.) The detection rung ahrcache.1 plans
+is therefore load-bearing, not a nicety.
+
+Two smaller mis-readings, with the cache attached and healthy:
+
+- `GET /v1/disks` reports the cache disk `status: "other"`, `poolName: null`,
+  `ahrArray: null` — it is not attributed to the pool it serves. This is
+  accidentally safe (`isComposableDisk()` admits only `available`, so the disk
+  is already excluded from composer, spare and expand candidates) but it reads
+  in the UI as an unrelated foreign disk.
+- `GET /v1/ahr/gtcache` reports `vg.sizeBytes` 1 598 029 824 — the concat VG
+  plus the cache slice — while `lv.sizeBytes` and the whole `capacity` block stay
+  correct (1 065 353 216 usable, `rawBytes` counts only the two member disks).
+  Any consumer deriving pool size from `vg.sizeBytes` inherits the cache slice.
+- A cache disk that comes *back* after being declared dead carries an outdated
+  PV label, and every LVM command on the node then prints
+  `WARNING: outdated PV /dev/sdd1 seqno 5 has been removed in current VG gtcache
+  seqno 9`. The repair path has to wipe the returning slice, not just forget it.
+
+**GT-24 — The 11.15 telemetry sampler keeps resolving, but its I/O tree stops
+summing.** `/dev/mapper/gtcache-gtcache--vol` still resolves to `dm-0`
+(`readlink -f` unchanged), so no sampler code breaks — the origin moves to a
+hidden LV and the cache target keeps the public dm number:
+
+```
+# dmsetup ls --tree
+gtcache-gtcache--vol (252:0)
+ ├─gtcache-gtcache--vol_corig (252:4) └─ (9:127)
+ ├─gtcache-gtcache--cache_cvol-cdata (252:2) └─gtcache-gtcache--cache_cvol (252:1) └─ (8:49)
+ └─gtcache-gtcache--cache_cvol-cmeta (252:3) └─gtcache-gtcache--cache_cvol (252:1) └─ (8:49)
+# dmsetup table
+gtcache-gtcache--vol: 0 2080768 cache 252:3 252:2 252:4 128 2 metadata2 writethrough mq 0
+gtcache-gtcache--vol_corig: 0 2080768 linear 9:127 2048
+```
+
+One warm 256 MiB read pass, measured across `/proc/diskstats`: pool LV `dm-0`
+**+525 216 sectors** (the whole read), band `md127` **+31 744 sectors** (6 %),
+cache slice `sdd1` **+493 472 sectors** — invisible to the sampler, which never
+looks at it. So on a cached pool the dashboard's pool row legitimately exceeds
+the sum of its bands, and the cache is where the difference went. The pool
+detail's `cache` block is the only honest place to put it.
+
+Note for the design text: `dmsetup table` renders the policy as `mq` even though
+`lvs` reports `cache_policy: smq` (the kernel's smq module registers under both
+names), and the status line's `sequential_threshold 0 / random_threshold 0` are
+mq-era knobs that smq does not use. §13's parenthetical "sequential I/O
+bypasses" is an mq property; under smq, sequential detection is internal and not
+tunable. `lvs` is the source of truth for mode and policy; `dmsetup status` is
+the source of truth for *health*.
+
+A verbatim `lvs -a … --reportformat json` capture of the cached pool (hidden
+`_cvol` / `_corig` sub-LVs, all cache columns populated) is saved as
+`packages/daemon/src/fixtures/ahr/lvs-cached-pool.json`.
+
+### Teardown
+
+Cache uncached, `gtcache` destroyed through the API (`DELETE /v1/ahr/gtcache`,
+confirm-code flow, job completed), disks 7/8/9 wiped and detached. Node
+verified clean: `zpool list` shows only `gtbackup`/`gtiscsi`, `lvs`/`vgs`/`pvs`
+and `mdadm --detail --scan` empty, `/proc/mdstat` `unused devices: <none>`, no
+`anas-ahr` line in `/etc/fstab`, no btrfs mounts, `GET /v1/ahr` → `{"data":[]}`
+and `GET /v1/disks` → the system disk only.

@@ -1,0 +1,14 @@
+  {
+      "report": [
+          {
+              "lv": [
+                  {"lv_name":"[gtcache-cache_cvol]", "vg_name":"gtcache", "lv_attr":"Cwi-aoC---", "lv_size":"508.00m", "pool_lv":"", "origin":"", "data_percent":"", "metadata_percent":"", "move_pv":"", "mirror_log":"", "copy_percent":"", "convert_lv":"", "cache_mode":"", "cache_policy":"", "cache_total_blocks":"", "cache_used_blocks":"", "cache_read_hits":"", "cache_read_misses":"", "cache_dirty_blocks":""},
+                  {"lv_name":"gtcache-vol", "vg_name":"gtcache", "lv_attr":"Cwi-aoC---", "lv_size":"1016.00m", "pool_lv":"[gtcache-cache_cvol]", "origin":"[gtcache-vol_corig]", "data_percent":"48.38", "metadata_percent":"1.66", "move_pv":"", "mirror_log":"", "copy_percent":"0.00", "convert_lv":"", "cache_mode":"writethrough", "cache_policy":"smq", "cache_total_blocks":"8000", "cache_used_blocks":"3870", "cache_read_hits":"21380", "cache_read_misses":"15925", "cache_dirty_blocks":"0"},
+                  {"lv_name":"[gtcache-vol_corig]", "vg_name":"gtcache", "lv_attr":"owi-aoC---", "lv_size":"1016.00m", "pool_lv":"", "origin":"", "data_percent":"", "metadata_percent":"", "move_pv":"", "mirror_log":"", "copy_percent":"", "convert_lv":"", "cache_mode":"", "cache_policy":"", "cache_total_blocks":"", "cache_used_blocks":"", "cache_read_hits":"", "cache_read_misses":"", "cache_dirty_blocks":""}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }
