@@ -10123,6 +10123,170 @@ warnings.length = 0
 created.windows.length = 0
 await smbSelfServiceChecks()
 
+// ---- Story vdevs.2 — the Pools toolbar's "Remove vdev…" dialog ------------
+//
+// The picker must offer the three classes `zpool remove` drops instantly and
+// NOTHING else, say so where the operator can read it, and send the vdev name
+// the daemon resolves. The grid AND the pool detail reload afterwards, success
+// or failure.
+
+/** A leaf as the pool detail carries one (the parser's PoolDisk shape). */
+function vdevLeaf(id, state) {
+  return {
+    id,
+    path: `/dev/disk/by-id/${id}-part1`,
+    state: state || 'ONLINE',
+    readErrors: 0,
+    writeErrors: 0,
+    checksumErrors: 0,
+    slowIos: 0,
+  }
+}
+
+function vdevOf(name, type, disks, state) {
+  return { name, type, state: state || 'ONLINE', readErrors: 0, writeErrors: 0, checksumErrors: 0, disks }
+}
+
+/** A pool with all six classes — a mirrored log, a bare cache, a bare spare. */
+const SIX_CLASS_DETAIL = {
+  name: 'tank',
+  state: 'ONLINE',
+  vdevGroups: [
+    { role: 'data', vdevs: [vdevOf('mirror-0', 'mirror', [vdevLeaf('ata-DATA-1'), vdevLeaf('ata-DATA-2')])] },
+    { role: 'log', vdevs: [vdevOf('mirror-1', 'mirror', [vdevLeaf('ata-LOG-1'), vdevLeaf('ata-LOG-2')])] },
+    { role: 'cache', vdevs: [vdevOf('cache', 'disk', [vdevLeaf('ata-CACHE-1')])] },
+    { role: 'spare', vdevs: [vdevOf('spares', 'spare', [vdevLeaf('ata-SPARE-1', 'AVAIL')], 'AVAIL')] },
+    { role: 'special', vdevs: [vdevOf('mirror-2', 'mirror', [vdevLeaf('ata-SPEC-1'), vdevLeaf('ata-SPEC-2')])] },
+    { role: 'dedup', vdevs: [vdevOf('mirror-3', 'mirror', [vdevLeaf('ata-DEDUP-1'), vdevLeaf('ata-DEDUP-2')])] },
+  ],
+}
+
+/** The same pool with nothing removable on it. */
+const NO_REMOVABLE_DETAIL = {
+  name: 'tank',
+  state: 'ONLINE',
+  vdevGroups: [
+    { role: 'data', vdevs: [vdevOf('mirror-0', 'mirror', [vdevLeaf('ata-DATA-1'), vdevLeaf('ata-DATA-2')])] },
+    { role: 'special', vdevs: [vdevOf('mirror-2', 'mirror', [vdevLeaf('ata-SPEC-1'), vdevLeaf('ata-SPEC-2')])] },
+  ],
+}
+
+async function openPoolsViewFor(rows, detail) {
+  // 00-core.js too: check (e) opens the pool-detail window, whose summary calls
+  // the real formatters (formatPercent) the recording stub does not carry.
+  const ANAS = loadSources(['00-core.js', '15-gfx.js', '30-pools.js', '34-pool-vdev-remove.js'], {
+    'GET /pools': { data: rows },
+    'GET /pools/tank': { data: detail },
+  })
+  const view = makeComponent(ANAS.views.pools.factory('harness'), null)
+  const grid = view.itemId === 'poolsGrid' ? view : view.down('#poolsGrid')
+  grid.fireEvent('afterrender', grid)
+  await settle()
+  return { ANAS, grid }
+}
+
+const tankDetailGets = () => apiGets.filter(p => p === '/pools/tank').length
+
+async function vdevRemoveChecks() {
+  // --- (a) the toolbar action: selection-gated, hands off a PVE-managed pool.
+  let { grid } = await openPoolsViewFor([poolRow('tank'), poolRow('pvepool', { pveStorages: [{ storage: 'local-zfs', type: 'zfspool' }] })], SIX_CLASS_DETAIL)
+  let state = toolbar(grid, ['removeVdev'])
+  ok('vdev-remove: the Remove vdev… button exists', !!state.removeVdev, JSON.stringify(warnings))
+  if (!state.removeVdev) { return }
+  ok('vdev-remove: it starts DISABLED with no selection', state.removeVdev.disabled === true)
+
+  grid.selectRow(grid.getStore().findExact('name', 'tank'))
+  state = toolbar(grid, ['removeVdev'])
+  ok('vdev-remove: an ANAS pool ENABLES it', state.removeVdev.disabled === false)
+
+  grid.selectRow(grid.getStore().findExact('name', 'pvepool'))
+  state = toolbar(grid, ['removeVdev'])
+  ok('vdev-remove: a PVE-managed pool DISABLES it', state.removeVdev.disabled === true)
+  ok('vdev-remove: and says why', /PVE manages this pool/.test(state.removeVdev.tip), state.removeVdev.tip)
+
+  // --- (b) the dialog lists ONLY cache/log/spare, and says so.
+  grid.selectRow(grid.getStore().findExact('name', 'tank'))
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  let dlg = openWindow()
+  let vgrid = dlg && dlg.down('#removableVdevs')
+  ok('vdev-remove: the dialog opened with a vdev grid', !!vgrid)
+  if (!vgrid) { return }
+  const rows = vgrid.getStore().getRange().map(r => ({ role: r.get('role'), vdev: r.get('vdev') }))
+  eq('vdev-remove: only cache, log and spare are listed — the mirrored log as mirror-N', rows, [
+    { role: 'log', vdev: 'mirror-1' },
+    { role: 'cache', vdev: 'ata-CACHE-1' },
+    { role: 'spare', vdev: 'ata-SPARE-1' },
+  ])
+  ok('vdev-remove: the refusal sentence is on the dialog',
+    /Data, special and dedup vdevs cannot be removed here\./.test(dlg.down('#vdevRemoveNote').html || ''),
+    dlg.down('#vdevRemoveNote').html)
+
+  // --- (c) the submit payload: the vdev NAME, nothing else.
+  jobs.length = 0
+  const beforePools = poolsGets()
+  vgrid.selectRow(0)
+  findCmp(dlg, 'anas-btn-vdev-remove-submit').handler()
+  await settle()
+  eq('vdev-remove: it POSTs the pool\'s remove path with just the vdev name',
+    { method: jobs[0] && jobs[0].method, path: jobs[0] && jobs[0].path, body: jobs[0] && jobs[0].body },
+    { method: 'post', path: '/pools/tank/vdevs/remove', body: { vdev: 'mirror-1' } })
+  ok('vdev-remove: the dialog closes on success', dlg.destroyed === true)
+  ok('vdev-remove: and the Pools grid reloads', poolsGets() > beforePools)
+
+  // --- (d) reload on FAILURE too: a refused removal must not leave a stale view.
+  created.windows.length = 0
+  grid.selectRow(grid.getStore().findExact('name', 'tank'))
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  dlg = openWindow()
+  vgrid = dlg.down('#removableVdevs')
+  jobs.length = 0
+  vgrid.selectRow(1)
+  findCmp(dlg, 'anas-btn-vdev-remove-submit').handler()
+  await settle()
+  eq('vdev-remove: a cache leaf goes out by its leaf name', jobs[0] && jobs[0].body, { vdev: 'ata-CACHE-1' })
+  const beforeFail = poolsGets()
+  jobs[0].onFailed({ error: { message: 'data, special and dedup vdevs cannot be removed here' } })
+  await settle()
+  ok('vdev-remove: the grid reloads on failure as well', poolsGets() > beforeFail)
+
+  // --- (e) the pool DETAIL behind the dialog reloads too.
+  created.windows.length = 0
+  grid.selectRow(grid.getStore().findExact('name', 'tank'))
+  const detailBtn = grid.down('#detail')
+  detailBtn.handler(detailBtn)
+  await settle()
+  const beforeDetail = tankDetailGets()
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  dlg = openWindow()
+  dlg.down('#removableVdevs').selectRow(0)
+  jobs.length = 0
+  findCmp(dlg, 'anas-btn-vdev-remove-submit').handler()
+  await settle()
+  ok('vdev-remove: the open pool detail reloads after the job',
+    tankDetailGets() > beforeDetail + 1, `${beforeDetail} → ${tankDetailGets()}`)
+
+  // --- (f) a pool with nothing removable: an empty grid that says so.
+  created.windows.length = 0
+  ;({ grid } = await openPoolsViewFor([poolRow('tank')], NO_REMOVABLE_DETAIL))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  dlg = openWindow()
+  vgrid = dlg.down('#removableVdevs')
+  eq('vdev-remove: a pool with no cache/log/spare lists nothing', vgrid.getStore().getCount(), 0)
+  ok('vdev-remove: and the empty state says why',
+    /no cache, log or spare vdev to remove/.test(vgrid.emptyText || ''), vgrid.emptyText)
+
+  ok('vdev-remove: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+warnings.length = 0
+created.windows.length = 0
+await vdevRemoveChecks()
+
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)
   for (const f of failures) { console.error(`  • ${f}`) }

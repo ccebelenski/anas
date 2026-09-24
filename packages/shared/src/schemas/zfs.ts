@@ -516,6 +516,40 @@ export const AddVdevRequest = z
 export type AddVdevRequest = z.infer<typeof AddVdevRequest>
 
 /**
+ * The vdev roles `zpool remove` can take out of a live pool instantly (story
+ * vdevs.2). ZFS drops a cache, log or spare device with no data movement: the
+ * L2ARC is a throw-away copy, the ZIL flushes and reverts to in-pool logging,
+ * and a spare holds nothing until it is used. `data`, `special` and `dedup` are
+ * deliberately ABSENT — removing one of those is device evacuation, a different
+ * operation ANAS does not offer.
+ */
+export const REMOVABLE_VDEV_ROLES: readonly VdevRole[] = ['cache', 'log', 'spare']
+
+/** True when `zpool remove` may take this role out (story vdevs.2). */
+export function isRemovableVdevRole(role: VdevRole): boolean {
+  return REMOVABLE_VDEV_ROLES.includes(role)
+}
+
+/**
+ * Remove a cache, log or spare vdev (POST /v1/pools/:name/vdevs/remove).
+ *
+ * `vdev` names ONE vdev the pool carries, as `zpool status` shows it: a leaf
+ * (a by-id name such as `ata-…_WD-1234`, a by-id partition basename, or a
+ * short kernel name such as `sdb3`) or a top-level vdev name (`mirror-1`, for
+ * a mirrored log). The daemon resolves the name against the pool's parsed
+ * status and answers for what the pool actually carries — the character class
+ * here is the same one {@link DiskId} uses and only keeps whitespace and path
+ * separators out of the argv; it is not the authority on what exists.
+ */
+export const RemoveVdevRequest = z.object({
+  vdev: z
+    .string()
+    .min(1)
+    .regex(/^[\w.-]+$/, 'Invalid vdev name — a leaf name, a by-id name, or a vdev name such as mirror-1'),
+})
+export type RemoveVdevRequest = z.infer<typeof RemoveVdevRequest>
+
+/**
  * Attach/replace a leaf OR widen a raidz vdev (POST /v1/pools/:name/attach).
  *
  * Story 3.31 — drop-location is intent. The request carries EXACTLY ONE target:
