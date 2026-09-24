@@ -4,8 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-# rclone.2 live-proof fixture — disposable state on the stunt node for the
-# cloud sync TASKS spec (tests/integration/cloud-tasks-api.spec.ts).
+# rclone.2 / rclone.3 live-proof fixture — disposable state on the stunt node
+# for the cloud sync TASKS specs (tests/integration/cloud-tasks-api.spec.ts and
+# tests/integration/cloud-tasks-ui.spec.ts).
 #
 # Everything the remotes half needs comes from cloud-fixture.sh, which this
 # script drives: the `rclonegt`/`gtpass` sftp user answering on 127.0.0.1, and
@@ -23,6 +24,16 @@ source "${SCRIPT_DIR}/config.sh"
 #                       `anas-cloud-<task>-<unix>` snapshot, which only a real
 #                       dataset can prove.
 #
+#   gtbackup/cloudsrc/raw
+#                       a CHILD dataset, mounted at ${SRC_PATH}/raw and left
+#                       EMPTY. The UI spec's wizard note names the nested
+#                       filesystems a snapshot will not contain, and it needs a
+#                       real one to name. Empty on purpose: the boundary scan is
+#                       an `st_dev` walk (a mounted dataset is a boundary
+#                       whether or not it holds anything), while a FILE in here
+#                       would show up in the API spec's `find -type f` listing
+#                       of the source and change what that spec asserts.
+#
 #   gtbackup/cloudempty an EMPTY dataset — the `sync` empty-source refusal
 #                       ("would delete everything at the destination") and the
 #                       `copy`-from-empty no-op that is deliberately allowed.
@@ -30,6 +41,11 @@ source "${SCRIPT_DIR}/config.sh"
 #   /home/rclonegt/dst  the sftp-side landing area, emptied of any `copy`/`sync`
 #                       tree a previous run left (hello.txt, the remotes
 #                       fixture's own file, stays).
+#
+#   /home/rclonegt/pictures
+#                       the UI spec's own landing area (its task sends to
+#                       `gt:pictures`, the remote's own home), swept here so a
+#                       run proves itself against an empty destination.
 #
 #   /mnt/gt-unmounted   an EMPTY MOUNTPOINT DIRECTORY plus an /etc/fstab line
 #                         //192.0.2.9/nope /mnt/gt-unmounted cifs noauto,guest,x-anas-fixture 0 0
@@ -57,11 +73,17 @@ source "${SCRIPT_DIR}/config.sh"
 POOL="gtbackup"
 SRC_DS="${POOL}/cloudsrc"
 SRC_PATH="/${SRC_DS}"
+# The nested filesystem the rclone.3 wizard note names. Empty on purpose — see
+# the header: a file in here would land in the API spec's source listing.
+NESTED_DS="${SRC_DS}/raw"
+NESTED_PATH="${SRC_PATH}/raw"
 EMPTY_DS="${POOL}/cloudempty"
 EMPTY_PATH="/${EMPTY_DS}"
 
 RCLONE_USER="rclonegt"
 DST_DIR="/home/${RCLONE_USER}/dst"
+# The rclone.3 UI spec sends to `gt:pictures` — the remote's own home, not ~/dst.
+UI_DST_DIR="/home/${RCLONE_USER}/pictures"
 
 UNMOUNTED_DIR="/mnt/gt-unmounted"
 FSTAB_LINE="//192.0.2.9/nope ${UNMOUNTED_DIR} cifs noauto,guest,x-anas-fixture 0 0"
@@ -72,14 +94,15 @@ FSTAB_MARK="x-anas-fixture"
 GUARDOK_DIR="/mnt/gt-guardok"
 GUARDOK_FSTAB_LINE="tmpfs ${GUARDOK_DIR} tmpfs noauto,x-anas-fixture 0 0"
 
-# The task names the spec creates. `down` removes exactly these units — a
-# crashed run must not leave a timer behind, and a foreign anas-cloud task
-# (there are none on the stunt node, but the rule is the rule) is not ours.
-TASKS=(gtcopy gtsync gtempty gtemptycopy gtunmounted gtfail)
+# The task names the specs create — the API spec's first, then the rclone.3 UI
+# spec's. `down` removes exactly these units: a crashed run must not leave a
+# timer behind, and a foreign anas-cloud task (there are none on the stunt node,
+# but the rule is the rule) is not ours.
+TASKS=(gtcopy gtsync gtempty gtemptycopy gtunmounted gtfail pictures-offsite sync-empty)
 
 usage() {
   echo "Usage: cloud-tasks-fixture.sh <up|down|status>"
-  echo "  up      cloud-fixture.sh up + ${SRC_DS} (a.bin/b.bin/sub/c.txt), ${EMPTY_DS}, a clean ${DST_DIR}, and the unmounted ${UNMOUNTED_DIR} / ${GUARDOK_DIR} fstab entries"
+  echo "  up      cloud-fixture.sh up + ${SRC_DS} (a.bin/b.bin/sub/c.txt) with the empty child ${NESTED_DS}, ${EMPTY_DS}, a clean ${DST_DIR} and ${UI_DST_DIR}, and the unmounted ${UNMOUNTED_DIR} / ${GUARDOK_DIR} fstab entries"
   echo "  down    Remove the fixture's task units, the fstab entries and mountpoints, both datasets, then cloud-fixture.sh down"
   echo "  status  Datasets and their content, the sftp-side tree, the fstab entries, any anas-cloud units"
   exit 1
@@ -92,7 +115,7 @@ ds_exists() { $SSH_CMD "zfs list -H $1" >/dev/null 2>&1; }
 status() {
   echo "--- source dataset ---"
   if ds_exists "${SRC_DS}"; then
-    $SSH_CMD "zfs list -o name,mountpoint -H ${SRC_DS}; find ${SRC_PATH} -type f -printf '%p %s\n' | sort"
+    $SSH_CMD "zfs list -r -o name,mountpoint -H ${SRC_DS}; find ${SRC_PATH} -xdev -type f -printf '%p %s\n' | sort"
     echo "--- sha256 ---"
     $SSH_CMD "cd ${SRC_PATH} && sha256sum a.bin b.bin sub/c.txt 2>/dev/null || true"
     echo "--- transient snapshots (should be none between runs) ---"
@@ -110,6 +133,9 @@ status() {
   echo
   echo "--- sftp destination tree ---"
   $SSH_CMD "find ${DST_DIR} -printf '%p\n' 2>/dev/null | sort || echo 'no ${DST_DIR}'"
+  echo
+  echo "--- sftp destination tree (rclone.3 UI spec) ---"
+  $SSH_CMD "find ${UI_DST_DIR} -printf '%p\n' 2>/dev/null | sort || echo 'no ${UI_DST_DIR}'"
   echo
   echo "--- unmounted-mount fixture ---"
   $SSH_CMD "grep -F '${FSTAB_MARK}' /etc/fstab || echo 'no fstab entry'"
@@ -147,8 +173,18 @@ case "$1" in
     $SSH_CMD "dd if=/dev/urandom of=${SRC_PATH}/a.bin bs=1024 count=200 status=none"
     $SSH_CMD "dd if=/dev/urandom of=${SRC_PATH}/b.bin bs=1024 count=150 status=none"
     $SSH_CMD "mkdir -p ${SRC_PATH}/sub && printf 'c from the rclone.2 tasks fixture\n' > ${SRC_PATH}/sub/c.txt"
+    # The nested filesystem the rclone.3 wizard note names. Created BEFORE the
+    # chmod so its mountpoint is readable too; left empty on purpose.
+    $SSH_CMD "zfs create ${NESTED_DS}"
     $SSH_CMD "chmod -R a+r ${SRC_PATH} && sync"
-    echo "✓ ${SRC_DS} built (a.bin 200K, b.bin 150K, sub/c.txt)"
+    # A nested filesystem the wizard's note can name only exists if it is
+    # actually mounted under the source — say so loudly rather than let the UI
+    # spec fail on a missing sentence.
+    if ! $SSH_CMD "findmnt -n ${NESTED_PATH} >/dev/null 2>&1"; then
+      echo "ERROR: ${NESTED_DS} is not mounted at ${NESTED_PATH} — the nested note would have nothing to name" >&2
+      exit 1
+    fi
+    echo "✓ ${SRC_DS} built (a.bin 200K, b.bin 150K, sub/c.txt) with the empty child ${NESTED_DS}"
 
     # --- the empty dataset -------------------------------------------------
     if ds_exists "${EMPTY_DS}"; then
@@ -163,6 +199,11 @@ case "$1" in
     # and sync/ trees are not a "before" the spec should read.
     $SSH_CMD "rm -rf ${DST_DIR}/copy ${DST_DIR}/sync ${DST_DIR}/empty && mkdir -p ${DST_DIR} && chown -R ${RCLONE_USER}:${RCLONE_USER} ${DST_DIR}"
     echo "✓ ${DST_DIR} clean (hello.txt kept)"
+
+    # The rclone.3 UI spec's own destination (`gt:pictures`), swept so a run
+    # proves itself against an empty one.
+    $SSH_CMD "rm -rf ${UI_DST_DIR}"
+    echo "✓ ${UI_DST_DIR} swept"
 
     # --- the configured-but-unmounted mount --------------------------------
     # Never mounted: 192.0.2.9 is TEST-NET and `noauto` keeps systemd from
@@ -235,7 +276,12 @@ case "$1" in
       fi
     done
 
-    # The datasets, with any transient snapshot a killed run left behind.
+    # The rclone.3 UI spec's destination (the tasks fixture created it; the
+    # remotes fixture's own ~/dst is cloud-fixture.sh's to restore).
+    $SSH_CMD "rm -rf ${UI_DST_DIR}" || true
+
+    # The datasets, with any transient snapshot a killed run left behind
+    # (`-r` takes the child dataset with the parent).
     for ds in "${SRC_DS}" "${EMPTY_DS}"; do
       if ds_exists "${ds}"; then
         $SSH_CMD "zfs destroy -r ${ds}"

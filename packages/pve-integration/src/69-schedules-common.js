@@ -91,6 +91,103 @@
         }
     };
 
+    // ---- Session run errors (rclone.3; backup gained it with the same fix) --
+    //
+    // systemd's last-result says `failure`; the LINE that says why is in
+    // journald, and the grid payload carries neither. A run the user started
+    // from this grid does have it — the job's error — so it is remembered for
+    // as long as the tab lives and shown as the failed cell's tooltip.
+    //
+    // Kept on the STORE (which survives a `loadData`, so a reload never forgets
+    // what this user watched fail) and KEYED TO THE RUN it came from: a line
+    // left over from an earlier failure must not be hung under a later run's
+    // timestamp, which would be a lie about what went wrong this time.
+    //
+    // The binding is two-step because the error is recorded BEFORE the reload
+    // that brings the new run's `lastRunAt` in: `set` records the timestamp the
+    // row carried at that moment (`prev`), and the first read whose timestamp
+    // has moved past it binds the line to that run. From then on the line shows
+    // for that run only, and any later run drops it.
+    var runErrors = {};
+
+    function runErrText(v) {
+        return (v === undefined || v === null) ? null : ('' + v);
+    }
+
+    function runErrBag(store) {
+        if (!store) {
+            return null;
+        }
+        if (!store._anasRunErrors) {
+            store._anasRunErrors = {};
+        }
+        return store._anasRunErrors;
+    }
+
+    runErrors.set = function (store, name, msg, prevAt) {
+        try {
+            var bag = runErrBag(store);
+            if (!bag || !name || !msg) {
+                return;
+            }
+            bag['' + name] = { at: undefined, prev: runErrText(prevAt), msg: '' + msg };
+        } catch (e) {
+            // A tooltip is never worth breaking a grid for.
+        }
+    };
+
+    runErrors.clear = function (store, name) {
+        try {
+            var bag = store && store._anasRunErrors;
+            if (bag && name) {
+                delete bag['' + name];
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    };
+
+    // The line for the run the row is showing, or '' when there is none for it.
+    runErrors.get = function (store, name, at) {
+        try {
+            var bag = store && store._anasRunErrors;
+            var entry = (bag && name) ? bag['' + name] : null;
+            if (!entry) {
+                return '';
+            }
+            var now = runErrText(at);
+            if (entry.at === undefined) {
+                // Still unbound. While the row shows the timestamp it carried
+                // when the failure was recorded, the reload has not landed yet.
+                if (now === entry.prev) {
+                    return entry.msg;
+                }
+                entry.at = now;
+                return entry.msg;
+            }
+            if (entry.at !== now) {
+                delete bag['' + name];
+                return '';
+            }
+            return entry.msg;
+        } catch (e) {
+            return '';
+        }
+    };
+
+    sched.runErrors = runErrors;
+
+    // The failed-cell tooltip both grids show: the run's own error line when
+    // this session has one, otherwise the time and where the history is.
+    sched.runErrorTip = function (store, name, at) {
+        var line = runErrors.get(store, name, at);
+        if (line) {
+            return line;
+        }
+        var abs = sched.absTime(at);
+        return (abs ? abs + ' — ' : '') + t('open Details for the recent runs');
+    };
+
     // ---- Visibility-gated poll loop (no leaked intervals) ------------------
     // Each view supplies its own `refresh(quiet)` closure (which grids to reload);
     // this owns the interval + the visibilitychange handler, stored on the view so
@@ -248,13 +345,21 @@
     }
 
     // A task's cadence, normalised; null when the task carries a raw schedule.
+    //
+    // `parity` is OMITTED when the task carries none. The shared schema types
+    // it `z.enum(['even','odd']).optional()`, so an empty string is not "no
+    // parity" to it — it is an invalid enum member, and a whole-task PUT built
+    // from this object (the enable/disable toggle on a weekly or monthly task)
+    // came back a 400.
     cad.of = function (task) {
         var c = task && task.cadence;
         if (!c || cad.KINDS.indexOf('' + c.kind) < 0 || c.kind === 'custom') {
             return null;
         }
         var days = [];
-        var raw = (c.days && c.days.length !== undefined) ? c.days : [];
+        // A REAL array test: a string has a `length` too, and iterating one
+        // character by character would silently produce an empty day list.
+        var raw = (Object.prototype.toString.call(c.days) === '[object Array]') ? c.days : [];
         for (var i = 0; i < cad.WEEKDAYS.length; i++) {
             for (var j = 0; j < raw.length; j++) {
                 if (raw[j] === cad.WEEKDAYS[i]) {
@@ -263,12 +368,15 @@
                 }
             }
         }
-        return {
+        var out = {
             kind: '' + c.kind,
             days: days,
             time: '' + (c.time || ''),
-            parity: c.parity ? ('' + c.parity) : '',
         };
+        if (c.parity) {
+            out.parity = '' + c.parity;
+        }
+        return out;
     };
 
     // A cadence in words. Deliberately spells out what the timer alone cannot say
@@ -337,6 +445,9 @@
                     xtype: 'radiogroup',
                     itemId: 'cadenceKind',
                     cls: 'anas-fld-' + pfx + '-cadence',
+                    // The caller's screen name, carried on the widget so the
+                    // readers below can put it back in front of a warning.
+                    anasPfx: pfx,
                     columns: 2,
                     items: [
                         { boxLabel: t('Weekly'), name: 'cadenceKind', inputValue: 'weekly', checked: kind === 'weekly' },
@@ -349,7 +460,7 @@
                             try {
                                 onChange();
                             } catch (e) {
-                                ANAS.warn('cadence toggle failed: ' + ANAS.errText(e));
+                                ANAS.warn(pfx + ' cadence toggle failed: ' + ANAS.errText(e));
                             }
                         },
                     },
@@ -416,6 +527,17 @@
         };
     };
 
+    // The screen a cadence widget belongs to ('backup' / 'cloud'), for the
+    // warnings the readers below raise — the widget stamps it on itself.
+    function cadPfxOf(win) {
+        try {
+            var g = win.down('#cadenceKind');
+            return (g && g.anasPfx) ? ('' + g.anasPfx) : 'backup';
+        } catch (e) {
+            return 'backup';
+        }
+    }
+
     // The chosen cadence kind, read off the radiogroup by itemId (string compare).
     cad.kindOf = function (win) {
         try {
@@ -452,7 +574,7 @@
                 note.update(enc(t(cad.NOTE[kind] || cad.NOTE.custom)));
             }
         } catch (e2) {
-            ANAS.warn('cadence note failed: ' + ANAS.errText(e2));
+            ANAS.warn(cadPfxOf(win) + ' cadence note failed: ' + ANAS.errText(e2));
         }
     };
 

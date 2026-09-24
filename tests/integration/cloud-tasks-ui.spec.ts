@@ -14,11 +14,13 @@ const execFileAsync = promisify(execFile)
  * this file exercises packages/pve-integration/src/72-cloud.js the way a user
  * meets it, per DESIGN.md "Cloud sync — rclone" → Workflow:
  *
- *   1. Create through the wizard — the nested-filesystems note renders from
- *      preview-nested while the source is typed (the source dataset has a
- *      CHILD dataset: what a snapshot will NOT contain, said BEFORE the save),
- *      the Mode radios carry the sync sentence with Copy the default, and the
- *      saved row lands selected with its `remote:path` destination.
+ *   1. Create through the wizard — every toolbar button is on the bar at this
+ *      viewport, Browse hands the source back through the shared path picker,
+ *      the nested-filesystems note renders from preview-nested for the picked
+ *      source (the source dataset has a CHILD dataset: what a snapshot will
+ *      NOT contain, said BEFORE the save), the Mode radios carry the sync
+ *      sentence with Copy the default, and the saved row lands selected with
+ *      its `remote:path` destination.
  *   2. Run now → the run rides the dashboard jobs strip (ANAS.runJob) and the
  *      row's Last run pill refreshes to `success` on completion.
  *   3. The empty-source `sync` refusal: the daemon's sentence, shown in the
@@ -35,9 +37,10 @@ const execFileAsync = promisify(execFile)
  * FIXTURE DEPENDENCY (written alongside this spec):
  * `test/stunt-node/cloud-tasks-fixture.sh` — `up` / `down`, the same capture
  * pre-state / restore posture as cloud-fixture.sh. It creates:
- *   - the dataset `gtbackup/cloudsrc` mounted at `/gtbackup/cloudsrc` WITH a
- *     child dataset `gtbackup/cloudsrc/raw` (the nested note needs a nested
- *     filesystem to name),
+ *   - the dataset `gtbackup/cloudsrc` mounted at `/gtbackup/cloudsrc` WITH an
+ *     EMPTY child dataset `gtbackup/cloudsrc/raw` (the nested note needs a
+ *     nested filesystem to name; empty because the API spec lists the files
+ *     under the source and a file in the child would change that list),
  *   - the sftp user `rclonegt` (password `gtpass`) the `gt` remote points at.
  * The remote `gt` and the tasks themselves are created through their own API
  * doors here (the UI's create is proven in test 1, the Remotes window's in
@@ -188,6 +191,18 @@ async function createTaskViaApi(
   }
 }
 
+/**
+ * Write a task through its own API door whatever is already there — the create
+ * helper above SKIPS an existing task, so a test that needs a particular stored
+ * state (a DISABLED task) has to say so rather than inherit the last test's.
+ */
+async function putTaskViaApi(
+  ctx: APIRequestContext,
+  body: Record<string, unknown>,
+): Promise<void> {
+  await runJob(ctx, 'put', `${V1}/cloud/tasks/${body.name as string}`, body)
+}
+
 /** Delete a cloud sync task through its own API door (best-effort). */
 async function removeTaskViaApi(ctx: APIRequestContext, name: string): Promise<void> {
   await ctx.delete(`${V1}/cloud/tasks/${name}`).catch(() => {})
@@ -263,15 +278,27 @@ async function pickRemote(page: Page, dlg: Locator, name: string): Promise<void>
   await boundList.locator('.x-boundlist-item', { hasText: new RegExp(`^${name}$`) }).first().click()
 }
 
-/** A radiogroup's value, read off the component (no DOM guessing). */
-async function radioValue(page: Page, scope: Locator, cls: string): Promise<string> {
-  const inputId = await scope.locator(`.${cls} input`).first().getAttribute('id')
-  return page.evaluate((id) => {
+/**
+ * A radiogroup's value, read off the GROUP component — `{ <name>: <inputValue> }`.
+ * The element carrying the `cls` is the group's own, so its id is the component
+ * id; the walk upward is there only in case a wrapper takes the class instead.
+ * Reading a CHILD radio is what fails: `Ext.form.field.Radio#getValue()` hands
+ * back the boolean `checked`, which carries no inputValue at all.
+ */
+async function radioValue(scope: Locator, cls: string): Promise<string> {
+  return scope.locator(`.${cls}`).first().evaluate((el) => {
     const ext = (window as unknown as { Ext: { getCmp: (id: string) => any } }).Ext
-    const cmp = ext.getCmp(String(id).replace(/-inputEl$/, ''))
-    const v = cmp && cmp.getValue ? cmp.getValue() : null
-    return v ? String(Object.values(v as Record<string, unknown>)[0]) : ''
-  }, inputId)
+    let node: Element | null = el
+    while (node) {
+      const cmp = node.id ? ext.getCmp(node.id) : null
+      if (cmp && typeof cmp.isXType === 'function' && cmp.isXType('radiogroup')) {
+        const v = cmp.getValue()
+        return (v && typeof v === 'object') ? String(Object.values(v)[0] ?? '') : ''
+      }
+      node = node.parentElement
+    }
+    return ''
+  })
 }
 
 /** The job-failure alert ANAS.runJob raises. */
@@ -286,24 +313,31 @@ async function dismissMessageBox(page: Page): Promise<void> {
 }
 
 /**
- * Count the tasks-list fetches — the reload-after-every-job observable (the
- * 0.3.3 lesson: the grid reflects reality after success AND failure).
+ * The reload-after-every-job observable (the 0.3.3 lesson: the grid reflects
+ * reality after success AND failure), read where the user reads it — the row's
+ * own Last run text. A raw fetch count cannot prove it: the view polls every
+ * 10 s on its own, so two fetches around a run that takes longer than that are
+ * met by the poll alone. A cell that moves from one result to another can only
+ * have come from a reload.
  */
-async function trackTasksFetches(page: Page): Promise<{ count: () => number }> {
-  const state = { n: 0 }
-  await page.route(/\/v1\/cloud\/tasks$/, async (route) => {
-    state.n += 1
-    await route.continue()
-  })
-  return { count: () => state.n }
+async function rowText(row: Locator): Promise<string> {
+  return ((await row.textContent()) ?? '').replace(/\s+/g, ' ')
 }
 
 // ---- Fixtures ---------------------------------------------------------------
 
-test.beforeEach(async () => {
+test.beforeAll(async () => {
+  // ONCE per worker: `down` first (a crashed earlier run leaves units and a
+  // dataset behind), then `up`. A per-test `up` is a swallowed no-op once the
+  // store's pre-state is captured — worse, re-capturing it would record a
+  // state this spec itself wrote as the "before" the teardown restores.
   // Self-heal like cloud-remotes-ui.spec.ts: a failed test ends the worker and
   // its afterAll tears the fixture down; the next worker re-ups it here.
+  await execFileAsync(FIXTURE_SH, ['down']).catch(() => {})
   await execFileAsync(FIXTURE_SH, ['up']).catch(() => {})
+})
+
+test.beforeEach(async () => {
   // The fixture user is the "fixture present" signal (the same posture the
   // rclone.1 spec uses — NOT the store, which `up` restores to its pre-state).
   test.skip(
@@ -359,6 +393,22 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     await setupViaApi(playwright, null)
     await grid.locator('.anas-btn-cloud-refresh').click()
 
+    // The toolbar overflow rule (pvepool.2): at 2560×1080 every toolbar button
+    // is ON the bar. A button ExtJS collapsed into the overflow menu is one the
+    // operator has to go looking for — and one this spec could never click.
+    for (const btn of [
+      'anas-btn-cloud-refresh',
+      'anas-btn-cloud-task-create',
+      'anas-btn-cloud-remotes',
+      'anas-btn-cloud-task-run',
+      'anas-btn-cloud-task-details',
+      'anas-btn-cloud-task-edit',
+      'anas-btn-cloud-task-toggle',
+      'anas-btn-cloud-task-remove',
+    ]) {
+      await expect(grid.locator(`.${btn}`), btn).toBeVisible({ timeout: 15_000 })
+    }
+
     const dlg = await openWizard(page, grid)
 
     // The sync sentence rides the Mode radios; Copy is the checked default —
@@ -366,13 +416,25 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     await expect(dlg.locator('#cloudModeNote')).toContainText(
       'Sync deletes files at the destination that are no longer in the source. Copy never deletes.',
     )
-    expect(await radioValue(page, dlg, 'anas-fld-cloud-mode')).toBe('copy')
+    expect(await radioValue(dlg, 'anas-fld-cloud-mode')).toBe('copy')
+
+    // The Source Browse button opens the SHARED path picker, and a
+    // single-select picker hands its answer back as a path STRING — the field
+    // is authoritative there, so a typed path the tree never showed is a
+    // legitimate pick. Reading `.path` off that string filled the field with
+    // nothing, and the wizard then refused its own source.
+    await dlg.locator('.anas-fld-cloud-task-name input').fill(TASK)
+    await dlg.locator('.anas-btn-cloud-source-browse').click()
+    const picker = page.locator('.anas-win-path-picker')
+    await expect(picker).toBeVisible({ timeout: 30_000 })
+    await picker.locator('.anas-fld-picker-path input').fill(SOURCE)
+    await picker.locator('.anas-btn-picker-select').click()
+    await expect(picker).toBeHidden({ timeout: 20_000 })
+    await expect(dlg.locator('.anas-fld-cloud-source input')).toHaveValue(SOURCE, { timeout: 15_000 })
 
     // The nested-filesystems note renders from the live preview-nested scan of
-    // the typed source: the fixture dataset has a CHILD dataset, and a
+    // the picked source: the fixture dataset has a CHILD dataset, and a
     // snapshot will not contain it — said BEFORE the save, in the wizard.
-    await dlg.locator('.anas-fld-cloud-task-name input').fill(TASK)
-    await dlg.locator('.anas-fld-cloud-source input').fill(SOURCE)
     await expect(dlg.locator('#cloudSourceScan')).toContainText(
       `Contains 1 nested filesystem that will not be included: ${NESTED}`,
       { timeout: 30_000 },
@@ -380,6 +442,9 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
 
     await pickRemote(page, dlg, REMOTE)
     await dlg.locator('.anas-fld-cloud-remote-path input').fill('pictures')
+    // A NEW task opens on the Custom tab with an empty OnCalendar field, and
+    // the wizard refuses to save without one ("Enter a schedule.").
+    await dlg.locator('.anas-fld-cloud-schedule input').fill('daily')
     await dlg.locator('.anas-btn-cloud-task-submit').click()
     await expect(dlg).toBeHidden({ timeout: 120_000 })
 
@@ -400,9 +465,9 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     await setupViaApi(playwright, TASK_BODY)
 
     const grid = await openTasksView(page)
-    const fetches = await trackTasksFetches(page)
     const row = taskRow(page, grid, TASK)
     await expect(row).toBeVisible({ timeout: 45_000 })
+    const before = await rowText(row)
 
     await row.click()
     await grid.locator('.anas-btn-cloud-task-run').click()
@@ -412,8 +477,9 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     await expect(page.locator('.x-toast', { hasText: `Cloud sync finished: ${TASK}` }))
       .toBeVisible({ timeout: 180_000 })
 
-    // The grid reloaded after the job and the row's Last run reads success.
-    expect(fetches.count()).toBeGreaterThanOrEqual(2)
+    // The grid reloaded after the job: the row's Last run MOVED to success,
+    // which only a reload can do.
+    expect(before, 'the row had not already succeeded before this run').not.toContain('success')
     await expect(row).toContainText('success', { timeout: 45_000 })
     await expect(row).not.toContainText('never run')
 
@@ -463,9 +529,9 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     await sshExec(`mv ${RCLONE_BIN} ${RCLONE_BAK} && printf '#!/bin/sh\\nexit 7\\n' > ${RCLONE_BIN} && chmod 755 ${RCLONE_BIN}`)
     try {
       const grid = await openTasksView(page)
-      const fetches = await trackTasksFetches(page)
       const row = taskRow(page, grid, TASK)
       await expect(row).toBeVisible({ timeout: 45_000 })
+      const before = await rowText(row)
       await row.click()
       await grid.locator('.anas-btn-cloud-task-run').click()
 
@@ -474,8 +540,10 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
       await expect(alert).toContainText('exit 7')
       await dismissMessageBox(page)
 
-      // Reload-after-failure, then the failed Last run cell — red, with the
-      // error line as its tooltip.
+      // Reload-after-failure, read as a transition: the Last run cell MOVED to
+      // failure, which only a reload can do. Then the cell itself — red, with
+      // the run's error line as its tooltip.
+      expect(before, 'the row had not already failed before this run').not.toContain('failure')
       await expect(row).toContainText('failure', { timeout: 45_000 })
       const cellTip = await row
         .locator('.x-grid-cell-inner', { hasText: 'failure' })
@@ -483,7 +551,6 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
         .first()
         .getAttribute('title')
       expect(cellTip).toContain('exit 7')
-      expect(fetches.count()).toBeGreaterThanOrEqual(2)
     }
     finally {
       // Put the real rclone back BEFORE anything else runs.
@@ -547,7 +614,16 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
   })
 
   test('7 — a disabled task\'s detail shows the history note', async ({ page, playwright }) => {
-    await setupViaApi(playwright, { ...TASK_BODY, enabled: false })
+    // The earlier tests left this task ENABLED, and the create helper skips a
+    // task that already exists — so the disabled state is written explicitly.
+    await setupViaApi(playwright, TASK_BODY)
+    const setupCtx = await apiCtx(playwright)
+    try {
+      await putTaskViaApi(setupCtx, { ...TASK_BODY, enabled: false })
+    }
+    finally {
+      await setupCtx.dispose()
+    }
 
     const grid = await openTasksView(page)
     const row = taskRow(page, grid, TASK)

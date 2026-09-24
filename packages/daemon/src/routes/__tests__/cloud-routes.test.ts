@@ -596,6 +596,14 @@ describe('cloud remotes routes (rclone.1)', () => {
       }
     })
 
+    it('the tasks GRID read is behind the same door — a node without rclone has a broken install, not an empty list', async () => {
+      await bare({ rcloneAvailable: async () => false })
+      const res = await app.inject({ method: 'GET', url: '/v1/cloud/tasks', headers: IDENTITY })
+      assert.equal(res.statusCode, 503)
+      assert.equal(res.json().error.code, 'UNAVAILABLE')
+      assert.equal(res.json().error.message, RCLONE_NOT_INSTALLED)
+    })
+
     it('deleting a remote a task still names → 409 naming the task(s)', async () => {
       await bare({ referencingTasks: async name => (name === 'gt' ? ['nightly'] : []) })
       await writeFile(bareFile, GT_SECTION, 'utf-8')

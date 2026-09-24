@@ -914,7 +914,12 @@
                 t('An off-week fire of an every-other-week task — nothing was backed up, '
                     + 'and nothing is wrong.') + (at ? ' ' + absTime(at) : ''));
         } else if (result === 'failure') {
-            pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)', absTime(at));
+            // The run's own error line when this session watched it fail (the
+            // shared session store, keyed to the run — a later run's failure
+            // never wears an older one's words); otherwise the time and where
+            // the history is. Parallel construction with the Cloud Sync grid.
+            pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)',
+                ANAS.sched.runErrorTip(rec.store, rec.get('name'), at));
         } else if (result === 'running') {
             pill = '<span title="' + enc(t('running')) + '"'
                 + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
@@ -4132,6 +4137,18 @@
         runTaskByName(view, node, rec.get('name'));
     }
 
+    // The `lastRunAt` a row carries right now — the run the grid is still
+    // showing when a failure is recorded against it.
+    function lastRunAtOf(store, name) {
+        try {
+            var idx = store ? store.findExact('name', name) : -1;
+            var rec = idx >= 0 ? store.getAt(idx) : null;
+            return rec ? rec.get('lastRunAt') : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
     // The ONE run path: POST the task's /run, let the task's own systemd unit
     // do the work, and supervise through the job (one code path, one history).
     // The Backup menu hands a grid record; the iSCSI LUN toolbar (75-iscsi.js)
@@ -4184,6 +4201,8 @@
                         + (notices.length === 1 ? t('note') : t('notes'))
                         + ', ' + t('see the task\'s Details');
                 }
+                // A manual success retires the line the last failure left.
+                ANAS.sched.runErrors.clear(grid && grid.getStore(), name);
                 ANAS.toast(msg);
                 if (warnings.length) {
                     try {
@@ -4200,6 +4219,18 @@
                     } catch (eMsg) {
                         ANAS.warn(warnings.join(' '));
                     }
+                }
+                loadTasks(view, node);
+            },
+            onFailed: function (job) {
+                // The grid reloads after a FAILED run too, and the run's error
+                // line becomes the failed cell's tooltip — keyed to the run:
+                // the timestamp the row carries now is the previous run's, and
+                // the reload that follows brings in this run's.
+                var message = (job && job.error && job.error.message) || '';
+                if (message) {
+                    var store = grid && grid.getStore();
+                    ANAS.sched.runErrors.set(store, name, message, lastRunAtOf(store, name));
                 }
                 loadTasks(view, node);
             },

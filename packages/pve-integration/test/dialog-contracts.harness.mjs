@@ -156,7 +156,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, deriveArchiveName, lunBackupId } from '@anas/shared'
+import { BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncTaskRequest, deriveArchiveName, lunBackupId } from '@anas/shared'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, '..', 'src')
@@ -171,6 +171,18 @@ function ok(label, cond, detail) {
 }
 function eq(label, actual, expected) {
   ok(label, JSON.stringify(actual) === JSON.stringify(expected), `got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)}`)
+}
+
+/**
+ * A captured request body against the REAL shared schema the daemon parses it
+ * with. A hand-written shape check cannot catch a field the schema refuses —
+ * `parity: ''` passed every deep compare in this file and was a 400 on the
+ * wire — so every payload a dialog sends is put through the schema itself.
+ */
+function validates(label, schema, body) {
+  const parsed = schema.safeParse(body)
+  ok(label, parsed.success,
+    parsed.success ? '' : JSON.stringify(parsed.error.issues))
 }
 
 // ============================================================================
@@ -517,6 +529,14 @@ function makeComponent(cfg, parent) {
     if (typeof l === 'function') { l.apply(c, args) }
   }
 
+  // ExtJS materialises an INLINE store config into a real store the moment the
+  // component is created, so `getStore()` on a combo declared with
+  // `store: { data: […], fields: […] }` hands back a store, not the config.
+  // The stub does the same — otherwise a combo built that way looks like it
+  // has rows here while having none in the field, or the reverse.
+  if (c.store && typeof c.store === 'object' && !c.store.isStore && !c.store.isTreeStore) {
+    c.store = c.store.root ? makeTreeStore(c.store) : makeStore(c.store)
+  }
   c.getStore = () => c.store
   c.setStore = function (st) { c.store = st; return c }
   c.getSelection = () => c._selection.slice()
@@ -1344,7 +1364,7 @@ function sweepFields(label, body, want) {
 }
 
 async function backupChecks() {
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   // afterrender is what the PVE UI fires on the real view; it loads the grid.
   view.fireEvent('afterrender', view)
@@ -1480,7 +1500,7 @@ async function save(dlg) {
 }
 
 async function nestedChecks() {
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -1593,7 +1613,7 @@ async function nestedChecks() {
  * reason — nothing about this alert may touch what a save sends.
  */
 async function sourceGuardChecks() {
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -1640,7 +1660,7 @@ async function sourceGuardChecks() {
 // ============================================================================
 
 async function consistencyChecks() {
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -1699,7 +1719,7 @@ async function consistencyChecks() {
 // ============================================================================
 
 async function imageKindChecks() {
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -1821,7 +1841,7 @@ async function imageKindChecks() {
 // ============================================================================
 
 async function lunPickerChecks() {
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -1898,7 +1918,7 @@ async function lunPickerChecks() {
 //    `kind: 'block'` verbatim and keeps its stored archive name.
 
 async function backupTaskKindChecks() {
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -4285,7 +4305,7 @@ const RESTORE_ROUTES = {
  */
 async function openRestoreDialog(routes = RESTORE_ROUTES) {
   ajax.responses = { '/network': PVE_NETWORK }
-  const ANAS = loadSources(['69-schedules-common.js', '12-picker.js', '68-backup.js', '75-iscsi.js'], routes)
+  const ANAS = loadSources(['12-picker.js', '68-backup.js', '69-schedules-common.js', '75-iscsi.js'], routes)
   const view = makeComponent(ANAS.views.iscsi.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -5462,7 +5482,7 @@ const LUN_BACKUP_ROUTES = {
 
 /** Both sources into one sandbox, then the iSCSI view — as on the real page. */
 async function openLunBackupView(routes) {
-  const ANAS = loadSources(['69-schedules-common.js', '68-backup.js', '75-iscsi.js'], routes)
+  const ANAS = loadSources(['68-backup.js', '69-schedules-common.js', '75-iscsi.js'], routes)
   const view = makeComponent(ANAS.views.iscsi.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -6262,7 +6282,7 @@ async function pickerChecks() {
 
 async function pickedPathChecks() {
   liveCalls.length = 0
-  const ANAS = loadPickerSources(['69-schedules-common.js', '12-picker.js', '68-backup.js'])
+  const ANAS = loadPickerSources(['12-picker.js', '68-backup.js', '69-schedules-common.js'])
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -6861,7 +6881,7 @@ async function pickFileSnapshot(dlg) {
  * half needs (the LUN inventory, the new-LUN target + backing pickers).
  */
 function loadRestoreSources() {
-  const ANAS = loadPickerSources(['69-schedules-common.js', '12-picker.js', '68-backup.js', '75-iscsi.js'])
+  const ANAS = loadPickerSources(['12-picker.js', '68-backup.js', '69-schedules-common.js', '75-iscsi.js'])
   const ROUTES = { ...FILE_RESTORE_ROUTES, ...ISCSI_ROUTES }
   const baseGet = ANAS.api.get
   ANAS.api.get = (node, path) => {
@@ -7760,7 +7780,7 @@ async function runNotesChecks() {
  * after the second has painted — the stale verdict must be dropped.
  */
 async function nestedScanRaceCheck() {
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], BACKUP_ROUTES)
   const parked = []
   const basePost = ANAS.api.post
   ANAS.api.post = (node, path, body) => (path === '/backup/tasks/preview-nested' && body && body.path === '/etc'
@@ -7815,7 +7835,7 @@ async function restoreRepoNamespacePrefillCheck() {
     'GET /backup/repos/pbs/groups': { data: { verdict: 'ok', repository: 'pbs', groups: [] } },
     'GET /backup/repos/pbs-offsite/groups': { data: { verdict: 'ok', repository: 'pbs-offsite', groups: [] } },
   }
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], routes)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], routes)
   const view = makeComponent({ xtype: 'panel' }, null)
   ANAS.backupRestore.open(view, 'harness', { repo: 'pbs' })
   await settle()
@@ -7833,7 +7853,7 @@ async function restoreRepoNamespacePrefillCheck() {
  * it), and every existing caller keeps working without one.
  */
 async function taskDoorOnDoneCheck() {
-  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -9866,7 +9886,91 @@ async function shareUsersChecks() {
     JSON.stringify(jobs[0] || {}))
 }
 
+/**
+ * The backup task grid's WEEKLY toggle and its failed-cell tooltip — the two
+ * halves of the rclone.3 fix batch that reach back into backup.
+ *
+ * (1) `TASK` is BIWEEKLY, so the toggle checks above happen to send a cadence
+ *     that carries a `parity`. On a WEEKLY or MONTHLY task the shared cadence
+ *     reader used to emit `parity: ''`, which the shared schema types as an
+ *     enum member — the whole-task PUT a toggle sends was a 400. The payload is
+ *     put through the REAL BackupTask schema here, not a shape of our own.
+ * (2) The failed Last run cell now carries the run's own error line, the same
+ *     session store the Cloud Sync grid uses (parallel construction), keyed to
+ *     the run so a later failure never wears an older one's words.
+ */
+const WEEKLY_CADENCE = { kind: 'weekly', days: ['Mon', 'Thu'], time: '03:15' }
+const WEEKLY_TASK = {
+  ...TASK,
+  name: 'weekly-pictures',
+  cadence: WEEKLY_CADENCE,
+  schedule: cadenceToOnCalendar(WEEKLY_CADENCE),
+}
+
+async function backupWeeklyToggleChecks() {
+  const routes = {
+    ...BACKUP_ROUTES,
+    'GET /backup/tasks': { data: [{ task: WEEKLY_TASK, lastRunResult: 'success', enabled: true }] },
+  }
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], routes)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  ok('backup(weekly): the grid loaded the weekly task', grid && grid.getStore().getCount() === 1)
+  grid.selectRow(0)
+
+  jobs.length = 0
+  const toggle = grid.down('#backupToggle')
+  toggle.handler(toggle)
+  await settle()
+  const body = jobs.length ? jobs[0].body : null
+  ok('backup(weekly): the toggle is a PUT of the whole task', jobs.length === 1 && jobs[0].method === 'put')
+  ok('backup(weekly): the cadence rides through the toggle',
+    !!body && !!body.cadence && body.cadence.kind === 'weekly', JSON.stringify(body && body.cadence))
+  ok('backup(weekly): a weekly cadence carries no empty parity key',
+    !!body && !('parity' in body.cadence), JSON.stringify(body && body.cadence))
+  validates('backup(weekly): the toggle payload validates against BackupTask', BackupTask, body)
+
+  // --- the failed Last run cell (shared with Cloud Sync) -------------------
+  const store = grid.getStore()
+  const RUN_ERR = "backup failed (exit 255): connection refused by 'pbs-main'"
+  const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
+  const failedRec = at => ({
+    get: k => ({ lastRunResult: 'failure', lastRunAt: at, overdue: false, name: WEEKLY_TASK.name }[k]),
+    store,
+  })
+
+  // Nothing recorded yet: the cell says the time and where the history is —
+  // never a cause it does not know.
+  const plain = lastRunCol.renderer('failure', {}, failedRec('2026-09-24T03:00:00Z'))
+  ok('backup(failed cell): with no recorded run the tooltip points at the detail',
+    /open Details for the recent runs/.test(plain), plain)
+
+  jobs.length = 0
+  const runBtn = grid.down('#backupRun')
+  runBtn.handler(runBtn)
+  await settle()
+  const runJobRec = jobs.find(j => /\/run$/.test(j.path || ''))
+  ok('backup(failed cell): Run now POSTs the task /run', !!runJobRec, JSON.stringify(jobs.map(j => j.path)))
+  const getsBeforeFail = apiGets.filter(p => p === '/backup/tasks').length
+  runJobRec.onFailed({ error: { message: RUN_ERR } })
+  await settle()
+  ok('backup(failed cell): a failed run reloads the grid too',
+    apiGets.filter(p => p === '/backup/tasks').length === getsBeforeFail + 1)
+  const tipped = lastRunCol.renderer('failure', {}, failedRec('2026-09-24T03:00:00Z'))
+  ok('backup(failed cell): the run\'s error line is the tooltip',
+    tipped.includes('connection refused'), tipped)
+  const later = lastRunCol.renderer('failure', {}, failedRec('2026-09-24T04:00:00Z'))
+  ok('backup(failed cell): a LATER run never wears the earlier run\'s error line',
+    !later.includes('connection refused') && /open Details for the recent runs/.test(later), later)
+
+  ok('backup(weekly): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 await backupChecks()
+warnings.length = 0
+await backupWeeklyToggleChecks()
 warnings.length = 0
 await nestedChecks()
 warnings.length = 0
@@ -10908,7 +11012,7 @@ function cloudRoutes(remotes, encrypted) {
 }
 
 async function openCloudRemotes(routes) {
-  const ANAS = loadSource(['10-api.js', '72-cloud.js'], routes)
+  const ANAS = loadSource(['10-api.js', '69-schedules-common.js', '72-cloud.js'], routes)
   ANAS.cloud.openRemotes('harness')
   await settle()
   return { ANAS, win: openWindow() }
@@ -11292,10 +11396,10 @@ async function cloudChecks() {
   eq('cloud(s3): exactly ONE region row after picking provider AWS',
     cloudRowFields(dlg, 'cloudOptionsBasic', 'region'), 1)
   const region = cloudOption(dlg, 'region')
+  const regionRows = region && region.getStore() ? region.getStore().getRange() : []
   ok('cloud(s3): the region combo carries the AWS examples',
-    !!region && region.store && region.store.data && region.store.data.length > 0
-      && region.store.data[0].value === 'us-east-1',
-    region && region.store && JSON.stringify(region.store.data && region.store.data[0]))
+    regionRows.length > 0 && regionRows[0].get('value') === 'us-east-1',
+    JSON.stringify(regionRows.map(r => r.get('value'))))
   cloudOption(dlg, 'access_key_id').setValue('AKIAEXAMPLE')
   dlg.down('#cloudOpt_provider').setValue('Ceph')
   await settle()
@@ -11509,11 +11613,19 @@ function cloudTaskRoutes() {
     'DELETE /cloud/tasks/pictures-offsite': { job: { id: 'cloud-task-del' } },
     'POST /cloud/tasks/pictures-offsite/run': { job: { id: 'cloud-task-run' } },
     'POST /backup/tasks/preview-nested': (body) => nestedPreviewRoute(body),
+    // The wizard's Browse button drives the SHARED picker, which reads the
+    // live filesystem through this one endpoint.
+    'GET /fs/browse': (path) => {
+      const params = new URLSearchParams(path.split('?')[1] || '')
+      return liveRoute(params.get('path') || '/', params.get('files') === '1')
+    },
   }
 }
 
 async function openCloudTasks(routes) {
-  const ANAS = loadSources(['10-api.js', '69-schedules-common.js', '72-cloud.js'], routes)
+  // 12-picker.js rides along because the wizard's Source Browse button opens
+  // it — in the bundle's own order (12 before 69 before 72).
+  const ANAS = loadSources(['10-api.js', '12-picker.js', '69-schedules-common.js', '72-cloud.js'], routes)
   const view = makeComponent(ANAS.views.cloud.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -11564,6 +11676,30 @@ async function cloudTaskChecks() {
     && (dlg.down('#cloudMode').getValue() || {}).cloudMode === 'copy',
     JSON.stringify(dlg.down('#cloudModeNote').html || ''))
 
+  // The Remote combo offers what the /cloud/remotes read returned. The list
+  // was fetched to decide whether to open at all and then thrown away, which
+  // left the combo with an empty store and nothing to pick.
+  const remoteStore = dlg.down('#cloudRemote').getStore()
+  eq('cloud tasks: the Remote combo\'s store carries the fetched remotes',
+    remoteStore ? remoteStore.getRange().map(r => r.get('name')) : null, ['gt'])
+
+  // Browse opens the SHARED picker, and a single-select picker hands back the
+  // path STRING — reading `.path` off it filled the field with nothing.
+  created.windows.length = 0
+  const browseBtn = findCmp(dlg, 'anas-btn-cloud-source-browse')
+  ok('cloud tasks: the Source row carries its Browse button', !!browseBtn)
+  browseBtn.handler(browseBtn)
+  await settle()
+  const cloudPicker = openWindow()
+  ok('cloud tasks(browse): Browse opened the shared path picker',
+    cloudPicker && cloudPicker.cls === 'anas-win-path-picker')
+  cloudPicker.down('#pickerPath').setValue('/mnt/pictures')
+  const cloudPick = cloudPicker.buttonCmps.find(b => b.cls === 'anas-btn-picker-select')
+  cloudPick.handler(cloudPick)
+  await settle()
+  eq('cloud tasks(browse): the picker\'s STRING answer fills the source field',
+    dlg.down('#cloudSource').getValue(), '/mnt/pictures')
+
   // The nested note renders from the preview-nested scan — it follows the
   // source field, so it lands once a source is set (an empty opening form has
   // an empty note, honestly: there is no source to scan).
@@ -11605,6 +11741,8 @@ async function cloudTaskChecks() {
     jobs[0] && !('schedule' in jobs[0].body))
   ok('cloud tasks(create): a cleared bandwidth limit sends nothing',
     jobs[0] && !('bwlimit' in jobs[0].body))
+  validates('cloud tasks(create): the payload validates against CloudSyncTaskRequest',
+    CloudSyncTaskRequest, jobs[0] && jobs[0].body)
 
   // The grid reloaded after the create job and the NEW row is selected.
   ok('cloud tasks(create): the grid reloaded after the job (success)',
@@ -11646,6 +11784,15 @@ async function cloudTaskChecks() {
   ok('cloud tasks(edit): the wizard pre-fills', editDlg && editDlg.down('#cloudTaskName').getValue() === 'pictures-offsite'
     && editDlg.down('#cloudSource').getValue() === '/mnt/pictures')
   ok('cloud tasks(edit): the name is immutable', editDlg.down('#cloudTaskName').disabled === true)
+  // An Edit opens with its stored remote SELECTED, which only holds if the
+  // combo's store carries it: a `forceSelection` combo over an empty store
+  // shows nothing and saves nothing.
+  const editRemote = editDlg.down('#cloudRemote')
+  const editRemoteStore = editRemote.getStore()
+  ok('cloud tasks(edit): the stored remote is a member of the combo\'s store',
+    !!editRemoteStore
+    && editRemoteStore.getRange().some(r => r.get('name') === editRemote.getValue()),
+    String(editRemote.getValue()))
   // A sync retarget + a bandwidth limit: the PUT carries the whole task.
   editDlg.down('#cloudMode').setValue({ cloudMode: 'sync' })
   editDlg.down('#cloudBwlimit').setValue('8M')
@@ -11666,6 +11813,8 @@ async function cloudTaskChecks() {
       bwlimit: '8M',
       cadence: { kind: 'weekly', days: ['Mon'], time: '02:00' },
     })
+  validates('cloud tasks(edit): the payload validates against CloudSyncTaskRequest',
+    CloudSyncTaskRequest, jobs[0] && jobs[0].body)
   created.windows.length = 0
 
   // --- Run now: the one run path, and the reload on success AND failure ------
@@ -11688,20 +11837,31 @@ async function cloudTaskChecks() {
     apiGets.filter(p => p === '/cloud/tasks').length === failGetsBefore + 1)
   // The failed Last run cell: red, with the run's error line as the tooltip —
   // the line the notification carries.
-  failJob.onFailed({ error: { message: 'rclone copy failed (exit 7): 2026/09/24 03:00 fatal error: max deletes reached' } })
+  const RUN_ERR = 'rclone copy failed (exit 7): 2026/09/24 03:00 fatal error: max deletes reached'
+  failJob.onFailed({ error: { message: RUN_ERR } })
   await settle()
   const errStore = grid.getStore()
-  eq('cloud tasks(run): the error line is recorded for the row', errStore._anasRunErrors && errStore._anasRunErrors['pictures-offsite'],
-    'rclone copy failed (exit 7): 2026/09/24 03:00 fatal error: max deletes reached')
+  eq('cloud tasks(run): the error line is recorded for the row, keyed to the run',
+    errStore._anasRunErrors && errStore._anasRunErrors['pictures-offsite'].msg, RUN_ERR)
   const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
-  const failedCell = lastRunCol.renderer('failure', {}, {
-    get: (k) => ({ lastRunResult: 'failure', lastRunAt: null, overdue: false, name: 'pictures-offsite' }[k]),
+  const failedRec = at => ({
+    get: k => ({ lastRunResult: 'failure', lastRunAt: at, overdue: false, name: 'pictures-offsite' }[k]),
     store: errStore,
   })
+  const failedCell = lastRunCol.renderer('failure', {}, failedRec('2026-09-24T03:00:00Z'))
   ok('cloud tasks(run): a failed Last run cell is red with the error line as its tooltip',
     /#c23b2c|var\(--anas-danger/.test(failedCell)
     && /max deletes reached/.test(failedCell)
     && !/gtpass/.test(failedCell), failedCell)
+  // The SAME run renders the same line — a poll must not consume it.
+  ok('cloud tasks(run): the line survives a re-render of the same run',
+    /max deletes reached/.test(lastRunCol.renderer('failure', {}, failedRec('2026-09-24T03:00:00Z'))))
+  // A LATER run is a different run: the old words are dropped, and the cell
+  // says where the history is instead of claiming a cause it does not know.
+  const laterCell = lastRunCol.renderer('failure', {}, failedRec('2026-09-24T04:00:00Z'))
+  ok('cloud tasks(run): a LATER run never wears the earlier run\'s error line',
+    !/max deletes reached/.test(laterCell) && /open Details for the recent runs/.test(laterCell),
+    laterCell)
 
   // --- toggle: the whole task rides the PUT, enabled flipped -----------------
   jobs.length = 0
@@ -11712,6 +11872,12 @@ async function cloudTaskChecks() {
     jobs[0] && jobs[0].body && jobs[0].body.remote === 'gt' && jobs[0].body.source === '/mnt/pictures'
     && jobs[0].body.mode === 'copy' && jobs[0].body.cadence && jobs[0].body.cadence.kind === 'weekly',
     JSON.stringify(jobs[0] && jobs[0].body))
+  // A WEEKLY cadence carries no week parity, and the schema types parity as an
+  // enum: an empty-string key made the toggle a 400 on every non-biweekly task.
+  ok('cloud tasks(toggle): a weekly cadence carries no empty parity key',
+    jobs[0] && !('parity' in jobs[0].body.cadence), JSON.stringify(jobs[0] && jobs[0].body.cadence))
+  validates('cloud tasks(toggle): the payload validates against CloudSyncTaskRequest',
+    CloudSyncTaskRequest, jobs[0] && jobs[0].body)
 
   // --- remove: the confirm, then DELETE of the units only ---------------------
   jobs.length = 0

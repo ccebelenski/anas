@@ -480,20 +480,29 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
   }
 
   // --- GET /cloud/tasks — the grid (LOCAL-ONLY status) ----------------------
-  server.get('/cloud/tasks', async () => {
-    const tasks = await readAllTasks(systemdDir)
-    const data = await Promise.all(
-      tasks.map(async (task): Promise<CloudSyncTaskView> => {
-        const st = await deriveTaskStatus(executor, task)
-        return {
-          ...task,
-          lastRunResult: st.lastRunResult,
-          lastRunAt: st.lastRunAt,
-          nextRunAt: st.nextRunAt,
-          overdue: st.overdue,
-        }
-      }),
-    )
+  // Behind the same 503 door as every other cloud read. `install.sh` installs
+  // rclone as a hard dependency, so a node without it has a broken install,
+  // and the grid that fronts the whole feature must say the install sentence
+  // rather than render an empty list as though nothing were configured.
+  server.get('/cloud/tasks', async (request, reply) => {
+    const data = await guard503(reply, async () => {
+      await requireRclone()
+      const tasks = await readAllTasks(systemdDir)
+      return Promise.all(
+        tasks.map(async (task): Promise<CloudSyncTaskView> => {
+          const st = await deriveTaskStatus(executor, task)
+          return {
+            ...task,
+            lastRunResult: st.lastRunResult,
+            lastRunAt: st.lastRunAt,
+            nextRunAt: st.nextRunAt,
+            overdue: st.overdue,
+          }
+        }),
+      )
+    })
+    if (data === undefined)
+      return undefined
     return { data }
   })
 

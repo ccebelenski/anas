@@ -1601,6 +1601,11 @@
             + enc(s) + '</span>';
     }
 
+    function renderName(v) {
+        var s = '' + (v == null ? '' : v);
+        return '<span title="' + enc(s) + '">' + enc(s) + '</span>';
+    }
+
     function renderSource(v) {
         var s = '' + (v == null ? '' : v);
         if (!s) {
@@ -1635,8 +1640,9 @@
     // it. A FAILED run's cell carries rclone's last error line as the tooltip —
     // the line the notification body shows. The grid payload names no error
     // line, so the tooltip reads the run this user started from this grid
-    // (runTaskNow records it on the store); a run started by the timer shows
-    // the pill without it — journald's tail is on the detail.
+    // (runTaskNow records it through the shared session store, keyed to the
+    // run); a run started by the timer, or a later run than the one that
+    // failed, shows the time and where the history is instead.
     function renderLastRun(v, meta, rec) {
         var result = '' + (rec.get('lastRunResult') || 'unknown');
         var at = rec.get('lastRunAt');
@@ -1649,18 +1655,8 @@
                 t('An off-week fire of an every-other-week task — nothing was copied, '
                     + 'and nothing is wrong.') + (at ? ' ' + absTime(at) : ''));
         } else if (result === 'failure') {
-            var err = '';
-            try {
-                var errs = rec.store && rec.store._anasRunErrors;
-                err = errs ? ('' + (errs[rec.get('name')] || '')) : '';
-            } catch (eStore) {
-                err = '';
-            }
-            var tip = err || absTime(at);
-            pill = '<span title="' + enc(tip) + '"'
-                + ' style="display:inline-block;padding:1px 9px;border-radius:9px;'
-                + 'font-size:0.85em;color:#fff;background:var(--anas-danger,#c23b2c);">'
-                + enc(t('failure')) + '</span>';
+            pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)',
+                ANAS.sched.runErrorTip(rec.store, rec.get('name'), at));
         } else if (result === 'running') {
             pill = '<span title="' + enc(t('running')) + '"'
                 + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
@@ -1847,6 +1843,18 @@
 
     // ---- Run now ------------------------------------------------------------
 
+    // The `lastRunAt` a row carries right now — the run the grid is still
+    // showing when a failure is recorded against it.
+    function lastRunAtOf(store, name) {
+        try {
+            var idx = store ? store.findExact('name', name) : -1;
+            var rec = idx >= 0 ? store.getAt(idx) : null;
+            return rec ? rec.get('lastRunAt') : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
     // The ONE run path, as backup runs it: POST the task's /run, let the task's
     // own systemd unit do the work, supervise through the job — so a manual run
     // lands in systemd's last-result and the unit journal exactly like a
@@ -1882,29 +1890,19 @@
                 } catch (eSum) {
                     // best-effort summary
                 }
-                try {
-                    var store = grid && grid.getStore();
-                    if (store && store._anasRunErrors) {
-                        delete store._anasRunErrors[name];
-                    }
-                } catch (eClr) {
-                    // non-fatal
-                }
+                // A manual success retires the line the last failure left.
+                ANAS.sched.runErrors.clear(grid && grid.getStore(), name);
                 ANAS.toast(msg);
                 loadTasks(view, node);
             },
             onFailed: function (job) {
                 var message = (job && job.error && job.error.message) || '';
                 if (message) {
-                    try {
-                        var store = grid && grid.getStore();
-                        if (store) {
-                            store._anasRunErrors = store._anasRunErrors || {};
-                            store._anasRunErrors[name] = message;
-                        }
-                    } catch (eRec) {
-                        // non-fatal
-                    }
+                    // Keyed to the run: the timestamp the row carries NOW is
+                    // the previous run's, and the reload that follows brings
+                    // in this run's — which is the one the line belongs to.
+                    var store = grid && grid.getStore();
+                    ANAS.sched.runErrors.set(store, name, message, lastRunAtOf(store, name));
                 }
                 loadTasks(view, node);
             },
@@ -2172,7 +2170,7 @@
         });
     }
 
-    function openTaskDetail(node, name, view) {
+    function openTaskDetail(node, name) {
         if (!name) {
             return;
         }
@@ -2208,7 +2206,6 @@
             ANAS.warn('cloud task detail window failed: ' + ANAS.errText(e));
             return;
         }
-        win._view = view;
         win.show();
         loadDetailInto(win, node, name);
     }
@@ -2330,33 +2327,53 @@
             value: cur || '/',
             title: t('Choose a directory'),
             onSelect: function (chosen) {
+                // A SINGLE-select picker hands back the path STRING — the path
+                // field is authoritative there, so a typed answer the tree
+                // never showed is still a legitimate pick. The object form is
+                // tolerated for an older picker, never relied on.
                 var f = win.down('#cloudSource');
-                if (f && chosen && chosen.path) {
-                    f.setValue(chosen.path);
+                if (!f) {
+                    return;
+                }
+                var picked = (typeof chosen === 'string')
+                    ? chosen
+                    : ((chosen && chosen.path) || '');
+                if (picked) {
+                    f.setValue(picked);
                 }
             },
         });
+    }
+
+    // The saved remotes, as the combo's store wants them.
+    function remoteStoreData(names) {
+        var out = [];
+        for (var i = 0; i < names.length; i++) {
+            out.push({ name: names[i] });
+        }
+        return out;
     }
 
     function openTaskWizard(view, node, existing) {
         var isEdit = !!existing;
         var task = existing || {};
         ANAS.api.get(node, '/cloud/remotes').then(function (res) {
-            if (!isEdit) {
-                // The remote combo is the wizard's one precondition: with no
-                // remote saved there is nothing to send to (the backup
-                // precedent — the toast names the button that fixes it).
-                var names = ((res && res.data) && res.data.remotes || []).map(function (r) {
-                    return r && r.name;
-                }).filter(function (n) {
-                    return !!n;
-                });
-                if (!names.length) {
-                    ANAS.toast(t(EMPTY_REMOTES_TOAST));
-                    return;
-                }
+            // The fetched names are what the combo offers — the read was
+            // always made, and throwing the list away left the Remote field
+            // with an empty store and nothing to pick.
+            var names = ((res && res.data) && res.data.remotes || []).map(function (r) {
+                return r && r.name;
+            }).filter(function (n) {
+                return !!n;
+            });
+            // The combo is the wizard's one precondition: with no remote saved
+            // there is nothing to send to (the backup precedent — the toast
+            // names the button that fixes it).
+            if (!isEdit && !names.length) {
+                ANAS.toast(t(EMPTY_REMOTES_TOAST));
+                return;
             }
-            buildTaskWizard(view, node, isEdit, task);
+            buildTaskWizard(view, node, isEdit, task, names);
         }, function (err) {
             ANAS.warn('cloud task wizard load failed: ' + ANAS.errText(err));
             ANAS.alertMsg('Load failed',
@@ -2364,7 +2381,7 @@
         });
     }
 
-    function buildTaskWizard(view, node, isEdit, task) {
+    function buildTaskWizard(view, node, isEdit, task, remoteNames) {
         var win;
         try {
             win = Ext.create('Ext.window.Window', {
@@ -2451,6 +2468,10 @@
                             allowBlank: false,
                             displayField: 'name',
                             valueField: 'name',
+                            store: {
+                                data: remoteStoreData(remoteNames || []),
+                                fields: ['name'],
+                            },
                             emptyText: t('(no remotes configured)'),
                             value: task.remote || '',
                             listeners: {
@@ -2741,7 +2762,7 @@
                     var view = btn.up('#cloudView');
                     var rec = selectedTask(gridOf(view));
                     if (rec) {
-                        openTaskDetail(node, rec.get('name'), view);
+                        openTaskDetail(node, rec.get('name'));
                     }
                 },
             },
@@ -2754,7 +2775,10 @@
                 handler: function (btn) {
                     var view = btn.up('#cloudView');
                     var rec = selectedTask(gridOf(view));
-                    openTaskWizard(view, node, rec ? (rec.get('raw') || {}) : null);
+                    // No stored task on the record = nothing to edit: open the
+                    // wizard as a CREATE rather than as a blank Edit that would
+                    // save an empty task under the row's name.
+                    openTaskWizard(view, node, (rec && rec.get('raw')) || null);
                 },
             },
             {
@@ -2800,8 +2824,10 @@
                     emptyText: t('No cloud sync tasks defined'),
                     columns: [
                         {
+                            // The tooltip carries the whole name: a column is a
+                            // width, and an id is never shortened to fit one.
                             text: t('Name'), dataIndex: 'name', width: 150,
-                            renderer: Ext.String.htmlEncode,
+                            renderer: renderName,
                         },
                         {
                             text: t('Source'), dataIndex: 'source', flex: 1,
@@ -2848,7 +2874,7 @@
                         },
                         itemdblclick: function (grid, rec) {
                             var view = grid.up('#cloudView');
-                            openTaskWizard(view, node, rec ? (rec.get('raw') || {}) : null);
+                            openTaskWizard(view, node, (rec && rec.get('raw')) || null);
                         },
                     },
                 },
@@ -2869,7 +2895,7 @@
 
     ANAS.cloud = {
         openRemotes: openRemotesManager,
-        openTasks: openTaskWizard,
+        openTaskWizard: openTaskWizard,
     };
 
     // ---- View registration -------------------------------------------------
