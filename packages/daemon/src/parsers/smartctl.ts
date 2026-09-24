@@ -72,19 +72,24 @@ export function isSmartctlStandby(result: { stdout: string, stderr?: string, exi
 }
 
 /**
- * The disk's power mode from a smartctl `--json` identity document, as
- * `power_mode.string` (smartctl 7.5's ATA identity emits it on the
- * `-n standby -iH` call — GT capture pve14 2026-09-10): "ACTIVE or IDLE",
- * "STANDBY", "SLEEP". SCSI/SAS/NVMe documents carry no `power_mode` object at
- * all, and that absence is preserved — the mode is NEVER inferred from a
- * transport or a rotation rate (2026-09-10 power-policy ruling: display only,
- * no policy). Undefined when the document reports none.
+ * The disk's power mode from a smartctl `--json` identity document. smartctl
+ * 7.5's ATA identity emits it on the `-n standby -iH` call as
+ * `"power_mode": { "ata_value": <int>, "name": "<string>" }` — the NAME is the
+ * mode, not a `string` key: the fleet capture of 2026-09-10 recorded
+ * `255 "ACTIVE or IDLE"` and `129 "IDLE_A"`. smartmontools 7.5's own table of
+ * names is `ACTIVE or IDLE`, `ACTIVE_NV_UP`, `ACTIVE_NV_DOWN`, `IDLE_A`,
+ * `IDLE_B`, `IDLE_C` and `STANDBY_Y`; a mode is reported verbatim, never
+ * mapped to a prettier word, because the operator will match it against
+ * `smartctl -n standby` output. SCSI/SAS/NVMe documents carry no `power_mode`
+ * object at all, and that absence is preserved — the mode is NEVER inferred
+ * from a transport or a rotation rate (2026-09-10 power-policy ruling: display
+ * only, no policy). Undefined when the document reports none.
  */
 export function parsePowerMode(data: {
-  power_mode?: { string?: string }
+  power_mode?: { ata_value?: number, name?: string }
   [key: string]: unknown
 }): string | undefined {
-  const mode = data.power_mode?.string
+  const mode = data.power_mode?.name
   return mode || undefined
 }
 

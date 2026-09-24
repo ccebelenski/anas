@@ -585,7 +585,7 @@ describe('DiskIdentityCache — readings age out on the pull (disks.1)', () => {
   function measuredWithPowerMode() {
     return { stdout: JSON.stringify({
       ...JSON.parse(NORMAL_IDENTITY),
-      power_mode: { string: 'ACTIVE or IDLE' },
+      power_mode: { ata_value: 255, name: 'ACTIVE or IDLE' },
     }), stderr: '', exitCode: 0 }
   }
 
@@ -746,4 +746,113 @@ describe('DiskIdentityCache — readings age out on the pull (disks.1)', () => {
       }
     }
   })
+
+  it('(G) a FAILED re-probe keeps the measured reading\'s date and power mode', async () => {
+    // The failure branch spreads the last MEASURED identity, so `measuredAt`
+    // and `powerMode` ride it: the detail's "as of <age>" must keep describing
+    // the reading those values came from. If the failure blanked either, a
+    // carried-over value would go undated — "last known" with no idea how
+    // long ago — which is the thing disks.1 exists to stop.
+    const clk = clock()
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: SMARTCTL,
+      args: ARGS,
+      results: [measuredWithPowerMode(), failureResult()],
+    })
+    const cache = new DiskIdentityCache(executor, { now: clk.now })
+
+    const measured = await cache.get('ata-WDC_A', '/dev/sdb')
+    const measuredAt = measured.measuredAt
+    assert.equal(measured.powerMode, 'ACTIVE or IDLE')
+    clk.advance(31 * 60 * 1000)
+
+    const failed = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 2, 'the aged reading was re-probed')
+    assert.equal(failed.staleReason, 'probe-failed')
+    assert.equal(failed.measuredAt, measuredAt, 'the failure keeps the MEASURED reading\'s date')
+    assert.notEqual(failed.measuredAt, clk.now(), 'and does not re-date it to the failure')
+    assert.equal(failed.powerMode, 'ACTIVE or IDLE', 'the power mode survives the failure')
+  })
+
+  it('(H) reprobeMs: 0 is "always due" — every pull re-probes', async () => {
+    // The tests' own dial. `??` keeps a literal 0, and the age check reads
+    // `>= 0`, so no reading is ever a hit. Nothing in the daemon passes it.
+    const clk = clock()
+    const executor = new MockExecutor()
+    executor.addFixture({ command: SMARTCTL, args: ARGS, results: [normalResult(), normalResult(), normalResult()] })
+    const cache = new DiskIdentityCache(executor, { now: clk.now, reprobeMs: 0 })
+
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 3, 'no clock movement needed — always due')
+  })
+})
+
+/**
+ * disks.1 — `ANAS_SMART_REPROBE_MS` is parsed WHOLE and clamped. The first cut
+ * used `Number.parseInt`, which reads `30m` as 30: a 30 ms cadence, i.e. an
+ * smartctl storm — one probe per disk on every single pull. The other end is
+ * just as bad: a huge value restores the never-re-probe bug the story exists
+ * to fix. So: `Number` (no partial parse), fall back to the 30-minute default
+ * on anything unusable, and clamp what survives to [1 s, 24 h].
+ *
+ * The cadence is not exported, so each case is measured through the cache's
+ * own behaviour: a reading is a hit one millisecond short of the expected
+ * cadence and due at it.
+ */
+describe('DiskIdentityCache — ANAS_SMART_REPROBE_MS is parsed whole and clamped (disks.1)', () => {
+  const DEFAULT_MS = 30 * 60 * 1000
+  const MIN_MS = 1000
+  const MAX_MS = 24 * 60 * 60 * 1000
+
+  const cases: Array<{ raw: string, expected: number, why: string }> = [
+    { raw: '', expected: DEFAULT_MS, why: 'an empty override is no override' },
+    { raw: '   ', expected: DEFAULT_MS, why: 'whitespace is no override either' },
+    { raw: 'abc', expected: DEFAULT_MS, why: 'unparsable falls back to the default' },
+    { raw: '0', expected: DEFAULT_MS, why: 'zero is not a cadence' },
+    { raw: '-1', expected: DEFAULT_MS, why: 'negative is not a cadence' },
+    { raw: '30m', expected: DEFAULT_MS, why: 'parseInt read this as 30 ms — a probe storm' },
+    { raw: '1e21', expected: MAX_MS, why: 'clamped down: never re-probing is the bug' },
+    { raw: '1', expected: MIN_MS, why: 'clamped up: 1 ms is a probe per pull' },
+    { raw: '2000', expected: 2000, why: 'a sane value is honoured verbatim' },
+  ]
+
+  for (const c of cases) {
+    it(`"${c.raw}" → ${c.expected} ms (${c.why})`, async () => {
+      const state = { now: 1_750_000_000_000 }
+      const now = () => state.now
+      const executor = new MockExecutor()
+      executor.addFixture({
+        command: SMARTCTL,
+        args: ARGS,
+        results: [normalResult(), normalResult()],
+      })
+      const old = process.env.ANAS_SMART_REPROBE_MS
+      process.env.ANAS_SMART_REPROBE_MS = c.raw
+      try {
+        const cache = new DiskIdentityCache(executor, { now })
+        await cache.get('ata-WDC_A', '/dev/sdb')
+        const calls = () => executor.calls.filter(x => x.command === SMARTCTL).length
+        assert.equal(calls(), 1)
+
+        state.now += c.expected - 1
+        await cache.get('ata-WDC_A', '/dev/sdb')
+        assert.equal(calls(), 1, 'a hair inside the cadence is still a cache hit')
+
+        state.now += 1
+        await cache.get('ata-WDC_A', '/dev/sdb')
+        assert.equal(calls(), 2, 'and at the cadence it is due')
+      }
+      finally {
+        if (old === undefined) {
+          delete process.env.ANAS_SMART_REPROBE_MS
+        }
+        else {
+          process.env.ANAS_SMART_REPROBE_MS = old
+        }
+      }
+    })
+  }
 })

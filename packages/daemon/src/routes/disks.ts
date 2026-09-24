@@ -167,6 +167,17 @@ export function computeHealth(
 }
 
 /**
+ * The ECMAScript time range: `new Date(ms).toISOString()` throws outside it,
+ * and on NaN. Wider than any real measurement, narrow enough that a garbage
+ * clock cannot take a route down.
+ */
+const MAX_EPOCH_MS = 8.64e15
+
+function isUsableEpochMs(ms: number | undefined): ms is number {
+  return typeof ms === 'number' && Number.isFinite(ms) && Math.abs(ms) <= MAX_EPOCH_MS
+}
+
+/**
  * Fetch all disk data: lsblk, by-id mapping, and pool membership, enriched with
  * cached identity + the fused SMART/ZFS `healthStatus`. Standalone (not a route
  * closure) so the Disks view AND the Dashboard status endpoint share ONE health
@@ -309,8 +320,14 @@ export async function collectDisks(
     // on a fresh reading, the last measured one on a standby/probe-failed
     // carry-over. The UI shows "read <age> ago" from it. Absent on a disk
     // never measured, and the power mode with it (undefined drops from JSON).
-    const smartMeasuredAt = identity?.measuredAt != null
-      ? new Date(identity.measuredAt).toISOString()
+    // A NaN, an Infinity or a value past the ECMAScript time range would make
+    // `toISOString()` THROW (RangeError) and take the whole disk list with it.
+    // The clock is injectable, so an unusable timestamp is a shape this route
+    // must survive rather than assume away: unusable reads as "never
+    // measured", which is exactly what an undated reading already means.
+    const measuredAtMs = identity?.measuredAt
+    const smartMeasuredAt = isUsableEpochMs(measuredAtMs)
+      ? new Date(measuredAtMs).toISOString()
       : undefined
     // Pool context joins on the kernel name (d.name), NOT the display by-id
     // (d.id) — the by-id ZFS reports and the by-id we display can differ.

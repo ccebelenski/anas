@@ -223,25 +223,42 @@ describe('standbySmartData', () => {
 
 /**
  * disks.1 rider 1 — the power mode, read off the ATA identity document's
- * `power_mode.string` and never inferred. The fixture is a minimal ATA
- * identity in the real smartctl 7.5 shape (built from smartctl's documented
- * `power_mode` object; no live capture in the tree carried the field). The
- * SCSI fixture (smartctl.json — a QEMU virtual disk) reports none, and so
- * would any SAS drive: absence must survive as absence.
+ * `power_mode.name` and never inferred. smartctl 7.5 emits
+ * `"power_mode": { "ata_value": <int>, "name": "<string>" }`; the parser read
+ * `power_mode.string` until the fix batch, which would have reported NO mode
+ * on every real ATA drive. The two fixtures carry the documented shape with
+ * the values the 2026-09-10 fleet capture recorded (255 "ACTIVE or IDLE" on an
+ * awake drive, 129 "IDLE_A" on one that had idled down) — see
+ * `fixtures/system/NOTES.md`. The SCSI fixture (smartctl.json — a QEMU virtual
+ * disk) reports none, and so would any SAS drive: absence must survive as
+ * absence.
  */
 describe('parsePowerMode', () => {
-  it('reads power_mode.string from the ATA identity document', () => {
+  it('reads power_mode.name from the ATA identity document', () => {
     const ata = loadFixture('smartctl-ata-identity.json')
+    assert.equal(ata.power_mode.ata_value, 255, 'the fixture carries the real smartctl shape')
     assert.equal(parsePowerMode(ata), 'ACTIVE or IDLE')
+  })
+
+  it('reads an idled-down drive\'s mode verbatim, never mapped to a prettier word', () => {
+    const idle = loadFixture('smartctl-ata-identity-idle.json')
+    assert.equal(idle.power_mode.ata_value, 129)
+    assert.equal(parsePowerMode(idle), 'IDLE_A')
   })
 
   it('is absent on a document without power_mode (SCSI/SAS shape)', () => {
     const scsi = loadFixture('smartctl.json')
+    assert.equal(scsi.power_mode, undefined, 'the SCSI fixture really carries no power_mode')
     assert.equal(parsePowerMode(scsi), undefined)
     assert.equal(parsePowerMode({}), undefined)
   })
 
-  it('an empty power_mode.string is absence, not an empty mode', () => {
-    assert.equal(parsePowerMode({ power_mode: { string: '' } }), undefined)
+  it('an empty power_mode.name is absence, not an empty mode', () => {
+    assert.equal(parsePowerMode({ power_mode: { ata_value: 255, name: '' } }), undefined)
+  })
+
+  it('the old `string` key alone is NOT a mode — the shape moved, nothing is inferred', () => {
+    const preFix = JSON.parse('{"power_mode":{"string":"ACTIVE or IDLE"}}')
+    assert.equal(parsePowerMode(preFix), undefined)
   })
 })

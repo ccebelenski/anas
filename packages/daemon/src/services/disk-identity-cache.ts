@@ -19,13 +19,34 @@ import { isSmartctlProbeFailure, isSmartctlStandby, parsePowerMode } from '../pa
  */
 const DEFAULT_SMART_REPROBE_MS = 30 * 60 * 1000
 
-/** `ANAS_SMART_REPROBE_MS` override (tests), or the 30-minute default. */
+/**
+ * The narrowest cadence the env may ask for. `Number.parseInt` would have read
+ * `30m` as 30 — a re-probe on every pull, i.e. an smartctl storm per disk per
+ * page load — so the value is parsed WHOLE and then clamped.
+ */
+const MIN_SMART_REPROBE_MS = 1000
+/**
+ * ...and the widest. A day is already "effectively never" on a box nobody
+ * looks at; anything past it restores the never-re-probe bug this story
+ * exists to fix.
+ */
+const MAX_SMART_REPROBE_MS = 24 * 60 * 60 * 1000
+
+/**
+ * `ANAS_SMART_REPROBE_MS` override (tests), or the 30-minute default. The
+ * value must be a whole number of milliseconds: `Number` rejects `30m`, `abc`
+ * and every other suffixed or partial form that `parseInt` would have taken
+ * the leading digits of, and anything outside [1 s, 24 h] is clamped rather
+ * than honoured — neither a probe storm nor a cadence that never comes due.
+ */
 function reprobeCadenceFromEnv(): number {
   const raw = process.env.ANAS_SMART_REPROBE_MS
-  if (raw === undefined)
+  if (raw === undefined || raw.trim() === '')
     return DEFAULT_SMART_REPROBE_MS
-  const n = Number.parseInt(raw, 10)
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SMART_REPROBE_MS
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0)
+    return DEFAULT_SMART_REPROBE_MS
+  return Math.min(Math.max(n, MIN_SMART_REPROBE_MS), MAX_SMART_REPROBE_MS)
 }
 
 export interface DiskIdentityCacheOptions {
@@ -34,7 +55,13 @@ export interface DiskIdentityCacheOptions {
    * `Date.now`.
    */
   now?: () => number
-  /** Re-probe cadence in ms. Default: `ANAS_SMART_REPROBE_MS` or 30 minutes. */
+  /**
+   * Re-probe cadence in ms. Default: `ANAS_SMART_REPROBE_MS` (parsed whole and
+   * clamped to [1 s, 24 h]) or 30 minutes. Unlike the env, this option is
+   * taken verbatim — it is the tests' own dial, and `reprobeMs: 0` means
+   * ALWAYS DUE: every pull re-probes. Tests only; nothing in the daemon
+   * passes it.
+   */
   reprobeMs?: number
 }
 
@@ -55,8 +82,9 @@ export interface DiskIdentity {
   smartHealthy: boolean | null
   /**
    * The disk's power mode as smartctl reported it at measurement time
-   * (`power_mode.string` from the ATA identity JSON — "ACTIVE or IDLE",
-   * "STANDBY"). Absent when the transport reports none (SAS/SCSI drives do
+   * (`power_mode.name` from the ATA identity JSON — "ACTIVE or IDLE",
+   * "IDLE_A", "STANDBY_Y" and the rest of smartmontools 7.5's names, reported
+   * verbatim). Absent when the transport reports none (SAS/SCSI drives do
    * not) — never inferred from a transport or a rotation rate. A standby skip
    * and a failed probe keep the last measured value: it rides the identity
    * it was measured with, and the reading's `measuredAt` says how old that is.
@@ -316,8 +344,9 @@ export class DiskIdentityCache {
       const last = this.measured.get(diskId)
       const identity = {
         ...(last ?? prior ?? emptyIdentity()),
-        // The power mode is no longer known either — the probe did not get
-        // to report it.
+        // The power mode rides the spread above: the probe reported nothing,
+        // so the LAST MEASURED mode is what is carried, dated by the same
+        // `measuredAt` — shown as "as of <age>", never as a fresh claim.
         standby: false,
         // `stale` is "last known, not current" — a claim only a REAL prior
         // reading can support. A disk never measured gets the re-probe duty

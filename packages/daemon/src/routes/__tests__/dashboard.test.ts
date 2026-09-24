@@ -448,6 +448,20 @@ describe('GET /v1/status — ahrPools briefs (story 11.13, AHR-DESIGN §10 revis
 
     await status(server)
     assert.equal(identityProbes(), first, 'a fresh reading is a cache hit within the cadence — no re-probe on the next pull')
+
+    // ...and once the readings AGE past the cadence, the very next /status
+    // pull re-probes: the dashboard's disk warnings are the whole reason the
+    // reading must not be a lifetime cache hit. The server's own cache is the
+    // one under test (there is exactly one for every consumer), so the clock
+    // is injected into it rather than the test sleeping 30 minutes.
+    const cache = (server as unknown as { diskIdentityCache: { now: () => number } }).diskIdentityCache
+    const realNow = cache.now
+    cache.now = () => realNow() + 31 * 60 * 1000
+    await status(server)
+    assert.ok(
+      identityProbes() > first,
+      `an aged reading is re-probed on the next dashboard pull (was ${first}, now ${identityProbes()})`,
+    )
   })
 
   it('carries the healthy AHR pool in the /v1/status aggregate', async () => {

@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { DevicePath } from './common.js'
+import { DevicePath, ISODateTime } from './common.js'
 import { VdevRole } from './zfs.js'
 
 // --- Enums ---
@@ -118,12 +118,13 @@ export const Disk = z.object({
    * ago" from it. Absent on a disk never measured (there is no measurement to
    * date) and on an older daemon (version-skew ruling).
    */
-  smartMeasuredAt: z.string().optional(),
+  smartMeasuredAt: ISODateTime.optional(),
   /**
-   * The disk's power mode as last measured by smartctl (`power_mode.string`):
-   * "ACTIVE or IDLE", "STANDBY", "SLEEP". Absent when the transport reports
-   * none (SAS/SCSI drives never do) — never inferred. Display only, no policy
-   * (2026-09-10 power-policy ruling).
+   * The disk's power mode as last measured by smartctl (`power_mode.name` on
+   * the ATA identity document): "ACTIVE or IDLE", "IDLE_A", "STANDBY_Y" and
+   * the rest of smartmontools 7.5's names, passed through verbatim. Absent
+   * when the transport reports none (SAS/SCSI drives never do) — never
+   * inferred. Display only, no policy (2026-09-10 power-policy ruling).
    */
   powerMode: z.string().optional(),
   /** Current usage status */

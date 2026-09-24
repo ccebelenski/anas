@@ -270,10 +270,19 @@
                 var tip = failed
                     ? t('The last SMART probe failed; the value shown is the last measured one')
                     : t('The disk is asleep and ANAS does not wake it to read SMART; the value shown is the last measured one');
+                // The re-probe promise is ONE translated sentence (a
+                // translator cannot reorder a clause assembled from
+                // fragments), and it is made only when the daemon dated the
+                // reading — a daemon old enough to report no age is one whose
+                // readings never age out at all, so promising a re-read there
+                // would be a lie.
                 if (readAge) {
-                    tip += ', ' + t('read') + ' ' + readAge;
+                    tip += ', ' + t('read') + ' ' + readAge + '. '
+                        + t('ANAS re-reads it on the next pull once it ages past the re-probe cadence.');
                 }
-                tip += '. ' + t('ANAS re-probes the disk.');
+                else {
+                    tip += '.';
+                }
                 html += ' <span class="anas-health-stale" title="' + enc(tip)
                     + '" style="color:' + COLOR_UNKNOWN + ';font-size:0.9em;">(' + enc(suffix) + ')</span>';
             }
@@ -455,45 +464,50 @@
         });
     }
 
+    // disks.1: the reading's age, and the power mode measured with it. Both
+    // belong to the DISK record the window was opened from — the fresh /smart
+    // call re-reports neither — and both must appear on BOTH detail shapes.
+    // They used to be rows in the summary store, which made them unreachable
+    // on exactly the disks the rider was written for: any ATA disk with a
+    // SMART attribute table takes the attribute grid, and an ATA disk is the
+    // only kind that HAS a power mode. So it is one line above the grid, built
+    // here and rendered by loadSmart for whichever shape came back.
+    //
+    // The power mode is left out on the standby shape: "spun down" is the
+    // current fact there, and "Power mode: ACTIVE or IDLE" beside it reads as
+    // a contradiction — the mode is only the last awake reading. The age is
+    // shown on both, and is what keeps a carried-over value honest.
+    function smartHeaderHtml(smart, disk) {
+        var parts = [];
+        var age = (disk && disk.smartMeasuredAt && ANAS.ago) ? ANAS.ago(disk.smartMeasuredAt) : '';
+        if (age) {
+            parts.push(enc(t('SMART read') + ' ' + age));
+        }
+        if (smart && smart.standby !== true && disk && disk.powerMode) {
+            var mode = t('Power mode') + ': ' + disk.powerMode;
+            if (age) {
+                mode += ' (' + t('as of') + ' ' + age + ')';
+            }
+            parts.push(enc(mode));
+        }
+        if (parts.length === 0) {
+            return '';
+        }
+        return '<div class="anas-smart-reading" style="color:' + COLOR_UNKNOWN
+            + ';padding:0 0 6px 2px;">' + parts.join(' &middot; ') + '</div>';
+    }
+
     // Name/value summary store for the NVMe / device shape (no attribute table)
-    // — used when SmartData.attributes is empty. `disk` is the grid record the
-    // window was opened from: it dates the reading (`smartMeasuredAt`, disks.1)
-    // and carries the power mode measured at that reading, neither of which the
-    // fresh /smart call re-reports.
-    function makeSummaryStore(smart, disk) {
+    // — used when SmartData.attributes is empty.
+    function makeSummaryStore(smart) {
         var rows = [];
         function push(name, value) {
             rows.push({ name: name, value: '' + value });
-        }
-        // disks.1: the age of the reading these values describe, and the power
-        // mode as it was measured then. Both ride the disk record, are shown
-        // only when the daemon reported them (old daemon / SAS / never-measured
-        // → absent, never inferred), and the age is what keeps a carried-over
-        // value honest.
-        function pushReadingAge() {
-            if (disk && disk.smartMeasuredAt && ANAS.ago) {
-                var age = ANAS.ago(disk.smartMeasuredAt);
-                if (age) {
-                    push(t('SMART read'), age);
-                }
-            }
-        }
-        function pushPowerMode() {
-            if (disk && disk.powerMode && ANAS.ago) {
-                var value = disk.powerMode;
-                var age = disk.smartMeasuredAt ? ANAS.ago(disk.smartMeasuredAt) : '';
-                if (age) {
-                    value += ' (' + t('as of') + ' ' + age + ')';
-                }
-                push(t('Power mode'), value);
-            }
         }
         // The daemon passed -n standby: a spun-down disk was never read, so the
         // placeholders below would read as "Supported: No" facts. One honest row.
         if (smart.standby === true) {
             push(t('Standby'), t('Disk is spun down; SMART was not read so as not to wake it'));
-            pushReadingAge();
-            pushPowerMode();
             return Ext.create('Ext.data.Store', {
                 fields: [{ name: 'name', type: 'string' }, { name: 'value', type: 'string' }],
                 data: rows,
@@ -502,8 +516,6 @@
         push(t('Supported'), smart.supported ? t('Yes') : t('No'));
         push(t('Enabled'), smart.enabled ? t('Yes') : t('No'));
         push(t('Overall Health'), smart.overallHealth);
-        pushReadingAge();
-        pushPowerMode();
         if (smart.temperature !== null && smart.temperature !== undefined) {
             push(t('Temperature'), smart.temperature + ' °C');
         }
@@ -628,13 +640,35 @@
                 content.setLoading(false);
                 var smart = (res && res.data) ? res.data : {};
                 var hasAttrs = smart.attributes && smart.attributes.length > 0;
-                content.add({
+                var grid = {
                     xtype: 'gridpanel',
+                    itemId: 'smartGrid',
                     border: false,
                     scrollable: true,
+                    flex: 1,
                     emptyText: t('No S.M.A.R.T. Values'),
-                    store: hasAttrs ? makeAttributeStore(smart.attributes) : makeSummaryStore(smart, disk),
+                    store: hasAttrs ? makeAttributeStore(smart.attributes) : makeSummaryStore(smart),
                     columns: hasAttrs ? attributeColumns() : summaryColumns(),
+                };
+                // The reading line (disks.1) sits ABOVE the grid, so it is
+                // there on both shapes — the attribute table and the summary.
+                // Absent entirely when the daemon dated nothing and reported
+                // no mode (old daemon, SAS, never measured): no empty strip.
+                var header = smartHeaderHtml(smart, disk);
+                var body = [grid];
+                if (header) {
+                    body = [{
+                        xtype: 'component',
+                        itemId: 'smartReading',
+                        html: header,
+                    }, grid];
+                }
+                content.add({
+                    xtype: 'panel',
+                    itemId: 'smartBody',
+                    border: false,
+                    layout: { type: 'vbox', align: 'stretch' },
+                    items: body,
                 });
             },
             function (err) {

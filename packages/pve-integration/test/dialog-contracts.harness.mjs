@@ -9476,8 +9476,24 @@ async function disksReadAgeChecks() {
   })
   ok('disks.1: a standby marker carries "read <age> ago"',
     /last known — disk in standby, read \d+m \d+s ago/.test(standby), standby)
+  const standbyTip = /title="([^"]*)"/.exec(standby)?.[1] || ''
   ok('disks.1: the standby tooltip says when the value was read',
-    /, read \d+m \d+s ago\./.test(/title="([^"]*)"/.exec(standby)?.[1] || ''), standby)
+    /, read \d+m \d+s ago\./.test(standbyTip), standby)
+  // The re-probe promise: one whole sentence, not a phrase glued from
+  // fragments, and it names the cadence rather than asserting a bare
+  // "ANAS re-probes the disk."
+  ok('disks.1: the tooltip promises the re-read as one sentence',
+    standbyTip.includes('ANAS re-reads it on the next pull once it ages past the re-probe cadence.'),
+    standbyTip)
+  ok('disks.1: the tooltip still leads with why the value is not current',
+    standbyTip.startsWith('The disk is asleep and ANAS does not wake it to read SMART'), standbyTip)
+  const failedTip = /title="([^"]*)"/.exec(render('healthy', {
+    healthStatus: 'healthy', smartStale: true, smartStaleReason: 'probe-failed', smartMeasuredAt: measuredAt,
+  }))?.[1] || ''
+  ok('disks.1: the probe-failed tooltip carries the same promise',
+    failedTip.startsWith('The last SMART probe failed')
+    && failedTip.includes('ANAS re-reads it on the next pull once it ages past the re-probe cadence.'),
+    failedTip)
 
   const failed = render('healthy', {
     healthStatus: 'healthy', smartStale: true, smartStaleReason: 'probe-failed', smartMeasuredAt: measuredAt,
@@ -9490,20 +9506,31 @@ async function disksReadAgeChecks() {
   const noAge = render('healthy', { healthStatus: 'healthy', smartStale: true, smartStaleReason: 'standby' })
   ok('disks.1: without smartMeasuredAt the marker keeps the bare wording',
     /last known — disk in standby\)/.test(noAge) && !/read \d+m \d+s ago/.test(noAge), noAge)
+  // ...and a daemon that dates nothing is one whose readings never age out,
+  // so the tooltip makes no re-read promise it cannot keep.
+  ok('disks.1: no age, no re-read promise in the tooltip',
+    !(/title="([^"]*)"/.exec(noAge)?.[1] || '').includes('re-reads it'), noAge)
   const badDate = render('healthy', {
     healthStatus: 'healthy', smartStale: true, smartStaleReason: 'standby', smartMeasuredAt: 'not-a-date',
   })
   ok('disks.1: an unparsable date is treated as absent, never an error',
     /last known — disk in standby\)/.test(badDate) && !/read \d+m \d+s ago/.test(badDate), badDate)
 
-  // --- the SMART detail window: the read-age row + the power-mode row -------
+  // --- the SMART detail window: the reading line above the grid ------------
   //
   // Driven through the grid's real itemdblclick door: openSmartWindow(node,
-  // rec) → GET /disks/:id/smart → the summary store. The summary (and the
-  // standby shape) gains "SMART read <age> ago" and, only when the daemon
-  // reported one, "Power mode <mode> (as of <age>)" — the age is what keeps a
-  // carried-over value honest. An old daemon / SAS disk record (no powerMode)
-  // shows no Power mode row: never inferred.
+  // rec) → GET /disks/:id/smart → whichever shape came back. The reading line
+  // is DOCKED above the grid, not pushed into the summary store: an ATA disk
+  // with a SMART attribute table takes the attribute grid, and an ATA disk is
+  // the only kind that HAS a power mode — rows in the summary store were
+  // unreachable on exactly the disks the rider was written for. So both
+  // shapes are driven here.
+  //
+  // The line reads "SMART read <age> ago" and, only when the daemon reported
+  // one, "Power mode: <mode> (as of <age>)" — the age is what keeps a
+  // carried-over value honest. The standby shape keeps its one honest row and
+  // shows NO power mode: "spun down" is the current fact, the mode is only
+  // the last awake reading, and the two side by side read as a contradiction.
   const DISK = {
     id: 'ata-WDC_WD6003FRYZ-01GDEB1_VDGK2GTN',
     name: 'sda',
@@ -9516,17 +9543,25 @@ async function disksReadAgeChecks() {
     temperature: 34, powerOnHours: 20481, attributes: [],
     nvmePercentageUsed: null, nvmeAvailableSpare: null,
   }
+  // The shape the rider actually targets: an ATA disk WITH a SMART attribute
+  // table, which takes makeAttributeStore and never sees the summary rows.
+  const ATTR_SMART = {
+    ...SMART,
+    attributes: [
+      { id: 5, name: 'Reallocated_Sector_Ct', value: 200, worst: 200, threshold: 140, rawValue: 0, failing: false },
+      { id: 9, name: 'Power_On_Hours', value: 71, worst: 71, threshold: 0, rawValue: 20481, failing: false },
+    ],
+  }
   const STANDBY_SMART = { ...SMART, supported: false, enabled: false, overallHealth: 'UNKNOWN', temperature: null, powerOnHours: null, standby: true }
-  const routes = {
-    'GET /disks': { data: [DISK] },
-    'GET /disks/ata-WDC_WD6003FRYZ-01GDEB1_VDGK2GTN/smart': { data: SMART },
-  }
-  const withStandby = {
-    'GET /disks': { data: [DISK] },
-    'GET /disks/ata-WDC_WD6003FRYZ-01GDEB1_VDGK2GTN/smart': { data: STANDBY_SMART },
-  }
+  const routesFor = (smart, disk) => ({
+    'GET /disks': { data: [disk || DISK] },
+    'GET /disks/ata-WDC_WD6003FRYZ-01GDEB1_VDGK2GTN/smart': { data: smart },
+  })
 
-  const rowsOf = async (r) => {
+  // Opens the detail window and hands back { reading, rows, attrs }: the
+  // docked line's html, the summary rows (empty on the attribute shape) and
+  // the attribute names (empty on the summary shape).
+  const detailOf = async (r) => {
     created.windows.length = 0
     const anas = loadSource('40-disks.js', r)
     const view = makeComponent(anas.views['disks'].factory('n1'), null)
@@ -9538,48 +9573,62 @@ async function disksReadAgeChecks() {
     await settle()
     const win = openWindow()
     ok('disks.1: the SMART window opened', !!win)
-    if (!win) { return [] }
-    const content = win.down('#smartContent')
-    const panel = content.items.getAt(0)
-    ok('disks.1: the summary store rendered', !!panel && !!panel.store)
-    return panel.store.getRange().map(rw => `${rw.get('name')}=${rw.get('value')}`)
+    if (!win) { return { reading: '', rows: [], attrs: [] } }
+    const smartGrid = win.down('#smartGrid')
+    ok('disks.1: the SMART grid rendered', !!smartGrid && !!smartGrid.store)
+    const line = win.down('#smartReading')
+    const cells = smartGrid.store.getRange()
+    const isAttrShape = !!smartGrid.columns.find(c => c.dataIndex === 'threshold')
+    return {
+      reading: (line && line.html) || '',
+      rows: isAttrShape ? [] : cells.map(rw => `${rw.get('name')}=${rw.get('value')}`),
+      attrs: isAttrShape ? cells.map(rw => rw.get('name')) : [],
+    }
   }
 
-  const rows = await rowsOf(routes)
-  ok('disks.1: the detail shows "SMART read <age> ago"',
-    rows.some(r => r.startsWith('SMART read=') && /\d+m \d+s ago$/.test(r)), rows.join(' | '))
-  ok('disks.1: the detail shows the power mode with its "as of" age',
-    rows.some(r => r.startsWith('Power mode=ACTIVE or IDLE') && /as of \d+m \d+s ago/.test(r)),
-    rows.join(' | '))
+  // (1) The summary shape (NVMe / no attribute table).
+  const summary = await detailOf(routesFor(SMART))
+  ok('disks.1: the summary detail shows "SMART read <age> ago" above the grid',
+    /SMART read \d+m \d+s ago/.test(summary.reading), summary.reading)
+  ok('disks.1: the summary detail shows the power mode with its "as of" age',
+    /Power mode: ACTIVE or IDLE \(as of \d+m \d+s ago\)/.test(summary.reading), summary.reading)
+  ok('disks.1: the reading line is not duplicated into the summary rows',
+    !summary.rows.some(r => r.startsWith('SMART read=') || r.startsWith('Power mode=')),
+    summary.rows.join(' | '))
+  ok('disks.1: the summary rows still carry the SMART facts',
+    summary.rows.some(r => r.startsWith('Overall Health=PASSED')), summary.rows.join(' | '))
 
-  const standbyRows = await rowsOf(withStandby)
+  // (2) The ATTRIBUTE shape — the one the rider exists for, and the one the
+  // summary-store rows could never reach.
+  const attr = await detailOf(routesFor(ATTR_SMART))
+  ok('disks.1: the attribute shape really rendered the attribute table',
+    attr.attrs.includes('Reallocated_Sector_Ct'), attr.attrs.join(' | '))
+  ok('disks.1: the attribute detail shows "SMART read <age> ago" too',
+    /SMART read \d+m \d+s ago/.test(attr.reading), attr.reading)
+  ok('disks.1: the attribute detail shows the power mode too',
+    /Power mode: ACTIVE or IDLE \(as of \d+m \d+s ago\)/.test(attr.reading), attr.reading)
+
+  // (3) The standby shape: the age, the honest row, and NO power mode.
+  const standbyDetail = await detailOf(routesFor(STANDBY_SMART))
   ok('disks.1: the standby detail keeps its one honest row',
-    standbyRows.some(r => r.startsWith('Standby=')), standbyRows.join(' | '))
-  ok('disks.1: the standby detail still shows the reading age and power mode',
-    standbyRows.some(r => r.startsWith('SMART read=')) && standbyRows.some(r => r.startsWith('Power mode=')),
-    standbyRows.join(' | '))
+    standbyDetail.rows.some(r => r.startsWith('Standby=')), standbyDetail.rows.join(' | '))
+  ok('disks.1: the standby detail dates the reading',
+    /SMART read \d+m \d+s ago/.test(standbyDetail.reading), standbyDetail.reading)
+  ok('disks.1: the standby detail shows NO power mode beside "spun down"',
+    !/Power mode/.test(standbyDetail.reading), standbyDetail.reading)
 
-  // SAS-shaped record: the daemon reports no power mode, the detail shows none.
-  created.windows.length = 0
-  const sas = loadSource('40-disks.js', {
-    'GET /disks': { data: [{ ...DISK, powerMode: undefined }] },
-    'GET /disks/ata-WDC_WD6003FRYZ-01GDEB1_VDGK2GTN/smart': { data: SMART },
-  })
-  const sasView = makeComponent(sas.views['disks'].factory('n1'), null)
-  const sasGrid = sasView.down('#anasDisksGrid')
-  sasView.fireEvent('afterrender', sasView) // loadDisks
-  await settle()
-  sasGrid.fireEvent('itemdblclick', sasGrid, sasGrid.getStore().getAt(0))
-  await settle()
-  const sasWin = openWindow()
-  ok('disks.1: the SAS-shaped detail window opened', !!sasWin)
-  const sasRows = sasWin
-    ? sasWin.down('#smartContent').items.getAt(0).store.getRange()
-      .map(rw => `${rw.get('name')}=${rw.get('value')}`)
-    : []
-  ok('disks.1: no Power mode row when the daemon reports none (never inferred)',
-    sasRows.some(r => r.startsWith('SMART read=')) && !sasRows.some(r => r.startsWith('Power mode=')),
-    sasRows.join(' | '))
+  // (4) SAS-shaped record: the daemon reports no power mode, none is shown.
+  const sas = await detailOf(routesFor(SMART, { ...DISK, powerMode: undefined }))
+  ok('disks.1: no power mode when the daemon reports none (never inferred)',
+    /SMART read \d+m \d+s ago/.test(sas.reading) && !/Power mode/.test(sas.reading),
+    sas.reading)
+
+  // (5) An older daemon dates nothing and reports no mode: no empty strip at
+  // all, just the grid.
+  const bare = await detailOf(routesFor(SMART, {
+    id: DISK.id, name: DISK.name, healthStatus: 'healthy',
+  }))
+  eq('disks.1: an undated reading renders no line above the grid', bare.reading, '')
 }
 
 // ============================================================================

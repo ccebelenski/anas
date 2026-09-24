@@ -213,8 +213,11 @@ const state = {
   burst: 1,
   timers: [],
   sections: {},
-  // GET /health body (disks.1 rider 2) — a value nothing else in the harness
-  // would produce, so the version-label check proves the label reads the probe.
+  // The version the install check's /health probe stashed (disks.1 rider 2) —
+  // a value nothing else in the harness would produce, so the version-label
+  // check proves the label reads that stash. `health` stays wired to the api
+  // stub so the "no second /health call" check has something to count.
+  daemonVersion: '9.9.9-harness',
   health: { status: 'ok', version: '9.9.9-harness' },
 }
 
@@ -283,12 +286,17 @@ function loadUi() {
         if (path === '/telemetry') { return Promise.resolve(telemetry(state.burst)) }
         return Promise.reject(new Error(`unexpected path ${path}`))
       },
-      // The node daemon's /health (disks.1 rider 2): the version label reads it.
+      // The install check's /health probe. The dashboard must NEVER reach it
+      // (disks.1 rider 2 fix batch: one call, one source) — every hit here is
+      // counted so the check can assert zero.
       health(_node) {
         state.healthCalls = (state.healthCalls || 0) + 1
         return Promise.resolve(state.health)
       },
     },
+    // What 20-notinstalled.js's install check stashed from that probe. The
+    // real function is a get/set pair; the harness serves the get.
+    daemonVersion(_node) { return state.daemonVersion },
   }
   const sandbox = {
     window: win,
@@ -316,7 +324,18 @@ function makeView() {
     _cmps: cmps,
     down(sel) {
       const id = sel.replace('#', '')
-      if (!cmps[id]) { cmps[id] = { itemId: id, html: '', setHtml(h) { this.html = h }, getWidth: () => 900 } }
+      if (!cmps[id]) {
+        cmps[id] = {
+          itemId: id,
+          html: '',
+          // The version line ships `hidden: true` and is shown only once it
+          // has a version (disks.1 fix batch) — the stub models both.
+          hidden: false,
+          setHtml(h) { this.html = h },
+          setHidden(v) { this.hidden = !!v },
+          getWidth: () => 900,
+        }
+      }
       return cmps[id]
     },
     up() { return null },
@@ -499,14 +518,30 @@ ok('charts carry the average overlay', html.includes('anas-gfx-tc-avg'))
 {
   const ver = view.down('#anasDashVersion')
   ok('the dashboard has a version line under the header', !!ver)
-  ok('the version line reads "ANAS <version>" off the /health probe',
-    /class="anas-dash-version">ANAS 9\.9\.9-harness</.test(ver.html || ''), ver && ver.html)
-  // Pull-driven like /status: refreshed on the loads that already refresh it,
-  // never polled — two telemetry ticks must not add a health call.
-  const before = state.healthCalls || 0
+  eq('the version line reads "ANAS <version>" off the stashed version',
+    ver.html, 'ANAS 9.9.9-harness')
+  ok('the version line is shown once it has a version', ver.hidden === false)
+
+  // ONE call, ONE source (fix batch): the install check every view is wrapped
+  // in already probed /health, so the dashboard issues no health GET at all —
+  // not on render, not on refresh, and certainly not on a telemetry tick.
+  eq('the dashboard makes no /health call of its own', state.healthCalls || 0, 0)
   await tick()
   await tick()
-  eq('telemetry ticks do not poll /health', state.healthCalls || 0, before)
+  eq('telemetry ticks do not poll /health', state.healthCalls || 0, 0)
+
+  // Fail-open: nothing stashed (an old gateway, a failed probe, a daemon that
+  // answered without a version) leaves the line empty AND hidden — an empty
+  // component still costs its 14 px margin.
+  state.daemonVersion = undefined
+  const bare = makeView()
+  ANAS.views.dashboard.factory('harness').listeners.afterrender(bare)
+  await new Promise(r => setImmediate(r))
+  const bareVer = bare.down('#anasDashVersion')
+  eq('with no version stashed the label stays empty', bareVer.html, '')
+  ok('...and hidden, so it reserves no space', bareVer.hidden === true)
+  eq('...and still no /health call was made', state.healthCalls || 0, 0)
+  state.daemonVersion = '9.9.9-harness'
 }
 
 // ---- Report -----------------------------------------------------------------

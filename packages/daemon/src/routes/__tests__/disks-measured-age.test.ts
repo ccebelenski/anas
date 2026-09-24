@@ -12,7 +12,7 @@ import { collectDisks } from '../disks.js'
  * mode. `smartMeasuredAt` is the ISO timestamp of the probe that produced the
  * values on THIS payload (its own probe when fresh, the last measured one on a
  * standby/probe-failed carry-over — the cache spreads it), absent on a disk
- * never measured. `powerMode` is `power_mode.string` from the ATA identity
+ * never measured. `powerMode` is `power_mode.name` from the ATA identity
  * JSON when the disk reports one (never inferred), absent otherwise. Both are
  * additive and drop from the JSON when absent, so an older daemon / a SAS disk
  * simply leaves the UI rows out (version-skew ruling).
@@ -26,7 +26,7 @@ const ATA_IDENTITY = {
   form_factor: { name: '3.5 inches' },
   firmware_version: '82.00A82',
   sata_version: { string: 'SATA 3.3, 6.0 Gb/s' },
-  power_mode: { string: 'ACTIVE or IDLE' },
+  power_mode: { ata_value: 255, name: 'ACTIVE or IDLE' },
   smart_status: { passed: true },
 }
 
@@ -89,7 +89,7 @@ describe('GET /v1/disks — the payload dates the reading and carries the power 
     const { fetch } = world([ok(JSON.stringify(ATA_IDENTITY))])
 
     const disk = await fetch()
-    assert.equal(disk.powerMode, 'ACTIVE or IDLE', 'power_mode.string passes through verbatim')
+    assert.equal(disk.powerMode, 'ACTIVE or IDLE', 'power_mode.name passes through verbatim')
     assert.ok(disk.smartMeasuredAt, 'the reading is dated')
     const at = Date.parse(disk.smartMeasuredAt!)
     assert.ok(!Number.isNaN(at) && at >= before - 1000 && at <= Date.now(), 'smartMeasuredAt is a real ISO timestamp near now')
@@ -138,5 +138,21 @@ describe('GET /v1/disks — the payload dates the reading and carries the power 
     assert.equal(disk.powerMode, undefined, 'absent, never inferred')
     const raw = JSON.parse(JSON.stringify(disk)) as Record<string, unknown>
     assert.ok(!('powerMode' in raw), 'the key drops from the wire payload')
+  })
+
+  it('an unusable clock reading is "never measured", not a thrown disk list', async () => {
+    // `new Date(NaN).toISOString()` throws a RangeError, and so does anything
+    // past the ECMAScript time range — which would take the WHOLE disk list
+    // (and the dashboard's disk warnings with it) down over one bad reading.
+    // The clock is injectable, so this is a shape the route must survive.
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 1e21]) {
+      const { fetch } = world([ok(JSON.stringify(ATA_IDENTITY))], { now: () => bad })
+      const disk = await fetch()
+      assert.equal(disk.smartMeasuredAt, undefined, `an unusable ${bad} reads as undated`)
+      // The rest of the reading is untouched: it WAS measured, it just cannot
+      // be dated.
+      assert.equal(disk.powerMode, 'ACTIVE or IDLE')
+      assert.equal(disk.smartHealthy, true)
+    }
   })
 })

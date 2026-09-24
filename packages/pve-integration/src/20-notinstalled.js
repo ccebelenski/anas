@@ -59,6 +59,24 @@
     //
     // Returns a docked-toolbar config, or null when everything matches (or the
     // bundle is unstamped — dev trees — in which case the check stays off).
+    // The per-node daemon version, as last seen by the install check's /health
+    // probe (disks.1 rider 2). ONE call, ONE source: every view render already
+    // probes /health here, so a consumer that wants to show the version reads
+    // it from this stash instead of issuing a second GET for the same body.
+    // Called with a version it records; called with none it reads. Fail-open —
+    // a node never probed (or a daemon that answered without a version) reads
+    // back undefined, and the caller shows nothing.
+    ANAS._daemonVersions = ANAS._daemonVersions || {};
+    ANAS.daemonVersion = function (node, version) {
+        if (version !== undefined) {
+            if (version) {
+                ANAS._daemonVersions[node] = version;
+            }
+            return version;
+        }
+        return ANAS._daemonVersions[node];
+    };
+
     ANAS.versionSkewBanner = function (node, daemonVersion) {
         var ui = ANAS.BUILD_VERSION;
         if (!ui) {
@@ -121,6 +139,18 @@
                             panel.setLoading(false);
                         } catch (e) {
                             // non-fatal
+                        }
+                        // The node daemon's version, remembered for whoever
+                        // wants to SHOW it (disks.1 rider 2 — the dashboard's
+                        // "ANAS <version>" label). Every view is already
+                        // wrapped in this check, so this probe is the one and
+                        // only /health call per view render: a label that made
+                        // its own GET would double the traffic to say what the
+                        // answer in hand already said.
+                        try {
+                            ANAS.daemonVersion(node, health && health.version);
+                        } catch (dv) {
+                            // non-fatal — the label simply stays empty
                         }
                         // Version-skew banner (12.1) — advisory, fail-open.
                         try {

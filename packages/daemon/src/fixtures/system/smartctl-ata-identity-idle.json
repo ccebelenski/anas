@@ -18,7 +18,7 @@
       "standby",
       "-iH",
       "--json",
-      "/dev/sda"
+      "/dev/sdb"
     ],
     "exit_status": 0
   },
@@ -27,8 +27,8 @@
     "asctime": "Wed Sep 24 08:00:00 2026 UTC"
   },
   "device": {
-    "name": "/dev/sda",
-    "info_name": "/dev/sda [SAT]",
+    "name": "/dev/sdb",
+    "info_name": "/dev/sdb [SAT]",
     "type": "sat",
     "protocol": "ATA"
   },
@@ -39,14 +39,14 @@
     "name": "3.5 inches"
   },
   "firmware_version": "82.00A82",
-  "serial_number": "VDGK2GTN",
+  "serial_number": "VDGK2GTP",
   "sata_version": {
     "string": "SATA 3.3",
     "value": 514
   },
   "power_mode": {
-    "ata_value": 255,
-    "name": "ACTIVE or IDLE"
+    "ata_value": 129,
+    "name": "IDLE_A"
   },
   "rotation_rate": 7200,
   "trim": {
@@ -60,7 +60,7 @@
     "passed": true
   },
   "temperature": {
-    "current": 34
+    "current": 31
   },
   "power_on_time": {
     "hours": 20481
