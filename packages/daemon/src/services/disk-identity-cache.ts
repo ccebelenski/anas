@@ -1,12 +1,42 @@
 /**
  * Lazy-loaded cache of disk identity info from smartctl.
- * Keyed by disk by-id name. Immutable per disk — model family,
- * form factor, firmware don't change unless the physical disk changes,
- * which means a new by-id key.
+ * Keyed by disk by-id name. Model family, form factor and firmware are
+ * immutable per disk — they don't change unless the physical disk changes,
+ * which means a new by-id key. The measured SMART health, by contrast, is
+ * re-probed on a cadence (default 30 minutes, `ANAS_SMART_REPROBE_MS` to
+ * override — disks.1): a reading ages out and the next consumer pull re-reads
+ * it, so a climbing reallocated-sector count is seen within the hour, not at
+ * the next daemon restart. There is no poller and no timer — only pulls probe.
  */
 
 import type { CommandExecutor } from '../executor/types.js'
-import { isSmartctlProbeFailure, isSmartctlStandby } from '../parsers/smartctl.js'
+import { isSmartctlProbeFailure, isSmartctlStandby, parsePowerMode } from '../parsers/smartctl.js'
+
+/**
+ * The re-probe cadence when nothing overrides it: 30 minutes, smartd's own
+ * default check interval — the cadence TrueNAS's disk health follows, and the
+ * one a PVE operator already learned to expect.
+ */
+const DEFAULT_SMART_REPROBE_MS = 30 * 60 * 1000
+
+/** `ANAS_SMART_REPROBE_MS` override (tests), or the 30-minute default. */
+function reprobeCadenceFromEnv(): number {
+  const raw = process.env.ANAS_SMART_REPROBE_MS
+  if (raw === undefined)
+    return DEFAULT_SMART_REPROBE_MS
+  const n = Number.parseInt(raw, 10)
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_SMART_REPROBE_MS
+}
+
+export interface DiskIdentityCacheOptions {
+  /**
+   * The clock, injected so tests age readings without sleeping. Default
+   * `Date.now`.
+   */
+  now?: () => number
+  /** Re-probe cadence in ms. Default: `ANAS_SMART_REPROBE_MS` or 30 minutes. */
+  reprobeMs?: number
+}
 
 export interface DiskIdentity {
   /** Human-readable model family, e.g. "Western Digital Red Pro" */
@@ -23,6 +53,23 @@ export interface DiskIdentity {
   trimSupport: boolean
   /** SMART health: true=passed, false=failed, null=not supported/unknown */
   smartHealthy: boolean | null
+  /**
+   * The disk's power mode as smartctl reported it at measurement time
+   * (`power_mode.string` from the ATA identity JSON — "ACTIVE or IDLE",
+   * "STANDBY"). Absent when the transport reports none (SAS/SCSI drives do
+   * not) — never inferred from a transport or a rotation rate. A standby skip
+   * and a failed probe keep the last measured value: it rides the identity
+   * it was measured with, and the reading's `measuredAt` says how old that is.
+   */
+  powerMode?: string
+  /**
+   * When THIS reading was measured (epoch ms). Carried by a fresh measured
+   * reading, and — spread from the last measured identity — by the standby and
+   * probe-failed readings that report those last measured values, so a
+   * consumer can show the reading's age. Absent only on a disk that was never
+   * measured (there is no measurement to date).
+   */
+  measuredAt?: number
   /**
    * The disk is asleep (STANDBY/SLEEP) and smartctl was told not to wake it —
    * nothing was measured this pass. Absent on a reading taken from an awake
@@ -94,9 +141,15 @@ export class DiskIdentityCache {
   /** Consecutive passes a key has been absent from a TRUSTWORTHY enumeration. */
   private absentPasses = new Map<string, number>()
   private executor: CommandExecutor
+  /** The clock (injected in tests) — ages readings for the cadence check. */
+  private now: () => number
+  /** How old a measured reading may get before it is re-probed. */
+  private reprobeMs: number
 
-  constructor(executor: CommandExecutor) {
+  constructor(executor: CommandExecutor, opts: DiskIdentityCacheOptions = {}) {
     this.executor = executor
+    this.now = opts.now ?? Date.now
+    this.reprobeMs = opts.reprobeMs ?? reprobeCadenceFromEnv()
   }
 
   /** Get the latest reading (measured, or standby/failure-marked), or null if never loaded */
@@ -106,9 +159,14 @@ export class DiskIdentityCache {
 
   /**
    * Whether a disk's reading needs a fresh probe: it was never read, the last
-   * reading was a standby skip (the disk may have woken), or the last probe
-   * failed and its backoff has drained. A clean measured reading is a cache
-   * hit — the identity does not change for the daemon's lifetime.
+   * reading was a standby skip (the disk may have woken), the last probe
+   * failed and its backoff has drained, or the measured reading has aged past
+   * the re-probe cadence. That last one is the disks.1 change: a clean
+   * measured reading is a hit only WITHIN the cadence, so a reallocated-sector
+   * count that starts climbing is seen on the next pull after 30 minutes —
+   * not at the next daemon restart. The re-probe is the same `-n standby`
+   * call, so an aged reading on a now-sleeping disk is refreshed by a skip,
+   * never a spin-up.
    */
   private isDue(diskId: string, reading: DiskIdentity | undefined): boolean {
     if (!reading)
@@ -116,10 +174,14 @@ export class DiskIdentityCache {
     if (reading.standby)
       return true
     if (reading.staleReason === 'probe-failed') {
-      // A failed probe re-probes — but bounded: wait out the backoff.
+      // A failed probe re-probes — but bounded: wait out the backoff. (Its
+      // age check is unreachable: the failure spread keeps the last
+      // measurement's `measuredAt`, and the backoff governs until it answers.)
       const state = this.backoff.get(diskId)
       return !state || state.skip <= 0
     }
+    if (reading.measuredAt != null && this.now() - reading.measuredAt >= this.reprobeMs)
+      return true
     return false
   }
 
@@ -132,7 +194,8 @@ export class DiskIdentityCache {
 
   /**
    * Get the reading for a disk, re-reading smartctl when the reading is due
-   * (standby skip, or a failed probe whose backoff has drained).
+   * (a standby skip, a failed probe whose backoff has drained, or a measured
+   * reading aged past the re-probe cadence).
    */
   async get(diskId: string, devicePath: string): Promise<DiskIdentity> {
     this.tickBackoff(diskId)
@@ -157,8 +220,9 @@ export class DiskIdentityCache {
 
   /**
    * Load readings for multiple disks in parallel. Disks whose reading is due
-   * (standby skip, or a failed probe whose backoff has drained) are re-read;
-   * measured disks are left alone.
+   * (never read, a standby skip, a failed probe whose backoff has drained, or
+   * a measured reading aged past the re-probe cadence) are re-read; the rest
+   * are left alone.
    *
    * The disk list is also the TOPOLOGY REFRESH: the cache is keyed per device,
    * and a device that has left the fleet must not leave its entries behind
@@ -312,6 +376,8 @@ export class DiskIdentityCache {
           interface: formatInterface(data),
           trimSupport: !!data.trim?.supported,
           smartHealthy: data.smart_status?.passed ?? null,
+          powerMode: parsePowerMode(data),
+          measuredAt: this.now(),
         },
       }
     }

@@ -433,6 +433,23 @@ describe('GET /v1/status — ahrPools briefs (story 11.13, AHR-DESIGN §10 revis
     return (res.json() as { data: StatusSummary }).data
   }
 
+  it('the disk-warning path probes SMART through loadMany — a pull re-reads due disks, a fresh pull does not', async () => {
+    // The dashboard's disk warnings ride collectDisks → the identity cache's
+    // loadMany (disks.1): the pull that renders the warning cards is the same
+    // pull that re-probes aged readings. No second path, no poller. The mock
+    // identity call is `smartctl -n standby -iH --json <dev>` — count those.
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    const identityProbes = () => mock.calls.filter(c => c.command === '/usr/sbin/smartctl' && c.args.includes('-iH')).length
+
+    await status(server)
+    const first = identityProbes()
+    assert.ok(first > 0, 'a /status pull probed the fleet')
+
+    await status(server)
+    assert.equal(identityProbes(), first, 'a fresh reading is a cache hit within the cadence — no re-probe on the next pull')
+  })
+
   it('carries the healthy AHR pool in the /v1/status aggregate', async () => {
     server = createServer({ mock: true, logger: false })
     const summary = await status(server)

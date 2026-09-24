@@ -134,6 +134,52 @@
         return value ? ANAS.t('Yes') : ANAS.t('No');
     };
 
+    // Human duration from milliseconds: "45s", "12m 3s", "1h 2m", "2d 3h".
+    // Shared so every "how long / how old" line on every view reads alike.
+    ANAS.formatDuration = function (ms) {
+        var n = Number(ms);
+        if (isNaN(n) || n < 0) {
+            return '';
+        }
+        var s = Math.round(n / 1000);
+        if (s < 60) {
+            return s + 's';
+        }
+        var m = Math.floor(s / 60); s = s % 60;
+        if (m < 60) {
+            return m + 'm ' + s + 's';
+        }
+        var h = Math.floor(m / 60); m = m % 60;
+        if (h < 24) {
+            return h + 'h ' + m + 'm';
+        }
+        var d = Math.floor(h / 24); h = h % 24;
+        return d + 'd ' + h + 'h';
+    };
+
+    // Relative "<age> ago" from an ISO timestamp or epoch-ms: "45s ago",
+    // "just now" under 10 s, never negative. '' when the input is absent or
+    // unparsable — callers simply omit the clause (disks.1's "SMART read <age>
+    // ago" and "as of <age>", the dashboard's job times).
+    ANAS.ago = function (when) {
+        if (when === undefined || when === null || when === '') {
+            return '';
+        }
+        var ms = typeof when === 'number' ? when : Date.parse('' + when);
+        if (isNaN(ms)) {
+            return '';
+        }
+        var delta = Date.now() - ms;
+        if (delta < 0) {
+            delta = 0;
+        }
+        if (delta < 10000) {
+            return ANAS.t('just now');
+        }
+        var dur = ANAS.formatDuration(delta);
+        return dur === '' ? '' : dur + ' ' + ANAS.t('ago');
+    };
+
     // The name ONE vdev leaf answers to — its device-path basename
     // (`ata-SSD-part1`, `sdb2`), falling back to the leaf id when the daemon
     // reports no path. Single source of truth for every dialog that hands the

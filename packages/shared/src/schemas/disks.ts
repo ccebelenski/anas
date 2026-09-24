@@ -110,6 +110,22 @@ export const Disk = z.object({
    */
   smartStale: z.boolean().optional(),
   smartStaleReason: z.enum(['standby', 'probe-failed']).optional(),
+  /**
+   * When the SMART reading was MEASURED (ISO 8601), however it is being
+   * reported: the timestamp of the probe that produced the values on this
+   * payload — a fresh reading's own probe, or the last measured one a standby
+   * skip / probe-failed reading is carrying. The Disks detail shows "read <age>
+   * ago" from it. Absent on a disk never measured (there is no measurement to
+   * date) and on an older daemon (version-skew ruling).
+   */
+  smartMeasuredAt: z.string().optional(),
+  /**
+   * The disk's power mode as last measured by smartctl (`power_mode.string`):
+   * "ACTIVE or IDLE", "STANDBY", "SLEEP". Absent when the transport reports
+   * none (SAS/SCSI drives never do) — never inferred. Display only, no policy
+   * (2026-09-10 power-policy ruling).
+   */
+  powerMode: z.string().optional(),
   /** Current usage status */
   status: DiskUsageStatus,
   /** If pool_member, the ZFS pool; if ahr_member, the AHR pool this disk is in */

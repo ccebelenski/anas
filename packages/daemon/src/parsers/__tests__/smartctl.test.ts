@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { isSmartctlProbeFailure, isSmartctlStandby, parseSmartctl, standbySmartData } from '../smartctl.js'
+import { isSmartctlProbeFailure, isSmartctlStandby, parsePowerMode, parseSmartctl, standbySmartData } from '../smartctl.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const fixturesDir = join(__dirname, '../../fixtures/system')
@@ -218,5 +218,30 @@ describe('standbySmartData', () => {
   it('parseSmartctl normal output carries standby: false (unsupported branch too)', () => {
     assert.equal(parseSmartctl(loadFixture('smartctl.json')).standby, false)
     assert.equal(parseSmartctl({ smart_support: { available: true, enabled: true } }).standby, false)
+  })
+})
+
+/**
+ * disks.1 rider 1 — the power mode, read off the ATA identity document's
+ * `power_mode.string` and never inferred. The fixture is a minimal ATA
+ * identity in the real smartctl 7.5 shape (built from smartctl's documented
+ * `power_mode` object; no live capture in the tree carried the field). The
+ * SCSI fixture (smartctl.json — a QEMU virtual disk) reports none, and so
+ * would any SAS drive: absence must survive as absence.
+ */
+describe('parsePowerMode', () => {
+  it('reads power_mode.string from the ATA identity document', () => {
+    const ata = loadFixture('smartctl-ata-identity.json')
+    assert.equal(parsePowerMode(ata), 'ACTIVE or IDLE')
+  })
+
+  it('is absent on a document without power_mode (SCSI/SAS shape)', () => {
+    const scsi = loadFixture('smartctl.json')
+    assert.equal(parsePowerMode(scsi), undefined)
+    assert.equal(parsePowerMode({}), undefined)
+  })
+
+  it('an empty power_mode.string is absence, not an empty mode', () => {
+    assert.equal(parsePowerMode({ power_mode: { string: '' } }), undefined)
   })
 })

@@ -213,6 +213,9 @@ const state = {
   burst: 1,
   timers: [],
   sections: {},
+  // GET /health body (disks.1 rider 2) — a value nothing else in the harness
+  // would produce, so the version-label check proves the label reads the probe.
+  health: { status: 'ok', version: '9.9.9-harness' },
 }
 
 function loadUi() {
@@ -250,11 +253,40 @@ function loadUi() {
     warn(m) { throw new Error(`dashboard warned: ${m}`) },
     errText: e => String((e && e.message) || e),
     tbar: items => ({ xtype: 'toolbar', items }), // real 00-core.js helper
+    // The real 00-core.js relative-time helpers (disks.1) — 50-dashboard's
+    // relAgo/fmtDur delegate to them, so the job strip renders real wording.
+    formatDuration(ms) {
+      const n = Number(ms)
+      if (Number.isNaN(n) || n < 0) { return '' }
+      let s = Math.round(n / 1000)
+      if (s < 60) { return `${s}s` }
+      let m = Math.floor(s / 60); s = s % 60
+      if (m < 60) { return `${m}m ${s}s` }
+      let h = Math.floor(m / 60); m = m % 60
+      if (h < 24) { return `${h}h ${m}m` }
+      const d = Math.floor(h / 24); h = h % 24
+      return `${d}d ${h}h`
+    },
+    ago(when) {
+      if (when === undefined || when === null || when === '') { return '' }
+      const ms = typeof when === 'number' ? when : Date.parse(String(when))
+      if (Number.isNaN(ms)) { return '' }
+      let delta = Date.now() - ms
+      if (delta < 0) { delta = 0 }
+      if (delta < 10000) { return 'just now' }
+      const dur = this.formatDuration(delta)
+      return dur === '' ? '' : `${dur} ago`
+    },
     api: {
       get(_node, path) {
         if (path === '/status') { return Promise.resolve(STATUS) }
         if (path === '/telemetry') { return Promise.resolve(telemetry(state.burst)) }
         return Promise.reject(new Error(`unexpected path ${path}`))
+      },
+      // The node daemon's /health (disks.1 rider 2): the version label reads it.
+      health(_node) {
+        state.healthCalls = (state.healthCalls || 0) + 1
+        return Promise.resolve(state.health)
       },
     },
   }
@@ -460,6 +492,21 @@ ok('charts carry the average overlay', html.includes('anas-gfx-tc-avg'))
       alpha.includes(marker) === gamma.includes(marker),
       `zfs=${alpha.includes(marker)} ahr=${gamma.includes(marker)}`)
   }
+}
+
+// --- 6. The header version label (disks.1 rider 2) ----------------------------
+
+{
+  const ver = view.down('#anasDashVersion')
+  ok('the dashboard has a version line under the header', !!ver)
+  ok('the version line reads "ANAS <version>" off the /health probe',
+    /class="anas-dash-version">ANAS 9\.9\.9-harness</.test(ver.html || ''), ver && ver.html)
+  // Pull-driven like /status: refreshed on the loads that already refresh it,
+  // never polled — two telemetry ticks must not add a health call.
+  const before = state.healthCalls || 0
+  await tick()
+  await tick()
+  eq('telemetry ticks do not poll /health', state.healthCalls || 0, before)
 }
 
 // ---- Report -----------------------------------------------------------------

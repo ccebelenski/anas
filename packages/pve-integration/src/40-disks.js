@@ -239,9 +239,12 @@
     // The stale marker: when the daemon's reading is the disk's LAST KNOWN
     // state, not a fresh probe (it is asleep, or its probe failed), the value
     // is still shown — it is the best we have — but a muted "(last known — …)"
-    // suffix + tooltip says it is not current. Absent on a fresh reading and
-    // on an older daemon (version skew), where the cell renders exactly as
-    // before.
+    // suffix + tooltip says it is not current. When the daemon also says WHEN
+    // that value was measured (`smartMeasuredAt`, disks.1), the suffix and the
+    // tooltip carry "read <age> ago" — "last known" without an age leaves the
+    // operator guessing whether that means minutes or days. Absent on a fresh
+    // reading and on an older daemon (version skew), where the cell renders
+    // exactly as before.
     function renderHealthStatus(v, meta, rec) {
         var level = v || 'unknown';
         var info = HEALTH[level] || HEALTH.unknown;
@@ -258,11 +261,19 @@
             var d = rec && rec.data;
             if (d && d.smartStale === true) {
                 var failed = d.smartStaleReason === 'probe-failed';
+                var readAge = d.smartMeasuredAt && ANAS.ago ? ANAS.ago(d.smartMeasuredAt) : '';
                 var suffix = failed ? t('last known — probe failed')
                     : t('last known — disk in standby');
+                if (readAge) {
+                    suffix += ', ' + t('read') + ' ' + readAge;
+                }
                 var tip = failed
-                    ? t('The last SMART probe failed; the value shown is the last measured one. ANAS re-probes the disk.')
-                    : t('The disk is asleep and ANAS does not wake it to read SMART; the value shown is the last measured one.');
+                    ? t('The last SMART probe failed; the value shown is the last measured one')
+                    : t('The disk is asleep and ANAS does not wake it to read SMART; the value shown is the last measured one');
+                if (readAge) {
+                    tip += ', ' + t('read') + ' ' + readAge;
+                }
+                tip += '. ' + t('ANAS re-probes the disk.');
                 html += ' <span class="anas-health-stale" title="' + enc(tip)
                     + '" style="color:' + COLOR_UNKNOWN + ';font-size:0.9em;">(' + enc(suffix) + ')</span>';
             }
@@ -445,16 +456,44 @@
     }
 
     // Name/value summary store for the NVMe / device shape (no attribute table)
-    // — used when SmartData.attributes is empty.
-    function makeSummaryStore(smart) {
+    // — used when SmartData.attributes is empty. `disk` is the grid record the
+    // window was opened from: it dates the reading (`smartMeasuredAt`, disks.1)
+    // and carries the power mode measured at that reading, neither of which the
+    // fresh /smart call re-reports.
+    function makeSummaryStore(smart, disk) {
         var rows = [];
         function push(name, value) {
             rows.push({ name: name, value: '' + value });
+        }
+        // disks.1: the age of the reading these values describe, and the power
+        // mode as it was measured then. Both ride the disk record, are shown
+        // only when the daemon reported them (old daemon / SAS / never-measured
+        // → absent, never inferred), and the age is what keeps a carried-over
+        // value honest.
+        function pushReadingAge() {
+            if (disk && disk.smartMeasuredAt && ANAS.ago) {
+                var age = ANAS.ago(disk.smartMeasuredAt);
+                if (age) {
+                    push(t('SMART read'), age);
+                }
+            }
+        }
+        function pushPowerMode() {
+            if (disk && disk.powerMode && ANAS.ago) {
+                var value = disk.powerMode;
+                var age = disk.smartMeasuredAt ? ANAS.ago(disk.smartMeasuredAt) : '';
+                if (age) {
+                    value += ' (' + t('as of') + ' ' + age + ')';
+                }
+                push(t('Power mode'), value);
+            }
         }
         // The daemon passed -n standby: a spun-down disk was never read, so the
         // placeholders below would read as "Supported: No" facts. One honest row.
         if (smart.standby === true) {
             push(t('Standby'), t('Disk is spun down; SMART was not read so as not to wake it'));
+            pushReadingAge();
+            pushPowerMode();
             return Ext.create('Ext.data.Store', {
                 fields: [{ name: 'name', type: 'string' }, { name: 'value', type: 'string' }],
                 data: rows,
@@ -463,6 +502,8 @@
         push(t('Supported'), smart.supported ? t('Yes') : t('No'));
         push(t('Enabled'), smart.enabled ? t('Yes') : t('No'));
         push(t('Overall Health'), smart.overallHealth);
+        pushReadingAge();
+        pushPowerMode();
         if (smart.temperature !== null && smart.temperature !== undefined) {
             push(t('Temperature'), smart.temperature + ' °C');
         }
@@ -592,7 +633,7 @@
                     border: false,
                     scrollable: true,
                     emptyText: t('No S.M.A.R.T. Values'),
-                    store: hasAttrs ? makeAttributeStore(smart.attributes) : makeSummaryStore(smart),
+                    store: hasAttrs ? makeAttributeStore(smart.attributes) : makeSummaryStore(smart, disk),
                     columns: hasAttrs ? attributeColumns() : summaryColumns(),
                 });
             },
@@ -657,8 +698,12 @@
                 'handsOff', 'handsOffReason',
                 // Stale SMART reading (last known, not current): auto fields —
                 // absent on old daemons and the Health cell's marker does not
-                // appear (version skew).
+                // appear (version skew). smartMeasuredAt (disks.1) dates the
+                // reading — the marker's "read <age> ago" — and powerMode is
+                // the rider's detail-panel row; both absent on old daemons,
+                // both simply omitted when the daemon has no value.
                 'smartStale', 'smartStaleReason',
+                'smartMeasuredAt', 'powerMode',
                 { name: 'size', type: 'number' },
                 { name: 'rotational', type: 'boolean' },
                 { name: 'smartHealthy' },

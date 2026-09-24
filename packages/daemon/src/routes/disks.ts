@@ -299,6 +299,13 @@ export async function collectDisks(
     // fresh reading (undefined keys drop out of the JSON).
     const smartStale = identity?.stale === true ? true : undefined
     const smartStaleReason = smartStale ? identity?.staleReason : undefined
+    // When the values on THIS payload were measured — the reading's own probe
+    // on a fresh reading, the last measured one on a standby/probe-failed
+    // carry-over. The UI shows "read <age> ago" from it. Absent on a disk
+    // never measured, and the power mode with it (undefined drops from JSON).
+    const smartMeasuredAt = identity?.measuredAt != null
+      ? new Date(identity.measuredAt).toISOString()
+      : undefined
     // Pool context joins on the kernel name (d.name), NOT the display by-id
     // (d.id) — the by-id ZFS reports and the by-id we display can differ.
     const info = poolInfo.get(d.name)
@@ -326,6 +333,8 @@ export async function collectDisks(
       smartHealthy,
       smartStale,
       smartStaleReason,
+      smartMeasuredAt,
+      powerMode: identity?.powerMode,
       ...zfsContext,
       ...ahrContext,
       ...handsOffContext(d, servedSerials),

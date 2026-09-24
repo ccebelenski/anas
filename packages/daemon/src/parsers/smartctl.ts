@@ -72,6 +72,23 @@ export function isSmartctlStandby(result: { stdout: string, stderr?: string, exi
 }
 
 /**
+ * The disk's power mode from a smartctl `--json` identity document, as
+ * `power_mode.string` (smartctl 7.5's ATA identity emits it on the
+ * `-n standby -iH` call — GT capture pve14 2026-09-10): "ACTIVE or IDLE",
+ * "STANDBY", "SLEEP". SCSI/SAS/NVMe documents carry no `power_mode` object at
+ * all, and that absence is preserved — the mode is NEVER inferred from a
+ * transport or a rotation rate (2026-09-10 power-policy ruling: display only,
+ * no policy). Undefined when the document reports none.
+ */
+export function parsePowerMode(data: {
+  power_mode?: { string?: string }
+  [key: string]: unknown
+}): string | undefined {
+  const mode = data.power_mode?.string
+  return mode || undefined
+}
+
+/**
  * Classify a PARSED `smartctl --json` document as a probe FAILURE.
  *
  * smartctl emits a VALID document even when the probe failed: for an open

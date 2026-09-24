@@ -831,6 +831,31 @@ function makeAnas(routes) {
       const list = Array.isArray(lines) ? lines : [lines]
       return '<ul>' + list.map(l => `<li>${String(l == null ? '' : l)}</li>`).join('') + '</ul>'
     },
+    // The real 00-core.js relative-time helpers (disks.1) — mirrored with the
+    // same ladder so the disks checks assert real wording ("12m ago"), not a
+    // stub's answer.
+    formatDuration(ms) {
+      const n = Number(ms)
+      if (Number.isNaN(n) || n < 0) { return '' }
+      let s = Math.round(n / 1000)
+      if (s < 60) { return `${s}s` }
+      let m = Math.floor(s / 60); s = s % 60
+      if (m < 60) { return `${m}m ${s}s` }
+      let h = Math.floor(m / 60); m = m % 60
+      if (h < 24) { return `${h}h ${m}m` }
+      const d = Math.floor(h / 24); h = h % 24
+      return `${d}d ${h}h`
+    },
+    ago(when) {
+      if (when === undefined || when === null || when === '') { return '' }
+      const ms = typeof when === 'number' ? when : Date.parse(String(when))
+      if (Number.isNaN(ms)) { return '' }
+      let delta = Date.now() - ms
+      if (delta < 0) { delta = 0 }
+      if (delta < 10000) { return 'just now' }
+      const dur = this.formatDuration(delta)
+      return dur === '' ? '' : `${dur} ago`
+    },
     renderState: s => String(s),
     notifyMode: {
       of(value, dflt) {
@@ -9427,6 +9452,137 @@ async function disksStaleHealthChecks() {
 }
 
 // ============================================================================
+//  Disks (disks.1) — the reading's age rides the marker, the detail shows it
+// ============================================================================
+//
+//  When the daemon dates the reading (`smartMeasuredAt`), "last known" stops
+//  being open-ended: the Health marker reads "…, read <age> ago", the tooltip
+//  carries the same clause, and the SMART detail window shows "SMART read
+//  <age> ago" plus the power mode measured at that reading. A marker without
+//  an age (field absent — old daemon, or a disk never measured) renders as it
+//  always did; an unparsable date is treated as absent, never as an error.
+
+async function disksReadAgeChecks() {
+  const ANAS = loadSource('40-disks.js', { 'GET /disks': { data: [] } })
+  const gridCfg = ANAS.views['disks'].factory('n1').items[0]
+  const healthCol = gridCfg.columns.find(c => c.dataIndex === 'healthStatus')
+  const render = (v, data) => healthCol.renderer(v, {}, makeRecord(data))
+
+  // Twelve minutes ago — inside the re-probe cadence, outside "just now".
+  const measuredAt = new Date(Date.now() - 12 * 60 * 1000).toISOString()
+
+  const standby = render('healthy', {
+    healthStatus: 'healthy', smartStale: true, smartStaleReason: 'standby', smartMeasuredAt: measuredAt,
+  })
+  ok('disks.1: a standby marker carries "read <age> ago"',
+    /last known — disk in standby, read \d+m \d+s ago/.test(standby), standby)
+  ok('disks.1: the standby tooltip says when the value was read',
+    /, read \d+m \d+s ago\./.test(/title="([^"]*)"/.exec(standby)?.[1] || ''), standby)
+
+  const failed = render('healthy', {
+    healthStatus: 'healthy', smartStale: true, smartStaleReason: 'probe-failed', smartMeasuredAt: measuredAt,
+  })
+  ok('disks.1: a probe-failed marker carries the age too',
+    /last known — probe failed, read \d+m \d+s ago/.test(failed), failed)
+
+  // No date on the payload (never measured, or an older daemon): the marker
+  // stays exactly the pre-disks.1 wording — the age is additive, never faked.
+  const noAge = render('healthy', { healthStatus: 'healthy', smartStale: true, smartStaleReason: 'standby' })
+  ok('disks.1: without smartMeasuredAt the marker keeps the bare wording',
+    /last known — disk in standby\)/.test(noAge) && !/read \d+m \d+s ago/.test(noAge), noAge)
+  const badDate = render('healthy', {
+    healthStatus: 'healthy', smartStale: true, smartStaleReason: 'standby', smartMeasuredAt: 'not-a-date',
+  })
+  ok('disks.1: an unparsable date is treated as absent, never an error',
+    /last known — disk in standby\)/.test(badDate) && !/read \d+m \d+s ago/.test(badDate), badDate)
+
+  // --- the SMART detail window: the read-age row + the power-mode row -------
+  //
+  // Driven through the grid's real itemdblclick door: openSmartWindow(node,
+  // rec) → GET /disks/:id/smart → the summary store. The summary (and the
+  // standby shape) gains "SMART read <age> ago" and, only when the daemon
+  // reported one, "Power mode <mode> (as of <age>)" — the age is what keeps a
+  // carried-over value honest. An old daemon / SAS disk record (no powerMode)
+  // shows no Power mode row: never inferred.
+  const DISK = {
+    id: 'ata-WDC_WD6003FRYZ-01GDEB1_VDGK2GTN',
+    name: 'sda',
+    healthStatus: 'healthy',
+    smartMeasuredAt: measuredAt,
+    powerMode: 'ACTIVE or IDLE',
+  }
+  const SMART = {
+    supported: true, enabled: true, overallHealth: 'PASSED',
+    temperature: 34, powerOnHours: 20481, attributes: [],
+    nvmePercentageUsed: null, nvmeAvailableSpare: null,
+  }
+  const STANDBY_SMART = { ...SMART, supported: false, enabled: false, overallHealth: 'UNKNOWN', temperature: null, powerOnHours: null, standby: true }
+  const routes = {
+    'GET /disks': { data: [DISK] },
+    'GET /disks/ata-WDC_WD6003FRYZ-01GDEB1_VDGK2GTN/smart': { data: SMART },
+  }
+  const withStandby = {
+    'GET /disks': { data: [DISK] },
+    'GET /disks/ata-WDC_WD6003FRYZ-01GDEB1_VDGK2GTN/smart': { data: STANDBY_SMART },
+  }
+
+  const rowsOf = async (r) => {
+    created.windows.length = 0
+    const anas = loadSource('40-disks.js', r)
+    const view = makeComponent(anas.views['disks'].factory('n1'), null)
+    const grid = view.down('#anasDisksGrid')
+    view.fireEvent('afterrender', view) // loadDisks
+    await settle()
+    eq('disks.1: the disks grid loaded', grid.getStore().getCount(), 1)
+    grid.fireEvent('itemdblclick', grid, grid.getStore().getAt(0))
+    await settle()
+    const win = openWindow()
+    ok('disks.1: the SMART window opened', !!win)
+    if (!win) { return [] }
+    const content = win.down('#smartContent')
+    const panel = content.items.getAt(0)
+    ok('disks.1: the summary store rendered', !!panel && !!panel.store)
+    return panel.store.getRange().map(rw => `${rw.get('name')}=${rw.get('value')}`)
+  }
+
+  const rows = await rowsOf(routes)
+  ok('disks.1: the detail shows "SMART read <age> ago"',
+    rows.some(r => r.startsWith('SMART read=') && /\d+m \d+s ago$/.test(r)), rows.join(' | '))
+  ok('disks.1: the detail shows the power mode with its "as of" age',
+    rows.some(r => r.startsWith('Power mode=ACTIVE or IDLE') && /as of \d+m \d+s ago/.test(r)),
+    rows.join(' | '))
+
+  const standbyRows = await rowsOf(withStandby)
+  ok('disks.1: the standby detail keeps its one honest row',
+    standbyRows.some(r => r.startsWith('Standby=')), standbyRows.join(' | '))
+  ok('disks.1: the standby detail still shows the reading age and power mode',
+    standbyRows.some(r => r.startsWith('SMART read=')) && standbyRows.some(r => r.startsWith('Power mode=')),
+    standbyRows.join(' | '))
+
+  // SAS-shaped record: the daemon reports no power mode, the detail shows none.
+  created.windows.length = 0
+  const sas = loadSource('40-disks.js', {
+    'GET /disks': { data: [{ ...DISK, powerMode: undefined }] },
+    'GET /disks/ata-WDC_WD6003FRYZ-01GDEB1_VDGK2GTN/smart': { data: SMART },
+  })
+  const sasView = makeComponent(sas.views['disks'].factory('n1'), null)
+  const sasGrid = sasView.down('#anasDisksGrid')
+  sasView.fireEvent('afterrender', sasView) // loadDisks
+  await settle()
+  sasGrid.fireEvent('itemdblclick', sasGrid, sasGrid.getStore().getAt(0))
+  await settle()
+  const sasWin = openWindow()
+  ok('disks.1: the SAS-shaped detail window opened', !!sasWin)
+  const sasRows = sasWin
+    ? sasWin.down('#smartContent').items.getAt(0).store.getRange()
+      .map(rw => `${rw.get('name')}=${rw.get('value')}`)
+    : []
+  ok('disks.1: no Power mode row when the daemon reports none (never inferred)',
+    sasRows.some(r => r.startsWith('SMART read=')) && !sasRows.some(r => r.startsWith('Power mode=')),
+    sasRows.join(' | '))
+}
+
+// ============================================================================
 //  Share Users (identity.1) — mixed-case names, need-gated confirm-gated
 //  delete on both grids, and the private-group label
 // ============================================================================
@@ -9744,6 +9900,11 @@ await scrubToolbarRepairChecks()
 warnings.length = 0
 created.windows.length = 0
 await disksStaleHealthChecks()
+// Disks (disks.1) — the reading's age on the marker + the detail's read-age
+// and power-mode rows.
+warnings.length = 0
+created.windows.length = 0
+await disksReadAgeChecks()
 // Share Users (identity.1) — mixed-case name rule, need-gated confirm-gated
 // delete on both grids, and the private-group label.
 warnings.length = 0

@@ -558,3 +558,192 @@ describe('DiskIdentityCache — smartctl never wakes a sleeping disk', () => {
     assert.equal(sddProbes, 2, 'the fallback entry was dropped and re-measured, not cached for ever')
   })
 })
+
+/**
+ * disks.1 — a measured reading AGES OUT. A clean measured reading used to be a
+ * cache hit for the daemon's lifetime, so a reallocated-sector count that
+ * started climbing was invisible until the daemon restarted. Now a reading is
+ * a hit only WITHIN the re-probe cadence (default 30 minutes — smartd's own
+ * check interval, `ANAS_SMART_REPROBE_MS` to override for tests); past it the
+ * next pull re-probes. The re-probe is the same `-n standby` call, so a disk
+ * that fell asleep in the meantime is never woken — its last measured values
+ * and their age are kept under the existing standby mark. A failed re-probe
+ * keeps the values under the existing probe-failed mark and the EXISTING
+ * backoff — aging must not have created a second, unbounded retry path.
+ * The clock is injected: no test sleeps.
+ */
+describe('DiskIdentityCache — readings age out on the pull (disks.1)', () => {
+  /** A mutable clock: tests age readings by moving `now`. */
+  function clock() {
+    const state = { now: 1_750_000_000_000 }
+    return {
+      now: () => state.now,
+      advance: (ms: number) => { state.now += ms },
+    }
+  }
+
+  function measuredWithPowerMode() {
+    return { stdout: JSON.stringify({
+      ...JSON.parse(NORMAL_IDENTITY),
+      power_mode: { string: 'ACTIVE or IDLE' },
+    }), stderr: '', exitCode: 0 }
+  }
+
+  const smartCalls = (executor: { calls: { command: string }[] }) =>
+    executor.calls.filter(c => c.command === SMARTCTL).length
+
+  it('(A) a fresh measured reading is a cache hit within the cadence', async () => {
+    const clk = clock()
+    const executor = new MockExecutor()
+    executor.addFixture({ command: SMARTCTL, args: ARGS, result: normalResult() })
+    const cache = new DiskIdentityCache(executor, { now: clk.now })
+
+    const first = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(first.measuredAt, clk.now(), 'the reading is dated at measurement time')
+    clk.advance(29 * 60 * 1000) // one minute short of the cadence
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    clk.advance(60 * 1000 - 1) // still a hair inside 30 minutes
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 1, 'a reading inside the cadence is a hit')
+  })
+
+  it('(B) a reading aged past the cadence is re-probed, with -n standby in the argv', async () => {
+    const clk = clock()
+    const executor = new MockExecutor()
+    executor.addFixture({ command: SMARTCTL, args: ARGS, results: [normalResult(), normalResult()] })
+    const cache = new DiskIdentityCache(executor, { now: clk.now })
+
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 1)
+    clk.advance(30 * 60 * 1000) // the cadence, exactly
+    const second = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 2, 'an aged reading is due on the next pull')
+    assert.equal(second.measuredAt, clk.now(), 'the fresh reading carries its own timestamp')
+
+    const call = executor.calls.find(c => c.command === SMARTCTL)
+    assert.ok(call)
+    assert.deepEqual(call.args.slice(0, 2), ['-n', 'standby'], 'the re-probe never wakes the disk')
+  })
+
+  it('(C) an aged disk that fell asleep is not woken — values and reading age are kept', async () => {
+    const clk = clock()
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: SMARTCTL,
+      args: ARGS,
+      results: [measuredWithPowerMode(), {
+        stdout: '',
+        stderr: 'Device is in STANDBY (OS) mode, exit(2)\n',
+        exitCode: 2,
+      }],
+    })
+    const cache = new DiskIdentityCache(executor, { now: clk.now })
+
+    const measured = await cache.get('ata-WDC_A', '/dev/sdb')
+    const measuredAt = measured.measuredAt
+    assert.equal(measured.powerMode, 'ACTIVE or IDLE', 'the power mode rides the measurement')
+    clk.advance(45 * 60 * 1000)
+
+    const stale = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 2, 'the aged reading was re-probed')
+    assert.equal(stale.standby, true, 'the re-probe was a standby skip — the disk was not woken')
+    assert.equal(stale.deviceModel, 'WDC WD2003FZEX-00SRLA0', 'the last measured values are kept')
+    assert.equal(stale.smartHealthy, true)
+    assert.equal(stale.powerMode, 'ACTIVE or IDLE', 'the power mode rides the identity it was measured with')
+    assert.equal(stale.measuredAt, measuredAt, 'the reading reports the MEASURED reading\'s age')
+    assert.equal(stale.stale, true)
+    assert.equal(stale.staleReason, 'standby')
+  })
+
+  it('(D) a failed re-probe of an aged reading keeps the values and the existing backoff', async () => {
+    const clk = clock()
+    const executor = new MockExecutor()
+    executor.addFixture({
+      command: SMARTCTL,
+      args: ARGS,
+      results: [normalResult(), failureResult(), failureResult(), normalResult()],
+    })
+    const cache = new DiskIdentityCache(executor, { now: clk.now })
+
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    clk.advance(31 * 60 * 1000)
+
+    const failed = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 2, 'the aged reading was re-probed')
+    assert.equal(failed.stale, true, 'a real measurement was taken — this one is last known')
+    assert.equal(failed.staleReason, 'probe-failed')
+    assert.equal(failed.deviceModel, 'WDC WD2003FZEX-00SRLA0', 'the measured identity survives')
+    assert.equal(failed.smartHealthy, true)
+
+    // The failure enters the SAME bounded backoff, not a fresh every-pass path
+    // — the exact ladder test (i) pins: failure 1 re-probes on the next pass,
+    // failure 2 waits two.
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 3, 'failure 1 re-probes on the next pass — the retry is alive, not dead')
+
+    await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 3, 'failure 2 waits two passes — no hammering')
+
+    const recovered = await cache.get('ata-WDC_A', '/dev/sdb')
+    assert.equal(smartCalls(executor), 4, 'and the disk answers')
+    assert.equal(recovered.stale, undefined, 'fresh once the probe answers')
+    assert.equal(recovered.measuredAt, clk.now())
+  })
+
+  it('(E) two concurrent loadMany passes probe a due disk once', async () => {
+    const clk = clock()
+    const executor = new MockExecutor()
+    executor.addFixture({ command: SMARTCTL, args: ['-n', 'standby', '-iH', '--json', '/dev/sdb'], result: normalResult() })
+    executor.addFixture({ command: SMARTCTL, args: ['-n', 'standby', '-iH', '--json', '/dev/sdc'], result: normalResult() })
+    const cache = new DiskIdentityCache(executor, { now: clk.now })
+
+    const fleet = [
+      { id: 'ata-A', path: '/dev/sdb' },
+      { id: 'ata-B', path: '/dev/sdc' },
+    ]
+    // Two consumers pull at once (Disks tab + dashboard) — the pending map
+    // dedupes, one probe per disk.
+    await Promise.all([cache.loadMany(fleet), cache.loadMany(fleet)])
+    assert.equal(smartCalls(executor), 2, 'one probe per disk, not one per pull')
+
+    // And the same again inside the cadence: still two.
+    await Promise.all([cache.loadMany(fleet), cache.loadMany(fleet)])
+    assert.equal(smartCalls(executor), 2, 'fresh readings are hits for both pulls')
+  })
+
+  it('(F) ANAS_SMART_REPROBE_MS overrides the cadence', async () => {
+    const clk = clock()
+    const executor = new MockExecutor()
+    executor.addFixture({ command: SMARTCTL, args: ARGS, results: [normalResult(), normalResult()] })
+    const old = process.env.ANAS_SMART_REPROBE_MS
+    process.env.ANAS_SMART_REPROBE_MS = '5000'
+    try {
+      const cache = new DiskIdentityCache(executor, { now: clk.now })
+      await cache.get('ata-WDC_A', '/dev/sdb')
+      clk.advance(5 * 1000)
+      await cache.get('ata-WDC_A', '/dev/sdb')
+      assert.equal(smartCalls(executor), 2, 'aged past the 5 s override — re-probed')
+
+      // A cache that names its own cadence is not moved by the env.
+      const executor2 = new MockExecutor()
+      executor2.addFixture({ command: SMARTCTL, args: ARGS, result: normalResult() })
+      const pinned = new DiskIdentityCache(executor2, { now: clk.now, reprobeMs: 60 * 60 * 1000 })
+      await pinned.get('ata-WDC_B', '/dev/sdb')
+      clk.advance(30 * 60 * 1000)
+      await pinned.get('ata-WDC_B', '/dev/sdb')
+      assert.equal(
+        executor2.calls.filter(c => c.command === SMARTCTL).length,
+        1,
+        'an explicit reprobeMs option wins over the env',
+      )
+    }
+    finally {
+      if (old === undefined) {
+        delete process.env.ANAS_SMART_REPROBE_MS
+      }
+      else {
+        process.env.ANAS_SMART_REPROBE_MS = old
+      }
+    }
+  })
+})

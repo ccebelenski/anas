@@ -77,7 +77,8 @@
  * 'anas-dash-warnings' / 'anas-dash-fleet' / 'anas-dash-pools' / 'anas-dash-arc'
  * / 'anas-dash-net' / 'anas-dash-status'; Refresh button 'anas-btn-dash-refresh';
  * latency readout 'anas-dash-lat' (pool head, vdev line, device tile);
- * collapsed sole vdev/band 'anas-dash-vdev-solo'.
+ * collapsed sole vdev/band 'anas-dash-vdev-solo'; header version label
+ * 'anas-dash-version' (itemId anasDashVersion, from GET /v1/health).
  *
  * Plain ES5 to match PVE's compiled ExtJS bundle — no build step, no deps.
  */
@@ -692,27 +693,21 @@
     }
 
     // Human duration from milliseconds: "45s", "12m 3s", "1h 2m", "2d 3h".
+    // The shared formatter (00-core.js) carries the ladder; this wrapper keeps
+    // the dashboard's own em-dash for an absent/unparsable duration.
     function fmtDur(ms) {
         var n = Number(ms);
         if (isNaN(n) || n < 0) { return '—'; }
-        var s = Math.round(n / 1000);
-        if (s < 60) { return s + 's'; }
-        var m = Math.floor(s / 60); s = s % 60;
-        if (m < 60) { return m + 'm ' + s + 's'; }
-        var h = Math.floor(m / 60); m = m % 60;
-        if (h < 24) { return h + 'h ' + m + 'm'; }
-        var d = Math.floor(h / 24); h = h % 24;
-        return d + 'd ' + h + 'h';
+        return ANAS.formatDuration(n);
     }
 
     // Relative "time ago" from an epoch-ms; "just now" under 10s. Never negative.
+    // The shared helper (00-core.js) — the same wording the Disks tab's
+    // "SMART read <age> ago" uses, so "ago" reads alike everywhere.
     function relAgo(ms) {
         var n = Number(ms);
         if (isNaN(n)) { return ''; }
-        var delta = Date.now() - n;
-        if (delta < 0) { delta = 0; }
-        if (delta < 10000) { return t('just now'); }
-        return fmtDur(delta) + ' ' + t('ago');
+        return ANAS.ago(n);
     }
 
     // 2.4 — enriched recent-activity strip. Each job renders as
@@ -1980,6 +1975,30 @@
 
     // ---- Factory + registration --------------------------------------------
 
+    // ANAS version label (disks.1 rider 2): a plain "ANAS <version>" line under
+    // the header, read off the node daemon's /health body — the same probe the
+    // install check and the version-skew banner (12.1) already make. The skew
+    // banner keeps its job of warning about a mismatch; this is only the label,
+    // so the dashboard says at a glance which ANAS the node is running.
+    // Pull-driven like everything else here: one GET on the loads that already
+    // refresh /status, no poll of its own. Fail-open — a failed probe or an
+    // old gateway simply leaves the line empty.
+    function loadVersion(view, node) {
+        if (typeof ANAS.api.health !== 'function') {
+            return;
+        }
+        ANAS.api.health(node).then(function (health) {
+            if (view.destroyed || view.destroying) {
+                return;
+            }
+            var v = health && health.version;
+            setSection(view, 'anasDashVersion',
+                v ? '<span class="anas-dash-version">' + enc(t('ANAS') + ' ' + v) + '</span>' : '');
+        }, function () {
+            // fail-open: no label rather than an error surface
+        });
+    }
+
     function headHtml(node) {
         return '<h2 style="margin:0 0 2px 0">' + enc(t('ANAS Dashboard')) + '</h2>'
             + '<div class="anas-dash-muted">' + enc(t('Node') + ': ' + node) + '</div>';
@@ -2021,6 +2040,7 @@
                             try {
                                 var v = btn.up('panel');
                                 loadStatus(v, node);
+                                loadVersion(v, node);
                                 pollTelemetry(v, node);
                             } catch (e) {
                                 ANAS.warn('dashboard refresh failed: ' + ANAS.errText(e));
@@ -2043,6 +2063,14 @@
                         style: { 'margin-bottom': '14px' },
                         html: headHtml(node)
                     },
+                    // ANAS <version> (disks.1 rider 2) — filled from /health.
+                    {
+                        xtype: 'component',
+                        itemId: 'anasDashVersion',
+                        cls: 'anas-dash-muted anas-dash-version',
+                        style: { 'margin-bottom': '14px' },
+                        html: ''
+                    },
                     // 2.5 warnings — no heading, callouts speak for themselves.
                     {
                         xtype: 'component',
@@ -2060,6 +2088,7 @@
                 listeners: {
                     afterrender: function (view) {
                         loadStatus(view, node);
+                        loadVersion(view, node);
                         startPolling(view, node);
                         // Follow the owning card's activate/deactivate (the PVE
                         // card layout fires these on the card, not this panel).
@@ -2068,6 +2097,7 @@
                             if (card && typeof card.on === 'function') {
                                 card.on('activate', function () {
                                     loadStatus(view, node);
+                                    loadVersion(view, node);
                                     startPolling(view, node);
                                 });
                                 card.on('deactivate', function () {
@@ -2099,6 +2129,7 @@
                     },
                     activate: function (view) {
                         loadStatus(view, node);
+                        loadVersion(view, node);
                         startPolling(view, node);
                     },
                     deactivate: function (view) {
