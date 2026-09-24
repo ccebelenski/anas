@@ -154,3 +154,20 @@ export const CloudRemoteTestResult = z
     message: z.string(),
   })
 export type CloudRemoteTestResult = z.infer<typeof CloudRemoteTestResult>
+
+/**
+ * `POST /v1/cloud/remotes/test` — Test a SAVED remote by `name`, or an
+ * UNSAVED dialog by `remote` (served through an environment-defined remote,
+ * so nothing is written before the user saves). Exactly one of the two.
+ * `path` is the remote-side path to list (default: the remote root).
+ */
+export const CloudRemoteTestRequest = z
+  .object({
+    name: CloudRemoteName.optional(),
+    remote: CloudRemoteWrite.optional(),
+    path: z.string().max(2048).optional(),
+  })
+  .refine(v => (v.name === undefined) !== (v.remote === undefined), {
+    message: 'exactly one of name or remote is required',
+  })
+export type CloudRemoteTestRequest = z.infer<typeof CloudRemoteTestRequest>

@@ -198,6 +198,7 @@ export {
   CloudRemote,
   CloudRemoteName,
   CloudRemotesResponse,
+  CloudRemoteTestRequest,
   CloudRemoteTestResult,
   CloudRemoteTestVerdict,
   CloudRemoteUpdate,

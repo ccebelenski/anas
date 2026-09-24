@@ -230,6 +230,14 @@ if [ -f "${ANAS_ENV_FILE}" ]; then
   info "removed ${ANAS_ENV_FILE}"
 fi
 
+# 3f. Deliberately NOT removed, ever (stated so a later reader does not add the
+# removal): the rclone package, and /etc/anas/rclone.conf alongside the rest of
+# /etc/anas (creds/, ahr/) — the same treatment as /etc/anas/creds. rclone is a
+# dependency like samba and mdadm (the node may be using it for something
+# else), and the config store is ANAS's DATA — every cloud remote and its
+# credentials. Deleting it would be an owner's move, not a guest's; a reinstall
+# picks the store straight back up.
+
 # 4. Remove the install prefix.
 if [ -d "${PREFIX}" ]; then
   info "removing ${PREFIX}"

@@ -6,6 +6,7 @@ import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
+import { PROBE_TMP_BASE, sweepStaleProbeDirs } from './services/rclone-probe.js'
 import { reconcileSelfhealState, reconcileWasQuiet } from './services/selfheal-reconcile.js'
 import { DEFAULT_SYSTEMD_DIR } from './services/snapshot-schedule-units.js'
 
@@ -113,6 +114,18 @@ async function main() {
       }).then((outcomes) => {
         if (outcomes.length > 0)
           server.log.warn(`iscsi stub quarantine: ${outcomes.length} placeholder LUN(s) taken offline — repair them from the iSCSI menu once the filesystem is mounted`)
+      })
+
+      // Stale probe configs (story rclone.1): a daemon killed mid-probe leaves
+      // /run/anas/anas-rclone-probe-*/ holding a full copy of the rclone store
+      // (its 0700/0600 modes are right, but the copy should never outlive the
+      // probe). One sweep at start — exact prefix, any age; this process has
+      // no probe of its own in flight yet. Non-blocking, fail-open.
+      void sweepStaleProbeDirs().then((swept) => {
+        if (swept.length > 0)
+          server.log.warn(`rclone probe sweep: removed ${swept.length} stale probe config dir(s) from ${PROBE_TMP_BASE} (${swept.join(', ')})`)
+      }).catch((err) => {
+        server.log.warn(`rclone probe sweep failed: ${err instanceof Error ? err.message : String(err)}`)
       })
 
       // No periodic-scrub adoption here (review F1/F4, design reversal

@@ -98,8 +98,8 @@ Options:
   --install-deps   Auto-install Node.js (>= ${MIN_NODE_MAJOR}) via the NodeSource setup_22.x
                    repository if it is absent or too old. Everything else ANAS
                    requires (acl, mdadm, btrfs-progs, samba, nfs-kernel-server,
-                   targetcli-fb, python3-rtslib-fb) is a HARD dependency and is
-                   installed regardless of this flag.
+                   targetcli-fb, python3-rtslib-fb, rclone) is a HARD dependency
+                   and is installed regardless of this flag.
   --yes            Non-interactive; assume "yes" to prompts.
   --prefix DIR     Install location (default: /opt/anas).
   --port N         Loopback port for the ANAS gateway (default: ${DEFAULT_PORT}).
@@ -284,6 +284,7 @@ NEED_BTRFS_INSTALL=0
 NEED_SAMBA_INSTALL=0
 NEED_NFS_INSTALL=0
 NEED_TARGETCLI_INSTALL=0
+NEED_RCLONE_INSTALL=0
 FATAL=()
 
 phase0_preflight() {
@@ -454,6 +455,18 @@ phase0_preflight() {
     info "targetcli-fb/python3-rtslib-fb missing — will auto-install"
   fi
 
+  # rclone — required for cloud sync remotes (rclone.1). A standard Debian
+  # package a node may not have. Same rule as samba/nfs: the Cloud screen is
+  # always there, not gated on the tooling, so the binary is a HARD dependency.
+  # ANAS drives it with an explicit --config (its own /etc/anas/rclone.conf),
+  # so only the binary itself is needed here.
+  if command -v rclone >/dev/null 2>&1; then
+    info "rclone present"
+  else
+    NEED_RCLONE_INSTALL=1
+    info "rclone missing — will auto-install"
+  fi
+
   # Resolve the gateway port (issue #2) before anything binds. This owns the
   # port-in-use logic: --port intent, preserving a configured port on upgrade,
   # and auto-scanning past a foreign listener on a fresh install. May exit here
@@ -481,7 +494,7 @@ phase0_preflight() {
 # Install the dependencies preflight marked missing: Node.js via NodeSource
 # (opted in with --install-deps), then the hard dependencies that are installed
 # regardless — acl, mdadm + btrfs-progs, samba + nfs-kernel-server,
-# targetcli-fb + python3-rtslib-fb. This mutates
+# targetcli-fb + python3-rtslib-fb, rclone. This mutates
 # the system but only adds standard Debian packages; it is NOT rolled back on a
 # later failure (leaving deps installed is harmless). It runs on every install
 # AND every upgrade, so an existing node picks up a dependency added by a newer
@@ -574,6 +587,25 @@ phase0b_install_deps() {
     # saved config file at /etc/rtslib-fb-target/saveconfig.json, ok, exiting").
     # ANAS's only job on that unit is the ordering drop-in, installed in Phase 1.
     info "note: python3-rtslib-fb enables and starts rtslib-fb-targetctl.service itself"
+  fi
+  if [ "${NEED_RCLONE_INSTALL}" -eq 1 ]; then
+    log "Installing rclone..."
+    # Same shape as samba/nfs above: the Cloud screen is always available, not
+    # gated on the tooling, so rclone is a hard dependency, not optional. The
+    # package lays down no configuration — ANAS's own /etc/anas/rclone.conf is
+    # created by the daemon on the first remote write (PRINCIPLES.md #12 —
+    # guest, not owner). This runs BEFORE the rollback trap arms, so no ANAS
+    # step has touched the node.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y rclone; then
+      err "failed to install the required package 'rclone'."
+      err "ANAS requires it for cloud sync remotes — the Cloud screen is always available, so it is a hard dependency, not optional."
+      err "Nothing on this node was modified (this step runs before any install action)."
+      err "On an air-gapped node, preseed it first (e.g. 'apt-get install -y --no-download rclone' from a local mirror, or pre-place the .deb file) and re-run this installer."
+      exit 1
+    fi
+    command -v rclone >/dev/null 2>&1 \
+      || { err "rclone install failed (rclone still missing) — ANAS requires it for cloud sync remotes; nothing was modified"; exit 1; }
+    info "rclone installed"
   fi
 }
 

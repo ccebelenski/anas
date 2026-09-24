@@ -116,16 +116,19 @@ interface RawProvider {
 
 /**
  * The parsed JSON of `rclone config providers` → the trimmed catalogue the
- * dialog renders from. Per option: `secret = IsPassword || the name rule`,
- * `password = IsPassword` (the obscure-in-file set — a different fact from
- * `secret`), `default = DefaultStr`, options with `Hide !== 0` dropped
- * (rclone hides `test_mode`-style knobs from config UIs). The output is
- * validated against the shared schema.
+ * dialog renders from. The binary prints a BARE JSON list of backends (GT
+ * 2026-09-23, v1.60.1 — the fixture is that output verbatim). Per option:
+ * `secret = IsPassword || the name rule`, `password = IsPassword` (the
+ * obscure-in-file set — a different fact from `secret`), `default =
+ * DefaultStr`, options with `Hide !== 0` dropped (rclone hides `test_mode`-
+ * style knobs from config UIs). The output is validated against the shared
+ * schema.
  */
 export function trimProviders(raw: unknown): CloudProvider[] {
-  if (typeof raw !== 'object' || raw === null || !Array.isArray((raw as { providers?: unknown }).providers))
-    throw new Error('rclone config providers: unexpected output shape (no providers list)')
-  const trimmed: CloudProvider[] = (raw as { providers: RawProvider[] }).providers.map(p => ({
+  if (!Array.isArray(raw))
+    throw new Error('rclone config providers: unexpected output shape (not a provider list)')
+  const list = raw as RawProvider[]
+  const trimmed: CloudProvider[] = list.map(p => ({
     name: String(p.Name ?? ''),
     description: String(p.Description ?? ''),
     options: (Array.isArray(p.Options) ? p.Options : [])

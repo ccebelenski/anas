@@ -1,5 +1,6 @@
 import type { CommandExecutor } from './executor/types.js'
 import { copyFileSync, readFileSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -14,6 +15,7 @@ import { LSBLK_ARGS } from './parsers/lsblk.js'
 import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from './parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from './parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from './parsers/mdstat.js'
+import { listSections, parseRcloneConf } from './parsers/rclone-conf.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
 import { ahrExpansionRoutes } from './routes/ahr-expand.js'
 import { ahrMutationRoutes } from './routes/ahr-mutate.js'
@@ -21,6 +23,7 @@ import { ahrSnapshotRoutes } from './routes/ahr-snapshots.js'
 import { ahrSpareRoutes } from './routes/ahr-spare.js'
 import { ahrRoutes } from './routes/ahr.js'
 import { backupRoutes } from './routes/backup.js'
+import { cloudRoutes } from './routes/cloud.js'
 import { dashboardRoutes } from './routes/dashboard.js'
 import { datasetRoutes } from './routes/datasets.js'
 import { diskRoutes } from './routes/disks.js'
@@ -42,6 +45,7 @@ import { ConfirmStore } from './safety/confirm.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from './services/ahr-topology.js'
 import { defaultBackupReposPaths } from './services/backup-repos.js'
 import { DiskIdentityCache } from './services/disk-identity-cache.js'
+import { defaultRcloneConfigPaths, RCLONE, rcloneBaseArgs } from './services/rclone-config.js'
 import { defaultRemotesPaths } from './services/replication-remotes.js'
 import { createTransport, defaultMembersFile } from './services/replication-transport.js'
 
@@ -131,6 +135,13 @@ export function createServer(opts?: ServerOptions) {
         pvePrivStorageDir: join(tmpdir(), `anas-mock-priv-storage-${process.pid}`),
       }
     : defaultBackupReposPaths()
+
+  // Cloud sync — remotes (rclone.1): ANAS's own rclone.conf (0600 root). The
+  // dev mock keeps it in a throwaway temp file so mock writes never touch the
+  // host (the same pattern as the creds dir and the AHR intent store).
+  const rclonePaths = (opts?.mock && !process.env.ANAS_RCLONE_CONFIG)
+    ? { configFile: join(tmpdir(), `anas-mock-rclone-${process.pid}.conf`) }
+    : defaultRcloneConfigPaths()
 
   // Register mock fixtures for dev mode
   if (opts?.mock) {
@@ -459,6 +470,31 @@ export function createServer(opts?: ServerOptions) {
     mock.addFixture({ command: '/usr/bin/btrfs', result: { stdout: '', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/realpath', result: { stdout: '/dev/md127\n', stderr: '', exitCode: 0 } })
     mock.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    // --- Cloud sync (rclone.1): rclone + the config verbs the remotes routes
+    // read. `config dump` is DYNAMIC — it re-parses the file ANAS just wrote,
+    // the way the real binary reads it back, so the post-write gate (the dump
+    // must list the section) behaves like production in the dev mock too.
+    const mockRcloneBase = rcloneBaseArgs(rclonePaths.configFile)
+    mock.addFixture({ command: RCLONE, args: ['version'], result: { stdout: 'rclone v1.60.1\n', stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: RCLONE, args: [...mockRcloneBase, 'config', 'providers'], result: { stdout: JSON.stringify([]), stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: RCLONE, args: [...mockRcloneBase, 'obscure', '-'], result: { stdout: 'mock-obscured\n', stderr: '', exitCode: 0 } })
+    const mockRcloneExec = mock.exec.bind(mock)
+    mock.exec = async (command, args, execOpts) => {
+      // The verb rides AFTER the base args (--config <file> --ask-password=false).
+      if (command === RCLONE && args.at(-2) === 'config' && args.at(-1) === 'dump') {
+        let text = ''
+        try {
+          text = await readFile(rclonePaths.configFile, 'utf-8')
+        }
+        catch { /* absent file → no sections, like the real binary */ }
+        const dump: Record<string, Record<string, string>> = {}
+        for (const section of listSections(parseRcloneConf(text)))
+          dump[section.name] = { ...section.values }
+        return { stdout: JSON.stringify(dump), stderr: '', exitCode: 0 }
+      }
+      return mockRcloneExec(command, args, execOpts)
+    }
   }
 
   const confirmStore = new ConfirmStore()
@@ -551,6 +587,19 @@ export function createServer(opts?: ServerOptions) {
     // backup2.10 — a file-backed new LUN on an AHR pool takes its boot ordering
     // from the SAME fstab (and mock override) the iSCSI add-LUN route uses.
     fstabPath,
+  })
+  // Cloud sync — remotes (rclone.1): ANAS's own rclone.conf (0600), the
+  // provider catalogue, the CRUD and the bounded lsjson Test. The rclone.2
+  // task store will wire referencingTasks into the delete refusal; until then
+  // the check runs against an empty store (the default).
+  server.register(cloudRoutes, {
+    prefix: '/v1',
+    executor,
+    jobQueue,
+    paths: rclonePaths,
+    // The dev mock never spawns anything, so probing the real /usr/bin/rclone
+    // would make the cloud paths untestable on a machine without rclone.
+    ...(opts?.mock ? { rcloneAvailable: async () => true } : {}),
   })
   // Uniform snapshot schedules (Epic 17.3/17.4) — units-as-store CRUD + status +
   // fire (take + prune). AHR targets mount @data on demand at subvolRuntimeDir.

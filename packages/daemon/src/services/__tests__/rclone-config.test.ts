@@ -28,11 +28,13 @@ import {
 } from '../rclone-config.js'
 import { assertNoSecretValues, SecretOnArgvError } from '../secret-argv.js'
 
-// The REAL 1.60.1 provider capture (packages/daemon/src/fixtures) — trimmed
-// through the function under test, so every assertion below runs on the
-// actual `rclone config providers` shape.
+// The REAL 1.60.1 provider capture (packages/daemon/src/fixtures) — the node's
+// `rclone config providers` stdout VERBATIM (a bare JSON list of all 46
+// backends, GT 2026-09-23), trimmed through the function under test, so every
+// assertion below runs on the actual binary's output.
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone/providers-1.60.1.json')
-const providers: CloudProvider[] = trimProviders(JSON.parse(await readFile(FIXTURE, 'utf-8')))
+const RAW_FIXTURE: { Name: string, Options?: { Hide?: number }[] }[] = JSON.parse(await readFile(FIXTURE, 'utf-8'))
+const providers: CloudProvider[] = trimProviders(RAW_FIXTURE)
 
 function provider(name: string): CloudProvider {
   const p = providers.find(x => x.name === name)
@@ -84,26 +86,19 @@ describe('rclone-config: the secret-key rule (rclone.1)', () => {
 })
 
 describe('rclone-config: trimProviders on the 1.60.1 fixture (rclone.1)', () => {
-  it('trims to the 8 captured backends with the shared shape', () => {
-    assert.equal(providers.length, 8)
-    assert.deepEqual(providers.map(p => p.name).sort(), ['alias', 'b2', 'crypt', 'drive', 'local', 's3', 'sftp', 'webdav'])
+  it('trims every backend of the captured catalogue with the shared shape', () => {
+    assert.equal(providers.length, RAW_FIXTURE.length)
+    for (const name of ['alias', 'b2', 'crypt', 'drive', 'local', 's3', 'sftp', 'webdav'])
+      assert.ok(providers.some(p => p.name === name), `the '${name}' backend is in the capture`)
   })
 
   it('every captured backend keeps exactly its fixture option count (Hide=0 only)', () => {
     // The expected counts are the fixture's own, per backend — a drift in
     // the trim (a dropped or duplicated option) fails here.
-    const expectedCounts: Record<string, number> = {
-      alias: 1,
-      b2: 15,
-      crypt: 8,
-      drive: 36,
-      local: 14,
-      s3: 80,
-      sftp: 28,
-      webdav: 8,
+    for (const raw of RAW_FIXTURE) {
+      const expected = (raw.Options ?? []).filter(o => (o.Hide ?? 0) === 0).length
+      assert.equal(provider(raw.Name).options.length, expected, `option count for '${raw.Name}'`)
     }
-    for (const [name, count] of Object.entries(expectedCounts))
-      assert.equal(provider(name).options.length, count, `option count for '${name}'`)
   })
 
   it('b2: account / key (secret, required) / hard_delete; hidden options dropped', () => {
