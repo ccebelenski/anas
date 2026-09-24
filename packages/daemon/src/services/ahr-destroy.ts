@@ -4,10 +4,11 @@ import type { LsblkIndex, PartInfo } from './ahr-topology.js'
 import { parseByIdToKernel, parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { parseFstab, removeMount } from '../parsers/fstab.js'
-import { LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
+import { lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { getArrays, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
+import { uncacheAhrLv } from './ahr-cache.js'
 import { run } from './ahr-exec.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { DEFAULT_MDADM_CONF, unpinArrays } from './ahr-mdadm-conf.js'
@@ -21,7 +22,7 @@ import { ahrSnapshotsMountpoint } from './share-selfservice.js'
  * mutation behind DELETE /v1/ahr/:name. Tears the stack down top-down:
  *
  *   umount (pool mountpoint AND the Previous Versions @snapshots mount)
- *     → fstab lines removed (surgical) → lvremove/vgremove/pvremove
+ *     → fstab lines removed (surgical) → uncache/lvremove/vgremove/pvremove
  *     → mdadm --stop per array → --zero-superblock per member partition
  *     → sgdisk --zap-all per member DISK → partlabel sweep for members no
  *       array still claims (issue #16) → unpin mdadm.conf ARRAY lines
@@ -230,6 +231,18 @@ export async function destroyAhrPool(
   const lvsRes = await executor.exec(LVS, LVS_ARGS)
   const lvs = lvsRes.exitCode === 0 ? parseLvsReport(lvsRes.stdout).filter(l => l.vgName === name) : []
   for (const lv of lvs) {
+    // A cached pool's LV is a dm-cache TARGET, and `lvremove` REFUSES one —
+    // which left the pool half-destroyed exactly here: already unmounted, its
+    // fstab line gone, and the VG, LV and arrays all still standing. Releasing
+    // the cache first is the detach step's own command (ahrcache.1 §13), and it
+    // is live, needs no force and works with the cache device absent (GT-20).
+    // The cache SLICE itself needs nothing extra: the cache disk is in the
+    // pool's disk set with role 'cache', so `sgdisk --zap-all` below already
+    // takes it with the rest.
+    if (lvIsCacheTarget(lv.attr)) {
+      updateProgress(`Removing the read cache from ${name}/${lv.name}`)
+      await uncacheAhrLv(executor, name, lv.name)
+    }
     updateProgress(`Removing logical volume ${name}/${lv.name}`)
     await run(executor, LVREMOVE, ['-y', `${name}/${lv.name}`])
   }

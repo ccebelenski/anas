@@ -613,3 +613,23 @@ pool, so both verbs accept it: attach reuses and re-wipes the slice, detach
 deletes it and hands the disk back. Slices 2 (the udev auto-uncache rung, the
 boot rung, Remount) and 3 (the UI) are the rest of the story.
 
+**Fix batch (review, 2026-09-24).** DESTROY must uncache before `lvremove`: a
+cached pool's LV is a dm-cache target and `lvremove` refuses one, which stopped
+the teardown with the pool already unmounted and its fstab line gone while the
+VG, LV and arrays still stood. It runs the detach step's own `lvconvert
+--uncache` first, and the confirm warnings name the cache disks and say they
+come back available. Four more calls, all in the same spirit: both verbs refuse
+through the job queue while a cache job is already in flight on the pool (the
+repair/scrub pattern — the queue runs four jobs at a time and a second attach's
+rollback would uncache the first's live cache); `vgreduce --removemissing` is
+taken only when every band already has its own named md PV, because a stopped
+band array reads `[unknown]` exactly as a dead cache device does; detach's
+`vgreduce` names only PVs sitting on a disk that carries one of our
+`<pool>-cache<n>` slices, so a PV an operator added to the VG by hand is left
+alone; and a cache-target LV whose `dmsetup status` cannot be read reports
+`failed`, never `absent` — an unreadable health signal is not "there is no
+cache". Detach on an offline pool is refused up front with the reason (uncache
+needs an active volume), a rollback that itself fails is logged to the journal
+with the pool and the step while the original cause is still what is thrown,
+and a duplicated disk in the attach request is a 400.
+

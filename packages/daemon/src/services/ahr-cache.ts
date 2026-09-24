@@ -234,7 +234,13 @@ export async function attachAhrCache(
     const sizeBytes = (await readPvs(executor))
       .filter(p => p.vgName === pool.name && !isMdPvName(p.name) && p.name !== UNKNOWN_PV_NAME)
       .reduce((sum, p) => sum + p.sizeBytes, 0)
-    return { pool: pool.name, devices: diskIds, sizeBytes }
+    // The pool's OWN cache devices, not the ones this request asked for: the
+    // cache that is already there may be built on other disks entirely (the
+    // route's 409 catches that from the topology read, but a job that reaches
+    // here has raced past it), and echoing the request would report the
+    // operator's untouched disks as the cache.
+    const devices = pool.cache && pool.cache.devices.length > 0 ? pool.cache.devices : diskIds
+    return { pool: pool.name, devices, sizeBytes }
   }
 
   try {
@@ -291,10 +297,18 @@ export async function attachAhrCache(
     // than half-consumed — a stray cache PV would sit in the VG as free
     // extents a later expansion would try to grow the pool onto).
     //
-    // Best-effort and silent: the step's own error is the one the operator
-    // needs, and a rollback failure must never replace it.
+    // Best-effort but NOT silent: the step's own error is the one the operator
+    // needs and a rollback failure must never replace it, so the cause is what
+    // is re-thrown — and the rollback's own failure goes to the journal, named
+    // by pool and step. Swallowing it outright left a half-attached cache
+    // (a stray PV in the VG, a slice on the disk) with nothing anywhere saying
+    // the cleanup had not worked.
     updateProgress('Attach failed — removing what this attempt created')
-    await detachAhrCache(executor, { pool }, () => {}, opts).catch(() => {})
+    await detachAhrCache(executor, { pool }, () => {}, opts).catch((rbErr: unknown) => {
+      const message = rbErr instanceof Error ? rbErr.message : String(rbErr)
+      log(`ahr.cache pool=${pool.name} step=rollback status=failed error=${message}`)
+      updateProgress(`The cleanup ALSO failed: ${message} — detach the cache to finish it`)
+    })
     throw err
   }
 }
@@ -380,6 +394,23 @@ async function ensureCachePv(
 
 // ---- cache-detach -----------------------------------------------------------
 
+/**
+ * `lvconvert --uncache <vg>/<lv>` — the ONE command that releases a dm-cache,
+ * in the ONE place that knows how to spell it.
+ *
+ * Detach is not its only caller: DESTROY must run it before `lvremove`,
+ * because a cached pool's LV is a dm-cache TARGET and `lvremove` refuses one,
+ * which left the pool half-destroyed (unmounted, fstab line gone, VG/LV and
+ * arrays intact). A second copy of the argv there would be a copy that drifts.
+ *
+ * Live and unconditional by design (GT-20): it needs no `--force`, no unmount
+ * and under a third of a second, and it works with the cache device ABSENT —
+ * writethrough guarantees there is nothing to flush.
+ */
+export async function uncacheAhrLv(executor: CommandExecutor, vg: string, lvName: string): Promise<void> {
+  await run(executor, LVCONVERT, [...LVM_MIXED_BLOCK_ARGS, '-y', '--uncache', `${vg}/${lvName}`])
+}
+
 export interface CacheDetachResult {
   pool: string
   /** The disks handed back to the inventory (their slices are gone). */
@@ -419,7 +450,7 @@ export async function detachAhrCache(
   const poolLv = lvs.find(l => l.name === lvName)
   if (poolLv && lvIsCacheTarget(poolLv.attr)) {
     updateProgress(`Removing the cache from ${pool.name}/${lvName}`)
-    await run(executor, LVCONVERT, [...LVM_MIXED_BLOCK_ARGS, '-y', '--uncache', `${pool.name}/${lvName}`])
+    await uncacheAhrLv(executor, pool.name, lvName)
     log(`ahr.cache pool=${pool.name} status=uncached`)
   }
   // 1b. An ORPHAN `<pool>-cache` volume — an attach that died between
@@ -433,13 +464,39 @@ export async function detachAhrCache(
     log(`ahr.cache pool=${pool.name} lv=${cacheLv} status=orphan-removed`)
   }
 
+  // The on-disk truth about which disks are OURS, read before any PV decision:
+  // a `<pool>-cache<n>` GPT label is the only thing that says a disk carries
+  // this pool's cache, and it survives `pvremove` and `wipefs` (GT-22).
+  const slices = await findCacheSlices(executor, pool.name)
+  const sliceDevices = new Set(slices.flatMap(s => [s.kernelPath, s.path]))
+
   // 2. The cache PVs leave the VG. A PV whose device is GONE cannot be named,
   //    so `--removemissing` is the only form that reaches it (GT-20); it
   //    rewrites a consistent VG and drops the ghost.
   const inVg = (await readPvs(executor)).filter(p => p.vgName === pool.name)
   const missing = inVg.filter(p => p.name === UNKNOWN_PV_NAME)
-  const namedCache = inVg.filter(p => !isMdPvName(p.name) && p.name !== UNKNOWN_PV_NAME)
+  // ONLY the PVs sitting on a disk that carries one of OUR slices. The old
+  // test — "in the VG and not an md device" — ejected every non-md PV there,
+  // including one an operator had added to the VG by hand, which detach has no
+  // business touching (guest philosophy: we own what we labelled, nothing else).
+  const namedCache = inVg.filter(p => sliceDevices.has(p.name))
   if (missing.length > 0) {
+    // `--removemissing` drops EVERY absent PV, not the one we mean. A stopped
+    // band md array reads `[unknown]` exactly as a dead cache device does
+    // (GT-19), so without this test the recovery for a failed cache would
+    // quietly evict a band's PV from a pool that was merely not assembled.
+    // The discriminator is the same one `buildAhrCacheState` uses: every band
+    // must already be accounted for by its own named md PV.
+    const bandPvCount = inVg.filter(p => isMdPvName(p.name)).length
+    const bandCount = pool.arrays.length
+    if (bandPvCount < bandCount) {
+      throw new Error(
+        `volume group '${pool.name}' is missing ${missing.length} physical volume${missing.length === 1 ? '' : 's'} `
+        + `while only ${bandPvCount} of ${bandCount} band arrays are present — a stopped band array is indistinguishable `
+        + `from a failed cache device here, and 'vgreduce --removemissing' would drop the band's physical volume with the cache's. `
+        + `Bring the band arrays up first (see the Hybrid RAID view), then detach the cache`,
+      )
+    }
     updateProgress(`Dropping the missing cache device from volume group '${pool.name}'`)
     await run(executor, VGREDUCE, [...LVM_MIXED_BLOCK_ARGS, '--removemissing', pool.name])
     log(`ahr.cache pool=${pool.name} status=vg-reduced-missing`)
@@ -453,7 +510,6 @@ export async function detachAhrCache(
   // 3–5. Per slice: drop the PV label, wipe, and DELETE the partition. Driven
   //      by the on-disk labels, so a slice LVM has already forgotten is still
   //      found and still handed back.
-  const slices = await findCacheSlices(executor, pool.name)
   const remaining = slices.length > 0 ? await readPvs(executor) : []
   const released: string[] = []
   for (const slice of slices) {

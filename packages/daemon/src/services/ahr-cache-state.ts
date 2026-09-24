@@ -119,6 +119,14 @@ export interface CacheFacts {
  * The counters ride only on `healthy`; on a failed cache `lvs` still reports
  * the last numbers it read (GT-23), and presenting those as live is precisely
  * the mis-reading this story exists to fix.
+ *
+ * ONE asymmetry, and it is deliberate: when the LV IS a cache target but
+ * dmsetup gave no legible answer — the command failed, the device is not in
+ * the table, the line did not parse — the verdict is `failed`, never `absent`.
+ * `absent` claims there is no cache, and the pool then reads healthy while
+ * potentially serving EIO to every read: the exact GT-23 failure. An
+ * unreadable health signal over a cache target is a cache whose health is not
+ * known to be good, which is what `failed` says.
  */
 export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   const { poolName, lv, pvs, bandCount, partsByKernel, byIdMap, dmStatus } = input
@@ -161,7 +169,10 @@ export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   }
 
   const diskIds = [...new Set([...fromPvs, ...fromLabels])]
-  const state = dmCacheHealth(dmStatus) ?? 'absent'
+  // No legible dm answer over a cache-target LV ⇒ `failed`, not `absent`
+  // (see the doc comment): the safe direction is the one that does not report
+  // a pool healthy while its cache may be dead.
+  const state = dmCacheHealth(dmStatus) ?? (isCacheTarget ? 'failed' : 'absent')
   // Size from the PVs: a PV reports its size even when its device is missing,
   // so the figure survives the failure the block exists to report. With no PV
   // at all (a slice cut but not yet adopted) the on-disk slice size stands in.

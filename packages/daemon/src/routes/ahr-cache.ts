@@ -19,6 +19,9 @@ export interface AhrCacheRouteOptions {
   intentDir: string
 }
 
+/** The cache verbs exclude each other AND themselves, per pool, at submit. */
+const CACHE_EXCLUSIVE_OPERATIONS = ['ahr.cache.attach', 'ahr.cache.detach'] as const
+
 /**
  * AHR read-cache routes (story ahrcache.1, docs/AHR-DESIGN.md §13/§4):
  *
@@ -39,6 +42,14 @@ export interface AhrCacheRouteOptions {
  *
  * A ROTATING cache disk is ALLOWED. The response carries one advisory sentence
  * and the request proceeds — it is the operator's disk and their call.
+ *
+ * Both also refuse while a cache job of EITHER verb is already in flight on the
+ * pool, through the job queue's own record — the pattern the repair/scrub pair
+ * uses. The queue runs four jobs at a time and there is no per-pool AHR lock,
+ * so two attaches would interleave their detect-then-delta reads: the second
+ * sees the slice the first just cut, decides its own delta from it, and on any
+ * failure its rollback (the detach sequence) uncaches the cache the first one
+ * had just made live.
  */
 export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRouteOptions) {
   const { executor, jobQueue, diskIdentityCache, intentDir } = opts
@@ -55,6 +66,25 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
       return null
     }
     return pool
+  }
+
+  /**
+   * 409 while another cache verb is in flight on this pool. `findActive` — not
+   * `findByOperation`, which answers with the LATEST job of an operation
+   * whatever its status and so lets a finished job hide a running one. The
+   * queue is in memory, so after a daemon restart this honestly answers
+   * "nothing in flight"; the verbs' own detect-then-delta steps are the
+   * backstop, and no shadow state is introduced to paper over it.
+   */
+  function refuseCacheJobInFlight(pool: string, reply: FastifyReply): boolean {
+    const active = jobQueue.findActive(CACHE_EXCLUSIVE_OPERATIONS, pool, 'pool')
+    if (!active)
+      return false
+    reply.code(409).send({ error: {
+      code: 'CONFLICT',
+      message: `A cache ${active.operation === 'ahr.cache.attach' ? 'attach' : 'detach'} is already in flight on AHR pool '${pool}' (job ${active.id}). Wait for it to finish`,
+    } })
+    return true
   }
 
   /** 409 while an expansion intent exists — the VG's shape is in flight. */
@@ -86,16 +116,9 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
       return
     if (await refuseExistingIntent(pool.name, reply))
       return
+    if (refuseCacheJobInFlight(pool.name, reply))
+      return
 
-    // Already cached: attaching a second cache to one LV is not a thing LVM
-    // does, and silently no-op'ing would read as success.
-    if (pool.cache && pool.cache.state !== 'absent') {
-      reply.code(409)
-      return { error: {
-        code: 'CONFLICT',
-        message: `AHR pool '${pool.name}' already has a read cache (${pool.cache.devices.join(', ') || 'device missing'}, ${fmtBytes(pool.cache.sizeBytes)}, state '${pool.cache.state}'). Detach it before attaching another`,
-      } }
-    }
     // A pool whose volume is not assembled has nothing to put a cache in front
     // of, and `lvconvert` would fail on an inactive LV after the disks were
     // already sliced. Refuse now, while nothing has been touched.
@@ -104,6 +127,17 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
       return { error: {
         code: 'CONFLICT',
         message: `AHR pool '${pool.name}' is ${pool.state}: its volume is not assembled, so there is nothing to cache. See the Hybrid RAID view`,
+      } }
+    }
+    // Already cached: attaching a second cache to one LV is not a thing LVM
+    // does, and silently no-op'ing would read as success. AFTER the state
+    // check on purpose: an offline pool with a cache is refused for being
+    // offline, because "detach it first" would send the operator nowhere.
+    if (pool.cache && pool.cache.state !== 'absent') {
+      reply.code(409)
+      return { error: {
+        code: 'CONFLICT',
+        message: `AHR pool '${pool.name}' already has a read cache (${pool.cache.devices.join(', ') || 'device missing'}, ${fmtBytes(pool.cache.sizeBytes)}, state '${pool.cache.state}'). Detach it before attaching another`,
       } }
     }
 
@@ -176,6 +210,8 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
       return
     if (await refuseExistingIntent(pool.name, reply))
       return
+    if (refuseCacheJobInFlight(pool.name, reply))
+      return
 
     // Nothing to detach. TWO things count as something: a live cache target,
     // and a `<pool>-cache<n>` slice still sitting on a disk with no cache
@@ -191,6 +227,16 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     if (!pool.cache || (pool.cache.state === 'absent' && pool.cache.devices.length === 0)) {
       reply.code(409)
       return { error: { code: 'CONFLICT', message: `AHR pool '${pool.name}' has no read cache to detach` } }
+    }
+    // An OFFLINE pool's volume is not assembled, and the cache is released by
+    // `lvconvert --uncache`, which needs an active volume — the job would fail
+    // on raw LVM stderr after the progress line said it was removing the cache.
+    // Scoped to a LIVE cache target on purpose: a mere leftover `<pool>-cache<n>`
+    // slice (§13's died-and-returned device) is handed back with `sgdisk -d`
+    // alone, which asks nothing of LVM, so that detach still runs.
+    if (pool.state === 'offline' && pool.cache.state !== 'absent') {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `AHR pool '${pool.name}' is offline: bring the pool online first — the cache is released by uncache, which needs an active volume. See the Hybrid RAID view for which band arrays cannot start` } }
     }
 
     const job = jobQueue.submit(

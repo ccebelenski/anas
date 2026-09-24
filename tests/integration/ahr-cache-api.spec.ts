@@ -34,6 +34,11 @@ const execFileAsync = promisify(execFile)
  *      which only holds because detach DELETES the slice (GT-22)
  *   6. the pool is destroyed through the API and the node is left clean
  *
+ * A SECOND test proves DESTROY with the cache still attached (the slice-1 fix
+ * batch): `lvremove` refuses a dm-cache target, so destroy runs the detach
+ * step's own `lvconvert --uncache` first, and the whole stack — LV, VG, arrays,
+ * fstab line — goes, with all three disks selectable again.
+ *
  * The cache-device FAILURE path (yank the disk live) belongs to slice 2, which
  * adds the udev rung that makes the recovery automatic.
  */
@@ -303,6 +308,67 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       const list = await ctx.get(`${V1}/ahr`)
       expect((await list.json()).data).toEqual([])
       expect(await sshExec('lvs --noheadings; pvs --noheadings; mdadm --detail --scan')).toBe('')
+    }
+    finally {
+      await ctx.dispose()
+    }
+  })
+
+  /**
+   * DESTROY WITH THE CACHE STILL ATTACHED — the ahrcache.1 slice-1 fix batch.
+   *
+   * A cached pool's LV is a dm-cache TARGET and `lvremove` REFUSES one, so
+   * destroy stopped dead at the LVM teardown: the pool was already unmounted
+   * and its fstab line already gone, while the VG, the LV and every band array
+   * were still standing — a half-destroyed pool with no product path forward.
+   * Destroy now runs the detach step's own `lvconvert --uncache` first.
+   *
+   * Unit tests pin the argv order; only the node can prove `lvremove` actually
+   * accepts what follows, so this rides slice 2's live proof.
+   */
+  test('destroy with the cache still attached tears the whole stack down', async ({ playwright, pveTicket }) => {
+    const cacheId = BY_ID(CACHE_SERIAL)
+    // Blank images: a disk left over from the previous test carries stale
+    // labels, and a stale signature aborts `pvcreate` non-interactively.
+    await execFileAsync(FIXTURE_SH, ['up'])
+    for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
+      expect(await fileExists(`/dev/disk/by-id/${BY_ID(serial)}`), `${serial} attached`).toBe(true)
+
+    const ctx = await authedContext(playwright, pveTicket)
+    try {
+      const inventory = await ctx.get(`${V1}/disks`)
+      const disks = (await inventory.json()).data as DiskRow[]
+      const bandIds = BAND_SERIALS.map(serial => disks.find(d => d.id.includes(serial))!.id)
+
+      await runConfirmedJob(ctx, 'post', `${V1}/ahr`, { name: POOL, tier: 'ahr1', disks: bandIds })
+      await runJob(ctx, 'post', `${V1}/ahr/${POOL}/cache`, { disks: [cacheId] })
+      expect((await poolDetail(ctx)).cache?.state).toBe('healthy')
+      // The pool LV really is a cache target — the state `lvremove` refuses.
+      expect(await sshExec(`lvs --noheadings -o lv_attr ${POOL}/${POOL}-vol`)).toMatch(/^C/)
+
+      // The confirm door names the cache disk and what becomes of it.
+      const challenge = await ctx.delete(`${V1}/ahr/${POOL}`)
+      expect(challenge.status()).toBe(409)
+      const warnings = (await challenge.json()).error.warnings as string[]
+      expect(warnings.some(w => w.includes('read cache') && w.includes(cacheId))).toBe(true)
+      const code = challenge.headers()['x-anas-confirm-code']
+      await runJob(ctx, 'delete', `${V1}/ahr/${POOL}`, undefined, { 'x-anas-confirm': code }, 300_000)
+
+      // NOTHING of the pool survives — before the fix this stopped at the LV.
+      const list = await ctx.get(`${V1}/ahr`)
+      expect((await list.json()).data).toEqual([])
+      expect(await sshExec('lvs --noheadings; pvs --noheadings; vgs --noheadings; mdadm --detail --scan')).toBe('')
+      expect(await sshExec(`grep -c anas-ahr /etc/fstab || true`)).toBe('0')
+
+      // All THREE disks — the two band members and the cache SSD — come back
+      // selectable. The cache disk only does because destroy zapped its slice
+      // as well: a partition with no filesystem still reads `other` (GT-22).
+      const after = (await (await ctx.get(`${V1}/disks`)).json()).data as DiskRow[]
+      for (const serial of [...BAND_SERIALS, CACHE_SERIAL]) {
+        const disk = after.find(d => d.id === BY_ID(serial))!
+        expect(disk.status, `${serial} available again`).toBe('available')
+        expect(disk.partitions).toEqual([])
+      }
     }
     finally {
       await ctx.dispose()

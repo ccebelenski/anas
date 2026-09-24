@@ -1,9 +1,17 @@
 import type { AhrPool } from '@anas/shared'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
 import { attachAhrCache, detachAhrCache, findCacheSlices } from '../ahr-cache.js'
+
+const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/ahr')
+function loadFixture(name: string): string {
+  return readFileSync(join(fixturesDir, name), 'utf-8')
+}
 
 /**
  * `cache-attach` / `cache-detach` as §5.1 detect-then-delta step sequences
@@ -49,9 +57,19 @@ const LVCONVERT = '/usr/sbin/lvconvert'
 
 const MIXED = ['--config', 'devices/allow_mixed_block_sizes=1']
 
-/** The minimum of an AhrPool these two verbs read. */
-function pool(): AhrPool {
-  return { name: POOL, lv: { name: POOL_LV, sizeBytes: 1065353216 } } as AhrPool
+/**
+ * The minimum of an AhrPool these two verbs read. `arrays` is load-bearing,
+ * not decoration: its LENGTH is the discriminator that tells a missing CACHE
+ * PV from a missing BAND PV, and `vgreduce --removemissing` is taken only when
+ * every band is still accounted for.
+ */
+function pool(extra: Partial<AhrPool> = {}, bands = 1): AhrPool {
+  return {
+    name: POOL,
+    lv: { name: POOL_LV, sizeBytes: 1065353216 },
+    arrays: Array.from({ length: bands }, (_, i) => ({ band: i + 1 })),
+    ...extra,
+  } as AhrPool
 }
 
 /**
@@ -75,8 +93,10 @@ class CacheWorld extends MockExecutor {
   missingPv = false
   /** A foreign partition label on the cache disk, if any. */
   foreignPart: string | null = null
-  /** Make one command fail, with this stderr. */
-  failCommand: { command: string, stderr: string } | null = null
+  /** Make these commands fail, each with its own stderr. */
+  failCommands: { command: string, stderr: string }[] = []
+  /** Serve this exact `pvs` JSON instead of the modelled one. */
+  pvsOverride: string | null = null
 
   private ok(stdout = ''): ExecResult {
     return { stdout, stderr: '', exitCode: 0 }
@@ -114,6 +134,8 @@ class CacheWorld extends MockExecutor {
   }
 
   private pvsJson(): string {
+    if (this.pvsOverride !== null)
+      return this.pvsOverride
     const rows: Record<string, string>[] = [
       { pv_name: '/dev/md127', vg_name: POOL, pv_size: '1065353216', pv_free: '0', dev_size: '1068433408' },
     ]
@@ -141,8 +163,9 @@ class CacheWorld extends MockExecutor {
 
   override async exec(command: string, args: string[]): Promise<ExecResult> {
     this.calls.push({ command, args })
-    if (this.failCommand && this.failCommand.command === command)
-      return { stdout: '', stderr: this.failCommand.stderr, exitCode: 5 }
+    const failure = this.failCommands.find(f => f.command === command)
+    if (failure)
+      return { stdout: '', stderr: failure.stderr, exitCode: 5 }
 
     switch (command) {
       case LSBLK:
@@ -316,7 +339,7 @@ describe('cache-attach — the step sequence (ahrcache.1, §13)', () => {
 
   it('a failed step rolls back what this attempt created, then re-throws the cause', async () => {
     const world = new CacheWorld()
-    world.failCommand = { command: LVCONVERT, stderr: 'lvconvert: cannot do that' }
+    world.failCommands = [{ command: LVCONVERT, stderr: 'lvconvert: cannot do that' }]
     await assert.rejects(
       attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop),
       /lvconvert: cannot do that/,
@@ -333,9 +356,43 @@ describe('cache-attach — the step sequence (ahrcache.1, §13)', () => {
     assert.equal(world.cacheLv, false)
   })
 
+  it('a rollback that ALSO fails is LOGGED, and the original cause is what is thrown', async () => {
+    const world = new CacheWorld()
+    // The attach dies on lvconvert; the rollback's own `lvremove` of the orphan
+    // cache volume then dies too. The operator must still get the diagnosis
+    // they can act on — and the cleanup's failure must not vanish, or a
+    // half-attached cache sits in the VG with nothing anywhere saying so.
+    world.failCommands = [
+      { command: LVCONVERT, stderr: 'lvconvert: cannot do that' },
+      { command: LVREMOVE, stderr: 'lvremove: Logical volume is in use' },
+    ]
+    const lines: string[] = []
+    await assert.rejects(
+      attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop, { log: l => lines.push(l) }),
+      /lvconvert: cannot do that/,
+      'the STEP\'s error is the one that reaches the operator, never the rollback\'s',
+    )
+    assert.deepEqual(
+      lines.filter(l => l.includes('step=rollback')),
+      [`ahr.cache pool=${POOL} step=rollback status=failed error=lvremove: Logical volume is in use`],
+    )
+  })
+
+  it('ALREADY cached: the result names the pool\'s OWN cache disks, not the request\'s', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    clearCalls(world)
+
+    // A request that raced past the route's 409 and asked for a different disk.
+    const cached = pool({ cache: { devices: ['ata-SOMEONE_ELSES_SSD'], sizeBytes: CACHE_PV_BYTES, mode: 'writethrough', policy: 'smq', state: 'healthy' } })
+    const result = await attachAhrCache(world, { pool: cached, diskIds: ['ata-OPERATORS_NEW_SSD'] }, noop)
+    assert.deepEqual(result.devices, ['ata-SOMEONE_ELSES_SSD'], 'what the pool HAS, not what was asked for')
+    assert.deepEqual(callsTo(world, SGDISK), [], 'and the requested disk is untouched')
+  })
+
   it('a disk that is not attached fails the step by name, before anything is written', async () => {
     const world = new CacheWorld()
-    world.failCommand = { command: LSBLK, stderr: 'lsblk: not found' }
+    world.failCommands = [{ command: LSBLK, stderr: 'lsblk: not found' }]
     await assert.rejects(
       attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop),
       /is not attached \(no \/dev\/disk\/by-id entry\)/,
@@ -399,6 +456,67 @@ describe('cache-detach — the step sequence (ahrcache.1, §13/GT-20/GT-22)', ()
     assert.deepEqual(callsTo(world, WIPEFS), [['-a', CACHE_SLICE]])
     assert.deepEqual(callsTo(world, SGDISK), [['-d', '1', CACHE_DEV]])
     assert.deepEqual(result.released, [CACHE_DISK])
+  })
+
+  it('missing PV with every band PRESENT: --removemissing is taken (the live fixture shape)', async () => {
+    const world = new CacheWorld()
+    world.cached = true
+    // The verbatim stunt-node capture: the band's md PV named and present, the
+    // cache's device gone and nameless.
+    world.pvsOverride = loadFixture('lvm-pvs-cache-missing.json')
+
+    await detachAhrCache(world, { pool: pool() }, noop)
+
+    assert.deepEqual(callsTo(world, LVCONVERT), [[...MIXED, '-y', '--uncache', `${POOL}/${POOL_LV}`]])
+    assert.deepEqual(callsTo(world, VGREDUCE), [[...MIXED, '--removemissing', POOL]])
+  })
+
+  it('missing PV with a BAND PV also gone: REFUSED, naming what is missing and what unlocks it', async () => {
+    const world = new CacheWorld()
+    world.cached = true
+    // A stopped band array reads `[unknown]` exactly as a dead cache device
+    // does. `--removemissing` here would evict the BAND's PV from a pool that
+    // was merely not assembled.
+    world.pvsOverride = JSON.stringify({
+      report: [{
+        pv: [
+          { pv_name: '[unknown]', vg_name: POOL, pv_size: '1065353216', pv_free: '0', dev_size: '0' },
+          { pv_name: '[unknown]', vg_name: POOL, pv_size: String(CACHE_PV_BYTES), pv_free: '0', dev_size: '0' },
+        ],
+      }],
+    })
+
+    await assert.rejects(
+      detachAhrCache(world, { pool: pool() }, noop),
+      /only 0 of 1 band arrays are present.*Bring the band arrays up first/s,
+    )
+    assert.deepEqual(callsTo(world, VGREDUCE), [], 'nothing was reduced')
+  })
+
+  it('a FOREIGN PV in the pool VG is left alone — only OUR slices are ejected', async () => {
+    const world = new CacheWorld()
+    world.slice = true
+    world.cached = true
+    // `/dev/sde1` is in the VG and is not an md device, which is all the old
+    // test asked. It carries no `<pool>-cache<n>` label, so it is not ours.
+    world.pvsOverride = JSON.stringify({
+      report: [{
+        pv: [
+          { pv_name: '/dev/md127', vg_name: POOL, pv_size: '1065353216', pv_free: '0', dev_size: '1068433408' },
+          { pv_name: '/dev/sdd1', vg_name: POOL, pv_size: String(CACHE_PV_BYTES), pv_free: '0', dev_size: String(SLICE_BYTES) },
+          { pv_name: '/dev/sde1', vg_name: POOL, pv_size: '1073741824', pv_free: '0', dev_size: '1073741824' },
+        ],
+      }],
+    })
+
+    await detachAhrCache(world, { pool: pool() }, noop)
+
+    assert.deepEqual(callsTo(world, VGREDUCE), [[...MIXED, POOL, '/dev/sdd1']])
+    assert.equal(
+      callsTo(world, VGREDUCE).some(a => a.includes('/dev/sde1')),
+      false,
+      'a PV the operator added by hand is not ours to evict',
+    )
   })
 
   it('DONE: running it AGAIN issues nothing', async () => {

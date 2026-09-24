@@ -643,6 +643,15 @@ export async function ahrMutationRoutes(server: FastifyInstance, opts: AhrMutati
       }
     }
 
+    // The read cache goes WITH the pool (ahrcache.1 §13): destroy releases it
+    // and wipes its slice, so the flash comes back as an available disk. Said
+    // at the confirm door because the cache disks are not the disks the
+    // operator picked when they built the pool, and nothing else on this
+    // screen names them.
+    if (pool.cache && pool.cache.state !== 'absent' && pool.cache.devices.length > 0) {
+      warnings.push(`The read cache on ${pool.cache.devices.join(', ')} is removed with the pool: the ${fmtBytes(pool.cache.sizeBytes)} slice is wiped and the disk comes back available`)
+    }
+
     // Fail-open is not fail-silent (D3): a broken claims read looks exactly
     // like a pool holding no LUNs, and the destroy takes the image file with
     // it. Disclose; the hard 409 above is unchanged.

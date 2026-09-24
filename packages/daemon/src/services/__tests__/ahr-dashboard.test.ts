@@ -9,6 +9,7 @@ import { afterEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
 import { btrfsUsageArgs } from '../../parsers/btrfs-usage.js'
+import { dmsetupStatusArgs } from '../../parsers/dmsetup.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { mdadmDetailExportArgs } from '../../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
@@ -90,6 +91,37 @@ describe('buildAhrWarnings (story 11.10, AHR-DESIGN §10)', () => {
     assert.ok(w.message.includes('ahr0-r1'), 'names the degraded array')
     assert.ok(w.message.includes('band 1'), 'names the band with a label')
     assert.ok(w.message.includes(`'${HOT1}'`), 'names the faulty member, untruncated')
+  })
+
+  /**
+   * ahrcache.1 §13/GT-19: a dead cache device makes EVERY read on the pool fail
+   * with EIO — dm-cache does not fall through to the origin. The BADGE stays
+   * `degraded` (the data is all there and one command restores service), but
+   * the card is CRITICAL, because the consequence is different in kind from a
+   * degraded band, which still serves every read.
+   */
+  it('failed read cache: a CRITICAL card naming the cache, while the badge stays degraded', async () => {
+    // Derived end to end, not hand-assembled: a cache-target LV plus the
+    // dmsetup line the kernel prints when the cache device is gone.
+    const executor = healthyExecutor({
+      lvs: JSON.stringify({ report: [{ lv: [{ lv_name: 'ahr0-vol', vg_name: 'ahr0', lv_attr: 'Cwi-aoC-p-', lv_size: '2670198784', cache_mode: 'writethrough', cache_policy: 'smq' }] }] }),
+    })
+    executor.addFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs('ahr0-ahr0--vol'), result: ok('0 5215744 cache Fail\n') })
+
+    const pools = await readAhrPools(executor)
+    const pool = pools[0]
+    assert.equal(pool.cache?.state, 'failed')
+    assert.equal(pool.state, 'degraded', 'the badge stays degraded — one command restores service')
+    assert.deepEqual(pool.arrays.map(a => a.state), ['clean', 'clean'], 'no band is degraded; the cache alone is')
+
+    const warnings = buildAhrWarnings(pools)
+    assert.equal(warnings.length, 1, 'ONE card per pool, as the §10 policy has it')
+    assert.equal(warnings[0].level, 'critical')
+    assert.equal(warnings[0].category, 'ahr')
+    assert.equal(warnings[0].ref, 'ahr0')
+    assert.ok(warnings[0].message.includes(`AHR pool 'ahr0'`), 'target-first')
+    assert.ok(warnings[0].message.includes('FAILED read cache'), 'names the cache, not a band')
+    assert.ok(warnings[0].message.includes('no data is lost'), 'and says writethrough holds no only copy')
   })
 
   it('failed: exactly one critical card', async () => {

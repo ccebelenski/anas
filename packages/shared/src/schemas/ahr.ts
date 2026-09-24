@@ -374,7 +374,17 @@ export type AhrCache = z.infer<typeof AhrCache>
  * not argue further.
  */
 export const AttachAhrCacheRequest = z.object({
-  disks: z.array(DiskId).min(1),
+  /**
+   * One or more cache disks, each listed ONCE. A repeat is a 400 rather than a
+   * silently-deduplicated list: the executor cuts one `<pool>-cache<n>` slice
+   * per entry, so a duplicate would try to partition the same disk twice under
+   * two ordinals — and the second cut lands on a disk the first already made a
+   * live PV, which is the HELD-disk case GT-21 says does not publish.
+   */
+  disks: z.array(DiskId).min(1).refine(
+    ids => new Set(ids).size === ids.length,
+    { message: 'the same cache disk is listed more than once' },
+  ),
 })
 export type AttachAhrCacheRequest = z.infer<typeof AttachAhrCacheRequest>
 

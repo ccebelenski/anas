@@ -22,6 +22,8 @@ const BIG = 'ata-ANAS_BIG_3G'
 const DETACHED = 'ata-ANAS_DETACHED_3G'
 /** A member disk that is not attached at all. */
 const GONE = 'ata-ANAS_GONE_3G'
+/** The read-cache SSD (ahrcache.1 §13) — role 'cache', no member partitions. */
+const CACHE = 'ata-ANAS_CACHE_SSD'
 const UUID_T2 = '11111111:22222222:33333333:44444444'
 const UUID_FOREIGN = '99999999:99999999:99999999:99999999'
 const MOUNTPOINT = '/mnt/test-ahr/t2'
@@ -83,6 +85,23 @@ function pool(mountpoint = MOUNTPOINT): AhrPool {
     state: 'healthy',
     subvolLayout: true,
     advisories: [],
+  })
+}
+
+/**
+ * `pool()` with a writethrough read cache attached (ahrcache.1 §13): the cache
+ * disk joins the disk set with role 'cache' and `partitions: []` — its slice
+ * backs no band, and that single fact is what puts it on destroy's wipe list.
+ */
+function cachedPool(): AhrPool {
+  const base = pool()
+  return AhrPool.parse({
+    ...base,
+    disks: [
+      ...base.disks,
+      { id: CACHE, sizeBytes: GIB, usableBytes: GIB, model: 'SSD', serial: 'S3', role: 'cache', partitions: [] },
+    ],
+    cache: { devices: [CACHE], sizeBytes: GIB, mode: 'writethrough', policy: 'smq', state: 'healthy' },
   })
 }
 
@@ -229,6 +248,94 @@ describe('destroyAhrPool (Epic 11 + AHR)', () => {
     assert.ok(conf.includes(UUID_FOREIGN))
     assert.ok(conf.includes('PROGRAM /usr/local/bin/anas-md-event'))
     assert.ok(conf.includes('hand comment survives'))
+  })
+
+  /**
+   * ahrcache.1 §13: a CACHED pool's LV is a dm-cache TARGET, and `lvremove`
+   * REFUSES one. Before the uncache step, destroy stopped dead right there —
+   * after the pool was already unmounted and its fstab line removed — leaving a
+   * half-destroyed pool whose VG, LV and arrays were all still standing.
+   */
+  it('a CACHED pool is uncached before lvremove, and the cache disk is zapped with the rest', async () => {
+    await writeFile(fstabPath, FSTAB_SEED)
+    await writeFile(confPath, CONF_SEED)
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: {
+      stdout: JSON.stringify({ filesystems: [{ target: MOUNTPOINT, source: '/dev/mapper/t2-t2--vol', fstype: 'btrfs', options: 'rw' }] }),
+      stderr: '',
+      exitCode: 0,
+    } })
+    // `Cwi-aoC---` — the live cached shape from the stunt node (GT-18). The
+    // cache volume itself is the HIDDEN `_cvol` and never appears here.
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', [{ lv_name: 't2-vol', vg_name: 't2', lv_attr: 'Cwi-aoC---', lv_size: String(2 * GIB) }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', [{ vg_name: 't2', pv_count: '2', lv_count: '1', vg_size: String(2 * GIB), vg_free: '0' }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', [
+      { pv_name: '/dev/md127', vg_name: 't2', pv_size: String(2 * GIB), pv_free: '0' },
+      { pv_name: '/dev/sde1', vg_name: 't2', pv_size: String(GIB), pv_free: '0' },
+    ]), stderr: '', exitCode: 0 } })
+    addDiskReads(
+      executor,
+      byIdListing([
+        { id: SMALL, kernel: 'sdc', parts: 1 },
+        { id: BIG, kernel: 'sdd', parts: 1 },
+        { id: CACHE, kernel: 'sde', parts: 1 },
+      ]),
+      lsblkTree([
+        { kernel: 'sdc', parts: ['t2-d1-b1'] },
+        { kernel: 'sdd', parts: ['t2-d2-b1'] },
+        { kernel: 'sde', parts: ['t2-cache1'] },
+      ]),
+    )
+    for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    const result = await destroyAhrPool(executor, cachedPool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.deepEqual(result, { destroyed: 't2' })
+
+    const sequence = acts(executor)
+    assert.deepEqual(sequence, [
+      { command: '/usr/bin/umount', args: [MOUNTPOINT] },
+      { command: '/usr/bin/systemctl', args: ['daemon-reload'] },
+      // THE fix: the cache is released before the volume can be removed.
+      { command: '/usr/sbin/lvconvert', args: ['--config', 'devices/allow_mixed_block_sizes=1', '-y', '--uncache', 't2/t2-vol'] },
+      { command: '/usr/sbin/lvremove', args: ['-y', 't2/t2-vol'] },
+      { command: '/usr/sbin/vgremove', args: ['-y', 't2'] },
+      { command: '/usr/sbin/pvremove', args: ['-y', '/dev/md127'] },
+      { command: '/usr/sbin/pvremove', args: ['-y', '/dev/sde1'] },
+      { command: '/usr/sbin/mdadm', args: ['--stop', '/dev/md127'] },
+      { command: '/usr/sbin/mdadm', args: ['--zero-superblock', `/dev/disk/by-id/${SMALL}-part1`] },
+      { command: '/usr/sbin/mdadm', args: ['--zero-superblock', `/dev/disk/by-id/${BIG}-part1`] },
+      { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${SMALL}`] },
+      { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${BIG}`] },
+      // The cache slice needs no step of its own: the cache disk is in the
+      // pool's disk set with role 'cache', so the zap list already had it.
+      { command: '/usr/sbin/sgdisk', args: ['--zap-all', `/dev/disk/by-id/${CACHE}`] },
+      { command: '/usr/sbin/update-initramfs', args: ['-u'] },
+    ])
+  })
+
+  it('an UNCACHED pool issues no lvconvert at all', async () => {
+    // The sibling of the test above, and the reason the uncache is conditional:
+    // `lvconvert --uncache` on a plain linear LV is an error, not a no-op.
+    await writeFile(fstabPath, FSTAB_SEED)
+    await writeFile(confPath, CONF_SEED)
+    const executor = new MockExecutor()
+    executor.addFixture({ command: '/usr/bin/cat', args: ['/proc/mdstat'], result: { stdout: MDSTAT_LIVE, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: EXPORT_T2_R1, stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/bin/findmnt', args: ['--json', '--real'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/lvs', result: { stdout: report('lv', [{ lv_name: 't2-vol', vg_name: 't2', lv_attr: '-wi-ao----', lv_size: String(2 * GIB) }]), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/vgs', result: { stdout: report('vg', []), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/pvs', result: { stdout: report('pv', []), stderr: '', exitCode: 0 } })
+    addDiskReads(executor, T2_BY_ID, T2_LSBLK)
+    for (const command of ['/usr/bin/umount', '/usr/bin/systemctl', '/usr/sbin/lvconvert', '/usr/sbin/lvremove', '/usr/sbin/vgremove', '/usr/sbin/pvremove', '/usr/sbin/sgdisk', '/usr/sbin/update-initramfs', '/usr/sbin/mdadm'])
+      executor.addFixture({ command, result: { stdout: '', stderr: '', exitCode: 0 } })
+
+    await destroyAhrPool(executor, pool(), m => progress.push(m), { fstabPath, mdadmConfPath: confPath })
+    assert.equal(executor.calls.some(c => c.command === '/usr/sbin/lvconvert'), false)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/lvremove').length, 1)
   })
 
   it('re-run on a half-destroyed pool: every absent layer is skipped, not an error', async () => {
