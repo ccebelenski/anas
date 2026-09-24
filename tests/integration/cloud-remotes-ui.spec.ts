@@ -244,9 +244,12 @@ test.beforeEach(async () => {
   // Self-heal like cloud-remotes-api.spec.ts: a failed test ends the worker
   // and its afterAll tears the fixture down; the next worker re-ups it here.
   await execFileAsync(FIXTURE_SH, ['up']).catch(() => {})
+  // The fixture user is the "fixture present" signal — NOT the store, which
+  // `up` deliberately removes after capturing the pre-state (every run starts
+  // with no store). Mirrors the script's user_exists(): getent/id on the user.
   test.skip(
-    !(await sshExec(`test -f ${RCLONE_CONF} && echo present || echo absent`)
-      .then(out => out.trim() === 'present')
+    !(await sshExec('id -u rclonegt')
+      .then(() => true)
       .catch(() => false)),
     'cloud fixture not present — run test/stunt-node/cloud-fixture.sh up',
   )
