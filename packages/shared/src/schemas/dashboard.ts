@@ -16,10 +16,16 @@ import { PoolState, VdevRole, VdevState, VdevType } from './zfs.js'
 
 // ---- GET /v1/status : base aggregate (stories 2.1–2.6) -----------------------
 
-/** A problem surfaced prominently on the dashboard (2.5). */
+/**
+ * A problem surfaced prominently on the dashboard (2.5). The category list is
+ * ADDITIVE — a new task kind adds its own rather than borrowing one, so a
+ * warning always deep-links to the view that can fix it (`cloud` = the cloud
+ * sync tasks of rclone.2; the prefix-parameterised warning builder in
+ * services/task-units.ts carries it).
+ */
 export const DashboardWarning = z.object({
   level: z.enum(['warning', 'critical']),
-  category: z.enum(['pool', 'disk', 'scrub', 'share', 'capacity', 'replication', 'mount', 'backup', 'ahr', 'schedule', 'iscsi']),
+  category: z.enum(['pool', 'disk', 'scrub', 'share', 'capacity', 'replication', 'mount', 'backup', 'ahr', 'schedule', 'iscsi', 'cloud']),
   message: z.string(),
   /** Optional target name (pool/disk/share) the UI can deep-link to. */
   ref: z.string().optional(),

@@ -1,10 +1,12 @@
-import type { BackupCadence } from '@anas/shared'
+import type { TaskCadence } from '@anas/shared'
 
 /**
- * Backup task CADENCE logic (Epic 16.10) — the run-time half of the structured
- * schedule. The other half is the contract itself (`BackupCadence` +
- * `cadenceToOnCalendar` in @anas/shared): the timer expression is GENERATED from
- * the cadence, so everything here is what systemd's calendar cannot express.
+ * Task CADENCE logic (Epic 16.10) — the run-time half of the structured
+ * schedule, shared by every scheduled-task store (backup first, cloud sync from
+ * rclone.2: the cadence contract itself is `TaskCadence` +
+ * `cadenceToOnCalendar` in @anas/shared, with `BackupCadence` kept as an alias).
+ * The timer expression is GENERATED from the cadence, so everything here is what
+ * systemd's calendar cannot express.
  *
  * Exactly one thing qualifies: BIWEEKLY. `OnCalendar=` has no "every other
  * week", so a biweekly task runs on a WEEKLY timer and this module decides, on
@@ -62,12 +64,14 @@ export function isoWeekParity(now: Date): 'even' | 'odd' {
 }
 
 /** How a run was triggered. Only a scheduled fire is ever gated. */
-export type BackupTrigger = 'scheduled' | 'manual'
+export type TaskTrigger = 'scheduled' | 'manual'
+/** Alias of {@link TaskTrigger} — the name backup's callers already import. */
+export type BackupTrigger = TaskTrigger
 
 export interface CadenceGateInput {
   /** The task's cadence (absent = a raw OnCalendar task: never gated). */
-  cadence?: BackupCadence
-  trigger: BackupTrigger
+  cadence?: TaskCadence
+  trigger: TaskTrigger
   now: Date
   /**
    * When the task last completed a real backup (LOCAL-ONLY: systemd + journald).
@@ -169,7 +173,7 @@ function formatDays(ms: number): string {
  * overdue (16.7's "past its schedule without a successful run counts as failed"
  * measured against the real cadence).
  */
-export function overdueWindowMs(cadence?: BackupCadence): number | undefined {
+export function overdueWindowMs(cadence?: TaskCadence): number | undefined {
   if (!cadence)
     return undefined
   switch (cadence.kind) {
@@ -186,7 +190,7 @@ export function overdueWindowMs(cadence?: BackupCadence): number | undefined {
 
 export interface OverdueInput {
   enabled: boolean
-  cadence?: BackupCadence
+  cadence?: TaskCadence
   /** The timer's next elapse (ISO), or null when systemd reports none. */
   nextRunAt: string | null
   /** Last SUCCESSFUL run (ISO), or null when there is no record. */

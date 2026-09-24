@@ -163,7 +163,6 @@ export {
   BackupWeekday,
   BackupWeekParity,
   BLOCK_ARCHIVE_NAME,
-  cadenceToOnCalendar,
   ChangeDetectionMode,
   classifyArchiveFile,
   composeGroupId,
@@ -526,6 +525,19 @@ export {
   RenameSnapshotRequest,
   Snapshot,
 } from './schemas/snapshots.js'
+
+// Task cadence — the structured schedule every unit-store task kind shares
+// (backup today, cloud sync in rclone.2). The `Backup*` spellings above are
+// aliases of these.
+export {
+  cadenceToOnCalendar,
+  TASK_WEEKDAYS,
+  TaskCadence,
+  TaskCadenceKind,
+  TaskTimeOfDay,
+  TaskWeekday,
+  TaskWeekParity,
+} from './schemas/task-cadence.js'
 
 // ZFS schemas
 export {
