@@ -253,6 +253,29 @@ describe('transient snapshot lifecycle (backup2.3)', () => {
     assert.equal(mock.calls.length, 2)
   })
 
+  it('the warning names the KIND of run — a cloud sync leftover is not a "backup" snapshot', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: ZFS, result: { stdout: '', stderr: 'cannot destroy: dataset is busy\n', exitCode: 1 } })
+    const warnings = await destroyTransients(
+      mock,
+      [{ backend: 'zfs', name: LABEL, target: 'tank/a', full: `tank/a@${LABEL}`, recursive: true }],
+      undefined,
+      undefined,
+      'cloud sync',
+    )
+    assert.match(warnings[0], /the transient cloud sync snapshot tank\/a@/)
+  })
+
+  it('the default noun stays backup\'s own — its text is byte-identical to what its tests pin', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({ command: ZFS, result: { stdout: '', stderr: 'cannot destroy: dataset is busy\n', exitCode: 1 } })
+    const warnings = await destroyTransients(
+      mock,
+      [{ backend: 'zfs', name: LABEL, target: 'tank/a', full: `tank/a@${LABEL}`, recursive: true }],
+    )
+    assert.match(warnings[0], /^the transient backup snapshot tank\/a@/)
+  })
+
   // ---- the stale sweep's scoping rule ------------------------------------
 
   const OLDER = formatTransientBackupSnapshot(TASK, new Date(NOW.getTime() - 3600_000))

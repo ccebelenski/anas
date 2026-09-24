@@ -56,6 +56,19 @@ const EXIT_SOME_FILES_FAILED = 6
 const STATS_INTERVAL = '30s'
 
 /**
+ * The executor's retention cap for an rclone run. The arithmetic that makes
+ * 256 MiB the right generosity: at `--stats 30s` rclone writes about 1.15 MB
+ * of stats JSON per day of run time (DESIGN ground truth 2026-09-23), so a
+ * 10 TB copy at `--bwlimit 8M` (~15 days) writes ~17 MB — and dying at the
+ * 10 MiB default with a half-copied destination would be the worst kind of
+ * failure. 256 MiB covers ~230 days of stats. The tee path retains none of
+ * it anyway (only the last 64 KiB tail); this cap governs stdout, which is
+ * empty, and exists so a future stderr-retaining path cannot reintroduce the
+ * death by default.
+ */
+export const RCLONE_MAX_BUFFER = 256 * 1024 * 1024
+
+/**
  * The JSON-log + stats flags every run carries. `--stats-log-level NOTICE`
  * is what makes the interval stats appear in the log at rclone's default
  * verbosity; without it the objects exist only at `-v`.
@@ -453,7 +466,7 @@ export async function runCloudSync(
       consistency,
       source: plan.source,
       destination,
-      ...(plan.label ? { snapshot: snapshotFullName(consistency, plan.label) } : {}),
+      ...(plan.snapshot ? { snapshot: plan.snapshot } : {}),
       bytes: stats.bytes,
       totalBytes: stats.totalBytes,
       transfers: stats.transfers,
@@ -461,6 +474,10 @@ export async function runCloudSync(
       deletes: stats.deletes,
       errors: stats.errors,
       elapsed: stats.elapsedTime,
+      // Whether rclone actually reported a stats object. A sub-second run may
+      // print none (its interval has not fired), and the counters below read
+      // 0 in that case — honest only when this flag says so.
+      countersReported: run.log.stats !== null,
       errorLines: run.log.errorLines,
       ...(nested.length ? { nested } : {}),
     }
@@ -468,7 +485,9 @@ export async function runCloudSync(
   finally {
     // Success, failure or refusal alike. A destroy that fails is a WARNING on
     // an otherwise-good run, never a reason to call a finished sync failed.
-    warnings.push(...await destroyTransients(executor, taken, updateProgress, deps.snapshotOptions))
+    // The noun says what kind of transient it was — this is a cloud sync run,
+    // not a backup.
+    warnings.push(...await destroyTransients(executor, taken, updateProgress, deps.snapshotOptions, 'cloud sync'))
   }
 
   if (warnings.length)
@@ -476,19 +495,16 @@ export async function runCloudSync(
   return result
 }
 
-/** `<dataset>@<label>` / `<pool>:@snapshots/<label>` — the snapshot, named in full. */
-function snapshotFullName(consistency: BackupArchiveConsistency, label: string): string {
-  return consistency.backend === 'ahr'
-    ? `${consistency.target}:@snapshots/${label}`
-    : `${consistency.target}@${label}`
-}
-
 /** What the rclone invocation will actually read, and what had to be taken for it. */
 interface SourcePlan {
   /** The path rclone is pointed at — the snapshot path, or the live tree. */
   source: string
-  /** The transient label, when one was taken. */
-  label?: string
+  /**
+   * The transient snapshot, named in full (`<dataset>@<label>` / AHR's
+   * `<pool>:@snapshots/<label>`) — taken verbatim from the `TakenSnapshot.full`
+   * the take helpers already assembled, so the naming lives in ONE place.
+   */
+  snapshot?: string
   /** The AHR pool whose top-level mount must be held open across the run. */
   pool?: AhrPool
 }
@@ -525,11 +541,12 @@ async function prepareSource(
     const dataset = consistency.target
     warnings.push(...await sweepZfsTransients(executor, dataset, task.name, now, updateProgress, sweep))
     updateProgress(`snapshotting ${dataset}@${label} (recursive)`)
-    taken.push(await takeZfsTransient(executor, dataset, label))
+    const snap = await takeZfsTransient(executor, dataset, label)
+    taken.push(snap)
     const source = snapshotRoot(consistency, label)
     if (!source)
       throw new Error(`the snapshot path for ${task.source} could not be resolved`)
-    return { source, label }
+    return { source, snapshot: snap.full }
   }
 
   const pool = ahrPools.find(p => p.name === consistency.target)
@@ -537,14 +554,15 @@ async function prepareSource(
     throw new Error(`AHR pool '${consistency.target}' is no longer resolvable`)
   warnings.push(...await sweepAhrTransients(executor, pool, task.name, now, updateProgress, deps.snapshotOptions, sweep))
   updateProgress(`snapshotting AHR pool '${pool.name}' as @snapshots/${label}`)
-  taken.push(await takeAhrTransient(executor, pool, label, undefined, updateProgress, deps.snapshotOptions))
+  const snap = await takeAhrTransient(executor, pool, label, undefined, updateProgress, deps.snapshotOptions)
+  taken.push(snap)
   // `@snapshots` lives OUTSIDE the mounted `@data` tree, so the path is only
   // reachable while the pool is mounted top-level — which is why the caller
   // wraps the rclone call in `withTopLevelMounts` for exactly this pool.
   const source = snapshotRoot(consistency, label, plannedTopLevel(pool, deps.snapshotOptions))
   if (!source)
     throw new Error(`the snapshot path for ${task.source} could not be resolved`)
-  return { source, label, pool }
+  return { source, snapshot: snap.full, pool }
 }
 
 /**
@@ -560,6 +578,10 @@ async function execRclone(
 ): Promise<{ exitCode: number, log: RcloneLogState }> {
   const reader = new RcloneLogReader()
   const r = await executor.exec(RCLONE, args, {
+    // See RCLONE_MAX_BUFFER for the arithmetic. The tee means stderr is NOT
+    // retained beyond the executor's bounded tail — a 15-day run's stats log
+    // never accumulates in the daemon.
+    maxBuffer: RCLONE_MAX_BUFFER,
     onStderr: (chunk) => {
       for (const stats of reader.push(chunk))
         updateProgress(statsProgressLine(mode, stats))

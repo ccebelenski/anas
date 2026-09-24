@@ -225,9 +225,19 @@ export const CloudSyncTask = z.object({
   /**
    * The remote-side path under `remote:`. MAY BE EMPTY — `remote:` alone is
    * the remote's own root, which is what an sftp home directory or a bucket
-   * root actually is.
+   * root actually is. MAY START WITH `/` — on some backends (sftp) that is
+   * the remote's own absolute root, so it stays allowed (rclone.3 dialog).
+   * Control characters and leading/trailing whitespace are refused: the path
+   * is joined into `remote:<path>` verbatim, and a padded or control-bearing
+   * value names something no backend resolves.
    */
-  path: z.string().max(2048).default(''),
+  path: z
+    .string()
+    .max(2048)
+    // eslint-disable-next-line no-control-regex -- the control characters ARE the thing being refused
+    .regex(/^[^\x00-\x1F\x7F]*$/, 'control characters are not allowed in a remote path')
+    .refine(p => p === p.trim(), 'leading or trailing whitespace is not allowed in a remote path')
+    .default(''),
   mode: CloudSyncMode.default('copy'),
   /** `--exclude` patterns, one flag each, in order. */
   excludes: z.array(z.string().min(1).max(512)).default([]),
@@ -338,6 +348,14 @@ export const CloudSyncRunResult = z.object({
   errors: z.number().nonnegative(),
   /** rclone's own elapsed seconds, from the final stats object. */
   elapsed: z.number().nonnegative(),
+  /**
+   * Whether rclone reported ANY stats object this run. It prints its first at
+   * the first `--stats` interval, so a sub-second run reports none and the
+   * counters above are zeros that rclone never said — the notification body
+   * and the UI say "no counters reported" instead of showing them. Defaults
+   * true so results recorded before the field existed still parse.
+   */
+  countersReported: z.boolean().default(true),
   /** rclone's error-level log lines, verbatim and in order. */
   errorLines: z.array(z.string()).default([]),
   /** Nested filesystems under the source that the run did NOT include. */

@@ -327,6 +327,10 @@ phase0_preflight() {
     || FATAL+=("release incomplete: systemd/${RECYCLE_TIMER} / ${RECYCLE_SERVICE} not found next to install.sh")
   [ -f "${APP_SRC}/packages/daemon/dist/recycle-purge.js" ] \
     || FATAL+=("release incomplete: app/packages/daemon/dist/recycle-purge.js not found (recycle purge runner)")
+  [ -f "${APP_SRC}/packages/daemon/dist/backup-task.js" ] \
+    || FATAL+=("release incomplete: app/packages/daemon/dist/backup-task.js not found (backup runner)")
+  [ -f "${APP_SRC}/packages/daemon/dist/cloud-task.js" ] \
+    || FATAL+=("release incomplete: app/packages/daemon/dist/cloud-task.js not found (cloud sync runner)")
   for tpl in "${NOTIFY_TEMPLATES[@]}"; do
     [ -f "${SCRIPT_DIR}/templates/${tpl}" ] \
       || FATAL+=("release incomplete: templates/${tpl} not found next to install.sh")

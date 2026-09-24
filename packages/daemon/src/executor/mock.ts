@@ -22,6 +22,14 @@ export interface MockFixture {
    * going activating → inactive). Takes precedence over `result`.
    */
   results?: ExecResult[]
+  /**
+   * Replay the stderr through `onStderr` (the default) or hold it back. The
+   * real executor tees stderr whenever a caller asks for live progress; an
+   * executor that buffers WITHOUT teeing is a different (broken) reality, and
+   * the re-read fallback in `execRclone` exists for exactly that case — a test
+   * can only reach it by suppressing the tee here.
+   */
+  teeStderr?: boolean
 }
 
 /** A canned response for a specific pipeline (cmd1 | cmd2) pattern. */
@@ -115,8 +123,9 @@ export class MockExecutor implements CommandExecutor {
   async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
     // Record for test assertions on the exact argv (e.g. the zfs hold calls).
     this.calls.push({ command, args })
-    // stdin (opts.stdin) is accepted for interface parity but ignored — mock
-    // matching is by command + args only, and secrets must never be matched on.
+    // stdin (opts.stdin) and maxBuffer (opts.maxBuffer) are accepted for
+    // interface parity but ignored — mock matching is by command + args only,
+    // and secrets must never be matched on.
     // Try exact match (command + args) first, then command-only match
     const exactMatch = this.fixtures.find(
       f =>
@@ -126,13 +135,13 @@ export class MockExecutor implements CommandExecutor {
         && f.args.every((a, i) => a === args[i]),
     )
     if (exactMatch)
-      return this.tee(this.resultOf(exactMatch), opts)
+      return this.tee(this.resultOf(exactMatch), exactMatch, opts)
 
     const commandMatch = this.fixtures.find(
       f => f.command === command && f.args === undefined,
     )
     if (commandMatch)
-      return this.tee(this.resultOf(commandMatch), opts)
+      return this.tee(this.resultOf(commandMatch), commandMatch, opts)
 
     return {
       stdout: '',
@@ -144,10 +153,11 @@ export class MockExecutor implements CommandExecutor {
   /**
    * Replay a fixture's stderr through the live progress sink the same way a
    * real child would, so a parser under test sees exactly the recorded bytes
-   * (the contract `execToStream` has always had, now on `exec` too).
+   * (the contract `execToStream` has always had, now on `exec` too). A fixture
+   * with `teeStderr: false` withholds it — see the field's note.
    */
-  private tee(result: ExecResult, opts?: ExecOptions): ExecResult {
-    if (result.stderr && opts?.onStderr)
+  private tee(result: ExecResult, fixture?: MockFixture, opts?: ExecOptions): ExecResult {
+    if (result.stderr && opts?.onStderr && fixture?.teeStderr !== false)
       opts.onStderr(result.stderr)
     return result
   }

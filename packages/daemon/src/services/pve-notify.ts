@@ -10,7 +10,7 @@ import type { CommandExecutor } from '../executor/index.js'
  * notification matchers/targets. The `fields` carry `type=<template>` so
  * operators can write matcher rules for ANAS events specifically — and, since
  * 16.12, for a specific KIND of ANAS event (`anas-ahr` array/pool events,
- * `anas-backup` backup-run events, — since 9.4 — `anas-snapshot` snapshot
+ * `anas-backup` backup-run events, and — since 9.4 — `anas-snapshot` snapshot
  * schedule runs and `anas-replication` replication runs, and — since rclone.2 —
  * `anas-cloud` cloud sync runs).
  *

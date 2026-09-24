@@ -57,6 +57,17 @@ describe('CloudSyncTask (rclone.2)', () => {
     for (const bwlimit of ['fast', '8MB', '8 M', '-1'])
       assert.equal(CloudSyncTask.safeParse({ ...MINIMAL, bwlimit }).success, false, bwlimit)
   })
+
+  it('the remote path: control characters and padding refused; a leading / stays allowed', () => {
+    assert.ok(CloudSyncTask.safeParse({ ...MINIMAL, path: 'pve1/pictures' }).success)
+    assert.ok(CloudSyncTask.safeParse({ ...MINIMAL, path: '' }).success, 'empty is the remote root')
+    assert.ok(
+      CloudSyncTask.safeParse({ ...MINIMAL, path: '/abs/on/remote' }).success,
+      'on sftp a leading / is the remote\'s own absolute root',
+    )
+    for (const path of ['pve1/pictures\n', 'x\u0000b', 'a\u001Fb', ' padded', 'padded ', '\tpve1'])
+      assert.equal(CloudSyncTask.safeParse({ ...MINIMAL, path }).success, false, JSON.stringify(path))
+  })
 })
 
 describe('CloudSyncTaskRequest (rclone.2)', () => {

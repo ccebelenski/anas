@@ -103,6 +103,19 @@ export interface ExecOptions {
    */
   env?: Record<string, string>
   /**
+   * Cap on what `exec` retains from the child, in bytes — the same meaning
+   * execFile's option has (exceeding it kills the child rather than growing
+   * without bound). Default 10 MiB.
+   *
+   * A long-running command that reports progress on stderr needs a HIGHER cap
+   * on the buffered stdout path — rclone's `--use-json-log` writes ~1.15 MB of
+   * stats JSON per day of run time (rclone.2), so a multi-day offsite copy
+   * outgrows the default near its end. With {@link onStderr} the cap matters
+   * differently: the tee path never retains stderr at all (only a bounded
+   * tail), so the cap governs stdout alone and can be set generously.
+   */
+  maxBuffer?: number
+  /**
    * Called with each chunk of the child's STDERR **as it arrives**, in addition
    * to the buffered `stderr` the result carries. A long-running command that
    * reports progress on stderr has to be read as it goes or the job shows
@@ -110,8 +123,11 @@ export interface ExecOptions {
    * at a roughly doubling interval (GT-59), and rclone's `--use-json-log`
    * emits one `stats` object per `--stats` interval (rclone.2).
    *
-   * Buffering is unchanged — this is a TEE, not a replacement — so a caller
-   * that only wants the final output keeps working untouched.
+   * Supplying this changes stderr's retention: the result carries only a
+   * bounded TAIL of stderr (the last lines — a final stats object, the error
+   * lines), not the whole log, so a multi-day run's progress output never
+   * accumulates in the daemon. A caller that wants the full buffered output
+   * omits `onStderr` and keeps the old behavior untouched.
    */
   onStderr?: (chunk: string) => void
 }

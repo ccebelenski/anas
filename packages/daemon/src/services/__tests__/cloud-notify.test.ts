@@ -43,6 +43,7 @@ const RESULT: CloudSyncRunResult = {
   deletes: 0,
   errors: 0,
   elapsed: 61.2,
+  countersReported: true,
   errorLines: [],
 }
 
@@ -124,6 +125,15 @@ describe('cloud sync notifications (rclone.2)', () => {
     it('falls back to the job clock when rclone reported no elapsed time', () => {
       const body = buildCloudNotifyBody({ task: TASK, result: { ...RESULT, elapsed: 0 }, elapsedMs: 62_000 })
       assert.match(body, /^Duration: +1m 2s \(job elapsed\)$/m)
+    })
+
+    it('a run rclone printed NO stats for says so instead of quoting silent zeros', () => {
+      // rclone prints its first stats object at the first --stats interval; a
+      // sub-second run prints none, and its counters are zeros rclone never
+      // said (review 2026-09-24, item 10).
+      const body = buildCloudNotifyBody({ task: TASK, result: { ...RESULT, elapsed: 0, countersReported: false } })
+      assert.match(body, /^Transferred:\n {2}rclone reported no counters$/m)
+      assert.ok(!body.includes('bytes:'), `no zero counters quoted:\n${body}`)
     })
 
     it('lists the nested filesystems the run did NOT include', () => {

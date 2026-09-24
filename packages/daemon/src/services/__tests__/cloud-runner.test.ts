@@ -396,13 +396,6 @@ describe('runCloudSync — guards', () => {
 })
 
 describe('runCloudSync — a live run', () => {
-  async function liveHarness(): Promise<Harness> {
-    const h = await harness()
-    await mkdir(h.source, { recursive: true })
-    await writeFile(join(h.source, 'a.jpg'), 'x', 'utf-8')
-    return h
-  }
-
   it('runs rclone over the LIVE tree, reports the final stats and takes no snapshot', async () => {
     const h = await liveHarness()
     try {
@@ -611,6 +604,14 @@ describe('runCloudSync — the argv guard stays uniform', () => {
   })
 })
 
+/** A live-tree harness: a real source directory with one file in it. */
+async function liveHarness(): Promise<Harness> {
+  const h = await harness()
+  await mkdir(h.source, { recursive: true })
+  await writeFile(join(h.source, 'a.jpg'), 'x', 'utf-8')
+  return h
+}
+
 /** The mock replays a fixture's stderr through `onStderr`, like a real child. */
 describe('the executor tees stderr live (rclone.2)', () => {
   it('exec forwards each fixture\'s stderr to onStderr and still buffers it', async () => {
@@ -621,5 +622,88 @@ describe('the executor tees stderr live (rclone.2)', () => {
     const r: ExecResult = await mock.exec('/bin/thing', [], opts)
     assert.deepEqual(seen, ['line one\n'])
     assert.equal(r.stderr, 'line one\n')
+  })
+
+  it('a fixture with teeStderr:false holds the stderr back — the no-tee executor shape', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: '/bin/thing',
+      teeStderr: false,
+      result: { stdout: '', stderr: 'line one\n', exitCode: 0 },
+    })
+    const seen: string[] = []
+    const r: ExecResult = await mock.exec('/bin/thing', [], { onStderr: c => seen.push(c) })
+    assert.deepEqual(seen, [], 'nothing reached the live sink')
+    assert.equal(r.stderr, 'line one\n', 'the buffer still has it — that is what the fallback re-reads')
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  Fix-batch pins (rclone.2 slice 2 review, 2026-09-24)
+// ---------------------------------------------------------------------------
+
+/** A MockExecutor that remembers the options the last exec was handed. */
+class OptsRecorder extends MockExecutor {
+  lastExecOpts?: ExecOptions
+  override exec(command: string, args: string[], opts?: ExecOptions) {
+    this.lastExecOpts = opts
+    return super.exec(command, args, opts)
+  }
+}
+
+describe('execRclone — executor options (fix batch)', () => {
+  it('asks for a generous maxBuffer: a 15-day stats log is ~17 MB, the 10 MiB default would kill the run', async () => {
+    const h = await harness()
+    try {
+      await mkdir(h.source, { recursive: true })
+      const mock = new OptsRecorder()
+      mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: findmntJson(), stderr: '', exitCode: 0 } })
+      mock.addFixture({ command: RCLONE, result: { stdout: '', stderr: FINAL_STATS, exitCode: 0 } })
+      await runCloudSync(mock, deps(h), () => {})
+      assert.equal(mock.lastExecOpts?.maxBuffer, 256 * 1024 * 1024)
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('a run rclone printed NO stats object for carries countersReported:false', async () => {
+    const h = await liveHarness()
+    try {
+      // rclone prints its first stats object at the first --stats interval; a
+      // sub-second run prints none and its counters would read as silent zeros.
+      h.mock.addFixture({ command: RCLONE, result: { stdout: '', stderr: '', exitCode: 0 } })
+      const result = await runCloudSync(h.mock, deps(h), m => h.progress.push(m))
+      assert.equal(result.status, 'success')
+      assert.equal(result.countersReported, false)
+      assert.equal(result.bytes, 0)
+      assert.deepEqual(
+        h.progress.filter(p => p.startsWith('copy: ')),
+        [],
+        'no stats progress was published — rclone printed nothing',
+      )
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('an executor that buffers WITHOUT teeing still yields the counters (the re-read fallback)', async () => {
+    const h = await liveHarness()
+    try {
+      h.mock.addFixture({
+        command: RCLONE,
+        teeStderr: false,
+        result: { stdout: '', stderr: [statsLine(), FINAL_STATS].join('\n'), exitCode: 0 },
+      })
+      const result = await runCloudSync(h.mock, deps(h), m => h.progress.push(m))
+      assert.equal(result.status, 'success')
+      assert.equal(result.bytes, 4194304, 'the counters came from re-reading r.stderr')
+      assert.equal(result.countersReported, true)
+      assert.deepEqual(h.progress.filter(p => p.startsWith('copy: ')), [], 'no live progress — the tee never fired')
+    }
+    finally {
+      await h.cleanup()
+    }
   })
 })

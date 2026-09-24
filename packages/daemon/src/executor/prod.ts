@@ -9,6 +9,7 @@ import type {
 } from './types.js'
 import { execFile, spawn } from 'node:child_process'
 import { close, fsync, open, readFileSync } from 'node:fs'
+import { StringDecoder } from 'node:string_decoder'
 
 /** Promisified `open(2)` — the caller owns the fd, so the stream cannot close it. */
 function openFd(path: string, flags: string | number): Promise<number> {
@@ -30,15 +31,84 @@ function closeFd(fd: number): void {
  *
  * execFile is used instead of exec to prevent shell interpretation
  * and command injection. Arguments are passed as an array.
+ *
+ * An `onStderr` caller takes a different road (`execTeeingStderr` below): one
+ * that does not retain the child's stderr at all.
  */
+
+/** The historical default, kept for every caller that does not ask for more. */
+const DEFAULT_MAX_BUFFER = 10 * 1024 * 1024
+
+/**
+ * How much of a teeing exec's stderr the RESULT keeps: the last 64 KiB. This
+ * is the arithmetic behind the number — a `--stats 30s` rclone run emits about
+ * 1.15 MB of stats JSON per day (DESIGN ground truth 2026-09-23), and the only
+ * things post-run code reads from stderr are the FINAL stats object and the
+ * error lines, which all arrive in the last seconds of a run. 64 KiB holds
+ * hours of them; a multi-day run's earlier stats are progress, already
+ * consumed by the tee, and not worth a day's worth of daemon memory.
+ */
+const STDERR_TAIL_CHARS = 64 * 1024
+
+/**
+ * Decodes stderr chunks multi-byte-safely, hands each decoded piece to a live
+ * sink, and keeps only the last {@link STDERR_TAIL_CHARS} characters for the
+ * result. Split out of `execTeeingStderr` so the two properties that matter —
+ * a UTF-8 character split across pipe reads, and the bounded tail — are
+ * testable on hand-picked chunk splits, which an OS pipe will not hand you on
+ * demand.
+ */
+export class StderrTee {
+  private readonly decoder = new StringDecoder('utf8')
+  private tail = ''
+
+  constructor(private readonly sink: (chunk: string) => void) {}
+
+  /** One raw stderr chunk, as the pipe delivered it. */
+  write(chunk: Buffer): void {
+    this.consume(this.decoder.write(chunk))
+  }
+
+  /** End of stderr: flushes a pending multi-byte character. Returns the tail. */
+  finish(): string {
+    this.consume(this.decoder.end())
+    return this.tail
+  }
+
+  private consume(chunk: string): void {
+    if (!chunk)
+      return
+    this.sink(chunk)
+    this.tail += chunk
+    if (this.tail.length > STDERR_TAIL_CHARS) {
+      this.tail = this.tail.slice(-STDERR_TAIL_CHARS)
+      // Cut at the next line break so the tail re-parses cleanly (a partial
+      // first line would read as a phantom raw line). A tail made of ONE line
+      // longer than the cap keeps its raw cut — bounded is the point, and no
+      // line is worth unbounding it for.
+      const nl = this.tail.indexOf('\n')
+      if (nl >= 0)
+        this.tail = this.tail.slice(nl + 1)
+    }
+  }
+}
+
 export class ProdExecutor implements CommandExecutor {
   exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
+    const { onStderr } = opts ?? {}
+    if (onStderr)
+      return this.execTeeingStderr(command, args, { ...opts, onStderr })
+    return this.execBuffered(command, args, opts)
+  }
+
+  /** The plain execFile path — stdout AND stderr fully buffered, as always. */
+  private execBuffered(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
     return new Promise((resolve, reject) => {
       const child = execFile(
         command,
         args,
         {
-          maxBuffer: 10 * 1024 * 1024,
+          maxBuffer: opts?.maxBuffer ?? DEFAULT_MAX_BUFFER,
           // Merge secret env (e.g. pbc's PBS_PASSWORD, Epic 16) over the
           // daemon's own environment for the child only — never on argv.
           ...(opts?.env ? { env: { ...process.env, ...opts.env } } : {}),
@@ -72,15 +142,6 @@ export class ProdExecutor implements CommandExecutor {
         },
       )
 
-      // Live stderr TEE: execFile still buffers everything for the result, but
-      // a caller that wants progress as it happens (rclone's JSON stats, pbc's
-      // restore lines) gets each chunk here rather than waiting for the exit.
-      if (opts?.onStderr) {
-        child.stderr?.on('data', (d) => {
-          opts.onStderr?.(String(d))
-        })
-      }
-
       // Feed stdin for secrets (e.g. smbpasswd -s reads the password here, so
       // it never lands in argv / the process list), then close the stream.
       if (opts?.stdin !== undefined && child.stdin) {
@@ -90,6 +151,83 @@ export class ProdExecutor implements CommandExecutor {
         })
         child.stdin.end(opts.stdin)
       }
+    })
+  }
+
+  /**
+   * The exec path for a caller that consumes stderr live (rclone's JSON stats,
+   * rclone.2 slice 2). execFile CANNOT serve it: it buffers both streams
+   * internally up to `maxBuffer` with no per-stream opt-out, so a multi-day
+   * run's stats log would be retained in full no matter what the tee did —
+   * and at the old flat 10 MiB the run would DIE near its end, mid-copy, with
+   * a maxBuffer error (the failure this path exists to remove).
+   *
+   * So this path spawns directly and applies the caps where they belong:
+   *   - stdout is buffered, up to `maxBuffer` (default 10 MiB) — overflowing
+   *     kills the child, the same contract execFile has. rclone's stdout is
+   *     empty; a cloud run passes a generous cap for the general case.
+   *   - stderr is TEEED to `onStderr` as it arrives and NOT retained: the
+   *     result carries the last {@link STDERR_TAIL_CHARS} characters only
+   *     (see the arithmetic there). Chunks are decoded with a StringDecoder
+   *     so a multi-byte character split across pipe reads — a filename in an
+   *     error line — is never turned into replacement characters.
+   *
+   * Everything else keeps execFile's observable contract: spawn failures
+   * reject (ENOENT/EACCES), a non-zero exit resolves (never throws), exit
+   * codes pass through exactly, a signal death reports `exitCode: 1` plus the
+   * signal name, stdin is fed and EPIPE on it is ignored.
+   */
+  private execTeeingStderr(command: string, args: string[], opts: ExecOptions & { onStderr: (chunk: string) => void }): Promise<ExecResult> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(command, args, {
+        stdio: [opts.stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+        // Merge secret env (e.g. pbc's PBS_PASSWORD, Epic 16) over the
+        // daemon's own environment for the child only — never on argv.
+        ...(opts.env ? { env: { ...process.env, ...opts.env } } : {}),
+      })
+
+      const tee = new StderrTee(opts.onStderr)
+
+      const stdoutChunks: Buffer[] = []
+      let stdoutBytes = 0
+      const maxBuffer = opts.maxBuffer ?? DEFAULT_MAX_BUFFER
+      child.stdout?.on('data', (d: Buffer) => {
+        stdoutBytes += d.length
+        if (stdoutBytes > maxBuffer) {
+          // execFile's contract: over the cap, the child dies. The error has
+          // no exit code worth reporting — the run's output is unrepresentable.
+          child.kill('SIGKILL')
+          reject(new Error(`stdout exceeded maxBuffer (${maxBuffer} bytes)`))
+          return
+        }
+        stdoutChunks.push(d)
+      })
+
+      child.stderr?.on('data', (d: Buffer) => tee.write(d))
+
+      if (child.stdin) {
+        child.stdin.on('error', () => {
+          // Ignore EPIPE if the child exits before consuming stdin — the
+          // close handler below already reports the real outcome.
+        })
+        child.stdin.end(opts.stdin)
+      }
+
+      child.on('error', (err) => {
+        // Spawn failures only (ENOENT, EACCES) — the process never started.
+        reject(err)
+      })
+
+      child.on('close', (code, signal) => {
+        // `finish` flushes the decoder: the tail bytes of a multi-byte
+        // character split across the last two reads are only now decodable.
+        resolve({
+          stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+          stderr: tee.finish(),
+          exitCode: code === null ? 1 : code,
+          ...(signal ? { signal } : {}),
+        })
+      })
     })
   }
 
@@ -240,6 +378,12 @@ export class ProdExecutor implements CommandExecutor {
         return
       }
 
+      // NOTE (rclone.2 slice 2 review): stderr is retained UNBOUNDED here — the
+      // same pre-tee pattern `exec` had. pbc's restore writes progress lines at
+      // a roughly doubling interval (GT-59), so a restore's whole stderr is a
+      // few MB at worst and the buffering has never hurt; the fix `exec` needed
+      // (days of `--stats 30s` JSON) does not apply to this shape. Revisit only
+      // if a stream target's tool learns to talk NDJSON on stderr.
       let stderr = ''
       let settled = false
 

@@ -124,11 +124,20 @@ export function buildCloudNotifyBody(ctx: CloudNotifyContext): string {
   if (result) {
     lines.push('')
     lines.push('Transferred:')
-    lines.push(`  bytes:     ${result.bytes} of ${result.totalBytes}`)
-    lines.push(`  files:     ${result.transfers}`)
-    lines.push(`  checked:   ${result.checks}`)
-    lines.push(`  deleted:   ${result.deletes}`)
-    lines.push(`  errors:    ${result.errors}`)
+    // rclone prints its first stats object only when the first --stats
+    // interval fires; a sub-second run prints none, and its counters would
+    // read as zeros. Zeros are rclone's own numbers only when it REPORTED
+    // them — anything else is a lie about what happened, so say that instead.
+    if (result.countersReported === false) {
+      lines.push('  rclone reported no counters')
+    }
+    else {
+      lines.push(`  bytes:     ${result.bytes} of ${result.totalBytes}`)
+      lines.push(`  files:     ${result.transfers}`)
+      lines.push(`  checked:   ${result.checks}`)
+      lines.push(`  deleted:   ${result.deletes}`)
+      lines.push(`  errors:    ${result.errors}`)
+    }
   }
 
   if (result?.nested?.length) {

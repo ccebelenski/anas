@@ -165,12 +165,17 @@ export async function takeAhrTransient(
  * recursive parent on AHR). Never throws: each failure becomes one warning line,
  * because a backup that already succeeded must not be reported as failed over a
  * snapshot that outlived it.
+ *
+ * `noun` names the KIND of run the transients belonged to (the `label` pattern
+ * in `backup-cadence.ts`: an optional trailing word defaulting to backup's own)
+ * — a leftover cloud sync transient must not say "backup" in its warning.
  */
 export async function destroyTransients(
   executor: CommandExecutor,
   taken: TakenSnapshot[],
   updateProgress: (message: string) => void = noop,
   opts?: BackupSnapshotOptions,
+  noun: string = 'backup',
 ): Promise<string[]> {
   const warnings: string[] = []
   // Reverse order: on AHR the nested-subvolume snapshots were taken after the
@@ -191,7 +196,7 @@ export async function destroyTransients(
     }
     catch (err) {
       warnings.push(
-        `the transient backup snapshot ${snap.full} could not be destroyed: ${errText(err)} - `
+        `the transient ${noun} snapshot ${snap.full} could not be destroyed: ${errText(err)} - `
         + `it is safe to destroy by hand, and the next run of this task sweeps it.`,
       )
     }
