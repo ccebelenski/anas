@@ -197,17 +197,18 @@ describe('attach/replace endpoint: POST /v1/pools/:name/attach', () => {
     assert.equal(res.json().error.code, 'VALIDATION_ERROR')
   })
 
-  // No `zpool status` fixture here: the leaf lookup FAILS OPEN, as every read
-  // on this route does, and the request's own by-id spelling stays the device —
-  // zpool's error is the answer, never a 500 from us.
+  // The pool's own status IS readable here — the leaf resolves, the argv is
+  // built from the device ZFS reports, and zpool's own refusal is what fails
+  // the job (never a 500 from us).
   it('fails the job when zpool replace fails', async () => {
     server = createServer({ mock: true, logger: false })
     const mock = (server as unknown as { executor: MockExecutor }).executor
     mock.clearFixtures()
     mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: mockFixtures.zpoolStatus() })
     mock.addFixture({
       command: '/usr/sbin/zpool',
-      args: ['replace', 'testpool', `${BY_ID}${FAILED}`, `${BY_ID}${NEW_B}`],
+      args: ['replace', 'testpool', FAILED_LEAF, `${BY_ID}${NEW_B}`],
       result: { stdout: '', stderr: 'cannot replace: device is too small', exitCode: 1 },
     })
 
@@ -388,5 +389,94 @@ describe('attach/replace on a by-id partition-backed split device (#66)', () => 
     assert.equal(res.statusCode, 400)
     assert.equal(res.json().error.message, `pool ${SPLIT_POOL} carries no vdev '${SSD}-part9'`)
     assert.equal(spy.calls.find(c => c.args[0] === 'replace'), undefined)
+  })
+})
+
+// --- an UNREADABLE pool status (vdevs.2 hardening) -------------------------
+//
+// The leaf lookup used to fail OPEN: a `zpool status` that could not be read
+// left `/dev/disk/by-id/<existingDiskId>` as the device handed to ZFS. On the
+// #66 partition-backed layout that spelling names a DIFFERENT member than the
+// leaf the operator picked (or none at all), and `zpool replace` aimed at a
+// substituted device destroys the data on it. Both leaf verbs name an existing
+// leaf, so neither runs on a read that did not happen.
+
+/** A server whose pool LISTS but whose `zpool status -jv` answers as given. */
+function statusReadServer(status: ExecResult): ReturnType<typeof createServer> {
+  const server = createServer({ mock: true, logger: false })
+  const mock = (server as unknown as { executor: MockExecutor }).executor
+  mock.clearFixtures()
+  mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: mockFixtures.zpoolList() })
+  mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: status })
+  mock.addFixture({ command: '/usr/sbin/zpool', args: undefined, result: { stdout: '', stderr: '', exitCode: 0 } })
+  return server
+}
+
+describe('attach/replace refuses when the pool status cannot be read', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  async function post(replace: boolean) {
+    return server!.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/attach',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ existingDiskId: EXISTING, newDiskId: NEW_A, replace }),
+    })
+  }
+
+  it('a REPLACE on an unreadable status is refused — no zpool replace argv', async () => {
+    server = statusReadServer({ stdout: '', stderr: 'cannot open \'testpool\': I/O error', exitCode: 1 })
+    const spy = spyExecutor(server)
+
+    const res = await post(true)
+    assert.equal(res.statusCode, 409)
+    const { error } = res.json() as { error: { code: string, reason: string, message: string } }
+    assert.equal(error.code, 'CONFLICT')
+    assert.equal(error.reason, 'unreadable')
+    assert.match(error.message, /pool testpool's status could not be read/)
+    assert.match(error.message, /refusing to replace a device it cannot identify/)
+    assert.match(error.message, /I\/O error/)
+    assert.equal(spy.calls.find(c => c.args[0] === 'replace' || c.args[0] === 'attach'), undefined)
+  })
+
+  it('an ATTACH on an unreadable status is refused the same way', async () => {
+    server = statusReadServer({ stdout: '', stderr: '', exitCode: 1 })
+    const spy = spyExecutor(server)
+
+    const res = await post(false)
+    assert.equal(res.statusCode, 409)
+    const { error } = res.json() as { error: { reason: string, message: string } }
+    assert.equal(error.reason, 'unreadable')
+    assert.match(error.message, /refusing to attach to a device it cannot identify/)
+    assert.match(error.message, /zpool status exited with code 1/)
+    assert.equal(spy.calls.find(c => c.args[0] === 'replace' || c.args[0] === 'attach'), undefined)
+  })
+
+  it('a status that exits 0 but no longer carries the pool is refused too', async () => {
+    server = statusReadServer({ stdout: JSON.stringify({ pools: {} }), stderr: '', exitCode: 0 })
+    const spy = spyExecutor(server)
+
+    const res = await post(true)
+    assert.equal(res.statusCode, 409)
+    assert.match((res.json() as { error: { message: string } }).error.message, /no longer reports the pool/)
+    assert.equal(spy.calls.find(c => c.args[0] === 'replace' || c.args[0] === 'attach'), undefined)
+  })
+
+  it('a READABLE status is unchanged — the leaf resolves and the argv is built', async () => {
+    server = statusReadServer(mockFixtures.zpoolStatus())
+    const spy = spyExecutor(server)
+
+    const res = await post(true)
+    assert.equal(res.statusCode, 202)
+    await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.deepEqual(
+      spy.calls.find(c => c.args[0] === 'replace')!.args,
+      ['replace', 'testpool', EXISTING_LEAF, `${BY_ID}${NEW_A}`],
+    )
   })
 })
