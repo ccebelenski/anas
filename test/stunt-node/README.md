@@ -2,6 +2,9 @@
 
 A local Proxmox VE 9 virtual machine for end-to-end testing of ANAS against real ZFS, SMB, and NFS.
 
+Backup work needs a real PBS to talk to: `test/pbs-node/` stands one up beside this
+node (`anas-pbs`, 192.168.200.51, datastore `gtstore`) on the same `anas-test` network.
+
 ## Host Requirements
 
 - **OS:** Fedora 43+ (other Linux distros may work)
