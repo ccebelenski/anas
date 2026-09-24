@@ -303,12 +303,35 @@ gtcache-gtcache--vol: 0 2080768 cache Error
   [unknown]  gtcache lvm2 a-m   508.00m    0
 ```
 
-`dmsetup status` reports the cache target as the single token `Error`; `lvs`,
+`dmsetup status` reports the cache target as a single token; `lvs`,
 `pvs` and `vgs` mark the partial VG (`Cwi-aoC-p-`, `wz-pn-`, PV attr `a-m`) and
 name the missing PV UUID on stderr. **The cache counters in `lvs` go stale
 rather than absent** — they keep reporting the last values read before the
 metadata died (3881 used blocks, 25 632 hits), so the pool-detail `cache` block
-must not present them as live once the target reads `Error`.
+must not present them as live once the target stops reporting a status line.
+
+> **Refined 2026-09-24 during the ahrcache.1 slice-1 build** (same node, kernel
+> 7.0.14-17-pve). Two corrections to the shape above, both measured:
+> 1. **The failure word is not one word.** Pulling the cache device under a
+>    pure READ load gives `0 2080768 cache Fail`, not `Error` — dm-cache emits
+>    `Fail` for a cache in `CM_FAIL` and `Error` from the generic target-error
+>    path, and the capture above was taken after a write had aborted the
+>    metadata transaction. A token list would have been one kernel wording away
+>    from calling a dead cache healthy, so the shipped test is structural: a
+>    real dm-cache status line opens with the metadata block size, a DIGIT;
+>    anything else is a failure word, whatever this kernel calls it.
+> 2. **`dmsetup status <name>` does NOT repeat the name.** The bare
+>    `dmsetup status` listing prefixes each line with `<name>: `, but the
+>    single-device form — the one a per-pool health read uses — prints the
+>    target line alone (`0 2080768 cache Fail`). The parser handles both.
+>
+> Also measured on the same pass: in that instance `lvs` reported the counters
+> as ZEROES (`cache_total_blocks: 0`, hits 0) rather than stale values. Either
+> way `lvs` cannot tell a working cache from a dead one, which is the fact the
+> gate exists for. Verbatim captures of all of it are committed as
+> `fixtures/ahr/dmsetup-status-cache-{healthy,failed}.txt`,
+> `dmsetup-status-uncached.txt`, `lvm-pvs-cach{ed,e-missing}.json` and
+> `lvs-cach{ed-live,e-missing}.json`.
 
 **btrfs behaviour splits by workload, and this is the part that decides the
 recovery rung.** Under a pure *read* load the filesystem stayed **rw** and just

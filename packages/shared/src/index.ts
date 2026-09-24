@@ -34,6 +34,8 @@ export {
   AhrArray,
   AhrArrayMember,
   AhrArraySync,
+  AhrCache,
+  AhrCacheState,
   AhrCapacity,
   AhrCreateRequest,
   AhrCreateSnapshotRequest,
@@ -69,6 +71,7 @@ export {
   AhrType,
   ArrayLevel,
   ArrayState,
+  AttachAhrCacheRequest,
 } from './schemas/ahr.js'
 
 // API envelope schemas

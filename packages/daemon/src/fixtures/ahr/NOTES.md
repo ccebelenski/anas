@@ -70,13 +70,33 @@ per the ground-truth idiom (never build a parser against an assumed format).
 | `mdstat-check.txt` | **Synthetic** | `mdstat-clean.txt`'s two arrays with a running `check` progress line on each (r1 at 12.4%, r2 at 61.9% — deliberately unequal, so the pool-level aggregation has something to choose between). The progress-line FORMAT is genuine: it is byte-identical in shape to the live `recovery` line in `mdstat-initial-recovery.txt`; only the action word differs (`check`). No live mdcheck run was captured — replace with one when a periodic check next runs on a node |
 | `mdstat-inactive-bands-post-lockup.txt` | **Reconstructed** | The pve5 2026-08-09 post-lockup incident (issue #18), rebuilt from `mdstat-initial-recovery-delayed-raid5.txt` — the same node, pools, kernel numbers, member devices and block counts — set to the state the operator reported: `chiaahr2` band r1 (md126) active but down a member `[5/4]`, bands r2 (md125) and r3 (md124) `inactive` with every member `(S)` (`mdadm --detail` said "active, FAILED, Not Started"), and the unrelated `chiaahr` pool (md127) still clean. The incident's own mdstat bytes were not retained; replace with the live capture if this recurs. VG-partial/LV-inactive halves of the shape are modelled in the test's `lvs`/`vgs` fixtures |
 
+## Genuine captures — story ahrcache.1 read cache (added 2026-09-24)
+
+Live-captured on the stunt node (`anas-pve`, kernel 7.0.14-17-pve, lvm2
+2.03.31-2+pmx1) during the ahrcache.1 slice-1 live proof: AHR-1 pool `gtcache`
+on ANAS_HOT7+HOT8, cache on ANAS_HOT9 (512 MiB), everything built and torn down
+through the daemon's own API. `lvs-cached-pool.json` is the earlier GT §18
+capture (`lvs -a`, hidden sub-LVs included); the files below are the shapes the
+daemon itself runs — `lvs` WITHOUT `-a`, and `pvs` in the byte form.
+
+| File | Source | What it is |
+|------|--------|------------|
+| `lvs-cached-live.json` | live, warm cache | `lvs --reportformat json --units b --nosuffix -o +cache_*` — the pool LV as a cache target: `lv_attr` `Cwi-aoC---`, `cache_mode` writethrough, `cache_policy` smq, 1036/8000 blocks used, 795 hits / 3585 misses, **0 dirty** (writethrough's guarantee). `lv_size` is the ORIGIN size (1016 MiB), not the VG's |
+| `lvs-cache-missing.json` | live, device pulled | The SAME LV seconds after the cache disk was detached live: `lv_attr` `Cwi-aoC-p-` (p = partial) and the cache counters all **zeroed** — GT-23 saw them go stale instead. Either way `lvs` cannot tell a working cache from a dead one, which is why health comes from `dmsetup status` |
+| `lvm-pvs-cached.json` | live, warm cache | `pvs … -o +dev_size` with the cache PV present: `/dev/md127` (the band) and `/dev/sdd1` (the cache slice) in VG `gtcache`. The non-md PV in the pool VG is the classification rule, live |
+| `lvm-pvs-cache-missing.json` | live, device pulled | The same call with the device gone: the cache PV reads `[unknown]`, `pv_attr` `a-m`, `dev_size` 0, and it keeps its `pv_size` — which is why the cache block derives its size from the PV, not from the LV. The two `log[]` warnings are lvm's, verbatim |
+| `dmsetup-status-cache-healthy.txt` | live, warm cache | `dmsetup status gtcache-gtcache--vol` — note the single-device form does NOT repeat the name. Opens with the metadata block size (a digit), which is the healthy test |
+| `dmsetup-status-cache-failed.txt` | live, device pulled | The same call, same second the reads started failing: `0 2080768 cache Fail`. **GT §18 recorded `Error`** (captured after a write aborted the metadata transaction); a pure read load gives `Fail`. Two words for one condition — hence the structural digit test rather than a token list |
+| `dmsetup-status-uncached.txt` | live, after `--uncache` | `0 2080768 linear` — the pool LV keeps its name and dm number across attach, failure and detach (GT-18) |
+
 ## Known gaps (for the next capture pass)
 
 - `mdadm --detail --scan` output was never captured — the topology reader
   deliberately discovers arrays via `/proc/mdstat` + per-array
   `--detail --export` instead (both shapes ARE captured).
-- `pvs/vgs/lvs --reportformat json --units b --nosuffix` (the byte form the
-  daemon actually runs) — only the suffixed form was captured.
+- `vgs --reportformat json --units b --nosuffix` (the byte form the daemon
+  actually runs) — only the suffixed form was captured. `pvs` and `lvs` in the
+  byte form ARE captured, by the ahrcache.1 set above.
 - `/proc/mdstat` for the GT-8 inactive-all-spares state (see above).
 - `--detail --export` of an array with a faulty/spare member — member STATE
   therefore comes from `/proc/mdstat` flags, not from export keys.

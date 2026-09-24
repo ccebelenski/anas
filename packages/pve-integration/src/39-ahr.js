@@ -742,10 +742,15 @@
     function lvmHtml(d) {
         var vg = d.vg || {};
         var lv = d.lv || {};
+        // The VG's own size is NOT shown, and that is the point (GT-23,
+        // ahrcache.1): the pool VG carries the band arrays AND, on a cached
+        // pool, the cache slice — so `vg.sizeBytes` legitimately exceeds the
+        // pool by the size of the flash, and read as a pool figure it is
+        // simply wrong. Capacity comes from the LV the filesystem sits on,
+        // here and in the capacity block above, never from the VG.
         return '<div style="' + SEC + '">' + enc(t('Volume (LVM)')) + '</div>'
             + '<div style="font-size:12.5px;color:var(--anas-ink)">'
-            + enc(t('VG') + ' ' + (vg.name || '—') + ' — ' + fmtBytes(vg.sizeBytes)
-                + ', ' + fmtBytes(vg.freeBytes) + ' ' + t('free')
+            + enc(t('VG') + ' ' + (vg.name || '—')
                 + '  ·  ' + t('LV') + ' ' + (lv.name || '—') + ' — ' + fmtBytes(lv.sizeBytes))
             + '</div>';
     }

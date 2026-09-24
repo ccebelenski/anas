@@ -17,6 +17,7 @@ import { mdadmDetailExportArgs } from './parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS } from './parsers/mdstat.js'
 import { listSections, parseRcloneConf } from './parsers/rclone-conf.js'
 import { zfsListArgs, zfsSnapshotDetailArgs } from './parsers/zfs-list.js'
+import { ahrCacheRoutes } from './routes/ahr-cache.js'
 import { ahrExpansionRoutes } from './routes/ahr-expand.js'
 import { ahrMutationRoutes } from './routes/ahr-mutate.js'
 import { ahrSnapshotRoutes } from './routes/ahr-snapshots.js'
@@ -657,6 +658,10 @@ export function createServer(opts?: ServerOptions) {
   // AHR hot spares (story 11.11, AHR-DESIGN §11) — attach/remove, both
   // confirm-gated; md owns failover after attach.
   server.register(ahrSpareRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, diskIdentityCache, intentDir: ahrIntentDir })
+  // AHR read cache (story ahrcache.1, AHR-DESIGN §13) — lvmcache writethrough
+  // attach/detach. No confirm gate: nothing that holds an only copy is
+  // destroyed (writethrough never holds one).
+  server.register(ahrCacheRoutes, { prefix: '/v1', executor, jobQueue, diskIdentityCache, intentDir: ahrIntentDir })
   // AHR btrfs snapshots (story 11.12, AHR-DESIGN §12) — list/create/delete/
   // rollback over the @data/@snapshots subvolume layout; delete/rollback
   // confirm-gated. Refused on flat-layout pools (no migration verb).

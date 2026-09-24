@@ -1,0 +1,14 @@
+  {
+      "report": [
+          {
+              "lv": [
+                  {"lv_name":"gtcache-vol", "vg_name":"gtcache", "lv_attr":"Cwi-aoC-p-", "lv_size":"1065353216", "pool_lv":"[gtcache-cache_cvol]", "origin":"[gtcache-vol_corig]", "data_percent":"", "metadata_percent":"", "move_pv":"", "mirror_log":"", "copy_percent":"", "convert_lv":"", "cache_mode":"writethrough", "cache_policy":"smq", "cache_total_blocks":"0", "cache_used_blocks":"0", "cache_read_hits":"0", "cache_read_misses":"0", "cache_dirty_blocks":"0"}
+              ]
+          }
+      ]
+      ,
+      "log": [
+          {"log_seq_num":"1", "log_type":"warn", "log_context":"processing", "log_object_type":"vg", "log_object_name":"gtcache", "log_object_id":"wobKuf-t9NF-Mjn2-WR80-1hQe-4ivl-tKkdgW", "log_object_group":"", "log_object_group_id":"", "log_message":"WARNING: Couldn't find device with uuid zGDdd6-GDYU-1Xqu-M4FC-HQzu-7Zbs-vODYNe.", "log_errno":"0", "log_ret_code":"0"},
+          {"log_seq_num":"2", "log_type":"warn", "log_context":"processing", "log_object_type":"vg", "log_object_name":"gtcache", "log_object_id":"wobKuf-t9NF-Mjn2-WR80-1hQe-4ivl-tKkdgW", "log_object_group":"", "log_object_group_id":"", "log_message":"WARNING: VG gtcache is missing PV zGDdd6-GDYU-1Xqu-M4FC-HQzu-7Zbs-vODYNe (last written to /dev/sdd1).", "log_errno":"0", "log_ret_code":"0"}
+      ]
+  }

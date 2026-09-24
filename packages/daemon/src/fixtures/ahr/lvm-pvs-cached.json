@@ -1,0 +1,13 @@
+  {
+      "report": [
+          {
+              "pv": [
+                  {"pv_name":"/dev/md127", "vg_name":"gtcache", "pv_fmt":"lvm2", "pv_attr":"a--", "pv_size":"1065353216", "pv_free":"0", "dev_size":"1068433408"},
+                  {"pv_name":"/dev/sdd1", "vg_name":"gtcache", "pv_fmt":"lvm2", "pv_attr":"a--", "pv_size":"532676608", "pv_free":"0", "dev_size":"535805440"}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }

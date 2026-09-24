@@ -1,0 +1,12 @@
+  {
+      "report": [
+          {
+              "lv": [
+                  {"lv_name":"gtcache-vol", "vg_name":"gtcache", "lv_attr":"Cwi-aoC---", "lv_size":"1065353216", "pool_lv":"[gtcache-cache_cvol]", "origin":"[gtcache-vol_corig]", "data_percent":"12.95", "metadata_percent":"1.17", "move_pv":"", "mirror_log":"", "copy_percent":"0.00", "convert_lv":"", "cache_mode":"writethrough", "cache_policy":"smq", "cache_total_blocks":"8000", "cache_used_blocks":"1036", "cache_read_hits":"795", "cache_read_misses":"3585", "cache_dirty_blocks":"0"}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }

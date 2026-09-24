@@ -1,0 +1,1 @@
+0 2080768 cache 8 24/2048 128 8/8000 8 28 0 0 0 8 0 2 metadata2 writethrough 2 migration_threshold 2048 mq 10 random_threshold 0 sequential_threshold 0 discard_promote_adjustment 0 read_promote_adjustment 0 write_promote_adjustment 0 rw -

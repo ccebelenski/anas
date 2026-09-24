@@ -1,4 +1,4 @@
-import type { Disk, DiskHealthStatus, VdevRole, VdevState } from '@anas/shared'
+import type { AhrDiskRole, Disk, DiskHealthStatus, VdevRole, VdevState } from '@anas/shared'
 import type { FastifyInstance } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
@@ -72,14 +72,20 @@ interface AhrDiskInfo {
 
 /**
  * The `Disk.ahrArray` band label for one AHR member disk: a single-band disk
- * reads "r1", a disk spanning bands reads the range "r1-r3", and a hot spare
- * (which slices every band but carries no active membership) reads "spare".
+ * reads "r1", a disk spanning bands reads the range "r1-r3", a hot spare
+ * (which slices every band but carries no active membership) reads "spare",
+ * and a read-cache disk (story ahrcache.1, §13) reads "cache".
  * Bands are contiguous from the bottom up by AHR construction (§2.6), so a
  * first→last range is faithful.
+ *
+ * A cache disk carries ONE slice that backs no band, so it has no band range
+ * to render — but it is genuinely in use by the pool, and saying so is the
+ * whole point: before ahrcache.1 it read `other` with no pool at all (GT-22),
+ * which in the UI is an unrelated foreign disk.
  */
-export function ahrBandLabel(bands: number[], role: 'member' | 'spare'): string {
-  if (role === 'spare')
-    return 'spare'
+export function ahrBandLabel(bands: number[], role: AhrDiskRole): string {
+  if (role === 'spare' || role === 'cache')
+    return role
   const unique = [...new Set(bands)]
   if (unique.length === 0)
     return 'AHR'

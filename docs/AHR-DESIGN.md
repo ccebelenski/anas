@@ -564,8 +564,8 @@ only `umount` + `mount` restores writes. **Design calls:** the daemon uncaches
 AUTOMATICALLY on detection — unattended-safe by construction (dirty = 0) and it
 restores reads instantly — through an EVENT, never a poller: a udev rule on the
 cache disk's removal (the `anas-md-event.sh` pattern) calls the daemon, which reads
-`dmsetup status` (`cache Error` is the one honest health token — `lvs` counters go
-STALE, not absent, on a dead cache) and runs uncache → vgreduce → notification
+`dmsetup status` (the ONE honest health signal — `lvs` counters go STALE, not
+absent, on a dead cache) and runs uncache → vgreduce → notification
 ("cache device <id> failed; pool <p> running uncached"); the boot rung does the same
 at activation; every AHR status READ also reports the truth from `dmsetup status`
 (`cache: failed` ⇒ pool `degraded`, warning card) — today it reports `healthy` with
@@ -590,4 +590,18 @@ difference is shown, and its counters are gated on `dmsetup status` not reading
 `Error`. Policy wording: `lvs` is truth for mode/policy (`smq`; the "sequential I/O
 bypasses" note was an `mq` property and is dropped), `dmsetup status` is truth for
 health.
+
+**Built 2026-09-24 — slice 1** (shared `cache` block + `AttachAhrCacheRequest`,
+the two executor step kinds, `POST`/`DELETE /v1/ahr/:name/cache`, the
+`dmsetup status` health read on every AHR read, the `cache` disk role; live-proven
+on the stunt node, spec `tests/integration/ahr-cache-api.spec.ts`). Three
+refinements the build measured, all recorded in GROUND-TRUTH §18: the failure
+word is `Fail` as often as `Error`, so health is decided structurally (a real
+dm-cache status line opens with a digit) rather than by matching a word;
+`dmsetup status <name>` prints its target line without the `<name>: ` prefix the
+bare listing uses; and a LEFTOVER `<pool>-cache<n>` slice — what a
+died-and-returned cache device carries back — keeps its disk attributed to the
+pool, so both verbs accept it: attach reuses and re-wipes the slice, detach
+deletes it and hands the disk back. Slices 2 (the udev auto-uncache rung, the
+boot rung, Remount) and 3 (the UI) are the rest of the story.
 

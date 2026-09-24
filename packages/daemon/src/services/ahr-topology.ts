@@ -13,16 +13,19 @@ import type {
   DashboardWarning,
 } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { DmStatusLine } from '../parsers/dmsetup.js'
 import type { MdadmDetailExport } from '../parsers/mdadm-detail.js'
 import type { MdstatArray } from '../parsers/mdstat.js'
 import { AhrPool, AhrPoolBrief } from '@anas/shared'
 import { btrfsUsageArgs, parseBtrfsUsage } from '../parsers/btrfs-usage.js'
 import { parseDiskByIdListing, wholeDiskKernel } from '../parsers/disk-by-id.js'
+import { dmsetupStatusArgs, parseDmsetupStatus } from '../parsers/dmsetup.js'
 import { optionsReadOnly, parseFindmnt } from '../parsers/findmnt.js'
-import { lvIsActive, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
+import { lvIsActive, lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, parseVgsReport, PVS_ARGS, VGS_ARGS } from '../parsers/lvm-report.js'
 import { hasArray, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
+import { buildAhrCacheState, cacheFailedAdvisory } from './ahr-cache-state.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { readIntent } from './ahr-intent.js'
 import { AHR_MIN_DISKS, floorToGranularity, isPvUnderSized } from './ahr-layout.js'
@@ -58,6 +61,7 @@ const LVS = '/usr/sbin/lvs'
 const PVS = '/usr/sbin/pvs'
 const BTRFS = '/usr/bin/btrfs'
 const FINDMNT = '/usr/bin/findmnt'
+const DMSETUP = '/usr/sbin/dmsetup'
 
 const MIB = 1024 ** 2
 
@@ -661,8 +665,54 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     if (!lv)
       advisories.push(missingLvAdvisory(poolName))
 
-    // ---- Mount + btrfs ------------------------------------------------------
+    // ---- Read cache (§13, story ahrcache.1) ---------------------------------
+    // `dmsetup status` is asked ONLY when the LV is a cache target: on an
+    // uncached pool — every pool before this story — the read costs nothing.
+    // It is asked on EVERY read of a cached one, because `lvs` cannot tell a
+    // warm cache from a dead one: its counters go STALE rather than absent
+    // (GT-23), and the pool then reports healthy while serving EIO to every
+    // read (GT-19). dmsetup answers with one token.
     const lvName = lv?.name ?? `${poolName}-vol`
+    let dmStatus: DmStatusLine | null = null
+    if (lv && lvIsCacheTarget(lv.attr)) {
+      const res = await executor.exec(DMSETUP, dmsetupStatusArgs(dmName(poolName, lvName)))
+      if (res.exitCode === 0)
+        dmStatus = parseDmsetupStatus(res.stdout)
+    }
+    const cacheFacts = buildAhrCacheState({
+      poolName,
+      lv,
+      pvs,
+      bandCount: arrayEntries.length,
+      partsByKernel: lsblk.partsByKernel,
+      byIdMap,
+      dmStatus,
+    })
+    // The cache disks join the pool's disk set with role 'cache'. That single
+    // fact is what /v1/disks reads to attribute the disk to this pool (GT-22:
+    // it reported `other`, unattributed) and what puts the slice on destroy's
+    // wipe list. `partitions: []` is deliberate — the slice backs no band, and
+    // every band-math consumer here filters on role 'member' anyway.
+    for (const cacheId of cacheFacts.diskIds) {
+      const kernel = [...byIdMap.entries()].find(([, id]) => id === cacheId)?.[0]
+      const info = kernel !== undefined
+        ? [...lsblk.partsByKernel.values()].find(p => p.disk.name === kernel)?.disk
+        : undefined
+      const sizeBytes = info?.size ?? 0
+      disks.push({
+        id: cacheId,
+        sizeBytes,
+        usableBytes: floorToGranularity(sizeBytes),
+        model: info?.model ?? null,
+        serial: info?.serial ?? null,
+        role: 'cache',
+        partitions: [],
+      })
+    }
+    if (cacheFacts.cache.state === 'failed')
+      advisories.push(cacheFailedAdvisory(poolName))
+
+    // ---- Mount + btrfs ------------------------------------------------------
     const mapperPath = `/dev/mapper/${dmName(poolName, lvName)}`
     // findmnt appends the mounted subvolume to a btrfs source
     // (`…-vol[/@data]`) — an exact `source === mapperPath` match MISSES every
@@ -768,7 +818,11 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     // for `offline`, which is decided below and outranks degraded outright. The
     // two tests read the same `md.active` flag, so a band that cannot start can
     // never fall between them and go unbadged.
-    const anyDegraded = arrays.some(a => a.state === 'degraded')
+    // A FAILED cache degrades the pool (§13's ruling). The bands are intact and
+    // every byte is still there — writethrough never held an only copy — so
+    // this is emphatically not `failed` or `offline`, which describe data that
+    // is missing. One `lvconvert --uncache` restores full service.
+    const anyDegraded = arrays.some(a => a.state === 'degraded') || cacheFacts.cache.state === 'failed'
     const anyReshape = arrayEntries.some(e => e.mdstat.sync?.action === 'reshape')
     const anySync = arrayEntries.some(e => e.mdstat.sync?.action === 'resync' || e.mdstat.sync?.action === 'recovery')
     const anyCheck = arrayEntries.some(e => e.mdstat.sync?.action === 'check')
@@ -857,6 +911,7 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
       capacity,
       state,
       subvolLayout,
+      cache: cacheFacts.cache,
       advisories,
     }))
   }
@@ -967,8 +1022,20 @@ export function buildAhrWarnings(pools: AhrPool[]): DashboardWarning[] {
       level = 'critical'
       clauses.push('is mounted READ-ONLY — btrfs is protecting itself; diagnose before any remount')
     }
-    else if (pool.state === 'degraded') {
+    else if (pool.state === 'degraded' && pool.arrays.some(a => a.state === 'degraded')) {
       clauses.push(`is degraded — ${degradedDetail(pool)}; replace the failed disk before a second failure`)
+    }
+    // A failed read cache (§13, ahrcache.1) cards on its own, whether or not a
+    // band is also degraded. CRITICAL, unlike the degraded-band card, because
+    // the consequence is different in kind: a degraded band still serves every
+    // read, while a dead cache device makes EVERY read on the pool fail with
+    // EIO — dm-cache does not fall through to the origin (GT-19). The pool's
+    // BADGE stays `degraded` (§13's ruling: the data is all there and one
+    // command restores service), which is why this is its own clause and not a
+    // re-use of the degraded one.
+    if (pool.cache?.state === 'failed') {
+      level = 'critical'
+      clauses.push(`has a FAILED read cache — every read returns an I/O error until the cache is detached; no data is lost (writethrough holds no only copy)`)
     }
     if (pool.expansion?.state === 'halted')
       clauses.push('has a HALTED expansion — Resume (recompute-and-continue) or Abandon it in the Hybrid RAID view')

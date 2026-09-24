@@ -109,8 +109,17 @@ export const AhrMemberState = z.enum([
 ])
 export type AhrMemberState = z.infer<typeof AhrMemberState>
 
-/** A disk's role in the pool. */
-export const AhrDiskRole = z.enum(['member', 'spare'])
+/**
+ * A disk's role in the pool.
+ *
+ * `cache` is the lvmcache read-cache disk (§13): it carries ONE GPT slice that
+ * is a PV of the pool VG, it is never an md member, and it holds no only-copy
+ * of anything. It is listed here so the pool owns its whole disk set — the
+ * /v1/disks inventory attributes the disk to this pool from exactly this role
+ * (GT-22: before ahrcache.1 it read `other`, unattributed), and destroy's wipe
+ * list sweeps it with the members.
+ */
+export const AhrDiskRole = z.enum(['member', 'spare', 'cache'])
 export type AhrDiskRole = z.infer<typeof AhrDiskRole>
 
 /** What a running md sync thread is doing (from /proc/mdstat + --detail). */
@@ -148,7 +157,12 @@ export const AhrDisk = z.object({
   serial: z.string().nullable(),
   /** Role in the pool. */
   role: AhrDiskRole,
-  /** Band slices carved on this disk (unused top capacity has no slice). */
+  /**
+   * BAND slices carved on this disk (unused top capacity has no slice). A
+   * `cache` disk reports `[]` — its one slice backs no band, and describing it
+   * as a band slice would be a lie the whole band-math stack reads. The cache
+   * slice is reported once, in {@link AhrCache}, where its size belongs.
+   */
   partitions: z.array(AhrDiskPartition),
 })
 export type AhrDisk = z.infer<typeof AhrDisk>
@@ -276,6 +290,94 @@ export const AhrExpansionIntent = z.object({
 })
 export type AhrExpansionIntent = z.infer<typeof AhrExpansionIntent>
 
+// ---- Read cache (story ahrcache.1, §13) -------------------------------------
+
+/**
+ * The pool's read-cache health — read from `dmsetup status` on EVERY AHR read,
+ * never from `lvs`.
+ *
+ * `lvs` keeps reporting the last counters it read after the cache device dies
+ * (GT-23: stale, not absent), and a pool that cannot serve a single byte then
+ * presents as a warm, healthy cache. `dmsetup status` answers with one token —
+ * `cache Error` (GT-19) — and that is the only honest health signal there is.
+ * `lvs` stays the source of truth for MODE and POLICY, which do not rot.
+ *
+ * `absent` means the pool LV is not a cache target: no cache was ever attached,
+ * one was detached, or a failed one was uncached.
+ */
+export const AhrCacheState = z.enum(['healthy', 'failed', 'absent'])
+export type AhrCacheState = z.infer<typeof AhrCacheState>
+
+/**
+ * The read cache in front of an AHR pool (§13, GitHub #63) — lvmcache in
+ * **writethrough** mode over one GPT slice per cache disk, linear across them.
+ *
+ * Writethrough is the whole safety story and it is not configurable: every
+ * write lands on the pool before it is acknowledged, so the cache never holds
+ * the only copy of anything and `cache_dirty_blocks` is zero by construction.
+ * Losing the cache device loses no data — it costs reads until the cache is
+ * dropped. Writeback and `--type writecache` are not exposed (EPICS §2 ruling).
+ *
+ * The COUNTERS are present only while `state === 'healthy'`. They are omitted
+ * outright on a failed or absent cache rather than reported as zeros or as the
+ * last values `lvs` happens to remember — a stale number presented as live is
+ * the failure GT-23 caught.
+ */
+export const AhrCache = z.object({
+  /**
+   * The cache disks by-id, in VG order. Empty when the cache device is GONE
+   * (a failed cache whose PV reads `[unknown]`) — the id cannot be recovered
+   * from a disk that is not there, and inventing one would be worse than
+   * saying nothing.
+   */
+  devices: z.array(DiskId),
+  /**
+   * Flash dedicated to the cache, in bytes: the sum of the cache PVs' sizes.
+   * Read from the PVs rather than from the cache LV because a PV reports its
+   * size even when its device is missing, so the figure survives a failure.
+   */
+  sizeBytes: z.number().int().nonnegative(),
+  /** Always `writethrough` — the only mode ANAS attaches (§13 ruling). */
+  mode: z.literal('writethrough'),
+  /**
+   * dm-cache replacement policy as `lvs` reports it (the kernel default is
+   * `smq`). Read, never chosen: ANAS passes no policy to `lvconvert`.
+   * `dmsetup table` renders smq as `mq` — the kernel module registers under
+   * both names — so `lvs` is the value to present.
+   */
+  policy: z.string(),
+  state: AhrCacheState,
+  /** Reads served from flash since the cache was attached. Healthy only. */
+  hits: z.number().int().nonnegative().optional(),
+  /** Reads that missed the cache. Healthy only. */
+  misses: z.number().int().nonnegative().optional(),
+  /** Cache blocks holding data. Healthy only. */
+  usedBlocks: z.number().int().nonnegative().optional(),
+  /** Cache blocks in total. Healthy only. */
+  totalBlocks: z.number().int().nonnegative().optional(),
+  /**
+   * Dirty cache blocks. Zero by construction in writethrough — a non-zero
+   * value is a bug, not a state the UI should normalize. Healthy only.
+   */
+  dirtyBlocks: z.number().int().nonnegative().optional(),
+})
+export type AhrCache = z.infer<typeof AhrCache>
+
+/**
+ * POST /v1/ahr/:name/cache request body — attach a read cache over the named
+ * disks (one GPT slice each, linear across them).
+ *
+ * NOT confirm-gated: nothing that holds an only copy is destroyed. The disks
+ * must be inventory-'available' (the shared composable-disk predicate), which
+ * already means they carry no data ANAS can see. A ROTATING disk is legal —
+ * the response advises once that it adds a seek rather than speed, and does
+ * not argue further.
+ */
+export const AttachAhrCacheRequest = z.object({
+  disks: z.array(DiskId).min(1),
+})
+export type AttachAhrCacheRequest = z.infer<typeof AttachAhrCacheRequest>
+
 /** An AHR pool (GET /v1/ahr/:name — the full §3 structure). */
 export const AhrPool = z.object({
   /** Pool name — also the VG name and the md-name prefix. */
@@ -315,6 +417,14 @@ export const AhrPool = z.object({
    * reports `false`.
    */
   subvolLayout: z.boolean(),
+  /**
+   * The read cache (§13). Always present on a live read — `state: 'absent'`
+   * with no devices when the pool has none. Optional in the SCHEMA for the
+   * version-skew ruling: a daemon that predates ahrcache.1 omits it, and a
+   * consumer that sees no field must read "this daemon cannot tell me", never
+   * "there is no cache".
+   */
+  cache: AhrCache.optional(),
   /** Operator advisories (unlock hints, degraded-band guidance, …). */
   advisories: z.array(z.string()),
   /**
