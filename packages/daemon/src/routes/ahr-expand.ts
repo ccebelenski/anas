@@ -178,11 +178,15 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
    */
   function gainFor(pool: AhrPool, bundle: PlanBundle, replace?: AhrReplacePair) {
     return expansionGain({
-      before: bundle.before,
+      // Planner-vs-planner (§5.2): the live volume can lag its own band math
+      // after an abandoned expansion, and that owed growth is not this plan's.
+      beforeUsableBytes: bundle.beforeUsableBytes,
       after: bundle.after,
       bands: bundle.plan.preview.bands,
       warnings: bundle.plan.preview.warnings,
       tier: pool.ahrType,
+      stepCount: bundle.plan.steps.length,
+      introducedDiskIds: bundle.introducedDiskIds,
       replaced: replace,
     })
   }
@@ -425,17 +429,17 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     const { bundle, approvedIds } = prepared
 
     const bands = pool.arrays.filter(a => a.members.some(m => m.disk === replace.oldDiskId)).map(a => a.band)
-    // ahrexpand.1 — the guided replace is where the honest zero-gain case
-    // lives (a failing disk swapped for one of the same size): same guiding
-    // 409, same confirm bypass.
+    // ahrexpand.1 — the guided replace is a REPAIR verb, so it keeps its own
+    // headline: swapping a failing disk for one of the same size is the point,
+    // not a mistake. The zero-gain fact is stated ONCE, as a warning, and the
+    // headline swap stays on ahr.expand where growth IS the intent.
     const zeroGain = gainFor(pool, bundle, replace).zeroGain
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'ahr.replace',
       params: { pool: pool.name, oldDiskId: replace.oldDiskId, newDiskId: replace.newDiskId },
-      message: zeroGain
-        ? zeroGain.shortfall
-        : `Replacing disk '${replace.oldDiskId}' in pool '${pool.name}'`,
+      message: `Replacing disk '${replace.oldDiskId}' in pool '${pool.name}'`,
       warnings: [
+        ...(zeroGain ? [zeroGain.shortfall] : []),
         `Every band of ${replace.oldDiskId} (band${bands.length === 1 ? '' : 's'} ${bands.join(', ')}) is copied onto ${replace.newDiskId} at rebuild speed — hours on large disks. The pool stays online and fully redundant throughout (live copy via mdadm --replace).`,
         'Do NOT remove either disk until the replace completes.',
         ...expansionWarnings(bundle),

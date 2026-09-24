@@ -7,7 +7,7 @@ import { isComposableDisk } from '@anas/shared'
 import { collectDisks } from '../routes/disks.js'
 import { executeExpansion, executeReplace, projectExistingBands, pvCatchUpSteps, syncCompletionSteps, syncingAhrBands, underSizedPvBands } from './ahr-expand-exec.js'
 import { AhrIntentConflictError, writeIntent } from './ahr-intent.js'
-import { AhrPlanError, planExpansion } from './ahr-layout.js'
+import { AhrPlanError, existingLayoutUsableBytes, planExpansion } from './ahr-layout.js'
 import { spareCoverageWarnings } from './ahr-spare.js'
 import { kernelInfo } from './kernel-version.js'
 
@@ -34,6 +34,14 @@ export interface PlanBundle {
   plan: AhrExpansionPlan
   before: AhrCapacity
   after: AhrCapacity
+  /**
+   * Band math of the CURRENT layout — the `before` side of the ahrexpand.1
+   * gain guard. `before.usableBytes` above is the LIVE volume, which is what
+   * the wizard shows; it is NOT what a plan is measured against (§5.2).
+   */
+  beforeUsableBytes: number
+  /** Disk ids this plan brings INTO the pool (additions + the replacement). */
+  introducedDiskIds: string[]
 }
 
 /**
@@ -114,7 +122,18 @@ export function computePlan(pool: AhrPool, approved: AhrLayoutDisk[], replaced: 
     usedBytes: before.usedBytes,
     freeBytes: Math.max(0, plan.preview.capacity.usableBytes - before.usedBytes),
   }
-  return { plan, before, after }
+  // A disk is INTRODUCED when no existing band already counts it as a member —
+  // the replacement and every added disk, and nothing else. The zero-gain
+  // guard uses it to keep an unrelated member's stranded sliver from becoming
+  // this plan's refusal headline (ahrexpand.1).
+  const members = new Set(existingBands.flatMap(b => b.members))
+  return {
+    plan,
+    before,
+    after,
+    beforeUsableBytes: existingLayoutUsableBytes(existingBands, pool.ahrType),
+    introducedDiskIds: approved.filter(d => !members.has(d.id)).map(d => d.id),
+  }
 }
 
 /**

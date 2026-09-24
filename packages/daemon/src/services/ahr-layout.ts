@@ -546,10 +546,19 @@ export function planExpansion(input: {
   }
 
   // --- New bands: strictly ABOVE the current top array boundary -------------
-  const topBoundary = existing.at(-1)!.endBytes
-  let nextBand = existing.at(-1)!.band + 1
+  const topExisting = existing.at(-1)
+  if (!topExisting)
+    throw new AhrPlanError('expansion requires at least one existing band array — fresh creation uses planFreshLayout')
+  const topBoundary = topExisting.endBytes
+  let nextBand = topExisting.band + 1
   let pendingBytes = 0
   let createdCount = 0
+  /**
+   * Bands that are physically present but locked (§5.2). Their sentence is
+   * composed AFTER the band loop, because the unlock gain is computed against
+   * the COMPLETE band list.
+   */
+  const pendingRegions: { rawBytes: number, band: AhrPreviewBand }[] = []
   for (const region of bandRegionsAbove(approved, topBoundary)) {
     const band = nextBand++
     const memberCount = region.members.length
@@ -571,18 +580,7 @@ export function planExpansion(input: {
       pvSteps.push({ kind: 'pv-create', target: mdName(band), status: 'pending' })
       createdCount++
     }
-    else {
-      // Physically present but locked (§5.2): report it as pending, with the
-      // concrete unlock condition — never as silent missing capacity.
-      const bandRaw = heightBytes * memberCount
-      pendingBytes += bandRaw
-      const needed = MIN_BAND_MEMBERS[tier] - memberCount
-      warnings.push(
-        `${fmtBytes(bandRaw)} of new capacity is pending — no new usable space until `
-        + `${needed} more disk${needed === 1 ? '' : 's'} of ≥${fmtBytes(region.endBytes)} ${needed === 1 ? 'is' : 'are'} added`,
-      )
-    }
-    bands.push({
+    const entry: AhrPreviewBand = {
       band,
       range: { startBytes: region.startBytes, endBytes: region.endBytes },
       memberCount,
@@ -590,9 +588,26 @@ export function planExpansion(input: {
       heightBytes,
       usableBytes: level === null ? 0 : heightBytes * (memberCount - PARITY_DISKS[tier]),
       protected: level !== null,
-    })
+    }
+    bands.push(entry)
+    if (level === null) {
+      // Physically present but locked (§5.2): pending, never silent missing
+      // capacity. The sentence itself waits for the full band list.
+      const bandRaw = heightBytes * memberCount
+      pendingBytes += bandRaw
+      pendingRegions.push({ rawBytes: bandRaw, band: entry })
+    }
     bandMembers.push({ band, protectedBand: level !== null, members: region.members })
   }
+
+  // --- Pending capacity (§5.2): ONE sentence, said once ---------------------
+  // The shortfall AND the unlock in a single line, composed here because the
+  // unlock gain needs the complete band list. {@link expansionGain} lifts this
+  // very line verbatim into its zero-gain refusal, so the plan preview and the
+  // 409 can never state different counts (single source of truth).
+  const unlockMode: AhrUnlockMode = replaced ? 'replace' : 'add'
+  for (const region of pendingRegions)
+    warnings.push(pendingCapacityWarning(region.rawBytes, pendingBandUnlock(bands, tier, region.band, unlockMode)))
 
   // --- Mixed sector geometries (issue #8) — the SAME label create shows ----
   // Parallel construction: an expansion that introduces a 4Kn disk into a 512e
@@ -607,14 +622,18 @@ export function planExpansion(input: {
   // (e.g. an approved 2.5 TB disk against existing 2/3 TB boundaries: the
   // 2–2.5 slice can never join the 2–3 band). Labeled, never silently dropped.
   const bandEnds = bands.map(b => b.range.endBytes)
+  const lowestBoundary = Math.min(...bandEnds)
   for (const d of approved) {
     if (d.roundedBytes > 0 && !bandEnds.includes(d.roundedBytes)) {
       const covered = Math.max(0, ...bandEnds.filter(e => e <= d.roundedBytes))
-      const stranded = d.roundedBytes - covered
-      warnings.push(
-        `disk '${d.id}': ${fmtBytes(stranded)} is stranded above the ${fmtBytes(covered)} boundary — `
-        + `existing band boundaries are immutable, so this capacity cannot be used`,
-      )
+      // A disk that reaches NO boundary is not "stranded above 0 GiB" — it is
+      // simply too small for the pool, and the sentence says that instead of
+      // naming a boundary that does not exist.
+      warnings.push(covered === 0
+        ? `disk '${d.id}': none of its ${fmtBytes(d.roundedBytes)} can be used — it does not reach the pool's lowest `
+        + `band boundary at ${fmtBytes(lowestBoundary)}, and existing band boundaries are immutable`
+        : `disk '${d.id}': ${fmtBytes(d.roundedBytes - covered)} is stranded above the ${fmtBytes(covered)} boundary — `
+          + `existing band boundaries are immutable, so this capacity cannot be used`)
     }
   }
 
@@ -652,13 +671,106 @@ export function planExpansion(input: {
 
 // ---- Usable-capacity delta of a plan (ahrexpand.1, §5.2) -------------------
 
+/**
+ * How pending capacity gets unlocked — and therefore how much it delivers.
+ *
+ * A bay-limited operator REPLACES a member with a bigger disk (the §5.2
+ * headline case): the member count of every band that disk already served is
+ * unchanged, so only the bands ABOVE the current top array boundary can form
+ * or grow. An operator with a free bay ADDS a disk, and then every band it
+ * reaches gains a member. The plan's own shape picks the model, so the
+ * sentence always describes the move the operator is already making.
+ */
+export type AhrUnlockMode = 'replace' | 'add'
+
+/** What a band still owes before it delivers, and what meeting it delivers. */
+export interface AhrPendingUnlock {
+  /** Disks still missing before the band can hold a protected array. */
+  count: number
+  /** The size each of those disks must reach — a band's top boundary. */
+  sizeBytes: number
+  /** Usable bytes they deliver, at the planner's own per-band math. */
+  gainBytes: number
+  /** Whether they arrive as replacements or as additions. */
+  mode: AhrUnlockMode
+}
+
+/** Opening words of the pending-capacity warning — the line the guard lifts. */
+const PENDING_CAPACITY_MARK = 'of new capacity is pending'
+
+/**
+ * The usable capacity `count` more disks of `sizeBytes` would deliver against
+ * a plan's resulting layout, at the planner's own per-band math:
+ *
+ *  - a PENDING band they reach delivers its protected math once the member
+ *    count crosses the tier's minimum, else nothing (still locked);
+ *  - a PROTECTED band they reach gains one height per ADDED disk — and
+ *    nothing at all under `replace`, because a replacement swaps one member
+ *    for a bigger one and leaves the member count where it was.
+ */
+function unlockAt(bands: AhrPreviewBand[], tier: AhrType, sizeBytes: number, count: number, mode: AhrUnlockMode): AhrPendingUnlock {
+  let gainBytes = 0
+  for (const b of bands) {
+    if (b.range.endBytes > sizeBytes)
+      continue
+    if (b.protected) {
+      if (mode === 'add')
+        gainBytes += b.heightBytes * count
+      continue
+    }
+    const members = b.memberCount + count
+    if (levelFor(tier, members) !== null)
+      gainBytes += b.heightBytes * (members - PARITY_DISKS[tier])
+  }
+  return { count, sizeBytes, gainBytes, mode }
+}
+
+/**
+ * What one PENDING band still owes: the disks it is short of the tier's
+ * minimum, each reaching that band's own top boundary. On AHR-2 that is three
+ * disks, not one — the count the planner's sentence and the zero-gain refusal
+ * both quote, from here.
+ */
+export function pendingBandUnlock(bands: AhrPreviewBand[], tier: AhrType, band: AhrPreviewBand, mode: AhrUnlockMode): AhrPendingUnlock {
+  return unlockAt(bands, tier, band.range.endBytes, Math.max(1, MIN_BAND_MEMBERS[tier] - band.memberCount), mode)
+}
+
+/**
+ * The §5.2 pending-capacity sentence: what is locked and what unlocks it, in
+ * ONE line. Emitted by the planner as a plan warning and lifted verbatim by
+ * {@link expansionGain}, so the preview and the refusal never disagree.
+ */
+export function pendingCapacityWarning(pendingRawBytes: number, unlock: AhrPendingUnlock): string {
+  return `${fmtBytes(pendingRawBytes)} ${PENDING_CAPACITY_MARK} — ${unlockClause(unlock)}`
+}
+
+/** "replace one more disk with ≥8 TiB to unlock ~4 TiB". */
+function unlockClause(unlock: AhrPendingUnlock): string {
+  const disks = unlock.count === 1 ? 'one more disk' : `${unlock.count} more disks`
+  return unlock.mode === 'replace'
+    ? `replace ${disks} with ≥${fmtBytes(unlock.sizeBytes)} to unlock ~${fmtBytes(unlock.gainBytes)}`
+    : `add ${disks} of ≥${fmtBytes(unlock.sizeBytes)} to unlock ~${fmtBytes(unlock.gainBytes)}`
+}
+
+/**
+ * Usable bytes of an EXISTING layout by the planner's own band math — the
+ * `before` side of a plan's gain (ahrexpand.1).
+ *
+ * Deliberately NOT the pool's live capacity. A pool whose arrays grew but
+ * whose `pvresize`/`lvextend` never ran (the abandoned expansion of §5.3 /
+ * issue #13) has a volume smaller than its band math, and measuring a NEW
+ * plan against that volume credits the new plan with the OLD expansion's
+ * growth — enough to sail a zero-step plan past the zero-gain guard.
+ * Planner-vs-planner closes that: both sides are band math over
+ * granularity-floored sizes, so the comparison is exact and needs no margin.
+ */
+export function existingLayoutUsableBytes(bands: ExistingBand[], tier: AhrType): number {
+  return bands.reduce((sum, b) => sum + (b.endBytes - b.startBytes) * (b.members.length - PARITY_DISKS[tier]), 0)
+}
+
 /** The usable-capacity delta a plan actually delivers, plus the zero-gain detail. */
 export interface AhrExpansionGain {
-  /**
-   * Usable bytes the plan adds — 0 when it adds none. The raw before → after
-   * delta below the overhead noise floor is reported as 0: that sliver is the
-   * live volume catching up to band math it already had, not new capacity.
-   */
+  /** Usable bytes the plan adds — 0 when it adds none (see `zeroGain`). */
   usableGain: number
   /** Present exactly when `usableGain` is 0: the shortfall and what unlocks it. */
   zeroGain: AhrExpansionZeroGain | null
@@ -668,85 +780,93 @@ export interface AhrExpansionGain {
  * The usable capacity a plan's reachable target actually adds (ahrexpand.1,
  * AHR-DESIGN §5.2) — the guard behind the zero-gain refusal.
  *
- * The delta reuses the planner's own numbers (`before`/`after`, §2.3
- * reachable target) — never re-derived. It is STRUCTURAL, never a bare zero:
- * a fully delivered pool's live volume sits a sliver below its band math
- * (LVM metadata + PV rounding — the same noise {@link PV_UNDERSIZE_MARGIN_BYTES}
- * exists for), so a plan that adds nothing reads as a sub-GiB "gain". Sub-GiB
- * never matters for capacity accounting (§5.3: thresholds must be structural,
- * not zero); a real gain is band-height scale, at least one granularity.
+ * TWO rules keep the delta honest, and both exist because a real pool caught
+ * the naive version out:
  *
- * The zero-gain detail is derived from the plan's resulting bands, never
- * hard-coded: the top boundary is the smallest size at which one more disk
- * would grow or form a band (`unlockSize`), and `unlockGain` is what that one
- * disk would actually deliver at the planner's own per-band math.
+ *  - **Planner-vs-planner.** `before` is the band math of the CURRENT layout
+ *    ({@link existingLayoutUsableBytes}), never the live volume. After an
+ *    abandoned expansion whose arrays grew but whose `pvresize`/`lvextend`
+ *    never ran, the live volume lags its own band math — and measuring a new
+ *    plan against it hands that old, owed growth to the new plan. Both sides
+ *    being band math also makes the comparison EXACT: no noise floor, no
+ *    margin, because both are multiples of the layout granularity.
+ *  - **No steps, no gain.** A plan that names no work delivers nothing by
+ *    construction, whatever the arithmetic says.
+ *
+ * The zero-gain detail is derived from the plan's own bands and warnings,
+ * never re-composed: a pending band's line is the planner's, lifted verbatim,
+ * so the preview and the 409 can never quote different counts.
  */
 export function expansionGain(input: {
-  /** The plan's `before` capacity (the pool's live capacity). */
-  before: AhrCapacity
+  /** Band math of the CURRENT layout — {@link existingLayoutUsableBytes}. */
+  beforeUsableBytes: number
   /** The plan's `after` capacity (the §2.3 reachable target). */
   after: AhrCapacity
   /** The plan's resulting bands (ascending band index). */
   bands: AhrPreviewBand[]
-  /** The plan's warnings — the stranded-capacity clause is lifted from the planner's own line. */
+  /** The plan's warnings — the pending and stranded causes are lifted from them. */
   warnings: string[]
   tier: AhrType
+  /** How many steps the plan names: none ⇒ it delivers nothing. */
+  stepCount: number
+  /** Disk ids this plan brings INTO the pool (additions + the replacement). */
+  introducedDiskIds?: string[]
   /** The declared substitution, when the plan is a replace. */
   replaced?: AhrReplacement
 }): AhrExpansionGain {
-  const { before, after, bands, warnings, tier, replaced } = input
-  const rawDelta = after.usableBytes - before.usableBytes
-  const usableGain = rawDelta >= PV_UNDERSIZE_MARGIN_BYTES ? Math.max(0, rawDelta) : 0
+  const { beforeUsableBytes, after, bands, warnings, tier, stepCount, replaced } = input
+  const introduced = input.introducedDiskIds ?? []
+  const usableGain = stepCount === 0 ? 0 : Math.max(0, after.usableBytes - beforeUsableBytes)
   if (usableGain > 0)
     return { usableGain, zeroGain: null }
 
-  // Zero gain (§5.2): name the shortfall and what unlocks it — the pending
-  // capacity is physically present, and saying so concretely is the whole
-  // point of the refusal.
-  const top = bands.at(-1)!
-  const unlockSize = top.range.endBytes
-  const unlockGain = gainFromAdditionalDisk(bands, tier, unlockSize)
-  // A pending band is never an existing one (existing bands ARE arrays), so
-  // its disk is one this plan brings in or one that has always sat there —
-  // the clause names the shape, never claims novelty.
-  const pending = top.level === null ? top : null
-  const cause = pending
-    ? pending.memberCount === 1
-      ? `the ${fmtBytes(pending.range.endBytes)} disk above the ${fmtBytes(pending.range.startBytes)} band sits alone`
-      : `the band ${fmtBytes(pending.range.startBytes)}–${fmtBytes(pending.range.endBytes)} has ${pending.memberCount} of the ${MIN_BAND_MEMBERS[tier]} disks a protected array needs`
-    : warnings.find(w => w.includes('is stranded above'))
-      ?? (replaced
-        ? 'the replacement only inherits the bands its predecessor already served'
-        : 'no disk in this plan reaches a band the planner can use')
-  const shortfall = `This plan adds no usable capacity: ${cause}; `
-    + `add one more disk of ≥ ${fmtBytes(unlockSize)} to unlock ~${fmtBytes(unlockGain)}`
-  return { usableGain, zeroGain: { shortfall, unlockSize, unlockGain } }
-}
+  const top = bands.at(-1)
+  if (!top)
+    throw new AhrPlanError('cannot measure the usable gain of a plan with no bands')
+  // The unlock is modelled the way the plan is shaped (§5.2): a replace is
+  // unlocked by another replace, an addition by another addition.
+  const mode: AhrUnlockMode = replaced ? 'replace' : 'add'
 
-/**
- * The usable-capacity delta ONE additional disk of `sizeBytes` would deliver
- * against the plan's resulting layout — the planner's per-band math applied
- * to a one-disk growth:
- *
- *  - every protected band the disk reaches gains exactly its height (raid5/6
- *    add a data disk; the ahr1 raid1×2 → raid5×3 convert gains the same
- *    height, h×1 → h×2);
- *  - a pending band it reaches delivers its protected math once the member
- *    count crosses the tier's minimum, else nothing (still locked).
- */
-function gainFromAdditionalDisk(bands: AhrPreviewBand[], tier: AhrType, sizeBytes: number): number {
-  let gain = 0
-  for (const b of bands) {
-    if (b.range.endBytes > sizeBytes)
-      continue
-    if (b.protected) {
-      gain += b.heightBytes
-    }
-    else {
-      const members = b.memberCount + 1
-      if (levelFor(tier, members) !== null)
-        gain += b.heightBytes * (members - PARITY_DISKS[tier])
+  // Zero gain with pending capacity (§5.2) — the planner already said the
+  // whole thing in one line (how much is locked, how many more disks of what
+  // size, and what they unlock). Lift it; never compose a second sentence.
+  const pendingBand = bands.find(b => b.level === null)
+  if (pendingBand) {
+    const unlock = pendingBandUnlock(bands, tier, pendingBand, mode)
+    const cause = warnings.find(w => w.includes(PENDING_CAPACITY_MARK))
+      ?? pendingCapacityWarning(pendingBand.heightBytes * pendingBand.memberCount, unlock)
+    return {
+      usableGain,
+      zeroGain: { shortfall: `This plan adds no usable capacity: ${cause}`, unlockSize: unlock.sizeBytes, unlockGain: unlock.gainBytes },
     }
   }
-  return gain
+
+  // No pending band: the cause is the plan's own shape. A same-size
+  // replacement is checked FIRST — a stranded sliver on some unrelated,
+  // pre-existing member is not what this plan did, so only a line naming a
+  // disk this plan INTRODUCES can be the headline.
+  const strandedHere = warnings.find(w => introduced.some(id => w.startsWith(`disk '${id}':`)))
+  const cause = replaced && !strandedHere
+    ? 'the replacement only inherits the bands its predecessor already served'
+    : strandedHere ?? 'no disk in this plan reaches a band the planner can use'
+  // The smallest boundary at which one more disk starts delivering — nothing
+  // between boundaries can help, they are immutable (§2.3). When no boundary
+  // delivers (a same-size replace), the top one is still the size a
+  // replacement must at least reach, and the clause is simply not said.
+  const unlock = firstDeliveringUnlock(bands, tier, mode) ?? unlockAt(bands, tier, top.range.endBytes, 1, mode)
+  const shortfall = `This plan adds no usable capacity: ${cause}${
+    unlock.gainBytes > 0 ? `; ${unlockClause(unlock)}` : ''}`
+  return { usableGain, zeroGain: { shortfall, unlockSize: unlock.sizeBytes, unlockGain: unlock.gainBytes } }
+}
+
+/** The lowest band boundary at which more disks would deliver anything. */
+function firstDeliveringUnlock(bands: AhrPreviewBand[], tier: AhrType, mode: AhrUnlockMode): AhrPendingUnlock | null {
+  for (const b of bands) {
+    const unlock = b.protected
+      ? unlockAt(bands, tier, b.range.endBytes, 1, mode)
+      : pendingBandUnlock(bands, tier, b, mode)
+    if (unlock.gainBytes > 0)
+      return unlock
+  }
+  return null
 }

@@ -11613,9 +11613,69 @@ warnings.length = 0
 created.windows.length = 0
 await vdevSplitReplaceChecks()
 
+/**
+ * ahrexpand.1 — the expansion wizard's capacity "Change" row.
+ *
+ * The row used to compute its own `after − before`, which compares the plan's
+ * band math to the LIVE volume: on the §5.2 zero-gain shape that reads as a
+ * few MiB of growth, and the operator clicked Execute into a 409 that said the
+ * opposite. The row now reads the daemon's `usableGain`, renders a zero as
+ * words, and shows the `zeroGain` sentence BEFORE Execute — while an older
+ * daemon that sends neither field keeps the old subtraction (version skew:
+ * a missing field never means a different meaning).
+ */
+function expandGainRowChecks() {
+  const ANAS = loadSources(['15-gfx.js', '39-ahr-composer.js', '39-ahr.js'], {})
+  const render = plan => ANAS.ahr.planLiveHtml(plan, [])
+  const cap = usableBytes => ({
+    rawBytes: usableBytes, usableBytes, usedBytes: 0, freeBytes: usableBytes,
+    redundancyOverheadBytes: 0, unprotectedWastedBytes: 0, pendingBytes: 0,
+  })
+  ok('expand gain: the wizard exposes its plan panel', typeof ANAS.ahr.planLiveHtml === 'function')
+  if (typeof ANAS.ahr.planLiveHtml !== 'function') { return }
+
+  // (1) Positive gain: the daemon's number, not a local subtraction.
+  const positive = render({
+    before: cap(6 * GiB), after: cap(8 * GiB), steps: [], warnings: [], bands: [], usableGain: 2 * GiB,
+  })
+  ok('expand gain: a positive gain is shown as +~2 GiB',
+    positive.includes('Change') && positive.includes(`+~${2 * GiB} B`), positive.slice(0, 600))
+  ok('expand gain: nothing is refused on a positive gain',
+    !positive.includes('no usable capacity'), positive.slice(0, 600))
+
+  // (2) Zero gain: words, not "+~8 MiB", plus the shortfall before Execute.
+  const shortfall = 'This plan adds no usable capacity: 2 GiB of new capacity is pending — '
+    + 'replace one more disk with ≥4 GiB to unlock ~2 GiB'
+  const zero = render({
+    // after − before is +8 MiB here — exactly the sliver that used to be
+    // rendered as growth on a plan Execute answers 409.
+    before: cap(6 * GiB - 8 * 1024 * 1024),
+    after: cap(6 * GiB),
+    steps: [],
+    warnings: [],
+    bands: [],
+    usableGain: 0,
+    zeroGain: { shortfall, unlockSize: 4 * GiB, unlockGain: 2 * GiB },
+  })
+  ok('expand gain: a zero gain reads as words, never a sliver',
+    zero.includes('no usable capacity') && !zero.includes(`+~${8 * 1024 * 1024} B`), zero.slice(0, 800))
+  ok('expand gain: the shortfall is shown in the wizard, before Execute',
+    zero.includes('replace one more disk with ≥4 GiB to unlock ~2 GiB'), zero.slice(0, 800))
+
+  // (3) Old daemon: no usableGain, no zeroGain — the subtraction stands.
+  const old = render({ before: cap(6 * GiB), after: cap(8 * GiB), steps: [], warnings: [], bands: [] })
+  ok('expand gain: an older daemon falls back to after − before',
+    old.includes(`+~${2 * GiB} B`) && !old.includes('no usable capacity'), old.slice(0, 600))
+  ok('expand gain: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
 warnings.length = 0
 created.windows.length = 0
 await composerSeedChecks()
+
+warnings.length = 0
+created.windows.length = 0
+expandGainRowChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

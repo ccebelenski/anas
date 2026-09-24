@@ -613,16 +613,24 @@ export type AhrReplaceRequest = z.infer<typeof AhrReplaceRequest>
  * present exactly when the plan's reachable target adds no usable capacity —
  * one disk replaced above a band boundary the planner cannot use yet, or a
  * disk set the planner cannot use. The numbers are derived from the plan,
- * never hard-coded: `unlockSize` is the smallest size at which one more disk
- * would grow or form a band, and `unlockGain` is what that one disk would
- * actually deliver.
+ * never hard-coded.
+ *
+ * `unlockSize` is a BAND BOUNDARY — the top of the band that is still short of
+ * members — because nothing between boundaries can help: they are immutable
+ * (AHR-DESIGN §2.3). `unlockGain` is what reaching it delivers, modelled the
+ * way the plan itself is shaped: a replace is unlocked by replacing another
+ * member (the bay-limited §5.2 case — the band's member count never changes,
+ * so only bands above the current top boundary form or grow), an addition by
+ * adding another disk. `unlockGain` is 0 when no single boundary delivers
+ * anything — a same-size replacement — and then `shortfall` says nothing about
+ * unlocking rather than quoting a gain of nothing.
  */
 export const AhrExpansionZeroGain = z.object({
   /** The operator-facing shortfall: what is locked, and what unlocks it. */
   shortfall: z.string().min(1),
-  /** Smallest size in bytes of one more disk that would start unlocking capacity. */
+  /** The band boundary in bytes the next disk must reach (see above). */
   unlockSize: z.number().int().nonnegative(),
-  /** Usable bytes one more disk of `unlockSize` would deliver. */
+  /** Usable bytes reaching `unlockSize` delivers — 0 when nothing does. */
   unlockGain: z.number().int().nonnegative(),
 })
 export type AhrExpansionZeroGain = z.infer<typeof AhrExpansionZeroGain>

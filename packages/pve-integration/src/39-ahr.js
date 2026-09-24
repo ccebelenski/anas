@@ -1841,6 +1841,12 @@
     ANAS.ahr = ANAS.ahr || {};
     ANAS.ahr.reload = loadPools;
     ANAS.ahr.selectedPool = selectedPool;
+    // The expansion wizard's plan panel, exposed so the dialog-contracts
+    // harness can pin what the Change row says for a positive gain, a
+    // zero-gain plan, and an older daemon that reports neither.
+    ANAS.ahr.planLiveHtml = function (plan, diskList) {
+        return planLiveHtml(plan, diskList);
+    };
 
     // ---- actions ------------------------------------------------------------
 
@@ -1963,18 +1969,29 @@
         if (after && ANAS.ahr && typeof ANAS.ahr.capacityRowsHtml === 'function') {
             html += '<div style="' + SEC + '">' + enc(t('Capacity after (estimated)')) + '</div>'
                 + ANAS.ahr.capacityRowsHtml(after);
-            if (before) {
-                var gain = (Number(after.usableBytes) || 0) - (Number(before.usableBytes) || 0);
-                html += capRow(t('Change'), (gain >= 0 ? '+~' : '−~') + fmtBytes(Math.abs(gain)), true);
+            // The daemon's own verdict (ahrexpand.1) wins over a local
+            // subtraction: `usableGain` is band math on both sides, while
+            // after − before compares band math to the LIVE volume and shows
+            // a few MiB of "growth" on a plan Execute then refuses with 409.
+            // An older daemon omits the field — then the subtraction is all
+            // there is, and it stays.
+            var hasGain = plan && typeof plan.usableGain === 'number';
+            var zg = (plan && plan.zeroGain) || null;
+            if (hasGain || before) {
+                var gain = hasGain
+                    ? Number(plan.usableGain)
+                    : (Number(after.usableBytes) || 0) - (Number(before.usableBytes) || 0);
+                html += capRow(t('Change'), (hasGain && gain === 0)
+                    ? t('no usable capacity')
+                    : (gain >= 0 ? '+~' : '−~') + fmtBytes(Math.abs(gain)), true);
+                if (hasGain && gain === 0 && zg && zg.shortfall) {
+                    html += '<div style="color:var(--anas-warn);font-size:12px;margin-top:2px">'
+                        + enc(zg.shortfall) + '</div>';
+                }
             }
             html += '<div style="color:var(--anas-muted);font-size:11px;margin-top:2px">'
                 + enc(t('Final sizes land slightly lower once metadata overheads are paid.'))
                 + '</div>';
-            if (Number(after.pendingBytes) > 0) {
-                html += '<div style="margin-top:6px;color:var(--anas-warn);font-size:12px">'
-                    + enc(t('Add one more disk above the top boundary to unlock the pending capacity.'))
-                    + '</div>';
-            }
         }
         // Steps.
         var steps = (plan && plan.steps) || [];

@@ -12,6 +12,7 @@ import { LSBLK_ARGS } from '../../parsers/lsblk.js'
 import { LVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { ConfirmStore } from '../../safety/confirm.js'
+import { diskLsblkArgs } from '../../services/ahr-expand-exec.js'
 import { readIntent, writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
@@ -200,9 +201,71 @@ function mkIntent(state: AhrExpansionIntent['state']): AhrExpansionIntent {
   return { id: randomUUID(), trigger: 'add-disk', approvedDisks: [X, Y, Z, S], before: CAP, after: CAP, state }
 }
 
-function buildExecutor(opts: { mdstat?: string } = {}): MockExecutor {
-  const executor = new MockExecutor()
+/** The band-1 slice label the quad replacement disk arrives already carrying. */
+const QUAD_NEW_SLICE_LABEL = 'quad-d5-b1'
+
+/** `lsblk -Jb -o NAME,TYPE,SIZE,PARTLABEL <dev>` for ONE disk (readDiskTree). */
+function diskTreeJson(kernel: string, size: number, parts: { name: string, size: number, label: string }[]): string {
+  return JSON.stringify({ blockdevices: [{
+    name: kernel,
+    type: 'disk',
+    size,
+    partlabel: null,
+    children: parts.map(p => ({ name: p.name, type: 'part', size: p.size, partlabel: p.label })),
+  }] })
+}
+
+/**
+ * A MockExecutor whose `/proc/mdstat` CHANGES once `mdadm --replace` has been
+ * issued — the one state transition a guided replace waits on. Against a
+ * static fixture the wait loop never returns (correctly: the outgoing member
+ * is still a healthy member), so a test that wants to prove the confirm bypass
+ * really drives the executor has to let md move.
+ */
+class ReplaceAwareExecutor extends MockExecutor {
+  private swapped = false
+  constructor(private readonly afterSwap: string) {
+    super()
+  }
+
+  override async exec(command: string, args: string[], opts?: Parameters<MockExecutor['exec']>[2]) {
+    if (this.swapped && command === '/usr/bin/cat' && args.join(' ') === MDSTAT_CAT_ARGS.join(' ')) {
+      this.calls.push({ command, args })
+      return { stdout: this.afterSwap, stderr: '', exitCode: 0 }
+    }
+    const result = await super.exec(command, args, opts)
+    if (command === '/usr/sbin/mdadm' && args.includes('--replace'))
+      this.swapped = true
+    return result
+  }
+}
+
+/** md125 after the copy landed: the incoming slice in, the outgoing one gone. */
+function mdstatQuadSwapped(newPartKernel: string): string {
+  return MDSTAT_BASE.replace('md125 : active raid5 sda1[3]', `md125 : active raid5 ${newPartKernel}[3]`)
+}
+
+function buildExecutor(opts: { mdstat?: string, driveReplaceOf?: string } = {}): MockExecutor {
+  // The incoming disk is the one whose slice md125 ends up carrying.
+  const incoming = DISKS.find(d => d.id === opts.driveReplaceOf)
+  const executor = incoming
+    ? new ReplaceAwareExecutor(mdstatQuadSwapped(`${incoming.kernel}1`))
+    : new MockExecutor()
   executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: opts.mdstat ?? MDSTAT_BASE, stderr: '', exitCode: 0 } })
+  if (incoming) {
+    // Per-disk trees for the replace path. The incoming disk already carries
+    // its band-1 slice, so the partition step is the detect-then-delta no-op
+    // it is on a resume and the run reaches the mdadm work under test.
+    for (const d of DISKS) {
+      const parts = d.id === incoming.id
+        ? [{ name: `${d.kernel}1`, size: B1_CLAMPED_2G, label: QUAD_NEW_SLICE_LABEL }]
+        : d.parts.map(p => ({ name: p.name, size: p.size, label: p.label }))
+      executor.addFixture({ command: '/usr/bin/lsblk', args: diskLsblkArgs(`/dev/disk/by-id/${d.id}`), result: { stdout: diskTreeJson(d.kernel, d.size, parts), stderr: '', exitCode: 0 } })
+    }
+    executor.addFixture({ command: '/usr/bin/lsblk', args: ['-Jb', '-o', 'NAME,TYPE,SIZE,PARTLABEL'], result: { stdout: ahrLsblkJson(), stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/mdadm', result: { stdout: '', stderr: '', exitCode: 0 } })
+    executor.addFixture({ command: '/usr/sbin/sgdisk', result: { stdout: '', stderr: '', exitCode: 0 } })
+  }
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: exportFor('tank-r1', 'raid5', 3, 'aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa'), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md126'], result: { stdout: exportFor('tank-r2', 'raid1', 2, 'bbbbbbbb:bbbbbbbb:bbbbbbbb:bbbbbbbb'), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md125'], result: { stdout: exportFor('quad-r1', 'raid5', 4, 'cccccccc:cccccccc:cccccccc:cccccccc'), stderr: '', exitCode: 0 } })
@@ -246,7 +309,7 @@ describe('AHR expansion routes (Epic 11.6)', () => {
   let jobQueue: JobQueue
   let server: ReturnType<typeof Fastify>
 
-  async function build(opts: { mdstat?: string } = {}) {
+  async function build(opts: { mdstat?: string, driveReplaceOf?: string } = {}) {
     executor = buildExecutor(opts)
     jobQueue = new JobQueue()
     server = Fastify({ logger: false })
@@ -357,7 +420,9 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       const warnings: string[] = first.json().error.warnings
       assert.ok(warnings.some(w => w.includes('hours to DAYS')))
       assert.ok(warnings.some(w => w.includes('Do NOT remove disks')))
-      assert.ok(warnings.some(w => w.includes('stranded')))
+      // S reaches no boundary at all, so the planner says so in plain words
+      // rather than reporting it "stranded above the 0 GiB boundary".
+      assert.ok(warnings.some(w => w.includes(`disk '${S}': none of its 1 GiB can be used`)), warnings.join(' | '))
       const code = first.headers['x-anas-confirm-code'] as string
       assert.ok(code)
 
@@ -457,11 +522,16 @@ describe('AHR expansion routes (Epic 11.6)', () => {
   })
 
   // ---- Zero-gain expand guard (ahrexpand.1, AHR-DESIGN §5.2) ----------------
-  // The "quad" pool is 4×2 GiB, one band raid5×4, LV EXACTLY the band math
-  // (6 GiB) — a plan that adds nothing is a zero delta, and the guard's
-  // numbers are the story's clean 2/4 GiB.
+  // The "quad" pool is 4×2 GiB, one band raid5×4 — the §5.2 shape at GiB
+  // scale. The guard measures band math against band math, so the LV's exact
+  // size no longer enters it; the numbers are the story's clean 2/4 GiB.
+  //
+  // The refusal is the PLANNER's own pending-capacity line, lifted verbatim —
+  // and because a replace is unlocked by another replace (band 1 keeps its
+  // four members), the second 4 GiB disk unlocks the [2,4 GiB] band alone.
 
-  const QUAD_ZERO_GAIN = 'This plan adds no usable capacity: the 4 GiB disk above the 2 GiB band sits alone; add one more disk of ≥ 4 GiB to unlock ~4 GiB'
+  const QUAD_PENDING_LINE = '2 GiB of new capacity is pending — replace one more disk with ≥4 GiB to unlock ~2 GiB'
+  const QUAD_ZERO_GAIN = `This plan adds no usable capacity: ${QUAD_PENDING_LINE}`
 
   describe('zero-gain expand guard (ahrexpand.1, §5.2)', () => {
     it('plan response: the exact §5.2 shape carries usableGain 0 + the shortfall and the unlock', async () => {
@@ -473,10 +543,11 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       assert.deepEqual(data.zeroGain, {
         shortfall: QUAD_ZERO_GAIN,
         unlockSize: 4 * GIB,
-        unlockGain: 4 * GIB,
+        unlockGain: 2 * GIB,
       })
-      // …and the pending band is still stated concretely in the warnings.
-      assert.ok(data.warnings.some(w => w.includes('pending')))
+      // …and the refusal quotes the planner's own warning, not a second
+      // sentence that could drift from it.
+      assert.ok(data.warnings.includes(QUAD_PENDING_LINE), data.warnings.join(' | '))
       assert.deepEqual(mutatingCalls(executor), [])
     })
 
@@ -491,8 +562,8 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       assert.equal(data.zeroGain, undefined)
     })
 
-    it('expand: the zero-gain plan is refused with the guiding 409; the confirm code proceeds', async () => {
-      await build()
+    it('expand: the zero-gain plan is refused with the guiding 409; the confirm code runs the job', async () => {
+      await build({ driveReplaceOf: E })
       const first = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand', headers: IDENTITY_HEADERS, payload: { replace: { oldDiskId: D1, newDiskId: E } } })
       assert.equal(first.statusCode, 409, first.body)
       const { error } = first.json()
@@ -503,27 +574,48 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       assert.ok(code)
       assert.deepEqual(mutatingCalls(executor), [], 'refused before any destructive action')
 
-      // The honest zero-gain case is still reachable: re-submit with the code.
+      // The honest zero-gain case is still reachable — and the bypass does not
+      // just mint a 202: the job RUNS the replace.
       const second = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code }, payload: { replace: { oldDiskId: D1, newDiskId: E } } })
       assert.equal(second.statusCode, 202, second.body)
-      assert.ok(second.json().job.id)
+      const job = await waitForJob(jobQueue, second.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.ok(
+        mutatingCalls(executor).some(c => c.command === '/usr/sbin/mdadm' && c.args.includes('--replace') && c.args.includes('/dev/sda1')),
+        JSON.stringify(mutatingCalls(executor)),
+      )
+      assert.equal(await readIntent('quad', dir), null, 'intent cleared on completion')
     })
 
-    it('guided replace: a same-size replacement is zero-gain refused; the confirm code proceeds', async () => {
-      await build()
+    it('guided replace: the repair headline stays; the zero-gain fact is a warning, and the code runs the job', async () => {
+      await build({ driveReplaceOf: F })
       const first = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: IDENTITY_HEADERS, payload: { newDiskId: F } })
       assert.equal(first.statusCode, 409, first.body)
       const { error } = first.json()
       assert.equal(error.code, 'CONFIRMATION_REQUIRED')
-      assert.match(error.message, /adds no usable capacity/)
-      assert.match(error.message, /inherits the bands its predecessor already served/)
-      assert.match(error.message, /≥ 2 GiB to unlock ~2 GiB/)
+      // Replace is a REPAIR verb: swapping a failing disk for one of the same
+      // size is the point, so the headline is the repair and the zero-gain
+      // fact is stated ONCE, below it.
+      assert.equal(error.message, `Replacing disk '${D1}' in pool 'quad'`)
+      const warnings: string[] = error.warnings
+      assert.equal(
+        warnings[0],
+        'This plan adds no usable capacity: the replacement only inherits the bands its predecessor already served',
+      )
+      assert.equal(warnings.filter(w => w.includes('adds no usable capacity')).length, 1, 'said once')
       const code = first.headers['x-anas-confirm-code'] as string
       assert.ok(code)
       assert.deepEqual(mutatingCalls(executor), [])
 
       const second = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code }, payload: { newDiskId: F } })
       assert.equal(second.statusCode, 202, second.body)
+      const job = await waitForJob(jobQueue, second.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.ok(
+        mutatingCalls(executor).some(c => c.command === '/usr/sbin/mdadm' && c.args.includes('--replace') && c.args.includes('/dev/sda1')),
+        JSON.stringify(mutatingCalls(executor)),
+      )
+      assert.equal(await readIntent('quad', dir), null, 'intent cleared on completion')
     })
 
     it('a positive-gain expand is NOT zero-gain gated (normal confirm surface, unchanged message)', async () => {
@@ -543,10 +635,14 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       assert.equal(first.statusCode, 409, first.body)
       const { error } = first.json()
       assert.equal(error.code, 'CONFIRMATION_REQUIRED')
-      // The guidance carries the planner's own stranded line, verbatim.
-      assert.match(error.message, /adds no usable capacity/)
-      assert.match(error.message, /stranded above the 0 GiB boundary/)
-      assert.match(error.message, /≥ 2 GiB to unlock ~2 GiB/)
+      // The guidance carries the planner's own line about the added disk,
+      // verbatim — and an ADD-shaped plan is unlocked by another ADD.
+      assert.equal(
+        error.message,
+        `This plan adds no usable capacity: disk '${G}': none of its 1 GiB can be used — it does not reach `
+        + `the pool's lowest band boundary at 2 GiB, and existing band boundaries are immutable; `
+        + `add one more disk of ≥2 GiB to unlock ~2 GiB`,
+      )
       const code = first.headers['x-anas-confirm-code'] as string
       assert.ok(code)
 
