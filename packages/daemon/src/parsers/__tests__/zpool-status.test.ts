@@ -216,6 +216,70 @@ describe('parseZpoolStatus', () => {
     }
   })
 
+  // GitHub #66: ZFS 2.x reports logs, l2cache, spares, special and dedup as
+  // POOL-LEVEL sections beside the vdev tree. The parser read only l2cache
+  // (and declared spares), so log, special and dedup vdevs never reached
+  // vdevGroups. Ground truth captured on the stunt node (ZFS 2.4.4): one
+  // pool, six classes, one partition each.
+  it('parses all six vdev classes from the pool-level sections, in fixed order', () => {
+    const result = parseZpoolStatus(loadFixture('zpool-status-all-vdev-classes-2.4.4.json'))
+    assert.equal(result.length, 1)
+    const pool = result[0]
+    assert.equal(pool.name, 'gt66')
+
+    // Fixed group order whatever the JSON key order: data, log, cache,
+    // spare, special, dedup.
+    assert.deepEqual(
+      pool.vdevGroups.map(g => g.role),
+      ['data', 'log', 'cache', 'spare', 'special', 'dedup'],
+    )
+
+    // One single-disk vdev per section, leaf names straight from the capture.
+    const leafOf = (role: string) => pool.vdevGroups.find(g => g.role === role)!.vdevs[0].disks[0]
+    assert.equal(leafOf('data').id, 'sdb1')
+    assert.equal(leafOf('log').id, 'sdb2')
+    assert.equal(leafOf('cache').id, 'sdb3')
+    assert.equal(leafOf('spare').id, 'sdb4')
+    assert.equal(leafOf('special').id, 'sdb5')
+    assert.equal(leafOf('dedup').id, 'sdb6')
+
+    // The vdev carries the entry's own state — a bare kernel name is listed
+    // as-is (no by-id to cross-reference), the spare's state is what the JSON
+    // says (AVAIL), not a normalised ONLINE.
+    assert.equal(pool.vdevGroups.find(g => g.role === 'log')!.vdevs[0].state, 'ONLINE')
+    assert.equal(leafOf('log').state, 'ONLINE')
+    assert.equal(pool.vdevGroups.find(g => g.role === 'spare')!.vdevs[0].state, 'AVAIL')
+    assert.equal(leafOf('spare').state, 'AVAIL')
+  })
+
+  it('parses a mirrored log section as one mirror vdev with its leaves', () => {
+    const result = parseZpoolStatus(loadFixture('zpool-status-mirrored-log-partitions-2.4.4.json'))
+    assert.equal(result.length, 1)
+    const pool = result[0]
+    assert.equal(pool.name, 'gtbackup')
+
+    // data + log + cache — no spares/special/dedup sections in this capture.
+    assert.deepEqual(
+      pool.vdevGroups.map(g => g.role),
+      ['data', 'log', 'cache'],
+    )
+
+    // The mirror-N entry is ONE vdev of that type, its children as disks.
+    const logGroup = pool.vdevGroups.find(g => g.role === 'log')!
+    assert.equal(logGroup.vdevs.length, 1)
+    const logVdev = logGroup.vdevs[0]
+    assert.equal(logVdev.name, 'mirror-4')
+    assert.equal(logVdev.type, 'mirror')
+    assert.equal(logVdev.state, 'ONLINE')
+    assert.deepEqual(logVdev.disks.map(d => d.id), ['sdb1', 'sdb2'])
+
+    // The bare cache leaf keeps the single-disk vdev shape.
+    const cacheGroup = pool.vdevGroups.find(g => g.role === 'cache')!
+    assert.equal(cacheGroup.vdevs.length, 1)
+    assert.equal(cacheGroup.vdevs[0].disks[0].id, 'sdb3')
+    assert.equal(cacheGroup.vdevs[0].disks[0].state, 'ONLINE')
+  })
+
   // Regression: on a real system `zpool status -jv` reports the leaf `name` as
   // the KERNEL device ("sdb"), which is unstable and must never be the disk's
   // identity. The stable by-id comes from `devid`. If parseDisk used `name`,

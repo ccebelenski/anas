@@ -73,10 +73,16 @@ interface ZfsPoolStatusRaw {
   /** RAIDZ-expansion reflow stats (story 3.31; doc-based — see caveat above). */
   raidz_expand_stats?: ZfsRaidzExpandStatsRaw
   vdevs: Record<string, ZfsVdevRaw>
-  /** Pool-level spares (separate from vdev tree) */
-  spares?: Record<string, ZfsVdevRaw>
+  /** Pool-level log (ZIL) vdevs (separate from vdev tree) */
+  logs?: Record<string, ZfsVdevRaw>
   /** Pool-level L2ARC cache (separate from vdev tree) */
   l2cache?: Record<string, ZfsVdevRaw>
+  /** Pool-level spares (separate from vdev tree) */
+  spares?: Record<string, ZfsVdevRaw>
+  /** Pool-level special vdevs (separate from vdev tree) */
+  special?: Record<string, ZfsVdevRaw>
+  /** Pool-level dedup-table vdevs (separate from vdev tree) */
+  dedup?: Record<string, ZfsVdevRaw>
   error_count: string
   /** Present with -v flag when there are data errors */
   errlist?: string
@@ -117,6 +123,27 @@ export function parseZpoolStatusPool(json: string | ZpoolStatusOutput, poolName:
   return parsePool(pool)
 }
 
+/** Fixed group order for vdevGroups (the VdevRole order, data first). */
+const ROLE_ORDER: readonly VdevRole[] = ['data', 'log', 'cache', 'spare', 'special', 'dedup']
+
+/** A pool-level vdev section key in `zpool status -j` (beside the vdev tree). */
+type PoolVdevSectionKey = 'logs' | 'l2cache' | 'spares' | 'special' | 'dedup'
+
+/**
+ * The pool-level vdev sections and the group each maps to: [section key,
+ * role, the name a bare leaf of the section gets as its vdev name — the
+ * in-tree named children were named the same]. Older ZFS put these classes
+ * as named children INSIDE the vdev tree; classifyVdevs still handles that
+ * shape, so both paths feed the same fixed group order below.
+ */
+const POOL_VDEV_SECTIONS: ReadonlyArray<readonly [PoolVdevSectionKey, VdevRole, string]> = [
+  ['logs', 'log', 'logs'],
+  ['l2cache', 'cache', 'cache'],
+  ['spares', 'spare', 'spares'],
+  ['special', 'special', 'special'],
+  ['dedup', 'dedup', 'dedup'],
+]
+
 function parsePool(pool: ZfsPoolStatusRaw): ParsedPoolStatus {
   const result: ParsedPoolStatus = {
     name: pool.name,
@@ -143,37 +170,41 @@ function parsePool(pool: ZfsPoolStatusRaw): ParsedPoolStatus {
     result.vdevGroups = classifyVdevs(rootVdev.vdevs)
   }
 
-  // Pool-level spares (separate from vdev tree)
-  if (pool.spares && Object.keys(pool.spares).length > 0) {
-    const spareDisksList: PoolDisk[] = Object.values(pool.spares).map(parseDisk)
-    const spareVdev: Vdev = {
-      name: 'spares',
-      type: 'spare',
-      state: 'ONLINE' as VdevState,
-      readErrors: 0,
-      writeErrors: 0,
-      checksumErrors: 0,
-      disks: spareDisksList,
-    }
-    result.vdevGroups.push({ role: 'spare', vdevs: [spareVdev] })
+  // Pool-level vdev sections: ZFS 2.x reports logs, l2cache, spares, special
+  // and dedup BESIDE the vdev tree, not inside it — reading only the in-tree
+  // names left log, special and dedup vdevs invisible (GitHub #66). One
+  // helper parses all five.
+  for (const [sectionKey, role, vdevName] of POOL_VDEV_SECTIONS) {
+    const section = pool[sectionKey]
+    if (section && Object.keys(section).length > 0)
+      result.vdevGroups.push(parsePoolVdevSection(section, role, vdevName))
   }
 
-  // Pool-level L2ARC cache
-  if (pool.l2cache && Object.keys(pool.l2cache).length > 0) {
-    const cacheDisksList: PoolDisk[] = Object.values(pool.l2cache).map(parseDisk)
-    const cacheVdev: Vdev = {
-      name: 'cache',
-      type: 'disk' as VdevType,
-      state: 'ONLINE' as VdevState,
-      readErrors: 0,
-      writeErrors: 0,
-      checksumErrors: 0,
-      disks: cacheDisksList,
-    }
-    result.vdevGroups.push({ role: 'cache', vdevs: [cacheVdev] })
-  }
+  // Fixed group order whatever the JSON key order: data, log, cache, spare,
+  // special, dedup.
+  result.vdevGroups.sort((a, b) => ROLE_ORDER.indexOf(a.role) - ROLE_ORDER.indexOf(b.role))
 
   return result
+}
+
+/**
+ * Parse one pool-level vdev section (logs / l2cache / spares / special /
+ * dedup) into its role group. Each entry in the section is a vdev:
+ *   - a `mirror-N` (or raidz) entry with its `vdevs` children → one Vdev of
+ *     that type with the children as disks,
+ *   - a bare leaf → the single-disk Vdev shape (the one the old l2cache
+ *     branch produced for a single cache disk), named after the section.
+ * The vdev carries the entry's OWN state — a spare reads AVAIL, a mirror its
+ * own state; we report what ZFS says. Leaves go through parseDisk/diskId, so
+ * a by-id `-partN` name resolves to its disk and a bare kernel name is
+ * listed as-is.
+ */
+function parsePoolVdevSection(section: Record<string, ZfsVdevRaw>, role: VdevRole, vdevName: string): VdevGroup {
+  const vdevs = Object.values(section).map((entry) => {
+    const vdev = parseVdev(entry)
+    return entry.vdevs && Object.keys(entry.vdevs).length > 0 ? vdev : { ...vdev, name: vdevName }
+  })
+  return { role, vdevs }
 }
 
 /**
