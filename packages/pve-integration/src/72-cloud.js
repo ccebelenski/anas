@@ -17,16 +17,27 @@
  *   - basic (non-`advanced`) options first, then the "Show advanced options"
  *     toggle and the advanced ones — EXCEPT an option named `token`, which
  *     always shows under the OAuth sentence (its home is the basic group even
- *     when rclone types it advanced).
+ *     when rclone types it advanced). The toggle is a VIEW, not a filter:
+ *     what was typed into an advanced row is kept when the toggle goes off
+ *     (a per-dialog stash) and is sent with the rest — hiding a row the user
+ *     filled must not silently discard it.
  *   - an option with a non-empty `provider` filter shows only when the filter
  *     matches the current value of the backend's `provider` option (rclone's
  *     syntax: a comma list of provider values, or `!A,B` = all except) — so
  *     an S3 form shows ONE `region` row for the picked provider. Changing the
- *     provider option REBUILDS the rows, keeping what was typed.
+ *     provider option REBUILDS the rows, keeping what was typed. A backend
+ *     that HAS a `provider` option requires one: with none picked the
+ *     positive filters match nothing and only the `!A,B` rows survive, which
+ *     is the wrong form — Save and Test wait for the pick.
  *   - `examples` → an editable combo (value + help); `type` `bool` → a
  *     checkbox; `int` → a number field; `secret` → a password field that is
  *     WRITE-ONLY: on edit it is blank with the emptyText "(unchanged)" and is
- *     sent only when typed. `required` marks the field and gates the buttons.
+ *     sent only when typed. `required` marks the field and gates the buttons,
+ *     EXCEPT a required secret the remote already stores (`secretsSet`): the
+ *     blank "(unchanged)" box is not a missing value. A `bool` is NEVER a
+ *     secret whatever rclone's name rule says (sftp/ftp `ask_password`): a
+ *     checkbox has no "(unchanged)" state, so the write-only rule would pin
+ *     it on forever.
  *   - keys the remote carries but the provider schema does not know (rclone
  *     appends keys of its own on first connect — a newer rclone's keys) are
  *     KEPT: shown read-only under "Other keys", never editable, never sent —
@@ -34,13 +45,16 @@
  *     diffed.
  *
  * Submit: create → POST /v1/cloud/remotes {name, type, options} (non-empty
- * values only; an unchecked bool is sent as 'false' only when it overrides a
- * 'true' default); edit → PUT /v1/cloud/remotes/:name {options} (changed keys
- * only; a cleared non-secret field sends '' = remove; an absent secret =
- * unchanged). Both are jobs: the manager grid reloads on success AND failure
- * (the 0.3.3 lesson). Test runs in the dialog (inline, unsaved — the daemon
- * serves it from an env-defined remote, nothing is written) and on the grid
- * toolbar (the saved remote by name).
+ * values only, and a bool equal to rclone's own default is NOT a key — an
+ * untouched form must not pin every default into the file); edit → PUT
+ * /v1/cloud/remotes/:name {options} (changed keys only; a cleared non-secret
+ * field sends '' = remove; an absent secret = unchanged). Both are jobs: the
+ * manager grid reloads on success AND failure (the 0.3.3 lesson). Test runs
+ * on the grid toolbar (the saved remote by name) and in the dialog: an ADD,
+ * or an edit with a secret typed, rides inline (the daemon serves it from an
+ * env-defined remote, nothing is written) — an edit with NO secret typed
+ * tests the SAVED remote by name, because the inline envelope cannot carry
+ * the stored secret and would read back a false "Authentication failed".
  *
  * The store is per node and read fresh on every load (Principle 11). An
  * encrypted configuration is reported as a fact in the footer and every
@@ -119,6 +133,37 @@
             }
         }
         return null;
+    }
+
+    // Is this option a WRITE-ONLY secret? rclone's `IsPassword` and the
+    // daemon's name rule both land on `opt.secret` — but a BOOL is never one.
+    // A checkbox has no "(unchanged)" state: unticking it produces a value
+    // like any other, and reading that as "keep what is stored" would make a
+    // secret-by-NAME bool (sftp/ftp `ask_password` — the name ends in
+    // `password`) impossible to turn off.
+    function isSecretOption(opt) {
+        return !!(opt && opt.secret && ('' + (opt.type || '')) !== 'bool');
+    }
+
+    // rclone's default for a bool, as the effective 'true' | 'false' string
+    // the checkbox and the wire both speak.
+    function boolDefault(opt) {
+        return ('' + ((opt && opt.default) || '')) === 'true' ? 'true' : 'false';
+    }
+
+    // A shallow copy of an option with `required` forced on — the `provider`
+    // row, which rclone does not flag required but the form cannot do without
+    // (see the provider-filter note in the header).
+    function requiredCopy(opt) {
+        var out = {};
+        var k;
+        for (k in opt) {
+            if (Object.prototype.hasOwnProperty.call(opt, k)) {
+                out[k] = opt[k];
+            }
+        }
+        out.required = true;
+        return out;
     }
 
     // rclone's option `Provider` filter: '' = all backends' values; a comma
@@ -311,6 +356,13 @@
                 }
                 return;
             }
+            // Any OTHER failure is transient — the store was busy, a read
+            // blew up. The window stays usable: the grid comes back and a
+            // "not installed" note left over from an earlier 503 must not sit
+            // there contradicting the alert the user is about to read.
+            var stale = win.down('#cloudUnavailable');
+            if (stale) { stale.setHidden(true); }
+            if (grid) { try { grid.setHidden(false); } catch (eG) { /* non-fatal */ } }
             ANAS.warn('cloud remotes load failed: ' + ANAS.errText(err));
             ANAS.alertMsg('Load failed', t('Failed to load the rclone remotes') + ': ' + ANAS.errText(err));
         });
@@ -323,7 +375,7 @@
             return;
         }
         var name = rec.get('name');
-        try { grid.setLoading(t('Testing') + ' ' + name + '…'); } catch (e) { /* non-fatal */ }
+        try { grid.setLoading(t('Testing') + ' ' + enc(name) + '…'); } catch (e) { /* non-fatal */ }
         ANAS.api.post(node, '/cloud/remotes/test', { name: name }).then(function (res) {
             try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
             if (grid.destroyed || grid.destroying) {
@@ -362,7 +414,7 @@
                         path: '/cloud/remotes/' + encodeURIComponent(name),
                         view: win,
                         failTitle: 'Remove failed',
-                        successMsg: t('Remote removed') + ': ' + name,
+                        successMsg: t('Remote removed') + ': ' + enc(name),
                         onComplete: function () { loadRemotes(win, node); },
                         // Timeliness: the grid reflects the file's real state
                         // even when the job fails — a referenced-remote refusal
@@ -410,7 +462,8 @@
                                     return '<span title="' + enc(v) + '">' + enc(v) + '</span>';
                                 } },
                             { text: t('Type'), dataIndex: 'type', width: 140,
-                                sortable: false, menuDisabled: true },
+                                sortable: false, menuDisabled: true,
+                                renderer: function (v) { return enc(v); } },
                             { text: t('Set'), dataIndex: 'name', flex: 1, minWidth: 200,
                                 sortable: false, menuDisabled: true, renderer: renderRemoteSet },
                         ],
@@ -524,27 +577,26 @@
     }
 
     // Snapshot every rendered option field's EFFECTIVE value (a string, or
-    // absent when the field represents "nothing set"), so a rebuild on a
-    // type/provider change keeps what was typed. Effective rules:
-    //   bool     → 'true' | 'false' (only when it overrides a 'true' default)
-    //              | '' (unchecked, default already false — nothing set)
+    // '' when the field represents "nothing set"), so a rebuild on a
+    // type/provider/advanced change keeps what was typed. Effective rules:
+    //   bool     → 'true' | 'false' — ALWAYS the box's own state, never ''.
+    //              A checkbox has no "nothing set": the wire builders decide
+    //              whether that state is worth a key (create: only when it
+    //              differs from rclone's default; update: only when it
+    //              differs from what is stored).
     //   int      → '' | String(number)
     //   secret   → '' (never typed) | the typed value
     //   string   → the trimmed value
     function effectiveValue(cmp, opt) {
         var type = '' + (opt.type || '');
         if (type === 'bool') {
-            var checked = cmp.getValue() === true;
-            if (checked) {
-                return 'true';
-            }
-            return ('' + (opt.default || '')) === 'true' ? 'false' : '';
+            return cmp.getValue() === true ? 'true' : 'false';
         }
         var v = cmp.getValue();
         if (type === 'int') {
             return (v === null || v === undefined || v === '') ? '' : String(v);
         }
-        if (opt.secret) {
+        if (isSecretOption(opt)) {
             // Write-only: blank means unchanged/absent, never "clear".
             return (v === null || v === undefined) ? '' : String(v);
         }
@@ -602,7 +654,9 @@
             };
         }
 
-        if (opt.examples && opt.examples.length) {
+        // A secret that ALSO carries examples (s3 `sse_customer_key`) is a
+        // password box first — a combo would put the value on screen.
+        if (opt.examples && opt.examples.length && !isSecretOption(opt)) {
             var exRows = [];
             for (var i = 0; i < opt.examples.length; i++) {
                 var ex = opt.examples[i] || {};
@@ -656,11 +710,11 @@
                     fieldLabel: label,
                     name: opt.name,
                     allowBlank: !required,
-                    inputType: opt.secret ? 'password' : 'text',
-                    inputAttrTpl: opt.secret
+                    inputType: isSecretOption(opt) ? 'password' : 'text',
+                    inputAttrTpl: isSecretOption(opt)
                         ? ANAS.noAutofill.secret.inputAttrTpl
                         : undefined,
-                    emptyText: opt.secret
+                    emptyText: isSecretOption(opt)
                         ? (isEdit ? t('(unchanged)') : '')
                         : (opt.default || ''),
                     value: value || '',
@@ -708,16 +762,62 @@
         return out;
     }
 
-    // The required fields currently rendered (the gate for Test and Save).
-    function requiredMissing(win) {
-        var vals = renderedValues(win);
-        for (var i = 0; i < (win._cloudRequired || []).length; i++) {
-            var name = win._cloudRequired[i];
-            if (!vals[name]) {
-                return name;
+    // Every value the dialog HOLDS, rendered or not: the stash (what was typed
+    // into an advanced row the toggle has since hidden) with the live fields
+    // over it. The advanced toggle is a view, not a filter — a value the user
+    // typed is kept and sent whether its row is on screen at submit or not.
+    // The stash is pruned to the chosen backend's options on every rebuild, so
+    // a key from a previously chosen type can never reach the wire.
+    function dialogValues(win) {
+        var out = {};
+        var stash = win._cloudStash || {};
+        var map = win._cloudOptionByName || {};
+        var k;
+        for (k in stash) {
+            if (Object.prototype.hasOwnProperty.call(stash, k) && map[k]) {
+                out[k] = stash[k];
             }
         }
+        var rendered = renderedValues(win);
+        for (k in rendered) {
+            if (Object.prototype.hasOwnProperty.call(rendered, k)) {
+                out[k] = rendered[k];
+            }
+        }
+        return out;
+    }
+
+    // The required fields currently rendered (the gate for Test and Save).
+    // A required SECRET the remote already stores is PRESENT, not missing: its
+    // box is blank because the API never returns a secret value, and reading
+    // that blank as "unfilled" would dead-lock Save and Test on every edit of
+    // a backend whose required option is a secret (b2 `key`, koofr `password`).
+    function requiredMissing(win) {
+        var vals = dialogValues(win);
+        var map = win._cloudOptionByName || {};
+        var stored = (win._cloudExisting && win._cloudExisting.secretsSet) || [];
+        for (var i = 0; i < (win._cloudRequired || []).length; i++) {
+            var name = win._cloudRequired[i];
+            if (vals[name]) {
+                continue;
+            }
+            if (win._cloudIsEdit === true && isSecretOption(map[name])
+                && indexOfName(stored, name) >= 0) {
+                continue;
+            }
+            return name;
+        }
         return '';
+    }
+
+    // Array#indexOf over strings — plain ES5, no Array.prototype assumptions.
+    function indexOfName(list, name) {
+        for (var i = 0; i < (list || []).length; i++) {
+            if ('' + list[i] === '' + name) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     // Live gate: Test and Save stay disabled until the name is a valid remote
@@ -765,9 +865,28 @@
             }
         }
 
-        var prev = renderedValues(win);
+        // The stash: everything the dialog holds. Merged from the LIVE fields
+        // at the top of every rebuild, then pruned to this backend's options —
+        // so a value typed into an advanced row survives the toggle going off
+        // and on, while a key belonging to a type the user has moved away from
+        // is dropped rather than carried to the wire.
+        var stash = win._cloudStash || {};
+        var fresh = renderedValues(win);
+        var sk;
+        for (sk in fresh) {
+            if (Object.prototype.hasOwnProperty.call(fresh, sk)) {
+                stash[sk] = fresh[sk];
+            }
+        }
+        for (sk in stash) {
+            if (Object.prototype.hasOwnProperty.call(stash, sk) && !win._cloudOptionByName[sk]) {
+                delete stash[sk];
+            }
+        }
+        win._cloudStash = stash;
+
         var showAdv = valOf(win, '#cloudAdvanced') === true;
-        var providerValue = prev.provider !== undefined ? prev.provider
+        var providerValue = stash.provider !== undefined ? stash.provider
             : ((storedOptions && storedOptions.provider) || '');
 
         var hasToken = false;
@@ -799,30 +918,36 @@
                 // The token field is always visible (it lives with the OAuth
                 // sentence) even when rclone types it advanced. Other advanced
                 // rows are NOT BUILT until the toggle asks for them — a hidden
-                // required field must never sit in the gate, and a stale
-                // hidden field must never reach the wire.
-                var toAdvanced = opt.advanced === true && opt.name !== 'token' && !showAdv;
-                var value = prev[opt.name];
-                if (value === undefined || value === '') {
+                // required field must never sit in the gate. What was TYPED
+                // into one stays in the stash and still reaches the wire: the
+                // toggle hides a row, it does not discard its value.
+                if (opt.advanced === true && opt.name !== 'token' && !showAdv) {
+                    continue;
+                }
+                // The stash is the authority for a value this dialog already
+                // holds — an explicit empty included (a cleared field stays
+                // cleared). Only a key the dialog has never touched falls back
+                // to the stored remote.
+                var value = stash[opt.name];
+                if (value === undefined) {
                     var storedVal = (storedOptions && storedOptions[opt.name]) || '';
-                    if (prev[opt.name] !== undefined && !toAdvanced) {
-                        value = prev[opt.name]; // an explicit empty stays empty
-                    } else if (opt.type === 'bool') {
+                    if (opt.type === 'bool') {
                         // A checkbox cannot show "the default": it renders the
                         // EFFECTIVE value — stored if present, else rclone's
                         // default — so an untouched edit diffs against the
                         // same effective value and sends nothing.
-                        value = storedVal !== '' ? storedVal
-                            : (opt.default === 'true' ? 'true' : '');
+                        value = storedVal !== '' ? storedVal : boolDefault(opt);
                     } else {
-                        value = opt.secret ? '' : storedVal;
+                        value = isSecretOption(opt) ? '' : storedVal;
                     }
                 }
-                if (toAdvanced) {
-                    continue; // not built until the toggle asks for it
-                }
-                var cfg = optionFieldCfg(opt, value, isEdit);
-                if (opt.required === true) {
+                // A backend that HAS a `provider` option cannot be configured
+                // without one: with none picked every positive filter misses
+                // and only the `!A,B` rows survive — the wrong form. Mark the
+                // row required so Save and Test wait for the pick.
+                var effOpt = opt.name === 'provider' ? requiredCopy(opt) : opt;
+                var cfg = optionFieldCfg(effOpt, value, isEdit);
+                if (effOpt.required === true) {
                     required.push(opt.name);
                 }
                 if (opt.advanced === true && opt.name !== 'token') {
@@ -897,18 +1022,20 @@
     // the raw stored key.
     function storedValueOf(stored, opt) {
         var v = (stored && stored[opt.name]) || '';
-        if (v === '' && opt.type === 'bool') {
-            return opt.default === 'true' ? 'true' : '';
+        if (opt.type === 'bool') {
+            return v !== '' ? v : boolDefault(opt);
         }
         return v;
     }
 
     // The options object the wire carries. `isCreate` shapes the create body
-    // (non-empty values only); an update diffs the rendered fields against the
-    // stored keys — changed keys only, a cleared non-secret field sent as ''
-    // (= remove), a typed secret sent, an untouched secret absent (= keep).
+    // (non-empty values only, and NO bool that already matches rclone's own
+    // default — an untouched form must not pin every default into the file);
+    // an update diffs what the dialog holds against the stored keys — changed
+    // keys only, a cleared non-secret field sent as '' (= remove), a typed
+    // secret sent, an untouched secret absent (= keep).
     function wireOptions(win, isCreate, storedOptions) {
-        var vals = renderedValues(win);
+        var vals = dialogValues(win);
         var out = {};
         var stored = storedOptions || {};
         var k;
@@ -918,12 +1045,15 @@
             }
             var v = vals[k];
             var opt = win._cloudOptionByName[k];
-            var isSecret = !!(opt && opt.secret);
             if (isCreate) {
-                if (v !== '') {
+                if (opt && opt.type === 'bool') {
+                    if (v !== boolDefault(opt)) {
+                        out[k] = v;
+                    }
+                } else if (v !== '') {
                     out[k] = v;
                 }
-            } else if (isSecret) {
+            } else if (isSecretOption(opt)) {
                 // Write-only: only a TYPED value rides; blank = unchanged.
                 if (v !== '') {
                     out[k] = v;
@@ -960,6 +1090,57 @@
         }
     }
 
+    // Has the user typed into ANY secret field of this dialog?
+    function anySecretTyped(win) {
+        var vals = dialogValues(win);
+        var map = win._cloudOptionByName || {};
+        var k;
+        for (k in vals) {
+            if (Object.prototype.hasOwnProperty.call(vals, k)
+                && isSecretOption(map[k]) && vals[k] !== '') {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // What the dialog's Test sends.
+    //
+    // An ADD has no stored remote, so the whole dialog rides inline and the
+    // daemon serves it from an env-defined remote — nothing is written before
+    // the user saves.
+    //
+    // An EDIT is different: the dialog CANNOT read a stored secret back (the
+    // API only names it), so an inline envelope would test a remote with no
+    // password and report "Authentication failed" on a remote that is fine.
+    // With nothing typed into a secret, Test names the SAVED remote and the
+    // daemon reads the stored value. Once a secret IS typed, the point is to
+    // try that value before saving it — so the inline envelope comes back,
+    // carrying the typed values over the stored non-secret options.
+    function testBody(win, name, type) {
+        var inline = wireOptions(win, true, {});
+        if (win._cloudIsEdit !== true) {
+            return { remote: { name: name, type: type, options: inline } };
+        }
+        if (!anySecretTyped(win)) {
+            return { name: name };
+        }
+        var merged = {};
+        var stored = win._cloudStoredOptions || {};
+        var k;
+        for (k in stored) {
+            if (Object.prototype.hasOwnProperty.call(stored, k)) {
+                merged[k] = stored[k];
+            }
+        }
+        for (k in inline) {
+            if (Object.prototype.hasOwnProperty.call(inline, k)) {
+                merged[k] = inline[k];
+            }
+        }
+        return { remote: { name: name, type: type, options: merged } };
+    }
+
     function runDialogTest(win, node) {
         var name = trim(valOf(win, '#cloudRemoteName') || '');
         var type = trim(valOf(win, '#cloudRemoteType') || '');
@@ -980,11 +1161,7 @@
                 // non-fatal
             }
         }
-        // Inline, unsaved: the daemon serves it from an env-defined remote —
-        // nothing is written before the user saves.
-        ANAS.api.post(node, '/cloud/remotes/test', {
-            remote: { name: name, type: type, options: wireOptions(win, true, {}) },
-        }).then(function (res) {
+        ANAS.api.post(node, '/cloud/remotes/test', testBody(win, name, type)).then(function (res) {
             if (win.destroyed || win.destroying) {
                 return;
             }
@@ -1031,8 +1208,8 @@
             body: body,
             view: win,
             failTitle: isEdit ? 'Save failed' : 'Add failed',
-            successMsg: isEdit ? (t('Remote saved') + ': ' + name)
-                : (t('Remote added') + ': ' + name),
+            successMsg: isEdit ? (t('Remote saved') + ': ' + enc(name))
+                : (t('Remote added') + ': ' + enc(name)),
             onComplete: function () {
                 if (!win.destroyed && !win.destroying) {
                     win.close();
@@ -1065,7 +1242,7 @@
         try {
             win = Ext.create('Ext.window.Window', {
                 cls: 'anas-win-cloud-remote-edit',
-                title: isEdit ? (t('Edit Remote') + ': ' + (r.name || '')) : t('Add Remote'),
+                title: isEdit ? (t('Edit Remote') + ': ' + enc(r.name || '')) : t('Add Remote'),
                 modal: true,
                 width: 560,
                 height: 680,
@@ -1211,7 +1388,9 @@
         }
 
         win._cloudExisting = r;
+        win._cloudIsEdit = isEdit;
         win._cloudStoredOptions = r.options || {};
+        win._cloudStash = {};
         win._cloudRebuild = function () {
             rebuildOptionFields(win, provs, isEdit, win._cloudStoredOptions || {});
         };

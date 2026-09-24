@@ -19,12 +19,14 @@ const execFileAsync = promisify(execFile)
  *   1. Add an sftp remote `gt` (host 127.0.0.1, user rclonegt, pass gtpass)
  *      → Test in the dialog → "Reachable" → Save → the grid row `gt` lists
  *      `pass (secret)` — never the value.
- *   2. Edit → the password box is blank ("(unchanged)") → save → the file's
- *      `pass =` line is unchanged (ssh; the secret is write-only).
+ *   2. Edit → the password box is blank ("(unchanged)") → change the USER and
+ *      save → the file's `user =` line moves while the `pass =` line stays
+ *      byte-identical (ssh; the secret is write-only), then the user goes back.
  *   3. Test from the toolbar → "Reachable" (the saved remote, by name).
  *   4. A wrong-password UNSAVED dialog → the "Authentication failed" verdict.
- *   5. The S3 form shows exactly ONE `region` row once a provider is picked
- *      (rclone's per-provider filtered options, rendered from the real schema).
+ *   5. The S3 form waits for a provider pick, then shows exactly ONE `region`
+ *      row — and it is the PICKED provider's row, not rclone's `!AWS,…`
+ *      fallback (rendered from the real schema, told apart by the examples).
  *   6. Remove → confirm → the row is gone.
  *   7. An injected failure (the store renamed to a DIRECTORY before Save) →
  *      the failure surfaces and the grid still reloads (the 0.3.3 lesson).
@@ -196,6 +198,24 @@ function optField(win: Locator, name: string): Locator {
   return win.locator(`.anas-fld-cloud-opt-${name} input`).first()
 }
 
+/**
+ * The example values behind an option's combo, read off the component rather
+ * than by opening its picker — an expanded bound list has to be dismissed, and
+ * ESC on a modal window is the wrong thing to gamble a whole test on.
+ */
+async function comboExamples(dlg: Locator, name: string): Promise<string[]> {
+  const inputId = await dlg.locator(`.anas-fld-cloud-opt-${name} input`).first().getAttribute('id')
+  return dlg.page().evaluate((id) => {
+    const ext = (window as unknown as { Ext: { getCmp: (id: string) => any } }).Ext
+    const cmp = ext.getCmp(String(id).replace(/-inputEl$/, ''))
+    const out: string[] = []
+    if (cmp && cmp.getStore) {
+      cmp.getStore().each((r: { get: (k: string) => unknown }) => out.push(String(r.get('value'))))
+    }
+    return out
+  }, inputId)
+}
+
 /** Open the Add dialog, pick a backend type, and wait for its fields. */
 async function openAddDialog(page: Page, win: Locator, name: string, type: string): Promise<Locator> {
   await win.locator('.anas-btn-cloud-remote-add').click()
@@ -315,15 +335,37 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     await expect(optField(dlg, 'host')).toHaveValue(HOST)
     await expect(optField(dlg, 'user')).toHaveValue(USER)
 
-    // "Change" the user to the same value (a body with a changed key only)
-    // and save — the secret must survive byte-identically.
-    await optField(dlg, 'user').fill(USER)
+    // Change the user to a DIFFERENT value and save: the `user =` line must
+    // move and the secret must survive byte-identically. (Re-filling the same
+    // value fires no change event and would prove only that an EMPTY save is
+    // harmless — which is a different claim.)
+    const userLine = (section: string) =>
+      section.split('\n').filter(l => l.startsWith('user =')).join('\n')
+    const userBefore = userLine(before)
+    expect(userBefore).toBe(`user = ${USER}`)
+
+    await optField(dlg, 'user').fill(`${USER}2`)
     await dlg.locator('.anas-btn-cloud-remote-save').click()
     await expect(dlg).toBeHidden({ timeout: 90_000 })
 
     const after = await storeSection(REMOTE)
     const passAfter = after.split('\n').filter(l => l.startsWith('pass =')).join('\n')
     expect(passAfter).toBe(passBefore)
+    expect(userLine(after)).not.toBe(userBefore)
+    expect(userLine(after)).toBe(`user = ${USER}2`)
+
+    // Put it back through the same door — test 3 tests the SAVED remote, and
+    // this second round trip proves the secret survives that save too.
+    await remoteRow(page, win, REMOTE).click()
+    await win.locator('.anas-btn-cloud-remote-edit').click()
+    await expect(dlg).toBeVisible({ timeout: 20_000 })
+    await optField(dlg, 'user').fill(USER)
+    await dlg.locator('.anas-btn-cloud-remote-save').click()
+    await expect(dlg).toBeHidden({ timeout: 90_000 })
+
+    const restored = await storeSection(REMOTE)
+    expect(userLine(restored)).toBe(userBefore)
+    expect(restored.split('\n').filter(l => l.startsWith('pass =')).join('\n')).toBe(passBefore)
   })
 
   test('3 — toolbar Test: the saved remote by name says Reachable', async ({ page }) => {
@@ -355,6 +397,17 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     const win = await openRemotesWindow(page)
 
     const dlg = await openAddDialog(page, win, 'gt-s3probe', 's3')
+
+    // Before the pick, the only `region` row that survives is rclone's
+    // `!AWS,…` negation variant — the fallback, not AWS's row. Its examples
+    // say which one it is. Save waits for the provider pick.
+    await expect(dlg.locator('.anas-fld-cloud-opt-region')).toHaveCount(1)
+    const regionBefore = await comboExamples(dlg, 'region')
+    expect(regionBefore, `region examples before the pick: ${regionBefore.join(',')}`)
+      .toContain('other-v2-signature')
+    expect(regionBefore).not.toContain('us-east-1')
+    await expect(dlg.locator('.anas-btn-cloud-remote-save')).toBeDisabled()
+
     // The `provider` option renders as an editable combo of rclone's examples.
     const providerInput = dlg.locator('.anas-fld-cloud-opt-provider input')
     await providerInput.click()
@@ -363,8 +416,14 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     await boundList.locator('.x-boundlist-item', { hasText: 'AWS' }).first().click()
 
     // rclone's schema repeats `region` per provider filter — the dialog
-    // renders only the row that applies to the picked provider.
+    // renders only the row that applies to the picked provider, and THAT row
+    // is AWS's (its examples carry the AWS regions).
     await expect(dlg.locator('.anas-fld-cloud-opt-region')).toHaveCount(1)
+    const regionAfter = await comboExamples(dlg, 'region')
+    expect(regionAfter, `region examples after picking AWS: ${regionAfter.join(',')}`)
+      .toContain('us-east-1')
+    expect(regionAfter).not.toContain('other-v2-signature')
+    await expect(dlg.locator('.anas-btn-cloud-remote-save')).toBeEnabled()
 
     await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
@@ -410,10 +469,17 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     const before = fetches.count()
     await dlg.locator('.anas-btn-cloud-remote-save').click()
 
-    // The failure surfaces (the refusal sentence in the failure alert — never
-    // a silent nothing), and the manager grid STILL reloads.
-    await expect(page.locator('.x-messagebox').first()).toBeVisible({ timeout: 60_000 })
-    await expect(fetches.count()).toBeGreaterThan(before)
+    // The failure surfaces as the SAVE failure alert — 10-api.js titles it with
+    // the job's failTitle ('Save failed' on an edit) and puts the daemon's own
+    // sentence in the body — never a bare "failed" and never some other modal.
+    const failAlert = page.locator('.x-messagebox').filter({ hasText: 'Save failed' })
+    await expect(failAlert.first()).toBeVisible({ timeout: 60_000 })
+    const failBody = ((await failAlert.first().textContent()) ?? '').replace(/Save failed|OK|Cancel/g, '').trim()
+    expect(failBody.length, `the save-failure alert body was: ${failBody}`).toBeGreaterThan(10)
+
+    // …and the manager grid STILL reloads. The counter is fed by an async
+    // route handler, so it is polled, not read once.
+    await expect.poll(() => fetches.count(), { timeout: 60_000 }).toBeGreaterThan(before)
 
     // Restore, then dismiss every stacked failure alert (the save's refusal
     // and the reload's own load failure — the reload path re-probed the store

@@ -133,7 +133,20 @@
  *      picked S3 provider, the OAuth sentence with the always-visible token
  *      field, advanced rows not built until the toggle asks), the live
  *      required-field gate, the encrypted lockout, the 503 door, and reload
- *      on success AND failure.
+ *      on success AND failure. And the four ways that gate and that wire body
+ *      go wrong on a REAL backend: a required option that is a stored SECRET
+ *      reads blank and must not dead-lock Save (b2 `key`); a bool is never a
+ *      write-only secret, so unticking rclone's secret-by-NAME
+ *      `ask_password` SENDS false instead of "unchanged"; the advanced toggle
+ *      is a view, so a value typed into a hidden row is kept and sent while a
+ *      bool still matching rclone's own default is NOT a key; and a backend
+ *      with a `provider` option requires the pick, because with none the only
+ *      surviving rows are the `!A,B` negations — the wrong form. Test from an
+ *      EDIT names the SAVED remote unless a secret was typed (the inline
+ *      envelope cannot carry a stored one and would report a false auth
+ *      failure). A required option hidden by its provider filter never gates
+ *      (koofr `endpoint`); a NON-503 load failure leaves the window usable;
+ *      a 409 `referenced` refusal reaches the user titled and reloads.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -482,7 +495,7 @@ function makeComponent(cfg, parent) {
     return rec
   }
 
-  c.setLoading = () => c
+  c.setLoading = (msg) => { c.loadingMsg = msg; return c }
   c.setHidden = function (v) { c.hidden = !!v; return c }
   c.setVisible = function (v) { c.hidden = !v; return c }
   c.isVisible = () => !c.hidden
@@ -749,6 +762,12 @@ function makeAnas(routes) {
         method: cfg.method,
         path: cfg.path,
         body: cfg.body,
+        // The title 10-api.js puts on the failure modal, under which it shows
+        // ANAS.errText(err) — the daemon's own refusal sentence. A job that
+        // names no title falls back to a bare "Operation failed".
+        failTitle: cfg.failTitle,
+        // The text ANAS.toast renders on success — HTML, like every toast.
+        successMsg: cfg.successMsg,
         onComplete: cfg.onComplete,
         onFailed: cfg.onFailed,
       })
@@ -10324,6 +10343,28 @@ const CLOUD_SFTP_REMOTE = {
   secretsSet: ['pass'],
 }
 
+// A saved b2 remote: its REQUIRED option `key` is a SECRET, so the edit box is
+// blank "(unchanged)" and only `secretsSet` says it is set. The gate must read
+// that blank as PRESENT — otherwise Save and Test are dead on every edit of a
+// backend whose required option is a secret.
+const CLOUD_B2_REMOTE = {
+  name: 'b2gt',
+  type: 'b2',
+  options: { account: 'acct123' },
+  secretsSet: ['key'],
+}
+
+// A saved sftp remote whose ADVANCED bool `ask_password` is ON. rclone types
+// it secret by NAME (it ends in `password`) although it is a checkbox — and a
+// checkbox has no "(unchanged)" state, so the write-only rule would make it
+// impossible to turn off.
+const CLOUD_ASKPASS_REMOTE = {
+  name: 'askpw',
+  type: 'sftp',
+  options: { host: '127.0.0.1', user: 'rclonegt', ask_password: 'true' },
+  secretsSet: [],
+}
+
 function cloudRoutes(remotes, encrypted) {
   return {
     'GET /cloud/providers': { data: CLOUD_PROVIDERS },
@@ -10339,6 +10380,8 @@ function cloudRoutes(remotes, encrypted) {
     },
     'POST /cloud/remotes': { job: { id: 'cloud-j-create' } },
     'PUT /cloud/remotes/gt': { job: { id: 'cloud-j-update' } },
+    'PUT /cloud/remotes/b2gt': { job: { id: 'cloud-j-update' } },
+    'PUT /cloud/remotes/askpw': { job: { id: 'cloud-j-update' } },
     'DELETE /cloud/remotes/gt': { job: { id: 'cloud-j-delete' } },
     'POST /cloud/remotes/test': { data: { verdict: 'ok', message: '' } },
   }
@@ -10376,7 +10419,7 @@ async function cloudChecks() {
     testBodies.push(body)
     return { data: { verdict: 'ok', message: '' } }
   }
-  let { win } = await openCloudRemotes(routes)
+  let { ANAS: cloudAnas, win } = await openCloudRemotes(routes)
   let grid = win.down('#cloudRemotesGrid')
 
   // --- (a) The manager window: grid, Set column, footer --------------------
@@ -10400,8 +10443,23 @@ async function cloudChecks() {
 
   // --- (b) Toolbar Test: the SAVED remote by name --------------------------
   grid.selectRow(0)
+  // The Type cell is a store value from the node's own config file: it goes
+  // through ANAS.enc like every other rendered string. Proven by swapping the
+  // sandbox's enc for a marker — the source calls ANAS.enc through a closure.
+  const realEnc = cloudAnas.enc
+  cloudAnas.enc = v => `ENC(${String(v == null ? '' : v)})`
+  ok('cloud: the Type column html-encodes its store value (a renderer, not a raw cell)',
+    typeof grid.columns[1].renderer === 'function'
+      && grid.columns[1].renderer('sftp') === 'ENC(sftp)',
+    grid.columns[1].renderer && String(grid.columns[1].renderer('sftp')))
+  cloudAnas.enc = realEnc
+
   const gridTestBtn = findCmp(win, 'anas-btn-cloud-remote-test')
+  cloudAnas.enc = v => `ENC(${String(v == null ? '' : v)})`
   gridTestBtn.handler(gridTestBtn)
+  ok('cloud(toolbar test): the LoadMask text encodes the remote name (a mask message is HTML)',
+    /ENC\(gt\)/.test(String(grid.loadingMsg || '')), String(grid.loadingMsg))
+  cloudAnas.enc = realEnc
   await settle()
   eq('cloud(toolbar test): the saved remote tests by NAME (no options on the wire)',
     testBodies[0], { name: 'gt' })
@@ -10453,6 +10511,41 @@ async function cloudChecks() {
   ok('cloud(create): the dialog closed and the manager reloaded',
     dlg.destroyed === true
       && apiGets.filter(p => p === '/cloud/remotes').length === getsBeforeCreate + 1)
+
+  // --- (c2) the advanced toggle is a VIEW, not a filter --------------------
+  // Unticking it hides rows; it must not throw away what the user typed into
+  // them, and what was typed still reaches the create body with the toggle off.
+  created.windows.length = 0
+  findCmp(win, 'anas-btn-cloud-remote-add').handler()
+  await settle()
+  dlg = openWindow()
+  dlg.down('#cloudRemoteName').setValue('sftpadv')
+  dlg.down('#cloudRemoteType').setValue('sftp')
+  await settle()
+  cloudOption(dlg, 'host').setValue('127.0.0.1')
+  dlg.down('#cloudAdvanced').setValue(true)
+  await settle()
+  cloudOption(dlg, 'md5sum_command').setValue('md5sum')
+  await settle()
+  dlg.down('#cloudAdvanced').setValue(false)
+  await settle()
+  ok('cloud(advanced): unticking the toggle takes the advanced rows off the form',
+    cloudOption(dlg, 'md5sum_command') === null)
+  dlg.down('#cloudAdvanced').setValue(true)
+  await settle()
+  ok('cloud(advanced): re-ticking shows what was typed, never an empty box',
+    !!cloudOption(dlg, 'md5sum_command')
+      && cloudOption(dlg, 'md5sum_command').getValue() === 'md5sum',
+    cloudOption(dlg, 'md5sum_command') && String(cloudOption(dlg, 'md5sum_command').getValue()))
+  dlg.down('#cloudAdvanced').setValue(false)
+  await settle()
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-cloud-remote-save').handler()
+  await settle()
+  eq('cloud(advanced): a value typed into an advanced row rides the create body with the toggle OFF',
+    jobs[0] && jobs[0].body,
+    { name: 'sftpadv', type: 'sftp', options: { host: '127.0.0.1', md5sum_command: 'md5sum' } })
+  created.windows.length = 0
 
   // --- (d) Edit: write-only secrets, changed-keys-only PUT, foreign keys ---
   created.windows.length = 0
@@ -10517,6 +10610,93 @@ async function cloudChecks() {
   eq('cloud(edit): a cleared non-secret field sends \'\' (= remove)',
     jobs[0] && jobs[0].body, { options: { user: '' } })
 
+  // --- (d2) a required SECRET that is already stored is PRESENT ------------
+  // b2's `key` is required AND secret: the edit box is blank "(unchanged)" and
+  // only `secretsSet` says it is set. Reading that blank as "missing" would
+  // kill Save and Test on every edit of such a backend.
+  created.windows.length = 0
+  const b2TestBodies = []
+  const b2Routes = cloudRoutes([CLOUD_B2_REMOTE])
+  b2Routes['POST /cloud/remotes/test'] = (body) => {
+    b2TestBodies.push(body)
+    return { data: { verdict: 'ok', message: '' } }
+  }
+  const b2Loaded = await openCloudRemotes(b2Routes)
+  const b2Win = b2Loaded.win
+  // The window title and the success toast are HTML: a marker enc proves the
+  // remote name goes through it rather than straight into the markup.
+  b2Loaded.ANAS.enc = v => `ENC(${String(v == null ? '' : v)})`
+  const b2Grid = b2Win.down('#cloudRemotesGrid')
+  b2Grid.selectRow(0)
+  const b2Edit = findCmp(b2Win, 'anas-btn-cloud-remote-edit')
+  b2Edit.handler(b2Edit)
+  await settle()
+  dlg = openWindow()
+  ok('cloud(edit b2): the dialog title encodes the remote name (a window title is HTML)',
+    /ENC\(b2gt\)/.test(String(dlg.title || '')), String(dlg.title))
+  ok('cloud(edit b2): the required secret `key` is blank with "(unchanged)"',
+    !!cloudOption(dlg, 'key') && cloudOption(dlg, 'key').getValue() === ''
+      && cloudOption(dlg, 'key').emptyText === '(unchanged)',
+    cloudOption(dlg, 'key') && cloudOption(dlg, 'key').emptyText)
+  ok('cloud(edit b2): a stored required secret does NOT gate — Save and Test are live',
+    dlg.down('#submit').disabled === false && dlg.down('#cloudTestBtn').disabled === false)
+
+  // The dialog Test from an EDIT: the inline envelope cannot carry the stored
+  // secret, so an untouched edit tests the SAVED remote by name.
+  findCmp(dlg, 'anas-btn-cloud-remote-testconn').handler()
+  await settle()
+  eq('cloud(dialog test, edit): with no secret typed the SAVED remote is tested BY NAME (an inline envelope would drop the stored key and report a false auth failure)',
+    b2TestBodies[b2TestBodies.length - 1], { name: 'b2gt' })
+  cloudOption(dlg, 'key').setValue('typedkey')
+  await settle()
+  findCmp(dlg, 'anas-btn-cloud-remote-testconn').handler()
+  await settle()
+  eq('cloud(dialog test, edit): a TYPED secret goes back inline, over the stored non-secret options',
+    b2TestBodies[b2TestBodies.length - 1],
+    { remote: { name: 'b2gt', type: 'b2', options: { account: 'acct123', key: 'typedkey' } } })
+
+  cloudOption(dlg, 'key').setValue('')
+  cloudOption(dlg, 'account').setValue('x')
+  await settle()
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-cloud-remote-save').handler()
+  await settle()
+  eq('cloud(edit b2): a changed non-secret saves alone — the untouched stored secret never rides',
+    jobs[0] && jobs[0].body, { options: { account: 'x' } })
+  ok('cloud(edit b2): the success toast encodes the remote name (Ext.toast renders HTML)',
+    /ENC\(b2gt\)/.test(String((jobs[0] || {}).successMsg || '')), String((jobs[0] || {}).successMsg))
+  ok('cloud(edit b2): the PUT went to the named remote',
+    jobs[0] && jobs[0].path === '/cloud/remotes/b2gt', jobs[0] && jobs[0].path)
+  created.windows.length = 0
+
+  // --- (d3) a secret-by-NAME BOOL is never write-only ----------------------
+  // rclone flags sftp's `ask_password` secret because the name ends in
+  // `password` — but it is a checkbox, and a checkbox has no "(unchanged)"
+  // state. Treated as write-only it can be switched on and never off.
+  created.windows.length = 0
+  const apWin = (await openCloudRemotes(cloudRoutes([CLOUD_ASKPASS_REMOTE]))).win
+  const apGrid = apWin.down('#cloudRemotesGrid')
+  apGrid.selectRow(0)
+  const apEdit = findCmp(apWin, 'anas-btn-cloud-remote-edit')
+  apEdit.handler(apEdit)
+  await settle()
+  dlg = openWindow()
+  dlg.down('#cloudAdvanced').setValue(true)
+  await settle()
+  ok('cloud(edit bool secret): a stored `ask_password = true` renders TICKED — a bool is not a write-only secret',
+    !!cloudOption(dlg, 'ask_password') && cloudOption(dlg, 'ask_password').getValue() === true,
+    cloudOption(dlg, 'ask_password') && String(cloudOption(dlg, 'ask_password').getValue()))
+  ok('cloud(edit bool secret): the row is a CHECKBOX, not a password box',
+    !!cloudOption(dlg, 'ask_password') && cloudOption(dlg, 'ask_password').inputType !== 'password')
+  cloudOption(dlg, 'ask_password').setValue(false)
+  await settle()
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-cloud-remote-save').handler()
+  await settle()
+  eq('cloud(edit bool secret): unticking a stored true SENDS false — a blank would read as "unchanged" and pin it on forever',
+    jobs[0] && jobs[0].body, { options: { ask_password: 'false' } })
+  created.windows.length = 0
+
   // --- (e) drive: the OAuth sentence + the always-visible token field ------
   created.windows.length = 0
   findCmp(win, 'anas-btn-cloud-remote-add').handler()
@@ -10553,8 +10733,15 @@ async function cloudChecks() {
   dlg.down('#cloudRemoteName').setValue('s3test')
   dlg.down('#cloudRemoteType').setValue('s3')
   await settle()
+  // With NO provider picked, every positive filter misses and only the
+  // `!AWS,…` rows survive — the wrong form. A backend that HAS a `provider`
+  // option requires one, so Save and Test wait for the pick.
+  ok('cloud(s3): with no provider picked Save and Test stay DISABLED',
+    dlg.down('#submit').disabled === true && dlg.down('#cloudTestBtn').disabled === true)
   dlg.down('#cloudOpt_provider').setValue('AWS')
   await settle()
+  ok('cloud(s3): picking a provider enables Save and Test',
+    dlg.down('#submit').disabled === false && dlg.down('#cloudTestBtn').disabled === false)
   eq('cloud(s3): exactly ONE region row after picking provider AWS',
     cloudRowFields(dlg, 'cloudOptionsBasic', 'region'), 1)
   const region = cloudOption(dlg, 'region')
@@ -10571,6 +10758,76 @@ async function cloudChecks() {
     cloudRowFields(dlg, 'cloudOptionsBasic', 'region'), 1)
   ok('cloud(s3): the secret_access_key field is a password box',
     cloudOption(dlg, 'secret_access_key').inputType === 'password')
+  created.windows.length = 0
+
+  // --- (f2) create: rclone's OWN defaults are never keys -------------------
+  // A checkbox always has a state, so an untouched advanced form would
+  // otherwise write every default-true bool into the node's config file.
+  findCmp(win, 'anas-btn-cloud-remote-add').handler()
+  await settle()
+  dlg = openWindow()
+  dlg.down('#cloudRemoteName').setValue('s3defaults')
+  dlg.down('#cloudRemoteType').setValue('s3')
+  await settle()
+  dlg.down('#cloudOpt_provider').setValue('AWS')
+  await settle()
+  dlg.down('#cloudAdvanced').setValue(true)
+  await settle()
+  ok('cloud(s3): a SECRET option that also carries examples is a password box, never a combo that shows the value',
+    !!cloudOption(dlg, 'sse_customer_key')
+      && cloudOption(dlg, 'sse_customer_key').inputType === 'password',
+    cloudOption(dlg, 'sse_customer_key') && String(cloudOption(dlg, 'sse_customer_key').xtype))
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-cloud-remote-save').handler()
+  await settle()
+  eq('cloud(create): an untouched advanced form sends NO default-valued bool (force_path_style defaults TRUE)',
+    jobs[0] && jobs[0].body, { name: 's3defaults', type: 's3', options: { provider: 'AWS' } })
+  created.windows.length = 0
+
+  findCmp(win, 'anas-btn-cloud-remote-add').handler()
+  await settle()
+  dlg = openWindow()
+  dlg.down('#cloudRemoteName').setValue('s3bools')
+  dlg.down('#cloudRemoteType').setValue('s3')
+  await settle()
+  dlg.down('#cloudOpt_provider').setValue('AWS')
+  await settle()
+  dlg.down('#cloudAdvanced').setValue(true)
+  await settle()
+  cloudOption(dlg, 'force_path_style').setValue(false)
+  cloudOption(dlg, 'v2_auth').setValue(true)
+  await settle()
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-cloud-remote-save').handler()
+  await settle()
+  eq('cloud(create): a bool that OVERRIDES its default is a key either way',
+    jobs[0] && jobs[0].body,
+    { name: 's3bools', type: 's3', options: { provider: 'AWS', force_path_style: 'false', v2_auth: 'true' } })
+  created.windows.length = 0
+
+  // --- (f3) koofr: a required option HIDDEN by its filter never gates ------
+  // koofr's `endpoint` is required but applies only to provider `other`, and
+  // its `password` is required per provider. Only the RENDERED rows gate.
+  findCmp(win, 'anas-btn-cloud-remote-add').handler()
+  await settle()
+  dlg = openWindow()
+  dlg.down('#cloudRemoteName').setValue('kf')
+  dlg.down('#cloudRemoteType').setValue('koofr')
+  await settle()
+  cloudOption(dlg, 'user').setValue('kuser')
+  await settle()
+  ok('cloud(koofr): with no provider picked Save stays disabled although every rendered required row is filled',
+    dlg.down('#submit').disabled === true)
+  dlg.down('#cloudOpt_provider').setValue('koofr')
+  await settle()
+  ok('cloud(koofr): the pick renders that provider\'s own required password row, and re-gates on it',
+    !!cloudOption(dlg, 'password') && dlg.down('#submit').disabled === true)
+  ok('cloud(koofr): the required `endpoint` (filter `other`) is not rendered for this provider',
+    cloudOption(dlg, 'endpoint') === null)
+  cloudOption(dlg, 'password').setValue('kpass')
+  await settle()
+  ok('cloud(koofr): a required option HIDDEN by its provider filter never blocks — the rendered ones alone gate',
+    dlg.down('#submit').disabled === false && dlg.down('#cloudTestBtn').disabled === false)
   created.windows.length = 0
 
   // --- (g) encrypted: the mutations go, the fact is in the footer ----------
@@ -10604,6 +10861,34 @@ async function cloudChecks() {
     win.down('#cloudUnavailable') && win.down('#cloudUnavailable').html)
   created.windows.length = 0
 
+  // --- (h2) a NON-503 load failure: the window stays usable ----------------
+  // 503 is "this node has no rclone" and replaces the grid. Anything else is
+  // transient — the grid must come back, and a "not installed" note left from
+  // an earlier 503 must not sit there contradicting the alert.
+  created.windows.length = 0
+  const flaky = {
+    'GET /cloud/providers': err503,
+    'GET /cloud/remotes': err503,
+  }
+  ;({ win } = await openCloudRemotes(flaky))
+  await settle()
+  ok('cloud(load failure): the 503 state is the starting point (grid replaced by the sentence)',
+    win.down('#cloudRemotesGrid').hidden === true && win.down('#cloudUnavailable').hidden === false)
+  const err500 = new Error('rclone config dump failed: exit 1')
+  err500.status = 500
+  flaky['GET /cloud/providers'] = err500
+  flaky['GET /cloud/remotes'] = err500
+  warnings.length = 0
+  win._reload()
+  await settle()
+  ok('cloud(load failure): a NON-503 failure brings the grid back and clears the stale "not installed" note',
+    win.down('#cloudRemotesGrid').hidden === false && win.down('#cloudUnavailable').hidden === true,
+    `grid.hidden=${win.down('#cloudRemotesGrid').hidden} note.hidden=${win.down('#cloudUnavailable').hidden}`)
+  ok('cloud(load failure): the failure is named in an alert carrying rclone\'s own line, never swallowed',
+    warnings.some(w => /alert: Load failed/.test(w) && /exit 1/.test(w)), warnings.join(' | '))
+  warnings.length = 0
+  created.windows.length = 0
+
   // --- (i) Remove: plain confirm → DELETE, reload on success AND failure ---
   routes = cloudRoutes()
   ;({ win } = await openCloudRemotes(routes))
@@ -10616,10 +10901,12 @@ async function cloudChecks() {
   eq('cloud(remove): the confirm goes straight to the DELETE (a refusal rides onError, no confirm-code flow)',
     jobs.length && jobs[0].method === 'del' && jobs[0].path, '/cloud/remotes/gt')
   ok('cloud(remove): the confirm window was asked', confirms.length > 0)
+  eq('cloud(remove): the DELETE names its failure TITLE, so a 409 `referenced` refusal reaches the user as the daemon\'s own sentence (10-api.js alerts errText under it) and never a bare "failed"',
+    jobs[0] && jobs[0].failTitle, 'Remove failed')
   const getsBeforeRemoveFail = apiGets.filter(p => p === '/cloud/remotes').length
   jobs[0].onFailed()
   await settle()
-  ok('cloud(remove): a FAILED removal still reloads the grid',
+  ok('cloud(remove): a 409 referenced refusal still reloads the grid — the file\'s real state',
     apiGets.filter(p => p === '/cloud/remotes').length === getsBeforeRemoveFail + 1)
   created.windows.length = 0
 

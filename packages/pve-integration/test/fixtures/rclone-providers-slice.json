@@ -2738,5 +2738,135 @@
         "advanced": true
       }
     ]
+  },
+  {
+    "name": "koofr",
+    "description": "Koofr, Digi Storage and other Koofr-compatible storage providers",
+    "options": [
+      {
+        "name": "provider",
+        "help": "Choose your storage provider.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "koofr",
+            "help": "Koofr, https://app.koofr.net/",
+            "provider": ""
+          },
+          {
+            "value": "digistorage",
+            "help": "Digi Storage, https://storage.rcs-rds.ro/",
+            "provider": ""
+          },
+          {
+            "value": "other",
+            "help": "Any other Koofr API compatible storage service",
+            "provider": ""
+          }
+        ],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "The Koofr API endpoint to use.",
+        "type": "string",
+        "required": true,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "other",
+        "advanced": false
+      },
+      {
+        "name": "mountid",
+        "help": "Mount ID of the mount to use.\n\nIf omitted, the primary mount is used.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "setmtime",
+        "help": "Does the backend support setting modification time.\n\nSet this to false if you use a mount ID that points to a Dropbox or Amazon Drive backend.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "true",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "user",
+        "help": "Your user name.",
+        "type": "string",
+        "required": true,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "password",
+        "help": "Your password for rclone (generate one at https://app.koofr.net/app/admin/preferences/password).",
+        "type": "string",
+        "required": true,
+        "secret": true,
+        "password": true,
+        "default": "",
+        "examples": [],
+        "provider": "koofr",
+        "advanced": false
+      },
+      {
+        "name": "password",
+        "help": "Your password for rclone (generate one at https://storage.rcs-rds.ro/app/admin/preferences/password).",
+        "type": "string",
+        "required": true,
+        "secret": true,
+        "password": true,
+        "default": "",
+        "examples": [],
+        "provider": "digistorage",
+        "advanced": false
+      },
+      {
+        "name": "password",
+        "help": "Your password for rclone (generate one at your service's settings page).",
+        "type": "string",
+        "required": true,
+        "secret": true,
+        "password": true,
+        "default": "",
+        "examples": [],
+        "provider": "other",
+        "advanced": false
+      },
+      {
+        "name": "encoding",
+        "help": "The encoding for the backend.\n\nSee the [encoding section in the overview](/overview/#encoding) for more info.",
+        "type": "MultiEncoder",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "Slash,BackSlash,Del,Ctl,InvalidUtf8,Dot",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      }
+    ]
   }
 ]
