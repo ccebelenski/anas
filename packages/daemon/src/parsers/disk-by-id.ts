@@ -17,17 +17,27 @@ const SYMLINK_RE = /(\S+)\s+->\s+(?:\.\.\/)*(\S+)$/
 const PARTITION_RE = /-part\d+$/
 const RELATIVE_PREFIX_RE = /^(?:\.\.\/)*/
 const NVME_PART_RE = /^(nvme\d+n\d+)p\d+$/
+/**
+ * eMMC/SD names carry their disk NUMBER before the `pN` partition suffix
+ * (`mmcblk0p1`), so the generic non-digits-then-digits rule below cannot reduce
+ * them — and would mangle the whole-disk `mmcblk0` into `mmcblk`. Both forms are
+ * matched here, ahead of it (vdevs.1 kernel-name leaf resolution).
+ */
+const MMC_PART_RE = /^(mmcblk\d+)(?:p\d+)?$/
 const SCSI_PART_RE = /^(\D+)\d+$/
 
 /**
  * Reduce a kernel partition name to its whole-disk parent:
- *   sdb1 → sdb, sda15 → sda, nvme0n1p1 → nvme0n1.
+ *   sdb1 → sdb, sda15 → sda, nvme0n1p1 → nvme0n1, mmcblk0p1 → mmcblk0.
  * A whole-disk name (no partition suffix) is returned unchanged.
  */
 export function wholeDiskKernel(kernel: string): string {
   const nvme = kernel.match(NVME_PART_RE)
   if (nvme)
     return nvme[1]
+  const mmc = kernel.match(MMC_PART_RE)
+  if (mmc)
+    return mmc[1]
   const scsi = kernel.match(SCSI_PART_RE)
   if (scsi)
     return scsi[1]

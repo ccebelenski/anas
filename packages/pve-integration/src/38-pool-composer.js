@@ -457,19 +457,29 @@
             }
         }
 
-        // Roles already present.
+        // Roles already present — the STAGED vdevs and, in expand mode, the
+        // pool's existing ones. Reading only the staged list offered a second
+        // special vdev to a pool that already had one, and left that vdev's
+        // danger sentence unsaid on the pool it actually applies to (vdevs.1
+        // consumer audit): the seeded topology is where those roles live.
         var hasSpecial = false;
         var hasCache = false;
         var hasLog = false;
+        var roles = [];
         for (i = 0; i < state.vdevs.length; i++) {
-            v = state.vdevs[i];
-            if (v.role === 'special') {
+            roles.push(state.vdevs[i].role);
+        }
+        for (i = 0; i < (state.existing || []).length; i++) {
+            roles.push(state.existing[i].role);
+        }
+        for (i = 0; i < roles.length; i++) {
+            if (roles[i] === 'special') {
                 hasSpecial = true;
             }
-            if (v.role === 'cache') {
+            if (roles[i] === 'cache') {
                 hasCache = true;
             }
-            if (v.role === 'log') {
+            if (roles[i] === 'log') {
                 hasLog = true;
             }
         }

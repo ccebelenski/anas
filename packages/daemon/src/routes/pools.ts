@@ -38,6 +38,8 @@ const FINDMNT_ARGS = ['--json', '--real']
 
 const BY_ID_PREFIX = '/dev/disk/by-id/'
 const PART_BY_ID_RE = /-part\d+$/
+/** `/dev/sdb1`, `/dev/nvme0n1p2` — a leaf ZFS named by its kernel device. */
+const KERNEL_DEV_PATH_RE = /^\/dev\/([a-z0-9]+)$/
 const TRAILING_CR_RE = /\r$/
 const TRAILING_SLASHES_RE = /\/+$/
 /** ZFS vdev names (raidz1-0, mirror-0, …) — charset guard for raidz-expand. */
@@ -54,43 +56,98 @@ const VDEV_REMOVE_POLL_MS = 250
 /** A destroyed pool's vdev leaf, resolved for disk hygiene (story 3.14). */
 interface PoolLeaf {
   /**
-   * by-id of the ACTUAL vdev device — WITH any `-partN` suffix, because that is
-   * where ZFS wrote its four labels (two front, two back). `labelclear`/`wipefs`
-   * must target this, not the whole disk: the parser's `disk.id` already strips
-   * `-partN`, which would mis-target the whole-disk device and leave the
-   * partition's labels intact.
+   * Identity of the ACTUAL vdev device — WITH any `-partN` suffix, because that
+   * is where ZFS wrote its four labels (two front, two back). `labelclear`/
+   * `wipefs` must target this, not the whole disk: the parser's `disk.id`
+   * already strips `-partN`, which would mis-target the whole-disk device and
+   * leave the partition's labels intact. A by-id name where ZFS gave one, else
+   * the kernel name. Reported back to the caller, so it names what was cleaned.
    */
   leafId: string
-  /** `/dev/disk/by-id/<leafId>` — labelclear + wipefs target. */
+  /** The leaf's REAL device path — labelclear + wipefs target. */
   leafPath: string
-  /** by-id of the WHOLE disk (leafId minus `-partN`) — the GPT-zap target. */
+  /** Identity of the WHOLE disk (leafId minus its partition suffix). */
   wholeDiskId: string
+  /** The WHOLE disk's REAL device path — the GPT-zap and ownership-probe target. */
+  wholeDiskPath: string
+  /**
+   * The leaf's KERNEL partition name when ZFS named the device directly
+   * (`/dev/sdb1`) rather than through by-id. The ownership guard resolves our
+   * own partitions through the by-id map; a leaf that never had a by-id needs
+   * this instead, or every partition of the disk reads as a stranger's.
+   */
+  leafKernel?: string
+}
+
+/**
+ * EVERY leaf of EVERY vdev class of a pool — data, log, cache, spare, special
+ * and dedup alike. The one `vdevGroups` walk both the destroy cleanup and the
+ * pool-list trim probe share, so "which classes count as leaves" is decided in
+ * ONE place (vdevs.1 consumer audit, GitHub #66: a leaf of a log, special or
+ * dedup vdev was invisible while the parser dropped those sections, and each
+ * consumer would have had to learn about them separately).
+ *
+ * Exported for the consumer-audit tests.
+ */
+export function allVdevLeaves(pool: ParsedPoolStatus): LeafRef[] {
+  const leaves: LeafRef[] = []
+  for (const group of pool.vdevGroups) {
+    for (const vdev of group.vdevs) {
+      for (const disk of vdev.disks)
+        leaves.push({ id: disk.id, path: disk.path })
+    }
+  }
+  return leaves
 }
 
 /**
  * Resolve a destroyed pool's leaves for cleanup. The leaf's real device node is
  * `disk.path` (`…-part1` for a partition vdev, the whole-disk by-id for a bare-
  * disk vdev); prefer it so labelclear hits the partition that actually holds the
- * labels. `wholeDiskId` is derived by stripping the trailing `-partN` from the
+ * labels. The whole disk is derived by stripping the trailing `-partN` from the
  * by-id name — uniform and nvme-safe (never a `sdb`+`1` / `nvme0n1`+`p1` concat).
+ *
+ * A pool built on the command line from `/dev/sdX` names has NO by-id anywhere
+ * in `zpool status`: ZFS reports the kernel path and the kernel name. Composing
+ * `/dev/disk/by-id/sdb1` out of that names nothing, so the cleanup used to fail
+ * on every leaf of such a pool and leave the disk labelled (vdevs.1 live proof).
+ * Those leaves are addressed by their kernel device instead, whole disk
+ * included, through the same partition-suffix reduction the disk join uses.
+ *
+ * Exported for the consumer-audit tests.
  */
-function leavesFromStatus(pool: ParsedPoolStatus): PoolLeaf[] {
-  const leaves: PoolLeaf[] = []
-  for (const group of pool.vdevGroups) {
-    for (const vdev of group.vdevs) {
-      for (const disk of vdev.disks) {
-        const leafId = disk.path.startsWith(BY_ID_PREFIX)
-          ? disk.path.slice(BY_ID_PREFIX.length)
-          : disk.id
-        leaves.push({
-          leafId,
-          leafPath: `${BY_ID_PREFIX}${leafId}`,
-          wholeDiskId: leafId.replace(PART_BY_ID_RE, ''),
-        })
+export function leavesFromStatus(pool: ParsedPoolStatus): PoolLeaf[] {
+  return allVdevLeaves(pool).map(({ id, path }) => {
+    if (path.startsWith(BY_ID_PREFIX)) {
+      const leafId = path.slice(BY_ID_PREFIX.length)
+      const wholeDiskId = leafId.replace(PART_BY_ID_RE, '')
+      return {
+        leafId,
+        leafPath: `${BY_ID_PREFIX}${leafId}`,
+        wholeDiskId,
+        wholeDiskPath: `${BY_ID_PREFIX}${wholeDiskId}`,
       }
     }
-  }
-  return leaves
+    const kernel = KERNEL_DEV_PATH_RE.exec(path)?.[1]
+    if (kernel) {
+      const wholeDiskId = wholeDiskKernel(kernel)
+      return {
+        leafId: kernel,
+        leafPath: `/dev/${kernel}`,
+        wholeDiskId,
+        wholeDiskPath: `/dev/${wholeDiskId}`,
+        leafKernel: kernel,
+      }
+    }
+    // Neither form: fall back to reading the id as a by-id name, as before.
+    const wholeDiskId = id.replace(PART_BY_ID_RE, '')
+    return {
+      leafId: id,
+      leafPath: `${BY_ID_PREFIX}${id}`,
+      wholeDiskId,
+      wholeDiskPath: `${BY_ID_PREFIX}${wholeDiskId}`,
+    }
+  })
 }
 
 /** Whole-disk ownership verdict for the destroy-cleanup GPT-zap guard. */
@@ -112,19 +169,21 @@ interface LsblkOwnChild { name?: string, type?: string, fstype?: string | null, 
  */
 async function evaluateDiskOwnership(
   executor: CommandExecutor,
-  wholeDiskId: string,
+  wholeDiskPath: string,
   diskLeaves: PoolLeaf[],
   byIdToKernel: Map<string, string>,
 ): Promise<DiskOwnership> {
   // Kernel names of OUR leaves on this disk — excluded from the foreign scan.
+  // A leaf ZFS named by its kernel device carries that name itself; every other
+  // leaf resolves through the by-id map.
   const ourKernels = new Set<string>()
   for (const leaf of diskLeaves) {
-    const kernel = byIdToKernel.get(leaf.leafId)
+    const kernel = byIdToKernel.get(leaf.leafId) ?? leaf.leafKernel
     if (kernel)
       ourKernels.add(kernel)
   }
 
-  const probe = await executor.exec(LSBLK, ['-Jb', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT', `${BY_ID_PREFIX}${wholeDiskId}`])
+  const probe = await executor.exec(LSBLK, ['-Jb', '-o', 'NAME,TYPE,FSTYPE,MOUNTPOINT', wholeDiskPath])
   if (probe.exitCode !== 0)
     return 'uncertain'
 
@@ -663,19 +722,12 @@ export async function poolRoutes(
       ? parseZpoolUpgrade(upgradeResult.stdout)
       : new Set<string>()
 
-    // Collect a pool's leaf devices (id + path) from its parsed topology.
-    const leavesOf = (status: (typeof statusData)[number] | undefined): LeafRef[] => {
-      const leaves: LeafRef[] = []
-      if (!status)
-        return leaves
-      for (const group of status.vdevGroups) {
-        for (const vdev of group.vdevs) {
-          for (const disk of vdev.disks)
-            leaves.push({ id: disk.id, path: disk.path })
-        }
-      }
-      return leaves
-    }
+    // Collect a pool's leaf devices (id + path) from its parsed topology — the
+    // SAME all-classes walk the destroy cleanup uses, so a pool whose only
+    // discard-capable device sits in a log/special/dedup vdev is still read as
+    // trim-capable (vdevs.1 consumer audit).
+    const leavesOf = (status: (typeof statusData)[number] | undefined): LeafRef[] =>
+      status ? allVdevLeaves(status) : []
 
     // Merge list (sizes) with status (state, scan, health) into PoolSummary
     const pools: PoolSummary[] = listData.map((pool) => {
@@ -1945,14 +1997,15 @@ export async function poolRoutes(
         const zapped: string[] = []
         const preserved: { disk: string, reason: 'shared' | 'uncertain' }[] = []
         for (const [wholeDiskId, diskLeaves] of byWholeDisk) {
-          const ownership = await evaluateDiskOwnership(executor, wholeDiskId, diskLeaves, byIdToKernel)
+          const wholeDiskPath = diskLeaves[0].wholeDiskPath
+          const ownership = await evaluateDiskOwnership(executor, wholeDiskPath, diskLeaves, byIdToKernel)
           if (ownership !== 'exclusive') {
             preserved.push({ disk: wholeDiskId, reason: ownership })
             continue
           }
           updateProgress(`Zapping GPT on ${wholeDiskId}`)
-          await executor.exec(SGDISK, ['--zap-all', `${BY_ID_PREFIX}${wholeDiskId}`])
-          await executor.exec(WIPEFS, ['-a', `${BY_ID_PREFIX}${wholeDiskId}`])
+          await executor.exec(SGDISK, ['--zap-all', wholeDiskPath])
+          await executor.exec(WIPEFS, ['-a', wholeDiskPath])
           zapped.push(wholeDiskId)
         }
 
