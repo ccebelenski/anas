@@ -177,6 +177,7 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `GET` | `/v1/pools/:name` | Pool detail (status, vdevs, properties) | `200` |
 | `PUT` | `/v1/pools/:name` | Update pool properties | `202` with job |
 | `DELETE` | `/v1/pools/:name` | Destroy a pool | `202`/`409` |
+| `POST` | `/v1/pools/:name/vdevs/remove` | Remove a cache, log or spare vdev (data/special/dedup refused — that is device evacuation) | `202` with job |
 | `POST` | `/v1/pools/:name/scrub` | Start a scrub | `202` with job |
 | `POST` | `/v1/pools/:name/export` | Export a pool | `202`/`409` |
 | `POST` | `/v1/pools/import` | Import a pool (on collection — pool isn't ours yet) | `202` with job |
@@ -566,6 +567,7 @@ anasd does NOT accept arbitrary commands. It maps structured operations to speci
 | `zpool.upgrade` | `zpool upgrade <name>` (enable feature flags; one-way) — Epic 4.12 |
 | `zpool.set` | `zpool set <prop>=<val> <name>` |
 | `zpool.add` | `zpool add <name> <vdev-spec...>` |
+| `zpool.remove` | `zpool remove <name> <vdev>` (cache/log/spare only — story vdevs.2) |
 | `zpool.attach` | `zpool attach <name> <device> <new-device>` |
 | `zpool.replace` | `zpool replace <name> <old-device> <new-device>` |
 | `zpool.import` | `zpool import [opts]` |

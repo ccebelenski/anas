@@ -508,7 +508,21 @@ export function createServer(opts?: ServerOptions) {
   // screen and the pool composability pre-flight (D4) must read the same
   // identities, not re-derive them per route.
   const diskIdentityCache = new DiskIdentityCache(executor)
-  server.register(poolRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, fstabPath, pveStoragePath: process.env.ANAS_STORAGE_CFG, iscsiPaths, diskIdentityCache })
+  // vdevRemoveSettleMs (story vdevs.2): how long a vdev-remove job waits for the
+  // vdev to leave `zpool status`. Defaults inside the route to 10 s; the env
+  // override keeps the "still there afterwards" failure path testable.
+  const vdevRemoveSettleMs = Number.parseInt(process.env.ANAS_VDEV_REMOVE_SETTLE_MS ?? '', 10)
+  server.register(poolRoutes, {
+    prefix: '/v1',
+    executor,
+    jobQueue,
+    confirmStore,
+    fstabPath,
+    pveStoragePath: process.env.ANAS_STORAGE_CFG,
+    iscsiPaths,
+    diskIdentityCache,
+    ...(Number.isFinite(vdevRemoveSettleMs) && vdevRemoveSettleMs >= 0 ? { vdevRemoveSettleMs } : {}),
+  })
   // datasetRoutes also reads the share configs to report associated shares
   // (Epic 4.4) and warn on destroy — same paths the share routes edit.
   server.register(datasetRoutes, { prefix: '/v1', executor, jobQueue, confirmStore, smbConfPath, exportsPath, transport, iscsiPaths })

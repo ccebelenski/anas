@@ -8966,6 +8966,724 @@ warnings.length = 0
 created.windows.length = 0
 await shareUsersChecks()
 
+// ============================================================================
+//  SMB Self-service (smbsvc.1) — the Previous Versions row: what the dialog
+//  SENDS (the §2 set / keep contract), the greyed custom-`vfs objects` state,
+//  the detail sentence, and reload on success AND failure
+// ============================================================================
+
+const SMB_SHARE = {
+  name: 'media',
+  path: '/tank/media',
+  comment: null,
+  browseable: true,
+  readOnly: false,
+  guestOk: false,
+  validUsers: [],
+  hostsAllow: [],
+  hostsDeny: [],
+}
+
+function smbSelfServiceRoutes(shares, detail) {
+  // The EDIT dialog opens on the share's DETAIL (smbsvc.3: it carries
+  // `capacity`, the cap-suggestion input) — defaulting to the first share row
+  // so the dialog's initial state matches what the row would show.
+  const det = detail || { ...(shares[0] || SMB_SHARE), connections: [] }
+  return {
+    'GET /shares/smb': { data: shares },
+    'GET /shares/nfs': { data: [] },
+    'GET /identity/users': { data: [] },
+    'GET /identity/groups': { data: [] },
+    'GET /shares/smb/media': { data: det },
+  }
+}
+
+async function openSharesView(routes) {
+  // Real bundle order: 10-api.js carries ANAS.smb (the custom-vfs rule the
+  // dialog's greyed state decides from), 70-shares.js the view.
+  const ANAS = loadSource(['10-api.js', '70-shares.js'], routes)
+  const view = makeComponent(ANAS.views.shares.factory('harness'), null)
+  const grid = view.down('#sharesGrid')
+  grid.fireEvent('afterrender', grid)
+  await settle()
+  return { ANAS, view, grid }
+}
+
+const smbSharesGets = () => apiGets.filter(p => p === '/shares/smb').length
+
+/** Click a Shares toolbar button by cls — the handlers read btn.up('grid'). */
+function clickTbar(grid, cls) {
+  const b = findCmp(grid, cls)
+  b.handler(b)
+  return b
+}
+
+async function smbSelfServiceChecks() {
+  // --- (a) CREATE: the fieldset frame, the fresh-enable note, and that a
+  // ticked box sends { enabled: true } while an unticked one sends nothing.
+  let { grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE]))
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  let dlg = openWindow()
+  ok('smb-self: the create dialog has the Self-service fieldset', !!dlg && !!dlg.down('#selfService'))
+  let pv = dlg && dlg.down('#previousVersions')
+  ok('smb-self: the Previous Versions box starts unticked and live',
+    !!pv && pv.checked === false && pv.disabled === false)
+  ok('smb-self: an unticked box shows no note',
+    !!dlg && dlg.down('#previousVersionsNote').hidden === true)
+  if (dlg && pv) {
+    pv.setValue(true)
+    const note = dlg.down('#previousVersionsNote')
+    ok('smb-self: a fresh enable names the empty-until-a-schedule note',
+      note.hidden === false && /finest snapshot schedule/.test(note.html)
+        && /Snapshots menu/.test(note.html), note.html)
+    dlg.down('#name').setValue('videos')
+    dlg.down('#path').setValue('/tank/videos')
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-self: a ticked create sends previousVersions { enabled: true }',
+      jobs[0] && jobs[0].body && jobs[0].body.previousVersions, { enabled: true })
+  }
+  created.windows.length = 0
+
+  // …and an unticked create sends NO previousVersions key (omitted = keep).
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  dlg = openWindow()
+  if (dlg) {
+    dlg.down('#name').setValue('videos')
+    dlg.down('#path').setValue('/tank/videos')
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    ok('smb-self: an unticked create omits previousVersions',
+      !!jobs[0] && !('previousVersions' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
+  }
+  created.windows.length = 0
+
+  // --- (b) EDIT, feature already on: the box starts ticked with the bucket
+  // sentence; an untouched save sends NO previousVersions key and the SAME
+  // body it always did (the byte-identical no-op); unticking sends
+  // { enabled: false }.
+  const pvOn = { ...SMB_SHARE, previousVersions: { bucket: 'hourly' } }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([pvOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  pv = dlg && dlg.down('#previousVersions')
+  ok('smb-self: an on share opens the edit box TICKED', !!pv && pv.checked === true)
+  ok('smb-self: the ticked edit names the bucket schedule',
+    !!dlg && dlg.down('#previousVersionsNote').hidden === false
+      && /exposes the hourly schedule's snapshots/.test(dlg.down('#previousVersionsNote').html),
+    dlg && dlg.down('#previousVersionsNote').html)
+  if (dlg && pv) {
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-self: an untouched edit PUTs the body it always did (no previousVersions key)', jobs[0] && jobs[0].body, {
+      path: '/tank/media',
+      comment: '',
+      browseable: true,
+      readOnly: false,
+      guestOk: false,
+      validUsers: [],
+      hostsAllow: [],
+      hostsDeny: [],
+    })
+
+    // Untick → the explicit off.
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#previousVersions').setValue(false)
+    ok('smb-self: unticking clears the note', dlg.down('#previousVersionsNote').hidden === true)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-self: unticking sends previousVersions { enabled: false }',
+      jobs[0] && jobs[0].body && jobs[0].body.previousVersions, { enabled: false })
+  }
+  created.windows.length = 0
+
+  // --- (c) The greyed state: a hand-made `vfs objects` line disables the row
+  // with the reason; an ANAS-composed line (the feature itself on) does NOT.
+  const custom = { ...SMB_SHARE, name: 'media', vfsObjects: ['media_audit'] }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([custom])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  pv = dlg && dlg.down('#previousVersions')
+  ok('smb-self: a custom vfs objects line DISABLES the Previous Versions box', !!pv && pv.disabled === true)
+  ok('smb-self: the greyed row carries the refusal sentence',
+    !!dlg && dlg.down('#previousVersionsNote').hidden === false
+      && /custom vfs objects line/.test(dlg.down('#previousVersionsNote').html),
+    dlg && dlg.down('#previousVersionsNote').html)
+  created.windows.length = 0
+
+  const anasLine = {
+    ...SMB_SHARE,
+    vfsObjects: ['shadow_copy2'],
+    previousVersions: { bucket: 'daily' },
+  }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([anasLine])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  pv = dlg && dlg.down('#previousVersions')
+  ok('smb-self: an ANAS-composed vfs line does NOT grey the box', !!pv && pv.disabled === false)
+  created.windows.length = 0
+
+  // --- (d) The detail window: "Previous Versions: on — <bucket> schedule" / off.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([pvOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  let dwin = openWindow()
+  let summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-self(detail): an on share reads "on — <bucket> schedule"',
+    /Previous Versions:<\/b> on — hourly schedule/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-self(detail): an off share reads "off"',
+    /Previous Versions:<\/b> off/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  // --- (e) Timeliness: the shares grid reloads after the job completes —
+  // and after it FAILS (the daemon's refusal sentence rides the failure
+  // alert; the reload is the dialog's own duty).
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  jobs.length = 0
+  apiGets.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+  await settle()
+  ok('smb-self: the grid reloaded on SUCCESS', smbSharesGets() > 0, JSON.stringify(apiGets))
+  if (typeof jobs[0].onFailed === 'function') {
+    const afterSuccess = smbSharesGets()
+    apiGets.length = 0
+    jobs[0].onFailed({ error: { message: 'share \'media\' has a custom vfs objects line — remove it before enabling self-service features' } })
+    await settle()
+    ok('smb-self: the grid reloaded on FAILURE too', smbSharesGets() > 0, JSON.stringify(apiGets))
+  } else {
+    ok('smb-self: onFailed reaches the poll', false, 'no onFailed recorded')
+  }
+  created.windows.length = 0
+
+  // …and the REMOVE flow (confirmAndRun) obeys the same rule.
+  jobs.length = 0
+  apiGets.length = 0
+  clickTbar(grid, 'anas-btn-share-remove')
+  await settle()
+  ok('smb-self(remove): the grid reloaded on SUCCESS', smbSharesGets() > 0, JSON.stringify(apiGets))
+  if (typeof jobs[0].onFailed === 'function') {
+    apiGets.length = 0
+    jobs[0].onFailed({ error: { message: 'smbshare removal failed' } })
+    await settle()
+    ok('smb-self(remove): the grid reloaded on FAILURE too', smbSharesGets() > 0, JSON.stringify(apiGets))
+  } else {
+    ok('smb-self(remove): onFailed reaches the poll', false, 'no onFailed recorded')
+  }
+  created.windows.length = 0
+
+  // --- (f) Recycle bin (smbsvc.2): the row, the §2 set/keep contract on
+  // purge age, the shared greyed state, and the detail sentences.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  dlg = openWindow()
+  let rc = dlg && dlg.down('#recycle')
+  let rcPurge = dlg && dlg.down('#recyclePurge')
+  ok('smb-recycle: the create dialog has the Recycle bin row',
+    !!rc && !!rcPurge && rc.checked === false && rc.disabled === false
+      && rcPurge.disabled === true, JSON.stringify({ rc: !!rc, purge: !!rcPurge }))
+  ok('smb-recycle: the purge combo defaults to 30 days',
+    !!rcPurge && rcPurge.getValue() === '30', rcPurge && rcPurge.getValue())
+  if (dlg && rc) {
+    rc.setValue(true)
+    ok('smb-recycle: ticking enables the purge combo and shows the #recycle note',
+      rcPurge.disabled === false && dlg.down('#recycleNote').hidden === false
+        && /#recycle folder/.test(dlg.down('#recycleNote').html)
+        && /Turning this off leaves #recycle in place/.test(dlg.down('#recycleNote').html),
+      dlg.down('#recycleNote').html)
+    dlg.down('#name').setValue('videos')
+    dlg.down('#path').setValue('/tank/videos')
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-recycle: a ticked create sends recycle { purgeDays: 30 }',
+      jobs[0] && jobs[0].body && jobs[0].body.recycle, { purgeDays: 30 })
+  }
+  created.windows.length = 0
+
+  // EDIT on a share with the feature already on (the ANAS-composed line):
+  // the box opens ticked with the stored age, an untouched save sends NO
+  // recycle key and the byte-identical body, an age change sends the new
+  // age, an untick sends null.
+  const rcOn = { ...SMB_SHARE, vfsObjects: ['recycle'], recycle: { purgeDays: 30 } }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([rcOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  rc = dlg && dlg.down('#recycle')
+  rcPurge = dlg && dlg.down('#recyclePurge')
+  ok('smb-recycle: an on share opens the edit box TICKED with the combo live',
+    !!rc && rc.checked === true && rc.disabled === false
+      && !!rcPurge && rcPurge.disabled === false)
+  ok('smb-recycle: the purge combo reads the stored 30 days',
+    !!rcPurge && rcPurge.getValue() === '30', rcPurge && rcPurge.getValue())
+  if (dlg && rc) {
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    ok('smb-recycle: an untouched edit sends NO recycle key',
+      !!jobs[0] && !('recycle' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
+    eq('smb-recycle: an untouched edit PUTs the body it always did', jobs[0] && jobs[0].body, {
+      path: '/tank/media',
+      comment: '',
+      browseable: true,
+      readOnly: false,
+      guestOk: false,
+      validUsers: [],
+      hostsAllow: [],
+      hostsDeny: [],
+    })
+
+    // Purge-age change on an already-on share → the new age (`never` = null).
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#recyclePurge').setValue('never')
+    ok('smb-recycle: choosing never keeps the note up',
+      dlg.down('#recycleNote').hidden === false)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-recycle: changing the purge age to never sends recycle { purgeDays: null }',
+      jobs[0] && jobs[0].body && jobs[0].body.recycle, { purgeDays: null })
+
+    // Untick → the explicit off.
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#recycle').setValue(false)
+    ok('smb-recycle: unticking hides the note and disables the combo',
+      dlg.down('#recycleNote').hidden === true
+        && dlg.down('#recyclePurge').disabled === true)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-recycle: unticking sends recycle null',
+      jobs[0] && jobs[0].body && jobs[0].body.recycle, null)
+  }
+  created.windows.length = 0
+
+  // The greyed state: a hand-made `vfs objects` line disables BOTH rows,
+  // each carrying the SAME refusal sentence.
+  const rcCustom = { ...SMB_SHARE, vfsObjects: ['media_audit'] }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([rcCustom])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  rc = dlg && dlg.down('#recycle')
+  ok('smb-recycle: a custom vfs objects line DISABLES the Recycle bin row',
+    !!rc && rc.disabled === true && dlg.down('#recyclePurge').disabled === true)
+  ok('smb-recycle: the greyed row carries the SAME refusal sentence as Previous Versions',
+    !!dlg && dlg.down('#recycleNote').hidden === false
+      && /custom vfs objects line/.test(dlg.down('#recycleNote').html)
+      && /custom vfs objects line/.test(dlg.down('#previousVersionsNote').html),
+    dlg && dlg.down('#recycleNote').html)
+  created.windows.length = 0
+
+  // The detail window: "Recycle bin: on — purge after 30 days" /
+  // "on — never purged" / "off".
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([
+    { ...SMB_SHARE, recycle: { purgeDays: 30 } },
+  ])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-recycle(detail): an on share reads "on — purge after 30 days"',
+    /Recycle bin:<\/b> on — purge after 30 days/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([
+    { ...SMB_SHARE, recycle: { purgeDays: null } },
+  ])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-recycle(detail): a never-purged share reads "on — never purged"',
+    /Recycle bin:<\/b> on — never purged/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-recycle(detail): an off share reads "off"',
+    /Recycle bin:<\/b> off/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  // --- (g) Time Machine target (smbsvc.3, BETA): the row, the required cap
+  // (empty refused before anything is sent), the capacity prefill, the §2
+  // set/keep contract, the shared greyed state, and the detail sentence.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  clickTbar(grid, 'anas-btn-smb-add')
+  await settle()
+  dlg = openWindow()
+  let tm = dlg && dlg.down('#timeMachine')
+  let tmSize = dlg && dlg.down('#timeMachineSize')
+  let tmUnit = dlg && dlg.down('#timeMachineUnit')
+  ok('smb-tm: the create dialog has the Time Machine (beta) row',
+    !!tm && !!tmSize && !!tmUnit && tm.checked === false && tm.disabled === false
+      && tmSize.disabled === true && tmUnit.disabled === true
+      && tmUnit.getValue() === 'G',
+    JSON.stringify({ tm: !!tm, size: !!tmSize, unit: tmUnit && tmUnit.getValue() }))
+  ok('smb-tm: an unticked box shows no note', !!dlg && dlg.down('#timeMachineNote').hidden === true)
+  if (dlg && tm) {
+    tm.setValue(true)
+    ok('smb-tm: ticking shows the note (dedicated share, tmutil, beta) and enables the cap field',
+      dlg.down('#timeMachineNote').hidden === false
+        && /Dedicate this share to Time Machine/.test(dlg.down('#timeMachineNote').html)
+        && /tmutil setdestination/.test(dlg.down('#timeMachineNote').html)
+        && /community-verified/.test(dlg.down('#timeMachineNote').html)
+        && tmSize.disabled === false && tmUnit.disabled === false,
+      dlg.down('#timeMachineNote').html)
+    // A create has no capacity to read — the suggestion cannot fill the field,
+    // and the REQUIRED cap is refused before anything is sent.
+    dlg.down('#name').setValue('videos')
+    dlg.down('#path').setValue('/tank/videos')
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    ok('smb-tm: an empty cap is refused with an alert and NO job',
+      warnings.length === 1 && /size cap/.test(warnings[0]) && jobs.length === 0,
+      JSON.stringify({ warnings: warnings.slice(), jobs: jobs.length }))
+    warnings.length = 0
+    tmSize.setValue(500)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-tm: a ticked create sends timeMachine { maxSize: 500 GiB }',
+      jobs[0] && jobs[0].body && jobs[0].body.timeMachine, { maxSize: 536870912000 })
+  }
+  created.windows.length = 0
+
+  // EDIT on a share with the feature already on: the box opens ticked with the
+  // stored cap split into the field (500 + G), an untouched save sends NO
+  // timeMachine key and the byte-identical body, a cap change sends the new
+  // cap, an untick sends null.
+  const tmOn = { ...SMB_SHARE, vfsObjects: ['catia', 'fruit', 'streams_xattr'], timeMachine: { maxSize: 536870912000 } }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([tmOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  tm = dlg && dlg.down('#timeMachine')
+  tmSize = dlg && dlg.down('#timeMachineSize')
+  tmUnit = dlg && dlg.down('#timeMachineUnit')
+  ok('smb-tm: an on share opens the edit box TICKED with the cap field live',
+    !!tm && tm.checked === true && tm.disabled === false
+      && !!tmSize && tmSize.disabled === false
+      && !!tmUnit && tmUnit.disabled === false)
+  ok('smb-tm: the cap field reads the stored 500 GiB', !!tmSize && tmSize.getValue() === 500 && tmUnit.getValue() === 'G',
+    JSON.stringify({ size: tmSize && tmSize.getValue(), unit: tmUnit && tmUnit.getValue() }))
+  ok('smb-tm: the note is up on a ticked edit', !!dlg && dlg.down('#timeMachineNote').hidden === false)
+  if (dlg && tm) {
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    ok('smb-tm: an untouched edit sends NO timeMachine key',
+      !!jobs[0] && !('timeMachine' in jobs[0].body), JSON.stringify(jobs[0] && jobs[0].body))
+
+    // Cap change on an already-on share → the new cap.
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#timeMachineSize').setValue(250)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-tm: changing the cap sends timeMachine { maxSize: 250 GiB }',
+      jobs[0] && jobs[0].body && jobs[0].body.timeMachine, { maxSize: 268435456000 })
+
+    // Untick → the explicit off.
+    created.windows.length = 0
+    clickTbar(grid, 'anas-btn-share-edit')
+    await settle()
+    dlg = openWindow()
+    dlg.down('#timeMachine').setValue(false)
+    ok('smb-tm: unticking hides the note and disables the cap field',
+      dlg.down('#timeMachineNote').hidden === true
+        && dlg.down('#timeMachineSize').disabled === true)
+    jobs.length = 0
+    dlg.buttonCmps.find(b => b.cls === 'anas-btn-smb-share-submit').handler(null)
+    await settle()
+    eq('smb-tm: unticking sends timeMachine null',
+      jobs[0] && jobs[0].body && jobs[0].body.timeMachine, null)
+  }
+  created.windows.length = 0
+
+  // The capacity prefill (smbsvc.3): an EDIT whose detail carries capacity —
+  // ticking an empty cap field prefills HALF the available bytes floored to
+  // whole GiB; a filled field is never overwritten.
+  const capDetail = { ...SMB_SHARE, connections: [], capacity: { availableBytes: 2 * 1024 ** 4 } }
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE], capDetail)))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  tm = dlg && dlg.down('#timeMachine')
+  tmSize = dlg && dlg.down('#timeMachineSize')
+  ok('smb-tm: an edit with capacity opens the cap field EMPTY', !!tmSize && !tmSize.getValue())
+  if (dlg && tm) {
+    tm.setValue(true)
+    ok('smb-tm: ticking prefills HALF the available space in GiB',
+      tmSize.getValue() === 1024 && dlg.down('#timeMachineUnit').getValue() === 'G',
+      JSON.stringify({ size: tmSize.getValue(), unit: dlg.down('#timeMachineUnit').getValue() }))
+    tmSize.setValue('') // the suggestion never overwrites a filled field
+    tm.setValue(false)
+    tm.setValue(true)
+    ok('smb-tm: the suggestion refills a re-ticked empty field',
+      tmSize.getValue() === 1024)
+  }
+  created.windows.length = 0
+
+  // The greyed state: the SAME custom-`vfs objects` rule as the other rows.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([rcCustom])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-edit')
+  await settle()
+  dlg = openWindow()
+  tm = dlg && dlg.down('#timeMachine')
+  ok('smb-tm: a custom vfs objects line DISABLES the row',
+    !!tm && tm.disabled === true && dlg.down('#timeMachineSize').disabled === true)
+  ok('smb-tm: the greyed row carries the SAME refusal sentence',
+    !!dlg && dlg.down('#timeMachineNote').hidden === false
+      && /custom vfs objects line/.test(dlg.down('#timeMachineNote').html),
+    dlg && dlg.down('#timeMachineNote').html)
+  created.windows.length = 0
+
+  // The detail window: "Time Machine target (beta): on — cap 500 GiB" / off.
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([tmOn])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-tm(detail): an on share reads "on — cap 500 GiB"',
+    /Time Machine target \(beta\):<\/b> on — cap 500 GiB/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  ;({ grid } = await openSharesView(smbSelfServiceRoutes([SMB_SHARE])))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-share-details')
+  await settle()
+  dwin = openWindow()
+  summary = dwin && dwin.items.getAt(0) && dwin.items.getAt(0).html
+  ok('smb-tm(detail): an off share reads "off"',
+    /Time Machine target \(beta\):<\/b> off/.test(summary || ''), summary)
+  created.windows.length = 0
+
+  ok('smb-self: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// Story smbsvc.1 — the SMB dialog's Self-service fieldset (Previous Versions):
+// set/keep on the wire, the custom-vfs greyed state, the detail sentence, and
+// reload on success AND failure.
+warnings.length = 0
+created.windows.length = 0
+await smbSelfServiceChecks()
+
+// ---- Story vdevs.2 — the Pools toolbar's "Remove vdev…" dialog ------------
+//
+// The picker must offer the three classes `zpool remove` drops instantly and
+// NOTHING else, say so where the operator can read it, and send the vdev name
+// the daemon resolves. The grid AND the pool detail reload afterwards, success
+// or failure.
+
+/** A leaf as the pool detail carries one (the parser's PoolDisk shape). */
+function vdevLeaf(id, state) {
+  return {
+    id,
+    path: `/dev/disk/by-id/${id}-part1`,
+    state: state || 'ONLINE',
+    readErrors: 0,
+    writeErrors: 0,
+    checksumErrors: 0,
+    slowIos: 0,
+  }
+}
+
+function vdevOf(name, type, disks, state) {
+  return { name, type, state: state || 'ONLINE', readErrors: 0, writeErrors: 0, checksumErrors: 0, disks }
+}
+
+/** A pool with all six classes — a mirrored log, a bare cache, a bare spare. */
+const SIX_CLASS_DETAIL = {
+  name: 'tank',
+  state: 'ONLINE',
+  vdevGroups: [
+    { role: 'data', vdevs: [vdevOf('mirror-0', 'mirror', [vdevLeaf('ata-DATA-1'), vdevLeaf('ata-DATA-2')])] },
+    { role: 'log', vdevs: [vdevOf('mirror-1', 'mirror', [vdevLeaf('ata-LOG-1'), vdevLeaf('ata-LOG-2')])] },
+    { role: 'cache', vdevs: [vdevOf('cache', 'disk', [vdevLeaf('ata-CACHE-1')])] },
+    { role: 'spare', vdevs: [vdevOf('spares', 'spare', [vdevLeaf('ata-SPARE-1', 'AVAIL')], 'AVAIL')] },
+    { role: 'special', vdevs: [vdevOf('mirror-2', 'mirror', [vdevLeaf('ata-SPEC-1'), vdevLeaf('ata-SPEC-2')])] },
+    { role: 'dedup', vdevs: [vdevOf('mirror-3', 'mirror', [vdevLeaf('ata-DEDUP-1'), vdevLeaf('ata-DEDUP-2')])] },
+  ],
+}
+
+/** The same pool with nothing removable on it. */
+const NO_REMOVABLE_DETAIL = {
+  name: 'tank',
+  state: 'ONLINE',
+  vdevGroups: [
+    { role: 'data', vdevs: [vdevOf('mirror-0', 'mirror', [vdevLeaf('ata-DATA-1'), vdevLeaf('ata-DATA-2')])] },
+    { role: 'special', vdevs: [vdevOf('mirror-2', 'mirror', [vdevLeaf('ata-SPEC-1'), vdevLeaf('ata-SPEC-2')])] },
+  ],
+}
+
+async function openPoolsViewFor(rows, detail) {
+  // 00-core.js too: check (e) opens the pool-detail window, whose summary calls
+  // the real formatters (formatPercent) the recording stub does not carry.
+  const ANAS = loadSources(['00-core.js', '15-gfx.js', '30-pools.js', '34-pool-vdev-remove.js'], {
+    'GET /pools': { data: rows },
+    'GET /pools/tank': { data: detail },
+  })
+  const view = makeComponent(ANAS.views.pools.factory('harness'), null)
+  const grid = view.itemId === 'poolsGrid' ? view : view.down('#poolsGrid')
+  grid.fireEvent('afterrender', grid)
+  await settle()
+  return { ANAS, grid }
+}
+
+const tankDetailGets = () => apiGets.filter(p => p === '/pools/tank').length
+
+async function vdevRemoveChecks() {
+  // --- (a) the toolbar action: selection-gated, hands off a PVE-managed pool.
+  let { grid } = await openPoolsViewFor([poolRow('tank'), poolRow('pvepool', { pveStorages: [{ storage: 'local-zfs', type: 'zfspool' }] })], SIX_CLASS_DETAIL)
+  let state = toolbar(grid, ['removeVdev'])
+  ok('vdev-remove: the Remove vdev… button exists', !!state.removeVdev, JSON.stringify(warnings))
+  if (!state.removeVdev) { return }
+  ok('vdev-remove: it starts DISABLED with no selection', state.removeVdev.disabled === true)
+
+  grid.selectRow(grid.getStore().findExact('name', 'tank'))
+  state = toolbar(grid, ['removeVdev'])
+  ok('vdev-remove: an ANAS pool ENABLES it', state.removeVdev.disabled === false)
+
+  grid.selectRow(grid.getStore().findExact('name', 'pvepool'))
+  state = toolbar(grid, ['removeVdev'])
+  ok('vdev-remove: a PVE-managed pool DISABLES it', state.removeVdev.disabled === true)
+  ok('vdev-remove: and says why', /PVE manages this pool/.test(state.removeVdev.tip), state.removeVdev.tip)
+
+  // --- (b) the dialog lists ONLY cache/log/spare, and says so.
+  grid.selectRow(grid.getStore().findExact('name', 'tank'))
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  let dlg = openWindow()
+  let vgrid = dlg && dlg.down('#removableVdevs')
+  ok('vdev-remove: the dialog opened with a vdev grid', !!vgrid)
+  if (!vgrid) { return }
+  const rows = vgrid.getStore().getRange().map(r => ({ role: r.get('role'), vdev: r.get('vdev') }))
+  eq('vdev-remove: only cache, log and spare are listed — the mirrored log as mirror-N', rows, [
+    { role: 'log', vdev: 'mirror-1' },
+    { role: 'cache', vdev: 'ata-CACHE-1' },
+    { role: 'spare', vdev: 'ata-SPARE-1' },
+  ])
+  ok('vdev-remove: the refusal sentence is on the dialog',
+    /Data, special and dedup vdevs cannot be removed here\./.test(dlg.down('#vdevRemoveNote').html || ''),
+    dlg.down('#vdevRemoveNote').html)
+
+  // --- (c) the submit payload: the vdev NAME, nothing else.
+  jobs.length = 0
+  const beforePools = poolsGets()
+  vgrid.selectRow(0)
+  findCmp(dlg, 'anas-btn-vdev-remove-submit').handler()
+  await settle()
+  eq('vdev-remove: it POSTs the pool\'s remove path with just the vdev name',
+    { method: jobs[0] && jobs[0].method, path: jobs[0] && jobs[0].path, body: jobs[0] && jobs[0].body },
+    { method: 'post', path: '/pools/tank/vdevs/remove', body: { vdev: 'mirror-1' } })
+  ok('vdev-remove: the dialog closes on success', dlg.destroyed === true)
+  ok('vdev-remove: and the Pools grid reloads', poolsGets() > beforePools)
+
+  // --- (d) reload on FAILURE too: a refused removal must not leave a stale view.
+  created.windows.length = 0
+  grid.selectRow(grid.getStore().findExact('name', 'tank'))
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  dlg = openWindow()
+  vgrid = dlg.down('#removableVdevs')
+  jobs.length = 0
+  vgrid.selectRow(1)
+  findCmp(dlg, 'anas-btn-vdev-remove-submit').handler()
+  await settle()
+  eq('vdev-remove: a cache leaf goes out by its leaf name', jobs[0] && jobs[0].body, { vdev: 'ata-CACHE-1' })
+  const beforeFail = poolsGets()
+  jobs[0].onFailed({ error: { message: 'data, special and dedup vdevs cannot be removed here' } })
+  await settle()
+  ok('vdev-remove: the grid reloads on failure as well', poolsGets() > beforeFail)
+
+  // --- (e) the pool DETAIL behind the dialog reloads too.
+  created.windows.length = 0
+  grid.selectRow(grid.getStore().findExact('name', 'tank'))
+  const detailBtn = grid.down('#detail')
+  detailBtn.handler(detailBtn)
+  await settle()
+  const beforeDetail = tankDetailGets()
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  dlg = openWindow()
+  dlg.down('#removableVdevs').selectRow(0)
+  jobs.length = 0
+  findCmp(dlg, 'anas-btn-vdev-remove-submit').handler()
+  await settle()
+  ok('vdev-remove: the open pool detail reloads after the job',
+    tankDetailGets() > beforeDetail + 1, `${beforeDetail} → ${tankDetailGets()}`)
+
+  // --- (f) a pool with nothing removable: an empty grid that says so.
+  created.windows.length = 0
+  ;({ grid } = await openPoolsViewFor([poolRow('tank')], NO_REMOVABLE_DETAIL))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  dlg = openWindow()
+  vgrid = dlg.down('#removableVdevs')
+  eq('vdev-remove: a pool with no cache/log/spare lists nothing', vgrid.getStore().getCount(), 0)
+  ok('vdev-remove: and the empty state says why',
+    /no cache, log or spare vdev to remove/.test(vgrid.emptyText || ''), vgrid.emptyText)
+
+  ok('vdev-remove: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+warnings.length = 0
+created.windows.length = 0
+await vdevRemoveChecks()
+
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)
   for (const f of failures) { console.error(`  • ${f}`) }

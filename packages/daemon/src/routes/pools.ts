@@ -5,7 +5,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
 import type { ConfirmStore } from '../safety/confirm.js'
 import type { IscsiPaths } from '../services/iscsi.js'
-import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, isComposableDisk, PoolMountpointRequest, PoolName, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
+import { AddVdevRequest, AttachDiskRequest, CreatePoolRequest, ExportPoolRequest, ImportPoolRequest, isComposableDisk, isRemovableVdevRole, PoolMountpointRequest, PoolName, RemoveVdevRequest, ScrubRequest, TrimPoolRequest, UpdatePoolPropertiesRequest } from '@anas/shared'
 import { parseByIdToKernel, parseByIdToKernelFull, wholeDiskKernel } from '../parsers/disk-by-id.js'
 import { parseFindmnt } from '../parsers/findmnt.js'
 import { hasMount } from '../parsers/fstab.js'
@@ -22,6 +22,7 @@ import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
+import { NON_REMOVABLE_VDEV_MESSAGE, resolveVdev, stillPresentMessage, unknownVdevMessage } from '../services/zfs-vdev-remove.js'
 import { collectDisks, resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -40,6 +41,14 @@ const TRAILING_CR_RE = /\r$/
 const TRAILING_SLASHES_RE = /\/+$/
 /** ZFS vdev names (raidz1-0, mirror-0, …) — charset guard for raidz-expand. */
 const VDEV_NAME_RE = /^[\w-]+$/
+/**
+ * How long a vdev-remove job waits for the vdev to leave `zpool status` (story
+ * vdevs.2). `zpool remove` of a log exits as soon as the ZIL flush is under
+ * way, so a re-read straight afterwards can still show it.
+ */
+const VDEV_REMOVE_SETTLE_MS = 10_000
+/** Gap between the settle re-reads. */
+const VDEV_REMOVE_POLL_MS = 250
 
 /** A destroyed pool's vdev leaf, resolved for disk hygiene (story 3.14). */
 interface PoolLeaf {
@@ -475,10 +484,19 @@ export async function poolRoutes(
      * only re-reads what it has not seen, never diverges.
      */
     diskIdentityCache?: DiskIdentityCache
+    /**
+     * How long the vdev-remove job waits for a removed vdev to disappear from
+     * `zpool status` before it calls the removal failed (story vdevs.2). A log
+     * removal flushes the ZIL first, so the vdev can linger for a moment after
+     * `zpool remove` has already exited 0. Defaults to 10 s; the env override
+     * keeps the failure path testable without a ten-second test.
+     */
+    vdevRemoveSettleMs?: number
   },
 ) {
   const { executor, jobQueue, confirmStore } = opts
   const fstabPath = opts.fstabPath ?? '/etc/fstab'
+  const vdevRemoveSettleMs = opts.vdevRemoveSettleMs ?? VDEV_REMOVE_SETTLE_MS
   const pveCfgPath = opts.pveStoragePath ?? PVE_STORAGE_CFG
   const iscsiPaths = opts.iscsiPaths ?? {}
   const diskIdentityCache = opts.diskIdentityCache ?? new DiskIdentityCache(executor)
@@ -1334,6 +1352,107 @@ export async function poolRoutes(
           throw new Error(result.stderr.trim() || `zpool add exited with code ${result.exitCode}`)
         }
         return null
+      },
+    )
+
+    reply.code(202)
+    return { job }
+  })
+
+  // Remove a cache, log or spare vdev (story vdevs.2) — the add path's twin.
+  // ZFS drops these three classes instantly: the L2ARC is a throw-away copy,
+  // the ZIL flushes and logging reverts into the pool, and an unused spare
+  // holds nothing. So this is a PLAIN job — no confirm code, nothing is
+  // destroyed. data/special/dedup removal is device evacuation, a different
+  // operation ANAS does not offer, and it is refused up front with one
+  // sentence.
+  //
+  // The request names ONE vdev the way the pool view shows it — a leaf (by-id
+  // name, by-id partition basename, or short kernel name) or a top-level vdev
+  // name (`mirror-1`, a mirrored log). The daemon resolves that against the
+  // pool's own `zpool status` and hands `zpool remove` the token ZFS itself
+  // reports, so the argv never carries a name the user typed.
+  server.post<{ Params: { name: string } }>('/pools/:name/vdevs/remove', async (request, reply) => {
+    const nameParsed = PoolName.safeParse(request.params.name)
+    if (!nameParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid pool name: ${nameParsed.error.issues[0]?.message}` } }
+    }
+    const poolName = nameParsed.data
+
+    const bodyParsed = RemoveVdevRequest.safeParse(request.body ?? {})
+    if (!bodyParsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid remove-vdev request: ${bodyParsed.error.issues[0]?.message}` } }
+    }
+    const requestedVdev = bodyParsed.data.vdev
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!(await poolExists(poolName))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    // SYSTEM-POOL GUARD (story pvepool.1) then the PVE-ownership guard — the
+    // same two doors export/destroy and the dataset verbs stand behind. PVE
+    // owns the topology of the pools it manages; ANAS does not reshape them.
+    const pve = await pveFootprint()
+    const systemBlock = await systemPoolBlock(poolName)
+    if (systemBlock) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: systemBlock.reason, message: systemBlock.message } }
+    }
+    const owned = pve.ownershipOf(poolName)
+    if (owned) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
+    }
+
+    const statusResult = await executor.exec(ZPOOL, ['status', '-jv'])
+    const status = statusResult.exitCode === 0
+      ? parseZpoolStatusPool(statusResult.stdout, poolName)
+      : null
+    if (!status) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
+    }
+
+    const resolved = resolveVdev(status, requestedVdev)
+    if (!resolved) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, requestedVdev) } }
+    }
+    if (!isRemovableVdevRole(resolved.role)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: NON_REMOVABLE_VDEV_MESSAGE } }
+    }
+
+    const { role, token } = resolved
+    const job = jobQueue.submit(
+      'zpool.remove',
+      { ...identity, params: { pool: poolName, vdev: requestedVdev, role } },
+      async () => {
+        const result = await executor.exec(ZPOOL, ['remove', poolName, token])
+        if (result.exitCode !== 0)
+          throw new Error(result.stderr.trim() || `zpool remove exited with code ${result.exitCode}`)
+
+        // `zpool remove` of a log returns while the ZIL is still flushing, so a
+        // straight re-read can still show the vdev. Poll until it is gone, or
+        // say plainly that it is not (Principle 11 — the system answers, we do
+        // not assume the command's exit code did).
+        const deadline = Date.now() + vdevRemoveSettleMs
+        for (;;) {
+          const after = await executor.exec(ZPOOL, ['status', '-jv'])
+          const parsed = after.exitCode === 0 ? parseZpoolStatusPool(after.stdout, poolName) : null
+          if (!parsed || !resolveVdev(parsed, requestedVdev))
+            return { pool: poolName, vdev: requestedVdev, role }
+          if (Date.now() >= deadline)
+            throw new Error(stillPresentMessage(poolName, requestedVdev))
+          await new Promise(resolve => setTimeout(resolve, VDEV_REMOVE_POLL_MS))
+        }
       },
     )
 

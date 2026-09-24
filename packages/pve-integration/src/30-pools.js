@@ -460,6 +460,7 @@
         exportPool: 1,
         destroyPool: 1,
         addVdevs: 1,
+        removeVdev: 1,
         attachDisk: 1,
         modifyProps: 1,
     };
@@ -1446,10 +1447,33 @@
 
         // Expose the loader so the mountpoint-change flow can refresh the window.
         win._reload = loadDetail;
+        // …and hold it for the grid's own actions (story vdevs.2): a topology
+        // mutation run from the toolbar must refresh the detail behind it, not
+        // just the grid. One window at a time — the detail is modal.
+        win._poolName = poolName;
+        openDetailWin = win;
 
         win.show();
         loadDetail();
     }
+
+    // The pool-detail window currently open, if any.
+    var openDetailWin = null;
+
+    /**
+     * Reload the open pool-detail window when it shows `poolName` (story
+     * vdevs.2). No window, a closed one, or a different pool — nothing happens.
+     */
+    ANAS.pools.reloadDetail = function (poolName) {
+        var win = openDetailWin;
+        if (!win || win.destroyed || win.destroying || typeof win._reload !== 'function') {
+            return;
+        }
+        if (poolName && win._poolName !== poolName) {
+            return;
+        }
+        win._reload();
+    };
 
     // ---- Add Vdevs action (stories 3.21 / 3.22 / 3.23) ---------------------
     //
