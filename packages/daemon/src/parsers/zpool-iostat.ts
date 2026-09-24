@@ -64,19 +64,34 @@ const DASHES_RE = /^[\s-]+$/
 const WHITESPACE_RE = /\s+/
 
 /**
+ * The five pool-level vdev-class sections `zpool iostat -plv` prints as an
+ * unindented row — the same five `zpool status -j` reports beside the data
+ * tree. A row must be called one of these AND carry no statistics to be read
+ * as a section header.
+ */
+const SECTION_NAMES: ReadonlySet<string> = new Set(['logs', 'cache', 'special', 'dedup', 'spares'])
+
+/**
  * Parse the full multi-sample output into an array of samples, each an array of
  * nodes. The telemetry route uses the LAST sample (the per-second interval).
  *
- * An unindented row is a pool row or a vdev-class section header, and the two
- * are told apart by SHAPE. GROUND TRUTH (stunt node, ZFS 2.4.4, 2026-09-24,
- * fixture `zpool-iostat-plv-all-vdev-classes-2.4.4.txt`): `zpool iostat -plv`
- * prints `logs`, `cache`, `special` and `dedup` UNINDENTED, in the pool column,
- * with every value cell `-`; their devices follow at the vdev indent. Read
+ * An unindented row is a pool row or a vdev-class section header. A row is a
+ * section header only when BOTH hold: every value cell is `-`, AND its name is
+ * one of the five section names ZFS prints (`logs`, `cache`, `special`,
+ * `dedup`, `spares`). GROUND TRUTH (stunt node, ZFS 2.4.4, 2026-09-24, fixture
+ * `zpool-iostat-plv-all-vdev-classes-2.4.4.txt`): `zpool iostat -plv` prints
+ * `logs`, `cache`, `special` and `dedup` UNINDENTED, in the pool column, with
+ * every value cell `-`; their devices follow at the vdev indent. Read
  * positionally those headers become four phantom pools and the real pool loses
- * the vdevs beneath them (vdevs.1 consumer audit). A header carries no
- * statistics; a pool row always carries its capacity (an idle pool prints `0`,
- * never `-`), so the all-`-` shape names the header whatever it is CALLED — a
- * pool named `logs` keeps its numbers and stays a pool.
+ * the vdevs beneath them (vdevs.1 consumer audit).
+ *
+ * Both halves are needed, and neither alone: a pool may legitimately be NAMED
+ * `logs` — it keeps its numbers, so the shape tells it from the header — while
+ * an all-`-` row under any OTHER name is a pool, not a header. That second
+ * half is the SUSPENDED-pool guard: no capture shows what `zpool iostat` prints
+ * for a suspended pool, so whether it can print a pool row as all `-` is
+ * UNVERIFIED; if it can, that pool stays a pool here instead of being swallowed
+ * as a header (vdevs.2 hardening).
  *
  * `knownPools` — the pools the command was ASKED about — is the secondary
  * check, for a header shape this ground truth has not seen.
@@ -116,15 +131,19 @@ export function parseZpoolIostat(text: string, knownPools?: ReadonlySet<string>)
     let vdev = currentVdev
     if (depth === 0) {
       // An unindented row can be a POOL or a vdev-class section header (logs /
-      // cache / special / dedup / spares). A header is told apart by its SHAPE:
-      // it carries no statistics at all, so every value cell prints `-`, while
-      // a pool row always carries its capacity numbers (an idle pool prints
-      // `0`, not `-`). Shape first, because a pool may legitimately be NAMED
-      // `logs` or `special`; `knownPools` stays as the secondary check for a
-      // header shape we have not seen. Either way the standing pool continues
-      // and the devices under the header are that pool's vdevs.
+      // cache / special / dedup / spares). A header is both SHAPED and NAMED
+      // like one: it carries no statistics at all, so every value cell prints
+      // `-`, and it is called by one of the five section names. Shape is needed
+      // because a pool may legitimately be NAMED `logs` or `special` — it keeps
+      // its capacity numbers and stays a pool. The name is needed because an
+      // all-`-` row called anything else is a pool, not a header: no capture
+      // shows what a SUSPENDED pool prints, so if it prints all `-` it survives
+      // here rather than being swallowed. `knownPools` stays as the secondary
+      // check for a header shape we have not seen. Either way the standing pool
+      // continues and the devices under the header are that pool's vdevs.
       const noStats = values.length > 0 && values.every(v => v === '-')
-      if (currentPool && (noStats || (knownPools && !knownPools.has(name)))) {
+      const sectionHeader = noStats && SECTION_NAMES.has(name)
+      if (currentPool && (sectionHeader || (knownPools && !knownPools.has(name)))) {
         currentVdev = undefined
         continue
       }

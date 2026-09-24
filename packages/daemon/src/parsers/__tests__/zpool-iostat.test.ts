@@ -92,8 +92,9 @@ describe('nodeToIoStats — column → IoStats mapping', () => {
  * Stunt-node capture (ZFS 2.4.4, 2026-09-24) of a pool carrying all six vdev
  * classes on six partitions of one disk — the shape GitHub #66 reported. The
  * class sections (`logs`, `cache`, `special`, `dedup`) print UNINDENTED, in the
- * pool column, with every value cell `-`. That SHAPE is what tells a header
- * from a pool row: a pool always carries its capacity numbers.
+ * pool column, with every value cell `-`. A header is BOTH: shaped like one
+ * (a pool always carries its capacity numbers) and named like one (`logs`,
+ * `cache`, `special`, `dedup`, `spares`).
  */
 describe('parseZpoolIostat — vdev-class section headers (vdevs.1)', () => {
   const classesText = readFileSync(
@@ -170,5 +171,41 @@ describe('parseZpoolIostat — vdev-class section headers (vdevs.1)', () => {
   it('the shape guard works with no pool names at all', () => {
     const [sample] = parseZpoolIostat(namedLikeSectionText)
     assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'logs'])
+  })
+
+  /**
+   * The other half of the rule (vdevs.2 hardening). Shape alone would swallow
+   * ANY unindented all-`-` row, whatever it is called — and no capture shows
+   * what `zpool iostat` prints for a SUSPENDED pool, so whether a pool row can
+   * come out all `-` is unverified. A row must also be NAMED like a section to
+   * be read as one: `tank` printing nothing but dashes stays a pool of its own,
+   * with no vdev rows under it, rather than folding into the pool above.
+   */
+  const allDashPoolText = [
+    '                        capacity                         operations                         bandwidth                   total_wait               disk_wait              syncq_wait              asyncq_wait            scrub        trim     rebuild',
+    'pool                  alloc             free             read            write             read            write        read       write        read       write        read       write        read       write        wait        wait        wait',
+    '----------  ---------------  ---------------  ---------------  ---------------  ---------------  ---------------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------',
+    'gtvdev               167424       1241346560                0                1            10596            35135     1460516      384704     1460516      288528         733        5473           -      213831           -           -           -',
+    '  sdb1                    0        402653184                0                0             2649             8283     1685211      409071     1685211      409071         877         427           -           -           -           -           -',
+    'tank                      -                -                -                -                -                -           -           -           -           -           -           -           -           -           -           -           -',
+    '----------  ---------------  ---------------  ---------------  ---------------  ---------------  ---------------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------',
+  ].join('\n')
+
+  it('an all-`-` row NAMED tank is a pool, not a section header', () => {
+    const [sample] = parseZpoolIostat(allDashPoolText, new Set(['gtvdev', 'tank']))
+    assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'tank'])
+    // It stands on its own: no vdev rows, and sdb1 stays with gtvdev.
+    assert.deepEqual(sample.filter(n => n.pool === 'tank').map(n => n.name), ['tank'])
+    assert.equal(sample.find(n => n.name === 'sdb1')!.pool, 'gtvdev')
+    // Nothing to read from an all-`-` row: rates 0, latency null.
+    const tank = sample.find(n => n.name === 'tank')!
+    assert.equal(tank.ops.read, 0)
+    assert.equal(tank.bandwidth.write, 0)
+    assert.equal(tank.totalWait.read, null)
+  })
+
+  it('and stays a pool with no pool names given at all', () => {
+    const [sample] = parseZpoolIostat(allDashPoolText)
+    assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'tank'])
   })
 })

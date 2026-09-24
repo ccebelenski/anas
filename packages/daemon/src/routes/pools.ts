@@ -1777,25 +1777,39 @@ export async function poolRoutes(
     // id, `/dev/disk/by-id/<disk>` is a device the pool does not have, and
     // guessing at one of the three would replace the wrong one. A name that
     // fits several leaves is refused with its candidates, exactly as the remove
-    // route refuses it. An unreadable status keeps the old by-id spelling —
-    // fail-open, as every read on this route is, with zpool's own error the
-    // answer.
+    // route refuses it.
+    //
+    // A status we CANNOT read fails CLOSED (vdevs.2 hardening). It used to fall
+    // back to `byIdPath(existingDiskId)` — a spelling the pool may not carry at
+    // all, and on a partition-backed device a spelling that names a DIFFERENT
+    // member than the one the operator picked. `zpool replace` aimed at a
+    // substituted device destroys the data on it, and that is not a risk to run
+    // on a read that did not happen. Both leaf verbs name an existing leaf —
+    // the mirror-attach names the leaf it mirrors, the schema requires it — so
+    // neither proceeds unidentified, and the attach's busy gate above is
+    // likewise not skipped on an unread status. The refusal is a 409 with its
+    // reason: nothing about the request is wrong, the node could not answer.
     const leafStatus = leafStatusResult.exitCode === 0
       ? parseZpoolStatusPool(leafStatusResult.stdout, poolName)
       : null
-    let existingPath = byIdPath(existingDiskId!)
-    if (leafStatus) {
-      const leaf = resolveLeafDevice(leafStatus, existingDiskId!)
-      if (!leaf) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, existingDiskId!) } }
-      }
-      if (isVdevRefusal(leaf)) {
-        reply.code(400)
-        return { error: { code: 'VALIDATION_ERROR', message: leaf.message } }
-      }
-      existingPath = leaf.path
+    if (!leafStatus) {
+      const detail = leafStatusResult.exitCode === 0
+        ? `zpool status no longer reports the pool`
+        : leafStatusResult.stderr.trim() || `zpool status exited with code ${leafStatusResult.exitCode}`
+      const verb = replace ? 'replace' : 'attach to'
+      reply.code(409)
+      return { error: { code: 'CONFLICT', reason: 'unreadable', message: `pool ${poolName}'s status could not be read (${detail}); refusing to ${verb} a device it cannot identify` } }
     }
+    const leaf = resolveLeafDevice(leafStatus, existingDiskId!)
+    if (!leaf) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, existingDiskId!) } }
+    }
+    if (isVdevRefusal(leaf)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: leaf.message } }
+    }
+    const existingPath = leaf.path
 
     const args = replace
       ? ['replace', poolName, existingPath, newPath]
