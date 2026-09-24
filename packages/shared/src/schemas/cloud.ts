@@ -44,7 +44,8 @@ export type CloudProviderExample = z.infer<typeof CloudProviderExample>
  * The two booleans carry DIFFERENT facts and drive different behaviour:
  *  - `secret` (hide the value from responses): `IsPassword` OR the name rule
  *    — s3's `secret_access_key` and b2's `key` are secret here although rclone
- *    does not type them as passwords.
+ *    does not type them as passwords. A BOOL option is never secret:
+ *    `sftp.ask_password` matches the name rule but holds `true`/`false`.
  *  - `password` (obscure the value in the file): rclone's `IsPassword` ONLY.
  *    A secret-by-name value is stored PLAIN — rclone would not reveal an
  *    obscured value in a non-password field.

@@ -382,7 +382,9 @@
                 return;
             }
             var d = (res && res.data) || {};
-            ANAS.toast(verdictSentence(d.verdict, d.message));
+            // The daemon's message is rclone's own text — encoded like the
+            // in-dialog verdict (renderCloudTestResult), never raw markup.
+            ANAS.toast(enc(verdictSentence(d.verdict, d.message)));
         }, function (err) {
             try { grid.setLoading(false); } catch (e) { /* non-fatal */ }
             if (grid.destroyed || grid.destroying) {

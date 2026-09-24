@@ -10354,10 +10354,11 @@ const CLOUD_B2_REMOTE = {
   secretsSet: ['key'],
 }
 
-// A saved sftp remote whose ADVANCED bool `ask_password` is ON. rclone types
-// it secret by NAME (it ends in `password`) although it is a checkbox — and a
-// checkbox has no "(unchanged)" state, so the write-only rule would make it
-// impossible to turn off.
+// A saved sftp remote whose ADVANCED bool `ask_password` is ON. The name ends
+// in `password`, so the generic name rule alone would call it a secret — the
+// daemon exempts bools (they come back as VALUES, never in `secretsSet`) and
+// the dialog does too: a checkbox has no "(unchanged)" state, so the
+// write-only rule would make it impossible to turn off.
 const CLOUD_ASKPASS_REMOTE = {
   name: 'askpw',
   type: 'sftp',
@@ -10414,10 +10415,11 @@ function cloudOption(win, name) {
 
 async function cloudChecks() {
   const testBodies = []
+  let testReply = { verdict: 'ok', message: '' }
   let routes = cloudRoutes()
   routes['POST /cloud/remotes/test'] = (body) => {
     testBodies.push(body)
-    return { data: { verdict: 'ok', message: '' } }
+    return { data: testReply }
   }
   let { ANAS: cloudAnas, win } = await openCloudRemotes(routes)
   let grid = win.down('#cloudRemotesGrid')
@@ -10465,6 +10467,18 @@ async function cloudChecks() {
     testBodies[0], { name: 'gt' })
   ok('cloud(toolbar test): the verdict sentence rides the toast',
     /Reachable/.test(toasts[toasts.length - 1] || ''), toasts[toasts.length - 1])
+
+  // A toast is HTML: rclone's own message goes through ANAS.enc, exactly as
+  // the in-dialog verdict does (renderCloudTestResult).
+  testReply = { verdict: 'auth', message: '<b>ssh: handshake failed</b>' }
+  cloudAnas.enc = v => `ENC(${String(v == null ? '' : v)})`
+  gridTestBtn.handler(gridTestBtn)
+  await settle()
+  cloudAnas.enc = realEnc
+  eq('cloud(toolbar test): the toast encodes the whole verdict sentence, daemon message included',
+    toasts[toasts.length - 1],
+    'ENC(Authentication failed \u2014 <b>ssh: handshake failed</b>)')
+  testReply = { verdict: 'ok', message: '' }
 
   // --- (c) Add dialog: the live gate, then the create body -----------------
   created.windows.length = 0
@@ -10670,9 +10684,9 @@ async function cloudChecks() {
   created.windows.length = 0
 
   // --- (d3) a secret-by-NAME BOOL is never write-only ----------------------
-  // rclone flags sftp's `ask_password` secret because the name ends in
-  // `password` — but it is a checkbox, and a checkbox has no "(unchanged)"
-  // state. Treated as write-only it can be switched on and never off.
+  // sftp's `ask_password` ends in `password` — but it is a checkbox, and a
+  // checkbox has no "(unchanged)" state. Treated as write-only it can be
+  // switched on and never off.
   created.windows.length = 0
   const apWin = (await openCloudRemotes(cloudRoutes([CLOUD_ASKPASS_REMOTE]))).win
   const apGrid = apWin.down('#cloudRemotesGrid')

@@ -82,12 +82,20 @@ export function defaultRcloneConfigPaths(): RcloneConfigPaths {
  * rclone 1.60 has no `Sensitive` flag, so this rule stands in for it — it is
  * a heuristic and is stated as one. `option` (when known) makes rclone's own
  * `IsPassword`/secret fact authoritative: `option.secret` wins either way.
+ *
+ * A BOOL option is never a secret. `sftp.ask_password` and `ftp.ask_password`
+ * match the name rule but hold `true`/`false` — hiding those would leave a
+ * stored `ask_password = true` neither showable nor clearable in the dialog.
+ * rclone's own flag still wins: a bool rclone ever typed as a password (or
+ * flagged secret) stays secret.
  */
 const SECRET_SUFFIX_RE = /(?:^|_)(?:pass|password|secret|token|key)$/
 
-export function isSecretKey(key: string, option?: CloudProviderOption): boolean {
+export function isSecretKey(key: string, option?: Partial<Pick<CloudProviderOption, 'secret' | 'type'>>): boolean {
   if (option?.secret)
     return true
+  if (option?.type === 'bool')
+    return false
   return SECRET_SUFFIX_RE.test(key)
 }
 
@@ -118,7 +126,8 @@ interface RawProvider {
  * The parsed JSON of `rclone config providers` → the trimmed catalogue the
  * dialog renders from. The binary prints a BARE JSON list of backends (GT
  * 2026-09-23, v1.60.1 — the fixture is that output verbatim). Per option:
- * `secret = IsPassword || the name rule`, `password = IsPassword` (the
+ * `secret = IsPassword || the name rule` (a BOOL option is never secret —
+ * `sftp.ask_password`), `password = IsPassword` (the
  * obscure-in-file set — a different fact from `secret`), `default =
  * DefaultStr`, options with `Hide !== 0` dropped (rclone hides `test_mode`-
  * style knobs from config UIs). The output is validated against the shared
@@ -135,12 +144,15 @@ export function trimProviders(raw: unknown): CloudProvider[] {
       .filter(o => (o.Hide ?? 0) === 0)
       .map((o) => {
         const name = String(o.Name ?? '')
+        const type = String(o.Type ?? '')
         return {
           name,
           help: String(o.Help ?? ''),
-          type: String(o.Type ?? ''),
+          type,
           required: o.Required === true,
-          secret: o.IsPassword === true || isSecretKey(name),
+          // The option's own TYPE goes through the rule, so a bool named like
+          // a secret (`ask_password`) comes out `secret: false`.
+          secret: o.IsPassword === true || isSecretKey(name, { type }),
           password: o.IsPassword === true,
           default: String(o.DefaultStr ?? ''),
           examples: (Array.isArray(o.Examples) ? o.Examples : []).map(e => ({

@@ -355,7 +355,7 @@
         "help": "Allow asking for SFTP password when needed.",
         "type": "bool",
         "required": false,
-        "secret": true,
+        "secret": false,
         "password": false,
         "default": "false",
         "examples": [],

@@ -83,6 +83,17 @@ describe('rclone-config: the secret-key rule (rclone.1)', () => {
     // the rule is a UNION (a name-lookalike stays secret)
     assert.equal(isSecretKey('client_secret', mkOption({ name: 'client_secret', secret: false })), true)
   })
+
+  it('a BOOL option is never a secret, however it is named', () => {
+    // sftp/ftp `ask_password` matches the name rule but holds true/false —
+    // hiding it would leave a stored `ask_password = true` neither showable
+    // nor clearable in the dialog.
+    assert.equal(isSecretKey('ask_password', mkOption({ name: 'ask_password', type: 'bool' })), false)
+    // the name rule alone (no option known) still calls it secret
+    assert.equal(isSecretKey('ask_password'), true)
+    // rclone's own flag still wins on a bool
+    assert.equal(isSecretKey('ask_password', mkOption({ name: 'ask_password', type: 'bool', secret: true })), true)
+  })
 })
 
 describe('rclone-config: trimProviders on the 1.60.1 fixture (rclone.1)', () => {
@@ -141,6 +152,15 @@ describe('rclone-config: trimProviders on the 1.60.1 fixture (rclone.1)', () => 
     const keyFile = sftp.options.find(o => o.name === 'key_file')!
     assert.equal(keyFile.secret, false)
     assert.equal(keyFile.password, false)
+  })
+
+  it('sftp/ftp ask_password is a bool, so it is not secret despite the name', () => {
+    for (const type of ['sftp', 'ftp']) {
+      const ask = provider(type).options.find(o => o.name === 'ask_password')!
+      assert.equal(ask.type, 'bool', `${type}.ask_password is a bool in the capture`)
+      assert.equal(ask.secret, false, `${type}.ask_password is not secret`)
+      assert.equal(ask.password, false)
+    }
   })
 
   it('crypt: password and password2 are secret; drive: the advanced token option', () => {
@@ -321,6 +341,23 @@ describe('rclone-config: readConfig (rclone.1)', () => {
     })
     const again = await readConfig(paths, mock)
     assert.deepEqual(again.remotes.map(r => r.secretsSet), [['pass'], ['secret_access_key']])
+  })
+
+  it('a bool named like a secret comes back as a VALUE, not in secretsSet', async () => {
+    // `ask_password = true` on an sftp remote: the providers make the option's
+    // type known, so the value is shown and can be cleared.
+    await writeFile(paths.configFile, '[a]\ntype = sftp\nask_password = true\n', 'utf-8')
+    mock.addFixture({
+      command: RCLONE,
+      args: [...rcloneBaseArgs(paths.configFile), 'config', 'dump'],
+      result: dumpResult({
+        a: { type: 'sftp', host: '127.0.0.1', ask_password: 'true', pass: 'OBSCURED-value' },
+      }),
+    })
+    const read = await readConfig(paths, mock, providers)
+    const a = read.remotes.find(r => r.name === 'a')!
+    assert.equal(a.options.ask_password, 'true')
+    assert.deepEqual(a.secretsSet, ['pass'])
   })
 
   it('an encrypted-style failure reads as encrypted:true with the raw text', async () => {
