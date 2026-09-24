@@ -380,12 +380,34 @@ describe('task units — journald reads under the cloud prefix', () => {
   it('cause hints are per-kind: backup\'s owner-mismatch line is not cloud\'s', () => {
     const journal = [
       '2026-09-20T02:00:03+0000 anas-pve anas-cloud-offsite[1010]: owner mismatch on the target',
+      '2026-09-20T02:00:03+0000 anas-pve anas-cloud-offsite[1010]: cleanup skipped',
       '2026-09-20T02:00:03+0000 anas-pve systemd[1]: anas-cloud-offsite.service: Failed with result \'exit-code\'.',
     ].join('\n')
+    // Backup's hint REACHES BACK past a later line to the real cause.
     assert.equal(failureDetailFromJournal(BACKUP_UNIT_KIND, journal), 'owner mismatch on the target')
-    // Cloud declares no hints, so it falls through to the last message line —
-    // honest, and nothing of backup's vocabulary leaks in.
-    assert.match(failureDetailFromJournal(CLOUD_UNIT_KIND, journal) ?? '', /Failed with result/)
+    // Cloud declares no such hint, so it takes the last line the unit itself
+    // printed — honest, and nothing of backup's vocabulary leaks in.
+    assert.equal(failureDetailFromJournal(CLOUD_UNIT_KIND, journal), 'cleanup skipped')
+  })
+
+  it('a guard refusal beats systemd\'s "Failed to start <unit>" sentence', () => {
+    // The real shape, captured on the stunt node (rclone.2 slice 3): the
+    // runner prints the refusal, which says nothing about failing, and systemd
+    // then writes three lines of its own — one of which puts the unit name
+    // INSIDE the sentence rather than in front of it. The operator must get the
+    // refusal, never systemd's "Failed to start …".
+    const refusal = '/mnt/gt-unmounted is a mount defined in /etc/fstab but not mounted right now - '
+      + 'the directory would be empty or incomplete, so the run is refused instead of reading through it. '
+      + 'Mount /mnt/gt-unmounted and run it again.'
+    const journal = [
+      '2026-09-24T21:30:15+0000 anas-pve systemd[1]: Starting anas-cloud-gtunmounted.service - ANAS cloud sync task gtunmounted...',
+      `2026-09-24T21:30:25+0000 anas-pve node[1884805]: ${refusal}`,
+      '2026-09-24T21:30:25+0000 anas-pve systemd[1]: anas-cloud-gtunmounted.service: Main process exited, code=exited, status=1/FAILURE',
+      '2026-09-24T21:30:25+0000 anas-pve systemd[1]: anas-cloud-gtunmounted.service: Failed with result \'exit-code\'.',
+      '2026-09-24T21:30:25+0000 anas-pve systemd[1]: Failed to start anas-cloud-gtunmounted.service - ANAS cloud sync task gtunmounted.',
+      '2026-09-24T21:30:25+0000 anas-pve systemd[1]: anas-cloud-gtunmounted.service: Consumed 698ms CPU time, 81.8M memory peak.',
+    ].join('\n')
+    assert.equal(failureDetailFromJournal(CLOUD_UNIT_KIND, journal), refusal)
   })
 
   it('an empty journal yields no detail at all', () => {

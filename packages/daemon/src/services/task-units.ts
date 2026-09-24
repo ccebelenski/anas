@@ -681,13 +681,24 @@ export function parseHelperResult<H extends TaskHelperResult = TaskHelperResult>
   return null
 }
 
-/** `^<prefix>\S+\.service:` — systemd's own boilerplate lines for this kind. */
+/**
+ * systemd's OWN lines about one of this kind's services — anything that names
+ * `<prefix><task>.service`. systemd writes them in two shapes and BOTH are
+ * boilerplate: the trailer it prefixes with the unit
+ * (`anas-cloud-x.service: Failed with result 'exit-code'.`) and the sentence it
+ * puts the unit INSIDE (`Failed to start anas-cloud-x.service - ANAS cloud sync
+ * task x.`). Matching only the first shape let the second one win the failure
+ * detail, so a guard refusal — whose own sentence says nothing about "failing"
+ * — reached the operator as "Failed to start anas-cloud-x.service", the bare
+ * failure DESIGN forbids (live proof rclone.2 slice 3). The unit's own output
+ * is always the better answer; systemd is only the supervisor.
+ */
 const UNIT_LINE_RE_CACHE = new Map<string, RegExp>()
 const REGEX_METACHARS = /[.*+?^${}()|[\]\\]/g
 function unitLineRegex(prefix: string): RegExp {
   let re = UNIT_LINE_RE_CACHE.get(prefix)
   if (!re) {
-    re = new RegExp(`^${prefix.replace(REGEX_METACHARS, '\\$&')}\\S+\\.service:`)
+    re = new RegExp(`${prefix.replace(REGEX_METACHARS, '\\$&')}\\S*\\.service`)
     UNIT_LINE_RE_CACHE.set(prefix, re)
   }
   return re
@@ -695,9 +706,11 @@ function unitLineRegex(prefix: string): RegExp {
 
 /**
  * The client-safe failure detail from the unit journal: prefer the command's
- * verbatim `Error:` line (or one of the kind's own cause hints), else the last
- * non-JSON message line. Never contains a secret (the tools ANAS runs keep
- * credentials off stderr, and secrets never reach an argv).
+ * verbatim `Error:` line (or one of the kind's own cause hints), then a
+ * failure-ish line, and finally the last line the UNIT itself printed. systemd's
+ * own lines about the unit are skipped at every step — they say a run failed,
+ * never why. Never contains a secret (the tools ANAS runs keep credentials off
+ * stderr, and secrets never reach an argv).
  */
 export function failureDetailFromJournal(kind: TaskUnitKind, journal: string): string | null {
   const msgs = journal.split('\n').map(messageFromJournalLine).filter(Boolean)
@@ -714,9 +727,12 @@ export function failureDetailFromJournal(kind: TaskUnitKind, journal: string): s
     if (FAILED_MSG_RE.test(msgs[i]) && !boilerplate.test(msgs[i]))
       return msgs[i]
   }
-  // Last resort: the last non-JSON message line.
+  // Last resort: the last message line that is neither the result JSON nor
+  // systemd's own boilerplate — i.e. the last thing the UNIT itself said. A
+  // refusal sentence carries no "failed" anywhere in it, so this is the branch
+  // every guard refusal lands in.
   for (let i = msgs.length - 1; i >= 0; i--) {
-    if (!msgs[i].startsWith('{'))
+    if (!msgs[i].startsWith('{') && !boilerplate.test(msgs[i]))
       return msgs[i]
   }
   return null
