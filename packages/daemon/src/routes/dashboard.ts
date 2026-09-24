@@ -374,7 +374,7 @@ export async function dashboardRoutes(
 
       const arc = computeArc(arc0, arc1)
       const net = computeNet(net0, net1, windowMs)
-      const pools = await computeIo(iostatText)
+      const pools = await computeIo(iostatText, new Set(poolNames))
       // AHR I/O rides its own diskstats deltas (11.15), fully fail-open to []:
       // an AHR resolve error never disturbs the ZFS/ARC/net telemetry above.
       const ahrPools = await collectAhrTelemetry(executor, diskstats0, diskstats1, windowMs, mdadmConfPath)
@@ -410,12 +410,14 @@ export async function dashboardRoutes(
    * Nested pool → vdevs[] → disks[] I/O from the interval (LAST) iostat sample.
    * Each vdev is enriched with type/role/state joined from `zpool status`.
    */
-  async function computeIo(iostatText: string): Promise<PoolTelemetry[]> {
+  async function computeIo(iostatText: string, knownPools: ReadonlySet<string>): Promise<PoolTelemetry[]> {
     const pools: PoolTelemetry[] = []
     if (!iostatText.trim())
       return pools
 
-    const samples = parseZpoolIostat(iostatText)
+    // The pools we asked iostat about — without them a `logs`/`special`/`dedup`
+    // section header reads as a pool of its own (vdevs.1 consumer audit).
+    const samples = parseZpoolIostat(iostatText, knownPools)
     const sample = samples.at(-1)
     if (!sample || sample.length === 0)
       return pools
@@ -502,8 +504,18 @@ export async function dashboardRoutes(
       for (const pool of parseZpoolStatus(r.stdout)) {
         const vmap = new Map<string, VdevJoin>()
         for (const group of pool.vdevGroups) {
-          for (const vdev of group.vdevs)
-            vmap.set(vdev.name, { type: vdev.type, role: group.role, state: vdev.state })
+          for (const vdev of group.vdevs) {
+            const join: VdevJoin = { type: vdev.type, role: group.role, state: vdev.state }
+            vmap.set(vdev.name, join)
+            // A single-leaf pool-level vdev is named after its SECTION by the
+            // status parser (`logs`, `cache`, `special`, `dedup`, `spares`)
+            // while iostat prints the leaf itself at the vdev indent. Index the
+            // leaf too, so a special/log/dedup vdev joins with its own role
+            // instead of falling back to `data` (vdevs.1 consumer audit). A key
+            // an actual vdev already owns is never overwritten.
+            if (vdev.disks.length === 1 && !vmap.has(vdev.disks[0].id))
+              vmap.set(vdev.disks[0].id, join)
+          }
         }
         map.set(pool.name, vmap)
       }

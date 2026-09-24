@@ -66,8 +66,18 @@ const WHITESPACE_RE = /\s+/
 /**
  * Parse the full multi-sample output into an array of samples, each an array of
  * nodes. The telemetry route uses the LAST sample (the per-second interval).
+ *
+ * `knownPools` — the pools the command was ASKED about — separates a pool row
+ * from a vdev-class section header. GROUND TRUTH (stunt node, ZFS 2.4.4,
+ * 2026-09-24, fixture `zpool-iostat-plv-all-vdev-classes-2.4.4.txt`): `zpool
+ * iostat -plv` prints `logs`, `cache`, `special` and `dedup` UNINDENTED, in the
+ * pool column, with every value cell `-`; their devices follow at the vdev
+ * indent. Read positionally those headers become four phantom pools and the
+ * real pool loses the vdevs beneath them (vdevs.1 consumer audit). Naming the
+ * pools is the only way to tell the two apart — a pool may legitimately be
+ * called `special`. Without the argument the old positional reading is kept.
  */
-export function parseZpoolIostat(text: string): IostatNode[][] {
+export function parseZpoolIostat(text: string, knownPools?: ReadonlySet<string>): IostatNode[][] {
   const samples: IostatNode[][] = []
   let current: IostatNode[] | null = null
   let currentPool = ''
@@ -101,6 +111,14 @@ export function parseZpoolIostat(text: string): IostatNode[][] {
     let pool = currentPool
     let vdev = currentVdev
     if (depth === 0) {
+      // An unindented row that is NOT one of the pools we asked about is a
+      // vdev-class section header (logs / cache / special / dedup / spares).
+      // It carries no statistics of its own; the standing pool continues and
+      // the devices under it are that pool's vdevs.
+      if (knownPools && !knownPools.has(name) && currentPool) {
+        currentVdev = undefined
+        continue
+      }
       currentPool = name
       currentVdev = undefined
       pool = name

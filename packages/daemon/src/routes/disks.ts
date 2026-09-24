@@ -13,7 +13,7 @@ import { iscsiServedSerials, normalizeSerial } from '../services/iscsi-held.js'
 const BY_ID_PATH_RE = /^\/dev\/disk\/by-(?:id|partuuid)\/(.+)$/
 const KERNEL_PATH_RE = /^\/dev\/([a-z0-9]+)$/
 const PART_SUFFIX_RE = /-part\d+$/
-const BARE_KERNEL_RE = /^(?:sd|vd|hd)[a-z]+\d*$|^nvme\d+n\d+/
+const BARE_KERNEL_RE = /^(?:sd|vd|hd)[a-z]+\d*$|^nvme\d+n\d+|^mmcblk\d+/
 
 /**
  * Resolve a `zpool status` leaf to its whole-disk KERNEL name so both sides of
@@ -101,6 +101,41 @@ interface PoolDiskInfo {
 }
 
 /**
+ * Class gravity for the one-row-per-disk pick below. One disk can carry leaves
+ * of SEVERAL vdev classes at once (a data partition and a special partition —
+ * the whole of the six-class pool the vdevs.1 live proof builds), and the disk
+ * row carries ONE context. Ranked by what the loss of that class costs: special
+ * and dedup take the WHOLE pool down with them and are the classes an operator
+ * is least likely to know are on this disk; data is next; a log, spare or cache
+ * device can be lost (a log, short of a crash) without losing data.
+ */
+const ROLE_GRAVITY: Record<VdevRole, number> = {
+  special: 5,
+  dedup: 4,
+  data: 3,
+  log: 2,
+  spare: 1,
+  cache: 0,
+}
+
+/**
+ * How much this leaf's context deserves the disk's single row. The FAULT comes
+ * first — a faulted special member with errors must never be shadowed by a
+ * healthy sibling class on the same disk — then the error counts, and only then
+ * class gravity as a deterministic tie-break between two equally healthy
+ * contexts. The state tiers mirror `computeHealth`'s own ranking.
+ */
+function contextWeight(info: PoolDiskInfo): number {
+  const stateRank = info.state === 'FAULTED' || info.state === 'UNAVAIL' || info.state === 'REMOVED'
+    ? 2
+    : info.state === 'OFFLINE' || info.state === 'DEGRADED'
+      ? 1
+      : 0
+  const errors = Math.min(info.read + info.write + info.checksum, 1_000_000)
+  return (stateRank * 10_000_000) + (errors * 10) + ROLE_GRAVITY[info.role]
+}
+
+/**
  * Fuse SMART pass/fail with live ZFS state into one health level — the signal
  * PVE's disk view never combines. Cheap: uses already-collected data, no extra
  * smartctl call per disk.
@@ -184,7 +219,7 @@ export async function collectDisks(
               const kernel = resolveLeafKernel(disk.id, disk.path, byIdToKernel)
               if (!kernel)
                 continue
-              poolInfo.set(kernel, {
+              const candidate: PoolDiskInfo = {
                 pool: pool.name,
                 vdevName: vdev.name,
                 role: group.role,
@@ -192,7 +227,14 @@ export async function collectDisks(
                 read: disk.readErrors,
                 write: disk.writeErrors,
                 checksum: disk.checksumErrors,
-              })
+              }
+              // Several leaves can resolve to ONE disk (partition-backed vdev
+              // classes on a single device); keep the context that most
+              // deserves the row rather than whichever class ZFS printed last.
+              const standing = poolInfo.get(kernel)
+              if (standing && contextWeight(standing) >= contextWeight(candidate))
+                continue
+              poolInfo.set(kernel, candidate)
             }
           }
         }

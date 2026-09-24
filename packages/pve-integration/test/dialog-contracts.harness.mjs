@@ -207,6 +207,90 @@ function makeStore(cfg) {
 
 const CHECKBOXES = ['checkbox', 'checkboxfield', 'radiofield', 'radio']
 
+/**
+ * A deliberately SHALLOW DOM, for the views that write raw HTML into a panel
+ * and then address parts of it by id — the pool Expand/Replace surface
+ * (35-pool-attach.js) is the first. It is not an HTML parser: each element
+ * keeps its `innerHTML` as a string, `querySelector('#x')` hands back a child
+ * node registered under that id once the id appears in the markup written so
+ * far, and `querySelectorAll` understands the one selector these views use, a
+ * radio group by name. That is enough to render, flip a radio and read what was
+ * written back. It models no containment, so it cannot catch a stale node — a
+ * check asserts on the node it asked for, never on the whole document.
+ */
+function makeDomNode(id, tree) {
+  const node = {
+    id,
+    _html: '',
+    _on: {},
+    style: {},
+    get innerHTML() { return node._html },
+    set innerHTML(v) { node._html = String(v == null ? '' : v) },
+    querySelector: sel => tree.find(sel),
+    querySelectorAll: sel => tree.findAll(sel),
+    addEventListener(ev, fn) { (node._on[ev] = node._on[ev] || []).push(fn) },
+    removeEventListener() {},
+    appendChild(c) { return c },
+    setAttribute() {},
+    getAttribute: () => null,
+    /** Fire a listener the view attached, the way a click/change would. */
+    fire(ev, e) { for (const fn of node._on[ev] || []) { fn(e || { target: node }) } },
+  }
+  return node
+}
+
+function makeDomTree() {
+  const byId = new Map()
+  const tree = {}
+  const root = makeDomNode('', tree)
+  // Everything written so far — the root's own markup plus every id-node's.
+  const markup = () => [root._html, ...[...byId.values()].map(n => n._html)].join('\n')
+
+  tree.find = (sel) => {
+    const id = /^#([\w-]+)$/.exec(sel)
+    if (id) {
+      if (byId.has(id[1])) { return byId.get(id[1]) }
+      if (!markup().includes(`id="${id[1]}"`)) { return null }
+      const node = makeDomNode(id[1], tree)
+      byId.set(id[1], node)
+      return node
+    }
+    const all = tree.findAll(sel)
+    return all.length ? all[0] : null
+  }
+
+  // Radio nodes are CACHED by name+value: a view re-attaches its change
+  // listener on every render, and a check has to be able to flip the very node
+  // the view is listening to. Handlers therefore accumulate across renders —
+  // harmless, since each one no-ops when the mode it would set is already the
+  // standing one.
+  const radioNodes = new Map()
+
+  tree.findAll = (sel) => {
+    const radios = /^input\[name="([^"]+)"\]$/.exec(sel)
+    if (!radios) { return [] }
+    const out = []
+    const re = new RegExp(`<input[^>]*name="${radios[1]}"[^>]*>`, 'g')
+    for (const tag of markup().match(re) || []) {
+      const value = /value="([^"]*)"/.exec(tag)
+      const key = `${radios[1]}=${value ? value[1] : ''}`
+      let node = radioNodes.get(key)
+      if (!node) {
+        node = makeDomNode('', tree)
+        node.value = value ? value[1] : ''
+        radioNodes.set(key, node)
+      }
+      node.checked = / checked/.test(tag)
+      out.push(node)
+    }
+    return out
+  }
+
+  root.markup = markup
+  root.nodeById = id => byId.get(id) || null
+  return root
+}
+
 function makeComponent(cfg, parent) {
   const c = { ...(cfg && typeof cfg === 'object' ? cfg : { xtype: 'tbseparator' }) }
   c.parent = parent || null
@@ -447,9 +531,23 @@ function makeComponent(cfg, parent) {
   c.setText = function (v) { c.text = v; return c }
   c.setIconCls = function (v) { c.iconCls = v; return c }
   c.update = function (h) { c.html = h; return c }
-  c.setHtml = function (h) { c.html = h; return c }
+  c.setHtml = function (h) {
+    c.html = h
+    if (c._dom) { c._dom._html = String(h == null ? '' : h) }
+    return c
+  }
   c.getForm = () => ({ isValid: () => true, getValues: () => ({}) })
-  c.getEl = () => ({ on() {}, dom: {} })
+  // The component's own shallow DOM, created on first use (see makeDomTree) and
+  // kept in step with setHtml — a view that renders markup and then addresses
+  // it by id gets the same element back on every look-up.
+  c.dom = function () {
+    if (!c._dom) {
+      c._dom = makeDomTree()
+      c._dom._html = String(c.html == null ? '' : c.html)
+    }
+    return c._dom
+  }
+  c.getEl = () => ({ on() {}, dom: c.dom() })
   c.getWidth = () => 900
   c.show = function () { c.hidden = false; return c }
   c.close = function () { c.destroyed = true; return c }
@@ -6763,6 +6861,18 @@ async function detailNestedScanChecks() {
   ok('detail scan: the detail window opened', detail && detail.cls === 'anas-win-backup-detail')
   const body = detail && detail.down('#detailBody')
 
+  /**
+   * The ARCHIVE block's own markup. When the scan lands, 68-backup.js re-renders
+   * that block ALONE, in place, through the archives wrapper id — the whole
+   * point of the wrapper, so the units/journald blocks below it are not rebuilt.
+   * Reading the panel's `html` would therefore still show the pre-scan render
+   * (spinners and all), which is precisely what the operator does NOT see.
+   */
+  const archivesOf = (panel) => {
+    const wrap = panel && panel._dom && panel._dom.nodeById('anas-backup-detail-archives')
+    return wrap ? wrap.innerHTML : (panel && panel.html) || ''
+  }
+
   // (a) The detail GET already rendered — WITHOUT the scan: the files rows show
   // their spinner, the rest of the detail is fully there.
   const html = body && body.html
@@ -6788,17 +6898,19 @@ async function detailNestedScanChecks() {
   // (b) The scan lands: the nested lines render from it, the spinner is gone.
   previewDeferred.resolve(nestedPreviewResponse(sent))
   await settle()
-  const html2 = body && body.html
+  const html2 = archivesOf(body)
   ok('detail scan: the scan`s boundaries render once it lands',
     !!html2 && html2.includes('/mnt/pictures/raw') && html2.includes('/etc/pve') && html2.includes('/srv/nfs'))
   ok('detail scan: the spinner is gone after the scan lands', !!html2 && !html2.includes('Scanning for nested filesystems'))
   ok('detail scan: included vs empty-directory is stated per boundary',
     !!html2 && html2.includes('included') && html2.includes('stored as an empty directory'))
   ok('detail scan: the derived consistency rides the same scan', !!html2 && html2.includes('snapshot'))
+  // …and the blocks AROUND the archives are untouched by that in-place redraw.
+  const panel2 = (body && body.html) || ''
   // The last run's notice is findable HERE — the run's notes-only toast points
   // the operator to this window, so the pointer must land on something.
   ok('detail scan: the last run`s notes render muted on the detail',
-    !!html2 && html2.includes('Notes: <ul>') && html2.includes(RUN_NOTICE))
+    !!panel2 && panel2.includes('Notes: <ul>') && panel2.includes(RUN_NOTICE))
 
   // (c) A preview that REFUSES (second window, second request): the rows say
   // "unavailable" and the rest of the detail stays exactly as it is.
@@ -6812,11 +6924,12 @@ async function detailNestedScanChecks() {
   ok('detail scan: a second open requests the scan again', !!sent2 && Array.isArray(sent2.archives))
   previewDeferred.reject(new Error('the scan could not run'))
   await settle()
-  const html3 = body2 && body2.html
+  const html3 = archivesOf(body2)
+  const panel3 = (body2 && body2.html) || ''
   ok('detail scan: a failed scan says unavailable on the archive rows',
     !!html3 && html3.includes('Nested-filesystem scan unavailable') && html3.includes('the scan could not run'))
   ok('detail scan: the rest of the detail survives a failed scan',
-    !!html3 && html3.includes('nightly-pictures') && html3.includes('pbs-main'))
+    !!panel3 && panel3.includes('nightly-pictures') && panel3.includes('pbs-main'))
   ok('detail scan: the spinner is gone after a failure too', !!html3 && !html3.includes('Scanning for nested filesystems'))
   ok('detail scan: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
@@ -9140,6 +9253,154 @@ async function vdevRemoveChecks() {
 warnings.length = 0
 created.windows.length = 0
 await vdevRemoveChecks()
+
+// ============================================================================
+//  Story vdevs.1 (GitHub #66) — consumer audit: every vdev CLASS is reachable
+//  from the dialogs, not just the data vdevs
+// ============================================================================
+
+/**
+ * `GET /pools/gtvdev` as the daemon answers it for the six-class pool the live
+ * proof builds — one vdev per class on one partition each, exactly the shape
+ * `zpool-status-all-vdev-classes-2.4.4.json` parses to (a single-leaf pool-level
+ * vdev is named after its SECTION, a data leaf after itself).
+ */
+const ALL_CLASS_DETAIL = {
+  name: 'gtvdev',
+  state: 'ONLINE',
+  vdevGroups: [
+    { role: 'data', vdevs: [{ name: 'sdb1', type: 'disk', state: 'ONLINE', disks: [{ id: 'sdb1', state: 'ONLINE' }] }] },
+    { role: 'log', vdevs: [{ name: 'logs', type: 'disk', state: 'ONLINE', disks: [{ id: 'sdb2', state: 'ONLINE' }] }] },
+    { role: 'cache', vdevs: [{ name: 'cache', type: 'disk', state: 'ONLINE', disks: [{ id: 'sdb3', state: 'ONLINE' }] }] },
+    { role: 'spare', vdevs: [{ name: 'spares', type: 'disk', state: 'AVAIL', disks: [{ id: 'sdb4', state: 'AVAIL' }] }] },
+    { role: 'special', vdevs: [{ name: 'special', type: 'disk', state: 'ONLINE', disks: [{ id: 'sdb5', state: 'ONLINE' }] }] },
+    { role: 'dedup', vdevs: [{ name: 'dedup', type: 'disk', state: 'ONLINE', disks: [{ id: 'sdb6', state: 'ONLINE' }] }] },
+  ],
+}
+
+const VDEV_ROUTES = {
+  'GET /pools/gtvdev/expansion': {
+    data: { pool: 'gtvdev', targets: [], busy: { busy: false }, capability: {} },
+  },
+  'GET /pools/gtvdev': { data: ALL_CLASS_DETAIL },
+  'GET /disks': {
+    data: [{
+      id: 'scsi-0QEMU_QEMU_HARDDISK_ANAS_SPARE1',
+      name: 'sdc',
+      status: 'available',
+      size: 2147483648,
+      model: 'QEMU HARDDISK',
+    }],
+  },
+}
+
+/**
+ * Consumer (d): the Expand / Replace surface builds its leaf list from the
+ * pool's vdevGroups. While the status parser dropped the pool-level sections,
+ * Replace listed the DATA leaves only — a failed special-vdev member, the one
+ * failure that loses the whole pool, could not be replaced from the UI at all.
+ */
+async function vdevClassChecks() {
+  const ANAS = loadSource('35-pool-attach.js', VDEV_ROUTES)
+  const action = (ANAS.pools._actions || []).find(a => a.itemId === 'attachDisk')
+  ok('vdev classes: the pool toolbar carries the Expand / Replace action', !!action)
+
+  const grid = makeComponent({ xtype: 'gridpanel' }, null)
+  created.windows.length = 0
+  action.handler('harness', grid, 'gtvdev')
+  await settle()
+
+  const win = openWindow()
+  ok('vdev classes: the expand/replace window opened', !!win && win.cls === 'anas-win-attach anas-win-pool-expand')
+  const body = win && win.down('#pexBody')
+  const dom = body && body.dom()
+  const area = () => {
+    const el = dom && dom.nodeById('pexArea')
+    return el ? el.innerHTML : ''
+  }
+
+  // Switch to Replace the way the operator does — the mode radio in the shell.
+  const modes = dom.querySelectorAll('input[name="pex-mode"]')
+  eq('vdev classes: the surface offers both modes', modes.map(m => m.value), ['expand', 'replace'])
+  const replace = modes.find(m => m.value === 'replace')
+  replace.fire('change', { target: { value: 'replace' } })
+  await settle()
+
+  const slots = area()
+  for (const leaf of ['sdb1', 'sdb2', 'sdb3', 'sdb4', 'sdb5', 'sdb6']) {
+    ok(`vdev classes(replace): ${leaf} is offered as a replaceable member`,
+      slots.includes(leaf), slots.slice(0, 400))
+  }
+  // Each leaf is named with the vdev it belongs to, so the operator can tell
+  // the special member from the data member on the same disk.
+  ok('vdev classes(replace): the SPECIAL member is labelled with its vdev',
+    slots.includes('special · ONLINE'), slots.slice(0, 400))
+  ok('vdev classes(replace): the log and dedup members carry theirs too',
+    slots.includes('logs · ONLINE') && slots.includes('dedup · ONLINE'))
+  ok('vdev classes(replace): the spare keeps the state ZFS reports for it',
+    slots.includes('spares · AVAIL'))
+  ok('vdev classes: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/**
+ * Consumer (e): the composer in EXPAND mode seeds the pool's existing vdevs as
+ * read-only bays and its advisor reads the roles already present. While the
+ * status parser dropped the pool-level sections the seed carried data vdevs
+ * only — so a pool with a special vdev got no special-vdev bay, no danger
+ * sentence about the one vdev whose loss loses the pool, and the advisor would
+ * happily offer it a second one.
+ *
+ * The composer needs the real graphics layer (`15-gfx.js`), which is what
+ * `gfxReady()` gates on, so both sources are loaded into one sandbox the way
+ * the page loads them.
+ */
+async function composerSeedChecks() {
+  const ANAS = loadSources(['15-gfx.js', '38-pool-composer.js'], VDEV_ROUTES)
+  created.windows.length = 0
+  ANAS.composer.open({ node: 'harness', grid: makeComponent({ xtype: 'gridpanel' }, null), mode: 'expand', poolName: 'gtvdev' })
+  const win = openWindow()
+  ok('composer seed: the expand window opened', !!win && win.title === 'Expand Pool: gtvdev')
+  // ExtJS fires afterrender once the body has a DOM; that listener is where the
+  // composer takes its root and does its first render.
+  win.fireEvent('afterrender', win)
+  await settle()
+
+  const dom = win.down('#composerBody').dom()
+  const text = id => (dom.nodeById(id) ? dom.nodeById(id).innerHTML : '')
+
+  // (1) The seed carries EVERY class, each bay named with its role.
+  const racks = text('anasc-racks')
+  for (const [leaf, label] of [
+    ['sdb1', 'Data'],
+    ['sdb2', 'Log (SLOG)'],
+    ['sdb3', 'Cache (L2ARC)'],
+    ['sdb4', 'Spare'],
+    ['sdb5', 'Special (metadata)'],
+    ['sdb6', 'Dedup (dedup table)'],
+  ]) {
+    ok(`composer seed: the existing ${label} vdev is seeded, with ${leaf}`,
+      racks.includes(label) && racks.includes(leaf), racks.slice(0, 400))
+  }
+  ok('composer seed: the seeded vdevs are read-only', racks.includes('existing — read only'))
+
+  // (2) The advisor reads those roles. The danger sentence is the visible half
+  // of the `hasSpecial` flag; the other half is the suggestion that flag
+  // suppresses — one flag, both consequences, so proving it here proves both.
+  const advisor = text('anasc-advisor')
+  ok('composer seed: the special-vdev danger sentence is said for the pool that HAS one',
+    advisor.includes('losing it loses the entire pool'), advisor.slice(0, 500))
+  ok('composer seed: no second special vdev is suggested to a pool that has one',
+    !advisor.includes('could form a mirrored special vdev'), advisor.slice(0, 500))
+  ok('composer seed: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+warnings.length = 0
+created.windows.length = 0
+await vdevClassChecks()
+
+warnings.length = 0
+created.windows.length = 0
+await composerSeedChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)

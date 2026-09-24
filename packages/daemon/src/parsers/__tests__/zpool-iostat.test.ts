@@ -87,3 +87,48 @@ describe('nodeToIoStats — column → IoStats mapping', () => {
     assert.equal(io.readBytesPerSec, 0)
   })
 })
+
+/**
+ * Stunt-node capture (ZFS 2.4.4, 2026-09-24) of a pool carrying all six vdev
+ * classes on six partitions of one disk — the shape GitHub #66 reported. The
+ * class sections (`logs`, `cache`, `special`, `dedup`) print UNINDENTED, in the
+ * pool column, with every value cell `-`; only the pools the command was asked
+ * about tell a pool row from one of those headers.
+ */
+describe('parseZpoolIostat — vdev-class section headers (vdevs.1)', () => {
+  const classesText = readFileSync(
+    join(fixturesDir, 'zpool-iostat-plv-all-vdev-classes-2.4.4.txt'),
+    'utf-8',
+  )
+
+  it('without the pool names a section header reads as a pool (the old behaviour)', () => {
+    const [sample] = parseZpoolIostat(classesText)
+    const pools = sample.filter(n => n.depth === 0).map(n => n.name)
+    assert.deepEqual(pools, ['gtvdev', 'dedup', 'special', 'logs', 'cache'])
+  })
+
+  it('naming the pool folds every section under it, its devices as vdevs', () => {
+    const [sample] = parseZpoolIostat(classesText, new Set(['gtvdev']))
+    assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev'])
+    for (const node of sample)
+      assert.equal(node.pool, 'gtvdev', `${node.name} belongs to gtvdev`)
+    // One vdev row per class that has I/O — the spare has no row at all.
+    assert.deepEqual(
+      sample.filter(n => n.depth === 1).map(n => n.name),
+      ['sdb1', 'sdb6', 'sdb5', 'sdb2', 'sdb3'],
+    )
+  })
+
+  it('the section header itself is dropped — it carries no statistics', () => {
+    const [sample] = parseZpoolIostat(classesText, new Set(['gtvdev']))
+    for (const name of ['logs', 'cache', 'special', 'dedup'])
+      assert.equal(sample.find(n => n.name === name), undefined, `${name} dropped`)
+  })
+
+  it('a pool that happens to be NAMED like a section is still a pool', () => {
+    // The argument is the pools we asked about, so the name collision resolves
+    // the honest way round — `special` is a pool here, not a header.
+    const [sample] = parseZpoolIostat(classesText, new Set(['gtvdev', 'special']))
+    assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'special'])
+  })
+})
