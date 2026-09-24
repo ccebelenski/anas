@@ -52,14 +52,31 @@
         draid3: 1,
     };
 
-    /** The leaf name a row sends and shows — the by-id id the parser carries. */
+    /**
+     * The name a row sends and shows: the LAST SEGMENT of the leaf's device
+     * path, which is what `zpool status` calls that leaf.
+     *
+     * Never `disk.id` — the parser strips a `-partN` suffix off the by-id to
+     * get the DISK's identity, so on a split device (one SSD carrying the log
+     * on -part1 and the cache on -part2) both leaves carry the same id and the
+     * daemon cannot tell which one the operator picked. The basename keeps the
+     * suffix and names exactly one leaf (GitHub #66 layout).
+     */
     function leafName(disk) {
-        return (disk && (disk.id || disk.path)) || '';
+        var path = (disk && disk.path) || '';
+        if (path) {
+            var cut = path.lastIndexOf('/');
+            return cut === -1 ? path : path.slice(cut + 1);
+        }
+        return (disk && disk.id) || '';
     }
 
     /**
      * The removable rows of a PoolDetail: one per mirrored log vdev, one per
-     * bare cache/spare/log leaf. `vdev` is exactly what the request body sends.
+     * bare cache/spare/log leaf — a section's bare leaves arrive as ONE
+     * container vdev (`cache`, `spares`, `logs`) holding all of them, and each
+     * leaf is separately removable, so a container yields one row per leaf.
+     * `vdev` is exactly what the request body sends.
      */
     function removableRows(detail) {
         var rows = [];

@@ -180,8 +180,10 @@ URLs identify resources (nouns). HTTP methods are the verbs. URL hierarchy impli
 | `POST` | `/v1/pools/:name/scrub` | Start a scrub | `202` with job |
 | `POST` | `/v1/pools/:name/export` | Export a pool | `202`/`409` |
 | `POST` | `/v1/pools/:name/vdevs` | Add a vdev (`AddVdevRequest`: role data/log/cache/spare/special/dedup + type + whole disks) — `zpool add` (3.21/3.23) | `202` with job |
-| `POST` | `/v1/pools/:name/vdevs/remove` | Remove a **cache, log or spare** vdev (`{ vdev }`: a leaf name or a log `mirror-N`) — `zpool remove`, instant, no evacuation; `400` for data/special/dedup vdevs (evacuation is a different operation ANAS does not offer) or a vdev the pool does not carry; plain job, no confirm code (vdevs.2, #66) | `202`/`400` |
+| `POST` | `/v1/pools/:name/vdevs/remove` | Remove a **cache, log or spare** vdev (`{ vdev }`: a leaf named by its device-path basename — `ata-SSD-part2`, `sdb3` — or a log `mirror-N`) — `zpool remove`, instant, no evacuation; `400` for data/special/dedup vdevs (evacuation is a different operation ANAS does not offer), a vdev the pool does not carry, a name that fits more than one leaf (a split by-id device), or a spare ZFS has put to work; plain job, no confirm code (vdevs.2, #66) | `202`/`400` |
 | `POST` | `/v1/pools/import` | Import a pool (on collection — pool isn't ours yet) | `202` with job |
+
+**Reshaping a pool's topology** — both vdev routes above stand behind ONE pre-flight: the system-pool `409` (the pool holding this node's boot filesystem, no bypass), then the PVE-ownership `400`. PVE owns the topology of the pools it manages, and adding a vdev reshapes a pool exactly as removing one does (pvepool.1).
 
 #### ZFS Datasets (nested under pools)
 

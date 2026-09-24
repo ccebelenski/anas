@@ -3,6 +3,9 @@ import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
@@ -315,5 +318,67 @@ describe('add-vdev endpoint: POST /v1/pools/:name/vdevs', () => {
     const job = await waitForJob(server, body.job.id)
     assert.equal(job.status, 'failed')
     assert.match(job.error!.message, /mismatched replication level/)
+  })
+})
+
+// --- PVE-owned pools are hands-off for the ADD side too --------------------
+//
+// Adding a vdev reshapes a pool's topology exactly as removing one does, so
+// both routes stand behind the same pre-flight (story pvepool.1: PVE owns the
+// topology of the pools it manages). Only the remove route had the gate.
+describe('add-vdev: a PVE-owned pool is refused', () => {
+  let server: ReturnType<typeof createServer> | undefined
+  let dir: string | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    delete process.env.ANAS_STORAGE_CFG
+    if (dir)
+      await rm(dir, { recursive: true, force: true })
+    dir = undefined
+  })
+
+  it('400s when storage.cfg registers the pool as a zfspool storage — no zpool add', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-vdev-add-'))
+    const cfg = join(dir, 'storage.cfg')
+    await writeFile(cfg, 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n')
+    process.env.ANAS_STORAGE_CFG = cfg
+
+    server = createServer({ mock: true, logger: false })
+    const spy = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ vdev: { type: 'mirror', disks: [DISK_A, DISK_B] } }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /local-zfs/)
+    assert.equal(spy.calls.find(c => c.args[0] === 'add'), undefined)
+  })
+
+  it('refuses a cache device on a PVE-owned pool as well', async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-vdev-add-'))
+    const cfg = join(dir, 'storage.cfg')
+    await writeFile(cfg, 'zfspool: local-zfs\n\tpool testpool\n\tcontent images,rootdir\n')
+    process.env.ANAS_STORAGE_CFG = cfg
+
+    server = createServer({ mock: true, logger: false })
+    const spy = spyExecutor(server)
+
+    const res = await server.inject({
+      method: 'POST',
+      url: '/v1/pools/testpool/vdevs',
+      headers: { ...IDENTITY_HEADERS, 'content-type': 'application/json' },
+      payload: JSON.stringify({ role: 'cache', disks: [DISK_A] }),
+    })
+
+    assert.equal(res.statusCode, 400)
+    assert.match(res.json().error.message, /local-zfs/)
+    assert.equal(spy.calls.find(c => c.args[0] === 'add'), undefined)
   })
 })

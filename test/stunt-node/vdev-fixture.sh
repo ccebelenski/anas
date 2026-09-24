@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-# vdevs.1 live-proof fixture — disposable state on the stunt node (GitHub #66).
+# vdevs.1 / vdevs.2 live-proof fixture — disposable state on the stunt node
+# (GitHub #66).
 #
 # Builds:
 #   gtvdev  a throwaway pool carrying all SIX vdev classes, one partition each,
@@ -17,9 +18,20 @@ source "${SCRIPT_DIR}/config.sh"
 #           spares/special/dedup sections), not the composer. Disks 1-8,
 #           gtbackup and gtiscsi are never touched.
 #
-# `up` attaches disk 9 (host side), partitions it on the node, and creates
-# gtvdev. `down` is the safety net: destroy gtvdev if present, wipe disk 9
-# (labels + GPT), detach it. Both verbs are idempotent.
+# Three shapes of the same pool, one verb each — all six leaves always live on
+# the SAME disk, which is the point of the by-id shape:
+#   up        leaves named by KERNEL device (/dev/sdX1 …). `zpool status` then
+#             carries no by-id anywhere.
+#   up-byid   the same six classes created from /dev/disk/by-id/<id>-partN, so
+#             every leaf is a by-id PARTITION. The whole-disk identity the
+#             parser derives (the `-partN` stripped) is then the SAME string
+#             for all six — the production layout of #66, where a request
+#             naming the disk names both the log and the cache.
+#   up-multi  one data leaf, TWO cache leaves and TWO spares (by-id), the shape
+#             that proves a pool-level section holding more than one bare leaf.
+#
+# `down` is the safety net for all three: destroy gtvdev if present, wipe disk 9
+# (labels + GPT), detach it. Every verb is idempotent.
 
 POOL="gtvdev"
 DISK_NUM=9
@@ -27,10 +39,12 @@ BY_ID="scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT${DISK_NUM}"
 IMAGE="${STORAGE_PATH}/${VM_NAME}-hot${DISK_NUM}.qcow2"
 
 usage() {
-  echo "Usage: vdev-fixture.sh <up|down|status>"
-  echo "  up      Attach disk ${DISK_NUM} (2048 MB), partition it into six, create pool ${POOL} (idempotent)"
-  echo "  down    Destroy ${POOL} if present, wipe disk ${DISK_NUM}, detach it (idempotent)"
-  echo "  status  The pool's zpool status + the disk's by-id links"
+  echo "Usage: vdev-fixture.sh <up|up-byid|up-multi|down|status>"
+  echo "  up        Attach disk ${DISK_NUM} (2048 MB), partition it into six, create pool ${POOL} from KERNEL names (idempotent)"
+  echo "  up-byid   The same six classes, created from /dev/disk/by-id/<id>-partN (idempotent)"
+  echo "  up-multi  data + TWO cache leaves + TWO spares, by-id (idempotent)"
+  echo "  down      Destroy ${POOL} if present, wipe disk ${DISK_NUM}, detach it (idempotent)"
+  echo "  status    The pool's zpool status + the disk's by-id links"
   exit 1
 }
 
@@ -75,9 +89,27 @@ status() {
   fi
 }
 
+# Partition disk 9 into six and create ${POOL} in ONE remote shell so the
+# partition table is fresh when the pool lands (a crashed earlier run left no
+# pool but may have left a stale table — zap it first). $1 is the `zpool
+# create` tail, with @D standing for the device prefix the leaves hang off:
+# the kernel device for `up`, the by-id path for the by-id shapes.
+create_pool() {
+  local tail="$1" prefix="$2"
+  $SSH_CMD "bash -s" <<REMOTE
+set -euo pipefail
+D=\$(readlink -f /dev/disk/by-id/${BY_ID})
+sgdisk -Z "\$D"
+sgdisk -n1:0:+400M -n2:0:+200M -n3:0:+200M -n4:0:+400M -n5:0:+300M -n6:0:0 "\$D"
+udevadm settle
+P="${prefix}"
+zpool create -f ${POOL} ${tail}
+REMOTE
+}
+
 case "$1" in
   up)
-    echo "=== vdevs.1 fixture — up ==="
+    echo "=== vdevs.1 fixture — up (kernel names) ==="
 
     "$SCRIPT_DIR/add-disk.sh" --size 2048 "$DISK_NUM"
     wait_for_by_id
@@ -85,18 +117,44 @@ case "$1" in
     if pool_exists; then
       echo "✓ ${POOL} already exists (skipping — 'down' first for a rebuild)"
     else
-      # Partition and create the pool in ONE remote shell so the partition
-      # table is fresh when the pool lands (a crashed earlier run left no
-      # pool but may have left a stale table — zap it first).
-      $SSH_CMD "bash -s" <<REMOTE
-set -euo pipefail
-D=\$(readlink -f /dev/disk/by-id/${BY_ID})
-sgdisk -Z "\$D"
-sgdisk -n1:0:+400M -n2:0:+200M -n3:0:+200M -n4:0:+400M -n5:0:+300M -n6:0:0 "\$D"
-udevadm settle
-zpool create -f ${POOL} "\${D}1" log "\${D}2" cache "\${D}3" spare "\${D}4" special "\${D}5" dedup "\${D}6"
-REMOTE
-      echo "✓ ${POOL} created (six classes on six partitions of ${BY_ID})"
+      create_pool '"${P}1" log "${P}2" cache "${P}3" spare "${P}4" special "${P}5" dedup "${P}6"' '$D'
+      echo "✓ ${POOL} created (six classes on six partitions of ${BY_ID}, kernel names)"
+    fi
+
+    echo
+    echo "=== Fixture ready ==="
+    status
+    ;;
+
+  up-byid)
+    echo "=== vdevs.2 fixture — up-byid (by-id partition leaves) ==="
+
+    "$SCRIPT_DIR/add-disk.sh" --size 2048 "$DISK_NUM"
+    wait_for_by_id
+
+    if pool_exists; then
+      echo "✓ ${POOL} already exists (skipping — 'down' first for a rebuild)"
+    else
+      create_pool '"${P}-part1" log "${P}-part2" cache "${P}-part3" spare "${P}-part4" special "${P}-part5" dedup "${P}-part6"' "/dev/disk/by-id/${BY_ID}"
+      echo "✓ ${POOL} created (six classes as by-id partitions of ${BY_ID})"
+    fi
+
+    echo
+    echo "=== Fixture ready ==="
+    status
+    ;;
+
+  up-multi)
+    echo "=== vdevs.2 fixture — up-multi (two cache leaves, two spares) ==="
+
+    "$SCRIPT_DIR/add-disk.sh" --size 2048 "$DISK_NUM"
+    wait_for_by_id
+
+    if pool_exists; then
+      echo "✓ ${POOL} already exists (skipping — 'down' first for a rebuild)"
+    else
+      create_pool '"${P}-part1" log "${P}-part2" cache "${P}-part3" "${P}-part6" spare "${P}-part4" "${P}-part5"' "/dev/disk/by-id/${BY_ID}"
+      echo "✓ ${POOL} created (data + two cache leaves + two spares, by-id)"
     fi
 
     echo
