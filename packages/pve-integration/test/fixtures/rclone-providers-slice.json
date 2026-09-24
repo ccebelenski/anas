@@ -1,0 +1,2742 @@
+[
+  {
+    "name": "b2",
+    "description": "Backblaze B2",
+    "options": [
+      {
+        "name": "account",
+        "help": "Account ID or Application Key ID.",
+        "type": "string",
+        "required": true,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "key",
+        "help": "Application Key.",
+        "type": "string",
+        "required": true,
+        "secret": true,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for the service.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "versions",
+        "help": "Include old versions in directory listings.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "version_at",
+        "help": "Show file versions as they were at the specified time.",
+        "type": "Time",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "off",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "hard_delete",
+        "help": "Permanently delete files on remote removal, otherwise hide files.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "upload_cutoff",
+        "help": "Cutoff for switching to chunked upload.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "200Mi",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "copy_cutoff",
+        "help": "Cutoff for switching to multipart copy.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "4Gi",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "chunk_size",
+        "help": "Upload chunk size.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "96Mi",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "disable_checksum",
+        "help": "Disable checksums for large (> upload cutoff) files.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "download_url",
+        "help": "Custom endpoint for downloads.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "download_auth_duration",
+        "help": "Time before the authorization token will expire in s or suffix ms|s|m|h|d.",
+        "type": "Duration",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "1w",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "memory_pool_flush_time",
+        "help": "How often internal memory buffer pools will be flushed.",
+        "type": "Duration",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "1m0s",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "memory_pool_use_mmap",
+        "help": "Whether to use mmap buffers in internal memory pool.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "encoding",
+        "help": "The encoding for the backend.",
+        "type": "MultiEncoder",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "Slash,BackSlash,Del,Ctl,InvalidUtf8,Dot",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      }
+    ]
+  },
+  {
+    "name": "sftp",
+    "description": "SSH/SFTP",
+    "options": [
+      {
+        "name": "host",
+        "help": "SSH host to connect to.",
+        "type": "string",
+        "required": true,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "user",
+        "help": "SSH username.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "root",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "port",
+        "help": "SSH port number.",
+        "type": "int",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "22",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "pass",
+        "help": "SSH password, leave blank to use ssh-agent.",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "password": true,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "key_pem",
+        "help": "Raw PEM-encoded private key.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "key_file",
+        "help": "Path to PEM-encoded private key file.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "key_file_pass",
+        "help": "The passphrase to decrypt the PEM-encoded private key file.",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "password": true,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "pubkey_file",
+        "help": "Optional path to public key file.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "known_hosts_file",
+        "help": "Optional path to known_hosts file.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "~/.ssh/known_hosts",
+            "help": "Use OpenSSH's known_hosts file.",
+            "provider": ""
+          }
+        ],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "key_use_agent",
+        "help": "When set forces the usage of the ssh-agent.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "use_insecure_cipher",
+        "help": "Enable the use of insecure ciphers and key exchange methods.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [
+          {
+            "value": "false",
+            "help": "Use default Cipher list.",
+            "provider": ""
+          },
+          {
+            "value": "true",
+            "help": "Enables the use of the aes128-cbc cipher and diffie-hellman-group-exchange-sha256, diffie-hellman-group-exchange-sha1 key exchange.",
+            "provider": ""
+          }
+        ],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "disable_hashcheck",
+        "help": "Disable the execution of SSH commands to determine if remote file hashing is available.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "ask_password",
+        "help": "Allow asking for SFTP password when needed.",
+        "type": "bool",
+        "required": false,
+        "secret": true,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "path_override",
+        "help": "Override path used by SSH shell commands.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "set_modtime",
+        "help": "Set the modified time on the remote if set.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "true",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "shell_type",
+        "help": "The type of SSH shell on remote server, if any.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "none",
+            "help": "No shell access",
+            "provider": ""
+          },
+          {
+            "value": "unix",
+            "help": "Unix shell",
+            "provider": ""
+          },
+          {
+            "value": "powershell",
+            "help": "PowerShell",
+            "provider": ""
+          },
+          {
+            "value": "cmd",
+            "help": "Windows Command Prompt",
+            "provider": ""
+          }
+        ],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "md5sum_command",
+        "help": "The command used to read md5 hashes.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "sha1sum_command",
+        "help": "The command used to read sha1 hashes.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "skip_links",
+        "help": "Set to skip any symlinks and any other non regular files.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "subsystem",
+        "help": "Specifies the SSH2 subsystem on the remote host.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "sftp",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "server_command",
+        "help": "Specifies the path or command to run a sftp server on the remote host.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "use_fstat",
+        "help": "If set use fstat instead of stat.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "disable_concurrent_reads",
+        "help": "If set don't use concurrent reads.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "disable_concurrent_writes",
+        "help": "If set don't use concurrent writes.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "idle_timeout",
+        "help": "Max time before closing idle connections.",
+        "type": "Duration",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "1m0s",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "chunk_size",
+        "help": "Upload and download chunk size.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "32Ki",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "concurrency",
+        "help": "The maximum number of outstanding requests for one file This controls the maximum number of outstanding requests for one file.",
+        "type": "int",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "64",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "set_env",
+        "help": "Environment variables to pass to sftp and commands Set environment variables in the form: VAR=value to be passed to the sftp client and to any commands run (eg md5sum).",
+        "type": "SpaceSepList",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      }
+    ]
+  },
+  {
+    "name": "s3",
+    "description": "Amazon S3 Compliant Storage Providers including AWS, Alibaba, Ceph, China Mobile, Cloudflare, ArvanCloud, Digital Ocean, Dreamhost, Huawei OBS, IBM COS, IDrive e2, IONOS Cloud, Lyve Cloud, Minio, Netease, RackCorp, Scaleway, SeaweedFS, StackPath, Storj, Tencent COS, Qiniu and Wasabi",
+    "options": [
+      {
+        "name": "provider",
+        "help": "Choose your S3 provider.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "AWS",
+            "help": "Amazon Web Services (AWS) S3",
+            "provider": ""
+          },
+          {
+            "value": "Alibaba",
+            "help": "Alibaba Cloud Object Storage System (OSS) formerly Aliyun",
+            "provider": ""
+          },
+          {
+            "value": "Ceph",
+            "help": "Ceph Object Storage",
+            "provider": ""
+          },
+          {
+            "value": "ChinaMobile",
+            "help": "China Mobile Ecloud Elastic Object Storage (EOS)",
+            "provider": ""
+          }
+        ],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "env_auth",
+        "help": "Get AWS credentials from runtime (environment variables or EC2/ECS meta data if no env vars).",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [
+          {
+            "value": "false",
+            "help": "Enter AWS credentials in the next step.",
+            "provider": ""
+          },
+          {
+            "value": "true",
+            "help": "Get AWS credentials from the environment (env vars or IAM).",
+            "provider": ""
+          }
+        ],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "access_key_id",
+        "help": "AWS Access Key ID.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "secret_access_key",
+        "help": "AWS Secret Access Key (password).",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "region",
+        "help": "Region to connect to.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "us-east-1",
+            "help": "The default endpoint - a good choice if you are unsure.",
+            "provider": ""
+          },
+          {
+            "value": "us-east-2",
+            "help": "US East (Ohio) Region.",
+            "provider": ""
+          },
+          {
+            "value": "us-west-1",
+            "help": "US West (Northern California) Region.",
+            "provider": ""
+          },
+          {
+            "value": "us-west-2",
+            "help": "US West (Oregon) Region.",
+            "provider": ""
+          }
+        ],
+        "provider": "AWS",
+        "advanced": false
+      },
+      {
+        "name": "region",
+        "help": "region - the location where your bucket will be created and your data stored.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "global",
+            "help": "Global CDN (All locations) Region",
+            "provider": ""
+          },
+          {
+            "value": "au",
+            "help": "Australia (All states)",
+            "provider": ""
+          },
+          {
+            "value": "au-nsw",
+            "help": "NSW (Australia) Region",
+            "provider": ""
+          },
+          {
+            "value": "au-qld",
+            "help": "QLD (Australia) Region",
+            "provider": ""
+          }
+        ],
+        "provider": "RackCorp",
+        "advanced": false
+      },
+      {
+        "name": "region",
+        "help": "Region to connect to.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "nl-ams",
+            "help": "Amsterdam, The Netherlands",
+            "provider": ""
+          },
+          {
+            "value": "fr-par",
+            "help": "Paris, France",
+            "provider": ""
+          },
+          {
+            "value": "pl-waw",
+            "help": "Warsaw, Poland",
+            "provider": ""
+          }
+        ],
+        "provider": "Scaleway",
+        "advanced": false
+      },
+      {
+        "name": "region",
+        "help": "Region to connect to.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "af-south-1",
+            "help": "AF-Johannesburg",
+            "provider": ""
+          },
+          {
+            "value": "ap-southeast-2",
+            "help": "AP-Bangkok",
+            "provider": ""
+          },
+          {
+            "value": "ap-southeast-3",
+            "help": "AP-Singapore",
+            "provider": ""
+          },
+          {
+            "value": "cn-east-3",
+            "help": "CN East-Shanghai1",
+            "provider": ""
+          }
+        ],
+        "provider": "HuaweiOBS",
+        "advanced": false
+      },
+      {
+        "name": "region",
+        "help": "Region to connect to.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "auto",
+            "help": "R2 buckets are automatically distributed across Cloudflare's data centers for low latency.",
+            "provider": ""
+          }
+        ],
+        "provider": "Cloudflare",
+        "advanced": false
+      },
+      {
+        "name": "region",
+        "help": "Region to connect to.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "cn-east-1",
+            "help": "The default endpoint - a good choice if you are unsure.",
+            "provider": ""
+          },
+          {
+            "value": "cn-east-2",
+            "help": "East China Region 2.",
+            "provider": ""
+          },
+          {
+            "value": "cn-north-1",
+            "help": "North China Region 1.",
+            "provider": ""
+          },
+          {
+            "value": "cn-south-1",
+            "help": "South China Region 1.",
+            "provider": ""
+          }
+        ],
+        "provider": "Qiniu",
+        "advanced": false
+      },
+      {
+        "name": "region",
+        "help": "Region where your bucket will be created and your data stored.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "de",
+            "help": "Frankfurt, Germany",
+            "provider": ""
+          },
+          {
+            "value": "eu-central-2",
+            "help": "Berlin, Germany",
+            "provider": ""
+          },
+          {
+            "value": "eu-south-2",
+            "help": "Logrono, Spain",
+            "provider": ""
+          }
+        ],
+        "provider": "IONOS",
+        "advanced": false
+      },
+      {
+        "name": "region",
+        "help": "Region to connect to.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "Use this if unsure.",
+            "provider": ""
+          },
+          {
+            "value": "other-v2-signature",
+            "help": "Use this only if v4 signatures don't work.",
+            "provider": ""
+          }
+        ],
+        "provider": "!AWS,Alibaba,ChinaMobile,Cloudflare,IONOS,ArvanCloud,Qiniu,RackCorp,Scaleway,Storj,TencentCOS,HuaweiOBS,IDrive",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for S3 API.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "AWS",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for China Mobile Ecloud Elastic Object Storage (EOS) API.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "eos-wuxi-1.cmecloud.cn",
+            "help": "The default endpoint - a good choice if you are unsure.",
+            "provider": ""
+          },
+          {
+            "value": "eos-jinan-1.cmecloud.cn",
+            "help": "East China (Jinan)",
+            "provider": ""
+          },
+          {
+            "value": "eos-ningbo-1.cmecloud.cn",
+            "help": "East China (Hangzhou)",
+            "provider": ""
+          },
+          {
+            "value": "eos-shanghai-1.cmecloud.cn",
+            "help": "East China (Shanghai-1)",
+            "provider": ""
+          }
+        ],
+        "provider": "ChinaMobile",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for Arvan Cloud Object Storage (AOS) API.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "s3.ir-thr-at1.arvanstorage.com",
+            "help": "The default endpoint - a good choice if you are unsure.",
+            "provider": ""
+          },
+          {
+            "value": "s3.ir-tbz-sh1.arvanstorage.com",
+            "help": "Tabriz Iran (Shahriar)",
+            "provider": ""
+          }
+        ],
+        "provider": "ArvanCloud",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for IBM COS S3 API.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "s3.us.cloud-object-storage.appdomain.cloud",
+            "help": "US Cross Region Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "s3.dal.us.cloud-object-storage.appdomain.cloud",
+            "help": "US Cross Region Dallas Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "s3.wdc.us.cloud-object-storage.appdomain.cloud",
+            "help": "US Cross Region Washington DC Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "s3.sjc.us.cloud-object-storage.appdomain.cloud",
+            "help": "US Cross Region San Jose Endpoint",
+            "provider": ""
+          }
+        ],
+        "provider": "IBMCOS",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for IONOS S3 Object Storage.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "s3-eu-central-1.ionoscloud.com",
+            "help": "Frankfurt, Germany",
+            "provider": ""
+          },
+          {
+            "value": "s3-eu-central-2.ionoscloud.com",
+            "help": "Berlin, Germany",
+            "provider": ""
+          },
+          {
+            "value": "s3-eu-south-2.ionoscloud.com",
+            "help": "Logrono, Spain",
+            "provider": ""
+          }
+        ],
+        "provider": "IONOS",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for OSS API.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "oss-accelerate.aliyuncs.com",
+            "help": "Global Accelerate",
+            "provider": ""
+          },
+          {
+            "value": "oss-accelerate-overseas.aliyuncs.com",
+            "help": "Global Accelerate (outside mainland China)",
+            "provider": ""
+          },
+          {
+            "value": "oss-cn-hangzhou.aliyuncs.com",
+            "help": "East China 1 (Hangzhou)",
+            "provider": ""
+          },
+          {
+            "value": "oss-cn-shanghai.aliyuncs.com",
+            "help": "East China 2 (Shanghai)",
+            "provider": ""
+          }
+        ],
+        "provider": "Alibaba",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for OBS API.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "obs.af-south-1.myhuaweicloud.com",
+            "help": "AF-Johannesburg",
+            "provider": ""
+          },
+          {
+            "value": "obs.ap-southeast-2.myhuaweicloud.com",
+            "help": "AP-Bangkok",
+            "provider": ""
+          },
+          {
+            "value": "obs.ap-southeast-3.myhuaweicloud.com",
+            "help": "AP-Singapore",
+            "provider": ""
+          },
+          {
+            "value": "obs.cn-east-3.myhuaweicloud.com",
+            "help": "CN East-Shanghai1",
+            "provider": ""
+          }
+        ],
+        "provider": "HuaweiOBS",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for Scaleway Object Storage.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "s3.nl-ams.scw.cloud",
+            "help": "Amsterdam Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "s3.fr-par.scw.cloud",
+            "help": "Paris Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "s3.pl-waw.scw.cloud",
+            "help": "Warsaw Endpoint",
+            "provider": ""
+          }
+        ],
+        "provider": "Scaleway",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for StackPath Object Storage.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "s3.us-east-2.stackpathstorage.com",
+            "help": "US East Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "s3.us-west-1.stackpathstorage.com",
+            "help": "US West Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "s3.eu-central-1.stackpathstorage.com",
+            "help": "EU Endpoint",
+            "provider": ""
+          }
+        ],
+        "provider": "StackPath",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint of the Shared Gateway.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "gateway.eu1.storjshare.io",
+            "help": "EU1 Shared Gateway",
+            "provider": ""
+          },
+          {
+            "value": "gateway.us1.storjshare.io",
+            "help": "US1 Shared Gateway",
+            "provider": ""
+          },
+          {
+            "value": "gateway.ap1.storjshare.io",
+            "help": "Asia-Pacific Shared Gateway",
+            "provider": ""
+          }
+        ],
+        "provider": "Storj",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for Tencent COS API.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "cos.ap-beijing.myqcloud.com",
+            "help": "Beijing Region",
+            "provider": ""
+          },
+          {
+            "value": "cos.ap-nanjing.myqcloud.com",
+            "help": "Nanjing Region",
+            "provider": ""
+          },
+          {
+            "value": "cos.ap-shanghai.myqcloud.com",
+            "help": "Shanghai Region",
+            "provider": ""
+          },
+          {
+            "value": "cos.ap-guangzhou.myqcloud.com",
+            "help": "Guangzhou Region",
+            "provider": ""
+          }
+        ],
+        "provider": "TencentCOS",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for RackCorp Object Storage.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "s3.rackcorp.com",
+            "help": "Global (AnyCast) Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "au.s3.rackcorp.com",
+            "help": "Australia (Anycast) Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "au-nsw.s3.rackcorp.com",
+            "help": "Sydney (Australia) Endpoint",
+            "provider": ""
+          },
+          {
+            "value": "au-qld.s3.rackcorp.com",
+            "help": "Brisbane (Australia) Endpoint",
+            "provider": ""
+          }
+        ],
+        "provider": "RackCorp",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for Qiniu Object Storage.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "s3-cn-east-1.qiniucs.com",
+            "help": "East China Endpoint 1",
+            "provider": ""
+          },
+          {
+            "value": "s3-cn-east-2.qiniucs.com",
+            "help": "East China Endpoint 2",
+            "provider": ""
+          },
+          {
+            "value": "s3-cn-north-1.qiniucs.com",
+            "help": "North China Endpoint 1",
+            "provider": ""
+          },
+          {
+            "value": "s3-cn-south-1.qiniucs.com",
+            "help": "South China Endpoint 1",
+            "provider": ""
+          }
+        ],
+        "provider": "Qiniu",
+        "advanced": false
+      },
+      {
+        "name": "endpoint",
+        "help": "Endpoint for S3 API.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "objects-us-east-1.dream.io",
+            "help": "Dream Objects endpoint",
+            "provider": "Dreamhost"
+          },
+          {
+            "value": "nyc3.digitaloceanspaces.com",
+            "help": "Digital Ocean Spaces New York 3",
+            "provider": "DigitalOcean"
+          },
+          {
+            "value": "ams3.digitaloceanspaces.com",
+            "help": "Digital Ocean Spaces Amsterdam 3",
+            "provider": "DigitalOcean"
+          },
+          {
+            "value": "sgp1.digitaloceanspaces.com",
+            "help": "Digital Ocean Spaces Singapore 1",
+            "provider": "DigitalOcean"
+          }
+        ],
+        "provider": "!AWS,IBMCOS,IDrive,IONOS,TencentCOS,HuaweiOBS,Alibaba,ChinaMobile,ArvanCloud,Scaleway,StackPath,Storj,RackCorp,Qiniu",
+        "advanced": false
+      },
+      {
+        "name": "location_constraint",
+        "help": "Location constraint - must be set to match the Region.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "Empty for US Region, Northern Virginia, or Pacific Northwest",
+            "provider": ""
+          },
+          {
+            "value": "us-east-2",
+            "help": "US East (Ohio) Region",
+            "provider": ""
+          },
+          {
+            "value": "us-west-1",
+            "help": "US West (Northern California) Region",
+            "provider": ""
+          },
+          {
+            "value": "us-west-2",
+            "help": "US West (Oregon) Region",
+            "provider": ""
+          }
+        ],
+        "provider": "AWS",
+        "advanced": false
+      },
+      {
+        "name": "location_constraint",
+        "help": "Location constraint - must match endpoint.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "wuxi1",
+            "help": "East China (Suzhou)",
+            "provider": ""
+          },
+          {
+            "value": "jinan1",
+            "help": "East China (Jinan)",
+            "provider": ""
+          },
+          {
+            "value": "ningbo1",
+            "help": "East China (Hangzhou)",
+            "provider": ""
+          },
+          {
+            "value": "shanghai1",
+            "help": "East China (Shanghai-1)",
+            "provider": ""
+          }
+        ],
+        "provider": "ChinaMobile",
+        "advanced": false
+      },
+      {
+        "name": "location_constraint",
+        "help": "Location constraint - must match endpoint.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "ir-thr-at1",
+            "help": "Tehran Iran (Asiatech)",
+            "provider": ""
+          },
+          {
+            "value": "ir-tbz-sh1",
+            "help": "Tabriz Iran (Shahriar)",
+            "provider": ""
+          }
+        ],
+        "provider": "ArvanCloud",
+        "advanced": false
+      },
+      {
+        "name": "location_constraint",
+        "help": "Location constraint - must match endpoint when using IBM Cloud Public.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "us-standard",
+            "help": "US Cross Region Standard",
+            "provider": ""
+          },
+          {
+            "value": "us-vault",
+            "help": "US Cross Region Vault",
+            "provider": ""
+          },
+          {
+            "value": "us-cold",
+            "help": "US Cross Region Cold",
+            "provider": ""
+          },
+          {
+            "value": "us-flex",
+            "help": "US Cross Region Flex",
+            "provider": ""
+          }
+        ],
+        "provider": "IBMCOS",
+        "advanced": false
+      },
+      {
+        "name": "location_constraint",
+        "help": "Location constraint - the location where your bucket will be located and your data stored.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "global",
+            "help": "Global CDN Region",
+            "provider": ""
+          },
+          {
+            "value": "au",
+            "help": "Australia (All locations)",
+            "provider": ""
+          },
+          {
+            "value": "au-nsw",
+            "help": "NSW (Australia) Region",
+            "provider": ""
+          },
+          {
+            "value": "au-qld",
+            "help": "QLD (Australia) Region",
+            "provider": ""
+          }
+        ],
+        "provider": "RackCorp",
+        "advanced": false
+      },
+      {
+        "name": "location_constraint",
+        "help": "Location constraint - must be set to match the Region.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "cn-east-1",
+            "help": "East China Region 1",
+            "provider": ""
+          },
+          {
+            "value": "cn-east-2",
+            "help": "East China Region 2",
+            "provider": ""
+          },
+          {
+            "value": "cn-north-1",
+            "help": "North China Region 1",
+            "provider": ""
+          },
+          {
+            "value": "cn-south-1",
+            "help": "South China Region 1",
+            "provider": ""
+          }
+        ],
+        "provider": "Qiniu",
+        "advanced": false
+      },
+      {
+        "name": "location_constraint",
+        "help": "Location constraint - must be set to match the Region.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "!AWS,Alibaba,HuaweiOBS,ChinaMobile,Cloudflare,IBMCOS,IDrive,IONOS,ArvanCloud,Qiniu,RackCorp,Scaleway,StackPath,Storj,TencentCOS",
+        "advanced": false
+      },
+      {
+        "name": "acl",
+        "help": "Canned ACL used when creating buckets and storing or copying objects.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "default",
+            "help": "Owner gets Full_CONTROL.",
+            "provider": "TencentCOS"
+          },
+          {
+            "value": "private",
+            "help": "Owner gets FULL_CONTROL.",
+            "provider": "!IBMCOS,TencentCOS"
+          },
+          {
+            "value": "public-read",
+            "help": "Owner gets FULL_CONTROL.",
+            "provider": "!IBMCOS"
+          },
+          {
+            "value": "public-read-write",
+            "help": "Owner gets FULL_CONTROL.",
+            "provider": "!IBMCOS"
+          }
+        ],
+        "provider": "!Storj,Cloudflare",
+        "advanced": false
+      },
+      {
+        "name": "bucket_acl",
+        "help": "Canned ACL used when creating buckets.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "private",
+            "help": "Owner gets FULL_CONTROL.",
+            "provider": ""
+          },
+          {
+            "value": "public-read",
+            "help": "Owner gets FULL_CONTROL.",
+            "provider": ""
+          },
+          {
+            "value": "public-read-write",
+            "help": "Owner gets FULL_CONTROL.",
+            "provider": ""
+          },
+          {
+            "value": "authenticated-read",
+            "help": "Owner gets FULL_CONTROL.",
+            "provider": ""
+          }
+        ],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "requester_pays",
+        "help": "Enables requester pays option when interacting with S3 bucket.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "AWS",
+        "advanced": true
+      },
+      {
+        "name": "server_side_encryption",
+        "help": "The server-side encryption algorithm used when storing this object in S3.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "None",
+            "provider": ""
+          },
+          {
+            "value": "AES256",
+            "help": "AES256",
+            "provider": ""
+          },
+          {
+            "value": "aws:kms",
+            "help": "aws:kms",
+            "provider": "!ChinaMobile"
+          }
+        ],
+        "provider": "AWS,Ceph,ChinaMobile,Minio",
+        "advanced": false
+      },
+      {
+        "name": "sse_customer_algorithm",
+        "help": "If using SSE-C, the server-side encryption algorithm used when storing this object in S3.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "None",
+            "provider": ""
+          },
+          {
+            "value": "AES256",
+            "help": "AES256",
+            "provider": ""
+          }
+        ],
+        "provider": "AWS,Ceph,ChinaMobile,Minio",
+        "advanced": true
+      },
+      {
+        "name": "sse_kms_key_id",
+        "help": "If using KMS ID you must provide the ARN of Key.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "None",
+            "provider": ""
+          },
+          {
+            "value": "arn:aws:kms:us-east-1:*",
+            "help": "arn:aws:kms:*",
+            "provider": ""
+          }
+        ],
+        "provider": "AWS,Ceph,Minio",
+        "advanced": false
+      },
+      {
+        "name": "sse_customer_key",
+        "help": "To use SSE-C you may provide the secret encryption key used to encrypt/decrypt your data.",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "None",
+            "provider": ""
+          }
+        ],
+        "provider": "AWS,Ceph,ChinaMobile,Minio",
+        "advanced": true
+      },
+      {
+        "name": "sse_customer_key_base64",
+        "help": "If using SSE-C you must provide the secret encryption key encoded in base64 format to encrypt/decrypt your data.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "None",
+            "provider": ""
+          }
+        ],
+        "provider": "AWS,Ceph,ChinaMobile,Minio",
+        "advanced": true
+      },
+      {
+        "name": "sse_customer_key_md5",
+        "help": "If using SSE-C you may provide the secret encryption key MD5 checksum (optional).",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "None",
+            "provider": ""
+          }
+        ],
+        "provider": "AWS,Ceph,ChinaMobile,Minio",
+        "advanced": true
+      },
+      {
+        "name": "storage_class",
+        "help": "The storage class to use when storing new objects in S3.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "Default",
+            "provider": ""
+          },
+          {
+            "value": "STANDARD",
+            "help": "Standard storage class",
+            "provider": ""
+          },
+          {
+            "value": "REDUCED_REDUNDANCY",
+            "help": "Reduced redundancy storage class",
+            "provider": ""
+          },
+          {
+            "value": "STANDARD_IA",
+            "help": "Standard Infrequent Access storage class",
+            "provider": ""
+          }
+        ],
+        "provider": "AWS",
+        "advanced": false
+      },
+      {
+        "name": "storage_class",
+        "help": "The storage class to use when storing new objects in OSS.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "Default",
+            "provider": ""
+          },
+          {
+            "value": "STANDARD",
+            "help": "Standard storage class",
+            "provider": ""
+          },
+          {
+            "value": "GLACIER",
+            "help": "Archive storage mode",
+            "provider": ""
+          },
+          {
+            "value": "STANDARD_IA",
+            "help": "Infrequent access storage mode",
+            "provider": ""
+          }
+        ],
+        "provider": "Alibaba",
+        "advanced": false
+      },
+      {
+        "name": "storage_class",
+        "help": "The storage class to use when storing new objects in ChinaMobile.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "Default",
+            "provider": ""
+          },
+          {
+            "value": "STANDARD",
+            "help": "Standard storage class",
+            "provider": ""
+          },
+          {
+            "value": "GLACIER",
+            "help": "Archive storage mode",
+            "provider": ""
+          },
+          {
+            "value": "STANDARD_IA",
+            "help": "Infrequent access storage mode",
+            "provider": ""
+          }
+        ],
+        "provider": "ChinaMobile",
+        "advanced": false
+      },
+      {
+        "name": "storage_class",
+        "help": "The storage class to use when storing new objects in ArvanCloud.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "STANDARD",
+            "help": "Standard storage class",
+            "provider": ""
+          }
+        ],
+        "provider": "ArvanCloud",
+        "advanced": false
+      },
+      {
+        "name": "storage_class",
+        "help": "The storage class to use when storing new objects in Tencent COS.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "Default",
+            "provider": ""
+          },
+          {
+            "value": "STANDARD",
+            "help": "Standard storage class",
+            "provider": ""
+          },
+          {
+            "value": "ARCHIVE",
+            "help": "Archive storage mode",
+            "provider": ""
+          },
+          {
+            "value": "STANDARD_IA",
+            "help": "Infrequent access storage mode",
+            "provider": ""
+          }
+        ],
+        "provider": "TencentCOS",
+        "advanced": false
+      },
+      {
+        "name": "storage_class",
+        "help": "The storage class to use when storing new objects in S3.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "",
+            "help": "Default.",
+            "provider": ""
+          },
+          {
+            "value": "STANDARD",
+            "help": "The Standard class for any upload.",
+            "provider": ""
+          },
+          {
+            "value": "GLACIER",
+            "help": "Archived storage.",
+            "provider": ""
+          }
+        ],
+        "provider": "Scaleway",
+        "advanced": false
+      },
+      {
+        "name": "storage_class",
+        "help": "The storage class to use when storing new objects in Qiniu.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "STANDARD",
+            "help": "Standard storage class",
+            "provider": ""
+          },
+          {
+            "value": "LINE",
+            "help": "Infrequent access storage mode",
+            "provider": ""
+          },
+          {
+            "value": "GLACIER",
+            "help": "Archive storage mode",
+            "provider": ""
+          },
+          {
+            "value": "DEEP_ARCHIVE",
+            "help": "Deep archive storage mode",
+            "provider": ""
+          }
+        ],
+        "provider": "Qiniu",
+        "advanced": false
+      },
+      {
+        "name": "upload_cutoff",
+        "help": "Cutoff for switching to chunked upload.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "200Mi",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "chunk_size",
+        "help": "Chunk size to use for uploading.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "5Mi",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "max_upload_parts",
+        "help": "Maximum number of parts in a multipart upload.",
+        "type": "int",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "10000",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "copy_cutoff",
+        "help": "Cutoff for switching to multipart copy.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "4.656Gi",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "disable_checksum",
+        "help": "Don't store MD5 checksum with object metadata.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "shared_credentials_file",
+        "help": "Path to the shared credentials file.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "profile",
+        "help": "Profile to use in the shared credentials file.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "session_token",
+        "help": "An AWS session token.",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "upload_concurrency",
+        "help": "Concurrency for multipart uploads.",
+        "type": "int",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "4",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "force_path_style",
+        "help": "If true use path style access if false use virtual hosted style.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "true",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "v2_auth",
+        "help": "If true use v2 authentication.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "use_accelerate_endpoint",
+        "help": "If true use the AWS S3 accelerated endpoint.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "AWS",
+        "advanced": true
+      },
+      {
+        "name": "leave_parts_on_error",
+        "help": "If true avoid calling abort upload on a failure, leaving all successfully uploaded parts on S3 for manual recovery.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "AWS",
+        "advanced": true
+      },
+      {
+        "name": "list_chunk",
+        "help": "Size of listing chunk (response list for each ListObject S3 request).",
+        "type": "int",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "1000",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "list_version",
+        "help": "Version of ListObjects to use: 1,2 or 0 for auto.",
+        "type": "int",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "0",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "list_url_encode",
+        "help": "Whether to url encode listings: true/false/unset Some providers support URL encoding listings and where this is available this is more reliable when using control characters in file names.",
+        "type": "Tristate",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "unset",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "no_check_bucket",
+        "help": "If set, don't attempt to check the bucket exists or create it.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "no_head",
+        "help": "If set, don't HEAD uploaded objects to check integrity.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "no_head_object",
+        "help": "If set, do not do HEAD before GET when getting objects.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "encoding",
+        "help": "The encoding for the backend.",
+        "type": "MultiEncoder",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "Slash,InvalidUtf8,Dot",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "memory_pool_flush_time",
+        "help": "How often internal memory buffer pools will be flushed.",
+        "type": "Duration",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "1m0s",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "memory_pool_use_mmap",
+        "help": "Whether to use mmap buffers in internal memory pool.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "disable_http2",
+        "help": "Disable usage of http2 for S3 backends.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "download_url",
+        "help": "Custom endpoint for downloads.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "use_multipart_etag",
+        "help": "Whether to use ETag in multipart uploads for verification This should be true, false or left unset to use the default for the provider.",
+        "type": "Tristate",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "unset",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "use_presigned_request",
+        "help": "Whether to use a presigned request or PutObject for single part uploads If this is false rclone will use PutObject from the AWS SDK to upload an object.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "versions",
+        "help": "Include old versions in directory listings.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "version_at",
+        "help": "Show file versions as they were at the specified time.",
+        "type": "Time",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "off",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "decompress",
+        "help": "If set this will decompress gzip encoded objects.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "might_gzip",
+        "help": "Set this if the backend might gzip objects.",
+        "type": "Tristate",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "unset",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "no_system_metadata",
+        "help": "Suppress setting and reading of system metadata",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      }
+    ]
+  },
+  {
+    "name": "drive",
+    "description": "Google Drive",
+    "options": [
+      {
+        "name": "client_id",
+        "help": "Google Application Client Id Setting your own is recommended.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "client_secret",
+        "help": "OAuth Client Secret.",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "token",
+        "help": "OAuth Access Token as a JSON blob.",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "auth_url",
+        "help": "Auth server URL.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "token_url",
+        "help": "Token server url.",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "scope",
+        "help": "Scope that rclone should use when requesting access from drive.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [
+          {
+            "value": "drive",
+            "help": "Full access all files, excluding Application Data Folder.",
+            "provider": ""
+          },
+          {
+            "value": "drive.readonly",
+            "help": "Read-only access to file metadata and file contents.",
+            "provider": ""
+          },
+          {
+            "value": "drive.file",
+            "help": "Access to files created by rclone only.",
+            "provider": ""
+          },
+          {
+            "value": "drive.appfolder",
+            "help": "Allows read and write access to the Application Data folder.",
+            "provider": ""
+          }
+        ],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "root_folder_id",
+        "help": "ID of the root folder.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "service_account_file",
+        "help": "Service Account Credentials JSON file path.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": false
+      },
+      {
+        "name": "auth_owner_only",
+        "help": "Only consider files owned by the authenticated user.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "use_trash",
+        "help": "Send files to the trash instead of deleting permanently.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "true",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "copy_shortcut_content",
+        "help": "Server side copy contents of shortcuts instead of the shortcut.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "skip_gdocs",
+        "help": "Skip google documents in all listings.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "skip_checksum_gphotos",
+        "help": "Skip MD5 checksum on Google photos and videos only.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "shared_with_me",
+        "help": "Only show files that are shared with me.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "trashed_only",
+        "help": "Only show files that are in the trash.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "starred_only",
+        "help": "Only show files that are starred.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "export_formats",
+        "help": "Comma separated list of preferred formats for downloading Google docs.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "docx,xlsx,pptx,svg",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "import_formats",
+        "help": "Comma separated list of preferred formats for uploading Google docs.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "allow_import_name_change",
+        "help": "Allow the filetype to change when uploading Google docs.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "list_chunk",
+        "help": "Size of listing chunk 100-1000, 0 to disable.",
+        "type": "int",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "1000",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "impersonate",
+        "help": "Impersonate this user when using a service account.",
+        "type": "string",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "upload_cutoff",
+        "help": "Cutoff for switching to chunked upload.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "8Mi",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "chunk_size",
+        "help": "Upload chunk size.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "8Mi",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "acknowledge_abuse",
+        "help": "Set to allow files which return cannotDownloadAbusiveFile to be downloaded.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "keep_revision_forever",
+        "help": "Keep new head revision of each file forever.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "v2_download_min_size",
+        "help": "If Object's are greater, use drive v2 API to download.",
+        "type": "SizeSuffix",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "off",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "pacer_min_sleep",
+        "help": "Minimum time to sleep between API calls.",
+        "type": "Duration",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "100ms",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "pacer_burst",
+        "help": "Number of API calls to allow without sleeping.",
+        "type": "int",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "100",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "server_side_across_configs",
+        "help": "Allow server-side operations (e.g.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "disable_http2",
+        "help": "Disable drive using http2.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "true",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "stop_on_upload_limit",
+        "help": "Make upload limit errors be fatal.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "stop_on_download_limit",
+        "help": "Make download limit errors be fatal.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "skip_shortcuts",
+        "help": "If set skip shortcut files.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "skip_dangling_shortcuts",
+        "help": "If set skip dangling shortcut files.",
+        "type": "bool",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "false",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "resource_key",
+        "help": "Resource key for accessing a link-shared file.",
+        "type": "string",
+        "required": false,
+        "secret": true,
+        "password": false,
+        "default": "",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      },
+      {
+        "name": "encoding",
+        "help": "The encoding for the backend.",
+        "type": "MultiEncoder",
+        "required": false,
+        "secret": false,
+        "password": false,
+        "default": "InvalidUtf8",
+        "examples": [],
+        "provider": "",
+        "advanced": true
+      }
+    ]
+  }
+]
