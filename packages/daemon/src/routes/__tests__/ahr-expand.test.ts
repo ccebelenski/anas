@@ -1,4 +1,4 @@
-import type { AhrCapacity, AhrExpansionIntent, AhrExpansionStep, Job } from '@anas/shared'
+import type { AhrCapacity, AhrExpansionIntent, AhrExpansionPlanResponse, Job } from '@anas/shared'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -28,6 +28,18 @@ const Z = 'ata-TANK_Z' // member, 3 GiB class → sds
 const W = 'ata-TANK_W' // available, 4 GiB class → sdt
 const S = 'ata-TANK_S' // available, 1 GiB class → sdu (too small for any band)
 
+// The ahrexpand.1 §5.2 pool "quad": 4×2 GiB, ONE band raid5×4, and an LV that
+// is EXACTLY the band math (6 GiB) — so a plan that adds nothing reads as a
+// zero delta, and the guard's numbers are the clean 2/4 GiB of the story.
+const D1 = 'ata-QUAD_D1' // member, 2 GiB class → sda
+const D2 = 'ata-QUAD_D2' // member, 2 GiB class → sdb
+const D3 = 'ata-QUAD_D3' // member, 2 GiB class → sdc
+const D4 = 'ata-QUAD_D4' // member, 2 GiB class → sdd
+const E = 'ata-QUAD_E' // available, 4 GiB class → sde
+const E2 = 'ata-QUAD_E2' // available, 4 GiB class → sdf
+const F = 'ata-QUAD_F' // available, 2 GiB class → sdg (the same-size replace)
+const G = 'ata-QUAD_G' // available, 1 GiB class → sdh (strands below band 1)
+
 const SIZE_2G = 2 * GIB + 8 * MIB
 const SIZE_3G = 3 * GIB + 8 * MIB
 const SIZE_4G = 4 * GIB + 8 * MIB
@@ -37,6 +49,8 @@ const B1_INTERIOR = 2 * GIB - MIB
 const B1_CLAMPED_2G = SIZE_2G - MIB - GPT_TAIL
 const B2_CLAMPED_3G = SIZE_3G - GPT_TAIL - 2 * GIB
 const LV_SIZE = 5360320512
+const LV_QUAD_SIZE = 6 * GIB // exactly the band math of raid5×4 over [0,2GiB]
+const QUAD_MD_BLOCKS = Math.floor(B1_CLAMPED_2G / 512)
 
 const MDSTAT_BASE = `Personalities : [raid1] [raid5]
 md126 : active raid1 sds2[1] sdr2[0]
@@ -44,6 +58,9 @@ md126 : active raid1 sds2[1] sdr2[0]
 
 md127 : active raid5 sds1[2] sdr1[1] sdq1[0]
       4190208 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+
+md125 : active raid5 sda1[3] sdb1[2] sdc1[1] sdd1[0]
+      ${QUAD_MD_BLOCKS} blocks super 1.2 level 5, 512k chunk, algorithm 2 [4/4] [UUUU]
 
 unused devices: <none>
 `
@@ -77,7 +94,7 @@ function exportFor(name: string, level: string, devices: number, uuid: string): 
   return `MD_LEVEL=${level}\nMD_DEVICES=${devices}\nMD_METADATA=1.2\nMD_UUID=${uuid}\nMD_DEVNAME=${name}\nMD_NAME=anas-test:${name}\n`
 }
 
-interface PartNode { name: string, size: number, label: string, md: 'md127' | 'md126' }
+interface PartNode { name: string, size: number, label: string, md: 'md127' | 'md126' | 'md125' }
 interface DiskNode { kernel: string, id: string, size: number, parts: PartNode[] }
 
 const DISKS: DiskNode[] = [
@@ -92,10 +109,19 @@ const DISKS: DiskNode[] = [
   ] },
   { kernel: 'sdt', id: W, size: SIZE_4G, parts: [] },
   { kernel: 'sdu', id: S, size: SIZE_1G, parts: [] },
+  { kernel: 'sda', id: D1, size: SIZE_2G, parts: [{ name: 'sda1', size: B1_CLAMPED_2G, label: 'quad-d1-b1', md: 'md125' }] },
+  { kernel: 'sdb', id: D2, size: SIZE_2G, parts: [{ name: 'sdb1', size: B1_CLAMPED_2G, label: 'quad-d2-b1', md: 'md125' }] },
+  { kernel: 'sdc', id: D3, size: SIZE_2G, parts: [{ name: 'sdc1', size: B1_CLAMPED_2G, label: 'quad-d3-b1', md: 'md125' }] },
+  { kernel: 'sdd', id: D4, size: SIZE_2G, parts: [{ name: 'sdd1', size: B1_CLAMPED_2G, label: 'quad-d4-b1', md: 'md125' }] },
+  { kernel: 'sde', id: E, size: SIZE_4G, parts: [] },
+  { kernel: 'sdf', id: E2, size: SIZE_4G, parts: [] },
+  { kernel: 'sdg', id: F, size: SIZE_2G, parts: [] },
+  { kernel: 'sdh', id: G, size: SIZE_1G, parts: [] },
 ]
 
-const MD_SIZES = { md127: 4190208 * 1024, md126: 1047552 * 1024 }
+const MD_SIZES = { md127: 4190208 * 1024, md126: 1047552 * 1024, md125: QUAD_MD_BLOCKS * 512 }
 const LVM_NODE = { name: 'tank-tank--vol', type: 'lvm', size: LV_SIZE, fstype: 'btrfs', mountpoint: '/mnt/anas-ahr/tank', partlabel: null }
+const LVM_QUAD_NODE = { name: 'quad-quad--vol', type: 'lvm', size: LV_QUAD_SIZE, fstype: 'btrfs', mountpoint: '/mnt/anas-ahr/quad', partlabel: null }
 
 function ahrLsblkJson(): string {
   return JSON.stringify({ blockdevices: DISKS.map(d => ({
@@ -114,7 +140,7 @@ function ahrLsblkJson(): string {
       fstype: 'linux_raid_member',
       mountpoint: null,
       partlabel: p.label,
-      children: [{ name: p.md, type: p.md === 'md127' ? 'raid5' : 'raid1', size: MD_SIZES[p.md], fstype: 'LVM2_member', mountpoint: null, partlabel: null, children: [LVM_NODE] }],
+      children: [{ name: p.md, type: p.md === 'md126' ? 'raid1' : 'raid5', size: MD_SIZES[p.md], fstype: 'LVM2_member', mountpoint: null, partlabel: null, children: [p.md === 'md125' ? LVM_QUAD_NODE : LVM_NODE] }],
     })),
   })) })
 }
@@ -146,6 +172,14 @@ const BTRFS_USAGE = [
   '',
 ].join('\n')
 
+const BTRFS_USAGE_QUAD = [
+  'Overall:',
+  `    Device size:\t\t${LV_QUAD_SIZE}`,
+  '    Used:\t\t1048576',
+  `    Free (estimated):\t\t${LV_QUAD_SIZE - 2 * MIB}\t(min: ${LV_QUAD_SIZE - 4 * MIB})`,
+  '',
+].join('\n')
+
 const IDENTITY_HEADERS = {
   'x-anas-user': 'root@pam',
   'x-anas-user-uid': '0',
@@ -171,13 +205,15 @@ function buildExecutor(opts: { mdstat?: string } = {}): MockExecutor {
   executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: { stdout: opts.mdstat ?? MDSTAT_BASE, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: { stdout: exportFor('tank-r1', 'raid5', 3, 'aaaaaaaa:aaaaaaaa:aaaaaaaa:aaaaaaaa'), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md126'], result: { stdout: exportFor('tank-r2', 'raid1', 2, 'bbbbbbbb:bbbbbbbb:bbbbbbbb:bbbbbbbb'), stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md125'], result: { stdout: exportFor('quad-r1', 'raid5', 4, 'cccccccc:cccccccc:cccccccc:cccccccc'), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: { stdout: ahrLsblkJson(), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...LSBLK_ARGS], result: { stdout: inventoryLsblkJson(), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: BY_ID_LISTING, stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '2', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-ao----', lv_size: String(LV_SIZE) }] }] }), stderr: '', exitCode: 0 } })
-  executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }] }), stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: { stdout: JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '2', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }, { vg_name: 'quad', pv_count: '1', lv_count: '1', vg_size: String(LV_QUAD_SIZE), vg_free: '0' }] }] }), stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: { stdout: JSON.stringify({ report: [{ lv: [{ lv_name: 'tank-vol', vg_name: 'tank', lv_attr: '-wi-ao----', lv_size: String(LV_SIZE) }, { lv_name: 'quad-vol', vg_name: 'quad', lv_attr: '-wi-ao----', lv_size: String(LV_QUAD_SIZE) }] }] }), stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: { stdout: JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }, { target: '/mnt/anas-ahr/quad', source: '/dev/mapper/quad-quad--vol', fstype: 'btrfs', options: 'rw,relatime' }] }), stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/tank'], result: { stdout: BTRFS_USAGE, stderr: '', exitCode: 0 } })
+  executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', '/mnt/anas-ahr/quad'], result: { stdout: BTRFS_USAGE_QUAD, stderr: '', exitCode: 0 } })
   executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 1 } })
   executor.addFixture({ command: '/usr/bin/perl', result: { stdout: '', stderr: '', exitCode: 0 } })
   return executor
@@ -237,7 +273,7 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       await build()
       const res = await server.inject({ method: 'POST', url: '/v1/ahr/tank/expand/plan', payload: { addDisks: [W] } })
       assert.equal(res.statusCode, 200, res.body)
-      const { data } = res.json() as { data: { before: AhrCapacity, after: AhrCapacity, steps: AhrExpansionStep[], warnings: string[] } }
+      const { data } = res.json() as { data: AhrExpansionPlanResponse }
       // Adding the 4 GiB disk: partition W, grow r1 (3→4), convert r2
       // (raid1×2 → raid5×3), waits, pv-resizes, then the one lv/fs tail.
       assert.deepEqual(data.steps.map(s => s.kind), [
@@ -255,6 +291,10 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       // The [3,4GiB] region has one disk → pending, stated concretely.
       assert.ok(data.after.pendingBytes > 0)
       assert.ok(data.warnings.some(w => w.includes('pending')))
+      // ahrexpand.1: a positive-gain plan reports the gain and carries no
+      // zeroGain detail.
+      assert.ok(data.usableGain !== undefined && data.usableGain > 0, 'positive-gain plan reports usableGain')
+      assert.equal(data.zeroGain, undefined)
       // The no-mutation guarantee.
       assert.deepEqual(mutatingCalls(executor), [])
     })
@@ -413,6 +453,109 @@ describe('AHR expansion routes (Epic 11.6)', () => {
       assert.ok(warnings.some(w => w.includes('retired')))
       assert.ok(res.headers['x-anas-confirm-code'])
       assert.deepEqual(mutatingCalls(executor), [])
+    })
+  })
+
+  // ---- Zero-gain expand guard (ahrexpand.1, AHR-DESIGN §5.2) ----------------
+  // The "quad" pool is 4×2 GiB, one band raid5×4, LV EXACTLY the band math
+  // (6 GiB) — a plan that adds nothing is a zero delta, and the guard's
+  // numbers are the story's clean 2/4 GiB.
+
+  const QUAD_ZERO_GAIN = 'This plan adds no usable capacity: the 4 GiB disk above the 2 GiB band sits alone; add one more disk of ≥ 4 GiB to unlock ~4 GiB'
+
+  describe('zero-gain expand guard (ahrexpand.1, §5.2)', () => {
+    it('plan response: the exact §5.2 shape carries usableGain 0 + the shortfall and the unlock', async () => {
+      await build()
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand/plan', payload: { replace: { oldDiskId: D1, newDiskId: E } } })
+      assert.equal(res.statusCode, 200, res.body)
+      const { data } = res.json() as { data: AhrExpansionPlanResponse }
+      assert.equal(data.usableGain, 0)
+      assert.deepEqual(data.zeroGain, {
+        shortfall: QUAD_ZERO_GAIN,
+        unlockSize: 4 * GIB,
+        unlockGain: 4 * GIB,
+      })
+      // …and the pending band is still stated concretely in the warnings.
+      assert.ok(data.warnings.some(w => w.includes('pending')))
+      assert.deepEqual(mutatingCalls(executor), [])
+    })
+
+    it('plan response: two 4 GiB disks → positive gain, no zeroGain', async () => {
+      await build()
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand/plan', payload: { replace: { oldDiskId: D1, newDiskId: E }, addDisks: [E2] } })
+      assert.equal(res.statusCode, 200, res.body)
+      const { data } = res.json() as { data: AhrExpansionPlanResponse }
+      // Band 1 grows raid5×4 → raid5×5 (+2 GiB); the [2,4GiB] band forms
+      // RAID1×2 (+2 GiB).
+      assert.equal(data.usableGain, 4 * GIB)
+      assert.equal(data.zeroGain, undefined)
+    })
+
+    it('expand: the zero-gain plan is refused with the guiding 409; the confirm code proceeds', async () => {
+      await build()
+      const first = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand', headers: IDENTITY_HEADERS, payload: { replace: { oldDiskId: D1, newDiskId: E } } })
+      assert.equal(first.statusCode, 409, first.body)
+      const { error } = first.json()
+      assert.equal(error.code, 'CONFIRMATION_REQUIRED')
+      // The MESSAGE is the guidance: the exact shortfall and what unlocks it.
+      assert.equal(error.message, QUAD_ZERO_GAIN)
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code)
+      assert.deepEqual(mutatingCalls(executor), [], 'refused before any destructive action')
+
+      // The honest zero-gain case is still reachable: re-submit with the code.
+      const second = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code }, payload: { replace: { oldDiskId: D1, newDiskId: E } } })
+      assert.equal(second.statusCode, 202, second.body)
+      assert.ok(second.json().job.id)
+    })
+
+    it('guided replace: a same-size replacement is zero-gain refused; the confirm code proceeds', async () => {
+      await build()
+      const first = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: IDENTITY_HEADERS, payload: { newDiskId: F } })
+      assert.equal(first.statusCode, 409, first.body)
+      const { error } = first.json()
+      assert.equal(error.code, 'CONFIRMATION_REQUIRED')
+      assert.match(error.message, /adds no usable capacity/)
+      assert.match(error.message, /inherits the bands its predecessor already served/)
+      assert.match(error.message, /≥ 2 GiB to unlock ~2 GiB/)
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code)
+      assert.deepEqual(mutatingCalls(executor), [])
+
+      const second = await server.inject({ method: 'POST', url: `/v1/ahr/quad/disk/${D1}/replace`, headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code }, payload: { newDiskId: F } })
+      assert.equal(second.statusCode, 202, second.body)
+    })
+
+    it('a positive-gain expand is NOT zero-gain gated (normal confirm surface, unchanged message)', async () => {
+      await build()
+      const res = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand', headers: IDENTITY_HEADERS, payload: { replace: { oldDiskId: D1, newDiskId: E }, addDisks: [E2] } })
+      assert.equal(res.statusCode, 409, res.body)
+      const { error } = res.json()
+      assert.equal(error.code, 'CONFIRMATION_REQUIRED')
+      assert.equal(error.message, `Expanding AHR pool 'quad' starts an online reshape`)
+      assert.ok(!error.message.includes('no usable capacity'))
+      assert.ok(res.headers['x-anas-confirm-code'])
+    })
+
+    it('no reachable target: a zero-step plan flows unchanged (409 confirm → 202 → no-op, intent cleared)', async () => {
+      await build()
+      const first = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand', headers: IDENTITY_HEADERS, payload: { addDisks: [G] } })
+      assert.equal(first.statusCode, 409, first.body)
+      const { error } = first.json()
+      assert.equal(error.code, 'CONFIRMATION_REQUIRED')
+      // The guidance carries the planner's own stranded line, verbatim.
+      assert.match(error.message, /adds no usable capacity/)
+      assert.match(error.message, /stranded above the 0 GiB boundary/)
+      assert.match(error.message, /≥ 2 GiB to unlock ~2 GiB/)
+      const code = first.headers['x-anas-confirm-code'] as string
+      assert.ok(code)
+
+      const second = await server.inject({ method: 'POST', url: '/v1/ahr/quad/expand', headers: { ...IDENTITY_HEADERS, 'x-anas-confirm': code }, payload: { addDisks: [G] } })
+      assert.equal(second.statusCode, 202, second.body)
+      const job = await waitForJob(jobQueue, second.json().job.id)
+      assert.equal(job.status, 'completed', JSON.stringify(job.error))
+      assert.equal(await readIntent('quad', dir), null, 'intent cleared on completion')
+      assert.deepEqual(mutatingCalls(executor), [], 'a zero-step plan mutates nothing')
     })
   })
 })

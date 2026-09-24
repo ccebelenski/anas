@@ -1,4 +1,4 @@
-import type { AhrExpansionIntent, AhrPool, AhrReplacePair } from '@anas/shared'
+import type { AhrExpansionIntent, AhrExpansionPlanResponse, AhrPool, AhrReplacePair } from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
@@ -13,7 +13,7 @@ import { executeReadd } from '../services/ahr-expand-exec.js'
 // (services/ahr-boot-scan.ts) — ONE implementation, no drift (single source).
 import { computePlan, resolveApproved, resumeExpansion, submitExpansion } from '../services/ahr-expand-resume.js'
 import { AhrIntentConflictError, clearIntent, readIntent, writeIntent } from '../services/ahr-intent.js'
-import { AhrPlanError, fmtBytes } from '../services/ahr-layout.js'
+import { AhrPlanError, expansionGain, fmtBytes } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { requireIdentity } from './identity.js'
 
@@ -170,6 +170,23 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     return false
   }
 
+  /**
+   * The usable-capacity delta this plan actually delivers (ahrexpand.1) —
+   * ONE computation shared by the plan preview and both mutation gates, so
+   * the number the operator sees before clicking and the number the 409
+   * refuses on can never disagree.
+   */
+  function gainFor(pool: AhrPool, bundle: PlanBundle, replace?: AhrReplacePair) {
+    return expansionGain({
+      before: bundle.before,
+      after: bundle.after,
+      bands: bundle.plan.preview.bands,
+      warnings: bundle.plan.preview.warnings,
+      tier: pool.ahrType,
+      replaced: replace,
+    })
+  }
+
   /** The Principle-14 confirm warnings for an expansion/replace. */
   function expansionWarnings(bundle: PlanBundle): string[] {
     const { before, after, plan } = bundle
@@ -213,7 +230,11 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     if (!prepared)
       return
     const { bundle } = prepared
-    return { data: {
+    // ahrexpand.1: the preview names the usable gain BEFORE the operator
+    // clicks — and when the plan adds none, the shortfall and the unlock, so
+    // the zero-gain 409 the Execute would hit is never a surprise.
+    const gain = gainFor(pool, bundle, prepared.replace)
+    const response: AhrExpansionPlanResponse = {
       before: bundle.before,
       after: bundle.after,
       steps: bundle.plan.steps,
@@ -221,7 +242,10 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       // The resulting band layout — the wizard renders the same banded disk
       // bars as the create composer (§6.3 before→after visualization).
       bands: bundle.plan.preview.bands,
-    } }
+      usableGain: gain.usableGain,
+      ...(gain.zeroGain ? { zeroGain: gain.zeroGain } : {}),
+    }
+    return { data: response }
   })
 
   // ---- POST /ahr/:name/expand — execute (202 / 409 confirm) ----------------
@@ -249,10 +273,19 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
       return
     const { bundle, approvedIds, replace } = prepared
 
+    // ahrexpand.1: a plan whose reachable target adds no usable capacity is
+    // refused UP FRONT — the guiding 409 states the shortfall and what
+    // unlocks it (§5.2), instead of a sub-second "success" that did nothing.
+    // The confirm code is the bypass for the honest zero-gain cases an
+    // operator may still want (replacing a failing disk with one of the same
+    // size) — the gate itself is unchanged, only its message.
+    const zeroGain = gainFor(pool, bundle, replace).zeroGain
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'ahr.expand',
       params: { pool: pool.name, addDisks: body.addDisks ?? [], replace: replace ?? null },
-      message: `Expanding AHR pool '${pool.name}' starts an online reshape`,
+      message: zeroGain
+        ? zeroGain.shortfall
+        : `Expanding AHR pool '${pool.name}' starts an online reshape`,
       warnings: expansionWarnings(bundle),
     })) {
       return reply
@@ -392,10 +425,16 @@ export async function ahrExpansionRoutes(server: FastifyInstance, opts: AhrExpan
     const { bundle, approvedIds } = prepared
 
     const bands = pool.arrays.filter(a => a.members.some(m => m.disk === replace.oldDiskId)).map(a => a.band)
+    // ahrexpand.1 — the guided replace is where the honest zero-gain case
+    // lives (a failing disk swapped for one of the same size): same guiding
+    // 409, same confirm bypass.
+    const zeroGain = gainFor(pool, bundle, replace).zeroGain
     if (!confirmGate(confirmStore, request, reply, {
       operation: 'ahr.replace',
       params: { pool: pool.name, oldDiskId: replace.oldDiskId, newDiskId: replace.newDiskId },
-      message: `Replacing disk '${replace.oldDiskId}' in pool '${pool.name}'`,
+      message: zeroGain
+        ? zeroGain.shortfall
+        : `Replacing disk '${replace.oldDiskId}' in pool '${pool.name}'`,
       warnings: [
         `Every band of ${replace.oldDiskId} (band${bands.length === 1 ? '' : 's'} ${bands.join(', ')}) is copied onto ${replace.newDiskId} at rebuild speed — hours on large disks. The pool stays online and fully redundant throughout (live copy via mdadm --replace).`,
         'Do NOT remove either disk until the replace completes.',

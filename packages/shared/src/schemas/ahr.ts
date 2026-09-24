@@ -608,6 +608,46 @@ export const AhrReplaceRequest = z.object({
 })
 export type AhrReplaceRequest = z.infer<typeof AhrReplaceRequest>
 
+/**
+ * The zero-gain detail of an expansion plan (ahrexpand.1, AHR-DESIGN §5.2):
+ * present exactly when the plan's reachable target adds no usable capacity —
+ * one disk replaced above a band boundary the planner cannot use yet, or a
+ * disk set the planner cannot use. The numbers are derived from the plan,
+ * never hard-coded: `unlockSize` is the smallest size at which one more disk
+ * would grow or form a band, and `unlockGain` is what that one disk would
+ * actually deliver.
+ */
+export const AhrExpansionZeroGain = z.object({
+  /** The operator-facing shortfall: what is locked, and what unlocks it. */
+  shortfall: z.string().min(1),
+  /** Smallest size in bytes of one more disk that would start unlocking capacity. */
+  unlockSize: z.number().int().nonnegative(),
+  /** Usable bytes one more disk of `unlockSize` would deliver. */
+  unlockGain: z.number().int().nonnegative(),
+})
+export type AhrExpansionZeroGain = z.infer<typeof AhrExpansionZeroGain>
+
+/**
+ * POST /v1/ahr/:name/expand/plan response — the before → after preview the
+ * expansion wizard renders (NO mutation). `usableGain`/`zeroGain` are
+ * additive: an older daemon omits them (version-skew ruling: no field ⇒ the
+ * UI falls back to the before → after comparison), never to a different
+ * meaning. `zeroGain` is present exactly when `usableGain` is 0.
+ */
+export const AhrExpansionPlanResponse = z.object({
+  before: AhrCapacity,
+  after: AhrCapacity,
+  steps: z.array(AhrExpansionStep),
+  warnings: z.array(z.string()),
+  /** The resulting band layout (the wizard's before → after bars). */
+  bands: z.array(AhrPreviewBand),
+  /** Usable bytes this plan would actually add (0 when none — see `zeroGain`). */
+  usableGain: z.number().int().nonnegative().optional(),
+  /** Present exactly when `usableGain` is 0: the shortfall and the unlock. */
+  zeroGain: AhrExpansionZeroGain.optional(),
+})
+export type AhrExpansionPlanResponse = z.infer<typeof AhrExpansionPlanResponse>
+
 // ---- Hot spares (story 11.11, §11) ------------------------------------------
 
 /**

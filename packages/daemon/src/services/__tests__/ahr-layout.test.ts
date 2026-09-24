@@ -1,5 +1,5 @@
-import type { AhrType } from '@anas/shared'
-import type { AhrLayoutDisk, ExistingBand } from '../ahr-layout.js'
+import type { AhrCapacity, AhrType } from '@anas/shared'
+import type { AhrLayoutDisk, AhrReplacement, ExistingBand } from '../ahr-layout.js'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { AhrExpansionStep, AhrLayoutPreview } from '@anas/shared'
@@ -7,10 +7,12 @@ import {
   AHR_MIN_DISKS,
   AHR_SIZE_GRANULARITY_BYTES,
   AhrPlanError,
+  expansionGain,
   floorToGranularity,
   MIXED_SECTOR_WARNING_PREFIX,
   planExpansion,
   planFreshLayout,
+  PV_UNDERSIZE_MARGIN_BYTES,
 } from '../ahr-layout.js'
 import { kernelInfo } from '../kernel-version.js'
 
@@ -669,6 +671,104 @@ describe('AHR layout (Epic 11 + AHR — docs/AHR-DESIGN.md §2)', () => {
         assert.deepEqual(plan.steps.map(s => s.index), plan.steps.map((_, i) => i))
       }
       assert.ok(exercised >= 24, `expected a few dozen exercised combos, got ${exercised}`)
+    })
+  })
+
+  // ---- Usable-capacity delta of a plan (ahrexpand.1, §5.2) -----------------
+
+  describe('usable-capacity delta of a plan (ahrexpand.1, AHR-DESIGN §5.2)', () => {
+    /** The §5.2 pool: 4×2 TiB AHR-1, one band raid5×4. */
+    const four2 = (): ExistingBand[] => [
+      { band: 1, startBytes: 0, endBytes: 2 * TiB, level: 'raid5', members: ['d1', 'd2', 'd3', 'd4'] },
+    ]
+    /** A live-pool capacity whose only load-bearing field is usableBytes. */
+    const cap = (usableBytes: number): AhrCapacity => ({
+      rawBytes: usableBytes,
+      usableBytes,
+      usedBytes: 0,
+      freeBytes: usableBytes,
+      redundancyOverheadBytes: 0,
+      unprotectedWastedBytes: 0,
+      pendingBytes: 0,
+    })
+    const planOf = (existingBands: ExistingBand[], approvedDisks: AhrLayoutDisk[], replaced?: AhrReplacement) =>
+      planExpansion({ poolName: 'quad', tier: 'ahr1', existingBands, approvedDisks, replaced })
+    const gainOf = (plan: ReturnType<typeof planOf>, before: AhrCapacity, replaced?: AhrReplacement) =>
+      expansionGain({
+        before,
+        after: plan.preview.capacity,
+        bands: plan.preview.bands,
+        warnings: plan.preview.warnings,
+        tier: 'ahr1',
+        replaced,
+      })
+
+    it('the exact §5.2 shape: one 2 TiB disk replaced by 4 TiB → zero gain, naming the 4 TiB unlock', () => {
+      const plan = planOf(four2(), [disk('d2', 2), disk('d3', 2), disk('d4', 2), disk('n1', 4)], { oldDiskId: 'd1', newDiskId: 'n1' })
+      const gain = gainOf(plan, cap(6 * TiB), { oldDiskId: 'd1', newDiskId: 'n1' })
+      assert.equal(gain.usableGain, 0)
+      assert.deepEqual(gain.zeroGain, {
+        shortfall: 'This plan adds no usable capacity: the 4 TiB disk above the 2 TiB band sits alone; add one more disk of ≥ 4 TiB to unlock ~4 TiB',
+        unlockSize: 4 * TiB,
+        unlockGain: 4 * TiB,
+      })
+    })
+
+    it('two 4 TiB disks (the second replace) → positive gain, no refusal detail', () => {
+      // The first replace already landed: n1 (4 TiB) is a band-1 member, and
+      // the second 4 TiB disk completes the [2–4] band into RAID1×2.
+      const existing: ExistingBand[] = [
+        { band: 1, startBytes: 0, endBytes: 2 * TiB, level: 'raid5', members: ['n1', 'd2', 'd3', 'd4'] },
+      ]
+      const plan = planOf(existing, [disk('n1', 4), disk('d3', 2), disk('d4', 2), disk('n2', 4)], { oldDiskId: 'd2', newDiskId: 'n2' })
+      const gain = gainOf(plan, cap(6 * TiB), { oldDiskId: 'd2', newDiskId: 'n2' })
+      assert.equal(gain.usableGain, 2 * TiB)
+      assert.equal(gain.zeroGain, null)
+    })
+
+    it('same-size replacement → zero gain refused with the inherited-bands clause, confirm is the bypass', () => {
+      const plan = planOf(four2(), [disk('d2', 2), disk('d3', 2), disk('d4', 2), disk('d5', 2)], { oldDiskId: 'd1', newDiskId: 'd5' })
+      const gain = gainOf(plan, cap(6 * TiB), { oldDiskId: 'd1', newDiskId: 'd5' })
+      assert.equal(gain.usableGain, 0)
+      assert.deepEqual(gain.zeroGain, {
+        shortfall: 'This plan adds no usable capacity: the replacement only inherits the bands its predecessor already served; add one more disk of ≥ 2 TiB to unlock ~2 TiB',
+        unlockSize: 2 * TiB,
+        unlockGain: 2 * TiB,
+      })
+    })
+
+    it('a disk the planner cannot use (stranded) → zero gain with the planner\'s own stranded line', () => {
+      const plan = planOf(four2(), [disk('d1', 2), disk('d2', 2), disk('d3', 2), disk('d4', 2), disk('n9', 1)])
+      const gain = gainOf(plan, cap(6 * TiB))
+      assert.equal(gain.usableGain, 0)
+      assert.deepEqual(gain.zeroGain, {
+        shortfall: 'This plan adds no usable capacity: disk \'n9\': 1 TiB is stranded above the 0 GiB boundary — existing band boundaries are immutable, so this capacity cannot be used; add one more disk of ≥ 2 TiB to unlock ~2 TiB',
+        unlockSize: 2 * TiB,
+        unlockGain: 2 * TiB,
+      })
+    })
+
+    it('a pending band does not by itself mean zero gain (a lower band still grows)', () => {
+      // ADD (not replace) of one 4 TiB disk: band 1 grows raid5×4 → raid5×5
+      // (+2 TiB) while the [2–4] band is born pending.
+      const plan = planOf(four2(), [disk('d1', 2), disk('d2', 2), disk('d3', 2), disk('d4', 2), disk('n1', 4)])
+      const gain = gainOf(plan, cap(6 * TiB))
+      assert.equal(gain.usableGain, 2 * TiB)
+      assert.equal(gain.zeroGain, null)
+    })
+
+    it('the delta is structural, not a bare zero: the sub-GiB LV catch-up sliver is not capacity (§5.3)', () => {
+      const plan = planOf(four2(), [disk('d2', 2), disk('d3', 2), disk('d4', 2), disk('n1', 4)], { oldDiskId: 'd1', newDiskId: 'n1' })
+      // A fully delivered pool\'s live volume sits a sliver below its band
+      // math (LVM metadata + PV rounding) — the §5.2 plan reads as +8 MiB
+      // against it, and must still be the zero-gain refusal.
+      const after = { ...plan.preview.capacity, usableBytes: plan.preview.capacity.usableBytes + 8 * 1024 ** 2 }
+      const gain = expansionGain({ before: cap(6 * TiB), after, bands: plan.preview.bands, warnings: plan.preview.warnings, tier: 'ahr1', replaced: { oldDiskId: 'd1', newDiskId: 'n1' } })
+      assert.equal(gain.usableGain, 0)
+      assert.ok(gain.zeroGain, 'the sub-margin delta is refused, not celebrated')
+      // …and the margin itself is the boundary: a gain AT the margin is real.
+      const afterReal = { ...plan.preview.capacity, usableBytes: plan.preview.capacity.usableBytes + PV_UNDERSIZE_MARGIN_BYTES }
+      assert.ok(gainOf({ ...plan, preview: { ...plan.preview, capacity: afterReal } }, cap(6 * TiB)).zeroGain === null)
     })
   })
 })

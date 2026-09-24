@@ -1,5 +1,7 @@
 import type {
+  AhrCapacity,
   AhrExpansionStep,
+  AhrExpansionZeroGain,
   AhrLayoutPreview,
   AhrPreviewBand,
   AhrType,
@@ -646,4 +648,105 @@ export function planExpansion(input: {
     minDisksMet: approved.length >= AHR_MIN_DISKS[tier],
   }
   return { steps: steps.map((s, index) => ({ index, ...s })), preview }
+}
+
+// ---- Usable-capacity delta of a plan (ahrexpand.1, §5.2) -------------------
+
+/** The usable-capacity delta a plan actually delivers, plus the zero-gain detail. */
+export interface AhrExpansionGain {
+  /**
+   * Usable bytes the plan adds — 0 when it adds none. The raw before → after
+   * delta below the overhead noise floor is reported as 0: that sliver is the
+   * live volume catching up to band math it already had, not new capacity.
+   */
+  usableGain: number
+  /** Present exactly when `usableGain` is 0: the shortfall and what unlocks it. */
+  zeroGain: AhrExpansionZeroGain | null
+}
+
+/**
+ * The usable capacity a plan's reachable target actually adds (ahrexpand.1,
+ * AHR-DESIGN §5.2) — the guard behind the zero-gain refusal.
+ *
+ * The delta reuses the planner's own numbers (`before`/`after`, §2.3
+ * reachable target) — never re-derived. It is STRUCTURAL, never a bare zero:
+ * a fully delivered pool's live volume sits a sliver below its band math
+ * (LVM metadata + PV rounding — the same noise {@link PV_UNDERSIZE_MARGIN_BYTES}
+ * exists for), so a plan that adds nothing reads as a sub-GiB "gain". Sub-GiB
+ * never matters for capacity accounting (§5.3: thresholds must be structural,
+ * not zero); a real gain is band-height scale, at least one granularity.
+ *
+ * The zero-gain detail is derived from the plan's resulting bands, never
+ * hard-coded: the top boundary is the smallest size at which one more disk
+ * would grow or form a band (`unlockSize`), and `unlockGain` is what that one
+ * disk would actually deliver at the planner's own per-band math.
+ */
+export function expansionGain(input: {
+  /** The plan's `before` capacity (the pool's live capacity). */
+  before: AhrCapacity
+  /** The plan's `after` capacity (the §2.3 reachable target). */
+  after: AhrCapacity
+  /** The plan's resulting bands (ascending band index). */
+  bands: AhrPreviewBand[]
+  /** The plan's warnings — the stranded-capacity clause is lifted from the planner's own line. */
+  warnings: string[]
+  tier: AhrType
+  /** The declared substitution, when the plan is a replace. */
+  replaced?: AhrReplacement
+}): AhrExpansionGain {
+  const { before, after, bands, warnings, tier, replaced } = input
+  const rawDelta = after.usableBytes - before.usableBytes
+  const usableGain = rawDelta >= PV_UNDERSIZE_MARGIN_BYTES ? Math.max(0, rawDelta) : 0
+  if (usableGain > 0)
+    return { usableGain, zeroGain: null }
+
+  // Zero gain (§5.2): name the shortfall and what unlocks it — the pending
+  // capacity is physically present, and saying so concretely is the whole
+  // point of the refusal.
+  const top = bands.at(-1)!
+  const unlockSize = top.range.endBytes
+  const unlockGain = gainFromAdditionalDisk(bands, tier, unlockSize)
+  // A pending band is never an existing one (existing bands ARE arrays), so
+  // its disk is one this plan brings in or one that has always sat there —
+  // the clause names the shape, never claims novelty.
+  const pending = top.level === null ? top : null
+  const cause = pending
+    ? pending.memberCount === 1
+      ? `the ${fmtBytes(pending.range.endBytes)} disk above the ${fmtBytes(pending.range.startBytes)} band sits alone`
+      : `the band ${fmtBytes(pending.range.startBytes)}–${fmtBytes(pending.range.endBytes)} has ${pending.memberCount} of the ${MIN_BAND_MEMBERS[tier]} disks a protected array needs`
+    : warnings.find(w => w.includes('is stranded above'))
+      ?? (replaced
+        ? 'the replacement only inherits the bands its predecessor already served'
+        : 'no disk in this plan reaches a band the planner can use')
+  const shortfall = `This plan adds no usable capacity: ${cause}; `
+    + `add one more disk of ≥ ${fmtBytes(unlockSize)} to unlock ~${fmtBytes(unlockGain)}`
+  return { usableGain, zeroGain: { shortfall, unlockSize, unlockGain } }
+}
+
+/**
+ * The usable-capacity delta ONE additional disk of `sizeBytes` would deliver
+ * against the plan's resulting layout — the planner's per-band math applied
+ * to a one-disk growth:
+ *
+ *  - every protected band the disk reaches gains exactly its height (raid5/6
+ *    add a data disk; the ahr1 raid1×2 → raid5×3 convert gains the same
+ *    height, h×1 → h×2);
+ *  - a pending band it reaches delivers its protected math once the member
+ *    count crosses the tier's minimum, else nothing (still locked).
+ */
+function gainFromAdditionalDisk(bands: AhrPreviewBand[], tier: AhrType, sizeBytes: number): number {
+  let gain = 0
+  for (const b of bands) {
+    if (b.range.endBytes > sizeBytes)
+      continue
+    if (b.protected) {
+      gain += b.heightBytes
+    }
+    else {
+      const members = b.memberCount + 1
+      if (levelFor(tier, members) !== null)
+        gain += b.heightBytes * (members - PARITY_DISKS[tier])
+    }
+  }
+  return gain
 }
