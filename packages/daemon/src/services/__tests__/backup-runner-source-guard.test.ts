@@ -166,13 +166,16 @@ describe('backup source guard — the run\'s step 0 (backup2.11)', () => {
       ]),
       (err: Error) => {
         // One fix round suffices: every offending archive is listed, and the
-        // one that is fine is not mentioned at all.
-        assert.deepEqual(err.message.split('\n'), [
+        // one that is fine is not mentioned at all. The join is '; ' on a
+        // single line, because failureDetailFromJournal carries one journal
+        // line to the Tasks grid's Last-run tooltip.
+        assert.deepEqual(err.message.split('; '), [
           'archive \'pictures\': /mnt/pictures is on /mnt/pictures (//nas/pictures), '
           + 'which is configured in /etc/fstab but not mounted',
           'archive \'archive\': /mnt/archive/2026 is on /mnt/archive (server:/export), '
           + 'which is configured in /etc/fstab but not mounted',
         ])
+        assert.ok(!err.message.includes('\n'), 'the thrown message has no newline')
         return true
       },
     )
@@ -230,8 +233,8 @@ describe('backup source guard — the run\'s step 0 (backup2.11)', () => {
     const withGuard = await run(guarded, archives)
     assert.equal(withGuard.status, 'success')
 
-    const ungurded = wire(ALL_MOUNTED)
-    const without = await run(ungurded, archives, join(dir, 'no-such-fstab'))
+    const unguarded = wire(ALL_MOUNTED)
+    const without = await run(unguarded, archives, join(dir, 'no-such-fstab'))
     assert.equal(without.status, 'success')
 
     const argvOf = (mock: MockExecutor): string[] =>
@@ -239,7 +242,7 @@ describe('backup source guard — the run\'s step 0 (backup2.11)', () => {
     assert.ok(argvOf(guarded).length > 0, 'pbc ran')
     assert.deepEqual(
       argvOf(guarded),
-      argvOf(ungurded),
+      argvOf(unguarded),
       'a mounted source changes NOTHING about the invocation — the guard only ever refuses',
     )
   })

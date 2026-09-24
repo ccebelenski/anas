@@ -598,7 +598,7 @@ export async function runBackup(
       refusals.push(unmountedArchiveRefusal(archive.name, archive.path, mount))
   }
   if (refusals.length)
-    throw new Error(refusals.join('\n'))
+    throw new Error(refusals.join('; '))
 
   // The fd cap must bind pbc ITSELF: pbc execs inside anasd (nofile 524288 —
   // Node raises soft→hard), not in the task unit's cgroup, so the unit's
