@@ -121,7 +121,10 @@ async function run(mock: MockExecutor, over: Partial<BackupTask> = {}) {
     repo: REPO,
     secret: 's3cret',
     now: NOW,
-    // No PVE storage.cfg on a test host, and never the real one.
+    // No PVE storage.cfg on a test host, and never the real one. Same for the
+    // source guard's fstab (backup2.11): an absent table configures nothing, so
+    // the guard passes and this file's argv sequences are untouched.
+    fstabPath: '/nonexistent/anas-test/fstab',
     consistencyOptions: { pveStorageCfg: '/nonexistent/anas-test/storage.cfg' },
     snapdevOptions: { deviceExists: async () => true, attempts: 2, intervalMs: 0 },
   }, () => {})

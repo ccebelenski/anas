@@ -129,6 +129,7 @@ import {
 import { classifyBacking } from '../services/iscsi-ownership.js'
 import { buildIscsiTargets, iscsiAvailability, readIscsiContext } from '../services/iscsi.js'
 import { imageArchiveScan, NESTED_SCAN_PREVIEW_TIMEOUT_S, scanArchives, scanNestedFilesystems } from '../services/nested-filesystems.js'
+import { readSourceGuardFacts, unmountedMountFor } from '../services/source-guard.js'
 import { requireIdentity } from './identity.js'
 
 /**
@@ -224,7 +225,20 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
   async function withConsistency(scans: BackupNestedScan[]): Promise<BackupNestedScan[]> {
     try {
       const facts = await readConsistencyFacts(executor, readAhrPools, { pveStorageCfg: paths.pveStorageCfg })
-      return scans.map(scan => ({ ...scan, consistency: deriveConsistency(scan.path, facts) }))
+      // backup2.11 — the save-time WARNING half of the source guard. The same
+      // fstab + mount table, read ONCE for the whole request, and the run's own
+      // guard reads them again at run start: this answer is time-dependent (a
+      // task may legitimately be defined during an outage) so it informs, and
+      // the run is what refuses. Fail-open comes from the helper itself.
+      const guard = await readSourceGuardFacts(executor, fstabPath)
+      return scans.map((scan) => {
+        const unmounted = unmountedMountFor(scan.path, guard)
+        return {
+          ...scan,
+          consistency: deriveConsistency(scan.path, facts),
+          ...(unmounted ? { unmounted } : {}),
+        }
+      })
     }
     catch (err) {
       server.log.warn(`[backup] consistency derivation failed: ${err instanceof Error ? err.message : String(err)}`)
@@ -1159,8 +1173,10 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
           const result = await runBackup(
             executor,
             // The consistency derivation reads the SAME storage.cfg the rest of
-            // the backup routes do (the zvol branch's PVE hands-off guard).
-            { task, repo, secret, consistencyOptions: { pveStorageCfg: paths.pveStorageCfg } },
+            // the backup routes do (the zvol branch's PVE hands-off guard), and
+            // the source guard (backup2.11) reads the SAME fstab the Mounts
+            // routes and `preview-nested` do.
+            { task, repo, secret, fstabPath, consistencyOptions: { pveStorageCfg: paths.pveStorageCfg } },
             updateProgress,
           )
           // Retention (16.11): prune ONLY after a run that actually backed up. A

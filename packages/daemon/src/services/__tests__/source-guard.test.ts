@@ -41,6 +41,14 @@ const ALL_MOUNTED = findmnt(['/', '/mnt/pictures', '/mnt/archive', '/mnt/old'])
 /** The boot race this guard exists for: the CIFS mount never came up. */
 const PICTURES_MISSING = findmnt(['/', '/mnt/archive', '/mnt/old'])
 
+/** The whole fact about `/mnt/pictures` as the fstab configures it. */
+const PICTURES_MOUNT = {
+  mountpoint: '/mnt/pictures',
+  source: '//nas/pictures',
+  fstype: 'cifs',
+  disabled: false,
+}
+
 describe('source guard — configured but unmounted (rclone.2)', () => {
   describe('buildSourceGuardFacts', () => {
     it('reads every absolute fstab mountpoint, including a disabled one', () => {
@@ -55,6 +63,17 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
         ['/mnt/old'],
         'a #ANAS-commented line is still a CONFIGURED mount',
       )
+      // backup2.11 — the two fstab fields a refusal sentence NAMES ride along.
+      // They can only come from fstab: the kernel table has nothing to say
+      // about a mount that is not there.
+      assert.deepEqual(
+        facts.configured.find(c => c.mountpoint === '/mnt/pictures'),
+        { mountpoint: '/mnt/pictures', source: '//nas/pictures', fstype: 'cifs', disabled: false },
+      )
+      assert.deepEqual(
+        facts.configured.find(c => c.mountpoint === '/mnt/archive'),
+        { mountpoint: '/mnt/archive', source: 'server:/export', fstype: 'nfs4', disabled: false },
+      )
       assert.equal(facts.mountTableUnavailable, false)
     })
 
@@ -67,12 +86,12 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
   describe('unmountedMountFor', () => {
     it('the source IS the unmounted mountpoint', () => {
       const facts = buildSourceGuardFacts(FSTAB, PICTURES_MISSING)
-      assert.deepEqual(unmountedMountFor('/mnt/pictures', facts), { mountpoint: '/mnt/pictures', disabled: false })
+      assert.deepEqual(unmountedMountFor('/mnt/pictures', facts), PICTURES_MOUNT)
     })
 
     it('the source is UNDER the unmounted mountpoint', () => {
       const facts = buildSourceGuardFacts(FSTAB, PICTURES_MISSING)
-      assert.deepEqual(unmountedMountFor('/mnt/pictures/2026/raw', facts), { mountpoint: '/mnt/pictures', disabled: false })
+      assert.deepEqual(unmountedMountFor('/mnt/pictures/2026/raw', facts), PICTURES_MOUNT)
     })
 
     it('passes when everything the fstab names is mounted', () => {
@@ -92,12 +111,15 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
       const facts = buildSourceGuardFacts(fstab, findmnt(['/', '/mnt/archive', '/mnt/old', '/mnt/pictures/live']))
       assert.equal(unmountedMountFor('/mnt/pictures/live/today', facts), null)
       // …while a sibling path under the still-absent mount is refused.
-      assert.deepEqual(unmountedMountFor('/mnt/pictures/2026', facts), { mountpoint: '/mnt/pictures', disabled: false })
+      assert.deepEqual(unmountedMountFor('/mnt/pictures/2026', facts), PICTURES_MOUNT)
     })
 
     it('a DISABLED fstab entry that is not mounted is still refused, and says so', () => {
       const facts = buildSourceGuardFacts(FSTAB, findmnt(['/', '/mnt/pictures', '/mnt/archive']))
-      assert.deepEqual(unmountedMountFor('/mnt/old/x', facts), { mountpoint: '/mnt/old', disabled: true })
+      assert.deepEqual(
+        unmountedMountFor('/mnt/old/x', facts),
+        { mountpoint: '/mnt/old', source: '//nas/old', fstype: 'cifs', disabled: true },
+      )
     })
 
     it('FAILS OPEN when the mount table could not be read', () => {
@@ -116,7 +138,7 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
 
   describe('the refusal sentence', () => {
     it('names the mount and the fix, in ASCII', () => {
-      const msg = unmountedSourceRefusal('/mnt/pictures/2026', { mountpoint: '/mnt/pictures', disabled: false })
+      const msg = unmountedSourceRefusal('/mnt/pictures/2026', PICTURES_MOUNT)
       assert.match(msg, /^\/mnt\/pictures\/2026 is under \/mnt\/pictures/)
       assert.match(msg, /not mounted right now/)
       assert.match(msg, /Mount \/mnt\/pictures and run it again\./)
@@ -125,7 +147,12 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
     })
 
     it('says so when the entry itself is disabled', () => {
-      const msg = unmountedSourceRefusal('/mnt/old', { mountpoint: '/mnt/old', disabled: true })
+      const msg = unmountedSourceRefusal('/mnt/old', {
+        mountpoint: '/mnt/old',
+        source: '//nas/old',
+        fstype: 'cifs',
+        disabled: true,
+      })
       assert.match(msg, /its \/etc\/fstab entry is disabled/)
     })
 

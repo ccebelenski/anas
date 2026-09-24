@@ -2990,9 +2990,33 @@
         }
     }
 
+    // backup2.11 — the SAVE-TIME half of the source guard. The daemon answers
+    // `unmounted` when this row's path sits on a mount /etc/fstab configures and
+    // the system does not currently have: the boot-race shape where an empty
+    // mountpoint directory would be backed up as a good snapshot. It is a
+    // WARNING, not a block — the fact is time-dependent (a task may legitimately
+    // be defined while a share is down, and the timer fires later), so Save is
+    // untouched and the RUN is the gate. An answer WITHOUT the key says nothing
+    // at all: the guard fails open, and an older daemon never sends it.
+    function unmountedAlertHtml(scan) {
+        var un = scan && scan.unmounted;
+        if (!un || !un.mountpoint) {
+            return '';
+        }
+        return '<div style="font-size:11px;color:var(--anas-warn,#c9820b);margin-bottom:3px;">'
+            + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
+            + enc(t('Not mounted') + ': ' + (scan.path || '') + ' ' + t('is on') + ' '
+                + un.mountpoint + ' (' + (un.source || '') + '), '
+                + t('configured in /etc/fstab but not mounted.') + ' '
+                + t('The run will be refused until it is mounted.'))
+            + '</div>';
+    }
+
     // One line per nested filesystem found under the source, ALWAYS naming its
     // kind — included ones in the muted/ok colour, excluded ones amber under an
-    // alert that says exactly what happens to them.
+    // alert that says exactly what happens to them. The missing-mount warning
+    // rides ABOVE all of it: if the filesystem is not there, nothing else the
+    // row says about it matters yet.
     function nestedAlertHtml(scan) {
         var found = (scan && isArray(scan.nested)) ? scan.nested : [];
         var excluded = excludedNested(scan);
@@ -3009,10 +3033,11 @@
                     : '')
                 + '</div>')
             : '';
+        var lead = unmountedAlertHtml(scan) + consistencyRow;
         if (!found.length && !truncated) {
-            return consistencyRow;
+            return lead;
         }
-        var head = consistencyRow;
+        var head = lead;
         if (excluded.length) {
             head += '<div style="font-size:11px;color:var(--anas-warn,#c9820b);">'
                 + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'

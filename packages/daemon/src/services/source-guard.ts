@@ -1,3 +1,4 @@
+import type { UnmountedMount } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import { readFile } from 'node:fs/promises'
 import { isPathWithin } from '@anas/shared'
@@ -38,8 +39,13 @@ import { readFindmnt } from './mounts.js'
 
 /** The facts one guard pass needs — read once, reusable for several paths. */
 export interface SourceGuardFacts {
-  /** Every fstab-configured mount, absolute mountpoints only (file order). */
-  configured: { mountpoint: string, disabled: boolean }[]
+  /**
+   * Every fstab-configured mount, absolute mountpoints only (file order), with
+   * the two fstab fields a refusal sentence NAMES: `source` (fs_spec) and
+   * `fstype` (fs_vfstype). They come from fstab and nowhere else — the kernel
+   * table has nothing to say about a mount that is not there.
+   */
+  configured: UnmountedMount[]
   /** Mountpoints the kernel currently has (findmnt targets). */
   mounted: Set<string>
   /**
@@ -47,13 +53,6 @@ export interface SourceGuardFacts {
    * — it has no evidence that anything is missing (fail open).
    */
   mountTableUnavailable: boolean
-}
-
-/** A configured mount that is not currently mounted. */
-export interface UnmountedMount {
-  mountpoint: string
-  /** Its fstab line is commented out with the `#ANAS ` marker (disabled, not deleted). */
-  disabled: boolean
 }
 
 /**
@@ -64,7 +63,12 @@ export interface UnmountedMount {
 export function buildSourceGuardFacts(fstabText: string, findmntText: string): SourceGuardFacts {
   const nodes = parseFindmnt(findmntText)
   return {
-    configured: parseFstab(fstabText).map(e => ({ mountpoint: e.mountpoint, disabled: e.disabled === true })),
+    configured: parseFstab(fstabText).map(e => ({
+      mountpoint: e.mountpoint,
+      source: e.spec,
+      fstype: e.fstype,
+      disabled: e.disabled === true,
+    })),
     mounted: new Set(nodes.map(n => n.target)),
     // An empty table is the unreadable case: a running Linux system always has
     // at least `/` mounted, so zero rows can only mean the read failed — and
@@ -101,7 +105,7 @@ export async function readSourceGuardFacts(
 export function unmountedMountFor(path: string, facts: SourceGuardFacts): UnmountedMount | null {
   if (facts.mountTableUnavailable)
     return null
-  let best: { mountpoint: string, disabled: boolean } | null = null
+  let best: UnmountedMount | null = null
   let bestLen = -1
   for (const entry of facts.configured) {
     if (!isPathWithin(entry.mountpoint, path))
@@ -114,7 +118,7 @@ export function unmountedMountFor(path: string, facts: SourceGuardFacts): Unmoun
   }
   if (!best || facts.mounted.has(best.mountpoint))
     return null
-  return { mountpoint: best.mountpoint, disabled: best.disabled }
+  return best
 }
 
 /**

@@ -39,6 +39,15 @@ source "${SCRIPT_DIR}/config.sh"
 #                       absent from the mount table, an empty directory sitting
 #                       where a share should be.
 #
+#   /mnt/gt-guardok     backup2.11's second half: the same shape, but MOUNTABLE.
+#                         tmpfs /mnt/gt-guardok tmpfs noauto,x-anas-fixture 0 0
+#                       It comes up UNMOUNTED (so the guard refuses a backup
+#                       rooted there), and `mount /mnt/gt-guardok` makes it real
+#                       — which is how the recovery half is proven: mount it,
+#                       drop a file in, Run now, and the backup completes. tmpfs
+#                       rather than a second CIFS share because it needs no
+#                       server, no credentials and no network at all.
+#
 # `down` reverses all of it — the units the spec may have leaked included (only
 # the fixture's OWN task names, never a foreign anas-cloud unit) — and then runs
 # `cloud-fixture.sh down`, which restores the store's pre-state and removes the
@@ -58,6 +67,11 @@ UNMOUNTED_DIR="/mnt/gt-unmounted"
 FSTAB_LINE="//192.0.2.9/nope ${UNMOUNTED_DIR} cifs noauto,guest,x-anas-fixture 0 0"
 FSTAB_MARK="x-anas-fixture"
 
+# backup2.11 — the MOUNTABLE counterpart. `x-` options are userspace-only, so
+# libmount strips the marker and `mount ${GUARDOK_DIR}` just works.
+GUARDOK_DIR="/mnt/gt-guardok"
+GUARDOK_FSTAB_LINE="tmpfs ${GUARDOK_DIR} tmpfs noauto,x-anas-fixture 0 0"
+
 # The task names the spec creates. `down` removes exactly these units — a
 # crashed run must not leave a timer behind, and a foreign anas-cloud task
 # (there are none on the stunt node, but the rule is the rule) is not ours.
@@ -65,9 +79,9 @@ TASKS=(gtcopy gtsync gtempty gtemptycopy gtunmounted gtfail)
 
 usage() {
   echo "Usage: cloud-tasks-fixture.sh <up|down|status>"
-  echo "  up      cloud-fixture.sh up + ${SRC_DS} (a.bin/b.bin/sub/c.txt), ${EMPTY_DS}, a clean ${DST_DIR}, and the never-mounted ${UNMOUNTED_DIR} fstab entry"
-  echo "  down    Remove the fixture's task units, the fstab entry and mountpoint, both datasets, then cloud-fixture.sh down"
-  echo "  status  Datasets and their content, the sftp-side tree, the fstab entry, any anas-cloud units"
+  echo "  up      cloud-fixture.sh up + ${SRC_DS} (a.bin/b.bin/sub/c.txt), ${EMPTY_DS}, a clean ${DST_DIR}, and the unmounted ${UNMOUNTED_DIR} / ${GUARDOK_DIR} fstab entries"
+  echo "  down    Remove the fixture's task units, the fstab entries and mountpoints, both datasets, then cloud-fixture.sh down"
+  echo "  status  Datasets and their content, the sftp-side tree, the fstab entries, any anas-cloud units"
   exit 1
 }
 
@@ -101,6 +115,10 @@ status() {
   $SSH_CMD "grep -F '${FSTAB_MARK}' /etc/fstab || echo 'no fstab entry'"
   $SSH_CMD "ls -ld ${UNMOUNTED_DIR} 2>/dev/null || echo 'no ${UNMOUNTED_DIR}'"
   $SSH_CMD "findmnt -n ${UNMOUNTED_DIR} && echo 'WARNING: it is MOUNTED' || echo 'not mounted (as intended)'"
+  echo
+  echo "--- mountable-mount fixture (backup2.11) ---"
+  $SSH_CMD "ls -ld ${GUARDOK_DIR} 2>/dev/null || echo 'no ${GUARDOK_DIR}'"
+  $SSH_CMD "findmnt -n ${GUARDOK_DIR} || echo 'not mounted (the spec mounts it)'"
   echo
   echo "--- anas-cloud units ---"
   $SSH_CMD "ls /etc/systemd/system | grep anas-cloud || echo 'none'"
@@ -162,6 +180,23 @@ case "$1" in
       exit 1
     fi
 
+    # --- the configured-but-unmounted mount that CAN be mounted ------------
+    # backup2.11's recovery half. It starts unmounted (`noauto`); the spec
+    # mounts it, proves the run then completes, and `down` unmounts it again.
+    $SSH_CMD "mkdir -p ${GUARDOK_DIR}"
+    if $SSH_CMD "grep -qF ' ${GUARDOK_DIR} ' /etc/fstab"; then
+      echo "✓ fstab entry already present for ${GUARDOK_DIR}"
+    else
+      $SSH_CMD "printf '%s\n' '${GUARDOK_FSTAB_LINE}' >> /etc/fstab && systemctl daemon-reload"
+      echo "✓ fstab entry added for ${GUARDOK_DIR} (tmpfs, noauto — mountable on demand)"
+    fi
+    # A leftover mount from a crashed spec run is not the "before" the guard
+    # test reads: it must start absent from the mount table.
+    if $SSH_CMD "findmnt -n ${GUARDOK_DIR} >/dev/null 2>&1"; then
+      $SSH_CMD "umount ${GUARDOK_DIR}"
+      echo "✓ stale ${GUARDOK_DIR} mount released"
+    fi
+
     echo
     echo "=== Fixture ready ==="
     status
@@ -180,16 +215,25 @@ case "$1" in
     done
     $SSH_CMD "systemctl daemon-reload"
 
-    # The fstab entry + its mountpoint (rmdir only — a populated directory is
-    # not ours to delete).
+    # The fstab entries + their mountpoints (rmdir only — a populated directory
+    # is not ours to delete). The tmpfs one is released FIRST: the spec mounts
+    # it, and an fstab line removed under a live mount leaves a stray tmpfs
+    # behind with nothing naming it.
+    if $SSH_CMD "findmnt -n ${GUARDOK_DIR} >/dev/null 2>&1"; then
+      $SSH_CMD "umount ${GUARDOK_DIR}"
+      echo "✓ ${GUARDOK_DIR} unmounted"
+    fi
+    # One marker, both lines — the CIFS one and the tmpfs one.
     if $SSH_CMD "grep -qF '${FSTAB_MARK}' /etc/fstab"; then
       $SSH_CMD "sed -i '/${FSTAB_MARK}/d' /etc/fstab && systemctl daemon-reload"
-      echo "✓ fstab entry removed"
+      echo "✓ fstab entries removed"
     fi
-    if $SSH_CMD "test -d ${UNMOUNTED_DIR}"; then
-      $SSH_CMD "rmdir ${UNMOUNTED_DIR} 2>/dev/null || true"
-      echo "✓ ${UNMOUNTED_DIR} removed (if empty)"
-    fi
+    for d in "${UNMOUNTED_DIR}" "${GUARDOK_DIR}"; do
+      if $SSH_CMD "test -d ${d}"; then
+        $SSH_CMD "rmdir ${d} 2>/dev/null || true"
+        echo "✓ ${d} removed (if empty)"
+      fi
+    done
 
     # The datasets, with any transient snapshot a killed run left behind.
     for ds in "${SRC_DS}" "${EMPTY_DS}"; do

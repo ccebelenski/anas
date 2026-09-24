@@ -190,6 +190,7 @@ export {
   restorePatternFor,
   restorePatternsFor,
   snapshotTimeIso,
+  UnmountedMount,
   UpsertBackupRepoRequest,
 } from './schemas/backup.js'
 

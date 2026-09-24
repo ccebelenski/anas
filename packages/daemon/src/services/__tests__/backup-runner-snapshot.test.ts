@@ -132,7 +132,13 @@ function zfsArgs(mock: MockExecutor, verb: string): string[][] {
 }
 
 async function run(executor: CommandExecutor, over: Partial<BackupTask> = {}) {
-  return runBackup(executor, { task: task(over), repo: REPO, secret: 's3cret', now: NOW }, () => {})
+  // backup2.11's fstab seam: an absent table configures nothing, so the source
+  // guard passes and every argv sequence below is the one it always was.
+  return runBackup(
+    executor,
+    { task: task(over), repo: REPO, secret: 's3cret', now: NOW, fstabPath: '/nonexistent/anas-test/fstab' },
+    () => {},
+  )
 }
 
 describe('snapshot-consistent run — lifecycle (backup2.3)', () => {

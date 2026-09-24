@@ -791,6 +791,34 @@ export const BackupNestedEntry = z.object({
 })
 export type BackupNestedEntry = z.infer<typeof BackupNestedEntry>
 
+/**
+ * A mount /etc/fstab configures that the kernel does NOT currently have — the
+ * boot-race shape the source guard exists for (story rclone.2 built the guard,
+ * backup2.11 wired it into backup).
+ *
+ * ONE definition for both consumers: the daemon's `services/source-guard.ts`
+ * derives it from the same two tables the Mounts view reads (fstab + findmnt),
+ * the cloud runner turns it into a refusal sentence, and backup carries it out
+ * to the wizard on the boundary scan below. `source` and `fstype` are the
+ * FSTAB fields (fs_spec and fs_vfstype) — there is nothing in the kernel's
+ * table to read them from, precisely because the mount is not there.
+ */
+export const UnmountedMount = z.object({
+  /** The configured mountpoint the source path sits on. */
+  mountpoint: AbsolutePath,
+  /** fstab fs_spec — the device / `//host/share` / `host:/export`. */
+  source: z.string(),
+  /** fstab fs_vfstype — cifs, nfs4, ext4, tmpfs, … */
+  fstype: z.string(),
+  /**
+   * Its fstab line is commented out with the `#ANAS ` marker (disabled, not
+   * deleted) — still a CONFIGURED mount, and still not mounted. Optional so an
+   * older daemon's answer parses.
+   */
+  disabled: z.boolean().optional(),
+})
+export type UnmountedMount = z.infer<typeof UnmountedMount>
+
 /** The detector's answer for ONE archive source. */
 export const BackupNestedScan = z.object({
   /** The archive name this scan belongs to (absent for a bare-path preview). */
@@ -818,6 +846,15 @@ export const BackupNestedScan = z.object({
    * renders as "not known", never as "live".
    */
   consistency: BackupArchiveConsistency.optional(),
+  /**
+   * backup2.11 — the configured-but-unmounted mount this source sits on, when
+   * there is one. ADDITIVE and OPTIONAL: absent means "no such mount, or the
+   * guard could not see the tables" (it fails open), never a promise that the
+   * source is there. The wizard turns it into the per-row alert; the RUN reads
+   * the tables again at run start and is the actual gate, because the fact is
+   * time-dependent — a task may legitimately be defined during an outage.
+   */
+  unmounted: UnmountedMount.optional(),
 })
 export type BackupNestedScan = z.infer<typeof BackupNestedScan>
 

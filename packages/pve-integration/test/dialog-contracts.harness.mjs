@@ -1149,11 +1149,26 @@ const nestedPreviews = []
  * `scanArchives`). Both forms answer `exists: true` here: this is a route
  * mock of the success path, not a missing-path fixture.
  */
+/**
+ * backup2.11 — the configured-but-unmounted answer, per path. `/mnt/gt-absent`
+ * is the incident shape: a CIFS share /etc/fstab names that the system does not
+ * currently have, with an empty mountpoint directory sitting where it belongs.
+ * Every OTHER path here answers with the key absent — which is both "it is
+ * mounted" and "an older daemon said nothing", the two cases that must render
+ * identically.
+ */
+const UNMOUNTED_BY_PATH = {
+  '/mnt/gt-absent': { mountpoint: '/mnt/gt-absent', source: '//nas/gtabsent', fstype: 'cifs', disabled: false },
+}
+
 function nestedPreviewResponse(body) {
   const scan = (path, choice, kind) => {
     const consistency = CONSISTENCY_BY_PATH[path]
+    const unmounted = UNMOUNTED_BY_PATH[path]
     if (kind === 'img') {
-      // The daemon skips the walk entirely for an img source.
+      // The daemon skips the walk entirely for an img source — but it is
+      // guarded exactly like a pxar one (an image file on an absent mount is
+      // the same lie in block form).
       return {
         path,
         exists: true,
@@ -1162,6 +1177,7 @@ function nestedPreviewResponse(body) {
         truncated: false,
         warnings: [],
         ...(consistency ? { consistency } : {}),
+        ...(unmounted ? { unmounted } : {}),
       }
     }
     const found = NESTED_BY_PATH[path] || []
@@ -1174,6 +1190,7 @@ function nestedPreviewResponse(body) {
       truncated: false,
       warnings: [],
       ...(consistency ? { consistency } : {}),
+      ...(unmounted ? { unmounted } : {}),
     }
   }
   const archives = (body && body.archives) || []
@@ -1551,6 +1568,71 @@ async function nestedChecks() {
     !('includeNested' in body.archives[1]), JSON.stringify(body.archives[1]))
 
   ok('nested: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+// ============================================================================
+//  1b'. backup2.11 — the source-guard alert on an archive row
+// ============================================================================
+
+/**
+ * The SAVE-TIME half of the guard, as the wizard renders it. Three states, in
+ * the one element that already carries the row's nested note
+ * (`#archNestedAlert`):
+ *
+ *   1. UNMOUNTED — the scan carries `unmounted`, and the row says so in the
+ *      warning colour, naming the mountpoint, the fstab source and the
+ *      consequence ("the run will be refused until it is mounted").
+ *   2. MOUNTED — the same path once the share is there: the daemon omits the
+ *      key and the row says nothing about mounts.
+ *   3. A SCAN WITHOUT THE FIELD — every stored row in this fixture. An older
+ *      daemon answers this way, and so does a guard that could not read the
+ *      tables (it fails open); the row must render exactly as it always did.
+ *
+ * Save is NOT blocked in any of them: the fact is time-dependent, so the RUN is
+ * the gate. The dialog is closed rather than saved here for exactly that
+ * reason — nothing about this alert may touch what a save sends.
+ */
+async function sourceGuardChecks() {
+  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  grid.selectRow(0)
+
+  const dlg = await openEdit(grid)
+  const rows = archiveRows(dlg)
+
+  // --- 3. the stored rows: no `unmounted` key anywhere in the fixture ------
+  for (let i = 0; i < rows.length; i++) {
+    const html = rows[i].down('#archNestedAlert').html || ''
+    ok(`guard: a scan without the field renders no mount warning (row ${i})`,
+      !/Not mounted/.test(html), html)
+  }
+
+  // --- 1. the unmounted path ----------------------------------------------
+  const row = rows[2]
+  row.down('#archPath').setValue('/mnt/gt-absent')
+  await settle()
+  let html = row.down('#archNestedAlert').html || ''
+  ok('guard: an unmounted source warns on the row', /Not mounted/.test(html), html)
+  ok('guard: the warning names the MOUNTPOINT', /\/mnt\/gt-absent/.test(html), html)
+  ok('guard: the warning names the fstab SOURCE', /\/\/nas\/gtabsent/.test(html), html)
+  ok('guard: the warning says what happens at run time',
+    /run will be refused until it is mounted/.test(html), html)
+  ok('guard: it renders in the warning colour, not as a quiet note',
+    /--anas-warn/.test(html), html)
+
+  // --- 2. back to a mounted path ------------------------------------------
+  row.down('#archPath').setValue('/srv')
+  await settle()
+  html = row.down('#archNestedAlert').html || ''
+  ok('guard: a mounted source carries no mount warning', !/Not mounted/.test(html), html)
+  ok('guard: and the row still renders its nested note', /\/srv\/nfs/.test(html), html)
+
+  dlg.close()
+  await settle()
+  ok('guard: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 // ============================================================================
@@ -9787,6 +9869,8 @@ async function shareUsersChecks() {
 await backupChecks()
 warnings.length = 0
 await nestedChecks()
+warnings.length = 0
+await sourceGuardChecks()
 warnings.length = 0
 await consistencyChecks()
 warnings.length = 0

@@ -8,6 +8,7 @@ import type {
   BackupRepoTestResult,
   BackupTask,
   BackupTransientSnapshot,
+  UnmountedMount,
 } from '@anas/shared'
 import type { PeerCertificate } from 'node:tls'
 import type { CommandExecutor } from '../executor/types.js'
@@ -33,6 +34,7 @@ import {
 import { withZvolSnapshotDevices } from './backup-zvol.js'
 import { nestedRunNotices, nestedRunWarnings, resolveNestedIncludes, scanArchives } from './nested-filesystems.js'
 import { formatTransientBackupSnapshot } from './snapshot-naming.js'
+import { readSourceGuardFacts, unmountedMountFor } from './source-guard.js'
 
 /**
  * Backup RUNNER logic (Epic 16.7) — assembles the pbc environment + argv,
@@ -446,6 +448,13 @@ export interface BackupRunDeps {
   repo: BackupRepo
   secret: string
   /**
+   * backup2.11 — where the source guard reads the configured mounts from. The
+   * SAME seam the cloud runner takes, and required for the same reason: a run
+   * must never silently fall back to a table nobody chose, and a test must be
+   * able to hand the guard a fstab of its own.
+   */
+  fstabPath: string
+  /**
    * backup2.3 test seam: the clock the transient snapshot's name and the stale
    * sweep's cutoff are read from, and the AHR runtime dir. Absent = real time
    * and the real `/run/anas-ahr`.
@@ -531,6 +540,24 @@ export interface BackupRunResult {
 }
 
 /**
+ * The refusal sentence for ONE archive whose source sits on a mount /etc/fstab
+ * configures and the system does not currently have (backup2.11).
+ *
+ * It names all four facts — the ARCHIVE (which row of the task to fix), the
+ * PATH as configured, the MOUNTPOINT the path actually sits on (which may be an
+ * ancestor of the path), and the fstab SOURCE (the share or device that is
+ * missing). "The backup source was empty" without the mount name sends the
+ * operator looking in the wrong place; that is the 2026-08 incident's lesson.
+ *
+ * ASCII only: it becomes a job error, a Last-run tooltip and a notification
+ * body line.
+ */
+export function unmountedArchiveRefusal(archive: string, path: string, mount: UnmountedMount): string {
+  return `archive '${archive}': ${path} is on ${mount.mountpoint} (${mount.source}), `
+    + `which is configured in /etc/fstab but not mounted`
+}
+
+/**
  * Run one backup: assemble env + argv, exec pbc, parse STDERR for progress
  * (feeding `updateProgress`), and classify. Returns a result for success /
  * benign too-soon; THROWS on a real failure (so the job fails and systemd's
@@ -544,6 +571,34 @@ export async function runBackup(
 ): Promise<BackupRunResult> {
   const { task, repo, secret } = deps
   const env = buildBackupEnv(repo, secret)
+
+  // ---- 0. Source guard (backup2.11) --------------------------------------
+  // FIRST, before the boundary scan, before any snapshot and before pbc is
+  // handed anything at all: a source that sits on a mount the system is
+  // configured to have and does not currently have is an EMPTY MOUNTPOINT
+  // DIRECTORY, and backing that up produces a near-empty snapshot presented as
+  // a good one (the 2026-08 boot race). The tables are read ONCE for the whole
+  // task, and every archive is tested — `img` as well as `pxar`: an image file
+  // on an absent mount is the same lie in block form.
+  //
+  // The WHOLE RUN fails, not the one archive: a backup that quietly omits an
+  // archive and reports success is the incident's shape, and PBS retention
+  // would then age the last real snapshot out behind it. An operator who wants
+  // the other archives to proceed splits the task. Every offending archive is
+  // named in ONE error so a single fix round suffices.
+  //
+  // Fail-open is the helper's own contract: an unreadable fstab or mount table
+  // yields no refusals, because a guard that cannot see the system must not
+  // claim a mount is missing.
+  const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath)
+  const refusals: string[] = []
+  for (const archive of task.archives) {
+    const mount = unmountedMountFor(archive.path, guardFacts)
+    if (mount)
+      refusals.push(unmountedArchiveRefusal(archive.name, archive.path, mount))
+  }
+  if (refusals.length)
+    throw new Error(refusals.join('\n'))
 
   // The fd cap must bind pbc ITSELF: pbc execs inside anasd (nofile 524288 —
   // Node raises soft→hard), not in the task unit's cgroup, so the unit's
