@@ -1,12 +1,16 @@
 import type { CloudSyncPreviewResult, CloudSyncTask } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { RcloneLogState } from './cloud-runner.js'
 import type { RcloneConfigPaths } from './rclone-config.js'
 import { stat } from 'node:fs/promises'
 import {
   buildRcloneArgs,
+  DELETED_FILES_CAP,
   execRcloneLog,
   finalStats,
   missingSourceRefusal,
+  rcloneFailureMessage,
+  rcloneRunCompleted,
 } from './cloud-runner.js'
 import { RCLONE } from './rclone-config.js'
 import { assertNoSecretValues } from './secret-argv.js'
@@ -63,11 +67,26 @@ export const PREVIEW_TIMEOUT_S = 120
 export const TIMEOUT_EXIT_CODE = 124
 
 /**
- * The cap on `deletedFiles` kept in the result. A whole-tree delete can name
- * a lot of files, and the operator reading the answer wants a sample with the
- * count, not a wall of names. `deletedTotal` is always the whole number.
+ * The cap on `deletedFiles` — ONE constant, defined with the reader that
+ * enforces it while the log is still arriving (`cloud-runner.ts`) and
+ * re-exported here because the answer's shape is this file's contract.
+ * `deletedTotal` is always the whole number.
  */
-export const DELETED_FILES_CAP = 200
+export { DELETED_FILES_CAP }
+
+/**
+ * A preview REFUSAL: the unmounted mount, the missing source — the run's own
+ * sentences, thrown by the guards below and answered 400 at the door. Typed
+ * on purpose: the route must not read an internal fault (a broken executor,
+ * a bug in the parser) as "the operator's request was invalid" and dress it
+ * up as a 400. Only what this class carries is the operator's to fix.
+ */
+export class PreviewRefusal extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PreviewRefusal'
+  }
+}
 
 /**
  * The fields a preview needs of a task — the stored task satisfies them and
@@ -91,11 +110,14 @@ export interface CloudPreviewDeps {
 }
 
 /**
- * Preview one cloud sync. THROWS on a guard refusal (the unmounted mount,
- * the missing source — the run's own sentences, which the route answers 400
- * with); a rclone FAILURE (an unknown remote, an auth failure) is NOT a
- * throw: the preview is a read, and its answer carries rclone's error lines
- * in `errors` with the counters it reported. On the wall ceiling it returns
+ * Preview one cloud sync. Throws a {@link PreviewRefusal} on a guard refusal
+ * (the unmounted mount, the missing source — the run's own sentences, which
+ * the route answers 400 with, and the ONLY throw the route reads as the
+ * operator's fault); a rclone FAILURE (an unknown remote, an auth failure) is
+ * NOT a throw: the preview is a read, and its answer carries rclone's error
+ * lines in `errors` with the counters it reported — and when rclone failed
+ * without logging a line at all, the run's own failure sentence instead, so a
+ * dead child never reads as "nothing to do". On the wall ceiling it returns
  * what was parsed so far with `truncated: true`, never an error.
  */
 export async function previewCloudSync(
@@ -110,13 +132,13 @@ export async function previewCloudSync(
   const guardFacts = await readSourceGuardFacts(executor, deps.fstabPath)
   const refusal = guardSourcePath(task.source, guardFacts)
   if (refusal)
-    throw new Error(refusal)
+    throw new PreviewRefusal(refusal)
 
   // The source must be a DIRECTORY that exists — LIVE. A preview takes no
   // snapshot, so this is the same check the run makes, on the live tree.
   const dirStat = await stat(task.source).catch((err: NodeJS.ErrnoException) => err)
   if (dirStat instanceof Error || !dirStat.isDirectory())
-    throw new Error(missingSourceRefusal(task.source))
+    throw new PreviewRefusal(missingSourceRefusal(task.source))
 
   // Deliberately ABSENT: the empty-source guard. A `sync` preview of an empty
   // source reporting "would delete everything" is the point.
@@ -133,14 +155,41 @@ export async function previewCloudSync(
     ...args,
   ])
   const stats = finalStats(log)
+  const truncated = exitCode === TIMEOUT_EXIT_CODE
   return {
     transfers: stats.transfers,
     bytes: stats.bytes,
     checks: stats.checks,
     deletes: stats.deletes,
+    // The reader already stopped at the cap; the slice is belt and braces
+    // against a future caller handing over a state built some other way.
     deletedFiles: log.skippedDeletes.slice(0, DELETED_FILES_CAP),
-    deletedTotal: log.skippedDeletes.length,
-    errors: log.errorLines,
-    truncated: exitCode === TIMEOUT_EXIT_CODE,
+    deletedTotal: log.skippedDeleteCount,
+    errors: previewErrors(task.mode, exitCode, truncated, log),
+    truncated,
   }
+}
+
+/**
+ * The `errors` the answer carries. rclone's own error lines when it logged
+ * any — and, when it FAILED without logging one, a sentence saying so.
+ *
+ * The case this exists for: a run that dies before its JSON logger is up (a
+ * panic, a pre-logger message), that is killed by a signal (exit 1, empty
+ * output), or that `timeout` itself could not start (125/126/127). All of
+ * those print no `stats` object and no error line, so the naive answer is
+ * all-zero counters with `errors: []` — byte-identical to an honest "nothing
+ * to do", which is the one lie a preview must never tell. `rcloneFailureMessage`
+ * is the RUN's own sentence (it falls back to the last raw line), so the
+ * operator reads the same words in both places.
+ *
+ * Not an error: the wall ceiling (`truncated` says what happened, and what
+ * was parsed by then is real), and exits 0 / 9 — rclone's two completions.
+ */
+function previewErrors(mode: string, exitCode: number, truncated: boolean, log: RcloneLogState): string[] {
+  if (log.errorLines.length)
+    return log.errorLines
+  if (truncated || rcloneRunCompleted(exitCode))
+    return []
+  return [rcloneFailureMessage(mode, exitCode, log)]
 }

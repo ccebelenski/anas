@@ -563,12 +563,15 @@ describe('cloud remotes routes (rclone.1)', () => {
         await rm(bareDir, { recursive: true, force: true })
     })
 
-    it('the mutation and test doors consult the availability probe → 503 with the install sentence', async () => {
+    it('the mutation, test and PREVIEW doors consult the availability probe → 503 with the install sentence', async () => {
       await bare({ rcloneAvailable: async () => false })
       for (const req of [
         { method: 'POST', url: '/v1/cloud/remotes/test', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'gt' }) },
         { method: 'POST', url: '/v1/cloud/remotes', headers: JSON_HEADERS, payload: JSON.stringify({ name: 'gt', type: 'sftp', options: {} }) },
         { method: 'DELETE', url: '/v1/cloud/remotes/gt', headers: IDENTITY },
+        // The dry-run preview is rclone's own binary too: a node without it
+        // has a broken install, not a preview that quietly reports nothing.
+        { method: 'POST', url: '/v1/cloud/tasks/preview', headers: JSON_HEADERS, payload: JSON.stringify({ source: '/tank/pictures', remote: 'gt' }) },
       ] as const) {
         const res = await app.inject(req)
         assert.equal(res.statusCode, 503, req.url)

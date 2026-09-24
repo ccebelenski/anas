@@ -499,6 +499,10 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
       const err = await refused.json()
       expect(err.error.message).toContain(`${UNMOUNTED} is a mount defined in /etc/fstab but not mounted right now`)
       expect(err.error.message).toContain(`Mount ${UNMOUNTED} and run it again.`)
+
+      // The FAILING preview (a dry run rclone itself cannot complete) is
+      // proven in the wrong-password test below — BAD_REMOTE is created
+      // there, and this spec runs serially.
     }
     finally {
       await ctx.dispose()
@@ -610,6 +614,37 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
       expect(failure).toContain(`Failed to create file system for "${BAD_REMOTE}:dst/fail"`)
       expect(failure).toContain('couldn\'t connect SSH')
       expect(failure, 'no secret rides the failure message').not.toContain('wrong-password')
+
+      // The FAILING PREVIEW (rclone.2 addendum, fix batch 2026-09-24). It
+      // belongs with the preview test above, but BAD_REMOTE is created here —
+      // and the spec is serial, so this is the first place it exists. The
+      // shape under test: a dry run that fails is still 200 (a preview is a
+      // read), and its `errors` carry rclone's OWN sentence. A preview that
+      // answered zero counters with an empty `errors` would be
+      // byte-identical to an honest "nothing to do", which is the one lie
+      // this endpoint must never tell.
+      const failedPreview = await ctx.post(`${V1}/cloud/tasks/preview`, {
+        data: { source: SRC, remote: BAD_REMOTE, path: 'dst/fail', mode: 'copy' },
+      })
+      expect(failedPreview.status(), await failedPreview.text()).toBe(200)
+      const bad = (await failedPreview.json()).data
+      expect(bad.errors.length, 'the failure is reported, not swallowed').toBeGreaterThan(0)
+      expect(bad.errors[0]).toMatch(/NewFs|couldn't connect SSH/)
+      expect(bad.truncated, 'rclone\'s own retries finish inside the 120 s ceiling').toBe(false)
+      expect(bad.transfers).toBe(0)
+      expect(bad.bytes).toBe(0)
+      expect(bad.checks).toBe(0)
+      expect(bad.deletes).toBe(0)
+      expect(bad.deletedFiles).toEqual([])
+      expect(bad.deletedTotal).toBe(0)
+      // GROUND TRUTH OWED: the first run of this spec must capture rclone's
+      // own stderr for this dry run and save it VERBATIM as
+      // `packages/daemon/src/fixtures/rclone/dry-run-auth-fail-1.60.1.log`
+      // (`rclone copy <SRC> gtbad:dst/fail --dry-run --use-json-log
+      // --stats 30s --stats-log-level NOTICE --config /etc/anas/rclone.conf
+      // --ask-password=false` on the node, stderr only). The unit test in
+      // `cloud-preview.test.ts` reads that file when it exists and says in
+      // its own name when it is still working from the hand-written shape.
 
       // The notification. PVE::Notify logs its outcome from the perl child in
       // anasd's cgroup, so the daemon's own journal carries the call; a

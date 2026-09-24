@@ -414,7 +414,9 @@ export type CloudSyncPreviewTask = z.infer<typeof CloudSyncPreviewTask>
 /**
  * `POST /v1/cloud/tasks/preview` — the dry run. Either a SAVED task by `name`
  * or the task INLINE (the wizard's unsaved form). A body carrying both previews
- * the saved task — the `name` door wins.
+ * the INLINE form — a `source` on the body is the operator looking at edits,
+ * and answering with the saved task's numbers under them would be a lie. The
+ * saved-task arm is `name` and nothing else.
  *
  * The two halves are exported as separate schemas on purpose: a `z.union`
  * failure collapses to a root "Invalid input" issue, and a 400 that cannot

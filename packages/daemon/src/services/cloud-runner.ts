@@ -192,6 +192,16 @@ export function errorLineOf(entry: Record<string, unknown>): string | null {
   return object ? `${object}: ${msg}` : msg
 }
 
+/**
+ * The cap on the would-be-delete NAMES the reader keeps. A whole-tree delete
+ * can name millions of files, and the operator reading the answer wants a
+ * sample with the count, not a wall of names — so the reader stops collecting
+ * names at the cap while `skippedDeleteCount` keeps counting. Defined HERE,
+ * next to the code that enforces it, and re-exported by `cloud-preview.ts`:
+ * the reader and the answer must never disagree about the number.
+ */
+export const DELETED_FILES_CAP = 200
+
 /** What one finished (or in-flight) read of rclone's log amounts to. */
 export interface RcloneLogState {
   /** The most recent stats object — the LAST one is the run's result. */
@@ -205,8 +215,18 @@ export interface RcloneLogState {
    * deletes a `--dry-run` reports (GT 2026-09-24: every would-be delete is
    * exactly such an object). A real run prints none, so this stays empty
    * there and the preview's `deletedFiles` has one source.
+   *
+   * CAPPED at {@link DELETED_FILES_CAP} names: the reader is fed by a live
+   * child's stderr, so an uncapped array would let a whole-tree delete grow
+   * the daemon's heap by the destination's file count. The number is
+   * {@link skippedDeleteCount}, which is never capped.
    */
   skippedDeletes: string[]
+  /**
+   * How many `skipped: delete` lines were read, whether or not their names
+   * were kept — the honest total behind the capped {@link skippedDeletes}.
+   */
+  skippedDeleteCount: number
 }
 
 /**
@@ -218,8 +238,14 @@ export class RcloneLogReader {
   private buffer = ''
   readonly errorLines: string[] = []
   readonly rawLines: string[] = []
-  /** The `object` of every `skipped: delete` line (a dry run's would-be deletes). */
+  /**
+   * The `object` of the first {@link DELETED_FILES_CAP} `skipped: delete`
+   * lines (a dry run's would-be deletes). The names stop at the cap; the
+   * count does not.
+   */
   readonly skippedDeletes: string[] = []
+  /** Every `skipped: delete` line read, capped names or not. */
+  skippedDeleteCount = 0
   stats: RcloneStats | null = null
 
   /**
@@ -278,8 +304,13 @@ export class RcloneLogReader {
     // `skipped: delete` object naming the file (`skipped: copy` lines are the
     // would-be TRANSFERS — rclone counts them in `stats.transfers`, so they
     // are not collected here twice).
-    if (entry.skipped === 'delete' && typeof entry.object === 'string' && entry.object.trim() !== '')
-      this.skippedDeletes.push(entry.object.trim())
+    // The NAMES stop at the cap (an unbounded array here would grow with the
+    // destination's file count, fed by a live child); the COUNT never does.
+    if (entry.skipped === 'delete' && typeof entry.object === 'string' && entry.object.trim() !== '') {
+      this.skippedDeleteCount++
+      if (this.skippedDeletes.length < DELETED_FILES_CAP)
+        this.skippedDeletes.push(entry.object.trim())
+    }
     const stats = statsOf(entry)
     if (stats)
       this.stats = stats
@@ -287,7 +318,13 @@ export class RcloneLogReader {
   }
 
   state(): RcloneLogState {
-    return { stats: this.stats, errorLines: [...this.errorLines], rawLines: [...this.rawLines], skippedDeletes: [...this.skippedDeletes] }
+    return {
+      stats: this.stats,
+      errorLines: [...this.errorLines],
+      rawLines: [...this.rawLines],
+      skippedDeletes: [...this.skippedDeletes],
+      skippedDeleteCount: this.skippedDeleteCount,
+    }
   }
 }
 
@@ -638,7 +675,7 @@ export async function execRcloneLog(
   // whose reader has already consumed the same bytes from the chunks. A log
   // whose only objects were `skipped` lines must re-read too, or a no-tee
   // executor would report the would-be deletes as zero.
-  if (!log.stats && !log.errorLines.length && !log.skippedDeletes.length && r.stderr)
+  if (!log.stats && !log.errorLines.length && !log.skippedDeleteCount && r.stderr)
     return { exitCode: r.exitCode, log: readRcloneLog(r.stderr) }
   return { exitCode: r.exitCode, log }
 }

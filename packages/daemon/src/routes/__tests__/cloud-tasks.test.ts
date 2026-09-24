@@ -509,5 +509,65 @@ describe('cloud sync task routes (rclone.2)', () => {
       })
       assert.equal(res.statusCode, 401)
     })
+
+    it('identity is checked BEFORE the store read: an unknown task without identity is 401, not 404', async () => {
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/tasks/preview',
+        headers: { 'content-type': 'application/json' },
+        payload: { name: 'nosuch' },
+      })
+      assert.equal(res.statusCode, 401, 'the door\'s own order: who, then what')
+    })
+
+    it('a body carrying BOTH `name` and an inline form previews the INLINE one — no store read, no 404', async () => {
+      // The wizard previewing unsaved edits to a task that IS saved: the
+      // numbers must be the EDITS'. `name` alone is the saved-task arm.
+      await createTask({ source: srcDir, path: 'dst/saved' })
+      await replayDryRun(DRY_RUN_DELETE_LOG)
+
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/tasks/preview',
+        headers: JSON_HEADERS,
+        payload: { name: 'offsite', source: srcDir, remote: 'gt', path: 'dst/inline', mode: 'sync' },
+      })
+      assert.equal(res.statusCode, 200, res.body)
+      const call = mockOf(server).calls.find(c => c.command === TIMEOUT)
+      assert.ok(call, 'the dry run was issued')
+      assert.deepEqual(call!.args.slice(2, 5), ['sync', srcDir, 'gt:dst/inline'], 'the INLINE destination and mode, not the saved task\'s')
+
+      // And a name that is NOT saved rides along with an inline form just the
+      // same — the inline arm never touches the store, so there is no 404.
+      await replayDryRun(DRY_RUN_DELETE_LOG)
+      const unsaved = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/tasks/preview',
+        headers: JSON_HEADERS,
+        payload: { name: 'nosuch', source: srcDir, remote: 'gt', path: 'dst/inline', mode: 'copy' },
+      })
+      assert.equal(unsaved.statusCode, 200, unsaved.body)
+    })
+
+    it('an INTERNAL fault inside the preview is a 500, not a 400 dressed up as the operator\'s mistake', async () => {
+      // Only the typed guard refusal is the operator's to fix. A broken
+      // executor answered 400 would send them looking at their own input.
+      const mock = mockOf(server)
+      const orig = mock.exec.bind(mock)
+      mock.exec = async (cmd: string, args: string[], opts?: Parameters<typeof orig>[2]): Promise<ExecResult> => {
+        if (cmd === TIMEOUT)
+          throw new Error('boom')
+        return orig(cmd, args, opts)
+      }
+
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/tasks/preview',
+        headers: JSON_HEADERS,
+        payload: { source: srcDir, remote: 'gt' },
+      })
+      assert.equal(res.statusCode, 500, res.body)
+      assert.notEqual((res.json() as { error?: { code?: string } }).error?.code, 'VALIDATION_ERROR')
+    })
   })
 })

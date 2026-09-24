@@ -28,7 +28,7 @@ import {
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
-import { previewCloudSync } from '../services/cloud-preview.js'
+import { previewCloudSync, PreviewRefusal } from '../services/cloud-preview.js'
 import { runCloudSync } from '../services/cloud-runner.js'
 import {
   DEFAULT_SYSTEMD_DIR,
@@ -551,6 +551,10 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
   // run's sentence); the empty-source guard does NOT — a sync preview that
   // shows it would delete everything is the point.
   server.post('/cloud/tasks/preview', async (request, reply) => {
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
     // Fastify parses a JSON primitive ("x") happily — it is not an object,
     // and `'name' in body` would throw on it. Treat it as no body at all.
     const body = typeof request.body === 'object' && request.body !== null
@@ -561,8 +565,13 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     // union failure collapses to a root "Invalid input", and a 400 that cannot
     // name the field the operator mistyped is half an answer (the task doors'
     // refusals all name the thing).
+    //
+    // The INLINE arm wins whenever the body carries a `source`: a wizard that
+    // previews its unsaved form while a task of that name is already saved
+    // would otherwise be shown the SAVED task's numbers under the edits it is
+    // looking at. The saved-task arm is `name` and nothing else.
     let task: CloudSyncTask | CloudSyncPreviewTask
-    if ('name' in body) {
+    if ('name' in body && !('source' in body)) {
       const nameParsed = BackupName.safeParse(body.name)
       if (!nameParsed.success) {
         reply.code(400)
@@ -584,10 +593,6 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       task = parsed.data
     }
 
-    const identity = requireIdentity(request, reply)
-    if (!identity)
-      return
-
     let data: CloudSyncPreviewResult | undefined
     try {
       data = await guard503(reply, async () => {
@@ -596,10 +601,15 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       })
     }
     catch (err) {
-      // A guard refusal: the unmounted mount, the missing source — the run's
-      // own sentence, answered 400 at the door (the run throws it into a job).
+      // ONLY a guard refusal: the unmounted mount, the missing source — the
+      // run's own sentence, answered 400 at the door (the run throws it into
+      // a job). Anything else is an internal fault and must reach Fastify's
+      // 500; a broken executor dressed up as "invalid request" would send the
+      // operator looking at their own input for a bug that is ours.
+      if (!(err instanceof PreviewRefusal))
+        throw err
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: err instanceof Error ? err.message : String(err) } }
+      return { error: { code: 'VALIDATION_ERROR', message: err.message } }
     }
     if (data === undefined)
       return undefined

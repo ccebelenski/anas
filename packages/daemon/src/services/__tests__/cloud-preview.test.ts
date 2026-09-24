@@ -1,6 +1,7 @@
 import type { CloudSyncTask } from '@anas/shared'
 import type { CloudPreviewDeps } from '../cloud-preview.js'
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -122,6 +123,29 @@ async function fixtureText(name: string): Promise<string> {
   return readFile(join(FIXTURES, name), 'utf-8')
 }
 
+/**
+ * The CAPTURED stderr of a dry run against a wrong-password remote. The
+ * integration spec (`cloud-tasks-api.spec.ts`, the wrong-password test) is
+ * where it comes from: the job that first runs that spec saves rclone's own
+ * stderr here VERBATIM. Until then the test below uses the hand-written shape
+ * and says so in its own name — the fixture is still owed, and a test name
+ * that claims ground truth it does not have is worse than no fixture.
+ */
+const AUTH_FAIL_FIXTURE = 'dry-run-auth-fail-1.60.1.log'
+const AUTH_FAIL_CAPTURED = existsSync(join(FIXTURES, AUTH_FAIL_FIXTURE))
+
+/** rclone's auth-failure stderr: the capture when it exists, else the shape. */
+async function authFailLog(): Promise<string> {
+  if (AUTH_FAIL_CAPTURED)
+    return fixtureText(AUTH_FAIL_FIXTURE)
+  return JSON.stringify({
+    level: 'error',
+    msg: 'Failed to create file system for "gtbad:dst/fail": NewFs: couldn\'t connect SSH: ssh: handshake failed: ssh: unable to authenticate',
+    source: 'fs/config.go:123',
+    time: '2026-09-24T22:00:00.000000+00:00',
+  })
+}
+
 // ---------------------------------------------------------------------------
 //  The reader: the `skipped: delete` collection
 // ---------------------------------------------------------------------------
@@ -140,6 +164,27 @@ describe('RcloneLogReader — the would-be deletes (rclone.2 addendum)', () => {
     both.push(`${fresh}${del}`)
     both.flush()
     assert.deepEqual(both.skippedDeletes, ['b.bin'], 'exactly the one would-be delete, named')
+  })
+
+  it('stops collecting NAMES at the cap while the COUNT keeps going — the reader never grows with the destination', () => {
+    const reader = new RcloneLogReader()
+    reader.push(Array.from({ length: 250 }, (_, i) => JSON.stringify({
+      level: 'warning',
+      msg: 'Skipped delete as --dry-run is set (size 34)',
+      object: `gone/file-${String(i).padStart(3, '0')}.txt`,
+      objectType: '*sftp.Object',
+      size: 34,
+      skipped: 'delete',
+      source: 'operations/operations.go:2404',
+      time: '2026-09-24T22:08:07.000000+00:00',
+    })).join('\n'))
+    reader.flush()
+    // The READER's own array, not the answer's slice: an uncapped reader fed
+    // by a live child's stderr would hold one string per would-be delete.
+    assert.equal(reader.skippedDeletes.length, DELETED_FILES_CAP, 'the reader itself stopped at 200')
+    assert.equal(reader.skippedDeleteCount, 250, 'and counted every one of them')
+    assert.equal(reader.skippedDeletes.at(-1), 'gone/file-199.txt', 'the FIRST 200, in rclone\'s order')
+    assert.equal(reader.state().skippedDeleteCount, 250, 'the count survives into the state')
   })
 
   it('a `skipped: delete` line without an `object` (or a blank one) is not collected', () => {
@@ -226,20 +271,110 @@ describe('previewCloudSync — the captured 1.60.1 dry-run logs', () => {
     }
   })
 
-  it('a preview that fails at rclone answers with rclone\'s error lines, not a throw', async () => {
+  it(`a preview that fails at rclone answers with rclone's error lines, not a throw (${AUTH_FAIL_CAPTURED ? `captured ${AUTH_FAIL_FIXTURE}` : 'hand-written shape — the 1.60.1 capture is still owed'})`, async () => {
     const h = await harness()
     try {
-      replayRclone(h.mock, JSON.stringify({
-        level: 'error',
-        msg: 'Failed to create file system for "gt:dst/preview": didn\'t find section in config file',
-        source: 'fs/config.go:123',
-        time: '2026-09-24T22:00:00.000000+00:00',
-      }), 1)
+      replayRclone(h.mock, await authFailLog(), 1)
       const result = await previewCloudSync(h.mock, deps(h))
       assert.equal(result.transfers, 0, 'no stats object was printed — the counters are zeros')
-      assert.equal(result.errors.length, 1)
-      assert.match(result.errors[0]!, /didn't find section in config file/)
+      assert.ok(result.errors.length >= 1, 'rclone\'s own error line came back')
+      assert.match(result.errors.join('\n'), /couldn't connect SSH|didn't find section in config file|NewFs/)
       assert.equal(result.truncated, false)
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+//  The exit code: a failure that logged NOTHING must not read as "nothing to do"
+// ---------------------------------------------------------------------------
+
+describe('previewCloudSync — a non-JSON failure carries the run\'s own sentence', () => {
+  it('exit 1 with EMPTY output: zero counters AND the failure sentence, never a silent all-clear', async () => {
+    const h = await harness()
+    try {
+      // A signal death, or a child that never reached its JSON logger: no
+      // stats object, no error line, nothing on stderr at all. Without the
+      // sentence this answer is byte-identical to an honest "nothing to do".
+      replayRclone(h.mock, '', 1)
+      const result = await previewCloudSync(h.mock, deps(h))
+      assert.deepEqual(
+        { transfers: result.transfers, bytes: result.bytes, checks: result.checks, deletes: result.deletes },
+        { transfers: 0, bytes: 0, checks: 0, deletes: 0 },
+        'rclone reported nothing, so the counters stay zero',
+      )
+      assert.equal(result.errors.length, 1, 'and the answer says the run FAILED')
+      assert.equal(result.errors[0], 'rclone copy failed (exit 1)')
+      assert.equal(result.truncated, false)
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('exit 1 with a RAW non-JSON line (a panic, a pre-logger message): the line rides the sentence', async () => {
+    const h = await harness()
+    try {
+      replayRclone(h.mock, 'panic: runtime error: invalid memory address or nil pointer dereference\n', 1)
+      const result = await previewCloudSync(h.mock, deps(h))
+      assert.equal(result.errors.length, 1)
+      assert.match(result.errors[0]!, /^rclone copy failed \(exit 1\): /)
+      assert.match(result.errors[0]!, /panic: runtime error/, 'rclone\'s own last line, verbatim')
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('`timeout` failing to start the child (127) is a failure too, not an empty look', async () => {
+    const h = await harness()
+    try {
+      replayRclone(h.mock, '/usr/bin/timeout: failed to run command \'/usr/bin/rclone\': No such file or directory\n', 127)
+      const result = await previewCloudSync(h.mock, deps(h))
+      assert.equal(result.errors.length, 1)
+      assert.match(result.errors[0]!, /exit 127/)
+      assert.match(result.errors[0]!, /failed to run command/)
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('exit 9 ("nothing to transfer") is a COMPLETION: no errors invented', async () => {
+    const h = await harness()
+    try {
+      replayRclone(h.mock, await fixtureText('dry-run-copy-1.60.1.log'), 9)
+      const result = await previewCloudSync(h.mock, deps(h))
+      assert.deepEqual(result.errors, [], 'rclone\'s other success code')
+      assert.equal(result.checks, 2, 'and the counters are still rclone\'s')
+      assert.equal(result.truncated, false)
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('exit 124 is the CEILING, not a failure: truncated, with no invented error', async () => {
+    const h = await harness()
+    try {
+      replayRclone(h.mock, '', TIMEOUT_EXIT_CODE)
+      const result = await previewCloudSync(h.mock, deps(h))
+      assert.equal(result.truncated, true)
+      assert.deepEqual(result.errors, [], 'the wall ceiling is reported by `truncated`, never as an error')
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('an error line rclone DID log wins over the sentence — its own words, not ours', async () => {
+    const h = await harness()
+    try {
+      replayRclone(h.mock, await authFailLog(), 1)
+      const result = await previewCloudSync(h.mock, deps(h))
+      assert.ok(!result.errors.some(e => e.startsWith('rclone copy failed')), 'no wrapper sentence when rclone spoke for itself')
     }
     finally {
       await h.cleanup()
