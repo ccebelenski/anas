@@ -20,13 +20,11 @@ import {
 /**
  * Story vdevs.2 — POST /v1/pools/:name/vdevs/remove.
  *
- * Two halves, for one reason: the zpool-status parser on main does not yet
- * surface the pool-level `logs`/`special`/`dedup` sections (that is story
- * vdevs.1, landing in parallel), so a log/special/dedup case cannot reach the
- * route through a fixture yet. Those roles are covered against a
- * `ParsedPoolStatus` built by hand — the parser's own output type — through the
- * SAME `resolveVdev` + `isRemovableVdevRole` pair the route asks. Cache and
- * spare go the whole way through the route, the parser and the mock executor.
+ * Two halves. Cache and spare go the whole way through the route, the parser
+ * and the mock executor, against the shipped `zpool status -j` fixture. The
+ * log, special and dedup roles are covered against a `ParsedPoolStatus` built
+ * by hand — the parser's own output type — through the SAME `resolveVdev` +
+ * `isRemovableVdevRole` pair the route asks.
  */
 
 const ZPOOL = '/usr/sbin/zpool'
@@ -114,9 +112,6 @@ function serverWith(statuses: StatusDoc[], remove?: ExecResult): ReturnType<type
   mock.clearFixtures()
   mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: mockFixtures.zpoolList() })
   mock.addFixture({ command: ZPOOL, args: ['status', '-jv'], results: statuses.map(asResult) })
-  // Readable boot facts with no bootfs: the system-pool rule stays inactive
-  // (an unreadable probe would tighten every pool to hands-off).
-  mock.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
   mock.addFixture({ command: ZPOOL, args: undefined, result: remove ?? { stdout: '', stderr: '', exitCode: 0 } })
   return server
 }
@@ -356,8 +351,11 @@ describe('remove-vdev endpoint: POST /v1/pools/:name/vdevs/remove', () => {
   })
 })
 
-// --- PVE-owned pools are hands-off (pvepool.1, as everywhere) --------------
-describe('remove-vdev: a PVE-owned pool is refused', () => {
+// --- PVE-managed pools are hands-off (story 3.25, the whole-pool rule) -----
+//
+// A pool any `zfspool` storage in storage.cfg names belongs to PVE — the same
+// door the mountpoint verb stands behind, and the same 400.
+describe('remove-vdev: a PVE-managed pool is refused', () => {
   let server: ReturnType<typeof createServer> | undefined
   let dir: string | undefined
 

@@ -1396,19 +1396,19 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    // SYSTEM-POOL GUARD (story pvepool.1) then the PVE-ownership guard — the
-    // same two doors export/destroy and the dataset verbs stand behind. PVE
-    // owns the topology of the pools it manages; ANAS does not reshape them.
-    const pve = await pveFootprint()
-    const systemBlock = await systemPoolBlock(poolName)
-    if (systemBlock) {
+    // ROOT-POOL GUARD then the PVE-ownership guard — the two doors this branch's
+    // pool verbs stand behind. Destroying the root pool is a Level-1 block with
+    // no override (Principle 14), and reshaping its topology is the same class
+    // of change; PVE owns the topology of the pools it manages, so ANAS keeps
+    // its hands off those the way the mountpoint verb does (story 3.25).
+    if (isRootPool(poolName)) {
       reply.code(409)
-      return { error: { code: 'CONFLICT', reason: systemBlock.reason, message: systemBlock.message } }
+      return { error: { code: 'PROTECTED_RESOURCE', message: `Cannot remove a vdev from the root pool '${poolName}'` } }
     }
-    const owned = pve.ownershipOf(poolName)
-    if (owned) {
+    const pveStorages = await poolPveStorages(poolName)
+    if (pveStorages.length > 0) {
       reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: owned.reason } }
+      return { error: { code: 'VALIDATION_ERROR', message: `Pool '${poolName}' is managed by PVE (${pveStorages.map(s => s.storage).join(', ')}) — PVE owns its topology and ANAS keeps hands off (story 3.25)` } }
     }
 
     const statusResult = await executor.exec(ZPOOL, ['status', '-jv'])
