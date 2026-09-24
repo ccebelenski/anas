@@ -552,10 +552,42 @@ vendor-specific — shown only when the attribute is present, never inferred
 (repeated random reads benefit, sequential I/O bypasses), and the SSD is a
 consumable (cached blocks are rewritten as the working set rotates).
 
-**Open before dispatch:** (a) the cache SSD failing while the pool is LIVE —
-dm-cache does not bypass a failing cache device; expect I/O errors on the pool
-until uncached; ground-truth with dm-flakey/dm-error and decide whether the
-daemon uncaches on detection or surfaces a one-click repair; (b) whether a
-cache slice must be published/verified like a band slice (issue #12 pattern —
-the cache disk is otherwise idle, so `BLKRRPART` should succeed, verify).
+**Resolved 2026-09-24 (GT-18…GT-24, `AHR-GROUND-TRUTH.md` §18).** (a) **dm-cache does NOT
+bypass a dead cache device** (GT-19): every read on the pool returns EIO within the
+second, promoted or not; btrfs stays read-write under a pure read load and flips to
+forced read-only on the first write (`aborting current metadata transaction`). The
+§13 recovery is the whole repair and it is live: `lvconvert --uncache` succeeds with
+the device absent and the pool mounted, no `--force`, in ~0.25 s, and reads recover on
+the next I/O (GT-20); `vgreduce --removemissing` then drops the ghost PV. What it
+cannot undo is btrfs's forced-readonly flag: `remount,rw` is refused after an error,
+only `umount` + `mount` restores writes. **Design calls:** the daemon uncaches
+AUTOMATICALLY on detection — unattended-safe by construction (dirty = 0) and it
+restores reads instantly — through an EVENT, never a poller: a udev rule on the
+cache disk's removal (the `anas-md-event.sh` pattern) calls the daemon, which reads
+`dmsetup status` (`cache Error` is the one honest health token — `lvs` counters go
+STALE, not absent, on a dead cache) and runs uncache → vgreduce → notification
+("cache device <id> failed; pool <p> running uncached"); the boot rung does the same
+at activation; every AHR status READ also reports the truth from `dmsetup status`
+(`cache: failed` ⇒ pool `degraded`, warning card) — today it reports `healthy` with
+the pool unable to serve a byte (GT-23), the load-bearing fix. If btrfs went
+read-only, the pool detail says so and offers **Remount** (unmount + mount, an
+operator verb: open share handles break, refused while a LUN holds the pool); the
+notification names both facts. A cache disk that RETURNS carries an outdated PV label
+(`WARNING: outdated PV … seqno`); the repair and the next attach wipe it. (b) **A cache
+slice on an idle disk publishes immediately** with `sgdisk` + `udevadm settle`, the
+create path's pair — the issue-#12 retry dance is a holders problem, not a cache one
+(GT-21; `partprobe` is not installed on PVE 9). `cache-attach` needs `wipefs -a` on
+the slice before `pvcreate` (a stale signature makes `pvcreate` abort non-
+interactively) and `lvconvert -y`. `cache-detach` must DELETE the partition
+(`sgdisk -d` / `--zap-all`), not merely `pvremove` + `wipefs`, or the disk keeps
+reading `other` instead of `available` (GT-22). **Consumers:** the cache disk is
+`in-use`, role `cache`, attributed to its pool (today `other`, unattributed — safe by
+accident since `isComposableDisk()` admits only `available`); `vg.sizeBytes` includes
+the cache slice — capacity derives from the LV, never the VG (audit the consumers);
+telemetry (11.15) keeps resolving `dm-0` but the pool row legitimately exceeds the sum
+of its bands by the cache hits (GT-24) — the pool-detail `cache` block is where the
+difference is shown, and its counters are gated on `dmsetup status` not reading
+`Error`. Policy wording: `lvs` is truth for mode/policy (`smq`; the "sequential I/O
+bypasses" note was an `mq` property and is dropped), `dmsetup status` is truth for
+health.
 
