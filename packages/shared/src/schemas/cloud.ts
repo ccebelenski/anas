@@ -276,10 +276,9 @@ export const CloudSyncTaskRequest = z.preprocess((raw) => {
     }
     // An empty bandwidth limit is what a cleared dialog field sends, and it
     // means "no limit" — which is what an ABSENT field already means, so it
-    // normalizes to absent rather than riding the unit JSON as `""` forever.
-    if (o.bwlimit === '' || o.bwlimit === null)
-      delete o.bwlimit
-    return o
+    // normalizes to absent rather than riding the unit JSON as `""` forever
+    // (one rule, shared with the preview's inline form).
+    return normalizeEmptyBwlimit(o)
   }
   return raw
 }, CloudSyncTask)
@@ -375,3 +374,85 @@ export type CloudSyncRunResult = z.infer<typeof CloudSyncRunResult>
  */
 export const CloudSyncRunRequest = BackupRunRequest
 export type CloudSyncRunRequest = BackupRunRequest
+
+// ---------------------------------------------------------------------------
+//  Dry-run PREVIEW (rclone.2 addendum, operator 2026-09-24)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the wizard's unsaved form sends as "no limit": a cleared bandwidth
+ * field rides as `''` (or null), which means ABSENT — the same normalization
+ * the task's write door and the preview's inline form both apply.
+ */
+function normalizeEmptyBwlimit(o: Record<string, unknown>): Record<string, unknown> {
+  if (o.bwlimit === '' || o.bwlimit === null)
+    delete o.bwlimit
+  return o
+}
+
+/**
+ * The INLINE half of a preview request — the stored task's fields with the
+ * task-MANAGEMENT fields omitted (there is nothing to save, so no name and no
+ * schedule; `notify` and `enabled` are unit facts a dry run never reads).
+ * Everything that IS here is `.omit`ted straight off {@link CloudSyncTask},
+ * so the defaults (`copy`, an empty remote path, no excludes) come from the
+ * ONE place they are defined.
+ */
+export const CloudSyncPreviewTask = z.preprocess((raw) => {
+  if (raw && typeof raw === 'object')
+    return normalizeEmptyBwlimit({ ...(raw as Record<string, unknown>) })
+  return raw
+}, CloudSyncTask.omit({
+  name: true,
+  schedule: true,
+  cadence: true,
+  notify: true,
+  enabled: true,
+}))
+export type CloudSyncPreviewTask = z.infer<typeof CloudSyncPreviewTask>
+
+/**
+ * `POST /v1/cloud/tasks/preview` — the dry run. Either a SAVED task by `name`
+ * or the task INLINE (the wizard's unsaved form). A body carrying both previews
+ * the saved task — the `name` door wins.
+ *
+ * The two halves are exported as separate schemas on purpose: a `z.union`
+ * failure collapses to a root "Invalid input" issue, and a 400 that cannot
+ * name the field the operator mistyped is half an answer. The route parses the
+ * arm the body actually carries.
+ */
+export const CloudSyncPreviewRequest = z.union([
+  z.object({ name: BackupName }),
+  CloudSyncPreviewTask,
+])
+export type CloudSyncPreviewRequest = z.infer<typeof CloudSyncPreviewRequest>
+
+/**
+ * What one dry run amounts to. Every count is rclone's own, from the LAST
+ * `stats` object of the `--dry-run` run — a would-be transfer is a `skipped:
+ * copy` line counted in `transfers`, a would-be delete a `skipped: delete`
+ * line (GT 2026-09-24, rclone 1.60.1). `deletedFiles` lists the would-be
+ * deletes by name, capped (the destination of a whole-tree delete can be
+ * large); `deletedTotal` is the uncapped count. `truncated` says the wall
+ * ceiling fired and everything reported is what rclone had logged by then —
+ * never an error.
+ */
+export const CloudSyncPreviewResult = z.object({
+  /** Would-be transfers (a `copy` run, or the adds of a `sync`). */
+  transfers: z.number().nonnegative(),
+  /** The bytes those transfers would move. */
+  bytes: z.number().nonnegative(),
+  /** Files rclone checked at the destination. */
+  checks: z.number().nonnegative(),
+  /** Would-be deletes at the destination (a `sync` only — `copy` never deletes). */
+  deletes: z.number().nonnegative(),
+  /** The files a `sync` would delete, by name — the first 200. */
+  deletedFiles: z.array(z.string()),
+  /** The total number of would-be deletes (`deletedFiles` is capped). */
+  deletedTotal: z.number().nonnegative(),
+  /** rclone's error-level log lines, verbatim and in order. */
+  errors: z.array(z.string()).default([]),
+  /** The 120 s ceiling fired: what is reported is what was parsed so far. */
+  truncated: z.boolean(),
+})
+export type CloudSyncPreviewResult = z.infer<typeof CloudSyncPreviewResult>

@@ -3,10 +3,11 @@ import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { createServer } from '../../server.js'
 import { RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
 
@@ -20,6 +21,12 @@ import { RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
 
 const SYSTEMCTL = '/usr/bin/systemctl'
 const SYSTEMD_ANALYZE = '/usr/bin/systemd-analyze'
+const FINDMNT = '/usr/bin/findmnt'
+const TIMEOUT = '/usr/bin/timeout'
+
+/** The captured sync-after-deletion dry-run log — one would-be delete (b.bin). */
+const DRY_RUN_DELETE_LOG
+  = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/rclone/dry-run-sync-delete-1.60.1.log')
 
 const IDENTITY = {
   'x-anas-user': 'root@pam',
@@ -62,6 +69,10 @@ describe('cloud sync task routes (rclone.2)', () => {
   let dir: string
   let systemdDir: string
   let configFile: string
+  /** The fstab the preview's source guard reads (a temp file, content per test). */
+  let fstab: string
+  /** A REAL directory: the preview requires its source to be a directory. */
+  let srcDir: string
   const saved: Record<string, string | undefined> = {}
 
   function setEnv(k: string, v: string) {
@@ -76,6 +87,14 @@ describe('cloud sync task routes (rclone.2)', () => {
     await writeFile(configFile, GT_SECTION, 'utf-8')
     setEnv('ANAS_RCLONE_CONFIG', configFile)
     setEnv('ANAS_SYSTEMD_DIR', systemdDir)
+    // The preview's source guard reads THIS file (content per test) — and the
+    // source it will be pointed at has to exist on this host for the door's
+    // directory check.
+    fstab = join(dir, 'fstab')
+    await writeFile(fstab, 'UUID=deadbeef / ext4 defaults 0 1\n', 'utf-8')
+    setEnv('ANAS_FSTAB_PATH', fstab)
+    srcDir = join(dir, 'src')
+    await mkdir(srcDir, { recursive: true })
     server = createServer({ mock: true, logger: false })
 
     const mock = mockOf(server)
@@ -378,6 +397,117 @@ describe('cloud sync task routes (rclone.2)', () => {
       const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
       assert.equal(job.status, 'completed', JSON.stringify(job.error))
       assert.ok(!(await readFile(configFile, 'utf-8')).includes('[gt]'))
+    })
+  })
+
+  describe('POST /v1/cloud/tasks/preview (rclone.2 addendum)', () => {
+    /** Replay one captured dry-run log for whatever `timeout` wraps. */
+    async function replayDryRun(stderrFile: string, exitCode = 0) {
+      mockOf(server).addFixture({
+        command: TIMEOUT,
+        result: { stdout: '', stderr: await readFile(stderrFile, 'utf-8'), exitCode },
+      })
+    }
+
+    it('previews a SAVED task by name and lists its would-be deletes — no job, 200', async () => {
+      await createTask({ source: srcDir })
+      await replayDryRun(DRY_RUN_DELETE_LOG)
+
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/preview', headers: JSON_HEADERS, payload: { name: 'offsite' } })
+      assert.equal(res.statusCode, 200, res.body)
+      const body = res.json() as { data: { transfers: number, bytes: number, checks: number, deletes: number, deletedFiles: string[], deletedTotal: number, errors: string[], truncated: boolean }, job?: unknown }
+      // The counters are rclone's final stats object from the captured log.
+      assert.deepEqual(
+        { transfers: body.data.transfers, bytes: body.data.bytes, checks: body.data.checks, deletes: body.data.deletes },
+        { transfers: 0, bytes: 0, checks: 3, deletes: 1 },
+      )
+      assert.deepEqual(body.data.deletedFiles, ['b.bin'])
+      assert.equal(body.data.deletedTotal, 1)
+      assert.deepEqual(body.data.errors, [])
+      assert.equal(body.data.truncated, false)
+      assert.equal(body.job, undefined, 'a preview is a read: it answers 200, never a 202 job')
+    })
+
+    it('previews the INLINE form and issues the run\'s own argv plus --dry-run', async () => {
+      await replayDryRun(DRY_RUN_DELETE_LOG)
+
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/tasks/preview',
+        headers: JSON_HEADERS,
+        payload: { source: srcDir, remote: 'gt', path: 'dst/preview', mode: 'sync' },
+      })
+      assert.equal(res.statusCode, 200, res.body)
+      assert.deepEqual((res.json() as { data: { deletedFiles: string[] } }).data.deletedFiles, ['b.bin'])
+
+      // The argv is the run's command, the live source, --dry-run.
+      const call = mockOf(server).calls.find(c => c.command === TIMEOUT)
+      assert.ok(call, 'the preview runs through the timeout ceiling')
+      assert.deepEqual(call!.args.slice(0, 5), ['120', RCLONE, 'sync', srcDir, 'gt:dst/preview'])
+      assert.equal(call!.args.at(-1), '--dry-run')
+      // And it read the LIVE tree: no snapshot machinery ran at all.
+      assert.ok(!mockOf(server).calls.some(c => c.command === '/usr/sbin/zfs'), 'no zfs call — a preview takes no snapshot')
+    })
+
+    it('404s for an unknown task name', async () => {
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/preview', headers: JSON_HEADERS, payload: { name: 'nosuch' } })
+      assert.equal(res.statusCode, 404)
+      assert.match((res.json() as { error: { message: string } }).error.message, /Cloud sync task 'nosuch' not found/)
+    })
+
+    it('400s on a bad body, naming the field', async () => {
+      // Neither arm: no name, no task.
+      const empty = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/preview', headers: JSON_HEADERS, payload: {} })
+      assert.equal(empty.statusCode, 400)
+      assert.match((empty.json() as { error: { message: string } }).error.message, /source/)
+
+      // The inline arm with a bad field: the field is named, as on the other doors.
+      const bad = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/tasks/preview',
+        headers: JSON_HEADERS,
+        payload: { source: 'relative/path', remote: 'gt' },
+      })
+      assert.equal(bad.statusCode, 400)
+      assert.match((bad.json() as { error: { message: string } }).error.message, /source/)
+
+      // The name arm with a bad name.
+      const badName = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/preview', headers: JSON_HEADERS, payload: { name: 'Not Valid' } })
+      assert.equal(badName.statusCode, 400)
+      assert.match((badName.json() as { error: { message: string } }).error.message, /name/)
+    })
+
+    it('refuses an unmounted-mount source with 400, naming the mount — and never issues the dry run', async () => {
+      // The boot-race shape the guard exists for: an fstab CIFS entry that is
+      // not in the mount table.
+      await writeFile(fstab, 'UUID=deadbeef / ext4 defaults 0 1\n//nas/pictures /mnt/pictures cifs nofail 0 0\n', 'utf-8')
+      mockOf(server).addFixture({
+        command: FINDMNT,
+        args: ['--json'],
+        result: { stdout: JSON.stringify({ filesystems: [{ target: '/', source: '/dev/sda1', fstype: 'ext4', options: 'rw' }] }), stderr: '', exitCode: 0 },
+      })
+
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/tasks/preview',
+        headers: JSON_HEADERS,
+        payload: { source: '/mnt/pictures', remote: 'gt' },
+      })
+      assert.equal(res.statusCode, 400)
+      const message = (res.json() as { error: { message: string } }).error.message
+      assert.match(message, /\/mnt\/pictures is a mount defined in \/etc\/fstab but not mounted right now/)
+      assert.match(message, /Mount \/mnt\/pictures and run it again\./)
+      assert.ok(!mockOf(server).calls.some(c => c.command === TIMEOUT), 'the dry run is never issued')
+    })
+
+    it('401s without identity', async () => {
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/tasks/preview',
+        headers: { 'content-type': 'application/json' },
+        payload: { source: srcDir, remote: 'gt' },
+      })
+      assert.equal(res.statusCode, 401)
     })
   })
 })

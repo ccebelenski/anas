@@ -98,8 +98,16 @@ export function rcloneDestination(task: Pick<CloudSyncTask, 'remote' | 'path'>):
  * exclude has to be: an rclone filter rule is relative to the source root by
  * definition, so the same pattern means the same thing whether the root is the
  * live tree or its snapshot.
+ *
+ * `dryRun` (the rclone.2 addendum's preview) appends `--dry-run` to the SAME
+ * command a run would issue — one builder, no preview-specific argv copy.
  */
-export function buildRcloneArgs(task: CloudSyncTask, configFile: string, source: string): string[] {
+export function buildRcloneArgs(
+  task: Pick<CloudSyncTask, 'mode' | 'remote' | 'path' | 'bwlimit' | 'excludes'>,
+  configFile: string,
+  source: string,
+  opts: { dryRun?: boolean } = {},
+): string[] {
   const args: string[] = [
     task.mode,
     source,
@@ -111,6 +119,8 @@ export function buildRcloneArgs(task: CloudSyncTask, configFile: string, source:
     args.push('--bwlimit', task.bwlimit)
   for (const pattern of task.excludes)
     args.push('--exclude', pattern)
+  if (opts.dryRun)
+    args.push('--dry-run')
   return args
 }
 
@@ -190,6 +200,13 @@ export interface RcloneLogState {
   errorLines: string[]
   /** Lines that were not JSON at all (a panic, a pre-logger message). */
   rawLines: string[]
+  /**
+   * The `object` names of `skipped: delete` lines, in order — the would-be
+   * deletes a `--dry-run` reports (GT 2026-09-24: every would-be delete is
+   * exactly such an object). A real run prints none, so this stays empty
+   * there and the preview's `deletedFiles` has one source.
+   */
+  skippedDeletes: string[]
 }
 
 /**
@@ -201,6 +218,8 @@ export class RcloneLogReader {
   private buffer = ''
   readonly errorLines: string[] = []
   readonly rawLines: string[] = []
+  /** The `object` of every `skipped: delete` line (a dry run's would-be deletes). */
+  readonly skippedDeletes: string[] = []
   stats: RcloneStats | null = null
 
   /**
@@ -255,6 +274,12 @@ export class RcloneLogReader {
     const error = errorLineOf(entry)
     if (error)
       this.errorLines.push(error)
+    // A would-be delete: rclone's `--dry-run` reports each one as a
+    // `skipped: delete` object naming the file (`skipped: copy` lines are the
+    // would-be TRANSFERS — rclone counts them in `stats.transfers`, so they
+    // are not collected here twice).
+    if (entry.skipped === 'delete' && typeof entry.object === 'string' && entry.object.trim() !== '')
+      this.skippedDeletes.push(entry.object.trim())
     const stats = statsOf(entry)
     if (stats)
       this.stats = stats
@@ -262,7 +287,7 @@ export class RcloneLogReader {
   }
 
   state(): RcloneLogState {
-    return { stats: this.stats, errorLines: [...this.errorLines], rawLines: [...this.rawLines] }
+    return { stats: this.stats, errorLines: [...this.errorLines], rawLines: [...this.rawLines], skippedDeletes: [...this.skippedDeletes] }
   }
 }
 
@@ -569,6 +594,8 @@ async function prepareSource(
  * One rclone invocation, its NDJSON stderr read AS IT ARRIVES so the job's
  * progress moves during the run rather than at the end of it. `execFile`, no
  * shell, argv array — the whole command is the array `buildRcloneArgs` built.
+ * The tee and the re-read fallback live in {@link execRcloneLog}, shared with
+ * the preview (which wraps the same argv in `timeout` and keeps no progress).
  */
 async function execRclone(
   executor: CommandExecutor,
@@ -576,24 +603,42 @@ async function execRclone(
   mode: string,
   updateProgress: (message: string) => void,
 ): Promise<{ exitCode: number, log: RcloneLogState }> {
+  return execRcloneLog(executor, RCLONE, args, stats => updateProgress(statsProgressLine(mode, stats)))
+}
+
+/**
+ * One rclone invocation (or a `timeout` wrapper around one), its NDJSON
+ * stderr read as it arrives. The ONE place the tee pattern lives: every
+ * completed `stats` object is handed to `onStats` (the run publishes job
+ * progress; the preview keeps none), and the bounded-tail re-read covers an
+ * executor that buffers without teeing.
+ */
+export async function execRcloneLog(
+  executor: CommandExecutor,
+  command: string,
+  args: string[],
+  onStats?: (stats: RcloneStats) => void,
+): Promise<{ exitCode: number, log: RcloneLogState }> {
   const reader = new RcloneLogReader()
-  const r = await executor.exec(RCLONE, args, {
+  const r = await executor.exec(command, args, {
     // See RCLONE_MAX_BUFFER for the arithmetic. The tee means stderr is NOT
     // retained beyond the executor's bounded tail — a 15-day run's stats log
     // never accumulates in the daemon.
     maxBuffer: RCLONE_MAX_BUFFER,
     onStderr: (chunk) => {
       for (const stats of reader.push(chunk))
-        updateProgress(statsProgressLine(mode, stats))
+        onStats?.(stats)
     },
   })
   for (const stats of reader.flush())
-    updateProgress(statsProgressLine(mode, stats))
+    onStats?.(stats)
   const log = reader.state()
   // A mock (or an executor that buffers without teeing) hands the whole log
   // back only in `stderr`; re-reading it there is idempotent for a live run,
-  // whose reader has already consumed the same bytes from the chunks.
-  if (!log.stats && !log.errorLines.length && r.stderr)
+  // whose reader has already consumed the same bytes from the chunks. A log
+  // whose only objects were `skipped` lines must re-read too, or a no-tee
+  // executor would report the would-be deletes as zero.
+  if (!log.stats && !log.errorLines.length && !log.skippedDeletes.length && r.stderr)
     return { exitCode: r.exitCode, log: readRcloneLog(r.stderr) }
   return { exitCode: r.exitCode, log }
 }

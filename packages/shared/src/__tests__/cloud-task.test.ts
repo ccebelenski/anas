@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { CloudSyncTask, CloudSyncTaskRequest } from '../schemas/cloud.js'
+import { CloudSyncPreviewRequest, CloudSyncPreviewResult, CloudSyncPreviewTask, CloudSyncTask, CloudSyncTaskRequest } from '../schemas/cloud.js'
 
 /**
  * The cloud sync task CONTRACT (rclone.2). The shape is what rides the
@@ -112,5 +112,68 @@ describe('CloudSyncTaskRequest (rclone.2)', () => {
     assert.equal(CloudSyncTaskRequest.parse({ ...MINIMAL, bwlimit: '' }).bwlimit, undefined)
     assert.equal(CloudSyncTaskRequest.parse({ ...MINIMAL, bwlimit: null }).bwlimit, undefined)
     assert.equal(CloudSyncTaskRequest.parse({ ...MINIMAL, bwlimit: '8M' }).bwlimit, '8M')
+  })
+})
+
+describe('CloudSyncPreviewRequest / CloudSyncPreviewResult (rclone.2 addendum)', () => {
+  const INLINE = {
+    source: '/tank/pictures',
+    remote: 'backblaze',
+    path: 'pve1/pictures',
+  }
+
+  it('the saved-task arm takes a name alone', () => {
+    const parsed = CloudSyncPreviewRequest.parse({ name: 'offsite' })
+    assert.deepEqual(parsed, { name: 'offsite' })
+  })
+
+  it('the inline arm takes the task fields, with the task defaults and no management fields', () => {
+    const parsed = CloudSyncPreviewTask.parse(INLINE)
+    assert.deepEqual(parsed, { ...INLINE, mode: 'copy', excludes: [] })
+    // The task-management fields are not part of the preview form — they strip.
+    assert.equal((parsed as Record<string, unknown>).name, undefined)
+    assert.equal((parsed as Record<string, unknown>).schedule, undefined)
+  })
+
+  it('the inline arm carries the stored task\'s validation: relative source, bad mode, bad bwlimit', () => {
+    assert.equal(CloudSyncPreviewTask.safeParse({ ...INLINE, source: 'relative' }).success, false)
+    assert.equal(CloudSyncPreviewTask.safeParse({ ...INLINE, mode: 'two-way' }).success, false)
+    assert.equal(CloudSyncPreviewTask.safeParse({ ...INLINE, bwlimit: 'fast' }).success, false)
+  })
+
+  it('an empty bandwidth limit normalizes to ABSENT, as on the write door', () => {
+    assert.equal(CloudSyncPreviewTask.parse({ ...INLINE, bwlimit: '' }).bwlimit, undefined)
+    assert.equal(CloudSyncPreviewTask.parse({ ...INLINE, bwlimit: '8M' }).bwlimit, '8M')
+  })
+
+  it('a sync-mode preview with excludes and a bwlimit parses whole', () => {
+    const parsed = CloudSyncPreviewTask.parse({ ...INLINE, mode: 'sync', excludes: ['*.tmp'], bwlimit: '8M' })
+    assert.deepEqual(parsed, { ...INLINE, mode: 'sync', excludes: ['*.tmp'], bwlimit: '8M' })
+  })
+
+  it('the union answers for both arms', () => {
+    assert.equal(CloudSyncPreviewRequest.safeParse({ name: 'offsite' }).success, true)
+    assert.equal(CloudSyncPreviewRequest.safeParse(INLINE).success, true)
+    assert.equal(CloudSyncPreviewRequest.safeParse({}).success, false, 'neither a name nor a task')
+    assert.equal(CloudSyncPreviewRequest.safeParse({ name: 'bad name' }).success, false)
+  })
+
+  it('the result carries rclone\'s counters, the capped delete list and the ceiling flag', () => {
+    const parsed = CloudSyncPreviewResult.parse({
+      transfers: 3,
+      bytes: 358434,
+      checks: 3,
+      deletes: 1,
+      deletedFiles: ['b.bin'],
+      deletedTotal: 1,
+      errors: [],
+      truncated: false,
+    })
+    assert.deepEqual(parsed.deletedFiles, ['b.bin'])
+    assert.equal(parsed.truncated, false)
+
+    // Every count is nonnegative; a negative or missing counter is not a result.
+    assert.equal(CloudSyncPreviewResult.safeParse({ ...parsed, bytes: -1 }).success, false)
+    assert.equal(CloudSyncPreviewResult.safeParse({ ...parsed, truncated: 'yes' }).success, false)
   })
 })

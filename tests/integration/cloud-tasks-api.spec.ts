@@ -41,6 +41,9 @@ const execFileAsync = promisify(execFile)
  *      delete → the units are gone and nothing at the destination is touched;
  *      a remote a task still references refuses to delete, and deletes once it
  *      does not
+ *   9. the dry-run preview (rclone.2 addendum) lists a source deletion as a
+ *      would-be delete on the LIVE source (no snapshot), and refuses an
+ *      unmounted-mount source naming the mount
  *
  * The fixture is taken DOWN and back UP in beforeAll (so a crashed earlier run
  * cannot be read as a "before") and DOWN in afterAll, leaving the node as
@@ -446,6 +449,56 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
         `${DST}/copy/b.bin`,
         `${DST}/copy/sub/c.txt`,
       ])
+    }
+    finally {
+      await ctx.dispose()
+    }
+  })
+
+  test('a dry-run preview lists the would-be deletes on the live source — and refuses an unmounted mount', async ({ playwright, pveTicket }) => {
+    const ctx = await authedContext(playwright, pveTicket)
+    try {
+      // The source lost b.bin in the previous test, but that test's second
+      // sync already mirrored the deletion — so stage the would-be delete
+      // ourselves: b.bin is absent from the LIVE source, so put it back at
+      // the destination and a sync preview must name it. The content is
+      // irrelevant; a would-be delete is presence at the destination,
+      // absence at the source.
+      await sshExec(`echo gt > ${DST}/sync/b.bin && chown ${USER}: ${DST}/sync/b.bin && sync`)
+      expect(await filesUnder(`${DST}/sync`)).toEqual([
+        `${DST}/sync/a.bin`,
+        `${DST}/sync/b.bin`,
+        `${DST}/sync/sub/c.txt`,
+      ])
+
+      // The sync PREVIEW of the saved task must read the live source and name
+      // b.bin as a would-be delete — rclone's own `skipped: delete` object,
+      // counted in its own `deletes` counter.
+      const res = await ctx.post(`${V1}/cloud/tasks/preview`, { data: { name: 'gtsync' } })
+      expect(res.status(), await res.text()).toBe(200)
+      const preview = (await res.json()).data
+      expect(preview.truncated, 'the look finished inside the 120 s ceiling').toBe(false)
+      expect(preview.deletes).toBeGreaterThanOrEqual(1)
+      expect(preview.deletedFiles).toContain('b.bin')
+      expect(preview.deletedTotal, 'the count and the list agree on a small destination').toBe(preview.deletedFiles.length)
+
+      // A preview is a LOOK, not a run: no snapshot was taken, and nothing
+      // was written or deleted at the destination — b.bin is still there.
+      expect(await transientSnapshots(), 'a preview takes no snapshot').toEqual([])
+      expect(await filesUnder(`${DST}/sync`)).toEqual([
+        `${DST}/sync/a.bin`,
+        `${DST}/sync/b.bin`,
+        `${DST}/sync/sub/c.txt`,
+      ])
+
+      // And the guard: a source on a configured-but-unmounted mount is a 400
+      // naming the mount — never a 200 that would have read through the empty
+      // mountpoint and reported "nothing to do".
+      const refused = await ctx.post(`${V1}/cloud/tasks/preview`, { data: { source: UNMOUNTED, remote: REMOTE } })
+      expect(refused.status(), await refused.text()).toBe(400)
+      const err = await refused.json()
+      expect(err.error.message).toContain(`${UNMOUNTED} is a mount defined in /etc/fstab but not mounted right now`)
+      expect(err.error.message).toContain(`Mount ${UNMOUNTED} and run it again.`)
     }
     finally {
       await ctx.dispose()

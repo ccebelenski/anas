@@ -3,6 +3,8 @@ import type {
   CloudRemoteTestRequest,
   CloudRemoteTestResult,
   CloudRemoteWrite,
+  CloudSyncPreviewResult,
+  CloudSyncPreviewTask,
   CloudSyncTask,
   CloudSyncTaskDetail,
   CloudSyncTaskView,
@@ -19,12 +21,14 @@ import {
   CloudRemoteTestRequest as CloudRemoteTestRequestSchema,
   CloudRemoteUpdate as CloudRemoteUpdateSchema,
   CloudRemoteWrite as CloudRemoteWriteSchema,
+  CloudSyncPreviewTask as CloudSyncPreviewTaskSchema,
   CloudSyncRunRequest,
   CloudSyncTaskRequest,
 } from '@anas/shared'
 import { readAhrPools } from '../services/ahr-topology.js'
 import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
 import { notifyCloudRun } from '../services/cloud-notify.js'
+import { previewCloudSync } from '../services/cloud-preview.js'
 import { runCloudSync } from '../services/cloud-runner.js'
 import {
   DEFAULT_SYSTEMD_DIR,
@@ -61,6 +65,7 @@ import { requireIdentity } from './identity.js'
  *   POST   /v1/cloud/remotes/test     → 200 { verdict, message } (bounded lsjson, no job)
  *   GET    /v1/cloud/tasks            → the grid: task + LOCAL-ONLY systemd status
  *   POST   /v1/cloud/tasks            → 202 job (remote must exist; schedule validated)
+ *   POST   /v1/cloud/tasks/preview    → 200 dry run on the LIVE source (no job, no notify)
  *   GET    /v1/cloud/tasks/:name      → detail: consistency, nested, unit+timer, journal
  *   PUT    /v1/cloud/tasks/:name      → 202 job (update / enable / disable)
  *   DELETE /v1/cloud/tasks/:name      → 202 job (units only; the remote is untouched)
@@ -536,6 +541,69 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     )
     reply.code(202)
     return { job }
+  })
+
+  // --- POST /cloud/tasks/preview — the dry run (rclone.2 addendum) -----------
+  // A USER-INITIATED READ, registered BEFORE any /cloud/tasks/:name door so
+  // the literal segment is never read as a task name. 200 with rclone's own
+  // counters — NO job (it mutates nothing), NO notification, no audit of its
+  // own beyond the request log. The unmounted-mount guard refuses (400, the
+  // run's sentence); the empty-source guard does NOT — a sync preview that
+  // shows it would delete everything is the point.
+  server.post('/cloud/tasks/preview', async (request, reply) => {
+    // Fastify parses a JSON primitive ("x") happily — it is not an object,
+    // and `'name' in body` would throw on it. Treat it as no body at all.
+    const body = typeof request.body === 'object' && request.body !== null
+      ? request.body as Record<string, unknown>
+      : {}
+
+    // The two arms of the shared request, parsed separately on purpose: a
+    // union failure collapses to a root "Invalid input", and a 400 that cannot
+    // name the field the operator mistyped is half an answer (the task doors'
+    // refusals all name the thing).
+    let task: CloudSyncTask | CloudSyncPreviewTask
+    if ('name' in body) {
+      const nameParsed = BackupName.safeParse(body.name)
+      if (!nameParsed.success) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid preview request: name — ${zodIssue(nameParsed.error)}` } }
+      }
+      const stored = await readTask(systemdDir, nameParsed.data)
+      if (!stored) {
+        reply.code(404)
+        return { error: { code: 'NOT_FOUND', message: `Cloud sync task '${nameParsed.data}' not found` } }
+      }
+      task = stored
+    }
+    else {
+      const parsed = CloudSyncPreviewTaskSchema.safeParse(body)
+      if (!parsed.success) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: `Invalid preview request: ${zodIssue(parsed.error)}` } }
+      }
+      task = parsed.data
+    }
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    let data: CloudSyncPreviewResult | undefined
+    try {
+      data = await guard503(reply, async () => {
+        await requireRclone()
+        return previewCloudSync(executor, { task, paths, fstabPath })
+      })
+    }
+    catch (err) {
+      // A guard refusal: the unmounted mount, the missing source — the run's
+      // own sentence, answered 400 at the door (the run throws it into a job).
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: err instanceof Error ? err.message : String(err) } }
+    }
+    if (data === undefined)
+      return undefined
+    return { data }
   })
 
   // --- GET /cloud/tasks/:name — detail --------------------------------------
