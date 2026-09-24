@@ -658,6 +658,32 @@ const Ext = {
     },
   },
   decode: t => JSON.parse(t),
+  // ExtJS's "run this after the current event stack unwinds". Modelled as a
+  // real queue, not a synchronous call: the whole point of deferring is that
+  // the callback does NOT run inside the event that scheduled it (a handler
+  // that rebuilds the form it is firing from destroys its own component —
+  // rclone.1), and a stub that ran it on the spot would assert the bug.
+  // `settle()` drains the queue.
+  defer(fn) {
+    deferred.push({ id: ++deferred.nextId, fn })
+    return deferred.nextId
+  },
+  undefer(id) {
+    const i = deferred.findIndex(d => d.id === id)
+    if (i >= 0) { deferred.splice(i, 1) }
+  },
+}
+
+/** Callbacks handed to Ext.defer, in order, plus the id counter. */
+const deferred = []
+deferred.nextId = 0
+
+/** Run everything Ext.defer has queued (callbacks may queue more). */
+function runDeferred(rounds = 4) {
+  for (let i = 0; i < rounds && deferred.length; i++) {
+    const batch = deferred.splice(0, deferred.length)
+    for (const d of batch) { d.fn() }
+  }
 }
 
 /** What Ext.Ajax hands back, keyed by a substring of the URL. */
@@ -956,9 +982,18 @@ function loadSources(files, routes) {
   return win.ANAS
 }
 
-/** Let the sources' promise chains settle. */
+/**
+ * Let the sources' promise chains settle — and run whatever they handed to
+ * `Ext.defer`. The sandbox's own setTimeout fires synchronously on purpose
+ * (the debounces elsewhere are asserted that way), so a handler that must
+ * leave ExtJS's event stack before it tears its own field down (rclone.1)
+ * uses Ext.defer, and THAT queue is what settle drains.
+ */
 async function settle(times = 6) {
-  for (let i = 0; i < times; i++) { await new Promise(r => setImmediate(r)) }
+  for (let i = 0; i < times; i++) {
+    await new Promise(r => setImmediate(r))
+    runDeferred()
+  }
 }
 
 // ============================================================================
@@ -10865,8 +10900,22 @@ async function cloudChecks() {
   // option requires one, so Save and Test wait for the pick.
   ok('cloud(s3): with no provider picked Save and Test stay DISABLED',
     dlg.down('#submit').disabled === true && dlg.down('#cloudTestBtn').disabled === true)
-  dlg.down('#cloudOpt_provider').setValue('AWS')
+  // The rebuild a provider pick asks for takes down the PROVIDER ROW ITSELF.
+  // Running it inside the change event destroys the component ExtJS is still
+  // firing from: in the real UI the combobox's own checkDirty then read the
+  // dead field (TypeError "Cannot read properties of null (reading
+  // 'isEmptyStore')"), the throw escaped mid-flush and left Ext's layout
+  // counter suspended, so every rebuilt row existed and none rendered — the
+  // S3 form went blank on the pick. The sandbox has no layout engine and can
+  // see none of that, but it CAN see the rule that was broken: the handler
+  // must leave its own field standing and rebuild on the next tick.
+  const providerFld = cloudOption(dlg, 'provider')
+  providerFld.setValue('AWS')
+  ok('cloud(s3): the provider pick leaves its OWN field standing (the rebuild is deferred)',
+    cloudOption(dlg, 'provider') === providerFld)
   await settle()
+  ok('cloud(s3): the deferred rebuild then replaces the rows',
+    cloudOption(dlg, 'provider') !== providerFld && !!cloudOption(dlg, 'provider'))
   ok('cloud(s3): picking a provider enables Save and Test',
     dlg.down('#submit').disabled === false && dlg.down('#cloudTestBtn').disabled === false)
   eq('cloud(s3): exactly ONE region row after picking provider AWS',

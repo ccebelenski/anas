@@ -25,10 +25,13 @@
  *     matches the current value of the backend's `provider` option (rclone's
  *     syntax: a comma list of provider values, or `!A,B` = all except) — so
  *     an S3 form shows ONE `region` row for the picked provider. Changing the
- *     provider option REBUILDS the rows, keeping what was typed. A backend
- *     that HAS a `provider` option requires one: with none picked the
- *     positive filters match nothing and only the `!A,B` rows survive, which
- *     is the wrong form — Save and Test wait for the pick.
+ *     provider option REBUILDS the rows, keeping what was typed — on the next
+ *     tick, because the rebuild takes down the provider row itself and doing
+ *     that inside ExtJS's own change flush kills the form (see
+ *     optionChangeListeners). A backend that HAS a `provider` option requires
+ *     one: with none picked the positive filters match nothing and only the
+ *     `!A,B` rows survive, which is the wrong form — Save and Test wait for
+ *     the pick.
  *   - `examples` → an editable combo (value + help); `type` `bool` → a
  *     checkbox; `int` → a number field; `secret` → a password field that is
  *     WRITE-ONLY: on edit it is blank with the emptyText "(unchanged)" and is
@@ -609,6 +612,18 @@
     // the button gate; a change of the backend's `provider` option REBUILDS
     // the rows outright (its filter decides which filtered rows apply —
     // region, endpoint, storage_class…).
+    //
+    // The provider rebuild is DEFERRED out of the change event, and that is
+    // not a nicety: the `provider` row is one of the rows the rebuild's
+    // removeAll() takes down, so a synchronous rebuild destroys the very
+    // component ExtJS is still firing from. Its own post-change work then
+    // reads the dead field — `checkDirty` → `getValue()` → "Cannot read
+    // properties of null (reading 'isEmptyStore')" — and that throw escapes
+    // mid-flush with Ext's global layout counter left suspended, so every row
+    // added afterwards exists on the container and never renders. Live
+    // symptom: the S3 form went blank the moment a provider was picked
+    // (rclone.1; the sandbox harness has no layout engine and saw none of it).
+    // A field's change handler must never tear its own field down.
     function optionChangeListeners(opt) {
         return { change: function () {
             var w = this.up('window');
@@ -616,13 +631,31 @@
                 return;
             }
             if (opt.name === 'provider' && w._cloudRebuild) {
-                w._cloudRebuild();
+                deferRebuild(w);
                 return;
             }
             if (w._cloudRefresh) {
                 w._cloudRefresh();
             }
         } };
+    }
+
+    // Rebuild once ExtJS has finished firing the change that asked for it.
+    // `Ext.defer` rather than setTimeout because this is ExtJS's own "leave
+    // the event stack" verb, not a debounce. Coalesced — a burst of changes
+    // rebuilds once — and a window closed in the meantime rebuilds nothing.
+    function deferRebuild(win) {
+        if (win._cloudRebuildPending) {
+            return;
+        }
+        win._cloudRebuildPending = true;
+        Ext.defer(function () {
+            win._cloudRebuildPending = false;
+            if (win.destroyed || win.destroying || !win._cloudRebuild) {
+                return;
+            }
+            win._cloudRebuild();
+        }, 1);
     }
 
     // Field config for one option row. The row is a fieldcontainer so the

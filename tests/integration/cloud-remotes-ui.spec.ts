@@ -424,15 +424,21 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     await expect(boundList).toBeVisible({ timeout: 20_000 })
     await boundList.locator('.x-boundlist-item', { hasText: 'AWS' }).first().click()
 
+    // The rebuild the pick asks for runs on the NEXT TICK — a change handler
+    // must not tear down the very field it is firing from (72-cloud.js) — so
+    // the form is read once that rebuild has run, and Save enabling is the
+    // rebuild's own last step. A `region` row count alone would be satisfied
+    // by the row still standing from before the pick.
+    await expect(dlg.locator('.anas-btn-cloud-remote-save')).toBeEnabled()
+
     // rclone's schema repeats `region` per provider filter — the dialog
     // renders only the row that applies to the picked provider, and THAT row
     // is AWS's (its examples carry the AWS regions).
     await expect(dlg.locator('.anas-fld-cloud-opt-region')).toHaveCount(1)
+    await expect.poll(() => comboExamples(dlg, 'region'), { timeout: 20_000 }).toContain('us-east-1')
     const regionAfter = await comboExamples(dlg, 'region')
-    expect(regionAfter, `region examples after picking AWS: ${regionAfter.join(',')}`)
-      .toContain('us-east-1')
-    expect(regionAfter).not.toContain('other-v2-signature')
-    await expect(dlg.locator('.anas-btn-cloud-remote-save')).toBeEnabled()
+    const why = `region examples after picking AWS: ${regionAfter.join(',')}`
+    expect(regionAfter, why).not.toContain('other-v2-signature')
 
     await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
@@ -443,7 +449,10 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     await remoteRow(page, win, REMOTE).click()
     await win.locator('.anas-btn-cloud-remote-remove').click()
 
-    const confirm = page.locator('.x-messagebox')
+    // ExtJS 7's message box is `.x-message-box` — the class every other spec
+    // here matches on. `:visible` because the dismissed subscription nag stays
+    // in the DOM as a hidden one.
+    const confirm = page.locator('.x-message-box:visible')
     await expect(confirm).toBeVisible({ timeout: 20_000 })
     await confirm.getByRole('button', { name: 'Yes' }).click()
 
@@ -481,7 +490,7 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     // The failure surfaces as the SAVE failure alert — 10-api.js titles it with
     // the job's failTitle ('Save failed' on an edit) and puts the daemon's own
     // sentence in the body — never a bare "failed" and never some other modal.
-    const failAlert = page.locator('.x-messagebox').filter({ hasText: 'Save failed' })
+    const failAlert = page.locator('.x-message-box:visible').filter({ hasText: 'Save failed' })
     await expect(failAlert.first()).toBeVisible({ timeout: 60_000 })
     const failBody = ((await failAlert.first().textContent()) ?? '').replace(/Save failed|OK|Cancel/g, '').trim()
     expect(failBody.length, `the save-failure alert body was: ${failBody}`).toBeGreaterThan(10)
@@ -494,14 +503,29 @@ test.describe('rclone.1 — Remotes manager window (stunt node UI)', () => {
     // and the reload's own load failure — the reload path re-probed the store
     // while it was still broken).
     await sshExec(`rmdir ${RCLONE_CONF} && mv ${RCLONE_CONF}.failing ${RCLONE_CONF}`)
-    for (let i = 0; i < 5; i++) {
-      const boxes = page.locator('.x-messagebox:visible')
+    // They do NOT arrive together — the reload's own "Load failed" lands a
+    // moment after the save's refusal — so the sweep runs until the screen has
+    // stayed clear, not until it is clear once. A box still up here is a modal
+    // mask over the dialog's Cancel button.
+    let clear = 0
+    for (let i = 0; i < 20 && clear < 3; i++) {
+      const boxes = page.locator('.x-message-box:visible')
       if ((await boxes.count()) === 0) {
-        break
+        clear += 1
       }
-      await boxes.first().getByRole('button', { name: 'OK' }).click().catch(() => {})
+      else {
+        clear = 0
+        await boxes.first().getByRole('button', { name: 'OK' }).click().catch(() => {})
+      }
       await page.waitForTimeout(500)
     }
+    await expect(page.locator('.x-message-box:visible')).toHaveCount(0, { timeout: 20_000 })
+    // The dialog is STILL OPEN, and that is the contract: submitRemote's
+    // onFailed reloads the grid and leaves the form standing so the save can
+    // be retried — a failed save must not throw away what was typed. Only a
+    // completed job closes it. Close it by hand, the way the user would.
+    await expect(dlg).toBeVisible()
+    await dlg.locator('.x-btn', { hasText: 'Cancel' }).click()
     await expect(dlg).toBeHidden({ timeout: 20_000 })
     expect(await storeSection(REMOTE)).not.toBe('')
   })
