@@ -1,5 +1,5 @@
 /*
- * ANAS — Cloud sync Remotes manager (rclone.1 — 72-cloud.js).
+ * ANAS — Cloud sync (rclone.1 + rclone.3 — 72-cloud.js).
  *
  * The Remotes manager window, the Repositories manager's twin (68-backup.js):
  * the grid of remotes in ANAS's OWN /etc/anas/rclone.conf plus the Add/Edit
@@ -1438,7 +1438,1453 @@
         win._cloudRebuild();
     }
 
+    // ======================================================================
+    //  Cloud Sync tasks (rclone.3) — grid, wizard, detail, Run now
+    // ======================================================================
+    //
+    // The Cloud Sync MENU, built as Backup is (DESIGN "Cloud sync — rclone" →
+    // Workflow): the Tasks grid with the toolbar (Create, Edit, Remove, Run
+    // now, Enable/Disable, Remotes…), the Remotes manager window behind the
+    // Remotes… button, the task wizard and the display-only detail window.
+    //
+    // DAEMON CONTRACT (packages/shared/src/schemas/cloud.ts):
+    //
+    //   GET    /v1/cloud/tasks         → { data: [task + lastRunResult,
+    //                                    lastRunAt, nextRunAt, overdue] }
+    //   GET    /v1/cloud/tasks/:name   → { data: CloudSyncTaskDetail — task,
+    //                                    consistency?, nested?, unit, timer,
+    //                                    journal?, statusNote? }
+    //   POST   /v1/cloud/tasks         → 202 { job } (remote must exist,
+    //                                    schedule validated by
+    //                                    systemd-analyze — the 400 sentences
+    //                                    ride the job-failure alert)
+    //   PUT    /v1/cloud/tasks/:name   → 202 { job } (update / enable / disable)
+    //   DELETE /v1/cloud/tasks/:name   → 202 { job } (units only — nothing on
+    //                                    the remote is touched)
+    //   POST   /v1/cloud/tasks/:name/run → 202 { job } (Run now)
+    //
+    // The grid derives everything from unit + timer state per load (no shadow
+    // state) and RELOADS after every job of its own, success AND failure (the
+    // 0.3.3 lesson). The one display-side exception is the failed Last run
+    // cell's tooltip: the grid payload carries no error line, so the tooltip
+    // holds the error of the run the user just watched from this grid
+    // (session-only, keyed on the grid's store, never persisted).
+
+    var TASK_NAME_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+    // The one sentence under the Mode radios, verbatim from the design.
+    var SYNC_SENTENCE = 'Sync deletes files at the destination that are no longer '
+        + 'in the source. Copy never deletes.';
+
+    // The guiding toast when a create is attempted with no remote saved (the
+    // backup precedent: "Register a PBS repository first (Repositories…).").
+    var EMPTY_REMOTES_TOAST = 'Add a remote first (Remotes…)';
+
+    // The nested note's lead — the daemon's own run-time sentence, said BEFORE
+    // the save: a snapshot captures one filesystem. Rendered as "Contains N
+    // nested filesystems that will not be included: <paths>".
+    function nestedNote(n) {
+        return n + ' ' + (n === 1 ? t('nested filesystem') : t('nested filesystems'))
+            + ' ' + t('that will not be included');
+    }
+
+    // Relative + absolute time. absTime delegates to the schedules common
+    // module (one formatter everywhere a schedules view prints a timestamp);
+    // relTime is the small per-file wrapper every screen carries.
+    function relTime(iso) {
+        if (iso === undefined || iso === null || iso === '') {
+            return '';
+        }
+        try {
+            var ms = new Date(iso).getTime();
+            if (isNaN(ms)) {
+                return '';
+            }
+            var diff = Date.now() - ms;
+            var future = diff < 0;
+            var s = Math.abs(diff) / 1000;
+            var out;
+            if (s < 60) {
+                out = Math.round(s) + 's';
+            } else if (s < 3600) {
+                out = Math.round(s / 60) + 'm';
+            } else if (s < 86400) {
+                out = Math.round(s / 3600) + 'h';
+            } else {
+                out = Math.round(s / 86400) + 'd';
+            }
+            return future ? (t('in') + ' ' + out) : (out + ' ' + t('ago'));
+        } catch (e) {
+            return '';
+        }
+    }
+
+    function absTime(iso) {
+        try {
+            return ANAS.sched.absTime(iso);
+        } catch (e) {
+            return '' + (iso == null ? '' : iso);
+        }
+    }
+
+    // The state pills — the schedules common module's, so the Cloud Sync grid
+    // reads exactly like the Backup grid's (parallel construction).
+    function pillHtml(label, color, title) {
+        return ANAS.sched.pillHtml(label, color, title);
+    }
+
+    function softPill(label, color, title) {
+        return ANAS.sched.softPill(label, color, title);
+    }
+
+    // Split a multiline excludes blob into a trimmed, non-empty pattern array.
+    function splitLines(v) {
+        var out = [];
+        var lines = ('' + (v == null ? '' : v)).split(/\r?\n/);
+        for (var i = 0; i < lines.length; i++) {
+            var s = trim(lines[i]);
+            if (s) {
+                out.push(s);
+            }
+        }
+        return out;
+    }
+
+    function destinationOf(task) {
+        task = task || {};
+        return '' + (task.remote || '') + ':' + (task.path || '');
+    }
+
+    // Flatten a task (+ its LOCAL-ONLY runtime status) into a grid record; the
+    // raw task rides under 'raw' so edit / toggle round-trip it.
+    function taskRow(entry) {
+        entry = entry || {};
+        var task = entry.task || entry;
+        return {
+            name: task.name,
+            source: task.source || '',
+            remote: task.remote || '',
+            path: task.path || '',
+            destination: destinationOf(task),
+            mode: task.mode === 'sync' ? 'sync' : 'copy',
+            excludes: task.excludes || [],
+            bwlimit: task.bwlimit || '',
+            notify: task.notify === 'on-failure' ? 'on-failure' : 'always',
+            schedule: task.schedule || '',
+            cadence: ANAS.sched.cadence.of(task),
+            enabled: task.enabled !== false,
+            lastRunResult: entry.lastRunResult || 'unknown',
+            lastRunAt: entry.lastRunAt,
+            nextRunAt: entry.nextRunAt,
+            overdue: entry.overdue === true,
+            raw: task,
+        };
+    }
+
+    // ---- Renderers ---------------------------------------------------------
+
+    // A structured cadence reads in words (it says which weeks a biweekly task
+    // runs — the thing the OnCalendar expression cannot); a raw schedule reads
+    // as the expression itself. Either way the generated expression is in the
+    // tooltip, never truncated.
+    function renderSchedule(v, meta, rec) {
+        var s = '' + (v == null ? '' : v);
+        var text = ANAS.sched.cadence.text(rec ? rec.get('cadence') : null);
+        if (!s && !text) {
+            return '<span style="color:gray;">&mdash;</span>';
+        }
+        if (text) {
+            return '<span title="' + enc(text + (s ? ' — OnCalendar: ' + s : '')) + '">'
+                + enc(text) + '</span>';
+        }
+        return '<span title="' + enc(s) + '" style="font-family:monospace;font-size:0.92em;">'
+            + enc(s) + '</span>';
+    }
+
+    function renderSource(v) {
+        var s = '' + (v == null ? '' : v);
+        if (!s) {
+            return '<span style="color:gray;">&mdash;</span>';
+        }
+        return '<span title="' + enc(s) + '" style="font-family:monospace;font-size:0.9em;">'
+            + enc(s) + '</span>';
+    }
+
+    // "remote:path", whole and monospace — never truncated.
+    function renderDestination(v) {
+        var d = '' + (v == null ? '' : v);
+        if (!d || d === ':') {
+            return '<span style="color:gray;">&mdash;</span>';
+        }
+        return '<span title="' + enc(d) + '" style="font-family:monospace;font-size:0.92em;">'
+            + enc(d) + '</span>';
+    }
+
+    // copy is the default and the mode that cannot destroy anything — muted;
+    // sync wears the accent (it deletes, and the sentence under the radios in
+    // the wizard is the one thing to have read).
+    function renderMode(v) {
+        if (v === 'sync') {
+            return pillHtml(t('sync'), 'var(--anas-accent,#3468c0)',
+                t(SYNC_SENTENCE));
+        }
+        return '<span style="color:var(--anas-muted,gray);">' + enc(t('copy')) + '</span>';
+    }
+
+    // Last run: a result pill + the relative time, as the Backup grid renders
+    // it. A FAILED run's cell carries rclone's last error line as the tooltip —
+    // the line the notification body shows. The grid payload names no error
+    // line, so the tooltip reads the run this user started from this grid
+    // (runTaskNow records it on the store); a run started by the timer shows
+    // the pill without it — journald's tail is on the detail.
+    function renderLastRun(v, meta, rec) {
+        var result = '' + (rec.get('lastRunResult') || 'unknown');
+        var at = rec.get('lastRunAt');
+        var overdue = rec.get('overdue') === true;
+        var pill;
+        if (result === 'success' && !overdue) {
+            pill = pillHtml(t('success'), 'var(--anas-ok,#1f9c56)', absTime(at));
+        } else if (result === 'skipped' && !overdue) {
+            pill = pillHtml(t('skipped (off week)'), 'var(--anas-muted,gray)',
+                t('An off-week fire of an every-other-week task — nothing was copied, '
+                    + 'and nothing is wrong.') + (at ? ' ' + absTime(at) : ''));
+        } else if (result === 'failure') {
+            var err = '';
+            try {
+                var errs = rec.store && rec.store._anasRunErrors;
+                err = errs ? ('' + (errs[rec.get('name')] || '')) : '';
+            } catch (eStore) {
+                err = '';
+            }
+            var tip = err || absTime(at);
+            pill = '<span title="' + enc(tip) + '"'
+                + ' style="display:inline-block;padding:1px 9px;border-radius:9px;'
+                + 'font-size:0.85em;color:#fff;background:var(--anas-danger,#c23b2c);">'
+                + enc(t('failure')) + '</span>';
+        } else if (result === 'running') {
+            pill = '<span title="' + enc(t('running')) + '"'
+                + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
+                + 'color:#fff;background:var(--anas-accent,#3468c0);">'
+                + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
+                + enc(t('running')) + '</span>';
+        } else if (result === 'disabled') {
+            // A disabled task's run history is garbage-collected by systemd;
+            // say there is none (the sentence the detail repeats).
+            pill = softPill(t('disabled'), 'var(--anas-muted,gray)',
+                t('run history is not retained while a task is disabled'));
+        } else if (result === 'never-run') {
+            pill = softPill(t('never run'), 'var(--anas-muted,gray)',
+                t('this task has not run yet'));
+        } else if (overdue) {
+            pill = pillHtml(t('overdue'), 'var(--anas-danger,#c23b2c)',
+                t('Past its schedule without a successful run — treated as failed.'));
+        } else {
+            pill = pillHtml(t('unknown'), 'var(--anas-muted,gray)', '');
+        }
+        var rel = at ? relTime(at) : '';
+        if (rel) {
+            pill += ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">' + enc(rel) + '</span>';
+        }
+        return pill;
+    }
+
+    function renderNextRun(v, meta, rec) {
+        var at = rec.get('nextRunAt');
+        var overdue = rec.get('overdue') === true;
+        if (!at) {
+            return '<span style="color:gray;">&mdash;</span>';
+        }
+        var rel = relTime(at);
+        var color = overdue ? 'var(--anas-danger,#c23b2c)' : '';
+        return '<span title="' + enc(absTime(at)) + '"'
+            + (color ? ' style="color:' + color + ';font-weight:600;"' : '') + '>'
+            + enc(rel || absTime(at)) + '</span>';
+    }
+
+    function renderEnabled(v) {
+        return v !== false
+            ? '<span style="color:var(--anas-ok,#1f9c56);">' + enc(t('yes')) + '</span>'
+            : '<span style="color:var(--anas-muted,gray);">' + enc(t('no')) + '</span>';
+    }
+
+    // ---- Grid load / selection / buttons ------------------------------------
+
+    function selectedTask(grid) {
+        var sel = grid ? grid.getSelection() : [];
+        return (sel && sel.length) ? sel[0] : null;
+    }
+
+    function gridOf(view) {
+        try {
+            return view ? view.down('#cloudTasksGrid') : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function setDisabled(grid, itemId, disabled) {
+        try {
+            var btn = grid.down('#' + itemId);
+            if (btn) {
+                btn.setDisabled(!!disabled);
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    function updateTaskButtons(grid) {
+        var rec = selectedTask(grid);
+        var has = !!rec;
+        setDisabled(grid, 'cloudTaskRun', !has);
+        setDisabled(grid, 'cloudTaskDetails', !has);
+        setDisabled(grid, 'cloudTaskEdit', !has);
+        setDisabled(grid, 'cloudTaskToggle', !has);
+        setDisabled(grid, 'cloudTaskRemove', !has);
+        try {
+            var toggle = grid.down('#cloudTaskToggle');
+            if (toggle) {
+                var on = has && rec.get('enabled');
+                toggle.setText(on ? t('Disable') : t('Enable'));
+                toggle.setIconCls(on ? 'fa fa-pause' : 'fa fa-play');
+            }
+        } catch (e) {
+            // non-fatal
+        }
+    }
+
+    // `quiet` skips the loading mask — the timed poll refreshes in place.
+    // `selName` (optional) selects that row after the load — the create's
+    // "the new row selected" contract.
+    function loadTasks(view, node, quiet, selName) {
+        var grid = gridOf(view);
+        if (!grid || grid.destroyed || grid.destroying) {
+            return;
+        }
+        if (!quiet) {
+            try {
+                grid.setLoading(true);
+            } catch (e) {
+                // non-fatal
+            }
+        }
+        var priorSel = selectedTask(grid);
+        var priorName = selName || (priorSel ? priorSel.get('name') : null);
+
+        ANAS.api.get(node, '/cloud/tasks').then(function (res) {
+            if (grid.destroyed || grid.destroying) {
+                return;
+            }
+            if (!quiet) {
+                try {
+                    grid.setLoading(false);
+                } catch (e) {
+                    // non-fatal
+                }
+            }
+            var list = (res && res.data) || [];
+            var rows = [];
+            for (var i = 0; i < list.length; i++) {
+                rows.push(taskRow(list[i]));
+            }
+            // A 503 from an earlier load hid the grid — a working read brings
+            // it back and clears the note that contradicts it.
+            var unavail = view ? view.down('#cloudTasksUnavailable') : null;
+            if (unavail) { unavail.setHidden(true); }
+            try { grid.setHidden(false); } catch (eG) { /* non-fatal */ }
+            // The run-error tooltips live on the STORE, which survives a
+            // loadData — a reload must not forget what this user watched fail.
+            var store = grid.getStore();
+            grid.anasReloading = true;
+            try {
+                store.loadData(rows);
+            } catch (e2) {
+                ANAS.warn('cloud tasks grid load failed: ' + ANAS.errText(e2));
+            }
+            if (priorName) {
+                try {
+                    var idx = store.findExact('name', priorName);
+                    if (idx >= 0) {
+                        grid.getSelectionModel().select(idx, false, true);
+                    }
+                } catch (eSel) {
+                    // non-fatal
+                }
+            }
+            grid.anasReloading = false;
+            updateTaskButtons(grid);
+        }, function (err) {
+            if (grid.destroyed || grid.destroying) {
+                return;
+            }
+            grid.anasReloading = false;
+            if (!quiet) {
+                try {
+                    grid.setLoading(false);
+                } catch (e) {
+                    // non-fatal
+                }
+            }
+            // No rclone on this node (503): the daemon's sentence takes the
+            // grid's place; any other failure is transient — warn and keep the
+            // last good rows.
+            if (err && err.status === 503) {
+                var unavail = view ? view.down('#cloudTasksUnavailable') : null;
+                if (unavail) {
+                    unavail.setHidden(false);
+                    unavail.setHtml('<div style="max-width:520px;margin:24px auto;'
+                        + 'color:var(--anas-warn,#b06a12);font-size:13px;">'
+                        + enc(ANAS.errText(err)) + '</div>');
+                }
+                if (grid) {
+                    try { grid.setHidden(true); } catch (eG) { /* non-fatal */ }
+                }
+                return;
+            }
+            ANAS.warn('cloud tasks load failed: ' + ANAS.errText(err));
+        });
+    }
+
+    // ---- Run now ------------------------------------------------------------
+
+    // The ONE run path, as backup runs it: POST the task's /run, let the task's
+    // own systemd unit do the work, supervise through the job — so a manual run
+    // lands in systemd's last-result and the unit journal exactly like a
+    // scheduled one (one history). The grid reloads when the job ends, success
+    // AND failure, and a failed run's error line becomes the Last run tooltip.
+    function runTaskNow(view, node, name) {
+        if (!name) {
+            return;
+        }
+        var grid = gridOf(view);
+        ANAS.runJob({
+            node: node,
+            method: 'post',
+            path: '/cloud/tasks/' + encodeURIComponent(name) + '/run',
+            body: {},
+            view: grid,
+            maxMs: 600000, // a real sync can run for minutes — keep polling
+            failTitle: 'Run failed',
+            onComplete: function (job) {
+                var msg = t('Cloud sync finished') + ': ' + name;
+                try {
+                    var result = (job && job.result) || {};
+                    // The counters are rclone's own, only when rclone said any
+                    // (a sub-second run reports none — say so, never zeros).
+                    if (result.countersReported === true) {
+                        msg += ' — ' + ANAS.formatBytes(result.bytes) + ' '
+                            + t('of') + ' ' + ANAS.formatBytes(result.totalBytes)
+                            + ', ' + result.transfers + ' '
+                            + (result.transfers === 1 ? t('file') : t('files'));
+                    } else {
+                        msg += ' — ' + t('no counters reported');
+                    }
+                } catch (eSum) {
+                    // best-effort summary
+                }
+                try {
+                    var store = grid && grid.getStore();
+                    if (store && store._anasRunErrors) {
+                        delete store._anasRunErrors[name];
+                    }
+                } catch (eClr) {
+                    // non-fatal
+                }
+                ANAS.toast(msg);
+                loadTasks(view, node);
+            },
+            onFailed: function (job) {
+                var message = (job && job.error && job.error.message) || '';
+                if (message) {
+                    try {
+                        var store = grid && grid.getStore();
+                        if (store) {
+                            store._anasRunErrors = store._anasRunErrors || {};
+                            store._anasRunErrors[name] = message;
+                        }
+                    } catch (eRec) {
+                        // non-fatal
+                    }
+                }
+                loadTasks(view, node);
+            },
+        });
+        ANAS.toast(t('Cloud sync started') + ': ' + name);
+    }
+
+    // ---- Enable / Disable (PUT the task with enabled flipped) ---------------
+
+    function toggleTask(view, node, rec) {
+        if (!rec) {
+            return;
+        }
+        var raw = rec.get('raw') || {};
+        var name = rec.get('name');
+        var next = !rec.get('enabled');
+        // A toggle rewrites the whole task — carry every stored field through
+        // it (the PUT replaces the task; a dropped field would be silently
+        // reset to its schema default).
+        var body = {
+            name: name,
+            source: raw.source || rec.get('source'),
+            remote: raw.remote || rec.get('remote'),
+            path: raw.path || '',
+            mode: raw.mode === 'sync' ? 'sync' : 'copy',
+            excludes: raw.excludes || [],
+            notify: raw.notify === 'on-failure' ? 'on-failure' : 'always',
+            schedule: raw.schedule || rec.get('schedule'),
+            enabled: next,
+        };
+        var cad = ANAS.sched.cadence.of(raw);
+        if (cad) {
+            body.cadence = cad;
+        }
+        if (raw.bwlimit) {
+            body.bwlimit = raw.bwlimit;
+        }
+        ANAS.runJob({
+            node: node,
+            method: 'put',
+            path: '/cloud/tasks/' + encodeURIComponent(name),
+            body: body,
+            view: gridOf(view),
+            failTitle: 'Update failed',
+            successMsg: next ? (t('Task enabled') + ': ' + name) : (t('Task disabled') + ': ' + name),
+            onComplete: function () {
+                loadTasks(view, node);
+            },
+            onFailed: function () {
+                loadTasks(view, node);
+            },
+        });
+    }
+
+    // ---- Remove (the units only; nothing on the remote is touched) ----------
+
+    function removeTask(view, node, rec) {
+        if (!rec) {
+            return;
+        }
+        var name = rec.get('name');
+        try {
+            Ext.Msg.confirm(
+                t('Remove Cloud Sync Task'),
+                t('Remove the cloud sync task') + ' "' + enc(name) + '"? '
+                    + t('This removes its schedule (the systemd units) only — '
+                        + 'data already at the remote is untouched.'),
+                function (btn) {
+                    if (btn !== 'yes') {
+                        return;
+                    }
+                    ANAS.runJob({
+                        node: node,
+                        method: 'del',
+                        path: '/cloud/tasks/' + encodeURIComponent(name),
+                        view: gridOf(view),
+                        failTitle: 'Remove failed',
+                        successMsg: t('Cloud sync task removed') + ': ' + name,
+                        onComplete: function () {
+                            loadTasks(view, node);
+                        },
+                        onFailed: function () {
+                            loadTasks(view, node);
+                        },
+                    });
+                }
+            );
+        } catch (e) {
+            ANAS.warn('cloud task remove confirm failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // ---- Detail (display-only, the Backup detail's twin) --------------------
+
+    function kv(label, value) {
+        return '<tr><td style="padding:2px 14px 2px 0;color:var(--anas-muted,gray);'
+            + 'white-space:nowrap;vertical-align:top;">' + enc(label)
+            + '</td><td style="padding:2px 0;">' + value + '</td></tr>';
+    }
+
+    function mono(s) {
+        return '<span style="font-family:monospace;font-size:0.92em;word-break:break-all;">'
+            + enc(s) + '</span>';
+    }
+
+    function unitBlock(title, text) {
+        if (!text) {
+            return '';
+        }
+        return '<div style="margin-top:10px;">'
+            + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
+            + enc(title) + '</div>'
+            + '<pre style="margin:0;padding:8px 10px;border-radius:6px;overflow-x:auto;'
+            + 'background:rgba(127,127,127,0.10);font-size:12px;white-space:pre;">'
+            + enc(text) + '</pre></div>';
+    }
+
+    // The derived consistency as the detail shows it: the chip, with the
+    // daemon's own reason as the tooltip (the wizard's line, repeated).
+    function consistencyChipHtml(c) {
+        if (!c || (c.consistency !== 'snapshot' && c.consistency !== 'live')) {
+            return '<span style="color:var(--anas-muted,gray);">' + enc(t('not known')) + '</span>';
+        }
+        var snap = c.consistency === 'snapshot';
+        return pillHtml(snap ? t('snapshot') : t('live'),
+            snap ? 'var(--anas-ok,#1f9c56)' : 'var(--anas-muted,gray)',
+            '' + (c.reason || ''));
+    }
+
+    // The schedule as the detail shows it: the cadence in words with the
+    // generated OnCalendar underneath (config-is-the-API transparency), or the
+    // expression for a raw-schedule task.
+    function scheduleDetailHtml(task) {
+        var expr = task && task.schedule
+            ? '<span style="font-family:monospace;font-size:0.92em;">' + enc(task.schedule) + '</span>'
+            : '<span style="color:gray;">&mdash;</span>';
+        var c = ANAS.sched.cadence.of(task);
+        var text = ANAS.sched.cadence.text(c);
+        if (!text) {
+            return expr;
+        }
+        var note = c.kind === 'biweekly'
+            ? '<div style="color:var(--anas-muted,gray);font-size:0.85em;">'
+                + enc(t('The timer fires weekly; ANAS skips the off weeks (systemd calendars '
+                    + 'cannot express "every other week"). A missed period heals on the next fire.'))
+                + '</div>'
+            : '';
+        return enc(text) + '<div style="color:var(--anas-muted,gray);font-size:0.85em;">'
+            + 'OnCalendar: ' + expr + '</div>' + note;
+    }
+
+    function notificationsRowHtml(task) {
+        var onFailure = task && task.notify === 'on-failure';
+        return enc(onFailure
+            ? t('on failure — only a failed run, or one that completed with warnings, notifies')
+            : t('always — every run that happened notifies (a skipped off week never does)'))
+            + ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+            + enc(t('— delivered by the Proxmox notification system (type anas-cloud)'))
+            + '</span>';
+    }
+
+    function cloudTaskDetailHtml(d) {
+        if (!d) {
+            return '<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
+                + enc(t('No detail returned for this task.')) + '</div>';
+        }
+        var task = d.task || d;
+        var excludes = (task.excludes && task.excludes.length)
+            ? mono(task.excludes.join('  '))
+            : '<span style="color:var(--anas-muted,gray);">' + enc(t('none')) + '</span>';
+        var nested = (d.nested && d.nested.length)
+            ? d.nested.map(function (n) {
+                return '<div style="font-size:11px;margin-left:2px;color:var(--anas-warn,#c9820b);">'
+                    + '<span style="font-family:monospace;">' + enc(n) + '</span> — '
+                    + enc(t('not included (a snapshot captures one filesystem)')) + '</div>';
+            }).join('')
+            : '';
+        var rows = ''
+            + kv(t('Task'), mono(task.name))
+            + kv(t('Source'), mono(task.source))
+            + kv(t('Destination'), mono(destinationOf(task)))
+            + kv(t('Mode'), renderMode(task.mode))
+            + kv(t('Excludes'), excludes)
+            + kv(t('Bandwidth limit'), task.bwlimit
+                ? mono(task.bwlimit)
+                : '<span style="color:var(--anas-muted,gray);">' + enc(t('none')) + '</span>')
+            + kv(t('Notifications'), notificationsRowHtml(task))
+            + kv(t('Schedule'), scheduleDetailHtml(task))
+            + kv(t('Enabled'), renderEnabled(task.enabled))
+            + kv(t('Consistency'), consistencyChipHtml(d.consistency));
+        if (nested) {
+            rows += kv(t('Nested filesystems'), nested);
+        }
+        // A disabled task has no last run to show — say so with the daemon's
+        // own sentence (statusNote) when it carries one.
+        var result = '' + (task.lastRunResult || '');
+        if (result === 'disabled') {
+            rows += kv(t('Last run'),
+                softPill(t('disabled'), 'var(--anas-muted,gray)',
+                    t('run history is not retained while a task is disabled'))
+                + ' <span style="color:var(--anas-muted,gray);">'
+                + enc('— ' + (d.statusNote || t('run history is not retained while a task is disabled')))
+                + '</span>');
+        } else if (result === 'never-run') {
+            rows += kv(t('Last run'), softPill(t('never run'), 'var(--anas-muted,gray)',
+                t('this task has not run yet')));
+        } else {
+            rows += kv(t('Last run'),
+                renderLastRun(task.lastRunResult, null, { get: function (k) {
+                    return k === 'lastRunResult' ? result
+                        : k === 'lastRunAt' ? task.lastRunAt
+                        : k === 'overdue' ? task.overdue
+                        : k === 'name' ? task.name
+                        : undefined;
+                } }));
+        }
+
+        var html = '<div style="padding:10px 14px;">'
+            + '<table style="border-collapse:collapse;width:100%;">' + rows + '</table>';
+        // The unit + timer, verbatim — config-is-the-API transparency.
+        html += unitBlock(t('systemd service unit (as written)'), d.unit);
+        html += unitBlock(t('systemd timer (as written)'), d.timer);
+        // Recent runs, labeled recent-only (journald is forensics, never
+        // correctness — standing ruling).
+        if (d.journal) {
+            html += '<div style="margin-top:12px;">'
+                + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
+                + '<i class="fa fa-history" style="margin-right:5px;"></i>'
+                + enc(t('Recent runs (journald) — older history is not retained')) + '</div>'
+                + '<pre style="margin:0;padding:8px 10px;border-radius:6px;overflow-x:auto;'
+                + 'background:rgba(127,127,127,0.10);font-size:11px;white-space:pre-wrap;">'
+                + enc(d.journal) + '</pre></div>';
+        }
+        html += '</div>';
+        return html;
+    }
+
+    function loadDetailInto(win, node, name) {
+        if (!win || win.destroyed || win.destroying) {
+            return;
+        }
+        var body = win.down('#detailBody');
+        if (!body) {
+            return;
+        }
+        body.update('<div style="padding:12px 14px;color:var(--anas-muted,gray);">'
+            + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
+            + enc(t('loading…')) + '</div>');
+        ANAS.api.get(node, '/cloud/tasks/' + encodeURIComponent(name)).then(function (res) {
+            if (body.destroyed || body.destroying) {
+                return;
+            }
+            try {
+                body.update(cloudTaskDetailHtml(res && res.data));
+            } catch (e) {
+                ANAS.warn('cloud task detail render failed: ' + ANAS.errText(e));
+            }
+        }, function (err) {
+            if (body.destroyed || body.destroying) {
+                return;
+            }
+            ANAS.warn('cloud task detail load failed: ' + ANAS.errText(err));
+            body.update('<div style="padding:12px 14px;color:var(--anas-danger,#c23b2c);">'
+                + enc(t('Failed to load detail') + ': ' + ANAS.errText(err)) + '</div>');
+        });
+    }
+
+    function openTaskDetail(node, name, view) {
+        if (!name) {
+            return;
+        }
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-cloud-task-detail',
+                title: t('Cloud Sync Task') + ': ' + name,
+                modal: false,
+                width: 760,
+                height: 520,
+                resizable: true,
+                layout: 'fit',
+                items: [{
+                    xtype: 'panel',
+                    itemId: 'detailBody',
+                    cls: 'anas-cloud-detail',
+                    border: false,
+                    scrollable: true,
+                    html: '',
+                }],
+                buttons: [
+                    {
+                        text: t('Reload'),
+                        cls: 'anas-btn-cloud-detail-reload',
+                        iconCls: 'fa fa-refresh',
+                        handler: function () { loadDetailInto(win, node, name); },
+                    },
+                    { text: t('Close'), handler: function () { win.close(); } },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('cloud task detail window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win._view = view;
+        win.show();
+        loadDetailInto(win, node, name);
+    }
+
+    // ---- Task wizard (create / edit) — 'anas-win-cloud-task' ----------------
+
+    // The source scan's two in-between states and its debounce mirror the
+    // backup wizard's: one walk per pause, the last to resolve paints.
+    var SOURCE_SCAN_DEBOUNCE_MS = 400;
+
+    function setScanHtml(win, html) {
+        var out = win.down('#cloudSourceScan');
+        if (out) {
+            try {
+                out.update(html);
+            } catch (e) {
+                // non-fatal
+            }
+        }
+    }
+
+    // What a snapshot will NOT contain, plus the derived consistency — both
+    // from the ONE preview-nested scan backup's wizard uses (the derived
+    // consistency rides it). Cloud tasks have no nested choice: a snapshot
+    // captures one filesystem, so every nested one is left out, and the note
+    // says so BEFORE the save (the daemon's run-time sentence, up front).
+    function scanCloudSource(win, node) {
+        if (!win || win.destroyed || win.destroying) {
+            return;
+        }
+        var seq = (win._cloudScanSeq = (win._cloudScanSeq || 0) + 1);
+        var stale = function () {
+            return win.destroyed || win.destroying || win._cloudScanSeq !== seq;
+        };
+        var path = trim(valOf(win, '#cloudSource') || '');
+        if (!path || path.charAt(0) !== '/') {
+            setScanHtml(win, '');
+            return;
+        }
+        setScanHtml(win, '<div style="font-size:11px;color:var(--anas-muted,gray);">'
+            + '<i class="fa fa-refresh fa-spin" style="margin-right:5px;"></i>'
+            + enc(t('checking the source…')) + '</div>');
+        ANAS.api.post(node, '/backup/tasks/preview-nested', { path: path, includeNested: 'none' }).then(
+            function (res) {
+                if (stale()) {
+                    return;
+                }
+                var d = (res && res.data) || {};
+                var scans = (d && d.archives && d.archives.length) ? d.archives : [];
+                var scan = scans[0] || {};
+                var html = '';
+                var c = scan.consistency;
+                if (c && (c.consistency === 'snapshot' || c.consistency === 'live')) {
+                    var snap = c.consistency === 'snapshot';
+                    html += '<div style="font-size:11px;margin-bottom:3px;">'
+                        + pillHtml(snap ? t('snapshot') : t('live'),
+                            snap ? 'var(--anas-ok,#1f9c56)' : 'var(--anas-muted,gray)',
+                            '' + (c.reason || ''))
+                        + '</div>';
+                }
+                var nested = (scan.nested && scan.nested.length) ? scan.nested : [];
+                if (nested.length) {
+                    var paths = [];
+                    for (var i = 0; i < nested.length; i++) {
+                        paths.push('' + (nested[i] && nested[i].path || ''));
+                    }
+                    html += '<div style="font-size:11px;color:var(--anas-warn,#c9820b);">'
+                        + '<i class="fa fa-exclamation-triangle" style="margin-right:5px;"></i>'
+                        + enc(t('Contains') + ' ' + nestedNote(nested.length) + ': ' + paths.join(', '))
+                        + '</div>';
+                }
+                if (scan.truncated === true) {
+                    html += '<div style="font-size:11px;color:var(--anas-muted,gray);">'
+                        + enc(t('The scan did not finish — there may be more than listed.')) + '</div>';
+                }
+                setScanHtml(win, html);
+            },
+            function (err) {
+                if (stale()) {
+                    return;
+                }
+                // Fail-open and HONEST: an unavailable scan says so, it never
+                // renders as "nothing is nested".
+                setScanHtml(win, '<div style="font-size:11px;color:var(--anas-muted,gray);">'
+                    + enc(t('Could not check the source') + ': ' + ANAS.errText(err)) + '</div>');
+            }
+        );
+    }
+
+    function scheduleSourceScan(win, node) {
+        if (!win || win.destroyed || win.destroying) {
+            return;
+        }
+        try {
+            if (win._cloudScanTimer) {
+                clearTimeout(win._cloudScanTimer);
+            }
+            win._cloudScanTimer = setTimeout(function () {
+                win._cloudScanTimer = null;
+                scanCloudSource(win, node);
+            }, SOURCE_SCAN_DEBOUNCE_MS);
+        } catch (e) {
+            scanCloudSource(win, node);
+        }
+    }
+
+    function openPathFor(win, node) {
+        var cur = trim(valOf(win, '#cloudSource') || '');
+        if (!ANAS.pathPicker) {
+            // Fail-open: an older bundle without the picker must not break the
+            // wizard — the path field still takes a typed path.
+            ANAS.warn('path picker unavailable; type the path instead');
+            return;
+        }
+        ANAS.pathPicker({
+            node: node,
+            backend: 'live',
+            mode: 'dir',
+            value: cur || '/',
+            title: t('Choose a directory'),
+            onSelect: function (chosen) {
+                var f = win.down('#cloudSource');
+                if (f && chosen && chosen.path) {
+                    f.setValue(chosen.path);
+                }
+            },
+        });
+    }
+
+    function openTaskWizard(view, node, existing) {
+        var isEdit = !!existing;
+        var task = existing || {};
+        ANAS.api.get(node, '/cloud/remotes').then(function (res) {
+            if (!isEdit) {
+                // The remote combo is the wizard's one precondition: with no
+                // remote saved there is nothing to send to (the backup
+                // precedent — the toast names the button that fixes it).
+                var names = ((res && res.data) && res.data.remotes || []).map(function (r) {
+                    return r && r.name;
+                }).filter(function (n) {
+                    return !!n;
+                });
+                if (!names.length) {
+                    ANAS.toast(t(EMPTY_REMOTES_TOAST));
+                    return;
+                }
+            }
+            buildTaskWizard(view, node, isEdit, task);
+        }, function (err) {
+            ANAS.warn('cloud task wizard load failed: ' + ANAS.errText(err));
+            ANAS.alertMsg('Load failed',
+                t('Failed to load the rclone remotes') + ': ' + ANAS.errText(err));
+        });
+    }
+
+    function buildTaskWizard(view, node, isEdit, task) {
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-cloud-task',
+                title: isEdit ? (t('Edit Cloud Sync Task') + ': ' + (task.name || '')) : t('New Cloud Sync Task'),
+                modal: true,
+                width: 620,
+                height: 720,
+                resizable: true,
+                layout: 'fit',
+                items: [{
+                    xtype: 'form',
+                    itemId: 'form',
+                    bodyPadding: 12,
+                    border: false,
+                    scrollable: true,
+                    defaults: { anchor: '100%', labelWidth: 150 },
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            itemId: 'cloudTaskName',
+                            cls: 'anas-fld-cloud-task-name',
+                            fieldLabel: t('Task name'),
+                            emptyText: 'pictures-offsite',
+                            disabled: isEdit,
+                            allowBlank: false,
+                            value: task.name || '',
+                            regex: TASK_NAME_RE,
+                            maxLength: 64,
+                            regexText: t('Lowercase letters, digits and hyphens; must start with a letter or digit.'),
+                        },
+                        {
+                            // The local tree to send. Free-form typing stays
+                            // first-class; the picker only fills the field in.
+                            xtype: 'fieldcontainer',
+                            fieldLabel: t('Source'),
+                            labelWidth: 150,
+                            layout: 'hbox',
+                            items: [
+                                {
+                                    xtype: 'textfield',
+                                    itemId: 'cloudSource',
+                                    cls: 'anas-fld-cloud-source',
+                                    flex: 1,
+                                    emptyText: '/tank/pictures',
+                                    allowBlank: false,
+                                    value: task.source || '',
+                                    listeners: {
+                                        change: function () {
+                                            scheduleSourceScan(win, node);
+                                        },
+                                    },
+                                },
+                                {
+                                    xtype: 'button',
+                                    itemId: 'cloudSourceBrowse',
+                                    cls: 'anas-btn-cloud-source-browse',
+                                    iconCls: 'fa fa-folder-open',
+                                    tooltip: t('Browse for a directory'),
+                                    margin: '0 0 0 6',
+                                    handler: function () {
+                                        openPathFor(win, node);
+                                    },
+                                },
+                            ],
+                        },
+                        {
+                            // The derived consistency + the nested note — from
+                            // the ONE preview-nested scan, said before the save.
+                            xtype: 'component',
+                            itemId: 'cloudSourceScan',
+                            cls: 'anas-cloud-source-scan',
+                            style: 'margin:-2px 0 8px 152px;',
+                            html: '',
+                        },
+                        {
+                            xtype: 'combobox',
+                            itemId: 'cloudRemote',
+                            cls: 'anas-fld-cloud-remote',
+                            fieldLabel: t('Remote'),
+                            queryMode: 'local',
+                            editable: false,
+                            forceSelection: true,
+                            allowBlank: false,
+                            displayField: 'name',
+                            valueField: 'name',
+                            emptyText: t('(no remotes configured)'),
+                            value: task.remote || '',
+                            listeners: {
+                                change: function () {
+                                    var w = this.up('window');
+                                    if (w && w._cloudRefreshGate) {
+                                        w._cloudRefreshGate();
+                                    }
+                                },
+                            },
+                        },
+                        {
+                            xtype: 'textfield',
+                            itemId: 'cloudRemotePath',
+                            cls: 'anas-fld-cloud-remote-path',
+                            fieldLabel: t('Path on remote'),
+                            emptyText: t('(the remote\'s own root)'),
+                            value: task.path || '',
+                        },
+                        {
+                            xtype: 'component',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                            html: enc(t('The path under the remote. Leave it empty to send to the '
+                                + 'remote\'s own root; on some backends (sftp) a leading / '
+                                + 'starts at the remote\'s absolute root.')),
+                        },
+                        {
+                            xtype: 'radiogroup',
+                            itemId: 'cloudMode',
+                            cls: 'anas-fld-cloud-mode',
+                            fieldLabel: t('Mode'),
+                            columns: 2,
+                            items: [
+                                {
+                                    boxLabel: t('Copy'),
+                                    name: 'cloudMode', inputValue: 'copy',
+                                    checked: task.mode !== 'sync',
+                                },
+                                {
+                                    boxLabel: t('Sync'),
+                                    name: 'cloudMode', inputValue: 'sync',
+                                    checked: task.mode === 'sync',
+                                },
+                            ],
+                        },
+                        {
+                            // The one sentence, always visible, verbatim from
+                            // the design — the deletion difference is the one
+                            // thing to have read before choosing sync.
+                            xtype: 'component',
+                            itemId: 'cloudModeNote',
+                            cls: 'anas-cloud-mode-note',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-2px 0 8px 152px;',
+                            html: enc(t(SYNC_SENTENCE)),
+                        },
+                        {
+                            xtype: 'textareafield',
+                            itemId: 'cloudExcludes',
+                            cls: 'anas-fld-cloud-excludes',
+                            fieldLabel: t('Excludes'),
+                            height: 60,
+                            emptyText: t('one per line — e.g. *.tmp'),
+                            value: (task.excludes && task.excludes.length)
+                                ? task.excludes.join('\n')
+                                : '',
+                        },
+                        {
+                            xtype: 'textfield',
+                            itemId: 'cloudBwlimit',
+                            cls: 'anas-fld-cloud-bwlimit',
+                            fieldLabel: t('Bandwidth limit'),
+                            emptyText: '8M',
+                            value: task.bwlimit || '',
+                        },
+                        {
+                            xtype: 'component',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                            html: enc(t('Optional — an rclone rate (digits, optionally suffixed '
+                                + 'K, M or G). Empty = no limit.')),
+                        },
+                        ANAS.sched.cadence.fieldset(ANAS.sched.cadence.of(task), task, function () {
+                            if (win) {
+                                ANAS.sched.cadence.syncFields(win);
+                            }
+                        }, 'cloud'),
+                        ANAS.notifyMode.field({
+                            itemId: 'notifyMode',
+                            cls: 'anas-fld-cloud-notify',
+                            value: task.notify === 'on-failure' ? 'on-failure' : 'always',
+                        }),
+                        {
+                            xtype: 'component',
+                            style: 'color:var(--anas-muted,gray);font-size:11px;margin:-4px 0 8px 152px;',
+                            html: enc(t('A finished run notifies through the Proxmox notification '
+                                + 'system (type anas-cloud). "Always" mails every run that happened; '
+                                + '"On failure" mails only a failed run. A skipped off week never notifies.')),
+                        },
+                        {
+                            xtype: 'checkboxfield',
+                            itemId: 'cloudEnabled',
+                            cls: 'anas-fld-cloud-enabled',
+                            fieldLabel: t('Enabled'),
+                            boxLabel: t('Run on the schedule'),
+                            checked: task.enabled !== false,
+                        },
+                    ],
+                }],
+                buttons: [
+                    { text: t('Cancel'), handler: function () { win.close(); } },
+                    {
+                        text: isEdit ? t('Save') : t('Create'),
+                        itemId: 'submit',
+                        cls: 'anas-btn-cloud-task-submit',
+                        handler: function () {
+                            try {
+                                submitCloudTask(win, view, node, isEdit, task);
+                            } catch (e) {
+                                ANAS.warn('cloud task submit failed: ' + ANAS.errText(e));
+                            }
+                        },
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('cloud task wizard failed: ' + ANAS.errText(e));
+            return;
+        }
+
+        win._cloudRefreshGate = function () {
+            // The remote combo gates nothing else today; the hook exists so a
+            // field change has one place to go (the save re-checks every gate).
+        };
+        win.show();
+        ANAS.sched.cadence.syncFields(win); // show only the fields the opening cadence uses
+        scheduleSourceScan(win, node); // the consistency + nested note for the opening source
+    }
+
+    // Build the request body the shared CloudSyncTaskRequest schema accepts —
+    // or null after alerting. Excludes ride as the ARRAY the schema wants (the
+    // textarea is one per line); a cleared bandwidth limit sends nothing
+    // (absent = no limit — the schema normalises the empty string, but absent
+    // is what a cleared field means); a structured cadence rides ALONE and the
+    // daemon generates the OnCalendar (one generator, in the shared schema —
+    // never a second copy here).
+    function cloudTaskBody(win) {
+        var body = {
+            name: trim(valOf(win, '#cloudTaskName') || ''),
+            source: trim(valOf(win, '#cloudSource') || ''),
+            remote: trim(valOf(win, '#cloudRemote') || ''),
+            path: trim(valOf(win, '#cloudRemotePath') || ''),
+            mode: (valOf(win, '#cloudMode') || {}).cloudMode === 'sync' ? 'sync' : 'copy',
+            excludes: splitLines(valOf(win, '#cloudExcludes')),
+            notify: valOf(win, '#notifyMode') === 'on-failure' ? 'on-failure' : 'always',
+            enabled: valOf(win, '#cloudEnabled') === true,
+        };
+        var bw = trim(valOf(win, '#cloudBwlimit') || '');
+        if (bw) {
+            body.bwlimit = bw;
+        }
+        // Custom = the raw OnCalendar the user typed; every other kind sends
+        // the structured cadence (readCadence alerts what is wrong itself).
+        var kind = ANAS.sched.cadence.kindOf(win);
+        if (kind === 'custom') {
+            body.schedule = trim(valOf(win, '#schedule') || '');
+            if (!body.schedule) {
+                ANAS.alertMsg('Invalid input', t('Enter a schedule.'));
+                return null;
+            }
+        } else {
+            var cad = ANAS.sched.cadence.read(win);
+            if (!cad) {
+                return null; // readCadence already said what is wrong
+            }
+            body.cadence = cad;
+        }
+        return body;
+    }
+
+    function submitCloudTask(win, view, node, isEdit, task) {
+        var body = cloudTaskBody(win);
+        if (!body) {
+            return; // cloudTaskBody already said what is wrong
+        }
+        if (!TASK_NAME_RE.test(body.name) || body.name.length > 64) {
+            ANAS.alertMsg('Invalid input',
+                t('Task name must be lowercase letters, digits and hyphens (≤64 chars).'));
+            return;
+        }
+        if (!body.source || body.source.charAt(0) !== '/') {
+            ANAS.alertMsg('Invalid input', t('Enter an absolute source path.'));
+            return;
+        }
+        if (!body.remote) {
+            ANAS.alertMsg('Invalid input', t('Choose a remote.'));
+            return;
+        }
+        // The daemon's save-time refusals (a remote the file does not carry, a
+        // schedule systemd will not accept) answer 400 with the sentence — the
+        // job-failure alert shows it under the field it belongs to.
+        ANAS.runJob({
+            node: node,
+            method: isEdit ? 'put' : 'post',
+            path: isEdit ? ('/cloud/tasks/' + encodeURIComponent(body.name)) : '/cloud/tasks',
+            body: body,
+            view: win,
+            failTitle: isEdit ? 'Save failed' : 'Create failed',
+            successMsg: isEdit ? (t('Cloud sync task saved') + ': ' + body.name)
+                : (t('Cloud sync task created') + ': ' + body.name),
+            onComplete: function () {
+                if (!win.destroyed && !win.destroying) {
+                    win.close();
+                }
+                // The grid reloads with the new row selected (create) — and
+                // reloads on FAILURE too (the handler below).
+                loadTasks(view, node, false, isEdit ? undefined : body.name);
+            },
+            onFailed: function () {
+                loadTasks(view, node);
+            },
+        });
+    }
+
+    // ---- View ---------------------------------------------------------------
+
+    function cloudView(node) {
+        var store = Ext.create('Ext.data.Store', {
+            fields: [
+                'name', 'source', 'remote', 'path', 'destination', 'mode',
+                'notify', 'bwlimit', 'schedule', 'lastRunResult', 'lastRunAt',
+                'nextRunAt',
+                { name: 'excludes', type: 'auto' },
+                { name: 'cadence', type: 'auto' },
+                { name: 'enabled', type: 'auto' },
+                { name: 'overdue', type: 'auto' },
+                { name: 'raw', type: 'auto' },
+            ],
+            data: [],
+            sorters: [{ property: 'name', direction: 'ASC' }],
+        });
+
+        var tbar = [
+            {
+                text: t('Reload'),
+                cls: 'anas-btn-refresh anas-btn-cloud-refresh',
+                iconCls: 'fa fa-refresh',
+                handler: function (btn) {
+                    loadTasks(btn.up('#cloudView'), node);
+                },
+            },
+            {
+                text: t('Create…'),
+                cls: 'anas-btn-cloud-task-create',
+                iconCls: 'fa fa-plus',
+                handler: function (btn) {
+                    openTaskWizard(btn.up('#cloudView'), node, null);
+                },
+            },
+            {
+                text: t('Remotes…'),
+                cls: 'anas-btn-cloud-remotes',
+                iconCls: 'fa fa-server',
+                handler: function () {
+                    openRemotesManager(node);
+                },
+            },
+            '-',
+            {
+                text: t('Run Now'),
+                itemId: 'cloudTaskRun',
+                cls: 'anas-btn-cloud-task-run',
+                iconCls: 'fa fa-play-circle',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#cloudView');
+                    var rec = selectedTask(gridOf(view));
+                    if (rec) {
+                        runTaskNow(view, node, rec.get('name'));
+                    }
+                },
+            },
+            {
+                text: t('Details'),
+                itemId: 'cloudTaskDetails',
+                cls: 'anas-btn-cloud-task-details',
+                iconCls: 'fa fa-info-circle',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#cloudView');
+                    var rec = selectedTask(gridOf(view));
+                    if (rec) {
+                        openTaskDetail(node, rec.get('name'), view);
+                    }
+                },
+            },
+            {
+                text: t('Edit'),
+                itemId: 'cloudTaskEdit',
+                cls: 'anas-btn-cloud-task-edit',
+                iconCls: 'fa fa-pencil',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#cloudView');
+                    var rec = selectedTask(gridOf(view));
+                    openTaskWizard(view, node, rec ? (rec.get('raw') || {}) : null);
+                },
+            },
+            {
+                text: t('Disable'),
+                itemId: 'cloudTaskToggle',
+                cls: 'anas-btn-cloud-task-toggle',
+                iconCls: 'fa fa-pause',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#cloudView');
+                    toggleTask(view, node, selectedTask(gridOf(view)));
+                },
+            },
+            {
+                text: t('Remove'),
+                itemId: 'cloudTaskRemove',
+                cls: 'anas-btn-cloud-task-remove',
+                iconCls: 'fa fa-trash',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#cloudView');
+                    removeTask(view, node, selectedTask(gridOf(view)));
+                },
+            },
+        ];
+
+        return {
+            xtype: 'panel',
+            itemId: 'cloudView',
+            cls: 'anas-view anas-view-cloud',
+            title: t('Cloud Sync'),
+            layout: { type: 'vbox', align: 'stretch' },
+            border: false,
+            items: [
+                {
+                    xtype: 'gridpanel',
+                    itemId: 'cloudTasksGrid',
+                    cls: 'anas-grid-cloud-tasks',
+                    flex: 1,
+                    border: false,
+                    store: store,
+                    selModel: { mode: 'SINGLE' },
+                    emptyText: t('No cloud sync tasks defined'),
+                    columns: [
+                        {
+                            text: t('Name'), dataIndex: 'name', width: 150,
+                            renderer: Ext.String.htmlEncode,
+                        },
+                        {
+                            text: t('Source'), dataIndex: 'source', flex: 1,
+                            minWidth: 180, sortable: false, menuDisabled: true,
+                            renderer: renderSource,
+                        },
+                        {
+                            text: t('Destination'), dataIndex: 'destination',
+                            width: 220, sortable: false, menuDisabled: true,
+                            renderer: renderDestination,
+                        },
+                        {
+                            text: t('Mode'), dataIndex: 'mode', width: 80,
+                            align: 'center', renderer: renderMode,
+                        },
+                        {
+                            // Wide enough for a spelled-out cadence ("Every
+                            // other week · Tue · 02:00 · even ISO weeks") —
+                            // never truncated (the Backup grid's own width).
+                            text: t('Schedule'), dataIndex: 'schedule', width: 260,
+                            renderer: renderSchedule,
+                        },
+                        {
+                            text: t('Last run'), dataIndex: 'lastRunResult', width: 170,
+                            sortable: false, menuDisabled: true, renderer: renderLastRun,
+                        },
+                        {
+                            text: t('Next run'), dataIndex: 'nextRunAt', width: 110,
+                            renderer: renderNextRun,
+                        },
+                        {
+                            text: t('Enabled'), dataIndex: 'enabled', width: 90,
+                            align: 'center', renderer: renderEnabled,
+                        },
+                    ],
+                    tbar: ANAS.tbar(tbar),
+                    listeners: {
+                        selectionchange: function (selModel, selected) {
+                            var grid = this;
+                            if (grid.anasReloading && !(selected && selected.length)) {
+                                return;
+                            }
+                            updateTaskButtons(grid);
+                        },
+                        itemdblclick: function (grid, rec) {
+                            var view = grid.up('#cloudView');
+                            openTaskWizard(view, node, rec ? (rec.get('raw') || {}) : null);
+                        },
+                    },
+                },
+                {
+                    // 503 — the node has no rclone: the daemon's sentence takes
+                    // the grid's place.
+                    xtype: 'component',
+                    itemId: 'cloudTasksUnavailable',
+                    cls: 'anas-cloud-unavailable',
+                    hidden: true,
+                },
+            ],
+            listeners: ANAS.sched.viewListeners(function (v, quiet) {
+                loadTasks(v, node, quiet);
+            }),
+        };
+    }
+
     ANAS.cloud = {
         openRemotes: openRemotesManager,
+        openTasks: openTaskWizard,
+    };
+
+    // ---- View registration -------------------------------------------------
+
+    ANAS.views['cloud'] = {
+        itemId: 'anas-cloud',
+        text: t('Cloud Sync'),
+        iconCls: 'fa fa-cloud',
+        factory: function (node) {
+            try {
+                return cloudView(node);
+            } catch (e) {
+                ANAS.warn('cloud view failed: ' + ANAS.errText(e));
+                return ANAS.errorPanel(ANAS.errText(e));
+            }
+        },
     };
 })();

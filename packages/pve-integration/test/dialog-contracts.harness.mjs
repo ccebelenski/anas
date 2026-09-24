@@ -1344,7 +1344,7 @@ function sweepFields(label, body, want) {
 }
 
 async function backupChecks() {
-  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   // afterrender is what the PVE UI fires on the real view; it loads the grid.
   view.fireEvent('afterrender', view)
@@ -1480,7 +1480,7 @@ async function save(dlg) {
 }
 
 async function nestedChecks() {
-  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -1640,7 +1640,7 @@ async function sourceGuardChecks() {
 // ============================================================================
 
 async function consistencyChecks() {
-  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -1699,7 +1699,7 @@ async function consistencyChecks() {
 // ============================================================================
 
 async function imageKindChecks() {
-  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -1821,7 +1821,7 @@ async function imageKindChecks() {
 // ============================================================================
 
 async function lunPickerChecks() {
-  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -1898,7 +1898,7 @@ async function lunPickerChecks() {
 //    `kind: 'block'` verbatim and keeps its stored archive name.
 
 async function backupTaskKindChecks() {
-  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -4285,7 +4285,7 @@ const RESTORE_ROUTES = {
  */
 async function openRestoreDialog(routes = RESTORE_ROUTES) {
   ajax.responses = { '/network': PVE_NETWORK }
-  const ANAS = loadSources(['12-picker.js', '68-backup.js', '75-iscsi.js'], routes)
+  const ANAS = loadSources(['69-schedules-common.js', '12-picker.js', '68-backup.js', '75-iscsi.js'], routes)
   const view = makeComponent(ANAS.views.iscsi.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -5462,7 +5462,7 @@ const LUN_BACKUP_ROUTES = {
 
 /** Both sources into one sandbox, then the iSCSI view — as on the real page. */
 async function openLunBackupView(routes) {
-  const ANAS = loadSources(['68-backup.js', '75-iscsi.js'], routes)
+  const ANAS = loadSources(['69-schedules-common.js', '68-backup.js', '75-iscsi.js'], routes)
   const view = makeComponent(ANAS.views.iscsi.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -6262,7 +6262,7 @@ async function pickerChecks() {
 
 async function pickedPathChecks() {
   liveCalls.length = 0
-  const ANAS = loadPickerSources(['12-picker.js', '68-backup.js'])
+  const ANAS = loadPickerSources(['69-schedules-common.js', '12-picker.js', '68-backup.js'])
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -6861,7 +6861,7 @@ async function pickFileSnapshot(dlg) {
  * half needs (the LUN inventory, the new-LUN target + backing pickers).
  */
 function loadRestoreSources() {
-  const ANAS = loadPickerSources(['12-picker.js', '68-backup.js', '75-iscsi.js'])
+  const ANAS = loadPickerSources(['69-schedules-common.js', '12-picker.js', '68-backup.js', '75-iscsi.js'])
   const ROUTES = { ...FILE_RESTORE_ROUTES, ...ISCSI_ROUTES }
   const baseGet = ANAS.api.get
   ANAS.api.get = (node, path) => {
@@ -7760,7 +7760,7 @@ async function runNotesChecks() {
  * after the second has painted — the stale verdict must be dropped.
  */
 async function nestedScanRaceCheck() {
-  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
   const parked = []
   const basePost = ANAS.api.post
   ANAS.api.post = (node, path, body) => (path === '/backup/tasks/preview-nested' && body && body.path === '/etc'
@@ -7815,7 +7815,7 @@ async function restoreRepoNamespacePrefillCheck() {
     'GET /backup/repos/pbs/groups': { data: { verdict: 'ok', repository: 'pbs', groups: [] } },
     'GET /backup/repos/pbs-offsite/groups': { data: { verdict: 'ok', repository: 'pbs-offsite', groups: [] } },
   }
-  const ANAS = loadSource('68-backup.js', routes)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], routes)
   const view = makeComponent({ xtype: 'panel' }, null)
   ANAS.backupRestore.open(view, 'harness', { repo: 'pbs' })
   await settle()
@@ -7833,7 +7833,7 @@ async function restoreRepoNamespacePrefillCheck() {
  * it), and every existing caller keeps working without one.
  */
 async function taskDoorOnDoneCheck() {
-  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
@@ -11467,6 +11467,284 @@ async function cloudChecks() {
 warnings.length = 0
 created.windows.length = 0
 await cloudChecks()
+
+// ============================================================================
+//  Cloud sync tasks (rclone.3) — the Cloud Sync workflow: what the wizard
+//  SENDS (mode default copy, excludes split one per line, bwlimit absent when
+//  cleared, the shared cadence widget's object, notify default), the empty-
+//  remotes toast, the nested note from preview-nested, the toolbar (Run now,
+//  toggle round-trip, Remove confirm), the grid reloading after every job of
+//  its own on SUCCESS and FAILURE, the failed Last run cell's error tooltip,
+//  and the dashboard's cloud warning glyph.
+// ============================================================================
+
+// One saved task with every field non-default, plus the LOCAL-ONLY status the
+// grid derives (CloudSyncTaskView).
+const CLOUD_TASK = {
+  name: 'pictures-offsite',
+  source: '/mnt/pictures',
+  remote: 'gt',
+  path: 'pictures',
+  mode: 'copy',
+  excludes: ['*.tmp'],
+  notify: 'always',
+  schedule: 'Mon *-*-* 02:00',
+  cadence: { kind: 'weekly', days: ['Mon'], time: '02:00' },
+  enabled: true,
+}
+const CLOUD_TASK_VIEW = {
+  ...CLOUD_TASK,
+  lastRunResult: 'never-run',
+  lastRunAt: null,
+  nextRunAt: null,
+  overdue: false,
+}
+
+function cloudTaskRoutes() {
+  return {
+    ...cloudRoutes([CLOUD_SFTP_REMOTE]),
+    'GET /cloud/tasks': { data: [CLOUD_TASK_VIEW] },
+    'POST /cloud/tasks': { job: { id: 'cloud-task-create' } },
+    'PUT /cloud/tasks/pictures-offsite': { job: { id: 'cloud-task-update' } },
+    'DELETE /cloud/tasks/pictures-offsite': { job: { id: 'cloud-task-del' } },
+    'POST /cloud/tasks/pictures-offsite/run': { job: { id: 'cloud-task-run' } },
+    'POST /backup/tasks/preview-nested': (body) => nestedPreviewRoute(body),
+  }
+}
+
+async function openCloudTasks(routes) {
+  const ANAS = loadSources(['10-api.js', '69-schedules-common.js', '72-cloud.js'], routes)
+  const view = makeComponent(ANAS.views.cloud.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  return { ANAS, view, grid: view.down('#cloudTasksGrid') }
+}
+
+async function cloudTaskChecks() {
+  const routes = cloudTaskRoutes()
+  const { ANAS, view, grid } = await openCloudTasks(routes)
+  ok('cloud tasks: the view carries the menu entry', ANAS.views.cloud && ANAS.views.cloud.text === 'Cloud Sync')
+  ok('cloud tasks: the grid loaded the saved task', grid && grid.getStore().getCount() === 1, String(grid && grid.getStore().getCount()))
+
+  // --- the Remotes… door opens the rclone.1 manager window ------------------
+  created.windows.length = 0
+  const remotesBtn = findCmp(view, 'anas-btn-cloud-remotes')
+  ok('cloud tasks: the toolbar carries the Remotes… door', !!remotesBtn)
+  remotesBtn.handler(remotesBtn)
+  await settle()
+  const remotesWin = openWindow()
+  ok('cloud tasks: Remotes… opens the remotes manager (the rclone.1 window, not a copy)',
+    remotesWin && remotesWin.cls === 'anas-win-cloud-remotes' && !!remotesWin.down('#cloudRemotesGrid'))
+  created.windows.length = 0
+
+  // --- toolbar gating --------------------------------------------------------
+  ok('cloud tasks: Run/Details/Edit/Toggle/Remove start disabled (no selection)',
+    grid.down('#cloudTaskRun').disabled && grid.down('#cloudTaskDetails').disabled
+    && grid.down('#cloudTaskEdit').disabled && grid.down('#cloudTaskRemove').disabled)
+  grid.selectRow(0)
+  ok('cloud tasks: a selection enables them all',
+    !grid.down('#cloudTaskRun').disabled && !grid.down('#cloudTaskDetails').disabled
+    && !grid.down('#cloudTaskEdit').disabled && !grid.down('#cloudTaskToggle').disabled
+    && !grid.down('#cloudTaskRemove').disabled)
+  ok('cloud tasks: the toggle reads Disable on an enabled task', grid.down('#cloudTaskToggle').text === 'Disable')
+
+  // --- create: the wizard's payload ------------------------------------------
+  const getsBeforeCreate = apiGets.filter(p => p === '/cloud/tasks').length
+  created.windows.length = 0
+  const createBtn = findCmp(view, 'anas-btn-cloud-task-create')
+  createBtn.handler(createBtn)
+  await settle()
+  const dlg = openWindow()
+  ok('cloud tasks: the create wizard opened', !!dlg && !!dlg.down('#cloudTaskName'))
+
+  // The sync sentence, verbatim, under the Mode radios.
+  ok('cloud tasks: the mode sentence is present and Copy is the default',
+    /Sync deletes files at the destination that are no longer in the source\. Copy never deletes\./
+      .test(dlg.down('#cloudModeNote').html || '')
+    && (dlg.down('#cloudMode').getValue() || {}).cloudMode === 'copy',
+    JSON.stringify(dlg.down('#cloudModeNote').html || ''))
+
+  // The nested note renders from the preview-nested scan — it follows the
+  // source field, so it lands once a source is set (an empty opening form has
+  // an empty note, honestly: there is no source to scan).
+  dlg.down('#cloudTaskName').setValue('pictures-offsite')
+  dlg.down('#cloudSource').setValue('/mnt/pictures')
+  await settle()
+  const scanHtml = dlg.down('#cloudSourceScan').html || ''
+  ok('cloud tasks: the nested note renders from preview-nested',
+    /Contains 1 nested filesystem that will not be included: \/mnt\/pictures\/raw/.test(scanHtml),
+    scanHtml)
+  ok('cloud tasks: the derived consistency chip rides the same scan',
+    /snapshot/.test(scanHtml) && /ZFS dataset tank\/pictures/.test(scanHtml), scanHtml)
+
+  dlg.down('#cloudRemote').setValue('gt')
+  dlg.down('#cloudRemotePath').setValue('pictures')
+  dlg.down('#cloudExcludes').setValue('*.tmp\n**/*.bak')
+  // The cadence path: weekly, Monday, the prefilled 02:00 — the shared widget,
+  // driven the way the Backup wizard's is.
+  dlg.down('#cadenceKind').setValue({ cadenceKind: 'weekly' })
+  await settle()
+  dlg.down('#dayMon').setValue(true)
+  jobs.length = 0
+  dlg.down('#submit').handler()
+  await settle()
+  eq('cloud tasks(create): one POST to /cloud/tasks', jobs.length && [jobs[0].method, jobs[0].path], ['post', '/cloud/tasks'])
+  eq('cloud tasks(create): the payload is the schema shape',
+    jobs[0] && jobs[0].body, {
+      name: 'pictures-offsite',
+      source: '/mnt/pictures',
+      remote: 'gt',
+      path: 'pictures',
+      mode: 'copy',
+      excludes: ['*.tmp', '**/*.bak'],
+      notify: 'always',
+      enabled: true,
+      cadence: { kind: 'weekly', days: ['Mon'], time: '02:00' },
+    })
+  ok('cloud tasks(create): no schedule key rides with a cadence (the daemon generates it)',
+    jobs[0] && !('schedule' in jobs[0].body))
+  ok('cloud tasks(create): a cleared bandwidth limit sends nothing',
+    jobs[0] && !('bwlimit' in jobs[0].body))
+
+  // The grid reloaded after the create job and the NEW row is selected.
+  ok('cloud tasks(create): the grid reloaded after the job (success)',
+    apiGets.filter(p => p === '/cloud/tasks').length === getsBeforeCreate + 1)
+  ok('cloud tasks(create): the new row is selected after the reload',
+    !!grid.getSelection().length && grid.getSelection()[0].get('name') === 'pictures-offsite',
+    JSON.stringify(grid.getSelection().map(r => r.get('name'))))
+  created.windows.length = 0
+
+  // --- create with NO remotes: the guiding toast, no wizard ------------------
+  const emptyRoutes = cloudTaskRoutes()
+  emptyRoutes['GET /cloud/remotes'] = {
+    data: { rclone: { version: '1.60.1', configFile: '/etc/anas/rclone.conf', encrypted: false }, remotes: [] },
+  }
+  const emptyAnas = loadSources(['10-api.js', '69-schedules-common.js', '72-cloud.js'], emptyRoutes)
+  const emptyView = makeComponent(emptyAnas.views.cloud.factory('harness'), null)
+  emptyView.fireEvent('afterrender', emptyView)
+  await settle()
+  toasts.length = 0
+  created.windows.length = 0
+  const emptyCreate = findCmp(emptyView, 'anas-btn-cloud-task-create')
+  emptyCreate.handler(emptyCreate)
+  await settle()
+  ok('cloud tasks(create): no remote saved → the guiding toast', toasts.some(m => /Add a remote first \(Remotes…\)/.test(m)), toasts.join(' | '))
+  eq('cloud tasks(create): no remote saved → no wizard', created.windows.length, 0)
+
+  // --- edit: changed keys ride the whole-task PUT ----------------------------
+  const editRoutes = cloudTaskRoutes()
+  const editAnas = loadSources(['10-api.js', '69-schedules-common.js', '72-cloud.js'], editRoutes)
+  const editView = makeComponent(editAnas.views.cloud.factory('harness'), null)
+  editView.fireEvent('afterrender', editView)
+  await settle()
+  const editGrid = editView.down('#cloudTasksGrid')
+  editGrid.selectRow(0)
+  created.windows.length = 0
+  editGrid.down('#cloudTaskEdit').handler(editGrid.down('#cloudTaskEdit'))
+  await settle()
+  const editDlg = openWindow()
+  ok('cloud tasks(edit): the wizard pre-fills', editDlg && editDlg.down('#cloudTaskName').getValue() === 'pictures-offsite'
+    && editDlg.down('#cloudSource').getValue() === '/mnt/pictures')
+  ok('cloud tasks(edit): the name is immutable', editDlg.down('#cloudTaskName').disabled === true)
+  // A sync retarget + a bandwidth limit: the PUT carries the whole task.
+  editDlg.down('#cloudMode').setValue({ cloudMode: 'sync' })
+  editDlg.down('#cloudBwlimit').setValue('8M')
+  jobs.length = 0
+  editDlg.down('#submit').handler()
+  await settle()
+  eq('cloud tasks(edit): the PUT targets the task', jobs.length && [jobs[0].method, jobs[0].path], ['put', '/cloud/tasks/pictures-offsite'])
+  eq('cloud tasks(edit): the body carries the changed fields and the stored ones',
+    jobs[0] && jobs[0].body, {
+      name: 'pictures-offsite',
+      source: '/mnt/pictures',
+      remote: 'gt',
+      path: 'pictures',
+      mode: 'sync',
+      excludes: ['*.tmp'],
+      notify: 'always',
+      enabled: true,
+      bwlimit: '8M',
+      cadence: { kind: 'weekly', days: ['Mon'], time: '02:00' },
+    })
+  created.windows.length = 0
+
+  // --- Run now: the one run path, and the reload on success AND failure ------
+  const runGetsBefore = apiGets.filter(p => p === '/cloud/tasks').length
+  jobs.length = 0
+  grid.down('#cloudTaskRun').handler(grid.down('#cloudTaskRun'))
+  await settle()
+  eq('cloud tasks(run): Run now POSTs the task /run (the unit supervises it)',
+    jobs.length && [jobs[0].method, jobs[0].path], ['post', '/cloud/tasks/pictures-offsite/run'])
+  eq('cloud tasks(run): the body is empty (non-direct)', jobs.length && jobs[0].body, {})
+  ok('cloud tasks(run): the grid reloaded when the job ended (success)',
+    apiGets.filter(p => p === '/cloud/tasks').length === runGetsBefore + 1)
+
+  const failGetsBefore = apiGets.filter(p => p === '/cloud/tasks').length
+  jobs.length = 0
+  grid.down('#cloudTaskRun').handler(grid.down('#cloudTaskRun'))
+  await settle()
+  const failJob = jobs[0]
+  ok('cloud tasks(run): the failed run reloads the grid too',
+    apiGets.filter(p => p === '/cloud/tasks').length === failGetsBefore + 1)
+  // The failed Last run cell: red, with the run's error line as the tooltip —
+  // the line the notification carries.
+  failJob.onFailed({ error: { message: 'rclone copy failed (exit 7): 2026/09/24 03:00 fatal error: max deletes reached' } })
+  await settle()
+  const errStore = grid.getStore()
+  eq('cloud tasks(run): the error line is recorded for the row', errStore._anasRunErrors && errStore._anasRunErrors['pictures-offsite'],
+    'rclone copy failed (exit 7): 2026/09/24 03:00 fatal error: max deletes reached')
+  const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
+  const failedCell = lastRunCol.renderer('failure', {}, {
+    get: (k) => ({ lastRunResult: 'failure', lastRunAt: null, overdue: false, name: 'pictures-offsite' }[k]),
+    store: errStore,
+  })
+  ok('cloud tasks(run): a failed Last run cell is red with the error line as its tooltip',
+    /#c23b2c|var\(--anas-danger/.test(failedCell)
+    && /max deletes reached/.test(failedCell)
+    && !/gtpass/.test(failedCell), failedCell)
+
+  // --- toggle: the whole task rides the PUT, enabled flipped -----------------
+  jobs.length = 0
+  grid.down('#cloudTaskToggle').handler(grid.down('#cloudTaskToggle'))
+  await settle()
+  eq('cloud tasks(toggle): the PUT flips enabled', jobs.length && jobs[0].body && jobs[0].body.enabled, false)
+  ok('cloud tasks(toggle): the stored fields ride through (a toggle must never drop one)',
+    jobs[0] && jobs[0].body && jobs[0].body.remote === 'gt' && jobs[0].body.source === '/mnt/pictures'
+    && jobs[0].body.mode === 'copy' && jobs[0].body.cadence && jobs[0].body.cadence.kind === 'weekly',
+    JSON.stringify(jobs[0] && jobs[0].body))
+
+  // --- remove: the confirm, then DELETE of the units only ---------------------
+  jobs.length = 0
+  confirms.length = 0
+  grid.down('#cloudTaskRemove').handler(grid.down('#cloudTaskRemove'))
+  await settle()
+  ok('cloud tasks(remove): the confirm names the task and what stays',
+    confirms.length === 1 && /pictures-offsite/.test(confirms[0].msg) && /remote is untouched|already at the remote/.test(confirms[0].msg),
+    JSON.stringify(confirms[0]))
+  eq('cloud tasks(remove): confirmed, it DELETEs the task units',
+    jobs.length && [jobs[0].method, jobs[0].path], ['del', '/cloud/tasks/pictures-offsite'])
+  ok('cloud tasks(remove): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/**
+ * The dashboard's warning glyphs: every category a daemon can stamp carries an
+ * icon. The map is exported as a pure seam (ANAS.dash.warnIcon) for exactly
+ * this assertion.
+ */
+function dashboardCloudIconChecks() {
+  const ANAS = loadSources(['50-dashboard.js'], {})
+  ok('dashboard: the cloud warning category carries the cloud glyph',
+    /fa-cloud/.test(ANAS.dash.warnIcon('cloud')), ANAS.dash.warnIcon('cloud'))
+  ok('dashboard: an unknown category still renders no icon', ANAS.dash.warnIcon('nope') === '')
+}
+
+warnings.length = 0
+created.windows.length = 0
+await cloudTaskChecks()
+
+warnings.length = 0
+created.windows.length = 0
+await dashboardCloudIconChecks()
 
 // ============================================================================
 //  Story vdevs.1 (GitHub #66) — consumer audit: every vdev CLASS is reachable

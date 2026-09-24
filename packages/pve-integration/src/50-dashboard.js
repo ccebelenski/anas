@@ -614,7 +614,11 @@
             // iSCSI (iscsi.5): block storage handed out over the network — a
             // plug, deliberately not the plain disk glyph, so a restore hole
             // does not read as a failing drive.
-            iscsi: 'fa-plug'
+            iscsi: 'fa-plug',
+            // Cloud sync (rclone.3): failing/overdue offsite copies — the same
+            // glyph the Cloud Sync menu carries, so a card and its menu find
+            // each other at a glance.
+            cloud: 'fa-cloud'
         };
         var fa = map['' + (category || '')];
         if (!fa) { return ''; }
@@ -2162,4 +2166,11 @@
             };
         }
     };
+
+    // The pure parts, exported so a harness can drive them without an ExtJS
+    // window — the same seam every other view's helpers use (rclone.3 pins the
+    // warning-category glyph map: every category a daemon can stamp carries an
+    // icon, so a new category renders named, not bare).
+    ANAS.dash = ANAS.dash || {};
+    ANAS.dash.warnIcon = warnIcon;
 })();
