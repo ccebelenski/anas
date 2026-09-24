@@ -1593,7 +1593,7 @@ async function nestedChecks() {
  * reason — nothing about this alert may touch what a save sends.
  */
 async function sourceGuardChecks() {
-  const ANAS = loadSource('68-backup.js', BACKUP_ROUTES)
+  const ANAS = loadSource(['69-schedules-common.js', '68-backup.js'], BACKUP_ROUTES)
   const view = makeComponent(ANAS.views.backup.factory('harness'), null)
   view.fireEvent('afterrender', view)
   await settle()
