@@ -74,11 +74,17 @@ function authedContext(
 
 async function pveTicket(playwright: PlaywrightWorkerArgs['playwright']): Promise<string | null> {
   const login = await playwright.request.newContext({ ignoreHTTPSErrors: true })
-  const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
-    form: { username: 'root@pam', password: 'anas-test' },
-  })
-  await login.dispose()
-  return ticketRes.ok() ? ((await ticketRes.json()).data.ticket as string) : null
+  try {
+    const ticketRes = await login.post(`${PVE_URL}/api2/json/access/ticket`, {
+      form: { username: 'root@pam', password: 'anas-test' },
+    })
+    const ok = ticketRes.ok()
+    const ticket = ok ? ((await ticketRes.json()).data.ticket as string) : null
+    return ticket
+  }
+  finally {
+    await login.dispose()
+  }
 }
 
 /** Poll a 202 job through GET /v1/jobs/:id until it completes or fails. */
