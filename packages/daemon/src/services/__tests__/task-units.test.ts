@@ -9,6 +9,7 @@ import { describe, it } from 'node:test'
 import { BACKUP_SKIP_EXIT_CODE } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
 import { BACKUP_UNIT_KIND } from '../backup-units.js'
+import { CLOUD_UNIT_KIND } from '../cloud-units.js'
 import {
   buildTaskWarnings,
   classifyTrigger,
@@ -43,19 +44,11 @@ import {
  * nothing of backup's leaks in (the last describe compares the two descriptors
  * over identical inputs).
  *
- * The descriptor below is the cloud store's, written here because cloud-units.ts
- * itself lands in the next slice. The unit names, the journal lines and the
- * warning text are exactly what that store will produce.
+ * The second descriptor is the cloud store's OWN (`cloud-units.ts`, rclone.2
+ * slice 2) — it moved there when that store landed, so this file proves the
+ * parameterisation against the descriptor production actually uses, not a copy
+ * of it.
  */
-const CLOUD_UNIT_KIND: TaskUnitKind = {
-  prefix: 'anas-cloud-',
-  marker: 'X-ANAS-Task=',
-  runnerScript: '/opt/anas/packages/daemon/dist/cloud-task.js',
-  warningCategory: 'cloud',
-  label: 'cloud sync',
-  title: 'Cloud sync',
-  view: 'Cloud Sync',
-}
 
 const SYSTEMCTL = '/usr/bin/systemctl'
 const SYSTEMD_ANALYZE = '/usr/bin/systemd-analyze'
@@ -736,8 +729,8 @@ describe('task units — both descriptors, identical inputs, identical answers',
     assert.deepEqual(await forKind(CLOUD_UNIT_KIND), await forKind(BACKUP_UNIT_KIND))
   })
 
-  it('the gate decides the same way off either prefix', async () => {
-    const forKind = async (kind: TaskUnitKind): Promise<unknown> => {
+  it('the gate decides the same way off either prefix — only the NOUN differs', async () => {
+    const forKind = async (kind: TaskUnitKind) => {
       // An OFF week (39, odd), so the decision pays for the journal read too.
       const mock = triggerFixtures(
         journalMock(successJournal('2026-09-15T02:00:07+0000', [], kind), kind),
@@ -746,7 +739,21 @@ describe('task units — both descriptors, identical inputs, identical answers',
       )
       return gateRun(kind, mock, task({ cadence: BIWEEKLY }), new Date(2026, 8, 22, 2, 0))
     }
-    assert.deepEqual(await forKind(CLOUD_UNIT_KIND), await forKind(BACKUP_UNIT_KIND))
+    const cloud = await forKind(CLOUD_UNIT_KIND)
+    const backup = await forKind(BACKUP_UNIT_KIND)
+    assert.deepEqual(
+      { run: cloud.run, reason: cloud.reason },
+      { run: backup.run, reason: backup.reason },
+      'the decision itself is one implementation',
+    )
+    // The detail is the same sentence with the kind's own word in it — a cloud
+    // sync's skip must never journal "backup" (rclone.2), and backup's string
+    // must not change because cloud exists.
+    assert.equal(
+      backup.detail,
+      'ISO week 39 is odd, this task runs even weeks — skipped (off week); last successful backup 7.2 days ago',
+    )
+    assert.equal(cloud.detail, backup.detail.replace('successful backup', 'successful cloud sync'))
   })
 
   it('supervision reports the same run off either prefix', async () => {

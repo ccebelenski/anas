@@ -188,8 +188,9 @@ export {
   UpsertBackupRepoRequest,
 } from './schemas/backup.js'
 
-// Cloud sync schemas (rclone.1)
+// Cloud sync schemas (rclone.1 remotes, rclone.2 tasks)
 export {
+  CloudBandwidthLimit,
   CloudProvider,
   CloudProviderExample,
   CloudProviderOption,
@@ -202,6 +203,13 @@ export {
   CloudRemoteTestVerdict,
   CloudRemoteUpdate,
   CloudRemoteWrite,
+  CloudSyncMode,
+  CloudSyncRunRequest,
+  CloudSyncRunResult,
+  CloudSyncTask,
+  CloudSyncTaskDetail,
+  CloudSyncTaskRequest,
+  CloudSyncTaskView,
 } from './schemas/cloud.js'
 
 // Common validators

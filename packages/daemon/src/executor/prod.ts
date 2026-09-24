@@ -72,6 +72,15 @@ export class ProdExecutor implements CommandExecutor {
         },
       )
 
+      // Live stderr TEE: execFile still buffers everything for the result, but
+      // a caller that wants progress as it happens (rclone's JSON stats, pbc's
+      // restore lines) gets each chunk here rather than waiting for the exit.
+      if (opts?.onStderr) {
+        child.stderr?.on('data', (d) => {
+          opts.onStderr?.(String(d))
+        })
+      }
+
       // Feed stdin for secrets (e.g. smbpasswd -s reads the password here, so
       // it never lands in argv / the process list), then close the stream.
       if (opts?.stdin !== undefined && child.stdin) {

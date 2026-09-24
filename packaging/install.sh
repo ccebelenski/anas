@@ -52,8 +52,9 @@ MIN_ZFS="2.2"
 # TYPE, so operators can match on the kind of event): anas-ahr = array/pool
 # events (AHR §7.2), anas-backup = backup-run results (16.12), anas-snapshot =
 # snapshot-schedule run failures and anas-replication = replication run
-# failures (9.4). Listed once — the preflight check and the install step both
-# read this list, and uninstall.sh removes exactly the same names.
+# failures (9.4), anas-cloud = cloud sync run results (rclone.2). Listed once —
+# the preflight check and the install step both read this list, and
+# uninstall.sh removes exactly the same names.
 NOTIFY_TEMPLATES=(
   anas-ahr-subject.txt.hbs
   anas-ahr-body.txt.hbs
@@ -63,6 +64,8 @@ NOTIFY_TEMPLATES=(
   anas-snapshot-body.txt.hbs
   anas-replication-subject.txt.hbs
   anas-replication-body.txt.hbs
+  anas-cloud-subject.txt.hbs
+  anas-cloud-body.txt.hbs
 )
 
 # The iSCSI boot-ordering drop-in (story iscsi.5). rtslib-fb-targetctl.service

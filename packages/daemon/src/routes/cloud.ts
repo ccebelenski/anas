@@ -1,17 +1,57 @@
-import type { CloudProvider, CloudRemoteTestRequest, CloudRemoteTestResult, CloudRemoteWrite } from '@anas/shared'
+import type {
+  CloudProvider,
+  CloudRemoteTestRequest,
+  CloudRemoteTestResult,
+  CloudRemoteWrite,
+  CloudSyncTask,
+  CloudSyncTaskDetail,
+  CloudSyncTaskView,
+} from '@anas/shared'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { RcloneConfigPaths } from '../services/rclone-config.js'
 import { access, constants } from 'node:fs/promises'
-import { CloudRemoteName, CloudRemoteTestRequest as CloudRemoteTestRequestSchema, CloudRemoteUpdate as CloudRemoteUpdateSchema, CloudRemoteWrite as CloudRemoteWriteSchema } from '@anas/shared'
+import {
+  BACKUP_SKIPPED_OFF_WEEK,
+  BackupName,
+  CloudRemoteName,
+  CloudRemoteTestRequest as CloudRemoteTestRequestSchema,
+  CloudRemoteUpdate as CloudRemoteUpdateSchema,
+  CloudRemoteWrite as CloudRemoteWriteSchema,
+  CloudSyncRunRequest,
+  CloudSyncTaskRequest,
+} from '@anas/shared'
+import { readAhrPools } from '../services/ahr-topology.js'
+import { deriveConsistency, readConsistencyFacts } from '../services/backup-consistency.js'
+import { notifyCloudRun } from '../services/cloud-notify.js'
+import { runCloudSync } from '../services/cloud-runner.js'
+import {
+  DEFAULT_SYSTEMD_DIR,
+  deriveTaskStatus,
+  DISABLED_HISTORY_NOTE,
+  effectiveSchedule,
+  gateRun,
+  readAllTasks,
+  readRecentJournal,
+  readTask,
+  readUnitTexts,
+  removeTaskUnits,
+  superviseRun,
+  taskFileExists,
+  tasksReferencingRemote,
+  validateSchedule,
+  writeTaskUnits,
+} from '../services/cloud-units.js'
+import { scanNestedFilesystems } from '../services/nested-filesystems.js'
 import { RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, RemoteNotFoundError, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
 
 /**
- * Cloud sync — remotes (story rclone.1, DESIGN "Cloud sync — rclone").
+ * Cloud sync — remotes (story rclone.1) and TASKS (story rclone.2), DESIGN
+ * "Cloud sync — rclone".
  *
  *   GET    /v1/cloud/providers        → rclone's backend catalogue, trimmed
  *   GET    /v1/cloud/remotes          → { rclone: {version, configFile, encrypted}, remotes }
@@ -19,10 +59,21 @@ import { requireIdentity } from './identity.js'
  *   PUT    /v1/cloud/remotes/:name    → 202 job (type immutable)
  *   DELETE /v1/cloud/remotes/:name    → 202 job (409 while a task references it)
  *   POST   /v1/cloud/remotes/test     → 200 { verdict, message } (bounded lsjson, no job)
+ *   GET    /v1/cloud/tasks            → the grid: task + LOCAL-ONLY systemd status
+ *   POST   /v1/cloud/tasks            → 202 job (remote must exist; schedule validated)
+ *   GET    /v1/cloud/tasks/:name      → detail: consistency, nested, unit+timer, journal
+ *   PUT    /v1/cloud/tasks/:name      → 202 job (update / enable / disable)
+ *   DELETE /v1/cloud/tasks/:name      → 202 job (units only; the remote is untouched)
+ *   POST   /v1/cloud/tasks/:name/run  → 202 job (guards → snapshot → rclone → notify)
  *
- * The store is ANAS's OWN rclone.conf — the service layer (rclone-config.ts)
- * owns the file, the secrets and the gate; these routes are the doors:
- * identity via {@link requireIdentity}, mutations as quick audit jobs
+ * Two stores, one prefix. REMOTES live in ANAS's own rclone.conf — the service
+ * layer (rclone-config.ts) owns the file, the secrets and the gate. TASKS are
+ * the systemd units themselves (cloud-units.ts) — no second config source and
+ * no scheduler of ANAS's own; every derivation behind them is local (systemd +
+ * journald + the mount table).
+ *
+ * These routes are the doors:
+ * identity via {@link requireIdentity}, mutations as jobs
  * answering 202 with the job ref, refusals as the standard error envelope
  * (`{ error: { code, message } }` — the code is what the gateway's
  * cross-node classifier keys on, the message names the thing: the duplicate,
@@ -68,11 +119,16 @@ export interface CloudRouteOptions {
   jobQueue: JobQueue
   /** The rclone config store paths (`defaultRcloneConfigPaths()` in prod). */
   paths: RcloneConfigPaths
+  /** Where the `anas-cloud-*` units live (the one systemd dir every store uses). */
+  systemdDir?: string
+  /** The fstab the run's source guard reads (Mounts' path; overridable for tests). */
+  fstabPath?: string
+  /** PVE storage.cfg for the consistency derivation (env/default when absent). */
+  storagePath?: string
   /**
    * The cloud sync task names referencing `name` (the delete refusal's hard
-   * 409 names them). The task store lands in rclone.2, which wires this in;
-   * the default (none) refuses nothing — rclone.1 ships the check against an
-   * empty store.
+   * 409 names them). Defaults to the REAL task store (rclone.2); the override
+   * exists so a test can drive the refusal without writing unit files.
    */
   referencingTasks?: (name: string) => Promise<string[]>
   /**
@@ -86,7 +142,11 @@ export interface CloudRouteOptions {
 export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptions) {
   const { executor, jobQueue, paths } = opts
   const available = opts.rcloneAvailable ?? rcloneIsInstalled
-  const referencingTasks = opts.referencingTasks ?? (async () => [] as string[])
+  const systemdDir = opts.systemdDir ?? DEFAULT_SYSTEMD_DIR
+  const fstabPath = opts.fstabPath ?? '/etc/fstab'
+  // The real store answers the remotes DELETE refusal now that it exists
+  // (rclone.1 shipped the hook against an empty store).
+  const referencingTasks = opts.referencingTasks ?? (name => tasksReferencingRemote(systemdDir, name))
 
   /** Refuse before the call: the availability probe (no binary → the sentinel). */
   async function requireRclone(): Promise<void> {
@@ -364,6 +424,309 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (data === undefined || data === null)
       return undefined
     return { data }
+  })
+
+  // =========================================================================
+  //  Tasks (rclone.2) — the units ARE the store
+  // =========================================================================
+
+  /** Parse + validate a task name from the URL, replying 400 itself on failure. */
+  function taskName(raw: string, reply: FastifyReply): string | null {
+    const parsed = BackupName.safeParse(raw)
+    if (parsed.success)
+      return parsed.data
+    reply.code(400).send({ error: { code: 'VALIDATION_ERROR', message: `Invalid task name: ${zodIssue(parsed.error)}` } })
+    return null
+  }
+
+  /**
+   * The save-time checks a task must pass, in the order that makes the
+   * refusal most useful: the remote has to exist (a task naming a remote the
+   * file does not carry can only ever fail at run time), then the schedule has
+   * to be one systemd will accept — `systemd-analyze calendar` is the
+   * authority, never a regex of ours. Replies itself and returns false on a
+   * refusal.
+   */
+  async function guardTask(task: CloudSyncTask, reply: FastifyReply): Promise<boolean> {
+    const known = await guard503(reply, async () => {
+      await requireRclone()
+      const current = await readConfig(paths, executor)
+      if (current.encrypted) {
+        refuseEncrypted(reply)
+        return null
+      }
+      return current.remotes.map(r => r.name)
+    })
+    if (known === undefined || known === null)
+      return false
+    if (!known.includes(task.remote)) {
+      reply.code(400).send({
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: `remote '${task.remote}' is not configured — add it under Remotes first`,
+        },
+      })
+      return false
+    }
+    const schedule = effectiveSchedule(task)
+    const valid = await validateSchedule(executor, schedule)
+    if (!valid.ok) {
+      reply.code(400).send({
+        error: { code: 'VALIDATION_ERROR', message: `Invalid schedule '${schedule}': ${valid.error}` },
+      })
+      return false
+    }
+    return true
+  }
+
+  // --- GET /cloud/tasks — the grid (LOCAL-ONLY status) ----------------------
+  server.get('/cloud/tasks', async () => {
+    const tasks = await readAllTasks(systemdDir)
+    const data = await Promise.all(
+      tasks.map(async (task): Promise<CloudSyncTaskView> => {
+        const st = await deriveTaskStatus(executor, task)
+        return {
+          ...task,
+          lastRunResult: st.lastRunResult,
+          lastRunAt: st.lastRunAt,
+          nextRunAt: st.nextRunAt,
+          overdue: st.overdue,
+        }
+      }),
+    )
+    return { data }
+  })
+
+  // --- POST /cloud/tasks — create ------------------------------------------
+  server.post('/cloud/tasks', async (request, reply) => {
+    const parsed = CloudSyncTaskRequest.safeParse(request.body ?? {})
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid cloud sync task: ${zodIssue(parsed.error)}` } }
+    }
+    const task = parsed.data
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (await taskFileExists(systemdDir, task.name)) {
+      reply.code(409)
+      return { error: { code: 'CONFLICT', message: `Cloud sync task '${task.name}' already exists` } }
+    }
+    if (!(await guardTask(task, reply)))
+      return reply
+
+    const job = jobQueue.submit(
+      'cloud.task.create',
+      { ...identity, params: { task: task.name, remote: task.remote } },
+      async () => {
+        await writeTaskUnits(executor, systemdDir, task)
+        return { created: task.name }
+      },
+    )
+    reply.code(202)
+    return { job }
+  })
+
+  // --- GET /cloud/tasks/:name — detail --------------------------------------
+  server.get<{ Params: { name: string } }>('/cloud/tasks/:name', async (request, reply) => {
+    const name = taskName(request.params.name, reply)
+    if (name === null)
+      return reply
+
+    const task = await readTask(systemdDir, name)
+    if (!task) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` } }
+    }
+
+    const [st, units, journal, consistency, nested] = await Promise.all([
+      deriveTaskStatus(executor, task),
+      readUnitTexts(systemdDir, name),
+      readRecentJournal(executor, name),
+      // The DERIVED consistency, from the same facts the run will read. Both
+      // probes fail open, so this never blanks the window.
+      readConsistencyFacts(executor, readAhrPools, { ...(opts.storagePath ? { pveStorageCfg: opts.storagePath } : {}) })
+        .then(facts => deriveConsistency(task.source, facts))
+        .catch(() => undefined),
+      // What a snapshot will NOT contain. Informational and fail-open.
+      scanNestedFilesystems(executor, task.source, { includeNested: 'none' })
+        .then(scan => scan.nested.map(n => n.path))
+        .catch(() => [] as string[]),
+    ])
+
+    const detail: CloudSyncTaskDetail = {
+      task: {
+        ...task,
+        lastRunResult: st.lastRunResult,
+        lastRunAt: st.lastRunAt,
+        nextRunAt: st.nextRunAt,
+        overdue: st.overdue,
+      },
+      ...(consistency ? { consistency } : {}),
+      ...(nested.length ? { nested } : {}),
+      unit: units.unit,
+      timer: units.timer,
+      ...(journal ? { journal } : {}),
+      // A disabled task's run history is garbage-collected by systemd; say so
+      // on the one screen with room for the sentence.
+      ...(st.lastRunResult === 'disabled' ? { statusNote: DISABLED_HISTORY_NOTE } : {}),
+    }
+    return { data: detail }
+  })
+
+  // --- PUT /cloud/tasks/:name — update / enable / disable -------------------
+  server.put<{ Params: { name: string } }>('/cloud/tasks/:name', async (request, reply) => {
+    const name = taskName(request.params.name, reply)
+    if (name === null)
+      return reply
+
+    const parsed = CloudSyncTaskRequest.safeParse(request.body ?? {})
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid cloud sync task: ${zodIssue(parsed.error)}` } }
+    }
+    const task = parsed.data
+    if (task.name !== name) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Task name in body ('${task.name}') does not match URL ('${name}')` } }
+    }
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!(await taskFileExists(systemdDir, name))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` } }
+    }
+    if (!(await guardTask(task, reply)))
+      return reply
+
+    const job = jobQueue.submit(
+      'cloud.task.update',
+      { ...identity, params: { task: name, remote: task.remote } },
+      async () => {
+        await writeTaskUnits(executor, systemdDir, task)
+        return { updated: name }
+      },
+    )
+    reply.code(202)
+    return { job }
+  })
+
+  // --- DELETE /cloud/tasks/:name — remove the units -------------------------
+  // Nothing at the remote is touched: deleting a schedule is not deleting data.
+  server.delete<{ Params: { name: string } }>('/cloud/tasks/:name', async (request, reply) => {
+    const name = taskName(request.params.name, reply)
+    if (name === null)
+      return reply
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!(await taskFileExists(systemdDir, name))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` } }
+    }
+
+    const job = jobQueue.submit(
+      'cloud.task.remove',
+      { ...identity, params: { task: name } },
+      async () => {
+        await removeTaskUnits(executor, systemdDir, name)
+        return { removed: name }
+      },
+    )
+    reply.code(202)
+    return { job }
+  })
+
+  // --- POST /cloud/tasks/:name/run — Run Now --------------------------------
+  // TWO paths, one endpoint (the recursion guard is the `direct` flag), exactly
+  // as the backup run route works:
+  //   • UI Run-Now (no `direct`): the job STARTS the task's own systemd unit and
+  //     supervises it, so a manual run lands in systemd's last-result and the
+  //     unit journal exactly like a scheduled one — one history.
+  //   • The unit's OWN execution (`direct:true`, from the cloud-task runner the
+  //     timer / `systemctl start` fires): runs rclone IN the daemon and NEVER
+  //     re-enters systemctl.
+  server.post<{ Params: { name: string } }>('/cloud/tasks/:name/run', async (request, reply) => {
+    const name = taskName(request.params.name, reply)
+    if (name === null)
+      return reply
+
+    const parsed = CloudSyncRunRequest.safeParse(request.body ?? {})
+    if (!parsed.success) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Invalid run request: ${zodIssue(parsed.error)}` } }
+    }
+    const direct = parsed.data.direct === true
+
+    const identity = requireIdentity(request, reply)
+    if (!identity)
+      return
+
+    if (!(await taskFileExists(systemdDir, name))) {
+      reply.code(404)
+      return { error: { code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` } }
+    }
+
+    const job = jobQueue.submit(
+      'cloud.task.run',
+      { ...identity, params: { task: name, ...(direct ? { direct: true } : {}) } },
+      async (updateProgress) => {
+        if (!direct) {
+          // The manual/UI path: run through the task's own unit and supervise it.
+          return superviseRun(executor, name, { onProgress: updateProgress })
+        }
+        const task = await readTask(systemdDir, name)
+        if (!task)
+          throw new Error(`Cloud sync task '${name}' not found`)
+
+        // This branch is the ONE place every real run converges (a timer fire
+        // and a UI Run Now both arrive here through the task's own unit), so it
+        // is also the one place a run notification is emitted.
+        const startedAt = Date.now()
+        try {
+          // Cadence gate: a biweekly task runs on a WEEKLY timer because
+          // OnCalendar cannot say "every other week", so an off-week SCHEDULED
+          // fire stops here as a first-class, visible skip. A Run Now is never
+          // gated (explicit intent), and a skip NEVER notifies.
+          const gate = await gateRun(executor, task)
+          if (!gate.run) {
+            updateProgress(`cloud sync task '${name}': ${gate.detail}`)
+            return { status: BACKUP_SKIPPED_OFF_WEEK, reason: gate.detail }
+          }
+          if (gate.reason === 'heal' || gate.reason === 'no-record')
+            updateProgress(`cloud sync task '${name}': ${gate.detail}`)
+
+          const result = await runCloudSync(
+            executor,
+            {
+              task,
+              paths,
+              fstabPath,
+              ...(opts.storagePath ? { consistencyOptions: { pveStorageCfg: opts.storagePath } } : {}),
+            },
+            updateProgress,
+          )
+          // Best-effort by contract: notifyCloudRun never throws, so a broken
+          // mail target cannot turn a good sync into a failed job.
+          await notifyCloudRun(executor, { task, result, elapsedMs: Date.now() - startedAt })
+          return result
+        }
+        catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          await notifyCloudRun(executor, { task, error: message, elapsedMs: Date.now() - startedAt })
+          throw err
+        }
+      },
+    )
+    reply.code(202)
+    return { job }
   })
 
   /**

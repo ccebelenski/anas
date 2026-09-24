@@ -1,13 +1,14 @@
 import type { DashboardWarning, TaskCadence } from '@anas/shared'
+import type { ZodType } from 'zod'
 import type { CommandExecutor } from '../executor/types.js'
 import type { CadenceGateDecision, TaskTrigger } from './backup-cadence.js'
 import type { SystemdRunResult } from './systemd-status.js'
-import { readFile } from 'node:fs/promises'
+import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, cadenceToOnCalendar } from '@anas/shared'
 import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
 import { deriveRunResult as deriveSystemdRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
-import { runSystemctl, unlinkQuiet } from './systemd-unit-store.js'
+import { listServiceUnits, parseMarkedJson, runSystemctl, unlinkQuiet } from './systemd-unit-store.js'
 
 /**
  * The scheduled-TASK generics — everything a units-are-the-store task kind does
@@ -47,6 +48,8 @@ const JOURNAL_TAIL = 200
  * precedes the start; 5s covers the granularity without spanning anything real.
  */
 const TRIGGER_SLACK_MS = 5000
+/** Trailing `=` of a marker token — trimmed for the skip warning's prose. */
+const MARKER_EQUALS_RE = /=$/
 /** journalctl `short-iso` numeric zone (`+0000`) → the ISO form Date.parse wants. */
 const JOURNAL_TZ_RE = /([+-]\d{2})(\d{2})$/
 /** journalctl syslog prefix without a `[pid]` bracket: `<ts> <host> <ident>: <msg>`. */
@@ -66,9 +69,16 @@ export const DEFAULT_SYSTEMD_DIR = process.env.ANAS_SYSTEMD_DIR ?? '/etc/systemd
 /**
  * What distinguishes one task kind from another. Everything else in this module
  * is identical between them — which is the whole point of the descriptor.
+ *
+ * ⚠ PREFIXES MUST BE DISJOINT. The store reads itself by listing
+ * `<prefix>*.service` (see {@link readAllTaskUnits}), so a prefix that is a
+ * prefix of another kind's would make one store adopt the other's units — and
+ * then rewrite them through its own schema. `anas-backup-` and `anas-cloud-`
+ * are disjoint; any kind added later must be checked against every existing
+ * one, not just the newest.
  */
 export interface TaskUnitKind {
-  /** Unit-name prefix, e.g. `anas-backup-` / `anas-cloud-`. */
+  /** Unit-name prefix, e.g. `anas-backup-` / `anas-cloud-`. MUST be disjoint from every other kind's. */
   prefix: string
   /** The service-file line carrying the canonical task JSON, e.g. `X-ANAS-Task=`. */
   marker: string
@@ -82,6 +92,8 @@ export interface TaskUnitKind {
   title: string
   /** The UI view a warning points at: `check the <view> view`. */
   view: string
+  /** The journald prefix this store's own warnings carry, e.g. `[backup]`. */
+  logTag: string
   /**
    * Extra journal lines that are a REAL cause, preferred over systemd's generic
    * trailer the way a runner's own `Error:` line is (backup: the runner's
@@ -99,9 +111,13 @@ export function timerUnitName(kind: TaskUnitKind, name: string): string {
 
 // --- Store plumbing that is byte-identical modulo the prefix -----------------
 //
-// Rendering, the canonical-JSON parse and the write path stay per store (they
-// carry the store's own schema and unit text). These four do not: they name the
-// two unit files and talk to systemd, and nothing else.
+// Unit RENDERING stays per store — a `.service` body carries the store's own
+// description, its own `ExecStart` and (backup) its own `LimitNOFILE=`, and
+// there is nothing generic left once those are removed. Everything else here
+// was byte-identical between the two stores modulo the prefix, the zod schema
+// and the log tag (rclone.2 slice 2, on the slice-1 review's suggestion): the
+// schema arrives as a PARAMETER (a descriptor field cannot carry a generic
+// type), the tag as `kind.logTag`, and the write takes the two rendered texts.
 
 /** Does a task's service file exist on disk? (the store is the files). */
 export async function taskFileExists(kind: TaskUnitKind, dir: string, name: string): Promise<boolean> {
@@ -125,6 +141,78 @@ export async function readUnitTexts(
     readFile(join(dir, timerUnitName(kind, name)), 'utf-8').catch(() => ''),
   ])
   return { unit, timer }
+}
+
+/**
+ * Parse a store's canonical task JSON out of a `.service` unit body via its
+ * `X-ANAS-Task=` line, zod-validated against the store's OWN schema. Null when
+ * the marker is absent or the JSON does not validate — a unit we did not write
+ * (or cannot read back) is never adopted.
+ */
+export function parseTaskUnit<T>(kind: TaskUnitKind, content: string, schema: ZodType<T>): T | null {
+  return parseMarkedJson(content, kind.marker, schema)
+}
+
+/**
+ * Every valid task parsed from this kind's `<prefix>*.service` files. An
+ * unreadable or unparseable file is SKIPPED with a warning (fail-open: one bad
+ * unit never blanks a store), tagged with the kind's own journald prefix.
+ */
+export async function readAllTaskUnits<T>(kind: TaskUnitKind, dir: string, schema: ZodType<T>): Promise<T[]> {
+  const services = await listServiceUnits(dir, kind.prefix)
+  const tasks: T[] = []
+  for (const file of services) {
+    try {
+      const content = await readFile(join(dir, file), 'utf-8')
+      const task = parseTaskUnit(kind, content, schema)
+      if (task)
+        tasks.push(task)
+      else
+        console.warn(`${kind.logTag} skipping ${file}: no valid ${kind.marker.replace(MARKER_EQUALS_RE, '')} JSON`)
+    }
+    catch (err) {
+      console.warn(`${kind.logTag} skipping ${file}: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return tasks
+}
+
+/** One task by name, or null if its service file is absent/invalid. */
+export async function readTaskUnit<T>(
+  kind: TaskUnitKind,
+  dir: string,
+  name: string,
+  schema: ZodType<T>,
+): Promise<T | null> {
+  try {
+    return parseTaskUnit(kind, await readFile(join(dir, serviceUnitName(kind, name)), 'utf-8'), schema)
+  }
+  catch {
+    return null
+  }
+}
+
+/**
+ * Write (or rewrite) a task's service+timer from the texts its store RENDERED,
+ * reload systemd, then bring the timer to match `enabled`. Throws on any
+ * systemctl failure so the mutation surfaces it.
+ */
+export async function writeTaskUnitFiles(
+  kind: TaskUnitKind,
+  executor: CommandExecutor,
+  dir: string,
+  task: { name: string, enabled: boolean },
+  units: { service: string, timer: string },
+): Promise<void> {
+  await writeFile(join(dir, serviceUnitName(kind, task.name)), units.service, 'utf-8')
+  await writeFile(join(dir, timerUnitName(kind, task.name)), units.timer, 'utf-8')
+
+  await runSystemctl(executor, ['daemon-reload'])
+  const timer = timerUnitName(kind, task.name)
+  if (task.enabled)
+    await runSystemctl(executor, ['enable', '--now', timer])
+  else
+    await runSystemctl(executor, ['disable', '--now', timer])
 }
 
 /**
@@ -456,6 +544,10 @@ async function showProps(executor: CommandExecutor, unit: string, props: string)
  * task last succeeded. The last-success lookup is done only when the decision
  * can still turn on it (an off-week biweekly fire), so an ordinary run costs
  * nothing extra.
+ *
+ * The kind's `label` rides along as the decision's NOUN, so a cloud sync's skip
+ * journals "last successful cloud sync" and a backup's still journals "last
+ * successful backup" — one decision, each kind's own words.
  */
 export async function gateRun(
   kind: TaskUnitKind,
@@ -463,15 +555,16 @@ export async function gateRun(
   task: { name: string, cadence?: TaskCadence },
   now: Date = new Date(),
 ): Promise<CadenceGateDecision> {
+  const label = kind.label
   // Nothing but a biweekly cadence is gated, so nothing else pays for the two
   // systemd reads the trigger check costs.
   if (!task.cadence || task.cadence.kind !== 'biweekly')
-    return decideCadenceRun({ cadence: task.cadence, trigger: 'scheduled', now, lastSuccessAt: null })
+    return decideCadenceRun({ cadence: task.cadence, trigger: 'scheduled', now, lastSuccessAt: null, label })
 
   const trigger = await deriveTriggerSource(kind, executor, task.name)
   // Cheap pre-check: on the task's own week (or a manual run) the last-success
   // time cannot change the answer, so it is never read.
-  const cheap = decideCadenceRun({ cadence: task.cadence, trigger, now, lastSuccessAt: null })
+  const cheap = decideCadenceRun({ cadence: task.cadence, trigger, now, lastSuccessAt: null, label })
   if (cheap.reason !== 'no-record')
     return cheap
   return decideCadenceRun({
@@ -479,6 +572,7 @@ export async function gateRun(
     trigger,
     now,
     lastSuccessAt: await readLastSuccessAt(kind, executor, task.name),
+    label,
   })
 }
 

@@ -74,6 +74,14 @@ export interface CadenceGateInput {
   trigger: TaskTrigger
   now: Date
   /**
+   * The NOUN this kind of task's work is called, for the decision's own prose
+   * ("last successful backup" / "last successful cloud sync"). Defaults to
+   * `backup`, which is what every string here said before the cloud store
+   * existed — so backup's details stay byte-identical and a cloud skip never
+   * journals the word "backup" (rclone.2).
+   */
+  label?: string
+  /**
    * When the task last completed a real backup (LOCAL-ONLY: systemd + journald).
    * null = no record — the journal rotated, or the task has never run.
    */
@@ -100,7 +108,8 @@ export interface CadenceGateDecision {
 }
 
 /**
- * Decide whether a fire should actually back up.
+ * Decide whether a fire should actually do its work (back up, sync to a cloud
+ * remote — the decision is the same, and `label` is the only word that differs).
  *
  * Heal rule (biweekly only): run regardless of parity when the last SUCCESSFUL
  * run is older than one full period. Because parity is fixed config, a heal
@@ -114,6 +123,9 @@ export interface CadenceGateDecision {
  */
 export function decideCadenceRun(input: CadenceGateInput): CadenceGateDecision {
   const { cadence, trigger, now, lastSuccessAt } = input
+  // The kind's own noun — `backup` by default, so every detail string below is
+  // byte-identical to what backup has always journalled (its tests pin them).
+  const label = input.label ?? 'backup'
   // Nothing to gate: the timer expression already IS the schedule.
   if (!cadence || cadence.kind !== 'biweekly' || !cadence.parity) {
     return { run: true, reason: 'ungated', detail: 'schedule is expressed entirely by the timer' }
@@ -131,7 +143,7 @@ export function decideCadenceRun(input: CadenceGateInput): CadenceGateDecision {
     return {
       run: true,
       reason: 'no-record',
-      detail: `${weekText}, but no successful run is on record — running rather than risk a missed backup`,
+      detail: `${weekText}, but no successful run is on record — running rather than risk a missed ${label}`,
     }
   }
   const last = Date.parse(lastSuccessAt)
@@ -143,14 +155,14 @@ export function decideCadenceRun(input: CadenceGateInput): CadenceGateDecision {
     return {
       run: true,
       reason: 'heal',
-      detail: `${weekText} — but the last successful backup was ${formatDays(elapsed)} ago, `
+      detail: `${weekText} — but the last successful ${label} was ${formatDays(elapsed)} ago, `
         + 'more than a full period: running now, then back on the configured week',
     }
   }
   return {
     run: false,
     reason: 'off-week',
-    detail: `${weekText} — skipped (off week); last successful backup ${formatDays(elapsed)} ago`,
+    detail: `${weekText} — skipped (off week); last successful ${label} ${formatDays(elapsed)} ago`,
   }
 }
 

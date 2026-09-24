@@ -602,15 +602,21 @@ export function createServer(opts?: ServerOptions) {
     // from the SAME fstab (and mock override) the iSCSI add-LUN route uses.
     fstabPath,
   })
-  // Cloud sync — remotes (rclone.1): ANAS's own rclone.conf (0600), the
-  // provider catalogue, the CRUD and the bounded lsjson Test. The rclone.2
-  // task store will wire referencingTasks into the delete refusal; until then
-  // the check runs against an empty store (the default).
+  // Cloud sync — remotes (rclone.1) and tasks (rclone.2): ANAS's own
+  // rclone.conf (0600), the provider catalogue, the remote CRUD and the bounded
+  // lsjson Test, plus the `anas-cloud-*` unit store, its Run-Now and its run
+  // job. The task store now answers the remotes DELETE refusal (the default
+  // `referencingTasks`). The run's source guard reads the SAME fstab the Mounts
+  // routes do, and its consistency derivation the same storage.cfg — one env
+  // override points all of them at a materialised capture in a test.
   server.register(cloudRoutes, {
     prefix: '/v1',
     executor,
     jobQueue,
     paths: rclonePaths,
+    systemdDir,
+    fstabPath,
+    ...(mountsStoragePath ? { storagePath: mountsStoragePath } : {}),
     // The dev mock never spawns anything, so probing the real /usr/bin/rclone
     // would make the cloud paths untestable on a machine without rclone.
     ...(opts?.mock ? { rcloneAvailable: async () => true } : {}),

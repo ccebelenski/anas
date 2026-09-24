@@ -10,8 +10,9 @@ import type { CommandExecutor } from '../executor/index.js'
  * notification matchers/targets. The `fields` carry `type=<template>` so
  * operators can write matcher rules for ANAS events specifically — and, since
  * 16.12, for a specific KIND of ANAS event (`anas-ahr` array/pool events,
- * `anas-backup` backup-run events, and — since 9.4 — `anas-snapshot` snapshot
- * schedule runs and `anas-replication` replication runs).
+ * `anas-backup` backup-run events, — since 9.4 — `anas-snapshot` snapshot
+ * schedule runs and `anas-replication` replication runs, and — since rclone.2 —
+ * `anas-cloud` cloud sync runs).
  *
  * Delivery is BEST-EFFORT by design: a notification failure must never fail
  * the job that emitted it (a degraded pool with a broken mail target still
@@ -32,6 +33,9 @@ export const ANAS_SNAPSHOT_NOTIFY_TEMPLATE = 'anas-snapshot'
 
 /** Replication-run template (9.4) — packaging/templates/anas-replication-*. */
 export const ANAS_REPLICATION_NOTIFY_TEMPLATE = 'anas-replication'
+
+/** Cloud-sync-run template (rclone.2) — packaging/templates/anas-cloud-*. */
+export const ANAS_CLOUD_NOTIFY_TEMPLATE = 'anas-cloud'
 
 /**
  * A template name is the ONE value interpolated into the perl body (PVE::Notify

@@ -9,7 +9,7 @@ import type { Transport } from '../services/replication-transport.js'
 import { ReplicatePlanRequest, ReplicateRequest } from '@anas/shared'
 import { notifyReplicationRun } from '../services/replication-notify.js'
 import { guardReplicationTarget } from '../services/replication-target.js'
-import { isTransientBackupSnapshot } from '../services/snapshot-naming.js'
+import { isTransientRunSnapshot } from '../services/snapshot-naming.js'
 import { createZfsSnapshot } from '../services/zfs-snapshot.js'
 import { requireIdentity } from './identity.js'
 
@@ -139,13 +139,13 @@ function discover(sourceSnaps: Snapshot[], targetSnaps: Snapshot[] | null, snaps
     return { mode: 'full', snapshot, targetExists: false, targetDiverged: false }
 
   const targetNames = new Set(
-    targetSnaps.map(s => s.snapshotName).filter(n => !isTransientBackupSnapshot(n)),
+    targetSnaps.map(s => s.snapshotName).filter(n => !isTransientRunSnapshot(n)),
   )
   // sourceSnaps is newest-first; snapshots OLDER than `snapshot` are the ones
   // after it in the list — a valid `-i` base must be older than what we send.
   const snapIdx = sourceSnaps.findIndex(s => s.snapshotName === snapshot)
   const older = snapIdx === -1 ? [] : sourceSnaps.slice(snapIdx + 1)
-  const common = older.find(s => !isTransientBackupSnapshot(s.snapshotName) && targetNames.has(s.snapshotName))
+  const common = older.find(s => !isTransientRunSnapshot(s.snapshotName) && targetNames.has(s.snapshotName))
   if (common)
     return { mode: 'incremental', snapshot, baseSnapshot: common.snapshotName, targetExists: true, targetDiverged: false }
   // Target exists but shares no common base → divergence (out of stage-1 scope).

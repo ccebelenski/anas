@@ -2,22 +2,15 @@ import type { BackupArchiveConsistency, BackupExpandedArchive, BackupPruneResult
 import type { CommandExecutor } from '../executor/types.js'
 import type { BackupTrigger, CadenceGateDecision } from './backup-cadence.js'
 import type { SuperviseRunOptions, TaskHelperResult, TaskUnitKind } from './task-units.js'
-import { readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import { BACKUP_SKIP_EXIT_CODE, BackupTask as BackupTaskSchema } from '@anas/shared'
 import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.js'
-// The unit-store plumbing (marker parse, dir listing, unlink/systemctl) is the
-// ONE shared copy in systemd-unit-store.ts — same shape as the snapshot store.
-import {
-  listServiceUnits,
-  parseMarkedJson,
-  runSystemctl,
-} from './systemd-unit-store.js'
 // The systemd/journald half — status derivation, journal reads, the cadence
-// gate, Run-Now supervision, dashboard warnings — is the ONE prefix-parameterised
-// copy in task-units.ts, which cloud sync's store calls with its own descriptor
-// (rclone.2 slice 1). Everything below hands it BACKUP_UNIT_KIND and keeps the
-// signature backup's callers have always imported.
+// gate, Run-Now supervision, dashboard warnings — and the store plumbing (the
+// marked-JSON parse, the dir read, the write + enable/disable) are the ONE
+// prefix-parameterised copy in task-units.ts, which cloud sync's store calls
+// with its own descriptor (rclone.2). Everything below hands it
+// BACKUP_UNIT_KIND and keeps the signature backup's callers have always
+// imported.
 import {
   buildTaskWarnings,
   collectTaskWarnings,
@@ -28,14 +21,18 @@ import {
   failureDetailFromJournal as failureDetailFromJournalGeneric,
   gateRun as gateRunGeneric,
   parseHelperResult as parseHelperResultGeneric,
+  parseTaskUnit,
+  readAllTaskUnits,
   readLastSuccessAt as readLastSuccessAtGeneric,
   readRecentJournal as readRecentJournalGeneric,
+  readTaskUnit,
   readUnitTexts as readUnitTextsGeneric,
   removeTaskUnits as removeTaskUnitsGeneric,
   serviceUnitName as serviceUnitNameGeneric,
   superviseTaskRun,
   taskFileExists as taskFileExistsGeneric,
   timerUnitName as timerUnitNameGeneric,
+  writeTaskUnitFiles,
 } from './task-units.js'
 
 /**
@@ -85,6 +82,7 @@ export const BACKUP_UNIT_KIND: TaskUnitKind = {
   label: 'backup',
   title: 'Backup',
   view: 'Backup',
+  logTag: '[backup]',
   causeHints: [OWNER_MISMATCH_MSG_RE],
 }
 
@@ -168,39 +166,19 @@ export function renderTimerUnit(task: BackupTask): string {
  * warns about) such files, fail-open.
  */
 export function parseServiceUnit(content: string): BackupTask | null {
-  return parseMarkedJson(content, BACKUP_UNIT_KIND.marker, BackupTaskSchema)
+  return parseTaskUnit(BACKUP_UNIT_KIND, content, BackupTaskSchema)
 }
 
 // --- Store: read ------------------------------------------------------------
 
 /** All valid tasks parsed from `anas-backup-*.service` files (invalid → skipped). */
 export async function readAllTasks(dir: string): Promise<BackupTask[]> {
-  const services = await listServiceUnits(dir, BACKUP_UNIT_KIND.prefix)
-  const tasks: BackupTask[] = []
-  for (const file of services) {
-    try {
-      const content = await readFile(join(dir, file), 'utf-8')
-      const task = parseServiceUnit(content)
-      if (task)
-        tasks.push(task)
-      else
-        console.warn(`[backup] skipping ${file}: no valid X-ANAS-Task JSON`)
-    }
-    catch (err) {
-      console.warn(`[backup] skipping ${file}: ${err instanceof Error ? err.message : String(err)}`)
-    }
-  }
-  return tasks
+  return readAllTaskUnits(BACKUP_UNIT_KIND, dir, BackupTaskSchema)
 }
 
 /** One task by name, or null if its service file is absent/invalid. */
 export async function readTask(dir: string, name: string): Promise<BackupTask | null> {
-  try {
-    return parseServiceUnit(await readFile(join(dir, serviceUnitName(name)), 'utf-8'))
-  }
-  catch {
-    return null
-  }
+  return readTaskUnit(BACKUP_UNIT_KIND, dir, name, BackupTaskSchema)
 }
 
 /** Does a task's service file exist on disk? (the store is the files). */
@@ -225,15 +203,10 @@ export async function writeTaskUnits(
   dir: string,
   task: BackupTask,
 ): Promise<void> {
-  await writeFile(join(dir, serviceUnitName(task.name)), renderServiceUnit(task), 'utf-8')
-  await writeFile(join(dir, timerUnitName(task.name)), renderTimerUnit(task), 'utf-8')
-
-  await runSystemctl(executor, ['daemon-reload'])
-  const timer = timerUnitName(task.name)
-  if (task.enabled)
-    await runSystemctl(executor, ['enable', '--now', timer])
-  else
-    await runSystemctl(executor, ['disable', '--now', timer])
+  return writeTaskUnitFiles(BACKUP_UNIT_KIND, executor, dir, task, {
+    service: renderServiceUnit(task),
+    timer: renderTimerUnit(task),
+  })
 }
 
 /**

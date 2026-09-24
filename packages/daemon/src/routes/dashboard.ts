@@ -38,6 +38,7 @@ import { buildFailedCreateWarnings, withAhrCreateStatus } from '../services/ahr-
 import { collectAhrTelemetry } from '../services/ahr-io.js'
 import { buildAhrCapacityWarnings, collectAhrPoolBriefs, collectAhrWarnings } from '../services/ahr-topology.js'
 import { collectBackupWarnings } from '../services/backup-units.js'
+import { collectCloudWarnings } from '../services/cloud-units.js'
 import { readConfig } from '../services/config-writer.js'
 import { collectIscsiWarnings } from '../services/iscsi-warnings.js'
 import { collectMountWarnings } from '../services/mounts.js'
@@ -121,7 +122,7 @@ export async function dashboardRoutes(
   server.get('/status', async () => {
     // Each block is independently fail-open so one failing source (e.g. no ZFS)
     // never blanks the rest of the dashboard.
-    const [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, ahrWarnings, ahrPools, scheduleWarnings, iscsiWarnings] = await Promise.all([
+    const [poolStatus, diskHealth, shares, jobs, replicationWarnings, mountWarnings, backupWarnings, cloudWarnings, ahrWarnings, ahrPools, scheduleWarnings, iscsiWarnings] = await Promise.all([
       collectPoolStatus(),
       collectDiskHealth(),
       collectShareStatus(),
@@ -129,6 +130,11 @@ export async function dashboardRoutes(
       collectReplicationWarnings(),
       collectMountWarnings(executor, { fstabPath, storagePath, mdadmConfPath }),
       collectBackupWarnings(executor, systemdDir),
+      // Cloud sync (rclone.2): failed/overdue enabled tasks → 'cloud' warnings,
+      // the same rule and the same code backup's go through (task-units.ts with
+      // the cloud descriptor). Healthy and disabled tasks contribute nothing;
+      // errors fail-open to [].
+      collectCloudWarnings(executor, systemdDir),
       // AHR (11.10): only bad states card (degraded/failed/readonly/halted
       // expansion); healthy pools contribute nothing, errors fail-open.
       collectAhrWarnings(executor, ahrIntentDir, ahrCreateStatus),
@@ -168,7 +174,7 @@ export async function dashboardRoutes(
       // A create that failed and rolled itself back leaves NO pool behind, so
       // it can only be surfaced from the job side (issue #11) — without this the
       // failure would be discoverable nowhere in the UI.
-      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...buildFailedCreateWarnings(ahrPools.map(p => p.name), jobQueue), ...scheduleWarnings, ...iscsiWarnings],
+      warnings: [...buildWarnings(poolStatus, diskHealth.disks), ...shares.warnings, ...replicationWarnings, ...mountWarnings, ...backupWarnings, ...cloudWarnings, ...ahrWarnings, ...buildAhrCapacityWarnings(ahrPools), ...buildFailedCreateWarnings(ahrPools.map(p => p.name), jobQueue), ...scheduleWarnings, ...iscsiWarnings],
       ahrPools,
     }
     return { data: summary }

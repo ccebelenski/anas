@@ -213,7 +213,8 @@ removed_template=0
 for tpl in anas-ahr-subject.txt.hbs anas-ahr-body.txt.hbs \
            anas-backup-subject.txt.hbs anas-backup-body.txt.hbs \
            anas-snapshot-subject.txt.hbs anas-snapshot-body.txt.hbs \
-           anas-replication-subject.txt.hbs anas-replication-body.txt.hbs; do
+           anas-replication-subject.txt.hbs anas-replication-body.txt.hbs \
+           anas-cloud-subject.txt.hbs anas-cloud-body.txt.hbs; do
   if [ -f "${PVE_TEMPLATE_DIR}/${tpl}" ]; then
     rm -f "${PVE_TEMPLATE_DIR}/${tpl}"
     removed_template=1

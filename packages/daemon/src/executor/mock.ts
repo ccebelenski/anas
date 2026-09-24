@@ -112,10 +112,10 @@ export class MockExecutor implements CommandExecutor {
     this.streamCalls.length = 0
   }
 
-  async exec(command: string, args: string[], _opts?: ExecOptions): Promise<ExecResult> {
+  async exec(command: string, args: string[], opts?: ExecOptions): Promise<ExecResult> {
     // Record for test assertions on the exact argv (e.g. the zfs hold calls).
     this.calls.push({ command, args })
-    // stdin (_opts.stdin) is accepted for interface parity but ignored — mock
+    // stdin (opts.stdin) is accepted for interface parity but ignored — mock
     // matching is by command + args only, and secrets must never be matched on.
     // Try exact match (command + args) first, then command-only match
     const exactMatch = this.fixtures.find(
@@ -126,19 +126,30 @@ export class MockExecutor implements CommandExecutor {
         && f.args.every((a, i) => a === args[i]),
     )
     if (exactMatch)
-      return this.resultOf(exactMatch)
+      return this.tee(this.resultOf(exactMatch), opts)
 
     const commandMatch = this.fixtures.find(
       f => f.command === command && f.args === undefined,
     )
     if (commandMatch)
-      return this.resultOf(commandMatch)
+      return this.tee(this.resultOf(commandMatch), opts)
 
     return {
       stdout: '',
       stderr: `mock: command not found: ${command}`,
       exitCode: 127,
     }
+  }
+
+  /**
+   * Replay a fixture's stderr through the live progress sink the same way a
+   * real child would, so a parser under test sees exactly the recorded bytes
+   * (the contract `execToStream` has always had, now on `exec` too).
+   */
+  private tee(result: ExecResult, opts?: ExecOptions): ExecResult {
+    if (result.stderr && opts?.onStderr)
+      opts.onStderr(result.stderr)
+    return result
   }
 
   /** A fixture's next result — dequeue from `results` (last repeats), else `result`. */

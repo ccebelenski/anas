@@ -85,12 +85,12 @@ export function isScheduledName(name: string): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * A snapshot-consistent backup run takes a TRANSIENT snapshot per snapshottable
- * source, backs up from it, and destroys it in a `finally`. Its name is
- * `anas-backup-<taskname>-<unix-seconds>` — a distinct prefix from the
- * `anas-<bucket>-<utc>` schedule convention above, on purpose: these are not
- * retention points, they are scaffolding that exists for the duration of one
- * run.
+ * A snapshot-consistent RUN — a backup (backup2.3), or a cloud sync (rclone.2)
+ * — takes a TRANSIENT snapshot of its source, reads from it, and destroys it in
+ * a `finally`. Its name is `anas-<kind>-<taskname>-<unix-seconds>`, a distinct
+ * prefix family from the `anas-<bucket>-<utc>` schedule convention above, on
+ * purpose: these are not retention points, they are scaffolding that exists for
+ * the duration of one run.
  *
  * ⚠ THE WHOLE REASON THIS PREDICATE IS SHARED (backup2.3's flagged risk): two
  * other subsystems walk the same snapshot lists and would otherwise reason about
@@ -98,25 +98,35 @@ export function isScheduledName(name: string): boolean {
  *
  *   - REPLICATION's newest-common-snapshot discovery. A transient that happened
  *     to be the newest common snapshot would become an incremental base, and the
- *     backup's `finally` destroy would then break the chain mid-flight. It also
+ *     run's `finally` destroy would then break the chain mid-flight. It also
  *     must not inflate `snapshotsBehind` (a source snapshot that is deliberately
  *     never replicated is not lag).
  *   - SCHEDULES RETENTION's bucketing/pruning. A transient must never occupy a
  *     bucket slot, never be counted, and never be handed to `zfs destroy` — the
- *     backup run owns its lifecycle from creation to destruction.
+ *     run owns its lifecycle from creation to destruction.
  *
- * Both read the answer from HERE, so the two can never drift apart.
+ * Both read the answer from {@link isTransientRunSnapshot}, which covers EVERY
+ * transient family — adding cloud sync's without adding it there would have
+ * recreated exactly the bug this block warns about.
  */
-const TRANSIENT_PREFIX = 'anas-backup-'
+const TRANSIENT_BACKUP_PREFIX = 'anas-backup-'
+/** Cloud sync's transient family (rclone.2) — same shape, its own prefix. */
+const TRANSIENT_CLOUD_PREFIX = 'anas-cloud-'
+/** Every transient prefix in the product. A new run kind belongs HERE. */
+const TRANSIENT_PREFIXES = [TRANSIENT_BACKUP_PREFIX, TRANSIENT_CLOUD_PREFIX] as const
 
 /**
- * `anas-backup-<taskname>-<unix-seconds>`, with an OPTIONAL `__<suffix>` that
- * AHR's per-subvolume snapshots carry (a single btrfs ro snapshot drops nested
+ * `<prefix><taskname>-<unix-seconds>`, with an OPTIONAL `__<suffix>` that AHR's
+ * per-subvolume snapshots carry (a single btrfs ro snapshot drops nested
  * subvolumes — GT-52 — so one run takes several, and every one of them has to
  * be recognised by the stale sweep). The task name may itself contain dashes,
  * so the seconds group anchors the split.
  */
-const TRANSIENT_RE = /^anas-backup-([a-z0-9][a-z0-9-]*?)-(\d{1,19})(?:__(.*))?$/
+function transientRegex(prefix: string): RegExp {
+  return new RegExp(`^${prefix}([a-z0-9][a-z0-9-]*?)-(\\d{1,19})(?:__(.*))?$`)
+}
+const TRANSIENT_BACKUP_RE = transientRegex(TRANSIENT_BACKUP_PREFIX)
+const TRANSIENT_CLOUD_RE = transientRegex(TRANSIENT_CLOUD_PREFIX)
 
 /**
  * The transient snapshot name a run of `task` takes at `at`. Unix SECONDS, not
@@ -125,12 +135,17 @@ const TRANSIENT_RE = /^anas-backup-([a-z0-9][a-z0-9-]*?)-(\d{1,19})(?:__(.*))?$/
  * both backends.
  */
 export function formatTransientBackupSnapshot(task: string, at: Date): string {
-  return `${TRANSIENT_PREFIX}${task}-${Math.floor(at.getTime() / 1000)}`
+  return `${TRANSIENT_BACKUP_PREFIX}${task}-${Math.floor(at.getTime() / 1000)}`
+}
+
+/** Cloud sync's transient label: `anas-cloud-<task>-<unix-seconds>`. */
+export function formatTransientCloudSnapshot(task: string, at: Date): string {
+  return `${TRANSIENT_CLOUD_PREFIX}${task}-${Math.floor(at.getTime() / 1000)}`
 }
 
 /** The decoded parts of a transient backup-snapshot name. */
 export interface ParsedTransientBackupSnapshot {
-  /** The backup task the snapshot was taken for. */
+  /** The task the snapshot was taken for. */
   task: string
   /** When it was taken (from the unix-seconds suffix). */
   at: Date
@@ -138,9 +153,8 @@ export interface ParsedTransientBackupSnapshot {
   subvolume?: string
 }
 
-/** Parse a transient backup-snapshot name, or null when it is not one. */
-export function parseTransientBackupSnapshot(name: string): ParsedTransientBackupSnapshot | null {
-  const m = TRANSIENT_RE.exec(name)
+function parseWith(re: RegExp, name: string): ParsedTransientBackupSnapshot | null {
+  const m = re.exec(name)
   if (!m)
     return null
   const seconds = Number(m[2])
@@ -150,14 +164,43 @@ export function parseTransientBackupSnapshot(name: string): ParsedTransientBacku
 }
 
 /**
- * Is `name` a transient backup snapshot? The ONE predicate replication and
- * retention both consult (see the block comment above). Deliberately answers on
- * the PREFIX shape alone — a name that starts `anas-backup-` but does not fully
- * parse is still ours, and still must not be adopted as a replication base or
- * pruned by a retention policy.
+ * Parse a transient BACKUP snapshot name, or null when it is not one. Strictly
+ * scoped to backup's prefix: the stale sweep compares the parsed task name
+ * against its own, and a cloud transient that parsed here could be swept by a
+ * backup task of the same name.
+ */
+export function parseTransientBackupSnapshot(name: string): ParsedTransientBackupSnapshot | null {
+  return parseWith(TRANSIENT_BACKUP_RE, name)
+}
+
+/** Parse a transient CLOUD SYNC snapshot name, or null when it is not one. */
+export function parseTransientCloudSnapshot(name: string): ParsedTransientBackupSnapshot | null {
+  return parseWith(TRANSIENT_CLOUD_RE, name)
+}
+
+/** Parse a transient snapshot name of ANY run kind (the collision guard's reader). */
+export function parseTransientRunSnapshot(name: string): ParsedTransientBackupSnapshot | null {
+  return parseTransientBackupSnapshot(name) ?? parseTransientCloudSnapshot(name)
+}
+
+/**
+ * Is `name` a transient backup snapshot? Backup's prefix only — the sweep's
+ * scope. Deliberately answers on the PREFIX shape alone: a name that starts
+ * `anas-backup-` but does not fully parse is still ours.
  */
 export function isTransientBackupSnapshot(name: string): boolean {
-  return name.startsWith(TRANSIENT_PREFIX)
+  return name.startsWith(TRANSIENT_BACKUP_PREFIX)
+}
+
+/**
+ * Is `name` a transient snapshot of ANY run kind? The ONE predicate replication
+ * and retention consult (see the block comment above) — they must skip a cloud
+ * sync's scaffolding for exactly the reasons they skip a backup's, and a
+ * predicate that knew only one family would adopt the other as a replication
+ * base or prune it mid-run.
+ */
+export function isTransientRunSnapshot(name: string): boolean {
+  return TRANSIENT_PREFIXES.some(p => name.startsWith(p))
 }
 
 /** Is `name` a transient snapshot belonging to THIS task? (the stale sweep's scope) */

@@ -84,15 +84,7 @@ export interface ExecStreamResult {
  * caller would have hit the hard way — compiled, shipped, silently ignored.
  * Omitting it makes that caller a compile error (D6).
  */
-export interface ExecStreamOptions extends Omit<ExecOptions, 'stdin'> {
-  /**
-   * Called with each chunk of the child's STDERR as it arrives. pbc emits its
-   * restore progress there, CR-terminated, at a roughly doubling interval
-   * (GT-59), so a job that wants live progress has to read it as it comes
-   * rather than waiting for the process to exit.
-   */
-  onStderr?: (chunk: string) => void
-}
+export type ExecStreamOptions = Omit<ExecOptions, 'stdin'>
 
 /** Optional execution options. */
 export interface ExecOptions {
@@ -110,6 +102,18 @@ export interface ExecOptions {
    * child only.
    */
   env?: Record<string, string>
+  /**
+   * Called with each chunk of the child's STDERR **as it arrives**, in addition
+   * to the buffered `stderr` the result carries. A long-running command that
+   * reports progress on stderr has to be read as it goes or the job shows
+   * nothing until it ends: pbc's restore progress arrives there CR-terminated
+   * at a roughly doubling interval (GT-59), and rclone's `--use-json-log`
+   * emits one `stats` object per `--stats` interval (rclone.2).
+   *
+   * Buffering is unchanged — this is a TEE, not a replacement — so a caller
+   * that only wants the final output keeps working untouched.
+   */
+  onStderr?: (chunk: string) => void
 }
 
 /**

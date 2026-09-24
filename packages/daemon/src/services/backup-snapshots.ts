@@ -1,13 +1,15 @@
 import type { AhrPool, BackupTransientSnapshot } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { AhrSnapshotOptions } from './ahr-snapshots.js'
+import type { ParsedTransientBackupSnapshot } from './snapshot-naming.js'
 import { createAhrSnapshot, deleteAhrSnapshot, listAhrSnapshots, topLevelMountPath, withTopLevelMount } from './ahr-snapshots.js'
-import { isTransientBackupSnapshot, parseTransientBackupSnapshot } from './snapshot-naming.js'
+import { isTransientBackupSnapshot, parseTransientBackupSnapshot, parseTransientRunSnapshot } from './snapshot-naming.js'
 import { createZfsSnapshot, destroyZfsSnapshot, ZFS, zfsSnapshotFullName } from './zfs-snapshot.js'
 
 /**
- * TRANSIENT SNAPSHOT LIFECYCLE for a snapshot-consistent backup run
- * (story backup2.3).
+ * TRANSIENT SNAPSHOT LIFECYCLE for a snapshot-consistent run — a backup
+ * (story backup2.3) or a cloud sync (rclone.2), which reuses every verb here
+ * with its own label prefix (`parse`, below) rather than owning a copy.
  *
  * The contract, in full:
  *
@@ -75,7 +77,10 @@ function ownLabelCollision(err: unknown, label: string, named?: string): boolean
   const text = err instanceof Error ? err.message : String(err)
   if (!ALREADY_EXISTS_RE.test(text))
     return false
-  if (parseTransientBackupSnapshot(label) === null)
+  // ANY run kind's transient label — the guard proves the leftover is OURS, and
+  // a cloud sync's `anas-cloud-<task>-<unix>` is exactly as provably ours as a
+  // backup's.
+  if (parseTransientRunSnapshot(label) === null)
     return false
   return named === undefined || text.includes(named)
 }
@@ -198,6 +203,16 @@ export async function destroyTransients(
 //  Stale sweep (every run start)
 // ---------------------------------------------------------------------------
 
+/**
+ * Which transient FAMILY a sweep is scoped to. A run sweeps only labels it can
+ * prove are its own kind's AND its own task's — a cloud sync must never touch a
+ * backup task's scaffolding (that task may be running right now), and the other
+ * way round. Defaults to backup's parser, so every existing caller is unchanged.
+ */
+export interface TransientSweepOptions {
+  parse?: (name: string) => ParsedTransientBackupSnapshot | null
+}
+
 /** `zfs list` argv for a dataset's own snapshot labels (direct, machine-parsable). */
 export function zfsTransientListArgs(dataset: string): string[] {
   return ['list', '-t', 'snapshot', '-Hp', '-o', 'name', '-r', dataset]
@@ -216,10 +231,15 @@ export function zfsTransientListArgs(dataset: string): string[] {
  * recognisably ours (so nothing else will prune it) but we cannot prove whose,
  * and a sweep is not the place to guess.
  */
-export function staleTransients(names: string[], task: string, before: Date): string[] {
+export function staleTransients(
+  names: string[],
+  task: string,
+  before: Date,
+  parse: (name: string) => ParsedTransientBackupSnapshot | null = parseTransientBackupSnapshot,
+): string[] {
   const cutoff = before.getTime()
   return names.filter((name) => {
-    const parsed = parseTransientBackupSnapshot(name)
+    const parsed = parse(name)
     return parsed !== null && parsed.task === task && parsed.at.getTime() < cutoff
   })
 }
@@ -235,6 +255,7 @@ export async function sweepZfsTransients(
   task: string,
   before: Date,
   updateProgress: (message: string) => void = noop,
+  sweep: TransientSweepOptions = {},
 ): Promise<string[]> {
   const warnings: string[] = []
   let labels: string[] = []
@@ -251,7 +272,7 @@ export async function sweepZfsTransients(
   catch {
     return warnings
   }
-  for (const label of staleTransients(labels, task, before)) {
+  for (const label of staleTransients(labels, task, before, sweep.parse)) {
     try {
       updateProgress(`sweeping stale transient snapshot ${zfsSnapshotFullName(dataset, label)}`)
       await destroyZfsSnapshot(executor, { dataset, name: label, recursive: true })
@@ -271,6 +292,7 @@ export async function sweepAhrTransients(
   before: Date,
   updateProgress: (message: string) => void = noop,
   opts?: BackupSnapshotOptions,
+  sweep: TransientSweepOptions = {},
 ): Promise<string[]> {
   const warnings: string[] = []
   let names: string[] = []
@@ -280,7 +302,7 @@ export async function sweepAhrTransients(
   catch {
     return warnings
   }
-  for (const name of staleTransients(names, task, before)) {
+  for (const name of staleTransients(names, task, before, sweep.parse)) {
     try {
       updateProgress(`sweeping stale transient snapshot ${pool.name}:@snapshots/${name}`)
       await deleteAhrSnapshot(executor, pool, name, updateProgress, opts)

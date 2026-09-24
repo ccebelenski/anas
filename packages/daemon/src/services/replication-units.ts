@@ -4,7 +4,7 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { LenientReplicationTask as LenientReplicationTaskSchema, ReplicationTask as ReplicationTaskSchema } from '@anas/shared'
 import { parseSnapshotList, zfsSnapshotDetailArgs } from '../parsers/zfs-list.js'
-import { isTransientBackupSnapshot } from './snapshot-naming.js'
+import { isTransientRunSnapshot } from './snapshot-naming.js'
 import { deriveRunResult, parseShow, parseSystemdTimestamp } from './systemd-status.js'
 // The unit-store plumbing (marker regex, unlink, systemctl, unit-dir listing)
 // is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
@@ -401,7 +401,7 @@ export async function deriveTaskStatus(
   // behind for as long as a backup run is in flight — and the count would then
   // silently fix itself when the run's `finally` destroyed them.
   const sourceSnaps = (await listSnapshots(executor, sourceFull))
-    .filter(s => !isTransientBackupSnapshot(s.snapshotName))
+    .filter(s => !isTransientRunSnapshot(s.snapshotName))
   let lastReplicatedSnapshot: string | null = null
   let lastReplicatedAt: string | null = null
   let snapshotsBehind: number | null = null

@@ -1,5 +1,5 @@
 import type { RetentionBucket, RetentionPlan, RetentionPolicy, ScheduledSnapshot } from '@anas/shared'
-import { isTransientBackupSnapshot, parseScheduledName } from './snapshot-naming.js'
+import { isTransientRunSnapshot, parseScheduledName } from './snapshot-naming.js'
 
 /**
  * The uniform retention engine (Epic 17) — pure computation, no I/O. Encodes
@@ -38,7 +38,7 @@ export function planRetention(
   policy: RetentionPolicy,
   now: Date = new Date(),
 ): RetentionPlan {
-  const durable = snapshots.filter(s => !isTransientBackupSnapshot(s.name))
+  const durable = snapshots.filter(s => !isTransientRunSnapshot(s.name))
   const anas = durable.filter(s => s.source === 'anas')
   const skippedHeld = anas.filter(s => s.held === true)
   const eligible = anas.filter(s => s.held !== true)
