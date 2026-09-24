@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs'
+import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
@@ -11,7 +11,8 @@ import { fileURLToPath } from 'node:url'
  * the X-Anas-* identity headers precisely because only local root can reach the
  * socket. That must not rest on the default umask — index.ts chmods the socket
  * to 0600 right after it starts listening. This boots the real daemon (mock
- * mode) on a throwaway socket and asserts the mode.
+ * mode) on a throwaway socket and polls the mode until that chmod lands (the
+ * socket exists from the moment of the bind, so a single stat races it).
  */
 describe('anasd socket permissions', () => {
   const here = dirname(fileURLToPath(import.meta.url))
@@ -37,14 +38,23 @@ describe('anasd socket permissions', () => {
     )
 
     try {
-      // Wait (up to ~10s) for the socket to appear.
-      for (let i = 0; i < 100 && !existsSync(sockPath); i++)
+      // listen() creates the socket at 0777 & ~umask (0755 under the usual
+      // 0022) and the chmod lands a moment later, so waiting only for the path
+      // to exist and stat'ing once races the chmod. Poll the MODE instead, to
+      // the same ~10s deadline, and report the last mode seen on timeout.
+      let st = statSync(sockPath, { throwIfNoEntry: false })
+      for (let i = 0; i < 100 && (st === undefined || (st.mode & 0o777) !== 0o600); i++) {
         await new Promise(r => setTimeout(r, 100))
+        st = statSync(sockPath, { throwIfNoEntry: false })
+      }
 
-      assert.ok(existsSync(sockPath), 'daemon should have created the socket')
-      const st = statSync(sockPath)
+      assert.ok(st, 'daemon should have created the socket')
       assert.ok(st.isSocket(), 'the path should be a unix socket')
-      assert.equal(st.mode & 0o777, 0o600, 'socket must be root-only (0600)')
+      assert.equal(
+        st.mode & 0o777,
+        0o600,
+        `socket must be root-only (0600); last observed 0${(st.mode & 0o777).toString(8)}`,
+      )
     }
     finally {
       child.kill('SIGTERM')
