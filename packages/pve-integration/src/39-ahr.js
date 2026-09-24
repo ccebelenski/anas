@@ -15,6 +15,8 @@
  *   POST   /ahr/:name/expand           → 409 confirm → 202 { job }
  *   POST   /ahr/:name/disk/:id/replace → 409 confirm → 202 { job }
  *   POST   /ahr/:name/scrub            → 202 { job }
+ *   POST   /ahr/:name/cache            → 202 { job }   (attach read cache, ahrcache.1)
+ *   DELETE /ahr/:name/cache            → 202 { job }   (detach read cache)
  *   DELETE /ahr/:name                  → 409 confirm → 202 { job }
  *
  * Mutation handlers degrade to a clear "not available in this build" message
@@ -490,6 +492,21 @@
         if (!(total > 0) || !(maxBytes > 0)) {
             return '';
         }
+        // A cache disk (ahrcache.1) carries ONE slice that backs no band —
+        // `partitions` is [] for it by schema, and rendering the default hatch
+        // would read the whole disk as unused. One full-width segment says
+        // what the disk is doing.
+        if (disk.role === 'cache') {
+            var cw = (total / maxBytes) * 100;
+            return '<span style="display:inline-flex;width:' + cw.toFixed(2) + '%;height:20px;'
+                + 'border-radius:5px;overflow:hidden;border:1px solid var(--anas-card-edge);'
+                + 'background:var(--anas-slot)">'
+                + '<span title="' + enc(t('read cache') + ' — ' + fmtBytes(total)) + '"'
+                + ' style="display:inline-flex;align-items:center;justify-content:center;'
+                + 'width:100%;height:100%;background:var(--anas-accent);'
+                + 'color:#fff;font-size:9.5px;font-weight:700;overflow:hidden;white-space:nowrap">'
+                + (cw > 6 ? enc(t('cache')) : '') + '</span></span>';
+        }
         var parts = (disk.partitions || []).slice();
         parts.sort(function (a, b) {
             return (a.band || 0) - (b.band || 0);
@@ -553,6 +570,9 @@
                 + fmtBytes(disk.usableBytes || disk.sizeBytes)
                 + (disk.role === 'spare'
                     ? ' · ' + t('hot spare — automatic rebuild target on any member failure')
+                    : '')
+                + (disk.role === 'cache'
+                    ? ' · ' + t('read cache — the slice is wiped on detach')
                     : '');
             var inner = '<div style="width:100%;min-width:340px">'
                 + '<div style="display:block;margin-bottom:5px">' + diskSliceBar(disk, maxBytes) + '</div>'
@@ -571,9 +591,15 @@
         }
         var memberBays = '';
         var spareBays = '';
+        var cacheBays = '';
         for (i = 0; i < disks.length; i++) {
             if (disks[i].role === 'spare') {
                 spareBays += bayFor(disks[i]);
+            } else if (disks[i].role === 'cache') {
+                // ahrcache.1: the cache disk backs no band — its own labelled
+                // group, parallel to the spares', never mixed into "band
+                // slices" where its empty partition list would lie.
+                cacheBays += bayFor(disks[i]);
             } else {
                 memberBays += bayFor(disks[i]);
             }
@@ -581,6 +607,9 @@
         var html = memberBays ? (gfx.bayGroup(t('Disks — band slices'), memberBays) || '') : '';
         if (spareBays) {
             html += gfx.bayGroup(t('Hot spare bay — excluded from capacity'), spareBays) || '';
+        }
+        if (cacheBays) {
+            html += gfx.bayGroup(t('Cache disk — read cache, not a band member'), cacheBays) || '';
         }
         return html;
     }
@@ -765,6 +794,87 @@
             + '</div>';
     }
 
+    // ---- read cache (ahrcache.1, AHR-DESIGN §13) ----------------------------
+
+    // The pool detail's Cache block. Version skew first (the shared schema's
+    // own ruling): a payload with no `cache` field is a daemon that predates
+    // ahrcache.1 — that reads "this daemon cannot tell me", never "there is
+    // no cache", so the whole section stays off rather than saying no.
+    //
+    // State line per state:
+    //   absent  → muted "no cache"; a leftover <pool>-cache<n> slice (the
+    //             died-and-returned device's mark, §13) names the disks and
+    //             both verbs that can clear or reuse it.
+    //   failed  → the red line in GT-19's own words (dm-cache does NOT fall
+    //             through to the origin — every read returns an I/O error
+    //             until the cache is detached), matching the daemon's
+    //             advisory sentence exactly.
+    //   healthy → the ONLINE pill, then the counters — which the schema only
+    //             carries on healthy (a stale number presented as live is the
+    //             failure GT-23 caught, so the fields are simply absent
+    //             otherwise and nothing is invented here).
+    function cacheHtml(d) {
+        var c = d.cache;
+        if (!c) {
+            return '';
+        }
+        var stateHtml;
+        var extra = '';
+        if (c.state === 'absent') {
+            stateHtml = '<span style="color:var(--anas-muted)">' + enc(t('no cache')) + '</span>';
+            if (c.devices && c.devices.length) {
+                extra = '<div style="font-size:12px;color:var(--anas-warn);margin-top:4px">'
+                    + enc(t('A leftover cache slice sits on') + ' ' + c.devices.join(', ') + ' — '
+                        + t('Attach cache… reuses it; Detach cache deletes it and the disk reads available again'))
+                    + '</div>';
+            }
+        } else if (c.state === 'failed') {
+            stateHtml = '<span style="color:var(--anas-danger);font-weight:700">'
+                + enc(t('cache device failed — every read returns an I/O error until the cache is detached (Detach cache)'))
+                + '</span>';
+        } else {
+            stateHtml = renderPoolState('healthy');
+        }
+        var rows = capRow(t('Devices'),
+            (c.devices && c.devices.length) ? c.devices.join(', ') : t('device missing'));
+        rows += capRow(t('Cache size'), fmtBytes(c.sizeBytes));
+        rows += capRow(t('Mode'),
+            c.mode + ' — ' + t('read cache; every write lands on the pool before it is acknowledged'));
+        if (c.policy) {
+            rows += capRow(t('Policy'), c.policy);
+        }
+        if (c.state === 'healthy') {
+            var hits = Number(c.hits);
+            var misses = Number(c.misses);
+            if (!isNaN(hits) && !isNaN(misses)) {
+                var total = hits + misses;
+                var ratio = total > 0 ? ANAS.formatPercent((hits / total) * 100) : '—';
+                rows += capRow(t('Hits / misses (hit ratio)'),
+                    hits + ' / ' + misses + ' (' + ratio + ')');
+            }
+            var used = c.usedBlocks;
+            var totalBlocks = c.totalBlocks;
+            if (used !== undefined && totalBlocks !== undefined) {
+                rows += capRow(t('Cache blocks'), used + ' ' + t('of') + ' ' + totalBlocks + ' ' + t('blocks used'));
+            }
+            var dirty = c.dirtyBlocks;
+            if (dirty !== undefined) {
+                // Zero by construction in writethrough — a non-zero figure is
+                // a bug, not a state to normalize (shared schema ruling).
+                rows += '<div style="display:flex;justify-content:space-between;gap:14px;padding:3px 0">'
+                    + '<span style="color:var(--anas-muted)">' + enc(t('Dirty blocks')) + '</span>'
+                    + '<span style="font-variant-numeric:tabular-nums;font-weight:600;'
+                    + (Number(dirty) > 0 ? 'color:var(--anas-danger)">' + enc('' + dirty)
+                        + ' — ' + enc(t('non-zero is a bug in writethrough'))
+                        : '">' + enc('' + dirty) + ' — ' + enc(t('0 by construction in writethrough')))
+                    + '</span></div>';
+            }
+        }
+        return '<div style="' + SEC + '">' + enc(t('Read cache')) + '</div>'
+            + '<div style="max-width:420px;font-size:12.5px">' + stateHtml + extra
+            + '<div style="margin-top:4px">' + rows + '</div></div>';
+    }
+
     // Reconstruct the composer-style band map from live pool state: arrays
     // are the protected bands (boundaries = cumulative heights, bottom-up);
     // any disk capacity above the top array boundary renders as an
@@ -854,6 +964,7 @@
             + disksHtml(d)
             + arraysHtml(d)
             + lvmHtml(d)
+            + cacheHtml(d)
             + fsHtml(d)
             + '</div>';
     }
@@ -934,10 +1045,30 @@
             : t('Snapshots unavailable: this pool predates the @data/@snapshots layout. Destroy and recreate it to gain snapshots (no in-place migration).');
     }
 
+    // The one open on-demand Details window (see openPoolDetailWindow).
+    var openDetail = null;
+
+    // ahrcache.1 — grid AND detail reload after every cache job, success AND
+    // failure (the §2 reload rule; a failed attach that left the pool
+    // uncached and clean must be reflected the moment the modal is dismissed,
+    // not at the next manual Reload).
+    function reloadAfterCacheJob(grid, node, pool) {
+        loadPools(grid, node);
+        if (openDetail && openDetail.win && !openDetail.win.destroyed && !openDetail.win.destroying
+            && openDetail.name === pool && openDetail.node === node) {
+            loadDetailInto(openDetail.win, node, pool);
+        }
+    }
+
     function openPoolDetailWindow(node, name) {
         if (!name) {
             return;
         }
+        // The Cache block's counters refresh with the detail load (ahrcache.1
+        // timeliness), so the toolbar verbs need a handle on the open window
+        // to reload it after THEIR jobs — one window at a time is the on-demand
+        // idiom here; a closed window clears the slot.
+        openDetail = { win: null, node: node, name: name };
         var win;
         try {
             win = Ext.create('Ext.window.Window', {
@@ -967,7 +1098,15 @@
                     },
                     { text: t('Close'), handler: function () { win.close(); } },
                 ],
+                listeners: {
+                    destroy: function () {
+                        if (openDetail && openDetail.win === win) {
+                            openDetail = null;
+                        }
+                    },
+                },
             });
+            openDetail.win = win;
             win.show();
             loadDetailInto(win, node, name);
         } catch (e) {
@@ -1428,6 +1567,42 @@
             abandonBtn.setHidden(!halted);
         }
         // Re-add appears only when a member is faulty/missing (11.9).
+        var cache = has ? sel[0].get('cache') : null;
+        var cacheBtn = grid.down('#attachCache');
+        if (cacheBtn) {
+            // ahrcache.1: Attach is live for a pool whose volume is assembled
+            // (the route refuses offline/failed — don't offer a dead button)
+            // and which has no cache yet. A `cache` field ABSENT (older
+            // daemon) leaves the button live — the route 404s there and the
+            // dialog says "not available in this build", the file's standing
+            // 404 treatment.
+            var absentish = !cache || cache.state === 'absent';
+            var cacheable = has && absentish && state !== 'offline' && state !== 'failed';
+            cacheBtn.setDisabled(!cacheable);
+            cacheBtn.setTooltip(!has
+                ? ''
+                : (!absentish
+                    ? t('This pool already has a read cache — detach it first')
+                    : (state === 'offline' || state === 'failed')
+                        ? t('The pool\'s volume is not assembled — there is nothing to cache')
+                        : ''));
+        }
+        // Detach is live for TWO shapes (the route's own test): a live cache
+        // target in any state, and a leftover <pool>-cache<n> slice on a
+        // state-absent pool — the died-and-returned device's mark (§13),
+        // which detach is the only product path to delete.
+        var detachBtn = grid.down('#detachCache');
+        if (detachBtn) {
+            var detachable = has && !!cache
+                && (cache.state !== 'absent' || (cache.devices && cache.devices.length > 0));
+            detachBtn.setDisabled(!detachable);
+            detachBtn.setTooltip(has && !detachable
+                ? t('This pool has no read cache to detach')
+                : '');
+        }
+        // ahrcache.1 slice 2 adds the Remount verb here — POST /v1/ahr/:name/remount,
+        // offered when the btrfs filesystem was forced read-only (unmount +
+        // mount, confirm-coded); not in this slice.
         var readdBtn = grid.down('#readd');
         if (readdBtn) {
             readdBtn.setHidden(!has || readdCandidates(sel[0]).length === 0);
@@ -1792,6 +1967,297 @@
                     run(value.replace(/\s+/g, ''));
                 }
             }, null, false, spares.length ? spares[0].id : '');
+    }
+
+    // ---- read cache verbs (ahrcache.1 slice 3, AHR-DESIGN §13) --------------
+    //
+    //   POST   /ahr/:name/cache  {disks[]}  — attach (202 job, NOT confirm-
+    //                                        gated: a writethrough cache never
+    //                                        holds the only copy of anything)
+    //   DELETE /ahr/:name/cache             — detach (202 job; the UI shows a
+    //                                        plain confirm naming the trade)
+    //
+    // The Attach dialog reuses the composable-disk picker (the shared
+    // drag-select, 11.14) with SSDs first; a rotating pick earns its one
+    // sentence, stated as a fact and never argued further. The daemon owns
+    // every refusal (non-composable disk, already cached, offline pool,
+    // duplicate) and its 409/400 sentence rides the failure modal verbatim.
+
+    // Attach read cache: pick disks, POST through the job queue. Reloads grid
+    // AND the open detail window on success AND failure — a failed attach
+    // leaves the pool uncached and clean, and the view must say so at once.
+    function openAttachCache(grid, node) {
+        var pool = selectedPool(grid);
+        if (!pool) {
+            return;
+        }
+        var win = null;
+        var cacheAssigned = {};   // diskId -> 'cache' (one multi-slot bay)
+        var cacheDrag = null;     // the shared drag-select controller
+        var rotById = {};         // diskId -> rotational (drives the one note)
+
+        function bodyEl() {
+            var p = win ? win.down('#ahrCacheBody') : null;
+            return (p && p.getEl()) ? p.getEl().dom : null;
+        }
+        function selectedIds() {
+            return cacheDrag ? cacheDrag.selectedInBay('cache') : [];
+        }
+
+        // The ONE sentence a rotating pick earns (§13, the daemon's advisory
+        // wording) — shown while ANY selected disk is rotational, gone the
+        // moment the pick is all flash.
+        function updateRotNote() {
+            var root = bodyEl();
+            var el = root ? root.querySelector('#ahrc-rotnote') : null;
+            if (!el) {
+                return;
+            }
+            var ids = selectedIds();
+            var rotating = 0;
+            for (var i = 0; i < ids.length; i++) {
+                if (rotById[ids[i]]) {
+                    rotating++;
+                }
+            }
+            el.innerHTML = rotating
+                ? '<div style="font-size:12px;padding:6px 10px;border-radius:9px;'
+                    + 'background:color-mix(in srgb,var(--anas-warn) 13%,transparent);'
+                    + 'color:var(--anas-warn)">'
+                    + enc(t('a rotating cache adds a seek, not speed')) + '</div>'
+                : '';
+        }
+
+        function submit() {
+            var ids = selectedIds();
+            if (!ids.length) {
+                ANAS.alertMsg('Attach cache', t('Drag at least one disk into the cache bay.'));
+                return;
+            }
+            ANAS.runJob({
+                node: node,
+                method: 'post',
+                path: '/ahr/' + encodeURIComponent(pool) + '/cache',
+                body: { disks: ids },
+                view: grid,
+                failTitle: 'Attach cache failed',
+                successMsg: t('Read cache attach started on') + ' ' + pool,
+                onSubmitted: function () {
+                    if (win && !win.destroyed && !win.destroying) {
+                        win.close();
+                    }
+                    reloadAfterCacheJob(grid, node, pool);
+                },
+                onFailed: function () {
+                    reloadAfterCacheJob(grid, node, pool);
+                },
+                onComplete: function () {
+                    reloadAfterCacheJob(grid, node, pool);
+                },
+            });
+        }
+
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-ahr-cache-attach',
+                title: t('Attach read cache') + ': ' + pool,
+                modal: true,
+                width: 620,
+                height: 480,
+                layout: 'fit',
+                items: [{
+                    xtype: 'panel',
+                    itemId: 'ahrCacheBody',
+                    border: false,
+                    scrollable: true,
+                    html: '',
+                }],
+                buttons: [
+                    {
+                        text: t('Cancel'),
+                        handler: function () {
+                            win.close();
+                        },
+                    },
+                    {
+                        text: t('Attach cache'),
+                        cls: 'anas-btn-ahr-cache-attach-exec',
+                        handler: submit,
+                    },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('ahr cache attach window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+        try {
+            win.setLoading(true);
+        } catch (eL) {
+            // non-fatal
+        }
+
+        function renderForm(candidates) {
+            var p = win ? win.down('#ahrCacheBody') : null;
+            if (!p) {
+                return;
+            }
+            p.setHtml('<div style="padding:12px;font-size:12.5px;color:var(--anas-ink)">'
+                // The two-sentence advisory, verbatim in substance (§13): the
+                // hotspot fact and the consumable fact, stated once.
+                + '<div style="font-size:12px;color:var(--anas-muted);margin:0 0 8px">'
+                + enc(t('A read cache pays off on hotspot reads: repeated random reads are '
+                    + 'served from flash; sequential streams do not benefit. The SSD is a '
+                    + 'consumable — cached blocks are rewritten as the working set rotates.'))
+                + '</div>'
+                + '<div style="color:var(--anas-muted);font-size:11.5px;margin:0 0 8px">'
+                + enc(t('Drag disks into the cache bay. Each cache disk is WIPED '
+                    + '(one slice cut per disk); flash is sorted first.'))
+                + '</div>'
+                + '<div style="display:flex;gap:12px;align-items:stretch;flex-wrap:wrap">'
+                + '<div style="flex:1 1 240px;min-width:0">'
+                + '<div style="' + SEC + ';margin:0 0 4px">' + enc(t('Available')) + '</div>'
+                + '<div data-anas-zone="tray" style="display:flex;flex-direction:column;min-height:74px;'
+                + 'border:1px solid var(--anas-card-edge);border-radius:11px;padding:4px;'
+                + 'background:var(--anas-panel)"></div></div>'
+                + '<div style="flex:1 1 240px;min-width:0">'
+                + '<div style="' + SEC + ';margin:0 0 4px">' + enc(t('Cache bay')) + '</div>'
+                + '<div class="anas-gfx-bay anas-grid-ahrc-bay" data-anas-zone="bay:cache"'
+                + ' style="display:flex;flex-wrap:wrap;gap:8px;min-height:74px;border-radius:11px;'
+                + 'padding:10px;background:var(--anas-bay);box-shadow:inset 0 2px 6px rgba(0,0,0,.16)">'
+                + '</div></div></div>'
+                + '<div id="ahrc-rotnote" style="margin-top:10px"></div></div>');
+            var root = bodyEl();
+            if (!root) {
+                return;
+            }
+            if (ANAS.ahrComposer && typeof ANAS.ahrComposer.makeDragSelect === 'function') {
+                cacheDrag = ANAS.ahrComposer.makeDragSelect({
+                    root: root,
+                    disks: candidates,
+                    assigned: cacheAssigned,
+                    bays: [{ id: 'cache' }],
+                    cardClass: 'anas-ahrcache-disk',
+                    removeClass: 'anas-ahrcache-unassign',
+                    removeAttr: 'data-ahrcache-unassign',
+                    bayEmpty: function () {
+                        return '<div style="flex:1;min-width:140px;color:var(--anas-muted);font-size:12px;'
+                            + 'text-align:center;padding:14px 8px">' + enc(t('Drag disks here')) + '</div>';
+                    },
+                    onChange: updateRotNote,
+                });
+                cacheDrag.render();
+            }
+            updateRotNote();
+        }
+
+        // Candidates: the available inventory PLUS this pool's own reclaimable
+        // cache slices (§13 — a died-and-returned device reads ahr_member
+        // because of its leftover <pool>-cache<n> slice, and re-attaching to
+        // it is exactly the right move; the route re-wipes the stale label).
+        // SSDs first (a rotating cache is legal, just not first in line).
+        ANAS.api.get(node, '/disks').then(function (res) {
+            if (!win || win.destroyed || win.destroying) {
+                return;
+            }
+            var all = (res && res.data) || [];
+            var reclaimable = {};
+            var i;
+            for (i = 0; i < all.length; i++) {
+                rotById[all[i].id] = all[i].rotational === true;
+            }
+            ANAS.api.get(node, '/ahr/' + encodeURIComponent(pool)).then(function (res2) {
+                if (!win || win.destroyed || win.destroying) {
+                    return;
+                }
+                win.setLoading(false);
+                var c = (res2 && res2.data && res2.data.cache) || null;
+                if (c && c.state === 'absent' && c.devices && c.devices.length) {
+                    for (i = 0; i < c.devices.length; i++) {
+                        reclaimable[c.devices[i]] = true;
+                    }
+                }
+                var candidates = [];
+                for (i = 0; i < all.length; i++) {
+                    if (all[i].status === 'available' || reclaimable[all[i].id]) {
+                        candidates.push(all[i]);
+                    }
+                }
+                candidates.sort(function (a, b) {
+                    return (a.rotational === true ? 1 : 0) - (b.rotational === true ? 1 : 0);
+                });
+                renderForm(candidates);
+            }, function () {
+                if (!win || win.destroyed || win.destroying) {
+                    return;
+                }
+                // No pool detail → no reclaimable set; the available list is
+                // still offerable (the route re-checks authoritatively).
+                win.setLoading(false);
+                var fallback = [];
+                for (i = 0; i < all.length; i++) {
+                    if (all[i].status === 'available') {
+                        fallback.push(all[i]);
+                    }
+                }
+                fallback.sort(function (a, b) {
+                    return (a.rotational === true ? 1 : 0) - (b.rotational === true ? 1 : 0);
+                });
+                renderForm(fallback);
+            });
+        }, function (err) {
+            if (!win || win.destroyed || win.destroying) {
+                return;
+            }
+            win.setLoading(false);
+            try {
+                ANAS.alertMsg('Error', t('Failed to load disks') + ': ' + ANAS.errText(err));
+            } catch (e) {
+                ANAS.warn('ahr cache disk load failed: ' + ANAS.errText(err));
+            }
+        });
+    }
+
+    // Detach read cache: a plain confirm (the daemon is deliberately NOT
+    // confirm-gated — a writethrough cache holds no only copy), then the 202
+    // job. The trade is named in the story's own words; a FAILED cache says
+    // the truth instead — reads do NOT continue until this runs (GT-19).
+    function openDetachCache(grid, node) {
+        var pool = selectedPool(grid);
+        var sel = grid.getSelection();
+        if (!pool || !sel || !sel.length) {
+            return;
+        }
+        var c = sel[0].get('cache') || {};
+        var failed = c.state === 'failed';
+        var devs = (c.devices && c.devices.length)
+            ? c.devices.join(', ')
+            : t('device missing');
+        ANAS.confirmAndRun({
+            node: node,
+            method: 'del',
+            path: '/ahr/' + encodeURIComponent(pool) + '/cache',
+            view: grid,
+            confirmTitle: 'Detach cache',
+            confirmIntro: (failed
+                ? t('Detaching the FAILED read cache on') + ' <b>' + enc(pool) + '</b> '
+                    + t('restores reads — every read currently returns an I/O error. ')
+                : t('Detaching the read cache on') + ' <b>' + enc(pool) + '</b> — '
+                    + t('reads continue from the pool; '))
+                + t('the SSD is wiped and returns to available') + ':'
+                + '<br><b>' + enc(devs) + '</b>',
+            failTitle: 'Detach cache failed',
+            successMsg: t('Read cache detach started on') + ' ' + pool,
+            onSubmitted: function () {
+                reloadAfterCacheJob(grid, node, pool);
+            },
+            onFailed: function () {
+                reloadAfterCacheJob(grid, node, pool);
+            },
+            onComplete: function () {
+                reloadAfterCacheJob(grid, node, pool);
+            },
+        });
     }
 
     function resumeExpansion(grid, node) {
@@ -2597,6 +3063,10 @@
                 // pool. AUTO field — absent on old daemons leaves get()
                 // undefined and nothing is gated (version-skew ruling).
                 'heldByLun',
+                // ahrcache.1: the read-cache block. AUTO field — absent on a
+                // daemon that predates the story means "cannot tell", and the
+                // toolbar gates nothing off it (the routes 404 there anyway).
+                'cache',
             ],
             data: [],
             sorters: [{ property: 'name', direction: 'ASC' }],
@@ -2750,6 +3220,30 @@
                             disabled: true,
                             handler: function (btn) {
                                 startScrub(btn.up('grid'), node);
+                            },
+                        },
+                        // ahrcache.1: the read-cache verbs — one feature, the
+                        // one menu it owns (§2). Attach needs an assembled,
+                        // uncached pool; Detach needs a cache target or a
+                        // leftover slice (see updateButtons for the gating).
+                        {
+                            text: t('Attach cache…'),
+                            itemId: 'attachCache',
+                            cls: 'anas-btn-ahr-cache-attach',
+                            iconCls: 'fa fa-link',
+                            disabled: true,
+                            handler: function (btn) {
+                                openAttachCache(btn.up('grid'), node);
+                            },
+                        },
+                        {
+                            text: t('Detach cache'),
+                            itemId: 'detachCache',
+                            cls: 'anas-btn-ahr-cache-detach',
+                            iconCls: 'fa fa-chain-broken',
+                            disabled: true,
+                            handler: function (btn) {
+                                openDetachCache(btn.up('grid'), node);
                             },
                         },
                         // 11.12: the snapshot manager — a grid verb like every

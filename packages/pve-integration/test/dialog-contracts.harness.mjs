@@ -147,6 +147,20 @@
  *      failure). A required option hidden by its provider filter never gates
  *      (koofr `endpoint`); a NON-503 load failure leaves the window usable;
  *      a 409 `referenced` refusal reaches the user titled and reloads.
+ *   11. AHR read cache (ahrcache.1 slice 3): the Cache block renders the
+ *       daemon's state honestly — "no cache" when absent, the counters with
+ *       labels and the hit ratio when healthy, the GT-19 sentence in red when
+ *       failed — and a payload with NO `cache` field renders no section at
+ *       all (version skew reads "cannot tell", never "no cache"). Attach
+ *       submits `{disks[]}` against the REAL shared `AttachAhrCacheRequest`
+ *       (whose duplicate refusal is pinned too), shows the two-sentence
+ *       advisory and the one rotating-disk sentence while a spinning pick
+ *       stands in the bay, and hands every daemon refusal to the failure
+ *       modal under its fail title. Detach's confirm names the trade — and
+ *       the failed-cache variant names the truth instead (reads do NOT
+ *       continue until it runs). Both verbs reload the grid AND the open
+ *       detail window on SUCCESS and FAILURE; the toolbar gates per state
+ *       with reasons; the Disks grid renders a cache disk "<pool> / cache".
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -156,7 +170,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncTaskRequest, deriveArchiveName, lunBackupId } from '@anas/shared'
+import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncTaskRequest, deriveArchiveName, lunBackupId } from '@anas/shared'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, '..', 'src')
@@ -12204,6 +12218,384 @@ await composerSeedChecks()
 warnings.length = 0
 created.windows.length = 0
 expandGainRowChecks()
+
+// ============================================================================
+//  ahrcache.1 slice 3 — the Cache block, the Attach/Detach toolbar verbs
+//
+//  00-core.js is loaded so the block renders through the REAL formatters
+//  (formatBytes / formatPercent) — the sizes and the ratio are asserted on.
+//  The drag-select is stubbed at the seam the dialog itself consults
+//  (ANAS.ahrComposer.makeDragSelect), capturing the spec so a check can place
+//  a disk in the bay exactly as a drop would and drive the real submit.
+// ============================================================================
+
+const MiB = 1024 * 1024
+const HOT7 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT7'
+const HOT8 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT8'
+const HOT9 = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9'
+
+// The wire shapes, quoted field-for-field from the shared AhrCache schema:
+// counters ride ONLY on healthy; a failed cache whose PV reads [unknown]
+// sends an empty devices list; the leftover slice of a died-and-returned
+// device reads state 'absent' WITH devices.
+const CACHE_HEALTHY = {
+  devices: [HOT9], sizeBytes: 512 * MiB, mode: 'writethrough', policy: 'smq',
+  state: 'healthy', hits: 30, misses: 10, usedBlocks: 100, totalBlocks: 400, dirtyBlocks: 0,
+}
+const CACHE_ABSENT = { devices: [], sizeBytes: 0, mode: 'writethrough', policy: '', state: 'absent' }
+const CACHE_LEFTOVER = { devices: [HOT8], sizeBytes: 512 * MiB, mode: 'writethrough', policy: '', state: 'absent' }
+const CACHE_FAILED = { devices: [], sizeBytes: 512 * MiB, mode: 'writethrough', policy: 'smq', state: 'failed' }
+
+function ahrCacheRow(name, extra) {
+  return ahrPoolRow(name, extra)
+}
+
+const ahrDetailGets = name => apiGets.filter(p => p === '/ahr/' + name).length
+const ahrListGets = () => apiGets.filter(p => p === '/ahr').length
+
+/** Load the AHR view over the cache rows and return { ANAS, grid }. */
+async function openAhrCacheView(rows, extraRoutes) {
+  const ANAS = loadSources(['00-core.js', '15-gfx.js', '39-ahr.js'], {
+    'GET /ahr': { data: rows },
+    ...extraRoutes,
+  })
+  const view = makeComponent(ANAS.views.ahr.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.itemId === 'ahrGrid' ? view : view.down('#ahrGrid')
+  ok('cache: the grid exists', !!grid, JSON.stringify(warnings))
+  return { ANAS, grid }
+}
+
+/** Open the pool Details window for one row and return its body HTML. */
+async function detailHtmlOf(grid, name) {
+  grid.selectRow(grid.getStore().findExact('name', name))
+  created.windows.length = 0
+  const btn = grid.down('#details')
+  btn.handler(btn)
+  await settle()
+  const win = openWindow()
+  ok('cache(detail ' + name + '): the detail window opened', !!win)
+  if (!win) { return '' }
+  return win.down('#ahrDetailBody').html || ''
+}
+
+async function ahrCacheBlockChecks() {
+  const rows = [
+    ahrCacheRow('gtcache', { cache: CACHE_HEALTHY }),
+    ahrCacheRow('gtclean', { cache: CACHE_ABSENT }),
+    ahrCacheRow('gtleft', { cache: CACHE_LEFTOVER }),
+    ahrCacheRow('gtfail', { state: 'degraded', cache: CACHE_FAILED }),
+    ahrCacheRow('gtold'),
+    ahrCacheRow('gtoff', { state: 'offline', cache: CACHE_ABSENT }),
+  ]
+  const routes = { 'GET /ahr': { data: rows } }
+  for (const r of rows) { routes['GET /ahr/' + r.name] = { data: r } }
+  const { grid } = await openAhrCacheView(rows, routes)
+  if (!grid) { return }
+
+  // ---- the Cache block, per state -----------------------------------------
+
+  const healthy = await detailHtmlOf(grid, 'gtcache')
+  ok('cache(healthy): the block exists', /Read cache/.test(healthy), healthy.slice(0, 400))
+  ok('cache(healthy): the cache disk is named by its FULL by-id (never truncated)',
+    healthy.includes(HOT9), healthy.slice(0, 600))
+  ok('cache(healthy): the size carries the unit', /512\.00 MiB/.test(healthy), healthy.slice(0, 600))
+  ok('cache(healthy): mode is writethrough and policy is the lvs-reported smq',
+    /writethrough/.test(healthy) && /smq/.test(healthy), healthy.slice(0, 600))
+  ok('cache(healthy): hits / misses are labelled WITH the hit ratio',
+    /Hits \/ misses \(hit ratio\)/.test(healthy) && /30 \/ 10 \(75%\)/.test(healthy),
+    healthy.slice(0, 800))
+  ok('cache(healthy): the block counts are labelled, not bare',
+    /100 of 400 blocks used/.test(healthy), healthy.slice(0, 800))
+  ok('cache(healthy): dirty blocks read 0 by construction in writethrough',
+    /Dirty blocks/.test(healthy) && /0 by construction in writethrough/.test(healthy),
+    healthy.slice(0, 800))
+
+  const absent = await detailHtmlOf(grid, 'gtclean')
+  ok('cache(absent): reads "no cache"', /no cache/.test(absent), absent.slice(0, 400))
+  ok('cache(absent): no counters are invented', !/Hits \/ misses/.test(absent), absent.slice(0, 400))
+  ok('cache(absent): no leftover note', !/leftover cache slice/.test(absent), absent.slice(0, 400))
+
+  const leftover = await detailHtmlOf(grid, 'gtleft')
+  ok('cache(leftover): the died-and-returned device is named, with both verbs',
+    /A leftover cache slice sits on/.test(leftover) && leftover.includes(HOT8)
+      && /Attach cache… reuses it/.test(leftover) && /Detach cache deletes it/.test(leftover),
+    leftover.slice(0, 600))
+
+  const failed = await detailHtmlOf(grid, 'gtfail')
+  ok('cache(failed): the red line says the GT-19 truth — every read errors until detach',
+    /cache device failed/.test(failed) && /every read returns an I\/O error until the cache is detached/.test(failed),
+    failed.slice(0, 600))
+  ok('cache(failed): the line is danger-styled, not a pill',
+    /var\(--anas-danger\)/.test(failed) && !/state-pill/.test(failed.slice(failed.indexOf('cache device failed') - 200, failed.indexOf('cache device failed'))),
+    failed.slice(0, 600))
+  ok('cache(failed): an unrecoverable device reads "device missing", never a blank row',
+    /device missing/.test(failed), failed.slice(0, 600))
+  ok('cache(failed): the stale lvs counters are NOT shown (GT-23) — policy may be (it does not rot), counters may not',
+    !/Hits \/ misses/.test(failed) && !/blocks used/.test(failed) && !/Dirty blocks/.test(failed),
+    failed.slice(0, 600))
+
+
+  const old = await detailHtmlOf(grid, 'gtold')
+  ok('cache(skew): a payload with no cache field renders NO section (cannot tell ≠ no cache)',
+    !/Read cache/.test(old), old.slice(0, 400))
+
+  // ---- toolbar enablement by state ----------------------------------------
+
+  const rowOf = name => grid.getStore().findExact('name', name)
+  const CACHE_BTNS = ['attachCache', 'detachCache']
+
+  grid.selectRow(rowOf('gtclean'))
+  let st = toolbar(grid, CACHE_BTNS)
+  ok('cache(toolbar): a healthy uncached pool offers Attach', st.attachCache && st.attachCache.disabled === false)
+  ok('cache(toolbar): …with no leftover reason', st.attachCache.tip === '', st.attachCache.tip)
+  ok('cache(toolbar): nothing to detach is DISABLED and says so',
+    st.detachCache.disabled === true && /no read cache to detach/.test(st.detachCache.tip), st.detachCache.tip)
+
+  grid.selectRow(rowOf('gtleft'))
+  st = toolbar(grid, CACHE_BTNS)
+  ok('cache(toolbar): a leftover slice is attachable (the route re-wipes it)', st.attachCache.disabled === false)
+  ok('cache(toolbar): …and detachable — the slice is what keeps the disk out of the inventory',
+    st.detachCache.disabled === false)
+
+  grid.selectRow(rowOf('gtcache'))
+  st = toolbar(grid, CACHE_BTNS)
+  ok('cache(toolbar): a cached pool refuses Attach', st.attachCache.disabled === true)
+  ok('cache(toolbar): …and the tooltip says to detach first',
+    /already has a read cache — detach it first/.test(st.attachCache.tip), st.attachCache.tip)
+  ok('cache(toolbar): a live cache is detachable', st.detachCache.disabled === false)
+
+  grid.selectRow(rowOf('gtfail'))
+  st = toolbar(grid, CACHE_BTNS)
+  ok('cache(toolbar): a FAILED cache refuses Attach (detach is the recovery)', st.attachCache.disabled === true)
+  ok('cache(toolbar): …and stays detachable in the failed state', st.detachCache.disabled === false)
+
+  grid.selectRow(rowOf('gtoff'))
+  st = toolbar(grid, CACHE_BTNS)
+  ok('cache(toolbar): an OFFLINE pool refuses Attach — nothing to cache',
+    st.attachCache.disabled === true && /volume is not assembled/.test(st.attachCache.tip), st.attachCache.tip)
+  ok('cache(toolbar): an offline pool with a state-absent cache refuses Detach',
+    st.detachCache.disabled === true)
+
+  grid.selectRow(rowOf('gtold'))
+  st = toolbar(grid, CACHE_BTNS)
+  ok('cache(toolbar): an older daemon (no cache field) keeps Attach live — the 404 door says "not in this build"',
+    st.attachCache.disabled === false)
+  ok('cache(toolbar): …and Detach stays dead (it cannot know there is a cache)',
+    st.detachCache.disabled === true)
+  ok('cache(toolbar): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+async function ahrCacheAttachChecks() {
+  const disksRows = [
+    { id: HOT7, status: 'available', size: 1024 * MiB, model: 'QEMU SSD', rotational: false, transport: 'sata' },
+    { id: HOT9, status: 'available', size: 512 * MiB, model: 'QEMU HDD', rotational: true, transport: 'sata' },
+    { id: HOT8, status: 'ahr_member', poolName: 'gtcache', ahrArray: 'cache', size: 512 * MiB, model: 'QEMU SSD', rotational: false },
+  ]
+  const { ANAS, grid } = await openAhrCacheView(
+    [ahrCacheRow('gtcache', { cache: CACHE_LEFTOVER })],
+    {
+      'GET /disks': { data: disksRows },
+      'GET /ahr/gtcache': { data: ahrCacheRow('gtcache', { cache: CACHE_LEFTOVER }) },
+      'POST /ahr/gtcache/cache': { job: { id: 'jc1' } },
+    },
+  )
+  if (!grid) { return }
+
+  // The detail window is open under the job — the reload contract covers it.
+  const detailBase = ahrDetailGets('gtcache')
+  await detailHtmlOf(grid, 'gtcache')
+  ok('cache(attach): the detail loaded once before any job', ahrDetailGets('gtcache') === detailBase + 1, String(ahrDetailGets('gtcache') - detailBase))
+
+  // The drag-select seam, stubbed exactly where the dialog consults it.
+  let dragSpec = null
+  let dragCtrl = null
+  ANAS.ahrComposer = {
+    makeDragSelect(spec) {
+      dragSpec = spec
+      dragCtrl = {
+        render() {},
+        selectedInBay(bay) {
+          return (spec.disks || []).filter(d => spec.assigned[d.id] === bay).map(d => d.id)
+        },
+        drop(id) { spec.assigned[id] = 'cache'; if (spec.onChange) { spec.onChange() } },
+        undrop(id) { delete spec.assigned[id]; if (spec.onChange) { spec.onChange() } },
+      }
+      return dragCtrl
+    },
+  }
+
+  created.windows.length = 0
+  const attachBtn = grid.down('#attachCache')
+  attachBtn.handler(attachBtn)
+  await settle()
+  const dlg = openWindow()
+  ok('cache(attach): the dialog opened', !!dlg, JSON.stringify(warnings))
+  if (!dlg) { return }
+  const dlgHtml = dlg.down('#ahrCacheBody').html || ''
+  ok('cache(attach): the two-sentence advisory is present (hotspot + consumable)',
+    /repeated random reads/.test(dlgHtml) && /sequential streams do not benefit/.test(dlgHtml)
+      && /The SSD is a consumable/.test(dlgHtml), dlgHtml.slice(0, 700))
+  ok('cache(attach): the bay is wired through the drag-select seam', !!dragSpec)
+  if (!dragSpec) { return }
+
+  const rotNote = () => {
+    const el = dlg.down('#ahrCacheBody').dom().nodeById('ahrc-rotnote')
+    return el ? el.innerHTML : ''
+  }
+
+  // The ONE sentence a rotating pick earns — shown for it, gone without it.
+  dragCtrl.drop(HOT9)
+  ok('cache(attach): a rotating pick shows "a rotating cache adds a seek, not speed"',
+    /a rotating cache adds a seek, not speed/.test(rotNote()), rotNote())
+  dragCtrl.undrop(HOT9)
+  ok('cache(attach): an all-flash pick hides the rotating note', rotNote() === '', rotNote())
+
+  // The reclaimable leftover slice of this pool's own cache is offerable
+  // (it reads ahr_member in the inventory; the route re-wipes the label).
+  const offered = dragSpec.disks.map(d => d.id)
+  ok('cache(attach): available disks AND the pool\'s leftover slice are offered',
+    offered.includes(HOT7) && offered.includes(HOT9) && offered.includes(HOT8),
+    JSON.stringify(offered))
+  ok('cache(attach): SSDs sort first', offered[0] !== HOT9, JSON.stringify(offered))
+
+  const beforeList = ahrListGets()
+  const beforeDetail = ahrDetailGets('gtcache')
+  dragCtrl.drop(HOT9)
+  const exec = findCmp(dlg, 'anas-btn-ahr-cache-attach-exec')
+  ok('cache(attach): the exec button exists', !!exec)
+  if (!exec) { return }
+  exec.handler(exec)
+  await settle()
+
+  ok('cache(attach): POST /ahr/gtcache/cache is the submitted job',
+    jobs.length === 1 && jobs[0].method === 'post' && jobs[0].path === '/ahr/gtcache/cache',
+    JSON.stringify(jobs[0] || {}))
+  eq('cache(attach): the body is exactly {disks:[id]}', (jobs[0] || {}).body, { disks: [HOT9] })
+  const parsed = AttachAhrCacheRequest.safeParse((jobs[0] || {}).body)
+  ok('cache(attach): the submitted body parses against the REAL AttachAhrCacheRequest',
+    parsed.success, JSON.stringify((parsed.error || {}).issues))
+  ok('cache(attach): the schema itself refuses a duplicated disk (the daemon-side 400)',
+    AttachAhrCacheRequest.safeParse({ disks: [HOT9, HOT9] }).success === false)
+
+  // Reload on SUCCESS: grid AND the open detail window.
+  ok('cache(attach): success reloads the grid', ahrListGets() === beforeList + 1)
+  ok('cache(attach): success reloads the open detail window',
+    ahrDetailGets('gtcache') === beforeDetail + 1)
+
+  // The daemon's 409 reaches the user under the fail title (the modal body
+  // is ANAS.errText(err) — the daemon's own sentence), and FAILURE reloads
+  // too: a failed attach leaves the pool uncached and clean.
+  ok('cache(attach): the failure modal is titled for the verb',
+    jobs[0].failTitle === 'Attach cache failed', jobs[0].failTitle)
+  jobs[0].onFailed({
+    error: { message: `AHR pool 'gtcache' already has a read cache (${HOT9}, 512.00 MiB, state 'healthy'). Detach it before attaching another` },
+  })
+  ok('cache(attach): failure reloads the grid too', ahrListGets() === beforeList + 2)
+  ok('cache(attach): failure reloads the detail too',
+    ahrDetailGets('gtcache') === beforeDetail + 2)
+
+  // The empty-bay guard: no disk, no POST, a telling alert.
+  created.windows.length = 0
+  attachBtn.handler(attachBtn)
+  await settle()
+  const dlg2 = openWindow()
+  ok('cache(attach): the dialog reopens for the empty-bay case', !!dlg2)
+  const jobsBefore = jobs.length
+  const alertsBefore = alerts.length
+  const exec2 = dlg2 && findCmp(dlg2, 'anas-btn-ahr-cache-attach-exec')
+  if (exec2) {
+    exec2.handler(exec2)
+    await settle()
+  }
+  ok('cache(attach): an empty bay refuses to submit with the telling alert',
+    alerts.length === alertsBefore + 1
+      && /Drag at least one disk into the cache bay/.test((alerts[alertsBefore] || {}).msg || ''),
+    JSON.stringify(alerts.slice(alertsBefore)))
+  ok('cache(attach): the empty bay sent nothing', jobs.length === jobsBefore)
+  ok('cache(attach): nothing warned by the guard', warnings.length === 0,
+    warnings.join(' | '))
+}
+
+async function ahrCacheDetachChecks() {
+  const rows = [
+    ahrCacheRow('gtcache', { cache: CACHE_HEALTHY }),
+    ahrCacheRow('gtfail', { state: 'degraded', cache: CACHE_FAILED }),
+  ]
+  const { ANAS, grid } = await openAhrCacheView(rows)
+  if (!grid) { return }
+  const detachBtn = grid.down('#detachCache')
+
+  // The confirm names the trade in the story's own words, device ids included.
+  grid.selectRow(grid.getStore().findExact('name', 'gtcache'))
+  let sent = null
+  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  detachBtn.handler(detachBtn)
+  await settle()
+  ok('cache(detach): DELETE /ahr/gtcache/cache through the confirm door',
+    sent && sent.method === 'del' && sent.path === '/ahr/gtcache/cache',
+    sent ? sent.method + ' ' + sent.path : 'nothing sent')
+  ok('cache(detach): the confirm says reads continue from the pool',
+    /reads continue from the pool/.test((sent || {}).confirmIntro || ''), (sent || {}).confirmIntro)
+  ok('cache(detach): …and the SSD is wiped and returns to available',
+    /the SSD is wiped and returns to available/.test((sent || {}).confirmIntro || ''), (sent || {}).confirmIntro)
+  ok('cache(detach): …naming the cache disk by its FULL by-id',
+    ((sent || {}).confirmIntro || '').includes(HOT9), (sent || {}).confirmIntro)
+
+  // Reload on success AND failure through the same cfg.
+  const beforeList = ahrListGets()
+  sent.onComplete({})
+  ok('cache(detach): success reloads the grid', ahrListGets() === beforeList + 1)
+  sent.onFailed({ error: { message: `AHR pool 'gtcache' is offline: bring the pool online first — the cache is released by uncache, which needs an active volume. See the Hybrid RAID view for which band arrays cannot start` } })
+  ok('cache(detach): failure reloads the grid too', ahrListGets() === beforeList + 2)
+
+  // The FAILED-cache variant: reads do NOT continue until this runs (GT-19) —
+  // the confirm states the recovery, never the healthy-cache sentence.
+  grid.selectRow(grid.getStore().findExact('name', 'gtfail'))
+  sent = null
+  detachBtn.handler(detachBtn)
+  await settle()
+  ok('cache(detach failed): the failed cache is what is blocking reads — detaching restores them',
+    /restores reads/.test((sent || {}).confirmIntro || '')
+      && /every read currently returns an I\/O error/.test((sent || {}).confirmIntro || ''),
+    (sent || {}).confirmIntro)
+  ok('cache(detach failed): it does NOT claim reads continue',
+    !/reads continue from the pool/.test((sent || {}).confirmIntro || ''), (sent || {}).confirmIntro)
+  ok('cache(detach failed): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/** The Disks grid's usage cell for a cache disk (GT-22: "<pool> / cache"). */
+function ahrCacheDisksChecks() {
+  const ANAS = loadSource('40-disks.js', { 'GET /disks': { data: [] } })
+  const gridCfg = ANAS.views['disks'].factory('n1').items[0]
+  const usageCol = gridCfg.columns.find(c => c.dataIndex === 'status')
+  ok('cache(disks): the Usage column exists', !!usageCol)
+  if (!usageCol) { return }
+  const render = (v, data) => usageCol.renderer(v, {}, makeRecord(data))
+  const cell = render('ahr_member', { status: 'ahr_member', poolName: 'gtcache', ahrArray: 'cache' })
+  ok('cache(disks): a cache disk reads "<pool> / cache" — attributed, role named',
+    /^gtcache \/ cache/.test(cell), cell)
+  ok('cache(disks): it never reads "Other"', !/Other/.test(cell), cell)
+}
+
+warnings.length = 0
+created.windows.length = 0
+await ahrCacheBlockChecks()
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await ahrCacheAttachChecks()
+
+warnings.length = 0
+created.windows.length = 0
+jobs.length = 0
+await ahrCacheDetachChecks()
+
+warnings.length = 0
+created.windows.length = 0
+ahrCacheDisksChecks()
 
 if (failures.length) {
   console.error(`\n✖ ${failures.length} of ${checks} checks failed:\n`)
