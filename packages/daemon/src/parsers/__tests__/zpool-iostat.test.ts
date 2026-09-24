@@ -92,8 +92,8 @@ describe('nodeToIoStats — column → IoStats mapping', () => {
  * Stunt-node capture (ZFS 2.4.4, 2026-09-24) of a pool carrying all six vdev
  * classes on six partitions of one disk — the shape GitHub #66 reported. The
  * class sections (`logs`, `cache`, `special`, `dedup`) print UNINDENTED, in the
- * pool column, with every value cell `-`; only the pools the command was asked
- * about tell a pool row from one of those headers.
+ * pool column, with every value cell `-`. That SHAPE is what tells a header
+ * from a pool row: a pool always carries its capacity numbers.
  */
 describe('parseZpoolIostat — vdev-class section headers (vdevs.1)', () => {
   const classesText = readFileSync(
@@ -101,10 +101,10 @@ describe('parseZpoolIostat — vdev-class section headers (vdevs.1)', () => {
     'utf-8',
   )
 
-  it('without the pool names a section header reads as a pool (the old behaviour)', () => {
+  it('a header is told by its shape even when no pool names are given', () => {
     const [sample] = parseZpoolIostat(classesText)
     const pools = sample.filter(n => n.depth === 0).map(n => n.name)
-    assert.deepEqual(pools, ['gtvdev', 'dedup', 'special', 'logs', 'cache'])
+    assert.deepEqual(pools, ['gtvdev'])
   })
 
   it('naming the pool folds every section under it, its devices as vdevs', () => {
@@ -125,10 +125,50 @@ describe('parseZpoolIostat — vdev-class section headers (vdevs.1)', () => {
       assert.equal(sample.find(n => n.name === name), undefined, `${name} dropped`)
   })
 
-  it('a pool that happens to be NAMED like a section is still a pool', () => {
-    // The argument is the pools we asked about, so the name collision resolves
-    // the honest way round — `special` is a pool here, not a header.
-    const [sample] = parseZpoolIostat(classesText, new Set(['gtvdev', 'special']))
-    assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'special'])
+  /**
+   * A pool may legitimately be called `logs`, `cache`, `special` or `dedup`.
+   * Guarding on the NAME broke such a pool outright: its row was read as a
+   * section header, its statistics were dropped and its vdevs were attributed
+   * to whichever pool printed before it. The shape guard cannot: this text is
+   * the capture's own layout with a second pool NAMED `logs` — carrying real
+   * numbers, and carrying a real `logs` section of its own (vdevs.1 fix
+   * batch 2).
+   */
+  const namedLikeSectionText = [
+    '                        capacity                         operations                         bandwidth                   total_wait               disk_wait              syncq_wait              asyncq_wait            scrub        trim     rebuild',
+    'pool                  alloc             free             read            write             read            write        read       write        read       write        read       write        read       write        wait        wait        wait',
+    '----------  ---------------  ---------------  ---------------  ---------------  ---------------  ---------------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------',
+    'gtvdev               167424       1241346560                0                1            10596            35135     1460516      384704     1460516      288528         733        5473           -      213831           -           -           -',
+    '  sdb1                    0        402653184                0                0             2649             8283     1685211      409071     1685211      409071         877         427           -           -           -           -           -',
+    'logs                      -                -                -                -                -                -           -           -           -           -           -           -           -           -           -           -           -',
+    '  sdb2                    0        201326592                0                0             2649             8238     1685211      615468     1685211      598372         713       25961           -           -           -           -           -',
+    'logs                  12288        536870912                0                2             4096            16384      900000      300000      900000      250000         500        1200           -           -           -           -           -',
+    '  sdc1                    0        536870912                0                2             4096            16384      900000      300000      900000      250000         500        1200           -           -           -           -           -',
+    'logs                      -                -                -                -                -                -           -           -           -           -           -           -           -           -           -           -           -',
+    '  sdc2                    0        201326592                0                0              512              256      100000       50000      100000       50000         100         200           -           -           -           -           -',
+    '----------  ---------------  ---------------  ---------------  ---------------  ---------------  ---------------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------',
+  ].join('\n')
+
+  it('a pool genuinely NAMED logs keeps its row — the header is the all-`-` one', () => {
+    const [sample] = parseZpoolIostat(namedLikeSectionText, new Set(['gtvdev', 'logs']))
+    assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'logs'])
+
+    // The pool row carries the statistics it printed.
+    const pool = sample.find(n => n.depth === 0 && n.name === 'logs')!
+    assert.equal(pool.ops.write, 2)
+    assert.equal(pool.bandwidth.read, 4096)
+
+    // Its own devices belong to it — including the one under its `logs`
+    // section header, which is dropped as a header while the pool stands.
+    assert.deepEqual(
+      sample.filter(n => n.pool === 'logs').map(n => n.name),
+      ['logs', 'sdc1', 'sdc2'],
+    )
+    assert.equal(sample.find(n => n.name === 'sdb2')!.pool, 'gtvdev')
+  })
+
+  it('the shape guard works with no pool names at all', () => {
+    const [sample] = parseZpoolIostat(namedLikeSectionText)
+    assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'logs'])
   })
 })

@@ -101,12 +101,21 @@
         return typeof f === 'function' ? f : null;
     }
 
-    // The by-id leaves of every top-level vdev, keyed by vdev name. A mirror /
-    // raidz vdev lists its member disks; a single-disk data vdev is its own leaf
-    // (the vdev name IS the device), so it falls back to the vdev name.
+    // The leaves of every top-level vdev, keyed by vdev name. A mirror / raidz
+    // vdev lists its member disks; a single-disk data vdev is its own leaf (the
+    // vdev name IS the device), so it falls back to the vdev name.
+    //
+    // A leaf is named by its device-path basename (`ANAS.vdevLeafName`), never
+    // by `disk.id`: the daemon strips a `-partN` suffix off the by-id to get
+    // the DISK's identity, so on a split SSD — log on -part1, cache on -part2,
+    // data on -part3 — all three leaves carry the same id. Sent that way the
+    // replace area drew three identically labelled slots and `zpool replace`
+    // was handed a device the pool does not have (GitHub #66). The basename
+    // names exactly one leaf, and the daemon resolves it against the pool's own
+    // `zpool status`.
     function buildVdevMap(detail) {
         var map = {};
-        var leaves = [];        // every pool leaf { id, state, vdevName, role }
+        var leaves = [];        // every pool leaf { name, state, vdevName, role }
         var groups = (detail && detail.vdevGroups) || [];
         for (var gi = 0; gi < groups.length; gi++) {
             var role = groups[gi].role;
@@ -114,12 +123,13 @@
             for (var vi = 0; vi < vdevs.length; vi++) {
                 var v = vdevs[vi];
                 var disks = v.disks || [];
-                var ids = [];
+                var names = [];
                 if (disks.length) {
                     for (var di = 0; di < disks.length; di++) {
-                        ids.push(disks[di].id);
+                        var leafName = ANAS.vdevLeafName(disks[di]);
+                        names.push(leafName);
                         leaves.push({
-                            id: disks[di].id,
+                            name: leafName,
                             state: disks[di].state || '',
                             vdevName: v.name,
                             role: role,
@@ -127,10 +137,10 @@
                     }
                 } else if (v.name) {
                     // Single-disk vdev — the vdev name is the leaf device.
-                    ids.push(v.name);
-                    leaves.push({ id: v.name, state: v.state || '', vdevName: v.name, role: role });
+                    names.push(v.name);
+                    leaves.push({ name: v.name, state: v.state || '', vdevName: v.name, role: role });
                 }
-                map[v.name] = { role: role, type: v.type, leaves: ids, firstLeaf: ids[0] || v.name };
+                map[v.name] = { role: role, type: v.type, leaves: names, firstLeaf: names[0] || v.name };
             }
         }
         return { byName: map, leaves: leaves };
@@ -495,7 +505,7 @@
                 + 'background:linear-gradient(var(--anas-card-top),var(--anas-card-bot))">'
                 + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:5px">'
                 + '<span style="font-weight:650;font-size:12px;color:var(--anas-ink);'
-                + 'overflow-wrap:anywhere" title="' + enc(leaf.id) + '">' + enc(leaf.id) + '</span>'
+                + 'overflow-wrap:anywhere" title="' + enc(leaf.name) + '">' + enc(leaf.name) + '</span>'
                 + '<span style="flex:1"></span>'
                 + '<span style="font-size:10px;font-weight:800;text-transform:uppercase;'
                 + 'letter-spacing:.5px;color:var(--anas-muted)">'
@@ -694,7 +704,7 @@
             } else {
                 for (i = 0; i < leaves.length; i++) {
                     var bId = 'rep' + i;
-                    bayMeta[bId] = { existingDiskId: leaves[i].id, allowed: true };
+                    bayMeta[bId] = { existingDiskId: leaves[i].name, allowed: true };
                     slots += replaceSlotHtml(leaves[i], bId);
                 }
             }

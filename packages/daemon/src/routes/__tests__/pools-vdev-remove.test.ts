@@ -14,13 +14,12 @@ import { fileURLToPath } from 'node:url'
 import { isRemovableVdevRole } from '@anas/shared'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
+import { ambiguousVdevMessage, isVdevRefusal, unknownVdevMessage } from '../../services/zfs-vdev-leaf.js'
 import {
-  ambiguousVdevMessage,
-  isVdevRefusal,
   NON_REMOVABLE_VDEV_MESSAGE,
   resolveVdev,
   spareInUseMessage,
-  unknownVdevMessage,
+  unreadablePoolMessage,
 } from '../../services/zfs-vdev-remove.js'
 
 /**
@@ -741,5 +740,210 @@ describe('remove-vdev: the settle poll only completes on an answer', () => {
     assert.equal(job.status, 'failed')
     assert.match(job.error!.message, /could not be read back/)
     assert.match(job.error!.message, /no such pool/)
+  })
+
+  // The OTHER unreadable answer, and the quieter one: `zpool status` exits 0
+  // and simply does not carry the pool any more. Nothing verified that the
+  // vdev came out — the pool it belonged to is the thing that went missing —
+  // so the job must say so rather than report a removal it never saw.
+  it('fails the job when status exits 0 but no longer carries the pool', async () => {
+    process.env.ANAS_VDEV_REMOVE_SETTLE_MS = '0'
+    server = serverForPool(MULTI_LIST, [
+      multiStatus(),
+      { stdout: JSON.stringify({ pools: {} }), stderr: '', exitCode: 0 },
+    ])
+
+    const res = await server.inject({
+      method: 'POST',
+      url: `/v1/pools/${MULTI_POOL}/vdevs/remove`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ vdev: `${MULTI_DISK}-part3` }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.equal(
+      job.error!.message,
+      unreadablePoolMessage(MULTI_POOL, 'zpool status no longer reports the pool'),
+    )
+    // The removal itself WAS run — this is the read-back that failed, and the
+    // job is honest about which half of the operation it could not confirm.
+    assert.deepEqual(removeCall(server), ['remove', MULTI_POOL, MULTI_PART(3)])
+  })
+})
+
+// --- an in-use spare, through the whole route ------------------------------
+//
+// `zpool-status-spare-active.json` is a real capture of a spare ZFS has put to
+// work: HOT3 is listed inside `mirror-0`'s `spare-1` (which the parser
+// flattens into the mirror's disks) AND in the pool's `spares` section as
+// INUSE. Read as a member of the mirror it came back role `data` and was
+// refused with the evacuation sentence — the wrong reason, one step away from
+// handing `zpool remove` the whole data mirror.
+
+describe('remove-vdev: an in-use spare is refused end to end', () => {
+  const SPARED_POOL = 'testpool'
+  const SPARED_ID = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT3'
+
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  function spareActiveStatus(): ExecResult {
+    const path = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/zfs/zpool-status-spare-active.json')
+    return { stdout: readFileSync(path, 'utf-8'), stderr: '', exitCode: 0 }
+  }
+
+  async function post(vdev: string) {
+    return server!.inject({
+      method: 'POST',
+      url: `/v1/pools/${SPARED_POOL}/vdevs/remove`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ vdev }),
+    })
+  }
+
+  it('400s with the spare sentence, naming the vdev it is patching', async () => {
+    server = serverForPool(mockFixtures.zpoolList(), [spareActiveStatus()])
+
+    const res = await post(SPARED_ID)
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.equal(res.json().error.message, spareInUseMessage(SPARED_ID, 'mirror-0'))
+    assert.equal(removeCall(server), undefined)
+  })
+
+  it('and by its partition basename — never as a data leaf', async () => {
+    server = serverForPool(mockFixtures.zpoolList(), [spareActiveStatus()])
+
+    const res = await post(`${SPARED_ID}-part1`)
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.message, spareInUseMessage(`${SPARED_ID}-part1`, 'mirror-0'))
+    assert.notEqual(res.json().error.message, NON_REMOVABLE_VDEV_MESSAGE)
+    assert.equal(removeCall(server), undefined)
+  })
+})
+
+// --- a BASENAME that collides across classes -------------------------------
+//
+// The stripped by-id is not the only spelling two leaves can share. A pool
+// mixing a by-id partition with a device-mapper alias of the same name gives
+// two DIFFERENT devices, in two different classes, the same device-path
+// basename — the very token the dialog sends. It must be refused, not guessed
+// at, exactly as the stripped id is.
+
+describe('remove-vdev: a basename that names two classes is refused', () => {
+  const DM_POOL = 'tank'
+
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  /** log on `/dev/disk/by-id/ssd-part1`, cache on `/dev/mapper/ssd-part1`. */
+  function collidingStatus(): ExecResult {
+    const counters = { read_errors: '0', write_errors: '0', checksum_errors: '0' }
+    return {
+      stdout: JSON.stringify({
+        pools: {
+          [DM_POOL]: {
+            name: DM_POOL,
+            state: 'ONLINE',
+            pool_guid: '1',
+            error_count: '0',
+            vdevs: {
+              [DM_POOL]: {
+                name: DM_POOL,
+                vdev_type: 'root',
+                state: 'ONLINE',
+                vdevs: {
+                  'ata-DATA-part1': {
+                    name: 'ata-DATA-part1',
+                    vdev_type: 'disk',
+                    path: '/dev/disk/by-id/ata-DATA-part1',
+                    devid: 'ata-DATA-part1',
+                    state: 'ONLINE',
+                    ...counters,
+                  },
+                },
+              },
+            },
+            logs: {
+              'ssd-part1': {
+                name: 'ssd-part1',
+                vdev_type: 'disk',
+                path: '/dev/disk/by-id/ssd-part1',
+                devid: 'ssd-part1',
+                class: 'log',
+                state: 'ONLINE',
+                ...counters,
+              },
+            },
+            l2cache: {
+              'dm-ssd': {
+                name: 'dm-ssd',
+                vdev_type: 'disk',
+                path: '/dev/mapper/ssd-part1',
+                class: 'l2cache',
+                state: 'ONLINE',
+                ...counters,
+              },
+            },
+          },
+        },
+      }),
+      stderr: '',
+      exitCode: 0,
+    }
+  }
+
+  /** The same pool with no `logs` section — what a successful remove leaves. */
+  function collidingStatusWithoutLog(): ExecResult {
+    const doc = JSON.parse(collidingStatus().stdout) as { pools: Record<string, Record<string, unknown>> }
+    delete doc.pools[DM_POOL].logs
+    return { stdout: JSON.stringify(doc), stderr: '', exitCode: 0 }
+  }
+
+  const DM_LIST: ExecResult = {
+    stdout: JSON.stringify({ pools: { [DM_POOL]: { name: DM_POOL, state: 'ONLINE', properties: {} } } }),
+    stderr: '',
+    exitCode: 0,
+  }
+
+  async function post(vdev: string) {
+    return server!.inject({
+      method: 'POST',
+      url: `/v1/pools/${DM_POOL}/vdevs/remove`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ vdev }),
+    })
+  }
+
+  it('the shared BASENAME names both and is refused, naming the candidates', async () => {
+    server = serverForPool(DM_LIST, [collidingStatus()])
+
+    const res = await post('ssd-part1')
+    assert.equal(res.statusCode, 400)
+    assert.equal(
+      res.json().error.message,
+      ambiguousVdevMessage(DM_POOL, 'ssd-part1', ['log ssd-part1', 'cache ssd-part1']),
+    )
+    assert.equal(removeCall(server), undefined)
+  })
+
+  it('each leaf still comes out under a spelling that names only it', async () => {
+    server = serverForPool(DM_LIST, [collidingStatus(), collidingStatusWithoutLog()])
+
+    // The by-id leaf's own id fits the LOG alone (the dm leaf's id is dm-ssd).
+    const res = await post('ssd')
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(removeCall(server), ['remove', DM_POOL, '/dev/disk/by-id/ssd-part1'])
   })
 })

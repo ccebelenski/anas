@@ -134,6 +134,24 @@
         return value ? ANAS.t('Yes') : ANAS.t('No');
     };
 
+    // The name ONE vdev leaf answers to — its device-path basename
+    // (`ata-SSD-part1`, `sdb2`), falling back to the leaf id when the daemon
+    // reports no path. Single source of truth for every dialog that hands the
+    // daemon a leaf (Remove vdev…, Expand / Replace): `disk.id` has had its
+    // `-partN` suffix stripped to name the DISK, so on a split device — one SSD
+    // carrying the log on -part1 and the cache on -part2 — every leaf carries
+    // the SAME id, and a token spelled that way names all of them (GitHub #66).
+    // The daemon refuses such a token rather than guessing, so what the dialog
+    // shows and what it sends must both be this.
+    ANAS.vdevLeafName = function (disk) {
+        var path = (disk && disk.path) || '';
+        if (path) {
+            var cut = path.lastIndexOf('/');
+            return cut === -1 ? path : path.slice(cut + 1);
+        }
+        return (disk && disk.id) || '';
+    };
+
     // Translate a POSIX octal mode ("0644", "755", "0000") into a human-readable
     // form: the symbolic triad string ("rw-r--r--") plus a plain-English gloss
     // ("Owner: read & write · Group: read · Others: read"). Single source of
