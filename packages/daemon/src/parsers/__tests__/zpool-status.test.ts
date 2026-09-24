@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { isVdevRefusal } from '../../services/zfs-vdev-leaf.js'
+import { resolveVdev } from '../../services/zfs-vdev-remove.js'
 import { lastScrubFromScan, parseLastScrubs, parseScrubScans, parseZpoolStatus, scrubRunningFromScan } from '../zpool-status.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -323,6 +325,52 @@ describe('parseZpoolStatus', () => {
     // makes `disk.id` an ambiguous way to name a leaf (GitHub #66).
     const ids = new Set(pool.vdevGroups.flatMap(g => g.vdevs.flatMap(v => v.disks.map(d => d.id))))
     assert.deepEqual([...ids], ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9'])
+  })
+
+  // A leaf ZFS can no longer open reports NEITHER `devid` NOR a by-id `path` —
+  // only the name `zpool status` prints. The identity (`id`) has its `-partN`
+  // stripped to name the DISK, so synthesizing the fallback path from it gave
+  // every partition of one device the SAME path: `zpool status`'s own
+  // `ata-SSD-part1` matched nothing, and a remove/replace token would have
+  // named the whole disk (vdevs.1 fix batch 2).
+  it('an UNAVAIL leaf with only a name keeps the partition in its fallback path', () => {
+    const status = {
+      pools: {
+        tank: {
+          name: 'tank',
+          pool_guid: '1',
+          state: 'DEGRADED',
+          error_count: '0',
+          vdevs: {
+            tank: {
+              name: 'tank',
+              vdev_type: 'root',
+              state: 'DEGRADED',
+              vdevs: {
+                'ata-SSD-part1': { name: 'ata-SSD-part1', vdev_type: 'disk', state: 'UNAVAIL' },
+                // An EMPTY path is no path at all — it must not become the
+                // leaf's device, or a token could be the empty string.
+                'ata-SSD-part2': { name: 'ata-SSD-part2', vdev_type: 'disk', state: 'UNAVAIL', path: '' },
+              },
+            },
+          },
+        },
+      },
+    }
+    const [pool] = parseZpoolStatus(status)
+    const data = pool.vdevGroups.find(g => g.role === 'data')!
+    const paths = data.vdevs.flatMap(v => v.disks.map(d => d.path))
+    assert.deepEqual(paths, ['/dev/disk/by-id/ata-SSD-part1', '/dev/disk/by-id/ata-SSD-part2'])
+    // The IDENTITY still names the disk — that is what cross-references to the
+    // Disks list — so the two spellings stay distinct on purpose.
+    assert.deepEqual(data.vdevs.flatMap(v => v.disks.map(d => d.id)), ['ata-SSD', 'ata-SSD'])
+
+    // And the leaf is therefore nameable: the token the dialog sends resolves.
+    const hit = resolveVdev(pool, 'ata-SSD-part1')
+    assert.ok(hit && !isVdevRefusal(hit))
+    assert.deepEqual(hit, { role: 'data', vdev: 'ata-SSD-part1', token: '/dev/disk/by-id/ata-SSD-part1' })
+    // The stripped id names both partitions and is refused, never guessed at.
+    assert.ok(isVdevRefusal(resolveVdev(pool, 'ata-SSD')!))
   })
 
   // Regression (0.3.4 → the uniform section parser): a pool built on FILES

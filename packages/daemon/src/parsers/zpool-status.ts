@@ -344,7 +344,16 @@ function parseDisk(raw: ZfsVdevRaw): PoolDisk {
   const id = diskId(raw)
   return {
     id,
-    path: (raw.path ?? `/dev/disk/by-id/${id}`) as `/dev/${string}`,
+    // `path` is the leaf's own device, and the ONE spelling that is unique per
+    // leaf: the `id` has had `-partN` stripped to name the DISK, so on a split
+    // device (log on -part1, cache on -part2) both leaves share it. When ZFS
+    // reports no path — an UNAVAIL leaf it can no longer open — the fallback is
+    // synthesized from the UNSTRIPPED name `zpool status` prints
+    // (`ata-SSD-part1`), never from the stripped id: a path naming the whole
+    // disk would make both leaves identical again, and a remove or replace
+    // token would name the disk instead of the partition. An empty string is
+    // no path at all, so it takes the fallback too.
+    path: (raw.path || `/dev/disk/by-id/${raw.name}`) as `/dev/${string}`,
     state: raw.state as VdevState,
     readErrors: parseIntOrZero(raw.read_errors),
     writeErrors: parseIntOrZero(raw.write_errors),

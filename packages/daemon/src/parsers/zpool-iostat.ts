@@ -67,15 +67,19 @@ const WHITESPACE_RE = /\s+/
  * Parse the full multi-sample output into an array of samples, each an array of
  * nodes. The telemetry route uses the LAST sample (the per-second interval).
  *
- * `knownPools` — the pools the command was ASKED about — separates a pool row
- * from a vdev-class section header. GROUND TRUTH (stunt node, ZFS 2.4.4,
- * 2026-09-24, fixture `zpool-iostat-plv-all-vdev-classes-2.4.4.txt`): `zpool
- * iostat -plv` prints `logs`, `cache`, `special` and `dedup` UNINDENTED, in the
- * pool column, with every value cell `-`; their devices follow at the vdev
- * indent. Read positionally those headers become four phantom pools and the
- * real pool loses the vdevs beneath them (vdevs.1 consumer audit). Naming the
- * pools is the only way to tell the two apart — a pool may legitimately be
- * called `special`. Without the argument the old positional reading is kept.
+ * An unindented row is a pool row or a vdev-class section header, and the two
+ * are told apart by SHAPE. GROUND TRUTH (stunt node, ZFS 2.4.4, 2026-09-24,
+ * fixture `zpool-iostat-plv-all-vdev-classes-2.4.4.txt`): `zpool iostat -plv`
+ * prints `logs`, `cache`, `special` and `dedup` UNINDENTED, in the pool column,
+ * with every value cell `-`; their devices follow at the vdev indent. Read
+ * positionally those headers become four phantom pools and the real pool loses
+ * the vdevs beneath them (vdevs.1 consumer audit). A header carries no
+ * statistics; a pool row always carries its capacity (an idle pool prints `0`,
+ * never `-`), so the all-`-` shape names the header whatever it is CALLED — a
+ * pool named `logs` keeps its numbers and stays a pool.
+ *
+ * `knownPools` — the pools the command was ASKED about — is the secondary
+ * check, for a header shape this ground truth has not seen.
  */
 export function parseZpoolIostat(text: string, knownPools?: ReadonlySet<string>): IostatNode[][] {
   const samples: IostatNode[][] = []
@@ -111,11 +115,16 @@ export function parseZpoolIostat(text: string, knownPools?: ReadonlySet<string>)
     let pool = currentPool
     let vdev = currentVdev
     if (depth === 0) {
-      // An unindented row that is NOT one of the pools we asked about is a
-      // vdev-class section header (logs / cache / special / dedup / spares).
-      // It carries no statistics of its own; the standing pool continues and
-      // the devices under it are that pool's vdevs.
-      if (knownPools && !knownPools.has(name) && currentPool) {
+      // An unindented row can be a POOL or a vdev-class section header (logs /
+      // cache / special / dedup / spares). A header is told apart by its SHAPE:
+      // it carries no statistics at all, so every value cell prints `-`, while
+      // a pool row always carries its capacity numbers (an idle pool prints
+      // `0`, not `-`). Shape first, because a pool may legitimately be NAMED
+      // `logs` or `special`; `knownPools` stays as the secondary check for a
+      // header shape we have not seen. Either way the standing pool continues
+      // and the devices under the header are that pool's vdevs.
+      const noStats = values.length > 0 && values.every(v => v === '-')
+      if (currentPool && (noStats || (knownPools && !knownPools.has(name)))) {
         currentVdev = undefined
         continue
       }

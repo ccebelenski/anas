@@ -1,6 +1,10 @@
 import type { VdevRole, VdevType } from '@anas/shared'
 import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
-import { basename } from 'node:path'
+import type { VdevRefusal } from './zfs-vdev-leaf.js'
+import { ambiguousVdevMessage, describeCandidate, matchPoolLeaves } from './zfs-vdev-leaf.js'
+
+export { ambiguousVdevMessage, isVdevRefusal, unknownVdevMessage } from './zfs-vdev-leaf.js'
+export type { VdevRefusal } from './zfs-vdev-leaf.js'
 
 /**
  * Story vdevs.2 — resolving the ONE vdev a remove request names against the
@@ -44,22 +48,6 @@ const SECTION_CONTAINER_NAMES = new Set(['logs', 'cache', 'spares', 'special', '
 export const NON_REMOVABLE_VDEV_MESSAGE
   = 'data, special and dedup vdevs cannot be removed here — their removal is device evacuation, which ANAS does not offer'
 
-/** The refusal for a name the pool does not carry. */
-export function unknownVdevMessage(pool: string, vdev: string): string {
-  return `pool ${pool} carries no vdev '${vdev}'`
-}
-
-/**
- * The refusal for a name that fits more than one leaf. A split device — one SSD
- * partitioned into a log and a cache — carries two leaves whose by-id DISK
- * identity is the same string (the `-partN` suffix is what tells them apart),
- * so a request naming the disk names both, and guessing would take out the SLOG
- * of an operator who picked the L2ARC (GitHub #66 layout).
- */
-export function ambiguousVdevMessage(pool: string, vdev: string, candidates: string[]): string {
-  return `'${vdev}' names more than one device in pool ${pool} (${candidates.join(', ')}) — name the one you mean by its device`
-}
-
 /** The refusal for a spare ZFS has already put to work. */
 export function spareInUseMessage(vdev: string, host: string): string {
   return `spare ${vdev} is in use by ${host} — ZFS releases it when the replaced disk returns or is detached`
@@ -85,28 +73,8 @@ export interface ResolvedVdev {
   token: string
 }
 
-/** A name the pool DOES carry but must not act on, with the sentence to say. */
-export interface VdevRefusal {
-  refusal: true
-  message: string
-}
-
 /** What a lookup answers: the one vdev, a refusal sentence, or nothing. */
 export type VdevLookup = ResolvedVdev | VdevRefusal | null
-
-export function isVdevRefusal(lookup: VdevLookup): lookup is VdevRefusal {
-  return lookup !== null && 'refusal' in lookup
-}
-
-/** The three spellings a leaf answers to: its path, its basename, its id. */
-function namesLeaf(disk: { id: string, path: string }, name: string): boolean {
-  return disk.path === name || basename(disk.path) === name || disk.id === name
-}
-
-/** How a candidate reads in the ambiguity sentence: `cache ata-SSD-part2`. */
-function describeCandidate(hit: ResolvedVdev): string {
-  return `${hit.role} ${basename(hit.token)}`
-}
 
 /**
  * Find the vdev `name` refers to anywhere in the pool's topology: a top-level
@@ -148,32 +116,30 @@ export function resolveVdev(status: ParsedPoolStatus, name: string): VdevLookup 
   const seen = new Set<string>()
   let inUseSpareHost: string | null = null
 
-  for (const group of status.vdevGroups) {
-    for (const vdev of group.vdevs) {
-      for (const disk of vdev.disks) {
-        if (!namesLeaf(disk, name))
-          continue
-        // The same leaf under a data vdev AND in the spares section: an active
-        // spare. Remember what it is standing in for, and do not read it as a
-        // member of the vdev it is patching.
-        if (group.role !== 'spare' && sparePaths.has(disk.path)) {
-          inUseSpareHost ??= vdev.name
-          continue
-        }
-        const hit: ResolvedVdev = GROUPING_VDEV_TYPES.has(vdev.type)
-          ? { role: group.role, vdev: vdev.name, token: vdev.name }
-          : { role: group.role, vdev: vdev.name, token: disk.path }
-        const key = `${hit.role}|${hit.vdev}|${hit.token}`
-        if (seen.has(key))
-          continue
-        seen.add(key)
-        matches.push(hit)
-      }
+  for (const { role, vdev, disk } of matchPoolLeaves(status, name)) {
+    // The same leaf under a data vdev AND in the spares section: an active
+    // spare. Remember what it is standing in for, and do not read it as a
+    // member of the vdev it is patching.
+    if (role !== 'spare' && sparePaths.has(disk.path)) {
+      inUseSpareHost ??= vdev.name
+      continue
     }
+    const hit: ResolvedVdev = GROUPING_VDEV_TYPES.has(vdev.type)
+      ? { role, vdev: vdev.name, token: vdev.name }
+      : { role, vdev: vdev.name, token: disk.path }
+    const key = `${hit.role}|${hit.vdev}|${hit.token}`
+    if (seen.has(key))
+      continue
+    seen.add(key)
+    matches.push(hit)
   }
 
-  if (matches.length > 1)
-    return { refusal: true, message: ambiguousVdevMessage(status.name, name, matches.map(describeCandidate)) }
+  if (matches.length > 1) {
+    return {
+      refusal: true,
+      message: ambiguousVdevMessage(status.name, name, matches.map(m => describeCandidate(m.role, m.token))),
+    }
+  }
   if (inUseSpareHost)
     return { refusal: true, message: spareInUseMessage(name, inUseSpareHost) }
   if (matches.length === 1)

@@ -10358,6 +10358,21 @@ const SPLIT_SSD_DETAIL = {
   ],
 }
 
+/**
+ * A mirrored log that has lost a leg: ONE leaf left under `mirror-1`. `zpool
+ * remove` takes the whole `mirror-N` out whatever it currently shows, so the
+ * dialog must still offer exactly one row named `mirror-1` — a leg count is
+ * not what decides the unit (vdevs.1 fix batch 2).
+ */
+const ONE_LEG_LOG_DETAIL = {
+  name: 'tank',
+  state: 'DEGRADED',
+  vdevGroups: [
+    { role: 'data', vdevs: [vdevOf('mirror-0', 'mirror', [vdevLeaf('ata-DATA-1'), vdevLeaf('ata-DATA-2')])] },
+    { role: 'log', vdevs: [vdevOf('mirror-1', 'mirror', [vdevLeaf('ata-LOG-1')], 'DEGRADED')] },
+  ],
+}
+
 /** The same pool with nothing removable on it. */
 const NO_REMOVABLE_DETAIL = {
   name: 'tank',
@@ -10501,6 +10516,27 @@ async function vdevRemoveChecks() {
   await settle()
   eq('vdev-remove: the cache partition goes out under its OWN name — never the stripped disk id',
     jobs[0] && jobs[0].body, { vdev: 'ata-SSD-part2' })
+
+  // --- (h) a mirrored log that has lost a leg is STILL one mirror-N row.
+  // The daemon removes the whole vdev; offering the surviving leg on its own
+  // would send a leaf name for a removal that takes out its parent.
+  created.windows.length = 0
+  ;({ grid } = await openPoolsViewFor([poolRow('tank')], ONE_LEG_LOG_DETAIL))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  dlg = openWindow()
+  vgrid = dlg.down('#removableVdevs')
+  eq('vdev-remove: a mirrored log with ONE surviving leg is one row, named mirror-N',
+    vgrid.getStore().getRange().map(r => ({ role: r.get('role'), vdev: r.get('vdev'), leaves: r.get('leaves') })),
+    [{ role: 'log', vdev: 'mirror-1', leaves: 'ata-LOG-1-part1' }])
+
+  jobs.length = 0
+  vgrid.selectRow(0)
+  findCmp(dlg, 'anas-btn-vdev-remove-submit').handler()
+  await settle()
+  eq('vdev-remove: and it sends the MIRROR, not the surviving leg',
+    jobs[0] && jobs[0].body, { vdev: 'mirror-1' })
 
   ok('vdev-remove: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
@@ -11185,7 +11221,9 @@ const VDEV_ROUTES = {
  * failure that loses the whole pool, could not be replaced from the UI at all.
  */
 async function vdevClassChecks() {
-  const ANAS = loadSource('35-pool-attach.js', VDEV_ROUTES)
+  // 00-core.js rides along for the ONE leaf-name helper both this dialog and
+  // the Remove vdev… dialog send the daemon (`ANAS.vdevLeafName`).
+  const ANAS = loadSources(['00-core.js', '35-pool-attach.js'], VDEV_ROUTES)
   const action = (ANAS.pools._actions || []).find(a => a.itemId === 'attachDisk')
   ok('vdev classes: the pool toolbar carries the Expand / Replace action', !!action)
 
@@ -11224,6 +11262,85 @@ async function vdevClassChecks() {
   ok('vdev classes(replace): the spare keeps the state ZFS reports for it',
     slots.includes('spares · AVAIL'))
   ok('vdev classes: nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/**
+ * The GitHub #66 layout, on the REPLACE side (vdevs.1 fix batch 2): one SSD
+ * split into a log partition, a cache partition and a data partition. Every
+ * leaf carries the same `disk.id` (the daemon strips `-partN` to name the
+ * DISK), so a slot built from the id drew three identically labelled rows and
+ * sent a device the pool does not have — `zpool replace pool
+ * /dev/disk/by-id/ata-SSD …` is refused by ZFS. The slot label and the
+ * `existingDiskId` it sends are the SAME string, taken from the same leaf in
+ * the same loop, so asserting the labels pins the payload; the end-to-end half
+ * (basename accepted, stripped id 400) is live-proven on the stunt node.
+ */
+const SPLIT_SSD_POOL_DETAIL = {
+  name: 'tank',
+  state: 'ONLINE',
+  vdevGroups: [
+    {
+      role: 'data',
+      vdevs: [{
+        name: 'mirror-0',
+        type: 'mirror',
+        state: 'ONLINE',
+        disks: [
+          { id: 'ata-SSD', path: '/dev/disk/by-id/ata-SSD-part3', state: 'ONLINE' },
+          { id: 'ata-OTHER', path: '/dev/disk/by-id/ata-OTHER-part1', state: 'ONLINE' },
+        ],
+      }],
+    },
+    {
+      role: 'log',
+      vdevs: [{ name: 'logs', type: 'disk', state: 'ONLINE', disks: [{ id: 'ata-SSD', path: '/dev/disk/by-id/ata-SSD-part1', state: 'ONLINE' }] }],
+    },
+    {
+      role: 'cache',
+      vdevs: [{ name: 'cache', type: 'disk', state: 'ONLINE', disks: [{ id: 'ata-SSD', path: '/dev/disk/by-id/ata-SSD-part2', state: 'ONLINE' }] }],
+    },
+  ],
+}
+
+async function vdevSplitReplaceChecks() {
+  const routes = {
+    'GET /pools/tank/expansion': { data: { pool: 'tank', targets: [], busy: { busy: false }, capability: {} } },
+    'GET /pools/tank': { data: SPLIT_SSD_POOL_DETAIL },
+    'GET /disks': { data: [{ id: 'ata-NEW', name: 'sdd', status: 'available', size: 2147483648, model: 'QEMU HARDDISK' }] },
+  }
+  const ANAS = loadSources(['00-core.js', '35-pool-attach.js'], routes)
+  const action = (ANAS.pools._actions || []).find(a => a.itemId === 'attachDisk')
+  const grid = makeComponent({ xtype: 'gridpanel' }, null)
+  created.windows.length = 0
+  action.handler('harness', grid, 'tank')
+  await settle()
+
+  const win = openWindow()
+  const dom = win && win.down('#pexBody') && win.down('#pexBody').dom()
+  ok('split replace: the expand/replace window opened', !!dom)
+  if (!dom) { return }
+  const replace = dom.querySelectorAll('input[name="pex-mode"]').find(m => m.value === 'replace')
+  replace.fire('change', { target: { value: 'replace' } })
+  await settle()
+  const slots = dom.nodeById('pexArea') ? dom.nodeById('pexArea').innerHTML : ''
+
+  // Four rows, four DISTINCT names: the three partitions of the split SSD and
+  // the other mirror leg. Named by `disk.id` the first three would all read
+  // `ata-SSD`.
+  const bays = (slots.match(/data-anas-zone="bay:rep\d+"/g) || []).length
+  eq('split replace: one slot per LEAF', bays, 4)
+  for (const leaf of ['ata-SSD-part1', 'ata-SSD-part2', 'ata-SSD-part3', 'ata-OTHER-part1']) {
+    ok(`split replace: ${leaf} is its own slot, by partition`,
+      slots.includes('>' + leaf + '<'), slots.slice(0, 600))
+  }
+  ok('split replace: the whole-disk id is never a slot name on its own',
+    !/>ata-SSD</.test(slots), slots.slice(0, 600))
+  // And each slot says which vdev it belongs to, so the log partition and the
+  // cache partition of one device are told apart at a glance.
+  ok('split replace: the log partition is labelled with its vdev', slots.includes('logs · ONLINE'))
+  ok('split replace: the cache partition is labelled with its vdev', slots.includes('cache · ONLINE'))
+  ok('split replace: the data partition is labelled with its mirror', slots.includes('mirror-0 · ONLINE'))
+  ok('split replace: nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 /**
@@ -11281,6 +11398,10 @@ async function composerSeedChecks() {
 warnings.length = 0
 created.windows.length = 0
 await vdevClassChecks()
+
+warnings.length = 0
+created.windows.length = 0
+await vdevSplitReplaceChecks()
 
 warnings.length = 0
 created.windows.length = 0

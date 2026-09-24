@@ -97,6 +97,46 @@ function leafToken(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1)
 }
 
+/** Replace one leaf through the attach route and wait for the job to finish. */
+async function replaceLeaf(
+  ctx: APIRequestContext,
+  existingDiskId: string,
+  newDiskId: string,
+): Promise<{ status: string, [k: string]: any }> {
+  const res = await ctx.post(`${V1}/pools/${POOL}/attach`, {
+    data: { existingDiskId, newDiskId, replace: true },
+  })
+  expect(res.status(), JSON.stringify(await res.json())).toBe(202)
+  return awaitJob(ctx, (await res.json()).job.id)
+}
+
+/** The daemon's 400 body for a refused replace. */
+async function refuseReplace(
+  ctx: APIRequestContext,
+  existingDiskId: string,
+  newDiskId: string,
+): Promise<string> {
+  const res = await ctx.post(`${V1}/pools/${POOL}/attach`, {
+    data: { existingDiskId, newDiskId, replace: true },
+  })
+  expect(res.status()).toBe(400)
+  return (await res.json()).error.message as string
+}
+
+/** Wait (bounded) for `zpool status` to settle on one section's leaves. */
+async function waitForSectionLeaves(section: string, expected: string[], timeout = 60_000): Promise<string[]> {
+  const deadline = Date.now() + timeout
+  let seen: string[] = []
+  for (;;) {
+    seen = await statusSectionLeaves(section)
+    if (seen.join(',') === expected.join(','))
+      return seen
+    if (Date.now() > deadline)
+      return seen
+    await new Promise(resolve => setTimeout(resolve, 1000))
+  }
+}
+
 /** Remove one vdev through the API and wait for the job to finish. */
 async function removeVdev(ctx: APIRequestContext, vdev: string): Promise<{ status: string, [k: string]: any }> {
   const res = await ctx.post(`${V1}/pools/${POOL}/vdevs/remove`, { data: { vdev } })
@@ -265,6 +305,56 @@ test.describe.serial('Remove a vdev on a BY-ID partition-backed pool (vdevs.2, #
       const after = await vdevGroups(ctx)
       for (const role of ['data', 'log', 'special', 'dedup'])
         expect(groupOf(after, role), `${role} is untouched`).toBeTruthy()
+    }
+    finally {
+      await ctx.dispose()
+    }
+  })
+
+  /**
+   * The REPLACE half of the same contract (vdevs.1 fix batch 2). The dialog
+   * builds its replace slots from the pool's leaves, and on this layout all six
+   * carry the same `disk.id` — so the slot that used to send it drew six
+   * identically labelled rows and `zpool replace gtvdev /dev/disk/by-id/<disk>
+   * <new>` named a device the pool does not have. It now sends the leaf's
+   * device-path basename and the daemon resolves it against `zpool status`.
+   *
+   * The replacement is the partition the two tests above freed (the old spare,
+   * bigger than the log partition it takes over).
+   */
+  test('the LOG partition is replaced by its basename — the stripped id is refused', async ({ playwright, pveTicket }) => {
+    const ctx = await authedContext(playwright, pveTicket)
+    try {
+      const disk = await fixtureDiskId(ctx)
+      const byId = (part: number) => `/dev/disk/by-id/${disk}-part${part}`
+
+      // The log leaf as ANAS reports it, and the free partition standing by.
+      expect(leafPathsOf(await vdevGroups(ctx), 'log')).toEqual([byId(2)])
+      expect(await statusSectionLeaves('logs')).toEqual([`${disk}-part2`])
+      // The freed partition still carries the label of the cache vdev it was;
+      // `zpool replace` refuses a device that looks like a pool member.
+      await sshExec(`zpool labelclear -f ${byId(4)} || true`)
+
+      // The stripped disk id names six leaves — refused, with the candidates.
+      const message = await refuseReplace(ctx, disk, `${disk}-part4`)
+      expect(message).toContain(`names more than one device in pool ${POOL}`)
+      expect(message).toContain('name the one you mean by its device')
+      expect(leafPathsOf(await vdevGroups(ctx), 'log'), 'nothing was replaced').toEqual([byId(2)])
+
+      // The basename names exactly one leaf — the SLOG comes out, the new
+      // partition takes its place, and nothing else moves.
+      const job = await replaceLeaf(ctx, `${disk}-part2`, `${disk}-part4`)
+      expect(job.status, JSON.stringify(job.error)).toBe('completed')
+
+      const logs = await waitForSectionLeaves('logs', [`${disk}-part4`])
+      expect(logs, 'zpool status shows the new leaf in logs').toEqual([`${disk}-part4`])
+      expect(leafPathsOf(await vdevGroups(ctx), 'log')).toEqual([byId(4)])
+
+      // The data leaf is where it was — a replace aimed at the disk would have
+      // taken the whole device with it.
+      expect(leafPathsOf(await vdevGroups(ctx), 'data')).toEqual([byId(1)])
+      for (const role of ['data', 'special', 'dedup'])
+        expect(groupOf(await vdevGroups(ctx), role), `${role} is untouched`).toBeTruthy()
     }
     finally {
       await ctx.dispose()

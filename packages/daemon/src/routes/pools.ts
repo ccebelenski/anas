@@ -23,7 +23,8 @@ import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal
 import { loadPveFootprint, systemPoolRefusal } from '../services/pve-footprint.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
-import { isVdevRefusal, NON_REMOVABLE_VDEV_MESSAGE, resolveVdev, stillPresentMessage, unknownVdevMessage, unreadablePoolMessage, vdevStillPresent } from '../services/zfs-vdev-remove.js'
+import { isVdevRefusal, resolveLeafDevice, unknownVdevMessage } from '../services/zfs-vdev-leaf.js'
+import { NON_REMOVABLE_VDEV_MESSAGE, resolveVdev, stillPresentMessage, unreadablePoolMessage, vdevStillPresent } from '../services/zfs-vdev-remove.js'
 import { collectDisks, resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -1751,20 +1752,49 @@ export async function poolRoutes(
     }
 
     // ---- LEAF path: mirror-attach or replace (story 3.12) ------------------
-    const existingPath = byIdPath(existingDiskId!)
+    //
+    // ONE `zpool status` read answers both questions this path asks: whether
+    // the pool is busy, and which device the existing leaf actually is.
+    const leafStatusResult = await executor.exec(ZPOOL, ['status', '-jv'])
 
     // GATE 2 (busy) applies to a mirror-attach too — never start a second
     // resilver-inducing op mid-resilver/reflow. Replace is exempt (you may be
     // replacing the very disk that is degraded).
-    if (!replace) {
-      const statusResult = await executor.exec(ZPOOL, ['status', '-jv'])
-      if (statusResult.exitCode === 0) {
-        const busy = parsePoolBusyState(statusResult.stdout, poolName)
-        if (busy.busy) {
-          reply.code(409)
-          return { error: { code: 'CONFLICT', reason: 'busy', message: busyDetail(busy, poolName) } }
-        }
+    if (!replace && leafStatusResult.exitCode === 0) {
+      const busy = parsePoolBusyState(leafStatusResult.stdout, poolName)
+      if (busy.busy) {
+        reply.code(409)
+        return { error: { code: 'CONFLICT', reason: 'busy', message: busyDetail(busy, poolName) } }
       }
+    }
+
+    // The request names the existing leaf the way the pool view shows it: a
+    // by-id disk id, a by-id partition basename (`ata-SSD-part1`), a short
+    // kernel name, or the full device path. Resolve it against the pool's own
+    // status so `zpool replace`/`attach` is handed the device ZFS itself
+    // reports (story vdevs.1 fix batch): on a split SSD — log on -part1, cache
+    // on -part2, data on -part3 — every leaf carries the SAME stripped by-id
+    // id, `/dev/disk/by-id/<disk>` is a device the pool does not have, and
+    // guessing at one of the three would replace the wrong one. A name that
+    // fits several leaves is refused with its candidates, exactly as the remove
+    // route refuses it. An unreadable status keeps the old by-id spelling —
+    // fail-open, as every read on this route is, with zpool's own error the
+    // answer.
+    const leafStatus = leafStatusResult.exitCode === 0
+      ? parseZpoolStatusPool(leafStatusResult.stdout, poolName)
+      : null
+    let existingPath = byIdPath(existingDiskId!)
+    if (leafStatus) {
+      const leaf = resolveLeafDevice(leafStatus, existingDiskId!)
+      if (!leaf) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, existingDiskId!) } }
+      }
+      if (isVdevRefusal(leaf)) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: leaf.message } }
+      }
+      existingPath = leaf.path
     }
 
     const args = replace
