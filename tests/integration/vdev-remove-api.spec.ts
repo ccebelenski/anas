@@ -1,7 +1,9 @@
 import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { expect, pveAuthState, test } from './fixtures/auth'
 import { NODE_NAME, PVE_URL } from './fixtures/pve-ui'
-import { getZpoolStatus, poolExists, sshExec } from './fixtures/stunt-node'
+import { getZpoolStatus, sshExec } from './fixtures/stunt-node'
 
 /**
  * Story vdevs.2 (GitHub #66) — LIVE PROOF of POST /v1/pools/:name/vdevs/remove
@@ -11,19 +13,16 @@ import { getZpoolStatus, poolExists, sshExec } from './fixtures/stunt-node'
  * PVEAuthCookie, gateway → local anasd → real zpool, exactly like
  * pvepool-api.spec.ts.
  *
- * DEPENDS ON TWO THINGS THAT ARE NOT IN THIS FILE:
- *
- *  1. The fixture `test/stunt-node/vdev-fixture.sh up`, which builds a
- *     THROWAWAY pool `gtvdev` across six partitions of one spare disk, added on
- *     the command line as KERNEL NAMES: <d>1 data, <d>2 log, <d>3 cache,
- *     <d>4 spare, <d>5 special, <d>6 dedup. `… down` destroys it. The whole
- *     file skips when the pool is absent. Nothing here touches any other pool.
- *
- *  2. Story vdevs.1 — the zpool-status parser fix that surfaces the pool-level
- *     `logs`, `special` and `dedup` sections. Until that lands, GET
- *     /v1/pools/gtvdev reports neither the log nor the special/dedup vdevs, so
- *     the log cases here cannot resolve and the special/dedup refusals would
- *     come back as "carries no vdev". RUN THIS FILE ONLY AFTER vdevs.1 IS IN.
+ * The file OWNS its fixture, the same way vdev-classes-api.spec.ts does:
+ * `test/stunt-node/vdev-fixture.sh` builds a THROWAWAY pool `gtvdev` across six
+ * partitions of one spare disk, added on the command line as KERNEL NAMES:
+ * <d>1 data, <d>2 log, <d>3 cache, <d>4 spare, <d>5 special, <d>6 dedup.
+ * beforeAll runs `down` and then `up`, afterAll runs `down` again (best-effort
+ * — a failed teardown must not mask the run's results). The leading `down`
+ * earns its keep because these tests CONSUME the fixture: they take the cache,
+ * the spare and the log out, so a pool left over from an earlier run no longer
+ * carries all six classes and the first test fails. Nothing here touches any
+ * other pool.
  *
  * The tests run SERIALLY and mutate the fixture pool in order: cache out,
  * spare out, log out, mirrored log added by CLI and taken out again. The
@@ -31,9 +30,14 @@ import { getZpoolStatus, poolExists, sshExec } from './fixtures/stunt-node'
  * there.
  */
 
+const execFileAsync = promisify(execFile)
+
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
 
 const POOL = 'gtvdev'
+
+/** Absolute path of the fixture script, relative to this spec file. */
+const FIXTURE_SH = new URL('../../test/stunt-node/vdev-fixture.sh', import.meta.url).pathname
 
 /** The sentence the daemon refuses data/special/dedup removal with. */
 const EVACUATION_SENTENCE
@@ -120,12 +124,21 @@ async function statusHasSection(section: string): Promise<boolean> {
   return text.split('\n').some(line => line.trim().split(/\s+/)[0] === section)
 }
 
-test.beforeEach(async () => {
-  test.skip(!(await poolExists(POOL)), `vdev fixture not present — run test/stunt-node/vdev-fixture.sh up`)
-})
-
 test.describe.serial('Remove a cache, log or spare vdev (story vdevs.2)', () => {
-  test.setTimeout(120_000)
+  // One fixture lifetime for the whole file, rebuilt from scratch: down then up
+  // in beforeAll (~30s of attach + partition + create on top of the teardown),
+  // down in afterAll (best-effort — a failed teardown must not mask the run's
+  // results; the node state is verified separately after the run).
+  test.setTimeout(240_000)
+
+  test.beforeAll(async () => {
+    await execFileAsync(FIXTURE_SH, ['down'], { timeout: 240_000 })
+    await execFileAsync(FIXTURE_SH, ['up'], { timeout: 240_000 })
+  })
+
+  test.afterAll(async () => {
+    await execFileAsync(FIXTURE_SH, ['down'], { timeout: 240_000 }).catch(() => {})
+  })
 
   test('the fixture pool starts with all six vdev classes', async ({ playwright, pveTicket }) => {
     const ctx = await authedContext(playwright, pveTicket)
