@@ -280,6 +280,93 @@ describe('parseZpoolStatus', () => {
     assert.equal(cacheGroup.vdevs[0].disks[0].state, 'ONLINE')
   })
 
+  // THE SHAPE of a section holding more than one bare leaf. Every consumer
+  // keys a vdev by `v.name` (the pool-detail bays, the attach/replace map, the
+  // remove dialog), so N leaves must not become N vdevs all called `cache` —
+  // they fold into ONE container vdev named after the section, the shape 0.3.4
+  // produced. Ground truth: the stunt-node fixture's `up-multi` shape (ZFS
+  // 2.4.4 / PVE 9.2.20, 2026-09-24) — one data leaf, two cache leaves, two
+  // spares, all of them by-id PARTITIONS of one disk.
+  it('folds a section\'s bare leaves into ONE container vdev named after the section', () => {
+    const result = parseZpoolStatus(loadFixture('zpool-status-multi-cache-spare-2.4.4.json'))
+    const pool = result[0]
+    assert.equal(pool.name, 'gtvdev')
+    assert.deepEqual(pool.vdevGroups.map(g => g.role), ['data', 'log', 'cache', 'spare'])
+
+    const cache = pool.vdevGroups.find(g => g.role === 'cache')!
+    assert.equal(cache.vdevs.length, 1)
+    assert.equal(cache.vdevs[0].name, 'cache')
+    assert.deepEqual(
+      cache.vdevs[0].disks.map(d => d.path),
+      [
+        '/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part3',
+        '/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part6',
+      ],
+    )
+
+    const spare = pool.vdevGroups.find(g => g.role === 'spare')!
+    assert.equal(spare.vdevs.length, 1)
+    assert.equal(spare.vdevs[0].name, 'spares')
+    assert.equal(spare.vdevs[0].disks.length, 2)
+    // A container reports the worst state of its leaves; both spares are AVAIL.
+    assert.equal(spare.vdevs[0].state, 'AVAIL')
+
+    // The single log leaf takes the same container shape — one entry, one
+    // container, so the single- and multi-leaf cases never diverge.
+    const log = pool.vdevGroups.find(g => g.role === 'log')!
+    assert.equal(log.vdevs.length, 1)
+    assert.equal(log.vdevs[0].name, 'logs')
+    assert.equal(log.vdevs[0].disks.length, 1)
+
+    // Every leaf is a PARTITION of the same disk, so the whole-disk identity
+    // the parser derives is the same string for all of them — the layout that
+    // makes `disk.id` an ambiguous way to name a leaf (GitHub #66).
+    const ids = new Set(pool.vdevGroups.flatMap(g => g.vdevs.flatMap(v => v.disks.map(d => d.id))))
+    assert.deepEqual([...ids], ['scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9'])
+  })
+
+  // Regression (0.3.4 → the uniform section parser): a pool built on FILES
+  // reports `vdev_type: "file"` for its leaves. Reading only `vdev_type ===
+  // 'disk'` gave such a cache or spare a vdev with NO disks — invisible in the
+  // pool view and unnameable in the remove dialog, though 0.3.4 listed it.
+  it('lists a FILE-backed cache and spare — a bare entry is a leaf whatever its type', () => {
+    const status = {
+      pools: {
+        filepool: {
+          name: 'filepool',
+          pool_guid: '1',
+          state: 'ONLINE',
+          error_count: '0',
+          vdevs: {
+            filepool: {
+              name: 'filepool',
+              vdev_type: 'root',
+              state: 'ONLINE',
+              vdevs: {
+                '/srv/zfs/data0': { name: '/srv/zfs/data0', vdev_type: 'file', path: '/srv/zfs/data0', state: 'ONLINE' },
+              },
+            },
+          },
+          l2cache: {
+            '/srv/zfs/cache0': { name: '/srv/zfs/cache0', vdev_type: 'file', path: '/srv/zfs/cache0', class: 'l2cache', state: 'ONLINE' },
+          },
+          spares: {
+            '/srv/zfs/spare0': { name: '/srv/zfs/spare0', vdev_type: 'file', path: '/srv/zfs/spare0', state: 'AVAIL' },
+          },
+        },
+      },
+    }
+    const [pool] = parseZpoolStatus(status as never)
+
+    const cache = pool.vdevGroups.find(g => g.role === 'cache')!
+    assert.equal(cache.vdevs.length, 1)
+    assert.deepEqual(cache.vdevs[0].disks.map(d => d.path), ['/srv/zfs/cache0'])
+
+    const spare = pool.vdevGroups.find(g => g.role === 'spare')!
+    assert.deepEqual(spare.vdevs[0].disks.map(d => d.path), ['/srv/zfs/spare0'])
+    assert.equal(spare.vdevs[0].disks[0].state, 'AVAIL')
+  })
+
   // Regression: on a real system `zpool status -jv` reports the leaf `name` as
   // the KERNEL device ("sdb"), which is unstable and must never be the disk's
   // identity. The stable by-id comes from `devid`. If parseDisk used `name`,

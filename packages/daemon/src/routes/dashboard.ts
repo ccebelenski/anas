@@ -25,6 +25,7 @@ import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import type { IscsiPaths } from '../services/iscsi.js'
 import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
+import { basename } from 'node:path'
 import { computeArcTelemetry, parseArcstats } from '../parsers/arcstats.js'
 import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { parseExports } from '../parsers/exports.js'
@@ -53,6 +54,12 @@ const SYSTEMCTL = '/usr/bin/systemctl'
 
 /** Pool states that are outright critical (data at risk / unavailable). */
 const CRITICAL_POOL_STATES = new Set(['FAULTED', 'UNAVAIL', 'REMOVED', 'SUSPENDED'])
+
+/**
+ * Vdev types whose members iostat prints NESTED under them — their leaves are
+ * never vdev rows, so the topology join must not index them by leaf name.
+ */
+const GROUPING_VDEV_TYPES = new Set<VdevType>(['mirror', 'raidz', 'raidz2', 'raidz3', 'draid', 'draid2', 'draid3', 'replacing'])
 
 /**
  * Dashboard endpoints (Epic 2).
@@ -507,14 +514,31 @@ export async function dashboardRoutes(
           for (const vdev of group.vdevs) {
             const join: VdevJoin = { type: vdev.type, role: group.role, state: vdev.state }
             vmap.set(vdev.name, join)
-            // A single-leaf pool-level vdev is named after its SECTION by the
-            // status parser (`logs`, `cache`, `special`, `dedup`, `spares`)
-            // while iostat prints the leaf itself at the vdev indent. Index the
-            // leaf too, so a special/log/dedup vdev joins with its own role
-            // instead of falling back to `data` (vdevs.1 consumer audit). A key
-            // an actual vdev already owns is never overwritten.
-            if (vdev.disks.length === 1 && !vmap.has(vdev.disks[0].id))
-              vmap.set(vdev.disks[0].id, join)
+            // A pool-level section's bare leaves are one CONTAINER vdev named
+            // after the section (`logs`, `cache`, `special`, `dedup`,
+            // `spares`) in the status parser, while iostat prints each leaf at
+            // the vdev indent. Index every leaf of such a vdev, so a
+            // special/log/dedup/cache device joins with its own role instead of
+            // falling back to `data` (vdevs.1 consumer audit) — a section
+            // holding two cache devices included.
+            //
+            // Under BOTH spellings: `disk.id` is the whole-disk by-id (the
+            // `-partN` suffix stripped), while iostat prints the leaf exactly
+            // as `zpool status` names it — `ata-SSD-part2` on a by-id
+            // partition-backed vdev, `sdb5` on a kernel-name one. Indexing the
+            // id alone missed every by-id partition leaf.
+            //
+            // A GROUPING vdev is left out: iostat nests a mirror's or raidz's
+            // members UNDER it, so its leaves are not vdev rows. A key an
+            // actual vdev already owns is never overwritten.
+            if (!GROUPING_VDEV_TYPES.has(vdev.type)) {
+              for (const disk of vdev.disks) {
+                for (const key of [disk.id, basename(disk.path)]) {
+                  if (!vmap.has(key))
+                    vmap.set(key, join)
+                }
+              }
+            }
           }
         }
         map.set(pool.name, vmap)

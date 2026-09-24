@@ -9098,10 +9098,10 @@ function clickTbar(grid, cls) {
 }
 
 /** A leaf as the pool detail carries one (the parser's PoolDisk shape). */
-function vdevLeaf(id, state) {
+function vdevLeaf(id, state, part) {
   return {
     id,
-    path: `/dev/disk/by-id/${id}-part1`,
+    path: `/dev/disk/by-id/${id}-part${part || 1}`,
     state: state || 'ONLINE',
     readErrors: 0,
     writeErrors: 0,
@@ -9125,6 +9125,22 @@ const SIX_CLASS_DETAIL = {
     { role: 'spare', vdevs: [vdevOf('spares', 'spare', [vdevLeaf('ata-SPARE-1', 'AVAIL')], 'AVAIL')] },
     { role: 'special', vdevs: [vdevOf('mirror-2', 'mirror', [vdevLeaf('ata-SPEC-1'), vdevLeaf('ata-SPEC-2')])] },
     { role: 'dedup', vdevs: [vdevOf('mirror-3', 'mirror', [vdevLeaf('ata-DEDUP-1'), vdevLeaf('ata-DEDUP-2')])] },
+  ],
+}
+
+/**
+ * The GitHub #66 layout: ONE SSD split into a log partition and a cache
+ * partition, plus a section holding TWO cache leaves. Both split leaves carry
+ * the SAME `id` (the parser strips `-partN` to get the disk's identity), so a
+ * row that sent `disk.id` would name the log and the cache alike.
+ */
+const SPLIT_SSD_DETAIL = {
+  name: 'tank',
+  state: 'ONLINE',
+  vdevGroups: [
+    { role: 'data', vdevs: [vdevOf('mirror-0', 'mirror', [vdevLeaf('ata-DATA-1'), vdevLeaf('ata-DATA-2')])] },
+    { role: 'log', vdevs: [vdevOf('logs', 'disk', [vdevLeaf('ata-SSD', 'ONLINE', 1)])] },
+    { role: 'cache', vdevs: [vdevOf('cache', 'disk', [vdevLeaf('ata-SSD', 'ONLINE', 2), vdevLeaf('ata-SSD', 'ONLINE', 3)])] },
   ],
 }
 
@@ -9182,8 +9198,8 @@ async function vdevRemoveChecks() {
   const rows = vgrid.getStore().getRange().map(r => ({ role: r.get('role'), vdev: r.get('vdev') }))
   eq('vdev-remove: only cache, log and spare are listed — the mirrored log as mirror-N', rows, [
     { role: 'log', vdev: 'mirror-1' },
-    { role: 'cache', vdev: 'ata-CACHE-1' },
-    { role: 'spare', vdev: 'ata-SPARE-1' },
+    { role: 'cache', vdev: 'ata-CACHE-1-part1' },
+    { role: 'spare', vdev: 'ata-SPARE-1-part1' },
   ])
   ok('vdev-remove: the refusal sentence is on the dialog',
     /Data, special and dedup vdevs cannot be removed here\./.test(dlg.down('#vdevRemoveNote').html || ''),
@@ -9212,7 +9228,7 @@ async function vdevRemoveChecks() {
   vgrid.selectRow(1)
   findCmp(dlg, 'anas-btn-vdev-remove-submit').handler()
   await settle()
-  eq('vdev-remove: a cache leaf goes out by its leaf name', jobs[0] && jobs[0].body, { vdev: 'ata-CACHE-1' })
+  eq('vdev-remove: a cache leaf goes out by its leaf name', jobs[0] && jobs[0].body, { vdev: 'ata-CACHE-1-part1' })
   const beforeFail = poolsGets()
   jobs[0].onFailed({ error: { message: 'data, special and dedup vdevs cannot be removed here' } })
   await settle()
@@ -9246,6 +9262,31 @@ async function vdevRemoveChecks() {
   eq('vdev-remove: a pool with no cache/log/spare lists nothing', vgrid.getStore().getCount(), 0)
   ok('vdev-remove: and the empty state says why',
     /no cache, log or spare vdev to remove/.test(vgrid.emptyText || ''), vgrid.emptyText)
+
+  // --- (g) a SPLIT device: the payload must name ONE leaf, not the disk.
+  // One SSD's log partition and cache partitions share a `disk.id`, so a row
+  // sending the id would leave the daemon unable to tell which leaf was
+  // picked. The row sends the device-path basename, which names exactly one.
+  created.windows.length = 0
+  ;({ grid } = await openPoolsViewFor([poolRow('tank')], SPLIT_SSD_DETAIL))
+  grid.selectRow(0)
+  clickTbar(grid, 'anas-btn-vdev-remove')
+  await settle()
+  dlg = openWindow()
+  vgrid = dlg.down('#removableVdevs')
+  eq('vdev-remove: a split SSD lists one row per LEAF, by partition',
+    vgrid.getStore().getRange().map(r => ({ role: r.get('role'), vdev: r.get('vdev') })), [
+      { role: 'log', vdev: 'ata-SSD-part1' },
+      { role: 'cache', vdev: 'ata-SSD-part2' },
+      { role: 'cache', vdev: 'ata-SSD-part3' },
+    ])
+
+  jobs.length = 0
+  vgrid.selectRow(1)
+  findCmp(dlg, 'anas-btn-vdev-remove-submit').handler()
+  await settle()
+  eq('vdev-remove: the cache partition goes out under its OWN name — never the stripped disk id',
+    jobs[0] && jobs[0].body, { vdev: 'ata-SSD-part2' })
 
   ok('vdev-remove: nothing warned', warnings.length === 0, warnings.join(' | '))
 }

@@ -189,22 +189,84 @@ function parsePool(pool: ZfsPoolStatusRaw): ParsedPoolStatus {
 
 /**
  * Parse one pool-level vdev section (logs / l2cache / spares / special /
- * dedup) into its role group. Each entry in the section is a vdev:
- *   - a `mirror-N` (or raidz) entry with its `vdevs` children → one Vdev of
- *     that type with the children as disks,
- *   - a bare leaf → the single-disk Vdev shape (the one the old l2cache
- *     branch produced for a single cache disk), named after the section.
- * The vdev carries the entry's OWN state — a spare reads AVAIL, a mirror its
- * own state; we report what ZFS says. Leaves go through parseDisk/diskId, so
- * a by-id `-partN` name resolves to its disk and a bare kernel name is
- * listed as-is.
+ * dedup) into its role group. THE SHAPE, decided once and relied on by every
+ * consumer (`v.name` is a key in the pool-detail bays, the attach/replace map
+ * and the remove dialog):
+ *
+ *   - a `mirror-N` (or raidz) entry with its `vdevs` children is its OWN Vdev
+ *     of that type, named as ZFS names it, with the children as disks;
+ *   - ALL the section's BARE entries fold into ONE container Vdev named after
+ *     the section (`cache`, `spares`, `logs`, `special`, `dedup`) carrying
+ *     them as its disks — the shape 0.3.4 produced for l2cache and spares.
+ *     Two cache devices are one `cache` row with two disks, not two rows
+ *     fighting over the same name.
+ *
+ * A container reports the WORST state of its leaves, the sum of their error
+ * counters and the sum of the sizes ZFS gave them — for a single bare leaf
+ * that is exactly the leaf's own. A `mirror-N` reports its own state. Bare
+ * entries become leaves whatever their `vdev_type`: a file-backed cache or
+ * spare (`vdev_type: "file"`, which every consumer sees as a plain disk) must
+ * be listed and removable like any other.
+ *
+ * Leaves go through parseDisk/diskId, so a by-id `-partN` name resolves to
+ * its disk and a bare kernel name is listed as-is.
  */
 function parsePoolVdevSection(section: Record<string, ZfsVdevRaw>, role: VdevRole, vdevName: string): VdevGroup {
-  const vdevs = Object.values(section).map((entry) => {
-    const vdev = parseVdev(entry)
-    return entry.vdevs && Object.keys(entry.vdevs).length > 0 ? vdev : { ...vdev, name: vdevName }
-  })
+  const vdevs: Vdev[] = []
+  const bare: ZfsVdevRaw[] = []
+
+  for (const entry of Object.values(section)) {
+    if (entry.vdevs && Object.keys(entry.vdevs).length > 0)
+      vdevs.push(parseVdev(entry))
+    else
+      bare.push(entry)
+  }
+
+  if (bare.length > 0)
+    vdevs.unshift(bareLeafContainer(bare, role, vdevName))
+
   return { role, vdevs }
+}
+
+/** VdevState severity, worst last — how a container picks its own state. */
+const VDEV_STATE_SEVERITY: readonly string[] = [
+  'ONLINE',
+  'AVAIL',
+  'INUSE',
+  'OFFLINE',
+  'REMOVED',
+  'DEGRADED',
+  'FAULTED',
+  'UNAVAIL',
+]
+
+/** The one container Vdev a section's bare leaves fold into. */
+function bareLeafContainer(entries: ZfsVdevRaw[], role: VdevRole, vdevName: string): Vdev {
+  const disks = entries.map(parseDisk)
+  const worst = disks.reduce<VdevState>((acc, disk) => {
+    const rank = (s: string) => {
+      const at = VDEV_STATE_SEVERITY.indexOf(s)
+      return at === -1 ? VDEV_STATE_SEVERITY.length : at
+    }
+    return rank(disk.state) > rank(acc) ? disk.state : acc
+  }, disks[0].state)
+
+  const allocated = entries.reduce((sum, e) => sum + parseHumanSize(e.alloc_space ?? ''), 0)
+  const size = entries.reduce((sum, e) => sum + parseHumanSize(e.total_space ?? ''), 0)
+
+  return {
+    name: vdevName,
+    // The spares container says what it is; every other section's bare leaves
+    // are plain devices. Neither type GROUPS its leaves the way a mirror does.
+    type: role === 'spare' ? 'spare' : 'disk',
+    state: worst,
+    ...(entries.some(e => e.alloc_space) && { allocated }),
+    ...(entries.some(e => e.total_space) && { size }),
+    readErrors: disks.reduce((sum, d) => sum + d.readErrors, 0),
+    writeErrors: disks.reduce((sum, d) => sum + d.writeErrors, 0),
+    checksumErrors: disks.reduce((sum, d) => sum + d.checksumErrors, 0),
+    disks,
+  }
 }
 
 /**

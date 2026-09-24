@@ -1,30 +1,38 @@
-import type { Job, JobAccepted, VdevGroup } from '@anas/shared'
+import type { Job, JobAccepted, VdevGroup, VdevState, VdevType } from '@anas/shared'
 import type { MockExecutor } from '../../executor/mock.js'
 import type { ExecResult } from '../../executor/types.js'
 import type { ParsedPoolStatus } from '../../parsers/zpool-status.js'
+import type { ResolvedVdev } from '../../services/zfs-vdev-remove.js'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { fileURLToPath } from 'node:url'
 import { isRemovableVdevRole } from '@anas/shared'
 import { mockFixtures } from '../../fixtures/loader.js'
 import { createServer } from '../../server.js'
 import {
+  ambiguousVdevMessage,
+  isVdevRefusal,
   NON_REMOVABLE_VDEV_MESSAGE,
   resolveVdev,
+  spareInUseMessage,
   unknownVdevMessage,
 } from '../../services/zfs-vdev-remove.js'
 
 /**
  * Story vdevs.2 — POST /v1/pools/:name/vdevs/remove.
  *
- * Two halves. Cache and spare go the whole way through the route, the parser
- * and the mock executor, against the shipped `zpool status -j` fixture. The
- * log, special and dedup roles are covered against a `ParsedPoolStatus` built
- * by hand — the parser's own output type — through the SAME `resolveVdev` +
- * `isRemovableVdevRole` pair the route asks.
+ * Route cases go the whole way through the route, the parser and the mock
+ * executor — over the shipped `zpool-status-online.json` for the plain shapes
+ * and over the stunt-node capture `zpool-status-multi-cache-spare-2.4.4.json`
+ * for the by-id partition-backed one. Resolution cases the captures do not
+ * carry (a split SSD's log and cache, a spare ZFS has put to work) ask the
+ * SAME `resolveVdev` + `isRemovableVdevRole` pair the route asks, over a
+ * `ParsedPoolStatus` built by hand — the parser's own output type.
  */
 
 const ZPOOL = '/usr/sbin/zpool'
@@ -107,11 +115,24 @@ async function waitForJob(server: ReturnType<typeof createServer>, id: string): 
  * Everything else is unmatched and fail-opens, as every read on this route does.
  */
 function serverWith(statuses: StatusDoc[], remove?: ExecResult): ReturnType<typeof createServer> {
+  return serverForPool(mockFixtures.zpoolList(), statuses.map(asResult), remove)
+}
+
+/**
+ * The same server for an arbitrary pool name and a scripted sequence of RAW
+ * `zpool status -jv` results — so a captured fixture (or a deliberately failing
+ * read) can be handed to the route as ZFS itself would.
+ */
+function serverForPool(
+  list: ExecResult,
+  statuses: ExecResult[],
+  remove?: ExecResult,
+): ReturnType<typeof createServer> {
   const server = createServer({ mock: true, logger: false })
   const mock = (server as unknown as { executor: MockExecutor }).executor
   mock.clearFixtures()
-  mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: mockFixtures.zpoolList() })
-  mock.addFixture({ command: ZPOOL, args: ['status', '-jv'], results: statuses.map(asResult) })
+  mock.addFixture({ command: ZPOOL, args: ['list', '-j'], result: list })
+  mock.addFixture({ command: ZPOOL, args: ['status', '-jv'], results: statuses })
   mock.addFixture({ command: ZPOOL, args: undefined, result: remove ?? { stdout: '', stderr: '', exitCode: 0 } })
   return server
 }
@@ -389,44 +410,31 @@ describe('remove-vdev: a PVE-managed pool is refused', () => {
   })
 })
 
-// --- log / special / dedup: the roles the parser does not surface yet -------
+// --- the six vdev classes, over a status built by hand --------------------
 //
-// Built as `ParsedPoolStatus` by hand (the parser's own output type) because
-// story vdevs.1 — the fix that reads the pool-level `logs`/`special`/`dedup`
-// sections — lands in parallel. The verdict under test is the route's: resolve
-// the name, then ask `isRemovableVdevRole` about the role that came back.
+// `ParsedPoolStatus` is the parser's own output type, so these pin the
+// RESOLUTION — which leaf a name fits and what `zpool remove` is handed —
+// without a whole HTTP round trip. The container shape (a section's bare
+// leaves under one vdev named after the section) is what the parser produces;
+// the fixture-backed cases below prove that end to end.
 
-function leaf(name: string, path: string) {
-  return { id: name, path: path as `/dev/${string}`, state: 'ONLINE' as const, readErrors: 0, writeErrors: 0, checksumErrors: 0, slowIos: 0 }
+function leaf(name: string, path: string, state: VdevState = 'ONLINE') {
+  return { id: name, path: path as `/dev/${string}`, state, readErrors: 0, writeErrors: 0, checksumErrors: 0, slowIos: 0 }
+}
+
+function container(name: string, type: VdevType, disks: ReturnType<typeof leaf>[], state: VdevState = 'ONLINE') {
+  return { name, type, state, readErrors: 0, writeErrors: 0, checksumErrors: 0, disks }
 }
 
 /** The six-class throwaway pool of `zpool-status-all-vdev-classes-2.4.4.json`. */
 function sixClassStatus(): ParsedPoolStatus {
   const groups: VdevGroup[] = [
-    {
-      role: 'data',
-      vdevs: [{ name: 'sdb1', type: 'disk', state: 'ONLINE', readErrors: 0, writeErrors: 0, checksumErrors: 0, disks: [leaf('sdb1', '/dev/sdb1')] }],
-    },
-    {
-      role: 'log',
-      vdevs: [{ name: 'sdb2', type: 'disk', state: 'ONLINE', readErrors: 0, writeErrors: 0, checksumErrors: 0, disks: [leaf('sdb2', '/dev/sdb2')] }],
-    },
-    {
-      role: 'cache',
-      vdevs: [{ name: 'sdb3', type: 'disk', state: 'ONLINE', readErrors: 0, writeErrors: 0, checksumErrors: 0, disks: [leaf('sdb3', '/dev/sdb3')] }],
-    },
-    {
-      role: 'spare',
-      vdevs: [{ name: 'sdb4', type: 'spare', state: 'AVAIL', readErrors: 0, writeErrors: 0, checksumErrors: 0, disks: [leaf('sdb4', '/dev/sdb4')] }],
-    },
-    {
-      role: 'special',
-      vdevs: [{ name: 'sdb5', type: 'disk', state: 'ONLINE', readErrors: 0, writeErrors: 0, checksumErrors: 0, disks: [leaf('sdb5', '/dev/sdb5')] }],
-    },
-    {
-      role: 'dedup',
-      vdevs: [{ name: 'sdb6', type: 'disk', state: 'ONLINE', readErrors: 0, writeErrors: 0, checksumErrors: 0, disks: [leaf('sdb6', '/dev/sdb6')] }],
-    },
+    { role: 'data', vdevs: [container('sdb1', 'disk', [leaf('sdb1', '/dev/sdb1')])] },
+    { role: 'log', vdevs: [container('logs', 'disk', [leaf('sdb2', '/dev/sdb2')])] },
+    { role: 'cache', vdevs: [container('cache', 'disk', [leaf('sdb3', '/dev/sdb3')])] },
+    { role: 'spare', vdevs: [container('spares', 'spare', [leaf('sdb4', '/dev/sdb4', 'AVAIL')], 'AVAIL')] },
+    { role: 'special', vdevs: [container('special', 'disk', [leaf('sdb5', '/dev/sdb5')])] },
+    { role: 'dedup', vdevs: [container('dedup', 'disk', [leaf('sdb6', '/dev/sdb6')])] },
   ]
   return { name: 'gtvdev', state: 'ONLINE', guid: '1', errorCount: 0, vdevGroups: groups, scan: null }
 }
@@ -435,67 +443,303 @@ function sixClassStatus(): ParsedPoolStatus {
 function mirroredLogStatus(): ParsedPoolStatus {
   const status = sixClassStatus()
   status.vdevGroups = status.vdevGroups.map(g => g.role === 'log'
-    ? {
-        role: 'log' as const,
-        vdevs: [{
-          name: 'mirror-1',
-          type: 'mirror' as const,
-          state: 'ONLINE' as const,
-          readErrors: 0,
-          writeErrors: 0,
-          checksumErrors: 0,
-          disks: [leaf('sdb2', '/dev/sdb2'), leaf('sdb3', '/dev/sdb3')],
-        }],
-      }
+    ? { role: 'log' as const, vdevs: [container('mirror-1', 'mirror', [leaf('sdb2', '/dev/sdb2'), leaf('sdb3', '/dev/sdb3')])] }
     : g)
   return status
 }
 
 describe('remove-vdev: the six vdev classes, resolved as the route resolves them', () => {
+  /** The resolution, asserting it is not one of the refusal answers. */
+  function hitOf(status: ParsedPoolStatus, name: string): ResolvedVdev {
+    const lookup = resolveVdev(status, name)
+    assert.ok(lookup && !isVdevRefusal(lookup), `expected a vdev for '${name}', got ${JSON.stringify(lookup)}`)
+    return lookup
+  }
+
   it('allows a single log leaf and hands zpool the leaf', () => {
-    const hit = resolveVdev(sixClassStatus(), 'sdb2')
-    assert.deepEqual(hit, { role: 'log', vdev: 'sdb2', token: '/dev/sdb2' })
-    assert.equal(isRemovableVdevRole(hit!.role), true)
+    const hit = hitOf(sixClassStatus(), 'sdb2')
+    assert.deepEqual(hit, { role: 'log', vdev: 'logs', token: '/dev/sdb2' })
+    assert.equal(isRemovableVdevRole(hit.role), true)
   })
 
   it('allows a mirrored log by its mirror-N name', () => {
-    const hit = resolveVdev(mirroredLogStatus(), 'mirror-1')
+    const hit = hitOf(mirroredLogStatus(), 'mirror-1')
     assert.deepEqual(hit, { role: 'log', vdev: 'mirror-1', token: 'mirror-1' })
-    assert.equal(isRemovableVdevRole(hit!.role), true)
+    assert.equal(isRemovableVdevRole(hit.role), true)
   })
 
   it('names the mirror, not the leg, when a leaf of a mirrored log is given', () => {
-    const hit = resolveVdev(mirroredLogStatus(), 'sdb2')
-    assert.deepEqual(hit, { role: 'log', vdev: 'mirror-1', token: 'mirror-1' })
+    assert.deepEqual(hitOf(mirroredLogStatus(), 'sdb2'), { role: 'log', vdev: 'mirror-1', token: 'mirror-1' })
   })
 
   it('allows a cache leaf and a spare leaf', () => {
     const status = sixClassStatus()
-    assert.deepEqual(resolveVdev(status, 'sdb3'), { role: 'cache', vdev: 'sdb3', token: '/dev/sdb3' })
-    assert.deepEqual(resolveVdev(status, 'sdb4'), { role: 'spare', vdev: 'sdb4', token: '/dev/sdb4' })
+    assert.deepEqual(hitOf(status, 'sdb3'), { role: 'cache', vdev: 'cache', token: '/dev/sdb3' })
+    assert.deepEqual(hitOf(status, 'sdb4'), { role: 'spare', vdev: 'spares', token: '/dev/sdb4' })
     assert.equal(isRemovableVdevRole('cache'), true)
     assert.equal(isRemovableVdevRole('spare'), true)
   })
 
   it('refuses the special vdev', () => {
-    const hit = resolveVdev(sixClassStatus(), 'sdb5')
-    assert.equal(hit?.role, 'special')
-    assert.equal(isRemovableVdevRole(hit!.role), false)
+    assert.equal(isRemovableVdevRole(hitOf(sixClassStatus(), 'sdb5').role), false)
   })
 
   it('refuses the dedup vdev', () => {
-    const hit = resolveVdev(sixClassStatus(), 'sdb6')
-    assert.equal(hit?.role, 'dedup')
-    assert.equal(isRemovableVdevRole(hit!.role), false)
+    assert.equal(isRemovableVdevRole(hitOf(sixClassStatus(), 'sdb6').role), false)
   })
 
   it('refuses the data leaf', () => {
-    const hit = resolveVdev(sixClassStatus(), 'sdb1')
-    assert.equal(hit?.role, 'data')
-    assert.equal(isRemovableVdevRole(hit!.role), false)
+    assert.equal(isRemovableVdevRole(hitOf(sixClassStatus(), 'sdb1').role), false)
   })
 
   it('answers null for a vdev the pool does not carry', () => {
     assert.equal(resolveVdev(sixClassStatus(), 'sdb9'), null)
+  })
+
+  it('answers null for a synthetic container name — the leaf is the unit', () => {
+    const status = sixClassStatus()
+    for (const name of ['logs', 'cache', 'spares', 'special', 'dedup'])
+      assert.equal(resolveVdev(status, name), null, name)
+  })
+})
+
+// --- a by-id PARTITION-backed split device (the #66 layout) ----------------
+//
+// One SSD carrying the log on -part1 and the cache on -part2: the parser
+// strips `-partN` to get the DISK's identity, so both leaves carry the same
+// `disk.id`. Taking the first match would remove the SLOG of an operator who
+// picked the L2ARC, and report success for role `log`.
+
+const SSD = 'ata-SSD_SERIAL0001'
+const SSD_PART = (n: number) => `/dev/disk/by-id/${SSD}-part${n}` as const
+
+/** log on -part1, cache on -part2, data on -part3 — one disk, three leaves. */
+function splitSsdStatus(): ParsedPoolStatus {
+  const groups: VdevGroup[] = [
+    { role: 'data', vdevs: [container('mirror-0', 'mirror', [leaf(SSD, SSD_PART(3)), leaf('ata-OTHER', '/dev/disk/by-id/ata-OTHER-part1')])] },
+    { role: 'log', vdevs: [container('logs', 'disk', [leaf(SSD, SSD_PART(1))])] },
+    { role: 'cache', vdevs: [container('cache', 'disk', [leaf(SSD, SSD_PART(2))])] },
+  ]
+  return { name: 'tank', state: 'ONLINE', guid: '1', errorCount: 0, vdevGroups: groups, scan: null }
+}
+
+describe('remove-vdev: a token that names two leaves of one disk is refused', () => {
+  it('the cache partition names the CACHE leaf only', () => {
+    assert.deepEqual(
+      resolveVdev(splitSsdStatus(), `${SSD}-part2`),
+      { role: 'cache', vdev: 'cache', token: SSD_PART(2) },
+    )
+  })
+
+  it('the log partition names the LOG leaf only', () => {
+    assert.deepEqual(
+      resolveVdev(splitSsdStatus(), `${SSD}-part1`),
+      { role: 'log', vdev: 'logs', token: SSD_PART(1) },
+    )
+  })
+
+  it('the full device path names exactly one leaf too', () => {
+    assert.deepEqual(
+      resolveVdev(splitSsdStatus(), SSD_PART(2)),
+      { role: 'cache', vdev: 'cache', token: SSD_PART(2) },
+    )
+  })
+
+  it('the STRIPPED disk id is refused, naming every candidate', () => {
+    const lookup = resolveVdev(splitSsdStatus(), SSD)
+    assert.ok(lookup && isVdevRefusal(lookup))
+    assert.equal(
+      lookup.message,
+      ambiguousVdevMessage('tank', SSD, ['data mirror-0', `log ${SSD}-part1`, `cache ${SSD}-part2`]),
+    )
+  })
+})
+
+// --- a spare ZFS has put to work -------------------------------------------
+//
+// An active spare is listed TWICE: under the data vdev it is patching (inside
+// `spare-N`, which the parser flattens into the mirror's disks) and in the
+// spares section as INUSE. Matched in the data walk it came back as a DATA
+// leaf, refused with the evacuation sentence — the wrong reason entirely, and
+// one step away from handing `zpool remove` the whole data mirror.
+
+const SPARE_IN_USE = 'ata-SPARE_0001'
+
+function inUseSpareStatus(): ParsedPoolStatus {
+  const spareLeaf = () => leaf(SPARE_IN_USE, `/dev/disk/by-id/${SPARE_IN_USE}-part1`, 'INUSE')
+  const groups: VdevGroup[] = [
+    {
+      role: 'data',
+      vdevs: [container('mirror-0', 'mirror', [
+        leaf('ata-DATA_0001', '/dev/disk/by-id/ata-DATA_0001-part1'),
+        leaf('ata-DATA_0002', '/dev/disk/by-id/ata-DATA_0002-part1', 'REMOVED'),
+        spareLeaf(),
+      ], 'DEGRADED')],
+    },
+    { role: 'spare', vdevs: [container('spares', 'spare', [spareLeaf()], 'INUSE')] },
+  ]
+  return { name: 'tank', state: 'DEGRADED', guid: '1', errorCount: 0, vdevGroups: groups, scan: null }
+}
+
+describe('remove-vdev: an in-use spare gets its own sentence', () => {
+  it('refuses it by name, naming the vdev it is patching', () => {
+    const lookup = resolveVdev(inUseSpareStatus(), SPARE_IN_USE)
+    assert.ok(lookup && isVdevRefusal(lookup))
+    assert.equal(lookup.message, spareInUseMessage(SPARE_IN_USE, 'mirror-0'))
+  })
+
+  it('and by its device path — never as a leaf of the data mirror', () => {
+    const lookup = resolveVdev(inUseSpareStatus(), `${SPARE_IN_USE}-part1`)
+    assert.ok(lookup && isVdevRefusal(lookup))
+    assert.equal(lookup.message, spareInUseMessage(`${SPARE_IN_USE}-part1`, 'mirror-0'))
+  })
+
+  it('the data leaves of the same mirror still resolve as data', () => {
+    const hit = resolveVdev(inUseSpareStatus(), 'ata-DATA_0001')
+    assert.ok(hit && !isVdevRefusal(hit))
+    assert.equal(hit.role, 'data')
+  })
+})
+
+// --- the route, over the CAPTURED by-id partition-backed pool --------------
+//
+// `zpool-status-multi-cache-spare-2.4.4.json` is a stunt-node capture (ZFS
+// 2.4.4 / PVE 9.2.20, 2026-09-24) of `vdev-fixture.sh up-multi`: data on
+// -part1, log on -part2, TWO cache leaves on -part3/-part6 and TWO spares on
+// -part4/-part5, all by-id partitions of ONE disk. Every leaf therefore shares
+// one `disk.id` — the shape that made the first-match lookup dangerous.
+
+const MULTI_POOL = 'gtvdev'
+const MULTI_DISK = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9'
+const MULTI_PART = (n: number) => `/dev/disk/by-id/${MULTI_DISK}-part${n}`
+const MULTI_LIST: ExecResult = {
+  stdout: JSON.stringify({ pools: { [MULTI_POOL]: { name: MULTI_POOL, state: 'ONLINE', properties: {} } } }),
+  stderr: '',
+  exitCode: 0,
+}
+
+function multiStatus(): ExecResult {
+  const path = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/zfs/zpool-status-multi-cache-spare-2.4.4.json')
+  return { stdout: readFileSync(path, 'utf-8'), stderr: '', exitCode: 0 }
+}
+
+/** The same capture with one leaf dropped from a pool-level section. */
+function multiStatusWithout(section: string, part: number): ExecResult {
+  const doc = JSON.parse(multiStatus().stdout) as { pools: Record<string, Record<string, Record<string, unknown>>> }
+  delete doc.pools[MULTI_POOL][section][`${MULTI_DISK}-part${part}`]
+  return { stdout: JSON.stringify(doc), stderr: '', exitCode: 0 }
+}
+
+describe('remove-vdev over a by-id partition-backed pool (the #66 layout)', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  async function post(vdev: string) {
+    return server!.inject({
+      method: 'POST',
+      url: `/v1/pools/${MULTI_POOL}/vdevs/remove`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ vdev }),
+    })
+  }
+
+  it('the cache partition takes out the CACHE leaf — the log is untouched', async () => {
+    server = serverForPool(MULTI_LIST, [multiStatus(), multiStatusWithout('l2cache', 3)])
+
+    const res = await post(`${MULTI_DISK}-part3`)
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal((job.result as { role: string }).role, 'cache')
+    assert.deepEqual(removeCall(server), ['remove', MULTI_POOL, MULTI_PART(3)])
+  })
+
+  it('the second cache leaf comes out on its own — one container, one leaf at a time', async () => {
+    server = serverForPool(MULTI_LIST, [multiStatus(), multiStatusWithout('l2cache', 6)])
+
+    const res = await post(`${MULTI_DISK}-part6`)
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(removeCall(server), ['remove', MULTI_POOL, MULTI_PART(6)])
+  })
+
+  it('a spare comes out by its partition, leaving the other spare alone', async () => {
+    server = serverForPool(MULTI_LIST, [multiStatus(), multiStatusWithout('spares', 4)])
+
+    const res = await post(`${MULTI_DISK}-part4`)
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(removeCall(server), ['remove', MULTI_POOL, MULTI_PART(4)])
+  })
+
+  it('the stripped disk id is refused as ambiguous — nothing is removed', async () => {
+    server = serverForPool(MULTI_LIST, [multiStatus()])
+
+    const res = await post(MULTI_DISK)
+    assert.equal(res.statusCode, 400)
+    assert.equal(res.json().error.code, 'VALIDATION_ERROR')
+    assert.match(res.json().error.message, /names more than one device in pool gtvdev/)
+    assert.match(res.json().error.message, /name the one you mean by its device/)
+    assert.equal(removeCall(server), undefined)
+  })
+})
+
+// --- the settle poll fails CLOSED ------------------------------------------
+//
+// `zpool status` exiting non-zero is not an answer. Reporting the removal done
+// on an unreadable read tells the operator the vdev came out when nothing
+// verified it.
+
+describe('remove-vdev: the settle poll only completes on an answer', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+    delete process.env.ANAS_VDEV_REMOVE_SETTLE_MS
+  })
+
+  it('keeps polling through a failed status read and completes when the vdev is gone', async () => {
+    server = serverForPool(MULTI_LIST, [
+      multiStatus(),
+      { stdout: '', stderr: 'cannot open \'gtvdev\': pool I/O is currently suspended', exitCode: 1 },
+      multiStatusWithout('l2cache', 3),
+    ])
+
+    const res = await server.inject({
+      method: 'POST',
+      url: `/v1/pools/${MULTI_POOL}/vdevs/remove`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ vdev: `${MULTI_DISK}-part3` }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+  })
+
+  it('fails the job with the status error when every read fails', async () => {
+    process.env.ANAS_VDEV_REMOVE_SETTLE_MS = '0'
+    server = serverForPool(MULTI_LIST, [
+      multiStatus(),
+      { stdout: '', stderr: 'cannot open \'gtvdev\': no such pool', exitCode: 1 },
+    ])
+
+    const res = await server.inject({
+      method: 'POST',
+      url: `/v1/pools/${MULTI_POOL}/vdevs/remove`,
+      headers: JSON_HEADERS,
+      payload: JSON.stringify({ vdev: `${MULTI_DISK}-part3` }),
+    })
+    assert.equal(res.statusCode, 202)
+    const job = await waitForJob(server, (res.json() as JobAccepted).job.id)
+    assert.equal(job.status, 'failed')
+    assert.match(job.error!.message, /could not be read back/)
+    assert.match(job.error!.message, /no such pool/)
   })
 })

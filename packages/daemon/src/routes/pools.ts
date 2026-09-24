@@ -1,5 +1,5 @@
 import type { Disk, ExpansionTarget, PoolDetail, PoolExpansionReport, PoolSummary, VdevSpec } from '@anas/shared'
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyReply } from 'fastify'
 import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
@@ -22,7 +22,7 @@ import { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { configfsOptionsFrom, createIscsiClaimCache, heldByLun, heldByLunRefusal } from '../services/iscsi-held.js'
 import { buildCapability, buildExpansionTargets, busyDetail, detectLocalZfsVersion, RAIDZ_EXPANSION_FEATURE, raidzParity } from '../services/zfs-expansion.js'
 import { syncZfsImportUnit } from '../services/zfs-import-unit.js'
-import { NON_REMOVABLE_VDEV_MESSAGE, resolveVdev, stillPresentMessage, unknownVdevMessage } from '../services/zfs-vdev-remove.js'
+import { isVdevRefusal, NON_REMOVABLE_VDEV_MESSAGE, resolveVdev, stillPresentMessage, unknownVdevMessage, unreadablePoolMessage, vdevStillPresent } from '../services/zfs-vdev-remove.js'
 import { collectDisks, resolveLeafKernel } from './disks.js'
 import { requireIdentity } from './identity.js'
 
@@ -642,6 +642,32 @@ export async function poolRoutes(
   async function poolPveStorages(poolName: string): Promise<{ storage: string }[]> {
     const storages = await readPveStorages(pveCfgPath, await readZfsMountpoints())
     return storages.get(poolName) ?? []
+  }
+
+  /**
+   * The ONE pre-flight the two vdev-shape routes stand behind — adding a vdev
+   * and removing one reshape the same topology, so they ask the same two doors
+   * this branch's pool verbs stand behind: the ROOT-POOL block (a Level-1
+   * refusal with no override, Principle 14 — reshaping the pool this node boots
+   * from is the same class of change as destroying it), then the PVE-ownership
+   * 400. PVE owns the topology of the pools it manages, so ANAS keeps its hands
+   * off those the way the mountpoint verb does (story 3.25).
+   *
+   * Answers the error body to return — the reply code is already set — or null
+   * when the request may proceed.
+   */
+  async function vdevTopologyGate(poolName: string, reply: FastifyReply, verb: 'add' | 'remove'): Promise<object | null> {
+    if (isRootPool(poolName)) {
+      const what = verb === 'add' ? 'add a vdev to' : 'remove a vdev from'
+      reply.code(409)
+      return { error: { code: 'PROTECTED_RESOURCE', message: `Cannot ${what} the root pool '${poolName}'` } }
+    }
+    const pveStorages = await poolPveStorages(poolName)
+    if (pveStorages.length > 0) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: `Pool '${poolName}' is managed by PVE (${pveStorages.map(s => s.storage).join(', ')}) — PVE owns its topology and ANAS keeps hands off (story 3.25)` } }
+    }
+    return null
   }
 
   /** Every leaf disk of a pool resolved for disk cleanup (labelclear + zap). */
@@ -1362,6 +1388,13 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
+    // The same topology gate the remove route asks — adding a vdev reshapes a
+    // pool exactly as removing one does, and a PVE-managed pool is hands-off
+    // either way.
+    const gate = await vdevTopologyGate(poolName, reply, 'add')
+    if (gate)
+      return gate
+
     // SAFETY (D4 — the create path's inventory pre-flight, shared): a hands-off
     // (loop-back LUN) or non-available disk must not be composed in, whatever
     // the role. Refused before the job; unresolvable ids keep zpool's error.
@@ -1448,20 +1481,10 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    // ROOT-POOL GUARD then the PVE-ownership guard — the two doors this branch's
-    // pool verbs stand behind. Destroying the root pool is a Level-1 block with
-    // no override (Principle 14), and reshaping its topology is the same class
-    // of change; PVE owns the topology of the pools it manages, so ANAS keeps
-    // its hands off those the way the mountpoint verb does (story 3.25).
-    if (isRootPool(poolName)) {
-      reply.code(409)
-      return { error: { code: 'PROTECTED_RESOURCE', message: `Cannot remove a vdev from the root pool '${poolName}'` } }
-    }
-    const pveStorages = await poolPveStorages(poolName)
-    if (pveStorages.length > 0) {
-      reply.code(400)
-      return { error: { code: 'VALIDATION_ERROR', message: `Pool '${poolName}' is managed by PVE (${pveStorages.map(s => s.storage).join(', ')}) — PVE owns its topology and ANAS keeps hands off (story 3.25)` } }
-    }
+    // The shared topology gate: the root pool, then PVE ownership.
+    const gate = await vdevTopologyGate(poolName, reply, 'remove')
+    if (gate)
+      return gate
 
     const statusResult = await executor.exec(ZPOOL, ['status', '-jv'])
     const status = statusResult.exitCode === 0
@@ -1472,11 +1495,18 @@ export async function poolRoutes(
       return { error: { code: 'NOT_FOUND', message: `Pool '${poolName}' not found` } }
     }
 
-    const resolved = resolveVdev(status, requestedVdev)
-    if (!resolved) {
+    const lookup = resolveVdev(status, requestedVdev)
+    if (!lookup) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: unknownVdevMessage(poolName, requestedVdev) } }
     }
+    // A name the pool carries but must not act on: it fits more than one leaf
+    // (a split by-id device), or it is a spare ZFS has put to work.
+    if (isVdevRefusal(lookup)) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: lookup.message } }
+    }
+    const resolved = lookup
     if (!isRemovableVdevRole(resolved.role)) {
       reply.code(400)
       return { error: { code: 'VALIDATION_ERROR', message: NON_REMOVABLE_VDEV_MESSAGE } }
@@ -1492,17 +1522,32 @@ export async function poolRoutes(
           throw new Error(result.stderr.trim() || `zpool remove exited with code ${result.exitCode}`)
 
         // `zpool remove` of a log returns while the ZIL is still flushing, so a
-        // straight re-read can still show the vdev. Poll until it is gone, or
-        // say plainly that it is not (Principle 11 — the system answers, we do
-        // not assume the command's exit code did).
+        // straight re-read can still show the vdev. Poll until the POOL ITSELF
+        // says it is gone, or say plainly that it did not (Principle 11 — the
+        // system answers, we do not assume the command's exit code did).
+        //
+        // The loop FAILS CLOSED: a `zpool status` that exits non-zero, or one
+        // whose output no longer carries the pool, is not an answer — it is a
+        // read we could not make, and reporting success on it would tell the
+        // operator the vdev came out when nothing verified that. Only a pool
+        // that answers and no longer carries the token completes the job.
         const deadline = Date.now() + vdevRemoveSettleMs
         for (;;) {
           const after = await executor.exec(ZPOOL, ['status', '-jv'])
-          const parsed = after.exitCode === 0 ? parseZpoolStatusPool(after.stdout, poolName) : null
-          if (!parsed || !resolveVdev(parsed, requestedVdev))
-            return { pool: poolName, vdev: requestedVdev, role }
+          let failure: string
+          if (after.exitCode !== 0) {
+            failure = unreadablePoolMessage(poolName, after.stderr.trim() || `zpool status exited with code ${after.exitCode}`)
+          }
+          else {
+            const parsed = parseZpoolStatusPool(after.stdout, poolName)
+            if (parsed && !vdevStillPresent(parsed, resolved))
+              return { pool: poolName, vdev: requestedVdev, role }
+            failure = parsed
+              ? stillPresentMessage(poolName, requestedVdev)
+              : unreadablePoolMessage(poolName, 'zpool status no longer reports the pool')
+          }
           if (Date.now() >= deadline)
-            throw new Error(stillPresentMessage(poolName, requestedVdev))
+            throw new Error(failure)
           await new Promise(resolve => setTimeout(resolve, VDEV_REMOVE_POLL_MS))
         }
       },

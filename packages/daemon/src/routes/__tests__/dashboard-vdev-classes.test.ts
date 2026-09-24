@@ -122,3 +122,60 @@ describe('GET /v1/telemetry — every vdev class joins with its own role (vdevs.
     assert.equal(pool.vdevs.find(v => v.name === 'sdb4'), undefined)
   })
 })
+
+/**
+ * The same join over a BY-ID PARTITION-BACKED pool (GitHub #66's own layout).
+ * The status parser strips `-partN` to get a leaf's DISK identity, while
+ * iostat prints the leaf exactly as `zpool status` names it —
+ * `…ANAS_HOT9-part2`. Indexing the stripped id alone matched nothing, so every
+ * by-id partition leaf fell back to role `data`.
+ *
+ * Both fixtures are a matched pair captured from `vdev-fixture.sh up-multi` on
+ * the stunt node (ZFS 2.4.4 / PVE 9.2.20, 2026-09-24): one data leaf, one log
+ * leaf and TWO cache leaves, all by-id partitions of one disk.
+ */
+describe('GET /v1/telemetry — by-id partition leaves join by their own name', () => {
+  let server: ReturnType<typeof createServer> | undefined
+
+  afterEach(async () => {
+    await server?.close()
+    server = undefined
+  })
+
+  const MULTI_POOL = 'gtvdev'
+  const DISK = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9'
+  const MULTI_IOSTAT = readFileSync(join(FIXTURES, 'telemetry/zpool-iostat-plv-multi-cache-spare-2.4.4.txt'), 'utf-8')
+  const MULTI_STATUS = readFileSync(join(FIXTURES, 'zfs/zpool-status-multi-cache-spare-2.4.4.json'), 'utf-8')
+  const MULTI_LIST = JSON.stringify({ pools: { [MULTI_POOL]: { name: MULTI_POOL, state: 'ONLINE', properties: {} } } })
+
+  async function telemetry(): Promise<Telemetry> {
+    server = createServer({ mock: true, logger: false })
+    const mock = (server as unknown as { executor: MockExecutor }).executor
+    mock.clearFixtures()
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['list', '-j'], result: { stdout: MULTI_LIST, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['iostat', '-plv', MULTI_POOL, '1', '2'], result: { stdout: MULTI_IOSTAT, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: MULTI_STATUS, stderr: '', exitCode: 0 } })
+    mock.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: { stdout: BY_ID, stderr: '', exitCode: 0 } })
+    const res = await server.inject({ method: 'GET', url: '/v1/telemetry', headers: IDENTITY_HEADERS })
+    assert.equal(res.statusCode, 200)
+    return (res.json() as { data: Telemetry }).data
+  }
+
+  it('the log and cache partitions carry their OWN role, not the data fallback', async () => {
+    const t = await telemetry()
+    const pool = t.pools.find(p => p.name === MULTI_POOL)!
+    const roleOf = (vdev: string) => pool.vdevs.find(v => v.name === vdev)?.role
+    assert.equal(roleOf(`${DISK}-part1`), 'data')
+    assert.equal(roleOf(`${DISK}-part2`), 'log')
+    assert.equal(roleOf(`${DISK}-part3`), 'cache')
+    assert.equal(roleOf(`${DISK}-part6`), 'cache')
+    assert.equal(pool.vdevs.filter(v => v.role === 'data').length, 1)
+  })
+
+  it('and their own state — one container, both its leaves joined', async () => {
+    const t = await telemetry()
+    const pool = t.pools.find(p => p.name === MULTI_POOL)!
+    for (const part of [2, 3, 6])
+      assert.equal(pool.vdevs.find(v => v.name === `${DISK}-part${part}`)?.state, 'ONLINE', `part${part}`)
+  })
+})
