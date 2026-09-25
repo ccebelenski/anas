@@ -546,3 +546,142 @@ verified clean: `zpool list` shows only `gtbackup`/`gtiscsi`, `lvs`/`vgs`/`pvs`
 and `mdadm --detail --scan` empty, `/proc/mdstat` `unused devices: <none>`, no
 `anas-ahr` line in `/etc/fstab`, no btrfs mounts, `GET /v1/ahr` → `{"data":[]}`
 and `GET /v1/disks` → the system disk only.
+
+### (c) The udev rung, live-proven (2026-09-25)
+
+> Captured during the ahrcache.1 live proof of `tests/integration/ahr-cache-api.spec.ts`
+> on the same stunt node, with slice 2 deployed — `/etc/udev/rules.d/99-anas-cache.rules`
+> and `/usr/local/bin/anas-cache-event` installed, anasd running. The disk is
+> yanked live with `test/stunt-node/ahrcache-fixture.sh pull-cache` (a real
+> `virsh detach-disk`) while a reader loop and a write loop stream against the
+> pool. `udevadm monitor --property --udev` ran to a file across the whole run.
+
+**GT-25 — The partition REMOVE uevent carries `ID_PART_ENTRY_NAME`, so the rule
+can match on it.** This was the first open question of the rung: udev strips
+most properties from a removal, and a rule keyed on a GPT label is worth
+nothing if the label is not in the event. It is. Verbatim, the live yank of the
+cache disk (the partition's own event; the WHOLE-DISK `remove` follows 6 ms
+later at `[392977.703572]`, which is what distinguishes a yank from a detach's
+`sgdisk -d`):
+
+```
+UDEV  [392977.697514] remove   /devices/pci0000:00/0000:00:01.6/0000:07:00.0/virtio5/host7/target7:0:0/7:0:0:3/block/sdd/sdd1 (block)
+ACTION=remove
+DEVPATH=/devices/pci0000:00/0000:00:01.6/0000:07:00.0/virtio5/host7/target7:0:0/7:0:0:3/block/sdd/sdd1
+SUBSYSTEM=block
+DEVNAME=/dev/sdd1
+DEVTYPE=partition
+DISKSEQ=494
+PARTN=1
+PARTNAME=gtcache-cache1
+PARTUUID=4410e71a-13e1-4110-87e6-f435f6ae49c9
+SEQNUM=14565
+USEC_INITIALIZED=392969444701
+ID_SCSI=1
+ID_VENDOR=QEMU
+ID_VENDOR_ENC=QEMU\x20\x20\x20\x20
+ID_MODEL=QEMU_HARDDISK
+ID_MODEL_ENC=QEMU\x20HARDDISK\x20\x20\x20
+ID_REVISION=2.5+
+ID_TYPE=disk
+ID_SERIAL=0QEMU_QEMU_HARDDISK_ANAS_HOT9
+ID_SERIAL_SHORT=ANAS_HOT9
+ID_SCSI_SERIAL=ANAS_HOT9
+ID_BUS=scsi
+ID_PATH=pci-0000:07:00.0-scsi-0:0:0:3
+ID_PATH_TAG=pci-0000_07_00_0-scsi-0_0_0_3
+ID_PART_TABLE_UUID=5ee0b2b5-199c-4504-94ac-f119437fd62f
+ID_PART_TABLE_TYPE=gpt
+ID_FS_UUID=3rxTJZ-6koj-HY0m-utEV-39yl-ouwo-kisJ24
+ID_FS_UUID_ENC=3rxTJZ-6koj-HY0m-utEV-39yl-ouwo-kisJ24
+ID_FS_VERSION=LVM2 001
+ID_FS_TYPE=LVM2_member
+ID_FS_USAGE=raid
+ID_PART_ENTRY_SCHEME=gpt
+ID_PART_ENTRY_NAME=gtcache-cache1
+ID_PART_ENTRY_UUID=4410e71a-13e1-4110-87e6-f435f6ae49c9
+ID_PART_ENTRY_TYPE=e6d6d379-f507-44c2-a23c-238f2a3df928
+ID_PART_ENTRY_NUMBER=1
+ID_PART_ENTRY_OFFSET=2048
+ID_PART_ENTRY_SIZE=1046495
+ID_PART_ENTRY_DISK=8:48
+MAJOR=8
+MINOR=49
+DEVLINKS=/dev/disk/by-partlabel/gtcache-cache1 /dev/disk/by-id/lvm-pv-uuid-3rxTJZ-6koj-HY0m-utEV-39yl-ouwo-kisJ24 /dev/disk/by-path/pci-0000:07:00.0-scsi-0:0:0:3-part/by-partnum/1 /dev/disk/by-path/pci-0000:07:00.0-scsi-0:0:0:3-part1 /dev/disk/by-path/pci-0000:07:00.0-scsi-0:0:0:3-part/by-partuuid/4410e71a-13e1-4110-87e6-f435f6ae49c9 /dev/disk/by-path/pci-0000:07:00.0-scsi-0:0:0:3-part/by-partlabel/gtcache-cache1 /dev/disk/by-diskseq/494-part1 /dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9-part1 /dev/disk/by-partuuid/4410e71a-13e1-4110-87e6-f435f6ae49c9
+TAGS=:systemd:
+CURRENT_TAGS=:systemd:
+```
+
+Three facts the rule depends on are all present: `ACTION=remove`,
+`DEVTYPE=partition` and `ID_PART_ENTRY_NAME=gtcache-cache1` — the label ANAS
+itself wrote at attach. `ID_PART_ENTRY_TYPE` is the LVM type GUID
+(`e6d6d379-…`, sgdisk `8E00`) and `ID_FS_TYPE=LVM2_member` still reads from the
+kernel's cached probe, but the rule matches on the NAME and nothing else, which
+is the one property an operator's own disk cannot accidentally collide with.
+
+**GT-26 — Yank to uncached is 0.40 s; yank to recovery complete is 0.85 s.**
+One merged journal window (`anas-ahr` tag, `anasd`, kernel), verbatim, for the
+same yank:
+
+```
+Sep 25 04:26:00.227466 anas-pve kernel: sd 7:0:0:3: [sdd] Synchronizing SCSI cache
+Sep 25 04:26:00.239726 anas-pve anas-ahr[2297285]: EVENT=CacheDeviceRemoved POOL=gtcache SLICE=gtcache-cache1 KERNEL=sdd1
+Sep 25 04:26:00.303578 anas-pve kernel: device-mapper: cache: 252:0: switching cache to fail mode
+Sep 25 04:26:00.355473 anas-pve kernel: BTRFS info (device dm-0 state E): forced readonly
+Sep 25 04:26:00.372406 anas-pve node[2266621]: audit: system:udev-cache-event submitted ahr.cache.detach
+Sep 25 04:26:00.377381 anas-pve anas-ahr[2297329]: EVENT=CacheEventDelivered POOL=gtcache SLICE=gtcache-cache1
+Sep 25 04:26:00.629597 anas-pve node[2266621]: ahr.cache pool=gtcache rung=recover status=uncached device=gtcache-cache1
+Sep 25 04:26:01.078097 anas-pve node[2266621]: ahr.cache pool=gtcache rung=recover readonly=true notified=1
+Sep 25 04:26:01.078358 anas-pve node[2266621]: audit: ahr.cache.detach completed (706ms)
+```
+
+(The `audit:` lines are the `msg` field of the daemon's own JSON records,
+quoted here without the surrounding object.) The intervals, from the kernel's
+removal at `.227`: **12 ms** to the udev RUN program's journald record, **145 ms**
+to the POST reaching the daemon and a job being queued, **402 ms** to
+`lvconvert --uncache` having returned, **851 ms** to the whole rung finished —
+ghost PV dropped, read-only state read back, notification emitted. GT-20's
+0.224 s measurement of `--uncache` itself sits inside that, and the udev half of
+the rung costs a seventh of a second. Nobody was at a keyboard.
+
+Two further facts the same window settles: dm-cache switches to **fail mode 76 ms**
+after the removal, and the rung's `readonly=true` shows the recovery reads the
+btrfs aftermath AFTER the uncache, as designed — the filesystem had already been
+forced read-only 274 ms before the uncache completed.
+
+**GT-27 — A streaming WRITE does not meet a dead writethrough cache; the
+TRANSACTION COMMIT does.** This corrects the reading of (a) that the live-proof
+spec was first written against. Three runs of the failure test wrote 1 MiB
+`oflag=direct` into the pool every 0.1 s straight through the failure window
+without a single error, while the reader loop took EIO on every one of its 32
+files and btrfs counted the two apart:
+
+```
+BTRFS error (device dm-0): bdev /dev/mapper/gtcache-gtcache--vol errs: wr 0, rd 213, flush 0, corrupt 0, gen 0
+```
+
+`wr 0`. A write to a file the pool has never READ is a cache MISS, and
+writethrough passes a miss to the ORIGIN — the healthy band — so it never
+touches the dead device; dm-cache did not even enter fail mode. What fails is
+the metadata and superblock traffic of a btrfs **transaction commit**, which
+does land on the cache device. Adding one `sync` per iteration to the same loop
+produced the error immediately. Measured on a bed with NO recovery armed (the
+cache slice labelled `probe-c1`, which the ANAS rule cannot match, so the dead
+cache stays dead):
+
+```
+Sep 25 04:14:34.285260 kernel: BTRFS error (device dm-0): bdev … errs: wr 1, rd 1, flush 0, corrupt 0, gen 0
+Sep 25 04:14:34.292387 kernel: BTRFS error (device dm-0): bdev … errs: wr 2, rd 1, flush 1, corrupt 0, gen 0
+Sep 25 04:14:34.303967 kernel: BTRFS info (device dm-0 state E): forced readonly
+Sep 25 04:14:34.305842 kernel: BTRFS error (device dm-0 state EA): Transaction aborted (error -5)
+```
+
+**20 ms** from the yank to `forced readonly` — not the 15 s the (a) capture
+suggested, which was the distance to that run's next unforced commit. Only
+**two** write errors are ever recorded: after the flag is set every later write
+returns EROFS instead, which is what a `dd` loop actually sees (213 of 273
+iterations there). Consequences: a live-proof that wants the read-only
+aftermath must force a commit, and a real pool with an ordinary read-mostly
+workload can lose its cache device and stay read-WRITE until something commits
+— the rung's 0.85 s then wins the race, and the pool never goes read-only at
+all.

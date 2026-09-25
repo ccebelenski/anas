@@ -156,6 +156,15 @@ fi
 # (same pattern as the pve-integration scripts). Idempotent on every deploy.
 $SSH_CMD "install -m 0755 /opt/anas/packaging/anas-md-event.sh /usr/local/bin/anas-md-event && install -d /usr/share/pve-manager/templates/default && install -m 0644 /opt/anas/packaging/templates/anas-*.hbs /usr/share/pve-manager/templates/default/"
 echo "  ✓ anas-md-event hook installed (/usr/local/bin/anas-md-event)"
+# AHR read-cache event hook + its udev rule (story ahrcache.1 slice 2,
+# AHR-DESIGN §13). MIRRORED from packaging/install.sh's step 2b2 for the same
+# reason the iSCSI drop-in above is — the FILES are the single source, only
+# whether they get installed differs between the two paths. Without this a dev
+# node has no `<pool>-cacheN` removal rung at all, so a pulled cache disk is
+# recovered only at the next daemon start (the boot rung) and the live
+# auto-uncache the story turns on could never be proven here.
+$SSH_CMD "install -m 0755 /opt/anas/packaging/anas-cache-event.sh /usr/local/bin/anas-cache-event && install -d /etc/udev/rules.d && install -m 0644 /opt/anas/packaging/anas-cache.rules /etc/udev/rules.d/99-anas-cache.rules && udevadm control --reload-rules"
+echo "  ✓ anas-cache-event hook + udev rule installed (/usr/local/bin/anas-cache-event, /etc/udev/rules.d/99-anas-cache.rules)"
 # smbd (samba) and exportfs (nfs-kernel-server) are per-protocol and the
 # operator chooses which to run, so warn but never auto-install or fail.
 if $SSH_CMD "command -v smbd >/dev/null 2>&1"; then

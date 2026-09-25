@@ -42,9 +42,13 @@ const execFileAsync = promisify(execFile)
  * SLICE 2 adds two more tests at the bottom of this file — the cache device
  * failing under a live pool (udev auto-uncache, the warning card, the
  * notification, the btrfs read-only aftermath and Remount) and the boot rung.
- * Both are WRITTEN, NOT YET RUN: slice 2 was built at unit level while the
- * stunt node was held by another job, so their first run IS the story's live
- * proof and nothing here claims they have passed.
+ * All four tests are LIVE-PROVEN on the stunt node (2026-09-25): two
+ * consecutive green runs, 4 passed each, with the udev rung firing on a real
+ * `virsh detach-disk`. The captures are GT-25 (the removal uevent really does
+ * carry `ID_PART_ENTRY_NAME`, so the rule can match), GT-26 (yank → uncached
+ * 0.40 s, yank → rung complete 0.85 s) and GT-27 (what a write has to do
+ * before it meets a dead writethrough cache at all), in
+ * `docs/AHR-GROUND-TRUTH.md` §18(c).
  */
 
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
@@ -433,10 +437,10 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
   /**
    * SLICE 2 — THE FAILURE PATH, end to end, as GT §18(a)'s procedure.
    *
-   * WRITTEN, NOT YET RUN: slice 2 was built at unit level with the stunt node
-   * held by another job. Everything below is the procedure the ground truth
-   * already walked by hand, expressed as a spec; the first run of it is the
-   * story's live proof and no claim is made here that it has passed.
+   * LIVE-PROVEN 2026-09-25 (GT §18(c)). The procedure the ground truth walked
+   * by hand, expressed as a spec and run against a real `virsh detach-disk`:
+   * the rung uncaches unattended in 0.40 s, btrfs is forced read-only 20 ms
+   * after the yank, and Remount brings writes back.
    *
    * The sequence, and why each step is in it:
    *   1. attach a cache, warm it, and start a reader loop — the cache must be
@@ -499,11 +503,18 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       // A reader loop against the pool, direct I/O so every pass really
       // reaches the block layer. It records a timestamped rc per file, which
       // is how "recovered on its next pass" is measured rather than asserted.
+      // `rc=$?` is captured into a variable BEFORE the timestamp, and that
+      // ordering is the whole record: bash expands a word list left to right,
+      // so a `$(date -Is)` earlier in the same `echo` runs `date` and resets
+      // `$?` — a later `rc=$?` then reports DATE's status, which is always 0.
+      // The first two runs of this spec logged `rc=0` through an EIO window the
+      // kernel had recorded (`BTRFS warning (device dm-0): direct IO failed …
+      // err no 10`), and this is why.
       const READER_LOG = '/tmp/anas-cache-reader.log'
       await sshExec(
         `rm -f ${READER_LOG}; setsid bash -c 'for p in $(seq 1 600); do for f in ${MOUNT}/f*.bin; do `
-        + `dd if=$f of=/dev/null bs=4k count=16 iflag=direct status=none 2>/dev/null; `
-        + `echo "$(date -Is) pass=$p rc=$?" >> ${READER_LOG}; done; sleep 0.2; done' >/dev/null 2>&1 &`,
+        + `dd if=$f of=/dev/null bs=4k count=16 iflag=direct status=none 2>/dev/null; rc=$?; `
+        + `echo "$(date -Is) pass=$p rc=$rc" >> ${READER_LOG}; done; sleep 0.2; done' >/dev/null 2>&1 &`,
       )
 
       // THE WRITE LOOP, IN FLIGHT BEFORE THE YANK — GT §18's write-then-yank
@@ -514,10 +525,20 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       // read-only leg of this proof would be unreachable. Streaming writes
       // are also what makes the yank's failure window honest for the WRITES:
       // the first one after the disk dies meets the dead dm-cache (GT-19).
+      //
+      // THE `sync` IS NOT DECORATION — it is what makes the write leg real, and
+      // it is GT-27. A bare `dd … oflag=direct` into a file the pool has never
+      // READ is a cache MISS, and writethrough passes a miss straight to the
+      // ORIGIN, which is the healthy band: three runs of this spec wrote
+      // through the entire failure window without a single error while btrfs
+      // counted `errs: wr 0, rd 213` and the filesystem stayed read-WRITE. The
+      // error arrives on the TRANSACTION COMMIT, whose metadata and superblock
+      // writes do land on the cache device — and then it arrives at once
+      // (GT-27: write error and `forced readonly` 20 ms after the yank).
       await sshExec(
         `rm -f ${WRITE_LOG} ${WRITE_STOP}; setsid bash -c 'until [ -f ${WRITE_STOP} ]; do `
-        + `dd if=/dev/urandom of=${MOUNT}/write.bin bs=1M count=1 oflag=direct status=none 2>/dev/null; `
-        + `echo rc=$? >> ${WRITE_LOG}; sleep 0.1; done' >/dev/null 2>&1 &`,
+        + `dd if=/dev/urandom of=${MOUNT}/write.bin bs=1M count=1 oflag=direct status=none 2>/dev/null; rc=$?; sync 2>/dev/null; `
+        + `echo "$(date -Is) rc=$rc" >> ${WRITE_LOG}; sleep 0.1; done' >/dev/null 2>&1 &`,
       )
 
       const cursor = await anasdCursor()
@@ -536,18 +557,36 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
         30_000,
         'the udev rung uncached the pool',
       )
-      // The LEFTOVER device is still named: the disk carries its
-      // `<pool>-cache1` slice, and that is what keeps Detach cache reachable
-      // as the reclaim verb instead of the disk reading as a foreign one.
-      expect(recovered.cache?.devices).toEqual([cacheId])
-      expect(recovered.state).toBe('healthy')
+      // WHILE THE DISK IS OUT the device list is EMPTY, and that is the honest
+      // answer: `buildAhrCacheState` names a cache disk from a PV lvm still
+      // reports or from a `<pool>-cache<n>` GPT label lsblk can still read, and
+      // a virsh-detached disk offers neither — the ghost PV has just been
+      // dropped by `vgreduce --removemissing` and there is no partition table
+      // left on the node to carry the label. The leftover-slice attribution the
+      // design turns on is a property of a disk that has COME BACK, and step 8
+      // below asserts it there, after `return-cache`. (The first run of this
+      // spec expected `[cacheId]` here and failed on `[]`.)
+      expect(recovered.cache?.devices).toEqual([])
+      // `readonly`, NOT `healthy` — and that is the staging working. The write
+      // loop is in flight across the yank by design, so btrfs has already met
+      // its error and forced the filesystem read-only by the time the rung
+      // finishes uncaching (GT-27 measures that at 20 ms after the yank, well
+      // inside the sub-second recovery). `healthy` here would mean no write
+      // ever reached the dead cache, which is exactly the hole step 6 exists
+      // to close — so this assertion is the early warning for it.
+      expect(recovered.state).toBe('readonly')
       // The node's own view: a plain linear volume, and no ghost PV left in
       // the VG (`vgreduce --removemissing` ran behind the band guard).
       expect(await sshExec(`dmsetup status ${DM_NAME}`)).toContain('linear')
       expect(await sshExec(`pvs --noheadings -o pv_name ${POOL} | tr -d ' '`)).not.toContain('[unknown]')
 
       // --- 4. The reader loop recovered on its next pass -------------------
-      const reader = await sshExec(`tail -40 ${READER_LOG}`)
+      // The WHOLE log, not a tail: one pass is 32 lines (one per warmed file)
+      // and the EIO window lasts one or two passes, so a `tail -40` shows only
+      // the passes AFTER the recovery and the window it is looking for has
+      // already scrolled off. That is how run 3 failed with 32 `rc=1` lines
+      // sitting in the file.
+      const reader = await sshExec(`cat ${READER_LOG}`)
       expect(reader, 'the reader loop met the EIO window').toContain('rc=1')
       expect(reader.trim().split('\n').at(-1), 'and came back after it').toContain('rc=0')
 
@@ -592,7 +631,7 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       expect(code).toBeTruthy()
       // Nothing of ours may hold the mount when Remount umounts it: both
       // loops are stopped — the write loop above, the reader here.
-      await sshExec(`pkill -f 'dd if=${MOUNT}' || true; pkill -f 'seq 1 600' || true; pkill -f 'anas-cache-write[.]stop' || true`)
+      await sshExec(`pkill -f 'd[d] if=${MOUNT}' || true; pkill -f 'se[q] 1 600' || true; pkill -f 'anas-cache-write[.]stop' || true`)
       await runJob(ctx, 'post', `${V1}/ahr/${POOL}/remount`, undefined, { 'x-anas-confirm': code })
 
       const writable = await poolDetail(ctx)
@@ -622,14 +661,23 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       // Neither loop may outlive the test — and if a step above threw before
       // the write loop was stopped by its marker, this is the only thing that
       // stops it.
-      await sshExec(`pkill -f 'seq 1 600' || true; pkill -f 'anas-cache-write[.]stop' || true; rm -f ${WRITE_STOP} ${WRITE_LOG}`)
+      //
+      // EVERY pattern here carries the `[x]` guard, not just the write loop's.
+      // `pkill -f` matches the joined cmdline of every process including the
+      // ssh shell RUNNING THIS COMMAND, and that shell's cmdline contains the
+      // patterns verbatim. A bare `pkill -f 'seq 1 600'` therefore killed the
+      // shell on its own first statement and the write loop was never reached
+      // — which is what happened on the first run of this spec: the loop
+      // outlived the test, held `/mnt/anas-ahr/gtcache`, and made the
+      // afterAll's `umount` (and with it the whole fixture teardown) fail.
+      await sshExec(`pkill -f 'se[q] 1 600' || true; pkill -f 'anas-cache-write[.]stop' || true; rm -f ${WRITE_STOP} ${WRITE_LOG}`)
         .catch(() => {})
       await ctx.dispose()
     }
   })
 
   /**
-   * SLICE 2 — THE BOOT RUNG. WRITTEN, NOT YET RUN (see above).
+   * SLICE 2 — THE BOOT RUNG. LIVE-PROVEN 2026-09-25 (see above).
    *
    * LVM refuses to activate a pool LV whose cache metadata is missing —
    * "Refusing activation of partial LV", in normal mode AND under
@@ -657,7 +705,10 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
 
       // Stop the daemon FIRST, so the pull cannot be answered by the udev rung
       // — the boot rung is what is under proof here, and it must be the only
-      // thing that could have repaired the pool.
+      // thing that could have repaired the pool. Nothing below this line may
+      // touch the API until `restart-daemon`: the gateway carries
+      // `Requires=anasd.service` and goes down with the daemon, and it is that
+      // fixture verb which starts it back.
       await sshExec('systemctl stop anasd')
       await execFileAsync(FIXTURE_SH, ['pull-cache'])
       // The pool is now exactly what a node boots into after losing its cache

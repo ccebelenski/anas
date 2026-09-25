@@ -617,8 +617,10 @@ pool, so both verbs accept it: attach reuses and re-wipes the slice, detach
 deletes it and hands the disk back. Slices 2 (the udev auto-uncache rung, the
 boot rung, Remount) and 3 (the UI) are the rest of the story.
 
-**Built 2026-09-24 — slice 2 (the failure path).** Four rungs, all at UNIT
-level; the live-proof spec is WRITTEN and its first run is the story's proof.
+**Built 2026-09-24 — slice 2 (the failure path).** Four rungs, LIVE-PROVEN on
+the stunt node 2026-09-25 (`tests/integration/ahr-cache-api.spec.ts`, two
+consecutive green runs, 4/4 each, against a real `virsh detach-disk`;
+GROUND-TRUTH §18(c) GT-25/26/27).
 (1) **udev auto-uncache.** `packaging/anas-cache.rules` →
 `/etc/udev/rules.d/99-anas-cache.rules` fires on the REMOVE of a block
 partition whose `ID_PART_ENTRY_NAME` matches `?*-cache[0-9]` (and the
@@ -661,6 +663,27 @@ when it is needed; the read-only advisory and the dashboard card now share ONE
 clause that names Remount and says writes are stopped until the pool is
 remounted. The UI verb itself is a small follow-up (the `39-ahr.js` comment
 marks where it goes).
+
+**Live proof (2026-09-25).** The rung works end to end and the product code
+needed no change: the removal uevent carries `ID_PART_ENTRY_NAME`, the rule
+fires, `anas-cache-event` reaches the socket, and the pool is uncached 0.40 s
+after the disk dies and the whole rung is done — ghost PV dropped, read-only
+state read back, notification sent — at 0.85 s (GT-25, GT-26). The boot rung
+recovers and mounts in the right order, and Remount restores writes. Two facts
+the proof corrects: a dead cache leaves `cache.devices` EMPTY while the disk is
+physically absent (there is no PV and no GPT label left to read — the
+leftover-slice attribution this design relies on is a property of a disk that
+has come BACK, and it holds there), and a streaming WRITE does not meet a dead
+writethrough cache at all, because a write to a never-read block is a miss that
+passes through to the healthy origin — the error arrives on the transaction
+COMMIT, and then btrfs is forced read-only within 20 ms (GT-27). The second one
+means a read-mostly pool can lose its cache and never go read-only, since the
+rung repairs in under a second; `mountedReadOnly` and Remount stay exactly as
+designed for the pools that do commit in that window. Deploying slice 2 to a
+dev node needed one fixture change: `test/stunt-node/deploy-anas.sh` did not
+install the rule or the hook (it mirrors `install.sh` for the md hook and the
+iSCSI drop-in but had no line for these), so a dev node had no removal rung at
+all.
 
 **Fix batch (review, 2026-09-24).** DESTROY must uncache before `lvremove`: a
 cached pool's LV is a dm-cache target and `lvremove` refuses one, which stopped

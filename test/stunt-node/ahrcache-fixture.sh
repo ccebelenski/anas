@@ -176,14 +176,24 @@ case "$1" in
   restart-daemon)
     echo "=== ahrcache.1 fixture — restart anasd ==="
     $SSH_CMD "systemctl restart anasd" || { echo "ERROR: could not restart anasd" >&2; exit 1; }
+    # The GATEWAY has to be started back explicitly. `anas.service` carries
+    # `Requires=anasd.service`, so stopping or restarting anasd deactivates the
+    # gateway with it and systemd does NOT bring it back (restart propagation
+    # needs `PartOf=`/`BindsTo=`, which the unit does not have). At a real boot
+    # both units start from `multi-user.target` and this never shows; it shows
+    # only when the boot rung is REPRODUCED by restarting the daemon, and it
+    # cost the first run of the boot-rung test a 502 from pveproxy's ANAS hook
+    # ("ANAS gateway not reachable on the loopback interface"). `start` is
+    # idempotent and leaves an already-running gateway alone.
+    $SSH_CMD "systemctl start anas" || { echo "ERROR: could not start the anas gateway" >&2; exit 1; }
     for n in $(seq 1 30); do
-      if $SSH_CMD "test -S /run/anas/anasd.sock"; then
-        echo "✓ anasd listening again (after ${n}s)"
+      if $SSH_CMD "test -S /run/anas/anasd.sock && systemctl is-active --quiet anas"; then
+        echo "✓ anasd listening and the gateway up again (after ${n}s)"
         exit 0
       fi
       sleep 1
     done
-    echo "ERROR: anasd socket never came back" >&2
+    echo "ERROR: anasd socket and/or the anas gateway never came back" >&2
     exit 1
     ;;
 
