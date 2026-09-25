@@ -1175,6 +1175,18 @@
         // timeliness), so the toolbar verbs need a handle on the open window
         // to reload it after THEIR jobs — one window at a time is the on-demand
         // idiom here; a closed window clears the slot.
+        //
+        // ONE window is not a figure of speech: `openDetail` holds a single
+        // handle, so a second Details click used to stack a duplicate that
+        // `reloadAfterCacheJob` could never reach — an identical-looking window
+        // sitting there with the cache counters frozen at the moment it opened,
+        // which is exactly the timeliness contract §13 asks the block to keep.
+        // Replace the open one instead (its destroy listener clears the slot,
+        // so the assignment below must come after the close).
+        if (openDetail && openDetail.win && !openDetail.win.destroyed
+            && !openDetail.win.destroying) {
+            openDetail.win.close();
+        }
         openDetail = { win: null, node: node, name: name };
         var win;
         try {

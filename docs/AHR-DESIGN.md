@@ -729,3 +729,30 @@ Two calls the UI leg settled:
   manufacture a "wasted" band out of flash that is doing its job. Hot spares
   STAY in all three: a spare is cut to the band geometry and really carries it.
 
+**Live proof — slice 3 (2026-09-25).** `tests/integration/ahr-cache-ui.spec.ts`
+run on the stunt node, two consecutive green runs, 3 passed each. The dialogs
+and the block hold as designed: the advisory's two sentences and the rotating
+pick's one sentence render in the picker, the attach job lands through the
+dialog, the Cache block names the device by its full by-id with the mode, the
+policy and the hit counters, Detach's plain confirm names the trade and the
+disk reads `Available` in the Disks tab afterwards, and a pool that was cached
+under the open dialog refuses the submit with the daemon's own
+already-cached sentence rather than a bare "failed". One product defect, found
+by the proof and fixed: **a second Details click stacked a duplicate window.**
+`openDetail` holds ONE handle, so the older window was orphaned — visually
+identical, never reloaded by `reloadAfterCacheJob`, its cache counters frozen
+at the moment it opened, which is the §13 timeliness contract inverted. The
+window now replaces the open one (`39-ahr.js`, `openPoolDetailWindow`).
+
+The proof also added the **Remount** test slice 2 left for the follow-up. It
+stages a real read-only pool: warm the cache, start a direct-write loop that
+`sync`s each pass (GT-27 — a streaming write only meets a dead writethrough
+cache on the transaction COMMIT, so the loop must already be in flight when
+the disk dies), then yank the disk. The verb is hidden on a writable pool,
+appears after the udev rung has uncached and btrfs has forced read-only, opens
+a confirm carrying the daemon's own open-handle warning with the mountpoint in
+it, and after the job writes succeed again and the button leaves the toolbar.
+GT-27's caveat is respected rather than assumed away: the test waits for
+`mountedReadOnly` with the write loop driving commits and reports what it
+waited for if the window closes without one.
+

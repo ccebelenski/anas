@@ -8,9 +8,10 @@ import { sshExec } from './fixtures/stunt-node'
 const execFileAsync = promisify(execFile)
 
 /**
- * Story ahrcache.1 slice 3 — the UI leg, WRITTEN NOT RUN (the stunt node is
- * held). Modelled on ahr-cache-api.spec.ts (slice 1, live-proven) and
- * pool-composer.spec.ts's pointer-drag helper.
+ * Story ahrcache.1 slice 3 — the UI leg, LIVE-PROVEN on the stunt node
+ * 2026-09-25 (two consecutive green runs, 3 passed each). Modelled on
+ * ahr-cache-api.spec.ts (slice 1 + 2, live-proven) and pool-composer.spec.ts's
+ * pointer-drag helper.
  *
  * Runs over test/stunt-node/ahrcache-fixture.sh (disks 7/8/9; pool `gtcache`
  * is NOT built by the fixture — creating it any way but the daemon's own API
@@ -29,6 +30,10 @@ const execFileAsync = promisify(execFile)
  *   - a refused attach (the disk became in-use while the dialog stood open —
  *     staged through the API, the race a dialog cannot prevent) surfaces the
  *     daemon's own sentence in the failure modal, never a bare "failed"
+ *   - Remount is offered ONLY on a pool whose `mountedReadOnly` field is true,
+ *     its confirm carries the daemon's own open-handle warning, and the job
+ *     restores writes and takes the verb back off the toolbar (the third test,
+ *     added by the live proof — see its own header for the GT-27 staging)
  *   - toolbar overflow rule as pvepool.2: runs at 2560×1080 — the AHR toolbar
  *     grew two labelled buttons and clicks in ExtJS's overflow menu would be
  *     invisible to the specs
@@ -37,7 +42,8 @@ const execFileAsync = promisify(execFile)
  * dashboard's CRITICAL card) needs slice 2's udev rung to stage honestly — a
  * yanked disk without the event would leave the block describing a state the
  * product never serves. It is proved on the unit level (dialog-contracts
- * harness, the GT-19 sentence) and joins the live proof with slice 2.
+ * harness, the GT-19 sentence) and on the wire by the API spec's slice-2 test;
+ * the Remount test below stages the same yank and drives the aftermath.
  */
 
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
@@ -72,8 +78,13 @@ test.use({ viewport: { width: 2560, height: 1080 } })
 
 interface PoolDetail {
   state: string
+  /** slice 2 — the narrow field the Remount verb is gated on. */
+  mountedReadOnly?: boolean
   cache?: { state: 'healthy' | 'failed' | 'absent', devices: string[] }
 }
+
+/** The pool's mountpoint on the node — the Remount test writes into it. */
+const MOUNT = `/mnt/anas-ahr/${POOL}`
 
 /** Build an authenticated request context carrying the PVE session cookie. */
 async function authedContext(
@@ -129,6 +140,25 @@ async function poolDetail(ctx: APIRequestContext): Promise<PoolDetail> {
   const res = await ctx.get(`${V1}/ahr/${POOL}`)
   expect(res.status(), await res.text()).toBe(200)
   return (await res.json()).data as PoolDetail
+}
+
+/** Poll the pool payload until `ok` holds, or fail naming what was awaited. */
+async function untilPool(
+  ctx: APIRequestContext,
+  ok: (p: PoolDetail) => boolean,
+  timeout: number,
+  what: string,
+): Promise<PoolDetail> {
+  const deadline = Date.now() + timeout
+  let last: PoolDetail | undefined
+  for (;;) {
+    last = await poolDetail(ctx)
+    if (ok(last))
+      return last
+    if (Date.now() > deadline)
+      throw new Error(`timed out after ${timeout}ms waiting for ${what}: ${JSON.stringify(last)}`)
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
 }
 
 /** Build the one-band pool through the daemon's own API; fail if it exists. */
@@ -340,6 +370,117 @@ test.describe('AHR read cache — the UI (ahrcache.1 slice 3)', () => {
       await modal.getByRole('button', { name: 'OK' }).click()
     }
     finally {
+      await destroyPool(ctx)
+    }
+  })
+
+  /**
+   * Slice 2's UI leg — the Remount verb, added by the live proof (2026-09-25).
+   *
+   * The button is gated on `mountedReadOnly`, a FIELD and not the state badge
+   * (§13), so the only honest way to see it is to take the pool read-only for
+   * real. GT-27 is what makes that stageable: a streaming write only meets a
+   * dead writethrough cache on the transaction COMMIT, so the write loop
+   * carries a `sync` and has to already be in flight when the disk dies — a
+   * write issued after the udev rung has uncached meets a plain linear volume
+   * and succeeds. The same recipe the API spec proved, minus its reader loop:
+   * that loop existed to MEASURE the recovery, which is not this test's claim.
+   *
+   * GT-27 also says a read-mostly pool can lose its cache and never go
+   * read-only at all, so this test does not assume it — it asserts the button
+   * is absent before the yank, waits for `mountedReadOnly` with the write loop
+   * driving commits, and fails naming what it waited for if the window closed.
+   *
+   * The cache is attached through the API here: the UI attach is the first
+   * test's business, and repeating it would only lengthen the staging.
+   */
+  test('Remount is offered only when the pool is read-only, and restores writes', async ({ page, playwright, pveTicket }) => {
+    const WRITE_LOG = '/tmp/anas-cache-ui-write.log'
+    const WRITE_STOP = '/tmp/anas-cache-ui-write.stop'
+    const ctx = await authedContext(playwright, pveTicket)
+    await buildPool(ctx)
+    try {
+      // ---- A live, warm cache ---------------------------------------------
+      const attach = await ctx.post(`${V1}/ahr/${POOL}/cache`, { data: { disks: [CACHE_ID] } })
+      expect(attach.status(), await attach.text()).toBe(202)
+      const attachJob = await awaitJob(ctx, (await attach.json()).job.id)
+      expect(attachJob.status, JSON.stringify(attachJob.error)).toBe('completed')
+      await sshExec(`cd ${MOUNT} && for i in $(seq 1 32); do dd if=/dev/urandom of=f$i.bin bs=1M count=4 status=none; done && sync`)
+      for (let pass = 0; pass < 4; pass++)
+        await sshExec(`echo 3 > /proc/sys/vm/drop_caches && cat ${MOUNT}/f*.bin > /dev/null`)
+      const warm = await poolDetail(ctx)
+      expect(warm.cache?.state).toBe('healthy')
+      expect(warm.mountedReadOnly).toBe(false)
+
+      // ---- A writable pool does not offer Remount --------------------------
+      const grid = await openAhrGrid(page)
+      await poolRow(page, grid, POOL).click()
+      const remountBtn = grid.locator('.anas-btn-ahr-remount')
+      await expect(remountBtn).toBeHidden()
+
+      // ---- The write loop, in flight BEFORE the yank (GT-27) ---------------
+      await sshExec(
+        `rm -f ${WRITE_LOG} ${WRITE_STOP}; setsid bash -c 'until [ -f ${WRITE_STOP} ]; do `
+        + `dd if=/dev/urandom of=${MOUNT}/write.bin bs=1M count=1 oflag=direct status=none 2>/dev/null; rc=$?; sync 2>/dev/null; `
+        + `echo "$(date -Is) rc=$rc" >> ${WRITE_LOG}; sleep 0.1; done' >/dev/null 2>&1 &`,
+      )
+      await execFileAsync(FIXTURE_SH, ['pull-cache'])
+
+      // The udev rung uncaches unattended; the commit that met the dead cache
+      // forces btrfs read-only, and THAT is what the verb exists for.
+      await untilPool(ctx, p => p.cache?.state === 'absent', 60_000, 'the udev rung to uncache the pool')
+      const ro = await untilPool(ctx, p => p.mountedReadOnly === true, 60_000, 'btrfs to force the filesystem read-only')
+      expect(ro.cache?.state).toBe('absent')
+      const writeLog = await sshExec(`cat ${WRITE_LOG}`)
+      expect(writeLog, 'the write loop wrote cleanly before the yank').toContain('rc=0')
+      expect(writeLog, 'and met the error once the cache was gone').toContain('rc=1')
+
+      // Nothing of ours may hold the mount when Remount umounts it. The `[.]`
+      // keeps the pattern off the pkill shell's own command line (the API
+      // spec's lesson — a bare pattern kills the shell on its first statement).
+      await sshExec(`touch ${WRITE_STOP}; sleep 0.5`)
+      await sshExec(`pkill -f 'anas-cache-ui-write[.]stop' || true`)
+
+      // ---- The verb appears, and its confirm names the break ---------------
+      // Reload, then re-select: an ExtJS store reload drops the selection, and
+      // the toolbar is gated on the SELECTED record. Wrapped in toPass because
+      // the click can land mid-reload on a row the store is about to replace.
+      await grid.locator('.anas-btn-ahr-refresh').click()
+      await expect(async () => {
+        await poolRow(page, grid, POOL).click()
+        await expect(remountBtn).toBeVisible({ timeout: 2_000 })
+      }).toPass({ timeout: 60_000 })
+      await expect(remountBtn).toBeEnabled()
+      await remountBtn.click()
+      const confirm = page.locator('.x-message-box:visible')
+      await expect(confirm).toBeVisible({ timeout: 30_000 })
+      await expect(confirm).toContainText('unmounts and mounts its filesystem')
+      // The daemon's own 409 warning rides the confirm window, mountpoint and
+      // all — the UI never paraphrases it.
+      await expect(confirm).toContainText('Open share handles break')
+      await expect(confirm).toContainText(MOUNT)
+      await confirm.getByRole('button', { name: 'Yes' }).click()
+
+      // ---- Writes are back, and the verb leaves the toolbar ----------------
+      const writable = await untilPool(ctx, p => p.mountedReadOnly === false, 180_000, 'the remount to restore writes')
+      expect(writable.state).toBe('healthy')
+      // GT-20's negative from the other side: `remount,rw` is refused after an
+      // error, so only umount + mount could have produced this.
+      expect(await sshExec(`dd if=/dev/urandom of=${MOUNT}/proof.bin bs=1M count=1 status=none && echo ok`)).toBe('ok')
+      await grid.locator('.anas-btn-ahr-refresh').click()
+      await expect(async () => {
+        await poolRow(page, grid, POOL).click()
+        await expect(remountBtn).toBeHidden({ timeout: 2_000 })
+      }).toPass({ timeout: 60_000 })
+    }
+    finally {
+      // The loop may never outlive the test: if a step above threw before the
+      // marker was written, this is the only thing that stops it.
+      await sshExec(`touch ${WRITE_STOP}; pkill -f 'anas-cache-ui-write[.]stop' || true; rm -f ${WRITE_STOP} ${WRITE_LOG}`)
+        .catch(() => {})
+      // Hand the disk back before the teardown so destroy wipes the leftover
+      // <pool>-cache<n> slice it carries, rather than leaving it on the image.
+      await execFileAsync(FIXTURE_SH, ['return-cache']).catch(() => {})
       await destroyPool(ctx)
     }
   })
