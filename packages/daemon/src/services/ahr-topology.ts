@@ -25,7 +25,7 @@ import { lvIsActive, lvIsCacheTarget, LVS_ARGS, parseLvsReport, parsePvsReport, 
 import { hasArray, parseMdadmConfDoc } from '../parsers/mdadm-conf.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
-import { buildAhrCacheState, cacheFailedAdvisory } from './ahr-cache-state.js'
+import { buildAhrCacheState, cacheFailedAdvisory, foreignVgPvAdvisory } from './ahr-cache-state.js'
 import { matchPartitionLabel } from './ahr-geometry.js'
 import { readIntent } from './ahr-intent.js'
 import { AHR_MIN_DISKS, floorToGranularity, isPvUnderSized } from './ahr-layout.js'
@@ -718,9 +718,15 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     // warm cache from a dead one: its counters go STALE rather than absent
     // (GT-23), and the pool then reports healthy while serving EIO to every
     // read (GT-19). dmsetup answers with one token.
+    //
+    // NOT asked for an INACTIVE volume: it has no dm table, dmsetup answers
+    // "Device does not exist", and that answer says nothing about the cache —
+    // the usual cause is a band array that did not assemble. The cache-state
+    // builder reads the inactive LV as `inactive` (or `failed` when the cache
+    // PV's device is itself gone), never from a dm answer that cannot exist.
     const lvName = lv?.name ?? `${poolName}-vol`
     let dmStatus: DmStatusLine | null = null
-    if (lv && lvIsCacheTarget(lv.attr)) {
+    if (lv && lvIsCacheTarget(lv.attr) && lvIsActive(lv.attr) !== false) {
       const res = await executor.exec(DMSETUP, dmsetupStatusArgs(dmName(poolName, lvName)))
       if (res.exitCode === 0)
         dmStatus = parseDmsetupStatus(res.stdout)
@@ -757,6 +763,10 @@ export async function readAhrPools(executor: CommandExecutor, mdadmConfPath?: st
     }
     if (cacheFacts.cache.state === 'failed')
       advisories.push(cacheFailedAdvisory(poolName))
+    // A PV an operator put in the VG by hand: not a pool disk (so not on
+    // destroy's wipe list), but never invisible either.
+    if (cacheFacts.foreignPvs.length > 0)
+      advisories.push(foreignVgPvAdvisory(poolName, cacheFacts.foreignPvs))
 
     // ---- Mount + btrfs ------------------------------------------------------
     const mapperPath = `/dev/mapper/${dmName(poolName, lvName)}`

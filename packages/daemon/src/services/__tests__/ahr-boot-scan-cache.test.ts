@@ -26,10 +26,17 @@ import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../ahr-topology.js'
  * udev event runs, THEN activates and mounts — in that order, which is the
  * single fact this file exists to pin.
  *
- * Three worlds over a one-band pool `tank`:
- *   'missing'  cache target, cache PV `[unknown]`, volume inactive, unmounted
- *   'healthy'  a live, working cache — must be left completely alone
- *   'bandsdown' cache PV AND the band's md PV missing → the guard refuses
+ * Five worlds over a one-band pool `tank`:
+ *   'missing'   cache target, cache PV `[unknown]`, volume inactive, unmounted
+ *   'healthy'   a live, working cache — must be left completely alone
+ *   'bandsdown' cache PV AND the band's md PV missing, volume inactive —
+ *               nothing proves which nameless PV is the cache's → `inactive`,
+ *               left alone (ahrcache.1 review)
+ *   'bandonly'  the band's md PV missing, the cache SSD present and named,
+ *               volume inactive — the review finding's own shape → left alone
+ *   'present'   the cache device PRESENT but dm reports it failed, volume
+ *               active and mounted → recovered, and described as FAILED,
+ *               never as a missing device
  */
 
 const GIB = 1024 ** 3
@@ -56,12 +63,22 @@ function ok(stdout: string) {
   return { stdout, stderr: '', exitCode: 0 }
 }
 
-type World = 'missing' | 'healthy' | 'bandsdown'
+type World = 'missing' | 'healthy' | 'bandsdown' | 'bandonly' | 'present'
+
+/** The cache SSD and its `tank-cache1` slice are attached and named in `pvs`. */
+function cachePresent(world: World): boolean {
+  return world === 'healthy' || world === 'bandonly' || world === 'present'
+}
+
+/** The pool volume is active and mounted. */
+function volumeUp(world: World): boolean {
+  return world === 'healthy' || world === 'present'
+}
 
 function ahrLsblkJson(world: World): string {
   // A pool whose partial LV could not activate is not mounted — that is the
   // whole reason this rung exists.
-  const lvmNode = { name: DM_NAME, type: 'lvm', size: LV_SIZE, fstype: 'btrfs', mountpoint: world === 'healthy' ? MOUNTPOINT : null, partlabel: null }
+  const lvmNode = { name: DM_NAME, type: 'lvm', size: LV_SIZE, fstype: 'btrfs', mountpoint: volumeUp(world) ? MOUNTPOINT : null, partlabel: null }
   const member = (kernel: string, id: string, n: number) => ({
     name: kernel,
     type: 'disk',
@@ -82,7 +99,7 @@ function ahrLsblkJson(world: World): string {
     }],
   })
   const disks: unknown[] = [member('sdq', X, 1), member('sdr', Y, 2)]
-  if (world === 'healthy') {
+  if (cachePresent(world)) {
     disks.push({
       name: 'sds',
       type: 'disk',
@@ -120,7 +137,7 @@ function lvsJson(world: World): string {
   // `Cwi` = a cache-target LV. Field 5 is the activation state: `a` active,
   // `-` not. A partial cached LV cannot activate, so it reads `-`, and the
   // trailing `p` says a PV of it is missing.
-  const attr = world === 'healthy' ? 'Cwi-aoC---' : 'Cwi---C-p-'
+  const attr = volumeUp(world) ? 'Cwi-aoC---' : 'Cwi---C-p-'
   return JSON.stringify({
     report: [{
       lv: [{
@@ -142,11 +159,11 @@ function lvsJson(world: World): string {
 
 function pvsJson(world: World): string {
   const rows: Record<string, string>[] = []
-  if (world === 'bandsdown')
+  if (world === 'bandsdown' || world === 'bandonly')
     rows.push({ pv_name: '[unknown]', vg_name: 'tank', pv_size: String(LV_SIZE), pv_free: '0', dev_size: '0' })
   else
     rows.push({ pv_name: '/dev/md127', vg_name: 'tank', pv_size: String(LV_SIZE), pv_free: '0', dev_size: String(LV_SIZE + 2 * MIB) })
-  if (world === 'healthy')
+  if (cachePresent(world))
     rows.push({ pv_name: '/dev/sds1', vg_name: 'tank', pv_size: String(4 * GIB - MIB), pv_free: '0', dev_size: String(4 * GIB) })
   else
     rows.push({ pv_name: '[unknown]', vg_name: 'tank', pv_size: String(4 * GIB - MIB), pv_free: '0', dev_size: '0' })
@@ -160,6 +177,8 @@ const DM_STATUS: Record<World, string> = {
   // asymmetry in `buildAhrCacheState` (GT-23's failure shape).
   missing: 'Device does not exist.\n',
   bandsdown: 'Device does not exist.\n',
+  bandonly: 'Device does not exist.\n',
+  present: '0 4186624 cache Fail\n',
   healthy: '0 4186624 cache 8 24/2048 128 8/8000 152 28 0 0 0 8 0 2 metadata2 writethrough 2 migration_threshold 2048 mq 10 random_threshold 0 sequential_threshold 0 discard_promote_adjustment 0 read_promote_adjustment 0 write_promote_adjustment 0 rw - \n',
 }
 
@@ -193,11 +212,11 @@ function buildExecutor(world: World): MockExecutor {
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: ok(lvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/lvs', args: LVS_STATE_ARGS, result: ok(lvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/pvs', args: [...PVS_ARGS], result: ok(pvsJson(world)) })
-  executor.addFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: world === 'healthy'
+  executor.addFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs(DM_NAME), result: volumeUp(world)
     ? ok(DM_STATUS[world])
     : { stdout: '', stderr: DM_STATUS[world], exitCode: 1 } })
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: ok(JSON.stringify({
-    filesystems: world === 'healthy'
+    filesystems: volumeUp(world)
       ? [{ target: MOUNTPOINT, source: `/dev/mapper/${DM_NAME}`, fstype: 'btrfs', options: 'rw,relatime,subvol=/@data' }]
       : [],
   })) })
@@ -295,25 +314,40 @@ describe('ahr-boot-scan branch (d) — a cached pool whose cache PV is missing',
       assert.equal(executorNoCache.calls.filter(c => c.command === cmd).length, 0, cmd)
   })
 
-  it('REFUSES --removemissing while a band PV is also missing, and says why', async () => {
+  it('cache PV AND a band PV nameless, volume inactive: NOTHING proves a dead cache — left alone', async () => {
+    // Before the ahrcache.1 review this read `failed` (no dm answer over a
+    // cache target), and the rung uncached a partial VG and announced a
+    // missing cache device. With a band PV also `[unknown]`, nothing says which
+    // nameless PV is the cache's (GT-19), and an inactive volume has no dm
+    // table to ask. The band is the operator's problem first.
     const executor = buildExecutor('bandsdown')
     const report = await ahrBootScan(executor, { intentDir: dir, log: () => {} })
     assert.deepEqual(report.cacheRecovered, [])
+    assert.deepEqual(rungCalls(executor), [])
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0)
+  })
 
-    // GT-19: a stopped band array reads `[unknown]` exactly as a dead cache
-    // device does, and `--removemissing` drops EVERY absent PV. At boot this is
-    // not a theoretical case — a node that lost the cache SSD may well have
-    // lost a band's disk in the same event.
-    const calls = rungCalls(executor)
-    assert.ok(!calls.some(c => c[0] === '/usr/sbin/vgreduce'), JSON.stringify(calls))
-    assert.ok(!calls.some(c => c[0] === '/usr/bin/mount'), JSON.stringify(calls))
+  it('a BAND down and the cache SSD healthy (the review finding): not recovered, no cache notification', async () => {
+    const executor = buildExecutor('bandonly')
+    const lines: string[] = []
+    const report = await ahrBootScan(executor, { intentDir: dir, log: l => lines.push(l) })
+    assert.deepEqual(report.cacheRecovered, [])
+    assert.deepEqual(rungCalls(executor), [], 'no uncache of a partial VG over a working SSD')
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0, 'and no claim that the SSD is missing')
+    // An inactive volume has no dm table: the reader does not ask.
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/dmsetup').length, 0)
+  })
 
+  it('a cache that is PRESENT but failed is recovered and described as failed, not missing', async () => {
+    const executor = buildExecutor('present')
+    const report = await ahrBootScan(executor, { intentDir: dir, log: () => {} })
+    assert.deepEqual(report.cacheRecovered, ['tank'])
     const perl = executor.calls.find(c => c.command === '/usr/bin/perl')
-    assert.ok(perl, 'the operator is told the automatic repair did not happen')
-    assert.equal(perl!.args[2], 'error')
-    assert.equal(perl!.args[3], 'AHR read cache recovery FAILED: tank')
-    assert.match(perl!.args[4], /a stopped band array is indistinguishable/)
-    assert.match(perl!.args[4], /cannot serve reads until the cache is removed/)
+    assert.ok(perl)
+    assert.equal(perl!.args[3], 'AHR read cache failed: tank')
+    assert.ok(!perl!.args[4].includes('was missing'), perl!.args[4])
+    // Mounted and active: nothing to activate or mount afterwards.
+    assert.ok(!rungCalls(executor).some(c => c[0] === '/usr/sbin/vgchange' || c[0] === '/usr/bin/mount'))
   })
 
   it('never takes the daemon down when the rung throws', async () => {

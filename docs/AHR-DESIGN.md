@@ -163,7 +163,7 @@ New resource `/v1/ahr` (parallel to `/v1/pools`; md/AHR is a distinct backend pe
 | `DELETE` | `/v1/ahr/:name` | Destroy pool | 202 job / **409 confirm** |
 | `POST` | `/v1/ahr/:name/cache` | **Attach a read cache** (`ahrcache.1`, §13): body `{disks[]}` — one GPT slice per disk, linear `<pool>-cache` LV, `lvconvert --type cache --cachemode writethrough`. Not confirm-gated (a writethrough cache never holds an only copy). Refuses an offline/failed pool, an already-cached pool, a non-composable disk and a duplicated disk; a rotating pick is LEGAL and earns one advisory sentence on the job result | 202 job |
 | `DELETE` | `/v1/ahr/:name/cache` | **Detach the read cache** (§13): `lvconvert --uncache` → `vgreduce` → `pvremove` → `wipefs` → `sgdisk -d`, so the disk reads `available` again (GT-22). Also the operator's RECOVERY verb for a failed cache, and the reclaim verb for a leftover `<pool>-cache<n>` slice a died-and-returned device carries back. Refuses an offline pool with a live cache (uncache needs an active volume) | 202 job |
-| `POST` | `/v1/ahr/:name/cache/event` | **The udev auto-uncache rung** (`ahrcache.1` slice 2, §13): body `{event: 'device-removed', slice?, kernel?}`, posted by `/usr/local/bin/anas-cache-event` when a disk carrying a `<pool>-cache<n>` slice is removed. A REPORT, not a command — the verdict is the daemon's own `dmsetup status` read, so the body can never uncache a healthy pool. Runs `lvconvert --uncache` → guarded `vgreduce --removemissing` → `anas-ahr` notification as a job; the leftover slice is deliberately left alone. Idempotent: a second event on an already-uncached pool answers 200 and runs nothing | 202 job / 200 no-op |
+| `POST` | `/v1/ahr/:name/cache/event` | **The udev auto-uncache rung** (`ahrcache.1` slice 2, §13): body `{event: 'device-removed', slice?, kernel?}`, posted by `/usr/local/bin/anas-cache-event` when a disk carrying a `<pool>-cache<n>` slice is removed. A REPORT, not a command — the verdict is the daemon's own read (`cache.state: failed`, or a cache target still reading healthy with no `<pool>-cache<n>` slice left on any disk), so the body can never uncache a healthy pool. Runs `lvconvert --uncache` → guarded `vgreduce --removemissing` → `anas-ahr` notification as a job; the leftover slice is deliberately left alone. Idempotent: a second event on an already-uncached pool answers 200 and runs nothing | 202 job / 200 no-op |
 | `POST` | `/v1/ahr/:name/remount` | **Remount** (`ahrcache.1` slice 2, §13): `umount` then `mount`, for a filesystem btrfs forced READ-ONLY after an I/O error — `mount -o remount,rw` is refused after an error (GT-20), so this pair is the only recovery. 409 unless `mountedReadOnly`, 409 while the read cache is still `failed` (uncache first), hard 409 while an iSCSI LUN holds the pool, then confirm-gated on the open-handle break. The job VERIFIES the mount came back read-write and fails if it did not | 202 job / **409 confirm** |
 
 **Confirm-gated (Principle 14, the 409 + X-Anas-Confirm-Code flow):** create (wipes disks — lists every disk that will be erased in the warnings), expand/replace (announces reshape duration estimate + the pending-capacity reality), abandon (leaves the pool at reachable-but-not-target layout — states exactly what that layout is), destroy, repair-from-parity (names the snapshot taken, the md knobs turned aside and restored, and what is written), parity-rewrite (names what parity is recomputed from, the fresh scrub that aborts the run, the files it cannot protect, and how long the band will be read), mirror-reconcile (names both arms and their cost, the rows it leaves exactly as they are, that the pool stays online and undegraded throughout, and that md's own repair is neither used nor to be run by hand), and remount (names the open share handles that break, that btrfs refuses `remount,rw` after an error so umount+mount is the only way back, and that a pool read-only again afterwards still has the fault that caused it). The cache verbs are deliberately NOT gated — a writethrough cache holds no only copy, so there is nothing a confirm code could protect. The confirm warnings carry the *concrete* consequence (which disks, how long, how much data at risk), not a generic "are you sure".
@@ -756,3 +756,39 @@ GT-27's caveat is respected rather than assumed away: the test waits for
 `mountedReadOnly` with the write loop driving commits and reports what it
 waited for if the window closes without one.
 
+**Fix batch (review, 2026-09-25).** Five corrections, all about acting only on
+evidence. (1) **A PV is the cache's only on our label.** The pool `cache` block
+used to count every named non-md PV in the VG as cache, so a PV an operator had
+added by hand became a role-`cache` pool disk, and destroy zaps every present
+pool disk. Cache PVs are now classified by the `<pool>-cache<n>` GPT label (the
+rule detach already followed); any other named PV is reported as a pool advisory
+naming it and what each verb does with it, and it stays off the disk list, so
+destroy leaves it alone. `vgremove` still removes the VG, which leaves that PV as
+a physical volume with no volume group. (2) **`inactive` is a cache state.** A
+cached pool LV that is not active (lv_attr field 5 `-`) has no dm table, and
+`dmsetup` answering "Device does not exist" says nothing about the cache: the
+usual cause is a band array that did not assemble. Reading that as `failed` sent
+the boot rung to uncache a partial VG and announce a missing SSD that was
+present. The reader no longer asks dmsetup about an inactive LV and reports
+`state: 'inactive'`; no rung acts on it. An ACTIVE cache target with no legible
+dm answer still reads `failed` (GT-23). (3) **A missing cache device is
+`failed` whatever dm says.** An `[unknown]` PV under the band guard now sets
+`cache.deviceMissing: true` and `state: 'failed'`. This covers the IDLE pull:
+dm-cache enters Fail only after an I/O reaches the dead device, so a removal on
+an idle pool arrives while `dmsetup status` still prints healthy counters, and
+the pool's first read would return EIO. The same fact covers the boot-time dead
+SSD (inactive LV, cache PV `[unknown]`). The udev event route also accepts a
+fresh label sweep that finds no `<pool>-cache<n>` slice on any disk while the
+LV is still a cache target, for the moment before LVM has noticed. GT-19
+measured the removal under a read load only; the idle shape (attach, no I/O,
+pull the SSD, then read) is for the stunt-node evaluation. The boot rung's
+notification says "missing" only when `deviceMissing` is set, and the
+recovery-failed notification says "has failed" otherwise. (4) **A failed slice
+read fails the step.** `findCacheSlices` threw nothing and answered `[]` when
+`lsblk` failed or printed something unparsable, so detach ran `--uncache`,
+skipped every cleanup step and reported success with the cache PV still in the
+VG (free extents a later `lvextend -l +100%FREE` would take). It now throws with
+the exit code and the first stderr line, and detach reads the slices before its
+first mutation, so a failed read changes nothing. An unreadable by-id listing
+fails the read too. (5) Attach cuts the slice label through
+`cachePartitionLabel()`, the one place that spells it.

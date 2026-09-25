@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { MockExecutor } from '../../executor/mock.js'
+import { cachePartitionLabel } from '../ahr-cache-state.js'
 import { attachAhrCache, detachAhrCache, findCacheSlices } from '../ahr-cache.js'
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), '../../fixtures/ahr')
@@ -97,6 +98,10 @@ class CacheWorld extends MockExecutor {
   failCommands: { command: string, stderr: string }[] = []
   /** Serve this exact `pvs` JSON instead of the modelled one. */
   pvsOverride: string | null = null
+  /** Extra `pvs` rows appended to the modelled ones (same capture shape). */
+  extraPvRows: Record<string, string>[] = []
+  /** The node-wide lsblk tree answers exit 0 with output that is not JSON. */
+  lsblkGarbage = false
 
   private ok(stdout = ''): ExecResult {
     return { stdout, stderr: '', exitCode: 0 }
@@ -143,6 +148,7 @@ class CacheWorld extends MockExecutor {
       rows.push({ pv_name: '[unknown]', vg_name: POOL, pv_size: String(CACHE_PV_BYTES), pv_free: '0', dev_size: '0' })
     else if (this.pv)
       rows.push({ pv_name: '/dev/sdd1', vg_name: this.inVg ? POOL : '', pv_size: String(CACHE_PV_BYTES), pv_free: '0', dev_size: String(SLICE_BYTES) })
+    rows.push(...this.extraPvRows)
     return JSON.stringify({ report: [{ pv: rows }] })
   }
 
@@ -169,6 +175,8 @@ class CacheWorld extends MockExecutor {
 
     switch (command) {
       case LSBLK:
+        if (this.lsblkGarbage && !args.includes(CACHE_DEV))
+          return this.ok('lsblk: sdd: failed to get device path\n')
         return this.ok(args.includes(CACHE_DEV) ? this.lsblkDisk() : this.lsblkNode())
       case LS:
         return this.ok(`total 0
@@ -566,5 +574,81 @@ describe('findCacheSlices — the on-disk label sweep', () => {
     const world = new CacheWorld()
     world.slice = true
     assert.deepEqual(await findCacheSlices(world, 'othertank'), [])
+  })
+})
+
+describe('ahrcache.1 review fixes — the executor', () => {
+  /** Every command a detach can MUTATE the node with. */
+  const MUTATIONS = [LVCONVERT, LVREMOVE, VGREDUCE, PVREMOVE, WIPEFS, SGDISK, UDEVADM]
+
+  // ---- Finding 4: a failed slice read fails the step ----------------------
+
+  it('lsblk FAILING during detach fails the job BEFORE any mutation, naming the exit and stderr', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    clearCalls(world)
+    world.failCommands = [{ command: LSBLK, stderr: 'lsblk: cannot open /sys/block\nsecond line' }]
+
+    await assert.rejects(
+      detachAhrCache(world, { pool: pool() }, noop),
+      /lsblk exited 5 \(lsblk: cannot open \/sys\/block\)/,
+    )
+    // The old behaviour: `[]` → uncache ran, every cleanup step was skipped,
+    // the job reported success with nothing released and the cache PV stayed
+    // in the VG as free extents. Now nothing runs at all.
+    for (const cmd of MUTATIONS)
+      assert.deepEqual(callsTo(world, cmd), [], `${cmd} must not run`)
+    assert.equal(world.cached, true, 'the cache is untouched, so a re-run starts clean')
+  })
+
+  it('an unparsable lsblk tree is a failed read too, never "no slices"', async () => {
+    const world = new CacheWorld()
+    world.slice = true
+    world.lsblkGarbage = true
+    await assert.rejects(findCacheSlices(world, POOL), /lsblk printed output that is not JSON/)
+  })
+
+  it('an unreadable /dev/disk/by-id fails the read — without it no slice can be named', async () => {
+    const world = new CacheWorld()
+    world.slice = true
+    world.failCommands = [{ command: LS, stderr: 'ls: cannot access' }]
+    await assert.rejects(findCacheSlices(world, POOL), /ls exited 5 \(ls: cannot access\)/)
+  })
+
+  it('an EMPTY answer stays the answer when lsblk genuinely shows no slice', async () => {
+    const world = new CacheWorld()
+    assert.deepEqual(await findCacheSlices(world, POOL), [])
+  })
+
+  it('attach ROLLBACK over a failed slice read: logged, and the step\'s own error is what is thrown', async () => {
+    const world = new CacheWorld()
+    world.failCommands = [{ command: LSBLK, stderr: 'lsblk: not found' }]
+    const lines: string[] = []
+    await assert.rejects(
+      attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop, { log: l => lines.push(l) }),
+      /is not attached \(no \/dev\/disk\/by-id entry\)/,
+    )
+    assert.ok(
+      lines.some(l => l.includes('step=rollback status=failed') && l.includes('lsblk exited 5')),
+      JSON.stringify(lines),
+    )
+  })
+
+  // ---- Finding 1 (executor side): a foreign PV is not cache flash ---------
+
+  it('attach reports the size of OUR slice only, with a foreign PV in the VG', async () => {
+    const world = new CacheWorld()
+    world.extraPvRows = [{ pv_name: '/dev/sde1', vg_name: POOL, pv_size: '1069547520', pv_free: '1069547520', dev_size: '1073741824' }]
+    const result = await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    assert.equal(result.sizeBytes, CACHE_PV_BYTES)
+  })
+
+  // ---- Finding 5: the slice label comes from the one helper ---------------
+
+  it('attach writes the GPT label the helper defines', async () => {
+    const world = new CacheWorld()
+    await attachAhrCache(world, { pool: pool(), diskIds: [CACHE_DISK] }, noop)
+    const cut = callsTo(world, SGDISK).find(a => a[0] === '-n')!
+    assert.equal(cut[cut.indexOf('-c') + 1], `1:${cachePartitionLabel(POOL, 1)}`)
   })
 })

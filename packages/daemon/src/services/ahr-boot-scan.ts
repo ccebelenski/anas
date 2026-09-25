@@ -60,7 +60,10 @@ import { pveNotify } from './pve-notify.js'
  *      notification) happens here, then `vgchange -ay` and the fstab mount, so
  *      the pool comes up UNCACHED rather than serving errors. It runs after
  *      (a) on purpose: the `--removemissing` guard needs the band arrays
- *      present to tell a dead cache from an unassembled band.
+ *      present to tell a dead cache from an unassembled band. It acts ONLY on
+ *      `cache.state: 'failed'`, which needs evidence the cache is the
+ *      problem; a cached volume that is merely inactive (a band that did not
+ *      assemble, the cache SSD fine) reads `inactive` and is left alone.
  */
 
 const CAT = '/usr/bin/cat'
@@ -217,7 +220,12 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
   //
   // A HEALTHY cached pool is untouched — `cache.state` comes from
   // `dmsetup status`, the one signal that can tell a working cache from a dead
-  // one (`lvs` counters go stale rather than absent, GT-23).
+  // one (`lvs` counters go stale rather than absent, GT-23). So is an
+  // INACTIVE one: a cached volume that could not activate because a BAND
+  // array is down reads `inactive`, and uncaching a partial VG over a healthy
+  // SSD — then announcing the SSD missing — is exactly what this rung must not
+  // do. Only `failed` (a failure word from dm, or the cache PV's device gone
+  // under the band guard) is evidence enough to act on.
   //
   // ONE `lvs` call gates the whole rung: most daemon starts have no cache on
   // the node at all, and the topology read this needs is a dozen commands.
@@ -231,11 +239,14 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
   for (const pool of cacheCandidates) {
     if (pool.cache?.state !== 'failed')
       continue
-    log(`ahr.boot pool=${pool.name} cache=failed action=recover-before-mount`)
+    // "missing" only on the evidence of a missing device; a cache that is
+    // present but failed is described as failed, never as a device that is gone.
+    const cause = pool.cache.deviceMissing === true ? 'missing' as const : 'failed' as const
+    log(`ahr.boot pool=${pool.name} cache=failed cause=${cause} action=recover-before-mount`)
     try {
       const outcome = await recoverFailedAhrCache(
         executor,
-        { pool, reason: 'missing' },
+        { pool, reason: cause },
         message => log(`ahr.boot pool=${pool.name} rung=cache-recover progress=${message}`),
         { log },
       )
@@ -259,7 +270,7 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
       // the udev rung's event job announces the identical failure.
       const message = err instanceof Error ? err.message : String(err)
       log(`ahr.boot pool=${pool.name} rung=cache-recover result=failed detail=${message}`)
-      await notifyCacheRecoveryFailed(executor, pool.name, 'boot', message)
+      await notifyCacheRecoveryFailed(executor, pool.name, 'boot', message, cause)
     }
     // Whatever happened, this pool's record is stale now.
     poolsByName = null

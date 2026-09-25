@@ -2,7 +2,7 @@ import type { AhrCache } from '@anas/shared'
 import type { DmStatusLine } from '../parsers/dmsetup.js'
 import type { LvmLv, LvmPv } from '../parsers/lvm-report.js'
 import { dmCacheHealth } from '../parsers/dmsetup.js'
-import { lvIsCacheTarget } from '../parsers/lvm-report.js'
+import { lvIsActive, lvIsCacheTarget } from '../parsers/lvm-report.js'
 
 /**
  * AHR read cache — naming conventions and the pool's `cache` block (story
@@ -39,6 +39,8 @@ const CACHE_LABEL_TAIL_RE = /^cache(\d+)$/
 
 /** The `-partN` tail of a by-id partition path. */
 const PART_SUFFIX_RE = /-part\d+$/
+/** The same tail, capturing N. */
+const PART_TAIL_RE = /-part(\d+)$/
 
 /**
  * The exact inverse of {@link cachePartitionLabel}: the slice ordinal a GPT
@@ -60,8 +62,9 @@ export function matchCachePartitionLabel(pool: string, label: string): number | 
 /**
  * Whether an lvm PV name is one of the pool's BAND arrays. Every AHR band PV
  * is an md device by construction (`/dev/md127` as lvm canonicalizes it, or
- * the `/dev/md/<pool>-r<N>` pin) — so a PV in the pool VG that is not one is
- * the cache's. That is §13's classification rule, stated as a predicate.
+ * the `/dev/md/<pool>-r<N>` pin). A PV in the pool VG that is NOT one is the
+ * cache's only when it sits on a `<pool>-cache<n>` slice — a named PV with no
+ * such label is someone else's (see {@link buildAhrCacheState}).
  */
 export function isMdPvName(name: string): boolean {
   return name.startsWith('/dev/md')
@@ -74,6 +77,8 @@ export interface CachePartInfo {
   partlabel: string | null
   size: number
   disk: { name: string }
+  /** GPT partition number, when lsblk's name carried one — resolves a by-id PV path. */
+  partNumber?: number | null
 }
 
 /** Everything {@link buildAhrCacheState} needs, all of it already read. */
@@ -91,7 +96,8 @@ export interface CacheStateInput {
   byIdMap: Map<string, string>
   /**
    * The pool LV's `dmsetup status` line, or null when it was not read (the
-   * reader only asks when the LV is a cache target) or could not be parsed.
+   * reader only asks when the LV is an ACTIVE cache target — an inactive LV
+   * has no dm table to ask) or could not be parsed.
    * THE health source: `lvs` counters go stale rather than absent on a dead
    * cache (GT-23), so they are never the verdict.
    */
@@ -106,34 +112,77 @@ export interface CacheFacts {
    * by-id of every disk this pool's cache occupies — PV-derived and
    * label-derived alike, so a half-attached or half-detached slice still
    * attributes its disk to the pool (and still rides destroy's wipe list).
+   * A PV counts only when it sits on one of this pool's `<pool>-cache<n>`
+   * slices: this list is what destroy zaps, and destroy must never reach a
+   * disk ANAS did not label.
    */
   diskIds: string[]
+  /**
+   * Named PVs of the pool VG that are neither a band array nor on one of this
+   * pool's cache slices — a PV an operator added by hand. Not ours: never a
+   * pool disk, never on a wipe list, surfaced as an advisory only.
+   */
+  foreignPvs: string[]
+  /**
+   * The cache PV's device is gone: an `[unknown]` PV under the band guard.
+   * The evidence both automatic rungs act on, and the fact that makes a
+   * recovery's notification say "missing" instead of "failed".
+   */
+  deviceMissing: boolean
 }
 
 /**
  * Build the pool's `cache` block from state the topology reader already holds.
  * PURE — no commands, no clock, no I/O.
  *
- * The verdict comes from `dmsetup status` and nothing else:
- *   `cache Error` ⇒ failed · any other `cache` target ⇒ healthy · else absent.
+ * The verdict, in order:
+ *   - not a cache target                         ⇒ absent
+ *   - the cache PV's device is gone (see below)  ⇒ failed
+ *   - the pool LV is not active                  ⇒ inactive
+ *   - `dmsetup status`: a failure word ⇒ failed · a real status line ⇒ healthy
  * The counters ride only on `healthy`; on a failed cache `lvs` still reports
  * the last numbers it read (GT-23), and presenting those as live is precisely
  * the mis-reading this story exists to fix.
  *
- * ONE asymmetry, and it is deliberate: when the LV IS a cache target but
- * dmsetup gave no legible answer — the command failed, the device is not in
- * the table, the line did not parse — the verdict is `failed`, never `absent`.
- * `absent` claims there is no cache, and the pool then reads healthy while
- * potentially serving EIO to every read: the exact GT-23 failure. An
- * unreadable health signal over a cache target is a cache whose health is not
- * known to be good, which is what `failed` says.
+ * `failed` always rests on evidence that the CACHE is the problem:
+ *  - A MISSING DEVICE outranks dmsetup. On an idle pool dm-cache only enters
+ *    `Fail` once an I/O reaches the dead device, so right after the pull
+ *    `dmsetup status` still prints healthy counters while the pool's first
+ *    read will return EIO. A `[unknown]` PV under the band guard is the cache
+ *    device gone, whatever dm says yet.
+ *  - An INACTIVE volume has no dm table, and "Device does not exist" from
+ *    dmsetup says nothing about the cache: the usual cause is a band array
+ *    that did not assemble, with the cache SSD fine. That reads `inactive`,
+ *    never `failed` — a `failed` here sent the boot rung to uncache a partial
+ *    VG and announce a missing cache device that was sitting right there.
+ *
+ * ONE asymmetry, and it is deliberate: when the LV is an ACTIVE cache target
+ * but dmsetup gave no legible answer — the command failed, the line did not
+ * parse — the verdict is `failed`, never `absent`. `absent` claims there is no
+ * cache, and the pool then reads healthy while potentially serving EIO to
+ * every read: the exact GT-23 failure. An active cache target whose health
+ * cannot be read is a cache whose health is not known to be good.
  */
 export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   const { poolName, lv, pvs, bandCount, partsByKernel, byIdMap, dmStatus } = input
   const isCacheTarget = lv !== undefined && lvIsCacheTarget(lv.attr)
 
   const inVg = pvs.filter(p => p.vgName === poolName)
-  const namedCachePvs = inVg.filter(p => !isMdPvName(p.name) && p.name !== UNKNOWN_PV_NAME)
+  // A named non-md PV is the cache's only when it sits on one of OUR labelled
+  // slices — the rule detach already follows (guest philosophy: we own what we
+  // labelled). Anything else in the VG is an operator's PV: it must never be
+  // reported as a pool disk, because pool.disks is destroy's wipe list.
+  const namedCachePvs: LvmPv[] = []
+  const foreignPvs: string[] = []
+  for (const pv of inVg) {
+    if (isMdPvName(pv.name) || pv.name === UNKNOWN_PV_NAME)
+      continue
+    const label = pvPartition(pv.name, partsByKernel, byIdMap)?.partlabel ?? null
+    if (label !== null && matchCachePartitionLabel(poolName, label) !== null)
+      namedCachePvs.push(pv)
+    else
+      foreignPvs.push(pv.name)
+  }
   // A PV whose device is gone reads `[unknown]`, and a missing BAND PV looks
   // exactly the same. It is counted as the cache's only on evidence: the LV is
   // a cache target AND every band already has its own named md PV, so the
@@ -143,6 +192,8 @@ export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   const unknownPvs = isCacheTarget && bandPvCount >= bandCount
     ? inVg.filter(p => p.name === UNKNOWN_PV_NAME)
     : []
+
+  const deviceMissing = unknownPvs.length > 0
 
   // by-id of each named cache PV's disk. LVM canonicalizes to the kernel path
   // (`/dev/sdd1`), so the slice is looked up in the lsblk index and resolved to
@@ -169,10 +220,18 @@ export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
   }
 
   const diskIds = [...new Set([...fromPvs, ...fromLabels])]
-  // No legible dm answer over a cache-target LV ⇒ `failed`, not `absent`
-  // (see the doc comment): the safe direction is the one that does not report
-  // a pool healthy while its cache may be dead.
-  const state = dmCacheHealth(dmStatus) ?? (isCacheTarget ? 'failed' : 'absent')
+  // See the doc comment for the order. `lvIsActive` null (no attr) reads as
+  // active: an `inactive` verdict is never manufactured from a missing column.
+  const lvActive = lv !== undefined && lvIsActive(lv.attr) !== false
+  let state: AhrCache['state']
+  if (!isCacheTarget)
+    state = 'absent'
+  else if (deviceMissing)
+    state = 'failed'
+  else if (!lvActive)
+    state = 'inactive'
+  else
+    state = dmCacheHealth(dmStatus) ?? 'failed'
   // Size from the PVs: a PV reports its size even when its device is missing,
   // so the figure survives the failure the block exists to report. With no PV
   // at all (a slice cut but not yet adopted) the on-disk slice size stands in.
@@ -195,10 +254,40 @@ export function buildAhrCacheState(input: CacheStateInput): CacheFacts {
       mode: 'writethrough',
       policy: lv?.cachePolicy ?? '',
       state,
+      ...(deviceMissing ? { deviceMissing: true as const } : {}),
       ...counters,
     },
     diskIds,
+    foreignPvs,
+    deviceMissing,
   }
+}
+
+/**
+ * The lsblk record of the partition an lvm PV path names, or null when the PV
+ * is not a partition lsblk can see (a whole disk, a dm device, a device that
+ * is gone). Kernel path first — lvm canonicalizes to it — then the by-id
+ * `<disk>-partN` form, resolved through the by-id map and the part number.
+ */
+function pvPartition(
+  pvName: string,
+  partsByKernel: Map<string, CachePartInfo>,
+  byIdMap: Map<string, string>,
+): CachePartInfo | null {
+  if (pvName.startsWith('/dev/disk/by-id/')) {
+    const tail = pvName.slice('/dev/disk/by-id/'.length)
+    const m = tail.match(PART_TAIL_RE)
+    if (!m)
+      return null
+    const diskId = tail.slice(0, m.index)
+    const partNumber = Number.parseInt(m[1], 10)
+    const kernelDisk = [...byIdMap.entries()].find(([, id]) => id === diskId)?.[0]
+    if (kernelDisk === undefined)
+      return null
+    return [...partsByKernel.values()].find(p => p.disk.name === kernelDisk && p.partNumber === partNumber) ?? null
+  }
+  const kernel = pvName.startsWith('/dev/') ? pvName.slice('/dev/'.length) : pvName
+  return partsByKernel.get(kernel) ?? null
 }
 
 /** by-id of the whole disk an lvm PV path sits on, or null when unresolvable. */
@@ -223,6 +312,22 @@ function pvDiskId(
  */
 export function cacheFailedAdvisory(pool: string): string {
   return `cache device failed on '${pool}'; reads fail until the cache is detached (Detach cache — no data is lost, writethrough holds nothing)`
+}
+
+/**
+ * The pool-level advisory for PVs in the pool VG that ANAS did not put there
+ * (ahrcache.1 review): named, not md, and on no `<pool>-cache<n>` slice. They
+ * are left alone by every verb, which is exactly why the operator is told —
+ * each clause is what a verb will or will not do to them. The expansion clause
+ * is `lvextend -l +100%FREE` with no PV list: it takes free extents wherever
+ * the VG has them.
+ */
+export function foreignVgPvAdvisory(pool: string, pvNames: string[]): string {
+  const one = pvNames.length === 1
+  return `volume group '${pool}' also holds ${pvNames.join(', ')}, which ${one ? 'is' : 'are'} neither a band array nor one of this pool's cache slices. `
+    + `ANAS leaves ${one ? 'it' : 'them'} alone: Detach cache does not remove ${one ? 'it' : 'them'} from the volume group, and Destroy removes the volume group `
+    + `and leaves ${one ? 'it as a physical volume' : 'them as physical volumes'} with no volume group. `
+    + `An expansion grows the pool volume into any free space ${one ? 'it has' : 'they have'}`
 }
 
 /**

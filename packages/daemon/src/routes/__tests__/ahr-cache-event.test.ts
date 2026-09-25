@@ -41,6 +41,18 @@ import { jobRoutes } from '../jobs.js'
  *               `[unknown]` rows → `vgreduce --removemissing` is REFUSED
  *   'readonly'  'failed', plus btrfs already forced read-only by a write that
  *               met the dead cache → the notification says writes are stopped
+ *
+ * And four from the ahrcache.1 review (the IDLE pull — a removal with no I/O
+ * in flight, so dm-cache has not entered Fail when the event arrives):
+ *   'idlepull'  dm still prints HEALTHY counters, `pvs` shows the cache PV
+ *               `[unknown]` → the missing device is the evidence; recovery runs
+ *   'lvmstale'  dm healthy AND `pvs` still names the cache PV, but no disk
+ *               carries a `tank-cache<n>` slice any more → the label sweep is
+ *               the evidence; recovery runs
+ *   'healthy'   dm healthy, the SSD and its slice still there → a spurious or
+ *               replayed event is a 200 no-op
+ *   'sweepfail' 'lvmstale' with the label sweep's lsblk failing → no evidence,
+ *               a 200 (the boot rung re-checks at the next start)
  */
 
 const GIB = 1024 ** 3
@@ -48,6 +60,7 @@ const MIB = 1024 ** 2
 
 const X = 'ata-TANK_X' // band member → sdq
 const Y = 'ata-TANK_Y' // band member → sdr
+const C = 'ata-TANK_C' // the cache SSD → sds (present only in 'healthy')
 
 const DISK_SIZE = 2 * GIB + 8 * MIB
 const BAND_SIZE = 2 * GIB - MIB
@@ -90,12 +103,25 @@ function ok(stdout: string) {
   return { stdout, stderr: '', exitCode: 0 }
 }
 
-type World = 'failed' | 'absent' | 'bandsdown' | 'readonly'
+type World = 'failed' | 'absent' | 'bandsdown' | 'readonly' | 'idlepull' | 'lvmstale' | 'healthy' | 'sweepfail'
 
 /** A dead cache device is GONE — the LV is a cache target, dm says so. */
 function cacheTarget(world: World): boolean {
   return world !== 'absent'
 }
+
+/** The cache SSD and its `tank-cache1` slice are still attached. */
+function cacheDiskPresent(world: World): boolean {
+  return world === 'healthy'
+}
+
+/** `pvs` still NAMES the cache PV (`/dev/sds1`) rather than `[unknown]`. */
+function cachePvNamed(world: World): boolean {
+  return world === 'healthy' || world === 'lvmstale' || world === 'sweepfail'
+}
+
+/** The dm-cache status line of a working cache, in the captured shape. */
+const DM_HEALTHY = '0 4186624 cache 8 24/2048 128 8/8000 152 28 0 0 0 8 0 2 metadata2 writethrough 2 migration_threshold 2048 mq 10 random_threshold 0 sequential_threshold 0 discard_promote_adjustment 0 read_promote_adjustment 0 write_promote_adjustment 0 rw - \n'
 
 /** The pool LV's dm status, verbatim in shape from the live captures. */
 const DM_STATUS: Record<World, string> = {
@@ -106,9 +132,14 @@ const DM_STATUS: Record<World, string> = {
   failed: '0 4186624 cache Fail\n',
   bandsdown: '0 4186624 cache Fail\n',
   readonly: '0 4186624 cache Error\n',
+  // No I/O has reached the dead device yet, so dm-cache has not entered Fail.
+  idlepull: DM_HEALTHY,
+  lvmstale: DM_HEALTHY,
+  healthy: DM_HEALTHY,
+  sweepfail: DM_HEALTHY,
 }
 
-function ahrLsblkJson(): string {
+function ahrLsblkJson(world: World): string {
   const lvmNode = { name: DM_NAME, type: 'lvm', size: LV_SIZE, fstype: 'btrfs', mountpoint: MOUNTPOINT, partlabel: null }
   const member = (kernel: string, id: string, n: number) => ({
     name: kernel,
@@ -131,7 +162,21 @@ function ahrLsblkJson(): string {
   })
   // The cache disk is simply not in the tree — it was removed, which is the
   // whole event. Its `tank-cache1` slice went with it.
-  return JSON.stringify({ blockdevices: [member('sdq', X, 1), member('sdr', Y, 2)] })
+  const disks: unknown[] = [member('sdq', X, 1), member('sdr', Y, 2)]
+  if (cacheDiskPresent(world)) {
+    disks.push({
+      name: 'sds',
+      type: 'disk',
+      size: CACHE_PV_SIZE + 8 * MIB,
+      fstype: null,
+      mountpoint: null,
+      partlabel: null,
+      model: 'SYNTH SSD',
+      serial: C,
+      children: [{ name: 'sds1', type: 'part', size: CACHE_PV_SIZE + 3 * MIB, fstype: 'LVM2_member', mountpoint: null, partlabel: 'tank-cache1' }],
+    })
+  }
+  return JSON.stringify({ blockdevices: disks })
 }
 
 function inventoryLsblkJson(): string {
@@ -162,7 +207,9 @@ function pvsJson(world: World): string {
     rows.push({ pv_name: '/dev/md127', vg_name: 'tank', pv_size: String(LV_SIZE), pv_free: '0', dev_size: String(LV_SIZE + 2 * MIB) })
   else
     rows.push({ pv_name: '[unknown]', vg_name: 'tank', pv_size: String(LV_SIZE), pv_free: '0', dev_size: '0' })
-  if (cacheTarget(world))
+  if (cachePvNamed(world))
+    rows.push({ pv_name: '/dev/sds1', vg_name: 'tank', pv_size: String(CACHE_PV_SIZE), pv_free: '0', dev_size: String(CACHE_PV_SIZE + 3 * MIB) })
+  else if (cacheTarget(world))
     rows.push({ pv_name: '[unknown]', vg_name: 'tank', pv_size: String(CACHE_PV_SIZE), pv_free: '0', dev_size: '0' })
   return JSON.stringify({ report: [{ pv: rows }] })
 }
@@ -175,7 +222,7 @@ function lvsJson(world: World): string {
         lv_name: 'tank-vol',
         vg_name: 'tank',
         // `p` in the last attribute field = partial: a PV of this LV is missing.
-        lv_attr: cached ? 'Cwi-aoC-p-' : '-wi-ao----',
+        lv_attr: cached ? (cachePvNamed(world) ? 'Cwi-aoC---' : 'Cwi-aoC-p-') : '-wi-ao----',
         lv_size: String(LV_SIZE),
         ...(cached
           ? {
@@ -202,22 +249,30 @@ const BTRFS_USAGE = [
   '',
 ].join('\n')
 
-const BY_ID_LISTING = [
-  `lrwxrwxrwx 1 root root 9 Sep 24 20:00 ${X} -> ../../sdq`,
-  `lrwxrwxrwx 1 root root 10 Sep 24 20:00 ${X}-part1 -> ../../sdq1`,
-  `lrwxrwxrwx 1 root root 9 Sep 24 20:00 ${Y} -> ../../sdr`,
-  `lrwxrwxrwx 1 root root 10 Sep 24 20:00 ${Y}-part1 -> ../../sdr1`,
-  '',
-].join('\n')
+function byIdListing(world: World): string {
+  const lines = [
+    `lrwxrwxrwx 1 root root 9 Sep 24 20:00 ${X} -> ../../sdq`,
+    `lrwxrwxrwx 1 root root 10 Sep 24 20:00 ${X}-part1 -> ../../sdq1`,
+    `lrwxrwxrwx 1 root root 9 Sep 24 20:00 ${Y} -> ../../sdr`,
+    `lrwxrwxrwx 1 root root 10 Sep 24 20:00 ${Y}-part1 -> ../../sdr1`,
+  ]
+  if (cacheDiskPresent(world)) {
+    lines.push(`lrwxrwxrwx 1 root root 9 Sep 24 20:00 ${C} -> ../../sds`)
+    lines.push(`lrwxrwxrwx 1 root root 10 Sep 24 20:00 ${C}-part1 -> ../../sds1`)
+  }
+  return `${lines.join('\n')}\n`
+}
 
-function buildExecutor(world: World): MockExecutor {
+function buildExecutor(world: World, opts: { lvconvertFails?: boolean } = {}): MockExecutor {
   const executor = new MockExecutor()
   executor.addFixture({ command: '/usr/bin/cat', args: [...MDSTAT_CAT_ARGS], result: ok(MDSTAT) })
   executor.addFixture({ command: '/usr/sbin/mdadm', args: ['--detail', '--export', '/dev/md127'], result: ok(MD_EXPORT) })
-  executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: ok(ahrLsblkJson()) })
+  executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_LSBLK_ARGS], result: ok(ahrLsblkJson(world)) })
   executor.addFixture({ command: '/usr/bin/lsblk', args: [...LSBLK_ARGS], result: ok(inventoryLsblkJson()) })
-  executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_CACHE_LSBLK_ARGS], result: ok(ahrLsblkJson()) })
-  executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(BY_ID_LISTING) })
+  executor.addFixture({ command: '/usr/bin/lsblk', args: [...AHR_CACHE_LSBLK_ARGS], result: world === 'sweepfail'
+    ? { stdout: '', stderr: 'lsblk: failed to access sysfs directory: /sys/dev/block', exitCode: 32 }
+    : ok(ahrLsblkJson(world)) })
+  executor.addFixture({ command: '/usr/bin/ls', args: ['-la', '/dev/disk/by-id/'], result: ok(byIdListing(world)) })
   executor.addFixture({ command: '/usr/sbin/vgs', args: [...VGS_ARGS], result: ok(JSON.stringify({ report: [{ vg: [{ vg_name: 'tank', pv_count: '2', lv_count: '1', vg_size: String(LV_SIZE), vg_free: '0' }] }] })) })
   executor.addFixture({ command: '/usr/sbin/lvs', args: [...LVS_ARGS], result: ok(lvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/lvs', args: ['--reportformat', 'json', '--units', 'b', '--nosuffix'], result: ok(lvsJson(world)) })
@@ -229,7 +284,9 @@ function buildExecutor(world: World): MockExecutor {
   executor.addFixture({ command: '/usr/bin/btrfs', args: ['filesystem', 'usage', '-b', MOUNTPOINT], result: ok(BTRFS_USAGE) })
   executor.addFixture({ command: '/usr/sbin/zpool', args: ['status', '-jv'], result: { stdout: '', stderr: '', exitCode: 1 } })
   executor.addFixture({ command: '/usr/bin/perl', result: ok('') })
-  executor.addFixture({ command: '/usr/sbin/lvconvert', result: ok('') })
+  executor.addFixture({ command: '/usr/sbin/lvconvert', result: opts.lvconvertFails
+    ? { stdout: '', stderr: '  Failed to uncache tank/tank-vol.', exitCode: 5 }
+    : ok('') })
   executor.addFixture({ command: '/usr/sbin/vgreduce', result: ok('') })
   executor.addFixture({ command: '/usr/sbin/lvremove', result: ok('') })
   executor.addFixture({ command: '/usr/sbin/pvremove', result: ok('') })
@@ -255,8 +312,8 @@ describe('AHR cache removal event (ahrcache.1 slice 2)', () => {
   let jobQueue: JobQueue
   let server: ReturnType<typeof Fastify>
 
-  async function build(world: World) {
-    executor = buildExecutor(world)
+  async function build(world: World, opts: { lvconvertFails?: boolean } = {}) {
+    executor = buildExecutor(world, opts)
     jobQueue = new JobQueue()
     server = Fastify({ logger: false })
     await server.register(jobRoutes, { prefix: '/v1', jobQueue })
@@ -410,7 +467,10 @@ describe('AHR cache removal event (ahrcache.1 slice 2)', () => {
     const [, , severity, title, body] = perlCalls[0]!.args
     assert.equal(severity, 'error')
     assert.equal(title, 'AHR read cache recovery FAILED: tank')
-    assert.match(body, /Pool 'tank' has a read cache whose device is missing/)
+    // NOT "whose device is missing": with a band PV also `[unknown]` nothing
+    // proves which nameless PV is the cache's, so the body says what IS known —
+    // dm reported the cache failed (ahrcache.1 review).
+    assert.match(body, /Pool 'tank' has a read cache that has failed/)
     // The reason, verbatim from the guard that refused the recovery.
     assert.match(body, /a stopped band array is indistinguishable/)
     assert.match(body, /Bring the band arrays up first/)
@@ -500,6 +560,100 @@ describe('AHR cache removal event (ahrcache.1 slice 2)', () => {
     const lastFindmnt = executor.calls.map(c => c.command).lastIndexOf('/usr/bin/findmnt')
     assert.ok(findmntCalls >= 2, 'the mount table is read again for the verdict')
     assert.ok(lastFindmnt > uncacheAt, 'the read-only verdict is taken AFTER the uncache')
+  })
+})
+
+describe('the udev rung — the IDLE pull (ahrcache.1 review)', () => {
+  // dm-cache enters Fail only after an I/O on the cache device fails. A pull
+  // on an idle pool therefore arrives while `dmsetup status` still prints
+  // healthy counters; nothing re-raises the event, and the pool returns EIO
+  // from its first read. GT-19 measured the removal under a running read
+  // load only — the stunt-node evaluation covers this shape live.
+  let dir: string
+  let executor: MockExecutor
+  let jobQueue: JobQueue
+  let server: ReturnType<typeof Fastify>
+
+  async function build(world: World, opts: { lvconvertFails?: boolean } = {}) {
+    executor = buildExecutor(world, opts)
+    jobQueue = new JobQueue()
+    server = Fastify({ logger: false })
+    await server.register(jobRoutes, { prefix: '/v1', jobQueue })
+    await server.register(ahrCacheRoutes, {
+      prefix: '/v1',
+      executor,
+      jobQueue,
+      diskIdentityCache: new DiskIdentityCache(executor),
+      intentDir: dir,
+    })
+    await server.ready()
+  }
+
+  async function postEvent() {
+    return server.inject({ method: 'POST', url: '/v1/ahr/tank/cache/event', headers: IDENTITY_HEADERS, payload: { event: 'device-removed', slice: 'tank-cache1', kernel: 'sds1' } })
+  }
+
+  const lvconverts = () => executor.calls.filter(c => c.command === '/usr/sbin/lvconvert')
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'anas-cache-event-idle-'))
+  })
+  afterEach(async () => {
+    await server?.close()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  it('dm still HEALTHY, cache PV `[unknown]`: the missing device is the evidence — recovery runs', async () => {
+    await build('idlepull')
+    const res = await postEvent()
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.deepEqual(
+      executor.calls.filter(c => c.command === '/usr/sbin/lvconvert' || c.command === '/usr/sbin/vgreduce').map(c => c.args.slice(-2)),
+      [['--uncache', 'tank/tank-vol'], ['--removemissing', 'tank']],
+    )
+  })
+
+  it('dm HEALTHY and LVM still names the PV, but no disk carries the slice: the sweep is the evidence', async () => {
+    await build('lvmstale')
+    const res = await postEvent()
+    assert.equal(res.statusCode, 202, res.body)
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'completed', JSON.stringify(job.error))
+    assert.equal(lvconverts().length, 1)
+    // The sweep is this route's own read — the body only named the slice.
+    assert.ok(executor.calls.some(c => c.command === '/usr/bin/lsblk' && c.args.join(' ') === AHR_CACHE_LSBLK_ARGS.join(' ')))
+  })
+
+  it('a spurious event over a HEALTHY cache whose slice is still there is a 200 no-op', async () => {
+    await build('healthy')
+    const res = await postEvent()
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.json().data.recovered, false)
+    assert.equal(res.json().data.cacheState, 'healthy')
+    assert.equal(lvconverts().length, 0)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0)
+  })
+
+  it('an unreadable label sweep is no evidence: a 200, nothing run', async () => {
+    await build('sweepfail')
+    const res = await postEvent()
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.json().data.recovered, false)
+    assert.equal(lvconverts().length, 0)
+  })
+
+  it('a FAILED recovery after an idle pull names the device as missing — the evidence said so', async () => {
+    await build('idlepull', { lvconvertFails: true })
+    const res = await postEvent()
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'failed')
+    const perl = executor.calls.filter(c => c.command === '/usr/bin/perl')
+    assert.equal(perl.length, 1)
+    assert.equal(perl[0]!.args[2], 'error')
+    assert.match(perl[0]!.args[4], /Pool 'tank' has a read cache whose device is missing/)
+    assert.match(perl[0]!.args[4], /Failed to uncache tank\/tank-vol\./)
   })
 })
 

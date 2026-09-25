@@ -304,8 +304,19 @@ export type AhrExpansionIntent = z.infer<typeof AhrExpansionIntent>
  *
  * `absent` means the pool LV is not a cache target: no cache was ever attached,
  * one was detached, or a failed one was uncached.
+ *
+ * `inactive` means the pool LV IS a cache target but is not active (lv_attr
+ * field 5 is `-`), so device-mapper has no table to ask and the cache's health
+ * cannot be read at all — typically a VG left partial by a band array that did
+ * not assemble, with the cache device perfectly healthy. It is not a verdict on
+ * the cache: `failed` needs evidence the CACHE is the problem (a failure word
+ * from `dmsetup status`, or the cache PV's device gone), and an inactive volume
+ * supplies neither. No recovery acts on it; the pool's own offline advisory
+ * says why the volume is down. (An inactive volume whose cache PV IS missing
+ * reads `failed` — LVM refuses to activate a partial cached LV, which is the
+ * boot-time shape of a dead cache SSD.)
  */
-export const AhrCacheState = z.enum(['healthy', 'failed', 'absent'])
+export const AhrCacheState = z.enum(['healthy', 'failed', 'absent', 'inactive'])
 export type AhrCacheState = z.infer<typeof AhrCacheState>
 
 /**
@@ -347,6 +358,17 @@ export const AhrCache = z.object({
    */
   policy: z.string(),
   state: AhrCacheState,
+  /**
+   * The cache PV's DEVICE is gone: a PV of the pool VG reads `[unknown]` in
+   * `pvs` while every band is accounted for by its own named md PV, so the
+   * nameless one can only be the cache's. Present (`true`) only then; omitted
+   * otherwise. It always comes with `state: 'failed'` — a cache whose device is
+   * gone fails the first read that reaches it, even while `dmsetup status`
+   * still prints healthy counters on an idle pool — and it is what lets a
+   * recovery say "missing" rather than "failed" about a device that is simply
+   * not there.
+   */
+  deviceMissing: z.literal(true).optional(),
   /** Reads served from flash since the cache was attached. Healthy only. */
   hits: z.number().int().nonnegative().optional(),
   /** Reads that missed the cache. Healthy only. */

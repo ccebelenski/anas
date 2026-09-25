@@ -855,6 +855,9 @@
     //             through to the origin — every read returns an I/O error
     //             until the cache is detached), matching the daemon's
     //             advisory sentence exactly.
+    //   inactive → the pool volume is not active, so the cache's health
+    //             cannot be read; a muted line, no verdict (the pool's own
+    //             offline advisory says why the volume is down).
     //   healthy → the ONLINE pill, then the counters — which the schema only
     //             carries on healthy (a stale number presented as live is the
     //             failure GT-23 caught, so the fields are simply absent
@@ -885,6 +888,10 @@
         } else if (c.state === 'failed') {
             stateHtml = '<span style="color:var(--anas-danger);font-weight:700">'
                 + enc(t('cache device failed — every read returns an I/O error until the cache is detached (Detach cache)'))
+                + '</span>';
+        } else if (c.state === 'inactive') {
+            stateHtml = '<span style="color:var(--anas-muted)">'
+                + enc(t('health unknown — the pool volume is not active, so the cache cannot be read'))
                 + '</span>';
         } else {
             stateHtml = renderPoolState('healthy');

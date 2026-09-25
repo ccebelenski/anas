@@ -37,8 +37,12 @@ import { jobRoutes } from '../jobs.js'
  *   'leftover'   a slice, no cache   → the died-and-returned device (§13): BOTH
  *                                      verbs accept it — attach reuses the slice,
  *                                      detach deletes it and hands the disk back
- *   'offline'    cache, inactive LV  → both refuse; uncache needs a live volume
+ *   'offline'    cache, inactive LV  → both refuse; uncache needs a live volume;
+ *                                      the cache reads `inactive`, never `failed`
  *   'poolfailed' no LV at all        → attach refuses, nothing to cache
+ *   'unreadable' cache, ACTIVE LV, dmsetup fails → `failed` (GT-23 asymmetry)
+ *   'foreignpv'  'healthy' + a PV the operator added to the VG by hand on
+ *                `U`'s partition → not a pool disk, an advisory
  */
 
 const GIB = 1024 ** 3
@@ -90,15 +94,15 @@ function ok(stdout: string) {
   return { stdout, stderr: '', exitCode: 0 }
 }
 
-type World = 'none' | 'healthy' | 'failed' | 'leftover' | 'offline' | 'poolfailed'
+type World = 'none' | 'healthy' | 'failed' | 'leftover' | 'offline' | 'poolfailed' | 'unreadable' | 'foreignpv'
 
 /** The pool LV is a dm-cache TARGET in this world. */
 function cacheTarget(world: World): boolean {
-  return world === 'healthy' || world === 'failed' || world === 'offline'
+  return world === 'healthy' || world === 'failed' || world === 'offline' || world === 'unreadable' || world === 'foreignpv'
 }
 /** A `tank-cache1` GPT slice sits on the cache disk. */
 function sliceOnDisk(world: World): boolean {
-  return world === 'healthy' || world === 'leftover' || world === 'offline'
+  return world === 'healthy' || world === 'leftover' || world === 'offline' || world === 'unreadable' || world === 'foreignpv'
 }
 /** The cache disk is attached at all (a FAILED device is simply gone). */
 function cacheDiskPresent(world: World): boolean {
@@ -112,11 +116,13 @@ const DM_STATUS: Record<World, string> = {
   poolfailed: '',
   healthy: '0 4186624 cache 8 24/2048 128 8/8000 152 28 0 0 0 8 0 2 metadata2 writethrough 2 migration_threshold 2048 mq 10 random_threshold 0 sequential_threshold 0 discard_promote_adjustment 0 read_promote_adjustment 0 write_promote_adjustment 0 rw - \n',
   failed: '0 4186624 cache Fail\n',
-  // An INACTIVE LV is not in the device-mapper table at all: dmsetup exits
-  // non-zero with prose, and the reader gets no line to judge. Over a
-  // cache-target LV that reads `failed`, never `absent` — an unreadable health
-  // signal must not present as "there is no cache" (GT-23's failure shape).
+  // An INACTIVE LV is not in the device-mapper table at all: dmsetup would
+  // exit non-zero with prose — so the reader does not ask (ahrcache.1 review).
   offline: 'Device does not exist.\n',
+  // An ACTIVE cache target whose dm answer cannot be read: reads `failed`,
+  // never `absent` (GT-23's failure shape).
+  unreadable: 'Device does not exist.\n',
+  foreignpv: '0 4186624 cache 8 24/2048 128 8/8000 152 28 0 0 0 8 0 2 metadata2 writethrough 2 migration_threshold 2048 mq 10 random_threshold 0 sequential_threshold 0 discard_promote_adjustment 0 read_promote_adjustment 0 write_promote_adjustment 0 rw - \n',
 }
 
 /** The AHR stack lsblk tree: two band members, plus the cache slice when cached. */
@@ -159,6 +165,9 @@ function ahrLsblkJson(world: World): string {
   const disks: unknown[] = [member('sdq', X, 1), member('sdr', Y, 2), spinner]
   if (cacheDiskPresent(world))
     disks.splice(2, 0, cacheDisk)
+  // The operator's hand-added PV: a partition with no GPT name at all.
+  if (world === 'foreignpv')
+    disks.push({ name: 'sdu', type: 'disk', size: CACHE_DISK_SIZE, fstype: null, mountpoint: null, partlabel: null, model: 'FOREIGN DISK', serial: U, children: [{ name: 'sdu1', type: 'part', size: CACHE_DISK_SIZE - MIB, fstype: 'LVM2_member', mountpoint: null, partlabel: null }] })
   return JSON.stringify({ blockdevices: disks })
 }
 
@@ -197,8 +206,10 @@ function pvsJson(world: World): string {
   const rows: Record<string, string>[] = [
     { pv_name: '/dev/md127', vg_name: 'tank', pv_size: String(LV_SIZE), pv_free: '0', dev_size: String(LV_SIZE + 2 * MIB) },
   ]
-  if (world === 'healthy' || world === 'offline')
+  if (world === 'healthy' || world === 'offline' || world === 'unreadable' || world === 'foreignpv')
     rows.push({ pv_name: '/dev/sds1', vg_name: 'tank', pv_size: String(CACHE_PV_SIZE), pv_free: '0', dev_size: String(CACHE_SLICE_SIZE) })
+  if (world === 'foreignpv')
+    rows.push({ pv_name: '/dev/sdu1', vg_name: 'tank', pv_size: String(CACHE_DISK_SIZE - 4 * MIB), pv_free: String(CACHE_DISK_SIZE - 4 * MIB), dev_size: String(CACHE_DISK_SIZE - MIB) })
   if (world === 'failed')
     rows.push({ pv_name: '[unknown]', vg_name: 'tank', pv_size: String(CACHE_PV_SIZE), pv_free: '0', dev_size: '0' })
   return JSON.stringify({ report: [{ pv: rows }] })
@@ -291,7 +302,7 @@ function buildExecutor(world: World): MockExecutor {
   executor.addFixture({ command: '/usr/sbin/lvs', args: ['--reportformat', 'json', '--units', 'b', '--nosuffix'], result: ok(lvsJson(world)) })
   executor.addFixture({ command: '/usr/sbin/pvs', args: [...PVS_ARGS], result: ok(pvsJson(world)) })
   // An inactive LV is not in the dm table: dmsetup exits NON-ZERO with prose.
-  executor.addFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs('tank-tank--vol'), result: world === 'offline'
+  executor.addFixture({ command: '/usr/sbin/dmsetup', args: dmsetupStatusArgs('tank-tank--vol'), result: world === 'offline' || world === 'unreadable'
     ? { stdout: '', stderr: DM_STATUS[world], exitCode: 1 }
     : ok(DM_STATUS[world]) })
   executor.addFixture({ command: '/usr/bin/findmnt', args: [...AHR_FINDMNT_ARGS], result: ok(JSON.stringify({ filesystems: [{ target: '/mnt/anas-ahr/tank', source: '/dev/mapper/tank-tank--vol', fstype: 'btrfs', options: 'rw,relatime' }] })) })
@@ -435,15 +446,44 @@ describe('AHR read-cache routes (story ahrcache.1)', () => {
       assert.equal(pool.disks.find(d => d.id === C)?.role, 'cache')
     })
 
-    it('cache target with NO legible dm answer reads FAILED, never absent', async () => {
-      // The pool is offline, so its LV is not in the dm table and `dmsetup`
-      // exits non-zero. `absent` would claim there is no cache at all — the
-      // GT-23 mis-reading in a different coat.
-      await build('offline')
+    it('an ACTIVE cache target with NO legible dm answer reads FAILED, never absent', async () => {
+      // `absent` would claim there is no cache at all — the GT-23 mis-reading
+      // in a different coat.
+      await build('unreadable')
       const pool = (await readAhrPools(executor)).find(p => p.name === 'tank')!
       assert.equal(pool.cache?.state, 'failed')
       assert.equal(pool.cache?.hits, undefined, 'and no counter rides an unverified cache')
-      assert.equal(pool.state, 'offline', 'total unavailability outranks the cache verdict')
+      assert.equal(pool.state, 'degraded')
+    })
+
+    it('an INACTIVE cache target reads `inactive` — no dm question, no `failed` verdict (review)', async () => {
+      // The volume is not active, so it has no dm table; "Device does not
+      // exist" would say nothing about the cache, which here is healthy and
+      // present. Reading it `failed` sent the boot rung to uncache a partial VG.
+      await build('offline')
+      const pool = (await readAhrPools(executor)).find(p => p.name === 'tank')!
+      assert.equal(pool.cache?.state, 'inactive')
+      assert.equal(pool.cache?.deviceMissing, undefined)
+      assert.equal(pool.cache?.hits, undefined, 'and no counter rides an unread cache')
+      assert.deepEqual(pool.cache?.devices, [C])
+      assert.equal(pool.state, 'offline')
+      assert.ok(!pool.advisories.some(a => a.includes('cache device failed')), JSON.stringify(pool.advisories))
+      assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/dmsetup').length, 0)
+    })
+
+    it('a FOREIGN PV in the pool VG is not a pool disk (so not on destroy\'s wipe list) and is advised', async () => {
+      await build('foreignpv')
+      const pool = (await readAhrPools(executor)).find(p => p.name === 'tank')!
+      assert.equal(pool.cache?.state, 'healthy')
+      // pool.disks is what destroyAhrPool zaps (`sgdisk --zap-all` per present
+      // disk). The operator's disk must not be on it.
+      assert.deepEqual(pool.disks.map(d => d.id).sort(), [C, X, Y].sort())
+      assert.deepEqual(pool.cache?.devices, [C])
+      assert.equal(pool.cache?.sizeBytes, CACHE_PV_SIZE, 'the foreign PV is not counted as cache flash')
+      assert.ok(
+        pool.advisories.some(a => a.includes('/dev/sdu1') && a.includes('neither a band array nor one of this pool\'s cache slices')),
+        JSON.stringify(pool.advisories),
+      )
     })
   })
 
@@ -669,6 +709,16 @@ describe('AHR read-cache routes (story ahrcache.1)', () => {
       assert.ok(cacheWarning, `no cache warning in ${JSON.stringify(warnings)}`)
       assert.ok(cacheWarning!.includes(C), 'names the cache disk, untruncated')
       assert.ok(cacheWarning!.includes('available'), 'and says the disk comes back')
+    })
+
+    it('the destroy confirm never names a foreign PV\'s disk as a cache disk', async () => {
+      await build('foreignpv')
+      const res = await server.inject({ method: 'DELETE', url: '/v1/ahr/tank', headers: IDENTITY_HEADERS })
+      assert.equal(res.statusCode, 409)
+      const warnings = res.json().error.warnings as string[]
+      const cacheWarning = warnings.find(w => w.includes('read cache'))!
+      assert.ok(cacheWarning.includes(C))
+      assert.ok(!cacheWarning.includes(U), cacheWarning)
     })
 
     it('an UNCACHED pool says nothing about a cache', async () => {

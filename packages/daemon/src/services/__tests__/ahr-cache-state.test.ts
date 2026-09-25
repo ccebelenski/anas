@@ -10,8 +10,10 @@ import {
   buildAhrCacheState,
   cacheLvName,
   cachePartitionLabel,
+  foreignVgPvAdvisory,
   isMdPvName,
   matchCachePartitionLabel,
+  poolOfCacheLabel,
   rotatingCacheAdvisory,
 } from '../ahr-cache-state.js'
 
@@ -26,15 +28,41 @@ const CACHE_DISK = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9'
 const BAND_DISK = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT7'
 
 /** The live shape: sdb1 = the band member slice, sdd1 = the cache slice. */
-function partsByKernel(opts?: { cacheSlice?: boolean }): Map<string, CachePartInfo> {
+function partsByKernel(opts?: { cacheSlice?: boolean, foreign?: string | null }): Map<string, CachePartInfo> {
   const parts = new Map<string, CachePartInfo>()
-  parts.set('sdb1', { partlabel: 'gtcache-d1-b1', size: 1072676352, disk: { name: 'sdb' } })
+  parts.set('sdb1', { partlabel: 'gtcache-d1-b1', size: 1072676352, disk: { name: 'sdb' }, partNumber: 1 })
   if (opts?.cacheSlice !== false)
-    parts.set('sdd1', { partlabel: 'gtcache-cache1', size: 535805440, disk: { name: 'sdd' } })
+    parts.set('sdd1', { partlabel: 'gtcache-cache1', size: 535805440, disk: { name: 'sdd' }, partNumber: 1 })
+  // An operator's own partition on a third disk, carrying whatever label (or
+  // none) they gave it — never one of ours.
+  if (opts?.foreign !== undefined)
+    parts.set('sde1', { partlabel: opts.foreign, size: 1073741824, disk: { name: 'sde' }, partNumber: 1 })
   return parts
 }
 
-const BY_ID = new Map<string, string>([['sdb', BAND_DISK], ['sdd', CACHE_DISK]])
+const FOREIGN_DISK = 'scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT8'
+const BY_ID = new Map<string, string>([['sdb', BAND_DISK], ['sdd', CACHE_DISK], ['sde', FOREIGN_DISK]])
+
+/** The captured cached-pool `pvs` (lvm-pvs-cached.json) plus extra rows in the same shape. */
+function pvsWith(fixture: string, extra: Record<string, string>[]) {
+  const doc = JSON.parse(loadFixture(fixture)) as { report: { pv: Record<string, string>[] }[] }
+  doc.report[0].pv.push(...extra)
+  return parsePvsReport(JSON.stringify(doc))
+}
+
+/** A PV row an operator added to the pool VG by hand. */
+const FOREIGN_PV_ROW = { pv_name: '/dev/sde1', vg_name: POOL, pv_fmt: 'lvm2', pv_attr: 'a--', pv_size: '1069547520', pv_free: '1069547520', dev_size: '1073741824' }
+
+/**
+ * The captured live cached LV with its activation field (lv_attr position 5)
+ * set to `-`: the same row as lvm prints it for a cached volume that is not
+ * active (`Cwi---C---`), which is what a VG left partial by a band array that
+ * did not assemble looks like.
+ */
+function inactive(fixture: string) {
+  const lv = parseLvsReport(loadFixture(fixture))[0]
+  return { ...lv, attr: `${lv.attr.slice(0, 4)}-${lv.attr.slice(5)}` }
+}
 
 describe('dmsetup status — the cache health signal (ahrcache.1, GT-19/GT-23)', () => {
   it('parses the single-device form, which does NOT repeat the name', () => {
@@ -220,5 +248,186 @@ describe('buildAhrCacheState — the pool `cache` block (ahrcache.1, §13)', () 
   it('the rotating advisory states the fact once, singular and plural', () => {
     assert.equal(rotatingCacheAdvisory(['a']), 'a is a rotating disk: a rotating cache adds a seek, not speed')
     assert.equal(rotatingCacheAdvisory(['a', 'b']), 'a, b are rotating disks: a rotating cache adds a seek, not speed')
+  })
+})
+
+describe('buildAhrCacheState — ahrcache.1 review fixes', () => {
+  // ---- Finding 1: a PV is the cache's only on OUR label -------------------
+
+  it('a named PV with NO cache label is foreign: not a pool disk, not in the size, reported', () => {
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: parseLvsReport(loadFixture('lvs-cached-live.json'))[0],
+      pvs: pvsWith('lvm-pvs-cached.json', [FOREIGN_PV_ROW]),
+      bandCount: 1,
+      partsByKernel: partsByKernel({ foreign: null }),
+      byIdMap: BY_ID,
+      dmStatus: parseDmsetupStatus(loadFixture('dmsetup-status-cache-healthy.txt')),
+    })
+    assert.equal(facts.cache.state, 'healthy')
+    // diskIds is what the topology turns into role-'cache' pool disks — the
+    // list destroy zaps. The operator's disk must never be on it.
+    assert.deepEqual(facts.diskIds, [CACHE_DISK])
+    assert.deepEqual(facts.cache.devices, [CACHE_DISK])
+    assert.equal(facts.cache.sizeBytes, 532676608, 'the cache size counts our slice only')
+    assert.deepEqual(facts.foreignPvs, ['/dev/sde1'])
+  })
+
+  it('another pool\'s cache label, or a band label, is foreign too', () => {
+    for (const label of ['other-cache1', 'gtcache-d2-b1', 'gtcache-cachex']) {
+      const facts = buildAhrCacheState({
+        poolName: POOL,
+        lv: parseLvsReport(loadFixture('lvs-cached-live.json'))[0],
+        pvs: pvsWith('lvm-pvs-cached.json', [FOREIGN_PV_ROW]),
+        bandCount: 1,
+        partsByKernel: partsByKernel({ foreign: label }),
+        byIdMap: BY_ID,
+        dmStatus: parseDmsetupStatus(loadFixture('dmsetup-status-cache-healthy.txt')),
+      })
+      assert.deepEqual(facts.foreignPvs, ['/dev/sde1'], label)
+      assert.ok(!facts.diskIds.includes(FOREIGN_DISK), label)
+    }
+  })
+
+  it('a named PV lsblk cannot see at all is not claimed either', () => {
+    // No partition record → no label → not provably ours.
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: parseLvsReport(loadFixture('lvs-cached-live.json'))[0],
+      pvs: pvsWith('lvm-pvs-cached.json', [FOREIGN_PV_ROW]),
+      bandCount: 1,
+      partsByKernel: partsByKernel(),
+      byIdMap: BY_ID,
+      dmStatus: parseDmsetupStatus(loadFixture('dmsetup-status-cache-healthy.txt')),
+    })
+    assert.deepEqual(facts.foreignPvs, ['/dev/sde1'])
+    assert.deepEqual(facts.diskIds, [CACHE_DISK])
+  })
+
+  it('a cache PV named by its by-id path resolves through the label to OUR slice', () => {
+    const doc = JSON.parse(loadFixture('lvm-pvs-cached.json')) as { report: { pv: Record<string, string>[] }[] }
+    doc.report[0].pv[1].pv_name = `/dev/disk/by-id/${CACHE_DISK}-part1`
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: parseLvsReport(loadFixture('lvs-cached-live.json'))[0],
+      pvs: parsePvsReport(JSON.stringify(doc)),
+      bandCount: 1,
+      partsByKernel: partsByKernel(),
+      byIdMap: BY_ID,
+      dmStatus: parseDmsetupStatus(loadFixture('dmsetup-status-cache-healthy.txt')),
+    })
+    assert.deepEqual(facts.foreignPvs, [])
+    assert.deepEqual(facts.diskIds, [CACHE_DISK])
+    assert.equal(facts.cache.sizeBytes, 532676608)
+  })
+
+  it('the foreign-PV advisory names the PV and says what each verb does with it', () => {
+    const one = foreignVgPvAdvisory('tank', ['/dev/sde1'])
+    assert.match(one, /volume group 'tank' also holds \/dev\/sde1, which is neither a band array nor one of this pool's cache slices/)
+    assert.match(one, /Detach cache does not remove it/)
+    assert.match(one, /Destroy removes the volume group and leaves it as a physical volume with no volume group/)
+    assert.match(one, /expansion grows the pool volume into any free space it has/)
+    assert.match(foreignVgPvAdvisory('tank', ['/dev/sde1', '/dev/sdf1']), /\/dev\/sde1, \/dev\/sdf1, which are neither/)
+  })
+
+  // ---- Finding 2: `failed` needs evidence the CACHE is the problem --------
+
+  it('an INACTIVE cached LV with its cache PV present reads `inactive`, never `failed`', () => {
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: inactive('lvs-cached-live.json'),
+      pvs: parsePvsReport(loadFixture('lvm-pvs-cached.json')),
+      bandCount: 1,
+      partsByKernel: partsByKernel(),
+      byIdMap: BY_ID,
+      // The reader does not ask dmsetup for an inactive volume.
+      dmStatus: null,
+    })
+    assert.equal(facts.cache.state, 'inactive')
+    assert.equal(facts.deviceMissing, false)
+    assert.equal(facts.cache.deviceMissing, undefined)
+    assert.equal(facts.cache.hits, undefined, 'no counter rides a cache whose health is unread')
+    assert.deepEqual(facts.cache.devices, [CACHE_DISK])
+  })
+
+  it('an inactive cached LV over a MISSING BAND (band guard fails) is `inactive` too', () => {
+    // The finding's own shape: the VG is partial because a band did not
+    // assemble; the cache SSD is fine. Two `[unknown]`-capable slots and only
+    // the cache named — the nameless PV is the band's.
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: inactive('lvs-cached-live.json'),
+      pvs: pvsWith('lvm-pvs-cached.json', [{ pv_name: '[unknown]', vg_name: POOL, pv_fmt: 'lvm2', pv_attr: 'a-m', pv_size: '1065353216', pv_free: '0', dev_size: '0' }]),
+      bandCount: 2,
+      partsByKernel: partsByKernel(),
+      byIdMap: BY_ID,
+      dmStatus: null,
+    })
+    assert.equal(facts.cache.state, 'inactive')
+    assert.equal(facts.deviceMissing, false)
+  })
+
+  it('an inactive cached LV whose cache PV IS missing reads `failed` (the boot-time dead SSD)', () => {
+    // LVM refuses to activate a partial cached LV, so a node that boots with
+    // the cache SSD dead has exactly this: inactive volume, band PV present,
+    // cache PV `[unknown]`. That is evidence, and the boot rung must act on it.
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: inactive('lvs-cache-missing.json'),
+      pvs: parsePvsReport(loadFixture('lvm-pvs-cache-missing.json')),
+      bandCount: 1,
+      partsByKernel: partsByKernel({ cacheSlice: false }),
+      byIdMap: BY_ID,
+      dmStatus: null,
+    })
+    assert.equal(facts.cache.state, 'failed')
+    assert.equal(facts.deviceMissing, true)
+    assert.equal(facts.cache.deviceMissing, true)
+  })
+
+  it('an ACTIVE cache target with no legible dm answer still reads `failed` (GT-23 asymmetry)', () => {
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: parseLvsReport(loadFixture('lvs-cached-live.json'))[0],
+      pvs: parsePvsReport(loadFixture('lvm-pvs-cached.json')),
+      bandCount: 1,
+      partsByKernel: partsByKernel(),
+      byIdMap: BY_ID,
+      dmStatus: parseDmsetupStatus('Device does not exist.'),
+    })
+    assert.equal(facts.cache.state, 'failed')
+    assert.equal(facts.deviceMissing, false, 'failed, but nothing says the device is gone')
+  })
+
+  // ---- Finding 3: the idle pull ------------------------------------------
+
+  it('IDLE PULL: dm still prints healthy counters, but the cache PV is `[unknown]` → failed', () => {
+    // dm-cache enters Fail only once an I/O reaches the dead device. On an
+    // idle pool the status line stays healthy after the pull; the missing PV
+    // is the evidence, and the first read would return EIO.
+    const facts = buildAhrCacheState({
+      poolName: POOL,
+      lv: parseLvsReport(loadFixture('lvs-cache-missing.json'))[0],
+      pvs: parsePvsReport(loadFixture('lvm-pvs-cache-missing.json')),
+      bandCount: 1,
+      partsByKernel: partsByKernel({ cacheSlice: false }),
+      byIdMap: BY_ID,
+      dmStatus: parseDmsetupStatus(loadFixture('dmsetup-status-cache-healthy.txt')),
+    })
+    assert.equal(facts.cache.state, 'failed')
+    assert.equal(facts.cache.deviceMissing, true)
+    assert.equal(facts.cache.hits, undefined, 'the healthy-looking counters are not presented')
+  })
+
+  // ---- Finding 5: one home for the label ----------------------------------
+
+  it('the label helper round-trips through BOTH inverses, even for a pool named like a cache', () => {
+    for (const pool of ['tank', 'my-cache', 'x-cache9']) {
+      for (const n of [1, 9, 12]) {
+        const label = cachePartitionLabel(pool, n)
+        assert.equal(matchCachePartitionLabel(pool, label), n, label)
+        assert.equal(poolOfCacheLabel(label), pool, label)
+      }
+    }
   })
 })

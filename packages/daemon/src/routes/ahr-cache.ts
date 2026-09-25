@@ -4,7 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrCacheEventRequest, AttachAhrCacheRequest, isComposableDisk, PoolName } from '@anas/shared'
-import { attachAhrCache, detachAhrCache, notifyCacheRecoveryFailed, recoverFailedAhrCache } from '../services/ahr-cache.js'
+import { attachAhrCache, detachAhrCache, findCacheSlices, notifyCacheRecoveryFailed, recoverFailedAhrCache } from '../services/ahr-cache.js'
 import { readIntent } from '../services/ahr-intent.js'
 import { fmtBytes } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -278,12 +278,12 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
    * job's audit record names the rung that raised it rather than a person.
    *
    * THE BODY IS A REPORT, NOT A COMMAND. Nothing in it can make the daemon
-   * uncache a healthy pool: the verdict comes from this node's own
-   * `dmsetup status` read (`cache.state`), the one honest health signal there
-   * is — `lvs` counters go stale rather than absent on a dead cache (GT-23).
-   * The body only supplies the slice LABEL, which is used to NAME the device in
-   * the notification once the disk is gone and its by-id can no longer be
-   * resolved.
+   * uncache a healthy pool: the verdict comes from this node's own reads — the
+   * pool's `cache.state` (dm-cache's own failure word, or the cache PV's device
+   * gone under the band guard) and a fresh label sweep that finds no
+   * `<pool>-cache<n>` slice left on any disk. The body only supplies the slice
+   * LABEL, which is used to NAME the device in the notification once the disk
+   * is gone and its by-id can no longer be resolved.
    *
    * IDEMPOTENT by construction: a second event on an already-uncached pool
    * finds `cache.state: 'absent'`, answers 200 with `recovered: false`, and
@@ -319,12 +319,50 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     if (refuseCacheJobInFlight(pool.name, reply))
       return
 
-    // The verdict, from this node's own read. `failed` covers both shapes the
-    // rung must catch: a dm-cache target reporting a failure word, and a cache
-    // target whose `dmsetup status` cannot be read at all (the deliberate
-    // asymmetry in `buildAhrCacheState` — an unreadable health signal is not
-    // "there is no cache").
-    if (pool.cache?.state !== 'failed') {
+    // The verdict, from this node's own reads. Recovery needs evidence that the
+    // cache is broken or its device gone, and there are two kinds:
+    //
+    //  1. `cache.state: 'failed'` — dm-cache reporting a failure word, an ACTIVE
+    //     cache target whose `dmsetup status` cannot be read (the GT-23
+    //     asymmetry in `buildAhrCacheState`), or the cache PV's device gone: an
+    //     `[unknown]` PV in the VG while every band has its own named md PV.
+    //  2. A cache target that still reads `healthy`, and NO disk left carrying
+    //     one of the pool's `<pool>-cache<n>` slices (a fresh lsblk sweep).
+    //
+    // Why the second exists, and why `healthy` alone is not the answer: dm-cache
+    // enters Fail only after an I/O on the cache device fails. A removal on an
+    // IDLE pool therefore arrives while `dmsetup status` still prints healthy
+    // counters; nothing raises the event again, and the pool returns EIO from
+    // its first read. The event is itself the fact that a device went away, so
+    // the verdict accepts "the slice's disk is gone" as evidence. When LVM has
+    // already noticed, (1) catches it through the `[unknown]` PV; the sweep
+    // covers the moment in which it has not.
+    //
+    // THE IDLE-PULL SHAPE IS NOT IN GT-19, which measured the removal under a
+    // running read load (dm had already failed when the event arrived). The
+    // stunt-node evaluation must cover it: attach a cache, run NO I/O, detach
+    // the SSD, then issue the first read — the event must have uncached the
+    // pool before that read, and the read must succeed.
+    //
+    // `inactive` is deliberately not in either kind: an inactive cached volume
+    // is usually a band that did not assemble, and uncaching a partial VG is
+    // not this rung's call (the boot rung and the operator own that shape).
+    let recover = pool.cache?.state === 'failed'
+    let cause: 'missing' | 'failed' = pool.cache?.deviceMissing === true ? 'missing' : 'failed'
+    if (!recover && pool.cache?.state === 'healthy') {
+      try {
+        if ((await findCacheSlices(executor, pool.name)).length === 0) {
+          recover = true
+          cause = 'missing'
+        }
+      }
+      catch (err) {
+        // An unreadable sweep is no evidence either way: log it and answer on
+        // what the pool read said. The boot rung re-checks at the next start.
+        request.log.warn({ pool: pool.name, err: err instanceof Error ? err.message : String(err) }, 'ahr.cache event: label sweep unreadable')
+      }
+    }
+    if (!recover) {
       reply.code(200)
       return { data: {
         pool: pool.name,
@@ -353,7 +391,7 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
           // a keyboard, so the failure is announced exactly as the boot rung
           // announces its own (parallel construction), and the job still fails
           // on the original error.
-          await notifyCacheRecoveryFailed(executor, pool.name, 'udev', err instanceof Error ? err.message : String(err))
+          await notifyCacheRecoveryFailed(executor, pool.name, 'udev', err instanceof Error ? err.message : String(err), cause)
           throw err
         }
       },

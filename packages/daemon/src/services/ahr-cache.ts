@@ -5,6 +5,7 @@ import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { lvIsCacheTarget, parseLvsReport, parsePvsReport, PVS_ARGS } from '../parsers/lvm-report.js'
 import {
   cacheLvName,
+  cachePartitionLabel,
   cacheRecoveryNotification,
   isMdPvName,
   matchCachePartitionLabel,
@@ -100,27 +101,55 @@ export interface CacheSlice {
   ordinal: number
 }
 
+/** The first line of a command's stderr, for an error message. */
+function stderrHead(stderr: string): string {
+  return stderr.trim().split('\n')[0]?.trim() ?? ''
+}
+
 /**
  * Every `<pool>-cache<n>` slice the host can currently see, ordinal ascending.
  * Read by LABEL rather than from LVM, because detach must still find a slice
  * after `pvremove` and `wipefs` have erased every trace LVM knew about — which
  * is exactly the state GT-22 caught leaving the disk permanently unusable.
+ *
+ * THROWS when the read itself fails — `lsblk` exits non-zero or prints
+ * something that is not JSON, or the by-id listing cannot be read (every slice
+ * is addressed by its by-id path, so without the listing no slice can be
+ * named). An empty list is the answer ONLY when the host genuinely shows no
+ * slice. The distinction matters because detach drives vgreduce, pvremove,
+ * wipefs and sgdisk from this list: a failed read that answered `[]` made the
+ * detach skip every cleanup step after `--uncache` and report success with
+ * nothing released, leaving the cache PV in the VG as free extents a later
+ * expansion would grow the pool onto.
  */
 export async function findCacheSlices(executor: CommandExecutor, pool: string): Promise<CacheSlice[]> {
   const [lsblkRes, byIdRes] = await Promise.all([
     executor.exec(LSBLK, AHR_CACHE_LSBLK_ARGS),
     executor.exec(LS, ['-la', '/dev/disk/by-id/']),
   ])
-  if (lsblkRes.exitCode !== 0)
-    return []
-  const byIdMap = byIdRes.exitCode === 0 ? parseDiskByIdListing(byIdRes.stdout) : new Map<string, string>()
+  if (lsblkRes.exitCode !== 0) {
+    throw new Error(
+      `could not read the block-device tree to find the cache slices of '${pool}': lsblk exited ${lsblkRes.exitCode}`
+      + `${stderrHead(lsblkRes.stderr) ? ` (${stderrHead(lsblkRes.stderr)})` : ''}`,
+    )
+  }
+  if (byIdRes.exitCode !== 0) {
+    throw new Error(
+      `could not read /dev/disk/by-id to name the cache slices of '${pool}': ls exited ${byIdRes.exitCode}`
+      + `${stderrHead(byIdRes.stderr) ? ` (${stderrHead(byIdRes.stderr)})` : ''}`,
+    )
+  }
+  const byIdMap = parseDiskByIdListing(byIdRes.stdout)
   interface Node { name?: string, type?: string, partlabel?: string | null, children?: Node[] }
   let root: { blockdevices?: Node[] }
   try {
     root = JSON.parse(lsblkRes.stdout)
   }
   catch {
-    return []
+    throw new Error(
+      `could not read the block-device tree to find the cache slices of '${pool}': lsblk printed output that is not JSON`
+      + ` (${lsblkRes.stdout.trim().slice(0, 80) || 'empty'})`,
+    )
   }
   const slices: CacheSlice[] = []
   for (const disk of root.blockdevices ?? []) {
@@ -153,6 +182,17 @@ export async function findCacheSlices(executor: CommandExecutor, pool: string): 
 }
 
 // ---- Shared state reads -----------------------------------------------------
+
+/**
+ * Bytes of the PVs that sit on this pool's own cache slices — the cache's
+ * size, scoped to what ANAS labelled. "Every non-md PV in the VG" would count a
+ * PV an operator added by hand as cache flash.
+ */
+function cachePvBytes(pvs: LvmPv[], pool: string, sliceDevices: Set<string>): number {
+  return pvs
+    .filter(p => p.vgName === pool && sliceDevices.has(p.name))
+    .reduce((sum, p) => sum + p.sizeBytes, 0)
+}
 
 /** Every LV of the pool VG as `lvs` reports it right now. */
 async function readVgLvs(executor: CommandExecutor, pool: string): Promise<LvmLv[]> {
@@ -234,9 +274,8 @@ export async function attachAhrCache(
   const already = (await readVgLvs(executor, pool.name)).find(l => l.name === lvName)
   if (already && lvIsCacheTarget(already.attr)) {
     updateProgress(`Pool '${pool.name}' already has a read cache`)
-    const sizeBytes = (await readPvs(executor))
-      .filter(p => p.vgName === pool.name && !isMdPvName(p.name) && p.name !== UNKNOWN_PV_NAME)
-      .reduce((sum, p) => sum + p.sizeBytes, 0)
+    const slices = await findCacheSlices(executor, pool.name)
+    const sizeBytes = cachePvBytes(await readPvs(executor), pool.name, new Set(slices.flatMap(s => [s.kernelPath, s.path])))
     // The pool's OWN cache devices, not the ones this request asked for: the
     // cache that is already there may be built on other disks entirely (the
     // route's 409 catches that from the topology read, but a job that reaches
@@ -249,8 +288,12 @@ export async function attachAhrCache(
   try {
     // --- Per disk: slice → wipe → pvcreate → vgextend ----------------------
     const slicePaths: string[] = []
-    for (const [i, diskId] of diskIds.entries())
-      slicePaths.push(await ensureCachePv(executor, { pool: pool.name, diskId, ordinal: i + 1, updateProgress, log }))
+    const sliceDevices = new Set<string>()
+    for (const [i, diskId] of diskIds.entries()) {
+      const slice = await ensureCachePv(executor, { pool: pool.name, diskId, ordinal: i + 1, updateProgress, log })
+      slicePaths.push(slice.path)
+      sliceDevices.add(slice.path).add(slice.kernelPath)
+    }
 
     // --- The cache LV: linear across the cache PVs ONLY ---------------------
     // `-l 100%PVS` with the PVs named (GT-18's exact, proven form): it takes
@@ -285,9 +328,7 @@ export async function attachAhrCache(
       log(`ahr.cache pool=${pool.name} disks=${diskIds.join(',')} status=attached mode=writethrough`)
     }
 
-    const sizeBytes = (await readPvs(executor))
-      .filter(p => p.vgName === pool.name && !isMdPvName(p.name) && p.name !== UNKNOWN_PV_NAME)
-      .reduce((sum, p) => sum + p.sizeBytes, 0)
+    const sizeBytes = cachePvBytes(await readPvs(executor), pool.name, sliceDevices)
     const warnings = input.rotationalIds && input.rotationalIds.length > 0
       ? [rotatingCacheAdvisory(input.rotationalIds)]
       : undefined
@@ -318,8 +359,8 @@ export async function attachAhrCache(
 
 /**
  * One cache disk, from bare metal to a PV of the pool VG; returns the slice's
- * by-id path. Each of the three acts detects its own completion, so this is
- * re-runnable at any point.
+ * by-id path and the kernel path lvm names it by. Each of the three acts
+ * detects its own completion, so this is re-runnable at any point.
  */
 async function ensureCachePv(
   executor: CommandExecutor,
@@ -330,9 +371,9 @@ async function ensureCachePv(
     updateProgress: (message: string) => void
     log: (line: string) => void
   },
-): Promise<string> {
+): Promise<{ path: string, kernelPath: string }> {
   const { pool, diskId, ordinal, updateProgress, log } = ctx
-  const label = `${pool}-cache${ordinal}`
+  const label = cachePartitionLabel(pool, ordinal)
   const dev = byIdPath(diskId)
 
   // 1. The slice. Detected by LABEL — the disk's own record of what it is for.
@@ -392,7 +433,7 @@ async function ensureCachePv(
     await run(executor, VGEXTEND, [...LVM_MIXED_BLOCK_ARGS, pool, slicePath])
     log(`ahr.cache pool=${pool} disk=${diskId} status=vg-extended`)
   }
-  return slicePath
+  return { path: slicePath, kernelPath }
 }
 
 // ---- cache-detach -----------------------------------------------------------
@@ -493,6 +534,16 @@ export async function detachAhrCache(
   const lvName = pool.lv.name
   const cacheLv = cacheLvName(pool.name)
 
+  // The on-disk truth about which disks are OURS, read FIRST — before any
+  // mutation: a `<pool>-cache<n>` GPT label is the only thing that says a disk
+  // carries this pool's cache, and it survives `pvremove` and `wipefs`
+  // (GT-22). Every step after the uncache is driven from this list, so an
+  // unreadable one must stop the detach here (findCacheSlices throws), with
+  // nothing yet changed — not after the uncache, where "no slices" would have
+  // skipped every cleanup step and reported success.
+  const slices = await findCacheSlices(executor, pool.name)
+  const sliceDevices = new Set(slices.flatMap(s => [s.kernelPath, s.path]))
+
   // 1. Uncache — drops the cache volume and restores direct service.
   const lvs = await readVgLvs(executor, pool.name)
   const poolLv = lvs.find(l => l.name === lvName)
@@ -511,12 +562,6 @@ export async function detachAhrCache(
     await run(executor, LVREMOVE, [...LVM_MIXED_BLOCK_ARGS, '-f', `${pool.name}/${cacheLv}`])
     log(`ahr.cache pool=${pool.name} lv=${cacheLv} status=orphan-removed`)
   }
-
-  // The on-disk truth about which disks are OURS, read before any PV decision:
-  // a `<pool>-cache<n>` GPT label is the only thing that says a disk carries
-  // this pool's cache, and it survives `pvremove` and `wipefs` (GT-22).
-  const slices = await findCacheSlices(executor, pool.name)
-  const sliceDevices = new Set(slices.flatMap(s => [s.kernelPath, s.path]))
 
   // 2. The cache PVs leave the VG. A PV whose device is GONE cannot be named,
   //    so `--removemissing` is the only form that reaches it (GT-20); it
@@ -693,12 +738,19 @@ export async function notifyCacheRecoveryFailed(
   pool: string,
   when: 'boot' | 'udev',
   message: string,
+  /**
+   * What the evidence said: `missing` only when the cache PV's device is gone
+   * (an `[unknown]` PV under the band guard, or no labelled slice left on any
+   * disk); `failed` for a cache whose device is present but reports a failure.
+   * The body never claims a device is missing on the strength of a dm answer.
+   */
+  cause: 'missing' | 'failed',
 ): Promise<void> {
   await pveNotify(
     executor,
     'error',
     `AHR read cache recovery FAILED: ${pool}`,
-    `Pool '${pool}' has a read cache whose device is missing, and ANAS could not drop it automatically `
+    `Pool '${pool}' has a read cache ${cause === 'missing' ? 'whose device is missing' : 'that has failed'}, and ANAS could not drop it automatically `
     + `${when === 'boot' ? 'at start-up' : 'after the cache device was removed'}: ${message} `
     + `The pool cannot serve reads until the cache is removed — every read through a dead dm-cache returns an I/O error. `
     + `Detach the cache from the Hybrid RAID view once the reason above is dealt with.`,
