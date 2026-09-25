@@ -595,3 +595,111 @@ missed-run heal and stays; a foreign `stamp-*.timer` and the scrub pair are
 never touched. The two integration specs keep their GT-21 absolute-date
 schedules — the product now removes the stamp itself, so the dates are belt
 and braces for pre-fix nodes.
+
+## 2026-09-25 — the remedy, live on the stunt node (`sched.stamps`)
+
+> Captured on the stunt node (`anas-pve`, 192.168.200.50) at 06:02–06:20 UTC on
+> 2026-09-25, on the build deployed from this branch. The live proof is
+> `tests/integration/sched-stamps.spec.ts` (3 tests, green twice back to back).
+
+### SCHEDULES-GT-22 — the sweep at daemon start, on the node's own orphans
+
+The node carried 26 stamp files before the deploy, 11 of them under our four
+prefixes. None had a `.service` unit left — every `anas-repl-*` / `anas-snap-*`
+task they belonged to had been deleted by a spec run months or days earlier
+(the oldest is GT-18's 2026-07-16):
+
+```
+-rw-r--r-- 1 root root 0 2026-09-25 00:00:36.025572000 +0000 stamp-anas-recycle.timer
+-rw-r--r-- 1 root root 0 2026-07-16 20:50:19.988477649 +0000 stamp-anas-repl-failproof.timer
+-rw-r--r-- 1 root root 0 2026-09-04 02:19:49.609117978 +0000 stamp-anas-repl-lp37nt.timer
+-rw-r--r-- 1 root root 0 2026-09-04 02:19:22.097273828 +0000 stamp-anas-repl-lp37ok.timer
+-rw-r--r-- 1 root root 0 2026-07-16 20:47:23.275992501 +0000 stamp-anas-repl-proof.timer
+-rw-r--r-- 1 root root 0 2026-07-16 22:39:52.065736937 +0000 stamp-anas-repl-remotetask.timer
+-rw-r--r-- 1 root root 0 2026-07-16 20:51:10.089472726 +0000 stamp-anas-repl-spec-repl-task.timer
+-rw-r--r-- 1 root root 0 2026-07-26 19:59:53.229636504 +0000 stamp-anas-snap-nightly-media.timer
+-rw-r--r-- 1 root root 0 2026-07-26 19:44:19.848366542 +0000 stamp-anas-snap-santest-daily.timer
+-rw-r--r-- 1 root root 0 2026-09-23 03:19:00.580484329 +0000 stamp-anas-snap-smbsvc-proof-daily.timer
+-rw-r--r-- 1 root root 0 2026-09-23 08:10:17.024640000 +0000 stamp-anas-snap-smbsvc-proof-hourly.timer
+-rw-r--r-- 1 root root 0 2026-07-27 02:46:55.866476321 +0000 stamp-anas-snap-snaptest-daily.timer
+-rw-r--r-- 1 root root 0 2026-09-24 06:38:27.047717000 +0000 stamp-apt-daily-upgrade.timer
+…13 more foreign stamps (apt, dpkg, e2scrub, fstrim, logrotate, man-db,
+mdcheck ×2, mdmonitor, probe2, proxmox-backup, pve-daily-update, sanoid)
+```
+
+The first daemon start carrying the fix journalled one line per orphan and
+nothing else — verbatim, `journalctl -u anasd -o short-iso`:
+
+```
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-repl-failproof.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-repl-lp37nt.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-repl-lp37ok.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-repl-proof.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-repl-remotetask.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-repl-spec-repl-task.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-snap-nightly-media.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-snap-santest-daily.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-snap-smbsvc-proof-daily.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-snap-smbsvc-proof-hourly.timer — its task no longer exists"}
+2026-09-25T06:04:11+00:00 anas-pve node[2461759]: {"level":30,…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-snap-snaptest-daily.timer — its task no longer exists"}
+```
+
+26 files before, 15 after; zero `stamp-anas-{backup,cloud,repl,snap}-*` left,
+and every foreign stamp survived — including `stamp-anas-recycle.timer`, which
+is ANAS's own (smbsvc recycle) but carries none of the four task prefixes, and
+`stamp-probe2.timer` from a ground-truth run of 2026-07-19.
+
+**A node is swept once.** That is why the integration spec PLANTS its orphans
+rather than assuming any: one per prefix, backdated (the sweep skips a stamp
+newer than the daemon's process start), plus a foreign `stamp-gtsweepforeign`
+and a `stamp-anas-scrub.timer` that must both survive. Every restart since
+prints exactly four lines:
+
+```
+2026-09-25T06:19:11+00:00 anas-pve node[2476761]: {…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-backup-gtsweepbk.timer — its task no longer exists"}
+2026-09-25T06:19:11+00:00 anas-pve node[2476761]: {…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-cloud-gtsweepcl.timer — its task no longer exists"}
+2026-09-25T06:19:11+00:00 anas-pve node[2476761]: {…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-repl-gtsweeprp.timer — its task no longer exists"}
+2026-09-25T06:19:11+00:00 anas-pve node[2476761]: {…,"msg":"task stamp sweep: removed orphan stamp stamp-anas-snap-gtsweepsn.timer — its task no longer exists"}
+```
+
+### SCHEDULES-GT-23 — the `reset-failed` pair, before and after
+
+A task whose last run FAILED is a `failed` unit until something resets it, and
+a task deleted in that state used to stay listed as a `not-found` ghost. The
+spec runs each task to a real failure first (a backup on an archive path that
+does not exist; a cloud sync whose source is the fixture's never-mounted CIFS
+line), then deletes it. `systemctl list-units --failed --no-legend` either
+side of the `DELETE`:
+
+```
+--- backup, BEFORE the delete ---
+● anas-backup-gtstampbk.service loaded failed failed ANAS backup task gtstampbk
+● nmbd.service                  loaded failed failed Samba NMB Daemon
+● zfs-import@datapool.service   loaded failed failed Import ZFS pool datapool
+● zfs-share.service             loaded failed failed ZFS file system shares
+--- backup, AFTER the delete ---
+● nmbd.service                loaded failed failed Samba NMB Daemon
+● zfs-import@datapool.service loaded failed failed Import ZFS pool datapool
+● zfs-share.service           loaded failed failed ZFS file system shares
+```
+
+```
+--- cloud, BEFORE the delete ---
+● anas-cloud-gtstampcl.service loaded failed failed ANAS cloud sync task gtstampcl
+● nmbd.service                 loaded failed failed Samba NMB Daemon
+● zfs-import@datapool.service  loaded failed failed Import ZFS pool datapool
+● zfs-share.service            loaded failed failed ZFS file system shares
+```
+```
+--- cloud, AFTER the delete ---
+● nmbd.service                loaded failed failed Samba NMB Daemon
+● zfs-import@datapool.service loaded failed failed Import ZFS pool datapool
+● zfs-share.service           loaded failed failed ZFS file system shares
+```
+
+The three surviving entries are the node's own long-standing failures and are
+untouched. The removal also deletes the stamp, so the SAME name re-created
+immediately afterwards with `OnCalendar=*-*-* 00:05:00` — a time of day that
+passed hours ago — records `LastTriggerUSec=` (empty), starts no service in 45
+seconds of journal, and reports no `lastRunAt`. That is the GT-17 self-fire,
+gone.

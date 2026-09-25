@@ -30,45 +30,19 @@ echo "✓ Files synced"
 echo
 
 # Install systemd units
+#
+# INSTALLED FROM packaging/systemd/, never re-typed here. The two units used to
+# be inline heredocs in this script, and that copy went stale: e49ce7f gave the
+# gateway `PartOf=anasd.service` so a daemon restart brings it back, the
+# packaging copy got it, and this one did not — every dev node kept the old
+# `Requires=`-only unit, where `systemctl restart anasd` leaves the UI at 502
+# with nothing to restart the gateway. The rsync above already puts the whole
+# repo (packaging included) at /opt/anas, so the node installs the SAME files
+# the tarball installer does — the same idiom as the iSCSI drop-in below.
 echo "Installing systemd units..."
-$SSH_CMD "cat > /etc/systemd/system/anasd.service" <<'EOF'
-[Unit]
-Description=ANAS Daemon
-After=network.target pve-cluster.service
-
-[Service]
-Type=simple
-ExecStartPre=/bin/mkdir -p /run/anas
-ExecStart=/usr/bin/node /opt/anas/packages/daemon/dist/index.js
-Environment=ANASD_SOCKET=/run/anas/anasd.sock
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-$SSH_CMD "cat > /etc/systemd/system/anas.service" <<'EOF'
-[Unit]
-Description=ANAS API Gateway
-After=anasd.service
-Requires=anasd.service
-
-[Service]
-Type=simple
-# The gateway reads the host's PVE certificates itself (story 13.8): it
-# auto-detects /etc/pve/local/pveproxy-ssl.* (custom) or pve-ssl.* (node) and
-# serves HTTPS. PVE marks PVEAuthCookie as Secure, so this HTTPS is required
-# for auth to work at all (story 10.4).
-ExecStart=/usr/bin/node /opt/anas/packages/gateway/dist/index.js
-Environment=ANASD_SOCKET=/run/anas/anasd.sock
-Environment=ANAS_AUTH_PROVIDER=pve
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+$SSH_CMD "install -m 0644 /opt/anas/packaging/systemd/anasd.service /etc/systemd/system/anasd.service"
+$SSH_CMD "install -m 0644 /opt/anas/packaging/systemd/anas.service /etc/systemd/system/anas.service"
+echo "  ✓ anasd.service + anas.service installed from packaging/systemd/"
 
 # The iSCSI boot-ordering drop-in (stories iscsi.5 / iscsi.8, live-proof F14).
 #
