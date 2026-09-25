@@ -7,6 +7,49 @@ source "${SCRIPT_DIR}/config.sh"
 echo "=== ANAS Stunt Node — Deploy ANAS ==="
 echo
 
+# Workspace links pre-flight
+#
+# npm workspaces link packages/<name> into node_modules/@anas/<name> as
+# RELATIVE symlinks. Tooling that rewrites paths (an agent worktree, a tree
+# move) can leave an ABSOLUTE link behind; rsync copies the link verbatim and
+# the node's anasd then dies with ERR_MODULE_NOT_FOUND for @anas/shared —
+# while the old three-second `is-active` verify below still reported success,
+# because a crash-looping unit reads `active` between crashes. Catch the bad
+# link on the host, before the build, where the repair is one `ln -sfn`.
+echo "Checking workspace links..."
+if [ ! -d "$PROJECT_ROOT/node_modules/@anas" ]; then
+  echo "✗ $PROJECT_ROOT/node_modules/@anas not found — run npm install"
+  exit 1
+fi
+for link in "$PROJECT_ROOT"/node_modules/@anas/*; do
+  [ -L "$link" ] || continue
+  name="$(basename "$link")"
+  target="$(readlink "$link")"
+  resolved="$(readlink -f "$link" 2>/dev/null || true)"
+  if [ -z "$resolved" ] || [ ! -d "$resolved" ]; then
+    echo "✗ node_modules/@anas/$name -> ${target:-(dangling)} — target does not resolve to a directory"
+    exit 1
+  fi
+  case "$resolved" in
+    "$PROJECT_ROOT"/packages/*) ;;
+    *)
+      echo "✗ node_modules/@anas/$name -> $target — does not resolve into $PROJECT_ROOT/packages"
+      exit 1
+      ;;
+  esac
+  case "$target" in
+    /*)
+      ln -sfn "../../packages/$name" "$link"
+      echo "  ✓ $name -> ../../packages/$name (was absolute: $target — relinked relative)"
+      ;;
+    *)
+      echo "  ✓ $name -> $target"
+      ;;
+  esac
+done
+echo "✓ Workspace links ok"
+echo
+
 # Build on host
 echo "Building ANAS on host..."
 cd "$PROJECT_ROOT"
@@ -15,10 +58,17 @@ echo "✓ Build complete"
 echo
 
 # rsync to VM
+#
+# --delete-excluded makes /opt/anas a true mirror: without it, a directory the
+# host stopped shipping (`.claude` — agent worktrees that once weighed 2.9G,
+# `unsloth_compiled_cache`) stayed on the node forever and helped fill the
+# root filesystem to 100%.
 echo "Syncing to VM..."
-rsync -az --delete \
+rsync -az --delete --delete-excluded \
   --exclude '.git' \
   --exclude '.nuxt' \
+  --exclude '.claude' \
+  --exclude 'unsloth_compiled_cache' \
   --exclude 'test' \
   --exclude 'tests' \
   --exclude 'test-results' \
@@ -68,25 +118,60 @@ echo "✓ Systemd units installed"
 echo
 
 # Start services
+#
+# reset-failed first: `systemctl restart` does NOT clear the unit's restart
+# counter, so NRestarts left over from a previous bad deploy would make the
+# crash-loop check below read 0 no matter what happens after this restart.
 echo "Starting services..."
+$SSH_CMD "systemctl reset-failed anasd anas 2>/dev/null || true"
 $SSH_CMD "systemctl restart anasd anas"
-sleep 3
 echo
 
 # Verify
+#
+# `is-active` three seconds after a restart proves nothing: with Restart=
+# on-failure and RestartSec=5 a unit that dies on startup (the ERR_MODULE_NOT_FOUND
+# case the workspace-links pre-flight above guards the other half of) reads
+# `active` between crashes, so the old check passed while anasd was crash-looping.
+# Wait out the crash loop instead: for a full window after the restart, both
+# units must stay active with NRestarts still at 0, the daemon's /v1/health must
+# answer over its socket with the version built from this tree, and the
+# gateway must answer the same version on its loopback port. The gateway probe
+# is /installed, not /api/health: /api/health sits behind the ticket check
+# when hit directly (only /installed is auth-exempt — the panels' pre-login
+# probe), and TLS termination belongs to pveproxy, so the loopback listener is
+# plain HTTP (gateway config.ts).
 echo "Verifying..."
-if $SSH_CMD "systemctl is-active --quiet anasd"; then
-  echo "  ✓ anasd running"
+expected_version="$(node -p "require('$PROJECT_ROOT/packages/daemon/package.json').version")"
+if $SSH_CMD "bash -s -- '$expected_version'" <<'REMOTE'
+deadline=$((SECONDS + 30))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  restarts="$(systemctl show -p NRestarts --value anasd)"
+  if [ "$restarts" != "0" ]; then
+    echo "  ✗ anasd crash-looping (NRestarts=$restarts)"
+    exit 1
+  fi
+  if systemctl is-active --quiet anasd && systemctl is-active --quiet anas; then
+    daemon_health="$(curl -sf --max-time 2 --unix-socket /run/anas/anasd.sock http://localhost/v1/health 2>/dev/null || true)"
+    . /etc/default/anas 2>/dev/null || true
+    # Loopback is plain HTTP by design (gateway config.ts — TLS belongs to
+    # pveproxy); /installed is the one auth-exempt GET and carries the version.
+    gw_health="$(curl -sf --max-time 2 "http://127.0.0.1:${ANAS_PORT:-3000}/installed" 2>/dev/null || true)"
+    if printf '%s' "$daemon_health" | grep -q "\"version\":\"$1\"" \
+      && printf '%s' "$gw_health" | grep -q "\"version\":\"$1\""; then
+      exit 0
+    fi
+  fi
+  sleep 2
+done
+echo "  ✗ timed out waiting for anasd/anas health endpoints"
+exit 1
+REMOTE
+then
+  echo "  ✓ anasd active, 0 restarts, /v1/health answers version $expected_version"
+  echo "  ✓ anas active, /installed answers the same version"
 else
-  echo "  ✗ anasd not running"
-  $SSH_CMD "journalctl -u anasd -n 20 --no-pager"
-  exit 1
-fi
-
-if $SSH_CMD "systemctl is-active --quiet anas"; then
-  echo "  ✓ anas running"
-else
-  echo "  ✗ anas not running"
+  $SSH_CMD "journalctl -u anasd -n 40 --no-pager"
   $SSH_CMD "journalctl -u anas -n 20 --no-pager"
   exit 1
 fi
