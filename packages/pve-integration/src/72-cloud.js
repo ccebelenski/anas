@@ -2241,39 +2241,79 @@
         return n === 1 ? one : many;
     }
 
+    // The 120 s ceiling fired: what is on screen is a partial answer, and the
+    // line says exactly what a partial answer is — the counters are rclone's
+    // last periodic tick, the list is everything it logged, neither is whole.
+    function previewTruncatedHtml() {
+        return '<div style="color:var(--anas-warn,#b06a12);font-size:11px;">'
+            + enc(t('stopped after 120 s — the counts are what rclone had reported '
+                + 'by then, the list is everything it logged; the full run will do '
+                + 'the rest')) + '</div>';
+    }
+
+    // The task-management keys a dry run never reads — ONE list, exported on
+    // ANAS.cloud: the preview body is cloudTaskFields minus exactly these, and
+    // a hand-copied field list would drift from the reader.
+    var CLOUD_TASK_MANAGEMENT_KEYS = ['name', 'schedule', 'cadence', 'notify', 'enabled'];
+
     // The summary, from the daemon's OWN counters (CloudSyncPreviewResult).
     // Numbers carry their units (ANAS.formatBytes labels the bytes); names and
     // paths are rendered whole — a list capped by the daemon says how many more.
     function cloudPreviewHtml(result) {
         result = result || {};
         var transfers = Number(result.transfers) || 0;
+        var checks = Number(result.checks) || 0;
         var deletes = Number(result.deletes) || 0;
         var deletedFiles = (result.deletedFiles && result.deletedFiles.length)
             ? result.deletedFiles : [];
-        var deletedTotal = Number(result.deletedTotal) || 0;
+        // The delete count is the READER's own (deletedTotal — counted from the
+        // skipped-delete lines, independent of the stats object), falling back
+        // to the stats count only when the answer carries neither.
+        var deletedTotal = Number(result.deletedTotal) || deletes;
         var errors = (result.errors && result.errors.length) ? result.errors : [];
         var truncated = result.truncated === true;
-        // The everything-deleted case is the one that repaints the whole line.
-        var danger = '';
+        var hasDeletes = deletedFiles.length > 0 || deletedTotal > 0;
         var lines = [];
 
+        // A FAILED preview never headlines a zero forecast: rclone's counters
+        // from a run that died say only what it managed before dying, so when
+        // errors ride the answer the counters lead does not — the sentence
+        // carries rclone's own first error line instead.
+        if (errors.length) {
+            lines.push('<div style="color:var(--anas-danger,#c23b2c);">'
+                + enc(t('The preview did not complete') + ' — ' + errors[0]) + '</div>');
+            if (truncated) {
+                lines.push(previewTruncatedHtml());
+            }
+            return lines.join('');
+        }
+
+        // The everything-deleted case is the one that repaints the whole line —
+        // but only for a COMPLETE answer: a truncated one with zeros may be
+        // part-way through a source that is not empty at all, and red here
+        // would be the lie the ceiling exists to prevent.
+        var danger = '';
         var lead;
-        if (deletes > 0 && transfers === 0 && !(Number(result.checks) > 0)) {
+        if (deletes > 0 && transfers === 0 && checks === 0 && !truncated) {
             danger = 'var(--anas-danger,#c23b2c)';
             lead = t(EMPTY_SOURCE_PREVIEW);
+        } else if (transfers === 0 && !hasDeletes && !truncated) {
+            lead = t('Nothing to do — the destination already matches the source');
         } else {
             lead = t('Would transfer') + ' ' + transfers + ' '
                 + countWord(transfers, t('file'), t('files'))
-                + ' / ' + ANAS.formatBytes(result.bytes);
-            if (deletes > 0) {
-                lead += ', ' + t('delete') + ' ' + deletes + ' '
-                    + countWord(deletes, t('file'), t('files')) + ' '
+                + ' / ' + ANAS.formatBytes(Number(result.bytes) || 0);
+            // The delete clause and the list gate on the READER's count, never
+            // on the stats one — the two disagree exactly when it matters.
+            if (hasDeletes) {
+                lead += ', ' + t('delete') + ' ' + deletedTotal + ' '
+                    + countWord(deletedTotal, t('file'), t('files')) + ' '
                     + t('at the destination');
             }
         }
         lines.push('<div style="color:' + danger + ';">' + enc(lead) + '</div>');
 
-        if (deletes > 0 && deletedFiles.length) {
+        if (hasDeletes && deletedFiles.length) {
             var names = deletedFiles.join(', ');
             if (deletedTotal > deletedFiles.length) {
                 names += ' ' + t('and') + ' ' + (deletedTotal - deletedFiles.length)
@@ -2283,13 +2323,7 @@
                 + danger + ';">' + enc(names) + '</div>');
         }
         if (truncated) {
-            lines.push('<div style="color:var(--anas-warn,#b06a12);font-size:11px;">'
-                + enc(t('stopped after 120 s — the full run will do the rest')) + '</div>');
-        }
-        if (errors.length) {
-            // rclone's own first error line, verbatim, in red.
-            lines.push('<div style="color:var(--anas-danger,#c23b2c);font-size:11px;">'
-                + enc(errors[0]) + '</div>');
+            lines.push(previewTruncatedHtml());
         }
         return lines.join('');
     }
@@ -2322,54 +2356,81 @@
     // The Preview gate AND the result's freshness in one place: enabled while
     // source and remote are filled (a radio always has a mode), cleared the
     // moment any field the dry run was computed from changes — a summary that
-    // outlived its inputs would be a lie with numbers on it.
+    // outlived its inputs would be a lie with numbers on it. Bumping the
+    // sequence drops whatever answer is still in flight: its inputs are gone.
     function refreshCloudPreview(win) {
-        var btn = win.down('#cloudPreviewBtn');
+        win._previewSeq = (win._previewSeq || 0) + 1;
         var fields = cloudTaskFields(win);
-        if (btn) {
-            try {
-                btn.setDisabled(!fields.source || !fields.remote);
-            } catch (e) {
-                // cosmetic — the handler re-checks the gate before it sends
-            }
-        }
+        setPreviewEnabled(win, false, !fields.source || !fields.remote);
         setPreviewLine(win, '');
     }
 
+    // The wizard Preview button's disabled state: hard-disabled while its own
+    // request runs, otherwise whatever the gate says. Cosmetic failures (a
+    // half-torn-down window) never break the request itself.
+    function setPreviewEnabled(win, busy, disabled) {
+        var btn = win.down('#cloudPreviewBtn');
+        if (!btn) {
+            return;
+        }
+        try {
+            btn.setDisabled(busy === true || disabled === true);
+        } catch (e) {
+            // cosmetic — the handler re-checks the gate before it sends
+        }
+    }
+
+    // The body the wizard's Preview sends: the form's data fields —
+    // cloudTaskFields minus the management keys, never a hand-copied list to
+    // drift from the reader. bwlimit rides only when set (absent = no limit).
+    function cloudPreviewBody(win) {
+        var fields = cloudTaskFields(win);
+        var body = {};
+        for (var k in fields) {
+            if (Object.prototype.hasOwnProperty.call(fields, k)
+                && CLOUD_TASK_MANAGEMENT_KEYS.indexOf(k) === -1) {
+                body[k] = fields[k];
+            }
+        }
+        return body;
+    }
+
     // The wizard's Preview click: the form as it stands, inline. The excluded
-    // keys never ride — there is nothing to save.
+    // keys never ride — there is nothing to save. The in-flight guard is a
+    // sequence token per window: a second Preview, or a field change (which
+    // clears through refreshCloudPreview), supersedes the first request's
+    // answer — a summary that answers a question already withdrawn is a lie
+    // with numbers on it.
     function previewCloudTaskForm(win, node) {
         var fields = cloudTaskFields(win);
         if (!fields.source || !fields.remote) {
             return; // the gate never enables the button without both
         }
-        var body = {
-            source: fields.source,
-            remote: fields.remote,
-            path: fields.path,
-            mode: fields.mode,
-            excludes: fields.excludes,
-        };
-        if (fields.bwlimit) {
-            body.bwlimit = fields.bwlimit;
-        }
+        var body = cloudPreviewBody(win);
+        var seq = (win._previewSeq = (win._previewSeq || 0) + 1);
+        setPreviewEnabled(win, true);
         setPreviewLine(win, previewPendingHtml());
         ANAS.api.post(node, '/cloud/tasks/preview', body).then(function (res) {
-            if (win.destroyed || win.destroying) {
+            if (win.destroyed || win.destroying || win._previewSeq !== seq) {
                 return;
             }
+            setPreviewEnabled(win, false);
             setPreviewLine(win, cloudPreviewHtml((res && res.data) || {}));
         }, function (err) {
-            if (win.destroyed || win.destroying) {
+            if (win.destroyed || win.destroying || win._previewSeq !== seq) {
                 return;
             }
+            setPreviewEnabled(win, false);
             setPreviewLine(win, previewErrorHtml(err));
         });
     }
 
     // The grid toolbar's Preview: the SAVED task, by name, in a small
-    // display-only window that reuses the wizard's renderer.
-    function previewTaskRow(node, rec) {
+    // display-only window that reuses the wizard's renderer. The toolbar
+    // button shares the wizard's in-flight posture — disabled while its
+    // request runs, re-enabled by the answer whatever happened to the window
+    // (a window closed mid-flight must not leave the toolbar dead).
+    function previewTaskRow(node, rec, btn) {
         if (!rec) {
             return;
         }
@@ -2399,13 +2460,34 @@
             return;
         }
         win.show();
+        var seq = (win._previewSeq = (win._previewSeq || 0) + 1);
+        try {
+            if (btn) {
+                btn.setDisabled(true);
+            }
+        } catch (e) {
+            // cosmetic
+        }
+        // Re-enables the toolbar button unless a NEWER request has taken it
+        // over — that one owns the button now.
+        var releaseBtn = function () {
+            if (btn && win._previewSeq === seq) {
+                try {
+                    btn.setDisabled(false);
+                } catch (e) {
+                    // the grid may be gone — cosmetic
+                }
+            }
+        };
         ANAS.api.post(node, '/cloud/tasks/preview', { name: name }).then(function (res) {
-            if (win.destroyed || win.destroying) {
+            releaseBtn();
+            if (win.destroyed || win.destroying || win._previewSeq !== seq) {
                 return;
             }
             setPreviewLine(win, cloudPreviewHtml((res && res.data) || {}));
         }, function (err) {
-            if (win.destroyed || win.destroying) {
+            releaseBtn();
+            if (win.destroyed || win.destroying || win._previewSeq !== seq) {
                 return;
             }
             setPreviewLine(win, previewErrorHtml(err));
@@ -2633,8 +2715,11 @@
                                     value: task.source || '',
                                     listeners: {
                                         change: function () {
-                                            scheduleSourceScan(win, node);
-                                            refreshCloudPreview(win);
+                                            var w = this.up('window');
+                                            if (w && w._cloudRefreshGate) {
+                                                w._cloudRefreshGate();
+                                            }
+                                            scheduleSourceScan(w, node);
                                         },
                                     },
                                 },
@@ -2795,6 +2880,14 @@
                             value: (task.excludes && task.excludes.length)
                                 ? task.excludes.join('\n')
                                 : '',
+                            listeners: {
+                                change: function () {
+                                    var w = this.up('window');
+                                    if (w && w._cloudRefreshGate) {
+                                        w._cloudRefreshGate();
+                                    }
+                                },
+                            },
                         },
                         {
                             xtype: 'textfield',
@@ -2803,6 +2896,14 @@
                             fieldLabel: t('Bandwidth limit'),
                             emptyText: '8M',
                             value: task.bwlimit || '',
+                            listeners: {
+                                change: function () {
+                                    var w = this.up('window');
+                                    if (w && w._cloudRefreshGate) {
+                                        w._cloudRefreshGate();
+                                    }
+                                },
+                            },
                         },
                         {
                             xtype: 'component',
@@ -3029,12 +3130,15 @@
             {
                 text: t('Preview'),
                 itemId: 'cloudTaskPreview',
-                cls: 'anas-btn-cloud-task-preview',
+                // Its OWN cls, deliberately not the wizard Preview button's:
+                // two buttons on one page under one class would let a
+                // page-scoped locator click the wrong one.
+                cls: 'anas-btn-cloud-preview-task',
                 iconCls: 'fa fa-eye',
                 disabled: true,
                 handler: function (btn) {
                     var view = btn.up('#cloudView');
-                    previewTaskRow(node, selectedTask(gridOf(view)));
+                    previewTaskRow(node, selectedTask(gridOf(view)), btn);
                 },
             },
             {
@@ -3181,6 +3285,9 @@
     ANAS.cloud = {
         openRemotes: openRemotesManager,
         openTaskWizard: openTaskWizard,
+        // The management keys the preview body never carries — exported so the
+        // harness pins the body against the list instead of against a copy.
+        taskManagementKeys: CLOUD_TASK_MANAGEMENT_KEYS,
     };
 
     // ---- View registration -------------------------------------------------

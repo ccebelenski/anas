@@ -11928,6 +11928,11 @@ async function cloudTaskChecks() {
       && !('schedule' in cloudPreviewPosts[0]) && !('cadence' in cloudPreviewPosts[0])
       && !('notify' in cloudPreviewPosts[0]) && !('enabled' in cloudPreviewPosts[0]),
     JSON.stringify(cloudPreviewPosts[0]))
+  // R3: the body is cloudTaskFields minus ONE exported list — the harness pins
+  // the list itself, so a key added to the reader shows up as a failing check
+  // here instead of as a silently-dropped field on the wire.
+  eq('cloud preview: the exported management-key list is the five a dry run never reads',
+    previewAnas.cloud.taskManagementKeys, ['name', 'schedule', 'cadence', 'notify', 'enabled'])
   validates('cloud preview: the body validates against CloudSyncPreviewRequest',
     CloudSyncPreviewRequest, cloudPreviewPosts[0])
   const pLine = () => pDlg.down('#cloudPreviewLine')
@@ -11963,33 +11968,84 @@ async function cloudTaskChecks() {
   ok('cloud preview: the everything-deleted case still lists the deletes',
     /a\.bin, b\.bin, sub\/c\.txt/.test(pLine().html), pLine() && pLine().html)
 
-  // The capped list: more deletes than the response carried names for.
+  // The Mode radios are one of the fields the summary was computed from:
+  // flipping the mode clears the line like any other (the radiogroup change
+  // lands on the same refresh gate).
+  pDlg.down('#cloudMode').setValue({ cloudMode: 'copy' })
+  await settle()
+  ok('cloud preview: a mode change clears the line', pLine().html === '', pLine().html)
+
+  // The `checks` half of the everything-deleted rule: a sync whose destination
+  // was CHECKED and passed some files is a forecast with deletes, not an empty
+  // source — the red sentence is for the zero-checks case alone.
+  cloudPreviewAnswer = {
+    transfers: 0, bytes: 0, checks: 5, deletes: 3,
+    deletedFiles: ['a.bin', 'b.bin', 'sub/c.txt'], deletedTotal: 3,
+    errors: [], truncated: false,
+  }
+  pDlg.down('#cloudMode').setValue({ cloudMode: 'sync' })
+  await settle()
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: a sync with checks on the books is NOT painted as an empty source',
+    !/anas-danger|#c23b2c/.test(pLine().html)
+      && !/empty source in sync mode/.test(pLine().html)
+      && /Would transfer 0 files \/ 0 B/.test(pLine().html)
+      && /delete 3 files at the destination/.test(pLine().html),
+    pLine() && pLine().html)
+
+  // The capped list, in sync mode: more deletes than the response carried
+  // names for — and the list rides the reader's count, not the mode.
   cloudPreviewAnswer = {
     transfers: 1, bytes: 204800, checks: 3, deletes: 4,
     deletedFiles: ['b.bin', 'sub/c.txt'], deletedTotal: 4,
     errors: [], truncated: false,
   }
-  pDlg.down('#cloudMode').setValue({ cloudMode: 'copy' })
-  await settle()
   findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
   await settle()
   ok('cloud preview: deletes beyond the list say "and T more"',
     /delete 4 files at the destination/.test(pLine().html) && /b\.bin, sub\/c\.txt and 2 more/.test(pLine().html),
     pLine() && pLine().html)
 
-  // The 120 s ceiling fired: what is on screen is a partial answer, and it
-  // says so.
+  // The ZERO variant is a real answer too: a copy over a complete destination.
+  // It says so in words, never in red.
   cloudPreviewAnswer = {
-    transfers: 2, bytes: 358400, checks: 1, deletes: 0,
+    transfers: 0, bytes: 0, checks: 1, deletes: 0,
     deletedFiles: [], deletedTotal: 0,
+    errors: [], truncated: false,
+  }
+  pDlg.down('#cloudMode').setValue({ cloudMode: 'copy' })
+  await settle()
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: a zero forecast says "nothing to do", not red, no phantom deletes',
+    /Nothing to do — the destination already matches the source/.test(pLine().html)
+      && !/anas-danger|#c23b2c/.test(pLine().html)
+      && !/delete/.test(pLine().html),
+    pLine() && pLine().html)
+
+  // D2: the ceiling fired and the counters are zeros from a PARTIAL walk —
+  // a truncated answer with deletes is never painted as an empty source.
+  cloudPreviewAnswer = {
+    transfers: 0, bytes: 0, checks: 0, deletes: 3,
+    deletedFiles: ['a.bin'], deletedTotal: 3,
     errors: [], truncated: true,
   }
   findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
   await settle()
-  ok('cloud preview: a truncated preview says the full run will do the rest',
-    /stopped after 120 s — the full run will do the rest/.test(pLine().html), pLine() && pLine().html)
+  ok('cloud preview: a truncated preview is never painted as an empty source',
+    !/empty source in sync mode/.test(pLine().html)
+      && !/anas-danger|#c23b2c/.test(pLine().html)
+      && /Would transfer 0 files \/ 0 B/.test(pLine().html),
+    pLine() && pLine().html)
+  ok('cloud preview: a truncated preview says what a partial answer is',
+    /stopped after 120 s — the counts are what rclone had reported by then, the list is everything it logged; the full run will do the rest/
+      .test(pLine().html), pLine() && pLine().html)
 
-  // rclone's own first error line rides the summary, in red.
+  // rclone's own first error line IS the summary — the counters lead is
+  // dropped (a dead rclone's counters are whatever it managed before dying),
+  // and the run's own failure sentence takes its place when rclone died
+  // without logging.
   cloudPreviewAnswer = {
     transfers: 0, bytes: 0, checks: 0, deletes: 0,
     deletedFiles: [], deletedTotal: 0,
@@ -11998,7 +12054,60 @@ async function cloudTaskChecks() {
   findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
   await settle()
   ok('cloud preview: an erroring preview shows rclone\'s own first line, in red',
-    /NewFs: unknown remote/.test(pLine().html) && /#c23b2c|anas-danger/.test(pLine().html),
+    /The preview did not complete — 2026\/09\/24 12:00:00 ERROR : NewFs: unknown remote/
+      .test(pLine().html) && /#c23b2c|anas-danger/.test(pLine().html),
+    pLine() && pLine().html)
+  ok('cloud preview: a failed preview never headlines a zero forecast',
+    !/Would transfer/.test(pLine().html) && !/Nothing to do/.test(pLine().html),
+    pLine() && pLine().html)
+
+  // D3: the stats `deletes` and the reader's own count are independent — the
+  // delete clause and the list gate on the READER's numbers, so a stats count
+  // of 0 with deletes the reader saw still names them.
+  cloudPreviewAnswer = {
+    transfers: 0, bytes: 0, checks: 2, deletes: 0,
+    deletedFiles: ['z.bin'], deletedTotal: 1,
+    errors: [], truncated: false,
+  }
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: the delete clause rides the reader\'s count, not the stats one',
+    /delete 1 file at the destination/.test(pLine().html) && /z\.bin/.test(pLine().html),
+    pLine() && pLine().html)
+
+  // D5: the in-flight guard. The button is disabled while ITS request runs;
+  // a field change mid-flight clears the line, re-enables the button and
+  // supersedes the request — whose answer then arrives STALE and is dropped.
+  let releaseInFlight = null
+  previewRoutes['POST /cloud/tasks/preview'] = (body) => {
+    cloudPreviewPosts.push(body)
+    return new Promise((resolve) => { releaseInFlight = () => resolve({ data: CLOUD_PREVIEW }) })
+  }
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: the button is disabled while its request is in flight',
+    findCmp(pDlg, 'anas-btn-cloud-task-preview').disabled === true)
+  pDlg.down('#cloudBwlimit').setValue('8M')
+  await settle()
+  ok('cloud preview: a field change mid-flight clears the line and re-enables the button',
+    pLine().html === ''
+      && findCmp(pDlg, 'anas-btn-cloud-task-preview').disabled === false,
+    pLine().html + ' / disabled=' + findCmp(pDlg, 'anas-btn-cloud-task-preview').disabled)
+  releaseInFlight()
+  await settle()
+  ok('cloud preview: the stale answer is dropped — the line stays cleared',
+    pLine().html === '', pLine().html)
+
+  // And one clean round trip: the button comes back with the answer.
+  previewRoutes['POST /cloud/tasks/preview'] = (body) => {
+    cloudPreviewPosts.push(body)
+    return { data: cloudPreviewAnswer }
+  }
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: the button is re-enabled by the answer',
+    findCmp(pDlg, 'anas-btn-cloud-task-preview').disabled === false
+      && /delete 1 file at the destination/.test(pLine().html),
     pLine() && pLine().html)
 
   // The guard refusal (the unmounted mount): the daemon's sentence, in the
@@ -12021,14 +12130,27 @@ async function cloudTaskChecks() {
   tGrid.selectRow(0)
   ok('cloud preview(toolbar): a selection enables it',
     tGrid.down('#cloudTaskPreview').disabled === false)
+  // Its own cls, deliberately NOT the wizard Preview button's — the two share
+  // a page, and a page-scoped locator under one class could click either.
+  ok('cloud preview(toolbar): the button carries its OWN cls, distinct from the wizard\'s',
+    tGrid.down('#cloudTaskPreview').cls === 'anas-btn-cloud-preview-task'
+      && !!findCmp(pDlg, 'anas-btn-cloud-task-preview')
+      && findCmp(pDlg, 'anas-btn-cloud-task-preview').cls === 'anas-btn-cloud-task-preview')
+  let releaseToolbar = null
   previewRoutes['POST /cloud/tasks/preview'] = (body) => {
     cloudPreviewPosts.push(body)
-    return { data: cloudPreviewAnswer }
+    return new Promise((resolve) => { releaseToolbar = () => resolve({ data: CLOUD_PREVIEW }) })
   }
   cloudPreviewPosts.length = 0
   cloudPreviewAnswer = CLOUD_PREVIEW
   tGrid.down('#cloudTaskPreview').handler(tGrid.down('#cloudTaskPreview'))
   await settle()
+  ok('cloud preview(toolbar): the button is disabled while its request is in flight',
+    tGrid.down('#cloudTaskPreview').disabled === true)
+  releaseToolbar()
+  await settle()
+  ok('cloud preview(toolbar): the button is re-enabled by the answer',
+    tGrid.down('#cloudTaskPreview').disabled === false)
   const tpWin = openWindow()
   ok('cloud preview(toolbar): the display-only window opened',
     !!tpWin && tpWin.cls === 'anas-win-cloud-preview' && !!tpWin.down('#cloudPreviewLine'))

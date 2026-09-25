@@ -306,6 +306,23 @@ async function radioValue(scope: Locator, cls: string): Promise<string> {
   })
 }
 
+/** Set a radiogroup's value on the GROUP component (the same walk as radioValue). */
+async function setRadio(scope: Locator, cls: string, value: string): Promise<void> {
+  await scope.locator(`.${cls}`).first().evaluate((el, v) => {
+    const ext = (window as unknown as { Ext: { getCmp: (id: string) => any } }).Ext
+    let node: Element | null = el
+    while (node) {
+      const cmp = node.id ? ext.getCmp(node.id) : null
+      if (cmp && typeof cmp.isXType === 'function' && cmp.isXType('radiogroup')) {
+        const radio = cmp.items.getAt(0)
+        cmp.setValue({ [radio.name]: v })
+        return
+      }
+      node = node.parentElement
+    }
+  }, value)
+}
+
 /** The job-failure alert ANAS.runJob raises. */
 function failureAlert(page: Page): Locator {
   return page.locator('.x-messagebox', { hasText: /failed|refused/i })
@@ -406,7 +423,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
       'anas-btn-cloud-task-create',
       'anas-btn-cloud-remotes',
       'anas-btn-cloud-task-run',
-      'anas-btn-cloud-task-preview',
+      'anas-btn-cloud-preview-task',
       'anas-btn-cloud-task-details',
       'anas-btn-cloud-task-edit',
       'anas-btn-cloud-task-toggle',
@@ -419,7 +436,8 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
 
     // The sync sentence rides the Mode radios; Copy is the checked default —
     // the mode that cannot destroy anything is the one you get for free.
-    await expect(dlg.locator('#cloudModeNote')).toContainText(
+    // (ExtJS 7 does not stamp itemIds as DOM ids — the cls is the selector.)
+    await expect(dlg.locator('.anas-cloud-mode-note')).toContainText(
       'Sync deletes files at the destination that are no longer in the source. Copy never deletes.',
     )
     expect(await radioValue(dlg, 'anas-fld-cloud-mode')).toBe('copy')
@@ -441,7 +459,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     // The nested-filesystems note renders from the live preview-nested scan of
     // the picked source: the fixture dataset has a CHILD dataset, and a
     // snapshot will not contain it — said BEFORE the save, in the wizard.
-    await expect(dlg.locator('#cloudSourceScan')).toContainText(
+    await expect(dlg.locator('.anas-cloud-source-scan')).toContainText(
       `Contains 1 nested filesystem that will not be included: ${NESTED}`,
       { timeout: 30_000 },
     )
@@ -653,13 +671,26 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
   })
 
   test('8 — preview: the wizard names the deleted file, the toolbar previews the saved task', async ({ page, playwright }) => {
+    // Two 120 s-bounded dry runs (wizard + toolbar) ride on top of the run —
+    // the describe-level budget can be eaten by the run alone.
+    test.setTimeout(600_000)
     // A sync whose destination already holds a copy. The fixture swept the
     // destination and this spec's earlier runs are not order guarantees, so
     // the stored sync task's OWN run lays the copy down first (a sync into an
     // empty destination copies everything and deletes nothing) — then one
     // source file goes away, and the preview must name it. The fixture's `up`
     // rebuilds the source dataset, so the deletion needs no restore.
-    await setupViaApi(playwright, { ...TASK_BODY, mode: 'sync' })
+    // setupViaApi's create helper SKIPS an existing task and test 7 leaves
+    // this one copy + disabled — the state the preview needs is written
+    // explicitly.
+    await setupViaApi(playwright, TASK_BODY)
+    const putCtx = await apiCtx(playwright)
+    try {
+      await putTaskViaApi(putCtx, { ...TASK_BODY, mode: 'sync', enabled: true })
+    }
+    finally {
+      await putCtx.dispose()
+    }
     const runCtx = await apiCtx(playwright)
     try {
       await runJob(runCtx, 'post', `${V1}/cloud/tasks/${TASK}/run`, {})
@@ -671,12 +702,18 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
 
     const grid = await openTasksView(page)
     const dlg = await openWizard(page, grid, TASK)
+    // The Mode radio is flipped in the wizard BEFORE the Preview: the summary
+    // must answer to the UNSAVED form — the inline arm, no name key on the
+    // wire — never to the stored row behind it.
+    await setRadio(dlg, 'anas-fld-cloud-mode', 'sync')
+    expect(await radioValue(dlg, 'anas-fld-cloud-mode')).toBe('sync')
     await dlg.locator('.anas-btn-cloud-task-preview').click()
 
     // The summary line under the Mode field: rclone's own dry-run counters,
     // with the deleted file named under the would-be deletes. A dry run on the
     // LIVE source is bounded by the daemon's 120 s ceiling — allow for it.
-    const line = dlg.locator('#cloudPreviewLine')
+    // (ExtJS 7 does not stamp itemIds as DOM ids — the cls is the selector.)
+    const line = dlg.locator('.anas-cloud-preview-line')
     await expect(line).toContainText('Would transfer', { timeout: 120_000 })
     await expect(line).toContainText('delete 1 file at the destination')
     await expect(line).toContainText('b.bin')
@@ -685,10 +722,12 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
     await expect(dlg).toBeHidden({ timeout: 15_000 })
 
     // The grid toolbar's Preview: the SAVED task by name, the same summary in
-    // the display-only window.
+    // the display-only window. The toolbar button carries its OWN cls —
+    // distinct from the wizard's Preview — so this locator can never click
+    // the wrong one.
     const row = taskRow(page, grid, TASK)
     await row.click()
-    await grid.locator('.anas-btn-cloud-task-preview').click()
+    await grid.locator('.anas-btn-cloud-preview-task').click()
     const previewWin = page.locator('.anas-win-cloud-preview')
     await expect(previewWin).toBeVisible({ timeout: 30_000 })
     await expect(previewWin).toContainText('Would transfer', { timeout: 120_000 })
