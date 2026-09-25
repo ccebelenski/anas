@@ -1,0 +1,1 @@
+2026/09/25 05:07:10 Failed to create file system for "gtbad:dst/fail": NewFs: couldn't connect SSH: ssh: handshake failed: read tcp 127.0.0.1:57360->127.0.0.1:22: read: connection reset by peer

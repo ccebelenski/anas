@@ -1,7 +1,6 @@
 import type { CloudSyncTask } from '@anas/shared'
 import type { CloudPreviewDeps } from '../cloud-preview.js'
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -34,6 +33,11 @@ import { RCLONE } from '../rclone-config.js'
  *                (checks 3, deletes 1, transfers 0)
  *   copy         a complete destination — NOTHING to do, and rclone still
  *                prints its final stats object (checks 2, transfers 0)
+ *   auth-fail    a wrong-password sftp remote (captured 2026-09-25, the run
+ *                that first executed the spec's failing-preview block) — ONE
+ *                plain pre-logger line, no JSON, no stats object
+ *   read-error   an unreadable source subdirectory — JSON `level: error`
+ *                objects AND a final stats object, exit 6
  */
 
 const FINDMNT = '/usr/bin/findmnt'
@@ -124,26 +128,35 @@ async function fixtureText(name: string): Promise<string> {
 }
 
 /**
- * The CAPTURED stderr of a dry run against a wrong-password remote. The
- * integration spec (`cloud-tasks-api.spec.ts`, the wrong-password test) is
- * where it comes from: the job that first runs that spec saves rclone's own
- * stderr here VERBATIM. Until then the test below uses the hand-written shape
- * and says so in its own name — the fixture is still owed, and a test name
- * that claims ground truth it does not have is worse than no fixture.
+ * The CAPTURED stderr of a dry run against a wrong-password remote — the debt
+ * the rclone.2 addendum owed, paid from the stunt node on 2026-09-25 by the
+ * run that first executed `cloud-tasks-api.spec.ts`'s failing-preview block.
+ *
+ * What the capture OVERTURNED, and why it earns its place: the hand-written
+ * shape this replaced assumed rclone reports a config-time failure as a JSON
+ * `level: error` object. It does not. rclone 1.60.1 fails to build the
+ * filesystem BEFORE its JSON logger is up, so `--use-json-log` or not, the
+ * whole of stderr is one plain timestamped line and `errorLines` stays EMPTY.
+ * The preview's answer therefore comes from the `rcloneFailureMessage`
+ * fallback (`rawLines`), not from the error-line path — the exact case
+ * `previewErrors` exists for, now pinned on real bytes instead of a guess.
  */
 const AUTH_FAIL_FIXTURE = 'dry-run-auth-fail-1.60.1.log'
-const AUTH_FAIL_CAPTURED = existsSync(join(FIXTURES, AUTH_FAIL_FIXTURE))
 
-/** rclone's auth-failure stderr: the capture when it exists, else the shape. */
+/**
+ * A dry run that fails with a genuine JSON `level: error` object — rclone's
+ * post-logger error path, captured on the node the same day (an unreadable
+ * source subdirectory, so the listing errors after the logger is up).
+ *
+ * It is a SEPARATE fixture because the auth failure above cannot prove this
+ * path: nothing rclone prints before its logger starts is JSON. This is the
+ * log that proves rclone's own words win over ANAS's wrapper sentence.
+ */
+const READ_ERROR_FIXTURE = 'dry-run-read-error-1.60.1.log'
+
+/** rclone's auth-failure stderr, verbatim from the node. */
 async function authFailLog(): Promise<string> {
-  if (AUTH_FAIL_CAPTURED)
-    return fixtureText(AUTH_FAIL_FIXTURE)
-  return JSON.stringify({
-    level: 'error',
-    msg: 'Failed to create file system for "gtbad:dst/fail": NewFs: couldn\'t connect SSH: ssh: handshake failed: ssh: unable to authenticate',
-    source: 'fs/config.go:123',
-    time: '2026-09-24T22:00:00.000000+00:00',
-  })
+  return fixtureText(AUTH_FAIL_FIXTURE)
 }
 
 // ---------------------------------------------------------------------------
@@ -271,15 +284,45 @@ describe('previewCloudSync — the captured 1.60.1 dry-run logs', () => {
     }
   })
 
-  it(`a preview that fails at rclone answers with rclone's error lines, not a throw (${AUTH_FAIL_CAPTURED ? `captured ${AUTH_FAIL_FIXTURE}` : 'hand-written shape — the 1.60.1 capture is still owed'})`, async () => {
+  it(`a preview that fails at rclone answers with rclone's own words, not a throw (captured ${AUTH_FAIL_FIXTURE})`, async () => {
     const h = await harness()
     try {
       replayRclone(h.mock, await authFailLog(), 1)
       const result = await previewCloudSync(h.mock, deps(h))
       assert.equal(result.transfers, 0, 'no stats object was printed — the counters are zeros')
-      assert.ok(result.errors.length >= 1, 'rclone\'s own error line came back')
+      assert.ok(result.errors.length >= 1, 'the failure is reported, never swallowed')
       assert.match(result.errors.join('\n'), /couldn't connect SSH|didn't find section in config file|NewFs/)
       assert.equal(result.truncated, false)
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('the auth failure is a PRE-LOGGER plain line, so it rides the wrapper sentence — the captured shape, not the assumed one', async () => {
+    const h = await harness()
+    try {
+      // Ground truth 2026-09-25 (stunt node, rclone 1.60.1): a config-time
+      // failure is printed before the JSON logger exists, so `--use-json-log`
+      // buys nothing and the reader sees ONE raw line and no error line.
+      const captured = await authFailLog()
+      assert.ok(!captured.includes('"level":"error"'), 'the capture is not JSON at all')
+
+      const reader = new RcloneLogReader()
+      reader.push(captured)
+      reader.flush()
+      assert.deepEqual(reader.errorLines, [], 'nothing rclone printed here is a JSON error line')
+      assert.equal(reader.rawLines.length, 1, 'exactly the one plain line')
+      assert.equal(reader.stats, null, 'and no stats object — the counters can only be zeros')
+
+      // So the answer is the RUN's own sentence carrying rclone's line, which
+      // is what keeps a dead child from reading as an honest "nothing to do".
+      replayRclone(h.mock, captured, 1)
+      const result = await previewCloudSync(h.mock, deps(h))
+      assert.equal(result.errors.length, 1)
+      assert.match(result.errors[0]!, /^rclone copy failed \(exit 1\): /)
+      assert.match(result.errors[0]!, /Failed to create file system for "gtbad:dst\/fail"/, 'rclone\'s line, verbatim')
+      assert.match(result.errors[0]!, /NewFs: couldn't connect SSH/)
     }
     finally {
       await h.cleanup()
@@ -369,12 +412,24 @@ describe('previewCloudSync — a non-JSON failure carries the run\'s own sentenc
     }
   })
 
-  it('an error line rclone DID log wins over the sentence — its own words, not ours', async () => {
+  it(`an error line rclone DID log wins over the sentence — its own words, not ours (captured ${READ_ERROR_FIXTURE})`, async () => {
     const h = await harness()
     try {
-      replayRclone(h.mock, await authFailLog(), 1)
+      // The post-logger error path, on real bytes: an unreadable source
+      // subdirectory, so rclone logs JSON `level: error` objects AND exits
+      // non-zero (6). The auth-fail capture cannot prove this — it never
+      // reaches the logger (see the pre-logger test above), which is why
+      // this case has a fixture of its own.
+      replayRclone(h.mock, await fixtureText(READ_ERROR_FIXTURE), 6)
       const result = await previewCloudSync(h.mock, deps(h))
       assert.ok(!result.errors.some(e => e.startsWith('rclone copy failed')), 'no wrapper sentence when rclone spoke for itself')
+      assert.match(result.errors[0]!, /failed to open directory "closed": open \/tmp\/pr\/src\/closed: permission denied/)
+      assert.equal(result.errors.length, 2, 'both of rclone\'s error lines, in order')
+      assert.match(result.errors[1]!, /Can't retry any of the errors/)
+      // And the counters are still rclone's own, from the stats object it
+      // printed despite the error.
+      assert.equal(result.checks, 0)
+      assert.equal(result.transfers, 1, 'the one would-be copy it could still see')
     }
     finally {
       await h.cleanup()

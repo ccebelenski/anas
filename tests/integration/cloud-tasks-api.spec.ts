@@ -64,6 +64,29 @@ const SRC = `/${SRC_DS}`
 const EMPTY_SRC = '/gtbackup/cloudempty'
 const UNMOUNTED = '/mnt/gt-unmounted'
 
+/**
+ * The schedule every task here is saved with — an absolute future DATE, not a
+ * time of day, and the same one for all of them.
+ *
+ * SCHEDULES-GT-17/GT-21 (ground truth 2026-09-25): deleting a task removes its
+ * units but LEAVES `/var/lib/systemd/timers/stamp-anas-cloud-<name>.timer`
+ * behind, and this spec re-uses its task names on every run. On `enable --now`
+ * of a `Persistent=true` timer, systemd reads that stamp as `LastTrigger`; if
+ * any calendar point falls between it and now, the timer fires IMMEDIATELY,
+ * once. A daily `*-*-* 03:00:00` therefore self-fires a run the moment the
+ * task is created — a second, unasked-for run racing the spec's own, whose
+ * journal lines and destination writes land in the middle of the assertions.
+ *
+ * `2030-01-01 00:00:00` has no occurrence between any stamp and now, so there
+ * is nothing to catch up on however stale the stamp (GT-21's verbatim
+ * finding). The one test that WANTS a real fire (the timer test) sets its own
+ * absolute schedule a minute out, which is future-dated for the same reason.
+ *
+ * The stamp remedy itself is landing separately; this is the spec's own
+ * immunity, not a substitute for it.
+ */
+const SCHEDULE = '2030-01-01 00:00:00'
+
 /** The absolute path of the fixture script, relative to this spec file. */
 const FIXTURE_SH = new URL('../../test/stunt-node/cloud-tasks-fixture.sh', import.meta.url).pathname
 
@@ -146,7 +169,7 @@ function taskBody(over: Record<string, unknown>): Record<string, unknown> {
     source: SRC,
     remote: REMOTE,
     mode: 'copy',
-    schedule: '*-*-* 03:00:00',
+    schedule: SCHEDULE,
     notify: 'on-failure',
     enabled: true,
     ...over,
@@ -308,7 +331,7 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
         name: 'gtcopy',
         path: 'dst/copy',
         mode: 'copy',
-        schedule: '*-*-* 03:00:00',
+        schedule: SCHEDULE,
         notify: 'on-failure',
       }))
 
@@ -319,7 +342,7 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
       expect(service).toContain('SuccessExitStatus=75')
       expect(service).toContain('/opt/anas/packages/daemon/dist/cloud-task.js --name gtcopy')
       expect(timer, 'a missed fire is caught up').toContain('Persistent=true')
-      expect(timer).toContain('OnCalendar=*-*-* 03:00:00')
+      expect(timer).toContain(`OnCalendar=${SCHEDULE}`)
 
       // The marker JSON is the canonical task, not a re-derivation.
       const marker = service.split('\n').find(l => l.includes('X-ANAS-Task='))!
@@ -414,7 +437,7 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
         name: 'gtsync',
         path: 'dst/sync',
         mode: 'sync',
-        schedule: '*-*-* 03:30:00',
+        schedule: SCHEDULE,
       }))
 
       // First run: the mirror is made.
@@ -517,7 +540,7 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
         source: EMPTY_SRC,
         path: 'dst/empty',
         mode: 'sync',
-        schedule: '*-*-* 04:00:00',
+        schedule: SCHEDULE,
       }))
       expect(await sshExec(`ls -A ${EMPTY_SRC} | wc -l`), 'the fixture source is empty').toBe('0')
 
@@ -537,7 +560,7 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
         source: EMPTY_SRC,
         path: 'dst/empty',
         mode: 'copy',
-        schedule: '*-*-* 04:30:00',
+        schedule: SCHEDULE,
       }))
       const run = await runTask(ctx, 'gtemptycopy')
       expect(run.status).toBe('success')
@@ -564,7 +587,7 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
         name: 'gtunmounted',
         source: UNMOUNTED,
         path: 'dst/nope',
-        schedule: '*-*-* 05:00:00',
+        schedule: SCHEDULE,
       }))
 
       const refusal = await runTaskExpectingFailure(ctx, 'gtunmounted')
@@ -601,7 +624,7 @@ test.describe('Cloud sync tasks (rclone.2)', () => {
         name: 'gtfail',
         remote: BAD_REMOTE,
         path: 'dst/fail',
-        schedule: '*-*-* 06:00:00',
+        schedule: SCHEDULE,
         // `always` here, so the ONE notification this window sees can only be
         // the failure's (the mode gate is not what is under test).
         notify: 'always',
