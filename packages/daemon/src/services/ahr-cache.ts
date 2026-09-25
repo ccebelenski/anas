@@ -678,3 +678,29 @@ export async function recoverFailedAhrCache(
 
   return { pool: pool.name, uncached, vgReduced, readOnly, device }
 }
+
+/**
+ * The error-severity notification the automatic recovery sends when it could
+ * not restore service — ONE builder for both rungs (parallel construction):
+ * the boot rung at activation (`when: 'boot'`) and the udev rung's event job
+ * under a live pool (`when: 'udev'`). Both failures leave the pool serving
+ * nothing — every read through a dead dm-cache is an I/O error — and both run
+ * unattended, so the announcement is identical down to the operator's next
+ * move. Only the clause naming WHEN it tried differs.
+ */
+export async function notifyCacheRecoveryFailed(
+  executor: CommandExecutor,
+  pool: string,
+  when: 'boot' | 'udev',
+  message: string,
+): Promise<void> {
+  await pveNotify(
+    executor,
+    'error',
+    `AHR read cache recovery FAILED: ${pool}`,
+    `Pool '${pool}' has a read cache whose device is missing, and ANAS could not drop it automatically `
+    + `${when === 'boot' ? 'at start-up' : 'after the cache device was removed'}: ${message} `
+    + `The pool cannot serve reads until the cache is removed — every read through a dead dm-cache returns an I/O error. `
+    + `Detach the cache from the Hybrid RAID view once the reason above is dealt with.`,
+  )
+}

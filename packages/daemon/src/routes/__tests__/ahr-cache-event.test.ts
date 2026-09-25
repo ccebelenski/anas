@@ -15,6 +15,7 @@ import { LVS_ARGS, PVS_ARGS, VGS_ARGS } from '../../parsers/lvm-report.js'
 import { MDSTAT_CAT_ARGS } from '../../parsers/mdstat.js'
 import { cacheRecoveryNotification, poolOfCacheLabel } from '../../services/ahr-cache-state.js'
 import { AHR_CACHE_LSBLK_ARGS } from '../../services/ahr-cache.js'
+import { writeIntent } from '../../services/ahr-intent.js'
 import { AHR_FINDMNT_ARGS, AHR_LSBLK_ARGS } from '../../services/ahr-topology.js'
 import { DiskIdentityCache } from '../../services/disk-identity-cache.js'
 import { ahrCacheRoutes } from '../ahr-cache.js'
@@ -394,6 +395,27 @@ describe('AHR cache removal event (ahrcache.1 slice 2)', () => {
     assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/lvconvert').length, 1)
   })
 
+  it('announces the failed auto-recovery with the boot rung\'s error notification', async () => {
+    // This rung runs with nobody at a keyboard — a silent failure leaves the
+    // pool serving I/O errors with no trace outside the job list. Parallel
+    // construction with ahr-boot-scan: same severity, same title, same body.
+    await build('bandsdown')
+    const res = await postEvent()
+    const job = await waitForJob(jobQueue, res.json().job.id)
+    assert.equal(job.status, 'failed')
+    const perlCalls = executor.calls.filter(c => c.command === '/usr/bin/perl')
+    // EXACTLY one: the recovery's own success notification never ran (the job
+    // failed before it), so the failure announcement is the only one.
+    assert.equal(perlCalls.length, 1)
+    const [, , severity, title, body] = perlCalls[0]!.args
+    assert.equal(severity, 'error')
+    assert.equal(title, 'AHR read cache recovery FAILED: tank')
+    assert.match(body, /Pool 'tank' has a read cache whose device is missing/)
+    // The reason, verbatim from the guard that refused the recovery.
+    assert.match(body, /a stopped band array is indistinguishable/)
+    assert.match(body, /Bring the band arrays up first/)
+  })
+
   it('refuses while a cache job is already in flight on the pool', async () => {
     await build('failed')
     let release = (): void => {}
@@ -408,6 +430,28 @@ describe('AHR cache removal event (ahrcache.1 slice 2)', () => {
     assert.equal(res.statusCode, 409)
     assert.match(res.json().error.message, /already in flight on AHR pool 'tank'/)
     release()
+  })
+
+  it('refuses while an expansion intent exists — the rung comes round again on its own', async () => {
+    // The same gate attach and detach apply: the VG's shape is in flight and
+    // the recovery's `vgreduce --removemissing` must not run under it.
+    await writeIntent('tank', {
+      id: randomUUID(),
+      trigger: 'add-disk',
+      approvedDisks: [X, Y],
+      before: { rawBytes: 2 * GIB, usableBytes: 2 * GIB, usedBytes: 0, freeBytes: 2 * GIB, redundancyOverheadBytes: 0, unprotectedWastedBytes: 0, pendingBytes: 0 },
+      after: { rawBytes: 3 * GIB, usableBytes: 3 * GIB, usedBytes: 0, freeBytes: 3 * GIB, redundancyOverheadBytes: 0, unprotectedWastedBytes: 0, pendingBytes: 0 },
+      state: 'running',
+    }, { dir })
+    await build('failed')
+    const res = await postEvent()
+    assert.equal(res.statusCode, 409)
+    assert.match(res.json().error.message, /expansion intent/)
+    // And it runs NOTHING: the recovery is skipped, not queued — udev
+    // re-raises the event and the boot rung re-runs it at the next start.
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/lvconvert').length, 0)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/sbin/vgreduce').length, 0)
+    assert.equal(executor.calls.filter(c => c.command === '/usr/bin/perl').length, 0)
   })
 
   // ---- what the operator is told -------------------------------------------

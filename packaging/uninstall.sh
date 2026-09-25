@@ -214,16 +214,16 @@ fi
 CACHE_HOOK_DEST="${CACHE_HOOK_DEST:-/usr/local/bin/anas-cache-event}"
 UDEV_RULES_DIR="${UDEV_RULES_DIR:-/etc/udev/rules.d}"
 CACHE_RULE_DEST="${CACHE_RULE_DEST:-${UDEV_RULES_DIR}/99-anas-cache.rules}"
-removed_cache_hook=0
+removed_cache_udev=0
 if [ -f "${CACHE_HOOK_DEST}" ]; then
   rm -f "${CACHE_HOOK_DEST}"
-  removed_cache_hook=1
+  removed_cache_udev=1
 fi
 if [ -f "${CACHE_RULE_DEST}" ]; then
   rm -f "${CACHE_RULE_DEST}"
-  removed_cache_hook=1
+  removed_cache_udev=1
 fi
-if [ "${removed_cache_hook}" -eq 1 ]; then
+if [ "${removed_cache_udev}" -eq 1 ]; then
   udevadm control --reload-rules >/dev/null 2>&1 || true
   info "removed AHR cache-event hook ${CACHE_HOOK_DEST} and ${CACHE_RULE_DEST}"
 fi

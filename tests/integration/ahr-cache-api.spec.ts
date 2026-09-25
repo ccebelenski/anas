@@ -441,25 +441,35 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
    * The sequence, and why each step is in it:
    *   1. attach a cache, warm it, and start a reader loop — the cache must be
    *      LIVE and hot when it dies, or the failure proves nothing
-   *   2. yank disk 9 live (`ahrcache-fixture.sh pull-cache`) — a real virsh
-   *      detach, the shape GT-19 measured: every read returns EIO within the
-   *      second, promoted or not, because dm-cache does not fall through to
-   *      the origin
-   *   3. the udev rung uncaches WITHIN SECONDS, with nobody at a keyboard;
+   *   2. start a bounded WRITE loop over ssh (GT §18's write-then-yank
+   *      variant) — a write issued AFTER the rung has already uncached would
+   *      meet a plain linear volume and succeed, so the write that must take
+   *      btrfs read-only has to already be streaming when the disk dies
+   *   3. yank disk 9 live (`ahrcache-fixture.sh pull-cache`) — a real virsh
+   *      detach, the shape GT-19 measured: every read AND write returns EIO
+   *      within the second, promoted or not, because dm-cache does not fall
+   *      through to the origin
+   *   4. the udev rung uncaches WITHIN SECONDS, with nobody at a keyboard;
    *      the reader loop recovers on its next pass (GT-20: `--uncache` is live
    *      with the device absent and takes under a third of a second)
-   *   4. the warning card and the notification appear, and the notification
-   *      really went out (journald cursor window: `notified via target`, zero
-   *      `could not notify`)
    *   5. `GET /v1/ahr/<p>` reports `cache.state: absent` with the leftover
    *      device still named — the died-and-returned disk's mark, which is what
    *      keeps Detach cache reachable as the reclaim verb
-   *   6. a WRITE takes btrfs read-only (GT-19), `mountedReadOnly` says so, and
-   *      Remount is refused without a confirm code, then restores writes
-   *   7. the returned disk is detached, which deletes the slice and hands it
+   *   6. the warning card and the notification appear, and the notification
+   *      really went out (journald cursor window: `notified via target`, zero
+   *      `could not notify`)
+   *   7. the write loop MET the error (its log shows it), btrfs went
+   *      read-only on it (GT-19), `mountedReadOnly` says so, and Remount is
+   *      refused without a confirm code, then restores writes
+   *   8. the returned disk is detached, which deletes the slice and hands it
    *      back as `available` (GT-22)
    */
   test('slice 2: the cache device dies live, ANAS uncaches itself, Remount restores writes', async ({ playwright, pveTicket }) => {
+    // The write loop's files, declared here so the finally can stop the loop
+    // and clean up even when a step below threw: a loop writing into the
+    // pool's mount must never outlive the test.
+    const WRITE_LOG = '/tmp/anas-cache-write.log'
+    const WRITE_STOP = '/tmp/anas-cache-write.stop'
     const cacheId = BY_ID(CACHE_SERIAL)
     await execFileAsync(FIXTURE_SH, ['up'])
     for (const serial of [...BAND_SERIALS, CACHE_SERIAL])
@@ -496,15 +506,30 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
         + `echo "$(date -Is) pass=$p rc=$?" >> ${READER_LOG}; done; sleep 0.2; done' >/dev/null 2>&1 &`,
       )
 
+      // THE WRITE LOOP, IN FLIGHT BEFORE THE YANK — GT §18's write-then-yank
+      // variant. One direct write a tenth of a second, until the marker file
+      // appears. Issued only AFTER the yank, it would meet whatever the node
+      // looks like by then (a plain linear volume once the rung has uncached)
+      // and succeed — btrfs would never abort a transaction and the
+      // read-only leg of this proof would be unreachable. Streaming writes
+      // are also what makes the yank's failure window honest for the WRITES:
+      // the first one after the disk dies meets the dead dm-cache (GT-19).
+      await sshExec(
+        `rm -f ${WRITE_LOG} ${WRITE_STOP}; setsid bash -c 'until [ -f ${WRITE_STOP} ]; do `
+        + `dd if=/dev/urandom of=${MOUNT}/write.bin bs=1M count=1 oflag=direct status=none 2>/dev/null; `
+        + `echo rc=$? >> ${WRITE_LOG}; sleep 0.1; done' >/dev/null 2>&1 &`,
+      )
+
       const cursor = await anasdCursor()
 
-      // --- 1. Yank the cache disk, live ------------------------------------
+      // --- 2. Yank the cache disk, live ------------------------------------
       await execFileAsync(FIXTURE_SH, ['pull-cache'])
 
-      // --- 2. The udev rung uncaches, unattended, within seconds -----------
+      // --- 3. The udev rung uncaches, unattended, within seconds -----------
       // 30 s is a generous ceiling on "within seconds": GT-20 measured the
       // uncache itself at 0.224 s, and the udev event is raised in the same
-      // second the kernel removes the device.
+      // second the kernel removes the device. The write loop keeps streaming
+      // across the whole window — that is the point of it.
       const recovered = await until(
         () => poolDetail(ctx),
         p => p.cache?.state === 'absent',
@@ -521,12 +546,12 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       expect(await sshExec(`dmsetup status ${DM_NAME}`)).toContain('linear')
       expect(await sshExec(`pvs --noheadings -o pv_name ${POOL} | tr -d ' '`)).not.toContain('[unknown]')
 
-      // --- 3. The reader loop recovered on its next pass -------------------
+      // --- 4. The reader loop recovered on its next pass -------------------
       const reader = await sshExec(`tail -40 ${READER_LOG}`)
       expect(reader, 'the reader loop met the EIO window').toContain('rc=1')
       expect(reader.trim().split('\n').at(-1), 'and came back after it').toContain('rc=0')
 
-      // --- 4. The notification really went out -----------------------------
+      // --- 5. The notification really went out -----------------------------
       const notified = await notificationsSince(cursor)
       expect(notified.sent, 'a PVE notification was emitted').toBeGreaterThan(0)
       expect(notified.renderFailures, 'the anas-ahr template pair rendered').toBe(0)
@@ -536,27 +561,38 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       const udevJournal = await sshExec(`journalctl -t anas-ahr --after-cursor='${cursor}' --no-pager -o cat`)
       expect(udevJournal).toContain(`EVENT=CacheDeviceRemoved POOL=${POOL} SLICE=${POOL}-cache1`)
 
-      // --- 5. A write takes btrfs read-only, and the card says so ----------
-      await sshExec(`dd if=/dev/urandom of=${MOUNT}/after.bin bs=1M count=1 status=none; sync; true`)
+      // --- 6. The writes MET the error, and btrfs went read-only ----------
+      // Stop the loop now that the uncache is observed — every write since
+      // the yank met either the dead dm-cache (EIO) or the filesystem btrfs
+      // forced read-only under it (EROFS); the log is the record of that.
+      await sshExec(`touch ${WRITE_STOP}; sleep 0.5`)
+      // Belt-and-braces: the `[.]` keeps the pattern from matching the pkill
+      // shell's own command line.
+      await sshExec(`pkill -f 'anas-cache-write[.]stop' || true`)
+      const writeLog = await sshExec(`cat ${WRITE_LOG}`)
+      expect(writeLog, 'the write loop wrote cleanly before the yank').toContain('rc=0')
+      expect(writeLog, 'and met the error once the cache was gone').toContain('rc=1')
       const ro = await until(
         () => poolDetail(ctx),
         p => p.mountedReadOnly === true,
         30_000,
-        'btrfs forced the filesystem read-only after the write',
+        'btrfs forced the filesystem read-only after a write met the dead cache',
       )
       expect(ro.state).toBe('readonly')
       expect(ro.advisories.some(a => a.includes('writes are stopped until the pool is remounted'))).toBe(true)
       const cards = await ahrWarnings(ctx)
       expect(cards.some(c => c.ref === POOL && c.level === 'critical' && c.message.includes('remounted'))).toBe(true)
 
-      // --- 6. Remount: 409 with a code, then writes are back ---------------
+      // --- 7. Remount: 409 with a code, then writes are back ---------------
       const challenge = await ctx.post(`${V1}/ahr/${POOL}/remount`)
       expect(challenge.status(), await challenge.text()).toBe(409)
       const warnings = (await challenge.json()).error.warnings as string[]
       expect(warnings.some(w => w.includes('Open share handles break'))).toBe(true)
       const code = challenge.headers()['x-anas-confirm-code']
       expect(code).toBeTruthy()
-      await sshExec(`pkill -f 'dd if=${MOUNT}' || true; pkill -f 'seq 1 600' || true`)
+      // Nothing of ours may hold the mount when Remount umounts it: both
+      // loops are stopped — the write loop above, the reader here.
+      await sshExec(`pkill -f 'dd if=${MOUNT}' || true; pkill -f 'seq 1 600' || true; pkill -f 'anas-cache-write[.]stop' || true`)
       await runJob(ctx, 'post', `${V1}/ahr/${POOL}/remount`, undefined, { 'x-anas-confirm': code })
 
       const writable = await poolDetail(ctx)
@@ -566,7 +602,7 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       // have done this — `remount,rw` is refused after an error.
       expect(await sshExec(`dd if=/dev/urandom of=${MOUNT}/proof.bin bs=1M count=1 status=none && echo ok`)).toBe('ok')
 
-      // --- 7. The disk comes back and Detach reclaims it -------------------
+      // --- 8. The disk comes back and Detach reclaims it -------------------
       await execFileAsync(FIXTURE_SH, ['return-cache'])
       const returned = await poolDetail(ctx)
       // Still attributed to the pool, by the slice the recovery deliberately
@@ -583,7 +619,11 @@ test.describe('AHR read cache — attach and detach (ahrcache.1)', () => {
       await runConfirmedJob(ctx, 'delete', `${V1}/ahr/${POOL}`)
     }
     finally {
-      await sshExec(`pkill -f 'seq 1 600' || true`).catch(() => {})
+      // Neither loop may outlive the test — and if a step above threw before
+      // the write loop was stopped by its marker, this is the only thing that
+      // stops it.
+      await sshExec(`pkill -f 'seq 1 600' || true; pkill -f 'anas-cache-write[.]stop' || true; rm -f ${WRITE_STOP} ${WRITE_LOG}`)
+        .catch(() => {})
       await ctx.dispose()
     }
   })

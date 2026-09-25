@@ -4,7 +4,7 @@ import type { JobQueue } from '../jobs/queue.js'
 import type { DiskIdentityCache } from './disk-identity-cache.js'
 import { matchAhrArrayName, mdadmDetailExportArgs, parseMdadmDetailExport } from '../parsers/mdadm-detail.js'
 import { MDSTAT_CAT_ARGS, parseMdstat } from '../parsers/mdstat.js'
-import { cachedVgNames, recoverFailedAhrCache } from './ahr-cache.js'
+import { cachedVgNames, notifyCacheRecoveryFailed, recoverFailedAhrCache } from './ahr-cache.js'
 import { resumeExpansion } from './ahr-expand-resume.js'
 import { defaultAhrIntentDir, listIntents, writeIntent } from './ahr-intent.js'
 import { ahrLvPath } from './ahr-paths.js'
@@ -255,17 +255,11 @@ export async function ahrBootScan(executor: CommandExecutor, opts: BootScanOptio
     catch (err) {
       // The guard refusing (bands still down) lands here, and so does any LVM
       // failure. Never fatal to the daemon; loud, because the pool is serving
-      // nothing until someone acts.
+      // nothing until someone acts. The notification body is the shared one —
+      // the udev rung's event job announces the identical failure.
       const message = err instanceof Error ? err.message : String(err)
       log(`ahr.boot pool=${pool.name} rung=cache-recover result=failed detail=${message}`)
-      await pveNotify(
-        executor,
-        'error',
-        `AHR read cache recovery FAILED: ${pool.name}`,
-        `Pool '${pool.name}' has a read cache whose device is missing, and ANAS could not drop it automatically at start-up: ${message} `
-        + `The pool cannot serve reads until the cache is removed — every read through a dead dm-cache returns an I/O error. `
-        + `Detach the cache from the Hybrid RAID view once the reason above is dealt with.`,
-      )
+      await notifyCacheRecoveryFailed(executor, pool.name, 'boot', message)
     }
     // Whatever happened, this pool's record is stale now.
     poolsByName = null

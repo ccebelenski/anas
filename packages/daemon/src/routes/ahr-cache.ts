@@ -4,7 +4,7 @@ import type { CommandExecutor } from '../executor/types.js'
 import type { JobQueue } from '../jobs/queue.js'
 import type { DiskIdentityCache } from '../services/disk-identity-cache.js'
 import { AhrCacheEventRequest, AttachAhrCacheRequest, isComposableDisk, PoolName } from '@anas/shared'
-import { attachAhrCache, detachAhrCache, recoverFailedAhrCache } from '../services/ahr-cache.js'
+import { attachAhrCache, detachAhrCache, notifyCacheRecoveryFailed, recoverFailedAhrCache } from '../services/ahr-cache.js'
 import { readIntent } from '../services/ahr-intent.js'
 import { fmtBytes } from '../services/ahr-layout.js'
 import { readAhrPools } from '../services/ahr-topology.js'
@@ -91,13 +91,18 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     return true
   }
 
-  /** 409 while an expansion intent exists — the VG's shape is in flight. */
-  async function refuseExistingIntent(pool: string, reply: FastifyReply): Promise<boolean> {
+  /**
+   * 409 while an expansion intent exists — the VG's shape is in flight. The
+   * sentence after the dash names what the CALLER should do about it: attach
+   * and detach can wait for the expansion, while the event route skips the
+   * recovery and the rung comes round again on its own.
+   */
+  async function refuseExistingIntent(pool: string, reply: FastifyReply, consequence?: string): Promise<boolean> {
     const existing = await readIntent(pool, intentDir)
     if (existing) {
       reply.code(409).send({ error: {
         code: 'CONFLICT',
-        message: `Pool '${pool}' has an expansion intent (state '${existing.state}') — the cache can be changed once it completes or is abandoned.`,
+        message: `Pool '${pool}' has an expansion intent (state '${existing.state}') — ${consequence ?? 'the cache can be changed once it completes or is abandoned'}.`,
       } })
       return true
     }
@@ -298,6 +303,14 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
     if (!pool)
       return
 
+    // The expansion-intent gate both verbs apply, for the same reason: the VG's
+    // shape is in flight and the recovery's `vgreduce --removemissing` must not
+    // run under it. The rung loses nothing by skipping — udev re-raises the
+    // event (a removal can generate several) and the boot rung re-runs the
+    // recovery at the next daemon start.
+    if (await refuseExistingIntent(pool.name, reply, 'the automatic cache recovery is skipped; it re-runs on the next event or at the next daemon start'))
+      return
+
     // A cache job already in flight IS the recovery (a detach submitted by the
     // operator a second earlier does the same three commands). Answering 409
     // rather than queueing a second one is the same rule both verbs follow, and
@@ -327,11 +340,23 @@ export async function ahrCacheRoutes(server: FastifyInstance, opts: AhrCacheRout
       // name would make an event and an operator detach invisible to each other.
       'ahr.cache.detach',
       { ...identity, params: { pool: pool.name, trigger: 'udev-device-removed' } },
-      async updateProgress => recoverFailedAhrCache(
-        executor,
-        { pool, sliceLabel: bodyParsed.data.slice ?? null, reason: 'failed' },
-        updateProgress,
-      ),
+      async (updateProgress) => {
+        try {
+          return await recoverFailedAhrCache(
+            executor,
+            { pool, sliceLabel: bodyParsed.data.slice ?? null, reason: 'failed' },
+            updateProgress,
+          )
+        }
+        catch (err) {
+          // A FAILED auto-recovery is not silent: this rung runs with nobody at
+          // a keyboard, so the failure is announced exactly as the boot rung
+          // announces its own (parallel construction), and the job still fails
+          // on the original error.
+          await notifyCacheRecoveryFailed(executor, pool.name, 'udev', err instanceof Error ? err.message : String(err))
+          throw err
+        }
+      },
     )
     reply.code(202)
     return { job }
