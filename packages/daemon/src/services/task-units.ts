@@ -1,6 +1,7 @@
-import type { DashboardWarning, TaskCadence } from '@anas/shared'
+import type { DashboardWarning, Job, TaskCadence } from '@anas/shared'
 import type { ZodType } from 'zod'
 import type { CommandExecutor } from '../executor/types.js'
+import type { JobQueue } from '../jobs/queue.js'
 import type { CadenceGateDecision, TaskTrigger } from './backup-cadence.js'
 import type { SystemdRunResult } from './systemd-status.js'
 import { readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
@@ -477,6 +478,14 @@ export interface TaskStatus {
    * journal, and only for a cadence whose period makes staleness meaningful.
    */
   lastSuccessAt: string | null
+  /**
+   * Is the unit's service in a still-running state RIGHT NOW? Free — the same
+   * `systemctl show` snapshot {@link deriveTaskStatus} already read (the
+   * shared supervision's {@link isRunActive} on it). The status routes use it
+   * to decide whether a running direct job's progress text belongs on the
+   * payload (rclone.3 human-pass finding 2).
+   */
+  runActive: boolean
 }
 
 /**
@@ -521,7 +530,7 @@ export async function deriveTaskStatus(
     now,
   })
 
-  return { lastRunResult, lastRunAt, nextRunAt, overdue, lastSuccessAt }
+  return { lastRunResult, lastRunAt, nextRunAt, overdue, lastSuccessAt, runActive: isRunActive(serviceProps) }
 }
 
 async function showService(
@@ -776,6 +785,88 @@ export function isRunActive(props: Record<string, string>): boolean {
   return RUN_ACTIVE_STATES.has(props.ActiveState ?? '')
 }
 
+/** The answer {@link readRunActive} gives the Run-Now doors. */
+export interface RunActiveState {
+  /** The unit's service is in a still-running state. */
+  active: boolean
+  /**
+   * When the current invocation started (ISO), or null when systemd could not
+   * say. Meaningful only when {@link RunActiveState.active} — a terminal run's
+   * InactiveExitTimestamp is when it ENDED.
+   */
+  since: string | null
+}
+
+/**
+ * Is this task's run executing right now, and since when? The one read the
+ * Run-Now doors make BEFORE submitting the supervising job (rclone.3
+ * human-pass finding 1): an already-running unit gets a 409 that names the run
+ * instead of a second supervisor attaching to it. One `systemctl show` of the
+ * two props the answer needs, fail-open to not-running — a systemd hiccup must
+ * not wedge the button (and a redundant run was safe before this gate; it
+ * still is, the supervision keeps its attach behaviour for the timer race).
+ */
+export async function readRunActive(
+  executor: CommandExecutor,
+  kind: TaskUnitKind,
+  name: string,
+): Promise<RunActiveState> {
+  const props = await showProps(executor, serviceUnitName(kind, name), 'ActiveState,InactiveExitTimestamp')
+  const active = isRunActive(props)
+  return { active, since: active ? parseSystemdTimestamp(props.InactiveExitTimestamp) : null }
+}
+
+/**
+ * The in-flight DIRECT run job for a task — the unit's own execution, whose
+ * `updateProgress` carries the tool's live stats text (rclone's "copy: … of …
+ * bytes, …, ETA …"). ONE lookup for the status routes (the payload's
+ * `runningProgress`) and the Run-Now 409 (which quotes it, so the operator
+ * sees what the running run is doing at the door). `undefined` when the queue
+ * holds no such job — a supervised Run-Now or a timer fire already ended, the
+ * daemon restarted (the queue is in-process state), or the run is being
+ * supervised but has not reached the tool.
+ *
+ * `withParams` on {@link JobQueue.findActive} does the filtering: `direct` is
+ * the recursion-guard flag the runner POSTs and a UI Run-Now omits, so it is
+ * exactly what separates the job that does the work from the job that watches.
+ */
+export function runningDirectJob(
+  jobQueue: JobQueue,
+  operation: string,
+  name: string,
+): Job | undefined {
+  return jobQueue.findActive(operation, name, 'task', { direct: true })
+}
+
+/** The running direct job's progress text, or null (no job, or nothing yet). */
+export function runningDirectJobProgress(
+  jobQueue: JobQueue,
+  operation: string,
+  name: string,
+): string | null {
+  const progress = runningDirectJob(jobQueue, operation, name)?.progress
+  return typeof progress === 'string' && progress.length > 0 ? progress : null
+}
+
+/**
+ * The Run-Now refusal for a run already in flight (rclone.3 human-pass finding
+ * 1): it names the run and when it started, and says what continues it — the
+ * supervising job that a second click would have submitted adds nothing. When
+ * the task's own direct run is executing, its live progress rides after an
+ * em-dash, so the refusal answers "it IS doing something" at the door.
+ */
+export function runningRunConflictMessage(
+  kind: TaskUnitKind,
+  name: string,
+  run: RunActiveState,
+  progress?: string | null,
+): string {
+  const since = run.since ? ` since ${run.since}` : ''
+  const suffix = progress ? ` — ${progress}` : ''
+  return `${kind.title} task '${name}' is already running${since}; `
+    + `it continues under systemd — wait for it to finish${suffix}`
+}
+
 /**
  * Did a TERMINAL run fail? A oneshot's failure shows as ActiveState=failed, or a
  * non-success Result, or a non-zero ExecMainStatus (NOTES §7 confirms these
@@ -996,10 +1087,13 @@ export async function superviseTaskRun<H extends TaskHelperResult = TaskHelperRe
   }
 
   // Ceiling — the run is legitimately still going. Truthful, not a failure.
+  // The sentence points at the row: the task status carries the running direct
+  // job's live progress now (rclone.3 human-pass finding 2), so "check the
+  // task again" names where the run actually shows.
   return {
     status: 'running',
     alreadyRunning,
-    reason: `still running after ${Math.round(timeoutMs / 1000)}s — systemd continues it; check the task again shortly`,
+    reason: `still running after ${Math.round(timeoutMs / 1000)}s — systemd continues it; the task row shows its progress until it ends`,
     helper: null,
   }
 }

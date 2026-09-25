@@ -229,6 +229,13 @@ describe('cloud sync task routes (rclone.2)', () => {
       assert.equal(rows[0].notify, 'always', 'backup parity')
       assert.ok('lastRunResult' in rows[0] && 'nextRunAt' in rows[0] && 'overdue' in rows[0])
     })
+
+    it('carries runningProgress only while a run actually executes (additive, absent otherwise)', async () => {
+      await createTask()
+      const res = await server.inject({ method: 'GET', url: '/v1/cloud/tasks', headers: IDENTITY })
+      const rows = (res.json() as { data: CloudSyncTaskView[] }).data
+      assert.equal(rows[0].runningProgress, undefined)
+    })
   })
 
   describe('GET /v1/cloud/tasks/:name', () => {
@@ -317,6 +324,50 @@ describe('cloud sync task routes (rclone.2)', () => {
       await createTask()
       const bad = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: 'yes' } })
       assert.equal(bad.statusCode, 400)
+    })
+
+    it('a Run-Now on a run already in flight answers 409 naming the run, and submits no job (rclone.3 human-pass finding 1)', async () => {
+      await createTask()
+      // The unit is mid-run as systemd reports it, started at this timestamp.
+      mockOf(server).addFixture({
+        command: SYSTEMCTL,
+        args: ['show', 'anas-cloud-offsite.service', '-p', 'ActiveState,InactiveExitTimestamp'],
+        result: {
+          stdout: `ActiveState=active\nInactiveExitTimestamp=${Date.parse('2026-09-25T10:00:00Z') * 1000}\n`,
+          stderr: '',
+          exitCode: 0,
+        },
+      })
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: {} })
+      assert.equal(res.statusCode, 409)
+      const message = (res.json() as { error: { code: string, message: string } }).error
+      assert.equal(message.code, 'CONFLICT')
+      assert.match(
+        message.message,
+        /Cloud sync task 'offsite' is already running since 2026-09-25T10:00:00\.000Z; it continues under systemd — wait for it to finish/,
+      )
+      // Nothing was submitted: no supervising job sits "waiting" in the list.
+      const jobs = await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })
+      assert.ok(!((jobs.json() as { data: { operation: string }[] }).data ?? []).some(j => j.operation === 'cloud.task.run'))
+    })
+
+    it('a DIRECT run bypasses the running gate — the recursion guard only ever starts work', async () => {
+      await createTask()
+      mockOf(server).addFixture({
+        command: SYSTEMCTL,
+        args: ['show', 'anas-cloud-offsite.service', '-p', 'ActiveState,InactiveExitTimestamp'],
+        result: {
+          stdout: `ActiveState=active\nInactiveExitTimestamp=${Date.parse('2026-09-25T10:00:00Z') * 1000}\n`,
+          stderr: '',
+          exitCode: 0,
+        },
+      })
+      // The direct path never asks the gate (and this test's task has no
+      // source on disk, so the run fails at its own guard — the 202 is the
+      // point, not the outcome).
+      const res = await server.inject({ method: 'POST', url: '/v1/cloud/tasks/offsite/run', headers: JSON_HEADERS, payload: { direct: true } })
+      assert.equal(res.statusCode, 202)
+      await waitForJob(server, (res.json() as JobAccepted).job.id)
     })
 
     it('a UI Run-Now (no direct) starts and supervises the task\'s own unit', async () => {

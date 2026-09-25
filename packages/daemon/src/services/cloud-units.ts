@@ -1,7 +1,14 @@
 import type { CloudSyncTask, DashboardWarning } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
+import type { JobQueue } from '../jobs/queue.js'
 import type { CadenceGateDecision, TaskTrigger } from './backup-cadence.js'
-import type { SuperviseRunOptions, TaskHelperResult, TaskRunResult, TaskUnitKind } from './task-units.js'
+import type {
+  RunActiveState,
+  SuperviseRunOptions,
+  TaskHelperResult,
+  TaskRunResult,
+  TaskUnitKind,
+} from './task-units.js'
 import { BACKUP_SKIP_EXIT_CODE, CloudSyncTask as CloudSyncTaskSchema } from '@anas/shared'
 import { DISABLED_HISTORY_NOTE, parseSystemdTimestamp } from './systemd-status.js'
 // Everything generic lives in task-units.ts and is handed CLOUD_UNIT_KIND: the
@@ -24,9 +31,12 @@ import {
   readAllTaskUnits,
   readLastSuccessAt as readLastSuccessAtGeneric,
   readRecentJournal as readRecentJournalGeneric,
+  readRunActive as readRunActiveGeneric,
   readTaskUnit,
   readUnitTexts as readUnitTextsGeneric,
   removeTaskUnits as removeTaskUnitsGeneric,
+  runningDirectJobProgress as runningDirectJobProgressGeneric,
+  runningRunConflictMessage as runningRunConflictMessageGeneric,
   serviceUnitName as serviceUnitNameGeneric,
   superviseTaskRun,
   taskFileExists as taskFileExistsGeneric,
@@ -262,6 +272,8 @@ export interface CloudTaskStatus {
   overdue: boolean
   /** When the task last completed a real sync (ISO), or null when there is no record. */
   lastSuccessAt: string | null
+  /** The unit's service is still running right now (task-units.ts — free off the same `systemctl show`). */
+  runActive: boolean
 }
 
 /**
@@ -311,6 +323,29 @@ export async function gateRun(
 }
 
 // --- Run-Now supervision (LOCAL-ONLY: systemd + journald) -------------------
+
+/**
+ * The Run-Now door's pre-check (rclone.3 human-pass finding 1): is this task's
+ * run executing right now, and since when — the generic half in task-units.ts,
+ * handed this store's descriptor.
+ */
+export async function readRunActive(executor: CommandExecutor, name: string): Promise<RunActiveState> {
+  return readRunActiveGeneric(executor, CLOUD_UNIT_KIND, name)
+}
+
+/**
+ * The in-flight DIRECT run job's live progress text (rclone's stats line), or
+ * null — the ONE lookup the status payload's `runningProgress` and the Run-Now
+ * 409 both use.
+ */
+export function runningDirectJobProgress(jobQueue: JobQueue, name: string): string | null {
+  return runningDirectJobProgressGeneric(jobQueue, 'cloud.task.run', name)
+}
+
+/** The Run-Now refusal sentence for a run already in flight (kind baked in). */
+export function runningRunConflictMessage(name: string, run: RunActiveState, progress?: string | null): string {
+  return runningRunConflictMessageGeneric(CLOUD_UNIT_KIND, name, run, progress)
+}
 
 export type { SuperviseRunOptions }
 

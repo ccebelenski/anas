@@ -750,6 +750,7 @@
             lastRunAt: first(entry.lastRunAt, entry.lastRun),
             nextRunAt: first(entry.nextRunAt, entry.nextRun),
             overdue: entry.overdue === true,
+            runningProgress: entry.runningProgress || '',
             raw: task,
         };
     }
@@ -898,6 +899,26 @@
             + 'color:' + color + ';border:1px solid ' + color + ';">' + enc(label) + '</span>';
     }
 
+    // rclone.3 human-pass finding 2 (backup parity with the Cloud Sync grid) —
+    // a run can outlive the Run-Now supervisor's 10-minute ceiling, and the
+    // daemon keeps the row fed with the running direct job's progress text.
+    // THE one render of it in this file: the running pill stays, the progress
+    // follows after an em-dash, and the tooltip reads the same. Empty html and
+    // the bare tooltip when the daemon sent no text (a finished run, an older
+    // daemon, no direct job yet).
+    function runningProgressHtml(rec) {
+        var prog = '' + ((rec && rec.get('runningProgress')) || '');
+        if (!prog) {
+            return { tip: t('running'), html: '' };
+        }
+        var tip = t('running') + ' — ' + prog;
+        return {
+            tip: tip,
+            html: ' <span title="' + enc(tip) + '"'
+                + ' style="color:var(--anas-muted,gray);font-size:0.9em;">— ' + enc(prog) + '</span>',
+        };
+    }
+
     // Last run: a result pill + the relative time. An overdue task is flagged
     // (silently-overdue counts as failed — the replication policy).
     function renderLastRun(v, meta, rec) {
@@ -921,11 +942,12 @@
             pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)',
                 ANAS.sched.runErrorTip(rec.store, rec.get('name'), at));
         } else if (result === 'running') {
-            pill = '<span title="' + enc(t('running')) + '"'
+            var rp = runningProgressHtml(rec);
+            pill = '<span title="' + enc(rp.tip) + '"'
                 + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
                 + 'color:#fff;background:var(--anas-accent,#3468c0);">'
                 + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
-                + enc(t('running')) + '</span>';
+                + enc(t('running')) + '</span>' + rp.html;
         } else if (result === 'disabled') {
             // Live-proof F9: a DISABLED task has no timer referencing its unit,
             // so systemd unloads it and garbage-collects the run history. The
@@ -1780,7 +1802,12 @@
     function updateButtons(grid) {
         var rec = selectedTask(grid);
         var has = !!rec;
-        setDisabled(grid, 'backupRun', !has);
+        // rclone.3 human-pass finding 1 (backup parity with Cloud Sync): a run
+        // already in flight refuses Run now with a 409 naming it — the toolbar
+        // says so first (the gate stays at the API; the button is the display,
+        // never the safety).
+        var running = has && rec.get('lastRunResult') === 'running';
+        setDisabled(grid, 'backupRun', !has || running);
         // A restore is allowed for a DISABLED task too — disabling the backups
         // must not take the restore path away with it.
         setDisabled(grid, 'backupRestore', !has);
@@ -2104,6 +2131,19 @@
         }
         if (result === 'never-run') {
             return kv(t('Last run'), softPill(t('never run'), 'var(--anas-muted,gray)', t(NEVER_RUN_TIP)));
+        }
+        // rclone.3 human-pass finding 2 — while a run executes (and it can
+        // outlive the Run-Now supervisor's ceiling), the detail window shows
+        // the same "running — <progress>" the row does, through the SAME
+        // renderer the grid uses.
+        if (result === 'running') {
+            return kv(t('Last run'), renderLastRun('running', null, { get: function (k) {
+                return k === 'lastRunResult' ? 'running'
+                    : k === 'lastRunAt' ? d.lastRunAt
+                    : k === 'overdue' ? d.overdue
+                    : k === 'runningProgress' ? d.runningProgress
+                    : undefined;
+            } }));
         }
         return '';
     }
@@ -5205,7 +5245,7 @@
                 { name: 'kind', type: 'auto' },
                 { name: 'storedKind', type: 'auto' },
                 { name: 'lunName', type: 'auto' },
-                'schedule', 'mode', 'notify', 'lastRunResult', 'lastRunAt', 'nextRunAt',
+                'schedule', 'mode', 'notify', 'lastRunResult', 'lastRunAt', 'nextRunAt', 'runningProgress',
                 { name: 'archiveCount', type: 'auto' },
                 { name: 'cadence', type: 'auto' },
                 { name: 'limitNofile', type: 'auto' },

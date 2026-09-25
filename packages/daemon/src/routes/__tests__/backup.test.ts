@@ -273,6 +273,33 @@ describe('backup routes (Epic 16)', () => {
     assert.equal(mock.calls.some(c => c.command === '/usr/bin/systemctl' && c.args[0] === 'start'), false)
   })
 
+  it('POST /run (no direct) on a run already in flight answers 409 naming the run, and submits no job (rclone.3 human-pass finding 1, backup parity)', async () => {
+    await createRepo()
+    await createTask()
+    const mock = mockOf(server)
+    // The unit is mid-run as systemd reports it, started at this timestamp.
+    mock.addFixture({
+      command: '/usr/bin/systemctl',
+      args: ['show', 'anas-backup-nightly-etc.service', '-p', 'ActiveState,InactiveExitTimestamp'],
+      result: {
+        stdout: `ActiveState=active\nInactiveExitTimestamp=${Date.parse('2026-09-25T10:00:00Z') * 1000}\n`,
+        stderr: '',
+        exitCode: 0,
+      },
+    })
+    const res = await server.inject({ method: 'POST', url: '/v1/backup/tasks/nightly-etc/run', headers: JSON_HEADERS, payload: {} })
+    assert.equal(res.statusCode, 409)
+    const { error } = res.json() as { error: { code: string, message: string } }
+    assert.equal(error.code, 'CONFLICT')
+    assert.match(
+      error.message,
+      /Backup task 'nightly-etc' is already running since 2026-09-25T10:00:00\.000Z; it continues under systemd — wait for it to finish/,
+    )
+    // Nothing was submitted: no supervising job sits "waiting" in the list.
+    const jobs = await server.inject({ method: 'GET', url: '/v1/jobs', headers: IDENTITY })
+    assert.ok(!((jobs.json() as { data: { operation: string }[] }).data ?? []).some(j => j.operation === 'backup.task.run'))
+  })
+
   it('POST /run (no direct) starts the unit and supervises it to a systemd result (Fix 1)', async () => {
     await createRepo()
     await createTask()

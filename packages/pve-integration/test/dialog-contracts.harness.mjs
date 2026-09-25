@@ -10024,9 +10024,63 @@ async function backupWeeklyToggleChecks() {
   ok('backup(weekly): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
+/**
+ * rclone.3 human-pass findings 1 + 2 (backup parity with the Cloud Sync grid)
+ * — Run now is gated on a run already in flight, and the running cell shows
+ * the daemon's live progress text past the supervision ceiling.
+ */
+async function backupRunningGatingChecks() {
+  const routes = {
+    ...BACKUP_ROUTES,
+    'GET /backup/tasks': { data: [
+      { task: TASK, lastRunResult: 'success', enabled: true },
+      { task: { ...TASK, name: 'nightly-running' }, lastRunResult: 'running',
+        runningProgress: 'Starting backup: host/etc@2026-09-25T02:00:00Z — 4 of 9 snapshots done' },
+      { task: { ...TASK, name: 'nightly-quiet' }, lastRunResult: 'running' },
+      { task: { ...TASK, name: 'nightly-failed' }, lastRunResult: 'failure', lastRunAt: '2026-09-25T03:00:00Z' },
+    ] },
+  }
+  const ANAS = loadSource(['68-backup.js', '69-schedules-common.js'], routes)
+  const view = makeComponent(ANAS.views.backup.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#backupGrid')
+  ok('backup(running): the grid loaded the four tasks', grid && grid.getStore().getCount() === 4)
+
+  grid.selectRow(1)
+  ok('backup(running): Run now is DISABLED on a running row', grid.down('#backupRun').disabled === true)
+  ok('backup(running): Restore/Details/Edit stay enabled on a running row',
+    !grid.down('#backupRestore').disabled && !grid.down('#backupDetails').disabled
+    && !grid.down('#backupEdit').disabled)
+  grid.selectRow(2)
+  ok('backup(running): Run now is disabled on a running row with no progress text yet',
+    grid.down('#backupRun').disabled === true)
+  grid.selectRow(0)
+  ok('backup(running): Run now is enabled on a success row', grid.down('#backupRun').disabled === false)
+  grid.selectRow(3)
+  ok('backup(running): Run now is enabled on a failure row', grid.down('#backupRun').disabled === false)
+
+  // The cell: the pill stays, the progress follows after an em-dash, and the
+  // tooltip reads the same sentence. Without text the pill stands alone.
+  const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
+  const PROGRESS = 'Starting backup: host/etc@2026-09-25T02:00:00Z — 4 of 9 snapshots done'
+  const live = lastRunCol.renderer('running', {}, { get: (k) => ({ lastRunResult: 'running', runningProgress: PROGRESS }[k]) })
+  ok('backup(running): the cell renders the pill AND the progress text',
+    /fa-refresh/.test(live) && /4 of 9 snapshots/.test(live), live)
+  ok('backup(running): the tooltip reads the same "running — <progress>" sentence',
+    /title="running — /.test(live), live)
+  const bare = lastRunCol.renderer('running', {}, { get: (k) => ({ lastRunResult: 'running' }[k]) })
+  ok('backup(running): without progress text the pill stands alone',
+    /fa-refresh/.test(bare) && !/snapshots/.test(bare), bare)
+  ok('backup(running): nothing warned', warnings.length === 0, warnings.join(' | '))
+  void view
+}
+
 await backupChecks()
 warnings.length = 0
 await backupWeeklyToggleChecks()
+warnings.length = 0
+await backupRunningGatingChecks()
 warnings.length = 0
 await nestedChecks()
 warnings.length = 0
@@ -12364,6 +12418,55 @@ async function cloudTaskChecks() {
 }
 
 /**
+ * rclone.3 human-pass findings 1 + 2 — Run now is gated on a run already in
+ * flight (a running row disables the button; the API answers 409 naming the
+ * run, which the shared runJob alert already surfaces), and the running cell
+ * shows the daemon's live progress text past the supervision ceiling.
+ */
+async function cloudRunningGatingChecks() {
+  const routes = cloudTaskRoutes()
+  routes['GET /cloud/tasks'] = {
+    data: [
+      CLOUD_TASK_VIEW,
+      { ...CLOUD_TASK_VIEW, name: 'drive-hours', lastRunResult: 'running',
+        runningProgress: 'copy: 1527851 of 17283186 bytes, 363 transferred, 0 checked, 0 deleted, 0 errors, ETA 62685s' },
+      { ...CLOUD_TASK_VIEW, name: 'drive-quiet', lastRunResult: 'running' },
+      { ...CLOUD_TASK_VIEW, name: 'drive-failed', lastRunResult: 'failure', lastRunAt: '2026-09-25T03:00:00Z' },
+    ],
+  }
+  const { view, grid } = await openCloudTasks(routes)
+  ok('cloud tasks(running): the grid loaded the four tasks', grid && grid.getStore().getCount() === 4)
+
+  grid.selectRow(1)
+  ok('cloud tasks(running): Run now is DISABLED on a running row', grid.down('#cloudTaskRun').disabled === true)
+  ok('cloud tasks(running): Preview/Details/Edit stay enabled on a running row',
+    !grid.down('#cloudTaskPreview').disabled && !grid.down('#cloudTaskDetails').disabled
+    && !grid.down('#cloudTaskEdit').disabled)
+  grid.selectRow(2)
+  ok('cloud tasks(running): Run now is disabled on a running row with no progress text yet',
+    grid.down('#cloudTaskRun').disabled === true)
+  grid.selectRow(0)
+  ok('cloud tasks(running): Run now is enabled on a never-run row', grid.down('#cloudTaskRun').disabled === false)
+  grid.selectRow(3)
+  ok('cloud tasks(running): Run now is enabled on a failure row', grid.down('#cloudTaskRun').disabled === false)
+
+  // The cell: the pill stays, the progress follows after an em-dash, and the
+  // tooltip reads the same sentence. Without text the pill stands alone.
+  const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
+  const PROGRESS = 'copy: 1527851 of 17283186 bytes, 363 transferred, 0 checked, 0 deleted, 0 errors, ETA 62685s'
+  const live = lastRunCol.renderer('running', {}, { get: (k) => ({ lastRunResult: 'running', runningProgress: PROGRESS }[k]) })
+  ok('cloud tasks(running): the cell renders the pill AND the progress text',
+    /fa-refresh/.test(live) && /copy: 1527851 of 17283186 bytes/.test(live), live)
+  ok('cloud tasks(running): the tooltip reads the same "running — <progress>" sentence',
+    /title="running — copy: 1527851/.test(live), live)
+  const bare = lastRunCol.renderer('running', {}, { get: (k) => ({ lastRunResult: 'running' }[k]) })
+  ok('cloud tasks(running): without progress text the pill stands alone',
+    /fa-refresh/.test(bare) && !/ETA/.test(bare), bare)
+  ok('cloud tasks(running): nothing warned', warnings.length === 0, warnings.join(' | '))
+  void view
+}
+
+/**
  * The dashboard's warning glyphs: every category a daemon can stamp carries an
  * icon. The map is exported as a pure seam (ANAS.dash.warnIcon) for exactly
  * this assertion.
@@ -12378,6 +12481,10 @@ function dashboardCloudIconChecks() {
 warnings.length = 0
 created.windows.length = 0
 await cloudTaskChecks()
+
+warnings.length = 0
+created.windows.length = 0
+await cloudRunningGatingChecks()
 
 warnings.length = 0
 created.windows.length = 0

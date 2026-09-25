@@ -1703,6 +1703,7 @@
             lastRunAt: entry.lastRunAt,
             nextRunAt: entry.nextRunAt,
             overdue: entry.overdue === true,
+            runningProgress: entry.runningProgress || '',
             raw: task,
         };
     }
@@ -1762,6 +1763,26 @@
         return '<span style="color:var(--anas-muted,gray);">' + enc(t('copy')) + '</span>';
     }
 
+    // rclone.3 human-pass finding 2 — a run can outlive the Run-Now
+    // supervisor's 10-minute ceiling, and the daemon keeps the row fed with
+    // the running direct job's live stats line (bytes of total, files, ETA).
+    // THE one render of it in this file: the running pill stays, the progress
+    // follows after an em-dash, and the tooltip reads the same. Empty html and
+    // the bare tooltip when the daemon sent no text (a finished run, an older
+    // daemon, no direct job yet).
+    function runningProgressHtml(rec) {
+        var prog = '' + ((rec && rec.get('runningProgress')) || '');
+        if (!prog) {
+            return { tip: t('running'), html: '' };
+        }
+        var tip = t('running') + ' — ' + prog;
+        return {
+            tip: tip,
+            html: ' <span title="' + enc(tip) + '"'
+                + ' style="color:var(--anas-muted,gray);font-size:0.9em;">— ' + enc(prog) + '</span>',
+        };
+    }
+
     // Last run: a result pill + the relative time, as the Backup grid renders
     // it. A FAILED run's cell carries rclone's last error line as the tooltip —
     // the line the notification body shows. The grid payload names no error
@@ -1784,11 +1805,12 @@
             pill = pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)',
                 ANAS.sched.runErrorTip(rec.store, rec.get('name'), at));
         } else if (result === 'running') {
-            pill = '<span title="' + enc(t('running')) + '"'
+            var rp = runningProgressHtml(rec);
+            pill = '<span title="' + enc(rp.tip) + '"'
                 + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
                 + 'color:#fff;background:var(--anas-accent,#3468c0);">'
                 + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
-                + enc(t('running')) + '</span>';
+                + enc(t('running')) + '</span>' + rp.html;
         } else if (result === 'disabled') {
             // A disabled task's run history is garbage-collected by systemd;
             // say there is none (the sentence the detail repeats).
@@ -1858,7 +1880,11 @@
     function updateTaskButtons(grid) {
         var rec = selectedTask(grid);
         var has = !!rec;
-        setDisabled(grid, 'cloudTaskRun', !has);
+        // rclone.3 human-pass finding 1: a run already in flight refuses Run
+        // now with a 409 naming it — the toolbar says so first (the gate stays
+        // at the API; the button is the display, never the safety).
+        var running = has && rec.get('lastRunResult') === 'running';
+        setDisabled(grid, 'cloudTaskRun', !has || running);
         setDisabled(grid, 'cloudTaskPreview', !has);
         setDisabled(grid, 'cloudTaskDetails', !has);
         setDisabled(grid, 'cloudTaskEdit', !has);
@@ -2242,6 +2268,7 @@
                     return k === 'lastRunResult' ? result
                         : k === 'lastRunAt' ? task.lastRunAt
                         : k === 'overdue' ? task.overdue
+                        : k === 'runningProgress' ? task.runningProgress
                         : k === 'name' ? task.name
                         : undefined;
                 } }));
@@ -3198,7 +3225,7 @@
             fields: [
                 'name', 'source', 'remote', 'path', 'destination', 'mode',
                 'notify', 'bwlimit', 'schedule', 'lastRunResult', 'lastRunAt',
-                'nextRunAt',
+                'nextRunAt', 'runningProgress',
                 { name: 'excludes', type: 'auto' },
                 { name: 'cadence', type: 'auto' },
                 { name: 'enabled', type: 'auto' },

@@ -38,9 +38,12 @@ import {
   gateRun,
   readAllTasks,
   readRecentJournal,
+  readRunActive,
   readTask,
   readUnitTexts,
   removeTaskUnits,
+  runningDirectJobProgress,
+  runningRunConflictMessage,
   superviseRun,
   taskFileExists,
   tasksReferencingRemote,
@@ -540,12 +543,18 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       return Promise.all(
         tasks.map(async (task): Promise<CloudSyncTaskView> => {
           const st = await deriveTaskStatus(executor, task)
+          // rclone.3 human-pass finding 2: while the run actually executes,
+          // the running DIRECT job's rclone stats text rides on the row — the
+          // run outliving the Run-Now supervisor's ceiling keeps reading as
+          // alive instead of a bare running pill. Absent otherwise.
+          const progress = st.runActive ? runningDirectJobProgress(jobQueue, task.name) : null
           return {
             ...task,
             lastRunResult: st.lastRunResult,
             lastRunAt: st.lastRunAt,
             nextRunAt: st.nextRunAt,
             overdue: st.overdue,
+            ...(progress ? { runningProgress: progress } : {}),
           }
         }),
       )
@@ -687,6 +696,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         .catch(() => [] as string[]),
     ])
 
+    const detailProgress = st.runActive ? runningDirectJobProgress(jobQueue, name) : null
     const detail: CloudSyncTaskDetail = {
       task: {
         ...task,
@@ -694,6 +704,7 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
         lastRunAt: st.lastRunAt,
         nextRunAt: st.nextRunAt,
         overdue: st.overdue,
+        ...(detailProgress ? { runningProgress: detailProgress } : {}),
       },
       ...(consistency ? { consistency } : {}),
       ...(nested.length ? { nested } : {}),
@@ -803,6 +814,25 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
     if (!(await taskFileExists(systemdDir, name))) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Cloud sync task '${name}' not found` } }
+    }
+
+    // rclone.3 human-pass finding 1: a run already in flight refuses the door
+    // with the run named — the supervising job a second click would submit
+    // adds nothing but a "waiting" line in the job list. The supervision's own
+    // attach behaviour stays (the timer-vs-manual race still needs it); this
+    // gate is for the USER who can see the row. When the task's direct run is
+    // executing, its live progress quotes in the sentence.
+    if (!direct) {
+      const run = await readRunActive(executor, name)
+      if (run.active) {
+        reply.code(409)
+        return {
+          error: {
+            code: 'CONFLICT',
+            message: runningRunConflictMessage(name, run, runningDirectJobProgress(jobQueue, name)),
+          },
+        }
+      }
     }
 
     const job = jobQueue.submit(

@@ -297,6 +297,14 @@ export const CloudSyncTaskView = CloudSyncTask.extend({
   nextRunAt: ISODateTime.nullable(),
   /** Enabled task past its schedule without a successful run (counts as failed). */
   overdue: z.boolean(),
+  /**
+   * rclone.3 human-pass finding 2 — the running direct run job's progress text
+   * (rclone's live stats line, verbatim), present ONLY while the run actually
+   * executes. A run outliving the Run-Now supervisor's 10-minute ceiling keeps
+   * its row and detail window reading "running — <progress>" instead of a bare
+   * pill. ADDITIVE/optional: an older daemon (or a finished run) omits it.
+   */
+  runningProgress: z.string().optional(),
 })
 export type CloudSyncTaskView = z.infer<typeof CloudSyncTaskView>
 

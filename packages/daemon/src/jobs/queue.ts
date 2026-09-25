@@ -121,11 +121,23 @@ export class JobQueue {
    * `rmw_level` and `sync_min`/`sync_max` turned aside). Status is the filter
    * here, and the answer is a job that is actually in flight or nothing.
    */
-  findActive(operations: string | readonly string[], target: string, paramKey: string = 'name'): Job | undefined {
+  findActive(
+    operations: string | readonly string[],
+    target: string,
+    paramKey: string = 'name',
+    /** Extra submitter-param key/values a match must ALSO carry (e.g. `{ direct: true }`). */
+    withParams?: Record<string, unknown>,
+  ): Job | undefined {
     const wanted = new Set(typeof operations === 'string' ? [operations] : operations)
     for (const record of this.jobs.values()) {
       if (!wanted.has(record.job.operation) || record.submitter.params?.[paramKey] !== target)
         continue
+      if (withParams) {
+        const params = record.submitter.params ?? {}
+        const matched = Object.entries(withParams).every(([k, v]) => params[k] === v)
+        if (!matched)
+          continue
+      }
       if (record.job.status === 'queued' || record.job.status === 'running')
         return record.job
     }

@@ -108,9 +108,12 @@ import {
   gateRun,
   readAllTasks,
   readRecentJournal,
+  readRunActive,
   readTask,
   readUnitTexts,
   removeTaskUnits,
+  runningDirectJobProgress,
+  runningRunConflictMessage,
   superviseRun,
   taskFileExists,
   validateSchedule,
@@ -746,12 +749,17 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const data = await Promise.all(
       tasks.map(async (task): Promise<BackupTaskEntry> => {
         const st = await deriveTaskStatus(executor, task)
+        // rclone.3 human-pass finding 2 (backup parity): while the run actually
+        // executes, the running DIRECT job's progress text rides on the row —
+        // same rule, same helper, as the Cloud Sync grid.
+        const progress = st.runActive ? runningDirectJobProgress(jobQueue, task.name) : null
         const entry: BackupTaskEntry = {
           task: toTaskView(task, joinRepos),
           lastRunResult: st.lastRunResult,
           lastRunAt: st.lastRunAt,
           nextRunAt: st.nextRunAt,
           overdue: st.overdue,
+          ...(progress ? { runningProgress: progress } : {}),
         }
         // backup2.9 — a block task's LUN NAME is read live: the unit stores the
         // record and the serial-derived id, never the display name (it can
@@ -961,12 +969,14 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     const lastRunNotices = Array.isArray(lastRunResult?.notices)
       ? lastRunResult.notices.filter((n): n is string => typeof n === 'string')
       : undefined
+    const detailProgress = st.runActive ? runningDirectJobProgress(jobQueue, name) : null
     const detail: BackupTaskDetail = {
       task: toTaskView(task, joinRepos),
       lastRunResult: st.lastRunResult,
       lastRunAt: st.lastRunAt,
       nextRunAt: st.nextRunAt,
       overdue: st.overdue,
+      ...(detailProgress ? { runningProgress: detailProgress } : {}),
       unit: units.unit,
       timer: units.timer,
       ...(journal ? { journal } : {}),
@@ -1115,6 +1125,25 @@ export async function backupRoutes(server: FastifyInstance, opts: BackupRouteOpt
     if (!(await taskFileExists(systemdDir, name))) {
       reply.code(404)
       return { error: { code: 'NOT_FOUND', message: `Backup task '${name}' not found` } }
+    }
+
+    // rclone.3 human-pass finding 1 (backup parity — the same gate, the same
+    // sentence shape, as the Cloud Sync run door): a run already in flight
+    // refuses the door with the run named. The supervision's own attach
+    // behaviour stays for the timer-vs-manual race; this gate is for the USER
+    // who can see the row. When the task's direct run is executing, its live
+    // progress quotes in the sentence.
+    if (!direct) {
+      const run = await readRunActive(executor, name)
+      if (run.active) {
+        reply.code(409)
+        return {
+          error: {
+            code: 'CONFLICT',
+            message: runningRunConflictMessage(name, run, runningDirectJobProgress(jobQueue, name)),
+          },
+        }
+      }
     }
 
     const job = jobQueue.submit(

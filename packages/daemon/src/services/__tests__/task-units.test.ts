@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { describe, it } from 'node:test'
 import { BACKUP_SKIP_EXIT_CODE } from '@anas/shared'
 import { MockExecutor } from '../../executor/mock.js'
+import { JobQueue } from '../../jobs/queue.js'
 import { BACKUP_UNIT_KIND } from '../backup-units.js'
 import { CLOUD_UNIT_KIND } from '../cloud-units.js'
 import {
@@ -25,9 +26,12 @@ import {
   parseHelperResult,
   readLastSuccessAt,
   readRecentJournal,
+  readRunActive,
   readUnitTexts,
   removeTaskUnits,
   runFailed,
+  runningDirectJobProgress,
+  runningRunConflictMessage,
   serviceUnitName,
   superviseTaskRun,
   sweepOrphanTaskStamps,
@@ -608,7 +612,12 @@ describe('task units — Run-Now supervision under the cloud prefix', () => {
     })
     assert.equal(run.status, 'running')
     assert.equal(run.helper, null)
-    assert.match(run.reason ?? '', /still running after 0s/)
+    // rclone.3 human-pass finding 2: the ceiling names where the run keeps
+    // showing — the task row, which now carries the direct job's progress.
+    assert.match(
+      run.reason ?? '',
+      /still running after 0s — systemd continues it; the task row shows its progress until it ends/,
+    )
   })
 
   it('a failed systemctl start throws (there is nothing to supervise)', async () => {
@@ -618,6 +627,96 @@ describe('task units — Run-Now supervision under the cloud prefix', () => {
       startStderr: `Failed to start ${SERVICE}: Unit not found.`,
     })
     await assert.rejects(superviseTaskRun(CLOUD_UNIT_KIND, mock, TASK, FAST), /Unit not found/)
+  })
+})
+
+describe('task units — the Run-Now gate inputs (rclone.3 human-pass findings)', () => {
+  const SHOW_ACTIVE_PROPS = 'ActiveState,InactiveExitTimestamp'
+  /** 2026-09-25T10:00:00Z in the usec form systemd actually prints. */
+  const SINCE_USEC = String(Date.parse('2026-09-25T10:00:00Z') * 1000)
+
+  function activeMock(props: Record<string, string>): MockExecutor {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['show', SERVICE, '-p', SHOW_ACTIVE_PROPS],
+      result: ok(showBlob(props)),
+    })
+    return mock
+  }
+
+  it('readRunActive: an active unit answers active with the invocation start', async () => {
+    const mock = activeMock({ ActiveState: 'active', InactiveExitTimestamp: SINCE_USEC })
+    const run = await readRunActive(mock, CLOUD_UNIT_KIND, TASK)
+    assert.deepEqual(run, { active: true, since: '2026-09-25T10:00:00.000Z' })
+    // The ONE read the door makes — the two props the answer needs, no more.
+    assert.deepEqual(mock.calls.at(0)?.args, ['show', SERVICE, '-p', SHOW_ACTIVE_PROPS])
+  })
+
+  it('readRunActive: a terminal run answers not-running, and never dates it (InactiveExit is when it ENDED)', async () => {
+    const mock = activeMock({ ActiveState: 'inactive', InactiveExitTimestamp: SINCE_USEC })
+    const run = await readRunActive(mock, CLOUD_UNIT_KIND, TASK)
+    assert.deepEqual(run, { active: false, since: null })
+  })
+
+  it('readRunActive: an unreadable unit fails OPEN to not-running (the gate must not wedge)', async () => {
+    const mock = new MockExecutor() // no fixture: the exec comes back 127 / empty
+    const run = await readRunActive(mock, CLOUD_UNIT_KIND, TASK)
+    assert.deepEqual(run, { active: false, since: null })
+  })
+
+  it('runningDirectJobProgress: the in-flight DIRECT run\'s progress text, verbatim, and nothing else', () => {
+    const queue = new JobQueue()
+    const watched = queue.submit('cloud.task.run', { user: 'root@pam', uid: 0, params: { task: TASK, direct: true } }, () => new Promise<void>(() => {}))
+    // No progress yet — null, not ''.
+    assert.equal(runningDirectJobProgress(queue, 'cloud.task.run', TASK), null)
+    queue.get(watched.id)!.progress = 'copy: 1527851 of 17283186 bytes, 363 transferred, ETA 62685s'
+    assert.equal(runningDirectJobProgress(queue, 'cloud.task.run', TASK), 'copy: 1527851 of 17283186 bytes, 363 transferred, ETA 62685s')
+    // A different task, a different operation, and a FINISHED job all read as none.
+    assert.equal(runningDirectJobProgress(queue, 'cloud.task.run', 'other'), null)
+    assert.equal(runningDirectJobProgress(queue, 'backup.task.run', TASK), null)
+    const finished = queue.submit('cloud.task.run', { user: 'root@pam', uid: 0, params: { task: TASK, direct: true } }, () => new Promise<void>(() => {}))
+    queue.get(finished.id)!.status = 'completed'
+    queue.get(finished.id)!.progress = 'stale last run'
+    assert.equal(runningDirectJobProgress(queue, 'cloud.task.run', TASK), 'copy: 1527851 of 17283186 bytes, 363 transferred, ETA 62685s')
+    // The supervising (non-direct) job never passes for the run itself.
+    const supervisor = queue.submit('cloud.task.run', { user: 'root@pam', uid: 0, params: { task: TASK } }, () => new Promise<void>(() => {}))
+    queue.get(supervisor.id)!.progress = 'cloud sync task \'offsite\' is already running — waiting for it to finish'
+    assert.equal(runningDirectJobProgress(queue, 'cloud.task.run', TASK), 'copy: 1527851 of 17283186 bytes, 363 transferred, ETA 62685s')
+  })
+
+  it('runningRunConflictMessage: the run, its start, what continues it — and the live progress', () => {
+    const active = { active: true as const, since: '2026-09-25T10:00:00.000Z' }
+    assert.equal(
+      runningRunConflictMessage(CLOUD_UNIT_KIND, TASK, active, 'copy: 1527851 of 17283186 bytes'),
+      'Cloud sync task \'offsite\' is already running since 2026-09-25T10:00:00.000Z; '
+      + 'it continues under systemd — wait for it to finish — copy: 1527851 of 17283186 bytes',
+    )
+    // No progress known (the direct job not yet started, or already polled away):
+    // the sentence stands without it.
+    assert.equal(
+      runningRunConflictMessage(CLOUD_UNIT_KIND, TASK, active, null),
+      'Cloud sync task \'offsite\' is already running since 2026-09-25T10:00:00.000Z; '
+      + 'it continues under systemd — wait for it to finish',
+    )
+    // systemd could not date the invocation: the sentence keeps its shape.
+    assert.equal(
+      runningRunConflictMessage(BACKUP_UNIT_KIND, 'nightly', { active: true, since: null }, 'pbc: 4 of 9 snapshots'),
+      'Backup task \'nightly\' is already running; '
+      + 'it continues under systemd — wait for it to finish — pbc: 4 of 9 snapshots',
+    )
+  })
+
+  it('deriveTaskStatus carries runActive off the same systemctl show it already read', async () => {
+    const mock = new MockExecutor()
+    mock.addFixture({
+      command: SYSTEMCTL,
+      args: ['show', SERVICE, '-p', SHOW_STATUS_PROPS],
+      result: ok(showBlob({ ActiveState: 'active', Result: 'success' })),
+    })
+    mock.addFixture({ command: SYSTEMCTL, args: ['show', TIMER, '-p', 'NextElapseUSecRealtime'], result: ok('NextElapseUSecRealtime=n/a\n') })
+    const st = await deriveTaskStatus(CLOUD_UNIT_KIND, mock, task())
+    assert.equal(st.runActive, true)
   })
 })
 

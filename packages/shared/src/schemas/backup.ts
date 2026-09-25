@@ -1283,6 +1283,12 @@ export const BackupTaskEntry = z.object({
   /** Enabled task past its schedule without a successful run (counts as failed). */
   overdue: z.boolean(),
   /**
+   * rclone.3 human-pass finding 2 (backup parity) — the running direct run
+   * job's progress text, verbatim, present ONLY while the run actually
+   * executes (see CloudSyncTaskView.runningProgress). ADDITIVE/optional.
+   */
+  runningProgress: z.string().optional(),
+  /**
    * backup2.9 — for a BLOCK task: the LUN's human NAME, resolved LIVE from the
    * iSCSI read layer. The stored task carries only the `{ targetIqn, index }`
    * record and the serial-derived backup-id; the name is display-only and can
@@ -1310,6 +1316,8 @@ export const BackupTaskDetail = z.object({
   lastRunAt: ISODateTime.nullable(),
   nextRunAt: ISODateTime.nullable(),
   overdue: z.boolean(),
+  /** The running direct run's live progress text while one executes (ADDITIVE/optional). */
+  runningProgress: z.string().optional(),
   /** The .service unit file, verbatim. */
   unit: z.string(),
   /** The .timer unit file, verbatim. */
