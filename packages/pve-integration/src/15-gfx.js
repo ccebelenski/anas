@@ -721,6 +721,130 @@
         }
     };
 
+    // ======================================================================
+    // ROLLING SAMPLE BUFFERS + SPARKS (rclone.6 — moved from 50-dashboard so
+    // the cloud run viewer and the task rows can hold rings of their own).
+    // ======================================================================
+
+    // pushBuf(view, bufKey, seenKey, key, value, cap) → the (mutated,
+    // oldest→newest) rolling buffer for `key`, capped at `cap`. The buffers live
+    // on the VIEW (under bufKey, e.g. `_anasSpark`), so they reset with the
+    // panel and never touch the server (no persisted history — Principle 7).
+    // A render is not a measurement: a panel may re-render several times inside
+    // one poll tick, and each render would otherwise duplicate the current
+    // sample — bending peak, average and the chart's own time axis.
+    // `_anasSampleSeq` is bumped once per poll tick by the polling panel; a
+    // buffer accepts one push per key per seq and returns itself unchanged for
+    // any further push at that seq.
+    gfx.pushBuf = function (view, bufKey, seenKey, key, value, cap) {
+        var buf = view[bufKey] || (view[bufKey] = {});
+        var seen = view[seenKey] || (view[seenKey] = {});
+        var arr = buf[key] || (buf[key] = []);
+        var seq = view._anasSampleSeq || 0;
+        if (seen[key] !== seq || arr.length === 0) {
+            seen[key] = seq;
+            arr.push(value);
+            while (arr.length > cap) {
+                arr.shift();
+            }
+        }
+        return arr;
+    };
+
+    // pushSpark(view, key, value, cap) → push a THROUGHPUT sample (a real 0
+    // counts — an idle window is a truthful zero, not a hole) onto the
+    // `_anasSpark` ring and return the buffer.
+    gfx.pushSpark = function (view, key, value, cap) {
+        var n = Number(value);
+        return gfx.pushBuf(view, '_anasSpark', '_anasSeenSpark', key, isNaN(n) ? 0 : n, cap);
+    };
+
+    // sparkFromSamples(samples, opts) → an inline SVG sparkline rendered
+    // straight from a samples array (oldest→newest), independent of any rolling
+    // buffer — the cloud run viewer draws it from a job's `speedSamples`, the
+    // dashboard rows from their `_anasSpark` rings.
+    //   samples : array of numbers (nulls/NaN skipped for the max scale)
+    //   opts    : { size:'full'|'small'|'tiny' (default 'small'),
+    //               color:cssVar override, title:String }
+    var SPARK_SIZES = {
+        full: { w: '100%', h: 28 },
+        small: { w: 90, h: 20 },
+        tiny: { w: 64, h: 14 }
+    };
+    gfx.sparkFromSamples = function (samples, opts) {
+        try {
+            ensureInjected();
+            opts = opts || {};
+            var arr = [];
+            var max = 0;
+            var i, v;
+            if (samples && samples.length) {
+                for (i = 0; i < samples.length; i++) {
+                    v = Number(samples[i]);
+                    if (isNaN(v)) { continue; }
+                    arr.push(v);
+                    if (v > max) { max = v; }
+                }
+            }
+            if (arr.length === 0) { return ''; }
+            if (max <= 0) { max = 1; }
+            var size = SPARK_SIZES[opts.size] || SPARK_SIZES.small;
+            var col = opts.color || 'var(--anas-series-1,#3468c0)';
+            var title = opts.title ? ' title="' + enc(opts.title) + '"' : '';
+            // 100×24 viewBox stretched by CSS (preserveAspectRatio none) — the
+            // shape follows its container; non-scaling-stroke keeps the line 2px.
+            var pts = [];
+            var span = arr.length > 1 ? arr.length - 1 : 1;
+            for (i = 0; i < arr.length; i++) {
+                pts.push(((i / span) * 100).toFixed(2) + ',' + (23 - (arr[i] / max) * 21).toFixed(2));
+            }
+            var svg = '<svg class="anas-gfx-spark anas-gfx-spark-' + (opts.size || 'small')
+                + '" viewBox="0 0 100 24" preserveAspectRatio="none" style="width:'
+                + size.w + ';height:' + size.h + 'px;vertical-align:middle;display:inline-block"'
+                + title + '>';
+            if (arr.length > 1) {
+                svg += '<polygon points="' + pts.join(' ') + ' 100,24 0,24" fill="' + col
+                    + '" opacity="0.12" stroke="none"/>';
+            }
+            svg += '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + col
+                + '" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>';
+            return svg;
+        } catch (e) {
+            warn('sparkFromSamples failed: ' + (e && e.message));
+            return '';
+        }
+    };
+
+    // stalledFor(detail) → seconds a cloud run has been stalled for, or null.
+    // "Stalled" (rclone.6): the last 3 speed samples are all zero while the run
+    // still has transfers outstanding (transfers < totalTransfers). rclone
+    // publishes a stats object every 5s (--stats 5s, pinned in the daemon), so
+    // trailing zero samples convert to seconds at that cadence.
+    var STALLED_SAMPLES = 3;
+    var STATS_INTERVAL_SECS = 5;
+    gfx.stalledFor = function (detail) {
+        if (!detail || !detail.speedSamples || !detail.speedSamples.length) { return null; }
+        if (!(Number(detail.transfers) < Number(detail.totalTransfers))) { return null; }
+        var s = detail.speedSamples;
+        var zeros = 0;
+        for (var i = s.length - 1; i >= 0 && Number(s[i]) === 0; i--) {
+            zeros++;
+        }
+        return zeros >= STALLED_SAMPLES ? zeros * STATS_INTERVAL_SECS : null;
+    };
+
+    // stalledHtml(detail) → the danger "stalled for Ns" label, or ''. ONE
+    // builder for all three homes of the label (run viewer, task row, jobs
+    // strip) so a stalled run reads the same wherever it is seen.
+    gfx.stalledHtml = function (detail) {
+        var sec = gfx.stalledFor(detail);
+        if (sec === null) { return ''; }
+        return '<span class="anas-gfx-stalled"'
+            + ' style="color:var(--anas-danger,#c23b2c);font-size:0.9em;">'
+            + enc('stalled for ' + (ANAS.formatDuration(sec * 1000) || sec + 's'))
+            + '</span>';
+    };
+
     function segColor(seg, i) {
         if (seg && seg.color) { return seg.color; }
         if (seg && seg.free) { return FREE_COLOR; }

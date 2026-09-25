@@ -890,6 +890,9 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
               fstabPath,
               ...(opts.storagePath ? { consistencyOptions: { pveStorageCfg: opts.storagePath } } : {}),
               onSpawn: cancel.onSpawn,
+              // rclone.6: the run's live detail rides on the job itself, beside
+              // the text progress — `GET /v1/jobs/:id` carries both.
+              onDetail: ctx.updateDetail,
             },
             updateProgress,
           )

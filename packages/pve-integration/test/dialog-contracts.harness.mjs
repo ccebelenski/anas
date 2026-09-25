@@ -1053,6 +1053,11 @@ function loadSources(files, routes) {
     createElement: () => ({ style: {}, appendChild() {}, setAttribute() {} }),
   }
   const win = { document: doc, ANAS: makeAnas(routes) }
+  // Recorded intervals: nothing ever fires them on its own (same silence the
+  // bare stub had), but a check can fire a recorded callback by id to stand in
+  // for a real timer tick — the run viewer's 2 s poll (rclone.6).
+  const intervals = new Map()
+  let intervalSeq = 0
   const sandbox = {
     window: win,
     document: doc,
@@ -1060,11 +1065,18 @@ function loadSources(files, routes) {
     Promise,
     Date,
     Ext,
-    setInterval: () => 1,
-    clearInterval: () => {},
+    setInterval: (fn) => { intervalSeq += 1; intervals.set(intervalSeq, fn); return intervalSeq },
+    clearInterval: (id) => { intervals.delete(id) },
     setTimeout: (fn) => { fn(); return 1 },
     clearTimeout: () => {},
   }
+  sandbox._fireInterval = (id) => {
+    const fn = intervals.get(id)
+    if (fn) { fn() }
+  }
+  // Reachable from checks through the sandbox's own ANAS (the stub-fn restore
+  // below never touches it): fire a recorded timer by its setInterval id.
+  win.ANAS._harnessFireInterval = sandbox._fireInterval
   // 10-api.js defines the REAL shared helpers (ANAS.pve — pvepool.2 U0/U1 —
   // and editGuard), which the sandbox keeps; but it also replaces the stub's
   // job plumbing with real polling. Put the recording stubs back so the
@@ -12882,6 +12894,312 @@ await backupCancelRunChecks()
 
 warnings.length = 0
 dashboardCancelledStripChecks()
+
+// ============================================================================
+//  rclone.6 — Run viewer (anas-win-cloud-run), plus the same spark in two
+//  more places: the dashboard's jobs strip and the task row
+// ============================================================================
+
+/**
+ * The running job as `GET /v1/jobs/:id` answers it — the queue carries the
+ * runner's published `detail` verbatim. MID is mid-run WITH an error (and not
+ * stalled); STALLED's ring trails zeros while files remain; EARLY has just
+ * started; DONE is the completed job. The same fixture shape drives the viewer
+ * body, the row's tiny spark and the strip's small spark.
+ */
+const RUN_VIEW_DETAIL = {
+  startedAt: '2026-09-25T12:00:00.000Z',
+  elapsedMs: 125000,
+  speed: 688901.8,
+  eta: 180,
+  bytes: 684032,
+  totalBytes: 3000000,
+  transfers: 2,
+  totalTransfers: 5,
+  checks: 1,
+  totalChecks: 5,
+  deletes: 1,
+  errors: 1,
+  lastError: 'f4.bin: read error: connection reset by peer',
+  transferring: [
+    { name: 'f5.bin', size: 3000000, bytes: 684032, percentage: 22, speed: 688901.8, eta: 3 },
+  ],
+  recent: [
+    { name: 'f4.bin', kind: 'error', at: '2026-09-25T12:01:30.000Z', message: 'read error: connection reset by peer' },
+    { name: 'f3.bin', kind: 'copied', at: '2026-09-25T12:01:20.000Z' },
+  ],
+  speedSamples: [688901.8, 700000, 655000, 690000, 688901.8],
+}
+const runViewJob = (status, detail, extra = {}) => ({
+  id: 'job-42',
+  operation: 'cloud.task.run',
+  status,
+  progress: 'copy: 684032 of 3000000 bytes',
+  detail,
+  ...extra,
+})
+const RUN_TASK = { name: 'drive-hours', source: '/mnt/pictures', remote: 'gt', path: 'backups', mode: 'copy' }
+
+/** The last-run cell of a running row carrying a polled `runningDetail`. */
+function rowSparkChecks(grid) {
+  const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
+  const rec = {
+    get: k => ({
+      lastRunResult: 'running',
+      runningProgress: CLOUD_RUNNING_PROGRESS,
+      runningJobId: 'job-42',
+      name: 'drive-hours',
+      runningDetail: RUN_VIEW_DETAIL,
+    }[k]),
+  }
+  const cell = lastRunCol.renderer('running', {}, rec)
+  ok('cloud row: the running cell carries the TINY spark beside the progress text',
+    /anas-gfx-spark-tiny/.test(cell), cell)
+  ok('cloud row: …with the current speed labeled beside it',
+    /688901\.8 B\/s/.test(cell), cell)
+  ok('cloud row: a healthy ring shows no stalled label', !/anas-gfx-stalled/.test(cell), cell)
+  const stalledRec = {
+    get: k => ({
+      lastRunResult: 'running',
+      runningJobId: 'job-42',
+      name: 'drive-hours',
+      runningDetail: { ...RUN_VIEW_DETAIL, speedSamples: [688901.8, 0, 0, 0] },
+    }[k]),
+  }
+  const stalled = lastRunCol.renderer('running', {}, stalledRec)
+  ok('cloud row: three zero samples while files remain ⇒ the stalled label',
+    /anas-gfx-stalled[^]*stalled for 15s/.test(stalled), stalled)
+  const quiet = lastRunCol.renderer('running', {}, {
+    get: k => ({ lastRunResult: 'running', runningProgress: CLOUD_RUNNING_PROGRESS }[k]),
+  })
+  ok('cloud row: without a polled detail the cell renders exactly as before',
+    /fa-refresh/.test(quiet) && !/anas-gfx-spark/.test(quiet), quiet)
+  ok('cloud row: the running text marks itself as the viewer door',
+    /data-anas-run-view="drive-hours"/.test(cell), cell)
+}
+
+/** The strip: small spark + speed + stalled label ONLY when details ride in. */
+function stripSparkChecks() {
+  const ANAS = loadSources(['15-gfx.js', '50-dashboard.js'], {})
+  const job = { id: 'job-42', kind: 'cloud.task.run', status: 'running', startedAt: '2026-09-25T12:00:00.000Z' }
+  const plain = ANAS.dash.jobsStrip({ jobs: [job] })
+  ok('dashboard strip: without details the running row renders exactly as before',
+    !/anas-gfx-spark/.test(plain), plain)
+  const sparked = ANAS.dash.jobsStrip({ jobs: [job] }, { 'job-42': RUN_VIEW_DETAIL })
+  const row = sparked.split('anas-dash-job"').find(r => r.includes('cloud.task.run')) || ''
+  ok('dashboard strip: an in-flight cloud run carries the SMALL spark',
+    /anas-gfx-spark-small/.test(row), row)
+  ok('dashboard strip: …with the current speed labeled beside it',
+    /688901\.8 B\/s/.test(row), row)
+  ok('dashboard strip: a healthy ring shows no stalled label', !/anas-gfx-stalled/.test(row), row)
+  const stalled = ANAS.dash.jobsStrip({ jobs: [job] },
+    { 'job-42': { ...RUN_VIEW_DETAIL, speedSamples: [688901.8, 0, 0, 0] } })
+  ok('dashboard strip: the same stalled label the row and viewer show',
+    /anas-gfx-stalled[^]*stalled for 15s/.test(stalled), stalled)
+  ok('dashboard strip: a finished run renders no spark even when its detail lingers',
+    !/anas-gfx-spark/.test(ANAS.dash.jobsStrip({ jobs: [{ ...job, status: 'completed',
+      finishedAt: '2026-09-25T12:20:00Z' }] }, { 'job-42': RUN_VIEW_DETAIL })))
+}
+
+/**
+ * The viewer BODY at the four moments (pure `ANAS.cloud.runViewerBody`), then
+ * the WINDOW: its 2 s poll, its stop on a finished job, the no-detail
+ * sentence, the View run gating and the running-text door.
+ */
+async function cloudRunViewerChecks() {
+  const routes = cloudTaskRoutes()
+  const jobGets = () => apiGets.filter(g => g === '/jobs/job-42').length
+  let jobAnswer = runViewJob('running', RUN_VIEW_DETAIL)
+  routes['GET /jobs/job-42'] = () => ({ job: jobAnswer })
+  routes['GET /cloud/tasks/drive-hours'] = { data: {
+    task: RUN_TASK,
+    consistency: { consistency: 'snapshot', reason: 'read from the task\'s own snapshot' },
+  } }
+  routes['GET /cloud/tasks'] = {
+    data: [
+      CLOUD_TASK_VIEW,
+      { ...CLOUD_TASK_VIEW, name: 'drive-hours', lastRunResult: 'running',
+        runningProgress: CLOUD_RUNNING_PROGRESS, runningJobId: 'job-42' },
+      { ...CLOUD_TASK_VIEW, name: 'drive-quiet', lastRunResult: 'running' },
+    ],
+  }
+  const ANAS = loadSources(['10-api.js', '12-picker.js', '15-gfx.js', '69-schedules-common.js', '72-cloud.js'], routes)
+  const view = makeComponent(ANAS.views.cloud.factory('harness'), null)
+  view.fireEvent('afterrender', view)
+  await settle()
+  const grid = view.down('#cloudTasksGrid')
+  rowSparkChecks(grid)
+
+  // --- the body at four moments ----------------------------------------------
+  const body = (job, opts) => ANAS.cloud.runViewerBody(RUN_TASK, job, opts)
+
+  const early = body(runViewJob('running', { ...RUN_VIEW_DETAIL, transfers: 0,
+    bytes: 0, errors: 0, lastError: undefined, recent: [], transferring: [],
+    speedSamples: [300000], eta: null }), {})
+  ok('run viewer: the header carries task, source → destination, mode, status',
+    /drive-hours[^]*mnt\/pictures[^]*gt:backups/.test(early) && /copy/.test(early)
+    && /running/.test(early), early)
+  ok('run viewer: the bytes bar carries the bytes-of-total caption',
+    /anas-gfx-gauge/.test(early) && /0 B of 3000000 B/.test(early), early)
+  ok('run viewer: the thin files bar follows with "0 of 5 files"',
+    /anas-gfx-bar/.test(early) && /0 of 5 files/.test(early), early)
+  ok('run viewer: the throughput spark renders from speedSamples (full size)',
+    /anas-gfx-spark-full[^]*<polyline/.test(early), early)
+  ok('run viewer: every figure carries its label — speed, ETA, elapsed, files, checks, deletes, errors',
+    ['speed', 'ETA', 'elapsed', 'files', 'checks', 'deletes', 'errors']
+      .every(l => early.includes(`data-anas-run-figure="${l}"`)), early)
+  ok('run viewer: nothing in flight says so',
+    /nothing in flight/.test(early), early)
+  ok('run viewer: an empty ring of events says so',
+    /nothing finished yet/.test(early), early)
+
+  const mid = body(runViewJob('running', RUN_VIEW_DETAIL), {})
+  ok('run viewer: Transferring now shows the in-flight file with its size, inline bar, %, speed and ETA',
+    (mid.match(/anas-run-transferring-row/g) || []).length === 1
+    && /f5\.bin/.test(mid) && /3000000 B/.test(mid) && /22%/.test(mid)
+    && /688901\.8 B\/s/.test(mid), mid)
+  ok('run viewer: Recent lists errors FIRST, in danger, with the message',
+    (mid.match(/anas-run-recent-row/g) || []).length === 2
+    && /anas-run-recent-row" data-anas-run-recent-kind="error"[^]*read error/.test(mid)
+    && mid.indexOf('data-anas-run-recent-kind="error"') < mid.indexOf('data-anas-run-recent-kind="copied"'),
+    mid)
+  ok('run viewer: the last error line stands under the grids',
+    /Last error: f4\.bin: read error/.test(mid), mid)
+  ok('run viewer: a non-zero error figure wears the danger colour',
+    /data-anas-run-figure="errors"[^]*anas-danger/.test(mid), mid)
+  ok('run viewer: a healthy ring shows no stalled label', !/anas-gfx-stalled/.test(mid), mid)
+
+  const stalled = body(runViewJob('running', { ...RUN_VIEW_DETAIL,
+    speedSamples: [688901.8, 0, 0, 0] }), {})
+  ok('run viewer: three zero samples while files remain ⇒ "stalled for 15s" in danger',
+    /anas-gfx-stalled[^]*stalled for 15s/.test(stalled), stalled)
+
+  const done = body(runViewJob('completed', { ...RUN_VIEW_DETAIL,
+    transfers: 5, bytes: 3000000, errors: 0, lastError: undefined, transferring: [] }), {})
+  ok('run viewer: a finished job shows the result banner — files, bytes, duration, no errors',
+    /anas-run-result-banner/.test(done) && /5 files/.test(done) && /no errors/.test(done), done)
+  ok('run viewer: …the in-flight section is gone, the bars stand at their final values',
+    !/anas-run-transferring/.test(done) && /anas-gfx-gauge/.test(done), done)
+  ok('run viewer: the last error line does not outlive a clean finish',
+    !/Last error/.test(done), done)
+  const failed = body(runViewJob('failed', { ...RUN_VIEW_DETAIL, errors: 2 },
+    { error: { code: 'RUN_FAILED', message: 'rclone exited 6' } }), {})
+  ok('run viewer: a failed run leads the banner with its error and counts the errors',
+    /rclone exited 6/.test(failed) && /2 errors/.test(failed), failed)
+  const cancelled = body(runViewJob('cancelled', RUN_VIEW_DETAIL,
+    { result: { status: 'cancelled', reason: 'cancelled by root@pam at 2026-09-25T12:02:05.000Z' } }), {})
+  ok('run viewer: a cancelled run leads the banner with the cancellation reason',
+    /cancelled by root@pam at 2026-09-25T12:02:05\.000Z/.test(cancelled), cancelled)
+
+  // The ring is 50 deep; ten show, the link says all.
+  const fifty = []
+  for (let i = 0; i < 50; i++) {
+    fifty.push({ name: `f${i}.bin`, kind: i === 7 ? 'error' : 'copied',
+      at: `2026-09-25T12:0${i % 10}:00.000Z`, message: i === 7 ? 'boom' : undefined })
+  }
+  const full = body(runViewJob('running', { ...RUN_VIEW_DETAIL, recent: fifty }), {})
+  ok('run viewer: ten recent rows show and the "show all 50" link stands under them',
+    (full.match(/anas-run-recent-row/g) || []).length === 10
+      && /data-anas-run-recent-all="1"[^]*show all 50/.test(full), full)
+  const allShown = body(runViewJob('running', { ...RUN_VIEW_DETAIL, recent: fifty }),
+    { showAllRecent: true })
+  ok('run viewer: the link\'s re-render shows the whole ring and the link is gone',
+    (allShown.match(/anas-run-recent-row/g) || []).length === 50
+      && !/data-anas-run-recent-all/.test(allShown), 'rows='
+      + (allShown.match(/anas-run-recent-row/g) || []).length)
+
+  // --- the no-detail sentence -------------------------------------------------
+  const noDetail = body(runViewJob('completed', null),
+    { journal: 'Sep 25 12:00:11 anasd[1]: drive-hours: run finished' })
+  ok('run viewer: a job that left the queue shows the per-file sentence',
+    /Per-file detail is shown only while a run is in progress\./.test(noDetail), noDetail)
+  ok('run viewer: …with the journal summary under it',
+    /Recent runs \(journald\)[^]*run finished/.test(noDetail), noDetail)
+
+  // --- the window: poll, stop, gating, the row's door --------------------------
+  created.windows.length = 0
+  const jobGetsBefore = jobGets()
+  const win = ANAS.cloud.openRunViewer('harness', 'drive-hours', 'job-42', grid,
+    { name: 'drive-hours', source: '/mnt/pictures', remote: 'gt', path: 'backups', mode: 'copy' })
+  await settle()
+  ok('run viewer: View run opens anas-win-cloud-run', !!win && win.cls === 'anas-win-cloud-run', win && win.cls)
+  ok('run viewer: opening polled the job (and only once — the recorded interval stands in for the 2 s timer)',
+    jobGets() - jobGetsBefore === 1, String(jobGets() - jobGetsBefore))
+  ok('run viewer: …and fetched the task for the live/snapshot label',
+    apiGets.includes('/cloud/tasks/drive-hours'), apiGets.join(' | '))
+  const bodyHtml = () => String((win.down('#runBody') || {}).html || '')
+  ok('run viewer: the live body renders the in-flight file',
+    /anas-run-transferring-row[^]*f5\.bin/.test(bodyHtml()), bodyHtml())
+  ok('run viewer: the header carries the live/snapshot chip from the task fetch',
+    /snapshot/.test(bodyHtml()), bodyHtml())
+  ok('run viewer: Cancel run is enabled while the job runs',
+    win.down('#cloudRunCancel').disabled === false)
+
+  // A 2 s tick with the job now finished: polling stops, the banner stands,
+  // Cancel run disables.
+  jobAnswer = runViewJob('completed', { ...RUN_VIEW_DETAIL, transfers: 5,
+    bytes: 3000000, errors: 0, lastError: undefined, transferring: [] })
+  ANAS._harnessFireInterval(win._anasRunTimer)
+  await settle()
+  ok('run viewer: the tick with a finished job renders the result banner',
+    /anas-run-result-banner[^]*no errors/.test(bodyHtml()), bodyHtml())
+  ok('run viewer: the poll stopped (the timer is cleared, no further fetch)',
+    win._anasRunTimer === null && jobGets() - jobGetsBefore === 2, String(win._anasRunTimer))
+  ok('run viewer: Cancel run disables once the job is no longer running',
+    win.down('#cloudRunCancel').disabled === true)
+
+  // No running job: the sentence above the journal facts.
+  created.windows.length = 0
+  const idleWin = ANAS.cloud.openRunViewer('harness', 'pictures-offsite', '', grid, null)
+  await settle()
+  ok('run viewer: no running job ⇒ the no-detail sentence in the window',
+    /Per-file detail is shown only while a run is in progress\./.test(
+      String((idleWin.down('#runBody') || {}).html || '')),
+    String((idleWin.down('#runBody') || {}).html || ''))
+
+  // --- View run gating + the row's door ---------------------------------------
+  created.windows.length = 0
+  const viewBtn = grid.down('#cloudTaskViewRun')
+  ok('run viewer: the toolbar carries View run', !!viewBtn && viewBtn.text === 'View run')
+  grid.selectRow(0)
+  ok('run viewer: an idle row keeps View run disabled', viewBtn.disabled === true)
+  grid.selectRow(1)
+  ok('run viewer: a running row with its job named enables View run', viewBtn.disabled === false)
+  viewBtn.handler(viewBtn)
+  await settle()
+  ok('run viewer: View run opened the run viewer window',
+    openWindow() && openWindow().cls === 'anas-win-cloud-run')
+  grid.selectRow(2)
+  ok('run viewer: a running row the daemon names no job for keeps it disabled',
+    viewBtn.disabled === true)
+
+  // The running text on the row opens it too: the cellclick answers only the
+  // marked pill, never the whole row.
+  created.windows.length = 0
+  const rec = grid.getStore().getAt(1)
+  const lastRunCol = (grid.columns || []).find(c => c.dataIndex === 'lastRunResult')
+  const cellHtml = lastRunCol.renderer('running', {}, rec)
+  ok('run viewer: the running pill carries the door mark', /data-anas-run-view/.test(cellHtml), cellHtml)
+  grid.fireEvent('cellclick', grid, { innerHTML: cellHtml }, 5, rec)
+  await settle()
+  ok('run viewer: clicking the running text opens the run viewer',
+    openWindow() && openWindow().cls === 'anas-win-cloud-run')
+  created.windows.length = 0
+  grid.fireEvent('cellclick', grid, { innerHTML: '<span>elsewhere</span>' }, 0, rec)
+  await settle()
+  ok('run viewer: a click elsewhere on the row opens nothing', created.windows.length === 0)
+
+  ok('run viewer: nothing warned', warnings.length === 0, warnings.join(' | '))
+  void view
+}
+
+warnings.length = 0
+created.windows.length = 0
+stripSparkChecks()
+
+warnings.length = 0
+created.windows.length = 0
+await cloudRunViewerChecks()
 
 // ============================================================================
 //  Story vdevs.1 (GitHub #66) — consumer audit: every vdev CLASS is reachable

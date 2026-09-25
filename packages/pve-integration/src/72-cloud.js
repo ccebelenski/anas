@@ -1903,6 +1903,23 @@
         };
     }
 
+    // rclone.6 — the row's tiny spark: beside the running progress text, from
+    // the running job's detail the grid polls every 5 s while a running row is
+    // on screen (one interval per grid). The same stalled label the viewer and
+    // the jobs strip show — one helper everywhere.
+    function runningDetailSparkHtml(rec) {
+        var d = (rec && rec.get && rec.get('runningDetail')) || null;
+        if (!d || !d.speedSamples || !d.speedSamples.length) {
+            return '';
+        }
+        return ' ' + ANAS.gfx.sparkFromSamples(d.speedSamples, {
+            size: 'tiny',
+            title: t('throughput, last 5 minutes'),
+        })
+            + ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+            + speedHtml(d.speed) + '</span> ' + ANAS.gfx.stalledHtml(d);
+    }
+
     // Last run: a result pill + the relative time, as the Backup grid renders
     // it. A FAILED run's cell carries rclone's last error line as the tooltip —
     // the line the notification body shows. The grid payload names no error
@@ -1926,11 +1943,16 @@
                 ANAS.sched.runErrorTip(rec.store, rec.get('name'), at));
         } else if (result === 'running') {
             var rp = runningProgressHtml(rec);
-            pill = '<span title="' + enc(rp.tip) + '"'
+            // rclone.6: the running text IS the viewer door — the pill carries
+            // the task name so the grid's cellclick can open the run viewer.
+            var runView = rec.get('runningJobId')
+                ? ' data-anas-run-view="' + enc(rec.get('name')) + '"'
+                : '';
+            pill = '<span' + runView + ' title="' + enc(rp.tip) + '"'
                 + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
-                + 'color:#fff;background:var(--anas-accent,#3468c0);">'
+                + 'color:#fff;background:var(--anas-accent,#3468c0);cursor:pointer;">'
                 + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
-                + enc(t('running')) + '</span>' + rp.html;
+                + enc(t('running')) + '</span>' + rp.html + runningDetailSparkHtml(rec);
         } else if (result === 'cancelled' && !overdue) {
             // rclone.5: stopped from the toolbar — the shared neutral pill,
             // who and when in the tooltip.
@@ -2009,6 +2031,9 @@
         // at the API; the button is the display, never the safety).
         var running = has && rec.get('lastRunResult') === 'running';
         setDisabled(grid, 'cloudTaskRun', !has || running);
+        // rclone.6: View run on the running row while its direct job is named —
+        // the same gate Cancel run reads (the pill on the row opens it too).
+        setDisabled(grid, 'cloudTaskViewRun', !(running && rec.get('runningJobId')));
         // rclone.5: Cancel run is the running row's verb — and only while the
         // daemon names the direct job to stop (the API gate still decides).
         setDisabled(grid, 'cloudTaskCancel', !ANAS.sched.cancellable(rec));
@@ -2089,6 +2114,7 @@
             }
             grid.anasReloading = false;
             updateTaskButtons(grid);
+            scheduleRowDetailPoll(grid, node);
         }, function (err) {
             if (grid.destroyed || grid.destroying) {
                 return;
@@ -2119,6 +2145,86 @@
             }
             ANAS.warn('cloud tasks load failed: ' + ANAS.errText(err));
         });
+    }
+
+    // ---- The running rows' live detail (rclone.6) ---------------------------
+
+    var ROW_DETAIL_POLL_MS = 5000;
+
+    // ONE interval per grid, started when a running row with a known job is on
+    // screen and stopped the moment there is none (or the grid dies): each tick
+    // polls the running rows' jobs and lands the detail on the record, where
+    // the row renderer reads its tiny spark and the stalled label. A row that
+    // stops running keeps its last detail until the next loadTasks overwrites
+    // the row — the renderer only draws it while the pill says running.
+    function scheduleRowDetailPoll(grid, node) {
+        if (!grid || grid.destroyed || grid.destroying) {
+            return;
+        }
+        var store = grid.getStore();
+        var running = [];
+        try {
+            store.each(function (rec) {
+                if (rec.get('lastRunResult') === 'running' && rec.get('runningJobId')) {
+                    running.push(rec);
+                }
+            });
+        } catch (e) {
+            return;
+        }
+        if (!running.length) {
+            if (grid._anasRowTimer) {
+                clearInterval(grid._anasRowTimer);
+                grid._anasRowTimer = null;
+            }
+            return;
+        }
+        var started = !grid._anasRowTimer;
+        if (started) {
+            grid._anasRowTimer = setInterval(function () {
+                if (grid.destroyed || grid.destroying) {
+                    clearInterval(grid._anasRowTimer);
+                    grid._anasRowTimer = null;
+                    return;
+                }
+                tickRowDetail(grid, node);
+            }, ROW_DETAIL_POLL_MS);
+        }
+        // An immediate first tick, but ONLY when the interval is newly started
+        // — a routine reload must not double-poll rows it just refreshed.
+        if (started) {
+            tickRowDetail(grid, node);
+        }
+    }
+
+    function tickRowDetail(grid, node) {
+        var store = grid.getStore();
+        var jobs = [];
+        try {
+            store.each(function (rec) {
+                if (rec.get('lastRunResult') === 'running' && rec.get('runningJobId')) {
+                    jobs.push(rec);
+                }
+            });
+        } catch (e) {
+            return;
+        }
+        for (var i = 0; i < jobs.length; i++) {
+            (function (rec) {
+                ANAS.api.get(node, '/jobs/' + encodeURIComponent(rec.get('runningJobId')))
+                    .then(function (res) {
+                        if (grid.destroyed || grid.destroying) {
+                            return;
+                        }
+                        var job = (res && res.job) || null;
+                        if (job && job.detail) {
+                            rec.set('runningDetail', job.detail);
+                        }
+                    }, function () {
+                        // transient — the next tick retries
+                    });
+            }(jobs[i]));
+        }
     }
 
     // ---- Run now ------------------------------------------------------------
@@ -2496,6 +2602,443 @@
         win.show();
         loadDetailInto(win, node, name);
     }
+
+    // ---- Run viewer (rclone.6) ----------------------------------------------
+    //
+    // A live dashboard over the running direct job's `detail` (CloudRunDetail),
+    // NOT a log: the job is polled every 2 s while it runs, every figure moves
+    // with the poll, and when the job ends the bars stand at their final values
+    // behind a result banner. Nothing survives the job leaving the queue —
+    // opening the viewer with no running job says so and shows the journal
+    // summary the detail window already carries.
+
+    var RUN_VIEW_POLL_MS = 2000;
+    var RECENT_SHOWN = 10;
+
+    // The header's task shape straight off a grid record.
+    function rowShapeOf(rec) {
+        if (!rec || !rec.get) {
+            return null;
+        }
+        return {
+            name: rec.get('name'),
+            source: rec.get('source'),
+            remote: rec.get('remote'),
+            path: rec.get('path'),
+            mode: rec.get('mode'),
+        };
+    }
+
+    function runStatusPillHtml(status) {
+        if (status === 'running') {
+            return '<span title=""'
+                + ' style="display:inline-block;padding:1px 9px;border-radius:9px;font-size:0.85em;'
+                + 'color:#fff;background:var(--anas-accent,#3468c0);">'
+                + '<i class="fa fa-refresh fa-spin" aria-hidden="true" style="margin-right:4px;"></i>'
+                + enc(t('running')) + '</span>';
+        }
+        if (status === 'completed') {
+            return pillHtml(t('completed'), 'var(--anas-ok,#1f9c56)', '');
+        }
+        if (status === 'failed') {
+            return pillHtml(t('failure'), 'var(--anas-danger,#c23b2c)', '');
+        }
+        if (status === 'cancelled') {
+            return pillHtml(t('cancelled'), 'var(--anas-muted,gray)', '');
+        }
+        return pillHtml(t('unknown'), 'var(--anas-muted,gray)', '');
+    }
+
+    // One labeled figure — every number carries its label and unit (UI rule:
+    // numbers need labeled context; no unlabeled tiles).
+    function runFigure(label, value) {
+        return '<span class="anas-run-figure" data-anas-run-figure="' + enc(label) + '"'
+            + ' style="display:inline-block;margin-right:18px;">'
+            + '<span style="display:block;color:var(--anas-muted,gray);font-size:0.82em;">'
+            + enc(label) + '</span>'
+            + '<span style="font-size:1.1em;">' + value + '</span></span>';
+    }
+
+    function speedHtml(bytesPerSec) {
+        var n = Number(bytesPerSec);
+        if (isNaN(n) || n <= 0) {
+            return '<span style="color:var(--anas-muted,gray);">—</span>';
+        }
+        return enc(ANAS.formatBytes(n) + '/s');
+    }
+
+    function etaHtml(sec) {
+        var n = Number(sec);
+        if (sec === null || sec === undefined || isNaN(n) || n < 0) {
+            return '<span style="color:var(--anas-muted,gray);">' + enc(t('—')) + '</span>';
+        }
+        return enc(ANAS.formatDuration(n * 1000));
+    }
+
+    // Recent event → one row. Errors first and in danger, with the message;
+    // everything else reads "name — what happened, how long ago".
+    function recentEventHtml(ev) {
+        ev = ev || {};
+        var isErr = ev.kind === 'error';
+        var what = isErr
+            ? '<span style="color:var(--anas-danger,#c23b2c);">' + enc(ev.message || t('error')) + '</span>'
+            : enc(t(ev.kind || 'copied'));
+        var ago = ev.at ? ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+            + enc(ANAS.ago(ev.at)) + '</span>' : '';
+        return '<div class="anas-run-recent-row" data-anas-run-recent-kind="' + enc(ev.kind || '') + '"'
+            + ' style="padding:1px 0;">'
+            + '<span style="font-family:monospace;font-size:0.92em;word-break:break-all;">'
+            + enc(ev.name || '') + '</span> — ' + what + ago + '</div>';
+    }
+
+    function kindSortKey(kind) {
+        return kind === 'error' ? 0 : 1;
+    }
+
+    // The viewer body — PURE, so the harness can assert every section from a
+    // fixture job. `task` is the row's shape ({name, source, remote, path,
+    // mode}); `job` the polled Job (status + detail + result/error). opts:
+    // { consistency:{consistency,reason}, showAllRecent:bool }.
+    function runViewerBody(task, job, opts) {
+        task = task || {};
+        opts = opts || {};
+        var detail = (job && job.detail) || null;
+        var status = (job && job.status) || 'unknown';
+        var running = status === 'running';
+
+        // (1) header — task, source → remote:path, mode, live/snapshot, status.
+        var header = '<div class="anas-run-header" style="margin-bottom:10px;">'
+            + '<span style="font-weight:600;font-size:1.05em;">' + enc(task.name || '') + '</span> '
+            + runStatusPillHtml(status)
+            + '<div style="color:var(--anas-muted,gray);margin-top:2px;">'
+            + mono(task.source || '') + ' <i class="fa fa-arrow-right" aria-hidden="true"></i> '
+            + mono(destinationOf(task)) + ' — ' + renderMode(task.mode)
+            + (opts.consistency ? ' ' + consistencyChipHtml(opts.consistency) : '')
+            + '</div></div>';
+
+        if (!detail) {
+            // The job has left the queue (or an older daemon): per-file detail
+            // is gone with it — the stateless rule. The sentence stands above
+            // the journal summary the task already shows (the recent-runs
+            // facts); nothing else is retained anywhere.
+            return header
+                + '<div class="anas-run-no-detail" style="padding:10px 12px;border-radius:8px;'
+                + 'background:rgba(127,127,127,0.10);">'
+                + enc(t('Per-file detail is shown only while a run is in progress.')) + ' '
+                + '<span style="color:var(--anas-muted,gray);">'
+                + enc(t('Finished runs keep their journal line and the recent-runs list '
+                    + 'in the task\'s Details window.')) + '</span>'
+                + (opts.journal
+                    ? '<div style="color:var(--anas-muted,gray);font-size:0.85em;'
+                        + 'margin:10px 0 3px;">'
+                        + '<i class="fa fa-history" style="margin-right:5px;"></i>'
+                        + enc(t('Recent runs (journald) — older history is not retained'))
+                        + '</div><pre style="margin:0;padding:8px 10px;border-radius:6px;'
+                        + 'overflow-x:auto;background:rgba(127,127,127,0.10);font-size:11px;'
+                        + 'white-space:pre-wrap;">' + enc(opts.journal) + '</pre>'
+                    : '')
+                + '</div>';
+        }
+
+        var frac = detail.totalBytes > 0 ? detail.bytes / detail.totalBytes : 0;
+        var fileFrac = detail.totalTransfers > 0
+            ? detail.transfers / detail.totalTransfers : 0;
+        var stalled = ANAS.gfx.stalledHtml(detail);
+
+        // (2) overall progress — bytes bar with the percentage beside it, thin
+        // files bar under it.
+        var progress = '<div class="anas-run-progress" style="margin-bottom:10px;">'
+            + ANAS.gfx.gauge(frac, {
+                label: ANAS.formatBytes(detail.bytes) + ' ' + t('of') + ' '
+                    + ANAS.formatBytes(detail.totalBytes),
+                pct: true,
+                title: t('bytes copied of the total'),
+            })
+            + '<div style="margin-top:4px;">'
+            + ANAS.gfx.bar(fileFrac, { pct: false, color: 'var(--anas-series-1,#3468c0)',
+                title: t('files transferred of the total') })
+            + ' <span style="color:var(--anas-muted,gray);font-size:0.9em;">'
+            + enc(detail.transfers + ' ' + t('of') + ' ' + detail.totalTransfers + ' '
+                + t('files')) + '</span></div></div>';
+
+        // (3) throughput spark + current speed + the stalled label.
+        var spark = '<div class="anas-run-spark" style="margin-bottom:10px;">'
+            + ANAS.gfx.sparkFromSamples(detail.speedSamples || [], {
+                size: 'full',
+                title: t('throughput, last 5 minutes'),
+            })
+            + ' <span class="anas-run-speed" style="white-space:nowrap;">'
+            + speedHtml(detail.speed) + '</span> ' + stalled + '</div>';
+
+        // (4) labeled figures — every number with its label and unit.
+        var figures = '<div class="anas-run-figures" style="margin-bottom:12px;">'
+            + runFigure(t('speed'), speedHtml(detail.speed))
+            + runFigure(t('ETA'), etaHtml(detail.eta))
+            + runFigure(t('elapsed'), enc(ANAS.formatDuration(detail.elapsedMs)))
+            + runFigure(t('files'), enc(detail.transfers + ' / ' + detail.totalTransfers))
+            + runFigure(t('checks'), enc('' + detail.checks))
+            + runFigure(t('deletes'), enc('' + detail.deletes))
+            + runFigure(t('errors'), detail.errors > 0
+                ? '<span style="color:var(--anas-danger,#c23b2c);">' + enc('' + detail.errors) + '</span>'
+                : enc('0'))
+            + '</div>';
+
+        var html = header + progress + spark + figures;
+
+        if (running) {
+            // (5) Transferring now — at most a handful of rows (rclone's
+            // --transfers default is 4).
+            var tr = (detail.transferring || []);
+            var rows = '';
+            for (var i = 0; i < tr.length; i++) {
+                var f = tr[i] || {};
+                rows += '<div class="anas-run-transferring-row" style="padding:2px 0;'
+                    + 'display:flex;align-items:center;gap:8px;">'
+                    + '<span style="flex:1;font-family:monospace;font-size:0.92em;'
+                    + 'word-break:break-all;">' + enc(f.name || '') + '</span>'
+                    + '<span style="white-space:nowrap;color:var(--anas-muted,gray);">'
+                    + enc(ANAS.formatBytes(Number(f.size) || 0)) + '</span>'
+                    + ANAS.gfx.bar((Number(f.percentage) || 0) / 100,
+                        { pct: true, color: 'var(--anas-series-1,#3468c0)' })
+                    + '<span style="white-space:nowrap;">' + speedHtml(f.speed) + '</span>'
+                    + '<span style="white-space:nowrap;color:var(--anas-muted,gray);">'
+                    + etaHtml(f.eta) + '</span></div>';
+            }
+            html += '<div class="anas-run-transferring" style="margin-bottom:12px;">'
+                + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
+                + enc(t('Transferring now')) + '</div>'
+                + (rows || '<div style="color:var(--anas-muted,gray);">'
+                    + enc(t('nothing in flight')) + '</div>')
+                + '</div>';
+        } else {
+            // The result banner stands where the in-flight section was; the
+            // bars above hold their final values.
+            html += '<div class="anas-run-result-banner" style="padding:8px 12px;'
+                + 'border-radius:8px;background:rgba(127,127,127,0.10);margin-bottom:12px;">'
+                + runResultBannerHtml(job) + '</div>';
+        }
+
+        // (6) Recent — the last 10 finished or failed files, errors first in
+        // danger with the message; a "show all 50" link when the ring holds more.
+        var recent = (detail.recent || []).slice();
+        recent.sort(function (a, b) {
+            return kindSortKey(a && a.kind) - kindSortKey(b && b.kind);
+        });
+        var shown = opts.showAllRecent ? recent : recent.slice(0, RECENT_SHOWN);
+        var recentHtml = '';
+        for (var r = 0; r < shown.length; r++) {
+            recentHtml += recentEventHtml(shown[r]);
+        }
+        if (!opts.showAllRecent && recent.length > RECENT_SHOWN) {
+            recentHtml += '<a href="#" data-anas-run-recent-all="1" class="anas-run-recent-all">'
+                + enc(t('show all ' + detail.recent.length)) + '</a>';
+        }
+        html += '<div class="anas-run-recent" style="margin-bottom:10px;">'
+            + '<div style="color:var(--anas-muted,gray);font-size:0.85em;margin-bottom:3px;">'
+            + enc(t('Recent')) + '</div>'
+            + (recentHtml || '<div style="color:var(--anas-muted,gray);">'
+                + enc(t('nothing finished yet')) + '</div>')
+            + '</div>';
+
+        // (7) the last error line, when there is one.
+        if (detail.lastError) {
+            html += '<div class="anas-run-last-error" style="color:var(--anas-danger,#c23b2c);'
+                + 'font-size:0.95em;">' + enc(t('Last error') + ': ' + detail.lastError) + '</div>';
+        }
+        return html;
+    }
+
+    // The one-line result banner: files and bytes transferred, duration, and
+    // the error count or its absence; a failed run leads with its last error,
+    // a cancelled one with the cancellation reason.
+    function runResultBannerHtml(job) {
+        var d = (job && job.detail) || {};
+        var status = job && job.status;
+        var lead = '';
+        if (status === 'cancelled') {
+            var reason = job.result && job.result.reason
+                ? job.result.reason : t('cancelled');
+            lead = '<span style="color:var(--anas-muted,gray);">' + enc('' + reason) + ' — </span>';
+        } else if (status === 'failed') {
+            var msg = (job.error && job.error.message) || d.lastError || t('the run failed');
+            lead = '<span style="color:var(--anas-danger,#c23b2c);">' + enc('' + msg) + ' — </span>';
+        }
+        var errors = Number(d.errors) || 0;
+        return lead + enc(
+            (Number(d.transfers) || 0) + ' ' + countWord(Number(d.transfers) || 0,
+                t('file'), t('files'))
+            + ', ' + ANAS.formatBytes(Number(d.bytes) || 0)
+            + ', ' + (ANAS.formatDuration(d.elapsedMs) || t('unknown duration'))
+            + ' — ' + (errors > 0
+                ? errors + ' ' + t('errors')
+                : t('no errors')));
+    }
+
+    // Open the viewer for a task row. Polls GET /v1/jobs/:id every 2 s while
+    // the job runs (pull — no websocket), stops at the job's end; one task
+    // fetch at open adds the live/snapshot label (fail-open). `grid` (the
+    // tasks grid, optional) is where Cancel run's reload lands.
+    function openRunViewer(node, name, jobId, grid, rowTask) {
+        if (!name) {
+            return;
+        }
+        // The row's shape for the header ({name, source, remote, path, mode}) —
+        // the task fetch below completes it (or supplies it) when the grid row
+        // did not hand one over.
+        var task = rowTask || null;
+        var job = null;
+        var showAllRecent = false;
+
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-cloud-run',
+                title: t('Run viewer') + ': ' + name,
+                modal: false,
+                width: 760,
+                height: 560,
+                resizable: true,
+                layout: 'fit',
+                items: [{
+                    xtype: 'panel',
+                    itemId: 'runBody',
+                    cls: 'anas-cloud-run',
+                    border: false,
+                    scrollable: true,
+                    html: '',
+                    listeners: {
+                        // The "show all 50" link re-renders the same body with
+                        // the whole ring.
+                        el: {
+                            click: function (e) {
+                                var tgt = e.getTarget('[data-anas-run-recent-all]');
+                                if (tgt) {
+                                    e.preventDefault();
+                                    showAllRecent = true;
+                                    render();
+                                }
+                            },
+                        },
+                    },
+                }],
+                buttons: [
+                    {
+                        text: t('Cancel run'),
+                        itemId: 'cloudRunCancel',
+                        cls: 'anas-btn-cloud-run-cancel',
+                        iconCls: 'fa fa-stop-circle',
+                        disabled: true,
+                        handler: function () {
+                            var grid = win._anasCloudGrid;
+                            ANAS.sched.cancelRun({
+                                node: node,
+                                jobId: jobId,
+                                name: name,
+                                view: grid || win,
+                                reload: function () { poll(); },
+                            });
+                        },
+                    },
+                    { text: t('Close'), handler: function () { win.close(); } },
+                ],
+                listeners: {
+                    destroy: function () {
+                        if (win._anasRunTimer) {
+                            clearInterval(win._anasRunTimer);
+                            win._anasRunTimer = null;
+                        }
+                    },
+                },
+            });
+        } catch (e) {
+            ANAS.warn('cloud run viewer failed: ' + ANAS.errText(e));
+            return;
+        }
+
+        function render() {
+            var body = win.down('#runBody');
+            if (!body || body.destroyed || body.destroying) {
+                return;
+            }
+            try {
+                body.update(runViewerBody(task, job, {
+                    consistency: win._anasConsistency,
+                    showAllRecent: showAllRecent,
+                    journal: win._anasJournal || null,
+                }));
+            } catch (e) {
+                ANAS.warn('cloud run viewer render failed: ' + ANAS.errText(e));
+            }
+            var cancelBtn = win.down('#cloudRunCancel');
+            if (cancelBtn) {
+                try {
+                    cancelBtn.setDisabled(!job || job.status !== 'running');
+                } catch (eB) {
+                    // cosmetic
+                }
+            }
+        }
+
+        function poll() {
+            if (!jobId || win.destroyed || win.destroying) {
+                return;
+            }
+            ANAS.api.get(node, '/jobs/' + encodeURIComponent(jobId)).then(function (res) {
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                job = (res && res.job) || job;
+                render();
+                if (job && job.status !== 'running') {
+                    // The job ended: bars stand at their final values, polling
+                    // stops, the pill turned with this very render.
+                    if (win._anasRunTimer) {
+                        clearInterval(win._anasRunTimer);
+                        win._anasRunTimer = null;
+                    }
+                }
+            }, function (err) {
+                if (win.destroyed || win.destroying) {
+                    return;
+                }
+                // Transient failure — keep the last good body, warn, keep
+                // polling; the next tick may simply confirm the job is gone.
+                ANAS.warn('cloud run poll failed: ' + ANAS.errText(err));
+            });
+        }
+
+        win._anasCloudGrid = grid || null;
+        win.show();
+        render();
+        if (jobId) {
+            win._anasRunTimer = setInterval(poll, RUN_VIEW_POLL_MS);
+            poll();
+        }
+        // The live/snapshot label (fail-open — an older daemon or a failed
+        // read just omits the chip) and the header's task shape when the row
+        // did not carry it.
+        ANAS.api.get(node, '/cloud/tasks/' + encodeURIComponent(name)).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            var d = (res && res.data) || {};
+            win._anasConsistency = d.consistency || null;
+            if (!task && d.task) {
+                task = d.task;
+            }
+            // No running job to poll: the journal summary is the facts the
+            // viewer can still show (the stateless rule).
+            if (!jobId && d.journal) {
+                win._anasJournal = d.journal;
+            }
+            render();
+        }, function () {
+            // fail-open: the label is optional garnish
+        });
+        return win;
+    }
+
+
 
     // ---- Preview (the rider — the dry run) ----------------------------------
     //
@@ -3363,6 +3906,9 @@
                 { name: 'cadence', type: 'auto' },
                 { name: 'enabled', type: 'auto' },
                 { name: 'overdue', type: 'auto' },
+                // rclone.6: the running job's detail, polled by the grid while
+                // a running row is on screen — never from the tasks payload.
+                { name: 'runningDetail', type: 'auto' },
                 { name: 'raw', type: 'auto' },
             ],
             data: [],
@@ -3406,6 +3952,23 @@
                     var rec = selectedTask(gridOf(view));
                     if (rec) {
                         runTaskNow(view, node, rec.get('name'));
+                    }
+                },
+            },
+            {
+                // rclone.6: the live run dashboard — enabled on the running row
+                // while the daemon names its direct job to poll.
+                text: t('View run'),
+                itemId: 'cloudTaskViewRun',
+                cls: 'anas-btn-cloud-task-view-run',
+                iconCls: 'fa fa-tachometer',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#cloudView');
+                    var rec = selectedTask(gridOf(view));
+                    if (rec && rec.get('runningJobId')) {
+                        openRunViewer(node, rec.get('name'), rec.get('runningJobId'),
+                            gridOf(view), rowShapeOf(rec));
                     }
                 },
             },
@@ -3571,6 +4134,26 @@
                             var view = grid.up('#cloudView');
                             openTaskWizard(view, node, (rec && rec.get('raw')) || null);
                         },
+                        // rclone.6: the running text on the row opens the run
+                        // viewer — the pill marks itself with the task name and
+                        // the click only answers when that mark is in the cell.
+                        cellclick: function (grid, td, cellIndex, rec) {
+                            if (!rec || rec.get('lastRunResult') !== 'running'
+                                || !rec.get('runningJobId')) {
+                                return;
+                            }
+                            var html = td && td.innerHTML ? td.innerHTML : (td || '');
+                            if (('' + html).indexOf('data-anas-run-view') >= 0) {
+                                openRunViewer(node, rec.get('name'), rec.get('runningJobId'),
+                                    grid, rowShapeOf(rec));
+                            }
+                        },
+                        destroy: function (grid) {
+                            if (grid._anasRowTimer) {
+                                clearInterval(grid._anasRowTimer);
+                                grid._anasRowTimer = null;
+                            }
+                        },
                     },
                 },
                 {
@@ -3591,6 +4174,10 @@
     ANAS.cloud = {
         openRemotes: openRemotesManager,
         openTaskWizard: openTaskWizard,
+        // rclone.6: the run viewer — the window and its PURE body renderer,
+        // the latter so the harness asserts every section from a fixture job.
+        openRunViewer: openRunViewer,
+        runViewerBody: runViewerBody,
         // The management keys the preview body never carries — exported so the
         // harness pins the body against the list instead of against a copy.
         taskManagementKeys: CLOUD_TASK_MANAGEMENT_KEYS,

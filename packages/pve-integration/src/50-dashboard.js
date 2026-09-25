@@ -333,26 +333,11 @@
 
     // ONE sample per telemetry tick, however many times we render it.
     //
-    // The buffers are filled as a side effect of rendering, but a render is not
-    // a measurement: the Pools composite is re-rendered by /status, by the manual
-    // Refresh and by the re-fit control as well as by the telemetry poll, and
-    // each of those would otherwise duplicate the current sample — bending peak,
-    // average and the chart's own time axis. `_anasSampleSeq` is bumped once per
-    // telemetry tick; a buffer accepts one push per key per seq and returns
-    // itself unchanged for any further render at that seq.
+    // The rolling-buffer machinery and the spark renderer live in ANAS.gfx
+    // (rclone.6 — the cloud run viewer and task rows hold rings of their own);
+    // these are the dashboard's thin wrappers pinned to the 5-minute window.
     function pushBuf(view, bufKey, seenKey, key, value, cap) {
-        var buf = view[bufKey] || (view[bufKey] = {});
-        var seen = view[seenKey] || (view[seenKey] = {});
-        var arr = buf[key] || (buf[key] = []);
-        var seq = view._anasSampleSeq || 0;
-        if (seen[key] !== seq || arr.length === 0) {
-            seen[key] = seq;
-            arr.push(value);
-            while (arr.length > cap) {
-                arr.shift();
-            }
-        }
-        return arr;
+        return gfx.pushBuf(view, bufKey, seenKey, key, value, cap);
     }
 
     // Push a sample onto the rolling buffer for `key`, capped at BUFFER_MAX (the
@@ -360,7 +345,7 @@
     // buffers feed gfx.timeChart; they live on the view so they reset with the
     // panel and never touch the server (no persisted history — Principle 7).
     function pushSpark(view, key, value) {
-        return pushBuf(view, '_anasSpark', '_anasSeenSpark', key, num(value), BUFFER_MAX);
+        return gfx.pushSpark(view, key, value, BUFFER_MAX);
     }
 
     // The ratchet state gfx.timeChart reads and writes for a chart, keyed by the
@@ -402,7 +387,7 @@
     function pushLat(view, key, value) {
         var n = (value === null || value === undefined || isNaN(Number(value)))
             ? null : Number(value);
-        return pushBuf(view, '_anasLat', '_anasSeenLat', key, n, BUFFER_MAX);
+        return gfx.pushBuf(view, '_anasLat', '_anasSeenLat', key, n, BUFFER_MAX);
     }
 
     // Peak (max) and average (mean) over the usable samples of a rolling buffer —
@@ -722,7 +707,11 @@
     // "<kind [target]> · <when> · <ran|elapsed duration>" plus an outcome tag.
     // Running jobs show elapsed since startedAt; finished jobs show finishedAt
     // relative + the run duration (durationMs, else finishedAt − startedAt).
-    function jobsStrip(status) {
+    // rclone.6: `details` (optional, jobId → the job's detail) adds a small
+    // spark + current speed on every in-flight run that carries speedSamples
+    // (cloud today), with the same stalled label the run viewer and the task
+    // row show. Without it the strip renders exactly as it always has.
+    function jobsStrip(status, details) {
         var jobs = (status && status.jobs) || [];
         if (!jobs.length) {
             return heading(t('Recent activity')) + muted(t('No recent jobs.'));
@@ -773,10 +762,24 @@
             if (when) { meta.push(when); }
             if (durPart) { meta.push(durPart); }
 
+            var sparkHtml = '';
+            var d = running && details ? details[j.id] : null;
+            if (d && d.speedSamples && d.speedSamples.length
+                && gfx && typeof gfx.sparkFromSamples === 'function') {
+                sparkHtml = ' ' + gfx.sparkFromSamples(d.speedSamples, {
+                    size: 'small',
+                    title: t('throughput, last 5 minutes'),
+                })
+                    + ' <span class="anas-dash-job-speed" style="color:var(--anas-muted,gray);'
+                    + 'font-size:0.9em;">' + bps(d.speed) + '</span> '
+                    + gfx.stalledHtml(d);
+            }
+
             rows += '<div class="anas-dash-job">'
                 + '<span class="anas-dash-job-k">' + enc(kind + (target ? ' ' + target : '')) + '</span>'
                 + (meta.length ? '<span class="anas-dash-job-meta">· ' + enc(meta.join(' · ')) + '</span>' : '')
                 + '<span class="anas-dash-job-out ' + outCls + '">' + enc(outTxt) + '</span>'
+                + sparkHtml
                 + '</div>';
         }
         if (jobs.length > maxRows) {
@@ -788,7 +791,7 @@
 
     // 2.2 — disk fleet health, now at the TOP: healthy / warning / critical /
     // unknown count tiles + total, with the recent-activity strip alongside.
-    function renderFleet(status) {
+    function renderFleet(status, jobDetails) {
         var d = (status && status.disks) || {};
         var tiles = '<div class="anas-dash-stats">'
             + statTile(num(d.healthy), t('Healthy'), OK_COLOR)
@@ -802,7 +805,8 @@
             + '<div class="anas-dash-col" style="flex:1 1 340px">'
             + heading(t('Disk Fleet')) + tiles + '</div>'
             + '<div class="anas-dash-col anas-dash-jobs" style="flex:1 1 300px">'
-            + '<div class="anas-dash-jobstrip">' + jobsStrip(status) + '</div></div>'
+            + '<div class="anas-dash-jobstrip">'
+            + jobsStrip(status, jobDetails) + '</div></div>'
             + '</div>';
     }
 
@@ -1863,7 +1867,8 @@
             var st = unwrap(res, 'pools');
             view._anasStatus = st; // cache for the composite (needs both endpoints)
             setSection(view, 'anasDashWarnings', renderWarnings(st));
-            setSection(view, 'anasDashFleet', renderFleet(st));
+            setSection(view, 'anasDashFleet', renderFleet(st, view._anasJobDetails));
+            loadJobDetails(view, node, st);
             // The Pools composite blends /status (state/capacity/scan) with the
             // cached /telemetry (I/O + vdevs). Re-render it from both caches.
             setSection(view, 'anasDashPools', renderPoolsComposite(view));
@@ -1885,6 +1890,44 @@
                 setSection(view, 'anasDashPools', heading(t('Pools')) + muted(t('Status unavailable.')));
             }
         });
+    }
+
+    // rclone.6 — the strip's sparks read the running runs' job detail, which
+    // the /status brief does not carry: ONE extra GET per RUNNING cloud run,
+    // on the dashboard's own /status cadence, none when idle. The details live
+    // on the view and the fleet section re-renders as each lands.
+    function loadJobDetails(view, node, st) {
+        var jobs = (st && st.jobs) || [];
+        var running = [];
+        for (var i = 0; i < jobs.length; i++) {
+            var j = jobs[i] || {};
+            if (j.id && j.kind === 'cloud.task.run'
+                && ('' + (j.status || '')).toLowerCase() === 'running') {
+                running.push(j.id);
+            }
+        }
+        if (!running.length) {
+            view._anasJobDetails = {};
+            return;
+        }
+        var details = {};
+        var done = 0;
+        var finish = function () {
+            if (view.destroyed || view.destroying) { return; }
+            view._anasJobDetails = details;
+            setSection(view, 'anasDashFleet', renderFleet(view._anasStatus, details));
+        };
+        for (var k = 0; k < running.length; k++) {
+            (function (id) {
+                ANAS.api.get(node, '/jobs/' + encodeURIComponent(id)).then(function (res) {
+                    var job = res && res.job;
+                    if (job && job.detail) { details[id] = job.detail; }
+                    if (++done === running.length) { finish(); }
+                }, function () {
+                    if (++done === running.length) { finish(); }
+                });
+            }(running[k]));
+        }
     }
 
     function pollTelemetry(view, node) {

@@ -39,6 +39,14 @@ export interface JobContext {
    * a failure: a run stopped on purpose must not notify as failed.
    */
   cancellation: () => JobCancellation | null
+  /**
+   * Publish structured live detail on the job (rclone.6, ADDITIVE): the
+   * text `updateProgress` carries stays exactly what it was — this is the
+   * typed companion a poller reads beside it (`GET /v1/jobs/:id` returns the
+   * job's `detail`). The queue stores what it is given verbatim; the shape is
+   * the publishing job family's business (cloud sync: `CloudRunDetail`).
+   */
+  updateDetail: (detail: unknown) => void
 }
 
 /** The function a job executes. Receives a progress callback and the cancel seam. */
@@ -147,6 +155,7 @@ export class JobQueue {
       completedAt: null,
       result: null,
       error: null,
+      detail: null,
     }
 
     const record: JobRecord = { job, handler, submitter, ...(opts.control ? { control: true } : {}) }
@@ -389,6 +398,9 @@ export class JobQueue {
         record.cancelMeta = meta ?? {}
       },
       cancellation: () => record.cancelling ?? null,
+      updateDetail: (detail) => {
+        job.detail = detail
+      },
     }
 
     let outcome: { ok: true, result: unknown } | { ok: false, err: unknown }

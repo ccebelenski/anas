@@ -1,4 +1,4 @@
-import type { AhrPool, BackupArchiveConsistency, CloudSyncRunResult, CloudSyncTask } from '@anas/shared'
+import type { AhrPool, BackupArchiveConsistency, CloudRunDetail, CloudRunRecentEvent, CloudSyncRunResult, CloudSyncTask } from '@anas/shared'
 import type { CommandExecutor, SpawnedChild } from '../executor/types.js'
 import type { BackupSnapshotOptions, TakenSnapshot } from './backup-snapshots.js'
 import type { RcloneConfigPaths } from './rclone-config.js'
@@ -52,29 +52,41 @@ const EXIT_NOTHING_TO_TRANSFER = 9
 /** "Less serious errors": some files did not make it. A FAILURE here (DESIGN). */
 const EXIT_SOME_FILES_FAILED = 6
 
-/** The stats cadence. 30s is quiet in the journal and live enough for a job. */
-const STATS_INTERVAL = '30s'
+/**
+ * The stats cadence. 5s (rclone.6 — was 30s): the run viewer, the task row's
+ * tiny spark and the dashboard strip all move on it, and `speedSamples` is
+ * 60 of these — the last 5 minutes of throughput. The journal noise it adds
+ * costs nothing: the runner's log stream goes to the daemon's pipe, not
+ * journald.
+ */
+const STATS_INTERVAL = '5s'
 
 /**
  * The executor's retention cap for an rclone run. The arithmetic that makes
- * 256 MiB the right generosity: at `--stats 30s` rclone writes about 1.15 MB
- * of stats JSON per day of run time (DESIGN ground truth 2026-09-23), so a
- * 10 TB copy at `--bwlimit 8M` (~15 days) writes ~17 MB — and dying at the
- * 10 MiB default with a half-copied destination would be the worst kind of
- * failure. 256 MiB covers ~230 days of stats. The tee path retains none of
- * it anyway (only the last 64 KiB tail); this cap governs stdout, which is
- * empty, and exists so a future stderr-retaining path cannot reintroduce the
- * death by default.
+ * 256 MiB the right generosity: at `--stats 5s` rclone writes about 5.75 MB
+ * of stats JSON per day of run time (the 1.15 MB/day DESIGN ground truth for
+ * `--stats 30s`, 2026-09-23, scaled by the cadence), so a 10 TB copy at
+ * `--bwlimit 8M` (~15 days) writes ~90 MB — and dying at the 10 MiB default
+ * with a half-copied destination would be the worst kind of failure. 256 MiB
+ * covers ~45 days of stats plus the `-v` per-file events (one line each — a
+ * million-file tree is ~200 MB, the one shape that approaches the cap). The
+ * tee path retains none of it anyway (only the last 64 KiB tail); this cap
+ * governs stdout, which is empty, and exists so a future stderr-retaining
+ * path cannot reintroduce the death by default.
  */
 export const RCLONE_MAX_BUFFER = 256 * 1024 * 1024
 
 /**
- * The JSON-log + stats flags every run carries. `--stats-log-level NOTICE`
- * is what makes the interval stats appear in the log at rclone's default
- * verbosity; without it the objects exist only at `-v`.
+ * The JSON-log + verbosity + stats flags every run carries. `-v` (rclone.6)
+ * adds one JSON event per finished file — the `recent` ring's source — and
+ * makes `--stats-log-level NOTICE` redundant for the stats themselves (they
+ * appear at `-v` regardless), but it stays: one flag list for the run and the
+ * preview (which shares this argv and simply ignores the per-file events) is
+ * the point.
  */
 export const RCLONE_LOG_ARGS = [
   '--use-json-log',
+  '-v',
   '--stats',
   STATS_INTERVAL,
   '--stats-log-level',
@@ -133,29 +145,75 @@ export interface RcloneStats {
   bytes: number
   totalBytes: number
   transfers: number
+  /** rclone.6 — the destination-side total, for the viewer's files bar. */
+  totalTransfers: number
   checks: number
+  totalChecks: number
   deletes: number
   errors: number
   elapsedTime: number
   /** Seconds remaining, when rclone could estimate them. */
   eta: number | null
   fatalError: boolean
+  /**
+   * rclone.6 — bytes/second, as the stats object reports it. Absent from the
+   * pre-rclone.6 shape (the progress text and the result never used it); the
+   * detail's speed ring is built from it.
+   */
+  speed: number
+  /**
+   * rclone.6 — the in-flight files the object names, verbatim from
+   * `transferring[]` (at most one per `--transfers` worker). Parsed for the
+   * run viewer; the result-building path ignores it.
+   */
+  transferring: RcloneTransferringFile[]
+}
+
+/** One in-flight file, as a stats object's `transferring[]` carries it. */
+export interface RcloneTransferringFile {
+  name: string
+  size: number
+  bytes: number
+  percentage: number
+  speed: number
+  eta: number | null
 }
 
 const ZERO_STATS: RcloneStats = {
   bytes: 0,
   totalBytes: 0,
   transfers: 0,
+  totalTransfers: 0,
   checks: 0,
+  totalChecks: 0,
   deletes: 0,
   errors: 0,
   elapsedTime: 0,
   eta: null,
   fatalError: false,
+  speed: 0,
+  transferring: [],
 }
 
 function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+/** One `transferring[]` entry, or null when it is not the shape rclone sends. */
+function transferringOf(raw: unknown): RcloneTransferringFile | null {
+  if (typeof raw !== 'object' || raw === null)
+    return null
+  const t = raw as Record<string, unknown>
+  if (typeof t.name !== 'string' || t.name === '')
+    return null
+  return {
+    name: t.name,
+    size: num(t.size),
+    bytes: num(t.bytes),
+    percentage: num(t.percentage),
+    speed: num(t.speed),
+    eta: typeof t.eta === 'number' && Number.isFinite(t.eta) ? t.eta : null,
+  }
 }
 
 /** Pull a `stats` object out of one parsed log object, or null when it has none. */
@@ -164,17 +222,79 @@ export function statsOf(entry: Record<string, unknown>): RcloneStats | null {
   if (typeof raw !== 'object' || raw === null)
     return null
   const s = raw as Record<string, unknown>
+  const transferring: RcloneTransferringFile[] = []
+  if (Array.isArray(s.transferring)) {
+    for (const t of s.transferring) {
+      const f = transferringOf(t)
+      if (f)
+        transferring.push(f)
+    }
+  }
   return {
     bytes: num(s.bytes),
     totalBytes: num(s.totalBytes),
     transfers: num(s.transfers),
+    totalTransfers: num(s.totalTransfers),
     checks: num(s.checks),
+    totalChecks: num(s.totalChecks),
     deletes: num(s.deletes),
     errors: num(s.errors),
     elapsedTime: num(s.elapsedTime),
     eta: typeof s.eta === 'number' && Number.isFinite(s.eta) ? s.eta : null,
     fatalError: s.fatalError === true,
+    speed: num(s.speed),
+    transferring,
   }
+}
+
+// --- Per-file events (rclone.6 — the `-v` stream) ---------------------------
+
+/** The per-file kinds the run detail's `recent` ring keeps. */
+export type RcloneFileEventKind = 'copied' | 'updated' | 'deleted' | 'error'
+
+/** One finished (or failed) file, as the `-v` stream reports it. */
+export interface RcloneFileEvent {
+  name: string
+  kind: RcloneFileEventKind
+  /** The error's message, verbatim (error events only). */
+  message?: string
+}
+
+/**
+ * The `-v` event messages rclone 1.60 emits per finished file, and the kind
+ * each maps to (GT 2026-09-25). A replace updates the destination, so it
+ * reads as `updated`; anything else an info-level object says about a file is
+ * not one of the viewer's kinds and is ignored.
+ */
+const FILE_EVENT_MSGS: [prefix: string, kind: RcloneFileEventKind][] = [
+  ['Copied (new)', 'copied'],
+  ['Copied (replaced existing)', 'updated'],
+  ['Updated', 'updated'],
+  ['Deleted', 'deleted'],
+]
+
+/**
+ * The per-file event one log object amounts to, or null when it is none:
+ * an info-level object naming a file with one of the messages above, or an
+ * error-level object naming the file it failed on (which is ALSO an error
+ * line — the caller pushes it to both).
+ */
+export function fileEventOf(entry: Record<string, unknown>): RcloneFileEvent | null {
+  const object = typeof entry.object === 'string' ? entry.object.trim() : ''
+  if (!object)
+    return null
+  const msg = typeof entry.msg === 'string' ? entry.msg.trim() : ''
+  if (!msg)
+    return null
+  if (entry.level === 'error' || entry.level === 'critical')
+    return { name: object, kind: 'error', message: msg }
+  if (entry.level !== 'info')
+    return null
+  for (const [prefix, kind] of FILE_EVENT_MSGS) {
+    if (msg.startsWith(prefix))
+      return { name: object, kind }
+  }
+  return null
 }
 
 /**
@@ -239,6 +359,12 @@ export class RcloneLogReader {
   readonly errorLines: string[] = []
   readonly rawLines: string[] = []
   /**
+   * rclone.6 — called with every per-file event a completed line amounts to
+   * (a finished file, or an error naming one). Optional: the preview keeps
+   * none. A live run completes at most one per chunk, like the stats objects.
+   */
+  onFileEvent?: (event: RcloneFileEvent) => void
+  /**
    * The `object` of the first {@link DELETED_FILES_CAP} `skipped: delete`
    * lines (a dry run's would-be deletes). The names stop at the cap; the
    * count does not.
@@ -300,6 +426,9 @@ export class RcloneLogReader {
     const error = errorLineOf(entry)
     if (error)
       this.errorLines.push(error)
+    const fileEvent = fileEventOf(entry)
+    if (fileEvent)
+      this.onFileEvent?.(fileEvent)
     // A would-be delete: rclone's `--dry-run` reports each one as a
     // `skipped: delete` object naming the file (`skipped: copy` lines are the
     // would-be TRANSFERS — rclone counts them in `stats.transfers`, so they
@@ -360,6 +489,88 @@ export function statsProgressLine(mode: string, stats: RcloneStats): string {
   if (stats.eta !== null)
     parts.push(`ETA ${stats.eta}s`)
   return `${mode}: ${parts.join(', ')}`
+}
+
+// ---------------------------------------------------------------------------
+//  The live run DETAIL (rclone.6)
+// ---------------------------------------------------------------------------
+
+/** The `recent` ring's cap — the last 50 per-file events. */
+export const RECENT_RING_CAP = 50
+/** The `speedSamples` ring's cap — the last 60 stats objects, i.e. 5 min at 5s. */
+export const SPEED_RING_CAP = 60
+
+/**
+ * Builds the {@link CloudRunDetail} a direct run job publishes on itself,
+ * fed by the same log stream that drives the progress text: one
+ * {@link onStats} per completed stats object, one {@link onEvent} per
+ * finished/failed file. Everything is rclone's own; the rings are capped so
+ * a multi-day run's daemon heap stays flat.
+ */
+export class CloudRunDetailTracker {
+  private startedMs: number
+  private latest: RcloneStats | null = null
+  private readonly recent: CloudRunRecentEvent[] = []
+  private readonly speedSamples: number[] = []
+  private lastError: string | undefined
+
+  constructor(startedAt: Date = new Date()) {
+    this.startedMs = startedAt.getTime()
+  }
+
+  /** The run's start, as the detail publishes it. */
+  get startedAt(): string {
+    return new Date(this.startedMs).toISOString()
+  }
+
+  /** Feed one completed stats object (the counters + the speed ring). */
+  onStats(stats: RcloneStats): void {
+    this.latest = stats
+    this.speedSamples.push(stats.speed)
+    while (this.speedSamples.length > SPEED_RING_CAP)
+      this.speedSamples.shift()
+  }
+
+  /** Feed one per-file event (the `recent` ring; an error also names `lastError`). */
+  onEvent(event: RcloneFileEvent, at: string = new Date().toISOString()): void {
+    const entry: CloudRunRecentEvent = {
+      name: event.name,
+      kind: event.kind,
+      at,
+      ...(event.message ? { message: event.message } : {}),
+    }
+    this.recent.push(entry)
+    while (this.recent.length > RECENT_RING_CAP)
+      this.recent.shift()
+    if (event.kind === 'error' && event.message)
+      this.lastError = `${event.name}: ${event.message}`
+  }
+
+  /** The detail as it stands right now — a fresh object every call. */
+  detail(now: number = Date.now()): CloudRunDetail {
+    const s = this.latest ?? ZERO_STATS
+    return {
+      startedAt: this.startedAt,
+      elapsedMs: Math.max(0, now - this.startedMs),
+      speed: s.speed,
+      eta: s.eta,
+      bytes: s.bytes,
+      totalBytes: s.totalBytes,
+      transfers: s.transfers,
+      totalTransfers: s.totalTransfers,
+      checks: s.checks,
+      totalChecks: s.totalChecks,
+      deletes: s.deletes,
+      errors: s.errors,
+      ...(this.lastError ? { lastError: this.lastError } : {}),
+      // Snapshots, not live references: every poll hands the published object
+      // to the wire on its own, so a poll already reading an older detail
+      // must never see a later tick mutate into it.
+      transferring: s.transferring.map(f => ({ ...f })),
+      recent: [...this.recent],
+      speedSamples: [...this.speedSamples],
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +643,12 @@ export interface CloudRunDeps {
    * cancel hook ({@link ChildCancel}) can signal it. Absent = not cancellable.
    */
   onSpawn?: (child: SpawnedChild) => void
+  /**
+   * rclone.6 — handed the run's live {@link CloudRunDetail} after every stats
+   * object and every per-file event, for the job to publish through the
+   * queue's `updateDetail`. Absent = no detail is built (the preview).
+   */
+  onDetail?: (detail: CloudRunDetail) => void
 }
 
 /**
@@ -518,10 +735,19 @@ export async function runCloudSync(
     // normally has nothing to check — which is the point of a backstop.
     assertNoSecretValues(args, deps.secrets ?? [])
 
+    // rclone.6 — the live detail the run publishes on its job, fed by the same
+    // stream the progress text is. Built only when someone is listening.
+    const tracker = deps.onDetail ? new CloudRunDetailTracker(now) : null
+    const publish = () => {
+      if (tracker)
+        deps.onDetail?.(tracker.detail())
+    }
+
     updateProgress(`rclone ${task.mode} ${plan.source} -> ${destination}`)
+    const exec = () => execRclone(executor, args, task.mode, updateProgress, deps.onSpawn, tracker ?? undefined, publish)
     const run = plan.pool
-      ? await withTopLevelMounts(executor, [plan.pool], async () => execRclone(executor, args, task.mode, updateProgress, deps.onSpawn), deps.snapshotOptions)
-      : await execRclone(executor, args, task.mode, updateProgress, deps.onSpawn)
+      ? await withTopLevelMounts(executor, [plan.pool], exec, deps.snapshotOptions)
+      : await exec()
 
     if (!rcloneRunCompleted(run.exitCode))
       throw new Error(rcloneFailureMessage(task.mode, run.exitCode, run.log))
@@ -638,6 +864,7 @@ async function prepareSource(
  * shell, argv array — the whole command is the array `buildRcloneArgs` built.
  * The tee and the re-read fallback live in {@link execRcloneLog}, shared with
  * the preview (which wraps the same argv in `timeout` and keeps no progress).
+ * `tracker`/`publish` (rclone.6) feed the live run detail off the same stream.
  */
 async function execRclone(
   executor: CommandExecutor,
@@ -645,16 +872,33 @@ async function execRclone(
   mode: string,
   updateProgress: (message: string) => void,
   onSpawn?: (child: SpawnedChild) => void,
+  tracker?: CloudRunDetailTracker,
+  publish?: () => void,
 ): Promise<{ exitCode: number, log: RcloneLogState }> {
-  return execRcloneLog(executor, RCLONE, args, stats => updateProgress(statsProgressLine(mode, stats)), onSpawn)
+  return execRcloneLog(
+    executor,
+    RCLONE,
+    args,
+    (stats) => {
+      updateProgress(statsProgressLine(mode, stats))
+      tracker?.onStats(stats)
+      publish?.()
+    },
+    onSpawn,
+    (event) => {
+      tracker?.onEvent(event)
+      publish?.()
+    },
+  )
 }
 
 /**
  * One rclone invocation (or a `timeout` wrapper around one), its NDJSON
  * stderr read as it arrives. The ONE place the tee pattern lives: every
  * completed `stats` object is handed to `onStats` (the run publishes job
- * progress; the preview keeps none), and the bounded-tail re-read covers an
- * executor that buffers without teeing.
+ * progress; the preview keeps none), every per-file event to `onEvent`
+ * (rclone.6), and the bounded-tail re-read covers an executor that buffers
+ * without teeing.
  */
 export async function execRcloneLog(
   executor: CommandExecutor,
@@ -662,8 +906,10 @@ export async function execRcloneLog(
   args: string[],
   onStats?: (stats: RcloneStats) => void,
   onSpawn?: (child: SpawnedChild) => void,
+  onEvent?: (event: RcloneFileEvent) => void,
 ): Promise<{ exitCode: number, log: RcloneLogState }> {
   const reader = new RcloneLogReader()
+  reader.onFileEvent = onEvent
   const r = await executor.exec(command, args, {
     ...(onSpawn ? { onSpawn } : {}),
     // See RCLONE_MAX_BUFFER for the arithmetic. The tee means stderr is NOT

@@ -45,6 +45,14 @@ export const Job = z.object({
       message: z.string(),
     })
     .nullable(),
+  /**
+   * Live structured detail a running job publishes on itself (rclone.6,
+   * ADDITIVE): a cloud sync's direct run carries a `CloudRunDetail` (its shape
+   * is the cloud schema's business — the queue only carries it verbatim).
+   * Null on every job that publishes none; in-memory like every other job
+   * field, gone when the job leaves the queue.
+   */
+  detail: z.unknown().nullable().optional(),
 })
 export type Job = z.infer<typeof Job>
 

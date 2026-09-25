@@ -40,6 +40,7 @@ function fakeCtx(): { ctx: JobContext, hook: () => CancelHook | undefined, meta:
         meta = m
       },
       cancellation: () => cancellation,
+      updateDetail: () => {},
     },
     hook: () => hook,
     meta: () => meta,

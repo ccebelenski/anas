@@ -11,8 +11,10 @@ import { ChildCancel } from '../../jobs/child-cancel.js'
 import { JobQueue } from '../../jobs/queue.js'
 import {
   buildRcloneArgs,
+  CloudRunDetailTracker,
   emptySourceRefusal,
   errorLineOf,
+  fileEventOf,
   missingSourceRefusal,
   RCLONE_LOG_ARGS,
   rcloneDestination,
@@ -20,7 +22,9 @@ import {
   RcloneLogReader,
   rcloneRunCompleted,
   readRcloneLog,
+  RECENT_RING_CAP,
   runCloudSync,
+  SPEED_RING_CAP,
   statsOf,
   statsProgressLine,
 } from '../cloud-runner.js'
@@ -90,6 +94,45 @@ const ERROR_LINE = JSON.stringify({
   time: '2026-09-24T02:00:12.000+00:00',
 })
 
+// rclone.6 — the shapes captured on the node today (rclone 1.60.1, 2026-09-25):
+// one stats object per `--stats 5s` tick (with `transferring[]`) and one `-v`
+// JSON event per finished file.
+const CAPTURED_STATS_LINE = JSON.stringify({
+  level: 'info',
+  msg: '\nTransferred:   \t 668 KiB / 8.6 MiB, 8%',
+  source: 'accounting/stats.go:479',
+  time: '2026-09-25T09:00:05.000000+02:00',
+  stats: {
+    bytes: 684032,
+    checks: 0,
+    deletedDirs: 0,
+    deletes: 0,
+    elapsedTime: 1.0,
+    errors: 0,
+    eta: 3,
+    fatalError: false,
+    renames: 0,
+    retryError: false,
+    speed: 688901.8,
+    totalBytes: 9000000,
+    totalChecks: 0,
+    totalTransfers: 3,
+    transferTime: 1.0,
+    transfers: 0,
+    transferring: [
+      { bytes: 684032, eta: null, group: 'global_stats', name: 'f1.bin', percentage: 22, size: 3000000, speed: 688901.8, speedAvg: 0 },
+    ],
+  },
+})
+const CAPTURED_EVENT_LINE = JSON.stringify({
+  level: 'info',
+  msg: 'Copied (new)',
+  object: 'f3.bin',
+  objectType: '*local.Object',
+  source: 'operations/operations.go:566',
+  time: '2026-09-25T09:00:06.000000+02:00',
+})
+
 /** The final stats object of a clean run: everything transferred. */
 const FINAL_STATS = statsLine({ bytes: 4194304, totalBytes: 4194304, transfers: 5, eta: 0, elapsedTime: 61.2 })
 
@@ -103,6 +146,17 @@ describe('cloud sync runner — argv (rclone.2)', () => {
       CONFIG,
       '--ask-password=false',
       ...RCLONE_LOG_ARGS,
+    ])
+  })
+
+  it('pins the rclone.6 log flags: -v, one JSON event per file, and a 5s stats cadence', () => {
+    assert.deepEqual(RCLONE_LOG_ARGS, [
+      '--use-json-log',
+      '-v',
+      '--stats',
+      '5s',
+      '--stats-log-level',
+      'NOTICE',
     ])
   })
 
@@ -130,12 +184,16 @@ describe('cloud sync runner — rclone\'s JSON log', () => {
       bytes: 4194304,
       totalBytes: 4194304,
       transfers: 5,
+      totalTransfers: 5,
       checks: 12,
+      totalChecks: 12,
       deletes: 0,
       errors: 0,
       elapsedTime: 61.2,
       eta: 0,
       fatalError: false,
+      speed: 34952.5,
+      transferring: [],
     })
   })
 
@@ -171,12 +229,16 @@ describe('cloud sync runner — rclone\'s JSON log', () => {
       bytes: 5,
       totalBytes: 0,
       transfers: 0,
+      totalTransfers: 0,
       checks: 0,
+      totalChecks: 0,
       deletes: 0,
       errors: 0,
       elapsedTime: 0,
       eta: null,
       fatalError: false,
+      speed: 0,
+      transferring: [],
     })
   })
 
@@ -221,6 +283,109 @@ describe('cloud sync runner — rclone\'s JSON log', () => {
     )
     const noEta = readRcloneLog(statsLine({ eta: null })).stats!
     assert.ok(!statsProgressLine('sync', noEta).includes('ETA'))
+  })
+})
+
+describe('cloud sync runner — the live run detail (rclone.6)', () => {
+  it('parses the captured stats object: counters, speed and the in-flight file', () => {
+    const stats = readRcloneLog(CAPTURED_STATS_LINE).stats!
+    assert.deepEqual(stats, {
+      bytes: 684032,
+      totalBytes: 9000000,
+      transfers: 0,
+      totalTransfers: 3,
+      checks: 0,
+      totalChecks: 0,
+      deletes: 0,
+      errors: 0,
+      elapsedTime: 1.0,
+      eta: 3,
+      fatalError: false,
+      speed: 688901.8,
+      transferring: [
+        { name: 'f1.bin', size: 3000000, bytes: 684032, percentage: 22, speed: 688901.8, eta: null },
+      ],
+    })
+  })
+
+  it('maps the captured -v file events onto the viewer kinds', () => {
+    assert.deepEqual(fileEventOf(JSON.parse(CAPTURED_EVENT_LINE)), { name: 'f3.bin', kind: 'copied' })
+    assert.deepEqual(fileEventOf({ level: 'info', msg: 'Copied (replaced existing)', object: 'f1.bin' }), { name: 'f1.bin', kind: 'updated' })
+    assert.deepEqual(fileEventOf({ level: 'info', msg: 'Updated', object: 'f2.bin' }), { name: 'f2.bin', kind: 'updated' })
+    assert.deepEqual(fileEventOf({ level: 'info', msg: 'Deleted', object: 'old.bin' }), { name: 'old.bin', kind: 'deleted' })
+  })
+
+  it('an error-level event is BOTH an error line and a recent error', () => {
+    const events: ReturnType<typeof fileEventOf>[] = []
+    const reader = new RcloneLogReader()
+    reader.onFileEvent = (e) => {
+      events.push(e)
+    }
+    reader.push(`${ERROR_LINE}\n`)
+    assert.equal(reader.errorLines.length, 1)
+    assert.deepEqual(events, [{
+      name: 'a.jpg',
+      kind: 'error',
+      message: 'Failed to copy: failed to open source object: open /tank/pictures/a.jpg: permission denied',
+    }])
+  })
+
+  it('an info line that is not one of the viewer\'s messages is no event', () => {
+    assert.equal(fileEventOf({ level: 'info', msg: 'Renamed', object: 'moved.bin' }), null)
+    assert.equal(fileEventOf({ level: 'info', msg: 'Copied (new)', objectType: '*local.Object' }), null)
+    assert.equal(fileEventOf({ level: 'notice', msg: 'Copied (new)', object: 'f9.bin' }), null)
+  })
+
+  it('the detail is the counters plus both rings, with an error naming lastError', () => {
+    const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
+    tracker.onStats(statsOf(JSON.parse(CAPTURED_STATS_LINE))!)
+    tracker.onEvent({ name: 'f3.bin', kind: 'copied' }, '2026-09-25T07:00:06.000Z')
+    tracker.onEvent({
+      name: 'a.jpg',
+      kind: 'error',
+      message: 'Failed to copy: permission denied',
+    }, '2026-09-25T07:00:07.000Z')
+    const detail = tracker.detail(Date.parse('2026-09-25T07:00:10.000Z'))
+    assert.equal(detail.startedAt, '2026-09-25T07:00:00.000Z')
+    assert.equal(detail.elapsedMs, 10000)
+    assert.equal(detail.speed, 688901.8)
+    assert.equal(detail.eta, 3)
+    assert.equal(detail.bytes, 684032)
+    assert.equal(detail.totalBytes, 9000000)
+    assert.equal(detail.totalTransfers, 3)
+    assert.deepEqual(detail.speedSamples, [688901.8])
+    assert.deepEqual(detail.transferring, [
+      { name: 'f1.bin', size: 3000000, bytes: 684032, percentage: 22, speed: 688901.8, eta: null },
+    ])
+    assert.deepEqual(detail.recent, [
+      { name: 'f3.bin', kind: 'copied', at: '2026-09-25T07:00:06.000Z' },
+      { name: 'a.jpg', kind: 'error', at: '2026-09-25T07:00:07.000Z', message: 'Failed to copy: permission denied' },
+    ])
+    assert.equal(detail.lastError, 'a.jpg: Failed to copy: permission denied')
+  })
+
+  it('both rings are capped: 60 speed samples, 50 recent events, oldest dropped', () => {
+    const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
+    const base = statsOf(JSON.parse(CAPTURED_STATS_LINE))!
+    for (let i = 0; i < SPEED_RING_CAP + 5; i++) {
+      tracker.onStats({ ...base, speed: i + 1 })
+      tracker.onEvent({ name: `f${i}.bin`, kind: 'copied' }, '2026-09-25T07:00:06.000Z')
+    }
+    const detail = tracker.detail()
+    assert.equal(detail.speedSamples.length, SPEED_RING_CAP)
+    assert.deepEqual(detail.speedSamples[0], 6)
+    assert.deepEqual(detail.speedSamples.at(-1), SPEED_RING_CAP + 5)
+    assert.equal(detail.recent.length, RECENT_RING_CAP)
+    assert.equal(detail.recent[0].name, `f${SPEED_RING_CAP + 5 - RECENT_RING_CAP}.bin`)
+  })
+
+  it('a clean run has no lastError, and the detail is a snapshot, not live arrays', () => {
+    const tracker = new CloudRunDetailTracker(new Date('2026-09-25T07:00:00.000Z'))
+    tracker.onStats(statsOf(JSON.parse(CAPTURED_STATS_LINE))!)
+    const first = tracker.detail()
+    tracker.onStats({ ...statsOf(JSON.parse(CAPTURED_STATS_LINE))!, speed: 1 })
+    assert.equal(first.speed, 688901.8, 'an older published detail does not change under a later tick')
+    assert.equal('lastError' in tracker.detail(), false)
   })
 })
 
@@ -444,6 +609,36 @@ describe('runCloudSync — a live run', () => {
       assert.ok(stats.length >= 2, `expected a progress line per stats object, got ${JSON.stringify(stats)}`)
       assert.match(stats[0], /1048576 of 4194304 bytes/)
       assert.match(stats.at(-1)!, /4194304 of 4194304 bytes/)
+    }
+    finally {
+      await h.cleanup()
+    }
+  })
+
+  it('publishes the live run detail on every stats object and file event (rclone.6)', async () => {
+    const h = await liveHarness()
+    try {
+      h.mock.addFixture({
+        command: RCLONE,
+        result: { stdout: '', stderr: `${[CAPTURED_STATS_LINE, CAPTURED_EVENT_LINE, FINAL_STATS].join('\n')}\n`, exitCode: 0 },
+      })
+      const details: import('@anas/shared').CloudRunDetail[] = []
+      await runCloudSync(h.mock, deps(h, { onDetail: d => details.push(d) }), () => {})
+      // One publication per stats object and per file event — the tracker's
+      // detail grows monotonically, so the last one is the run's final state.
+      assert.ok(details.length >= 3, `expected a detail per stats object + file event, got ${details.length}`)
+      const last = details.at(-1)!
+      assert.equal(last.bytes, 4194304)
+      assert.equal(last.transfers, 5)
+      assert.deepEqual(last.speedSamples, [688901.8, 34952.5], 'one sample per stats object')
+      assert.deepEqual(last.recent.map(e => [e.name, e.kind]), [['f3.bin', 'copied']])
+      // The published details are snapshots. Within ONE delivered chunk the
+      // file events fire as their lines complete and the stats callbacks once
+      // the chunk's lines are done, so the first publication here is the file
+      // event's — and it keeps its own state as later ticks arrive.
+      assert.deepEqual(details[0].speedSamples, [])
+      assert.deepEqual(details[0].recent.map(e => [e.name, e.kind]), [['f3.bin', 'copied']])
+      assert.deepEqual(details[1].speedSamples, [688901.8])
     }
     finally {
       await h.cleanup()

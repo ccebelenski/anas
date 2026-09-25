@@ -203,7 +203,7 @@ export {
   UpsertBackupRepoRequest,
 } from './schemas/backup.js'
 
-// Cloud sync schemas (rclone.1 remotes, rclone.2 tasks)
+// Cloud sync schemas (rclone.1 remotes, rclone.2 tasks, rclone.6 run detail)
 export {
   CloudBandwidthLimit,
   CloudProvider,
@@ -218,6 +218,9 @@ export {
   CloudRemoteTestVerdict,
   CloudRemoteUpdate,
   CloudRemoteWrite,
+  CloudRunDetail,
+  CloudRunRecentEvent,
+  CloudRunTransferringFile,
   CloudSyncMode,
   CloudSyncPreviewRequest,
   CloudSyncPreviewResult,

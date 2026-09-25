@@ -408,6 +408,78 @@ export const CloudSyncRunResult = z.object({
 })
 export type CloudSyncRunResult = z.infer<typeof CloudSyncRunResult>
 
+// ---------------------------------------------------------------------------
+//  Live run DETAIL (story rclone.6)
+// ---------------------------------------------------------------------------
+
+/**
+ * One file rclone reports as in flight, from a stats object's `transferring[]`
+ * (rclone 1.60 ground truth, 2026-09-25: `name`, `size`, `bytes`,
+ * `percentage`, `speed`, `eta` per in-flight file). `--transfers` defaults to
+ * 4, so a run carries a handful of these at most.
+ */
+export const CloudRunTransferringFile = z.object({
+  name: z.string(),
+  size: z.number().nonnegative(),
+  bytes: z.number().nonnegative(),
+  percentage: z.number(),
+  speed: z.number().nonnegative(),
+  eta: z.number().nullable(),
+})
+export type CloudRunTransferringFile = z.infer<typeof CloudRunTransferringFile>
+
+/**
+ * One finished (or failed) per-file event, from the `-v` log stream: an
+ * info-level object whose `msg` says what happened ("Copied (new)",
+ * "Copied (replaced existing)", "Updated", "Deleted") and whose `object` names
+ * the file — or an error-level object naming the file it failed on. `at` is
+ * the moment the daemon read the line.
+ */
+export const CloudRunRecentEvent = z.object({
+  name: z.string(),
+  kind: z.enum(['copied', 'updated', 'deleted', 'error']),
+  at: ISODateTime,
+  /** The error's message, verbatim (error events only). */
+  message: z.string().optional(),
+})
+export type CloudRunRecentEvent = z.infer<typeof CloudRunRecentEvent>
+
+/**
+ * The live run detail a cloud sync's DIRECT run job publishes on itself
+ * (rclone.6) — everything the run viewer, the task row's tiny spark and the
+ * dashboard strip render, parsed from rclone's JSON log AS IT ARRIVES.
+ *
+ * Every counter is rclone's own, from the most recent `stats` object; the two
+ * rings are in-memory on the job like every other job field, never written
+ * anywhere (Principle 11 — a finished run's history is the journal, not this).
+ * `speedSamples` holds the last 60 `speed` readings, one per stats object —
+ * the last 5 minutes at the pinned `--stats 5s`.
+ */
+export const CloudRunDetail = z.object({
+  startedAt: ISODateTime,
+  elapsedMs: z.number().nonnegative(),
+  /** Bytes/second, from the latest stats object. */
+  speed: z.number().nonnegative(),
+  /** Seconds remaining, when rclone could estimate them; null otherwise. */
+  eta: z.number().nullable(),
+  bytes: z.number().nonnegative(),
+  totalBytes: z.number().nonnegative(),
+  transfers: z.number().nonnegative(),
+  totalTransfers: z.number().nonnegative(),
+  checks: z.number().nonnegative(),
+  totalChecks: z.number().nonnegative(),
+  deletes: z.number().nonnegative(),
+  errors: z.number().nonnegative(),
+  /** The most recent error-level line, verbatim; absent on a clean run. */
+  lastError: z.string().optional(),
+  transferring: z.array(CloudRunTransferringFile),
+  /** The last 50 per-file events, oldest → newest. */
+  recent: z.array(CloudRunRecentEvent),
+  /** The last 60 `speed` readings, oldest → newest. */
+  speedSamples: z.array(z.number().nonnegative()),
+})
+export type CloudRunDetail = z.infer<typeof CloudRunDetail>
+
 /**
  * Run-Now request body — structurally the backup run request, and deliberately
  * ITS schema: `direct: true` is the INTERNAL path a task's own systemd unit
