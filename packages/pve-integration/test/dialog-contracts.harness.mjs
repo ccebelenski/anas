@@ -11152,6 +11152,25 @@ function cloudRowFields(win, containerId, name) {
   return n
 }
 
+/** The option names a dialog container renders, in row order — the layout
+ * contract (the guided groups, and an uncurated backend's byte-for-byte
+ * field order) is asserted against it. */
+function cloudRowOrder(win, containerId) {
+  const cont = win.down('#' + containerId)
+  const out = []
+  if (cont) {
+    cont.items.each(function (row) {
+      if (!row.items) { return }
+      row.items.each(function (sub) {
+        if (sub.itemId && sub.itemId.indexOf('cloudOpt_') === 0) {
+          out.push(sub.itemId.slice('cloudOpt_'.length))
+        }
+      })
+    })
+  }
+  return out
+}
+
 function cloudOption(win, name) {
   return win.down('#cloudOpt_' + name)
 }
@@ -11696,6 +11715,123 @@ async function cloudChecks() {
   await settle()
   ok('cloud(koofr): a required option HIDDEN by its provider filter never blocks — the rendered ones alone gate',
     dlg.down('#submit').disabled === false && dlg.down('#cloudTestBtn').disabled === false)
+  created.windows.length = 0
+
+  // --- (f4) rclone.4: the guided remote form --------------------------------
+  // A CURATED backend renders: the guide sentence, the essential fields in
+  // the primary section, the own-OAuth-client pair under its collapsed
+  // fieldset (with the one sentence), every other non-advanced option under
+  // collapsed "More options", the advanced toggle unchanged. An UNCURATED
+  // backend renders today's layout byte for byte — no guide, no fieldsets.
+  created.windows.length = 0
+  findCmp(win, 'anas-btn-cloud-remote-add').handler()
+  await settle()
+  dlg = openWindow()
+  dlg.down('#cloudRemoteName').setValue('gd4')
+  dlg.down('#cloudRemoteType').setValue('drive')
+  await settle()
+  const gd4Guide = dlg.down('#cloudGuideNote')
+  ok('cloud(guide): the guide sentence renders for a curated backend and names its paste',
+    !!gd4Guide && gd4Guide.hidden === false
+      && /rclone authorize/.test(gd4Guide.html) && /drive/.test(gd4Guide.html),
+    gd4Guide && gd4Guide.html)
+  const gd4Items = dlg.down('#form').items.getRange().map(c => c.itemId || '')
+  const gd4Idx = id => gd4Items.indexOf(id)
+  ok('cloud(guide): top to bottom — guide, OAuth sentence, primary, own client, more options, advanced toggle',
+    gd4Idx('cloudGuideNote') >= 0 && gd4Idx('cloudGuideNote') < gd4Idx('cloudOAuthNote')
+      && gd4Idx('cloudOAuthNote') < gd4Idx('cloudOptionsBasic')
+      && gd4Idx('cloudOptionsBasic') < gd4Idx('cloudOwnClientGroup')
+      && gd4Idx('cloudOwnClientGroup') < gd4Idx('cloudMoreGroup')
+      && gd4Idx('cloudMoreGroup') < gd4Idx('cloudAdvanced'))
+  eq('cloud(drive curated): the token alone is the primary section',
+    cloudRowOrder(dlg, 'cloudOptionsBasic'), ['token'])
+  eq('cloud(drive curated): the own-OAuth-client pair rides the own-client fieldset',
+    cloudRowOrder(dlg, 'cloudOwnClientGroup'), ['client_id', 'client_secret'])
+  ok('cloud(drive curated): the own-client fieldset opens with the one sentence',
+    /built-in client is shared/.test((dlg.down('#cloudOwnClientGroup').items.getAt(0) || {}).html || ''),
+    dlg.down('#cloudOwnClientGroup') && dlg.down('#cloudOwnClientGroup').items.getAt(0))
+  eq('cloud(drive curated): every other non-advanced option sits under More options',
+    cloudRowOrder(dlg, 'cloudMoreGroup'), ['scope', 'service_account_file'])
+  ok('cloud(drive curated): both fieldsets render collapsed',
+    dlg.down('#cloudOwnClientGroup').hidden === false && dlg.down('#cloudOwnClientGroup').collapsed === true
+      && dlg.down('#cloudMoreGroup').hidden === false && dlg.down('#cloudMoreGroup').collapsed === true)
+  ok('cloud(drive curated): the advanced rows still wait for the toggle',
+    cloudOption(dlg, 'root_folder_id') === null)
+  dlg.down('#cloudAdvanced').setValue(true)
+  await settle()
+  ok('cloud(drive curated): the toggle reveals the advanced rows as before',
+    !!cloudOption(dlg, 'root_folder_id')
+      && cloudRowOrder(dlg, 'cloudOptionsAdvanced').indexOf('root_folder_id') >= 0)
+  cloudOption(dlg, 'token').setValue(TOKEN_OBJ)
+  ok('cloud(drive curated): a typed own-client value rides the create body with the fieldset collapsed',
+    cloudOption(dlg, 'client_id').setValue('my-client')
+      && dlg.down('#cloudAdvanced').setValue(false))
+  await settle()
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-cloud-remote-save').handler()
+  await settle()
+  eq('cloud(drive curated): the create body carries the collapsed group\'s typed value',
+    jobs[0] && jobs[0].body,
+    { name: 'gd4', type: 'drive', options: { client_id: 'my-client', token: TOKEN_OBJ } })
+  created.windows.length = 0
+
+  // s3: exactly the five primary fields; the guide names the access-key page.
+  findCmp(win, 'anas-btn-cloud-remote-add').handler()
+  await settle()
+  dlg = openWindow()
+  dlg.down('#cloudRemoteName').setValue('s3g4')
+  dlg.down('#cloudRemoteType').setValue('s3')
+  await settle()
+  dlg.down('#cloudOpt_provider').setValue('AWS')
+  await settle()
+  eq('cloud(s3 curated): exactly the five primary fields, in schema order',
+    cloudRowOrder(dlg, 'cloudOptionsBasic'),
+    ['provider', 'access_key_id', 'secret_access_key', 'region', 'endpoint'])
+  ok('cloud(s3 curated): env_auth is not primary — it sits under More options',
+    cloudRowOrder(dlg, 'cloudMoreGroup').indexOf('env_auth') >= 0
+      && cloudRowOrder(dlg, 'cloudOptionsBasic').indexOf('env_auth') < 0)
+  ok('cloud(s3 curated): no own-client group (the backend has no such fields)',
+    dlg.down('#cloudOwnClientGroup').hidden === true)
+  ok('cloud(s3 curated): the guide sentence names the access-key page',
+    /access-key page/.test(dlg.down('#cloudGuideNote').html),
+    dlg.down('#cloudGuideNote') && dlg.down('#cloudGuideNote').html)
+  created.windows.length = 0
+
+  // An uncurated backend: today's layout byte for byte.
+  findCmp(win, 'anas-btn-cloud-remote-add').handler()
+  await settle()
+  dlg = openWindow()
+  dlg.down('#cloudRemoteName').setValue('kf4')
+  dlg.down('#cloudRemoteType').setValue('koofr')
+  await settle()
+  ok('cloud(uncurated koofr): no guide and no fieldsets — today\'s layout',
+    dlg.down('#cloudGuideNote').hidden === true
+      && dlg.down('#cloudOwnClientGroup').hidden === true
+      && dlg.down('#cloudMoreGroup').hidden === true)
+  dlg.down('#cloudOpt_provider').setValue('koofr')
+  await settle()
+  eq('cloud(uncurated koofr): the primary rows keep today\'s field order, byte for byte',
+    cloudRowOrder(dlg, 'cloudOptionsBasic'), ['provider', 'user', 'password'])
+  ok('cloud(uncurated koofr): the advanced rows stay behind the toggle',
+    cloudOption(dlg, 'setmtime') === null)
+  created.windows.length = 0
+
+  // A curated remote in EDIT mode: same layout, the secret "(unchanged)".
+  created.windows.length = 0
+  const gd4Loaded = await openCloudRemotes(cloudRoutes([CLOUD_DRIVE_REMOTE]))
+  const gd4Grid = gd4Loaded.win.down('#cloudRemotesGrid')
+  gd4Grid.selectRow(0)
+  const gd4Edit = findCmp(gd4Loaded.win, 'anas-btn-cloud-remote-edit')
+  gd4Edit.handler(gd4Edit)
+  await settle()
+  dlg = openWindow()
+  ok('cloud(edit drive curated): the guide sentence renders in edit mode too',
+    !!dlg.down('#cloudGuideNote') && dlg.down('#cloudGuideNote').hidden === false)
+  ok('cloud(edit drive curated): the blank token box reads "(unchanged)" and sits in the primary section',
+    !!cloudOption(dlg, 'token') && cloudOption(dlg, 'token').getValue() === ''
+      && cloudOption(dlg, 'token').emptyText === '(unchanged)'
+      && cloudRowOrder(dlg, 'cloudOptionsBasic').indexOf('token') >= 0,
+    cloudOption(dlg, 'token') && cloudOption(dlg, 'token').emptyText)
   created.windows.length = 0
 
   // --- (g) encrypted: the mutations go, the fact is in the footer ----------

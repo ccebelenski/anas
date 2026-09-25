@@ -13,7 +13,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "key",
@@ -25,7 +26,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -37,7 +39,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "versions",
@@ -49,7 +52,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "version_at",
@@ -61,7 +65,8 @@
         "default": "off",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "hard_delete",
@@ -73,7 +78,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "upload_cutoff",
@@ -85,7 +91,8 @@
         "default": "200Mi",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "copy_cutoff",
@@ -97,7 +104,8 @@
         "default": "4Gi",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "chunk_size",
@@ -109,7 +117,8 @@
         "default": "96Mi",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "disable_checksum",
@@ -121,7 +130,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "download_url",
@@ -133,7 +143,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "download_auth_duration",
@@ -145,7 +156,8 @@
         "default": "1w",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "memory_pool_flush_time",
@@ -157,7 +169,8 @@
         "default": "1m0s",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "memory_pool_use_mmap",
@@ -169,7 +182,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "encoding",
@@ -181,9 +195,11 @@
         "default": "Slash,BackSlash,Del,Ctl,InvalidUtf8,Dot",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       }
-    ]
+    ],
+    "guide": "The account ID and application key come from the Backblaze B2 application-keys page."
   },
   {
     "name": "sftp",
@@ -199,7 +215,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "user",
@@ -211,7 +228,8 @@
         "default": "root",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "port",
@@ -223,7 +241,8 @@
         "default": "22",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "pass",
@@ -235,7 +254,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "key_pem",
@@ -247,7 +267,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "key_file",
@@ -259,7 +280,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "key_file_pass",
@@ -271,7 +293,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "pubkey_file",
@@ -283,7 +306,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "known_hosts_file",
@@ -301,7 +325,8 @@
           }
         ],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "key_use_agent",
@@ -313,7 +338,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "use_insecure_cipher",
@@ -336,7 +362,8 @@
           }
         ],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "disable_hashcheck",
@@ -348,7 +375,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "ask_password",
@@ -360,7 +388,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "path_override",
@@ -372,7 +401,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "set_modtime",
@@ -384,7 +414,8 @@
         "default": "true",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "shell_type",
@@ -417,7 +448,8 @@
           }
         ],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "md5sum_command",
@@ -429,7 +461,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "sha1sum_command",
@@ -441,7 +474,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "skip_links",
@@ -453,7 +487,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "subsystem",
@@ -465,7 +500,8 @@
         "default": "sftp",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "server_command",
@@ -477,7 +513,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "use_fstat",
@@ -489,7 +526,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "disable_concurrent_reads",
@@ -501,7 +539,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "disable_concurrent_writes",
@@ -513,7 +552,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "idle_timeout",
@@ -525,7 +565,8 @@
         "default": "1m0s",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "chunk_size",
@@ -537,7 +578,8 @@
         "default": "32Ki",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "concurrency",
@@ -549,7 +591,8 @@
         "default": "64",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "set_env",
@@ -561,9 +604,11 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       }
-    ]
+    ],
+    "guide": "The host, port, user and password are the SSH login of the server; a key file can replace the password."
   },
   {
     "name": "s3",
@@ -600,7 +645,8 @@
           }
         ],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "env_auth",
@@ -623,7 +669,8 @@
           }
         ],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "access_key_id",
@@ -635,7 +682,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "secret_access_key",
@@ -647,7 +695,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "region",
@@ -680,7 +729,8 @@
           }
         ],
         "provider": "AWS",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "region",
@@ -713,7 +763,8 @@
           }
         ],
         "provider": "RackCorp",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "region",
@@ -741,7 +792,8 @@
           }
         ],
         "provider": "Scaleway",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "region",
@@ -774,7 +826,8 @@
           }
         ],
         "provider": "HuaweiOBS",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "region",
@@ -792,7 +845,8 @@
           }
         ],
         "provider": "Cloudflare",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "region",
@@ -825,7 +879,8 @@
           }
         ],
         "provider": "Qiniu",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "region",
@@ -853,7 +908,8 @@
           }
         ],
         "provider": "IONOS",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "region",
@@ -876,7 +932,8 @@
           }
         ],
         "provider": "!AWS,Alibaba,ChinaMobile,Cloudflare,IONOS,ArvanCloud,Qiniu,RackCorp,Scaleway,Storj,TencentCOS,HuaweiOBS,IDrive",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -888,7 +945,8 @@
         "default": "",
         "examples": [],
         "provider": "AWS",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -921,7 +979,8 @@
           }
         ],
         "provider": "ChinaMobile",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -944,7 +1003,8 @@
           }
         ],
         "provider": "ArvanCloud",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -977,7 +1037,8 @@
           }
         ],
         "provider": "IBMCOS",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1005,7 +1066,8 @@
           }
         ],
         "provider": "IONOS",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1038,7 +1100,8 @@
           }
         ],
         "provider": "Alibaba",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1071,7 +1134,8 @@
           }
         ],
         "provider": "HuaweiOBS",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1099,7 +1163,8 @@
           }
         ],
         "provider": "Scaleway",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1127,7 +1192,8 @@
           }
         ],
         "provider": "StackPath",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1155,7 +1221,8 @@
           }
         ],
         "provider": "Storj",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1188,7 +1255,8 @@
           }
         ],
         "provider": "TencentCOS",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1221,7 +1289,8 @@
           }
         ],
         "provider": "RackCorp",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1254,7 +1323,8 @@
           }
         ],
         "provider": "Qiniu",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -1287,7 +1357,8 @@
           }
         ],
         "provider": "!AWS,IBMCOS,IDrive,IONOS,TencentCOS,HuaweiOBS,Alibaba,ChinaMobile,ArvanCloud,Scaleway,StackPath,Storj,RackCorp,Qiniu",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "location_constraint",
@@ -1320,7 +1391,8 @@
           }
         ],
         "provider": "AWS",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "location_constraint",
@@ -1353,7 +1425,8 @@
           }
         ],
         "provider": "ChinaMobile",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "location_constraint",
@@ -1376,7 +1449,8 @@
           }
         ],
         "provider": "ArvanCloud",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "location_constraint",
@@ -1409,7 +1483,8 @@
           }
         ],
         "provider": "IBMCOS",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "location_constraint",
@@ -1442,7 +1517,8 @@
           }
         ],
         "provider": "RackCorp",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "location_constraint",
@@ -1475,7 +1551,8 @@
           }
         ],
         "provider": "Qiniu",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "location_constraint",
@@ -1487,7 +1564,8 @@
         "default": "",
         "examples": [],
         "provider": "!AWS,Alibaba,HuaweiOBS,ChinaMobile,Cloudflare,IBMCOS,IDrive,IONOS,ArvanCloud,Qiniu,RackCorp,Scaleway,StackPath,Storj,TencentCOS",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "acl",
@@ -1520,7 +1598,8 @@
           }
         ],
         "provider": "!Storj,Cloudflare",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "bucket_acl",
@@ -1553,7 +1632,8 @@
           }
         ],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "requester_pays",
@@ -1565,7 +1645,8 @@
         "default": "false",
         "examples": [],
         "provider": "AWS",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "server_side_encryption",
@@ -1593,7 +1674,8 @@
           }
         ],
         "provider": "AWS,Ceph,ChinaMobile,Minio",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "sse_customer_algorithm",
@@ -1616,7 +1698,8 @@
           }
         ],
         "provider": "AWS,Ceph,ChinaMobile,Minio",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "sse_kms_key_id",
@@ -1639,7 +1722,8 @@
           }
         ],
         "provider": "AWS,Ceph,Minio",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "sse_customer_key",
@@ -1657,7 +1741,8 @@
           }
         ],
         "provider": "AWS,Ceph,ChinaMobile,Minio",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "sse_customer_key_base64",
@@ -1675,7 +1760,8 @@
           }
         ],
         "provider": "AWS,Ceph,ChinaMobile,Minio",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "sse_customer_key_md5",
@@ -1693,7 +1779,8 @@
           }
         ],
         "provider": "AWS,Ceph,ChinaMobile,Minio",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "storage_class",
@@ -1726,7 +1813,8 @@
           }
         ],
         "provider": "AWS",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "storage_class",
@@ -1759,7 +1847,8 @@
           }
         ],
         "provider": "Alibaba",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "storage_class",
@@ -1792,7 +1881,8 @@
           }
         ],
         "provider": "ChinaMobile",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "storage_class",
@@ -1810,7 +1900,8 @@
           }
         ],
         "provider": "ArvanCloud",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "storage_class",
@@ -1843,7 +1934,8 @@
           }
         ],
         "provider": "TencentCOS",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "storage_class",
@@ -1871,7 +1963,8 @@
           }
         ],
         "provider": "Scaleway",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "storage_class",
@@ -1904,7 +1997,8 @@
           }
         ],
         "provider": "Qiniu",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "upload_cutoff",
@@ -1916,7 +2010,8 @@
         "default": "200Mi",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "chunk_size",
@@ -1928,7 +2023,8 @@
         "default": "5Mi",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "max_upload_parts",
@@ -1940,7 +2036,8 @@
         "default": "10000",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "copy_cutoff",
@@ -1952,7 +2049,8 @@
         "default": "4.656Gi",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "disable_checksum",
@@ -1964,7 +2062,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "shared_credentials_file",
@@ -1976,7 +2075,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "profile",
@@ -1988,7 +2088,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "session_token",
@@ -2000,7 +2101,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "upload_concurrency",
@@ -2012,7 +2114,8 @@
         "default": "4",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "force_path_style",
@@ -2024,7 +2127,8 @@
         "default": "true",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "v2_auth",
@@ -2036,7 +2140,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "use_accelerate_endpoint",
@@ -2048,7 +2153,8 @@
         "default": "false",
         "examples": [],
         "provider": "AWS",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "leave_parts_on_error",
@@ -2060,7 +2166,8 @@
         "default": "false",
         "examples": [],
         "provider": "AWS",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "list_chunk",
@@ -2072,7 +2179,8 @@
         "default": "1000",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "list_version",
@@ -2084,7 +2192,8 @@
         "default": "0",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "list_url_encode",
@@ -2096,7 +2205,8 @@
         "default": "unset",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "no_check_bucket",
@@ -2108,7 +2218,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "no_head",
@@ -2120,7 +2231,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "no_head_object",
@@ -2132,7 +2244,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "encoding",
@@ -2144,7 +2257,8 @@
         "default": "Slash,InvalidUtf8,Dot",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "memory_pool_flush_time",
@@ -2156,7 +2270,8 @@
         "default": "1m0s",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "memory_pool_use_mmap",
@@ -2168,7 +2283,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "disable_http2",
@@ -2180,7 +2296,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "download_url",
@@ -2192,7 +2309,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "use_multipart_etag",
@@ -2204,7 +2322,8 @@
         "default": "unset",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "use_presigned_request",
@@ -2216,7 +2335,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "versions",
@@ -2228,7 +2348,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "version_at",
@@ -2240,7 +2361,8 @@
         "default": "off",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "decompress",
@@ -2252,7 +2374,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "might_gzip",
@@ -2264,7 +2387,8 @@
         "default": "unset",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "no_system_metadata",
@@ -2276,9 +2400,11 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       }
-    ]
+    ],
+    "guide": "The access key id, secret access key, region and endpoint come from your storage provider's access-key page; the provider row selects which S3-compatible service this remote is."
   },
   {
     "name": "drive",
@@ -2294,7 +2420,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "client_secret",
@@ -2306,7 +2433,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "token",
@@ -2318,7 +2446,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": true
       },
       {
         "name": "auth_url",
@@ -2330,7 +2459,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "token_url",
@@ -2342,7 +2472,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "scope",
@@ -2375,7 +2506,8 @@
           }
         ],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "root_folder_id",
@@ -2387,7 +2519,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "service_account_file",
@@ -2399,7 +2532,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": false
       },
       {
         "name": "auth_owner_only",
@@ -2411,7 +2545,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "use_trash",
@@ -2423,7 +2558,8 @@
         "default": "true",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "copy_shortcut_content",
@@ -2435,7 +2571,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "skip_gdocs",
@@ -2447,7 +2584,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "skip_checksum_gphotos",
@@ -2459,7 +2597,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "shared_with_me",
@@ -2471,7 +2610,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "trashed_only",
@@ -2483,7 +2623,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "starred_only",
@@ -2495,7 +2636,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "export_formats",
@@ -2507,7 +2649,8 @@
         "default": "docx,xlsx,pptx,svg",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "import_formats",
@@ -2519,7 +2662,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "allow_import_name_change",
@@ -2531,7 +2675,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "list_chunk",
@@ -2543,7 +2688,8 @@
         "default": "1000",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "impersonate",
@@ -2555,7 +2701,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "upload_cutoff",
@@ -2567,7 +2714,8 @@
         "default": "8Mi",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "chunk_size",
@@ -2579,7 +2727,8 @@
         "default": "8Mi",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "acknowledge_abuse",
@@ -2591,7 +2740,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "keep_revision_forever",
@@ -2603,7 +2753,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "v2_download_min_size",
@@ -2615,7 +2766,8 @@
         "default": "off",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "pacer_min_sleep",
@@ -2627,7 +2779,8 @@
         "default": "100ms",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "pacer_burst",
@@ -2639,7 +2792,8 @@
         "default": "100",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "server_side_across_configs",
@@ -2651,7 +2805,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "disable_http2",
@@ -2663,7 +2818,8 @@
         "default": "true",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "stop_on_upload_limit",
@@ -2675,7 +2831,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "stop_on_download_limit",
@@ -2687,7 +2844,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "skip_shortcuts",
@@ -2699,7 +2857,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "skip_dangling_shortcuts",
@@ -2711,7 +2870,8 @@
         "default": "false",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "resource_key",
@@ -2723,7 +2883,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "encoding",
@@ -2735,8 +2896,14 @@
         "default": "InvalidUtf8",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       }
+    ],
+    "guide": "The token comes from the `rclone authorize \"drive\"` paste \u2014 run it on a machine with a browser; every other field is optional.",
+    "ownClient": [
+      "client_id",
+      "client_secret"
     ]
   },
   {
@@ -2769,7 +2936,8 @@
           }
         ],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "endpoint",
@@ -2781,7 +2949,8 @@
         "default": "",
         "examples": [],
         "provider": "other",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "mountid",
@@ -2793,7 +2962,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "setmtime",
@@ -2805,7 +2975,8 @@
         "default": "true",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       },
       {
         "name": "user",
@@ -2817,7 +2988,8 @@
         "default": "",
         "examples": [],
         "provider": "",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "password",
@@ -2829,7 +3001,8 @@
         "default": "",
         "examples": [],
         "provider": "koofr",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "password",
@@ -2841,7 +3014,8 @@
         "default": "",
         "examples": [],
         "provider": "digistorage",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "password",
@@ -2853,7 +3027,8 @@
         "default": "",
         "examples": [],
         "provider": "other",
-        "advanced": false
+        "advanced": false,
+        "essential": true
       },
       {
         "name": "encoding",
@@ -2865,7 +3040,8 @@
         "default": "Slash,BackSlash,Del,Ctl,InvalidUtf8,Dot",
         "examples": [],
         "provider": "",
-        "advanced": true
+        "advanced": true,
+        "essential": false
       }
     ]
   }

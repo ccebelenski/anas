@@ -66,6 +66,14 @@ export const CloudProviderOption = z
     /** The backend filter this option instance applies to (`AWS`, `!AWS,…`); '' = all. */
     provider: z.string(),
     advanced: z.boolean(),
+    /**
+     * rclone.4 — the dialog renders this option in the primary section: one of
+     * the curated backend's few essential fields, or — on an uncurated
+     * backend — simply everything rclone does not flag `advanced` (today's
+     * layout). ADDITIVE/optional so an older payload still validates; the
+     * trim always sets it.
+     */
+    essential: z.boolean().optional(),
   })
 export type CloudProviderOption = z.infer<typeof CloudProviderOption>
 
@@ -75,6 +83,18 @@ export const CloudProvider = z
     name: z.string(),
     description: z.string(),
     options: z.array(CloudProviderOption),
+    /**
+     * rclone.4 — the curated backend's one sentence naming where the
+     * essential values come from. Absent on an uncurated backend (the
+     * curation table, `@anas/shared` `cloud-guide.ts`, decides).
+     */
+    guide: z.string().optional(),
+    /**
+     * rclone.4 — the option names for someone bringing their OWN OAuth
+     * client (rendered in the collapsed "Use your own OAuth client" group).
+     * Absent when the backend has no such fields.
+     */
+    ownClient: z.array(z.string()).optional(),
   })
 export type CloudProvider = z.infer<typeof CloudProvider>
 

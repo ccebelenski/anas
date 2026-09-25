@@ -31,7 +31,7 @@ import type { CloudProvider, CloudProviderOption, CloudRemote, CloudRemoteWrite 
 import type { CommandExecutor, ExecResult } from '../executor/types.js'
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
-import { CloudProvider as CloudProviderSchema } from '@anas/shared'
+import { CLOUD_BACKEND_GUIDES, CloudProvider as CloudProviderSchema } from '@anas/shared'
 import { z } from 'zod'
 import { listSections, parseRcloneConf, removeSection, upsertSection } from '../parsers/rclone-conf.js'
 import { withFileLock } from './file-lock.js'
@@ -203,8 +203,18 @@ interface RawProvider {
  * `sftp.ask_password`), `password = IsPassword` (the
  * obscure-in-file set — a different fact from `secret`), `default =
  * DefaultStr`, options with `Hide !== 0` dropped (rclone hides `test_mode`-
- * style knobs from config UIs). The output is validated against the shared
- * schema.
+ * style knobs from config UIs).
+ *
+ * rclone.4 — the curated backends of the ONE curation table
+ * (`@anas/shared` `cloud-guide.ts`) additionally carry `guide` (and
+ * `ownClient` when the table names fields for a private OAuth client), and
+ * each option's `essential` says whether the dialog renders it in the
+ * primary section: on a curated backend `essential` is the table's list (the
+ * guide sentence names where those values come from); on an uncurated
+ * backend `essential = !advanced` — today's layout, nothing added. A curated
+ * name absent from the node's rclone is simply never looked up — the table
+ * never invents a backend or an option. The output is validated against the
+ * shared schema.
  */
 export function trimProviders(raw: unknown): CloudProvider[] {
   if (!Array.isArray(raw))
@@ -218,6 +228,7 @@ export function trimProviders(raw: unknown): CloudProvider[] {
       .map((o) => {
         const name = String(o.Name ?? '')
         const type = String(o.Type ?? '')
+        const guide = CLOUD_BACKEND_GUIDES[String(p.Name ?? '')]
         return {
           name,
           help: String(o.Help ?? ''),
@@ -235,8 +246,13 @@ export function trimProviders(raw: unknown): CloudProvider[] {
           })),
           provider: String(o.Provider ?? ''),
           advanced: o.Advanced === true,
+          // Curated ⇒ the table's essential list; uncurated ⇒ today's
+          // behaviour (`!advanced`) — the dialog groups by this one flag.
+          essential: guide ? guide.essential.includes(name) : o.Advanced !== true,
         }
       }),
+    guide: CLOUD_BACKEND_GUIDES[String(p.Name ?? '')]?.guide,
+    ownClient: CLOUD_BACKEND_GUIDES[String(p.Name ?? '')]?.ownClient,
   }))
   const parsed = z.array(CloudProviderSchema).safeParse(trimmed)
   if (!parsed.success)

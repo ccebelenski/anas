@@ -2,12 +2,20 @@
 
 export const VERSION = '0.3.5'
 
+// Cloud remote-form curation table (rclone.4) — the ONE display-side guide
+// the daemon's catalogue trim consumes; the UI renders from the trim.
+export {
+  CLOUD_BACKEND_GUIDES,
+} from './cloud-guide.js'
+export type { CloudBackendGuide } from './cloud-guide.js'
+
 // Mount target normalisation (Epic 18): the pure server/share normaliser the
 // daemon (buildSpec, create/test routes) and the UI port both build from,
 // plus its result type.
 export {
   normalizeMountTarget,
 } from './mount-target.js'
+
 export type { MountTarget } from './mount-target.js'
 
 // PVE footprint ownership (story pvepool.1 — GitHub #61): the shared pure
@@ -85,7 +93,6 @@ export {
   ErrorCode,
   RequestHeaders,
 } from './schemas/api.js'
-
 // Backup schemas (Epic 16 — PBS file backup)
 export {
   ArchivePath,

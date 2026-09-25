@@ -21,6 +21,16 @@
  *     what was typed into an advanced row is kept when the toggle goes off
  *     (a per-dialog stash) and is sent with the rest — hiding a row the user
  *     filled must not silently discard it.
+ *   - rclone.4 — a CURATED backend (the daemon's catalogue trim carries a
+ *     `guide` sentence, from the ONE curation table in @anas/shared
+ *     `cloud-guide.ts`) renders: the guide sentence, the essential fields in
+ *     the primary section, the optional own-OAuth-client fields under a
+ *     collapsed "Use your own OAuth client" fieldset (with its one sentence),
+ *     and every other non-advanced option under a collapsed "More options"
+ *     fieldset — the advanced toggle unchanged. The dialog stays a renderer:
+ *     it holds no copy of the curation knowledge. An UNCURATED backend
+ *     renders exactly as before (`essential` mirrors `!advanced`, no guide,
+ *     both fieldsets empty and hidden).
  *   - an option with a non-empty `provider` filter shows only when the filter
  *     matches the current value of the backend's `provider` option (rclone's
  *     syntax: a comma list of provider values, or `!A,B` = all except) — so
@@ -83,7 +93,9 @@
  * buttons 'anas-btn-cloud-remote-add' / '-edit' / '-test' / '-remove');
  * dialog 'anas-win-cloud-remote-edit' (name 'anas-fld-cloud-remote-name',
  * type 'anas-fld-cloud-remote-type', advanced toggle 'anas-fld-cloud-advanced',
- * per-option field 'anas-fld-cloud-opt-<name>', OAuth note 'anas-cloud-oauth',
+ * per-option field 'anas-fld-cloud-opt-<name>', guide note 'anas-cloud-guide',
+ * OAuth note 'anas-cloud-oauth', own-client fieldset 'anas-fld-cloud-own-client',
+ * more-options fieldset 'anas-fld-cloud-more',
  * other keys 'anas-cloud-other-keys', Test 'anas-btn-cloud-remote-testconn',
  * verdict area 'anas-cloud-test-result', save 'anas-btn-cloud-remote-save').
  *
@@ -990,9 +1002,23 @@
         }
     }
 
+    // The one sentence inside the own-OAuth-client group (rclone.4). Only a
+    // curated backend with `ownClient` fields renders it.
+    var OWN_CLIENT_SENTENCE = 'Optional. rclone\'s built-in client is shared '
+        + 'by every rclone user and rate-limited; a client of your own avoids that.';
+
     // Rebuild BOTH option containers from the chosen provider's schema,
     // keeping the values currently on the fields (a provider change may
     // add/remove filtered rows — what was typed elsewhere survives).
+    //
+    // rclone.4 — on a CURATED backend (the daemon's catalogue trim carries
+    // `guide`) the rows split four ways: the essential fields in the primary
+    // container, the own-OAuth-client pair in its collapsed fieldset, every
+    // other non-advanced option in the collapsed "More options" fieldset, and
+    // the advanced ones behind the unchanged toggle. An UNCURATED backend
+    // renders exactly as before — `essential` mirrors `!advanced`, so the
+    // same routing lands every row where it always sat and both fieldsets
+    // stay empty and hidden.
     function rebuildOptionFields(win, providers, isEdit, storedOptions) {
         var type = trim(valOf(win, '#cloudRemoteType') || '');
         var prov = findProvider(providers, type);
@@ -1000,8 +1026,19 @@
         var adv = win.down('#cloudOptionsAdvanced');
         var oauth = win.down('#cloudOAuthNote');
         var other = win.down('#cloudOtherKeys');
+        var guideNote = win.down('#cloudGuideNote');
+        var ownGroup = win.down('#cloudOwnClientGroup');
+        var moreGroup = win.down('#cloudMoreGroup');
         if (!basic || !adv) {
             return;
+        }
+
+        var curated = !!(prov && prov.guide);
+        var isOwnClient = {};
+        var ownClientList = (curated && prov.ownClient) || [];
+        var iOwn;
+        for (iOwn = 0; iOwn < ownClientList.length; iOwn++) {
+            isOwnClient[ownClientList[iOwn]] = true;
         }
 
         // The option-name → option map for THIS backend: the wire builder's
@@ -1044,6 +1081,8 @@
         var hasAdvanced = false;
         var basicRows = [];
         var advRows = [];
+        var ownRows = [];
+        var moreRows = [];
         var required = [];
         var known = {};
 
@@ -1103,9 +1142,25 @@
                 }
                 if (opt.advanced === true && opt.name !== 'token') {
                     advRows.push(cfg); // below the toggle
+                } else if (opt.name === 'token') {
+                    basicRows.push(cfg); // the token's home is with its sentence
+                } else if (curated && isOwnClient[opt.name]) {
+                    ownRows.push(cfg); // collapsed own-OAuth-client fieldset
+                } else if (opt.essential === true) {
+                    basicRows.push(cfg); // the primary section
+                } else if (curated) {
+                    moreRows.push(cfg); // collapsed "More options" fieldset
                 } else {
-                    basicRows.push(cfg);
+                    basicRows.push(cfg); // uncurated fallback (a payload without essential)
                 }
+            }
+        }
+
+        if (guideNote) {
+            guideNote.setHidden(!curated);
+            if (curated) {
+                guideNote.setHtml('<div style="color:var(--anas-muted,gray);font-size:11px;margin:2px 0 8px 0;">'
+                    + enc(prov.guide) + '</div>');
             }
         }
 
@@ -1123,6 +1178,29 @@
             adv.removeAll();
             adv.add(advRows);
             adv.setHidden(advRows.length === 0);
+            // The two collapsed groups of a curated backend (rclone.4). The
+            // own-client group opens with its one sentence; "More options"
+            // holds every other non-advanced row. A fieldset holds its fields
+            // even collapsed — a typed value is read at submit regardless of
+            // the collapsed state, the same "a view, not a filter" rule the
+            // advanced toggle follows.
+            if (ownGroup) {
+                ownGroup.removeAll();
+                if (ownRows.length) {
+                    ownGroup.add([{
+                        xtype: 'component',
+                        cls: 'anas-cloud-ownclient-note',
+                        html: '<div style="color:var(--anas-muted,gray);font-size:11px;margin:2px 0 8px 0;">'
+                            + enc(t(OWN_CLIENT_SENTENCE)) + '</div>',
+                    }].concat(ownRows));
+                }
+                ownGroup.setHidden(ownRows.length === 0);
+            }
+            if (moreGroup) {
+                moreGroup.removeAll();
+                moreGroup.add(moreRows);
+                moreGroup.setHidden(moreRows.length === 0);
+            }
             // A backend with no advanced options has no toggle to offer.
             var advToggle = win.down('#cloudAdvanced');
             if (advToggle) {
@@ -1460,6 +1538,14 @@
                             } },
                         },
                         {
+                            // Curated backends (rclone.4): the one sentence
+                            // naming where the essential values come from.
+                            xtype: 'component',
+                            itemId: 'cloudGuideNote',
+                            cls: 'anas-cloud-guide',
+                            hidden: true,
+                        },
+                        {
                             // OAuth backends: the sentence + the always-visible
                             // token field (rendered with the basic options).
                             xtype: 'component',
@@ -1471,6 +1557,32 @@
                             xtype: 'container',
                             itemId: 'cloudOptionsBasic',
                             layout: 'anchor',
+                        },
+                        {
+                            // Curated backends: the optional own-OAuth-client
+                            // fields, collapsed (rclone.4).
+                            xtype: 'fieldset',
+                            itemId: 'cloudOwnClientGroup',
+                            cls: 'anas-fld-cloud-own-client',
+                            title: t('Use your own OAuth client'),
+                            collapsible: true,
+                            collapsed: true,
+                            hidden: true,
+                            layout: 'anchor',
+                            defaults: { anchor: '100%', labelWidth: 160 },
+                        },
+                        {
+                            // Curated backends: every other non-advanced
+                            // option, collapsed (rclone.4).
+                            xtype: 'fieldset',
+                            itemId: 'cloudMoreGroup',
+                            cls: 'anas-fld-cloud-more',
+                            title: t('More options'),
+                            collapsible: true,
+                            collapsed: true,
+                            hidden: true,
+                            layout: 'anchor',
+                            defaults: { anchor: '100%', labelWidth: 160 },
                         },
                         {
                             xtype: 'checkboxfield',

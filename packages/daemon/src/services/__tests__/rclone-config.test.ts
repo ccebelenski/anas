@@ -194,6 +194,80 @@ describe('rclone-config: trimProviders on the 1.60.1 fixture (rclone.1)', () => 
   })
 })
 
+describe('rclone-config: trimProviders curation (rclone.4)', () => {
+  it('a curated backend carries the guide sentence and the own-client list', () => {
+    const drive = provider('drive')
+    assert.ok(drive.guide && drive.guide.length > 0, 'drive has a guide sentence')
+    assert.match(drive.guide!, /rclone authorize/)
+    assert.match(drive.guide!, /drive/, 'the sentence names its own backend')
+    assert.deepEqual(drive.ownClient, ['client_id', 'client_secret'])
+    // dropbox/box have no own-client fields: the field stays ABSENT, never [].
+    assert.equal(provider('dropbox').ownClient, undefined)
+    assert.ok(provider('dropbox').guide, 'dropbox has a guide sentence')
+  })
+
+  it('curated ⇒ essential is the table\'s list, on the real capture', () => {
+    // drive: token essential (even though rclone types it advanced); the
+    // own-client pair and everything else are not.
+    const drive = provider('drive')
+    assert.equal(drive.options.find(o => o.name === 'token')!.essential, true)
+    for (const name of ['client_id', 'client_secret', 'scope', 'service_account_file', 'root_folder_id'])
+      assert.equal(drive.options.find(o => o.name === name)!.essential, false, name)
+    // s3: exactly the five primary fields.
+    const s3 = provider('s3')
+    for (const name of ['provider', 'access_key_id', 'secret_access_key', 'region', 'endpoint'])
+      assert.equal(s3.options.find(o => o.name === name)!.essential, true, name)
+    assert.equal(s3.options.find(o => o.name === 'env_auth')!.essential, false)
+    // b2: account / key essential, the rest not.
+    const b2 = provider('b2')
+    for (const name of ['account', 'key'])
+      assert.equal(b2.options.find(o => o.name === name)!.essential, true, name)
+    assert.equal(b2.options.find(o => o.name === 'hard_delete')!.essential, false)
+    // sftp: the login fields essential; `key_pem` (a paste-in key, not a path) not.
+    const sftp = provider('sftp')
+    for (const name of ['host', 'port', 'user', 'pass', 'key_file'])
+      assert.equal(sftp.options.find(o => o.name === name)!.essential, true, name)
+    assert.equal(sftp.options.find(o => o.name === 'key_pem')!.essential, false)
+  })
+
+  it('curated backends of the capture all carry a guide', () => {
+    for (const name of ['drive', 'onedrive', 'dropbox', 'box', 'pcloud', 's3', 'b2', 'sftp', 'ftp', 'webdav', 'smb', 'azureblob'])
+      assert.ok(provider(name).guide, `'${name}' has a guide sentence`)
+  })
+
+  it('an uncurated backend mirrors !advanced and adds nothing', () => {
+    for (const name of ['koofr', 'alias', 'local']) {
+      const p = provider(name)
+      assert.equal(p.guide, undefined, `'${name}' has no guide`)
+      assert.equal(p.ownClient, undefined, `'${name}' has no own-client list`)
+      for (const o of p.options)
+        assert.equal(o.essential, !o.advanced, `${name}.${o.name}`)
+    }
+  })
+
+  it('a curated name absent from rclone\'s catalogue is ignored, never invented', () => {
+    // A synthetic capture whose `dropbox` knows only two options: the trim
+    // marks what IS there from the table and invents nothing that is not.
+    const raw = [
+      {
+        Name: 'dropbox',
+        Description: 'Dropbox',
+        Options: [
+          { Name: 'token', Help: '', Type: 'string', Required: false, Advanced: true },
+          { Name: 'chunk_size', Help: '', Type: 'string', Required: false, Advanced: false },
+        ],
+      },
+      { Name: 'notacuration', Description: 'x', Options: [] },
+    ]
+    const [dbx, unk] = trimProviders(raw)
+    assert.equal(dbx!.options.find(o => o.name === 'token')!.essential, true)
+    assert.equal(dbx!.options.find(o => o.name === 'chunk_size')!.essential, false)
+    assert.equal(dbx!.options.some(o => o.name === 'nonexistent'), false)
+    assert.equal(unk!.guide, undefined)
+    assert.equal(unk!.ownClient, undefined)
+  })
+})
+
 describe('rclone-config: argv guard + base args (rclone.1)', () => {
   it('rcloneBaseArgs is --config <file> --ask-password=false, nothing more', () => {
     assert.deepEqual(rcloneBaseArgs('/etc/anas/rclone.conf'), ['--config', '/etc/anas/rclone.conf', '--ask-password=false'])
