@@ -22,6 +22,14 @@ import { TASK_CANCELLED_EXIT_CODE } from '@anas/shared'
 export const RUNNER_POLL_INTERVAL_MS = 10_000
 /** Runaway backstop: 8640 polls ≈ 24h at 10s. NOT an expected-duration guess. */
 export const RUNNER_POLL_MAX_ATTEMPTS = 8640
+/**
+ * Consecutive unanswered polls (refused connection, missing socket, 401/500)
+ * tolerated before the run is declared interrupted: 30 × 10s ≈ 5 min — long
+ * enough for anasd to restart, never long enough to hold a systemd unit
+ * `activating` for hours. A 200 resets the count; a 404 never gets here (it is
+ * terminal on the first sight — see the loop).
+ */
+export const RUNNER_POLL_RECONNECT_ATTEMPTS = 30
 
 const DEFAULT_SOCKET = process.env.ANASD_SOCKET ?? '/run/anas/anasd.sock'
 
@@ -58,14 +66,28 @@ export interface RunLoopOptions {
   intervalMs?: number
   /** Runaway backstop (default {@link RUNNER_POLL_MAX_ATTEMPTS} ≈ 24h). */
   maxAttempts?: number
+  /**
+   * Consecutive unanswered polls before the run is declared interrupted
+   * (default {@link RUNNER_POLL_RECONNECT_ATTEMPTS}).
+   */
+  reconnectAttempts?: number
   /** Injectable sleep (tests pass a no-op). */
   sleep?: (ms: number) => Promise<void>
 }
 
+/** The bound-reached error: the daemon went silent mid-run for `failures` polls. */
+function interruptedError(kind: string, id: string, failures: number, intervalMs: number): Error {
+  return new Error(
+    `${kind} job ${id}: the daemon did not answer for ${Math.round(failures * intervalMs / 1000)} s — the run was interrupted`,
+  )
+}
+
 /**
  * Poll a submitted job to a terminal state. Resolves with the finished Job
- * (completed OR failed); rejects only on transport/protocol failures — or on
- * the 24h backstop, `kind` naming the caller in the error.
+ * (completed OR failed); rejects, with `kind` naming the caller in the error,
+ * when the mirror breaks: a vanished job (404 — the in-memory queue lost it to
+ * a daemon restart mid-run), a daemon that stayed silent for the reconnect
+ * bound, or the 24h backstop.
  */
 export async function pollJobToTerminal(
   requester: Requester,
@@ -75,19 +97,52 @@ export async function pollJobToTerminal(
 ): Promise<Job> {
   const intervalMs = loop.intervalMs ?? RUNNER_POLL_INTERVAL_MS
   const maxAttempts = loop.maxAttempts ?? RUNNER_POLL_MAX_ATTEMPTS
+  const reconnectAttempts = loop.reconnectAttempts ?? RUNNER_POLL_RECONNECT_ATTEMPTS
   const sleep = loop.sleep ?? (ms => new Promise<void>(r => setTimeout(r, ms)))
   const headers = identityHeaders()
 
+  let unanswered = 0
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const poll = await requester({
-      method: 'GET',
-      path: `/v1/jobs/${jobRef.id}`,
-      headers,
-    })
+    let poll: RunnerResponse
+    try {
+      poll = await requester({
+        method: 'GET',
+        path: `/v1/jobs/${jobRef.id}`,
+        headers,
+      })
+    }
+    catch {
+      // Transport failure — connection refused / socket missing while anasd
+      // restarts. Retryable, but bounded: a silent daemon past the reconnect
+      // bound means the run died with the restart.
+      unanswered += 1
+      if (unanswered >= reconnectAttempts)
+        throw interruptedError(kind, jobRef.id, unanswered, intervalMs)
+      await sleep(intervalMs)
+      continue
+    }
     if (poll.statusCode === 200) {
+      // A live answer ends any silent streak — the counter counts CONSECUTIVE
+      // failures only.
+      unanswered = 0
       const job = (poll.body as { job?: Job }).job
       if (job && isTerminalJob(job))
         return job
+    }
+    else if (poll.statusCode === 404) {
+      // The job queue is in-memory: a 404 means anasd restarted mid-run, the
+      // child (rclone / proxmox-backup-client) died with it, and the id can
+      // never come back. Terminal on the first sight — polling on held the
+      // unit `activating` for the 24h backstop (found live 2026-09-25).
+      throw new Error(`${kind} job ${jobRef.id} no longer exists: the daemon restarted while the run was in progress, so the run was interrupted and must be started again`)
+    }
+    else {
+      // Any other non-200 (401/500; socketRequester also answers statusCode 0
+      // when no status came back) is a daemon problem, not a missing job —
+      // the reconnect bound's territory, and it counts toward it.
+      unanswered += 1
+      if (unanswered >= reconnectAttempts)
+        throw interruptedError(kind, jobRef.id, unanswered, intervalMs)
     }
     await sleep(intervalMs)
   }
