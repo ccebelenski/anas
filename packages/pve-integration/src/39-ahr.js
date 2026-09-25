@@ -376,6 +376,18 @@
             + pill + tier + '</div>';
     }
 
+    // Counters are read, not calculated on: group them in threes so a
+    // seven-digit hit count is legible at a glance. Grouping is done here
+    // rather than through toLocaleString so the separator does not move with
+    // the node's locale between one panel and the next.
+    function fmtCount(n) {
+        var v = Number(n);
+        if (!isFinite(v)) {
+            return '' + n;
+        }
+        return String(Math.round(v)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    }
+
     function capRow(label, value, emphasis) {
         return '<div style="display:flex;justify-content:space-between;gap:14px;padding:3px 0">'
             + '<span style="color:var(--anas-muted)">' + enc(label) + '</span>'
@@ -487,25 +499,41 @@
     // One disk's band-slice bar: each partition a segment coloured by its band,
     // width proportional to size; the unpartitioned remainder (the raw region
     // above the top array boundary, §2.6) hatched/grey with a label.
-    function diskSliceBar(disk, maxBytes) {
+    function diskSliceBar(disk, maxBytes, sliceBytes) {
         var total = Number(disk.usableBytes) || Number(disk.sizeBytes) || 0;
         if (!(total > 0) || !(maxBytes > 0)) {
             return '';
         }
         // A cache disk (ahrcache.1) carries ONE slice that backs no band —
         // `partitions` is [] for it by schema, and rendering the default hatch
-        // would read the whole disk as unused. One full-width segment says
-        // what the disk is doing.
+        // would read the whole disk as unused. The segment is the SLICE, whose
+        // size the pool's `cache` reports (§13): a reclaimed hand-cut slice is
+        // smaller than the disk it sits on, and labelling the disk's size there
+        // would name flash the cache does not have. Without a slice figure the
+        // whole disk is the honest picture. The bar is clipped to the member
+        // scale — a cache disk taller than every member is not a wider bar.
         if (disk.role === 'cache') {
-            var cw = (total / maxBytes) * 100;
+            var slice = Number(sliceBytes) || 0;
+            if (!(slice > 0) || slice > total) {
+                slice = total;
+            }
+            var cw = Math.min(100, (total / maxBytes) * 100);
+            var fill = Math.min(100, (slice / total) * 100);
+            var rest = 100 - fill;
             return '<span style="display:inline-flex;width:' + cw.toFixed(2) + '%;height:20px;'
                 + 'border-radius:5px;overflow:hidden;border:1px solid var(--anas-card-edge);'
                 + 'background:var(--anas-slot)">'
-                + '<span title="' + enc(t('read cache') + ' — ' + fmtBytes(total)) + '"'
+                + '<span title="' + enc(t('read cache') + ' — ' + fmtBytes(slice)) + '"'
                 + ' style="display:inline-flex;align-items:center;justify-content:center;'
-                + 'width:100%;height:100%;background:var(--anas-accent);'
+                + 'width:' + fill.toFixed(2) + '%;height:100%;background:var(--anas-accent);'
                 + 'color:#fff;font-size:9.5px;font-weight:700;overflow:hidden;white-space:nowrap">'
-                + (cw > 6 ? enc(t('cache')) : '') + '</span></span>';
+                + (cw * fill / 100 > 6 ? enc(t('cache')) : '') + '</span>'
+                + (rest > 0.5
+                    ? '<span title="' + enc(t('unallocated') + ' — ' + fmtBytes(total - slice)) + '"'
+                        + ' style="display:inline-flex;width:' + rest.toFixed(2) + '%;height:100%;'
+                        + 'background:' + HATCH + '"></span>'
+                    : '')
+                + '</span>';
         }
         var parts = (disk.partitions || []).slice();
         parts.sort(function (a, b) {
@@ -556,13 +584,27 @@
             return '';
         }
         var bad = faultedDiskIds(d);
+        // The slice bars are scaled against the tallest MEMBER (or spare — a
+        // spare really carries the band geometry). A cache disk backs no band,
+        // so letting it set the scale would shrink every member's bar to a
+        // fraction of a disk that has nothing to do with the layout.
         var maxBytes = 0;
         var i;
         for (i = 0; i < disks.length; i++) {
+            if (disks[i].role === 'cache') {
+                continue;
+            }
             var u = Number(disks[i].usableBytes) || Number(disks[i].sizeBytes) || 0;
             if (u > maxBytes) {
                 maxBytes = u;
             }
+        }
+        // The cache slice's own size (§13 reports it once, on the cache, where
+        // it belongs — a reclaimed hand-cut slice is smaller than its disk).
+        // Attributable only when ONE disk carries the cache.
+        var cacheSliceBytes = 0;
+        if (d.cache && d.cache.devices && d.cache.devices.length === 1) {
+            cacheSliceBytes = Number(d.cache.sizeBytes) || 0;
         }
         function bayFor(disk) {
             var faulted = !!bad[disk.id];
@@ -575,7 +617,8 @@
                     ? ' · ' + t('read cache — the slice is wiped on detach')
                     : '');
             var inner = '<div style="width:100%;min-width:340px">'
-                + '<div style="display:block;margin-bottom:5px">' + diskSliceBar(disk, maxBytes) + '</div>'
+                + '<div style="display:block;margin-bottom:5px">'
+                + diskSliceBar(disk, maxBytes, disk.role === 'cache' ? cacheSliceBytes : 0) + '</div>'
                 + '<div style="font-size:11px;color:var(--anas-muted)">' + enc(sub)
                 + (faulted ? ' · <b style="color:var(--anas-danger)">' + enc(t('FAULTED')) + '</b>' : '')
                 + '</div></div>';
@@ -820,6 +863,14 @@
         }
         var stateHtml;
         var extra = '';
+        // An absent cache has no devices, no size and no mode — the schema
+        // sends 0/'' there, and rendering the rows anyway reads "device
+        // missing · 0 B · writethrough", three facts about a cache that does
+        // not exist. The state line is the whole truth. The leftover slice is
+        // the one absent shape with real numbers (the device and the size of
+        // the slice still on it), so it keeps those two rows — and only those.
+        var describable = c.state !== 'absent';
+        var leftover = c.state === 'absent' && !!(c.devices && c.devices.length);
         if (c.state === 'absent') {
             stateHtml = '<span style="color:var(--anas-muted)">' + enc(t('no cache')) + '</span>';
             if (c.devices && c.devices.length) {
@@ -835,13 +886,18 @@
         } else {
             stateHtml = renderPoolState('healthy');
         }
-        var rows = capRow(t('Devices'),
-            (c.devices && c.devices.length) ? c.devices.join(', ') : t('device missing'));
-        rows += capRow(t('Cache size'), fmtBytes(c.sizeBytes));
-        rows += capRow(t('Mode'),
-            c.mode + ' — ' + t('read cache; every write lands on the pool before it is acknowledged'));
-        if (c.policy) {
-            rows += capRow(t('Policy'), c.policy);
+        var rows = '';
+        if (describable || leftover) {
+            rows += capRow(t('Devices'),
+                (c.devices && c.devices.length) ? c.devices.join(', ') : t('device missing'));
+            rows += capRow(leftover ? t('Slice size') : t('Cache size'), fmtBytes(c.sizeBytes));
+        }
+        if (describable) {
+            rows += capRow(t('Mode'),
+                c.mode + ' — ' + t('read cache; every write lands on the pool before it is acknowledged'));
+            if (c.policy) {
+                rows += capRow(t('Policy'), c.policy);
+            }
         }
         if (c.state === 'healthy') {
             var hits = Number(c.hits);
@@ -850,12 +906,23 @@
                 var total = hits + misses;
                 var ratio = total > 0 ? ANAS.formatPercent((hits / total) * 100) : '—';
                 rows += capRow(t('Hits / misses (hit ratio)'),
-                    hits + ' / ' + misses + ' (' + ratio + ')');
+                    fmtCount(hits) + ' / ' + fmtCount(misses) + ' (' + ratio + ')');
             }
             var used = c.usedBlocks;
             var totalBlocks = c.totalBlocks;
             if (used !== undefined && totalBlocks !== undefined) {
-                rows += capRow(t('Cache blocks'), used + ' ' + t('of') + ' ' + totalBlocks + ' ' + t('blocks used'));
+                // How full the cache is, which is the question the figure
+                // answers; the raw counts stay one hover away rather than
+                // asking the reader to divide six-digit numbers in their head.
+                var fullPct = Number(totalBlocks) > 0
+                    ? ANAS.formatPercent((Number(used) / Number(totalBlocks)) * 100)
+                    : '—';
+                rows += '<div title="' + enc(fmtCount(used) + ' ' + t('of') + ' '
+                        + fmtCount(totalBlocks) + ' ' + t('cache blocks hold data')) + '"'
+                    + ' style="display:flex;justify-content:space-between;gap:14px;padding:3px 0">'
+                    + '<span style="color:var(--anas-muted)">' + enc(t('Cache blocks used')) + '</span>'
+                    + '<span style="font-variant-numeric:tabular-nums;font-weight:600">'
+                    + enc(fullPct) + '</span></div>';
             }
             var dirty = c.dirtyBlocks;
             if (dirty !== undefined) {
@@ -864,9 +931,9 @@
                 rows += '<div style="display:flex;justify-content:space-between;gap:14px;padding:3px 0">'
                     + '<span style="color:var(--anas-muted)">' + enc(t('Dirty blocks')) + '</span>'
                     + '<span style="font-variant-numeric:tabular-nums;font-weight:600;'
-                    + (Number(dirty) > 0 ? 'color:var(--anas-danger)">' + enc('' + dirty)
+                    + (Number(dirty) > 0 ? 'color:var(--anas-danger)">' + enc(fmtCount(dirty))
                         + ' — ' + enc(t('non-zero is a bug in writethrough'))
-                        : '">' + enc('' + dirty) + ' — ' + enc(t('0 by construction in writethrough')))
+                        : '">' + enc(fmtCount(dirty)) + ' — ' + enc(t('0 by construction in writethrough')))
                     + '</span></div>';
             }
         }
@@ -912,10 +979,19 @@
             });
             start += h;
         }
+        // The unprotected pseudo-band is band GEOMETRY: capacity that sits
+        // above the top array on a disk the bands are cut from. A cache disk
+        // is not one of those — it backs no band, its one slice is the whole
+        // story, and counting it here manufactures a "wasted" band out of an
+        // SSD that is doing exactly what it was attached to do. Spares STAY:
+        // a spare is cut to the band geometry and really does carry it.
         var disks = (d && d.disks) || [];
         var tallest = 0;
         var above = 0;
         for (i = 0; i < disks.length; i++) {
+            if (disks[i].role === 'cache') {
+                continue;
+            }
             var s = Number(disks[i].usableBytes) || 0;
             if (s > tallest) {
                 tallest = s;
@@ -942,7 +1018,12 @@
         if (!(ANAS.ahr && typeof ANAS.ahr.bandBarsHtml === 'function')) {
             return '';
         }
-        var disks = ((d && d.disks) || []).map(function (x) {
+        // Members and spares only. `diskInBand()` is a pure size test, so a
+        // cache SSD as tall as the bands would be painted with band segments
+        // it holds not one byte of (ahrcache.1 review).
+        var disks = ((d && d.disks) || []).filter(function (x) {
+            return x.role !== 'cache';
+        }).map(function (x) {
             return { id: x.id, size: Number(x.usableBytes) || 0 };
         });
         var html = ANAS.ahr.bandBarsHtml(poolBands(d), disks);
@@ -1566,7 +1647,6 @@
         if (abandonBtn) {
             abandonBtn.setHidden(!halted);
         }
-        // Re-add appears only when a member is faulty/missing (11.9).
         var cache = has ? sel[0].get('cache') : null;
         var cacheBtn = grid.down('#attachCache');
         if (cacheBtn) {
@@ -1593,12 +1673,25 @@
         // which detach is the only product path to delete.
         var detachBtn = grid.down('#detachCache');
         if (detachBtn) {
-            var detachable = has && !!cache
+            var something = !!cache
                 && (cache.state !== 'absent' || (cache.devices && cache.devices.length > 0));
+            // …but an OFFLINE pool releases a LIVE cache through
+            // `lvconvert --uncache`, which needs an active volume, and the
+            // route refuses exactly that shape. A mere leftover slice comes
+            // off with `sgdisk -d`, which asks nothing of LVM, so it stays
+            // detachable on an offline pool — this mirrors the route rather
+            // than Attach, or the button would be dead where the recovery
+            // lives (detaching a FAILED cache IS the recovery, on a pool the
+            // failure has already dragged to degraded).
+            var liveOnOffline = something && state === 'offline'
+                && cache.state !== 'absent';
+            var detachable = has && something && !liveOnOffline;
             detachBtn.setDisabled(!detachable);
-            detachBtn.setTooltip(has && !detachable
-                ? t('This pool has no read cache to detach')
-                : '');
+            detachBtn.setTooltip(!has
+                ? ''
+                : (liveOnOffline
+                    ? t('The pool\'s volume is not assembled — bring it online first, the cache is released by uncache')
+                    : (!detachable ? t('This pool has no read cache to detach') : '')));
         }
         // The Remount verb goes HERE. Its daemon side shipped with ahrcache.1
         // slice 2 — POST /v1/ahr/:name/remount, confirm-coded (unmount + mount:
@@ -1611,6 +1704,7 @@
         // that case wants the tooltip rather than a live button. A daemon that
         // omits `mountedReadOnly` is an older one — no field, no button.
         // Not built in slice 2; this is the follow-up's marker.
+        // Re-add appears only when a member is faulty/missing (11.9).
         var readdBtn = grid.down('#readd');
         if (readdBtn) {
             readdBtn.setHidden(!has || readdCandidates(sel[0]).length === 0);
@@ -2226,10 +2320,22 @@
         });
     }
 
-    // Detach read cache: a plain confirm (the daemon is deliberately NOT
-    // confirm-gated — a writethrough cache holds no only copy), then the 202
-    // job. The trade is named in the story's own words; a FAILED cache says
-    // the truth instead — reads do NOT continue until this runs (GT-19).
+    // Detach read cache: a PLAIN confirm, then the 202 job.
+    //
+    // Not confirmAndRun. That helper only ever prompts on the daemon's 409
+    // confirm-code challenge, and DELETE /v1/ahr/:pool/cache answers 202 by
+    // design (§13: a writethrough cache holds no only copy, so there is
+    // nothing for a confirm code to protect). Routed through confirmAndRun the
+    // dialog would never open and the SSD would be wiped on the first click,
+    // with both confirm texts below dead strings — so this uses the plain
+    // Ext.Msg.confirm idiom the codebase gives un-gated destructive verbs
+    // (60-datasets.js, 69-snapshots.js, 75-iscsi.js). A 202 verb that consumes
+    // a consumable earns a click-through, not a confirm code.
+    //
+    // The trade is named in the story's own words; a FAILED cache says the
+    // truth instead — reads do NOT continue until this runs (GT-19). The wipe
+    // clause is conditional: with the device gone there is no SSD to wipe, and
+    // promising one back would be a lie the operator can check.
     function openDetachCache(grid, node) {
         var pool = selectedPool(grid);
         var sel = grid.getSelection();
@@ -2238,34 +2344,44 @@
         }
         var c = sel[0].get('cache') || {};
         var failed = c.state === 'failed';
-        var devs = (c.devices && c.devices.length)
-            ? c.devices.join(', ')
-            : t('device missing');
-        ANAS.confirmAndRun({
-            node: node,
-            method: 'del',
-            path: '/ahr/' + encodeURIComponent(pool) + '/cache',
-            view: grid,
-            confirmTitle: 'Detach cache',
-            confirmIntro: (failed
-                ? t('Detaching the FAILED read cache on') + ' <b>' + enc(pool) + '</b> '
-                    + t('restores reads — every read currently returns an I/O error. ')
-                : t('Detaching the read cache on') + ' <b>' + enc(pool) + '</b> — '
-                    + t('reads continue from the pool; '))
-                + t('the SSD is wiped and returns to available') + ':'
-                + '<br><b>' + enc(devs) + '</b>',
-            failTitle: 'Detach cache failed',
-            successMsg: t('Read cache detach started on') + ' ' + pool,
-            onSubmitted: function () {
-                reloadAfterCacheJob(grid, node, pool);
-            },
-            onFailed: function () {
-                reloadAfterCacheJob(grid, node, pool);
-            },
-            onComplete: function () {
-                reloadAfterCacheJob(grid, node, pool);
-            },
-        });
+        var devs = (c.devices && c.devices.length) ? c.devices.join(', ') : '';
+        var msg = failed
+            ? t('Detaching the FAILED read cache on') + ' <b>' + enc(pool) + '</b> '
+                + t('restores reads — every read currently returns an I/O error until it is detached')
+            : t('Detaching the read cache on') + ' <b>' + enc(pool) + '</b> — '
+                + t('reads continue from the pool');
+        msg += devs
+            ? '; ' + t('the SSD is wiped and returns to available') + ':'
+                + '<br><b>' + enc(devs) + '</b>'
+            : '. ' + t('The cache device is gone — there is no SSD left to wipe.');
+        function run() {
+            ANAS.runJob({
+                node: node,
+                method: 'del',
+                path: '/ahr/' + encodeURIComponent(pool) + '/cache',
+                view: grid,
+                failTitle: 'Detach cache failed',
+                successMsg: t('Read cache detach started on') + ' ' + pool,
+                onSubmitted: function () {
+                    reloadAfterCacheJob(grid, node, pool);
+                },
+                onFailed: function () {
+                    reloadAfterCacheJob(grid, node, pool);
+                },
+                onComplete: function () {
+                    reloadAfterCacheJob(grid, node, pool);
+                },
+            });
+        }
+        try {
+            Ext.Msg.confirm(t('Detach cache'), msg, function (btn) {
+                if (btn === 'yes') {
+                    run();
+                }
+            });
+        } catch (e) {
+            ANAS.warn('ahr cache detach confirm failed: ' + ANAS.errText(e));
+        }
     }
 
     function resumeExpansion(grid, node) {

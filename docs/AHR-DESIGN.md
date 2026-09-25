@@ -557,10 +557,10 @@ Verify the 11.15 telemetry sampler's dm-name resolution once the pool LV is a
 
 **Pool detail `cache` block:** devices (by-id), size, mode (always
 writethrough), hits/misses, used/total blocks, dirty blocks (should read 0 —
-non-zero is a bug), and SSD wear where the drive reports it: NVMe
-`percentage_used` from smartctl JSON is standard; SATA wear attributes are
-vendor-specific — shown only when the attribute is present, never inferred
-(firmware permutation bar). Advisory states two facts once: hotspot cache
+non-zero is a bug). **Wear: the Disks tab (SMART), not repeated here** — wear
+is a per-disk fact the disk inventory already owns (`disks.1`), and a second
+rendering of it in the Cache block is the same number in two places, free to
+diverge. One place. Advisory states two facts once: hotspot cache
 (repeated random reads benefit, sequential I/O bypasses), and the SSD is a
 consumable (cached blocks are rewritten as the working set rotates).
 
@@ -681,4 +681,28 @@ cache". Detach on an offline pool is refused up front with the reason (uncache
 needs an active volume), a rollback that itself fails is logged to the journal
 with the pool and the step while the original cause is still what is thrown,
 and a duplicated disk in the attach request is a 400.
+
+**Built 2026-09-24 — slice 3** (the pool detail's Cache block, the **Attach
+cache…** / **Detach cache** toolbar verbs with the advisory and the confirm;
+`packages/pve-integration/src/39-ahr.js`, proven in the dialog-contracts
+harness, Playwright spec `tests/integration/ahr-cache-ui.spec.ts` written).
+Two calls the UI leg settled:
+
+- **Detach's confirm is a plain `Ext.Msg.confirm`.** The route stays
+  un-gated — a writethrough cache holds no only copy, which is what a confirm
+  code is for — but a 202 verb that wipes a consumable SSD still earns a
+  click-through. This is the distinction `ANAS.confirmAndRun` does NOT make:
+  that helper only ever opens its dialog from the daemon's 409 challenge, so
+  pointing it at a 202 route runs the verb on the first click with the confirm
+  text a dead string. Un-gated destructive verbs take the plain-confirm idiom
+  (`60-datasets.js`, `69-snapshots.js`, `75-iscsi.js`); the harness guards the
+  rule generically by resolving every `confirmAndRun` in the AHR view to its
+  daemon route and requiring that route to gate.
+- **The cache disk is not band geometry.** It is excluded from the banded-layout
+  bars, from the "capacity above the top band" test that draws the unprotected
+  pseudo-band, and from the scale the per-disk slice bars are drawn against —
+  `diskInBand()` is a pure size test, so a cache SSD taller than the members
+  would otherwise be painted with bands it holds not one byte of and would
+  manufacture a "wasted" band out of flash that is doing its job. Hot spares
+  STAY in all three: a spare is cut to the band geometry and really carries it.
 

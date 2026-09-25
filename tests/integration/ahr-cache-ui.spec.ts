@@ -328,11 +328,15 @@ test.describe('AHR read cache — the UI (ahrcache.1 slice 3)', () => {
       await dlg.locator('.anas-btn-ahr-cache-attach-exec').click()
 
       // The daemon's own refusal sentence reaches the user under the verb's
-      // fail title — never a bare "failed".
+      // fail title — never a bare "failed". The POOL is what changed under
+      // the dialog, not just the disk, so the ALREADY-CACHED guard answers
+      // first (ahr-cache.ts checks the pool's cache before it ever looks at
+      // the requested disks) — that is the sentence the user sees.
       const modal = page.locator('.x-message-box:visible')
       await expect(modal).toBeVisible({ timeout: 30_000 })
       await expect(modal).toContainText('Attach cache failed')
-      await expect(modal).toContainText(`already part of pool '${POOL}'`)
+      await expect(modal).toContainText('already has a read cache')
+      await expect(modal).toContainText(CACHE_ID)
       await modal.getByRole('button', { name: 'OK' }).click()
     }
     finally {

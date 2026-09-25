@@ -179,7 +179,7 @@
  *
  * Exit 0 = all checks pass; exit 1 prints the failures.
  */
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
@@ -689,7 +689,10 @@ const Ext = {
   },
   Date: { format: d => String(d) },
   Msg: {
-    confirm(title, msg, fn) { confirms.push({ title, msg }); if (fn) { fn('yes') } },
+    // Answers 'yes' by default — the answer a check that only cares about
+    // what happens AFTER the confirm wants. `confirmAnswer` lets a check say
+    // 'no' instead, which is the only way to prove a door actually holds.
+    confirm(title, msg, fn) { confirms.push({ title, msg }); if (fn) { fn(confirmAnswer) } },
     alert(title, msg) { alerts.push({ title, msg }) },
   },
   // PVE's own /nodes/<node>/network, which the portal picker reads (the same
@@ -767,6 +770,9 @@ const jobs = []
  * flow is recorded on the JOB instead (confirmWindow/extraItems), so a check can
  * tell a plain confirm from a confirm-code flow. */
 const confirms = []
+/** The button the Ext.Msg.confirm stub answers with. 'yes' unless a check
+ * sets it — and a check that sets it must set it back. */
+let confirmAnswer = 'yes'
 /** Every GET the UI issued, with its query — the read-contract record. */
 const apiGets = []
 /** Every toast the UI raised (message) — the run-completion channel. */
@@ -966,7 +972,13 @@ function makeAnas(routes) {
         successMsg: cfg.successMsg,
         onComplete: cfg.onComplete,
         onFailed: cfg.onFailed,
+        onSubmitted: cfg.onSubmitted,
       })
+      // 10-api.js fires onSubmitted the moment the daemon ACCEPTS the job
+      // (202), BEFORE the poll — that is where a long-job dialog closes itself
+      // and hands the poll a longer-lived view. Firing it here in the same
+      // order is what makes "the dialog closed on acceptance" provable.
+      if (cfg.onSubmitted) { cfg.onSubmitted({ id: 'job-stub' }) }
       if (cfg.onComplete) { cfg.onComplete({}) }
     },
     // A confirm-gated mutation. The real one only shows its window after the
@@ -12444,6 +12456,11 @@ const CACHE_HEALTHY = {
 const CACHE_ABSENT = { devices: [], sizeBytes: 0, mode: 'writethrough', policy: '', state: 'absent' }
 const CACHE_LEFTOVER = { devices: [HOT8], sizeBytes: 512 * MiB, mode: 'writethrough', policy: '', state: 'absent' }
 const CACHE_FAILED = { devices: [], sizeBytes: 512 * MiB, mode: 'writethrough', policy: 'smq', state: 'failed' }
+/** Freshly attached: healthy, counters present, nothing read through it yet. */
+const CACHE_COLD = {
+  devices: [HOT9], sizeBytes: 512 * MiB, mode: 'writethrough', policy: 'smq',
+  state: 'healthy', hits: 0, misses: 0, usedBlocks: 0, totalBlocks: 4096, dirtyBlocks: 0,
+}
 
 function ahrCacheRow(name, extra) {
   return ahrPoolRow(name, extra)
@@ -12454,7 +12471,10 @@ const ahrListGets = () => apiGets.filter(p => p === '/ahr').length
 
 /** Load the AHR view over the cache rows and return { ANAS, grid }. */
 async function openAhrCacheView(rows, extraRoutes) {
-  const ANAS = loadSources(['00-core.js', '15-gfx.js', '39-ahr.js'], {
+  // 39-ahr-composer.js rides along so `ANAS.ahr.bandBarsHtml` is the REAL
+  // band painter: the "a cache disk is not banded" checks below are worth
+  // nothing against a missing function that renders an empty string either way.
+  const ANAS = loadSources(['00-core.js', '15-gfx.js', '39-ahr-composer.js', '39-ahr.js'], {
     'GET /ahr': { data: rows },
     ...extraRoutes,
   })
@@ -12479,6 +12499,18 @@ async function detailHtmlOf(grid, name) {
   return win.down('#ahrDetailBody').html || ''
 }
 
+/**
+ * Just the Read cache block out of a detail body — the "no phantom row"
+ * checks must not be satisfied (or defeated) by text from Capacity or the
+ * Layered stack above it.
+ */
+function cacheSection(html) {
+  const start = html.indexOf('Read cache')
+  if (start < 0) { return '' }
+  const end = html.indexOf('Filesystem (btrfs)', start)
+  return html.slice(start, end > start ? end : undefined)
+}
+
 async function ahrCacheBlockChecks() {
   const rows = [
     ahrCacheRow('gtcache', { cache: CACHE_HEALTHY }),
@@ -12487,6 +12519,15 @@ async function ahrCacheBlockChecks() {
     ahrCacheRow('gtfail', { state: 'degraded', cache: CACHE_FAILED }),
     ahrCacheRow('gtold'),
     ahrCacheRow('gtoff', { state: 'offline', cache: CACHE_ABSENT }),
+    // An offline pool that still carries a LIVE cache: the route refuses the
+    // detach (uncache needs an active volume), so the button must not offer it.
+    ahrCacheRow('gtoffcache', { state: 'offline', cache: CACHE_HEALTHY }),
+    // …and one whose cache is only a leftover slice: `sgdisk -d` releases it
+    // without LVM, so the route lets that detach through even while offline.
+    ahrCacheRow('gtoffleft', { state: 'offline', cache: CACHE_LEFTOVER }),
+    // A cache attached moments ago: no read has reached it yet, so the ratio
+    // has nothing to divide.
+    ahrCacheRow('gtcold', { cache: CACHE_COLD }),
   ]
   const routes = { 'GET /ahr': { data: rows } }
   for (const r of rows) { routes['GET /ahr/' + r.name] = { data: r } }
@@ -12505,22 +12546,50 @@ async function ahrCacheBlockChecks() {
   ok('cache(healthy): hits / misses are labelled WITH the hit ratio',
     /Hits \/ misses \(hit ratio\)/.test(healthy) && /30 \/ 10 \(75%\)/.test(healthy),
     healthy.slice(0, 800))
-  ok('cache(healthy): the block counts are labelled, not bare',
-    /100 of 400 blocks used/.test(healthy), healthy.slice(0, 800))
+  ok('cache(healthy): how full the cache is reads as a PERCENTAGE — 100 of 400 blocks is 25%',
+    /Cache blocks used/.test(healthy) && /25%/.test(healthy), healthy.slice(0, 900))
+  ok('cache(healthy): …with the raw counts one hover away, never gone',
+    /100 of 400 cache blocks hold data/.test(healthy), healthy.slice(0, 900))
   ok('cache(healthy): dirty blocks read 0 by construction in writethrough',
     /Dirty blocks/.test(healthy) && /0 by construction in writethrough/.test(healthy),
     healthy.slice(0, 800))
 
-  const absent = await detailHtmlOf(grid, 'gtclean')
-  ok('cache(absent): reads "no cache"', /no cache/.test(absent), absent.slice(0, 400))
-  ok('cache(absent): no counters are invented', !/Hits \/ misses/.test(absent), absent.slice(0, 400))
-  ok('cache(absent): no leftover note', !/leftover cache slice/.test(absent), absent.slice(0, 400))
+  // R3 — a cache nothing has read through yet: 0 hits, 0 misses, and NO
+  // ratio invented out of 0/0. The 4,096-block total also proves the
+  // thousands grouping (fixed separators here, never the node's locale).
+  const cold = cacheSection(await detailHtmlOf(grid, 'gtcold'))
+  ok('cache(cold): 0 / 0 is shown as it stands', /0 \/ 0/.test(cold), cold)
+  ok('cache(cold): …with an em dash for the ratio, never 0% or NaN',
+    /0 \/ 0 \(—\)/.test(cold) && !/NaN/.test(cold), cold)
+  ok('cache(cold): an empty cache reads 0% full, and the raw counts are grouped in threes',
+    /Cache blocks used/.test(cold) && /0 of 4,096 cache blocks hold data/.test(cold), cold)
 
-  const leftover = await detailHtmlOf(grid, 'gtleft')
+  // D3 — an ABSENT cache has no devices, no size and no mode. The schema
+  // sends 0/'' there; rendering the rows anyway describes a cache that is
+  // not there, in three separate lies.
+  const absent = cacheSection(await detailHtmlOf(grid, 'gtclean'))
+  ok('cache(absent): reads "no cache"', /no cache/.test(absent), absent)
+  ok('cache(absent): no counters are invented', !/Hits \/ misses/.test(absent), absent)
+  ok('cache(absent): no leftover note', !/leftover cache slice/.test(absent), absent)
+  ok('cache(absent): no "device missing" row — nothing is missing, there is no cache',
+    !/device missing/.test(absent), absent)
+  ok('cache(absent): no "0 B" cache size row', !/Cache size/.test(absent) && !/0 B/.test(absent), absent)
+  ok('cache(absent): no mode row — an absent cache is not in writethrough',
+    !/writethrough/.test(absent), absent)
+
+  const leftover = cacheSection(await detailHtmlOf(grid, 'gtleft'))
   ok('cache(leftover): the died-and-returned device is named, with both verbs',
     /A leftover cache slice sits on/.test(leftover) && leftover.includes(HOT8)
       && /Attach cache… reuses it/.test(leftover) && /Detach cache deletes it/.test(leftover),
-    leftover.slice(0, 600))
+    leftover)
+  // The one absent shape with real numbers: the disk carrying the slice and
+  // the size of the slice on it. Both are kept; the mode is still not one.
+  ok('cache(leftover): the slice\'s real size is kept, labelled as a slice',
+    /Slice size/.test(leftover) && /512\.00 MiB/.test(leftover), leftover)
+  ok('cache(leftover): …and the device row names the disk',
+    /Devices/.test(leftover) && leftover.includes(HOT8), leftover)
+  ok('cache(leftover): no mode row — the slice is a leftover, not a running cache',
+    !/writethrough/.test(leftover), leftover)
 
   const failed = await detailHtmlOf(grid, 'gtfail')
   ok('cache(failed): the red line says the GT-19 truth — every read errors until detach',
@@ -12577,6 +12646,24 @@ async function ahrCacheBlockChecks() {
   ok('cache(toolbar): an offline pool with a state-absent cache refuses Detach',
     st.detachCache.disabled === true)
 
+  // R5 — an OFFLINE pool whose LIVE cache the route refuses to release:
+  // `lvconvert --uncache` needs an active volume. Gated here too, with the
+  // reason on the button, rather than offering a click that 409s.
+  grid.selectRow(rowOf('gtoffcache'))
+  st = toolbar(grid, CACHE_BTNS)
+  ok('cache(toolbar): an OFFLINE pool with a live cache refuses Detach — uncache needs an active volume',
+    st.detachCache.disabled === true, st.detachCache.tip)
+  ok('cache(toolbar): …and the button carries the reason, not a blank tooltip',
+    /volume is not assembled/.test(st.detachCache.tip) && /uncache/.test(st.detachCache.tip),
+    st.detachCache.tip)
+  // …but the LEFTOVER slice still comes off an offline pool: `sgdisk -d`
+  // asks nothing of LVM, and the route lets exactly that through. A UI
+  // stricter than its route would kill the only path back to that disk.
+  grid.selectRow(rowOf('gtoffleft'))
+  st = toolbar(grid, CACHE_BTNS)
+  ok('cache(toolbar): the offline gate is scoped to a LIVE cache — a leftover slice still detaches',
+    st.detachCache.disabled === false, st.detachCache.tip)
+
   grid.selectRow(rowOf('gtold'))
   st = toolbar(grid, CACHE_BTNS)
   ok('cache(toolbar): an older daemon (no cache field) keeps Attach live — the 404 door says "not in this build"',
@@ -12584,6 +12671,77 @@ async function ahrCacheBlockChecks() {
   ok('cache(toolbar): …and Detach stays dead (it cannot know there is a cache)',
     st.detachCache.disabled === true)
   ok('cache(toolbar): nothing warned', warnings.length === 0, warnings.join(' | '))
+}
+
+/**
+ * A ONE-BAND pool whose cache SSD is TALLER than its members — the shape the
+ * band layout gets wrong if the cache disk is treated as band geometry.
+ * `diskInBand()` is a pure size test, so a 4 GiB cache over two 2 GiB members
+ * would be painted with band-1 segments and would drag a phantom
+ * "unprotected — wasted" pseudo-band into being out of flash that is doing its
+ * job. It also sets the slice-bar scale, shrinking every member's bar to half.
+ */
+function ahrBandedCacheRow() {
+  const member = (id, dev) => ({
+    id, sizeBytes: 2 * GiB, usableBytes: 2 * GiB, model: 'QEMU HDD', serial: null,
+    role: 'member', partitions: [{ band: 1, device: dev, sizeBytes: 2 * GiB }],
+  })
+  return ahrCacheRow('gtband', {
+    cache: CACHE_HEALTHY,
+    disks: [
+      member(HOT7, '/dev/sda1'),
+      member(HOT8, '/dev/sdb1'),
+      // 4 GiB of flash, 512 MiB of it cut into the cache slice.
+      { id: HOT9, sizeBytes: 4 * GiB, usableBytes: 4 * GiB, model: 'QEMU SSD', serial: null, role: 'cache', partitions: [] },
+    ],
+    arrays: [{
+      device: '/dev/md/gtband-r1', band: 1, level: 'raid1', state: 'clean',
+      heightBytes: 2 * GiB,
+      members: [
+        { disk: HOT7, partition: '/dev/sda1', memberState: 'in_sync' },
+        { disk: HOT8, partition: '/dev/sdb1', memberState: 'in_sync' },
+      ],
+    }],
+  })
+}
+
+async function ahrCacheLayoutChecks() {
+  const row = ahrBandedCacheRow()
+  const { ANAS, grid } = await openAhrCacheView([row], { 'GET /ahr/gtband': { data: row } })
+  if (!grid) { return }
+  ok('cache(layout): the REAL band painter is loaded — the checks below are not vacuous',
+    !!(ANAS.ahr && typeof ANAS.ahr.bandBarsHtml === 'function'))
+
+  const detail = await detailHtmlOf(grid, 'gtband')
+  const bandStart = detail.indexOf('Banded layout')
+  const bandEnd = detail.indexOf('Capacity')
+  ok('cache(layout): the Banded layout section rendered', bandStart >= 0 && bandEnd > bandStart,
+    detail.slice(0, 300))
+  const banded = bandStart >= 0 ? detail.slice(bandStart, bandEnd) : ''
+
+  ok('cache(layout): the band bars paint the two members',
+    banded.includes(HOT7) && banded.includes(HOT8), banded.slice(0, 600))
+  ok('cache(layout): the cache SSD gets NO band segment — it backs no band',
+    !banded.includes(HOT9), banded.slice(0, 900))
+  ok('cache(layout): and no phantom "unprotected — wasted" band is manufactured from it',
+    !/unprotected/.test(banded), banded.slice(0, 900))
+  ok('cache(layout): the legend names band 1 only', /Band 1 —/.test(banded) && !/Band 2 —/.test(banded),
+    banded.slice(-500))
+
+  // R6 — the slice bars scale against the tallest MEMBER. With the 4 GiB
+  // cache disk setting the scale, both 2 GiB members would halve to 50%.
+  ok('cache(layout): a member\'s slice bar runs full width — the cache disk does not set the scale',
+    /width:100\.00%;height:20px/.test(detail), detail.slice(0, 400))
+  ok('cache(layout): …so no member bar is halved by the taller cache SSD',
+    !/width:50\.00%;height:20px/.test(detail))
+
+  // The cache bay's own bar is labelled with the SLICE, never the disk: a
+  // reclaimed hand-cut slice is smaller than the flash it sits on.
+  ok('cache(layout): the cache bar names the SLICE size',
+    /read cache — 512\.00 MiB/.test(detail), detail.slice(detail.indexOf('read cache —') - 100, detail.indexOf('read cache —') + 120))
+  ok('cache(layout): …not the whole disk',
+    !/read cache — 4\.00 GiB/.test(detail))
+  ok('cache(layout): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
 async function ahrCacheAttachChecks() {
@@ -12678,10 +12836,23 @@ async function ahrCacheAttachChecks() {
   ok('cache(attach): the schema itself refuses a duplicated disk (the daemon-side 400)',
     AttachAhrCacheRequest.safeParse({ disks: [HOT9, HOT9] }).success === false)
 
-  // Reload on SUCCESS: grid AND the open detail window.
-  ok('cache(attach): success reloads the grid', ahrListGets() === beforeList + 1)
+  // R2 — the 202 hand-off. 10-api.js fires onSubmitted the moment the daemon
+  // ACCEPTS, before the poll: that is where this dialog closes itself (a job
+  // that outlives the window must not poll into a dead view — issue #48) and
+  // where the first reload is asked for. The stub fires it in that order.
+  ok('cache(attach): the job carries an onSubmitted hand-off', typeof jobs[0].onSubmitted === 'function')
+  ok('cache(attach): acceptance (202) CLOSES the dialog — it does not sit there through the job',
+    dlg.destroyed === true || dlg.destroying === true || created.windows.indexOf(dlg) < 0,
+    JSON.stringify({ destroyed: dlg.destroyed, destroying: dlg.destroying }))
+
+  // Reload on SUCCESS: grid AND the open detail window. Twice over, by
+  // design — once on acceptance (the pool is busy NOW) and once when the job
+  // lands (the cache is there).
+  ok('cache(attach): success reloads the grid', ahrListGets() === beforeList + 2,
+    String(ahrListGets() - beforeList))
   ok('cache(attach): success reloads the open detail window',
-    ahrDetailGets('gtcache') === beforeDetail + 1)
+    ahrDetailGets('gtcache') === beforeDetail + 2,
+    String(ahrDetailGets('gtcache') - beforeDetail))
 
   // The daemon's 409 reaches the user under the fail title (the modal body
   // is ANAS.errText(err) — the daemon's own sentence), and FAILURE reloads
@@ -12691,9 +12862,11 @@ async function ahrCacheAttachChecks() {
   jobs[0].onFailed({
     error: { message: `AHR pool 'gtcache' already has a read cache (${HOT9}, 512.00 MiB, state 'healthy'). Detach it before attaching another` },
   })
-  ok('cache(attach): failure reloads the grid too', ahrListGets() === beforeList + 2)
+  ok('cache(attach): failure reloads the grid too', ahrListGets() === beforeList + 3,
+    String(ahrListGets() - beforeList))
   ok('cache(attach): failure reloads the detail too',
-    ahrDetailGets('gtcache') === beforeDetail + 2)
+    ahrDetailGets('gtcache') === beforeDetail + 3,
+    String(ahrDetailGets('gtcache') - beforeDetail))
 
   // The empty-bay guard: no disk, no POST, a telling alert.
   created.windows.length = 0
@@ -12717,50 +12890,157 @@ async function ahrCacheAttachChecks() {
     warnings.join(' | '))
 }
 
+/**
+ * D1 — the door on the detach verb must be a PLAIN confirm, and the generic
+ * rule behind it: `ANAS.confirmAndRun` only ever prompts on the daemon's 409
+ * confirm-code challenge (10-api.js: the dialog lives in `onConfirm`). Point
+ * it at a route that answers 202 and the confirm text is a dead string — the
+ * verb runs on the first click with nothing asked. So every confirmAndRun in
+ * the AHR view is resolved to the daemon route it calls and that route's file
+ * is required to gate. Source-level, deliberately: this is the property no
+ * fixture can show, because a 202 route simply never reaches the dialog.
+ */
+function confirmDoorGuardChecks() {
+  const ahrSrc = readFileSync(join(SRC, '39-ahr.js'), 'utf8')
+  const ROUTES = join(SRC, '..', '..', 'daemon', 'src', 'routes')
+
+  // Every daemon route declaration, with whether its FILE calls confirmGate.
+  const gatedByPath = new Map()
+  for (const file of readdirSync(ROUTES).filter(f => f.endsWith('.ts'))) {
+    const text = readFileSync(join(ROUTES, file), 'utf8')
+    const gated = /confirmGate\(/.test(text.replace(/import[^\n]*confirmGate[^\n]*\n/, ''))
+    for (const m of text.matchAll(/server\.(post|delete|put)<[^>]*>\(\s*'([^']+)'/g)) {
+      gatedByPath.set(`${m[1]} ${m[2].replace(/:[A-Za-z]+/g, ':p')}`, { file, gated })
+    }
+  }
+  ok('confirm-door: the daemon route table was read', gatedByPath.size > 10, String(gatedByPath.size))
+  ok('confirm-door: DELETE /ahr/:name/cache exists and is NOT confirm-gated (the §13 ruling)',
+    gatedByPath.get('delete /ahr/:p/cache') && gatedByPath.get('delete /ahr/:p/cache').gated === false,
+    JSON.stringify(gatedByPath.get('delete /ahr/:p/cache')))
+  ok('confirm-door: POST /ahr/:name/cache is not gated either',
+    gatedByPath.get('post /ahr/:p/cache') && gatedByPath.get('post /ahr/:p/cache').gated === false,
+    JSON.stringify(gatedByPath.get('post /ahr/:p/cache')))
+
+  // Each confirmAndRun call in the AHR view → its method + path. The call's
+  // own option block is bounded at the next mutation helper so a nested
+  // runJob inside a later function cannot be read as part of this one.
+  const norm = raw => raw
+    .replace(/enc[A-Za-z]*\([^()]*\)/g, '\':p\'')
+    .split('+')
+    .map(s => s.trim().replace(/^'/, '').replace(/'$/, ''))
+    .join('')
+  const verbs = []
+  const CALL = 'ANAS.confirmAndRun({'
+  for (let at = ahrSrc.indexOf(CALL); at >= 0; at = ahrSrc.indexOf(CALL, at + 1)) {
+    const rest = ahrSrc.slice(at + CALL.length)
+    const nextCall = Math.min(
+      ...[rest.indexOf(CALL), rest.indexOf('ANAS.runJob({')].filter(i => i >= 0).concat([rest.length]),
+    )
+    const body = rest.slice(0, nextCall)
+    const method = (body.match(/method:\s*'([a-z]+)'/) || [])[1]
+    // A path expression may wrap over several lines — take it up to the first
+    // line that CLOSES it with a comma, then flatten it.
+    const rawPath = (body.match(/^\s*path:\s*([\s\S]*?),\s*$/m) || [])[1]
+    if (!method || !rawPath) { continue }
+    // The UI names the verb 'del'; Fastify registers it as `delete`.
+    verbs.push({ method: method === 'del' ? 'delete' : method, path: norm(rawPath.replace(/\s+/g, ' ')) })
+  }
+  ok('confirm-door: the AHR view\'s confirmAndRun verbs were parsed', verbs.length >= 4,
+    JSON.stringify(verbs))
+  // Every one must RESOLVE to a daemon route, or the gate check below would
+  // pass by looking up nothing.
+  const unresolved = verbs.filter(v => !gatedByPath.get(`${v.method} ${v.path}`))
+  ok('confirm-door: every confirmAndRun verb resolves to a real daemon route',
+    unresolved.length === 0, JSON.stringify(unresolved))
+  const ungated = verbs.filter((v) => {
+    const hit = gatedByPath.get(`${v.method} ${v.path}`)
+    return hit && hit.gated === false
+  })
+  ok('confirm-door: no AHR verb is driven through confirmAndRun against an UN-GATED route',
+    ungated.length === 0, JSON.stringify(ungated))
+  ok('confirm-door: …and the cache verbs are not in that path at all',
+    !verbs.some(v => /\/cache$/.test(v.path)), JSON.stringify(verbs.map(v => v.path)))
+}
+
 async function ahrCacheDetachChecks() {
   const rows = [
     ahrCacheRow('gtcache', { cache: CACHE_HEALTHY }),
     ahrCacheRow('gtfail', { state: 'degraded', cache: CACHE_FAILED }),
   ]
-  const { ANAS, grid } = await openAhrCacheView(rows)
+  const { ANAS, grid } = await openAhrCacheView(rows, {
+    'DELETE /ahr/gtcache/cache': { job: { id: 'jd1' } },
+    'DELETE /ahr/gtfail/cache': { job: { id: 'jd2' } },
+  })
   if (!grid) { return }
   const detachBtn = grid.down('#detachCache')
+  // If the verb ever goes back through confirmAndRun, this makes it loud
+  // instead of silently passing: the real helper would show no dialog.
+  ANAS.confirmAndRun = () => {
+    ok('cache(detach): the verb does NOT go through confirmAndRun (a 202 route never reaches its dialog)',
+      false, 'confirmAndRun was called')
+  }
 
-  // The confirm names the trade in the story's own words, device ids included.
+  // ---- the door itself: a PLAIN confirm, and nothing leaves before "yes" ---
   grid.selectRow(grid.getStore().findExact('name', 'gtcache'))
-  let sent = null
-  ANAS.confirmAndRun = (cfg) => { sent = cfg }
+  confirms.length = 0
+  jobs.length = 0
+  confirmAnswer = 'no'
   detachBtn.handler(detachBtn)
   await settle()
-  ok('cache(detach): DELETE /ahr/gtcache/cache through the confirm door',
-    sent && sent.method === 'del' && sent.path === '/ahr/gtcache/cache',
-    sent ? sent.method + ' ' + sent.path : 'nothing sent')
+  ok('cache(detach): the door is a plain Ext.Msg.confirm, titled for the verb',
+    confirms.length === 1 && /Detach cache/.test(confirms[0].title), JSON.stringify(confirms))
+  ok('cache(detach): "No" sends NOTHING — the SSD is not wiped on the first click',
+    jobs.length === 0, JSON.stringify(jobs))
+  const intro = (confirms[0] || {}).msg || ''
   ok('cache(detach): the confirm says reads continue from the pool',
-    /reads continue from the pool/.test((sent || {}).confirmIntro || ''), (sent || {}).confirmIntro)
+    /reads continue from the pool/.test(intro), intro)
   ok('cache(detach): …and the SSD is wiped and returns to available',
-    /the SSD is wiped and returns to available/.test((sent || {}).confirmIntro || ''), (sent || {}).confirmIntro)
-  ok('cache(detach): …naming the cache disk by its FULL by-id',
-    ((sent || {}).confirmIntro || '').includes(HOT9), (sent || {}).confirmIntro)
+    /the SSD is wiped and returns to available/.test(intro), intro)
+  ok('cache(detach): …naming the cache disk by its FULL by-id', intro.includes(HOT9), intro)
+  ok('cache(detach): the healthy sentence joins cleanly — no lower-case start after a full stop',
+    !/\.\s+the SSD is wiped/.test(intro), intro)
 
-  // Reload on success AND failure through the same cfg.
+  // ---- "Yes" runs the 202 verb --------------------------------------------
+  confirmAnswer = 'yes'
+  confirms.length = 0
   const beforeList = ahrListGets()
-  sent.onComplete({})
-  ok('cache(detach): success reloads the grid', ahrListGets() === beforeList + 1)
-  sent.onFailed({ error: { message: `AHR pool 'gtcache' is offline: bring the pool online first — the cache is released by uncache, which needs an active volume. See the Hybrid RAID view for which band arrays cannot start` } })
-  ok('cache(detach): failure reloads the grid too', ahrListGets() === beforeList + 2)
-
-  // The FAILED-cache variant: reads do NOT continue until this runs (GT-19) —
-  // the confirm states the recovery, never the healthy-cache sentence.
-  grid.selectRow(grid.getStore().findExact('name', 'gtfail'))
-  sent = null
   detachBtn.handler(detachBtn)
   await settle()
+  ok('cache(detach): "Yes" submits DELETE /ahr/gtcache/cache',
+    jobs.length === 1 && jobs[0].method === 'del' && jobs[0].path === '/ahr/gtcache/cache',
+    JSON.stringify(jobs))
+  ok('cache(detach): under the verb\'s own fail title',
+    (jobs[0] || {}).failTitle === 'Detach cache failed', (jobs[0] || {}).failTitle)
+  ok('cache(detach): acceptance (202) reloads the grid — onSubmitted, not only the poll',
+    ahrListGets() > beforeList, String(ahrListGets() - beforeList))
+  const afterSubmit = ahrListGets()
+  if (jobs[0] && jobs[0].onFailed) {
+    jobs[0].onFailed({ error: { message: `AHR pool 'gtcache' is offline: bring the pool online first — the cache is released by uncache, which needs an active volume. See the Hybrid RAID view for which band arrays cannot start` } })
+  }
+  ok('cache(detach): failure reloads the grid too', ahrListGets() > afterSubmit)
+
+  // ---- the FAILED-cache variant (D4) --------------------------------------
+  // Reads do NOT continue until this runs (GT-19) — the confirm states the
+  // recovery. And with the device gone there is no SSD to hand back, so the
+  // wipe clause must not be promised.
+  grid.selectRow(grid.getStore().findExact('name', 'gtfail'))
+  confirms.length = 0
+  jobs.length = 0
+  detachBtn.handler(detachBtn)
+  await settle()
+  const fintro = (confirms[0] || {}).msg || ''
   ok('cache(detach failed): the failed cache is what is blocking reads — detaching restores them',
-    /restores reads/.test((sent || {}).confirmIntro || '')
-      && /every read currently returns an I\/O error/.test((sent || {}).confirmIntro || ''),
-    (sent || {}).confirmIntro)
+    /restores reads/.test(fintro) && /every read currently returns an I\/O error/.test(fintro), fintro)
   ok('cache(detach failed): it does NOT claim reads continue',
-    !/reads continue from the pool/.test((sent || {}).confirmIntro || ''), (sent || {}).confirmIntro)
+    !/reads continue from the pool/.test(fintro), fintro)
+  ok('cache(detach failed): with the device GONE it does not promise an SSD back',
+    !/the SSD is wiped and returns to available/.test(fintro), fintro)
+  ok('cache(detach failed): …it says so instead, and never prints "device missing" as a disk id',
+    /no SSD left to wipe/.test(fintro) && !/device missing/.test(fintro), fintro)
+  ok('cache(detach failed): the sentence joins cleanly — no lower-case start after a full stop',
+    !/\.\s+[a-z]/.test(fintro.replace(/<[^>]*>/g, '')), fintro)
+  ok('cache(detach failed): "Yes" still submits the verb',
+    jobs.length === 1 && (jobs[0] || {}).path === '/ahr/gtfail/cache', JSON.stringify(jobs))
   ok('cache(detach failed): nothing warned', warnings.length === 0, warnings.join(' | '))
 }
 
@@ -12784,13 +13064,19 @@ await ahrCacheBlockChecks()
 
 warnings.length = 0
 created.windows.length = 0
+await ahrCacheLayoutChecks()
+
+warnings.length = 0
+created.windows.length = 0
 jobs.length = 0
 await ahrCacheAttachChecks()
 
 warnings.length = 0
 created.windows.length = 0
 jobs.length = 0
+confirmDoorGuardChecks()
 await ahrCacheDetachChecks()
+confirmAnswer = 'yes'
 
 warnings.length = 0
 created.windows.length = 0
