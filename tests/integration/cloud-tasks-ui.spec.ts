@@ -33,6 +33,11 @@ const execFileAsync = promisify(execFile)
  *   6. Removing a remote that a task references is refused (409), the refusal
  *      naming the task.
  *   7. A disabled task's detail shows the history note.
+ *   8. The Preview rider (rclone.3, operator 2026-09-24): the wizard's dry run
+ *      of the unsaved form — with one source file deleted after a copy sits at
+ *      the destination, the summary line under the Mode field names that file
+ *      under the would-be deletes — and the grid toolbar's Preview of the
+ *      saved task in the display-only window, the same renderer.
  *
  * FIXTURE DEPENDENCY (written alongside this spec):
  * `test/stunt-node/cloud-tasks-fixture.sh` — `up` / `down`, the same capture
@@ -401,6 +406,7 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
       'anas-btn-cloud-task-create',
       'anas-btn-cloud-remotes',
       'anas-btn-cloud-task-run',
+      'anas-btn-cloud-task-preview',
       'anas-btn-cloud-task-details',
       'anas-btn-cloud-task-edit',
       'anas-btn-cloud-task-toggle',
@@ -644,5 +650,50 @@ test.describe('rclone.3 — Cloud Sync tasks (stunt node UI)', () => {
 
     await detail.locator('.x-tool-close').click()
     await expect(detail).toBeHidden({ timeout: 15_000 })
+  })
+
+  test('8 — preview: the wizard names the deleted file, the toolbar previews the saved task', async ({ page, playwright }) => {
+    // A sync whose destination already holds a copy. The fixture swept the
+    // destination and this spec's earlier runs are not order guarantees, so
+    // the stored sync task's OWN run lays the copy down first (a sync into an
+    // empty destination copies everything and deletes nothing) — then one
+    // source file goes away, and the preview must name it. The fixture's `up`
+    // rebuilds the source dataset, so the deletion needs no restore.
+    await setupViaApi(playwright, { ...TASK_BODY, mode: 'sync' })
+    const runCtx = await apiCtx(playwright)
+    try {
+      await runJob(runCtx, 'post', `${V1}/cloud/tasks/${TASK}/run`, {})
+    }
+    finally {
+      await runCtx.dispose()
+    }
+    await sshExec(`rm -f ${SOURCE}/b.bin`)
+
+    const grid = await openTasksView(page)
+    const dlg = await openWizard(page, grid, TASK)
+    await dlg.locator('.anas-btn-cloud-task-preview').click()
+
+    // The summary line under the Mode field: rclone's own dry-run counters,
+    // with the deleted file named under the would-be deletes. A dry run on the
+    // LIVE source is bounded by the daemon's 120 s ceiling — allow for it.
+    const line = dlg.locator('#cloudPreviewLine')
+    await expect(line).toContainText('Would transfer', { timeout: 120_000 })
+    await expect(line).toContainText('delete 1 file at the destination')
+    await expect(line).toContainText('b.bin')
+
+    await dlg.locator('.x-tool-close').click()
+    await expect(dlg).toBeHidden({ timeout: 15_000 })
+
+    // The grid toolbar's Preview: the SAVED task by name, the same summary in
+    // the display-only window.
+    const row = taskRow(page, grid, TASK)
+    await row.click()
+    await grid.locator('.anas-btn-cloud-task-preview').click()
+    const previewWin = page.locator('.anas-win-cloud-preview')
+    await expect(previewWin).toBeVisible({ timeout: 30_000 })
+    await expect(previewWin).toContainText('Would transfer', { timeout: 120_000 })
+    await expect(previewWin).toContainText('b.bin')
+    await previewWin.locator('.x-tool-close').click()
+    await expect(previewWin).toBeHidden({ timeout: 15_000 })
   })
 })

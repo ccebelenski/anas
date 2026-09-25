@@ -1462,6 +1462,10 @@
     //   DELETE /v1/cloud/tasks/:name   → 202 { job } (units only — nothing on
     //                                    the remote is touched)
     //   POST   /v1/cloud/tasks/:name/run → 202 { job } (Run now)
+    //   POST   /v1/cloud/tasks/preview → { data: CloudSyncPreviewResult } (the
+    //                                    dry run — the unsaved form inline or
+    //                                    {name}; a 400 guard refusal carries the
+    //                                    run's own sentence)
     //
     // The grid derives everything from unit + timer state per load (no shadow
     // state) and RELOADS after every job of its own, success AND failure (the
@@ -1733,6 +1737,7 @@
         var rec = selectedTask(grid);
         var has = !!rec;
         setDisabled(grid, 'cloudTaskRun', !has);
+        setDisabled(grid, 'cloudTaskPreview', !has);
         setDisabled(grid, 'cloudTaskDetails', !has);
         setDisabled(grid, 'cloudTaskEdit', !has);
         setDisabled(grid, 'cloudTaskToggle', !has);
@@ -2210,6 +2215,203 @@
         loadDetailInto(win, node, name);
     }
 
+    // ---- Preview (the rider — the dry run) ----------------------------------
+    //
+    // POST /cloud/tasks/preview is a USER-INITIATED, one-shot READ (the backup
+    // wizard's prune-preview precedent): never polled, never automatic. The
+    // wizard sends its UNSAVED form inline — the CloudSyncPreviewRequest shape,
+    // the task's data fields WITHOUT the management keys a dry run never reads
+    // (name, schedule, cadence, notify, enabled); the grid toolbar sends the
+    // saved task's {name}. One renderer, two homes: the wizard's summary line
+    // under the Mode field and the toolbar's display-only window.
+
+    // The daemon's empty-source sentence shape, verbatim — the preview does NOT
+    // refuse it (showing that a sync would delete everything is the point), so
+    // the UI says it in red.
+    var EMPTY_SOURCE_PREVIEW = 'an empty source in sync mode would delete '
+        + 'everything at the destination';
+
+    function previewPendingHtml() {
+        return '<div style="color:var(--anas-muted,gray);font-size:11px;">'
+            + '<i class="fa fa-refresh fa-spin" style="margin-right:6px;"></i>'
+            + enc(t('asking the server…')) + '</div>';
+    }
+
+    function countWord(n, one, many) {
+        return n === 1 ? one : many;
+    }
+
+    // The summary, from the daemon's OWN counters (CloudSyncPreviewResult).
+    // Numbers carry their units (ANAS.formatBytes labels the bytes); names and
+    // paths are rendered whole — a list capped by the daemon says how many more.
+    function cloudPreviewHtml(result) {
+        result = result || {};
+        var transfers = Number(result.transfers) || 0;
+        var deletes = Number(result.deletes) || 0;
+        var deletedFiles = (result.deletedFiles && result.deletedFiles.length)
+            ? result.deletedFiles : [];
+        var deletedTotal = Number(result.deletedTotal) || 0;
+        var errors = (result.errors && result.errors.length) ? result.errors : [];
+        var truncated = result.truncated === true;
+        // The everything-deleted case is the one that repaints the whole line.
+        var danger = '';
+        var lines = [];
+
+        var lead;
+        if (deletes > 0 && transfers === 0 && !(Number(result.checks) > 0)) {
+            danger = 'var(--anas-danger,#c23b2c)';
+            lead = t(EMPTY_SOURCE_PREVIEW);
+        } else {
+            lead = t('Would transfer') + ' ' + transfers + ' '
+                + countWord(transfers, t('file'), t('files'))
+                + ' / ' + ANAS.formatBytes(result.bytes);
+            if (deletes > 0) {
+                lead += ', ' + t('delete') + ' ' + deletes + ' '
+                    + countWord(deletes, t('file'), t('files')) + ' '
+                    + t('at the destination');
+            }
+        }
+        lines.push('<div style="color:' + danger + ';">' + enc(lead) + '</div>');
+
+        if (deletes > 0 && deletedFiles.length) {
+            var names = deletedFiles.join(', ');
+            if (deletedTotal > deletedFiles.length) {
+                names += ' ' + t('and') + ' ' + (deletedTotal - deletedFiles.length)
+                    + ' ' + t('more');
+            }
+            lines.push('<div style="font-family:monospace;font-size:11px;color:'
+                + danger + ';">' + enc(names) + '</div>');
+        }
+        if (truncated) {
+            lines.push('<div style="color:var(--anas-warn,#b06a12);font-size:11px;">'
+                + enc(t('stopped after 120 s — the full run will do the rest')) + '</div>');
+        }
+        if (errors.length) {
+            // rclone's own first error line, verbatim, in red.
+            lines.push('<div style="color:var(--anas-danger,#c23b2c);font-size:11px;">'
+                + enc(errors[0]) + '</div>');
+        }
+        return lines.join('');
+    }
+
+    // A guard refusal (the unmounted mount) is the answer the user came for —
+    // the daemon's own sentence, in the line, in red. Everything else warns the
+    // console as well.
+    function previewErrorHtml(err) {
+        if (!err || err.status !== 400) {
+            ANAS.warn('cloud preview failed: ' + ANAS.errText(err));
+        }
+        return '<div style="color:var(--anas-danger,#c23b2c);font-size:11px;">'
+            + enc(ANAS.errText(err)) + '</div>';
+    }
+
+    // The line both windows render into — the same itemId on purpose, so one
+    // setter serves the wizard and the toolbar window.
+    function setPreviewLine(win, html) {
+        var line = win.down('#cloudPreviewLine');
+        if (!line) {
+            return;
+        }
+        try {
+            line.update(html);
+        } catch (e) {
+            ANAS.warn('cloud preview render failed: ' + ANAS.errText(e));
+        }
+    }
+
+    // The Preview gate AND the result's freshness in one place: enabled while
+    // source and remote are filled (a radio always has a mode), cleared the
+    // moment any field the dry run was computed from changes — a summary that
+    // outlived its inputs would be a lie with numbers on it.
+    function refreshCloudPreview(win) {
+        var btn = win.down('#cloudPreviewBtn');
+        var fields = cloudTaskFields(win);
+        if (btn) {
+            try {
+                btn.setDisabled(!fields.source || !fields.remote);
+            } catch (e) {
+                // cosmetic — the handler re-checks the gate before it sends
+            }
+        }
+        setPreviewLine(win, '');
+    }
+
+    // The wizard's Preview click: the form as it stands, inline. The excluded
+    // keys never ride — there is nothing to save.
+    function previewCloudTaskForm(win, node) {
+        var fields = cloudTaskFields(win);
+        if (!fields.source || !fields.remote) {
+            return; // the gate never enables the button without both
+        }
+        var body = {
+            source: fields.source,
+            remote: fields.remote,
+            path: fields.path,
+            mode: fields.mode,
+            excludes: fields.excludes,
+        };
+        if (fields.bwlimit) {
+            body.bwlimit = fields.bwlimit;
+        }
+        setPreviewLine(win, previewPendingHtml());
+        ANAS.api.post(node, '/cloud/tasks/preview', body).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            setPreviewLine(win, cloudPreviewHtml((res && res.data) || {}));
+        }, function (err) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            setPreviewLine(win, previewErrorHtml(err));
+        });
+    }
+
+    // The grid toolbar's Preview: the SAVED task, by name, in a small
+    // display-only window that reuses the wizard's renderer.
+    function previewTaskRow(node, rec) {
+        if (!rec) {
+            return;
+        }
+        var name = rec.get('name');
+        var win;
+        try {
+            win = Ext.create('Ext.window.Window', {
+                cls: 'anas-win-cloud-preview',
+                title: t('Preview') + ': ' + name,
+                modal: true,
+                width: 560,
+                resizable: true,
+                layout: 'fit',
+                items: [{
+                    xtype: 'component',
+                    itemId: 'cloudPreviewLine',
+                    cls: 'anas-cloud-preview-line',
+                    padding: 12,
+                    html: previewPendingHtml(),
+                }],
+                buttons: [
+                    { text: t('Close'), handler: function () { win.close(); } },
+                ],
+            });
+        } catch (e) {
+            ANAS.warn('cloud preview window failed: ' + ANAS.errText(e));
+            return;
+        }
+        win.show();
+        ANAS.api.post(node, '/cloud/tasks/preview', { name: name }).then(function (res) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            setPreviewLine(win, cloudPreviewHtml((res && res.data) || {}));
+        }, function (err) {
+            if (win.destroyed || win.destroying) {
+                return;
+            }
+            setPreviewLine(win, previewErrorHtml(err));
+        });
+    }
+
     // ---- Task wizard (create / edit) — 'anas-win-cloud-task' ----------------
 
     // The source scan's two in-between states and its debounce mirror the
@@ -2432,6 +2634,7 @@
                                     listeners: {
                                         change: function () {
                                             scheduleSourceScan(win, node);
+                                            refreshCloudPreview(win);
                                         },
                                     },
                                 },
@@ -2490,6 +2693,14 @@
                             fieldLabel: t('Path on remote'),
                             emptyText: t('(the remote\'s own root)'),
                             value: task.path || '',
+                            listeners: {
+                                change: function () {
+                                    var w = this.up('window');
+                                    if (w && w._cloudRefreshGate) {
+                                        w._cloudRefreshGate();
+                                    }
+                                },
+                            },
                         },
                         {
                             xtype: 'component',
@@ -2504,6 +2715,14 @@
                             cls: 'anas-fld-cloud-mode',
                             fieldLabel: t('Mode'),
                             columns: 2,
+                            listeners: {
+                                change: function () {
+                                    var w = this.up('window');
+                                    if (w && w._cloudRefreshGate) {
+                                        w._cloudRefreshGate();
+                                    }
+                                },
+                            },
                             items: [
                                 {
                                     boxLabel: t('Copy'),
@@ -2526,6 +2745,45 @@
                             cls: 'anas-cloud-mode-note',
                             style: 'color:var(--anas-muted,gray);font-size:11px;margin:-2px 0 8px 152px;',
                             html: enc(t(SYNC_SENTENCE)),
+                        },
+                        {
+                            // The dry-run Preview — the backup wizard's, pointed
+                            // at the cloud door: user-initiated, one-shot,
+                            // nothing is copied or deleted.
+                            xtype: 'fieldcontainer',
+                            layout: 'hbox',
+                            margin: '0 0 4 152px',
+                            items: [
+                                {
+                                    xtype: 'button',
+                                    itemId: 'cloudPreviewBtn',
+                                    cls: 'anas-btn-cloud-task-preview',
+                                    text: t('Preview'),
+                                    iconCls: 'fa fa-eye',
+                                    disabled: true,
+                                    handler: function () {
+                                        previewCloudTaskForm(win, node);
+                                    },
+                                },
+                                {
+                                    xtype: 'component',
+                                    flex: 1,
+                                    margin: '4 0 0 8',
+                                    style: 'color:var(--anas-muted,gray);font-size:11px;',
+                                    html: enc(t('a dry run against the live source — '
+                                        + 'nothing is copied or deleted')),
+                                },
+                            ],
+                        },
+                        {
+                            // The dry-run summary. Empty until a Preview runs;
+                            // cleared the moment a field it was computed from
+                            // changes (refreshCloudPreview).
+                            xtype: 'component',
+                            itemId: 'cloudPreviewLine',
+                            cls: 'anas-cloud-preview-line',
+                            style: 'margin:-2px 0 8px 152px;',
+                            html: '',
                         },
                         {
                             xtype: 'textareafield',
@@ -2601,24 +2859,23 @@
         }
 
         win._cloudRefreshGate = function () {
-            // The remote combo gates nothing else today; the hook exists so a
-            // field change has one place to go (the save re-checks every gate).
+            // The remote combo, the mode radios and the remote path land here,
+            // as does the source field directly: the Preview gate and its stale
+            // summary have one place to go (the save re-checks every gate).
+            refreshCloudPreview(win);
         };
         win.show();
         ANAS.sched.cadence.syncFields(win); // show only the fields the opening cadence uses
         scheduleSourceScan(win, node); // the consistency + nested note for the opening source
+        refreshCloudPreview(win); // the Preview gate follows the opening form (an edit opens enabled)
     }
 
-    // Build the request body the shared CloudSyncTaskRequest schema accepts —
-    // or null after alerting. Excludes ride as the ARRAY the schema wants (the
-    // textarea is one per line); a cleared bandwidth limit sends nothing
-    // (absent = no limit — the schema normalises the empty string, but absent
-    // is what a cleared field means); a structured cadence rides ALONE and the
-    // daemon generates the OnCalendar (one generator, in the shared schema —
-    // never a second copy here).
-    function cloudTaskBody(win) {
-        var body = {
-            name: trim(valOf(win, '#cloudTaskName') || ''),
+    // The task fields the wizard's form holds — ONE reader, shared by the save
+    // body and the preview body (two field walks diverge into bugs). A cleared
+    // bandwidth limit sends nothing (absent = no limit — the schema normalises
+    // the empty string, but absent is what a cleared field means).
+    function cloudTaskFields(win) {
+        var fields = {
             source: trim(valOf(win, '#cloudSource') || ''),
             remote: trim(valOf(win, '#cloudRemote') || ''),
             path: trim(valOf(win, '#cloudRemotePath') || ''),
@@ -2629,7 +2886,24 @@
         };
         var bw = trim(valOf(win, '#cloudBwlimit') || '');
         if (bw) {
-            body.bwlimit = bw;
+            fields.bwlimit = bw;
+        }
+        return fields;
+    }
+
+    // Build the request body the shared CloudSyncTaskRequest schema accepts —
+    // or null after alerting. Excludes ride as the ARRAY the schema wants (the
+    // textarea is one per line); a structured cadence rides ALONE and the
+    // daemon generates the OnCalendar (one generator, in the shared schema —
+    // never a second copy here).
+    function cloudTaskBody(win) {
+        var body = { name: trim(valOf(win, '#cloudTaskName') || '') };
+        var fields = cloudTaskFields(win);
+        var k;
+        for (k in fields) {
+            if (Object.prototype.hasOwnProperty.call(fields, k)) {
+                body[k] = fields[k];
+            }
         }
         // Custom = the raw OnCalendar the user typed; every other kind sends
         // the structured cadence (readCadence alerts what is wrong itself).
@@ -2750,6 +3024,17 @@
                     if (rec) {
                         runTaskNow(view, node, rec.get('name'));
                     }
+                },
+            },
+            {
+                text: t('Preview'),
+                itemId: 'cloudTaskPreview',
+                cls: 'anas-btn-cloud-task-preview',
+                iconCls: 'fa fa-eye',
+                disabled: true,
+                handler: function (btn) {
+                    var view = btn.up('#cloudView');
+                    previewTaskRow(node, selectedTask(gridOf(view)));
                 },
             },
             {

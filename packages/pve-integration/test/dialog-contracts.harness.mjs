@@ -161,6 +161,19 @@
  *       continue until it runs). Both verbs reload the grid AND the open
  *       detail window on SUCCESS and FAILURE; the toolbar gates per state
  *       with reasons; the Disks grid renders a cache disk "<pool> / cache".
+ *   12. Cloud sync tasks (rclone.3) + the Preview rider: the wizard sends the
+ *       schema shape (mode default copy, excludes one per line, bwlimit absent
+ *       when cleared, the shared cadence object), the toggle round-trips every
+ *       stored field, the grid reloads after every job of its own on SUCCESS
+ *       and FAILURE, and the failed Last run cell carries the run's error line
+ *       keyed to the run. The rider: the wizard's Preview sends the UNSAVED
+ *       form inline — none of the management keys a dry run never reads — and
+ *       the toolbar variant sends `{name}`; both validate against the REAL
+ *       `CloudSyncPreviewRequest`; the summary line renders the daemon's own
+ *       counters (zero / some / everything-deleted / "and T more" /
+ *       truncated / errors / a 400 guard sentence), the everything-deleted
+ *       sync in red with the empty-source sentence, and the line clears when
+ *       a field it was computed from changes.
  *
  *   node packages/pve-integration/test/dialog-contracts.harness.mjs
  *
@@ -170,7 +183,7 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
-import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncTaskRequest, deriveArchiveName, lunBackupId } from '@anas/shared'
+import { AttachAhrCacheRequest, BackupTask, BLOCK_ARCHIVE_NAME, cadenceToOnCalendar, CloudSyncPreviewRequest, CloudSyncTaskRequest, deriveArchiveName, lunBackupId } from '@anas/shared'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = join(HERE, '..', 'src')
@@ -11618,6 +11631,32 @@ const CLOUD_TASK_VIEW = {
   overdue: false,
 }
 
+/**
+ * The dry-run answer (rclone.3 rider) as the daemon's real shape — two would-be
+ * transfers, one would-be delete named in the capped list. The route answers
+ * with whatever `cloudPreviewAnswer` currently holds, so each variant below can
+ * swap it without re-opening anything.
+ */
+const CLOUD_PREVIEW = {
+  transfers: 2,
+  bytes: 358400,
+  checks: 1,
+  deletes: 1,
+  deletedFiles: ['b.bin'],
+  deletedTotal: 1,
+  errors: [],
+  truncated: false,
+}
+let cloudPreviewAnswer = CLOUD_PREVIEW
+/** Every preview body the UI sent — wizard and toolbar alike. */
+const cloudPreviewPosts = []
+/** The 400 guard refusal: the unmounted-mount sentence a run would throw. */
+const CLOUD_PREVIEW_400 = new Error(
+  '/mnt/gt-unmounted sits on a mount //192.0.2.9/nope which is configured in '
+  + '/etc/fstab but not mounted — the source may be an empty directory',
+)
+CLOUD_PREVIEW_400.status = 400
+
 function cloudTaskRoutes() {
   return {
     ...cloudRoutes([CLOUD_SFTP_REMOTE]),
@@ -11626,6 +11665,10 @@ function cloudTaskRoutes() {
     'PUT /cloud/tasks/pictures-offsite': { job: { id: 'cloud-task-update' } },
     'DELETE /cloud/tasks/pictures-offsite': { job: { id: 'cloud-task-del' } },
     'POST /cloud/tasks/pictures-offsite/run': { job: { id: 'cloud-task-run' } },
+    'POST /cloud/tasks/preview': (body) => {
+      cloudPreviewPosts.push(body)
+      return { data: cloudPreviewAnswer }
+    },
     'POST /backup/tasks/preview-nested': (body) => nestedPreviewRoute(body),
     // The wizard's Browse button drives the SHARED picker, which reads the
     // live filesystem through this one endpoint.
@@ -11664,14 +11707,15 @@ async function cloudTaskChecks() {
   created.windows.length = 0
 
   // --- toolbar gating --------------------------------------------------------
-  ok('cloud tasks: Run/Details/Edit/Toggle/Remove start disabled (no selection)',
-    grid.down('#cloudTaskRun').disabled && grid.down('#cloudTaskDetails').disabled
-    && grid.down('#cloudTaskEdit').disabled && grid.down('#cloudTaskRemove').disabled)
+  ok('cloud tasks: Run/Preview/Details/Edit/Toggle/Remove start disabled (no selection)',
+    grid.down('#cloudTaskRun').disabled && grid.down('#cloudTaskPreview').disabled
+    && grid.down('#cloudTaskDetails').disabled && grid.down('#cloudTaskEdit').disabled
+    && grid.down('#cloudTaskRemove').disabled)
   grid.selectRow(0)
   ok('cloud tasks: a selection enables them all',
-    !grid.down('#cloudTaskRun').disabled && !grid.down('#cloudTaskDetails').disabled
-    && !grid.down('#cloudTaskEdit').disabled && !grid.down('#cloudTaskToggle').disabled
-    && !grid.down('#cloudTaskRemove').disabled)
+    !grid.down('#cloudTaskRun').disabled && !grid.down('#cloudTaskPreview').disabled
+    && !grid.down('#cloudTaskDetails').disabled && !grid.down('#cloudTaskEdit').disabled
+    && !grid.down('#cloudTaskToggle').disabled && !grid.down('#cloudTaskRemove').disabled)
   ok('cloud tasks: the toggle reads Disable on an enabled task', grid.down('#cloudTaskToggle').text === 'Disable')
 
   // --- create: the wizard's payload ------------------------------------------
@@ -11829,6 +11873,161 @@ async function cloudTaskChecks() {
     })
   validates('cloud tasks(edit): the payload validates against CloudSyncTaskRequest',
     CloudSyncTaskRequest, jobs[0] && jobs[0].body)
+  created.windows.length = 0
+
+  // --- Preview (the rider): the dry run of the UNSAVED form ------------------
+  // The wizard sends its form inline — the data fields ONLY, never the
+  // management keys a dry run does not read — and the summary lands in the
+  // line under the Mode field.
+  const previewRoutes = cloudTaskRoutes()
+  const previewAnas = loadSources(['10-api.js', '12-picker.js', '69-schedules-common.js', '72-cloud.js'], previewRoutes)
+  const previewView = makeComponent(previewAnas.views.cloud.factory('harness'), null)
+  previewView.fireEvent('afterrender', previewView)
+  await settle()
+  created.windows.length = 0
+  const pCreate = findCmp(previewView, 'anas-btn-cloud-task-create')
+  pCreate.handler(pCreate)
+  await settle()
+  const pDlg = openWindow()
+  ok('cloud preview: the wizard carries the Preview button', !!findCmp(pDlg, 'anas-btn-cloud-task-preview'))
+  ok('cloud preview: Preview starts disabled (no source, no remote)',
+    findCmp(pDlg, 'anas-btn-cloud-task-preview').disabled === true)
+  pDlg.down('#cloudSource').setValue('/mnt/pictures')
+  await settle()
+  ok('cloud preview: a source alone does not enable Preview',
+    findCmp(pDlg, 'anas-btn-cloud-task-preview').disabled === true)
+  pDlg.down('#cloudRemote').setValue('gt')
+  await settle()
+  ok('cloud preview: source + remote enable Preview',
+    findCmp(pDlg, 'anas-btn-cloud-task-preview').disabled === false)
+  cloudPreviewPosts.length = 0
+  cloudPreviewAnswer = CLOUD_PREVIEW
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  eq('cloud preview: the wizard sends the UNSAVED form inline', cloudPreviewPosts[0], {
+    source: '/mnt/pictures',
+    remote: 'gt',
+    path: '',
+    mode: 'copy',
+    excludes: [],
+  })
+  ok('cloud preview: the body carries NONE of the management keys',
+    cloudPreviewPosts[0] && !('name' in cloudPreviewPosts[0])
+      && !('schedule' in cloudPreviewPosts[0]) && !('cadence' in cloudPreviewPosts[0])
+      && !('notify' in cloudPreviewPosts[0]) && !('enabled' in cloudPreviewPosts[0]),
+    JSON.stringify(cloudPreviewPosts[0]))
+  validates('cloud preview: the body validates against CloudSyncPreviewRequest',
+    CloudSyncPreviewRequest, cloudPreviewPosts[0])
+  const pLine = () => pDlg.down('#cloudPreviewLine')
+  ok('cloud preview: the summary names the transfers with their units and the delete',
+    /Would transfer 2 files \/ 358400 B/.test(pLine().html)
+      && /delete 1 file at the destination/.test(pLine().html),
+    pLine() && pLine().html)
+  ok('cloud preview: the delete is listed by name', /b\.bin/.test(pLine().html), pLine() && pLine().html)
+  ok('cloud preview: a clean preview is not painted red',
+    !/#c23b2c|anas-danger/.test(pLine().html), pLine() && pLine().html)
+
+  // The line is only as fresh as its inputs: any field the dry run was
+  // computed from clears it.
+  pDlg.down('#cloudRemotePath').setValue('pictures')
+  await settle()
+  ok('cloud preview: a field change clears the line', pLine().html === '', pLine().html)
+
+  // A sync that would delete everything: red, with the daemon's empty-source
+  // sentence — the one preview that is a warning, not a forecast.
+  cloudPreviewAnswer = {
+    transfers: 0, bytes: 0, checks: 0, deletes: 3,
+    deletedFiles: ['a.bin', 'b.bin', 'sub/c.txt'], deletedTotal: 3,
+    errors: [], truncated: false,
+  }
+  pDlg.down('#cloudMode').setValue({ cloudMode: 'sync' })
+  await settle()
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: a sync that would delete everything is red with the empty-source sentence',
+    /anas-danger|#c23b2c/.test(pLine().html)
+      && /empty source in sync mode would delete everything at the destination/.test(pLine().html),
+    pLine() && pLine().html)
+  ok('cloud preview: the everything-deleted case still lists the deletes',
+    /a\.bin, b\.bin, sub\/c\.txt/.test(pLine().html), pLine() && pLine().html)
+
+  // The capped list: more deletes than the response carried names for.
+  cloudPreviewAnswer = {
+    transfers: 1, bytes: 204800, checks: 3, deletes: 4,
+    deletedFiles: ['b.bin', 'sub/c.txt'], deletedTotal: 4,
+    errors: [], truncated: false,
+  }
+  pDlg.down('#cloudMode').setValue({ cloudMode: 'copy' })
+  await settle()
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: deletes beyond the list say "and T more"',
+    /delete 4 files at the destination/.test(pLine().html) && /b\.bin, sub\/c\.txt and 2 more/.test(pLine().html),
+    pLine() && pLine().html)
+
+  // The 120 s ceiling fired: what is on screen is a partial answer, and it
+  // says so.
+  cloudPreviewAnswer = {
+    transfers: 2, bytes: 358400, checks: 1, deletes: 0,
+    deletedFiles: [], deletedTotal: 0,
+    errors: [], truncated: true,
+  }
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: a truncated preview says the full run will do the rest',
+    /stopped after 120 s — the full run will do the rest/.test(pLine().html), pLine() && pLine().html)
+
+  // rclone's own first error line rides the summary, in red.
+  cloudPreviewAnswer = {
+    transfers: 0, bytes: 0, checks: 0, deletes: 0,
+    deletedFiles: [], deletedTotal: 0,
+    errors: ['2026/09/24 12:00:00 ERROR : NewFs: unknown remote'], truncated: false,
+  }
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: an erroring preview shows rclone\'s own first line, in red',
+    /NewFs: unknown remote/.test(pLine().html) && /#c23b2c|anas-danger/.test(pLine().html),
+    pLine() && pLine().html)
+
+  // The guard refusal (the unmounted mount): the daemon's sentence, in the
+  // same line, red.
+  previewRoutes['POST /cloud/tasks/preview'] = CLOUD_PREVIEW_400
+  findCmp(pDlg, 'anas-btn-cloud-task-preview').handler()
+  await settle()
+  ok('cloud preview: a 400 guard refusal shows the daemon\'s sentence, red',
+    /configured in \/etc\/fstab but not mounted/.test(pLine().html)
+      && /#c23b2c|anas-danger/.test(pLine().html),
+    pLine() && pLine().html)
+  ok('cloud preview: nothing warned (the refusal is the answer, not a failure)',
+    warnings.length === 0, warnings.join(' | '))
+  created.windows.length = 0
+
+  // --- the grid toolbar's Preview: the SAVED task, by name --------------------
+  const tGrid = previewView.down('#cloudTasksGrid')
+  ok('cloud preview(toolbar): the button starts disabled (no selection)',
+    tGrid.down('#cloudTaskPreview').disabled === true)
+  tGrid.selectRow(0)
+  ok('cloud preview(toolbar): a selection enables it',
+    tGrid.down('#cloudTaskPreview').disabled === false)
+  previewRoutes['POST /cloud/tasks/preview'] = (body) => {
+    cloudPreviewPosts.push(body)
+    return { data: cloudPreviewAnswer }
+  }
+  cloudPreviewPosts.length = 0
+  cloudPreviewAnswer = CLOUD_PREVIEW
+  tGrid.down('#cloudTaskPreview').handler(tGrid.down('#cloudTaskPreview'))
+  await settle()
+  const tpWin = openWindow()
+  ok('cloud preview(toolbar): the display-only window opened',
+    !!tpWin && tpWin.cls === 'anas-win-cloud-preview' && !!tpWin.down('#cloudPreviewLine'))
+  eq('cloud preview(toolbar): the body is the saved task\'s name',
+    cloudPreviewPosts[0], { name: 'pictures-offsite' })
+  validates('cloud preview(toolbar): the body validates against CloudSyncPreviewRequest',
+    CloudSyncPreviewRequest, cloudPreviewPosts[0])
+  ok('cloud preview(toolbar): the same summary renderer as the wizard\'s line',
+    /Would transfer 2 files \/ 358400 B/.test(tpWin.down('#cloudPreviewLine').html)
+      && /b\.bin/.test(tpWin.down('#cloudPreviewLine').html),
+    tpWin.down('#cloudPreviewLine') && tpWin.down('#cloudPreviewLine').html)
   created.windows.length = 0
 
   // --- Run now: the one run path, and the reload on success AND failure ------
