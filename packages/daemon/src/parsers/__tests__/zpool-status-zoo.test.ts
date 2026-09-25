@@ -24,14 +24,16 @@ import { parseZpoolStatus } from '../zpool-status.js'
  *     shape.
  *
  * A fixture file without a table entry is itself a failure: the zoo table in
- * NOTES.md and this test are updated together, so no capture lands undocumented.
- * New shapes arrive as real captures (test/stunt-node/topology-zoo.sh capture)
- * — never as hand-built files (the ground-truth-first ruling).
+ * NOTES.md and this test are updated together, so no capture lands undocumented
+ * — the test READS NOTES.md and asserts, by name, that every fixture file has
+ * its row. New shapes arrive as real captures (test/stunt-node/topology-zoo.sh
+ * capture) — never as hand-built files (the ground-truth-first ruling).
  */
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const STATUS_DIR = join(__dirname, '../../fixtures/zfs')
 const IOSTAT_DIR = join(__dirname, '../../fixtures/telemetry')
+const ZOO_NOTES = readFileSync(join(STATUS_DIR, 'NOTES.md'), 'utf-8')
 
 /** The VdevRole order the parser promises (data first, then the sections). */
 const ROLE_ORDER: readonly VdevRole[] = ['data', 'log', 'cache', 'spare', 'special', 'dedup']
@@ -191,6 +193,14 @@ describe('zpool-status zoo — every fixture, one stable shape', () => {
     assert.deepEqual(files, tabled, 'fixtures/zfs and the zoo test table drifted — a capture landed without its row (NOTES.md) or its facts')
   })
 
+  it('every zoo file is named in the NOTES.md zoo table — provenance by name', () => {
+    // The backticked name is the row's anchor, so this matches the row for
+    // THIS file and nothing longer (the delimiting backticks make the
+    // substring exact).
+    for (const file of files)
+      assert.ok(ZOO_NOTES.includes(`\`${file}\``), `${file}: no zoo-table row in fixtures/zfs/NOTES.md`)
+  })
+
   for (const file of files) {
     const expected = STATUS_ZOO[file]
     if (!expected)
@@ -198,25 +208,33 @@ describe('zpool-status zoo — every fixture, one stable shape', () => {
 
     describe(file, () => {
       const text = readFileSync(join(STATUS_DIR, file), 'utf-8')
+      // Memoised lazily: the parse happens inside an `it`, never at collection
+      // time — the first call throws HERE, in a test that names this file.
+      let pools: ReturnType<typeof parseZpoolStatus> | undefined
+      const poolsOf = () => {
+        if (!pools)
+          pools = parseZpoolStatus(text)
+        return pools
+      }
 
       it('parses without throwing, into the pools the table names', () => {
-        const pools = parseZpoolStatus(text) // throws → the failure names this file
-        assert.deepEqual(pools.map(p => p.name), expected.map(p => p.name))
+        assert.deepEqual(poolsOf().map(p => p.name), expected.map(p => p.name))
       })
 
       for (const [i, exp] of expected.entries()) {
-        const pools = parseZpoolStatus(text)
-        const pool = pools[i]
+        const pool = poolsOf()[i]
 
         it(`${exp.name}: state, error count, health${exp.errorDetail ? ' + error detail' : ''}`, () => {
           assert.equal(pool.state, exp.state)
           assert.equal(pool.errorCount, exp.errorCount ?? 0)
           // CROSS-FIXTURE FACT the zoo exposes: the older fixtures carry the
           // pool_guid QUOTED (a string), the 2.4.4 captures UNQUOTED (a JSON
-          // number — libzfs emits a uint64 and only the pretty-printed older
-          // files wrapped it in quotes). The parser passes it through verbatim,
-          // so `guid` is number-typed on exactly the real 2.4.4 captures. Pinned
-          // as presence, never as type.
+          // number). That is the `-p` FLAG the 2.4.4 captures were taken with —
+          // its parseable-numbers form emits the guid as a bare uint64 — not
+          // the ZFS version (see "Capture argv" in fixtures/zfs/NOTES.md). The
+          // parser passes the value through verbatim, so `guid` is
+          // number-typed on exactly the `-p` captures. Pinned as presence,
+          // never as type.
           assert.ok(pool.guid != null && String(pool.guid).length > 0, 'no pool guid')
           assert.equal(!!pool.health, exp.health ?? false)
           assert.equal(!!pool.errorDetail, exp.errorDetail ?? false)
@@ -331,14 +349,21 @@ describe('zpool-iostat zoo — every pair, one stable shape', () => {
 
     describe(file, () => {
       const text = readFileSync(join(IOSTAT_DIR, file), 'utf-8')
-      const samples = parseZpoolIostat(text, new Set(exp.pools))
+      // Memoised lazily: the parse happens inside an `it`, never at collection
+      // time.
+      let samples: ReturnType<typeof parseZpoolIostat> | undefined
+      const samplesOf = () => {
+        if (!samples)
+          samples = parseZpoolIostat(text, new Set(exp.pools))
+        return samples
+      }
 
       it('splits into the two samples (since-boot + interval)', () => {
-        assert.equal(samples.length, exp.samples)
+        assert.equal(samplesOf().length, exp.samples)
       })
 
       it('every row is positioned in the pool → vdev → leaf tree', () => {
-        for (const sample of samples) {
+        for (const sample of samplesOf()) {
           assert.ok(sample.length > 0, 'empty sample')
           for (const node of sample) {
             assert.ok(node.name.length > 0)
@@ -359,7 +384,7 @@ describe('zpool-iostat zoo — every pair, one stable shape', () => {
       })
 
       it('the pools and row counts are exactly as captured', () => {
-        for (const sample of samples) {
+        for (const sample of samplesOf()) {
           const depth0 = sample.filter(n => n.depth === 0).map(n => n.name)
           assert.deepEqual(depth0, exp.shape.map(([pool]) => pool))
           for (const [pool, d1, d2] of exp.shape) {
@@ -373,7 +398,7 @@ describe('zpool-iostat zoo — every pair, one stable shape', () => {
       it('no section-header name survives as a row — all-dash rows named logs/cache/special/dedup/spares are dropped', () => {
         // The all-dash header rule: an unindented row that carries no statistics
         // AND is named like one of the five sections is a header, not a pool.
-        for (const sample of samples) {
+        for (const sample of samplesOf()) {
           for (const name of ['logs', 'cache', 'special', 'dedup', 'spares'])
             assert.equal(sample.find(n => n.name === name), undefined, `${name}: a section header leaked into the tree`)
         }
@@ -382,11 +407,22 @@ describe('zpool-iostat zoo — every pair, one stable shape', () => {
         // always prints real numbers (the interval sample may honestly be idle).
         if (!exp.hasSectionHeaders)
           return
-        const pool = samples[0].find(n => n.depth === 0)!
+        const pool = samplesOf()[0].find(n => n.depth === 0)!
         assert.ok(
           pool.bandwidth.read > 0 || pool.bandwidth.write > 0 || pool.ops.read > 0 || pool.ops.write > 0,
           `${pool.name}: pool row lost its statistics`,
         )
+      })
+
+      it('the all-dash header rule holds WITHOUT knownPools too — it is name+shape, not the pool-name check', () => {
+        // The parse above runs WITH knownPools, which would also drop any
+        // unindented row the command was not asked about — this parse without
+        // it is what pins the header rule itself (the pre-existing parser
+        // suite asserts the same on its own samples).
+        for (const sample of parseZpoolIostat(text)) {
+          for (const name of ['logs', 'cache', 'special', 'dedup', 'spares'])
+            assert.equal(sample.find(n => n.name === name), undefined, `${name}: survived as a pool row without knownPools`)
+        }
       })
     })
   }
