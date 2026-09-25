@@ -531,6 +531,7 @@ function makeComponent(cfg, parent) {
     else {
       c.value = v
       if (isTextish) { c._domValue = (v === undefined || v === null) ? '' : v }
+      c._invalidMsg = undefined
     }
     c.fireEvent('change', c, v)
     return c
@@ -542,12 +543,23 @@ function makeComponent(cfg, parent) {
     if (isTextish && c._domValue !== undefined && c._domValue !== c.value) {
       c.setValue(c._domValue)
     }
+    // ExtJS fires the blur event after its own validate-on-blur — the OAuth
+    // token field normalises the paste (and marks the inline error) there.
+    c.fireEvent('blur', c)
     return c
   }
   /** The box contents, committed or not — ExtJS's getRawValue. */
   c.getRawValue = function () {
     return c._domValue === undefined ? c.getValue() : c._domValue
   }
+
+  // The per-field invalid mark: ExtJS's markInvalid/clearInvalid/isValid, as
+  // the cloud token field's contract uses them. A setValue revalidates, so it
+  // clears the mark (a mark set BEFORE the set does not survive it); a mark
+  // set after the set stands until the next clear.
+  c.markInvalid = function (msg) { c._invalidMsg = String(msg == null ? '' : msg); return c }
+  c.clearInvalid = function () { c._invalidMsg = undefined; return c }
+  c.isValid = function () { return c._invalidMsg === undefined }
 
   c.on = function (ev, fn) { (c._on[ev] = c._on[ev] || []).push(fn) }
   c.fireEvent = function (ev, ...args) {
@@ -11033,6 +11045,16 @@ const CLOUD_ASKPASS_REMOTE = {
   secretsSet: [],
 }
 
+// A saved drive remote: the OAuth token is a SECRET only by the name rule
+// (rclone does not type it IsPassword), so the edit box is blank
+// "(unchanged)" and `secretsSet` alone says it is set.
+const CLOUD_DRIVE_REMOTE = {
+  name: 'gd',
+  type: 'drive',
+  options: {},
+  secretsSet: ['token'],
+}
+
 function cloudRoutes(remotes, encrypted) {
   return {
     'GET /cloud/providers': { data: CLOUD_PROVIDERS },
@@ -11405,6 +11427,103 @@ async function cloudChecks() {
     !!cloudOption(dlg, 'token'))
   ok('cloud(drive): the token field is a password box',
     cloudOption(dlg, 'token').inputType === 'password')
+  created.windows.length = 0
+
+  // --- (e2) the OAuth token field normalises the paste ----------------------
+  // `rclone authorize` prints THREE things: the "Paste the following" marker
+  // line, the token JSON object, and "<---End paste". A paste of all of it —
+  // or of the object wrapped in the quotes of a JSON-encoded string — failed
+  // inside rclone with a Go unmarshal error, not a sentence (human-pass
+  // finding 2026-09-25). The field normalises on blur, marks anything that is
+  // not a JSON object with the one sentence, Test and Save refuse, and the
+  // field always shows the text that will be sent.
+  created.windows.length = 0
+  findCmp(win, 'anas-btn-cloud-remote-add').handler()
+  await settle()
+  dlg = openWindow()
+  dlg.down('#cloudRemoteName').setValue('gd2')
+  dlg.down('#cloudRemoteType').setValue('drive')
+  await settle()
+  ok('cloud(token): the OAuth sentence names the JSON block and the marker lines',
+    /paste only the JSON block/.test(dlg.down('#cloudOAuthNote').html)
+      && /End paste/.test(dlg.down('#cloudOAuthNote').html),
+    dlg.down('#cloudOAuthNote') && dlg.down('#cloudOAuthNote').html)
+  const TOKEN_OBJ = '{"access_token":"ya29.x","token_type":"Bearer",'
+    + '"refresh_token":"1//rt","expiry":"2026-09-25T00:00:00Z"}'
+  const fullAuthorizeOutput = 'Paste the following into your remote machine --->\n'
+    + TOKEN_OBJ + '\n<---End paste'
+  const tok = cloudOption(dlg, 'token')
+
+  // A bare object: accepted VERBATIM.
+  tok.pasteInto(TOKEN_OBJ).blur()
+  await settle()
+  ok('cloud(token): a bare JSON object is accepted verbatim',
+    tok.getValue() === TOKEN_OBJ && tok.isValid() === true, String(tok.getValue()))
+  ok('cloud(token): a valid token does not gate',
+    dlg.down('#submit').disabled === false && dlg.down('#cloudTestBtn').disabled === false)
+
+  // The whole `rclone authorize` output: the marker lines are stripped and
+  // the field shows what will be sent.
+  tok.pasteInto(fullAuthorizeOutput).blur()
+  await settle()
+  ok('cloud(token): the marker lines are stripped on blur',
+    tok.getValue() === TOKEN_OBJ && tok.isValid() === true, String(tok.getValue()))
+
+  // The JSON-encoded string: one layer of quotes unwrapped.
+  tok.pasteInto('"' + TOKEN_OBJ.replace(/"/g, '\\"') + '"').blur()
+  await settle()
+  ok('cloud(token): a JSON-encoded string is unwrapped once',
+    tok.getValue() === TOKEN_OBJ && tok.isValid() === true, String(tok.getValue()))
+
+  // Not a JSON object: the inline error marks the field and gates the buttons.
+  tok.pasteInto('gibberish').blur()
+  await settle()
+  ok('cloud(token): a plain word is refused with the one sentence',
+    tok.isValid() === false
+      && /JSON block rclone authorize/.test(String(tok._invalidMsg || '')),
+    String(tok._invalidMsg))
+  ok('cloud(token): an invalid token DISABLES Test and Save',
+    dlg.down('#submit').disabled === true && dlg.down('#cloudTestBtn').disabled === true)
+  const testsBeforeRefusal = testBodies.length
+  findCmp(dlg, 'anas-btn-cloud-remote-testconn').handler()
+  await settle()
+  ok('cloud(token): Test refuses an invalid token (nothing on the wire)',
+    testBodies.length === testsBeforeRefusal, JSON.stringify(testBodies))
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-cloud-remote-save').handler()
+  await settle()
+  ok('cloud(token): Save refuses an invalid token (no job)', jobs.length === 0)
+
+  // A paste with the markers reaches Save as the bare object.
+  tok.pasteInto(fullAuthorizeOutput).blur()
+  await settle()
+  jobs.length = 0
+  dlg.buttonCmps.find(b => b.cls === 'anas-btn-cloud-remote-save').handler()
+  await settle()
+  eq('cloud(token): the create body carries the NORMALISED token',
+    jobs[0] && jobs[0].body,
+    { name: 'gd2', type: 'drive', options: { token: TOKEN_OBJ } })
+  created.windows.length = 0
+
+  // --- (e3) an empty token field in EDIT mode is "(unchanged)" ---------------
+  // The token is a secret: on edit its box is blank "(unchanged)" and an
+  // empty value is NOT validated — the unchanged stored token must keep
+  // saving without the paste contract standing in its way.
+  created.windows.length = 0
+  const gdLoaded = await openCloudRemotes(cloudRoutes([CLOUD_DRIVE_REMOTE]))
+  const gdGrid = gdLoaded.win.down('#cloudRemotesGrid')
+  gdGrid.selectRow(0)
+  const gdEdit = findCmp(gdLoaded.win, 'anas-btn-cloud-remote-edit')
+  gdEdit.handler(gdEdit)
+  await settle()
+  dlg = openWindow()
+  ok('cloud(edit token): the blank token box reads "(unchanged)" and carries NO invalid mark',
+    !!cloudOption(dlg, 'token') && cloudOption(dlg, 'token').getValue() === ''
+      && cloudOption(dlg, 'token').emptyText === '(unchanged)'
+      && cloudOption(dlg, 'token').isValid() === true,
+    cloudOption(dlg, 'token') && String(cloudOption(dlg, 'token')._invalidMsg))
+  ok('cloud(edit token): an empty token field does not gate — Save and Test are live',
+    dlg.down('#submit').disabled === false && dlg.down('#cloudTestBtn').disabled === false)
   created.windows.length = 0
 
   // --- (f) s3: ONE region row per picked provider --------------------------

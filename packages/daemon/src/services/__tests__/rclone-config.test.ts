@@ -11,6 +11,8 @@ import {
   ConfigEncryptedError,
   defaultRcloneConfigPaths,
   isSecretKey,
+  normalizeOAuthToken,
+  OAUTH_TOKEN_ERROR,
   obscure,
   passwordKeysFor,
   providerOption,
@@ -801,5 +803,44 @@ describe('rclone-config: removeRemote (rclone.1)', () => {
     })
     await assert.rejects(removeRemote(paths, mock, 'homelab'), RcloneConfigGateError)
     assert.equal(await readFile(cfg, 'utf-8'), seed)
+  })
+})
+
+describe('rclone-config: normalizeOAuthToken (the OAuth paste, human-pass finding 2026-09-25)', () => {
+  // `rclone authorize` prints the marker line, the JSON object, and the
+  // closing marker. The helper is the daemon boundary of the same contract
+  // the dialog's token field applies on blur (72-cloud.js).
+  const TOKEN = '{"access_token":"ya29.x","token_type":"Bearer","refresh_token":"1//rt","expiry":"2026-09-25T00:00:00Z"}'
+
+  it('a bare object is accepted VERBATIM', () => {
+    const res = normalizeOAuthToken(TOKEN)
+    assert.deepEqual(res, { ok: true, value: TOKEN })
+    // whitespace around it is trimmed
+    assert.deepEqual(normalizeOAuthToken(`  ${TOKEN}  `), { ok: true, value: TOKEN })
+  })
+
+  it('the marker lines are stripped — only what lies between them survives', () => {
+    const pasted = `Paste the following into your remote machine --->\n${
+      TOKEN}\n<---End paste`
+    assert.deepEqual(normalizeOAuthToken(pasted), { ok: true, value: TOKEN })
+  })
+
+  it('a JSON-encoded string (the object wrapped in one pair of double quotes) is unwrapped once', () => {
+    const quoted = `"${TOKEN.replace(/"/g, '\\"')}"`
+    assert.deepEqual(normalizeOAuthToken(quoted), { ok: true, value: TOKEN })
+    // a SECOND layer is left alone — and then refused (a string is not an object)
+    const twice = `"${quoted.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+    assert.equal(normalizeOAuthToken(twice).ok, false)
+  })
+
+  it('anything that is not a JSON object is refused, with the sentence ready', () => {
+    for (const bad of ['gibberish', '123', '[1,2]', '"just a string"', TOKEN.slice(0, -1)]) {
+      const res = normalizeOAuthToken(bad)
+      assert.equal(res.ok, false, `expected '${bad}' refused`)
+      assert.equal(typeof res.value, 'string')
+    }
+    // the empty field is the "(unchanged)" marker — nothing to validate
+    assert.deepEqual(normalizeOAuthToken(''), { ok: true, value: '' })
+    assert.equal(OAUTH_TOKEN_ERROR.includes('JSON block'), true)
   })
 })

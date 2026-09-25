@@ -48,7 +48,7 @@ import {
   writeTaskUnits,
 } from '../services/cloud-units.js'
 import { scanNestedFilesystems } from '../services/nested-filesystems.js'
-import { RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, RemoteNotFoundError, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
+import { normalizeOAuthToken, OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs, rcloneVersion, readConfig, RemoteNotFoundError, removeRemote, trimProviders, writeRemote } from '../services/rclone-config.js'
 import { testRemote } from '../services/rclone-probe.js'
 import { zodIssue } from '../validation.js'
 import { requireIdentity } from './identity.js'
@@ -160,6 +160,28 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
   }
 
   /**
+   * The one OAuth-token normalisation at this boundary: a `token` option is
+   * the pasted `rclone authorize` output, and the daemon accepts exactly the
+   * text the dialog's field accepts — marker lines and one layer of quotes
+   * stripped, a JSON object required ({@link OAUTH_TOKEN_ERROR} is the field's
+   * own inline sentence). Empty stays empty (the dialog's "(unchanged)" and
+   * the update route's keep-as-stored marker). Returns the options with the
+   * normalised token in place — the value that reaches the file and the probe
+   * — or null when the paste is not a JSON object and the door answers the
+   * 400 instead of letting rclone fail with a Go unmarshal error. `token` is
+   * secret only by the NAME rule (rclone does not type it IsPassword): the
+   * obscure/secret handling is untouched.
+   */
+  function normalizeTokenOption(options: Record<string, string>): Record<string, string> | null {
+    if (!Object.hasOwn(options, 'token'))
+      return options
+    const res = normalizeOAuthToken(options.token)
+    if (!res.ok)
+      return null
+    return res.value === options.token ? options : { ...options, token: res.value }
+  }
+
+  /**
    * The 503 door every endpoint shares. A missing binary surfaces two ways:
    * the availability probe before the call (the test endpoint's `timeout`
    * wrapper would otherwise hide the spawn failure behind an exit 127), and
@@ -252,6 +274,12 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid remote: ${zodIssue(parsed.error)}` } }
     }
     const input = parsed.data
+    const normalized = normalizeTokenOption(input.options)
+    if (normalized === null) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: OAUTH_TOKEN_ERROR } }
+    }
+    input.options = normalized
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -310,6 +338,12 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid remote update: ${zodIssue(parsed.error)}` } }
     }
     const input = parsed.data
+    const normalized = normalizeTokenOption(input.options)
+    if (normalized === null) {
+      reply.code(400)
+      return { error: { code: 'VALIDATION_ERROR', message: OAUTH_TOKEN_ERROR } }
+    }
+    input.options = normalized
 
     const identity = requireIdentity(request, reply)
     if (!identity)
@@ -400,6 +434,16 @@ export async function cloudRoutes(server: FastifyInstance, opts: CloudRouteOptio
       return { error: { code: 'VALIDATION_ERROR', message: `Invalid test request: ${zodIssue(parsed.error)}` } }
     }
     const req = parsed.data
+    // The unsaved dialog's token paste is normalised here too — the probe is
+    // served the same text the save would write.
+    if (req.remote) {
+      const normalized = normalizeTokenOption(req.remote.options)
+      if (normalized === null) {
+        reply.code(400)
+        return { error: { code: 'VALIDATION_ERROR', message: OAUTH_TOKEN_ERROR } }
+      }
+      req.remote.options = normalized
+    }
 
     const identity = requireIdentity(request, reply)
     if (!identity)

@@ -99,6 +99,79 @@ export function isSecretKey(key: string, option?: Partial<Pick<CloudProviderOpti
   return SECRET_SUFFIX_RE.test(key)
 }
 
+// ── The OAuth token paste ──────────────────────────────────────────────────
+
+/**
+ * The refusal sentence for a `token` option that never becomes a JSON object
+ * — the same sentence the dialog marks into the field (72-cloud.js). Answered
+ * as a 400 at every door that accepts remote options, never rclone's own Go
+ * unmarshal error from inside the write or the probe.
+ */
+export const OAUTH_TOKEN_ERROR
+  = 'The token must be the JSON block rclone authorize prints, starting with { and ending with }'
+
+/** A paste carrying one of `rclone authorize`'s marker lines (extraction case). */
+const OAUTH_TOKEN_MARKER_RE = /Paste the following|End paste/
+
+/** The result of normalising a pasted `rclone authorize` output. */
+export interface NormalizedOAuthToken {
+  /** False when the text is not (and cannot be trimmed to) a JSON object. */
+  ok: boolean
+  /** The text to send — the normalised paste, or '' when nothing was typed. */
+  value: string
+}
+
+/**
+ * Normalise a pasted `rclone authorize` output to the bare JSON object text.
+ * `rclone authorize` prints THREE things — a `Paste the following …  --->`
+ * marker line, the token JSON object, and `<---End paste` — and a paste of
+ * the whole output, or of the object wrapped in the quotes of a JSON-encoded
+ * string, fails inside rclone with a Go unmarshal error instead of a sentence
+ * (human-pass finding 2026-09-25).
+ *
+ *   trim; marker lines present ⇒ keep only what lies between them (in
+ *   practice the first `{` through the matching last `}`); one pair of double
+ *   quotes wrapping a JSON-encoded string is unwrapped ONCE; what remains
+ *   must JSON.parse to a PLAIN object — never a string, number or array. The
+ *   object's KEYS are the backend's business and are not validated. An EMPTY
+ *   value is nothing to validate ('' is the dialog's "(unchanged)" and the
+ *   update route's keep-as-stored marker).
+ *
+ * The same contract the field applies on blur (72-cloud.js
+ * `normalizeOAuthToken`) — validate at both boundaries, Principle 6.
+ */
+export function normalizeOAuthToken(text: string): NormalizedOAuthToken {
+  let s = String(text ?? '').trim()
+  if (s === '')
+    return { ok: true, value: '' }
+  if (OAUTH_TOKEN_MARKER_RE.test(s)) {
+    const start = s.indexOf('{')
+    const end = s.lastIndexOf('}')
+    if (start < 0 || end <= start)
+      return { ok: false, value: s }
+    s = s.slice(start, end + 1).trim()
+  }
+  if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+    try {
+      const inner: unknown = JSON.parse(s)
+      if (typeof inner === 'string')
+        s = inner.trim()
+    }
+    catch {
+      // Left as-is; the object check below refuses it.
+    }
+  }
+  let obj: unknown
+  try {
+    obj = JSON.parse(s)
+  }
+  catch {
+    return { ok: false, value: s }
+  }
+  const plain = typeof obj === 'object' && obj !== null && !Array.isArray(obj)
+  return { ok: plain, value: s }
+}
+
 // ── The provider catalogue (rclone config providers) ───────────────────────
 
 /** The raw shape of `rclone config providers` (1.60), per option. */

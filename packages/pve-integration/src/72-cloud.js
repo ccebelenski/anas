@@ -573,12 +573,113 @@
     //  Add / edit remote dialog — 'anas-win-cloud-remote-edit'
     // ======================================================================
 
-    // The OAuth sentence, verbatim from the design — shown when the backend
-    // has a `token` option (the token field always shows beneath it).
+    // The OAuth sentence — shown when the backend has a `token` option (the
+    // token field always shows beneath it). Human-pass finding 2026-09-25:
+    // `rclone authorize` prints THREE things — the `Paste the following …`
+    // marker, the token JSON object, and `<---End paste` — and "paste its
+    // output" sent users pasting all of it (or the object wrapped in the
+    // quotes of a JSON-encoded string), which failed inside rclone with a Go
+    // unmarshal error instead of a sentence. The sentence now names the block
+    // and the two marker lines to leave out.
     function oauthSentence(type) {
         return t('This backend authorises through a browser. On a machine with '
             + 'one, run') + ' `rclone authorize "' + type + '"` '
-            + t('and paste its output into the token field.');
+            + t('and paste only the JSON block it prints, from the opening { to '
+                + 'the closing }, into the token field. Leave out the "Paste the '
+                + 'following" and "End paste" lines.');
+    }
+
+    // The inline refusal for a token field that never becomes a JSON object —
+    // the field marks it, and Test and Save refuse with it.
+    var OAUTH_TOKEN_ERROR = 'The token must be the JSON block rclone authorize '
+        + 'prints, starting with { and ending with }';
+
+    // Normalise a pasted `rclone authorize` output to the bare JSON object
+    // text: trim; marker lines present → keep only what lies between them (in
+    // practice the first { through the matching last }); one pair of double
+    // quotes wrapping a JSON-encoded string → unwrapped ONCE; what remains
+    // must JSON.parse to a PLAIN object (never a string, number or array —
+    // the keys are the backend's business, not ours). An EMPTY value is
+    // nothing to validate (the edit box's "(unchanged)"). Returns
+    // { ok, value } — value is the text to send.
+    function normalizeOAuthToken(text) {
+        var s = trim(text == null ? '' : '' + text);
+        if (!s) {
+            return { ok: true, value: '' };
+        }
+        if (/Paste the following|End paste/.test(s)) {
+            var start = s.indexOf('{');
+            var end = s.lastIndexOf('}');
+            if (start < 0 || end <= start) {
+                return { ok: false, value: s };
+            }
+            s = trim(s.substring(start, end + 1));
+        }
+        if (s.length >= 2 && s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') {
+            var inner = null;
+            try {
+                inner = JSON.parse(s);
+            } catch (eOuter) {
+                inner = null;
+            }
+            if (typeof inner === 'string') {
+                s = trim(inner);
+            }
+        }
+        var obj = null;
+        try {
+            obj = JSON.parse(s);
+        } catch (eParse) {
+            obj = null;
+        }
+        var plain = obj !== null && typeof obj === 'object'
+            && Object.prototype.toString.call(obj) !== '[object Array]';
+        return { ok: plain, value: s };
+    }
+
+    // The token field's blur: normalise the paste IN PLACE — the field then
+    // shows exactly what will be sent — and mark (or clear) the inline error.
+    // Fail-open on the mark: the button gate and the send guards re-check the
+    // value regardless of whether the field carries the mark API.
+    function oauthTokenBlur(cmp) {
+        var res = normalizeOAuthToken(cmp.getValue());
+        try { cmp.setValue(res.value); } catch (eSet) { /* non-fatal */ }
+        try {
+            if (res.ok) {
+                cmp.clearInvalid();
+            } else {
+                cmp.markInvalid(t(OAUTH_TOKEN_ERROR));
+            }
+        } catch (eMark) { /* non-fatal */ }
+        var w = cmp.up('window');
+        if (w && w._cloudRefresh) {
+            w._cloudRefresh();
+        }
+        return res;
+    }
+
+    // The inline error for the token field's current value, '' when the field
+    // is absent (a non-OAuth backend) or the value is absent / a JSON object.
+    // The button gate reads it, so Test and Save wait for a valid paste.
+    function oauthTokenProblem(win) {
+        var cmp = null;
+        try { cmp = win.down('#cloudOpt_token'); } catch (e) { cmp = null; }
+        if (!cmp) {
+            return '';
+        }
+        return normalizeOAuthToken(cmp.getValue()).ok ? '' : t(OAUTH_TOKEN_ERROR);
+    }
+
+    // Before Test and before Save: normalise the token paste in place and
+    // refuse when it is not a JSON object — the inline error is the answer;
+    // the send never happens with text the daemon would bounce.
+    function normalizeTokenField(win) {
+        var cmp = null;
+        try { cmp = win.down('#cloudOpt_token'); } catch (e) { cmp = null; }
+        if (!cmp) {
+            return true;
+        }
+        return oauthTokenBlur(cmp).ok;
     }
 
     // Snapshot every rendered option field's EFFECTIVE value (a string, or
@@ -756,11 +857,24 @@
                     // An int's box stays empty unless typed/stored — the
                     // default rides rclone's side, never forced in.
                     _anasOption: opt,
-                    listeners: optionChangeListeners(opt),
+                    listeners: optionFieldListeners(opt),
                 },
                 subFieldCfg(sub),
             ],
         };
+    }
+
+    // The change listeners every option field carries — plus, on the token
+    // field, the blur that normalises a pasted `rclone authorize` output in
+    // place (the OAuth contract above). The token field is always a plain
+    // text/password box (it is a secret, so the examples-combo branch above
+    // never builds it) — this is its only home.
+    function optionFieldListeners(opt) {
+        var l = optionChangeListeners(opt);
+        if (opt.name === 'token') {
+            l.blur = function () { oauthTokenBlur(this); };
+        }
+        return l;
     }
 
     function subFieldCfg(sub) {
@@ -856,14 +970,16 @@
     }
 
     // Live gate: Test and Save stay disabled until the name is a valid remote
-    // name, a type is chosen, and every REQUIRED rendered field carries a
-    // value. A hidden (provider-filtered) required field cannot block — it is
-    // not part of this form.
+    // name, a type is chosen, every REQUIRED rendered field carries a value,
+    // and the token field (an OAuth backend) is not sitting on a paste that
+    // never becomes a JSON object. A hidden (provider-filtered) required field
+    // cannot block — it is not part of this form.
     function refreshDialogButtons(win) {
         var name = trim(valOf(win, '#cloudRemoteName') || '');
         var type = trim(valOf(win, '#cloudRemoteType') || '');
         var missing = requiredMissing(win);
-        var ok = REMOTE_NAME_RE.test(name) && !!type && !missing;
+        var tokenErr = oauthTokenProblem(win);
+        var ok = REMOTE_NAME_RE.test(name) && !!type && !missing && !tokenErr;
         try {
             var testBtn = win.down('#cloudTestBtn');
             if (testBtn) { testBtn.setDisabled(!ok); }
@@ -1182,6 +1298,9 @@
         if (!REMOTE_NAME_RE.test(name) || !type || requiredMissing(win)) {
             return;
         }
+        if (!normalizeTokenField(win)) {
+            return;
+        }
         var area = win.down('#cloudTestResult');
         if (area) {
             try {
@@ -1228,6 +1347,9 @@
         if (requiredMissing(win)) {
             ANAS.alertMsg('Invalid input',
                 t('Fill every required field (marked *).'));
+            return;
+        }
+        if (!normalizeTokenField(win)) {
             return;
         }
         var body;

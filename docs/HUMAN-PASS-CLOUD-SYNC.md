@@ -18,7 +18,9 @@ remote dialog that tells the user to authorise on a machine with a browser.
    ```
 
    A browser window opens; approve the account. rclone prints the token between two marker
-   lines. Copy **only the `{ ... }` JSON block** — not the marker lines around it.
+   lines. Copy **only the `{ ... }` JSON block** — not the marker lines around it. The dialog
+   now strips the marker lines and one layer of quotes itself and refuses anything that is
+   not a JSON object, but pasting only the block is still the clean way.
 3. Decide a folder on the Drive for the test (the task's "Path on remote", e.g. `anas-test`).
    Nothing outside that folder is touched, but a `sync` task deletes inside it.
 

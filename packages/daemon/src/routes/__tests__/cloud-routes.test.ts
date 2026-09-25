@@ -14,7 +14,7 @@ import { MockExecutor } from '../../executor/mock.js'
 import { JobQueue } from '../../jobs/queue.js'
 import { listSections, parseRcloneConf } from '../../parsers/rclone-conf.js'
 import { createServer } from '../../server.js'
-import { RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
+import { OAUTH_TOKEN_ERROR, RCLONE, rcloneBaseArgs } from '../../services/rclone-config.js'
 import { PROBE_REMOTE_NAME, probeArgs } from '../../services/rclone-probe.js'
 import { cloudRoutes, RCLONE_NOT_INSTALLED } from '../cloud.js'
 
@@ -354,6 +354,120 @@ describe('cloud remotes routes (rclone.1)', () => {
     it('a missing remote → 404', async () => {
       const res = await server.inject({ method: 'DELETE', url: '/v1/cloud/remotes/nosuch', headers: IDENTITY })
       assert.equal(res.statusCode, 404)
+    })
+  })
+
+  // --- The OAuth token paste (human-pass finding 2026-09-25) -------------------
+  // `rclone authorize` prints the marker lines around the JSON block, and a
+  // paste of the whole output (or of the block wrapped in quotes) failed
+  // inside rclone with a Go unmarshal error. Every door that accepts remote
+  // options normalises the `token` option the same way the dialog's field
+  // does, and refuses anything that is not a JSON object with the one
+  // sentence — 400 at the door, never rclone's own error from inside the
+  // write or the probe.
+  describe('the OAuth token paste is normalised at every door', () => {
+    const TOKEN = '{"access_token":"ya29.x","token_type":"Bearer","refresh_token":"1//rt","expiry":"2026-09-25T00:00:00Z"}'
+    const MARKER_PASTE = `Paste the following into your remote machine --->\n${
+      TOKEN}\n<---End paste`
+    const QUOTED = `"${TOKEN.replace(/"/g, '\\"')}"`
+    const DRIVE_SECTION = '[gd]\ntype = drive\nscope = drive\n'
+
+    it('POST /cloud/remotes: a bad paste → 400 with the sentence, no job; a marker paste → the bare object written', async () => {
+      const refused = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/remotes',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'gd', type: 'drive', options: { token: 'gibberish' } }),
+      })
+      assert.equal(refused.statusCode, 400)
+      assert.equal(refused.json().error.code, 'VALIDATION_ERROR')
+      assert.equal(refused.json().error.message, OAUTH_TOKEN_ERROR)
+      await assert.rejects(readFile(configFile, 'utf-8'), 'nothing was written')
+
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/remotes',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ name: 'gd', type: 'drive', options: { token: MARKER_PASTE } }),
+      })
+      assert.equal(res.statusCode, 202)
+      const { job } = res.json() as JobAccepted
+      const done = await waitForJob(server, job.id)
+      assert.equal(done.status, 'completed', done.error?.message)
+      const text = await readFile(configFile, 'utf-8')
+      // `token` is secret only by the NAME rule — stored PLAIN, the marker
+      // lines stripped, exactly the JSON block rclone authorize printed.
+      assert.ok(text.includes(`token = ${TOKEN}\n`), text)
+      assert.ok(!text.includes('Paste the following') && !text.includes('End paste'), text)
+      const get = await server.inject({ method: 'GET', url: '/v1/cloud/remotes', headers: IDENTITY })
+      assert.ok(get.payload.includes('"token"'), 'the API names the key (secretsSet), never the value')
+      assert.ok(!get.payload.includes('ya29.x'), 'the token value is never returned')
+    })
+
+    it('PUT /cloud/remotes/:name: a bad paste → 400 with the sentence, no job; a quoted paste → the bare object written', async () => {
+      await writeFile(configFile, DRIVE_SECTION, 'utf-8')
+      const refused = await server.inject({
+        method: 'PUT',
+        url: '/v1/cloud/remotes/gd',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ options: { token: 'gibberish' } }),
+      })
+      assert.equal(refused.statusCode, 400)
+      assert.equal(refused.json().error.message, OAUTH_TOKEN_ERROR)
+      const untouched = await readFile(configFile, 'utf-8')
+      assert.ok(!untouched.includes('token'), 'the refusal wrote nothing')
+
+      const res = await server.inject({
+        method: 'PUT',
+        url: '/v1/cloud/remotes/gd',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({ options: { token: QUOTED } }),
+      })
+      assert.equal(res.statusCode, 202)
+      const { job } = res.json() as JobAccepted
+      const done = await waitForJob(server, job.id)
+      assert.equal(done.status, 'completed', done.error?.message)
+      const text = await readFile(configFile, 'utf-8')
+      assert.ok(text.includes(`token = ${TOKEN}\n`), text)
+      assert.ok(text.includes('scope = drive'), 'the untouched line survived')
+    })
+
+    it('POST /cloud/remotes/test: a bad paste → 400 with the sentence, no probe; a marker paste → the probe is served the bare object', async () => {
+      mockOf(server).addFixture({ command: '/usr/bin/timeout', result: { stdout: '[]', stderr: '', exitCode: 0 } })
+      const refused = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/remotes/test',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({
+          remote: { name: 'draft', type: 'drive', options: { token: 'gibberish' } },
+        }),
+      })
+      assert.equal(refused.statusCode, 400)
+      assert.equal(refused.json().error.message, OAUTH_TOKEN_ERROR)
+      assert.equal(mockOf(server).calls.some(c => c.command === '/usr/bin/timeout'), false, 'the refusal never reached the probe')
+
+      const probeEnvs: (Record<string, string> | undefined)[] = []
+      const mock = mockOf(server)
+      const orig = mock.exec.bind(mock)
+      mock.exec = async (command, args, execOpts) => {
+        if (command === '/usr/bin/timeout')
+          probeEnvs.push(execOpts?.env as Record<string, string> | undefined)
+        return orig(command, args, execOpts)
+      }
+      const res = await server.inject({
+        method: 'POST',
+        url: '/v1/cloud/remotes/test',
+        headers: JSON_HEADERS,
+        payload: JSON.stringify({
+          remote: { name: 'draft', type: 'drive', options: { token: MARKER_PASTE } },
+        }),
+      })
+      assert.equal(res.statusCode, 200)
+      assert.deepEqual(res.json(), { data: { verdict: 'ok', message: '' } })
+      const env = probeEnvs[0] ?? {}
+      // The env-defined remote carries the NORMALISED text — the same bytes a
+      // save would write.
+      assert.equal(env.RCLONE_CONFIG_ANASTEST_TOKEN, TOKEN)
     })
   })
 
