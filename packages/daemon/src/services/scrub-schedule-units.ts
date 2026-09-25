@@ -307,9 +307,16 @@ async function readScrubTimerEnabled(executor: CommandExecutor): Promise<boolean
 /**
  * Remove the node's scrub units: stop+disable the timer, delete both files
  * AND the timer's Persistent stamp (review R10 — a leftover stamp makes the
- * next enable start the whole scrub immediately), reload systemd. Used when
- * the pool list empties — the operator asked for no scrubbing, so nothing is
- * left firing and no stale catch-up is armed for the next enable.
+ * next enable start the whole scrub immediately), reset the units' failed
+ * state, reload systemd. Used when the pool list empties — the operator asked
+ * for no scrubbing, so nothing is left firing and no stale catch-up is armed
+ * for the next enable.
+ *
+ * The `reset-failed` pair is the task stores' shape (review R2): a removed
+ * oneshot that failed stays in the failed state as a `not-found` ghost, so
+ * `systemctl reset-failed` is issued as TWO calls — service first, then timer
+ * — each with its exit IGNORED; a reset of nothing must never fail the
+ * removal.
  */
 export async function removeScrubUnits(executor: CommandExecutor, dir: string): Promise<void> {
   // Best-effort disable first (ignore failure — the unit may already be gone).
@@ -319,5 +326,8 @@ export async function removeScrubUnits(executor: CommandExecutor, dir: string): 
     unlinkQuiet(join(dir, SCRUB_TIMER_NAME)),
     unlinkQuiet(scrubStampPath()),
   ])
+  // Best-effort: not failed / already gone is exactly the goal state.
+  await executor.exec(SYSTEMCTL, ['reset-failed', SCRUB_SERVICE_NAME]).catch(() => undefined)
+  await executor.exec(SYSTEMCTL, ['reset-failed', SCRUB_TIMER_NAME]).catch(() => undefined)
   await runSystemctl(executor, ['daemon-reload'])
 }

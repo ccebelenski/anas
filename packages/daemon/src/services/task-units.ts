@@ -3,7 +3,7 @@ import type { ZodType } from 'zod'
 import type { CommandExecutor } from '../executor/types.js'
 import type { CadenceGateDecision, TaskTrigger } from './backup-cadence.js'
 import type { SystemdRunResult } from './systemd-status.js'
-import { readdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { BACKUP_SKIP_EXIT_CODE, BACKUP_SKIPPED_OFF_WEEK, cadenceToOnCalendar } from '@anas/shared'
 import { decideCadenceRun, isTaskOverdue, overdueWindowMs } from './backup-cadence.js'
@@ -237,11 +237,12 @@ export function taskStampPath(kind: TaskUnitKind, name: string): string {
  * and leaving either behind poisons the task's NEXT life: a leftover stamp
  * makes the re-created timer fire immediately (`Persistent=true` reads the
  * stamp as a missed run — SCHEDULES-GT-17), and a removed oneshot that failed
- * stays in the failed state as a `not-found` ghost. Both go the way the scrub
- * store has always gone (review R10): the stamp unlinked beside the unit
- * files, and `systemctl reset-failed <service> <timer>` issued with its exit
- * IGNORED — the units may already be out of the failed state, and a reset of
- * nothing must never fail the removal.
+ * stays in the failed state as a `not-found` ghost. The stamp unlink is the
+ * scrub store's pattern (review R10); the `reset-failed` is new here (review
+ * R2). It is issued as TWO calls — service first, then timer — each with its
+ * exit IGNORED: one combined call is unproven against real systemd (whether a
+ * not-loaded first unit short-circuits the rest of the argv), and a reset of
+ * nothing must never fail the removal anyway.
  */
 export async function removeTaskUnits(
   kind: TaskUnitKind,
@@ -256,7 +257,8 @@ export async function removeTaskUnits(
     unlinkQuiet(taskStampPath(kind, name)),
   ])
   // Best-effort: not failed / already gone is exactly the goal state.
-  await executor.exec(SYSTEMCTL, ['reset-failed', serviceUnitName(kind, name), timerUnitName(kind, name)]).catch(() => undefined)
+  await executor.exec(SYSTEMCTL, ['reset-failed', serviceUnitName(kind, name)]).catch(() => undefined)
+  await executor.exec(SYSTEMCTL, ['reset-failed', timerUnitName(kind, name)]).catch(() => undefined)
   await runSystemctl(executor, ['daemon-reload'])
 }
 
@@ -264,35 +266,85 @@ export async function removeTaskUnits(
 const STAMP_FILE_PREFIX = 'stamp-'
 
 /**
+ * What the stamp sweep needs from a unit store: just its unit-name prefix.
+ * The task stores pass their full {@link TaskUnitKind} descriptors (which
+ * satisfy this structurally); the replication and snapshot-schedule stores,
+ * which have no task-kind descriptor, pass their exported prefix constant.
+ */
+export interface TaskStampSource {
+  /** Unit-name prefix, e.g. `anas-backup-` / `anas-repl-`. MUST be disjoint from every other source's. */
+  prefix: string
+}
+
+/**
+ * This process's start time — the default {@link startedAt}: stamps at or
+ * after it are skipped, never swept. `uptime()` is measured from the real
+ * process start, so this is exact no matter when the module loads.
+ */
+const PROCESS_START_MS = Date.now() - process.uptime() * 1000
+
+/**
+ * The `.service` file NAMES in a unit dir, as a set — the unit stores' own
+ * definition of "this task exists" ({@link listServiceUnits} reads the same
+ * way). A not-listed service means the task is gone.
+ *
+ * Deliberately NOT {@link listServiceUnits} itself: that helper fails open to
+ * [] on ANY error, which here would read "every task is gone" and WIDEN the
+ * delete (review N2). An unreadable unit dir is not evidence of absence — so
+ * only ENOENT (no unit dir at all: nothing exists) is quiet, and any other
+ * read error throws to the boot caller, which logs it and starts anyway.
+ */
+async function listServiceUnitNames(unitDir: string): Promise<Set<string>> {
+  let files: string[]
+  try {
+    files = await readdir(unitDir)
+  }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT')
+      return new Set()
+    throw err
+  }
+  return new Set(files.filter(f => f.endsWith('.service')))
+}
+
+/**
  * Sweep the stamp files of tasks that NO LONGER EXIST (SCHEDULES-GT-18): a
  * removed task used to leave its Persistent stamp behind, and re-creating a
  * task under that name inherited the stale last-trigger and fired at once
- * (SCHEDULES-GT-17). `removeTaskUnits` now deletes the stamp itself; this
- * sweep — one pass at daemon start, after the unit stores are readable —
- * clears the orphans already on a node (GT-18 counted 30-odd, the oldest from
- * July). Runs in the boot path next to the stale-probe sweep, and never in a
- * mutation: at start this process has no removal of its own in flight.
+ * (SCHEDULES-GT-17). Every store's removal deletes its stamp now — the task
+ * stores since 63532c8, the replication and snapshot-schedule stores since
+ * this fix — and this sweep, one pass at daemon start, clears the orphans
+ * already on a node (GT-18 counted 30-odd, the oldest from July). Runs in the
+ * boot path next to the stale-probe sweep, and never in a mutation: at start
+ * this process has no removal of its own in flight.
  *
- * Scope is tight, both ways. Only stamps whose timer name sits under one of
- * `kinds`' prefixes are considered — the callers pass the unit stores' own
- * descriptors (`BACKUP_UNIT_KIND`, `CLOUD_UNIT_KIND`), never a hard-coded
- * list, so a kind added later is swept the day it exists and a foreign
- * `stamp-*.timer` (systemd ships some, other software may too) is never
- * touched. And a stamp whose unit STILL exists is the missed-run heal —
- * `Persistent=true` firing a catch-up run across a reboot is the point — so it
- * is kept. Both unit files are checked (service and timer): either one present
- * means the task, or a half-removed remnant of it, is still on the node, and
- * the stamp stays.
+ * Scope is tight, all four ways. (1) Only stamps whose timer name sits under
+ * one of `sources`' prefixes are considered — the caller passes the unit
+ * stores' own constants (task kinds and the bare prefix constants), never a
+ * hard-coded list, so a store added later is swept the day it is passed and a
+ * foreign `stamp-*.timer` (systemd ships some, other software may too) is
+ * never touched. (2) A stamp FRESHER than the process start is skipped
+ * (review R1): the sweep reads the dir listing and unlinks a beat later, and
+ * a task created in that window writes its stamp at `enable --now` — deleting
+ * it would hand a fresh task the immediate-fire it exists to prevent. (3) A
+ * stamp whose task STILL EXISTS is the missed-run heal — `Persistent=true`
+ * firing a catch-up run across a reboot is the point — so it is kept. The
+ * existence test is the store's own: the task's `.service` unit lists in the
+ * unit dir (review R3). A timer-only remnant of a half-removal is therefore
+ * swept (its service is gone, the stamp can only fire a service systemd
+ * cannot find) and a service-only remnant is kept (its task still runs).
  *
  * Returns the swept file names (the caller logs one line each). A missing
  * stamp dir is quiet (no stamps, nothing to sweep); an unreadable one THROWS —
- * the boot caller logs it and starts anyway. One stubborn file is left for the
- * next boot rather than stopping the sweep.
+ * the boot caller logs it and starts anyway, and per N2 an unreadable UNIT dir
+ * throws too rather than reading as an empty store. One stubborn file is left
+ * for the next boot rather than stopping the sweep.
  */
 export async function sweepOrphanTaskStamps(
-  kinds: readonly TaskUnitKind[],
+  sources: readonly TaskStampSource[],
   unitDir: string = DEFAULT_SYSTEMD_DIR,
   stampDir: string = systemdTimersStampDir(),
+  startedAt: number = PROCESS_START_MS,
 ): Promise<string[]> {
   let entries: string[]
   try {
@@ -303,16 +355,24 @@ export async function sweepOrphanTaskStamps(
       return []
     throw err
   }
+  const services = await listServiceUnitNames(unitDir)
   const swept: string[] = []
   for (const file of entries) {
     if (!file.startsWith(STAMP_FILE_PREFIX) || !file.endsWith('.timer'))
       continue
     const unit = file.slice(STAMP_FILE_PREFIX.length, -'.timer'.length)
-    if (!kinds.some(kind => unit.startsWith(kind.prefix)))
+    if (!sources.some(source => unit.startsWith(source.prefix)))
       continue
-    const unitExists = await taskUnitFileExists(join(unitDir, `${unit}.service`))
-      || await taskUnitFileExists(join(unitDir, `${unit}.timer`))
-    if (unitExists)
+    // Fresh stamp — possibly a create in flight; never ours to delete.
+    try {
+      if ((await stat(join(stampDir, file))).mtimeMs >= startedAt)
+        continue
+    }
+    catch {
+      // Vanished under us, or unreadable — either way not provably an orphan.
+      continue
+    }
+    if (services.has(`${unit}.service`))
       continue
     try {
       await unlink(join(stampDir, file))
@@ -323,17 +383,6 @@ export async function sweepOrphanTaskStamps(
     }
   }
   return swept
-}
-
-/** Does a file exist (readable)? A missing/unreadable one is not there to us. */
-async function taskUnitFileExists(path: string): Promise<boolean> {
-  try {
-    await readFile(path)
-    return true
-  }
-  catch {
-    return false
-  }
 }
 
 /**

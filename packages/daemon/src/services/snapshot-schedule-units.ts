@@ -10,6 +10,7 @@ import {
   listServiceUnits,
   parseMarkedJson,
   runSystemctl,
+  systemdTimersStampDir,
   unlinkQuiet,
 } from './systemd-unit-store.js'
 
@@ -41,6 +42,13 @@ const JOURNALCTL = '/usr/bin/journalctl'
 const RUNNER_NODE = '/usr/bin/node'
 const RUNNER_SCRIPT = '/opt/anas/packages/daemon/dist/snapshot-task.js'
 const UNIT_PREFIX = 'anas-snap-'
+/**
+ * This store's unit-name prefix, exported for the boot sweep of orphan timer
+ * stamps ({@link sweepOrphanTaskStamps} takes bare prefixes too). Same constant
+ * as `UNIT_PREFIX` — one home, two names, because the sweep needs the prefix
+ * and nothing else about this store.
+ */
+export const SNAPSHOT_UNIT_PREFIX = UNIT_PREFIX
 /** How many recent journald lines the detail view surfaces (mirrors backup). */
 const JOURNAL_TAIL = 200
 /** The service-file line that carries the canonical schedule JSON (as a comment). */
@@ -54,6 +62,17 @@ export function serviceUnitName(id: string): string {
 }
 export function timerUnitName(id: string): string {
   return `${UNIT_PREFIX}${id}.timer`
+}
+
+/**
+ * Where systemd records a Persistent timer's last fire for ONE schedule: the
+ * timers stamp dir (shared {@link systemdTimersStampDir}) + `stamp-<timer>` —
+ * e.g. `/var/lib/systemd/timers/stamp-anas-snap-<id>.timer`. A stamp a removed
+ * schedule leaves behind makes the schedule's re-creation fire at once (the
+ * stamp reads as a missed run — SCHEDULES-GT-17), so removal deletes it.
+ */
+export function snapshotStampPath(id: string): string {
+  return `${systemdTimersStampDir()}/stamp-${timerUnitName(id)}`
 }
 
 // --- Cadence → OnCalendar ----------------------------------------------------
@@ -203,10 +222,21 @@ export async function writeScheduleUnits(
 }
 
 /**
- * Remove a schedule: stop+disable the timer, delete both unit files, reload
- * systemd. Deliberately touches NOTHING in ZFS/btrfs — the snapshots the schedule
+ * Remove a schedule: stop+disable the timer, delete both unit files AND the
+ * timer's Persistent stamp, reset the units' failed state, reload systemd.
+ * Deliberately touches NOTHING in ZFS/btrfs — the snapshots the schedule
  * created are left exactly as they are (deleting a schedule is not deleting its
  * snapshots).
+ *
+ * The stamp and the failed state are systemd's OWN bookkeeping about the
+ * schedule, and leaving either behind poisons the schedule's NEXT life: a
+ * leftover stamp makes the re-created timer fire immediately (`Persistent=true`
+ * reads the stamp as a missed run — SCHEDULES-GT-17), and a removed oneshot
+ * that failed stays in the failed state as a `not-found` ghost. Same shape as
+ * the task stores' `removeTaskUnits`: the stamp unlinked beside the unit
+ * files, and `systemctl reset-failed` issued as TWO calls (service, then
+ * timer), each with its exit IGNORED — a reset of nothing must never fail the
+ * removal.
  */
 export async function removeScheduleUnits(
   executor: CommandExecutor,
@@ -218,7 +248,11 @@ export async function removeScheduleUnits(
   await Promise.all([
     unlinkQuiet(join(dir, serviceUnitName(id))),
     unlinkQuiet(join(dir, timerUnitName(id))),
+    unlinkQuiet(snapshotStampPath(id)),
   ])
+  // Best-effort: not failed / already gone is exactly the goal state.
+  await executor.exec(SYSTEMCTL, ['reset-failed', serviceUnitName(id)]).catch(() => undefined)
+  await executor.exec(SYSTEMCTL, ['reset-failed', timerUnitName(id)]).catch(() => undefined)
   await runSystemctl(executor, ['daemon-reload'])
 }
 

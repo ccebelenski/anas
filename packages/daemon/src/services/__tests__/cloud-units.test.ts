@@ -26,6 +26,7 @@ import {
   timerUnitName,
   writeTaskUnits,
 } from '../cloud-units.js'
+import { withStampDir } from './stamp-dir.js'
 
 /**
  * The cloud sync unit store (rclone.2) — what is genuinely THIS store's: the
@@ -169,26 +170,40 @@ describe('cloud sync units (rclone.2)', () => {
 
   describe('the store is the files', () => {
     it('write → read → remove, and the timer is enabled to match', async () => {
-      const dir = await mkdtemp(join(tmpdir(), 'anas-cloudunits-'))
-      try {
-        const mock = systemctlMock()
-        await writeTaskUnits(mock, dir, TASK)
+      // The removal deletes systemd's Persistent stamp — the stamp dir MUST be
+      // pointed at a scratch dir first, or the unlink reaches the real
+      // /var/lib/systemd/timers (review D1: this test omitted the override).
+      await withStampDir(async (stampDir) => {
+        const dir = await mkdtemp(join(tmpdir(), 'anas-cloudunits-'))
+        try {
+          const mock = systemctlMock()
+          await writeTaskUnits(mock, dir, TASK)
+          await writeFile(join(stampDir, `stamp-${timerUnitName('offsite')}`), '')
+          // Another task's stamp — one removal must not reach past its own name.
+          await writeFile(join(stampDir, 'stamp-anas-cloud-other.timer'), '')
 
-        assert.equal(await taskFileExists(dir, 'offsite'), true)
-        assert.deepEqual(await readTask(dir, 'offsite'), TASK)
-        assert.deepEqual(await readAllTasks(dir), [TASK])
+          assert.equal(await taskFileExists(dir, 'offsite'), true)
+          assert.deepEqual(await readTask(dir, 'offsite'), TASK)
+          assert.deepEqual(await readAllTasks(dir), [TASK])
 
-        const argv = mock.calls.filter(c => c.command === SYSTEMCTL).map(c => c.args.join(' '))
-        assert.deepEqual(argv, ['daemon-reload', 'enable --now anas-cloud-offsite.timer'])
+          const argv = mock.calls.filter(c => c.command === SYSTEMCTL).map(c => c.args.join(' '))
+          assert.deepEqual(argv, ['daemon-reload', 'enable --now anas-cloud-offsite.timer'])
 
-        await removeTaskUnits(mock, dir, 'offsite')
-        assert.deepEqual(await readdir(dir), [])
-        assert.equal(await taskFileExists(dir, 'offsite'), false)
-        assert.equal(await readTask(dir, 'offsite'), null)
-      }
-      finally {
-        await rm(dir, { recursive: true, force: true })
-      }
+          await removeTaskUnits(mock, dir, 'offsite')
+          assert.deepEqual(await readdir(dir), [])
+          assert.equal(await taskFileExists(dir, 'offsite'), false)
+          assert.equal(await readTask(dir, 'offsite'), null)
+          assert.deepEqual(await readdir(stampDir), ['stamp-anas-cloud-other.timer'])
+          // The reset-failed goes out per unit (review R2), exits ignored.
+          const after = mock.calls.filter(c => c.command === SYSTEMCTL).map(c => c.args.join(' '))
+          assert.ok(after.includes(`reset-failed ${serviceUnitName('offsite')}`))
+          assert.ok(after.includes(`reset-failed ${timerUnitName('offsite')}`))
+          assert.ok(after.includes('daemon-reload'))
+        }
+        finally {
+          await rm(dir, { recursive: true, force: true })
+        }
+      })
     })
 
     it('a DISABLED task disables its timer instead of enabling it', async () => {

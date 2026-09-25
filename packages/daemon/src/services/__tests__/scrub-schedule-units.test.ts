@@ -20,6 +20,7 @@ import {
   scrubUnitsAreForeign,
   writeScrubUnits,
 } from '../scrub-schedule-units.js'
+import { useStampDir } from './stamp-dir.js'
 
 const SYSTEMCTL = '/usr/bin/systemctl'
 
@@ -86,20 +87,22 @@ describe('scrub schedule units — the unit files ARE the store', () => {
 describe('scrub schedule units — CRUD lifecycle (temp dir + mocked systemctl)', () => {
   let dir: string
   let stampDir: string
+  let restoreStampDir: () => void
   let mock: MockExecutor
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'anas-scrub-units-'))
     // The stamp path is computed per call from this env override, so the test
     // never touches the real /var/lib/systemd/timers — and it sits OUTSIDE the
-    // unit dir, whose contents the lifecycle tests assert on.
-    stampDir = await mkdtemp(join(tmpdir(), 'anas-scrub-stamp-'))
-    process.env.ANAS_TIMERS_STAMP_DIR = stampDir
+    // unit dir, whose contents the lifecycle tests assert on. The save/restore
+    // is the ONE shared helper (review D1 — the hand-copied dance is where the
+    // omission happened).
+    ;({ stampDir, restore: restoreStampDir } = await useStampDir())
     mock = new MockExecutor()
     mock.addFixture({ command: SYSTEMCTL, result: { stdout: '', stderr: '', exitCode: 0 } })
   })
   afterEach(async () => {
-    delete process.env.ANAS_TIMERS_STAMP_DIR
+    restoreStampDir()
     await rm(dir, { recursive: true, force: true })
     await rm(stampDir, { recursive: true, force: true })
   })
@@ -113,13 +116,22 @@ describe('scrub schedule units — CRUD lifecycle (temp dir + mocked systemctl)'
     assert.ok(cmds.includes(`enable --now ${SCRUB_TIMER_NAME}`))
   })
 
-  it('removeScrubUnits disables the timer, deletes both files, reloads', async () => {
+  it('removeScrubUnits disables the timer, deletes stamp + both files, resets failed, reloads', async () => {
+    // The stamp is systemd's own bookkeeping — a leftover one makes the next
+    // enable start the whole scrub immediately (review R10).
+    await writeFile(join(stampDir, `stamp-${SCRUB_TIMER_NAME}`), '')
+    await writeFile(join(stampDir, 'stamp-anas-scrub-untouched.timer'), '')
     await writeScrubUnits(mock, dir, schedule())
     await removeScrubUnits(mock, dir)
     assert.deepEqual(await readdir(dir), [])
+    assert.deepEqual(await readdir(stampDir), ['stamp-anas-scrub-untouched.timer'])
     const cmds = mock.calls.map(c => c.args.join(' '))
     assert.ok(cmds.includes(`disable --now ${SCRUB_TIMER_NAME}`))
     assert.equal(cmds.filter(c => c === 'daemon-reload').length, 2)
+    // The failed-state ghost goes too (review R2, the task stores' shape):
+    // one reset-failed per unit, each exit ignored.
+    assert.ok(cmds.includes(`reset-failed ${SCRUB_SERVICE_NAME}`))
+    assert.ok(cmds.includes(`reset-failed ${SCRUB_TIMER_NAME}`))
   })
 
   it('writeScrubUnits throws on a systemctl failure so the mutation surfaces it', async () => {

@@ -18,9 +18,11 @@ import {
   renderTimerUnit,
   scheduleFileExists,
   serviceUnitName,
+  snapshotStampPath,
   timerUnitName,
   writeScheduleUnits,
 } from '../snapshot-schedule-units.js'
+import { withStampDir } from './stamp-dir.js'
 
 const SYSTEMCTL = '/usr/bin/systemctl'
 
@@ -125,13 +127,30 @@ describe('snapshot schedule units — CRUD lifecycle (temp dir + mocked systemct
     assert.ok(!cmds.some(c => c.startsWith('enable ')))
   })
 
-  it('removeScheduleUnits deletes both files, disables the timer, leaves others', async () => {
-    await writeScheduleUnits(mock, dir, makeSchedule())
-    await writeFile(join(dir, 'keep.txt'), 'x')
-    assert.equal(await scheduleFileExists(dir, 'nightly-tank-media'), true)
-    await removeScheduleUnits(mock, dir, 'nightly-tank-media')
-    assert.deepEqual(await readdir(dir), ['keep.txt'])
-    assert.equal(await scheduleFileExists(dir, 'nightly-tank-media'), false)
+  it('removeScheduleUnits deletes both files, the stamp, resets failed; leaves others', async () => {
+    // SCHEDULES-GT-17 (review D2): the store renders `Persistent=true`, so a
+    // leftover stamp makes the schedule's re-creation fire at once — the stamp
+    // and the failed-state ghost go down with the units, exactly like the task
+    // stores' removal.
+    await withStampDir(async (stampDir) => {
+      await writeScheduleUnits(mock, dir, makeSchedule())
+      await writeFile(join(stampDir, `stamp-${timerUnitName('nightly-tank-media')}`), '')
+      // Another schedule's stamp — one removal must not reach past its own id.
+      await writeFile(join(stampDir, 'stamp-anas-snap-other.timer'), '')
+      await writeFile(join(dir, 'keep.txt'), 'x')
+      assert.equal(await scheduleFileExists(dir, 'nightly-tank-media'), true)
+      await removeScheduleUnits(mock, dir, 'nightly-tank-media')
+      assert.deepEqual(await readdir(dir), ['keep.txt'])
+      assert.deepEqual(await readdir(stampDir), ['stamp-anas-snap-other.timer'])
+      assert.equal(snapshotStampPath('nightly-tank-media'), `${stampDir}/stamp-${timerUnitName('nightly-tank-media')}`)
+      const cmds = mock.calls.map(c => c.args.join(' '))
+      assert.ok(cmds.includes(`disable --now ${timerUnitName('nightly-tank-media')}`))
+      // ONE unit per reset-failed call (review R2) — service, then timer.
+      assert.ok(cmds.includes(`reset-failed ${serviceUnitName('nightly-tank-media')}`))
+      assert.ok(cmds.includes(`reset-failed ${timerUnitName('nightly-tank-media')}`))
+      assert.ok(cmds.includes('daemon-reload'))
+      assert.equal(await scheduleFileExists(dir, 'nightly-tank-media'), false)
+    })
   })
 
   it('readAllSchedules parses valid units and skips invalid ones (fail-open)', async () => {

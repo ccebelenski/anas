@@ -9,7 +9,7 @@ import { deriveRunResult, parseShow, parseSystemdTimestamp } from './systemd-sta
 // The unit-store plumbing (marker regex, unlink, systemctl, unit-dir listing)
 // is the ONE shared copy in systemd-unit-store.ts — this store was its fourth
 // hand-copy and its last private leftovers (third pass).
-import { listServiceUnits, markerRegex, readUnitFile, runSystemctl, unlinkQuiet } from './systemd-unit-store.js'
+import { listServiceUnits, markerRegex, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
 
 /**
  * Recurring replication TASKS (Epic 5.5.3) — the systemd units ARE the store.
@@ -36,6 +36,13 @@ const ZFS = '/usr/sbin/zfs'
 const RUNNER_NODE = '/usr/bin/node'
 const RUNNER_SCRIPT = '/opt/anas/packages/daemon/dist/replicate-task.js'
 const UNIT_PREFIX = 'anas-repl-'
+/**
+ * This store's unit-name prefix, exported for the boot sweep of orphan timer
+ * stamps ({@link sweepOrphanTaskStamps} takes bare prefixes too). Same constant
+ * as `UNIT_PREFIX` — one home, two names, because the sweep needs the prefix
+ * and nothing else about this store.
+ */
+export const REPLICATION_UNIT_PREFIX = UNIT_PREFIX
 /** The service-file line that carries the canonical task JSON (as a comment). */
 const TASK_MARKER = 'X-ANAS-Task='
 const WHITESPACE_RE = /\s/
@@ -49,6 +56,17 @@ export function serviceUnitName(name: string): string {
 }
 export function timerUnitName(name: string): string {
   return `${UNIT_PREFIX}${name}.timer`
+}
+
+/**
+ * Where systemd records a Persistent timer's last fire for ONE task: the
+ * timers stamp dir (shared {@link systemdTimersStampDir}) + `stamp-<timer>` —
+ * e.g. `/var/lib/systemd/timers/stamp-anas-repl-<name>.timer`. A stamp a
+ * removed task leaves behind makes the task's re-creation fire at once (the
+ * stamp reads as a missed run — SCHEDULES-GT-17), so removal deletes it.
+ */
+export function replicationStampPath(name: string): string {
+  return `${systemdTimersStampDir()}/stamp-${timerUnitName(name)}`
 }
 
 // --- Runner argv -------------------------------------------------------------
@@ -280,9 +298,19 @@ export async function writeTaskUnits(
 }
 
 /**
- * Remove a task: stop+disable the timer, delete both unit files, reload systemd.
+ * Remove a task: stop+disable the timer, delete both unit files AND the
+ * timer's Persistent stamp, reset the units' failed state, reload systemd.
  * Deliberately touches NOTHING in ZFS — data, snapshots and `anas-repl` holds
  * are left exactly as they are (deleting a schedule is not deleting a backup).
+ *
+ * The stamp and the failed state are systemd's OWN bookkeeping about the task,
+ * and leaving either behind poisons the task's NEXT life: a leftover stamp
+ * makes the re-created timer fire immediately (`Persistent=true` reads the
+ * stamp as a missed run — SCHEDULES-GT-17), and a removed oneshot that failed
+ * stays in the failed state as a `not-found` ghost. Same shape as the task
+ * stores' `removeTaskUnits`: the stamp unlinked beside the unit files, and
+ * `systemctl reset-failed` issued as TWO calls (service, then timer), each
+ * with its exit IGNORED — a reset of nothing must never fail the removal.
  */
 export async function removeTaskUnits(
   executor: CommandExecutor,
@@ -294,7 +322,11 @@ export async function removeTaskUnits(
   await Promise.all([
     unlinkQuiet(join(dir, serviceUnitName(name))),
     unlinkQuiet(join(dir, timerUnitName(name))),
+    unlinkQuiet(replicationStampPath(name)),
   ])
+  // Best-effort: not failed / already gone is exactly the goal state.
+  await executor.exec(SYSTEMCTL, ['reset-failed', serviceUnitName(name)]).catch(() => undefined)
+  await executor.exec(SYSTEMCTL, ['reset-failed', timerUnitName(name)]).catch(() => undefined)
   await runSystemctl(executor, ['daemon-reload'])
 }
 

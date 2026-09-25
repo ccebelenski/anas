@@ -9,8 +9,9 @@ import { BACKUP_UNIT_KIND } from './services/backup-units.js'
 import { CLOUD_UNIT_KIND } from './services/cloud-units.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
 import { PROBE_TMP_BASE, sweepStaleProbeDirs } from './services/rclone-probe.js'
+import { REPLICATION_UNIT_PREFIX } from './services/replication-units.js'
 import { reconcileSelfhealState, reconcileWasQuiet } from './services/selfheal-reconcile.js'
-import { DEFAULT_SYSTEMD_DIR } from './services/snapshot-schedule-units.js'
+import { DEFAULT_SYSTEMD_DIR, SNAPSHOT_UNIT_PREFIX } from './services/snapshot-schedule-units.js'
 import { sweepOrphanTaskStamps } from './services/task-units.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
@@ -131,16 +132,22 @@ async function main() {
         server.log.warn(`rclone probe sweep failed: ${err instanceof Error ? err.message : String(err)}`)
       })
 
-      // Orphan task stamps (SCHEDULES-GT-17/18, operator ruling 2026-09-25): a
-      // removed backup/cloud task used to leave systemd's Persistent stamp
-      // behind, and re-creating a task under that name fired at once — the
-      // stamp read as a missed run. removeTaskUnits deletes the stamp now; this
-      // sweep clears the orphans already on a node (GT-18 counted 30-odd).
-      // Exact prefixes from the two stores' descriptors, any age — the units
-      // are gone, nothing of ours is in flight at start, and a stamp whose
-      // units still exist is the missed-run heal and stays. Non-blocking,
-      // fail-open.
-      void sweepOrphanTaskStamps([BACKUP_UNIT_KIND, CLOUD_UNIT_KIND]).then((swept) => {
+      // Orphan timer stamps (SCHEDULES-GT-17/18, operator ruling 2026-09-25):
+      // a removed task/schedule used to leave systemd's Persistent stamp
+      // behind, and re-creating one under that name fired at once — the stamp
+      // read as a missed run. Every store's removal deletes its stamp now
+      // (backup/cloud since 63532c8, replication/snapshot since this fix);
+      // this sweep clears the orphans already on a node (GT-18 counted 30-odd)
+      // for ALL our unit-store prefixes. Exact prefixes from the stores' own
+      // constants, never literals; a stamp whose task still exists is the
+      // missed-run heal and stays, and a stamp written during this boot is
+      // skipped (possibly a create in flight). Non-blocking, fail-open.
+      void sweepOrphanTaskStamps([
+        BACKUP_UNIT_KIND,
+        CLOUD_UNIT_KIND,
+        { prefix: REPLICATION_UNIT_PREFIX },
+        { prefix: SNAPSHOT_UNIT_PREFIX },
+      ]).then((swept) => {
         for (const file of swept)
           server.log.info(`task stamp sweep: removed orphan stamp ${file} — its task no longer exists`)
       }).catch((err) => {

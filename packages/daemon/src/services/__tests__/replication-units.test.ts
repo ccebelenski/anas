@@ -15,11 +15,13 @@ import {
   removeTaskUnits,
   renderServiceUnit,
   renderTimerUnit,
+  replicationStampPath,
   serviceUnitName,
   timerUnitName,
   validateSchedule,
   writeTaskUnits,
 } from '../replication-units.js'
+import { withStampDir } from './stamp-dir.js'
 
 const SYSTEMCTL = '/usr/bin/systemctl'
 const SYSTEMD_ANALYZE = '/usr/bin/systemd-analyze'
@@ -233,16 +235,31 @@ describe('replication units (Epic 5.5.3 — units are the store)', () => {
       assert.ok(!cmds.some(c => c.startsWith('enable ')))
     })
 
-    it('removeTaskUnits deletes both files and disables the timer; leaves nothing else', async () => {
-      const task = makeTask()
-      await writeTaskUnits(mock, dir, task)
-      // A stray unrelated file must survive removal.
-      await writeFile(join(dir, 'keep.txt'), 'x')
-      await removeTaskUnits(mock, dir, task.name)
+    it('removeTaskUnits deletes both files, the stamp, resets failed; leaves nothing else', async () => {
+      // SCHEDULES-GT-17 (review D2): the store renders `Persistent=true`, so a
+      // leftover stamp makes the task's re-creation fire at once — the stamp
+      // and the failed-state ghost go down with the units, exactly like the
+      // task stores' removal.
+      await withStampDir(async (stampDir) => {
+        const task = makeTask()
+        await writeTaskUnits(mock, dir, task)
+        await writeFile(join(stampDir, `stamp-${timerUnitName(task.name)}`), '')
+        // Another task's stamp — one removal must not reach past its own name.
+        await writeFile(join(stampDir, 'stamp-anas-repl-other.timer'), '')
+        // A stray unrelated file must survive removal.
+        await writeFile(join(dir, 'keep.txt'), 'x')
+        await removeTaskUnits(mock, dir, task.name)
 
-      assert.deepEqual(await readdir(dir), ['keep.txt'])
-      const cmds = mock.calls.map(c => c.args.join(' '))
-      assert.ok(cmds.includes(`disable --now ${timerUnitName(task.name)}`))
+        assert.deepEqual(await readdir(dir), ['keep.txt'])
+        assert.deepEqual(await readdir(stampDir), ['stamp-anas-repl-other.timer'])
+        assert.equal(replicationStampPath(task.name), `${stampDir}/stamp-${timerUnitName(task.name)}`)
+        const cmds = mock.calls.map(c => c.args.join(' '))
+        assert.ok(cmds.includes(`disable --now ${timerUnitName(task.name)}`))
+        // ONE unit per reset-failed call (review R2) — service, then timer.
+        assert.ok(cmds.includes(`reset-failed ${serviceUnitName(task.name)}`))
+        assert.ok(cmds.includes(`reset-failed ${timerUnitName(task.name)}`))
+        assert.ok(cmds.includes('daemon-reload'))
+      })
     })
 
     it('readAllTasks parses valid units and skips invalid ones (fail-open)', async () => {

@@ -2,7 +2,7 @@ import type { TaskCadence } from '@anas/shared'
 import type { ExecResult } from '../../executor/types.js'
 import type { TaskStatusSubject, TaskUnitKind } from '../task-units.js'
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -36,6 +36,7 @@ import {
   timerUnitName,
   validateSchedule,
 } from '../task-units.js'
+import { withStampDir } from './stamp-dir.js'
 
 /**
  * The extracted task-unit generics, exercised under a SECOND descriptor
@@ -660,109 +661,141 @@ describe('task units — dashboard warnings in the kind\'s own category', () => 
 
 describe('task units — the store plumbing that is prefix-only', () => {
   it('taskFileExists / readUnitTexts / removeTaskUnits work off the cloud names', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
-    try {
-      const mock = new MockExecutor()
-      mock.addFixture({ command: SYSTEMCTL, result: ok('') })
-      await writeFile(join(dir, SERVICE), '[Unit]\nDescription=ANAS cloud sync task offsite\n')
-      await writeFile(join(dir, TIMER), '[Timer]\nOnCalendar=Tue 02:00\n')
-      await writeFile(join(dir, 'keep.txt'), 'x')
+    // The removal deletes the timer's Persistent stamp — the stamp dir MUST be
+    // pointed at a scratch dir first, or the unlink reaches the real
+    // /var/lib/systemd/timers (review D1: this test omitted the override).
+    await withStampDir(async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+      try {
+        const mock = new MockExecutor()
+        mock.addFixture({ command: SYSTEMCTL, result: ok('') })
+        await writeFile(join(dir, SERVICE), '[Unit]\nDescription=ANAS cloud sync task offsite\n')
+        await writeFile(join(dir, TIMER), '[Timer]\nOnCalendar=Tue 02:00\n')
+        await writeFile(join(dir, 'keep.txt'), 'x')
 
-      assert.equal(await taskFileExists(CLOUD_UNIT_KIND, dir, TASK), true)
-      assert.equal(await taskFileExists(CLOUD_UNIT_KIND, dir, 'absent'), false)
-      // Backup's descriptor does not see the cloud store's files.
-      assert.equal(await taskFileExists(BACKUP_UNIT_KIND, dir, TASK), false)
+        assert.equal(await taskFileExists(CLOUD_UNIT_KIND, dir, TASK), true)
+        assert.equal(await taskFileExists(CLOUD_UNIT_KIND, dir, 'absent'), false)
+        // Backup's descriptor does not see the cloud store's files.
+        assert.equal(await taskFileExists(BACKUP_UNIT_KIND, dir, TASK), false)
 
-      const texts = await readUnitTexts(CLOUD_UNIT_KIND, dir, TASK)
-      assert.match(texts.unit, /cloud sync task offsite/)
-      assert.match(texts.timer, /OnCalendar=Tue 02:00/)
-      assert.deepEqual(await readUnitTexts(CLOUD_UNIT_KIND, dir, 'absent'), { unit: '', timer: '' })
+        const texts = await readUnitTexts(CLOUD_UNIT_KIND, dir, TASK)
+        assert.match(texts.unit, /cloud sync task offsite/)
+        assert.match(texts.timer, /OnCalendar=Tue 02:00/)
+        assert.deepEqual(await readUnitTexts(CLOUD_UNIT_KIND, dir, 'absent'), { unit: '', timer: '' })
 
-      await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
-      assert.deepEqual(await readdir(dir), ['keep.txt'])
-      const cmds = mock.calls.map(c => c.args.join(' '))
-      assert.ok(cmds.includes(`disable --now ${TIMER}`))
-      assert.ok(cmds.includes('daemon-reload'))
-    }
-    finally {
-      await rm(dir, { recursive: true, force: true })
-    }
+        await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
+        assert.deepEqual(await readdir(dir), ['keep.txt'])
+        const cmds = mock.calls.map(c => c.args.join(' '))
+        assert.ok(cmds.includes(`disable --now ${TIMER}`))
+        assert.ok(cmds.includes('daemon-reload'))
+      }
+      finally {
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
   })
 
   // SCHEDULES-GT-17/18 (operator ruling 2026-09-25): the removal must take
   // systemd's own bookkeeping down with the units — the Persistent stamp (its
   // leftover makes a re-created task fire at once) and the failed-state ghost.
-  it('removeTaskUnits deletes the stamp beside the units and issues reset-failed', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
-    const stampDir = await mkdtemp(join(tmpdir(), 'anas-task-stamps-'))
-    const savedStampDir = process.env.ANAS_TIMERS_STAMP_DIR
-    process.env.ANAS_TIMERS_STAMP_DIR = stampDir
-    try {
-      const mock = new MockExecutor()
-      mock.addFixture({ command: SYSTEMCTL, result: ok('') })
-      await writeFile(join(dir, SERVICE), '[Unit]\n')
-      await writeFile(join(dir, TIMER), '[Timer]\n')
-      await writeFile(join(stampDir, `stamp-${TIMER}`), '')
-      // Another task's stamp — one removal must not reach past its own name.
-      await writeFile(join(stampDir, 'stamp-anas-cloud-other.timer'), '')
+  it('removeTaskUnits deletes the stamp beside the units and issues reset-failed for both units', async () => {
+    await withStampDir(async (stampDir) => {
+      const dir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+      try {
+        const mock = new MockExecutor()
+        mock.addFixture({ command: SYSTEMCTL, result: ok('') })
+        await writeFile(join(dir, SERVICE), '[Unit]\n')
+        await writeFile(join(dir, TIMER), '[Timer]\n')
+        await writeFile(join(stampDir, `stamp-${TIMER}`), '')
+        // Another task's stamp — one removal must not reach past its own name.
+        await writeFile(join(stampDir, 'stamp-anas-cloud-other.timer'), '')
 
-      await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
+        await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
 
-      assert.deepEqual(await readdir(stampDir), ['stamp-anas-cloud-other.timer'])
-      assert.equal(taskStampPath(CLOUD_UNIT_KIND, TASK), `${stampDir}/stamp-${TIMER}`)
-      const cmds = mock.calls.map(c => c.args.join(' '))
-      assert.ok(cmds.includes(`reset-failed ${SERVICE} ${TIMER}`))
-      // The argv sequence, in order: disable, reset-failed (both tolerated
-      // failures), then the reload.
-      assert.deepEqual(
-        mock.calls.filter(c => c.command === SYSTEMCTL).map(c => c.args[0]),
-        ['disable', 'reset-failed', 'daemon-reload'],
-      )
-    }
-    finally {
-      if (savedStampDir === undefined)
-        delete process.env.ANAS_TIMERS_STAMP_DIR
-      else
-        process.env.ANAS_TIMERS_STAMP_DIR = savedStampDir
-      await rm(dir, { recursive: true, force: true })
-      await rm(stampDir, { recursive: true, force: true })
-    }
+        assert.deepEqual(await readdir(stampDir), ['stamp-anas-cloud-other.timer'])
+        assert.equal(taskStampPath(CLOUD_UNIT_KIND, TASK), `${stampDir}/stamp-${TIMER}`)
+        const cmds = mock.calls.map(c => c.args.join(' '))
+        // ONE unit per call (review R2): a not-loaded unit must not be able to
+        // short-circuit the other's reset in one combined argv.
+        assert.ok(cmds.includes(`reset-failed ${SERVICE}`))
+        assert.ok(cmds.includes(`reset-failed ${TIMER}`))
+        // No combined reset-failed: every reset call names exactly ONE unit.
+        assert.ok(!mock.calls.some(c => c.args[0] === 'reset-failed' && c.args.length > 2))
+        // The argv sequence, in order: disable, the two reset-failed (both
+        // tolerated failures), then the reload.
+        assert.deepEqual(
+          mock.calls.filter(c => c.command === SYSTEMCTL).map(c => c.args[0]),
+          ['disable', 'reset-failed', 'reset-failed', 'daemon-reload'],
+        )
+      }
+      finally {
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
+  })
+
+  // Review D1: the removal's stamp unlink goes ONLY where the env points. A
+  // file planted in a second dir — the shape the real /var/lib/systemd/timers
+  // would take if the env were missing — must survive untouched.
+  it('removeTaskUnits never touches a path outside the env-provided stamp dir', async () => {
+    await withStampDir(async (stampDir) => {
+      const dir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+      const elsewhere = await mkdtemp(join(tmpdir(), 'anas-elsewhere-stamps-'))
+      try {
+        const mock = new MockExecutor()
+        mock.addFixture({ command: SYSTEMCTL, result: ok('') })
+        await writeFile(join(dir, SERVICE), '[Unit]\n')
+        await writeFile(join(dir, TIMER), '[Timer]\n')
+        // The exact stamp name this removal WOULD delete, planted one dir over.
+        const planted = join(elsewhere, `stamp-${TIMER}`)
+        await writeFile(planted, '')
+
+        await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
+
+        assert.equal(await readFile(planted, 'utf-8'), '', 'the planted file outside the env dir survives')
+        assert.deepEqual(await readdir(stampDir), [], 'the env-provided dir takes the delete')
+        assert.equal(process.env.ANAS_TIMERS_STAMP_DIR, stampDir, 'the env was restored to the scratch dir, not unset')
+      }
+      finally {
+        await rm(dir, { recursive: true, force: true })
+        await rm(elsewhere, { recursive: true, force: true })
+      }
+    })
   })
 
   it('removeTaskUnits tolerates nothing-to-remove: absent units, absent stamp, reset-failed nonzero', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
-    const stampDir = await mkdtemp(join(tmpdir(), 'anas-task-stamps-'))
-    const savedStampDir = process.env.ANAS_TIMERS_STAMP_DIR
-    process.env.ANAS_TIMERS_STAMP_DIR = stampDir
-    try {
-      const mock = new MockExecutor()
-      // disable/reset-failed exit nonzero (unit already gone / not failed);
-      // daemon-reload must still run and the whole removal must not throw.
-      mock.addFixture({
-        command: SYSTEMCTL,
-        args: ['disable', '--now', TIMER],
-        result: { stdout: '', stderr: 'Failed to disable unit', exitCode: 1 },
-      })
-      mock.addFixture({
-        command: SYSTEMCTL,
-        args: ['reset-failed', SERVICE, TIMER],
-        result: { stdout: '', stderr: '', exitCode: 1 },
-      })
-      mock.addFixture({ command: SYSTEMCTL, args: ['daemon-reload'], result: ok('') })
+    await withStampDir(async (stampDir) => {
+      const dir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+      try {
+        const mock = new MockExecutor()
+        // disable/reset-failed exit nonzero (unit already gone / not failed);
+        // daemon-reload must still run and the whole removal must not throw.
+        mock.addFixture({
+          command: SYSTEMCTL,
+          args: ['disable', '--now', TIMER],
+          result: { stdout: '', stderr: 'Failed to disable unit', exitCode: 1 },
+        })
+        mock.addFixture({
+          command: SYSTEMCTL,
+          args: ['reset-failed', SERVICE],
+          result: { stdout: '', stderr: '', exitCode: 1 },
+        })
+        mock.addFixture({
+          command: SYSTEMCTL,
+          args: ['reset-failed', TIMER],
+          result: { stdout: '', stderr: '', exitCode: 1 },
+        })
+        mock.addFixture({ command: SYSTEMCTL, args: ['daemon-reload'], result: ok('') })
 
-      await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
-      assert.deepEqual(await readdir(dir), [])
-      assert.deepEqual(await readdir(stampDir), [])
-      assert.ok(mock.calls.some(c => c.args[0] === 'daemon-reload'))
-    }
-    finally {
-      if (savedStampDir === undefined)
-        delete process.env.ANAS_TIMERS_STAMP_DIR
-      else
-        process.env.ANAS_TIMERS_STAMP_DIR = savedStampDir
-      await rm(dir, { recursive: true, force: true })
-      await rm(stampDir, { recursive: true, force: true })
-    }
+        await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
+        assert.deepEqual(await readdir(dir), [])
+        assert.deepEqual(await readdir(stampDir), [])
+        assert.ok(mock.calls.some(c => c.args[0] === 'daemon-reload'))
+      }
+      finally {
+        await rm(dir, { recursive: true, force: true })
+      }
+    })
   })
 
   it('validateSchedule asks systemd, and surfaces its stderr', async () => {
@@ -797,6 +830,14 @@ describe('task units — the store plumbing that is prefix-only', () => {
 })
 
 describe('task units — the boot sweep of orphan task stamps (SCHEDULES-GT-18)', () => {
+  /**
+   * The `startedAt` the sweep tests pass: the test stamps are written "now",
+   * so the fake process start sits a minute AHEAD of them, making every
+   * fixture stamp count as pre-boot (the real daemon's start is in the past,
+   * and real orphan stamps are older still).
+   */
+  const startedAfterFixtures = (): number => Date.now() + 60_000
+
   /** A stamp dir + unit dir with the sweep's whole decision table laid out. */
   async function sweepFixture(): Promise<{ unitDir: string, stampDir: string }> {
     const unitDir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
@@ -804,16 +845,25 @@ describe('task units — the boot sweep of orphan task stamps (SCHEDULES-GT-18)'
     // A live task: both units exist → its stamp is the missed-run heal. KEPT.
     await writeFile(join(unitDir, 'anas-backup-live.service'), '[Unit]\n')
     await writeFile(join(unitDir, 'anas-backup-live.timer'), '[Timer]\n')
-    // A half-removed remnant (service only): conservative ground — KEPT.
+    // A half-removed remnant (service only): the .service is the store's own
+    // existence test, so its task still exists — KEPT (review R3).
     await writeFile(join(unitDir, 'anas-backup-halftaken.service'), '[Unit]\n')
-    // Orphans of ours: both units gone → swept.
+    // The other remnant shape: timer file only, NO .service → SWEPT (R3).
+    await writeFile(join(unitDir, 'anas-backup-timeronly.timer'), '[Timer]\n')
+    // Orphans of ours: no units → swept.
     await writeFile(join(stampDir, 'stamp-anas-cloud-orphan.timer'), '')
     await writeFile(join(stampDir, 'stamp-anas-backup-gone.timer'), '')
+    await writeFile(join(stampDir, 'stamp-anas-backup-timeronly.timer'), '')
     // A stamp whose units still exist, either flavour. KEPT.
     await writeFile(join(stampDir, 'stamp-anas-backup-live.timer'), '')
     await writeFile(join(stampDir, 'stamp-anas-backup-halftaken.timer'), '')
-    // Another store's stamp (the scrub pair is not a task kind). KEPT.
+    // Another store's stamp (the scrub pair is not a unit store passed here). KEPT.
     await writeFile(join(stampDir, 'stamp-anas-scrub.timer'), '')
+    // Near-miss pins (review N1): one dash or one character off our prefix.
+    // If the prefix match ever loses its trailing dash, these get swept and
+    // this fixture fails — that is the point.
+    await writeFile(join(stampDir, 'stamp-anas-backupX.timer'), '')
+    await writeFile(join(stampDir, 'stamp-anas-backup.timer'), '')
     // Foreign stamps and noise. KEPT.
     await writeFile(join(stampDir, 'stamp-someone-elses.timer'), '')
     await writeFile(join(stampDir, 'stamp-ana-backupx.timer'), '')
@@ -821,15 +871,25 @@ describe('task units — the boot sweep of orphan task stamps (SCHEDULES-GT-18)'
     return { unitDir, stampDir }
   }
 
-  it('sweeps exactly the stamps of OUR kinds whose units are both gone', async () => {
+  it('sweeps exactly the stamps of OUR kinds whose .service unit is absent', async () => {
     const { unitDir, stampDir } = await sweepFixture()
     try {
-      const swept = await sweepOrphanTaskStamps([BACKUP_UNIT_KIND, CLOUD_UNIT_KIND], unitDir, stampDir)
-      assert.deepEqual(swept.sort(), ['stamp-anas-backup-gone.timer', 'stamp-anas-cloud-orphan.timer'])
+      const swept = await sweepOrphanTaskStamps(
+        [BACKUP_UNIT_KIND, CLOUD_UNIT_KIND],
+        unitDir,
+        stampDir,
+        startedAfterFixtures(),
+      )
+      assert.deepEqual(
+        swept.sort(),
+        ['stamp-anas-backup-gone.timer', 'stamp-anas-backup-timeronly.timer', 'stamp-anas-cloud-orphan.timer'],
+      )
       const left = await readdir(stampDir)
       assert.ok(left.includes('stamp-anas-backup-live.timer'), 'a live task\'s stamp stays')
-      assert.ok(left.includes('stamp-anas-backup-halftaken.timer'), 'a half-removed task\'s stamp stays')
-      assert.ok(left.includes('stamp-anas-scrub.timer'), 'the scrub store\'s stamp is not a task kind\'s')
+      assert.ok(left.includes('stamp-anas-backup-halftaken.timer'), 'a service-only remnant\'s stamp stays')
+      assert.ok(left.includes('stamp-anas-scrub.timer'), 'the scrub store\'s stamp is not a passed store\'s')
+      assert.ok(left.includes('stamp-anas-backupX.timer'), 'a near-miss name (X, no dash) stays')
+      assert.ok(left.includes('stamp-anas-backup.timer'), 'a near-miss name (no trailing dash) stays')
       assert.ok(left.includes('stamp-someone-elses.timer'), 'foreign stamps stay')
       assert.ok(left.includes('stamp-ana-backupx.timer'), 'a near-miss name that is not under a prefix stays')
       assert.ok(left.includes('unrelated.txt'))
@@ -844,9 +904,58 @@ describe('task units — the boot sweep of orphan task stamps (SCHEDULES-GT-18)'
     const { unitDir, stampDir } = await sweepFixture()
     try {
       // Backup alone: the cloud orphan is not this call's business.
-      const swept = await sweepOrphanTaskStamps([BACKUP_UNIT_KIND], unitDir, stampDir)
-      assert.deepEqual(swept, ['stamp-anas-backup-gone.timer'])
+      const swept = await sweepOrphanTaskStamps([BACKUP_UNIT_KIND], unitDir, stampDir, startedAfterFixtures())
+      assert.deepEqual(swept.sort(), ['stamp-anas-backup-gone.timer', 'stamp-anas-backup-timeronly.timer'])
       assert.ok((await readdir(stampDir)).includes('stamp-anas-cloud-orphan.timer'))
+    }
+    finally {
+      await rm(unitDir, { recursive: true, force: true })
+      await rm(stampDir, { recursive: true, force: true })
+    }
+  })
+
+  // Review D2: the replication and snapshot-schedule stores have no task-kind
+  // descriptor — the sweep takes their bare prefix constants and cleans their
+  // orphans the same way.
+  it('bare prefix sources sweep the replication and snapshot stores\' orphans too', async () => {
+    const unitDir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+    const stampDir = await mkdtemp(join(tmpdir(), 'anas-task-stamps-'))
+    try {
+      // A live replication task: its .service lists → its stamp stays.
+      await writeFile(join(unitDir, 'anas-repl-live.service'), '[Unit]\n')
+      await writeFile(join(stampDir, 'stamp-anas-repl-gone.timer'), '')
+      await writeFile(join(stampDir, 'stamp-anas-snap-gone.timer'), '')
+      await writeFile(join(stampDir, 'stamp-anas-repl-live.timer'), '')
+
+      const swept = await sweepOrphanTaskStamps(
+        [{ prefix: 'anas-repl-' }, { prefix: 'anas-snap-' }],
+        unitDir,
+        stampDir,
+        startedAfterFixtures(),
+      )
+      assert.deepEqual(swept.sort(), ['stamp-anas-repl-gone.timer', 'stamp-anas-snap-gone.timer'])
+      assert.ok((await readdir(stampDir)).includes('stamp-anas-repl-live.timer'))
+    }
+    finally {
+      await rm(unitDir, { recursive: true, force: true })
+      await rm(stampDir, { recursive: true, force: true })
+    }
+  })
+
+  // Review R1: the sweep reads the listing, then unlinks a beat later. A task
+  // created inside that window writes its stamp at `enable --now` — deleting
+  // it would hand a fresh task the immediate-fire the removal exists to
+  // prevent. So a stamp at or after the process start is never ours.
+  it('a stamp fresher than the process start is skipped, never swept', async () => {
+    const unitDir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+    const stampDir = await mkdtemp(join(tmpdir(), 'anas-task-stamps-'))
+    try {
+      const fresh = join(stampDir, 'stamp-anas-cloud-inflight.timer')
+      await writeFile(fresh, '')
+      const { mtimeMs } = await stat(fresh)
+      const swept = await sweepOrphanTaskStamps([CLOUD_UNIT_KIND], unitDir, stampDir, mtimeMs)
+      assert.deepEqual(swept, [])
+      assert.equal(await readFile(fresh, 'utf-8'), '', 'the fresh stamp survives')
     }
     finally {
       await rm(unitDir, { recursive: true, force: true })
@@ -866,6 +975,24 @@ describe('task units — the boot sweep of orphan task stamps (SCHEDULES-GT-18)'
     }
     finally {
       await rm(unitDir, { recursive: true, force: true })
+    }
+  })
+
+  // Review N2: an unreadable UNIT dir must never read as an empty store —
+  // that would declare every task gone and widen the delete.
+  it('an unreadable unit dir throws rather than sweeping everything', async () => {
+    const unitDir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+    const stampDir = await mkdtemp(join(tmpdir(), 'anas-task-stamps-'))
+    try {
+      await writeFile(join(stampDir, 'stamp-anas-cloud-orphan.timer'), '')
+      const notADir = join(unitDir, 'plain-file')
+      await writeFile(notADir, 'x')
+      await assert.rejects(sweepOrphanTaskStamps([CLOUD_UNIT_KIND], notADir, stampDir, startedAfterFixtures()))
+      assert.ok((await readdir(stampDir)).includes('stamp-anas-cloud-orphan.timer'), 'nothing swept on the error path')
+    }
+    finally {
+      await rm(unitDir, { recursive: true, force: true })
+      await rm(stampDir, { recursive: true, force: true })
     }
   })
 })

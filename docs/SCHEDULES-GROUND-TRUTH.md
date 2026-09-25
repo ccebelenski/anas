@@ -574,14 +574,24 @@ units and no `anas-backup-*` ZFS snapshots remained on the node.
 
 ### Remedy (operator ruling 2026-09-25)
 
-Remedy 1, the delete half: `removeTaskUnits` now deletes the stamp alongside the
-units and issues `systemctl reset-failed` for the pair (the scrub store's
-pattern — a removed oneshot that failed otherwise stays behind as a
-`not-found` ghost), while the missed-run heal for a task that still exists is
-left exactly as systemd built it. The orphans already on a node (GT-18 counted
-30-odd) are swept at daemon start: every `stamp-anas-backup-*` /
-`stamp-anas-cloud-*` file in the timers dir whose service AND timer units no
-longer exist is deleted, one journald line each; a stamp whose units exist, a
-foreign `stamp-*.timer`, and the scrub pair are never touched. The two
-integration specs keep their GT-21 absolute-date schedules — the product now
-removes the stamp itself, so the dates are belt and braces for pre-fix nodes.
+Remedy 1, the delete half: `removeTaskUnits` deletes the stamp alongside the
+units — the scrub store's pattern (its review R10) — and issues
+`systemctl reset-failed` for the service and the timer as TWO calls with their
+exits ignored: a removed oneshot that failed otherwise stays behind as a
+`not-found` ghost, but the reset itself is NEW here (a one-argv reset-failed
+was unproven against real systemd, and the scrub store never issued one until
+it gained the same pair — attribution corrected, review R2). The missed-run
+heal for a task that still exists is left exactly as systemd built it. The
+replication and snapshot-schedule stores — both render `Persistent=true`, both
+take re-usable names — got the same removal treatment, and the orphans already
+on a node (GT-18 counted 30-odd) are swept at daemon start for ALL the unit
+stores' prefixes: every `stamp-anas-backup-*` / `stamp-anas-cloud-*` /
+`stamp-anas-repl-*` / `stamp-anas-snap-*` file in the timers dir whose
+`.service` unit no longer exists is deleted, one journald line each. A stamp
+fresher than the daemon's process start is skipped (a create may be landing in
+the sweep's read-then-unlink window); a stamp whose task still exists — its
+`.service` file lists in the unit dir, the store's own definition — is the
+missed-run heal and stays; a foreign `stamp-*.timer` and the scrub pair are
+never touched. The two integration specs keep their GT-21 absolute-date
+schedules — the product now removes the stamp itself, so the dates are belt
+and braces for pre-fix nodes.
