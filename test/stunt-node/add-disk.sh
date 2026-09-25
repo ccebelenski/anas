@@ -34,6 +34,29 @@ SERIAL="ANAS_HOT${DISK_NUM}"
 if [ ! -f "$DISK_PATH" ]; then
   echo "Creating hot${DISK_NUM} disk image (${SIZE_MB}M)..."
   qemu-img create -f qcow2 "$DISK_PATH" "${SIZE_MB}M"
+else
+  # A LEFTOVER image from an earlier run is reused — but silently reusing one
+  # SMALLER than --size asks for makes the caller's partition plan fail on the
+  # node with a confusing sgdisk error instead of here. Grow it (qcow2 grow is
+  # non-destructive and the image is not attached yet; a bigger image is left
+  # alone — shrinking would destroy data).
+  #
+  # The image's OWN virtual size is the TOP-LEVEL "virtual-size" of
+  # `qemu-img info --output=json`. The nested children[].info carries the
+  # backing FILE's size under the same key and comes first, so a flat grep for
+  # the key reads the bytes-on-disk instead (that is what made a 512 MiB image
+  # report as "0M").
+  # jq where it exists; otherwise the 4-space indent anchors the top-level key
+  # (the nested copy sits at 16), so no new tool is required to run this script.
+  if command -v jq >/dev/null 2>&1; then
+    HAVE_BYTES=$(qemu-img info --output=json "$DISK_PATH" | jq -r '."virtual-size"')
+  else
+    HAVE_BYTES=$(qemu-img info --output=json "$DISK_PATH" | sed -n 's/^    "virtual-size": *\([0-9]*\).*/\1/p' | head -1)
+  fi
+  if [ "$HAVE_BYTES" -lt $(( SIZE_MB * 1048576 )) ]; then
+    echo "Growing hot${DISK_NUM} disk image $(( HAVE_BYTES / 1048576 ))M -> ${SIZE_MB}M..."
+    qemu-img resize "$DISK_PATH" "${SIZE_MB}M"
+  fi
 fi
 
 # QEMU runs as 'qemu' user — needs read/write access. Skip when the mode is

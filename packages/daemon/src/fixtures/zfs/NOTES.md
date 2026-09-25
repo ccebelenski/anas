@@ -91,13 +91,14 @@ Provenance comes from each file's own git history (`git log --follow`) and its
 `_comment` where it has one — never from inside the JSON. March 2026 captures are from
 the stunt node of that period (PVE 9, "ZFS 2.4" per the capturing commit); the
 `*-2.4.4` files are verbatim daemon stdout from the current stunt node (PVE 9.2.20,
-`zfs-2.4.4`, 2026-09-24, the vdevs.1/vdevs.2 ground-truth sessions). One cross-fixture
-fact the zoo exposed: the older files quote `pool_guid` (a JSON string), the 2.4.4
-captures emit it UNQUOTED (libzfs's uint64) — the parser passes it through verbatim, so
-`guid` is number-typed on exactly the real 2.4.4 captures. For files added
-with a feature commit and without a recorded capture, provenance is stated as
-**unrecorded** — read them as capture-shaped until a capture replaces them, not as
-evidence about how ZFS behaves.
+`zfs-2.4.4`), either from the vdevs.1/vdevs.2 ground-truth sessions of 2026-09-24 or
+from the topology.1 capture run of 2026-09-25 (the six files whose rows name that
+run). One cross-fixture fact the zoo exposed: some files quote `pool_guid` (a JSON
+string) and others emit it UNQUOTED (libzfs's uint64) — the parser passes it through
+verbatim, so `guid` is number-typed on exactly the `-p` captures. The topology.1 run
+settled why; see **Capture argv**. For files added with a feature commit and without
+a recorded capture, provenance is stated as **unrecorded** — read them as
+capture-shaped until a capture replaces them, not as evidence about how ZFS behaves.
 
 ### Capture argv
 
@@ -106,15 +107,21 @@ The daemon issues `zpool status -jv` (all pools, no `-p` — `routes/disks.ts` a
 `test/stunt-node/topology-zoo.sh capture` captures exactly it. The iostat half is
 `zpool iostat -plv <pool> 1 2` throughout.
 
-**The three `*-2.4.4` status captures below were taken with `-j -p`** — the
-parseable-numbers form: numbers unquoted, sizes in raw bytes. They are real
+**The three unsuffixed `*-2.4.4` status captures below were taken with `-j -p`** —
+the parseable-numbers form: numbers unquoted, sizes in raw bytes. They are real
 captures and 0.3.5's tests pin them, so they stay checked in, but they are a wire
-form the daemon never receives; their rows carry the mark, and a `-jv` re-capture
-of each shape is owed (see Missing shapes). This is also the whole story behind the
-pool_guid difference the zoo exposed: the older files quote `pool_guid` (a JSON
-string), the 2.4.4 captures emit it UNQUOTED (libzfs's uint64) — an artifact of the
-`-p` flag those captures were taken with, not of the ZFS version; the parser passes
-the value through verbatim either way.
+form the daemon never receives. Each now has a `-jv` re-capture checked in beside
+it under the same name plus `-jv` (2026-09-25); both are kept, because their parser
+output is NOT identical — the `-p` files parse `guid` to a number and their sizes
+are raw byte counts, the `-jv` files parse `guid` to a string and their sizes are
+display form.
+
+That pair also **settles** the pool_guid difference the zoo exposed, which was
+previously an inference: the older files quote `pool_guid` (a JSON string), the `-p`
+2.4.4 captures emit it UNQUOTED (libzfs's uint64). Both forms now exist for the same
+three shapes on the same ZFS build, captured a day apart on the same node, and they
+differ in exactly that way — so it is the `-p` flag, not the ZFS version. The parser
+passes the value through verbatim either way.
 
 | File | Pool (state) | ZFS | Captured | Layout facts pinned |
 |------|--------------|-----|----------|---------------------|
@@ -135,6 +142,12 @@ the value through verbatim either way.
 | `zpool-status-all-vdev-classes-2.4.4.json` | `gt66` (ONLINE) | 2.4.4 | 2026-09-23/24, stunt node (vdevs.1 GT) | One pool, **all six classes**, one partition each, **kernel names** (`sdb1`–`sdb6`, no by-id anywhere — the CLI-built shape); all five pool-level sections (`logs`, `l2cache`, `spares`, `special`, `dedup`) beside the tree. **`-p` form** — numbers unquoted, sizes in bytes; RE-CAPTURE under `-jv` owed, see Missing shapes. |
 | `zpool-status-mirrored-log-partitions-2.4.4.json` | `gtbackup` (ONLINE) | 2.4.4 | 2026-09-23/24, stunt node (vdevs.1 GT) | **File vdev as the data root** (`vdev_type: "file"`, `/var/tmp/gtbackup.img`); a **mirrored log inside the `logs` section** (`mirror-4` with two partition leaves); a bare disk cache. KNOWN QUIRK it pins: the in-tree file vdev parses with **zero leaves** — only pool-level bare entries become leaves — which is exactly the shape the missing file-vdev capture below will re-examine. **`-p` form** — numbers unquoted, sizes in bytes; RE-CAPTURE under `-jv` owed, see Missing shapes. |
 | `zpool-status-multi-cache-spare-2.4.4.json` | `gtvdev` (ONLINE) | 2.4.4 | 2026-09-24, stunt node (vdevs.1/.2 fix batch, `c10b976`) | **By-id partitions of ONE disk** for every class; `l2cache` with **two** bare leaves and `spares` with **two** (the multi-entry sections that fold into one container vdev each); single-leaf `logs` takes the same container shape. **`-p` form** — numbers unquoted, sizes in bytes; RE-CAPTURE under `-jv` owed, see Missing shapes. |
+| `zpool-status-all-vdev-classes-jv-2.4.4.json` | `gtvdev` (ONLINE) | 2.4.4 | 2026-09-25, stunt node (topology.1 capture run) | The six-class shape under the argv the daemon ACTUALLY issues (`zpool status -jv`, no `-p`) — the `-jv` re-capture the `-p` file above owed. Same layout as its sibling (one partition per class, **kernel names** `sdb1`–`sdb6`, all five pool-level sections), so the only difference is the wire form: `pool_guid` and every counter are JSON **strings** and sizes are DISPLAY form (`384M`, `1.16G`). Together the two files are the A/B that proves the quoted-vs-unquoted guid is the `-p` flag and not the ZFS version — same build, same day's fixture, both forms. |
+| `zpool-status-multi-cache-spare-jv-2.4.4.json` | `gtvdev` (ONLINE) | 2.4.4 | 2026-09-25, stunt node (topology.1 capture run) | The multi-entry sections under `-jv`: `l2cache` with **two** bare by-id partition leaves and `spares` with **two**, each folding into one container vdev; single-leaf `logs` takes the same container shape. |
+| `zpool-status-mirrored-log-partitions-jv-2.4.4.json` | `gtvdev` (ONLINE) | 2.4.4 | 2026-09-25, stunt node (topology.1 capture run) | The file-root/mirrored-log/disk-cache structure under `-jv`, rebuilt on disk 9 so the log mirror's leaves are **by-id partitions** where the `-p` capture's are kernel-named (`sdb1`/`sdb2`) — the leaf naming differs on purpose. Confirms the in-tree **file vdev still parses with zero leaves** on a second, independently built pool: the quirk is the shape, not that one pool. |
+| `zpool-status-file-vdev-2.4.4.json` | `gtvdev` (ONLINE) | 2.4.4 | 2026-09-25, stunt node (topology.1 capture run) | A **dedicated file-vdev pool**: `vdev_type: "file"` on the data root AND on a file-backed `logs`, `l2cache` and `spares` entry. Settles both open questions — `zpool create` **does** accept a file as a log/cache/spare member (that risk is retired), and the asymmetry is real: the in-tree file vdev carries **zero leaves** while each pool-level file entry keeps its leaf, exactly as a bare disk entry does. |
+| `zpool-status-byid-whole-disk-2.4.4.json` | `gtvdev` (ONLINE) | 2.4.4 | 2026-09-25, stunt node (topology.1 capture run) | The REAL by-id **whole-disk** layout (`zpool create` on `/dev/disk/by-id/<id>`), which until now rested on the synthetic `zpool-status-scrub-verdicts.json`. The evidence it lands: ZFS names the leaf by the **whole disk** (`scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT9`, no `-partN`) while `path` and `devid` both point at the partition ZFS made underneath (`…-part1`). Name and path disagree by design here — the name is the read that must win. |
+| `zpool-status-suspended-2.4.4.json` | `gtvdev` (SUSPENDED) | 2.4.4 | 2026-09-25, stunt node (topology.1 capture run; pool on a dm-linear device whose table was swapped to dm-error) | The suspended shape re-taken under the current build and the daemon's `-jv` argv (the March `zpool-status-suspended*.json` pre-date the zoo and its argv). Carries the `ZFS-8000-HC` health block, `error_count: "5"`, a root vdev `CANT_OPEN` with `aux: "NO_REPLICAS"` over a `FAULTED` leaf with `aux: "ERR_EXCEEDED"`, and no scan record. Two facts about the command itself: it **returns immediately** on a suspended pool rather than blocking, and it prints `errors: List of errors unavailable: pool I/O is currently suspended` on **stderr** — stdout stays valid JSON. Under `-jv` the `errlist` is not a list at all but the errno string `"Resource temporarily unavailable"`. |
 
 The iostat half of the zoo lives beside its parser fixtures in `../telemetry/` (each
 row there in `../telemetry/NOTES.md`); the pairs:
@@ -144,44 +157,74 @@ row there in `../telemetry/NOTES.md`); the pairs:
 | `zpool-iostat-plv.txt` | synthetic `testpool` — **not a capture** (pre-labelling) | The base two-sample layout (`1 2` = since-boot + interval), tree depth by indentation. |
 | `zpool-iostat-plv-all-vdev-classes-2.4.4.txt` | `zpool-status-all-vdev-classes-2.4.4.json` (the pool name is rewritten `gt66` → `gtvdev` IN MEMORY by the consumer test — the fixture file itself is never edited) | The vdev-class section headers print **UNINDENTED in the pool column, every cell `-`**; devices at the vdev indent; **a spare prints no row at all**. This is the capture behind the all-dash header rule. |
 | `zpool-iostat-plv-multi-cache-spare-2.4.4.txt` | `zpool-status-multi-cache-spare-2.4.4.json` | By-id **partition** leaves at the vdev indent under the section headers — long names, two leaves per section. |
+| `zpool-iostat-plv-all-vdev-classes-jv-2.4.4.txt` | `zpool-status-all-vdev-classes-jv-2.4.4.json` | The same header layout on a pool whose status half was captured in the same breath — no in-memory pool-name rewrite needed. |
+| `zpool-iostat-plv-multi-cache-spare-jv-2.4.4.txt` | `zpool-status-multi-cache-spare-jv-2.4.4.json` | Two cache leaves; two spares that print no row. |
+| `zpool-iostat-plv-mirrored-log-partitions-jv-2.4.4.txt` | `zpool-status-mirrored-log-partitions-jv-2.4.4.json` | The zoo's only **depth-2** rows: a `mirror-1` at the vdev indent with its two partition leaves indented beneath it. |
+| `zpool-iostat-plv-file-vdev-2.4.4.txt` | `zpool-status-file-vdev-2.4.4.json` | File paths as row names at every indent; the file-backed spare prints no row. |
+| `zpool-iostat-plv-byid-whole-disk-2.4.4.txt` | `zpool-status-byid-whole-disk-2.4.4.json` | The control: one vdev row, **no section header at all**. |
+| `zpool-iostat-plv-suspended-2.4.4.txt` | `zpool-status-suspended-2.4.4.json` | A SUSPENDED pool prints **real counters**, not an all-dash row — the question the header rule was left open for. |
 
 Also captured by the 3.16 session and feeding the same parsers: `zpool-list-raidz.json`
 (the `testpool-rz` capture of `zpool list -j`).
 
 ### Missing shapes
 
-The captures still missing, each with the `test/stunt-node/vdev-fixture.sh` verb
-that will produce it (`test/stunt-node/topology-zoo.sh capture` runs the sequence
-and lands the files here / in `../telemetry/`). Until a capture exists, no fixture
-file for that shape is checked in and no test cites one — the zoo test skips the
-pair. The first three rows are the `-jv` re-captures the three `*-2.4.4` files owe
-(see **Capture argv** above).
+**None.** Every shape this section listed as owed was captured on 2026-09-25 by
+`test/stunt-node/topology-zoo.sh capture <shape>`, run one shape at a time on the
+stunt node (`anas-pve`, 192.168.200.50, PVE 9.2.20, `zfs-2.4.4-pve1`, kernel
+7.0.14-17-pve) against `test/stunt-node/vdev-fixture.sh`'s verbs: the three `-jv`
+re-captures (`up`, `up-multi`, `up-mirrorlog`), the dedicated file-vdev pool
+(`up-file`), the by-id whole-disk pool (`up-byid-whole`) and the suspended pool
+(`up-suspended`). Their rows are in the zoo table above and their iostat halves in
+`../telemetry/NOTES.md`. That run was also the first time either script had ever
+been executed, so it is their proof as much as the captures'.
 
-| Missing shape | Verb | What the capture settles |
-|---------------|------|--------------------------|
-| `zpool-status-all-vdev-classes-2.4.4.json` re-captured under the daemon's `-jv` | `up` | The six-class shape in the wire form the daemon actually receives — the committed capture is `-p` form (unquoted numbers, byte sizes), which no production `-jv` response carries. |
-| `zpool-status-mirrored-log-partitions-2.4.4.json` re-captured under `-jv` | `up-mirrorlog` — file data root + mirrored log on two partitions + a disk cache, rebuilt on disk 9 | The file-root/mirrored-log/disk-cache structure under `-jv`, with by-id partition leaves (the committed capture's log mirror is kernel-named `sdb1`/`sdb2`); the leaf naming difference is deliberate. |
-| `zpool-status-multi-cache-spare-2.4.4.json` re-captured under `-jv` | `up-multi` | The multi-entry sections (two cache leaves, two spares) under `-jv`. |
-| File vdevs (a dedicated file-vdev pool; file-backed `cache`/`spare` section entries) | `up-file` — files under the `gtbackup` dataset | Whether the in-tree file vdev should carry a leaf the way a section entry does (the `gtbackup` quirk above), and that a `vdev_type: "file"` cache/spare keeps its leaf. |
-| A by-id **whole-disk** pool (leaves by-id with no `-partN`) | `up-byid-whole` — disk 9's whole disk by-id | The REAL leaf identity/path evidence for the whole-disk layout (`zpool create` on `/dev/disk/by-id/<disk>`): the name-vs-path read above rests on a synthetic file until this capture lands. |
-| A suspended pool's `zpool status -j` under the current ZFS build | `up-suspended` — a pool on a dm-linear device over a file under `/gtbackup/anas-topology-zoo`, whose table is swapped to **dm-error** so every I/O fails and the pool suspends (ZFS holds a file or loop device OPEN, so removing the backing does not fail the I/O — the dm swap does, deterministically, the way the yanked-disk capture of story 3.16 did) | Re-takes the March capture under ZFS 2.4.4 with the `-jv` argv the daemon actually issues (the existing `zpool-status-suspended*.json` pre-date the zoo). |
-| A suspended pool's `zpool iostat -plv` | `up-suspended` (same pool) | **The all-dash header question**: whether a suspended pool can print its pool row as all `-`. If it can, that row must survive `parseZpoolIostat` as a pool — the name half of the header rule exists for exactly this unknown, and this capture is the one that retires it. |
+What the run retired, beyond the fixtures themselves:
+
+- **`zpool create` does accept a file as a `log`, `cache` or `spare` member.** That
+  was listed below as unverified; `up-file` built the pool on the first attempt.
+- **The in-tree file vdev really does parse with zero leaves** while a pool-level
+  file entry keeps its leaf. Two independently built pools show it, so it is the
+  shape and not an accident of `gtbackup`.
+- **The all-dash header question is answered: no.** A suspended pool prints real
+  counters in its pool row, so it can never be mistaken for a section header. The
+  name half of the all-dash rule is not carrying this case.
+- **`zpool status -jv` does not block on a suspended pool** — it returns in
+  milliseconds. `zpool iostat -plv … 1 2` returns in about a second. The command
+  that DOES block is the forcing `zpool scrub`, and it blocks uninterruptibly (see
+  below).
+
+One shape the scripts can build has no capture here and none is owed:
+`byid-partition-classes` (`up-byid`, six by-id partition leaves of one disk). Its
+distinguishing fact — by-id `-partN` leaves in the pool-level sections — is already
+pinned by `zpool-status-multi-cache-spare-jv-2.4.4.json`.
 
 `up-suspended` recovers with `down`-style teardown: restore the dm-linear table, then
 `zpool clear` (the pool comes back and can be destroyed cleanly); `zpool destroy -f`
-after the table is restored is the FAILURE fallback when the pool will not clear —
-the hang guard is the `timeout 60` every zpool call on the shape runs under. Never
-touches disks 1–6, `gtbackup`'s data or `gtiscsi`'s zvol — file vdevs live under the
-`gtbackup` MOUNTPOINT but in a throwaway subdirectory, and the suspended pool's
-backing file is its own.
+after the table is restored is the FAILURE fallback when the pool will not clear.
+**Proven on 2026-09-25**, including from a half-built shape whose forcing scrub was
+still stuck: reloading the linear table released the blocked scrub and the pool
+cleared and destroyed in about a second. Never touches disks 1–6, `gtbackup`'s data
+or `gtiscsi`'s zvol — file vdevs live under the `gtbackup` MOUNTPOINT but in a
+throwaway subdirectory, and the suspended pool's backing file is its own.
 
-Stated risks of the file-backed shapes, accepted until the first run retires them:
-they stack ZFS on ZFS (short-lived display fixtures, torn down at once); whether
-`zpool create` accepts file-backed log/cache/spare members is unverified; loop-device
-truncation WOULD fail I/O on its own, and dm-error is chosen because it is
-deterministic. `capture` also stops `anasd` around the suspended shape — the
-daemon's dashboard pull issues `zpool status -jv` with no pool argument and would
-block on the suspended pool.
+**The hang guard has one hole, and the first run fell in it.** `zpool scrub` — the
+command `up-suspended` uses to force the I/O that suspends the pool — blocks in
+uninterruptible D state (`cv_wait_common`) once the pool suspends under it. SIGTERM
+never lands on a D-state task, so the `timeout 60` wrapper hangs alongside it rather
+than bounding it, and the verb never returns. `up-suspended` therefore launches the
+scrub **detached and never waits on it**; the pool-state poll is the real completion
+test, and every zpool call the verb does wait on still runs under `timeout 60`. The
+stuck scrub is released by the table restore in `down`.
+
+Stated risks of the file-backed shapes: they stack ZFS on ZFS (short-lived display
+fixtures, torn down at once) — accepted, and the 2026-09-25 run showed no trouble
+from it; loop-device truncation WOULD fail I/O on its own, and dm-error is chosen
+because it is deterministic. `capture` also stops `anasd` around the suspended shape
+— the daemon's dashboard pull issues `zpool status -jv` with no pool argument and
+would block on the suspended pool — and starts **both** `anasd` and `anas` again
+afterwards, because the gateway unit is `PartOf=anasd.service` and `PartOf`
+propagates stop and restart but never start.
 
 ## Pre-existing fixtures — synthetic
 

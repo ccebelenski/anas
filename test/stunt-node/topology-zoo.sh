@@ -11,8 +11,11 @@ source "${SCRIPT_DIR}/config.sh"
 # gtbackup's own data, never gtiscsi), captures BOTH commands verbatim for each
 # shape, and lands them in the zoo:
 #
-#   packages/daemon/src/fixtures/zfs/zpool-status-<shape>-<zfsver>.json
-#   packages/daemon/src/fixtures/telemetry/zpool-iostat-plv-<shape>-<zfsver>.txt
+#   packages/daemon/src/fixtures/zfs/zpool-status-<token>-<zfsver>.json
+#   packages/daemon/src/fixtures/telemetry/zpool-iostat-plv-<token>-<zfsver>.txt
+#
+# (<token> is the shape name, except for the three `-jv` re-captures — see
+# SHAPE_FILE below.)
 #
 # Commands captured, verbatim daemon stdout — the DAEMON's argv:
 #   zpool status  -jv <pool>        (what routes/disks.ts and routes/pools.ts
@@ -68,6 +71,22 @@ declare -A SHAPE_VERB=(
   [suspended]=up-suspended
 )
 SHAPES=(all-vdev-classes byid-partition-classes multi-cache-spare file-vdev mirrored-log-partitions byid-whole-disk suspended)
+
+# shape → the token the fixture FILES carry. It is the shape name everywhere
+# except the three shapes whose `-p` captures are already checked in under the
+# unsuffixed name (see "Capture argv" in fixtures/zfs/NOTES.md): those files are
+# pinned by 0.3.5's tests and must not be replaced by a `-jv` re-capture, so the
+# re-capture lands beside them carrying `-jv` in its name. Both halves of a pair
+# take the same token, so a status capture and its iostat stay a matched pair.
+declare -A SHAPE_FILE=(
+  [all-vdev-classes]=all-vdev-classes-jv
+  [byid-partition-classes]=byid-partition-classes
+  [multi-cache-spare]=multi-cache-spare-jv
+  [file-vdev]=file-vdev
+  [mirrored-log-partitions]=mirrored-log-partitions-jv
+  [byid-whole-disk]=byid-whole-disk
+  [suspended]=suspended
+)
 
 # shape → the pool state the shape is SUPPOSED to produce. Every captured
 # status is validated against this BEFORE it is written (a capture that reads
@@ -158,8 +177,9 @@ capture_shape() {
   [ "$rc" -eq 0 ] || fail "zpool iostat failed on ${shape} (exit ${rc})"
   echo "$iostat_out" | grep -q "capacity" || fail "iostat capture for ${shape} has no header line"
 
-  status_path="${FIXTURES_ROOT}/${ZFS_DIR}/zpool-status-${shape}-${zfsver}.json"
-  iostat_path="${FIXTURES_ROOT}/${TELEMETRY_DIR}/zpool-iostat-plv-${shape}-${zfsver}.txt"
+  local token="${SHAPE_FILE[$shape]:-$shape}"
+  status_path="${FIXTURES_ROOT}/${ZFS_DIR}/zpool-status-${token}-${zfsver}.json"
+  iostat_path="${FIXTURES_ROOT}/${TELEMETRY_DIR}/zpool-iostat-plv-${token}-${zfsver}.txt"
 
   if [ -e "$status_path" ] || [ -e "$iostat_path" ]; then
     [ "$FORCE" -eq 1 ] || fail "a capture already exists at ${status_path} (or its pair) — replacing a capture is deliberate; pass --force"
@@ -179,11 +199,16 @@ FORCE=0
 
 # anasd is stopped only around the suspended shape; the EXIT trap makes sure a
 # failed or interrupted run still starts it again.
+#
+# BOTH units are named on the way back up. The gateway unit is
+# PartOf=anasd.service, so stopping anasd stops anas with it — but PartOf
+# propagates stop and restart ONLY, never start, so starting anasd alone leaves
+# the UI at 502. A run that stops anasd must hand back both.
 ANASD_STOPPED=0
 start_anasd() {
   [ "$ANASD_STOPPED" -eq 1 ] || return 0
   ANASD_STOPPED=0
-  $SSH_CMD "systemctl start anasd" 2>/dev/null || echo "WARNING: anasd did not start — 'systemctl start anasd' on the node by hand" >&2
+  $SSH_CMD "systemctl start anasd anas" 2>/dev/null || echo "WARNING: anasd/anas did not start — 'systemctl start anasd anas' on the node by hand" >&2
 }
 trap start_anasd EXIT
 

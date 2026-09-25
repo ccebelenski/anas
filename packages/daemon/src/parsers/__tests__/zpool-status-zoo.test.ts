@@ -59,6 +59,35 @@ const STATUS_ZOO: Record<string, readonly PoolExpected[]> = {
     errorCount: 0,
     roles: [['data', 1, 1], ['log', 1, 1], ['cache', 1, 1], ['spare', 1, 1], ['special', 1, 1], ['dedup', 1, 1]],
   }],
+  // The `-jv` re-capture of the shape above — the argv the daemon actually
+  // issues. Identical role facts, so what it pins beyond its sibling is the
+  // WIRE FORM: quoted guid, display-form sizes (see "Capture argv" in
+  // fixtures/zfs/NOTES.md). The pool is gtvdev here, not gt66.
+  'zpool-status-all-vdev-classes-jv-2.4.4.json': [{
+    name: 'gtvdev',
+    state: 'ONLINE',
+    errorCount: 0,
+    roles: [['data', 1, 1], ['log', 1, 1], ['cache', 1, 1], ['spare', 1, 1], ['special', 1, 1], ['dedup', 1, 1]],
+  }],
+  // A pool built on the WHOLE disk by-id: one data vdev, no sections at all.
+  // Its evidence is the leaf NAME (whole disk, no -partN) against its path
+  // (…-part1) — the invariant block below asserts both are non-empty; the
+  // fixture is what makes the name-vs-path read real instead of synthetic.
+  'zpool-status-byid-whole-disk-2.4.4.json': [{
+    name: 'gtvdev',
+    state: 'ONLINE',
+    errorCount: 0,
+    roles: [['data', 1, 1]],
+  }],
+  // A dedicated file-vdev pool. The zero-leaf data vdev is the pinned
+  // asymmetry: an in-tree `vdev_type: "file"` carries no leaf, while the
+  // file-backed log/cache/spare entries each keep theirs.
+  'zpool-status-file-vdev-2.4.4.json': [{
+    name: 'gtvdev',
+    state: 'ONLINE',
+    errorCount: 0,
+    roles: [['data', 1, 0], ['log', 1, 1], ['cache', 1, 1], ['spare', 1, 1]],
+  }],
   'zpool-status-degraded.json': [{
     name: 'testpool',
     state: 'DEGRADED',
@@ -88,7 +117,24 @@ const STATUS_ZOO: Record<string, readonly PoolExpected[]> = {
     errorCount: 0,
     roles: [['data', 1, 0], ['log', 1, 2], ['cache', 1, 1]],
   }],
+  // The `-jv` re-capture of the shape above, rebuilt on disk 9 so the log
+  // mirror's leaves are by-id partitions. Same role facts, including the
+  // zero-leaf file data root — which is how this file shows the quirk belongs
+  // to the shape and not to the gtbackup pool.
+  'zpool-status-mirrored-log-partitions-jv-2.4.4.json': [{
+    name: 'gtvdev',
+    state: 'ONLINE',
+    errorCount: 0,
+    roles: [['data', 1, 0], ['log', 1, 2], ['cache', 1, 1]],
+  }],
   'zpool-status-multi-cache-spare-2.4.4.json': [{
+    name: 'gtvdev',
+    state: 'ONLINE',
+    errorCount: 0,
+    roles: [['data', 1, 1], ['log', 1, 1], ['cache', 1, 2], ['spare', 1, 2]],
+  }],
+  // The `-jv` re-capture of the shape above.
+  'zpool-status-multi-cache-spare-jv-2.4.4.json': [{
     name: 'gtvdev',
     state: 'ONLINE',
     errorCount: 0,
@@ -158,6 +204,19 @@ const STATUS_ZOO: Record<string, readonly PoolExpected[]> = {
     health: true,
     scan: 'RESILVER/FINISHED',
     roles: [['data', 1, 3], ['spare', 1, 1]],
+  }],
+  // A real SUSPENDED pool under ZFS 2.4.4 and the daemon's `-jv` argv (the two
+  // files below are the March 2.4 captures this one re-takes). One dm-error
+  // leaf, FAULTED under a CANT_OPEN root; the ZFS-8000-HC health block; five
+  // errors. `errorDetail` is true because `-jv` emits an `errlist` — on a
+  // suspended pool it is not a list but the errno string libzfs got back.
+  'zpool-status-suspended-2.4.4.json': [{
+    name: 'gtvdev',
+    state: 'SUSPENDED',
+    errorCount: 5,
+    health: true,
+    errorDetail: true,
+    roles: [['data', 1, 1]],
   }],
   'zpool-status-suspended.json': [{
     name: 'testpool',
@@ -324,6 +383,35 @@ const IOSTAT_ZOO: Record<string, IostatExpected> = {
     shape: [['gtvdev', 5, 0]],
     hasSectionHeaders: true,
   },
+  'zpool-iostat-plv-all-vdev-classes-jv-2.4.4.txt': {
+    pools: ['gtvdev'],
+    samples: 2,
+    shape: [['gtvdev', 5, 0]],
+    hasSectionHeaders: true,
+  },
+  // The control for the header rule: nothing to drop, so a parser that started
+  // eating rows would fail HERE first.
+  'zpool-iostat-plv-byid-whole-disk-2.4.4.txt': {
+    pools: ['gtvdev'],
+    samples: 2,
+    shape: [['gtvdev', 1, 0]],
+  },
+  // File paths as row names: data root + log + cache at the vdev indent; the
+  // file-backed spare prints no row, exactly as a disk spare does.
+  'zpool-iostat-plv-file-vdev-2.4.4.txt': {
+    pools: ['gtvdev'],
+    samples: 2,
+    shape: [['gtvdev', 3, 0]],
+    hasSectionHeaders: true,
+  },
+  // The zoo's only depth-2 rows: the log `mirror-1` sits at the vdev indent and
+  // its two partition leaves are indented under it.
+  'zpool-iostat-plv-mirrored-log-partitions-jv-2.4.4.txt': {
+    pools: ['gtvdev'],
+    samples: 2,
+    shape: [['gtvdev', 3, 2]],
+    hasSectionHeaders: true,
+  },
   'zpool-iostat-plv-multi-cache-spare-2.4.4.txt': {
     pools: ['gtvdev'],
     samples: 2,
@@ -331,6 +419,20 @@ const IOSTAT_ZOO: Record<string, IostatExpected> = {
     // all, exactly as in the all-classes capture.
     shape: [['gtvdev', 4, 0]],
     hasSectionHeaders: true,
+  },
+  'zpool-iostat-plv-multi-cache-spare-jv-2.4.4.txt': {
+    pools: ['gtvdev'],
+    samples: 2,
+    shape: [['gtvdev', 4, 0]],
+    hasSectionHeaders: true,
+  },
+  // A SUSPENDED pool prints REAL counters in its pool row, not all dashes —
+  // the unknown the all-dash rule's name half was left open for. No section
+  // header appears at all, so `hasSectionHeaders` is absent by fact.
+  'zpool-iostat-plv-suspended-2.4.4.txt': {
+    pools: ['gtvdev'],
+    samples: 2,
+    shape: [['gtvdev', 1, 0]],
   },
 }
 
