@@ -26,6 +26,7 @@ import type { IscsiPaths } from '../services/iscsi.js'
 import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { basename } from 'node:path'
+import { GROUPING_VDEV_TYPES } from '@anas/shared'
 import { computeArcTelemetry, parseArcstats } from '../parsers/arcstats.js'
 import { parseDiskByIdListing } from '../parsers/disk-by-id.js'
 import { parseExports } from '../parsers/exports.js'
@@ -58,9 +59,10 @@ const CRITICAL_POOL_STATES = new Set(['FAULTED', 'UNAVAIL', 'REMOVED', 'SUSPENDE
 
 /**
  * Vdev types whose members iostat prints NESTED under them — their leaves are
- * never vdev rows, so the topology join must not index them by leaf name.
+ * never vdev rows, so the topology join must not index them by leaf name. One
+ * set, shared with the vdev-remove resolver: GROUPING_VDEV_TYPES in
+ * `@anas/shared`, beside the VdevType values it is a set of.
  */
-const GROUPING_VDEV_TYPES = new Set<VdevType>(['mirror', 'raidz', 'raidz2', 'raidz3', 'draid', 'draid2', 'draid3', 'replacing'])
 
 /**
  * Dashboard endpoints (Epic 2).

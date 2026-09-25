@@ -472,6 +472,20 @@ describe('remove-vdev: the six vdev classes, resolved as the route resolves them
     assert.deepEqual(hitOf(mirroredLogStatus(), 'sdb2'), { role: 'log', vdev: 'mirror-1', token: 'mirror-1' })
   })
 
+  /**
+   * A `replacing-N` vdev GROUPS its leaves in `zpool status`/`zpool iostat -v`
+   * the way a mirror does — it is in the shared GROUPING_VDEV_TYPES — so a leaf
+   * under one resolves to the whole replacing vdev, never to the leg.
+   */
+  it('a leaf under replacing-0 resolves to the whole replacing vdev', () => {
+    const status = sixClassStatus()
+    status.vdevGroups = status.vdevGroups.map(g => g.role === 'data'
+      ? { role: 'data' as const, vdevs: [container('replacing-0', 'replacing', [leaf('sdb1', '/dev/sdb1'), leaf('ata-NEW', '/dev/ata-NEW')])] }
+      : g)
+    assert.deepEqual(hitOf(status, 'sdb1'), { role: 'data', vdev: 'replacing-0', token: 'replacing-0' })
+    assert.deepEqual(hitOf(status, 'replacing-0'), { role: 'data', vdev: 'replacing-0', token: 'replacing-0' })
+  })
+
   it('allows a cache leaf and a spare leaf', () => {
     const status = sixClassStatus()
     assert.deepEqual(hitOf(status, 'sdb3'), { role: 'cache', vdev: 'cache', token: '/dev/sdb3' })

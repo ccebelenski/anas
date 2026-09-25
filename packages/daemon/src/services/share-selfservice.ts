@@ -1,13 +1,13 @@
-import type { CreateSmbShareRequest, MountEntry, SnapshotSchedule } from '@anas/shared'
+import type { AhrPool, CreateSmbShareRequest, MountEntry, SnapshotSchedule } from '@anas/shared'
 import type { CommandExecutor } from '../executor/types.js'
 import type { SelfServiceKeys } from '../parsers/smb-conf.js'
 import { isPathWithin, RetentionBucket } from '@anas/shared'
 import { addMount, hasMount } from '../parsers/fstab.js'
+import { matchMountpoint, readZfsMountpointsFull } from '../parsers/pve-storage.js'
 import { ahrLvPath } from './ahr-paths.js'
 import { SUBVOL_SNAPSHOTS } from './ahr-snapshots.js'
 import { readAhrPools } from './ahr-topology.js'
 import { editConfig } from './config-writer.js'
-import { loadPveFootprint } from './pve-footprint.js'
 import { readAllSchedules } from './snapshot-schedule-units.js'
 
 /**
@@ -16,10 +16,11 @@ import { readAllSchedules } from './snapshot-schedule-units.js'
  * shares"); `parsers/smb-conf.ts` holds only the composer + managed keys.
  *
  * The decisions:
- *   - WHERE the share lives: ZFS dataset (the ONE longest-prefix mountpoint
- *     resolver, `datasetOfPath` from the pvepool.1 footprint service) or AHR
- *     pool (longest match over the pools' `@data` mountpoints) — never a new
- *     resolver.
+ *   - WHERE the share lives: ZFS dataset (the ONE longest-prefix resolver,
+ *     `matchMountpoint` over the mountpoint table — exactly what the footprint
+ *     service's `datasetOfPath` asks, without the storage.cfg/boot reads this
+ *     decision has no use for) or AHR pool (longest match over the pools'
+ *     `@data` mountpoints) — never a new resolver.
  *   - WHICH bucket Previous Versions exposes: the finest cadence among the
  *     ENABLED snapshot schedules targeting that dataset/pool (a disabled
  *     schedule takes nothing, so it exposes nothing); `daily` when none —
@@ -56,38 +57,39 @@ export function ahrSnapshotsMountpoint(poolName: string, override?: string): str
 /** Where a share's path lives, for the self-service decisions. */
 export type SelfServiceTarget
   = | { kind: 'zfs', dataset: string }
-    | { kind: 'ahr', pool: string }
+    | { kind: 'ahr', pool: string, /** The pool record as `readAhrPools` returned it — consumers need no second read. */ poolRecord: AhrPool }
 
 /**
  * Resolve a share path to its snapshot-bearing home. ZFS first (the ONE
- * mountpoint table the footprint service loads), then AHR (longest
- * mountpoint match over the live pools). `null` = neither — nothing here is
- * snapshotted, and Previous Versions has nothing to expose.
+ * longest-prefix resolver, `matchMountpoint`, over the mountpoint table — the
+ * cheap read, not the full footprint load), then AHR (longest mountpoint
+ * match over the live pools). `null` = neither — nothing here is snapshotted,
+ * and Previous Versions has nothing to expose.
  */
 export async function resolveSelfServiceTarget(executor: CommandExecutor, path: string): Promise<SelfServiceTarget | null> {
-  const pve = await loadPveFootprint(executor)
-  const dataset = pve.datasetOfPath(path)
+  const mountRead = await readZfsMountpointsFull(executor)
+  const dataset = matchMountpoint(path, mountRead?.mountpoints ?? [])?.dataset ?? null
   if (dataset)
     return { kind: 'zfs', dataset }
 
   const pools = await readAhrPools(executor)
-  let best: { pool: string, mountpoint: string } | undefined
+  let best: { pool: AhrPool, mountpoint: string } | undefined
   for (const pool of pools) {
     if (!isPathWithin(pool.mountpoint, path))
       continue
     if (!best || pool.mountpoint.length > best.mountpoint.length)
-      best = { pool: pool.name, mountpoint: pool.mountpoint }
+      best = { pool, mountpoint: pool.mountpoint }
   }
-  return best ? { kind: 'ahr', pool: best.pool } : null
+  return best ? { kind: 'ahr', pool: best.pool.name, poolRecord: best.pool } : null
 }
 
 /**
  * The free space of the storage `path` sits on, in bytes — the input for the
  * Time Machine cap suggestion (smbsvc.3): the ZFS dataset's `available`, or
  * the AHR pool's free bytes (reusing the SAME target resolver and pool read
- * everything else here uses — no second resolver). FAIL-OPEN `undefined`: an
- * unresolvable path, a failed read or an unparseable value is a missing
- * suggestion, never a detail-view failure.
+ * everything else uses — no second resolver, no second `readAhrPools`). FAIL-
+ * OPEN `undefined`: an unresolvable path, a failed read or an unparseable
+ * value is a missing suggestion, never a detail-view failure.
  */
 export async function shareAvailableBytes(executor: CommandExecutor, path: string): Promise<number | undefined> {
   try {
@@ -101,9 +103,7 @@ export async function shareAvailableBytes(executor: CommandExecutor, path: strin
       const n = Number(r.stdout.trim())
       return Number.isInteger(n) && n >= 0 ? n : undefined
     }
-    const pools = await readAhrPools(executor)
-    const pool = pools.find(p => p.name === target.pool)
-    return pool ? pool.capacity.freeBytes : undefined
+    return target.poolRecord.capacity.freeBytes
   }
   catch {
     return undefined
@@ -214,11 +214,8 @@ export async function resolveSelfService(
   const target = await resolveSelfServiceTarget(executor, path)
   if (!target)
     throw new Error(`'${path}' is not on a ZFS dataset or an AHR pool — there are no snapshots to expose`)
-  if (target.kind === 'ahr') {
-    const pools = await readAhrPools(executor)
-    const pool = pools.find(p => p.name === target.pool)
-    if (!pool || !pool.subvolLayout)
-      throw new Error(`pool '${target.pool}' predates the snapshot layout — Previous Versions needs @snapshots`)
+  if (target.kind === 'ahr' && !target.poolRecord.subvolLayout) {
+    throw new Error(`pool '${target.pool}' predates the snapshot layout — Previous Versions needs @snapshots`)
   }
 
   const schedules = await readAllSchedules(opts.systemdDir)

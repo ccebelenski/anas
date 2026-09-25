@@ -568,6 +568,7 @@ export {
   ExpansionOpKind,
   ExpansionTarget,
   ExportPoolRequest,
+  GROUPING_VDEV_TYPES,
   ImportPoolRequest,
   isRemovableVdevRole,
   PoolDetail,

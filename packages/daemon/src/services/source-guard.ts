@@ -23,6 +23,9 @@ import { readFindmnt } from './mounts.js'
  *   1. `/etc/fstab` — what the system is configured to mount (the parser is
  *      Mounts' own, so a disabled `#ANAS ` line is still a configured mount and
  *      an entry with a non-absolute mountpoint — swap — is already dropped).
+ *      A `noauto` line is NOT configured to be mounted at boot — it mounts on
+ *      demand, when somebody runs `mount` for it — so it is not the boot race
+ *      this guard exists for and does not count as configured.
  *   2. `findmnt --json` — what is mounted right now. It reads
  *      `/proc/self/mountinfo`, so it can never hang, even on a dead NFS server.
  *
@@ -43,7 +46,8 @@ export interface SourceGuardFacts {
    * Every fstab-configured mount, absolute mountpoints only (file order), with
    * the two fstab fields a refusal sentence NAMES: `source` (fs_spec) and
    * `fstype` (fs_vfstype). They come from fstab and nowhere else — the kernel
-   * table has nothing to say about a mount that is not there.
+   * table has nothing to say about a mount that is not there. `noauto` entries
+   * are not among them: they are not configured to be mounted at boot.
    */
   configured: UnmountedMount[]
   /** Mountpoints the kernel currently has (findmnt targets). */
@@ -63,12 +67,18 @@ export interface SourceGuardFacts {
 export function buildSourceGuardFacts(fstabText: string, findmntText: string): SourceGuardFacts {
   const nodes = parseFindmnt(findmntText)
   return {
-    configured: parseFstab(fstabText).map(e => ({
-      mountpoint: e.mountpoint,
-      source: e.spec,
-      fstype: e.fstype,
-      disabled: e.disabled === true,
-    })),
+    configured: parseFstab(fstabText)
+      // The parser has already classified the option list (`MountCommonOptions`),
+      // so `noauto` is read from its structured field — never re-parsed from
+      // the raw line. A disabled `#ANAS ` entry still counts: it is configured,
+      // just switched off.
+      .filter(e => !e.options.common.noauto)
+      .map(e => ({
+        mountpoint: e.mountpoint,
+        source: e.spec,
+        fstype: e.fstype,
+        disabled: e.disabled === true,
+      })),
     mounted: new Set(nodes.map(n => n.target)),
     // An empty table is the unreadable case: a running Linux system always has
     // at least `/` mounted, so zero rows can only mean the read failed — and

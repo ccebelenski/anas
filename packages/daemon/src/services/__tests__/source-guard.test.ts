@@ -55,8 +55,8 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
       const facts = buildSourceGuardFacts(FSTAB, ALL_MOUNTED)
       assert.deepEqual(
         facts.configured.map(c => c.mountpoint),
-        ['/', '/mnt/pictures', '/mnt/archive', '/mnt/old'],
-        'swap has no absolute mountpoint and is dropped by the parser',
+        ['/', '/mnt/pictures', '/mnt/old'],
+        'swap has no absolute mountpoint and is dropped by the parser; the noauto line is not boot-configured',
       )
       assert.deepEqual(
         facts.configured.filter(c => c.disabled).map(c => c.mountpoint),
@@ -70,11 +70,6 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
         facts.configured.find(c => c.mountpoint === '/mnt/pictures'),
         { mountpoint: '/mnt/pictures', source: '//nas/pictures', fstype: 'cifs', disabled: false },
       )
-      assert.deepEqual(
-        facts.configured.find(c => c.mountpoint === '/mnt/archive'),
-        { mountpoint: '/mnt/archive', source: 'server:/export', fstype: 'nfs4', disabled: false },
-      )
-      assert.equal(facts.mountTableUnavailable, false)
     })
 
     it('an unreadable mount table is flagged, not read as "nothing is mounted"', () => {
@@ -133,6 +128,22 @@ describe('source guard — configured but unmounted (rclone.2)', () => {
 
     it('an empty fstab configures nothing, so nothing is refused', () => {
       assert.equal(unmountedMountFor('/mnt/pictures', buildSourceGuardFacts('', ALL_MOUNTED)), null)
+    })
+
+    /**
+     * A `noauto` line is not configured to be mounted at boot — it mounts on
+     * demand — so a path under it passes the guard even while nothing is
+     * mounted there, while a normal unmounted entry next to it is still
+     * refused (review finding).
+     */
+    it('a noauto fstab line is not configured-but-unmounted — a path under it passes', () => {
+      const facts = buildSourceGuardFacts(FSTAB, findmnt(['/']))
+      assert.equal(unmountedMountFor('/mnt/archive', facts), null)
+      assert.equal(unmountedMountFor('/mnt/archive/2026/raw', facts), null)
+      assert.equal(guardSourcePath('/mnt/archive/2026/raw', facts), null)
+      // …while the plain unmounted entry in the SAME fstab still fails it.
+      assert.deepEqual(unmountedMountFor('/mnt/pictures', facts), PICTURES_MOUNT)
+      assert.match(guardSourcePath('/mnt/pictures', facts) ?? '', /not mounted right now/)
     })
   })
 

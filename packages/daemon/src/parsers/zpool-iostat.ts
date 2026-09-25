@@ -93,8 +93,12 @@ const SECTION_NAMES: ReadonlySet<string> = new Set(['logs', 'cache', 'special', 
  * UNVERIFIED; if it can, that pool stays a pool here instead of being swallowed
  * as a header (vdevs.2 hardening).
  *
- * `knownPools` — the pools the command was ASKED about — is the secondary
- * check, for a header shape this ground truth has not seen.
+ * `knownPools` — the pools the command was ASKED about — extends the name
+ * check: an all-`-` row named like NONE of them is read as a section header
+ * too, for a header shape this ground truth has not seen. The SHAPE half still
+ * applies to it — a pool that is not in the list (imported between the
+ * `zpool list` and the `zpool iostat -plv` call) keeps its capacity numbers,
+ * so it is a pool of its own, never folded into the pool printed before it.
  */
 export function parseZpoolIostat(text: string, knownPools?: ReadonlySet<string>): IostatNode[][] {
   const samples: IostatNode[][] = []
@@ -138,12 +142,17 @@ export function parseZpoolIostat(text: string, knownPools?: ReadonlySet<string>)
       // its capacity numbers and stays a pool. The name is needed because an
       // all-`-` row called anything else is a pool, not a header: no capture
       // shows what a SUSPENDED pool prints, so if it prints all `-` it survives
-      // here rather than being swallowed. `knownPools` stays as the secondary
-      // check for a header shape we have not seen. Either way the standing pool
-      // continues and the devices under the header are that pool's vdevs.
+      // here rather than being swallowed. When `knownPools` is given, a row
+      // named like NONE of them joins the name check — but only when it is
+      // ALSO shaped like a header: a pool imported after the `zpool list` the
+      // names came from is not in the set, yet it carries its numbers and is a
+      // pool of its own, never a header of the pool printed before it. Either
+      // way the standing pool continues and the devices under the header are
+      // that pool's vdevs.
       const noStats = values.length > 0 && values.every(v => v === '-')
-      const sectionHeader = noStats && SECTION_NAMES.has(name)
-      if (currentPool && (sectionHeader || (knownPools && !knownPools.has(name)))) {
+      const sectionHeader = noStats
+        && (SECTION_NAMES.has(name) || (knownPools !== undefined && !knownPools.has(name)))
+      if (currentPool && sectionHeader) {
         currentVdev = undefined
         continue
       }

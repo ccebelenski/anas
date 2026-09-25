@@ -208,4 +208,49 @@ describe('parseZpoolIostat — vdev-class section headers (vdevs.1)', () => {
     const [sample] = parseZpoolIostat(allDashPoolText)
     assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'tank'])
   })
+
+  /**
+   * A pool IMPORTED between the `zpool list` that produced `knownPools` and
+   * the `zpool iostat -plv` call is not in the set — yet it is a pool, not a
+   * section header of the pool printed before it. Reading every unindented
+   * unknown name as a header appended its vdevs to the previous pool
+   * (review finding). The shape half of the header test settles it: a real
+   * pool row carries its capacity numbers, a section header prints all `-`.
+   * Same capture layout as the fixtures above (ZFS 2.4.4).
+   */
+  const lateImportedPoolText = [
+    '                        capacity                         operations                         bandwidth                   total_wait               disk_wait              syncq_wait              asyncq_wait            scrub        trim     rebuild',
+    'pool                  alloc             free             read            write             read            write        read       write        read       write        read       write        read       write        wait        wait        wait',
+    '----------  ---------------  ---------------  ---------------  ---------------  ---------------  ---------------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------',
+    'gtvdev               167424       1241346560                0                1            10596            35135     1460516      384704     1460516      288528         733        5473           -      213831           -           -           -',
+    '  sdb1                    0        402653184                0                0             2649             8283     1685211      409071     1685211      409071         877         427           -           -           -           -           -',
+    'latepool              12288        536870912                0                2             4096            16384      900000      300000      900000      250000         500        1200           -           -           -           -           -',
+    '  sdd1                    0        536870912                0                2             4096            16384      900000      300000      900000      250000         500        1200           -           -           -           -           -',
+    'logs                      -                -                -                -                -                -           -           -           -           -           -           -           -           -           -           -           -',
+    '  sde1                    0        201326592                0                0              512              256      100000       50000      100000       50000         100         200           -           -           -           -           -',
+    '----------  ---------------  ---------------  ---------------  ---------------  ---------------  ---------------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------  ----------',
+  ].join('\n')
+
+  it('a pool row with statistics that is NOT in knownPools is its own pool', () => {
+    const [sample] = parseZpoolIostat(lateImportedPoolText, new Set(['gtvdev']))
+    assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'latepool'])
+
+    // It keeps the statistics it printed — never folded into gtvdev.
+    const latepool = sample.find(n => n.depth === 0 && n.name === 'latepool')!
+    assert.equal(latepool.ops.write, 2)
+    assert.equal(latepool.bandwidth.read, 4096)
+
+    // Its devices belong to it — including the one under the all-`-` `logs`
+    // row, which is still dropped as a header (unknown name, no stats).
+    assert.equal(sample.find(n => n.name === 'sdd1')!.pool, 'latepool')
+    assert.equal(sample.find(n => n.name === 'sdb1')!.pool, 'gtvdev')
+    assert.equal(sample.find(n => n.name === 'sde1')!.pool, 'latepool')
+    assert.equal(sample.find(n => n.name === 'logs'), undefined)
+  })
+
+  it('and the same fixture parses identically with no pool names at all', () => {
+    const [sample] = parseZpoolIostat(lateImportedPoolText)
+    assert.deepEqual(sample.filter(n => n.depth === 0).map(n => n.name), ['gtvdev', 'latepool'])
+    assert.equal(sample.find(n => n.name === 'sde1')!.pool, 'latepool')
+  })
 })

@@ -44,6 +44,25 @@ export const VdevType = z.enum([
 ])
 export type VdevType = z.infer<typeof VdevType>
 
+/**
+ * Top-level vdev types that GROUP their leaves in `zpool status` and
+ * `zpool iostat -v` output. A leaf inside one of these is not a vdev of its
+ * own — the whole `mirror-N`/`raidz-N`/`draid-N`/`replacing-N` reports as one,
+ * and its members print nested UNDER it. One set, asked by every consumer that
+ * has to tell a grouping container from a bare leaf (the dashboard topology
+ * join, the vdev-remove resolver) — never a second copy that can drift.
+ */
+export const GROUPING_VDEV_TYPES: ReadonlySet<VdevType> = new Set<VdevType>([
+  'mirror',
+  'raidz',
+  'raidz2',
+  'raidz3',
+  'draid',
+  'draid2',
+  'draid3',
+  'replacing',
+])
+
 /** Vdev role — our concept, not ZFS's. ZFS uses position, we're explicit. */
 export const VdevRole = z.enum([
   'data',

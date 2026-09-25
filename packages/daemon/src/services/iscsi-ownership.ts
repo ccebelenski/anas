@@ -220,8 +220,12 @@ export function classifyBacking(
   if (devPath.startsWith('/dev/'))
     return unmatched
 
+  // `matchMountpoint` only returns rows of the mountpoint table, and the table
+  // parser never emits an empty dataset (`parseZfsMountpoints` skips rows
+  // without one) — so an `mp` always carries the dataset it matched, and there
+  // is no "mountpoint without a dataset" shape to answer.
   const mp = matchMountpoint(devPath, inputs.zfsMountpoints)
-  if (mp && mp.dataset) {
+  if (mp) {
     const owned = ownershipOf(inputs, mp.dataset)
     return {
       kind: 'file',
@@ -233,17 +237,6 @@ export function classifyBacking(
       // A file cannot be a guest VOLUME (PVE inventories zvols/subvols, never
       // plain files) — but a dir storage's tree is owned as `dir-storage`, and
       // `pveOwned` already reflects that.
-      pveGuestVolume: false,
-    }
-  }
-  if (mp) {
-    return {
-      kind: 'file',
-      pool: mp.pool,
-      dataset: null,
-      mountpoint: mp.mountpoint,
-      pveOwned: false,
-      pveOwnership: null,
       pveGuestVolume: false,
     }
   }

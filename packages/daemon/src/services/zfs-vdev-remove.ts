@@ -1,6 +1,7 @@
-import type { VdevRole, VdevType } from '@anas/shared'
+import type { VdevRole } from '@anas/shared'
 import type { ParsedPoolStatus } from '../parsers/zpool-status.js'
 import type { VdevRefusal } from './zfs-vdev-leaf.js'
+import { GROUPING_VDEV_TYPES } from '@anas/shared'
 import { ambiguousVdevMessage, describeCandidate, matchPoolLeaves } from './zfs-vdev-leaf.js'
 
 export { ambiguousVdevMessage, isVdevRefusal, unknownVdevMessage } from './zfs-vdev-leaf.js'
@@ -19,19 +20,11 @@ export type { VdevRefusal } from './zfs-vdev-leaf.js'
  */
 
 /**
- * Top-level vdev types that GROUP their leaves. Removing one leaf of a mirrored
- * log is not what `zpool remove` does — the whole `mirror-N` comes out — so a
- * leaf inside one of these resolves to its parent.
+ * The grouping types live ONCE in `@anas/shared` (GROUPING_VDEV_TYPES — the
+ * same set the dashboard's topology join asks). A leaf inside one of them
+ * resolves to its parent: removing one leg of a mirrored log is not what
+ * `zpool remove` does — the whole `mirror-N` comes out.
  */
-const GROUPING_VDEV_TYPES = new Set<VdevType>([
-  'mirror',
-  'raidz',
-  'raidz2',
-  'raidz3',
-  'draid',
-  'draid2',
-  'draid3',
-])
 
 /**
  * The synthetic container names the status parser gives a pool-level section's

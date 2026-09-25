@@ -1,4 +1,5 @@
-import type { SnapshotSchedule } from '@anas/shared'
+import type { AhrPool, SnapshotSchedule } from '@anas/shared'
+import type { SelfServiceTarget } from '../share-selfservice.js'
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -67,7 +68,8 @@ describe('pickBucket — the finest enabled cadence on the target (smbsvc.1)', (
   })
 
   it('an AHR target matches only pool schedules, finest first', () => {
-    const AHR = { kind: 'ahr' as const, pool: 'tank' }
+    // pickBucket reads the pool NAME only; the record stand-in carries nothing.
+    const AHR: SelfServiceTarget = { kind: 'ahr', pool: 'tank', poolRecord: {} as AhrPool }
     const schedules = [
       schedule({ id: 'm', cadence: 'monthly', target: AHR }),
       schedule({ id: 'h', cadence: 'hourly', target: { kind: 'zfs', dataset: 'testpool/media' } }),
@@ -90,15 +92,12 @@ describe('touchesSelfService', () => {
 // --- Executor fixtures --------------------------------------------------------
 
 const ZFS = '/usr/sbin/zfs'
-const ZPOOL = '/usr/sbin/zpool'
 const FINDMNT = '/usr/bin/findmnt'
 
-/** The footprint reads datasetOfPath needs: the mountpoint table + boot probe. */
+/** The reads the mountpoint resolver needs: the `zfs list` table + findmnt (for legacy/none targets). */
 function addZfsFootprintFixtures(mock: MockExecutor, table: string): void {
   mock.addFixture({ command: ZFS, args: ['list', '-H', '-o', 'name,mountpoint'], result: { stdout: table, stderr: '', exitCode: 0 } })
   mock.addFixture({ command: FINDMNT, args: ['--json'], result: { stdout: JSON.stringify({ filesystems: [] }), stderr: '', exitCode: 0 } })
-  mock.addFixture({ command: ZPOOL, args: ['get', '-H', '-o', 'name,value', 'bootfs'], result: { stdout: 'testpool\t-\n', stderr: '', exitCode: 0 } })
-  mock.addFixture({ command: FINDMNT, args: ['-n', '-o', 'SOURCE,FSTYPE', '/'], result: { stdout: '/dev/sda1\text4\n', stderr: '', exitCode: 0 } })
 }
 
 // The single-band raid5×3 pool "tank" recipe (mirrors ahr-snapshots.test.ts):
@@ -168,7 +167,8 @@ describe('resolveSelfServiceTarget (smbsvc.1)', () => {
     const mock = new MockExecutor()
     addZfsFootprintFixtures(mock, '') // no ZFS datasets at all
     addAhrPoolFixtures(mock)
-    assert.deepEqual(await resolveSelfServiceTarget(mock, '/mnt/anas-ahr/tank/media'), { kind: 'ahr', pool: 'tank' })
+    const tank = (await readAhrPools(mock)).find(p => p.name === 'tank')!
+    assert.deepEqual(await resolveSelfServiceTarget(mock, '/mnt/anas-ahr/tank/media'), { kind: 'ahr', pool: 'tank', poolRecord: tank })
   })
 
   it('a path on neither stack resolves to null', async () => {
