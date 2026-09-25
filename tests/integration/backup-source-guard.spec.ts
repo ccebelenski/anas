@@ -1,9 +1,9 @@
-import type { APIRequestContext, PlaywrightWorkerArgs } from '@playwright/test'
+import type { APIRequestContext, Locator, PlaywrightWorkerArgs } from '@playwright/test'
 import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { promisify } from 'node:util'
 import { expect, pveAuthState, test } from './fixtures/auth'
-import { NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
+import { loginToPve, NODE_NAME, openAnasItem, PVE_URL } from './fixtures/pve-ui'
 import { sshExec } from './fixtures/stunt-node'
 
 const execFileAsync = promisify(execFile)
@@ -45,9 +45,17 @@ const execFileAsync = promisify(execFile)
  * registered if it is not there and KEPT — it is node configuration the backup
  * specs share, not this spec's disposable state.
  *
- * NOT YET RUN (2026-09-24): written at unit level while the stunt node was
- * held by another job. Run it with the node free; the counts and any ground
- * truth it turns up belong in the story's Result paragraph.
+ * RUN 2026-09-25 on the stunt node: 5 passed, twice back to back.
+ *
+ * The run turned up one piece of ground truth of its own, written up in
+ * docs/SCHEDULES-GROUND-TRUTH.md (GT-16..GT-21): a task timer carries
+ * `Persistent=true`, and deleting a task removes its units but leaves
+ * `/var/lib/systemd/timers/stamp-anas-backup-<name>.timer` behind. Re-using a
+ * task name — which every spec does on every run — therefore hands the new
+ * timer an old "last trigger", and `enable --now` fires the service at once if
+ * any calendar point falls between that stamp and now. Hence the 2030 schedule
+ * in `taskBody` and the by-timestamp assertions below: this spec asserts on the
+ * run it starts, never on "whatever ran last".
  */
 
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
@@ -157,6 +165,30 @@ async function runTaskExpectingFailure(ctx: APIRequestContext, name: string): Pr
   return job.error?.message ?? ''
 }
 
+/**
+ * Type a value into the editable path combobox the way an operator does —
+ * real per-keystroke events. The row's rescan (and the derived name) ride the
+ * combobox's `change`, which ExtJS fires PER KEYSTROKE; a one-shot DOM value
+ * set (`fill`) commits nothing, so the row would still scan its old path.
+ * Select-all + type + Tab (blur commits and closes the dropdown).
+ */
+async function typePath(field: Locator, value: string): Promise<void> {
+  await field.click()
+  await field.press('Control+A')
+  await field.pressSequentially(value, { delay: 10 })
+  await field.press('Tab')
+}
+
+/** One point in time as `GET /backup/tasks/:name/snapshots` lists it. */
+interface TaskSnapshot { backupTime: number, backupTimeIso: string, files?: { archive?: string }[] }
+
+/** The task group's points in time on PBS ([] when the group does not exist). */
+async function taskSnapshots(ctx: APIRequestContext, name: string): Promise<TaskSnapshot[]> {
+  const res = await ctx.get(`${V1}/backup/tasks/${name}/snapshots`)
+  expect(res.status(), await res.text()).toBe(200)
+  return ((await res.json()).data.snapshots ?? []) as TaskSnapshot[]
+}
+
 /** The `unmounted` fact `preview-nested` reports for one path. */
 async function previewUnmounted(ctx: APIRequestContext, path: string): Promise<any> {
   const res = await ctx.post(`${V1}/backup/tasks/preview-nested`, { data: { path } })
@@ -176,7 +208,17 @@ function taskBody(name: string, archivePath: string): Record<string, unknown> {
     // A failed run must reach the operator — that is half of what this story
     // is about, so the notification is exercised rather than suppressed.
     notify: 'always',
-    schedule: '*-*-* 04:00:00',
+    // An ABSOLUTE date years out, not a time of day — the timer must never run
+    // itself. `Persistent=true` + a leftover
+    // `/var/lib/systemd/timers/stamp-anas-backup-<name>.timer` (deleting a task
+    // removes its units but NOT its stamp) makes `enable --now` fire at once
+    // when any calendar point lies between that stamp and now; `*-*-* 04:00:00`
+    // has such a point every day, so re-running this spec would race its own
+    // catch-up run against the one it asks for. A 2030 date has no occurrence
+    // to have missed, however stale the stamp — SCHEDULES-GROUND-TRUTH
+    // GT-16..GT-21, live on the stunt node. The task stays ENABLED because the
+    // dashboard warning this story asserts is only raised for enabled tasks.
+    schedule: '2030-01-01 00:00:00',
     enabled: true,
   }
 }
@@ -316,21 +358,26 @@ test.describe('Backup source guard (backup2.11)', () => {
 
   test('the wizard row warns on the unmounted path and is silent on a mounted one', async ({ page }) => {
     // The real PVE UI, the real wizard. The alert is the element that already
-    // carries the row's nested note.
+    // carries the row's nested note. The bare page fixture is not logged in —
+    // every other UI spec drives the login form first.
+    await loginToPve(page)
     await openAnasItem(page, 'Backup')
-    await page.getByRole('button', { name: 'Add' }).first().click()
+    // The grid's toolbar opens the task wizard (its seeded first row carries
+    // the path field); there is no "Add" button at this level.
+    await page.locator('.anas-btn-backup-new').click()
+    const taskWin = page.locator('.anas-win-backup-task')
+    await expect(taskWin).toBeVisible({ timeout: 45_000 })
 
     const row = page.locator('.anas-backup-archives .anas-backup-arch-nested-alert').first()
     const path = page.locator('.anas-backup-archives .anas-fld-backup-arch-path input').first()
+    await expect(path).toBeVisible({ timeout: 45_000 })
 
-    await path.fill(GUARDOK_SRC)
-    await path.blur()
+    await typePath(path, GUARDOK_SRC)
     await expect(row).toContainText('Not mounted', { timeout: 20_000 })
     await expect(row).toContainText(GUARDOK)
     await expect(row).toContainText('The run will be refused until it is mounted.')
 
-    await path.fill(MOUNTED_SRC)
-    await path.blur()
+    await typePath(path, MOUNTED_SRC)
     // The scan for the new path must have landed before this is read — the
     // consistency chip only appears once it has.
     await expect(row).toContainText(/snapshot|live/, { timeout: 20_000 })
@@ -344,7 +391,17 @@ test.describe('Backup source guard (backup2.11)', () => {
       // while the mount is down is a legitimate thing to have.
       await runJob(ctx, 'post', `${V1}/backup/tasks`, taskBody(GUARD_TASK, GUARDOK_SRC))
 
+      // PBS is the shared, KEPT repository — a previous run of this spec has
+      // left `host/gtguard` points in time on it, and nothing in the API
+      // deletes a backup (deleting a schedule is not deleting a backup). So the
+      // claim is checked as a DELTA over this run, not as an empty group.
+      const before = await taskSnapshots(ctx, GUARD_TASK)
+
       const cursor = await anasdCursor()
+      // The instant our own run began — the grid's `lastRunAt` and any new
+      // point in time are compared against it, so "the last run" is provably
+      // the one we asked for.
+      const runStartedAt = Date.now()
       const refusal = await runTaskExpectingFailure(ctx, GUARD_TASK)
 
       // DESIGN's own sentence, with all four facts.
@@ -353,11 +410,14 @@ test.describe('Backup source guard (backup2.11)', () => {
         + `which is configured in /etc/fstab but not mounted`,
       )
 
-      // Step 0 means step 0: nothing was uploaded, so PBS has no group for this
-      // task at all.
-      const snapsRes = await ctx.get(`${V1}/backup/tasks/${GUARD_TASK}/snapshots`)
-      expect(snapsRes.status()).toBe(200)
-      expect((await snapsRes.json()).data.snapshots ?? []).toEqual([])
+      // Step 0 means step 0: the refused run uploaded nothing, so PBS gained no
+      // point in time for it.
+      const after = await taskSnapshots(ctx, GUARD_TASK)
+      expect(after.length, 'the refused run added no snapshot').toBe(before.length)
+      expect(
+        after.filter(s => s.backupTime * 1000 >= runStartedAt - 1_000),
+        'no point in time was written at or after the refused run started',
+      ).toEqual([])
 
       // The failure reaches the operator through the surfaces that already
       // existed — nothing new carries it.
@@ -365,9 +425,18 @@ test.describe('Backup source guard (backup2.11)', () => {
       expect(notified.sent, 'the refused run emitted a PVE notification').toBeGreaterThan(0)
       expect(notified.renderFailures, 'the anas-backup template pair rendered').toBe(0)
 
+      // The grid row is the entry ENVELOPE — the task rides under `task`, the
+      // derived status (lastRunResult, lastRunAt, …) sits beside it.
       const rowRes = await ctx.get(`${V1}/backup/tasks`)
       expect(rowRes.status()).toBe(200)
-      const row = (await rowRes.json()).data.find((t: { name: string }) => t.name === GUARD_TASK)
+      const row = (await rowRes.json()).data.find(
+        (t: { task: { name: string } }) => t.task.name === GUARD_TASK,
+      )
+      expect(row, 'the task grid carries the created task').toBeTruthy()
+      // Tied to OUR run, not to "whatever ran last": systemd reports the run's
+      // timestamp to the second, so allow a second of slack either way.
+      expect(new Date(row.lastRunAt).getTime(), `lastRunAt ${row.lastRunAt} is the run this test started`)
+        .toBeGreaterThanOrEqual(runStartedAt - 1_000)
       expect(row.lastRunResult).toBe('failure')
 
       const statusRes = await ctx.get(`${V1}/status`)
@@ -413,16 +482,17 @@ test.describe('Backup source guard (backup2.11)', () => {
       // The save-time fact follows the system, not a cache.
       expect(await previewUnmounted(ctx, GUARDOK_SRC)).toBeUndefined()
 
+      const runStartedAt = Date.now()
       const result = await runJob(ctx, 'post', `${V1}/backup/tasks/${GUARD_TASK}/run`, {})
       expect(result, 'the run produced a result').toBeTruthy()
 
-      // PBS is the witness: the group now has a snapshot, and it carries the
-      // archive the guard used to refuse.
-      const snapsRes = await ctx.get(`${V1}/backup/tasks/${GUARD_TASK}/snapshots`)
-      expect(snapsRes.status()).toBe(200)
-      const snapshots = (await snapsRes.json()).data.snapshots as { files?: string[] }[]
-      expect(snapshots.length, 'PBS lists the snapshot this run wrote').toBeGreaterThan(0)
-      expect(JSON.stringify(snapshots)).toContain('guarded.pxar')
+      // PBS is the witness: a point in time written BY THIS RUN — a group the
+      // repository already carried from an earlier run would not prove it — and
+      // it carries the archive the guard used to refuse.
+      const written = (await taskSnapshots(ctx, GUARD_TASK))
+        .filter(s => s.backupTime * 1000 >= runStartedAt - 1_000)
+      expect(written.length, 'PBS lists the snapshot this run wrote').toBeGreaterThan(0)
+      expect(JSON.stringify(written)).toContain('guarded.pxar')
     }
     finally {
       await ctx.dispose()

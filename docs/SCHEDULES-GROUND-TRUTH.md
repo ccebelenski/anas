@@ -328,3 +328,246 @@ granularity). The toggle enables/disables BOTH timers `--now`. Read-only here;
   `x-anas-request-id` (zod `.uuid()`), and a DELETE must not carry
   `content-type: application/json` with an empty body (Fastify rejects empty JSON
   bodies before the handler) — harness notes, not route bugs.
+
+## 2026-09-25 — a freshly created task's unit firing without a Run now (stunt node)
+
+> Captured on the stunt node (`anas-pve`, 192.168.200.50) at 03:16–03:24 UTC on
+> 2026-09-25, against the build deployed from this branch. Two spec runs earlier
+> the same day (cloud `pictures-offsite`, backup `gtguard`) had seen a task's
+> service start seconds after the task was created, with no `Run now` issued.
+> The question: is that `Persistent=true` catching up on a missed calendar
+> point, and what decides it. Answer: yes, and the deciding input is the
+> **stamp file, which survives deleting the task**.
+
+### What the code does
+
+`packages/daemon/src/services/backup-units.ts` renders every task timer as
+
+```
+[Unit]
+Description=ANAS backup timer <name>
+
+[Timer]
+OnCalendar=<schedule>
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+and `writeTaskUnitFiles` in `packages/daemon/src/services/task-units.ts` writes
+both unit files, runs `systemctl daemon-reload`, then
+
+```
+systemctl enable --now anas-backup-<name>.timer     # enabled task
+systemctl disable --now anas-backup-<name>.timer    # disabled task
+```
+
+`removeTaskUnits` (same file) does `disable --now`, unlinks the two unit files
+and reloads — it does **not** touch `/var/lib/systemd/timers/stamp-…`.
+`removeScrubUnits` in `scrub-schedule-units.ts` does delete its stamp (review
+R10); the generic task path never got that treatment.
+
+### SCHEDULES-GT-16 — a stamp-less timer does NOT fire on enable
+
+Task `gtsched1`, `OnCalendar=daily`, created 03:17:09 UTC. No stamp file
+existed beforehand:
+
+```
+--- pre: stamp file for anas-backup-gtsched1.timer ---
+ls: cannot access '/var/lib/systemd/timers/stamp-anas-backup-gtsched1.timer': No such file or directory
+--- pre: journal for the service ---
+-- No entries --
+```
+
+Immediately after the create job completed:
+
+```
+NEXT                             LEFT LAST                               PASSED UNIT                              ACTIVATES
+Sat 2026-09-26 00:00:00 UTC       20h -                                       - anas-backup-gtsched1.timer        anas-backup-gtsched1.service
+
+NextElapseUSecRealtime=Sat 2026-09-26 00:00:00 UTC
+LastTriggerUSec=
+Persistent=yes
+ActiveState=active
+InactiveExitTimestamp=Fri 2026-09-25 03:17:09 UTC
+
+-rw-r--r-- 1 root root 0 2026-09-25 03:17:09.707355953 +0000 /var/lib/systemd/timers/stamp-anas-backup-gtsched1.timer
+```
+
+45 s later, still nothing (no `Run now` was issued at any point):
+
+```
+--- t+45s: journal for the service ---
+-- No entries --
+--- t+45s: journal for the timer ---
+2026-09-25T03:17:09+00:00 anas-pve systemd[1]: Started anas-backup-gtsched1.timer - ANAS backup timer gtsched1.
+```
+
+systemd **creates** the stamp file at timer start when it is absent (mtime
+03:17:09.707, the moment of `enable --now`) but leaves `LastTriggerUSec` empty,
+so the next elapse is computed from *now*: 00:00 tomorrow. There is nothing to
+catch up on. The "a `daily` timer enabled at 02:36 sees today's fire as missed"
+reading is wrong for a genuinely fresh name.
+
+### SCHEDULES-GT-17 — a LEFTOVER stamp makes it fire immediately
+
+`gtsmoke` is a task an earlier spec run created and deleted. Its stamp file was
+still on the node, carrying that run's trigger time:
+
+```
+--- pre: stamp file for anas-backup-gtsmoke.timer ---
+-rw-r--r-- 1 root root 0 2026-09-24 19:42:14.622373009 +0000 /var/lib/systemd/timers/stamp-anas-backup-gtsmoke.timer
+--- pre: unit files ---
+ls: cannot access '/etc/systemd/system/anas-backup-gtsmoke.*': No such file or directory
+```
+
+A task of that name was created again at 03:18:57 UTC with `OnCalendar=daily`,
+and nothing else was asked of it:
+
+```
+--- t+0s: systemctl list-timers ---
+NEXT                             LEFT LAST                               PASSED UNIT                              ACTIVATES
+-                                   - Fri 2026-09-25 03:18:58 UTC     389ms ago anas-backup-gtsmoke.timer         anas-backup-gtsmoke.service
+--- t+0s: systemctl show timer ---
+NextElapseUSecRealtime=
+LastTriggerUSec=Fri 2026-09-25 03:18:58 UTC
+Persistent=yes
+ActiveState=active
+InactiveExitTimestamp=Fri 2026-09-25 03:18:58 UTC
+--- t+0s: stamp file ---
+-rw-r--r-- 1 root root 0 2026-09-25 03:18:58.344009000 +0000 /var/lib/systemd/timers/stamp-anas-backup-gtsmoke.timer
+--- t+0s: service state ---
+ExecMainStartTimestamp=Fri 2026-09-25 03:18:58 UTC
+ActiveState=activating
+SubState=start
+InvocationID=c3507a49ff084f5eb2c3057e8c382e15
+```
+
+```
+--- t+45s: journal for the service ---
+2026-09-25T03:18:58+00:00 anas-pve systemd[1]: Starting anas-backup-gtsmoke.service - ANAS backup task gtsmoke...
+2026-09-25T03:19:08+00:00 anas-pve node[2040620]: Error: unable to access '/gtbackup/.zfs/snapshot/anas-backup-gtsmoke-1790306338/nosuchpath' - No such file or directory (os error 2)
+2026-09-25T03:19:08+00:00 anas-pve systemd[1]: anas-backup-gtsmoke.service: Main process exited, code=exited, status=1/FAILURE
+--- t+45s: journal for the timer ---
+2026-09-25T03:18:58+00:00 anas-pve systemd[1]: Started anas-backup-gtsmoke.timer - ANAS backup timer gtsmoke.
+```
+
+The service started in the same second the timer did. The stamp said "last ran
+19:42 yesterday", the last `daily` point (00:00 today) fell after that, so
+`Persistent=true` treated it as a missed run and fired.
+
+### SCHEDULES-GT-18 — the stamp file survives deleting the task
+
+`DELETE /v1/backup/tasks/gtsmoke` (job `backup.task.remove`, completed):
+
+```
+--- after delete: unit files ---
+ls: cannot access '/etc/systemd/system/anas-backup-gtsmoke.*': No such file or directory
+--- after delete: stamp file (does it survive?) ---
+-rw-r--r-- 1 root root 0 2026-09-25 03:18:58.344009000 +0000 /var/lib/systemd/timers/stamp-anas-backup-gtsmoke.timer
+```
+
+The node currently carries 30-odd such orphans, the oldest from 2026-07-19 —
+one per task name any spec or operator has ever used and removed.
+
+### SCHEDULES-GT-19 — the same name, the same schedule, the other stamp: no fire
+
+Re-creating `gtsmoke` at 03:20:07 with `OnCalendar=daily` again, the only
+difference being the stamp GT-17 had just refreshed to 03:18:58 today:
+
+```
+--- t+0s: systemctl list-timers ---
+NEXT                             LEFT LAST                               PASSED UNIT                              ACTIVATES
+Sat 2026-09-26 00:00:00 UTC       20h Fri 2026-09-25 03:18:58 UTC             - anas-backup-gtsmoke.timer         anas-backup-gtsmoke.service
+--- t+0s: systemctl show timer ---
+NextElapseUSecRealtime=Sat 2026-09-26 00:00:00 UTC
+LastTriggerUSec=Fri 2026-09-25 03:18:58 UTC
+Persistent=yes
+ActiveState=active
+InactiveExitTimestamp=Fri 2026-09-25 03:20:08 UTC
+```
+
+and at t+45 s the service journal still ended at the 03:19:08 run — no new
+activation. The stamp is the whole variable.
+
+### SCHEDULES-GT-20 — a far-future TIME OF DAY is not immunity
+
+Fresh name `gtsched3`, `OnCalendar=*-*-* 23:59:00`, created 03:21:15, no stamp
+beforehand — next elapse 23:59 today, nothing fired:
+
+```
+NextElapseUSecRealtime=Fri 2026-09-25 23:59:00 UTC
+LastTriggerUSec=
+Persistent=yes
+--- t+45s: journal for the service ---
+-- No entries --
+```
+
+The same schedule on a name whose stamp is old (`livemeta`, stamp
+2026-07-19 02:13:04) fired at once, because 23:59 *yesterday* is a point the
+stamp says was missed:
+
+```
+--- t+0s: systemctl list-timers ---
+NEXT                             LEFT LAST                               PASSED UNIT                              ACTIVATES
+-                                   - Fri 2026-09-25 03:22:09 UTC     457ms ago anas-backup-livemeta.timer        anas-backup-livemeta.service
+--- t+0s: systemctl show timer ---
+NextElapseUSecRealtime=
+LastTriggerUSec=Fri 2026-09-25 03:22:09 UTC
+Persistent=yes
+--- t+45s: journal for the service ---
+2026-09-25T03:22:09+00:00 anas-pve systemd[1]: Starting anas-backup-livemeta.service - ANAS backup task livemeta...
+```
+
+### SCHEDULES-GT-21 — an absolute future DATE is immunity
+
+`livetok` (stamp 2026-07-19 02:20:28, two months stale), `OnCalendar=2030-01-01
+00:00:00`, created 03:23:04:
+
+```
+--- t+0s: systemctl list-timers ---
+NEXT                                    LEFT LAST                               PASSED UNIT                              ACTIVATES
+Tue 2030-01-01 00:00:00 UTC 3 years 3 months Sun 2026-07-19 02:20:28 UTC             - anas-backup-livetok.timer         anas-backup-livetok.service
+--- t+0s: systemctl show timer ---
+NextElapseUSecRealtime=Tue 2030-01-01 00:00:00 UTC
+LastTriggerUSec=Sun 2026-07-19 02:20:28 UTC
+Persistent=yes
+ActiveState=active
+--- t+45s: journal for the service ---
+(empty)
+```
+
+A calendar expression with no occurrence between the stamp and now has nothing
+to catch up on, however stale the stamp. This is what a spec should use when it
+needs an enabled task that will not run itself.
+
+### Verdict
+
+The rule systemd applies on `enable --now` of a `Persistent=true` timer:
+
+- **no stamp file** → the stamp is created with the current time, `LastTrigger`
+  stays empty, the next elapse is the first calendar point *after now*. Never an
+  immediate run.
+- **a stamp file** → its mtime is `LastTrigger`. If any calendar point lies
+  between it and now, the timer fires immediately, once.
+
+ANAS creates the condition itself: deleting a task removes its units but leaves
+the stamp, so **re-using a task name is what arms the immediate run**, and the
+staler the stamp the likelier it is. Both of today's sightings were re-used
+names — `pictures-offsite` and `gtguard` are spec task names created and deleted
+on every run of their specs.
+
+All five probe tasks were deleted afterwards; no `anas-backup-*`/`anas-cloud-*`
+units and no `anas-backup-*` ZFS snapshots remained on the node.
+
+### The two candidate remedies (operator rules)
+
+1. **Write the stamp at creation** — `touch
+   /var/lib/systemd/timers/stamp-anas-<kind>-<name>.timer` before `enable
+   --now` (or delete it in `removeTaskUnits`, the way `removeScrubUnits`
+   already does), so a newly saved task's first run waits for its next real
+   calendar point.
+2. **Document it** — say plainly that a task whose schedule has already passed
+   today runs once as soon as it is saved, and leave the catch-up as the
+   missed-run heal it was built to be.
