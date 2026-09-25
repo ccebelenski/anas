@@ -30,21 +30,49 @@ source "${SCRIPT_DIR}/config.sh"
 #   up-multi  one data leaf, TWO cache leaves and TWO spares (by-id), the shape
 #             that proves a pool-level section holding more than one bare leaf.
 #
-# `down` is the safety net for all three: destroy gtvdev if present, wipe disk 9
-# (labels + GPT), detach it. Every verb is idempotent.
+# Three more shapes for the topology zoo (topology.1 — the story's still-missing
+# captures; test/stunt-node/topology-zoo.sh drives them and lands the files):
+#   up-file       FILE vdevs on sparse files under /gtbackup/anas-topology-zoo:
+#                 a file data root PLUS file-backed log, cache and spare
+#                 sections in one pool — the vdev_type:"file" shapes in the
+#                 tree and beside it.
+#   up-byid-whole a pool on the WHOLE disk by-id (no partitions) — the most
+#                 common production layout, leaves named by-id without -partN.
+#   up-suspended  a pool on a dm-linear device over a file under the same
+#                 directory, whose table is then swapped to dm-error so every
+#                 I/O fails and the pool SUSPENDS. WHY NOT "rm the backing
+#                 file": ZFS holds the file (or loop device) OPEN, so unlinking
+#                 or truncating it does not fail the I/O — the pool keeps
+#                 running on the unlinked inode. A dm table swap fails the I/O
+#                 at the kernel boundary, deterministically, the way the
+#                 yanked-disk capture of story 3.16 did. Recovery in `down`:
+#                 restore the linear table, `zpool clear` (the pool comes back
+#                 and can be destroyed cleanly); `zpool destroy -f` is the
+#                 fallback once the table is restored.
+#
+# `down` is the safety net for ALL six: restore the suspended shape's dm table
+# if present, destroy gtvdev if present, wipe disk 9 (labels + GPT), detach it,
+# sweep the file-vdev directory. Every verb is idempotent.
 
 POOL="gtvdev"
 DISK_NUM=9
 BY_ID="scsi-0QEMU_QEMU_HARDDISK_ANAS_HOT${DISK_NUM}"
 IMAGE="${STORAGE_PATH}/${VM_NAME}-hot${DISK_NUM}.qcow2"
+# The file-backed shapes live under the gtbackup MOUNTPOINT in their own
+# directory — never among gtbackup's data, and never on disks 1-6.
+FILES_DIR="/gtbackup/anas-topology-zoo"
+DM_NAME="gtzoosusp"
 
 usage() {
-  echo "Usage: vdev-fixture.sh <up|up-byid|up-multi|down|status>"
-  echo "  up        Attach disk ${DISK_NUM} (2048 MB), partition it into six, create pool ${POOL} from KERNEL names (idempotent)"
-  echo "  up-byid   The same six classes, created from /dev/disk/by-id/<id>-partN (idempotent)"
-  echo "  up-multi  data + TWO cache leaves + TWO spares, by-id (idempotent)"
-  echo "  down      Destroy ${POOL} if present, wipe disk ${DISK_NUM}, detach it (idempotent)"
-  echo "  status    The pool's zpool status + the disk's by-id links"
+  echo "Usage: vdev-fixture.sh <up|up-byid|up-multi|up-file|up-byid-whole|up-suspended|down|status>"
+  echo "  up             Attach disk ${DISK_NUM} (2048 MB), partition it into six, create pool ${POOL} from KERNEL names (idempotent)"
+  echo "  up-byid        The same six classes, created from /dev/disk/by-id/<id>-partN (idempotent)"
+  echo "  up-multi       data + TWO cache leaves + TWO spares, by-id (idempotent)"
+  echo "  up-file        File vdevs on sparse files under ${FILES_DIR} (idempotent)"
+  echo "  up-byid-whole  A pool on the whole disk by-id, no partitions (idempotent)"
+  echo "  up-suspended   A pool on a dm-linear device over a file, table swapped to dm-error so the pool suspends (idempotent)"
+  echo "  down           Destroy ${POOL} if present, restore/sweep the file shapes, wipe disk ${DISK_NUM}, detach it (idempotent)"
+  echo "  status         The pool's zpool status + the disk's by-id links"
   exit 1
 }
 
@@ -87,6 +115,121 @@ status() {
   else
     echo "no fixture pool (${POOL})"
   fi
+}
+
+# up-file — file vdevs on sparse files under ${FILES_DIR}. The files must exist
+# before `zpool create` names them (ZFS does not create missing file vdevs).
+up_file() {
+  echo "=== topology.1 fixture — up-file (file vdevs) ==="
+  if pool_exists; then
+    echo "✓ ${POOL} already exists (skipping — 'down' first for a rebuild)"
+    return
+  fi
+  $SSH_CMD "bash -s" <<REMOTE
+set -euo pipefail
+if [ ! -d /gtbackup ]; then
+  echo "ERROR: /gtbackup is not mounted — the file-vdev shapes need it" >&2
+  exit 1
+fi
+mkdir -p ${FILES_DIR}
+truncate -s 1G   ${FILES_DIR}/data0.img
+truncate -s 256M ${FILES_DIR}/log0.img
+truncate -s 256M ${FILES_DIR}/cache0.img
+truncate -s 256M ${FILES_DIR}/spare0.img
+zpool create -f ${POOL} \\
+  "${FILES_DIR}/data0.img" \\
+  log "${FILES_DIR}/log0.img" \\
+  cache "${FILES_DIR}/cache0.img" \\
+  spare "${FILES_DIR}/spare0.img"
+REMOTE
+  echo "✓ ${POOL} created (file data root + file log/cache/spare sections under ${FILES_DIR})"
+}
+
+# up-byid-whole — the whole disk by-id, no partitions. The zap first is the
+# same stale-table guard the other shapes use.
+up_byid_whole() {
+  echo "=== topology.1 fixture — up-byid-whole (whole disk by-id) ==="
+
+  "$SCRIPT_DIR/add-disk.sh" --size 2048 "$DISK_NUM"
+  wait_for_by_id
+
+  if pool_exists; then
+    echo "✓ ${POOL} already exists (skipping — 'down' first for a rebuild)"
+  else
+    # The tail reaches the node VERBATIM (create_pool does not re-expand it),
+    # so the by-id is expanded host-side here — unlike the `up` shapes, whose
+    # tails are node-side "${P}" placeholders.
+    create_pool "\"/dev/disk/by-id/${BY_ID}\"" ''
+    echo "✓ ${POOL} created (whole disk ${BY_ID}, no partitions)"
+  fi
+}
+
+# up-suspended — a pool on a dm-linear device over a file; the table is then
+# swapped to dm-error so EVERY I/O fails and the pool suspends (failmode wait).
+# See the header comment for why the backing file is not simply removed.
+up_suspended() {
+  echo "=== topology.1 fixture — up-suspended (dm-error suspension) ==="
+  if pool_exists; then
+    echo "✓ ${POOL} already exists (skipping — 'down' first for a rebuild)"
+    return
+  fi
+  $SSH_CMD "bash -s" <<REMOTE
+set -euo pipefail
+if [ ! -d /gtbackup ]; then
+  echo "ERROR: /gtbackup is not mounted — the suspended shape needs it" >&2
+  exit 1
+fi
+mkdir -p ${FILES_DIR}
+truncate -s 256M ${FILES_DIR}/susp.img
+LOOP=\$(losetup --find --show ${FILES_DIR}/susp.img)
+SIZE=\$(blockdev --getsz "\$LOOP")
+dmsetup create ${DM_NAME} --table "0 \${SIZE} linear \${LOOP} 0"
+echo "0 \${SIZE} linear \${LOOP} 0" > /run/anas-topology-zoo-${DM_NAME}.table
+zpool create -f ${POOL} /dev/mapper/${DM_NAME}
+zfs create ${POOL}/fs
+# Swap the table to error and force reads: every I/O now fails and the pool
+# suspends exactly the way a yanked disk does (story 3.16).
+echo "0 \${SIZE} error" | dmsetup load ${DM_NAME}
+dmsetup resume ${DM_NAME}
+zpool scrub ${POOL} || true
+for n in \$(seq 1 60); do
+  if [ "\$(zpool list -H -o health ${POOL} 2>/dev/null)" = "SUSPENDED" ]; then
+    echo "✓ ${POOL} is SUSPENDED"
+    exit 0
+  fi
+  sleep 1
+done
+echo "ERROR: ${POOL} never suspended" >&2
+exit 1
+REMOTE
+}
+
+# The suspended shape's I/O must be restored BEFORE the pool can be destroyed:
+# reload the saved linear table, clear, then destroy. Everything here tolerates
+# the never-suspended state.
+restore_dm_and_destroy() {
+  $SSH_CMD "bash -s" <<REMOTE || true
+if dmsetup info ${DM_NAME} >/dev/null 2>&1; then
+  TABLE=/run/anas-topology-zoo-${DM_NAME}.table
+  dmsetup suspend ${DM_NAME} || true
+  if [ -s "\$TABLE" ]; then
+    dmsetup load ${DM_NAME} --table "\$TABLE" || true
+  fi
+  dmsetup resume ${DM_NAME} || true
+  if zpool list -H ${POOL} >/dev/null 2>&1; then
+    zpool clear ${POOL} || true
+    for n in \$(seq 1 10); do
+      [ "\$(zpool list -H -o health ${POOL} 2>/dev/null)" != "SUSPENDED" ] && break
+      sleep 1
+    done
+    zpool destroy -f ${POOL} || true
+  fi
+  dmsetup remove ${DM_NAME} || true
+  LOOP=\$(losetup -a | grep '${FILES_DIR}/susp.img' | cut -d: -f1 || true)
+  [ -n "\$LOOP" ] && losetup -d "\$LOOP" || true
+fi
+rm -rf ${FILES_DIR}
+REMOTE
 }
 
 # Partition disk 9 into six and create ${POOL} in ONE remote shell so the
@@ -162,8 +305,32 @@ case "$1" in
     status
     ;;
 
+  up-file)
+    up_file
+    echo
+    echo "=== Fixture ready ==="
+    status
+    ;;
+
+  up-byid-whole)
+    up_byid_whole
+    echo
+    echo "=== Fixture ready ==="
+    status
+    ;;
+
+  up-suspended)
+    up_suspended
+    echo
+    echo "=== Fixture ready ==="
+    status
+    ;;
+
   down)
     echo "=== vdevs.1 fixture — down ==="
+    # The suspended shape first: its dm table is the pool's backing, and a
+    # suspended pool cannot be destroyed until the I/O is restored.
+    restore_dm_and_destroy
     if pool_exists; then
       $SSH_CMD "zpool destroy ${POOL}"
       echo "✓ ${POOL} destroyed"
