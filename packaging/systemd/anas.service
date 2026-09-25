@@ -2,6 +2,9 @@
 Description=ANAS API Gateway
 After=anasd.service
 Requires=anasd.service
+# A daemon restart propagates to the gateway: Requires= alone left it stopped
+# with nothing to restart it (ahrcache.1 live proof, AHR-DESIGN §13 live-proof paragraph).
+PartOf=anasd.service
 
 [Service]
 Type=simple
