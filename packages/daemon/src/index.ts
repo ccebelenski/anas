@@ -5,10 +5,13 @@ import type { IscsiPaths } from './services/iscsi.js'
 import { chmodSync, existsSync, statSync, unlinkSync } from 'node:fs'
 import { createServer } from './server.js'
 import { ahrBootScan } from './services/ahr-boot-scan.js'
+import { BACKUP_UNIT_KIND } from './services/backup-units.js'
+import { CLOUD_UNIT_KIND } from './services/cloud-units.js'
 import { iscsiStubBootScan } from './services/iscsi-quarantine.js'
 import { PROBE_TMP_BASE, sweepStaleProbeDirs } from './services/rclone-probe.js'
 import { reconcileSelfhealState, reconcileWasQuiet } from './services/selfheal-reconcile.js'
 import { DEFAULT_SYSTEMD_DIR } from './services/snapshot-schedule-units.js'
+import { sweepOrphanTaskStamps } from './services/task-units.js'
 
 // Default to the same socket the gateway expects (/run/anas/anasd.sock). A
 // no-env manual launch must NOT land the trust-boundary socket in world-writable
@@ -126,6 +129,22 @@ async function main() {
           server.log.warn(`rclone probe sweep: removed ${swept.length} stale probe config dir(s) from ${PROBE_TMP_BASE} (${swept.join(', ')})`)
       }).catch((err) => {
         server.log.warn(`rclone probe sweep failed: ${err instanceof Error ? err.message : String(err)}`)
+      })
+
+      // Orphan task stamps (SCHEDULES-GT-17/18, operator ruling 2026-09-25): a
+      // removed backup/cloud task used to leave systemd's Persistent stamp
+      // behind, and re-creating a task under that name fired at once — the
+      // stamp read as a missed run. removeTaskUnits deletes the stamp now; this
+      // sweep clears the orphans already on a node (GT-18 counted 30-odd).
+      // Exact prefixes from the two stores' descriptors, any age — the units
+      // are gone, nothing of ours is in flight at start, and a stamp whose
+      // units still exist is the missed-run heal and stays. Non-blocking,
+      // fail-open.
+      void sweepOrphanTaskStamps([BACKUP_UNIT_KIND, CLOUD_UNIT_KIND]).then((swept) => {
+        for (const file of swept)
+          server.log.info(`task stamp sweep: removed orphan stamp ${file} — its task no longer exists`)
+      }).catch((err) => {
+        server.log.warn(`task stamp sweep failed: ${err instanceof Error ? err.message : String(err)}`)
       })
 
       // No periodic-scrub adoption here (review F1/F4, design reversal

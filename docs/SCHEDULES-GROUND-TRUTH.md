@@ -571,3 +571,17 @@ units and no `anas-backup-*` ZFS snapshots remained on the node.
 2. **Document it** — say plainly that a task whose schedule has already passed
    today runs once as soon as it is saved, and leave the catch-up as the
    missed-run heal it was built to be.
+
+### Remedy (operator ruling 2026-09-25)
+
+Remedy 1, the delete half: `removeTaskUnits` now deletes the stamp alongside the
+units and issues `systemctl reset-failed` for the pair (the scrub store's
+pattern — a removed oneshot that failed otherwise stays behind as a
+`not-found` ghost), while the missed-run heal for a task that still exists is
+left exactly as systemd built it. The orphans already on a node (GT-18 counted
+30-odd) are swept at daemon start: every `stamp-anas-backup-*` /
+`stamp-anas-cloud-*` file in the timers dir whose service AND timer units no
+longer exist is deleted, one journald line each; a stamp whose units exist, a
+foreign `stamp-*.timer`, and the scrub pair are never touched. The two
+integration specs keep their GT-21 absolute-date schedules — the product now
+removes the stamp itself, so the dates are belt and braces for pre-fix nodes.

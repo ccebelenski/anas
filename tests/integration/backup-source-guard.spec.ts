@@ -49,13 +49,14 @@ const execFileAsync = promisify(execFile)
  *
  * The run turned up one piece of ground truth of its own, written up in
  * docs/SCHEDULES-GROUND-TRUTH.md (GT-16..GT-21): a task timer carries
- * `Persistent=true`, and deleting a task removes its units but leaves
+ * `Persistent=true`, and deleting a task used to remove its units but leave
  * `/var/lib/systemd/timers/stamp-anas-backup-<name>.timer` behind. Re-using a
- * task name — which every spec does on every run — therefore hands the new
- * timer an old "last trigger", and `enable --now` fires the service at once if
- * any calendar point falls between that stamp and now. Hence the 2030 schedule
- * in `taskBody` and the by-timestamp assertions below: this spec asserts on the
- * run it starts, never on "whatever ran last".
+ * task name — which every spec does on every run — therefore handed the new
+ * timer an old "last trigger", and `enable --now` fired the service at once if
+ * any calendar point fell between that stamp and now. The product removes the
+ * stamp itself now (operator ruling 2026-09-25, SCHEDULES-GT remedy); the 2030
+ * schedule in `taskBody` and the by-timestamp assertions below stay belt and
+ * braces: this spec asserts on the run it starts, never on "whatever ran last".
  */
 
 const V1 = `${PVE_URL}/anas/api/nodes/${NODE_NAME}/v1`
@@ -210,14 +211,17 @@ function taskBody(name: string, archivePath: string): Record<string, unknown> {
     notify: 'always',
     // An ABSOLUTE date years out, not a time of day — the timer must never run
     // itself. `Persistent=true` + a leftover
-    // `/var/lib/systemd/timers/stamp-anas-backup-<name>.timer` (deleting a task
-    // removes its units but NOT its stamp) makes `enable --now` fire at once
-    // when any calendar point lies between that stamp and now; `*-*-* 04:00:00`
-    // has such a point every day, so re-running this spec would race its own
-    // catch-up run against the one it asks for. A 2030 date has no occurrence
-    // to have missed, however stale the stamp — SCHEDULES-GROUND-TRUTH
-    // GT-16..GT-21, live on the stunt node. The task stays ENABLED because the
-    // dashboard warning this story asserts is only raised for enabled tasks.
+    // `/var/lib/systemd/timers/stamp-anas-backup-<name>.timer` used to fire
+    // `enable --now` at once when any calendar point lay between that stamp and
+    // now; `*-*-* 04:00:00` has such a point every day, so re-running this spec
+    // would race its own catch-up run against the one it asks for. The product
+    // removes the stamp itself now (operator ruling 2026-09-25: removeTaskUnits
+    // deletes it, the daemon sweeps orphans at start), so a re-used name starts
+    // stamp-less — the 2030 date stays belt and braces for a pre-fix node,
+    // which has no occurrence to have missed however stale its stamps are
+    // (SCHEDULES-GROUND-TRUTH GT-16..GT-21, live on the stunt node). The task
+    // stays ENABLED because the dashboard warning this story asserts is only
+    // raised for enabled tasks.
     schedule: '2030-01-01 00:00:00',
     enabled: true,
   }

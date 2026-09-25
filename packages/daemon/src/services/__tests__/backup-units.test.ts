@@ -428,11 +428,32 @@ describe('backup units — CRUD lifecycle (temp dir + mocked systemctl)', () => 
     assert.ok(!cmds.some(c => c.startsWith('enable ')))
   })
 
-  it('removeTaskUnits deletes both files, disables the timer, leaves others', async () => {
-    await writeTaskUnits(mock, dir, makeTask())
-    await writeFile(join(dir, 'keep.txt'), 'x')
-    await removeTaskUnits(mock, dir, 'nightly-etc')
-    assert.deepEqual(await readdir(dir), ['keep.txt'])
+  it('removeTaskUnits deletes both files, the stamp, disables the timer, resets failed, leaves others', async () => {
+    // SCHEDULES-GT-17/18: the stamp and the failed-state ghost go with the
+    // units, so a re-created task cannot inherit a stale last-trigger.
+    const stampDir = await mkdtemp(join(tmpdir(), 'anas-backup-stamps-'))
+    const savedStampDir = process.env.ANAS_TIMERS_STAMP_DIR
+    process.env.ANAS_TIMERS_STAMP_DIR = stampDir
+    try {
+      await writeTaskUnits(mock, dir, makeTask())
+      await writeFile(join(stampDir, `stamp-${timerUnitName('nightly-etc')}`), '')
+      await writeFile(join(stampDir, 'stamp-anas-backup-untouched.timer'), '')
+      await writeFile(join(dir, 'keep.txt'), 'x')
+      await removeTaskUnits(mock, dir, 'nightly-etc')
+      assert.deepEqual(await readdir(dir), ['keep.txt'])
+      assert.deepEqual(await readdir(stampDir), ['stamp-anas-backup-untouched.timer'])
+      const cmds = mock.calls.map(c => c.args.join(' '))
+      assert.ok(cmds.includes(`reset-failed ${serviceUnitName('nightly-etc')} ${timerUnitName('nightly-etc')}`))
+      assert.ok(cmds.includes(`disable --now ${timerUnitName('nightly-etc')}`))
+      assert.ok(cmds.includes('daemon-reload'))
+    }
+    finally {
+      if (savedStampDir === undefined)
+        delete process.env.ANAS_TIMERS_STAMP_DIR
+      else
+        process.env.ANAS_TIMERS_STAMP_DIR = savedStampDir
+      await rm(stampDir, { recursive: true, force: true })
+    }
   })
 
   it('readAllTasks parses valid units and skips invalid ones (fail-open)', async () => {

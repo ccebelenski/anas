@@ -83,6 +83,19 @@ export async function listServiceUnits(dir: string, prefix: string): Promise<str
   return files.filter(f => f.startsWith(prefix) && f.endsWith('.service'))
 }
 
+/**
+ * Where systemd records a Persistent timer's last fire — `stamp-<unit>.timer`
+ * beside `/etc/systemd/system`, NOT with the unit files. A leftover stamp makes
+ * a re-enabled or re-created timer fire at once (the stamp reads as a missed
+ * run), so every ANAS store that removes a timer deletes its stamp alongside
+ * the units. Read per call, not at import, so a test can point it at a scratch
+ * dir by env after the modules are loaded. ONE home for the path — the scrub
+ * store knew it first, the task stores now share it.
+ */
+export function systemdTimersStampDir(): string {
+  return process.env.ANAS_TIMERS_STAMP_DIR ?? '/var/lib/systemd/timers'
+}
+
 /** Delete a file quietly — a missing file is fine, the goal state already holds. */
 export async function unlinkQuiet(path: string): Promise<void> {
   try {

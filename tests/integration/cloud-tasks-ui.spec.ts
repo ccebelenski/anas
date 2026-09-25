@@ -71,18 +71,21 @@ const TASK = 'pictures-offsite'
 /**
  * The schedule every task this spec creates carries.
  *
- * SCHEDULES-GT-17/GT-18/GT-21: deleting a task removes its units but LEAVES
- * `/var/lib/systemd/timers/stamp-anas-cloud-<name>.timer` behind, and this spec
- * re-uses `pictures-offsite` and `sync-empty` on every run — so on the second
- * run onwards the stamp is already there, carrying the previous run's trigger
- * time. `Persistent=true` then fires the timer the instant it is enabled if ANY
- * calendar point lies between that stamp and now, which a `daily` (or any
- * time-of-day) expression always has. An absolute FUTURE DATE has no occurrence
- * between the stamp and now however stale the stamp is, so the task sits
- * enabled and runs only when this spec runs it (GT-21, proven on the node).
+ * SCHEDULES-GT-17/GT-18/GT-21: deleting a task used to remove its units but
+ * LEAVE `/var/lib/systemd/timers/stamp-anas-cloud-<name>.timer` behind, and
+ * this spec re-uses `pictures-offsite` and `sync-empty` on every run — so from
+ * the second run onwards the stamp was already there, carrying the previous
+ * run's trigger time, and `Persistent=true` fired the re-created timer the
+ * instant it was enabled if ANY calendar point lay between that stamp and now.
+ * The product removes the stamp itself now (operator ruling 2026-09-25,
+ * task-units.ts removeTaskUnits + the daemon-start sweep), so a re-used name
+ * starts stamp-less — the fresh-timer rule of GT-16, never an immediate run.
  *
- * This is a spec-side workaround, deliberately: the stamp remedy is an open
- * product ruling, and a live proof must not change the product to suit itself.
+ * The absolute FUTURE DATE stays anyway, belt and braces (GT-21): a node
+ * running a pre-fix build still carries its orphans until a daemon start on
+ * the fixed one, and a date with no occurrence before 2030 can never arm the
+ * immediate fire however stale the stamp is. The task sits enabled and runs
+ * only when this spec runs it.
  */
 const SCHEDULE = '2030-01-01 00:00:00'
 
@@ -99,7 +102,9 @@ const TASK_BODY: Record<string, unknown> = {
   excludes: [],
   notify: 'on-failure',
   // A raw OnCalendar, NOT a `cadence`: a cadence generates a weekly time-of-day
-  // expression, which the leftover stamp turns into an immediate self-run.
+  // expression, which a leftover stamp (a pre-fix node's) turns into an
+  // immediate self-run. The product deletes the stamp now; the raw schedule
+  // stays belt and braces.
   schedule: SCHEDULE,
   enabled: true,
 }

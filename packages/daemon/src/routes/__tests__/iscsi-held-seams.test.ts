@@ -143,6 +143,12 @@ describe('iscsi.6 — the backing-file-removal seam (no such path exists)', () =
     // unlinkQuiet to (review remediation 2026-09-13): same systemd unit files,
     // same ownership rule — only files ANAS wrote.
     'systemd-unit-store.ts',
+    // The task stores (backup/cloud) tear down what they rendered plus —
+    // SCHEDULES-GT-17/18, operator ruling 2026-09-25 — systemd's own
+    // `stamp-<timer>.timer` Persistent-stamp files: only in the timers stamp
+    // dir, only under a task kind's prefix, only when both of the task's unit
+    // files are already gone. It never reaches a dataset.
+    'task-units.ts',
     'iscsi-mutate.ts',
     'iscsi-quarantine.ts',
     'backup-restore.ts',

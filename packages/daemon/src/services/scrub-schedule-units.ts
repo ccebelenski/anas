@@ -6,7 +6,7 @@ import { AhrScrubSchedule as AhrScrubScheduleSchema } from '@anas/shared'
 import { parseSystemdTimestamp } from './systemd-status.js'
 // The unit-store plumbing (marker parse, unlink, systemctl) is the ONE shared
 // copy in systemd-unit-store.ts — this store was its fourth hand-copy.
-import { parseMarkedJson, readUnitFile, runSystemctl, unlinkQuiet } from './systemd-unit-store.js'
+import { parseMarkedJson, readUnitFile, runSystemctl, systemdTimersStampDir, unlinkQuiet } from './systemd-unit-store.js'
 
 /**
  * The node-level AHR periodic-scrub UNITS (story selfheal.4) — the
@@ -53,11 +53,12 @@ const SCHEDULE_MARKER_RE_LINE = /^#?\s*X-ANAS-Schedule=.*$/m
  * `removeScrubUnits` clears the stamp alongside the units (review R10), and
  * the enable-confirm dialog warns the operator anyway (belt and braces).
  * Verified live: `/var/lib/systemd/timers/stamp-anas-scrub.timer` on the
- * stunt node. The dir is env-overridable so tests never touch the real one.
+ * stunt node. The dir comes from the shared {@link systemdTimersStampDir} —
+ * ONE place knows the path — and is env-overridable so tests never touch the
+ * real one.
  */
 export function scrubStampPath(): string {
-  const stampDir = process.env.ANAS_TIMERS_STAMP_DIR ?? '/var/lib/systemd/timers'
-  return `${stampDir}/stamp-${SCRUB_TIMER_NAME}`
+  return `${systemdTimersStampDir()}/stamp-${SCRUB_TIMER_NAME}`
 }
 
 /**

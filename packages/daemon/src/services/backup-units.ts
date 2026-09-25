@@ -210,9 +210,11 @@ export async function writeTaskUnits(
 }
 
 /**
- * Remove a task: stop+disable the timer, delete both unit files, reload systemd.
- * Deliberately touches NOTHING on the PBS server — snapshots already stored are
- * left exactly as they are (deleting a schedule is not deleting a backup).
+ * Remove a task: stop+disable the timer, delete both unit files AND the
+ * timer's Persistent stamp, reset the failed-state ghost, reload systemd
+ * (task-units.ts — SCHEDULES-GT-17/18). Deliberately touches NOTHING on the
+ * PBS server — snapshots already stored are left exactly as they are (deleting
+ * a schedule is not deleting a backup).
  */
 export async function removeTaskUnits(
   executor: CommandExecutor,

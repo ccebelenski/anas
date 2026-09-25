@@ -30,7 +30,9 @@ import {
   runFailed,
   serviceUnitName,
   superviseTaskRun,
+  sweepOrphanTaskStamps,
   taskFileExists,
+  taskStampPath,
   timerUnitName,
   validateSchedule,
 } from '../task-units.js'
@@ -687,6 +689,82 @@ describe('task units — the store plumbing that is prefix-only', () => {
     }
   })
 
+  // SCHEDULES-GT-17/18 (operator ruling 2026-09-25): the removal must take
+  // systemd's own bookkeeping down with the units — the Persistent stamp (its
+  // leftover makes a re-created task fire at once) and the failed-state ghost.
+  it('removeTaskUnits deletes the stamp beside the units and issues reset-failed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+    const stampDir = await mkdtemp(join(tmpdir(), 'anas-task-stamps-'))
+    const savedStampDir = process.env.ANAS_TIMERS_STAMP_DIR
+    process.env.ANAS_TIMERS_STAMP_DIR = stampDir
+    try {
+      const mock = new MockExecutor()
+      mock.addFixture({ command: SYSTEMCTL, result: ok('') })
+      await writeFile(join(dir, SERVICE), '[Unit]\n')
+      await writeFile(join(dir, TIMER), '[Timer]\n')
+      await writeFile(join(stampDir, `stamp-${TIMER}`), '')
+      // Another task's stamp — one removal must not reach past its own name.
+      await writeFile(join(stampDir, 'stamp-anas-cloud-other.timer'), '')
+
+      await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
+
+      assert.deepEqual(await readdir(stampDir), ['stamp-anas-cloud-other.timer'])
+      assert.equal(taskStampPath(CLOUD_UNIT_KIND, TASK), `${stampDir}/stamp-${TIMER}`)
+      const cmds = mock.calls.map(c => c.args.join(' '))
+      assert.ok(cmds.includes(`reset-failed ${SERVICE} ${TIMER}`))
+      // The argv sequence, in order: disable, reset-failed (both tolerated
+      // failures), then the reload.
+      assert.deepEqual(
+        mock.calls.filter(c => c.command === SYSTEMCTL).map(c => c.args[0]),
+        ['disable', 'reset-failed', 'daemon-reload'],
+      )
+    }
+    finally {
+      if (savedStampDir === undefined)
+        delete process.env.ANAS_TIMERS_STAMP_DIR
+      else
+        process.env.ANAS_TIMERS_STAMP_DIR = savedStampDir
+      await rm(dir, { recursive: true, force: true })
+      await rm(stampDir, { recursive: true, force: true })
+    }
+  })
+
+  it('removeTaskUnits tolerates nothing-to-remove: absent units, absent stamp, reset-failed nonzero', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+    const stampDir = await mkdtemp(join(tmpdir(), 'anas-task-stamps-'))
+    const savedStampDir = process.env.ANAS_TIMERS_STAMP_DIR
+    process.env.ANAS_TIMERS_STAMP_DIR = stampDir
+    try {
+      const mock = new MockExecutor()
+      // disable/reset-failed exit nonzero (unit already gone / not failed);
+      // daemon-reload must still run and the whole removal must not throw.
+      mock.addFixture({
+        command: SYSTEMCTL,
+        args: ['disable', '--now', TIMER],
+        result: { stdout: '', stderr: 'Failed to disable unit', exitCode: 1 },
+      })
+      mock.addFixture({
+        command: SYSTEMCTL,
+        args: ['reset-failed', SERVICE, TIMER],
+        result: { stdout: '', stderr: '', exitCode: 1 },
+      })
+      mock.addFixture({ command: SYSTEMCTL, args: ['daemon-reload'], result: ok('') })
+
+      await removeTaskUnits(CLOUD_UNIT_KIND, mock, dir, TASK)
+      assert.deepEqual(await readdir(dir), [])
+      assert.deepEqual(await readdir(stampDir), [])
+      assert.ok(mock.calls.some(c => c.args[0] === 'daemon-reload'))
+    }
+    finally {
+      if (savedStampDir === undefined)
+        delete process.env.ANAS_TIMERS_STAMP_DIR
+      else
+        process.env.ANAS_TIMERS_STAMP_DIR = savedStampDir
+      await rm(dir, { recursive: true, force: true })
+      await rm(stampDir, { recursive: true, force: true })
+    }
+  })
+
   it('validateSchedule asks systemd, and surfaces its stderr', async () => {
     const good = new MockExecutor()
     good.addFixture({ command: SYSTEMD_ANALYZE, args: ['calendar', 'Tue 02:00'], result: ok('Normalized form: Tue *-*-* 02:00:00\n') })
@@ -715,6 +793,80 @@ describe('task units — the store plumbing that is prefix-only', () => {
     )
     // `custom` generates nothing: the raw expression is the schedule.
     assert.equal(effectiveSchedule({ schedule: '*-*-* 03:00:00', cadence: { kind: 'custom', days: [] } }), '*-*-* 03:00:00')
+  })
+})
+
+describe('task units — the boot sweep of orphan task stamps (SCHEDULES-GT-18)', () => {
+  /** A stamp dir + unit dir with the sweep's whole decision table laid out. */
+  async function sweepFixture(): Promise<{ unitDir: string, stampDir: string }> {
+    const unitDir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+    const stampDir = await mkdtemp(join(tmpdir(), 'anas-task-stamps-'))
+    // A live task: both units exist → its stamp is the missed-run heal. KEPT.
+    await writeFile(join(unitDir, 'anas-backup-live.service'), '[Unit]\n')
+    await writeFile(join(unitDir, 'anas-backup-live.timer'), '[Timer]\n')
+    // A half-removed remnant (service only): conservative ground — KEPT.
+    await writeFile(join(unitDir, 'anas-backup-halftaken.service'), '[Unit]\n')
+    // Orphans of ours: both units gone → swept.
+    await writeFile(join(stampDir, 'stamp-anas-cloud-orphan.timer'), '')
+    await writeFile(join(stampDir, 'stamp-anas-backup-gone.timer'), '')
+    // A stamp whose units still exist, either flavour. KEPT.
+    await writeFile(join(stampDir, 'stamp-anas-backup-live.timer'), '')
+    await writeFile(join(stampDir, 'stamp-anas-backup-halftaken.timer'), '')
+    // Another store's stamp (the scrub pair is not a task kind). KEPT.
+    await writeFile(join(stampDir, 'stamp-anas-scrub.timer'), '')
+    // Foreign stamps and noise. KEPT.
+    await writeFile(join(stampDir, 'stamp-someone-elses.timer'), '')
+    await writeFile(join(stampDir, 'stamp-ana-backupx.timer'), '')
+    await writeFile(join(stampDir, 'unrelated.txt'), '')
+    return { unitDir, stampDir }
+  }
+
+  it('sweeps exactly the stamps of OUR kinds whose units are both gone', async () => {
+    const { unitDir, stampDir } = await sweepFixture()
+    try {
+      const swept = await sweepOrphanTaskStamps([BACKUP_UNIT_KIND, CLOUD_UNIT_KIND], unitDir, stampDir)
+      assert.deepEqual(swept.sort(), ['stamp-anas-backup-gone.timer', 'stamp-anas-cloud-orphan.timer'])
+      const left = await readdir(stampDir)
+      assert.ok(left.includes('stamp-anas-backup-live.timer'), 'a live task\'s stamp stays')
+      assert.ok(left.includes('stamp-anas-backup-halftaken.timer'), 'a half-removed task\'s stamp stays')
+      assert.ok(left.includes('stamp-anas-scrub.timer'), 'the scrub store\'s stamp is not a task kind\'s')
+      assert.ok(left.includes('stamp-someone-elses.timer'), 'foreign stamps stay')
+      assert.ok(left.includes('stamp-ana-backupx.timer'), 'a near-miss name that is not under a prefix stays')
+      assert.ok(left.includes('unrelated.txt'))
+    }
+    finally {
+      await rm(unitDir, { recursive: true, force: true })
+      await rm(stampDir, { recursive: true, force: true })
+    }
+  })
+
+  it('a kind added later is swept the day it is passed — the list comes from the descriptors', async () => {
+    const { unitDir, stampDir } = await sweepFixture()
+    try {
+      // Backup alone: the cloud orphan is not this call's business.
+      const swept = await sweepOrphanTaskStamps([BACKUP_UNIT_KIND], unitDir, stampDir)
+      assert.deepEqual(swept, ['stamp-anas-backup-gone.timer'])
+      assert.ok((await readdir(stampDir)).includes('stamp-anas-cloud-orphan.timer'))
+    }
+    finally {
+      await rm(unitDir, { recursive: true, force: true })
+      await rm(stampDir, { recursive: true, force: true })
+    }
+  })
+
+  it('a missing stamp dir is quiet; an unreadable one throws (the boot caller logs and starts anyway)', async () => {
+    const unitDir = await mkdtemp(join(tmpdir(), 'anas-task-units-'))
+    try {
+      assert.deepEqual(await sweepOrphanTaskStamps([CLOUD_UNIT_KIND], unitDir, join(unitDir, 'no-such-dir')), [])
+      // Not a directory at all: readdir fails with ENOTDIR, which is NOT the
+      // quiet case — the sweep must surface it for the boot caller to log.
+      const notADir = join(unitDir, 'plain-file')
+      await writeFile(notADir, 'x')
+      await assert.rejects(sweepOrphanTaskStamps([CLOUD_UNIT_KIND], unitDir, notADir))
+    }
+    finally {
+      await rm(unitDir, { recursive: true, force: true })
+    }
   })
 })
 
